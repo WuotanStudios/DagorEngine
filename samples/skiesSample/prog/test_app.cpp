@@ -531,6 +531,7 @@ public:
 
   virtual void actScene()
   {
+    cpujobs::release_done_jobs();
     samplebenchmark::quitIfBenchmarkHasEnded();
     webui::update();
 
@@ -2548,11 +2549,7 @@ wind_dep0(S[0].windDependency), wind_dep1(S[1].windDependency), wind_dep2(S[2].w
           UniqueTexHolder &tex;
           TexPtr ht;
           InitHeightmap(UniqueTexHolder &_tex, TexPtr &&_ht) : ht(eastl::move(_ht)), tex(_tex) {}
-          virtual void performAction()
-          {
-            tex = UniqueTexHolder(eastl::move(ht), "heightmap");
-            cpujobs::release_done_jobs();
-          }
+          void performAction() override { tex = UniqueTexHolder(eastl::move(ht), "heightmap"); }
         };
         add_delayed_action(new InitHeightmap(s.heightmap, eastl::move(tex)));
       };
@@ -2643,11 +2640,7 @@ wind_dep0(S[0].windDependency), wind_dep1(S[1].windDependency), wind_dep2(S[2].w
           UpdatePtr(eastl::unique_ptr<DynamicRenderableSceneInstance> &_dest, DynamicRenderableSceneInstance *_val) :
             dest(_dest), val(_val)
           {}
-          virtual void performAction()
-          {
-            dest.reset(val);
-            cpujobs::release_done_jobs();
-          }
+          void performAction() override { dest.reset(val); }
         };
         add_delayed_action(new UpdatePtr(dm, val));
       }
@@ -2872,7 +2865,8 @@ void game_demo_init()
   df_close(file);*/
 
   debug("[DEMO] registering factories");
-  ::enable_tex_mgr_mt(true, 1024);
+  const DataBlock &blk = *dgs_get_settings();
+  ::enable_tex_mgr_mt(true, blk.getInt("max_tex_count", 1024));
   if (!cpujobs::is_inited())
     cpujobs::init();
   ::set_gameres_sys_ver(2);
@@ -2885,7 +2879,6 @@ void game_demo_init()
   console::init();
   add_con_proc(&test_console);
 
-  const DataBlock &blk = *dgs_get_settings();
   ::set_gameres_sys_ver(2);
 
   const char *res_vrom = "res/grp_hdr.vromfs.bin";

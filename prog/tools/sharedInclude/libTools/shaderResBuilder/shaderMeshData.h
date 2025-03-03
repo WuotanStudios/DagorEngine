@@ -108,6 +108,8 @@ public:
   static bool preferZstdPacking;      // =false by default
   static bool allowOodlePacking;      // =false by default
   static bool fastNoPacking;          // =false by default
+  static unsigned zstdMaxWindowLog;   // =0 by default (to use zstd defaults for compression level)
+  static int zstdCompressionLevel;    // =18 by default
 
   //*************************************************************
   // desc for single element (vertex group & material)
@@ -236,4 +238,5 @@ bool can_combine_elems(const ShaderMeshData::RElem &left, const ShaderMeshData::
   int additional_verices_num = 0, int additional_faces_num = 0);
 
 void create_vertex_color_data(Mesh &m, int usage, int usage_index);
-void add_per_vertex_domain_uv(Mesh &m, int usage, int usage_index);
+
+void add_per_vertex_domain_uv(Mesh &m, int usage, int usage_index_0, int usage_index_1);

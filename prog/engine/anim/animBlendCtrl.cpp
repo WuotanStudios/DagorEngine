@@ -51,7 +51,8 @@ static void process_nodes_with_bitmap(NodeList &list, IPureAnimStateHolder &st, 
     }
     c(list[i].node, bitmap & bit);
   }
-  st.setParamInt(paramIdToClear, 0);
+  if (paramIdToClear >= 0)
+    st.setParamInt(paramIdToClear, 0);
 }
 
 static void set_rewind_bit(uint32_t bit_idx, IPureAnimStateHolder &st, dag::ConstSpan<int> rewind_bitmap_params_ids)
@@ -309,6 +310,11 @@ void AnimBlendNodeContinuousLeaf::buildBlendingList(BlendCtx &bctx, real w)
       else if (prevTime < irqs[i].irqTime || (prevTime == 0 && irqs[i].irqTime == 0))
         bctx.irq(irqs[i].irqId, (intptr_t)this, curTime, 0);
   }
+
+#if DAGOR_DBGLEVEL > 0
+  if (getDebugAnimParam())
+    bctx.irq(getDebugAnimParamIrqId(), (intptr_t)this, curTime - t0, dt);
+#endif
 
   wt[bnlId] += w;
   bctx.cKeyPos[bnlId] = curTime;
@@ -573,10 +579,10 @@ void AnimBlendNodeParametricLeaf::buildBlendingList(BlendCtx &bctx, real w)
       param = 1.0f;
   }
 
-  const int curTime = int(t0 + (param)*dt);
+  const int curTime = int(t0 + param * dt);
 
 #if DAGOR_DBGLEVEL > 0
-  if (param > 0.f && param < 1.f && getDebugAnimParam())
+  if (getDebugAnimParam())
     bctx.irq(getDebugAnimParamIrqId(), (intptr_t)this, curTime - t0, dt);
 #endif
 

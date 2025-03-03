@@ -64,9 +64,13 @@ static ZSTD_customMem const ZSTD_dagorCMem = {&zstd_alloc<tmpmem_ptr>, &zstd_fre
 static ZSTD_customMem const ZSTD_framememCMem = {&zstd_alloc<framemem_ptr>, &zstd_free<framemem_ptr>, NULL};
 
 size_t zstd_compress_bound(size_t srcSize) { return ZSTD_compressBound(srcSize); }
-size_t zstd_compress(void *dst, size_t maxDstSize, const void *src, size_t srcSize, int compressionLevel)
+size_t zstd_compress(void *dst, size_t maxDstSize, const void *src, size_t srcSize, int compressionLevel, unsigned max_window_log)
 {
-  size_t enc_sz = ZSTD_compress(dst, maxDstSize, src, srcSize, compressionLevel);
+  ZSTD_CCtx *ctx = zstd_create_cctx();
+  if (max_window_log)
+    ZSTD_CCtx_setParameter(ctx, ZSTD_c_windowLog, max_window_log);
+  size_t enc_sz = ZSTD_compressCCtx(ctx, dst, maxDstSize, src, srcSize, compressionLevel);
+  zstd_destroy_cctx(ctx);
   CHECK_ERROR(enc_sz);
   return enc_sz;
 }
@@ -89,13 +93,13 @@ size_t zstd_decompress_with_dict(ZSTD_DCtx *ctx, void *dst, size_t dstSize, cons
   return enc_sz;
 }
 
-int64_t zstd_compress_data_solid(IGenSave &dest, IGenLoad &src, const size_t sz, int compressionLevel)
+int64_t zstd_compress_data_solid(IGenSave &dest, IGenLoad &src, const size_t sz, int compressionLevel, unsigned max_window_log)
 {
   SmallTab<uint8_t, TmpmemAlloc> srcBuf, dstBuf;
   clear_and_resize(srcBuf, sz);
   clear_and_resize(dstBuf, ZSTD_compressBound(sz));
   src.readTabData(srcBuf);
-  size_t enc_sz = zstd_compress(dstBuf.data(), data_size(dstBuf), srcBuf.data(), data_size(srcBuf), compressionLevel);
+  size_t enc_sz = zstd_compress(dstBuf.data(), data_size(dstBuf), srcBuf.data(), data_size(srcBuf), compressionLevel, max_window_log);
   if (ZSTD_isError(enc_sz))
     return (int)enc_sz;
   dest.write(dstBuf.data(), enc_sz);
@@ -103,13 +107,15 @@ int64_t zstd_compress_data_solid(IGenSave &dest, IGenLoad &src, const size_t sz,
 }
 
 static int64_t zstd_stream_compress_data_base(IGenSave &dest, IGenLoad &src, const int64_t sz, int compressionLevel,
-  const ZSTD_CDict_s *dict = nullptr)
+  unsigned max_window_log, const ZSTD_CDict_s *dict = nullptr)
 {
   ZSTD_CStream *strm = ZSTD_createCStream_advanced(ZSTD_dagorCMem);
   ZSTD_inBuffer inBuf;
   ZSTD_outBuffer outBuf;
 
   ZSTD_initCStream_srcSize(strm, compressionLevel, sz >= 0 ? sz : ZSTD_CONTENTSIZE_UNKNOWN);
+  if (max_window_log)
+    ZSTD_CCtx_setParameter(strm, ZSTD_c_windowLog, max_window_log);
   const size_t outBufStoreSz = ZSTD_CStreamOutSize(), inBufStoreSz = min(sz >= 0 ? (size_t)sz : outBufStoreSz, outBufStoreSz);
   SmallTab<uint8_t, TmpmemAlloc> tempBuf;
   clear_and_resize(tempBuf, inBufStoreSz + outBufStoreSz);
@@ -178,14 +184,9 @@ static int64_t zstd_stream_compress_data_base(IGenSave &dest, IGenLoad &src, con
   return enc_sz;
 }
 
-int64_t zstd_stream_compress_data(IGenSave &dest, IGenLoad &src, const size_t sz, int compression_level)
+int64_t zstd_stream_compress_data(IGenSave &dest, IGenLoad &src, const size_t sz, int compression_level, unsigned max_window_log)
 {
-  return zstd_stream_compress_data_base(dest, src, sz, compression_level);
-}
-
-int64_t zstd_stream_compress_data(IGenSave &dest, IGenLoad &src, int compression_level)
-{
-  return zstd_stream_compress_data_base(dest, src, -1, compression_level);
+  return zstd_stream_compress_data_base(dest, src, sz, compression_level, max_window_log);
 }
 
 static int64_t zstd_stream_decompress_data_base(IGenSave &dest, IGenLoad &src, const size_t compr_sz,
@@ -302,9 +303,10 @@ void zstd_destroy_cctx(ZSTD_CCtx *ctx) { ZSTD_freeCCtx(ctx); }
 ZSTD_DCtx *zstd_create_dctx(bool tmp) { return ZSTD_createDCtx_advanced(tmp ? ZSTD_framememCMem : ZSTD_dagorCMem); }
 void zstd_destroy_dctx(ZSTD_DCtx *ctx) { ZSTD_freeDCtx(ctx); }
 
-int64_t zstd_stream_compress_data_with_dict(IGenSave &dest, IGenLoad &src, const size_t sz, int cLev, const ZSTD_CDict_s *dict)
+int64_t zstd_stream_compress_data_with_dict(IGenSave &dest, IGenLoad &src, const size_t sz, int cLev, const ZSTD_CDict_s *dict,
+  unsigned max_window_log)
 {
-  return zstd_stream_compress_data_base(dest, src, sz, cLev, dict);
+  return zstd_stream_compress_data_base(dest, src, sz, cLev, max_window_log, dict);
 }
 int64_t zstd_stream_decompress_data(IGenSave &dest, IGenLoad &src, const size_t compr_sz, const ZSTD_DDict_s *dict)
 {
@@ -579,6 +581,101 @@ void ZstdSaveCB::flush()
   }
   zstdBufUsed = 0;
   cwrDest->flush();
+}
+
+
+ZstdDecompressSaveCB::ZstdDecompressSaveCB(IGenSave &dest_cwr, const ZSTD_DDict_s *dict, bool tmp, bool multiframe) :
+  cwrDest(dest_cwr), allowMultiFrame(multiframe)
+{
+  zstdStream = ZSTD_createDStream_advanced(tmp ? ZSTD_framememCMem : ZSTD_dagorCMem);
+  G_VERIFY(zstdStream);
+  G_VERIFY(ZSTD_initDStream(zstdStream) != 0);
+  if (dict)
+    ZSTD_DCtx_refDDict(zstdStream, dict);
+}
+
+ZstdDecompressSaveCB::~ZstdDecompressSaveCB()
+{
+  if (zstdStream)
+    ZSTD_freeDStream(zstdStream);
+}
+
+void ZstdDecompressSaveCB::flush()
+{
+  ZSTD_inBuffer inBuf;
+  inBuf.src = nullptr;
+  inBuf.size = 0;
+  inBuf.pos = 0;
+
+  bool haveMore = true;
+  while (haveMore)
+    haveMore = doProcessStep(&inBuf);
+  cwrDest.flush();
+}
+
+void ZstdDecompressSaveCB::write(const void *ptr, int size)
+{
+  G_ASSERT_RETURN(size >= 0, );
+  ZSTD_inBuffer inBuf;
+  inBuf.src = ptr;
+  inBuf.size = (size_t)size;
+  inBuf.pos = 0;
+
+  while (inBuf.pos < inBuf.size)
+  {
+    if (!doProcessStep(&inBuf))
+      break;
+  }
+}
+
+void ZstdDecompressSaveCB::finish()
+{
+  flush();
+
+  isFinished = isFinished || (allowMultiFrame && isFrameFinished);
+
+  if (!isFinished && !isBroken)
+    logerr("Zstd stream wasn't finished, processedId=%d, processedOut=%d", processedIn, processedOut);
+}
+
+bool ZstdDecompressSaveCB::doProcessStep(void *opaqueInBuf)
+{
+  if (isBroken || isFinished)
+    return false;
+
+  ZSTD_inBuffer &inBuf = *reinterpret_cast<ZSTD_inBuffer *>(opaqueInBuf);
+  ZSTD_outBuffer outBuf;
+  outBuf.dst = &rdBuf[0];
+  outBuf.size = RD_BUFFER_SIZE;
+  outBuf.pos = 0;
+
+  if (isFrameFinished && inBuf.size > inBuf.pos)
+    isFrameFinished = false;
+  int oldPos = inBuf.pos;
+  size_t ret = ZSTD_decompressStream(zstdStream, &outBuf, &inBuf);
+  int stepProcessedIn = inBuf.pos - oldPos;
+  processedIn += stepProcessedIn;
+  if (ZSTD_isError(ret))
+  {
+    logerr("Zstd decode error: %08X %s, processedIn: %d, processedOut: %d", ret, ZSTD_getErrorName(ret), processedIn, processedOut);
+    isBroken = true;
+    return false;
+  }
+  if (outBuf.pos > 0)
+  {
+    cwrDest.write(outBuf.dst, outBuf.pos);
+    processedOut += outBuf.pos;
+  }
+
+  if (ret == 0)
+  {
+    isFrameFinished = true;
+    if (!allowMultiFrame)
+      isFinished = true;
+    return false;
+  }
+
+  return stepProcessedIn > 0 || outBuf.pos > 0;
 }
 
 #define EXPORT_PULL dll_pull_iosys_zstdIo

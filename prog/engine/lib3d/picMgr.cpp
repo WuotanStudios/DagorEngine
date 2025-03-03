@@ -1618,6 +1618,11 @@ bool PictureManager::TexRec::initAtlas()
 
     ad->atlas.init(sz, texBlk.getInt("picReserve", 16), margin, texBlk.getStr("name", NULL),
       tex_fmt | TEXCF_CLEAR_ON_CREATE | TEXCF_LINEAR_LAYOUT);
+    if (!ad->atlas.tex.first.getTex2D())
+    {
+      del_it(ad);
+      return false;
+    }
     bool bc_format = ad->fmt == ad->FMT_DXT5 || ad->fmt == ad->FMT_none;
     G_UNUSED(bc_format);
     G_ASSERT(!bc_format || ad->atlas.getMargin() == margin);
@@ -1970,9 +1975,11 @@ void PictureManager::AsyncPicLoadJob::loadTexPic()
   outTexId = get_managed_texture_id(name);
   if (outTexId == BAD_TEXTUREID)
     outTexId = add_managed_texture(name);
+  smpId = get_texture_separate_sampler(outTexId);
+  if (smpId == d3d::INVALID_SAMPLER_HANDLE)
+    smpId = d3d::request_sampler({});
 
   BaseTexture *tex = acquire_managed_tex(outTexId);
-  smpId = get_texture_separate_sampler(outTexId);
   TextureInfo ti;
   if (!tex || tex->restype() != RES3D_TEX || !tex->getinfo(ti))
     ti.w = ti.h = 0;
