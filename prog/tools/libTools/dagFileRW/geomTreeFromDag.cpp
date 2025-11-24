@@ -114,7 +114,7 @@ void GeomNodeTreeBuilder::buildFromDagNodes(Node *sc_root, const char *unimporta
 
   if (unimportant_nodes_prefix && *unimportant_nodes_prefix)
   {
-    int un_prefix_len = i_strlen(unimportant_nodes_prefix);
+    int un_prefix_len = (int)strlen(unimportant_nodes_prefix);
     Tab<int> n_remap;
     n_remap.resize(nodes.size());
     mem_set_ff(n_remap);
@@ -170,7 +170,7 @@ void GeomNodeTreeBuilder::save(mkbindump::BinDumpSaveCB &final_cwr, bool compr, 
   G_ASSERTF(nodes.size() < 0x80000000, "nodes.size()=%u", nodes.size());
   final_cwr.writeInt32e(invalidTmOfs | (lastUnimportantCount << 20));
 
-  mkbindump::BinDumpSaveCB cwr(64 << 10, final_cwr.getTarget(), final_cwr.WRITE_BE);
+  mkbindump::BinDumpSaveCB cwr(64 << 10, final_cwr);
   for (int i = 0; i < nodes.size(); ++i)
   {
     const TreeNode &n = nodes[i];
@@ -186,7 +186,7 @@ void GeomNodeTreeBuilder::save(mkbindump::BinDumpSaveCB &final_cwr, bool compr, 
 
   if (compr && cwr.getSize() > 512) // compressing is requested and has sence
   {
-    mkbindump::BinDumpSaveCB zcwr(cwr.getSize(), final_cwr.getTarget(), final_cwr.WRITE_BE);
+    mkbindump::BinDumpSaveCB zcwr(cwr.getSize(), final_cwr);
     MemoryLoadCB mcrd(cwr.getMem(), false);
     if (allow_oodle)
     {

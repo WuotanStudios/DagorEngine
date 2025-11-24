@@ -26,7 +26,7 @@ void out_debug_str(const char *str)
   if (out_debug_file_handle != invalid_console_handle)
   {
     DWORD cWritten = 0;
-    ::WriteFile((HANDLE)out_debug_file_handle, str, i_strlen(str), &cWritten, NULL);
+    ::WriteFile((HANDLE)out_debug_file_handle, str, (int)strlen(str), &cWritten, NULL);
   }
 #endif
 }
@@ -98,11 +98,14 @@ void out_debug_str(const char *str)
 void out_debug_str(const char *str)
 {
   __android_log_write(ANDROID_LOG_DEBUG, "dagor", str);
+
+#if DAGOR_DBGLEVEL > 0
   if (out_debug_file_handle != invalid_console_handle)
   {
-    fprintf((FILE *)out_debug_file_handle, "%s", str);
+    fputs(str, (FILE *)out_debug_file_handle);
     fflush((FILE *)out_debug_file_handle);
   }
+#endif
 }
 #endif
 

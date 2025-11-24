@@ -1,4 +1,9 @@
-import bpy,os
+from os         import walk
+from os         import sep as os_sep
+from os.path    import exists, join, isfile
+
+import bpy
+
 from bpy.utils          import register_class, unregister_class
 from bpy.types          import Operator
 
@@ -10,10 +15,11 @@ from math               import radians
 from .cmp_const         import *
 from .cache_rw          import build_cache, read_cache
 from ..helpers.texts    import get_text, log
-from ..helpers.basename import basename
-from ..helpers.popup    import show_popup
+from ..helpers.names    import asset_basename, ensure_no_extension, ensure_no_path
 from ..helpers.props    import fix_type
+from ..helpers.getters  import *
 
+from ..popup.popup_functions    import show_popup
 #TODO: find better solution than global variable?
 
 dags_to_import = []
@@ -42,16 +48,16 @@ class cmp_ent:
         return
 
 def get_collection(name):
-    col = bpy.data.collections.get(name)
-    if col is None:
-        col = bpy.data.collections.new(name)
-    return col
+    collection = bpy.data.collections.get(name)
+    if collection is None:
+        collection = bpy.data.collections.new(name)
+    return collection
 
-def check_col_name(col, name):
-    if 'name' in col.keys():
-        if basename(col['name']) == name:
+def check_collection_name(collection, name):
+    if 'name' in collection.keys():
+        if ensure_no_extension(collection['name']) == name:
             return True
-    elif col.name == name:
+    elif collection.name == name:
         return True
     return False
 
@@ -66,7 +72,7 @@ def check_col_type(col,type):
 def get_node_collection(name,type):
     collections = bpy.data.collections
     for col in collections:
-        if check_col_name(col,name) and check_col_type(col, type):
+        if check_collection_name(col,name) and check_col_type(col, type):
             not_imported = col.objects.__len__()==col.children.__len__()==0
             return [col, not_imported]
     col = bpy.data.collections.new(name)
@@ -271,7 +277,7 @@ def apply_matrix(node,node_object):
     return{'FINISHED'}
 
 def read_cmp(path_import,with_sub_cmp,with_dags,with_lods,assets):
-    pref = bpy.context.preferences.addons[basename(__package__)].preferences
+    pref = get_preferences()
     i = int(pref.project_active)
     search_path = pref.projects[i].path
     if path_import.replace(' ','')=='':
@@ -279,12 +285,13 @@ def read_cmp(path_import,with_sub_cmp,with_dags,with_lods,assets):
         show_popup(message=msg,title='ERROR!',icon='ERROR')
         log(msg, type = 'ERROR', show = True)
         return{"CANCELLED"}
-    if path_import.find('\\')==-1:# if no folders, that might be name of composit
+    path_import = path_import.replace('/', os_sep)
+    if path_import.find(os_sep)==-1:# if no folders, that might be name of composit
         found=False
-        for subdir,dirs,files in os.walk(search_path):
+        for subdir,dirs,files in walk(search_path):
             for file in files:
                 if file in [path_import, path_import+'.composit.blk']:
-                    path_import=subdir + os.sep + file
+                    path_import = join(subdir, file)
                     found=True
                     break
             if found:
@@ -294,13 +301,14 @@ def read_cmp(path_import,with_sub_cmp,with_dags,with_lods,assets):
             show_popup(message=msg,title='ERROR!',icon='ERROR')
             log(msg, type = 'ERROR', show = True)
             return{"CANCELLED"}
-    if not os.path.isfile(path_import):
+    if not isfile(path_import):
         msg=f'{path_import} is not a file!\n'
         log(msg, type = 'ERROR')
         show_popup(message=msg,title='ERROR!',icon='ERROR')
         return{"CANCELLED"}
     if not path_import.endswith('.blk'):
-        msg=f'{os.path.basename(path_import)} is not a .blk file!\n'
+        filename = ensure_no_path(path_import)
+        msg = f'{filename} is not a .blk file!\n'
         log(msg, type = 'ERROR', show = True)
         show_popup(message=msg,title='ERROR!',icon='ERROR')
     msg = f'IMPORTING {path_import}\n'
@@ -333,14 +341,14 @@ def read_cmp(path_import,with_sub_cmp,with_dags,with_lods,assets):
     split=split.replace(';','\n')
     split=split.replace('\t','')
 #hierarchy
-    nodes=read_cmp_hierarchy(split.splitlines(),assets)
-    name=basename(path_import)
+    nodes = read_cmp_hierarchy(split.splitlines(), assets)
+    name = asset_basename(path_import)
 
-    cmp_col=get_node_collection(name,'composit')[0]
-    clear_collection(cmp_col)
+    cmp_collection = get_node_collection(name,'composit')[0]
+    clear_collection(cmp_collection)
 
 #node creation
-    build_nodes(nodes,cmp_col,None,assets)
+    build_nodes(nodes,cmp_collection, None, assets)
 #import parts
     if with_sub_cmp:
         sub_composits = list(dict.fromkeys(cmp_to_import))
@@ -361,22 +369,62 @@ def read_cmp(path_import,with_sub_cmp,with_dags,with_lods,assets):
         log(msg)
         dags_to_import.clear()#we don't need it to be modified dynamically
         for dag in dags:
-            bpy.ops.import_scene.dag(filepath = dag, with_lods = with_lods)
-    log(f'IMPORTED {os.path.basename(path_import)}\n')
+            bpy.ops.import_scene.dag(
+                filepath = dag,
+                with_lods = with_lods,
+#making sure no parameters were overridden by previous call
+                dirpath = "",
+                includes = "",
+                excludes = "",
+                includes_re = "",
+                excludes_re = "",
+                check_subdirs = False,
+                with_dps= False,
+                with_dmgs= False,
+                with_destr = False,
+                )
+    log(f'IMPORTED {asset_basename(path_import)}\n')
     return
 
 class DAGOR_OP_CmpImport(Operator):
     bl_idname = "dt.cmp_import"
     bl_label = "Import CMP"
-    bl_description = "Import composit"
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(self, context):
+        pref = get_preferences()
+        if pref.projects.__len__() == 0:
+            return False
+        project = pref.projects[int(pref.project_active)]
+        if not exists(project.path):
+            return False
+        return True
+
+    @classmethod
+    def description(cls, context, properties):
+        pref = get_preferences()
+        if pref.projects.__len__() == 0:
+            return "No active project found!"
+        project = pref.projects[int(pref.project_active)]
+        if not exists(project.path):
+            return f'Path of project "{project.name}" does not exist!'
+        return "Import Composite"
+
     def execute(self, context):
-        P = bpy.data.scenes[0].dag4blend.cmp.importer
-        #try:
+        pref = get_preferences()
+        index = pref.project_active
+        project = pref.projects[int(index)]
+        if not exists(project.path):
+            msg = f'Pafth of project "{project.name}" does not exist, can not search for resources'
+            log(msg, type = 'ERROR')
+            show_popup(msg)
+            return {'CANCELLED'}
+        props = get_local_props()
+        cmp_import_props = props.cmp.importer
         start=time()
         bpy.ops.dt.init_blend()
-        if P.refresh_cache:
+        if cmp_import_props.refresh_cache:
             assets = build_cache()
         else:
             try:
@@ -387,7 +435,11 @@ class DAGOR_OP_CmpImport(Operator):
         dags_to_import.clear()
         cmp_to_import.clear()
 
-        read_cmp(P.filepath, P.with_sub_cmp, P.with_dags, P.with_lods,assets)
+        read_cmp(cmp_import_props.filepath,
+                cmp_import_props.with_sub_cmp,
+                cmp_import_props.with_dags,
+                cmp_import_props.with_lods,
+                assets)
         context.window.scene = bpy.data.scenes['COMPOSITS']
         show_popup(f'finished in {round(time()-start,4)} sec')
         return{'FINISHED'}

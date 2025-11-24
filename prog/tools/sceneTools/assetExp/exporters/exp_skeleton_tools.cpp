@@ -105,7 +105,7 @@ static void calc_bounding_bbox(const DagorAsset *asset, const AScene &dag_scene,
   bool forceBoxCollision = asset->props.getBool("forceBoxCollision", false);
 
   bool treeCapsule = false;
-  if (!dd_strnicmp(dag_obj.name, "_Clip", i_strlen("_Clip")))
+  if (!dd_strnicmp(dag_obj.name, "_Clip", (int)strlen("_Clip")))
     ;
   else if (forceBoxCollision)
     ;
@@ -251,7 +251,7 @@ class FindNodesWithIndex : public Node::NodeEnumCB
   const char *name;
   Tab<Node *> &nodes;
   Tab<int> &indexes;
-  virtual int node(Node &c)
+  int node(Node &c) override
   {
     int index = -1;
     if (sscanf(c.name.str(), name, &index) == 1 && strcmp(String(32, name, index).str(), c.name.str()) == 0)
@@ -279,9 +279,9 @@ static void calc_tm(Node *node)
     calc_tm(node->child[i]);
 }
 
-static void remove_suffix(char *buff, const char *str, const char *suffix)
+void remove_suffix(char *buff, const char *str, const char *suffix)
 {
-  int suffixLen = i_strlen(suffix);
+  int suffixLen = (int)strlen(suffix);
   if (suffixLen > 0)
   {
     if (const char *suffixPos = strstr(str, suffix))

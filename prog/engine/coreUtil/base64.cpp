@@ -11,7 +11,7 @@ static const char sixtet_to_base64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn
 
 void Base64::operator=(const char *s)
 {
-  int l = i_strlen(s);
+  int l = (int)strlen(s);
   ensureAlloced(l + 1);
   strcpy((char *)data, s);
   len = l;
@@ -79,6 +79,22 @@ void Base64::encode(const uint8_t *from, int size)
 
   *to++ = '\0';
   len = to - data;
+}
+
+void Base64::encode_urlsafe(const uint8_t *from, int size)
+{
+  encode(from, size);
+  for (int i = 0; i < len; ++i)
+  {
+    if (data[i] == '+')
+      data[i] = '-';
+    else if (data[i] == '/')
+      data[i] = '_';
+  }
+  // remove trailing '='
+  while (len > 0 && data[len - 1] == '=')
+    --len;
+  data[len] = '\0'; // ensure null-termination
 }
 
 int Base64::decodeLength(void) const
@@ -161,4 +177,19 @@ void Base64::decode(String &dest) const
   dest = (const char *)buf;
 
   delete[] buf;
+}
+
+void Base64::decode_urlsafe(String &dest) const
+{
+  if (len)
+  {
+    for (int i = 0; i < len; ++i)
+    {
+      if (data[i] == '-')
+        data[i] = '+';
+      else if (data[i] == '_')
+        data[i] = '/';
+    }
+  }
+  decode(dest);
 }

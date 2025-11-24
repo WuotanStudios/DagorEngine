@@ -60,9 +60,9 @@ namespace das {
     __forceinline vec4f normalize2(vec4f a){return v_norm2(a); }
     __forceinline vec4f normalize3(vec4f a){return v_norm3(a); }
     __forceinline vec4f normalize4(vec4f a){return v_norm4(a); }
-    __forceinline vec4f safe_normalize2(vec4f a){return v_norm2_safe(a, v_make_vec4f(0.0f, 0.0f, 0.0f, 0.0f));}
-    __forceinline vec4f safe_normalize3(vec4f a){return v_norm3_safe(a, v_make_vec4f(0.0f, 0.0f, 0.0f, 0.0f));}
-    __forceinline vec4f safe_normalize4(vec4f a){return v_norm4_safe(a, v_make_vec4f(0.0f, 0.0f, 0.0f, 0.0f));}
+    __forceinline vec4f safe_normalize2(vec4f a){return v_norm2_safe(a, v_zero());}
+    __forceinline vec4f safe_normalize3(vec4f a){return v_norm3_safe(a, v_zero());}
+    __forceinline vec4f safe_normalize4(vec4f a){return v_norm4_safe(a, v_zero());}
 
     __forceinline vec4f cross3(vec4f a, vec4f b){vec4f v = v_cross3(a,b); return v;}
 
@@ -74,7 +74,7 @@ namespace das {
 #else
 #define DAS_FINITE_MATH
 #endif
-#if defined(__clang__) && !defined(__arm64__) && !defined(_TARGET_C3)
+#if defined(__clang__) && !defined(__arm64__) && !defined(__e2k__) && !defined(_TARGET_C3)
 #pragma float_control(push)
 #pragma float_control(precise, on)
 #endif
@@ -107,7 +107,7 @@ namespace das {
     ___noinline DAS_FINITE_MATH inline bool   disfinite(double  a) { return __builtin_isfinite(a); }
 #endif
 #undef DAS_FINITE_MATH
-#if defined(__clang__) && !defined(__arm64__) && !defined(_TARGET_C3)
+#if defined(__clang__) && !defined(__arm64__) && !defined(__e2k__) && !defined(_TARGET_C3)
 #pragma float_control(pop)
 #endif
 #else

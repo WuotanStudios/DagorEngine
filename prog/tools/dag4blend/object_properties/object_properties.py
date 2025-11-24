@@ -1,11 +1,17 @@
-import bpy, os
-from   bpy.props            import StringProperty, PointerProperty, FloatProperty
-from   bpy.utils            import register_class, unregister_class
-from   bpy.types            import Operator, Panel, PropertyGroup
-from ..helpers.texts        import *
-from ..helpers.popup        import show_popup
-from ..helpers.basename     import basename
-from ..helpers.props        import fix_type
+from os.path    import exists, isfile, join
+from os         import listdir
+
+import bpy
+
+from   bpy.props    import StringProperty, PointerProperty, FloatProperty
+from   bpy.utils    import register_class, unregister_class
+from   bpy.types    import Operator, Panel, PropertyGroup
+
+from ..helpers.texts    import *
+from ..ui.draw_elements import draw_custom_header
+from ..popup.popup_functions    import show_popup
+from ..helpers.props    import fix_type
+from ..helpers.getters  import get_preferences
 
 #functions
 def clear_props(obj):
@@ -14,6 +20,10 @@ def clear_props(obj):
         props.append(key)
     for key in props:
         del obj.dagorprops[key]
+
+def update_uniform_scale(self, context):
+    self.scale = [self.uniform_scale]*3
+    return
 
 #func/text
 def text_to_props(obj):
@@ -32,12 +42,12 @@ def text_to_props(obj):
                 broken+=line+';'
             elif prop[0].endswith(':b') and prop[1] not in ['yes','no']:
                 broken+=line+';'
-            elif prop[0]=='broken_properties':
+            elif prop[0]=='broken_properties:t':
                 broken+=line[1:-1]+';'
             else:
                 DP[prop[0]]=fix_type(prop[1])
     if broken.__len__()>0:
-        DP['broken_properties']=f'"{broken}"'
+        DP['broken_properties:t']=f'"{broken}"'
 
 def props_to_text(obj):
     txt=get_text_clear('props_temp')
@@ -53,10 +63,9 @@ def props_to_text(obj):
         txt.write(value+'\n')
 
 def get_presets_list():
-    addon_name = basename(__package__)
-    pref = bpy.context.preferences.addons[addon_name].preferences
+    pref = get_preferences()
     path = pref.props_presets_path
-    files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path,f))]
+    files = [f for f in listdir(path) if isfile(join(path,f))]
     return files
 
 #operators
@@ -105,11 +114,10 @@ class DAGOR_OT_apply_op_preset(Operator):
             show_popup(message='No active object found',title='Error',icon='ERROR')
             return {'CANCELLED'}
         temp=get_text_clear('props_temp')
-        addon_name = basename(__package__)
-        pref=bpy.context.preferences.addons[addon_name].preferences
+        pref = get_preferences()
         preset = pref.prop_preset
-        path = pref.props_presets_path + f"\\{preset}.txt"
-        if os.path.exists(path):
+        path = pref.props_presets_path + f"/{preset}.txt"
+        if exists(path):
             with open(path,'r') as t:
                 temp.write(t.read())
                 t.close()
@@ -130,15 +138,14 @@ class DAGOR_OT_save_op_preset(Operator):
             show_popup(message='No active object found',title='Error',icon='ERROR')
             return {'CANCELLED'}
         props_to_text(obj)
-        addon_name = basename(__package__)
-        pref=bpy.context.preferences.addons[addon_name].preferences
+        pref = get_preferences()
         name = pref.prop_preset_name
         if name == '':
             name = 'unnamed'
         dirpath = pref.props_presets_path
-        if not os.path.exists(dirpath):
+        if not exists(dirpath):
             os.makedirs(dirpath)
-        path = f"{dirpath}\\{name}.txt"
+        path = f"{dirpath}/{name}.txt"
         with open (path,'w') as preset:
             for line in bpy.data.texts["props_temp"].lines:
                 if line.body!='':
@@ -158,10 +165,9 @@ class DAGOR_OT_remove_op_preset(Operator):
         return get_presets_list().__len__()>0
 
     def execute(self, context):
-        addon_name = basename(__package__)
-        pref=bpy.context.preferences.addons[addon_name].preferences
+        pref = get_preferences()
         name = pref.prop_preset
-        path = pref.props_presets_path + f"\\{name}.txt"
+        path = pref.props_presets_path + f"/{name}.txt"
         os.remove(path)
         list = get_presets_list()
         if list.__len__()>0:
@@ -208,7 +214,7 @@ class DAGOR_OT_add_prop(Operator):
         if obj is None:
             show_popup(message='No active object found',title='Error',icon='ERROR')
             return {'CANCELLED'}
-        pref=bpy.context.preferences.addons[basename(__package__)].preferences
+        pref = get_preferences()
         if pref.prop_name.replace(' ','')=='':
             show_popup(message='Enter prop name',title='Error',icon='ERROR')
             return {'CANCELLED'}
@@ -248,9 +254,6 @@ class DAGOR_PT_Properties(Panel):
     bl_category = 'Dagor'
     bl_options = {'DEFAULT_CLOSED'}
 
-    def __init__(self):
-        pass
-
     def draw(self, context):
         C=context
         l = self.layout
@@ -259,13 +262,10 @@ class DAGOR_PT_Properties(Panel):
             info = l.box()
             info.label(text = "No active object!", icon = 'ERROR')
             return
-        pref=bpy.context.preferences.addons[basename(__package__)].preferences
+        pref = get_preferences()
         DP = bpy.context.active_object.dagorprops
         props=l.box()
-        header=props.row()
-        header.prop(pref, 'props_maximized',icon = 'DOWNARROW_HLT'if pref.props_maximized else 'RIGHTARROW_THIN',
-            emboss=False,text='Properties')
-        header.label(text='',icon='THREE_DOTS')
+        draw_custom_header(props, 'Properties', pref, 'props_maximized', icon = 'THREE_DOTS')
         if pref.props_maximized:
             add = props.box()
             add.operator('dt.add_prop',text='',icon='ADD')
@@ -295,16 +295,12 @@ class DAGOR_PT_Properties(Panel):
                 rem.operator('dt.remove_prop',text='',icon='TRASH').prop=key
 
         presets = l.box()
-        header=presets.row()
-        header.prop(pref, 'props_preset_maximized',
-        icon = 'DOWNARROW_HLT'if pref.props_preset_maximized else 'RIGHTARROW_THIN', emboss=False,text='Presets')
-        header.label(text='',icon='THREE_DOTS')
+        draw_custom_header(presets, 'Presets', pref, 'props_preset_maximized', icon = 'THREE_DOTS')
 
         if pref.props_preset_maximized:
 
-            addon_name = basename(__package__)
             path = pref.props_presets_path
-            path_exists = os.path.exists(path)
+            path_exists = exists(path)
             if path_exists:
 
                 save = presets.column(align = True)
@@ -330,10 +326,7 @@ class DAGOR_PT_Properties(Panel):
                 col.prop(pref, 'props_presets_path', text = "")
 
         tools = l.box()
-        header = tools.row()
-        header.prop(pref, 'props_tools_maximized',icon = 'DOWNARROW_HLT'if pref.props_tools_maximized else 'RIGHTARROW_THIN',
-            emboss=False,text='Tools')
-        header.label(text='',icon='TOOL_SETTINGS')
+        draw_custom_header(tools, 'Tools', pref, 'props_tools_maximized', icon = 'TOOL_SETTINGS')
         if pref.props_tools_maximized:
             row = tools.row(align = True)
             row.operator('dt.props_to_text', text='Open as text', icon = 'TEXT')
@@ -356,11 +349,11 @@ classes=[dagorprops,
 def register():
     for cl in classes:
         register_class(cl)
-    bpy.types.Object.dagorprops=PointerProperty(type=dagorprops)
-    bpy.types.Object.dag_sets=PointerProperty(type=dagorprops)
+    bpy.types.Object.dagorprops = PointerProperty(type=dagorprops)
+    bpy.types.Object.uniform_scale = FloatProperty(update = update_uniform_scale)
 
 def unregister():
     for cl in classes:
         unregister_class(cl)
     del bpy.types.Object.dagorprops
-    del bpy.types.Object.dag_sets
+    del bpy.types.Object.uniform_scale

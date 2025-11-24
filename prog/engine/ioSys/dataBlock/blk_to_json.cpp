@@ -4,6 +4,7 @@
 #include <ioSys/dag_chainedMemIo.h>
 #include <math/integer/dag_IPoint2.h>
 #include <math/integer/dag_IPoint3.h>
+#include <math/integer/dag_IPoint4.h>
 #include <math/dag_Point3.h>
 #include <math/dag_Point4.h>
 #include <math/dag_TMatrix.h>
@@ -35,7 +36,7 @@ static void writeString(IGenSave &cb, const char *s)
 {
   if (!s || !*s)
     return;
-  int l = i_strlen(s);
+  int l = (int)strlen(s);
   cb.write(s, l);
 }
 
@@ -64,7 +65,7 @@ static void writeJsonIdent(IGenSave &cb, const char *nm, bool allow_unquoted)
       return writeJsonStrQuoted(cb, nm);
   if (strcmp(nm, "true") == 0 || strcmp(nm, "false") == 0 || strcmp(nm, "null") == 0)
     return writeJsonStrQuoted(cb, nm);
-  cb.write(nm, i_strlen(nm));
+  cb.write(nm, (int)strlen(nm));
 }
 static int getAvgParamCount(const DataBlock *b)
 {
@@ -188,6 +189,13 @@ static void exportJsonText(IGenSave &cb, const DataBlock &blk, JsonCtx &jctx)
       {
         IPoint3 cdi = blk.getIPoint3(idx);
         snprintf(buf, sizeof(buf), "[%d, %d, %d]", cdi[0], cdi[1], cdi[2]);
+        writeString(cb, buf);
+        break;
+      }
+      case DataBlock::TYPE_IPOINT4:
+      {
+        IPoint4 cdi = blk.getIPoint4(idx);
+        snprintf(buf, sizeof(buf), "[%d, %d, %d, %d]", cdi[0], cdi[1], cdi[2], cdi[3]);
         writeString(cb, buf);
         break;
       }

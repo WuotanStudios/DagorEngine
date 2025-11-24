@@ -1,5 +1,8 @@
-import os
 import mathutils
+
+from os         import makedirs
+from os.path    import exists, join, dirname
+
 import bpy
 from bpy.path                       import ensure_ext
 from mathutils                      import Matrix
@@ -15,8 +18,8 @@ from ..face                         import FaceExp
 from ..node                         import NodeExp
 from ..nodeMaterial                 import MaterialExp
 from ..mesh                         import MeshExp
-from ..helpers.popup                import show_popup
-from ..helpers.basename             import basename
+from ..popup.popup_functions    import show_popup
+from ..helpers.names                import ensure_no_path
 from ..helpers.multiline            import _label_multiline
 from ..helpers.texts                import log
 from ..helpers.version              import get_blender_version
@@ -137,7 +140,8 @@ class DagExporter(Operator, ExportHelper):
         options={'HIDDEN'},
         default = 'Visible')
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.writer = writer.DagWriter()
         self.last_index = 0
         self.nodes = list()
@@ -474,17 +478,17 @@ class DagExporter(Operator, ExportHelper):
             for tri in me.polygons:
                 d = color_attributes.data[tri.loop_indices[0]]
                 if d is not None:
-                    meshExp.color_attributes_poly.append(meshExp.addVertexColor(d.color))
+                    meshExp.color_attributes_poly.append(meshExp.addVertexColor(d.color_srgb))
                 else:
                     meshExp.color_attributes_poly.append(meshExp.addVertexColor([1.0, 1.0, 1.0]))
                 d = color_attributes.data[tri.loop_indices[2]]
                 if d is not None:
-                    meshExp.color_attributes_poly.append(meshExp.addVertexColor(d.color))
+                    meshExp.color_attributes_poly.append(meshExp.addVertexColor(d.color_srgb))
                 else:
                     meshExp.color_attributes_poly.append(meshExp.addVertexColor([1.0, 1.0, 1.0]))
                 d = color_attributes.data[tri.loop_indices[1]]
                 if d is not None:
-                    meshExp.color_attributes_poly.append(meshExp.addVertexColor(d.color))
+                    meshExp.color_attributes_poly.append(meshExp.addVertexColor(d.color_srgb))
                 else:
                     meshExp.color_attributes_poly.append(meshExp.addVertexColor([1.0, 1.0, 1.0]))
         node.mesh = meshExp
@@ -613,7 +617,7 @@ class DagExporter(Operator, ExportHelper):
             if tex.startswith('//'):
                 abs_tex = bpy.path.abspath(tex)
                 if abs_tex[1]!=':':#still doesn't start with drive letter
-                    abs_tex = bpy.path.basename(tex)
+                    abs_tex = ensure_no_path(tex)
                 self.writer.writeDAGString(abs_tex)
             else:
                 self.writer.writeDAGString(tex)
@@ -636,19 +640,22 @@ class DagExporter(Operator, ExportHelper):
                 flags |= DAG_MF_2SIDED
             self.writer.writeDWord(flags)
             for i in range(DAGTEXNUM):
-                attr_name = "tex" + str(i)
-                if hasattr(mat.dagormat.textures, attr_name):
-                    texture_path = getattr(mat.dagormat.textures, attr_name)
-                    if not texture_path:
-                        self.writer.writeUShort(DAGBADMATID)
-                    q = 0
-                    for tex in self.textures:
-                        if texture_path == tex:
-                            self.writer.writeUShort(q)
-                            break
-                        q += 1
+                if DM.is_proxy:
+                        self.writer.writeUShort(DAGBADMATID)  # proxy uses textures from blk, not from dagormat itself
                 else:
-                    self.writer.writeUShort(DAGBADMATID)
+                    attr_name = "tex" + str(i)
+                    if hasattr(mat.dagormat.textures, attr_name):
+                        texture_path = getattr(mat.dagormat.textures, attr_name)
+                        if not texture_path:
+                            self.writer.writeUShort(DAGBADMATID)
+                        q = 0
+                        for tex in self.textures:
+                            if texture_path == tex:
+                                self.writer.writeUShort(q)
+                                break
+                            q += 1
+                    else:
+                        self.writer.writeUShort(DAGBADMATID)
             # _resv
             self.writer.writeUShort(0)
             self.writer.writeUShort(0)
@@ -704,17 +711,17 @@ class DagExporter(Operator, ExportHelper):
 
     def export_dag(self,whole_list,filepath):
         existing_objects = list(ob  for ob  in bpy.data.objects)
-        existing_mats    = list(mat for mat in bpy.data.materials)
-        filename         = basename(filepath)
-        filepath_temp    = bpy.app.tempdir + os.sep + "dag4blend"
-        if not os.path.exists(filepath_temp):
-            os.makedirs(filepath_temp)
-        filepath_temp+=os.sep+filename
-        filepath = bpy.path.ensure_ext(filepath, self.filename_ext)
+        existing_mats = list(mat for mat in bpy.data.materials)
+        filename = ensure_no_path(filepath)
+        dirpath_temp = join(bpy.app.tempdir, "dag4blend")
+        if not exists(dirpath_temp):
+            makedirs(dirpath_temp)
+        filepath_temp = join(dirpath_temp, filename)
+        filepath = ensure_ext(filepath, self.filename_ext)
         log(f'EXPORTING {filepath}\n')
         objs=list(ob for ob in whole_list if ob.parent is None or ob.parent not in whole_list)
-        if objs.__len__()==0:
-            err='No objects to export in '+os.path.basename(filepath)
+        if objs.__len__() == 0:
+            err = 'No objects to export in ' + ensure_no_path(filepath)
             show_popup(message=err,icon='ERROR',title='Error!')
             log(f'{err}\n', type = 'ERROR', show = True)
             return{'CANCELLED'}
@@ -739,14 +746,14 @@ class DagExporter(Operator, ExportHelper):
         dagEndChunkPos = self.writer.beginChunk(DAG_END)
         self.writer.endChunk(dagEndChunkPos)
         self.writer.close()
-        dirpath = os.path.dirname(filepath)
-        if not os.path.exists(dirpath):
-            os.makedirs(dirpath)
+        dirpath = dirname(filepath)
+        if not exists(dirpath):
+            makedirs(dirpath)
         copyfile(filepath_temp,filepath)
         #no need to delete temporary dag, it will be auto-removed with bpy.app.tempdir on blender being closed/crushed
         #cleanup part. Let's remove temporary stuff
-        filename=os.path.basename(filepath)
-        occluders=0
+        filename = ensure_no_path(filepath)
+        occluders = 0
         for obj in bpy.data.objects:
             if obj not in existing_objects:
                 if obj.name.startswith('occluder_box'):
@@ -769,24 +776,24 @@ class DagExporter(Operator, ExportHelper):
             if orphans:
                 for obj in col.objects:
                     if obj.type in SUPPORTED_TYPES:
-                        filepath=os.path.join(dirpath,obj.name+'.dag')
+                        filepath=join(dirpath,obj.name+'.dag')
                         self.export_dag([obj],filepath)
             for child in col.children:
                 self.export_collection(child,dirpath)
         #collection(s) without children, but with objects
         elif col.objects.__len__()>0:
             if "name" in col.keys():
-                col["name"] = col["name"].replace('/','\\')
-                #"\" in the beginning makes blender save file one directory above export path, we don't need that
-                while col["name"].startswith('\\'):
+                col["name"] = col["name"].replace('\\','/')
+                #separator in the beginning makes blender save file one directory above export path, we don't need that
+                while col["name"].startswith('/'):
                     col["name"] = col["name"][1:]
                 subpath = col["name"].replace('*',col.name)
                 if subpath[1]==':':#drive
                     filepath = subpath
                 else:
-                    filepath = os.path.join(dirpath,subpath)
+                    filepath = join(dirpath,subpath)
             else:
-                filepath=os.path.join(dirpath,col.name)
+                filepath=join(dirpath,col.name)
             whole_list=list(ob for ob in col.objects if ob.type in SUPPORTED_TYPES)
             filepath = bpy.path.ensure_ext(filepath,'.dag')
             self.export_dag(whole_list,filepath)
@@ -794,7 +801,7 @@ class DagExporter(Operator, ExportHelper):
     def execute(self, context):
         mode = self.limits
         filepath = self.filepath
-        dirpath=os.path.dirname(filepath)
+        dirpath=dirname(filepath)
         P = bpy.data.scenes[0].dag4blend.exporter
         try:
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -810,7 +817,7 @@ class DagExporter(Operator, ExportHelper):
         elif mode=='Sel.Separated':
             for obj in VL.objects:
                 if obj.select_get() and obj.type in SUPPORTED_TYPES:
-                    filepath=os.path.join(dirpath,obj.name)
+                    filepath=join(dirpath,obj.name)
                     self.export_dag([obj],filepath)
         elif mode=='Col.Separated':
             dag_col=P.collection
@@ -824,7 +831,7 @@ class DagExporter(Operator, ExportHelper):
                 self.export_collection(dag_col,dirpath)
         elif mode =='Col.Joined':
             dag_col=P.collection
-            filepath=os.path.join(self.filepath,dag_col.name)
+            filepath=join(self.filepath,dag_col.name)
             if dag_col==None:
                 show_popup(message="Doesn't work for Scenre Collection",icon='ERROR')
                 return{'CANCELLED'}

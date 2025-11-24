@@ -60,7 +60,7 @@ public:
   char portBuf[128], portBufUDP[128], adrBuf[128];
   char hostName[NI_MAXHOST];
   int family, socketType;
-  char *port, *portUdp, *address;
+  const char *port, *portUdp, *address;
 
   int numSocks, udpSocksStart;
   ADDRINFO hints, *addrInfo, *AI;
@@ -421,7 +421,7 @@ public:
         if (fp)
         {
           const char *p = proc ? proc->getUserFriendlyName() : "=READY=";
-          int len = i_strlen(p) + 1;
+          int len = (int)strlen(p) + 1;
 
           fwrite(p, 1, len, fp);
           fclose(fp);

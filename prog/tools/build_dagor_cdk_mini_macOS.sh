@@ -4,7 +4,7 @@ jam -s Root=../.. -f sceneTools/assetExp/jamfile
 jam -s Root=../.. -f converters/ddsxCvt2/jamfile
 
 # daImpostorBaker
-jam -s Root=../.. -f sceneTools/impostorBaker/jamfile
+jam -s Root=../.. -f sceneTools/impostorBaker/tool/jamfile
 
 # DDSx plugins
 jam -s Root=../.. -f sceneTools/assetExp/ddsxConv/jamfile
@@ -13,6 +13,7 @@ jam -s Root=../.. -s Tegra_exp=yes -f sceneTools/assetExp/ddsxConv/jamfile
 
 # shader compilers
 jam -s Root=../.. -f ShaderCompiler2/jamfile
+jam -s Root=../.. -f ShaderCompiler2/jamfile-stub
 
 # common minimal gui shaders for tools
 pushd sceneTools/guiShaders_commonData

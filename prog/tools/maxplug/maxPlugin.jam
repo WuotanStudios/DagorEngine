@@ -44,7 +44,7 @@ if $(Platform)-$(PlatformArch) = windows-x86_64 {
     case Max2022 : PlatformSpec = vc15 ; WinSdkVer = win.sdk.100 ; VCUpdateVer = 15.9.5 ;   WinSdkUpdateVer = 18362 ; #17134
     case Max2023 : PlatformSpec = vc16 ; WinSdkVer = win.sdk.100 ; VCUpdateVer = 16.11.34 ; WinSdkUpdateVer = 19041 ;
     case Max2024 : PlatformSpec = vc16 ; WinSdkVer = win.sdk.100 ; VCUpdateVer = 16.11.34 ; WinSdkUpdateVer = 19041 ;
-    case Max2025 : PlatformSpec = vc17 ; WinSdkVer = win.sdk.100 ; VCUpdateVer = 17.9.5 ;   WinSdkUpdateVer = 22621 ;
+    case Max2025 : PlatformSpec = vc17 ; WinSdkVer = win.sdk.100 ; VCUpdateVer = 17.14.4 ;  WinSdkUpdateVer = 22621 ;
     case * : exit $(MaxVer) not supported for $(Platform) ;
   }
 } else {
@@ -110,5 +110,5 @@ if $(MaxVer) = Max2011 || $(MaxVer) = Max2012 || $(MaxVer) = Max2014 {
 CPPopt += -FImax_cpt.h ;
 
 if $(MaxVer) in Max2013 Max2014 Max2015 Max2016 Max2017 Max2018 Max2019 Max2020 Max2021 Max2022 Max2023 Max2024 Max2025 {
-  CPPopt +=  /D "_UNICODE" /D "UNICODE" -DNOMINMAX ;
+  CPPopt +=  -D_UNICODE -DUNICODE -DNOMINMAX ;
 }

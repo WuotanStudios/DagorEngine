@@ -1,3 +1,5 @@
+# Asset Viewer
+
 ## Overview
 
 The Asset Viewer is one of the two main tools for working with assets, and in
@@ -278,12 +280,14 @@ simply displaying the axes, it can also be used for quick navigation:
 
 ## Building Assets
 
-To learn more about what *building* entails and why it's necessary, refer to the
-dedicated article about [Resource
-Building](../../resource-building/resource_building.md). In short, the game
-doesn't directly handle files like `.dag` files, textures, etc.; it operates on
-binary files where these resources are compiled. To check your work in-game, you
-need to compile these resources into the binary files.
+The game doesn't directly handle files like `.dag` files, textures, etc.; it
+operates on binary files where these resources are compiled. To check your work
+in-game, you need to *build* these resources into the binary files.
+
+```{seealso}
+To learn more about what *building* entails and why it's necessary, see
+[Building Resources](../../building-resources/building_resources.md).
+```
 
 ### General Considerations
 
@@ -401,7 +405,7 @@ By default, all asset-related errors (loggers) will be output to the console. If
 you need to control these locally, you can add the following block to your
 `application.blk`:
 
-```text
+```blk
 logerr_to_con{
   assetViewer{
     include_re:t=... // only loggers matching this regex will be shown
@@ -412,7 +416,7 @@ logerr_to_con{
 
 **Example:**
 
-```text
+```blk
 logerr_to_con{
   assetViewer{
     exclude_re:t="(warning: node <occluder_box> from)|(Shader 'land_mesh_combined' not found in bin dump)|(has mesh with 0 faces)|(degenerate tri)|(degenerate mesh node)" // loggers matching this regex will be excluded

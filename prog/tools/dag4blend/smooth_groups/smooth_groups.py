@@ -5,8 +5,9 @@ from bpy.app.handlers   import persistent
 from bpy.types          import Operator
 from bpy.props          import IntProperty
 
-from ..helpers.basename         import basename
+from ..ui.draw_elements         import draw_custom_header
 from ..helpers.version          import get_blender_version
+from ..helpers.getters          import get_preferences
 from .mesh_calc_smooth_groups   import *
 
 dic={}
@@ -106,8 +107,7 @@ class DAGOR_OT_SmoothGroupSet(bpy.types.Operator):
     def execute(self, context):
         i=self.index
         pressed=self.pressed
-        addon_name = basename(__package__)
-        pref=context.preferences.addons[addon_name].preferences
+        pref = get_preferences()
         obj=context.edit_object
         bm = dic.setdefault(obj.name, bmesh.from_edit_mesh(obj.data))
         SG = bm.faces.layers.int.get("SG")
@@ -163,8 +163,7 @@ class DAGOR_PT_SmoothGroupPanel(bpy.types.Panel):
         return context.mode == "EDIT_MESH"
 
     def draw(self, context):
-        addon_name = basename(__package__)
-        pref=context.preferences.addons[addon_name].preferences
+        pref = get_preferences()
         obj = context.object
         mesh = obj.data
         bm = dic.setdefault(obj.name, bmesh.from_edit_mesh(mesh))
@@ -202,10 +201,7 @@ class DAGOR_PT_SmoothGroupPanel(bpy.types.Panel):
             all_active=SG_MAX_UINT-1
         #buttons state end
         SG_set=l.box()
-        header = SG_set.row()
-        header.prop(pref, 'sg_set_maximized', text = "Set SG",
-            icon = 'DOWNARROW_HLT'if pref.sg_set_maximized else 'RIGHTARROW_THIN',
-            emboss=False, expand=True)
+        draw_custom_header(SG_set, pref, 'sg_set_maximized')
         if pref.sg_set_maximized:
             SG_set.prop(pref, 'sg_live_refresh', text = "Live Update", toggle = True,
                 icon = 'CHECKBOX_HLT' if pref.sg_live_refresh else 'CHECKBOX_DEHLT')
@@ -226,10 +222,7 @@ class DAGOR_PT_SmoothGroupPanel(bpy.types.Panel):
                     text+=1
                     btn.pressed=all_pressed
         SG_select = l.box()
-        header = SG_select.row()
-        header.prop(pref, 'sg_select_maximized', text = "Select by SG",
-            icon = 'DOWNARROW_HLT'if pref.sg_select_maximized else 'RIGHTARROW_THIN',
-            emboss=False, expand=True)
+        draw_custom_header(SG_select, 'Select by SG', pref, sg_select_maximized)
         if pref.sg_select_maximized:
             SG_select=SG_select.column(align = True)
             SG_select.operator('dt.select_smooth_group',text='0').index = -1

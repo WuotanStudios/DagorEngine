@@ -114,7 +114,7 @@ public:
       return;
     }
 
-    int len = i_strlen(s);
+    int len = (int)strlen(s);
     writeInt(len);
     write(s, len);
     alignOnDword(len);
@@ -141,7 +141,7 @@ public:
       return;
     }
 
-    int len = i_strlen(s);
+    int len = (int)strlen(s);
     if (len > 0xFFFF)
       len = 0xFFFF;
     writeIntP<2>(len);
@@ -158,7 +158,7 @@ public:
   inline void writeIntP(int v)
   {
     G_STATIC_ASSERT(BYTENUM > 0 && BYTENUM <= 4);
-#if defined(_TARGET_CPU_BE)
+#if _TARGET_CPU_BE
     write(((char *)&v) + (4 - BYTENUM), BYTENUM);
 #else
     write(&v, BYTENUM);
@@ -346,7 +346,7 @@ public:
   {
     G_STATIC_ASSERT(BYTENUM > 0 && BYTENUM <= 4);
     int v = 0;
-#if defined(_TARGET_CPU_BE)
+#if _TARGET_CPU_BE
     read(((char *)&v) + (4 - BYTENUM), BYTENUM);
 #else
     read(&v, BYTENUM);

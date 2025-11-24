@@ -6,6 +6,7 @@
 #include <EASTL/vector.h>
 #include <math/integer/dag_IPoint2.h>
 #include <math/integer/dag_IPoint3.h>
+#include <math/integer/dag_IPoint4.h>
 #include <math/dag_Point3.h>
 #include <math/dag_Point4.h>
 #include <math/dag_TMatrix.h>
@@ -46,7 +47,7 @@ public:
     if (idx == -1)
     {
       fastMap.insert(name, LambdaStrcmp(), 32);
-      int len = i_strlen(name);
+      int len = (int)strlen(name);
       totalSz += len + encode_len_sz(len);
     }
   }
@@ -71,7 +72,7 @@ public:
     for (int i = 0; i < fastMap.size(); i++)
     {
       char buf[4];
-      int len = i_strlen(fastMap[i]);
+      int len = (int)strlen(fastMap[i]);
       int sz_len = encode_len(len, buf);
       cwr.write(buf, sz_len);
       cwr.write(fastMap[i], len);
@@ -127,6 +128,7 @@ static void dblk::save(const ExposedDataBlock &blk, IGenSave &cb, dblk::StringVa
       case DataBlock::TYPE_REAL:
       case DataBlock::TYPE_POINT3:
       case DataBlock::TYPE_IPOINT3:
+      case DataBlock::TYPE_IPOINT4:
       case DataBlock::TYPE_POINT2:
       case DataBlock::TYPE_IPOINT2:
       case DataBlock::TYPE_POINT4:

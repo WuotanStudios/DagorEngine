@@ -1,7 +1,9 @@
 import bpy
 import os
 import re
-import glob
+from fnmatch    import fnmatch
+from os.path    import exists, dirname, basename, isfile, join, abspath
+from os         import listdir
 from math                           import pi
 from mathutils                      import Vector
 from bpy.types                      import Operator
@@ -18,15 +20,16 @@ from ..nodeMaterial                 import MaterialExp
 from ..face                         import FaceExp
 from ..mesh                         import MeshExp
 from ..material                     import Material
-from ..dagormat.build_node_tree     import buildMaterial
+from ..dagormat.build_node_tree     import build_dagormat_node_tree
+from ..dagormat.rw_dagormat_text    import dagormat_to_string
 from ..dagormat.compare_dagormats   import compare_dagormats
 from ..object_properties            import object_properties
-from ..helpers.props                import fix_type
+from ..helpers.props                import fix_type, dagormat_prop_add
 from ..helpers.texts                import log
-from ..helpers.basename             import basename
-from ..helpers.popup                import show_popup
+from ..popup.popup_functions        import show_popup
 from ..helpers.version              import get_blender_version
-from ..smooth_groups.smooth_groups  import uint_to_int,int_to_uint,sg_to_sharp_edges
+from ..helpers.getters              import get_preferences
+from ..smooth_groups.smooth_groups  import uint_to_int, int_to_uint, sg_to_sharp_edges
 from ..tools.tools_panel            import fix_mat_slots, optimize_mat_slots
 
 FACENO = 0
@@ -38,7 +41,7 @@ BEENTHERE = 2
 
 #returns possible asset type based on name
 def guess_dag_type(name):
-    pref = bpy.context.preferences.addons[basename(__package__)].preferences
+    pref = get_preferences()
     if name.endswith('_destr.lod00'):
         return 'dynmodel'
     if name[:-2].endswith('.lod'):
@@ -89,8 +92,8 @@ def get_dag_col(name,replace_existing):
             keys = c.keys()
             if 'name' in keys:
                 name_parts = c['name']
-                name_parts = name_parts.replace('\\','//')
-                name_parts = name_parts.split('//')
+                name_parts = name_parts.replace('\\','/')
+                name_parts = name_parts.split('/')
                 if name_parts[-1] in [name, f'{name}.dag']:
                     if 'type' in keys and c['type'] == type:
                         col = c
@@ -157,49 +160,92 @@ class Curve:
 class DagImporter(Operator, ImportHelper):
     bl_idname = "import_scene.dag"
     bl_label = "Import DAG"
-    bl_options = {'PRESET','REGISTER', 'UNDO'}
+    bl_options = {'PRESET', 'UNDO'}
 
     filename_ext = ".dag"
 
-    filter_glob: StringProperty(default="*.dag", options={'HIDDEN'})
+    filter_glob: StringProperty(
+        default="*.dag",
+        options={'HIDDEN'})
 
-#extra dags to import
+# Batch import related
+    includes_re: StringProperty(
+        name = "Regular Expression",
+        description = "RE for search in import forler",
+        default = "",
+        options = {'HIDDEN'})
+
+    excludes_re: StringProperty(
+        name = "Regular Expression",
+        description = "RE for skip in import forler",
+        default = "",
+        options = {'HIDDEN'})
+
+    dirpath: StringProperty(
+        name = "Dirpath",
+        description = "Directory that contains dag files to import",
+        default = "",
+        subtype = 'DIR_PATH',
+        options = {'HIDDEN'})
+
+    check_subdirs: BoolProperty(
+        name = "Include subdirs",
+        description = "Search in subdirectories as well",
+        default = False,
+        options = {'HIDDEN'})
+
+    includes: StringProperty(
+        default = "",
+        options = {'HIDDEN'})
+
+    excludes: StringProperty(
+        default = "",
+        options = {'HIDDEN'})
+
     with_lods: BoolProperty(
-            name="Import LODs",
-            description="Import all LODs",
-            default=False)
+            name = "Import LODs",
+            description = "Search for other levels of detail",
+            default = False)
 
     with_dps: BoolProperty(
-        name="Import dps",
-        description="Import all dps",
-        default=False)
+        name = "Import dps",
+        description = "Search for related Damage Parts",
+        default = False)
 
     with_dmgs: BoolProperty(
-        name="Import dmgs",
-        description="Import all dmgs",
-        default=False)
+        name = "Import dmgs",
+        description = "Search for Damaged versions",
+        default = False)
 
-#Optimozation
+    with_destr: BoolProperty(
+        name = "Import destr",
+        description = "Search for dynamic destr asset",
+        default = False)
+
+#Optimization
     mopt: BoolProperty(
         name="Optimize material slots",
         description="Remove unused materials",
         default=True)
-
+#hidden from UI, because not implemented yet----------------------------------------------------------------------------
     fix_mat_ids: BoolProperty(
         name = "Fix material indices",
         description = "update each material index, if it's higher than amount of material_slots",
-        default = True)
+        default = True,
+        options = {'HIDDEN'})
 
     remove_degenerates: BoolProperty(
         name = "Remove degenerates",
         description = "Remove triangles with area = 0",
-        default = True)
+        default = True,
+        options = {'HIDDEN'})
 
     remove_loose: BoolProperty(
         name = "Remove loose geometry",
         description = "Remove vertices, that not connected to any face",
-        default = True)
-
+        default = True,
+        options = {'HIDDEN'})
+#-----------------------------------------------------------------------------------------------------------------------
 #Other
     replace_existing: BoolProperty(
         name = 'Replace existing',
@@ -223,6 +269,23 @@ class DagImporter(Operator, ImportHelper):
 
     textures = []
     materials = []
+
+    @classmethod
+    def poll(self, context):
+        pref = get_preferences()
+        if pref.projects.__len__() == 0:
+            return False
+        project = pref.projects[int(pref.project_active)]
+        if not exists(project.path):
+            return False
+        return True
+
+    @classmethod
+    def description(cls, context, properties):
+        pref = get_preferences()
+        if pref.projects.__len__() == 0:
+            return "No active project found. Please, configure at least one project"
+        return "Import DAG file(s)"
 
     @staticmethod
     def findNeighbors(faces):
@@ -345,12 +408,11 @@ class DagImporter(Operator, ImportHelper):
             for index in indices:
                 poly.append(node.mesh.color_attributes_poly[index])
             vcol_lay = me.color_attributes.new(name = "",domain = "CORNER", type = "FLOAT_COLOR")
-            
             col = []
             for index in poly:
                 col.extend(node.mesh.color_attributes[index])
                 col.append(1.0)
-            vcol_lay.data.foreach_set("color", tuple(col))
+            vcol_lay.data.foreach_set("color_srgb", tuple(col))
 
         me.validate()
         me.update()
@@ -383,15 +445,15 @@ class DagImporter(Operator, ImportHelper):
             me.use_auto_smooth = True
             me.auto_smooth_angle = pi
         else:
-            with bpy.context.temp_override(object = o):
-                bpy.ops.object.shade_smooth(keep_sharp_edges=True)
+            values = [True]*o.data.polygons.__len__()
+            o.data.polygons.foreach_set('use_smooth', values)
         self.collection.objects.link(o)
         if parent is not None:
             o.parent = parent
         o.matrix_world = tm
 
         self.buildObjProperties(o, node.objProps)
-        if o.dagorprops.get('broken_properties') is not None:
+        if o.dagorprops.get('broken_properties:t') is not None:
             msg =f'{o.name} has incorrect object properties\n'
             log(msg,type = 'WARNING', show = True)
         tm.transpose()
@@ -419,10 +481,7 @@ class DagImporter(Operator, ImportHelper):
                 msg = f'{o.name} materials does not contain "apex_interior_material:t"="{apex_mat}"\n'
                 log(msg, type = 'WARNING')
 #fixing mat_ids:
-        was_broken=fix_mat_slots(o)
-        if was_broken:
-            msg = f'{o.name} had incorrect material indices, fixed\n'
-            log(msg,type = 'WARNING')
+        fix_mat_slots(o)
         if self.mopt:
             before=o.material_slots.__len__()
             optimize_mat_slots(o)
@@ -458,20 +517,20 @@ class DagImporter(Operator, ImportHelper):
                 else:
                     dagorprops[prop[0]]=fix_type(prop[1])
         if broken.__len__()>0:
-            dagorprops['broken_properties']=broken
+            dagorprops['broken_properties:t']=broken
         return
 
     def DM_set_params(_self, script):
         params = []
         type_value = script.split('\n')
         for el in type_value:
-            if el == '':
+            if el.find("=") == -1:
                 continue
             pair = el.split('=')
-            params.append([pair[0],fix_type(pair[1])])
+            params.append([pair[0], pair[1]])
         return params
 
-    def buildMaterials(self):
+    def build_dagormat_node_trees(self):
         for m in self.materials:
             og_mat = bpy.data.materials.get(m.name)
             if og_mat is not None:
@@ -497,12 +556,13 @@ class DagImporter(Operator, ImportHelper):
             if not m.mat.dagormat.is_proxy:
                 if (m.flags & DAG_MF_2SIDED) == DAG_MF_2SIDED:
                     m.mat.dagormat.sides = 1
-                for i in range(DAGTEXNUM):
+                tex_amount = DAGTEXNUM if (m.flags & DAG_MF_16TEX) else 8
+                for i in range(tex_amount):
                     tex='tex'+str(i)
                     if m.tex[i] != DAGBADMATID:
-                        attr_name='tex'+str(i)
-                        if hasattr(m.mat.dagormat.textures, attr_name):
-                            setattr(m.mat.dagormat.textures, tex, self.textures[m.tex[i]])
+                        setattr(m.mat.dagormat.textures, tex, self.textures[m.tex[i]])
+                    else:
+                        setattr(m.mat.dagormat.textures, tex, "")
                 blk = datablock.DataBlock()
                 try:
                     m.script = m.script.replace("(", "")
@@ -512,12 +572,12 @@ class DagImporter(Operator, ImportHelper):
                     params = self.DM_set_params(m.script)
                     for param in params:
                         if param[0] == "real_two_sided":
-                            if param[1]=='yes' or param[1]==1:
+                            if param[1].lower() in ['1', 'yes', 'true']:
                                 m.mat.dagormat.sides = 2
                             continue
                         else:
                             try:
-                                m.mat.dagormat.optional[param[0]] = param[1]
+                                dagormat_prop_add(m.mat.dagormat, param[0], param[1])
                             except:
                                 msg = f'\nsomething wrong happened on reading "{m.mat.name}" parameters!\n'
                                 log(msg,type = 'ERROR')
@@ -529,17 +589,19 @@ class DagImporter(Operator, ImportHelper):
 #merging_mats
             for mat in bpy.data.materials:
                 is_unic=True
-                if mat!=m.mat:
-                    if compare_dagormats(m.mat,mat):
-                        just_imported=m.mat
-                        m.mat=mat
-                        if m.mat.name.startswith(just_imported.name):
-                            m.mat.name=just_imported.name
-                        bpy.data.materials.remove(just_imported)
-                        is_unic=False
-                        break
+                if mat == m.mat:
+                    continue
+                if compare_dagormats(m.mat,mat):
+                    log(f'"{m.mat.name}" remapped to "{mat.name}"\n')
+                    just_imported = m.mat
+                    m.mat=mat
+                    if m.mat.name.startswith(just_imported.name):
+                        m.mat.name=just_imported.name
+                    bpy.data.materials.remove(just_imported)
+                    is_unic=False
+                    break
             if is_unic:
-                buildMaterial(m.mat)
+                build_dagormat_node_tree(m.mat)
         return
 
     def buildCurves(self, node, tm, parent):
@@ -915,9 +977,9 @@ class DagImporter(Operator, ImportHelper):
                 self.reader.endChunk(chunk.size)
             chunk = self.reader.beginChunk()
         self.reader.close()
-        self.buildMaterials()
+        self.build_dagormat_node_trees()
 #searching for existing collection
-        col_name = os.path.basename(filepath).replace('.dag','')
+        col_name = basename(filepath).replace('.dag','')
         self.collection = get_dag_col(col_name,self.replace_existing)
         if self.preserve_path:
             self.collection["name"] = filepath.replace('.dag','')
@@ -932,49 +994,118 @@ class DagImporter(Operator, ImportHelper):
             self.buildEmpty(node, node.tm, None)
         return
 
-    def loadVariations(self, filepath):
-        res = re.findall("_dmg", filepath)
-        dmgs = ("", "_dmg") if self.with_dmgs else (res[0] if len(res) else "",)
-        for dmg in dmgs:
-            filepath2 = os.path.basename(filepath)
-            if self.with_lods is False and self.with_dps is False:
-                if re.search("[.]lod[0-9][0-9]", filepath2) is not None:
-                    filepath2 = re.sub("_dmg[.]lod", ".lod", filepath2)
-                    filepath2 = re.sub("[.]lod", dmg + ".lod", filepath2)
-                else:
-                    filepath2 = re.sub("_dmg[.]dag$", ".dag", filepath2)
-                    filepath2 = re.sub("[.]dag$", dmg + ".dag", filepath2)
-                paths = glob.glob(os.path.join(os.path.dirname(filepath), filepath2))
-                for path in paths:
-                    self.load(path)
-                continue
-            filepath2 = filepath2.replace(".dag", "")
-            lod = ""
-            dp = ""
-            if self.with_lods:
-                lod = ".lod??"
-            else:
-                res = re.findall("[.]lod[0-9][0-9]", filepath2)
-                lod = res[0] if len(res) else ""
-            filepath2 = re.sub("_dmg[.]lod[0-9][0-9]", "", filepath2)
-            filepath2 = re.sub("[.]lod[0-9][0-9]", "", filepath2)
-
-            if self.with_dps:
-                dp = "_dp_??"
-            else:
-                res = re.findall("_dp_[0-9][0-9]", filepath2)
-                dp = res[0] if len(res) else ""
-
-            filepath2 = re.sub("_dp_[0-9][0-9]_dmg", "", filepath2)
-            filepath2 = re.sub("_dp_[0-9][0-9]", "", filepath2)
-
-            if self.with_lods or lod != "":
-                for path in glob.glob(os.path.join(os.path.dirname(filepath), filepath2) + dmg + lod + ".dag"):
-                    self.load(path)
-            if self.with_dps or dp != "":
-                for path in glob.glob(os.path.join(os.path.dirname(filepath), filepath2) + dp + dmg + lod + ".dag"):
-                    self.load(path)
-        return
+    def filename_to_regex(self):
+        filename = basename(self.filepath)
+        dp =    self.with_dps
+        lods =  self.with_lods
+        dmg =   self.with_dmgs
+        destr = self.with_destr
+        lod_info = re.search("\\.lod\\d\\d\\.dag$", filename)  # '\d' == '[0-9]'
+        if lod_info is None:  # can not find variantions for non-standard names
+            return f"^{filename}$"
+        split_index = lod_info.span()[0]
+        base_name = filename[:split_index]
+        base_lod = filename[split_index+1:-4]  # no dots or extension needed
+        dp_re = "(_dp_\\d\\d|)" if dp else "()"
+        dmg_re = "(_dmg|)" if dmg else "()"
+        lods_re = "\\.lod\\d\\d" if lods else f"\\.{base_lod}"
+        variants_re = f"^{base_name}{dp_re}{dmg_re}{lods_re}\\.dag$"
+        if not destr:
+            return variants_re
+        destr_re = f"^{base_name}{dp_re}{dmg_re}_destr\\.lod00\\.dag$"  # destr is always ".lod00"
+        combined_re = f"({variants_re}|{destr_re})"
+        return combined_re
+#base mode
+    def file_to_filepaths(self):
+        filepath = abspath(self.filepath)
+        filepaths = [filepath]
+        regex = self.filename_to_regex()
+        regex = re.compile(regex)
+        dirpath = dirname(filepath)
+        if self.check_subdirs:
+            print("checking subdirs")
+            for subdir, dirs, files in os.walk(dirpath):
+                for file in files:
+                    filepath = join(subdir, file)
+                    if re.search(regex, file):
+                        filepaths.append(filepath)
+        else:
+            filenames = [file for file in listdir(dirpath) if isfile(join(dirpath,file))]
+            original_filename = basename(self.filepath)
+            for filename in filenames:
+                if filename == original_filename:
+                    continue
+                if re.search(regex, filename):
+                    filepaths.append(join(dirpath, filename))
+        return list(set(filepaths))
+#advanced mode (wildcard search)
+    def includes_to_filepaths(self):
+        filepaths = []
+        includes = self.includes.split(';')
+        excludes = self.excludes.split(';')
+        if self.check_subdirs:
+            for subdir, dirs, files in os.walk(self.dirpath):
+                for file in files:
+                    has_match = False
+                    for include in includes:
+                        if include == "":
+                            continue
+                        if fnmatch(file, include) or fnmatch(file[:-4], include):
+                            has_match = True
+                            break
+                    if not has_match:
+                        continue
+                    for exclude in excludes:
+                        if exclude == "":
+                            continue
+                        if fnmatch(file, exclude) or fnmatch(file[:-4], exclude):
+                            has_match = False
+                            break
+                    if has_match:
+                        filepaths.append(join(subdir, file))
+        else:
+            files = [file for file in listdir(self.dirpath) if isfile(join(self.dirpath,file))]
+            for file in files:
+                has_match = False
+                for include in includes:
+                    if include == "":
+                        continue
+                    if fnmatch(file, include):
+                        has_match = True
+                        break
+                if not has_match:
+                    continue
+                for exclude in excludes:
+                    if exclude == "":
+                        continue
+                    if fnmatch(file, exclude):
+                        has_match = False
+                        break
+                if has_match:
+                    filepaths.append(join(self.dirpath, file))
+        return filepaths
+#expert mode (regex search)
+    def regex_to_filepaths(self):
+        regex_include = re.compile(self.includes_re)
+        regex_exclude = re.compile(self.excludes_re)
+        filepaths = []
+        if self.check_subdirs:
+            for subdir, dirs, files in os.walk(self.dirpath):
+                for file in files:
+                    name = file.lower()
+                    if not name.endswith('.dag'):
+                        continue
+                    if re.search(regex_include, file) and not re.search(regex_exclude, file):
+                        filepaths.append(join(subdir, file))
+        else:
+            files = [file for file in listdir(self.dirpath) if isfile(join(self.dirpath,file))]
+            for file in files:
+                name = file.lower()
+                if not name.endswith('.dag'):
+                    continue
+                if re.search(regex_include, file) and not re.search(regex_exclude, file):
+                    filepaths.append(join(self.dirpath, file))
+        return filepaths
 
     def execute(self, context):
         if bpy.context.mode != 'OBJECT':
@@ -983,20 +1114,17 @@ class DagImporter(Operator, ImportHelper):
             except Exception:
                 pass
         bpy.ops.dt.init_blend()
-        filepath = '{:s}'.format(self.filepath)
-        msg = f'IMPORTING {filepath}\n'
-        pref = context.preferences.addons[basename(__package__)].preferences
-        if not pref.project_active:
-            show_popup(message='Please configure at least one project in addon preferences',
-                title='ERROR!', icon='ERROR')
-            return {'CANCELLED'}
-        log(msg)#isn't necessary in the info panel
-        if self.with_dmgs is False and self.with_dps is False and self.with_lods is False:
-            self.load(filepath)
+        if self.filepath != "":
+            filepaths = self.file_to_filepaths()
+        elif self.includes_re != "" and self.dirpath != "":
+            filepaths = self.regex_to_filepaths()
+        elif self.includes != "":
+            filepaths = self.includes_to_filepaths()
         else:
-            self.loadVariations(filepath)
-        msg = f'Import of {filepath} is FINISHED\n'
-        log(msg, show = True)
+            filepaths = []  # placeholer, will be replaced by error message for unknown import mode
+            log('Which mode we are in???', type = 'ERROR', show = True)
+        for filepath in filepaths:
+            self.load(filepath)
         context.window.scene = bpy.data.scenes['GEOMETRY']
         return {'FINISHED'}
 

@@ -7,13 +7,13 @@ include $(Root)/prog/platform.jam ;
 # temporary substitute for legacy Platform names
 switch $(Platform) {
   case macosx :
-    Platform = macOS ; echo replaced macosx with Platform=$(Platform) ;
+    Platform = macOS ; echo warning: replaced macosx with Platform=$(Platform) ;
   case linux64 :
-    Platform = linux ; echo replaced linux64 with Platform=$(Platform) ;
+    Platform = linux ; echo warning: replaced linux64 with Platform=$(Platform) ;
   case win32 :
-    Platform = windows ; PlatformArch = x86 ; echo replaced win32 with Platform=$(Platform) PlatformArch=$(PlatformArch) ;
+    Platform = windows ; PlatformArch = x86 ; echo warning: replaced win32 with Platform=$(Platform) PlatformArch=$(PlatformArch) ;
   case win64 :
-    Platform = windows ; PlatformArch = x86_64 ; echo replaced win64 with Platform=$(Platform) PlatformArch=$(PlatformArch) ;
+    Platform = windows ; PlatformArch = x86_64 ; echo warning: replaced win64 with Platform=$(Platform) PlatformArch=$(PlatformArch) ;
 }
 
 switch $(OS) {
@@ -21,6 +21,20 @@ switch $(OS) {
   case MACOSX : Platform  ?= macOS ;
   case LINUX  : Platform  ?= linux ;
 }
+if $(OS) = NT {
+  if (64-bit) in $(PROCESSOR_IDENTIFIER) {
+    switch $(PROCESSOR_IDENTIFIER) {
+      case ARMv* : WindowsHostArch = arm64 ; PlatformArch_windows ?= arm64 ;
+    }
+  }
+  switch $(PROCESSOR_ARCHITECTURE) {
+    case x86   : WindowsHostArch ?= x86 ;
+    case AMD64 : WindowsHostArch ?= x86_64 ;
+    case ARM64 : WindowsHostArch = arm64  ; PlatformArch_windows ?= arm64 ;
+  }
+  WindowsHostArch ?= x86_64 ;
+}
+
 PlatformArch_windows ?= x86 ;
 PlatformArch_linux ?= x86_64 ;
 PlatformArch_macOS ?= x86_64 ;

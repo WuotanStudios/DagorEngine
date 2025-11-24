@@ -7,6 +7,11 @@ PlatformArch_windows = x86_64 ;
 PlatformSpec_windows = clang ;
 include $(Root)/prog/_jBuild/defPlatform.jam ;
 
+if $(Platform) = windows {
+  PlatformArch = $(WindowsHostArch) ;
+  if $(PlatformArch) = arm64 { PlatformSpec = vc17 ; } # clang 18.1.8 crashes (ICE) on compiling legacy_parser/whale/whale.cpp
+}
+
 Config         = rel ;
 StrictCompile  = no ;
 FullOOPEnabled = yes ;
@@ -26,7 +31,7 @@ AddIncludes =
 local AllSources = [ GLOB $(Root)/$(Location) : *.cpp ] ;
 Sources = $(AllSources:D=) ;
 
-CPPopt += -D__B_NO_MEM_BASE_INCLUDE=1 ;
+CPPopt += -D__B_NO_MEM_BASE_INCLUDE ;
 if $(Platform) in linux macOS { CPPopt += -funsigned-char ; }
 
 if $(PlatformSpec) = clang {

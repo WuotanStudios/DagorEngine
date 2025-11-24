@@ -1,4 +1,5 @@
 @echo off
+if not "%1" == "" set PlatformArch=%1
 
 rem DaEditorX
 jam -s Root=../.. -f sceneTools/daEditorX/jamfile-editor
@@ -19,7 +20,7 @@ jam -s Root=../.. -f sceneTools/findUnusedTex/jamfile
   if errorlevel 1 goto error
 
 rem daImpostorBaker
-jam -s Root=../.. -f sceneTools/impostorBaker/jamfile
+jam -s Root=../.. -f sceneTools/impostorBaker/tool/jamfile
   if errorlevel 1 goto error
 
 rem DDSx plugins
@@ -42,6 +43,8 @@ jam -s Root=../.. -f shaderCompiler2/jamfile-hlsl2spirv
 jam -s Root=../.. -f shaderCompiler2/jamfile-hlsl2metal
   if errorlevel 1 goto error
 jam -s Root=../.. -f shaderCompiler2/jamfile-dx12
+  if errorlevel 1 goto error
+jam -s Root=../.. -f shaderCompiler2/jamfile-stub
   if errorlevel 1 goto error
 jam -s Root=../.. -f shaderCompiler2/hlslCompiler/jamfile
   if errorlevel 1 goto error
@@ -97,16 +100,12 @@ popd
 
 rem 3ds Max plugins, we don't care if these plugins fail to compile (this could happen due to missing SDK or compiler)
 jam -s Root=../.. -s MaxVer=Max2025 -f maxplug/jamfile
-jam -s Root=../.. -s MaxVer=Max2025 -f maxplug/jamfile-imp
 
 jam -s Root=../.. -s MaxVer=Max2024 -f maxplug/jamfile
-jam -s Root=../.. -s MaxVer=Max2024 -f maxplug/jamfile-imp
 
 jam -s Root=../.. -s MaxVer=Max2023 -f maxplug/jamfile
-jam -s Root=../.. -s MaxVer=Max2023 -f maxplug/jamfile-imp
 
 jam -s Root=../.. -s MaxVer=Max2022 -f maxplug/jamfile
-jam -s Root=../.. -s MaxVer=Max2022 -f maxplug/jamfile-imp
 if errorlevel 1 goto EOF
 
 goto EOF

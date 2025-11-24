@@ -11,6 +11,9 @@
 #include <ctype.h>
 #include <stdlib.h>
 
+#if _TARGET_PC_LINUX || _TARGET_PC_MACOSX
+#include <unistd.h>
+#endif
 
 //==============================================================================
 bool is_full_path(const char *path)
@@ -18,11 +21,16 @@ bool is_full_path(const char *path)
   if (!path || !*path)
     return false;
 
+#if _TARGET_PC_WIN
   if (isalpha(*path) && path[1] == ':')
     return true;
 
   if (*path == '\\' && path[1] == '\\')
     return true;
+#else
+  if (*path == '/')
+    return true;
+#endif
 
   return false;
 }
@@ -35,7 +43,7 @@ void split_path(const char *path, String &location, String &filename)
     path = "";
 
   int i;
-  for (i = i_strlen(path) - 1; i >= 0; --i)
+  for (i = (int)strlen(path) - 1; i >= 0; --i)
     if (path[i] == '/' || path[i] == '\\' || path[i] == ':')
       break;
 
@@ -58,7 +66,7 @@ bool find_in_base(const char *path, const char *base, String &new_path)
   if (!path || !*path || !base || !*base)
     return false;
 
-  const int pathLen = i_strlen(path) - 1;
+  const int pathLen = (int)strlen(path) - 1;
 
   for (int i = pathLen; i >= 0; --i)
   {
@@ -238,6 +246,54 @@ String make_full_path(const char *dir, const char *fname)
   return ::make_good_path(String(1024, mask, dir, fname));
 }
 
+//==============================================================================
+String make_path_absolute(const char *path)
+{
+#if _TARGET_PC_WIN
+  char buffer[DAGOR_MAX_PATH + 1];
+  if (_fullpath(buffer, path, sizeof(buffer)))
+    return String(buffer);
+#elif _TARGET_PC_LINUX || _TARGET_PC_MACOSX
+  if (is_full_path(path))
+    return String(path);
+
+  // realpath() does not work if path does not exist.
+  char buffer[DAGOR_MAX_PATH + 1];
+  *buffer = 0;
+  if (getcwd(buffer, sizeof(buffer)))
+    return make_full_path(buffer, path);
+#else
+  G_ASSERTF(false, "make_path_absolute is not implemented for this platform");
+  return String(path); // not implemented for other platforms
+#endif
+
+  return String();
+}
+
+#if _TARGET_PC_LINUX
+//==============================================================================
+String make_path_relative(const char *path, const char *base)
+{
+  if (!base || !*base || !path || !*path)
+    return String(path);
+
+  String pathStr(path);
+  String baseStr(base);
+  if (pathStr.length() > baseStr.length())
+  {
+    make_slashes(pathStr);
+    make_slashes(baseStr);
+    append_slash(baseStr);
+    if (strncmp(baseStr, pathStr, baseStr.length()) == 0)
+    {
+      const char *start = pathStr.c_str() + baseStr.length();
+      return make_good_path(*start == '/' ? &start[1] : start);
+    }
+  }
+
+  return ::make_good_path(path);
+}
+#endif
 
 //==============================================================================
 void location_from_path(String &full_path)
@@ -288,8 +344,8 @@ String bytes_to_mb(uint64_t bytes) { return String(32, "%.2f Mb", bytes / (1024.
 //==============================================================================
 bool trail_strcmp(const char *str, const char *trail_str)
 {
-  int s_len = i_strlen(str);
-  int t_len = i_strlen(trail_str);
+  int s_len = (int)strlen(str);
+  int t_len = (int)strlen(trail_str);
   if (s_len < t_len)
     return false;
   return strcmp(str + (s_len - t_len), trail_str) == 0;
@@ -299,8 +355,8 @@ bool trail_strcmp(const char *str, const char *trail_str)
 //==============================================================================
 bool trail_stricmp(const char *str, const char *trail_str)
 {
-  int s_len = i_strlen(str);
-  int t_len = i_strlen(trail_str);
+  int s_len = (int)strlen(str);
+  int t_len = (int)strlen(trail_str);
   if (s_len < t_len)
     return false;
   return stricmp(str + (s_len - t_len), trail_str) == 0;
@@ -310,8 +366,8 @@ bool trail_stricmp(const char *str, const char *trail_str)
 //==============================================================================
 void remove_trailing_string(String &target, const char *trail_str)
 {
-  int s_len = i_strlen(target);
-  int t_len = i_strlen(trail_str);
+  int s_len = (int)strlen(target);
+  int t_len = (int)strlen(trail_str);
   if (s_len < t_len || stricmp(target.c_str() + (s_len - t_len), trail_str) != 0)
     return;
   erase_items(target, s_len - t_len, t_len);

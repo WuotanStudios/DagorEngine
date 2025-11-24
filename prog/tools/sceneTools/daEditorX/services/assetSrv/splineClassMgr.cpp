@@ -16,21 +16,23 @@
 #include <debug/dag_debug.h>
 #include <EASTL/vector_set.h>
 
+extern const char *daeditor3_get_appblk_fname();
+
 class StubSpacerObjEntity : public IObjEntity
 {
 public:
   StubSpacerObjEntity() : IObjEntity(1000000) {}
 
-  virtual void setTm(const TMatrix &) {}
-  virtual void getTm(TMatrix &tm) const { tm.identity(); }
-  virtual void destroy() {}
+  void setTm(const TMatrix &) override {}
+  void getTm(TMatrix &tm) const override { tm.identity(); }
+  void destroy() override {}
 
-  virtual void *queryInterfacePtr(unsigned /*huid*/) { return nullptr; }
-  virtual BSphere3 getBsph() const { return BSphere3(Point3(0, 1e6, 0), 1); }
-  virtual BBox3 getBbox() const { return BBox3(Point3(0, 1e6, 0), Point3(0, 1e6, 0)); }
+  void *queryInterfacePtr(unsigned /*huid*/) override { return nullptr; }
+  BSphere3 getBsph() const override { return BSphere3(Point3(0, 1e6, 0), 1); }
+  BBox3 getBbox() const override { return BBox3(Point3(0, 1e6, 0), Point3(0, 1e6, 0)); }
 
   inline int getAssetTypeId() const { return entityClass; }
-  virtual const char *getObjAssetName() const { return " "; }
+  const char *getObjAssetName() const override { return " "; }
 };
 static StubSpacerObjEntity stubEntity;
 
@@ -250,6 +252,8 @@ bool SharedSplineClassAssetData::loadAsset(const DataBlock &blk)
 
 bool SharedSplineClassAssetData::loadRoadData(splineclass::RoadData &road, const DataBlock &blk)
 {
+  if (!inited)
+    init();
 #define LOAD_MAT(name)       road.mat.name = blk.getStr(#name, #name)
 #define LOAD_FLG(name)       road.name = blk.getBool(#name, false)
 #define LOAD_FLG2(name, def) road.name = blk.getBool(#name, def)
@@ -299,6 +303,11 @@ bool SharedSplineClassAssetData::loadRoadData(splineclass::RoadData &road, const
   road.wallSlope = blk.getReal("wallScale", 0.8);
   road.curvatureStrength = blk.getReal("curvatureStrength", 15.0);
   road.minStep = blk.getReal("minStep", 3.0);
+  if (road.minStep < splineMinStep)
+  {
+    DAEDITOR3.conError("minStep %.1f < %.1f in road asset <%s>, forced minimal value", road.minStep, splineMinStep, loadingAssetFname);
+    road.minStep = splineMinStep;
+  }
   road.maxStep = blk.getReal("maxStep", 25.0);
 
   road.leftWallHeight = blk.getReal("leftWallHeight", -10.0);
@@ -507,7 +516,7 @@ bool SharedSplineClassAssetData::loadGenEntities(splineclass::GenEntities &gen, 
       const char *pattern = gen_b.getStr("genTagSeq", NULL);
       if (pattern && *pattern)
       {
-        clear_and_resize(sgeg.genTagSeq, i_strlen(pattern));
+        clear_and_resize(sgeg.genTagSeq, (int)strlen(pattern));
         for (int i = 0; i < sgeg.genTagSeq.size(); i++)
         {
           if (tag_to_id[pattern[i]] == -1)
@@ -520,7 +529,7 @@ bool SharedSplineClassAssetData::loadGenEntities(splineclass::GenEntities &gen, 
       }
       if (const char *tags = gen_b.getStr("genTagFirst", NULL))
       {
-        clear_and_resize(sgeg.genTagFirst, i_strlen(tags));
+        clear_and_resize(sgeg.genTagFirst, (int)strlen(tags));
         for (int i = 0; i < sgeg.genTagFirst.size(); i++)
         {
           if (tag_to_id[tags[i]] == -1)
@@ -533,7 +542,7 @@ bool SharedSplineClassAssetData::loadGenEntities(splineclass::GenEntities &gen, 
       }
       if (const char *tags = gen_b.getStr("genTagLast", NULL))
       {
-        clear_and_resize(sgeg.genTagLast, i_strlen(tags));
+        clear_and_resize(sgeg.genTagLast, (int)strlen(tags));
         for (int i = 0; i < sgeg.genTagLast.size(); i++)
         {
           if (tag_to_id[tags[i]] == -1)
@@ -678,6 +687,8 @@ bool SharedSplineClassAssetData::loadGenEntities(splineclass::GenEntities &gen, 
 
 bool SharedSplineClassAssetData::loadLoftGeomData(splineclass::LoftGeomGenData &genGeom, const DataBlock &blk)
 {
+  if (!inited)
+    init();
   int loftNid = blk.getNameId("loft");
   int pointNid = blk.getNameId("pt");
   int groupNid = blk.getNameId("group");
@@ -720,6 +731,12 @@ bool SharedSplineClassAssetData::loadLoftGeomData(splineclass::LoftGeomGenData &
       loft.offset = b_loft.getPoint2("offset", Point2(0, 0));
 
       loft.minStep = b_loft.getReal("minStep", 3.f);
+      if (loft.minStep < splineMinStep)
+      {
+        DAEDITOR3.conError("minStep %.1f < %.1f in loft asset <%s>, forced minimal value", loft.minStep, splineMinStep,
+          loadingAssetFname);
+        loft.minStep = splineMinStep;
+      }
       loft.maxStep = b_loft.getReal("maxStep", 25.f);
       loft.curvatureStrength = b_loft.getReal("curvatureStrength", 15.f);
       loft.marginAtStart = b_loft.getReal("marginAtStart", 0.f);
@@ -934,4 +951,14 @@ bool SharedSplineClassAssetData::loadLoftGeomData(splineclass::LoftGeomGenData &
   return true;
 }
 
+void SharedSplineClassAssetData::init()
+{
+  DataBlock appBlk(daeditor3_get_appblk_fname());
+  splineMinStep = appBlk.getBlockByNameEx("assets")->getReal("splineMinStep", splineMinStep);
+  inited = true;
+}
+
+
 const char *SharedSplineClassAssetData::loadingAssetFname = NULL;
+float SharedSplineClassAssetData::splineMinStep = 0.f;
+bool SharedSplineClassAssetData::inited = false;
