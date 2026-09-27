@@ -31,7 +31,11 @@ void Frustum::construct(const mat44f &matrix)
   v_construct_camplanes(matrix, camPlanes[0], camPlanes[1], camPlanes[2], camPlanes[3], camPlanes[5], camPlanes[4]);
   for (int p = 0; p < 6; p++)
     camPlanes[p] = v_norm3(camPlanes[p]); // .w is divided by length(xyz) as side effect
+  constructVectorizedPlanes();
+}
 
+void Frustum::constructVectorizedPlanes()
+{
   //  build a bit-field that will tell us the indices for the nearest and farthest vertices from each plane...
   plane03X = camPlanes[0];
   plane03Y = camPlanes[1];
@@ -46,16 +50,32 @@ void Frustum::construct(const mat44f &matrix)
   plane5W2 = v_perm_xyzd(plane5W2, v_add(plane5W2, plane5W2));
 }
 
+bbox3f Frustum::calcFrustumBBox(vec3f *pntList) const
+{
+  vec3f frustumMax01 = v_max(pntList[0], pntList[1]);
+  vec3f frustumMin01 = v_min(pntList[0], pntList[1]);
+  vec3f frustumMax23 = v_max(pntList[2], pntList[3]);
+  vec3f frustumMin23 = v_min(pntList[2], pntList[3]);
+  vec3f frustumMax45 = v_max(pntList[4], pntList[5]);
+  vec3f frustumMin45 = v_min(pntList[4], pntList[5]);
+  vec3f frustumMax67 = v_max(pntList[6], pntList[7]);
+  vec3f frustumMin67 = v_min(pntList[6], pntList[7]);
+
+  vec3f frustumMin03 = v_min(frustumMin01, frustumMin23);
+  vec3f frustumMax03 = v_max(frustumMax01, frustumMax23);
+  vec3f frustumMin47 = v_min(frustumMin45, frustumMin67);
+  vec3f frustumMax47 = v_max(frustumMax45, frustumMax67);
+
+  vec3f frustumMin_v = v_min(frustumMin03, frustumMin47);
+  vec3f frustumMax_v = v_max(frustumMax03, frustumMax47);
+  return bbox3f{frustumMin_v, frustumMax_v};
+}
+
 void Frustum::calcFrustumBBox(bbox3f &box) const
 {
-  box.bmax = box.bmin = planeIntersection(camPlanes[5], camPlanes[2], camPlanes[1]);
-  v_bbox3_add_pt(box, planeIntersection(camPlanes[4], camPlanes[2], camPlanes[1]));
-  v_bbox3_add_pt(box, planeIntersection(camPlanes[5], camPlanes[3], camPlanes[1]));
-  v_bbox3_add_pt(box, planeIntersection(camPlanes[4], camPlanes[3], camPlanes[1]));
-  v_bbox3_add_pt(box, planeIntersection(camPlanes[5], camPlanes[2], camPlanes[0]));
-  v_bbox3_add_pt(box, planeIntersection(camPlanes[4], camPlanes[2], camPlanes[0]));
-  v_bbox3_add_pt(box, planeIntersection(camPlanes[5], camPlanes[3], camPlanes[0]));
-  v_bbox3_add_pt(box, planeIntersection(camPlanes[4], camPlanes[3], camPlanes[0]));
+  // the 8 corners are the (P5|P4, P2|P3, P1|P0) plane triples - solve them SoA in two
+  // 4-wide batches instead of eight scalar three-plane intersections
+  v_frustum_box_unsafe(box, camPlanes[0], camPlanes[1], camPlanes[2], camPlanes[3], camPlanes[4], camPlanes[5]);
 }
 
 void Frustum::generateAllPointFrustm(vec3f *pntList) const
@@ -70,78 +90,80 @@ void Frustum::generateAllPointFrustm(vec3f *pntList) const
   pntList[7] = planeIntersection(camPlanes[4], camPlanes[3], camPlanes[0]);
 }
 
-//  Tests if an AABB is inside/intersecting the view frustum
-// todo:
-int Frustum::testSphere(const Point3 &center, float radius, unsigned int &last_plane, unsigned int in_mask,
-  unsigned int &out_mask) const
+void Frustum::prepareBoxCorrectSAT(const vec3f *frustumPoints, BoxCorrectSAT &sat) const
 {
-  G_ASSERT(last_plane < 6 && in_mask <= ALL_PLANES_MASK);
+  // 24 separating axes: the 6 plane normals, then cross(world_axis, normal) over 3 world axes
+  // x 6 normals. Ordering is irrelevant to the result (a box is culled iff ANY axis separates);
+  // build and per-cell test only have to agree lane for lane. A cross axis is zero where the
+  // normal is world-axis aligned - a zero axis never separates, matching the scalar path.
+  vec4f axis[24];
+  for (int i = 0; i < 6; ++i)
+    axis[i] = camPlanes[i]; // .w (plane dist) is dropped by the transpose below
+  const vec4f worldAxis[3] = {V_C_UNIT_1000, V_C_UNIT_0100, V_C_UNIT_0010};
+  int idx = 6;
+  for (int p = 0; p < 6; ++p)
+    for (int a = 0; a < 3; ++a)
+      axis[idx++] = v_cross3(worldAxis[a], camPlanes[p]);
 
-  if (in_mask != ALL_PLANES_MASK)
+  for (int g = 0; g < 6; ++g)
   {
-    bool intersect = false;
-    unsigned int k = 1 << last_plane;
-    out_mask = 0;
-    if (k & in_mask)
-    {
-      float dist = as_plane3(&camPlanes[last_plane]).distance(center);
-      if (dist < -radius)
-        return OUTSIDE;
-      if (dist < radius)
-      {
-        out_mask |= k;
-        intersect = true;
-      }
-    }
+    // transpose the group's 4 axes AoS -> SoA: ax = the four .x, ay the .y, az the .z (4th row unused)
+    vec4f ax = axis[g * 4 + 0], ay = axis[g * 4 + 1], az = axis[g * 4 + 2], aw = axis[g * 4 + 3];
+    v_mat44_transpose(ax, ay, az, aw);
+    sat.axisX[g] = ax, sat.axisY[g] = ay, sat.axisZ[g] = az;
+    sat.absX[g] = v_abs(ax), sat.absY[g] = v_abs(ay), sat.absZ[g] = v_abs(az);
 
-    for (unsigned int planeNo = 0, planeBit = 1; planeBit <= in_mask; planeNo++, planeBit += planeBit)
+    // frustum-point projection interval per axis: bounds over the 8 corners of dot(pt, axis),
+    // four axes at once. madd order (x, then y, then z) matches the scalar dot by commutativity.
+    vec4f px = v_splat_x(frustumPoints[0]), py = v_splat_y(frustumPoints[0]), pz = v_splat_z(frustumPoints[0]);
+    v_bbox3_init(sat.fInterval[g], v_madd(pz, az, v_madd(py, ay, v_mul(px, ax))));
+    for (int i = 1; i < 8; ++i)
     {
-      if (planeBit & in_mask && (planeNo != last_plane))
-      {
-        float dist = as_plane3(&camPlanes[planeNo]).distance(center);
-        if (dist < -radius)
-          return OUTSIDE;
-        if (dist < radius)
-        {
-          out_mask |= k;
-          intersect = true;
-        }
-      }
+      px = v_splat_x(frustumPoints[i]), py = v_splat_y(frustumPoints[i]), pz = v_splat_z(frustumPoints[i]);
+      v_bbox3_add_pt(sat.fInterval[g], v_madd(pz, az, v_madd(py, ay, v_mul(px, ax))));
     }
-    return intersect ? INTERSECT : INSIDE;
   }
-  else // fast path
+}
+
+int Frustum::testBoxCorrectPrepared(const BBox3 &box, const bbox3f &frustumBox, const BoxCorrectSAT &sat) const
+{
+  vec3f bmin_v = v_ldu(&box[0].x);
+  vec3f bmax_v = v_ldu(&box[1].x);
+  vec4f center2_v = v_add(bmax_v, bmin_v);
+  vec4f extent2_v = v_sub(bmax_v, bmin_v);
+  int cheapResult = v_box_frustum_intersect_extent2(center2_v, extent2_v, plane03X, plane03Y, plane03Z, plane03W2, plane4W2, plane5W2);
+  if (cheapResult != INTERSECT)
+    return cheapResult;
+
+  if (v_check_xyz_any_true(v_or(v_cmp_lt(frustumBox.bmax, bmin_v), v_cmp_gt(frustumBox.bmin, bmax_v))))
+    return OUTSIDE;
+
+  // SAT refinement: project box and frustum onto every axis, four axes per group; the box is
+  // separated (culled) as soon as any axis interval clears the frustum interval. The madd order
+  // (start from x, add y, add z) reproduces the scalar dot's (x+y)+z by commutativity, so the
+  // classification is bit-identical to the old per-axis scalar path on the non-FMA build.
+  vec4f c = v_mul(center2_v, V_C_HALF);
+  vec4f e = v_mul(extent2_v, V_C_HALF);
+  vec4f cx = v_splat_x(c), cy = v_splat_y(c), cz = v_splat_z(c);
+  vec4f ex = v_splat_x(e), ey = v_splat_y(e), ez = v_splat_z(e);
+  for (int g = 0; g < 6; ++g)
   {
-    // fast case
-    float dist = as_plane3(&camPlanes[last_plane]).distance(center);
-    if (dist < -radius)
-    {
-      out_mask = 0;
+    vec4f bCenter = v_madd(cz, sat.axisZ[g], v_madd(cy, sat.axisY[g], v_mul(cx, sat.axisX[g])));
+    vec4f r = v_madd(ez, sat.absZ[g], v_madd(ey, sat.absY[g], v_mul(ex, sat.absX[g])));
+    vec4f bMin = v_sub(bCenter, r);
+    vec4f bMax = v_add(bCenter, r);
+    if (v_check_xyzw_any_true(v_or(v_cmp_lt(bMax, sat.fInterval[g].bmin), v_cmp_lt(sat.fInterval[g].bmax, bMin))))
       return OUTSIDE;
-    }
-
-    float outside = -1.0f; // false
-    float intersect = -1.0f;
-    float maskBit = 1.0f;
-    float maskFlt = 0.0f;
-    for (int i = 0; i < 6; i++)
-    {
-      const float dist_ = as_plane3(&camPlanes[i]).distance(center);
-      outside = fsel(dist_ - (-radius), outside, 1.0f);        //(dist_ < -rad) -> 1.0f
-      intersect = fsel(dist_ - radius, intersect, 1.0f);       //(dist_ < rad)  -> 1.0f
-      const float mergeMsk = fsel(dist_ - radius, 0.0f, 1.0f); //(dist_ < rad)  -> 1.0f
-      maskFlt += maskBit * mergeMsk;
-      maskBit += maskBit;
-    }
-
-    if (outside >= 0.0f)
-    {
-      out_mask = 0;
-      return OUTSIDE;
-    }
-    out_mask = (unsigned int)maskFlt; // LHS!
-    return (intersect >= 0.0f) ? INTERSECT : INSIDE;
   }
+  // Fully-inside is caught by the cheap test, so a box that no axis separates is INTERSECT.
+  return INTERSECT;
+}
+
+int Frustum::testBoxCorrect(const BBox3 &box, const vec3f *frustumPoints, const bbox3f &frustumBox) const
+{
+  BoxCorrectSAT sat;
+  prepareBoxCorrectSAT(frustumPoints, sat);
+  return testBoxCorrectPrepared(box, frustumBox, sat);
 }
 
 int Frustum::testBox(vec4f bmin, vec4f bmax, unsigned int &last_start_plane, unsigned int in_mask, unsigned int &out_mask) const
@@ -161,16 +183,8 @@ int Frustum::testBox(vec4f bmin, vec4f bmax, unsigned int &last_start_plane, uns
     sp = camPlanes[last_start_plane];
     pos = v_plane_dist_x(sp, v_add(center, v_xor(extent, v_and(sp, signmask))));
     neg = v_plane_dist_x(sp, v_sub(center, v_xor(extent, v_and(sp, signmask))));
-#if _TARGET_SIMD_SSE
-    if (_mm_movemask_ps(pos) & 1)
-      return OUTSIDE;
-
-    if (_mm_movemask_ps(neg) & 1)
-    {
-      out_mask |= last_mask;
-      result = INTERSECT;
-    }
-#else
+    // negative .x distance = box outside this plane; lane-x test is cheap on both ISAs (a full
+    // v_signmask would do a 4-lane movemask reduction on NEON just to read lane x)
     if (v_test_vec_x_lt_0(pos))
       return OUTSIDE;
 
@@ -179,7 +193,6 @@ int Frustum::testBox(vec4f bmin, vec4f bmax, unsigned int &last_start_plane, uns
       out_mask |= last_mask;
       result = INTERSECT;
     }
-#endif
   }
 
   for (unsigned i = 0, k = 1; k <= in_mask; i++, k += k)
@@ -191,18 +204,6 @@ int Frustum::testBox(vec4f bmin, vec4f bmax, unsigned int &last_start_plane, uns
     pos = v_plane_dist_x(sp, v_add(center, v_xor(extent, v_and(sp, signmask))));
     neg = v_plane_dist_x(sp, v_sub(center, v_xor(extent, v_and(sp, signmask))));
 
-#if _TARGET_SIMD_SSE
-    if (_mm_movemask_ps(pos) & 1)
-    {
-      last_start_plane = i;
-      return OUTSIDE;
-    }
-    if (_mm_movemask_ps(neg) & 1)
-    {
-      out_mask |= k;
-      result = INTERSECT;
-    }
-#else
     if (v_test_vec_x_lt_0(pos))
     {
       last_start_plane = i;
@@ -213,7 +214,6 @@ int Frustum::testBox(vec4f bmin, vec4f bmax, unsigned int &last_start_plane, uns
       out_mask |= k;
       result = INTERSECT;
     }
-#endif
   }
   return result;
 }
@@ -376,29 +376,23 @@ bool Frustum::testSweptSphere(vec4f sphere_center, vec4f sphere_radius, vec4f sw
 
 #define CALC_DISTANCE_SOA(N) const vec4f dist##N = v_madd(plane##N##x, x, v_madd(plane##N##y, y, v_madd(plane##N##z, z, plane##N##w)));
 
-#define TEST_SPHERE_SOA(RES, DISP)                                                                                        \
-  {                                                                                                                       \
-    const vec4f x = v_madd(sweepDirX, DISP, scX);                                                                         \
-    const vec4f y = v_madd(sweepDirY, DISP, scY);                                                                         \
-    const vec4f z = v_madd(sweepDirZ, DISP, scZ);                                                                         \
-                                                                                                                          \
-    CALC_DISTANCE_SOA(0);                                                                                                 \
-    CALC_DISTANCE_SOA(1);                                                                                                 \
-    CALC_DISTANCE_SOA(2);                                                                                                 \
-    CALC_DISTANCE_SOA(3);                                                                                                 \
-    CALC_DISTANCE_SOA(4);                                                                                                 \
-    CALC_DISTANCE_SOA(5);                                                                                                 \
-                                                                                                                          \
-    RES = FSEL(v_add(dist0, sr11),                                                                                        \
-      FSEL(v_add(dist1, sr11),                                                                                            \
-        FSEL(v_add(dist2, sr11),                                                                                          \
-          FSEL(v_add(dist3, sr11), FSEL(v_add(dist4, sr11), FSEL(v_add(dist5, sr11), zeroSoa, minusOneSoa), minusOneSoa), \
-            minusOneSoa),                                                                                                 \
-          minusOneSoa),                                                                                                   \
-        minusOneSoa),                                                                                                     \
-      minusOneSoa);                                                                                                       \
-                                                                                                                          \
-    RES = FSEL(DISP, RES, oneSoa);                                                                                        \
+#define TEST_SPHERE_SOA(RES, DISP)                                                                  \
+  {                                                                                                 \
+    const vec4f x = v_madd(sweepDirX, DISP, scX);                                                   \
+    const vec4f y = v_madd(sweepDirY, DISP, scY);                                                   \
+    const vec4f z = v_madd(sweepDirZ, DISP, scZ);                                                   \
+                                                                                                    \
+    CALC_DISTANCE_SOA(0);                                                                           \
+    CALC_DISTANCE_SOA(1);                                                                           \
+    CALC_DISTANCE_SOA(2);                                                                           \
+    CALC_DISTANCE_SOA(3);                                                                           \
+    CALC_DISTANCE_SOA(4);                                                                           \
+    CALC_DISTANCE_SOA(5);                                                                           \
+                                                                                                    \
+    /* inside all 6 planes iff the smallest distance clears -sr11 */                                \
+    const vec4f minD = v_min(v_min(v_min(dist0, dist1), v_min(dist2, dist3)), v_min(dist4, dist5)); \
+    RES = FSEL(v_add(minD, sr11), zeroSoa, minusOneSoa);                                            \
+    RES = FSEL(DISP, RES, oneSoa);                                                                  \
   }
 
   TEST_SPHERE_SOA(res03, disp03);
@@ -409,7 +403,7 @@ bool Frustum::testSweptSphere(vec4f sphere_center, vec4f sphere_radius, vec4f sw
   // Combine results.
 
   vec4f res = v_and(v_and(res03, res47), res8b);
-  res = v_and(v_and(v_and(res, v_splat_y(res)), v_splat_z(res)), v_splat_w(res));
+  res = v_hand(res);
   return (v_test_vec_x_eqi_0(res));
 
 #undef TEST_SPHERE_SOA

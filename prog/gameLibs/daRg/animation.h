@@ -60,11 +60,15 @@ public:
   void requestStop();
   void rewind();
   bool isFinished() const;
+  bool isFadingOut() const;
   void skip();
   void skipOnDelete();
   void skipDelay();
+  void setPause(bool on);
 
 protected:
+  // resolve a null 'from' to the value the element has right now, see start()
+  virtual void snapshotFromCurrent() {}
   bool baseUpdate(int64_t dt_usec);
   void playSound(const Sqrat::Object &key);
   void callHandler(const Sqrat::Object &handler, bool allow_start);
@@ -79,6 +83,7 @@ public:
   AnimDesc desc;
   int64_t t = 0, delayLeft = 0;
   bool isPlayingLoop = false;
+  bool isPaused = false;
   Element *elem;
 };
 
@@ -94,11 +99,12 @@ public:
   static const Sqrat::Object *fieldForAnim(const Element *elem, AnimProp prop, bool assert_on_missing);
 
 private:
-  ColorHsva cur;
+  virtual void snapshotFromCurrent() override;
+
   E3DCOLOR *output;
   E3DCOLOR baseElemColor;
 
-  ColorHsva cFrom, cTo;
+  ColorOklcha cFrom, cTo;
 };
 
 
@@ -111,6 +117,8 @@ public:
   virtual void apply() override;
 
 private:
+  virtual void snapshotFromCurrent() override;
+
   float cur = 0;
   float *output = nullptr;
   float fFrom = 0, fTo = 0;
@@ -120,14 +128,17 @@ private:
 class Point2Anim : public Animation
 {
 public:
-  Point2Anim(Element *elem) : Animation(elem) {}
+  Point2Anim(Element *elem, Point2 def) : Animation(elem), defVal(def), cur(def), p2From(def), p2To(def) {}
   virtual void setup(bool initial) override;
   virtual void update(int64_t dt_usec) override;
   virtual void apply() override;
 
 private:
-  Point2 cur = Point2(0, 0);
-  Point2 p2From = Point2(0, 0), p2To = Point2(0, 0);
+  virtual void snapshotFromCurrent() override;
+
+  Point2 cur;
+  Point2 p2From, p2To;
+  const Point2 defVal;
 };
 
 
@@ -166,7 +177,7 @@ private:
   E3DCOLOR lastElemColor = 0, curColor = 0;
   float lastElemFloat = 0, curFloat = 0;
   Point2 lastElemP2 = Point2(0, 0), curP2 = Point2(0, 0);
-  ColorHsva colorFrom, colorTo;
+  ColorOklcha colorFrom, colorTo;
   float floatFrom = 0, floatTo = 0;
   Point2 p2From = Point2(0, 0), p2To = Point2(0, 0);
 

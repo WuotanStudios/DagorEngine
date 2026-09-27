@@ -270,12 +270,14 @@ static constexpr ecs::ComponentDesc cinematic_mode_settings_changed_es_event_han
   {ECS_HASH("cinematic_mode__manager"), ecs::ComponentTypeInfo<CinematicMode>()},
   {ECS_HASH("cinematic_mode__lenseCoveringTex"), ecs::ComponentTypeInfo<ecs::string>()},
   {ECS_HASH("cinematic_mode__lenseRadialTex"), ecs::ComponentTypeInfo<ecs::string>()},
-//start of 12 ro components at [3]
+//start of 14 ro components at [3]
   {ECS_HASH("cinematic_mode__vignetteStrength"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("cinematic_mode__lenseFlareIntensity"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("cinematic_mode__lenseDust"), ecs::ComponentTypeInfo<bool>()},
   {ECS_HASH("cinematic_mode__chromaticAberration"), ecs::ComponentTypeInfo<Point3>()},
-  {ECS_HASH("cinematic_mode__filmGrain"), ecs::ComponentTypeInfo<Point3>()},
+  {ECS_HASH("cinematic_mode__filmGrainNoise"), ecs::ComponentTypeInfo<Point3>()},
+  {ECS_HASH("cinematic_mode__filmGrainLut"), ecs::ComponentTypeInfo<Point4>()},
+  {ECS_HASH("cinematic_mode__filmGrainMul"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("cinematic_mode__fps"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("cinematic_mode__subPixels"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("cinematic_mode__superPixels"), ecs::ComponentTypeInfo<int>()},
@@ -295,7 +297,9 @@ static void cinematic_mode_settings_changed_es_event_handler_all_events(const ec
     , ECS_RW_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__lenseRadialTex", ecs::string)
     , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__lenseDust", bool)
     , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__chromaticAberration", Point3)
-    , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__filmGrain", Point3)
+    , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__filmGrainNoise", Point3)
+    , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__filmGrainLut", Point4)
+    , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__filmGrainMul", float)
     , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__fps", int)
     , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__subPixels", int)
     , ECS_RO_COMP(cinematic_mode_settings_changed_es_event_handler_comps, "cinematic_mode__superPixels", int)
@@ -312,13 +316,13 @@ static ecs::EntitySystemDesc cinematic_mode_settings_changed_es_event_handler_es
   "prog/daNetGame/render/cinematicModeES.cpp.inl",
   ecs::EntitySystemOps(nullptr, cinematic_mode_settings_changed_es_event_handler_all_events),
   make_span(cinematic_mode_settings_changed_es_event_handler_comps+0, 3)/*rw*/,
-  make_span(cinematic_mode_settings_changed_es_event_handler_comps+3, 12)/*ro*/,
+  make_span(cinematic_mode_settings_changed_es_event_handler_comps+3, 14)/*ro*/,
   empty_span(),
   empty_span(),
   ecs::EventSetBuilder<ecs::EventEntityCreated,
                        ecs::EventComponentsAppear>::build(),
   0
-,nullptr,"cinematic_mode__audioDataFName,cinematic_mode__bitrate,cinematic_mode__chromaticAberration,cinematic_mode__enablePostBloom,cinematic_mode__filmGrain,cinematic_mode__fname,cinematic_mode__fps,cinematic_mode__lenseDust,cinematic_mode__lenseFlareIntensity,cinematic_mode__subPixels,cinematic_mode__superPixels,cinematic_mode__vignetteStrength");
+,nullptr,"cinematic_mode__audioDataFName,cinematic_mode__bitrate,cinematic_mode__chromaticAberration,cinematic_mode__enablePostBloom,cinematic_mode__filmGrainLut,cinematic_mode__filmGrainMul,cinematic_mode__filmGrainNoise,cinematic_mode__fname,cinematic_mode__fps,cinematic_mode__lenseDust,cinematic_mode__lenseFlareIntensity,cinematic_mode__subPixels,cinematic_mode__superPixels,cinematic_mode__vignetteStrength");
 static constexpr ecs::ComponentDesc cinematic_mode_save_bloom_threshold_es_comps[] =
 {
 //start of 1 rw components at [0]
@@ -330,7 +334,8 @@ static void cinematic_mode_save_bloom_threshold_es_all_events(const ecs::Event &
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     cinematic_mode_save_bloom_threshold_es(evt
-        , ECS_RW_COMP(cinematic_mode_save_bloom_threshold_es_comps, "cinematic_mode__saved_bloom_threshold", float)
+        , components.manager()
+    , ECS_RW_COMP(cinematic_mode_save_bloom_threshold_es_comps, "cinematic_mode__saved_bloom_threshold", float)
     , ECS_RO_COMP_OR(cinematic_mode_save_bloom_threshold_es_comps, "cinematic_mode__default_bloom_threshold", float(1.0))
     );
   while (++comp != compE);
@@ -357,7 +362,8 @@ static void cinematic_mode_restore_bloom_threshold_es_all_events(const ecs::Even
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     cinematic_mode_restore_bloom_threshold_es(evt
-        , ECS_RO_COMP(cinematic_mode_restore_bloom_threshold_es_comps, "cinematic_mode__saved_bloom_threshold", float)
+        , components.manager()
+    , ECS_RO_COMP(cinematic_mode_restore_bloom_threshold_es_comps, "cinematic_mode__saved_bloom_threshold", float)
     );
   while (++comp != compE);
 }
@@ -444,9 +450,9 @@ static ecs::CompileTimeQueryDesc get_cinematic_mode_manager_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_cinematic_mode_manager_ecs_query(Callable function)
+inline void get_cinematic_mode_manager_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_cinematic_mode_manager_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_cinematic_mode_manager_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -472,9 +478,9 @@ static ecs::CompileTimeQueryDesc set_video_recording_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void set_video_recording_ecs_query(Callable function)
+inline void set_video_recording_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, set_video_recording_ecs_query_desc.getHandle(),
+  perform_query(&manager, set_video_recording_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -500,9 +506,9 @@ static ecs::CompileTimeQueryDesc get_bloom_threshold_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_bloom_threshold_ecs_query(Callable function)
+inline void get_bloom_threshold_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_bloom_threshold_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_bloom_threshold_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -528,9 +534,9 @@ static ecs::CompileTimeQueryDesc set_bloom_threshold_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void set_bloom_threshold_ecs_query(Callable function)
+inline void set_bloom_threshold_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, set_bloom_threshold_ecs_query_desc.getHandle(),
+  perform_query(&manager, set_bloom_threshold_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -558,9 +564,9 @@ static ecs::CompileTimeQueryDesc delete_color_grading_ecs_query_desc
   make_span(delete_color_grading_ecs_query_comps+1, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void delete_color_grading_ecs_query(Callable function)
+inline void delete_color_grading_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, delete_color_grading_ecs_query_desc.getHandle(),
+  perform_query(&manager, delete_color_grading_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -586,9 +592,9 @@ static ecs::CompileTimeQueryDesc get_default_color_grade_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_default_color_grade_ecs_query(Callable function)
+inline void get_default_color_grade_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_default_color_grade_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_default_color_grade_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do

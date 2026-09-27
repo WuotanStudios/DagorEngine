@@ -77,7 +77,15 @@ public:
   eastl::fixed_vector<intptr_t, 4> dumpThreadIds;
   OSSpinlock dumpThreadIdMutex;
 
-  WatchDogThread(WatchdogConfig *cfg_) : DaThread("WatchDogThread", 128 << 10, 0, WORKER_THREADS_AFFINITY_MASK), lastUpdateTimeMs(0u)
+  WatchDogThread(WatchdogConfig *cfg_) :
+    DaThread("WatchDogThread",
+#if _TARGET_PC
+      DaThread::DEFAULT_STACK_SZ * 2,
+#else
+      DaThread::DEFAULT_STACK_SZ,
+#endif
+      0, WORKER_THREADS_AFFINITY_MASK),
+    lastUpdateTimeMs(0u)
   {
     os_event_create(&sleepEvent);
     if (cfg_)
@@ -128,6 +136,14 @@ public:
           debug("set watchdog sleep time %lld ms", (int64_t)p0);
         kick();
         return old;
+      }
+      case WATCHDOG_OPTION_FREEZE_CB:
+      {
+        auto old = interlocked_exchange_ptr(cfg.on_freeze_cb, (decltype(cfg.on_freeze_cb))p0);
+        if (!p1)
+          debug("set watchdog freeze cb %p", (void *)p0);
+        kick();
+        return (intptr_t)old;
       }
       case WATCHDOG_OPTION_DUMP_THREADS:
       {
@@ -207,12 +223,11 @@ public:
         if (freeze)
           dump_all_thread_callstacks();
         else
-        {
-          logwarn("WatchDog: no kick in %d ms", e_time);
 #else
         if (!freeze) // To consider: add flag to force dump even in release
-        {
 #endif
+        {
+          logwarn("WatchDog: no kick in %d ms", e_time);
           // we can't dump random thread callstacks so its pointless
           // also it seems it takes forever on intel macs which is weird
 #if !_TARGET_APPLE
@@ -228,8 +243,8 @@ public:
       if (!freeze)
         continue;
 
-      if (cfg.on_freeze_cb)
-        cfg.on_freeze_cb(e_time, cfg.user_data);
+      if (auto freeze_cb = interlocked_acquire_load_ptr(cfg.on_freeze_cb))
+        freeze_cb(e_time, cfg.user_data);
 
       kick();
     }
@@ -273,6 +288,15 @@ intptr_t watchdog_set_option(int option, intptr_t p0, intptr_t p1)
   if (!thread)
     return -1;
   return thread->setOption(option, p0, p1);
+}
+
+bool watchdog_set_keep_sleeping_cb(bool (*keep_sleeping_cb)())
+{
+  auto *thread = interlocked_acquire_load_ptr(watchdog_thread);
+  if (!thread)
+    return false;
+  thread->cfg.keep_sleeping_cb = keep_sleeping_cb;
+  return true;
 }
 
 #if _TARGET_PC_WIN

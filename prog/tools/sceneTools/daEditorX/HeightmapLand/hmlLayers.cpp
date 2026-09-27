@@ -7,9 +7,25 @@
 #include "hmlCm.h"
 #include <math/dag_adjpow2.h>
 
+G_STATIC_ASSERT(EditLayerProps::MAX_LAYERS <= IObjEntity::LAYER_INDEX_LANDCLASS);
+
 FastNameMapEx EditLayerProps::layerNames;
 Tab<EditLayerProps> EditLayerProps::layerProps;
 int EditLayerProps::activeLayerIdx[EditLayerProps::TYPENUM];
+
+LandscapeObjectTypeState LandscapeObjectTypeState::types[EditLayerProps::TYPENUM];
+
+bool EditLayerProps::isLayerOrTypeHidden() const
+{
+  G_ASSERT(type < TYPENUM);
+  return hide || !LandscapeObjectTypeState::types[type].visible;
+}
+
+bool EditLayerProps::isLayerOrTypeLocked() const
+{
+  G_ASSERT(type < TYPENUM);
+  return lock || LandscapeObjectTypeState::types[type].locked;
+}
 
 void EditLayerProps::resetLayersToDefauls()
 {
@@ -51,7 +67,7 @@ void EditLayerProps::loadLayersConfig(const DataBlock &blk, const DataBlock &loc
       *layersBlk_local.getBlockByNameEx(lptype_name[layerProps[lidx].type])->getBlockByNameEx(b.getBlockName());
     layerProps[lidx].lock = b_local.getBool("lock", false);
     layerProps[lidx].hide = b_local.getBool("hide", false);
-    layerProps[lidx].renderToMask = b_local.getBool("renderToMask", true);
+    layerProps[lidx].renderToMask = b.getBool("renderToMask", true);
     layerProps[lidx].exp = b.getBool("export", true);
     layerProps[lidx].renameable = false;
   }
@@ -62,12 +78,6 @@ void EditLayerProps::loadLayersConfig(const DataBlock &blk, const DataBlock &loc
   for (int i = 0; i < EditLayerProps::TYPENUM; i++)
     if (activeLayerIdx[i] < 0)
       activeLayerIdx[i] = i;
-
-  uint64_t lh_mask = 0;
-  for (int i = 0; i < layerProps.size(); i++)
-    if (layerProps[i].hide)
-      lh_mask |= 1ull << i;
-  DAEDITOR3.setEntityLayerHiddenMask(lh_mask);
 }
 void EditLayerProps::saveLayersConfig(DataBlock &blk, DataBlock &local_data)
 {
@@ -86,7 +96,8 @@ void EditLayerProps::saveLayersConfig(DataBlock &blk, DataBlock &local_data)
       b.setInt("type", layerProps[i].type);
       b_local.setBool("lock", layerProps[i].lock);
       b_local.setBool("hide", layerProps[i].hide);
-      b_local.setBool("renderToMask", layerProps[i].renderToMask);
+      if (!layerProps[i].renderToMask)
+        b.setBool("renderToMask", layerProps[i].renderToMask);
       if (!layerProps[i].exp)
         b.setBool("export", layerProps[i].exp);
     }
@@ -124,4 +135,53 @@ void EditLayerProps::renameLayer(int idx, const char *new_name)
   }
 
   layerProps[idx].nameId = nid;
+}
+
+void EditLayerProps::updateEntityLayerHiddenMask()
+{
+  LayerHiddenMask lhMask;
+  for (int i = 0; i < EditLayerProps::layerProps.size(); ++i)
+    lhMask.setHidden(i, EditLayerProps::layerProps[i].isLayerOrTypeHidden());
+  DAEDITOR3.setEntityLayerHiddenMask(lhMask);
+}
+
+void LandscapeObjectTypeState::resetAllObjectTypesToDefault()
+{
+  for (int i = 0; i < EditLayerProps::TYPENUM; ++i)
+    types[i] = LandscapeObjectTypeState();
+}
+
+void LandscapeObjectTypeState::saveAllObjectTypeConfig(DataBlock &local_data)
+{
+  DataBlock *typesBlk = nullptr;
+  for (int i = 0; i < EditLayerProps::TYPENUM; ++i)
+  {
+    const bool typeHidden = !LandscapeObjectTypeState::types[i].visible;
+    const bool typeLocked = LandscapeObjectTypeState::types[i].locked;
+    if (typeHidden || typeLocked)
+    {
+      if (!typesBlk)
+        typesBlk = local_data.addBlock("types");
+
+      DataBlock *typeBlk = typesBlk->addBlock(lptype_name[i]);
+      if (typeHidden)
+        typeBlk->addBool("hide", typeHidden);
+      if (typeLocked)
+        typeBlk->addBool("lock", typeLocked);
+    }
+  }
+}
+
+void LandscapeObjectTypeState::loadAllObjectTypeConfig(const DataBlock &local_data)
+{
+  const DataBlock *typesBlk = local_data.getBlockByName("types");
+  if (!typesBlk)
+    return;
+
+  for (int i = 0; i < EditLayerProps::TYPENUM; ++i)
+    if (const DataBlock *typeBlk = typesBlk->getBlockByName(lptype_name[i]))
+    {
+      LandscapeObjectTypeState::types[i].visible = !typeBlk->getBool("hide", false);
+      LandscapeObjectTypeState::types[i].locked = typeBlk->getBool("lock", false);
+    }
 }

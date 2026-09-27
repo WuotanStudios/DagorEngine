@@ -1,4 +1,3 @@
-
 int ffxMinTraversalOccupancy = 4;
 
 macro FFX_RAYMARCH_INIT(code)

@@ -1,6 +1,8 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <daECS/core/coreEvents.h>
 #include <daECS/net/network.h>
 #include <daECS/net/netEvent.h>
@@ -12,6 +14,7 @@
 #include <EASTL/vector.h>
 
 #include "phys/quantization.h"
+#include "phys/netPhysSnapshots.h" // {write,read}_cur_time
 #include "net/net.h"
 #include "net/channel.h"
 #include "net/recipientFilters.h"
@@ -44,7 +47,6 @@ ECS_UNICAST_EVENT_TYPE(EventSnapshotBlink, TMatrix /*from*/, TMatrix /*to*/, flo
 ECS_REGISTER_EVENT(EventSnapshotBlink);
 
 // TODO: move net:: to gameLibs, otherwise this code is doomed to be DNG specific
-extern net::CNetwork *get_net_internal();
 
 struct SnapshotEntityData
 {
@@ -89,14 +91,15 @@ inline bool verify_snapshot_quat(const Quat &q)
   return true;
 }
 
+using tmp_snap_entity_data_t = eastl::vector<SnapshotEntityData, framemem_allocator>;
+
 template <typename Callable>
 static void gather_transform_snapshot_entities_ecs_query(ecs::EntityManager &, Callable c);
 
 template <typename Callable>
 static void apply_transform_snapshot_ecs_query(ecs::EntityManager &, ecs::EntityId eid, Callable c);
 
-static void gather_snapshot_data(
-  ecs::EntityManager &manager, float at_time, eastl::vector<SnapshotEntityData, framemem_allocator> &buffer)
+static void gather_snapshot_data(ecs::EntityManager &manager, double at_time, tmp_snap_entity_data_t &buffer)
 {
   // simplest implementation, which does not know anything about network LODs and just sends quantized
   // snapshots with a fixed framerate. we don't anticipate to have more than 10 entities with these snapshots
@@ -104,11 +107,12 @@ static void gather_snapshot_data(
   // TODO: implement support for network LODs and thus reduce traffic
   gather_transform_snapshot_entities_ecs_query(manager,
     [&](ECS_REQUIRE_NOT(ecs::Tag deadEntity) ECS_REQUIRE_NOT(ecs::Tag loc_snaphots__disabled) ecs::EntityId eid,
-      const TMatrix &transform, float &loc_snapshots__sendAtTime, float loc_snapshots__sendPeriod,
-      const ecs::Tag *loc_snapshots__scaledTransform, bool *loc_snapshots__blink) {
-      if (at_time < loc_snapshots__sendAtTime)
-        return;
+      const TMatrix &transform,
+      float &loc_snapshots__sendAtTime, // TODO: replace to double
+      float loc_snapshots__sendPeriod, const ecs::Tag *loc_snapshots__scaledTransform, bool *loc_snapshots__blink) {
       const float timeOverflow = at_time - loc_snapshots__sendAtTime;
+      if (timeOverflow < 0)
+        return;
       if (timeOverflow < loc_snapshots__sendPeriod)
         loc_snapshots__sendAtTime += loc_snapshots__sendPeriod;
       else
@@ -141,10 +145,8 @@ static void gather_snapshot_data(
     });
 }
 
-static void send_snapshots(
-  ecs::EntityManager &manager, const eastl::vector<SnapshotEntityData, framemem_allocator> &snap_data, float at_time)
+static void send_snapshots(ecs::EntityManager &manager, const tmp_snap_entity_data_t &snap_data, double at_time)
 {
-  danet::BitStream tmpBs(framemem_ptr());
   const size_t num = snap_data.size();
   constexpr size_t batchSize = 32;
   G_STATIC_ASSERT(batchSize < eastl::numeric_limits<uint8_t>::max());
@@ -154,8 +156,9 @@ static void send_snapshots(
     size_t j = i * batchSize;
     const size_t to = eastl::min<size_t>((i + 1) * batchSize, num);
 
-    tmpBs.ResetWritePointer();
-    tmpBs.Write(at_time);
+    danet::BitStream tmpBs;
+    tmpBs.reserveBits(BYTES_TO_BITS(1024));
+    write_cur_time(tmpBs, at_time);
     tmpBs.Write(uint8_t(to - j));
     for (; j < to; ++j)
     {
@@ -167,7 +170,7 @@ static void send_snapshots(
       tmpBs.Write(entityData.blink);
       // Note: the interval is not written. Because this loc snapshot implementation does not use it.
     }
-    manager.broadcastEvent(TransformSnapshots(tmpBs));
+    manager.broadcastEvent(TransformSnapshots(eastl::move(tmpBs)));
   }
 }
 
@@ -175,12 +178,10 @@ ECS_NO_ORDER
 ECS_TAG(server, net)
 static void send_transform_snapshots_es(const ecs::UpdateStageInfoAct &info, ecs::EntityManager &manager)
 {
-  // Gather data
-  eastl::vector<SnapshotEntityData, framemem_allocator> snapEntityData;
-  gather_snapshot_data(manager, info.curTime, snapEntityData);
-  // Send data
-  if (snapEntityData.size() > 0)
-    send_snapshots(manager, snapEntityData, info.curTime);
+  tmp_snap_entity_data_t snapEntityData;
+  gather_snapshot_data(manager, info.curTimeD, snapEntityData);
+  if (!snapEntityData.empty())
+    send_snapshots(manager, snapEntityData, info.curTimeD);
 }
 
 ECS_TAG(gameClient)
@@ -191,8 +192,8 @@ static void rcv_loc_snapshots_es_event_handler(const TransformSnapshots &evt, ec
 
   bool isOk = true;
 
-  float atTime = 0.f;
-  isOk &= bs.Read(atTime);
+  double atTime = 0.f;
+  read_cur_time(bs, atTime);
   uint8_t num = 0;
   isOk &= bs.Read(num);
 
@@ -236,7 +237,7 @@ ECS_REQUIRE_NOT(ecs::Tag loc_snapshots__dynamicInterpTime)
 static void cleanup_loc_snapshots_es(
   const ecs::UpdateStageInfoAct &info, LocSnapshotsList &loc_snapshots__snapshotData, float loc_snapshots__interpTimeOffset = 0.15f)
 {
-  const float interpTime = info.curTime - loc_snapshots__interpTimeOffset;
+  const double interpTime = info.curTimeD - loc_snapshots__interpTimeOffset;
   for (int i = loc_snapshots__snapshotData.size() - 2; i >= 0; --i)
   {
     const LocSnapshot &nextSnap = loc_snapshots__snapshotData[i + 1];
@@ -271,7 +272,7 @@ static void interp_loc_snapshots_es(const ecs::UpdateStageInfoAct &info,
     transform.setcol(3, snap.pos);
     return;
   }
-  const float interpTime = info.curTime - loc_snapshots__interpTimeOffset;
+  const double interpTime = info.curTimeD - loc_snapshots__interpTimeOffset;
   for (int i = loc_snapshots__snapshotData.size() - 2; i >= 0; --i)
   {
     const LocSnapshot &curSnap = loc_snapshots__snapshotData[i];
@@ -279,7 +280,7 @@ static void interp_loc_snapshots_es(const ecs::UpdateStageInfoAct &info,
     if (curSnap.atTime > interpTime)
       continue;
     // curSnap time is _before_ our curtime, use this pair to interpolate
-    float interpK = nextSnap.blink ? 1.0 : cvt(interpTime, curSnap.atTime, nextSnap.atTime, 0.f, 1.f);
+    float interpK = nextSnap.blink ? 1.f : cvt_double(interpTime, curSnap.atTime, nextSnap.atTime, 0., 1.);
     transform = makeTM(qinterp(curSnap.quat, nextSnap.quat, interpK));
     transform.setcol(3, lerp(curSnap.pos, nextSnap.pos, interpK));
     if (nextSnap.blink && interpTime - info.dt <= curSnap.atTime)

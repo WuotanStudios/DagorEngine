@@ -1,3 +1,5 @@
+include "pre_rotation_inc.dshl"
+
 macro SCREEN_TO_TC()
 hlsl(vs) {
   float2 screen_to_texcoords(float2 pos)
@@ -12,6 +14,12 @@ macro DECL_POSTFX_TC_VS_DEP()
 endmacro
 
 macro USE_POSTFX_VERTEX_POSITIONS()
+
+// workaround for android drivers providing trash base vertex on vulkan
+// NOTE: shader will use vulkan vertex id logic with this pragma!
+hlsl(vs) {
+  #pragma spir-v no-base-vertex
+}
 
 DECL_POSTFX_TC_VS_DEP()
 SCREEN_TO_TC()
@@ -62,6 +70,9 @@ macro POSTFX_VS(pos_z)
 
       #ifdef USE_VIEW_VEC
         output.USE_VIEW_VEC = get_view_vec_by_vertex_id(vertexId);
+      #endif
+      #ifdef POSTFX_PRE_ROTATION
+        output.pos.xy = apply_pre_rotation(output.pos.xy);
       #endif
       return output;
     }

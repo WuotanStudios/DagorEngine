@@ -2,6 +2,7 @@
 #pragma once
 
 #include "scalarTypes.h"
+#include <cstdarg>
 
 namespace stcode::cpp
 {
@@ -14,15 +15,15 @@ struct ShadervarPtrInitInfo
 };
 
 typedef void (*SetResourceCallback)(int, uint, const void *); // stage id, res id, handle/pointer to mem
-typedef void (*GetGlobalMatrixCallback)(float4x4 *);          // dst
+typedef void (*GetGlobalMatrixCallback)(void *);              // dst
 typedef void (*GetGlobalVecCallback)(int, float4 *);          // component, dst
 
-typedef real (*GetTimeCallback)(real, real); // period, offset
+typedef float (*GetTimeCallback)(float, float); // period, offset
 
 typedef float4 (*GetTexDimCallback)(const void *, int); // tex, mip
 typedef int (*GetBufSizeCallback)(const void *);        // id
 typedef float4 (*GetViewportCallback)();
-typedef uint64_t (*RequestSamplerCallback)(int, float4, int, int); // smp id, args.. -> sampler handle
+typedef uint64_t (*RequestSamplerCallback)(int, float4, float, float); // smp id, args.. -> sampler handle
 
 typedef int (*CheckResourceExistanceCallback)(const void *); // res, returns 1 if exists, 0 otherwise
 
@@ -32,10 +33,34 @@ typedef void (*GetShadervarPtrsCallback)(const ShadervarPtrInitInfo *, uint32_t)
 
 // For stblkcode
 typedef void (*RegBindlessCallback)(void *, int, void *); // tex_ptr, reg, context
-typedef void (*CreateStblkStateCallback)(const uint *, uint16_t, const uint *, uint16_t, const void *, int, bool,
+typedef void (*CreateStblkStateCallback)(const uint *, uint32_t, const uint *, uint32_t, const void *, int, bool,
   void *); // vs_tex, vs_tex_range_packed, ps_tex, ps_tex_range_packed, consts, const_cnt, multidraw_cbuf, context
 
 typedef uint (*AcquireTexCallback)(void *); // tex_ptr, returns tid
+
+typedef void (*FatalErrorCallback)(const char *, va_list); // fmt, args
+
+typedef float4 (*RbGetF4Callback)(int32_t);
+typedef float (*RbGetRealCallback)(int32_t);
+typedef int32_t (*RbGetIntCallback)(int32_t);
+typedef void (*RbGetMat44Callback)(int32_t, float4x4 *);
+typedef void (*RbGetMat43Callback)(int32_t, float4x3 *);
+typedef void *(*RbGetTexCallback)(int32_t);
+typedef void *(*RbGetBufCallback)(int32_t);
+typedef int4 (*RbGetIvecCallback)(int32_t);
+typedef void (*RbFlushTexCallback)(int32_t, int32_t, void *);
+typedef void (*RbFlushBufCallback)(int32_t, int32_t, void *);
+typedef uint32_t (*RbAllocBindlessCallback)(void *);
+typedef void (*RbFlushBindlessTexCallback)(uint32_t, void *);
+typedef uint64_t (*RbGetSamplerCallback)(int32_t);
+typedef void *(*RbGetTlasCallback)(int32_t);
+typedef void (*RbFlushCbCallback)(int32_t, int32_t, void *);
+typedef void (*RbFlushSamplerCallback)(int32_t, int32_t, uint64_t);
+typedef uint32_t (*RbAllocBindlessSamplerCallback)(uint64_t);
+typedef void (*RbFlushBindlessSamplerCallback)(uint32_t, uint64_t);
+typedef void (*RbFlushTlasCallback)(int32_t, int32_t, void *);
+typedef void (*RbFlushRwtexCallback)(int32_t, int32_t, void *);
+typedef void (*RbFlushRwbufCallback)(int32_t, int32_t, void *);
 
 struct CallbackTable
 {
@@ -69,6 +94,31 @@ struct CallbackTable
   CreateStblkStateCallback createState;
 
   AcquireTexCallback acquireTex;
+
+  FatalErrorCallback fatal;
+
+  RbGetF4Callback rbGetF4;
+  RbGetRealCallback rbGetReal;
+  RbGetIntCallback rbGetInt;
+  RbGetMat44Callback rbGetMat44;
+  RbGetTexCallback rbGetTex;
+  RbGetBufCallback rbGetBuf;
+  RbGetIvecCallback rbGetIvec;
+
+  RbFlushTexCallback rbFlushTex;
+  RbFlushBufCallback rbFlushBuf;
+  RbAllocBindlessCallback rbAllocBindless;
+  RbFlushBindlessTexCallback rbFlushBindlessTex;
+  RbGetSamplerCallback rbGetSampler;
+  RbGetTlasCallback rbGetTlas;
+  RbFlushCbCallback rbFlushCb;
+  RbFlushSamplerCallback rbFlushSampler;
+  RbAllocBindlessSamplerCallback rbAllocBindlessSampler;
+  RbFlushBindlessSamplerCallback rbFlushBindlessSampler;
+  RbFlushTlasCallback rbFlushTlas;
+  RbFlushRwtexCallback rbFlushRwtex;
+  RbFlushRwbufCallback rbFlushRwbuf;
+  RbGetMat43Callback rbGetMat43;
 };
 
 } // namespace stcode::cpp

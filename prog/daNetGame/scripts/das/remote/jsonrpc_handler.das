@@ -66,9 +66,10 @@ class JsonRpcMatch : Matcher
       tryParse ||= oc > 0 || ac > 0
       if tryParse && oc == 0 && ac == 0 && (ch == '}' || ch == ']')
         tryParse = false
-        if self->parseReq(str |> slice(start, idx + 1))
-          start = idx + 1
+        let nextStart = idx + 1
+        if self->parseReq(str |> slice(start, nextStart))
           end = idx + 1
+        start = nextStart
 
     if start < strLen - 1
       if self->parseReq(str |> slice(start, strLen))
@@ -131,6 +132,8 @@ class JsonRpcMatch : Matcher
         js as _object |> get("id") <| $(ptr)
           if ptr is _number
             req.id = uint64(ptr as _number)
+          elif ptr is _longint
+            req.id = uint64(ptr as _longint)
           elif ptr is _string
             req.id = uint64(double(ptr as _string))
           else

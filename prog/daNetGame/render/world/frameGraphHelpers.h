@@ -1,12 +1,16 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <render/world/defaultVrsSettings.h>
 #include <render/daFrameGraph/daFG.h>
 #include <render/debugMesh.h>
+#include <render/debugGbuffer.h>
 #include <render/rendererFeatures.h>
-#include <render/world/cameraParams.h>
-#include <render/world/cameraInCamera.h>
+#include <render/world/bvh.h>
+#include <render/cameraParams.h>
+#include <render/cameraInCamera/cameraInCamera.h>
 #include <render/world/gbufferConsts.h>
+#include <render/world/wrDispatcher.h>
 #include <util/dag_convar.h>
 #include <drv/3d/dag_texture.h>
 
@@ -26,6 +30,53 @@ extern bool need_hero_cockpit_flag_in_prepass;
 // explicitly passing such data through blobs.
 struct OrderingToken
 {};
+
+class CameraViewShvars final
+{
+  using CameraBlobRequestType = decltype(eastl::declval<dafg::Registry>().readBlob<CameraParams>(""));
+  using CameraBlobHandleType = decltype(eastl::declval<CameraBlobRequestType>().handle());
+  static const Point4 &getViewVecLT(const CameraParams &params) { return params.viewVecs.viewVecLT; }
+  static const Point4 &getViewVecRT(const CameraParams &params) { return params.viewVecs.viewVecRT; }
+  static const Point4 &getViewVecLB(const CameraParams &params) { return params.viewVecs.viewVecLB; }
+  static const Point4 &getViewVecRB(const CameraParams &params) { return params.viewVecs.viewVecRB; }
+
+public:
+  CameraViewShvars(CameraBlobRequestType camera_view) : view(camera_view) {}
+
+  CameraViewShvars bindViewVecs() &&
+  {
+    eastl::move(view).bindToShaderVar<getViewVecLT>("view_vecLT");
+    eastl::move(view).bindToShaderVar<getViewVecRT>("view_vecRT");
+    eastl::move(view).bindToShaderVar<getViewVecLB>("view_vecLB");
+    eastl::move(view).bindToShaderVar<getViewVecRB>("view_vecRB");
+    return {view};
+  }
+
+  CameraBlobHandleType toHandle() && { return eastl::move(view).handle(); }
+
+private:
+  CameraBlobRequestType view;
+};
+
+inline void strict_camera_view_ordering(dafg::Registry registry, const bool is_main_view)
+{
+  if (is_main_view)
+    registry.createBlob<OrderingToken>("camera_view_strict_ordering_token");
+  else
+    (registry.getParentNameSpace() / "view0").readBlob<OrderingToken>("camera_view_strict_ordering_token");
+}
+
+inline void read_all_camera_view_tokens(dafg::NameSpaceRequest ns, const char *name)
+{
+  (ns / "view0").readBlob<OrderingToken>(name).optional();
+  (ns / "view1").readBlob<OrderingToken>(name).optional();
+}
+
+inline void read_all_camera_view_tokens(dafg::NameSpaceRequest ns, std::initializer_list<const char *> names)
+{
+  for (const char *name : names)
+    read_all_camera_view_tokens(ns, name);
+}
 
 inline const char *get_camera_in_camera_blob_name()
 {
@@ -64,6 +115,34 @@ inline auto use_camera_in_camera(dafg::Registry registry, const bool jittered = 
                   .bindAsView<&CameraParams::viewTm>()
                   .bindToShaderVar<&CameraParams::jitteredCamPosToUnjitteredHistoryClip>("jitteredCamPosToUnjitteredHistoryClip");
 
+  return jittered ? eastl::move(camReq).bindAsProj<&CameraParams::jitterProjTm>()
+                  : eastl::move(camReq).bindAsProj<&CameraParams::noJitterProjTm>();
+}
+
+inline auto read_camera_view(dafg::Registry registry, const char *view_ns)
+{
+  return (registry.root() / view_ns).readBlob<CameraParams>("current_camera");
+}
+
+inline auto read_camera_view_history(dafg::Registry registry, const char *view_ns)
+{
+  return (registry.root() / view_ns).readBlobHistory<CameraParams>("current_camera");
+}
+
+inline auto use_camera_view(dafg::Registry registry, const char *view_ns, const bool jittered = true)
+{
+  auto camReq = read_camera_view(registry, view_ns)
+                  .bindAsView<&CameraParams::viewTm>()
+                  .bindToShaderVar<&CameraParams::jitteredCamPosToUnjitteredHistoryClip>("jitteredCamPosToUnjitteredHistoryClip");
+  return jittered ? eastl::move(camReq).bindAsProj<&CameraParams::jitterProjTm>()
+                  : eastl::move(camReq).bindAsProj<&CameraParams::noJitterProjTm>();
+}
+
+inline auto use_rot_camera_view(dafg::Registry registry, const char *view_ns, const bool jittered = true)
+{
+  auto camReq = read_camera_view(registry, view_ns)
+                  .bindAsView<&CameraParams::viewRotTm>()
+                  .bindToShaderVar<&CameraParams::jitteredCamPosToUnjitteredHistoryClip>("jitteredCamPosToUnjitteredHistoryClip");
   return jittered ? eastl::move(camReq).bindAsProj<&CameraParams::jitterProjTm>().handle()
                   : eastl::move(camReq).bindAsProj<&CameraParams::noJitterProjTm>().handle();
 }
@@ -73,8 +152,7 @@ inline auto use_current_camera(dafg::Registry &registry)
   return registry.readBlob<CameraParams>("current_camera")
     .bindAsView<&CameraParams::viewTm>()
     .bindAsProj<&CameraParams::jitterProjTm>()
-    .bindToShaderVar<&CameraParams::jitteredCamPosToUnjitteredHistoryClip>("jitteredCamPosToUnjitteredHistoryClip")
-    .handle();
+    .bindToShaderVar<&CameraParams::jitteredCamPosToUnjitteredHistoryClip>("jitteredCamPosToUnjitteredHistoryClip");
 }
 
 inline auto request_common_transparent_state(dafg::Registry &registry, const char *depth_bind = nullptr, bool use_reactive_mask = true)
@@ -86,16 +164,16 @@ inline auto request_common_transparent_state(dafg::Registry &registry, const cha
       registry.allowAsyncPipelines()
         .requestRenderPass()
         .color({"color_target", reactiveMask})
-        .depthRoAndBindToShaderVars("depth", {depth_bind});
+        .depthReadTestAndSample("depth", {depth_bind});
     else
-      registry.allowAsyncPipelines().requestRenderPass().color({"color_target", reactiveMask}).depthRo("depth");
+      registry.allowAsyncPipelines().requestRenderPass().color({"color_target", reactiveMask}).depthReadTestOnly("depth");
   }
   else
   {
     if (depth_bind)
-      registry.allowAsyncPipelines().requestRenderPass().color({"color_target"}).depthRoAndBindToShaderVars("depth", {depth_bind});
+      registry.allowAsyncPipelines().requestRenderPass().color({"color_target"}).depthReadTestAndSample("depth", {depth_bind});
     else
-      registry.allowAsyncPipelines().requestRenderPass().color({"color_target"}).depthRo("depth");
+      registry.allowAsyncPipelines().requestRenderPass().color({"color_target"}).depthReadTestOnly("depth");
   }
 
   registry.readBlob<Point4>("world_view_pos").bindToShaderVar("world_view_pos");
@@ -106,11 +184,11 @@ inline auto request_common_published_transparent_state(dafg::Registry &registry,
   if (use_reactive_mask)
   {
     auto reactiveMask = registry.modify("reactive_mask").texture().optional();
-    registry.requestRenderPass().color({"target_for_transparency", reactiveMask}).depthRw("depth_for_transparency");
+    registry.requestRenderPass().color({"target_for_transparency", reactiveMask}).depth("depth_for_transparency");
   }
   else
   {
-    registry.requestRenderPass().color({"target_for_transparency"}).depthRw("depth_for_transparency");
+    registry.requestRenderPass().color({"target_for_transparency"}).depth("depth_for_transparency");
   }
   registry.readBlob<Point4>("world_view_pos").bindToShaderVar("world_view_pos");
   return use_camera_in_camera(registry);
@@ -118,8 +196,68 @@ inline auto request_common_published_transparent_state(dafg::Registry &registry,
 
 inline auto request_common_opaque_state(dafg::Registry registry)
 {
-  auto cameraHndl = use_camera_in_camera(registry);
+  auto camera = use_camera_in_camera(registry);
+  auto cameraHndl = CameraViewShvars{camera}.bindViewVecs().toHandle();
   auto stateRequest = registry.requestState().setFrameBlock("global_frame").allowWireframe();
+
+  // Many shaders read CSM shadows, so we just add dependency for all opaque state requests
+  registry.root().readTexture("csm_texture").optional().atStage(dafg::Stage::POST_RASTER);
+
+  // For impostor billboards and stuff
+  registry.readBlob<Point4>("world_view_pos").bindToShaderVar("world_view_pos");
+
+  return eastl::pair{cameraHndl, stateRequest};
+}
+
+inline auto request_common_transparent_state_per_view(
+  dafg::Registry &registry, const char *view_ns, const char *depth_bind = nullptr, bool use_reactive_mask = true)
+{
+  if (use_reactive_mask)
+  {
+    auto reactiveMask = registry.modify("reactive_mask").texture().optional();
+    if (depth_bind)
+      registry.allowAsyncPipelines()
+        .requestRenderPass()
+        .color({"color_target", reactiveMask})
+        .depthReadTestAndSample("depth", {depth_bind});
+    else
+      registry.allowAsyncPipelines().requestRenderPass().color({"color_target", reactiveMask}).depthReadTestOnly("depth");
+  }
+  else
+  {
+    if (depth_bind)
+      registry.allowAsyncPipelines().requestRenderPass().color({"color_target"}).depthReadTestAndSample("depth", {depth_bind});
+    else
+      registry.allowAsyncPipelines().requestRenderPass().color({"color_target"}).depthReadTestOnly("depth");
+  }
+
+  registry.readBlob<Point4>("world_view_pos").bindToShaderVar("world_view_pos");
+  return use_camera_view(registry, view_ns);
+}
+inline auto request_common_published_transparent_state_per_view(
+  dafg::Registry &registry, const char *view_ns, bool use_reactive_mask = false)
+{
+  if (use_reactive_mask)
+  {
+    auto reactiveMask = registry.modify("reactive_mask").texture().optional();
+    registry.requestRenderPass().color({"target_for_transparency", reactiveMask}).depth("depth_for_transparency");
+  }
+  else
+  {
+    registry.requestRenderPass().color({"target_for_transparency"}).depth("depth_for_transparency");
+  }
+  registry.readBlob<Point4>("world_view_pos").bindToShaderVar("world_view_pos");
+  return use_camera_view(registry, view_ns);
+}
+
+inline auto request_common_opaque_state_per_view(dafg::Registry registry, const char *view_ns)
+{
+  auto camera = use_camera_view(registry, view_ns);
+  auto cameraHndl = CameraViewShvars{camera}.bindViewVecs().toHandle();
+  auto stateRequest = registry.requestState().setFrameBlock("global_frame").allowWireframe();
+
+  // Many shaders read CSM shadows, so we just add dependency for all opaque state requests
+  registry.root().readTexture("csm_texture").optional().atStage(dafg::Stage::POST_RASTER);
 
   // For impostor billboards and stuff
   registry.readBlob<Point4>("world_view_pos").bindToShaderVar("world_view_pos");
@@ -130,26 +268,63 @@ inline auto request_common_opaque_state(dafg::Registry registry)
 inline void start_transparent_region(dafg::Registry registry, dafg::NameSpaceRequest previous_region_ns)
 {
   registry.requestRenderPass()
-    .color({previous_region_ns.rename("color_target_done", "color_target", dafg::History::No).texture()})
-    .depthRo(previous_region_ns.rename("depth_done", "depth", dafg::History::No).texture());
+    .color({previous_region_ns.rename("color_target_done", "color_target").texture()})
+    .depthReadTestOnly(previous_region_ns.rename("depth_done", "depth").texture());
 }
 
 inline void end_transparent_region(dafg::Registry registry)
 {
   registry.requestRenderPass()
-    .color({registry.rename("color_target", "color_target_done", dafg::History::No).texture()})
-    .depthRo(registry.rename("depth", "depth_done", dafg::History::No).texture());
+    .color({registry.rename("color_target", "color_target_done").texture()})
+    .depthReadTestOnly(registry.rename("depth", "depth_done").texture());
 }
+
+inline bool is_resolve_target_external() { return !shouldRenderGbufferDebug() && !renderer_has_feature(FeatureRenderFlags::POSTFX); }
 
 inline uint32_t get_frame_render_target_format()
 {
-  if (renderer_has_feature(FeatureRenderFlags::FORWARD_RENDERING) && !renderer_has_feature(FeatureRenderFlags::POSTFX))
-    return TEXFMT_R8G8B8A8;
-
   uint32_t rtFmt = TEXFMT_R11G11B10F;
   if (!(d3d::get_texformat_usage(rtFmt) & d3d::USAGE_RTARGET))
     rtFmt = TEXFMT_A16B16G16R16F;
   return rtFmt;
+}
+
+inline void create_gbuffer_targets(
+  dafg::Registry registry, const char *name_fmt, const bool need_motion_vectors, const bool force_clear_on_creation = false)
+{
+  const auto gbufResolution = registry.getResolution<2>("main_view");
+
+  const bool isThinG = !renderer_has_feature(FULL_DEFERRED);
+  G_ASSERTF(!(isThinG && need_motion_vectors), "Motion vectors are not supported with thin gbuffer!");
+
+  dag::Span<const unsigned> gbufFmts = isThinG ? dag::Span<const unsigned>(THIN_GBUFFER_RT_FORMATS)
+                                       : need_motion_vectors
+                                         ? dag::Span<const unsigned>(FULL_GBUFFER_FORMATS)
+                                         : dag::Span<const unsigned>(FULL_GBUFFER_FORMATS.data(), NO_MOTION_GBUFFER_RT_COUNT);
+
+  const uint32_t globalFlags = WRDispatcher::isEnviCover() && WRDispatcher::isEnviCoverCompatible()
+                                 ? TEXCF_UNORDERED | GBUF_TARGET_GLOBAL_FLAGS
+                                 : GBUF_TARGET_GLOBAL_FLAGS;
+
+  const bool isRREnabled = is_rr_enabled();
+
+  static const Point3 MOTION_MASK{65504, 65504, 0};
+  for (uint32_t i = 0; i < gbufFmts.size(); ++i)
+  {
+    eastl::fixed_string<char, 16> name(eastl::fixed_string<char, 16>::CtorSprintf{}, name_fmt, i);
+    auto gbufRtHndl = registry.create(name.c_str())
+                        .texture({gbufFmts[i] | globalFlags | TEXCF_RTARGET, gbufResolution})
+                        .useAs(dafg::Usage::COLOR_ATTACHMENT)
+                        .atStage(dafg::Stage::PS);
+    if (i == 0 && (force_clear_on_creation || isRREnabled))
+      eastl::move(gbufRtHndl).clear(make_clear_value(0.0f, 0.0f, 0.0f, 0.0f));
+    if (i == 1 && (force_clear_on_creation || !renderer_has_feature(FeatureRenderFlags::PREV_OPAQUE_TEX) || isRREnabled))
+      eastl::move(gbufRtHndl).clear(make_clear_value(0, 0, 0, 0));
+    if (i == 2 && (need_motion_vectors))
+      eastl::move(gbufRtHndl).clear(make_clear_value(0, 0, 0, 0));
+    if (i == 3)
+      eastl::move(gbufRtHndl).clear(make_clear_value(MOTION_MASK.x, MOTION_MASK.y, MOTION_MASK.z, 0.0f));
+  }
 }
 
 inline uint32_t get_gbuffer_depth_format(const bool need_stencil = false)
@@ -226,28 +401,39 @@ inline auto render_to_gbuffer(dafg::Registry registry)
 {
   return registry.allowAsyncPipelines()
     .requestRenderPass()
-    .depthRw("gbuf_depth")
+    .depth("gbuf_depth")
     .color({"gbuf_0", "gbuf_1", registry.modify("gbuf_2").texture().optional(), registry.modify("gbuf_3").texture().optional()});
 }
 
 inline auto render_to_gbuffer_prepass(dafg::Registry registry)
 {
-  return registry.allowAsyncPipelines().requestRenderPass().depthRw("gbuf_depth_prepass");
+  return registry.allowAsyncPipelines().requestRenderPass().depth("gbuf_depth_prepass");
 }
 
 // Depth can be sampled through depth_gbuf
 inline auto render_to_gbuffer_but_sample_depth(dafg::Registry registry)
 {
-  return registry.allowAsyncPipelines()
-    .requestRenderPass()
-    .depthRoAndBindToShaderVars("gbuf_depth", {"depth_gbuf"})
-    .color({"gbuf_0", "gbuf_1", registry.modify("gbuf_2").texture().optional(), registry.modify("gbuf_3").texture().optional()});
+  if (renderer_has_feature(FeatureRenderFlags::GBUFFER_PACKED_NORMALS))
+  {
+    return registry.allowAsyncPipelines()
+      .requestRenderPass()
+      .depthReadTestAndSample("gbuf_depth", {"depth_gbuf"})
+      .color({"gbuf_0", "unpacked_normals", registry.modify("gbuf_2").texture().optional(),
+        registry.modify("gbuf_3").texture().optional()});
+  }
+  else
+  {
+    return registry.allowAsyncPipelines()
+      .requestRenderPass()
+      .depthReadTestAndSample("gbuf_depth", {"depth_gbuf"})
+      .color({"gbuf_0", "gbuf_1", registry.modify("gbuf_2").texture().optional(), registry.modify("gbuf_3").texture().optional()});
+  }
 }
 
 inline auto use_and_sample_ro_gbuffer_depth(dafg::Registry registry)
 {
   registry.read("gbuf_sampler").blob<d3d::SamplerHandle>().bindToShaderVar("depth_gbuf_samplerstate");
-  return registry.allowAsyncPipelines().requestRenderPass().depthRoAndBindToShaderVars("gbuf_depth", {"depth_gbuf"});
+  return registry.allowAsyncPipelines().requestRenderPass().depthReadTestAndSample("gbuf_depth", {"depth_gbuf"});
 }
 
 inline void start_gbuffer_rendering_region(dafg::Registry registry, dafg::NameSpaceRequest previous_region_ns, bool use_prepass)
@@ -255,18 +441,17 @@ inline void start_gbuffer_rendering_region(dafg::Registry registry, dafg::NameSp
   // we rename "opaque/DYNAMICS/gbuf_0_done" to "opaque/STATICS/gbuf_0" and so on
   registry.requestRenderPass()
     .color({
-      previous_region_ns.rename("gbuf_0_done", "gbuf_0", dafg::History::No).texture(),
-      previous_region_ns.rename("gbuf_1_done", "gbuf_1", dafg::History::No).texture(),
-      previous_region_ns.rename("gbuf_2_done", "gbuf_2", dafg::History::No).texture().optional(),
-      previous_region_ns.rename("gbuf_3_done", "gbuf_3", dafg::History::No).texture().optional(),
+      previous_region_ns.rename("gbuf_0_done", "gbuf_0").texture(),
+      previous_region_ns.rename("gbuf_1_done", "gbuf_1").texture(),
+      previous_region_ns.rename("gbuf_2_done", "gbuf_2").texture().optional(),
+      previous_region_ns.rename("gbuf_3_done", "gbuf_3").texture().optional(),
     })
-    .depthRw(
-      previous_region_ns.rename("gbuf_depth_done", use_prepass ? "gbuf_depth_prepass" : "gbuf_depth", dafg::History::No).texture());
+    .depth(previous_region_ns.rename("gbuf_depth_done", use_prepass ? "gbuf_depth_prepass" : "gbuf_depth").texture());
 }
 
 inline void complete_prepass_of_gbuffer_rendering_region(dafg::Registry registry)
 {
-  registry.requestRenderPass().depthRw(registry.rename("gbuf_depth_prepass", "gbuf_depth", dafg::History::No).texture());
+  registry.requestRenderPass().depth(registry.rename("gbuf_depth_prepass", "gbuf_depth").texture());
 }
 
 inline void end_gbuffer_rendering_region(dafg::Registry registry)
@@ -281,12 +466,12 @@ inline void end_gbuffer_rendering_region(dafg::Registry registry)
   // so we require a rename at the end of every such namespace
   registry.requestRenderPass()
     .color({
-      registry.rename("gbuf_0", "gbuf_0_done", dafg::History::No).texture(),
-      registry.rename("gbuf_1", "gbuf_1_done", dafg::History::No).texture(),
-      registry.rename("gbuf_2", "gbuf_2_done", dafg::History::No).texture().optional(),
-      registry.rename("gbuf_3", "gbuf_3_done", dafg::History::No).texture().optional(),
+      registry.rename("gbuf_0", "gbuf_0_done").texture(),
+      registry.rename("gbuf_1", "gbuf_1_done").texture(),
+      registry.rename("gbuf_2", "gbuf_2_done").texture().optional(),
+      registry.rename("gbuf_3", "gbuf_3_done").texture().optional(),
     })
-    .depthRw(registry.rename("gbuf_depth", "gbuf_depth_done", dafg::History::No).texture());
+    .depth(registry.rename("gbuf_depth", "gbuf_depth_done").texture());
 }
 
 inline const vec4f &get_jitter_frustumPlane03X(const CameraParams &params) { return params.jitterFrustum.plane03X; }
@@ -313,13 +498,9 @@ inline const vec4f &get_no_jitter_frustumPlane4(const CameraParams &params) { re
 
 inline const vec4f &get_no_jitter_frustumPlane5(const CameraParams &params) { return params.noJitterFrustum.camPlanes[5]; }
 
-/**
- * This is similar to calling set_frustum_planes(...), but it is handled by the FG.
- * It sets the frustum plane shader vars according to the current_camera::jitterFrustum
- */
-inline void use_jitter_frustum_plane_shader_vars(dafg::Registry registry, const char *camera_blob_name = "current_camera")
+inline void bind_jitter_frustum_plane_shader_vars(dafg::NameSpaceRequest ns, const char *camera_blob_name)
 {
-  registry.readBlob<CameraParams>(camera_blob_name)
+  ns.readBlob<CameraParams>(camera_blob_name)
     .bindToShaderVar<get_jitter_frustumPlane03X>("frustumPlane03X")
     .bindToShaderVar<get_jitter_frustumPlane03Y>("frustumPlane03Y")
     .bindToShaderVar<get_jitter_frustumPlane03Z>("frustumPlane03Z")
@@ -328,11 +509,25 @@ inline void use_jitter_frustum_plane_shader_vars(dafg::Registry registry, const 
     .bindToShaderVar<get_jitter_frustumPlane5>("frustumPlane5");
 }
 
+/**
+ * This is similar to calling set_frustum_planes(...), but it is handled by the FG.
+ * It sets the frustum plane shader vars according to the current_camera::jitterFrustum
+ */
+inline void use_jitter_frustum_plane_shader_vars(dafg::Registry registry, const char *camera_blob_name = "current_camera")
+{
+  bind_jitter_frustum_plane_shader_vars(registry.currNameSpace(), camera_blob_name);
+}
+
 inline void use_camera_in_camera_jitter_frustum_plane_shader_vars(dafg::Registry registry)
 {
   const bool hasCamCamFeature = renderer_has_feature(FeatureRenderFlags::CAMERA_IN_CAMERA);
   const char *camName = hasCamCamFeature ? "camera_in_camera" : "current_camera";
   use_jitter_frustum_plane_shader_vars(registry, camName);
+}
+
+inline void use_camera_view_jitter_frustum_plane_shader_vars(dafg::Registry registry, const char *view_ns)
+{
+  bind_jitter_frustum_plane_shader_vars(registry.root() / view_ns, "current_camera");
 }
 
 /**
@@ -369,4 +564,13 @@ inline void use_volfog_shadow(dafg::Registry registry, dafg::Stage stage)
 {
   G_UNUSED(stage); // currently volfog shadow resources are fully outside of FG
   registry.readBlob<OrderingToken>("volfog_shadow_token").optional();
+}
+
+inline void request_and_bind_scope_lens_reflections(dafg::Registry registry)
+{
+  registry.readTexture("scope_lens_reflections").optional().atStage(dafg::Stage::PS).bindToShaderVar("scope_lens_reflections");
+  registry.readBlob<d3d::SamplerHandle>("scope_lens_reflections_sampler")
+    .optional()
+    .bindToShaderVar("scope_lens_reflections_samplerstate");
+  registry.readBlob<float>("inv_scope_lens_reflection_texel_size").optional().bindToShaderVar("inv_scope_lens_reflection_texel_size");
 }

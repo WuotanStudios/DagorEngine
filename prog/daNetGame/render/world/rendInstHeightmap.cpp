@@ -118,7 +118,7 @@ RendInstHeightmap::RendInstHeightmap(int tex_size, float rect_size, float land_h
 static struct RendinstHeightmapVisibilityJob final : public cpujobs::IJob
 {
   RendInstHeightmap *riHmap;
-  const char *getJobName(bool &) const override { return "rendinst_heightmap_visibility"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("rendinst_heightmap_visibility"); }
   void doJob() override { riHmap->prepareRiVisibilityAsync(); };
 } visibility_job;
 
@@ -175,15 +175,13 @@ void RendInstHeightmap::prepareRiVisibilityAsync()
     G_ASSERTF(region.lt.x + region.wd.x <= helper.texSize && helper.texSize - region.lt.y <= helper.texSize,
       "update region exceeds texture size left_top = %@, width = %@ texSize = %@", region.lt, region.wd, helper.texSize);
 
-    TMatrix4 globTm = TMatrix4(vtm) * projTMs[i];
-    mat44f culling_view_proj;
-    v_mat44_make_from_44cu(culling_view_proj, &globTm._11);
-
     if (rendinstHeightmapVisibilities.size() <= i)
       rendinstHeightmapVisibilities.push_back(create_rendinst_heightmap_visibility());
 
-    rendinst::prepareRIGenExtraVisibility(culling_view_proj, Point3(box.center().x, (zf - zn), box.center().y),
-      *rendinstHeightmapVisibilities[i], true, NULL, {}, rendinst::RiExtraCullIntention::MAIN, false, true);
+    bbox3f cullBox;
+    cullBox.bmin = v_make_vec4f(box[0].x, zn, box[0].y, 0.f);
+    cullBox.bmax = v_make_vec4f(box[1].x, zf, box[1].y, 0.f);
+    rendinst::prepareRIGenExtraVisibilityBoxForRIClipmapBox(cullBox, 0, 0.f, 0.f, *rendinstHeightmapVisibilities[i], nullptr);
   }
 }
 
@@ -210,8 +208,7 @@ void RendInstHeightmap::updateToroidalTextureRegions(int globalFrameBlockId)
   FRAME_LAYER_GUARD(globalFrameBlockId);
 
   d3d::settm(TM_VIEW, vtm);
-  d3d::set_render_target((Texture *)nullptr, 0);
-  d3d::set_depth(depthTexture.getTex2D(), DepthAccess::RW);
+  d3d::set_render_target({depthTexture.getTex2D(), 0, 0}, DepthAccess::RW, {});
 
   for (int i = 0; i < regionsToUpdate.size(); ++i)
   {
@@ -251,7 +248,7 @@ void RendInstHeightmap::updateToroidalTextureRegions(int globalFrameBlockId)
   }
   regionsToUpdate.resize(0);
 
-  d3d::set_depth(nullptr, DepthAccess::RW);
+  d3d::set_render_target({}, DepthAccess::RW, {});
   d3d::resource_barrier({depthTexture.getTex2D(), RB_RO_SRV | RB_STAGE_COMPUTE, 0, 0});
 
   setVar();
@@ -266,7 +263,7 @@ void RendInstHeightmap::driverReset()
 void RendInstHeightmap::invalidate()
 {
   prevCamPos.x = prevCamPos.y = prevCamPos.z = eastl::numeric_limits<float>::max();
-  helper.curOrigin = {-1000000, 100000};
+  helper.curOrigin = {-1000000, 1000000};
 }
 
 void RendInstHeightmap::setVar()
@@ -275,12 +272,12 @@ void RendInstHeightmap::setVar()
     return;
   ShaderGlobal::set_texture(rendinst_clipmapVarId, depthTexture);
   Point2 ofs = Point2((helper.mainOrigin - helper.curOrigin) % helper.texSize) / helper.texSize;
-  ShaderGlobal::set_color4(rendinst_clipmap_world_to_hmap_tex_ofsVarId, ofs.x, -ofs.y, 0, 0);
+  ShaderGlobal::set_float4(rendinst_clipmap_world_to_hmap_tex_ofsVarId, ofs.x, -ofs.y, 0, 0);
 
   Point2 worldSpaceOrigin = Point2(helper.curOrigin) * texelSize;
   float worldArea = helper.texSize * texelSize;
-  ShaderGlobal::set_color4(rendinst_clipmap_world_to_hmap_ofsVarId, 1.0f / worldArea, -1.0f / worldArea,
+  ShaderGlobal::set_float4(rendinst_clipmap_world_to_hmap_ofsVarId, 1.0f / worldArea, -1.0f / worldArea,
     -worldSpaceOrigin.x / worldArea + 0.5f, worldSpaceOrigin.y / worldArea + 0.5);
 
-  ShaderGlobal::set_color4(rendinst_clipmap_zn_zfVarId, landHeightMin, maxHt, 0, 0);
+  ShaderGlobal::set_float4(rendinst_clipmap_zn_zfVarId, landHeightMin, maxHt, 0, 0);
 }

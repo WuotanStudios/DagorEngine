@@ -14,6 +14,7 @@ DataBlock *imgui_get_blk() { return nullptr; }
 void imgui_save_blk() {}
 void imgui_window_set_visible(const char *, const char *, const bool) {}
 bool imgui_window_is_visible(const char *, const char *) { return false; }
+void imgui_window_request_focus(const char *, const char *) {}
 void imgui_perform_registered(bool) {}
 void imgui_set_bold_font() {}
 void imgui_set_mono_font() {}
@@ -22,6 +23,7 @@ ImFont *imgui_get_bold_font() { return nullptr; }
 ImFont *imgui_get_mono_font() { return nullptr; }
 void imgui_apply_style_from_blk() {}
 int imgui_get_menu_bar_height() { return 0; }
+void *convert_dag_res_id_to_imgui(D3DRESID) { return nullptr; };
 
 ImGuiFunctionQueue *ImGuiFunctionQueue::windowHead = nullptr;
 ImGuiFunctionQueue *ImGuiFunctionQueue::functionHead = nullptr;

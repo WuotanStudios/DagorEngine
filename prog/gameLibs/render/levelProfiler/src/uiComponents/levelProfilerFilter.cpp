@@ -11,14 +11,6 @@
 namespace levelprofiler
 {
 
-static constexpr int TEXTURE_PROFILER_TAB_INDEX = 0;
-
-static TextureModule *getTextureModule()
-{
-  auto profilerUI = static_cast<TextureProfilerUI *>(ILevelProfiler::getInstance()->getTab(TEXTURE_PROFILER_TAB_INDEX)->module);
-  return profilerUI->getTextureModule();
-}
-
 // === Base Filters ===
 
 namespace ImGuiUtils
@@ -290,31 +282,6 @@ void LpIncludeExcludeFilter::drawPopup(const char *popup_id)
 
 // === Filter UI Components ===
 
-void LpFilterPopupManager::registerPopup(TableColumn table_column, const char *popup_identifier, FilterDrawCallback draw_func)
-{
-  entries.push_back({table_column, popup_identifier, draw_func});
-}
-
-void LpFilterPopupManager::open(TableColumn table_column) { columnToOpen = table_column; }
-
-void LpFilterPopupManager::drawAll()
-{
-  for (auto &entry : entries)
-  {
-    if (entry.column == columnToOpen)
-    {
-      ImGui::OpenPopup(entry.popupId);
-      columnToOpen = COLUMN_NONE; // Reset after opening
-    }
-
-    if (ImGui::BeginPopup(entry.popupId))
-    {
-      entry.drawFunction();
-      ImGui::EndPopup();
-    }
-  }
-}
-
 // === Master Filter Manager ===
 
 void TextureFilterManager::setNameSearch(const char *search_text)
@@ -381,11 +348,12 @@ bool TextureFilterManager::isTextureUsageFilterActive() const { return textureUs
 
 TextureFilterManager::TextureFilterManager() :
   // Initialize with reasonable defaults for filter ranges
-  mipRangeFilter(1, 12),           // Typical mip level range
-  sizeRangeFilter(0.0f, 100.0f),   // Size range in MB
-  lodsRangeFilter(1, 6),           // LOD levels range
-  resolutionRangeFilter(32, 4096), // Typical resolution range
-  textureUsageRangeFilter(2, 10)   // Texture Usage count range, min 2 for shared
+  mipRangeFilter(1, 12),
+  sizeRangeFilter(0.0f, 100.0f),
+  lodsRangeFilter(1, 6),
+  resolutionRangeFilter(32, 4096),
+  textureUsageRangeFilter(SHARED_TEXTURE_USAGE_MIN, 10),
+  assetInstanceCountRangeFilter(0, 100)
 {
   isTextureUsageFilterNonRI = true;
   isTextureUsageFilterUnique = true;
@@ -393,7 +361,8 @@ TextureFilterManager::TextureFilterManager() :
 
   mipRangeFilter.setAbsoluteBounds(0, 16);
   sizeRangeFilter.setAbsoluteBounds(0, 128.0f);
-  textureUsageRangeFilter.setAbsoluteBounds(2, 100);
+  textureUsageRangeFilter.setAbsoluteBounds(SHARED_TEXTURE_USAGE_MIN, 100);
+  assetInstanceCountRangeFilter.setAbsoluteBounds(0, 1000);
 }
 
 TextureFilterManager::~TextureFilterManager() {}
@@ -410,7 +379,6 @@ bool TextureFilterManager::passesAllFilters(const ProfilerString &texture_name, 
 
   // Width filter (use -1 for "Other" values)
   {
-    auto textureModule = getTextureModule();
     auto uniqueWidths = textureModule->getUniqueWidths();
     int widthKey = texture_data.info.w;
     if (eastl::find(uniqueWidths.begin(), uniqueWidths.end(), widthKey) == uniqueWidths.end())
@@ -421,7 +389,6 @@ bool TextureFilterManager::passesAllFilters(const ProfilerString &texture_name, 
   }
 
   {
-    auto textureModule = getTextureModule();
     auto uniqueHeights = textureModule->getUniqueHeights();
     int heightKey = texture_data.info.h;
     if (eastl::find(uniqueHeights.begin(), uniqueHeights.end(), heightKey) == uniqueHeights.end())
@@ -438,7 +405,6 @@ bool TextureFilterManager::passesAllFilters(const ProfilerString &texture_name, 
   }
 
   {
-    auto textureModule = getTextureModule();
     float sizeInMB = textureModule->getTextureMemorySize(texture_data);
     if (!sizeRangeFilter.pass(sizeInMB))
       return false;
@@ -463,7 +429,7 @@ bool TextureFilterManager::passesAllFilters(const ProfilerString &texture_name, 
 
   bool isNonRi = (textureUsage.unique == 0);
   bool isUnique = (textureUsage.unique == 1);
-  bool isShared = (textureUsage.unique >= 2);
+  bool isShared = (textureUsage.unique >= SHARED_TEXTURE_USAGE_MIN);
 
   if (isNonRi && !isTextureUsageFilterNonRI)
     return false;
@@ -476,22 +442,44 @@ bool TextureFilterManager::passesAllFilters(const ProfilerString &texture_name, 
   if (isShared && !textureUsageRangeFilter.pass(textureUsage.unique))
     return false;
 
+  // Asset instance count filter (checks if ALL assets using this texture have countOnMap in range)
+  if (assetInstanceCountRangeFilter.isUsingMin() || assetInstanceCountRangeFilter.isUsingMax())
+  {
+    const auto &textureToAssetsMap = riModule->getTextureToAssetsMap();
+    auto it = textureToAssetsMap.find(texture_name);
+    if (it == textureToAssetsMap.end() || it->second.empty())
+      return false;
+
+    const auto &instanceCounts = riModule->getRiInstanceCounts();
+
+    for (const auto &assetName : it->second)
+    {
+      auto countIt = instanceCounts.find(assetName);
+      if (countIt != instanceCounts.end())
+      {
+        if (!assetInstanceCountRangeFilter.pass(countIt->second))
+          return false;
+      }
+    }
+  }
+
   return true;
 }
 
-bool TextureFilterManager::isColumnFilterActive(TableColumn table_column) const
+bool TextureFilterManager::isColumnFilterActive(ColumnIndex table_column) const
 {
   switch (table_column)
   {
-    case COL_NAME: return nameFilter.isActive();
-    case COL_FORMAT: return !formatFilter.getOffList().empty();
-    case COL_WIDTH: return !widthFilter.getOffList().empty();
-    case COL_HEIGHT: return !heightFilter.getOffList().empty();
-    case COL_MIPS: return mipRangeFilter.isUsingMin() || mipRangeFilter.isUsingMax();
-    case COL_MEM_SIZE: return sizeRangeFilter.isUsingMin() || sizeRangeFilter.isUsingMax();
-    case COL_TEX_USAGE:
+    case *TextureColumn::NAME: return nameFilter.isActive();
+    case *TextureColumn::FORMAT: return !formatFilter.getOffList().empty();
+    case *TextureColumn::WIDTH: return !widthFilter.getOffList().empty();
+    case *TextureColumn::HEIGHT: return !heightFilter.getOffList().empty();
+    case *TextureColumn::MIPS: return mipRangeFilter.isUsingMin() || mipRangeFilter.isUsingMax();
+    case *TextureColumn::MEM_SIZE: return sizeRangeFilter.isUsingMin() || sizeRangeFilter.isUsingMax();
+    case *TextureColumn::USAGE:
       return !isTextureUsageFilterNonRI || !isTextureUsageFilterUnique || !isTextureUsageFilterShared ||
-             textureUsageRangeFilter.isUsingMin() || textureUsageRangeFilter.isUsingMax() || textureUsageFilter.isActive();
+             textureUsageRangeFilter.isUsingMin() || textureUsageRangeFilter.isUsingMax() || textureUsageFilter.isActive() ||
+             assetInstanceCountRangeFilter.isUsingMin() || assetInstanceCountRangeFilter.isUsingMax();
     default: return false;
   }
 }
@@ -502,26 +490,21 @@ void TextureFilterManager::resetAllFilters()
   formatFilter.reset();
   widthFilter.reset();
   heightFilter.reset();
+  textureUsageFilter.reset();
 
-  auto profilerUI = static_cast<TextureProfilerUI *>(ILevelProfiler::getInstance()->getTab(TEXTURE_PROFILER_TAB_INDEX)->module);
-  auto textureModule = profilerUI->getTextureModule();
-  auto riModuleInstance = profilerUI->getRIModule();
+  const DataBounds bounds = gatherDataBounds();
 
-  int minMip = textureModule->getMipMinDefault();
-  int maxMip = textureModule->getMipMaxDefault();
-  float minSize = textureModule->getMemorySizeMinDefault();
-  float maxSize = textureModule->getMemorySizeMaxDefault();
-  int minTextureUsage = 2; // Minimum for shared textures
-  int maxTextureUsageCount = riModuleInstance->getMaxUniqueTextureUsageCount();
+  mipRangeFilter.reset(bounds.mipMin, bounds.mipMax);
+  mipRangeFilter.setAbsoluteBounds(bounds.mipMin, bounds.mipMax);
 
-  mipRangeFilter.reset(minMip, maxMip);
-  mipRangeFilter.setAbsoluteBounds(minMip, maxMip);
+  sizeRangeFilter.reset(bounds.sizeMin, bounds.sizeMax);
+  sizeRangeFilter.setAbsoluteBounds(bounds.sizeMin, bounds.sizeMax);
 
-  sizeRangeFilter.reset(minSize, maxSize);
-  sizeRangeFilter.setAbsoluteBounds(minSize, maxSize);
+  textureUsageRangeFilter.reset(bounds.usageMin, bounds.usageMax);
+  textureUsageRangeFilter.setAbsoluteBounds(bounds.usageMin, bounds.usageMax);
 
-  textureUsageRangeFilter.reset(minTextureUsage, maxTextureUsageCount);
-  textureUsageRangeFilter.setAbsoluteBounds(minTextureUsage, maxTextureUsageCount);
+  assetInstanceCountRangeFilter.reset(bounds.instMin, bounds.instMax);
+  assetInstanceCountRangeFilter.setAbsoluteBounds(bounds.instMin, bounds.instMax);
 
   lodsRangeFilter.reset(1, 6);
   resolutionRangeFilter.reset(32, 4096);
@@ -531,14 +514,37 @@ void TextureFilterManager::resetAllFilters()
   isTextureUsageFilterShared = true;
 }
 
+TextureFilterManager::DataBounds TextureFilterManager::gatherDataBounds() const
+{
+  DataBounds bounds;
+  bounds.mipMin = textureModule->getMipMinDefault();
+  bounds.mipMax = textureModule->getMipMaxDefault();
+  bounds.sizeMin = textureModule->getMemorySizeMinDefault();
+  bounds.sizeMax = textureModule->getMemorySizeMaxDefault();
+  bounds.usageMin = SHARED_TEXTURE_USAGE_MIN;
+  bounds.usageMax = riModule->getMaxUniqueTextureUsageCount();
+  bounds.instMin = 0;
+  bounds.instMax = riModule->getMaxAssetInstanceCount();
+  return bounds;
+}
+
+void TextureFilterManager::rebindFiltersToData()
+{
+  const DataBounds bounds = gatherDataBounds();
+
+  mipRangeFilter.rebind(bounds.mipMin, bounds.mipMax);
+  sizeRangeFilter.rebind(bounds.sizeMin, bounds.sizeMax);
+  textureUsageRangeFilter.rebind(bounds.usageMin, bounds.usageMax);
+  assetInstanceCountRangeFilter.rebind(bounds.instMin, bounds.instMax);
+
+  // lods and resolution have fixed bounds, and the check, name and usage-flag filters hold values
+  // rather than data references, so they carry over untouched.
+}
+
 void TextureFilterManager::applyFilters()
 {
-  auto profilerUI = static_cast<TextureProfilerUI *>(ILevelProfiler::getInstance()->getTab(TEXTURE_PROFILER_TAB_INDEX)->module);
-  auto textureModule = profilerUI->getTextureModule();
-  auto riModuleInstance = profilerUI->getRIModule();
-
   const auto &allTextures = textureModule->getTextures();
-  const auto &textureUsageMap = riModuleInstance->getTextureUsage();
+  const auto &textureUsageMap = riModule->getTextureUsage();
 
   auto &currentFilteredTextures = const_cast<eastl::vector<ProfilerString> &>(textureModule->getFilteredTextures());
   currentFilteredTextures.clear();
@@ -548,7 +554,7 @@ void TextureFilterManager::applyFilters()
     // If the texture usage filter (by asset name) is active, check if any asset using this texture passes.
     if (textureUsageFilter.isActive())
     {
-      const auto &textureToAssetMap = riModuleInstance->getTextureToAssetsMap();
+      const auto &textureToAssetMap = riModule->getTextureToAssetsMap();
       auto assetIterator = textureToAssetMap.find(textureName);
 
       if (assetIterator == textureToAssetMap.end())
@@ -588,13 +594,18 @@ void TextureFilterManager::setTextureUsageFilters(bool non_ri_flag, bool unique_
   applyFilters();
 }
 
-void TextureFilterManager::setRIModule(RIModule *module) { riModule = module; }
+void TextureFilterManager::setModules(TextureModule *texture_module, RIModule *ri_module)
+{
+  G_ASSERT(texture_module && ri_module);
+  textureModule = texture_module;
+  riModule = ri_module;
+}
 
-eastl::vector<ProfilerString> TextureFilterManager::getUniqueFormats() const { return getTextureModule()->getUniqueFormats(); }
+eastl::vector<ProfilerString> TextureFilterManager::getUniqueFormats() const { return textureModule->getUniqueFormats(); }
 
-eastl::vector<int> TextureFilterManager::getUniqueWidths() const { return getTextureModule()->getUniqueWidths(); }
+eastl::vector<int> TextureFilterManager::getUniqueWidths() const { return textureModule->getUniqueWidths(); }
 
-eastl::vector<int> TextureFilterManager::getUniqueHeights() const { return getTextureModule()->getUniqueHeights(); }
+eastl::vector<int> TextureFilterManager::getUniqueHeights() const { return textureModule->getUniqueHeights(); }
 
 
 void TextureFilterManager::updateStringFilterSelection(LpSelectionExternalStorage *storage, int index, bool is_selected)

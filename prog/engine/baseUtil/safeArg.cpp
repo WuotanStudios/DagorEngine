@@ -18,22 +18,8 @@
 #include <math/dag_color.h>
 #include <math/dag_e3dColor.h>
 #include <stdio.h>
+#include <osApiWrappers/dag_unicode.h>
 
-void DagorSafeArg::set(const String &s)
-{
-  varValue.s = s;
-  varType = TYPE_STR;
-}
-void DagorSafeArg::set(const SimpleString &s)
-{
-  varValue.s = s;
-  varType = TYPE_STR;
-}
-void DagorSafeArg::set(const eastl::basic_string<char, eastl::allocator> &s)
-{
-  varValue.s = s.c_str();
-  varType = TYPE_STR;
-}
 void DagorSafeArg::set(const eastl::basic_string_view<char> &s)
 {
   varValue.s = s.data();
@@ -246,6 +232,11 @@ static bool check_dagor_custom_fmt(const char *&fmt, const DagorSafeArg *arg, in
   return true;
 }
 
+static const void *opt_convert_to_utf8(const char *fmt_buf, Tab<char> &temp_utf8_buf, const wchar_t *ws)
+{
+  return strchr(fmt_buf, 'l') || strchr(fmt_buf, 'w') ? (const void *)ws : (const void *)convert_to_utf8(temp_utf8_buf, ws);
+}
+
 int DagorSafeArg::count_len(const char *fmt, const DagorSafeArg *arg, int anum)
 {
   if (!anum)
@@ -253,6 +244,7 @@ int DagorSafeArg::count_len(const char *fmt, const DagorSafeArg *arg, int anum)
 
   int len = 0, carg = 0;
   char fmt_buf[32];
+  Tab<char> temp_utf8_buf;
 
   for (char c = *fmt; c; fmt++, c = *fmt)
   {
@@ -297,6 +289,9 @@ int DagorSafeArg::count_len(const char *fmt, const DagorSafeArg *arg, int anum)
         case DagorSafeArg::TYPE_P4:
           len += COUNT_PRNFMT_LEN("(%.3f,%.3f,%.3f,%.3f)", a.varValue.p4->x, a.varValue.p4->y, a.varValue.p4->z, a.varValue.p4->w);
           break;
+        case DagorSafeArg::TYPE_DP3:
+          len += COUNT_PRNFMT_LEN("(%.6f,%.6f,%.6f)", a.varValue.dp3->x, a.varValue.dp3->y, a.varValue.dp3->z);
+          break;
         case DagorSafeArg::TYPE_IP2: len += COUNT_PRNFMT_LEN("(%d,%d)", a.varValue.ip2->x, a.varValue.ip2->y); break;
         case DagorSafeArg::TYPE_IP3:
           len += COUNT_PRNFMT_LEN("(%d,%d,%d)", a.varValue.ip3->x, a.varValue.ip3->y, a.varValue.ip3->z);
@@ -330,6 +325,7 @@ int DagorSafeArg::count_len(const char *fmt, const DagorSafeArg *arg, int anum)
         case DagorSafeArg::TYPE_INT: len += COUNT_PRNFMT_LEN(FMT_I64, a.varValue.i); break;
         case DagorSafeArg::TYPE_DOUBLE: len += COUNT_PRNFMT_LEN("%g", a.varValue.d); break;
         case DagorSafeArg::TYPE_STR: len += COUNT_PRNFMT_LEN("%s", a.varValue.s); break;
+        case DagorSafeArg::TYPE_WSTR: len += COUNT_PRNFMT_LEN("%s", convert_to_utf8(temp_utf8_buf, a.varValue.ws)); break;
         case DagorSafeArg::TYPE_PTR: len += COUNT_PRNFMT_LEN("%p", a.varValue.p); break;
 
         default: G_ASSERT(0);
@@ -408,12 +404,15 @@ int DagorSafeArg::count_len(const char *fmt, const DagorSafeArg *arg, int anum)
                   case 1: len += COUNT_PRNFMT_LEN(fmt_buf, cwp[1], a.varValue.s); break;
                   case 2: len += COUNT_PRNFMT_LEN(fmt_buf, cwp[1], cwp[2], a.varValue.s); break;
                 }
+              else if (a.varType == a.TYPE_WSTR && cwp[0] == 0)
+                len += COUNT_PRNFMT_LEN(fmt_buf, opt_convert_to_utf8(fmt_buf, temp_utf8_buf, a.varValue.ws));
               else
                 mismatch = true;
               break;
             case 'p':
               G_ASSERT(cwp[0] == 0);
-              if ((a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END) || a.varType == a.TYPE_INT || a.varType == a.TYPE_STR)
+              if ((a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END) || //
+                  a.varType == a.TYPE_INT || a.varType == a.TYPE_STR || a.varType == a.TYPE_WSTR)
                 len += COUNT_PRNFMT_LEN(fmt_buf, a.varValue.p);
               else
                 mismatch = true;
@@ -430,6 +429,8 @@ int DagorSafeArg::count_len(const char *fmt, const DagorSafeArg *arg, int anum)
               len += COUNT_PRNFMT_LEN("%g", a.varValue.d);
             else if (a.varType == a.TYPE_STR)
               len += COUNT_PRNFMT_LEN("%s", a.varValue.s);
+            else if (a.varType == a.TYPE_WSTR)
+              len += COUNT_PRNFMT_LEN("%s", convert_to_utf8(temp_utf8_buf, a.varValue.ws));
             else if (a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END)
               len += COUNT_PRNFMT_LEN("%p", a.varValue.p);
           }
@@ -460,6 +461,7 @@ int DagorSafeArg::print_fmt(char *buf, int len, const char *fmt, const DagorSafe
   int carg = 0;
   char fmt_buf[32];
   char *bufp = buf;
+  Tab<char> temp_utf8_buf;
   len = max(len, 0); // do nothing when len < 0
 
   for (char c = *fmt; c && len; fmt++, c = *fmt)
@@ -509,6 +511,9 @@ int DagorSafeArg::print_fmt(char *buf, int len, const char *fmt, const DagorSafe
         case DagorSafeArg::TYPE_P4:
           PRNFMT(bufp, len, "(%.3f,%.3f,%.3f,%.3f)", a.varValue.p4->x, a.varValue.p4->y, a.varValue.p4->z, a.varValue.p4->w);
           break;
+        case DagorSafeArg::TYPE_DP3:
+          PRNFMT(bufp, len, "(%.6f,%.6f,%.6f)", a.varValue.dp3->x, a.varValue.dp3->y, a.varValue.dp3->z);
+          break;
         case DagorSafeArg::TYPE_IP2: PRNFMT(bufp, len, "(%d,%d)", a.varValue.ip2->x, a.varValue.ip2->y); break;
         case DagorSafeArg::TYPE_IP3: PRNFMT(bufp, len, "(%d,%d,%d)", a.varValue.ip3->x, a.varValue.ip3->y, a.varValue.ip3->z); break;
         case DagorSafeArg::TYPE_IP4:
@@ -540,6 +545,7 @@ int DagorSafeArg::print_fmt(char *buf, int len, const char *fmt, const DagorSafe
         case DagorSafeArg::TYPE_INT: PRNFMT(bufp, len, FMT_I64, a.varValue.i); break;
         case DagorSafeArg::TYPE_DOUBLE: PRNFMT(bufp, len, "%g", a.varValue.d); break;
         case DagorSafeArg::TYPE_STR: PRNFMT(bufp, len, "%s", a.varValue.s); break;
+        case DagorSafeArg::TYPE_WSTR: PRNFMT(bufp, len, "%s", convert_to_utf8(temp_utf8_buf, a.varValue.ws)); break;
         case DagorSafeArg::TYPE_PTR: PRNFMT(bufp, len, "%p", a.varValue.p); break;
 
         default: G_ASSERT(0);
@@ -618,12 +624,15 @@ int DagorSafeArg::print_fmt(char *buf, int len, const char *fmt, const DagorSafe
                   case 1: PRNFMT(bufp, len, fmt_buf, cwp[1], a.varValue.s); break;
                   case 2: PRNFMT(bufp, len, fmt_buf, cwp[1], cwp[2], a.varValue.s); break;
                 }
+              else if (a.varType == a.TYPE_WSTR && cwp[0] == 0)
+                PRNFMT(bufp, len, fmt_buf, opt_convert_to_utf8(fmt_buf, temp_utf8_buf, a.varValue.ws));
               else
                 mismatch = true;
               break;
             case 'p':
               G_ASSERT(cwp[0] == 0);
-              if ((a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END) || a.varType == a.TYPE_INT || a.varType == a.TYPE_STR)
+              if ((a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END) || //
+                  a.varType == a.TYPE_INT || a.varType == a.TYPE_STR || a.varType == a.TYPE_WSTR)
                 PRNFMT(bufp, len, fmt_buf, a.varValue.p);
               else
                 mismatch = true;
@@ -640,6 +649,8 @@ int DagorSafeArg::print_fmt(char *buf, int len, const char *fmt, const DagorSafe
               PRNFMT(bufp, len, "%g", a.varValue.d);
             else if (a.varType == a.TYPE_STR)
               PRNFMT(bufp, len, "%s", a.varValue.s);
+            else if (a.varType == a.TYPE_WSTR)
+              PRNFMT(bufp, len, "%s", convert_to_utf8(temp_utf8_buf, a.varValue.ws));
             else if (a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END)
               PRNFMT(bufp, len, "%p", a.varValue.p);
           }
@@ -683,6 +694,7 @@ int DagorSafeArg::fprint_fmt(void *fp, const char *fmt, const DagorSafeArg *arg,
   int carg = 0, len = 0;
   char fmt_buf[32];
   const char *str_s = NULL;
+  Tab<char> temp_utf8_buf;
   int str_l = 0;
 
   for (char c = *fmt; c; fmt++, c = *fmt)
@@ -732,6 +744,9 @@ int DagorSafeArg::fprint_fmt(void *fp, const char *fmt, const DagorSafeArg *arg,
         case DagorSafeArg::TYPE_P4:
           len += fprintf((FILE *)fp, "(%.3f,%.3f,%.3f,%.3f)", a.varValue.p4->x, a.varValue.p4->y, a.varValue.p4->z, a.varValue.p4->w);
           break;
+        case DagorSafeArg::TYPE_DP3:
+          len += fprintf((FILE *)fp, "(%.6f,%.6f,%.6f)", a.varValue.dp3->x, a.varValue.dp3->y, a.varValue.dp3->z);
+          break;
         case DagorSafeArg::TYPE_IP2: len += fprintf((FILE *)fp, "(%d,%d)", a.varValue.ip2->x, a.varValue.ip2->y); break;
         case DagorSafeArg::TYPE_IP3:
           len += fprintf((FILE *)fp, "(%d,%d,%d)", a.varValue.ip3->x, a.varValue.ip3->y, a.varValue.ip3->z);
@@ -765,6 +780,7 @@ int DagorSafeArg::fprint_fmt(void *fp, const char *fmt, const DagorSafeArg *arg,
         case DagorSafeArg::TYPE_INT: len += fprintf((FILE *)fp, FMT_I64, a.varValue.i); break;
         case DagorSafeArg::TYPE_DOUBLE: len += fprintf((FILE *)fp, "%g", a.varValue.d); break;
         case DagorSafeArg::TYPE_STR: len += fprintf((FILE *)fp, "%s", a.varValue.s); break;
+        case DagorSafeArg::TYPE_WSTR: len += fprintf((FILE *)fp, "%s", convert_to_utf8(temp_utf8_buf, a.varValue.ws)); break;
         case DagorSafeArg::TYPE_PTR: len += fprintf((FILE *)fp, "%p", a.varValue.p); break;
 
         default: G_ASSERT(0);
@@ -848,12 +864,15 @@ int DagorSafeArg::fprint_fmt(void *fp, const char *fmt, const DagorSafeArg *arg,
                   case 1: len += fprintf((FILE *)fp, fmt_buf, cwp[1], a.varValue.s); break;
                   case 2: len += fprintf((FILE *)fp, fmt_buf, cwp[1], cwp[2], a.varValue.s); break;
                 }
+              else if (a.varType == a.TYPE_WSTR && cwp[0] == 0)
+                len += fprintf((FILE *)fp, fmt_buf, opt_convert_to_utf8(fmt_buf, temp_utf8_buf, a.varValue.ws));
               else
                 mismatch = true;
               break;
             case 'p':
               G_ASSERT(cwp[0] == 0);
-              if ((a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END) || a.varType == a.TYPE_INT || a.varType == a.TYPE_STR)
+              if ((a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END) || //
+                  a.varType == a.TYPE_INT || a.varType == a.TYPE_STR || a.varType == a.TYPE_WSTR)
                 len += fprintf((FILE *)fp, fmt_buf, a.varValue.p);
               else
                 mismatch = true;
@@ -870,6 +889,8 @@ int DagorSafeArg::fprint_fmt(void *fp, const char *fmt, const DagorSafeArg *arg,
               len += fprintf((FILE *)fp, "%g", a.varValue.d);
             else if (a.varType == a.TYPE_STR)
               len += fprintf((FILE *)fp, "%s", a.varValue.s);
+            else if (a.varType == a.TYPE_WSTR)
+              len += fprintf((FILE *)fp, "%s", convert_to_utf8(temp_utf8_buf, a.varValue.ws));
             else if (a.varType >= a.TYPE_PTR && a.varType < a.TYPE_PTR_END)
               len += fprintf((FILE *)fp, "%p", a.varValue.p);
           }

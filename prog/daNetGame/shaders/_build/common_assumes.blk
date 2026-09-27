@@ -9,7 +9,6 @@ ssr_target:i = 1//can be optional
 upscale_sampling_tex:i = 1
 hack_globtm_from_register:i = 0//not supported
 supports_uav:i = 1
-render_with_normalmap:i=3
 in_editor_assume:i=0
 in_editor:i=0
 //shore_waves_on:i=1
@@ -22,8 +21,6 @@ is_gather4_supported:i = 1
 //blur_quality:i = 0
 hero_ao:i = 0
 compatibility_mode:i = 0
-mobile_render:i=0
-mobile_simplified_materials:i=0
 use_clouds_reprojection:i = 0
 realtime_raymarch_steps:i = 10
 use_clouds_fake_gi:i = 1
@@ -41,6 +38,7 @@ gtao_use_reprojection_with_neighborhood:i=1
 luminance_from_alpha:i=0
 assume_fom_shadows:i=1
 assume_downsampled_shadows:i=1
+voxel_shadows_allow_underground:i=1
 nuke_in_atmosphere:i=0
 use_dafx:i=1
 use_postfx:i = 1
@@ -52,7 +50,6 @@ use_bounding_vr_reprojection:i=0
 water_cascades:i=4
 baked_impostor_multisample:i=1
 lens_night_vision_on:i=0
-water_colormap_assume:i=0
 xray_destruction:i=0
 fx_apply_volfog_per_pixel:i=1
 fx_has_volfog_injection:i=1
@@ -69,6 +66,7 @@ fom_double_intensity:i=1
 rendinst_use_cell_sbuffer:i=0
 sky_panorama_patch:i=1
 modfx_bboard_lighting_from_clustered_lights:i=1
+modfx_wboit_enabled:i=0
 grassify:i=0
 render_scope_collimator:i=1
 flowmap_height:i=0
@@ -78,6 +76,9 @@ water_ripples_normal:i=1
 plod_gen:i=0
 water_rt_enabled:i=0
 glass_rt_reflection:i=0
+allow_rt_glass_reflection:i=0
+bvh_usable:i=0
+bvh_has_omm_support:i=0
 water_distant
 {
   water_tess_factor:i=0
@@ -106,19 +107,23 @@ water_depth_nv2_heightmap
   water_tess_factor:i=3 // WaterNVRender::waterHeightmapTessFactor
   water_heightmap_pages:i=1
 }
-water_ssr_nv2_heightmap
+water_normal_nv2_heightmap
 {
   water_tess_factor:i=3 // WaterNVRender::waterHeightmapTessFactor
   water_heightmap_pages:i=1
+}
+rendinst_landclass {
+  water_heightmap_pages:i=0
+  shore_distance_field_tex:i=0
 }
 water_heightmap_tex_enabled:i=0
 foam_occlusion_test:i=1
 wfx_foam_z_enable:i=1
 rtsm_is_half_precision:i=0 // Remove me, once it can be half in DNG as well.
+rtsm_has_nuke:i=0
 cloud_volume:i=0
 palette_rotation_mode:i=1
 dynamic_texture_hdr_pass:i=0 // Only needed if dynamic mirrors are rendered
-xray_camera_relative_skinning:i=0
 use_satellite_rendering:i=0
 use_portal_rendering:i=0
 allow_satellite_rendering:i=0
@@ -135,10 +140,27 @@ detect_cockpit_by_distance:i=0
 clouds_panorama_split:i=0
 has_hero_matrix:i=1
 debug_torn_wounds:i=0 // Delete this line if you want to access the feature
-use_gui_glob_tm:i=0
+burnt_grass_enabled:i=0
+burnt_ground_animated_decals_enabled:i=0
 use_glass_dual_source_blending:i=1
 max_flowmap_cascades:i=2
 vsm_shadowmap:i=0
 need_character_microdetails_texture_check:i=1
 use_vr_reprojection:i=0
 use_contact_shadows:i=1
+deform_occupied_tiles_bitvector:i=0
+caustics_render {
+  shore_distance_field_tex:i = 0
+}
+caustics_render_cs {
+  shore_distance_field_tex:i = 0
+}
+film_grain:i=1
+film_grain_mode:i=1
+gpu_objects_is_grass:i=0
+gi_enable_lights_at_radiance_trace:i=0 // Handled by voxels lit scene.
+dynamic_lighting_texture:i=1
+has_motion_vectors:i=1
+downsampled_motion_vectors_tex:i=1
+motion_gbuf:i=1
+motion_vector_type:i=2

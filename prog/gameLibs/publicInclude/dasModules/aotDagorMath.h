@@ -34,6 +34,7 @@ MAKE_TYPE_FACTORY(Capsule, Capsule)
 MAKE_TYPE_FACTORY(quat, Quat)
 MAKE_TYPE_FACTORY(Plane3, Plane3)
 MAKE_TYPE_FACTORY(InterpolateTabFloat, InterpolateTabFloat)
+MAKE_TYPE_FACTORY(InterpolateTabMemPtrFloat, InterpolateTabMemPtrFloat)
 MAKE_TYPE_FACTORY(mat44f, mat44f)
 MAKE_TYPE_FACTORY(Frustum, Frustum)
 
@@ -55,21 +56,17 @@ struct WrapType<Quat>
   typedef Point4 type;
   typedef Point4 rettype;
 };
-template <>
-struct WrapRetType<Quat>
-{
-  typedef Point4 type;
-};
-class Quat_WrapArg : public Quat
-{
-public:
-  Quat_WrapArg(const Point4 &t) : Quat(t.x, t.y, t.z, t.w) {}
-};
 
 template <>
 struct WrapArgType<Quat>
 {
-  typedef Quat_WrapArg type;
+  typedef WrapVec4Arg<Quat, real> type;
+};
+
+template <>
+struct WrapRetType<Quat>
+{
+  typedef WrapVec4Arg<Quat, real> type;
 };
 
 template <>
@@ -177,7 +174,7 @@ inline float distance_dpoint3(const DPoint3 &from, const DPoint3 &to) { return l
 inline float distance_sq_dpoint3(const DPoint3 &from, const DPoint3 &to) { return lengthSq(from - to); }
 inline float distance_plane_point3(const Point4 &plane, const Point3 &point)
 {
-  return v_extract_x(v_plane_dist_x(v_ldu(&plane.x), v_ldu(&point.x)));
+  return v_extract_x(v_plane_dist_x(v_ldu(&plane.x), v_ldu_p3_safe(&point.x)));
 }
 inline das::float3 from_dpoint3(const DPoint3 &a) { return {float(a.x), float(a.y), float(a.z)}; }
 inline DPoint3 dpoint3_from_point3(const das::float3 &a) { return DPoint3(double(a.x), double(a.y), double(a.z)); }
@@ -274,6 +271,10 @@ inline DPoint3 dpoint3_approach_vel(const DPoint3 &from, const DPoint3 &to, floa
 inline void dpoint3_add_dpoint3(DPoint3 &a, const DPoint3 &b) { a += b; }
 
 inline float interpolate_tab_float_interpolate(const InterpolateTabFloat &tab, float val) { return tab.interpolate(val); }
+inline float interpolate_tab_mem_ptr_float_interpolate(const InterpolateTabMemPtrFloat &tab, float val)
+{
+  return tab.interpolate(val);
+}
 
 inline mat44f mat44f_make_matrix(TMatrix const &tm)
 {
@@ -288,6 +289,10 @@ inline TMatrix mat44f_make_tm(mat44f const &m)
   v_mat_43ca_from_mat44(tm.m[0], m);
   return tm;
 }
+
+inline Frustum frustum_make_from_mat44f(mat44f const &m) { return Frustum(m); }
+inline bool frustum_test_sphere(const Frustum &f, das::float3 c, float r) { return f.testSphereB(v_ldu_p3_safe(&c.x), v_splats(r)); }
+inline bool frustum_test_box(const Frustum &f, const BBox3 &bb) { return f.testBoxB(bb); }
 
 inline float v_distance_sq_to_bbox(das::float4 bmin, das::float4 bmax, das::float4 c)
 {
@@ -308,6 +313,25 @@ inline void read_interpolate_tab_as_params(InterpolateTabFloat &tab, const DataB
 }
 
 inline void read_interpolate_tab_float_p2(InterpolateTabFloat &tab, const DataBlock &blk)
+{
+  ::read_interpolate_tab_as_params(tab, blk, [](const DataBlock &blk, int i, float &x, float &y) -> bool {
+    Point2 p = blk.getPoint2(i);
+    x = p.x;
+    y = p.y;
+    return true;
+  });
+}
+
+inline void read_interpolate_tab_mem_ptr_as_params(InterpolateTabMemPtrFloat &tab, const DataBlock &blk,
+  const das::TBlock<bool, DataBlock &, int, float, float> &block, das::Context *context, das::LineInfoArg *at)
+{
+  ::read_interpolate_tab_as_params(tab, blk, [&](const DataBlock &, int i, float x, float y) -> bool {
+    vec4f args[] = {das::cast<DataBlock &>::from(blk), das::cast<int>::from(i), das::cast<float>::from(x), das::cast<float>::from(y)};
+    return das::cast<bool>::to(context->invoke(block, args, nullptr, at));
+  });
+}
+
+inline void read_interpolate_tab_mem_ptr_float_p2(InterpolateTabMemPtrFloat &tab, const DataBlock &blk)
 {
   ::read_interpolate_tab_as_params(tab, blk, [](const DataBlock &blk, int i, float &x, float &y) -> bool {
     Point2 p = blk.getPoint2(i);

@@ -10,55 +10,113 @@
 namespace bvh::ri
 {
 
+extern vec4f ri_tree_anim_max_distance_sq_v;
+extern bool ri_enable_caching;
+
 using TreeMapper = bvh::ReferencedTransformData &(*)(ContextId context_id, uint64_t object_id, vec4f pos,
   rendinst::riex_handle_t handle, int lod_ix, uint64_t bvh_id, void *user_data, bool &recycled);
 
+inline void set_tree_anim_max_distance(float distance) { ri_tree_anim_max_distance_sq_v = v_splats(distance * distance); }
+
 inline bool is_tree(ContextId context_id, ShaderMesh::RElem &elem)
 {
-  return context_id->has(Features::RIFull) && strncmp(elem.mat->getShaderClassName(), "rendinst_tree", 13) == 0;
+  return context_id->hasAny(Features::RIFull) && strncmp(elem.mat->getShaderClassName(), "rendinst_tree", 13) == 0;
 }
 
 inline bool is_leaves(ContextId context_id, ShaderMesh::RElem &elem)
 {
-  return context_id->has(Features::RIFull) && strncmp(elem.mat->getShaderClassName(), "rendinst_facing_leaves", 22) == 0;
+  return context_id->hasAny(Features::RIFull) && strncmp(elem.mat->getShaderClassName(), "rendinst_facing_leaves", 22) == 0;
 }
 
 inline bool is_flag(ContextId context_id, ShaderMesh::RElem &elem)
 {
-  return context_id->has(Features::RIFull) && strncmp(elem.mat->getShaderClassName(), "rendinst_flag", 13) == 0;
+  return context_id->hasAny(Features::RIFull) && strncmp(elem.mat->getShaderClassName(), "rendinst_flag", 13) == 0;
 }
 
-using map_tree_fn = ReferencedTransformData *(ContextId, uint64_t, vec4f, rendinst::riex_handle_t, int, void *, bool &);
+using map_rendinst_fn = ReferencedTransformData *(ContextId, uint64_t, uint64_t, int, void *, bool &, int &);
 
-template <map_tree_fn mapper>
-inline bool handle_tree(ContextId context_id, ShaderMesh::RElem &elem, uint64_t object_id, int lod_ix, bool is_pos_inst,
-  mat44f_cref tm, vec4f_const originalPos, const E3DCOLOR *colors, rendinst::riex_handle_t handle,
-  eastl::optional<TMatrix4> &inv_world_tm, TreeInfo &treeInfo, MeshMetaAllocator::AllocId &metaAllocId, void *user_data)
+inline ReferencedTransformData *map_rendinst_stationary(ContextId, uint64_t, uint64_t, int, void *, bool &, int &anim_index)
 {
-  if (!inv_world_tm.has_value())
-    inv_world_tm = make_packed_precise_itm(tm);
+  anim_index = -1;
+  return nullptr;
+}
 
-  auto data = mapper(context_id, object_id, tm.col3, handle, lod_ix, user_data, treeInfo.recycled);
+struct MapRendinstPointers
+{
+  dag::Span<eastl::unordered_map<uint64_t, ReferencedTransformDatasForInstance>> uniqueBuffers;
+  dag::Span<eastl::unordered_map<uint64_t, ReferencedTransformDatasForInstance>> newUniqueBuffers;
+  ContextId contextId = nullptr;
+  eastl::unordered_map<uint64_t, BLASesWithAtomicCursor> *freeUniqueBLASes = nullptr;
+};
 
-  if (!data)
-    return false;
+template <bool do_animation_index>
+inline ReferencedTransformData *map_rendinst_base(uint64_t object_id, uint64_t id, int lod_ix, bool &recycled, int &anim_index,
+  MapRendinstPointers &pointers)
+{
+  recycled = false;
 
-  if (data->metaAllocId == MeshMetaAllocator::INVALID_ALLOC_ID)
-    data->metaAllocId = context_id->allocateMetaRegion(1);
+  // No need to have a lock here to access the containers. While this function is called from multiple threads,
+  // the uniqueBuffers is only read from all threads. All new items are added to the newUniqueBuffers,
+  // which is thread local. Then later it will be merged into the uniqueBuffers on the main thread.
 
-  metaAllocId = data->metaAllocId;
+  G_ASSERT(lod_ix < Context::maxUniqueLods);
+  auto &uniqueContainer = pointers.uniqueBuffers[lod_ix];
 
-  treeInfo.invWorldTm = inv_world_tm.value();
-  treeInfo.transformedBuffer = &data->buffer;
-  treeInfo.transformedBlas = &data->blas;
+  ReferencedTransformDatasForInstance *instance = nullptr;
+  if (auto instanceIter = uniqueContainer.find(id); instanceIter != uniqueContainer.end())
+  {
+    instance = &instanceIter->second;
+  }
+  else
+  {
+    instance = &pointers.newUniqueBuffers[lod_ix][id];
 
+    if constexpr (do_animation_index)
+    {
+      // Assign an anim index, which has the least instances
+      OSSpinlockScopedLock lock(pointers.contextId->treeAnimIndexCountLock);
+      int leastIndices = 0;
+      for (int i = 1; i < Context::MaxTreeAnimIndices; ++i)
+        if (pointers.contextId->treeAnimIndexCount[i] < pointers.contextId->treeAnimIndexCount[leastIndices])
+          leastIndices = i;
+
+      instance->animIndex = leastIndices;
+      ++pointers.contextId->treeAnimIndexCount[leastIndices];
+    }
+  }
+
+  if constexpr (do_animation_index)
+    anim_index = instance->animIndex;
+  else
+    anim_index = -1;
+
+  auto &data = instance->elems[object_id];
+
+  data.age = -1;
+
+  if (!data.buffer && !data.blas && ri_enable_caching)
+  {
+    if (auto iter = pointers.freeUniqueBLASes->find(object_id); iter != pointers.freeUniqueBLASes->end())
+    {
+      if (int index = iter->second.cursor.sub_fetch(1); index >= 0)
+      {
+        take_blas_from_pool(data, iter->second.blases[index]);
+        recycled = true;
+      }
+    }
+  }
+
+  return &data;
+}
+
+template <map_rendinst_fn mapper, bool ri_ex>
+inline bool handle_tree(ContextId context_id, ShaderMesh::RElem &elem, uint64_t object_id, int lod_ix, bool is_pos_inst,
+  mat44f_cref tm, vec4f_const originalPos, const E3DCOLOR *colors, uint64_t id, eastl::optional<TMatrix4> &inv_world_tm,
+  TreeInfo &treeInfo, MeshMetaAllocator::AllocId &metaAllocId, void *user_data, bool stationary, bool is_burning, uint32_t palette_id)
+{
   static int is_pivotedVarId = VariableMap::getVariableId("is_pivoted");
+  static int small_plantVarId = VariableMap::getVariableId("small_plant");
   static int wind_channel_strengthVarId = VariableMap::getVariableId("wind_channel_strength");
-  static int tree_wind_branch_ampVarId = VariableMap::getVariableId("tree_wind_branch_amp");
-  static int tree_wind_detail_ampVarId = VariableMap::getVariableId("tree_wind_detail_amp");
-  static int tree_wind_speedVarId = VariableMap::getVariableId("tree_wind_speed");
-  static int tree_wind_timeVarId = VariableMap::getVariableId("tree_wind_time");
-  static int tree_wind_blend_params1VarId = VariableMap::getVariableId("tree_wind_blend_params1");
   static int wind_noise_speed_baseVarId = VariableMap::getVariableId("wind_noise_speed_base");
   static int wind_noise_speed_level_mulVarId = VariableMap::getVariableId("wind_noise_speed_level_mul");
   static int wind_angle_rot_baseVarId = VariableMap::getVariableId("wind_angle_rot_base");
@@ -69,12 +127,55 @@ inline bool handle_tree(ContextId context_id, ShaderMesh::RElem &elem, uint64_t 
   static int wind_motion_damp_level_mulVarId = VariableMap::getVariableId("wind_motion_damp_level_mul");
   static int AnimWindScaleVarId = VariableMap::getVariableId("AnimWindScale");
   static int atestVarId = VariableMap::getVariableId("atest");
+  static int ground_snap_height_softVarId = VariableMap::getVariableId("ground_snap_height_soft");
+  static int ground_snap_height_fullVarId = VariableMap::getVariableId("ground_snap_height_full");
+  static int ground_snap_normal_offsetVarId = VariableMap::getVariableId("ground_snap_normal_offset");
+  static int ground_snap_limitVarId = VariableMap::getVariableId("ground_snap_limit");
+  static int ground_bend_heightVarId = VariableMap::getVariableId("ground_bend_height");
+  static int ground_bend_normal_offsetVarId = VariableMap::getVariableId("ground_bend_normal_offset");
+  static int ground_bend_tangent_offsetVarId = VariableMap::getVariableId("ground_bend_tangent_offset");
 
-  treeInfo.data.windBranchAmp = ShaderGlobal::get_real(tree_wind_branch_ampVarId);
-  treeInfo.data.windDetailAmp = ShaderGlobal::get_real(tree_wind_detail_ampVarId);
-  treeInfo.data.windSpeed = ShaderGlobal::get_real(tree_wind_speedVarId);
-  treeInfo.data.windTime = ShaderGlobal::get_real(tree_wind_timeVarId);
-  treeInfo.data.windBlendParams = Point4::rgba(ShaderGlobal::get_color4(tree_wind_blend_params1VarId));
+  // Filter elements out before mapping refreshes the age, so the memory can be freed up
+  int atest = 0;
+  elem.mat->getIntVariable(atestVarId, atest);
+  const bool isTrunk = atest == 0; // rendinst_tree_perlin_layered doesn't have this shadervar
+
+  if (is_burning && !isTrunk)
+    return false; // Just drop all burning tree leaves from BVH, eventually they'll disappear entirely anyway
+
+  int smallPlant = 0;
+  if (elem.mat->getIntVariable(small_plantVarId, smallPlant) && smallPlant > 0)
+    return false;
+
+  if (!inv_world_tm.has_value())
+    inv_world_tm = make_packed_precise_itm(tm);
+
+  auto data = mapper(context_id, object_id, id, lod_ix, user_data, treeInfo.recycled, treeInfo.animIndex);
+
+  treeInfo.stationary = stationary;
+
+  if (stationary)
+  {
+    auto buffers = context_id->stationaryTreeBuffers.find(object_id);
+    if (buffers == context_id->stationaryTreeBuffers.end())
+      return false;
+
+    treeInfo.recycled = false;
+    treeInfo.stationary = true;
+    data = &buffers->second;
+
+    G_ASSERT(data->metaAllocId != MeshMetaAllocator::INVALID_ALLOC_ID);
+  }
+  else if (!data)
+    return false;
+
+  if (data->metaAllocId == MeshMetaAllocator::INVALID_ALLOC_ID)
+    data->metaAllocId = context_id->allocateMetaRegion(1, "riTree");
+
+  metaAllocId = data->metaAllocId;
+
+  treeInfo.invWorldTm = inv_world_tm.value();
+  treeInfo.transformedData = data;
 
   int isPivoted;
   if (!elem.mat->getIntVariable(is_pivotedVarId, isPivoted))
@@ -100,24 +201,121 @@ inline bool handle_tree(ContextId context_id, ShaderMesh::RElem &elem, uint64_t 
     treeInfo.data.ppWindMotionDampLevelMul = 0.8;
   if (!elem.mat->getRealVariable(AnimWindScaleVarId, treeInfo.data.AnimWindScale))
     treeInfo.data.AnimWindScale = 0.25;
-  int atest = 0;
-  elem.mat->getIntVariable(atestVarId, atest);
-  treeInfo.data.apply_tree_wind = atest > 0 && strncmp(elem.mat->getShaderClassName(), "rendinst_tree_perlin_layered", 28) != 0;
+  if (!elem.mat->getRealVariable(ground_snap_height_softVarId, treeInfo.data.groundSnapHeightSoft))
+    treeInfo.data.groundSnapHeightSoft = -1;
+  if (!elem.mat->getRealVariable(ground_snap_height_fullVarId, treeInfo.data.groundSnapHeightFull))
+    treeInfo.data.groundSnapHeightFull = 0.5;
+  if (!elem.mat->getRealVariable(ground_snap_normal_offsetVarId, treeInfo.data.groundSnapNormalOffset))
+    treeInfo.data.groundSnapNormalOffset = 0.1;
+  if (!elem.mat->getRealVariable(ground_snap_limitVarId, treeInfo.data.groundSnapLimit))
+    treeInfo.data.groundSnapLimit = 1.0;
+  if (!elem.mat->getRealVariable(ground_bend_heightVarId, treeInfo.data.groundBendHeight))
+    treeInfo.data.groundBendHeight = -1;
+  if (!elem.mat->getRealVariable(ground_bend_normal_offsetVarId, treeInfo.data.groundBendNormalOffset))
+    treeInfo.data.groundBendNormalOffset = 0.075;
+  if (!elem.mat->getRealVariable(ground_bend_tangent_offsetVarId, treeInfo.data.groundBendTangentOffset))
+    treeInfo.data.groundBendTangentOffset = 4;
+  treeInfo.data.isTrunk = isTrunk;
 
-  // Using this instead of acquire_managed_tex to avoid increasing reference count, but this might return nullptr
-  treeInfo.data.ppPosition = D3dResManagerData::getBaseTex(elem.mat->get_texture(7));
-  treeInfo.data.ppDirection = D3dResManagerData::getBaseTex(elem.mat->get_texture(8));
+  // It will be filled later from mesh!
+  treeInfo.data.ppPositionBindless = MeshMeta::INVALID_TEXTURE;
+  treeInfo.data.ppDirectionBindless = MeshMeta::INVALID_TEXTURE;
 
   treeInfo.data.isPivoted = !!isPivoted;
   treeInfo.data.isPosInstance = is_pos_inst;
 
-  treeInfo.data.color = colors ? random_color_from_pos(originalPos, 0, colors[0], colors[1]) : E3DCOLOR(0x40404040U);
-  if (treeInfo.data.isPivoted && !treeInfo.data.isPosInstance)
-    treeInfo.data.perInstanceRenderAdditionalData = rendinst::getRiExtraPerInstanceRenderEncodedAdditionalData(handle);
+  const E3DCOLOR WHITE = E3DCOLOR(0x40404040U);
+
+  if (isTrunk)
+    treeInfo.data.color = is_burning ? E3DCOLOR(0x10101010U) : WHITE;
+  else
+    treeInfo.data.color = colors ? random_color_from_pos(originalPos, palette_id, colors[0], colors[1]) : WHITE;
+
+  if (ri_ex && treeInfo.data.isPivoted && !treeInfo.data.isPosInstance)
+    treeInfo.data.perInstanceRenderAdditionalData = rendinst::getRiExtraPerInstanceRenderEncodedAdditionalData(id);
   else
     treeInfo.data.perInstanceRenderAdditionalData = 0;
 
   return true;
 }
+
+struct TidyUpRendinstPointers
+{
+  dag::Span<eastl::unordered_map<uint64_t, ReferencedTransformDatasForInstance>> uniqueBuffers;
+  ContextId contextId = nullptr;
+  eastl::unordered_map<uint64_t, BLASesWithAtomicCursor> *freeUniqueBLASes = nullptr;
+};
+
+template <bool do_animation_index>
+inline int tidy_up_rendinsts_base(ContextId context_id, TidyUpRendinstPointers &pointers)
+{
+  // We make use of the fact that resize does not shrink the vector itself, only the elem count is changed
+  if (ri_enable_caching)
+    for (auto &freeBlases : *pointers.freeUniqueBLASes)
+    {
+      if (freeBlases.second.cursor.load() < 0)
+        freeBlases.second.cursor.store(0);
+      freeBlases.second.blases.resize(freeBlases.second.cursor.load());
+    }
+
+  int dropCount = 0;
+
+  for (auto [index, lod] : enumerate(pointers.uniqueBuffers))
+    for (auto iter = lod.begin(); iter != lod.end();)
+    {
+      auto &elems = iter->second.elems;
+      for (auto elemIter = elems.begin(); elemIter != elems.end();)
+      {
+        if (++elemIter->second.age < 1)
+        {
+          ++elemIter;
+          continue;
+        }
+
+        auto meshId = elemIter->first;
+        auto &elem = elemIter->second;
+
+        if (ri_enable_caching)
+        {
+          give_blas_to_pool((*pointers.freeUniqueBLASes)[meshId].blases.push_back(), elem);
+        }
+
+        context_id->freeMetaRegion(elem.metaAllocId);
+
+        if (elem.buffer)
+        {
+          WinAutoLock lock(context_id->processBufferAllocatorLock);
+          context_id->processBufferAllocator[elem.buffer.allocator].first.free(elem.buffer.allocId);
+        }
+
+        elemIter = elems.erase(elemIter);
+      }
+
+      if (!elems.empty())
+      {
+        ++iter;
+        continue;
+      }
+
+      if constexpr (do_animation_index)
+      {
+        OSSpinlockScopedLock lock(pointers.contextId->treeAnimIndexCountLock);
+        --pointers.contextId->treeAnimIndexCount[iter->second.animIndex];
+      }
+
+      dropCount++;
+      iter = lod.erase(iter);
+    }
+
+  if (ri_enable_caching)
+    for (auto &freeBlases : *pointers.freeUniqueBLASes)
+      freeBlases.second.cursor.store(freeBlases.second.blases.size());
+
+  return dropCount;
+}
+
+float get_ri_lod_dist_bias();
+
+void debug_update();
 
 } // namespace bvh::ri

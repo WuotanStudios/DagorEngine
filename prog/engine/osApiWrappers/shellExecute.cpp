@@ -44,7 +44,12 @@ class ShellExecuteJob : public cpujobs::IJob
   void initOneString(char *destination, const T *source)
   {
     if (source)
-      memcpy(destination, source, min(strLenWithZero(source), maxTextLength));
+    {
+      int len = min(strLenWithZero(source), maxTextLength);
+      memcpy(destination, source, len);
+      destination[len] = 0;
+      destination[len + 1] = 0;
+    }
     else
     {
       destination[0] = 0;
@@ -66,7 +71,7 @@ public:
       *dirIt = '\\';
   }
 
-  const char *getJobName(bool &) const override { return "ShellExecuteJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("ShellExecuteJob"); }
 
   virtual void doJob();
 

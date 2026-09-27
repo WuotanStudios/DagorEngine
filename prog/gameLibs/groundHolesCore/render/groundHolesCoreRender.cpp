@@ -1,7 +1,10 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entityManager.h>
-#include <ecs/core/attributeEx.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
 #include <daECS/core/entityComponent.h>
 #include <daECS/core/coreEvents.h>
 #include <ecs/render/updateStageRender.h>
@@ -18,7 +21,6 @@
 #include <shaders/dag_DynamicShaderHelper.h>
 #include <heightmap/heightmapHandler.h>
 #include <landMesh/lmeshManager.h>
-#include <landMesh/heightmap_holes_zones.hlsli>
 #include <util/dag_convar.h>
 #include <groundHolesCore/helpers.h>
 
@@ -36,7 +38,6 @@ namespace ground_holes
 {
 #define VAR(a, opt) static ShaderVariableInfo a##VarId(#a, opt);
 
-VAR(heightmap_holes_zones_num, true)
 VAR(hmap_holes_scale_step_offset, false)
 VAR(hmap_hole_ofs_size, false)
 VAR(heightmap_holes_tmp_write_offset_size, false)
@@ -45,18 +46,14 @@ CONSOLE_BOOL_VAL("render", debug_ground_hole_use_cs_workaround, true); // TODO: 
 
 CONSOLE_BOOL_VAL("render", debug_ground_holes_hide, false);
 
-static void createTempResources(int tempTexSize, UniqueTexHolder &hmapHolesTmpTex, UniqueBufHolder &hmapHolesBuf)
+static void createTempResources(int tempTexSize, UniqueTexWithShaderVar &hmapHolesTmpTex, UniqueBufWithShaderVar &hmapHolesBuf)
 {
-  hmapHolesBuf = dag::buffers::create_persistent_cb(MAX_GROUND_HOLES * 4 * 2, "hmap_holes_matrices");
-  hmapHolesTmpTex =
-    dag::create_tex(NULL, tempTexSize, tempTexSize, TEXCF_RTARGET | TEXCF_UNORDERED | TEXFMT_R8, 1, "temp_heightmap_holes_tex");
-  d3d::SamplerInfo smpInfo;
-  smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Wrap;
-  smpInfo.filter_mode = d3d::FilterMode::Point;
-  ShaderGlobal::set_sampler(get_shader_variable_id("temp_heightmap_holes_tex_samplerstate"), d3d::request_sampler(smpInfo));
+  hmapHolesBuf = dag::buffers::create_persistent_cb(MAX_GROUND_HOLES * 4 * 2, "hmap_holes_matrices", RESTAG_LAND);
+  hmapHolesTmpTex = dag::create_tex(NULL, tempTexSize, tempTexSize, TEXCF_RTARGET | TEXCF_UNORDERED | TEXFMT_R8, 1,
+    "temp_heightmap_holes_tex", RESTAG_LAND);
 }
 
-static void closeTempResources(UniqueTexHolder &hmapHolesTmpTex, UniqueBufHolder &hmapHolesBuf)
+static void closeTempResources(UniqueTexWithShaderVar &hmapHolesTmpTex, UniqueBufWithShaderVar &hmapHolesBuf)
 {
   hmapHolesBuf.close();
   hmapHolesTmpTex.close();
@@ -90,6 +87,12 @@ HolesMtxTempVec getInverseMatrices(const ecs::Point4List &holes)
 void holes_initialize(int &hmap_holes_scale_step_offset_varId, int &hmap_holes_temp_ofs_size_varId, bool &should_render_ground_holes,
   ecs::Point4List &holes)
 {
+#if DAGOR_DBGLEVEL > 0
+  const float scale = ShaderGlobal::get_float4(hmap_holes_scale_step_offsetVarId.get_var_id()).r;
+  if (scale != 0.f)
+    LOGERR_ONCE("hmap_holes_scale_step_offset.x is %f, expected 0: the ground hole system is in an invalid state", scale);
+#endif
+
   hmap_holes_scale_step_offset_varId = hmap_holes_scale_step_offsetVarId.get_var_id();
   hmap_holes_temp_ofs_size_varId = hmap_hole_ofs_sizeVarId.get_var_id();
   holes.reserve(MAX_GROUND_HOLES);
@@ -97,14 +100,14 @@ void holes_initialize(int &hmap_holes_scale_step_offset_varId, int &hmap_holes_t
   should_render_ground_holes = true;
 }
 
-void on_disappear(int hmap_holes_scale_step_offset_varId, UniqueTexHolder &hmapHolesTex)
+void on_disappear(int hmap_holes_scale_step_offset_varId, UniqueTexWithShaderVar &hmapHolesTex)
 {
   const Point4 forceOutOfRangeCoeffs = Point4(0, 0, 10.f, 10.f);
-  ShaderGlobal::set_color4(hmap_holes_scale_step_offset_varId, forceOutOfRangeCoeffs);
+  ShaderGlobal::set_float4(hmap_holes_scale_step_offset_varId, forceOutOfRangeCoeffs);
   hmapHolesTex.close();
 }
 
-void render(UniqueTexHolder &hmapHolesTex, UniqueTexHolder &hmapHolesTmpTex, UniqueBufHolder &hmapHolesBuf,
+void render(UniqueTexWithShaderVar &hmapHolesTex, UniqueTexWithShaderVar &hmapHolesTmpTex, UniqueBufWithShaderVar &hmapHolesBuf,
   PostFxRenderer &hmapHolesProcessRenderer, PostFxRenderer &hmapHolesMipmapRenderer, ShadersECS &hmapHolesPrepareRenderer,
   bool &should_render_ground_holes, int hmap_holes_scale_step_offset_varId, int hmap_holes_temp_ofs_size_varId, ecs::Point4List &holes,
   ecs::Point3List &invalidate_bboxes, const ComputeShader &heightmap_holes_process_cs)
@@ -114,7 +117,7 @@ void render(UniqueTexHolder &hmapHolesTex, UniqueTexHolder &hmapHolesTmpTex, Uni
   int ground_holes_main_tex_size = 256;
   Point4 scaleStepOffset = getScaleOffset(ground_holes_main_tex_size);
   hmapHolesTex = dag::create_tex(NULL, ground_holes_main_tex_size, ground_holes_main_tex_size,
-    TEXCF_RTARGET | TEXCF_UNORDERED | TEXFMT_L16, 0, "heightmap_holes_tex");
+    TEXCF_RTARGET | TEXCF_UNORDERED | TEXFMT_L16, 0, "heightmap_holes_tex", RESTAG_LAND);
   d3d::SamplerInfo smpInfo;
   smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Wrap;
   smpInfo.filter_mode = d3d::FilterMode::Point;
@@ -124,8 +127,7 @@ void render(UniqueTexHolder &hmapHolesTex, UniqueTexHolder &hmapHolesTmpTex, Uni
   int ground_holes_temp_tex_size = ground_holes_main_tex_size / 2;
   createTempResources(ground_holes_temp_tex_size, hmapHolesTmpTex, hmapHolesBuf);
   scaleStepOffset.y = getSamplingStepDist(1 / scaleStepOffset.x, ground_holes_main_tex_size);
-  ShaderGlobal::set_color4(hmap_holes_scale_step_offset_varId, scaleStepOffset);
-  d3d::set_depth(nullptr, DepthAccess::RW);
+  ShaderGlobal::set_float4(hmap_holes_scale_step_offset_varId, scaleStepOffset);
   int scale = (TEX_CELL_RES * ground_holes_main_tex_size) / ground_holes_temp_tex_size;
   if (!holes.empty())
   {
@@ -141,10 +143,10 @@ void render(UniqueTexHolder &hmapHolesTex, UniqueTexHolder &hmapHolesTmpTex, Uni
   for (int y = 0; y < scale; y++)
     for (int x = 0; x < scale; x++)
     {
-      d3d::set_render_target(hmapHolesTmpTex.getTex2D(), 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{hmapHolesTmpTex.getTex2D(), 0, 0}});
       d3d::setview(0, 0, ground_holes_temp_tex_size, ground_holes_temp_tex_size, 0, 1);
       d3d::clearview(CLEAR_TARGET, 0, 0, 0);
-      ShaderGlobal::set_color4(hmap_holes_temp_ofs_size_varId, x, y, scale, ground_holes_temp_tex_size / TEX_CELL_RES);
+      ShaderGlobal::set_float4(hmap_holes_temp_ofs_size_varId, x, y, scale, ground_holes_temp_tex_size / TEX_CELL_RES);
       if (!holes.empty())
       {
         d3d::setvsrc(0, 0, 0);
@@ -157,7 +159,7 @@ void render(UniqueTexHolder &hmapHolesTex, UniqueTexHolder &hmapHolesTmpTex, Uni
       int sz = ground_holes_temp_tex_size / TEX_CELL_RES;
       if (debug_ground_hole_use_cs_workaround)
       {
-        ShaderGlobal::set_color4(heightmap_holes_tmp_write_offset_sizeVarId, x * sz, y * sz, sz, sz);
+        ShaderGlobal::set_float4(heightmap_holes_tmp_write_offset_sizeVarId, x * sz, y * sz, sz, sz);
         d3d::resource_barrier({hmapHolesTex.getTex2D(), RB_FLUSH_UAV | RB_SOURCE_STAGE_COMPUTE | RB_STAGE_COMPUTE, 0, 1});
         STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 7, VALUE, 0, 0), hmapHolesTex.getTex2D());
         heightmap_holes_process_cs.dispatchThreads(sz, sz, 1);
@@ -165,7 +167,7 @@ void render(UniqueTexHolder &hmapHolesTex, UniqueTexHolder &hmapHolesTmpTex, Uni
       else
       {
         d3d::resource_barrier({hmapHolesTex.getTex2D(), RB_RO_SRV | RB_SOURCE_STAGE_PIXEL | RB_STAGE_PIXEL, 0, 1});
-        d3d::set_render_target(hmapHolesTex.getTex2D(), 0);
+        d3d::set_render_target({}, DepthAccess::RW, {{hmapHolesTex.getTex2D(), 0, 0}});
         d3d::setview(x * sz, y * sz, sz, sz, 0, 1);
         hmapHolesProcessRenderer.render();
       }
@@ -180,7 +182,7 @@ void render(UniqueTexHolder &hmapHolesTex, UniqueTexHolder &hmapHolesTmpTex, Uni
     d3d::resource_barrier(
       {hmapHolesTex.getTex2D(), RB_RO_SRV | RB_SOURCE_STAGE_COMPUTE | RB_SOURCE_STAGE_PIXEL | RB_STAGE_PIXEL, unsigned(i - 1), 1});
     hmapHolesTex.getTex2D()->texmiplevel(i - 1, i - 1);
-    d3d::set_render_target(hmapHolesTex.getTex2D(), i);
+    d3d::set_render_target({}, DepthAccess::RW, {{hmapHolesTex.getTex2D(), static_cast<uint32_t>(i), 0}});
     d3d::setview(0, 0, sz, sz, 0, 1);
     hmapHolesMipmapRenderer.render();
   }
@@ -200,14 +202,6 @@ void spawn_hole(ecs::Point4List &holes, const TMatrix &transform, bool roundShap
     holes.back().w = -(1 + shapeIntersection);
   else
     holes.back().w = 1 + shapeIntersection;
-
-  const LandMeshManager *lmeshMgr = getLmeshMgr();
-  if (lmeshMgr)
-  {
-    HeightmapHandler *hmap = lmeshMgr->getHmapHandler();
-    if (hmap)
-      hmap->addTessRect(transform, shapeIntersection);
-  }
 }
 
 void get_invalidation_bbox(ecs::Point3List &bboxes, const TMatrix &transform, bool shapeIntersection)
@@ -233,41 +227,6 @@ void convar_helper(bool &should_render_ground_holes)
   {
     should_render_ground_holes = true;
   }
-}
-
-
-void zones_before_render(UniqueBufHolder &hmapHolesZonesBuf, bool &should_update_ground_holes_zones, Tab<Point3_vec4> &bboxes)
-{
-  if (!should_update_ground_holes_zones)
-    return;
-  if (!heightmap_holes_zones_numVarId)
-    return;
-  if (!hmapHolesZonesBuf.getBuf())
-    hmapHolesZonesBuf = dag::buffers::create_persistent_cb(
-      dag::buffers::cb_array_reg_count<Point3_vec4>(MAX_HEIGHTMAP_HOLES_ZONES * 2), "heightmap_holes_zones_cb");
-
-  G_ASSERT(bboxes.size() % 2 == 0);
-  G_ASSERTF_ONCE(bboxes.size() <= MAX_HEIGHTMAP_HOLES_ZONES * 2, "Ground holes zones above limit! Current: %d, Limit: %d",
-    bboxes.size() / 2, MAX_HEIGHTMAP_HOLES_ZONES);
-
-  ShaderGlobal::set_int(heightmap_holes_zones_numVarId, bboxes.size() / 2);
-  if (!bboxes.empty())
-    hmapHolesZonesBuf.getBuf()->updateDataWithLock(0, sizeof(Point3_vec4) * bboxes.size(), bboxes.data(), VBLOCK_DISCARD);
-
-  should_update_ground_holes_zones = false;
-}
-
-void zones_after_device_reset(UniqueBufHolder &hmapHolesZonesBuf, bool &should_update_ground_holes_zones)
-{
-  should_update_ground_holes_zones = true;
-  ShaderGlobal::set_int(heightmap_holes_zones_numVarId, 0);
-  hmapHolesZonesBuf.close();
-}
-
-void zones_manager_on_disappear(UniqueBufHolder &hmapHolesZonesBuf)
-{
-  ShaderGlobal::set_int(heightmap_holes_zones_numVarId, 0);
-  hmapHolesZonesBuf.close();
 }
 
 bool get_debug_hide() { return debug_ground_holes_hide; }

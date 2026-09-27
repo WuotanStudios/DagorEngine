@@ -81,6 +81,9 @@ rule ProcessEmbeddedFrameworks
 
   if $(SignTarget) { Depends $(SignTarget) : $(dstFramework) ; } else { Depends all : $(dstFramework) ; }
 
+  # source may be fetched at build time (CocoaPods), so it can be missing at parse time
+  NOCARE $(srcFramework) ;
+  if $(GlobalLinkPrereqs) { Depends $(srcFramework) : $(GlobalLinkPrereqs) ; }
   Depends $(dstFramework) : $(srcFramework) ;
 
   src on $(dstFramework) = $(srcFramework) ;
@@ -88,6 +91,27 @@ rule ProcessEmbeddedFrameworks
   copy_framework $(dstFramework) ;
 
   if $(1[2]) { ProcessEmbeddedFrameworks $(1[2-]) ; }
+}
+
+rule ProcessBundleFrameworks
+{
+  local srcFramework = $(1[1]) ;
+  local dstFramework = $(OutDir)/Frameworks/$(srcFramework:B).framework ;
+
+  LINKopt += -Wl,-rpath,@executable_path/Frameworks/$(srcFramework:B).framework ;
+
+  if $(SignTarget) { Depends $(SignTarget) : $(dstFramework) ; } else { Depends all : $(dstFramework) ; }
+
+  # source may be fetched at build time (CocoaPods), so it can be missing at parse time
+  NOCARE $(srcFramework) ;
+  if $(GlobalLinkPrereqs) { Depends $(srcFramework) : $(GlobalLinkPrereqs) ; }
+  Depends $(dstFramework) : $(srcFramework) ;
+
+  src on $(dstFramework) = $(srcFramework) ;
+  dst on $(dstFramework) = $(OutDir)/Frameworks/$(srcFramework:B).framework ;
+  copy_framework $(dstFramework) ;
+
+  if $(1[2]) { ProcessBundleFrameworks $(1[2-]) ; }
 }
 
 rule MakeAndSignFramework
@@ -277,12 +301,22 @@ rule ProcessBundleLang
   }
 }
 
+# copies resource bundles with a build-time action (not parse-time GLOB),
+# so bundles fetched during the build (CocoaPods) are copied too
 rule CopyFrameworkResBundle
 {
   for t in $(1) {
     local src = $(t).bundle ;
     local dst = $(OutDir)/$(t:D=).bundle ;
-    CopyDepsRecursively $(OutDir)/$(Target) : $(src) $(dst) : ;
+
+    Depends $(OutDir)/$(Target) : $(dst) ;
+    NOCARE $(src) ;
+    if $(GlobalLinkPrereqs) { Depends $(src) : $(GlobalLinkPrereqs) ; }
+    Depends $(dst) : $(src) ;
+
+    src on $(dst) = $(src) ;
+    dst on $(dst) = $(dst) ;
+    copy_framework $(dst) ;
   }
 }
 

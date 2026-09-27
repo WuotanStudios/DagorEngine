@@ -25,6 +25,7 @@ from ..helpers.texts                import log
 from ..helpers.version              import get_blender_version
 from ..tools.tools_panel            import apply_modifiers, fix_mat_slots, optimize_mat_slots, preserve_sharp
 from ..tools.tools_functions        import *
+from ..dagormat.rw_dagormat_text    import dagormat_prop_to_string
 
 from ..smooth_groups.smooth_groups              import int_to_uint
 from ..smooth_groups.mesh_calc_smooth_groups    import objects_calc_smooth_groups
@@ -305,32 +306,43 @@ class DagExporter(Operator, ExportHelper):
         node.objFlg |= DAG_NF_CASTSHADOW
         #<
         DP=o.dagorprops
-        broken=''
+        broken_properties = []
+        scripts = []
         for key in DP.keys():
-            if key!='broken_properties':
-                if key=='renderable:b':
-                    node.objFlg -= DAG_NF_RENDERABLE*int(DP[key]=='no')
-                elif key=='cast_shadows:b':
-                    node.objFlg -= DAG_NF_CASTSHADOW*int(DP[key]=='no')
-                try:
-                    value=str(DP[key].to_list())
-                    value=value.replace('[','')
-                    value=value.replace(']','')
-                except:
-                    value=str(DP[key])
-                    if key.endswith(':t'):
-                        value=value.replace('"','')#to avoid multiple quotes
-                        value='"'+value+'"'
-                line=key+'='+value+'\r\n'
-                #TODO: replace with more complex validation
-                if value.__len__()==0 or (key.endswith(':b') and value not in['yes','no']) or key.find(':')==-1:
-                    broken+=line
+            if key == 'broken_properties:t':
+                broken_properties.append(DP[key])
+                continue
+            if key=='renderable:b':
+                node.objFlg -= DAG_NF_RENDERABLE*int(not DP[key])
+            elif key=='cast_shadows:b':
+                node.objFlg -= DAG_NF_CASTSHADOW*int(not DP[key])
+            try:
+                value=str(DP[key].to_list())
+                value=value.replace('[','')
+                value=value.replace(']','')
+            except:
+                value=str(DP[key])
+                if key.endswith(':t'):
+                    value=value.replace('"','')#to avoid multiple quotes
+                    value='"'+value+'"'
+            if key.endswith(':b'):
+                if f'{DP[key]}'.lower() in ["0", "no", "false"]:
+                    scripts.append(f'{key}=no')
+                elif f'{DP[key]}'.lower() in ["1", "yes", "true"]:
+                    scripts.append(f'{key}=yes')
                 else:
-                    scripts+=line
+                    broken_properties.append(f'{key}={value}')
+                continue
+            script = f'{key}={value}'
+            #TODO: replace with more complex validation
+            if value.__len__()==0 or key.find(':')==-1:
+                broken_properties.append(script)
             else:
-                broken+=DP[key]
-        if broken.__len__()>0:
-            scripts+='broken_properties='+broken
+                scripts.append(script)
+        if broken_properties.__len__() > 0:
+            broken = ";".join(broken_properties)
+            scripts.append(f'broken_properties:t="{broken}"')
+        scripts = "\r\n".join(scripts)
         return scripts
 
     def toMesh(self, o, scene):
@@ -499,19 +511,9 @@ class DagExporter(Operator, ExportHelper):
         dagormat_scripts = []
         if DM.sides == 2:
             dagormat_scripts.append("real_two_sided=yes")
-        for param in optional.keys():
-            try:
-                values = optional[param].to_list()
-                value = ''
-                for el in values:
-                    value+=f'{round(el,7)}, '
-                value = value[:-2]
-            except:
-                try:
-                    value = f'{round(optional[param],7)}'
-                except:
-                    value=f'{optional[param]}'
-            dagormat_scripts.append(param+ "=" + value)
+        for key in optional.keys():
+            prop_string = dagormat_prop_to_string(optional, key, short = True)
+            dagormat_scripts.append(prop_string)
         return "\r\n".join(dagormat_scripts)
 
     def saveMesh(self, node):

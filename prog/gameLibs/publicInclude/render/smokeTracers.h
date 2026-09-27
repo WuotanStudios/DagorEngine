@@ -45,6 +45,9 @@ public:
   void leaveTracer(unsigned id);                       // we don't auto destroy tracers, which are referenced by someone
   void init(const DataBlock &settings) { initGPU(settings); }
   void afterDeviceReset();
+  Sbuffer *getTracerBuffer() const { return tracerBuffer.get(); }
+  Sbuffer *getDynamicBuffer() const { return tracerBufferDynamic.get(); }
+  Sbuffer *getVertsBuffer() const { return tracerVertsBuffer.get(); }
 
 protected:
   void initGPU(const DataBlock &settings);
@@ -78,7 +81,7 @@ protected:
   int currentUsed;
   DynamicShaderHelper headRenderer, tailRenderer;
   float cTime, lastDt;
-  SharedTexHolder tailTex;
+  SharedTexWithShaderVar tailTex;
 #if DAGOR_DBGLEVEL > 0
   unsigned int lastGpuUpdateFrame = 0;
 #endif

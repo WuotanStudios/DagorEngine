@@ -5,13 +5,14 @@
 #pragma once
 
 #include <drv/3d/dag_consts.h>
+#include <drv/3d/dag_multi_interface.h>
 
 class Sbuffer;
 
 using Ibuffer = Sbuffer;
 using Vbuffer = Sbuffer;
 
-namespace d3d
+namespace d3d _MULTI_INTERFACE
 {
 /**
  * @brief Creates a vertex buffer.
@@ -21,11 +22,12 @@ namespace d3d
  * @todo Make the name parameter mandatory.
  *
  * @param size_bytes The size of the vertex buffer in bytes.
- * @param flags The creation flags.
+ * @param flags The creation flags. Only SBCF_BIND_VERTEX and SBCF_BIND_SHADER_RES bind flags are allowed;
+ * create a buffer with other bind usage (e.g. a UAV) via create_sbuffer.
  * @param name The name of the vertex buffer (temporarily optional).
  * @return A pointer to the created vertex buffer.
  */
-Sbuffer *create_vb(int size_bytes, int flags, const char *name = "");
+Sbuffer *create_vb(int size_bytes, int flags, const char *name = "", ResourceTagType tag = nullptr);
 
 /**
  * @brief Creates an index buffer.
@@ -35,11 +37,12 @@ Sbuffer *create_vb(int size_bytes, int flags, const char *name = "");
  * @todo Make the name parameter mandatory.
  *
  * @param size_bytes The size of the index buffer in bytes.
- * @param flags The creation flags.
+ * @param flags The creation flags. Only SBCF_BIND_INDEX and SBCF_BIND_SHADER_RES bind flags are allowed;
+ * create a buffer with other bind usage via create_sbuffer.
  * @param stat_name The name of the index buffer (temporarily optional).
  * @return A pointer to the created index buffer.
  */
-Sbuffer *create_ib(int size_bytes, int flags, const char *stat_name = "ib");
+Sbuffer *create_ib(int size_bytes, int flags, const char *stat_name = "ib", ResourceTagType tag = nullptr);
 
 /**
  * @brief Sets the vertex buffer as a stream source.
@@ -106,14 +109,17 @@ void delete_vdecl(VDECL vdecl);
  * @return True if the vertex declaration was set successfully, false otherwise.
  */
 bool setvdecl(VDECL vdecl);
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 #if _TARGET_D3D_MULTI
 #include <drv/3d/dag_interface_table.h>
 namespace d3d
 {
-inline Sbuffer *create_vb(int sz, int f, const char *name) { return d3di.create_vb(sz, f, name); }
-inline Sbuffer *create_ib(int size_bytes, int flags, const char *stat_name) { return d3di.create_ib(size_bytes, flags, stat_name); }
+inline Sbuffer *create_vb(int sz, int f, const char *name, ResourceTagType tag) { return d3di.create_vb(sz, f, name, tag); }
+inline Sbuffer *create_ib(int size_bytes, int flags, const char *stat_name, ResourceTagType tag)
+{
+  return d3di.create_ib(size_bytes, flags, stat_name, tag);
+}
 inline bool setvsrc_ex(int s, Sbuffer *vb, int ofs, int stride_bytes) { return d3di.setvsrc_ex(s, vb, ofs, stride_bytes); }
 inline bool setind(Sbuffer *ib) { return d3di.setind(ib); }
 inline VDECL create_vdecl(VSDTYPE *vsd) { return d3di.create_vdecl(vsd); }

@@ -1,0 +1,43 @@
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+#pragma once
+
+#include <shaders/dag_shaders.h>
+#include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_tex3d.h>
+#include <3d/dag_resPtr.h>
+#include <shaders/dag_postFxRenderer.h>
+#include <perfMon/dag_perfTimer.h>
+
+enum
+{
+  SWRT_BUF_PAGE_SIZE = 65536,
+  SWRT_BUF_PAGE_MASK = SWRT_BUF_PAGE_SIZE - 1
+};
+
+inline void ensure_buf_size_and_update(UniqueBufWithShaderVar &buf, const uint8_t *data, uint32_t size, const char *name,
+  bool do_debug = true)
+{
+  const uint32_t cSize = buf ? buf.getBuf()->getSize() : 0;
+  const uint32_t nextSize = ((size + SWRT_BUF_PAGE_MASK) & ~SWRT_BUF_PAGE_MASK);
+  // Grow when too small; recreate to shrink only when more than 2x oversized. (cSize * 2 > nextSize
+  // was inverted: true in the steady state cSize == nextSize, so the buffer was rebuilt every call.)
+  if (cSize < size || cSize > nextSize * 2)
+  {
+    buf.close();
+    buf = dag::create_sbuffer(sizeof(uint32_t), nextSize / sizeof(uint32_t),
+      SBCF_BIND_SHADER_RES | SBCF_MISC_ALLOW_RAW, // ByteAddressBuffer requires SBCF_MISC_ALLOW_RAW flag
+      0, name);
+  }
+  if (size)
+  {
+    const int64_t reft = profile_ref_ticks();
+    buf.getBuf()->updateData(0, size, data, 0);
+    if (do_debug)
+      debug("update %s in %dus", name, profile_time_usec(reft));
+  }
+}
+
+inline void ensure_buf_size_and_update(UniqueBufWithShaderVar &buf, const Tab<uint8_t> &data, const char *name, bool do_debug = true)
+{
+  ensure_buf_size_and_update(buf, data.begin(), data.size(), name, do_debug);
+}

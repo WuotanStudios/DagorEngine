@@ -7,6 +7,7 @@
 #include <math/dag_mathBase.h>
 #include <gameRes/dag_stdGameResId.h>
 #include <util/dag_delayedAction.h>
+#include <drv/3d/dag_lock.h>
 
 
 uint32_t rendinst::gen::RotationPaletteManager::version = 0;
@@ -30,14 +31,17 @@ rendinst::gen::RotationPaletteManager::RotationPaletteManager() : impostorData(m
   // If one rendinst uses palettes, it will be turned on globally
   // The reason for this is to avoid extra cpu overhead of switching
   if (RendInstGenData::renderResRequired)
+  {
+    d3d::GpuAutoLock gpuLock;
     ShaderGlobal::set_int(ScopedDisablePaletteRotation::get_var_id(), 0);
+  }
   clear();
 }
 
 void rendinst::gen::RotationPaletteManager::clear()
 {
   version++;
-  impostorDataBuffer.close();
+  // impostorDataBuffer will be closed/recreated on main thread in deferBufferRecreationToMT
   entityIdToPaletteInfo.clear();
   // Dummy impostor data with identity rotation to serve as default value for anything that doesn't have rotation palettes
   impostorData.resize(IMPOSTOR_DATA_PALETTE_OFFSET + 1);
@@ -95,7 +99,8 @@ void rendinst::gen::RotationPaletteManager::createPalette(const RendintsInfo &ri
     G_ASSERTF(strcmp(ri_info.rtData->riResName[entityId], ri_info.pregenEnt[i].riName.get()) == 0,
       "Pregen ent identified incorrectly: #%d <%s> != <%s>", i, ri_info.rtData->riResName[entityId],
       ri_info.pregenEnt[i].riName.get());
-    if (count != ri_info.pregenEnt[i].riRes->getRotationPaletteSize() && RendInstGenData::renderResRequired)
+    if (RendInstGenData::renderResRequired && ri_info.pregenEnt[i].riRes &&
+        count != ri_info.pregenEnt[i].riRes->getRotationPaletteSize())
       logwarn("[RI] The level binary was exported with a different palette size than currently "
               "specified for an RI: <%s> (level binary: %d != asset: %d)",
         ri_info.rtData->riResName[entityId], count, ri_info.pregenEnt[i].riRes->getRotationPaletteSize());
@@ -105,7 +110,8 @@ void rendinst::gen::RotationPaletteManager::createPalette(const RendintsInfo &ri
       continue;
     count = clamp(count, 1u, uint32_t(PALETTE_ID_MULTIPLIER));
     // This entity is not registered in the currently used landclass, but it's placed down manually. Default rotation limits are used
-    addPalette(ri_info.pregenEnt[i].riName.get(), ri_info.rtData->riRes[entityId]->getImpostorParams(), id, count);
+    if (ri_info.rtData->riRes[entityId])
+      addPalette(ri_info.pregenEnt[i].riName.get(), ri_info.rtData->riRes[entityId]->getImpostorParams(), id, count);
   }
 
   // Add all landclass assets without rotation palette
@@ -133,7 +139,10 @@ void rendinst::gen::RotationPaletteManager::createPalette(const RendintsInfo &ri
   }
 
   if (RendInstGenData::renderResRequired)
+  {
+    d3d::GpuAutoLock gpuLock;
     ShaderGlobal::set_int(ScopedDisablePaletteRotation::get_var_id(), 1);
+  }
   deferBufferRecreationToMT();
 }
 
@@ -143,7 +152,8 @@ void rendinst::gen::RotationPaletteManager::deferBufferRecreationToMT()
   {
     run_action_on_main_thread([this]() {
       impostorDataBuffer.close();
-      impostorDataBuffer = dag::buffers::create_persistent_sr_tbuf(impostorData.size(), TEXFMT_A32B32G32R32F, "impostor_data_buffer");
+      impostorDataBuffer = dag::buffers::create_persistent_sr_tbuf(impostorData.size(), TEXFMT_A32B32G32R32F, "impostor_data_buffer",
+        d3d::buffers::Init::No, RESTAG_RENDINST);
       fillBuffer();
     });
   }
@@ -198,8 +208,7 @@ uint32_t rendinst::gen::RotationPaletteManager::getImpostorDataBufferOffset(cons
 
     int paletteSize = 1;
 
-    DataBlock *data =
-      reinterpret_cast<DataBlock *>(get_one_game_resource_ex(GAMERES_HANDLE(impostor_data), ImpostorDataGameResClassId));
+    DataBlock *data = reinterpret_cast<DataBlock *>(get_one_game_resource_ex("impostor_data", ImpostorDataGameResClassId));
     if (data)
     {
       DataBlock *impostorBlk = data->getBlockByName(name);
@@ -335,7 +344,7 @@ Point3 rendinst::gen::RotationPaletteManager::clamp_euler_angles(const Palette &
     // no need to apply modulo with 2*pi for these angle values, because the maximum interval size
     // is 2 * pi, which is handled by circular_clamp
     return Point3(circular_clamp(rotation.x, -palette.tiltLimit.x, palette.tiltLimit.x),
-      circular_clamp(rotation.y, y - palette.tiltLimit.x, y + palette.tiltLimit.x),
+      circular_clamp(rotation.y, y - palette.tiltLimit.y, y + palette.tiltLimit.y),
       circular_clamp(rotation.z, -palette.tiltLimit.z, palette.tiltLimit.z));
   }
   else

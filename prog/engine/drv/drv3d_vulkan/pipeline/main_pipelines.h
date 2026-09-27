@@ -115,7 +115,7 @@ public:
         stagesFb += String(45, "    stage [%d] doesn't have a feedback \n", i);
     }
 
-    debug("%s \n  %s\n%s", prefix, "pipeline hit cache: no", stagesFb.c_str());
+    debug("%s\n%s", prefix, stagesFb.c_str());
   }
 
 private:
@@ -172,6 +172,9 @@ public:
   template <CleanupTag Tag>
   void onDelayedCleanupFinish();
 
+  void onDeviceReset();
+  void afterDeviceReset(bool async);
+
   const char *resTypeString() { return "ComputePipeline"; }
 
   ComputePipeline(ProgramID prog, VulkanPipelineCacheHandle cache, LayoutType *l, const CreationInfo &info);
@@ -180,11 +183,15 @@ public:
   void compile();
   bool pendingCompilation();
 
+  ProgramID getProgram() const { return program; }
+
 private:
   static const uint32_t workGroupDims = 3;
   static uint32_t spirvWorkGroupSizeDimConstantIds[workGroupDims];
 
   ComputePipelineCompileScratchData *compileScratch;
+  ShaderModuleBlob blob;
+  ProgramID program;
 };
 
 struct GraphicsPipelineVariantDescription
@@ -194,6 +201,7 @@ struct GraphicsPipelineVariantDescription
   uint64_t nativeRPhash;
   uint32_t subpass;
   VkPrimitiveTopology topology;
+  uint8_t nonDefaultShadingRate;
 
   typedef uint64_t Hash;
 
@@ -221,6 +229,9 @@ struct GraphicsPipelineVariantDescription
     if (topology != l.topology)
       return false;
 
+    if (nonDefaultShadingRate != l.nonDefaultShadingRate)
+      return false;
+
     return true;
   }
 
@@ -228,10 +239,11 @@ struct GraphicsPipelineVariantDescription
   {
     uint16_t trimmedRS = state.renderState.staticIdx;
 
-    debug("vulkan: gfx pipeline variation desc: %04X %02X %02X %02X %02X %08X %016lX %02X %02X %02X | %016llX [%u]", trimmedRS,
+    debug("vulkan: gfx pipeline variation desc: %04X %02X %02X %02X %02X %08X %016lX %02X %02X %02X | %016llX [%u], %u", trimmedRS,
       state.strides[0], state.strides[1], state.strides[2], state.strides[3], // hacky, but will work for debug
       state.inputLayout.get(), *((uint64_t *)&rpClass.colorFormats[0]), (uint8_t)rpClass.depthStencilFormat,
-      (uint8_t)rpClass.colorTargetMask, (topology << 3) | (state.polygonLine << 2) | rpClass.depthState, nativeRPhash, subpass);
+      (uint8_t)rpClass.colorTargetMask, (topology << 3) | (state.polygonLine << 2) | rpClass.depthState, nativeRPhash, subpass,
+      nonDefaultShadingRate);
   }
 #endif
 
@@ -263,6 +275,8 @@ struct GraphicsPipelineVariantDescription
       fnv1_helper(&state.strides[i], ret);
     fnv1_helper(&state.inputLayout, ret);
 
+    ret = fnv1a_step<64>(nonDefaultShadingRate, ret);
+
     if (!nativeRPhash)
     {
       for (int i = 0; i < Driver3dRenderTarget::MAX_SIMRT; ++i)
@@ -275,6 +289,13 @@ struct GraphicsPipelineVariantDescription
 
       // save 2 bytes by mixing booleans and small topo value
       ret = fnv1a_step<64>((topology << 3) | (state.polygonLine << 2) | rpClass.depthState, ret);
+
+      if (rpClass.shadingRateAttachment)
+      {
+        ret = fnv1a_step<64>((uint8_t)rpClass.shadingRateAttachment, ret);
+        ret = fnv1a_step<64>((uint8_t)rpClass.shadingRateAttachmentFormat, ret);
+        ret = fnv1a_step<64>(rpClass.shadingRateAttachmentSamples, ret);
+      }
     }
     else
     {
@@ -288,20 +309,9 @@ struct GraphicsPipelineVariantDescription
   }
 };
 
-BEGIN_BITFIELD_TYPE(GraphicsPipelineDynamicStateMask, uint8_t)
-  ADD_BITFIELD_MEMBER(hasDepthBias, 0, 1)
-  ADD_BITFIELD_MEMBER(hasDepthBoundsTest, 1, 1)
-  ADD_BITFIELD_MEMBER(hasStencilTest, 2, 1)
-  ADD_BITFIELD_MEMBER(hasBlendConstants, 3, 1)
-
-  void from(RenderStateSystemBackend & rs_backend, const GraphicsPipelineVariantDescription &desc, RenderPassResource *native_rp);
-
-END_BITFIELD_TYPE()
-
 class GraphicsPipeline : public BasePipeline<GraphicsPipelineLayout, GraphicsProgram>
 {
   int32_t refs = 1;
-  bool ignore;
 
 public:
   using CreationFeedback = CreationFeedbackBase<spirv::graphics::MAX_SETS>;
@@ -310,7 +320,6 @@ public:
   {
     RenderStateSystemBackend &rsBackend;
     const GraphicsPipelineVariantDescription &varDsc;
-    const GraphicsPipelineDynamicStateMask &dynStateMask;
     const GraphicsPipelineShaderSet<const ShaderModule *> &modules;
     GraphicsPipeline *parentPipeline;
     RenderPassResource *nativeRP;
@@ -320,11 +329,8 @@ public:
   GraphicsPipeline(VulkanPipelineCacheHandle cache, LayoutType *l, const CreationInfo &info);
   void bind() const;
 
-  const GraphicsPipelineDynamicStateMask &getDynamicStateMask() { return dynStateMask; }
-
   int32_t addRef() { return ++refs; }
   int32_t release() { return --refs; }
-  bool isIgnored() { return ignore; }
   void compile();
   VulkanPipelineHandle createPipelineObject(CreationFeedback &cr_feedback);
 
@@ -333,8 +339,9 @@ public:
 #endif
 
 private:
-  GraphicsPipelineDynamicStateMask dynStateMask;
   GraphicsPipelineCompileScratchData *compileScratch;
+
+  void checkAndFixMissingInputs(GraphicsPipelineCompileScratchData &csd, InputLayout &input_layout);
 };
 
 } // namespace drv3d_vulkan

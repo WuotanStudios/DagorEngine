@@ -5,12 +5,13 @@
 #include <pathFinder/tileRICommon.h>
 #include <pathFinder/tileCacheUtil.h>
 #include <pathFinder/pathFinder.h>
-#include <detourCommon.h>
+#include <DetourCommon.h>
 #include <ska_hash_map/flat_hash_map2.hpp>
 #include <debug/dag_debug3d.h>
 #include <math/dag_mathUtils.h>
 #include <util/dag_console.h>
 #include <perfMon/dag_cpuFreq.h>
+#include <generic/dag_span.h>
 #include <EASTL/string.h>
 
 namespace pathfinder
@@ -69,6 +70,11 @@ bool tilecache_is_working()
 
 bool tilecache_is_blocking(rendinst::riex_handle_t riex_handle) { return tilecache_ri_is_blocking(riex_handle); }
 
+obstacle_handle_t tilecache_get_obstacle_handle(rendinst::riex_handle_t riex_handle)
+{
+  return tilecache_ri_get_obstacle_handle(riex_handle);
+}
+
 bool tilecache_is_loaded() { return tileCache && nextHandle; }
 
 bool tilecache_is_inside(const BBox3 &box)
@@ -83,9 +89,10 @@ void tilecache_cleanup()
   tilecache_stop();
   dtFreeTileCache(tileCache);
   tileCache = nullptr;
-  tileObstacleResNameHashes.clear();
-  obstaclesToAdd.clear();
-  obstaclesToRemove.clear();
+  // free the bucket arrays too; obstaclesToAdd peaks at level load with all obstacles pending
+  clear_and_shrink(tileObstacleResNameHashes);
+  clear_and_shrink(obstaclesToAdd);
+  clear_and_shrink(obstaclesToRemove);
 }
 
 void tilecache_restart() { tilecache_start(tileCacheCheckCb, tileCacheObstacleSettingsPath.c_str()); }
@@ -123,7 +130,7 @@ void tilecache_stop()
     return;
   tilecache_ri_stop();
   nextHandle = 0;
-  handle2obstacle.clear();
+  clear_and_shrink(handle2obstacle); // release bucket array, not just elements
 }
 
 static bool tilecache_step()
@@ -171,7 +178,7 @@ static bool tilecache_step()
     }
     else if (!dtStatusDetail(status, DT_BUFFER_TOO_SMALL))
     {
-      logerr("failed to add navmesh obstacle!");
+      logerr("failed to add navmesh obstacle! (2) reason=%X cnt=%d obstaclesToAdd=%d", (int)status, cnt, (int)obstaclesToAdd.size());
     }
     else
       break;
@@ -228,7 +235,7 @@ static obstacle_handle_t obstacle_add_impl(obstacle_handle_t handle, const Point
     }
     if (!dtStatusDetail(status, DT_BUFFER_TOO_SMALL) || upToDate)
     {
-      logerr("failed to add navmesh obstacle!");
+      logerr("failed to add navmesh obstacle! (1) reason=%X upToDate=%d", (int)status, upToDate ? 1 : 0);
       handle = 0;
       ref = 0;
       break;

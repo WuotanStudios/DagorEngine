@@ -7,11 +7,12 @@ var
 
 let
   commonMountPointPrefixes <- {
-    "ecs" => "%dasGameLibs/ecs",
-    "math" => "%dasGameLibs/math",
-    "daFrameGraph" => "%dasGameLibs/daFrameGraph",
+    "ecs" => "%gameLibs/das/ecs",
+    "math" => "%gameLibs/das/math",
+    "daFrameGraph" => "%gameLibs/das/daFrameGraph",
     "daslib" => "%daslib",
     "danetlibs" => "%danetlibs",
+    "gameLibs" => "%gameLibs",
     "imgui" => "%dasImgui",
     "debug" => "%dngdas/das/debug",
     "remote" => "%dngdas/das/remote",
@@ -21,11 +22,11 @@ let
     "common_sounds" => "%danetlibs/sound/common_sounds",
     "environment_sounds" => "%danetlibs/sound/environment_sounds"}
   commonAliasPath <- {
-    "daFrameGraph" => "%dasGameLibs/daFrameGraph.daFG.das"
+    "daFrameGraph" => "%gameLibs/das/daFrameGraph.daFG.das"
   }
 
 [export]
-def module_get(req, from : string) : tuple<string; string; string> const
+def module_get(req, _from : string) : tuple<string; string; string> const
   var rs <- split_by_chars(req, "./")
 
   let mod_name = rs[length(rs) - 1]
@@ -50,5 +51,5 @@ def module_get(req, from : string) : tuple<string; string; string> const
   return (mod_name, "{DAS_PAK_ROOT}/{join(rs,"/")}.das", alias_name)
 
 [export]
-def include_get(inc, from : string) : string
+def include_get(inc, _from : string) : string
   return starts_with(inc, "%") ? inc : "{DAS_PAK_ROOT}/{inc}"

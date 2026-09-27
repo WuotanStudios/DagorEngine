@@ -9,10 +9,10 @@
 #include <free_list_utils.h>
 #include <image_global_subresource_id.h>
 #include <tagged_types.h>
-#include <typed_bit_set.h>
 
 #include <dag/dag_vector.h>
 #include <debug/dag_assert.h>
+#include <generic/dag_expected.h>
 #include <EASTL/numeric.h>
 #include <EASTL/optional.h>
 #include <EASTL/string.h>
@@ -20,6 +20,9 @@
 #include <osApiWrappers/dag_critSec.h>
 #include <osApiWrappers/dag_spinlock.h>
 #include <perfMon/dag_cpuFreq.h>
+#include <startup/dag_globalSettings.h>
+#include <ioSys/dag_dataBlock.h>
+#include <util/dag_compilerDefs.h>
 
 #include <windows.h>
 #include <psapi.h> // psapi.h is not self-contained, it needs windows.h
@@ -29,6 +32,79 @@
 
 namespace drv3d_dx12::resource_manager
 {
+struct MemoryAllocationError
+{
+  /// Error code reported by the underlying DX12 / Win32 API.
+  /// Failures that never reached an API call use fixed codes, so that error handling can tell them
+  /// apart: E_OUTOFMEMORY for a real allocation failure, E_INVALIDARG for a malformed request,
+  /// E_ABORT for a refused attempt that the caller is expected to retry on another path and
+  /// E_UNEXPECTED for a device that is already ill.
+  HRESULT errorCode = S_OK;
+  /// Memory size that that was requested that caused the error.
+  uint64_t requestSize = 0;
+  /// The total size of the memory pool where the memory was attempted to allocate from.
+  uint64_t poolSize = 0;
+  /// The total memory budget granted by the OS of the memory pool where the memory was attempted to allocate from.
+  uint64_t poolBudget = 0;
+  /// The available memory budget of the memory pool where the memory was attempted to allocated from.
+  /// This is basically poolBudget minus currently allocate memory from the pool.
+  uint64_t poolAvail = 0;
+  /// Free space in the system page file.
+  /// Currently always 0 on GDK.
+  uint64_t pageFileSpace = 0;
+  /// System wide host memory usage load as percentage from 0 - 100.
+  /// On GDK this is GameUsed * 100 / GameLimit.
+  uint32_t systemMemoryLoadPercentage = 0;
+
+  enum class Type
+  {
+    // All errors that where because of something else than OOM
+    NoAllocationAttempt,
+    // Allocation failed most likely because of the memory pool was exhausted and there was no way of providing it with paging
+    PoolExhausted,
+    // It is not PoolExhausted and its most likely that the system is under high memory load with no way of paging to page file
+    SystemLoad,
+    // It is neither PoolExhausted nor SystemLoad, so from what we see it should have allocated memory but still failed anyways
+    Unexpected,
+  };
+
+  /// Multiplier to decide if a memory pool or page size can be considered to be exhausted to fulfill the memory request.
+  /// Currently assumes x 2, so if a pool or page size is less than x 2 of the request, it will be considered exhausted.
+  constexpr static uint64_t requested_memory_size_pool_exhaustion_scale = 2;
+  /// Min percentage value of system host memory load that is considered to be exhausted and possible cause for memory
+  /// allocation failures.
+  constexpr static uint32_t system_memory_min_load_percentage_as_exhaustion = 80;
+
+  Type getType() const
+  {
+    if (E_OUTOFMEMORY != errorCode)
+    {
+      return Type::NoAllocationAttempt;
+    }
+    if (poolAvail < requestSize * requested_memory_size_pool_exhaustion_scale)
+    {
+      return Type::PoolExhausted;
+    }
+    if (systemMemoryLoadPercentage > system_memory_min_load_percentage_as_exhaustion)
+    {
+      if (pageFileSpace < requestSize * requested_memory_size_pool_exhaustion_scale)
+      {
+        return Type::SystemLoad;
+      }
+    }
+    return Type::Unexpected;
+  }
+};
+
+/// For failures that did not come from an allocation attempt, so there is no budget information to
+/// report. MemoryBudgetObserver::makeMemoryAllocationError fills that in for the ones that did.
+inline MemoryAllocationError memory_allocation_error(HRESULT error_code) { return {.errorCode = error_code}; }
+
+inline dag::Unexpected<MemoryAllocationError> unexpected_memory_allocation_error(HRESULT error_code)
+{
+  return dag::Unexpected{memory_allocation_error(error_code)};
+}
+
 class ConcurrentAccessControler
 {
 protected:
@@ -88,6 +164,13 @@ protected:
   accessRecodingPendingFrameCompletion(U accessor)
   {
     OSSpinlockScopedLock lock{recodingPendingFrameCompletionMutex};
+    accessor(*static_cast<T *>(recodingPendingFrameCompletion));
+  }
+
+  template <typename T, typename U>
+  typename eastl::enable_if<eastl::is_convertible<T &, PendingForCompletedFrameData &>::value>::type
+  accessRecodingPendingFrameCompletionNoLock(U accessor) DAG_TS_REQUIRES(recodingPendingFrameCompletionMutex)
+  {
     accessor(*static_cast<T *>(recodingPendingFrameCompletion));
   }
 
@@ -172,13 +255,30 @@ protected:
   void setup(const SetupInfo &info)
   {
     didReportOOM = false;
+#if _TARGET_XBOX
+    renderMemoryLimitBytes = static_cast<uint64_t>(dgs_get_settings()->getBlockByNameEx("dx12")->getInt("renderMemoryLimitMb", 0))
+                             << 20u;
+    logdbg("DX12: Render memory limit set to %u MB", renderMemoryLimitBytes >> 20u);
+#if DAGOR_ADDRESS_SANITIZER
+    const uint64_t additionalAsanSystemMemoryBytes =
+      static_cast<uint64_t>(dgs_get_settings()->getBlockByNameEx("dx12")->getInt("additionalAsanSystemMemoryMb", 0)) << 20u;
+    renderMemoryLimitBytes -= additionalAsanSystemMemoryBytes;
+    logdbg("DX12: Adjusted render memory limit to %u MB due to ASAN build (additional system memory: %u MB)",
+      renderMemoryLimitBytes >> 20u, additionalAsanSystemMemoryBytes >> 20u);
+#endif
+#endif
     BaseType::setup(info);
   }
+
+#if _TARGET_XBOX
+  uint64_t renderMemoryLimitBytes = 0;
+  uint64_t renderMemoryUsedBytes = 0;
+#endif
 
   class OomReportData
   {
   public:
-    OomReportData(const char *method_name, const char *resource_name = nullptr, const eastl::optional<uint64_t> &requested_size = {},
+    OomReportData(const char *method_name, const char *resource_name, uint64_t requested_size,
       const eastl::optional<uint32_t> &allocation_flags = {}, const eastl::optional<uint32_t> &memory_group = {}) :
       methodName{method_name},
       resourceName{resource_name},
@@ -201,7 +301,7 @@ protected:
       if (requestedSize)
       {
         oomReport += ", requested size: ";
-        oomReport += eastl::to_string(*requestedSize);
+        oomReport += eastl::to_string(requestedSize);
       }
       if (allocationFlags)
       {
@@ -216,17 +316,20 @@ protected:
       return oomReport;
     }
 
+    uint64_t getRequestedSize() const { return requestedSize; }
+
   private:
     const char *methodName = nullptr;
     const char *resourceName = nullptr;
-    eastl::optional<uint64_t> requestedSize;
+    uint64_t requestedSize;
     eastl::optional<uint32_t> allocationFlags;
     eastl::optional<uint32_t> memoryGroup;
   };
 
   void reportOOMInformation(DXGIAdapter *adapter);
 
-  bool checkForOOM(DXGIAdapter *adapter, bool was_okay, const OomReportData &report_data);
+  bool checkForOOM(DXGIAdapter *adapter, const eastl::optional<MemoryAllocationError> &error_info, const OomReportData &report_data,
+    bool fatal = true);
 
   template <typename C>
   class ScopeExitChecker
@@ -271,7 +374,6 @@ public:
     BUFFERS,
     TEXTURES,
     CONST_RING,
-    TEMP_RING,
     TEMP_MEMORY,
     PERSISTENT_UPLOAD,
     PERSISTENT_READ_BACK,
@@ -280,7 +382,84 @@ public:
     RAYTRACING,
     COUNT,
   };
-  using MetricBits = TypedBitSet<Metric>;
+  struct MetricBits
+  {
+    bool eventLog : 1 = false;
+    bool metricLog : 1 = false;
+    bool memoryUse : 1 = false;
+    bool heaps : 1 = false;
+    bool memory : 1 = false;
+    bool buffers : 1 = false;
+    bool textures : 1 = false;
+    bool constRing : 1 = false;
+    bool tempRing : 1 = false;
+    bool tempMemory : 1 = false;
+    bool persistentUpload : 1 = false;
+    bool persistentReadBack : 1 = false;
+    bool persistentBidirectional : 1 = false;
+    bool scratchBuffer : 1 = false;
+    bool raytracing : 1 = false;
+
+    bool test(Metric m) const
+    {
+      switch (m)
+      {
+        using enum Metric;
+        case EVENT_LOG: return eventLog;
+        case METRIC_LOG: return metricLog;
+        case MEMORY_USE: return memoryUse;
+        case HEAPS: return heaps;
+        case MEMORY: return memory;
+        case BUFFERS: return buffers;
+        case TEXTURES: return textures;
+        case CONST_RING: return constRing;
+        case TEMP_MEMORY: return tempMemory;
+        case PERSISTENT_UPLOAD: return persistentUpload;
+        case PERSISTENT_READ_BACK: return persistentReadBack;
+        case PERSISTENT_BIDIRECTIONAL: return persistentBidirectional;
+        case SCRATCH_BUFFER: return scratchBuffer;
+        case RAYTRACING: return raytracing;
+        default: return false;
+      }
+    }
+
+    void set(Metric m, bool value = true)
+    {
+      switch (m)
+      {
+        using enum Metric;
+        case EVENT_LOG: eventLog = value; break;
+        case METRIC_LOG: metricLog = value; break;
+        case MEMORY_USE: memoryUse = value; break;
+        case HEAPS: heaps = value; break;
+        case MEMORY: memory = value; break;
+        case BUFFERS: buffers = value; break;
+        case TEXTURES: textures = value; break;
+        case CONST_RING: constRing = value; break;
+        case TEMP_MEMORY: tempMemory = value; break;
+        case PERSISTENT_UPLOAD: persistentUpload = value; break;
+        case PERSISTENT_READ_BACK: persistentReadBack = value; break;
+        case PERSISTENT_BIDIRECTIONAL: persistentBidirectional = value; break;
+        case SCRATCH_BUFFER: scratchBuffer = value; break;
+        case RAYTRACING: raytracing = value; break;
+        default: break;
+      }
+    }
+
+    void set()
+    {
+      eventLog = metricLog = memoryUse = heaps = memory = buffers = textures = constRing = tempRing = tempMemory = persistentUpload =
+        persistentReadBack = persistentBidirectional = scratchBuffer = raytracing = true;
+    }
+
+    void reset() { *this = {}; }
+
+    bool any() const
+    {
+      return eventLog || metricLog || memoryUse || heaps || memory || buffers || textures || constRing || tempRing || tempMemory ||
+             persistentUpload || persistentReadBack || persistentBidirectional || scratchBuffer || raytracing;
+    }
+  };
   struct SetupInfo : BaseType::SetupInfo
   {
     MetricBits collectedMetrics;
@@ -297,7 +476,6 @@ protected:
   {
     SYSTEM,
     CONST_RING,
-    UPLOAD_RING,
     TEMP_MEMORY,
     UPLOAD_MEMORY,
     READ_BACK_MEMORY,
@@ -406,8 +584,6 @@ protected:
   ALLOCATE_ALIAS_COUNTERS(placedGpuBufferHeaps, gpuBufferHeaps)                                                                     \
   ALLOCATE_FREE_COUNTERS(allocatedConstRing, freedConstRing, constRing)                                                             \
   COUNTER(usedConstRing)                                                                                                            \
-  ALLOCATE_FREE_COUNTERS(allocatedUploadRing, freedUploadRing, uploadRing)                                                          \
-  COUNTER(usedUploadRing)                                                                                                           \
   ALLOCATE_FREE_COUNTERS(allocatedTempBuffer, freedTempBuffer, tempBuffer)                                                          \
   COUNTER(usedTempBuffer)                                                                                                           \
   ALLOCATE_FREE_COUNTERS(allocatedPersistentUploadBuffer, freedPersistentUploadBuffer, persistentUploadBuffer)                      \
@@ -426,7 +602,9 @@ protected:
   COUNTER(scratchBufferPersistentUse)                                                                                               \
   ALLOCATE_FREE_COUNTERS(allocatedRaytraceAccelStructPool, freedRaytraceAccelStructPool, raytraceAccelStructPool)                   \
   ALLOCATE_FREE_COUNTERS(allocatedRaytraceBottomStructure, freedRaytraceBottomStructure, raytraceBottomStructure)                   \
-  ALLOCATE_FREE_COUNTERS(allocatedRaytraceTopStructure, freedRaytraceTopStructure, raytraceTopStructure)
+  ALLOCATE_FREE_COUNTERS(allocatedRaytraceTopStructure, freedRaytraceTopStructure, raytraceTopStructure)                            \
+  ALLOCATE_FREE_COUNTERS(allocatedRaytraceOpacityMicroMapTriangleArray, freedRaytraceOpacityMicroMapTriangleArray,                  \
+    raytraceOpacityMicroMapTriangleArray)
 
   struct RawCounterSet
   {
@@ -574,8 +752,6 @@ protected:
         FREE_TEXTURE,
         ALLOCATE_CONST_RING,
         FREE_CONST_RING,
-        ALLOCATE_TEMP_RING,
-        FREE_TEMP_RING,
         ALLOCATE_TEMP_BUFFER,
         FREE_TEMP_BUFFER,
         USE_TEMP_BUFFER,
@@ -603,6 +779,8 @@ protected:
         RAYTRACE_BOTTOM_STRUCTURE_FREE,
         RAYTRACE_TOP_STRUCTURE_ALLOCATE,
         RAYTRACE_TOP_STRUCTURE_FREE,
+        RAYTRACE_OPACITY_MICRO_MAP_TRIANGLE_ARRAY_ALLOCATE,
+        RAYTRACE_OPACITY_MICRO_MAP_TRIANGLE_ARRAY_FREE,
         COUNT
       };
       Type type;
@@ -705,39 +883,33 @@ protected:
       actionHistory.push_back(msg);
     }
 
-    void recordBufferEvent(ActionInfo::Type type, size_t size, bool is_gpu, const char *name)
+    void recordBufferEvent(ActionInfo::Type type, size_t size, bool is_gpu, eastl::string_view name)
     {
       ActionInfo msg;
       msg.type = type;
       msg.frameIndex = currentFrame.frameIndex;
       msg.eventPath = curentEventPath;
+      msg.objectName = name;
       msg.size = size;
       msg.isGPUMemory = is_gpu;
       msg.timeIndex = get_time_msec();
-      if (name)
-      {
-        msg.objectName = name;
-      }
       actionHistory.push_back(msg);
     }
 
     void recordTextureEvent(ActionInfo::Type type, MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, uint32_t size,
-      FormatStore format, const char *name)
+      FormatStore format, eastl::string_view name)
     {
       ActionInfo msg;
       msg.type = type;
       msg.frameIndex = currentFrame.frameIndex;
       msg.eventPath = curentEventPath;
-      msg.format = format.asDxGiTextureCreateFormat();
+      msg.objectName = name;
       msg.size = size;
+      msg.format = format.asDxGiResourceCreateFormat();
       msg.extent = extent;
       msg.mips = mips.count();
       msg.arrays = arrays.count();
       msg.timeIndex = get_time_msec();
-      if (name)
-      {
-        msg.objectName = name;
-      }
       actionHistory.push_back(msg);
     }
   };
@@ -753,7 +925,6 @@ class MetricsProvider : public MetricsProviderBase
 
 protected:
   using ConcurrentMetricsState = ContainerMutexWrapper<MetricsState, WinCritSec>;
-  using ConcurrentMetricsStateAccessToken = ConcurrentMetricsState::AccessToken;
 
 private:
   MetricBits metricsCollectedBits{};
@@ -767,7 +938,7 @@ private:
   }
 
   void recordBufferEvent(ConcurrentMetricsState::AccessToken &at, MetricsState::ActionInfo::Type type, size_t size,
-    bool is_gpu = false, const char *name = nullptr)
+    bool is_gpu = false, eastl::string_view name = {})
   {
     if (!isCollectingMetric(Metric::EVENT_LOG))
       return;
@@ -775,7 +946,7 @@ private:
   }
 
   void recordTextureEvent(ConcurrentMetricsState::AccessToken &at, MetricsState::ActionInfo::Type type, MipMapCount mips,
-    ArrayLayerCount arrays, const Extent3D &extent, uint32_t size, FormatStore format, const char *name)
+    ArrayLayerCount arrays, const Extent3D &extent, uint32_t size, FormatStore format, eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::EVENT_LOG))
       return;
@@ -787,10 +958,10 @@ protected:
   bool isAnyCounterCollecting() const
   {
     return isCollectingMetric(Metric::HEAPS) || isCollectingMetric(Metric::MEMORY) || isCollectingMetric(Metric::BUFFERS) ||
-           isCollectingMetric(Metric::TEXTURES) || isCollectingMetric(Metric::CONST_RING) || isCollectingMetric(Metric::TEMP_RING) ||
-           isCollectingMetric(Metric::TEMP_MEMORY) || isCollectingMetric(Metric::PERSISTENT_UPLOAD) ||
-           isCollectingMetric(Metric::PERSISTENT_READ_BACK) || isCollectingMetric(Metric::PERSISTENT_BIDIRECTIONAL) ||
-           isCollectingMetric(Metric::SCRATCH_BUFFER) || isCollectingMetric(Metric::RAYTRACING);
+           isCollectingMetric(Metric::TEXTURES) || isCollectingMetric(Metric::CONST_RING) || isCollectingMetric(Metric::TEMP_MEMORY) ||
+           isCollectingMetric(Metric::PERSISTENT_UPLOAD) || isCollectingMetric(Metric::PERSISTENT_READ_BACK) ||
+           isCollectingMetric(Metric::PERSISTENT_BIDIRECTIONAL) || isCollectingMetric(Metric::SCRATCH_BUFFER) ||
+           isCollectingMetric(Metric::RAYTRACING);
   }
   bool isCollectingAnyMetric() const { return metricsCollectedBits.any(); }
 
@@ -858,7 +1029,7 @@ protected:
     recordMemoryEvent(metricsAccess, MetricsState::ActionInfo::Type::FREE_MEMORY, size, is_gpu);
   }
 
-  void recordBufferHeapAllocated(uint32_t size, bool is_gpu, const char *name)
+  void recordBufferHeapAllocated(uint32_t size, bool is_gpu, eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::BUFFERS))
       return;
@@ -870,7 +1041,8 @@ protected:
 
     recordBufferEvent(metricsAccess, MetricsState::ActionInfo::Type::ALLOCATE_BUFFER_HEAP, size, is_gpu, name);
   }
-  void recordBufferHeapFreed(uint32_t size, bool is_gpu, const char *name)
+
+  void recordBufferHeapFreed(uint32_t size, bool is_gpu, eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::BUFFERS))
       return;
@@ -884,7 +1056,7 @@ protected:
   }
 
   void recordTextureAllocated(MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, uint32_t size, FormatStore format,
-    const char *name)
+    eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::TEXTURES))
       return;
@@ -896,7 +1068,8 @@ protected:
     recordTextureEvent(metricsAccess, MetricsState::ActionInfo::Type::ALLOCATE_TEXTURE, mips, arrays, extent, size, format, name);
   }
 
-  void recordTextureAliased(MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, FormatStore format, const char *name)
+  void recordTextureAliased(MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, FormatStore format,
+    eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::TEXTURES))
       return;
@@ -908,7 +1081,8 @@ protected:
     recordTextureEvent(metricsAccess, MetricsState::ActionInfo::Type::ALIAS_TEXTURE, mips, arrays, extent, 0, format, name);
   }
 
-  void recordTextureAdopted(MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, FormatStore format, const char *name)
+  void recordTextureAdopted(MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, FormatStore format,
+    eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::TEXTURES))
       return;
@@ -921,7 +1095,7 @@ protected:
   }
 
   void recordTextureESRamAllocated(MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, uint32_t size, FormatStore format,
-    const char *name)
+    eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::TEXTURES))
       return;
@@ -935,7 +1109,7 @@ protected:
   }
 
   void recordTextureFreed(MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, uint32_t size, FormatStore format,
-    const char *name)
+    eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::TEXTURES))
       return;
@@ -979,41 +1153,6 @@ protected:
     auto &target = metricsAccess->currentFrame.rawCounters.usedConstRing;
     target.count++;
     target.size += size;
-  }
-
-  void recordUploadRingAllocated(uint32_t size)
-  {
-    if (!isCollectingMetric(Metric::TEMP_RING))
-      return;
-    auto metricsAccess = metrics.access();
-    auto &target = metricsAccess->currentFrame.rawCounters.allocatedUploadRing;
-    target.count++;
-    target.size += size;
-
-    recordBufferEvent(metricsAccess, MetricsState::ActionInfo::Type::ALLOCATE_TEMP_RING, size);
-  }
-
-  void recordUploadRingFreed(uint32_t size)
-  {
-    if (!isCollectingMetric(Metric::TEMP_RING))
-      return;
-    auto metricsAccess = metrics.access();
-    auto &target = metricsAccess->currentFrame.rawCounters.freedUploadRing;
-    target.count++;
-    target.size += size;
-
-    recordBufferEvent(metricsAccess, MetricsState::ActionInfo::Type::FREE_TEMP_RING, size);
-  }
-
-  void recordUploadRingUsed(uint32_t size)
-  {
-    if (!isCollectingMetric(Metric::TEMP_RING))
-      return;
-    auto metricsAccess = metrics.access();
-    auto &target = metricsAccess->currentFrame.rawCounters.usedUploadRing;
-    target.count++;
-    target.size += size;
-    // does not generate events, there are way too many
   }
 
   void recordTempBufferAllocated(uint32_t size)
@@ -1221,7 +1360,7 @@ protected:
   }
 
   void recordTexturePlacedInUserResourceHeap(MipMapCount mips, ArrayLayerCount arrays, const Extent3D &extent, uint32_t size,
-    FormatStore format, const char *name)
+    FormatStore format, eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::TEXTURES))
       return;
@@ -1234,7 +1373,7 @@ protected:
       format, name);
   }
 
-  void recordBufferPlacedInUserResourceHeap(uint32_t size, bool is_gpu, const char *name)
+  void recordBufferPlacedInUserResourceHeap(uint32_t size, bool is_gpu, eastl::string_view name)
   {
     if (!isCollectingMetric(Metric::BUFFERS))
       return;
@@ -1438,6 +1577,29 @@ protected:
     recordBufferEvent(metricsAccess, MetricsState::ActionInfo::Type::RAYTRACE_TOP_STRUCTURE_FREE, size, true);
   }
 
+  void recordRaytraceOpacityMicroMapTriangleArrayAllocated(uint32_t size)
+  {
+    if (!isCollectingMetric(Metric::RAYTRACING))
+      return;
+    auto metricsAccess = metrics.access();
+    auto &target = metricsAccess->currentFrame.rawCounters.allocatedRaytraceOpacityMicroMapTriangleArray;
+    target.count++;
+    target.size += size;
+    recordBufferEvent(metricsAccess, MetricsState::ActionInfo::Type::RAYTRACE_OPACITY_MICRO_MAP_TRIANGLE_ARRAY_ALLOCATE, size, true);
+  }
+
+  void recordRaytraceOpacityMicroMapTriangleArrayFreed(uint32_t size)
+  {
+    if (!isCollectingMetric(Metric::RAYTRACING))
+      return;
+    auto metricsAccess = metrics.access();
+    auto &target = metricsAccess->currentFrame.rawCounters.freedRaytraceOpacityMicroMapTriangleArray;
+    target.count++;
+    target.size += size;
+
+    recordBufferEvent(metricsAccess, MetricsState::ActionInfo::Type::RAYTRACE_OPACITY_MICRO_MAP_TRIANGLE_ARRAY_FREE, size, true);
+  }
+
 public:
   void pushEvent(const char *begin, const char *end)
   {
@@ -1499,25 +1661,21 @@ class MetricsProvider : public MetricsProviderBase
   using BaseType = MetricsProviderBase;
 
 protected:
-  WinCritSec *getMetrixMutex() { return nullptr; }
-
+  bool isCollectingMetric(Metric) const { return false; }
   void recordHeapAllocated(uint32_t, bool) {}
   void recordHeapFreed(uint32_t, bool) {}
   void recordMemoryAllocated(uint32_t, bool) {}
   void recordMemoryFreed(uint32_t, bool) {}
-  void recordBufferHeapAllocated(uint32_t, bool, const char *) {}
-  void recordBufferHeapFreed(uint32_t, bool, const char *) {}
-  void recordTextureAllocated(MipMapCount, ArrayLayerCount, const Extent3D &, uint32_t, FormatStore, const char *) {}
-  void recordTextureAliased(MipMapCount, ArrayLayerCount, const Extent3D &, FormatStore, const char *) {}
-  void recordTextureAdopted(MipMapCount, ArrayLayerCount, const Extent3D &, FormatStore, const char *) {}
-  void recordTextureESRamAllocated(MipMapCount, ArrayLayerCount, const Extent3D &, uint32_t, FormatStore, const char *) {}
-  void recordTextureFreed(MipMapCount, ArrayLayerCount, const Extent3D &, uint32_t, FormatStore, const char *) {}
+  void recordBufferHeapAllocated(uint32_t, bool, auto &&) {}
+  void recordBufferHeapFreed(uint32_t, bool, auto &&) {}
+  void recordTextureAllocated(MipMapCount, ArrayLayerCount, const Extent3D &, uint32_t, FormatStore, auto &&) {}
+  void recordTextureAliased(MipMapCount, ArrayLayerCount, const Extent3D &, FormatStore, auto &&) {}
+  void recordTextureAdopted(MipMapCount, ArrayLayerCount, const Extent3D &, FormatStore, auto &&) {}
+  void recordTextureESRamAllocated(MipMapCount, ArrayLayerCount, const Extent3D &, uint32_t, FormatStore, auto &&) {}
+  void recordTextureFreed(MipMapCount, ArrayLayerCount, const Extent3D &, uint32_t, FormatStore, auto &&) {}
   void recordConstantRingAllocated(uint32_t) {}
   void recordConstantRingFreed(uint32_t) {}
   void recordConstantRingUsed(uint32_t) {}
-  void recordUploadRingAllocated(uint32_t) {}
-  void recordUploadRingFreed(uint32_t) {}
-  void recordUploadRingUsed(uint32_t) {}
   void recordTempBufferAllocated(uint32_t) {}
   void recordTempBufferFreed(uint32_t) {}
   void recordTempBufferUsed(uint32_t) {}
@@ -1535,8 +1693,8 @@ protected:
   void recordPersistentBidirectionalMemoryFreed(uint32_t) {}
   void recordNewUserResourceHeap(size_t, bool) {}
   void recordDeletedUserResourceHeap(size_t, bool) {}
-  void recordTexturePlacedInUserResourceHeap(MipMapCount, ArrayLayerCount, const Extent3D &, uint32_t, FormatStore, const char *) {}
-  void recordBufferPlacedInUserResourceHeap(uint32_t, bool, const char *) {}
+  void recordTexturePlacedInUserResourceHeap(MipMapCount, ArrayLayerCount, const Extent3D &, uint32_t, FormatStore, auto &&) {}
+  void recordBufferPlacedInUserResourceHeap(uint32_t, bool, auto &&) {}
   // void setup(const SetupInfo &) {}
   // void shutdown() {}
   // void preRecovery() {}
@@ -1551,6 +1709,8 @@ protected:
   void recordRaytraceBottomStructureFreed(uint32_t) {}
   void recordRaytraceTopStructureAllocated(uint32_t) {}
   void recordRaytraceTopStructureFreed(uint32_t) {}
+  void recordRaytraceOpacityMicroMapTriangleArrayAllocated(uint32_t) {}
+  void recordRaytraceOpacityMicroMapTriangleArrayFreed(uint32_t) {}
 
 public:
   void pushEvent(const char *, const char *) {}

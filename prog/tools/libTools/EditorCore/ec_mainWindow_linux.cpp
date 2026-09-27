@@ -10,31 +10,47 @@
 #include <drv/hid/dag_hiPointing.h>
 #include <EditorCore/ec_imguiInitialization.h>
 #include <EditorCore/ec_input.h>
+#include <ioSys/dag_dataBlock.h>
 #include <startup/dag_globalSettings.h>
 #include <startup/dag_inpDevClsDrv.h>
 #include <startup/dag_restart.h>
+#include <workCycle/dag_gameSettings.h>
 #include <workCycle/dag_genGuiMgr.h>
 #include <workCycle/dag_workCycle.h>
 
-#include <X11/Xcursor/Xcursor.h>
-
-namespace workcycle_internal
-{
-extern Display *get_root_display();
-extern bool window_initing;
-} // namespace workcycle_internal
+#include <osApiWrappers/dag_linuxGUI.h>
 
 extern bool ec_mouse_cursor_hidden;
 
 static IWndManagerEventHandler *editor_main_window_event_handler = nullptr;
 static void (*old_shutdown_handler)() = nullptr;
+static ImguiWndManagerBase::WindowPositionAndSize last_windw_position_and_size;
+static bool exit_requested = false;
 
 class EditorCoreGeneralGuiManager : public IGeneralGuiManager
 {
 public:
-  void beforeRender(int) override {}
+  void beforeRender(int) override
+  {
+    void *wnd = win32_get_main_wnd();
 
-  bool canCloseNow() override { return !editor_main_window_event_handler || editor_main_window_event_handler->onClose(); }
+    int x = 0, y = 0;
+    linux_GUI::get_window_frame_position(wnd, x, y);
+
+    // Saving client size, XCreateWindow() expects that.
+    int width = 0, height = 0;
+    linux_GUI::get_window_client_size(wnd, width, height);
+
+    last_windw_position_and_size.rectangle = EcRect{.l = x, .t = y, .r = x + width, .b = y + height};
+    last_windw_position_and_size.maximized = linux_GUI::is_window_maximized(wnd);
+  }
+
+  bool canCloseNow() override
+  {
+    if (!editor_main_window_event_handler || editor_main_window_event_handler->onClose())
+      exit_requested = true;
+    return false;
+  }
 
   void drawFps(float, float, float) override {}
 };
@@ -46,7 +62,28 @@ class ImguiWndManagerLinux : public ImguiWndManagerBase
 public:
   explicit ImguiWndManagerLinux(void *main_hwnd) : mainHwnd(main_hwnd) {}
 
-  void close() override { quit_game(); }
+  void close() override { general_gui_manager.canCloseNow(); }
+
+  void loadMainWindowPositionAndSize(const DataBlock &blk) override
+  {
+    const IPoint2 position = blk.getIPoint2("position", IPoint2::ZERO);
+    const IPoint2 size = blk.getIPoint2("size", IPoint2::ZERO);
+    requestedMainWindowPositionAndSize.rectangle.l = position.x;
+    requestedMainWindowPositionAndSize.rectangle.t = position.y;
+    requestedMainWindowPositionAndSize.rectangle.r = position.x + size.x;
+    requestedMainWindowPositionAndSize.rectangle.b = position.y + size.y;
+    requestedMainWindowPositionAndSize.maximized = blk.getBool("maximized", true);
+  }
+
+  void saveMainWindowPositionAndSize(DataBlock &blk) override
+  {
+    if (!last_windw_position_and_size.isValid())
+      return;
+
+    blk.addIPoint2("position", IPoint2(last_windw_position_and_size.rectangle.l, last_windw_position_and_size.rectangle.t));
+    blk.addIPoint2("size", IPoint2(last_windw_position_and_size.rectangle.width(), last_windw_position_and_size.rectangle.height()));
+    blk.addBool("maximized", last_windw_position_and_size.maximized);
+  }
 
   void *getMainWindow() const override { return mainHwnd; }
 
@@ -67,15 +104,28 @@ public:
     }
   }
 
-  bool init3d(const char *drv_name, const DataBlock *blkTexStreaming) override
+  bool init3d(const char *drv_name, const DataBlock *blkTexStreaming, const char *caption, const char *icon) override
   {
-    workcycle_internal::window_initing = true;
+    tools3d::load_settings();
 
-    const bool succeeded = tools3d::init(drv_name, blkTexStreaming);
+    if (requestedMainWindowPositionAndSize.isValid())
+    {
+      WindowPositionAndSize &wps = requestedMainWindowPositionAndSize;
+      DataBlock &videoBlk = *const_cast<DataBlock *>(dgs_get_settings())->addBlock("video");
+      videoBlk.setStr("resolution", String(0, "%dx%d", wps.rectangle.width(), wps.rectangle.height()));
+      videoBlk.setIPoint2("position", IPoint2(wps.rectangle.l, wps.rectangle.t));
+      videoBlk.setBool("maximized", wps.maximized);
+      wps.reset();
+    }
 
-    // Mark window_initing complete because while it is true dgs_app_active is not updated in prog/engine/workCycle/mainWndProc.cpp,
-    // and handle_app_activity_change() in imguiImp.cpp uses dgs_app_active to send focus events.
-    workcycle_internal::window_initing = false;
+    const bool succeeded = tools3d::init(drv_name, blkTexStreaming, caption, nullptr);
+    mainHwnd = win32_get_main_wnd();
+
+    // The only reason this is here to match the Windows version.
+    const bool oldLimitFps = dgs_limit_fps;
+    dgs_limit_fps = false;
+    dagor_work_cycle();
+    dgs_limit_fps = oldLimitFps;
 
     return succeeded;
   }
@@ -133,13 +183,7 @@ private:
       if (global_cls_drv_pnt->isMouseCursorHidden())
         global_cls_drv_pnt->hideMouseCursor(false);
 
-      // Set the cursor after hideMouseCursor() because that might have also changed the cursor.
-      Display *display = workcycle_internal::get_root_display();
-      Window window = (intptr_t)win32_get_main_wnd(); // see getWindowFromPtrHandle()
-      Cursor cursor = XcursorLibraryLoadCursor(display, cursorName);
-      if (cursor == None)
-        cursor = XcursorLibraryLoadCursor(display, arrowCursor);
-      XDefineCursor(display, window, cursor);
+      linux_GUI::set_cursor(win32_get_main_wnd(), cursorName);
 
       return false;
     }
@@ -169,17 +213,15 @@ private:
   void *mainHwnd;
   CursorParams cursorParams;
   bool cursorParamsMakeHiddenCursor = false;
+  WindowPositionAndSize requestedMainWindowPositionAndSize;
 };
 
-// Used in the Linux version, not used in the Windows version.
 static void post_shutdown_handler()
 {
   if (editor_main_window_event_handler)
     editor_main_window_event_handler->onDestroy();
 
   ::shutdown_game(RESTART_ALL);
-
-  d3d::release_driver();
 
   // invoke shutdown handler installed by platform
   if (old_shutdown_handler)
@@ -188,7 +230,7 @@ static void post_shutdown_handler()
 
 IWndManager *EditorMainWindow::createWindowManager() { return new ImguiWndManagerLinux(mainHwnd); }
 
-void EditorMainWindow::run(const char *caption, const char *icon, FileDropHandler file_drop_handler, E3DCOLOR bg_color)
+void EditorMainWindow::run(FileDropHandler file_drop_handler)
 {
   editor_main_window_event_handler = &eventHandler;
 
@@ -200,16 +242,12 @@ void EditorMainWindow::run(const char *caption, const char *icon, FileDropHandle
   onMainWindowCreated();
 
   ::dagor_reset_spent_work_time();
-  for (;;) // infinite loop!
+  while (!exit_requested)
     if (d3d::is_inited())
       ::dagor_work_cycle();
     else
       ::dagor_idle_cycle();
 }
-
-void EditorMainWindow::close() {}
-
-void EditorMainWindow::onClose() {}
 
 // TODO: tools Linux porting: missing messages: WM_MOVE, WM_SIZE -- only needed for multi view
 // TODO: tools Linux porting: missing messages: WM_DROPFILES -- only used for ScreenshotMetaInfoLoader

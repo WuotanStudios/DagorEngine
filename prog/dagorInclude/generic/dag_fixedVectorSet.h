@@ -13,6 +13,7 @@
 // see dag_relocatableFixedVector.h for more info
 
 #include <generic/dag_relocatableFixedVector.h>
+#include <util/dag_compilerDefs.h>
 
 
 namespace dag
@@ -20,7 +21,7 @@ namespace dag
 
 template <typename T, size_t inplace_count, bool allow_overflow = true, typename ExtractKey = eastl::use_self<T>,
   typename Allocator = MidmemAlloc, typename Counter = uint32_t>
-class FixedVectorSet : protected RelocatableFixedVector<T, inplace_count, allow_overflow, Allocator, Counter>
+class DAGOR_WARN_IF_UNUSED FixedVectorSet : protected RelocatableFixedVector<T, inplace_count, allow_overflow, Allocator, Counter>
 {
 public:
   typedef RelocatableFixedVector<T, inplace_count, allow_overflow, Allocator, Counter> base_type;
@@ -75,7 +76,7 @@ template <typename T, size_t N, bool O, typename E, typename A, typename C>
 template <typename InputIterator>
 inline FixedVectorSet<T, N, O, E, A, C>::FixedVectorSet(InputIterator first, InputIterator last)
 {
-  reserve(eastl::distance(last, first));
+  reserve(eastl::distance(first, last));
   // This is equivalent to an insertion sort
   for (; first != last; ++first)
     insert(*first);

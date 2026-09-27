@@ -21,19 +21,12 @@ void writeHistory32(danet::BitStream &bs, uint32_t data);
 
 // Time
 double alignTime(double time, float fixed_dt);
-inline int floorPhysicsTickNumber(float time, float fixed_dt)
+inline int floorPhysicsTickNumber(double time, float fixed_dt)
 {
   return int(time / fixed_dt); // conversion to int always truncates (round-to-zero)
 }
-inline int nearestPhysicsTickNumber(float time, float fixed_dt)
-{
-#if _TARGET_SIMD_SSE > 0
-  return _mm_cvtss_si32(_mm_set_ss(time / fixed_dt));
-#else
-  return int(time / fixed_dt + 0.5f);
-#endif
-}
-inline int ceilPhysicsTickNumber(float time, float fixed_dt)
+inline int nearestPhysicsTickNumber(double time, float fixed_dt) { return ::round(time / fixed_dt); }
+inline int ceilPhysicsTickNumber(double time, float fixed_dt)
 {
   // Note: difference from std ceil() - for exactly divisible by fixed_dt time N this gives N+1 tick (i.e. 123.0 -> 124)
   // This is intentional, since this is how our controls/physics works
@@ -82,8 +75,8 @@ inline void calc_quat_omega_at_time(double at_time, const Quat &quat1, const T &
 
 // Moved from dng/phys/physUtils.h
 // TODO: Move to gamephys namespace
-template <typename Phys>
-inline float get_phys_interp_time(const Phys &phys, float at_time)
+template <typename Phys, typename F = double>
+inline F get_phys_interp_time(const Phys &phys, F at_time)
 {
   if (int tdelta = phys.currentState.atTick - phys.currentState.lastAppliedControlsForTick - 1) // correction for delayed controls mode
     return at_time + tdelta * phys.timeStep;
@@ -91,9 +84,9 @@ inline float get_phys_interp_time(const Phys &phys, float at_time)
     return at_time;
 }
 
-template <typename Phys>
-inline float get_phys_interpk_clamped(const Phys &phys, float at_time)
+template <typename Phys, typename F = double>
+inline float get_phys_interpk_clamped(const Phys &phys, F at_time)
 {
-  return cvt(get_phys_interp_time(phys, at_time), phys.previousState.atTick * phys.timeStep, phys.currentState.atTick * phys.timeStep,
-    0.f, 1.f);
+  F ts = phys.timeStep;
+  return cvt_type_<F>(get_phys_interp_time(phys, at_time), phys.previousState.atTick * ts, phys.currentState.atTick * ts, 0.f, 1.f);
 }

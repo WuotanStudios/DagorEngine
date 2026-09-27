@@ -26,6 +26,9 @@
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/EmptyShape.h>
 #include "shapes/HeightField16Shape.h"
+#include "shapes/CollisionBlasShape.h"
+#include "joltNativeShape.h"
+#include "collResJoltChunk.h"
 #include <Jolt/Physics/Collision/GroupFilterTable.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/ShapeCast.h>
@@ -44,6 +47,7 @@
 #include <startup/dag_globalSettings.h>
 #include <osApiWrappers/dag_miscApi.h>
 #include <perfMon/dag_statDrv.h>
+#include <util/dag_compilerDefs.h>
 
 namespace layers
 {
@@ -193,7 +197,7 @@ public:
     JobImpl(const char *jName, JPH::ColorArg color, JPH::JobSystem *jSys, const JobFunction &jFunc, JPH::uint32 numDeps) :
       Job(jName, color, jSys, jFunc, numDeps)
     {}
-    const char *getJobName(bool &) const override { return "JoltJobImpl"; }
+    const char *getJobName(bool &) const override { return DAPROFILER_STRING("JoltJobImpl"); }
     void doJob() override
     {
       Execute();
@@ -201,7 +205,7 @@ public:
     }
     JobImpl *prevInBarrier = nullptr;
     // Don't execute non jolt jobs on active wait as it causing lock-order-inversion on e.g. Jolt rw locks & rendinst rw-locks
-#ifdef __SANITIZE_THREAD__
+#ifdef DAGOR_THREAD_SANITIZER
     static constexpr threadpool::JobPriority tprio = threadpool::PRIO_HIGH;
 #else
     // Low prio in order to avoid interference with neighbouring parallel-for jobs
@@ -237,7 +241,7 @@ public:
       }
     }
 
-    void AddJob(const JobHandle &inJob) override
+    void addJobImpl(const JobHandle &inJob, bool wake = true)
     {
       auto job = static_cast<JobImpl *>(inJob.GetPtr());
       if (job->SetBarrier(this)) // Note: this if is not taken if job is already done at this point
@@ -246,7 +250,11 @@ public:
         G_ASSERT(!job->prevInBarrier);
         interlocked_increment(n2wait);
         if (job->CanBeExecuted())
+        {
           JoltJobSystemImpl::submitJob(job);
+          if (wake)
+            threadpool::wake_up_one();
+        }
 
         JobImpl *prev = interlocked_acquire_load_ptr(jTail);
         while (1)
@@ -260,25 +268,37 @@ public:
       }
     }
 
+    void AddJob(const JobHandle &inJob) override { addJobImpl(inJob); }
+
     void AddJobs(const JobHandle *inHandles, JPH::uint inNumHandles) override
     {
-      bool should_wake_up = inNumHandles > 16;
-      for (; inNumHandles; inHandles++, inNumHandles--)
-        AddJob(*inHandles);
-      if (should_wake_up)
+      for (unsigned i = 0; i < inNumHandles; ++i)
+        addJobImpl(inHandles[i], /*wake*/ false);
+      if (inNumHandles > 4)
         threadpool::wake_up_all();
     }
 
     void activeWait()
     {
       while (interlocked_acquire_load(n2wait) > 0) // Note: new jobs can keep being added during this wait
+      {
+        int nSubmitted = 0;
         for (auto *j = interlocked_acquire_load_ptr(jTail); j; j = j->prevInBarrier)
           if (j->getState() == j->S_SUBMITTED)
           {
             threadpool::wait(j, 0, j->tprio); // Active wait
             j->setState(j->S_WAITED_ON);
             interlocked_decrement(n2wait);
+            nSubmitted++;
           }
+        if (!nSubmitted)
+          if (int nw = interlocked_acquire_load(n2wait); nw > 0)
+          {
+            if (nw > 1)
+              nw > 2 ? threadpool::wake_up_all() : threadpool::wake_up_one();
+            threadpool::perform_pending_job(JobImpl::tprio); // Execute deps jobs
+          }
+      }
     }
 
   protected:
@@ -341,13 +361,16 @@ protected:
     threadpool::add(j, j->tprio, qPos, threadpool::AddFlags::IgnoreNotDone);
     j->setState(j->S_SUBMITTED);
   }
-  void QueueJob(Job *inJob) override { submitJob(static_cast<JobImpl *>(inJob)); }
+  void QueueJob(Job *inJob) override
+  {
+    submitJob(static_cast<JobImpl *>(inJob));
+    threadpool::wake_up_one();
+  }
   void QueueJobs(Job **inJobs, JPH::uint inNumJobs) override
   {
-    bool should_wake_up = inNumJobs > 4;
-    for (; inNumJobs; inJobs++, inNumJobs--)
-      submitJob(static_cast<JobImpl *>(*inJobs));
-    if (should_wake_up)
+    for (int i = 0; i < inNumJobs; ++i)
+      submitJob(static_cast<JobImpl *>(inJobs[i]));
+    if (inNumJobs > 4)
       threadpool::wake_up_all();
   }
 
@@ -404,10 +427,12 @@ void PhysWorld::init_engine(bool single_threaded)
 
   JPH_IF_ENABLE_ASSERTS(JPH::AssertFailed = joltAssertFailed;)
   JPH::Trace = &jolt_trace;
+  JPH::RegisterDefaultAllocator();
   tempAllocator = new JPH::TempAllocatorImpl(tempAllocSz); // To consider: implement using framemem. Is cross-thread freeing required?
   JPH::Factory::sInstance = new JPH::Factory;
   JPH::RegisterTypes();
   JPH::HeightField16Shape::sRegister();
+  JPH::CollisionBlasShape::sRegister();
   physicsSystem = new JPH::PhysicsSystem();
   physicsSystem->Init(maxBodiesNum, numBodyMutexes, maxBodiesPairsNum, maxContactConstraints, broadPhaseLayerInterface, broadphase_f,
     objects_f);
@@ -458,14 +483,29 @@ void PhysWorld::term_engine()
 
 JPH::Quat to_jQuat(const TMatrix &tm)
 {
-  // Note: vector convention gives different results somehow. Figure it out?
-  /*
+  // collision node TMs may carry scale, shear and mirroring which a quat
+  // cannot represent; v_quat_from_mat drops all of them
   mat44f m;
   v_mat44_make_from_43cu_unsafe(m, tm.array);
-  return JPH::Quat(v_norm4(v_un_quat_from_mat4(m)));
-  return JPH::Mat44(m.col0, m.col1, m.col2, V_C_UNIT_0001).GetQuaternion().Normalized(); */
-  Quat q = normalize(Quat(tm));
-  return JPH::Quat(q.x, q.y, q.z, q.w);
+  return JPH::Quat(v_quat_from_mat43(m));
+}
+
+// position + rotation from a single matrix decode, for the SetPositionAndRotation-style pairs.
+// A body pose carries no scale (scale lives in the shape), so scale is dropped as in to_jQuat.
+static void to_jPosRot(const TMatrix &tm, JPH::Vec3 &pos, JPH::Quat &rot)
+{
+  mat44f m;
+  v_mat44_make_from_43cu_unsafe(m, tm.array);
+  pos = JPH::Vec3(JPH::Vec4(m.col3)); // via Vec4 to fix the garbage .w from the unaligned load
+  rot = JPH::Quat(v_quat_from_mat43(m));
+}
+
+static void set_body_pos_rot(JPH::BodyID body_id, JPH::Vec3Arg pos, JPH::QuatArg rot)
+{
+  PhysBody::lock_body_rw(body_id, [&](JPH::Body &b) { // Lock explicitly to save read-lock call on `IsAdded`
+    auto act = b.IsInBroadPhase() ? JPH::EActivation::Activate : JPH::EActivation::DontActivate;
+    jolt_api::physicsSystem->GetBodyInterfaceNoLock().SetPositionAndRotation(body_id, pos, rot, act);
+  });
 }
 
 PhysBody::PhysBody(PhysWorld *w, float mass, const PhysCollision *coll, const TMatrix &tm, const PhysBodyCreationData &s) : world(w)
@@ -474,8 +514,13 @@ PhysBody::PhysBody(PhysWorld *w, float mass, const PhysCollision *coll, const TM
 
   JPH::BodyCreationSettings body;
   bool isDynamic = mass > 0.f;
-  if (auto shape = PhysBody::create_jolt_collision_shape(coll, isDynamic))
-    body.SetShape(shape);
+  auto shape = PhysBody::create_jolt_collision_shape(coll, isDynamic);
+  if (!shape)
+  {
+    logerr("No collision shape for phys body <%s> with collType=%d @ %@", s.debugName, coll ? (int)coll->collType : -1, tm);
+    return;
+  }
+  body.SetShape(shape);
   if (s.autoMask)
   {
     groupMask = isDynamic ? DefaultFilter : StaticFilter;
@@ -499,9 +544,13 @@ PhysBody::PhysBody(PhysWorld *w, float mass, const PhysCollision *coll, const TM
       s.autoInertia ? JPH::EOverrideMassProperties::CalculateInertia : JPH::EOverrideMassProperties::MassAndInertiaProvided;
     body.mMassPropertiesOverride.mMass = (body.mMotionType == JPH::EMotionType::Kinematic) ? 1.0f : mass;
     body.mMassPropertiesOverride.mInertia = JPH::Mat44::sScale(to_jVec3(s.momentOfInertia));
+    if (isDynamic && !s.autoInertia)
+      G_ASSERTF(v_check_xyz_all_false(v_cmp_lt(v_ldu(&s.momentOfInertia.x), v_zero())), "Negative momj=(%g,%g,%g)! mass=%g",
+        P3D(s.momentOfInertia), mass);
   }
-  body.mPosition = to_jVec3(tm.getcol(3));
-  body.mRotation = to_jQuat(tm);
+  JPH::Vec3 pos;
+  to_jPosRot(tm, pos, body.mRotation);
+  body.mPosition = pos;
   body.mLinearDamping = s.linearDamping;
   body.mAngularDamping = s.angularDamping;
   body.mUserData = (uintptr_t)this;
@@ -550,10 +599,24 @@ PhysBody::~PhysBody()
 
 void PhysBody::setTm(const TMatrix &wtm)
 {
-  lockRW([&](JPH::Body &b) { // Lock explicitly to save read-lock call on `IsAdded`
-    auto act = b.IsInBroadPhase() ? JPH::EActivation::Activate : JPH::EActivation::DontActivate;
-    jolt_api::physicsSystem->GetBodyInterfaceNoLock().SetPositionAndRotation(bodyId, to_jVec3(wtm.getcol(3)), to_jQuat(wtm), act);
+  JPH::Vec3 pos;
+  JPH::Quat rot;
+  to_jPosRot(wtm, pos, rot);
+  set_body_pos_rot(bodyId, pos, rot);
+}
+
+void PhysBody::setTmWhenChanged(const TMatrix &wtm)
+{
+  // Similar to `SetPositionAndRotationWhenChanged` but with lower eps and ro lock on up-to-date code path
+  JPH::Vec3 pos;
+  JPH::Quat rot;
+  to_jPosRot(wtm, pos, rot);
+  bool changed = true;
+  lockRO([&](const JPH::Body &b) {
+    changed = (b.GetPosition() - pos).LengthSq() > 1e-6f || (b.GetRotation().GetXYZW() - rot.GetXYZW()).LengthSq() > 1e-6f;
   });
+  if (changed)
+    set_body_pos_rot(bodyId, pos, rot);
 }
 
 void PhysBody::getTm(TMatrix &wtm) const
@@ -571,7 +634,10 @@ bool PhysBody::isGravityDisabled()
 
 void PhysBody::setTmWithDynamics(const TMatrix &wtm, real dt, bool activate)
 {
-  api().MoveKinematic(bodyId, to_jVec3(wtm.getcol(3)), to_jQuat(wtm), dt);
+  JPH::Vec3 pos;
+  JPH::Quat rot;
+  to_jPosRot(wtm, pos, rot);
+  api().MoveKinematic(bodyId, pos, rot, dt);
 }
 
 // Zero mass makes body static.
@@ -584,10 +650,22 @@ void PhysBody::setMassMatrix(real _mass, real ixx, real iyy, real izz)
   });
 }
 
+void PhysBody::setLockedStatic(bool locked, real /*mass*/, const Point3 & /*momj*/)
+{
+  // Switch motion type. Kinematic bodies ignore gravity/forces and stay put (acting as a joint anchor),
+  // and Jolt preserves the dynamic mass/inertia so releasing restores the original behaviour.
+  api().SetMotionType(bodyId, locked ? JPH::EMotionType::Kinematic : JPH::EMotionType::Dynamic, JPH::EActivation::Activate);
+  if (locked)
+  {
+    setVelocity(Point3(0, 0, 0));
+    setAngularVelocity(Point3(0, 0, 0));
+  }
+}
+
 void PhysBody::getMassMatrix(real &_mass, real &ixx, real &iyy, real &izz)
 {
   lockRO([&](const JPH::Body &b) {
-    if (!b.IsStatic())
+    if (b.IsDynamic())
     {
       auto &mp = *b.GetMotionProperties();
       _mass = safeinv(mp.GetInverseMass());
@@ -603,7 +681,7 @@ void PhysBody::getMassMatrix(real &_mass, real &ixx, real &iyy, real &izz)
 void PhysBody::getInvMassMatrix(real &_mass, real &ixx, real &iyy, real &izz)
 {
   lockRO([&](const JPH::Body &b) {
-    if (!b.IsStatic())
+    if (b.IsDynamic())
     {
       auto &mp = *b.GetMotionProperties();
       _mass = mp.GetInverseMass();
@@ -616,16 +694,98 @@ void PhysBody::getInvMassMatrix(real &_mass, real &ixx, real &iyy, real &izz)
   });
 }
 
-struct JoltPhysNativeShape : public PhysCollision
-{
-  JPH::RefConst<JPH::Shape> shape;
-  JPH::Vec3 localScale;
-
-  JoltPhysNativeShape(JPH::RefConst<JPH::Shape> s, JPH::Vec3 ls) : PhysCollision(TYPE_NATIVE_SHAPE), shape(s), localScale(ls) {}
-};
 void PhysCollision::clearNativeShapeData(PhysCollision &c) { static_cast<JoltPhysNativeShape &>(c).shape = nullptr; }
 
-JPH::Ref<JPH::Shape> check_and_return_shape(JPH::ShapeSettings::ShapeResult res, int ln)
+namespace
+{
+// the resource's shape: the bare chunk shape plus the claim on the Data block the chunk lives in
+class CollResBlasShape final : public JPH::CollisionBlasShape
+{
+public:
+  CollResBlasShape(const soa4::ChunkRef &chunk, const CollResJoltChunk::Share &share, JPH::uint32 compound_children,
+    bool force_descent_ids, ShapeResult &out_result) :
+    JPH::CollisionBlasShape(chunk, compound_children, force_descent_ids, out_result), mData(share)
+  {}
+  virtual Stats GetStats() const override
+  {
+    return Stats(sizeof(*this) + mData.sharedBytes(), CollisionBlasShape::GetStats().mNumTriangles);
+  }
+
+private:
+  CollResJoltChunk::Share mData;
+};
+} // namespace
+
+JPH::Shape::ShapeResult CollResJoltChunk::createShape(const CollisionResource &res, int node_id, JPH::uint32 compound_children,
+  bool force_descent_ids)
+{
+  JPH::Shape::ShapeResult result;
+  const CollisionNode *node = res.getNode(node_id);
+  if (!node || node->nodeBlasOfs == ~0u)
+  {
+    result.SetError("node has no BLAS chunk");
+    return result;
+  }
+  const View view = viewOf(res, *node);
+  if (!view) // the binding exists but fails a bounds or validity check
+  {
+    result.SetError("node's BLAS chunk binding is corrupt");
+    return result;
+  }
+  // the header bit is the stamped truth (read past validation): a post-load behavior mutation
+  // cannot add the flags words
+  if (!(view.hdrFlags & CollisionResource::NodeBlasChunkHeader::HAS_EDGE_FLAGS))
+  {
+    logerr("collres node %d <%s>: its chunk carries no edge flags (not PHYS_COLLIDABLE at chunk build); no Jolt shape", node_id,
+      res.getNodeNameStr(*node));
+    result.SetError("node's chunk has no edge flags");
+    return result;
+  }
+  JPH::Ref<CollResBlasShape> shape = new CollResBlasShape(view.chunk, Share(res),
+    compound_children ? compound_children : (JPH::uint32)res.getAllNodes().size(), force_descent_ids, result);
+  return result;
+}
+
+PhysCollision *create_phys_collision_from_coll_resource_node(const CollisionResource &res, int node_id, unsigned compound_children)
+{
+  if (!res.hasNodeBlas(node_id)) // no chunk (non-mesh, degenerate): the trimesh path, silently
+    return nullptr;
+  const JPH::Shape::ShapeResult shape = CollResJoltChunk::createShape(res, node_id, compound_children);
+  if (shape.IsValid())
+    return new JoltPhysNativeShape(shape.Get());
+  logwarn("collres node %d: %s, the body takes the trimesh path", node_id, shape.GetError().c_str());
+  return nullptr;
+}
+
+PhysCollision *create_phys_collision_from_blas_chunk(const soa4::ChunkRef &chunk)
+{
+  const JPH::Shape::ShapeResult shape = JPH::CollisionBlasShape::sCreate(chunk);
+  if (shape.IsValid())
+    return new JoltPhysNativeShape(shape.Get());
+  logwarn("BLAS chunk of %u triangles: %s, the body takes the trimesh path", chunk.triCount, shape.GetError().c_str());
+  return nullptr;
+}
+
+// Jolt's incremental hull builder can fail its own consistency check on near-degenerate
+// point configurations (e.g. quantization-aligned verts); a slightly larger tolerance
+// builds a valid hull, so retry before giving up.
+static JPH::ShapeSettings::ShapeResult create_convex_hull_shape(JPH::ConvexHullShapeSettings &settings)
+{
+  JPH::ShapeSettings::ShapeResult res = settings.Create();
+  for (int attempt = 0; attempt < 3 && res.HasError(); attempt++)
+  {
+    logwarn("convex hull of %d points failed (tolerance=%g): %s; retrying with x2 tolerance", //
+      settings.mPoints.size(), settings.mHullTolerance, res.GetError().c_str());
+    settings.mHullTolerance *= 2.f;
+    settings.ClearCachedResult();
+    res = settings.Create();
+  }
+  if (res.HasError())
+    logerr("convex hull build failed (tolerance=%g): %s;", settings.mHullTolerance, res.GetError().c_str());
+  return res;
+}
+
+static JPH::Ref<JPH::Shape> check_and_return_shape(JPH::ShapeSettings::ShapeResult res, int ln)
 {
   if (DAGOR_UNLIKELY(res.HasError()))
   {
@@ -654,26 +814,31 @@ JPH::RefConst<JPH::Shape> PhysBody::create_jolt_collision_shape(const PhysCollis
     case PhysCollision::TYPE_SPHERE:
     {
       auto sphereColl = static_cast<const PhysSphereCollision *>(c);
-      return zeroDensityIfStatic(new JPH::SphereShape(sphereColl->radius));
+      auto sphereShape = check_and_return_shape(JPH::SphereShapeSettings(sphereColl->radius).Create(), __LINE__);
+      return zeroDensityIfStatic(sphereShape);
     }
     break;
+
     case PhysCollision::TYPE_BOX:
     {
       auto boxColl = static_cast<const PhysBoxCollision *>(c);
-      return zeroDensityIfStatic(new JPH::BoxShape(to_jVec3(boxColl->size / 2), jolt_api::min_convex_rad_for_box(boxColl->size)));
+      JPH::BoxShapeSettings boxSett(to_jVec3(boxColl->size / 2), jolt_api::min_convex_rad_for_box(boxColl->size));
+      return zeroDensityIfStatic(check_and_return_shape(boxSett.Create(), __LINE__));
     }
     break;
 
     case PhysCollision::TYPE_CAPSULE:
     {
       auto capsuleColl = static_cast<const PhysCapsuleCollision *>(c);
-      if (capsuleColl->height <= 0.f) // sphere is degenerate capsule
+      if (DAGOR_UNLIKELY(capsuleColl->height <= 0.f)) // sphere is degenerate capsule
       {
         if (capsuleColl->height < 0)
           logerr("%s attempt to create capsule with height %.12f, fallback to sphere", __FUNCTION__, capsuleColl->height);
-        return zeroDensityIfStatic(new JPH::SphereShape(capsuleColl->radius));
+        auto sphereShape = check_and_return_shape(JPH::SphereShapeSettings(capsuleColl->radius).Create(), __LINE__);
+        return zeroDensityIfStatic(sphereShape);
       }
-      auto shape = zeroDensityIfStatic(new JPH::CapsuleShape(capsuleColl->height * 0.5f, capsuleColl->radius));
+      JPH::CapsuleShapeSettings capSet(capsuleColl->height * 0.5f, capsuleColl->radius);
+      auto shape = zeroDensityIfStatic(check_and_return_shape(capSet.Create(), __LINE__));
       switch (capsuleColl->dirIdx)
       {
         case 0: return new JPH::RotatedTranslatedShape(JPH::Vec3::sZero(), JPH::Quat(0, 0, M_SQRT1_2, M_SQRT1_2), shape);
@@ -763,7 +928,7 @@ JPH::RefConst<JPH::Shape> PhysBody::create_jolt_collision_shape(const PhysCollis
       {
         JPH::ConvexHullShapeSettings chullShapeSett((const JPH::Vec3 *)convexColl->vdata, convexColl->vnum);
         chullShapeSett.mHullTolerance = convexColl->hullTolerance;
-        return zeroDensityIfStatic(check_and_return_shape(chullShapeSett.Create(), __LINE__));
+        return zeroDensityIfStatic(check_and_return_shape(create_convex_hull_shape(chullShapeSett), __LINE__));
       }
 
       int fstride = convexColl->vstride / 4;
@@ -775,7 +940,7 @@ JPH::RefConst<JPH::Shape> PhysBody::create_jolt_collision_shape(const PhysCollis
 
       JPH::ConvexHullShapeSettings chullShapeSett(v.data(), v.size());
       chullShapeSett.mHullTolerance = convexColl->hullTolerance;
-      return zeroDensityIfStatic(check_and_return_shape(chullShapeSett.Create(), __LINE__));
+      return zeroDensityIfStatic(check_and_return_shape(create_convex_hull_shape(chullShapeSett), __LINE__));
     }
     break;
 
@@ -966,7 +1131,7 @@ void PhysBody::setSphereShapeRad(float rad)
     sphere->SetEmbedded();                // Don't complain in dtor about dangling ref
     sphere->Release();
     sphere->~SphereShape();
-    (new (sphere, _NEW_INPLACE) SphereShape(rad))->AddRef();
+    (new (sphere) SphereShape(rad))->AddRef();
     if (isInWorld())
       api().NotifyShapeChanged(bodyId, Vec3::sZero(), false, EActivation::Activate);
   }
@@ -1044,7 +1209,7 @@ void PhysBody::setGravity(const Point3 &grav, bool activate)
 void PhysBody::setDamping(float linDamping, float angDamping)
 {
   lockRW([&](JPH::Body &b) {
-    if (!b.IsStatic())
+    if (b.IsDynamic())
     {
       auto &mp = *b.GetMotionProperties();
       mp.SetLinearDamping(linDamping);
@@ -1151,6 +1316,13 @@ void PhysRagdollBallJoint::setTargetOrientation(const TMatrix &tm)
   constraint->SetSwingMotorState(JPH::EMotorState::Position);
   constraint->SetTwistMotorState(JPH::EMotorState::Position);
   constraint->SetTargetOrientationBS(to_jQuat(tm));
+}
+
+void PhysRagdollBallJoint::disableMotors()
+{
+  auto constraint = static_cast<JPH::SwingTwistConstraint *>(joint);
+  constraint->SetSwingMotorState(JPH::EMotorState::Off);
+  constraint->SetTwistMotorState(JPH::EMotorState::Off);
 }
 
 void PhysRagdollBallJoint::setTwistSwingMotorSettings(float twistFrequency, float twistDamping, float swingFrequency,
@@ -1399,13 +1571,13 @@ struct JoltSimJob final : public cpujobs::IJob
 
   void update(float dt, int nsteps = 1) { jolt_api::phys_sys().Update(dt, nsteps, tempAllocator, jobSystem); }
 
-  const char *getJobName(bool &) const override { return "JoltSimJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("JoltSimJob"); }
 
   void doJob() override
   {
     if (maxSubSteps > 0)
     {
-      int numSubSteps = int(time / fixedTimeStep);
+      int numSubSteps = int(double(time) / fixedTimeStep);
       time -= numSubSteps * fixedTimeStep;
       numSubSteps = min(numSubSteps, (int)maxSubSteps);
       if (numSubSteps || !allowVariable)
@@ -1431,12 +1603,13 @@ void PhysWorld::startSim(real dt, bool wake_up_thread)
 }
 bool PhysWorld::fetchSimRes(bool wait, PhysBody *)
 {
-  if (wait && interlocked_acquire_load(sim_job.done) == 0)
-  {
+  if (interlocked_acquire_load(sim_job.done))
+    ;
+  else if (wait)
     threadpool::barrier_active_wait_for_job(&sim_job, threadpool::PRIO_DEFAULT, sim_job.qPos);
-    threadpool::wait(&sim_job);
-  }
-  return interlocked_acquire_load(sim_job.done) == 1;
+  else
+    return false;
+  return true;
 }
 
 
@@ -1572,30 +1745,37 @@ void PhysWorld::shapeQuery(const PhysCollision &shape, const TMatrix &from, cons
 void PhysSystemInstance::phys_jolt_setup_collision_groups_for_joints(int grpId, Tab<PhysSystemInstance::Body> &b, PhysicsResource *r)
 {
   JPH::Ref<JPH::GroupFilterTable> group_filter = new JPH::GroupFilterTable(b.size());
-  for (const auto &jnt : r->rdBallJoints)
+  for (const auto &jnt : r->getRdBallJoints())
   {
     group_filter->DisableCollision(jnt.body2, jnt.body1);
     b[jnt.body1].body->lockRW([&](JPH::Body &b) { b.GetCollisionGroup().SetGroupFilter(group_filter); });
     b[jnt.body2].body->lockRW([&](JPH::Body &b) { b.GetCollisionGroup().SetGroupFilter(group_filter); });
   }
-  for (const auto &jnt : r->rdHingeJoints)
+  for (const auto &jnt : r->getRdHingeJoints())
   {
     group_filter->DisableCollision(jnt.body2, jnt.body1);
     b[jnt.body1].body->lockRW([&](JPH::Body &b) { b.GetCollisionGroup().SetGroupFilter(group_filter); });
     b[jnt.body2].body->lockRW([&](JPH::Body &b) { b.GetCollisionGroup().SetGroupFilter(group_filter); });
   }
-  for (const auto &jnt : r->revoluteJoints)
+  for (const auto &jnt : r->getRevoluteJoints())
   {
     group_filter->DisableCollision(jnt.body2, jnt.body1);
     b[jnt.body1].body->lockRW([&](JPH::Body &b) { b.GetCollisionGroup().SetGroupFilter(group_filter); });
     b[jnt.body2].body->lockRW([&](JPH::Body &b) { b.GetCollisionGroup().SetGroupFilter(group_filter); });
   }
-  for (const auto &jnt : r->sphericalJoints)
+  for (const auto &jnt : r->getSphericalJoints())
   {
     group_filter->DisableCollision(jnt.body2, jnt.body1);
     b[jnt.body1].body->lockRW([&](JPH::Body &b) { b.GetCollisionGroup().SetGroupFilter(group_filter); });
     b[jnt.body2].body->lockRW([&](JPH::Body &b) { b.GetCollisionGroup().SetGroupFilter(group_filter); });
   }
+  for (const auto &pr : r->getNoCollisionPairs())
+  {
+    group_filter->DisableCollision(pr.body0, pr.body1);
+    b[pr.body0].body->lockRW([&](JPH::Body &bd) { bd.GetCollisionGroup().SetGroupFilter(group_filter); });
+    b[pr.body1].body->lockRW([&](JPH::Body &bd) { bd.GetCollisionGroup().SetGroupFilter(group_filter); });
+  }
+
   for (int i = 0; i < b.size(); ++i)
     b[i].body->lockRW([&](JPH::Body &b) {
       if (b.GetCollisionGroup().GetGroupFilter() == group_filter)

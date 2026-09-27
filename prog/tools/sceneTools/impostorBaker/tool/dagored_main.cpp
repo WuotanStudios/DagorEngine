@@ -24,6 +24,7 @@
 #include <startup/dag_inpDevClsDrv.h>
 #include <startup/dag_restart.h>
 #include <startup/dag_startupTex.h>
+#include <util/dag_threadPool.h>
 #include <workCycle/dag_gameSettings.h>
 #include <workCycle/dag_startupModules.h>
 #include <workCycle/dag_workCycle.h>
@@ -32,9 +33,12 @@
 #include <shaders/dag_rendInstRes.h>
 #include <rendInst/rendInstGen.h>
 #include <libTools/util/setupTexStreaming.h>
+#include <libTools/util/setupNamedMounts.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <assets/assetPlugin.h>
 #include <assets/texAssetBuilderTextureFactory.h>
 
+#define __DEBUG_FILEPATH nullptr
 #if _TARGET_PC_WIN
 #include <startup/dag_winMain.inc.cpp>
 #else
@@ -78,7 +82,7 @@ void DagorWinMainInit(int, bool)
   char stamp_buf[256];
   printf("--------------------------------------------\n"
          "DaImpostor v1.00\n"
-         "Copyright (C) Gaijin Games KFT, 2023\n"
+         "Copyright (C) Gaijin Games KFT, 2026\n"
          "--------------------------------------------\n"
          "%s\n\n\n",
     dagor_get_build_stamp_str(stamp_buf, sizeof(stamp_buf), ""));
@@ -146,6 +150,13 @@ static ImpostorGenerator::GenerateResponse impostor_export_callback(DagorAsset *
   return ImpostorGenerator::GenerateResponse::PROCESS;
 }
 
+static int log_cb_with_stack(int lev_tag, const char *fmt, const void *arg, int anum, const char *ctx_file, int ctx_line)
+{
+  if ((lev_tag & 0x0F) <= LOGLEVEL_ERR)
+    debug_dump_stack("logerr callstack");
+  return 1; // continue normal logging
+}
+
 int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 {
   signal(SIGINT, ctrl_break_handler);
@@ -158,41 +169,49 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 
   const ImpostorOptions options = parse_impostor_options();
 
-  if (!options.valid)
-  {
-    print_impostor_options();
-    return 1;
-  }
-
   if (options.classic_dbg)
     start_classic_debug_system("debug.log");
   else
     start_debug_system(__argv[0]);
   char stamp_buf[256];
   debug(dagor_get_build_stamp_str(stamp_buf, sizeof(stamp_buf), "\n"));
+  debug_set_log_callback(log_cb_with_stack);
+
+  if (!options.valid)
+  {
+    logerr("invalid option passed to impostor baker");
+    print_impostor_options();
+    return 1;
+  }
 
   if (!::symhlp_load("daKernel" DAGOR_DLL))
     DEBUG_CTX("can't load sym for: %s", "daKernel" DAGOR_DLL);
 
-  String path_to_blk;
+  char app_dir[512];
+  dd_get_fname_location(app_dir, options.appBlk.c_str());
+  set_canonical_app_dir_mount(app_dir);
+  // set_canonical_app_dir_mount() only registers the resolved absolute path as the %appDir mount,
+  // it doesn't write it back here - read it back so app_dir (used below for appblk's "appDir" str,
+  // consumed by texconvcache::init()'s AssetExportCache::setSdkRoot()) is absolute too, same as
+  // daBuild.exe's cmain.cpp does. Otherwise a relative application.blk path on the command line
+  // leaves sdkRoot relative, and every AssetExportCache filename lookup then miscompares.
+  if (const char *path = dd_get_named_mount_path("appDir", 6))
+  {
+    strncpy(app_dir, path, sizeof(app_dir));
+    app_dir[sizeof(app_dir) - 1] = '\0';
+  }
+  else if (!app_dir[0])
+    strcpy(app_dir, "./");
+
   DataBlock appblk;
   if (!appblk.load(options.appBlk.c_str()))
   {
     logerr("cannot load %s", options.appBlk.c_str());
     return 1;
   }
-  else
-  {
-    path_to_blk = String(options.appBlk.c_str());
-    ::dd_get_fname_location(path_to_blk, options.appBlk.c_str());
-  }
+  setup_named_mount_points(*appblk.getBlockByNameEx("mountPoints"));
 
   engine.demandInit();
-
-  char app_dir[512];
-  dd_get_fname_location(app_dir, path_to_blk.c_str());
-  if (!app_dir[0])
-    strcpy(app_dir, "./");
 
   DataBlock *global_settings_blk = const_cast<DataBlock *>(::dgs_get_settings());
 
@@ -210,16 +229,23 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 #endif
 
   cpujobs::init();
+  threadpool::init(eastl::min(cpujobs::get_core_count(), 64), 1024, 128 << 10);
+
+  if (options.profile)
+  {
+    da_profiler::start_file_dump_server("");
+    da_profiler::set_mode(da_profiler::EVENTS | da_profiler::TAGS | da_profiler::SAMPLING | da_profiler::CONTINUOUS);
+    da_profiler::tick_frame();
+  }
 
   const DataBlock &blk = *appblk.getBlockByNameEx("assets");
   const DataBlock *exp_blk = blk.getBlockByName("export");
-  const DataBlock *game_blk = appblk.getBlockByName("game");
 
   const char *sh_file = appblk.getStr("impostorbakerShaders", appblk.getStr("shaders", "compiledShaders/tools"));
   appblk.setStr("appDir", app_dir);
 
   DataBlock texStreamingBlk;
-  ::load_tex_streaming_settings(String(0, "%s/application.blk", appblk.getStr("appDir")), &texStreamingBlk);
+  ::load_tex_streaming_settings(options.appBlk.c_str(), &texStreamingBlk);
 
   global_settings_blk->removeBlock("texStreaming");
   global_settings_blk->addNewBlock(&texStreamingBlk, "texStreaming")->setBool("texLoadOnDemand", true);
@@ -230,7 +256,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   ::dagor_init_video("DagorWClass", nCmdShow, NULL, "Loading...");
   dagor_install_dev_fatal_handler(NULL);
 
-  ::startup_shaders(String(0, "%s/%s", app_dir, sh_file).c_str());
+  ::startup_shaders(make_eff_app_relative_path(sh_file));
   ::startup_game(RESTART_ALL);
 
   CALL_AT_END_OF_SCOPE(flush_files());
@@ -240,51 +266,19 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   init_res_factories();
 
   ShaderGlobal::enableAutoBlockChange(true);
-  ShaderGlobal::set_int(get_shader_variable_id("in_editor", true), 0);
+  ShaderGlobal::set_int(get_shader_variable_id("in_editor", true), 1);
 
-  DataBlock impostorShaderVarsBlk;
-  const DataBlock *impostorBlock = blk.getBlockByName("impostor");
-  String folder;
-  if (impostorBlock)
-  {
-    G_ASSERTF(impostorBlock->paramExists("data_folder"), "Add data_folder:t to the assets/impostor block in application.blk");
-    folder = String(0, "%s/%s/", app_dir, impostorBlock->getStr("data_folder"));
-  }
-  else
-  {
-    G_ASSERTF(blk.paramExists("impostor_data_folder"), "Add the assets/impostor block to application.blk");
-    folder = String(0, "%s/%s/", app_dir, blk.getStr("impostor_data_folder"));
-  }
-  simplify_fname(folder);
-  String impostorShaderVarsFile = String(0, "%simpostor_shader_vars.blk", folder.c_str());
-  debug("impostorShaderVarsFile: looking for a file at <%s>", impostorShaderVarsFile);
-  if (::dd_file_exists(impostorShaderVarsFile.c_str()))
-  {
-    debug("impostorShaderVarsFile: was found");
-    impostorShaderVarsBlk.load(impostorShaderVarsFile.c_str());
-  }
-  else
-  {
-    debug("impostorShaderVarsFile: was not found");
-  }
+  ShaderGlobal::set_int(get_shader_variable_id("dgs_tex_anisotropy", true), ::dgs_tex_anisotropy);
+  ShaderGlobal::set_float(get_shader_variable_id("mip_bias", true), 0.f);
 
   ShaderGlobal::set_vars_from_blk(*::dgs_get_settings()->getBlockByNameEx("shaderVar"), true);
-  if (impostorShaderVarsBlk != nullptr)
-  {
-    const DataBlock *shaderBlock = impostorShaderVarsBlk.getBlockByName("shaderVar");
-    G_ASSERTF(shaderBlock != nullptr, "Add shaderVar{} block to the impostor_shader_vars.blk");
-    ShaderGlobal::set_vars_from_blk(*shaderBlock, true);
-  }
 
   startup_game(RESTART_ALL);
 
   bool loadDDSxPacks = blk.getStr("ddsxPacks", nullptr) != nullptr;
   if (exp_blk)
-  {
-    ::set_gameres_sys_ver(2);
     if (!loadDDSxPacks)
       texconvcache::init_build_on_demand_tex_factory(engine->getAssetManager(), engine->getConsoleLogWriter());
-  }
   if (blk.getStr("gameRes", nullptr) || blk.getStr("ddsxPacks", nullptr))
   {
     int nid = blk.getNameId("prebuiltGameResFolder");
@@ -297,12 +291,14 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
       }
   }
 
-  G_ASSERT(DAEDITOR3.initAssetBase(app_dir));
+  G_ASSERT(DAEDITOR3.initAssetBase(app_dir, appblk));
   if (get_max_managed_texture_id())
     debug("tex/res registered with AssetBase:   %d", get_max_managed_texture_id().index());
 
   rendinst::configurateRIGen(*appblk.getBlockByNameEx("projectDefaults")->getBlockByNameEx("riMgr")->getBlockByNameEx("config"));
   rendinst::initRIGen(true, 80, 8000.0f);
+
+  da_profiler::tick_frame();
 
   struct SceneToEnablePresent : public DagorGameScene
   {
@@ -313,11 +309,13 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
       d3d::clearview(CLEAR_TARGET, 0, 0, 0);
       if (app)
         app->getImpostorBaker()->drawLastExportedImage();
+      da_profiler::tick_frame();
     }
   } scene;
 
   int ret = 0;
   {
+    DA_PROFILE_EVENT("impostor_baker_app");
     RenderableInstanceLodsResource::on_higher_lod_required = nullptr; // force lod0 streaming
     ImpostorGenerator app{app_dir, appblk, &engine->getAssetManager(), engine->getConsoleLogWriter(), true, impostor_export_callback};
     scene.app = &app;
@@ -327,6 +325,15 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
     if (ret == 0)
       app.generateQualitySummary("impostor_baker_quality_summery.csv");
     scene.app = nullptr;
+  }
+
+  if (options.profile)
+  {
+    da_profiler::request_dump();
+    da_profiler::tick_frame();
+    da_profiler::tick_frame();
+    da_profiler::stop_file_dump_server("");
+    da_profiler::shutdown();
   }
 
   dagor_select_game_scene(nullptr);

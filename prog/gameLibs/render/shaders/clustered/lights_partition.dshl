@@ -1,0 +1,853 @@
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+
+include "shader_global.dshl"
+include "lights_cb.dshl"
+include "frustum.dshl"
+include "gpu_occlusion.dshl"
+include "hardware_defines.dshl"
+
+buffer scene_omni_managed_lights;
+buffer scene_spot_managed_lights;
+
+buffer scene_omni_render_lights;
+buffer scene_spot_render_lights;
+
+int visible_far_max_lights_count;
+
+buffer visible_lights_data_buf;
+buffer visible_lights_counts_buf;
+
+buffer partition_lights_frustum_planes;
+float partition_lights_cutoff_dist_sq;
+float partition_lights_mark_small_lights_as_far_limit;
+int partition_lights_omni_require_any_mask;
+int partition_lights_spot_require_any_mask;
+float4 partition_lights_camera_position;
+float4 partition_lights_znear_plane;
+float partition_lights_inverse_zfar;
+
+shader partition_lights_cs
+{
+  (cs) {
+    partition_lights_frustum_planes@cbuf = partition_lights_frustum_planes hlsl {
+      cbuffer partition_lights_frustum_planes@cbuf
+      {
+        float4 partition_lights_frustum_planes[6];
+      };
+    }
+
+    partition_lights_cutoff_dist_sq@f1 = partition_lights_cutoff_dist_sq;
+    partition_lights_mark_small_lights_as_far_limit_sq@f1 = partition_lights_mark_small_lights_as_far_limit * partition_lights_mark_small_lights_as_far_limit;
+    partition_lights_omni_require_any_mask@u1 = partition_lights_omni_require_any_mask;
+    partition_lights_spot_require_any_mask@u1 = partition_lights_spot_require_any_mask;
+    partition_lights_camera_position@f4 = partition_lights_camera_position;
+    partition_lights_znear_plane@f4 = partition_lights_znear_plane;
+    partition_lights_inverse_zfar@f1 = partition_lights_inverse_zfar;
+  }
+
+  USE_OMNI_LIGHTS_BOUNDS(cs)
+  USE_SPOT_LIGHTS_BOUNDS(cs)
+  GPU_OCCLUSION(cs)
+
+  (cs) {
+    scene_omni_managed_lights@buf = scene_omni_managed_lights hlsl {
+      #include <lightsManager.hlsli>
+      StructuredBuffer<ManagedLight> scene_omni_managed_lights@buf;
+    };
+
+    scene_omni_render_lights@buf = scene_omni_render_lights hlsl {
+      #include <renderLights.hlsli>
+      StructuredBuffer<RenderOmniLight> scene_omni_render_lights@buf;
+    };
+
+    visible_lights_data_buf@uav = visible_lights_data_buf hlsl {
+      RWByteAddressBuffer visible_lights_data_buf@uav;
+    };
+
+    visible_lights_counts_buf@uav = visible_lights_counts_buf hlsl {
+      RWStructuredBuffer<uint> visible_lights_counts_buf@uav;
+    };
+
+    scene_spot_managed_lights@buf = scene_spot_managed_lights hlsl {
+      #include <lightsManager.hlsli>
+      StructuredBuffer<ManagedLight> scene_spot_managed_lights@buf;
+    };
+
+    scene_spot_render_lights@buf = scene_spot_render_lights hlsl {
+      #include <renderLights.hlsli>
+      StructuredBuffer<RenderSpotLight> scene_spot_render_lights@buf;
+    };
+  }
+
+  hlsl(cs) {
+
+    #include "frustum_culling.hlsl"
+    #include "lightsPartition.hlsli"
+    #include <lightsSorter.hlsli>
+
+    inline bool is_viewed_small(float radius, float distance_sqr)
+    {
+      return radius * radius < partition_lights_mark_small_lights_as_far_limit_sq * distance_sqr;
+    };
+
+    [numthreads(256, 1, 1)]
+    void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint3 group_thread_id : SV_GroupThreadID)
+    {
+      BRANCH
+      if(dispatch_thread_id.x >= MAX_SCENE_OMNI_LIGHTS + MAX_SCENE_SPOT_LIGHTS)
+        return;
+
+      bool isSpot = (dispatch_thread_id.x >= MAX_SCENE_OMNI_LIGHTS);
+      uint kMaxLightsCount = isSpot ? MAX_SCENE_SPOT_LIGHTS : MAX_SCENE_OMNI_LIGHTS;
+
+      uint sceneLightIndex = isSpot ? (dispatch_thread_id.x - MAX_SCENE_OMNI_LIGHTS) : dispatch_thread_id.x;
+
+      float4 lightBoundSphere = 0;
+      bool validLight = false;
+      uint shadowIdMask = 0;
+
+      ##if downsampled_far_depth_tex != NULL
+        float3 occlusionBoxMin, occlusionBoxMax;
+      ##endif
+
+      BRANCH
+      if(isSpot)
+      {
+        RenderSpotLight rl = structuredBufferAt(scene_spot_render_lights, sceneLightIndex);
+        float2 rad = decode_spot_light_radius_and_culling_radius(rl);
+        validLight = rad.x > 0.0f;
+
+        BRANCH
+        if(validLight)
+        {
+          ManagedLight ml = structuredBufferAt(scene_spot_managed_lights, sceneLightIndex);
+          lightBoundSphere = getSpotLightBoundingSphere(rl);
+          shadowIdMask = ml.shadowId_mask;
+          ##if downsampled_far_depth_tex != NULL
+            getSpotLightBoundingBox(rl, occlusionBoxMin, occlusionBoxMax);
+          ##endif
+        }
+      }
+      else
+      {
+        RenderOmniLight rl = structuredBufferAt(scene_omni_render_lights, sceneLightIndex);
+        validLight = rl.posRadius.w > 0.0f;
+
+        BRANCH
+        if(validLight)
+        {
+          ManagedLight ml = structuredBufferAt(scene_omni_managed_lights, sceneLightIndex);
+          lightBoundSphere = getOmniLightBoundingSphere(rl);
+          shadowIdMask = ml.shadowId_mask;
+          ##if downsampled_far_depth_tex != NULL
+            occlusionBoxMin = lightBoundSphere.xyz - lightBoundSphere.w;
+            occlusionBoxMax = lightBoundSphere.xyz + lightBoundSphere.w;
+          ##endif
+        }
+      }
+
+      if(!validLight)
+        return;
+
+      uint mask = decode_managed_mask(shadowIdMask);
+      uint requireAnyMask = isSpot ? partition_lights_spot_require_any_mask : partition_lights_omni_require_any_mask;
+      if (requireAnyMask && !(requireAnyMask & mask))
+        return;
+
+      float3 lightPos = lightBoundSphere.xyz;
+      float lightRadius = lightBoundSphere.w;
+
+      if (!baseTestSphereB(lightPos, lightRadius, partition_lights_frustum_planes))
+        return;
+
+      ##if downsampled_far_depth_tex != NULL
+        if (!check_box_occl_visible(occlusionBoxMin, occlusionBoxMax))
+          return;
+      ##endif
+
+      float boundSphereRadiusScale = isSpot ? 1.0f : OMNI_LIGHT_BOUND_SPHERE_RADIUS_SCALE;
+
+      float lightRadiusScaled = lightRadius * boundSphereRadiusScale;
+      float3 cameraPos = partition_lights_camera_position.xyz;
+      float3 light2CamVec = cameraPos - lightPos;
+      float light2CamSqrDistance = dot(light2CamVec, light2CamVec);
+
+      if (light2CamSqrDistance > partition_lights_cutoff_dist_sq)
+        return;
+
+      bool camInSphere = (light2CamSqrDistance < lightRadius * lightRadius);
+      bool intersectsNear = (dot(lightPos, partition_lights_znear_plane.xyz) + partition_lights_znear_plane.w - lightRadiusScaled) < 0.0f;
+
+      uint shadowId = decode_managed_shadow_id(shadowIdMask);
+      bool small = shadowId == INVALID_SHADOW_VOLUME_ID && is_viewed_small(lightRadius, light2CamSqrDistance);
+      uint appendIdx;
+
+      uint clusteredCountIndex = isSpot ? CLUSTERED_SPOT_LIGHTS_COUNT_INDEX : CLUSTERED_OMNI_LIGHTS_COUNT_INDEX;
+      uint clusteredIdsOffset = isSpot ? CLUSTERED_SPOT_LIGHTS_IDS_OFFSET : CLUSTERED_OMNI_LIGHTS_IDS_OFFSET;
+      uint farCountIndex = isSpot ? FAR_SPOT_LIGHTS_COUNT_INDEX : FAR_OMNI_LIGHTS_COUNT_INDEX;
+      uint farIdsOffset = isSpot ? FAR_SPOT_LIGHTS_IDS_OFFSET : FAR_OMNI_LIGHTS_IDS_OFFSET;
+
+      bool isFar = (intersectsNear || small) && !camInSphere;
+
+      uint countIndex = isFar ? farCountIndex : clusteredCountIndex;
+      uint idsOffset = isFar ? farIdsOffset : clusteredIdsOffset;
+
+      InterlockedAdd(structuredBufferAt(visible_lights_counts_buf, countIndex), 1, appendIdx);
+      if(appendIdx < kMaxLightsCount)
+      {
+        uint valueToStore = isFar
+          ? sceneLightIndex
+          : encode_sort_data(sceneLightIndex, get_relative_sort_distance(light2CamSqrDistance, partition_lights_inverse_zfar));
+        storeBuffer(visible_lights_data_buf, (idsOffset + appendIdx) * 4u, valueToStore);
+      }
+      else
+        InterlockedMin(structuredBufferAt(visible_lights_counts_buf, countIndex), kMaxLightsCount);
+    }
+  }
+
+  compile("target_cs", "main");
+}
+
+buffer sort_lights_dispatch_args_buf;
+buffer sort_lights_stage_data_buf;
+
+bool lights_sorter_wave_supported = !(hardware.ps4 || (hardware.xbox && !hardware.scarlett) || hardware.dx11 || hardware.vulkan);
+
+macro SETUP_LIGHTS_SORTER(code)
+  if (lights_sorter_wave_supported)
+  {
+    hlsl(code) {
+      #if WAVE_INTRINSICS
+        #define LIGHTS_SORTER_USE_WAVES 1
+        #define LIGHTS_SORTER_WAVE_GROUP_SIZE 256
+        #define LIGHTS_SORTER_WAVE_LENGTH() (uint)MIN_POSSIBLE_WARP_SIZE
+      #endif
+    }
+  }
+endmacro
+
+shader prepare_sort_lights_cs
+{
+  (cs) {
+    sort_lights_dispatch_args_buf@uav = sort_lights_dispatch_args_buf hlsl {
+      RWByteAddressBuffer sort_lights_dispatch_args_buf@uav;
+    };
+    sort_lights_stage_data_buf@uav = sort_lights_stage_data_buf hlsl {
+      RWStructuredBuffer<uint> sort_lights_stage_data_buf@uav;
+    };
+  }
+  SETUP_LIGHTS_SORTER(cs)
+
+  (cs) {
+    visible_lights_data_buf@uav = visible_lights_data_buf hlsl {
+      RWByteAddressBuffer visible_lights_data_buf@uav;
+    };
+
+    visible_lights_counts_buf@uav = visible_lights_counts_buf hlsl {
+      RWStructuredBuffer<uint> visible_lights_counts_buf@uav;
+    };
+  }
+
+  hlsl (cs) {
+    #include <lightsSorter.hlsli>
+    #include <lightsPartition.hlsli>
+
+    struct SortStagesDispatchData
+    {
+      uint waveGroups;
+      uint basicGroups;
+      uint mediumGroups;
+      uint highScalarGroups;
+      uint highBatchedGroups;
+    };
+
+    inline SortStagesDispatchData computeSortStagesDispatchData(uint actual_clustered_light_count)
+    {
+      uint clusteredLightCountPowerOf2 = next_power_of_two(actual_clustered_light_count);
+      uint minLightsCountForSortingStage = 2u;
+
+      SortStagesDispatchData data;
+
+      #if LIGHTS_SORTER_USE_WAVES
+        uint waveChunkSize = LIGHTS_SORTER_WAVE_LENGTH();
+        data.waveGroups = (clusteredLightCountPowerOf2 >= minLightsCountForSortingStage) ? max(clusteredLightCountPowerOf2 / LIGHTS_SORTER_WAVE_GROUP_SIZE, 1u) : 0u;
+        minLightsCountForSortingStage = data.waveGroups > 0 ? waveChunkSize * 2u : minLightsCountForSortingStage;
+      #else
+        data.waveGroups = 0u;
+      #endif
+
+      data.basicGroups = (clusteredLightCountPowerOf2 >= minLightsCountForSortingStage && LIGHTS_SORTER_BASIC_GROUP_SIZE >= minLightsCountForSortingStage)
+                              ? max(clusteredLightCountPowerOf2 / LIGHTS_SORTER_BASIC_GROUP_SIZE, 1u) : 0u;
+      minLightsCountForSortingStage = data.basicGroups > 0 ? LIGHTS_SORTER_BASIC_GROUP_SIZE * 2u : minLightsCountForSortingStage;
+
+      data.mediumGroups = (clusteredLightCountPowerOf2 >= minLightsCountForSortingStage && LIGHTS_SORTER_MEDIUM_GROUP_SIZE >= minLightsCountForSortingStage)
+                              ? max(clusteredLightCountPowerOf2 / LIGHTS_SORTER_MEDIUM_GROUP_SIZE, 1u) : 0u;
+      minLightsCountForSortingStage = data.mediumGroups > 0 ? LIGHTS_SORTER_MEDIUM_GROUP_SIZE * 2u : minLightsCountForSortingStage;
+
+      uint highGroups = (clusteredLightCountPowerOf2 >= minLightsCountForSortingStage) ? 1u : 0u;
+
+      uint lightsPerThread = max(clusteredLightCountPowerOf2 / LIGHTS_SORTER_HIGH_GROUP_SIZE, 1u);
+      bool useBatchProcessing = lightsPerThread >= 4u;
+
+      data.highScalarGroups = !useBatchProcessing ? highGroups : 0u;
+      data.highBatchedGroups = useBatchProcessing ? highGroups : 0u;
+
+      return data;
+    }
+
+    [numthreads(256, 1, 1)]
+    void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
+    {
+      BRANCH
+      if(dispatch_thread_id.x >= MAX_SCENE_OMNI_LIGHTS + MAX_SCENE_SPOT_LIGHTS)
+        return;
+      bool isSpot = (dispatch_thread_id.x >= MAX_SCENE_OMNI_LIGHTS);
+
+      uint lightIndex = isSpot? (dispatch_thread_id.x - MAX_SCENE_OMNI_LIGHTS) : dispatch_thread_id.x;
+      uint actualOmniClusteredLightCount = structuredBufferAt(visible_lights_counts_buf, CLUSTERED_OMNI_LIGHTS_COUNT_INDEX);
+      uint actualSpotClusteredLightCount = structuredBufferAt(visible_lights_counts_buf, CLUSTERED_SPOT_LIGHTS_COUNT_INDEX);
+      uint actualClusteredLightCount = isSpot ? actualSpotClusteredLightCount : actualOmniClusteredLightCount;
+      uint clusteredLightCountPowerOf2 = next_power_of_two(actualClusteredLightCount);
+
+      if(dispatch_thread_id.x == 0)
+      {
+        SortStagesDispatchData omniStages = computeSortStagesDispatchData(actualOmniClusteredLightCount);
+        SortStagesDispatchData spotStages = computeSortStagesDispatchData(actualSpotClusteredLightCount);
+
+        uint finalizeGroupCount =
+            max((actualOmniClusteredLightCount + actualSpotClusteredLightCount + LIGHTS_SORTER_HIGH_GROUP_SIZE - 1u) / LIGHTS_SORTER_HIGH_GROUP_SIZE, 1u);
+        storeBuffer3(sort_lights_dispatch_args_buf, SORT_LIGHTS_DISPATCH_ARGS_FINALIZE_OFFSET, uint3(finalizeGroupCount, 1u, 1u));
+
+        storeBuffer3(sort_lights_dispatch_args_buf, SORT_LIGHTS_DISPATCH_ARGS_WAVE_OFFSET,
+          uint3(omniStages.waveGroups + spotStages.waveGroups, 1u, 1u));
+        storeBuffer3(sort_lights_dispatch_args_buf, SORT_LIGHTS_DISPATCH_ARGS_BASIC_OFFSET,
+          uint3(omniStages.basicGroups + spotStages.basicGroups, 1u, 1u));
+        storeBuffer3(sort_lights_dispatch_args_buf, SORT_LIGHTS_DISPATCH_ARGS_MEDIUM_OFFSET,
+          uint3(omniStages.mediumGroups + spotStages.mediumGroups, 1u, 1u));
+        storeBuffer3(sort_lights_dispatch_args_buf, SORT_LIGHTS_DISPATCH_ARGS_SCALAR_HIGH_OFFSET,
+          uint3(omniStages.highScalarGroups + spotStages.highScalarGroups, 1u, 1u));
+        storeBuffer3(sort_lights_dispatch_args_buf, SORT_LIGHTS_DISPATCH_ARGS_BATCHED_HIGH_OFFSET,
+          uint3(omniStages.highBatchedGroups + spotStages.highBatchedGroups, 1u, 1u));
+
+        structuredBufferAt(sort_lights_stage_data_buf, LIGHTS_SORTER_WAVE_STAGE_DATA_INDEX) = omniStages.waveGroups;
+        structuredBufferAt(sort_lights_stage_data_buf, LIGHTS_SORTER_BASIC_STAGE_DATA_INDEX) = omniStages.basicGroups;
+        structuredBufferAt(sort_lights_stage_data_buf, LIGHTS_SORTER_MEDIUM_STAGE_DATA_INDEX) = omniStages.mediumGroups;
+        structuredBufferAt(sort_lights_stage_data_buf, LIGHTS_SORTER_SCALAR_HIGH_STAGE_DATA_INDEX) = omniStages.highScalarGroups;
+        structuredBufferAt(sort_lights_stage_data_buf, LIGHTS_SORTER_BATCHED_HIGH_STAGE_DATA_INDEX) = omniStages.highBatchedGroups;
+
+        structuredBufferAt(visible_lights_counts_buf, CLUSTERED_OMNI_LIGHTS_COUNT_INDEX + 1) = actualOmniClusteredLightCount;
+        structuredBufferAt(visible_lights_counts_buf, CLUSTERED_SPOT_LIGHTS_COUNT_INDEX + 1) = actualSpotClusteredLightCount;
+        structuredBufferAt(visible_lights_counts_buf, FAR_OMNI_LIGHTS_COUNT_INDEX + 1) =
+          structuredBufferAt(visible_lights_counts_buf, FAR_OMNI_LIGHTS_COUNT_INDEX);
+        structuredBufferAt(visible_lights_counts_buf, FAR_SPOT_LIGHTS_COUNT_INDEX + 1) =
+          structuredBufferAt(visible_lights_counts_buf, FAR_SPOT_LIGHTS_COUNT_INDEX);
+      }
+
+      BRANCH
+      if(lightIndex >= clusteredLightCountPowerOf2)
+        return;
+
+      BRANCH
+      if(actualClusteredLightCount > 1u && lightIndex >= actualClusteredLightCount)
+      {
+        uint clusteredLightsIdsOffset = isSpot ? CLUSTERED_SPOT_LIGHTS_IDS_OFFSET : CLUSTERED_OMNI_LIGHTS_IDS_OFFSET;
+        uint sentinelSortData = encode_sort_data(0xFFFF, asfloat(0x7F7FFFFF));
+        storeBuffer(visible_lights_data_buf, (clusteredLightsIdsOffset + lightIndex) * 4u, sentinelSortData);
+      }
+    }
+
+  }
+
+  compile("target_cs", "main");
+}
+
+shader finalize_sort_lights_cs
+{
+  (cs) {
+    visible_lights_data_buf@uav = visible_lights_data_buf hlsl {
+      RWByteAddressBuffer visible_lights_data_buf@uav;
+    };
+
+    visible_lights_counts_buf@uav = visible_lights_counts_buf hlsl {
+      RWStructuredBuffer<uint> visible_lights_counts_buf@uav;
+    };
+
+    visible_far_max_lights_count@i1 = visible_far_max_lights_count;
+  }
+
+  hlsl (cs) {
+    #include <lightsSorter.hlsli>
+    #include <lightsPartition.hlsli>
+
+    [numthreads(LIGHTS_SORTER_HIGH_GROUP_SIZE, 1, 1)]
+    void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
+    {
+      uint actualOmniClusteredLightCount = structuredBufferAt(visible_lights_counts_buf, CLUSTERED_OMNI_LIGHTS_COUNT_INDEX + 1);
+      uint actualSpotClusteredLightCount = structuredBufferAt(visible_lights_counts_buf, CLUSTERED_SPOT_LIGHTS_COUNT_INDEX + 1);
+      uint naturalOmniFarLightsCount = structuredBufferAt(visible_lights_counts_buf, FAR_OMNI_LIGHTS_COUNT_INDEX + 1);
+      uint naturalSpotFarLightsCount = structuredBufferAt(visible_lights_counts_buf, FAR_SPOT_LIGHTS_COUNT_INDEX + 1);
+
+      BRANCH
+      if(dispatch_thread_id.x == 0)
+      {
+        structuredBufferAt(visible_lights_counts_buf, CLUSTERED_OMNI_LIGHTS_COUNT_INDEX) = min(actualOmniClusteredLightCount, (uint)MAX_CLUSTERED_OMNI_LIGHTS);
+        structuredBufferAt(visible_lights_counts_buf, CLUSTERED_SPOT_LIGHTS_COUNT_INDEX) = min(actualSpotClusteredLightCount, (uint)MAX_CLUSTERED_SPOT_LIGHTS);
+
+        uint overflowOmniLightsCount = max(actualOmniClusteredLightCount, (uint)MAX_CLUSTERED_OMNI_LIGHTS) - (uint)MAX_CLUSTERED_OMNI_LIGHTS;
+        uint overflowSpotLightsCount = max(actualSpotClusteredLightCount, (uint)MAX_CLUSTERED_SPOT_LIGHTS) - (uint)MAX_CLUSTERED_SPOT_LIGHTS;
+
+        structuredBufferAt(visible_lights_counts_buf, FAR_OMNI_LIGHTS_COUNT_INDEX) =
+          min(naturalOmniFarLightsCount + overflowOmniLightsCount, (uint)visible_far_max_lights_count);
+
+        structuredBufferAt(visible_lights_counts_buf, FAR_SPOT_LIGHTS_COUNT_INDEX) =
+          min(naturalSpotFarLightsCount + overflowSpotLightsCount, (uint)visible_far_max_lights_count);
+      }
+
+      bool isSpot = (dispatch_thread_id.x >= actualOmniClusteredLightCount);
+
+      BRANCH
+      if(dispatch_thread_id.x < actualOmniClusteredLightCount + actualSpotClusteredLightCount)
+      {
+        uint lightIndex = isSpot ? (dispatch_thread_id.x - actualOmniClusteredLightCount) : dispatch_thread_id.x;
+        uint clusteredIdOffset = isSpot ? CLUSTERED_SPOT_LIGHTS_IDS_OFFSET : CLUSTERED_OMNI_LIGHTS_IDS_OFFSET;
+        uint sceneIndex = decode_sort_data_scene_index(loadBuffer(visible_lights_data_buf, (clusteredIdOffset + lightIndex) * 4u));
+
+        uint farIdOffset = isSpot ? FAR_SPOT_LIGHTS_IDS_OFFSET : FAR_OMNI_LIGHTS_IDS_OFFSET;
+        uint kMaxSceneLights = isSpot ? (uint)MAX_CLUSTERED_SPOT_LIGHTS : (uint)MAX_CLUSTERED_OMNI_LIGHTS;
+        uint naturalFarLightsCount = isSpot ? naturalSpotFarLightsCount : naturalOmniFarLightsCount;
+
+        storeBuffer(visible_lights_data_buf, (clusteredIdOffset + lightIndex) * 4u, sceneIndex);
+
+        if(lightIndex >= kMaxSceneLights)
+        {
+          uint farSlot = naturalFarLightsCount + (lightIndex - kMaxSceneLights);
+          if (farSlot < (uint)visible_far_max_lights_count)
+            storeBuffer(visible_lights_data_buf, (farIdOffset + farSlot) * 4u, sceneIndex);
+        }
+      }
+    }
+  }
+
+  compile("target_cs", "main");
+}
+
+macro INIT_SORT_IMPL_LIGHTS_COMMON_PARAMS(code)
+  (code) {
+    sort_lights_stage_data_buf@buf = sort_lights_stage_data_buf hlsl {
+      StructuredBuffer<uint> sort_lights_stage_data_buf@buf;
+    };
+    visible_lights_data_buf@uav = visible_lights_data_buf hlsl {
+      RWByteAddressBuffer visible_lights_data_buf@uav;
+    };
+    visible_lights_counts_buf@buf = visible_lights_counts_buf hlsl {
+      StructuredBuffer<uint> visible_lights_counts_buf@buf;
+    };
+  }
+endmacro
+
+macro SORT_IMPL_LIGHTS_CORE(code, use_batching, max_lights_count_sort, thread_group_size, stage_data_index, first_block_size)
+  SETUP_LIGHTS_SORTER(code)
+  hlsl (code) {
+    #include <lightsSorter.hlsli>
+    #include <lightsPartition.hlsli>
+
+    ##if use_batching
+      groupshared uint4 gs_sort_data_batched[max_lights_count_sort / 4u];
+    ##else
+      groupshared uint gs_sort_data_scalar[max_lights_count_sort];
+    ##endif
+
+    inline bool compareSwap(
+      uint light_left_sort_index,
+      uint block,
+      inout uint left_encoded_value,
+      inout uint right_encoded_value
+    )
+    {
+      bool ascending = (light_left_sort_index & block) == 0u;
+      uint minValue = min(left_encoded_value, right_encoded_value);
+      uint maxValue = max(left_encoded_value, right_encoded_value);
+      uint newLeft = ascending ? minValue : maxValue;
+      uint newRight = ascending ? maxValue : minValue;
+
+      bool res = (newLeft != left_encoded_value);
+
+      left_encoded_value = newLeft;
+      right_encoded_value = newRight;
+
+      return res;
+    }
+
+    inline void compareSwap(
+      uint light_left_sort_index,
+      uint block,
+      inout bool swap_executed,
+      inout uint left_encoded_value,
+      inout uint right_encoded_value
+    )
+    {
+      bool res = compareSwap(
+        light_left_sort_index,
+        block,
+        left_encoded_value,
+        right_encoded_value
+      );
+
+      swap_executed = swap_executed || res;
+    }
+
+    ##if !use_batching
+      inline void compareSwapScalarNoChecks(
+        uint left_light_sort_index,
+        uint right_light_sort_index,
+        uint block,
+        uint group_base_global_light_index
+      )
+      {
+        uint lightThreadDataLeft = gs_sort_data_scalar[left_light_sort_index];
+        uint lightThreadDataRight = gs_sort_data_scalar[right_light_sort_index];
+
+        bool swapExecuted = false;
+        compareSwap(left_light_sort_index + group_base_global_light_index, block, swapExecuted, lightThreadDataLeft,
+          lightThreadDataRight);
+
+        if(swapExecuted)
+        {
+          gs_sort_data_scalar[left_light_sort_index] = lightThreadDataLeft;
+          gs_sort_data_scalar[right_light_sort_index] = lightThreadDataRight;
+        }
+      }
+    ##endif
+
+    [numthreads(thread_group_size, 1, 1)]
+    void main(uint3 group_thread_id : SV_GroupThreadID, uint3 group_id : SV_GroupID)
+    {
+      uint firstSpotGroupIndex = structuredBufferAt(sort_lights_stage_data_buf, stage_data_index);
+      bool isSpot = group_id.x >= firstSpotGroupIndex;
+      uint localGroupId = isSpot ? group_id.x - firstSpotGroupIndex : group_id.x;
+
+      uint countIndex = isSpot ? CLUSTERED_SPOT_LIGHTS_COUNT_INDEX : CLUSTERED_OMNI_LIGHTS_COUNT_INDEX;
+      uint idsByteOffset = (isSpot ? CLUSTERED_SPOT_LIGHTS_IDS_OFFSET : CLUSTERED_OMNI_LIGHTS_IDS_OFFSET) * 4u;
+
+      #if LIGHTS_SORTER_USE_WAVES
+        uint minSortedBlockSizeForGroup = max(first_block_size, LIGHTS_SORTER_WAVE_LENGTH());
+      #else
+        uint minSortedBlockSizeForGroup = first_block_size;
+      #endif
+
+      uint maxPossibleSortedBlockSizeForGroup = max_lights_count_sort;
+      uint groupBaseGlobalLightIndex = localGroupId * maxPossibleSortedBlockSizeForGroup;
+
+      uint actualLightCount = structuredBufferAt(visible_lights_counts_buf, countIndex);
+      uint dispatchSortWorkspaceLength = next_power_of_two(actualLightCount);
+
+      BRANCH
+      if(actualLightCount <= 1)
+        return;
+
+      BRANCH
+      if(groupBaseGlobalLightIndex >= dispatchSortWorkspaceLength)
+        return;
+
+      uint lightCountPowerOf2 = min(dispatchSortWorkspaceLength, maxPossibleSortedBlockSizeForGroup);
+      uint lightsPerThread = max(lightCountPowerOf2 / thread_group_size, 1u);
+
+      ##if use_batching
+
+        BRANCH
+        if(lightsPerThread < 4u)
+          return;
+
+        uint lightsBatchPerThread = max(lightsPerThread / 4u, 1u);
+        uint baseLightThreadBatchIndex = group_thread_id.x * lightsBatchPerThread;
+      ##else
+        uint baseLightThreadIndex = group_thread_id.x * lightsPerThread;
+        uint lightPairsCountPowerOf2 = lightCountPowerOf2 / 2u;
+        uint lightPairsCountPerThread = max(lightPairsCountPowerOf2 / thread_group_size, 1u);
+        uint baseLightThreadPairIndex = group_thread_id.x * lightPairsCountPerThread;
+      ##endif
+
+      ##if use_batching
+        for(uint threadBatchOffset = 0; threadBatchOffset < lightsBatchPerThread; ++threadBatchOffset)
+        {
+          uint lightThreadBatchIndex = baseLightThreadBatchIndex + threadBatchOffset;
+          uint startLightIndexInBatch = lightThreadBatchIndex * 4u;
+
+          uint4 batchedSortData = loadBuffer4(visible_lights_data_buf, (startLightIndexInBatch + groupBaseGlobalLightIndex) * 4u + idsByteOffset);
+
+          gs_sort_data_batched[lightThreadBatchIndex] = batchedSortData;
+        }
+      ##else
+        for(uint threadOffset = 0; threadOffset < lightsPerThread; ++threadOffset)
+        {
+          uint lightThreadIndex = baseLightThreadIndex + threadOffset;
+
+          BRANCH
+          if (lightThreadIndex < lightCountPowerOf2)
+            gs_sort_data_scalar[lightThreadIndex] = loadBuffer(visible_lights_data_buf, (lightThreadIndex + groupBaseGlobalLightIndex) * 4u + idsByteOffset);
+        }
+      ##endif
+
+      GroupMemoryBarrierWithGroupSync();
+
+      for (uint block = 2u * minSortedBlockSizeForGroup; block <= lightCountPowerOf2; block <<= 1)
+      {
+        for (uint stride = block >> 1; stride >= 1u; stride >>= 1)
+        {
+          ##if use_batching
+            for(uint threadBatchOffset = 0; threadBatchOffset < lightsBatchPerThread; ++threadBatchOffset)
+            {
+              uint lightThreadBatchIndex = baseLightThreadBatchIndex + threadBatchOffset;
+              uint startLightIndexInBatch = lightThreadBatchIndex * 4u;
+
+              uint4 batchedSortData = gs_sort_data_batched[lightThreadBatchIndex];
+              bool swapExecuted = false;
+
+              BRANCH
+              if(stride == 1u)
+              {
+                compareSwap(startLightIndexInBatch + groupBaseGlobalLightIndex, block, swapExecuted, batchedSortData.x,
+                  batchedSortData.y);
+                compareSwap(startLightIndexInBatch + 2 + groupBaseGlobalLightIndex, block, swapExecuted, batchedSortData.z,
+                  batchedSortData.w);
+
+                if(swapExecuted)
+                  gs_sort_data_batched[lightThreadBatchIndex] = batchedSortData;
+
+              } else BRANCH if (stride == 2u)
+              {
+                compareSwap(startLightIndexInBatch + groupBaseGlobalLightIndex, block, swapExecuted, batchedSortData.x,
+                  batchedSortData.z);
+                compareSwap(startLightIndexInBatch + 1 + groupBaseGlobalLightIndex, block, swapExecuted, batchedSortData.y,
+                  batchedSortData.w);
+
+                if(swapExecuted)
+                  gs_sort_data_batched[lightThreadBatchIndex] = batchedSortData;
+              }
+              else
+              {
+                uint startLightIndexInBatchOpposite = startLightIndexInBatch ^ stride;
+
+                BRANCH
+                if (startLightIndexInBatch < lightCountPowerOf2 && startLightIndexInBatchOpposite > startLightIndexInBatch)
+                {
+                  uint lightThreadBatchOppositeIndex = startLightIndexInBatchOpposite / 4u;
+                  uint4 batchedSortDataOpposite = gs_sort_data_batched[lightThreadBatchOppositeIndex];
+
+                  compareSwap(startLightIndexInBatch + groupBaseGlobalLightIndex, block, swapExecuted, batchedSortData.x,
+                    batchedSortDataOpposite.x);
+                  compareSwap(startLightIndexInBatch + 1 + groupBaseGlobalLightIndex, block, swapExecuted, batchedSortData.y,
+                    batchedSortDataOpposite.y);
+                  compareSwap(startLightIndexInBatch + 2 + groupBaseGlobalLightIndex, block, swapExecuted, batchedSortData.z,
+                    batchedSortDataOpposite.z);
+                  compareSwap(startLightIndexInBatch + 3 + groupBaseGlobalLightIndex, block, swapExecuted, batchedSortData.w,
+                    batchedSortDataOpposite.w);
+
+                  if(swapExecuted)
+                  {
+                    gs_sort_data_batched[lightThreadBatchIndex] = batchedSortData;
+                    gs_sort_data_batched[lightThreadBatchOppositeIndex] = batchedSortDataOpposite;
+                  }
+                }
+              }
+            }
+          ##else
+            BRANCH
+            if(lightsPerThread == 1u)
+            {
+              uint oppositeIndex = baseLightThreadIndex ^ stride;
+              uint lightThreadDataLeft = gs_sort_data_scalar[baseLightThreadIndex];
+              uint lightThreadDataRight = gs_sort_data_scalar[oppositeIndex];
+
+              GroupMemoryBarrierWithGroupSync();
+
+              BRANCH
+              if (baseLightThreadIndex < lightCountPowerOf2)
+              {
+                compareSwap(min(baseLightThreadIndex, oppositeIndex) + groupBaseGlobalLightIndex, block, lightThreadDataLeft,
+                  lightThreadDataRight);
+
+                gs_sort_data_scalar[baseLightThreadIndex] = (baseLightThreadIndex < oppositeIndex) ? lightThreadDataLeft : lightThreadDataRight;
+              }
+            }
+            else
+            {
+              for(uint threadPairOffset = 0; threadPairOffset < lightPairsCountPerThread; ++threadPairOffset)
+              {
+                uint lightPairIndex = baseLightThreadPairIndex + threadPairOffset;
+
+                if (lightPairIndex < lightPairsCountPowerOf2)
+                {
+                  uint leftLightIndex = ((lightPairIndex / stride) * 2u * stride) + (lightPairIndex % stride);
+                  uint rightLightIndex = leftLightIndex + stride;
+
+                  compareSwapScalarNoChecks(
+                    leftLightIndex,
+                    rightLightIndex,
+                    block,
+                    groupBaseGlobalLightIndex
+                  );
+                }
+              }
+            }
+          ##endif
+
+          GroupMemoryBarrierWithGroupSync();
+        }
+      }
+
+
+      ##if use_batching
+        for(uint threadBatchOffset = 0; threadBatchOffset < lightsBatchPerThread; ++threadBatchOffset)
+        {
+          uint lightThreadBatchIndex = baseLightThreadBatchIndex + threadBatchOffset;
+          uint startLightIndexInBatch = lightThreadBatchIndex * 4u;
+
+          uint4 batchedSortData = gs_sort_data_batched[lightThreadBatchIndex];
+          storeBuffer4(visible_lights_data_buf, (startLightIndexInBatch + groupBaseGlobalLightIndex) * 4u + idsByteOffset, batchedSortData);
+        }
+      ##else
+        for(uint threadOffset = 0; threadOffset < lightsPerThread; ++threadOffset)
+        {
+          uint lightThreadIndex = baseLightThreadIndex + threadOffset;
+          BRANCH
+          if (lightThreadIndex < lightCountPowerOf2)
+            storeBuffer(visible_lights_data_buf, (lightThreadIndex + groupBaseGlobalLightIndex) * 4u + idsByteOffset, gs_sort_data_scalar[lightThreadIndex]);
+        }
+      ##endif
+    }
+  }
+endmacro
+
+shader sort_lights_in_wave_cs
+{
+  if (!lights_sorter_wave_supported)
+  {
+    dont_render;
+  }
+  else
+  {
+    (cs)
+    {
+      sort_lights_stage_data_buf@buf = sort_lights_stage_data_buf hlsl {
+        StructuredBuffer<uint> sort_lights_stage_data_buf@buf;
+      };
+      visible_lights_data_buf@uav = visible_lights_data_buf hlsl {
+        RWByteAddressBuffer visible_lights_data_buf@uav;
+      };
+      visible_lights_counts_buf@buf = visible_lights_counts_buf hlsl {
+        StructuredBuffer<uint> visible_lights_counts_buf@buf;
+      };
+    }
+    SETUP_LIGHTS_SORTER(cs)
+    USE_PS5_WAVE32_MODE()
+    hlsl(cs)
+    {
+      #include <lightsSorter.hlsli>
+      #include <lightsPartition.hlsli>
+
+      #if LIGHTS_SORTER_USE_WAVES
+      [numthreads(LIGHTS_SORTER_WAVE_GROUP_SIZE, 1u, 1u)]
+      #else
+      [numthreads(1u, 1u, 1u)]
+      #endif
+      void main(
+          uint3 group_id : SV_GroupID,
+          uint3 group_thread_id : SV_GroupThreadID
+      )
+      {
+        #if LIGHTS_SORTER_USE_WAVES
+
+          uint firstSpotGroupIndex = structuredBufferAt(sort_lights_stage_data_buf, LIGHTS_SORTER_WAVE_STAGE_DATA_INDEX);
+          bool isSpot = group_id.x >= firstSpotGroupIndex;
+          uint localGroupId = isSpot ? group_id.x - firstSpotGroupIndex : group_id.x;
+
+          uint countIndex = isSpot ? CLUSTERED_SPOT_LIGHTS_COUNT_INDEX : CLUSTERED_OMNI_LIGHTS_COUNT_INDEX;
+          uint idsByteOffset = (isSpot ? CLUSTERED_SPOT_LIGHTS_IDS_OFFSET : CLUSTERED_OMNI_LIGHTS_IDS_OFFSET) * 4u;
+
+          const uint chunkSize = LIGHTS_SORTER_WAVE_LENGTH();
+          uint chunksPerGroup = (uint)LIGHTS_SORTER_WAVE_GROUP_SIZE / chunkSize;
+          uint chunkIndexInGroup = group_thread_id.x / chunkSize;
+          uint localIndexInChunk = group_thread_id.x % chunkSize;
+          uint globalChunkIndex = localGroupId * chunksPerGroup + chunkIndexInGroup;
+          uint globalStartLightIndexInChunk = globalChunkIndex * chunkSize;
+
+          uint actualLightCount = structuredBufferAt(visible_lights_counts_buf, countIndex);
+          uint lightCountPowerOf2 = next_power_of_two(actualLightCount);
+          uint globalLightIndex = globalStartLightIndexInChunk + localIndexInChunk;
+
+          BRANCH
+          if(globalStartLightIndexInChunk >= lightCountPowerOf2)
+            return;
+
+          uint currentLaneValue = (globalLightIndex < lightCountPowerOf2)
+                                    ? loadBuffer(visible_lights_data_buf, globalLightIndex * 4u + idsByteOffset)
+                                    : get_default_sort_data();
+
+          uint realLaneIndexInWarp = WaveGetLaneIndex();
+          uint chunkIndexInWarp = realLaneIndexInWarp / chunkSize;
+
+          UNROLL
+          for (uint block = 2u; block <= chunkSize; block <<= 1)
+          {
+            bool ascending = (globalLightIndex & block) == 0u;
+
+            UNROLL
+            for (uint stride = block >> 1; stride >= 1u; stride >>= 1)
+            {
+              uint oppositeIndexInChunk = localIndexInChunk ^ stride;
+              uint oppositeLaneIndexInWarp = chunkIndexInWarp * chunkSize + oppositeIndexInChunk;
+              uint oppositeLaneValue = WaveReadLaneAt(currentLaneValue, oppositeLaneIndexInWarp);
+
+              uint minValue = min(currentLaneValue, oppositeLaneValue);
+              uint maxValue = max(currentLaneValue, oppositeLaneValue);
+
+              currentLaneValue = (localIndexInChunk < oppositeIndexInChunk)
+                                    ? (ascending ? minValue : maxValue)
+                                    : (ascending ? maxValue : minValue);
+            }
+          }
+
+          BRANCH
+          if(globalLightIndex < lightCountPowerOf2)
+            storeBuffer(visible_lights_data_buf, globalLightIndex * 4u + idsByteOffset, currentLaneValue);
+
+        #endif
+      }
+    }
+    compile("target_cs", "main");
+  }
+}
+
+shader sort_scalar_basic_impl_lights_cs
+{
+  INIT_SORT_IMPL_LIGHTS_COMMON_PARAMS(cs)
+  SORT_IMPL_LIGHTS_CORE(cs, false, LIGHTS_SORTER_BASIC_GROUP_SIZE, LIGHTS_SORTER_BASIC_GROUP_SIZE, LIGHTS_SORTER_BASIC_STAGE_DATA_INDEX,
+    1)
+  compile("target_cs", "main");
+}
+
+shader sort_scalar_medium_impl_lights_cs
+{
+  INIT_SORT_IMPL_LIGHTS_COMMON_PARAMS(cs)
+  SORT_IMPL_LIGHTS_CORE(cs, false, LIGHTS_SORTER_MEDIUM_GROUP_SIZE, LIGHTS_SORTER_MEDIUM_GROUP_SIZE,
+    LIGHTS_SORTER_MEDIUM_STAGE_DATA_INDEX, LIGHTS_SORTER_BASIC_GROUP_SIZE)
+  compile("target_cs", "main");
+}
+
+shader sort_scalar_high_impl_lights_cs
+{
+  INIT_SORT_IMPL_LIGHTS_COMMON_PARAMS(cs)
+  SORT_IMPL_LIGHTS_CORE(cs, false, MAX_SCENE_SORT_LIGHTS, LIGHTS_SORTER_HIGH_GROUP_SIZE, LIGHTS_SORTER_SCALAR_HIGH_STAGE_DATA_INDEX,
+    LIGHTS_SORTER_MEDIUM_GROUP_SIZE)
+  compile("target_cs", "main");
+}
+
+shader sort_batched_high_impl_lights_cs
+{
+  INIT_SORT_IMPL_LIGHTS_COMMON_PARAMS(cs)
+  SORT_IMPL_LIGHTS_CORE(cs, true, MAX_SCENE_SORT_LIGHTS, LIGHTS_SORTER_HIGH_GROUP_SIZE, LIGHTS_SORTER_BATCHED_HIGH_STAGE_DATA_INDEX,
+    LIGHTS_SORTER_MEDIUM_GROUP_SIZE)
+  compile("target_cs", "main");
+}
+

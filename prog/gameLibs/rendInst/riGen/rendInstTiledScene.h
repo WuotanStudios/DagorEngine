@@ -29,7 +29,7 @@ public:
     VISIBLE_IN_VSM = 1 << 11,
     DRAFT_DEPTH = 1 << 12,
     VISIBLE_IN_LANDMASK = 1 << 13,
-    // EMPTY = 1 << 14,
+    UNDERWATER_ONLY = 1 << 14,
     HAS_PER_INSTANCE_RENDER_ADDITIONAL_DATA = 1 << 15,
   };
   using SimpleScene::calcNodeBox;
@@ -43,18 +43,22 @@ public:
   using SimpleScene::isAliveNodeFast;
   using SimpleScene::prefetchNode;
   using TiledScene::allocate;
+  using TiledScene::beginBulkTransformUpdate;
   using TiledScene::boxCull;
   using TiledScene::destroy;
   using TiledScene::doMaintenance;
   using TiledScene::dumpSceneState;
+  using TiledScene::endBulkTransformUpdate;
   using TiledScene::flushDeferredTransformUpdates;
   using TiledScene::frustumCull;
   using TiledScene::frustumCullOneTile;
   using TiledScene::frustumCullTilesPass;
+  using TiledScene::getGridObjMaxHeight;
   using TiledScene::getNodeIndexInternal; // for faster visibility in dev
   using TiledScene::getNodesAliveCount;
   using TiledScene::getNodesCount;
   using TiledScene::getPoolBbox;
+  using TiledScene::getTileBoxByIdx;
   using TiledScene::getTileCountInBox;
   using TiledScene::getTileSize;
   using TiledScene::lockForRead;
@@ -65,7 +69,6 @@ public:
   using TiledScene::setPoolBBox;
   using TiledScene::setPoolDistanceSqScale;
   using TiledScene::setTransform;
-  using TiledScene::term;
   using TiledScene::unlockAfterRead;
   using TiledScene::unsetFlags;
   using TiledScene::unsetFlagsUnordered;
@@ -100,6 +103,16 @@ public:
     reserve(nodes_reserve);
   }
 
+  void term()
+  {
+    TiledScene::term();
+    clear_and_shrink(distance);
+    clear_and_shrink(nodeUserData);
+    clear_and_shrink(perInstanceRenderAdditionalData);
+    userDataWordCount = 0;
+    dirFromSunOnPrevDistInvalidation = {0, 0, 0};
+  }
+
   uint8_t getDistance(scene::node_index id) const
   {
     uint32_t index = TiledScene::getNodeIndexInternal(id); // for perf in dev mode use internal index
@@ -131,6 +144,10 @@ public:
   }
 
   void debugDumpScene(const char *file_name);
+  // Writes this scene's full reconstructable state (tileSize, poolBox[] + vertical centers, and every
+  // alive node mat44f) to cb, in the per-scene block layout documented in rendInst/riSceneDump.h. Used
+  // by rendinst::dumpAllScenes for the offline scene-representation benchmark.
+  void dumpForBenchmark(IGenSave &cb) const;
   void shrinkDistance() { distance.resize(getNodesCount(), LIGHTDIST_INVALID); }
 
   void setNodeUserDataDeferred(scene::node_index node, unsigned user_cmd, int dw_cnt, const int32_t *dw_data)
@@ -158,14 +175,11 @@ public:
     if (isInWritingThread() && mDeferredCommand.empty())
     {
       WriteLockRAII lock(*this);
-      if (mDeferredCommand.empty())
-      {
-        int32_t data[16];
-        memcpy(data, dw_data, dw_cnt * 4);
-        data[15] = dw_cnt;
-        if (user_cmd_processsor(user_cmd, *this, node, (const char *)&data))
-          return;
-      }
+      int32_t data[16];
+      memcpy(data, dw_data, dw_cnt * 4);
+      data[15] = dw_cnt;
+      if (user_cmd_processsor(user_cmd, *this, node, (const char *)&data))
+        return;
     }
 
     setNodeUserDataDeferred(node, user_cmd, dw_cnt, dw_data);
@@ -235,27 +249,12 @@ public:
     return 0;
   }
 
-  void setPerInstanceRenderAdditionalDataImm(scene::node_index ni, uint32_t encoded_data)
-  {
-    G_ASSERT_RETURN(isInWritingThread(), );
-    if (encoded_data)
-    {
-      setFlagsImm(ni, HAS_PER_INSTANCE_RENDER_ADDITIONAL_DATA);
-      perInstanceRenderAdditionalData[ni] = encoded_data;
-    }
-    else
-    {
-      if (getNodeFlags(ni) & HAS_PER_INSTANCE_RENDER_ADDITIONAL_DATA)
-      {
-        unsetFlagsImm(ni, HAS_PER_INSTANCE_RENDER_ADDITIONAL_DATA);
-        perInstanceRenderAdditionalData.erase(ni);
-      }
-    }
-  }
+  void setPerInstanceRenderAdditionalData(scene::node_index ni, uint32_t encoded_data);
 
   void onDirFromSunChanged(const Point3 &nd);
 
 protected:
+  void setPerInstanceRenderAdditionalDataImm(scene::node_index ni, uint32_t encoded_data);
   void invalidateShadowDist()
   {
     for (auto &di : distance)
@@ -275,11 +274,19 @@ protected:
 
 struct TiledScenePoolInfo
 {
+  static constexpr uint32_t INVALID_POOL = ~uint32_t(0);
   float distSqLOD[RiExtraPool::MAX_LODS];
   uint32_t lodLimits, poolIdx;
   uint16_t boxOccluder, quadOccluder;
   bool isDynamic;
 };
+
+inline const TiledScenePoolInfo *get_pool_info_if_ready(const eastl::vector<TiledScenePoolInfo> &pools, scene::pool_index pool_id)
+{
+  if (pool_id >= pools.size() || pools[pool_id].poolIdx == TiledScenePoolInfo::INVALID_POOL)
+    return nullptr;
+  return &pools[pool_id];
+}
 
 template <int N>
 class TiledScenesGroup

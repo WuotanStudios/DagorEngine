@@ -13,6 +13,9 @@ void teardown() {}
 
 void turn_off() {}
 
-void render(bvh::ContextId, const TMatrix4 &, TEXTUREID, bool, const denoiser::TexMap &, Quality, bool) {}
+void render(bvh::ContextId, const TMatrix4 &, Texture *, bool, const denoiser::TexMap &, Quality, bool, bool) {}
+
+bool is_validation_layer_enabled() { return false; }
+void render_validation_layer() {}
 
 } // namespace ptgi

@@ -6,6 +6,7 @@
 #include <drv/3d/dag_shaderConstants.h>
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_commands.h>
+#include <drv/3d/dag_texture.h>
 #include <3d/dag_textureIDHolder.h>
 #include <perfMon/dag_statDrv.h>
 #include <math/integer/dag_IPoint4.h>
@@ -30,7 +31,7 @@ bool texture_util::rotate_texture(TEXTUREID source_texture_id, BaseTexture *dest
   d3d::set_vs_const(10, (const float *)&rot, 1);
 
   SCOPE_RENDER_TARGET;
-  d3d::set_render_target(dest_texture, 0);
+  d3d::set_render_target({}, DepthAccess::RW, {{dest_texture, 0, 0}});
 
   postFxRenderer.render();
 
@@ -50,7 +51,7 @@ static bool stitch_textures_impl(dag::ConstSpan<BaseTexture *> source_textures, 
       return false;
     source_textures[i]->getinfo(texInfo);
 
-    if (!dest_texture->updateSubRegion(source_textures[i], 0, 0, 0, 0, texInfo.w, texInfo.h, 1, 0, is_vertical ? 0 : offset,
+    if (!d3d::update_sub_region(source_textures[i], 0, 0, 0, 0, texInfo.w, texInfo.h, 1, dest_texture, 0, is_vertical ? 0 : offset,
           is_vertical ? offset : 0, 0))
       return false;
     offset += is_vertical ? texInfo.h : texInfo.w;
@@ -69,7 +70,8 @@ bool texture_util::stitch_textures_vertical(dag::ConstSpan<BaseTexture *> source
   return stitch_textures_impl(source_textures, dest_texture, true);
 }
 
-TexPtr texture_util::stitch_textures_horizontal(dag::ConstSpan<TEXTUREID> source_texture_ids, const char *dest_tex_name, int flags)
+TexPtr texture_util::stitch_textures_horizontal(dag::ConstSpan<TEXTUREID> source_texture_ids, const char *dest_tex_name, int flags,
+  ResourceTagType tag)
 {
   if (source_texture_ids.empty())
     return TexPtr();
@@ -112,7 +114,7 @@ TexPtr texture_util::stitch_textures_horizontal(dag::ConstSpan<TEXTUREID> source
   }
 
   TexPtr combinedTex =
-    dag::create_tex(nullptr, destWidth, destHeight, flags | TEXCF_CLEAR_ON_CREATE | TEXCF_UPDATE_DESTINATION, 1, dest_tex_name);
+    dag::create_tex(nullptr, destWidth, destHeight, flags | TEXCF_CLEAR_ON_CREATE | TEXCF_UPDATE_DESTINATION, 1, dest_tex_name, tag);
   G_ASSERT(combinedTex);
   if (combinedTex)
     texture_util::stitch_textures_horizontal(source_textures, combinedTex.get());

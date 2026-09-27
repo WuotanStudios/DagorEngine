@@ -12,8 +12,10 @@
 #include <util/dag_stdint.h>
 #include <generic/dag_carray.h>
 #include <EASTL/fixed_function.h>
+#include <generic/dag_functionRef.h>
 
 #include <rendInst/rendInstDesc.h>
+#include <rendInst/rendInstAccess.h>
 #include <rendInst/constants.h>
 #include <rendInst/rendInstGenDamageInfo.h>
 #include <rendInst/treeDestr.h>
@@ -30,32 +32,27 @@ using ri_damage_effect_cb = void (*)(int type, const TMatrix &emitter_tm, const 
 using damage_effect_cb = void (*)(int type, const TMatrix &emitter_tm, const TMatrix &fx_tm, int pool_idx, bool is_player,
   AcesEffect **locked_fx, const char *effect_template);
 
-void doRIGenDamage(const BSphere3 &sphere, unsigned frameNo, const Point3 &axis = Point3(0.f, 0.f, 0.f), bool create_debris = true);
+// Optional per-pool skip predicate for the sphere sweep: return true to spare that (layer, pool) from
+// being swept. Non-owning: the callable must outlive the call, do not bind a temporary.
+using RIGenPoolSkipCbType = dag::FunctionRef<bool(int layer, int pool) const>;
+void doRIGenDamage(const BSphere3 &sphere, unsigned frameNo, const Point3 &axis = Point3(0.f, 0.f, 0.f), bool create_debris = true,
+  RIGenPoolSkipCbType pool_skip_cb = {});
 void doRIGenDamage(const BBox3 &box, unsigned frameNo, const Point3 &axis = Point3(0.f, 0.f, 0.f), bool create_debris = true);
 void doRIGenDamage(const BBox3 &box, unsigned frameNo, const TMatrix &check_itm, const Point3 &axis = Point3(0.f, 0.f, 0.f),
   bool create_debris = true);
 void doRIGenDamage(const Point3 &pos, unsigned frameNo, ri_damage_effect_cb effect_cb, const Point3 &axis = Point3(0.f, 0.f, 0.f),
   float dmg_pts = 1000, bool create_debris = true);
 
-struct RendInstBufferData
-{
-  mat44f tm;
-  carray<int16_t, 12> data;
-};
+void playRIGenDestrEffect(const RendInstBufferData &buffer, ri_damage_effect_cb effect_cb, const Point3 *coll_point);
 
-DynamicPhysObjectData *doRIGenDestr(const RendInstDesc &desc, RendInstBufferData &out_buffer, bool create_destr_effects,
-  ri_damage_effect_cb effect_cb, riex_handle_t &out_destroyed_riex_handle, int32_t user_data = -1, const Point3 *coll_point = nullptr,
-  bool *ri_removed = nullptr, DestrOptionFlags destroy_flags = DestrOptionFlag::AddDestroyedRi | DestrOptionFlag::ForceDestroy,
-  const Point3 &impulse = Point3::ZERO, const Point3 &impulse_pos = Point3::ZERO);
+// Invokes onRiExtraDestruction callback for RI extra, returns true for
+// dynamic RI, that must not undergo default destruction path
+bool doDynamicRIExtraDestr(const RendInstDesc &desc, bool create_destr_effects, int32_t user_data, const Point3 &impulse,
+  const Point3 &impulse_pos);
+bool doRIGenDestr(const RendInstDesc &desc, riex_handle_t &out_destroyed_riex, DestrOptionFlags destroy_flags);
 
-// This one ignores subcells and doesn't return buffer (as we use it when we don't need to restore it)
-// As well it doesn't updateVb, as it's used in batches, so you'll updateVb only once, when you need it
-DynamicPhysObjectData *doRIGenDestrEx(const RendInstDesc &desc, bool create_destr_effects, ri_damage_effect_cb effect_cb = nullptr,
-  int32_t user_data = -1, const Point3 &impulse = Point3(), const Point3 &impulse_pos = Point3());
-DynamicPhysObjectData *doRIExGenDestrEx(rendinst::riex_handle_t riex_handle, ri_damage_effect_cb effect_cb = nullptr);
-
-bool restoreRiGen(const RendInstDesc &desc, const RendInstBufferData &buffer);
-riex_handle_t restoreRiGenDestr(const RendInstDesc &desc, const RendInstBufferData &buffer);
+bool delRIGen(const RendInstDesc &desc, bool add_destr_data);
+riex_handle_t restoreRendInst(const RendInstBufferData &buffer, bool remove_from_destr_data);
 
 struct TreeInstData
 {
@@ -66,14 +63,19 @@ struct TreeInstData
     Bottom
   };
 
-  float timer = 0.0f;
-  float disappearStartTime = -1.0f;
+  float creationTimeAt = 0.0f;
+  float disappearStartTimeAt = 0.0f;
   float maxDistanceSq = 0.0f;
   int rndSeed = 0;
   Point2 impactXZ = Point2(0.0f, 0.0f);
   Point3 localImpactPos = Point3::ZERO;
   CutType cutType = CutType::None;
   uint64_t originalTmDataId = ~0ull;
+  uint64_t destructionDataId = ~0ull;
+  float bendAngle = 0.0f;
+  float bendStrength = 0.0f;
+  float bendAnglePrev = 0.0f;
+  float bendStrengthPrev = 0.0f;
   rendinstdestr::BranchDestr branchDestr;
 };
 
@@ -88,6 +90,8 @@ struct TreeInstDebugData
   Tab<Point3> impulsePositions;
   bool last_object_was_from_damage = false;
   bool useCutHeightOverride = false;
+  float bendAngle = 0.0f;
+  float bendStrength = 0.0f;
 };
 
 struct DestroyedRi
@@ -111,10 +115,9 @@ struct DestroyedRi
   ~DestroyedRi();
 };
 
-DestroyedRi *doRIGenExternalControl(const RendInstDesc &desc, bool rem_rendinst = true);
-Tab<DestroyedRi *> doRIGenExternalControlMultiple(const RendInstDesc &desc, int copy_count, bool rem_rendinst = true);
+Tab<DestroyedRi *> doRIGenExternalControl(const RendInstDesc &desc, const RendInstBufferData &buffer, int copy_count);
 bool fillTreeInstData(const RendInstDesc &desc, bool from_damage, TreeInstData &out_data);
-void updateTreeDestrRenderData(riex_handle_t ri_handle, TreeInstData &tree_inst_data,
+uint64_t updateTreeDestrRenderData(riex_handle_t ri_handle, const TreeInstData &tree_inst_data,
   const TreeInstDebugData *tree_inst_debug_data = nullptr);
 
 bool should_clear_external_controls();

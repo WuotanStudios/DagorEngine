@@ -1,6 +1,9 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "textLayout.h"
+#include "dargDebugUtils.h"
+
+#include <daRg/dag_layout.h>
 
 #include <generic/dag_tabUtils.h>
 #include <gui/dag_stdGuiRender.h>
@@ -46,6 +49,8 @@ void TextBlock::calcNumChars()
     numChars = utf8_strlen(text.c_str());
   else if (type == TBT_LINE_BREAK)
     numChars = 1;
+  else if (type == TBT_COMPONENT)
+    numChars = 1;
   else
   {
     G_ASSERT(0);
@@ -69,7 +74,15 @@ FormattedText::~FormattedText() { clear(); }
 
 void FormattedText::clear()
 {
+  if (isFormatting)
+  {
+    LOGERR_ONCE("daRg textarea: text mutated from inside an embed-size closure; ignored");
+    return;
+  }
+
   lines.clear();
+  freeFragments();
+  embeddedComps.clear();
   for (TextBlock *block : blocks)
     freeTextBlock(block);
   blocks.clear();
@@ -90,8 +103,93 @@ TextBlock *FormattedText::allocateTextBlock()
 void FormattedText::freeTextBlock(TextBlock *block)
 {
   G_ASSERT(block);
+  if (block->type == TextBlock::TBT_COMPONENT)
+  {
+    for (auto it = embeddedComps.begin(); it != embeddedComps.end(); ++it)
+    {
+      if (it->first == block)
+      {
+        embeddedComps.erase(it);
+        break;
+      }
+    }
+  }
   block->~TextBlock();
   textBlockAllocator.freeOneBlock(block);
+}
+
+
+TextBlock *FormattedText::allocateFragment(const TextBlock *src, int begin, int end)
+{
+  TextBlock *frag = allocateTextBlock();
+  frag->type = TextBlock::TBT_TEXT;
+  frag->text.assign(src->text.c_str() + begin, end - begin);
+  frag->fontId = src->fontId;
+  frag->fontHt = src->fontHt;
+  frag->customColor = src->customColor;
+  frag->useCustomColor = src->useCustomColor;
+  fragments.push_back(frag);
+  return frag;
+}
+
+
+void FormattedText::freeFragments()
+{
+  for (TextBlock *frag : fragments)
+    freeTextBlock(frag);
+  fragments.clear();
+}
+
+
+// Same measure as shapeBlock
+static int fit_prefix_len(const TextBlock *block, const StdGuiFontContext &fontCtx, float max_w)
+{
+  const char *text = block->text.c_str();
+  const char *end = text + block->text.length();
+
+  Tab<int> cpEnds(framemem_ptr());
+  for (const char *p = text; p < end;)
+  {
+    utf8::next(p, end);
+    cpEnds.push_back(p - text);
+  }
+  if (cpEnds.empty())
+    return 0;
+
+  int lo = 0, hi = cpEnds.size() - 1;
+  while (lo < hi)
+  {
+    int mid = (lo + hi + 1) / 2;
+    if (StdGuiRender::get_str_bbox(text, cpEnds[mid], fontCtx).right() <= max_w)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  return cpEnds[lo];
+}
+
+
+void FormattedText::setEmbeddedComp(TextBlock *block, Sqrat::Object &&comp)
+{
+  embeddedComps.push_back(eastl::make_pair(block, eastl::move(comp)));
+}
+
+
+Sqrat::Object *FormattedText::getEmbeddedComp(const TextBlock *block)
+{
+  for (auto &p : embeddedComps)
+    if (p.first == block)
+      return &p.second;
+  return nullptr;
+}
+
+
+const Sqrat::Object *FormattedText::getEmbeddedComp(const TextBlock *block) const
+{
+  for (const auto &p : embeddedComps)
+    if (p.first == block)
+      return &p.second;
+  return nullptr;
 }
 
 
@@ -104,7 +202,22 @@ void FormattedText::updateText(const char *text, int len, ITextParams *tp)
 
 void FormattedText::appendText(const char *text, int len, ITextParams *tp)
 {
-  parseAndSplitText(text, len, tp);
+  if (isFormatting) // see clear(): the block list must not change mid-format
+    return;
+
+  parseAndSplitText(blocks, text, len, tp);
+  lastFormatParamsForCurText.reset();
+}
+
+
+void FormattedText::invalidateShapes()
+{
+  for (TextBlock *block : blocks)
+  {
+    // components shapes don't depend on textarea text
+    if (block->type != TextBlock::TBT_COMPONENT)
+      block->hasValidShape = false;
+  }
   lastFormatParamsForCurText.reset();
 }
 
@@ -112,15 +225,15 @@ void FormattedText::appendText(const char *text, int len, ITextParams *tp)
 bool is_space(char chr) { return (chr == ' ') || (chr == '\t'); }
 
 
-E3DCOLOR FormattedText::strToColor(const char *str, int &out_length, bool &out_error)
+bool FormattedText::strToColor(const char *str, const char *end, E3DCOLOR &out_color, int &out_length)
 {
-  out_error = false;
-  const char *finalSymbolPtr = strchr(str, '>');
+  const char *finalSymbolPtr = (str < end) ? (const char *)memchr(str, '>', end - str) : nullptr;
   if (!finalSymbolPtr)
   {
-    out_length = 0;
-    out_error = true;
-    return E3DCOLOR(0, 0, 0, 255);
+    // No closing '>' within the given range; caller keeps out_length<0 as "not a tag".
+    out_length = -1;
+    out_color = E3DCOLOR(0, 0, 0, 255);
+    return false;
   }
 
   out_length = finalSymbolPtr - str;
@@ -128,21 +241,19 @@ E3DCOLOR FormattedText::strToColor(const char *str, int &out_length, bool &out_e
   if (out_length == 8)
   {
     char *endPtr = nullptr;
-    E3DCOLOR res = E3DCOLOR((unsigned int)strtoul(str, &endPtr, 16));
-    out_error = (endPtr != finalSymbolPtr);
-    return res;
+    out_color = E3DCOLOR((unsigned int)strtoul(str, &endPtr, 16));
+    return endPtr == finalSymbolPtr;
   }
   else if (out_length == 6)
   {
     char *endPtr = nullptr;
-    E3DCOLOR res = E3DCOLOR(((unsigned int)strtoul(str, &endPtr, 16)) | 0xFF000000U);
-    out_error = (endPtr != finalSymbolPtr);
-    return res;
+    out_color = E3DCOLOR(((unsigned int)strtoul(str, &endPtr, 16)) | 0xFF000000U);
+    return endPtr == finalSymbolPtr;
   }
   else
   {
-    out_error = true;
-    return E3DCOLOR(0, 0, 0, 255);
+    out_color = E3DCOLOR(0, 0, 0, 255);
+    return false;
   }
 }
 
@@ -174,9 +285,9 @@ static int check_endline(const char *s, bool useTags)
 }
 
 
-void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *tp)
+void FormattedText::parseAndSplitText(Tab<TextBlock *> &output, const char *str, int strLen, ITextParams *tp)
 {
-  const bool useTags = (preformattedFlags & FMT_IGNORE_TAGS) == 0;
+  const bool useTags = (preformattedFlags & FMT_IGNORE_TAGS) == 0 && tp != nullptr;
   const bool keepSpaces = (preformattedFlags & FMT_KEEP_SPACES) != 0;
 
   if (strLen < 0)
@@ -202,7 +313,6 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
     E3DCOLOR fontColor = E3DCOLOR(0, 0, 0, 255);
     short fontId = -1, fontHt = 0;
     bool isDefaultColor = true;
-    bool isSpace = false;
   };
 
   CharAttributes nextBlockAttr;
@@ -213,6 +323,15 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
   if (useTags)
     tp->getUserTags(customTags);
 
+  // One run of consecutive tags (e.g. <a/><b/>) can yield several components before they
+  // are emitted, so queue them rather than keep a single overwritable pending slot.
+  struct PendingEmbed
+  {
+    Sqrat::Object comp;
+    String marker;
+  };
+  eastl::vector<PendingEmbed> pendingEmbeds;
+
   for (int i = 0; i <= strLen;)
   {
     bool endBlockByTag = false;
@@ -221,22 +340,33 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
     {
       while (i < strLen && str[i] == '<') // handle text modifiers
       {
+        if (check_endline(str + i, useTags))
+          break;
+
         bool gotTag = false;
 
         if (STARTS_WITH(str + i, "<color=#"))
         {
-          attrStack.push_back(nextBlockAttr);
-          tagsStack.push_back(strColor);
           int length = 0;
-          bool isError = false;
-          nextBlockAttr.fontColor = strToColor(str + i + 8, length, isError);
+          E3DCOLOR color;
+          const bool ok = strToColor(str + i + 8, str + strLen, color, length);
 
-          if (isError)
-            logerr("parseAndSplitText: syntax error in color constant at pos=%i string='%s'", i, str);
+          if (length < 0)
+            // Unclosed <color=#...> within strLen: keep '<' as literal text.
+            logerr("parseAndSplitText: unclosed <color=#...> at pos=%i string='%s'", i, str);
+          else
+          {
+            attrStack.push_back(nextBlockAttr);
+            tagsStack.push_back(strColor);
+            nextBlockAttr.fontColor = color;
 
-          nextBlockAttr.isDefaultColor = isError;
-          gotTag = true;
-          i += length + 1 + 8;
+            if (!ok)
+              logerr("parseAndSplitText: syntax error in color constant at pos=%i string='%s'", i, str);
+
+            nextBlockAttr.isDefaultColor = !ok;
+            gotTag = true;
+            i += length + 1 + 8;
+          }
         }
         else if (STARTS_WITH(str + i, "<color=@"))
         {
@@ -245,11 +375,15 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
 
           char constName[128];
           int constLen = 0;
-          while (constLen < sizeof(constName) - 1)
+          bool hasClosingBracket = false;
+          while (constLen < sizeof(constName) - 1 && i + constLen + 8 < strLen)
           {
             const char chr = str[i + constLen + 8];
-            if (!chr || chr == '>')
+            if (chr == '>')
+            {
+              hasClosingBracket = true;
               break;
+            }
             constName[constLen++] = chr;
           }
           constName[constLen] = '\0';
@@ -267,21 +401,23 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
             logerr("parseAndSplitText: syntax error in color constant name string='%s'", str);
 
           gotTag = true;
-          i += 8 + constLen + 1;
+          i += 8 + constLen + (hasClosingBracket ? 1 : 0);
         }
         else if (STARTS_WITH(str + i, "<color="))
         {
-          attrStack.push_back(nextBlockAttr);
-          tagsStack.push_back(strColor);
-
-          bool isError = false;
           const char *startPtr = str + i + 7;
-          char *endPtr = nullptr;
-          const char *endOfIntPtr = strchr(startPtr, '>');
+          const char *rangeEnd = str + strLen;
+          const char *endOfIntPtr = (startPtr < rangeEnd) ? (const char *)memchr(startPtr, '>', rangeEnd - startPtr) : nullptr;
           if (!endOfIntPtr)
-            isError = true;
+            // Unclosed <color=...>: keep it as literal text instead of dropping the remainder.
+            logerr("parseAndSplitText: unclosed <color=...> at pos=%i string='%s'", i, str);
           else
           {
+            attrStack.push_back(nextBlockAttr);
+            tagsStack.push_back(strColor);
+
+            bool isError = false;
+            char *endPtr = nullptr;
             long long color = strtoll(startPtr, &endPtr, 10);
             if (endPtr != endOfIntPtr || color > (long long)(UINT_MAX) || color < INT_MIN)
             {
@@ -290,16 +426,14 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
                 color = E3DCOLOR(255, 255, 255, 255);
             }
 
+            if (isError)
+              logerr("parseAndSplitText: syntax error in color constant at pos=%i string='%s'", i, str);
+
             nextBlockAttr.fontColor = uint32_t(color);
-            int length = int(endOfIntPtr - startPtr);
-            i += length + 1 + 7;
+            nextBlockAttr.isDefaultColor = isError;
+            i += int(endOfIntPtr - startPtr) + 1 + 7;
+            gotTag = true;
           }
-
-          if (isError)
-            logerr("parseAndSplitText: syntax error in color constant at pos=%i string='%s'", i, str);
-
-          nextBlockAttr.isDefaultColor = isError;
-          gotTag = true;
         }
         else if (STARTS_WITH(str + i, "</color>"))
         {
@@ -344,7 +478,7 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
                 }
               }
               else
-                logerr("parseAndSplitText: mismatched closing tag %s at pos=%d string='%s'", i, str);
+                logerr("parseAndSplitText: mismatched closing tag %s at pos=%d string='%s'", tagName.c_str(), i, str);
 
               break;
             }
@@ -378,6 +512,36 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
                 logerr("parseAndSplitText: getTagAttr(%s) failed", tagName.c_str());
 
               break;
+            }
+          }
+
+          if (!gotTag)
+          {
+            // Try embedded components
+            // Find tag closing (limited length)
+            int embedEnd = -1;
+            const int maxEmbedNameLen = 128;
+            for (int t = i + 2; embedEnd < 0 && t < strLen - 1 && t <= i + 1 + maxEmbedNameLen; ++t)
+            {
+              if (str[t] == '>') // not an embed
+                break;
+              if (str[t] == '/' && str[t + 1] == '>')
+                embedEnd = t;
+            }
+
+            if (embedEnd > 0)
+            {
+              String tagName(str + i + 1, embedEnd - i - 1);
+              Sqrat::Object comp;
+              if (tp->getEmbeddedComponent(tagName, comp))
+              {
+                gotTag = true;
+                pendingEmbeds.push_back(PendingEmbed{eastl::move(comp), String(str + i, embedEnd + 2 - i)});
+                i = embedEnd + 2;
+              }
+              else
+                // Unknown <foo/>: leave it as literal text instead of swallowing it.
+                logwarn("parseAndSplitText: unknown embedded component <%s/> at pos=%d string='%s'", tagName.c_str(), i, str);
             }
           }
         }
@@ -415,8 +579,20 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
       block->fontId = lastBlockAttr.fontId;
       block->fontHt = lastBlockAttr.fontHt;
 
-      blocks.push_back(block);
+      output.push_back(block);
     }
+
+    for (PendingEmbed &pe : pendingEmbeds)
+    {
+      TextBlock *block = allocateTextBlock();
+
+      block->type = TextBlock::TBT_COMPONENT;
+      block->text = pe.marker.c_str();
+      setEmbeddedComp(block, eastl::move(pe.comp));
+
+      output.push_back(block);
+    }
+    pendingEmbeds.clear();
 
     if (isEndLine)
     {
@@ -428,7 +604,7 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
       block->fontId = lastBlockAttr.fontId;
       block->fontHt = lastBlockAttr.fontHt;
 
-      blocks.push_back(block);
+      output.push_back(block);
     }
 
     if (endOfText)
@@ -449,8 +625,8 @@ void FormattedText::parseAndSplitText(const char *str, int strLen, ITextParams *
 #if DEBUG_TEXTAREA
   String dbgText(str, strLen);
   debug("TextArea: parse: source text = [%s]", dbgText.str());
-  debug("----- Text blocks (%d): -----", blocks.size());
-  for (const TextBlock *block : blocks)
+  debug("----- Text blocks (%d): -----", output.size());
+  for (const TextBlock *block : output)
     debug("(%d) [%s]", block->type, block->text.c_str());
 #endif
 }
@@ -500,18 +676,134 @@ private:
   Tab<TextLine> &lines;
 };
 
+Point2 FormattedText::calcEmbeddedComponentSize(const Sqrat::Object &comp, float def_height)
+{
+  using namespace darg;
+
+  const Point2 defSize(def_height, def_height);
+  HSQUIRRELVM vm = comp.GetVM();
+
+  Sqrat::Table desc;
+  if (comp.GetType() == OT_CLOSURE)
+  {
+    Sqrat::Function f(vm, Sqrat::Object(vm).GetObject(), comp.GetObject());
+    Sqrat::Object result;
+    if (!f.Execute(result))
+    {
+      formatErrorMsg = "Failed to build embedded component";
+      return defSize;
+    }
+    desc = result;
+  }
+  else
+    desc = comp;
+
+  SizeSpec sizeSpec[2];
+  const char *errMsg = nullptr;
+  Sqrat::Object strSize("size", vm, 4);
+  if (!Layout::read_size(desc.RawGetSlot(strSize), sizeSpec, &errMsg))
+  {
+    darg_assert_trace_var(String(0, "Error reading size: %s", errMsg), desc, strSize);
+    return defSize;
+  }
+
+  Point2 resSize = defSize;
+  for (int axis = 0; axis < 2; ++axis)
+  {
+    const SizeSpec &s = sizeSpec[axis];
+    if (s.mode == SizeSpec::PIXELS)
+      resSize[axis] = s.value;
+    else if (s.mode == SizeSpec::FONT_H)
+      resSize[axis] = ceilf(def_height * s.value * 0.01f);
+    else
+    {
+      darg_assert_trace_var("For embedded components only absolute sizes (pixels, fontH) are allowed", desc, strSize);
+      resSize[axis] = def_height;
+    }
+  }
+
+  return resSize;
+}
+
+
+static void resolve_block_font(const TextBlock *block, const FormatParams &params, StdGuiFontContext &fontCtx, float &ascent,
+  float &descent)
+{
+  fontCtx.font = StdGuiRender::get_font(block->fontId);
+  if (!fontCtx.font)
+  {
+    logerr("Invalid fontId=%d in text block '%s'", block->fontId, block->text.c_str());
+    fontCtx.font = StdGuiRender::get_font(params.defFontId);
+  }
+  if (!fontCtx.font)
+    DAG_FATAL("Fonts are broken: block fontId=%d defFontId=%d", block->fontId, params.defFontId);
+  fontCtx.fontHt = block->fontHt;
+
+  ascent = StdGuiRender::get_font_ascent(fontCtx);
+  descent = StdGuiRender::get_font_descent(fontCtx);
+}
+
+
+void FormattedText::shapeBlock(TextBlock *block, const StdGuiFontContext &fontCtx, float ascent, float descent)
+{
+  if (block->hasValidShape)
+    return;
+
+  block->size.y = ascent + descent;
+
+  switch (block->type)
+  {
+    case TextBlock::TBT_TEXT:
+    {
+      BBox2 strBox = StdGuiRender::get_str_bbox(block->text.c_str(), block->text.length(), fontCtx);
+      block->size.x = strBox.right();
+      break;
+    }
+    case TextBlock::TBT_SPACE:
+    {
+      const char *spaces = "  ";
+      BBox2 box1 = StdGuiRender::get_str_bbox(spaces, 2, fontCtx);
+      BBox2 box2 = StdGuiRender::get_str_bbox(spaces, 1, fontCtx);
+      block->size.x = box1.right() - box2.right();
+      break;
+    }
+    case TextBlock::TBT_LINE_BREAK: //
+      block->size.x = 0;
+      break;
+    case TextBlock::TBT_COMPONENT:
+    {
+      Sqrat::Object *comp = getEmbeddedComp(block);
+      block->size = comp ? calcEmbeddedComponentSize(*comp, ascent) : Point2(0, 0);
+      break;
+    }
+    default: //
+      G_ASSERTF(0, "Invalid block type %d", block->type);
+  }
+
+  block->hasValidShape = true;
+}
+
 
 void FormattedText::format(const FormatParams &params)
 {
-  formatErrorMsg.clear();
-
-  const bool lastResultIsStillValid =
-    !hasFormatError() && memcmp(&lastFormatParamsForCurText, &params, sizeof(FormatParams)) == 0; //-V1014
+  const bool lastResultIsStillValid = !hasFormatError() && lastFormatParamsForCurText.isSameCacheKey(params);
 
   if (lastResultIsStillValid)
     return;
 
+  // Any change to a shape-affecting field invalidates every block's cached
+  // block->size; wrap-only changes (maxWidth, spacing/indent) preserve it.
+  const bool shapeInputsChanged =
+    lastFormatParamsForCurText.defFontId != params.defFontId || lastFormatParamsForCurText.defFontHt != params.defFontHt ||
+    lastFormatParamsForCurText.spacing != params.spacing || lastFormatParamsForCurText.monoWidth != params.monoWidth;
+  if (shapeInputsChanged)
+    for (TextBlock *block : blocks)
+      block->hasValidShape = false;
+
   lastFormatParamsForCurText = params;
+  freeFragments();
+
+  formatErrorMsg.clear();
 
   if (!blocks.size())
   {
@@ -526,21 +818,51 @@ void FormattedText::format(const FormatParams &params)
     return;
   }
 
+  struct FormatGuard
+  {
+    bool &flag;
+    bool prev;
+    FormatGuard(bool &f) : flag(f), prev(f) { flag = true; }
+    ~FormatGuard() { flag = prev; }
+  } formatGuard(isFormatting);
+
   StdGuiFontContext fontCtx;
   fontCtx.spacing = params.spacing;
   fontCtx.monoW = params.monoWidth;
 
   const bool allowWrap = (preformattedFlags & FMT_NO_WRAP) == 0;
+  const bool breakLongWords = allowWrap && params.maxWidth > 0 && params.breakLongWords;
 
   // Form lines
 
   LinesBuilder linesBuilder(lines);
 
   TextLine curLine;
+  float curMaxDescent = 0;
   linesBuilder.aquireNextLineBlocksVector(curLine);
   curLine.paragraphStart = true;
   if (lines.empty()) // first format call with no previous data
     curLine.blocks.reserve(::min(blocks.size(), 8u));
+
+  auto startNewLine = [&]() {
+    linesBuilder.pushBack(eastl::move(curLine));
+    curLine.reset();
+    curMaxDescent = 0;
+    linesBuilder.aquireNextLineBlocksVector(curLine);
+  };
+
+  auto appendToLine = [&](TextBlock *block, float ascent, float descent) {
+    curLine.blocks.push_back(block);
+    curLine.contentWidth += block->indent + block->size.x;
+    if (block->type == TextBlock::TBT_COMPONENT)
+      curLine.baseLineY = max(curLine.baseLineY, block->size.y);
+    else
+    {
+      curLine.baseLineY = max(curLine.baseLineY, ascent);
+      curMaxDescent = max(curMaxDescent, descent);
+    }
+    curLine.contentHeight = curLine.baseLineY + curMaxDescent;
+  };
 
   for (int blockIdx = 0; blockIdx < blocks.size(); blockIdx++)
   {
@@ -558,64 +880,60 @@ void FormattedText::format(const FormatParams &params)
         block->fontHt = params.defFontHt;
     }
 
-    fontCtx.font = StdGuiRender::get_font(block->fontId);
-    if (!fontCtx.font)
-    {
-      logerr("Invalid fontId=%d in text block '%s'", block->fontId, block->text.c_str());
-      fontCtx.font = StdGuiRender::get_font(params.defFontId);
-    }
-    if (!fontCtx.font)
-      DAG_FATAL("Fonts are broken: block fontId=%d defFontId=%d", block->fontId, params.defFontId);
-    fontCtx.fontHt = block->fontHt;
-
-    if (block->type == TextBlock::TBT_TEXT)
-    {
-      BBox2 strBox = StdGuiRender::get_str_bbox(block->text.c_str(), block->text.length(), fontCtx);
-      block->size.x = strBox.right();
-    }
-    else if (block->type == TextBlock::TBT_SPACE)
-    {
-      const char *spaces = "  ";
-      BBox2 box1 = StdGuiRender::get_str_bbox(spaces, 2, fontCtx);
-      BBox2 box2 = StdGuiRender::get_str_bbox(spaces, 1, fontCtx);
-      block->size.x = box1.right() - box2.right();
-    }
-    else if (block->type == TextBlock::TBT_LINE_BREAK)
-    {
-      block->size.x = 0;
-    }
-    else
-      G_ASSERTF(0, "Invalid block type %d", block->type);
-
-    float ascent = StdGuiRender::get_font_ascent(fontCtx);
-    float descent = StdGuiRender::get_font_descent(fontCtx);
-    block->size.y = ascent + descent;
+    float ascent, descent;
+    resolve_block_font(block, params, fontCtx, ascent, descent);
+    shapeBlock(block, fontCtx, ascent, descent);
 
     if (allowWrap && params.maxWidth > 0 && curLine.contentWidth > 0 && (curLine.contentWidth + block->size.x > params.maxWidth) &&
         block->type != TextBlock::TBT_LINE_BREAK) // no duplicate line breaks (TODO: review logic)
     {
-      linesBuilder.pushBack(eastl::move(curLine));
-      curLine.reset();
-      linesBuilder.aquireNextLineBlocksVector(curLine);
+      startNewLine();
       block->indent = params.hangingIndent;
     }
 
     if (should_skip_leading_space_block(curLine, block, preformattedFlags))
       continue;
 
+    // Only fragments are edited in place, never parsed blocks.
+    while (breakLongWords && block->type == TextBlock::TBT_TEXT && block->indent + block->size.x > params.maxWidth)
+    {
+      const int headLen = fit_prefix_len(block, fontCtx, params.maxWidth - block->indent);
+      if (headLen <= 0 || headLen >= int(block->text.length()))
+        break;
+
+      TextBlock *head = allocateFragment(block, 0, headLen);
+      head->indent = block->indent;
+      shapeBlock(head, fontCtx, ascent, descent);
+      appendToLine(head, ascent, descent);
+      startNewLine();
+
+      TextBlock *tail;
+      if (block == blocks[blockIdx])
+        tail = allocateFragment(block, headLen, block->text.length());
+      else
+      {
+        tail = block;
+        tail->text.erase(0, headLen);
+        tail->hasValidShape = false;
+      }
+      tail->indent = params.hangingIndent;
+      shapeBlock(tail, fontCtx, ascent, descent);
+      block = tail;
+    }
+
     // add new line block to the _next_ line for consistent cursor positioning
     if (block->type == TextBlock::TBT_LINE_BREAK)
     {
-      linesBuilder.pushBack(eastl::move(curLine));
-      curLine.reset();
-      linesBuilder.aquireNextLineBlocksVector(curLine);
+      if (curLine.blocks.empty())
+      {
+        curLine.baseLineY = max(curLine.baseLineY, ascent);
+        curLine.contentHeight = curLine.baseLineY + max(curMaxDescent, descent);
+      }
+      startNewLine();
       curLine.paragraphStart = true;
     }
 
-    curLine.blocks.push_back(block);
-    curLine.contentWidth += block->indent + block->size.x;
-    curLine.contentHeight = max(curLine.contentHeight, block->size.y);
-    curLine.baseLineY = max(curLine.baseLineY, ascent);
+    appendToLine(block, ascent, descent);
   }
 
   if (curLine.blocks.size())
@@ -657,6 +975,8 @@ void FormattedText::format(const FormatParams &params)
     {
       TextBlock *block = line.blocks[iBlock];
       block->position = Point2(curX + block->indent, curY);
+      if (block->type == TextBlock::TBT_COMPONENT)
+        block->position.y += line.baseLineY - block->size.y;
       curX = block->position.x + block->size.x;
     }
 
@@ -676,14 +996,15 @@ void FormattedText::format(const FormatParams &params)
 }
 
 
-void FormattedText::join(eastl::string &dest)
+void FormattedText::join(eastl::string &dest) const
 {
   dest.clear();
   for (const TextBlock *block : blocks)
   {
     switch (block->type)
     {
-      case TextBlock::TBT_TEXT: dest += block->text; break;
+      case TextBlock::TBT_TEXT:
+      case TextBlock::TBT_COMPONENT: dest += block->text; break;
       case TextBlock::TBT_SPACE: dest += ' '; break;
       case TextBlock::TBT_LINE_BREAK: dest += '\n'; break;
       default: G_ASSERTF(0, "Unexpected block type %d", block->type);

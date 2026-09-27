@@ -15,7 +15,7 @@ static constexpr ecs::ComponentDesc lightning_update_es_comps[] =
   {ECS_HASH("lightning"), ecs::ComponentTypeInfo<LightningFX>()},
   {ECS_HASH("transform"), ecs::ComponentTypeInfo<TMatrix>()},
   {ECS_HASH("lightning__animchars_eids"), ecs::ComponentTypeInfo<ecs::EidList>()},
-//start of 38 ro components at [3]
+//start of 39 ro components at [3]
   {ECS_HASH("lightning__is_volumetric"), ecs::ComponentTypeInfo<bool>()},
   {ECS_HASH("lightning__base_strike_time_interval"), ecs::ComponentTypeInfo<Point2>()},
   {ECS_HASH("lightning__base_sleep_time_interval"), ecs::ComponentTypeInfo<Point2>()},
@@ -53,13 +53,15 @@ static constexpr ecs::ComponentDesc lightning_update_es_comps[] =
   {ECS_HASH("lightning__point_light_color"), ecs::ComponentTypeInfo<Point3>()},
   {ECS_HASH("lightning__scene_illumination_multiplier"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("lightning__scene_illumination_enable_for_flash"), ecs::ComponentTypeInfo<bool>()},
-  {ECS_HASH("lightning__scene_illumination_near_sun_threshold"), ecs::ComponentTypeInfo<float>()}
+  {ECS_HASH("lightning__scene_illumination_near_sun_threshold"), ecs::ComponentTypeInfo<float>()},
+  {ECS_HASH("lightning__cloud_density_check"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL}
 };
 static void lightning_update_es_all(const ecs::UpdateStageInfo &__restrict info, const ecs::QueryView & __restrict components)
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE);
   do
     lightning_update_es(*info.cast<ecs::UpdateStageInfoAct>()
+    , components.manager()
     , ECS_RW_COMP(lightning_update_es_comps, "lightning", LightningFX)
     , ECS_RW_COMP(lightning_update_es_comps, "transform", TMatrix)
     , ECS_RO_COMP(lightning_update_es_comps, "lightning__is_volumetric", bool)
@@ -101,6 +103,7 @@ static void lightning_update_es_all(const ecs::UpdateStageInfo &__restrict info,
     , ECS_RO_COMP(lightning_update_es_comps, "lightning__scene_illumination_enable_for_flash", bool)
     , ECS_RO_COMP(lightning_update_es_comps, "lightning__scene_illumination_near_sun_threshold", float)
     , ECS_RW_COMP(lightning_update_es_comps, "lightning__animchars_eids", ecs::EidList)
+    , ECS_RO_COMP_OR(lightning_update_es_comps, "lightning__cloud_density_check", bool(false))
     );
   while (++comp != compE);
 }
@@ -110,7 +113,7 @@ static ecs::EntitySystemDesc lightning_update_es_es_desc
   "prog/gameLibs/ecs/render/weather_effects/lightningES.cpp.inl",
   ecs::EntitySystemOps(lightning_update_es_all),
   make_span(lightning_update_es_comps+0, 3)/*rw*/,
-  make_span(lightning_update_es_comps+3, 38)/*ro*/,
+  make_span(lightning_update_es_comps+3, 39)/*ro*/,
   empty_span(),
   empty_span(),
   ecs::EventSetBuilder<>::build(),
@@ -183,7 +186,8 @@ static void lightning_created_es_all_events(const ecs::Event &__restrict evt, co
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     lightning_created_es(evt
-        , ECS_RW_COMP(lightning_created_es_comps, "lightning", LightningFX)
+        , components.manager()
+    , ECS_RW_COMP(lightning_created_es_comps, "lightning", LightningFX)
     , ECS_RW_COMP(lightning_created_es_comps, "lightning__animchars_eids", ecs::EidList)
     );
   while (++comp != compE);
@@ -214,9 +218,9 @@ static ecs::CompileTimeQueryDesc get_lightnings_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_lightnings_ecs_query(Callable function)
+inline void get_lightnings_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_lightnings_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_lightnings_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -242,9 +246,9 @@ static ecs::CompileTimeQueryDesc get_animchar_eids_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_animchar_eids_ecs_query(Callable function)
+inline void get_animchar_eids_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_animchar_eids_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_animchar_eids_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -270,9 +274,9 @@ static ecs::CompileTimeQueryDesc disable_lightning_animchar_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void disable_lightning_animchar_ecs_query(ecs::EntityId eid, Callable function)
+inline void disable_lightning_animchar_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, disable_lightning_animchar_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, disable_lightning_animchar_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -300,9 +304,9 @@ static ecs::CompileTimeQueryDesc enable_lightning_animchar_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void enable_lightning_animchar_ecs_query(ecs::EntityId eid, Callable function)
+inline void enable_lightning_animchar_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, enable_lightning_animchar_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, enable_lightning_animchar_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -317,5 +321,5 @@ inline void enable_lightning_animchar_ecs_query(ecs::EntityId eid, Callable func
     }
   );
 }
-static constexpr ecs::component_t animchar__res_get_type(){return ecs::ComponentTypeInfo<eastl::basic_string<char, eastl::allocator>>::type; }
+static constexpr ecs::component_t animchar__res_get_type(){return ecs::ComponentTypeInfo<eastl::basic_string<char>>::type; }
 static constexpr ecs::component_t animchar_render__enabled_get_type(){return ecs::ComponentTypeInfo<bool>::type; }

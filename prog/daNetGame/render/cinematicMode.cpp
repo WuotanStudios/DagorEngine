@@ -10,6 +10,7 @@
 #include <workCycle/dag_workCycle.h>
 #include <drv/3d/dag_info.h>
 #include <render/priorityManagedShadervar.h>
+#include "filmGrain.h"
 
 #define CINEMATIC_MODE_SHADERVARS  \
   VAR(cinematic_mode_on)           \
@@ -39,8 +40,10 @@ CinematicMode::~CinematicMode()
   dagor_set_game_act_rate(getOrigActRate());
   ShaderGlobal::set_int(cinematic_mode_onVarId, 0);
   PriorityShadervar::clear(chromatic_aberration_paramsVarId, CHROMATIC_ABERRATION_PRIORITY);
-  PriorityShadervar::clear(film_grain_paramsVarId, FILM_GRAIN_PRIORITY);
+  if (get_film_grain_mode() == FilmGrainMode::NOISE_BASED)
+    PriorityShadervar::clear(film_grain_paramsVarId, FILM_GRAIN_PRIORITY);
   PriorityShadervar::clear(vignette_strengthVarId, VIGNETTE_PRIORITY);
+  FilmGrainLutHolder::disable_external_modifier();
   reset_default_color_grading();
   videoEncoder.stop();
   videoEncoder.shutdown();
@@ -51,17 +54,21 @@ const CinematicMode::Settings *CinematicMode::getSettings() const { return &sett
 
 void CinematicMode::setVignetteStrength(float strength)
 {
-  PriorityShadervar::set_real(vignette_strengthVarId, VIGNETTE_PRIORITY, strength);
+  PriorityShadervar::set_float(vignette_strengthVarId, VIGNETTE_PRIORITY, strength);
 }
 
 void CinematicMode::setChromaticAberration(Point3 chromatic_aberration)
 {
-  PriorityShadervar::set_color4(chromatic_aberration_paramsVarId, CHROMATIC_ABERRATION_PRIORITY, Point4::xyz0(chromatic_aberration));
+  PriorityShadervar::set_float4(chromatic_aberration_paramsVarId, CHROMATIC_ABERRATION_PRIORITY, Point4::xyz0(chromatic_aberration));
 }
 
-void CinematicMode::setFilmGrain(Point3 film_grain)
+void CinematicMode::setFilmGrain(float strength_mul, Point3 film_grain_noise, Point4 film_grain_lut)
 {
-  PriorityShadervar::set_color4(film_grain_paramsVarId, FILM_GRAIN_PRIORITY, Point4::xyz0(film_grain));
+  film_grain_noise.x *= strength_mul;
+  film_grain_lut.x *= strength_mul;
+  if (get_film_grain_mode() == FilmGrainMode::NOISE_BASED)
+    PriorityShadervar::set_float4(film_grain_paramsVarId, FILM_GRAIN_PRIORITY, Point4::xyz0(film_grain_noise));
+  FilmGrainLutHolder::enable_external_modifier(film_grain_lut);
 }
 
 void CinematicMode::setFps(int fps) { settings.videoSettings.fps = fps; }
@@ -72,8 +79,8 @@ void CinematicMode::setSuperPixels(int super_pixels) { settings.super_pixels = s
 
 void CinematicMode::setLenseFlareIntesity(float intensity)
 {
-  ShaderGlobal::set_real(flare_halo_space_mulVarId, intensity);
-  ShaderGlobal::set_real(flare_ghosts_space_mulVarId, intensity);
+  ShaderGlobal::set_float(flare_halo_space_mulVarId, intensity);
+  ShaderGlobal::set_float(flare_ghosts_space_mulVarId, intensity);
 }
 
 void CinematicMode::toggleLenseFlareCovering(bool use_covering) { flare.toggleCovering(use_covering); }
@@ -86,14 +93,14 @@ void CinematicMode::initLenseFlare(const char *covering_tex_name, const char *re
   flare.init(Point2(scrw / 4.0f, scrh / 4.0f), covering_tex_name, readial_tex_name);
 }
 
-void CinematicMode::renderLenseFlare(ManagedTexView prev_frame_tex)
+void CinematicMode::renderLenseFlare(Texture *prev_frame_tex)
 {
   if (!prev_frame_tex)
   {
     logerr("Lens flare was enabled, but prev_frame_tex was null!");
     return;
   }
-  flare.apply(prev_frame_tex.getTex2D(), prev_frame_tex.getTexId());
+  flare.apply(prev_frame_tex);
 }
 
 void CinematicMode::setOrigActRate(int rate) { settings.origActRate = rate; }

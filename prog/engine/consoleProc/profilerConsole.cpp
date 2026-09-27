@@ -3,6 +3,7 @@
 #include <util/dag_console.h>
 #include <perfMon/dag_statDrv.h>
 #include <perfMon/dag_daProfilerSettings.h>
+
 #include <util/dag_string.h>
 using namespace console;
 
@@ -74,7 +75,21 @@ static bool profiler_console_handler(const char *argv[], int argc)
   SET_SAMPLING(sampling_frequency)
   SET_SAMPLING(sampling_spike_frequency)
   SET_SAMPLING(sampling_thread_mul)
-  CONSOLE_CHECK_NAME("profiler", "dump", 1, 1) { da_profiler::request_dump(); }
+  CONSOLE_CHECK_NAME("profiler", "dump", 1, 1)
+  {
+    da_profiler::request_dump();
+    da_profiler::remove_mode(da_profiler::CONTINUOUS);
+  }
+  CONSOLE_CHECK_NAME("profiler", "dump_dir", 1, 2)
+  {
+    static String dumpDir;
+    if (!dumpDir.empty())
+      da_profiler::stop_file_dump_server(dumpDir);
+    dumpDir = (argc > 1) ? argv[1] : "";
+    if (!dumpDir.empty())
+      da_profiler::start_file_dump_server(dumpDir);
+    console::print_d("profiler dump_dir: %s", dumpDir.empty() ? "none" : dumpDir.c_str());
+  }
   CONSOLE_CHECK_NAME("profiler", "stop", 1, 2)
   {
     if (uint32_t mode = (argc > 1) ? da_profiler::find_profiler_mode(argv[1]) : 0)
@@ -112,6 +127,14 @@ static bool profiler_console_handler(const char *argv[], int argc)
     else
       da_profiler::remove_mode(da_profiler::GPU);
     console::print_d("switched %s", (da_profiler::get_current_mode() & da_profiler::GPU) ? "on" : "off");
+  }
+  CONSOLE_CHECK_NAME("profiler", "platform", 1, 2)
+  {
+    if ((argc > 1) ? to_bool(argv[1]) : !(da_profiler::get_current_mode() & da_profiler::PLATFORM_EVENTS))
+      da_profiler::add_mode(da_profiler::EVENTS | da_profiler::PLATFORM_EVENTS);
+    else
+      da_profiler::remove_mode(da_profiler::PLATFORM_EVENTS);
+    console::print_d("switched %s", (da_profiler::get_current_mode() & da_profiler::PLATFORM_EVENTS) ? "on" : "off");
   }
   CONSOLE_CHECK_NAME("profiler", "enabled", 1, 2)
   {

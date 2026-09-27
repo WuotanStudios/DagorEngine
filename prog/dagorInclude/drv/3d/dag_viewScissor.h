@@ -5,11 +5,12 @@
 #pragma once
 
 #include <generic/dag_span.h>
+#include <drv/3d/dag_multi_interface.h>
 
 struct ScissorRect;
 struct Viewport;
 
-namespace d3d
+namespace d3d _MULTI_INTERFACE
 {
 /**
  * @brief Set scissor for the current render target. Part of the render target that is outside the scissor rectangle is not rendered.
@@ -66,7 +67,7 @@ bool setviews(dag::ConstSpan<Viewport> viewports);
  * @return true if the view rectangle was retrieved successfully
  */
 bool getview(int &x, int &y, int &w, int &h, float &minz, float &maxz);
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 #if _TARGET_D3D_MULTI
 #include <drv/3d/dag_interface_table.h>
@@ -79,3 +80,11 @@ inline bool setviews(dag::ConstSpan<Viewport> viewports) { return d3di.setviews(
 inline bool getview(int &x, int &y, int &w, int &h, float &minz, float &maxz) { return d3di.getview(x, y, w, h, minz, maxz); }
 } // namespace d3d
 #endif
+
+namespace d3d
+{
+inline bool setviewscissor(int x, int y, int w, int h, float minz = 0, float maxz = 1)
+{
+  return setview(x, y, w, h, minz, maxz) && setscissor(x, y, w, h);
+}
+} // namespace d3d

@@ -21,10 +21,27 @@ namespace shaders
 struct RenderState;
 }
 
+struct RefinedBlockLayoutBindumpEntry
+{
+  bindump::string varName;
+  int cbufOffset = -1;
+  int slotCount = -1;
+  int slot[STAGE_MAX] = {-1, -1, -1};
+  int space = -1;
+};
+
+struct BindumpRefinedBlockLayout
+{
+  int cache_sign = -1;
+  int cache_version = -1;
+  bindump::vector<RefinedBlockLayoutBindumpEntry> vars;
+};
+
 struct ShadersBindump
 {
   SerializableTab<ShaderGlobal::Var> variable_list;
   SerializableTab<Sampler> static_samplers;
+  SerializableTab<ImmutableSamplerRef> immutable_samplers;
   IntervalList intervals;
   bindump::Ptr<ShaderStateBlock> empty_block;
   SerializableTab<ShaderStateBlock *> state_blocks;
@@ -32,6 +49,8 @@ struct ShadersBindump
   SerializableTab<shaders::RenderState> renderStates;
   SerializableTab<TabFsh> shadersFsh;
   SerializableTab<TabVpr> shadersVpr;
+  SerializableTab<TabShaderMetadata> shadersFshMetadata;
+  SerializableTab<TabShaderMetadata> shadersVprMetadata;
   SerializableTab<TabStcode> shadersStcode;
   SerializableTab<CryptoHash> dynamicCppcodeHashes;
   SerializableTab<CryptoHash> staticCppcodeHashes;
@@ -39,6 +58,9 @@ struct ShadersBindump
   SerializableTab<bindump::string> staticCppcodeRoutineNames;
   SerializableTab<SerializableTab<int32_t>> cppcodeRegisterTables;
   SerializableTab<int32_t> cppcodeRegisterTableOffsets;
+  SerializableTab<shc::SerializedRefinedBlockVar> refinedBlockVars;
+  SerializableTab<int32_t> refinedBlockComputedStcode;
+  SerializableTab<char> refinedBlockComputedCppExprs;
 
   // Only used if shc::config().generateCppStcodeValidationData
   SerializableTab<shader_layout::StcodeConstValidationMask *> stcodeConstMasks{};
@@ -51,6 +73,8 @@ struct ShadersBindumpHeader
   BlkHashBytes last_blk_hash = {};
   bindump::EnableHash<ShadersBindump> hash;
   bindump::vector<bindump::string> dependency_files;
+  BindumpRefinedBlockLayout refined_block_layout;
+  SerializableTab<bindump::string> usedSepDebugInfoNames;
 };
 
 struct CompressedShadersBindump : ShadersBindumpHeader
@@ -64,8 +88,8 @@ void close_shader_class();
 
 void add_shader_class(ShaderClass *sc, shc::TargetContext &ctx);
 
-int add_fshader(dag::ConstSpan<unsigned> code, shc::TargetContext &ctx);
-int add_vprog(dag::ConstSpan<unsigned> vs, dag::ConstSpan<unsigned> hs, dag::ConstSpan<unsigned> ds, dag::ConstSpan<unsigned> gs,
+int add_fshader(const ShaderStageData &code, shc::TargetContext &ctx);
+int add_vprog(const ShaderStageData &vs, const ShaderStageData &hs, const ShaderStageData &ds, const ShaderStageData &gs,
   shc::TargetContext &ctx);
 int add_render_state(const SemanticShaderPass &state, shc::TargetContext &ctx);
 
@@ -76,7 +100,8 @@ void add_stcode_validation_mask(int stcode_id, shader_layout::StcodeConstValidat
 void count_shader_stats(unsigned &uniqueFshBytesInFile, unsigned &uniqueFshCountInFile, unsigned &uniqueVprBytesInFile,
   unsigned &uniqueVprCountInFile, unsigned &stcodeBytes, const shc::TargetContext &ctx);
 
-bool load_shaders_bindump(ShadersBindump &shaders, bindump::IReader &full_file_reader, shc::TargetContext &ctx);
+bool load_shaders_bindump(ShadersBindump &shaders, ShadersBindumpHeader &header, bindump::IReader &full_file_reader,
+  shc::TargetContext &ctx);
 bool link_scripted_shaders(const uint8_t *mapped_data, int data_size, const char *filename, const char *source_name,
   shc::TargetContext &ctx);
 void save_scripted_shaders(const char *filename, dag::ConstSpan<SimpleString> files, shc::TargetContext &ctx,
@@ -96,8 +121,7 @@ struct VertexProgramAndPixelShaderIdents
   int vprog;
   int fsh;
 };
-VertexProgramAndPixelShaderIdents add_phase_one_progs(dag::ConstSpan<unsigned> vs, dag::ConstSpan<unsigned> hs,
-  dag::ConstSpan<unsigned> ds, dag::ConstSpan<unsigned> gs, dag::ConstSpan<unsigned> ps,
-  SemanticShaderPass::EnableFp16State enableFp16, shc::TargetContext &ctx);
+VertexProgramAndPixelShaderIdents add_phase_one_progs(ShaderStageData vs, ShaderStageData hs, ShaderStageData ds, ShaderStageData gs,
+  ShaderStageData ps, SemanticShaderPass::EnableFp16State enableFp16, shc::TargetContext &ctx);
 void recompile_shaders(shc::TargetContext &ctx);
 #endif

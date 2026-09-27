@@ -5,7 +5,7 @@
 #include <backend/resourceScheduling/barrierScheduler.h>
 #include <drv/3d/dag_renderPass.h>
 #include <id/idIndexedFlags.h>
-#include <common/cycAlloc.h>
+#include <id/idSparseIndexedMapping.h>
 
 #include <ska_hash_map/flat_hash_map2.hpp>
 
@@ -52,7 +52,7 @@ struct BeginRenderPass
 {
   d3d::RenderPass *rp;
   dag::RelocatableFixedVector<Attachment, 9> attachments;
-  eastl::optional<Attachment> vrsRateAttachment; // TODO: remove me when NRPs support VRS rate attachments
+  bool useVrs;
 };
 
 struct NextSubpass
@@ -69,9 +69,7 @@ struct PassChange
 
 using RenderPassDelta = eastl::variant<PassChange, NextSubpass>;
 
-class DeltaCalculator;
-using Alloc = CycAlloc<DeltaCalculator>;
-using BindingsMap = dag::FixedVectorMap<int, intermediate::Binding, 8, true, Alloc>;
+using BindingsMap = dag::FixedVectorMap<int, intermediate::Binding, 8, true>;
 
 struct NodeStateDelta
 {
@@ -86,13 +84,12 @@ struct NodeStateDelta
   ShaderBlockLayersInfoDelta shaderBlockLayers;
 };
 
-using NodeStateDeltas = IdIndexedMapping<intermediate::NodeIndex, NodeStateDelta, Alloc>;
+using NodeStateDeltas = IdSparseIndexedMapping<intermediate::NodeIndex, NodeStateDelta>;
 
 struct RPsDescKey
 {
   dag::RelocatableFixedVector<RenderPassTargetDesc, 8> targets;
   dag::RelocatableFixedVector<RenderPassBind, 16> binds;
-  uint32_t subpassBindingOffset;
 
   bool operator==(const RPsDescKey &other) const = default;
 };
@@ -106,7 +103,6 @@ public:
 
     hash_combine(result, rpDesc.targets.size());
     hash_combine(result, rpDesc.binds.size());
-    hash_combine(result, rpDesc.subpassBindingOffset);
 
     for (auto &prTarget : rpDesc.targets)
       hash_combine(result, (*this)(prTarget));
@@ -148,11 +144,26 @@ class DeltaCalculator
 public:
   DeltaCalculator(const intermediate::Graph &graph);
 
-  NodeStateDeltas calculatePerNodeStateDeltas(const BarrierScheduler::EventsCollectionRef &events);
+  void calculatePerNodeStateDeltas(NodeStateDeltas &result, const BarrierScheduler::EventsCollection &events,
+    const IdIndexedFlags<intermediate::NodeIndex, framemem_allocator> &nodes_changed,
+    const IdIndexedFlags<intermediate::ResourceIndex, framemem_allocator> &resources_changed,
+    const IdIndexedFlags<intermediate::ResourceIndex, framemem_allocator> &resource_requests_changed);
 
   // On some platforms, driver objects can have internal caches and aggregate
   // too much elements over time, so wiping at an opportune time is a good idea.
-  void invalidateCaches() { rpCache.clear(); }
+  // Only evicts cache entries whose attachments depend on the given auto-res type,
+  // so that passes targeting unrelated resolutions keep their cached render passes.
+  void invalidateCachesForAutoResType(AutoResTypeNameId id);
+
+  void resetIncrementalState()
+  {
+    rpCache.clear();
+    rpCacheKeysByAutoResType.clear();
+    firstActivationPosition.clear();
+    firstAccessPosition.clear();
+    baseInitialized.clear();
+    cachedForcePassBreak.clear();
+  }
 
 private:
   // Use this overload set to add special processing for fields
@@ -168,7 +179,7 @@ private:
     const eastl::optional<shaders::OverrideState> &) const;
 
   RenderPassDelta delta(const eastl::optional<intermediate::RenderPass> &current,
-    const eastl::optional<intermediate::RenderPass> &previous);
+    const eastl::optional<intermediate::RenderPass> &previous, uint16_t schedule_position);
 
   sd::BindingsMap delta(const intermediate::BindingsMap &old_binding, const intermediate::BindingsMap &new_binding) const;
 
@@ -182,14 +193,46 @@ private:
     const eastl::optional<intermediate::IndexSource> &new_source) const;
 
   NodeStateDelta getStateDelta(const intermediate::RequiredNodeState &first, const intermediate::RequiredNodeState &second,
-    bool force_pass_break);
+    bool force_pass_break, uint16_t schedule_position);
+
+  IdIndexedFlags<intermediate::ResourceIndex, framemem_allocator> precomputeResourceState(
+    const BarrierScheduler::EventsCollection &events,
+    const IdIndexedFlags<intermediate::ResourceIndex, framemem_allocator> &resources_changed,
+    const IdIndexedFlags<intermediate::ResourceIndex, framemem_allocator> &resource_requests_changed);
+
+  IdIndexedFlags<intermediate::NodeIndex> computeDirtyDeltas(const NodeStateDeltas &result,
+    const BarrierScheduler::EventsCollection &events, const IdIndexedFlags<intermediate::NodeIndex, framemem_allocator> &nodes_changed,
+    const IdIndexedFlags<intermediate::ResourceIndex, framemem_allocator> &dirty_resources);
+
+  void recalculateUsedRenderPasses(const NodeStateDeltas &result);
 
 private:
   const intermediate::Graph &graph;
   ska::flat_hash_map<RPsDescKey, eastl::unique_ptr<d3d::RenderPass, RpDestroyer>, RPDescHasher> rpCache;
+  ska::flat_hash_set<d3d::RenderPass *> usedRenderPasses;
+  // Reverse index: for each auto-res type, the set of rpCache keys whose attachments
+  // reference a resource of that type. Populated on cache insertion, consumed by
+  // invalidateCachesForAutoResType to do targeted eviction.
+  IdIndexedMapping<AutoResTypeNameId, ska::flat_hash_set<RPsDescKey, RPDescHasher>> rpCacheKeysByAutoResType;
   const char *nodeName = "";
-  IdIndexedFlags<intermediate::ResourceIndex> resourceInitialized;
-  IdIndexedFlags<intermediate::ResourceIndex> resourceAccessed;
+
+  // Schedule-order position of the first activation / untracked first use
+  // event for each resource.
+  // UINT16_MAX = no activation (may still be initialized from resource type).
+  // Persists across compiles: precomputeResourceState snapshots it before recomputing,
+  // so the prior value is available for change detection.
+  IdIndexedMapping<intermediate::ResourceIndex, uint16_t> firstActivationPosition;
+
+  // Schedule-order position of first render pass attachment access for each resource.
+  // UINT16_MAX = never accessed as attachment. Persistence as above.
+  IdIndexedMapping<intermediate::ResourceIndex, uint16_t> firstAccessPosition;
+
+  // Base initialization: true for external, driverDeferred, ClearStage::Activation
+  // resources. Persistence as above.
+  IdIndexedFlags<intermediate::ResourceIndex> baseInitialized;
+
+  // Cached state for incremental dirty detection.
+  IdIndexedFlags<intermediate::NodeIndex> cachedForcePassBreak;
 };
 
 } // namespace dafg::sd

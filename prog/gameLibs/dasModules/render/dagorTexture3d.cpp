@@ -18,7 +18,15 @@ G_STATIC_ASSERT(D3DRESID::INVALID_ID == 0u);
 struct D3DRESIDAnnotation final : das::ManagedValueAnnotation<D3DRESID>
 {
   D3DRESIDAnnotation(das::ModuleLibrary &ml) : ManagedValueAnnotation(ml, "D3DRESID") { cppName = " ::D3DRESID"; }
-  virtual void walk(das::DataWalker &walker, void *data) override { walker.UInt(*reinterpret_cast<unsigned *>(data)); }
+  virtual void walk(das::DataWalker &walker, void *data) override
+  {
+    if (walker.collecting)
+    {
+      das::ManagedValueAnnotation<D3DRESID>::walk(walker, data);
+      return;
+    }
+    walker.UInt(*reinterpret_cast<unsigned *>(data));
+  }
   virtual bool hasNonTrivialCtor() const override { return false; }
   virtual bool hasNonTrivialCopy() const override { return false; }
   virtual bool hasNonTrivialDtor() const override { return false; }
@@ -71,13 +79,13 @@ public:
   {
     das::ModuleLibrary lib(this);
 
-    addEnumeration(das::make_smart<EnumerationD3DResourceType>());
+    addEnumeration(new EnumerationD3DResourceType());
 
-    addAnnotation(das::make_smart<D3DRESIDAnnotation>(lib));
-    addAnnotation(das::make_smart<TextureInfoAnnotation>(lib));
-    addAnnotation(das::make_smart<BaseTextureAnnotation>(lib));
-    addAnnotation(das::make_smart<SbufferAnnotation>(lib));
-    addAnnotation(das::make_smart<TextureFactoryAnnotation>(lib));
+    addAnnotation(new D3DRESIDAnnotation(lib));
+    addAnnotation(new TextureInfoAnnotation(lib));
+    addAnnotation(new BaseTextureAnnotation(lib));
+    addAnnotation(new SbufferAnnotation(lib));
+    addAnnotation(new TextureFactoryAnnotation(lib));
 
     // ensure that resid is actually zero-inited, in case anyone decides to
     // change that -- required for the type to work as a value inside das

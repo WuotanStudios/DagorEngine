@@ -1,8 +1,9 @@
 #include "daScript/misc/platform.h"
 
 #include "daScript/simulate/runtime_string.h"
+#include "daScript/simulate/aot_builtin_string.h"
 #include "daScript/simulate/simulate.h"
-#include "daScript/simulate/hash.h"
+#include "daScript/simulate/aot.h"
 #include "daScript/simulate/debug_print.h"
 #include "daScript/simulate/runtime_string_delete.h"
 #include "daScript/simulate/simulate_nodes.h"
@@ -20,23 +21,48 @@ namespace das
     void das_throw(const char * msg) {
         if ( *g_throwBuf ) {
             *g_throwMsg = msg;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Walign-mismatch"  // mingw jmp_buf alignment
+#endif
             longjmp(**g_throwBuf,1);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
         } else {
             DAS_FATAL_ERROR("unhanded das_throw, %s\n", msg);
         }
     }
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable:4611)  // setjmp + C++ object destruction
+#endif
     void das_trycatch(callable<void()> tryBody, callable<void(const char * msg)> catchBody) {
-        DAS_ASSERTF(*g_throwBuf==nullptr, "das_trycatch without g_throwBuf");
+        // re-entrant: save/restore the outer frame so das_trycatch can nest (e.g. a fmt
+        // error raised while already formatting another value) — #2570. prevBuf is set
+        // before setjmp and never touched after, so it survives the longjmp.
+        jmp_buf * prevBuf = *g_throwBuf;
         jmp_buf ev;
         *g_throwBuf = &ev;
         if ( !setjmp(ev) ) {
             tryBody();
+            *g_throwBuf = prevBuf;
         } else {
-            *g_throwBuf = nullptr;
+            *g_throwBuf = prevBuf;
             catchBody(g_throwMsg->c_str());
         }
-        *g_throwBuf = nullptr;
+    }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    #else
+
+    // DAS_ENABLE_EXCEPTIONS=1: route das_throw through the project's exception class
+    // so catch (dasException&) handlers picked up by simulate_exceptions.cpp catch
+    // C++-side throws from low-level headers (daslang_hash_map::at, etc.) too.
+    void das_throw(const char * msg) {
+        throw dasException(msg ? msg : "", LineInfo());
     }
     #endif
 
@@ -52,17 +78,25 @@ namespace das
         *head++ = '}'; *head = 0;
 #if DAS_ENABLE_EXCEPTIONS
         try {
-            auto result = fmt::format_to(buf, fmt::runtime(ffmt), value);
-            *result = 0;
-            writer.writeStr(buf, result - buf);
+            auto result = fmt::format_to_n(buf, sizeof(buf)-1, fmt::runtime(ffmt), value);
+            auto len = result.size < sizeof(buf) ? result.size : sizeof(buf)-1;
+            buf[len] = 0;
+            writer.writeStr(buf, len);
+            if ( result.size >= sizeof(buf) ) {
+                context->throw_error_at(at, "fmt overflow, output truncated to %d characters", int(sizeof(buf)-1));
+            }
         } catch ( const std::exception & e ) {
             context->throw_error_at(at, "fmt error: %s", e.what());
         }
 #else
         das_trycatch([&]{
-            auto result = fmt::format_to(buf, fmt::runtime(ffmt), value);
-            *result = 0;
-            writer.writeStr(buf, result - buf);
+            auto result = fmt::format_to_n(buf, sizeof(buf)-1, fmt::runtime(ffmt), value);
+            auto len = result.size < sizeof(buf) ? result.size : sizeof(buf)-1;
+            buf[len] = 0;
+            writer.writeStr(buf, len);
+            if ( result.size >= sizeof(buf) ) {
+                context->throw_error_at(at, "fmt overflow, output truncated to %d characters", int(sizeof(buf)-1));
+            }
         },[&](const char * e){
             context->throw_error_at(at, "fmt error: %s", e);
         });
@@ -113,9 +147,13 @@ namespace das
         *head++ = '}'; *head = 0;
 #if DAS_ENABLE_EXCEPTIONS
         try {
-            auto result = fmt::format_to(buf, fmt::runtime(ffmt), value);
-            *result= 0;
-            return context->allocateString(buf, uint32_t(result-buf), at);
+            auto result = fmt::format_to_n(buf, sizeof(buf)-1, fmt::runtime(ffmt), value);
+            auto len = result.size < sizeof(buf) ? result.size : sizeof(buf)-1;
+            buf[len] = 0;
+            if ( result.size >= sizeof(buf) ) {
+                context->throw_error_at(at, "fmt overflow, output truncated to %d characters", int(sizeof(buf)-1));
+            }
+            return context->allocateString(buf, uint32_t(len), at);
         } catch (const std::exception & e) {
             context->throw_error_at(at, "fmt error: %s", e.what());
             return nullptr;
@@ -123,9 +161,13 @@ namespace das
 #else
     char * return_value = nullptr;
     das_trycatch([&]{
-        auto result = fmt::format_to(buf, fmt::runtime(ffmt), value);
-        *result= 0;
-        return_value = context->allocateString(buf, uint32_t(result-buf), at);
+        auto result = fmt::format_to_n(buf, sizeof(buf)-1, fmt::runtime(ffmt), value);
+        auto len = result.size < sizeof(buf) ? result.size : sizeof(buf)-1;
+        buf[len] = 0;
+        if ( result.size >= sizeof(buf) ) {
+            context->throw_error_at(at, "fmt overflow, output truncated to %d characters", int(sizeof(buf)-1));
+        }
+        return_value = context->allocateString(buf, uint32_t(len), at);
     },[&](const char * e){
         context->throw_error_at(at, "fmt error: %s", e);
     });
@@ -217,6 +259,13 @@ namespace das
         return das_lexical_cast_fp_T(x, __context__, at);
     }
 
+    // temp-string reclaim wrapper: the compiler inserts this around a [temp_string_result] call
+    // whose result dies in the consuming call - the fresh string rides the 1-slot dispose queue
+    char * das_temp_string_result ( char * str, Context * __context__, LineInfoArg * at ) {
+        __context__->freeTempString(str, at);
+        return str;
+    }
+
     // string operations
 
     vec4f SimPolicy_String::Add ( vec4f a, vec4f b, Context & context, LineInfo * at ) {
@@ -260,9 +309,9 @@ namespace das
 
     // helper functions
 
-    const char * rts_null = "";
+    DAS_API const char * rts_null = "";
 
-    int hexChar ( char ch ) {
+    static int hexChar ( char ch ) {
         if ( ch>='a' && ch<='f' ) {
             return ch - 'a' + 10;
         } else if ( ch>='A' && ch<='F' ) {
@@ -275,7 +324,7 @@ namespace das
     }
 
 
-    bool encodeUtf8Char(uint32_t ch, char * result) {
+    static bool encodeUtf8Char(uint32_t ch, char * result) {
 
       if (ch <= 0x7F) {
           result[0] = char(ch);
@@ -435,13 +484,13 @@ namespace das
         return result;
     }
 
-    string getFewLines ( const char* st, uint32_t stlen, int ROW, int COL, int /*LROW*/, int LCOL, int TAB ) {
+    static string getFewLines ( const char* st, uint32_t stlen, int ROW, int COL, int /*LROW*/, int LCOL, int TAB ) {
         TextWriter text;
         int col=0, row=1;
         auto it = st;
         auto itend = st + stlen;
         if ( ROW>1 ) {
-            while ( *it && it!=itend ) {
+            while ( it!=itend && *it ) {
                 auto CH = *it++;
                 if ( CH=='\n' ) {
                     row++;
@@ -453,7 +502,7 @@ namespace das
         if ( row!=ROW ) return "";
         auto beginOfLine = it;
         for (;;) {
-            if (*it == 0 || it == itend)
+            if (it == itend || *it == 0)
             {
                 text << "\n";
                 break;
@@ -478,7 +527,7 @@ namespace das
         }
         it = beginOfLine;
         const char * tail = it + COL;
-        while ( *it && it!=tail && it!=itend ) {
+        while ( it!=tail && it!=itend && *it ) {
             auto CH = *it++;
             if ( CH=='\t' ) {
                 int tcol = (col + TAB) & ~(TAB-1);
@@ -503,9 +552,11 @@ namespace das
         else if ( val==-DBL_MIN ) return "(-DBL_MIN)";
         else if ( val==DBL_MAX ) return "DBL_MAX";
         else if ( val==-DBL_MAX ) return "(-DBL_MAX)";
+        else if ( isinf(val) ) return val > 0 ? "((double)INFINITY)" : "((double)(-INFINITY))";
+        else if ( isnan(val) ) return "((double)NAN)";
         else {
             char buf[256];
-            auto result = fmt::format_to(buf, FMT_STRING("{:e}"), val);
+            auto result = fmt::format_to(buf, FMT_STRING("{:.17e}"), val);
             *result = 0;
             return buf;
         }
@@ -535,9 +586,22 @@ namespace das
         else if ( val==-FLT_MIN ) return "(-FLT_MIN)";
         else if ( val==FLT_MAX ) return "FLT_MAX";
         else if ( val==-FLT_MAX ) return "(-FLT_MAX)";
+        else if ( isinf(val) ) return val > 0 ? "INFINITY" : "(-INFINITY)";
+        else if ( isnan(val) ) return "NAN";
         else {
             char buf[256];
-            auto result = fmt::format_to(buf, FMT_STRING("{:e}f"), val);
+            // {:e} defaults to %e semantics (6 digits after decimal = 7 sig figs
+            // total), which is below FLT_DECIMAL_DIG=9 — the minimum precision
+            // C++ guarantees for an exact float→text→float roundtrip. Without
+            // 9 sig figs the AOT-emitted literal can parse back to a float that
+            // differs from the value the interpreter/JIT computes at runtime,
+            // shifting boundary cases by 1 ULP. Surfaced as a tests/language/
+            // random_numbers.das failure on the mingw AOT worker: emitting
+            // 1.0f/32767.0f as "3.051851e-05f" reparses slightly high, so
+            // 32767.0f * F rounds to exactly 1.0f and the test's f < 1.0
+            // assertion flips. {:.8e} gives 9 sig figs, matching to_cpp_double's
+            // {:.17e} (= DBL_DECIMAL_DIG=17).
+            auto result = fmt::format_to(buf, FMT_STRING("{:.8e}f"), val);
             *result = 0;
             return buf;
         }
@@ -587,9 +651,6 @@ namespace das
         uint64_t length = writer.tellp();
         if ( length ) {
             auto pStr = context.allocateString(writer.c_str(), uint32_t(length), &debugInfo, isTempString);
-            if ( !pStr  ) {
-                context.throw_out_of_memory(true, uint32_t(length), &debugInfo);
-            }
             if ( isTempString ) context.freeTempString(pStr, &debugInfo);
             return cast<char *>::from(pStr);
         } else {
@@ -625,7 +686,6 @@ namespace das
         vec4f ll = source->eval(context);
         char * str = cast<char *>::to(ll);
         char * iter = context.allocateIterator(sizeof(StringIterator),"string iterator", &debugInfo);
-        if ( !iter ) context.throw_out_of_memory(false, sizeof(StringIterator)+16, &debugInfo);
         new (iter) StringIterator(str, &debugInfo);
         return cast<char *>::from(iter);
     }

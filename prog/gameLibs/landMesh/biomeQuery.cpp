@@ -58,6 +58,7 @@ public:
   void afterDeviceReset();
   int query(const Point3 &world_pos, const float radius);
   GpuReadbackResultState getQueryResult(int query_id, BiomeQueryResult &result);
+  void cancelQuery(int query_id);
   int getBiomeGroup(int biome_id);
   int getBiomeGroupId(const char *biome_group_name);
   const char *getBiomeGroupName(int biome_group_id);
@@ -69,7 +70,7 @@ private:
   float minSampleScaleRadius = MIN_SAMPLE_SCALE_RADIUS_TEXEL_SPACE;
   Tab<int> biomeGroupIndices;
   FastNameMap biomeGroupNameMap;
-  UniqueBufHolder biomeGroupIndicesBuffer;
+  UniqueBufWithShaderVar biomeGroupIndicesBuffer;
   int numBiomeGroups = 0;
   Sbuffer *detailsCB = 0;
 #if DEBUG_DRAW_QUERIES
@@ -89,31 +90,21 @@ static int console_query_id = -1;
 static int console_query_elapsed_frames = 0;
 #endif
 
+static bool get_int_slot(const char *name, int &out)
+{
+  if (ShaderGlobal::get_int_by_name(name, out))
+    return true;
+  logerr("BiomeQuery: Could not find shader variable \"%s\"", name);
+  return false;
+}
+
 bool BiomeQueryCtx::init()
 {
-  int resultBufferSlot = -1;
-  if (!ShaderGlobal::get_int_by_name("biome_query_results_buf_slot", resultBufferSlot))
-  {
-    logerr("BiomeQuery: Could not find shader variable \"biome_query_results_buf_slot\"");
+  int resultBufferSlot = -1, resultsOffsetSlot = -1;
+  if (!get_int_slot("biome_query_results_buf_slot", resultBufferSlot) ||
+      !get_int_slot("biome_results_offset_slot", resultsOffsetSlot) || !get_int_slot("num_biome_groups_slot", num_biome_groups_slot) ||
+      !get_int_slot("landmesh_indexed_landclass_lc_ps_details_cb_register", details_cb_slot))
     return false;
-  }
-  int resultsOffsetSlot = -1;
-  if (!ShaderGlobal::get_int_by_name("biome_results_offset_slot", resultsOffsetSlot))
-  {
-    logerr("BiomeQuery: Could not find shader variable \"biome_results_offset_slot\"");
-    return false;
-  }
-  if (!ShaderGlobal::get_int_by_name("num_biome_groups_slot", num_biome_groups_slot))
-  {
-    logerr("BiomeQuery: Could not find shader variable \"num_biome_groups_slot\"");
-    return false;
-  }
-
-  if (!ShaderGlobal::get_int_by_name("landmesh_indexed_landclass_lc_ps_details_cb_register", details_cb_slot))
-  {
-    logerr("BiomeQuery: Could not find shader variable \"landmesh_indexed_landclass_lc_ps_details_cb_register\"");
-    return false;
-  }
 
   GpuReadbackQuerySystemDescription grqsDesc;
   grqsDesc.maxQueriesPerFrame = MAX_BIOME_QUERIES_PER_FRAME;
@@ -132,7 +123,8 @@ bool BiomeQueryCtx::init()
     return false;
   }
 
-  biomeGroupIndicesBuffer = dag::buffers::create_persistent_sr_structured(sizeof(int), MAX_BIOMES, "biome_group_indices_buffer");
+  biomeGroupIndicesBuffer = dag::buffers::create_persistent_sr_structured(sizeof(int), MAX_BIOMES, "biome_group_indices_buffer",
+    d3d::buffers::Init::No, RESTAG_LAND);
   setBiomeGroupIndicesBufferData();
 
   return true;
@@ -154,6 +146,12 @@ void biome_query::init()
   }
 }
 
+bool biome_query::is_inited()
+{
+  BIOME_QUERY_BLOCK;
+  return biome_query_ctx != nullptr;
+}
+
 void BiomeQueryCtx::initLandClass(TEXTUREID lc_texture, float tile, dag::ConstSpan<const char *> biome_group_names,
   dag::ConstSpan<int> biome_group_indices)
 {
@@ -170,7 +168,7 @@ void BiomeQueryCtx::initLandClass(TEXTUREID lc_texture, float tile, dag::ConstSp
   G_ASSERT(biomeTexInfo.w == biomeTexInfo.h);
 
   minSampleScaleRadius = (1.0f / (tile * biomeTexInfo.w)) * MIN_SAMPLE_SCALE_RADIUS_TEXEL_SPACE;
-  ShaderGlobal::set_real(minSampleScaleRadiusVarId, minSampleScaleRadius);
+  ShaderGlobal::set_float(minSampleScaleRadiusVarId, minSampleScaleRadius);
 
   numBiomeGroups = min<int>(MAX_BIOME_GROUPS, biome_group_names.size());
   G_ASSERT(numBiomeGroups <= MAX_BIOME_GROUPS);
@@ -383,7 +381,7 @@ GpuReadbackResultState BiomeQueryCtx::getQueryResult(int query_id, BiomeQueryRes
       grqSystem->getQueryInput(query_id, qInput);
       logmessage(DAGOR_DBGLEVEL > 0 ? LOGLEVEL_ERR : LOGLEVEL_WARN,
         "Biome query result is out of range! firstIdx: %d, secondIdx: %d, maxIdx: %d, pos (%f %f %f),  radius %f", firstIdx, secondIdx,
-        maxIdx, qInput.worldPos.x, maxIdx, qInput.worldPos.y, maxIdx, qInput.worldPos.z, qInput.radius);
+        maxIdx, qInput.worldPos.x, qInput.worldPos.y, qInput.worldPos.z, qInput.radius);
       resultOutOfRangeLogged = true;
     }
     result.mostFrequentBiomeGroupIndex = clamp(firstIdx, 0, maxIdx);
@@ -397,6 +395,15 @@ GpuReadbackResultState biome_query::get_query_result(int query_id, BiomeQueryRes
 {
   BIOME_QUERY_BLOCK;
   return biome_query_ctx ? biome_query_ctx->getQueryResult(query_id, result) : GpuReadbackResultState::SYSTEM_NOT_INITIALIZED;
+}
+
+void BiomeQueryCtx::cancelQuery(int query_id) { grqSystem->cancelQuery(query_id); }
+
+void biome_query::cancel_query(int query_id)
+{
+  BIOME_QUERY_BLOCK;
+  if (biome_query_ctx)
+    biome_query_ctx->cancelQuery(query_id);
 }
 
 int BiomeQueryCtx::getBiomeGroup(int biome_id)

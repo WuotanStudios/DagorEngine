@@ -10,15 +10,17 @@
 
 #include <render/cascadeShadows.h>
 #include <render/toroidalStaticShadows.h>
+#include <render/voxelShadows.h>
 #include <render/gpuVisibilityTest.h>
 #include <render/rendererFeatures.h>
 #include <render/daFrameGraph/daFG.h>
 
 #include <shaders/dag_postFxRenderer.h>
 
-#include "cameraParams.h"
+#include <render/cameraParams.h>
 #include "rendinstShadowCullBboxesLoader.h"
 #include <rendInst/visibilityDecl.h>
+#include <rendInst/rendInstRenderJob.h>
 #include <render/variance.h>
 
 
@@ -46,7 +48,6 @@ struct IShadowInfoProvider
   virtual Point3 getDirToSun(DirToSunType type) const = 0;
   virtual eastl::span<RiGenVisibility *> getRendinstShadowVisibilities() = 0;
   virtual bool hasRenderFeature(FeatureRenderFlags) const = 0;
-  virtual bool isForward() const = 0;
   virtual BBox3 getStaticShadowsBBox() const = 0;
   virtual float getWaterLevel() const = 0;
   virtual float getCameraHeight() const = 0;
@@ -88,7 +89,6 @@ public:
 
   void staticShadowsSetWorldSize();
   void markWorldBBoxDirty();
-  void restoreShadowSampler();
 
   void initVisibilityNode();
   void initShadowsDownsampleNode();
@@ -180,6 +180,9 @@ public:
   void prepareVSM(const Point3 &camera_pos);
   void closeVSM();
 
+  void prepareVoxelShadows(const Point3 &camera_pos);
+  void debugRenderVoxelShadows();
+
 public:
   float csmStartOffsetDistance = 0.0f;
   float staticShadowsAdditionalHeight = 0.f;
@@ -191,6 +194,8 @@ private:
   float shadowQualityLoweringThreshold = 0.25f;
 
   void initDynamicShadows();
+  void initVoxelShadows();
+  void initParallaxShadows();
 
   Point3 getThisFrameCameraPos() const { return shadowInfoProvider.getCurrentFrameCameraParams().viewItm.getcol(3); }
 
@@ -205,11 +210,15 @@ private:
   CascadeShadows::ModeSettings csm_mode;
   float csmShadowsMaxDist = 50;
   bool csmShadowsDistanceFovScaling = true;
+  dafg::NodeHandle csmExportResourcesNode;
+
+  eastl::unique_ptr<VoxelShadows> voxelShadows;
 
   float staticShadowMaxUpdateAmount = 0.1;
   bool staticShadowUniformUpdate = false;
   bool worldBBoxDirty = false;
   eastl::unique_ptr<ToroidalStaticShadows> staticShadows;
+  eastl::unique_ptr<rendinst::render::RiExtraRendererBuilder> staticShadowsRiexBuilder;
   dafg::NodeHandle staticShadowRenderNode;
   bool staticShadowsSetShaderVars = false;
   shaders::UniqueOverrideStateId staticShadowsOverride;

@@ -12,7 +12,7 @@
 #include <EASTL/unordered_map.h>
 #include <ioEventsPoll/ioEventsPoll.h>
 #include <quirrel/sqEventBus/sqEventBus.h>
-#include <quirrel/sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
 #include <quirrel_json/quirrel_json.h>
 #include <sqstdblob.h>
 
@@ -27,6 +27,10 @@ struct SocketInfo
 {
   os_socket_t s;
   eastl::string id;
+  // On Windows os_socket_sys_handle() calls _open_osfhandle(), minting a fresh CRT fd
+  // on every call. subscribe/unsubscribe must use the same fd or libev never drops the
+  // watcher, leaving it polling a closed socket. Capture it once at creation.
+  ioevents::FileDesc sysHandle;
 };
 
 struct UDPPacket
@@ -101,16 +105,16 @@ public:
   void registerSocket(const SocketInfo &sinfo)
   {
     WinAutoLock lock(iopollMutex);
-    iopoll->subscribe(os_socket_sys_handle(sinfo.s), ioevents::EventFlag::READ,
+    iopoll->subscribe(sinfo.sysHandle, ioevents::EventFlag::READ,
       ioevents::make_io_callback([sinfo = eastl::make_shared<const SocketInfo>(sinfo), this](ioevents::FileDesc, ioevents::EventFlag,
                                    ioevents::EventData const &) { this->onSocketReadReady(sinfo); }));
     os_event_set(&wakeupEvent);
   }
 
-  void unregisterSocket(os_socket_t s)
+  void unregisterSocket(ioevents::FileDesc sys_handle)
   {
     WinAutoLock lock(iopollMutex);
-    iopoll->unsubscribe(os_socket_sys_handle(s), ioevents::EventFlag::READ);
+    iopoll->unsubscribe(sys_handle, ioevents::EventFlag::READ);
   }
 };
 
@@ -125,25 +129,21 @@ static void update(void *)
   {
     if (sockets.find(p.sinfo->id) == sockets.end())
       continue; // packet from unregistered socket
-                //
-    char addr[20] = {0};
-    int port = os_socket_addr_get_port(&p.from, sizeof(p.from));
-    os_socket_addr_to_string(&p.from, sizeof(p.from), addr, sizeof(addr));
 
-    sqeventbus::do_with_vm([&](HSQUIRRELVM vm) {
-      if (vm)
-      {
-        Sqrat::Table evt(vm);
-        evt.SetValue("recvTime", p.recvTime);
-        evt.SetValue("host", addr);
-        evt.SetValue("port", port);
-        evt.SetValue("socketId", p.sinfo->id);
-        SQUserPointer destPtr = sqstd_createblob(vm, p.data.size());
-        memcpy(destPtr, p.data.data(), p.data.size());
-        evt.SetValue("data", Sqrat::Var<Sqrat::Object>(vm, -1).value);
-        sq_pop(vm, 1);
-        sqeventbus::send_event("udp.on_packet", evt);
-      }
+    sqeventbus::write_event_main_thread("udp.on_packet", [&](auto &evt) {
+      char addr[20] = {0};
+      int port = os_socket_addr_get_port(&p.from, sizeof(p.from));
+      os_socket_addr_to_string(&p.from, sizeof(p.from), addr, sizeof(addr));
+
+      evt["recvTime"] = p.recvTime;
+      evt["host"] = addr;
+      evt["port"] = port;
+      evt["socketId"] = p.sinfo->id;
+      auto vm = evt.getVM();
+      SQUserPointer destPtr = sqstd_createblob(vm, p.data.size());
+      memcpy(destPtr, p.data.data(), p.data.size());
+      evt["data"] = Sqrat::Var<Sqrat::Object>(vm, -1).value;
+      sq_pop(vm, 1);
     });
   }
   input_buffer->clear();
@@ -183,7 +183,7 @@ static os_socket_t get_socket(eastl::string_view socket_id)
   }
   os_socket_set_option(s, OsSocketOption::OSO_NONBLOCK, 1);
   eastl::string idstr(socket_id);
-  auto it = sockets.insert(eastl::make_pair(idstr, SocketInfo{s, idstr})).first;
+  auto it = sockets.insert(eastl::make_pair(idstr, SocketInfo{s, idstr, os_socket_sys_handle(s)})).first;
   poll_thread->registerSocket(it->second);
   interlocked_increment(sockets_num);
   return s;
@@ -196,7 +196,7 @@ static void close_socket(eastl::string_view socket_id)
   if (it == sockets.end())
     return;
   os_socket_t s = it->second.s;
-  poll_thread->unregisterSocket(s);
+  poll_thread->unregisterSocket(it->second.sysHandle);
   interlocked_decrement(sockets_num);
   sockets.erase(it);
   os_socket_close(s);

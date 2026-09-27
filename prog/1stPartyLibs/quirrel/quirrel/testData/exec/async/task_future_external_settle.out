@@ -1,0 +1,11 @@
+=== inflight ===
+resolve threw: cannot resolve the future returned by an async function
+bare: fulfilled
+consumer got: 42
+=== returns_future ===
+resolve still throws: cannot resolve the future returned by an async function
+consumer got: real
+=== after_done ===
+resolve throws: cannot resolve the future returned by an async function
+after probe, task awaits to: 42
+script done

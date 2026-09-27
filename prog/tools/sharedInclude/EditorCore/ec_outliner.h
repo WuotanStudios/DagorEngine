@@ -117,8 +117,8 @@ private:
     AddNewLayer,
     RenameLayer,
     MoveObjectToLayerSubMenu,
-    MoveObjectToLayerStart = MoveObjectToLayerSubMenu + 1, // Inclusive
-    MoveObjectToLayerEnd = MoveObjectToLayerStart + 64,    // Not inclusive.
+    MoveObjectToLayerStart = MoveObjectToLayerSubMenu + 1,                                    // Inclusive
+    MoveObjectToLayerEnd = MoveObjectToLayerStart + IOutliner::MAXIMUM_SUPPORTED_LAYER_COUNT, // Not inclusive.
     RenameObject,
     ChangeObjectAsset,
     DeleteObject,
@@ -141,7 +141,8 @@ private:
   bool showLayerControls(LayerTreeItem &tree_item, int type, int per_type_layer_index, bool layer_visible, bool layer_locked,
     bool dim_layer_color, const ImVec4 &dimmed_text_color, float action_buttons_total_width, ImGuiMultiSelectIO *multiSelectIo);
   const char *getObjectNoun(int type, int count) const;
-  bool showObjectControls(ObjectTreeItem &tree_item, int type, int per_type_layer_index, bool has_child);
+  bool showObjectControls(ObjectTreeItem &tree_item, int type, int per_type_layer_index, bool has_child, bool dim_object_color,
+    float action_buttons_total_width);
   bool showObjectAssetNameControls(ObjectAssetNameTreeItem &tree_item, RenderableEditableObject &object);
 
   void fillTypeContextMenu(int type);
@@ -152,11 +153,13 @@ private:
   LayerTreeItem *getContextMenuTargetLayer() const;
   void resetContextMenu(PropPanel::IMenu *context_menu = nullptr, int type = -1, int per_type_layer_index = -1);
   void updateSelectionHead(OutlinerTreeItem &tree_item);
-  void fillTree(ImGuiMultiSelectIO *multiSelectIo);
+  void renderTreeItem(OutlinerTreeItem &tree_item, const ImVec4 &dimmed_text_color, float action_buttons_total_width,
+    ImGuiMultiSelectIO *multi_select_io);
+  void fillTree(ImGuiMultiSelectIO *multi_select_io);
   bool applyRangeSelectionRequestInternal(const ImGuiSelectionRequest &request, OutlinerTreeItem &tree_item, bool &found_first);
   void applyRangeSelectionRequest(const ImGuiSelectionRequest &request);
   void applySelectionRequests(const ImGuiMultiSelectIO &multi_select_io, bool &started_selecting);
-  void showAddLayerControls();
+  void showAddLayerControls(const char *popup_id);
   void showSettingsPanel(const char *popup_id);
 
   IOutliner *treeInterface = nullptr;
@@ -164,6 +167,7 @@ private:
 
   // Add layer.
   int addingLayerToType = -1;
+  bool addLayerPopupShown = false;
   String addLayerName;
   String addLayerErrorMessage;
 

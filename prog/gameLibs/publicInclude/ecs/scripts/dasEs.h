@@ -16,6 +16,11 @@ namespace ecs
 class EntityManager;
 }
 
+namespace das
+{
+struct daScriptEnvironment;
+}
+
 namespace bind_dascript
 {
 enum class HotReload;
@@ -87,8 +92,18 @@ struct LoadingDasEcsContextRAII
 bool get_always_use_main_thread_env();
 void set_always_use_main_thread_env(bool value);
 void set_worker_threads_mode(bool on);
+
+struct RAIIDasEnvBound
+{
+  das::daScriptEnvironment *savedBound = nullptr;
+  RAIIDasEnvBound();
+  ~RAIIDasEnvBound();
+};
+
 bool is_in_worker_threads_mode();
 bool is_in_documentation();
+bool enable_das_rtti();
+bool set_enable_das_rtti(bool);
 void set_is_in_documentation(bool value);
 void set_das_root(const char *root_path);
 void free_serializer_buffer(bool success);
@@ -121,6 +136,10 @@ void set_das_aot(AotMode value);
 AotMode get_das_aot();
 void set_das_log_aot_errors(LogAotErrors value);
 LogAotErrors get_das_log_aot_errors();
+void set_das_very_safe_context(bool value);
+bool get_das_very_safe_context();
+void set_das_force_inscope_pod(bool value);
+bool get_das_force_inscope_pod();
 enum ReloadResult
 {
   NO_CHANGES,
@@ -147,11 +166,13 @@ void set_sandbox(bool is_sandbox);
 void set_game_mode(bool is_active);
 
 void bind_das_events(SqModules *modules_mgr);
-void bind_das(SqModules *modules_mgr);
+// environment is rebound when bound funcs are called from threads without a live one
+void bind_das(SqModules *modules_mgr, das::daScriptEnvironment *environment);
 void unload_all_das_scripts_without_debug_agents();
 void das_load_ecs_templates();
 
 void set_loading_profiling_enabled(bool enabled);
+bool set_keep_file_names(bool enabled);
 
 bool fill_stack_while_compile_das();
 }; // namespace bind_dascript

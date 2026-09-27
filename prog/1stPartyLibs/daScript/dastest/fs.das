@@ -3,7 +3,7 @@ options indenting = 4
 
 module fs shared
 
-require fio
+require daslib/fio
 require strings
 require uriparser
 
@@ -41,13 +41,13 @@ def private trim_path(path : string) : string {
 
 def join_path(a, path_b : string) : string {
     let b = trim_path(path_b)
-    if (length(a) == 0) {
+    if (empty(a)) {
         return fix_path(b)
     }
-    if (length(b) == 0) {
+    if (empty(b)) {
         return fix_path(a)
     }
-    var res = build_string() <| $(builder) {
+    let res = build_string() $(builder) {
         builder |> write(a)
         let ends = ends_with_separator(a)
         let starts = starts_with_separator(b)
@@ -65,16 +65,31 @@ def join_path(a, path_b : string) : string {
 
 
 def fix_path(path : string) : string {
-    return path |> trim_path() |> file_name_to_uri() |> normalize_uri() |> uri_to_file_name()
+    let uri = path |> trim_path() |> file_name_to_uri()
+    // file_name_to_uri does NOT percent-encode the path, so a path containing a
+    // space (or '#', '?', ...) produces an invalid URI that normalize_uri's
+    // parser rejects, returning "" — which silently drops the path and makes
+    // every file under such a directory fail to collect. uri_to_file_name itself
+    // tolerates those characters, so fall back to the un-normalized round-trip
+    // when normalization fails. Normal paths still normalize as before.
+    let normalized = uri |> normalize_uri()
+    return (empty(normalized) ? uri : normalized) |> uri_to_file_name()
 }
 
 
 def scan_dir(path : string; var cache : table<string; void?>; var res : array<string>; suffix = ".das") : bool {
+    return scan_dir(path, cache, res, suffix) $(_n) {
+        return true
+    }
+}
+
+def scan_dir(path : string; var cache : table<string; void?>; var res : array<string>; suffix = ".das";
+             dir_filter : block<(name : string) : bool>) : bool {
     let dirStat = stat(path)
     if (!dirStat.is_dir) {
         return false
     }
-    fio::dir(path) <| $(n) {
+    fio::dir(path) $(n) {
         if (n == "." || n == "..") {
             return
         }
@@ -84,8 +99,11 @@ def scan_dir(path : string; var cache : table<string; void?>; var res : array<st
             return
         }
         if (fStat.is_dir) {
-            f |> scan_dir(cache, res, suffix)
-        } elif (fStat.is_reg && f |> ends_with(suffix) && !cache |> key_exists(f)) {
+            if (n |> starts_with("_") || !invoke(dir_filter, n)) {
+                return
+            }
+            f |> scan_dir(cache, res, suffix, dir_filter)
+        } elif (fStat.is_reg && f |> ends_with(suffix) && !(n |> starts_with("_")) && !cache |> key_exists(f)) {
             cache |> insert(f, null)
             res |> push(f)
         }

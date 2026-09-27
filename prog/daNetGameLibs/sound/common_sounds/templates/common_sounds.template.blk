@@ -1,3 +1,11 @@
+global_sound_cooldown{
+  _use:t="replicating"
+  "global_sound_cooldown:object"{
+    _tags:t="sound" // pairs of key=lastTime
+  }
+  _singleton:b=yes
+}
+
 sound_effect{
   _use:t="sound_control"
 
@@ -10,8 +18,11 @@ sound_effect{
     _tags:t="sound"
     sound_effect__path:t=""
     sound_effect__localOffset:p3=0, 0, 0
+    sound_effect__occlusionRadius:r=0
     sound_effect__abandonOnReset:b=no
     sound_effect__autoRange:b=yes
+    sound_effect__globalKey:t=""
+    sound_effect__globalCooldown:r=0
     "sound_effect__event:SoundEvent"{}
   }
 }
@@ -21,7 +32,7 @@ sound_effect_with_transform{
   transform:m=[[1, 0, 0] [0, 1, 0] [0, 0, 1] [0, 0, 0]]
 }
 
-replicated_sound_effect{
+replicated_sound_effect_with_transform{
   _use:t="sound_effect_with_transform"
   _use:t="replicating"
   replicated_sound_effect__path:t=""
@@ -31,12 +42,13 @@ disable_sound_effect{
   _use:t="disable_sound_control"
 }
 
-moveable_sound_effect_tag{
-  "movableSoundEffect:tag"{_tags:t="sound";}
+dynamic_sound_effect_tag{
+  "dynamicSoundEffect:tag"{_tags:t="sound";}
 }
 
-watchable_sound_effect_tag{
-  "watchableSoundEffect:tag"{_tags:t="sound";}
+dynamic_sound_effect{
+  _use:t="sound_effect"
+  _use:t="dynamic_sound_effect_tag"
 }
 
 test_sound_effect{
@@ -53,6 +65,10 @@ sound_effect_speed_var{
   _group{
     _tags:t="sound"
     sound_effect_speed_var__pos:p3=0,0,0
+    sound_effect_speed_var__speedSq:r=-1
+    // setup
+    sound_effect_speed_var__name:t="speed"
+    sound_effect_speed_var__thresholdSq:r=0.01
     sound_effect_speed_var__speedToVar:p4=0,10,0,100
   }
 }
@@ -84,6 +100,19 @@ phys_obj_collision_sound{
     phys_obj_collision_sound__offset:p3=0,0,0
     phys_obj_collision_sound__numSounds:i=9999
     "phys_obj_collision_sound__event:SoundEvent"{}
+  }
+}
+
+phys_obj_shake_sound{ // simple alternative for phys_obj_collision_sound
+  _group{
+    _tags:t="sound"
+    phys_obj_shake_sound__prevSpeed:r=0
+    phys_obj_shake_sound__nextTime:r=0
+    // setup
+    phys_obj_shake_sound__path:t="missing phys_obj_shake_sound__path"
+    phys_obj_shake_sound__minMaxSpeedDrop:p2=3,3
+    phys_obj_shake_sound__cooldown:r=1
+    phys_obj_shake_sound__cooldownOnAppear:r=1
   }
 }
 
@@ -148,8 +177,8 @@ landmesh_biomes_to_sound_material{
 }
 
 game_effect_sound{
-  game_effect_sound__hero:t=""
-  game_effect_sound__enemy:t=""
+  game_effect_sound__watched:t=""
+  game_effect_sound__other:t=""
   "game_effect_sound__event:SoundEvent"{
     _tags:t="sound"
   }

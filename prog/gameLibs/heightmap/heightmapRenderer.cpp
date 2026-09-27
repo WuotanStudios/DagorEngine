@@ -1,6 +1,5 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <osApiWrappers/dag_critSec.h>
 #include <heightmap/lodGrid.h>
 #include <heightmap/heightmapRenderer.h>
 #include <heightmap/heightmapHandler.h>
@@ -8,6 +7,7 @@
 #include <drv/3d/dag_draw.h>
 #include <drv/3d/dag_vertexIndexBuffer.h>
 #include <drv/3d/dag_shaderConstants.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
 #include <math/dag_Point3.h>
 #include <math/dag_bounds3.h>
@@ -21,58 +21,16 @@
 #include <memory/dag_framemem.h>
 #include <util/dag_convar.h>
 #include <util/dag_bitwise_cast.h>
+#include <util/dag_nameHashers.h>
+#include <util/dag_finally.h>
+#include "lodGridVertexDataPool.h"
 
 constexpr uint32_t SUBPATCHES_DEPTH = 1;
 // Current implementation supports SUBPATCHES_DEPTH not bigger than 3.
 
 CONSOLE_BOOL_VAL("heightmap", use_hw_tesselation, true);
 
-namespace var
-{
-static ShaderVariableInfo hmap_object_tess_factor("hmap_object_tess_factor", true);
-}
-
-enum
-{
-  MAX_HW_INSTANCING = 440,
-  VDATA_OFS = 3,
-  MAX_VDATA = 5
-}; // bones
-
-static LodGridVertexData vdata[MAX_VDATA];
-
-
-static void generate_patch_vertices(int dim, int xofs, int yofs, LodGridVertex *vertex)
-{
-  for (int y = 0; y <= dim; ++y)
-    for (int x = 0; x <= dim; ++x)
-    {
-      vertex[y * (dim + 1) + x].x = x + xofs;
-      vertex[y * (dim + 1) + x].y = y + yofs;
-    }
-}
-
-template <class It>
-static inline int generate_patch_indices_quads(int dim, It &&indices, int startInd)
-{
-  size_t index = 0;
-  for (int y = 0; y < dim; ++y)
-    for (int x = 0; x < dim; ++x)
-    {
-      const int topleft = y * (dim + 1) + x + startInd;
-      const int downleft = topleft + (dim + 1);
-      const int downright = topleft + (dim + 1) + 1;
-      const int topright = topleft + 1;
-      indices[index + 0] = topleft;
-      indices[index + 1] = downleft;
-      indices[index + 2] = downright;
-      indices[index + 3] = topright;
-      index += 4;
-    }
-  return index;
-}
-
-bool get_hw_tesselation_usage(int hmap_tess_factorVarId, const LodGridCullData &cull_data)
+bool get_hw_tesselation_usage(int hmap_tess_factorVarId, const LodGridRingCullData &cull_data)
 {
   return (hmap_tess_factorVarId != -1) && cull_data.useHWTesselation && use_hw_tesselation.get();
 }
@@ -88,93 +46,11 @@ static int get_tessellation_var_id(const char *hmap_tess_factor_name)
   return -1;
 }
 
-void LodGridVertexData::close()
-{
-  if (!refCnt)
-    return;
-  if (interlocked_decrement(refCnt) > 0)
-    return;
-  del_d3dres(ib);
-  del_d3dres(quadsIb);
-  patchDim = 0;
-}
-
-bool LodGridVertexData::init(int dim)
-{
-  if (interlocked_increment(refCnt) > 1)
-  {
-    G_ASSERT(patchDim == dim);
-    return true;
-  }
-  patchDim = dim;
-
-  return createBuffers();
-}
-
-bool LodGridVertexData::createBuffers()
-{
-  recreateBuffers = false;
-  verticesCnt = (patchDim + 1) * (patchDim + 1);
-
-  const int indexSize = 2;
-  indicesCnt = patchDim * patchDim * 6;
-  int totalIndicesCnt = indicesCnt * 4;
-  G_ASSERT(!ib);
-  ib = d3d::create_ib(totalIndicesCnt * indexSize, (indexSize == 4 ? SBCF_INDEX32 : 0), "lod_grid_vdata_ib");
-  d3d_err(ib);
-  if (!ib)
-    return false;
-  if (auto lockedIndices = lock_sbuffer<uint16_t>(ib, 0, 0, VBLOCK_WRITEONLY))
-  {
-    faceCnt = generate_patch_indices(patchDim, lockedIndices, 0) / 3;
-    generate_patch_indices(patchDim, LockedBufferWithOffset(lockedIndices, indicesCnt), 1);
-    generate_patch_indices(patchDim, LockedBufferWithOffset(lockedIndices, indicesCnt * 2), 1, 0); // REGULAR_RTLB
-    generate_patch_indices(patchDim, LockedBufferWithOffset(lockedIndices, indicesCnt * 3), 0, 0); // REGULAR_LTRB
-  }
-  else
-    return false;
-
-  if (d3d::get_driver_desc().caps.hasQuadTessellation)
-  {
-    quadsIndicesCnt = indicesCnt / 6 * 4;
-    G_ASSERT(!quadsIb);
-    quadsIb = d3d::create_ib(quadsIndicesCnt * indexSize, (indexSize == 4 ? SBCF_INDEX32 : 0), "lod_grid_vdata_quadsIb");
-    d3d_err(quadsIb);
-    if (!quadsIb)
-      return false;
-    if (auto lockedIndices = lock_sbuffer<uint16_t>(quadsIb, 0, 0, VBLOCK_WRITEONLY))
-      quadsCnt = generate_patch_indices_quads(patchDim, lockedIndices, 0) / 4;
-    else
-      return false;
-  }
-
-  debug("heightmap will be rendered using instanceId instancing");
-  ShaderGlobal::set_int(get_shader_variable_id("heightmap_use_instancing", true), 1);
-  return true;
-}
-
-void LodGridVertexData::beforeResetDevice()
-{
-  if (patchDim <= 0)
-    return;
-
-  recreateBuffers = true;
-  del_d3dres(ib);
-  del_d3dres(quadsIb);
-}
-
-void LodGridVertexData::afterResetDevice()
-{
-  if (recreateBuffers)
-    createBuffers();
-}
-
 static int heightmap_scale_offset_varId = -1;
 static int heightmap_scale_offset_c = 0;
 static int heightmap_region_gvid = -1;
 static int lod0_centerVarId = -1;
 static int worldToHmapLod0VarId = -1;
-
 HeightmapRenderer::HeightmapRenderer(int bits) : shmat(NULL), shElem(NULL)
 {
   dimBits = clamp(bits - VDATA_OFS, 0, MAX_VDATA - 1) + VDATA_OFS;
@@ -185,19 +61,7 @@ void HeightmapRenderer::close()
     return;
   shElem = NULL; // Deleted in shmat
   del_it(shmat);
-  vdata[dimBits - VDATA_OFS].close();
-}
-
-void HeightmapRenderer::beforeResetDevice()
-{
-  for (int i = 0; i < MAX_VDATA; ++i)
-    vdata[i].beforeResetDevice();
-}
-
-void HeightmapRenderer::afterResetDevice()
-{
-  for (int i = 0; i < MAX_VDATA; ++i)
-    vdata[i].afterResetDevice();
+  lod_grid_vdata[dimBits - VDATA_OFS].close();
 }
 
 bool HeightmapRenderer::init(const char *shader_name, const char *mat_script, const char *hmap_tess_factor_name, bool do_fatal,
@@ -225,7 +89,7 @@ bool HeightmapRenderer::init(const char *shader_name, const char *mat_script, co
       DAG_FATAL("can't create ShaderElement for ShaderMaterial '%s'", shader_name);
     return false;
   }
-  if (!vdata[dimBits - VDATA_OFS].init(1 << dimBits)) // || !vdata[dimBits-VDATA_OFS].vb)
+  if (!lod_grid_vdata[dimBits - VDATA_OFS].init(1 << dimBits)) // || !lod_grid_vdata[dimBits-VDATA_OFS].vb)
   {
     if (do_fatal)
       DAG_FATAL("can not init heightmap buffers");
@@ -238,7 +102,7 @@ void HeightmapRenderer::setRenderClip(const BBox2 *clip) const
 {
   Color4 c =
     clip ? Color4(clip->left(), clip->top(), clip->right(), clip->bottom()) : Color4(-(128 << 20), -(128 << 20), 128 << 20, 128 << 20);
-  ShaderGlobal::set_color4_fast(heightmap_region_gvid, c);
+  ShaderGlobal::set_float4(heightmap_region_gvid, c);
 }
 
 void HeightmapRenderer::renderPatchesByBatches(dag::ConstSpan<LodGridPatchParams> patches, const int buffer_size, const int vDataIndex,
@@ -249,24 +113,21 @@ void HeightmapRenderer::renderPatchesByBatches(dag::ConstSpan<LodGridPatchParams
   {
     int current_batch_size = min(total_instances, buffer_size);
     int toFlipped = startFlipped - patch;
-    if (current_batch_size > toFlipped)
+    if (current_batch_size > toFlipped && toFlipped > 0)
     {
       current_batch_size = toFlipped;
       startFlipped = 10000000;
-      nextStartInd = render_quads ? vdata[vDataIndex].quadsIndicesCnt : vdata[vDataIndex].indicesCnt;
+      nextStartInd = render_quads ? primitiveCount * 4 : primitiveCount * 6;
     }
 
-    if (current_batch_size)
+    d3d::set_vs_const(heightmap_scale_offset_c, &patches[patch].params.x, current_batch_size);
+    if (render_quads)
+      d3d::drawind_instanced(PRIM_4_CONTROL_POINTS, startInd, primitiveCount, 0, current_batch_size);
+    else
     {
-      d3d::set_vs_const(heightmap_scale_offset_c, &patches[patch].params.x, current_batch_size);
-      if (render_quads)
-        d3d::drawind_instanced(PRIM_4_CONTROL_POINTS, startInd, primitiveCount, 0, current_batch_size);
-      else
-      {
-        d3d::drawind_instanced(PRIM_TRILIST, startInd, primitiveCount, 0, current_batch_size);
-        // no difference performance wise on Xb1 or XbSX
-        // d3d::draw_instanced(PRIM_TRILIST, startInd, primitiveCount, current_batch_size);
-      }
+      d3d::drawind_instanced(PRIM_TRILIST, startInd, primitiveCount, 0, current_batch_size);
+      // no difference performance wise on Xb1 or XbSX
+      // d3d::draw_instanced(PRIM_TRILIST, 0, primitiveCount, current_batch_size);
     }
 
     total_instances -= current_batch_size;
@@ -275,105 +136,64 @@ void HeightmapRenderer::renderPatchesByBatches(dag::ConstSpan<LodGridPatchParams
   }
 }
 
-void HeightmapRenderer::render(const LodGrid &lodGrid, const LodGridCullData &cull_data, LodGridVertexData *vData, int vDataDim) const
+void HeightmapRenderer::render(const LodGrid &lodGrid, const LodGridRingCullData &cull_data, LodGridVertexData *vData,
+  int vDataDim) const
 {
   int vDataIndex = dimBits - VDATA_OFS;
   if (!shElem || !cull_data.hasPatches())
     return;
+
+  // Recovery for consumers without reset-device hooks (tools); serialized via afterResetDevice.
+  for (int i = 0; i < MAX_VDATA; ++i)
+  {
+    if (lod_grid_vdata[i].recreateBuffers)
+    {
+      logerr("heightmap: vdata is invalid during rendering, recreating");
+      lod_grid_vdata[i].afterResetDevice();
+    }
+  }
+
   d3d::setvsrc_ex(0, NULL, 0, 0);
   TIME_D3D_PROFILE(heightmap);
 
-  ShaderGlobal::set_color4(worldToHmapLod0VarId, cull_data.worldToLod0);
+  ShaderGlobal::set_float4(worldToHmapLod0VarId, cull_data.worldToLod0);
 
   const bool hwTesselationUsage = get_hw_tesselation_usage(hmap_tess_factorVarId, cull_data);
-  ShaderGlobal::set_real(var::hmap_object_tess_factor, hwTesselationUsage ? 1 : 0);
 
-  if (cull_data.hasPatches())
+  const int buffer_size = min<int>(MAX_HW_INSTANCING, d3d::get_driver_desc().maxvpconsts - heightmap_scale_offset_c);
+  int dim = vDataDim >= 0 ? vDataDim : getDim();
+  LodGridVertexData *vdataPtr = vData ? vData : &lod_grid_vdata[vDataIndex];
+  d3d::set_vs_const1(heightmap_scale_offset_c - 2, 0, bitwise_cast<float>(2 * get_log2i(dim)), bitwise_cast<float>(dim - 1), 0);
+  d3d::set_vs_const1(heightmap_scale_offset_c - 1, dim, bitwise_cast<float>(dim + 1), cull_data.scaleX,
+    bitwise_cast<float>(get_log2i(dim)));
+
+  G_ASSERTF(cull_data.lod0PatchesCount <= cull_data.startFlipped, "%d <= %d", cull_data.lod0PatchesCount, cull_data.startFlipped);
+  const bool renderQuads = hwTesselationUsage && cull_data.lod0PatchesCount && lodGrid.lod0SubDiv >= 1;
+  if (hwTesselationUsage)
   {
-    const int maxReqInstances = MAX_HW_INSTANCING;
-    const int buffer_size = d3d::set_vs_constbuffer_size(maxReqInstances + heightmap_scale_offset_c) - heightmap_scale_offset_c;
-    int dim = vDataDim >= 0 ? vDataDim : getDim();
-    LodGridVertexData *vdataPtr = vData ? vData : &vdata[vDataIndex];
-    d3d::set_vs_const1(heightmap_scale_offset_c - 1, dim, bitwise_cast<float>(dim + 1), cull_data.scaleX,
-      bitwise_cast<float>(get_log2i(dim)));
-
-    G_ASSERT(cull_data.lod0PatchesCount <= cull_data.startFlipped);
-    const bool renderQuads = hwTesselationUsage && cull_data.lod0PatchesCount && lodGrid.lod0SubDiv >= 1;
-    if (hwTesselationUsage)
-    {
-      if (cull_data.frustum.has_value())
-        set_frustum_planes(cull_data.frustum.value());
-    }
-
-    if (renderQuads)
-    {
-      d3d::setind(vdataPtr->quadsIb);
-      ShaderGlobal::set_real_fast(hmap_tess_factorVarId, 1 << lodGrid.lod0SubDiv);
-      ShaderGlobal::set_color4_fast(lod0_centerVarId, Color4(cull_data.originPos.x, cull_data.originPos.y, 0, 0));
-      if (!shElem->setStates(0, true))
-        return;
-      TIME_D3D_PROFILE(lod0_hw_tessellation);
-      dag::ConstSpan<LodGridPatchParams> lod0Patches = make_span_const(cull_data.patches).first(cull_data.lod0PatchesCount);
-      renderPatchesByBatches(lod0Patches, buffer_size, vDataIndex, cull_data.startFlipped, renderQuads,
-        renderQuads ? vdataPtr->quadsCnt : vdataPtr->faceCnt);
-    }
-
-    const uint32_t renderedQuads = (renderQuads ? cull_data.lod0PatchesCount : 0);
-    d3d::setind(vdataPtr->ib);
-    ShaderGlobal::set_real_fast(hmap_tess_factorVarId, 1.f);
+    if (cull_data.frustum.has_value())
+      set_frustum_planes(cull_data.frustum.value());
+  }
+  const int quadsInPatch = dim * dim;
+  if (renderQuads)
+  {
+    d3d::setind(vdataPtr->quadsIb);
+    ShaderGlobal::set_float(hmap_tess_factorVarId, 1 << lodGrid.lod0SubDiv);
+    ShaderGlobal::set_float4(lod0_centerVarId, Color4(cull_data.originPos.x, cull_data.originPos.y, 0, 0));
     if (!shElem->setStates(0, true))
       return;
-    dag::ConstSpan<LodGridPatchParams> otherLodsPatches =
-      make_span_const(cull_data.patches).last(cull_data.getCount() - renderedQuads);
-    renderPatchesByBatches(otherLodsPatches, buffer_size, vDataIndex, cull_data.startFlipped - renderedQuads, false,
-      vdataPtr->faceCnt);
-    int startIndex = vdata[vDataIndex].indicesCnt;
-    for (int i = 0; i < cull_data.additionalTriPatches.size(); ++i)
-    {
-      renderPatchesByBatches(make_span_const(cull_data.additionalTriPatches[i]), buffer_size, vDataIndex,
-        cull_data.additionalTriPatches[i].size(), false, vdataPtr->faceCnt, startIndex);
-      startIndex += vdata[vDataIndex].indicesCnt;
-    }
-
-    d3d::set_vs_constbuffer_size(0);
+    TIME_D3D_PROFILE(lod0_hw_tessellation);
+    dag::ConstSpan<LodGridPatchParams> lod0Patches = make_span_const(cull_data.patches).first(cull_data.lod0PatchesCount);
+    renderPatchesByBatches(lod0Patches, buffer_size, vDataIndex, cull_data.startFlipped, renderQuads, quadsInPatch);
   }
-  d3d::setvsrc_ex(1, NULL, 0, 0);
-}
 
-void HeightmapRenderer::renderOnePatch(const Point2 &left_top, const Point2 &bottom_right) const
-{
-  int vDataIndex = dimBits - VDATA_OFS;
-  if (!shElem)
-    return;
-  d3d::setvsrc_ex(0, NULL, 0, 0);
-  d3d::setind(vdata[vDataIndex].ib);
+  const uint32_t renderedQuads = (renderQuads ? cull_data.lod0PatchesCount : 0);
+  d3d::setind(vdataPtr->ib);
+  ShaderGlobal::set_float(hmap_tess_factorVarId, 1.f);
   if (!shElem->setStates(0, true))
     return;
-  TIME_D3D_PROFILE(heightmapOnePatch);
-  G_ASSERT(fabs((bottom_right.y - left_top.y) - (bottom_right.x - left_top.x)) < 0.00001);
-  Point4 oneConst = Point4((bottom_right.x - left_top.x), 0, left_top.x, left_top.y);
-  d3d::set_vs_const1(heightmap_scale_offset_c - 1, getDim(), bitwise_cast<float>(getDim() + 1), 0,
-    bitwise_cast<float>(get_log2i(getDim())));
-  d3d::set_vs_const(heightmap_scale_offset_c, &oneConst.x, 1);
-  d3d::drawind(PRIM_TRILIST, 0, 2, 0);
-  d3d::setvsrc_ex(1, NULL, 0, 0);
-}
-
-void HeightmapRenderer::renderEmpty() const
-{
-  int vDataIndex = dimBits - VDATA_OFS;
-  if (!shElem)
-    return;
-  d3d::setvsrc_ex(0, NULL, 0, 0);
-  d3d::setind(vdata[vDataIndex].ib);
-  if (!shElem->setStates(0, true))
-    return;
-  TIME_D3D_PROFILE(heightmapOnePatch);
-  Point4 oneConst = Point4(0, 0, -1000000, -1000000);
-  d3d::set_vs_const1(heightmap_scale_offset_c - 1, getDim(), bitwise_cast<float>(getDim() + 1), 0,
-    bitwise_cast<float>(get_log2i(getDim())));
-  d3d::set_vs_const(heightmap_scale_offset_c, &oneConst.x, 1);
-  d3d::drawind(PRIM_TRILIST, 0, 1, 0);
+  dag::ConstSpan<LodGridPatchParams> otherLodsPatches = make_span_const(cull_data.patches).last(cull_data.getCount() - renderedQuads);
+  renderPatchesByBatches(otherLodsPatches, buffer_size, vDataIndex, cull_data.startFlipped - renderedQuads, false, quadsInPatch << 1);
 }
 
 struct GridCullingContext
@@ -471,10 +291,10 @@ static inline uint32_t uint_pack_edges_tess(int edgeTessOut[4])
 }
 
 void cull_lod_grid(const LodGrid &lodGrid, int maxLod, float originPosX, float originPosY, float scaleX, float scaleY, float alignX,
-  float alignY, float hMin, float hMax, const Frustum *frustum, const BBox2 *clip, LodGridCullData &cull_data,
+  float alignY, float hMin, float hMax, const Frustum *frustum, const BBox2 *clip, LodGridRingCullData &cull_data,
   const Occlusion *use_occlusion, float &out_lod0_area_radius, int hmap_tess_factorVarId, int dim, bool fight_t_junctions,
-  const HeightmapHeightCulling *heightCulling, const HMapTesselationData *hmap_tdata, BBox2 *innerLodsRegion, float waterLevel,
-  const Point3 *viewPos)
+  const HeightmapHeightCulling *heightCulling, BBox2 *innerLodsRegion, float waterLevel, const Point3 *viewPos,
+  eastl::function<bool(const Point3_vec4 &pos, const Point3_vec4 &posRB)> cullCb, void (*on_patch_cb)(const BBox3 &box))
 {
   G_UNREFERENCED(fight_t_junctions);
   G_ASSERT(scaleX == scaleY);
@@ -505,6 +325,8 @@ void cull_lod_grid(const LodGrid &lodGrid, int maxLod, float originPosX, float o
   int lod0SubDiv = !get_hw_tesselation_usage(hmap_tess_factorVarId, cull_data) ? lodGrid.lod0SubDiv : 0;
   int flipLod = ((patchesX + patchesY) & 1) ? get_log2w(dim) : 100000;
   cull_data.startFlipped = 1000000;
+  if (frustum)
+    cull_data.frustum = *frustum;
   out_lod0_area_radius = 0.f;
   alignas(16) struct Area
   {
@@ -625,8 +447,11 @@ void cull_lod_grid(const LodGrid &lodGrid, int maxLod, float originPosX, float o
                   posRB.z += lodGrid.lastLodExtension;
               }
 
-              if (cull_node_by_clip(pos, posRB, ctx) && cull_node(pos, posRB, ctx, waterLevel, viewPos))
+              if (cull_node_by_clip(pos, posRB, ctx) && cull_node(pos, posRB, ctx, waterLevel, viewPos) &&
+                  (!cullCb || cullCb(pos, posRB)))
               {
+                if (on_patch_cb)
+                  on_patch_cb(BBox3(Point3(pos.x, pos.y, pos.z), Point3(posRB.x, posRB.y, posRB.z)));
                 IPoint2 patchPos = IPoint2(chunkX, chunkY);
                 cull_data.patches.push_back(
                   LodGridPatchParams(gridSize, bit_pack_ipoint2_to_uint(IPoint2(chunkX, chunkY)), origin.x, origin.y));
@@ -690,59 +515,16 @@ void cull_lod_grid(const LodGrid &lodGrid, int maxLod, float originPosX, float o
           if (!cull_node(pos, posRB, ctx, waterLevel, viewPos))
             continue;
 
-          if (BBox2 cellRoot(origin, origin + Point2(patchSize, patchSize));
-              SUBPATCHES_DEPTH > 0 && hmap_tdata && hmap_tdata->testRegionTesselated(cellRoot))
-          {
-            struct SubpatchQuad
-            {
-              BBox2 cell;
-              IPoint2 pos;
-              int depth;
-            };
+          if (cullCb && !cullCb(pos, posRB))
+            continue;
 
-            // tessCellSize is equal of bigger than LOD 0 gridSize (without subdivision).
-            float tessCellSize = max(scaleX, hmap_tdata->getTessCellSize());
-            Tab<SubpatchQuad> subpatchesStack(framemem_ptr());
-            subpatchesStack.push_back({cellRoot, IPoint2(x, y) << (lod + lod0SubDiv), 1});
-            do
-            {
-              SubpatchQuad subpatch = subpatchesStack.back();
-              subpatchesStack.pop_back();
+          if (on_patch_cb)
+            on_patch_cb(BBox3(Point3(pos.x, pos.y, pos.z), Point3(posRB.x, posRB.y, posRB.z)));
 
-              int patchLOD = lod - subpatch.depth;
-              int patchStep = 1 << (patchLOD + lod0SubDiv);
-              IPoint2 patchPos = subpatch.pos;
-              Point2 widthStep = subpatch.cell.width() * 0.5f;
-              BBox2 newCell(subpatch.cell.lim[0], subpatch.cell.lim[0]);
-              for (int j = 0; j < 2; ++j, newCell[0].y += widthStep.y, patchPos.y += patchStep)
-              {
-                patchPos.x = subpatch.pos.x;
-                newCell[0].x = subpatch.cell.lim[0].x;
-                for (int i = 0; i < 2; ++i, newCell[0].x += widthStep.x, patchPos.x += patchStep)
-                {
-                  newCell[1] = newCell[0] + widthStep;
-                  float newGridSize = gridSize * widthStep.x / cellRoot.width().x;
-                  if (subpatch.depth < SUBPATCHES_DEPTH && newGridSize > tessCellSize && hmap_tdata->testRegionTesselated(newCell))
-                  {
-                    subpatchesStack.push_back({newCell, patchPos, subpatch.depth + 1});
-                  }
-                  else
-                  {
-                    cull_data.patches.push_back(LodGridPatchParams(newGridSize,
-                      bit_pack_ipoint2_to_uint(patchPos >> (patchLOD + lod0SubDiv)), newCell[0].x, newCell[0].y));
-                    posLOD_map[patchPos] = patchLOD;
-                  }
-                }
-              }
-            } while (subpatchesStack.size());
-          }
-          else
-          {
-            int patchStep = 1 << (lod + lod0SubDiv);
-            IPoint2 patchPos = IPoint2(x, y) << (lod + lod0SubDiv);
-            cull_data.patches.push_back(LodGridPatchParams(gridSize, bit_pack_ipoint2_to_uint(IPoint2(x, y)), origin.x, origin.y));
-            posLOD_map[patchPos] = lod;
-          }
+          int patchStep = 1 << (lod + lod0SubDiv);
+          IPoint2 patchPos = IPoint2(x, y) << (lod + lod0SubDiv);
+          cull_data.patches.push_back(LodGridPatchParams(gridSize, bit_pack_ipoint2_to_uint(IPoint2(x, y)), origin.x, origin.y));
+          posLOD_map[patchPos] = lod;
         }
       }
     }

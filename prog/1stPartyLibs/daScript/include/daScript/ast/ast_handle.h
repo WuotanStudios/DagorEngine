@@ -2,6 +2,8 @@
 
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_interop.h"
+#include "daScript/ast/ast_simulate.h"
+#include "daScript/misc/handle_registry.h"
 #include "daScript/simulate/interop.h"
 #include "daScript/simulate/aot.h"
 #include "daScript/simulate/simulate_nodes.h"
@@ -11,6 +13,10 @@ namespace das
 {
     #define DAS_BIND_MANAGED_FIELD(FIELDNAME)   DAS_BIND_FIELD(ManagedType,FIELDNAME)
     #define DAS_BIND_MANAGED_PROP(FIELDNAME)    DAS_BIND_PROP(ManagedType,FIELDNAME)
+
+    // shared lock for lazy handle type-info build; recursive since makeTypeInfo re-enters
+    // for nested types. sti/ati are published atomically only after the build completes.
+    inline recursive_mutex g_handleTypeInfoMutex;
 
     struct DummyTypeAnnotation : TypeAnnotation {
         DummyTypeAnnotation(const string & name, const string & cppName, size_t sz, size_t al)
@@ -53,6 +59,8 @@ namespace das
         virtual SimNode * simulateClone ( Context & context, const LineInfo & at, SimNode * l, SimNode * r ) const override {
             return context.code->makeNode<SimNode_CloneRefValueT<string>>(at, l, r);
         }
+        static void jit_clone_string ( void * dst, const void * src ) { *(string*)dst = *(const string*)src; }
+        virtual void * jitGetClone() const override { return (void *) &jit_clone_string; }
     };
 
     template <typename OT>
@@ -69,14 +77,14 @@ namespace das
         bool canDelete = canNew && is_destructible<OT>::value
     > struct ManagedStructureAnnotation ;
 
-    struct BasicStructureAnnotation : TypeAnnotation {
-        struct StructureField {
+    struct DAS_API BasicStructureAnnotation : TypeAnnotation {
+        struct DAS_API StructureField {
             string      name;
             string      cppName;
             string      aotPrefix;
             string      aotPostfix;
-            TypeDeclPtr decl;
-            TypeDeclPtr constDecl;
+            TypeDeclPtr decl = nullptr;
+            TypeDeclPtr constDecl = nullptr;
             uint32_t    offset;
             __forceinline void adjustAot ( const char * pref, const char * postf ) { aotPrefix=pref; aotPostfix=postf; }
         };
@@ -101,6 +109,19 @@ namespace das
         virtual void aotVisitGetFieldPtr(TextWriter & ss, const string & fieldName) override;
         virtual bool canSubstitute(TypeAnnotation * ann) const override;
         virtual bool hasStringData(das_set<void *> & dep) const override;
+        virtual void gc_collect ( gc_root * target, gc_root * from ) override {
+            Annotation::gc_collect(target, from);
+            for ( auto && fp : fields ) {
+                if ( fp.second.decl ) fp.second.decl->gc_collect(target, from);
+                if ( fp.second.constDecl ) fp.second.constDecl->gc_collect(target, from);
+            }
+        }
+        virtual void visitTypeDecls ( const function<void(TypeDecl *)> & callback ) override {
+            for ( auto && fp : fields ) {
+                if ( fp.second.decl ) callback(fp.second.decl);
+                if ( fp.second.constDecl ) callback(fp.second.constDecl);
+            }
+        }
         StructureField & addFieldEx(const string & na, const string & cppNa, off_t offset, const TypeDeclPtr & pT);
         virtual void walk(DataWalker & walker, void * data) override;
         void updateTypeInfo() const;
@@ -110,11 +131,11 @@ namespace das
         das_map<string,StructureField> fields;
         vector<string>                 fieldsInOrder;
         mutable DebugInfoHelper    helpA;
-        mutable StructInfo *       sti = nullptr;
+        mutable atomic<StructInfo*> sti { nullptr };
+        mutable StructInfo *       sti_gc = nullptr;
         ModuleLibrary *            mlib = nullptr;
         vector<TypeAnnotation*> parents;
         bool validationNeverFails = false;
-        mutable recursive_mutex walkMutex;
     };
 
     template <typename TT, bool canCopy = isCloneable<TT>::value>
@@ -125,6 +146,8 @@ namespace das
         static __forceinline SimNode * simulateClone ( Context & context, const LineInfo & at, SimNode * l, SimNode * r ) {
             return context.code->makeNode<SimNode_CloneRefValueT<TT>>(at, l, r);
         }
+        static void jit_clone ( void * dst, const void * src ) { *(TT*)dst = *(const TT*)src; }
+        static void * jitGetClone () { return (void *) &jit_clone; }
     };
 
     template <typename TT>
@@ -132,6 +155,7 @@ namespace das
         static __forceinline SimNode * simulateClone ( Context &, const LineInfo &, SimNode *, SimNode * ) {
             return nullptr;
         }
+        static void * jitGetClone () { return nullptr; }
     };
 
     template <typename FuncT, FuncT fn> struct CallProperty;
@@ -295,6 +319,7 @@ namespace das
         virtual SimNode * simulateClone ( Context & context, const LineInfo & at, SimNode * l, SimNode * r ) const override {
             return GenCloneNode<OT>::simulateClone(context,at,l,r);
         }
+        virtual void * jitGetClone() const override { return GenCloneNode<OT>::jitGetClone(); }
     };
 
     template <typename OT, bool is_smart>
@@ -442,55 +467,62 @@ namespace das
         virtual bool canMove() const override { return false; }
         virtual bool canCopy() const override { return false; }
         virtual bool isLocal() const override { return false; }
-        virtual TypeDeclPtr makeIndexType ( const ExpressionPtr &, const ExpressionPtr & ) const override {
-            return make_smart<TypeDecl>(*vecType);
+        virtual TypeDeclPtr makeIndexType ( ExpressionPtr, ExpressionPtr ) const override {
+            return new TypeDecl(*vecType);
         }
-        virtual TypeDeclPtr makeIteratorType ( const ExpressionPtr & ) const override {
-            return make_smart<TypeDecl>(*vecType);
+        virtual TypeDeclPtr makeIteratorType ( ExpressionPtr ) const override {
+            return new TypeDecl(*vecType);
         }
         virtual SimNode * simulateGetAt ( Context & context, const LineInfo & at, const TypeDeclPtr &,
-                                         const ExpressionPtr & rv, const ExpressionPtr & idx, uint32_t ofs ) const override {
+                                         ExpressionPtr rv, ExpressionPtr idx, uint32_t ofs ) const override {
             return context.code->makeNode<SimNode_AtStdVector>(at,
-                                                               rv->simulate(context),
-                                                               idx->simulate(context),
+                                                               simulateExpression(context, rv),
+                                                               simulateExpression(context, idx),
                                                                ofs);
         }
         virtual SimNode * simulateGetAtR2V ( Context & context, const LineInfo & at, const TypeDeclPtr & type,
-                                            const ExpressionPtr & rv, const ExpressionPtr & idx, uint32_t ofs ) const override {
+                                            ExpressionPtr rv, ExpressionPtr idx, uint32_t ofs ) const override {
             if ( type->isHandle() ) {
                 auto expr = context.code->makeNode<SimNode_AtStdVector>(at,
-                                                                rv->simulate(context),
-                                                                idx->simulate(context),
+                                                                simulateExpression(context, rv),
+                                                                simulateExpression(context, idx),
                                                                 ofs);
-                return ExprRef2Value::GetR2V(context, at, type, expr);
+                return GetR2V(context, at, type, expr);
             } else {
                 return context.code->makeValueNode<SimNode_AtStdVectorR2V>(type->baseType,
                                                                 at,
-                                                                rv->simulate(context),
-                                                                idx->simulate(context),
+                                                                simulateExpression(context, rv),
+                                                                simulateExpression(context, idx),
                                                                 ofs);
             }
         }
 
-        virtual SimNode * simulateGetIterator ( Context & context, const LineInfo & at, const ExpressionPtr & src ) const override {
-            auto rv = src->simulate(context);
+        virtual SimNode * simulateGetIterator ( Context & context, const LineInfo & at, ExpressionPtr src ) const override {
+            auto rv = simulateExpression(context, src);
             return context.code->makeNode<SimNode_AnyIterator<VectorType,StdVectorIterator<VectorType>>>(at, rv);
         }
         virtual void walk ( DataWalker & walker, void * vec ) override {
-            {
-                lock_guard<recursive_mutex> guard(walkMutex);
-                if ( !ati ) {
-                    auto dimType = make_smart<TypeDecl>(*vecType);
-                    dimType->ref = 0;
-                    dimType->dim.push_back(1);
-                    ati = helpA.makeTypeInfo(nullptr, dimType);
-                    ati->flags |= TypeInfo::flag_isHandled;
+            if ( !ati.load() ) {
+                lock_guard<recursive_mutex> guard(g_handleTypeInfoMutex);
+                if ( !ati.load() ) {
+                    // gc_local: scratch TypeDecls just to drive makeTypeInfo —
+                    // read once, never stored on the result. RAII unlinks from
+                    // the thread gc_root immediately and deletes at scope exit.
+                    // BOTH nodes need a guard - the fixed-array head does not own its element.
+                    auto elemType = new TypeDecl(*vecType);
+                    gc_local<TypeDecl> elemGuard(elemType);
+                    elemType->ref = 0;
+                    gc_local<TypeDecl> dimType(makeFixedArrayTypeDecl(1, elemType));
+                    TypeInfo * tinfo = helpA.makeTypeInfo(nullptr, dimType);
+                    tinfo->flags |= TypeInfo::flag_isHandled;
+                    this->ati.store(tinfo);
                 }
             }
             auto pVec = (VectorType *)vec;
-            auto atit = *ati;
+            auto tinfo = this->ati.load();
+            auto atit = *tinfo;
             atit.dim[atit.dimSize - 1] = uint32_t(pVec->size());
-            atit.size = int(ati->size * pVec->size());
+            atit.size = int(tinfo->size * pVec->size());
             walker.walk_dim((char *)pVec->data(), &atit);
         }
         virtual bool isYetAnotherVectorTemplate() const override { return true; }
@@ -499,10 +531,16 @@ namespace das
             vecType->getOwnSemanticHash(hb, dep, adep);
             return hb.getHash();
         }
-        TypeDeclPtr                vecType;
+        virtual void gc_collect ( gc_root * target, gc_root * from ) override {
+            Annotation::gc_collect(target, from);
+            if ( vecType ) vecType->gc_collect(target, from);
+        }
+        virtual void visitTypeDecls ( const function<void(TypeDecl *)> & callback ) override {
+            if ( vecType ) callback(vecType);
+        }
+        TypeDeclPtr                vecType = nullptr;
         DebugInfoHelper            helpA;
-        TypeInfo *                 ati = nullptr;
-        recursive_mutex            walkMutex;
+        atomic<TypeInfo*>          ati { nullptr };
     };
 
     template <typename TT>
@@ -517,44 +555,102 @@ namespace das
 
     template <typename TT>
     struct registerVectorJitFunctions {
-        static void initIndex ( const FunctionPtr & ptr ) {
-            ptr->generated = true;
-            ptr->jitOnly = true;
-            ptr->arguments[0]->type->explicitConst = true;
-        }
+        // This should be done before insertion to module
+        // because it changes mangled name.
+        struct vectorIndexArgFn : defaultTempFn {
+            vectorIndexArgFn() : defaultTempFn() {}
+            ___noinline bool operator () ( Function * fn ) {
+                defaultTempFn::operator()(fn);
+                if ( !fn->arguments.empty() ) {
+                    fn->arguments[0]->type->explicitConst = true;
+                }
+                fn->builtIn = true;
+                fn->generated = true;
+                fn->jitOnly = true;
+                return true;
+            }
+        };
         static void init ( Module * mod, const ModuleLibrary & lib ) {
             // index
             using OT = typename TT::value_type;
             auto TTN = describeCppType(makeType<TT>(lib));
             auto OTN = describeCppType(makeType<OT>(lib));
             auto atin = "das_ati<"+TTN+","+OTN+">";
-            initIndex(addExtern<DAS_BIND_FUN((das_ati<TT,OT>)),SimNode_ExtFuncCallRef>(*mod, lib, "[]",
+            addExtern<DAS_BIND_FUN((das_ati<TT,OT>)),SimNode_ExtFuncCallRef,vectorIndexArgFn>(*mod, lib, ".[]",
                 SideEffects::modifyArgument, atin.c_str())
-                    ->args({"vec","index","context","at"}));
+                    ->args({"vec","index","context","at"});
             auto atun = "das_atu<"+TTN+","+OTN+">";
-            initIndex(addExtern<DAS_BIND_FUN((das_atu<TT,OT>)),SimNode_ExtFuncCallRef>(*mod, lib, "[]",
+            addExtern<DAS_BIND_FUN((das_atu<TT,OT>)),SimNode_ExtFuncCallRef,vectorIndexArgFn>(*mod, lib, ".[]",
                 SideEffects::modifyArgument, atun.c_str())
-                    ->args({"vec","index","context","at"}));
+                    ->args({"vec","index","context","at"});
             auto atcin = "das_atci<"+TTN+","+OTN+">";
-            initIndex(addExtern<DAS_BIND_FUN((das_atci<TT,OT>)),SimNode_ExtFuncCallRef>(*mod, lib, "[]",
+            addExtern<DAS_BIND_FUN((das_atci<TT,OT>)),SimNode_ExtFuncCallRef,vectorIndexArgFn>(*mod, lib, ".[]",
                 SideEffects::none, atcin.c_str())
-                    ->args({"vec","index","context","at"}));
+                    ->args({"vec","index","context","at"});
             auto atcun = "das_atcu<"+TTN+","+OTN+">";
-            initIndex(addExtern<DAS_BIND_FUN((das_atcu<TT,OT>)),SimNode_ExtFuncCallRef>(*mod, lib, "[]",
+            addExtern<DAS_BIND_FUN((das_atcu<TT,OT>)),SimNode_ExtFuncCallRef,vectorIndexArgFn>(*mod, lib, ".[]",
                 SideEffects::none, atcun.c_str())
-                    ->args({"vec","index","context","at"}));
+                    ->args({"vec","index","context","at"});
+            auto atin64 = "das_ati_i64<"+TTN+","+OTN+">";
+            addExtern<DAS_BIND_FUN((das_ati_i64<TT,OT>)),SimNode_ExtFuncCallRef,vectorIndexArgFn>(*mod, lib, ".[]",
+                SideEffects::modifyArgument, atin64.c_str())
+                    ->args({"vec","index","context","at"});
+            auto atun64 = "das_atu_u64<"+TTN+","+OTN+">";
+            addExtern<DAS_BIND_FUN((das_atu_u64<TT,OT>)),SimNode_ExtFuncCallRef,vectorIndexArgFn>(*mod, lib, ".[]",
+                SideEffects::modifyArgument, atun64.c_str())
+                    ->args({"vec","index","context","at"});
+            auto atcin64 = "das_atci_i64<"+TTN+","+OTN+">";
+            addExtern<DAS_BIND_FUN((das_atci_i64<TT,OT>)),SimNode_ExtFuncCallRef,vectorIndexArgFn>(*mod, lib, ".[]",
+                SideEffects::none, atcin64.c_str())
+                    ->args({"vec","index","context","at"});
+            auto atcun64 = "das_atcu_u64<"+TTN+","+OTN+">";
+            addExtern<DAS_BIND_FUN((das_atcu_u64<TT,OT>)),SimNode_ExtFuncCallRef,vectorIndexArgFn>(*mod, lib, ".[]",
+                SideEffects::none, atcun64.c_str())
+                    ->args({"vec","index","context","at"});
         }
     };
+
+    template<typename T, typename = void, typename... Args>
+    struct has_emplace_method : std::false_type {};
+
+    template<typename T, typename... Args>
+    struct has_emplace_method<T, std::void_t<decltype(std::declval<T>().emplace(
+        std::declval<typename T::iterator>(),
+        std::declval<Args>()...
+    ))>, Args...> : std::true_type {};
+
+    template<typename T, typename = void, typename... Args>
+    struct has_emplace_back_method : std::false_type {};
+
+    template<typename T, typename... Args>
+    struct has_emplace_back_method<T, std::void_t<decltype(std::declval<T>().emplace_back(
+        std::declval<Args>()...
+    ))>, Args...> : std::true_type {};
+
+    template<typename T, typename... Args>
+    inline constexpr bool has_emplace_back_method_v = has_emplace_back_method<T, void, Args...>::value;
+    template<typename T, typename... Args>
+    inline constexpr bool has_emplace_method_v = has_emplace_method<T, void, Args...>::value;
 
     template <typename TT>
     struct registerVectorFunctions<TT,false> {
         static void init ( Module * mod, const ModuleLibrary & lib, bool canCopy, bool canMove ) {
             DAS_ASSERT(!canCopy || canCopy == das::is_copy_constructible<typename TT::value_type>::value);
-            if ( canMove ) {
-                addExtern<DAS_BIND_FUN((das_vector_emplace<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "emplace",
-                    SideEffects::modifyArgument, "das_vector_emplace")->generated = true;
-                addExtern<DAS_BIND_FUN((das_vector_emplace_back<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "emplace",
-                    SideEffects::modifyArgument, "das_vector_emplace_back")->generated = true;
+            if constexpr(has_emplace_method_v<TT, typename TT::value_type> && has_emplace_back_method_v<TT, typename TT::value_type>) {
+                if ( canMove ) {
+                    addExtern<DAS_BIND_FUN((das_vector_emplace<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "emplace",
+                        SideEffects::modifyArgument, "das_vector_emplace")->generated = true;
+                    addExtern<DAS_BIND_FUN((das_vector_emplace_back<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "emplace",
+                        SideEffects::modifyArgument, "das_vector_emplace_back")->generated = true;
+                }
+            }
+            if constexpr(has_emplace_method_v<TT> && has_emplace_back_method_v<TT>) {
+                if constexpr ( das::is_default_constructible<typename TT::value_type>::value ) {
+                    addExtern<DAS_BIND_FUN((das_vector_push_empty<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_empty",
+                        SideEffects::modifyArgument, "das_vector_push_empty")->generated = true;
+                    addExtern<DAS_BIND_FUN((das_vector_push_back_empty<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_empty",
+                        SideEffects::modifyArgument, "das_vector_push_back_empty")->generated = true;
+                }
             }
             if constexpr (das::is_copy_constructible<typename TT::value_type>::value) {
                 if ( canCopy ) {
@@ -563,12 +659,6 @@ namespace das
                     addExtern<DAS_BIND_FUN((das_vector_push_back<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push",
                         SideEffects::modifyArgument, "das_vector_push_back")->generated = true;
                 }
-            }
-            if constexpr ( das::is_default_constructible<typename TT::value_type>::value ) {
-                addExtern<DAS_BIND_FUN((das_vector_push_empty<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_empty",
-                    SideEffects::modifyArgument, "das_vector_push_empty")->generated = true;
-                addExtern<DAS_BIND_FUN((das_vector_push_back_empty<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_empty",
-                    SideEffects::modifyArgument, "das_vector_push_back_empty")->generated = true;
             }
             addExtern<DAS_BIND_FUN(das_vector_pop<TT>)>(*mod, lib, "pop",
                 SideEffects::modifyArgument, "das_vector_pop")->generated = true;
@@ -581,7 +671,7 @@ namespace das
             addExtern<DAS_BIND_FUN(das_vector_erase_range<TT>),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "erase",
                 SideEffects::modifyArgument, "das_vector_erase_range")->generated = true;
             addExtern<DAS_BIND_FUN(das_vector_each<TT>),SimNode_ExtFuncCallAndCopyOrMove,explicitConstArgFn>(*mod, lib, "each",
-                SideEffects::none, "das_vector_each")->generated = true;
+                SideEffects::modifyArgument, "das_vector_each")->generated = true;
             addExtern<DAS_BIND_FUN(das_vector_each_const<TT>),SimNode_ExtFuncCallAndCopyOrMove,explicitConstArgFn>(*mod, lib, "each",
                 SideEffects::none, "das_vector_each_const")->generated = true;
             addExtern<DAS_BIND_FUN(das_vector_length<TT>)>(*mod, lib, "length",
@@ -598,13 +688,25 @@ namespace das
     struct registerVectorFunctions<TT,true> {
         static void init ( Module * mod, const ModuleLibrary & lib, bool canCopy, bool canMove ) {
             DAS_ASSERT(!canCopy || canCopy == das::is_copy_constructible<typename TT::value_type>::value);
-            if ( canMove ) {
-                addExtern<DAS_BIND_FUN((das_vector_emplace<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "emplace",
-                    SideEffects::modifyArgument, "das_vector_emplace")
-                        ->args({"vec","value","at"})->generated = true;
-                addExtern<DAS_BIND_FUN((das_vector_emplace_back<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "emplace",
-                    SideEffects::modifyArgument, "das_vector_emplace_back")
-                        ->args({"vec","value"})->generated = true;
+            if constexpr(has_emplace_method_v<TT, typename TT::value_type> && has_emplace_back_method_v<TT, typename TT::value_type>) {
+                if ( canMove ) {
+                    addExtern<DAS_BIND_FUN((das_vector_emplace<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "emplace",
+                        SideEffects::modifyArgument, "das_vector_emplace")
+                            ->args({"vec","value","at"})->generated = true;
+                    addExtern<DAS_BIND_FUN((das_vector_emplace_back<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "emplace",
+                        SideEffects::modifyArgument, "das_vector_emplace_back")
+                            ->args({"vec","value"})->generated = true;
+                }
+            }
+            if constexpr(has_emplace_method_v<TT> && has_emplace_back_method_v<TT>) {
+                if constexpr ( das::is_default_constructible<typename TT::value_type>::value ) {
+                    addExtern<DAS_BIND_FUN((das_vector_push_empty<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_empty",
+                        SideEffects::modifyArgument, "das_vector_push_empty")
+                            ->args({"vec","at","context"})->generated = true;
+                    addExtern<DAS_BIND_FUN((das_vector_push_back_empty<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_empty",
+                          SideEffects::modifyArgument, "das_vector_push_back_empty")
+                              ->args({"vec"})->generated = true;
+                }
             }
             if constexpr (das::is_copy_constructible<typename TT::value_type>::value) {
                 if ( canCopy ) {
@@ -615,14 +717,6 @@ namespace das
                         SideEffects::modifyArgument, "das_vector_push_back_value")
                             ->args({"vec","value"})->generated = true;
                 }
-            }
-            if constexpr ( das::is_default_constructible<typename TT::value_type>::value ) {
-              addExtern<DAS_BIND_FUN((das_vector_push_empty<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_empty",
-                  SideEffects::modifyArgument, "das_vector_push_empty")
-                      ->args({"vec","at","context"})->generated = true;
-              addExtern<DAS_BIND_FUN((das_vector_push_back_empty<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_empty",
-                    SideEffects::modifyArgument, "das_vector_push_back_empty")
-                        ->args({"vec"})->generated = true;
             }
             if constexpr (das::is_smart_ptr<typename TT::value_type>::value) {
                 addExtern<DAS_BIND_FUN((das_vector_push_value<TT>)),SimNode_ExtFuncCall,permanentArgFn>(*mod, lib, "push_clone",
@@ -646,7 +740,7 @@ namespace das
                 SideEffects::modifyArgument, "das_vector_erase_range")
                     ->args({"vec","index","count","context"})->generated = true;
             addExtern<DAS_BIND_FUN(das_vector_each<TT>),SimNode_ExtFuncCallAndCopyOrMove,explicitConstArgFn>(*mod, lib, "each",
-                SideEffects::none, "das_vector_each")
+                SideEffects::modifyArgument, "das_vector_each")
                     ->args({"vec","context","at"})->generated = true;
             addExtern<DAS_BIND_FUN(das_vector_each_const<TT>),SimNode_ExtFuncCallAndCopyOrMove,explicitConstArgFn>(*mod, lib, "each",
                 SideEffects::none, "das_vector_each_const")
@@ -668,7 +762,7 @@ namespace das
             string declN = typeName<VT>::name();
             if ( library.findAnnotation(declN,nullptr).size()==0 ) {
                 auto declT = makeType<TT>(library);
-                auto ann = make_smart<ManagedVectorAnnotation<VT>>(declN,const_cast<ModuleLibrary &>(library));
+                auto ann = new ManagedVectorAnnotation<VT>(declN,const_cast<ModuleLibrary &>(library));
                 ann->cppName = "das::vector<" + describeCppType(declT, CpptSubstitureRef::no,
                                                                 CpptSkipRef::no, CpptSkipConst::no,
                                                                 CpptRedundantConst::yes, ChooseSmartPtr::yes) + ">";
@@ -695,7 +789,7 @@ namespace das
 
     template <typename TT>
     __forceinline void addVectorAnnotation(Module * mod, ModuleLibrary & lib, const string & name ) {
-        return addVectorAnnotation<TT>(mod,lib,make_smart<ManagedVectorAnnotation<TT>>(name,lib));
+        return addVectorAnnotation<TT>(mod,lib,new ManagedVectorAnnotation<TT>(name,lib));
     }
 
     template <typename OT>
@@ -737,22 +831,71 @@ namespace das
         das::SimNode *simulateClone(das::Context &context, const das::LineInfo &at, das::SimNode *l, das::SimNode *r) const override {
             return context.code->makeNode<SimNode_Set<OT>>(at, l, r);
         }
+        static void jit_clone_value ( void * dst, const void * src ) { *(OT*)dst = *(const OT*)src; }
+        virtual void * jitGetClone() const override { return (void *) &jit_clone_value; }
         virtual uint64_t getOwnSemanticHash ( HashBuilder & hb, das_set<Structure *> & dep, das_set<Annotation *> & adep ) const override {
             hb.updateString(getMangledName());
             valueType->getOwnSemanticHash(hb, dep, adep);
             return hb.getHash();
         }
-        TypeDeclPtr valueType;
+        virtual void gc_collect ( gc_root * target, gc_root * from ) override {
+            Annotation::gc_collect(target, from);
+            if ( valueType ) valueType->gc_collect(target, from);
+        }
+        virtual void visitTypeDecls ( const function<void(TypeDecl *)> & callback ) override {
+            if ( valueType ) callback(valueType);
+        }
+        TypeDeclPtr valueType = nullptr;
+    };
+
+    // nominal `distinct Foo = int` type entity. ABI-identical to underlyingType (a workhorse type),
+    // but never interconverts with it. NOT a handled type - TypeDecl carries it as tDistinct, and it
+    // erases to the underlying type at the AST->TypeInfo boundary.
+    struct DAS_API DistinctTypeAnnotation : TypeAnnotation {
+        DistinctTypeAnnotation ( const string & n, const TypeDeclPtr & underlying, const string & cpn = string() )
+            : TypeAnnotation(n,cpn), underlyingType(underlying) {}
+        virtual bool rtti_isDistinctTypeAnnotation() const override { return true; }
+        virtual TypeDeclPtr makeValueType() const override { return underlyingType; }
+        virtual bool canMove() const override { return true; }
+        virtual bool canCopy() const override { return true; }
+        virtual bool canClone() const override { return true; }
+        virtual bool isLocal() const override { return true; }
+        virtual bool hasNonTrivialCtor() const override { return false; }
+        virtual bool hasNonTrivialDtor() const override { return false; }
+        virtual bool hasNonTrivialCopy() const override { return false; }
+        virtual bool isPod() const override { return true; }
+        virtual bool isRawPod() const override { return true; }
+        virtual bool isRefType() const override { return false; }
+        virtual size_t getSizeOf() const override { return underlyingType ? size_t(underlyingType->getSizeOf()) : 0; }
+        virtual size_t getAlignOf() const override { return underlyingType ? size_t(underlyingType->getAlignOf()) : 1; }
+        virtual bool hasStringData(das_set<void *> & dep) const override {
+            return underlyingType ? underlyingType->hasStringData(dep) : false;
+        }
+        virtual uint64_t getOwnSemanticHash ( HashBuilder & hb, das_set<Structure *> & dep, das_set<Annotation *> & adep ) const override {
+            hb.updateString(getMangledName());
+            if ( underlyingType ) underlyingType->getOwnSemanticHash(hb, dep, adep);
+            return hb.getHash();
+        }
+        virtual void gc_collect ( gc_root * target, gc_root * from ) override {
+            Annotation::gc_collect(target, from);
+            if ( underlyingType ) underlyingType->gc_collect(target, from);
+        }
+        virtual void visitTypeDecls ( const function<void(TypeDecl *)> & callback ) override {
+            if ( underlyingType ) callback(underlyingType);
+        }
+        TypeDeclPtr underlyingType = nullptr;
+        LineInfo    at;
+        bool        isPrivate = false;
     };
 
     template <typename TT>
     void addConstant ( Module & mod, const string & name, const TT & value ) {
-        VariablePtr pVar = make_smart<Variable>();
+        VariablePtr pVar = new Variable();
         pVar->name = name;
-        pVar->type = make_smart<TypeDecl>((Type)ToBasicType<TT>::type);
+        pVar->type = new TypeDecl((Type)ToBasicType<TT>::type);
         pVar->type->constant = true;
         pVar->init = Program::makeConst(LineInfo(),pVar->type,cast<TT>::from(value));
-        pVar->init->type = make_smart<TypeDecl>(*pVar->type);
+        pVar->init->type = new TypeDecl(*pVar->type);
         pVar->init->constexpression = true;
         pVar->initStackSize = sizeof(Prologue);
         if ( !mod.addVariable(pVar) ) {
@@ -760,12 +903,12 @@ namespace das
         }
     }
     __forceinline void addConstant ( Module & mod, const string & name, const string & value ) {
-        VariablePtr pVar = make_smart<Variable>();
+        VariablePtr pVar = new Variable();
         pVar->name = name;
-        pVar->type = make_smart<TypeDecl>(Type::tString);
+        pVar->type = new TypeDecl(Type::tString);
         pVar->type->constant = true;
-        pVar->init = make_smart<ExprConstString>(LineInfo(),value);
-        pVar->init->type = make_smart<TypeDecl>(*pVar->type);
+        pVar->init = new ExprConstString(LineInfo(),value);
+        pVar->init->type = new TypeDecl(*pVar->type);
         pVar->init->constexpression = true;
         pVar->initStackSize = sizeof(Prologue);
         if ( !mod.addVariable(pVar) ) {
@@ -785,6 +928,97 @@ namespace das
     void addEquNeqVal(Module & mod, const ModuleLibrary & lib) {
         addExtern<decltype(&das_equ_val<TT,TT>),  das_equ_val<TT,TT>> (mod, lib, "==", SideEffects::none, "das_equ_val");
         addExtern<decltype(&das_nequ_val<TT,TT>), das_nequ_val<TT,TT>>(mod, lib, "!=", SideEffects::none, "das_nequ_val");
+    }
+
+    template <typename T>
+    struct WrapType<Handle<T>> { enum { value = true }; typedef uint64_t type; typedef uint64_t rettype; };
+
+    template <typename T>
+    struct typeName<Handle<T>> {
+        static string name() {
+            return string("Handle<") + typeName<T>::name() + ">";
+        }
+    };
+
+    template <typename T>
+    struct cast<Handle<T>> {
+        static __forceinline Handle<T> to   ( vec4f x ) {
+            uint64_t raw = v_extract_xi64(v_cast_vec4i(x));
+            Handle<T> h;
+            h.value = raw;
+            return h;
+        }
+        static __forceinline vec4f from ( Handle<T> h ) {
+            uint64_t raw = h.value;
+            return v_cast_vec4f(v_ldui_half(&raw));
+        }
+    };
+
+    template <typename T>
+    struct typeFactory<Handle<T>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & library) {
+            // Normalize: typeName<T>::name() may return const char * or string
+            // depending on T's specialization. string -> const char* via c_str.
+            string tn = typeName<T>::name();
+            return makeHandleType(library, tn.c_str());
+        }
+    };
+
+    template <typename T>
+    struct ManagedHandleAnnotation : ManagedValueAnnotation<Handle<T>> {
+        ManagedHandleAnnotation ( ModuleLibrary & lib, const string & n, const string & cpn = string() )
+            : ManagedValueAnnotation<Handle<T>>(lib,n,cpn) {}
+    };
+
+    template <typename T> bool das_handle_is_alive ( Handle<T> h ) {
+        return HandleRegistry<T>::instance().is_alive(h);
+    }
+    template <typename T> bool das_handle_release  ( Handle<T> h ) {
+        return HandleRegistry<T>::instance().release(h);
+    }
+    template <typename T> bool das_handle_equ  ( Handle<T> a, Handle<T> b ) { return a == b; }
+    template <typename T> bool das_handle_nequ ( Handle<T> a, Handle<T> b ) { return a != b; }
+
+    template <typename T>
+    void dumpHandleLeaks () {
+        auto & reg = HandleRegistry<T>::instance();
+        if ( reg.live_count() == 0 ) return;
+        TextPrinter tp;
+        string tn = typeName<T>::name();
+        int total = 0;
+        reg.for_each_live([&](Handle<T> h, const shared_ptr<T> & p){
+            uint32_t idx = uint32_t(h.value & 0xFFFFFFFFu) - 1;
+            uint32_t gen = uint32_t(h.value >> 32);
+            tp << "  Handle<" << tn << "> idx=" << idx << " gen=" << gen
+               << " (rc=" << int(p.use_count()) << ")\n";
+            total++;
+        });
+        if ( total ) tp << "total " << total << " leaked handles of type " << tn << "\n";
+    }
+
+    template <typename T>
+    uint64_t countHandleLeaks () {
+        return uint64_t(HandleRegistry<T>::instance().live_count());
+    }
+
+    template <typename T>
+    void addHandleAnnotation ( Module * mod, ModuleLibrary & lib,
+                               const string & name,
+                               const string & destroyFnName = string(),
+                               const string & cppTypeName = string() ) {
+        handleRegistry_registerDump(&dumpHandleLeaks<T>);
+        handleRegistry_registerCount(&countHandleLeaks<T>);
+        mod->addAnnotation(new ManagedHandleAnnotation<T>(lib, name, cppTypeName));
+        addExtern<decltype(&das_handle_equ<T>),  das_handle_equ<T>>
+            (*mod, lib, "==", SideEffects::none, "das_handle_equ");
+        addExtern<decltype(&das_handle_nequ<T>), das_handle_nequ<T>>
+            (*mod, lib, "!=", SideEffects::none, "das_handle_nequ");
+        addExtern<decltype(&das_handle_is_alive<T>), das_handle_is_alive<T>>
+            (*mod, lib, "is_alive", SideEffects::accessExternal, "das_handle_is_alive");
+        if ( !destroyFnName.empty() ) {
+            addExtern<decltype(&das_handle_release<T>), das_handle_release<T>>
+                (*mod, lib, destroyFnName.c_str(), SideEffects::modifyExternal, "das_handle_release");
+        }
     }
 
     void setParents ( Module * mod, const char * child, const std::initializer_list<const char *> & parents );

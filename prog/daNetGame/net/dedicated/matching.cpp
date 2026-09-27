@@ -8,7 +8,10 @@
 #include "net/userid.h"
 #include "main/appProfile.h"
 #include "main/main.h"
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <time.h>
 
 namespace dedicated_matching
 {
@@ -83,6 +86,7 @@ static eastl::string room_secret;
 static eastl::unordered_map<matching::UserId, Json::Value> room_members;
 static int group_size = 0; // 0 = unlimited
 bool (*generate_peer_auth)(matching::UserId, void const *, size_t, matching::AuthKey &) = nullptr;
+void (*try_start_relay_and_subscribe)(void(__cdecl *)(bool)) = nullptr;
 } // namespace state_data
 
 static void merge_json(Json::Value const &what, Json::Value &where)
@@ -104,6 +108,14 @@ static Json::Value &get_room_member(matching::UserId user_id)
   if (it != room_members.end())
     return it->second;
   return null;
+}
+
+static int member_app_id(const Json::Value &member)
+{
+  if (member.isNull())
+    return 0;
+  const Json::Value &appId = member["public"]["appId"];
+  return appId.isIntegral() ? appId.asInt() : 0;
 }
 
 static void register_room_member(Json::Value const &member_info)
@@ -178,10 +190,17 @@ void apply_room_member_attr_changed(const Json::Value &params)
 
   const Json::Value &pub = params["public"];
   const Json::Value &priv = params["private"];
+  const int prevAppId = member_app_id(member);
   if (pub.isObject())
     merge_json(pub, member["public"]);
   if (priv.isObject())
     merge_json(priv, member["private"]);
+
+  // A member may join with no public attributes at all, so its platform appId can land after
+  // the player already connected and got this server's appId baked into their player entity.
+  const int appId = member_app_id(member);
+  if (appId != 0 && appId != prevAppId)
+    g_entity_mgr->broadcastEventImmediate(NetMatchingEventOnPlayerAppIdChanged{userId, appId});
 }
 
 void apply_room_destroyed(const Json::Value &) {}
@@ -224,6 +243,8 @@ void player_kick_from_room(matching::UserId user_id) { g_entity_mgr->broadcastEv
 
 void ban_player_in_room(matching::UserId user_id) { g_entity_mgr->broadcastEventImmediate(NetMatchingBanPlayerEvent{user_id}); }
 
+void leave_room() { g_entity_mgr->broadcastEventImmediate(NetMatchingLeaveRoomEvent{}); }
+
 void on_player_team_changed(matching::UserId user_id, int team)
 {
   g_entity_mgr->broadcastEventImmediate(NetMatchingChangeTeamEvent{user_id, team});
@@ -258,13 +279,10 @@ int get_player_req_teams_num(matching::UserId uid)
 
 int get_player_app_id(matching::UserId uid)
 {
-  const Json::Value &member = get_room_member(uid);
-  if (member.isNull())
-    return app_profile::get().appId;
-  const Json::Value &appId = member["public"]["appId"];
-  if (appId.isIntegral())
-    return appId.asInt();
-  return app_profile::get().appId;
+  // Matching may not know the player's platform appId yet; this server's own appId is the only
+  // guess available, NetMatchingEventOnPlayerAppIdChanged corrects the players once it lands.
+  const int appId = member_app_id(get_room_member(uid));
+  return appId != 0 ? appId : app_profile::get().appId;
 }
 
 eastl::string get_player_name(matching::UserId uid)
@@ -313,9 +331,43 @@ const char *get_player_custom_info(matching::UserId uid)
   return member["public"]["custom"].asCString();
 }
 
+bool has_player_penalty(matching::UserId uid, const char *penalty)
+{
+  // Expiry is never pushed by matching, so activity is computed per call.
+  // start is epoch sec by the matching cluster clock; duration < 0 = permanent.
+  if (penalty == nullptr || *penalty == '\0')
+    return false;
+  const Json::Value &member = get_room_member(uid);
+  if (member.isNull())
+    return false;
+  const Json::Value &list = member["private"]["penalties"];
+  if (!list.isArray())
+    return false;
+  const int64_t now = (int64_t)time(nullptr);
+  for (Json::ArrayIndex i = 0; i < list.size(); ++i)
+  {
+    const Json::Value &rec = list[i];
+    if (!rec.isObject())
+      continue;
+    const Json::Value &kind = rec["penalty"];
+    if (!kind.isString() || strcmp(kind.asCString(), penalty) != 0)
+      continue;
+    const Json::Value &start = rec["start"], &dur = rec["duration"];
+    if (!start.isIntegral() || !dur.isIntegral())
+      continue;
+    const int64_t duration = dur.asInt64();
+    if (duration < 0 || start.asInt64() + duration > now)
+      return true;
+  }
+  return false;
+}
+
 const eastl::unordered_map<matching::UserId, Json::Value> &get_session_players() { return room_members; }
 
+matching::RoomId get_current_room_id() { return state_data::current_room_id; }
+eastl::string get_current_cluster() { return state_data::room_info.get("private", {}).get("cluster", "").asCString(); }
 } // namespace dedicated_matching
+
 
 #define NET_MATCHING_ECS_EVENT ECS_REGISTER_EVENT
 NET_MATCHING_ECS_EVENTS

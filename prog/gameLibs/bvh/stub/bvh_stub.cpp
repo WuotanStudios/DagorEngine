@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <bvh/bvh.h>
+#include <debug/dag_debug.h>
 
 namespace bvh
 {
@@ -8,13 +9,19 @@ bool has_enough_vram_for_rt() { return false; }
 
 bool is_available() { return false; }
 
-void init(elem_rules_fn) {}
+BvhAvailabilityCode is_available_verbose() { return BvhAvailabilityCode::STUB; }
 
-void teardown() {}
+void init(elem_rules_fn, screenshot_fn, AdditionalSettings) {}
 
-ContextId create_context(const char *, Features) { return InvalidContextId; }
+void teardown(bool, bool) {}
+
+ContextId create_context(const char *, Features, Features) { return InvalidContextId; }
+bool has_features(ContextId, uint32_t) { return false; }
 
 void teardown(ContextId &) {}
+
+void enable_dyn_models(ContextId) {}
+void disable_dyn_models(ContextId) {}
 
 void start_frame() {}
 
@@ -26,19 +33,26 @@ void update_terrain(ContextId, const Point2 &) {}
 
 void set_for_gpu_objects(ContextId) {}
 
+void add_bin_scene(ContextId, BaseStreamingSceneHolder &) {}
+
+void add_water(ContextId, FFTWater &) {}
+
 void prepare_ri_extra_instances() {}
 
 void set_ri_dist_mul(float) {}
 
 void override_out_of_camera_ri_dist_mul(float) {}
 
-void update_instances(ContextId, const Point3 &, const Frustum &, const Frustum &, dynrend::ContextId *, dynrend::ContextId *,
-  RiGenVisibility *, threadpool::JobPriority)
+void update_instances(ContextId, const Point3 &, const Point3 &, const Point3 &, const TMatrix &, const TMatrix4 &, const Frustum &,
+  const Frustum &, dynrend::ContextId *, dynrend::ContextId *, RiGenVisibility *, dag::Vector<DynamicRenderableSceneInstance *> &&,
+  threadpool::JobPriority)
 {}
 
-void update_instances(ContextId, const Point3 &, const Frustum &, const Frustum &, const dag::Vector<RiGenVisibility *> &,
-  dynrend::BVHIterateCallback, threadpool::JobPriority)
+void update_instances(ContextId, const Point3 &, const Point3 &, const TMatrix &, const TMatrix4 &, const Frustum &, const Frustum &,
+  const dag::Vector<RiGenVisibility *> &, dynrend::BVHIterateCallback, threadpool::JobPriority)
 {}
+
+void wait_dynamic_instances_jobs() {}
 
 void add_object(ContextId, uint64_t, const ObjectInfo &) {}
 
@@ -46,17 +60,29 @@ void add_instance(ContextId, uint64_t, const mat43f &) {}
 
 void remove_object(ContextId, uint64_t) {}
 
+void enable_dynamic_planar_decals(bool) {}
+
 void build(ContextId, const TMatrix &, const TMatrix4 &, const Point3 &, const Point3 &) {}
+
+void set_rigen_cpu_budget(int) {}
+void set_tree_anim_max_distance(float) {}
 
 void process_meshes(ContextId, BuildBudget) {}
 
 void render_debug(ContextId, const IPoint2 &) {}
 
+void bind_gbuffer_textures(ContextId, Texture *, Texture *, Texture *, Texture *, Texture *) {}
+
+void bind_fom_textures(ContextId, Texture *, Texture *, const d3d::SamplerHandle *) {}
+
 void bind_resources(ContextId, int) {}
+void unbind_resources() {}
 
 void on_before_unload_scene(ContextId) {}
 
 void on_before_settings_changed(ContextId) {}
+
+void release_game_texture_holds(ContextId) {}
 
 void on_unload_scene(ContextId) {}
 
@@ -78,12 +104,56 @@ bool is_building(ContextId) { return false; }
 
 void set_grass_range(ContextId, float) {}
 
+void set_grass_fraction_to_keep(ContextId, float) {}
+
 void set_debug_view_min_t(float) {}
 
 void ChannelParser::enum_shader_channel(int, int, int, int, int, ChannelModifier, int) {}
 
 void enable_per_frame_processing(bool) {}
-void bind_tlas_stage(ContextId, ShaderStage) {}
-void unbind_tlas_stage(ShaderStage) {}
+
+void set_on_parallel_jobs_finished_cb(on_parallel_jobs_finished_callback) {}
+
+void render_rt_mem_overlay(ContextId) {}
+
+void log_rt_memory_overhead(ContextId) {}
+void try_log_rt_memory_overhead(ContextId) {}
+
+void connect_dagdp(ContextId, dagdp_connect_callback callback) { callback(nullptr); }
+
+void gpu_grass_make_meta(ContextId, const GPUGrassBase &) {}
+void generate_gpu_grass_instances(ContextId, bool) {}
+
+void tell_active_dynamic_resources(ContextId, const eastl::vector_set<const DynamicRenderableSceneLodsResource *> &) {}
+
+void gather_splinegen_instances(ContextId, Sbuffer *, eastl::vector<eastl::pair<uint32_t, MeshInfo>> &, uint32_t, uint32_t &) {}
+void remove_spline_gen_instances(ContextId) {}
+
+void connect_smoke_tracers(ContextId, smoke_tracers_connect_callback) {}
+
+void update_smoke_tracer_instances(SmokeTracerManager *) {}
+
+void ensure_particle_buffer_capacity(int, int) {}
+
+bool connect_lru_collision(ContextId, LRURendinstCollision *, lru_collision_gather_fn, const LruCollisionSettings &)
+{
+  logerr("[BVH] connect_lru_collision: bvh is compiled out (BVHSupport = no)");
+  return false;
+}
+
+void invalidate_lru_collision(ContextId) {}
+
+void set_lru_collision_range(ContextId, float, float) {}
+
+LruCollisionStats get_lru_collision_stats(ContextId) { return {}; }
+
+void set_voxel_activity(ContextId, const VoxelActivitySettings &)
+{
+  logerr("[BVH] set_voxel_activity: bvh is compiled out (BVHSupport = no)");
+}
+
+void remove_voxel_activity(ContextId) {}
 
 } // namespace bvh
+
+size_t BVHInstanceMapper::getHWInstanceSize() { return 0; }

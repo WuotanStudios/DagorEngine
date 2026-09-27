@@ -22,30 +22,12 @@ class IPoint4
 public:
   int x, y, z, w;
 
-  INLINE IPoint4() = default;
-  INLINE IPoint4(int ax, int ay, int az, int aw)
-  {
-    x = ax;
-    y = ay;
-    z = az;
-    w = aw;
-  }
+  constexpr INLINE IPoint4() = default;
+  constexpr INLINE IPoint4(int ax, int ay, int az, int aw) : x(ax), y(ay), z(az), w(aw) {}
   // IPoint4(const IPoint4& p) {x=p.x;y=p.y;z=p.z;}
   // IPoint4& operator =(const Point3& p) {x=p.x;y=p.y;z=p.z;return *this;}
-  INLINE IPoint4(const Point4 &p)
-  {
-    x = (int)p.x;
-    y = (int)p.y;
-    z = (int)p.z;
-    w = (int)p.w;
-  }
-  INLINE explicit IPoint4(const int *p)
-  {
-    x = p[0];
-    y = p[1];
-    z = p[2];
-    w = p[3];
-  }
+  constexpr INLINE IPoint4(const Point4 &p) : x((int)p.x), y((int)p.y), z((int)p.z), w((int)p.w) {}
+  constexpr INLINE explicit IPoint4(const int *p) : x(p[0]), y(p[1]), z(p[2]), w(p[3]) {}
 
   static const IPoint4 ZERO;
   static const IPoint4 ONE;
@@ -147,6 +129,9 @@ public:
   INLINE real lengthF() const { return fastsqrt(lengthSq()); }
 };
 
+inline constexpr IPoint4 IPoint4::ZERO(0, 0, 0, 0);
+inline constexpr IPoint4 IPoint4::ONE(1, 1, 1, 1);
+
 INLINE IPoint4 operator*(int a, const IPoint4 &p) { return IPoint4(p.x * a, p.y * a, p.z * a, p.w * a); }
 INLINE int lengthSq(const IPoint4 &a) { return a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w; }
 
@@ -166,6 +151,8 @@ INLINE IPoint4 clamp(IPoint4 t, const IPoint4 min_val, const IPoint4 max_val)
 {
   return min(max(t, min_val), max_val);
 }
+INLINE IPoint4 mul(const IPoint4 &a, const IPoint4 &b) { return IPoint4(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); }
+INLINE IPoint4 div(const IPoint4 &a, const IPoint4 &b) { return IPoint4(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w); }
 
 INLINE IPoint4 ipoint4(const Point4 &p) { return IPoint4(real2int(p.x), real2int(p.y), real2int(p.z), real2int(p.w)); }
 INLINE Point4 point4(const IPoint4 &p) { return Point4(p.x, p.y, p.z, p.w); }

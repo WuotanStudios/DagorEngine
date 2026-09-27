@@ -44,6 +44,8 @@ Sources =
   eventInstanceStealing.cpp
   visualLabels.cpp
   occlusion.cpp
+  occlusionGPU.cpp
+  assertsMonitor.cpp
 ;
 
 if $(Config) = rel {
@@ -63,7 +65,23 @@ if $(Platform) in iOS {
 UseProgLibs =
   engine/coreUtil
   $(FmodUseProgLib)
+  gameLibs/soundOcclusionGPU
 ;
+
+if $(UseSteamAudio) = yes && $(Platform)-$(PlatformArch) in windows-x86 windows-x86_64 {
+  AddIncludes += $(_DEVTOOL)/steamaudio-4.8.1/include ;
+  Sources +=
+    steamAudio/steamAudio.cpp
+    steamAudio/steamAudioSpatializer.cpp
+  ;
+  if $(Platform)-$(PlatformArch) = windows-x86_64 {
+    AddLibs += $(_DEVTOOL)/steamaudio-4.8.1/lib/windows-x64/phonon.lib ;
+  } else {
+    AddLibs += $(_DEVTOOL)/steamaudio-4.8.1/lib/windows-x86/phonon.lib ;
+  }
+} else {
+  Sources += stub/steamAudioStub.cpp ;
+}
 
 include $(Root)/prog/_jBuild/build.jam ;
 

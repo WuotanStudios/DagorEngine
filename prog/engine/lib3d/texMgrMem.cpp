@@ -20,6 +20,7 @@
 #include <util/dag_string.h>
 #include <osApiWrappers/dag_threads.h>
 #include <osApiWrappers/dag_miscApi.h>
+#include <osApiWrappers/dag_stackHlp.h>
 #include <3d/tql.h>
 #include <EASTL/vector_set.h>
 #include <generic/dag_tabWithLock.h>
@@ -58,12 +59,17 @@ static void load_tex_on_usage(dag::ConstSpan<TEXTUREID> tid);
 static void free_up_sys_mem(int mem_to_free_tb, bool force_report = false);
 static void free_up_gpu_mem(int mem_to_free_kb, int actual_quota_kb, bool should_evict_unused = false);
 
+static uint32_t get_total_used_persistent_mem_kb()
+{
+  return interlocked_relaxed_load(mem_used_persistent_kb) + interlocked_relaxed_load(tql::gpu_mem_backend_overhead_kb);
+}
+
 void tql::get_tex_streaming_stats(int &_mem_used_discardable_kb, int &_mem_used_persistent_kb, int &_mem_used_discardable_kb_max,
   int &_mem_used_persistent_kb_max, int &_mem_used_sum_kb_max, int &_tex_used_discardable_cnt, int &_tex_used_persistent_cnt,
   int &_max_mem_used_overdraft_kb)
 {
   _mem_used_discardable_kb = interlocked_relaxed_load(mem_used_discardable_kb);
-  _mem_used_persistent_kb = interlocked_relaxed_load(mem_used_persistent_kb);
+  _mem_used_persistent_kb = get_total_used_persistent_mem_kb();
   _mem_used_discardable_kb_max = interlocked_relaxed_load(mem_used_discardable_kb_max);
   _mem_used_persistent_kb_max = interlocked_relaxed_load(mem_used_persistent_kb_max);
   _mem_used_sum_kb_max = interlocked_relaxed_load(mem_used_sum_kb_max);
@@ -71,21 +77,22 @@ void tql::get_tex_streaming_stats(int &_mem_used_discardable_kb, int &_mem_used_
   _tex_used_persistent_cnt = interlocked_relaxed_load(tex_used_persistent_cnt);
   _max_mem_used_overdraft_kb = 0 /*-mem_quota_reserve_kb*/;
 }
-static bool schedule_trim_discardable_tex_mem = false;
+// set from driver code on memory pressure, consumed in on_frame_finished()
+static int trim_discardable_tex_mem_pending = 0;
 void tql::schedule_trim_discardable_tex_mem()
 {
   if (!tql::streaming_enabled)
     return;
-  ::schedule_trim_discardable_tex_mem = true;
+  interlocked_release_store(trim_discardable_tex_mem_pending, 1);
 }
 void tql::trim_discardable_tex_mem()
 {
   if (!tql::streaming_enabled)
     return;
   int memUsedDiscardableKb = interlocked_relaxed_load(mem_used_discardable_kb);
-  int memUsedPersistentKb = interlocked_relaxed_load(mem_used_persistent_kb);
-  free_up_gpu_mem(memUsedDiscardableKb, memUsedPersistentKb, true);
-  debug("Force trim discardable texture memory: %dKb", memUsedDiscardableKb);
+  int actualQuotaKb = tql::mem_quota_kb - get_total_used_persistent_mem_kb() - mem_quota_reserve_kb;
+  free_up_gpu_mem(memUsedDiscardableKb, actualQuotaKb, true);
+  debug("Force trim discardable texture memory: %dKb (strmQuota=%dKb)", memUsedDiscardableKb, actualQuotaKb);
 }
 
 // TODO: implement inside of dag_atomic.h through intrinsics with this as fallback
@@ -227,11 +234,11 @@ static void on_tex_released(BaseTexture *t)
     debug("TEX- %p %dK -> pers(%d)=%dK discr(%d)=%dK quota=%dK", t, sz, observedTexUsedPersistentCnt, observedMemUsedPersistentKb,
       observedTexUsedDiscardableCnt, observedMemUsedDiscardableKb, tql::mem_quota_kb);
 }
-static void on_buf_changed(bool add, int delta_sz_kb)
+static void on_persistent_changed(bool add, int delta_sz_kb)
 {
   interlocked_add(mem_used_persistent_kb, delta_sz_kb);
   if (mgr_log_level >= 3)
-    debug("%s %+dK", add ? "BUF+" : "BUF-", delta_sz_kb);
+    debug("%s %+dK", add ? "PERS+" : "PERS-", delta_sz_kb);
   G_UNUSED(add);
 }
 static bool check_texture_id_valid(TEXTUREID tid) { return is_managed_texture_id_valid(tid, true); }
@@ -240,6 +247,10 @@ static void do_stop_bkg_tex_loading(int sleep_quant)
 {
   if (reload_jobmgr_id >= 0 && cpujobs::is_inited())
   {
+    // stop on_frame_finished() (called below) from re-queueing jobs, else the drain never ends
+    const bool wasDisabled = interlocked_acquire_load(texmgr_internal::texq_load_disabled);
+    interlocked_release_store(texmgr_internal::texq_load_disabled, 1);
+
     cpujobs::reset_job_queue(reload_jobmgr_id, true);
     while (cpujobs::is_job_manager_busy(reload_jobmgr_id))
     {
@@ -251,6 +262,9 @@ static void do_stop_bkg_tex_loading(int sleep_quant)
       if (is_main_thread())
         texmgr_internal::do_per_frame_updates_while_waiting_on_main_thread();
     }
+
+    if (!wasDisabled)
+      interlocked_release_store(texmgr_internal::texq_load_disabled, 0);
   }
 }
 
@@ -326,17 +340,23 @@ static void on_frame_finished()
       mt ? load_tex_on_usage_cb(list, true) : add_delayed_callback(+[](void *d) { load_tex_on_usage_cb(d, /*mt*/ false); }, list);
   }
 
-  if (tql::mem_quota_kb && sys_mem_usage_thres_mb && RMGR.getTotalBdCount())
+#if _TARGET_PC_WIN
+  static const int sys_mem_min_avail_commit_mb =
+    dgs_get_settings()->getBlockByNameEx("texStreaming")->getInt("sysMemMinAvailCommitMB", 512);
+#endif
+
+  if (tql::mem_quota_kb && sys_mem_usage_thres_mb && RMGR.getTotalBdCount()) //-V1051
   {
     size_t mem_used_mb = (dagor_memory_stat::get_memchunk_count(true) * 32 + dagor_memory_stat::get_memory_allocated(true)) >> 20;
 #if _TARGET_PC_WIN
     MEMORYSTATUSEX msx;
     msx.dwLength = sizeof(msx);
     if (GlobalMemoryStatusEx(&msx))
-      if ((msx.ullAvailPhys >> 20) < sys_mem_add_free_mb)
+      if ((msx.ullAvailPhys >> 20) < sys_mem_add_free_mb || (msx.ullAvailPageFile >> 20) < sys_mem_min_avail_commit_mb)
       {
         if (mgr_log_level >= 1)
-          debug("SYSMEM# AvailPhys=%dM AvailVirtual=%dM mem_used=%dM", msx.ullAvailPhys >> 20, msx.ullAvailVirtual >> 20, mem_used_mb);
+          debug("SYSMEM# AvailPhys=%dM AvailCommit=%dM AvailVirtual=%dM mem_used=%dM", msx.ullAvailPhys >> 20,
+            msx.ullAvailPageFile >> 20, msx.ullAvailVirtual >> 20, mem_used_mb);
         mem_used_mb += sys_mem_add_free_mb;
         if (mem_used_mb < sys_mem_usage_thres_mb)
           mem_used_mb = sys_mem_usage_thres_mb + 1;
@@ -346,22 +366,21 @@ static void on_frame_finished()
       free_up_sys_mem(int(mem_used_mb - sys_mem_usage_thres_mb + sys_mem_add_free_mb) << 10);
   }
 
-  const int observedMemUsedPersistentKb = interlocked_relaxed_load(mem_used_persistent_kb);
+  interlocked_relaxed_store(tql::gpu_mem_backend_overhead_kb, int(d3d::get_dedicated_gpu_memory_system_internal_overhead_kb()));
+  const int observedMemUsedPersistentKb = get_total_used_persistent_mem_kb();
 
   if (!(dagor_frame_no() & 0x7F))
   {
-    int total_gpu_mem_sz_kb = 0, free_gpu_mem_sz_kb = 0;
-    // we can't tune quota of vulkan as it can make some resources non resident,
-    // and it is reflected on free GPU memory
-    if (d3d::is_inited() && !d3d::get_driver_code().is(d3d::vulkan) &&
-        d3d::driver_command(Drv3dCommand::GET_VIDEO_MEMORY_BUDGET, (void *)&total_gpu_mem_sz_kb, (void *)&free_gpu_mem_sz_kb))
+    int total_gpu_mem_sz_kb = 0, free_gpu_mem_sz_kb = 0, used_gpu_mem_sz_kb = 0;
+    if (d3d::is_inited() && d3d::driver_command(Drv3dCommand::GET_VIDEO_MEMORY_BUDGET, (void *)&total_gpu_mem_sz_kb,
+                              (void *)&free_gpu_mem_sz_kb, (void *)&used_gpu_mem_sz_kb))
     {
       int as_reserve_kb = 0;
       int as_memory_kb = 0;
 
-      // If there are any number of acceleration structures allocated, make room for 2GB of acceleration structure data.
+      // If there are any number of acceleration structures allocated, make room for 512MB of acceleration structure data.
       static const int as_reserve_target_kb =
-        dgs_get_settings()->getBlockByNameEx("texStreaming")->getInt("asReserveTargetKb", 2 << 20);
+        dgs_get_settings()->getBlockByNameEx("texStreaming")->getInt("asReserveTargetKb", 1 << 19);
 
       if (as_reserve_target_kb)
       {
@@ -374,6 +393,35 @@ static void on_frame_finished()
       int new_quota_kb = min(observedMemUsedPersistentKb + RMGR.getTotalUsedTexSzKB() + free_gpu_mem_sz_kb, total_gpu_mem_sz_kb) -
                          max(tql::gpu_mem_reserve_kb, as_reserve_kb);
 
+#if _TARGET_PC_WIN
+      MEMORYSTATUSEX msx;
+      msx.dwLength = sizeof(msx);
+      if (GlobalMemoryStatusEx(&msx))
+      {
+        int64_t commit_quota_kb = observedMemUsedPersistentKb + RMGR.getTotalUsedTexSzKB() +
+                                  max(int64_t(msx.ullAvailPageFile >> 10) - (int64_t(sys_mem_min_avail_commit_mb) << 10), int64_t(0));
+        if (commit_quota_kb < new_quota_kb)
+        {
+          // keyed on free commit (the quota itself stays almost flat while textures consume it)
+          // and on the requested quota; the quiet period keeps an active clamp visible
+          static int64_t lastLoggedAvailKb = -1, lastLoggedQuotaKb = -1;
+          static int64_t lastLoggedReft = 0;
+          const int64_t availKb = int64_t(msx.ullAvailPageFile >> 10);
+          const int64_t thresholdKb = min(int64_t(64 << 10), max(lastLoggedAvailKb / 8, int64_t(16 << 10)));
+          if (lastLoggedAvailKb < 0 || availKb < lastLoggedAvailKb - thresholdKb || availKb > lastLoggedAvailKb + thresholdKb ||
+              abs(new_quota_kb - lastLoggedQuotaKb) > (64 << 10) || profile_usec_passed(lastLoggedReft, 60 * 1000000))
+          {
+            debug("freeGPUmem= quota clamped by commit: %dM -> %dM, availCommit=%dM", new_quota_kb >> 10, commit_quota_kb >> 10,
+              msx.ullAvailPageFile >> 20);
+            lastLoggedAvailKb = availKb;
+            lastLoggedQuotaKb = new_quota_kb;
+            lastLoggedReft = profile_ref_ticks();
+          }
+          new_quota_kb = int(commit_quota_kb);
+        }
+      }
+#endif
+
       if (new_quota_kb + (2 << 10) < tql::mem_quota_kb || new_quota_kb > tql::mem_quota_kb + (64 << 10))
       {
         if (new_quota_kb > tql::mem_quota_limit_kb)
@@ -381,18 +429,21 @@ static void on_frame_finished()
 
         if (new_quota_kb != tql::mem_quota_kb)
         {
-          debug("freeGPUmem= %dM (%dM), so tql::mem_quota_kb changed (%dM -> %dM). AS allocation is %dM, as reserve is %dM",
-            free_gpu_mem_sz_kb >> 10, total_gpu_mem_sz_kb >> 10, tql::mem_quota_kb >> 10, new_quota_kb >> 10, as_memory_kb >> 10,
-            as_reserve_kb >> 10);
+          debug(
+            "freeGPUmem= %dM (%dM), vram overhead %dM, so tql::mem_quota_kb changed (%dM -> %dM). AS allocation is %dM, as reserve "
+            "is %dM",
+            free_gpu_mem_sz_kb >> 10, total_gpu_mem_sz_kb >> 10, interlocked_relaxed_load(tql::gpu_mem_backend_overhead_kb) >> 10,
+            tql::mem_quota_kb >> 10, new_quota_kb >> 10, as_memory_kb >> 10, as_reserve_kb >> 10);
           tql::mem_quota_kb = new_quota_kb;
         }
       }
-      if (schedule_trim_discardable_tex_mem)
-      {
-        tql::trim_discardable_tex_mem();
-        schedule_trim_discardable_tex_mem = false;
-      }
     }
+  }
+
+  if (interlocked_acquire_load(trim_discardable_tex_mem_pending))
+  {
+    interlocked_release_store(trim_discardable_tex_mem_pending, 0);
+    tql::trim_discardable_tex_mem();
   }
 
   int actual_quota_kb = tql::mem_quota_kb - observedMemUsedPersistentKb - mem_quota_reserve_kb;
@@ -401,8 +452,6 @@ static void on_frame_finished()
 
   if (!(dagor_frame_no() & 0x3FF))
     dump_texture_streaming_memory_state();
-
-  RMGR.copyMaxReqLevToPrev();
 
   if (reload_jobmgr_id < 0)
     return;
@@ -506,10 +555,9 @@ static void free_up_gpu_mem(int mem_to_free_kb, int actual_quota_kb, bool should
 
   if (mgr_log_level >= 2 && !skip_log && mem_to_free_kb > RMGR.getTotalAddMemNeededSzKB())
     debug("GPUMEM* %dM (%dM pers + %dM in %d tex); to_free=%dK (ready to free %dM in %d tex), strmQuota=%dM frame=%d (%d)",
-      (RMGR.getTotalUsedTexSzKB() + interlocked_relaxed_load(mem_used_persistent_kb)) >> 10,
-      interlocked_relaxed_load(mem_used_persistent_kb) >> 10, RMGR.getTotalUsedTexSzKB() >> 10, RMGR.getTotalUsedTexCount(),
-      interlocked_relaxed_load(mem_to_free_kb), RMGR.getReadyForDiscardTexSzKB() >> 10, RMGR.getReadyForDiscardTexCount(),
-      actual_quota_kb >> 10, frame, log_hide_cnt);
+      (RMGR.getTotalUsedTexSzKB() + get_total_used_persistent_mem_kb()) >> 10, (get_total_used_persistent_mem_kb()) >> 10,
+      RMGR.getTotalUsedTexSzKB() >> 10, RMGR.getTotalUsedTexCount(), interlocked_relaxed_load(mem_to_free_kb),
+      RMGR.getReadyForDiscardTexSzKB() >> 10, RMGR.getReadyForDiscardTexCount(), actual_quota_kb >> 10, frame, log_hide_cnt);
   log_hide_cnt = skip_log ? log_hide_cnt + 1 : 0;
 
   if (!RMGR.getTotalUsedTexCount())
@@ -584,7 +632,7 @@ static void free_up_gpu_mem(int mem_to_free_kb, int actual_quota_kb, bool should
     }
     if (!texmgr_internal::is_gpu_mem_enough_to_load_hq_tex())
     {
-      const int observedMemUsedPersistentKb = interlocked_relaxed_load(tql::mem_used_persistent_kb);
+      const int observedMemUsedPersistentKb = get_total_used_persistent_mem_kb();
       target_tex_size = tql::mem_quota_kb - observedMemUsedPersistentKb - tql::mem_quota_reserve_kb;
       for (unsigned i = startDowngrade, ie = endDowngrade; i < ie; i++)
         if (DAGOR_UNLIKELY(RMGR.getRefCount(i) < 0) || RMGR.texDesc[i].dim.stubIdx < 0 ||
@@ -601,7 +649,8 @@ static void free_up_gpu_mem(int mem_to_free_kb, int actual_quota_kb, bool should
               BREAK_WHEN_CLEANED_ENOUGH_GPUMEM();
             }
         }
-        else if (downgraded < 10 && RMGR.resQS[i].getLdLev() > RMGR.resQS[i].getMaxLev() && !RMGR.resQS[i].isReading())
+        else if (downgraded < 10 && max<unsigned>(RMGR.resQS[i].getLdLev(), RMGR.getTexAllocLev(i)) > RMGR.resQS[i].getMaxLev() &&
+                 !RMGR.resQS[i].isReading())
         {
           if (BaseTexture *t = RMGR.baseTexture(i))
             if (RMGR.downgradeTexQuality(i, *t, RMGR.resQS[i].getMaxLev()))
@@ -737,7 +786,7 @@ void init_managed_textures_streaming_support(int _reload_jobmgr_id)
   tql::check_texture_id_valid = &check_texture_id_valid;
   tql::on_tex_created = &on_tex_created;
   tql::on_tex_released = &on_tex_released;
-  tql::on_buf_changed = &on_buf_changed;
+  tql::on_persistent_changed = &on_persistent_changed;
   tql::unload_on_drv_shutdown = &unload_on_drv_shutdown;
   texmgr_internal::always_release_threshold_tex_size_kb = b.getInt("alwaysReleaseThresholdTexSizeKB", -1);
   if (!b.getBool("alwaysRelease", false))
@@ -812,9 +861,19 @@ void init_managed_textures_streaming_support(int _reload_jobmgr_id)
     debug("will use %d ms wait before each tex loaded in reload_jobmg", texmgr_internal::dbg_texq_load_sleep_ms);
 
   if (reload_jobmgr_id >= 0 && texmgr_internal::texq_load_on_demand)
+  {
     tql::on_frame_finished = &on_frame_finished;
+    register_regular_action_to_idle_cycle(
+      +[](void *) {
+        if (is_main_thread())
+          texmgr_internal::do_per_frame_updates_while_waiting_on_main_thread();
+      },
+      nullptr, false);
+  }
   else
+  {
     register_regular_action_to_idle_cycle(+[](void *) { flush_streaming_actions_to_d3d(); }, nullptr);
+  }
 #undef READ_PROP
 }
 
@@ -823,7 +882,7 @@ bool is_managed_textures_streaming_load_on_demand() { return tql::streaming_enab
 
 void dump_texture_streaming_memory_state()
 {
-  const int observedMemUsedPersistentKb = interlocked_relaxed_load(mem_used_persistent_kb);
+  const int observedMemUsedPersistentKb = get_total_used_persistent_mem_kb();
   int actual_quota_kb = tql::mem_quota_kb - observedMemUsedPersistentKb - mem_quota_reserve_kb;
   size_t mem_used_mb = (dagor_memory_stat::get_memchunk_count(true) * 32 + dagor_memory_stat::get_memory_allocated(true)) >> 20;
 
@@ -847,28 +906,27 @@ void dump_texture_streaming_memory_state()
 bool texmgr_internal::D3dResMgrDataFinal::downgradeTexQuality(int idx, BaseTexture &this_tex, int req_lev)
 {
   unsigned ld_lev = resQS[idx].getLdLev();
-  if (ld_lev <= 1 || (ld_lev <= req_lev && getTexAddMemSizeNeeded4K(idx) != 0)) //==
+  if (ld_lev <= 1 || (ld_lev <= req_lev && getTexAllocLev(idx) <= req_lev))
     return false;
+  // the resized object holds only filled mips, so it can not be larger than what is loaded
+  req_lev = min<int>(req_lev, ld_lev);
 
   if (texDesc[idx].dim.stubIdx >= 0 && req_lev == 1 && getTexMemSize4K(idx) > 1 && RMGR.startReading(idx, 1))
   {
-    if (incRefCount(idx) == 1)
-      RMGR.decReadyForDiscardTex(idx);
+    RMGR.incRefCountAndDecReadyForDiscardTex(idx);
     this_tex.discardTex();
-    RMGR.changeTexUsedMem(idx, tql::sizeInKb(this_tex.getSize()), (getTexMemSize4K(idx) + getTexAddMemSizeNeeded4K(idx)) * 4);
+    RMGR.changeTexUsedMem(idx, tql::sizeInKb(this_tex.getSize()), (getTexMemSize4K(idx) + getTexAddMemSizeNeeded4K(idx)) * 4, 1);
     resQS[idx].setCurQL(TQL_stub);
     resQS[idx].setLdLev(1);
     resQS[idx].setMaxReqLev(1);
-    if (decRefCount(idx) == 0)
-      RMGR.incReadyForDiscardTex(idx);
+    RMGR.decRefCountAndIncReadyForDiscardTex(idx);
     RMGR.incTexStreamingGeneration(idx);
     return true;
   }
 
   if (req_lev > 1 && RMGR.startReading(idx, req_lev))
   {
-    if (incRefCount(idx) == 1)
-      RMGR.decReadyForDiscardTex(idx);
+    RMGR.incRefCountAndDecReadyForDiscardTex(idx);
     unsigned skip = (texDesc[idx].dim.maxLev - req_lev);
     unsigned w = max(texDesc[idx].dim.w >> skip, 1), h = max(texDesc[idx].dim.h >> skip, 1);
     unsigned d = max(this_tex.getType() == D3DResourceType::VOLTEX ? texDesc[idx].dim.d >> skip : texDesc[idx].dim.d, 1);
@@ -876,16 +934,23 @@ bool texmgr_internal::D3dResMgrDataFinal::downgradeTexQuality(int idx, BaseTextu
 
     if (auto tmpTex = tql::makeResizedTmpTexResCopy(&this_tex, w, h, d, l, ld_lev))
     {
-      RMGR.changeTexUsedMem(idx, tql::sizeInKb(tmpTex->getSize()), (getTexMemSize4K(idx) + getTexAddMemSizeNeeded4K(idx)) * 4);
+      RMGR.changeTexUsedMem(idx, tql::sizeInKb(tmpTex->getSize()), (getTexMemSize4K(idx) + getTexAddMemSizeNeeded4K(idx)) * 4,
+        req_lev);
       RMGR.completeTextureUpdateAsync(idx, &this_tex, tmpTex, 0, l - 1, [req_lev](int idx) {
         resQS[idx].setCurQL(req_lev < resQS[idx].getQLev() ? calcCurQL(idx, req_lev) : resQS[idx].getMaxQL());
         resQS[idx].setLdLev(req_lev);
         resQS[idx].setMaxReqLev(req_lev);
       });
     }
+    else
+    {
+      // undo startReading; not cancelReading: that drops a base tex ref taken only by scheduleReading
+      resQS[idx].setRdLev(0);
+      RMGR.decRefCountAndIncReadyForDiscardTex(idx);
+      return false;
+    }
 
-    if (decRefCount(idx) == 0)
-      RMGR.incReadyForDiscardTex(idx);
+    RMGR.decRefCountAndIncReadyForDiscardTex(idx);
 
     RMGR_DUMP_TEX_STATE(idx);
     return true;
@@ -908,7 +973,7 @@ bool prefetch_managed_textures(dag::ConstSpan<TEXTUREID> tid)
     int rc = RMGR.getRefCount(idx);
     if (rc < 0)
       continue;
-    if (!rc || (RMGR.baseTexture(idx) && RMGR.isTexLoaded(idx, false)))
+    if (!rc || (RMGR.getD3dRes(idx) && RMGR.isTexLoaded(idx, false)))
       ready++;
     if (RMGR.texDesc[idx].dim.stubIdx >= 0)
       RMGR.markResLFU(tid[i]);
@@ -944,24 +1009,27 @@ bool prefetch_managed_textures_by_textag(int textag)
 
 bool prefetch_and_check_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_list, bool fq_loaded)
 {
-  if (check_all_managed_textures_loaded(tex_list, fq_loaded))
-    return true;
-  bool loaded = is_managed_textures_streaming_load_on_demand() ? prefetch_managed_textures(tex_list) : false;
   for (TEXTUREID id : tex_list)
-    mark_managed_tex_lfu(id);
-  return (loaded && fq_loaded) ? check_all_managed_textures_loaded(tex_list, fq_loaded) : loaded;
+  {
+    int idx = RMGR.toIndex(id);
+    if (idx < 0)
+      continue;
+    RMGR.markResLFU(id, RMGR.calcTexLoadedLev(idx, fq_loaded));
+  }
+  return check_all_managed_textures_loaded(tex_list, fq_loaded);
 }
 
-
-void prefetch_and_wait_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_list, bool fq_loaded)
+bool prefetch_and_wait_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_list, bool fq_loaded, int timeout_usec)
 {
   int64_t reft = ref_time_ticks();
   unsigned f = dagor_frame_no();
-#if DAGOR_THREAD_SANITIZER
-  int timeout_usec = is_main_thread() ? 15000000 /*15 sec*/ : 40000000 /*40 sec*/; // TSAN takes longer
-#else
-  int timeout_usec = is_main_thread() ? 5000000 /*5 sec*/ : 30000000 /*30 sec*/;
+  if (timeout_usec == 0)
+  {
+    timeout_usec = is_main_thread() ? 5'000'000 /*5 sec*/ : 30'000'000 /*30 sec*/;
+#if DAGOR_THREAD_SANITIZER || DAGOR_ADDRESS_SANITIZER
+    timeout_usec *= 3; // TSAN and ASAN takes longer
 #endif
+  }
   while (!prefetch_and_check_managed_textures_loaded(tex_list, fq_loaded))
   {
     if (!texmgr_internal::texq_load_on_demand)
@@ -993,7 +1061,7 @@ void prefetch_and_wait_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_lis
       }
 
       if (tex_list.size() == ready)
-        return;
+        return true;
       if (tex_list.size() == ready + bad)
       {
         debug("%s: finish waiting: %d ready, %d bad; waited %d msec (%d frames)", __FUNCTION__, ready, bad, get_time_usec(reft) / 1000,
@@ -1001,7 +1069,7 @@ void prefetch_and_wait_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_lis
         for (TEXTUREID tid : tex_list)
           if (RMGR.isValidID(tid, nullptr) && !check_managed_texture_loaded(tid, fq_loaded) && RMGR.resQS[tid.index()].getRdLev() == 0)
             RMGR.dumpTexState(tid.index());
-        return;
+        return false;
       }
     }
     if (get_time_usec(reft) > timeout_usec)
@@ -1026,16 +1094,26 @@ void prefetch_and_wait_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_lis
         G_UNUSED(rc);
         G_UNUSED(loaded_bq);
       }
+#if _TARGET_PC_WIN && _TARGET_64BIT && !_TARGET_PC_TOOLS_BUILD
+      if (!is_main_thread())
+      {
+        logdbg("%s: timeout for back thread: main thread callstack follows:", __FUNCTION__);
+        dump_thread_callstack(get_main_thread_id());
+      }
+#endif
       logerr("%s: timeout=%d usec (for %s thread) passed, waiting for %d tex, %s, frame=%d", __FUNCTION__, timeout_usec,
         is_main_thread() ? "main" : "back", tex_list.size(), fq_loaded ? "FQ" : "BQ", dagor_frame_no());
-      break;
+      return false;
     }
   }
+  return true;
 }
 
 void texmgr_internal::do_per_frame_updates_while_waiting_on_main_thread()
 {
   G_ASSERT(is_main_thread());
+  if (!d3d::is_inited())
+    return;
   tql::on_frame_finished ? tql::on_frame_finished() : on_frame_finished();
   // process pending resource updates to avoid stalling here when waiting in main thread
   if (d3d::driver_command(Drv3dCommand::PROCESS_PENDING_RESOURCE_UPDATED))

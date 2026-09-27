@@ -43,4 +43,16 @@ UseProgLibs +=
   gameLibs/resourcePool
 ;
 
+if $(HaveRenderer) = yes {
+  UseProgLibs += gameLibs/render/nodeBasedShader ;
+} else {
+  UseProgLibs += gameLibs/render/nodeBasedShader/stub ;
+}
+
+SourceES =
+  cloudsRainMapES.cpp.inl
+;
+
+for s in $(SourceES) { GenESSourceFile $(s) ; }
+
 include $(Root)/prog/_jBuild/build.jam ;

@@ -23,7 +23,7 @@ static vec3f transform_vec_upto_root(const GeomNodeTree &tree, dag::Index16 n, v
   return v;
 }
 
-void AnimV20::LegsIKCtrl::init(IPureAnimStateHolder &st, const GeomNodeTree &tree)
+void AnimV20::LegsIKCtrl::init(AnimGraphStateHolder &st, const GeomNodeTree &tree)
 {
   if (!rec.size())
     return;
@@ -42,15 +42,15 @@ void AnimV20::LegsIKCtrl::init(IPureAnimStateHolder &st, const GeomNodeTree &tre
     nodes[i].dy = nodes[i].da = nodes[i].dt = 0;
   }
 }
-void AnimV20::LegsIKCtrl::advance(IPureAnimStateHolder &st, real dt)
+void AnimV20::LegsIKCtrl::advance(AnimGraphStateHolder &st, real dt)
 {
   NodeId *nodes = (NodeId *)st.getInlinePtr(varId);
   for (int i = 0; i < rec.size(); i++)
     nodes[i].dt = dt;
 }
-void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTree &tree, AnimPostBlendCtrl::Context &ctx)
+void AnimV20::LegsIKCtrl::process(AnimGraphStateHolder &st, real wt, GeomNodeTree &tree, AnimPostBlendCtrl::Context &ctx)
 {
-  if (wt < 1e-3f || tree.empty())
+  if (wt < 1e-3f || tree.empty() || rec.size() == 0)
     return;
 
   TIME_PROFILE_DEV(LegsIKCtrl);
@@ -59,11 +59,24 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
 
   G_ASSERT_AND_DO(rec.size(), return);
 
+  struct alignas(16) AdditionalLegData
+  {
+    Point3 footP1; // must be 16-byte aligned: written/read via aligned v_st/v_ld
+    bool moveFoot; // sits in the W lane of the v_st(&footP1.x, ...) store, which sets it
+    float legsDiff;
+  };
+
   tree.calcWtm();
   vec3f wofs = v_add(ctx.worldTranslate, ctx.ac->getWtmOfs());
-  dag::RelocatableFixedVector<AnimCharV20::LegsIkRay, 8, true /*OF*/, framemem_allocator> traces;
+
+  dag::RelocatableFixedVector<AnimCharV20::TraceRayInfo, 8, true /*OF*/, framemem_allocator> traces;
   traces.resize(isCrawl ? rec.size() : rec.size() * 2);
-  memset(traces.data(), 0, sizeof(AnimCharV20::LegsIkRay) * traces.size());
+  memset(traces.data(), 0, sizeof(AnimCharV20::TraceRayInfo) * traces.size());
+
+  dag::RelocatableFixedVector<AdditionalLegData, 8, true /*OF*/, framemem_allocator> legData;
+  legData.resize(isCrawl ? rec.size() : rec.size() * 2);
+  memset(legData.data(), 0, sizeof(AdditionalLegData) * legData.size());
+
   bool isTraceDown = !isCrawl;
   for (int i = 0; i < rec.size(); i++)
   {
@@ -98,7 +111,7 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
       pt = v_add(pt, v_mat44_mul_vec3p(animcharTmCorrected, v_ldu(&kneeOffset.x)));
       v_st(&traces[i].pos.x, v_perm_xyzd(pt, v_splats(crawlMaxRay)));
       v_st(&traces[i].dir.x, v_perm_xyzd(dir, v_zero()));
-      v_st(&traces[i].footP1.x, v_perm_xyzd(foot_p1, v_zero()));
+      v_st(&legData[i].footP1.x, v_perm_xyzd(foot_p1, v_zero()));
     }
     else // !isCrawl
     {
@@ -127,16 +140,18 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
           v_madd(vup, v_splats(footUpOfs), v_add(v_mat44_mul_vec3p(animcharTm, v_and(foot_p2, v_cast_vec4f(V_CI_MASK1010))), wofs));
         v_st(&traces[i * 2 + 0].pos.x, v_perm_xyzd(tr1, v_splats(maxDist)));
         v_st(&traces[i * 2 + 1].pos.x, v_perm_xyzd(tr2, v_splats(maxDist)));
-        v_st(&traces[i * 2 + 0].dir.x, v_perm_xyzd(v_neg(vup), v_splats(leg_diff)));
-        v_st(&traces[i * 2 + 1].dir.x, v_perm_xyzd(v_neg(vup), v_splats(leg_diff)));
+        v_st(&traces[i * 2 + 0].dir.x, v_neg(vup));
+        v_st(&traces[i * 2 + 1].dir.x, v_neg(vup));
+        legData[i * 2 + 0].legsDiff = leg_diff;
+        legData[i * 2 + 1].legsDiff = leg_diff;
       }
       else
       {
         traces[i * 2 + 0].t = -1.f;
         traces[i * 2 + 1].t = -1.f;
       }
-      v_st(&traces[i * 2 + 0].footP1.x, v_perm_xyzd(foot_p1, v_cast_vec4f(v_splatsi(move_foot))));
-      v_st(&traces[i * 2 + 1].footP1.x, v_perm_xyzd(foot_p1, v_cast_vec4f(v_splatsi(move_foot))));
+      v_st(&legData[i * 2 + 0].footP1.x, v_perm_xyzd(foot_p1, v_cast_vec4f(v_splatsi(move_foot))));
+      v_st(&legData[i * 2 + 1].footP1.x, v_perm_xyzd(foot_p1, v_cast_vec4f(v_splatsi(move_foot))));
     }
   }
 
@@ -152,7 +167,7 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
         footNewPos = v_sub(v_madd(v_ld(&traces[i].dir.x), v_splats(traces[i].t - crawlFootOffset), v_ld(&traces[i].pos.x)), wofs);
         footNewPos = v_and(footNewPos, V_CI_MASK1110);
         nodes[i].da = crawlFootAngle + v_extract_x(v_acos_x(v_set_x((crawlMaxRay - traces[i].t) / crawlMaxRay)));
-        traces[i].moveFoot = true;
+        legData[i].moveFoot = true;
       }
     }
     else
@@ -161,7 +176,7 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
       if (traceRes == GIRQR_TraceOK && traces[i * 2].t >= 0)
       {
         float maxDist = rec[i].maxFootUp + 0.15f;
-        float footUpOfs = min(rec[i].maxFootUp, (traces[i * 2].legsDiff + 0.15f) * 0.9f);
+        float footUpOfs = min(rec[i].maxFootUp, (legData[i * 2].legsDiff + 0.15f) * 0.9f);
         float t1 = traces[i * 2 + 0].t;
         float t2 = traces[i * 2 + 1].t;
         trace_h1 = (t1 != maxDist ? t1 : t2) - footUpOfs;
@@ -171,7 +186,7 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
       }
 
       float foot_len = v_extract_w(rec[i].vFootFwd);
-      vec3f foot_p1 = v_ld(&traces[i * 2].footP1.x);
+      vec3f foot_p1 = v_ld(&legData[i * 2].footP1.x);
       float foot_h1 = v_extract_y(foot_p1);
       // float foot_h2 = v_extract_y(foot_p2);
       float move_wt = clamp<float>((rec[i].footStepRange[1] - foot_h1) * rec[i].footStepRange[0], 0.0f, 1.0f);
@@ -211,7 +226,7 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
       }
     } // isCrawl
 
-    bool move_foot = traces[isCrawl ? i : i * 2].moveFoot;
+    bool move_foot = legData[isCrawl ? i : i * 2].moveFoot;
     if (alwaysSolve || nodes[i].dy || move_foot)
     {
       auto foot = nodes[i].footId;
@@ -222,15 +237,21 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
       mat44f &knee_wtm = tree.getNodeWtmRel(nodes[i].kneeId);
       float len0 = v_extract_x(v_length3_x(v_sub(leg_wtm.col3, knee_wtm.col3)));
       float len1 = v_extract_x(v_length3_x(v_sub(foot_wtm.col3, knee_wtm.col3)));
-      vec3f foot_p1 = v_ld(&traces[isCrawl ? i : i * 2].footP1.x);
+      vec3f foot_p1 = v_ld(&legData[isCrawl ? i : i * 2].footP1.x);
       vec4f vup = V_C_UNIT_0100;
       if (rec[i].useAnimcharUpDir)
         vup = tree.getRootWtmRel().col1;
       if (isCrawl)
         foot_wtm.col3 = footNewPos;
       else
-        foot_wtm.col3 = v_perm_xyzd(v_madd(vup, v_splats(nodes[i].dy), move_foot ? foot_p1 : foot_wtm.col3), V_C_UNIT_0001);
+      {
+        // footP1 is stored in root-local space (see transform_vec_upto_root), convert before using as wtmRel pos
+        vec3f movedFootPos = v_mat44_mul_vec3p(tree.getRootWtmRel(), foot_p1);
+        foot_wtm.col3 = v_perm_xyzd(v_madd(vup, v_splats(nodes[i].dy), move_foot ? movedFootPos : foot_wtm.col3), V_C_UNIT_0001);
+      }
       vec3f flex_direction = v_cross3(v_sub(foot_wtm.col3, leg_wtm.col3), leg_wtm.col2);
+      if (rec[i].reverseFlexDirection)
+        flex_direction = v_neg(flex_direction);
       solve_2bones_ik(leg_wtm, knee_wtm, foot_wtm, foot_wtm, len0, len1, flex_direction);
       if (ctx.acScale)
       {
@@ -263,7 +284,8 @@ void AnimV20::LegsIKCtrl::process(IPureAnimStateHolder &st, real wt, GeomNodeTre
 void AnimV20::LegsIKCtrl::createNode(AnimationGraph &graph, const DataBlock &blk)
 {
   const char *name = blk.getStr("name", NULL);
-  G_ASSERTF_AND_DO(name != NULL, return, "not found '%s' param", "name");
+  if (!isAnimNodeNameValid(name))
+    return;
 
   LegsIKCtrl *node = new LegsIKCtrl(graph);
   const DataBlock &def = *blk.getBlockByNameEx("def");
@@ -295,12 +317,12 @@ void AnimV20::LegsIKCtrl::createNode(AnimationGraph &graph, const DataBlock &blk
       r.maxDaRate = DEG_TO_RAD * GET_PROP(Real, "maxDaRate", 60); // deg/s
 
       r.useAnimcharUpDir = GET_PROP(Bool, "useAnimcharUpDir", false);
+      r.reverseFlexDirection = GET_PROP(Bool, "reverseFlexDirection", false);
 
       G_ASSERTF_AND_DO(!r.foot.empty() && !r.knee.empty() && !r.leg.empty(), node->rec.pop_back(), "foot=<%s> knee=<%s> leg=<%s>",
         r.foot, r.knee, r.leg);
 #undef GET_PROP
     }
-  G_ASSERTF(node->rec.size(), "no legs?");
 
   node->alwaysSolve = blk.getBool("alwaysSolve", false);
   node->isCrawl = blk.getBool("isCrawl", false);
@@ -309,6 +331,6 @@ void AnimV20::LegsIKCtrl::createNode(AnimationGraph &graph, const DataBlock &blk
   node->crawlFootAngle = blk.getReal("crawlFootAngle", 130.f);
   node->crawlMaxRay = blk.getReal("crawlMaxRay", 0.5f);
   node->varId =
-    graph.addInlinePtrParamId(String(0, "$%s", name), sizeof(NodeId) * node->rec.size(), IPureAnimStateHolder::PT_InlinePtr);
+    graph.addInlinePtrParamId(String(0, "$%s", name), sizeof(NodeId) * node->rec.size(), AnimGraphStateHolder::PT_InlinePtr);
   graph.registerBlendNode(node, name);
 }

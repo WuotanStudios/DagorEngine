@@ -1,8 +1,6 @@
 include "caustics_render_inc.dshl"
 include "frustum.dshl"
 
-
-
 shader caustics_render
 {
   no_ablend;
@@ -16,8 +14,9 @@ shader caustics_render
   POSTFX_VS_TEXCOORD_VIEWVEC(0, texcoord, viewVect)
 
   hlsl(ps) {
-    float4 caustics_ps(VsOutput input) : SV_Target
+    float2 caustics_ps(VsOutput input) : SV_Target
     {
+      input.texcoord.xy = input.texcoord.xy;
       return caustics(input.texcoord, input.viewVect);
     }
   }

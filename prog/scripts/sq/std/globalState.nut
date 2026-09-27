@@ -5,7 +5,9 @@ from "eventbus" import eventbus_send_foreign, eventbus_subscribe
 from "dagor.debug" import logerr
 from "dagor.memtrace" import is_quirrel_object_larger_than, set_huge_alloc_threshold
 from "dagor.time" import get_time_msec
+from "frp" import this_subscriber_call_may_take_up_to_usec, get_slow_subscriber_threshold_usec
 from "iostream" import blob
+from "types" import String
 // Disabled due to bug in zstd streaming decompression
 //from "json" import parse_json_from_zstd_stream, object_to_zstd_json
 // from "json" import parse_json, object_to_json_string
@@ -34,7 +36,7 @@ function readNewData(name){
 // it spamming too much, but without info about VM logs are useless
 }
 
-function globalWatched(name, ctor=null) {
+function globalWatched(name, ctor=null): table {
   assert(name not in registered, $"Global persistent state duplicate registration: {name}")
   let key = ["GLOBAL_PERSIST_STATE", name]
   local val
@@ -66,7 +68,7 @@ eventbus_subscribe(EVT_NEW_DATA, readNewData)
 local uniqueKey = null
 function setUniqueNestKey(key) {
   assert(!ndbExists(key), $"key {key} is not unique")
-  assert(type(key)=="string", $"setUniqueNestKey failed: {key} is not string")
+  assert(key instanceof String, $"setUniqueNestKey failed: {key} is not string")
   uniqueKey = key
   ndbWrite(key, true)
 }
@@ -82,7 +84,7 @@ let persistOnHardReloadData = persist("PERSIST_ON_RELOAD_DATA", @() {})
 let usedKeysForPersist = {}
 let _big_datas = persist("_big_datas", @() {})
 
-let size_threshold_to_store_as_big_data = 100 << 10
+const size_threshold_to_store_as_big_data = 100 << 10
 on_module_unload(function(is_closing) {
   if (isExiting) {
     print("App exiting, not writing PersistentOnReload data")
@@ -194,7 +196,13 @@ function hardPersistWatched(key, def=null, big_immutable_data = null) {
   }
   persistOnHardReloadData[key] <- val
   let res = Watched(val)
-  res.subscribe(@(v) persistOnHardReloadData[key] <- v)
+  if (!big_immutable_data)
+    res.subscribe(@(v) persistOnHardReloadData[key] <- v)
+  else
+    res.subscribe(function(v) {
+      this_subscriber_call_may_take_up_to_usec(10 * get_slow_subscriber_threshold_usec())
+      persistOnHardReloadData[key] <- v
+    })
   return res
 }
 

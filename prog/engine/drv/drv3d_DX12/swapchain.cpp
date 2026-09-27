@@ -4,12 +4,11 @@
 #include "device.h"
 #include "device_context.h"
 #include "resource_manager/image.h"
+#include "streamline_adapter.h"
 #include "texture.h"
 
 #include <3d/gpuLatency.h>
 #include <3d/dag_lowLatency.h>
-
-#include <EASTL/finally.h>
 
 using namespace drv3d_dx12;
 
@@ -33,7 +32,7 @@ void frontend::Swapchain::setup(SetupInfo setup, uint32_t swapchain_index)
 #endif
   if (!swapchainColorTex)
   {
-    swapchainColorTex.reset(new BaseTex{D3DResourceType::TEX, setup.colorImage->getFormat().asTexFlags() | TEXCF_RTARGET});
+    swapchainColorTex.reset(new BaseTex{D3DResourceType::TEX, setup.colorImage->getFormat().asTexFlags() | TEXCF_RTARGET, nullptr});
   }
   else
   {
@@ -54,7 +53,7 @@ void frontend::Swapchain::setup(SetupInfo setup, uint32_t swapchain_index)
     if (!swapchainSecondaryColorTex)
     {
       swapchainSecondaryColorTex.reset(
-        new BaseTex{D3DResourceType::TEX, setup.secondaryColorImage->getFormat().asTexFlags() | TEXCF_RTARGET});
+        new BaseTex{D3DResourceType::TEX, setup.secondaryColorImage->getFormat().asTexFlags() | TEXCF_RTARGET, nullptr});
     }
     else
     {
@@ -66,7 +65,7 @@ void frontend::Swapchain::setup(SetupInfo setup, uint32_t swapchain_index)
   }
 #endif
 
-  presentMode = setup.presentMode;
+  presentInterval = setup.presentInterval;
 }
 
 void backend::Swapchain::setupVirtualBackbuffers(uint32_t swapchain_index, BaseTex *frontend_target, Image *virtual_backbuffer)
@@ -76,12 +75,14 @@ void backend::Swapchain::setupVirtualBackbuffers(uint32_t swapchain_index, BaseT
   G_ASSERT(!swapchainInfo.virtualColorTarget);
   swapchainInfo.virtualColorTarget = virtual_backbuffer;
 
+  frontend_target->setName(eastl::string{eastl::string::CtorSprintf{}, "virtual_backbuffer_%u", swapchain_index}.c_str());
   G_VERIFY(frontend_target->swapTextureNoLock(swapchainInfo.colorTarget.get(), swapchainInfo.virtualColorTarget));
 }
 
 void frontend::Swapchain::waitForFrameStart() const
 {
 #if _TARGET_PC
+  TIME_PROFILE(waitForFrameStart);
   if (waitableObject)
   {
     // In some cases the object times out even when the GPU is idle and waits for work,
@@ -159,6 +160,8 @@ void backend::Swapchain::setPresentWindow(uint32_t index) { currentSwapchainInde
 
 void backend::Swapchain::registerSwapchainView(D3DDevice *device, Image *image, ImageViewInfo info)
 {
+  // A descriptor allocation only fails while the device is being removed, DescriptorHeap::allocate
+  // is fatal otherwise, so a view table entry that stays null is never reached in a live swapchain.
   auto &currentSwapchain = getCurrentSwapchain();
   auto &colorTarget = currentSwapchain.colorTarget;
   auto &swapchainViewSet = currentSwapchain.swapchainViewSet;
@@ -180,8 +183,12 @@ void backend::Swapchain::registerSwapchainView(D3DDevice *device, Image *image, 
       auto desc = info.state.asSRVDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, image->isMultisampled());
       for (auto &buffer : colorTargets)
       {
-        auto descriptor = swapchainBufferSRVHeap.allocate(device);
-        device->CreateShaderResourceView(buffer.buffer.Get(), &desc, descriptor);
+        auto descriptor = swapchainBufferSRVHeap.allocate(device)
+                            .transform([&](auto handle) {
+                              device->CreateShaderResourceView(buffer.buffer.Get(), &desc, handle);
+                              return handle;
+                            })
+                            .value_or({});
         buffer.viewTable.push_back(descriptor);
         G_ASSERT(buffer.viewTable.size() == swapchainViewSet.size());
       }
@@ -192,8 +199,12 @@ void backend::Swapchain::registerSwapchainView(D3DDevice *device, Image *image, 
       auto desc = info.state.asUAVDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D);
       for (auto &buffer : colorTargets)
       {
-        auto descriptor = swapchainBufferSRVHeap.allocate(device);
-        device->CreateUnorderedAccessView(buffer.buffer.Get(), nullptr, &desc, descriptor);
+        auto descriptor = swapchainBufferSRVHeap.allocate(device)
+                            .transform([&](auto handle) {
+                              device->CreateUnorderedAccessView(buffer.buffer.Get(), nullptr, &desc, handle);
+                              return handle;
+                            })
+                            .value_or({});
         buffer.viewTable.push_back(descriptor);
         G_ASSERT(buffer.viewTable.size() == swapchainViewSet.size());
       }
@@ -204,8 +215,12 @@ void backend::Swapchain::registerSwapchainView(D3DDevice *device, Image *image, 
       auto desc = info.state.asRTVDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, image->isMultisampled());
       for (auto &buffer : colorTargets)
       {
-        auto descriptor = swapchainBufferRTVHeap.allocate(device);
-        device->CreateRenderTargetView(buffer.buffer.Get(), &desc, descriptor);
+        auto descriptor = swapchainBufferRTVHeap.allocate(device)
+                            .transform([&](auto handle) {
+                              device->CreateRenderTargetView(buffer.buffer.Get(), &desc, handle);
+                              return handle;
+                            })
+                            .value_or({});
         buffer.viewTable.push_back(descriptor);
         G_ASSERT(buffer.viewTable.size() == swapchainViewSet.size());
       }
@@ -236,8 +251,12 @@ void backend::Swapchain::registerSwapchainView(D3DDevice *device, Image *image, 
         auto desc = info.state.asSRVDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, image->isMultisampled());
         for (auto &buffer : secondaryColorTargets)
         {
-          auto descriptor = swapchainBufferSRVHeap.allocate(device);
-          device->CreateShaderResourceView(buffer.buffer.Get(), &desc, descriptor);
+          auto descriptor = swapchainBufferSRVHeap.allocate(device)
+                              .transform([&](auto handle) {
+                                device->CreateShaderResourceView(buffer.buffer.Get(), &desc, handle);
+                                return handle;
+                              })
+                              .value_or({});
           buffer.viewTable.push_back(descriptor);
           G_ASSERT(buffer.viewTable.size() == secondarySwapchainViewSet.size());
         }
@@ -248,8 +267,12 @@ void backend::Swapchain::registerSwapchainView(D3DDevice *device, Image *image, 
         auto desc = info.state.asRTVDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, image->isMultisampled());
         for (auto &buffer : secondaryColorTargets)
         {
-          auto descriptor = swapchainBufferRTVHeap.allocate(device);
-          device->CreateRenderTargetView(buffer.buffer.Get(), &desc, descriptor);
+          auto descriptor = swapchainBufferRTVHeap.allocate(device)
+                              .transform([&](auto handle) {
+                                device->CreateRenderTargetView(buffer.buffer.Get(), &desc, handle);
+                                return handle;
+                              })
+                              .value_or({});
           buffer.viewTable.push_back(descriptor);
           G_ASSERT(buffer.viewTable.size() == secondarySwapchainViewSet.size());
         }
@@ -282,6 +305,57 @@ static bool is_tearing_supported(DXGIFactory *factory)
   return SUCCEEDED(hr) && allowTearing;
 }
 
+using FgSwapchainCreator = bool (*)(DXGIFactory *factory, ID3D12CommandQueue *queue, const SwapchainCreateInfo &create_info,
+  const DXGI_SWAP_CHAIN_DESC1 &swapchain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &fullscreen_desc, DXGISwapChain **swapchain);
+
+static HRESULT fg_swapchain_factory(FgSwapchainCreator creator, DXGIFactory *factory, ID3D12CommandQueue *queue,
+  const SwapchainCreateInfo &create_info, const DXGI_SWAP_CHAIN_DESC1 &swapchain_desc,
+  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &fullscreen_desc, DXGISwapChain **swapchain)
+{
+  if (creator(factory, queue, create_info, swapchain_desc, fullscreen_desc, swapchain))
+    return S_OK;
+  return default_swapchain_factory(factory, queue, create_info, swapchain_desc, fullscreen_desc, swapchain);
+}
+
+HRESULT drv3d_dx12::default_swapchain_factory(DXGIFactory *factory, ID3D12CommandQueue *queue, const SwapchainCreateInfo &create_info,
+  const DXGI_SWAP_CHAIN_DESC1 &swapchain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &fullscreen_desc, DXGISwapChain **swapchain)
+{
+  ComPtr<IDXGISwapChain1> swapchainLevel1;
+  HRESULT hr =
+    factory->CreateSwapChainForHwnd(queue, create_info.window, &swapchain_desc, &fullscreen_desc, nullptr, &swapchainLevel1);
+  if (FAILED(hr))
+    return hr;
+
+  ComPtr<DXGISwapChain> nativeSwapchain;
+  hr = swapchainLevel1.As(&nativeSwapchain);
+  if (FAILED(hr))
+    return hr;
+
+  *swapchain = nativeSwapchain.Detach();
+  return S_OK;
+}
+
+HRESULT drv3d_dx12::nvidia_dlssg_swapchain_factory(DXGIFactory *factory, ID3D12CommandQueue *queue,
+  const SwapchainCreateInfo &create_info, const DXGI_SWAP_CHAIN_DESC1 &swapchain_desc,
+  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &fullscreen_desc, DXGISwapChain **swapchain)
+{
+  return default_swapchain_factory(StreamlineAdapter::hook(factory), queue, create_info, swapchain_desc, fullscreen_desc, swapchain);
+}
+
+HRESULT drv3d_dx12::amd_fsrfg_swapchain_factory(DXGIFactory *factory, ID3D12CommandQueue *queue,
+  const SwapchainCreateInfo &create_info, const DXGI_SWAP_CHAIN_DESC1 &swapchain_desc,
+  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &fullscreen_desc, DXGISwapChain **swapchain)
+{
+  return fg_swapchain_factory(create_fsrfg_swapchain, factory, queue, create_info, swapchain_desc, fullscreen_desc, swapchain);
+}
+
+HRESULT drv3d_dx12::intel_xessfg_swapchain_factory(DXGIFactory *factory, ID3D12CommandQueue *queue,
+  const SwapchainCreateInfo &create_info, const DXGI_SWAP_CHAIN_DESC1 &swapchain_desc,
+  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &fullscreen_desc, DXGISwapChain **swapchain)
+{
+  return fg_swapchain_factory(create_xessfg_swapchain, factory, queue, create_info, swapchain_desc, fullscreen_desc, swapchain);
+}
+
 bool backend::Swapchain::adopt(Device &device, frontend::Swapchain &fe, DXGISwapChain *external_swapchain, SwapchainCreateInfo &&sci)
 {
   swapchainBufferSRVHeap.init(device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
@@ -305,19 +379,18 @@ bool backend::Swapchain::adopt(Device &device, frontend::Swapchain &fe, DXGISwap
 }
 
 bool backend::Swapchain::setup(Device &device, frontend::Swapchain &fe, DXGIFactory *factory, ID3D12CommandQueue *queue,
-  SwapchainCreateInfo &&sci, uint32_t swapchain_index, bool disable_frame_latency)
+  SwapchainCreateInfo &&sci, uint32_t swapchain_index, bool enable_waitable_swapchain)
 {
   swapchainBufferSRVHeap.init(device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
   swapchainBufferRTVHeap.init(device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV));
 
-  const bool isThereDisplay = [] {
+  const bool enableWaitableSwapchain = sci.swapchainKind == SwapchainKind::Default && enable_waitable_swapchain && [] {
     DISPLAY_DEVICE dd;
     dd.cb = sizeof(dd);
     return EnumDisplayDevices(nullptr, 0, &dd, 0) != FALSE;
   }();
-  const bool hasLatencyObject = isThereDisplay && !disable_frame_latency;
 
-  presentMode = sci.presentMode;
+  presentInterval = sci.presentInterval;
 
   FormatStore colorFormat = FormatStore::fromCreateFlags(TEXFMT_DEFAULT);
   isTearingSupported = is_tearing_supported(factory);
@@ -331,33 +404,30 @@ bool backend::Swapchain::setup(Device &device, frontend::Swapchain &fe, DXGIFact
     .BufferCount = FRAME_FRAME_BACKLOG_LENGTH,
     // fastest mode, allows composer to scribble on it to avoid extra copy
     .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    .Flags = (hasLatencyObject ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0u) |
+    .Flags = (enableWaitableSwapchain ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0u) |
              (isTearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u),
   };
 
   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreenDesc = {.Windowed = TRUE};
 
-  // create with default size (target size)
-  ComPtr<IDXGISwapChain1> swapchainLevel1;
-
-  if (DX12_CHECK_FAIL(factory->CreateSwapChainForHwnd(queue, sci.window, &swapchainDesc, &fullscreenDesc, nullptr, &swapchainLevel1)))
-    return false;
-
-
   auto &swapchain = swapchains[swapchain_index].swapchain;
   auto &output = swapchains[swapchain_index].output;
+  SwapchainFactory swapchainFactory = sci.swapchainFactory;
+  if (!swapchainFactory)
+    swapchainFactory = default_swapchain_factory;
 
-  swapchainLevel1.As(&swapchain);
+  if (DX12_CHECK_FAIL(swapchainFactory(factory, queue, sci, swapchainDesc, fullscreenDesc, &swapchain)))
+    return false;
   if (!swapchain)
   {
     return false;
   }
   output = eastl::move(sci.output);
 
-  return postSetup(device, fe, eastl::move(sci), hasLatencyObject, factory, swapchain_index);
+  return postSetup(device, fe, eastl::move(sci), enableWaitableSwapchain, factory, swapchain_index);
 }
 
-bool backend::Swapchain::postSetup(Device &device, frontend::Swapchain &fe, SwapchainCreateInfo &&sci, bool has_waitable_object,
+bool backend::Swapchain::postSetup(Device &device, frontend::Swapchain &fe, SwapchainCreateInfo &&sci, bool use_waitable_swapchain,
   DXGIFactory *factory, uint32_t swapchain_index)
 {
   DX12_DEBUG_RESULT(factory->MakeWindowAssociation(sci.window, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_PRINT_SCREEN));
@@ -367,7 +437,7 @@ bool backend::Swapchain::postSetup(Device &device, frontend::Swapchain &fe, Swap
   auto &output = swapchainInfo.output;
   auto &colorTarget = swapchainInfo.colorTarget;
 
-  if (has_waitable_object)
+  if (use_waitable_swapchain)
   {
     DX12_DEBUG_RESULT(swapchain->SetMaximumFrameLatency(FRAME_LATENCY));
   }
@@ -393,8 +463,8 @@ bool backend::Swapchain::postSetup(Device &device, frontend::Swapchain &fe, Swap
     {
       .window = sci.window,
       .colorImage = colorTarget.get(),
-      .waitableObject{has_waitable_object ? swapchain->GetFrameLatencyWaitableObject() : nullptr},
-      .presentMode = sci.presentMode,
+      .waitableObject{use_waitable_swapchain ? swapchain->GetFrameLatencyWaitableObject() : nullptr},
+      .presentInterval = sci.presentInterval,
     },
     swapchain_index);
 
@@ -411,33 +481,36 @@ void backend::Swapchain::swapchainPresent(uint32_t frame_id, uint32_t swapchain_
 {
   if (swapchain_index == 0)
   {
-    auto *lowLatencyModule = GpuLatency::getInstance();
-    if (lowLatencyModule)
+    if (auto *lowLatencyModule = GpuLatency::getInstance(); lowLatencyModule)
       lowLatencyModule->setMarker(frame_id, lowlatency::LatencyMarkerType::PRESENT_START);
-    eastl::finally deferredPresentEnd([&] {
-      if (lowLatencyModule)
-        lowLatencyModule->setMarker(frame_id, lowlatency::LatencyMarkerType::PRESENT_END);
-    });
   }
 
-  const bool useVSync = isVsyncOn();
-  UINT interval = useVSync ? 1 : 0;
+  const int interval = getPresentationInterval();
   // ALLOW_TEARING is required for disable v-sync
   // ALLOW_TEARING requires interval=0 and not exclusive fullscreen
   // https://docs.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-present
-  UINT flags = (!useVSync && isTearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+  UINT flags = (interval == 0 && isTearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
   const auto &swapchain = swapchains[swapchain_index].swapchain;
   auto resultCode = DX12_CHECK_RESULT(swapchain->Present(interval, flags));
   if (FAILED(resultCode))
   {
     logdbg("DX12: swapchain->Present(interval:%u, flags: %08X)", interval, flags);
   }
+
+  if (swapchain_index == 0)
+  {
+    if (auto *lowLatencyModule = GpuLatency::getInstance(); lowLatencyModule)
+      lowLatencyModule->setMarker(frame_id, lowlatency::LatencyMarkerType::PRESENT_END);
+  }
 }
 
-void backend::Swapchain::present(Device &, uint32_t frame_id)
+void backend::Swapchain::present(Device &device, uint32_t frame_id)
 {
-  numFramesCompletedByBackend++;
+  // if there was input sampling and the engine missed calling this, made up for it to avoid get out of sync
+  device.getContext().gpuLatencyWait();
+  TIME_PROFILE(present);
   swapchainPresent(frame_id, getCurrentSwapchainIndex());
+  numFramesCompletedByBackend++;
 }
 
 void backend::Swapchain::secondaryPresent(uint32_t swapchain_index, uint32_t frame_id) { swapchainPresent(frame_id, swapchain_index); }
@@ -448,7 +521,7 @@ void backend::Swapchain::prepareForShutdown(Device &device, int swapchain_index)
   clearViews(device, swapchain_index);
   if (swapchains[swapchain_index].virtualColorTarget)
   {
-    device.getContext().destroyImage(swapchains[swapchain_index].virtualColorTarget, true);
+    device.getContext().destroyImageNoLock(swapchains[swapchain_index].virtualColorTarget, true);
     swapchains[swapchain_index].virtualColorTarget = nullptr;
   }
 }
@@ -534,7 +607,14 @@ void backend::Swapchain::preRecovery()
   {
     info.colorTargets.clear();
     info.output.Reset();
-    info.swapchain.Reset();
+    if (auto swapchain = info.swapchain.Get())
+    {
+      DXGI_SWAP_CHAIN_DESC desc;
+      swapchain->GetDesc(&desc);
+      // Resize with 0 size to invalidate the backbuffer, triggering a release on the old resources in overlays.
+      StreamlineAdapter::unhook(info.swapchain)->ResizeBuffers(0, 1, 1, DXGI_FORMAT_UNKNOWN, desc.Flags);
+      info.swapchain.Reset();
+    }
     if (info.colorTarget)
     {
       info.colorTarget->removeAllViews();
@@ -543,6 +623,7 @@ void backend::Swapchain::preRecovery()
     info.swapchainViewSet.clear();
     info.virtualColorTarget = nullptr;
   }
+  numFramesCompletedByBackend.store(0, std::memory_order_relaxed);
   swapchainBufferSRVHeap.shutdown();
   swapchainBufferRTVHeap.shutdown();
 }
@@ -559,7 +640,14 @@ void backend::Swapchain::shutdownSwapchainInfo(uint32_t swapchain_index)
   info.output.Reset();
 #endif
 #if !_TARGET_XBOX
-  info.swapchain.Reset();
+  if (auto swapchain = info.swapchain.Get())
+  {
+    DXGI_SWAP_CHAIN_DESC desc;
+    swapchain->GetDesc(&desc);
+    // Resize to invalidate the backbuffer, triggering a release on the old resources in overlays.
+    StreamlineAdapter::unhook(info.swapchain)->ResizeBuffers(0, 1, 1, DXGI_FORMAT_UNKNOWN, desc.Flags);
+    info.swapchain.Reset();
+  }
 #endif
 #if _TARGET_XBOX
   info.secondaryColorTarget.reset();
@@ -705,11 +793,16 @@ void backend::Swapchain::bufferResize(Device &device, const SwapchainProperties 
   auto &swapchainInfo = swapchains[swapchain_index];
   if (swapchainInfo.virtualColorTarget)
   {
-    device.getContext().destroyImage(swapchainInfo.virtualColorTarget, true);
-    swapchainInfo.virtualColorTarget = device.createVirtualBackbuffer(swapchainInfo.colorTarget.get());
-    device.getContext().back.sharedContextState.resourceStates.setTextureState(
-      device.getContext().back.sharedContextState.initialResourceStateSet,
-      swapchainInfo.virtualColorTarget->getGlobalSubResourceIdBase(), 1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    device.getContext().destroyImageNoLock(swapchainInfo.virtualColorTarget, true);
+    swapchainInfo.virtualColorTarget = device.createVirtualBackbuffer(swapchainInfo.colorTarget.get(),
+      eastl::string{eastl::string::CtorSprintf{}, "virtual_backbuffer_%u", swapchain_index}.c_str());
+    if (!swapchainInfo.virtualColorTarget)
+    {
+      // The old one is already destroyed, so the swapchain continues without one. The caller has to
+      // move the frontend texture off the destroyed image, see DeviceContext::changeSwapchainExtents.
+      D3D_ERROR("DX12: Lost the virtual backbuffer of swapchain %u on resize, it renders into its swapchain image now",
+        swapchain_index);
+    }
   }
 }
 

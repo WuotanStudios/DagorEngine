@@ -14,6 +14,7 @@ source
   file:t = "../renderGradedColorLUT.dshl"
 
   include "../../../gameLibs/daGI2/shaders/shadersList.blk"
+  include "../../../gameLibs/voxelizedMedia/_shaders.blk"
   include "../../../gameLibs/daSDF/shaders/daSDFList.blk"
   include shadersList.blk
   include shadersListForTools.blk
@@ -22,7 +23,6 @@ source
 common_valid_variants
 {
   include variants.blk
-  invalid {hasTexture:i=4;}
 }
 
 common_assume_vars {}
@@ -33,7 +33,8 @@ Compile
   group_size_in_kb:i=128
   assume_vars {
     include common_assumes.blk
-    supports_sh_6_1:i = 0
+    "@override:film_grain":i=0
+    supports_barycentrics:i = 0
     static_shadows_custom_fxaa:i=0
     grass_use_quads:i=0
     dagi_sp_has_exposure_assume:i=1

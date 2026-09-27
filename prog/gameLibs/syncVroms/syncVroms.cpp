@@ -341,36 +341,20 @@ static bool save_compressed(const char *path, const Tab<char> &bytes, const Comp
 }
 
 
-syncvroms::LoadedSyncVrom syncvroms::load_vromfs_dump(const char *path, const VromfsCompression &compr)
+syncvroms::LoadedSyncVrom syncvroms::load_vromfs_dump(const char *path, const VromfsCompression &compr, bool allow_shared_mem)
 {
   static constexpr VromfsCompression::CheckType vromfsCheck = VromfsCompression::CHECK_VERBOSE;
   static constexpr VromfsCompression::InputDataType inputData = VromfsCompression::IDT_DATA;
 
   int64_t mtime = -1;
-  eastl::pair<Bytes, VromHash> vrom;
-
-#if DAGOR_DBGLEVEL > 0
-  static const char *devVromExt = ".dev";
-  eastl::string devPath = eastl::string(path) + devVromExt;
-  vrom = load_vrom_compressed(devPath.c_str(), compr, mtime);
-  if (!vrom.first.empty())
-  {
-    path = devPath.c_str();
-    logwarn("[SyncVroms] DEV-vrom exists and will be used: %s", path);
-  }
-#endif // DAGOR_DBGLEVEL
-
-  if (vrom.first.empty())
-    vrom = load_vrom_compressed(path, compr, mtime);
-
+  const eastl::pair<Bytes, VromHash> vrom{load_vrom_compressed(path, compr, mtime)};
   if (!vrom.first.empty() && compr.getDataType(vrom.first.data() + 1, vrom.first.size() - 1, vromfsCheck) != inputData)
   {
     dag::ConstSpan<char> vromSlice{vrom.first.data(), (intptr_t)vrom.first.size()};
-    if (syncvroms::LoadedSyncVrom loadedVrom{vrom.second, dd_get_fname(path), load_vromfs_dump_from_mem(vromSlice, defaultmem)})
-    {
-      loadedVrom.fsData->mtime = mtime;
+    const char *shared_nm = allow_shared_mem ? dd_get_fname(path) : nullptr;
+    if (syncvroms::LoadedSyncVrom loadedVrom{
+          vrom.second, dd_get_fname(path), load_vromfs_dump_from_mem(vromSlice, defaultmem, shared_nm, mtime)})
       return loadedVrom;
-    }
   }
 
   return {};
@@ -445,7 +429,14 @@ eastl::pair<int, int> syncvroms::write_vrom_diffs(danet::BitStream &bs, const Sy
     // Skip client vroms with the same hashes on the server
     const auto clientSyncVromIt = eastl::find(client_sync_vroms.cbegin(), client_sync_vroms.cend(), serverSyncVrom);
     if (clientSyncVromIt != client_sync_vroms.cend())
+    {
+      debug("[SyncVroms]: write_vrom_diffs ignoring unchanged vrom '%s' with hash '%s'", clientSyncVromIt->name,
+        clientSyncVromIt->hash.c_str());
       continue;
+    }
+
+    debug("[SyncVroms]: write_vrom_diffs server vrom '%s' with hash '%s' is not found in recieved client vroms. Writing diff.",
+      serverSyncVrom.name, serverSyncVrom.hash.c_str());
 
     const VromHash &baseVromHash = syncvroms::get_base_vrom_hash(serverSyncVrom.name.c_str());
 

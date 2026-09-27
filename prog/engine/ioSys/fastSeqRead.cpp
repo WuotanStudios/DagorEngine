@@ -20,22 +20,31 @@ FastSeqReader::FastSeqReader()
 {
   memset(&file, 0, sizeof(file));
   memset(buf, 0, sizeof(buf));
-
-  for (int i = 0; i < BUF_CNT; i++)
-  {
-    buf[i].mask = 1 << i;
-#if _TARGET_PC_WIN | \
-  _TARGET_XBOX // MS require special aligment for non_cached reads (see
-               // https://msdn.microsoft.com/en-us/library/windows/desktop/cc644950(v=vs.85).aspx#ALIGNMENT_AND_FILE_ACCESS_REQUIREMENTS)
-    buf[i].data = (char *)tmpmem->allocAligned(BUF_SZ, 4096);
+#if _TARGET_PC_WIN | _TARGET_XBOX
+  // MS require 4K alignment for non-cached reads (FILE_FLAG_NO_BUFFERING):
+  // https://learn.microsoft.com/en-us/windows/win32/fileio/file-buffering?#alignment-and-file-access-requirements
+  static constexpr uintptr_t BUF_ALIGN_MASK = 4095;
+  static_assert(BUF_SZ % (BUF_ALIGN_MASK + 1) == 0);
 #else
-    buf[i].data = (char *)tmpmem->allocAligned(BUF_SZ, 32);
+  static constexpr uintptr_t BUF_ALIGN_MASK = 0;
 #endif
+  rawBufMem = (char *)tmpmem->alloc(BUF_CNT * BUF_SZ + BUF_ALIGN_MASK);
+  char *adata = (char *)(((uintptr_t)rawBufMem + BUF_ALIGN_MASK) & ~BUF_ALIGN_MASK);
+  for (unsigned i = 0, m = 1; i < BUF_CNT; i++, m <<= 1, adata += BUF_SZ)
+  {
+    buf[i].mask = m;
+    buf[i].data = adata;
     buf[i].handle = dfa_alloc_asyncdata();
-    G_ASSERT(buf[i].handle >= 0 && "FastSeqReader ran out of async handles?");
+    G_ASSERTF(buf[i].handle >= 0, "FastSeqReader ran out of async handles?");
   }
-  pendMask = doneMask = readAheadPos = maxBackSeek = lastSweepPos = 0;
-  cBuf = NULL;
+}
+
+FastSeqReader::~FastSeqReader()
+{
+  reset();
+  for (auto &b : buf)
+    dfa_free_asyncdata(b.handle);
+  tmpmem->free(rawBufMem);
 }
 
 void FastSeqReader::assignFile(void *handle, unsigned base_ofs, int size, const char *fname, int min_chunk_size, int max_back_seek)
@@ -43,6 +52,8 @@ void FastSeqReader::assignFile(void *handle, unsigned base_ofs, int size, const 
   G_ASSERT(max_back_seek >= 0);
   reset();
 
+  requestedBytes = 0u;
+  requestCount = 0u;
   file.handle = handle;
   file.baseOfs = base_ofs == 0xFFFFFFFFu ? 0u : base_ofs; // 0xFFFFFFFFu was stored in entry.data() for ofs=0 to differ from nullptr
   file.size = size;
@@ -71,18 +82,6 @@ void FastSeqReader::reset()
   curThreadId = -1;
 }
 
-void FastSeqReader::closeData()
-{
-  reset();
-  for (int i = 0; i < BUF_CNT; i++)
-    if (buf[i].data)
-    {
-      dfa_free_asyncdata(buf[i].handle);
-      tmpmem->freeAligned(buf[i].data);
-    }
-  memset(&file, 0, sizeof(file));
-  memset(buf, 0, sizeof(buf));
-}
 void FastSeqReader::waitForBuffersFull()
 {
   placeRequests();
@@ -218,7 +217,7 @@ void FastSeqReader::readCompleted(int i, int bit, int sz)
 #if DAGOR_EXCEPTIONS_ENABLED
     DAGOR_THROW(LoadException("async read failed", buf[i].sa)); // To consider: store copy of string within DagorException?
 #else
-    DAG_FATAL("exception: LoadException(\"async read from '%s' failed with error %d\")", targetFilename.c_str(), sz);
+    DAG_FATAL("exception: LoadException(\"async read from '%s' failed with error %d\")", targetFilename.c_str(), -sz);
 #endif
   }
   G_ASSERT(sz);
@@ -250,7 +249,9 @@ void FastSeqReader::placeRequests()
   }
 
   unsigned unusedMask = (~(doneMask | pendMask)) & BUF_ALL_MASK;
-  if (unusedMask && readAheadPos < file.size)
+  int eff_file_end =
+    ((ranges.size() ? min(ranges.back().end, file.size) : file.size) + file.chunkSize - 1) / file.chunkSize * file.chunkSize;
+  if (unusedMask && readAheadPos < eff_file_end)
     for (int i = 0, bit = 1; i < BUF_CNT; i++, bit <<= 1)
       if (unusedMask & bit)
       {
@@ -276,27 +277,29 @@ void FastSeqReader::placeRequests()
               pos = (r->end + (BLOCK_SIZE)-1) / (BLOCK_SIZE) * (BLOCK_SIZE);
               if (pos < readAheadPos)
                 buf[i].ea = readAheadPos = pos;
+              if (readAheadPos > eff_file_end)
+                buf[i].ea = readAheadPos = eff_file_end;
               r = NULL;
               break;
             }
 
           if (r != NULL)
           {
-            if (readAheadPos >= file.size)
-              break;
-            else if (readAheadPos < ranges.back().end)
+            if (readAheadPos < eff_file_end)
               goto again;
             else
             {
               // out_debug_str_fmt("cease it: %d < %d (%d..%d) %d\n", readAheadPos, file.size, ranges[0].start, ranges.back().end,
               // ranges.size());
-              readAheadPos = file.size;
+              readAheadPos = eff_file_end;
               break;
             }
           }
         }
 
         G_ASSERT(buf[i].ea - buf[i].sa);
+        requestedBytes += buf[i].ea - buf[i].sa;
+        requestCount++;
         G_VERIFY(dfa_read_async(file.handle, buf[i].handle, buf[i].sa + file.baseOfs, buf[i].data, buf[i].ea - buf[i].sa));
         // out_debug_str_fmt("place req %d: %d-%d\n", i, buf[i].sa, buf[i].ea);
         if (cBuf == buf + i)

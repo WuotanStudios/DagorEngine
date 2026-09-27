@@ -1,9 +1,16 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include "driver.h"
+#include "pipeline_cache.h"
+
 #include <drv/3d/rayTrace/dag_drvRayTrace.h>
-#include "shader_library.h"
-#include <EASTL/intrusive_ptr.h>
+#include <drv/shadersMetaData/dxil/compiled_shader_header.h>
+#include <supp/dag_comPtr.h>
+
+#include <EASTL/string.h>
+#include <EASTL/optional.h>
+
 
 #if D3D_HAS_RAY_TRACING
 
@@ -25,14 +32,14 @@ class RayTracePipeline
     uint32_t minRecursion = 0;
     uint32_t minPayload = 0;
     uint32_t minAttributes = 0;
-    bool isSupported = false;
+    bool allowOpacityMicroMaps = false;
   };
   ComPtr<ID3D12StateObject> object;
   RaytracePipelineSignature rootSignature;
   RayTracePipelineResourceTypeTable resourceTypeTable;
   DynamicArray<uint8_t> shaderReferenceTableStorage;
   eastl::string debugName;
-  ExpansionSupportData expansionData;
+  eastl::optional<ExpansionSupportData> expansionData;
 
 public:
   RayTracePipeline() = default;
@@ -42,14 +49,31 @@ public:
   RayTracePipeline &operator=(RayTracePipeline &&) = delete;
   ~RayTracePipeline() = default;
 
-  bool build(AnyDevicePtr device_ptr, bool has_native_expand, PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serializer, RayTracePipeline *base,
-    const ::raytrace::PipelineCreateInfo &ci);
+  struct BuildConfig
+  {
+    // Collection-style libraries (raygen-only / hit-group imports) carry their shader and pipeline
+    // config subobjects in the DXIL, so the driver must not emit duplicates. When set, the driver
+    // trusts the embedded configs. The builder still forces a CPU-side pipeline config when a library
+    // carries a DSHL raytrace_pipeline block, which it detects from the per-shader flags itself.
+    bool useEmbeddedObjects = false;
+  };
+
+  bool build(AnyDevicePtr device_ptr, bool has_native_expand, bool device_allows_omm, PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serializer,
+    RayTracePipeline *base, const ::raytrace::PipelineCreateInfo &ci);
+  // build function for simpler pipeline builds with supplied root signature, currently used for CS on RayGen
+  bool build(D3DDevice *device, const RaytracePipelineSignature &root_signature,
+    const RayTracePipelineResourceTypeTable &res_type_table, const ::raytrace::PipelineCreateInfo &ci, const BuildConfig &build_config,
+    bool device_allows_omm);
   RayTracePipeline *expand(ID3D12Device7 *device, const ::raytrace::PipelineExpandInfo &ei) const;
   ID3D12StateObject *get() { return object.Get(); }
   const RaytracePipelineSignature &getSignature() { return rootSignature; }
   const uint8_t *getShaderReferenceTable() const { return shaderReferenceTableStorage.data(); }
   uint32_t getShaderCount() const { return shaderReferenceTableStorage.size() / D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES; }
-  bool isExpandable() const { return expansionData.isSupported; }
+  dag::ConstSpan<uint8_t> getShaderReferenceTableSpan() const
+  {
+    return make_span(shaderReferenceTableStorage.data(), shaderReferenceTableStorage.size());
+  }
+  bool isExpandable() const { return static_cast<bool>(expansionData); }
   const eastl::string &name() const { return debugName; }
   // TODO
   uint32_t getRayGenGroupShaderRecordDataSize() const { return 0; }

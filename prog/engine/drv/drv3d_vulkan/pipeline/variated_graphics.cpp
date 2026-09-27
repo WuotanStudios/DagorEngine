@@ -39,8 +39,7 @@ void VariatedGraphicsPipeline::onDelayedCleanupFinish<CleanupTag::DESTROY>()
 using namespace drv3d_vulkan;
 
 GraphicsPipelineVariationStorage::ExtendedVariantDescription &GraphicsPipelineVariationStorage::get(
-  const GraphicsPipelineVariantDescription &dsc, GraphicsPipelineVariantDescription::Hash hash, RenderStateSystemBackend &rs_backend,
-  RenderPassResource *native_rp)
+  const GraphicsPipelineVariantDescription &dsc, GraphicsPipelineVariantDescription::Hash hash)
 {
   const auto itr = eastl::lower_bound(indexArray.begin(), indexArray.end(), eastl::make_pair(hash, 0),
     [](const KeyIndexPair &one, const KeyIndexPair &two) { return one.first < two.first; });
@@ -61,15 +60,13 @@ GraphicsPipelineVariationStorage::ExtendedVariantDescription &GraphicsPipelineVa
   }
   else
   {
-#if VULKAN_LOG_PIPELINE_ACTIVITY > 0
-    debug("vulkan: new graphics pipeline variation, total %u", lastIndex + 1);
+#if VULKAN_LOG_PIPELINE_ACTIVITY
+    if (Globals::cfg.bits.logPipelineCompile)
+      debug("vulkan: new graphics pipeline variation, total %u", lastIndex + 1);
 #endif
 
-    GraphicsPipelineDynamicStateMask mask;
-    mask.from(rs_backend, dsc, native_rp);
-
     indexArray.insert(itr, eastl::make_pair(hash, dataArray.size()));
-    dataArray.push_back({dsc, mask, lastIndex++});
+    dataArray.push_back({dsc, lastIndex++});
     return dataArray.back();
   }
 }
@@ -120,7 +117,7 @@ GraphicsPipeline *VariatedGraphicsPipeline::compileNewVariant(CompilationContext
   const GraphicsPipelineVariantDescription &dsc)
 {
   auto hash = dsc.getHash();
-  auto eDsc = variations.get(dsc, hash, comp_ctx.rsBackend, comp_ctx.nativeRP);
+  auto eDsc = variations.get(dsc, hash);
 
   GraphicsPipeline *ret = nullptr;
   int64_t compilationTime = 0;
@@ -159,8 +156,8 @@ GraphicsPipeline *VariatedGraphicsPipeline::compileNewVariant(CompilationContext
     if (tryCached)
     {
       TIME_PROFILE(vulkan_gr_pipeline_compile_cached)
-      ret = new GraphicsPipeline(comp_ctx.pipeCache, layout,
-        {comp_ctx.rsBackend, eDsc.base, eDsc.mask, modules, parentPipe, comp_ctx.nativeRP, csd});
+      ret =
+        new GraphicsPipeline(comp_ctx.pipeCache, layout, {comp_ctx.rsBackend, eDsc.base, modules, parentPipe, comp_ctx.nativeRP, csd});
       ret->compile();
       if (ret->checkCompiled() != PipelineCompileStatus::OK)
       {
@@ -174,8 +171,8 @@ GraphicsPipeline *VariatedGraphicsPipeline::compileNewVariant(CompilationContext
     }
 
     if (!ret)
-      ret = new GraphicsPipeline(comp_ctx.pipeCache, layout,
-        {comp_ctx.rsBackend, eDsc.base, eDsc.mask, modules, parentPipe, comp_ctx.nativeRP, csd});
+      ret =
+        new GraphicsPipeline(comp_ctx.pipeCache, layout, {comp_ctx.rsBackend, eDsc.base, modules, parentPipe, comp_ctx.nativeRP, csd});
     items.push_back(eastl::make_pair(hash, ret));
 
     if (async && !ret->isIgnored())
@@ -200,8 +197,9 @@ GraphicsPipeline *VariatedGraphicsPipeline::getVariant(CompilationContext &comp_
     return nullptr;
 #endif
 
-#if VULKAN_LOG_PIPELINE_ACTIVITY > 1
-  debug("vulkan: get gfx vs %s fs %s", debugInfo.vs().name, debugInfo.fs().name);
+#if VULKAN_LOG_PIPELINE_ACTIVITY
+  if (Globals::cfg.bits.logPipelineBinds)
+    debug("vulkan: get gfx vs %s fs %s", debugInfo.vs().name, debugInfo.fs().name);
 #endif
 
   if (!pipe)
@@ -246,7 +244,7 @@ GraphicsPipeline *VariatedGraphicsPipeline::getVariant(CompilationContext &comp_
 
       // add to list as mapped to another desc
       auto origHash = dsc.getHash();
-      variations.get(dsc, origHash, comp_ctx.rsBackend, comp_ctx.nativeRP);
+      variations.get(dsc, origHash);
       items.push_back(eastl::make_pair(origHash, pipe));
       pipe->addRef();
     }
@@ -261,4 +259,11 @@ GraphicsPipeline *VariatedGraphicsPipeline::getVariant(CompilationContext &comp_
   }
 
   return pipe;
+}
+
+VariatedGraphicsPipeline::VariatedGraphicsPipeline(ProgramID inProg, VulkanPipelineCacheHandle, LayoutType *l,
+  const CreationInfo &info) :
+  DebugAttachedPipeline(l), modules(info.modules), variations(info.varStorage), program(inProg), seenBefore(info.seenBefore)
+{
+  inputLayout = Globals::shaderProgramDatabase.getGraphicsProgInputLayout(program);
 }

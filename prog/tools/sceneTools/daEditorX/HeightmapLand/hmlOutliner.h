@@ -16,7 +16,9 @@ public:
   const char *getTypeName(int type, bool plural = false) override;
   bool isTypeVisible(int type) override;
   bool isTypeLocked(int type) override;
+  bool doesSelectionModeAllowSelectingType(int type) override;
   bool canAddNewLayerWithName(int type, const char *name, String &error_message) override;
+  const char *getTypeUnselectabilityReason(int type) override;
 
   void selectAllTypeObjects(int type, bool select) override;
   void toggleTypeVisibility(int type) override;
@@ -34,6 +36,7 @@ public:
   bool canChangeLayerLock(int type, int per_type_layer_index) override;
   bool isLayerRenameable(int type, int per_type_layer_index) override;
   bool canRenameLayerTo(int type, int per_type_layer_index, const char *name, String &error_message) override;
+  const char *getLayerUnselectabilityReason(int type, int per_type_layer_index) override;
 
   void setLayerActive(int type, int per_type_layer_index) override;
   void selectAllLayerObjects(int type, int per_type_layer_index, bool select) override;
@@ -44,17 +47,24 @@ public:
   void renameLayer(int type, int per_type_layer_index, const char *name) override;
 
   bool isObjectSelected(RenderableEditableObject &object) override;
+  bool isObjectVisible(RenderableEditableObject &object) override;
+  bool isObjectLocked(RenderableEditableObject &object) override;
   bool canSelectObject(RenderableEditableObject &object) override;
+  bool canChangeObjectVisibility(RenderableEditableObject &object) override;
+  bool canChangeObjectLock(RenderableEditableObject &object) override;
   bool canRenameObject(RenderableEditableObject &object, const char *name, String &error_message) override;
   bool getObjectTypeAndPerTypeLayerIndex(RenderableEditableObject &object, int &type, int &per_type_layer_index) override;
   const char *getObjectAssetName(RenderableEditableObject &object) override;
   int getObjectAssetType(RenderableEditableObject &object, const char *&asset_type_name) override;
   bool isSampleObject(RenderableEditableObject &object) override;
+  const char *getObjectUnselectabilityReason(RenderableEditableObject &object, int type, int per_type_layer_index) override;
 
   void startObjectSelection() override;
   void setObjectSelected(RenderableEditableObject &object, bool selected) override;
   void endObjectSelection() override;
   void unselectAllObjects() override;
+  void toggleObjectVisibility(RenderableEditableObject &object) override;
+  void toggleObjectLock(RenderableEditableObject &object) override;
   void moveObjectsToLayer(dag::Span<RenderableEditableObject *> objects, int type, int per_type_destination_layer_index) override;
   void renameObject(RenderableEditableObject &object, const char *name) override;
   void changeObjectAsset(dag::Span<RenderableEditableObject *> objects) override;
@@ -62,20 +72,19 @@ public:
   void zoomAndCenterObject(RenderableEditableObject &object) override;
 
 private:
-  struct ObjectTypeState
-  {
-    bool visible = true;
-    bool locked = false;
-  };
-
   int getLayerPropsIndex(int type, int per_type_layer_index) const;
   int getPerTypeLayerIndex(int type, int layer_props_index) const;
   EditLayerProps *getEditLayerProps(int type, int per_type_layer_index) const;
+
+  bool canSelectObjectOnly(RenderableEditableObject &object);
+  bool canSelectSubObjectOnly(RenderableEditableObject &object);
+
+  bool isLayerOrTypeHidden(RenderableEditableObject &object);
+  bool isLayerOrTypeLocked(RenderableEditableObject &object);
 
   static bool getObjectTypeAndLayerPropsIndex(RenderableEditableObject &object, int &type, int &layer_props_index);
   static const char *getAssetName(RenderableEditableObject &object);
   static bool isValidLayerName(const char *name, String &error_message);
 
   HmapLandObjectEditor &objectEditor;
-  ObjectTypeState objectTypeStates[EditLayerProps::TYPENUM];
 };

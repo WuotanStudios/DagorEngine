@@ -2,12 +2,13 @@
 
 #include <shaders/dag_rendInstRes.h>
 #include <shaders/dag_shaderResUnitedData.h>
+#include <shaders/dag_atlasBlockManager.h>
 #include <gameRes/dag_gameResSystem.h>
 #include <gameRes/dag_stdGameRes.h>
 #include <shaders/dag_shaderMeshTexLoadCtrl.h>
 #include <memory/dag_framemem.h>
 #include <ioSys/dag_dataBlock.h>
-#include <EASTL/vector.h>
+#include <dag/dag_vector.h>
 #include <generic/dag_initOnDemand.h>
 #include <3d/fileTexFactory.h>
 #include <drv/3d/dag_driver.h>
@@ -19,11 +20,15 @@
 #include <osApiWrappers/dag_critSec.h>
 #include <util/dag_console.h>
 #include <perfMon/dag_perfTimer.h>
+#include <util/dag_compilerDefs.h>
 
 ShaderResUnitedVdata<RenderableInstanceLodsResource> unitedvdata::riUnitedVdata;
 static constexpr unsigned VDATA_MT_RENDINST = 2;
 
 using unitedvdata::riUnitedVdata;
+
+static PtrTab<RenderableInstanceLodsResource> pendingReloadResList;
+static std::mutex pendingReloadResListMutex;
 
 class RendInstGameResFactory : public GameResourceFactory
 {
@@ -36,7 +41,7 @@ public:
     RPtr sceneRes;
   };
 
-  eastl::vector<GameRes> gameRes;
+  dag::Vector<GameRes> gameRes;
 
 
   int findGameRes(int res_id) const
@@ -66,15 +71,15 @@ public:
   bool isResLoaded(int res_id) override { return findGameRes(res_id) >= 0; }
   bool checkResPtr(GameResource *res) override { return findGameRes((RenderableInstanceLodsResource *)res) >= 0; }
 
-  GameResource *getGameResource(int res_id) override
+  GameResource *getGameResource(RRL rrl, int res_id) override
   {
+    WinAutoLock lock(get_gameres_main_cs());
     int id = findGameRes(res_id);
-
     if (id < 0)
-      ::load_game_resource_pack(res_id);
-
-    id = findGameRes(res_id);
-
+    {
+      load_game_resource_pack_gameres_main_cs_locked(res_id, rrl);
+      id = findGameRes(res_id);
+    }
     if (id < 0)
       return NULL;
 
@@ -112,24 +117,31 @@ public:
     return true;
   }
 
-  bool freeUnusedResources(bool forced_free_unref_packs, bool once /*= false*/) override
+  bool freeUnusedResources(RRL rrl, bool forced_free_unref_packs, bool once /*= false*/) override
   {
     bool result = false;
     bool ri_factory = (getResClassId() == RendInstGameResClassId);
     for (int i = gameRes.size() - 1; i >= 0; --i)
     {
-      if (get_refcount_game_resource_pack_by_resid(gameRes[i].resId) > 0)
+      if (rrl && is_res_required(rrl, gameRes[i].resId))
         continue;
-      // 1 ref for riUnitedVdata, 1 ref for res
-      if (gameRes[i].sceneRes && gameRes[i].sceneRes->getRefCount() > 1 + (ri_factory ? 1 : 0))
+      RenderableInstanceLodsResource *res = gameRes[i].sceneRes;
       {
-        if (!forced_free_unref_packs)
-          continue;
-        else
-          FATAL_ON_UNLOADING_USED_RES(gameRes[i].resId, gameRes[i].sceneRes->getRefCount());
+        std::lock_guard<std::mutex> scopedLock(pendingReloadResListMutex);
+        // 1 ref for riUnitedVdata, 1 ref for res
+        if (res && res->getRefCount() > 1 + (ri_factory ? 1 : 0) + (find_value_idx(pendingReloadResList, res) >= 0 ? 1 : 0))
+        {
+          if (!forced_free_unref_packs)
+            continue;
+          else
+            FATAL_ON_UNLOADING_USED_RES(gameRes[i].resId, res->getRefCount());
+        }
       }
-      if (ri_factory && RenderableInstanceLodsResource::on_higher_lod_required)
-        riUnitedVdata.delRes(gameRes[i].sceneRes);
+      if (ri_factory && res && RenderableInstanceLodsResource::on_higher_lod_required)
+      {
+        if (!riUnitedVdata.delRes(res) && res->getRefCount() > 1)
+          continue; // this resource was not referenced in streaming, so only free it if this is the only ref
+      }
       gameRes.erase(gameRes.begin() + i);
       result = true;
       if (once)
@@ -137,7 +149,11 @@ public:
     }
 
     if (ri_factory && riUnitedVdata.getResCount() == 0)
+    {
       riUnitedVdata.clear();
+      voxeldata::rgbaAtlasManager.clear();
+      voxeldata::normAtlasManager.clear();
+    }
     return result;
   }
 
@@ -159,7 +175,7 @@ public:
       dagor_set_sm_tex_load_ctx_name(name);
     textag_mark_begin(TEXTAG_RENDINST);
     int flags = SRLOAD_SRC_ONLY;
-    RPtr srcRes = RenderableInstanceLodsResource::loadResource(cb, flags, name, gameres_rendinst_desc.getBlockByName(name));
+    RPtr srcRes = RenderableInstanceLodsResource::loadResource(cb, flags, name, gameres_find_ri_desc_block(name));
     if (srcRes)
       riUnitedVdata.addRes(srcRes);
     textag_mark_end();
@@ -172,14 +188,16 @@ public:
     gameRes.emplace_back(GameRes{res_id, srcRes});
   }
 
-  void createGameResource(int /*res_id*/, const int * /*ref_ids*/, int /*num_refs*/) override {}
+  void createGameResource(RRL, int, const int *, int) override {}
 
   void reset() override
   {
     if (getResClassId() == RendInstGameResClassId)
     {
       riUnitedVdata.clear();
-      freeUnusedResources(false, false);
+      voxeldata::rgbaAtlasManager.clear();
+      voxeldata::normAtlasManager.clear();
+      freeUnusedResources(nullptr, false, false);
     }
 
     gameRes.clear();
@@ -187,16 +205,14 @@ public:
 
   IMPLEMENT_DUMP_RESOURCES_REF_COUNT(gameRes, resId, sceneRes->getRefCount())
 };
+DAG_DECLARE_RELOCATABLE(RendInstGameResFactory::GameRes);
 
 class RendInstGameResFactoryFinal final : public RendInstGameResFactory
 {};
 
 static InitOnDemand<RendInstGameResFactoryFinal> rendinst_factory;
 
-static PtrTab<RenderableInstanceLodsResource> pendingReloadResList;
-static std::mutex pendingReloadResListMutex;
-
-#if DAGOR_DBGLEVEL > 0 && !defined(__SANITIZE_THREAD__)
+#if DAGOR_DBGLEVEL > 0 && !defined(DAGOR_THREAD_SANITIZER)
 struct MeshStreamingStat
 {
   struct Stat
@@ -238,19 +254,17 @@ static int64_t last_reported_mls_reft = 0;
 static void batch_reload_res(void *)
 {
   TIME_PROFILE(batch_reload_res_ri);
-#if DAGOR_DBGLEVEL > 0 && !defined(__SANITIZE_THREAD__)
+#if DAGOR_DBGLEVEL > 0 && !defined(DAGOR_THREAD_SANITIZER)
   int64_t reft = profile_ref_ticks();
 #endif
-  PtrTab<RenderableInstanceLodsResource> pendingReloadResListCopy(framemem_ptr());
+  PtrTab<RenderableInstanceLodsResource> pendingReloadResListCopy;
   {
     // Move buffer away, so that we can release the lock before calling functions on riUnitedVdata
     std::lock_guard<std::mutex> scopedLock(pendingReloadResListMutex);
-    pendingReloadResListCopy.assign(pendingReloadResList.begin(), pendingReloadResList.end());
-    pendingReloadResList.clear();
+    pendingReloadResListCopy = eastl::move(pendingReloadResList);
   }
+  riUnitedVdata.reloadResList(std::move(pendingReloadResListCopy));
   riUnitedVdata.discardUnusedResToFreeReqMem();
-  for (RenderableInstanceLodsResource *res : pendingReloadResListCopy)
-    riUnitedVdata.reloadRes(res);
 
   const auto &mt_stats = ShaderMatVdata::get_model_load_stats(VDATA_MT_RENDINST);
   if (interlocked_acquire_load(mt_stats.reloadDataCount) == last_reported_mls.reloadDataCount)
@@ -269,14 +283,14 @@ static void batch_reload_res(void *)
     COPY_STAT(reloadDataCount);
 #undef COPY_STAT
     String status_str(framemem_ptr());
-    riUnitedVdata.buildStatusStr(status_str, false);
-    debug("unitedVdata<%s>: reloaded %u models (%uK for %u msec) during last %u msec [total reloaded %uK of %u models]\n\n%s\n",
+    riUnitedVdata.buildStatusStrThrottled(status_str, 30 * 1000000);
+    debug("unitedVdata<%s>: reloaded %u models (%uK for %u msec) during last %u msec [total reloaded %uK of %u models]%s",
       RenderableInstanceLodsResource::getStaticClassName(), diff_mls.reloadDataCount, diff_mls.reloadDataSizeKb,
       diff_mls.reloadTimeMsec, profile_time_usec(last_reported_mls_reft) / 1000, last_reported_mls.reloadDataSizeKb,
       last_reported_mls.reloadDataCount, status_str);
     last_reported_mls_reft = profile_ref_ticks();
   }
-#if DAGOR_DBGLEVEL > 0 && !defined(__SANITIZE_THREAD__)
+#if DAGOR_DBGLEVEL > 0 && !defined(DAGOR_THREAD_SANITIZER)
   if (dagor_frame_no() > mss.end_frame_no + 16 || mss.end_frame_no > mss.start_frame_no + 600)
     mss.reset();
   mss.end_frame_no = dagor_frame_no();
@@ -288,7 +302,7 @@ static void batch_reload_res(void *)
 }
 static void on_higher_lod_required(RenderableInstanceLodsResource *res, unsigned req_lod, unsigned /*cur_lod*/)
 {
-#if DAGOR_DBGLEVEL > 0 && !defined(__SANITIZE_THREAD__)
+#if DAGOR_DBGLEVEL > 0 && !defined(DAGOR_THREAD_SANITIZER)
   mss.end_frame_no = dagor_frame_no();
   mss.ohlr_call.add(1);
   int64_t reft = profile_ref_ticks();
@@ -299,7 +313,7 @@ static void on_higher_lod_required(RenderableInstanceLodsResource *res, unsigned
   std::lock_guard<std::mutex> scopedLock(pendingReloadResListMutex);
   if (res->getResLoadingFlag())
     return;
-#if DAGOR_DBGLEVEL > 0 && !defined(__SANITIZE_THREAD__)
+#if DAGOR_DBGLEVEL > 0 && !defined(DAGOR_THREAD_SANITIZER)
   mss.ohlr_rcnt.add(1);
 #endif
   if (find_value_idx(pendingReloadResList, res) >= 0)
@@ -307,7 +321,7 @@ static void on_higher_lod_required(RenderableInstanceLodsResource *res, unsigned
   pendingReloadResList.push_back(res);
   if (pendingReloadResList.size() == 1)
     add_delayed_callback(&batch_reload_res, nullptr);
-#if DAGOR_DBGLEVEL > 0 && !defined(__SANITIZE_THREAD__)
+#if DAGOR_DBGLEVEL > 0 && !defined(DAGOR_THREAD_SANITIZER)
   mss.ohlr_usec.add(profile_time_usec(reft));
 #endif
 }
@@ -321,6 +335,12 @@ void register_rendinst_gameres_factory(bool use_united_vdata_streaming)
   if (auto hints_blk = ::dgs_get_game_params()->getBlockByName("unitedVdata.rendInst.def"))
     riUnitedVdata.setHints(*hints_blk);
   RenderableInstanceLodsResource::on_higher_lod_required = !use_united_vdata_streaming ? nullptr : &on_higher_lod_required;
+  RenderableInstanceLodsResource::always_load_last_tree_geom_lod =
+    ::dgs_get_game_params()->getBool("rendinstAlwaysLoadLastTreeGeomLod", false);
+  RenderableInstanceLodsResource::disable_voxel_lods =
+    ::dgs_get_settings()->getBlockByNameEx("debug")->getBool("disableVoxelLods", !riUnitedVdata.canUseVbAsSr());
+  if (RenderableInstanceLodsResource::disable_voxel_lods)
+    debug("voxel LODs are disabled");
 
   rendinst_factory.demandInit();
   ::add_factory(rendinst_factory);
@@ -338,7 +358,10 @@ REGISTER_D3D_BEFORE_RESET_FUNC(before_reset_rendinst_buffers);
 static void reset_rendinst_buffers(bool full_reset)
 {
   if (full_reset)
+  {
     riUnitedVdata.onAfterD3dReset();
+    VoxelSurfaceData::onAfterD3dReset();
+  }
 }
 REGISTER_D3D_AFTER_RESET_FUNC(reset_rendinst_buffers);
 
@@ -378,7 +401,7 @@ static bool riUnitedVdata_console_handler(const char *argv[], int argc)
     riUnitedVdata.dumpMemBlocks(&summary);
     console::print_d("riUnitedVdata: %s (detailed memory map listed to debug)", summary);
   }
-#if DAGOR_DBGLEVEL > 0 && !defined(__SANITIZE_THREAD__)
+#if DAGOR_DBGLEVEL > 0 && !defined(DAGOR_THREAD_SANITIZER)
   CONSOLE_CHECK_NAME("riUnitedVdata", "perfStat", 1, 1)
   {
     console::print_d(
@@ -427,7 +450,7 @@ public:
     gameRes.emplace_back(GameRes{res_id, RPtr(srcRes)});
   }
 
-  void createGameResource(int /*res_id*/, const int * /*ref_ids*/, int /*num_refs*/) override {}
+  void createGameResource(RRL, int, const int *, int) override {}
 };
 static InitOnDemand<RndGrassGameResFactory> rndgrass_factory;
 

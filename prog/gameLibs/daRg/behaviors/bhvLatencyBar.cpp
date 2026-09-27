@@ -13,6 +13,7 @@
 #include <util/dag_localization.h>
 
 #include <perfMon/dag_cpuFreq.h>
+#include <drv/3d/dag_commands.h>
 #include <startup/dag_globalSettings.h>
 #include <workCycle/dag_workCycle.h>
 #include <frameTimeMetrics/aggregator.h>
@@ -36,7 +37,8 @@ void BhvLatencyBar::onAttach(Element *elem)
 
 int BhvLatencyBar::update(UpdateStage /*stage*/, darg::Element *elem, float /*dt*/)
 {
-  frameTimeMetrics->update(::get_time_msec(), ::dagor_frame_no(), ::dagor_game_act_time, displayMode);
+  frameTimeMetrics->update(::get_time_msec(), ::dagor_frames_presented(), ::dagor_game_act_time, displayMode,
+    d3d::driver_command(Drv3dCommand::GET_PRESENTED_FRAME_COUNT));
   if (textVersion != frameTimeMetrics->getTextVersion())
   {
     textVersion = frameTimeMetrics->getTextVersion();

@@ -8,11 +8,21 @@ include "gbuffer.dshl"
 include "gbuffer_forward.dshl"
 include "static_shadow.dshl"
 include "wetness_inc.dshl"
-
-float4 camera_base_offset = (0, 0, 0, 0);
+include "triangle_size_debug.dshl"
+include "triangle_size_debug_lmesh.dshl"
 
 shader land_mesh//, land_mesh_combined
 {
+  assume allow_forced_in_editor = yes;
+  if ((allow_triangle_size_debug == no && lmesh_triangle_size_debug == on) || (!hardware.dx12 && lmesh_triangle_size_debug == on))
+  {
+    dont_render;
+  }
+
+  if (lmesh_rendering_mode != rendering_landmesh && lmesh_triangle_size_debug == on)
+  {
+    dont_render;
+  }
 
   (vs) { camera_base_offset@f4 = camera_base_offset; }
 
@@ -67,26 +77,29 @@ shader land_mesh//, land_mesh_combined
     static float detail_mul_u = 4;
     static float detail_mul_v = 4;
     (ps) {
-      colormapTex@static = colormap;
-      detailTex@static = diffusedetail;
-      normalmapTex@static = normaldetail;
+      colormapTex@staticSmp = colormap;
+      detailTex@staticSmp = diffusedetail;
+      normalmapTex@staticSmp = normaldetail;
     }
     (vs) { detail_mul@f2 = (detail_mul_u, detail_mul_v, 0, 0); }
     USE_PIXEL_TANGENT_SPACE()
   }
 
-  if (in_editor_assume == yes)
+  if (in_editor_assume == yes || use_editor_render)
   {
     (vs) {
-      globtm@f44 = globtm;
       world_local_x@f3 = world_local_x;
       world_local_y@f3 = world_local_y;
       world_local_z@f3 = world_local_z;
       world_local_pos@f3 = world_local_pos;
     }
   }
+
+  if (in_editor_assume == yes)
+  {
+    (vs) { globtm@f44 = globtm; }
+  }
   INIT_HARDCODED_WORLD_POS()
-  ENABLE_ASSERT(ps)
 
   if (lmesh_rendering_mode == grass_color || lmesh_rendering_mode == grass_mask || lmesh_rendering_mode == rendering_clipmap)
   {
@@ -178,7 +191,7 @@ shader land_mesh//, land_mesh_combined
     if (lmesh_rendering_mode == rendering_landmesh)
     {
       supports land_mesh_with_clipmap;
-      USE_CLIPMAP_NORMAL()
+      USE_CLIPMAP_NORMAL(false)
       USE_NORMAL_DETAIL()
       USE_LAND_MICRODETAILS_PS()
       USE_LAND_MICRODETAIL_PARAMS_PS()
@@ -186,10 +199,21 @@ shader land_mesh//, land_mesh_combined
       USE_LAND_SHORE()
       USE_UAV_RENDERING_FEEDBACK()
       WRITE_GBUFFER()
+      if (in_editor == yes || use_editor_render)
+      {
+        INIT_GLOBAL_LINEAR_WRAP_SAMPLER(ps)
+        (ps) {
+          heightmap_gradient_land_tex@tex2d = heightmap_gradient_land_tex;
+          heightmap_gradient_land_params@f4 = heightmap_gradient_land_params;
+          heightmap_show_gradient_land@i1 = heightmap_show_gradient_land;
+        }
+        hlsl(ps) {
+          #define heightmap_gradient_land_tex_samplerstate global_linear_wrap_sampler
+        }
+      }
     } else if (lmesh_rendering_mode == rendering_reflection)
     {
       supports land_mesh_with_clipmap_reflection;
-      supports global_const_block;
       hlsl
       {
         // TODO: check if a fully forward rendering pipeline needs it
@@ -210,7 +234,8 @@ shader land_mesh//, land_mesh_combined
     {
       USE_LANDMESH_COMBINE()
     }
-    USE_LAND_LIGHTING()
+
+    USE_LAND_NORMAL_FROM_NORMALMAP()
 
     hlsl {
       struct VsOutput
@@ -223,7 +248,6 @@ shader land_mesh//, land_mesh_combined
         float3 pointToEye : TEXCOORD2;
       };
     }
-    NO_VERTICAL_TEX_USE()
     INIT_STATIC_SHADOW_PS()
 
     if (compatibility_mode == compatibility_mode_off)
@@ -238,7 +262,9 @@ shader land_mesh//, land_mesh_combined
       GLOBAL_UAV_FEEDBACK
 
       FORCE_EARLY_DEPTH_STENCIL
-      GBUFFER_OUTPUT landmesh_ps(VsOutput input HW_USE_SCREEN_POS)
+      GBUFFER_OUTPUT landmesh_ps(VsOutput input HW_USE_SCREEN_POS
+        HW_USE_READ_SHADING_RATE
+      )
       {
         float4 screenpos = GET_SCREEN_POS(input.pos);
         float3 pointToEye = input.pointToEye.xyz;
@@ -247,9 +273,8 @@ shader land_mesh//, land_mesh_combined
         float3 pointToEyeNorm = pointToEye * rcp(dist);
 
         // Normalmap.
-        
         half baseAo = 1;
-        half3 worldNormal = get_land_normal_from_normalmap(worldPos.xz, baseAo);
+        half3 worldNormal = get_land_normal_from_normalmap(worldPos.xyz, baseAo);
 
         half3 verticalNormal = worldNormal;//sample from level
         half3 vertexNormal = verticalNormal;
@@ -259,7 +284,7 @@ shader land_mesh//, land_mesh_combined
 
         // Base color.
         float4 worldPosGradients = float4(ddx(worldPos.xz), ddy(worldPos.xz));
-        WRITE_UAV_FEEDBACK(worldPos.xz, 0, worldPosGradients)
+        WRITE_UAV_FEEDBACK(worldPos.xz, 0, worldPosGradients / GET_SHADING_RATE.xxyy)
         half2 clipNormalXY = 0;
         ##if (lmesh_rendering_mode == rendering_landmesh)
         //shader_lod == 0, actually
@@ -303,7 +328,6 @@ shader land_mesh//, land_mesh_combined
         ##else
           half shadow = 1;
           half3 diffuseColor = sample_lastclip(worldPos.xyz);
-          half clipmapHorAmount = applyVerticalTexture(verticalNormal, worldNormal, diffuse, worldPos, false);
           half reflectance = 0.5*pow5(saturate(0.9 - (diffuseColor.g-max(diffuseColor.r, diffuseColor.b))));
           half smoothness = 0;
           half translucency = 0;
@@ -317,9 +341,21 @@ shader land_mesh//, land_mesh_combined
       worldNormal.xz *= mirror_scale.xy;
   ## endif
 
-        //half clipmapHorAmount = applyVerticalTexture(verticalNormal, normal, diffuseColor, worldPos, true);
         half3 diffuse = diffuseColor.rgb;
-       //shadow = lerp(1, shadow, clipmapHorAmount*(1-combinedAmount));
+
+        ##if (in_editor == yes || use_editor_render) && lmesh_rendering_mode == rendering_landmesh
+          BRANCH
+          if (heightmap_show_gradient_land != 0)
+          {
+            float gradientT = saturate((worldPos.y - heightmap_gradient_land_params.x) * heightmap_gradient_land_params.y);
+            // To make edge colors flat remap to texel centers, so bilinear filtering never reaches past the first/last texel.
+            const float gradientLandTexWidth = 256.0; // HeightmapDebugShading::TEXTURE_WIDTH
+            float gradientU = (gradientT * (gradientLandTexWidth - 1.0f) + 0.5) / gradientLandTexWidth;
+            diffuse.rgb = tex2Dlod(heightmap_gradient_land_tex, float4(gradientU, 0.5, 0, 0)).rgb;
+          }
+        ##endif
+
+        //shadow = lerp(1, shadow, 1-combinedAmount);
         UnpackedGbuffer result;
         init_gbuffer(result);
         init_albedo(result, diffuse.rgb);
@@ -360,8 +396,8 @@ shader land_mesh//, land_mesh_combined
         float4 inpos = decode_pos_shader(inputpos);
         float4 pos = decode_pos(inpos);
         float3 worldPos = pos.xyz;
-  ##if in_editor_assume == yes
-        output.pos = mulPointTm(pos, globtm);
+  ##if in_editor_assume == yes || use_editor_render
+        output.pos = mulPointTm(pos.xyz, globtm);
         worldPos = pos.x * world_local_x + pos.y * world_local_y + pos.z * world_local_z + world_local_pos;
   ##else
         output.pos = mulPointTm(worldPos + camera_base_offset.xyz, globtm);
@@ -382,6 +418,13 @@ shader land_mesh//, land_mesh_combined
     }
 
     compile("vs_5_0", "landmesh_vs");
-    compile("ps_5_0", "landmesh_ps");
+    if (lmesh_triangle_size_debug == on)
+    {
+      TRIANGLE_SIZE_DEBUG_PS()
+    }
+    else
+    {
+      compile("ps_5_0", "landmesh_ps");
+    }
   }
 }

@@ -12,7 +12,7 @@
 #include "net/netConsts.h"
 #include <util/dag_string.h>
 #include <util/dag_watchdog.h>
-#include <crypto/base64.h>
+#include <dagCrypto/base64.h>
 #include <EASTL/string.h>
 #include <EASTL/algorithm.h>
 #include <ioSys/dag_dataBlock.h>
@@ -66,20 +66,29 @@ namespace dedicated
 static uint16_t binded_net_port = 0;
 uint16_t get_binded_port() { return binded_net_port; }
 
+#if !DAGOR_HOSTED_INTERNAL_SERVER
 bool is_dedicated() { return true; }
+#endif
 
 const char *get_host_url(eastl::string &str, int &it)
 {
   const char *listen = dgs_get_argv("listen", it);
   if (!listen)
+  {
+    debug("get_host_url %d: not listen (dgs_argc=%d), returns null", it, dgs_argc);
     return nullptr;
+  }
   if (const char *pcol = strchr(listen, ':')) // port already specified
+  {
+    debug("get_host_url %d: listen %s", it, listen);
     return listen;
+  }
   // append binded port
   int bport = get_binded_port();
   G_FAST_ASSERT(bport != 0);
   str = listen;
   str.append_sprintf(":%d", bport);
+  debug("get_host_url %d: %s", it, str.c_str());
   return str.c_str();
 }
 
@@ -96,17 +105,28 @@ static inline uint16_t try_parse_port(const char *str) // return 0 on error
   return ret;
 }
 
-net::INetDriver *create_listen_net_driver()
+net::INetDriver *create_listen_net_driver(const char *url_override, int max_connections, bool no_fatal_on_failure)
 {
+  // -nolisten: only applies to the cmdline-driven path; a script-provided URL overrides it.
+  if (!url_override && dgs_get_argv("nolisten"))
+    return nullptr;
+  const char *listen = url_override ? url_override : dgs_get_argv("listen");
+  if (dedicated::is_hosted_server_instance())
+    max_connections += 1; // reserve one connection for possible relay control connections
+
   net::INetDriver *drv = nullptr;
-  if (dgs_get_argv("nolisten"))
-    return drv;
-  const char *listen = dgs_get_argv("listen");
-  if (const char *udp_sock = dgs_get_argv("udp_sock")) // if udp_sock is passed than port should be passed as well
+  // -udp_sock: is a startup-time relay-handoff concern; only honored on the cmdline path.
+  const char *udp_sock = url_override ? nullptr : dgs_get_argv("udp_sock");
+  if (udp_sock) // if udp_sock is passed than port should be passed as well
   {
     binded_net_port = listen ? try_parse_port(listen) : 0;
     if (!binded_net_port)
     {
+      if (no_fatal_on_failure)
+      {
+        logerr("failed to parse bind port from listen url '%s'", listen);
+        return nullptr;
+      }
       DAG_FATAL("failed to parse bind port from listen url '%s'", listen);
       return nullptr;
     }
@@ -117,18 +137,27 @@ net::INetDriver *create_listen_net_driver()
       SocketDescriptor sdss;
       sdss.type = SocketDescriptor::SOCKET;
       sdss.socket = sockfp;
-      int max_connections = NET_MAX_PLAYERS;
-      if (gameproj::is_hosted_server_instance())
-        max_connections += 1; // reserve one connection for possible relay control connections
       drv = net::create_net_driver_listen(sdss, max_connections);
     }
     else
+    {
+      if (no_fatal_on_failure)
+      {
+        logerr("failed to parse udp sock '%s'", udp_sock);
+        return nullptr;
+      }
       DAG_FATAL("failed to parse udp sock '%s'", udp_sock);
+    }
   }
   else
-    drv = net::create_net_driver_listen(listen ? listen : "", NET_MAX_PLAYERS, &binded_net_port);
+    drv = net::create_net_driver_listen(listen ? listen : "", max_connections, &binded_net_port);
   if (!drv)
   {
+    if (no_fatal_on_failure)
+    {
+      logerr("failed to create listen net driver on '%s', port %d is not available?", listen, binded_net_port);
+      return nullptr;
+    }
     DAG_FATAL("failed to create dedicated net driver on '%s', port %d is not available?", listen, binded_net_port);
     return nullptr;
   }
@@ -189,7 +218,13 @@ static void send_delayed_connection_event(net::ConnectionId conn_id)
   auto res = delayed_connection_event_map.find(conn_id);
   if (res != delayed_connection_event_map.end())
   {
-    g_entity_mgr->broadcastEventImmediate(eastl::move(*res->second));
+    // Field order of NET_ECS_EVENT(EventOnClientConnected) in daECS/net/netEvents.h.
+    constexpr size_t EV_USER_ID = 1, EV_APP_ID = 8;
+    // The vrom sync can outlast the matching push carrying the player's real appId, and back
+    // then NetMatchingEventOnPlayerAppIdChanged had no player entity to correct.
+    EventOnClientConnected &evt = *res->second;
+    evt.get<EV_APP_ID>() = dedicated_matching::get_player_app_id(evt.get<EV_USER_ID>());
+    g_entity_mgr->broadcastEventImmediate(eastl::move(evt));
     res->second.reset();
   }
 }
@@ -200,7 +235,7 @@ static void on_sync_vroms_done_msg(const net::IMessage *msgraw)
   debug("[SyncVroms]: The client #%d has applied vrom diffs successfully", msgraw->connection->getId());
 
   auto msg = msgraw->cast<SyncVromsDone>();
-  G_ASSERT(msg);
+  G_VERIFY(msg);
 
   auto it = apply_diffs_timestamp_map.find(msgraw->connection->getId());
   if (it != apply_diffs_timestamp_map.end())
@@ -211,14 +246,13 @@ static void on_sync_vroms_done_msg(const net::IMessage *msgraw)
       statsd::profile("syncvroms.done_ms", (long)syncTimeMs);
   }
 
-  uint32_t &connFlagsRW = msgraw->connection->getConnFlagsRW();
-  if (!(connFlagsRW & net::CF_PENDING))
+  if (!msgraw->connection->hasAnyFlags(net::CF_PENDING))
   {
-    debug("[SyncVroms]: The connection is excpected to by in peding state.");
+    debug("[SyncVroms]: The connection is expected to be in pending state.");
     return;
   }
 
-  connFlagsRW &= ~net::CF_PENDING; // not pending anymore
+  msgraw->connection->clearFlags(net::CF_PENDING);
 
   send_delayed_connection_event(msgraw->connection->getId());
 
@@ -256,7 +290,10 @@ static bool check_client_vroms_and_send_diffs(const ClientInfo *msg)
     syncvroms::write_vrom_diffs(applyDiffsMsg.get<0>(), syncvroms::get_mounted_sync_vroms_list(), clientSyncVroms);
 
   if (diffsCount == 0)
+  {
+    debug("[SyncVroms]: Recieved client #%d and server vroms are the same, no diff to send.", (int)msg->connection->getId());
     return true;
+  }
 
   auto insIt = apply_diffs_timestamp_map.insert(msg->connection->getId());
   insIt.first->second = get_time_msec();
@@ -319,8 +356,7 @@ struct DedicatedNetObserver final : public net::INetworkObserver
     net::IConnection &conn = *msgraw->connection;
     auto msg = msgraw->cast<ClientInfo>();
     G_ASSERT(msg);
-    uint32_t &connFlags = conn.getConnFlagsRW();
-    if (DAGOR_UNLIKELY(!(connFlags & net::CF_PENDING)))
+    if (DAGOR_UNLIKELY(!conn.hasAnyFlags(net::CF_PENDING)))
     {
       logwarn("ClientInfo for not pending connection %d", (int)conn.getId());
       return;
@@ -386,14 +422,14 @@ struct DedicatedNetObserver final : public net::INetworkObserver
     const bool vromsAreTheSame = check_client_vroms_and_send_diffs(msg);
 
     if (vromsAreTheSame)
-      connFlags &= ~net::CF_PENDING; // not pending anymore
+      conn.clearFlags(net::CF_PENDING);
 
     {
       ServerInfo srvInfoMsg((uint16_t)serverFlags, (uint8_t)phys_get_tickrate(), (uint8_t)phys_get_bot_tickrate(), get_exe_version32(),
         sceneload::get_current_game().sceneName, sceneload::get_current_game().levelBlkPath, Tab<uint8_t>{});
 
       g_entity_mgr->broadcastEventImmediate(
-        OnNetDedicatedPrepareServerInfo(srvInfoMsg, serverFlags, connFlags, clientFlags, userId, userName, pltf, conn));
+        OnNetDedicatedPrepareServerInfo(srvInfoMsg, serverFlags, clientFlags, userId, userName, pltf, conn));
       srvInfoMsg.connection = &conn;
       send_net_msg(*g_entity_mgr, net::get_msg_sink(), eastl::move(srvInfoMsg));
     }
@@ -409,24 +445,23 @@ struct DedicatedNetObserver final : public net::INetworkObserver
         send_event_after_sync_vroms_done(conn.getId(), eastl::move(evt));
     }
 
-    if (!(connFlags & net::CF_PENDING)) // i.e. not disconnected in event handlers
-      flush_new_connection(conn);
+    flush_new_connection(conn);
   }
 
   void onConnect(net::Connection &conn) override
   {
     G_VERIFY(conn.setEntityInScopeAlways(net::get_msg_sink()));
-    if (!conn.isBlackHole()) // network connection
+    if (!conn.isBlackHole())
     {
+      conn.addFlags(net::CF_PENDING);
       debug("Client #%d connected, wait for identity message", (int)conn.getId());
-      conn.getConnFlagsRW() = net::CF_PENDING;
 
       if (ecs::get_common_loading_job_mgr() == cpujobs::COREID_IMMEDIATE) // Init MT loading mgr on first connect
         init_loading_job_manager();
     }
     else // replay connection
     {
-      G_ASSERT(get_time_mgr().getMillis() == 0); // make sure that all replay connections has same timeline
+      G_ASSERT(get_sync_millis() == 0);
       flush_new_connection(conn);
     }
   }

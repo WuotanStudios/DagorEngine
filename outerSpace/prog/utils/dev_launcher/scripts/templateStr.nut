@@ -1,11 +1,12 @@
 from "%darg/ui_imports.nut" import *
+from "types" import String
 
 let {startswith, endswith} = require("string")
 //let {kwpartial} = require("%sqstd/functools.nut")
 
 function applyParams(func, params){
   let {parameters, defparams, varargs} = func.getfuncinfos()
-  assert(varargs==0, "no varargs allowed")
+  assert(!varargs, "no varargs allowed")
   let arguments = array(parameters.len())
   let defparamsOffset = parameters.len() - defparams.len()
   foreach (idx, paramname in parameters){
@@ -35,7 +36,7 @@ function buildStrByTemplates(str, params, formatters){
     }
     let t = token.slice(">>".len()).slice(0, -"<<".len())
     assert(t in formatters, @() $"unknown template: {t}")
-    if (type(formatters[t])=="string") {
+    if (formatters[t] instanceof String) {
       resStrings.append(buildStrByTemplates(formatters[t], params, formatters))
     }
     else {

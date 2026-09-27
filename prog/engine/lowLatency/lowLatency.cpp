@@ -14,7 +14,7 @@
 #include <workCycle/dag_workCycle.h>
 #include <shaders/dag_shaderBlock.h>
 #include <math/integer/dag_IPoint2.h>
-#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
 
 #include <debug/dag_debug.h>
 #include <util/dag_console.h>
@@ -58,14 +58,19 @@ lowlatency::LatencyMode lowlatency::get_from_blk()
     case GpuVendor::INTEL: mode = video->getInt("intel_latency", def); break;
     default: mode = lowlatency::LatencyMode::LATENCY_MODE_OFF;
   }
+  bool frameGenerationEnabled = false;
   if (vendor == GpuVendor::NVIDIA)
-  {
-    const bool frameGenerationEnabled =
+    frameGenerationEnabled =
       video->getInt("dlssFrameGenerationCount", 0) > 0 ||
-      (stricmp(video->getStr("antialiasing_mode", "off"), "dlss") == 0 && video->getInt("antialiasing_fgc", 0) > 0);
-    if (frameGenerationEnabled)
-      return lowlatency::LatencyMode::LATENCY_MODE_NV_BOOST; // forced by frame generation
-  }
+      (stricmp(video->getStr("antialiasing_mode", "off"), "dlss") == 0 && video->getInt("antialiasing_fgc", 0) != 0);
+  else if (vendor == GpuVendor::INTEL)
+    frameGenerationEnabled =
+      (stricmp(video->getStr("antialiasing_mode", "off"), "xess") == 0 && video->getInt("antialiasing_fgc", 0) > 0);
+
+  // frame generation needs at least ON, the choice between ON and ON+BOOST stays with the player
+  if (frameGenerationEnabled && mode == lowlatency::LatencyMode::LATENCY_MODE_OFF)
+    mode = lowlatency::LatencyMode::LATENCY_MODE_ON;
+
   return static_cast<lowlatency::LatencyMode>(mode);
 }
 
@@ -110,12 +115,6 @@ void lowlatency::set_latency_mode(LatencyMode mode, float min_interval_ms)
       case LATENCY_MODE_ON: latency->setOptions(GpuLatency::Mode::On, min_interval_ms * 1000); break;
       case LATENCY_MODE_NV_BOOST: latency->setOptions(GpuLatency::Mode::OnPlusBoost, min_interval_ms * 1000); break;
     }
-}
-
-void lowlatency::mark_flash_indicator()
-{
-  if (auto latency = GpuLatency::getInstance())
-    latency->setMarker(dagor_get_latest_frame_started(), lowlatency::LatencyMarkerType::TRIGGER_FLASH);
 }
 
 void lowlatency::sleep(uint32_t frame_id)

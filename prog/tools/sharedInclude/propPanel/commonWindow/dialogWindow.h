@@ -10,6 +10,8 @@
 #include <math/dag_Point2.h>
 #include <util/dag_string.h>
 
+#include <float.h>
+
 namespace PropPanel
 {
 
@@ -23,11 +25,24 @@ enum
   DIALOG_ID_CLOSE,
   DIALOG_ID_YES = 6,
   DIALOG_ID_NO = 7,
+
+  DIALOG_ID_FIRST_FREE
 };
 
 class DialogWindow : public ControlEventHandler
 {
 public:
+  // Helper context structure used between beforeUpdateImguiDialog() and updateImguiDialog().
+  struct DialogFrameSizing
+  {
+    // Use this instead of "autoSizingRequestedForFrames > 0".
+    bool autoSize = false;
+
+    // The panel's limit from autoSize(). Only valid when autoSize is set.
+    float maxContentWidth = FLT_MAX;
+    float maxContentHeight = FLT_MAX;
+  };
+
   DialogWindow(void *phandle, hdpi::Px w, hdpi::Px h, const char caption[], bool hide_panel = false);
   DialogWindow(void *phandle, int x, int y, hdpi::Px w, hdpi::Px h, const char caption[], bool hide_panel = false);
   ~DialogWindow() override;
@@ -51,10 +66,16 @@ public:
   virtual void clickDialogButton(int id);
   virtual SimpleString getDialogButtonText(int id) const;
   virtual void setDialogButtonText(int id, const char *text);
+  virtual void createDialogButton(int id, const char *text);
   virtual bool removeDialogButton(int id);
+  virtual void setDialogButtonEnabled(int id, bool enabled);
+  virtual void setDialogButtonTooltip(int id, const char *text);
 
   virtual IPoint2 getWindowPosition() const;
   virtual void setWindowPosition(const IPoint2 &position, const Point2 &pivot = Point2::ZERO);
+
+  static void setInitialSizeExtension(hdpi::Px w, hdpi::Px h);
+  static IPoint2 getInitialSizeExtension();
 
   virtual IPoint2 getWindowSize() const;
   virtual void setWindowSize(const IPoint2 &size);
@@ -68,10 +89,22 @@ public:
   // "When multi-viewports are enabled, all Dear ImGui coordinates become absolute coordinates"
   virtual void centerWindowToMousePos();
 
-  virtual void positionLeftToWindow(const char *window_name, bool use_same_height = false);
+  // Position the dialog beside the specified window.
+  // If the window cannot be found then the function does nothing.
+  // The dialog is placed to the left or right side of the specified window, or to the center of the window's viewport
+  // if there is no enough room beside the window.
+  // prefer_left_side: if true then the left side is used if there is enough room, if false then the right side
+  // use_same_height: if true then the dialog's height will be changed to the same as the window's height
+  virtual void positionBesideWindow(const char *window_name, bool prefer_left_side = true, bool use_same_height = true);
+
   virtual void dockTo(unsigned dock_node_id);
 
-  virtual void autoSize(bool auto_center = true);
+  // Fits the dialog to its content once, over the next couple of frames. The dialog grows up to a fixed fraction of the
+  // screen (AUTO_SIZE_MAX_DISPLAY_FRACTION) in either dimension. Past that point the content can be scrolled, keeping
+  // the buttons in view.
+  // use_preferred_size: set the dialog's minimum size based on the panel's PropertyControlBase::getPreferredSize().
+  //   Off by default because getPreferredSize() support is still limited across controls.
+  virtual void autoSize(bool auto_center = true, bool use_preferred_size = false);
 
   // Check if the dialog has ever been shown. "Ever" also includes previous sessions.
   // For example in that case setting the window position and size can be skipped and the dialog will be displayed at
@@ -86,6 +119,7 @@ public:
   virtual void setScrollPos(int pos);
 
   // events
+  virtual void onButtonPanelClick(int id);
   virtual bool onOk() { return true; }
   virtual bool onCancel() { return true; }
   virtual bool onClose() { return onCancel(); }
@@ -94,9 +128,12 @@ public:
 
   void setCloseHandler(ControlEventHandler *close_event_handler) { closeEventHandler = close_event_handler; }
 
+  void setCloseButtonVisible(bool close_button_visible) { closeButtonVisible = close_button_visible; }
+  bool getCloseButtonVisible() const { return closeButtonVisible; }
+
   // When showing the dialog the focus will be set to the speficified control.
-  // id: must be DIALOG_ID_NONE, DIALOG_ID_OK or DIALOG_ID_CANCEL.
-  //     When DIALOG_ID_NONE is specified then no focus will be set.
+  // id: can be DIALOG_ID_NONE, DIALOG_ID_OK, DIALOG_ID_CANCEL or any control ID from the buttonsPanel or propertiesPanel.
+  //     When DIALOG_ID_NONE is specified then no initial focus will be set.
   void setInitialFocus(int id) { initialFocusId = id; }
 
   // Prevent the procession of the Tab key, so changing the focused control and the selected combo box item will not work with the
@@ -112,14 +149,20 @@ public:
   void setModalBackgroundDimmingEnabled(bool enabled) { modalBackgroundDimmingEnabled = enabled; }
   bool isModalBackgroundDimmingEnabled() const { return modalBackgroundDimmingEnabled; }
 
-  virtual void beforeUpdateImguiDialog(bool &use_auto_size_for_the_current_frame);
-  virtual void updateImguiDialog();
+  // Pass the result to updateImguiDialog().
+  // content_frame_padding: the ImGuiStyleVar_FramePadding that is used for the content in updateImguiDialog()
+  virtual DialogFrameSizing beforeUpdateImguiDialog(const Point2 &content_frame_padding);
+  virtual void updateImguiDialog(const DialogFrameSizing &sizing);
 
 protected:
   void create(unsigned w, unsigned h, bool hide_panel);
+  void applyInitialFocus();
 
   // The height taken by the button panel.
   float getButtonPanelHeight() const { return buttonPanelHeight; }
+
+  // Called with button style vars (ItemSpacing, FramePadding) already pushed.
+  virtual float calculateButtonPanelHeight() const;
 
   ControlEventHandler *buttonEventHandler = nullptr;
   ControlEventHandler *closeEventHandler = nullptr;
@@ -133,11 +176,13 @@ protected:
   bool modal = false;
   bool visible = false;
   bool buttonsVisible = true;
+  bool closeButtonVisible = true;
   bool manualModalSizingEnabled = false;
   bool preventNavigationWithTheTabKey = false;
   bool modalBackgroundDimmingEnabled = false; // Off by default, artists wanted to see the viewport without dimming.
 
   int autoSizingRequestedForFrames = 0;
+  bool autoSizeUsePreferredSize = false;
   bool moveRequested = false;
   Point2 moveRequestPosition = Point2::ZERO;
   Point2 moveRequestPivot = Point2::ZERO;

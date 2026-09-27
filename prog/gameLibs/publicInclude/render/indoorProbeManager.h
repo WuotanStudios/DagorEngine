@@ -49,11 +49,19 @@ public:
   int framesSinceLastCulling = 0;
   static constexpr int GPU_CULLING_FREQUENCY = 6;
 
+  enum
+  {
+    PROBE_IN_PROGRESS,
+    LAST_UPDATED_PROBE,
+    ACTIVE_PROBE
+  };
+
 private:
   LightProbeSpecularCubesContainer *cubesContainer;
-  UniqueBufHolder indoorActiveProbesData;
-  UniqueBufHolder indoorVisibleProbesData;
-  UniqueBufHolder cellClusters;
+  UniqueBufWithShaderVar indoorActiveProbesData;
+  UniqueBufWithShaderVar indoorVisibleProbesData;
+  UniqueBuf indoorVisibleProbesDataSecondary;
+  UniqueBufWithShaderVar cellClusters;
   BufPtr indoorActiveProbesStaging;
   eastl::vector<uint32_t> probeIdxToNodeIdx;
   eastl::vector<Point3> probesPositions;
@@ -64,17 +72,17 @@ private:
   eastl::unique_ptr<ComputeShaderElement> clusterizator;
   float lastY;
 
-  UniqueBufHolder allIndoorProbeBoxes;
-  UniqueBufHolder allIndoorProbePosAndCubes;
+  UniqueBufWithShaderVar allIndoorProbeBoxes;
+  UniqueBufWithShaderVar allIndoorProbePosAndCubes;
 
-  UniqueBufHolder indoorProbeVisibilityMask; // For debug
+  UniqueBufWithShaderVar indoorProbeVisibilityMask; // For debug
 
   void initLightProbes();
 
   using UintLocalVector = eastl::vector<uint32_t, framemem_allocator>;
   using Point4LocalVector = eastl::vector<Point4, framemem_allocator>;
   using MatrixLocalVector = eastl::vector<mat44f, framemem_allocator>;
-  void updateActiveProbes(const UintLocalVector &node_indices);
+  void updateActiveProbes(dag::ConstSpan<uint32_t> probe_indices);
   bool tryToActivateProbe(uint32_t probe_index);
   void setActiveProbe(int probe_idx, uint32_t active_slot);
   Point4LocalVector packMatricesAndProbesData(dag::ConstSpan<uint32_t> probe_indices, dag::ConstSpan<mat44f> matrices,
@@ -82,14 +90,7 @@ private:
   void fillCellsBuffer();
   void initBuffers();
 
-  enum
-  {
-    PROBE_IN_PROGRESS,
-    LAST_UPDATED_PROBE,
-    ACTIVE_PROBE
-  };
   eastl::vector<uint32_t> activeProbesState;
-
 
 public:
   IndoorProbeManager(LightProbeSpecularCubesContainer *container, IIndoorProbeNodes *nodes);
@@ -115,9 +116,16 @@ public:
 
   void setVisibleBoxesData(dag::ConstSpan<uint32_t> probe_indices, dag::ConstSpan<mat44f> matrices,
     dag::ConstSpan<uint32_t> shapeTypes);
+  void bindSecondaryVisibleBoxesData(dag::ConstSpan<uint32_t> probe_indices, dag::ConstSpan<mat44f> matrices,
+    dag::ConstSpan<uint32_t> shapeTypes);
+  void bindMainVisibleBoxesData();
   eastl::tuple<CpuMatrices, CpuIndices, CpuIndices, bool> cpuCheck(Occlusion *occlusion, const Point3 &view_pos,
     const TMatrix4 &view_mat, const Driver3dPerspective &persp);
-  void completeCullingReadback();
+  void completeCullingReadback(dag::ConstSpan<uint32_t> force_probe_indices = dag::ConstSpan<uint32_t>());
+
+  uint32_t getProbeState(uint32_t probe_index) const;
+
+  bool hasActiveIndoorProbes() const;
 
 private:
   IIndoorProbeNodes *indoorProbeNodes = nullptr;

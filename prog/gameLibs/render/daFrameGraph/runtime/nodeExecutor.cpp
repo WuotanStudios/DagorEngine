@@ -4,6 +4,7 @@
 
 #include <id/idRange.h>
 #include <debug/backendDebug.h>
+#include <debug/gpuRangeCapture.h>
 #include <frontend/multiplexingInternal.h>
 #include <backend/blobBindingHelpers.h>
 
@@ -12,8 +13,13 @@
 #include <drv/3d/dag_renderPass.h>
 #include <drv/3d/dag_heap.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
+#include <drv/3d/dag_driverDesc.h>
+#include <drv/3d/dag_bindless.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_vertexIndexBuffer.h>
+#include <drv/3d/dag_rwResource.h>
+#include <drv/3d/dag_tex3d.h>
+#include <common/resourceUsage.h>
 #include <perfMon/dag_statDrv.h>
 #include <shaders/dag_shaderVar.h>
 #include <shaders/dag_shaderBlock.h>
@@ -27,11 +33,14 @@
 namespace dafg
 {
 
-template <class F, class G, class H, class I, class B>
+template <class F, class G, class H, class I, class B, class T>
 void populate_resource_provider(ResourceProvider &provider, // passed by ref to avoid reallocs
   const InternalRegistry &registry, const NameResolver &resolver, NodeNameId node_id, const F &texture_provider,
-  const G &buffer_provider, const H &blob_provider, const I &is_available, const B &is_banned)
+  const G &buffer_provider, const H &blob_provider, const I &is_available, const B &is_banned, const T &get_res_type)
 {
+  if (registry.nodes[node_id].sideEffect == SideEffects::None)
+    return;
+
   provider.providedResources.reserve(registry.nodes[node_id].resourceRequests.size());
   provider.providedHistoryResources.reserve(registry.nodes[node_id].historyResourceReadRequests.size());
 
@@ -58,7 +67,10 @@ void populate_resource_provider(ResourceProvider &provider, // passed by ref to 
     if (is_banned(resId))
       return;
 
-    switch (registry.resources[resId].type)
+    // available res must have type
+    const auto resType = get_res_type(resId);
+
+    switch (resType)
     {
       case ResourceType::Texture: setRes(texture_provider(history, resId)); break;
       case ResourceType::Buffer: setRes(buffer_provider(history, resId)); break;
@@ -74,48 +86,88 @@ void populate_resource_provider(ResourceProvider &provider, // passed by ref to 
 }
 
 
-struct CallstackData
+struct NodeExecutor::CallstackData : private stackhelp::ext::ScopedCallStackContext
 {
-  NodeExecutor *executor;
-  NodeNameId nodeId;
-  multiplexing::Index multiplexingIndex;
+  CallstackData(NodeExecutor *executor, NodeNameId nodeId, multiplexing::Index multiplexingIndex) :
+    ScopedCallStackContext{captureCallstackData, this},
+    data{
+      static_cast<uint16_t>(multiplexingIndex.superSample),
+      static_cast<uint16_t>(multiplexingIndex.subSample),
+      static_cast<uint16_t>(multiplexingIndex.viewport),
+      static_cast<uint16_t>(multiplexingIndex.subCamera),
+    },
+    ref{executor, nodeId}
+  {}
+
+private:
+  // Compact packing into 1 void * on x64
+  struct Data
+  {
+    uint16_t superSample;
+    uint16_t subSample;
+    uint16_t viewport;
+    uint16_t subCamera;
+  };
+  static constexpr size_t CALLSTACK_DATA_SIZE_IN_POINTERS = (sizeof(Data) + sizeof(void *) - 1) / sizeof(void *);
+  // Data is hashed, so all bytes should be filled
+  static_assert(CALLSTACK_DATA_SIZE_IN_POINTERS * sizeof(void *) == sizeof(Data));
+  Data data;
+  struct Ref
+  {
+    NodeExecutor *executor;
+    NodeNameId nodeId;
+  };
+  Ref ref;
+
+  static stackhelp::ext::CallStackResolverCallbackAndSizePair captureCallstackData(stackhelp::CallStackInfo stack, void *context);
+  static stackhelp::ext::ResolvedRecord resolveCallStackData(char *buf, unsigned max_buf, stackhelp::CallStackInfo stack);
 };
 
-static constexpr size_t CALLSTACK_DATA_SIZE_IN_POINTERS = (sizeof(CallstackData) + sizeof(void *) - 1) / sizeof(void *);
 
-stackhelp::ext::CallStackResolverCallbackAndSizePair NodeExecutor::captureCallstackData(stackhelp::CallStackInfo stack, void *context)
+stackhelp::ext::CallStackResolverCallbackAndSizePair NodeExecutor::CallstackData::captureCallstackData(stackhelp::CallStackInfo stack,
+  void *context)
 {
   auto *ctx = static_cast<CallstackData *>(context);
+  const char *nodeName = ctx->ref.executor->registry.knownNames.getName(ctx->ref.nodeId);
+  unsigned nodeNameLen = strlen(nodeName) + 1;
+  unsigned nodeNameLenInPtr = (nodeNameLen + sizeof(void *) - 1) / sizeof(void *);
+  unsigned consumedStack = CALLSTACK_DATA_SIZE_IN_POINTERS + nodeNameLenInPtr;
 
+  if (stack.stackSize < consumedStack)
+    return ctx->invokePrev(stack);
+
+  memcpy(&stack.stack[0], &ctx->data, sizeof(CallstackData::Data));
+  strncpy(reinterpret_cast<char *>(&stack.stack[CALLSTACK_DATA_SIZE_IN_POINTERS]), nodeName, nodeNameLenInPtr * sizeof(void *));
+
+  return ctx->invokeChain<resolveCallStackData>(stack, consumedStack);
+}
+
+stackhelp::ext::ResolvedRecord NodeExecutor::CallstackData::resolveCallStackData(char *buf, unsigned max_buf,
+  stackhelp::CallStackInfo stack)
+{
   if (stack.stackSize < CALLSTACK_DATA_SIZE_IN_POINTERS)
     return {};
 
-  memcpy(&stack.stack[0], ctx, sizeof(CallstackData));
-
-  return {&NodeExecutor::resolveCallStackData, CALLSTACK_DATA_SIZE_IN_POINTERS};
-}
-
-unsigned NodeExecutor::resolveCallStackData(char *buf, unsigned max_buf, stackhelp::CallStackInfo stack)
-{
-  if (stack.stackSize < CALLSTACK_DATA_SIZE_IN_POINTERS)
-    return 0;
-
-  CallstackData data;
-  memcpy(&data, stack.stack, sizeof(data));
+  const Data &data = *reinterpret_cast<const Data *>(stack.stack);
+  const char *nodeName = reinterpret_cast<const char *>(&stack.stack[CALLSTACK_DATA_SIZE_IN_POINTERS]);
+  unsigned nodeNameLen = strlen(nodeName) + 1;
+  unsigned nodeNameLenInPtr = (nodeNameLen + sizeof(void *) - 1) / sizeof(void *);
+  unsigned consumedStack = CALLSTACK_DATA_SIZE_IN_POINTERS + nodeNameLenInPtr;
 
   unsigned writtenChars = 0;
   {
-    auto ret = snprintf(buf, max_buf, "While executing node %s with sub sample %d, super sample %d, viewport %d and subCamera %d\n",
-      data.executor->registry.knownNames.getName(data.nodeId), data.multiplexingIndex.subSample, data.multiplexingIndex.superSample,
-      data.multiplexingIndex.viewport, data.multiplexingIndex.subCamera);
+    auto ret =
+      snprintf(buf, max_buf, "While executing node %s with sub sample %hd, super sample %hd, viewport %hd and subCamera %hd\n",
+        nodeName, data.subSample, data.superSample, data.viewport, data.subCamera);
     if (ret > 0)
       writtenChars += ret;
   }
 
-  return eastl::min(writtenChars, max_buf);
+  return {eastl::min(writtenChars, max_buf), consumedStack};
 }
 
-#if TIME_PROFILER_ENABLED && DAGOR_DBGLEVEL > 0
+#if TIME_PROFILER_ENABLED
+#if DAGOR_DBGLEVEL > 0
 static eastl::fixed_string<char, 128, false, framemem_allocator> generate_node_name_for_profiling(const char *node_name,
   multiplexing::Mode node_multiplex_mode, multiplexing::Extents multiplexing_extents, const multiplexing::Index &multi_idx)
 {
@@ -169,11 +221,62 @@ static eastl::fixed_string<char, 128, false, framemem_allocator> generate_node_n
   using TmpString = eastl::fixed_string<char, 128, false, framemem_allocator>;
   return TmpString(TmpString::CtorSprintf{}, "%s%s%s%s%s", namePtr, camcamTag, viewportTag, subSamplingTag, superSamplingTag);
 }
+const char *extract_node_name(const eastl::fixed_string<char, 128, false, framemem_allocator> &node_name) { return node_name.c_str(); }
+#else
+static const char *generate_node_name_for_profiling(const char *node_name, multiplexing::Mode, multiplexing::Extents,
+  const multiplexing::Index &)
+{
+  const char *namePtr = node_name;
+  if (namePtr[0] == '/')
+    namePtr++;
+  return namePtr;
+}
+const char *extract_node_name(const char *node_name) { return node_name; }
+#endif // DAGOR_DBGLEVEL > 0
 #endif
 
+void activate_untracked_texture(BaseTexture *tex, const d3d::TextureBarrier &first_use, ResourceActivationAction action,
+  const ResourceClearValue &clear_value)
+{
+  const bool clearAsUav = action == ResourceActivationAction::CLEAR_F_AS_UAV || action == ResourceActivationAction::CLEAR_I_AS_UAV;
+  const bool clearAsRtvDsv = action == ResourceActivationAction::CLEAR_AS_RTV_DSV;
+
+  if (!clearAsUav && !clearAsRtvDsv)
+  {
+    d3d::enhanced_texture_barrier(first_use, tex);
+    return;
+  }
+
+  constexpr d3d::TextureLayout clearLayout = d3d::TextureLayout::ClearDest;
+  constexpr d3d::AccessFlags clearAccess{d3d::AccessFlag::ClearWrite};
+  constexpr d3d::PipelineStageFlags clearStage{d3d::PipelineStageFlag::Clear};
+
+  const auto firstStage = first_use.pipelineSync.dst;
+
+  d3d::enhanced_texture_barrier({{first_use.pipelineSync.src, clearStage}, {{}, clearAccess},
+                                  {d3d::TextureLayout::Undefined, clearLayout}, ENTIRE_TEXTURE_SUBRESOURCE_RANGE},
+    tex);
+
+  TextureInfo texInfo = {};
+  tex->getinfo(texInfo);
+  for (int layer = 0; layer < texInfo.a; ++layer)
+    for (int mip = 0; mip < texInfo.mipLevels; ++mip)
+    {
+      if (action == ResourceActivationAction::CLEAR_F_AS_UAV)
+        d3d::clear_rwtexf(tex, clear_value.asFloat, layer, mip);
+      else if (action == ResourceActivationAction::CLEAR_I_AS_UAV)
+        d3d::clear_rwtexi(tex, clear_value.asUint, layer, mip);
+      else
+        d3d::clear_rt(RenderTarget{tex, static_cast<uint32_t>(mip), static_cast<uint32_t>(layer)}, clear_value);
+    }
+
+  d3d::enhanced_texture_barrier({{clearStage, firstStage}, {clearAccess, first_use.memorySync.dst},
+                                  {clearLayout, first_use.layoutTransition.dst}, ENTIRE_TEXTURE_SUBRESOURCE_RANGE},
+    tex);
+}
 
 void NodeExecutor::execute(int prev_frame, int curr_frame, multiplexing::Extents multiplexing_extents,
-  const BarrierScheduler::FrameEventsRef &events, const sd::NodeStateDeltas &state_deltas)
+  const BarrierScheduler::FrameEvents &events, const sd::NodeStateDeltas &state_deltas, const BlockProviderMap &block_providers)
 {
   // We permit changing the concrete instance of Texture used as an external
   // resources on a per-frame basis. This may be useful for double-buffering
@@ -194,11 +297,17 @@ void NodeExecutor::execute(int prev_frame, int curr_frame, multiplexing::Extents
     }
 
   const auto historyMultiplexingExtents = extents_for_node(registry.defaultHistoryMultiplexingMode, multiplexing_extents);
-  for (auto i : IdRange<intermediate::NodeIndex>(graph.nodes.size()))
+
+#if TIME_PROFILER_ENABLED
+  auto frameGraphMarker = graphMarksParser.createGraphMarker();
+#endif
+  gpu_capture_range_prepare(graph, multiplexing_extents);
+  for (auto i : graph.nodes.keys())
   {
     const intermediate::Node &irNode = graph.nodes[i];
     if (!irNode.frontendNode)
     {
+      gpu_capture_range_before_node(i);
       applyStateBeforeEvents(state_deltas[i], curr_frame, prev_frame);
       processEvents(events[i], curr_frame);
       applyState(state_deltas[i], curr_frame, prev_frame);
@@ -207,18 +316,27 @@ void NodeExecutor::execute(int prev_frame, int curr_frame, multiplexing::Extents
 
     const auto nodeId = *irNode.frontendNode;
     const multiplexing::Index multiIdx = multiplexing_index_from_ir(irNode.multiplexingIndex, multiplexing_extents);
-#if TIME_PROFILER_ENABLED && DAGOR_DBGLEVEL > 0
-    const char *namePtr = registry.knownNames.getName(nodeId);
+    // Before the profiling block, so the capture brackets the whole per-node
+    // footprint (profile markers, barriers, state) with no dangling scope end.
+    gpu_capture_range_before_node(i);
+#if TIME_PROFILER_ENABLED
+
+    frameGraphMarker.markNode(i);
+
     const multiplexing::Mode nodeMultiplexMode = registry.nodes[nodeId].multiplexingMode.value_or(multiplexing::Mode::None);
+    const auto nodeNameContainer =
+      generate_node_name_for_profiling(frameGraphMarker.getNodeDisplayName(i), nodeMultiplexMode, multiplexing_extents, multiIdx);
 
-    const auto nodeName = generate_node_name_for_profiling(namePtr, nodeMultiplexMode, multiplexing_extents, multiIdx);
+    const auto nodeName = extract_node_name(nodeNameContainer);
 
-    TIME_D3D_PROFILE_NAME(FramegraphNode, nodeName.c_str());
+    TIME_D3D_PROFILE_NAME(FramegraphNode, nodeName);
     DA_PROFILE_TAG(Viewport, "%d", multiIdx.viewport);
     DA_PROFILE_TAG(SubSample, "%d", multiIdx.subSample);
     DA_PROFILE_TAG(SuperSample, "%d", multiIdx.superSample);
     DA_PROFILE_TAG(SubCamera, "%d", multiIdx.subCamera);
 #endif
+
+    CallstackData context{this, nodeId, multiIdx};
 
     applyStateBeforeEvents(state_deltas[i], curr_frame, prev_frame);
     processEvents(events[i], curr_frame);
@@ -229,16 +347,16 @@ void NodeExecutor::execute(int prev_frame, int curr_frame, multiplexing::Extents
 
     populate_resource_provider(
       currentlyProvidedResources, registry, nameResolver, nodeId,
-      [this, prev_frame, curr_frame, multiIndex = irNode.multiplexingIndex, historyMultiIdx](bool history,
-        ResNameId res_id) -> ManagedTexView {
-        return getManagedTexView(res_id, history ? prev_frame : curr_frame, history ? historyMultiIdx : multiIndex);
-      },
-      [this, prev_frame, curr_frame, multiIndex = irNode.multiplexingIndex, historyMultiIdx](bool history,
-        ResNameId res_id) -> ManagedBufView {
-        return getManagedBufView(res_id, history ? prev_frame : curr_frame, history ? historyMultiIdx : multiIndex);
-      },
       [this, prev_frame, curr_frame, multiIndex = irNode.multiplexingIndex, historyMultiIdx](bool history, ResNameId res_id)
-        -> BlobView { return getBlobView(res_id, history ? prev_frame : curr_frame, history ? historyMultiIdx : multiIndex); },
+        -> BaseTexture * { return getTexture(res_id, history ? prev_frame : curr_frame, history ? historyMultiIdx : multiIndex); },
+      [this, prev_frame, curr_frame, multiIndex = irNode.multiplexingIndex, historyMultiIdx](bool history, ResNameId res_id)
+        -> Sbuffer * { return getBuffer(res_id, history ? prev_frame : curr_frame, history ? historyMultiIdx : multiIndex); },
+      [this, prev_frame, curr_frame, multiIndex = irNode.multiplexingIndex, historyMultiIdx, nodeId](bool history,
+        ResNameId res_id) -> BlobView {
+        auto blobView = getBlobView(res_id, history ? prev_frame : curr_frame, history ? historyMultiIdx : multiIndex);
+        debug_send_blob_data(nodeId, res_id, blobView);
+        return blobView;
+      },
       [this, multiIndex = irNode.multiplexingIndex](ResNameId res_id) {
         G_ASSERT(res_id != ResNameId::Invalid);
         return mapping.wasResMapped(res_id, multiIndex);
@@ -247,14 +365,26 @@ void NodeExecutor::execute(int prev_frame, int curr_frame, multiplexing::Extents
         // Checking against the registry won't work due to renames
         const auto idx = mapping.mapRes(res_id, multiIndex);
         return graph.resources[idx].isDriverDeferredTexture();
+      },
+      [this, multiIndex = irNode.multiplexingIndex](ResNameId res_id) {
+        const auto idx = mapping.mapRes(res_id, multiIndex);
+        return graph.resources[idx].getResType();
       });
 
     validation_set_current_node(registry, nodeId);
     {
-      CallstackData context{this, nodeId, multiIdx};
-      stackhelp::ext::ScopedCallStackContext callstackCtxScope{&captureCallstackData, &context};
-
       applyState(state_deltas[i], curr_frame, prev_frame);
+
+      // Bind the refined_block pass block this node consumes (registry.useBlock).
+      if (const auto &blockId = registry.nodes[nodeId].usedRefinedBlock; blockId.has_value())
+      {
+        const auto it = block_providers.find(*blockId);
+        G_ASSERTF(it != block_providers.end(), "daFG: node '%s' uses unregistered refined block '%s'",
+          registry.knownNames.getName(nodeId), registry.knownNames.getName(*blockId));
+        if (it != block_providers.end())
+          (*it->second)(multiIdx).setState();
+      }
+
       if (const auto &node = registry.nodes[nodeId]; node.enabled && node.sideEffect != SideEffects::None)
       {
         {
@@ -271,37 +401,51 @@ void NodeExecutor::execute(int prev_frame, int curr_frame, multiplexing::Extents
 
     // Clean up resource references inside the provider, just in case
     currentlyProvidedResources.clear();
+
+    // FIXME: barriers should be paired with action on GPU right now
+    // otherwise it bound to produce broken/slow dependency chain
+    // complete whatever is outstanding and hope for the best
+    d3d::driver_command(Drv3dCommand::COMPLETE_SYNC);
+    gpu_capture_range_after_node(i);
   }
-  applyStateBeforeEvents(state_deltas.back(), curr_frame, prev_frame);
-  processEvents(events.back(), curr_frame);
-  applyState(state_deltas.back(), curr_frame, prev_frame);
+
+  // End-of-frame events (deactivations, trailing barriers). The state itself has
+  // already been driven back to {} by the destination sentinel's delta in the loop
+  // above, so we only need to process events here, not apply a state delta.
+  if (!graph.nodes.empty())
+    processEvents(events.back(), curr_frame);
+  gpu_capture_range_after_frame();
 }
 
 void NodeExecutor::gatherExternalResources(multiplexing::Extents extents)
 {
+  TIME_PROFILE(gatherExternalResources);
   externalResources.clear();
-  externalResources.resize(graph.resources.size());
+  externalResources.reserve(graph.resources.totalKeys());
 
   for (auto [resIdx, res] : graph.resources.enumerate())
   {
     if (!res.isExternal())
       continue;
 
+    // front always contains original registered resource id in this case
     const ResNameId resNameId = res.frontendResources.front();
-    const ExternalResourceProvider &provider = eastl::get<ExternalResourceProvider>(registry.resources[resNameId].creationInfo);
+    // must be present, because ir res is external
+    const auto &createdResData = registry.resources[resNameId].createdResData.value();
+    const ExternalResourceProvider &provider = eastl::get<ExternalResourceProvider>(createdResData.creationInfo);
 
     const ExternalResource extRes = provider(multiplexing_index_from_ir(res.multiplexingIndex, extents));
     static_assert(eastl::variant_size_v<decltype(extRes)> == 2); // paranoid check
     if (auto *tex = eastl::get_if<ManagedTexView>(&extRes))
     {
-      G_ASSERTF(*tex, "daFG: External texture '%s' was not provided by it's registering node!",
-        registry.knownNames.getName(resNameId));
+      if (DAGOR_UNLIKELY(!*tex))
+        LOGERR_ONCE("daFG: External texture '%s' was not provided by it's registering node!", registry.knownNames.getName(resNameId));
 
 #if DAGOR_DBGLEVEL > 0
       if (*tex)
       {
         TextureInfo actualInfo;
-        tex->getBaseTex()->getinfo(actualInfo);
+        (*tex)->getinfo(actualInfo);
         TextureInfo expectedInfo = eastl::get<TextureInfo>(res.asExternal().info);
         // TODO: should we require resolutions to match too?
         G_ASSERTF(actualInfo.cflg == expectedInfo.cflg,
@@ -313,13 +457,14 @@ void NodeExecutor::gatherExternalResources(multiplexing::Extents extents)
     }
     else if (auto *buf = eastl::get_if<ManagedBufView>(&extRes))
     {
-      G_ASSERTF(*buf, "daFG: External buffer '%s' was not provided by it's registering node!", registry.knownNames.getName(resNameId));
+      if (DAGOR_UNLIKELY(!*buf))
+        LOGERR_ONCE("daFG: External buffer '%s' was not provided by it's registering node!", registry.knownNames.getName(resNameId));
 
 #if DAGOR_DBGLEVEL > 0
       if (*buf)
       {
         intermediate::BufferInfo actualInfo;
-        actualInfo.flags = buf->getBuf()->getFlags();
+        actualInfo.flags = (*buf)->getFlags();
         auto expectedInfo = eastl::get<intermediate::BufferInfo>(res.asExternal().info);
         G_ASSERTF(actualInfo.flags == expectedInfo.flags,
           "daFG: External buffer '%s' changed it's properties "
@@ -329,16 +474,23 @@ void NodeExecutor::gatherExternalResources(multiplexing::Extents extents)
 #endif
     }
 
-    externalResources[resIdx] = extRes;
+    externalResources.emplaceAt(resIdx, eastl::move(extRes));
   }
 }
 
-void NodeExecutor::processEvents(BarrierScheduler::NodeEventsRef events, int frame) const
+void NodeExecutor::processEvents(const BarrierScheduler::NodeEvents &events, int frame) const
 {
   // NOTE: split barriers are not properly implemented on vulkan
   // and lead to RP breaks without giving any benefit
   const auto ignoreBarrier = [drvCode = d3d::get_driver_code()](int rb) {
     return drvCode.is(d3d::vulkan) && (rb & RB_FLAG_SPLIT_BARRIER_BEGIN) != 0;
+  };
+
+  const auto resolveClearValue =
+    [this, frame](const eastl::variant<ResourceClearValue, intermediate::DynamicParameter> &value) -> ResourceClearValue {
+    if (auto *concrete = eastl::get_if<ResourceClearValue>(&value))
+      return *concrete;
+    return getDynamicParameter<ResourceClearValue>(eastl::get<intermediate::DynamicParameter>(value), frame);
   };
 
   for (const auto &evt : events)
@@ -354,29 +506,35 @@ void NodeExecutor::processEvents(BarrierScheduler::NodeEventsRef events, int fra
     {
       case ResourceType::Texture:
       {
-        const ManagedTexView tex = getManagedTexView(evt.resource, evt.frameResourceProducedOn);
+        BaseTexture *tex = getTexture(evt.resource, evt.frameResourceProducedOn);
 
         G_ASSERT_CONTINUE(tex);
 
         if (auto *data = eastl::get_if<BarrierScheduler::Event::Activation>(&evt.data))
         {
           G_ASSERT(!iRes.isExternal());
-          ResourceClearValue clearValue{};
-          if (auto value = eastl::get_if<ResourceClearValue>(&data->clearValue))
-            clearValue = *value;
-          else if (auto dynValue = eastl::get_if<intermediate::DynamicParameter>(&data->clearValue))
-            clearValue = getDynamicParameter<ResourceClearValue>(*dynValue, frame);
-          d3d::activate_texture(tex.getBaseTex(), data->action, clearValue);
+          d3d::activate_texture(tex, data->action, resolveClearValue(data->clearValue));
         }
         else if (auto *data = eastl::get_if<BarrierScheduler::Event::Barrier>(&evt.data))
         {
           if (!ignoreBarrier(data->barrier))
-            d3d::resource_barrier({tex.getBaseTex(), data->barrier, 0, 0});
+            d3d::resource_barrier({tex, data->barrier, 0, 0});
+        }
+        else if (auto *data = eastl::get_if<BarrierScheduler::Event::EnhancedTextureBarrier>(&evt.data))
+        {
+          if (data->kind == BarrierScheduler::Event::BarrierKind::FirstUse)
+          {
+            const auto &scheduled = iRes.asScheduled();
+            const auto &basicResDesc = scheduled.getGpuDescription().asBasicRes;
+            activate_untracked_texture(tex, data->barrier, basicResDesc.activation, resolveClearValue(scheduled.clearValue));
+          }
+          else
+            d3d::enhanced_texture_barrier(data->barrier, tex);
         }
         else if (eastl::holds_alternative<BarrierScheduler::Event::Deactivation>(evt.data))
         {
           G_ASSERT(!iRes.isExternal());
-          d3d::deactivate_texture(tex.getBaseTex());
+          d3d::deactivate_texture(tex);
         }
         else
           G_ASSERTF(false, "Unexpected event type!");
@@ -385,24 +543,37 @@ void NodeExecutor::processEvents(BarrierScheduler::NodeEventsRef events, int fra
 
       case ResourceType::Buffer:
       {
-        const ManagedBufView buf = getManagedBufView(evt.resource, evt.frameResourceProducedOn);
+        Sbuffer *buf = getBuffer(evt.resource, evt.frameResourceProducedOn);
 
         G_ASSERT_CONTINUE(buf);
 
         if (auto *data = eastl::get_if<BarrierScheduler::Event::Activation>(&evt.data))
         {
           G_ASSERT(!iRes.isExternal());
-          d3d::activate_buffer(buf.getBuf(), data->action);
+          d3d::activate_buffer(buf, data->action);
         }
         else if (auto *data = eastl::get_if<BarrierScheduler::Event::Barrier>(&evt.data))
         {
           if (!ignoreBarrier(data->barrier))
-            d3d::resource_barrier({buf.getBuf(), data->barrier});
+            d3d::resource_barrier({buf, data->barrier});
+        }
+        else if (auto *data = eastl::get_if<BarrierScheduler::Event::EnhancedBufferBarrier>(&evt.data))
+        {
+#if DAGOR_DBGLEVEL > 0
+          if (data->kind == BarrierScheduler::Event::BarrierKind::FirstUse)
+          {
+            const auto activation = iRes.asScheduled().getGpuDescription().asBasicRes.activation;
+            G_ASSERTF(activation != ResourceActivationAction::CLEAR_F_AS_UAV && activation != ResourceActivationAction::CLEAR_I_AS_UAV,
+              "daFG: untracked buffer first use carries a CLEAR action, but the enhanced barrier path only "
+              "discards; clear it explicitly via d3d::zero_rwbufi with matching barriers");
+          }
+#endif
+          d3d::enhanced_buffer_barrier(data->barrier, buf);
         }
         else if (eastl::holds_alternative<BarrierScheduler::Event::Deactivation>(evt.data))
         {
           G_ASSERT(!iRes.isExternal());
-          d3d::deactivate_buffer(buf.getBuf());
+          d3d::deactivate_buffer(buf);
         }
         else
           G_ASSERTF(false, "Unexpected event type!");
@@ -411,7 +582,7 @@ void NodeExecutor::processEvents(BarrierScheduler::NodeEventsRef events, int fra
 
       case ResourceType::Blob:
       {
-        auto blobView = resourceScheduler.getBlob(evt.frameResourceProducedOn, evt.resource);
+        auto blobView = resourceAllocator.getBlob(evt.frameResourceProducedOn, evt.resource);
 
         if (auto *data = eastl::get_if<BarrierScheduler::Event::CpuActivation>(&evt.data))
           data->func(blobView.data);
@@ -427,15 +598,13 @@ void NodeExecutor::processEvents(BarrierScheduler::NodeEventsRef events, int fra
   }
 }
 
-inline void resetVariableRateShading()
+inline void resetVariableRateShadingCombiners()
 {
-  d3d::set_variable_rate_shading_texture(nullptr);
   d3d::set_variable_rate_shading(1, 1, VariableRateShadingCombiner::VRS_PASSTHROUGH, VariableRateShadingCombiner::VRS_PASSTHROUGH);
 }
 
-inline void setVariableRateTexture(BaseTexture *tex)
+inline void setVariableRateShadingCombinersForTextureVRS()
 {
-  d3d::set_variable_rate_shading_texture(tex);
   d3d::set_variable_rate_shading(1, 1, VariableRateShadingCombiner::VRS_PASSTHROUGH, VariableRateShadingCombiner::VRS_OVERRIDE);
 }
 
@@ -450,13 +619,16 @@ void NodeExecutor::applyStateBeforeEvents(const sd::NodeStateDelta &state, int, 
       {
         d3d::end_render_pass();
         if (shouldSwitchVrsTex())
-          resetVariableRateShading();
+          resetVariableRateShadingCombiners();
       }
       else if (eastl::holds_alternative<sd::LegacyBackbufferPass>(passChange->endAction))
       {
         d3d::set_render_target({}, DepthAccess::RW, {});
         if (shouldSwitchVrsTex())
-          resetVariableRateShading();
+        {
+          d3d::set_variable_rate_shading_texture(nullptr);
+          resetVariableRateShadingCombiners();
+        }
       }
     }
   }
@@ -488,12 +660,8 @@ void NodeExecutor::applyState(const sd::NodeStateDelta &state, int frame, int pr
     {
       if (auto begin = eastl::get_if<sd::BeginRenderPass>(&passChange->beginAction))
       {
-        if (shouldSwitchVrsTex() && begin->vrsRateAttachment.has_value())
-        {
-          const auto &att = *begin->vrsRateAttachment;
-          auto tex = getManagedTexView(att.res, frame).getBaseTex();
-          setVariableRateTexture(tex);
-        }
+        if (shouldSwitchVrsTex() && begin->useVrs)
+          setVariableRateShadingCombinersForTextureVRS();
 
         dag::Vector<RenderPassTarget, framemem_allocator> targets;
         for (const auto &att : begin->attachments)
@@ -506,23 +674,26 @@ void NodeExecutor::applyState(const sd::NodeStateDelta &state, int frame, int pr
           else
             G_ASSERT_FAIL("Impossible situation!");
 
-          targets.push_back(
-            RenderPassTarget{RenderTarget{getManagedTexView(att.res, frame).getBaseTex(), att.mipLevel, att.layer}, clearValue});
+          BaseTexture *tex = getTexture(att.res, frame);
+          if (DAGOR_UNLIKELY(tex == nullptr))
+            LOGERR_ONCE("daFG: render pass attachment '%s' was missing at execution time!", resourceName(att.res));
+
+          targets.push_back(RenderPassTarget{RenderTarget{tex, att.mipLevel, att.layer}, clearValue});
         }
 
+        if (DAGOR_UNLIKELY(targets.empty()))
+          LOGERR_ONCE("daFG: encountered a render pass without attachments!");
+
+        // FIXME: barriers are already defined for RP, yet we double generate them, causing issues
+        // process ahead of time and hope for the best for now
+        d3d::driver_command(Drv3dCommand::COMPLETE_SYNC);
         // TODO: this is a dirty hack, we need to upgrade API to properly tackle this
         TextureInfo info;
         targets.front().resource.tex->getinfo(info);
-        d3d::begin_render_pass(begin->rp, {0, 0, info.w, info.h, 0, 1}, targets.data());
+        d3d::begin_render_pass(begin->rp, {0, 0, info.w, info.h, 0, 1}, make_span_const(targets.data(), targets.size()));
       }
       else if (eastl::holds_alternative<sd::LegacyBackbufferPass>(passChange->beginAction))
       {
-        if (shouldSwitchVrsTex() && begin->vrsRateAttachment.has_value())
-        {
-          const auto &att = *begin->vrsRateAttachment;
-          auto tex = getManagedTexView(att.res, frame).getBaseTex();
-          setVariableRateTexture(tex);
-        }
         // Despite the name, this sets the backbuffer as the only MRT
         d3d::set_render_target();
       }
@@ -552,14 +723,12 @@ void NodeExecutor::applyState(const sd::NodeStateDelta &state, int frame, int pr
   for (auto [stream, vertexSource] : enumerate(state.vertexSources))
     if (vertexSource)
     {
-      Sbuffer *vertexBuffer =
-        vertexSource->buffer.has_value() ? getManagedBufView(vertexSource->buffer.value(), frame).getBuf() : nullptr;
+      Sbuffer *vertexBuffer = vertexSource->buffer.has_value() ? getBuffer(vertexSource->buffer.value(), frame) : nullptr;
       d3d::setvsrc(stream, vertexBuffer, vertexSource->stride);
     }
   if (state.indexSource)
   {
-    Sbuffer *indexBuffer =
-      state.indexSource->buffer.has_value() ? getManagedBufView(state.indexSource->buffer.value(), frame).getBuf() : nullptr;
+    Sbuffer *indexBuffer = state.indexSource->buffer.has_value() ? getBuffer(state.indexSource->buffer.value(), frame) : nullptr;
     d3d::setind(indexBuffer);
   }
 }
@@ -574,11 +743,17 @@ void NodeExecutor::applyBindings(const sd::BindingsMap &bindings, int frame, int
   {
     // At this point, the bindings are guaranteed to be correct,
     // but (optional) resource might've still gone missing.
+    const int frameToGet = bindInfo.history ? prev_frame : frame;
     switch (bindInfo.type)
     {
       case BindingType::ShaderVar:
       {
         bindShaderVar(bindIdx, bindInfo, frame, prev_frame);
+        break;
+      }
+      case BindingType::BindlessShaderVar:
+      {
+        bindBindlessShaderVar(bindIdx, bindInfo, frame, prev_frame);
         break;
       }
       case BindingType::ViewMatrix:
@@ -587,11 +762,11 @@ void NodeExecutor::applyBindings(const sd::BindingsMap &bindings, int frame, int
           "Binding a blob as VIEW whose projected type is not a matrix.");
         if (bindInfo.projectedTag == tag_for<TMatrix4>())
         {
-          bindBlob<TMatrix4, static_cast<void (*)(int, const TMatrix4 &)>(&bindViewSetter)>(bindIdx, bindInfo, frame);
+          bindBlob<TMatrix4, static_cast<void (*)(int, const TMatrix4 &)>(&bindViewSetter)>(bindIdx, bindInfo, frameToGet);
         }
         else if (bindInfo.projectedTag == tag_for<TMatrix>())
         {
-          bindBlob<TMatrix, static_cast<void (*)(int, const TMatrix &)>(&bindViewSetter)>(bindIdx, bindInfo, frame);
+          bindBlob<TMatrix, static_cast<void (*)(int, const TMatrix &)>(&bindViewSetter)>(bindIdx, bindInfo, frameToGet);
         }
         break;
       }
@@ -599,7 +774,7 @@ void NodeExecutor::applyBindings(const sd::BindingsMap &bindings, int frame, int
       {
         G_ASSERTF_BREAK(bindInfo.projectedTag == tag_for<TMatrix4>() || bindInfo.projectedTag == tag_for<TMatrix4_vec4>(),
           "Binding a blob as PROJ whose projected type is not a matrix.");
-        bindBlob<TMatrix4, &bindProjSetter>(bindIdx, bindInfo, frame);
+        bindBlob<TMatrix4, &bindProjSetter>(bindIdx, bindInfo, frameToGet);
         break;
       }
       case BindingType::Invalid: G_ASSERT(false); break;
@@ -635,19 +810,57 @@ void NodeExecutor::bindShaderVar(int bind_idx, const intermediate::Binding &bind
 #undef TAG_CASE
     case SHVT_TEXTURE:
     {
-      const auto texId = binding.resource ? getManagedTexView(*binding.resource, frameToGet).getTexId() : BAD_D3DRESID;
-      ShaderGlobal::set_texture(bind_idx, texId);
+      BaseTexture *texPtr = binding.resource ? getTexture(*binding.resource, frameToGet) : nullptr;
+      ShaderGlobal::set_texture_unsafe(bind_idx, texPtr);
       break;
     }
     case SHVT_BUFFER:
     {
-      const auto bufId = binding.resource ? getManagedBufView(*binding.resource, frameToGet).getBufId() : BAD_D3DRESID;
-      ShaderGlobal::set_buffer(bind_idx, bufId);
+      Sbuffer *bufPtr = binding.resource ? getBuffer(*binding.resource, frameToGet) : nullptr;
+      ShaderGlobal::set_buffer_unsafe(bind_idx, bufPtr);
       break;
     }
     case SHVT_TLAS: logerr("daFG: set_tlas is not implemented yet"); break;
     default: logerr("daFG: Invalid shader var type '%d'!", svType); break;
   }
+}
+
+void NodeExecutor::bindBindlessShaderVar(int bind_idx, const intermediate::Binding &binding, int frame, int prev_frame) const
+{
+  if (DAGOR_UNLIKELY(ShaderGlobal::get_var_type(bind_idx) != SHVT_INT))
+    return;
+
+  const int frameToGet = binding.history ? prev_frame : frame;
+
+  uint32_t slot = BindlessSlotManager::INVALID_SLOT;
+  if (binding.resource)
+  {
+    if (binding.projectedTag == tag_for<d3d::SamplerHandle>())
+    {
+      const auto blob = getBlobView(*binding.resource, frameToGet);
+      if (DAGOR_UNLIKELY(!blob))
+        LOGERR_ONCE("daFG: sampler blob '%s' bound bindlessly to shader var %d was missing at execution time!",
+          resourceName(*binding.resource), bind_idx);
+      slot = d3d::register_bindless_sampler(*static_cast<const d3d::SamplerHandle *>(binding.projector(blob.data)));
+    }
+    else
+    {
+      // Pick this frame's slot from the resource's per-frame range; the manager
+      // refreshes the descriptor only if the bound resource changed.
+      const uint32_t baseSlot = bindlessSlots.baseSlot(*binding.resource);
+      const bool isTex = graph.resources[*binding.resource].getResType() == ResourceType::Texture;
+      D3dResource *res = isTex ? static_cast<D3dResource *>(getTexture(*binding.resource, frameToGet))
+                               : static_cast<D3dResource *>(getBuffer(*binding.resource, frameToGet));
+      if (baseSlot != BindlessSlotManager::INVALID_SLOT && res)
+      {
+        slot = baseSlot + frameToGet;
+        bindlessSlots.updateBindlessResource(isTex, slot, res);
+      }
+    }
+  }
+
+  // Published as int: INVALID_SLOT's (uint32_t)-1 reads back as -1 (missing or unbound).
+  ShaderGlobal::set_int(bind_idx, static_cast<int>(slot));
 }
 
 template <typename ProjectedType, auto bindSetter>
@@ -657,42 +870,46 @@ void NodeExecutor::bindBlob(int bind_idx, const intermediate::Binding &binding, 
   {
     // TODO: should we try and reset things to zero when unbinding?
     const auto blob = getBlobView(*binding.resource, frame);
+    if (DAGOR_UNLIKELY(!blob))
+      LOGERR_ONCE("daFG: blob '%s' bound at index %d was missing at execution time!", resourceName(*binding.resource), bind_idx);
     bindSetter(bind_idx, *static_cast<const eastl::remove_reference_t<ProjectedType> *>((binding.projector)(blob.data)));
   }
+  else if (binding.reset || binding.optional)
+    bindSetter(bind_idx, ProjectedType{});
 }
 
-ManagedTexView NodeExecutor::getManagedTexView(ResNameId res_name_id, int frame, intermediate::MultiplexingIndex multi_index) const
+BaseTexture *NodeExecutor::getTexture(ResNameId res_name_id, int frame, intermediate::MultiplexingIndex multi_index) const
 {
   G_ASSERT_RETURN(res_name_id != ResNameId::Invalid && mapping.wasResMapped(res_name_id, multi_index), {});
 
   const intermediate::ResourceIndex resIdx = mapping.mapRes(res_name_id, multi_index);
 
-  return getManagedTexView(resIdx, frame);
+  return getTexture(resIdx, frame);
 }
 
-ManagedTexView NodeExecutor::getManagedTexView(intermediate::ResourceIndex res_idx, int frame) const
+BaseTexture *NodeExecutor::getTexture(intermediate::ResourceIndex res_idx, int frame) const
 {
   if (graph.resources[res_idx].isExternal())
-    return eastl::get<ManagedTexView>(*externalResources[res_idx]);
+    return eastl::get<ManagedTexView>(externalResources[res_idx]).getBaseTex();
   else
-    return resourceScheduler.getTexture(frame, res_idx);
+    return resourceAllocator.getTexture(frame, res_idx);
 }
 
-ManagedBufView NodeExecutor::getManagedBufView(ResNameId res_name_id, int frame, intermediate::MultiplexingIndex multi_index) const
+Sbuffer *NodeExecutor::getBuffer(ResNameId res_name_id, int frame, intermediate::MultiplexingIndex multi_index) const
 {
   G_ASSERT_RETURN(res_name_id != ResNameId::Invalid && mapping.wasResMapped(res_name_id, multi_index), {});
 
   const intermediate::ResourceIndex resIdx = mapping.mapRes(res_name_id, multi_index);
 
-  return getManagedBufView(resIdx, frame);
+  return getBuffer(resIdx, frame);
 }
 
-ManagedBufView NodeExecutor::getManagedBufView(intermediate::ResourceIndex res_idx, int frame) const
+Sbuffer *NodeExecutor::getBuffer(intermediate::ResourceIndex res_idx, int frame) const
 {
   if (graph.resources[res_idx].isExternal())
-    return eastl::get<ManagedBufView>(*externalResources[res_idx]);
+    return eastl::get<ManagedBufView>(externalResources[res_idx]).getBuf();
   else
-    return resourceScheduler.getBuffer(frame, res_idx);
+    return resourceAllocator.getBuffer(frame, res_idx);
 }
 
 BlobView NodeExecutor::getBlobView(ResNameId res_name_id, int frame, intermediate::MultiplexingIndex multi_index) const
@@ -706,14 +923,22 @@ BlobView NodeExecutor::getBlobView(ResNameId res_name_id, int frame, intermediat
 
 BlobView NodeExecutor::getBlobView(intermediate::ResourceIndex res_idx, int frame) const
 {
-  return resourceScheduler.getBlob(frame, res_idx);
+  return resourceAllocator.getBlob(frame, res_idx);
+}
+
+const char *NodeExecutor::resourceName(intermediate::ResourceIndex res_idx) const
+{
+  return graph.resourceNames.isMapped(res_idx) ? graph.resourceNames[res_idx].c_str() : "NOT_MAPPED";
 }
 
 template <class T>
 const T &NodeExecutor::getDynamicParameter(const intermediate::DynamicParameter &param, int frame) const
 {
   G_ASSERT(param.projectedTag == tag_for<T>()); // Paranoic check
-  return *static_cast<const T *>(param.projector(getBlobView(param.resource, frame).data));
+  const auto blob = getBlobView(param.resource, frame);
+  if (DAGOR_UNLIKELY(!blob))
+    LOGERR_ONCE("daFG: blob '%s' providing a dynamic parameter was missing at execution time!", resourceName(param.resource));
+  return *static_cast<const T *>(param.projector(blob.data));
 }
 
 bool NodeExecutor::shouldSwitchVrsTex() const

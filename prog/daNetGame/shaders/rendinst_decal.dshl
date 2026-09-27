@@ -6,22 +6,26 @@ include "decals/decal_inc.dshl"
 include "decals/blend_diffuse_decal_inc.dshl"
 include "decals/modulate2x_decal_inc.dshl"
 include "decals/deferred_decal_inc.dshl"
+include "gbuffer.dshl"
+include "gbuffer_with_mixing.dshl"
+include "emissive.dshl"
+include "unpack_unit_vector_inc.dshl"
 
 texture names_tex;
 
 shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst_names_diffuse_decal, rendinst_blend_normal_decal
 {
-  if (shader != rendinst_names_diffuse_decal)
+  if (shader != rendinst_names_diffuse_decal && rendinst_render_pass != rendinst_render_pass_impostor_voxel)
   {
     NO_DYNSTCODE()
   }
   assume instancing_type = tm_vb;
-  if (rendinst_render_pass == rendinst_render_pass_voxelize_albedo) { dont_render;}
+  if (rendinst_render_pass == rendinst_render_pass_voxelize_albedo || is_triangle_size_debug) { dont_render;}
   if (rendinst_render_pass == rendinst_render_pass_impostor_color || rendinst_render_pass == rendinst_render_pass_impostor_shadow || rendinst_render_pass == rendinst_render_pass_to_shadow || rendinst_render_pass == rendinst_render_pass_depth)
   {
     dont_render;
   }
-  render_stage imm_decal;
+  render_stage decal;
   if (shader != rendinst_names_diffuse_decal && shader != rendinst_blend_normal_decal)
   {
     texture tex = material.texture.diffuse;
@@ -38,20 +42,27 @@ shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst
     if (normal != NULL)
     {
       USE_PIXEL_TANGENT_SPACE()
-      WRITE_GBUFFER()
-      (ps) { normal_tex@static = normal; }
+      (ps) { normal_tex@staticSmp = normal; }
       hlsl {
         #define HAS_NORMAL 1
       }
     }
   }
 
-  static int draw_order = 0 no_warnings;
+  static int draw_order = -10 no_warnings;
 
   channel float3 pos = pos;
   channel color8 norm = norm unsigned_pack;
   channel float2 tc[0] = tc[0];
   supports rendinst_scene;
+
+  if (rendinst_render_pass == rendinst_render_pass_impostor_voxel)
+  {
+    hlsl
+    {
+      #define RENDINST_IMPOSTOR_VOXEL 1
+    }
+  }
 
   if (shader == rendinst_blend_diffuse_decal)
   {
@@ -61,6 +72,7 @@ shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst
 
   ENABLE_MULTI_DRAW(false)
   RENDINST_INSTANCING()
+  USE_UNPACK_UNIT_VECTOR_VS()
   SETUP_CHARACTER_MICRODETAIL()
   hlsl {
     struct VsOutput
@@ -104,7 +116,7 @@ shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst
       #endif
 
       #if HAS_NORMAL
-      float3 localNormal = normalize(BGR_SWIZZLE(input.normal)*2-1);
+      float3 localNormal = normalize(unpack_unit_vector(input.normal.xyz));
       #else
       float3 localNormal = 1;
       #endif
@@ -129,7 +141,11 @@ shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst
       output.normal = worldNormal;
       #endif
       #if COLOR_NEEDED
-        output.colorMul = 1;
+        #if RENDINST_IMPOSTOR_VOXEL
+          output.colorMul = float3(-1, 0, 0);
+        #else
+          output.colorMul = 1;
+        #endif
         #if HAS_PAINT_DETAILS
           output.colorMul = getColorMul(hashVal);
         #endif
@@ -143,9 +159,10 @@ shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst
     }
   }
 
+  blend_asrc = 0; blend_adst = 1;
   if (shader == rendinst_blend_diffuse_decal)
   {
-    (ps) { diffuse_tex@static = tex; }
+    (ps) { diffuse_tex@staticSmp = tex; }
   } else if (shader == rendinst_blend_normal_decal)
   {
     static int writemask = 1904;//(7<<4)|(7<<8) - normal and material properties
@@ -157,20 +174,21 @@ shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst
 
   if (shader == rendinst_modulate2x_diffuse_decal)
   {
-    MODULATE_2X_DECAL_PS(false)
+    MODULATE_2X_DECAL_PS(false, false)
   } else if (shader == rendinst_blend_diffuse_decal)
   {
-    BLEND_DIFFUSE_DECAL_PS(false)
+    BLEND_DIFFUSE_DECAL_PS(false, false)
   } else
   {
+    if (rendinst_render_pass == rendinst_render_pass_impostor_voxel) { dont_render; }
+    DYNAMIC_FILTER_FOR_MIXING(false, false)
     blend_src = sa; blend_dst = isa;
   }
   if (shader == rendinst_blend_normal_decal)
   {
+    WRITE_GBUFFER_WITH_MIXING(true, true, false)
     USE_CHARACTER_MICRODETAIL()
   }
-  ENABLE_ASSERT(ps)
-  blend_asrc = 0; blend_adst = 1;
   hlsl(ps) {
     ##if (shader == rendinst_blend_normal_decal)
       #if HAS_NORMAL
@@ -196,6 +214,11 @@ shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst
               sample_character_micro_detail(input.diffuseTexcoord.xy*get_character_micro_detail_scale().xy, character_micro_detail_layer),
               albedo.rgb, worldNormal, reflectance, smoothness);
           }
+
+          #if FILTER_DYNAMIC
+            filterDynamic(GET_SCREEN_POS(input.pos).xy);
+          #endif
+
           UnpackedGbuffer result;
           init_gbuffer(result);
           init_albedo(result, albedo.rgb);
@@ -226,9 +249,9 @@ shader rendinst_blend_diffuse_decal, rendinst_modulate2x_diffuse_decal, rendinst
   }
 }
 
-shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_deferred_normal_decal
+shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_deferred_normal_decal, rendinst_deferred_emissive_decal
 {
-  if (instancing_type != tm_vb)
+  if (instancing_type != tm_vb || is_triangle_size_debug)
   {
     dont_render;
   }
@@ -236,12 +259,13 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
   hlsl {
     #define BLEND_GBUFFER 1
   }
+  blend_asrc = 0; blend_adst = 1;
 
   if (shader != rendinst_deferred_normal_decal)
   {
   texture tex = material.texture.diffuse;
   }
-  if (shader == rendinst_deferred_decal || shader == rendinst_deferred_normal_decal)
+  if (shader == rendinst_deferred_decal || shader == rendinst_deferred_normal_decal || shader == rendinst_deferred_emissive_decal)
   {
     texture normal = material.texture[2];
     if (shader == rendinst_deferred_decal)
@@ -252,15 +276,12 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
     if (normal != NULL)
     {
       USE_PIXEL_TANGENT_SPACE()
-      REDUCE_GBUFFER_MRT_MOBILE()
-      WRITE_GBUFFER()
-      (ps) { normal_tex@static = normal; }
+      (ps) { normal_tex@staticSmp = normal; }
       hlsl {
         #define HAS_NORMAL 1
       }
     } else if (compatibility_mode == compatibility_mode_on)
     {
-      WRITE_GBUFFER()
       hlsl {
         #undef HAS_NORMAL
         #define HAS_NORMAL 1
@@ -270,12 +291,24 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
 
   z_write = false;
 
-  static int draw_order = 0 no_warnings;
+  static int draw_order = 100 no_warnings;
 
   channel float3 pos = pos;
   channel color8 norm = norm unsigned_pack;
   channel float2 tc[0] = tc[0];
   supports rendinst_scene;
+
+  if (rendinst_render_pass == rendinst_render_pass_impostor_voxel)
+  {
+    hlsl
+    {
+      #define RENDINST_IMPOSTOR_VOXEL 1
+    }
+    (vs) {
+      impostor_depth_proj@f4 = impostor_depth_proj;
+    }
+  }
+
   if (shader == rendinst_deferred_decal)
   {
     RENDINST_OVERLAY_COLOR_MAP(vs, false, get_paint_palette_row_index().x)
@@ -284,7 +317,98 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
 
   ENABLE_MULTI_DRAW(false)
   RENDINST_INSTANCING()
+  USE_UNPACK_UNIT_VECTOR_VS()
   SETUP_CHARACTER_MICRODETAIL()
+
+  if (shader == rendinst_deferred_emissive_decal)
+  {
+    static int emission_anim = 0;
+    interval emission_anim : no < 1, yes;
+
+    no_ablend;
+
+    if (compatibility_mode == compatibility_mode_on)
+    {
+      dont_render;
+    }
+    static float4 emission__off_attack__min_max = (0, 3, 1, 3) no_warnings;
+    static float4 emission__on_release__min_max = (0, 3, 1, 3) no_warnings;
+
+    static float emission__on_brightness = 1 no_warnings;
+    static float emission__off_brightness = 0 no_warnings;
+
+    local float min_emission_cycle_time = (emission__off_attack__min_max.x + emission__off_attack__min_max.z +
+                                           emission__on_release__min_max.x + emission__on_release__min_max.z);
+    local float max_emission_cycle_time = (emission__off_attack__min_max.y + emission__off_attack__min_max.w +
+                                           emission__on_release__min_max.y + emission__on_release__min_max.w);
+
+    if (emission_anim == yes)
+    {
+      (vs)
+      {
+        global_time@f1 = time_phase(0, 0);
+
+        off_brightness@f1 = emission__off_brightness;
+        on_brightness@f1 = emission__on_brightness;
+
+        max_inv_cycle_time@f1 = 1 / max_emission_cycle_time;
+        min_inv_cycle_time@f1 = 1 / min_emission_cycle_time;
+
+        min_off_time@f1 = emission__off_attack__min_max.x;
+        max_off_time@f1 = emission__off_attack__min_max.y;
+        min_attack_time@f1 = emission__off_attack__min_max.z;
+        max_attack_time@f1 = emission__off_attack__min_max.w;
+        min_on_time@f1 = emission__on_release__min_max.x;
+        max_on_time@f1 = emission__on_release__min_max.y;
+        min_release_time@f1 = emission__on_release__min_max.z;
+        max_release_time@f1 = emission__on_release__min_max.w;
+      }
+      hlsl (vs) {
+        #include <pcg_hash.hlsl>
+        float random01(uint seed)
+        {
+          const float INV_MAX_UINT = 1.0 / 4294967296.0;
+          return pcg_hash(seed) * INV_MAX_UINT;
+        }
+
+        float getEmissionBrightnessMul(uint seed)
+        {
+          seed *= get_min_inv_cycle_time() + 1;
+          float inv_cycle_time = lerp(get_min_inv_cycle_time(), get_max_inv_cycle_time(), random01(seed));
+          int cycle_count = int(floor(global_time * inv_cycle_time));
+          float cycle_phase = frac(global_time * inv_cycle_time);
+
+          seed *= cycle_count;
+
+          float off_time     = lerp(get_min_off_time(),     get_max_off_time(),     random01(seed * 0x1234u));
+          float attack_time  = lerp(get_min_attack_time(),  get_max_attack_time(),  random01(seed * 0x4123u));
+          float release_time = lerp(get_min_release_time(), get_max_release_time(), random01(seed * 0x3412u));
+          float on_time      = lerp(get_min_on_time(),      get_max_on_time(),      random01(seed * 0x2341u));
+
+          float inv_rand_cycle_time = 1 / (off_time + attack_time + release_time + on_time);
+
+          float glow_start = off_time * inv_rand_cycle_time;
+          float glow_end   = (off_time + attack_time) * inv_rand_cycle_time;
+          float fade_start = 1 - release_time * inv_rand_cycle_time;
+          float fade_end   = 1;
+
+          float glow = smoothstep(glow_start, glow_end, cycle_phase);
+          float fade = 1 - smoothstep(fade_start, fade_end, cycle_phase);
+          return lerp(get_off_brightness(), get_on_brightness(), glow * fade);
+        }
+      }
+    }
+  }
+
+  if (shader == rendinst_deferred_emissive_decal && emission_anim == yes)
+  {
+    hlsl { #define VS_CALCULATED_EMISSION_MUL 1 }
+  }
+  else
+  {
+    hlsl { #define VS_CALCULATED_EMISSION_MUL 0 }
+  }
+
   hlsl {
     struct VsOutput
     {
@@ -297,6 +421,9 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
       #endif
       #if COLOR_NEEDED
       float3 colorMul : TEXCOORD3;
+      #endif
+      #if VS_CALCULATED_EMISSION_MUL
+        nointerpolation float emissionMul        :  TEXCOORD4;
       #endif
       VSOUT_DRAW_ID
     };
@@ -323,7 +450,7 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
         SET_DRAW_CALL_ID(GET_MATERIAL_OFFSET);
       #endif
 
-      float3 localNormal = normalize(BGR_SWIZZLE(input.normal)*2-1);
+      float3 localNormal = normalize(unpack_unit_vector(input.normal.xyz));
       float3 localPos = input.pos;
       float opacity = 1;
       VB_PERFORM_INSTANCING
@@ -334,13 +461,21 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
 
       output.pos = mulPointTm(worldPos + camera_base_offset, globtm);
       output.diffuseTexcoord.xy = input.diffuseTexcoord;
-      output.diffuseTexcoord.z = output.pos.w;
+      #if RENDINST_IMPOSTOR_VOXEL
+        output.diffuseTexcoord.z = dot(impostor_depth_proj, float4(worldPos, 1));
+      #else
+        output.diffuseTexcoord.z = output.pos.w;
+      #endif
       #if HAS_NORMAL
       output.pointToEye = pointToEye;
       output.normal = worldNormal;
       #endif
       #if COLOR_NEEDED
-        output.colorMul = 1;
+        #if RENDINST_IMPOSTOR_VOXEL
+          output.colorMul = float3(-1, 0, 0);
+        #else
+          output.colorMul = 1;
+        #endif
         #if HAS_PAINT_DETAILS
           output.colorMul = getColorMul(hashVal);
         #endif
@@ -349,39 +484,45 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
             output.colorMul = get_overlay_map_color(worldPos);
         #endif
       #endif
+      #if VS_CALCULATED_EMISSION_MUL
+        output.emissionMul = getEmissionBrightnessMul(hashVal);
+      #endif
 
       return output;
     }
   }
-  if (shader == rendinst_deferred_decal)
+  if (shader == rendinst_deferred_decal || shader == rendinst_deferred_emissive_decal)
   {
-    (ps) { diffuse_tex@static = tex; }
+    (ps) { diffuse_tex@staticSmp = tex; }
   }
   else if (shader == rendinst_deferred_normal_decal)
   {
     static int writemask = 1904;//(7<<4)|(7<<8) - normal and material properties
     color_write = static writemask;
+
+    WRITE_GBUFFER_WITH_MIXING(true, true, false)
   }
-
-  blend_asrc = 0; blend_adst = 1;
-
   if (shader == rendinst_deferred_normal_decal)
   {
     USE_CHARACTER_MICRODETAIL()
   }
-  ENABLE_ASSERT(ps)
 
   if (shader == rendinst_deferred_decal)
   {
-    BLEND_DIFFUSE_DECAL_PS(true)
+    BLEND_DIFFUSE_DECAL_PS(true, false)
   }
   else if (shader == rendinst_deferred_modulate2x_decal)
   {
-    MODULATE_2X_DECAL_PS(true)
+    MODULATE_2X_DECAL_PS(true, false)
+  }
+  else
+  {
+    if (rendinst_render_pass == rendinst_render_pass_impostor_voxel) { dont_render; }
   }
 
   if (shader == rendinst_deferred_normal_decal)
   {
+    DYNAMIC_FILTER_FOR_MIXING(false, false)
     DEFERRED_DECAL_DEPTH()
     blend_src = sa; blend_dst = isa;
 
@@ -405,8 +546,8 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
           half smoothness = packedNormalMap.r;
           half metalness = packedNormalMap.b;
 
-          half3 albedo = saturate(abs(packedNormalMap.g - 0.5) * 2 * 10);
-          half alpha = 0;
+          half3 albedo = 0;
+          half alpha = saturate(abs(packedNormalMap.g - 0.5) * 2 * 10);
           half3 normalMap = unpack_ag_normal(packedNormalMap);
           half3 vertexNormal = normalize(input.normal);
           half3 worldNormal = perturb_normal_precise(normalMap, vertexNormal, input.pointToEye.xyz, input.diffuseTexcoord.xy );
@@ -418,6 +559,11 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
               sample_character_micro_detail(input.diffuseTexcoord.xy*get_character_micro_detail_scale().xy, character_micro_detail_layer),
               albedo.rgb, worldNormal, reflectance, smoothness);
           }
+
+          #if FILTER_DYNAMIC
+            filterDynamic(GET_SCREEN_POS(input.pos).xy);
+          #endif
+
           UnpackedGbuffer result;
           init_gbuffer(result);
           init_albedo(result, albedo.rgb);
@@ -441,5 +587,74 @@ shader rendinst_deferred_decal, rendinst_deferred_modulate2x_decal, rendinst_def
     compile("target_ps", "deferred_decal_ps");
   }
 
+  if (shader == rendinst_deferred_emissive_decal)
+  {
+    DECLARE_DYNAMIC_MATERIAL_PARAMS()
+    assume parameters_channel = from_asset;
+    INIT_EMISSIVE_ANIMCHAR_DYNMAT_PARAMS()
+    USE_EMISSIVE_ANIMCHAR_DYNMAT_PARAMS()
+
+    WRITE_GBUFFER_WITH_MIXING(false, false, false)
+
+    hlsl(ps)
+    {
+      #if HAS_NORMAL
+        [earlydepthstencil]
+        GBUFFER_OUTPUT deferred_decal_ps(VsOutput input HW_USE_SCREEN_POS)
+        {
+          #if FILTER_DYNAMIC
+            filterDynamic(GET_SCREEN_POS(input.pos).xy);
+          #endif
+
+          #if SET_UP_MULTIDRAW
+            SET_DRAW_CALL_ID(GET_MATERIAL_OFFSET(input));
+          #endif
+
+
+          half4 diffuseColor = tex2DBindless(get_diffuse_tex(), input.diffuseTexcoord.xy);
+          clip(diffuseColor.a - 0.5);
+
+          half3 albedo = diffuseColor.rgb;
+
+          half4 packedNormalMap = tex2DBindless(get_normal_tex(), input.diffuseTexcoord.xy);
+          half smoothness = packedNormalMap.r;
+          half emissionMask = packedNormalMap.b;
+
+          float4 emissiveColor;
+          float emissionAlbedoMult;
+          get_emissive_parameters(emissiveColor, emissionAlbedoMult);
+
+          half3 normalMap = unpack_ag_normal(packedNormalMap);
+          half3 vertexNormal = normalize(input.normal);
+          half3 worldNormal = perturb_normal_precise(normalMap, vertexNormal, input.pointToEye.xyz, input.diffuseTexcoord.xy );
+
+          UnpackedGbuffer result;
+          init_gbuffer(result);
+          init_material(result, SHADING_SELFILLUM);
+          init_albedo(result, albedo);
+          init_smoothness(result, smoothness);
+          init_normal(result, worldNormal);
+
+          #if VS_CALCULATED_EMISSION_MUL
+            float emissionMul = input.emissionMul;
+          #else
+            float emissionMul = 1.f;
+          #endif
+
+          init_emission(result, RemoveSRGBCurve_Fast(emissionMask).x * min(abs(emissiveColor.a), MAX_EMISSION) * emissionMul);
+          init_emission_color(result, half4(emissiveColor.rgb, emissionAlbedoMult));
+
+
+          return encode_gbuffer(result, input.pointToEye.xyz, GET_SCREEN_POS(input.pos));
+        }
+      #else
+        float4 deferred_decal_ps(VsOutput input HW_USE_SCREEN_POS):SV_Target0
+        {
+          return 0;
+        }
+      #endif
+    }
+    compile("target_ps", "deferred_decal_ps");
+  }
   compile("target_vs", "deferred_decal_vs");
 }

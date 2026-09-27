@@ -33,14 +33,20 @@ void KdopProcessing::calcSelectedKdop()
 
 void KdopProcessing::calcKdop(const KdopSettings &settings)
 {
-  if (settings.preset == KdopPreset::SET_EMPTY)
+  if (settings.preset == KdopPreset::SET_EMPTY || !collisionRes)
     return;
 
   dag::Vector<Point3_vec4> verts;
   dag::ConstSpan<CollisionNode> nodes = collisionRes->getAllNodes();
   for (const auto &refNode : settings.selectedNodes.refNodes)
   {
-    G_ASSERT_LOG(add_verts_from_node(nodes, refNode, verts), "Collision node not found: %s", refNode);
+    if (!add_verts_from_node(*collisionRes, nodes, refNode, verts))
+    {
+      // Missing/empty ref: abort so the preview is not silently built with this node omitted.
+      logerr("Collision node not found or empty: %s", refNode);
+      selectedKdop.reset();
+      return;
+    }
   }
   selectedKdop.setPreset(settings.preset, settings.cutOffThreshold, settings.segmentsCountX, settings.segmentsCountY);
   selectedKdop.setRotation(Point3(settings.rotX, settings.rotY, settings.rotZ));

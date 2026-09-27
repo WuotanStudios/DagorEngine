@@ -9,6 +9,7 @@
 #include <shaders/dag_shaderState.h>
 #include <3d/dag_resPtr.h>
 #include <vecmath/dag_vecMathDecl.h>
+#include <generic/dag_span.h>
 #include <math/dag_Point4.h>
 #include <3d/dag_texStreamingContext.h>
 #include <ecs/render/renderPasses.h>
@@ -18,7 +19,7 @@
 #include <shaders/dag_shaderVarsUtils.h>
 #include <memory/dag_framemem.h>
 #include <daECS/core/componentTypes.h>
-#include "animCharRenderAdditionalData.h"
+#include <render/dynmodelRenderer/animCharRenderAdditionalData.h>
 
 
 struct UpdateStageInfoRender;
@@ -37,11 +38,31 @@ DAG_DECLARE_RELOCATABLE(dynmodel_renderer::RenderElement);
 namespace dynmodel_renderer
 {
 
+// lightweight view of filter bits, it doesn't store anything directly
+class PathFilterView : public dag::ConstSpan<uint8_t>
+{
+public:
+  PathFilterView(const uint8_t *p, uint32_t n) : dag::ConstSpan<uint8_t>(p, n) {}
+  PathFilterView(const dag::ConstSpan<uint8_t> &s) : dag::ConstSpan<uint8_t>(s) {}
+  explicit PathFilterView(const ecs::UInt8List *data) :
+    dag::ConstSpan<uint8_t>(data ? data->begin() : nullptr, data ? data->size() : 0)
+  {}
+
+  static const PathFilterView NULL_FILTER;
+};
+
+
 enum class RenderPriority : uint8_t
 {
   HIGH = 0,
   DEFAULT = 1,
   LOW = 2
+};
+
+enum class NeedPreviousMatrices
+{
+  No,
+  Yes
 };
 
 struct DynamicBufferHolder
@@ -50,31 +71,26 @@ struct DynamicBufferHolder
   int curOffset = -1;
 };
 
+struct DynamicShaderOverrides
+{
+  ShaderElement *rigidsShader = nullptr;
+  ShaderElement *skinsShader = nullptr;
+};
+
 struct RenderElement
 {
   ShaderElement *curShader;
   GlobalVertexData *vData;
-  int curVar; // probably can be just int16_t
-  uint32_t prog;
-  ShaderStateBlockId state;
-  shaders::RenderStateId rstate;
-  shaders::TexStateIdx tstate;
-  shaders::ConstStateIdx cstate;
+  shaders::CombinedDynVariantState dvState;
   uint8_t reqTexLevel;
   RenderPriority priority;
   uint8_t lodNo;
-  uint32_t instanceId : 31; // uint16_t cnt;
-  uint32_t needImmediateConstPS : 1;
+  uint32_t instanceId;           // uint16_t cnt;
   int si, numf, bv;              // can be 24 bit each, and so 12 bytes alltogether with instance Id, saving 4 bytes
   uint16_t bindposeBufferOffset; // maybe merge with something else, ~12 bits should be enough
 
   RenderElement(ShaderElement *curShader,
-    int curVar,
-    uint32_t prog,
-    ShaderStateBlockId state,
-    shaders::RenderStateId rstate,
-    shaders::TexStateIdx tstate,
-    shaders::ConstStateIdx cstate,
+    const shaders::CombinedDynVariantState &dv_state,
     GlobalVertexData *vData,
     uint8_t req_tex_level,
     RenderPriority priority,
@@ -83,15 +99,9 @@ struct RenderElement
     int si,
     int numf,
     int bv,
-    bool needImmediateConstPS,
     int bindposeBufferOffset) :
     curShader(curShader),
-    curVar(curVar),
-    prog(prog),
-    state(state),
-    rstate(rstate),
-    tstate(tstate),
-    cstate(cstate),
+    dvState(dv_state),
     vData(vData),
     reqTexLevel(req_tex_level),
     priority(priority),
@@ -100,7 +110,6 @@ struct RenderElement
     si(si),
     numf(numf),
     bv(bv),
-    needImmediateConstPS(needImmediateConstPS),
     bindposeBufferOffset(bindposeBufferOffset)
   {}
 };
@@ -143,12 +152,10 @@ struct DynModelRenderingState
     const DynamicRenderableSceneInstance *scene,
     const DynamicRenderableSceneResource *lodResource,
     const animchar_additional_data::AnimcharAdditionalDataView additional_data,
-    bool need_previous_matrices,
-    ShaderElement *shader_override = nullptr,
-    const uint8_t *path_filter = nullptr,
-    uint32_t path_filter_size = 0,
+    NeedPreviousMatrices need_previous_matrices = NeedPreviousMatrices::No,
+    DynamicShaderOverrides shader_overrides = {},
+    const PathFilterView path_filter = PathFilterView::NULL_FILTER,
     uint8_t render_mask = 0,
-    bool need_immediate_const_ps = false,
     RenderPriority priority = RenderPriority::DEFAULT,
     const GlobalVariableStates *gvars_state = nullptr,
     TexStreamingContext texCtx = TexStreamingContext(0),
@@ -159,12 +166,10 @@ struct DynModelRenderingState
     uint32_t end_stage, // inclusive range of stages
     const DynamicRenderableSceneInstance *scene,
     const animchar_additional_data::AnimcharAdditionalDataView additional_data,
-    bool need_previous_matrices,
-    ShaderElement *shader_override = nullptr,
-    const uint8_t *path_filter = nullptr,
-    uint32_t path_filter_size = 0,
+    NeedPreviousMatrices need_previous_matrices = NeedPreviousMatrices::No,
+    DynamicShaderOverrides shader_overrides = {},
+    const PathFilterView path_filter = PathFilterView::NULL_FILTER,
     uint8_t render_mask = 0,
-    bool need_immediate_const_ps = false,
     RenderPriority priority = RenderPriority::DEFAULT,
     const GlobalVariableStates *gvars_state = nullptr,
     TexStreamingContext texCtx = TexStreamingContext(0));
@@ -208,6 +213,10 @@ inline void DynModelRenderingState::clear()
   drawcallRanges.clear();
   bindlessStatesToUpdateTexLevels.clear();
 }
+
+// releases capacity retained by named states (sized to peak visible animchars);
+// call on level unload, buffers regrow on next frame that needs them
+void shrink_states();
 
 uint32_t prepare_bones_to(
   vec4f *__restrict bones, const ShaderSkinnedMesh &skin, const DynamicRenderableSceneInstance &scene, bool previous_matrices);

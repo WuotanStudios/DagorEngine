@@ -17,11 +17,14 @@
 #include <assets/asset.h>
 #include <assets/assetFolder.h>
 #include <assets/assetMgr.h>
+#include <assets/assetHlp.h>
 #include <assets/assetMsgPipe.h>
+#include <assets/assetUtils.h>
 #include <assets/texAssetBuilderTextureFactory.h>
 #include <assetsGui/av_selObjDlg.h>
 #include <EditorCore/ec_imguiInitialization.h>
 #include <EditorCore/ec_interface.h>
+#include <EditorCore/ec_ViewportWindow.h>
 #include <libTools/util/strUtil.h>
 #include <shaders/dag_shaders.h>
 #include <perfMon/dag_graphStat.h>
@@ -35,11 +38,17 @@
 #include <osApiWrappers/dag_direct.h>
 #include <osApiWrappers/dag_miscApi.h>
 #include <propPanel/constants.h>
+#include <propPanel/propPanelService.h>
+#include <propPanel/propPanel.h>
+#include <propPanel/toastManager.h>
+#include <gui/dag_imgui.h>
 #include <util/dag_fastIntList.h>
 #include <debug/dag_debug.h>
 #include <debug/dag_logSys.h>
 #include <regExp/regExp.h>
 #include <imgui/imgui.h>
+
+extern DataBlock asset_browser_modal_settings;
 
 static Tab<IEditorService *> srvPlugins(inimem);
 static Tab<IObjEntityMgr *> entityMgrs(inimem);
@@ -61,7 +70,7 @@ static bool fatalStatus = false, fatalQuiet = false;
 static bool de3_gen_fatal_handler(const char *msg, [[maybe_unused]] const char *call_stack, const char *file, int line)
 {
   fatalStatus = true;
-  if (!fatalQuiet)
+  if (!fatalQuiet && EDITORCORE)
   {
     DAEDITOR3.conError("FATAL: %s,%d:\n    %s", file, line, msg);
     EDITORCORE->getConsole().showConsole();
@@ -104,7 +113,7 @@ class DaEditor3Engine : public IDaEditor3Engine
 {
 public:
   DaEditor3Engine() { daEditor3InterfaceVer = DAEDITOR3_VERSION; }
-  ~DaEditor3Engine() {}
+  ~DaEditor3Engine() { del_it(tagManager); }
 
   const char *getBuildString() override { return "1.0"; }
 
@@ -112,7 +121,7 @@ public:
   {
     if (!disabledSrvNames.nameCount())
     {
-      DataBlock appblk(::get_app().getWorkspace().getAppPath());
+      DataBlock appblk(::get_app().getWorkspace().getAppBlkPath());
       const DataBlock &b = *appblk.getBlockByNameEx("dagored_disabled_plugins");
       int nid = b.getNameId("disable");
       if (nid >= 0)
@@ -127,7 +136,7 @@ public:
     srvPlugins.push_back(srv);
     if (srv->getServiceFriendlyName() && disabledSrvNames.getNameId(srv->getServiceFriendlyName()) >= 0)
     {
-      debug("-- service %s not loaded, disable in application.blk", srv->getServiceFriendlyName());
+      debug("-- service %s not loaded, disable in %s", srv->getServiceFriendlyName(), ::get_app().getWorkspace().getAppBlkShortName());
       srvPlugins.pop_back();
       delete srv;
       return false;
@@ -215,8 +224,8 @@ public:
   unsigned getEntitySubTypeMask(int mask_type) override { return IObjEntityFilter::getSubTypeMask(mask_type); }
 
   void setEntitySubTypeMask(int mask_type, unsigned value) override { IObjEntityFilter::setSubTypeMask(mask_type, value); }
-  uint64_t getEntityLayerHiddenMask() override { return 1ull << 63; }
-  void setEntityLayerHiddenMask(uint64_t /*value*/) override {}
+  LayerHiddenMask getEntityLayerHiddenMask() override { return LayerHiddenMask(IObjEntity::LAYER_INDEX_ALWAYS_HIDDEN, true); }
+  void setEntityLayerHiddenMask(LayerHiddenMask /*value*/) override {}
 
   dag::ConstSpan<int> getGenObjAssetTypes() const override
   {
@@ -228,7 +237,7 @@ public:
       Tab<const char *> obj_types;
       obj_types = make_span_const(genobj_asset_type, sizeof(genobj_asset_type) / sizeof(genobj_asset_type[0]));
 
-      DataBlock appblk(::get_app().getWorkspace().getAppPath());
+      DataBlock appblk(::get_app().getWorkspace().getAppBlkPath());
       if (const DataBlock *b = appblk.getBlockByName("genObjTypes"))
       {
         int nid = b->getNameId("type");
@@ -326,8 +335,7 @@ public:
     return NULL;
   }
 
-  bool initAssetBase(const char *) override { return false; }
-
+  bool initAssetBase(const char *, const DataBlock &) override { return false; }
 
   //! simple console messages output
   ILogWriter &getCon() override { return EDITORCORE->getConsole(); }
@@ -389,36 +397,40 @@ public:
     bool open_all_grp) override
   {
     static String buf;
-    IWndManager &mgr = *get_app().getWndManager();
 
-    SelectAssetDlg dlg(mgr.getMainWindow(), const_cast<DagorAssetMgr *>(&get_app().getAssetMgr()), caption, "Select asset",
-      "Reset asset", types);
-    dlg.setManualModalSizingEnabled();
+    SelectAssetDlgOptions dlgOptions;
+    dlgOptions.selectableAssetTypes = types;
+    dlgOptions.initiallySelectedAsset = asset;
+    dlgOptions.dialogCaption = caption;
+    dlgOptions.filter = filter_str;
+    dlgOptions.openAllGroups = open_all_grp;
 
-    dlg.selectObj(asset);
-    if (open_all_grp)
-    {
-      Tab<bool> gr;
-      dlg.getTreeNodesExpand(gr);
-      mem_set_ff(gr);
-      dlg.setTreeNodesExpand(gr);
-    }
-    if (filter_str)
-      dlg.setFilterStr(filter_str);
+    const eastl::optional<String> dlgResult = selectAsset(dlgOptions);
+    if (!dlgResult.has_value())
+      return nullptr;
 
-    int ret = dlg.showDialog();
+    buf = dlgResult.value();
+    return buf;
+  }
 
-    if (ret == PropPanel::DIALOG_ID_CLOSE)
-      return NULL;
+  eastl::optional<String> selectAsset(const SelectAssetDlgOptions &options) override
+  {
+    DagorAssetMgr &mgr = const_cast<DagorAssetMgr &>(get_app().getAssetMgr());
+    eastl::unique_ptr<SelectAssetDlg> dlg(assets_gui_create_asset_selector_dialog(options, mgr));
 
-    if (ret == PropPanel::DIALOG_ID_OK)
-    {
-      buf = dlg.getSelObjName();
-      return buf;
-    }
+    dlg->loadAssetBrowserSettings(asset_browser_modal_settings);
 
-    // on reset asset, return empty string
-    return "";
+    const int result = dlg->showDialog();
+
+    asset_browser_modal_settings.clearData();
+    dlg->saveAssetBrowserSettings(asset_browser_modal_settings);
+
+    if (result == PropPanel::DIALOG_ID_OK) // select
+      return String(dlg->getSelObjName());
+    else if (result == PropPanel::DIALOG_ID_CANCEL) // reset
+      return String();
+    else // close
+      return {};
   }
 
   void showAssetWindow(bool, const char *, IAssetBaseViewClient *, dag::ConstSpan<int>) override {}
@@ -429,15 +441,41 @@ public:
     return false;
   }
 
-  void imguiBegin(const char *name, bool *open, unsigned window_flags) override { editor_core_imgui_begin(name, open, window_flags); }
+  bool imguiBegin(const char *name, bool *open, unsigned window_flags) override
+  {
+    return editor_core_imgui_begin(name, open, window_flags);
+  }
 
-  void imguiBegin(PropPanel::PanelWindowPropertyControl &panel_window, bool *open, unsigned window_flags) override
+  bool imguiBegin(PropPanel::PanelWindowPropertyControl &panel_window, bool *open, unsigned window_flags) override
   {
     panel_window.beforeImguiBegin();
-    imguiBegin(panel_window.getStringCaption(), open, window_flags);
+    return imguiBegin(panel_window.getStringCaption(), open, window_flags);
   }
 
   void imguiEnd() override { ImGui::End(); }
+
+  PropPanel::IPropPanelService *getPropPanelService() override { return &PropPanel::get_service(); }
+
+  AssetTagManager *getVisibleTagManagerWindow() override { return tagManager; }
+
+  void showTagManagerWindow(bool show) override
+  {
+    if (show)
+    {
+      if (tagManager == nullptr)
+        tagManager = new AssetTagManager(get_app().getCurAsset());
+
+      get_app().showTagManager(true);
+    }
+    else
+    {
+      del_it(tagManager);
+
+      get_app().showTagManager(false);
+    }
+  }
+
+  bool saveAssetsTags() override { return assettags::save(get_app().getAssetMgr()); }
 
   Outliner::OutlinerWindow *createOutlinerWindow() override
   {
@@ -445,7 +483,20 @@ public:
     return nullptr;
   }
 
+  void revealInExplorer(const char *path) override { dag_reveal_in_explorer(String(path)); }
+
+  void showToast(PropPanel::ToastType type, const char *text) override
+  {
+    PropPanel::ToastMessage message;
+    message.type = type;
+    message.text = text;
+    message.setHideOnMouseMove(true);
+    message.setToMousePos(Point2(0.5f, 0.5f));
+    PropPanel::set_toast_message(message);
+  }
+
   FastNameMap disabledSrvNames;
+  AssetTagManager *tagManager;
 };
 
 static DaEditor3Engine engine_impl;
@@ -510,7 +561,7 @@ void IObjEntityFilter::setSubTypeMask(int mask_type, unsigned mask) { entSubType
 
 
 unsigned IObjEntityFilter::getSubTypeMask(int mask_type) { return entSubTypeMask[mask_type]; }
-uint64_t IObjEntityFilter::getLayerHiddenMask() { return (1ull << 63); }
+LayerHiddenMask IObjEntityFilter::getLayerHiddenMask() { return LayerHiddenMask(IObjEntity::LAYER_INDEX_ALWAYS_HIDDEN, true); }
 
 
 void IObjEntityFilter::setShowInvalidAsset(bool show) { showInvalidAssets = show; }
@@ -559,9 +610,10 @@ class ServicesRenderPlugin : public IGenEditorPlugin, public ILightingChangeClie
   void beforeRenderObjects() override
   {
     static int water_level_gvid = get_shader_variable_id("water_level", true);
-    ShaderGlobal::set_real(water_level_gvid, -3000);
+    ShaderGlobal::set_float(water_level_gvid, -3000);
 
-    ddsx::tex_pack2_perform_delayed_data_loading();
+    if (!is_managed_textures_streaming_load_on_demand())
+      ddsx::tex_pack2_perform_delayed_data_loading();
     for (int i = 0; i < srvPlugins.size(); i++)
       srvPlugins[i]->beforeRenderService();
   }
@@ -615,26 +667,23 @@ class ServicesRenderPlugin : public IGenEditorPlugin, public ILightingChangeClie
       else if (stage != STG_RENDER_STATIC_OPAQUE)
         return;
 
-      FastIntList loft_layers;
-      loft_layers.addInt(0);
+      ISplineGenService::LayerIndexList loft_layers(0);
+      ISplineGenService::LayerIndexList order_layers;
       splSrv->gatherLoftLayers(loft_layers, true);
+      splSrv->gatherGeneratedGeomOrderLayers(order_layers);
 
       d3d::settm(TM_WORLD, TMatrix::IDENT);
       TMatrix4 globtm;
-      d3d::getglobtm(globtm);
+      if (ViewportWindow *vpw = static_cast<ViewportWindow *>(EDITORCORE->getRenderViewport()))
+        d3d::calcglobtm(vpw->getViewTm(), vpw->getProjTm(), globtm);
+      else
+        d3d::getglobtm(globtm);
       Frustum frustum;
       frustum.construct(globtm);
 
-      for (int lli = 0; lli < loft_layers.size(); lli++)
-        splSrv->renderLoftGeom(loft_layers.getList()[lli], opaque, frustum, -1);
+      loft_layers.iterate_layers(
+        [&](unsigned ll) { order_layers.iterate_layers([&](unsigned l) { splSrv->renderGeneratedGeom(ll, opaque, frustum, l); }); });
     }
-  }
-
-  void renderUI() override
-  {
-    for (int i = 0; i < srvPlugins.size(); i++)
-      if (IRenderingService *srv = srvPlugins[i]->queryInterface<IRenderingService>())
-        srv->renderUI();
   }
 
   void onLightingChanged() override
@@ -685,6 +734,7 @@ static struct DagorEdReset3DCallback : public IDrv3DResetCB
       DAEDITOR3.conNote("reloading textures...");
       ddsx::reload_active_textures(0);
     }
+    environment::after_d3d_reset(full_reset);
     DAEDITOR3.conNote("notifying services...");
     for (int i = 0; i < srvPlugins.size(); i++)
       srvPlugins[i]->catchEvent(HUID_AfterD3DReset, NULL);
@@ -696,7 +746,7 @@ void init_interface_de3()
   IEditorCoreEngine::get()->registerPlugin(srvPlugin = new ServicesRenderPlugin);
   ::set_3d_device_reset_callback(&drv_3d_reset_cb);
 
-  DataBlock appblk(::get_app().getWorkspace().getAppPath());
+  DataBlock appblk(::get_app().getWorkspace().getAppBlkPath());
   const char *incl_re_str = nullptr;
   const char *excl_re_str = nullptr;
   if (const DataBlock *b = appblk.getBlockByNameEx("logerr_to_con")->getBlockByName("AssetViewer"))

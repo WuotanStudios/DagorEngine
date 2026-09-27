@@ -71,7 +71,14 @@ __forceinline void ProfilerData::addLeafEvent(uint32_t description, uint64_t sta
   if (DAGOR_UNLIKELY(!storage))
     return;
 
-  storage->events.push_back(EventData{start, end, description, more_safe_get(storage->depth)});
+  const uint32_t depth = more_safe_get(storage->depth);
+  storage->events.push_back(EventData{start, end, description, depth});
+  if (DAGOR_LIKELY(depth != 0)) // a scoped event is open, so endEvent will free for us
+    return;
+  // A thread emitting only leaf events never reaches endEvent, so this is its one chance to free.
+  const uint64_t freeTick = safe_first_needed_tick();
+  if (DAGOR_UNLIKELY(storage->nextFreeEventTick < freeTick))
+    storage->freeEventChunks(freeTick, end);
 }
 
 __forceinline EventData *ProfilerData::startEvent(uint32_t description, ThreadStorage *&storage)
@@ -218,6 +225,7 @@ GpuEventData *ProfilerData::startGPUEvent(uint32_t description, const char *d3d_
   e.description = description;
   e.depth = currentDepth;
   gpu_profiler::start_ds(e.ds);
+  gpu_profiler::begin_gpu_stats();
   gpu_profiler::insert_time_stamp(&e.start); // this is only safe, because we never free data which isnt finished (i.e. as long as end
                                              // is ~0ull)
   return &e;
@@ -232,6 +240,8 @@ __forceinline void ProfilerData::endGPUEvent(GpuEventData &e)
   if (storage)
   {
     gpu_profiler::stop_ds(e.ds);
+    // it will replace cpu side triangle stats if gpu stats are supported
+    gpu_profiler::end_gpu_stats(&e.ds.tri);
     gpu_profiler::insert_time_stamp(&e.end);
     storage->gpuDepth--;
   }
@@ -335,6 +345,8 @@ bool ProfilerData::profileCpuSpike(uint64_t frame_ticks, uint32_t save_first, ui
 {
   // check if it is spiked frame
   const uint32_t frameCount = framesInfo.activeFramesCount();
+  if (frameCount < 2) // need at least 2 frames for variance calculation
+    return false;
   const uint64_t avg = cpuFrameMovingAverageTick / frameCount; // count
   // const uint64_t spikeThreshold = (avg*cpuSpikesMulAverage) + cpuSpikesAddTicks;//3 average + fixed threshold
   // todo: we can actually use running average for variance
@@ -616,6 +628,7 @@ void ProfilerData::addFrame() // can only be called from one frame, and only fro
   // newFrame.gpuEnd = ~0ULL;
   newFrame.frameNo = framesInfo.frameCount;
   newFrame.addFrameCount = 0;
+  newFrame.gpuClockMhz = (newMode & GPU) ? gpu_current_clock_mhz() : 0;
   framesInfo.frameCount++;
 
   // we should call flip once per frame, and now it is both from MP and our profiler

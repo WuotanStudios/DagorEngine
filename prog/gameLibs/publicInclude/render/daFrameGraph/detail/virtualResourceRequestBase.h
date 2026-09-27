@@ -6,6 +6,7 @@
 
 #include <render/daFrameGraph/usage.h>
 #include <render/daFrameGraph/stage.h>
+#include <render/daFrameGraph/history.h>
 #include <render/daFrameGraph/resourceCreation.h>
 
 #include <render/daFrameGraph/detail/projectors.h>
@@ -13,6 +14,7 @@
 #include <render/daFrameGraph/detail/nodeNameId.h>
 #include <render/daFrameGraph/detail/blob.h>
 #include <render/daFrameGraph/detail/rtti.h>
+#include <render/daFrameGraph/externalResources.h>
 
 
 union ResourceClearValue;
@@ -22,6 +24,7 @@ namespace dafg
 struct InternalRegistry;
 struct ResourceProvider;
 struct ResourceRequest;
+enum class BindingType : uint8_t;
 } // namespace dafg
 
 
@@ -36,12 +39,17 @@ struct VirtualResourceRequestBase
   void texture(const Texture2dCreateInfo &info);
   void texture(const Texture3dCreateInfo &info);
   void buffer(const BufferCreateInfo &info);
-  void blob(BlobDescription &&desc, detail::RTTI &&rtti);
+  void blob(BlobDescription &&desc, RTTI::RecursiveMakerRef rtti_maker);
+  void backBuffer();
+  void externalBuffer(dafg::ExternalResourceProvider &&external_resource_provider);
+  void externalTexture(dafg::ExternalResourceProvider &&external_resource_provider);
 
   void markWithTag(ResourceSubtypeTag tag);
 
   void optional();
+  void forBlock(const char *block_name, const char *shader_var_name, ResourceSubtypeTag projectedTag);
   void bindToShaderVar(const char *shader_var_name, ResourceSubtypeTag projectedTag, TypeErasedProjector projector);
+  void bindlessShaderVar(const char *shader_var_name, ResourceSubtypeTag projected_tag);
   void bindAsView(ResourceSubtypeTag projectedTag, TypeErasedProjector projector);
   void bindAsProj(ResourceSubtypeTag projectedTag, TypeErasedProjector projector);
   void bindAsVertexBuffer(uint32_t stream, uint32_t stride);
@@ -49,10 +57,13 @@ struct VirtualResourceRequestBase
 
   void atStage(Stage stage);
   void useAs(Usage type);
-  void clear(const ResourceClearValue &clear_value);
-  void clear(ResourceSubtypeTag projectee, const char *blob_name, detail::TypeErasedProjector projector);
+  void withHistory(History history);
+  void clear(const ResourceClearValue &clear_value, ResourceClearFlags flags);
+  void clear(ResourceSubtypeTag projectee, const char *blob_name, detail::TypeErasedProjector projector, ResourceClearFlags flags);
   const ResourceProvider *provider();
   ResourceRequest &thisRequest();
+  void recordShaderVarBinding(BindingType binding_type, const char *shader_var_name, ResourceSubtypeTag projectedTag,
+    TypeErasedProjector projector);
 
   ResUid resUid;
   NodeNameId nodeId;

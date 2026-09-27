@@ -1,5 +1,6 @@
 from "%darg/ui_imports.nut" import *
 from "dagor.workcycle" import defer
+from "types" import Array
 
 let cursorC = Color(180,180,180,180)
 
@@ -18,7 +19,7 @@ let defStyling = {
   Root = {
     rendObj = ROBJ_SOLID
     color = Color(30,30,30,250)
-    size = static [sw(100), sh(50)]
+    size = const [sw(100), sh(50)]
     vplace = ALIGN_CENTER
     padding = sh(2)
   }
@@ -31,11 +32,11 @@ let defStyling = {
   maskKeys = ""
   BgOverlay = {
     rendObj = ROBJ_SOLID
-    size = static [sw(100), sh(100)]
+    size = const [sw(100), sh(100)]
     color = Color(0, 0, 0, 200)
     behavior = Behaviors.Button
-    transform = {}
-    animations = [
+    transform = true
+    animations = const [
       { prop=AnimProp.opacity, from=0, to=1, duration=0.32, play=true, easing=OutCubic }
       { prop=AnimProp.scale,  from=[1, 0], to=[1,1], duration=0.25, play=true, easing=OutQuintic }
 
@@ -71,7 +72,7 @@ let defStyling = {
                         : Color(120,120,120,120)
 
         size = SIZE_TO_CONTENT
-        margin = static [sh(0.5), sh(1)]
+        margin = const [sh(0.5), sh(1)]
         watch = stateFlags
 
         children = {
@@ -91,7 +92,7 @@ let defStyling = {
       size = flex()
       halign = ALIGN_CENTER
       valign = ALIGN_CENTER
-      padding = static [sh(2), 0]
+      padding = const [sh(2), 0]
       children = {
         size = FLEX_H
         rendObj = ROBJ_TEXTAREA
@@ -206,7 +207,7 @@ function show(params, styling=defStyling) {
 
   local btnsDesc = params?.buttons ?? defaultButtons
   if (!(isObservable(btnsDesc)))
-    btnsDesc = Watched(btnsDesc, FRP_DONT_CHECK_NESTED)
+    btnsDesc = Watched(btnsDesc)
 
   local defCancel = null
   local initialBtnIdx = 0
@@ -254,7 +255,7 @@ function show(params, styling=defStyling) {
             }
           : null
         local behaviors = desc?.customStyle?.behavior ?? desc?.customStyle?.behavior
-        behaviors = type(behaviors) == "array" ? behaviors : [behaviors]
+        behaviors = behaviors instanceof Array ? behaviors : [behaviors]
         behaviors.append(Behaviors.RecalcHandler, Behaviors.Button)
         let customStyle = (desc?.customStyle ?? {}).__merge({
           onHover = onHover

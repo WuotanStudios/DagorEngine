@@ -63,6 +63,7 @@ struct GraphicsPipelineStaticState
       // stores power of two of count plus one so that 0 is 0 not 1
       uint32_t forcedSampleCountExponent : 3;
       uint32_t alphaToCoverage : 1;
+      uint32_t dualSourceBlendEnabled : 1;
     };
     uint32_t bitField;
   };
@@ -144,6 +145,7 @@ struct GraphicsPipelineStaticState
     conservativeRasterEnable = 0;
     colorMask = 0;
     alphaToCoverage = 0;
+    dualSourceBlendEnabled = 0;
   }
 };
 
@@ -168,6 +170,10 @@ struct InputLayout
   static constexpr int max_element_length = 16; // i.e. 4component*32bit entry
   InputStreamSet streams;
   VertexAttributeSet attribs;
+
+  struct IDCachedPayload
+  {};
+  static constexpr IDCachedPayload idPayload = {};
 
   void fromVdecl(const VSDTYPE *decl);
 
@@ -203,9 +209,10 @@ struct InputLayout
   static constexpr bool isRemovalPending() { return false; }
   bool release() { return true; }
 
-  static InputLayoutID makeID(LinearStorageIndex index) { return InputLayoutID(index); }
+  static InputLayoutID makeID(LinearStorageIndex index, const IDCachedPayload &) { return InputLayoutID(index); }
   static LinearStorageIndex getIndexFromID(InputLayoutID id) { return id.get(); }
   static bool checkID(InputLayoutID) { return true; }
+  static IDCachedPayload createInfoToIDPayload(const CreationInfo &) { return {}; }
 };
 
 inline bool operator==(const InputLayout &l, const InputLayout &r)

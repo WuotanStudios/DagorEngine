@@ -113,6 +113,17 @@ const char *to_string(History history)
   return "Invalid";
 }
 
+const char *to_string(DesiredActivationBehaviour behavior)
+{
+  switch (behavior)
+  {
+    case DesiredActivationBehaviour::Discard: return "Discard";
+    case DesiredActivationBehaviour::Clear: return "Clear";
+  }
+
+  return "Invalid";
+}
+
 static eastl::string access_conjunction_name(uint32_t access_conjunction)
 {
   eastl::string result;
@@ -134,12 +145,12 @@ static eastl::string access_conjunction_name(uint32_t access_conjunction)
   return result;
 }
 
-static bool set_check_activation(History history, eastl::optional<ResourceActivationAction> &activation,
+static bool set_check_activation(DesiredActivationBehaviour behaviour, eastl::optional<ResourceActivationAction> &activation,
   eastl::optional<ResourceActivationAction> discard_activation, eastl::optional<ResourceActivationAction> clear_activation)
 {
   // NOTE: If our usage type has several bits set for now we would like to make sure that they all use the same activation action
   eastl::optional<ResourceActivationAction> new_activation =
-    (history == History::DiscardOnFirstFrame) ? discard_activation : clear_activation;
+    (behaviour == DesiredActivationBehaviour::Discard) ? discard_activation : clear_activation;
 
   if (new_activation != eastl::nullopt)
   {
@@ -152,20 +163,13 @@ static bool set_check_activation(History history, eastl::optional<ResourceActiva
   return true;
 }
 
-ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, History history)
+ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, DesiredActivationBehaviour behavior, bool is_int)
 {
   if (usage.type == Usage::UNKNOWN)
   {
     if (usage.stage != Stage::UNKNOWN)
     {
       G_ASSERTF(false, "Usage with UNKNOWN type has non-zero stage. Resource usage initialization may be wrong!");
-      return ValidateUsageResult::Invalid;
-    }
-
-    if (history != History::No)
-    {
-      logerr("daFG: Resource requested a history action but no usage is provided!"
-             " This may cause driver validation errors! Please, provide a usage.");
       return ValidateUsageResult::Invalid;
     }
 
@@ -260,14 +264,10 @@ ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, H
     return ValidateUsageResult::Invalid;
   }
 
-
-  // Check if all usages have the same activation function if any
-  if (history == History::No)
-    return ValidateUsageResult::OK;
-
   // Let's first check activation and then, if it's empty, complain to logger
   eastl::optional<ResourceActivationAction> activation = eastl::nullopt;
   bool compatible_activations = true;
+  const auto clear_as_uav = is_int ? ResourceActivationAction::CLEAR_I_AS_UAV : ResourceActivationAction::CLEAR_F_AS_UAV;
   mask = eastl::to_underlying(usage.type);
   while (mask)
   {
@@ -281,21 +281,15 @@ ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, H
       case Usage::DEPTH_ATTACHMENT:
       case Usage::RESOLVE_ATTACHMENT:
       case Usage::BLIT:
-        compatible_activations &= set_check_activation(history, activation, ResourceActivationAction::DISCARD_AS_RTV_DSV,
+        compatible_activations &= set_check_activation(behavior, activation, ResourceActivationAction::DISCARD_AS_RTV_DSV,
           ResourceActivationAction::CLEAR_AS_RTV_DSV);
-        break;
-
-      case Usage::VRS_RATE_TEXTURE:
-        compatible_activations &=
-          set_check_activation(history, activation, eastl::nullopt, ResourceActivationAction::CLEAR_AS_RTV_DSV);
         break;
 
       case Usage::SHADER_RESOURCE:
         if ((usage.access == Access::READ_WRITE) || (res_type == ResourceType::Buffer))
-          compatible_activations &= set_check_activation(history, activation, ResourceActivationAction::DISCARD_AS_UAV,
-            ResourceActivationAction::CLEAR_I_AS_UAV);
+          compatible_activations &= set_check_activation(behavior, activation, ResourceActivationAction::DISCARD_AS_UAV, clear_as_uav);
         else if (res_type == ResourceType::Texture)
-          compatible_activations &= set_check_activation(history, activation, ResourceActivationAction::DISCARD_AS_RTV_DSV,
+          compatible_activations &= set_check_activation(behavior, activation, ResourceActivationAction::DISCARD_AS_RTV_DSV,
             ResourceActivationAction::CLEAR_AS_RTV_DSV);
         else
         {
@@ -304,20 +298,17 @@ ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, H
         }
         break;
 
+      case Usage::VRS_RATE_TEXTURE:
       case Usage::CONSTANT_BUFFER:
-        compatible_activations &= set_check_activation(history, activation, ResourceActivationAction::DISCARD_AS_UAV,
-          ResourceActivationAction::CLEAR_I_AS_UAV);
-        break;
-
       case Usage::INDEX_BUFFER:
       case Usage::VERTEX_BUFFER:
       case Usage::INDIRECTION_BUFFER:
-        compatible_activations &= set_check_activation(history, activation, eastl::nullopt, ResourceActivationAction::CLEAR_I_AS_UAV);
+        compatible_activations &= set_check_activation(behavior, activation, ResourceActivationAction::DISCARD_AS_UAV, clear_as_uav);
         break;
 
       case Usage::COPY:
-        compatible_activations &= set_check_activation(history, activation, ResourceActivationAction::REWRITE_AS_COPY_DESTINATION,
-          ResourceActivationAction::CLEAR_I_AS_UAV);
+        compatible_activations &=
+          set_check_activation(behavior, activation, ResourceActivationAction::REWRITE_AS_COPY_DESTINATION, clear_as_uav);
         break;
 
       default: break;
@@ -327,7 +318,7 @@ ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, H
 
   if (!compatible_activations)
   {
-    logerr("daFG: Provided usage type was '%s', provided history was '%s'", to_string(usage.type), to_string(history));
+    logerr("daFG: Provided usage type was '%s', desired behavior was '%s'", to_string(usage.type), to_string(behavior));
     return ValidateUsageResult::IncompatibleActivation;
   }
 
@@ -372,7 +363,7 @@ ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, H
       mask &= ~(1u << bit_index);
     }
 
-    logerr("daFG: Provided usage type was '%s', provided history was '%s'", to_string(usage.type), to_string(history));
+    logerr("daFG: Provided usage type was '%s', desired behavior was '%s'", to_string(usage.type), to_string(behavior));
     return ValidateUsageResult::EmptyActivation;
   }
 
@@ -464,19 +455,212 @@ ResourceBarrier barrier_for_transition(intermediate::ResourceUsage usage_before,
   return resource_barrier;
 }
 
-eastl::optional<ResourceActivationAction> get_activation_from_usage(History history, intermediate::ResourceUsage usage,
-  ResourceType res_type)
+static d3d::PipelineStageFlags enhanced_shading_stages_for_usage(intermediate::ResourceUsage usage)
 {
-  if (usage.type == Usage::UNKNOWN)
+  d3d::PipelineStageFlags result{};
+
+  if ((usage.stage & Stage::PRE_RASTER) != Stage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::AllVertexShading;
+  if ((usage.stage & Stage::POST_RASTER) != Stage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::PixelShading;
+  if ((usage.stage & Stage::COMPUTE) != Stage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::ComputeShading;
+  if ((usage.stage & Stage::RAYTRACE) != Stage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::All;
+
+  return result;
+}
+
+static d3d::PipelineStageFlags enhanced_stages_for_usage(intermediate::ResourceUsage usage)
+{
+  d3d::PipelineStageFlags result = enhanced_shading_stages_for_usage(usage);
+
+  if ((usage.stage & Stage::TRANSFER) != Stage::UNKNOWN)
   {
-    return eastl::nullopt;
+    if ((usage.type & Usage::COPY) != Usage::UNKNOWN)
+      result |= d3d::PipelineStageFlag::Copy;
+    if ((usage.type & Usage::BLIT) != Usage::UNKNOWN)
+      result |= d3d::PipelineStageFlag::Blit;
   }
 
-  switch (history)
-  {
-    case History::No: return eastl::nullopt;
+  if ((usage.type & Usage::VERTEX_BUFFER) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::VertexAttributeInput;
+  if ((usage.type & Usage::INDEX_BUFFER) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::IndexInput;
+  if ((usage.type & Usage::INDIRECTION_BUFFER) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::ExecuteIndirect;
+  if ((usage.type & Usage::VRS_RATE_TEXTURE) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::Rasterization;
 
-    case History::DiscardOnFirstFrame:
+  return result;
+}
+
+static d3d::AccessFlags enhanced_accesses_for_usage(intermediate::ResourceUsage usage)
+{
+  d3d::AccessFlags result{};
+
+  if ((usage.type & Usage::SHADER_RESOURCE) != Usage::UNKNOWN)
+    result |= usage.access == Access::READ_WRITE ? d3d::AccessFlag::UnorderedAccess : d3d::AccessFlag::ShaderResource;
+  if ((usage.type & Usage::CONSTANT_BUFFER) != Usage::UNKNOWN)
+    result |= d3d::AccessFlag::ConstantBuffer;
+  if ((usage.type & Usage::VERTEX_BUFFER) != Usage::UNKNOWN)
+    result |= d3d::AccessFlag::VertexBuffer;
+  if ((usage.type & Usage::INDEX_BUFFER) != Usage::UNKNOWN)
+    result |= d3d::AccessFlag::IndexBuffer;
+  if ((usage.type & Usage::INDIRECTION_BUFFER) != Usage::UNKNOWN)
+    result |= d3d::AccessFlag::IndirectArgument;
+  if ((usage.type & Usage::COPY) != Usage::UNKNOWN)
+    result |= usage.access == Access::READ_ONLY ? d3d::AccessFlag::CopyRead : d3d::AccessFlag::CopyWrite;
+  if ((usage.type & Usage::BLIT) != Usage::UNKNOWN)
+    result |= usage.access == Access::READ_ONLY ? d3d::AccessFlag::BlitRead : d3d::AccessFlag::BlitWrite;
+
+  return result;
+}
+
+static d3d::BufferBarrier enhanced_buffer_barrier_for_transition(intermediate::ResourceUsage usage_before,
+  intermediate::ResourceUsage usage_after)
+{
+  return {{enhanced_stages_for_usage(usage_before), enhanced_stages_for_usage(usage_after)},
+    {enhanced_accesses_for_usage(usage_before), enhanced_accesses_for_usage(usage_after)}};
+}
+
+d3d::BufferBarrier enhanced_buffer_barrier_for_release(intermediate::ResourceUsage last_usage, d3d::PipelineStageFlags sync_after)
+{
+  return {{enhanced_stages_for_usage(last_usage), sync_after}, {enhanced_accesses_for_usage(last_usage), {}}};
+}
+
+d3d::BufferBarrier enhanced_buffer_barrier_for_activation(intermediate::ResourceUsage first_usage, d3d::PipelineStageFlags sync_before)
+{
+  return {{sync_before, enhanced_stages_for_usage(first_usage)}, {{}, enhanced_accesses_for_usage(first_usage)}};
+}
+
+static d3d::AccessFlags enhanced_texture_accesses_for_usage(intermediate::ResourceUsage usage)
+{
+  d3d::AccessFlags result{};
+  const bool rw = usage.access == Access::READ_WRITE;
+
+  if ((usage.type & Usage::COLOR_ATTACHMENT) != Usage::UNKNOWN)
+    result |= rw ? d3d::AccessFlag::RenderTargetWrite : d3d::AccessFlag::RenderTargetRead;
+  if ((usage.type & Usage::DEPTH_ATTACHMENT) != Usage::UNKNOWN)
+    result |= rw ? d3d::AccessFlag::DepthStencilWrite : d3d::AccessFlag::DepthStencilRead;
+  if ((usage.type & Usage::RESOLVE_ATTACHMENT) != Usage::UNKNOWN)
+    result |= rw ? d3d::AccessFlag::ResolveWrite : d3d::AccessFlag::ResolveRead;
+  if ((usage.type & Usage::SHADER_RESOURCE) != Usage::UNKNOWN)
+    result |= rw ? d3d::AccessFlag::UnorderedAccess : d3d::AccessFlag::ShaderResource;
+  if ((usage.type & Usage::COPY) != Usage::UNKNOWN)
+    result |= rw ? d3d::AccessFlag::CopyWrite : d3d::AccessFlag::CopyRead;
+  if ((usage.type & Usage::BLIT) != Usage::UNKNOWN)
+    result |= rw ? d3d::AccessFlag::BlitWrite : d3d::AccessFlag::BlitRead;
+  if ((usage.type & Usage::VRS_RATE_TEXTURE) != Usage::UNKNOWN)
+    result |= d3d::AccessFlag::ShadingRate;
+
+  return result;
+}
+
+static d3d::TextureLayout enhanced_texture_layout_for_usage(intermediate::ResourceUsage usage)
+{
+  const bool rw = usage.access == Access::READ_WRITE;
+
+  // A depth-read-only layout permits depth reads only, so a depth attachment that is
+  // sampled at the same time has to use the combined read-only layout instead.
+  if ((usage.type & Usage::DEPTH_ATTACHMENT_AND_SHADER_RESOURCE) == Usage::DEPTH_ATTACHMENT_AND_SHADER_RESOURCE)
+    return d3d::TextureLayout::GenericRead;
+  if ((usage.type & Usage::INPUT_ATTACHMENT) == Usage::INPUT_ATTACHMENT)
+    return d3d::TextureLayout::ShaderResource;
+
+  if ((usage.type & Usage::COLOR_ATTACHMENT) != Usage::UNKNOWN)
+    return d3d::TextureLayout::RenderTarget;
+  if ((usage.type & Usage::DEPTH_ATTACHMENT) != Usage::UNKNOWN)
+    return rw ? d3d::TextureLayout::DepthRw : d3d::TextureLayout::DepthRo;
+  if ((usage.type & Usage::RESOLVE_ATTACHMENT) != Usage::UNKNOWN)
+    return rw ? d3d::TextureLayout::ResolveDest : d3d::TextureLayout::ResolveSource;
+  if ((usage.type & Usage::SHADER_RESOURCE) != Usage::UNKNOWN)
+    return rw ? d3d::TextureLayout::UnorderedAccess : d3d::TextureLayout::ShaderResource;
+  if ((usage.type & Usage::BLIT) != Usage::UNKNOWN)
+    return rw ? d3d::TextureLayout::BlitDest : d3d::TextureLayout::BlitSource;
+  if ((usage.type & Usage::COPY) != Usage::UNKNOWN)
+    return rw ? d3d::TextureLayout::CopyDest : d3d::TextureLayout::CopySource;
+  if ((usage.type & Usage::VRS_RATE_TEXTURE) != Usage::UNKNOWN)
+    return d3d::TextureLayout::ShadingRateSource;
+
+  return d3d::TextureLayout::GenericRead;
+}
+
+static bool enhanced_texture_layout_differs(intermediate::ResourceUsage usage_before, intermediate::ResourceUsage usage_after)
+{
+  return enhanced_texture_layout_for_usage(usage_before) != enhanced_texture_layout_for_usage(usage_after);
+}
+
+static d3d::PipelineStageFlags enhanced_texture_stages_for_usage(intermediate::ResourceUsage usage)
+{
+  d3d::PipelineStageFlags result{};
+
+  if ((usage.type & Usage::COLOR_ATTACHMENT) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::OutputMerging;
+  if ((usage.type & Usage::DEPTH_ATTACHMENT) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::EarlyFragmentTests | d3d::PipelineStageFlag::LateFragmentTests;
+  if ((usage.type & Usage::RESOLVE_ATTACHMENT) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::Resolve;
+  if ((usage.type & Usage::SHADER_RESOURCE) != Usage::UNKNOWN)
+    result |= enhanced_shading_stages_for_usage(usage);
+  if ((usage.type & Usage::COPY) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::Copy;
+  if ((usage.type & Usage::BLIT) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::Blit;
+  if ((usage.type & Usage::VRS_RATE_TEXTURE) != Usage::UNKNOWN)
+    result |= d3d::PipelineStageFlag::Rasterization;
+
+  return result;
+}
+
+static d3d::TextureBarrier enhanced_texture_barrier_for_transition(intermediate::ResourceUsage usage_before,
+  intermediate::ResourceUsage usage_after)
+{
+  return {{enhanced_texture_stages_for_usage(usage_before), enhanced_texture_stages_for_usage(usage_after)},
+    {enhanced_texture_accesses_for_usage(usage_before), enhanced_texture_accesses_for_usage(usage_after)},
+    {enhanced_texture_layout_for_usage(usage_before), enhanced_texture_layout_for_usage(usage_after)},
+    ENTIRE_TEXTURE_SUBRESOURCE_RANGE};
+}
+
+intermediate::EnhancedBarrier enhanced_barrier_for_transition(intermediate::ResourceUsage usage_before,
+  intermediate::ResourceUsage usage_after, ResourceType res_type)
+{
+  G_ASSERT(res_type == ResourceType::Texture || res_type == ResourceType::Buffer);
+  const bool isTexture = res_type == ResourceType::Texture;
+
+  const bool needsBarrier = barrier_for_transition(usage_before, usage_after) != RB_NONE || usage_after.access == Access::READ_WRITE ||
+                            (isTexture && enhanced_texture_layout_differs(usage_before, usage_after));
+
+  if (!needsBarrier)
+    return {};
+
+  if (isTexture)
+    return enhanced_texture_barrier_for_transition(usage_before, usage_after);
+  return enhanced_buffer_barrier_for_transition(usage_before, usage_after);
+}
+
+d3d::TextureBarrier enhanced_texture_barrier_for_release(intermediate::ResourceUsage last_usage, d3d::PipelineStageFlags sync_after)
+{
+  return {{enhanced_texture_stages_for_usage(last_usage), sync_after}, {enhanced_texture_accesses_for_usage(last_usage), {}},
+    {enhanced_texture_layout_for_usage(last_usage), d3d::TextureLayout::Undefined}, ENTIRE_TEXTURE_SUBRESOURCE_RANGE};
+}
+
+d3d::TextureBarrier enhanced_texture_barrier_for_activation(intermediate::ResourceUsage first_usage,
+  d3d::PipelineStageFlags sync_before)
+{
+  return {{sync_before, enhanced_texture_stages_for_usage(first_usage)}, {{}, enhanced_texture_accesses_for_usage(first_usage)},
+    {d3d::TextureLayout::Undefined, enhanced_texture_layout_for_usage(first_usage)}, ENTIRE_TEXTURE_SUBRESOURCE_RANGE};
+}
+
+eastl::optional<ResourceActivationAction> get_activation_from_usage(DesiredActivationBehaviour behavior,
+  intermediate::ResourceUsage usage, ResourceType res_type, bool is_int)
+{
+  if (usage.type == Usage::UNKNOWN)
+    return eastl::nullopt;
+
+  switch (behavior)
+  {
+    case DesiredActivationBehaviour::Discard:
     {
       uint32_t mask = uint32_t(usage.type);
       while (mask)
@@ -517,8 +701,9 @@ eastl::optional<ResourceActivationAction> get_activation_from_usage(History hist
     }
     break;
 
-    case History::ClearZeroOnFirstFrame:
+    case DesiredActivationBehaviour::Clear:
     {
+      const auto clear_as_uav = is_int ? ResourceActivationAction::CLEAR_I_AS_UAV : ResourceActivationAction::CLEAR_F_AS_UAV;
       uint32_t mask = uint32_t(usage.type);
       while (mask)
       {
@@ -532,7 +717,7 @@ eastl::optional<ResourceActivationAction> get_activation_from_usage(History hist
           case Usage::CONSTANT_BUFFER:
           case Usage::VERTEX_BUFFER:
           case Usage::INDEX_BUFFER:
-          case Usage::INDIRECTION_BUFFER: return ResourceActivationAction::CLEAR_I_AS_UAV;
+          case Usage::INDIRECTION_BUFFER: return clear_as_uav;
 
           case Usage::BLIT:
           case Usage::COLOR_ATTACHMENT:
@@ -542,11 +727,11 @@ eastl::optional<ResourceActivationAction> get_activation_from_usage(History hist
 
           case Usage::SHADER_RESOURCE:
             if (usage.access == Access::READ_WRITE)
-              return ResourceActivationAction::CLEAR_I_AS_UAV;
+              return clear_as_uav;
             else if (res_type == ResourceType::Texture)
               return ResourceActivationAction::CLEAR_AS_RTV_DSV;
             else if (res_type == ResourceType::Buffer)
-              return ResourceActivationAction::CLEAR_I_AS_UAV;
+              return clear_as_uav;
             break;
 
           default: break;
@@ -560,11 +745,12 @@ eastl::optional<ResourceActivationAction> get_activation_from_usage(History hist
   return {};
 }
 
-ResourceActivationAction get_history_activation(History history, ResourceActivationAction res_activaton, bool is_int)
+ResourceActivationAction get_history_activation(DesiredActivationBehaviour behavior, ResourceActivationAction res_activaton,
+  bool is_int)
 {
-  switch (history)
+  switch (behavior)
   {
-    case History::DiscardOnFirstFrame:
+    case DesiredActivationBehaviour::Discard:
     {
       switch (res_activaton)
       {
@@ -574,14 +760,15 @@ ResourceActivationAction get_history_activation(History history, ResourceActivat
 
         case ResourceActivationAction::REWRITE_AS_UAV:
         case ResourceActivationAction::DISCARD_AS_UAV:
-        case ResourceActivationAction::CLEAR_I_AS_UAV: return ResourceActivationAction::DISCARD_AS_UAV;
+        case ResourceActivationAction::CLEAR_I_AS_UAV:
+        case ResourceActivationAction::CLEAR_F_AS_UAV: return ResourceActivationAction::DISCARD_AS_UAV;
 
         default: break;
       }
     }
     break;
 
-    case History::ClearZeroOnFirstFrame:
+    case DesiredActivationBehaviour::Clear:
     {
       switch (res_activaton)
       {
@@ -592,13 +779,13 @@ ResourceActivationAction get_history_activation(History history, ResourceActivat
         case ResourceActivationAction::REWRITE_AS_UAV:
         case ResourceActivationAction::DISCARD_AS_UAV:
         case ResourceActivationAction::CLEAR_I_AS_UAV:
+        case ResourceActivationAction::CLEAR_F_AS_UAV:
           return is_int ? ResourceActivationAction::CLEAR_I_AS_UAV : ResourceActivationAction::CLEAR_F_AS_UAV;
 
         default: break;
       }
     }
     break;
-    default: break;
   }
   G_ASSERTF(false, "History is not set! This should never happen!");
   return {};
@@ -617,17 +804,19 @@ static uint32_t get_creation_flags_from_usage(ResourceUsage usage, ResourceType 
     {
       case Usage::COPY:
       case Usage::BLIT:
-        if (usage.access == Access::READ_WRITE)
-          flags |= TEXCF_UPDATE_DESTINATION;
+        if (res_type == ResourceType::Texture)
+          flags |= usage.access == Access::READ_WRITE ? TEXCF_UPDATE_DESTINATION : 0;
         break;
       case Usage::COLOR_ATTACHMENT:
       case Usage::DEPTH_ATTACHMENT:
       case Usage::RESOLVE_ATTACHMENT: flags |= TEXCF_RTARGET; break;
       case Usage::SHADER_RESOURCE:
-        if (res_type == ResourceType::Texture && usage.access == Access::READ_WRITE)
-          flags |= TEXCF_UNORDERED;
+        if (res_type == ResourceType::Texture)
+          flags |= usage.access == Access::READ_WRITE ? TEXCF_UNORDERED : 0;
         else if (res_type == ResourceType::Buffer)
-          flags |= SBCF_BIND_UNORDERED;
+          flags |= usage.access == Access::READ_WRITE  ? SBCF_BIND_UNORDERED
+                   : usage.access == Access::READ_ONLY ? SBCF_BIND_SHADER_RES
+                                                       : 0;
         break;
       case Usage::VERTEX_BUFFER: flags |= SBCF_BIND_VERTEX; break;
       case Usage::INDEX_BUFFER: flags |= SBCF_BIND_INDEX; break;

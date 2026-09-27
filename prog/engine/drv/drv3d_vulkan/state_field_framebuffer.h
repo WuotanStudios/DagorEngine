@@ -51,9 +51,8 @@ struct StateFieldFramebufferAttachment
   VULKAN_TRACKED_STATE_ARRAY_FIELD_CB_DEFENITIONS();
 };
 
-struct StateFieldFramebufferAttachments : TrackedStateFieldArray<StateFieldFramebufferAttachment,
-                                            Driver3dRenderTarget::MAX_SIMRT + 1, //+1 for depth/stencil
-                                            true, true>
+struct StateFieldFramebufferAttachments
+  : TrackedStateFieldArray<StateFieldFramebufferAttachment, Driver3dRenderTarget::MAX_SIMRT + MRT_EXTRA_SLOTS, true, true>
 {};
 
 struct StateFieldFramebufferSwapchainSrgbWrite : TrackedStateFieldBase<true, false>, TrackedStateFieldGenericSmallPOD<bool>
@@ -68,6 +67,15 @@ struct StateFieldFramebufferReadOnlyDepth : TrackedStateFieldBase<true, false>, 
 
 struct StateFieldFramebufferClearColor : TrackedStateFieldBase<true, false>, TrackedStateFieldGenericSmallPOD<E3DCOLOR>
 {
+  struct InvalidateTag
+  {};
+
+  using TrackedStateFieldGenericSmallPOD<E3DCOLOR>::set;
+  using TrackedStateFieldGenericSmallPOD<E3DCOLOR>::diff;
+
+  void set(InvalidateTag) {}
+  bool diff(InvalidateTag) const { return true; }
+
   VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
 };
 

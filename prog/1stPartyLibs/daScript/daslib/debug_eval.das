@@ -1,18 +1,22 @@
 options gen2
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options strict_smart_pointers
 options indenting = 4
 
 module debug_eval shared private
+
+//! Expression evaluator for the debugger.
+//!
+//! Parses and evaluates simple C-like expressions (arithmetic, field access,
+//! indexing, casts) against live debug context data. Used by the DAP debug
+//! server to implement watch and hover evaluation.
 
 require daslib/strings_boost
 require daslib/match
 require daslib/math_bits
 require daslib/ast_boost
 
-require rtti public
-require debugapi
+require daslib/rtti public
+require daslib/debugger
 
 variant Token {
     number : int64
@@ -23,7 +27,7 @@ variant Token {
 }
 
 def each_token(st : string) {
-    return <- generator<Token>() <| $() {
+    return <- generator<Token> {
         var tst := st
         var chars <- unsafe(each(tst))
         var ahead = ' '
@@ -73,17 +77,19 @@ def each_token(st : string) {
 let INVALID_VALUE = LONG_MIN
 
 struct public Result {
-    tinfo : TypeInfo
-    value : float4
-    data  : void const?
-    error : string
+    //! Result of evaluating a debug expression.
+    tinfo : TypeInfo //! Type information of the result.
+    value : float4 //! Raw value storage for the result.
+    data  : void const? //! Pointer to the result data, if available.
+    error : string //! Error message, empty if evaluation succeeded.
 }
 
 struct TokenStream {
-    tokens : iterator<Token>
-    stream : array<Token>
-    errors : array<string>
-    names  : table<string; Result>
+    //! Token stream for parsing debug expressions.
+    tokens : iterator<Token> //! Iterator over lexed tokens.
+    stream : array<Token> //! Buffered array of tokens.
+    errors : array<string> //! Accumulated parsing errors.
+    names  : table<string; Result> //! Named variable lookup table for expression evaluation.
 }
 
 def TokenStream(st : string) {
@@ -134,10 +140,11 @@ def error(var st : TokenStream; error : string) {
 
 def loadI(data : void?; t : auto(TT)) {
     unsafe {
-        return *(reinterpret<TT?> data)
+        return *(reinterpret<TT?>(data))
     }
 }
 
+[unused_argument(st)]
 def getPD(var st : TokenStream; result : Result; offset : int = 0) : void? {
     unsafe {
         var data : void const?
@@ -146,21 +153,17 @@ def getPD(var st : TokenStream; result : Result; offset : int = 0) : void? {
         } else {
             data = addr(result.value)
             if (result.tinfo.flags.refType) {
-                let pdata = reinterpret<void ??> data
-                if (pdata == null) {
-                    return null
-                }
+                let pdata = reinterpret<void ??>(data)
+                if (pdata == null) return null
                 data = *pdata
             }
         }
         if (result.tinfo.flags.ref) {
-            let pdata = reinterpret<void ??> data
-            if (pdata == null) {
-                return null
-            }
+            let pdata = reinterpret<void ??>(data)
+            if (pdata == null) return null
             data = *pdata
         }
-        return (reinterpret<uint8 const?> data) + offset
+        return (reinterpret<uint8 const?>(data)) + offset
     }
 }
 
@@ -179,15 +182,14 @@ def getI(var st : TokenStream; result : Result) : int64 {
     return int64(loadI(data, type<int>)) if (bt == Type.tInt || bt == Type.tUInt)
     return int64(loadI(data, type<int16>)) if (bt == Type.tInt16 || bt == Type.tUInt16)
     return int64(loadI(data, type<int8>)) if (bt == Type.tInt8 || bt == Type.tUInt8)
-    return int64(loadI(data, type<bool>) ? 1l : 0l) if (bt == Type.tBool)
+    return (loadI(data, type<bool>) ? 1l : 0l) if (bt == Type.tBool)
     st |> error("can't get value of {result.tinfo.basicType}")
     return INVALID_VALUE
 }
 
+[unused_argument(st)]
 def getT(var st : TokenStream; result : Result) : string {
-    if (!empty(result.error)) {
-        return ""
-    }
+    if (!empty(result.error)) return ""
     if (result.data != null) {
         return sprint_data(result.data, unsafe(addr(result.tinfo)), print_flags.singleLine)
     } else {
@@ -202,15 +204,15 @@ def func_call_length(var st : TokenStream; result : Result) : Result {
             return <- Result(int64(idim))
         }
         if (TypeInfo(basicType = Type.tString)) {
-            let pstr = unsafe(reinterpret<string?> getPD(st, result))
-            return <- Result(int64(length(*pstr)))
+            let pstr = unsafe(reinterpret<string?>(getPD(st, result)))
+            return <- Result(long_length(*pstr))
         }
         if (TypeInfo(basicType = Type.tArray)) {
-            let parr = unsafe(reinterpret<DapiArray?> getPD(st, result))
+            let parr = unsafe(reinterpret<DapiArray?>(getPD(st, result)))
             return <- Result(int64(parr.size))
         }
         if (TypeInfo(basicType = Type.tTable)) {
-            let ptab = unsafe(reinterpret<DapiTable?> getPD(st, result))
+            let ptab = unsafe(reinterpret<DapiTable?>(getPD(st, result)))
             return <- Result(int64(ptab.size))
         }
     }
@@ -239,90 +241,76 @@ def expr_value(var st : TokenStream) : Result {
             if (ntoken ?as punkt ?? 0 == '(') {
                 let arg = expr(st);
                 ntoken = token(st);
-                if (ntoken ?as punkt ?? 0 != ')') {
-                    return st |> error("expecting )")
-                }
+                if (ntoken ?as punkt ?? 0 != ')') return st |> error("expecting )")
                 return func_call(st, name, arg)
             }
             unput(st, ntoken)
             if (name == "true") {
                 return <- Result(true)
-            } elif (name == "false") {
-                return <- Result(false)
-            }
-            if (st.names |> key_exists(name)) {
-                return st.names |> get_value(name)
-            }
+            } elif (name == "false") return <- Result(false)
+            if (st.names |> key_exists(name)) return st.names |> get_value(name)
             return st |> error("unknown variable {name}")
         }
         if (Token(punkt = '(')) {// '(' expr ')
             var res = expr(st);
-            if (token(st) ?as punkt ?? 0 != ')') {
-                return st |> error("expecting )")
-            }
+            if (token(st) ?as punkt ?? 0 != ')') return st |> error("expecting )")
             return <- res
         }
-        if (Token(punkt = $v(any))) {
-            return st |> error("unexpected character {to_char(any)}, expecting number or (")
-        }
+        if (Token(punkt = $v(any))) return st |> error("unexpected character {to_char(any)}, expecting number or (")  // nolint:STYLE005 (qmatch macro expansion)
     }
     return st |> error("unexpected token {token}, expecting number or (")
 }
 
-def getStructFieldOffset(var st : TokenStream; ident : string; var result : Result) : tuple<int; TypeInfo> {
+[unused_argument(st)]
+def getStructFieldOffset(var st : TokenStream; ident : string; var result : Result) : tuple<offset : int; tinfo : TypeInfo> {
     var size = 0
     for (field in *result.tinfo.structType) {
         var tinfo : TypeInfo?
         unsafe {
-            tinfo = reinterpret<TypeInfo?>(unsafe(addr(field)))
+            tinfo = addr<TypeInfo?>(field)
         }
-        if (field.name == ident) {
-            return (size, *tinfo)
-        }
+        if (field.name == ident) return (offset = size, tinfo = *tinfo)
         let al = get_type_align(tinfo) - 1
         size = (size + al) & ~al
         size += get_type_size(tinfo)
     }
-    return (-1, TypeInfo(uninitialized))
+    return (offset = -1, tinfo = TypeInfo(uninitialized))
 }
 
-def getTupleFieldOffset(var st : TokenStream; ident : string; var result : Result) : tuple<int; TypeInfo> {
+[unused_argument(st)]
+def getTupleFieldOffset(var st : TokenStream; ident : string; result : Result) : tuple<offset : int; tinfo : TypeInfo> {
     var size = 0
     for (cnt in range(result.tinfo.argCount)) {
         let tinfo = unsafe(result.tinfo.argTypes[cnt])
-        if (ident == "_{cnt}") {
-            return (size, *tinfo)
-        }
+        if (ident == "_{cnt}") return (offset = size, tinfo = *tinfo)
         let al = get_type_align(tinfo) - 1
         size = (size + al) & ~al
         size += get_type_size(tinfo)
     }
-    return (-1, TypeInfo(uninitialized))
+    return (offset = -1, tinfo = TypeInfo(uninitialized))
 }
 
-def getVectorOffset(var st : TokenStream; ident : string; var result : Result) : tuple<int; TypeInfo> {
+[unused_argument(st)]
+def getVectorOffset(var st : TokenStream; ident : string; result : Result) : tuple<offset : int; tinfo : TypeInfo> {
     let ofs = getVectorOffset(result.tinfo.basicType, ident)
-    return (-1, TypeInfo(uninitialized)) if (ofs < 0)
+    return (offset = -1, tinfo = TypeInfo(uninitialized)) if (ofs < 0)
     let fieldSize = getVectorElementSize(result.tinfo.basicType)
     let tinfo = TypeInfo(
         basicType = getVectorElementType(result.tinfo.basicType),
         size = uint(fieldSize)
     )
-    return (ofs * fieldSize, tinfo)
+    return (offset = ofs * fieldSize, tinfo = tinfo)
 }
 
-def getHandleFieldOffset(var st : TokenStream; ident : string; var result : Result) : tuple<int; TypeInfo> {
+[unused_argument(st)]
+def getHandleFieldOffset(var st : TokenStream; ident : string; result : Result) : tuple<offset : int; tinfo : TypeInfo> {
     unsafe {
-        var ann <- unsafe(reinterpret<smart_ptr<TypeAnnotation>> result.tinfo.annotation)
-        if (ann == null) {
-            return (-1, TypeInfo(uninitialized))
-        }
+        var ann = unsafe(reinterpret<TypeAnnotation?>(result.tinfo.annotation))
+        if (ann == null) return (offset = -1, tinfo = TypeInfo(uninitialized))
         let ofs  = int(get_handled_type_field_offset(ann, ident))
-        if (ofs == -1) {
-            return (-1, TypeInfo(uninitialized))
-        }
+        if (ofs == -1) return (offset = -1, tinfo = TypeInfo(uninitialized))
         let tinfo = get_handled_type_field_type(ann, ident)
-        return (ofs, *tinfo)
+        return (offset = ofs, tinfo = *tinfo)
     }
 }
 
@@ -351,9 +339,7 @@ def expr_field(var st : TokenStream) : Result {
                     oti = getHandleFieldOffset(st, field as ident, result)
                 }
             }
-            if (oti.offset < 0) {
-                return st |> error("unknown field {field} in type {result.tinfo.basicType}")
-            }
+            if (oti.offset < 0) return st |> error("unknown field {field} in type {result.tinfo.basicType}")
             let newData = getPD(st, result, oti.offset)
             result.data = newData
             result.tinfo = oti.tinfo
@@ -369,9 +355,7 @@ def expr_field(var st : TokenStream) : Result {
 
 def opDim(var st : TokenStream; index : int64; var result : Result) {
     let dim = result.tinfo |> get_dim(int(result.tinfo.dimSize - 1u))
-    if (index < 0l || index >= int64(dim)) {
-        return st |> error("index out of range")
-    }
+    if (index < 0l || index >= int64(dim)) return st |> error("index out of range")
     result.tinfo.dimSize--
     let elemSize = get_type_size(unsafe(addr(result.tinfo)))
     result.data = st |> getPD(result, int(index) * elemSize)
@@ -388,25 +372,19 @@ def opDimString(var st : TokenStream; index : int64; var result : Result) {
         }
     }
     let len = length(str)
-    if (index >= int64(len)) {
-        return st |> error("index out of range {index} of {len} (string too short)")
-    }
-    return Result(int64(character_at(str, int(index))))
+    if (index >= int64(len)) return st |> error("index out of range {index} of {len} (string too short)")
+    return Result(int64(character_at(str, int(index)))) // nolint:PERF003 single indexed access, not a loop
 }
 
 def opArray(var st : TokenStream; index : int64; var result : Result) {
     unsafe {
-        let pArray = reinterpret<DapiArray?> getPD(st, result)
-        if (pArray == null) {
-            return st |> error("null pointer")
-        }
+        let pArray = reinterpret<DapiArray?>(getPD(st, result))
+        if (pArray == null) return st |> error("null pointer")
         let dim = pArray.size
-        if (index < 0l || index >= int64(dim)) {
-            return st |> error("index out of range")
-        }
-        let pData = reinterpret<int8?> pArray.data
+        if (index < 0l || uint64(index) >= dim) return st |> error("index out of range")
+        let pData = reinterpret<int8?>(pArray.data)
         let elemSize = get_type_size(result.tinfo.firstType)
-        let offset = int(index) * elemSize
+        let offset = index * int64(elemSize)
         result.data = pData + offset
         result.tinfo = *result.tinfo.firstType
         return result
@@ -415,22 +393,16 @@ def opArray(var st : TokenStream; index : int64; var result : Result) {
 
 def opTable(var st : TokenStream; index : Result; var result : Result) {
     unsafe {
-        let pTable = reinterpret<DapiTable?> getPD(st, result)
-        if (pTable == null) {
-            return st |> error("table - null pointer")
-        }
+        let pTable = reinterpret<DapiTable?>(getPD(st, result))
+        if (pTable == null) return st |> error("table - null pointer")
         let pKey = reinterpret<float4?>(getPD(st, index))
-        if (pKey == null) {
-            return st |> error("key - null pointer")
-        }
+        if (pKey == null) return st |> error("key - null pointer")
         let key = *pKey
         let keyBaseType = result.tinfo.firstType.basicType
         let valueTypeSize = get_type_size(result.tinfo.secondType)
         let elementIndex = get_table_key_index(pTable, key, keyBaseType, valueTypeSize)
-        if (elementIndex == -1) {
-            return st |> error("key not found")
-        }
-        let pValue = (reinterpret<uint8?> pTable.data) + elementIndex * valueTypeSize
+        if (elementIndex == -1) return st |> error("key not found")
+        let pValue = (reinterpret<uint8?>(pTable.data)) + elementIndex * valueTypeSize
         result.data = pValue
         result.tinfo = *result.tinfo.secondType
         return result
@@ -442,9 +414,7 @@ def expr_at(var st : TokenStream) : Result {
     var token = token(st)
     while (token ?as punkt ?? 0 == '[') {
         let eindex = expr(st);
-        if (token(st) ?as punkt ?? 0 != ']') {
-            return st |> error("expecting ]")
-        }
+        if (token(st) ?as punkt ?? 0 != ']') return st |> error("expecting ]")
         var nresult : Result
         match (result.tinfo) {
             if (TypeInfo(basicType = Type.tString, dimSize = 0u)) {
@@ -459,7 +429,7 @@ def expr_at(var st : TokenStream) : Result {
             if (TypeInfo(dimSize = 0u)) {
                 return st |> error("can't index non-array")
             }
-            if (_) {
+            if (_) { // nolint:STYLE010 — match wildcard arm; macro rewrites `_` to `if(true)`
                 nresult = opDim(st, st |> getI(eindex), result)
             }
         }
@@ -482,9 +452,7 @@ def expr_unary(var st : TokenStream) : Result {
         if (Token(punkt = '~')) {
             return Result(~st |> getI(expr_unary(st)))
         }
-        if (Token(punkt = '!')) {
-            return Result(st |> getI(expr_unary(st)) == 0l)
-        }
+        if (Token(punkt = '!')) return Result(st |> getI(expr_unary(st)) == 0l)  // nolint:STYLE005 (qmatch macro expansion)
     }
     unput(st, token)
     return expr_at(st)
@@ -499,12 +467,10 @@ def expr_mul_div(var st : TokenStream) : Result {
         }
         if (Token(punkt = '/')) {
             let rightValue = st |> getI(expr_mul_div(st))
-            if (rightValue == 0l) {
-                return st |> error("runtime error, division by 0")
-            }
+            if (rightValue == 0l) return st |> error("runtime error, division by 0")
             return Result(st |> getI(leftValue) * rightValue)
         }
-        if (_) {
+        if (_) { // nolint:STYLE010 — match wildcard arm; macro rewrites `_` to `if(true)`
             unput(st, token)
         }
     }
@@ -521,7 +487,7 @@ def expr_add_sub(var st : TokenStream) : Result {
         if (Token(punkt = '-')) {
             return Result(st |> getI(leftValue) - st |> getI(expr_add_sub(st)))
         }
-        if (_) {
+        if (_) { // nolint:STYLE010 — match wildcard arm; macro rewrites `_` to `if(true)`
             unput(st, token)
         }
     }
@@ -598,7 +564,7 @@ def expr_bool_op(var st : TokenStream) : Result {
             unput(st, subtoken)
             return Result(st |> getI(leftValue) > st |> getI(expr_bool_op(st)))
         }
-        if (_) {
+        if (_) { // nolint:STYLE010 — match wildcard arm; macro rewrites `_` to `if(true)`
             unput(st, subtoken)
             unput(st, token)
         }
@@ -611,16 +577,13 @@ def expr(var st : TokenStream) : Result {
 }
 
 def public debug_eval(context : table<string; Result>; expr : string) : Result {
+    //! Evaluates a debug expression string with the given variable context and returns the result.
     var st <- TokenStream(expr)
     st.names := context
     var result = expr(st)
     let token = token(st)
-    if (!(token is eos)) {
-        return Result(error = "unexpected token {token}")
-    }
-    if (!empty(st.errors)) {
-        return Result(error = st.errors[0])
-    }
+    if (!(token is eos)) return Result(error = "unexpected token {token}")
+    if (!empty(st.errors)) return Result(error = st.errors[0])
     return <- result
 }
 

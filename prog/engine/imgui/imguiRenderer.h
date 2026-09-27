@@ -7,6 +7,7 @@
 
 struct ImGuiIO;
 struct ImGuiPlatformIO;
+struct ImTextureData;
 
 struct ImDrawData;
 struct ImDrawVert;
@@ -17,23 +18,28 @@ class DagImGuiRenderer
 public:
   DagImGuiRenderer();
   void setBackendFlags(ImGuiIO &io);
-  void createAndSetFontTexture(ImGuiIO &io);
   void render(ImGuiPlatformIO &platform_io);
   void renderDrawDataToTexture(const ImDrawData *draw_data, BaseTexture *rt);
+  void afterDeviceReset();
+
+  // Must be called before ImGui::DestroyContext().
+  static void releaseAllTextureData();
 
 private:
   void resizeBuffers(const uint32_t vtx_count, const uint32_t idx_count);
   void lockBuffers(ImDrawVert *&vbdata, const uint32_t vtx_count, ImDrawIdx *&ibdata, const uint32_t idx_count);
   void unlockBuffers();
   bool copyDrawData(const ImDrawData *draw_data, ImDrawVert *&vbdata, ImDrawIdx *&ibdata);
-  void processDrawDataToRT(const ImDrawData *draw_data, int &global_idx_offset, int &global_vtx_offset);
+  void processDrawDataToRT(const ImDrawData *draw_data, int &global_idx_offset, int &global_vtx_offset, int prerotate_angle);
+
+  static void updateTextureData(ImTextureData &td);
+  static void releaseTextureData(ImTextureData &td);
 
 private:
   DynamicShaderHelper renderer;
   shaders::UniqueOverrideStateId overrideStateId;
   VDECL vDecl = BAD_VDECL;
   int vStride = -1;
-  UniqueTex fontTex;
   UniqueBuf vb;
   UniqueBuf ib;
   uint32_t vbSize = 0;

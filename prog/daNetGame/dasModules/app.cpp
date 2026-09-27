@@ -9,6 +9,12 @@
 
 MAKE_TYPE_FACTORY(sceneload::UserGameModeContext, sceneload::UserGameModeContext);
 
+// the renderer publishes it and the das AOT does not link the renderer, so the
+// storage sits with the binding: every game's AOT then reads the default
+static bool loading_splash_opens_onto_game_flag = false;
+void set_loading_splash_opens_onto_game(bool opens) { loading_splash_opens_onto_game_flag = opens; }
+bool loading_splash_opens_onto_game() { return loading_splash_opens_onto_game_flag; }
+
 namespace bind_dascript
 {
 struct UserGameModeContextAnnotation : das::ManagedStructureAnnotation<sceneload::UserGameModeContext, false>
@@ -28,15 +34,19 @@ public:
   DngAppModule() : das::Module("app")
   {
     das::ModuleLibrary lib(this);
-    addAnnotation(das::make_smart<UserGameModeContextAnnotation>(lib));
+    addAnnotation(new UserGameModeContextAnnotation(lib));
 
-    das::addExtern<DAS_BIND_FUN(get_sync_time)>(*this, lib, "get_sync_time", das::SideEffects::accessExternal, "::get_sync_time");
+    addBuiltinDependency(lib, require("AppTime"), true);
+
     das::addExtern<DAS_BIND_FUN(get_timespeed)>(*this, lib, "get_timespeed", das::SideEffects::accessExternal, "::get_timespeed");
     das::addExtern<DAS_BIND_FUN(set_timespeed)>(*this, lib, "set_timespeed", das::SideEffects::modifyExternal, "::set_timespeed");
     das::addExtern<DAS_BIND_FUN(toggle_pause)>(*this, lib, "toggle_pause", das::SideEffects::modifyExternal, "::toggle_pause");
 
     das::addExtern<DAS_BIND_FUN(get_exe_version_str)>(*this, lib, "get_exe_version_str", das::SideEffects::accessExternal,
       "::get_exe_version_str");
+
+    das::addExtern<DAS_BIND_FUN(::loading_splash_opens_onto_game)>(*this, lib, "loading_splash_opens_onto_game",
+      das::SideEffects::accessExternal, "::loading_splash_opens_onto_game");
 
     das::addExtern<DAS_BIND_FUN(app_profile_get_app_id)>(*this, lib, "get_app_id", das::SideEffects::accessExternal,
       "::app_profile_get_app_id");
@@ -48,8 +58,8 @@ public:
 
     das::addExtern<DAS_BIND_FUN(sceneload::load_game_scene)>(*this, lib, "load_game_scene", das::SideEffects::modifyExternal,
       "sceneload::load_game_scene")
-      ->arg_init(/*import_depth*/ 1, das::make_smart<das::ExprConstInt>(1))
-      ->arg_init(/*load_type*/ 2, das::make_smart<das::ExprConstUInt>(3 /*IMPORT*/));
+      ->arg_init(/*import_depth*/ 1, new das::ExprConstInt(1))
+      ->arg_init(/*load_type*/ 2, new das::ExprConstUInt(3 /*IMPORT*/));
     das::addExtern<DAS_BIND_FUN(das_switch_scene_1)>(*this, lib, "switch_scene", das::SideEffects::modifyExternal,
       "bind_dascript::das_switch_scene_1");
     das::addExtern<DAS_BIND_FUN(das_switch_scene_2)>(*this, lib, "switch_scene", das::SideEffects::modifyExternal,
@@ -66,8 +76,14 @@ public:
       "bind_dascript::exit_game_safe");
     das::addExternTempRef<DAS_BIND_FUN(dgs_get_game_params)>(*this, lib, "dgs_get_game_params", das::SideEffects::accessExternal,
       "bind_dascript::dgs_get_game_params");
-    das::addExtern<DAS_BIND_FUN(bind_dascript::dgs_get_argv)>(*this, lib, "dgs_get_argv", das::SideEffects::accessExternal,
-      "bind_dascript::dgs_get_argv");
+    das::addExtern<DAS_BIND_FUN(bind_dascript::dgs_has_arg)>(*this, lib, "dgs_has_arg", das::SideEffects::accessExternal,
+      "bind_dascript::dgs_has_arg");
+    // Warn: return empty string on existing arg without value which in das is indistinguishable from null;
+    // use `dgs_has_arg` for if you need that
+    // FIXME: return temp string somehow (gc-friendly)
+    das::addExtern<const char *(*)(const char *, const char *), &::dgs_get_argv>(*this, lib, "dgs_get_argv",
+      das::SideEffects::accessExternal, "::dgs_get_argv")
+      ->arg_init(1 /*def_val*/, new das::ExprConstString());
     das::addExtern<DAS_BIND_FUN(bind_dascript::dgs_get_argv_all)>(*this, lib, "dgs_get_argv_all", das::SideEffects::accessExternal,
       "bind_dascript::dgs_get_argv_all");
 

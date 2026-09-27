@@ -28,8 +28,11 @@ macro SUN_LIGHT_POINT_TRACE_HIT(code)//at trace hit when calculating probes
       #ifdef NUM_CASCADES
         //using CSM is only 5% slower than just use static cascade, but obviously more accurate
         //todo: disable on prev-gen / bare minimum
-        float3 csmShadow = get_csm_shadow( csm_world_view_pos.xyz - offsetedWorldPos, 0 );
-        float shadow = csmShadow.z ? getStaticShadow(offsetedWorldPos) : csmShadow.x;
+        float3 csmShadow = get_csm_shadow( csm_world_view_pos.xyz - offsetedWorldPos, 0, -1 );
+        // CSM fades out toward the last cascade edge (and is 1 beyond it), so static
+        // shadow always carries the far range. Matches WT combined_shadows.
+        float csmFade = 1.0 - csmShadow.z;
+        float shadow = lerp(1.0, csmShadow.x, csmFade) * getStaticShadow(offsetedWorldPos);
       #else
         float shadow = getStaticShadow(offsetedWorldPos);
       #endif
@@ -159,7 +162,7 @@ macro PROJECT_LIGHT_POINT_TRACE_HIT(code)//at trace hit when calculating probes
   //INIT_CSM_SHADOW(code)
   //BASE_USE_CSM_SHADOW_DEF_NUM(code)
   hlsl(code) {
-    float3 project_get_lit_color_at_trace_hit(float3 worldPos, float3 worldNormal, float3 albedo)
+    float3 project_get_lit_color_at_trace_hit(float3 worldPos, float3 worldNormal, float3 albedo, float4 toCameraBiasDirAndLimit = 0)
     {
       float3 ambientWorldPos = worldPos;//fixme!
       float shadowBiasMeters = 0;//fixme: we should add bias based on distance
@@ -170,7 +173,7 @@ endmacro
 
 macro PROJECT_LIGHT_POINT_VOXELIZE(code) // when voxelizing radiance of radiance voxel scene
   INIT_CSM_SHADOW(code)
-  BASE_USE_CSM_SHADOW_DEF_NUM(code)
+  BASE_USE_CSM_SHADOW_DEF_NUM_DEFAULT(code)
   SUN_SKY_LIGHT_POINT_TRACE_HIT(code)
   hlsl(code) {
     float3 project_get_lit_color_at_voxelize(float3 worldPos, float3 worldNormal, float3 albedo, float ambient_loss = 0.5, float3 def_ambient = 0)
@@ -220,3 +223,31 @@ macro PROJECT_LIGHT_POINT_SCREEN_VOXEL_LIT_SCENE(code)
   PROJECT_LIGHT_POINT_SCREEN_VOXEL(code)
 endmacro
 
+
+// media voxel lit color for the daGI2 media volumes: static shadowed sun + GI ambient on
+// the front side, the back side lit through the translucency color (a leaf cloud
+// transmits); the ambient is lost to the canopy above (dagi_media_vols_atten)
+macro PROJECT_DAGI_MEDIA_VOLS_AMBIENT(code)
+  SUN_SKY_LIGHT_POINT_TRACE_HIT(code)
+  (code) {
+    dagi_media_vols_sky_mean@f3 = (enviSPH0.w, enviSPH1.w, enviSPH2.w, 0);
+  }
+  hlsl(code) {
+    float3 dagi_media_vols_ambient(float3 world_pos, float3 world_normal, float3 albedo, float3 translucency_color,
+      float voxel_size)
+    {
+      float atten = dagi_media_vols_atten(world_pos, voxel_size);
+      // the irradiance grid sampler writes the inouts only inside its clips (bool return
+      // it cannot surface through this call): everywhere else the mean sky irradiance is
+      // the fallback, an uninitialized register otherwise ends up stored in the scene
+      float3 ambient = dagi_media_vols_sky_mean, backAmbient = dagi_media_vols_sky_mean;
+      // the step samples the ambient above the voxel and the sun shadow toward the sun: a
+      // crown center otherwise reads both through its own crown slab (static shadows carry
+      // the trees, the irradiance grid carries the forest darkening)
+      float step = dagi_media_vols_light_step(voxel_size);
+      float3 ambientPos = world_pos + float3(0, step, 0);
+      return get_sun_sky_lit_color_both(ambientPos, world_pos, world_normal, albedo, translucency_color, ambient, backAmbient,
+        step, atten);
+    }
+  }
+endmacro

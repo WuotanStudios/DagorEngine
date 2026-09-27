@@ -5,10 +5,6 @@
 #include "dagor.h"
 #include "ta.h"
 #include "loadta.h"
-#include <string>
-
-std::string wideToStr(const TCHAR *sw);
-M_STD_STRING strToWide(const char *sz);
 
 class TAClassDesc : public ClassDesc
 {
@@ -16,11 +12,7 @@ public:
   int IsPublic() override { return 1; }
   void *Create(BOOL loading = FALSE) override { return new BitmapIO_TA; }
   const TCHAR *ClassName() override { return _T("Dagor TexAnim"); }
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
   const MCHAR *NonLocalizedClassName() override { return ClassName(); }
-#else
-  const MCHAR *NonLocalizedClassName() { return ClassName(); }
-#endif
   SClass_ID SuperClassID() override { return BMM_IO_CLASS_ID; }
   Class_ID ClassID() override { return TexAnimIO_CID; }
   const TCHAR *Category() override { return _T("Bitmap I/O"); }
@@ -29,15 +21,11 @@ public:
 static TAClassDesc TADesc;
 ClassDesc *GetTexAnimIOCD() { return &TADesc; }
 
-BitmapIO_TA::BitmapIO_TA() {}
-
-BitmapIO_TA::~BitmapIO_TA() {}
-
 void BitmapIO_TA::ShowAbout(HWND hWnd) {}
 
 BOOL BitmapIO_TA::ShowControl(HWND hWnd, DWORD flag) { return (FALSE); }
 
-static void check_image_file(TCHAR *fn)
+static void check_image_file(TCHAR *fn, size_t count)
 {
   int e;
   for (e = (int)_tcslen(fn) - 1; e >= 0; --e)
@@ -47,6 +35,8 @@ static void check_image_file(TCHAR *fn)
     if (fn[e] == '.')
       return;
   e = (int)_tcslen(fn);
+  if (size_t(e) + 5 > count)
+    return;
   _tcscpy(fn + e, _T(".tga"));
   if (DoesFileExist(fn))
     return;
@@ -60,10 +50,9 @@ BMMRES BitmapIO_TA::GetImageInfo(BitmapInfo *fbi)
 {
   //-- Define Number of Frames
   TexAnimFile file;
-  std::string s = wideToStr(fbi->Name());
-  if (!file.load(s.c_str()))
-    return (ProcessImageIOError(fbi, (TCHAR *)strToWide(file.getlasterr()).c_str()));
-  int frameCount = file.frm.Count();
+  if (!file.load(fbi->Name()))
+    return (ProcessImageIOError(fbi, (TCHAR *)file.getlasterr().c_str()));
+  int frameCount = (int)file.frm.size();
 
   if (!frameCount)
     return (ProcessImageIOError(fbi, _T("no frames in .TA file")));
@@ -74,8 +63,8 @@ BMMRES BitmapIO_TA::GetImageInfo(BitmapInfo *fbi)
   BitmapInfo tbi;
 
 
-  _tcscpy(filenameOut, strToWide(file.tex[0]).c_str());
-  check_image_file(filenameOut);
+  _tcsncpy_s(filenameOut, _countof(filenameOut), file.tex[0].c_str(), _TRUNCATE);
+  check_image_file(filenameOut, _countof(filenameOut));
   tbi.SetName(filenameOut);
   BMMRES res = TheManager->GetImageInfo(&tbi, filenameOut);
   if (res != BMMRES_SUCCESS)
@@ -85,7 +74,6 @@ BMMRES BitmapIO_TA::GetImageInfo(BitmapInfo *fbi)
 
   fbi->SetWidth(tbi.Width());
   fbi->SetHeight(tbi.Height());
-  // fbi->SetGamma(tbi.Gamma());
   fbi->SetAspect(tbi.Aspect());
   fbi->SetType(tbi.Type());
   fbi->SetFirstFrame(0);
@@ -106,10 +94,9 @@ BMMRES BitmapIO_TA::GetImageName(BitmapInfo *fbi, TCHAR *filename)
   //-- Define Number of Frames
   TexAnimFile file;
 
-  std::string s = wideToStr(fbi->Name());
-  if (!file.load(s.c_str()))
-    return (ProcessImageIOError(fbi, (TCHAR *)strToWide(file.getlasterr()).c_str()));
-  int frameCount = file.frm.Count();
+  if (!file.load(fbi->Name()))
+    return (ProcessImageIOError(fbi, (TCHAR *)file.getlasterr().c_str()));
+  int frameCount = (int)file.frm.size();
 
   if (!frameCount)
   {
@@ -146,8 +133,8 @@ BMMRES BitmapIO_TA::GetImageName(BitmapInfo *fbi, TCHAR *filename)
 
   if (frame < 0)
     frame = 0;
-  _tcscpy(filename, strToWide(file.tex[file.frm[frame]]).c_str());
-  check_image_file(filename);
+  _tcsncpy_s(filename, MAX_PATH, file.tex[file.frm[frame]].c_str(), _TRUNCATE);
+  check_image_file(filename, MAX_PATH);
 
   return BMMRES_SUCCESS;
 }

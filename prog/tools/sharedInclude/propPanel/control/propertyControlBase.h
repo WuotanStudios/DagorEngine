@@ -4,15 +4,18 @@
 //
 #pragma once
 
+#include <propPanel/colors.h>
 #include <propPanel/c_common.h>
 #include <propPanel/c_control_event_handler.h>
 #include <propPanel/c_window_event_handler.h>
 #include <propPanel/c_data_flags.h>
 #include <propPanel/focusHelper.h>
+#include <propPanel/variant.h>
 
 #include <generic/dag_tab.h>
 #include <libTools/util/hdpiUtil.h>
 #include <math/dag_math3d.h>
+#include <util/dag_simpleString.h>
 #include <util/dag_string.h>
 
 class DataBlock;
@@ -22,6 +25,10 @@ namespace PropPanel
 
 class ContainerPropertyControl;
 class IListBoxControlEventHandler;
+class IDragSourceHandler;
+class IDropTargetHandler;
+class IListDragHandler;
+class IListDropHandler;
 
 class PropertyControlBase : public WindowControlEventHandler
 {
@@ -48,6 +55,10 @@ public:
   virtual void setTextGradientValue(const TextGradient &source) { G_UNUSED(source); }
   virtual void setControlPointsValue(Tab<Point2> &points) { G_UNUSED(points); }
 
+  // Sets the name the test automation uses to refer to this control.
+  // It is captured at creation from the caption, and it does not follow later setCaptionValue() calls.
+  virtual void setAutomationName(const char automation_name[]) { automationName = automation_name; }
+
   virtual void setTooltip(const char tooltip[]) { controlTooltip = tooltip; }
 
   // for indirect fill
@@ -59,15 +70,28 @@ public:
     G_UNUSED(step);
   }
 
+  virtual void setGradientMinMaxPointCount([[maybe_unused]] int min, [[maybe_unused]] int max) {}
   virtual void setPrecValue(int prec) { G_UNUSED(prec); }
   virtual void setStringsValue(const Tab<String> &vals) { G_UNUSED(vals); }
   virtual void setSelectionValue(const Tab<int> &sels) { G_UNUSED(sels); }
   virtual void setCaptionValue(const char value[]) { G_UNUSED(value); }
   virtual void setButtonPictureValues(const char *fname = nullptr) { G_UNUSED(fname); }
   virtual void setListBoxEventHandlerValue(IListBoxControlEventHandler *handler) { G_UNUSED(handler); }
+  virtual void setDragSourceHandlerValue([[maybe_unused]] IDragSourceHandler *handler) {}
+  virtual void setDropTargetHandler([[maybe_unused]] IDropTargetHandler *handler) {}
+  virtual void setListDragHandlerValue([[maybe_unused]] IListDragHandler *handler) {}
+  virtual void setListDropHandlerValue([[maybe_unused]] IListDropHandler *handler) {}
+  virtual void setValueHighlight([[maybe_unused]] ColorOverride::ColorIndex color) {}
+  virtual void setShowTooltipAlways([[maybe_unused]] bool show) {}
 
   virtual int addStringValue(const char *value);
   virtual void removeStringValue(int idx) { G_UNUSED(idx); }
+
+  // The placeholder text is the text shown when the edit box is empty.
+  virtual void setPlaceholderText([[maybe_unused]] const char *text) {}
+
+  // Display an error message toast near the control.
+  virtual void setErrorMessageToast([[maybe_unused]] const char *message) {}
 
   // Gets
   virtual void *getUserDataValue() const;
@@ -85,6 +109,7 @@ public:
   virtual void getTextGradientValue(TextGradient &destGradient) const;
   virtual void getCurveCoefsValue(Tab<Point2> &points) const;
   virtual bool getCurveCubicCoefsValue(Tab<Point2> &xy_4c_per_seg) const;
+  virtual const char *getAutomationName() const;
   virtual const char *getTooltip() const;
 
   virtual int getStringsValue(Tab<String> &vals);
@@ -99,6 +124,14 @@ public:
   virtual int getX() const { return mX; }
   virtual int getY() const { return mY; }
   virtual int getID() const { return mId; }
+
+  virtual void *queryInterfacePtr([[maybe_unused]] unsigned huid) { return nullptr; }
+
+  template <class T>
+  T *queryInterface()
+  {
+    return (T *)queryInterfacePtr(T::HUID);
+  }
 
   virtual void setWidth(hdpi::Px w) { mW = _px(w); }
 
@@ -127,6 +160,7 @@ public:
   long onWcKeyDown(WindowBase *source, unsigned v_key) override;
   void onWcResize(WindowBase *source) override;
   void onWcPostEvent(unsigned id) override;
+  void onWcChangeFinished(WindowBase *source) override;
 
   virtual const ContainerPropertyControl *getContainer() const { return nullptr; }
   virtual ContainerPropertyControl *getContainer() { return nullptr; }
@@ -161,13 +195,49 @@ public:
 
   virtual void updateImgui() {}
 
+  // Returns a best-effort estimate (in pixels) of the size this control will occupy, so a caller can predict a
+  // control's layout without drawing it.
+  // Not a guarantee: a control that clips or ellipsizes its content instead of growing to fit it (e.g. a fixed-width,
+  // non-word-wrapped label) reports that fixed size, not its full content size.
+  // (0, 0) means the control has no size preference, or the function has not been implemented yet.
+  // max_width_px: the width budget available to the control. A control whose content reflows (e.g. word-wrapped
+  //   text) should fit within it, others can ignore it. Pass FLT_MAX for no limit.
+  virtual Point2 getPreferredSize([[maybe_unused]] float max_width_px) const { return Point2(0.0f, 0.0f); }
+
   // Returns with PropPanel::ControlType.
   virtual int getImguiControlType() const { return 0; }
 
+  // Type of the control for the test automation. Has to be a string literal (static), because it is not copied.
+  virtual const char *getImguiTypeName() const { return nullptr; }
+
+  // Makes the last drawn ImGui item findable by the test automation under this control's automation name,
+  // or as one of its sub-components when subcomponent_name is set.
+  // Call it right after the ImGui call that draws the item.
+  // A control created without a caption gets no automation name.
+  void setImguiTestItemInfo(const char *subcomponent_name = nullptr) const;
+
+  // Same for an item that is not the last one, for drawing code that submits further items after the one to name.
+  void setImguiTestItemInfoById(unsigned item_id, const char *subcomponent_name = nullptr) const;
+
+  virtual bool isDefaultValueSet() const { return true; }
+  virtual void setDefaultValue(Variant var) { G_UNUSED(var); }
+  virtual void applyDefaultValue() {}
+
+  // Used by ChangeFinishTracker to follow every onChange with an onChangeFinished: a control holding
+  // ImGui's active item is still being edited. See note_held_active_imgui_item for who has to stamp it.
+  void heldActiveImguiItem();
+  bool isEditInProgress() const;
+  void sendChangeFinishedIfPending();
+
 protected:
+  bool changeFinishPending = false;
+  int activeImguiItemFrame = -1;
+
   void setFocusToNextImGuiControlIfRequested(int offset = 0) { focus_helper.setFocusToNextImGuiControlIfRequested(this, offset); }
 
   void setPreviousImguiControlTooltip();
+  void labelWithTooltip(const char *label, const char *label_end, bool use_text_width = false);
+  void separateLineLabelWithTooltip(const char *label, const char *label_end);
 
   int mId;
   ControlEventHandler *mEventHandler;
@@ -178,6 +248,7 @@ protected:
   bool hasCaption;
   bool mEnabledChanges;
 
+  SimpleString automationName;
   String controlTooltip;
 };
 

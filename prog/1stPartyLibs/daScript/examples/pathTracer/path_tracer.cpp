@@ -1,5 +1,9 @@
 #include "daScript/daScript.h"
 
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+#include "modules/external_declare.inc"
+#endif
+
 using namespace das;
 
 #define PATHTRACER_NAME   "/examples/pathTracer/toy_path_tracer_profile.das"
@@ -23,7 +27,7 @@ void pathtracer () {
         }
         return;
     }
-    // create daScript context
+    // create daslang context
     Context ctx(program->getContextStackSize());
     if ( !program->simulate(ctx, tout) ) {
         // if interpretation failed, report errors
@@ -60,8 +64,10 @@ int main( int, char * [] ) {
     force_aot_stub();
     // request all da-script built in modules
     NEED_ALL_DEFAULT_MODULES;
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
     // request external modules
-    #include "modules/external_need.inc"
+    #include "modules/external_pull.inc"
+#endif
     // add job-que
     if (!Module::require("jobque")) {
         NEED_MODULE(Module_JobQue);
@@ -70,7 +76,7 @@ int main( int, char * [] ) {
     Module::Initialize();
     // run the path-tracer
     pathtracer();
-    // shut-down daScript, free all memory
+    // shut-down daslang, free all memory
     Module::Shutdown();
     return 0;
 }

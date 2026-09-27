@@ -13,10 +13,16 @@ rule ProcessLinkTarget
 {
   local _LIBS =
      c m log dl android
-     stdc++ c++abi c++_static
+     stdc++ c++abi
   ;
 
-  if $(AndroidNdkVer) in r27c {
+  if $(Sanitize) = hwaddress {
+    _LIBS += c++_shared ;
+  } else {
+    _LIBS += c++_static ;
+  }
+
+  if $(AndroidNdkVer) in r27c r29 {
     _LIBS += clang_rt.builtins-aarch64-android ;
   } else {
     _LIBS += gcc ;
@@ -24,12 +30,22 @@ rule ProcessLinkTarget
 
   if $(TargetType) = exe
   {
+    if $(Sanitize) = hwaddress {
+      BundleCopy +=
+        @$(_A_NDK_DIR)/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so libs/$(PlatformArch)/libc++_shared.so
+        @$(_A_NDK_DIR)/wrap.sh/hwasan.sh src/main/resources/lib/$(PlatformArch)/wrap.sh
+      ;
+    }
+
     if $(BundleCopy) { ProcessBundleCopy $(BundleCopy) ; BundleCopy = ; } # process it here to force actual AndroidJavaCode value
 
     # configure build engine specific settings
     local stage_dir = $($(Target)__TmpDir)/android ;
 
     AndroidGradleOutDir = $(stage_dir) ;
+
+    if $(Config) = rel { AndroidObfuscate ?= yes ; }
+
     local jbuild_dir = $(Root)/prog/_jBuild/$(Platform) ;
     local jni_libs = $(stage_dir)/libs/$(PlatformArch) ;
     local unstripped_libs = $(stage_dir)/unstripped_libs/$(PlatformArch) ;
@@ -48,7 +64,7 @@ rule ProcessLinkTarget
     if $(PlatformArch) in arm64-v8a {
       _LINK_OPT += -L$(_A_NDK_DIR)/toolchains/aarch64-linux-android-4.9/prebuilt/$(_A_NDK_PREBUILT_SUFFIX)/lib/gcc/aarch64-linux-android/4.9.x ;
       _LINK_OPT += -L$(_A_NDK_DIR)/toolchains/llvm/prebuilt/$(_A_NDK_PREBUILT_SUFFIX)/$(_AndroidClangLibFolder)/clang/$(_AndroidClangVer)/lib/linux/aarch64 ;
-      if $(AndroidNdkVer) in r27c {
+      if $(AndroidNdkVer) in r27c r29 {
         _LINK_OPT += -L$(_A_NDK_SYSROOT_USR_LIB)/.. ;
         _LINK_OPT += -Wl,-z,max-page-size=16384 ;
       }
@@ -116,7 +132,7 @@ rule ProcessLinkTarget
     ;
 
     if $(UseVersionSelector) = yes {
-      postlink += copyfile $($(Target)__TmpDir)/$(VersionSelectorMangledTarget).so $(jni_libs)/lib$(VersionSelectorMangledTarget).so "
+      postlink += copyfile $(VersionSelectorOutDir)/$(VersionSelectorMangledTarget).so $(jni_libs)/lib$(VersionSelectorMangledTarget).so "
  " ;
     }
 
@@ -136,12 +152,25 @@ rule ProcessLinkTarget
  "
     ;
 
+    if $(UseVersionSelector) = yes {
+      postlink +=
+        copyfile $(VersionSelectorOutDir)/$(VersionSelectorMangledTarget).so $(OutDir)/lib$(VersionSelectorMangledTarget).so "
+ "
+      ;
+    }
+
     if $(AndroidGenerateDebugSymbols) {
       postlink +=
         mkdir $(unstripped_libs) "
 "       copyfile $(jni_libs)/lib$(proj).so $(unstripped_libs)/lib$(proj).so "
 "
       ;
+      if $(UseVersionSelector) = yes {
+        postlink +=
+          copyfile $(VersionSelectorOutDir)/unstripped/$(VersionSelectorMangledTarget).so $(unstripped_libs)/lib$(VersionSelectorMangledTarget).so "
+"
+        ;
+      }
     }
 
     local stripOpts = --strip-debug ;
@@ -154,27 +183,28 @@ rule ProcessLinkTarget
  "
     ;
 
-    AndroidExternalLibs ?= ;
-
-    postlink +=
-      call $(PYTHON_EXE) $(jbuild_dir)/update_java_external_libs.py $(stage_dir)/src $(AndroidExternalLibs) "
- "
-    ;
-
-    AndroidJavaSignatureVersion ?= 0 ;
-
-    if $(AndroidJavaSignatureVersion) {
-    postlink +=
-      call $(PYTHON_EXE) $(jbuild_dir)/update_java_signature_class.py $(stage_dir)/src $(AndroidJavaSignatureVersion) "
+    if $(UseVersionSelector) = yes {
+      postlink +=
+        call $(_A_STRIP_EXE) $(stripOpts) $(jni_libs)/lib$(VersionSelectorMangledTarget).so "
  "
       ;
     }
 
+    AndroidExternalLibs ?= no ;
+    AndroidJavaSignatureVersion ?= 0 ;
 
     local base_activity = android.app.NativeActivity ;
+    local debug_value = true ;
+    if $(Config) = rel { debug_value = false ; }
+
+    # projects append their own {KEY} java placeholders here, e.g. AndroidDefine += MY_KEY value ;
+    AndroidDefine ?= ;
+    AndroidDefine += NATIVE_ACTIVITY $(base_activity) ;
+    AndroidDefine += JAVA_SIG_VERSION $(AndroidJavaSignatureVersion) ;
+    AndroidDefine += DEBUG $(debug_value) ;
 
     postlink +=
-      call $(PYTHON_EXE) $(jbuild_dir)/update_java_native_activity.py $(stage_dir)/src $(base_activity) "
+      call $(PYTHON_EXE) $(jbuild_dir)/preprocess_java.py $(stage_dir)/src [ AndroidDefineArgs $(AndroidDefine) ] --external-libs $(AndroidExternalLibs) "
   "
     ;
 
@@ -423,9 +453,9 @@ rule ProcessLinkTarget
 		;
         }
 
-        if $(AndroidProguard) && $(Config) = rel {
-          ProcessBundleCopy $(AndroidProguard) project.proguard ;
-        }
+        # App-level proguard rules (AndroidProguard in the apk jamfile) are collected
+        # into proguard.d/ via the same unified path as module rules (see the
+        # AndroidProguard block in _jBuild/jBuild.jam) — nothing to copy here.
 
         # Otherwise mac ignores previously set JAVA_HOME and tries to use default one
         if $(OS) = MACOSX {
@@ -439,25 +469,37 @@ rule ProcessLinkTarget
 "
         ;
 
-        if $(Config) = rel && $(AndroidProguard) {
-          postlink +=
-            call $(PYTHON_EXE) $(jbuild_dir)/gradle/inject_proguard_gradle.py $(stage_dir) "
-"
-          ;
-        }
+        # NOTE: module proguard rules are picked up directly by build.gradle via a
+        # fileTree glob over the proguard.d/ folder, so no gradle string injection
+        # step is needed here anymore (see gradle/build.gradle release block).
 
         postlink +=
-          call $(PYTHON_EXE) $(jbuild_dir)/gradle/inject_gradle_libs.py $(stage_dir) "
+          call $(PYTHON_EXE) $(jbuild_dir)/gradle/make_gradle_deps.py $(stage_dir) "
 "
         ;
 
-        build_command = call $(_A_GRADLE_CMD) $(build_cfg) --quiet --no-daemon --project-dir=$(stage_dir) ;
-        build_command_bundle = call $(_A_GRADLE_CMD) $(build_cfg_bundle) --quiet --no-daemon --project-dir=$(stage_dir) ;
+        local crashlytics_task = ;
+        if $(AndroidUploadCrashlyticsSymbols) = yes && $(Config) = rel {
+          crashlytics_task = uploadCrashlyticsSymbolFileRelease ;
+        }
+        build_command = call $(_A_GRADLE_CMD) $(build_cfg) $(crashlytics_task) -PDAGOR_OBFUSCATE=$(AndroidObfuscate) --quiet --no-daemon --project-dir=$(stage_dir) ;
+        build_command_bundle = call $(_A_GRADLE_CMD) $(build_cfg_bundle) -PDAGOR_OBFUSCATE=$(AndroidObfuscate) --quiet --no-daemon --project-dir=$(stage_dir) ;
 
       }
     }
 
     if $(AndroidBundleCopyRecursively) { ProcessBundleCopyRecursively $(AndroidBundleCopyRecursively) ; }
+
+    local _apb_file = ;
+    for _apb_item in $(AndroidBundlePatchBlk) {
+      if $(_apb_file) {
+        postlink += call $(PYTHON_EXE) $(Root)/prog/_jBuild/_scripts/patch_blk.py $(stage_dir)/$(_apb_file) $(_apb_item) "
+ "      ;
+        _apb_file = ;
+      } else {
+        _apb_file = $(_apb_item) ;
+      }
+    }
 
     if $(AndroidMakeAssetIndexMasks) {
       local index_file = $(stage_dir)/assets/_asset_index.blk ;
@@ -519,17 +561,11 @@ rule ProcessLinkTarget
       }
     }
 
-    if $(Config) = rel && $(AndroidProguard) {
+    if $(AndroidObfuscate) = yes {
       postlink +=
         if exist $(mapping_file) copyfile $(mapping_file) $(OutDir)/$(Target:D=:S=)_obfuscate.txt "
 "
       ;
-    }
-
-    if $(AndroidUploadCrashlyticsSymbols) = yes && $(Config) = rel {
-      postlink +=
-        call $(_A_GRADLE_CMD) uploadCrashlyticsSymbolFileRelease --quiet --no-daemon --project-dir=$(stage_dir)"
- "    ;
     }
 
     if $(AndroidCopyToDevice) {
@@ -540,7 +576,12 @@ rule ProcessLinkTarget
    "  ;
     }
 
-    $(Target)__POSTLINK_CMD = $(postlink) ;
+    BuildApk ?= yes ;
+    if $(BuildApk) = yes {
+      $(Target)__POSTLINK_CMD = $(postlink) ;
+    } else {
+      $(Target)__POSTLINK_CMD = "goto skip_apk_check" ;
+    }
     LinkExeSetBuildStamp $(Target) ;
   }
   else if $(TargetType) = lib
@@ -554,6 +595,7 @@ rule ProcessLinkTarget
       -shared -nostdlib
       -Wl,--no-undefined
       -Wl,-z,noexecstack
+      -Wl,--build-id
       -Wl,--gc-sections
     ;
     _LINK_OPT += -L$(_A_NDK_DIR)/sources/cxx-stl/llvm-libc++/libs/$(PlatformArch) ;
@@ -562,7 +604,7 @@ rule ProcessLinkTarget
     if $(PlatformArch) in arm64-v8a {
       _LINK_OPT += -L$(_A_NDK_DIR)/toolchains/aarch64-linux-android-4.9/prebuilt/$(_A_NDK_PREBUILT_SUFFIX)/lib/gcc/aarch64-linux-android/4.9.x ;
       _LINK_OPT += -L$(_A_NDK_DIR)/toolchains/llvm/prebuilt/$(_A_NDK_PREBUILT_SUFFIX)/$(_AndroidClangLibFolder)/clang/$(_AndroidClangVer)/lib/linux/aarch64 ;
-      if $(AndroidNdkVer) in r27c {
+      if $(AndroidNdkVer) in r27c r29 {
         _LINK_OPT += -L$(_A_NDK_SYSROOT_USR_LIB)/.. ;
         _LINK_OPT += -Wl,-z,max-page-size=16384 ;
       }
@@ -582,7 +624,17 @@ rule ProcessLinkTarget
     $(Target)__LINK_OPT  = $(_LINK_OPT) $(LINKopt) ;
     $(Target)__POSTLINK_CMD =
         copyfile $($(Target)__TmpDir)/$(Target:D=) $(OutDir)/$(Target:D=) "
- "      call $(_A_STRIP_EXE) --strip-debug $(OutDir)/$(Target:D=)
+ "
+    ;
+    if $(AndroidUploadCrashlyticsSymbols) = yes {
+      $(Target)__POSTLINK_CMD +=
+        mkdir $(OutDir)/unstripped "
+ "      copyfile $($(Target)__TmpDir)/$(Target:D=) $(OutDir)/unstripped/$(Target:D=) "
+ "
+      ;
+    }
+    $(Target)__POSTLINK_CMD +=
+        call $(_A_STRIP_EXE) --strip-debug $(OutDir)/$(Target:D=)
     ;
     LinkExeSetBuildStamp $(Target) ;
   }
@@ -599,6 +651,17 @@ rule SignPackageRule
 {
 }
 
+rule AndroidDefineArgs
+{
+  local key = $(1[1]) ;
+  local value = $(1[2]) ;
+  local result = --define $(key)=$(value) ;
+  if $(1[3]) {
+    result += [ AndroidDefineArgs $(1[3-]) ] ;
+  }
+  return $(result) ;
+}
+
 rule ProcessBundleCopy
 {
   local src = [ LocationBasedToAbsPath $(1[1]) ] ;
@@ -609,9 +672,11 @@ rule ProcessBundleCopy
   Depends $(OutDir)/$(Target) : $(out)/$(dest) ;
   Depends $(out)/$(dest) : $(src) ;
   file on $(out)/$(dest) = $(dest) ;
+  dstAbs on $(out)/$(dest) = [ MakePathAbsolute $(JAM_CWD) : $(out)/$(dest) ] ;
+  srcAbs on $(out)/$(dest) = [ MakePathAbsolute $(JAM_CWD) : $(src) ] ;
   raw_copy_file $(out)/$(dest) : $(src) ;
 
-  if ! $(AndroidJavaCode) && $(dest:S) = .java { AndroidJavaCode = yes ; }
+  if ! $(AndroidJavaCode) && $(dest:S) in .java .kt { AndroidJavaCode = yes ; }
   if $(1[3]) { ProcessBundleCopy $(1[3-]) ; }
 }
 
@@ -630,6 +695,28 @@ rule ProcessBundleCopyRecursively
 
 rule ProcessAndroidSources
 {
+  if ! ( $(1[1]:S) in .java .kt ) {
+    Exit AndroidSources accepts only .java/.kt files, got \"$(1[1])\" in $(Location) ; use AndroidCopy for other files ;
+  }
+
+  local out = $(AndroidGradleOutDir) ;
+  local src = [ LocationBasedToAbsPath $(1[1]) ] ;
+  local stamp = $(out)/.jcopy/$(Target:D=:S=)~$(1[1]:D=).jcopy ;
+
+  MakeDirectory $(stamp) : $(stamp:D) ;
+  Depends $(OutDir)/$(Target) : $(stamp) ;
+  Depends $(stamp) : $(src) ;
+  script on $(stamp) = $(Root)/prog/_jBuild/android/copy_java_sources.py ;
+  out_src on $(stamp) = $(out)/src ;
+  copy_android_java_src $(stamp) : $(src) ;
+
+  AndroidJavaCode = yes ;
+
+  if $(1[2]) { ProcessAndroidSources $(1[2-]) ; }
+}
+
+rule ProcessAndroidCopy
+{
   local src = [ LocationBasedToAbsPath $(1[1]) ] ;
   local dest = $(1[2]) ;
   local out = $(AndroidGradleOutDir) ;
@@ -638,41 +725,56 @@ rule ProcessAndroidSources
   Depends $(OutDir)/$(Target) : $(out)/$(dest) ;
   Depends $(out)/$(dest) : $(src) ;
   file on $(out)/$(dest) = $(dest) ;
+  dstAbs on $(out)/$(dest) = [ MakePathAbsolute $(JAM_CWD) : $(out)/$(dest) ] ;
+  srcAbs on $(out)/$(dest) = [ MakePathAbsolute $(JAM_CWD) : $(src) ] ;
   raw_copy_file $(out)/$(dest) : $(src) ;
 
-  AndroidJavaCode = yes ;
+  if ! $(AndroidJavaCode) && $(dest:S) in .java .kt { AndroidJavaCode = yes ; }
 
-  if $(1[3]) { ProcessAndroidSources $(1[3-]) ; }
+  if $(1[3]) { ProcessAndroidCopy $(1[3-]) ; }
 }
 
-rule ProcessAndroidLibProguard
+actions together quietly copy_android_java_src
+{
+  del $(1)
+  call $(PYTHON_EXE) $(script) $(out_src) $(1) $(2)
+  if not exist $(1) set errorlevel=13
+}
+
+rule ProcessAndroidProguard
 {
   local src = [ LocationBasedToAbsPath $(1[1]) ] ;
-  local dest = $(1[1]:D=:S=)_$(Target:D=:S=).proguard ;
+  local dest = proguard.d/$(1[1]:D=:S=)_$(Target:D=:S=).proguard ;
   local out = $(AndroidGradleOutDir) ;
 
   MakeDirectory $(out)/$(dest) : $(out)/$(dest:D) ;
   Depends $(OutDir)/$(Target) : $(out)/$(dest) ;
   Depends $(out)/$(dest) : $(src) ;
   file on $(out)/$(dest) = $(dest) ;
+  dstAbs on $(out)/$(dest) = [ MakePathAbsolute $(JAM_CWD) : $(out)/$(dest) ] ;
+  srcAbs on $(out)/$(dest) = [ MakePathAbsolute $(JAM_CWD) : $(src) ] ;
   raw_copy_file $(out)/$(dest) : $(src) ;
 
-  if $(1[2]) { ProcessAndroidLibProguard $(1[2-]) ; }
+  if $(1[2]) { ProcessAndroidProguard $(1[2-]) ; }
 }
 
 rule ProcessAndroidLibs
 {
-  local src = [ LocationBasedToAbsPath $(1[1]) ] ;
-  local dest = $(1[1]:D=:S=)_$(Target:D=:S=).libs ;
   local out = $(AndroidGradleOutDir) ;
+  local dest = $(out)/$(Target:D=:S=).libs ;
 
-  MakeDirectory $(out)/$(dest) : $(out)/$(dest:D) ;
-  Depends $(OutDir)/$(Target) : $(out)/$(dest) ;
-  Depends $(out)/$(dest) : $(src) ;
-  file on $(out)/$(dest) = $(dest) ;
-  raw_copy_file $(out)/$(dest) : $(src) ;
+  MakeDirectory $(dest) : $(dest:D) ;
+  Depends $(OutDir)/$(Target) : $(dest) ;
+  Depends $(dest) : $(Root)/$(Location)/jamfile ;
+  script on $(dest) = $(Root)/prog/_jBuild/android/gradle/write_gradle_libs.py ;
+  libs on $(dest) = $(1) ;
+  write_android_libs $(dest) ;
+}
 
-  if $(1[2]) { ProcessAndroidLibs $(1[2-]) ; }
+actions together quietly write_android_libs
+{
+  call $(PYTHON_EXE) $(script) $(1) $(libs)
+  if not exist $(1) set errorlevel=13
 }
 
 actions together quietly link_target
@@ -695,6 +797,9 @@ actions together quietly link_target
   if errorlevel 1 goto failed
   if not exist $(1) goto failed
   echo SUCCESSFULLY built $(1:B)$(1:S)  $(_PrintedOutput)
+  goto end
+  :skip_apk_check
+  echo SUCCESSFULLY built $(1:B).so  $(_PrintedOutput)
   goto end
 
   :failed

@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "assemblyShader.h"
+#include "shExprParser.h"
 #include <shaders/shOpcodeFormat.h>
 #include <shaders/shOpcode.h>
 #include <shaders/shUtils.h>
@@ -10,6 +11,7 @@
 #include "shaderSemantic.h"
 #include "transcodeCommon.h"
 #include "hwAssembly.h"
+#include "boolExpr.h"
 #include "variantAssembly.h"
 #include "shTargetContext.h"
 
@@ -45,6 +47,12 @@
 #include <EASTL/optional.h>
 #include <util/dag_strUtil.h>
 
+#include "hashed_cache.h"
+#include <osApiWrappers/dag_direct.h>
+#include <osApiWrappers/dag_files.h>
+#include <debug/dag_logSys.h>
+#include "sha1_cache_version.h"
+
 #include "debugSpitfile.h"
 
 using namespace ShaderParser;
@@ -78,263 +86,14 @@ static bool is_hlsl_debug() { return shc::config().hlslDebugLevel != DebugLevel:
  *
  *********************************/
 AssembleShaderEvalCB::AssembleShaderEvalCB(shc::VariantContext &ctx) :
-  semantic::VariantBoolExprEvalCB{ctx},
-  ctx{ctx},
-  sclass{ctx.shCtx().compiledShader()},
-  code{ctx.parsedSemCode()},
+  GatherVariantLocalVarsCB{ctx, &preshaderSource},
   curvariant{&ctx.parsedPass()},
   curpass{ctx.hasParsedPass() ? &ctx.parsedPass().pass.value() : nullptr},
-  stBytecodeAccum{ctx.stBytecode()},
-  stCppcodeAccum{ctx.cppStcode()},
-  shConst{ctx.namedConstTable()},
-  parser{ctx.tgtCtx().sourceParseState().parser},
   exprParser{ctx},
   allRefStaticVars{ctx.shCtx().typeTables().referencedTypes},
   dont_render(false),
-  variant(ctx.variant()),
-  varMerger{ctx.tgtCtx()}
+  variant(ctx.variant())
 {}
-
-eastl::optional<ShaderVarType> shtok_to_shvt(int shtok)
-{
-  switch (shtok)
-  {
-    case SHADER_TOKENS::SHTOK_int: return SHVT_INT;
-    case SHADER_TOKENS::SHTOK_int4: return SHVT_INT4;
-    case SHADER_TOKENS::SHTOK_float: return SHVT_REAL;
-    case SHADER_TOKENS::SHTOK_float4x4: return SHVT_FLOAT4X4;
-    case SHADER_TOKENS::SHTOK_float4: return SHVT_COLOR4;
-    case SHADER_TOKENS::SHTOK_texture: return SHVT_TEXTURE;
-    default: return eastl::nullopt;
-  }
-}
-
-void AssembleShaderEvalCB::eval_static(static_var_decl &s)
-{
-  auto shvt = shtok_to_shvt(s.type->type->num);
-  if (!shvt)
-  {
-    report_error(parser, s.type->type, "Unsupported shadervar type %s to declare as static/dynamic variable", s.type->type->text);
-    return;
-  }
-  ShaderVarType t = *shvt;
-
-  int varNameId = ctx.tgtCtx().varNameMap().addVarId(s.name->text);
-
-  int v = code.find_var(varNameId);
-  if (v >= 0)
-  {
-    eastl::string message(eastl::string::CtorSprintf{}, "static variable '%s' already declared in ", s.name->text);
-    message += parser.get_lexer().get_symbol_location(varNameId, SymbolType::STATIC_VARIABLE);
-    report_error(parser, s.name, message.c_str());
-    return;
-  }
-  parser.get_lexer().register_symbol(varNameId, SymbolType::STATIC_VARIABLE, s.name);
-  v = append_items(code.vars, 1);
-  code.vars[v].type = t;
-  code.vars[v].nameId = varNameId;
-  code.vars[v].terminal = s.name;
-  code.vars[v].dynamic = s.mode && s.mode->mode->num == SHADER_TOKENS::SHTOK_dynamic;
-  if (s.no_warnings)
-    code.vars[v].noWarnings = true;
-
-  code.staticStcodeVars.add(s.name->text, v);
-
-  bool inited = (!s.mode && s.init) || code.vars[v].dynamic || (t != SHVT_TEXTURE) || s.init;
-  if (!inited)
-    report_error(parser, s.name, "Variable '%s' must be inited", s.name->text);
-
-  bool varReferenced = true;
-
-  if (!s.mode)
-  {
-    int intervalNameId = ctx.tgtCtx().intervalNameMap().getNameId(s.name->text);
-    ShaderVariant::ExtType intervalIndex = allRefStaticVars.getIntervals()->getIntervalIndex(intervalNameId);
-    const Interval *interv = allRefStaticVars.getIntervals()->getInterval(intervalIndex);
-    varReferenced = interv ? allRefStaticVars.findType(interv->getVarType(), intervalIndex) != -1 : false;
-    code.vars[v].used = varReferenced;
-  }
-
-  int sv = sclass.find_static_var(varNameId);
-  if (sv < 0 && varReferenced)
-  {
-    sv = append_items(sclass.stvar, 1);
-    sclass.stvar[sv].type = t;
-    sclass.stvar[sv].nameId = varNameId;
-
-    if (sclass.stvarsAreDynamic.size() <= sv)
-      sclass.stvarsAreDynamic.resize(sv + 1);
-    sclass.stvarsAreDynamic[sv] = code.vars[v].dynamic;
-
-    const bool expectingInt = t == SHVT_INT || t == SHVT_INT4;
-    Color4 val = expectingInt ? Color4{bitwise_cast<float>(0), bitwise_cast<float>(0), bitwise_cast<float>(0), bitwise_cast<float>(1)}
-                              : Color4{0, 0, 0, 1};
-    if (s.init && s.init->expr)
-    {
-      shexpr::ValueType expectedValType = shexpr::VT_UNDEFINED;
-      if (t == SHVT_REAL || t == SHVT_INT || t == SHVT_TEXTURE)
-        expectedValType = shexpr::VT_REAL;
-      else if (t == SHVT_COLOR4 || t == SHVT_INT4)
-        expectedValType = shexpr::VT_COLOR4;
-      else if (t == SHVT_FLOAT4X4)
-      {
-        report_error(parser, s.name, "float4x4 default value is not supported");
-        return;
-      }
-
-      if (!exprParser.parseConstExpression(*s.init->expr, val, ExpressionParser::Context{expectedValType, expectingInt, s.name}))
-      {
-        report_error(parser, s.name, "Wrong expression");
-        return;
-      }
-    }
-
-    switch (t)
-    {
-      case SHVT_COLOR4: sclass.stvar[sv].defval.c4.set(val); break;
-      case SHVT_REAL: sclass.stvar[sv].defval.r = val[0]; break;
-      case SHVT_INT: sclass.stvar[sv].defval.i = bitwise_cast<int>(val[0]); break;
-      case SHVT_INT4:
-        sclass.stvar[sv].defval.i4.set(bitwise_cast<int>(val[0]), bitwise_cast<int>(val[1]), bitwise_cast<int>(val[2]),
-          bitwise_cast<int>(val[3]));
-        break;
-      case SHVT_FLOAT4X4:
-        // default value is not supported
-        break;
-      case SHVT_TEXTURE:
-        if (real2int(val[0]) != 0)
-        {
-          report_error(parser, s.name, "texture may be inited only with 0");
-          return;
-        }
-        sclass.stvar[sv].defval.texId = unsigned(BAD_TEXTUREID);
-        break;
-      default: G_ASSERT(0);
-    }
-  }
-  else if (sv >= 0)
-  {
-    if (sclass.stvar[sv].type != t)
-    {
-      report_error(parser, s.name, "static var '%s' defined with different type", s.name->text);
-      return;
-    }
-  }
-
-  if (varReferenced)
-  {
-    int i = append_items(code.stvarmap, 1);
-    code.stvarmap[i].v = v;
-    code.stvarmap[i].sv = sv;
-  }
-
-  if (s.init && !s.init->expr)
-    eval_init_stat(s.name, *s.init);
-}
-
-void AssembleShaderEvalCB::eval_bool_decl(bool_decl &decl) { ctx.localBoolVars().add(decl, parser); }
-
-void AssembleShaderEvalCB::decl_bool_alias(const char *name, bool_expr &expr)
-{
-  bool_decl decl;
-  SHTOK_ident ident;
-  ident.file_start = 0;
-  ident.line_start = 0;
-  ident.col_start = 0;
-  decl.name = &ident;
-  decl.name->text = name;
-  decl.expr = &expr;
-  eval_bool_decl(decl);
-}
-
-void AssembleShaderEvalCB::eval_init_stat(SHTOK_ident *var, shader_init_value &v)
-{
-  int varNameId = ctx.tgtCtx().varNameMap().getVarId(var->text);
-
-  int vi = code.find_var(varNameId);
-  if (vi < 0)
-  {
-    report_error(parser, var, "unknown variable '%s'", var->text);
-    return;
-  }
-
-  if (v.color)
-  {
-    if (code.vars[vi].type != SHVT_COLOR4)
-    {
-      report_error(parser, v.color->color, "can't assign color to %s", ShUtils::shader_var_type_name(code.vars[vi].type));
-      return;
-    }
-    int c;
-    switch (v.color->color->num)
-    {
-      case SHADER_TOKENS::SHTOK_diffuse: c = SHCOD_DIFFUSE; break;
-      case SHADER_TOKENS::SHTOK_emissive: c = SHCOD_EMISSIVE; break;
-      case SHADER_TOKENS::SHTOK_specular: c = SHCOD_SPECULAR; break;
-      case SHADER_TOKENS::SHTOK_ambient: c = SHCOD_AMBIENT; break;
-      default: G_ASSERT(0);
-    }
-    int ident_id = ctx.tgtCtx().intervalNameMap().getNameId(var->text);
-    int intervalIndex = variant.intervals.getIntervalIndex(ident_id);
-    if (intervalIndex != INTERVAL_NOT_INIT && !code.vars[vi].dynamic)
-    {
-      int stVarId = sclass.find_static_var(varNameId);
-      if (stVarId < 0)
-      {
-        report_error(parser, var, "variable <%s> is not static var", var->text);
-        return;
-      }
-
-      sclass.shInitCode.push_back(stVarId);
-      sclass.shInitCode.push_back(shaderopcode::makeOp0(c));
-      return;
-    }
-
-    code.initcode.push_back(vi);
-    code.initcode.push_back(shaderopcode::makeOp0(c));
-  }
-  else if (v.tex)
-  {
-    if (code.vars[vi].type != SHVT_TEXTURE)
-    {
-      report_error(parser, v.tex->tex, "can't assign texture to %s", ShUtils::shader_var_type_name(code.vars[vi].type));
-      return;
-    }
-    int ind;
-    if (v.tex->tex_num)
-      ind = semutils::int_number(v.tex->tex_num->text);
-    else if (v.tex->tex_name && v.tex->tex_name->num == SHADER_TOKENS::SHTOK_diffuse)
-      ind = 0;
-    else
-      G_ASSERT(0);
-
-    code.vars[vi].slot = ind;
-
-    int e_texture_ident_id = ctx.tgtCtx().intervalNameMap().getNameId(var->text);
-    int intervalIndex = variant.intervals.getIntervalIndex(e_texture_ident_id);
-    int stVarId = intervalIndex != INTERVAL_NOT_INIT ? sclass.find_static_var(varNameId) : -1;
-    if (stVarId >= 0 && !code.vars[vi].dynamic)
-    {
-      int opcode = shaderopcode::makeOp2(SHCOD_TEXTURE, ind, 0);
-      for (int i = 0; i < sclass.shInitCode.size(); i += 2)
-        if (sclass.shInitCode[i] == stVarId)
-        {
-          if (sclass.shInitCode[i + 1] != opcode)
-            report_error(parser, v.tex->tex, "ambiguous init for static texture <%s> used in branching", var->text);
-          return;
-        }
-
-      sclass.shInitCode.push_back(stVarId);
-      sclass.shInitCode.push_back(opcode);
-      return;
-    }
-
-    code.initcode.push_back(vi);
-    code.initcode.push_back(shaderopcode::makeOp2(SHCOD_TEXTURE, ind, 0));
-  }
-  else
-    G_ASSERT(0);
-}
 
 static inline int channel_type(int token)
 {
@@ -375,6 +134,8 @@ static inline int channel_usage(int token)
 
 void AssembleShaderEvalCB::eval_channel_decl(channel_decl &s, int str_idx)
 {
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
   ShaderChannelId ch;
 
   int tp = ::channel_type(s.type->type->num);
@@ -601,6 +362,8 @@ void AssembleShaderEvalCB::eval_blend_value(const Terminal &blend_func_tok, cons
 
 void AssembleShaderEvalCB::eval_state(state_stat &s)
 {
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
   if (s.var)
   {
 
@@ -726,6 +489,8 @@ void AssembleShaderEvalCB::eval_state(state_stat &s)
 
             int varNameId = ctx.tgtCtx().varNameMap().getVarId(val->text);
             int sv = sclass.find_static_var(varNameId);
+            G_ASSERTF_RETURN(sv >= 0, , "ICE: static variable '%s' found in static variant, but not backed in the shader class",
+              val->text);
             curpass->color_write = sclass.stvar[sv].defval.i;
             break;
           }
@@ -872,6 +637,8 @@ void AssembleShaderEvalCB::eval_state(state_stat &s)
 
 void AssembleShaderEvalCB::eval_zbias_state(zbias_state_stat &s)
 {
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
   switch (s.var->num)
   {
     case SHADER_TOKENS::SHTOK_slope_z_bias:
@@ -902,6 +669,203 @@ void AssembleShaderEvalCB::eval_zbias_state(zbias_state_stat &s)
   }
 }
 
+void AssembleShaderEvalCB::eval_refined_block_var(state_block_stat &s, ShaderStage stage)
+{
+  semantic::VariableType vt = semantic::parse_named_const_type(s);
+  if (vt == semantic::VariableType::Unknown)
+  {
+    report_error(parser, s.var->var->name, "#rb var <%s> has unknown type", s.var->var->name->text);
+    return;
+  }
+
+  const bool isNumeric = semantic::vt_is_numeric(vt);
+  const bool isTexOrBuf = semantic::vt_is_tex(vt) || semantic::vt_is_buf(vt);
+  const bool isCbuf = semantic::vt_is_cbuf(vt);
+  const bool isSampler = semantic::vt_is_sampler(vt);
+  const bool isTlas = semantic::vt_is_tlas(vt);
+  const bool isUav = semantic::vt_is_uav(vt);
+  if (!isNumeric && !isTexOrBuf && !isCbuf && !isSampler && !isTlas && !isUav)
+  {
+    report_error(parser, s.var->var->name, "#rb var <%s> must have a numeric, texture/buffer, cbuf, sampler, tlas, or uav type",
+      s.var->var->name->text);
+    return;
+  }
+
+  if (!s.var->val || !s.var->val->expr)
+  {
+    report_error(parser, s.var->var->name, "#rb var <%s> must have a value", s.var->var->name->text);
+    return;
+  }
+
+  const char *hlslName = s.var->var->name->text;
+  auto &allocator = ctx.compCtx().rbAllocator();
+  auto &rbNameIdToReg = ctx.compCtx().rbVars();
+  auto &rbNameMap = ctx.compCtx().rbVarNameMap();
+  auto &layout = ctx.tgtCtx().refinedBlockLayout();
+
+  // Resolve or reuse the rb var id stored in the AST node.
+  int rbVarId = s.var->var->rbVarId;
+  if (rbVarId < 0)
+    rbVarId = s.var->var->rbVarId = rbNameMap.addVarId(hlslName);
+
+  Terminal *shaderVarTerm = s.var->val->expr->lhs ? s.var->val->expr->lhs->lhs->var_name : nullptr;
+  if (!shaderVarTerm)
+  {
+    // Complex expression path: RHS is an arithmetic expression, not a simple global var ref.
+    if (!semantic::vt_is_numeric(vt) || semantic::vt_is_integer(vt) || semantic::vt_float_size(vt) > 4)
+    {
+      report_error(parser, s.var->var->name, "#rb var <%s>: computed expressions are only supported for float types (@f1..@f4)",
+        hlslName);
+      return;
+    }
+
+    const int slotCount = semantic::vt_float_size(vt);
+    auto [var, isNewVar] =
+      layout.addVar(rbVarId, {.varName = hlslName,
+                               .globVarId = -1,
+                               .varType = vt,
+                               .svType = static_cast<ShaderVarType>(semantic::vt_float_size(vt) == 1 ? SHVT_REAL : SHVT_COLOR4)});
+
+    if (isNewVar)
+    {
+      auto [cache, isNewCache] = rbNameIdToReg.emplace(rbVarId, shc::RefinedBlockRegister{});
+      if (isNewCache)
+      {
+        const int offset = int(allocator.allocCbufSlot(slotCount));
+        cache->second.cbufOffsetAndCount = eastl::make_pair(offset, slotCount);
+      }
+      G_ASSERT(cache->second.cbufOffsetAndCount.has_value());
+      var.cbufOffset = cache->second.cbufOffsetAndCount.value().first;
+    }
+
+    const bool isInt = semantic::vt_is_integer(vt);
+    shexpr::ValueType shexprVT = semantic::vt_float_size(vt) == 1 ? shexpr::VT_REAL : shexpr::VT_COLOR4;
+    ShaderParser::ComplexExpression colorExpr{s.var->val->expr, shexprVT};
+    if (!exprParser.parseExpression(*s.var->val->expr, &colorExpr,
+          ShaderParser::ExpressionParser::Context{shexprVT, isInt, s.var->var->name}))
+    {
+      report_error(parser, s.var->var->name, "#rb var <%s>: invalid expression", hlslName);
+      return;
+    }
+    colorExpr.collapseNumbers(parser);
+
+    ShaderParser::CodeTable computedStcode;
+    StcodeVMRegisterAllocator regAlloc{parser};
+    Register dr = regAlloc.add_vec_reg();
+    colorExpr.assembleBytecode(computedStcode, dr, regAlloc, isInt);
+    computedStcode.push_back(shaderopcode::makeOpStageSlot(SHCOD_SET_CONST_PACKED, int(dr), slotCount, var.cbufOffset.value()));
+
+    eastl::string computedCppExpr;
+    if (shc::config().compileCppStcode())
+    {
+      StcodeExpression cppExpr;
+      cppExpr.noGlobal = true;
+      colorExpr.assembleCpp(cppExpr, isInt);
+      computedCppExpr = cppExpr.releaseAssembledCode();
+    }
+
+    var.computedStcode = eastl::move(computedStcode);
+    var.computedCppExpr = eastl::move(computedCppExpr);
+    return;
+  }
+
+  // Simple path: RHS is a direct global var reference.
+  auto [globVarId, valType, isGlobal] = semantic::lookup_state_var(shaderVarTerm->text, ctx, /*allow_not_found=*/false, shaderVarTerm);
+  if (globVarId < 0)
+    return; // error already reported by lookup_state_var
+  if (!isGlobal)
+  {
+    report_error(parser, shaderVarTerm, "#rb var <%s>: <%s> is a local shader variable, must reference a global variable", hlslName,
+      shaderVarTerm->text);
+    return;
+  }
+
+  const bool requiresHlsl = (vt == semantic::VariableType::buf || vt == semantic::VariableType::tex) || isCbuf || isTlas || isUav;
+  if (requiresHlsl && !s.var->hlsl_var_text)
+  {
+    const char *nsText = s.var->var->nameSpace->text;
+    report_error(parser, s.var->var->name,
+      "#rb var <%s> has type <%s> and requires an inline hlsl declaration, "
+      "e.g.:  hlsl { ByteAddressBuffer %s%s }",
+      hlslName, nsText, hlslName, nsText);
+    return;
+  }
+
+  eastl::string hlslDecl;
+  if (s.var->hlsl_var_text)
+  {
+    hlslDecl = s.var->hlsl_var_text->text;
+    const auto first = hlslDecl.find_first_not_of(" \t\n\r");
+    const auto last = hlslDecl.find_last_of(";\n\t\r");
+    if (first == eastl::string::npos)
+      hlslDecl.clear();
+    else
+      hlslDecl = hlslDecl.substr(first, last - first);
+  }
+
+  const auto allocSlot = [&](HlslRegisterSpace space) {
+    auto [var, _] = layout.addVar(rbVarId, {.varName = hlslName,
+                                             .globVarId = globVarId,
+                                             .varType = vt,
+                                             .svType = static_cast<ShaderVarType>(valType),
+                                             .space = space,
+                                             .hlslDecl = hlslDecl});
+    if (!var.slot[stage].has_value())
+    {
+      auto [cache, isNewCache] = rbNameIdToReg.emplace(rbVarId, shc::RefinedBlockRegister{});
+      G_UNUSED(isNewCache);
+      G_ASSERT(isNewCache || cache->second.space == space);
+
+      cache->second.space = space;
+      if (!cache->second.slot[stage].has_value())
+        cache->second.slot[stage] = allocator.allocSlot(stage, space);
+
+      var.slot[stage] = cache->second.slot[stage];
+    }
+    return var;
+  };
+
+  const bool allocateBindlessId = shc::config().enableBindless && hlslDecl.empty() && vt != semantic::VariableType::cmpSampler;
+
+  if (isNumeric || ((isTexOrBuf || isSampler) && allocateBindlessId))
+  {
+    auto [var, isNewVar] = layout.addVar(rbVarId, {.varName = hlslName,
+                                                    .globVarId = globVarId,
+                                                    .varType = vt,
+                                                    .svType = static_cast<ShaderVarType>(valType),
+                                                    .hlslDecl = hlslDecl});
+    if (isNewVar)
+    {
+      auto [cache, isNewCache] = rbNameIdToReg.emplace(rbVarId, shc::RefinedBlockRegister{});
+      if (isNewCache)
+      {
+        const int slotCount = isNumeric ? semantic::vt_float_size(vt) : 1;
+        const int offset = int(allocator.allocCbufSlot(slotCount));
+        cache->second.cbufOffsetAndCount = eastl::make_pair(offset, slotCount);
+      }
+      G_ASSERT(cache->second.cbufOffsetAndCount.has_value());
+      var.cbufOffset = cache->second.cbufOffsetAndCount.value().first;
+    }
+  }
+  else if (isTexOrBuf || isTlas)
+    allocSlot(HlslRegisterSpace::HLSL_RSPACE_T);
+  else if (isCbuf)
+    allocSlot(HlslRegisterSpace::HLSL_RSPACE_B);
+  else if (isSampler)
+    allocSlot(HlslRegisterSpace::HLSL_RSPACE_S);
+  else if (isUav)
+    allocSlot(HlslRegisterSpace::HLSL_RSPACE_U);
+}
+
+void AssembleShaderEvalCB::processRefinedBlockVars()
+{
+  if (refinedBlockStats.empty())
+    return;
+
+  for (auto &[stat, stage] : refinedBlockStats)
+    eval_refined_block_var(*stat, stage);
+}
+
 void AssembleShaderEvalCB::eval_external_block(external_state_block &state_block)
 {
   auto stageMaybe = semantic::parse_state_block_stage(state_block.scope->text);
@@ -911,7 +875,6 @@ void AssembleShaderEvalCB::eval_external_block(external_state_block &state_block
     addBlockType(state_block.scope->text, state_block.scope);
 
   ShaderStage stage = *stageMaybe;
-  ctx.cppStcode().cppStcode.reportStageUsage(stage);
 
   auto eval_if_stat = [this, stage](state_block_if_stat &s, auto &&eval_if_stat) -> void {
     G_ASSERT(s.expr);
@@ -951,6 +914,15 @@ void AssembleShaderEvalCB::eval_external_block(external_state_block &state_block
 
 void AssembleShaderEvalCB::eval_external_block_stat(state_block_stat &s, ShaderStage stage)
 {
+  if (s.var && s.var->var->refined_tag && shc::config().compileRefinedBlock)
+  {
+    refinedBlockStats.emplace_back(&s, stage);
+    return;
+  }
+
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
+
   semantic::VariableType vt = semantic::parse_named_const_type(s);
   if (vt == semantic::VariableType::Unknown)
   {
@@ -961,319 +933,19 @@ void AssembleShaderEvalCB::eval_external_block_stat(state_block_stat &s, ShaderS
   PreshaderStat stat{&s, stage, vt};
 
   if (s.reg || s.reg_arr)
-    preshaderHardcodedStats.emplace_back(stat);
+    preshaderSource.hardcodedStats.emplace_back(stat);
   else if (semantic::vt_is_numeric(vt))
-    preshaderScalarStats.emplace_back(stat);
+    preshaderSource.scalarStats.emplace_back(stat);
   else if (semantic::vt_is_static_texture(vt))
-    preshaderStaticTextureStats.emplace_back(stat);
+    preshaderSource.staticTextureStats.emplace_back(stat);
   else
-    preshaderDynamicResourceStats.emplace_back(stat);
-}
-
-void AssembleShaderEvalCB::process_external_block_stat(const PreshaderStat &stat)
-{
-  using semantic::VariableType;
-
-  auto &[st, stage, vt] = stat;
-
-  G_ASSERT(st->var || st->arr || st->reg || st->reg_arr);
-
-  if (shc::config().cppStcodeMode == shader_layout::ExternalStcodeMode::BRANCHED_CPP)
-    usedPreshaderStatements.push_back(uintptr_t(st));
-
-  G_ASSERT(st->var || st->arr || st->reg || st->reg_arr);
-  if (!st->var || st->var->val->builtin_var)
-    return compile_external_block_stat(stat);
-
-  // clang-format off
-  switch (vt)
-  {
-    case VariableType::f1:
-    case VariableType::f2:
-    case VariableType::f3:
-    case VariableType::i1:
-    case VariableType::i2:
-    case VariableType::i3:
-    case VariableType::u1:
-    case VariableType::u2:
-    case VariableType::u3:
-      break;
-    default:
-      return compile_external_block_stat(stat);
-  }
-  // clang-format on
-
-  auto exprIsDynamic = [&, this]() {
-    if (!st->var->val->expr)
-      return true;
-
-    ComplexExpression colorExpr(st->var->val->expr, shexpr::VT_COLOR4);
-
-    if (!exprParser.parseExpression(*st->var->val->expr, &colorExpr,
-          ExpressionParser::Context{shexpr::VT_COLOR4, vt_is_integer(vt), st->var->var->name}))
-    {
-      return false;
-    }
-
-    if (Symbol *s = colorExpr.hasDynamicAndMaterialTermsAt())
-    {
-      hasDynStcodeRelyingOnMaterialParams = true;
-      exprWithDynamicAndMaterialTerms = s;
-    }
-
-    if (!colorExpr.collapseNumbers(parser))
-      return false;
-
-    Color4 v;
-    if (colorExpr.evaluate(v, parser))
-      return false;
-
-    return colorExpr.isDynamic();
-  };
-
-  if (ctx.shCtx().blockLevel() != ShaderBlockLevel::GLOBAL_CONST && exprIsDynamic())
-    varMerger.addConstStat(*st, stage);
-  else
-    varMerger.addBufferedStat(*st, stage);
-}
-
-void AssembleShaderEvalCB::compile_external_block_stat(const PreshaderStat &stat)
-{
-  RegionMemAlloc rm_alloc(4 << 20, 4 << 20);
-
-  const auto parsedDefMaybe = semantic::parse_named_const_definition(*stat.stat, stat.stage, stat.vt, ctx, &rm_alloc);
-  if (!parsedDefMaybe)
-    return;
-
-  const semantic::NamedConstDefInfo &def = *parsedDefMaybe;
-
-  if (def.isBindless)
-    code.vars[def.bindlessVarId].texType = def.shvarTexType;
-
-  hasDynStcodeRelyingOnMaterialParams |= def.hasDynStcodeRelyingOnMaterialParams;
-  if (def.exprWithDynamicAndMaterialTerms)
-    exprWithDynamicAndMaterialTerms = def.exprWithDynamicAndMaterialTerms;
-
-  // Validate that the same shadervar has not been used both as a uav and an srv resource in the same pass
-  if (def.shvarType == SHVT_TEXTURE || def.shvarType == SHVT_BUFFER)
-  {
-    const bool isRw = def.type == semantic::VariableType::uav;
-    const auto setForVar = [this](bool isRw, bool isGlobal) -> decltype(uavGlobalShadervarRefs) & {
-      return isGlobal ? (isRw ? uavGlobalShadervarRefs : srvGlobalShadervarRefs)
-                      : (isRw ? uavLocalShadervarRefs : srvLocalShadervarRefs);
-    };
-
-    for (const auto &elem : def.initializer)
-    {
-      G_ASSERT(elem.isGlobalVar() || elem.isMaterialVar());
-      bool isGlobal = elem.isGlobalVar();
-      const char *varName = elem.varName();
-
-      auto &set = setForVar(isRw, isGlobal);
-      const auto &conflictSet = setForVar(!isRw, isGlobal);
-
-      if (auto it = conflictSet.find(varName); it != conflictSet.end())
-      {
-        const auto strForUsage = [](bool isRw) { return isRw ? "UAV" : "SRV"; };
-        report_error(parser, stat.stat, "The same %s shadervar is used as a %s, while being previously used as a %s at %s(%d, %d)",
-          isGlobal ? "global" : "material", strForUsage(isRw), strForUsage(!isRw),
-          parser.get_lexer().get_filename(it->second->file_start), it->second->line_start, it->second->col_start);
-      }
-
-      set.emplace(varName, stat.stat);
-    }
-  }
-
-  {
-    Terminal *const var = def.varTerm;
-    const int hardcoded_reg = def.hardcodedRegister;
-    const int registers_count = def.registerSize;
-    const ShaderStage stage = def.stage;
-    const String &varName = def.mangledName;
-    const HlslRegisterSpace reg_space = def.regSpace;
-
-    const auto hnd = shConst.addConst(stage, varName, reg_space, registers_count, hardcoded_reg, def.isDynamic,
-      ctx.shCtx().blockLevel() == ShaderBlockLevel::GLOBAL_CONST);
-    if (!is_valid(hnd))
-    {
-      // @TODO: implement correct expression comparison to not allow silent redecls
-      if (!hnd.isBufConst)
-      {
-        report_error(parser, var, "Redeclaration for variable <%s> in external block is not allowed", varName.c_str());
-      }
-      else
-      {
-        report_debug_message(parser, *var,
-          "Redeclaration for variable <%s> for %s is skipped. If it's declaration differs from previous, this is UB.", varName.c_str(),
-          def.isDynamic ? "global const block" : "static cbuf");
-      }
-      return;
-    }
-
-    const int reg = shConst.getSlot(hnd).regIndex;
-
-    auto builtHlslMaybe = assembly::build_hlsl_decl_for_named_const(def, ctx, reg, varMerger);
-    if (!builtHlslMaybe)
-      return;
-
-    assembly::NamedConstDeclarationHlsl &builtHlsl = *builtHlslMaybe;
-
-    ctx.namedConstTable().addHlslDecl(hnd, eastl::move(builtHlsl.definition), eastl::move(builtHlsl.postfix));
-
-    if (!assembly::build_stcode_for_named_const<assembly::StcodeBuildFlagsBits::ALL>(def, reg, ctx, &rm_alloc))
-      return;
-
-    stcode_vars.push_back(var);
-  }
-
-  if (def.pairSamplerTmpDecl)
-  {
-    G_ASSERT(ctx.shCtx().blockLevel() != ShaderBlockLevel::GLOBAL_CONST);
-
-    const String samplerConstName{0, "%s%s", def.mangledName.c_str(), def.pairSamplerBindSuffix};
-    const auto hnd = shConst.addConst(def.stage, samplerConstName, HLSL_RSPACE_S, 1, def.hardcodedRegister, def.isDynamic, false);
-    if (!is_valid(hnd))
-    {
-      report_error(parser, def.varTerm, "Redeclaration for variable <%s> with implicit pair sampler is not allowed",
-        def.mangledName.c_str());
-      return;
-    }
-
-    const int reg = shConst.getSlot(hnd).regIndex;
-    String hlsl = assembly::build_hlsl_for_pair_sampler(def.mangledName.c_str(), def.pairSamplerIsShadow, reg, ctx);
-    shConst.addHlslDecl(hnd, eastl::move(hlsl), {});
-
-    if (def.isDynamic && def.hardcodedRegister == -1)
-    {
-      if (def.pairSamplerIsGlobal)
-        ctx.tgtCtx().samplers().add(*def.pairSamplerTmpDecl, parser);
-      else
-        add_dynamic_sampler_for_stcode(code, sclass, *def.pairSamplerTmpDecl, parser, ctx.tgtCtx().varNameMap());
-
-      auto [samplerVarId, varType, isGlobal] = semantic::lookup_state_var(*def.pairSamplerTmpDecl->name, ctx);
-      G_ASSERT(isGlobal == def.pairSamplerIsGlobal);
-      G_ASSERT(varType == SHVT_SAMPLER);
-
-      assembly::build_stcode_for_pair_sampler<assembly::StcodeBuildFlagsBits::ALL>(samplerConstName.c_str(),
-        def.pairSamplerName.c_str(), reg, def.stage, samplerVarId, def.pairSamplerIsGlobal, ctx);
-    }
-  }
-}
-
-
-void AssembleShaderEvalCB::eval_supports(supports_stat &s)
-{
-  for (int i = 0; i < s.name.size(); i++)
-  {
-    if (s.name[i]->num != SHADER_TOKENS::SHTOK_none)
-    {
-      using namespace std::string_view_literals;
-      if (s.name[i]->text == "__static_cbuf"sv)
-      {
-        reserveSpecialCbufferAt(HlslSlotSemantic::RESERVED_FOR_MATERIAL_PARAMS_CBUF, MATERIAL_PARAMS_CONST_BUF_REGISTER);
-        continue;
-      }
-      if (s.name[i]->text == "__static_multidraw_cbuf"sv)
-      {
-        // Currently we support multidraw constbuffers only for bindless material version.
-        reserveSpecialCbufferAt(HlslSlotSemantic::RESERVED_FOR_MATERIAL_PARAMS_CBUF, MATERIAL_PARAMS_CONST_BUF_REGISTER);
-        shConst.multidrawCbuf = true;
-        continue;
-      }
-      if (s.name[i]->text == "__draw_id"sv)
-      {
-        continue;
-      }
-    }
-    ShaderStateBlock *b = (s.name[i]->num == SHADER_TOKENS::SHTOK_none) ? ctx.tgtCtx().blocks().emptyBlock()
-                                                                        : ctx.tgtCtx().blocks().findBlock(s.name[i]->text);
-    if (!b)
-    {
-      report_error(parser, s.name[i], "can't support undefined block <%s>", s.name[i]->text);
-      continue;
-    }
-
-    bool found = (b == shConst.globConstBlk);
-    for (int j = 0; j < shConst.suppBlk.size(); j++)
-      if (shConst.suppBlk[j] == b)
-      {
-        found = true;
-        break;
-      }
-    if (found)
-    {
-      report_error(parser, s.name[i], "double support for block <%s>", s.name[i]->text);
-      continue;
-    }
-
-    if (b->layerLevel < ShaderBlockLevel::SHADER && !b->canBeSupportedBy(ctx.shCtx().blockLevel()))
-    {
-      report_error(parser, s.name[i], "block <%s>, layer %d, cannot be supported here", s.name[i]->text, int(b->layerLevel));
-      continue;
-    }
-
-    if (b->shConst.multidrawCbuf)
-      shConst.multidrawCbuf = true;
-
-    if (b->layerLevel == ShaderBlockLevel::GLOBAL_CONST)
-      shConst.globConstBlk = b;
-    else
-    {
-      for_each_hlsl_reg_space([this, b](HlslRegisterSpace space) {
-        auto vr = shConst.vertexRegAllocators[space].reserveAllFrom(b->shConst.vertexRegAllocators[space]);
-        auto pcr = shConst.pixelOrComputeRegAllocators[space].reserveAllFrom(b->shConst.pixelOrComputeRegAllocators[space]);
-
-        auto reportFailure = [this, b, space](ShaderStage stage) {
-          auto propsField = stage == STAGE_VS ? &NamedConstBlock::vertexProps : &NamedConstBlock::pixelProps;
-          auto regAllocsField =
-            stage == STAGE_VS ? &NamedConstBlock::vertexRegAllocators : &NamedConstBlock::pixelOrComputeRegAllocators;
-          auto errorMsg = string_f("Supported blk registers overlap at space %c for %s shader\n", HLSL_RSPACE_ALL_SYMBOLS[space],
-            SHADER_STAGE_NAMES[stage]);
-          errorMsg.append_sprintf("Trying to support block %s. ", b->name.c_str());
-          errorMsg += get_reg_alloc_dump((b->shConst.*regAllocsField)[stage], space, b->shConst.makeInfoProvider(propsField, space));
-
-          errorMsg.append("\nConflicting blocks:\n");
-          eastl::vector_set<const ShaderStateBlock *> conflictingBlocks{};
-          auto collectBlocks = [&](const NamedConstBlock &consts, auto &&self) -> void {
-            auto processOneBlock = [&](const auto *blk) {
-              auto regalloc = (blk->shConst.*regAllocsField)[space]; // Copy out to simulate collision
-              if (auto allocRes = regalloc.reserveAllFrom((b->shConst.*regAllocsField)[space]); !allocRes)
-              {
-                conflictingBlocks.insert(blk);
-                errorMsg.append_sprintf("%s, ", blk->name.c_str());
-                errorMsg +=
-                  get_reg_alloc_dump((blk->shConst.*regAllocsField)[stage], space, blk->shConst.makeInfoProvider(propsField, space));
-              }
-            };
-            for (const auto &blk : consts.suppBlk)
-            {
-              if (conflictingBlocks.find(blk.get()) != conflictingBlocks.end())
-                continue;
-              self(blk->shConst, self);
-              processOneBlock(blk.get());
-            }
-            if (consts.globConstBlk && conflictingBlocks.find(consts.globConstBlk) == conflictingBlocks.end())
-            {
-              self(consts.globConstBlk->shConst, self);
-              processOneBlock(consts.globConstBlk);
-            }
-          };
-
-          collectBlocks(shConst, collectBlocks);
-        };
-
-        if (!vr)
-          reportFailure(STAGE_VS);
-        if (!pcr)
-          reportFailure(isCompute() ? STAGE_CS : STAGE_PS);
-      });
-      shConst.suppBlk.push_back(b);
-    }
-  }
+    preshaderSource.dynamicResourceStats.emplace_back(stat);
 }
 
 void AssembleShaderEvalCB::eval_render_stage(render_stage_stat &s)
 {
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
   String stage_nm;
   if (s.name_s)
     stage_nm.printf(0, "%.*s", strlen(s.name_s->text) - 2, s.name_s->text + 1);
@@ -1295,8 +967,29 @@ void AssembleShaderEvalCB::eval_render_stage(render_stage_stat &s)
       renderStageToIdxMap.getName(code.renderStageIdx), idx, renderStageToIdxMap.getName(idx));
   }
 }
+void AssembleShaderEvalCB::eval_raytrace_pipeline(raytrace_pipeline_stat &s)
+{
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
+
+  rtPipelineConfigDeclared = true;
+
+  if (s.max_recursion)
+  {
+    if (eastl::exchange(rtPipelineMaxRecursionSet, true))
+      report_error(parser, s.max_recursion, "max_recursion specified more than once");
+    rtPipelineMaxRecursion = atoi(s.recursion_value->text);
+  }
+  else if (s.allow_opacity_micromaps)
+  {
+    if (eastl::exchange(rtPipelineAllowOmm, true))
+      report_error(parser, s.allow_opacity_micromaps, "allow_opacity_micromaps specified more than once");
+  }
+}
 void AssembleShaderEvalCB::eval_command(shader_directive &s)
 {
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
   switch (s.command->num)
   {
     case SHADER_TOKENS::SHTOK_no_ablend: curpass->force_noablend = true; return;
@@ -1327,167 +1020,7 @@ void AssembleShaderEvalCB::eval_command(shader_directive &s)
   }
 }
 
-// clang-format off
-// clang-format linearizes this function
-void AssembleShaderEvalCB::eval_error_stat(error_stat &s)
-{
-  report_error(parser, s.message, s.message->text);
-}
-// clang-format on
-
-void AssembleShaderEvalCB::compilePreshader()
-{
-  G_ASSERT(stBytecodeAccum.stcode.empty());
-  G_ASSERT(stBytecodeAccum.stblkcode.empty());
-  G_ASSERT(!stCppcodeAccum.cppStcode.hasCode());
-  G_ASSERT(!stCppcodeAccum.cppStblkcode.hasCode());
-
-  // Push header for static stcode straight away to avoid push-front copies
-  // Format:
-  // 1: SHCOD_STATIC_MULTIDRAW_BLOCK/SHCOD_STATIC_BLOCK, #consts
-  // 2: if not bindless: vsTexBase [8], vsSamplerBase [4], vsTexCount [4], psTexBase [8], psSamplerBase [4], psTexCount [4]
-  //    else: 0, 0, 0, 0
-  const bool needsStblkcodeHeader = ctx.shCtx().blockLevel() == ShaderBlockLevel::SHADER && !isCompute();
-  if (needsStblkcodeHeader)
-  {
-    stBytecodeAccum.push_stblkcode(shaderopcode::makeOp1(0, 0));
-    stBytecodeAccum.push_stblkcode(shaderopcode::makeData4(0, 0, 0, 0));
-  }
-
-  // Then, process hardcoded preshader stats (to be able to allocate around them)
-  for (auto &s : preshaderHardcodedStats)
-    compile_external_block_stat(s);
-
-  // Then, process all numeric stats. By doing them first, we can infer whether special constbuffers are actually required, thus
-  // obtaining all the info needed to allocate other cbuffer registers.
-  for (auto &s : preshaderScalarStats)
-  {
-    eastl::visit(
-      [this](auto &&s) {
-        if constexpr (eastl::is_same_v<eastl::remove_reference_t<decltype(s)>, PreshaderStat>)
-          process_external_block_stat(s);
-        else
-          process_shader_locdecl(*s);
-      },
-      s);
-  }
-
-  varMerger.mergeAllVars(this);
-
-  // Then, if bindless is used, we just compile the stats for static textures, as they are going to emit uint2 elements to the material
-  // cbuf. @TODO: introduce packing with other material consts.
-  if (needsStblkcodeHeader)
-  {
-    // @TODO: validate that compute stuff does NOT need an stblkcode header
-    if (shc::config().enableBindless)
-    {
-      for (auto &s : preshaderStaticTextureStats)
-        process_external_block_stat(s);
-    }
-    // Otherwise, we need to procure a contiguous range in the t space for slot textures and a range in the s space for samplers
-    else
-    {
-      static_assert(STAGE_PS < STAGE_VS && STAGE_CS < STAGE_VS);
-
-      fast_sort(preshaderStaticTextureStats, [](const PreshaderStat &s1, const PreshaderStat &s2) { return s1.stage < s2.stage; });
-      auto pivot = eastl::find_if(preshaderStaticTextureStats.begin(), preshaderStaticTextureStats.end(),
-        [](const PreshaderStat &s) { return s.stage == STAGE_VS; });
-      dag::Span<PreshaderStat> psTexStats{preshaderStaticTextureStats.begin(), pivot - preshaderStaticTextureStats.begin()},
-        vsTexStats{pivot, preshaderStaticTextureStats.end() - pivot};
-
-      const uint32_t vsRangeExtent = uint32_t{vsTexStats.size()};
-      const uint32_t psRangeExtent = uint32_t{psTexStats.size()};
-      G_ASSERT(vsRangeExtent < (1 << 4));
-      G_ASSERT(psRangeExtent < (1 << 4));
-
-      if (!shConst.initSlotTextureSuballocators(vsRangeExtent, psRangeExtent))
-      {
-        sh_debug(SHLOG_ERROR, "Failed to allocate %d vs static texture range and %d ps static texture range", vsRangeExtent,
-          psRangeExtent);
-        return;
-      }
-
-      for (auto &s : preshaderStaticTextureStats)
-        compile_external_block_stat(s);
-
-      auto [vsTexRangeBase, _1] = shConst.slotTextureSuballocators.vsTex.getRange();
-      auto [psTexRangeBase, _2] = shConst.slotTextureSuballocators.psTex.getRange();
-      auto [vsSamplerRangeBase, _3] = shConst.slotTextureSuballocators.vsSamplers.getRange();
-      auto [psSamplerRangeBase, _4] = shConst.slotTextureSuballocators.psSamplers.getRange();
-
-      uint8_t vsSamplerBaseAndExtentPacked = (uint8_t(vsSamplerRangeBase << 4)) | (uint8_t(vsRangeExtent & 0xF));
-      uint8_t psSamplerBaseAndExtentPacked = (uint8_t(psSamplerRangeBase << 4)) | (uint8_t(psRangeExtent & 0xF));
-      stBytecodeAccum.stblkcode[1] =
-        shaderopcode::makeData4(vsTexRangeBase, vsSamplerBaseAndExtentPacked, psTexRangeBase, psSamplerBaseAndExtentPacked);
-
-      if (curpass)
-      {
-        curpass->vsTexSmpRange = SlotTexturesRangeInfo{uint8_t(vsTexRangeBase), uint8_t(vsSamplerRangeBase), uint8_t(vsRangeExtent)};
-        curpass->psTexSmpRange = SlotTexturesRangeInfo{uint8_t(psTexRangeBase), uint8_t(psSamplerRangeBase), uint8_t(psRangeExtent)};
-      }
-    }
-
-    auto [constBase, constCap] = shConst.bufferedConstsRegAllocator.getRange();
-    if (constBase > 0)
-    {
-      sh_debug(SHLOG_ERROR, "Invalid allocation of material cbuf registers: range is [%d, %d), but it must begin at 0", constBase,
-        constCap);
-      return;
-    }
-    const auto signOpcod = shConst.multidrawCbuf ? SHCOD_STATIC_MULTIDRAW_BLOCK : SHCOD_STATIC_BLOCK;
-    stBytecodeAccum.stblkcode[0] = shaderopcode::makeOp1(signOpcod, constCap);
-
-    if (shConst.multidrawCbuf)
-      ctx.cppStcode().cppStblkcode.reportMutlidrawSupport();
-  }
-
-  // Now, based on gathered consts we reserve slots for cbuf-s that will hold them
-
-  // Concervatively reserve 0 for implicit cbuf (as it may be used via hlsl-hardcoded regs)
-  // @TODO: try and collect hardcoded regs from parsed code blocks to factor them into the allocators
-  if (ctx.shCtx().blockLevel() != ShaderBlockLevel::GLOBAL_CONST)
-    reserveSpecialCbufferAt(HlslSlotSemantic::RESERVED_FOR_IMPLICIT_CONST_CBUF, 0);
-
-  // Then, reserve material const buf if we have static consts (or remove reservation if we don't)
-  if (ctx.shCtx().blockLevel() == ShaderBlockLevel::SHADER) // static cbuf is only used by shaders, not blocks
-  {
-    if (shConst.bufferedConstsRegAllocator.hasRegs())
-    {
-      G_ASSERT(!isCompute());
-      reserveSpecialCbufferAt(HlslSlotSemantic::RESERVED_FOR_MATERIAL_PARAMS_CBUF, MATERIAL_PARAMS_CONST_BUF_REGISTER);
-    }
-    else
-    {
-      // If there are no regs to fill, but support blocks declared supp __static_cbuf, we unreserve
-      G_VERIFY(shConst.vertexRegAllocators[HLSL_RSPACE_B].unreserveIfUsed(HlslSlotSemantic::RESERVED_FOR_MATERIAL_PARAMS_CBUF,
-        MATERIAL_PARAMS_CONST_BUF_REGISTER));
-      G_VERIFY(shConst.pixelOrComputeRegAllocators[HLSL_RSPACE_B].unreserveIfUsed(HlslSlotSemantic::RESERVED_FOR_MATERIAL_PARAMS_CBUF,
-        MATERIAL_PARAMS_CONST_BUF_REGISTER));
-    }
-  }
-
-  // Reserve special global consts block slot if such a block was declared
-  // @TODO: find out the reason why just checking supp blks is not enough (this was how it was done before too)
-  if (ctx.tgtCtx().blocks().countBlock(ShaderBlockLevel::GLOBAL_CONST) > 0)
-    reserveSpecialCbufferAt(HlslSlotSemantic::RESERVED_FOR_GLOBAL_CONST_CBUF, GLOBAL_CONST_BUF_REGISTER);
-
-  // Finally, reservations are completed, and we process automatic preshaders decls for dynamic resources
-  // @TODO: use the fact that we know these to be dynamic and don't recalculate
-  for (auto &s : preshaderDynamicResourceStats)
-    process_external_block_stat(s);
-
-  // After assebmling everything, do validations on the code that has been assembled
-  validateDynamicConstsForMultidraw();
-
-  if (curpass)
-  {
-    curpass->psOrCsConstRange = shConst.pixelOrComputeRegAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
-    curpass->vsConstRange = shConst.vertexRegAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
-    curpass->bufferedConstRange = shConst.bufferedConstsRegAllocator.getRange(HlslSlotSemantic::ALLOCATED);
-  }
-}
-
-void AssembleShaderEvalCB::end_pass()
+bool AssembleShaderEvalCB::end_pass()
 {
   Terminal *terminal = ctx.shCtx().declTerm();
 
@@ -1581,12 +1114,7 @@ void AssembleShaderEvalCB::end_pass()
     p.z_test = 1;
 
   p.z_bias = true;
-
-  if (!p.slope_z_bias)
-  {
-    p.slope_z_bias = true;
-    stBytecodeAccum.push_stblkcode(shaderopcode::makeOp2_8_16(SHCOD_IMM_REAL1, int(stBytecodeAccum.regAllocator->add_reg()), 0));
-  }
+  p.slope_z_bias = true;
 
   bool accept = false;
   if (!dont_render)
@@ -1602,10 +1130,9 @@ void AssembleShaderEvalCB::end_pass()
   const char *shname = ctx.shCtx().name();
   if (accept)
   {
-    curvariant->suppBlk.resize(shConst.suppBlk.size());
-    for (size_t i = 0; i < shConst.suppBlk.size(); i++)
-      curvariant->suppBlk[i] = shConst.suppBlk[i];
-
+    curvariant->suppBlk.resize(curpass->preshader->namedConstTable.suppBlk.size());
+    for (const auto &[i, blk] : enumerate(curpass->preshader->namedConstTable.suppBlk))
+      curvariant->suppBlk[i] = blk;
 
     if (isCompute())
     {
@@ -1654,12 +1181,13 @@ void AssembleShaderEvalCB::end_pass()
 
     if (!isCompute())
     {
-      if (!curpass->fsh.data() && hlsls.fields.ps.hasCompilation())
+      // curpass->getCidx would have id if we're compiling in thread
+      if (curpass->fsh.empty() && !curpass->getCidx(HLSL_PS).has_value() && hlsls.fields.ps.hasCompilation())
       {
         report_error(parser, terminal, "%s: missing pixel shader", shname);
         accept = false;
       }
-      if (!curpass->vpr.data())
+      if (curpass->vpr.empty() && !curpass->getCidx(HLSL_VS).has_value() && !curpass->getCidx(HLSL_MS).has_value())
       {
         report_error(parser, terminal, "%s: missing vertex shader", shname);
         accept = false;
@@ -1674,73 +1202,125 @@ void AssembleShaderEvalCB::end_pass()
   }
 
 end:
-  if (accept)
-  {
-    assembly::build_cpp_declarations_for_used_local_vars(ctx);
-    auto &cache = ctx.tgtCtx().stcodeCache();
-    auto cacheRefs = cache.findOrPost(eastl::move(ctx.stBytecode()));
-    curpass->stcode = cacheRefs.stcode;
-    curpass->stblkcode = cacheRefs.stblkcode;
-    curpass->cppstcode = eastl::move(ctx.cppStcode());
-    if (shc::config().cppStcodeMode == shader_layout::ExternalStcodeMode::BRANCHED_CPP)
-    {
-      curpass->constPackedVarsMaps = eastl::move(varMerger.constVarsMaps);
-      curpass->bufferedPackedVarsMap = eastl::move(varMerger.bufferedVarsMap);
-      curpass->usedConstStatAstNodes = eastl::move(usedPreshaderStatements);
-      curpass->boolAstNodesEvaluationResults = eastl::move(boolElementsEvaluationResults);
-    }
-  }
-  if (accept && no_dynstcode && curpass->stcode.size())
-  {
-    report_error(parser, no_dynstcode, "%s: has dynstcode, while it was required to have none with no_dynstcode:", shname);
-    for (Terminal *var : stcode_vars)
-      report_error(parser, var, "'%s'", var->text);
-    debug("\n******* State code shader --s--");
-    ShUtils::shcod_dump(curpass->stcode, nullptr); // todo: we need variable names!
-  }
-  curpass = nullptr;
-}
-
-bool AssembleShaderEvalCB::validateDynamicConstsForMultidraw()
-{
-  if (!shConst.multidrawCbuf)
-    return true;
-
-  if (hasDynStcodeRelyingOnMaterialParams)
-  {
-    report_error(parser, exprWithDynamicAndMaterialTerms,
-      "Encountered both static and dynamic operands in an stcode expression!\n\n"
-      "  With bindless enabled this can break multidraw, as dynstcode is run once per combined draw call.\n"
-      "  Consider splitting the expression into separate parts.");
-    return false;
-  }
-
-  return true;
+  return accept;
 }
 
 void AssembleShaderEvalCB::end_eval(shader_decl &sh)
 {
-  compilePreshader();
-  code.regsize = ctx.stBytecode().regAllocator->requiredRegCount();
+  processRefinedBlockVars();
 
-  hlsls.forEach([this](HlslCompile &comp) { evalHlslCompileClass(&comp); });
-  end_pass();
-}
-
-
-void AssembleShaderEvalCB::process_shader_locdecl(local_var_decl &s)
-{
-  auto parseResMaybe = semantic::parse_local_var_decl(s, ctx);
-  if (!parseResMaybe)
+  if (ctx.tgtCtx().isPreshaderOnly())
     return;
 
-  if (!parseResMaybe->var->isConst)
-    assembly::assemble_local_var<assembly::StcodeBuildFlagsBits::ALL>(parseResMaybe->var, parseResMaybe->expr.get(), s.name, ctx);
-}
+  static_assert(STAGE_PS < STAGE_VS && STAGE_CS < STAGE_VS);
 
+  preshaderSource.isCompute = isCompute();
+
+  // First goes all PS stats, then all VS stats
+  // Within the stage, all textures with samplers go first, then without samplers
+  fast_sort(preshaderSource.staticTextureStats, [](const PreshaderStat &s1, const PreshaderStat &s2) {
+    if (s1.stage != s2.stage)
+      return s1.stage < s2.stage;
+    const bool s1NeedSampler = semantic::vt_is_static_sampled_texture(s1.vt);
+    const bool s2NeedSampler = semantic::vt_is_static_sampled_texture(s2.vt);
+    return s1NeedSampler > s2NeedSampler;
+  });
+
+  if (ctx.shCtx().isDebugModeEnabled())
+  {
+    Tab<uint32_t> stages = {STAGE_VS, STAGE_PS};
+    if (isCompute())
+      stages = {STAGE_CS};
+    // else if (hlsls.fields.vs.symbol == nullptr) // mesh shader
+    //   stages = {STAGE_VS+1, STAGE_VS+2, STAGE_PS};
+    for (auto stage : stages)
+      eval_external_block(*ctx.shCtx().debugBlock(stage));
+  }
+
+  auto &preshaderCache = ctx.shCtx().preshaderCache();
+  CompiledPreshader *compiledPreshaderRef = preshaderCache.query(preshaderSource);
+  if (!compiledPreshaderRef)
+  {
+    if (auto preshaderCompilationOutputMaybe = compile_variant_preshader(preshaderSource, ctx))
+      compiledPreshaderRef = preshaderCache.post(eastl::move(preshaderSource), eastl::move(preshaderCompilationOutputMaybe->code));
+    else
+      return;
+  }
+  else
+  {
+    for (auto const &name : compiledPreshaderRef->dynamicSamplerImplicitVars)
+    {
+      sampler_decl smpDecl = {};
+      SHTOK_ident smpNameId = {};
+      smpNameId.text = name.c_str();
+      smpDecl.name = &smpNameId;
+      smpDecl.is_always_referenced = nullptr;
+      add_dynamic_sampler_for_stcode(code, sclass, smpDecl, parser, ctx.tgtCtx().varNameMap());
+    }
+    for (int vid : compiledPreshaderRef->usedMaterialVarIds)
+      code.vars[vid].used = true;
+  }
+
+  for (auto [i, shvt] : enumerate(compiledPreshaderRef->shadervarTexTypes))
+  {
+    if (shvt != SHVT_TEX_UNKNOWN)
+      ctx.parsedSemCode().vars[i].texType = shvt;
+  }
+
+  if (curpass)
+  {
+    curpass->preshader = compiledPreshaderRef;
+
+    auto const staticVsTexRange = compiledPreshaderRef->namedConstTable.slotTextureSuballocators.vsTex.getRange();
+    auto const staticPsTexRange = compiledPreshaderRef->namedConstTable.slotTextureSuballocators.psTex.getRange();
+    auto const staticVsSamplersRange = compiledPreshaderRef->namedConstTable.slotTextureSuballocators.vsSamplers.getRange();
+    auto const staticPsSamplersRange = compiledPreshaderRef->namedConstTable.slotTextureSuballocators.psSamplers.getRange();
+    // SlotTexturesRangeInfo stores base and count as uint8_t each, so cap itself may exceed a byte.
+    auto const fitsInSlotRangeInfo = [](HlslRegRange r) {
+      return r.min >= 0 && r.cap >= r.min && r.min <= UINT8_MAX && r.cap - r.min <= UINT8_MAX;
+    };
+    G_ASSERT(fitsInSlotRangeInfo(staticVsTexRange));
+    G_ASSERT(fitsInSlotRangeInfo(staticPsTexRange));
+    G_ASSERT(fitsInSlotRangeInfo(staticVsSamplersRange));
+    G_ASSERT(fitsInSlotRangeInfo(staticPsSamplersRange));
+    curpass->vsTexSmpRange = SlotTexturesRangeInfo{uint8_t(staticVsTexRange.min), uint8_t(staticVsSamplersRange.min),
+      uint8_t(staticVsTexRange.cap - staticVsTexRange.min), uint8_t(staticVsSamplersRange.cap - staticVsSamplersRange.min)};
+    curpass->psTexSmpRange = SlotTexturesRangeInfo{uint8_t(staticPsTexRange.min), uint8_t(staticPsSamplersRange.min),
+      uint8_t(staticPsTexRange.cap - staticPsTexRange.min), uint8_t(staticPsSamplersRange.cap - staticPsSamplersRange.min)};
+
+    curpass->psOrCsConstRange =
+      compiledPreshaderRef->namedConstTable.pixelOrComputeRegAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
+    curpass->vsConstRange =
+      compiledPreshaderRef->namedConstTable.vertexRegAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
+    curpass->bufferedConstRange =
+      compiledPreshaderRef->namedConstTable.bufferedConstsRegAllocator.getRange(HlslSlotSemantic::ALLOCATED);
+  }
+
+  code.regsize = compiledPreshaderRef->requiredRegCount;
+  hlsls.forEach([this](HlslCompile &comp) { evalHlslCompileClass(&comp); });
+
+  if (end_pass())
+  {
+    if (shc::config().cppStcodeMode == shader_layout::ExternalStcodeMode::BRANCHED_CPP)
+      curpass->boolAstNodesEvaluationResults = eastl::move(boolElementsEvaluationResults);
+    if (no_dynstcode && (compiledPreshaderRef->dynStBytecode.size() || compiledPreshaderRef->cppStcode.cppStcode.hasCode()))
+    {
+      report_error(parser, no_dynstcode,
+        "%s: has dynstcode, while it was required to have none with no_dynstcode:", ctx.shCtx().name());
+      for (Terminal *var : compiledPreshaderRef->stcodeVars)
+        report_error(parser, var, "'%s'", var->text);
+      debug("\n******* State code shader --s--");
+      ShUtils::shcod_dump(compiledPreshaderRef->dynStBytecode, nullptr);
+    }
+  }
+
+  curpass = nullptr;
+}
 
 void AssembleShaderEvalCB::eval_hlsl_compile(hlsl_compile_class &hlsl_compile)
 {
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
   semantic::HlslCompileClass compile = semantic::parse_hlsl_compilation_info(hlsl_compile, parser, ctx.tgtCtx().compCtx());
 
   HlslCompile &hlslXS = hlsls.all[compile.stage];
@@ -1776,7 +1356,7 @@ void AssembleShaderEvalCB::eval_hlsl_compile(hlsl_compile_class &hlsl_compile)
       case HLSL_AS: curpass->enableFp16.gsOrAs = compDirective->useHalfs; break;
     }
 
-#if !_CROSS_TARGET_C1 && !_CROSS_TARGET_C2 && !_CROSS_TARGET_DX11 && !_CROSS_TARGET_EMPTY
+#if !_CROSS_TARGET_C1 && !_CROSS_TARGET_C2 && !_CROSS_TARGET_DX12 && !_CROSS_TARGET_DX11 && !_CROSS_TARGET_EMPTY
     if (strcmp(compDirective->profile, "ps_3_0") == 0)
       curpass->ps30 = true;
     else if (strcmp(compDirective->profile, "vs_3_0") == 0)
@@ -1790,6 +1370,8 @@ void AssembleShaderEvalCB::eval_hlsl_compile(hlsl_compile_class &hlsl_compile)
 
 void AssembleShaderEvalCB::eval_hlsl_decl(hlsl_local_decl_class &sh)
 {
+  if (ctx.tgtCtx().isPreshaderOnly())
+    return;
   if (sh.ident)
     addBlockType(sh.ident->text, sh.ident);
 }
@@ -1866,30 +1448,12 @@ void AssembleShaderEvalCB::evalHlslCompileClass(HlslCompile *comp)
   }
 }
 
-void AssembleShaderEvalCB::reserveSpecialCbufferAt(HlslSlotSemantic cbuffer_sem, int reg)
-{
-  G_ASSERT(cbuffer_sem >= HlslSlotSemantic::RESERVED_FOR_IMPLICIT_CONST_CBUF);
-  auto vr = shConst.vertexRegAllocators[HLSL_RSPACE_B].reserve(cbuffer_sem, reg);
-  auto pcr = shConst.pixelOrComputeRegAllocators[HLSL_RSPACE_B].reserve(cbuffer_sem, reg);
-  if (!vr)
-  {
-    G_ASSERT(!vr.error().outOfRange);
-    report_reg_reserve_failed(nullptr, reg, 1, HLSL_RSPACE_B, cbuffer_sem, vr.error(), shConst.vertexRegAllocators[HLSL_RSPACE_B],
-      shConst.makeInfoProvider(&NamedConstBlock::vertexProps, HLSL_RSPACE_B));
-  }
-  if (!pcr)
-  {
-    G_ASSERT(!pcr.error().outOfRange);
-    report_reg_reserve_failed(nullptr, reg, 1, HLSL_RSPACE_B, cbuffer_sem, pcr.error(),
-      shConst.pixelOrComputeRegAllocators[HLSL_RSPACE_B], shConst.makeInfoProvider(&NamedConstBlock::pixelProps, HLSL_RSPACE_B));
-  }
-}
-
 class CompileShaderJob : public shc::Job
 {
 public:
   CompileShaderJob(AssembleShaderEvalCB *ascb, AssembleShaderEvalCB::HlslCompile &hlsl, HlslCompilationStage stage,
-    const hlsl_compile_class *compile_symbol, dag::ConstSpan<CodeSourceBlocks::Unconditional *> code_blocks, uint64_t variant_hash) :
+    const hlsl_compile_class *compile_symbol, CodeSourceBlocks &code_blocks,
+    dag::ConstSpan<CodeSourceBlocks::Unconditional *> preprocessed_blocks, uint64_t variant_hash) :
     ctx{ascb->ctx.shCtx()}, dynVariant{ascb->ctx.variant().dyn}, stage{stage}
   {
     G_ASSERT(is_valid(stage));
@@ -1905,8 +1469,9 @@ public:
     shaderName = ctx.name();
     cgArgs = shc::config().hlslNoDisassembly ? def_cg_args + 1 : def_cg_args;
 
-    CodeSourceBlocks &code = *getSourceBlocks(profile);
-    dag::ConstSpan<char> main_src = code.buildSourceCode(code_blocks);
+    memset(srcSha1, 0, sizeof(srcSha1));
+
+    dag::ConstSpan<char> main_src = code_blocks.buildSourceCode(preprocessed_blocks);
     source.setStr(main_src.data(), main_src.size());
 
     eastl::string src_predefines = assembly::build_hardware_defines_hlsl(profile.c_str(), enableFp16, ascb->ctx.tgtCtx().compCtx());
@@ -1921,8 +1486,8 @@ public:
 
 #endif
 
-    ascb->shConst.patchHlsl(source, HLSL_STAGE_TO_SHADER_STAGE[stage], ascb->varMerger, max_constants_no,
-      eastl::string_view{src_predefines}, curpass->dual_source_blending);
+    ascb->curpass->preshader->namedConstTable.patchHlsl(source, HLSL_STAGE_TO_SHADER_STAGE[stage], *ascb->curpass->preshader, *lexer,
+      implicitCbufRegCount, eastl::string_view{src_predefines}, curpass->dual_source_blending);
     int base = append_items(source, 16);
     memset(&source[base], 0, 16);
 
@@ -1930,6 +1495,10 @@ public:
       compileCtx = sh_get_compile_context();
 
     shader_variant_hash = variant_hash;
+
+    rtPipelineConfigDeclared = ascb->rtPipelineConfigDeclared;
+    rtPipelineAllowOmm = ascb->rtPipelineAllowOmm;
+    rtPipelineMaxRecursion = ascb->rtPipelineMaxRecursion;
   }
 
 protected:
@@ -1954,14 +1523,24 @@ protected:
   String compileCtx;
   const char **cgArgs;
   CompileResult compile_result;
-  int max_constants_no;
+  int implicitCbufRegCount;
   bool enableFp16;
 
   const char *shaderName;
   const SHTOK_string *hlsl_compile_token;
   Lexer *lexer;
 
+  unsigned char srcSha1[HASH_SIZE];
+
   uint64_t shader_variant_hash;
+
+  // RT pipeline config copied from the cb's max_recursion / allow_opacity_micromaps statements
+  // (DX12 RT libs only).
+  bool rtPipelineConfigDeclared = false;
+  bool rtPipelineAllowOmm = false;
+  int rtPipelineMaxRecursion = 1;
+
+  bool separateDebugInfoIsNeeded = false;
 };
 
 void AssembleShaderEvalCB::hlsl_compile(HlslCompilationStage stage)
@@ -1973,15 +1552,15 @@ void AssembleShaderEvalCB::hlsl_compile(HlslCompilationStage stage)
   G_ASSERT(hlsl.hasCompilation());
   semantic::HlslCompileDirective &compile = hlsl.compile.value();
 
-  CodeSourceBlocks *codeP = getSourceBlocks(compile.profile);
-  G_ASSERT(codeP && "ShaderParser::curXsCode must be non null here by design");
+  CodeSourceBlocks *codeP = ctx.shCtx().hlslCodeBlocks().validProfileSwitch(compile.profile);
+  G_ASSERTF(codeP, "ShaderParser::curXsCode must be non null here by design");
   CodeSourceBlocks &code = *codeP;
 
   ShaderBytecodeCache &cache = ctx.tgtCtx().bytecodeCache();
 
   dag::ConstSpan<CodeSourceBlocks::Unconditional *> code_blocks = code.getPreprocessedCode(*this);
   CryptoHash code_digest = code.getCodeDigest(code_blocks);
-  CryptoHash const_digest = shConst.getDigest(HLSL_STAGE_TO_SHADER_STAGE[stage], varMerger);
+  CryptoHash const_digest = curpass->preshader->namedConstTable.getDigest(HLSL_STAGE_TO_SHADER_STAGE[stage], *curpass->preshader);
 
   ShaderCompilerStat::hlslCompileCount++;
   auto [cacheIdx, entryIds] = cache.find(code_digest, const_digest, compile.entry, compile.profile);
@@ -2017,16 +1596,9 @@ void AssembleShaderEvalCB::hlsl_compile(HlslCompilationStage stage)
     if (variant.dyn)
       hash_variant_src(*variant.dyn, shader_variant_hash);
 
-    CompileShaderJob *job = new CompileShaderJob{this, hlsl, stage, hlsl.symbol, code_blocks, shader_variant_hash};
-    shc::add_job(job, shc::JobMgrChoiceStrategy::ROUND_ROBIN);
+    shc::add_job(new CompileShaderJob{this, hlsl, stage, hlsl.symbol, code, code_blocks, shader_variant_hash});
   }
 }
-
-#include "hashed_cache.h"
-#include <osApiWrappers/dag_direct.h>
-#include <osApiWrappers/dag_files.h>
-#include <debug/dag_logSys.h>
-#include "sha1_cache_version.h"
 
 // @TODO: refactor hlsl stage handling in compilation jobs/caching code, and move it to a separate module.
 
@@ -2140,32 +1712,99 @@ static void dump_hlsl_src(const char *compileCtx, const char *source, const east
   debug("=== compiling code:\n%s\n%s\n%s", compileCtx, source, status);
 }
 
+static void upgrade_sm(const shc::ShaderContext &ctx, char *sm, const char *new_sm, const char *reason)
+{
+  G_ASSERT(strlen(new_sm) == 3 && isdigit(new_sm[0]) && new_sm[1] == '.' && isdigit(new_sm[2]));
+
+  const uint32_t numberOffset = (0 == strncmp(sm, "lib", 3)) ? 4 : 3;
+
+  auto &major = sm[numberOffset + 0];
+  auto &minor = sm[numberOffset + 2];
+
+  const uint32_t smV = (uint32_t(major) << 8) | minor;
+  const uint32_t newV = (uint32_t(new_sm[0]) << 8) | new_sm[2];
+
+  if (smV < newV)
+  {
+    sh_debug(SHLOG_INFO, "Upgrading shader model from %s to %s for %s due to %s", sm, new_sm, ctx.name(), reason);
+    major = new_sm[0];
+    minor = new_sm[2];
+  }
+}
+
 void CompileShaderJob::doJobBody()
 {
   // @TODO: it should be const in fields!
   const shc::ShaderContext &sctx = ctx;
 
-  char sha1SrcPath[420];
-  sha1SrcPath[0] = 0;
-  unsigned char srcSha1[HASH_SIZE];
-
 #if _CROSS_TARGET_DX12
-  if (strstr(source, "SV_ViewID"))
+  const bool hasInlineRtPipelineConfig = find_string(source.data(), source.size(), "RaytracingPipelineConfig") != -1;
+  // The DSHL max_recursion / allow_opacity_micromaps statements are the sole pipeline-config authority.
+  // An inline HLSL RaytracingPipelineConfig next to them would be baked into DXIL but silently ignored
+  // by the driver, so reject the ambiguity instead of building something that does not match the source.
+  if (rtPipelineConfigDeclared && hasInlineRtPipelineConfig)
   {
-    if (profile[3] < '6')
-    {
-      profile[3] = '6';
-      profile[5] = '1';
-    }
-    else if (profile[3] == '6' && profile[5] == '0')
-    {
-      profile[5] = '1';
-    }
+    compile_result.errors.append_sprintf("shader declares a DSHL RT pipeline config (max_recursion / "
+                                         "allow_opacity_micromaps) and an inline HLSL RaytracingPipelineConfig; "
+                                         "remove the HLSL RaytracingPipelineConfig");
+    return;
   }
 #endif
 
+  char sha1SrcPath[420];
+  sha1SrcPath[0] = 0;
+
+#if _CROSS_TARGET_DX12 || _CROSS_TARGET_SPIRV || _CROSS_TARGET_METAL || (!_CROSS_TARGET_DX11 && !_CROSS_TARGET_EMPTY)
+#if _CROSS_TARGET_DX12
+  if (dx12::dxil::Platform::PC != shc::config().targetPlatform)
+  {
+    // All non PC (eg XB One and XB Series) support 6.6 and up, so upgrade to it, to use dynamic resources for bindless
+    upgrade_sm(sctx, profile, "6.6", "GDK Baseline profile 6.6");
+  }
+  else
+#endif
+  {
+    if (strstr(source, "SV_ViewID"))
+      upgrade_sm(sctx, profile, "6.1", "presence of SV_ViewID");
+
+    if (strstr(source, "SV_ShadingRate"))
+      upgrade_sm(sctx, profile, "6.4", "presence of SV_ShadingRate");
+  }
+#endif
+
+  static constexpr const char PRAGMA_PREFIX[] = "#pragma ";
+
+  bool full_debug = false;
+
+#if _CROSS_TARGET_DX12
+  // For phase one compilation we don't store the pdb. Unless it's CS, which does both phases in one go.
+  const bool separateDebugInfoIsNeededForPhase = !use_two_phase_compilation(shc::config().targetPlatform) || stage == HLSL_CS;
+  if (separateDebugInfoIsNeededForPhase)
+  {
+    // Prepass full-debug macro before sha1 cache check. We need this to know whether the shader needs separate debug info and it's
+    // missing (so we need to rerun compilation even if sha1 cache is fine)
+    for (const char *pragma = strstr(source, PRAGMA_PREFIX); pragma; pragma = strstr(pragma, PRAGMA_PREFIX))
+    {
+      pragma += LITSTR_LEN(PRAGMA_PREFIX);
+#define PRAGMA(b) (strncmp(pragma, b, strlen(b)) == 0)
+      if (PRAGMA("debugfull") || PRAGMA("dfull"))
+        full_debug = true;
+      else
+        continue;
+    }
+  }
+
+  separateDebugInfoIsNeeded = separateDebugInfoIsNeededForPhase && (shc::config().hlslDebugLevel != DebugLevel::NONE || full_debug);
+#endif
+
   const unsigned sourceLen = (unsigned)strlen(source);
+
+  // For DX12 we use the sha1 cache key as the name for the pdb file
+#if _CROSS_TARGET_DX12
+  if (shc::config().useSha1Cache || separateDebugInfoIsNeeded)
+#else
   if (shc::config().useSha1Cache)
+#endif
   {
     const bool enableBindlessVar = shc::config().enableBindless;
     const bool isDebugModeEnabledVar = sctx.isDebugModeEnabled();
@@ -2184,11 +1823,7 @@ void CompileShaderJob::doJobBody()
     HASH_UPDATE(&sha1, (const unsigned char *)&hlsl2021Var, (uint32_t)sizeof(hlsl2021Var));
     HASH_UPDATE(&sha1, (const unsigned char *)&enableFp16, (uint32_t)sizeof(enableFp16));
     HASH_UPDATE(&sha1, (const unsigned char *)&enableBindlessVar, (uint32_t)sizeof(enableBindlessVar));
-#if _CROSS_TARGET_SPIRV
-    auto mode =
-      shc::config().compilerDXC ? CompilerMode::DXC : (shc::config().compilerHlslCc ? CompilerMode::HLSLCC : CompilerMode::DEFAULT);
-    HASH_UPDATE(&sha1, (const unsigned char *)&mode, (uint32_t)sizeof(mode));
-#elif _CROSS_TARGET_DX12
+#if _CROSS_TARGET_DX12
     const auto platform = shc::config().targetPlatform;
     HASH_UPDATE(&sha1, (const unsigned char *)&platform, (uint32_t)sizeof(platform));
     HASH_UPDATE(&sha1, (const unsigned char *)&useScarlettWave32, (uint32_t)sizeof(useScarlettWave32));
@@ -2204,7 +1839,10 @@ void CompileShaderJob::doJobBody()
       HASH_UPDATE(&sha1, (const unsigned char *)&isDebugModeEnabledVar, (uint32_t)sizeof(isDebugModeEnabledVar));
 
     HASH_FINISH(&sha1, srcSha1);
+  }
 
+  if (shc::config().useSha1Cache)
+  {
     SNPRINTF(sha1SrcPath, sizeof(sha1SrcPath), "%s/src/%s/" HASH_LIST_STRING, shc::config().sha1CacheDir,
       profile.c_str(), // sources and binaries lives in different subfolders. that is to reduce risk of collision, while probably not
                        // needed
@@ -2227,8 +1865,8 @@ void CompileShaderJob::doJobBody()
         }
         else
         {
-          int sha1FileLen;
-          const void *content = df_mmap(sha1BinFile, &sha1FileLen);
+          int sha1FileLen = 0;
+          const uint8_t *content = (const uint8_t *)df_mmap(sha1BinFile, &sha1FileLen);
           if (!sha1FileLen)
           {
             debug("link is broken?");
@@ -2236,15 +1874,44 @@ void CompileShaderJob::doJobBody()
           }
           else
           {
-            const uint8_t *end_bytecode = (const uint8_t *)content + sha1FileLen - sizeof(ComputeShaderInfo);
-            compile_result.bytecode.assign((const uint8_t *)content, end_bytecode);
-            memcpy(&compile_result.computeShaderInfo, end_bytecode, sizeof(ComputeShaderInfo));
-            df_unmap(content, sha1FileLen);
-            df_close(sha1BinFile);
-            if (shc::config().hlslDumpCodeAlways)
-              dump_hlsl_src(compileCtx, source, compile_result.bytecode, sha1SrcPath, true, shaderName, shader_variant_hash);
-            ShaderCompilerStat::hlslExternalCacheHitCount.fetch_add(1);
-            return;
+#if _CROSS_TARGET_DX12
+            bool missingSeparateDebugInfo = false;
+            if (separateDebugInfoIsNeeded)
+            {
+              eastl::string pdbName;
+              pdbName.sprintf(HASH_TEMP_STRING, HASH_LIST(srcSha1));
+              missingSeparateDebugInfo = ctx.compCtx().compInfo().getCompleteDebugInfoPackListing().getNameId(pdbName.c_str()) < 0;
+            }
+            if (!missingSeparateDebugInfo)
+#endif
+            {
+              uint32_t metadata_size = 0;
+              memcpy(&metadata_size, content, sizeof(metadata_size));
+
+              uint32_t bytecode_size = 0;
+              memcpy(&bytecode_size, content + sizeof(metadata_size), sizeof(bytecode_size));
+
+              const uint8_t *start_metadata = content + sizeof(metadata_size) + sizeof(bytecode_size);
+              const uint8_t *end_metadata = start_metadata + metadata_size;
+              compile_result.metadata.assign(start_metadata, end_metadata);
+
+              const uint8_t *start_bytecode = end_metadata;
+              const uint8_t *end_bytecode = start_bytecode + bytecode_size;
+              compile_result.bytecode.assign(start_bytecode, end_bytecode);
+              memcpy(&compile_result.computeShaderInfo, end_bytecode, sizeof(ComputeShaderInfo));
+              df_unmap(content, sha1FileLen);
+              df_close(sha1BinFile);
+              if (shc::config().hlslDumpCodeAlways)
+                dump_hlsl_src(compileCtx, source, compile_result.bytecode, sha1SrcPath, true, shaderName, shader_variant_hash);
+              ShaderCompilerStat::hlslExternalCacheHitCount.fetch_add(1);
+              return;
+            }
+#if _CROSS_TARGET_DX12
+            else
+            {
+              debug("Separate debug info for %s is missing.", sha1SrcPath);
+            }
+#endif
           }
         }
       }
@@ -2260,8 +1927,8 @@ void CompileShaderJob::doJobBody()
     (shc::config().hlslDebugLevel == DebugLevel::FULL_DEBUG_INFO) ? 0 : shc::config().hlslOptimizationLevel;
   bool optimizationLevelHasBeenOverriden = false;
   auto lastOptimizationLevel = localHlslOptimizationLevel;
-  bool full_debug = false, forceDisableWarnings = false;
-  bool embed_source = shc::config().hlslEmbedSource;
+  bool forceDisableWarnings = false;
+  DebugParts debugParts = shc::config().hlslDebugParts;
   bool useWave32 = useScarlettWave32;
   int waveSpecification = 0;
   bool useHlsl2021 = shc::config().hlsl2021;
@@ -2269,10 +1936,10 @@ void CompileShaderJob::doJobBody()
 #if _CROSS_TARGET_DX12
   dag::Vector<dxil::StreamOutputComponentInfo> streamOutputComponents;
 #endif
-  for (const char *pragma = strstr(source, "#pragma "); pragma; pragma = strstr(pragma, "#pragma "))
+  for (const char *pragma = strstr(source, PRAGMA_PREFIX); pragma; pragma = strstr(pragma, PRAGMA_PREFIX))
   {
     void *original = (void *)pragma;
-    pragma += strlen("#pragma ");
+    pragma += LITSTR_LEN(PRAGMA_PREFIX);
 #define PRAGMA(b) (strncmp(pragma, b, strlen(b)) == 0)
     if (PRAGMA("debugfull") || PRAGMA("dfull"))
     {
@@ -2281,7 +1948,7 @@ void CompileShaderJob::doJobBody()
     }
     else if (PRAGMA("embed_source"))
     {
-      embed_source = true;
+      debugParts = DebugParts::EMBED_SOURCE;
     }
     else if (PRAGMA("force_disable_warnings"))
     {
@@ -2294,13 +1961,24 @@ void CompileShaderJob::doJobBody()
     else if (PRAGMA("force_min_opt_level "))
     {
       pragma += strlen("force_min_opt_level ");
-      localHlslOptimizationLevel = max(atoi(pragma), shc::config().hlslOptimizationLevel);
+      const int pragmaOptLevel = atoi(pragma);
+      lastOptimizationLevel = eastl::exchange(localHlslOptimizationLevel, max(pragmaOptLevel, shc::config().hlslOptimizationLevel));
       if (eastl::exchange(optimizationLevelHasBeenOverriden, true) && localHlslOptimizationLevel != lastOptimizationLevel)
       {
-        compile_result.errors.append_sprintf("#pragma force_min_opt_level redefined with value %d (previous=%d)",
-          lastOptimizationLevel, localHlslOptimizationLevel);
+        compile_result.errors.append_sprintf("override conflict: force_min_opt_level=%d (previous level=%d, current level=%d)",
+          pragmaOptLevel, lastOptimizationLevel, localHlslOptimizationLevel);
       }
-      lastOptimizationLevel = localHlslOptimizationLevel;
+    }
+    else if (PRAGMA("force_max_opt_level "))
+    {
+      pragma += strlen("force_max_opt_level ");
+      const int pragmaOptLevel = atoi(pragma);
+      lastOptimizationLevel = eastl::exchange(localHlslOptimizationLevel, min(pragmaOptLevel, localHlslOptimizationLevel));
+      if (eastl::exchange(optimizationLevelHasBeenOverriden, true) && localHlslOptimizationLevel != lastOptimizationLevel)
+      {
+        compile_result.errors.append_sprintf("override conflict: force_max_opt_level=%d (previous level=%d, current level=%d)",
+          pragmaOptLevel, lastOptimizationLevel, localHlslOptimizationLevel);
+      }
     }
 #if _CROSS_TARGET_C1 || _CROSS_TARGET_C2
 
@@ -2385,11 +2063,12 @@ void CompileShaderJob::doJobBody()
 
 
 
+
 #elif _CROSS_TARGET_METAL
   if (shc::config().dxcContext)
   {
     compile_result = compileShaderMetal(shc::config().dxcContext, source, profile, entry, !shc::config().hlslNoDisassembly,
-      useHlsl2021, enableFp16, shc::config().hlslSkipValidation, localHlslOptimizationLevel ? true : false, max_constants_no,
+      useHlsl2021, enableFp16, shc::config().hlslSkipValidation, localHlslOptimizationLevel ? true : false, implicitCbufRegCount,
       shaderName, shc::config().useIosToken, shc::config().useBinaryMsl, shader_variant_hash, shc::config().enableBindless);
   }
   else
@@ -2399,14 +2078,24 @@ void CompileShaderJob::doJobBody()
 #elif _CROSS_TARGET_SPIRV
   if (shc::config().dxcContext)
   {
-    compile_result =
-      compileShaderSpirV(shc::config().dxcContext, source, profile, entry, !shc::config().hlslNoDisassembly, useHlsl2021, enableFp16,
-        shc::config().hlslSkipValidation, localHlslOptimizationLevel ? true : false, max_constants_no, shaderName,
-        shc::config().compilerDXC      ? CompilerMode::DXC
-        : shc::config().compilerHlslCc ? CompilerMode::HLSLCC
-                                       : CompilerMode::DEFAULT,
-        shader_variant_hash, shc::config().enableBindless, full_debug || shc::config().hlslDebugLevel != DebugLevel::NONE,
-        shc::config().dumpSpirvOnly);
+    compile_result = compileShaderSpirV({.dxcCtx = shc::config().dxcContext,
+      .source = source,
+      .profile = profile,
+      .entry = entry,
+      .shaderName = shaderName,
+      .shaderVariantHash = shader_variant_hash,
+      .implicitCbufRegCount = implicitCbufRegCount,
+      .needDisasm = !shc::config().hlslNoDisassembly,
+      .hlsl2021 = useHlsl2021,
+      .enableFp16 = enableFp16,
+      .skipValidation = shc::config().hlslSkipValidation,
+      .optimize = localHlslOptimizationLevel ? true : false,
+      .enableBindless = shc::config().enableBindless,
+      .embedDebugData = full_debug || shc::config().hlslDebugLevel != DebugLevel::NONE,
+      .dumpSpirvOnly = shc::config().dumpSpirvOnly,
+      .validateGlobalConstsOffsetOrder = shc::config().sortGlobalConstsByOffset,
+      .noConversionWarnings = shc::config().noConversionWarnings,
+      .useScalarLayout = shc::config().useScalarLayout});
   }
   else
   {
@@ -2415,11 +2104,35 @@ void CompileShaderJob::doJobBody()
 #elif _CROSS_TARGET_DX12
   // NOTE: when we support this kind of switch somehow this can be replaced with actual information
   // of use or not
-  compile_result = dx12::dxil::compileShader(make_span_const(source).first(sourceLen), // source length includes trailing zeros
-    profile, entry, !shc::config().hlslNoDisassembly, useHlsl2021, enableFp16, shc::config().hlslSkipValidation,
-    localHlslOptimizationLevel ? true : false, is_hlsl_debug(), shc::config().dx12PdbCacheDir, max_constants_no, shaderName,
-    shc::config().targetPlatform, useWave32, !forceDisableWarnings && shc::config().hlslWarningsAsErrors,
-    full_debug ? DebugLevel::FULL_DEBUG_INFO : shc::config().hlslDebugLevel, embed_source, streamOutputComponents);
+  eastl::wstring pdbName;
+  if (separateDebugInfoIsNeeded)
+    pdbName.sprintf(HASH_TEMP_WSTRING, HASH_LIST(srcSha1));
+  compile_result = dx12::dxil::compileShader({.name = shaderName,
+    .profile = profile,
+    .entry = entry,
+    .source = make_span_const(source).first(sourceLen),
+    .needDisasm = !shc::config().hlslNoDisassembly,
+    .implicitCbufRegCount = implicitCbufRegCount,
+    .platform = shc::config().targetPlatform,
+    .warningsAsErrors = !forceDisableWarnings && shc::config().hlslWarningsAsErrors,
+    .debugParts = debugParts,
+    .debugLevel = full_debug ? DebugLevel::FULL_DEBUG_INFO : shc::config().hlslDebugLevel,
+    .compilationOptions =
+      {
+        .optimizeLevel = (uint32_t)eastl::min(localHlslOptimizationLevel, dx12::dxil::MAX_OPTIMIZE_LEVEL),
+        .skipValidation = shc::config().hlslSkipValidation,
+        .debugInfo = is_hlsl_debug(),
+        .scarlettW32 = useWave32,
+        .hlsl2021 = useHlsl2021,
+        .enableFp16 = enableFp16,
+        .hasExplicitRtPipelineConfig = rtPipelineConfigDeclared,
+        .allowOpacityMicroMaps = rtPipelineAllowOmm,
+        .rtMaxRecursion = rtPipelineMaxRecursion,
+        .hasDxilRtPipelineConfig = hasInlineRtPipelineConfig && !rtPipelineConfigDeclared,
+      },
+    .PDBDir = shc::config().dx12PdbCacheDir,
+    .PDBName = pdbName.data(),
+    .streamOutputComponents = streamOutputComponents});
 #else //_CROSS_TARGET_DX11
   unsigned int flags = is_hlsl_debug() ? D3DCOMPILE_DEBUG : 0;
   flags |= shc::config().hlslSkipValidation ? D3DCOMPILE_SKIP_VALIDATION : 0;
@@ -2432,8 +2145,8 @@ void CompileShaderJob::doJobBody()
                          : (localHlslOptimizationLevel >= 1 ? D3DCOMPILE_OPTIMIZATION_LEVEL0 : D3DCOMPILE_SKIP_OPTIMIZATION)));
   flags |= shc::config().hlslWarningsAsErrors ? D3DCOMPILE_WARNINGS_ARE_ERRORS : 0;
   compile_result = compileShaderDX11(shaderName, source, NULL, profile, entry, !shc::config().hlslNoDisassembly,
-    full_debug ? DebugLevel::FULL_DEBUG_INFO : shc::config().hlslDebugLevel, shc::config().hlslSkipValidation, embed_source, flags,
-    max_constants_no);
+    full_debug ? DebugLevel::FULL_DEBUG_INFO : shc::config().hlslDebugLevel, shc::config().hlslSkipValidation, debugParts, flags,
+    implicitCbufRegCount);
 #endif
 
   if (shc::config().hlslDumpCodeAlways)
@@ -2447,9 +2160,16 @@ void CompileShaderJob::doJobBody()
 
   if (shc::config().writeSha1Cache && shc::config().useSha1Cache && !compile_result.bytecode.empty() && dd_mkpath(sha1SrcPath))
   {
+    uint32_t metadata_size = compile_result.metadata.size();
+    uint32_t bytecode_size = compile_result.bytecode.size();
+    uint32_t total_size = sizeof(metadata_size) + sizeof(bytecode_size) + metadata_size + bytecode_size + sizeof(ComputeShaderInfo);
+
     unsigned char binSha1[HASH_SIZE];
     HASH_CONTEXT sha1;
     HASH_INIT(&sha1);
+    HASH_UPDATE(&sha1, (const unsigned char *)&metadata_size, sizeof(metadata_size));
+    HASH_UPDATE(&sha1, (const unsigned char *)&bytecode_size, sizeof(bytecode_size));
+    HASH_UPDATE(&sha1, (const unsigned char *)compile_result.metadata.data(), compile_result.metadata.size());
     HASH_UPDATE(&sha1, (const unsigned char *)compile_result.bytecode.data(), compile_result.bytecode.size());
     HASH_UPDATE(&sha1, (const unsigned char *)&compile_result.computeShaderInfo, sizeof(compile_result.computeShaderInfo));
     HASH_FINISH(&sha1, binSha1);
@@ -2460,7 +2180,7 @@ void CompileShaderJob::doJobBody()
                        // needed
       HASH_LIST(binSha1));
     DagorStat binbuf;
-    if (df_stat(sha1BinPath, &binbuf) != -1 && binbuf.size == compile_result.bytecode.size() + sizeof(ComputeShaderInfo))
+    if (df_stat(sha1BinPath, &binbuf) != -1 && binbuf.size == total_size)
     {
       // blob is already saved
     }
@@ -2474,9 +2194,12 @@ void CompileShaderJob::doJobBody()
         "%s_bin_" HASH_TEMP_STRING "XXXXXX",
         shc::config().sha1CacheDir, profile.c_str(), HASH_LIST(binSha1));
       file_ptr_t tmpF = df_mkstemp(tmpFileName);
-      int written = df_write(tmpF, compile_result.bytecode.data(), compile_result.bytecode.size());
+      int written = df_write(tmpF, &metadata_size, sizeof(metadata_size));
+      written += df_write(tmpF, &bytecode_size, sizeof(bytecode_size));
+      written += df_write(tmpF, compile_result.metadata.data(), compile_result.metadata.size());
+      written += df_write(tmpF, compile_result.bytecode.data(), compile_result.bytecode.size());
       written += df_write(tmpF, &compile_result.computeShaderInfo, sizeof(ComputeShaderInfo));
-      if (written == compile_result.bytecode.size() + sizeof(ComputeShaderInfo))
+      if (written == total_size)
       {
         df_close(tmpF);
         if (!dd_rename(tmpFileName, sha1BinPath))
@@ -2706,7 +2429,7 @@ bool CompileShaderJob::skipEmptyPragmaSpaces(const char *&pragma)
 
 void CompileShaderJob::addResults()
 {
-  auto entryIdsMaybe = curpass->getCidx(stage, true);
+  auto entryIdsMaybe = curpass->getCidx(stage);
   G_VERIFY(entryIdsMaybe.has_value());
   ShaderCacheLevelIds entryIds = entryIdsMaybe.value();
 
@@ -2725,6 +2448,13 @@ void CompileShaderJob::addResults()
         cachedShader.compileCtx, compileCtx);
     }
   }
+#if _CROSS_TARGET_DX12
+  else if (separateDebugInfoIsNeeded)
+  {
+    eastl::string debugInfoName{eastl::string::CtorSprintf{}, HASH_TEMP_STRING, HASH_LIST(srcSha1)};
+    ctx.tgtCtx().storage().usedSepDebugInfoNames.emplace_back(debugInfoName.c_str());
+  }
+#endif
 
   apply_shader_from_cache(*curpass, stage, entryIds, cache);
 

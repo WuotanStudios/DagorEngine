@@ -1,0 +1,151 @@
+include "nbsPermutations/node_based_perm_inc.dshl"
+
+texture hmapMain always_referenced;
+float4 biom_attributes[32] always_referenced;
+texture static_shadow_tex always_referenced;
+sampler static_shadow_tex_samplerstate always_referenced;
+
+float4 nbs_params always_referenced;
+float4 skylight_params always_referenced;
+float4 zn_zfar always_referenced;
+float4 view_vecLB always_referenced;
+float4 view_vecLT always_referenced;
+float4 view_vecRB always_referenced;
+float4 view_vecRT always_referenced;
+float4 world_view_pos always_referenced;
+float4 world_to_hmap_low always_referenced;
+float4 heightmap_scale always_referenced;
+float4 tex_hmap_inv_sizes always_referenced;
+float4 world_to_depth_ao always_referenced;
+float4 depth_ao_heights always_referenced;
+int depth_ao_extra_enabled always_referenced;
+float4 world_to_depth_ao_extra always_referenced;
+float4 depth_ao_heights_extra always_referenced;
+float depth_ao_texture_size always_referenced;
+float depth_ao_texture_size_inv always_referenced;
+float4 land_detail_mul_offset always_referenced;
+float global_time_phase always_referenced;
+texture noise_64_tex_l8 always_referenced;
+sampler noise_64_tex_l8_samplerstate always_referenced;
+texture tex_hmap_low always_referenced;
+sampler tex_hmap_low_samplerstate always_referenced;
+texture clouds_rain_map_tex always_referenced;
+sampler clouds_rain_map_tex_samplerstate always_referenced;
+float4 clouds_rain_map_offset_scale always_referenced;
+int clouds_rain_map_valid always_referenced;
+float clouds_rain_map_max_height always_referenced;
+float nbs_clouds_start_altitude2_meters always_referenced;
+float water_level always_referenced;
+texture distant_heightmap_tex always_referenced;
+float4 distant_world_to_hmap_low always_referenced;
+float4 distant_heightmap_scale always_referenced;
+float4 distant_heightmap_target_box always_referenced;
+float4 from_sun_direction always_referenced;
+texture ambient_wind_tex always_referenced;
+sampler ambient_wind_tex_samplerstate always_referenced;
+float4 ambient_wind_map_scale__offset always_referenced;
+float4 ambient_wind__speed__current_time__previous_time always_referenced;
+texture biomeIndicesTex always_referenced;
+sampler biomeIndicesTex_samplerstate always_referenced;
+float4 biome_indices_tex_size always_referenced;
+float4 water_heightmap_page_count__det_scale always_referenced;
+float4 water_height_offset_scale__page_padding always_referenced;
+float4 world_to_water_heightmap always_referenced;
+texture water_heightmap_grid always_referenced;
+sampler water_heightmap_grid_samplerstate always_referenced;
+texture water_heightmap_pages always_referenced;
+int4 world_sdf_res always_referenced;
+const_buffer world_sdf_params always_referenced;
+float4 world_sdf_to_atlas_decode__gradient_offset always_referenced;
+texture world_sdf_clipmap always_referenced;
+sampler world_sdf_clipmap_samplerstate always_referenced;
+
+float4 camera_in_camera_prev_vp_ellipse_center always_referenced;
+float4 camera_in_camera_prev_vp_ellipse_xy_axes always_referenced;
+float4 camera_in_camera_vp_ellipse_center always_referenced;
+float4 camera_in_camera_vp_ellipse_xy_axes always_referenced;
+float camera_in_camera_vp_y_scale always_referenced;
+float4 camera_in_camera_vp_uv_remapping always_referenced;
+float camera_in_camera_postfx_lens_view always_referenced;
+float camera_in_camera_active always_referenced;
+
+int nbs_quality always_referenced;
+interval nbs_quality : low < 1, medium < 2, high always_referenced;
+
+hlsl (cs) {
+##if nbs_quality == low
+#define NBS_QUALITY 0
+##elif nbs_quality == medium
+#define NBS_QUALITY 1
+##elif nbs_quality == high
+#define NBS_QUALITY 2
+##endif
+}
+
+macro NBS_COMMON_BLOCK()
+  (cs) {
+    skylight_params@f4 = skylight_params;
+    zn_zfar@f4 = zn_zfar;
+    view_vecLB@f4 = view_vecLB;
+    view_vecLT@f4 = view_vecLT;
+    view_vecRB@f4 = view_vecRB;
+    view_vecRT@f4 = view_vecRT;
+    world_view_pos@f4 = world_view_pos;
+    world_to_hmap_low@f4 = world_to_hmap_low;
+    heightmap_scale@f4 = heightmap_scale;
+    tex_hmap_inv_sizes@f4 = tex_hmap_inv_sizes;
+    world_to_depth_ao@f4 = world_to_depth_ao;
+    depth_ao_heights@f4 = depth_ao_heights;
+    meter_to_depth_ao_tex_space@f1 = (1.0 / max(depth_ao_heights.x, 0.00001));
+    depth_ao_extra_enabled@i1 = depth_ao_extra_enabled;
+    world_to_depth_ao_extra@f4 = world_to_depth_ao_extra;
+    depth_ao_heights_extra@f4 = depth_ao_heights_extra;
+    depth_ao_texture_size@f1 = depth_ao_texture_size;
+    depth_ao_texture_size_inv@f1 = depth_ao_texture_size_inv;
+    land_detail_mul_offset@f4 = land_detail_mul_offset;
+    global_time_phase@f1 = global_time_phase;
+    noise_64_tex_l8@tex2d = noise_64_tex_l8;
+    noise_64_tex_l8_samplerstate@sampler = noise_64_tex_l8_samplerstate;
+    hmapMain@tex2d = hmapMain;
+    tex_hmap_low@tex2d = tex_hmap_low;
+    tex_hmap_low_samplerstate@sampler = tex_hmap_low_samplerstate;
+    clouds_rain_map_tex@tex2d = clouds_rain_map_tex;
+    clouds_rain_map_tex_samplerstate@sampler = clouds_rain_map_tex_samplerstate;
+    clouds_rain_map_offset_scale@f4 = clouds_rain_map_offset_scale;
+    clouds_rain_map_valid@i1 = clouds_rain_map_valid;
+    clouds_rain_map_max_height@f1 = clouds_rain_map_max_height;
+    nbs_clouds_start_altitude2_meters@f1 = nbs_clouds_start_altitude2_meters;
+    water_level@f1 = water_level;
+    distant_heightmap_tex@tex2d = distant_heightmap_tex;
+    distant_world_to_hmap_low@f4 = distant_world_to_hmap_low;
+    distant_heightmap_scale@f4 = distant_heightmap_scale;
+    distant_heightmap_target_box@f4 = distant_heightmap_target_box;
+    from_sun_direction@f4 = from_sun_direction;
+    ambient_wind_tex@tex2d = ambient_wind_tex;
+    ambient_wind_tex_samplerstate@sampler = ambient_wind_tex_samplerstate;
+    ambient_wind_map_scale__offset@f4 = ambient_wind_map_scale__offset;
+    ambient_wind__speed__current_time__previous_time@f4 = ambient_wind__speed__current_time__previous_time;
+    biomeIndicesTex@tex2d = biomeIndicesTex;
+    biomeIndicesTex_samplerstate@sampler = biomeIndicesTex_samplerstate;
+    biome_indices_tex_size@f4 = biome_indices_tex_size;
+    biom_attributes@f4 = biom_attributes;
+    water_heightmap_page_count__det_scale@f4 = water_heightmap_page_count__det_scale;
+    water_height_offset_scale__page_padding@f4 = water_height_offset_scale__page_padding;
+    world_to_water_heightmap@f4 = world_to_water_heightmap;
+    water_heightmap_grid@tex2d = water_heightmap_grid;
+    water_heightmap_grid_samplerstate@sampler = water_heightmap_grid_samplerstate;
+    water_heightmap_pages@tex2d = water_heightmap_pages;
+    world_sdf_res@i4 = world_sdf_res;
+    world_sdf_params@cbuf = world_sdf_params hlsl {
+      cbuffer world_sdf_params@cbuf {
+        #include <world_sdf.hlsli>
+        CBUFF_STRUCTURE_world_sdf_params
+      };
+    };
+    world_sdf_to_atlas_decode__gradient_offset@f4 = world_sdf_to_atlas_decode__gradient_offset;
+    world_sdf_clipmap@tex3d = world_sdf_clipmap;
+    world_sdf_clipmap_samplerstate@sampler = world_sdf_clipmap_samplerstate;
+    nbs_quality@i1 = nbs_quality;
+    nbs_params@f4 = nbs_params;
+  }
+endmacro

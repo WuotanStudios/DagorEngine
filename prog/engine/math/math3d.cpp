@@ -13,14 +13,7 @@
 #include <math/integer/dag_IPoint2.h>
 #include <math/integer/dag_IPoint3.h>
 #include <math/integer/dag_IPoint4.h>
-
-#if _TARGET_PC && !_TARGET_SIMD_NEON
-#if _MSC_VER <= 1310
-#include <xmmintrin.h>
-#else
-#include <intrin.h>
-#endif
-#endif
+#include <supp/dag_cpuControl.h>
 
 static const int QNaNint = 0xFFFFFFFF;
 static const int SNaNint = 0xFFBFFFFF;
@@ -32,25 +25,6 @@ const float realSNaN = bitwise_cast<float, int>(SNaNint);
 const double doubleQNaN = bitwise_cast<double, int64_t>(QNaNint64);
 const double doubleSNaN = bitwise_cast<double, int64_t>(SNaNint64);
 
-const Matrix3 Matrix3::IDENT(1.f), Matrix3::ZERO(0.f);
-const TMatrix TMatrix::IDENT(1), TMatrix::ZERO(0);
-const TMatrix4 TMatrix4::IDENT(1), TMatrix4::ZERO(0);
-const TMatrix4D TMatrix4D::IDENT(1.0), TMatrix4D::ZERO(0.0);
-const BBox3 BBox3::IDENT(Point3(), 1.f);
-
-const IPoint2 IPoint2::ZERO = IPoint2(0, 0);
-const IPoint2 IPoint2::ONE = IPoint2(1, 1);
-const IPoint3 IPoint3::ZERO = IPoint3(0, 0, 0);
-const IPoint3 IPoint3::ONE = IPoint3(1, 1, 1);
-const IPoint4 IPoint4::ZERO = IPoint4(0, 0, 0, 0);
-const IPoint4 IPoint4::ONE = IPoint4(1, 1, 1, 1);
-
-const Point2 Point2::ZERO = Point2(0, 0);
-const Point2 Point2::ONE = Point2(1, 1);
-const Point3 Point3::ZERO = Point3(0, 0, 0);
-const Point3 Point3::ONE = Point3(1, 1, 1);
-const Point4 Point4::ZERO = Point4(0, 0, 0, 0);
-const Point4 Point4::ONE = Point4(1, 1, 1, 1);
 
 #if _TARGET_PC_WIN | _TARGET_XBOX
 const float __declspec(align(16)) math_float_zero[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -61,12 +35,8 @@ const float math_float_zero[16] __attribute__((aligned(16))) = {0, 0, 0, 0, 0, 0
 void init_math()
 {
   perlin_noise::init_noise(1120272305);
-#if _TARGET_SIMD_SSE
-  _mm_setcsr((_mm_getcsr() & ~_MM_ROUND_MASK) | _MM_FLUSH_ZERO_MASK | _MM_ROUND_NEAREST | 0x40); // 0x40 - denorms are zero.
-  // it is helpful to have 0x40 - denorms are zero - flag, for performance reasons.
-  // it should not matter for our math, since we do have _MM_FLUSH_ZERO_MASK (flush-to-zero), but if we load thrash from memory, which
-  // we won't use anyway (consider .w in vertex position), it will affect performance! DEBUG_CTX("set DAZ and RN flags");
-#endif
+  // re-assert for the main thread; other threads get this automatically (see cpuControl.cpp)
+  set_default_fp_control_this_thread();
 }
 
 static inline void calc_screen_box(BBox2 &scbox, Point2 pt[8], BBox3 &b, TMatrix4 &gtm)

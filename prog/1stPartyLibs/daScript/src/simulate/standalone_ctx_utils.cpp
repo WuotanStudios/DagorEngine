@@ -8,6 +8,7 @@ namespace das {
         gfun->stackSize = uint32_t(info.stackSize);
         gfun->mangledNameHash = MNH;
         gfun->aotFunction = nullptr;
+        gfun->jitFunction = nullptr;
         gfun->flags = 0;
         gfun->fastcall = info.fastCall;
         gfun->unsafe = info.unsafeOperation;
@@ -47,7 +48,6 @@ namespace das {
                 fn->aot = true;
                 auto fcb = (SimNode_CallBase *) fn->code;
                 fn->aotFunction = fcb->aotFunction;
-                (*ctx.tabMnLookup)[fn->mangledNameHash] = fn;
             } else if (!fn->builtin) {
                 // Can't fill noAot functions.
                 DAS_ASSERT(false);

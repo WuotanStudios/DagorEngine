@@ -91,6 +91,7 @@ inline const char *getFormatTypeInString(uint32_t formatFlags)
     FORMAT_TO_NAME(TEXFMT_R8G8S);
     FORMAT_TO_NAME(TEXFMT_BC6H);
     FORMAT_TO_NAME(TEXFMT_BC7);
+    FORMAT_TO_NAME(TEXFMT_BC5S);
     FORMAT_TO_NAME(TEXFMT_R8UI);
     FORMAT_TO_NAME(TEXFMT_R16UI);
     FORMAT_TO_NAME(TEXFMT_DEPTH24);
@@ -102,7 +103,9 @@ inline const char *getFormatTypeInString(uint32_t formatFlags)
     FORMAT_TO_NAME(TEXFMT_ASTC12);
     FORMAT_TO_NAME(TEXFMT_ETC2_RG);
     FORMAT_TO_NAME(TEXFMT_ETC2_RGBA);
-    FORMAT_TO_NAME(TEXFMT_PSSR_TARGET);
+#if _TARGET_C2
+
+#endif
     default: return "ERR_TYPE";
   }
 }

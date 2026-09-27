@@ -616,7 +616,7 @@ namespace Geometry
     {
         float3 p;
         p.xy = uv * cameraFrustum.zw + cameraFrustum.xy;
-        p.xy *= viewZ * ( 1.0f - abs( orthoMode ) ) + orthoMode;
+        p.xy *= orthoMode == 0.0f ? viewZ : orthoMode;
         p.z = viewZ;
 
         return p;
@@ -1694,10 +1694,11 @@ namespace Rng
     #define ML_RNG_UTOF 0
     #define ML_RNG_MANTISSA_BITS 1
 
+    // Both produce a float in [0; 1) range
     #if( ML_RNG_FLOAT01_MODE == ML_RNG_UTOF )
         #define _UintToFloat01( x ) ( ( x >> 8 ) * ( 1.0f / float( 1 << 24 ) ) )
     #else
-        #define _UintToFloat01( x ) ( 2.0f - asfloat( ( x >> 9 ) | 0x3F800000 ) )
+        #define _UintToFloat01( x ) ( asfloat( ( x >> 9 ) | 0x3F800000 ) - 1.0f )
     #endif
 
     // Tiny Encryption Algorithm
@@ -3017,6 +3018,7 @@ namespace Text
 
     ML_INLINE void Print_ui( uint x, ML_INOUT( uint4 ) state )
     {
+        [unroll] // FXC: avoid "X3557: loop only executes for N iteration(s), forcing loop to unroll"
         while( x )
         {
             uint a = x / 10;

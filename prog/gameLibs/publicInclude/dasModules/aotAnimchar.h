@@ -13,6 +13,7 @@
 #include <ecs/anim/anim.h>
 #include <ecs/anim/animState.h>
 #include <ecs/anim/animchar_visbits.h>
+#include <ecs/render/nodeCollapserBitsType.h>
 #include <dasModules/aotGeomNodeTree.h>
 #include <animChar/dag_animCharacter2.h>
 #include <shaders/dag_dynSceneRes.h>
@@ -24,6 +25,7 @@
 #include <memory/dag_framemem.h>
 #include <dasModules/dasManagedTab.h>
 #include <generic/dag_patchTab.h>
+#include <anim/dag_animDecl.h>
 
 #include <../engine/anim/animFifo.h>
 
@@ -47,8 +49,9 @@ DAS_BIND_SPAN(RoNameMapExIdPatchableTab, RoNameMapExIdPatchableTab, uint16_t);
 MAKE_TYPE_FACTORY(NameIdPair, das::NameIdPair);
 MAKE_TYPE_FACTORY(AnimcharBaseComponent, AnimV20::AnimcharBaseComponent);
 MAKE_TYPE_FACTORY(AnimcharRendComponent, AnimV20::AnimcharRendComponent);
+MAKE_TYPE_FACTORY(IAnimCharacter2, AnimV20::IAnimCharacter2);
 MAKE_TYPE_FACTORY(AnimationGraph, AnimV20::AnimationGraph);
-MAKE_TYPE_FACTORY(IAnimStateHolder, AnimV20::IAnimStateHolder);
+MAKE_TYPE_FACTORY(AnimGraphStateHolder, AnimV20::AnimGraphStateHolder);
 MAKE_TYPE_FACTORY(IAnimBlendNode, AnimV20::IAnimBlendNode);
 MAKE_TYPE_FACTORY(AnimBlendNodeNull, AnimV20::AnimBlendNodeNull);
 MAKE_TYPE_FACTORY(AnimBlendNodeContinuousLeaf, AnimV20::AnimBlendNodeContinuousLeaf);
@@ -84,7 +87,7 @@ MAKE_TYPE_FACTORY(AnimPostBlendParamFromNode, AnimV20::AnimPostBlendParamFromNod
 MAKE_TYPE_FACTORY(AttachGeomNodeCtrlVarId, AnimV20::AttachGeomNodeCtrl::VarId);
 using AttachGeomNodeCtrlVarIdTab = Tab<AnimV20::AttachGeomNodeCtrl::VarId>;
 DAS_BIND_VECTOR(AttachGeomNodeCtrlVarIdTab, AttachGeomNodeCtrlVarIdTab, AnimV20::AttachGeomNodeCtrl::VarId,
-  " ::Tab<AnimV20::AttachGeomNodeCtrl::VarId>");
+  " ::Tab<::AnimV20::AttachGeomNodeCtrl::VarId>");
 MAKE_TYPE_FACTORY(AttachGeomNodeCtrlAttachDesc, AnimV20::AttachGeomNodeCtrl::AttachDesc);
 MAKE_TYPE_FACTORY(AttachGeomNodeCtrl, AnimV20::AttachGeomNodeCtrl);
 
@@ -95,18 +98,36 @@ MAKE_TYPE_FACTORY(DynSceneResNameMapResource, DynSceneResNameMapResource);
 // TODO: extract these render related types into separate module
 MAKE_TYPE_FACTORY(DynamicRenderableSceneLodsResource, DynamicRenderableSceneLodsResource);
 MAKE_TYPE_FACTORY(DynamicRenderableSceneInstance, DynamicRenderableSceneInstance);
+using NodeCollapserBits = DynamicRenderableSceneInstance::NodeCollapserBits;
+MAKE_TYPE_FACTORY(NodeCollapserBits, DynamicRenderableSceneInstance::NodeCollapserBits);
 
 MAKE_TYPE_FACTORY(Animate2ndPassCtx, Animate2ndPassCtx);
 
+using IAnimBlendNodePtrTab = PtrTab<AnimV20::IAnimBlendNode>;
 using BnlPtrTab = PtrTab<AnimV20::AnimBlendNodeLeaf>;
 using PbCtrlPtrTab = PtrTab<AnimV20::AnimPostBlendCtrl>;
+using floatTab = Tab<float>;
 
-DAS_BIND_VECTOR(BnlPtrTab, BnlPtrTab, AnimBlendNodeLeafPtr, " ::PtrTab<AnimV20::AnimBlendNodeLeaf>");
-DAS_BIND_VECTOR(PbCtrlPtrTab, PbCtrlPtrTab, AnimPostBlendCtrlPtr, " ::PtrTab<AnimV20::AnimPostBlendCtrl>");
+DAS_BIND_VECTOR(floatTab, floatTab, float, " ::Tab<float>");
+DAS_BIND_VECTOR(IAnimBlendNodePtrTab, IAnimBlendNodePtrTab, IAnimBlendNodePtr, " ::PtrTab<::AnimV20::IAnimBlendNode>");
+DAS_BIND_VECTOR(BnlPtrTab, BnlPtrTab, AnimBlendNodeLeafPtr, " ::PtrTab<::AnimV20::AnimBlendNodeLeaf>");
+DAS_BIND_VECTOR(PbCtrlPtrTab, PbCtrlPtrTab, AnimPostBlendCtrlPtr, " ::PtrTab<::AnimV20::AnimPostBlendCtrl>");
+
+using LinearPolyAnimPointTab = Tab<AnimV20::AnimBlendCtrl_LinearPoly::AnimPoint>;
+using ParamSwitcherItemAnimTab = Tab<AnimV20::AnimBlendCtrl_ParametricSwitcher::ItemAnim>;
+DAS_BIND_VECTOR(LinearPolyAnimPointTab, LinearPolyAnimPointTab, AnimV20::AnimBlendCtrl_LinearPoly::AnimPoint,
+  " ::Tab<::AnimV20::AnimBlendCtrl_LinearPoly::AnimPoint>");
+DAS_BIND_VECTOR(ParamSwitcherItemAnimTab, ParamSwitcherItemAnimTab, AnimV20::AnimBlendCtrl_ParametricSwitcher::ItemAnim,
+  " ::Tab<::AnimV20::AnimBlendCtrl_ParametricSwitcher::ItemAnim>");
 
 MAKE_TYPE_FACTORY(AnimBlender, AnimV20::AnimBlender);
+MAKE_TYPE_FACTORY(AnimcharDebugContext, AnimV20::AnimcharDebugContext);
 
 DAS_BIND_ENUM_CAST_98(AnimcharVisbits);
+
+DAS_BIND_ENUM_CAST_98_IN_NAMESPACE(AnimV20::FifoMorphType, FifoMorphType);
+
+MAKE_TYPE_FACTORY(TraceRayInfo, AnimCharV20::TraceRayInfo);
 
 template <>
 struct das::isCloneable<AnimV20::AnimationGraph> : false_type
@@ -129,6 +150,8 @@ inline int ronamemapex_get_name_id(const RoNameMapEx &names, const char *node_na
 {
   return names.getNameId(node_name ? node_name : "");
 }
+
+inline const char *ronamemapex_get_name(const RoNameMapEx &names, int name_id) { return names.getNameSlow(name_id); }
 
 inline void scene_instance_show_node(DynamicRenderableSceneInstance *scene_instance, int node_idx, bool show)
 {
@@ -171,6 +194,21 @@ inline int anim_graph_getParamId(const ::AnimV20::AnimationGraph &animGraph, con
   return animGraph.getParamId(state_name ? state_name : "", type);
 }
 
+inline const DataBlock *anim_graph_getEnumList(const ::AnimV20::AnimationGraph &animGraph, const char *enum_cls)
+{
+  return &animGraph.getEnumList(enum_cls ? enum_cls : "");
+}
+
+inline int anim_graph_addParamId(::AnimV20::AnimationGraph &animGraph, const char *param_name, int type)
+{
+  return animGraph.addParamIdEx(param_name, type);
+}
+
+inline int anim_graph_addInlinePtrParamId(::AnimV20::AnimationGraph &animGraph, const char *param_name, int size_bytes)
+{
+  return (param_name && *param_name) ? animGraph.addInlinePtrParamId(param_name, (size_t)size_bytes) : -1;
+}
+
 inline ::AnimV20::AnimBlendCtrl_Fifo3 *anim_graph_getFifo3NodePtr(::AnimV20::AnimationGraph &animGraph, int node_idx)
 {
   ::AnimV20::IAnimBlendNode *node = animGraph.getBlendNodePtr(node_idx);
@@ -192,10 +230,7 @@ inline void AnimBlendCtrl_1axis_getChildren(const ::AnimV20::AnimBlendCtrl_1axis
   auto res = ctrl.getChildren();
 
   das::Array arr;
-  arr.data = (char *)res.data();
-  arr.size = uint32_t(res.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)res.data(), res.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -209,10 +244,7 @@ inline void anim_graph_getParamNames(const ::AnimV20::AnimationGraph &animGraph,
   iterate_names(animGraph.getParamNames(), [&pairs](int id, const char *name) { pairs.push_back(das::NameIdPair{id, name}); });
 
   das::Array arr;
-  arr.data = (char *)pairs.data();
-  arr.size = uint32_t(pairs.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, pairs.data(), pairs.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -226,10 +258,7 @@ inline void anim_graph_getAnimNodeNames(const ::AnimV20::AnimationGraph &animGra
   iterate_names(animGraph.getAnimNodeNames(), [&pairs](int id, const char *name) { pairs.push_back(das::NameIdPair{id, name}); });
 
   das::Array arr;
-  arr.data = (char *)pairs.data();
-  arr.size = uint32_t(pairs.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, pairs.data(), pairs.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -242,13 +271,33 @@ inline void anim_graph_getStRec(const ::AnimV20::AnimationGraph &animGraph,
   dag::ConstSpan<::AnimV20::AnimationGraph::StateRec> names = animGraph.getStRec();
 
   das::Array arr;
-  arr.data = (char *)names.data();
-  arr.size = uint32_t(names.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)names.data(), names.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
+}
+
+inline int anim_graph_getStateChanCount(const ::AnimV20::AnimationGraph &animGraph) { return animGraph.getStDest().size(); }
+
+inline ::AnimV20::IAnimBlendNode *anim_graph_getStateChanFifo(const ::AnimV20::AnimationGraph &animGraph, int chan_idx)
+{
+  return animGraph.getStDest()[chan_idx].fifo.get();
+}
+
+inline int anim_graph_getStateChanNodemaskOfs(const ::AnimV20::AnimationGraph &animGraph, int chan_idx)
+{
+  return animGraph.getStDest()[chan_idx].defNodemaskIdx;
+}
+
+inline ::AnimV20::AnimationGraph::StateRec *anim_graph_getStateRec(::AnimV20::AnimationGraph &animGraph, int state_idx, int chan_idx)
+{
+  dag::Span<::AnimV20::AnimationGraph::StateRec> state = animGraph.getStateRW(state_idx);
+  return uint32_t(chan_idx) < state.size() ? &state[chan_idx] : nullptr;
+}
+
+inline const char *anim_get_fifo_morph_type_name(::AnimV20::FifoMorphType morph_type)
+{
+  return ::AnimV20::fifoMorphTypeNames[morph_type];
 }
 
 inline float AnimBlendCtrl_ParametricSwitcherItemAnim_getStart(const ::AnimV20::AnimBlendCtrl_ParametricSwitcher::ItemAnim &item)
@@ -259,6 +308,12 @@ inline float AnimBlendCtrl_ParametricSwitcherItemAnim_getEnd(const ::AnimV20::An
 {
   return item.range[1];
 }
+inline void AnimBlendCtrl_ParametricSwitcherItemAnim_setRange(::AnimV20::AnimBlendCtrl_ParametricSwitcher::ItemAnim &item, float start,
+  float end)
+{
+  item.range[0] = start;
+  item.range[1] = end;
+}
 
 inline void AnimBlendCtrl_ParametricSwitcher_getChildren(::AnimV20::AnimBlendCtrl_ParametricSwitcher &param_switch,
   const das::TBlock<void, das::TTemporary<das::TArray<::AnimV20::AnimBlendCtrl_ParametricSwitcher::ItemAnim>>> &block,
@@ -267,10 +322,7 @@ inline void AnimBlendCtrl_ParametricSwitcher_getChildren(::AnimV20::AnimBlendCtr
   dag::ConstSpan<::AnimV20::AnimBlendCtrl_ParametricSwitcher::ItemAnim> children = param_switch.getChildren();
 
   das::Array arr;
-  arr.data = (char *)children.data();
-  arr.size = uint32_t(children.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)children.data(), children.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -283,10 +335,7 @@ inline void AnimBlendCtrl_RandomSwitcher_getChildren(const ::AnimV20::AnimBlendC
   dag::ConstSpan<::AnimV20::AnimBlendCtrl_RandomSwitcher::RandomAnim> children = param_switch.getChildren();
 
   das::Array arr;
-  arr.data = (char *)children.data();
-  arr.size = uint32_t(children.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)children.data(), children.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -299,10 +348,7 @@ inline void AnimBlendCtrl_Hub_getChildren(const ::AnimV20::AnimBlendCtrl_Hub &hu
   dag::ConstSpan<Ptr<::AnimV20::IAnimBlendNode>> children = hub.getChildren();
 
   das::Array arr;
-  arr.data = (char *)children.data();
-  arr.size = uint32_t(children.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)children.data(), children.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -314,10 +360,7 @@ inline void AnimBlendCtrl_Hub_getDefNodeWt(const ::AnimV20::AnimBlendCtrl_Hub &h
   dag::ConstSpan<float> children = hub.getDefNodeWt();
 
   das::Array arr;
-  arr.data = (char *)children.data();
-  arr.size = uint32_t(children.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)children.data(), children.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -330,10 +373,7 @@ inline void AnimBlendCtrl_Blender_getChildren(const ::AnimV20::AnimBlendCtrl_Ble
   dag::ConstSpan<Ptr<::AnimV20::IAnimBlendNode>> children = hub.getChildren();
 
   das::Array arr;
-  arr.data = (char *)children.data();
-  arr.size = uint32_t(children.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)children.data(), children.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -346,10 +386,7 @@ inline void AnimBlendCtrl_BinaryIndirectSwitch_getChildren(const ::AnimV20::Anim
   dag::ConstSpan<Ptr<::AnimV20::IAnimBlendNode>> children = hub.getChildren();
 
   das::Array arr;
-  arr.data = (char *)children.data();
-  arr.size = uint32_t(children.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)children.data(), children.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -362,10 +399,7 @@ inline void AnimBlendCtrl_LinearPoly_getChildren(const ::AnimV20::AnimBlendCtrl_
   dag::ConstSpan<::AnimV20::AnimBlendCtrl_LinearPoly::AnimPoint> children = hub.getChildren();
 
   das::Array arr;
-  arr.data = (char *)children.data();
-  arr.size = uint32_t(children.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)children.data(), children.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -375,10 +409,7 @@ inline void AttachGeomNodeCtrl_getNodeNames(const ::AnimV20::AttachGeomNodeCtrl 
   const das::TBlock<void, das::TTemporary<das::TArray<const char *>>> &block, das::Context *context, das::LineInfoArg *at)
 {
   das::Array arr;
-  arr.data = (char *)pbc.nodeNames.data();
-  arr.size = uint32_t(pbc.nodeNames.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)pbc.nodeNames.data(), pbc.nodeNames.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -400,6 +431,31 @@ inline ::AnimV20::AnimData *AnimData_get_source_anim_data(const ::AnimV20::AnimD
   return anim_data.getSourceAnimData();
 }
 
+inline float AnimData_duration(const ::AnimV20::AnimData &anim_data) { return anim_data.getDuration(); }
+
+inline int AnimData_note_count(const ::AnimV20::AnimData &anim_data) { return (int)anim_data.dumpData.noteTrack.size(); }
+
+inline const char *AnimData_note_name(const ::AnimV20::AnimData &anim_data, int idx) { return anim_data.dumpData.noteTrack[idx].name; }
+
+inline float AnimData_note_time(const ::AnimV20::AnimData &anim_data, int idx)
+{
+  return float(anim_data.dumpData.noteTrack[idx].time) / float(::AnimV20::TIME_TicksPerSec);
+}
+
+inline int AnimData_node_count(const ::AnimV20::AnimData &anim_data) { return (int)anim_data.anim.rot.nodeNum; }
+
+inline const char *AnimData_node_name(const ::AnimV20::AnimData &anim_data, int node_idx)
+{
+  return anim_data.anim.rot.nodeName[node_idx];
+}
+
+inline void AnimData_sample_node(const ::AnimV20::AnimData &anim_data, int node_idx, float time, das::float3x4 &out_tm)
+{
+  TMatrix tm = TMatrix::IDENT;
+  anim_data.sampleNodeTm(dag::Index16(node_idx), time, tm);
+  out_tm = dag::bit_cast<das::float3x4>(tm);
+}
+
 inline ::AnimV20::IAnimBlendNode *IAnimBlendNodePtr_get(IAnimBlendNodePtr &node_ptr) { return node_ptr.get(); }
 
 inline ::AnimV20::AnimBlendNodeLeaf *AnimBlendNodeLeafPtr_get(AnimBlendNodeLeafPtr &node_ptr) { return node_ptr.get(); }
@@ -413,30 +469,30 @@ inline void send_change_anim_state_event(ecs::EntityId eid, const char *name, ec
   g_entity_mgr->sendEventImmediate(eid, EventChangeAnimState(ecs::HashedConstString{name, name_hash}, state_id));
 }
 
-inline void anim_graph_enqueueState(::AnimV20::AnimationGraph &anim_graph, ::AnimV20::AnimCommonStateHolder &state, int state_idx,
+inline void anim_graph_enqueueState(::AnimV20::AnimationGraph &anim_graph, ::AnimV20::AnimGraphStateHolder &state, int state_idx,
   float force_dur, float force_speed)
 {
   anim_graph.enqueueState(state, anim_graph.getState(state_idx), force_dur, force_speed);
 }
 
-inline void anim_graph_setStateSpeed(::AnimV20::AnimationGraph &anim_graph, ::AnimV20::AnimCommonStateHolder &state, int state_idx,
+inline void anim_graph_setStateSpeed(::AnimV20::AnimationGraph &anim_graph, ::AnimV20::AnimGraphStateHolder &state, int state_idx,
   float force_speed)
 {
   anim_graph.setStateSpeed(state, anim_graph.getState(state_idx), force_speed);
 }
 
-inline bool anim_graph_enqueueNode(::AnimV20::AnimationGraph &anim_graph, ::AnimV20::AnimCommonStateHolder &state, const char *anim)
+inline bool anim_graph_enqueueNode(::AnimV20::AnimationGraph &anim_graph, ::AnimV20::AnimGraphStateHolder &state, const char *anim)
 {
-  if (anim_graph.getRoot() && anim_graph.getRoot()->isSubOf(AnimV20::AnimBlendCtrl_Fifo3CID))
+  if (anim_graph.getRoot() && anim_graph.getRoot()->isSubOf(::AnimV20::AnimBlendCtrl_Fifo3CID))
   {
-    AnimV20::IAnimBlendNode *n = anim_graph.getBlendNodePtr(anim);
+    ::AnimV20::IAnimBlendNode *n = anim_graph.getBlendNodePtr(anim);
     if (!n)
       return false;
 
-    AnimV20::AnimBlendCtrl_Fifo3 *fifo = (AnimV20::AnimBlendCtrl_Fifo3 *)anim_graph.getRoot();
+    ::AnimV20::AnimBlendCtrl_Fifo3 *fifo = (::AnimV20::AnimBlendCtrl_Fifo3 *)anim_graph.getRoot();
     if (!fifo->isEnqueued(state, n))
       n->resume(state, true);
-    fifo->enqueueState(state, n, /*overlap_time*/ 0.15f, /*max_lag*/ 0.0f);
+    fifo->enqueueState(state, n, /*overlap_time*/ 0.15f);
     return true;
   }
   return false;
@@ -474,6 +530,15 @@ inline BBox3 animchar_render_calcWorldBox(const ::AnimCharV20::AnimcharRendCompo
   return out;
 }
 
+inline das::float4 animchar_render_prepareSphereAndCalcBox(const ::AnimCharV20::AnimcharRendComponent &animchar_render,
+  const AnimcharNodesMat44 &nodes, BBox3 &out_box)
+{
+  bbox3f out_wbb;
+  vec4f sphere = animchar_render.prepareSphereAndCalcBox(out_wbb, nodes);
+  v_stu_bbox3(out_box, out_wbb);
+  return sphere;
+}
+
 inline void animchar_getDebugBlenderState(::AnimV20::AnimcharBaseComponent &animchar, bool dump_tm,
   const das::TBlock<void, das::TTemporary<const DataBlock>> &block, das::Context *context, das::LineInfoArg *at)
 {
@@ -484,41 +549,37 @@ inline void animchar_getDebugBlenderState(::AnimV20::AnimcharBaseComponent &anim
   }
 }
 
-inline void animchar_getAnimBlendNodeWeights(::AnimV20::AnimationGraph &graph, ::AnimV20::IPureAnimStateHolder &st,
+inline void animchar_getAnimBlendNodeWeights(::AnimV20::AnimationGraph &graph, ::AnimV20::AnimGraphStateHolder &st,
   const das::TBlock<void, das::TTemporary<das::TArray<float>>, das::TTemporary<das::TArray<float>>,
     das::TTemporary<das::TArray<float>>> &block,
   das::Context *context, das::LineInfoArg *at)
 {
   ::AnimV20::AnimBlender::TlsContext &tlsCtx = graph.selectBlenderCtx();
+  // animchar_getAnimBlendNodeWeights right now is only used for debug viewing.
+  // buildBlendingList might change animchars state. We don't want the char to change how it behaves
+  // because we opened a debug window. So copy the chars state and use that for calculating the blend
+  // list and displaying that.
+  ::AnimV20::AnimGraphStateHolder stateCopy = ::AnimV20::AnimGraphStateHolder(st);
 
   Tab<float> abnWt(framemem_ptr());
   mem_set_0(tlsCtx.bnlWt);
   mem_set_0(tlsCtx.pbcWt);
   abnWt.resize(graph.getAnimNodeCount());
   mem_set_0(abnWt);
-  ::AnimV20::IAnimBlendNode::BlendCtx bctx(st, tlsCtx, true);
+  ::AnimV20::IAnimBlendNode::BlendCtx bctx(stateCopy, tlsCtx, true);
   bctx.abnWt = abnWt.data();
   graph.getRoot()->buildBlendingList(bctx, 1.0);
 
   das::Array abnWtArr;
-  abnWtArr.data = (char *)abnWt.data();
-  abnWtArr.size = uint32_t(abnWt.size());
-  abnWtArr.capacity = abnWtArr.size;
-  abnWtArr.lock = 1;
+  das::array_mark_locked(abnWtArr, abnWt.data(), abnWt.size());
   abnWtArr.flags = 0;
 
   das::Array bnlWtArr;
-  bnlWtArr.data = (char *)tlsCtx.bnlWt.data();
-  bnlWtArr.size = uint32_t(tlsCtx.bnlWt.size());
-  bnlWtArr.capacity = bnlWtArr.size;
-  bnlWtArr.lock = 1;
+  das::array_mark_locked(bnlWtArr, tlsCtx.bnlWt.data(), tlsCtx.bnlWt.size());
   bnlWtArr.flags = 0;
 
   das::Array pbcWtArr;
-  pbcWtArr.data = (char *)tlsCtx.pbcWt.data();
-  pbcWtArr.size = uint32_t(tlsCtx.pbcWt.size());
-  pbcWtArr.capacity = pbcWtArr.size;
-  pbcWtArr.lock = 1;
+  das::array_mark_locked(pbcWtArr, tlsCtx.pbcWt.data(), tlsCtx.pbcWt.size());
   pbcWtArr.flags = 0;
 
   vec4f args[3];
@@ -534,5 +595,32 @@ inline void animchar_getAnimBlendNodeWeights(::AnimV20::AnimationGraph &graph, :
     at);
 }
 
+inline int animchar_getSlotNodeIdx(const ::AnimCharV20::AnimcharBaseComponent &animchar, int slot_id)
+{
+  return static_cast<int>(animchar.getSlotNodeIdx(slot_id));
+}
+
+inline void AnimcharNodesMat44_getWtms(AnimcharNodesMat44 &nodes, const das::TBlock<void, das::TTemporary<das::TArray<mat44f>>> &block,
+  das::Context *context, das::LineInfoArg *at)
+{
+  das::Array arr;
+  das::array_mark_locked(arr, nodes.nwtm.data(), nodes.nwtm.size());
+  arr.flags = 0;
+  vec4f arg = das::cast<das::Array *>::from(&arr);
+  context->invoke(block, &arg, nullptr, at);
+}
+
+inline char *anim_state_holder_dumpStateText(const ::AnimV20::AnimGraphStateHolder &st, das::Context *context, das::LineInfoArg *at)
+{
+  String out;
+  st.dumpStateText(out);
+  return context->allocateString(out.c_str(), out.length(), at);
+}
+
+inline bool anim_pbc_ctx_trace_single(::AnimV20::AnimPostBlendCtrl::Context &ctx, ::AnimCharV20::TraceRayInfo &ray,
+  const bool isTraceDown)
+{
+  return ctx.irq(::AnimV20::GIRQT_TraceFootStepMultiRay, (intptr_t)&ray, 1, (intptr_t)isTraceDown) == ::AnimV20::GIRQR_TraceOK;
+}
 
 } // namespace bind_dascript

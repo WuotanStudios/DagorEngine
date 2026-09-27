@@ -3,12 +3,18 @@
 #include <pathFinder/tileCache.h>
 #include <pathFinder/tileCacheUtil.h>
 #include <pathFinder/pathFinder.h>
+#include <recastTools/recastTileCacheDetail.h>
 #include <scene/dag_tiledScene.h>
 #include <math/dag_mathUtils.h>
-#include <detourCommon.h>
-#include <detourNavMesh.h>
-#include <detourNavMeshQuery.h>
+#include <DetourCommon.h>
+#include <DetourNavMesh.h>
+#include <DetourNavMeshQuery.h>
+#include <debug/dag_debug.h>
+
+#ifdef FAST_LZ_SUPPORTED
 #include <arc/fastlz/fastlz.h>
+#endif
+
 #define ZDICT_STATIC_LINKING_ONLY 1
 #include <zstd.h>
 #include <dictBuilder/zdict.h>
@@ -28,8 +34,6 @@ bool tilecache_is_dynamic_ladder_links_enabled() { return generateDynamicLadderL
 
 void tilecache_disable_tile_remove_cb() { tileCacheRemoveCbEnabled = false; }
 void tilecache_set_tile_remove_cb(tile_remove_cb_t tile_remove_cb) { tileCacheRemoveCb = tile_remove_cb; }
-
-static const float fastlzMaxCompressedSizeFactor = 1.05f;
 
 static const unsigned int staticJLBias = 1000;
 static const unsigned int staticOLBias = 2000;
@@ -72,6 +76,24 @@ static inline bool is_obstacle_in_tile(const dtCompressedTileRef *a, const int n
   return false;
 }
 
+TileCacheMeshProcess::TileCacheMeshProcess() : detailStorage(eastl::make_unique<recastnavmesh::TileCacheDetailStorage>()) {}
+
+TileCacheMeshProcess::~TileCacheMeshProcess() = default;
+
+void TileCacheMeshProcess::setDetailedData(bool include, float sample_dist, float sample_max_error)
+{
+  includeDetailedData = include;
+  detailSampleDist = sample_dist;
+  detailSampleMaxError = sample_max_error;
+  if (!includeDetailedData && detailStorage)
+    detailStorage->clear();
+}
+
+TileCacheDetailSettings TileCacheMeshProcess::getDetailedDataSettings() const
+{
+  return {includeDetailedData ? 1u : 0u, detailSampleDist, detailSampleMaxError};
+}
+
 static inline bool is_pt_in_obstacle(const float *center, const float *half_extents, const float *rot_aux, const float *p)
 {
   const float y = p[1] - center[1];
@@ -88,71 +110,49 @@ static inline bool is_pt_in_obstacle(const float *center, const float *half_exte
   return true;
 }
 
-TileCacheCompressor::~TileCacheCompressor()
+void TileCacheCompressor::initDict(dag::ConstSpan<char> zstdDictBuff)
 {
-  ZSTD_freeDCtx(dctx);
-  ZSTD_freeDDict(dDict);
-}
-
-void TileCacheCompressor::reset(bool isZSTD, const Tab<char> &zstdDictBuff)
-{
-  ZSTD_freeDCtx(dctx);
-  ZSTD_freeDDict(dDict);
-  dctx = nullptr;
-  dDict = nullptr;
-
-  if (!isZSTD)
-    return;
-
-  dctx = ZSTD_createDCtx();
-  G_ASSERT(dctx);
+  G_ASSERT(!dDict); // Double load without cleanup?
   if (!zstdDictBuff.empty())
   {
-    dDict = ZSTD_createDDict(zstdDictBuff.data(), zstdDictBuff.size());
-    G_ASSERT(dDict);
+    G_VERIFY((dctx = ZSTD_createDCtx()));
+    G_VERIFY((dDict = ZSTD_createDDict(zstdDictBuff.data(), zstdDictBuff.size())));
   }
 }
 
-int TileCacheCompressor::maxCompressedSize(const int bufferSize)
+void TileCacheCompressor::reset()
 {
-  return (dctx != nullptr) ? (int)ZSTD_compressBound(bufferSize) : (int)(bufferSize * fastlzMaxCompressedSizeFactor);
+  if (auto d = eastl::exchange(dctx, nullptr))
+    ZSTD_freeDCtx(d);
+  if (auto d = eastl::exchange(dDict, nullptr))
+    ZSTD_freeDDict(d);
 }
+
+int TileCacheCompressor::maxCompressedSize(const int bufferSize) { return ZSTD_compressBound(bufferSize); }
 
 dtStatus TileCacheCompressor::compress(const unsigned char *buffer, const int bufferSize, unsigned char *compressed,
   const int maxCompressedSize, int *compressedSize)
 {
-  if (dctx != nullptr)
-  {
-    size_t res = ZSTD_compress(compressed, maxCompressedSize, buffer, bufferSize, -1);
-    *compressedSize = ZSTD_isError(res) ? -1 : (int)res;
-  }
-  else
-    *compressedSize = fastlz_compress((const void *const)buffer, bufferSize, compressed);
+  size_t res = ZSTD_compress(compressed, maxCompressedSize, buffer, bufferSize, -1);
+  *compressedSize = ZSTD_isError(res) ? -1 : (int)res;
   return *compressedSize < 0 ? DT_FAILURE : DT_SUCCESS;
 }
 
 dtStatus TileCacheCompressor::decompress(const unsigned char *compressed, const int compressedSize, unsigned char *buffer,
   const int maxBufferSize, int *bufferSize)
 {
-  if (dctx != nullptr)
-  {
-    size_t res;
-    if (dDict)
-      res = ZSTD_decompress_usingDDict(dctx, buffer, maxBufferSize, compressed, compressedSize, dDict);
-    else
-      res = ZSTD_decompressDCtx(dctx, buffer, maxBufferSize, compressed, compressedSize);
-
-    if (!ZSTD_isError(res))
-      *bufferSize = (int)res;
-    else
-    {
-      // if failed try fastlz (for example for navmesh patch tiles)
-      int sz = fastlz_decompress(compressed, compressedSize, buffer, maxBufferSize);
-      *bufferSize = sz > 0 ? sz : -1;
-    }
-  }
+  size_t res;
+  if (dDict)
+    res = ZSTD_decompress_usingDDict(dctx, buffer, maxBufferSize, compressed, compressedSize, dDict);
   else
-    *bufferSize = fastlz_decompress(compressed, compressedSize, buffer, maxBufferSize);
+    res = ZSTD_decompress(buffer, maxBufferSize, compressed, compressedSize);
+  *bufferSize = -1;
+  if (!ZSTD_isError(res))
+    *bufferSize = (int)res;
+#ifdef FAST_LZ_SUPPORTED // Legacy support for sandbox navmesh patch files
+  else if (int sz = fastlz_decompress(compressed, compressedSize, buffer, maxBufferSize); sz > 0)
+    *bufferSize = sz;
+#endif
   return *bufferSize < 0 ? DT_FAILURE : DT_SUCCESS;
 }
 
@@ -472,8 +472,11 @@ void TileCacheMeshProcess::remove(int tx, int ty, int tlayer)
 }
 
 void TileCacheMeshProcess::process(struct dtNavMeshCreateParams *params, unsigned char *polyAreas, unsigned short *polyFlags,
-  dtCompressedTileRef ref)
+  dtCompressedTileRef ref, const dtTileCacheLayer &layer)
 {
+  if (detailStorage)
+    detailStorage->clear();
+
   for (int i = 0; i < params->polyCount; ++i)
   {
     const auto area = polyAreas[i];
@@ -485,6 +488,20 @@ void TileCacheMeshProcess::process(struct dtNavMeshCreateParams *params, unsigne
       case POLYAREA_BLOCKED: flags |= POLYFLAG_BLOCKED; break;
     }
     polyFlags[i] = flags;
+  }
+
+  if (includeDetailedData && detailStorage)
+  {
+    const dtTileCacheParams *tcParams = tc->getParams();
+    const float sampleDist = detailSampleDist < 0.9f ? 0.0f : params->cs * detailSampleDist;
+    const float sampleMaxError = params->ch * detailSampleMaxError;
+    if (detailStorage->build(layer, *params, tcParams->maxSimplificationError, sampleDist, sampleMaxError))
+      detailStorage->apply(*params);
+    else
+      logwarn("navmesh: failed to build tile cache detail mesh for tile (%d, %d, %d), "
+              "(%.3f, %.3f, %.3f)-(%.3f, %.3f, %.3f), detail sample dist %.3f, max error %.3f",
+        params->tileX, params->tileY, params->tileLayer, params->bmin[0], params->bmin[1], params->bmin[2], params->bmax[0],
+        params->bmax[1], params->bmax[2], sampleDist, sampleMaxError);
   }
 
   const dtMeshTile *tile = mesh->getTileAt(params->tileX, params->tileY, params->tileLayer);

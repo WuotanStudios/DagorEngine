@@ -82,87 +82,115 @@ namespace das {
         das_iterator(T & info) : das_rtti_iterator<VarInfo, T>(info) {}
     };
 
-    char * rtti_get_das_type_name(Type tt, Context * context, LineInfoArg * at);
-    int rtti_add_annotation_argument(AnnotationArgumentList& list, const char* name);
+    DAS_API char * rtti_get_das_type_name(Type tt, Context * context, LineInfoArg * at);
+    DAS_API int rtti_add_annotation_argument(AnnotationArgumentList& list, const char* name);
 
-    vec4f rtti_contextFunctionInfo ( Context & context, SimNode_CallBase *, vec4f * );
-    vec4f rtti_contextVariableInfo ( Context & context, SimNode_CallBase *, vec4f * );
-    int32_t rtti_contextTotalFunctions(Context & context);
-    int32_t rtti_contextTotalVariables(Context & context);
+    DAS_API vec4f rtti_contextFunctionInfo ( Context & context, SimNode_CallBase *, vec4f * );
+    DAS_API vec4f rtti_contextVariableInfo ( Context & context, SimNode_CallBase *, vec4f * );
+    DAS_API int32_t rtti_contextTotalFunctions(Context & context);
+    DAS_API int32_t rtti_contextTotalVariables(Context & context);
+    struct NameLookup;
+    DAS_API NameLookup * rtti_name_lookup_create ();
+    DAS_API void rtti_name_lookup_destroy ( NameLookup * lookup );
+    DAS_API void rtti_name_lookup_insert ( NameLookup * lookup, uint64_t mnh, const char * name, uint32_t index, uint32_t value );
+    DAS_API void rtti_name_lookup_seal ( NameLookup * lookup, Context * context, LineInfoArg * at );
+    DAS_API uint32_t rtti_name_lookup_count ( NameLookup * lookup );
+    DAS_API uint32_t rtti_name_lookup_mnh_buckets ( NameLookup * lookup );
+    DAS_API uint32_t rtti_name_lookup_mnh_slots ( NameLookup * lookup );
+    DAS_API uint32_t rtti_name_lookup_name_buckets ( NameLookup * lookup );
+    DAS_API uint32_t rtti_name_lookup_name_slots ( NameLookup * lookup );
+    DAS_API uint32_t rtti_name_lookup_mnh_disp ( NameLookup * lookup, uint32_t bucket );
+    DAS_API uint32_t rtti_name_lookup_name_disp ( NameLookup * lookup, uint32_t bucket );
+    DAS_API uint64_t rtti_name_lookup_entry_mnh ( NameLookup * lookup, uint32_t slot );
+    DAS_API uint32_t rtti_name_lookup_entry_value ( NameLookup * lookup, uint32_t slot );
+    DAS_API uint32_t rtti_name_lookup_entry_index ( NameLookup * lookup, uint32_t slot );
+    DAS_API int32_t rtti_name_lookup_entry_next ( NameLookup * lookup, uint32_t slot );
+    DAS_API uint64_t rtti_name_lookup_name_hash ( NameLookup * lookup, uint32_t slot );
+    DAS_API int32_t rtti_name_lookup_name_head ( NameLookup * lookup, uint32_t slot );
 
     __forceinline Context  & thisContext ( Context * context ) { return *context; }
 
-    RttiValue rtti_builtin_variable_value(const VarInfo & info);
+    DAS_API RttiValue rtti_builtin_variable_value(const VarInfo & info);
 
     struct AnnotationArgument;
-    RttiValue rtti_builtin_argument_value(const AnnotationArgument & info, Context * context, LineInfoArg * at);
+    DAS_API RttiValue rtti_builtin_argument_value(const AnnotationArgument & info, Context * context, LineInfoArg * at);
+    DAS_API RttiValue rtti_builtin_argument_info_value(const AnnotationArgumentInfo & info, Context * context, LineInfoArg * at);
 
-    int32_t rtti_getDimTypeInfo(const TypeInfo & ti, int32_t index, Context * context, LineInfoArg * at);
-    int32_t rtti_getDimVarInfo(const VarInfo & ti, int32_t index, Context * context, LineInfoArg * at);
+    DAS_API const AnnotationInfo & rtti_builtin_struct_annotation ( const StructInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API const AnnotationInfo & rtti_builtin_func_annotation ( const FuncInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API const AnnotationInfo & rtti_builtin_enum_annotation ( const EnumInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API const AnnotationArgumentInfo & rtti_builtin_annotation_argument ( const AnnotationInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API const AnnotationArgumentInfo & rtti_builtin_var_annotation_argument ( const VarInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API Annotation * rtti_builtin_resolve_annotation ( const AnnotationInfo & info );
 
-    char * builtin_das_root ( Context * context, LineInfoArg * at );
-    smart_ptr<FileAccess> makeFileAccess( char * pak, Context * context, LineInfoArg * at );
-    bool introduceFile ( smart_ptr_raw<FileAccess> access, char * fname, char * str, Context * context, LineInfoArg * );
-    bool rtti_add_file_access_root ( smart_ptr<FileAccess> access, const char * mod, const char * path );
+    DAS_API int32_t rtti_getDimTypeInfo(const TypeInfo & ti, int32_t index, Context * context, LineInfoArg * at);
+    DAS_API int32_t rtti_getDimVarInfo(const VarInfo & ti, int32_t index, Context * context, LineInfoArg * at);
+
+    DAS_API smart_ptr<FileAccess> makeFileAccess( char * pak, Context * context, LineInfoArg * at );
+    DAS_API bool introduceFile ( smart_ptr_raw<FileAccess> access, char * fname, char * str, Context * context, LineInfoArg * );
+    DAS_API bool rtti_add_file_access_root ( smart_ptr<FileAccess> access, const char * mod, const char * path );
 
     struct CodeOfPolicies;
-    void rtti_builtin_compile(char * modName, char * str, const CodeOfPolicies & cop,
+    DAS_API void rtti_builtin_compile(char * modName, char * str, const CodeOfPolicies & cop,
         const TBlock<void, bool, smart_ptr<Program>, const string> & block, Context * context, LineInfoArg * lineinfo);
-    void rtti_builtin_compile_ex ( char * modName, char * str, const CodeOfPolicies & cop, bool exportAll,
+    DAS_API void rtti_builtin_compile_ex ( char * modName, char * str, const CodeOfPolicies & cop, bool exportAll,
             const TBlock<void,bool,smart_ptr<Program>,const string> & block, Context * context, LineInfoArg * at );
-    void rtti_builtin_compile_file(char * modName, smart_ptr<FileAccess> access, ModuleGroup* module_group, const CodeOfPolicies & cop,
+    DAS_API void rtti_builtin_compile_file(char * modName, smart_ptr<FileAccess> access, ModuleGroup* module_group, const CodeOfPolicies & cop,
         const TBlock<void, bool, smart_ptr<Program>, const string> & block, Context * context, LineInfoArg * lineinfo);
 
-    void rtti_builtin_simulate ( const smart_ptr<Program> & program,
+    DAS_API void rtti_builtin_simulate ( const smart_ptr<Program> & program,
         const TBlock<void,bool,smart_ptr_raw<Context>,string> & block, Context * context, LineInfoArg * lineinfo );
 
-    void rtti_builtin_program_for_each_module(smart_ptr_raw<Program> prog, const TBlock<void, Module *> & block, Context * context, LineInfoArg * lineinfo);
-    void rtti_builtin_program_for_each_registered_module(const TBlock<void, Module *> & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_program_for_each_module(smart_ptr_raw<Program> prog, const TBlock<void, Module *> & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_program_for_each_registered_module(const TBlock<void, Module *> & block, Context * context, LineInfoArg * lineinfo);
 
-    void rtti_builtin_module_for_each_dependency ( Module * module, const TBlock<void,Module *,bool> & block, Context * context, LineInfoArg * at );
+    DAS_API void rtti_builtin_module_for_each_dependency ( Module * module, const TBlock<void,Module *,bool> & block, Context * context, LineInfoArg * at );
 
-    Module * rtti_get_this_module(smart_ptr_raw<Program> prog);
-    Module * rtti_get_builtin_module(const char * name);
+    DAS_API Module * rtti_get_this_module(smart_ptr_raw<Program> prog);
+    DAS_API Module * rtti_get_builtin_module(const char * name);
 
-    void rtti_builtin_module_for_each_enumeration(Module * module, const TBlock<void, const EnumInfo> & block, Context * context, LineInfoArg * lineinfo);
-    void rtti_builtin_module_for_each_structure(Module * module, const TBlock<void, const StructInfo> & block, Context * context, LineInfoArg * lineinfo);
-    void rtti_builtin_module_for_each_function(Module * module, const TBlock<void, const FuncInfo> & block, Context * context, LineInfoArg * lineinfo);
-    void rtti_builtin_module_for_each_generic(Module * module, const TBlock<void, const FuncInfo> & block, Context * context, LineInfoArg * lineinfo);
-    void rtti_builtin_module_for_each_global(Module * module, const TBlock<void, const VarInfo> & block, Context * context, LineInfoArg * lineinfo);
-    void rtti_builtin_module_for_each_annotation(Module * module, const TBlock<void, const Annotation> & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_module_for_each_enumeration(Module * module, const TBlock<void, const EnumInfo> & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_module_for_each_structure(Module * module, const TBlock<void, const StructInfo> & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_module_for_each_function(Module * module, const TBlock<void, const FuncInfo> & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_module_for_each_generic(Module * module, const TBlock<void, const FuncInfo> & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_module_for_each_global(Module * module, const TBlock<void, const VarInfo> & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_module_for_each_annotation(Module * module, const TBlock<void, const Annotation> & block, Context * context, LineInfoArg * lineinfo);
 
     // note: this one is not TBlock, so that we don't have to include ast.h
-    void rtti_builtin_structure_for_each_annotation(const StructInfo & info, const Block & block, Context * context, LineInfoArg * lineinfo);
+    DAS_API void rtti_builtin_structure_for_each_annotation(const StructInfo & info, const Block & block, Context * context, LineInfoArg * lineinfo);
 
     // if we are in the module, compiling macros
-    bool is_compiling_macros_in_module ( char * name );
+    DAS_API bool is_compiling_macros_in_module ( char * name );
 
     struct BasicStructureAnnotation;
-    void rtti_builtin_basic_struct_for_each_field(const BasicStructureAnnotation & ann,
+    DAS_API void rtti_builtin_basic_struct_for_each_field(const BasicStructureAnnotation & ann,
         const TBlock<void, char *, char*, const TypeInfo, uint32_t> & block, Context * context, LineInfoArg * lineinfo);
-    void rtti_builtin_basic_struct_for_each_parent ( const BasicStructureAnnotation & ann,
+    DAS_API void rtti_builtin_basic_struct_for_each_parent ( const BasicStructureAnnotation & ann,
         const TBlock<void,Annotation *> & block, Context * context, LineInfoArg * at );
 
-    LineInfo getCurrentLineInfo( LineInfoArg * lineInfo );
-    void builtin_expected_errors ( ProgramPtr prog, const TBlock<void,CompilationError,int> & block, Context * context, LineInfoArg * lineInfo );
-    void builtin_list_require ( ProgramPtr prog, const TBlock<void,Module *,TTemporary<const char *>,TTemporary<const char *>,bool,const LineInfo &> & block,
+    DAS_API LineInfo getCurrentLineInfo( LineInfoArg * lineInfo );
+    DAS_API void builtin_expected_errors ( ProgramPtr prog, const TBlock<void,CompilationError,int> & block, Context * context, LineInfoArg * lineInfo );
+    DAS_API void builtin_list_require ( ProgramPtr prog, const TBlock<void,Module *,TTemporary<const char *>,TTemporary<const char *>,bool,const LineInfo &> & block,
         Context * context, LineInfoArg * lineInfo );
 
-    Func builtin_getFunctionByMnh ( uint64_t MNH, Context * context );
-    Func builtin_getFunctionByMnh_inContext ( uint64_t MNH, Context & context );
-    uint64_t builtin_getFunctionMnh ( Func func, Context * context );
-    uint64_t das_get_SimFunction_by_MNH ( uint64_t MNH, Context & context );
-    int32_t rtti_getTablePtr ( void * _table, vec4f key, Type baseType, int valueTypeSize, Context * context, LineInfoArg * at );
+    DAS_API Func builtin_getFunctionByMnh ( uint64_t MNH, Context * context );
+    DAS_API Func builtin_getFunctionByMnh_inContext ( uint64_t MNH, Context & context );
+    DAS_API uint64_t builtin_getFunctionMnh ( Func func, Context * context );
+    DAS_API uint64_t das_get_SimFunction_by_MNH ( uint64_t MNH, Context & context );
+    DAS_API int32_t rtti_getTablePtr ( void * _table, vec4f key, Type baseType, int valueTypeSize, Context * context, LineInfoArg * at );
 
-    void lockThisContext ( const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
-    void lockAnyContext ( Context & ctx, const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
-    void lockAnyMutex ( recursive_mutex & rm, const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
+    DAS_API void lockThisContext ( const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
+    DAS_API void lockAnyContext ( Context & ctx, const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
+    DAS_API void lockAnyMutex ( recursive_mutex & rm, const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
 
-    TSequence<VarInfo&> each_FuncInfo ( FuncInfo & st, Context * context, LineInfoArg * at );
-    TSequence<const VarInfo&> each_const_FuncInfo ( const FuncInfo & st, Context * context, LineInfoArg * at );
-    TSequence<VarInfo&> each_StructInfo ( StructInfo & st, Context * context, LineInfoArg * at );
-    TSequence<const VarInfo&> each_const_StructInfo ( const StructInfo & st, Context * context, LineInfoArg * at );
-    TSequence<EnumValueInfo&> each_EnumInfo ( EnumInfo & st, Context * context, LineInfoArg * at );
-    TSequence<const EnumValueInfo&> each_const_EnumInfo ( const EnumInfo & st, Context * context, LineInfoArg * at );
+    DAS_API char * rtti_get_source_line ( FileInfo * info, uint32_t line, Context * context, LineInfoArg * at );
+    DAS_API bool rtti_is_nolint_suppressed ( FileInfo * info, uint32_t line, const char * code, Context * context, LineInfoArg * at );
+
+    DAS_API TSequence<VarInfo&> each_FuncInfo ( FuncInfo & st, Context * context, LineInfoArg * at );
+    DAS_API TSequence<const VarInfo&> each_const_FuncInfo ( const FuncInfo & st, Context * context, LineInfoArg * at );
+    DAS_API TSequence<VarInfo&> each_StructInfo ( StructInfo & st, Context * context, LineInfoArg * at );
+    DAS_API TSequence<const VarInfo&> each_const_StructInfo ( const StructInfo & st, Context * context, LineInfoArg * at );
+    DAS_API TSequence<EnumValueInfo&> each_EnumInfo ( EnumInfo & st, Context * context, LineInfoArg * at );
+    DAS_API TSequence<const EnumValueInfo&> each_const_EnumInfo ( const EnumInfo & st, Context * context, LineInfoArg * at );
 }
 

@@ -7,6 +7,7 @@
 #include "phys_cm.h"
 #include <assets/asset.h>
 #include <de3_interface.h>
+#include <de3_lodController.h>
 #include <de3_objEntity.h>
 #include <de3_randomSeed.h>
 #include <de3_dynRenderService.h>
@@ -30,6 +31,7 @@
 
 #include <winGuiWrapper/wgw_input.h>
 #include <render/dag_cur_view.h>
+#include <libTools/util/appDirRelativePath.h>
 
 using hdpi::_pxActual;
 using hdpi::_pxScaled;
@@ -84,6 +86,8 @@ static inline int testBits(int in, int bits) { return (in & bits) == bits; }
 class PhysObjViewPlugin : public IGenEditorPlugin, public PropPanel::ControlEventHandler
 {
 public:
+  static constexpr int PHYSOBJ_MAX_LOD_COUNT = 10;
+
   enum
   {
     PID_PHYSOBJ_DRAW_BODIES,
@@ -94,6 +98,8 @@ public:
 
     PID_PHYSOBJ_BODY_GLOBAL_GRP,
 
+    PID_PHYSOBJ_BODY_COLLAPSE_ALL,
+    PID_PHYSOBJ_BODY_EXPAND_ALL,
     PID_PHYSOBJ_BODY_GRP,
     PID_PHYSOBJ_BODY_TM_0 = PID_PHYSOBJ_BODY_GRP + MAX_PHYSOBJ_BODY,
     PID_PHYSOBJ_BODY_TM_1 = PID_PHYSOBJ_BODY_TM_0 + MAX_PHYSOBJ_BODY,
@@ -101,8 +107,9 @@ public:
     PID_PHYSOBJ_BODY_TM_3 = PID_PHYSOBJ_BODY_TM_2 + MAX_PHYSOBJ_BODY,
     PID_PHYSOBJ_BODY_MASS = PID_PHYSOBJ_BODY_TM_3 + MAX_PHYSOBJ_BODY,
     PID_PHYSOBJ_BODY_MOMENT = PID_PHYSOBJ_BODY_MASS + MAX_PHYSOBJ_BODY,
+    PID_PHYSOBJ_BODY_STATIC = PID_PHYSOBJ_BODY_MOMENT + MAX_PHYSOBJ_BODY,
 
-    PID_PHYSOBJ_MATERIAL_GRP = PID_PHYSOBJ_BODY_MOMENT + MAX_PHYSOBJ_BODY,
+    PID_PHYSOBJ_MATERIAL_GRP = PID_PHYSOBJ_BODY_STATIC + MAX_PHYSOBJ_BODY,
     PID_PHYSOBJ_MATERIAL = PID_PHYSOBJ_MATERIAL_GRP + MAX_PHYSOBJ_MAT,
 
     PID_PHYSOBJ_BODY_COL_GRP = PID_PHYSOBJ_MATERIAL + MAX_PHYSOBJ_BODY,
@@ -128,6 +135,13 @@ public:
 
     PID_PHYSOBJ_INSTANCE_COUNT,
     PID_PHYSOBJ_INSTANCE_INTERVAL,
+
+    PID_PHYSOBJ_LODS_GROUP,
+    PID_PHYSOBJ_LOD_AUTO_CHOOSE,
+    PID_PHYSOBJ_LOD_FIRST,                                                    // inclusive
+    PID_PHYSOBJ_LOD_LAST = PID_PHYSOBJ_LOD_FIRST + PHYSOBJ_MAX_LOD_COUNT - 1, // inclusive
+
+    PID_PHYSOBJ_NOCOLL_GRP,
   };
 
   PhysObjViewPlugin() :
@@ -153,6 +167,8 @@ public:
   bool begin(DagorAsset *asset) override
   {
     simulationStat.reset();
+    lodCount = 0;
+    forcedRenderLod = -1;
     dasset = asset;
     entity = asset ? DAEDITOR3.createEntity(*asset) : NULL;
     const char *name = asset->getName();
@@ -170,10 +186,14 @@ public:
     if (IRandomSeedHolder *irsh = entity->queryInterface<IRandomSeedHolder>())
       irsh->setPerInstanceSeed(auto_inst_seed0);
 
-    dynPhysObjData = (DynamicPhysObjectData *)get_game_resource_ex(GAMERES_HANDLE_FROM_STRING(name), PhysObjGameResClassId);
+    dynPhysObjData = (DynamicPhysObjectData *)get_game_resource_ex(name, PhysObjGameResClassId);
 
     slowSimulate = false;
-    ::dagor_game_time_scale = 1.0;
+    setPaused(false);
+
+    // We need to store the LOD count because in simulation mode entity is null.
+    ILodController *lodController = entity->queryInterface<ILodController>();
+    lodCount = lodController ? lodController->getLodCount() : 0;
 
     fillPluginPanel();
 
@@ -184,20 +204,95 @@ public:
     physsimulator::end();
 
     nowSimulated = false;
-    simulationPaused = false;
+    slowSimulate = false;
+    setPaused(false);
     simulationStat.reset();
-    ::dagor_game_time_scale = 1.0;
 
     dasset = NULL;
     destroy_it(entity);
 
     if (dynPhysObjData)
     {
-      release_game_resource((GameResource *)dynPhysObjData);
+      release_game_resource_ex(dynPhysObjData, PhysObjGameResClassId);
       dynPhysObjData = NULL;
     }
 
     return true;
+  }
+
+  void registerEditorCommands(IEditorCommandSystem &command_system) override
+  {
+    G_STATIC_ASSERT(PHYSOBJ_MAX_LOD_COUNT == 10);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_AUTO, ImGuiKey_Backspace, ImGuiKey_KeypadDecimal);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_0, ImGuiKey_0, ImGuiKey_Keypad0);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_1, ImGuiKey_1, ImGuiKey_Keypad1);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_2, ImGuiKey_2, ImGuiKey_Keypad2);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_3, ImGuiKey_3, ImGuiKey_Keypad3);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_4, ImGuiKey_4, ImGuiKey_Keypad4);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_5, ImGuiKey_5, ImGuiKey_Keypad5);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_6, ImGuiKey_6, ImGuiKey_Keypad6);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_7, ImGuiKey_7, ImGuiKey_Keypad7);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_8, ImGuiKey_8, ImGuiKey_Keypad8);
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_CHANGE_LOD_9, ImGuiKey_9, ImGuiKey_Keypad9);
+  }
+
+  void registerMenuAccelerators() override
+  {
+    IWndManager &wndManager = *EDITORCORE->getWndManager();
+
+    G_STATIC_ASSERT(PHYSOBJ_MAX_LOD_COUNT == 10);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_AUTO, EditorCommandIds::PHYSOBJ_CHANGE_LOD_AUTO);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_0, EditorCommandIds::PHYSOBJ_CHANGE_LOD_0);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_1, EditorCommandIds::PHYSOBJ_CHANGE_LOD_1);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_2, EditorCommandIds::PHYSOBJ_CHANGE_LOD_2);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_3, EditorCommandIds::PHYSOBJ_CHANGE_LOD_3);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_4, EditorCommandIds::PHYSOBJ_CHANGE_LOD_4);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_5, EditorCommandIds::PHYSOBJ_CHANGE_LOD_5);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_6, EditorCommandIds::PHYSOBJ_CHANGE_LOD_6);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_7, EditorCommandIds::PHYSOBJ_CHANGE_LOD_7);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_8, EditorCommandIds::PHYSOBJ_CHANGE_LOD_8);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_CHANGE_LOD_9, EditorCommandIds::PHYSOBJ_CHANGE_LOD_9);
+  }
+
+  void handleViewportAcceleratorCommand([[maybe_unused]] IGenViewportWnd &wnd, [[maybe_unused]] unsigned id) override
+  {
+    G_STATIC_ASSERT(PHYSOBJ_MAX_LOD_COUNT == 10);
+    if (id == CM_PHYSOBJ_CHANGE_LOD_AUTO)
+      changeLod(-1);
+    else if (id >= CM_PHYSOBJ_CHANGE_LOD_0 && id <= CM_PHYSOBJ_CHANGE_LOD_9)
+      changeLod(id - CM_PHYSOBJ_CHANGE_LOD_0);
+  }
+
+  void updateLodOnPanel()
+  {
+    if (lodCount < 1)
+      return;
+
+    int lod = forcedRenderLod;
+    if (lod >= 0)
+      lod = clamp(lod, 0, lodCount - 1);
+
+    if (PropPanel::ContainerPropertyControl *pluginPanel = getPluginPanel())
+    {
+      if (lod >= 0 && lod < PHYSOBJ_MAX_LOD_COUNT)
+        pluginPanel->setInt(PID_PHYSOBJ_LODS_GROUP, PID_PHYSOBJ_LOD_FIRST + lod);
+      else if (lod < 0)
+        pluginPanel->setInt(PID_PHYSOBJ_LODS_GROUP, PID_PHYSOBJ_LOD_AUTO_CHOOSE);
+    }
+  }
+
+  void changeLod(int lod)
+  {
+    if (lodCount < 1)
+      return;
+
+    forcedRenderLod = lod;
+
+    if (ILodController *lodController = entity ? entity->queryInterface<ILodController>() : nullptr)
+      lodController->setCurLod(lod);
+
+    physsimulator::setRenderLod(lod);
+    updateLodOnPanel();
   }
 
   void clearObjects() override {}
@@ -232,7 +327,7 @@ public:
     if (nowSimulated)
     {
       physsimulator::renderTrans(testBits(getRendSubTypeMask(), collisionMask), false, drawBodies, drawCmass, drawConstraints,
-        drawConstraintRefsys);
+        drawConstraintRefsys, true);
       return;
     }
 
@@ -278,7 +373,7 @@ public:
 
       case STG_RENDER_DYNAMIC_TRANS:
         if (nowSimulated && testBits(getRendSubTypeMask(), rendGeomMask))
-          physsimulator::renderTrans(false, true, false, false, false, false);
+          physsimulator::renderTrans(false, true, false, false, false, false, true);
         break;
 
       default: break;
@@ -314,6 +409,25 @@ public:
     panel.createCheckBox(PID_PHYSOBJ_DRAW_C_MASS, "draw center mass", drawCmass);
     panel.createCheckBox(PID_PHYSOBJ_DRAW_CONSTR, "draw constraints", drawConstraints);
     panel.createCheckBox(PID_PHYSOBJ_DRAW_CONSTR_RS, "draw constraints refSys", drawConstraintRefsys);
+
+    ILodController *lodController = entity->queryInterface<ILodController>();
+    if (lodController && lodCount > 0)
+    {
+      PropPanel::ContainerPropertyControl *radioGroup = panel.createRadioGroup(PID_PHYSOBJ_LODS_GROUP, "Presentation lods:");
+
+      if (lodCount > 1)
+        radioGroup->createRadio(PID_PHYSOBJ_LOD_AUTO_CHOOSE, "auto choose");
+
+      String buffer;
+      for (int i = 0; i < lodCount; ++i)
+      {
+        buffer.printf(64, "lod_%d [%.2f m]", i, lodController->getLodRange(i));
+        radioGroup->createRadio(PID_PHYSOBJ_LOD_FIRST + i, buffer);
+      }
+
+      updateLodOnPanel();
+    }
+
     if (IRandomSeedHolder *irsh = entity->queryInterface<IRandomSeedHolder>())
     {
       panel.createTrackInt(PID_PHYSOBJ_PER_INSTANCE_SEED, "Per-instance seed", irsh->getPerInstanceSeed(), 0, 32767, 1);
@@ -331,6 +445,9 @@ public:
     panel.createEditInt(PID_PHYSOBJ_INSTANCE_COUNT, "physobj instances count", physObjInstanceCount);
     panel.createEditFloat(PID_PHYSOBJ_INSTANCE_INTERVAL, "instance interval size", physObjInstanceInterval);
     panel.createSeparator();
+
+    panel.createButton(PID_PHYSOBJ_BODY_COLLAPSE_ALL, "collapse all bodies");
+    panel.createButton(PID_PHYSOBJ_BODY_EXPAND_ALL, "expand all bodies", true, false);
 
     OAHashNameMap<true> matNames;
 
@@ -362,6 +479,22 @@ public:
       colCapCnt += cap;
 
       fillPanel(panel, body, expand, i, sph, box, cap);
+    }
+
+    panel.createSeparator();
+
+    dag::ConstSpan<PhysicsResource::CollisionPair> pairs = dynPhysObjData->physRes->getNoCollisionPairs();
+    const dag::ConstSpan<PhysicsResource::Body> &bodies = dynPhysObjData->physRes->getBodies();
+    PropPanel::ContainerPropertyControl *grp = panel.createGroup(PID_PHYSOBJ_NOCOLL_GRP, "Non colliding body pairs");
+    if (pairs.empty())
+    {
+      grp->createStatic(-1, "No pairs");
+    }
+    String cap;
+    for (int i = 0; i < pairs.size(); ++i)
+    {
+      cap.printf(256, "%s - %s", bodies[pairs[i].body0].name.str(), bodies[pairs[i].body1].name.str());
+      grp->createStatic(-1, cap);
     }
 
     PropPanel::ContainerPropertyControl &gStatGrp = *panel.createGroup(PID_PHYSOBJ_BODY_GLOBAL_GRP, "Statistic");
@@ -422,6 +555,7 @@ public:
 
 
     PropPanel::ContainerPropertyControl *grp = panel.createGroup(PID_PHYSOBJ_BODY_GRP + i, caption.str());
+    grp->setBoolValue(!simple); // multi body phys objects have groups collapsed, simple expanded
     {
 
       static String buffer;
@@ -432,6 +566,11 @@ public:
       grp->createStatic(PID_PHYSOBJ_BODY_MOMENT + i, "inertia tensor:");
       buffer.printf(128, "  %.2f, %.2f, %.2f", body.momj.x, body.momj.y, body.momj.z);
       grp->createStatic(PID_PHYSOBJ_BODY_MOMENT + i, buffer);
+
+      buffer.printf(128, "material name: %s", body.materialName);
+      grp->createStatic(-1, buffer);
+
+      grp->createCheckBox(PID_PHYSOBJ_BODY_STATIC + i, "lock body", i < bodyStatic.size() ? bodyStatic[i] : false);
 
       if (simple || !(cap_cnt || sph_cnt || box_cnt))
         return;
@@ -463,6 +602,29 @@ public:
 
   void postFillPropPanel() override {}
 
+  void setBodyStatic(int body_idx, bool is_static)
+  {
+    if (body_idx < 0 || !dynPhysObjData || !dynPhysObjData->physRes)
+      return;
+    if (body_idx >= bodyStatic.size())
+      bodyStatic.resize(body_idx + 1, false);
+
+    bodyStatic[body_idx] = is_static;
+
+    const PhysicsResource::Body &rb = dynPhysObjData->physRes->getBodies()[body_idx];
+    physsimulator::setBodyStatic(body_idx, is_static, rb.mass, rb.momj);
+  }
+
+  void applyBodyStatics()
+  {
+    if (!dynPhysObjData || !dynPhysObjData->physRes)
+      return;
+    dag::ConstSpan<PhysicsResource::Body> bodies = dynPhysObjData->physRes->getBodies();
+    for (int i = 0; i < bodyStatic.size() && i < bodies.size(); ++i)
+      if (bodyStatic[i])
+        physsimulator::setBodyStatic(i, true, bodies[i].mass, bodies[i].momj);
+  }
+
 
   void onChange(int pcb_id, PropPanel::ContainerPropertyControl *panel) override
   {
@@ -487,6 +649,17 @@ public:
         physType = physsimulator::PHYS_DEFAULT;
       restartSimulation(*panel);
     }
+    else if (pcb_id == PID_PHYSOBJ_LODS_GROUP)
+    {
+      const int radioButtonValue = panel->getInt(PID_PHYSOBJ_LODS_GROUP);
+      if (radioButtonValue == PropPanel::RADIO_SELECT_NONE)
+        return;
+
+      if (radioButtonValue >= PID_PHYSOBJ_LOD_FIRST && radioButtonValue <= PID_PHYSOBJ_LOD_LAST)
+        changeLod(radioButtonValue - PID_PHYSOBJ_LOD_FIRST);
+      else
+        changeLod(-1);
+    }
     else if (pcb_id == PID_PHYSOBJ_SIM_SPRING_FACTOR)
       physsimulator::springFactor = panel->getFloat(pcb_id);
     else if (pcb_id == PID_PHYSOBJ_SIM_DAMPER_FACTOR)
@@ -497,12 +670,13 @@ public:
       physObjInstanceInterval = panel->getFloat(pcb_id);
     else if (pcb_id == PID_PHYSOBJ_SCENE_TYPE_GRP)
       sceneType = panel->getInt(pcb_id);
+    else if (pcb_id >= PID_PHYSOBJ_BODY_STATIC && pcb_id < PID_PHYSOBJ_BODY_STATIC + MAX_PHYSOBJ_BODY)
+      setBodyStatic(pcb_id - PID_PHYSOBJ_BODY_STATIC, panel->getBool(pcb_id));
   }
 
 
   void onClick(int pcb_id, PropPanel::ContainerPropertyControl *panel) override
   {
-
     if (pcb_id == PID_PHYSOBJ_SIMULATE)
     {
       if (nowSimulated)
@@ -512,8 +686,10 @@ public:
       }
       else
       {
-        if (!physsimulator::begin(dynPhysObjData, physType, physObjInstanceCount, sceneType, physObjInstanceInterval))
+        if (!physsimulator::begin(dynPhysObjData, physType, physObjInstanceCount, sceneType, physObjInstanceInterval,
+              physsimulator::def_base_plane_ht, physsimulator::def_base_plane_ht, forcedRenderLod))
           return;
+        applyBodyStatics();
         panel->setCaption(pcb_id, "stop simulation");
       }
 
@@ -529,18 +705,20 @@ public:
       restartSimulation(*panel);
     else if (pcb_id == PID_PHYSOBJ_SIM_PAUSE)
     {
-      simulationPaused = !simulationPaused;
-      if (simulationPaused)
-        panel->setCaption(pcb_id, "resume");
-      else
-        panel->setCaption(pcb_id, "pause");
+      setPaused(!simulationPaused);
+      panel->setCaption(pcb_id, simulationPaused ? "resume" : "pause");
     }
     else if (pcb_id == PID_PHYSOBJ_SIM_SLOWMO)
     {
-      slowSimulate = !slowSimulate;
-      ::dagor_game_time_scale = slowSimulate ? 0.1 : 1.0;
+      setSlowMo(!slowSimulate);
       panel->setCaption(pcb_id, slowSimulate ? "normal" : "slow-mo");
     }
+    else if (pcb_id == PID_PHYSOBJ_BODY_COLLAPSE_ALL)
+      for (int i = 0; i < MAX_PHYSOBJ_BODY; ++i)
+        panel->setBool(PID_PHYSOBJ_BODY_GRP + i, /*minimised*/ true);
+    else if (pcb_id == PID_PHYSOBJ_BODY_EXPAND_ALL)
+      for (int i = 0; i < MAX_PHYSOBJ_BODY; ++i)
+        panel->setBool(PID_PHYSOBJ_BODY_GRP + i, /*minimised*/ false);
   }
 
   void drawText(IGenViewportWnd *wnd, hdpi::Px x, hdpi::Px y, const String &text)
@@ -634,15 +812,27 @@ public:
   }
 
 protected:
+  void applyTimeScale() const { ::dagor_game_time_scale = simulationPaused ? 0.f : (slowSimulate ? 0.1f : 1.f); }
+
+  void setPaused(bool paused)
+  {
+    simulationPaused = paused;
+    applyTimeScale();
+  }
+
+  void setSlowMo(bool slowmo)
+  {
+    slowSimulate = slowmo;
+    applyTimeScale();
+  }
+
   void prepareSimulate(bool simulate)
   {
     simulationStat.reset();
+    setPaused(false);
 
     if (simulate)
-    {
       destroy_it(entity);
-      simulationPaused = false;
-    }
     else
     {
       entity = dasset ? DAEDITOR3.createEntity(*dasset) : NULL;
@@ -650,6 +840,7 @@ protected:
       {
         entity->setSubtype(DAEDITOR3.registerEntitySubTypeId("single_ent"));
         entity->setTm(TMatrix::IDENT);
+        changeLod(forcedRenderLod);
       }
       repaintView();
     }
@@ -661,7 +852,7 @@ protected:
     if (!nowSimulated)
       return;
 
-    simulationPaused = false;
+    setPaused(false);
     panel.setCaption(PID_PHYSOBJ_SIM_PAUSE, "pause");
 
     simulationStat.reset();
@@ -680,7 +871,11 @@ protected:
   {
     if (nowSimulated)
       physsimulator::end();
-    return nowSimulated = physsimulator::begin(dynPhysObjData, physType, physObjInstanceCount, sceneType, physObjInstanceInterval);
+    nowSimulated = physsimulator::begin(dynPhysObjData, physType, physObjInstanceCount, sceneType, physObjInstanceInterval,
+      physsimulator::def_base_plane_ht, physsimulator::def_base_plane_ht, forcedRenderLod);
+    if (nowSimulated)
+      applyBodyStatics();
+    return nowSimulated;
   }
 
 protected:
@@ -697,6 +892,9 @@ protected:
   int sceneType = physsimulator::SCENE_TYPE_GROUP;
   int physObjInstanceCount = 1;
   float physObjInstanceInterval = 0;
+  int forcedRenderLod = -1;
+  int lodCount = 0;
+  Tab<bool> bodyStatic;
 };
 
 
@@ -723,13 +921,13 @@ public:
     steady = false;
     rwd = fwd = rsa = fsa = false;
 
-    DataBlock appBlk(::get_app().getWorkspace().getAppPath());
-    const char *cpBlkPath = appBlk.getBlockByNameEx("game")->getStr("car_params", "/game/config/car_params.blk");
-    load_car_params_block_from(String(260, "%s%s", ::get_app().getWorkspace().getAppDir(), cpBlkPath));
+    DataBlock appBlk(::get_app().getWorkspace().getAppBlkPath());
+    load_car_params_block_from(
+      make_eff_app_relative_path(appBlk.getBlockByNameEx("game")->getStr("car_params", "game/config/car_params.blk")));
 
     nowSimulated = false;
     slowSimulate = false;
-    ::dagor_game_time_scale = 1.0;
+    setPaused(false);
     car = NULL;
     restartSim();
 
@@ -758,27 +956,32 @@ public:
     physsimulator::end();
 
     nowSimulated = false;
-    simulationPaused = false;
+    slowSimulate = false;
+    setPaused(false);
     simulationStat.reset();
     curTime = 0.f;
-    ::dagor_game_time_scale = 1.0;
 
     dasset = NULL;
     destroy_it(entity);
 
     if (dynPhysObjData)
     {
-      release_game_resource((GameResource *)dynPhysObjData);
+      release_game_resource_ex(dynPhysObjData, PhysObjGameResClassId);
       dynPhysObjData = NULL;
     }
 
     return true;
   }
 
+  void registerEditorCommands(IEditorCommandSystem &command_system) override
+  {
+    command_system.addCommand(EditorCommandIds::PHYSOBJ_SIM_TOGGLE_DRIVER, ImGuiKey_Enter);
+  }
+
   void registerMenuAccelerators() override
   {
     IWndManager &wndManager = *EDITORCORE->getWndManager();
-    wndManager.addViewportAccelerator(CM_PHYSOBJ_SIM_TOGGLE_DRIVER, ImGuiKey_Enter);
+    wndManager.addViewportAccelerator(CM_PHYSOBJ_SIM_TOGGLE_DRIVER, EditorCommandIds::PHYSOBJ_SIM_TOGGLE_DRIVER);
   }
 
   void handleViewportAcceleratorCommand([[maybe_unused]] IGenViewportWnd &wnd, [[maybe_unused]] unsigned id) override
@@ -835,7 +1038,7 @@ public:
   void renderObjects() override {}
   void renderTransObjects() override
   {
-    physsimulator::renderTrans(testBits(getRendSubTypeMask(), collisionMask), false, false, false, false, false);
+    physsimulator::renderTrans(testBits(getRendSubTypeMask(), collisionMask), false, false, false, false, false, true);
     if (car)
       car->renderDebug();
   }
@@ -951,7 +1154,8 @@ public:
     if (nowSimulated)
       physsimulator::end();
 
-    if (!physsimulator::begin(NULL, physType, physObjInstanceCount, sceneType, physObjInstanceInterval))
+    if (!physsimulator::begin(NULL, physType, physObjInstanceCount, sceneType, physObjInstanceInterval,
+          physsimulator::def_base_plane_ht, physsimulator::def_base_plane_ht, forcedRenderLod))
       return nowSimulated = false;
 
     if (physType == physsimulator::PHYS_BULLET)

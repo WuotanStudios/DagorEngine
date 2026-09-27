@@ -4,9 +4,7 @@
 #include "hmlSplineObject.h"
 #include "hmlSplinePoint.h"
 #include "hmlEntity.h"
-#include "hmlLight.h"
 #include "hmlOutliner.h"
-#include "hmlSnow.h"
 #include "entityCopyDlg.h"
 
 #include "hmlObjectsEditor.h"
@@ -30,6 +28,7 @@
 
 #include <libTools/dagFileRW/splineShape.h>
 #include <libTools/dagFileRW/dagFileShapeObj.h>
+#include <EditorCore/ec_editorCommandSystem.h>
 #include <EditorCore/ec_ObjectCreator.h>
 #include <EditorCore/ec_outliner.h>
 #include <propPanel/commonWindow/dialogWindow.h>
@@ -46,12 +45,14 @@
 
 #include "crossRoad.h"
 #include "hmlCm.h"
-#include "common.h"
 
 #include <debug/dag_debug.h>
 #include <heightMapLand/dag_hmlGetHeight.h>
 
 #include <winGuiWrapper/wgw_dialogs.h>
+
+#include <EASTL/string_view.h>
+#include <ska_hash_map/flat_hash_map2.hpp>
 
 using editorcore_extapi::dagGeom;
 using editorcore_extapi::dagInput;
@@ -63,8 +64,6 @@ using heightmapland::CopyDlg;
 #define OBJECT_SPLINE  "Splines"
 #define OBJECT_POLYGON "Polygons"
 #define OBJECT_ENTITY  "Entities"
-#define OBJECT_LIGHT   "Sphere lights"
-#define OBJECT_SNOW    "Snow sources"
 
 int HmapLandObjectEditor::geomBuildCntLoft = 0;
 int HmapLandObjectEditor::geomBuildCntPoly = 0;
@@ -144,6 +143,28 @@ struct TraceSplineCache
   }
 } spline_cache;
 
+static void apply_layer_idx_to_entities(RenderableEditableObject *o, bool use_render_layer = true)
+{
+  if (!HmapLandObjectEditor::doesObjectSupportHiding(*o))
+    return;
+
+  if (LandscapeEntityObject *entityObj = RTTI_cast<LandscapeEntityObject>(o))
+    entityObj->applyLayerIdxToEntity(use_render_layer);
+  else if (SplineObject *spline = RTTI_cast<SplineObject>(o))
+    spline->applyLayerIdxToEntities(use_render_layer);
+  else
+    G_ASSERT(false);
+}
+
+static void apply_object_hide_to_entities(PtrTab<RenderableEditableObject> &objects, bool hide)
+{
+  for (int i = 0; i < objects.size(); ++i)
+  {
+    RenderableEditableObject *o = objects[i];
+    if (o->isHidden())
+      apply_layer_idx_to_entities(o, hide);
+  }
+}
 
 HmapLandObjectEditor::HmapLandObjectEditor() :
   inGizmo(false),
@@ -152,13 +173,13 @@ HmapLandObjectEditor::HmapLandObjectEditor() :
   crossRoads(midmem),
   loftGeomCollider(true, *this),
   polyGeomCollider(false, *this),
-  nearSources(tmpmem),
-  cloneObjs(midmem)
+  cloneObjs(midmem),
+  outlinerInterface(new HeightmapLandOutlinerInterface(*this))
 {
   waterGeom = NULL;
   objCreator = NULL;
   areLandHoleBoxesVisible = true;
-  hideSplines = false;
+  hideNotes = false;
   showPhysMat = showPhysMatColors = false;
   autoUpdateSpline = true;
   usePixelPerfectSelection = false;
@@ -192,7 +213,6 @@ HmapLandObjectEditor::HmapLandObjectEditor() :
     assetSrv->subscribeUpdateNotify(this, true, true);
 
   setSuffixDigitsCount(3);
-  nearSources.reserve(SnowSourceObject::NEAR_SRC_COUNT);
 
   if (waterSurfSubtypeMask == -1)
     waterSurfSubtypeMask = 1 << IDaEditor3Engine::get().registerEntitySubTypeId("water_surf");
@@ -235,8 +255,6 @@ void HmapLandObjectEditor::clearToDefaultState()
   memset(catmul, 0, sizeof(catmul));
 
   SplinePointObject::initStatics();
-  SphereLightObject::clearMats();
-  SnowSourceObject::clearMats();
 
   curPt = NULL;
   curSpline = NULL;
@@ -256,87 +274,127 @@ PropPanel::PanelWindowPropertyControl *HmapLandObjectEditor::getObjectProperties
   return objectPropBar ? objectPropBar->getPanel() : nullptr;
 }
 
-void HmapLandObjectEditor::addButton(PropPanel::ContainerPropertyControl *tb, int id, const char *bmp_name, const char *hint,
-  bool check)
-{
-  // In the Landscape editor instead of the "Select objects by name" dialog we show the Outliner.
-  if (id == CM_OBJED_SELECT_BY_NAME)
-  {
-    bmp_name = "outliner";
-    hint = "Outliner (H)";
-    check = true;
-  }
-
-  ObjectEditor::addButton(tb, id, bmp_name, hint, check);
-}
-
 void HmapLandObjectEditor::fillToolBar(PropPanel::ContainerPropertyControl *toolbar)
 {
-  PropPanel::ContainerPropertyControl *tb1 = toolbar->createToolbarPanel(0, "");
+  ObjectEditor::fillToolBar(toolbar);
 
-  addButton(tb1, CM_SHOW_PANEL, "show_hml_panel", "Show/hide landscape props panel (P)", true);
+  IEditorCommandSystem *commandSystem = EDITORCORE->queryEditorInterface<IEditorCommandSystem>();
+
+  // The first toolbar panel. We make it first by moving it before the panels created by ObjectEditor::fillToolBar().
+  PropPanel::ContainerPropertyControl *tb1 = toolbar->createToolbarPanel(CM_HEIGHTMAP_TOOLBAR_PANEL_FIRST);
+  toolbar->moveById(CM_HEIGHTMAP_TOOLBAR_PANEL_FIRST, CM_OBJED_TOOLBAR_PANEL_FIRST);
+
+  addEditorCommandButton(tb1, CM_SHOW_PANEL, EditorCommandIds::TOGGLE_PROPERTIES_AND_OBJECT_PROPERTIES, "show_hml_panel",
+    "Show/hide landscape props panel", true);
+
+  toolbar->removeById(CM_OBJED_OBJPROP_PANEL);
+  addEditorCommandButton(tb1, CM_OBJED_OBJPROP_PANEL, EditorCommandIds::OBJED_OBJPROP_PANEL, "show_panel",
+    "Show/hide object props panel", true);
+  setButton(CM_OBJED_OBJPROP_PANEL, objectPropBar != nullptr);
+
+  toolbar->removeById(CM_OBJED_SELECT_BY_NAME);
+  toolbar->removeById(CM_OBJED_SELECT_BY_NAME_SEPARATOR);
+  addEditorCommandButton(tb1, CM_OBJED_SELECT_BY_NAME, EditorCommandIds::OBJED_SELECT_BY_NAME, "outliner", "Outliner", true);
+
   //  addButton(tb1, CM_SHOW_LAND_OBJECTS, "show_bounds", "Show land hole boxes", true);
   tb1->createSeparator();
 
-  addButton(tb1, CM_HILL_UP, "terr_up_vertex", "Hill up mode (1)", true);
-  addButton(tb1, CM_HILL_DOWN, "terr_down_vertex", "Hill down mode (2)", true);
-  addButton(tb1, CM_ALIGN, "terr_align", "Align mode (3)", true);
-  addButton(tb1, CM_SMOOTH, "terr_smooth", "Smooth mode (4)", true);
+  addEditorCommandButton(tb1, CM_HILL_UP, EditorCommandIds::HILL_UP, "terr_up_vertex", "Hill up mode", true);
+  addEditorCommandButton(tb1, CM_HILL_DOWN, EditorCommandIds::HILL_DOWN, "terr_down_vertex", "Hill down mode", true);
+  addEditorCommandButton(tb1, CM_ALIGN, EditorCommandIds::ALIGN, "terr_align", "Align mode", true);
+  addEditorCommandButton(tb1, CM_SMOOTH, EditorCommandIds::SMOOTH, "terr_smooth", "Smooth mode", true);
   if (hasLightmapTex)
-    addButton(tb1, CM_SHADOWS, "terr_light", "Calculate lighting mode (5)", true);
-  addButton(tb1, CM_SCRIPT, "terr_script", "Apply script (6)", true);
+    addEditorCommandButton(tb1, CM_SHADOWS, EditorCommandIds::SHADOWS, "terr_light", "Calculate lighting mode", true);
+  addEditorCommandButton(tb1, CM_SCRIPT, EditorCommandIds::SCRIPT, "terr_script", "Apply script", true);
   tb1->createSeparator();
 
-  ObjectEditor::fillToolBar(toolbar);
+  // The toolbar panel before the "Filter by name" edit box.
+  PropPanel::ContainerPropertyControl *tb2 = toolbar->createToolbarPanel(CM_HEIGHTMAP_TOOLBAR_PANEL_SECOND);
+  toolbar->moveById(CM_HEIGHTMAP_TOOLBAR_PANEL_SECOND, CM_OBJED_TOOLBAR_PANEL_SELECT_FILTER);
 
-  PropPanel::ContainerPropertyControl *tb2 = toolbar->createToolbarPanel(0, "");
+  addEditorCommandButton(tb2, CM_USE_PIXEL_PERFECT_SELECTION, EditorCommandIds::USE_PIXEL_PERFECT_SELECTION, "ctrl_eff_from_att",
+    "Use pixel perfect selection", true);
+  addEditorCommandButton(tb2, CM_SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT, EditorCommandIds::SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT,
+    "select_only_if_entire_object_in_rect", "Select only if the entire object is in the selection rectangle", true);
+  tb2->createSeparator();
 
-  tb2->createSeparator();
-  addButton(tb2, CM_HIDE_SPLINES, "hide_splines", "Hide splines (Ctrl+0)", true);
-  addButton(tb2, CM_SHOW_PHYSMAT, "show_physmat", "Show physmat", true);
-  addButton(tb2, CM_SHOW_PHYSMAT_COLORS, "show_physmat_colors", "Show physmat color", true);
-  tb2->createSeparator();
-  addButton(tb2, CM_SELECT_PT, "select_vertex", "Select only points (Ctrl+1)", true);
-  addButton(tb2, CM_SELECT_SPLINES, "select_spline", "Select only splines (Ctrl+2)", true);
-  addButton(tb2, CM_SELECT_ENT, "select_entity", "Select only entities (Ctrl+3)", true);
-  addButton(tb2, CM_SELECT_SPL_ENT, "select_spl_ent", "Select only splines and entities (Ctrl+7)", true);
-  //  addButton(tb2, CM_SELECT_LT, "select_lt", "Select only light spheres (Ctrl+4)", true);
-  if (HmapLandPlugin::self->isSnowAvailable())
-    addButton(tb2, CM_SELECT_SNOW, "hide_multi_objects", "Select only snow sources (Ctrl+5)", true);
-  addButton(tb2, CM_USE_PIXEL_PERFECT_SELECTION, "ctrl_eff_from_att", "Use pixel perfect selection (Ctrl+Q)", true);
-  addButton(tb2, CM_SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT, "select_only_if_entire_object_in_rect",
-    "Select only if the entire object is in the selection rectangle", true);
-  tb2->createSeparator();
+  {
+    PropPanel::ContainerPropertyControl *selectPointsContainer = commandSystem->createToolbarPopupButtonGroup(*tb2);
+    addEditorCommandButton(selectPointsContainer, CM_SELECT_POINTS_ALL, EditorCommandIds::SELECT_POINTS_ALL, "select_vertex",
+      "Select only spline and polygon points", true);
+    addEditorCommandButton(selectPointsContainer, CM_SELECT_POINTS_SPLINE, EditorCommandIds::SELECT_POINTS_SPLINE,
+      "select_vertices_spline", "Select only spline points", true);
+    addEditorCommandButton(selectPointsContainer, CM_SELECT_POINTS_POLYGON, EditorCommandIds::SELECT_POINTS_POLYGON,
+      "select_vertices_polygon", "Select only polygon points", true);
+
+    PropPanel::ContainerPropertyControl *selectSplinesContainer = commandSystem->createToolbarPopupButtonGroup(*tb2);
+    addEditorCommandButton(selectSplinesContainer, CM_SELECT_SPLINES_AND_POLYGONS, EditorCommandIds::SELECT_SPLINES_AND_POLYGONS,
+      "select_spline_polygon", "Select only splines and polygons", true);
+    addEditorCommandButton(selectSplinesContainer, CM_SELECT_SPLINES, EditorCommandIds::SELECT_SPLINES, "select_spline",
+      "Select only splines", true);
+    addEditorCommandButton(selectSplinesContainer, CM_SELECT_POLYGONS, EditorCommandIds::SELECT_POLYGONS, "select_polygon",
+      "Select only polygons", true);
+
+    addEditorCommandButton(tb2, CM_SELECT_ENT, EditorCommandIds::SELECT_ENT, "select_entity", "Select only entities", true);
+    addEditorCommandButton(tb2, CM_SELECT_SPL_ENT, EditorCommandIds::SELECT_SPL_ENT, "select_spl_ent",
+      "Select only splines and entities", true);
+  }
+
+  // The toolbar panel after the "Filter by name" edit box.
+  PropPanel::ContainerPropertyControl *tb3 = toolbar->createToolbarPanel(CM_HEIGHTMAP_TOOLBAR_PANEL_SECOND);
+  tb3->createSeparator();
+
+  PropPanel::ContainerPropertyControl *splineAndPolygonDebugControlsContainer = commandSystem->createToolbarPopupButtonGroup(*tb3);
+  addEditorCommandButton(splineAndPolygonDebugControlsContainer, CM_TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS,
+    EditorCommandIds::TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS, "hide_splines_polygons", "Hide spline and polygon controls", true);
+  addEditorCommandButton(splineAndPolygonDebugControlsContainer, CM_TOGGLE_SPLINE_DEBUG_CONTROLS,
+    EditorCommandIds::TOGGLE_SPLINE_DEBUG_CONTROLS, "hide_splines", "Hide only spline controls", true);
+  addEditorCommandButton(splineAndPolygonDebugControlsContainer, CM_TOGGLE_POLYGON_DEBUG_CONTROLS,
+    EditorCommandIds::TOGGLE_POLYGON_DEBUG_CONTROLS, "hide_polygons", "Hide only polygon controls", true);
+
+  addEditorCommandButton(tb3, CM_TOGGLE_NOTE_DEBUG_CONTROLS, EditorCommandIds::TOGGLE_NOTE_DEBUG_CONTROLS, "", "", true);
+  tb3->createSeparator();
 
   //  addButton(tb2, CM_CREATE_HOLEBOX_MODE, "create_holebox", "Create land hole box", true);
-  addButton(tb2, CM_CREATE_ENTITY, "create_lib_ent", "Create entity", true);
-  addButton(tb2, CM_ROTATION_NONE, "rotation_none", "No rotation", true);
-  addButton(tb2, CM_ROTATION_X, "rotation_x", "X to normal", true);
-  addButton(tb2, CM_ROTATION_Y, "rotation_y", "Y to normal", true);
-  addButton(tb2, CM_ROTATION_Z, "rotation_z", "Z to normal", true);
-  addButton(tb2, CM_CREATE_SPLINE, "create_spline", "Create spline (hold shift to place on RI)", true);
-  addButton(tb2, CM_CREATE_POLYGON, "create_poly", "Create polygon", true);
-  //  addButton(tb2, CM_CREATE_LT, "create_lt", "Create light sphere", true);
-  if (HmapLandPlugin::self->isSnowAvailable())
-    addButton(tb2, CM_CREATE_SNOW_SOURCE, "create_multi_object", "Create snow source", true);
-  tb2->createSeparator();
 
-  addButton(tb2, CM_REFINE_SPLINE, "spline_refine", "Refine spline", true);
-  addButton(tb2, CM_SPLIT_SPLINE, "split_spline", "Split spline", true);
-  addButton(tb2, CM_SPLIT_POLY, "split_poly", "Split poly", true);
+  {
+    PropPanel::ContainerPropertyControl *rotationContainer = tb3->createToolbarPanel(0, true);
+    addEditorCommandButton(rotationContainer, CM_ROTATION_NONE, EditorCommandIds::ROTATION_NONE, "rotation_none", "No rotation", true);
+    addEditorCommandButton(rotationContainer, CM_ROTATION_X, EditorCommandIds::ROTATION_X, "rotation_x", "X to normal", true);
+    addEditorCommandButton(rotationContainer, CM_ROTATION_Y, EditorCommandIds::ROTATION_Y, "rotation_y", "Y to normal", true);
+    addEditorCommandButton(rotationContainer, CM_ROTATION_Z, EditorCommandIds::ROTATION_Z, "rotation_z", "Z to normal", true);
+  }
 
-  addButton(tb2, CM_REVERSE_SPLINE, "spline_reverse", "Reverse spline(s)");
-  addButton(tb2, CM_CLOSE_SPLINE, "spline_close", "Close selected spline(s)");
-  addButton(tb2, CM_OPEN_SPLINE, "spline_break", "Un-close spline at selected point");
-  tb2->createSeparator();
+  addEditorCommandButton(tb3, CM_CREATE_ENTITY, EditorCommandIds::CREATE_ENTITY, "create_lib_ent", "Create entity", true);
+  addEditorCommandButton(tb3, CM_CREATE_SPLINE, EditorCommandIds::CREATE_SPLINE, "create_spline",
+    "Create spline (hold Shift to place on RI; Alt+Click for regular shape)", true);
+  addEditorCommandButton(tb3, CM_CREATE_POLYGON, EditorCommandIds::CREATE_POLYGON, "create_poly",
+    "Create polygon (Alt+Click for regular shape)", true);
+  tb3->createSeparator();
 
-  addButton(tb2, CM_MANUAL_SPLINE_REGEN_MODE, "offline", "Use manual obj/geom update for spline/poly", true);
-  addButton(tb2, CM_SPLINE_REGEN, "compile", "Manual spline/poly obj/geom update (F1)");
+  addEditorCommandButton(tb3, CM_SHOW_PHYSMAT, EditorCommandIds::SHOW_PHYSMAT, "show_physmat", "Show physmat", true);
+  addEditorCommandButton(tb3, CM_SHOW_PHYSMAT_COLORS, EditorCommandIds::SHOW_PHYSMAT_COLORS, "show_physmat_colors",
+    "Show physmat color", true);
+  tb3->createSeparator();
+
+  addEditorCommandButton(tb3, CM_REFINE_SPLINE, EditorCommandIds::REFINE_SPLINE, "spline_refine", "Refine spline", true);
+  addEditorCommandButton(tb3, CM_SPLIT_SPLINE, EditorCommandIds::SPLIT_SPLINE, "split_spline", "Split spline", true);
+  addEditorCommandButton(tb3, CM_SPLIT_POLY, EditorCommandIds::SPLIT_POLY, "split_poly", "Split poly", true);
+
+  addEditorCommandButton(tb3, CM_REVERSE_SPLINE, EditorCommandIds::REVERSE_SPLINE, "spline_reverse", "Reverse spline(s)");
+  addEditorCommandButton(tb3, CM_CLOSE_SPLINE, EditorCommandIds::CLOSE_SPLINE, "spline_close", "Close selected spline(s)");
+  addEditorCommandButton(tb3, CM_OPEN_SPLINE, EditorCommandIds::OPEN_SPLINE, "spline_break", "Un-close spline at selected point");
+  tb3->createSeparator();
+
+  addEditorCommandButton(tb3, CM_MANUAL_SPLINE_REGEN_MODE, EditorCommandIds::MANUAL_SPLINE_REGEN_MODE, "offline",
+    "Use manual obj/geom update for spline/poly", true);
+  addEditorCommandButton(tb3, CM_SPLINE_REGEN, EditorCommandIds::SPLINE_REGEN, "compile", "Manual spline/poly obj/geom update");
 
   setButton(CM_MANUAL_SPLINE_REGEN_MODE, !autoUpdateSpline);
   enableButton(CM_SPLINE_REGEN, !autoUpdateSpline);
 
-  addButton(tb2, CM_REBUILD_SPLINES_BITMASK, "splinemask", "Rebuild splines bitmask (F2)");
+  addEditorCommandButton(tb3, CM_REBUILD_SPLINES_BITMASK, EditorCommandIds::REBUILD_SPLINES_BITMASK, "splinemask",
+    "Rebuild splines bitmask");
 }
 
 void HmapLandObjectEditor::updateToolbarButtons()
@@ -360,10 +418,11 @@ void HmapLandObjectEditor::updateToolbarButtons()
   setButton(CM_ROTATION_Y, buttonIdToPlacementRotation(CM_ROTATION_Y) == selectedPlacementRotation);
   setButton(CM_ROTATION_Z, buttonIdToPlacementRotation(CM_ROTATION_Z) == selectedPlacementRotation);
   setRadioButton(CM_CREATE_HOLEBOX_MODE, getEditMode());
-  setRadioButton(CM_CREATE_LT, getEditMode());
-  setRadioButton(CM_CREATE_SNOW_SOURCE, getEditMode());
   setButton(CM_SHOW_LAND_OBJECTS, areLandHoleBoxesVisible);
-  setButton(CM_HIDE_SPLINES, hideSplines);
+  setRadioButton(CM_TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS, hideSplinesAndPolygonsMode);
+  setRadioButton(CM_TOGGLE_SPLINE_DEBUG_CONTROLS, hideSplinesAndPolygonsMode);
+  setRadioButton(CM_TOGGLE_POLYGON_DEBUG_CONTROLS, hideSplinesAndPolygonsMode);
+  setButton(CM_TOGGLE_NOTE_DEBUG_CONTROLS, !hideNotes);
   setButton(CM_SHOW_PHYSMAT, showPhysMat);
   setButton(CM_SHOW_PHYSMAT_COLORS, showPhysMatColors);
   setButton(CM_MANUAL_SPLINE_REGEN_MODE, !autoUpdateSpline);
@@ -372,8 +431,7 @@ void HmapLandObjectEditor::updateToolbarButtons()
   setButton(CM_SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT, selectOnlyIfEntireObjectInRect);
 
   const int mode = getEditMode();
-  const bool inCreateMode =
-    mode == CM_CREATE_ENTITY || mode == CM_CREATE_SPLINE || mode == CM_CREATE_POLYGON || mode == CM_CREATE_SNOW_SOURCE;
+  const bool inCreateMode = mode == CM_CREATE_ENTITY || mode == CM_CREATE_SPLINE || mode == CM_CREATE_POLYGON;
   enableButton(CM_REFINE_SPLINE, !inCreateMode);
   enableButton(CM_SPLIT_SPLINE, !inCreateMode);
   enableButton(CM_SPLIT_POLY, !inCreateMode);
@@ -381,8 +439,30 @@ void HmapLandObjectEditor::updateToolbarButtons()
   enableButton(CM_CLOSE_SPLINE, !inCreateMode);
   enableButton(CM_OPEN_SPLINE, !inCreateMode);
 
+  const bool isCreateEntityMode = mode == CM_CREATE_ENTITY;
+  enableButton(CM_ROTATION_NONE, isCreateEntityMode);
+  enableButton(CM_ROTATION_X, isCreateEntityMode);
+  enableButton(CM_ROTATION_Y, isCreateEntityMode);
+  enableButton(CM_ROTATION_Z, isCreateEntityMode);
+
   if (HmapLandPlugin::self)
+  {
     enableButton(CM_SPLINE_REGEN, !autoUpdateSpline);
+
+    if (PropPanel::ContainerPropertyControl *toolbar = HmapLandPlugin::self->getToolbar())
+    {
+      if (hideNotes)
+      {
+        toolbar->setButtonPictures(CM_TOGGLE_NOTE_DEBUG_CONTROLS, "show_note_spheres_controls");
+        toolbar->setTooltipId(CM_TOGGLE_NOTE_DEBUG_CONTROLS, "Show note controls");
+      }
+      else
+      {
+        toolbar->setButtonPictures(CM_TOGGLE_NOTE_DEBUG_CONTROLS, "hide_note_spheres_controls");
+        toolbar->setTooltipId(CM_TOGGLE_NOTE_DEBUG_CONTROLS, "Hide note controls");
+      }
+    }
+  }
 }
 
 
@@ -504,6 +584,16 @@ bool HmapLandObjectEditor::supportsRealtimeUpdate() const
 
       if (spline && (spline->isAffectingHmap() || spline->isHeightBake() || spline->getLandClass()))
         return false; // too heavy for realtime updates
+
+      if (auto *p = RTTI_cast<LandscapeEntityObject>(obj); p && p->getEntity())
+      {
+        static int rendInstClassId = DAEDITOR3.getAssetTypeId("rendInst");
+        static int compositClassId = DAEDITOR3.getAssetTypeId("composit");
+        static int prefabClassId = DAEDITOR3.getAssetTypeId("prefab");
+        int entityType = p->getEntity()->getAssetTypeId();
+        if (entityType == compositClassId || entityType == rendInstClassId || entityType == prefabClassId)
+          return false;
+      }
     }
   }
   return true;
@@ -511,8 +601,12 @@ bool HmapLandObjectEditor::supportsRealtimeUpdate() const
 
 void HmapLandObjectEditor::render()
 {
-  bool curPlugin = DAGORED2->curPlugin() == HmapLandPlugin::self;
-  int st_mask = IDaEditor3Engine::get().getEntitySubTypeMask(IObjEntityFilter::STMASK_TYPE_RENDER);
+  const bool curPlugin = DAGORED2->curPlugin() == HmapLandPlugin::self;
+  const int st_mask = IDaEditor3Engine::get().getEntitySubTypeMask(IObjEntityFilter::STMASK_TYPE_RENDER);
+  const bool hideSplines = hideSplinesAndPolygonsMode == CM_TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS ||
+                           hideSplinesAndPolygonsMode == CM_TOGGLE_SPLINE_DEBUG_CONTROLS;
+  const bool hidePolygons = hideSplinesAndPolygonsMode == CM_TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS ||
+                            hideSplinesAndPolygonsMode == CM_TOGGLE_POLYGON_DEBUG_CONTROLS;
 
   TMatrix4 gtm;
   d3d::getglobtm(gtm);
@@ -526,38 +620,56 @@ void HmapLandObjectEditor::render()
 
   if (curPlugin)
   {
-    bool all = !hideSplines;
-    SplineObject *spl_of_sel_pt = NULL;
-    if (hideSplines)
+    if (hideSplines || hidePolygons)
+    {
+      for (SplineObject *spline : splines)
+        spline->forceDebugDrawWhenHidden = false;
+
       for (int i = 0; i < selection.size(); ++i)
         if (SplinePointObject *p = RTTI_cast<SplinePointObject>(selection[i]))
-        {
-          spl_of_sel_pt = p->spline;
-          break;
-        }
-
-    if ((st_mask & SphereLightObject::lightGeomSubtype) && all)
-      for (int i = 0; i < objects.size(); ++i)
-      {
-        SphereLightObject *l = RTTI_cast<SphereLightObject>(objects[i]);
-        if (l)
-          l->render();
-      }
+          if (p->spline)
+            p->spline->forceDebugDrawWhenHidden = p->spline->isPoly() ? hidePolygons : hideSplines;
+    }
 
     dagRender->startLinesRender(true, false, true);
     dagRender->setLinesTm(TMatrix::IDENT);
     for (int i = 0; i < splines.size(); ++i)
-      if (all || splines[i]->isSelected() || splines[i] == spl_of_sel_pt)
+    {
+      const bool showCurrentType = splines[i]->isPoly() ? !hidePolygons : !hideSplines;
+      if (showCurrentType || splines[i]->isSelected() || splines[i]->forceDebugDrawWhenHidden)
         splines[i]->renderLines(false, frustum);
+    }
     dagRender->endLinesRender();
 
     dagRender->startLinesRender();
     for (int i = 0; i < splines.size(); ++i)
-      if (all || splines[i]->isSelected() || splines[i] == spl_of_sel_pt)
+    {
+      const bool showCurrentType = splines[i]->isPoly() ? !hidePolygons : !hideSplines;
+      if (showCurrentType || splines[i]->isSelected() || splines[i]->forceDebugDrawWhenHidden)
         splines[i]->renderLines(true, frustum);
+    }
 
     if (debugP1 && debugP2)
       dagRender->renderLine(*debugP1, *debugP2, E3DCOLOR(255, 0, 0));
+
+    if (shapeCenterPlaced && shapeRadius > 0.f)
+    {
+      const E3DCOLOR circleCol(255, 200, 0);
+      const float cy = shapeCenter.y;
+      const int drawSegs = (getEditMode() == CM_CREATE_POLYGON) ? shapeSegments : 64;
+      const float alpha = TWOPI / drawSegs;
+      Point3 prev(shapeCenter.x - sinf(shapeRotation) * shapeRadius, cy, shapeCenter.z + cosf(shapeRotation) * shapeRadius);
+      for (int i = 1; i <= drawSegs; ++i)
+      {
+        const float t = i * alpha + shapeRotation;
+        Point3 cur(shapeCenter.x - sinf(t) * shapeRadius, cy, shapeCenter.z + cosf(t) * shapeRadius);
+        dagRender->renderLine(prev, cur, circleCol);
+        prev = cur;
+      }
+      if (curPt && curPt->visible)
+        dagRender->renderLine(shapeCenter, curPt->getPos(), E3DCOLOR(255, 255, 100));
+    }
+
     dagRender->endLinesRender();
 
     dagRender->dynRenderBufferClearBuf(*ptDynBuf);
@@ -565,12 +677,28 @@ void HmapLandObjectEditor::render()
 
     int cnt = 0;
     for (int i = 0; i < splines.size(); ++i)
-      if (all || splines[i]->isSelected() || splines[i] == spl_of_sel_pt)
+    {
+      const bool showCurrentType = splines[i]->isPoly() ? !hidePolygons : !hideSplines;
+      if (showCurrentType || splines[i]->isSelected() || splines[i]->forceDebugDrawWhenHidden)
         splines[i]->render(ptDynBuf, gtm, scale, frustum, cnt);
+    }
 
     if (curPt && curPt->visible)
       SplinePointObject::renderPoint(*ptDynBuf, toPoint4(curPt->getPt(), 1) * gtm, scale * SplinePointObject::ptScreenRad,
         E3DCOLOR(200, 200, 10));
+
+    if (shapeCenterPlaced && shapeRadius > 0.f)
+    {
+      const float alpha = TWOPI / shapeSegments;
+      const float cy = shapeCenter.y;
+      for (int i = 0; i < shapeSegments; ++i)
+      {
+        const float t = i * alpha + shapeRotation;
+        Point3 vp(shapeCenter.x - sinf(t) * shapeRadius, cy, shapeCenter.z + cosf(t) * shapeRadius);
+        SplinePointObject::renderPoint(*ptDynBuf, toPoint4(vp, 1) * gtm, scale * SplinePointObject::ptScreenRad,
+          E3DCOLOR(255, 200, 0));
+      }
+    }
 
     dagGeom->set(zFuncLessStateId);
     dagGeom->shaderGlobalSetInt(SplinePointObject::ptRenderPassId, 0);
@@ -583,45 +711,53 @@ void HmapLandObjectEditor::render()
 
     // render note signs
     dagRender->dynRenderBufferClearBuf(*ptDynBuf);
-    if (!all)
-      goto end;
-    for (int i = 0; i < objects.size(); ++i)
+    if (!hideNotes)
     {
-      LandscapeEntityObject *p = RTTI_cast<LandscapeEntityObject>(objects[i]);
-      if (p && !p->getProps().notes.empty())
-        SplinePointObject::renderPoint(*ptDynBuf, toPoint4(p->getPos(), 1) * gtm, 3 * scale * SplinePointObject::ptScreenRad,
-          E3DCOLOR(50, 60, 255));
+      for (int i = 0; i < objects.size(); ++i)
+      {
+        LandscapeEntityObject *p = RTTI_cast<LandscapeEntityObject>(objects[i]);
+        if (p && !p->isHidden() && !p->getProps().notes.empty())
+          SplinePointObject::renderPoint(*ptDynBuf, toPoint4(p->getPos(), 1) * gtm, 3 * scale * SplinePointObject::ptScreenRad,
+            E3DCOLOR(50, 60, 255));
+      }
+      for (int i = 0; i < splines.size(); ++i)
+        if (!splines[i]->isHidden() && !splines[i]->getProps().notes.empty())
+          SplinePointObject::renderPoint(*ptDynBuf, toPoint4(splines[i]->points[0]->getPos(), 1) * gtm,
+            3 * scale * SplinePointObject::ptScreenRad, E3DCOLOR(50, 160, 255));
+
+      dagGeom->set(zFuncLessStateId);
+      dagGeom->shaderGlobalSetInt(SplinePointObject::ptRenderPassId, 0);
+      dagRender->dynRenderBufferFlushToBuffer(*ptDynBuf, signTexPt);
+      dagGeom->reset_override();
+
+      dagGeom->shaderGlobalSetInt(SplinePointObject::ptRenderPassId, 1);
+      dagRender->dynRenderBufferFlushToBuffer(*ptDynBuf, signTexPt);
+      dagRender->dynRenderBufferFlush(*ptDynBuf);
     }
-    for (int i = 0; i < splines.size(); ++i)
-      if (!splines[i]->getProps().notes.empty())
-        SplinePointObject::renderPoint(*ptDynBuf, toPoint4(splines[i]->points[0]->getPos(), 1) * gtm,
-          3 * scale * SplinePointObject::ptScreenRad, E3DCOLOR(50, 160, 255));
-
-    dagGeom->set(zFuncLessStateId);
-    dagGeom->shaderGlobalSetInt(SplinePointObject::ptRenderPassId, 0);
-    dagRender->dynRenderBufferFlushToBuffer(*ptDynBuf, signTexPt);
-    dagGeom->reset_override();
-
-    dagGeom->shaderGlobalSetInt(SplinePointObject::ptRenderPassId, 1);
-    dagRender->dynRenderBufferFlushToBuffer(*ptDynBuf, signTexPt);
-    dagRender->dynRenderBufferFlush(*ptDynBuf);
   }
   else if ((HmapLandPlugin::self->renderAllSplinesAlways || HmapLandPlugin::self->renderSelSplinesAlways))
   {
-    bool all = HmapLandPlugin::self->renderAllSplinesAlways && !hideSplines;
+    const bool showAllSplines = HmapLandPlugin::self->renderAllSplinesAlways && !hideSplines;
+    const bool showAllPolygons = HmapLandPlugin::self->renderAllSplinesAlways && !hidePolygons;
 
     dagRender->startLinesRender(true, false, true);
     dagRender->setLinesTm(TMatrix::IDENT);
     for (int i = 0; i < splines.size(); ++i)
-      if (all || splines[i]->isSelected())
+    {
+      const bool showCurrentType = splines[i]->isPoly() ? showAllPolygons : showAllSplines;
+      if (showCurrentType || splines[i]->isSelected())
         splines[i]->renderLines(false, frustum);
+    }
     dagRender->endLinesRender();
 
     dagRender->startLinesRender();
 
     for (int i = 0; i < splines.size(); ++i)
-      if (all || splines[i]->isSelected())
+    {
+      const bool showCurrentType = splines[i]->isPoly() ? showAllPolygons : showAllSplines;
+      if (showCurrentType || splines[i]->isSelected())
         splines[i]->renderLines(true, frustum);
+    }
 
     if (debugP1 && debugP2)
       dagRender->renderLine(*debugP1, *debugP2, E3DCOLOR(255, 0, 0));
@@ -633,8 +769,11 @@ void HmapLandObjectEditor::render()
 
     int cnt = 0;
     for (int i = 0; i < splines.size(); ++i)
-      if (all || splines[i]->isSelected())
+    {
+      const bool showCurrentType = splines[i]->isPoly() ? showAllPolygons : showAllSplines;
+      if (showCurrentType || splines[i]->isSelected())
         splines[i]->render(ptDynBuf, gtm, scale, frustum, cnt);
+    }
 
     dagGeom->set(zFuncLessStateId);
     dagGeom->shaderGlobalSetInt(SplinePointObject::ptRenderPassId, 0);
@@ -646,7 +785,6 @@ void HmapLandObjectEditor::render()
     dagRender->dynRenderBufferFlush(*ptDynBuf);
   }
 
-end:
   if (objCreator)
     objCreator->render();
 }
@@ -663,14 +801,6 @@ void HmapLandObjectEditor::renderTrans()
   // render object boxes
   if (1)
   {
-    if (st_mask & SphereLightObject::lightGeomSubtype)
-      for (int i = 0; i < objects.size(); ++i)
-      {
-        SphereLightObject *l = RTTI_cast<SphereLightObject>(objects[i]);
-        if (l)
-          l->renderTrans();
-      }
-
     dagRender->startLinesRender();
     dagRender->setLinesTm(TMatrix::IDENT);
     for (int i = 0; i < objects.size(); ++i)
@@ -686,17 +816,6 @@ void HmapLandObjectEditor::renderTrans()
         if (HmapLandHoleObject *o = RTTI_cast<HmapLandHoleObject>(objects[i]))
           o->render();
       }
-
-      if (st_mask & SphereLightObject::lightGeomSubtype)
-      {
-        if (SphereLightObject *l = RTTI_cast<SphereLightObject>(objects[i]))
-          l->renderObject();
-      }
-      if (st_mask & SnowSourceObject::showSubtypeId)
-      {
-        if (SnowSourceObject *sn = RTTI_cast<SnowSourceObject>(objects[i]))
-          sn->renderObject();
-      }
     }
 
     dagRender->endLinesRender();
@@ -711,18 +830,11 @@ void HmapLandObjectEditor::renderGrassMask()
   Frustum frustum;
   frustum.construct(globtm);
 
-  ISplineGenService *splSrv = EDITORCORE->queryEditorInterface<ISplineGenService>();
-  if (splSrv)
   {
-    FastIntList loft_layers;
-    loft_layers.addInt(0);
-    splSrv->gatherLoftLayers(loft_layers, true);
+    ISplineGenService::LayerIndexList loft_layers(0);
+    HmapLandPlugin::splSrv->gatherLoftLayers(loft_layers, true);
     bool opaque = true;
-    for (int lli = 0; lli < loft_layers.size(); lli++)
-    {
-      int ll = loft_layers.getList()[lli];
-      splSrv->renderLoftGeom(ll, opaque, frustum, 0);
-    }
+    loft_layers.iterate_layers([&](unsigned ll) { HmapLandPlugin::splSrv->renderGeneratedGeom(ll, opaque, frustum, 0); });
   }
 
   IRenderingService *prefabMgr = nullptr;
@@ -757,7 +869,7 @@ void HmapLandObjectEditor::renderGeometry(bool opaque)
     dagGeom->shaderGlobalSetColor4(landCellShortDecodeY, Color4(1.0f / 32767.f, 0, 0, 0));
   }
 
-  ISplineGenService *splSrv = EDITORCORE->queryEditorInterface<ISplineGenService>();
+  ISplineGenService *splSrv = HmapLandPlugin::splSrv;
   d3d::settm(TM_WORLD, TMatrix::IDENT);
   TMatrix4 globtm;
   d3d::getglobtm(globtm);
@@ -772,40 +884,32 @@ void HmapLandObjectEditor::renderGeometry(bool opaque)
       dagGeom->geomObjectRenderTrans(*waterGeom);
   }
 
-  FastIntList loft_layers;
-  loft_layers.addInt(0);
-  Tab<SplineObject *> renderSplines;
-  renderSplines.reserve(splines.size());
-  for (int i = 0; i < splines.size(); ++i)
+  ISplineGenService::LayerIndexList loft_layers(0);
+  ISplineGenService::LayerIndexList order_layers;
+  renderRoadsSplinesCache.clear();
+  if (st_mask & SplineObject::roadsSubtypeMask)
   {
-    if (frustum.testBoxB(splines[i]->getGeomBox()))
-      renderSplines.push_back(splines[i]);
+    renderRoadsSplinesCache.reserve(splines.size());
+    for (auto *s : splines)
+      if (s->shouldRenderRoadsGeom(frustum))
+      {
+        order_layers.set(s->getLayer());
+        renderRoadsSplinesCache.push_back(s);
+      }
   }
-  if (splSrv && (st_mask & SplineObject::splineSubtypeMask))
+  splSrv->gatherGeneratedGeomOrderLayers(order_layers);
+  if (st_mask & SplineObject::splineSubtypeMask)
     splSrv->gatherLoftLayers(loft_layers, true);
 
-  for (int lli = 0; lli < loft_layers.size(); lli++)
-  {
-    int max_layer = 0, ll = loft_layers.getList()[lli];
-    for (int i = 0; i < renderSplines.size(); ++i)
-    {
-      int l = renderSplines[i]->getLayer();
-      if (!l)
-        renderSplines[i]->renderGeom(opaque, ll, frustum);
-      else if (max_layer < l)
-        max_layer = l;
-    }
-    if (splSrv)
-      splSrv->renderLoftGeom(ll, opaque, frustum, 0);
-    for (int l = 1; l <= max_layer; l++)
-    {
-      for (int i = 0; i < renderSplines.size(); ++i)
-        if (renderSplines[i]->getLayer() == l)
-          renderSplines[i]->renderGeom(opaque, ll, frustum);
-      if (splSrv)
-        splSrv->renderLoftGeom(ll, opaque, frustum, l);
-    }
-  }
+  loft_layers.iterate_layers([&](unsigned ll) {
+    order_layers.iterate_layers([&](unsigned l) {
+      if (ll == 0)
+        for (auto *s : renderRoadsSplinesCache)
+          if (s->getLayer() == l)
+            s->renderRoadsGeom(opaque, frustum);
+      splSrv->renderGeneratedGeom(ll, opaque, frustum, l);
+    });
+  });
 
   if (st_mask & SplineObject::roadsSubtypeMask)
     for (int i = 0; i < crossRoads.size(); i++)
@@ -836,11 +940,31 @@ void HmapLandObjectEditor::onBrushPaintEnd()
   */
 }
 
+// The selection can change before the drag ends - a Shift+drag clone selects the clones - so the drag is
+// left by exactly the objects that entered it, not by whatever is selected at that point.
 void HmapLandObjectEditor::setSelectionGizmoTranformMode(bool enable)
 {
-  for (int i = 0; i < selection.size(); ++i)
-    if (auto *obj = RTTI_cast<LandscapeEntityObject>(selection[i]))
-      obj->setGizmoTranformMode(enable);
+  if (enable)
+  {
+    clear_and_shrink(gizmoTransformObjs);
+    for (int i = 0; i < selection.size(); ++i)
+      if (auto *obj = RTTI_cast<LandscapeEntityObject>(selection[i]))
+      {
+        obj->setGizmoTranformMode(true);
+        obj->setHiddenFromPlacementTrace(true);
+        gizmoTransformObjs.push_back(obj);
+      }
+  }
+  else
+  {
+    for (int i = 0; i < gizmoTransformObjs.size(); ++i)
+      if (auto *obj = RTTI_cast<LandscapeEntityObject>(gizmoTransformObjs[i]))
+      {
+        obj->setGizmoTranformMode(false); // re-places the object, which still needs it hidden from itself
+        obj->setHiddenFromPlacementTrace(false);
+      }
+    clear_and_shrink(gizmoTransformObjs);
+  }
 }
 
 void HmapLandObjectEditor::gizmoStarted()
@@ -853,8 +977,7 @@ void HmapLandObjectEditor::gizmoStarted()
   setSelectionGizmoTranformMode(true);
 
   for (int i = 0; i < selection.size(); ++i)
-    if (!RTTI_cast<LandscapeEntityObject>(selection[i]) && !RTTI_cast<SplineObject>(selection[i]) &&
-        !RTTI_cast<SphereLightObject>(selection[i]) && !RTTI_cast<SnowSourceObject>(selection[i]))
+    if (!RTTI_cast<LandscapeEntityObject>(selection[i]) && !RTTI_cast<SplineObject>(selection[i]))
       return;
 
   if (dagInput->isShiftKeyDown() && getEditMode() == CM_OBJED_MODE_MOVE)
@@ -954,12 +1077,8 @@ void HmapLandObjectEditor::_addObjects(RenderableEditableObject **obj, int num, 
 
   ObjectEditor::_addObjects(objs.data(), num, use_undo);
 
-  for (int i = 0; i < num; ++i)
-    if (RTTI_cast<SnowSourceObject>(objs[i]))
-    {
-      HmapLandPlugin::self->updateSnowSources();
-      break;
-    }
+  if (num == 1 && !RTTI_cast<SplineObject>(objs[0]))
+    return;
 
   clear_and_shrink(splines);
   for (int i = 0; i < objects.size(); i++)
@@ -978,7 +1097,7 @@ void HmapLandObjectEditor::_removeObjects(RenderableEditableObject **obj, int nu
   Tab<RenderableEditableObject *> remObjs(tmpmem);
   bool rebuild_hmap_modif = false;
 
-  // splitting objects on groops
+  // splitting objects on groups
   for (int i = 0; i < num; i++)
   {
     if (SplineObject *o = RTTI_cast<SplineObject>(obj[i]))
@@ -1005,18 +1124,21 @@ void HmapLandObjectEditor::_removeObjects(RenderableEditableObject **obj, int nu
       HmapLandPlugin::self->setApplyModOnHeightBakeSplineEdit(prevApplyHeightbake);
       rebuild_hmap_modif = true;
     }
-    if (remSplines[i]->isClosed())
+    // put() with no operation open runs restore() at once, which would rebuild a spline that is being torn down
+    if (use_undo && remSplines[i]->isClosed())
       getUndoSystem()->put(remSplines[i]->makePointListUndo());
     remSplines[i]->points.clear();
   }
 
   if (use_undo)
   {
+    // removing the seam point drops the closure duplicate too, and re-adding the point alone would leave the spline open,
+    // so record the point list. Points of removed splines need no entry here, their whole list is recorded above
     Tab<SplineObject *> undoPointsListSplines(tmpmem);
-    for (int i = 0; i < remPoints.size(); i++)
-      if (remPoints[i]->arrId == 0 && remPoints[i]->spline->isClosed())
-        if (find_value_idx(undoPointsListSplines, remPoints[i]->spline) == -1)
-          undoPointsListSplines.push_back(remPoints[i]->spline);
+    for (int i = 0; i < remPt0.size(); i++)
+      if (remPt0[i]->arrId == 0 && remPt0[i]->spline && remPt0[i]->spline->isClosed())
+        if (find_value_idx(undoPointsListSplines, remPt0[i]->spline) == -1)
+          undoPointsListSplines.push_back(remPt0[i]->spline);
 
     for (int i = 0; i < undoPointsListSplines.size(); i++)
       getUndoSystem()->put(undoPointsListSplines[i]->makePointListUndo());
@@ -1044,6 +1166,11 @@ void HmapLandObjectEditor::_removeObjects(RenderableEditableObject **obj, int nu
   if (rebuild_hmap_modif)
     HmapLandPlugin::self->applyHmModifiers();
 
+  // the split may have been waiting for a second point on a polygon that just went away,
+  // and the cursor may have been hovering a point that went with it
+  stopPolySplittingIfPickGone();
+  dropHoverState();
+
   HmapLandPlugin::self->onObjectsRemove();
 }
 
@@ -1058,29 +1185,53 @@ bool HmapLandObjectEditor::canSelectObj(RenderableEditableObject *o)
 
   if (LandscapeEntityObject *e = RTTI_cast<LandscapeEntityObject>(o))
   {
-    if (EditLayerProps::layerProps[e->getEditLayerIdx()].lock)
+    if (isObjectLocked(*e))
       return false;
   }
   else if (SplineObject *s = RTTI_cast<SplineObject>(o))
   {
-    if (EditLayerProps::layerProps[s->getEditLayerIdx()].lock)
+    if (isObjectLocked(*s))
       return false;
   }
   else if (SplinePointObject *p = RTTI_cast<SplinePointObject>(o))
   {
     if (SplineObject *s = p->spline)
-      if (EditLayerProps::layerProps[s->getEditLayerIdx()].lock)
+      if (s->isHidden() || isObjectLocked(*s))
         return false;
   }
 
   switch (selectMode)
   {
-    case CM_SELECT_PT: return RTTI_cast<SplinePointObject>(o) != NULL;
-    case CM_SELECT_SPLINES: return RTTI_cast<SplineObject>(o) != NULL;
+    case CM_SELECT_POINTS_ALL: return RTTI_cast<SplinePointObject>(o) != NULL;
+
+    case CM_SELECT_POINTS_SPLINE:
+    {
+      SplinePointObject *spo = RTTI_cast<SplinePointObject>(o);
+      return spo && spo->spline && !spo->spline->isPoly();
+    }
+
+    case CM_SELECT_POINTS_POLYGON:
+    {
+      SplinePointObject *spo = RTTI_cast<SplinePointObject>(o);
+      return spo && spo->spline && spo->spline->isPoly();
+    }
+
+    case CM_SELECT_SPLINES_AND_POLYGONS: return RTTI_cast<SplineObject>(o) != NULL;
+
+    case CM_SELECT_SPLINES:
+    {
+      SplineObject *s = RTTI_cast<SplineObject>(o);
+      return s && !s->isPoly();
+    }
+
+    case CM_SELECT_POLYGONS:
+    {
+      SplineObject *s = RTTI_cast<SplineObject>(o);
+      return s && s->isPoly();
+    }
+
     case CM_SELECT_ENT: return RTTI_cast<LandscapeEntityObject>(o) != NULL;
     case CM_SELECT_SPL_ENT: return RTTI_cast<LandscapeEntityObject>(o) || RTTI_cast<SplineObject>(o);
-    case CM_SELECT_LT: return RTTI_cast<SphereLightObject>(o) != NULL;
-    case CM_SELECT_SNOW: return RTTI_cast<SnowSourceObject>(o) != NULL;
 
     default: return true;
   }
@@ -1099,6 +1250,12 @@ void HmapLandObjectEditor::onObjectFlagsChange(RenderableEditableObject *obj, in
       outlinerWindow->onObjectSelectionChanged(getMainObjectForOutliner(*obj));
     HmapLandPlugin::self->onObjectSelectionChanged(obj);
   }
+
+  if ((changed_flags & RenderableEditableObject::FLG_HIDDEN) != 0)
+    apply_layer_idx_to_entities(obj);
+
+  if ((changed_flags & (RenderableEditableObject::FLG_HIDDEN | RenderableEditableObject::FLG_LOCKED)) != 0)
+    DAGORED2->invalidateViewportCache();
 }
 
 
@@ -1125,7 +1282,6 @@ void HmapLandObjectEditor::fillSelectionMenu(IGenViewportWnd *wnd, PropPanel::IM
   int oneLayer = -1;
   int perTypeLayerCount = 0;
   bool enabledMoveToLayer = anySelected;
-  HeightmapLandOutlinerInterface outliner(*this);
   for (auto obj : selection)
   {
     RenderableEditableObject *object = obj;
@@ -1135,7 +1291,7 @@ void HmapLandObjectEditor::fillSelectionMenu(IGenViewportWnd *wnd, PropPanel::IM
 
     int objType;
     int perTypeLayerIndex;
-    const bool supported = outliner.getObjectTypeAndPerTypeLayerIndex(*object, objType, perTypeLayerIndex);
+    const bool supported = outlinerInterface->getObjectTypeAndPerTypeLayerIndex(*object, objType, perTypeLayerIndex);
     if (supported && (type == objType || type == -1))
     {
       type = objType;
@@ -1153,7 +1309,7 @@ void HmapLandObjectEditor::fillSelectionMenu(IGenViewportWnd *wnd, PropPanel::IM
 
     if (type > -1)
     {
-      perTypeLayerCount = outliner.getLayerCount(type);
+      perTypeLayerCount = outlinerInterface->getLayerCount(type);
       enabledMoveToLayer = perTypeLayerCount > 1;
     }
   }
@@ -1164,7 +1320,7 @@ void HmapLandObjectEditor::fillSelectionMenu(IGenViewportWnd *wnd, PropPanel::IM
   {
     for (int layerIdx = 0; layerIdx < perTypeLayerCount; ++layerIdx)
     {
-      const char *layerName = outliner.getLayerName(type, layerIdx);
+      const char *layerName = outlinerInterface->getLayerName(type, layerIdx);
       const int id = CM_MOVE_TO_LAYER_FIRST + layerIdx;
       menu->addItem(CM_MOVE_TO_LAYER, id, layerName);
       if (layerIdx == oneLayer)
@@ -1183,8 +1339,6 @@ int HmapLandObjectEditor::onMenuItemClick(unsigned id)
 {
   if (CM_MOVE_TO_LAYER_FIRST <= id && id <= CM_MOVE_TO_LAYER_LAST)
   {
-    HeightmapLandOutlinerInterface outliner(*this);
-
     int type = -1;
     const int destinationLayerIndex = id - CM_MOVE_TO_LAYER_FIRST;
     dag::Vector<RenderableEditableObject *> objectsToMove;
@@ -1205,7 +1359,7 @@ int HmapLandObjectEditor::onMenuItemClick(unsigned id)
       }
 
       int objType, objLayerIndex;
-      if (outliner.getObjectTypeAndPerTypeLayerIndex(*object, objType, objLayerIndex))
+      if (outlinerInterface->getObjectTypeAndPerTypeLayerIndex(*object, objType, objLayerIndex))
       {
         if (type == objType || type == -1)
         {
@@ -1224,13 +1378,13 @@ int HmapLandObjectEditor::onMenuItemClick(unsigned id)
     const int amount = objectsToMove.size();
     if (amount > 0)
     {
-      outliner.moveObjectsToLayer(make_span(objectsToMove), type, destinationLayerIndex);
+      outlinerInterface->moveObjectsToLayer(make_span(objectsToMove), type, destinationLayerIndex);
 
       eastl::unique_ptr<PropPanel::DialogWindow> dialog(
         DAGORED2->createDialog(hdpi::_pxScaled(360), hdpi::_pxScaled(100), "Move to layer"));
       dialog->removeDialogButton(PropPanel::DIALOG_ID_CANCEL);
       PropPanel::ContainerPropertyControl *panel = dialog->getPanel();
-      const char *layerName = outliner.getLayerName(type, destinationLayerIndex);
+      const char *layerName = outlinerInterface->getLayerName(type, destinationLayerIndex);
       panel->createStatic(0, String(0, "%d node(s) moved to layer \"%s\"", amount, layerName));
       dialog->showDialog();
 
@@ -1267,7 +1421,7 @@ void HmapLandObjectEditor::save(DataBlock &blk)
       obj->save(*blk.addNewBlock("hole"));
 }
 
-void HmapLandObjectEditor::save(DataBlock &splBlk, DataBlock &polBlk, DataBlock &entBlk, DataBlock &ltBlk, int layer)
+void HmapLandObjectEditor::save(DataBlock &splBlk, DataBlock &polBlk, DataBlock &entBlk, int layer)
 {
   for (int i = 0; i < objects.size(); ++i)
     if (SplineObject *s = RTTI_cast<SplineObject>(objects[i]))
@@ -1288,17 +1442,97 @@ void HmapLandObjectEditor::save(DataBlock &splBlk, DataBlock &polBlk, DataBlock 
 
       if (layer >= 0)
         continue;
-
-      if (SphereLightObject *l = RTTI_cast<SphereLightObject>(objects[i]))
-        l->save(*ltBlk.addNewBlock("SphereLightSource"));
-      else if (SnowSourceObject *s = RTTI_cast<SnowSourceObject>(objects[i]))
-        s->save(*ltBlk.addNewBlock("SnowSource"));
     }
 
   if (layer < 0)
     LandscapeEntityObject::saveColliders(entBlk);
 }
 
+void HmapLandObjectEditor::saveObjectLocalStates(DataBlock &local_data)
+{
+  DataBlock *objectStatesBlk = nullptr;
+  for (int i = 0; i < objects.size(); ++i)
+  {
+    RenderableEditableObject *o = objects[i];
+
+    const char *objectName = o->getName();
+    if (!objectName || !*objectName)
+      continue;
+
+    const bool hidden = doesObjectSupportHiding(*o) && o->isHidden();
+    const bool locked = doesObjectSupportLocking(*o) && o->isLocked();
+    if (!hidden && !locked)
+      continue;
+
+    if (!objectStatesBlk)
+      objectStatesBlk = local_data.addBlock("objectLocalStates");
+
+    DataBlock *objectBlk = objectStatesBlk->addNewBlock("object");
+    objectBlk->setStr("name", objectName);
+    if (hidden)
+      objectBlk->setBool("hidden", hidden);
+    if (locked)
+      objectBlk->setBool("locked", locked);
+  }
+}
+
+void HmapLandObjectEditor::loadObjectLocalStates(const DataBlock &local_data)
+{
+  const DataBlock *objectStatesBlk = local_data.getBlockByName("objectLocalStates");
+  if (!objectStatesBlk)
+    return;
+
+  const int objectNid = objectStatesBlk->getNameId("object");
+  if (objectNid < 0)
+    return;
+
+  ska::flat_hash_map<eastl::string_view, RenderableEditableObject *> objectsByName;
+  objectsByName.reserve(objects.size());
+  for (int i = 0; i < objects.size(); ++i)
+  {
+    const eastl::string_view objectName = objects[i]->getNameStringView();
+    if (!objectName.empty())
+      objectsByName.emplace(objectName, objects[i]); // A repeated name keeps the first object, matching getObjectByName().
+  }
+
+  for (int i = 0; i < objectStatesBlk->blockCount(); ++i)
+  {
+    const DataBlock *objectBlk = objectStatesBlk->getBlock(i);
+    if (objectBlk->getBlockNameId() != objectNid)
+      continue;
+
+    const auto objectIt = objectsByName.find(objectBlk->getStr("name", ""));
+    if (objectIt == objectsByName.end())
+      continue;
+
+    RenderableEditableObject *o = objectIt->second;
+    if (objectBlk->getBool("hidden", false) && doesObjectSupportHiding(*o))
+      o->hideObject();
+    if (objectBlk->getBool("locked", false) && doesObjectSupportLocking(*o))
+      o->lockObject();
+  }
+}
+
+bool HmapLandObjectEditor::doesObjectSupportHiding(RenderableEditableObject &object)
+{
+  return RTTI_cast<LandscapeEntityObject>(&object) || RTTI_cast<SplineObject>(&object);
+}
+
+bool HmapLandObjectEditor::doesObjectSupportLocking(RenderableEditableObject &object) { return doesObjectSupportHiding(object); }
+
+bool HmapLandObjectEditor::isObjectLocked(const LandscapeEntityObject &object)
+{
+  return object.isLocked() || EditLayerProps::layerProps[object.getEditLayerIdx()].isLayerOrTypeLocked();
+}
+
+bool HmapLandObjectEditor::isObjectLocked(const SplineObject &object)
+{
+  return object.isLocked() || EditLayerProps::layerProps[object.getEditLayerIdx()].isLayerOrTypeLocked();
+}
+
+void HmapLandObjectEditor::showHiddenObjectsForBuild() { apply_object_hide_to_entities(objects, false); }
+
+void HmapLandObjectEditor::restoreHiddenObjectsAfterBuild() { apply_object_hide_to_entities(objects, true); }
 
 void HmapLandObjectEditor::load(const DataBlock &main_blk)
 {
@@ -1319,12 +1553,12 @@ void HmapLandObjectEditor::load(const DataBlock &main_blk)
   }
 }
 
-void HmapLandObjectEditor::load(const DataBlock &splBlk, const DataBlock &polBlk, const DataBlock &entBlk, const DataBlock &ltBlk,
-  int layer)
+void HmapLandObjectEditor::load(const DataBlock &splBlk, const DataBlock &polBlk, const DataBlock &entBlk, int layer)
 {
   if (layer < 0)
     splines.clear();
 
+  unsigned splines_loaded = 0, polygons_loaded = 0, entities_loaded = 0;
   int nid = splBlk.getNameId("spline");
   for (int i = 0; i < splBlk.blockCount(); i++)
     if (splBlk.getBlock(i)->getBlockNameId() == nid)
@@ -1336,7 +1570,10 @@ void HmapLandObjectEditor::load(const DataBlock &splBlk, const DataBlock &polBlk
       addObject(s, false);
       s->load(cb, false);
       s->onCreated(false);
+      splines_loaded++;
     }
+  if (splines_loaded)
+    debug("loaded %d spline(s) from %s", splines_loaded, splBlk.resolveFilename());
 
   nid = polBlk.getNameId("polygon");
   for (int i = 0; i < polBlk.blockCount(); i++)
@@ -1349,7 +1586,10 @@ void HmapLandObjectEditor::load(const DataBlock &splBlk, const DataBlock &polBlk
       addObject(s, false);
       s->load(cb, false);
       s->onCreated(false);
+      polygons_loaded++;
     }
+  if (polygons_loaded)
+    debug("loaded %d polygon(s) from %s", polygons_loaded, polBlk.resolveFilename());
 
   nid = entBlk.getNameId("entity");
   if (layer < 0)
@@ -1364,31 +1604,10 @@ void HmapLandObjectEditor::load(const DataBlock &splBlk, const DataBlock &polBlk
       o->setEditLayerIdx(layer < 0 ? o->lpIndex() : layer);
       addObject(o, false);
       o->load(cb);
+      entities_loaded++;
     }
-
-  if (layer >= 0)
-    return;
-
-  nid = ltBlk.getNameId("SphereLightSource");
-  int nids = ltBlk.getNameId("SnowSource");
-
-  for (int i = 0; i < ltBlk.blockCount(); i++)
-    if (ltBlk.getBlock(i)->getBlockNameId() == nid)
-    {
-      const DataBlock &cb = *ltBlk.getBlock(i);
-
-      SphereLightObject *o = new SphereLightObject;
-      addObject(o, false);
-      o->load(cb);
-    }
-    else if (ltBlk.getBlock(i)->getBlockNameId() == nids)
-    {
-      const DataBlock &cb = *ltBlk.getBlock(i);
-
-      SnowSourceObject *o = new SnowSourceObject;
-      addObject(o, false);
-      o->load(cb);
-    }
+  if (entities_loaded)
+    debug("loaded %d entities from %s", entities_loaded, entBlk.resolveFilename());
 }
 
 
@@ -1402,8 +1621,6 @@ void HmapLandObjectEditor::getObjNames(Tab<String> &names, Tab<String> &sel_name
   bool showSplines = false;
   bool showPolys = false;
   bool showEnt = false;
-  bool showLt = false;
-  bool showSnow = false;
 
   for (int ti = 0; ti < types.size(); ++ti)
   {
@@ -1415,12 +1632,6 @@ void HmapLandObjectEditor::getObjNames(Tab<String> &names, Tab<String> &sel_name
 
     if (types[ti] == 2)
       showEnt = true;
-
-    if (types[ti] == 3)
-      showLt = true;
-
-    if (types[ti] == 4)
-      showSnow = true;
   }
 
   for (int i = 0; i < splines.size(); ++i)
@@ -1438,30 +1649,12 @@ void HmapLandObjectEditor::getObjNames(Tab<String> &names, Tab<String> &sel_name
     }
   }
 
-  if (showEnt || showLt || showSnow)
+  if (showEnt)
     for (int i = 0; i < objects.size(); i++)
     {
       RenderableEditableObject *o;
 
       o = showEnt ? RTTI_cast<LandscapeEntityObject>(objects[i]) : NULL;
-      if (o)
-      {
-        names.push_back() = o->getName();
-
-        if (o->isSelected())
-          sel_names.push_back() = o->getName();
-      }
-
-      o = showLt ? RTTI_cast<SphereLightObject>(objects[i]) : NULL;
-      if (o)
-      {
-        names.push_back() = o->getName();
-
-        if (o->isSelected())
-          sel_names.push_back() = o->getName();
-      }
-
-      o = showSnow ? RTTI_cast<SnowSourceObject>(objects[i]) : NULL;
       if (o)
       {
         names.push_back() = o->getName();
@@ -1475,15 +1668,10 @@ void HmapLandObjectEditor::getObjNames(Tab<String> &names, Tab<String> &sel_name
 
 void HmapLandObjectEditor::getTypeNames(Tab<String> &names)
 {
-  bool has_snow = HmapLandPlugin::self->isSnowAvailable();
-
-  names.resize(has_snow ? 5 : 4);
+  names.resize(3);
   names[0] = OBJECT_SPLINE;
   names[1] = OBJECT_POLYGON;
   names[2] = OBJECT_ENTITY;
-  names[3] = OBJECT_LIGHT;
-  if (has_snow)
-    names[4] = OBJECT_SNOW;
 }
 
 
@@ -1590,6 +1778,7 @@ void HmapLandObjectEditor::recalcCatmul()
 void HmapLandObjectEditor::setEditMode(int cm)
 {
   stopSplineCreation();
+  stopPolySplitting();
 
   memset(catmul, 0, sizeof(catmul));
 
@@ -1618,20 +1807,6 @@ void HmapLandObjectEditor::setEditMode(int cm)
     updateToolbarButtons();
     DAGORED2->repaint();
   }
-  else if (cm == CM_CREATE_LT)
-  {
-    objCreator = dagGeom->newSphereCreator();
-
-    updateToolbarButtons();
-    DAGORED2->repaint();
-  }
-  else if (cm == CM_CREATE_SNOW_SOURCE)
-  {
-    objCreator = dagGeom->newSphereCreator();
-
-    updateToolbarButtons();
-    DAGORED2->repaint();
-  }
 
   ObjectEditor::setEditMode(cm);
   if (getEditMode() != CM_CREATE_ENTITY)
@@ -1641,7 +1816,7 @@ void HmapLandObjectEditor::setEditMode(int cm)
 
 void HmapLandObjectEditor::gatherStaticGeometry(StaticGeometryContainer &cont, int flags, bool collision, int stage)
 {
-  ISplineGenService *splSrv = EDITORCORE->queryEditorInterface<ISplineGenService>();
+  ISplineGenService *splSrv = HmapLandPlugin::splSrv;
   int st_mask =
     DAEDITOR3.getEntitySubTypeMask(collision ? IObjEntityFilter::STMASK_TYPE_COLLISION : IObjEntityFilter::STMASK_TYPE_EXPORT);
 
@@ -1650,38 +1825,35 @@ void HmapLandObjectEditor::gatherStaticGeometry(StaticGeometryContainer &cont, i
   if (collision)
     flags |= StaticGeometryNode::FLG_COLLIDABLE;
 
-  FastIntList loft_layers;
-  loft_layers.addInt(0);
-  if (splSrv && (st_mask & SplineObject::splineSubtypeMask))
+  ISplineGenService::LayerIndexList loft_layers(0);
+  if (st_mask & SplineObject::splineSubtypeMask)
     splSrv->gatherLoftLayers(loft_layers, false);
 
-  for (int lli = 0; lli < loft_layers.size(); lli++)
-  {
-    int max_layer = 0, ll = loft_layers.getList()[lli];
-    for (int i = 0; i < splines.size(); ++i)
-    {
-      int l = splines[i]->getLayer();
-      if (max_layer < l)
-        max_layer = l;
-    }
-    for (int l = 0; l <= max_layer; l++)
-    {
-      if (splSrv)
-        splSrv->gatherStaticGeometry(cont, flags, collision, ll, stage, l);
-      for (int i = 0; i < splines.size(); ++i)
-        if (splines[i]->getLayer() == l)
-        {
-          StaticGeometryContainer splineNodes;
-          splines[i]->gatherStaticGeometry(splineNodes, flags, collision, ll, stage);
-          for (int nodeNo = 0; nodeNo < splineNodes.nodes.size(); nodeNo++)
+  ISplineGenService::LayerIndexList order_layers;
+  splSrv->gatherGeneratedGeomOrderLayers(order_layers);
+  if (st_mask & SplineObject::roadsSubtypeMask)
+    for (auto *s : splines)
+      order_layers.set(s->getLayer());
+
+  loft_layers.iterate_layers([&](unsigned ll) {
+    order_layers.iterate_layers([&](unsigned l) {
+      splSrv->gatherStaticGeometry(cont, flags, collision, ll, stage, l);
+
+      StaticGeometryContainer splineNodes;
+      if (ll == 0 && (st_mask & SplineObject::roadsSubtypeMask))
+        for (auto *s : splines)
+          if (s->getLayer() == l)
           {
-            splineNodes.nodes[nodeNo]->script.setInt("splineLayer", l); // Use this and layer:i from loft to split materials by layers.
-            cont.addNode(splineNodes.nodes[nodeNo]);
+            s->gatherRoadsGeometry(splineNodes, flags, collision, stage);
+            for (auto *n : splineNodes.nodes)
+            {
+              n->script.setInt("splineLayer", l); // Use this and layer:i from loft to split materials by layers.
+              cont.addNode(n);
+            }
+            splineNodes.nodes.clear();
           }
-          clear_and_shrink(splineNodes.nodes);
-        }
-    }
-  }
+    });
+  });
 
   if (st_mask & SplineObject::roadsSubtypeMask)
     for (int i = 0; i < crossRoads.size(); i++)
@@ -1693,14 +1865,6 @@ void HmapLandObjectEditor::gatherStaticGeometry(StaticGeometryContainer &cont, i
 
   if (waterGeom && (st_mask & waterSurfSubtypeMask))
     SplineObject::gatherStaticGeom(cont, *waterGeom->getGeometryContainer(), flags, 7, 0, stage);
-
-  if (st_mask & SphereLightObject::lightGeomSubtype)
-    for (int i = 0; i < objects.size(); ++i)
-    {
-      SphereLightObject *l = RTTI_cast<SphereLightObject>(objects[i]);
-      if (l)
-        l->gatherGeom(cont);
-    }
 }
 void HmapLandObjectEditor::gatherLoftLandPts(Tab<Point3> &loft_pt_cloud, Tab<Point3> &water_border_polys,
   Tab<Point2> &hmap_sweep_polys)
@@ -1715,18 +1879,20 @@ void HmapLandObjectEditor::setSelectMode(int cm)
     return;
   int old_mode = selectMode;
   selectMode = cm;
-  setRadioButton(CM_SELECT_PT, selectMode);
+  setRadioButton(CM_SELECT_POINTS_ALL, selectMode);
+  setRadioButton(CM_SELECT_POINTS_SPLINE, selectMode);
+  setRadioButton(CM_SELECT_POINTS_POLYGON, selectMode);
+  setRadioButton(CM_SELECT_SPLINES_AND_POLYGONS, selectMode);
   setRadioButton(CM_SELECT_SPLINES, selectMode);
+  setRadioButton(CM_SELECT_POLYGONS, selectMode);
   setRadioButton(CM_SELECT_ENT, selectMode);
   setRadioButton(CM_SELECT_SPL_ENT, selectMode);
-  setRadioButton(CM_SELECT_LT, selectMode);
-  setRadioButton(CM_SELECT_SNOW, selectMode);
 
   if (selectMode != -1)
   {
     bool desel = false;
 
-    getUndoSystem()->begin();
+    getUndoSystem()->begin(true);
     for (int i = selection.size() - 1; i >= 0; i--)
       if (!canSelectObj(selection[i]))
       {
@@ -1763,7 +1929,7 @@ void HmapLandObjectEditor::setSelectMode(int cm)
 
     if (desel)
     {
-      getUndoSystem()->put(new UndoSelModeChange(this, old_mode));
+      getUndoSystem()->put<UndoSelModeChange>(this, old_mode);
       getUndoSystem()->accept("Change select mode");
     }
     else
@@ -1813,6 +1979,14 @@ float HmapLandObjectEditor::screenDistBetweenCursorAndPoint(IGenViewportWnd *wnd
 
 void HmapLandObjectEditor::update(real dt)
 {
+  if (!shapeCenterPlaced && !curSpline && (getEditMode() == CM_CREATE_SPLINE || getEditMode() == CM_CREATE_POLYGON))
+  {
+    if (dagInput->isAltKeyDown())
+      IEditorCoreEngine::get()->setShowMessageAt(lastMouseX, lastMouseY,
+        SimpleString("Regular shape mode\nAlt+Click to place center, RMB to cancel"));
+    else
+      IEditorCoreEngine::get()->setShowMessageAt(0, 0, SimpleString());
+  }
   if (objCreator && objCreator->isFinished())
   {
     if (objCreator->isOk() && getEditMode() == CM_CREATE_HOLEBOX_MODE)
@@ -1845,36 +2019,6 @@ void HmapLandObjectEditor::update(real dt)
 
       HmapLandPlugin::self->resetRenderer();
       del_it(objCreator);
-    }
-    else if (objCreator->isOk() && getEditMode() == CM_CREATE_LT)
-    {
-      SphereLightObject *obj = new SphereLightObject;
-      String name("Sph_Light_Source_001");
-      setUniqName(obj, name);
-      obj->setWtm(objCreator->matrix);
-
-      getUndoSystem()->begin();
-      addObject(obj);
-      obj->selectObject();
-      getUndoSystem()->accept("create sphere light source");
-
-      del_it(objCreator);
-      // objCreator = dagGeom->newSphereCreator();
-    }
-    else if (objCreator->isOk() && getEditMode() == CM_CREATE_SNOW_SOURCE)
-    {
-      SnowSourceObject *obj = new SnowSourceObject;
-      String name("Snow_Source_001");
-      setUniqName(obj, name);
-      obj->setWtm(objCreator->matrix);
-
-      getUndoSystem()->begin();
-      addObject(obj);
-      obj->selectObject();
-      getUndoSystem()->accept("create snow source");
-
-      del_it(objCreator);
-      // objCreator = dagGeom->newSphereCreator();
     }
     else
       del_it(objCreator);
@@ -1988,28 +2132,6 @@ void HmapLandObjectEditor::clone(bool clone_seed)
       ns->selectObject();
       continue;
     }
-
-    SphereLightObject *o = RTTI_cast<SphereLightObject>(oldSel[i]);
-    if (o)
-    {
-      SphereLightObject *nl = o->clone();
-      // cloneName = nl->getName();
-      addObject(nl);
-      cloneObjs.push_back(nl);
-      nl->selectObject();
-      continue;
-    }
-
-    SnowSourceObject *sn = RTTI_cast<SnowSourceObject>(oldSel[i]);
-    if (sn)
-    {
-      SnowSourceObject *nl = sn->clone();
-      // cloneName = nl->getName();
-      addObject(nl);
-      cloneObjs.push_back(nl);
-      nl->selectObject();
-      continue;
-    }
   }
 }
 
@@ -2052,6 +2174,8 @@ void HmapLandObjectEditor::markCrossRoadChanged(SplinePointObject *p)
 
 void HmapLandObjectEditor::updateCrossRoads(SplinePointObject *p)
 {
+  if (p && p->isFilletGen) // derived fillet points never form crosses
+    return;
   if (!p)
   {
     for (int i = 0; i < crossRoads.size(); i++)
@@ -2080,20 +2204,19 @@ void HmapLandObjectEditor::updateCrossRoads(SplinePointObject *p)
       }
 
     updateCrossRoadsOnPointAdd(p);
-    if (p->arrId > 0 && p->spline->points[p->arrId - 1]->isCross)
-    {
-      markCrossChanged(crossRoads, p->spline->points[p->arrId - 1]);
-      crossRoadsChanged = true;
-    }
-    if (p->arrId + 1 < p->spline->points.size() && p->spline->points[p->arrId + 1]->isCross)
-    {
-      markCrossChanged(crossRoads, p->spline->points[p->arrId + 1]);
-      crossRoadsChanged = true;
-    }
+    for (int dir = -1; dir <= 1; dir += 2)
+      if (SplinePointObject *n = p->spline->nextRealPoint(p->arrId, dir))
+        if (n->isCross)
+        {
+          markCrossChanged(crossRoads, n);
+          crossRoadsChanged = true;
+        }
   }
 }
 void HmapLandObjectEditor::updateCrossRoadsOnPointAdd(SplinePointObject *p)
 {
+  if (p->isFilletGen)
+    return;
   SplineObject *pspl = p->spline;
   Point3 p3 = p->getProps().pt;
   static Tab<SplinePointObject *> cr(tmpmem);
@@ -2103,7 +2226,8 @@ void HmapLandObjectEditor::updateCrossRoadsOnPointAdd(SplinePointObject *p)
     if (splines[i] && (splines[i] != pspl || pspl->getProps().maySelfCross) && (splines[i]->getSplineBox() & p->getPt()))
     {
       for (int j = splines[i]->points.size() - 1; j >= 0; j--)
-        if (splines[i]->points[j] != p && splines[i]->points[j] && lengthSq(splines[i]->points[j]->getProps().pt - p3) < 1e-4)
+        if (splines[i]->points[j] != p && splines[i]->points[j] && !splines[i]->points[j]->isFilletGen &&
+            lengthSq(splines[i]->points[j]->getProps().pt - p3) < 1e-4)
         {
           if (!dest)
             dest = addCross(crossRoads, splines[i]->points[j], p);
@@ -2176,62 +2300,6 @@ void HmapLandObjectEditor::updateCrossRoadsOnPointRemove(SplinePointObject *p)
   }
 }
 
-
-void HmapLandObjectEditor::calcSnow(StaticGeometryContainer &container)
-{
-  Tab<SnowSourceObject *> snow_sources(tmpmem);
-  snow_sources.reserve(10);
-
-  for (int i = 0; i < objects.size(); ++i)
-  {
-    SnowSourceObject *s = RTTI_cast<SnowSourceObject>(objects[i]);
-    if (s)
-      snow_sources.push_back(s);
-  }
-
-  SnowSourceObject::calcSnow(snow_sources, HmapLandPlugin::self->getSnowValue(), container);
-}
-
-void HmapLandObjectEditor::updateSnowSources()
-{
-  if (!HmapLandPlugin::self->hasSnowSpherePreview())
-    return;
-
-  if (!DAGORED2->getCurrentViewport())
-    return;
-
-  TMatrix ctm;
-  DAGORED2->getCurrentViewport()->getCameraTransform(ctm);
-  Point3 cam_pos = ctm.getcol(3);
-  clear_and_shrink(nearSources);
-
-  for (int i = 0; i < objects.size(); ++i)
-    if (SnowSourceObject *s = RTTI_cast<SnowSourceObject>(objects[i]))
-    {
-      float source_dist = (cam_pos - s->getPos()).length();
-
-      if (nearSources.size() < SnowSourceObject::NEAR_SRC_COUNT)
-        nearSources.push_back(NearSnowSource(s, source_dist));
-      else
-      {
-        int worst_index = 0;
-
-        for (int j = 0; j < nearSources.size(); ++j)
-        {
-          if (nearSources[j].distance > nearSources[worst_index].distance)
-            worst_index = j;
-        }
-
-        if (nearSources[worst_index].distance > source_dist)
-        {
-          nearSources[worst_index].distance = source_dist;
-          nearSources[worst_index].source = s;
-        }
-      }
-    }
-
-  SnowSourceObject::updateSnowSources(nearSources);
-}
 
 GeomObject &HmapLandObjectEditor::getClearedWaterGeom()
 {
@@ -2336,31 +2404,6 @@ bool HmapLandObjectEditor::traceRay(const Point3 &p, const Point3 &dir, real &ma
 
   return hit;
 }
-bool HmapLandObjectEditor::shadowRayHitTest(const Point3 &p, const Point3 &dir, real maxt)
-{
-  if (maxt <= 0)
-    return false;
-
-  int st_mask = DAEDITOR3.getEntitySubTypeMask(IObjEntityFilter::STMASK_TYPE_COLLISION);
-  if (!(st_mask & SplineObject::roadsSubtypeMask))
-    return false;
-
-  for (int i = 0; i < splines.size(); i++)
-    for (int j = splines[i]->points.size() - 1; j >= 0; j--)
-    {
-      GeomObject *geom = splines[i]->points[j]->getRoadGeom();
-      if (geom && dagGeom->geomObjectShadowRayHitTest(*geom, p, dir, maxt))
-        return true;
-    }
-
-  for (int i = 0; i < crossRoads.size(); i++)
-  {
-    GeomObject *geom = crossRoads[i]->getRoadGeom();
-    if (geom && dagGeom->geomObjectShadowRayHitTest(*geom, p, dir, maxt))
-      return true;
-  }
-  return false;
-}
 bool HmapLandObjectEditor::isColliderVisible() const
 {
   return HmapLandPlugin::self->getVisible() &&
@@ -2374,23 +2417,21 @@ bool HmapLandObjectEditor::LoftAndGeomCollider::traceRay(const Point3 &p, const 
   if (maxt <= 0)
     return false;
 
+  ISplineGenService *splSrv = HmapLandPlugin::splSrv;
   bool hit = false;
   if (loft)
   {
-    ISplineGenService *splSrv = EDITORCORE->queryEditorInterface<ISplineGenService>();
-    if (!splSrv)
-      return hit;
     int end_layer = loftLayerOrder < 0 ? LAYER_ORDER_MAX : min(loftLayerOrder, (int)LAYER_ORDER_MAX);
     if (dir.y < -0.999)
     {
       for (int layer = 0; layer < end_layer; ++layer)
         if (bm_loft_mask[layer].isMarked(p.x, p.z))
-          if (splSrv->traceRayFoundationGeom(layer, p, dir, maxt, norm))
+          if (splSrv->traceRayFoundationLoftGeom(layer, p, dir, maxt, norm))
             hit = true;
       return hit;
     }
 
-    if (splSrv->traceRayFoundationGeom(-1, p, dir, maxt, norm))
+    if (splSrv->traceRayFoundationLoftGeom(-1, p, dir, maxt, norm))
       hit = true;
   }
   else
@@ -2399,70 +2440,10 @@ bool HmapLandObjectEditor::LoftAndGeomCollider::traceRay(const Point3 &p, const 
       if (!bm_poly_mask.isMarked(p.x, p.z))
         return false;
 
-    for (int i = 0; i < objEd.splines.size(); i++)
-      if (objEd.splines[i]->isCreated())
-      {
-        const objgenerator::LandClassData *lcd = objEd.splines[i]->getLandClass();
-        if (!lcd || !lcd->data || !lcd->data->genGeom || !lcd->data->genGeom->foundationGeom)
-          continue;
-
-        GeomObject *geom = objEd.splines[i]->polyGeom.mainMesh;
-        if (geom && dagGeom->geomObjectTraceRay(*geom, p, dir, maxt, norm))
-          hit = true;
-
-        geom = objEd.splines[i]->polyGeom.borderMesh;
-        if (geom && dagGeom->geomObjectTraceRay(*geom, p, dir, maxt, norm))
-          hit = true;
-      }
+    if (splSrv->traceRayFoundationPolyGeom(-1, p, dir, maxt, norm))
+      hit = true;
   }
   return hit;
-}
-bool HmapLandObjectEditor::LoftAndGeomCollider::shadowRayHitTest(const Point3 &p, const Point3 &dir, real maxt)
-{
-  if (maxt <= 0)
-    return false;
-
-  if (loft)
-  {
-    ISplineGenService *splSrv = EDITORCORE->queryEditorInterface<ISplineGenService>();
-    if (!splSrv)
-      return false;
-    int end_layer = loftLayerOrder < 0 ? LAYER_ORDER_MAX : min(loftLayerOrder, (int)LAYER_ORDER_MAX);
-    if (dir.y < -0.999)
-    {
-      for (int layer = 0; layer < end_layer; ++layer)
-        if (bm_loft_mask[layer].isMarked(p.x, p.z))
-          if (splSrv->shadowRayFoundationGeomHitTest(layer, p, dir, maxt))
-            return true;
-      return false;
-    }
-
-    if (splSrv->shadowRayFoundationGeomHitTest(-1, p, dir, maxt))
-      return true;
-  }
-  else
-  {
-    if (dir.y < -0.999)
-      if (!bm_poly_mask.isMarked(p.x, p.z))
-        return false;
-
-    for (int i = 0; i < objEd.splines.size(); i++)
-      if (objEd.splines[i]->isCreated())
-      {
-        const objgenerator::LandClassData *lcd = objEd.splines[i]->getLandClass();
-        if (!lcd || !lcd->data || !lcd->data->genGeom || !lcd->data->genGeom->foundationGeom)
-          continue;
-
-        GeomObject *geom = objEd.splines[i]->polyGeom.mainMesh;
-        if (geom && dagGeom->geomObjectShadowRayHitTest(*geom, p, dir, maxt))
-          return true;
-
-        geom = objEd.splines[i]->polyGeom.borderMesh;
-        if (geom && dagGeom->geomObjectShadowRayHitTest(*geom, p, dir, maxt))
-          return true;
-      }
-  }
-  return false;
 }
 bool HmapLandObjectEditor::LoftAndGeomCollider::isColliderVisible() const { return false; }
 
@@ -2540,7 +2521,7 @@ void HmapLandObjectEditor::getPixelPerfectHits(IPixelPerfectSelectionService &se
       continue;
 
     LandscapeEntityObject *landscapeEntityObject = RTTI_cast<LandscapeEntityObject>(object);
-    if (!landscapeEntityObject)
+    if (!landscapeEntityObject || EditLayerProps::layerProps[landscapeEntityObject->getEditLayerIdx()].isLayerOrTypeHidden())
       continue;
 
     IObjEntity *entity = landscapeEntityObject->getEntity();
@@ -2571,4 +2552,64 @@ bool HmapLandObjectEditor::pickObjects(IGenViewportWnd *wnd, int x, int y, Tab<R
 
   getPixelPerfectHits(*pixelPerfectSelectionService, *wnd, x, y, objs);
   return !objs.empty();
+}
+
+void HmapLandObjectEditor::updateShapeToast(int x, int y)
+{
+  if (shapeRadius > 0.01f)
+    IEditorCoreEngine::get()->setShowMessageAt(x, y,
+      SimpleString(String(256, "Mouse wheel to change vertex count (%d)\nRadius: %.1f\nClick to create, RMB to cancel", shapeSegments,
+        shapeRadius)));
+  else
+    IEditorCoreEngine::get()->setShowMessageAt(x, y, SimpleString("Move mouse to set radius and rotation\nRMB to cancel"));
+}
+
+void HmapLandObjectEditor::createRegularShape(const Point3 &center, float radius, bool as_poly)
+{
+  // handle length for a circular arc of angle 2*PI/N: (4/3)*tan(PI/(2*N))*r
+  const float alpha = TWOPI / shapeSegments;
+  const float k = (4.0f / 3.0f) * tanf(alpha * 0.25f) * radius;
+  const float cy = center.y;
+
+  SplineObject *spl = new SplineObject(as_poly);
+  spl->setEditLayerIdx(EditLayerProps::activeLayerIdx[spl->lpIndex()]);
+  spl->setCornerType(0);
+  spl->selectObject();
+  splines.push_back(spl);
+
+  if (!curSplineAsset.empty())
+  {
+    String objname(128, "%s_001", curSplineAsset.str());
+    setUniqName(spl, objname);
+  }
+
+  getUndoSystem()->begin();
+  addObject(spl);
+
+  for (int i = 0; i < shapeSegments; ++i)
+  {
+    const float t = i * alpha + shapeRotation;
+    const float ct = cosf(t), st = sinf(t);
+    SplinePointObject *pt = new SplinePointObject;
+    pt->setPos(Point3(center.x - st * radius, cy, center.z + ct * radius));
+    pt->setRelBezierOut(Point3(-ct * k, 0, -st * k));
+    pt->setRelBezierIn(Point3(ct * k, 0, st * k));
+    pt->arrId = spl->points.size();
+    pt->spline = spl;
+    addObject(pt);
+  }
+
+  if (!curSplineAsset.empty())
+    spl->changeAsset(curSplineAsset, false);
+
+  if (!as_poly)
+    spl->points.push_back(spl->points[0]);
+  spl->getSpline();
+  spl->pointChanged(-1);
+
+  getUndoSystem()->put(spl->makePointListUndo());
+  getUndoSystem()->accept(as_poly ? "Create circle polygon" : "Create circle spline");
+
+  spl->onCreated();
+  curSpline = nullptr;
 }

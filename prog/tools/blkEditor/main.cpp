@@ -39,7 +39,6 @@ public:
   {
     G_ASSERT(app);
     return app->canClose();
-    return true;
   }
 
   void onDestroy() override { del_it(app); }
@@ -58,7 +57,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   AppManager appManager;
 
   EditorMainWindow mainWindow(appManager);
-  mainWindow.run("Datablock Editor", "guiEditorIcon");
+  mainWindow.run();
 
   return 0;
 }

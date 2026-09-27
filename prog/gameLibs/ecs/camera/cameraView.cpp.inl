@@ -1,7 +1,9 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <ecs/camera/getActiveCameraSetup.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <drv/3d/dag_viewScissor.h>
 #include <drv/3d/dag_renderTarget.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
@@ -18,7 +20,7 @@ static inline float deg_to_fov(float deg) { return 1.f / tanf(DEG_TO_RAD * 0.5f 
 template <typename Callable>
 static inline void process_active_camera_ecs_query(ecs::EntityManager &manager, Callable);
 
-CameraSetup get_active_camera_setup(ecs::EntityManager &manager)
+CameraSetup get_active_camera_setup(ecs::EntityManager &manager, bool allow_missing_camera)
 {
   CameraSetup camSetup;
   ecs::EntityId active_camera_eid = ecs::INVALID_ENTITY_ID;
@@ -29,7 +31,7 @@ CameraSetup get_active_camera_setup(ecs::EntityManager &manager)
     [&active_camera_eid, &active_camera_found, &camSetup](ECS_REQUIRE(eastl::true_type camera__active)
                                                             ECS_REQUIRE(ecs::Tag camera_view) const ecs::EntityManager &manager,
       ecs::EntityId eid, const TMatrix &transform, const DPoint3 *camera__accuratePos = nullptr, float fov = 90.0f,
-      float fovSettings = 90.0f, float znear = 0.1f, float zfar = 5000.f, bool camera__fovHorPlus = true,
+      float cockpit_fov = -1.0f, float fovSettings = 90.0f, float znear = 0.1f, float zfar = 5000.f, bool camera__fovHorPlus = true,
       bool camera__fovHybrid = false) {
       G_UNUSED(manager);
 #if DAGOR_DBGLEVEL > 0
@@ -47,6 +49,7 @@ CameraSetup get_active_camera_setup(ecs::EntityManager &manager)
         camSetup.accuratePos = transform.getcol(3);
       camSetup.fovSettings = fovSettings;
       camSetup.fov = fov;
+      camSetup.cockpitFov = cockpit_fov;
       camSetup.znear = znear;
       camSetup.zfar = zfar;
       camSetup.fovMode = camera__fovHybrid ? EFM_HYBRID : camera__fovHorPlus ? EFM_HOR_PLUS : EFM_HOR_PLUS;
@@ -56,8 +59,9 @@ CameraSetup get_active_camera_setup(ecs::EntityManager &manager)
       active_camera_found++;
     });
 
+  G_UNUSED(allow_missing_camera);
 #if DAGOR_DBGLEVEL > 0
-  if (!active_camera_found)
+  if (!active_camera_found && !allow_missing_camera)
   {
     static unsigned last_warn_frame_no = 0;
     if (last_warn_frame_no == 0 || dagor_frame_no() - last_warn_frame_no > 1)
@@ -103,13 +107,13 @@ CameraSetup get_active_camera_setup(ecs::EntityManager &manager)
   else // all good
     return camSetup;
   // bad camera's tm (not (ortho)normalized basis)
-  ECS_SET(camSetup.camEid, transform, camSetup.transform); // correct camera entity transform comp as well
+  ECS_SET_MGR(manager, camSetup.camEid, transform, camSetup.transform); // correct camera entity transform comp as well
   return camSetup;
 }
 
-CameraSetup get_active_camera_setup()
+CameraSetup get_active_camera_setup(bool allow_missing_camera)
 {
-  return get_active_camera_setup(*g_entity_mgr); // still singleton
+  return get_active_camera_setup(*g_entity_mgr, allow_missing_camera); // still singleton
 }
 
 TMatrix4 calc_active_camera_globtm()

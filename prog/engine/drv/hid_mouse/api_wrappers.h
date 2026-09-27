@@ -4,8 +4,12 @@
 #if _TARGET_PC_WIN
 #include <supp/_platform.h>
 #include <osApiWrappers/dag_progGlobals.h>
+#include <stdint.h>
+#include <math/integer/dag_IPoint2.h>
 
 extern void mouse_api_ClipCursorToRect(const RECT &r);
+extern void mouse_api_SetSystemCursorPosChangeAllowed(bool allowed);
+extern void *mouse_api_create_mouse_cursor(int cursorWidth, int cursorHeight, uint32_t *rgba, IPoint2 hotspot = {});
 
 #else
 #include <osApiWrappers/dag_wndProcCompMsg.h>

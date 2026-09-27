@@ -27,6 +27,7 @@
 #include <math/dag_math3d.h>
 #include <math/dag_capsule.h>
 #include "riCollisionCallback.h"
+#include "collisionLibPrivate.h"
 #include "collisionGlobals.h"
 
 namespace dacoll
@@ -39,10 +40,12 @@ typedef CollisionInstances CollisionInstancesType;
 G_STATIC_ASSERT(!eastl::is_polymorphic<CollisionInstances>::value); // Don't need it (for perfomance reasons)
 #endif
 static dag::Vector<CollisionInstancesType> ri_instances;
-static constexpr int NON_EMPTY_HEAD_INDEX = -2;
+static constexpr int NON_EMPTY_HEAD_INDEX = -2; // prevNotEmpty of list head: in list, but without prev (unlike NOT_IN_LIST)
 static int last_non_empty_ri_instance = NON_EMPTY_HEAD_INDEX; // Tail of list
 static int num_non_empty_ri_instances = 0;
 static float ri_instances_time = 0;
+#define HANDLE_TO_RI_INSTANCE_IDX(h) (int((uintptr_t)(h)) - 1)
+ska::flat_hash_map<rendinst::RendInstDesc, int, RendInstDescHash> disabled_ri_instances;
 
 struct PairCollisionCB
 {
@@ -64,6 +67,8 @@ struct PairCollisionCB
 
 struct RIAddToWorldCB : public rendinst::RendInstCollisionCB
 {
+  mutable int count = 0;
+
   void processCollisionInstance(const rendinst::CollisionInfo &info) const
   {
     if (info.handle)
@@ -71,26 +76,31 @@ struct RIAddToWorldCB : public rendinst::RendInstCollisionCB
       dacoll::CollisionInstances *instance = dacoll::get_collision_instances_by_handle(info.handle);
       G_ASSERTF(instance, "Cannot find collision for ri at " FMT_P3, P3D(info.tm.getcol(3)));
       if (instance)
+      {
         instance->updateTm(info.desc, info.tm);
+#if DAGOR_DBGLEVEL > 0
+        count++;
+#endif
+      }
     }
   }
 
   virtual void addCollisionCheck(const rendinst::CollisionInfo &info) { processCollisionInstance(info); }
-
   virtual void addTreeCheck(const rendinst::CollisionInfo &info) { processCollisionInstance(info); }
 };
 
 
-void update_ri_cache_in_volume_to_phys_world(const BBox3 &box)
+int update_ri_cache_in_volume_to_phys_world(const BBox3 &box)
 {
   if (!get_phys_world())
-    return;
+    return 0;
 
   get_phys_world()->fetchSimRes(true);
 
   RIAddToWorldCB callback;
   rendinst::testObjToRendInstIntersection(box, callback, rendinst::GatherRiTypeFlag::RiGenAndExtra, nullptr /*cache*/, PHYSMAT_INVALID,
     true /*unlock_before_cb*/);
+  return callback.count;
 }
 
 bool test_collision_ri(const CollisionObject &co, const BBox3 &box, Tab<gamephys::CollisionContactData> &out_contacts,
@@ -146,15 +156,12 @@ bool test_collision_ri(const CollisionObject &co, const BSphere3 &sphere, Tab<ga
   WrapperContactResultCB contactCb(out_contacts, mat_id, dacoll::get_collision_object_collapse_threshold(co));
   PairCollisionCB pairColl(co, contactCb);
   RICollisionCB<PairCollisionCB> callback(pairColl);
+  vec4f wbsph = v_ldu_bsphere3(tm, sphere);
 
   if (trace_cache)
   {
-    mat44f vtm;
-    v_mat44_make_from_43cu_unsafe(vtm, tm.array);
-    vec4f bsph;
-    v_bsph_init(bsph, vtm, v_ldu(&sphere.c.x), v_set_x(sphere.r));
     bbox3f castBox;
-    v_bbox3_init_by_bsph(castBox, bsph, v_splat_w(bsph));
+    v_bbox3_init_by_bsph(castBox, wbsph, v_splat_w(wbsph));
     bool res = try_use_trace_cache(castBox, trace_cache);
 
     BBox3 wbox;
@@ -164,7 +171,9 @@ bool test_collision_ri(const CollisionObject &co, const BSphere3 &sphere, Tab<ga
       trace_cache = nullptr;
   }
 
-  rendinst::testObjToRendInstIntersection(sphere, callback, rendinst::GatherRiTypeFlag::RiGenAndExtra, trace_cache, mat_id,
+  BSphere3 wSphere;
+  v_stu_bsphere3(wSphere, wbsph);
+  rendinst::testObjToRendInstIntersection(wSphere, callback, rendinst::GatherRiTypeFlag::RiGenAndExtra, trace_cache, mat_id,
     true /*unlock_before_cb*/);
   return out_contacts.size() > prev_cont;
 }
@@ -201,6 +210,44 @@ bool test_collision_ri(const CollisionObject &co, const BBox3 &box, Tab<gamephys
   }
 
   rendinst::testObjToRendInstIntersection(box, tm, callback, rendinst::GatherRiTypeFlag::RiGenAndExtra, trace_cache, mat_id,
+    true /*unlock_before_cb*/);
+
+  return out_contacts.size() > prev_cont;
+}
+
+bool test_collision_ri(const CollisionObject &co, const BSphere3 &sphere, Tab<gamephys::CollisionContactData> &out_contacts,
+  bool provide_coll_info, float at_time, const TraceMeshFaces *trace_cache, int mat_id, bool process_tree_behaviour)
+{
+  if (!get_phys_world())
+    return false;
+
+  get_phys_world()->fetchSimRes(true);
+
+  int prev_cont = out_contacts.size();
+
+  TMatrix tm;
+  co.body->getTmInstant(tm);
+
+  WrapperRendinstContactResultCB contactCb(out_contacts, 0, mat_id, process_tree_behaviour);
+  WrapperRendInstCollisionCB callback(co, contactCb, provide_coll_info, at_time);
+  vec4f wbsph = v_ldu_bsphere3(tm, sphere);
+
+  if (trace_cache)
+  {
+    bbox3f castBox;
+    v_bbox3_init_by_bsph(castBox, wbsph, v_splat_w(wbsph));
+    bool res = try_use_trace_cache(castBox, trace_cache);
+
+    BBox3 wbox;
+    v_stu_bbox3(wbox, castBox);
+    trace_utils::draw_trace_handle_debug_cast_result(trace_cache, wbox, res, false);
+    if (!res)
+      trace_cache = nullptr;
+  }
+
+  BSphere3 wSphere;
+  v_stu_bsphere3(wSphere, wbsph);
+  rendinst::testObjToRendInstIntersection(wSphere, callback, rendinst::GatherRiTypeFlag::RiGenAndExtra, trace_cache, mat_id,
     true /*unlock_before_cb*/);
 
   return out_contacts.size() > prev_cont;
@@ -303,13 +350,19 @@ void unregister_collision_cb(void *&handle)
   CollisionInstances *ci = get_collision_instances_by_handle(handle);
   G_ASSERT_RETURN(ci, );
 
-#ifndef ENABLE_APEX
-  if (!ci->empty())
+  if (ci->prevNotEmpty != CollisionInstances::NOT_IN_LIST)
   {
+    G_ASSERT((!eastl::is_same_v<CollisionInstancesType, CollisionInstances> || ci->hasPhysBodyInstances())); // APEX unlinks lazily
     ci->clearInstances();
     remove_empty_ri_instance_list(*ci);
   }
-#endif
+
+  const int riIdx = HANDLE_TO_RI_INSTANCE_IDX(handle);
+  for (auto it = disabled_ri_instances.begin(); it != disabled_ri_instances.end();)
+    if (it->second == riIdx)
+      it = disabled_ri_instances.erase(it);
+    else
+      ++it;
 
   if (ci == &ri_instances.back())
     ri_instances.pop_back();
@@ -322,7 +375,7 @@ CollisionInstances *get_collision_instances_by_handle(void *handle)
 {
   if (!handle)
     return nullptr;
-  int ri = int((uintptr_t)handle) - 1;
+  int ri = HANDLE_TO_RI_INSTANCE_IDX(handle);
   G_ASSERTF_RETURN((unsigned)ri < ri_instances.size(), nullptr, "%d >= %d", ri, ri_instances.size());
   return &ri_instances[ri];
 }
@@ -341,6 +394,8 @@ void flush_ri_instances()
 void clear_ri_instances()
 {
   clear_and_shrink(ri_instances);
+  disabled_ri_instances.clear();
+  disabled_ri_instances.shrink_to_fit();
   flush_ri_instances();
   ri_instances_time = 0;
 }
@@ -356,13 +411,17 @@ void clear_ri_apex_instances()
 void enable_disable_ri_instance(const rendinst::RendInstDesc &desc, bool flag)
 {
   void *handle = rendinst::getCollisionResourceHandle(desc);
-  if (CollisionInstances *instance = handle ? get_collision_instances_by_handle(handle) : nullptr)
-    instance->enableDisableCollisionObject(desc, flag);
+  if (!get_collision_instances_by_handle(handle))
+    return;
+  if (!flag)
+    disabled_ri_instances.emplace(desc, HANDLE_TO_RI_INSTANCE_IDX(handle));
+  else
+    disabled_ri_instances.erase(desc);
 }
 
-bool is_ri_instance_enabled(const CollisionInstances *instance, const rendinst::RendInstDesc &desc)
+bool is_ri_instance_disabled_outofline(const rendinst::RendInstDesc &desc)
 {
-  return instance->isCollisionObjectEnabled(desc);
+  return disabled_ri_instances.find(desc) != disabled_ri_instances.end();
 }
 
 
@@ -412,14 +471,21 @@ bool check_ri_collision_filtered(const rendinst::RendInstDesc &desc, const TMatr
 
 float get_ri_instances_time() { return ri_instances_time; }
 
-#ifndef ENABLE_APEX
+static size_t get_ri_instance_index(const CollisionInstances &ci)
+{
+  return (uintptr_t(&ci) - uintptr_t(ri_instances.data())) / sizeof(CollisionInstancesType);
+}
+
 void push_non_empty_ri_instance_list(CollisionInstances &ci)
 {
-  G_ASSERT(size_t(&ci - ri_instances.data()) < ri_instances.size());
-  G_ASSERT(ci.prevNotEmpty < 0 && ci.nextNotEmpty < 0);
-  G_ASSERT(!ci.empty());
+  if (ci.prevNotEmpty != CollisionInstances::NOT_IN_LIST)
+    return;
+  size_t i = get_ri_instance_index(ci);
+  if (i >= ri_instances.size())
+    return;
+  G_ASSERT(ci.nextNotEmpty < 0);
   ci.prevNotEmpty = last_non_empty_ri_instance;
-  last_non_empty_ri_instance = &ci - ri_instances.data();
+  last_non_empty_ri_instance = int(i);
   if (ci.prevNotEmpty >= 0)
     ri_instances[ci.prevNotEmpty].nextNotEmpty = last_non_empty_ri_instance;
   num_non_empty_ri_instances++;
@@ -427,9 +493,9 @@ void push_non_empty_ri_instance_list(CollisionInstances &ci)
 
 void remove_empty_ri_instance_list(CollisionInstances &ci)
 {
-  G_ASSERT(size_t(&ci - ri_instances.data()) < ri_instances.size());
-  G_ASSERT(ci.empty());
-  int i = &ci - ri_instances.data();
+  G_ASSERT(get_ri_instance_index(ci) < ri_instances.size());
+  G_ASSERT(!ci.hasPhysBodyInstances());
+  int i = int(get_ri_instance_index(ci));
   if (ci.nextNotEmpty >= 0)
   {
     G_ASSERT(ri_instances[ci.nextNotEmpty].prevNotEmpty == i);
@@ -449,34 +515,31 @@ void remove_empty_ri_instance_list(CollisionInstances &ci)
     G_ASSERT(ci.prevNotEmpty == NON_EMPTY_HEAD_INDEX);
   G_ASSERT(last_non_empty_ri_instance != i);
   G_UNUSED(i);
-  ci.prevNotEmpty = ci.nextNotEmpty = -1;
+  ci.unlink();
   num_non_empty_ri_instances--;
   G_ASSERT(num_non_empty_ri_instances >= 0);
 }
-#endif
 
 void update_ri_instances(float dt)
 {
   TIME_PROFILE_DEV(update_ri_instances);
+
   ri_instances_time += dt;
-#if ENABLE_APEX // TODO: implement for apex code path
-  for (auto &ri : ri_instances)
-    ri.update(ri_instances_time);
-#else
-  int n = 0;
+  [[maybe_unused]] int numNonEmpty = 0;
   for (int i = last_non_empty_ri_instance; i >= 0;)
   {
-    G_ASSERT(!ri_instances[i].empty());
+#if !ENABLE_APEX // With APEX listed instance might have only PhysX instances or none (removal doesn't unlink, update() does)
+    G_ASSERT(ri_instances[i].hasPhysBodyInstances());
+#endif
     int pi = ri_instances[i].prevNotEmpty;
     if (!ri_instances[i].update(ri_instances_time))
       remove_empty_ri_instance_list(ri_instances[i]);
     else
-      ++n;
+      ++numNonEmpty;
     i = pi;
   }
-  G_UNUSED(n);
-  G_ASSERTF(n == num_non_empty_ri_instances, "%d != %d", n, num_non_empty_ri_instances); // Broken list?
-#endif
+  G_ASSERTF(numNonEmpty == num_non_empty_ri_instances, "%d != %d", numNonEmpty, num_non_empty_ri_instances); // Broken list?
+  TIME_PROFILE_TAG_DEV(update_ri_instances, ": %d non empty", numNonEmpty);
 }
 
 } // namespace dacoll

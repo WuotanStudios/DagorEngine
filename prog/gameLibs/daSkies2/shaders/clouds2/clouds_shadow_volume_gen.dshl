@@ -4,6 +4,7 @@ include "skyLight.dshl"
 include "hardware_defines.dshl"
 include "shader_global.dshl"
 include "writeToTex.dshl"
+include "statistical_clouds_shadow.dshl"
 
 int cloud_shadow_samples_cnt = 40;
 
@@ -11,6 +12,10 @@ float4 clouds_start_compute_offset;
 float4 clouds_compute_width;
 float4 clouds_new_shadow_ambient_weight;
 texture cloud_shadows_old_values;
+
+int clouds_reduced_ambient_samples = 0;
+interval clouds_reduced_ambient_samples: no < 1, yes;
+assume_if_not_assumed clouds_reduced_ambient_samples = no;
 
 macro INIT_COPY_CLOUD_SHADOWS_VOLUME(stage)
   (stage) {
@@ -46,11 +51,13 @@ endmacro
 
 shader copy_cloud_shadows_volume
 {
-  ENABLE_ASSERT(cs)
   INIT_COPY_CLOUD_SHADOWS_VOLUME(cs)
+  (cs) {
+    output@uav : register(0) hlsl {
+      RWTexture3D<uint> output@uav;
+    }
+  }
   hlsl(cs) {
-    RWTexture3D<uint> output : register(u0);
-
     #pragma wave32
     [numthreads(CLOUD_SHADOWS_WARP_SIZE_XZ/2, CLOUD_SHADOWS_WARP_SIZE_XZ, CLOUD_SHADOWS_WARP_SIZE_Y)]
     void cs_main(uint3 dtid : SV_DispatchThreadID)
@@ -103,13 +110,16 @@ macro USE_GEN_CLOUD_SHADOWS_VOLUME(stage)
     skies_planet_radius@f1 = (skies_planet_radius);
     cloud_shadow_samples_cnt@f2 = (cloud_shadow_samples_cnt, 8,0,0);
     start_compute_offset@f3 = clouds_start_compute_offset;
+    //coverage-mean extinction for the un-marched tail, in the march's own units
+    //(log2 per km, last octave), godray statistical calibration (coverage * 0.5)
+    clouds_stat_tail@f1 = (ms_sigma.z*clouds_shadow_coverage*1000*0.5);
   }
   if (shader == gen_cloud_shadows_volume_partial_cs || shader == gen_cloud_shadows_volume_partial_ps)
   {
     (stage) {
       clouds_new_shadow_ambient_weight@f2 = clouds_new_shadow_ambient_weight;
       clouds_compute_width@f2 = clouds_compute_width;
-      oldValues@smp = cloud_shadows_old_values hlsl {Texture3D<uint> oldValues@smp;}
+      oldValues@tex = cloud_shadows_old_values hlsl {Texture3D<uint> oldValues@tex;}
     }
     hlsl(stage) {
       #define TEMPORAL_UPDATE_SHADOW 1
@@ -129,6 +139,7 @@ macro GEN_CLOUD_SHADOWS_VOLUME_MAIN(stage)
   {
     #include <monteCarlo.hlsl>
     #include <fibonacci_sphere.hlsl>
+    #include <atmosphere/statistical_clouds_shadow.hlsli>
     uint3 gen_cloud_shadows_volume_main(in uint3 dtid, in uint3 gid, out float2 result)
     {
       //todo: toroidal update for additional around
@@ -188,7 +199,23 @@ macro GEN_CLOUD_SHADOWS_VOLUME_MAIN(stage)
          expStep
        );
 
-
+      //the march reach is finite (~80km at low sun): at grazing sun it ends in clear
+      //air below a higher layer it never climbed into, reading unshadowed. Attenuate
+      //by the coverage-mean transmittance of the un-marched remainder of the shell,
+      //evaluated at the true marched endpoint - horizontal travel also raises the
+      //radius and tilts the local mu, a vertical-only endpoint re-attenuates path the
+      //march already covered. A march that exits the shell gets a zero remainder, and
+      //past the reach the sun disk penumbra averages per-gap structure out anyway
+      {
+        float marchLen = (firstSampleCount*firstShadowStep +
+                         shadowStep*(exp2(float(shadowSamples)*log2(1. + expStep)) - 1.)/expStep)*0.001;//km
+        float mu = skies_primary_sun_light_dir.z;
+        float r0 = worldPos.y*0.001 - clouds_radiuses.z;//.z = -planet radius, km
+        float rEnd = sqrt(r0*r0 + marchLen*(2.*r0*mu + marchLen));
+        float muEnd = (r0*mu + marchLen)/rEnd;
+        float remainLen = getCloudsLength(rEnd, muEnd, clouds_radiuses.x, clouds_radiuses.y);
+        light_sample_extinctionLast *= exp2(clouds_stat_tail*remainLen);
+      }
 
       float ambient_extinction = 0.0;
       #if TEMPORAL_UPDATE_SHADOW
@@ -198,12 +225,12 @@ macro GEN_CLOUD_SHADOWS_VOLUME_MAIN(stage)
       {
         float ambientStepSize = 96;
         float baseMip = 0, mipAdd = 0.25;
-        #if MOBILE_DEVICE
+        ##if clouds_reduced_ambient_samples == yes
           //~5 times faster on nswitch (1,2s -> 0,25s)
           int NUM_AMBIENT_SAMPLES = 8;
-        #else
+        ##else
           int NUM_AMBIENT_SAMPLES = 16;
-        #endif
+        ##endif
         half totalWeight = 0;
         //very expensive ambient computations
 
@@ -236,11 +263,15 @@ endmacro
 
 shader gen_cloud_shadows_volume_cs, gen_cloud_shadows_volume_partial_cs
 {
-  ENABLE_ASSERT(cs)
   USE_GEN_CLOUD_SHADOWS_VOLUME(cs)
+  (cs) {
+    output@uav : register(0) hlsl {
+      ACCESS_FORMAT(rg8)
+      RWTexture3D<float2> output@uav;
+    }
+  }
   hlsl(cs) {
     #define D3D_SHADER_REQUIRES_TYPED_UAV_LOAD_ADDITIONAL_FORMATS 1
-    RWTexture3D<float2> output : register(u0);
   }
   GEN_CLOUD_SHADOWS_VOLUME_MAIN(cs)
   hlsl(cs) {

@@ -21,7 +21,9 @@ Sources =
   dafxSparksCpu.cpp
   dafxModFxSystem.cpp
   dafxSystemDesc.cpp
+  dafxEmitterDebug.cpp
   modfx/modfx_cpu.cpp
+  stub/outdatedFx.cpp
 
   $(fxList).cpp
 ;

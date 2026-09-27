@@ -198,7 +198,7 @@ struct SplineSegmentPoint
   float splinePos;
 
   SplineSegmentPoint(SplinePointObject *p, float splPos) :
-    in(p->getBezierIn()), pos(p->getPt()), out(p->getBezierOut()), splinePos(splPos)
+    in(p->getKnotBezierIn()), pos(p->getKnotPos()), out(p->getKnotBezierOut()), splinePos(splPos)
   {}
 };
 
@@ -283,7 +283,7 @@ void SplineExporter::fillSplineData(const Tab<SplineObject *> &splines)
         if (p)
         {
           splData.segments.points.push_back(SplineSegmentPoint(p, len));
-          grid.addPoint(p->getPt(), uint16_t(i), uint16_t(pointId));
+          grid.addPoint(p->getKnotPos(), uint16_t(i), uint16_t(pointId));
           pointId++;
         }
         if (j != o->points.size() - 1)
@@ -659,7 +659,7 @@ void SplineExporter::savePaths(mkbindump::BinDumpSaveCB &cwr)
     for (int i = 0; i < table.size(); ++i)
     {
       const IntersectionTableRecord &rec = table[i];
-      cwr.writeInt32e(rec.dist);
+      cwr.writeReal(rec.dist);
       cwr.writeInt16e(rec.nextPoint.nodeId);
       cwr.writeInt8e(rec.nextPoint.nodePointId);
       cwr.writeInt8e(0);

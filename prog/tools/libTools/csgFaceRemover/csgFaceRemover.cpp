@@ -197,7 +197,7 @@ public:
       delete_mesh(open_poly);
 #if REMOVE_OPEN_WITH_TRACE
       for (int i = 0; i < sceneRay.size(); ++i)
-        del_it(sceneRay[i]);
+        destroy_it(sceneRay[i]);
 #endif
       del_it(openSkip);
     }
@@ -247,12 +247,11 @@ public:
       csg.sliceAndClassify(closed, open, open_sliced, NULL);
       for (std::list<std::pair<carve::csg::FaceClass, carve_poly_t *>>::iterator i = open_sliced.begin(); i != open_sliced.end(); ++i)
       {
-        switch ((*i).first)
+        if ((*i).first == carve::csg::FACE_IN) // remove only out
         {
-          case carve::csg::FACE_IN: has_cutted = true; break; // remove only out
-        }
-        if (has_cutted)
+          has_cutted = true;
           break;
+        }
       }
       if (!has_cutted)
       {
@@ -280,6 +279,9 @@ public:
               result_open = result2;
             }
             break;
+
+          case carve::csg::FACE_UNCLASSIFIED:
+          case carve::csg::FACE_ON: break;
         }
       }
       return result_open;
@@ -573,6 +575,6 @@ protected:
   }
 };
 
-BaseCSGRemoval *make_new_csg() { return new PerformCSG(); }
+BaseCSGRemoval *make_new_csg_removal() { return new PerformCSG(); }
 
 void delete_csg(BaseCSGRemoval *csg) { delete ((PerformCSG *)csg); }

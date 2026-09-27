@@ -12,7 +12,7 @@ __forceinline void * v_extract_ptr(vec4i a) {
 }
 
 #if defined(_MSC_VER) && !defined(__clang__) && INTPTR_MAX == INT32_MAX//MSVC generates flawed code, for example in _builtin_binary_save, so make it out of line
-extern VECTORCALL vec4i v_ldu_ptr(const void * a);
+DAS_API vec4i VECTORCALL v_ldu_ptr(const void * a);
 #else
 VECTORCALL __forceinline vec4i v_ldu_ptr(const void * a) {
 #if INTPTR_MAX == INT32_MAX
@@ -41,7 +41,8 @@ __forceinline vec4i v_modi2(vec4i a, vec4i b) {
     } A, B, C;
     A.v = a;
     B.v = b;
-    C.a[0] = A.a[0] % B.a[0];   C.a[1] = A.a[1] % B.a[1];
+    // x % -1 == 0; special-cased to dodge INT_MIN % -1 overflow (matches scalar Mod)
+    C.a[0] = B.a[0]==-1 ? 0 : A.a[0] % B.a[0];   C.a[1] = B.a[1]==-1 ? 0 : A.a[1] % B.a[1];
     return C.v;
 }
 
@@ -63,7 +64,8 @@ __forceinline vec4i v_modi3(vec4i a, vec4i b) {
     } A, B, C;
     A.v = a;
     B.v = b;
-    C.a[0] = A.a[0] % B.a[0];   C.a[1] = A.a[1] % B.a[1];   C.a[2] = A.a[2] % B.a[2];
+    // x % -1 == 0; special-cased to dodge INT_MIN % -1 overflow (matches scalar Mod)
+    C.a[0] = B.a[0]==-1 ? 0 : A.a[0] % B.a[0];   C.a[1] = B.a[1]==-1 ? 0 : A.a[1] % B.a[1];   C.a[2] = B.a[2]==-1 ? 0 : A.a[2] % B.a[2];
     return C.v;
 }
 
@@ -86,7 +88,8 @@ __forceinline vec4i v_modi4(vec4i a, vec4i b) {
     } A, B, C;
     A.v = a;
     B.v = b;
-    C.a[0] = A.a[0] % B.a[0];   C.a[1] = A.a[1] % B.a[1];   C.a[2] = A.a[2] % B.a[2];   C.a[3] = A.a[3] % B.a[3];
+    // x % -1 == 0; special-cased to dodge INT_MIN % -1 overflow (matches scalar Mod)
+    C.a[0] = B.a[0]==-1 ? 0 : A.a[0] % B.a[0];   C.a[1] = B.a[1]==-1 ? 0 : A.a[1] % B.a[1];   C.a[2] = B.a[2]==-1 ? 0 : A.a[2] % B.a[2];   C.a[3] = B.a[3]==-1 ? 0 : A.a[3] % B.a[3];
     return C.v;
 }
 

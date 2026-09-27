@@ -1,6 +1,12 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entitySystem.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/ecsQuery.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/entityComponent.h>
+#include <daECS/core/entityManager.h>
 #include <math/random/dag_random.h>
 #include <ecs/anim/anim.h>
 #include <daECS/core/coreEvents.h>
@@ -23,7 +29,7 @@ static void amimchar_entities_with_random_starter_es_event_handler(const ecs::Ev
         AnimV20::AnimBlendNodeContinuousLeaf *continuousNode = (AnimV20::AnimBlendNodeContinuousLeaf *)animBlendNode;
         if (!continuousNode->isStartOffsetEnabled())
           continue;
-        AnimV20::IAnimStateHolder *stateHolder = animchar.getAnimState();
+        AnimV20::AnimGraphStateHolder *stateHolder = animchar.getAnimState();
         real duration = continuousNode->getDuration(*stateHolder);
         continuousNode->seekToSyncTime(*stateHolder, rnd_float(0.0, duration));
         continuousNode->enableRewind(false);

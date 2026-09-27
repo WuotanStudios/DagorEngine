@@ -7,6 +7,7 @@
 #include <ecs/scripts/dasEs.h>
 #include <debug/dag_logSys.h>
 #include <osApiWrappers/dag_dbgStr.h> //set_debug_console_handle
+#include <osApiWrappers/dag_vromfs.h>
 #if _TARGET_PC_WIN
 #include <windows.h> //set_debug_console_handle
 #endif
@@ -19,7 +20,7 @@ String modulePath;
 
 das::FileAccessPtr get_file_access(char *pak)
 {
-  if (pak)
+  if (pak && *pak)
     return das::make_smart<bind_dascript::DagFileAccess>(pak, bind_dascript::HotReload::DISABLED);
   if (!modulePath.empty())
     return das::make_smart<bind_dascript::DagFileAccess>(modulePath.c_str());
@@ -61,14 +62,10 @@ int DagorWinMain(bool debugmode)
   setvbuf(stdout, NULL, _IOFBF, 8192);
 #if _TARGET_PC_WIN
   set_debug_console_handle((intptr_t)::GetStdHandle(STD_OUTPUT_HANDLE));
+#elif _TARGET_PC_LINUX || _TARGET_PC_MACOSX
+  set_debug_console_handle((intptr_t)stdout);
 #endif
   dgs_report_fatal_error = stderr_report_fatal_error;
-  if (dgs_argc < 3)
-  {
-    ::debug("dasAot <in_script.das> <out_script.das.cpp> [-q] [-j] "
-            "-- [--config aot_config.blk] [--das-root=das/root] [--strict] [--verbose]\n");
-    return -1;
-  }
   debug_set_log_callback(&log_callback);
 
   String dasRoot;
@@ -76,6 +73,7 @@ int DagorWinMain(bool debugmode)
   // dng default
   version2syntax = false;
   gen2MakeSyntax = true;
+  VirtualRomFsData *vrom = nullptr;
 
   DataBlock config;
   for (int ai = 0; ai != dgs_argc; ++ai)
@@ -167,6 +165,19 @@ int DagorWinMain(bool debugmode)
     {
       verboseLogs = true;
     }
+    else if (strcmp(dgs_argv[ai], "--ver2") == 0)
+    {
+      version2syntax = true;
+    }
+    else if (strcmp(dgs_argv[ai], "--vfs") == 0)
+    {
+      String vromfsPath = String(dgs_argv[ai + 1 < dgs_argc ? ai + 1 : ai]);
+      vrom = load_vromfs_dump(vromfsPath.c_str(), inimem, nullptr, nullptr, 0);
+      if (vrom)
+        add_vromfs(vrom, false, nullptr);
+      else
+        logerr("Unable to load vromfs file: %s", vromfsPath.c_str());
+    }
   }
 
   if (!dasRoot.empty())
@@ -177,9 +188,13 @@ int DagorWinMain(bool debugmode)
   bind_dascript::init_systems(bind_dascript::AotMode::NO_AOT, bind_dascript::HotReload::DISABLED, bind_dascript::LoadDebugCode::YES,
     bind_dascript::LogAotErrors::NO, syntax, !modulePath.empty() ? modulePath.c_str() : nullptr);
 
-  (*das::daScriptEnvironment::bound)->das_def_tab_size = indenting;
+  das::daScriptEnvironment::getBound()->das_def_tab_size = indenting;
 
   const int res = aot_main(dgs_argc, (char **)dgs_argv);
+
+  if (vrom)
+    remove_vromfs(vrom);
+
   return res != 0 || !strict ? res : strictExit;
 }
 #if _TARGET_PC_LINUX

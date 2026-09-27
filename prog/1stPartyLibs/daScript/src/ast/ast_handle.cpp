@@ -9,11 +9,11 @@ namespace das {
         auto chA = mod->findAnnotation(child);
         DAS_VERIFYF(chA,"missing child annotation");
         DAS_VERIFYF(chA->rtti_isBasicStructureAnnotation(),"expecting basic structure annotation");
-        auto bsaCh = (BasicStructureAnnotation *) chA.get();
+        auto bsaCh = (BasicStructureAnnotation *) chA;
         for ( auto parent : parents ) {
             auto chP = mod->findAnnotation(parent);
             DAS_VERIFYF(chP,"missing parent annotation");
-            bsaCh->parents.push_back((TypeAnnotation *)chP.get());
+            bsaCh->parents.push_back((TypeAnnotation *)chP);
         }
     }
 
@@ -75,8 +75,9 @@ namespace das {
 
     TypeInfo * BasicStructureAnnotation::getFieldType ( const string & na ) const {
         updateTypeInfo();
-        for ( uint32_t n=0; n!=sti->count; ++n ) {
-            auto & fi = sti->fields[n];
+        auto sinfo = this->sti.load();
+        for ( uint32_t n=0; n!=sinfo->count; ++n ) {
+            auto & fi = sinfo->fields[n];
             if ( fi->name == na ) {
                 return fi;
             }
@@ -97,7 +98,7 @@ namespace das {
         auto it = fields.find(na);
         if ( it!=fields.end() ) {
             auto & sfield = it->second;
-            auto t = isConst && sfield.constDecl ? make_smart<TypeDecl>(*sfield.constDecl) :  make_smart<TypeDecl>(*sfield.decl);
+            auto t = isConst && sfield.constDecl ? new TypeDecl(*sfield.constDecl) :  new TypeDecl(*sfield.decl);
             if ( sfield.offset != -1U ) {
                 t->ref = true;
             }
@@ -112,7 +113,7 @@ namespace das {
         if ( it!=fields.end() ) {
             auto & sfield = it->second;
             if ( sfield.offset!=-1U ) {
-                return isConst && sfield.constDecl ? make_smart<TypeDecl>(*sfield.constDecl) : make_smart<TypeDecl>(*sfield.decl);
+                return isConst && sfield.constDecl ? new TypeDecl(*sfield.constDecl) : new TypeDecl(*sfield.decl);
             } else {
                 return nullptr;
             }
@@ -166,24 +167,30 @@ namespace das {
     }
 
     void BasicStructureAnnotation::updateTypeInfo() const {
-        lock_guard<recursive_mutex> guard(walkMutex);
-        if ( !sti ) {
+        if ( sti.load() ) return;
+        lock_guard<recursive_mutex> guard(g_handleTypeInfoMutex);
+        if ( !sti.load() ) {
             auto debugInfo = helpA.debugInfo;
-            sti = debugInfo->template makeNode<StructInfo>();
-            sti->name = debugInfo->allocateName(name);
+            StructInfo * sinfo = debugInfo->template makeNode<StructInfo>();
+            sinfo->name = debugInfo->allocateName(name);
+            sti_gc = debugInfo->template makeNode<StructInfo>();
+            sti_gc->name = sinfo->name;
             // flags
-            sti->flags = 0;
+            sinfo->flags = 0;
+            sti_gc->flags = 0;
             // count fields
-            sti->count = 0;
+            sinfo->count = 0;
             for ( auto & fi : fields ) {
                 auto & var = fi.second;
                 if ( var.offset != -1U ) {
-                    sti->count ++;
+                    sinfo->count ++;
                 }
             }
             // and allocate
-            sti->size = (uint32_t) getSizeOf();
-            sti->fields = (VarInfo **) debugInfo->allocate( sizeof(VarInfo *) * sti->count );
+            sti_gc->count = 0;
+            sinfo->size = (uint32_t) getSizeOf();
+            sti_gc->size = sinfo->size;
+            sinfo->fields = (VarInfo **) debugInfo->allocate( sizeof(VarInfo *) * sinfo->count );
             int i = 0;
             for ( const auto & fn : fieldsInOrder ) {
                 auto itvar = fields.find(fn);
@@ -194,18 +201,39 @@ namespace das {
                         helpA.makeTypeInfo(vi, var.decl);
                         vi->name = debugInfo->allocateName(fn);
                         vi->offset = var.offset;
-                        sti->fields[i++] = vi;
+                        sinfo->fields[i++] = vi;
+                        if ( vi->flags & (TypeInfo::flag_heapGC | TypeInfo::flag_stringHeapGC)   ) {
+                            sti_gc->count++;
+                        }
                     }
                 }
             }
-            sti->module_name = debugInfo->allocateCachedName(this->module->name);
+            if ( sti_gc->count ) {
+                sti_gc->fields = (VarInfo **) debugInfo->allocate( sizeof(VarInfo *) * sti_gc->count );
+                int j = 0;
+                for ( uint32_t n=0; n!=sinfo->count; ++n ) {
+                    auto & fi = sinfo->fields[n];
+                    if ( fi->flags & (TypeInfo::flag_heapGC | TypeInfo::flag_stringHeapGC) ) {
+                        sti_gc->fields[j++] = fi;
+                    }
+                }
+            } else {
+                sti_gc->fields = nullptr;
+            }
+            sinfo->module_name = debugInfo->allocateCachedName(this->module->name);
+            this->sti.store(sinfo);
         }
-
     }
 
     void BasicStructureAnnotation::walk ( DataWalker & walker, void * data ) {
         updateTypeInfo();
-        walker.walk_struct((char *)data, sti);
+        if ( walker.collecting ) {
+            if ( sti_gc->count ) {
+                walker.walk_struct((char *)data, sti_gc);
+            }
+        } else {
+            walker.walk_struct((char *)data, sti.load());
+        }
     }
 
     void BasicStructureAnnotation::from ( BasicStructureAnnotation * ann ) {
@@ -217,19 +245,19 @@ namespace das {
     }
 
     void BasicStructureAnnotation::from ( const char * parentName ) {
-        from((BasicStructureAnnotation*)(this->module->findAnnotation(parentName).get()));
+        from((BasicStructureAnnotation*)(this->module->findAnnotation(parentName)));
     }
 
     void Program::validateAotCpp ( TextWriter & logs, Context & ) {
         library.foreach([&](Module * mod) -> bool {
             if ( mod->builtIn ) {
                 logs << "// validating " << mod->name << "\n";
-                mod->handleTypes.foreach([&](auto tp){
+                for ( auto & [key, tp] : mod->handleTypes ) {
                     if ( tp->rtti_isBasicStructureAnnotation() ) {
-                        auto bs = static_pointer_cast<BasicStructureAnnotation>(tp);
+                        auto bs = static_cast<BasicStructureAnnotation*>(tp);
                         if ( !bs->validationNeverFails ) {
-                            auto cppt = make_smart<TypeDecl>(Type::tHandle);
-                            cppt->annotation = bs.get();
+                            auto cppt = new TypeDecl(Type::tHandle);
+                            cppt->annotation = bs;
                             auto cppn = describeCppType(cppt);
                             logs << "//\t" << cppn << " aka " << tp->name << "\n";
                             for ( const auto & flp : bs->fields ) {
@@ -243,9 +271,9 @@ namespace das {
                             }
                         }
                     }
-                });
+                }
                 mod->enumerations.foreach([&](auto tp){
-                    auto cppt = make_smart<TypeDecl>(tp);
+                    auto cppt = new TypeDecl(tp);
                     auto cppn = describeCppType(cppt);
                     auto baset = tp->makeBaseType();
                     logs << "//\t" << cppn << " aka " << tp->name << "\n";
@@ -258,48 +286,4 @@ namespace das {
         },"*");
     }
 
-    void reportTrait ( const TypeDeclPtr & type, const string & prefix, set<Structure *> & visited, const callable<void(const TypeDeclPtr &, const string &)> & report ) {
-        report(type, prefix);
-        if ( type->baseType==Type::tPointer ) {
-            // trait never propages via pointer
-            //if ( type->firstType ) reportTrait(type->firstType, prefix, visited, report);
-        } else if ( type->baseType==Type::tStructure ) {
-            if ( type->structType ) {
-                if ( visited.find(type->structType)!=visited.end() ) return;
-                visited.insert(type->structType);
-                for ( auto & fld : type->structType->fields ) {
-                    reportTrait(fld.type, prefix+"."+fld.name, visited, report);
-                }
-            }
-        } else if ( type->baseType==Type::tTuple || type->baseType==Type::tVariant ) {
-            if ( type->argNames.size() ) {
-                int index = 0;
-                for ( auto & argN : type->argNames ) {
-                    reportTrait(type->argTypes[index], prefix+"."+argN, visited, report);
-                    index++;
-                }
-            } else if ( type->argTypes.size() ) {
-                for ( size_t i=0; i!=type->argTypes.size(); ++i ) {
-                    reportTrait(type->argTypes[i], prefix+"."+to_string(i), visited, report);
-                }
-            }
-        } else if ( type->baseType==Type::tArray ) {
-            if ( type->firstType ) reportTrait(type->firstType, prefix+"[]", visited, report);
-        } else if ( type->baseType==Type::tTable ) {
-            if ( type->firstType ) reportTrait(type->firstType, prefix+".key", visited, report);
-            if ( type->secondType ) reportTrait(type->secondType, prefix+".value", visited, report);
-        } else if ( type->baseType==Type::tHandle ) {
-            if ( type->annotation->rtti_isBasicStructureAnnotation() ) {
-                auto sa = (BasicStructureAnnotation *)(type->annotation);
-                for ( auto & fld : sa->fields ) {
-                    reportTrait((fld.second).decl, prefix+"."+fld.first, visited, report);
-                }
-            }
-        }
-    }
-
-    void reportTrait ( const TypeDeclPtr & type, const string & prefix, const callable<void(const TypeDeclPtr &, const string &)> & report ) {
-        set<Structure *> visisted;
-        reportTrait(type, prefix, visisted, report);
-    }
 }

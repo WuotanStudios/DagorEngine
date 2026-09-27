@@ -11,11 +11,23 @@ class RenderScene;
 
 bool is_level_loaded();
 bool is_level_loaded_not_empty();
+// the loading screen ends by opening onto the game's own frame, and this host
+// draws it. The renderer publishes it; it lives in the das module because the
+// das AOT links that and not the renderer
+bool loading_splash_opens_onto_game();
+void set_loading_splash_opens_onto_game(bool opens);
+// the renderer's own answer, for a caller that runs before its next draw
+bool splash_opens_onto_game();
+// the splash is covering a loaded game right now; safe from any thread
+bool is_splash_over_game_active();
+bool is_level_loaded_no_binary();
 bool is_level_loading();
 bool is_level_unloading();
 ecs::EntityId get_current_level_eid();
 
 void select_weather_preset(const char *preset_name);
+void select_weather_preset_delayed(const char *preset_name);
+void update_delayed_weather_selection();
 
 const char *get_rendinst_dmg_blk_fn();
 

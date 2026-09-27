@@ -21,9 +21,9 @@ public:
   void changeResolution(int w, int h);
   // frame: frame or (w+1)/2 downsampled frame
   // fov_scale: can be just p.hk, which mean dof is set for 90 fov
-  void perform(const TextureIDPair &frame, const TextureIDPair &close_depth, float zn, float zf, float fov_scale);
+  void perform(BaseTexture *frame, BaseTexture *close_depth, float zn, float zf, float fov_scale);
   void apply(); // to current render target
-  void setBlendDepthTex(TEXTUREID tex_id);
+  void setBlendDepthTex(BaseTexture *tex);
   void setDoFParams(const DOFProperties &focus_) { nFocus = focus_; }
   const DOFProperties &getDoFParams() const { return nFocus; }
   const DOFProperties &getUsedDoFParams() const { return cFocus; }
@@ -46,11 +46,14 @@ public:
   void setOn(bool on_);
   bool isOn() const { return on; }
   void setSimplifiedRendering(bool sr) { useSimplifiedRendering = sr; }
+  bool isSimplifiedRendering() const { return useSimplifiedRendering; }
   void setCocAccumulation(bool acc) { useCoCAccumulation = acc; }
+  bool isCocAccumulationEnabled() const { return useCoCAccumulation; }
   void setLinearBlend(bool use_linear_blend) { useLinearBlend = use_linear_blend; }
   int getWidth() const { return width; }
   int getHeight() const { return height; }
   void releaseRTs();
+  void closeTextures();
 
 protected:
   void initNear();
@@ -59,12 +62,12 @@ protected:
   void closeFar();
   void changeNearResolution();
   void changeFarResolution();
+  void resetOutputVars();
 
   bool useLinearBlend;
   bool useSimplifiedRendering = false;
   bool useCoCAccumulation = false;
-  bool useNearDof = false;
-  bool useFarDof = false;
+  bool historyValid = false;
   PostFxRenderer dofGather, dofComposite, dofDownscale, dofTile;
   int width, height;
   int originalWidth = 0, originalHeight = 0;

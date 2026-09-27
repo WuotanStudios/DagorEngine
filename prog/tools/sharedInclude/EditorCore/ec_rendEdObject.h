@@ -46,6 +46,7 @@ public:
     FLG_FROZEN = 1 << 2,       ///< Object is "frozen".
     FLG_HIGHLIGHTED = 1 << 3,  ///< Object is highlighted.
     FLG_WANTRESELECT = 1 << 4, ///< Object wants receive every select (even if already selected)
+    FLG_LOCKED = 1 << 5,       ///< Object is locked. All modifications are disabled
   };
 
   /// Constructor 1.
@@ -102,6 +103,9 @@ public:
   /// @return @b true if object is highlighted, @b false in other case
   inline bool isHighlighted() const { return objFlags & FLG_HIGHLIGHTED; }
 
+  /// Test whether the object is locked.
+  /// @return @b true if object is locked, @b false in other case
+  inline bool isLocked() const { return objFlags & FLG_LOCKED; }
 
   /// Get object flags.
   /// @return object flags
@@ -131,6 +135,11 @@ public:
   /// @param[in] select - <b>true / false</b>: set object selection
   ///                     <b>on / off</b>
   virtual void selectObject(bool select = true) { setFlags(select ? FLG_SELECTED : 0, FLG_SELECTED); }
+  //@}
+
+  /// Lock / unlock object.
+  /// @param[in] lock - <b>true / false: lock / unlock</b> object
+  virtual void lockObject(bool lock = true) { setFlags(lock ? FLG_LOCKED : 0, FLG_LOCKED); }
   //@}
 
   //*****************************************************************
@@ -227,6 +236,10 @@ public:
   /// @param[in] basis - Gizmo basis (see #IEditorCoreEngine::BasisType)
   virtual void scaleObject(const Point3 &delta, const Point3 &origin, IEditorCoreEngine::BasisType basis);
   //@}
+
+  /// Queries if the object can be transformed
+  /// @return possibility of object transformation
+  virtual bool canTransform() const { return true; }
 
   //*****************************************************************
   /// @name Undo / redo methods.
@@ -359,6 +372,7 @@ protected:
     void redo() override { obj->setFlags(redoFlags, ~0); }
 
     size_t size() override { return sizeof(*this); }
+    UNDO_MERGE_SNAPSHOT_BY_TARGET(0x218026D5u, obj.get()) // UndoObjFlags
     void accepted() override {}
     void get_description(String &s) override { s = "UndoObjFlags"; }
   };
@@ -383,6 +397,7 @@ protected:
     void redo() override { obj->setPos(redoPos); }
 
     size_t size() override { return sizeof(*this); }
+    UNDO_MERGE_SNAPSHOT_BY_TARGET(0x351CA44Bu, obj.get()) // UndoMove
     void accepted() override {}
     void get_description(String &s) override { s = "UndoMove"; }
   };
@@ -407,6 +422,7 @@ protected:
     void redo() override { obj->setMatrix(redoMatrix); }
 
     size_t size() override { return sizeof(*this); }
+    UNDO_MERGE_SNAPSHOT_BY_TARGET(0x0357EB02u, obj.get()) // UndoMatrix
     void accepted() override {}
     void get_description(String &s) override { s = "UndoMatrix"; }
   };

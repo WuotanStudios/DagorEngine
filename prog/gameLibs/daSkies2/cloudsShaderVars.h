@@ -4,9 +4,21 @@
 #define CLOUDS_VARS_LIST                                                                  \
   VAR(cloud_volume_res, false)                                                            \
   VAR(cloud_volume_dist, false)                                                           \
+  VAR(prev_clouds_volume_transmittance, true)                                             \
+  VAR(cloud_frame_no, true)                                                               \
+  VAR(prev_skies_globtm_0, true)                                                          \
+  VAR(prev_skies_globtm_1, true)                                                          \
+  VAR(prev_skies_globtm_2, true)                                                          \
+  VAR(prev_skies_globtm_3, true)                                                          \
   VAR(clouds2_current_frame, true)                                                        \
   VAR(clouds2_dispatch_groups, false)                                                     \
   VAR(clouds2_resolution, true)                                                           \
+  VAR(clouds2_far_res_last_texel_index, true)                                             \
+  VAR(clouds2_used_uv_far, true)                                                          \
+  VAR(clouds2_used_uv_far_prev, true)                                                     \
+  VAR(clouds2_used_uv_close, true)                                                        \
+  VAR(clouds2_close_allocated_resolution, true)                                           \
+  VAR(clouds2_prev_resolution, true)                                                      \
   VAR(clouds_ambient_desaturation, false)                                                 \
   VAR(clouds_average_weight, false)                                                       \
   VAR(clouds_back_eccentricity, false)                                                    \
@@ -14,7 +26,6 @@
   VAR(clouds_color, true)                                                                 \
   VAR(clouds_color_samplerstate, true)                                                    \
   VAR(clouds_color_close, true)                                                           \
-  VAR(clouds_color_close_samplerstate, true)                                              \
   VAR(clouds_color_prev, true)                                                            \
   VAR(clouds_color_prev_samplerstate, true)                                               \
   VAR(clouds_compute_width, true)                                                         \
@@ -22,11 +33,16 @@
   VAR(clouds_depth, true)                                                                 \
   VAR(clouds_depth_samplerstate, true)                                                    \
   VAR(clouds_depth_gbuf, true)                                                            \
-  VAR(clouds_depth_gbuf_samplerstate, true)                                               \
+  VAR(clouds_depth_gbuf_dims, true)                                                       \
   VAR(clouds_detail_tex_size, false)                                                      \
   VAR(clouds_epicness, false)                                                             \
   VAR(clouds_erosion_noise_tile_size, false)                                              \
   VAR(clouds_erosion_noise_wind_ofs, true)                                                \
+  VAR(clouds_erosion_wind_dir, true)                                                      \
+  VAR(clouds_erosion_strength, true)                                                      \
+  VAR(clouds_erosion_height_bias, true)                                                   \
+  VAR(clouds_erosion_edge_mul, true)                                                      \
+  VAR(clouds_erosion_edge_add, true)                                                      \
   VAR(clouds_field_downsample_ratio, false)                                               \
   VAR(clouds_field_res, false)                                                            \
   VAR(clouds_field_volume, false)                                                         \
@@ -36,7 +52,6 @@
   VAR(clouds_forward_eccentricity_weight, false)                                          \
   VAR(clouds_gen_mips_3d_one_layer, false)                                                \
   VAR(clouds_gen_mips_3d_source, false)                                                   \
-  VAR(clouds_gen_mips_3d_source_samplerstate, false)                                      \
   VAR(clouds_has_close_sequence, false)                                                   \
   VAR(clouds_height_fractions, false)                                                     \
   VAR(clouds_hole_light_dir, true)                                                        \
@@ -57,7 +72,7 @@
   VAR(clouds_offset, true)                                                                \
   VAR(clouds_origin_offset, true)                                                         \
   VAR(clouds_prev_depth_gbuf, true)                                                       \
-  VAR(clouds_prev_depth_gbuf_samplerstate, true)                                          \
+  VAR(clouds_prev_depth_gbuf_dims, true)                                                  \
   VAR(clouds_prev_taa_weight, true)                                                       \
   VAR(clouds_prev_taa_weight_samplerstate, true)                                          \
   VAR(clouds_rain_clouds_amount, false)                                                   \
@@ -75,17 +90,15 @@
   VAR(clouds_target_depth_gbuf_transform, true)                                           \
   VAR(clouds_thickness2, false)                                                           \
   VAR(clouds_tile_distance, true)                                                         \
-  VAR(clouds_tile_distance_samplerstate, true)                                            \
   VAR(clouds_tile_distance_tmp, true)                                                     \
-  VAR(clouds_tile_distance_tmp_samplerstate, true)                                        \
   VAR(clouds_tiled_res, true)                                                             \
   VAR(clouds_turbulence_freq, false)                                                      \
   VAR(clouds_turbulence_scale, false)                                                     \
+  VAR(clouds_use_bsm, true)                                                               \
   VAR(clouds_weather_size, false)                                                         \
   VAR(clouds_wind_alt_gradient, true)                                                     \
   VAR(clouds_use_fullres, true)                                                           \
   VAR(compress_voltex_bc4_source, false)                                                  \
-  VAR(compress_voltex_bc4_source_samplerstate, false)                                     \
   VAR(dispatch_size, false)                                                               \
   VAR(global_clouds_sigma, false)                                                         \
   VAR(nbs_world_pos_to_clouds_alt__inv_clouds_weather_size__neg_clouds_thickness_m, true) \
@@ -93,9 +106,45 @@
   VAR(nbs_clouds_start_altitude2_meters, true)                                            \
   VAR(clouds_direct_sequence, true)                                                       \
   VAR(clouds_use_blur_apply, true)                                                        \
-  VAR(clouds_ignore_close_objects, true)
-
+  VAR(clouds_invalidate_taa_frames, true)                                                 \
+  VAR(clouds_ignore_close_objects, true)                                                  \
+  VAR(clouds_rain_map_max_height, true)                                                   \
+  VAR(clouds_perlin_worley_dilation, true)                                                \
+  VAR(clouds_worley_erosion, true)                                                        \
+  VAR(clouds_shape_gamma, true)                                                           \
+  VAR(clouds_droplet_diameter_um, true)                                                   \
+  VAR(clouds_droplet_phase_params, true)                                                  \
+  VAR(clouds_edge_albedo, true)                                                           \
+  VAR(clouds_edge_albedo_sharpness, true)                                                 \
+  VAR(clouds_taa_exposure, true)                                                          \
+  VAR(clouds_checkerboard, true)                                                          \
+  VAR(traced_clouds_res, true)                                                            \
+  VAR(clouds_checker_dt_scale, true)                                                      \
+  VAR(clouds_checker_clamp_collapse, true)                                                \
+  VAR(clouds_bsm_texel, true)                                                             \
+  VAR(clouds_bsm, true)                                                                   \
+  VAR(clouds_bsm_samplerstate, true)                                                      \
+  VAR(clouds_bsm_raw, true)                                                               \
+  VAR(clouds_bsm_raw_tex, true)                                                           \
+  VAR(clouds_bsm_gen_from_tex, true)                                                      \
+  VAR(clouds_bsm_gen, true)                                                               \
+  VAR(clouds_bsm_gen_sun, true)                                                           \
+  VAR(clouds_bsm_gen_ofs, true)                                                           \
+  VAR(clouds_bsm_gen_hole, true)                                                          \
+  VAR(clouds_bsm_world, true)                                                             \
+  VAR(clouds_bsm_consts, true)                                                            \
+  VAR(clouds_bsm_stat, true)                                                              \
+  VAR(clouds_bsm_ms_attn_sq, true)                                                        \
+  VAR(clouds_bsm_scattering_physicality, true)                                            \
+  VAR(clouds_bsm_blend, true)                                                             \
+  VAR(clouds_bsm_blend_src, true)                                                         \
+  VAR(clouds_bsm_blend_hist, true)                                                        \
+  VAR(clouds_bsm_blend_hist_samplerstate, true)
 
 #define VAR(a, opt) extern int a##VarId;
 CLOUDS_VARS_LIST
 #undef VAR
+
+// the single source of the "checker shader variants exist" gate: the renderer's
+// per-frame check and DaSkies::canCheckerboardTrace must not diverge
+bool clouds_checkerboard_compiled();

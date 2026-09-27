@@ -6,7 +6,9 @@
 #include <EASTL/hash_set.h>
 #include <EASTL/vector_map.h>
 #include <asyncHTTPClient/asyncHTTPClient.h>
-#include <sqModules/sqModules.h>
+#include <quirrel/sqasync_helpers.h>
+#include <sqasync.h>
+#include <sqmodules/sqmodules.h>
 #include <sqrat.h>
 #include <squirrel.h>
 #include <sqstdblob.h>
@@ -35,6 +37,29 @@ struct Request
 };
 
 static eastl::vector<eastl::unique_ptr<Request>> active_requests;
+
+// Heap context for a single httpFetch invocation. FutureHolder owns the
+// strong ref on the awaiting Future.
+//
+// Lifecycle:
+//   1. [VM thread]      http_fetch creates the ctx, kicks off async_request.
+//   2. [worker thread]  HTTP completion fills POD result fields and posts
+//                       settle_fetch_on_vm to sqasync's inbox.
+//   3. [VM thread]      settle_fetch_on_vm builds the response object,
+//                       settles the holder, erases from active_fetches.
+struct FetchCtx
+{
+  sqasync_helpers::FutureHolder holder;
+  // POD result fields filled on the worker thread before post_from_any_thread:
+  httprequests::RequestStatus status = httprequests::RequestStatus::SUCCESS;
+  int httpCode = 0;
+  eastl::vector<char> bodyOwned;
+  eastl::vector<eastl::pair<eastl::string, eastl::string>> headersOwned;
+  httprequests::RequestId rid = 0;
+  explicit FetchCtx(HSQUIRRELVM vm) : holder(vm) {}
+};
+
+static eastl::vector<eastl::unique_ptr<FetchCtx>> active_fetches;
 
 static eastl::vector_map<HSQUIRRELVM, eastl::hash_set<eastl::string>> whitelists;
 
@@ -72,6 +97,201 @@ static SQRESULT is_url_allowed(HSQUIRRELVM vm, const char *url)
 
   return SQ_OK;
 }
+
+
+// Parses the HTTP params shared by httpRequest and httpFetch: url + whitelist,
+// method (POST default), userAgent, timeout_ms, needResponseHeaders, headers,
+// data (string / blob / table-as-form-urlencoded), json, and Content-Type
+// defaulting. stringStorage receives owned copies of header values, body data,
+// and JSON; reqParams.postData spans / reqParams.headers pairs point into it.
+// Storage is reserved up front so no reallocation invalidates those pointers.
+//
+// Returns true on success. On failure, sq_throwerror has already been called
+// and the caller should return SQ_ERROR.
+static bool parse_http_params(HSQUIRRELVM vm, Sqrat::Table &params, httprequests::AsyncRequestParams &reqParams,
+  eastl::vector<eastl::string> &stringStorage)
+{
+  using namespace httprequests;
+
+  Sqrat::Var<const char *> varUrl = params.RawGetSlot("url").GetVar<const char *>();
+  if (!varUrl.value || !*varUrl.value)
+  {
+    sq_throwerror(vm, "No url provided");
+    return false;
+  }
+  if (SQ_FAILED(is_url_allowed(vm, varUrl.value)))
+    return false;
+  reqParams.url = varUrl.value;
+
+  Sqrat::Object methodObj = params.RawGetSlot("method");
+  const char *method = sq_objtostring(&methodObj.GetObject());
+  if (!method || strcmp(method, "POST") == 0)
+    reqParams.reqType = HTTPReq::POST; //-V1048
+  else if (strcmp(method, "GET") == 0)
+    reqParams.reqType = HTTPReq::GET;
+  else if (strcmp(method, "HEAD") == 0)
+    reqParams.reqType = HTTPReq::HEAD;
+  else
+  {
+    sq_throwerror(vm, "Only GET, POST and HEAD methods are supported");
+    return false;
+  }
+
+  Sqrat::Object userAgent = params.RawGetSlot("userAgent");
+  if (userAgent.GetType() == OT_STRING)
+    reqParams.userAgent = sq_objtostring(&userAgent.GetObject());
+
+  Sqrat::Object timeout = params.RawGetSlot("timeout_ms");
+  if (timeout.GetType() == OT_INTEGER)
+    reqParams.reqTimeoutMs = eastl::clamp((int)sq_objtointeger(&timeout.GetObject()), 0, MAX_REQUEST_TIMEOUT_MS);
+  else
+    reqParams.reqTimeoutMs = DEF_REQUEST_TIMEOUT_MS;
+
+  reqParams.needResponseHeaders = true; //-V1048 To consider: flip this default to false
+  if (Sqrat::Object needResponseHeaders = params.RawGetSlot("needResponseHeaders"); !needResponseHeaders.IsNull())
+    reqParams.needResponseHeaders = needResponseHeaders.Cast<bool>();
+
+  Sqrat::Object dataObj = params.RawGetSlot("data");
+  Sqrat::Object jsonObj = params.RawGetSlot("json");
+  Sqrat::Table tblHeaders = params.GetSlot("headers");
+  bool isBlob = false;
+
+  if (!dataObj.IsNull() && !jsonObj.IsNull())
+  {
+    sq_throwerror(vm, "Only one of 'data' and 'json' arguments can be provided");
+    return false;
+  }
+
+  stringStorage.reserve((tblHeaders.GetType() == OT_TABLE ? tblHeaders.Length() : 0) + (dataObj.GetType() != OT_NULL ? 1 : 0) +
+                        (jsonObj.GetType() != OT_NULL ? 1 : 0));
+
+  {
+    SQObjectType dataObjType = dataObj.GetType();
+    if (dataObjType == OT_TABLE || dataObjType == OT_CLASS || dataObjType == OT_INSTANCE)
+    {
+      if (dataObjType == OT_INSTANCE)
+      {
+        SqStackChecker chk(vm);
+        SQUserPointer blobDataPtr = nullptr;
+        sq_pushobject(vm, dataObj.GetObject());
+        if (SQ_SUCCEEDED(sqstd_getblob(vm, -1, &blobDataPtr)))
+        {
+          SQInteger blobDataSize = sqstd_getblobsize(vm, -1);
+          isBlob = true;
+          eastl::string outBuf;
+          outBuf.resize(blobDataSize + 1, 0);
+          memcpy(&outBuf[0], blobDataPtr, blobDataSize);
+          stringStorage.emplace_back(outBuf);
+          reqParams.postData = make_span(stringStorage.back().c_str(), blobDataSize);
+        }
+        sq_pop(vm, 1);
+      }
+
+      if (!isBlob)
+      {
+        SqStackChecker chk(vm);
+        // if content is provided via 'data' field it will be form-urlencoded
+        Sqrat::Object::iterator it;
+        eastl::string outBuf;
+        for (; dataObj.Next(it);)
+        {
+          sq_pushobject(vm, it.getKey());
+          sq_pushobject(vm, it.getValue());
+
+          if (SQ_FAILED(sq_tostring(vm, -2)))
+          {
+            sq_throwerror(vm, "Failed to convert data object key to string");
+            return false;
+          }
+          if (SQ_FAILED(sq_tostring(vm, -2)))
+          {
+            sq_throwerror(vm, "Failed to convert data object value to string");
+            return false;
+          }
+
+          const char *strKey = nullptr, *strValue = nullptr;
+          G_VERIFY(SQ_SUCCEEDED(sq_getstring(vm, -2, &strKey)));
+          G_VERIFY(SQ_SUCCEEDED(sq_getstring(vm, -1, &strValue)));
+
+          if (!outBuf.empty())
+            outBuf += "&";
+          outBuf.append(strKey);
+          outBuf.append("=");
+          outBuf.append(strValue);
+
+          sq_pop(vm, 4);
+        }
+        stringStorage.emplace_back(outBuf);
+        reqParams.postData = make_span(stringStorage.back().c_str(), stringStorage.back().size());
+      }
+    }
+    else if (dataObjType == OT_STRING)
+    {
+      stringStorage.emplace_back(dataObj.Cast<eastl::string>());
+      reqParams.postData = make_span(stringStorage.back().c_str(), stringStorage.back().size());
+    }
+    else if (dataObjType != OT_NULL)
+    {
+      sqstd_throwerrorf(vm, "Unsupported 'data' type %s (%#X), only string, table, class and instance are supported",
+        sq_objtypestr(dataObjType), dataObjType);
+      return false;
+    }
+  }
+
+  {
+    SQObjectType jsonObjType = jsonObj.GetType();
+    if (jsonObjType == OT_TABLE || jsonObjType == OT_CLASS || jsonObjType == OT_INSTANCE)
+    {
+      // if content is provided via 'json' field it will be converted to json string
+      stringStorage.emplace_back(quirrel_to_jsonstr(jsonObj));
+      reqParams.postData = make_span(stringStorage.back().c_str(), stringStorage.back().size());
+    }
+    else if (jsonObjType == OT_STRING)
+    {
+      stringStorage.emplace_back(jsonObj.Cast<eastl::string>());
+      reqParams.postData = make_span(stringStorage.back().c_str(), stringStorage.back().size());
+    }
+    else if (jsonObjType != OT_NULL)
+    {
+      sqstd_throwerrorf(vm, "Unsupported 'json' type %s (%#X), only string, table, class and instance are supported",
+        sq_objtypestr(jsonObjType), jsonObjType);
+      return false;
+    }
+  }
+
+  bool contentTypeProvided = false;
+  if (tblHeaders.GetType() == OT_TABLE)
+  {
+    Sqrat::Object::iterator it;
+    for (; tblHeaders.Next(it);)
+    {
+      if (sq_type(it.getKey()) != OT_STRING)
+      {
+        sq_throwerror(vm, "Header name is not a string");
+        return false;
+      }
+
+      HSQOBJECT hValue = it.getValue();
+      Sqrat::Object valueObj(hValue, vm);
+      stringStorage.emplace_back(valueObj.Cast<eastl::string>());
+      reqParams.headers.push_back({it.getName(), stringStorage.back().c_str()});
+
+      if (stricmp("Content-Type", it.getName()) == 0)
+        contentTypeProvided = true;
+    }
+  }
+
+  if (!contentTypeProvided)
+  {
+    if (!jsonObj.IsNull())
+      reqParams.headers.push_back({"Content-Type", "application/json"});
+    else if (isBlob)
+      reqParams.headers.push_back({"Content-Type", "application/octet-stream"});
+  }
+
+  return true;
+}
+
 
 /* qdox @module dagor.http
 @function requestHttp
@@ -117,165 +337,10 @@ static SQInteger request(HSQUIRRELVM vm)
 
   AsyncRequestParams reqParams;
   reqParams.sendResponseInMainThreadOnly = true;
-
-  Sqrat::Var<const char *> varUrl = params.RawGetSlot("url").GetVar<const char *>();
-  if (!varUrl.value || !*varUrl.value)
-    return sq_throwerror(vm, "No url provided");
-  if (SQ_FAILED(is_url_allowed(vm, varUrl.value)))
-    return SQ_ERROR;
-
-  reqParams.url = varUrl.value;
-
-  Sqrat::Object methodObj = params.RawGetSlot("method");
-  const char *method = sq_objtostring(&methodObj.GetObject());
-  if (!method || strcmp(method, "POST") == 0)
-    reqParams.reqType = HTTPReq::POST; //-V1048
-  else if (strcmp(method, "GET") == 0)
-    reqParams.reqType = HTTPReq::GET;
-  else if (strcmp(method, "HEAD") == 0)
-    reqParams.reqType = HTTPReq::HEAD;
-  else
-    return sq_throwerror(vm, "Only GET, POST and HEAD methods are supported");
-
-  Sqrat::Object userAgent = params.RawGetSlot("userAgent");
-  if (userAgent.GetType() == OT_STRING)
-    reqParams.userAgent = sq_objtostring(&userAgent.GetObject());
-
-  Sqrat::Object timeout = params.RawGetSlot("timeout_ms");
-  if (timeout.GetType() == OT_INTEGER)
-    reqParams.reqTimeoutMs = eastl::clamp((int)sq_objtointeger(&timeout.GetObject()), 0, MAX_REQUEST_TIMEOUT_MS);
-  else
-    reqParams.reqTimeoutMs = DEF_REQUEST_TIMEOUT_MS;
-
-  reqParams.needResponseHeaders = true; //-V1048 To consider: flip this default to false
-  if (Sqrat::Object needResponseHeaders = params.RawGetSlot("needResponseHeaders"); !needResponseHeaders.IsNull())
-    reqParams.needResponseHeaders = needResponseHeaders.Cast<bool>();
-
-  Sqrat::Object dataObj = params.RawGetSlot("data");
-  Sqrat::Object jsonObj = params.RawGetSlot("json");
-  Sqrat::Table tblHeaders = params.GetSlot("headers");
-  bool isBlob = false;
-
-  if (!dataObj.IsNull() && !jsonObj.IsNull())
-    return sq_throwerror(vm, "Only one of 'data' and 'json' arguments can be provided");
-
   eastl::vector<eastl::string> stringStorage;
-  stringStorage.reserve((tblHeaders.GetType() == OT_TABLE ? tblHeaders.Length() : 0) + (dataObj.GetType() != OT_NULL ? 1 : 0) +
-                        (jsonObj.GetType() != OT_NULL ? 1 : 0));
 
-
-  {
-    SQObjectType dataObjType = dataObj.GetType();
-    if (dataObjType == OT_TABLE || dataObjType == OT_CLASS || dataObjType == OT_INSTANCE)
-    {
-      if (dataObjType == OT_INSTANCE)
-      {
-        SqStackChecker chk(vm);
-        SQUserPointer blobDataPtr = nullptr;
-        sq_pushobject(vm, dataObj.GetObject());
-        if (SQ_SUCCEEDED(sqstd_getblob(vm, -1, &blobDataPtr)))
-        {
-          SQInteger blobDataSize = sqstd_getblobsize(vm, -1);
-          isBlob = true;
-          eastl::string outBuf;
-          outBuf.resize(blobDataSize + 1, 0);
-          memcpy(&outBuf[0], blobDataPtr, blobDataSize);
-          stringStorage.emplace_back(outBuf);
-          reqParams.postData = make_span(stringStorage.back().c_str(), blobDataSize);
-        }
-        sq_pop(vm, 1);
-      }
-
-      if (!isBlob)
-      {
-        SqStackChecker chk(vm);
-        // if content is provided via 'data' field it will be form-urlencoded
-        Sqrat::Object::iterator it;
-        eastl::string outBuf;
-        for (; dataObj.Next(it);)
-        {
-          sq_pushobject(vm, it.getKey());
-          sq_pushobject(vm, it.getValue());
-
-          if (SQ_FAILED(sq_tostring(vm, -2)))
-            return sq_throwerror(vm, "Failed to convert data object key to string");
-          if (SQ_FAILED(sq_tostring(vm, -2)))
-            return sq_throwerror(vm, "Failed to convert data object value to string");
-
-          const SQChar *strKey = nullptr, *strValue = nullptr;
-          G_VERIFY(SQ_SUCCEEDED(sq_getstring(vm, -2, &strKey)));
-          G_VERIFY(SQ_SUCCEEDED(sq_getstring(vm, -1, &strValue)));
-
-          if (!outBuf.empty())
-            outBuf += "&";
-          outBuf.append(strKey);
-          outBuf.append("=");
-          outBuf.append(strValue);
-
-          sq_pop(vm, 4);
-        }
-        stringStorage.emplace_back(outBuf);
-        reqParams.postData = make_span(stringStorage.back().c_str(), stringStorage.back().size());
-      }
-    }
-    else if (dataObjType == OT_STRING)
-    {
-      stringStorage.emplace_back(dataObj.Cast<eastl::string>());
-      reqParams.postData = make_span(stringStorage.back().c_str(), stringStorage.back().size());
-    }
-    else if (dataObjType != OT_NULL)
-    {
-      return sqstd_throwerrorf(vm, "Unsupported 'data' type %s (%#X), only string, table, class and instance are supported",
-        sq_objtypestr(dataObjType), dataObjType);
-    }
-  }
-
-  {
-    SQObjectType jsonObjType = jsonObj.GetType();
-    if (jsonObjType == OT_TABLE || jsonObjType == OT_CLASS || jsonObjType == OT_INSTANCE)
-    {
-      // if content is provided via 'json' field it will be converted to json string
-      stringStorage.emplace_back(quirrel_to_jsonstr(jsonObj));
-      reqParams.postData = make_span(stringStorage.back().c_str(), stringStorage.back().size());
-    }
-    else if (jsonObjType == OT_STRING)
-    {
-      stringStorage.emplace_back(jsonObj.Cast<eastl::string>());
-      reqParams.postData = make_span(stringStorage.back().c_str(), stringStorage.back().size());
-    }
-    else if (jsonObjType != OT_NULL)
-    {
-      return sqstd_throwerrorf(vm, "Unsupported 'json' type %s (%#X), only string, table, class and instance are supported",
-        sq_objtypestr(jsonObjType), jsonObjType);
-    }
-  }
-
-  bool contentTypeProvided = false;
-  if (tblHeaders.GetType() == OT_TABLE)
-  {
-    Sqrat::Object::iterator it;
-    for (; tblHeaders.Next(it);)
-    {
-      if (sq_type(it.getKey()) != OT_STRING)
-        return sq_throwerror(vm, "Header name is not a string");
-
-      HSQOBJECT hValue = it.getValue();
-      Sqrat::Object valueObj(hValue, vm);
-      stringStorage.emplace_back(valueObj.Cast<eastl::string>());
-      reqParams.headers.push_back({it.getName(), stringStorage.back().c_str()});
-
-      if (stricmp("Content-Type", it.getName()) == 0)
-        contentTypeProvided = true;
-    }
-  }
-
-  if (!contentTypeProvided)
-  {
-    if (!jsonObj.IsNull())
-      reqParams.headers.push_back({"Content-Type", "application/json"});
-    else if (isBlob)
-      reqParams.headers.push_back({"Content-Type", "application/octet-stream"});
-  }
+  if (!parse_http_params(vm, params, reqParams, stringStorage))
+    return SQ_ERROR;
 
   Sqrat::Object cbFunc = params.RawGetSlot("callback");
   if (cbFunc.GetType() != OT_NULL && cbFunc.GetType() != OT_CLOSURE && cbFunc.GetType() != OT_NATIVECLOSURE &&
@@ -304,55 +369,44 @@ static SQInteger request(HSQUIRRELVM vm)
 
   reqParams.callback =
     make_http_callback([req](RequestStatus status, int http_code, dag::ConstSpan<char> response, StringMap const &resp_headers) {
-      bool haveCb = !req->callback.IsNull();
-      if ((haveCb || !req->respEventId.empty()) && (status != RequestStatus::SHUTDOWN))
-      {
-        auto cb = [haveCb, status, http_code, req, response, &resp_headers](HSQUIRRELVM vm) {
-          if (vm)
+      auto cb = [&](sqeventbus::Value &resp) {
+        auto vm = resp.getVM();
+        resp["status"] = (SQInteger)status;
+        resp["http_code"] = (SQInteger)http_code;
+        resp["context"] = req->context;
+
+        if (!resp_headers.empty())
+        {
+          sqeventbus::Value sqRespHeaders(vm);
+          for (auto &kv : resp_headers)
+            sqRespHeaders[kv.first.data()] = kv.second.data();
+          resp["headers"] = sqRespHeaders; // TODO: rename to `resp_headers`
+        }
+        if (!response.empty())
+        {
+          SQUserPointer ptr = sqstd_createblob(vm, response.size());
+          G_ASSERT(ptr); // can happen if blob library was not registered
+          if (ptr)
           {
-            Sqrat::Table resp(vm);
-            resp.SetValue("status", (SQInteger)status);
-            resp.SetValue("http_code", (SQInteger)http_code);
-            resp.SetValue("context", req->context);
-
-            if (!resp_headers.empty())
-            {
-              Sqrat::Table sqRespHeaders(vm);
-              for (auto &kv : resp_headers)
-                sqRespHeaders.SetValue(kv.first.data(), kv.second.data());
-              resp.SetValue("headers", sqRespHeaders); // TODO: rename to `resp_headers`
-            }
-            if (!response.empty())
-            {
-              SQUserPointer ptr = sqstd_createblob(vm, response.size());
-              G_ASSERT(ptr); // can happen if blob library was not registered
-              if (ptr)
-              {
-                memcpy(ptr, response.data(), response.size());
-                HSQOBJECT hBlob;
-                sq_getstackobj(vm, -1, &hBlob);
-                resp.SetValue("body", Sqrat::Object(hBlob, vm));
-                sq_pop(vm, 1);
-              }
-            }
-
-            resp.FreezeSelf();
-            if (haveCb)
-            {
-              if (!req->callback(resp))
-                LOGERR_CTX("Failed to call HTTP request callback");
-            }
-            if (!req->respEventId.empty())
-              sqeventbus::send_event(req->respEventId.c_str(), resp);
+            memcpy(ptr, response.data(), response.size());
+            resp["body"] = Sqrat::Var<Sqrat::Object>(vm, -1).value;
+            sq_pop(vm, 1);
           }
-        };
-
-        if (haveCb)
-          cb(req->callback.GetVM());
-        else
-          sqeventbus::do_with_vm(cb);
+        }
+        resp.obj.FreezeSelf();
+      };
+      if (status != RequestStatus::SHUTDOWN)
+      {
+        if (!req->callback.IsNull())
+        {
+          sqeventbus::Value resp(req->callback.GetVM());
+          cb(resp);
+          if (!req->callback(resp.obj))
+            LOGERR_CTX("Failed to call HTTP request callback");
+        }
+        if (!req->respEventId.empty())
+          sqeventbus::write_event_main_thread(req->respEventId.c_str(), cb);
       }
-
       auto it = eastl::find_if(active_requests.begin(), active_requests.end(),
         [req](eastl::unique_ptr<Request> &p) { return p.get() == req; });
       G_ASSERT(it != active_requests.end());
@@ -367,6 +421,124 @@ static SQInteger request(HSQUIRRELVM vm)
     http_client_wait_active_requests(0);
 
   return 1;
+}
+
+
+// Settle a fetch promise. Runs on the VM thread via sqasync::pump's inbox
+// drain (posted by the worker-side completion lambda via post_from_any_thread).
+// Always resolves with a frozen response table {status, http_code, headers?,
+// body?}: status is the RequestStatus enum as integer (HTTP_SUCCESS /
+// HTTP_FAILED / HTTP_ABORTED / HTTP_SHUTDOWN, same as httpRequest's status),
+// http_code is 0 when no server response was received, and headers / body are
+// only present when non-empty -- mirroring httpRequest's callback shape.
+// Documented HTTP failure (4xx/5xx) is a resolved value, not a fault.
+// resolve is a no-op if the holder has been disowned by onVmShutdown(), so
+// this is safe to call after http_client_on_vm_shutdown.
+static void settle_fetch_on_vm(void *user)
+{
+  auto *ctx = static_cast<FetchCtx *>(user);
+  HSQUIRRELVM vm = ctx->holder.vm();
+
+  Sqrat::Table resp(vm);
+  resp.SetValue("status", (SQInteger)ctx->status);
+  resp.SetValue("http_code", (SQInteger)ctx->httpCode);
+
+  if (!ctx->headersOwned.empty())
+  {
+    Sqrat::Table hdrs(vm);
+    for (const auto &kv : ctx->headersOwned)
+      hdrs.SetValue(kv.first.c_str(), kv.second.c_str());
+    resp.SetValue("headers", hdrs);
+  }
+
+  // Body is delivered as a Blob to match httpRequest's response shape (script
+  // gets it via body.as_string() for text, or .readn / read pointer for binary).
+  // Empty body leaves the slot unset (resp.body == null), again matching httpRequest.
+  if (!ctx->bodyOwned.empty())
+  {
+    SQUserPointer ptr = sqstd_createblob(vm, ctx->bodyOwned.size());
+    G_ASSERT(ptr); // null only if the blob library was not registered for this VM
+    if (ptr)
+    {
+      memcpy(ptr, ctx->bodyOwned.data(), ctx->bodyOwned.size());
+      resp.SetValue("body", Sqrat::Var<Sqrat::Object>(vm, -1).value);
+      sq_pop(vm, 1);
+    }
+  }
+
+  resp.FreezeSelf();
+  ctx->holder.resolve(resp.GetObject());
+
+  auto it = eastl::find_if(active_fetches.begin(), active_fetches.end(),
+    [ctx](const eastl::unique_ptr<FetchCtx> &p) { return p.get() == ctx; });
+  G_ASSERT(it != active_fetches.end());
+  active_fetches.erase(it);
+}
+
+
+/* qdox @module dagor.http
+@function httpFetch
+
+Future-based fetch. Always resolves with a frozen response table; never
+faults. The script checks `response.status` against `HTTP_SUCCESS` /
+`HTTP_FAILED` / `HTTP_ABORTED` / `HTTP_SHUTDOWN` -- the same status values
+`httpRequest`'s callback receives. Documented HTTP failure (4xx/5xx) is a
+resolved `HTTP_SUCCESS` response with a non-2xx `http_code`.
+
+Response shape matches `httpRequest`'s callback:
+  - `status` : int (always present)
+  - `http_code` : int (0 when no server response was received)
+  - `headers` : table (optional; present only when non-empty)
+  - `body` : Blob (optional; present only when non-empty). Use
+            `body.as_string()` for text; `.readn` / read pointer for binary.
+
+@param params t : same shape as httpRequest, minus callback / respEventId / context / waitable
+       (the Future is the awaitable).
+@return p : Future
+*/
+static SQInteger http_fetch(HSQUIRRELVM vm)
+{
+  using namespace httprequests;
+
+  Sqrat::Var<Sqrat::Table> varParams(vm, 2);
+  Sqrat::Table &params = varParams.value;
+  if (params.GetType() != OT_TABLE)
+    return sq_throwerror(vm, "httpFetch: first argument must be a table");
+
+  AsyncRequestParams reqParams;
+  // sqasync inbox handles the VM-thread hop, so no sendResponseInMainThreadOnly here.
+  eastl::vector<eastl::string> stringStorage;
+
+  if (!parse_http_params(vm, params, reqParams, stringStorage))
+    return SQ_ERROR;
+
+  auto ctxOwner = eastl::make_unique<FetchCtx>(vm);
+  if (sq_isnull(ctxOwner->holder.instance()))
+    return SQ_ERROR;                              // future_create raised
+  sq_pushobject(vm, ctxOwner->holder.instance()); // for `return 1`
+  FetchCtx *ctx = ctxOwner.get();
+  active_fetches.emplace_back(eastl::move(ctxOwner));
+
+  reqParams.callback = make_http_callback([ctx, storage = eastl::move(stringStorage)](RequestStatus status, int http_code,
+                                            dag::ConstSpan<char> response, StringMap const &resp_headers) {
+    // RUNS ON ANY THREAD: POD-only writes to ctx, no Sqrat / HSQOBJECT off the
+    // VM thread. `storage` keeps request strings alive until the lambda dies.
+    (void)storage;
+    ctx->status = status;
+    ctx->httpCode = http_code;
+    ctx->bodyOwned.assign(response.begin(), response.end());
+    ctx->headersOwned.reserve(resp_headers.size());
+    for (const auto &h : resp_headers)
+      ctx->headersOwned.emplace_back(eastl::string(h.first.data(), h.first.size()), eastl::string(h.second.data(), h.second.size()));
+
+    // http_client_on_vm_shutdown waits for in-flight workers before
+    // sqasync::shutdown, so the inbox is guaranteed open here.
+    G_VERIFY(SQ_SUCCEEDED(sqasync::post_from_any_thread(ctx->holder.vm(), &settle_fetch_on_vm, ctx)));
+  });
+
+  ctx->rid = httprequests::async_request(reqParams);
+
+  return 1; // promise instance left on stack
 }
 
 
@@ -481,15 +653,12 @@ static SQInteger download(HSQUIRRELVM vm)
       if (status != httprequests::RequestStatus::SUCCESS)
         dd_erase(req->filepath.c_str());
 
-      delayed_call([status, http_code, event = req->doneEventId, downloaded = req->totalDownloaded, id = req->id]() {
-        sqeventbus::do_with_vm([&](HSQUIRRELVM vm) {
-          Sqrat::Table resp(vm);
-          resp.SetValue("status", (SQInteger)status);
-          resp.SetValue("http_code", (SQInteger)http_code);
-          resp.SetValue("id", id);
-          resp.SetValue("downloaded", (SQInteger)downloaded);
-          sqeventbus::send_event(event.c_str(), resp);
-        });
+      // Note: no need to `delayed_call` since `sendResponseInMainThreadOnly=true`
+      sqeventbus::write_event_main_thread(req->doneEventId.c_str(), [&](auto &resp) {
+        resp["status"] = (SQInteger)status;
+        resp["http_code"] = (SQInteger)http_code;
+        resp["id"] = req->id;
+        resp["downloaded"] = (SQInteger)req->totalDownloaded;
       });
     }
 
@@ -513,11 +682,9 @@ static SQInteger download(HSQUIRRELVM vm)
         req->lastUpdate = curTime;
 
         delayed_call([event = req->progressEventId, id = req->id, downloaded = req->totalDownloaded]() {
-          sqeventbus::do_with_vm([&](HSQUIRRELVM vm) {
-            Sqrat::Table resp(vm);
-            resp.SetValue("downloaded", (SQInteger)downloaded);
-            resp.SetValue("id", id);
-            sqeventbus::send_event(event.c_str(), resp);
+          sqeventbus::write_event_main_thread(event.c_str(), [&](auto &resp) {
+            resp["downloaded"] = (SQInteger)downloaded;
+            resp["id"] = id;
           });
         });
       }
@@ -526,7 +693,7 @@ static SQInteger download(HSQUIRRELVM vm)
 
     void onHttpHeadersResponse(httprequests::StringMap const &resp_headers) override
     {
-      // if headers are recieved after the first data chunk (they shouldn't), then don't allocate the whole file
+      // if headers are received after the first data chunk (they shouldn't), then don't allocate the whole file
       if (req->totalDownloaded > 0)
         return;
 
@@ -575,9 +742,11 @@ void bind_http_client(SqModules *module_mgr)
   Sqrat::Table nsTbl(module_mgr->getVM());
   ///@module dagor.http
   nsTbl //
-    .SquirrelFunc("httpRequest", request, 2, ".t")
-    .SquirrelFunc("httpAbort", abort_request, 2, ".i")
-    .SquirrelFunc("httpDownload", download, 2, ".t")
+    .SquirrelFuncDeclString(request, "httpRequest(params: table): int")
+    .SquirrelFuncDeclString(http_fetch, "httpFetch(params: table): instance")
+    .SquirrelFuncDeclString(abort_request, "httpAbort(request_id: int): null")
+    .SquirrelFuncDeclString(download, "httpDownload(params: table): int")
+    .Func("poll", httprequests::poll)
     ///@param request_id i
     .SetValue("HTTP_SUCCESS", (SQInteger)httprequests::RequestStatus::SUCCESS)
     .SetValue("HTTP_FAILED", (SQInteger)httprequests::RequestStatus::FAILED)
@@ -616,8 +785,48 @@ void http_client_on_vm_shutdown(HSQUIRRELVM vm)
       req->context.Release();
     }
   }
+  // onVmShutdown() disowns the holder so a late worker settle becomes a no-op.
+  // The drain below must complete BEFORE sqasync::shutdown (~SQSharedState),
+  // or a worker post would race with inbox teardown.
+  bool anyForVm = false;
+  for (auto &ctx : active_fetches)
+  {
+    if (ctx->holder.vm() == vm)
+    {
+      ctx->holder.onVmShutdown();
+      httprequests::abort_request(ctx->rid);
+      anyForVm = true;
+    }
+  }
+  if (anyForVm)
+  {
+    const int deadlineMs = get_time_msec() + 5000;
+    while (true)
+    {
+      httprequests::poll();
+      sqasync::pump(vm);
+      bool stillAny = false;
+      for (auto &ctx : active_fetches)
+        if (ctx->holder.vm() == vm)
+        {
+          stillAny = true;
+          break;
+        }
+      if (!stillAny)
+        break;
+      if (get_time_msec() > deadlineMs)
+      {
+        logerr("[httpFetch] vm shutdown timed out waiting for in-flight fetches; ctxs leak until process exit");
+        break;
+      }
+      sleep_msec(1);
+    }
+  }
   whitelists.erase(vm);
 }
+
+
+bool http_has_pending_async_fetch() { return !active_fetches.empty(); }
 
 
 void http_set_domains_whitelist(HSQUIRRELVM vm, const eastl::vector<eastl::string> &domains)

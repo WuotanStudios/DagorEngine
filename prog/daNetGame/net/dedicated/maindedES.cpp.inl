@@ -6,6 +6,7 @@
 #include <gameRes/dag_gameResSystem.h>
 #include <util/dag_delayedAction.h>
 #include "net/dedicated/matching.h"
+#include "net/dedicated/matching_state_data.h"
 #include <daECS/net/network.h>
 #include "game/gameEvents.h"
 #include "game/player.h"
@@ -26,7 +27,7 @@ namespace dedicated
 {
 
 ECS_AFTER(on_gameapp_started_es)
-static void dedicated_init_on_appstart_es(const EventOnGameAppStarted &)
+static void dedicated_init_on_appstart_es(const EventOnGameAppStarted &, ecs::EntityManager &manager)
 {
   set_no_gameres_factory_fatal(false);
 #if !_TARGET_PC_LINUX // On Linux using workcycle::idle_loop() is called automatically from dagor_idle_cycle()
@@ -34,7 +35,22 @@ static void dedicated_init_on_appstart_es(const EventOnGameAppStarted &)
   register_regular_action_to_idle_cycle([](void *) { workcycle_internal::idle_loop(); }, nullptr);
 #endif
   dedicated_matching::init();
-  g_entity_mgr->broadcastEventImmediate(DedicatedServerEventOnInit{});
+  manager.broadcastEventImmediate(DedicatedServerEventOnInit{});
+}
+
+// The connecting player's appId is read from their matching room member, which may not carry it
+// yet. Keep the entity in step, or every backend request for that player stays wrong all session.
+ECS_NO_ORDER
+static void dedicated_player_app_id_changed_es(const NetMatchingEventOnPlayerAppIdChanged &evt)
+{
+  const game::Player *plr = game::find_player_by_userid(evt.get<0>());
+  if (!plr)
+    return;
+  int *appId = g_entity_mgr->getNullableRW<int>(plr->getEid(), ECS_HASH("appId"));
+  if (!appId || *appId == evt.get<1>())
+    return;
+  debug("matching reports appId %d for player %lld, was %d", evt.get<1>(), (long long)evt.get<0>(), *appId);
+  *appId = evt.get<1>();
 }
 
 void update()

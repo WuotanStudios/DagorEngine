@@ -6,6 +6,9 @@
 namespace das {
 
     class UnsafeFolding : public PassVisitor {
+    public:
+        using PassVisitor::visit;
+        UnsafeFolding() : PassVisitor(0) {}
     protected:
         virtual ExpressionPtr visit ( ExprUnsafe * expr ) {
             return expr->body;
@@ -25,46 +28,56 @@ namespace das {
     //  r2v(a ? b : c)      = a ? r2v(b) : r2v(c)
     //  r2v(cast(x))        = cast(r2v(x))
     class RefFolding : public PassVisitor {
+    public:
+        using PassVisitor::PassVisitor;
+        using PassVisitor::visit;
+
+        virtual bool canVisitStructure ( Structure * /*st*/ ) override { return false; }
+        virtual bool canVisitEnumeration ( Enumeration * /*en*/ ) override { return false; }
+        virtual bool canVisitStructureFieldInit ( Structure * /*var*/ ) override { return false; }
+        virtual bool canVisitArgumentInit ( Function * /*fun*/, const VariablePtr & /*var*/, Expression * /*init*/ ) override { return false; }
+
     protected:
+        // note: loop_source is set during type inference (ast_infer_type.cpp)
         virtual ExpressionPtr visit ( ExprRef2Value * expr ) override {
             if ( expr->subexpr->rtti_isCast() ) {
                 reportFolding();
-                auto ecast = static_pointer_cast<ExprCast>(expr->subexpr);
-                auto nr2v = make_smart<ExprRef2Value>();
+                auto ecast = static_cast<ExprCast*>(expr->subexpr);
+                auto nr2v = new ExprRef2Value();
                 nr2v->at = expr->at;
                 nr2v->subexpr = ecast->subexpr;
-                nr2v->type = make_smart<TypeDecl>(*nr2v->subexpr->type);
+                nr2v->type = new TypeDecl(*nr2v->subexpr->type);
                 nr2v->type->ref = false;
                 ecast->subexpr = nr2v;
                 ecast->type->ref = false;
                 return ecast;
             } else if ( expr->subexpr->rtti_isVar() ) {
                 reportFolding();
-                auto evar = static_pointer_cast<ExprVar>(expr->subexpr);
+                auto evar = static_cast<ExprVar*>(expr->subexpr);
                 evar->r2v = true;
                 evar->type->ref = false;
                 return evar;
             } else if ( expr->subexpr->rtti_isField() ) {
                 reportFolding();
-                auto efield = static_pointer_cast<ExprField>(expr->subexpr);
+                auto efield = static_cast<ExprField*>(expr->subexpr);
                 efield->r2v = true;
                 efield->type->ref = false;
                 return efield;
             } else if ( expr->subexpr->rtti_isAsVariant() ) {
                 reportFolding();
-                auto efield = static_pointer_cast<ExprAsVariant>(expr->subexpr);
+                auto efield = static_cast<ExprAsVariant*>(expr->subexpr);
                 efield->r2v = true;
                 efield->type->ref = false;
                 return efield;
             } else if ( expr->subexpr->rtti_isSafeAsVariant() ) {
                 reportFolding();
-                auto efield = static_pointer_cast<ExprSafeAsVariant>(expr->subexpr);
+                auto efield = static_cast<ExprSafeAsVariant*>(expr->subexpr);
                 efield->r2v = true;
                 efield->type->ref = false;
                 return efield;
             } else if ( expr->subexpr->rtti_isSwizzle() ) {
                 reportFolding();
-                auto eswiz = static_pointer_cast<ExprSwizzle>(expr->subexpr);
+                auto eswiz = static_cast<ExprSwizzle*>(expr->subexpr);
                 eswiz->r2v = true;
                 eswiz->type->ref = false;
                 if (!TypeDecl::isSequencialMask(eswiz->fields)) {
@@ -74,33 +87,33 @@ namespace das {
             } else if ( expr->subexpr->rtti_isSafeField() ) {
                 DAS_ASSERTF(false, "we should not be here. R2V of ?. is strange indeed");
                 reportFolding();
-                auto efield = static_pointer_cast<ExprSafeField>(expr->subexpr);
+                auto efield = static_cast<ExprSafeField*>(expr->subexpr);
                 efield->r2v = true;
                 efield->type->ref = false;
                 return efield;
             } else if ( expr->subexpr->rtti_isAt() ) {
                 reportFolding();
-                auto eat = static_pointer_cast<ExprAt>(expr->subexpr);
+                auto eat = static_cast<ExprAt*>(expr->subexpr);
                 eat->r2v = true;
                 eat->type->ref = false;
                 return eat;
             } else if ( expr->subexpr->rtti_isSafeAt() ) {
                 DAS_ASSERTF(false, "we should not be here. R2V of ?[ is strange indeed");
                 reportFolding();
-                auto eat = static_pointer_cast<ExprSafeAt>(expr->subexpr);
+                auto eat = static_cast<ExprSafeAt*>(expr->subexpr);
                 eat->r2v = true;
                 eat->type->ref = false;
                 return eat;
             } else if ( expr->subexpr->rtti_isOp3() ) {
                 reportFolding();
-                auto op3 = static_pointer_cast<ExprOp3>(expr->subexpr);
+                auto op3 = static_cast<ExprOp3*>(expr->subexpr);
                 op3->left = Expression::autoDereference(op3->left);
                 op3->right = Expression::autoDereference(op3->right);
                 op3->type->ref = false;
                 return expr->subexpr;
             } else if ( expr->subexpr->rtti_isNullCoalescing() ) {
                 reportFolding();
-                auto nc = static_pointer_cast<ExprNullCoalescing>(expr->subexpr);
+                auto nc = static_cast<ExprNullCoalescing*>(expr->subexpr);
                 nc->defaultValue = Expression::autoDereference(nc->defaultValue);
                 nc->type->ref = false;
                 return nc;
@@ -110,10 +123,10 @@ namespace das {
         }
     };
 
-    bool doesExprTerminates ( const ExpressionPtr & expr ) {
+    bool doesExprTerminates ( ExpressionPtr expr ) {
         if ( !expr ) return false;
         if ( expr->rtti_isBlock() ) {
-            auto pBlock = static_pointer_cast<ExprBlock>(expr);
+            auto pBlock = static_cast<ExprBlock*>(expr);
             for ( auto & e : pBlock->list ) {
                 if ( e->rtti_isReturn() || e->rtti_isBreak() || e->rtti_isContinue() ) {
                     return true;
@@ -125,12 +138,12 @@ namespace das {
                 }
             }
         } else if ( expr->rtti_isIfThenElse() ) {
-            auto pIte = static_pointer_cast<ExprIfThenElse>(expr);
+            auto pIte = static_cast<ExprIfThenElse*>(expr);
             if ( doesExprTerminates(pIte->if_true) && doesExprTerminates(pIte->if_false) ) {
                 return true;
             }
         } else if ( expr->rtti_isWith() ) {
-            auto pWith = static_pointer_cast<ExprWith>(expr);
+            auto pWith = static_cast<ExprWith*>(expr);
             if ( pWith->body && doesExprTerminates(pWith->body) ) {
                 return true;
             }
@@ -139,6 +152,20 @@ namespace das {
     }
 
     class BlockFolding : public PassVisitor {
+    public:
+        using PassVisitor::PassVisitor;
+        using PassVisitor::preVisit;
+
+        virtual bool canVisitStructure ( Structure * /*st*/ ) override { return false; }
+        virtual bool canVisitGlobalVariable ( Variable * /*fun*/ ) override { return false; }
+        virtual bool canVisitEnumeration ( Enumeration * /*en*/ ) override { return false; }
+        virtual bool canVisitStructureFieldInit ( Structure * /*var*/ ) override { return false; }
+        virtual bool canVisitExpr ( ExprTypeInfo * /*expr*/, Expression * /*subexpr*/ ) override { return false; }
+        virtual bool canVisitMakeStructureBlock ( ExprMakeStruct * /*expr*/, Expression * /*blk*/ ) override { return false; }
+        virtual bool canVisitMakeStructureBody ( ExprMakeStruct * /*expr*/ ) override { return false; }
+        virtual bool canVisitArgumentInit ( Function * /*fun*/, const VariablePtr & /*var*/, Expression * /*init*/ ) override { return false; }
+        virtual bool canVisitNamedCall ( ExprNamedCall * /*expr*/ ) override { return false; }
+
     protected:
         das_set<int32_t> labels;
         bool allLabels = false;
@@ -149,7 +176,7 @@ namespace das {
                 if ( expr->rtti_isLabel() ) {
                     return true;
                 } else  if ( expr->rtti_isBlock() ) {
-                    auto pBlock = static_pointer_cast<ExprBlock>(expr);
+                    auto pBlock = static_cast<ExprBlock*>(expr);
                     if ( !pBlock->isClosure ) {
                         if ( hasLabels(pBlock->list) ) return true;
                     }
@@ -163,7 +190,7 @@ namespace das {
             for ( auto & expr : blockList ) {
                 if ( !expr ) continue;
                 if ( expr->rtti_isLabel() ) {
-                    auto lexpr = static_pointer_cast<ExprLabel>(expr);
+                    auto lexpr = static_cast<ExprLabel*>(expr);
                     if ( allLabels || (labels.find(lexpr->label)!=labels.end()) ) {
                         list.push_back(expr);
                         skipTilLabel = false;
@@ -197,14 +224,24 @@ namespace das {
                     }
                 }
                 if ( expr->rtti_isBlock() ) {
-                    auto pBlock = static_pointer_cast<ExprBlock>(expr);
-                    if ( !pBlock->isClosure && !pBlock->finalList.size() ) {
+                    auto pBlock = static_cast<ExprBlock*>(expr);
+                    bool keepScope = false;
+                    if ( pBlock->generated ) {
+                        for ( auto & st : pBlock->list ) if ( st && st->rtti_isLet() ) { keepScope = true; break; }
+                    }
+                    if ( !pBlock->isClosure && !pBlock->finalList.size() && !keepScope ) {
                         collect(list, pBlock->list);
                     } else {
                         list.push_back(expr);
+                        // a kept scope which always exits ends the enclosing flow too; without this
+                        // the statements behind it survive as dead code the JIT can't emit
+                        if ( keepScope && !pBlock->isClosure && doesExprTerminates(expr) ) {
+                            if ( stopAtExit ) break;
+                            skipTilLabel = true;
+                        }
                     }
                 } else if ( expr->rtti_isWith() ) {
-                    auto pWith = static_pointer_cast<ExprWith>(expr);
+                    auto pWith = static_cast<ExprWith*>(expr);
                     if ( pWith->body ) {
                         list.push_back(pWith->body);
                     }
@@ -254,7 +291,7 @@ namespace das {
             allLabels = false;
             if ( func->body && func->result->isVoid() ) {   // remove trailing return on the void function
                 if ( func->body->rtti_isBlock() ) {
-                    auto block = static_pointer_cast<ExprBlock>(func->body);
+                    auto block = static_cast<ExprBlock*>(func->body);
                     if ( block->list.size() && block->list.back()->rtti_isReturn() ) {
                         block->list.resize(block->list.size()-1);
                         reportFolding();
@@ -267,58 +304,61 @@ namespace das {
     };
 
     class CondFolding : public PassVisitor {
+    public:
+        using PassVisitor::PassVisitor;
+        using PassVisitor::visit;
+
+        virtual bool canVisitStructure ( Structure * /*st*/ ) override { return false; }
+        virtual bool canVisitGlobalVariable ( Variable * /*fun*/ ) override { return false; }
+        virtual bool canVisitEnumeration ( Enumeration * /*en*/ ) override { return false; }
+        virtual bool canVisitStructureFieldInit ( Structure * /*var*/ ) override { return false; }
+        virtual bool canVisitArgumentInit ( Function * /*fun*/, const VariablePtr & /*var*/, Expression * /*init*/ ) override { return false; }
+
     protected:
-        Function * func = nullptr;
-        virtual void preVisit ( Function * f ) override {
-            Visitor::preVisit(f);
-            func = f;
-        }
-        virtual FunctionPtr visit ( Function * f ) override {
-            func = nullptr;
-            return Visitor::visit(f);
+        // extract `return ...` from an if arm: either a naked return (folding a nested
+        // if/else in an elif chain leaves one), or a block holding exactly one return.
+        // a block with a finally section never qualifies - the fold would drop it.
+        static ExprReturn * armReturn ( Expression * arm ) {
+            ExprReturn * ret = nullptr;
+            if (arm->rtti_isReturn()) {
+                ret = static_cast<ExprReturn*>(arm);
+            } else if (arm->rtti_isBlock()) {
+                auto blk = static_cast<ExprBlock*>(arm);
+                if (blk->list.size() == 1 && blk->finalList.empty() && blk->list.back()->rtti_isReturn()) {
+                    ret = static_cast<ExprReturn*>(blk->list.back());
+                }
+            }
+            if ( ret && ret->subexpr && ret->subexpr->rtti_isMakeLocal() ) {
+                ret = nullptr;   // we don't touch CMRES stuff
+            }
+            return ret;
         }
         virtual ExpressionPtr visit ( ExprIfThenElse * expr ) override {
             // if ( func && func->generator ) return Visitor::visit(expr);
             // if (cond) return x; else return y; => (cond ? x : y)
             if (expr->if_false) {
-                smart_ptr<ExprReturn> lr, rr;
-                if (expr->if_true->rtti_isBlock()) {
-                    auto tb = static_pointer_cast<ExprBlock>(expr->if_true);
-                    if (tb->list.size() == 1 && tb->list.back()->rtti_isReturn()) {
-                        lr = static_pointer_cast<ExprReturn>(tb->list.back());
-                        if ( lr->subexpr && lr->subexpr->rtti_isMakeLocal() ) {
-                            lr.reset();   // we don't touch CMRES stuff
-                        }
-                    }
-                }
-                if (expr->if_false->rtti_isBlock()) {
-                    auto fb = static_pointer_cast<ExprBlock>(expr->if_false);
-                    if (fb->list.size() == 1 && fb->list.back()->rtti_isReturn()) {
-                        rr = static_pointer_cast<ExprReturn>(fb->list.back());
-                        if ( rr->subexpr && rr->subexpr->rtti_isMakeLocal() ) {
-                            rr.reset();   // we don't touch CMRES stuff
-                        }
-                    }
-                }
+                ExprReturn * lr = armReturn(expr->if_true);
+                ExprReturn * rr = armReturn(expr->if_false);
                 if (lr && rr) {
                     if ( lr->moveSemantics != rr->moveSemantics ) {
-                        lr.reset(); // move semantics must match
-                        rr.reset();
+                        lr = nullptr; // move semantics must match
+                        rr = nullptr;
                     } else if ( lr->subexpr && rr->subexpr && (lr->subexpr->type->isRef() || rr->subexpr->type->isRef()) ) {
-                        lr.reset(); // ref types must match
-                        rr.reset();
+                        lr = nullptr; // don't fold when either side is a ref
+                        rr = nullptr;
                     }
                 }
                 if (lr && rr) {
-                    if ( lr->subexpr ) {
-                        auto newCond = make_smart<ExprOp3>(expr->at, "?", expr->cond, lr->subexpr, rr->subexpr);
-                        newCond->type = make_smart<TypeDecl>(*lr->subexpr->type);
-                        auto newRet = make_smart<ExprReturn>(expr->at, newCond);
+                    if ( lr->subexpr && rr->subexpr ) {
+                        auto newCond = new ExprOp3(expr->at, "?", expr->cond, lr->subexpr, rr->subexpr);
+                        newCond->type = new TypeDecl(*lr->subexpr->type);
+                        auto newRet = new ExprReturn(expr->at, newCond);
                         newRet->moveSemantics = lr->moveSemantics;
                         reportFolding();
                         return newRet;
-                    } else {
+                    } else if ( !lr->subexpr && !rr->subexpr && expr->cond->noSideEffects ) {
                         // this is actually if ( a ) return; else return;
+                        // evaluating `a` does nothing, so the whole thing is a bare return
                         reportFolding();
                         return lr;
                     }
@@ -341,34 +381,45 @@ namespace das {
             else
                 b
             */
-            if (!block->isClosure && block->list.size() > 1) {
-                for ( int i=0, is=int(block->list.size())-1; i!=is; ++i ) {
-                    auto expr = block->list[i];
-                    if (expr != block->list.back()) {
-                        if (expr->rtti_isIfThenElse()) {
-                            auto ite = static_pointer_cast<ExprIfThenElse>(expr);
-                            if (!ite->if_false) {
-                                if (ite->if_true->rtti_isBlock()) {
-                                    auto tb = static_pointer_cast<ExprBlock>(ite->if_true);
-                                    if ( tb->list.size() ) {
-                                        auto lastE = tb->list.back();
-                                        if (lastE->rtti_isReturn() || lastE->rtti_isBreak() || lastE->rtti_isContinue()) {
-                                            vector<ExpressionPtr> tail;
-                                            tail.insert(tail.begin(), block->list.begin() + i + 1, block->list.end());
-                                            auto fb = make_smart<ExprBlock>();
-                                            fb->at = tail.front()->at;
-                                            swap(fb->list, tail);
-                                            ite->if_false = fb;
-                                            block->list.resize(i + 1);
-                                            reportFolding();
-                                            return Visitor::visit(block);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+            if (block->isClosure) {
+                return Visitor::visit(block);
+            }
+            // Traverse the block in reversed order to handle all transformations
+            // in a single pass. This makes it easier to apply or rewrites
+            // without doing a ping-pong with optimization runner per every if
+            // statement being rewritten. Instead, we'll report changes only
+            // once per the entire batch of rewrites.
+            // This reduces the approx run time of optimize phase over
+            // a ~400 if statement function from ~0.500s to ~0.005s
+            // and have ~2 optimization passes instead of ~402
+            bool anyChange = false;
+            for (int i = block->list.size() - 2; i >= 0; i--) {
+                auto expr = block->list[i];
+                if (!expr->rtti_isIfThenElse()) {
+                    continue;
                 }
+                auto ite = static_cast<ExprIfThenElse*>(expr);
+                if (ite->if_false || !ite->if_true->rtti_isBlock()) {
+                    continue;
+                }
+                auto tb = static_cast<ExprBlock*>(ite->if_true);
+                if (tb->list.size() == 0) {
+                    continue;
+                }
+                auto lastE = tb->list.back();
+                if (lastE->rtti_isReturn() || lastE->rtti_isBreak() || lastE->rtti_isContinue()) {
+                    vector<ExpressionPtr> tail;
+                    tail.insert(tail.begin(), block->list.begin() + i + 1, block->list.end());
+                    auto fb = new ExprBlock();
+                    fb->at = tail.front()->at;
+                    swap(fb->list, tail);
+                    ite->if_false = fb;
+                    block->list.resize(i + 1);
+                    anyChange = true;
+                }
+            }
+            if (anyChange) {
+                reportFolding();
             }
             return Visitor::visit(block);
         }
@@ -376,10 +427,10 @@ namespace das {
 
     // program
 
-    bool Program::optimizationRefFolding() {
+    bool Program::optimizationRefFolding(int32_t round) {
         bool any = false, anything = false;
         do {
-            RefFolding context;
+            RefFolding context(round);
             visit(context);
             any = context.didAnything();
             anything |= any;
@@ -387,14 +438,14 @@ namespace das {
         return anything;
     }
 
-    bool Program::optimizationBlockFolding() {
-        BlockFolding context;
+    bool Program::optimizationBlockFolding(int32_t round) {
+        BlockFolding context(round);
         visit(context);
         return context.didAnything();
     }
 
-    bool Program::optimizationCondFolding() {
-        CondFolding context;
+    bool Program::optimizationCondFolding(int32_t round) {
+        CondFolding context(round);
         visit(context);
         return context.didAnything();
     }

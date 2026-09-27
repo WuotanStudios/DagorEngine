@@ -6,6 +6,7 @@ include "static_shadow.dshl"
 include "giHelpers/voxelize_gs.dshl"
 
 include "world_sdf_rasterize_sdf_common.dshl"
+include "unpack_unit_vector_inc.dshl"
 
 macro SET_WORLD_VIEW_POS()
   (ps) { world_view_pos@f3 = world_view_pos; }
@@ -56,7 +57,7 @@ shader sponza, simple_aces
   }
   if (scene_mode == voxelize_sdf)
   {
-    if (supports_sh_6_1 == on)
+    if (supports_barycentrics == on)
     {
       hlsl {
         #define RASTERIZE_PRIMS 1
@@ -104,21 +105,21 @@ shader sponza, simple_aces
     USE_VOXELIZE_SPACE(vs)
   }
 
-  (ps) { diffuse_tex@static = tex; }
+  (ps) { diffuse_tex@staticSmp = tex; }
   if (normal != NULL)
   {
     USE_PIXEL_TANGENT_SPACE()
-    (ps) { normal_tex@static = normal; }
+    (ps) { normal_tex@staticSmp = normal; }
   }
   if (shader == sponza)
   {
     if (spec != NULL)
     {
-      (ps) { spec@static = spec; }
+      (ps) { spec@staticSmp = spec; }
     }
     if (mask != NULL)
     {
-      (ps) { mask@static = mask; }
+      (ps) { mask@staticSmp = mask; }
     }
   } else
   {
@@ -254,7 +255,7 @@ shader sponza, simple_aces
       }
     ##endif
   }
-  if (scene_mode == voxelize_sdf && supports_sh_6_1 == on)
+  if (scene_mode == voxelize_sdf && supports_barycentrics == on)
   {
     compile("ps_6_1", "main_ps_simple_aces");
   } else
@@ -281,6 +282,7 @@ shader sponza, simple_aces
   }
 
 
+  USE_UNPACK_UNIT_VECTOR_VS()
   hlsl(vs) {
     struct VsInput
     {
@@ -303,7 +305,7 @@ shader sponza, simple_aces
       float3 normal = input.packedNormal * 2. - 1.;
       float3 worldNormal = normalize(normal.x * world_local_x + normal.y * world_local_y + normal.z * world_local_z);
 ##else
-      float3 worldNormal = BGR_SWIZZLE(input.packedNormal) * 2. - 1.;
+      float3 worldNormal = unpack_unit_vector(input.packedNormal.xyz);
 ##endif
       ##if scene_mode == normal
       output.pos = mul(float4(input.pos,1), globtm);
@@ -347,8 +349,10 @@ shader gi_black
 
   if (scene_mode == voxelize_sdf)
   {
-    hlsl(ps) {
-      RWTexture3D<float> world_sdf_clipmap : register(u0);
+    (ps) {
+      world_sdf_clipmap@uav : register(0) hlsl {
+        RWTexture3D<float> world_sdf_clipmap@uav;
+      }
     }
     (vs) {voxelize_axis@i1 = (voxelize_axis);}
   } else if (scene_mode == voxelize_albedo)

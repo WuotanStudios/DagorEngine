@@ -12,8 +12,7 @@ enum
 {
   LAYER_FRAME,
   LAYER_SCENE,
-  LAYER_OBJECT,
-  LAYER_GLOBAL_CONST
+  LAYER_OBJECT
 };
 
 //! searches shader block by name and returns ID
@@ -53,6 +52,12 @@ bool enableAutoBlockChange(bool enable);
 //! designed primarily for internal use (in auto-block-change mode)
 void changeStateWord(unsigned new_block_state_word);
 }; // namespace ShaderGlobal
+
+struct ShaderBlockIds
+{
+  int blockId = -1;         // Is the same over the app lifetime. public api takes this id, and it entails an indirection
+  int internalBlockId = -1; // Internal id, may become invalid on shader bidump reload. Not accessible by the public api
+};
 
 struct ShaderBlockSetter
 {
@@ -99,15 +104,15 @@ protected:
 
 class ShaderBlockIdHolder : public IShaderBindumpReloadListener
 {
-  int id = -1;
+  ShaderBlockIds ids{};
   const char *name;
   int layer;
 
 public:
   explicit ShaderBlockIdHolder(const char *name, int layer = -1) : name{name}, layer{layer} { resolve(); }
 
-  int get() const { return id; }
-  operator int() const { return id; }
+  int get() const { return ids.blockId; }
+  operator int() const { return ids.blockId; }
 
 protected:
   void resolve() override;

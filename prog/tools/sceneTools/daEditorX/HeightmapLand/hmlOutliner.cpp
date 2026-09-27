@@ -1,16 +1,17 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "hmlOutliner.h"
+#include "hmlCm.h"
 #include "hmlEntity.h"
-#include "hmlLight.h"
 #include "hmlObjectsEditor.h"
 #include "hmlPlugin.h"
-#include "hmlSnow.h"
 #include "hmlSplineObject.h"
 #include "hmlSplinePoint.h"
 #include <assets/asset.h>
 #include <de3_interface.h>
 #include <EditorCore/ec_rendEdObject.h>
+
+G_STATIC_ASSERT(Outliner::IOutliner::MAXIMUM_SUPPORTED_LAYER_COUNT >= LayerHiddenMask::BIT_COUNT);
 
 HeightmapLandOutlinerInterface::HeightmapLandOutlinerInterface(HmapLandObjectEditor &object_editor) : objectEditor(object_editor) {}
 
@@ -34,9 +35,28 @@ const char *HeightmapLandOutlinerInterface::getTypeName(int type, bool plural)
   return nullptr;
 }
 
-bool HeightmapLandOutlinerInterface::isTypeVisible(int type) { return objectTypeStates[type].visible; }
+bool HeightmapLandOutlinerInterface::isTypeVisible(int type) { return LandscapeObjectTypeState::types[type].visible; }
 
-bool HeightmapLandOutlinerInterface::isTypeLocked(int type) { return objectTypeStates[type].locked; }
+bool HeightmapLandOutlinerInterface::isTypeLocked(int type) { return LandscapeObjectTypeState::types[type].locked; }
+
+bool HeightmapLandOutlinerInterface::doesSelectionModeAllowSelectingType(int type)
+{
+  G_STATIC_ASSERT(EditLayerProps::TYPENUM == 3);
+
+  switch (objectEditor.getSelectMode())
+  {
+    case CM_SELECT_POINTS_ALL: return type == EditLayerProps::SPL || type == EditLayerProps::PLG; //-V1037
+    case CM_SELECT_POINTS_SPLINE: return type == EditLayerProps::SPL;  //-V1037 Two or more case-branches perform the same actions.
+    case CM_SELECT_POINTS_POLYGON: return type == EditLayerProps::PLG; //-V1037
+    case CM_SELECT_SPLINES_AND_POLYGONS: return type == EditLayerProps::SPL || type == EditLayerProps::PLG;
+    case CM_SELECT_SPLINES: return type == EditLayerProps::SPL;
+    case CM_SELECT_POLYGONS: return type == EditLayerProps::PLG;
+    case CM_SELECT_ENT: return type == EditLayerProps::ENT;
+    case CM_SELECT_SPL_ENT: return type == EditLayerProps::ENT || type == EditLayerProps::SPL || type == EditLayerProps::PLG;
+
+    default: return true;
+  }
+}
 
 bool HeightmapLandOutlinerInterface::canAddNewLayerWithName(int type, const char *name, String &error_message)
 {
@@ -58,12 +78,23 @@ bool HeightmapLandOutlinerInterface::canAddNewLayerWithName(int type, const char
   return true;
 }
 
+const char *HeightmapLandOutlinerInterface::getTypeUnselectabilityReason(int type)
+{
+  if (!isTypeVisible(type))
+    return "This cannot be selected because the type is not visible.";
+  if (isTypeLocked(type))
+    return "This cannot be selected because the type is locked.";
+  if (!doesSelectionModeAllowSelectingType(type))
+    return "This cannot be selected because of the current selection mode.";
+  return nullptr;
+}
+
 void HeightmapLandOutlinerInterface::selectAllTypeObjects(int type, bool select)
 {
   objectEditor.getUndoSystem()->begin();
 
   for (int i = 0; i < EditLayerProps::layerProps.size(); ++i)
-    if (EditLayerProps::layerProps[i].type == type && !EditLayerProps::layerProps[i].lock)
+    if (EditLayerProps::layerProps[i].type == type && !EditLayerProps::layerProps[i].isLayerOrTypeLocked())
       HmapLandPlugin::self->selectLayerObjects(i, select);
 
   objectEditor.getUndoSystem()->accept("Type selection in Outliner");
@@ -71,40 +102,18 @@ void HeightmapLandOutlinerInterface::selectAllTypeObjects(int type, bool select)
 
 void HeightmapLandOutlinerInterface::toggleTypeVisibility(int type)
 {
-  const bool newVisible = !objectTypeStates[type].visible;
-  objectTypeStates[type].visible = newVisible;
-
-  for (int i = 0; i < EditLayerProps::layerProps.size(); ++i)
-  {
-    EditLayerProps &layerProp = EditLayerProps::layerProps[i];
-
-    if (layerProp.type == type)
-    {
-      layerProp.hide = !newVisible;
-      if (layerProp.hide)
-        DAEDITOR3.setEntityLayerHiddenMask(DAEDITOR3.getEntityLayerHiddenMask() | (1ull << i));
-      else
-        DAEDITOR3.setEntityLayerHiddenMask(DAEDITOR3.getEntityLayerHiddenMask() & ~(1ull << i));
-    }
-  }
+  LandscapeObjectTypeState::types[type].visible = !LandscapeObjectTypeState::types[type].visible;
+  EditLayerProps::updateEntityLayerHiddenMask();
 }
 
 void HeightmapLandOutlinerInterface::toggleTypeLock(int type)
 {
-  const bool newLock = !objectTypeStates[type].locked;
-  objectTypeStates[type].locked = newLock;
+  const bool newLock = !LandscapeObjectTypeState::types[type].locked;
+  LandscapeObjectTypeState::types[type].locked = newLock;
 
   for (int i = 0; i < EditLayerProps::layerProps.size(); ++i)
-  {
-    EditLayerProps &layerProp = EditLayerProps::layerProps[i];
-
-    if (layerProp.type == type)
-    {
-      layerProp.lock = newLock;
-      if (layerProp.lock)
-        HmapLandPlugin::self->selectLayerObjects(i, false);
-    }
-  }
+    if (EditLayerProps::layerProps[i].type == type && newLock)
+      HmapLandPlugin::self->selectLayerObjects(i, false);
 }
 
 int HeightmapLandOutlinerInterface::addNewLayer(int type, const char *name)
@@ -119,6 +128,9 @@ int HeightmapLandOutlinerInterface::addNewLayer(int type, const char *name)
     return -1;
 
   EditLayerProps::layerProps[layerPropsIndex].renameable = true;
+
+  // The object type could be hidden, so update the mask.
+  EditLayerProps::updateEntityLayerHiddenMask();
 
   objectEditor.invalidateObjectProps();
 
@@ -156,7 +168,7 @@ bool HeightmapLandOutlinerInterface::isLayerVisible(int type, int per_type_layer
 {
   EditLayerProps *props = getEditLayerProps(type, per_type_layer_index);
   if (props)
-    return !props->hide;
+    return !props->isLayerOrTypeHidden();
 
   G_ASSERT(false);
   return true;
@@ -166,7 +178,7 @@ bool HeightmapLandOutlinerInterface::isLayerLocked(int type, int per_type_layer_
 {
   EditLayerProps *props = getEditLayerProps(type, per_type_layer_index);
   if (props)
-    return props->lock;
+    return props->isLayerOrTypeLocked();
 
   G_ASSERT(false);
   return false;
@@ -225,6 +237,17 @@ bool HeightmapLandOutlinerInterface::canRenameLayerTo(int type, int per_type_lay
   return true;
 }
 
+const char *HeightmapLandOutlinerInterface::getLayerUnselectabilityReason(int type, int per_type_layer_index)
+{
+  if (const char *reason = getTypeUnselectabilityReason(type))
+    return reason;
+  if (!isLayerVisible(type, per_type_layer_index))
+    return "This cannot be selected because the layer is not visible.";
+  if (isLayerLocked(type, per_type_layer_index))
+    return "This cannot be selected because the layer is locked.";
+  return nullptr;
+}
+
 void HeightmapLandOutlinerInterface::setLayerActive(int type, int per_type_layer_index)
 {
   const int layerPropsIndex = getLayerPropsIndex(type, per_type_layer_index);
@@ -234,7 +257,7 @@ void HeightmapLandOutlinerInterface::setLayerActive(int type, int per_type_layer
 void HeightmapLandOutlinerInterface::selectAllLayerObjects(int type, int per_type_layer_index, bool select)
 {
   const int layerPropsIndex = getLayerPropsIndex(type, per_type_layer_index);
-  if (EditLayerProps::layerProps[layerPropsIndex].lock)
+  if (EditLayerProps::layerProps[layerPropsIndex].isLayerOrTypeLocked())
     return;
 
   HmapLandPlugin::self->selectLayerObjects(layerPropsIndex, select);
@@ -249,10 +272,7 @@ void HeightmapLandOutlinerInterface::toggleLayerVisibility(int type, int per_typ
   EditLayerProps &layerProp = EditLayerProps::layerProps[layerPropsIndex];
 
   layerProp.hide = !layerProp.hide;
-  if (layerProp.hide)
-    DAEDITOR3.setEntityLayerHiddenMask(DAEDITOR3.getEntityLayerHiddenMask() | (1ull << layerPropsIndex));
-  else
-    DAEDITOR3.setEntityLayerHiddenMask(DAEDITOR3.getEntityLayerHiddenMask() & ~(1ull << layerPropsIndex));
+  EditLayerProps::updateEntityLayerHiddenMask();
 }
 
 void HeightmapLandOutlinerInterface::toggleLayerLock(int type, int per_type_layer_index)
@@ -323,7 +343,25 @@ bool HeightmapLandOutlinerInterface::isObjectSelected(RenderableEditableObject &
   return false;
 }
 
-bool HeightmapLandOutlinerInterface::canSelectObject(RenderableEditableObject &object) { return objectEditor.canSelectObj(&object); }
+bool HeightmapLandOutlinerInterface::canSelectSubObjectOnly(RenderableEditableObject &object)
+{
+  if (SplineObject *spline = RTTI_cast<SplineObject>(&object))
+    for (SplinePointObject *splinePoint : spline->points)
+      if (objectEditor.canSelectObj(splinePoint))
+        return true;
+
+  return false;
+}
+
+bool HeightmapLandOutlinerInterface::canSelectObjectOnly(RenderableEditableObject &object)
+{
+  return objectEditor.canSelectObj(&object);
+}
+
+bool HeightmapLandOutlinerInterface::canSelectObject(RenderableEditableObject &object)
+{
+  return canSelectObjectOnly(object) || canSelectSubObjectOnly(object);
+}
 
 bool HeightmapLandOutlinerInterface::canRenameObject(RenderableEditableObject &object, const char *name, String &error_message)
 {
@@ -382,6 +420,107 @@ int HeightmapLandOutlinerInterface::getObjectAssetType(RenderableEditableObject 
 
 bool HeightmapLandOutlinerInterface::isSampleObject(RenderableEditableObject &object) { return objectEditor.isSampleObject(object); }
 
+const char *HeightmapLandOutlinerInterface::getObjectUnselectabilityReason(RenderableEditableObject &object, int type,
+  int per_type_layer_index)
+{
+  if (const char *reason = getLayerUnselectabilityReason(type, per_type_layer_index))
+    return reason;
+  if (object.isHidden())
+    return "This cannot be selected because the object is hidden.";
+  if (object.isLocked())
+    return "This cannot be selected because the object is locked.";
+  if (!objectEditor.checkObjSelFilter(object))
+    return "This cannot be selected because its name does not match the name filter on the toolbar.";
+  if (!canSelectObject(object))
+    return "This cannot be selected.";
+  return nullptr;
+}
+
+bool HeightmapLandOutlinerInterface::isLayerOrTypeHidden(RenderableEditableObject &object)
+{
+  int type, layerPropsIndex;
+  if (getObjectTypeAndLayerPropsIndex(object, type, layerPropsIndex))
+    return EditLayerProps::layerProps[layerPropsIndex].isLayerOrTypeHidden();
+
+  G_ASSERT(false);
+  return false;
+}
+
+bool HeightmapLandOutlinerInterface::isLayerOrTypeLocked(RenderableEditableObject &object)
+{
+  int type, layerPropsIndex;
+  if (getObjectTypeAndLayerPropsIndex(object, type, layerPropsIndex))
+    return EditLayerProps::layerProps[layerPropsIndex].isLayerOrTypeLocked();
+
+  G_ASSERT(false);
+  return false;
+}
+
+bool HeightmapLandOutlinerInterface::isObjectVisible(RenderableEditableObject &object)
+{
+  return !object.isHidden() && !isLayerOrTypeHidden(object);
+}
+
+bool HeightmapLandOutlinerInterface::canChangeObjectVisibility(RenderableEditableObject &object)
+{
+  return HmapLandObjectEditor::doesObjectSupportHiding(object) && !isLayerOrTypeHidden(object);
+}
+
+bool HeightmapLandOutlinerInterface::isObjectLocked(RenderableEditableObject &object)
+{
+  return object.isLocked() || isLayerOrTypeLocked(object);
+}
+
+bool HeightmapLandOutlinerInterface::canChangeObjectLock(RenderableEditableObject &object)
+{
+  return HmapLandObjectEditor::doesObjectSupportLocking(object) && !isLayerOrTypeLocked(object);
+}
+
+void HeightmapLandOutlinerInterface::toggleObjectVisibility(RenderableEditableObject &object)
+{
+  if (!canChangeObjectVisibility(object))
+    return;
+
+  const bool hide = !object.isHidden();
+
+  objectEditor.getUndoSystem()->begin();
+
+  if (hide)
+    if (SplineObject *spline = RTTI_cast<SplineObject>(&object))
+      for (SplinePointObject *splinePoint : spline->points)
+        splinePoint->selectObject(false);
+
+  object.hideObject(hide);
+
+  objectEditor.updateGizmo();
+  objectEditor.getUndoSystem()->accept(hide ? "Hide object" : "Show object");
+}
+
+void HeightmapLandOutlinerInterface::toggleObjectLock(RenderableEditableObject &object)
+{
+  if (!canChangeObjectLock(object))
+    return;
+
+  const bool lock = !object.isLocked();
+
+  objectEditor.getUndoSystem()->begin();
+
+  // Unlike hideObject(), lockObject() keeps the selection, but a locked object must not stay selected.
+  if (lock)
+  {
+    object.selectObject(false);
+
+    if (SplineObject *spline = RTTI_cast<SplineObject>(&object))
+      for (SplinePointObject *splinePoint : spline->points)
+        splinePoint->selectObject(false);
+  }
+
+  object.lockObject(lock);
+
+  objectEditor.updateGizmo();
+  objectEditor.getUndoSystem()->accept(lock ? "Lock object" : "Unlock object");
+}
+
 void HeightmapLandOutlinerInterface::startObjectSelection() { objectEditor.getUndoSystem()->begin(); }
 
 void HeightmapLandOutlinerInterface::setObjectSelected(RenderableEditableObject &object, bool selected)
@@ -389,16 +528,27 @@ void HeightmapLandOutlinerInterface::setObjectSelected(RenderableEditableObject 
   // Ensure that startObjectSelection has been called.
   G_ASSERT(objectEditor.getUndoSystem()->is_holding());
 
-  if (!objectEditor.canSelectObj(&object))
-    return;
+  // Spline points are not displayed in the Outliner.
+  G_ASSERT(!RTTI_cast<SplinePointObject>(&object));
 
-  object.selectObject(selected);
+  if (canSelectObjectOnly(object))
+  {
+    object.selectObject(selected);
 
-  // We must unselect all the sub-objects to be consistent with isObjectSelected.
-  if (!selected)
+    // We must unselect all the sub-objects to be consistent with isObjectSelected.
+    if (!selected)
+      if (SplineObject *spline = RTTI_cast<SplineObject>(&object))
+        for (SplinePointObject *splinePoint : spline->points)
+          splinePoint->selectObject(false);
+  }
+  else if (canSelectSubObjectOnly(object))
+  {
+    object.selectObject(false);
+
     if (SplineObject *spline = RTTI_cast<SplineObject>(&object))
       for (SplinePointObject *splinePoint : spline->points)
-        splinePoint->selectObject(false);
+        splinePoint->selectObject(selected);
+  }
 }
 
 void HeightmapLandOutlinerInterface::endObjectSelection()
@@ -574,7 +724,7 @@ bool HeightmapLandOutlinerInterface::getObjectTypeAndLayerPropsIndex(RenderableE
     return true;
   }
 
-  G_ASSERT(RTTI_cast<SplinePointObject>(&object) || RTTI_cast<SphereLightObject>(&object) || RTTI_cast<SnowSourceObject>(&object));
+  G_ASSERT(RTTI_cast<SplinePointObject>(&object));
   return false;
 }
 

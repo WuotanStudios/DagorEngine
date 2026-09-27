@@ -8,26 +8,38 @@
  ******************** functions checks*******************
  ******************************************************************************/
 
+from "types" import Table, Array, String, Function, Integer, Float, Null, Bool, Class, Generator, UserData, Thread, WeakRef
+
 /**
   make common iteratee function
 */
 
-let isTable = @(v) type(v)=="table"
-let isArray = @(v) type(v)=="array"
-let isString = @(v) type(v)=="string"
-let isFunction = @(v) type(v)=="function"
+let isTable = @(v) v instanceof Table
+let isArray = @(v) v instanceof Array
+let isString = @(v) v instanceof String
+let isFunction = @(v) v instanceof Function
+let isInteger = @(v) v instanceof Integer
+let isFloat = @(v) v instanceof Float
+let isNull = @(v) v instanceof Null
+let isBool = @(v) v instanceof Bool
+// instanceof Instance does not match script class instances, keep the raw type check
+let isInstance = @(v) type(v) == "instance"
+let isGenerator = @(v) v instanceof Generator
+let isUserdata = @(v) v instanceof UserData
+let isThread = @(v) v instanceof Thread
+let isWeakref = @(v) v instanceof WeakRef
 
-function isDataBlock(obj) {
+function isDataBlock(obj): bool {
   //prefer this as it can handle any DataBlock binding and implementation
   if (obj?.paramCount!=null && obj?.blockCount != null)
     return true
   return false
 }
 
-let callableTypes = static ["function","table","instance"].totable()
-let recursivetypes = static ["table","array","class"].totable()
+let callableTypes = const ["function","table","instance"].totable()
+let recursivetypes = const ["table","array","class"].totable()
 
-function isCallable(v) {
+function isCallable(v): bool {
   let typ = typeof v
   return typ=="function" || (typ in callableTypes && (v.getfuncinfos() != null))
 }
@@ -35,7 +47,7 @@ function isCallable(v) {
 function mkIteratee(func){
   let infos = func.getfuncinfos()
   let params = infos.parameters.len()-1
-  assert(params>0 && params<3)
+  assert(params>0 && params<4)
   if (params == 3)
     return func
   else if (params==2)
@@ -47,12 +59,13 @@ function mkIteratee(func){
 /**
   Check for proper iteratee and so on - under construction
 */
-function funcCheckArgsNum(func, numRequired){
+function funcCheckArgsNum(func, numRequired): bool {
   let infos = func.getfuncinfos()
-  local plen = infos.parameters.len() - 1
+  let params = infos.parameters
+  local plen = params.len() - 1
   let deplen = infos.defparams.len()
-  let isVargv = infos.varargs > 0
-  if (isVargv)
+  let isVargv = !!infos.varargs
+  if (isVargv && params.top()=="...")
     plen -= 2
   let mandatoryParams = plen - deplen
   if (mandatoryParams > numRequired)
@@ -74,7 +87,7 @@ Split list into two arrays:
 one whose elements all satisfy predicate and one whose elements all do not satisfy predicate.
 predicate is transformed through iteratee to facilitate shorthand syntaxes.
 */
-function partition(list, predicate){
+function partition(list, predicate): array {
   let ok = []
   let not_ok = []
   predicate = mkIteratee(predicate)
@@ -105,10 +118,11 @@ function pluck(list, propertyName){
       throw null
     return v[propertyName]
   })
-/*  local res = []
+/*
+  let res = []
   foreach (v in list) {
     if (propertyName in v)
-      res.append(v.propertyName)
+      res.append(v[propertyName])
   }
   return res
 */
@@ -119,7 +133,7 @@ function pluck(list, propertyName){
  * values the keys. For this to work, all of your table's values should be
  * unique and string serializable.
  */
-function invert(table) {
+function invert(table): table {
   let res = {}
   foreach (key, val in table)
     res[val] <- key
@@ -131,7 +145,7 @@ function invert(table) {
    if addParams=true), and for each key maps value func(tbl1Value, tbl2Value)
  * If value not exist in one of table it will be pushed to func as defValue
  */
-function tablesCombine(tbl1, tbl2, func=null, defValue = null, addParams = true) {
+function tablesCombine(tbl1, tbl2, func=null, defValue = null, addParams = true): table {
   let res = {}
   if (func == null)
     func = function (_val1, val2) {return val2}
@@ -145,7 +159,7 @@ function tablesCombine(tbl1, tbl2, func=null, defValue = null, addParams = true)
   return res
 }
 
-function isEqual(val1, val2, customIsEqual={}){
+function isEqual(val1, val2, customIsEqual = const {}){
   if (val1 == val2)
     return true
   let valType = type(val1)
@@ -168,12 +182,45 @@ function isEqual(val1, val2, customIsEqual={}){
   }
 
   if (valType == "instance") {
-    foreach(classRef, func in customIsEqual)
-      if (val1 instanceof classRef && val2 instanceof classRef)
+    if ("isEqual" in val1)
+      return val1.isEqual(val2)
+    foreach(classRef, func in customIsEqual) {
+      if (classRef instanceof Function && classRef(val1) && classRef(val2))
         return func(val1, val2)
+      if (classRef instanceof Class && val1 instanceof classRef && val2 instanceof classRef)
+        return func(val1, val2)
+    }
     return false
   }
 
+  return false
+}
+
+/**
+ * Return true for null, false, zero, empty string/table/array, and for an
+ * instance that reports itself empty via a customIsEmpty entry or its own
+ * isEmpty() method
+ */
+function isEmpty(val, customIsEmpty = const {}) {
+  if (!val)
+    return true
+  let valType = type(val)
+  if (valType == "string" || valType == "table" || valType == "array")
+    return val.len() == 0
+  if (valType == "instance") {
+    if ("isEmpty" in val)
+      return val.isEmpty()
+    if (isDataBlock(val))
+      return val.paramCount() && val.blockCount()
+    if ("len" in val && val.len instanceof Function)
+      return val.len()==0
+    foreach(classRef, func in customIsEmpty) {
+      if (classRef instanceof Function && classRef(val))
+        return func(val)
+      if (classRef instanceof Class && val instanceof classRef)
+        return func(val)
+    }
+  }
   return false
 }
 /*
@@ -181,19 +228,28 @@ function isEqual(val1, val2, customIsEqual={}){
 * equals to python list(set(<list>)), and with optional hash function
 * (for example to extract key form list of tables to make unique by that)
 */
-function unique(list, hashfunc=null){
+function unique(list, hashfunc=null, replace=false): array {
   let values = {}
+
   let res = []
   hashfunc = hashfunc ?? @(v) v
   foreach (v in list){
     let hash = hashfunc(v)
-    if (hash in values)
+    if (hash in values){
+      if (replace) {
+        let i = values[hash]
+        res.remove(i)
+        res.insert(i, v)
+      }
       continue
-    values[hash]<-true
+    }
     res.append(v)
+    values[hash]<-replace ? res.len()-1 : true
   }
   return res
 }
+
+let unique_override = @(list, hashfunc=null) unique(list, hashfunc, true)
 /*
 foreach (k, v in range(-1, -5, -1))
   print($"{v}  ")
@@ -203,12 +259,14 @@ print("\n")
 function range(m, n=null, step=1) {
   let start = n==null ? 0 : m
   let end = n==null ? m : n
+  if (step == 0 || (end > start && step < 0) || (end < start && step > 0)) // -potentially-nulled-ops
+    return
   for (local i=start; (end>start) ? i<end : i>end; i+=step) // -potentially-nulled-ops
     yield i
 }
 
 //not recursive isEqual, for simple lists or tables
-function isEqualSimple(list1, list2, compareFunc=null) {
+function isEqualSimple(list1, list2, compareFunc=null): bool {
   compareFunc = compareFunc ?? @(a,b) a!=b
   if (list1 == list2)
     return true
@@ -222,7 +280,7 @@ function isEqualSimple(list1, list2, compareFunc=null) {
 }
 
 //create from one-dimentional array two-dimentional array by slice it to rows with fixed amount of columns
-function arrayByRows(arr, columns) {
+function arrayByRows(arr, columns): array {
   let res = []
   for(local i = 0; i < arr.len(); i += columns)
     res.append(arr.slice(i, i + columns))
@@ -233,7 +291,7 @@ function arrayByRows(arr, columns) {
 **Chunk a single array into multiple arrays, each containing count or fewer items.
 */
 
-function chunk(list, count) {
+function chunk(list, count): array {
   if (count == null || count < 1) return []
   let result = []
   local i = 0
@@ -251,7 +309,7 @@ function chunk(list, count) {
  * element in the array (or a property name), returns an object with an index
  * of each item.
  */
-function indexBy(list, iteratee) {
+function indexBy(list, iteratee): table {
   let res = {}
   if (isString(iteratee)){
     foreach (val in list)
@@ -317,7 +375,7 @@ function flatten(list, depth = -1, level=0){
     if (!isArray(i) || level==depth)
       res.append(i)
     else {
-      res.extend(flatten(i, depth, level))
+      res.extend(flatten(i, depth, level+1))
     }
   }
   return res
@@ -358,10 +416,10 @@ or
 
 function do_in_scope(obj, doFn){
   assert(
-    (type(obj)=="instance" || type(obj)=="table") &&  "__enter__" in obj && "__exit__" in obj,
+    (type(obj)=="instance" || obj instanceof Table) &&  "__enter__" in obj && "__exit__" in obj,
     "to support 'do_in_scope' object passed as first argument should implement '__enter__' and '__exit__' methods"
   )
-  assert(type(doFn) == "function", "function should be passed as second argument")
+  assert(doFn instanceof Function, "function should be passed as second argument")
 
   let scope = obj.__enter__()
   let defErr = {}
@@ -383,7 +441,7 @@ function do_in_scope(obj, doFn){
   return res
 }
 
-function insertGap(list, gap){
+function insertGap(list, gap): array {
   let res = []
   let len = list.len()
   foreach (idx, l in list){
@@ -395,10 +453,23 @@ function insertGap(list, gap){
   return res
 }
 
+function getSubArray(tbl, key) {
+  if (key not in tbl)
+    tbl[key] <- []
+  return tbl[key]
+}
+
+function getSubTable(tbl, key) {
+  if (key not in tbl)
+    tbl[key] <- {}
+  return tbl[key]
+}
+
 return freeze({
   invert
   tablesCombine
   isEqual
+  isEmpty
   isEqualSimple
   prevIfEqual = @(prev, cur) isEqual(cur, prev) ? prev : cur
   funcCheckArgsNum
@@ -407,18 +478,30 @@ return freeze({
   range
   do_in_scope
   unique
+  unique_override
   arrayByRows
   chunk
-  isTable
-  isArray
-  isString
-  isFunction
-  isCallable
-  isDataBlock
   indexBy
   deep_clone
   deep_update
   deep_merge
   flatten
   insertGap
+  getSubArray
+  getSubTable
+  isInteger
+  isFloat
+  isTable
+  isArray
+  isString
+  isFunction
+  isCallable
+  isDataBlock
+  isNull
+  isBool
+  isInstance
+  isGenerator
+  isUserdata
+  isThread
+  isWeakref
 })

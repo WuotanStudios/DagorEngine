@@ -1,0 +1,663 @@
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+
+#include <daECS/core/entitySystem.h>
+#include <shaders/dag_postFxRenderer.h>
+#include <render/viewVecs.h>
+#include <render/debugMesh.h>
+#include <render/deferredRenderer.h>
+#include <render/renderEvent.h>
+#include <render/world/worldRendererQueries.h>
+#include <render/world/gbufferConsts.h>
+#include <render/world/defaultVrsSettings.h>
+#include <perfMon/dag_statDrv.h>
+#include <util/dag_convar.h>
+#include <EASTL/fixed_string.h>
+#include <math/dag_Point3.h>
+#include <render/daFrameGraph/singleShaders.h>
+
+#include <daECS/core/entityManager.h>
+
+#include "frameGraphNodes.h"
+#include <render/world/frameGraphHelpers.h>
+#include <drv/3d/dag_renderTarget.h>
+#include <render/antiAliasing_legacy.h>
+#include <render/lights/clusteredLights.h>
+#include <render/world/bvh.h>
+#include <render/world/shadowsManager.h>
+#include <render/world/wrDispatcher.h>
+#include <render/world/depthBounds.h>
+#include <landMesh/virtualtexture.h>
+
+CONSOLE_FLOAT_VAL_MINMAX("render", thin_scattering_start, 32.0f, 0.f, 1024);
+extern ConVarT<bool, false> volfog_enabled;
+extern ConVarT<bool, false> dynamic_lights;
+extern ConVarT<bool, false> process_reactive_gbuffer_data;
+extern ConVarT<int, true> gi_quality;
+
+extern uint32_t get_gi_history_frames();
+
+dafg::NodeHandle makePrepareGbufferDepthNode(const uint32_t depth_format)
+{
+  auto ns = dafg::root() / "init";
+  return ns.registerNode("prepare_gbuffer_depth_node", DAFG_PP_NODE_SRC, [depth_format](dafg::Registry registry) {
+    const auto gbufResolution = registry.getResolution<2>("main_view");
+
+    // Weird names are used here for simpler integration with "opaque/closeups"
+    registry.create("gbuf_depth_done")
+      .texture({depth_format | GBUF_TARGET_GLOBAL_FLAGS | TEXCF_RTARGET, gbufResolution})
+      .atStage(dafg::Stage::PS)
+      .useAs(dafg::Usage::DEPTH_ATTACHMENT)
+      .clear(make_clear_value(0.f, 0));
+  });
+}
+
+dafg::NodeHandle makePrepareGbufferNode()
+{
+  auto ns = dafg::root() / "init";
+  return ns.registerNode("prepare_gbuffer_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
+    const auto gbufResolution = registry.getResolution<2>("main_view");
+
+    // Weird names are used here for simpler integration with "opaque/closeups"
+    create_gbuffer_targets(registry, "gbuf_%d_done", WRDispatcher::needMotionVectors());
+
+    registry.requestState().setFrameBlock("global_frame");
+
+    // Schedule clipmap prepareRender before starting rendering gbuffer.
+    registry.readBlob<eastl::monostate>("vtex_clipmap_prepare_render_done").optional();
+
+    registry.requestRenderPass()
+      .depth("gbuf_depth_done")
+      .color({"gbuf_0_done", "gbuf_1_done", registry.modify("gbuf_2_done").texture().optional(),
+        registry.modify("gbuf_3_done").texture().optional()});
+
+    const auto camera = registry.readBlob<CameraParams>("current_camera");
+    CameraViewShvars{camera}.bindViewVecs().toHandle();
+    use_jitter_frustum_plane_shader_vars(registry);
+    return [gbufResolution, screenPosToTexcoordVard = get_shader_variable_id("screen_pos_to_texcoord"),
+             gbufferViewSizeVarId = get_shader_variable_id("gbuffer_view_size")]() {
+      if (Clipmap *clipmap = WRDispatcher::getClipmap())
+        clipmap->resetUAVAtomicPrefix(); // Reset is required before each multiplex pass.
+
+      const auto resolution = gbufResolution.get();
+      ShaderGlobal::set_float4(screenPosToTexcoordVard, 1.f / resolution.x, 1.f / resolution.y, 0, 0);
+      ShaderGlobal::set_int4(gbufferViewSizeVarId, resolution.x, resolution.y, 0, 0);
+    };
+  });
+}
+
+dafg::NodeHandle makeReactiveMaskFillNode(bool process_gbuffer_data)
+{
+  if (process_gbuffer_data)
+    return dafg::register_node("reactive_mask_fill", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
+      registry.createTexture2d("reactive_mask", {TEXFMT_R8 | TEXCF_RTARGET, registry.getResolution<2>("main_view")});
+
+      auto ns = registry.root() / "opaque" / "decorations";
+      registry.requestRenderPass().color({"reactive_mask"});
+      ns.read("gbuf_3_done").texture().atStage(dafg::Stage::PS).bindToShaderVar("reactive_gbuf");
+
+      dafg::postFx("fill_reactive_mask_from_gbuffer", registry);
+    });
+  else
+    return dafg::register_node("reactive_mask_clear", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
+      registry.createTexture2d("reactive_mask", {TEXFMT_R8 | TEXCF_RTARGET, registry.getResolution<2>("main_view")})
+        .clear(make_clear_value(0.f, 0));
+    });
+}
+
+static inline float w_to_depth(float w, const Point2 &zNearFar, float def)
+{
+  return w > zNearFar.x ? (zNearFar.y - w) * (zNearFar.x / (zNearFar.y - zNearFar.x)) / w : def; // reverse
+  // return w > zNearFar.x ? (w-zNearFar.x)* zNearFar.y/(zNearFar.y-zNearFar.x)/w : 0.0;//fwd
+}
+
+#define RESOLVE_GBUFFER_SHADERVARS   \
+  VAR(reproject_screen_gi, true)     \
+  VAR(thin_gbuf_resolve, true)       \
+  VAR(frame_tex, false)              \
+  VAR(dynamic_lights_count, true)    \
+  VAR(gi_use_r9g9b9e5_tex_fmt, true) \
+  VAR(depth_gbuf, false)
+
+#define VAR(a, o) static ShaderVariableInfo a##VarId(#a, o);
+RESOLVE_GBUFFER_SHADERVARS
+#undef VAR
+
+static inline bool use_single_pass_shading()
+{
+  static bool isDeferredLightShaderMissing = !shader_exists("deferredLight");
+  return isDeferredLightShaderMissing;
+}
+
+static inline bool use_deferred_lighting()
+{
+  return renderer_has_feature(FeatureRenderFlags::DEFERRED_LIGHT) && !use_single_pass_shading();
+}
+
+static inline bool use_deferred_shading()
+{
+  return renderer_has_feature(FeatureRenderFlags::FULL_DEFERRED) && !use_single_pass_shading();
+}
+
+// TODO Restore compute shader version, or delete the shader as a whole
+// CONSOLE_BOOL_VAL("render", deferred_light_on_compute, false);
+// deferredLightCompute = Ptr(new_compute_shader("deferred_light_compute"))
+// And instead of render target just set current_specular and current_ambient as @uav shadervars
+eastl::array<dafg::NodeHandle, 2> makeDeferredLightNode(bool reprojectGI)
+{
+  const bool giUseR9G9B9E5TexFmt = reprojectGI && d3d::check_texformat(TEXFMT_R9G9B9E5 | TEXCF_RTARGET);
+  ShaderGlobal::set_int(gi_use_r9g9b9e5_tex_fmtVarId, giUseR9G9B9E5TexFmt ? 1 : 0);
+
+  const uint32_t gi_fmt = giUseR9G9B9E5TexFmt ? TEXFMT_R9G9B9E5 : TEXFMT_R11G11B10F;
+  const auto giHistory = reprojectGI ? dafg::History::ClearZeroOnFirstFrame : dafg::History::No;
+
+  auto perCameraResNode = dafg::register_node("deferred_light_per_cam_res_node", DAFG_PP_NODE_SRC,
+    [reprojectGI, gi_fmt, giHistory](dafg::Registry registry) {
+      registry.create("current_specular")
+        .texture({gi_fmt | TEXCF_RTARGET, registry.getResolution<2>("main_view"), 1})
+        .withHistory(giHistory)
+        .useAs(dafg::Usage::COLOR_ATTACHMENT)
+        .atStage(dafg::Stage::PS)
+        .clear(make_clear_value(0.f, 0.f, 0.f, 0.f));
+
+      registry.create("current_ambient")
+        .texture({gi_fmt | TEXCF_RTARGET, registry.getResolution<2>("main_view"), 1})
+        .withHistory(giHistory)
+        .useAs(dafg::Usage::COLOR_ATTACHMENT)
+        .atStage(dafg::Stage::PS)
+        .clear(make_clear_value(0.f, 0.f, 0.f, 0.f));
+
+      if (reprojectGI)
+      {
+        registry.create("current_gi_pixel_age")
+          .texture({TEXFMT_R8 | TEXCF_RTARGET, registry.getResolution<2>("main_view"), 1})
+          .withHistory(dafg::History::ClearZeroOnFirstFrame)
+          .useAs(dafg::Usage::COLOR_ATTACHMENT)
+          .atStage(dafg::Stage::PS);
+      }
+    });
+
+  auto renderNode = dafg::register_node("deferred_light_node", DAFG_PP_NODE_SRC, [reprojectGI](dafg::Registry registry) {
+    auto gbufDepthHndl = registry.read("gbuf_depth").texture();
+    registry.read("gbuf_1").texture().atStage(dafg::Stage::PS).bindToShaderVar("normal_gbuf");
+    registry.bindBlob("gbuf_sampler", "normal_gbuf_samplerstate");
+    registry.read("gbuf_2").texture().atStage(dafg::Stage::PS).bindToShaderVar("material_gbuf");
+    registry.bindBlob("gbuf_sampler", "material_gbuf_samplerstate");
+    registry.read("motion_vecs").texture().atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("motion_gbuf").optional();
+    registry.bindBlob("gbuf_sampler", "motion_gbuf_samplerstate").optional();
+
+    auto stateRequest = registry.requestState().setFrameBlock("global_frame");
+
+    auto depthBoundsSet = [&](dafg::VirtualPassRequest &renderPass) {
+      if (depth_bounds_enabled())
+      {
+        shaders::OverrideState state;
+        state.set(shaders::OverrideState::Z_BOUNDS_ENABLED);
+        eastl::move(stateRequest).enableOverride(state);
+        eastl::move(renderPass).depthReadTestAndSample(gbufDepthHndl, {"depth_gbuf"});
+      }
+      else if (renderer_has_feature(CAMERA_IN_CAMERA))
+        eastl::move(renderPass).depthReadTestAndSample(gbufDepthHndl, {"depth_gbuf"});
+      else
+        eastl::move(gbufDepthHndl).atStage(dafg::Stage::PS).bindToShaderVar("depth_gbuf");
+    };
+
+    if (reprojectGI)
+    {
+      registry.historyFor("depth_for_postfx").texture().atStage(dafg::Stage::PS).bindToShaderVar("prev_gbuf_depth");
+      registry.historyFor("current_gi_pixel_age").texture().atStage(dafg::Stage::PS).bindToShaderVar("prev_gi_pixel_age");
+      registry.historyFor("current_specular").texture().atStage(dafg::Stage::PS).bindToShaderVar("prev_specular");
+      registry.historyFor("current_ambient").texture().atStage(dafg::Stage::PS).bindToShaderVar("prev_ambient");
+      auto renderPass = registry.requestRenderPass()
+                          .color({"current_specular", "current_ambient", "current_gi_pixel_age"})
+                          .vrsRate(SHADING_VRS_RATE_TEXTURE_NAME);
+      depthBoundsSet(renderPass);
+    }
+    else
+    {
+      auto renderPass =
+        registry.requestRenderPass().color({"current_specular", "current_ambient"}).vrsRate(SHADING_VRS_RATE_TEXTURE_NAME);
+      depthBoundsSet(renderPass);
+    }
+
+    registry.readBlob("gi_before_frame_lit_token").optional();
+
+    //  We apply indoor probes when resolving the gbuffer. We also use
+    // them in most transparent stuff, but obviously transparent stuff
+    // goes after the resolve, so no need for orderings there.
+    (registry.root() / "indoor_probes").readBlob("probes_ready_token").optional();
+
+    registry.bindBlob("world_view_pos", "world_view_pos");
+    auto camera = use_camera_in_camera(registry);
+    auto cameraHndl = CameraViewShvars{camera}.bindViewVecs().toHandle();
+    auto prevCameraHndl = read_history_camera_in_camera(registry).handle();
+
+    return [reproject = reprojectGI, deferredLight = PostFxRenderer("deferredLight"), cameraHndl, prevCameraHndl](
+             const dafg::multiplexing::Index &multiplexing_index) {
+      camera_in_camera::ApplyPostfxState camcam{
+        multiplexing_index, cameraHndl.ref(), prevCameraHndl.ref(), camera_in_camera::USE_STENCIL};
+
+      float farPlaneDepth = far_plane_depth(get_gbuffer_depth_format());
+      api_set_depth_bounds(farPlaneDepth, 1);
+      const uint32_t histFrames = reproject ? get_gi_history_frames() : 0;
+      ShaderGlobal::set_int(reproject_screen_giVarId, histFrames ? 1 : 0);
+      deferredLight.render();
+    };
+  });
+
+  return {eastl::move(perCameraResNode), eastl::move(renderNode)};
+}
+static void bindResolvePassResources(dafg::Registry registry)
+{
+  registry.bindBlob("gbuf_sampler", "depth_gbuf_samplerstate");
+  registry.read("gbuf_0").texture().atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("albedo_gbuf");
+  registry.bindBlob("gbuf_sampler", "albedo_gbuf_samplerstate");
+  registry.read("gbuf_1").texture().atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("normal_gbuf");
+  registry.bindBlob("gbuf_sampler", "normal_gbuf_samplerstate");
+  registry.read("gbuf_2").texture().atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("material_gbuf").optional();
+  registry.bindBlob("gbuf_sampler", "material_gbuf_samplerstate").optional();
+  registry.read("motion_vecs").texture().atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("motion_gbuf").optional();
+  registry.bindBlob("gbuf_sampler", "motion_gbuf_samplerstate").optional();
+  registry.readTexture("close_depth").atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("downsampled_close_depth_tex");
+  registry.bindBlob("close_depth_sampler", "downsampled_close_depth_tex_samplerstate");
+  registry.readTexture("far_downsampled_depth").atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("downsampled_far_depth_tex");
+  registry.bindBlob("far_downsampled_depth_sampler", "downsampled_far_depth_tex_samplerstate");
+
+  if (renderer_has_feature(FeatureRenderFlags::COMBINED_SHADOWS))
+  {
+    registry.readTexture("combined_shadows").atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("combined_shadows");
+    registry.bindBlob("combined_shadows_sampler", "combined_shadows_samplerstate");
+  }
+
+  if (use_deferred_lighting())
+  {
+    registry.readTexture("current_specular").atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("specular_tex");
+    registry.readTexture("current_ambient").atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("current_ambient");
+  }
+  registry.readTexture("ssr_target").atStage(dafg::Stage::PS).bindToShaderVar("ssr_target").optional();
+  registry.bindBlob("ssr_target_sampler", "ssr_target_samplerstate").optional();
+
+  use_volfog(registry, dafg::Stage::PS_OR_CS);
+  registry.readTexture("ssao_tex").atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("ssao_tex").optional();
+  registry.bindBlob("ssao_sampler", "ssao_tex_samplerstate").optional();
+  registry.readBlob("rtr_token").optional();
+  registry.readTexture("half_selected_depth_rtr").atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("half_selected_depth_rtr").optional();
+  registry.readBlob("rtao_token").optional();
+  registry.readBlob("ptgi_token").optional();
+  // for SSAO&SSR
+  registry.read("upscale_sampling_tex").texture().atStage(dafg::Stage::PS_OR_CS).bindToShaderVar("upscale_sampling_tex").optional();
+}
+
+static dafg::NodeHandle makeClearResolveTargetNode()
+{
+  if (!is_resolve_target_external())
+    return dafg::NodeHandle();
+
+  return dafg::register_node("clear_resolve_target_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
+    registry.createBlob<OrderingToken>("conditional_resolve_target_clear_token");
+
+    auto resolveTargetHndl =
+      registry.modifyTexture("opaque_resolved").atStage(dafg::Stage::POST_RASTER).useAs(dafg::Usage::COLOR_ATTACHMENT).handle();
+    auto waterModeHndl = registry.readBlob<WaterRenderMode>("water_render_mode").handle();
+
+    return [resolveTargetHndl, waterModeHndl]() {
+      if (has_custom_sky() || waterModeHndl.ref() == WaterRenderMode::EARLY_BEFORE_ENVI)
+      {
+        d3d::set_render_target({}, DepthAccess::RW, {{resolveTargetHndl.get(), 0, 0}});
+        d3d::clearview(CLEAR_TARGET, 0, 0, 0);
+      }
+    };
+  });
+}
+
+static dafg::NodeHandle makeStubBlackTextureNode()
+{
+  return dafg::register_node("single_pass_shading_prepare_stub_texture_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
+    registry.createTexture2d("single_pass_shading_stub_black_tex", {TEXFMT_A8R8G8B8 | TEXCF_RTARGET, IPoint2(4, 4)})
+      .withHistory(dafg::History::No);
+    auto stubTexHndl = registry.modifyTexture("single_pass_shading_stub_black_tex")
+                         .atStage(dafg::Stage::POST_RASTER)
+                         .useAs(dafg::Usage::COLOR_ATTACHMENT)
+                         .handle();
+
+    return [stubTexHndl]() {
+      d3d::set_render_target({}, DepthAccess::RW, {{stubTexHndl.get(), 0, 0}});
+      d3d::clearview(CLEAR_TARGET, 0, 0, 0);
+    };
+  });
+}
+
+static dafg::NodeHandle makeSinglePassResolveGbufferNode(const char *resolve_pshader_name)
+{
+  // nothing ever resets this var, so setting it once at node creation is enough
+  ShaderGlobal::set_int(get_shader_variable_id("use_precomputed_dynamic_lights"), 1);
+
+  return dafg::register_node("resolve_gbuffer_node", DAFG_PP_NODE_SRC, [resolve_pshader_name](dafg::Registry registry) {
+    registry.readBlob("gi_before_frame_lit_token").optional();
+    registry.readBlob("conditional_resolve_target_clear_token").optional();
+
+    registry.requestRenderPass().color({"opaque_resolved"}).depthReadTestAndSample("gbuf_depth", {"depth_gbuf"});
+
+    bindResolvePassResources(registry);
+    registry.bindBlob<Point4>("world_view_pos", "world_view_pos");
+    auto camera = use_current_camera(registry);
+    auto cameraHndl = CameraViewShvars{camera}.bindViewVecs().toHandle();
+    registry.requestState().setFrameBlock("global_frame");
+
+    static constexpr const char *shaderVars[] = {"precomputed_dynamic_lights", "precomputed_dynamic_lights_mask",
+      "envi_cover_intensity_map", "droplets_8bit_tex", "distant_fog_result_inscatter"};
+    for (auto shaderVar : shaderVars)
+      registry.readTexture("single_pass_shading_stub_black_tex").atStage(dafg::Stage::PS).bindToShaderVar(shaderVar);
+
+    return
+      [resolveShader = PostFxRenderer(resolve_pshader_name), cameraHndl, sunColorVarId = get_shader_variable_id("sun_color_0"),
+        sunColorHt0VarId = get_shader_variable_id("sun_color_0_ht0"), sunColorHt1VarId = get_shader_variable_id("sun_color_0_ht1"),
+        sunColorHt2VarId = get_shader_variable_id("sun_color_0_ht2")]() {
+        WRDispatcher::getShadowsManager().setShadowFrameIndex(cameraHndl.ref());
+
+        // emulate different sun color on different height feature with constant sun color
+        Color4 sunColor = ShaderGlobal::get_float4(sunColorVarId);
+        ShaderGlobal::set_float4(sunColorHt0VarId, sunColor.r, sunColor.g, sunColor.b, 1.0f);
+        ShaderGlobal::set_float4(sunColorHt1VarId, sunColor.r, sunColor.g, sunColor.b, 2.0f);
+        ShaderGlobal::set_float4(sunColorHt2VarId, sunColor.r, sunColor.g, sunColor.b, 3.0f);
+
+        resolveShader.render();
+      };
+  });
+}
+
+static dafg::NodeHandle makeFullResolveGbufferNode(const char *resolve_pshader_name)
+{
+  return dafg::register_node("resolve_gbuffer_node", DAFG_PP_NODE_SRC, [resolve_pshader_name](dafg::Registry registry) {
+    registry.read("gi_before_frame_lit_token").blob<OrderingToken>().optional();
+    registry.readBlob("conditional_resolve_target_clear_token").optional();
+
+    auto thermalVisionHndl = registry.readBlob<OrderingToken>("thermal_vision_active").optional().handle();
+
+    registry.bindBlob<bool>("has_any_dynamic_lights", "has_any_dynamic_lights");
+    registry.bindTexPs("dynamic_lighting_texture", "dynamic_lighting_texture");
+    registry.requestRenderPass().color({"opaque_resolved"}).depthReadTestAndSample("gbuf_depth", {"depth_gbuf"});
+
+    bindResolvePassResources(registry);
+    registry.bindBlob<Point4>("world_view_pos", "world_view_pos");
+
+    registry.multiplex(dafg::multiplexing::Mode::FullMultiplex);
+    auto camera = use_camera_in_camera(registry);
+    auto cameraHndl = CameraViewShvars{camera}.bindViewVecs().toHandle();
+
+    registry.requestState().setFrameBlock("global_frame");
+
+    shaders::OverrideState state{};
+    state.set(shaders::OverrideState::Z_BOUNDS_ENABLED);
+
+    return [enabledDepthBoundsId = shaders::overrides::create(state), resolveShader = PostFxRenderer(resolve_pshader_name),
+             depth_boundsVarId = get_shader_variable_id("depth_bounds", true), cameraHndl,
+             thermalVisionHndl](const dafg::multiplexing::Index &multiplexing_index) {
+      if (thermalVisionHndl.get())
+        return;
+
+      camera_in_camera::ApplyPostfxState camcam{multiplexing_index, cameraHndl.ref(), camera_in_camera::USE_STENCIL};
+
+      ShadowsManager &shadowsManager = WRDispatcher::getShadowsManager();
+      const CameraParams &camera = cameraHndl.ref();
+
+      shadowsManager.setShadowFrameIndex(camera);
+
+      const float farPlaneDepth = far_plane_depth(get_gbuffer_depth_format());
+      bool useDepthBounds = ::depth_bounds_enabled();
+      if (useDepthBounds)
+      {
+        shaders::overrides::set(enabledDepthBoundsId);
+        api_set_depth_bounds(farPlaneDepth, 1);
+      }
+      else
+        ShaderGlobal::set_float4(depth_boundsVarId, farPlaneDepth, 1);
+
+      resolveShader.render();
+
+      if (useDepthBounds)
+        shaders::overrides::reset();
+    };
+  });
+}
+
+static dafg::NodeHandle makeThinResolveGbufferNodeWithDepthBounds(const char *resolve_pshader_name)
+{
+  return dafg::register_node("resolve_gbuffer_node", DAFG_PP_NODE_SRC, [resolve_pshader_name](dafg::Registry registry) {
+    registry.read("gi_before_frame_lit_token").blob().optional();
+    registry.readBlob("conditional_resolve_target_clear_token").optional();
+
+    // Present iff the thermal special resolve will overwrite opaque_resolved; skip this resolve then.
+    auto thermalVisionHndl = registry.readBlob<OrderingToken>("thermal_vision_active").optional().handle();
+
+    registry.requestRenderPass().color({"opaque_resolved"}).depthReadTestAndSample("gbuf_depth", {"depth_gbuf"});
+
+    bindResolvePassResources(registry);
+    registry.bindBlob<Point4>("world_view_pos", "world_view_pos");
+    auto camera = use_current_camera(registry);
+    auto cameraHndl = CameraViewShvars{camera}.bindViewVecs().toHandle();
+    registry.requestState().setFrameBlock("global_frame");
+
+    shaders::OverrideState state{};
+    state.set(shaders::OverrideState::Z_BOUNDS_ENABLED);
+
+    return [enabledDepthBoundsId = shaders::overrides::create(state), resolveShader = PostFxRenderer(resolve_pshader_name), cameraHndl,
+             thermalVisionHndl]() {
+      if (thermalVisionHndl.get())
+        return;
+
+      ShadowsManager &shadowsManager = WRDispatcher::getShadowsManager();
+      const CameraParams &camera = cameraHndl.ref();
+
+      shadowsManager.setShadowFrameIndex(camera);
+
+      float farPlaneDepth = far_plane_depth(get_gbuffer_depth_format());
+      shaders::overrides::set(enabledDepthBoundsId);
+      api_set_depth_bounds(farPlaneDepth, 1);
+
+      enum ThinGbufResolve
+      {
+        NO_DEPTH_BOUNDS = 0,
+        SHADOWS_NO_SCATTERING = 1,
+        ALL_SHADOWS_SCATTERING = 2,
+        STATIC_SHADOWS_NO_SCATTERING = 3,
+        STATIC_SHADOWS_SCATTERING = 4
+      };
+
+      CascadeShadows *csm = WRDispatcher::getShadowsManager().getCascadeShadows();
+      const bool hasVolumeLight = WRDispatcher::getVolumeLight() && volfog_enabled.get();
+      const float scatteringStart = hasVolumeLight ? 0 : thin_scattering_start.get(),
+                  csmEnd = csm ? csm->getMaxShadowDistance() : scatteringStart;
+      const float scatteringStartRawD = w_to_depth(scatteringStart, Point2(camera.jitterPersp.zn, camera.jitterPersp.zf), 1.f);
+      const float csm_distancRawD = w_to_depth(csmEnd, Point2(camera.jitterPersp.zn, camera.jitterPersp.zf), 1.f);
+
+      if (scatteringStart < csmEnd)
+      {
+        if (scatteringStartRawD < 1.0f)
+        {
+          api_set_depth_bounds(scatteringStartRawD, 1);
+          ShaderGlobal::set_int(thin_gbuf_resolveVarId, SHADOWS_NO_SCATTERING);
+          resolveShader.render();
+        }
+        api_set_depth_bounds(csm_distancRawD, scatteringStartRawD);
+        ShaderGlobal::set_int(thin_gbuf_resolveVarId, ALL_SHADOWS_SCATTERING);
+        resolveShader.render();
+      }
+      else
+      {
+        if (csm_distancRawD < 1.0f)
+        {
+          api_set_depth_bounds(csm_distancRawD, 1);
+          ShaderGlobal::set_int(thin_gbuf_resolveVarId, SHADOWS_NO_SCATTERING);
+          resolveShader.render();
+        }
+        api_set_depth_bounds(scatteringStartRawD, csm_distancRawD);
+        ShaderGlobal::set_int(thin_gbuf_resolveVarId, STATIC_SHADOWS_NO_SCATTERING);
+        resolveShader.render();
+      }
+
+      api_set_depth_bounds(farPlaneDepth, scatteringStart < csmEnd ? csm_distancRawD : scatteringStartRawD);
+      ShaderGlobal::set_int(thin_gbuf_resolveVarId, STATIC_SHADOWS_SCATTERING);
+      resolveShader.render();
+      api_set_depth_bounds(farPlaneDepth, 1); // restore default
+      ShaderGlobal::set_int(thin_gbuf_resolveVarId, NO_DEPTH_BOUNDS);
+
+      shaders::overrides::reset();
+    };
+  });
+}
+
+static dafg::NodeHandle makeThinResolveGbufferNode(const char *resolve_pshader_name)
+{
+  return dafg::register_node("resolve_gbuffer_node", DAFG_PP_NODE_SRC, [resolve_pshader_name](dafg::Registry registry) {
+    registry.read("gi_before_frame_lit_token").blob<OrderingToken>().optional();
+    registry.readBlob("conditional_resolve_target_clear_token").optional();
+
+    auto thermalVisionHndl = registry.readBlob<OrderingToken>("thermal_vision_active").optional().handle();
+
+    registry.requestRenderPass().color({"opaque_resolved"}).depthReadTestAndSample("gbuf_depth", {"depth_gbuf"});
+
+    bindResolvePassResources(registry);
+    registry.bindBlob<Point4>("world_view_pos", "world_view_pos");
+    auto camera = use_current_camera(registry);
+    auto cameraHndl = CameraViewShvars{camera}.bindViewVecs().toHandle();
+    registry.requestState().setFrameBlock("global_frame");
+
+    return [resolveShader = PostFxRenderer(resolve_pshader_name), cameraHndl, thermalVisionHndl]() {
+      if (thermalVisionHndl.get())
+        return;
+
+      WRDispatcher::getShadowsManager().setShadowFrameIndex(cameraHndl.ref());
+      resolveShader.render();
+    };
+  });
+}
+
+static dafg::NodeHandle makeRenderOtherLightsNode()
+{
+  return dafg::register_node("render_other_lights", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
+    registry.requestRenderPass().color({"opaque_resolved"}).depthReadTestAndSample("gbuf_depth", {"depth_gbuf"});
+    registry.orderMeAfter("resolve_gbuffer_node");
+    registry.requestState().setFrameBlock("global_frame");
+    bindResolvePassResources(registry);
+
+    // Thermal special resolve overwrites opaque_resolved; skip these lights so they cannot land on it.
+    auto thermalVisionHndl = registry.readBlob<OrderingToken>("thermal_vision_active").optional().handle();
+
+    registry.multiplex(dafg::multiplexing::Mode::FullMultiplex);
+    auto camera = use_camera_in_camera(registry);
+    auto cameraHndl = CameraViewShvars{camera}.bindViewVecs().toHandle();
+
+    shaders::OverrideState state{};
+    state.set(shaders::OverrideState::Z_BOUNDS_ENABLED);
+
+    return [enabledDepthBoundsId = shaders::overrides::create(state), thermalVisionHndl, cameraHndl](
+             const dafg::multiplexing::Index &multiplexing_index) {
+      ClusteredLights &lights = WRDispatcher::getClusteredLights();
+      if (thermalVisionHndl.get() || !dynamic_lights.get() || !lights.hasDeferredLights())
+        return;
+
+      camera_in_camera::ApplyPostfxState camcam{multiplexing_index, cameraHndl.ref(), camera_in_camera::USE_STENCIL};
+
+      const bool useDepthBounds = ::depth_bounds_enabled();
+      if (useDepthBounds)
+      {
+        float farPlaneDepth = far_plane_depth(get_gbuffer_depth_format());
+        shaders::overrides::set(enabledDepthBoundsId);
+        api_set_depth_bounds(farPlaneDepth, 1);
+      }
+      lights.renderOtherLights();
+      if (useDepthBounds)
+        shaders::overrides::reset();
+    };
+  });
+}
+
+static eastl::fixed_vector<dafg::NodeHandle, 3, false> makeResolveGbufferNodes(const char *resolve_pshader_name)
+{
+  const bool useDepthBounds = ::depth_bounds_enabled();
+
+  eastl::fixed_vector<dafg::NodeHandle, 3, false> result;
+  result.push_back(makeClearResolveTargetNode());
+  if (use_single_pass_shading())
+  {
+    result.push_back(makeStubBlackTextureNode());
+    result.push_back(makeSinglePassResolveGbufferNode(resolve_pshader_name));
+  }
+  else if (use_deferred_shading())
+  {
+    result.push_back(makeFullResolveGbufferNode(resolve_pshader_name));
+    result.push_back(makeRenderOtherLightsNode());
+  }
+  else
+  {
+    if (useDepthBounds)
+      result.push_back(makeThinResolveGbufferNodeWithDepthBounds(resolve_pshader_name));
+    else
+      result.push_back(makeThinResolveGbufferNode(resolve_pshader_name));
+  }
+  return result;
+}
+
+dafg::NodeHandle makeRenameDepthNode()
+{
+  return dafg::register_node("rename_depth", DAFG_PP_NODE_SRC,
+    [](dafg::Registry registry) { registry.renameTexture("gbuf_depth", "gbuf_depth_after_resolve"); });
+}
+
+ECS_TAG(render)
+ECS_ON_EVENT(OnCameraNodeConstruction)
+static void create_gbuffer_nodes_es(const OnCameraNodeConstruction &evt)
+{
+  evt.nodes->push_back(makeRenameDepthNode());
+
+  auto *antiAliasing = WRDispatcher::getAntialiasing();
+  if (antiAliasing && antiAliasing->supportsReactiveMask())
+    evt.nodes->push_back(makeReactiveMaskFillNode(process_reactive_gbuffer_data));
+
+  {
+    const bool hasStencilTest = renderer_has_feature(FeatureRenderFlags::CAMERA_IN_CAMERA) || WRDispatcher::isStencilGbufRequired();
+    const uint32_t gbufDepthFormat = get_gbuffer_depth_format(hasStencilTest);
+    evt.nodes->push_back(makePrepareGbufferDepthNode(gbufDepthFormat));
+  }
+
+  if (use_deferred_lighting())
+  {
+    auto nodes = makeDeferredLightNode(evt.giNeedsReprojection);
+    for (auto &n : nodes)
+      evt.nodes->push_back(eastl::move(n));
+  }
+
+  {
+    const char *resolve_shader = nullptr;
+    if (use_single_pass_shading())
+      resolve_shader = "deferred_shadow_to_buffer";
+    else if (use_deferred_shading())
+      resolve_shader = evt.isBareMinimum ? "deferred_shadow_bare_minimum" : "deferred_shadow_to_buffer";
+    else
+      resolve_shader = THIN_GBUFFER_RESOLVE_SHADER;
+
+    auto nodes = makeResolveGbufferNodes(resolve_shader);
+    for (auto &n : nodes)
+      evt.nodes->push_back(eastl::move(n));
+
+    // We expose the gbuffer to the outside world by renaming it to
+    // "/gbuf_X", i.e. moving it to the global namespace
+    const bool isNormalsPacked = renderer_has_feature(GBUFFER_PACKED_NORMALS);
+    evt.nodes->push_back(dafg::register_node("gbuffer_publish_node", DAFG_PP_NODE_SRC, [isNormalsPacked](dafg::Registry registry) {
+      auto ns = isNormalsPacked ? registry.root() / "opaque" / "mixing" : registry.root() / "opaque" / "decorations";
+      ns.rename("gbuf_0_done", "gbuf_0").texture();
+      if (!isNormalsPacked)
+      {
+        ns.rename("gbuf_1_done", "gbuf_1").texture().optional();
+      }
+      ns.rename("gbuf_2_done", "gbuf_2").texture().optional();
+      ns.rename("gbuf_3_done", "gbuf_3").texture().optional();
+      ns.rename("gbuf_depth_done", "gbuf_depth").texture();
+
+      d3d::SamplerInfo smpInfo;
+      smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
+      smpInfo.filter_mode = d3d::FilterMode::Point;
+      registry.create("gbuf_sampler").blob(d3d::request_sampler(smpInfo));
+    }));
+  }
+}

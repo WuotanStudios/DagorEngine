@@ -16,7 +16,6 @@
 #include <debug/dag_log.h>
 #include <ioSys/dag_genIo.h>
 #include <util/dag_bitArray.h>
-#include <util/dag_stlqsort.h>
 #include <EASTL/hash_map.h>
 #include <hash/mum_hash.h>
 
@@ -58,6 +57,7 @@ bool MeshData::ExtraChannel::resize_verts(int n, int t)
     case CHT_FLOAT3: vsize = sizeof(float) * 3; break;
     case CHT_FLOAT4: vsize = sizeof(float) * 4; break;
     case CHT_E3DCOLOR: vsize = sizeof(E3DCOLOR); break;
+    case CHT_SHORT4: vsize = sizeof(int16_t) * 4; break;
     case CHT_UNKNOWN: vsize = 0; break;
     default: vsize = 0; LOGERR_CTX("unknown mesh channel type %d", t);
   }
@@ -95,12 +95,10 @@ Mesh::Mesh() {}
 
 static Face *faces;
 
-#ifndef __clang__
 struct FaceMatCompare
 {
   static int compare(const int a, const int b) { return faces[a].mat - faces[b].mat; }
 };
-#endif
 
 void MeshData::erasefaces(int at, int n)
 {
@@ -250,11 +248,9 @@ sort_codepath:
   for (int j = 0; j < fi.size(); ++j)
     fi[j] = j;
   faces = &face[0];
-#ifdef __clang__
-  stlsort::sort(fi.data(), fi.data() + fi.size(), [&](auto a, auto b) { return faces[a].mat < faces[b].mat; });
-#else
+  // one sort algorithm for all compilers: relative order of faces with equal
+  // mat is algorithm-defined and any difference cascades into built vdata
   SimpleQsort<int, FaceMatCompare>::sort(&fi[0], fi.size());
-#endif
   return reorder_faces(fi.data());
 }
 
@@ -984,6 +980,9 @@ bool MeshData::optimize_extra(int id, float sqThreshold)
     case CHT_E3DCOLOR:
       ::optimize_tface_base<GetTFaceVert>(nv, map, vfm, channel.fc, (E3DCOLOR *)&channel.vt[0], channel.numverts(), sqThreshold);
       break;
+    case CHT_SHORT4:
+      ::optimize_tface_base<GetTFaceVert>(nv, map, vfm, channel.fc, (BoneIndices *)&channel.vt[0], channel.numverts(), sqThreshold);
+      break;
     default: return false;
   }
   channel.resize_verts(nv.size());
@@ -1006,9 +1005,9 @@ struct RemoveDegenerate
     if (f.v[0] == f.v[1] || f.v[0] == f.v[2] || f.v[1] == f.v[2])
       return true;
 
-    vec3f v0 = v_ldu(&verts[f.v[0]].x);
-    vec3f v1 = v_ldu(&verts[f.v[1]].x);
-    vec3f v2 = v_ldu(&verts[f.v[2]].x);
+    vec3f v0 = v_ldu_p3_safe(&verts[f.v[0]].x);
+    vec3f v1 = v_ldu_p3_safe(&verts[f.v[1]].x);
+    vec3f v2 = v_ldu_p3_safe(&verts[f.v[2]].x);
     vec3f fa = v_cross3(v_sub(v1, v0), v_sub(v2, v0));
     if (DAGOR_UNLIKELY(v_extract_x(v_length3_sq_x(fa)) < faceAreaThres))
       return true;
@@ -1079,43 +1078,45 @@ static void remove_faces(MeshData &m, const CanRemove &c)
   for (int cc = 0; cc < m.extra.size(); ++cc)
     ERASE(m.extra[cc].fc)
 #undef ERASE
+  if (m.ntab.size())
+  {
+    m.ntab.clear();
+    m.ngr.clear();
+  }
 }
 
 void MeshData::kill_bad_faces(float fa_thres) { remove_faces(*this, RemoveDegenerate(fa_thres)); }
 
-void MeshData::kill_bad_faces2(float fa_thresh, float fa_to_check_thresh, float fa_to_perim_ratio_thresh)
+void MeshData::kill_sliver_faces(float fa_thresh, float ratio)
 {
   struct RemoveDegenerateByPerimeterToFaceAreaRatio
   {
     float faceAreaThres;
-    float faceAreaCheckThres;
-    float faceAreaToPerimeterRatioThres;
+    float perimeterTo2FaceAreaRatioThres;
     bool can_remove(const Face &f, dag::ConstSpan<Point3> verts, int) const
     {
       if (f.v[0] == f.v[1] || f.v[0] == f.v[2] || f.v[1] == f.v[2])
         return true;
 
-      vec3f v0 = v_ldu(&verts[f.v[0]].x);
-      vec3f v1 = v_ldu(&verts[f.v[1]].x);
-      vec3f v2 = v_ldu(&verts[f.v[2]].x);
+      vec3f v0 = v_ldu_p3_safe(&verts[f.v[0]].x);
+      vec3f v1 = v_ldu_p3_safe(&verts[f.v[1]].x);
+      vec3f v2 = v_ldu_p3_safe(&verts[f.v[2]].x);
       vec3f v10 = v_sub(v1, v0);
       vec3f v20 = v_sub(v2, v0);
       vec3f vfa2 = v_length3_sq_x(v_cross3(v10, v20));
-      if (DAGOR_UNLIKELY(v_extract_x(vfa2) < faceAreaCheckThres))
-      {
-        if (v_extract_x(vfa2) < faceAreaThres)
-          return true;
-        vec4f v21fa2 = v_perm_xaxa(v_length3_sq_x(v_sub(v2, v1)), vfa2);
-        vec4f vpfa = v_sqrt(v_perm_xyab(v_perm_xaxa(v_length3_sq_x(v10), v_length3_sq_x(v20)), v21fa2));
-        if (v_extract_x(v_hadd3_x(vpfa)) / v_extract_w(vpfa) > faceAreaToPerimeterRatioThres)
-          return true;
-      }
+
+      if (v_extract_x(vfa2) < faceAreaThres)
+        return true;
+
+      vec4f v21fa2 = v_perm_xaxa(v_length3_sq_x(v_sub(v2, v1)), vfa2);
+      vec4f vpfa = v_sqrt(v_perm_xyab(v_perm_xaxa(v_length3_sq_x(v10), v_length3_sq_x(v20)), v21fa2));
+      if (v_extract_x(v_hadd3_x(vpfa)) / v_extract_w(vpfa) > perimeterTo2FaceAreaRatioThres)
+        return true;
 
       return false;
     }
   };
-  RemoveDegenerateByPerimeterToFaceAreaRatio cb{fa_thresh, fa_to_check_thresh, fa_to_perim_ratio_thresh};
-  remove_faces(*this, cb);
+  remove_faces(*this, RemoveDegenerateByPerimeterToFaceAreaRatio{fa_thresh, ratio});
 }
 
 class RemoveUnused
@@ -1165,6 +1166,16 @@ int MeshData::check_mesh()
         debug("cface %d has invalid vertex %u", i, cface[i].t[j]);
         return 0;
       }
+  if (facengr.size() && facengr.size() != face.size())
+  {
+    debug("facengr.size=%d != face.size=%d", (int)facengr.size(), (int)face.size());
+    return 0;
+  }
+  if (ngr.size() && vertnorm.size() && ngr.size() != vertnorm.size())
+  {
+    debug("ngr.size=%d != vertnorm.size=%d", (int)ngr.size(), (int)vertnorm.size());
+    return 0;
+  }
   for (i = 0; i < facengr.size(); ++i)
     for (j = 0; j < 3; ++j)
       if (facengr[i][j] >= vertnorm.size())
@@ -1172,6 +1183,26 @@ int MeshData::check_mesh()
         debug("facengr %d has invalid ngr %u", i, facengr[i][j]);
         return 0;
       }
+  for (i = 0; i < ngr.size(); ++i)
+  {
+    if ((unsigned)ngr[i] >= (unsigned)ntab.size())
+    {
+      debug("ngr[%d]=%d out of ntab range [0,%d)", i, ngr[i], (int)ntab.size());
+      return 0;
+    }
+    int cc = ntab[ngr[i]];
+    if (cc < 1 || ngr[i] + cc >= (int)ntab.size())
+    {
+      debug("ngr[%d] bad count %d (ntab.size=%d)", i, cc, (int)ntab.size());
+      return 0;
+    }
+    for (j = 1; j <= cc; ++j)
+      if ((unsigned)ntab[ngr[i] + j] >= (unsigned)face.size())
+      {
+        debug("ngr[%d] face[%d]=%d out of range [0,%d)", i, j - 1, ntab[ngr[i] + j], (int)face.size());
+        return 0;
+      }
+  }
   return 1;
 }
 

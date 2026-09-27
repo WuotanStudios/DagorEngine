@@ -89,17 +89,21 @@ BINDUMP_BEGIN_LAYOUT(Interval)
 
   inline unsigned getValCount() const { return maxVal.size() + 1; }
 
-  uint32_t getAssumedVal() const
+  int getAssumedVal() const
   {
     G_ASSERT(type == TYPE_ASSUMED_INTERVAL);
     // The assumed value is stored in the `mCount` field of the `maxVal` member,
     // this is done because the `maxVal` member is not used for the assumed interval,
     // and there are no other fields, and in order not to change the dump format, it is done this way
-    return maxVal.size();
+    return bitwise_cast<int>(maxVal.size());
   }
 
   inline unsigned getNormalizedValue(real v) const
   {
+    // For TYPE_ASSUMED_INTERVAL the maxVal slot holds the assumed value, not boundary thresholds (see getAssumedVal()).
+    // Use getAssumedVal() for those intervals.
+    G_ASSERT(type != TYPE_ASSUMED_INTERVAL);
+
     for (int i = 0; i < maxVal.size(); i++)
       if (v < maxVal[i])
         return i;
@@ -345,7 +349,6 @@ BINDUMP_BEGIN_LAYOUT(ShaderClass)
       return NO_TIMESTAMP;
     return timestamp[0];
   }
-
 BINDUMP_END_LAYOUT()
 
 BINDUMP_BEGIN_LAYOUT(ShaderBlock)
@@ -372,11 +375,6 @@ BINDUMP_BEGIN_LAYOUT(ShaderBlock)
         sb++;
     return false;
   }
-BINDUMP_END_LAYOUT()
-
-BINDUMP_BEGIN_LAYOUT(ShGroup)
-  BINDUMP_USING_EXTENSION()
-  VecHolder<VecHolder<uint8_t>> shaders;
 BINDUMP_END_LAYOUT()
 
 BINDUMP_BEGIN_LAYOUT(ScriptedShadersBinDump)
@@ -417,13 +415,9 @@ BINDUMP_BEGIN_LAYOUT(ScriptedShadersBinDump)
   VecHolder<ShaderHashValue> shaderHashes;
 
   // compressed shaders
-  struct ShGroupsMapping
-  {
-    uint16_t groupId = 0;
-    uint16_t indexInGroup = 0;
-  };
-  VecHolder<ShGroupsMapping> shGroupsMapping;
-  VecHolder<Compressed<Field<ShGroup>>> shGroups;
+  VecHolder<uint32_t> uncompressed_shader_sizes;
+  VecHolder<VecHolder<uint8_t>> shaders_metadata;
+  VecHolder<VecHolder<uint8_t>> shaders;
   VecHolder<char> dictionary;
 
   const Field<ShaderClass> *findShaderClass(const char *name) const;
@@ -434,6 +428,7 @@ struct ScriptedShadersBinDumpCompressedHeader
   uint32_t magicPart1 = 0, magicPart2 = 0;
   uint32_t version = 0;
   uint8_t checksumHash[32] = {};
+  uint8_t buildBlkHash[20] = {}; // For compiler use only (incremental builds)
 };
 
 BINDUMP_BEGIN_LAYOUT(ScriptedShadersBinDumpCompressed)
@@ -470,6 +465,10 @@ BINDUMP_BEGIN_LAYOUT(IntervalInfosBucket)
   {
     return intervalInfoByHash[(interval_name_hash >> hashShift) & (intervalInfoByHash.size() - 1)];
   }
+  inline const Field<IntervalInfo> &getIntervalInfoByHash(uint32_t interval_name_hash) const
+  {
+    return intervalInfoByHash[(interval_name_hash >> hashShift) & (intervalInfoByHash.size() - 1)];
+  }
 BINDUMP_END_LAYOUT()
 
 BINDUMP_BEGIN_EXTEND_LAYOUT(ScriptedShadersBinDumpV2, ScriptedShadersBinDump)
@@ -483,8 +482,17 @@ BINDUMP_BEGIN_EXTEND_LAYOUT(ScriptedShadersBinDumpV2, ScriptedShadersBinDump)
   {
     return intervalInfosBuckets[interval_name_hash & (intervalInfosBuckets.size() - 1)];
   }
+  const Field<IntervalInfosBucket> &getIntervalInfosBucketByHash(uint32_t interval_name_hash) const
+  {
+    return intervalInfosBuckets[interval_name_hash & (intervalInfosBuckets.size() - 1)];
+  }
 
-  inline Field<IntervalInfo> &getIntervalInfoByHash(uint32_t interval_name_hash)
+  Field<IntervalInfo> &getIntervalInfoByHash(uint32_t interval_name_hash)
+  {
+    auto &bucket = getIntervalInfosBucketByHash(interval_name_hash);
+    return bucket.getIntervalInfoByHash(interval_name_hash);
+  }
+  const Field<IntervalInfo> &getIntervalInfoByHash(uint32_t interval_name_hash) const
   {
     auto &bucket = getIntervalInfosBucketByHash(interval_name_hash);
     return bucket.getIntervalInfoByHash(interval_name_hash);
@@ -554,9 +562,16 @@ struct StcodeConstValidationMask
   }
 };
 
+struct ImmutableSamplerMapping
+{
+  uint16_t samplerId = uint16_t(-1);
+  uint16_t globalVarId = uint16_t(-1);
+};
+
 BINDUMP_BEGIN_EXTEND_LAYOUT(ScriptedShadersBinDumpV3, ScriptedShadersBinDumpV2)
   BINDUMP_USING_EXTENSION()
   VecHolder<d3d::SamplerInfo> samplers;
+  VecHolder<ImmutableSamplerMapping> immutableSamplersMap;
 
   ExternalStcodeMode externalStcodeMode = ExternalStcodeMode::NONE;
   uint32_t externalStcodeVersion = 0;
@@ -564,4 +579,41 @@ BINDUMP_BEGIN_EXTEND_LAYOUT(ScriptedShadersBinDumpV3, ScriptedShadersBinDumpV2)
 
   VecHolder<StcodeConstValidationMask> stcodeConstValidationMasks;
 BINDUMP_END_LAYOUT()
+
+struct ShaderGvarMetadata
+{
+  uint8_t isRef : 1 = false;
+  uint8_t isLiteral : 1 = false;
+  uint8_t pad_ : 6 = 0;
+};
+static_assert(sizeof(ShaderGvarMetadata) == 1);
+
+BINDUMP_BEGIN_EXTEND_LAYOUT(ScriptedShadersBinDumpV4, ScriptedShadersBinDumpV3)
+  BINDUMP_USING_EXTENSION()
+  int32_t externalPsoCacheVersion = 0;
+  VecHolder<ShaderGvarMetadata> globVarsMetadata;
+BINDUMP_END_LAYOUT()
+
+struct StubTextureKey
+{
+  uint32_t col;
+  ShaderVarTextureType textype;
+
+  operator uint64_t() const { return uint64_t(col) | (uint64_t(textype) << 32); }
+  friend bool operator==(const StubTextureKey &, const StubTextureKey &) = default;
+  friend bool operator!=(const StubTextureKey &, const StubTextureKey &) = default;
+};
+
+BINDUMP_BEGIN_EXTEND_LAYOUT(ScriptedShadersBinDumpV5, ScriptedShadersBinDumpV4)
+  BINDUMP_USING_EXTENSION()
+  VecHolder<StubTextureKey> usedStubTextureKeys;
+  int32_t refinedBlockStcodeId = -1;
+  int32_t cppRefinedBlockStcodeId = -1;
+BINDUMP_END_LAYOUT()
+
+// Header version used by stripped minidump for export shaders. Frozed to increase binary stability, as newer header versions are more
+// volatile. Only increase if you actually need the new features for export shaders as well.
+// @NOTE: templated 'using' for some reason trips clang up.
+#define stripped_bindump_frozen_version_t ScriptedShadersBinDumpV4
+
 } // namespace shader_layout

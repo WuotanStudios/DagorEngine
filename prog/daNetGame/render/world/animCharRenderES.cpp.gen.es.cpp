@@ -7,10 +7,10 @@ ECS_DEF_PULL_VAR(animCharRender);
 //static constexpr ecs::ComponentDesc animchar_before_render_es_comps[] ={};
 static void animchar_before_render_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   G_FAST_ASSERT(evt.is<UpdateStageInfoBeforeRender>());
   animchar_before_render_es(static_cast<const UpdateStageInfoBeforeRender&>(evt)
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc animchar_before_render_es_es_desc
 (
@@ -27,10 +27,10 @@ static ecs::EntitySystemDesc animchar_before_render_es_es_desc
 //static constexpr ecs::ComponentDesc animchar_render_opaque_async_es_comps[] ={};
 static void animchar_render_opaque_async_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   G_FAST_ASSERT(evt.is<AnimcharRenderAsyncEvent>());
   animchar_render_opaque_async_es(static_cast<const AnimcharRenderAsyncEvent&>(evt)
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc animchar_render_opaque_async_es_es_desc
 (
@@ -67,10 +67,10 @@ static ecs::EntitySystemDesc animchar_render_opaque_es_es_desc
 //static constexpr ecs::ComponentDesc animchar_vehicle_cockpit_render_depth_prepass_es_comps[] ={};
 static void animchar_vehicle_cockpit_render_depth_prepass_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   G_FAST_ASSERT(evt.is<VehicleCockpitPrepass>());
   animchar_vehicle_cockpit_render_depth_prepass_es(static_cast<const VehicleCockpitPrepass&>(evt)
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc animchar_vehicle_cockpit_render_depth_prepass_es_es_desc
 (
@@ -94,7 +94,8 @@ static void copy_hero_crawling_es_all_events(const ecs::Event &__restrict evt, c
   G_FAST_ASSERT(evt.is<UpdateStageInfoBeforeRender>());
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     copy_hero_crawling_es(static_cast<const UpdateStageInfoBeforeRender&>(evt)
-        , ECS_RW_COMP(copy_hero_crawling_es_comps, "is_hero_crawling", bool)
+        , components.manager()
+    , ECS_RW_COMP(copy_hero_crawling_es_comps, "is_hero_crawling", bool)
     );
   while (++comp != compE);
 }
@@ -113,10 +114,10 @@ static ecs::EntitySystemDesc copy_hero_crawling_es_es_desc
 //static constexpr ecs::ComponentDesc animchar_render_hmap_deform_es_comps[] ={};
 static void animchar_render_hmap_deform_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   G_FAST_ASSERT(evt.is<RenderHmapDeform>());
   animchar_render_hmap_deform_es(static_cast<const RenderHmapDeform&>(evt)
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc animchar_render_hmap_deform_es_es_desc
 (
@@ -139,7 +140,7 @@ static constexpr ecs::ComponentDesc animchar_render_trans_init_es_event_handler_
   {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
   {ECS_HASH("animchar"), ecs::ComponentTypeInfo<AnimV20::AnimcharBaseComponent>()},
 //start of 4 no components at [4]
-  {ECS_HASH("semi_transparent__placingColor"), ecs::ComponentTypeInfo<Point3>()},
+  {ECS_HASH("excludeFromAnimcharRender"), ecs::ComponentTypeInfo<ecs::Tag>()},
   {ECS_HASH("invisibleUpdatableAnimchar"), ecs::ComponentTypeInfo<ecs::Tag>()},
   {ECS_HASH("late_transparent_render"), ecs::ComponentTypeInfo<ecs::Tag>()},
   {ECS_HASH("requires_trans_render"), ecs::ComponentTypeInfo<ecs::Tag>()}
@@ -171,10 +172,10 @@ static ecs::EntitySystemDesc animchar_render_trans_init_es_event_handler_es_desc
 //static constexpr ecs::ComponentDesc animchar_render_trans_es_comps[] ={};
 static void animchar_render_trans_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   G_FAST_ASSERT(evt.is<UpdateStageInfoRenderTrans>());
   animchar_render_trans_es(static_cast<const UpdateStageInfoRenderTrans&>(evt)
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc animchar_render_trans_es_es_desc
 (
@@ -191,10 +192,10 @@ static ecs::EntitySystemDesc animchar_render_trans_es_es_desc
 //static constexpr ecs::ComponentDesc animchar_render_distortion_es_comps[] ={};
 static void animchar_render_distortion_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   G_FAST_ASSERT(evt.is<UpdateStageInfoRenderDistortion>());
   animchar_render_distortion_es(static_cast<const UpdateStageInfoRenderDistortion&>(evt)
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc animchar_render_distortion_es_es_desc
 (
@@ -211,10 +212,10 @@ static ecs::EntitySystemDesc animchar_render_distortion_es_es_desc
 //static constexpr ecs::ComponentDesc animchar_has_any_visible_distortion_es_comps[] ={};
 static void animchar_has_any_visible_distortion_es_all_events(ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   G_FAST_ASSERT(evt.is<UpdateStageInfoNeedDistortion>());
   animchar_has_any_visible_distortion_es(static_cast<UpdateStageInfoNeedDistortion&>(evt)
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc animchar_has_any_visible_distortion_es_es_desc
 (
@@ -257,7 +258,8 @@ static void init_vehicle_reactive_mask_node_es_event_handler_all_events(const ec
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     init_vehicle_reactive_mask_node_es_event_handler(evt
-        , ECS_RW_COMP(init_vehicle_reactive_mask_node_es_event_handler_comps, "reactiveMaskNode", dafg::NodeHandle)
+        , components.manager()
+    , ECS_RW_COMP(init_vehicle_reactive_mask_node_es_event_handler_comps, "reactiveMaskNode", dafg::NodeHandle)
     );
   while (++comp != compE);
 }
@@ -276,7 +278,7 @@ static ecs::EntitySystemDesc init_vehicle_reactive_mask_node_es_event_handler_es
 ,"render");
 static constexpr ecs::ComponentDesc animchar_render_objects_prepare_ecs_query_comps[] =
 {
-//start of 8 rw components at [0]
+//start of 10 rw components at [0]
   {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
   {ECS_HASH("animchar_render__root_pos"), ecs::ComponentTypeInfo<vec3f>()},
   {ECS_HASH("animchar_attaches_bbox"), ecs::ComponentTypeInfo<bbox3f>(), ecs::CDF_OPTIONAL},
@@ -285,7 +287,9 @@ static constexpr ecs::ComponentDesc animchar_render_objects_prepare_ecs_query_co
   {ECS_HASH("animchar_shadow_cull_bbox"), ecs::ComponentTypeInfo<bbox3f>()},
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
   {ECS_HASH("animchar_render__shadow_cast_dist"), ecs::ComponentTypeInfo<float>()},
-//start of 12 ro components at [8]
+  {ECS_HASH("animchar__switched_lod"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("animchar_attach__isAttached"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
+//start of 13 ro components at [10]
   {ECS_HASH("animchar_node_wtm"), ecs::ComponentTypeInfo<AnimcharNodesMat44>()},
   {ECS_HASH("animchar_render__dist_sq"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("animchar_attaches_bbox_precalculated"), ecs::ComponentTypeInfo<bbox3f>(), ecs::CDF_OPTIONAL},
@@ -297,20 +301,21 @@ static constexpr ecs::ComponentDesc animchar_render_objects_prepare_ecs_query_co
   {ECS_HASH("animchar__actOnDemand"), ecs::ComponentTypeInfo<ecs::Tag>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar__updatable"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar_extra_culling_dist"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
-  {ECS_HASH("animchar__use_precise_shadow_culling"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL}
+  {ECS_HASH("animchar__use_precise_shadow_culling"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("animchar_attach__attachedTo"), ecs::ComponentTypeInfo<ecs::EntityId>(), ecs::CDF_OPTIONAL}
 };
 static ecs::CompileTimeQueryDesc animchar_render_objects_prepare_ecs_query_desc
 (
   "animchar_render_objects_prepare_ecs_query",
-  make_span(animchar_render_objects_prepare_ecs_query_comps+0, 8)/*rw*/,
-  make_span(animchar_render_objects_prepare_ecs_query_comps+8, 12)/*ro*/,
+  make_span(animchar_render_objects_prepare_ecs_query_comps+0, 10)/*rw*/,
+  make_span(animchar_render_objects_prepare_ecs_query_comps+10, 13)/*ro*/,
   empty_span(),
   empty_span()
   , 4);
 template<typename Callable>
-inline void animchar_render_objects_prepare_ecs_query(Callable function)
+inline void animchar_render_objects_prepare_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, animchar_render_objects_prepare_ecs_query_desc.getHandle(),
+  perform_query(&manager, animchar_render_objects_prepare_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -330,12 +335,15 @@ inline void animchar_render_objects_prepare_ecs_query(Callable function)
             , ECS_RW_COMP(animchar_render_objects_prepare_ecs_query_comps, "animchar_shadow_cull_bbox", bbox3f)
             , ECS_RW_COMP(animchar_render_objects_prepare_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
             , ECS_RW_COMP(animchar_render_objects_prepare_ecs_query_comps, "animchar_render__shadow_cast_dist", float)
+            , ECS_RW_COMP_PTR(animchar_render_objects_prepare_ecs_query_comps, "animchar__switched_lod", bool)
             , ECS_RO_COMP_OR(animchar_render_objects_prepare_ecs_query_comps, "animchar__usePrecalculatedData", bool(false))
             , ECS_RO_COMP_OR(animchar_render_objects_prepare_ecs_query_comps, "animchar_render__enabled", bool(true))
             , ECS_RO_COMP_PTR(animchar_render_objects_prepare_ecs_query_comps, "animchar__actOnDemand", ecs::Tag)
             , ECS_RO_COMP_OR(animchar_render_objects_prepare_ecs_query_comps, "animchar__updatable", bool(true))
             , ECS_RO_COMP_OR(animchar_render_objects_prepare_ecs_query_comps, "animchar_extra_culling_dist", float(100))
             , ECS_RO_COMP_OR(animchar_render_objects_prepare_ecs_query_comps, "animchar__use_precise_shadow_culling", bool(false))
+            , ECS_RW_COMP_PTR(animchar_render_objects_prepare_ecs_query_comps, "animchar_attach__isAttached", bool)
+            , ECS_RO_COMP_OR(animchar_render_objects_prepare_ecs_query_comps, "animchar_attach__attachedTo", ecs::EntityId(ecs::INVALID_ENTITY_ID))
             );
 
         }while (++comp != compE);
@@ -344,11 +352,12 @@ inline void animchar_render_objects_prepare_ecs_query(Callable function)
 }
 static constexpr ecs::ComponentDesc animchar_process_objects_in_shadow_ecs_query_comps[] =
 {
-//start of 3 rw components at [0]
+//start of 4 rw components at [0]
   {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
   {ECS_HASH("animchar_bbox"), ecs::ComponentTypeInfo<bbox3f>()},
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
-//start of 3 ro components at [3]
+  {ECS_HASH("animchar__switched_lod"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
+//start of 3 ro components at [4]
   {ECS_HASH("animchar_node_wtm"), ecs::ComponentTypeInfo<AnimcharNodesMat44>()},
   {ECS_HASH("animchar_bsph"), ecs::ComponentTypeInfo<vec4f>()},
   {ECS_HASH("animchar_render__enabled"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL}
@@ -356,14 +365,14 @@ static constexpr ecs::ComponentDesc animchar_process_objects_in_shadow_ecs_query
 static ecs::CompileTimeQueryDesc animchar_process_objects_in_shadow_ecs_query_desc
 (
   "animchar_process_objects_in_shadow_ecs_query",
-  make_span(animchar_process_objects_in_shadow_ecs_query_comps+0, 3)/*rw*/,
-  make_span(animchar_process_objects_in_shadow_ecs_query_comps+3, 3)/*ro*/,
+  make_span(animchar_process_objects_in_shadow_ecs_query_comps+0, 4)/*rw*/,
+  make_span(animchar_process_objects_in_shadow_ecs_query_comps+4, 3)/*ro*/,
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void animchar_process_objects_in_shadow_ecs_query(Callable function)
+inline void animchar_process_objects_in_shadow_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, animchar_process_objects_in_shadow_ecs_query_desc.getHandle(),
+  perform_query(&manager, animchar_process_objects_in_shadow_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -374,6 +383,7 @@ inline void animchar_process_objects_in_shadow_ecs_query(Callable function)
             , ECS_RW_COMP(animchar_process_objects_in_shadow_ecs_query_comps, "animchar_bbox", bbox3f)
             , ECS_RO_COMP(animchar_process_objects_in_shadow_ecs_query_comps, "animchar_bsph", vec4f)
             , ECS_RW_COMP(animchar_process_objects_in_shadow_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
+            , ECS_RW_COMP_PTR(animchar_process_objects_in_shadow_ecs_query_comps, "animchar__switched_lod", bool)
             , ECS_RO_COMP_OR(animchar_process_objects_in_shadow_ecs_query_comps, "animchar_render__enabled", bool(true))
             );
 
@@ -392,8 +402,9 @@ static constexpr ecs::ComponentDesc update_animchar_hmap_deform_ecs_query_comps[
   {ECS_HASH("animchar__actOnDemand"), ecs::ComponentTypeInfo<ecs::Tag>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("slot_attach"), ecs::ComponentTypeInfo<ecs::Tag>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar__updatable"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-//start of 2 no components at [7]
-  {ECS_HASH("semi_transparent__placingColor"), ecs::ComponentTypeInfo<Point3>()},
+//start of 3 no components at [7]
+  {ECS_HASH("excludeFromAnimcharRender"), ecs::ComponentTypeInfo<ecs::Tag>()},
+  {ECS_HASH("excludeFromHmapDeform"), ecs::ComponentTypeInfo<ecs::Tag>()},
   {ECS_HASH("invisibleUpdatableAnimchar"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc update_animchar_hmap_deform_ecs_query_desc
@@ -402,11 +413,11 @@ static ecs::CompileTimeQueryDesc update_animchar_hmap_deform_ecs_query_desc
   make_span(update_animchar_hmap_deform_ecs_query_comps+0, 2)/*rw*/,
   make_span(update_animchar_hmap_deform_ecs_query_comps+2, 5)/*ro*/,
   empty_span(),
-  make_span(update_animchar_hmap_deform_ecs_query_comps+7, 2)/*no*/);
+  make_span(update_animchar_hmap_deform_ecs_query_comps+7, 3)/*no*/);
 template<typename Callable>
-inline void update_animchar_hmap_deform_ecs_query(Callable function)
+inline void update_animchar_hmap_deform_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, update_animchar_hmap_deform_ecs_query_desc.getHandle(),
+  perform_query(&manager, update_animchar_hmap_deform_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -427,25 +438,27 @@ inline void update_animchar_hmap_deform_ecs_query(Callable function)
 }
 static constexpr ecs::ComponentDesc preprocess_visible_animchars_in_frustum_ecs_query_comps[] =
 {
-//start of 2 rw components at [0]
+//start of 3 rw components at [0]
   {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
-//start of 3 ro components at [2]
+  {ECS_HASH("animchar__switched_lod"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
+//start of 3 ro components at [3]
   {ECS_HASH("animchar_node_wtm"), ecs::ComponentTypeInfo<AnimcharNodesMat44>()},
   {ECS_HASH("animchar_bsph"), ecs::ComponentTypeInfo<vec4f>()},
-  {ECS_HASH("animchar_render__enabled"), ecs::ComponentTypeInfo<bool>()}
+  {ECS_HASH("animchar_render__enabled"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL}
 };
 static ecs::CompileTimeQueryDesc preprocess_visible_animchars_in_frustum_ecs_query_desc
 (
   "preprocess_visible_animchars_in_frustum_ecs_query",
-  make_span(preprocess_visible_animchars_in_frustum_ecs_query_comps+0, 2)/*rw*/,
-  make_span(preprocess_visible_animchars_in_frustum_ecs_query_comps+2, 3)/*ro*/,
+  make_span(preprocess_visible_animchars_in_frustum_ecs_query_comps+0, 3)/*rw*/,
+  make_span(preprocess_visible_animchars_in_frustum_ecs_query_comps+3, 3)/*ro*/,
   empty_span(),
-  empty_span());
+  empty_span()
+  , 4);
 template<typename Callable>
-inline void preprocess_visible_animchars_in_frustum_ecs_query(Callable function)
+inline void preprocess_visible_animchars_in_frustum_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, preprocess_visible_animchars_in_frustum_ecs_query_desc.getHandle(),
+  perform_query(&manager, preprocess_visible_animchars_in_frustum_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -455,12 +468,13 @@ inline void preprocess_visible_animchars_in_frustum_ecs_query(Callable function)
             , ECS_RO_COMP(preprocess_visible_animchars_in_frustum_ecs_query_comps, "animchar_node_wtm", AnimcharNodesMat44)
             , ECS_RO_COMP(preprocess_visible_animchars_in_frustum_ecs_query_comps, "animchar_bsph", vec4f)
             , ECS_RW_COMP(preprocess_visible_animchars_in_frustum_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
-            , ECS_RO_COMP(preprocess_visible_animchars_in_frustum_ecs_query_comps, "animchar_render__enabled", bool)
+            , ECS_RO_COMP_OR(preprocess_visible_animchars_in_frustum_ecs_query_comps, "animchar_render__enabled", bool(true))
+            , ECS_RW_COMP_PTR(preprocess_visible_animchars_in_frustum_ecs_query_comps, "animchar__switched_lod", bool)
             );
 
         }while (++comp != compE);
     }
-  );
+    , nullptr, preprocess_visible_animchars_in_frustum_ecs_query_desc.getQuant());
 }
 static constexpr ecs::ComponentDesc animchar_csm_distance_ecs_query_comps[] =
 {
@@ -472,7 +486,7 @@ static constexpr ecs::ComponentDesc animchar_csm_distance_ecs_query_comps[] =
   {ECS_HASH("animchar_bbox"), ecs::ComponentTypeInfo<bbox3f>()},
   {ECS_HASH("animchar_shadow_cull_bbox"), ecs::ComponentTypeInfo<bbox3f>()},
   {ECS_HASH("attaches_list"), ecs::ComponentTypeInfo<ecs::EidList>(), ecs::CDF_OPTIONAL},
-  {ECS_HASH("animchar_attach__attachedTo"), ecs::ComponentTypeInfo<ecs::EntityId>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("animchar_attach__isAttached"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
 //start of 1 no components at [7]
   {ECS_HASH("cockpitEntity"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
@@ -485,13 +499,15 @@ static ecs::CompileTimeQueryDesc animchar_csm_distance_ecs_query_desc
   make_span(animchar_csm_distance_ecs_query_comps+7, 1)/*no*/
   , 4);
 template<typename Callable>
-inline void animchar_csm_distance_ecs_query(Callable function)
+inline void animchar_csm_distance_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, animchar_csm_distance_ecs_query_desc.getHandle(),
+  perform_query(&manager, animchar_csm_distance_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
         {
+          if ( !(!ECS_RO_COMP_OR(animchar_csm_distance_ecs_query_comps, "animchar_attach__isAttached", bool( false))) )
+            continue;
           function(
               ECS_RW_COMP(animchar_csm_distance_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
             , ECS_RO_COMP(animchar_csm_distance_ecs_query_comps, "animchar_bsph", vec4f)
@@ -499,11 +515,10 @@ inline void animchar_csm_distance_ecs_query(Callable function)
             , ECS_RO_COMP(animchar_csm_distance_ecs_query_comps, "animchar_shadow_cull_bbox", bbox3f)
             , ECS_RW_COMP(animchar_csm_distance_ecs_query_comps, "animchar_render__shadow_cast_dist", float)
             , ECS_RO_COMP_PTR(animchar_csm_distance_ecs_query_comps, "attaches_list", ecs::EidList)
-            , ECS_RO_COMP_OR(animchar_csm_distance_ecs_query_comps, "animchar_attach__attachedTo", ecs::EntityId(ecs::INVALID_ENTITY_ID))
             );
 
         }while (++comp != compE);
-    }
+      }
     , nullptr, animchar_csm_distance_ecs_query_desc.getQuant());
 }
 static constexpr ecs::ComponentDesc animchar_csm_visibility_ecs_query_comps[] =
@@ -515,9 +530,8 @@ static constexpr ecs::ComponentDesc animchar_csm_visibility_ecs_query_comps[] =
   {ECS_HASH("animchar_attaches_bbox"), ecs::ComponentTypeInfo<bbox3f>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar_render__shadow_cast_dist"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("attaches_list"), ecs::ComponentTypeInfo<ecs::EidList>(), ecs::CDF_OPTIONAL},
-  {ECS_HASH("animchar_attach__attachedTo"), ecs::ComponentTypeInfo<ecs::EntityId>(), ecs::CDF_OPTIONAL},
-//start of 2 no components at [6]
-  {ECS_HASH("attachedToParent"), ecs::ComponentTypeInfo<ecs::Tag>()},
+  {ECS_HASH("animchar_attach__isAttached"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
+//start of 1 no components at [6]
   {ECS_HASH("cockpitEntity"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc animchar_csm_visibility_ecs_query_desc
@@ -526,27 +540,28 @@ static ecs::CompileTimeQueryDesc animchar_csm_visibility_ecs_query_desc
   make_span(animchar_csm_visibility_ecs_query_comps+0, 1)/*rw*/,
   make_span(animchar_csm_visibility_ecs_query_comps+1, 5)/*ro*/,
   empty_span(),
-  make_span(animchar_csm_visibility_ecs_query_comps+6, 2)/*no*/
+  make_span(animchar_csm_visibility_ecs_query_comps+6, 1)/*no*/
   , 50);
 template<typename Callable>
-inline void animchar_csm_visibility_ecs_query(Callable function)
+inline void animchar_csm_visibility_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, animchar_csm_visibility_ecs_query_desc.getHandle(),
+  perform_query(&manager, animchar_csm_visibility_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
         {
+          if ( !(!ECS_RO_COMP_OR(animchar_csm_visibility_ecs_query_comps, "animchar_attach__isAttached", bool( false))) )
+            continue;
           function(
               ECS_RW_COMP(animchar_csm_visibility_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
             , ECS_RO_COMP(animchar_csm_visibility_ecs_query_comps, "animchar_bbox", bbox3f)
             , ECS_RO_COMP_PTR(animchar_csm_visibility_ecs_query_comps, "animchar_attaches_bbox", bbox3f)
             , ECS_RO_COMP(animchar_csm_visibility_ecs_query_comps, "animchar_render__shadow_cast_dist", float)
             , ECS_RO_COMP_PTR(animchar_csm_visibility_ecs_query_comps, "attaches_list", ecs::EidList)
-            , ECS_RO_COMP_PTR(animchar_csm_visibility_ecs_query_comps, "animchar_attach__attachedTo", ecs::EntityId)
             );
 
         }while (++comp != compE);
-    }
+      }
     , nullptr, animchar_csm_visibility_ecs_query_desc.getQuant());
 }
 static constexpr ecs::ComponentDesc animchar_attaches_inherit_visibility_ecs_query_comps[] =
@@ -562,9 +577,9 @@ static ecs::CompileTimeQueryDesc animchar_attaches_inherit_visibility_ecs_query_
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void animchar_attaches_inherit_visibility_ecs_query(ecs::EntityId eid, Callable function)
+inline void animchar_attaches_inherit_visibility_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, animchar_attaches_inherit_visibility_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, animchar_attaches_inherit_visibility_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -585,7 +600,7 @@ static constexpr ecs::ComponentDesc draw_shadow_occlusion_boxes_ecs_query_comps[
 //start of 3 ro components at [2]
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
   {ECS_HASH("animchar_attaches_bbox"), ecs::ComponentTypeInfo<bbox3f>(), ecs::CDF_OPTIONAL},
-  {ECS_HASH("animchar_attach__attachedTo"), ecs::ComponentTypeInfo<ecs::EntityId>(), ecs::CDF_OPTIONAL}
+  {ECS_HASH("animchar_attach__isAttached"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL}
 };
 static ecs::CompileTimeQueryDesc draw_shadow_occlusion_boxes_ecs_query_desc
 (
@@ -595,30 +610,31 @@ static ecs::CompileTimeQueryDesc draw_shadow_occlusion_boxes_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void draw_shadow_occlusion_boxes_ecs_query(Callable function)
+inline void draw_shadow_occlusion_boxes_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, draw_shadow_occlusion_boxes_ecs_query_desc.getHandle(),
+  perform_query(&manager, draw_shadow_occlusion_boxes_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
         {
+          if ( !(!ECS_RO_COMP_OR(draw_shadow_occlusion_boxes_ecs_query_comps, "animchar_attach__isAttached", bool( false))) )
+            continue;
           function(
               ECS_RO_COMP(draw_shadow_occlusion_boxes_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
             , ECS_RW_COMP(draw_shadow_occlusion_boxes_ecs_query_comps, "animchar_bbox", bbox3f)
             , ECS_RW_COMP(draw_shadow_occlusion_boxes_ecs_query_comps, "animchar_render__shadow_cast_dist", float)
             , ECS_RO_COMP_PTR(draw_shadow_occlusion_boxes_ecs_query_comps, "animchar_attaches_bbox", bbox3f)
-            , ECS_RO_COMP_PTR(draw_shadow_occlusion_boxes_ecs_query_comps, "animchar_attach__attachedTo", ecs::EntityId)
             );
 
         }while (++comp != compE);
-    }
+      }
   );
 }
 static constexpr ecs::ComponentDesc gather_animchar_async_ecs_query_comps[] =
 {
 //start of 1 rw components at [0]
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
-//start of 10 ro components at [1]
+//start of 9 ro components at [1]
   {ECS_HASH("eid"), ecs::ComponentTypeInfo<ecs::EntityId>()},
   {ECS_HASH("invisibleUpdatableAnimchar"), ecs::ComponentTypeInfo<ecs::Tag>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar_bsph"), ecs::ComponentTypeInfo<vec4f>()},
@@ -628,21 +644,20 @@ static constexpr ecs::ComponentDesc gather_animchar_async_ecs_query_comps[] =
   {ECS_HASH("additional_data"), ecs::ComponentTypeInfo<ecs::Point4List>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar_render__nodeVisibleStgFilters"), ecs::ComponentTypeInfo<ecs::UInt8List>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar__renderPriority"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-  {ECS_HASH("needImmediateConstPS"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-//start of 1 no components at [11]
-  {ECS_HASH("semi_transparent__placingColor"), ecs::ComponentTypeInfo<Point3>()}
+//start of 1 no components at [10]
+  {ECS_HASH("excludeFromAnimcharRender"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc gather_animchar_async_ecs_query_desc
 (
   "gather_animchar_async_ecs_query",
   make_span(gather_animchar_async_ecs_query_comps+0, 1)/*rw*/,
-  make_span(gather_animchar_async_ecs_query_comps+1, 10)/*ro*/,
+  make_span(gather_animchar_async_ecs_query_comps+1, 9)/*ro*/,
   empty_span(),
-  make_span(gather_animchar_async_ecs_query_comps+11, 1)/*no*/);
+  make_span(gather_animchar_async_ecs_query_comps+10, 1)/*no*/);
 template<typename Callable>
-inline void gather_animchar_async_ecs_query(Callable function)
+inline void gather_animchar_async_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gather_animchar_async_ecs_query_desc.getHandle(),
+  perform_query(&manager, gather_animchar_async_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -658,7 +673,6 @@ inline void gather_animchar_async_ecs_query(Callable function)
             , ECS_RO_COMP_PTR(gather_animchar_async_ecs_query_comps, "additional_data", ecs::Point4List)
             , ECS_RO_COMP_PTR(gather_animchar_async_ecs_query_comps, "animchar_render__nodeVisibleStgFilters", ecs::UInt8List)
             , ECS_RO_COMP_OR(gather_animchar_async_ecs_query_comps, "animchar__renderPriority", bool(false))
-            , ECS_RO_COMP_OR(gather_animchar_async_ecs_query_comps, "needImmediateConstPS", bool(false))
             );
 
         }while (++comp != compE);
@@ -669,7 +683,7 @@ static constexpr ecs::ComponentDesc find_animchar_single_ecs_query_comps[] =
 {
 //start of 1 rw components at [0]
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
-//start of 9 ro components at [1]
+//start of 8 ro components at [1]
   {ECS_HASH("animchar_bsph"), ecs::ComponentTypeInfo<vec4f>()},
   {ECS_HASH("animchar_bbox"), ecs::ComponentTypeInfo<bbox3f>()},
   {ECS_HASH("animchar_attaches_bbox"), ecs::ComponentTypeInfo<bbox3f>(), ecs::CDF_OPTIONAL},
@@ -678,21 +692,20 @@ static constexpr ecs::ComponentDesc find_animchar_single_ecs_query_comps[] =
   {ECS_HASH("animchar_render__nodeVisibleStgFilters"), ecs::ComponentTypeInfo<ecs::UInt8List>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("invisibleUpdatableAnimchar"), ecs::ComponentTypeInfo<ecs::Tag>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar__renderPriority"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-  {ECS_HASH("needImmediateConstPS"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-//start of 1 no components at [10]
-  {ECS_HASH("semi_transparent__placingColor"), ecs::ComponentTypeInfo<Point3>()}
+//start of 1 no components at [9]
+  {ECS_HASH("excludeFromAnimcharRender"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc find_animchar_single_ecs_query_desc
 (
   "find_animchar_single_ecs_query",
   make_span(find_animchar_single_ecs_query_comps+0, 1)/*rw*/,
-  make_span(find_animchar_single_ecs_query_comps+1, 9)/*ro*/,
+  make_span(find_animchar_single_ecs_query_comps+1, 8)/*ro*/,
   empty_span(),
-  make_span(find_animchar_single_ecs_query_comps+10, 1)/*no*/);
+  make_span(find_animchar_single_ecs_query_comps+9, 1)/*no*/);
 template<typename Callable>
-inline void find_animchar_single_ecs_query(ecs::EntityId eid, Callable function)
+inline void find_animchar_single_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, find_animchar_single_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, find_animchar_single_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -707,7 +720,6 @@ inline void find_animchar_single_ecs_query(ecs::EntityId eid, Callable function)
             , ECS_RO_COMP_PTR(find_animchar_single_ecs_query_comps, "animchar_render__nodeVisibleStgFilters", ecs::UInt8List)
             , ECS_RO_COMP_PTR(find_animchar_single_ecs_query_comps, "invisibleUpdatableAnimchar", ecs::Tag)
             , ECS_RO_COMP_OR(find_animchar_single_ecs_query_comps, "animchar__renderPriority", bool(false))
-            , ECS_RO_COMP_OR(find_animchar_single_ecs_query_comps, "needImmediateConstPS", bool(false))
             );
 
         }
@@ -718,7 +730,7 @@ static constexpr ecs::ComponentDesc gather_animchar_ecs_query_comps[] =
 {
 //start of 1 rw components at [0]
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
-//start of 9 ro components at [1]
+//start of 8 ro components at [1]
   {ECS_HASH("animchar_bsph"), ecs::ComponentTypeInfo<vec4f>()},
   {ECS_HASH("animchar_bbox"), ecs::ComponentTypeInfo<bbox3f>()},
   {ECS_HASH("animchar_attaches_bbox"), ecs::ComponentTypeInfo<bbox3f>(), ecs::CDF_OPTIONAL},
@@ -727,21 +739,20 @@ static constexpr ecs::ComponentDesc gather_animchar_ecs_query_comps[] =
   {ECS_HASH("animchar_render__nodeVisibleStgFilters"), ecs::ComponentTypeInfo<ecs::UInt8List>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("invisibleUpdatableAnimchar"), ecs::ComponentTypeInfo<ecs::Tag>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar__renderPriority"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-  {ECS_HASH("needImmediateConstPS"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-//start of 1 no components at [10]
-  {ECS_HASH("semi_transparent__placingColor"), ecs::ComponentTypeInfo<Point3>()}
+//start of 1 no components at [9]
+  {ECS_HASH("excludeFromAnimcharRender"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc gather_animchar_ecs_query_desc
 (
   "gather_animchar_ecs_query",
   make_span(gather_animchar_ecs_query_comps+0, 1)/*rw*/,
-  make_span(gather_animchar_ecs_query_comps+1, 9)/*ro*/,
+  make_span(gather_animchar_ecs_query_comps+1, 8)/*ro*/,
   empty_span(),
-  make_span(gather_animchar_ecs_query_comps+10, 1)/*no*/);
+  make_span(gather_animchar_ecs_query_comps+9, 1)/*no*/);
 template<typename Callable>
-inline void gather_animchar_ecs_query(Callable function)
+inline void gather_animchar_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gather_animchar_ecs_query_desc.getHandle(),
+  perform_query(&manager, gather_animchar_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -756,7 +767,6 @@ inline void gather_animchar_ecs_query(Callable function)
             , ECS_RO_COMP_PTR(gather_animchar_ecs_query_comps, "animchar_render__nodeVisibleStgFilters", ecs::UInt8List)
             , ECS_RO_COMP_PTR(gather_animchar_ecs_query_comps, "invisibleUpdatableAnimchar", ecs::Tag)
             , ECS_RO_COMP_OR(gather_animchar_ecs_query_comps, "animchar__renderPriority", bool(false))
-            , ECS_RO_COMP_OR(gather_animchar_ecs_query_comps, "needImmediateConstPS", bool(false))
             );
 
         }while (++comp != compE);
@@ -765,12 +775,11 @@ inline void gather_animchar_ecs_query(Callable function)
 }
 static constexpr ecs::ComponentDesc gather_animchar_vehicle_cockpit_ecs_query_comps[] =
 {
-//start of 4 ro components at [0]
+//start of 3 ro components at [0]
   {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
   {ECS_HASH("additional_data"), ecs::ComponentTypeInfo<ecs::Point4List>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
-  {ECS_HASH("needImmediateConstPS"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-//start of 2 rq components at [4]
+//start of 2 rq components at [3]
   {ECS_HASH("cockpit__vehicleEid"), ecs::ComponentTypeInfo<ecs::EntityId>()},
   {ECS_HASH("cockpitEntity"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
@@ -778,13 +787,13 @@ static ecs::CompileTimeQueryDesc gather_animchar_vehicle_cockpit_ecs_query_desc
 (
   "gather_animchar_vehicle_cockpit_ecs_query",
   empty_span(),
-  make_span(gather_animchar_vehicle_cockpit_ecs_query_comps+0, 4)/*ro*/,
-  make_span(gather_animchar_vehicle_cockpit_ecs_query_comps+4, 2)/*rq*/,
+  make_span(gather_animchar_vehicle_cockpit_ecs_query_comps+0, 3)/*ro*/,
+  make_span(gather_animchar_vehicle_cockpit_ecs_query_comps+3, 2)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void gather_animchar_vehicle_cockpit_ecs_query(Callable function)
+inline void gather_animchar_vehicle_cockpit_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gather_animchar_vehicle_cockpit_ecs_query_desc.getHandle(),
+  perform_query(&manager, gather_animchar_vehicle_cockpit_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -793,7 +802,6 @@ inline void gather_animchar_vehicle_cockpit_ecs_query(Callable function)
               ECS_RO_COMP(gather_animchar_vehicle_cockpit_ecs_query_comps, "animchar_render", AnimV20::AnimcharRendComponent)
             , ECS_RO_COMP_PTR(gather_animchar_vehicle_cockpit_ecs_query_comps, "additional_data", ecs::Point4List)
             , ECS_RO_COMP(gather_animchar_vehicle_cockpit_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
-            , ECS_RO_COMP_OR(gather_animchar_vehicle_cockpit_ecs_query_comps, "needImmediateConstPS", bool(false))
             );
 
         }while (++comp != compE);
@@ -812,7 +820,7 @@ static constexpr ecs::ComponentDesc render_animchar_hmap_deform_ecs_query_comps[
   {ECS_HASH("vehicle_trails__nodesFilter"), ecs::ComponentTypeInfo<ecs::UInt8List>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("render_to_hmap_deform_in_crawling_fps_mode"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
 //start of 2 no components at [7]
-  {ECS_HASH("semi_transparent__placingColor"), ecs::ComponentTypeInfo<Point3>()},
+  {ECS_HASH("excludeFromAnimcharRender"), ecs::ComponentTypeInfo<ecs::Tag>()},
   {ECS_HASH("invisibleUpdatableAnimchar"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc render_animchar_hmap_deform_ecs_query_desc
@@ -823,9 +831,9 @@ static ecs::CompileTimeQueryDesc render_animchar_hmap_deform_ecs_query_desc
   empty_span(),
   make_span(render_animchar_hmap_deform_ecs_query_comps+7, 2)/*no*/);
 template<typename Callable>
-inline void render_animchar_hmap_deform_ecs_query(Callable function)
+inline void render_animchar_hmap_deform_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, render_animchar_hmap_deform_ecs_query_desc.getHandle(),
+  perform_query(&manager, render_animchar_hmap_deform_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -848,31 +856,33 @@ static constexpr ecs::ComponentDesc animchar_render_trans_first_ecs_query_comps[
 {
 //start of 1 rw components at [0]
   {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
-//start of 2 ro components at [1]
+//start of 3 ro components at [1]
+  {ECS_HASH("additional_data"), ecs::ComponentTypeInfo<ecs::Point4List>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
   {ECS_HASH("animchar_render__nodeVisibleStgFilters"), ecs::ComponentTypeInfo<ecs::UInt8List>(), ecs::CDF_OPTIONAL},
-//start of 1 rq components at [3]
+//start of 1 rq components at [4]
   {ECS_HASH("requires_trans_render"), ecs::ComponentTypeInfo<ecs::Tag>()},
-//start of 1 no components at [4]
+//start of 1 no components at [5]
   {ECS_HASH("late_transparent_render"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc animchar_render_trans_first_ecs_query_desc
 (
   "animchar_render_trans_first_ecs_query",
   make_span(animchar_render_trans_first_ecs_query_comps+0, 1)/*rw*/,
-  make_span(animchar_render_trans_first_ecs_query_comps+1, 2)/*ro*/,
-  make_span(animchar_render_trans_first_ecs_query_comps+3, 1)/*rq*/,
-  make_span(animchar_render_trans_first_ecs_query_comps+4, 1)/*no*/);
+  make_span(animchar_render_trans_first_ecs_query_comps+1, 3)/*ro*/,
+  make_span(animchar_render_trans_first_ecs_query_comps+4, 1)/*rq*/,
+  make_span(animchar_render_trans_first_ecs_query_comps+5, 1)/*no*/);
 template<typename Callable>
-inline void animchar_render_trans_first_ecs_query(Callable function)
+inline void animchar_render_trans_first_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, animchar_render_trans_first_ecs_query_desc.getHandle(),
+  perform_query(&manager, animchar_render_trans_first_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
         {
           function(
               ECS_RW_COMP(animchar_render_trans_first_ecs_query_comps, "animchar_render", AnimV20::AnimcharRendComponent)
+            , ECS_RO_COMP_PTR(animchar_render_trans_first_ecs_query_comps, "additional_data", ecs::Point4List)
             , ECS_RO_COMP(animchar_render_trans_first_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
             , ECS_RO_COMP_PTR(animchar_render_trans_first_ecs_query_comps, "animchar_render__nodeVisibleStgFilters", ecs::UInt8List)
             );
@@ -899,9 +909,9 @@ static ecs::CompileTimeQueryDesc animchar_render_distortion_ecs_query_desc
   make_span(animchar_render_distortion_ecs_query_comps+3, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void animchar_render_distortion_ecs_query(Callable function)
+inline void animchar_render_distortion_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, animchar_render_distortion_ecs_query_desc.getHandle(),
+  perform_query(&manager, animchar_render_distortion_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -931,9 +941,9 @@ static ecs::CompileTimeQueryDesc animchar_render_find_any_visible_distortion_ecs
   make_span(animchar_render_find_any_visible_distortion_ecs_query_comps+1, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline ecs::QueryCbResult animchar_render_find_any_visible_distortion_ecs_query(Callable function)
+inline ecs::QueryCbResult animchar_render_find_any_visible_distortion_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  return perform_query(g_entity_mgr, animchar_render_find_any_visible_distortion_ecs_query_desc.getHandle(),
+  return perform_query(&manager, animchar_render_find_any_visible_distortion_ecs_query_desc.getHandle(),
     ecs::stoppable_query_cb_t([&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -951,31 +961,35 @@ static constexpr ecs::ComponentDesc animchar_render_trans_second_ecs_query_comps
 {
 //start of 1 rw components at [0]
   {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
-//start of 2 ro components at [1]
+//start of 4 ro components at [1]
+  {ECS_HASH("additional_data"), ecs::ComponentTypeInfo<ecs::Point4List>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
   {ECS_HASH("animchar_render__nodeVisibleStgFilters"), ecs::ComponentTypeInfo<ecs::UInt8List>(), ecs::CDF_OPTIONAL},
-//start of 1 rq components at [3]
+  {ECS_HASH("watchedPlayerItem"), ecs::ComponentTypeInfo<ecs::Tag>(), ecs::CDF_OPTIONAL},
+//start of 1 rq components at [5]
   {ECS_HASH("late_transparent_render"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc animchar_render_trans_second_ecs_query_desc
 (
   "animchar_render_trans_second_ecs_query",
   make_span(animchar_render_trans_second_ecs_query_comps+0, 1)/*rw*/,
-  make_span(animchar_render_trans_second_ecs_query_comps+1, 2)/*ro*/,
-  make_span(animchar_render_trans_second_ecs_query_comps+3, 1)/*rq*/,
+  make_span(animchar_render_trans_second_ecs_query_comps+1, 4)/*ro*/,
+  make_span(animchar_render_trans_second_ecs_query_comps+5, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void animchar_render_trans_second_ecs_query(Callable function)
+inline void animchar_render_trans_second_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, animchar_render_trans_second_ecs_query_desc.getHandle(),
+  perform_query(&manager, animchar_render_trans_second_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
         {
           function(
               ECS_RW_COMP(animchar_render_trans_second_ecs_query_comps, "animchar_render", AnimV20::AnimcharRendComponent)
+            , ECS_RO_COMP_PTR(animchar_render_trans_second_ecs_query_comps, "additional_data", ecs::Point4List)
             , ECS_RO_COMP(animchar_render_trans_second_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
             , ECS_RO_COMP_PTR(animchar_render_trans_second_ecs_query_comps, "animchar_render__nodeVisibleStgFilters", ecs::UInt8List)
+            , ECS_RO_COMP_PTR(animchar_render_trans_second_ecs_query_comps, "watchedPlayerItem", ecs::Tag)
             );
 
         }while (++comp != compE);
@@ -995,9 +1009,9 @@ static ecs::CompileTimeQueryDesc mark_animchar_for_reactive_mask_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void mark_animchar_for_reactive_mask_ecs_query(ecs::EntityId eid, Callable function)
+inline void mark_animchar_for_reactive_mask_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, mark_animchar_for_reactive_mask_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, mark_animchar_for_reactive_mask_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -1024,9 +1038,9 @@ static ecs::CompileTimeQueryDesc get_animchars_with_moved_decals_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_animchars_with_moved_decals_ecs_query(Callable function)
+inline void get_animchars_with_moved_decals_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_animchars_with_moved_decals_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_animchars_with_moved_decals_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -1034,66 +1048,6 @@ inline void get_animchars_with_moved_decals_ecs_query(Callable function)
           function(
               ECS_RO_COMP(get_animchars_with_moved_decals_ecs_query_comps, "needsRenderToReactiveMask", int)
             , ECS_RO_COMP(get_animchars_with_moved_decals_ecs_query_comps, "eid", ecs::EntityId)
-            );
-
-        }while (++comp != compE);
-    }
-  );
-}
-static constexpr ecs::ComponentDesc count_animchar_renderer_ecs_query_comps[] =
-{
-//start of 2 ro components at [0]
-  {ECS_HASH("animchar__res"), ecs::ComponentTypeInfo<ecs::string>()},
-  {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()}
-};
-static ecs::CompileTimeQueryDesc count_animchar_renderer_ecs_query_desc
-(
-  "count_animchar_renderer_ecs_query",
-  empty_span(),
-  make_span(count_animchar_renderer_ecs_query_comps+0, 2)/*ro*/,
-  empty_span(),
-  empty_span());
-template<typename Callable>
-inline void count_animchar_renderer_ecs_query(Callable function)
-{
-  perform_query(g_entity_mgr, count_animchar_renderer_ecs_query_desc.getHandle(),
-    [&function](const ecs::QueryView& __restrict components)
-    {
-        auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
-        {
-          function(
-              ECS_RO_COMP(count_animchar_renderer_ecs_query_comps, "animchar__res", ecs::string)
-            , ECS_RO_COMP(count_animchar_renderer_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
-            );
-
-        }while (++comp != compE);
-    }
-  );
-}
-static constexpr ecs::ComponentDesc gather_animchar_renderer_ecs_query_comps[] =
-{
-//start of 2 ro components at [0]
-  {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
-  {ECS_HASH("animchar__res"), ecs::ComponentTypeInfo<ecs::string>()}
-};
-static ecs::CompileTimeQueryDesc gather_animchar_renderer_ecs_query_desc
-(
-  "gather_animchar_renderer_ecs_query",
-  empty_span(),
-  make_span(gather_animchar_renderer_ecs_query_comps+0, 2)/*ro*/,
-  empty_span(),
-  empty_span());
-template<typename Callable>
-inline void gather_animchar_renderer_ecs_query(Callable function)
-{
-  perform_query(g_entity_mgr, gather_animchar_renderer_ecs_query_desc.getHandle(),
-    [&function](const ecs::QueryView& __restrict components)
-    {
-        auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
-        {
-          function(
-              ECS_RO_COMP(gather_animchar_renderer_ecs_query_comps, "animchar_render", AnimV20::AnimcharRendComponent)
-            , ECS_RO_COMP(gather_animchar_renderer_ecs_query_comps, "animchar__res", ecs::string)
             );
 
         }while (++comp != compE);

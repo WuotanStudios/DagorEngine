@@ -5,7 +5,9 @@
 #include <daECS/net/network.h>
 #include <daECS/net/network.h>
 #include "net/netPrivate.h"
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include "net/time.h"
 #include <daECS/net/netEvents.h>
 
@@ -16,7 +18,7 @@ class SqModules;
 namespace dedicated
 {
 
-#if _TARGET_PC
+#if !DAGOR_HOSTED_INTERNAL_SERVER && _TARGET_PC
 bool is_dedicated() { return false; }
 #endif
 void init() {}
@@ -25,7 +27,7 @@ void shutdown() {}
 String setup_log() { return String(); }
 bool init_statsd(const char *) { return false; }
 void statsd_report_ctrl_ploss(ControlsPlossCalc &, uint16_t &, uint16_t) {}
-net::INetDriver *create_listen_net_driver() { return nullptr; }
+net::INetDriver *create_listen_net_driver(const char *, int, bool) { return nullptr; }
 uint16_t get_binded_port() { return 0; }
 net::msg_handler_t get_clientinfo_msg_handler() { return NULL; }
 net::msg_handler_t get_sync_vroms_done_msg_handler() { return NULL; }
@@ -36,6 +38,11 @@ bool is_dynamic_tickrate_enabled() { return false; };
 size_t number_of_tickrate_changes = 0;
 
 } // namespace dedicated
+
+namespace dedicated_matching
+{
+void notify_network_is_up() {}
+} // namespace dedicated_matching
 
 void pull_dedicated_das() {}
 

@@ -46,24 +46,24 @@ public:
     addBuiltinDependency(lib, require("DagorMath"));
     addBuiltinDependency(lib, require("DagorResPtr"), true);
     addBuiltinDependency(lib, require("DagorDriver3D"));
-    addEnumeration(das::make_smart<EnumerationSHVT>());
-    addAnnotation(das::make_smart<ShaderVarAnnotation>(lib));
-    addAnnotation(das::make_smart<ShaderMaterialAnnotation>(lib));
-    addAnnotation(das::make_smart<ShaderMaterialPtrAnnotation>(lib));
+    addEnumeration(new EnumerationSHVT());
+    addAnnotation(new ShaderVarAnnotation(lib));
+    addAnnotation(new ShaderMaterialAnnotation(lib));
+    addAnnotation(new ShaderMaterialPtrAnnotation(lib));
 
 
     das::addExtern<DAS_BIND_FUN(my_get_var_type)>(*this, lib, "get_var_type", das::SideEffects::modifyExternal,
       "::bind_dascript::my_get_var_type");
     das::addExtern<DAS_BIND_FUN(get_shader_variable_id)>(*this, lib, "get_shader_variable_id", das::SideEffects::modifyExternal,
       "get_shader_variable_id")
-      ->arg_init(/*is_optional*/ 1, das::make_smart<das::ExprConstBool>(false));
+      ->arg_init(/*is_optional*/ 1, new das::ExprConstBool(false));
     das::addExtern<bool (*)(int, int), set_int>(*this, lib, "set_int", das::SideEffects::modifyExternal, "::ShaderGlobal::set_int");
     das::addExtern<bool (*)(int, const IPoint4 &), set_int4>(*this, lib, "set_int4", das::SideEffects::modifyExternal,
       "::ShaderGlobal::set_int4");
     das::addExtern<bool (*)(int, const TMatrix4 &), set_float4x4>(*this, lib, "set_float4x4", das::SideEffects::modifyExternal,
       "::ShaderGlobal::set_float4x4");
-    das::addExtern<bool (*)(int, float), set_real>(*this, lib, "set_real", das::SideEffects::modifyExternal,
-      "::ShaderGlobal::set_real");
+    das::addExtern<bool (*)(int, float), set_float>(*this, lib, "set_float", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::set_float");
     das::addExtern<bool (*)(int, D3DRESID), set_texture>(*this, lib, "set_texture", das::SideEffects::modifyExternal,
       "::ShaderGlobal::set_texture");
     das::addExtern<bool (*)(int, D3DRESID), set_buffer>(*this, lib, "set_buffer", das::SideEffects::modifyExternal,
@@ -74,28 +74,32 @@ public:
       "::ShaderGlobal::set_buffer");
     das::addExtern<bool (*)(int, d3d::SamplerHandle), set_sampler>(*this, lib, "set_sampler", das::SideEffects::modifyExternal,
       "::ShaderGlobal::set_sampler");
-    das::addExtern<DAS_BIND_FUN(set_color4)>(*this, lib, "set_color4", das::SideEffects::modifyExternal, "::ShaderGlobal::set_color4");
-    das::addExtern<DAS_BIND_FUN(set_color4_e3d)>(*this, lib, "set_color4", das::SideEffects::modifyExternal,
-      "::ShaderGlobal::set_color4");
-    das::addExtern<DAS_BIND_FUN(set_color4_p4)>(*this, lib, "set_color4", das::SideEffects::modifyExternal,
-      "::ShaderGlobal::set_color4");
-    das::addExtern<DAS_BIND_FUN(set_color4_p3)>(*this, lib, "set_color4", das::SideEffects::modifyExternal,
-      "::ShaderGlobal::set_color4");
-    das::addExtern<DAS_BIND_FUN(set_color4_p3f)>(*this, lib, "set_color4", das::SideEffects::modifyExternal,
-      "::ShaderGlobal::set_color4");
-    das::addExtern<DAS_BIND_FUN(set_color4_f4)>(*this, lib, "set_color4", das::SideEffects::modifyExternal,
-      "::ShaderGlobal::set_color4");
-    das::addExtern<DAS_BIND_FUN(set_color4_f3)>(*this, lib, "set_color4", das::SideEffects::modifyExternal,
-      "::ShaderGlobal::set_color4");
-    das::addExtern<DAS_BIND_FUN(set_color4_f2)>(*this, lib, "set_color4", das::SideEffects::modifyExternal,
-      "::ShaderGlobal::set_color4");
+    das::addExtern<DAS_BIND_FUN(set_float4)>(*this, lib, "set_float4", das::SideEffects::modifyExternal, "::ShaderGlobal::set_float4");
+    das::addExtern<DAS_BIND_FUN(set_float4_e3d)>(*this, lib, "set_float4", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::set_float4");
+    das::addExtern<DAS_BIND_FUN(set_float4_p4)>(*this, lib, "set_float4", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::set_float4");
+    das::addExtern<DAS_BIND_FUN(set_float4_p3)>(*this, lib, "set_float4", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::set_float4");
+    das::addExtern<DAS_BIND_FUN(set_float4_p3f)>(*this, lib, "set_float4", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::set_float4");
+    das::addExtern<DAS_BIND_FUN(set_float4_f4)>(*this, lib, "set_float4", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::set_float4");
+    das::addExtern<DAS_BIND_FUN(set_float4_f3)>(*this, lib, "set_float4", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::set_float4");
+    das::addExtern<DAS_BIND_FUN(set_float4_f2)>(*this, lib, "set_float4", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::set_float4");
 
     das::addExtern<int (*)(int), get_int>(*this, lib, "get_int", das::SideEffects::modifyExternal, "::ShaderGlobal::get_int");
-    das::addExtern<float (*)(int), get_real>(*this, lib, "get_real", das::SideEffects::modifyExternal, "::ShaderGlobal::get_real");
-    das::addExtern<Color4 (*)(int), get_color4, das::SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "get_color4",
-      das::SideEffects::modifyExternal, "::ShaderGlobal::get_color4");
+    das::addExtern<float (*)(int), get_float>(*this, lib, "get_float", das::SideEffects::modifyExternal, "::ShaderGlobal::get_float");
+    das::addExtern<Color4 (*)(int), get_float4, das::SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "get_float4",
+      das::SideEffects::modifyExternal, "::ShaderGlobal::get_float4");
     das::addExtern<DAS_BIND_FUN(get_tex)>(*this, lib, "get_tex", das::SideEffects::modifyExternal, "::ShaderGlobal::get_tex");
+    das::addExtern<DAS_BIND_FUN(get_tex_ptr)>(*this, lib, "get_tex_ptr", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::get_tex_ptr");
     das::addExtern<DAS_BIND_FUN(get_buf)>(*this, lib, "get_buf", das::SideEffects::modifyExternal, "::ShaderGlobal::get_buf");
+    das::addExtern<DAS_BIND_FUN(get_buf_ptr)>(*this, lib, "get_buf_ptr", das::SideEffects::modifyExternal,
+      "::ShaderGlobal::get_buf_ptr");
     das::addExtern<DAS_BIND_FUN(get_shader_global_time_phase)>(*this, lib, "get_shader_global_time_phase",
       das::SideEffects::accessExternal, "::get_shader_global_time_phase");
     das::addExtern<DAS_BIND_FUN(get_slot_by_name)>(*this, lib, "get_slot_by_name", das::SideEffects::modifyExternal,
@@ -104,12 +108,12 @@ public:
     das::addExtern<DAS_BIND_FUN(ShaderGlobal::getBlockId)>(*this, lib, "getBlockId", das::SideEffects::accessExternal,
       "ShaderGlobal::getBlockId")
       ->args({"block_name", "layer"})
-      ->arg_init(1, das::make_smart<das::ExprConstInt>(-1));
+      ->arg_init(1, new das::ExprConstInt(-1));
 
     das::addExtern<DAS_BIND_FUN(ShaderGlobal::setBlock)>(*this, lib, "setBlock", das::SideEffects::accessExternal,
       "ShaderGlobal::setBlock")
       ->args({"block_id", "layer", "invalidate_cached_stblk"})
-      ->arg_init(2, das::make_smart<das::ExprConstBool>(true));
+      ->arg_init(2, new das::ExprConstBool(true));
 
     das::addExtern<DAS_BIND_FUN(exec_with_shader_blocks_scope_reset)>(*this, lib, "exec_with_shader_blocks_scope_reset",
       das::SideEffects::modifyExternal, "::bind_dascript::exec_with_shader_blocks_scope_reset");
@@ -117,7 +121,6 @@ public:
     das::addConstant<int>(*this, "LAYER_FRAME", ShaderGlobal::LAYER_FRAME);
     das::addConstant<int>(*this, "LAYER_SCENE", ShaderGlobal::LAYER_SCENE);
     das::addConstant<int>(*this, "LAYER_OBJECT", ShaderGlobal::LAYER_OBJECT);
-    das::addConstant<int>(*this, "LAYER_GLOBAL_CONST", ShaderGlobal::LAYER_GLOBAL_CONST);
 
 #define ADD_METHOD(name, side_effects)                         \
   using method_##name = DAS_CALL_MEMBER(ShaderMaterial::name); \

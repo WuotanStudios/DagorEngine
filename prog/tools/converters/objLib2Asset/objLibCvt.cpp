@@ -24,7 +24,7 @@ void __cdecl ctrl_break_handler(int) { quit_game(0); }
 static void print_title()
 {
   printf("Object Library to Asset converter\n"
-         "Copyright (C) Gaijin Games KFT, 2023\n\n");
+         "Copyright (C) Gaijin Games KFT, 2026\n\n");
 }
 
 static int getLastSmbPos(const char *str, const char *smbs)
@@ -148,6 +148,7 @@ static void copyFile(const char *src_name, const char *dst_path, const char *des
     pos -= slashPos + 1;
     char *name = new char[pos + 1];
     strncpy(name, &src_name[slashPos + 1], pos);
+    name[pos] = '\0';
 
     int id = 0;
     int filesCnt = 0;

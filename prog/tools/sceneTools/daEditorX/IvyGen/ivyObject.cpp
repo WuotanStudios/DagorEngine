@@ -336,8 +336,8 @@ void IvyObject::fillProps(PropPanel::ContainerPropertyControl &panel, DClassID f
     grp = panel.createGroup(PID_GEOM_GRP, "Geometry");
 
     PropPanel::ContainerPropertyControl *gtRadio = grp->createRadioGroup(PID_GEN_TYPE, "Geometry type:");
-    gtRadio->createRadio(PID_GEN_TYPE + GEOM_TYPE_PRISM, "prism");
-    gtRadio->createRadio(PID_GEN_TYPE + GEOM_TYPE_BILLBOARDS, "billboards");
+    gtRadio->createRadio(PID_GEN_TYPE + eastl::to_underlying(GEOM_TYPE_PRISM), "prism");
+    gtRadio->createRadio(PID_GEN_TYPE + eastl::to_underlying(GEOM_TYPE_BILLBOARDS), "billboards");
     grp->setInt(PID_GEN_TYPE, PID_GEN_TYPE + genGeomType);
 
     grp->createIndent();
@@ -691,9 +691,13 @@ void IvyObject::putMoveUndo()
       if (v)
         v->reGrow();
     }
+
+    // Its own key, or it shares UndoMove's and folds into the one a rotate or scale puts for the same
+    // object, which would drop the reGrow() above.
+    UNDO_MERGE_SNAPSHOT_BY_TARGET(0x17DBAF59u, obj.get()) // ReGrowUndo
   };
 
-  getObjEditor()->getUndoSystem()->put(new ReGrowUndo(this));
+  getObjEditor()->getUndoSystem()->put<ReGrowUndo>(this);
 }
 
 

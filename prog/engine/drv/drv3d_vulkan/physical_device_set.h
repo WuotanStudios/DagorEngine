@@ -5,6 +5,7 @@
 #include <ioSys/dag_dataBlock.h>
 #include <ska_hash_map/flat_hash_map2.hpp>
 #include <drv/3d/dag_decl.h>
+#include <drv/3d/dag_driverDesc.h>
 
 #include "vulkan_device.h"
 #include "vulkan_instance.h"
@@ -13,7 +14,7 @@
 
 namespace drv3d_vulkan
 {
-struct PhysicalDeviceSet
+struct PhysicalDeviceSet // -V553
 {
   VulkanPhysicalDeviceHandle device;
   VkPhysicalDeviceFeatures features{};
@@ -32,6 +33,11 @@ struct PhysicalDeviceSet
 #if VK_EXT_conditional_rendering
   VkPhysicalDeviceConditionalRenderingFeaturesEXT conditionalRenderingFeature = //
     {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT, nullptr, false, false};
+#endif
+
+#if VK_EXT_scalar_block_layout
+  VkPhysicalDeviceScalarBlockLayoutFeatures scalarBlockLayoutFeature = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, nullptr, false};
 #endif
 
 #if VK_EXT_memory_budget
@@ -68,6 +74,13 @@ struct PhysicalDeviceSet
     {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR, nullptr, true};
   VkPhysicalDeviceAccelerationStructurePropertiesKHR deviceAccelerationStructureProps = //
     {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR, nullptr};
+#endif
+
+#if VK_EXT_opacity_micromap
+  VkPhysicalDeviceOpacityMicromapFeaturesEXT opacityMicromapFeature = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT, nullptr, false, false, false};
+  VkPhysicalDeviceOpacityMicromapPropertiesEXT opacityMicromapProps = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT, nullptr};
 #endif
 
 #if VK_EXT_device_fault
@@ -145,15 +158,86 @@ struct PhysicalDeviceSet
     {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_FEATURES_QCOM, nullptr, false};
 #endif
 
+#if VK_AMD_anti_lag
+  VkPhysicalDeviceAntiLagFeaturesAMD antiLagFeaturesAMD = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD, nullptr, false};
+#endif
+
+#if VK_AMD_device_coherent_memory
+  VkPhysicalDeviceCoherentMemoryFeaturesAMD deviceCoherentMemoryFeaturesAMD = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD, nullptr, false};
+#endif
+
+#if VK_KHR_fragment_shader_barycentric
+  VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragmentShaderBarycentricFeaturesKHR = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR, nullptr, false};
+#endif
+
+#if VK_KHR_fragment_shading_rate
+  VkPhysicalDeviceFragmentShadingRateFeaturesKHR fragmenShadingRateFeaturesKHR = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR, nullptr, false, false, false};
+  VkPhysicalDeviceFragmentShadingRatePropertiesKHR fragmentShadingRateProps = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR, nullptr};
+#endif
+
+#if VK_KHR_maintenance7
+  VkPhysicalDeviceMaintenance7FeaturesKHR maintenance7FeaturesKHR = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR, nullptr, false};
+  VkPhysicalDeviceMaintenance7PropertiesKHR maintenance7PropsKHR = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR, nullptr};
+#endif
+
+#if VK_KHR_shader_subgroup_extended_types
+  VkPhysicalDeviceShaderSubgroupExtendedTypesFeaturesKHR shaderSubgroupExtendedTypesFeaturesKHR = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES_KHR, nullptr, false};
+#endif
+
+#if VK_KHR_vulkan_memory_model
+  VkPhysicalDeviceVulkanMemoryModelFeaturesKHR vulkanMemoryModelFeaturesKHR = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES, nullptr, false, false, false};
+#endif
+
+#if VK_KHR_shader_maximal_reconvergence
+  VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR shaderMaximalReconvergenceFeaturesKHR = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR, nullptr, false};
+#endif
+
+#if VK_KHR_shader_quad_control
+  VkPhysicalDeviceShaderQuadControlFeaturesKHR shaderQuadControlFeaturesKHR = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_QUAD_CONTROL_FEATURES_KHR, nullptr, false};
+#endif
+
+#if VK_EXT_extended_dynamic_state
+  VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extendedDynamicStateFeaturesEXT = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, nullptr, false};
+#endif
+
+#if VK_EXT_extended_dynamic_state2
+  VkPhysicalDeviceExtendedDynamicState2FeaturesEXT extendedDynamicState2FeaturesEXT = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, nullptr, false, false, false};
+#endif
+
+#if VK_EXT_extended_dynamic_state3
+  VkPhysicalDeviceExtendedDynamicState3FeaturesEXT extendedDynamicState3FeaturesEXT = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, nullptr};
+  VkPhysicalDeviceExtendedDynamicState3PropertiesEXT extendedDynamicState3PropsEXT = //
+    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT, nullptr, false};
+#endif
+
   bool hasDevProps2 = false;
 
   bool hasConditionalRender = false;
+  bool hasScalarBlockLayout = false;
   bool hasImagelessFramebuffer = false;
   bool hasDeviceMemoryReport = false;
   bool hasDeviceBufferDeviceAddress = false;
   bool hasRayTracingPipeline = false;
   bool hasRayQuery = false;
   bool hasAccelerationStructure = false;
+  bool hasOpacityMicromap = false;
+  // What the device reported, unlike hasOpacityMicromap which config may clear to keep OMM from being used at all. Read this to ask
+  // what the device implements, not whether OMM is allowed.
+  bool deviceReportsOpacityMicromap = false;
   bool hasIndirectRayTrace = false;
   bool hasRayTracePrimitiveCulling = false;
   bool hasDeviceFaultFeature = false;
@@ -173,6 +257,22 @@ struct PhysicalDeviceSet
   bool hasTilePropQCOM = false;
   bool hasTileMemoryHeapQCOM = false;
   bool hasTileShadingQCOM = false;
+  bool hasAMDAntiLag = false;
+  bool hasAMDDeviceCoherentMem = false;
+  bool hasFragmentShaderBarycentric = false;
+  bool hasPipelineFragmentShadingRate = false;
+  bool hasPrimitiveFragmentShadingRate = false;
+  bool hasAttachmentFragmentShadingRate = false;
+  bool hasMaintenance7 = false;
+  bool hasShaderSubgroupExtendedTypes = false;
+  bool hasVulkanMemoryModel = false;
+  bool hasShaderMaximalReconvergence = false;
+  bool hasShaderQuadControl = false;
+  bool hasExtendedDynamicState = false;
+  bool hasExtendedDynamicState2 = false;
+  bool hasExtendedDynamicState2LogicOp = false;
+  bool hasExtendedDynamicState2PatchControlPoints = false;
+  bool hasExtendedDynamicState3 = false;
   uint32_t maxBindlessTextures = 0;
   uint32_t maxBindlessSamplers = 0;
   uint32_t maxBindlessBuffers = 0;
@@ -181,6 +281,7 @@ struct PhysicalDeviceSet
   uint32_t raytraceMaxRecursionDepth = 0;
   uint32_t raytraceTopAccelerationInstanceElementSize = 0;
   uint32_t raytraceScratchBufferAlignment = 0;
+  uint32_t primaryDeviceLocalHeap = 0;
 #if VK_KHR_driver_properties
   VkPhysicalDeviceDriverPropertiesKHR driverProps = // init it to something safe
     {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR, nullptr, VK_DRIVER_ID_MAX_ENUM, "<unknown>", "<unknown>", {0, 0, 0, 0}};
@@ -198,10 +299,17 @@ struct PhysicalDeviceSet
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES, nullptr};
 #endif
   GpuVendor vendor = GpuVendor::UNKNOWN;
-  char vendorName[16] = {};
+  String vendorName;
   uint32_t warpSize = 32;
   uint32_t score = 0;
   uint32_t driverVersionDecoded[4] = {};
+
+  // this information may not be available as it "guessed" i.e. no common API is used to obtain it
+  struct
+  {
+    double tflops = 0;               // Peak FP32 single-precision (TFLOPS)
+    const char *uarch = "<unknown>"; // GPU micro-architecture
+  } additional;
 
   uint32_t deviceTypeScoreMultiplier()
   {
@@ -218,30 +326,31 @@ struct PhysicalDeviceSet
 
   inline void calculateScore()
   {
+    // low byte is score
+    // mid bytes is guessed tflops
+    // high bits is type
     score = 0;
 #define VULKAN_FEATURE_REQUIRE(name) \
   if (features.name == VK_FALSE)     \
     score = 0;
-#define VULKAN_FEATURE_DISABLE(name)
 #define VULKAN_FEATURE_OPTIONAL(name) \
   if (features.name == VK_TRUE)       \
     ++score;
-    VULKAN_FEATURESET_DISABLED_LIST
     VULKAN_FEATURESET_OPTIONAL_LIST
     VULKAN_FEATURESET_REQUIRED_LIST
 #undef VULKAN_FEATURE_REQUIRE
-#undef VULKAN_FEATURE_DISABLE
 #undef VULKAN_FEATURE_OPTIONAL
-    // score <<= 24;
-    // TODO: add max tex size, queue stuff
-    score *= deviceTypeScoreMultiplier();
+    score |= (uint32_t)(additional.tflops * 100) << 8;
+    score |= deviceTypeScoreMultiplier() << 29;
   }
 
   void detectDeviceVendor()
   {
     vendor = d3d_get_vendor(properties.vendorID);
-    strcpy(vendorName, d3d_get_vendor_name(vendor));
+    vendorName.setStr(d3d_get_vendor_name(vendor));
   }
+
+  void guessAdditionalInformation();
 
   void guessWarpSize()
   {
@@ -326,6 +435,12 @@ struct PhysicalDeviceSet
       chain_structs(target, conditionalRenderingFeature);
     }
 #endif
+#if VK_EXT_scalar_block_layout
+    if (hasExtension<ScalarBlockLayoutEXT>())
+    {
+      chain_structs(target, scalarBlockLayoutFeature);
+    }
+#endif
 
 #if VK_EXT_device_memory_report
     if (hasExtension<DeviceMemoryReportEXT>())
@@ -359,6 +474,13 @@ struct PhysicalDeviceSet
     if (hasExtension<AccelerationStructureKHR>())
     {
       chain_structs(target, deviceAccelerationStructureFeature);
+    }
+#endif
+
+#if VK_EXT_opacity_micromap
+    if (hasExtension<OpacityMicromapEXT>())
+    {
+      chain_structs(target, opacityMicromapFeature);
     }
 #endif
 
@@ -459,56 +581,166 @@ struct PhysicalDeviceSet
       chain_structs(target, tileShadingFeaturesQCOM);
     }
 #endif
+
+#if VK_AMD_anti_lag
+    if (hasExtension<AntiLagAMD>())
+    {
+      chain_structs(target, antiLagFeaturesAMD);
+    }
+#endif
+
+#if VK_AMD_device_coherent_memory
+    if (hasExtension<DeviceCoherentMemoryAMD>())
+    {
+      chain_structs(target, deviceCoherentMemoryFeaturesAMD);
+    }
+#endif
+
+#if VK_KHR_fragment_shader_barycentric
+    if (hasExtension<FragmentShaderBarycentricKHR>())
+    {
+      chain_structs(target, fragmentShaderBarycentricFeaturesKHR);
+    }
+#endif
+
+#if VK_KHR_fragment_shading_rate
+    if (hasExtension<FragmentShadingRateKHR>())
+    {
+      chain_structs(target, fragmenShadingRateFeaturesKHR);
+    }
+#endif
+
+#if VK_KHR_maintenance7
+    if (hasExtension<Maintenance7KHR>())
+    {
+      chain_structs(target, maintenance7FeaturesKHR);
+    }
+#endif
+
+#if VK_KHR_shader_subgroup_extended_types
+    if (hasExtension<ShaderSubgroupExtendedTypesKHR>())
+    {
+      chain_structs(target, shaderSubgroupExtendedTypesFeaturesKHR);
+    }
+#endif
+
+#if VK_KHR_vulkan_memory_model
+    if (hasExtension<VulkanMemoryModelKHR>())
+    {
+      chain_structs(target, vulkanMemoryModelFeaturesKHR);
+    }
+#endif
+
+#if VK_KHR_shader_maximal_reconvergence
+    if (hasExtension<ShaderMaximalReconvergenceKHR>())
+    {
+      chain_structs(target, shaderMaximalReconvergenceFeaturesKHR);
+    }
+#endif
+
+#if VK_KHR_shader_quad_control
+    if (hasExtension<ShaderQuadControlKHR>())
+    {
+      chain_structs(target, shaderQuadControlFeaturesKHR);
+    }
+#endif
+
+#if VK_EXT_extended_dynamic_state
+    if (hasExtension<ExtendedDynamicStateEXT>())
+    {
+      chain_structs(target, extendedDynamicStateFeaturesEXT);
+    }
+#endif
+
+#if VK_EXT_extended_dynamic_state2
+    if (hasExtension<ExtendedDynamicState2EXT>())
+    {
+      chain_structs(target, extendedDynamicState2FeaturesEXT);
+    }
+#endif
+
+#if VK_EXT_extended_dynamic_state3
+    if (hasExtension<ExtendedDynamicState3EXT>())
+    {
+      chain_structs(target, extendedDynamicState3FeaturesEXT);
+    }
+#endif
   }
 
   uint32_t getAvailableVideoMemoryKb() const { return deviceLocalHeapSizeKb; }
 
+  uint32_t calculateAvailableDeviceLocalMemoryBudgetKb()
+  {
+    uint32_t availableKb = 0;
+#if VK_EXT_memory_budget
+    if (memoryBudgetInfoAvailable)
+    {
+      VkDeviceSize budget = memoryBudgetInfo.heapBudget[primaryDeviceLocalHeap];
+
+#if VK_EXT_pageable_device_local_memory
+      if (!hasExtension<PageableDeviceLocalMemoryEXT>())
+#endif
+      {
+        // report less memory as vulkan drivers can't swap memory
+        // between processes and having any light load on system (any browser)
+        // will generate OOM for us, even with residency logic
+        budget = (budget * 80) / 100;
+      }
+      // apply soft limit from config
+      int64_t softLimitMb = ::dgs_get_settings()
+                              ->getBlockByNameEx("vulkan")
+                              ->getBlockByNameEx(String(64, "heap%u", primaryDeviceLocalHeap))
+                              ->getInt64("softLimitMb", -1);
+      if (softLimitMb != -1)
+        budget = softLimitMb << 20;
+      availableKb = budget >> 10;
+    }
+    else
+#endif
+    {
+      availableKb = memoryProperties.memoryHeaps[primaryDeviceLocalHeap].size >> 10;
+    }
+    return availableKb;
+  }
+
   uint32_t calculateTotalAvailableDeviceLocalMemoryKb()
   {
-    uint32_t ret = 0;
-    for (uint32_t i = 0; i < memoryProperties.memoryHeapCount; ++i)
-    {
-      if (memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-      {
-        uint32_t availableKb = 0;
+    uint32_t budgetKb = calculateAvailableDeviceLocalMemoryBudgetKb();
+
+    uint32_t availableKb = 0;
 #if VK_EXT_memory_budget
-        if (memoryBudgetInfoAvailable)
-        {
-          // sanity check as spec says "heap's usage is an estimate"
-          VkDeviceSize budget = memoryBudgetInfo.heapBudget[i];
-
-#if _TARGET_PC_LINUX
-          // report less memory as vulkan drivers can't swap memory
-          // between processes and having any light load on system (any browser)
-          // will generate OOM for us
-          // TODO: this should be removed when residency will be in place
-          budget = (budget * 80) / 100;
-#endif
-          // apply soft limit from config
-          int64_t softLimitMb =
-            ::dgs_get_settings()->getBlockByNameEx("vulkan")->getBlockByNameEx(String(64, "heap%u", i))->getInt64("softLimitMb", -1);
-          if (softLimitMb != -1)
-            budget = softLimitMb << 20;
-
-          if (budget < memoryBudgetInfo.heapUsage[i])
-            availableKb = 0;
-          else
-            availableKb = (budget - memoryBudgetInfo.heapUsage[i]) >> 10;
-        }
-        else
-#endif
-        {
-          availableKb = memoryProperties.memoryHeaps[i].size >> 10;
-        }
-        // usually we have heap 0 and heap 2 device local heaps
-        // and they are interleaved (i.e. allocation in 2 will count in 0 too)
-        // so just find out biggest heap and use it as available memory
-        ret = max<uint32_t>(ret, availableKb);
-      }
+    if (memoryBudgetInfoAvailable)
+    {
+      // sanity check as spec says "heap's usage is an estimate"
+      uint32_t usageKb = memoryBudgetInfo.heapUsage[primaryDeviceLocalHeap] >> 10;
+      if (budgetKb < usageKb)
+        availableKb = 0;
+      else
+        availableKb = budgetKb - usageKb;
     }
-
-    return ret;
+    else
+#endif
+    {
+      availableKb = budgetKb;
+    }
+    return availableKb;
   }
+
+#if VK_EXT_memory_budget
+  void getCurrentMemoryBudget(VulkanInstance &instance, VkPhysicalDeviceMemoryBudgetPropertiesEXT &out_info)
+  {
+    G_ASSERT(memoryBudgetInfoAvailable);
+
+    VkPhysicalDeviceMemoryProperties2KHR pdmp = //
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2_KHR, nullptr};
+
+    out_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    out_info.pNext = nullptr;
+    chain_structs(pdmp, out_info);
+
+    VULKAN_LOG_CALL(instance.vkGetPhysicalDeviceMemoryProperties2KHR(device, &pdmp));
+  }
+#endif
 
   uint32_t getCurrentAvailableMemoryKb(VulkanInstance &instance)
   {
@@ -551,6 +783,16 @@ struct PhysicalDeviceSet
     }
     else
       hasConditionalRender = false;
+#endif
+
+#if VK_EXT_scalar_block_layout
+    if (hasExtension<ScalarBlockLayoutEXT>())
+    {
+      hasScalarBlockLayout = scalarBlockLayoutFeature.scalarBlockLayout == VK_TRUE;
+      scalarBlockLayoutFeature.pNext = nullptr;
+    }
+    else
+      hasScalarBlockLayout = false;
 #endif
 
 #if VK_KHR_imageless_framebuffer
@@ -612,11 +854,35 @@ struct PhysicalDeviceSet
 #if VK_KHR_acceleration_structure
     if (hasExtension<AccelerationStructureKHR>())
     {
-      hasAccelerationStructure = deviceAccelerationStructureFeature.accelerationStructure == VK_TRUE;
+      hasAccelerationStructure = hasDeviceBufferDeviceAddress && deviceAccelerationStructureFeature.accelerationStructure == VK_TRUE;
+      if (!hasDeviceBufferDeviceAddress) //-V1051
+        debug("vulkan: acceleration structure disabled: dependency buffer_device_address is not available");
       deviceAccelerationStructureFeature.pNext = nullptr;
     }
     else
       hasAccelerationStructure = false;
+#endif
+
+#if VK_EXT_opacity_micromap
+    if (hasExtension<OpacityMicromapEXT>())
+    {
+      if (checkExtensionDepencency<OpacityMicromapEXT, AccelerationStructureKHR>())
+      {
+        hasOpacityMicromap = opacityMicromapFeature.micromap == VK_TRUE;
+        // queried struct is re-chained into device create info, enable only the base feature
+        opacityMicromapFeature.micromapCaptureReplay = VK_FALSE;
+        opacityMicromapFeature.micromapHostCommands = VK_FALSE;
+        opacityMicromapFeature.pNext = nullptr;
+      }
+      else
+      {
+        hasOpacityMicromap = false;
+        disableExtension<OpacityMicromapEXT>();
+      }
+    }
+    else
+      hasOpacityMicromap = false;
+    deviceReportsOpacityMicromap = hasOpacityMicromap;
 #endif
 
 #if VK_EXT_device_fault
@@ -762,6 +1028,141 @@ struct PhysicalDeviceSet
     else
       hasTileShadingQCOM = false;
 #endif
+
+#if VK_AMD_anti_lag
+    if (hasExtension<AntiLagAMD>())
+    {
+      hasAMDAntiLag = antiLagFeaturesAMD.antiLag;
+      antiLagFeaturesAMD.pNext = nullptr;
+    }
+    else
+      hasAMDAntiLag = false;
+#endif
+
+#if VK_AMD_device_coherent_memory
+    if (hasExtension<DeviceCoherentMemoryAMD>())
+    {
+      hasAMDDeviceCoherentMem = deviceCoherentMemoryFeaturesAMD.deviceCoherentMemory;
+      deviceCoherentMemoryFeaturesAMD.pNext = nullptr;
+    }
+    else
+      hasAMDDeviceCoherentMem = false;
+#endif
+
+#if VK_KHR_fragment_shader_barycentric
+    if (hasExtension<FragmentShaderBarycentricKHR>())
+    {
+      hasFragmentShaderBarycentric = fragmentShaderBarycentricFeaturesKHR.fragmentShaderBarycentric;
+      fragmentShaderBarycentricFeaturesKHR.pNext = nullptr;
+    }
+    else
+      hasFragmentShaderBarycentric = false;
+#endif
+
+#if VK_KHR_fragment_shading_rate
+    if (hasExtension<FragmentShadingRateKHR>())
+    {
+      hasPipelineFragmentShadingRate = fragmenShadingRateFeaturesKHR.pipelineFragmentShadingRate;
+      hasPrimitiveFragmentShadingRate = fragmenShadingRateFeaturesKHR.primitiveFragmentShadingRate;
+      hasAttachmentFragmentShadingRate = fragmenShadingRateFeaturesKHR.attachmentFragmentShadingRate;
+      fragmenShadingRateFeaturesKHR.pNext = nullptr;
+    }
+    else
+    {
+      hasPipelineFragmentShadingRate = false;
+      hasPrimitiveFragmentShadingRate = false;
+      hasAttachmentFragmentShadingRate = false;
+    }
+#endif
+
+#if VK_KHR_maintenance7
+    if (hasExtension<Maintenance7KHR>())
+    {
+      hasMaintenance7 = maintenance7FeaturesKHR.maintenance7;
+      maintenance7FeaturesKHR.pNext = nullptr;
+    }
+    else
+      hasMaintenance7 = false;
+#endif
+
+#if VK_KHR_shader_subgroup_extended_types
+    if (hasExtension<ShaderSubgroupExtendedTypesKHR>())
+    {
+      hasShaderSubgroupExtendedTypes = shaderSubgroupExtendedTypesFeaturesKHR.shaderSubgroupExtendedTypes;
+      shaderSubgroupExtendedTypesFeaturesKHR.pNext = nullptr;
+    }
+    else
+      hasShaderSubgroupExtendedTypes = false;
+#endif
+
+#if VK_KHR_vulkan_memory_model
+    if (hasExtension<VulkanMemoryModelKHR>())
+    {
+      hasVulkanMemoryModel = vulkanMemoryModelFeaturesKHR.vulkanMemoryModel;
+      vulkanMemoryModelFeaturesKHR.pNext = nullptr;
+    }
+    else
+      hasVulkanMemoryModel = false;
+#endif
+
+#if VK_KHR_shader_maximal_reconvergence
+    if (hasExtension<ShaderMaximalReconvergenceKHR>())
+    {
+      hasShaderMaximalReconvergence = shaderMaximalReconvergenceFeaturesKHR.shaderMaximalReconvergence;
+      shaderMaximalReconvergenceFeaturesKHR.pNext = nullptr;
+    }
+    else
+      hasShaderMaximalReconvergence = false;
+#endif
+
+#if VK_KHR_shader_quad_control
+    if (hasExtension<ShaderQuadControlKHR>())
+    {
+      hasShaderQuadControl = shaderQuadControlFeaturesKHR.shaderQuadControl;
+      shaderQuadControlFeaturesKHR.pNext = nullptr;
+    }
+    else
+      hasShaderQuadControl = false;
+#endif
+
+#if VK_EXT_extended_dynamic_state
+    if (hasExtension<ExtendedDynamicStateEXT>())
+    {
+      hasExtendedDynamicState = extendedDynamicStateFeaturesEXT.extendedDynamicState;
+      extendedDynamicStateFeaturesEXT.pNext = nullptr;
+    }
+    else
+      hasExtendedDynamicState = false;
+#endif
+
+#if VK_EXT_extended_dynamic_state2
+    if (hasExtension<ExtendedDynamicState2EXT>())
+    {
+      hasExtendedDynamicState2 = extendedDynamicState2FeaturesEXT.extendedDynamicState2;
+      hasExtendedDynamicState2LogicOp = extendedDynamicState2FeaturesEXT.extendedDynamicState2LogicOp;
+      hasExtendedDynamicState2PatchControlPoints = extendedDynamicState2FeaturesEXT.extendedDynamicState2PatchControlPoints;
+      extendedDynamicState2FeaturesEXT.pNext = nullptr;
+    }
+    else
+    {
+      hasExtendedDynamicState2 = false;
+      hasExtendedDynamicState2LogicOp = false;
+      hasExtendedDynamicState2PatchControlPoints = false;
+    }
+#endif
+
+#if VK_EXT_extended_dynamic_state3
+    // VK_EXT_extended_dynamic_state3 has no single feature bit: it exposes a set of per-state
+    // toggles. Track availability of the extension itself; individual toggles stay in the
+    // queried struct for callers to inspect.
+    if (hasExtension<ExtendedDynamicState3EXT>())
+    {
+      hasExtendedDynamicState3 = true;
+      extendedDynamicState3FeaturesEXT.pNext = nullptr;
+    }
+    else
+      hasExtendedDynamicState3 = false;
+#endif
   }
 
   template <class TargetExt, class DepExt>
@@ -774,6 +1175,23 @@ struct PhysicalDeviceSet
         extension_name<DepExt>());
     }
     return hasExt;
+  }
+
+  // maximum dynamic uniform buffers usable across all sets of a single pipeline layout;
+  // maintenance7 refines the base limit with explicit cross-stage totals
+  uint32_t maxDynamicUniformBuffersInLayout() const
+  {
+    uint32_t limit = properties.limits.maxDescriptorSetUniformBuffersDynamic;
+#if VK_KHR_maintenance7
+    if (hasMaintenance7)
+    {
+      if (maintenance7PropsKHR.maxDescriptorSetTotalUniformBuffersDynamic < limit)
+        limit = maintenance7PropsKHR.maxDescriptorSetTotalUniformBuffersDynamic;
+      if (maintenance7PropsKHR.maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic < limit)
+        limit = maintenance7PropsKHR.maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic;
+    }
+#endif
+    return limit;
   }
 
   bool initExt(VulkanInstance &instance)
@@ -840,8 +1258,43 @@ struct PhysicalDeviceSet
       chain_structs(pdp, deviceAccelerationStructureProps);
 #endif
 
+#if VK_EXT_opacity_micromap
+    if (hasExtension<OpacityMicromapEXT>())
+      chain_structs(pdp, opacityMicromapProps);
+#endif
+
+#if VK_KHR_fragment_shading_rate
+    if (hasExtension<FragmentShadingRateKHR>())
+      chain_structs(pdp, fragmentShadingRateProps);
+#endif
+
+#if VK_KHR_maintenance7
+    if (hasMaintenance7)
+      chain_structs(pdp, maintenance7PropsKHR);
+#endif
+
+#if VK_EXT_extended_dynamic_state3
+    if (hasExtension<ExtendedDynamicState3EXT>())
+      chain_structs(pdp, extendedDynamicState3PropsEXT);
+#endif
+
     VULKAN_LOG_CALL(instance.vkGetPhysicalDeviceProperties2KHR(device, &pdp));
     properties = pdp.properties;
+
+#if VK_KHR_fragment_shading_rate
+    if (hasExtension<FragmentShadingRateKHR>())
+      fragmentShadingRateProps.pNext = nullptr;
+#endif
+
+#if VK_KHR_maintenance7
+    if (hasMaintenance7)
+      maintenance7PropsKHR.pNext = nullptr;
+#endif
+
+#if VK_EXT_extended_dynamic_state3
+    if (hasExtension<ExtendedDynamicState3EXT>())
+      extendedDynamicState3PropsEXT.pNext = nullptr;
+#endif
 
 #if VK_KHR_acceleration_structure
     if (hasExtension<AccelerationStructureKHR>())
@@ -849,6 +1302,11 @@ struct PhysicalDeviceSet
       raytraceScratchBufferAlignment = deviceAccelerationStructureProps.minAccelerationStructureScratchOffsetAlignment;
       deviceAccelerationStructureProps.pNext = nullptr;
     }
+#endif
+
+#if VK_EXT_opacity_micromap
+    if (hasExtension<OpacityMicromapEXT>())
+      opacityMicromapProps.pNext = nullptr;
 #endif
 
 #if VK_KHR_ray_tracing_pipeline || VK_KHR_ray_query
@@ -929,9 +1387,6 @@ struct PhysicalDeviceSet
       VULKAN_LOG_CALL(instance.vkGetPhysicalDeviceFormatProperties2KHR(device, (VkFormat)i, &fp));
       formatProperties[i] = fp.formatProperties;
     }
-
-    deviceLocalHeapSizeKb = calculateTotalAvailableDeviceLocalMemoryKb();
-
     return true;
   }
 
@@ -984,6 +1439,23 @@ struct PhysicalDeviceSet
     }
   }
 
+  void detectPrimaryDeviceLocalHeap()
+  {
+    VkDeviceSize maxHeapSize = 0;
+    primaryDeviceLocalHeap = 0;
+    for (uint32_t i = 0; i < memoryProperties.memoryHeapCount; ++i)
+    {
+      if ((memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0)
+        continue;
+
+      if (maxHeapSize < memoryProperties.memoryHeaps[i].size)
+      {
+        primaryDeviceLocalHeap = i;
+        maxHeapSize = memoryProperties.memoryHeaps[i].size;
+      }
+    }
+  }
+
   void detectLazyMemorySupport()
   {
     for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i)
@@ -1027,10 +1499,13 @@ struct PhysicalDeviceSet
     queryExtensionList(instance);
     if (!initExt(instance))
       initUnextended(instance);
+    detectPrimaryDeviceLocalHeap();
     detectLazyMemorySupport();
+    deviceLocalHeapSizeKb = calculateTotalAvailableDeviceLocalMemoryKb();
     detectDeviceVendor();
     decodeDriverVersion();
     guessWarpSize();
+    guessAdditionalInformation();
     calculateScore();
     queryDisplays(instance);
   }
@@ -1113,7 +1588,7 @@ struct PhysicalDeviceSet
     apd("maxUniformBufferRange: %u, maxStorageBufferRange: %u", limits.maxUniformBufferRange, limits.maxStorageBufferRange);
     apd("maxMemoryAllocationCount: %u, maxSamplerAllocationCount: %u", limits.maxMemoryAllocationCount,
       limits.maxSamplerAllocationCount);
-    apd("maxPushConstantsSize: %u, bufferImageGranularity: %u, sparseAddressSpaceSize: %u, maxBoundDescriptorSets: %u",
+    apd("maxPushConstantsSize: %u, bufferImageGranularity: %llu, sparseAddressSpaceSize: %llu, maxBoundDescriptorSets: %u",
       limits.maxPushConstantsSize, limits.bufferImageGranularity, limits.sparseAddressSpaceSize, limits.maxBoundDescriptorSets);
     apd(
       "maxPerStageDescriptor[Samplers,UniformBuffers,StorageBuffers,SampledImages,StorageImages,InputAttachments]: %u,%u,%u,%u,%u,%u",
@@ -1152,9 +1627,9 @@ struct PhysicalDeviceSet
     apd("maxDraw[IndexedIndexValue,IndirectCount]: %u,%u", limits.maxDrawIndexedIndexValue, limits.maxDrawIndirectCount);
     apd("maxSampler[LodBias,Anisotropy]: %f,%f, maxViewport[s,Dimensions]: %u, [%u,%u]", limits.maxSamplerLodBias,
       limits.maxSamplerAnisotropy, limits.maxViewports, limits.maxViewportDimensions[0], limits.maxViewportDimensions[1]);
-    apd("viewportBoundsRange: [%f,%f], viewportSubPixelBits: %u, minMemoryMapAlignment: %u", limits.viewportBoundsRange[0],
+    apd("viewportBoundsRange: [%f,%f], viewportSubPixelBits: %u, minMemoryMapAlignment: %llu", limits.viewportBoundsRange[0],
       limits.viewportBoundsRange[1], limits.viewportSubPixelBits, limits.minMemoryMapAlignment);
-    apd("min[Texel,Uniform,Storage]BufferOffsetAlignment: %u,%u,%u", limits.minTexelBufferOffsetAlignment,
+    apd("min[Texel,Uniform,Storage]BufferOffsetAlignment: %llu,%llu,%llu", limits.minTexelBufferOffsetAlignment,
       limits.minUniformBufferOffsetAlignment, limits.minStorageBufferOffsetAlignment);
     apd("[min,max]TexelOffset: %u,%u, [min,max]TexelGatherOffset: %u,%u", limits.minTexelOffset, limits.maxTexelOffset,
       limits.minTexelGatherOffset, limits.maxTexelGatherOffset);
@@ -1176,7 +1651,7 @@ struct PhysicalDeviceSet
     apd("discreteQueuePriorities: %u, pointSizeGranularity: %f, lineWidthGranularity: %f", limits.discreteQueuePriorities,
       limits.pointSizeGranularity, limits.lineWidthGranularity);
     apd("strictLines: %s, standardSampleLocations: %s", bool32ToStr(limits.strictLines), bool32ToStr(limits.standardSampleLocations));
-    apd("optimalBufferCopy[Offset,RowPitch]Alignment: %u,%u, nonCoherentAtomSize: %u", limits.optimalBufferCopyOffsetAlignment,
+    apd("optimalBufferCopy[Offset,RowPitch]Alignment: %llu,%llu, nonCoherentAtomSize: %llu", limits.optimalBufferCopyOffsetAlignment,
       limits.optimalBufferCopyRowPitchAlignment, limits.nonCoherentAtomSize);
   }
 
@@ -1512,6 +1987,14 @@ struct PhysicalDeviceSet
       if (flags & VK_FORMAT_FEATURE_TRANSFER_DST_BIT_KHR)
         str += "CpyD|";
     }
+
+#if VK_KHR_fragment_shading_rate
+    if (flags & VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
+    {
+      str += "VRS|";
+    }
+#endif
+
     if (str.empty())
       str += "None";
     else
@@ -1565,7 +2048,11 @@ struct PhysicalDeviceSet
         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
         VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_CUBIC_BIT_IMG |
-        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT_KHR | VK_FORMAT_FEATURE_TRANSFER_DST_BIT_KHR);
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT_KHR | VK_FORMAT_FEATURE_TRANSFER_DST_BIT_KHR
+#if VK_KHR_fragment_shading_rate
+        | VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR
+#endif
+      );
 
     UniqFeaturesMap linMasks;
     UniqFeaturesMap optMasks;
@@ -1592,7 +2079,7 @@ struct PhysicalDeviceSet
       flags.chop(3);
     else
       flags = "None";
-    apd("Heap %i: %s, %u Gib, %u Mib, %u Kib, %u b", i, flags, type.size / 1024 / 1024 / 1024, type.size / 1024 / 1024,
+    apd("Heap %i: %s, %llu Gib, %llu Mib, %llu Kib, %llu b", i, flags, type.size / 1024 / 1024 / 1024, type.size / 1024 / 1024,
       type.size / 1024, type.size);
   }
 
@@ -1620,7 +2107,7 @@ struct PhysicalDeviceSet
   {
     String dump("Budget: [");
     for (int i = 0; i != mem.memoryHeapCount; ++i)
-      dump.aprintf(32, "%u:%uMb used %uMb,", i, budget.heapBudget[i] >> 20, budget.heapUsage[i] >> 20);
+      dump.aprintf(32, "%u:%lluMb used %lluMb,", i, budget.heapBudget[i] >> 20, budget.heapUsage[i] >> 20);
     dump.pop_back();
     dump += "]";
     apdnf(dump);
@@ -1727,12 +2214,13 @@ struct PhysicalDeviceSet
     apd("hasLazyMemory: %s, hasShaderFloat16: %s, hasMemoryPriority: %s, hasPageableDeviceLocalMemory: %s", boolToStr(hasLazyMemory),
       boolToStr(hasShaderFloat16), boolToStr(hasMemoryPriority), boolToStr(hasPageableDeviceLocalMemory));
     apd("hasPipelineCreationCacheControl: %s", boolToStr(hasPipelineCreationCacheControl));
-    apd("hasSixteenBitStorage: %s", boolToStr(hasSixteenBitStorage));
+    apd("hasSixteenBitStorage: %s, primaryDeviceLocalHeap: %u, hasAMDAntiLag: %s, hasAMDDeviceCoherentMem: %s",
+      boolToStr(hasSixteenBitStorage), primaryDeviceLocalHeap, boolToStr(hasAMDAntiLag), boolToStr(hasAMDDeviceCoherentMem));
     apd("hasSynchronization2: %s, hasGlobalPriority: %s, hasTimelineSemaphore: %s, hasPipelineExecutableInfo: %s",
       boolToStr(hasSynchronization2), boolToStr(hasGlobalPriority), boolToStr(hasTimelineSemaphore),
       boolToStr(hasPipelineExecutableInfo));
-    apd("hasTilePropQCOM: %s, hasTileMemoryHeapQCOM: %s, hasTileShadingQCOM: %s", boolToStr(hasTilePropQCOM),
-      boolToStr(hasTileMemoryHeapQCOM), boolToStr(hasTileShadingQCOM));
+    apd("hasTilePropQCOM: %s, hasTileMemoryHeapQCOM: %s, hasTileShadingQCOM: %s, hasMaintenance7: %s", boolToStr(hasTilePropQCOM),
+      boolToStr(hasTileMemoryHeapQCOM), boolToStr(hasTileShadingQCOM), boolToStr(hasMaintenance7));
     if (hasTileShadingQCOM)
     {
 #if VK_QCOM_tile_shading
@@ -1747,6 +2235,13 @@ struct PhysicalDeviceSet
         tileShadingFeaturesQCOM.tileShadingImageProcessing);
 #endif
     }
+    apd("hasFragmentShaderBarycentric: %s", boolToStr(hasFragmentShaderBarycentric));
+    apd("hasFragmentShadingRate[Pipeline,Primitive,Attachment]: %s, %s, %s", boolToStr(hasPipelineFragmentShadingRate),
+      boolToStr(hasPrimitiveFragmentShadingRate), boolToStr(hasAttachmentFragmentShadingRate));
+    apd("hasExtendedDynamicState: %s, hasExtendedDynamicState2[Base,LogicOp,PatchControlPoints]: %s, %s, %s, "
+        "hasExtendedDynamicState3: %s",
+      boolToStr(hasExtendedDynamicState), boolToStr(hasExtendedDynamicState2), boolToStr(hasExtendedDynamicState2LogicOp),
+      boolToStr(hasExtendedDynamicState2PatchControlPoints), boolToStr(hasExtendedDynamicState3));
   }
 
   inline void print(uint32_t device_index)

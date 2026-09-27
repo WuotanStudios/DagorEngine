@@ -51,7 +51,7 @@ void DagorLogWindow::addToLog(LogLevel level, const TCHAR *format, va_list args)
   if (level == LogLevel::Warning || level == LogLevel::Error)
     hasWarningOrError = true;
 
-  updateLogEditBox();
+  appendToLogEditBox(textToAdd);
 }
 
 void DagorLogWindow::clearLog()
@@ -69,6 +69,17 @@ void DagorLogWindow::updateLogEditBox()
     SetDlgItemText(hwnd, IDC_LOGTEXT, logText);
 }
 
+void DagorLogWindow::appendToLogEditBox(const TCHAR *text)
+{
+  if (!hwnd)
+    return;
+
+  HWND editBox = GetDlgItem(hwnd, IDC_LOGTEXT);
+  const int length = GetWindowTextLength(editBox);
+  SendMessage(editBox, EM_SETSEL, (WPARAM)length, (LPARAM)length);
+  SendMessage(editBox, EM_REPLACESEL, FALSE, (LPARAM)text); // FALSE: keep it out of the undo buffer
+}
+
 std::vector<TSTR> DagorLogWindow::getLogLines()
 {
   std::vector<TSTR> lines;
@@ -79,22 +90,14 @@ std::vector<TSTR> DagorLogWindow::getLogLines()
   {
     if (logText[i] == '\r' && (i + 1) < length && logText[i + 1] == '\n')
     {
-#if _MSC_VER >= 1700
       lines.emplace_back(logText.Substr(lineStartIndex, i - lineStartIndex));
-#else
-      lines.push_back(logText.Substr(lineStartIndex, i - lineStartIndex));
-#endif
       lineStartIndex = i + 2;
       ++i;
     }
   }
 
   if (lineStartIndex < length)
-#if _MSC_VER >= 1700
     lines.emplace_back(logText.Substr(lineStartIndex, length - lineStartIndex));
-#else
-    lines.push_back(logText.Substr(lineStartIndex, length - lineStartIndex));
-#endif
 
   return lines;
 }
@@ -105,6 +108,9 @@ INT_PTR CALLBACK DagorLogWindow::dialogProc(HWND hw, UINT msg, WPARAM wParam, LP
   {
     case WM_INITDIALOG:
       hwnd = hw;
+
+      // Remove default input limit (30000 chars)
+      SendDlgItemMessage(hwnd, IDC_LOGTEXT, EM_SETLIMITTEXT, 0, 0);
       updateLogEditBox();
 
       // Prevent the default selection of the entire contents of the edit box.
@@ -232,12 +238,10 @@ private:
   void log(DagorLogWindow::LogLevel level, const TCHAR *message)
   {
     TSTR str(message);
-#if defined(MAX_RELEASE_R15) && MAX_RELEASE >= MAX_RELEASE_R15
     // \n in MaxScript is actually \r\n, but handle everything.
     str.Replace(_T("\r\n"), _T("\n"));
     str.Replace(_T("\r"), _T("\n"));
     str.Replace(_T("\n"), _T("\r\n"));
-#endif
     DagorLogWindow::addToLog(level, _T("%s\r\n"), str.data());
   }
 };
@@ -258,10 +262,6 @@ static DagorLogStaticInterface theDagorLogStaticInterface(
   DagorLogStaticInterface::FunctionId::GetLogLines, _T("getLogLines"), -1, TYPE_STRING_TAB, FP_NO_REDRAW, 0,
   DagorLogStaticInterface::FunctionId::HasWarningOrError, _T("hasWarningOrError"), -1, TYPE_BOOL, FP_NO_REDRAW, 0,
 
-#if defined(MAX_RELEASE_R15) && MAX_RELEASE >= MAX_RELEASE_R15
   p_end
-#else
-  end
-#endif
 );
 // clang-format on

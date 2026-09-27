@@ -2,13 +2,14 @@
 
 #include "shader.h"
 #include "device_context.h"
+#include "backend/cmd/resources.h"
 
 using namespace drv3d_vulkan;
 
 void BaseProgram::removeFromContext(DeviceContext &ctx, ProgramID prog)
 {
   inRemoval = true;
-  ctx.removeProgram(prog);
+  ctx.dispatchCmd<CmdRemoveProgram>({prog});
 }
 
 GraphicsProgram::GraphicsProgram(const CreationInfo &info) :
@@ -17,7 +18,8 @@ GraphicsProgram::GraphicsProgram(const CreationInfo &info) :
   fragmentShader(info.fs),
   geometryShader(info.vs->geometryShader.get()),
   controlShader(info.vs->controlShader.get()),
-  evaluationShader(info.vs->evaluationShader.get())
+  evaluationShader(info.vs->evaluationShader.get()),
+  idPayload(createInfoToIDPayload(info))
 {}
 
 void GraphicsProgram::addToContext(DeviceContext &ctx, ProgramID prog, const CreationInfo &)
@@ -49,14 +51,48 @@ void GraphicsProgram::addToContext(DeviceContext &ctx, ProgramID prog, const Cre
     temup = &temu;
   }
 
-  ctx.addGraphicsProgram(prog, vsmu, fsmu, gsmup, tcmup, temup);
+  CmdAddGraphicsProgram cmd{prog};
+  OSSpinlockScopedLock frontLock(ctx.getFrontLock());
+  cmd.vs = Frontend::replay->shaderModuleUses.size();
+  Frontend::replay->shaderModuleUses.push_back(vsmu);
+
+  cmd.fs = Frontend::replay->shaderModuleUses.size();
+  Frontend::replay->shaderModuleUses.push_back(fsmu);
+
+  if (gsmup)
+  {
+    cmd.gs = Frontend::replay->shaderModuleUses.size();
+    Frontend::replay->shaderModuleUses.push_back(*gsmup);
+  }
+  else
+    cmd.gs = ~uint32_t(0);
+
+  if (tcmup)
+  {
+    cmd.tc = Frontend::replay->shaderModuleUses.size();
+    Frontend::replay->shaderModuleUses.push_back(*tcmup);
+  }
+  else
+    cmd.tc = ~uint32_t(0);
+
+  if (temup)
+  {
+    cmd.te = Frontend::replay->shaderModuleUses.size();
+    Frontend::replay->shaderModuleUses.push_back(*temup);
+  }
+  else
+    cmd.te = ~uint32_t(0);
+
+  ctx.dispatchCmdNoLock(cmd);
 }
+
+ComputeProgram::ComputeProgram(const CreationInfo &info) : idPayload(createInfoToIDPayload(info)) {}
 
 void ComputeProgram::addToContext(DeviceContext &ctx, ProgramID prog, const CreationInfo &info)
 {
   auto smb = eastl::make_unique<ShaderModuleBlob>(info.smb);
-  if (smb->blob.empty())
+  if (smb->source.compressedData.empty())
     DAG_FATAL("Shader has no byte code blob");
 
-  ctx.addComputeProgram(prog, eastl::move(smb), info.smh);
+  ctx.dispatchCmd<CmdAddComputeProgram>({prog, smb.release(), info.smh});
 }

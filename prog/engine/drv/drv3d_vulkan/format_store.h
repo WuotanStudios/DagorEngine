@@ -19,11 +19,13 @@ BEGIN_BITFIELD_TYPE(FormatStore, uint8_t)
     CREATE_FLAGS_FORMAT_SHIFT = 24,
     // one additional entry for the default
     MAX_FORMAT_COUNT = (TEXFMT_LAST_DEPTH >> CREATE_FLAGS_FORMAT_SHIFT) - (TEXFMT_A2R10G10B10 >> CREATE_FLAGS_FORMAT_SHIFT) + 1 + 1,
-    BITS = BitsNeeded<MAX_FORMAT_COUNT>::VALUE
+    BITS = BitsNeeded<MAX_FORMAT_COUNT>::VALUE,
+    BITS_SZ = BITS + 2
   };
   ADD_BITFIELD_MEMBER(isSrgb, BITS, 1)
+  ADD_BITFIELD_MEMBER(isSrgbRead, BITS + 1, 1)
   ADD_BITFIELD_MEMBER(linearFormat, 0, BITS)
-  ADD_BITFIELD_MEMBER(index, 0, BITS + 1)
+  ADD_BITFIELD_MEMBER(index, 0, BITS_SZ)
 
   BEGIN_BITFIELD_TYPE(CreateFlagFormat, uint32_t)
     ADD_BITFIELD_MEMBER(format, 24, 8)
@@ -60,27 +62,31 @@ BEGIN_BITFIELD_TYPE(FormatStore, uint8_t)
   {
     CreateFlagFormat fmt(flags);
     linearFormat = fmt.format;
-    isSrgb = fmt.srgbRead | fmt.srgbWrite;
+    // for blit like operations with raw input values (like clear_rt) to properly work we need base sRGB format
+    // only when srgb write is enabled, for other cases linear format is enough
+    isSrgb = fmt.srgbWrite;
+    isSrgbRead = fmt.srgbRead;
   }
   uint32_t asTexFlags() const
   {
     CreateFlagFormat fmt;
     fmt.format = linearFormat;
-    fmt.srgbRead = isSrgb;
     fmt.srgbWrite = isSrgb;
+    fmt.srgbRead = isSrgbRead;
     return fmt.wrapper.value;
   }
   uint32_t getFormatFlags() { return linearFormat << CREATE_FLAGS_FORMAT_SHIFT; }
   VkImageAspectFlags getAspektFlags() const
   {
-    uint8_t val = linearFormat;
-    if (val == (TEXFMT_DEPTH16 >> CREATE_FLAGS_FORMAT_SHIFT) || val == (TEXFMT_DEPTH32 >> CREATE_FLAGS_FORMAT_SHIFT))
-      return VK_IMAGE_ASPECT_DEPTH_BIT;
-    constexpr auto range = make_value_range(TEXFMT_FIRST_DEPTH >> CREATE_FLAGS_FORMAT_SHIFT,
-      (TEXFMT_LAST_DEPTH >> CREATE_FLAGS_FORMAT_SHIFT) - (TEXFMT_FIRST_DEPTH >> CREATE_FLAGS_FORMAT_SHIFT) + 1);
-
-    if (range.isInside(val))
-      return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    switch (asVkFormat())
+    {
+      case VK_FORMAT_D32_SFLOAT:
+      case VK_FORMAT_D16_UNORM: return VK_IMAGE_ASPECT_DEPTH_BIT;
+      case VK_FORMAT_D16_UNORM_S8_UINT:
+      case VK_FORMAT_D24_UNORM_S8_UINT:
+      case VK_FORMAT_D32_SFLOAT_S8_UINT: return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+      default: break;
+    }
     return VK_IMAGE_ASPECT_COLOR_BIT;
   }
   uint32_t calculateRowPitch(int32_t w) const
@@ -137,6 +143,7 @@ BEGIN_BITFIELD_TYPE(FormatStore, uint8_t)
       case TEXFMT_A16B16G16R16S >> CREATE_FLAGS_FORMAT_SHIFT:
       case TEXFMT_ATI1N >> CREATE_FLAGS_FORMAT_SHIFT:
       case TEXFMT_ATI2N >> CREATE_FLAGS_FORMAT_SHIFT:
+      case TEXFMT_BC5S >> CREATE_FLAGS_FORMAT_SHIFT:
       case TEXFMT_R8G8B8A8 >> CREATE_FLAGS_FORMAT_SHIFT:
       case TEXFMT_R11G11B10F >> CREATE_FLAGS_FORMAT_SHIFT:
       case TEXFMT_R9G9B9E5 >> CREATE_FLAGS_FORMAT_SHIFT:

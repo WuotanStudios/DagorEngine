@@ -1,13 +1,14 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
+#include "render/world/antiAliasingMode.h"
 #define INSIDE_RENDERER 1 // fixme: move to jam
 
 #include "render/renderEvent.h"
 #include <render/lruCollision.h>
 #include <gameRes/dag_collisionResource.h>
 #include <render/shaderCacheWarmup/shaderCacheWarmup.h>
-#include <daGI2/treesAboveDepth.h>
-#include <daGI2/settingSupport.h>
+#include <render/antialiasing.h>
+#include <daGI2/daGI2.h>
 #include <GIWindows/GIWindows.h>
 
 #include <rendInst/rendInstGen.h>
@@ -17,24 +18,32 @@
 #include <rendInst/gpuObjects.h>
 #include <rendInst/visibility.h>
 
-#include <landMesh/landRayTracer.h>
+#include <heightmap/heightmapCulling.h>
+#include <landMesh/landRayTracerSoA4.h>
+#include <math/dag_mathUtils.h>
 #include <landMesh/clipMap.h>
 #include <landMesh/lastClip.h>
 #include <landMesh/biomeQuery.h>
 #include <landMesh/heightmapQuery.h>
 #include <landMesh/lmeshMirroring.h>
 #include <landMesh/lmeshRenderer.h>
+#include <landMesh/vtexRenderMode.h>
 #include <render/world/landMeshToHeightmapRenderer.h>
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <ecs/render/updateStageRender.h>
 #include <ecs/camera/getActiveCameraSetup.h>
+#include <ecs/lights/light.h>
 
 #include <osApiWrappers/dag_messageBox.h>
 #include <osApiWrappers/dag_direct.h>
 
 #include <3d/dag_lowLatency.h>
+#include <3d/dag_texMgr.h>
 #include <3d/dag_texMgrTags.h>
+#include <shaders/dag_shaderResUnitedData.h>
 #include <3d/dag_gpuConfig.h>
 #include <drv/3d/dag_rwResource.h>
 #include <drv/3d/dag_renderStates.h>
@@ -44,6 +53,7 @@
 #include <drv/3d/dag_matricesAndPerspective.h>
 #include <drv/3d/dag_texture.h>
 #include <drv/3d/dag_lock.h>
+#include <drv/3d/dag_shaderConstants.h>
 #include <render/dag_cur_view.h>
 #include <workCycle/dag_workCycle.h> // dagor_work_cycle_is_need_to_draw
 
@@ -53,10 +63,11 @@
 #include <shaders/dag_shaderBlock.h>
 #include <shaders/dag_shaderVarsUtils.h>
 #include <shaders/dag_shAssert.h>
+#include <shaders/dag_refinedBlock.h>
 
 #include <visualConsole/dag_visualConsole.h>
 
-#include "aimRender.h"
+#include <ecs/render/aimRender.h>
 
 #include <util/dag_delayedAction.h>
 #include <util/dag_localization.h>
@@ -81,8 +92,10 @@
 #include <render/debugTonemapOverlay.h>
 #include <render/preIntegratedGF.h>
 #include <render/downsampleDepth.h>
-#include <render/screenSpaceReflections.h>
+#include <screenSpaceReflections_api.h>
 #include <render/rendererFeatures.h>
+#include "render/rendinstTessellation.h"
+#include "render/world/dynModelRenderer.h"
 #include <nodeBasedShaderManager/nodeBasedShaderManager.h>
 #include <render/volumetricLights/volumetricLights.h>
 #include <render/weather/fluidWind.h>
@@ -90,6 +103,7 @@
 #include <render/emissionColorMaps.h>
 #include <render/dynamicQuality.h>
 #include <render/dynamicResolution.h>
+#include <render/metronome.h>
 #include <render/cinematicMode.h>
 #include <render/vertexDensityOverlay.h>
 #include <render/imGuiProfiler.h>
@@ -111,7 +125,7 @@
 
 #include <render/deepLearningSuperSampling.h>
 #include <render/XeSuperSampling.h>
-#include <render/FSR2.h>
+#include <render/FSR.h>
 #include <render/temporalSuperResolution.h>
 #if _TARGET_C2
 
@@ -130,7 +144,7 @@
 
 #include <gui/dag_visualLog.h>
 #include <render/noiseTex.h>
-#include <render/world/dynModelRenderer.h>
+#include <render/dynmodelRenderer.h>
 #include <render/clipmapDecals.h>
 #include <render/grass/grassRender.h>
 #include <render/lightShadowParams.h>
@@ -152,14 +166,16 @@
 
 #include <gui/dag_stdGuiRender.h>
 #include <render/debugBoxRenderer.h>
-#include <render/world/cameraInCamera.h>
+#include <render/cameraInCamera/cameraInCamera.h>
+#include <render/cameraInCamera/cameraInCameraNodes.h>
+#include <render/world/dafgCameraRegistrator.h>
 #include <render/world/dynModelRenderPass.h>
 #include "render/world/overridden_params.h"
 #include "render/world/worldRendererQueries.h"
 #include "render/world/wrDispatcher.h"
 #include "render/world/defaultVrsSettings.h"
 #include "render/world/renderDynamicCube.h"
-#include "render/world/reprojectionTm.h"
+#include <render/reprojectionTm.h>
 #include "render/world/depthAOAbove.h"
 #include "render/world/renderPrecise.h"
 #include "render/world/dynamicShadowRenderExtender.h"
@@ -173,6 +189,7 @@
 #include <render/indoorProbeScenes.h>
 #include <render/indoorProbeNodes.h>
 #include <render/debugLightProbeShapeRenderer.h>
+#include <render/debugCollisionDensityRenderer.h>
 
 #include <render/world/portalRenderer.h>
 
@@ -185,6 +202,11 @@
 #include <fftWater/fftWater.h>
 #include <gpuMemoryDumper/gpuMemoryDumper.h>
 #include <render/enviCover/enviCover.h>
+#include <main/settingsValidator.h>
+
+#include <quirrel/bindQuirrelEx/autoBind.h>
+#include <ecs/scripts/sqBindEvent.h>
+#include <sqrat.h>
 
 #if _TARGET_ANDROID || _TARGET_IOS
 #include <crashlytics/firebase_crashlytics.h>
@@ -194,13 +216,17 @@ extern void init_fx();
 extern void term_fx();
 extern void add_volfog_optional_graphs();
 extern void add_envi_cover_optional_graphs();
+extern void add_clouds_optional_graphs();
 extern void set_nightly_spot_lights();
+extern void volfog_load_from_resources(
+  const char *root_graph, const float low_range, const float high_range, const float low_height, const float high_height);
 
 void compute_csm_visibility(const Occlusion &occlusion, const Point3 &dir_from_sun);
 void update_csm_length(const Frustum &frustum, const Point3 &dir_from_sun, float csm_shadows_max_dist);
 bool can_change_altitude_unexpectedly();
 void get_underground_zones_data(Tab<Point3_vec4> &bboxes);
 float get_default_static_resolution_scale();
+void set_fps_limit_from_level(); // depends on v-sync
 
 #define DEF_RENDER_EVENT      ECS_REGISTER_EVENT
 #define DEF_RENDER_PROF_EVENT ECS_REGISTER_EVENT
@@ -208,20 +234,69 @@ DEF_RENDER_PROFILE_EVENTS
 DEF_RENDER_EVENTS
 #undef DEF_RENDER_PROF_EVENT
 #undef DEF_RENDER_EVENT
+ECS_REGISTER_EVENT(EventRenderSceneUnload)
+ECS_REGISTER_EVENT(EventAfterDeviceReset)
 
 #define VAR(a) ShaderVariableInfo a##VarId(#a, true);
 GLOBAL_VARS_LIST
 GLOBAL_VARS_OPTIONAL_LIST
 #undef VAR
 
+namespace var
+{
+ShaderVariableInfo sky_polarization_filter_term("sky_polarization_filter_term", true);
+}
+
+SQ_DEF_AUTO_BINDING_MODULE_EX(bind_render_events, "renderEvents", sq::VM_UI_ALL)
+{
+  Sqrat::Table tbl = ecs::sq::EventsBind<EventAfterDeviceReset>::bindall(vm);
+
+  return tbl;
+}
+
 extern eastl::unique_ptr<DebugBoxRenderer> debugBoxRenderer;
 extern bool grs_draw_wire;
 extern uint32_t global_frame_id;
+
+static void (*clipmap_decals_cb)(const BBox3 &landPart) = nullptr;
+
 enum
 {
   NUM_ROUGHNESS = 10,
   NUM_METALLIC = 10
 };
+
+static AntiAliasingMode convertAntialiasingMethod(render::antialiasing::AntialiasingMethod method)
+{
+  using render::antialiasing::AntialiasingMethod;
+  switch (method)
+  {
+    case AntialiasingMethod::None:
+    case AntialiasingMethod::MSAA:
+    case AntialiasingMethod::MOBILE_MSAA: return AntiAliasingMode::OFF;
+    case AntialiasingMethod::FXAALow:
+    case AntialiasingMethod::FXAAHigh:
+    case AntialiasingMethod::SMAA: return AntiAliasingMode::FXAA;
+    case AntialiasingMethod::DLSS: return AntiAliasingMode::DLSS;
+    case AntialiasingMethod::XeSS: return AntiAliasingMode::XESS;
+    case AntialiasingMethod::FSR: return AntiAliasingMode::FSR;
+    case AntialiasingMethod::TSR:
+    case AntialiasingMethod::TAA:
+    case AntialiasingMethod::MobileTAA:
+    case AntialiasingMethod::MobileTAALow:
+    case AntialiasingMethod::SGSR:
+    case AntialiasingMethod::SGSR2:
+    case AntialiasingMethod::ARM_ASR:
+    case AntialiasingMethod::METALFX:
+    case AntialiasingMethod::METALFX_TEMPORAL: return AntiAliasingMode::TSR;
+#if _TARGET_C2
+
+#endif
+    case AntialiasingMethod::SSAA: return AntiAliasingMode::SSAA;
+  }
+
+  return AntiAliasingMode::OFF;
+}
 
 static constexpr int DISPLACEMENT_TEX_SIZE = 2048;
 static constexpr float DISPLACEMENT_DIST = 16.0f;
@@ -229,16 +304,14 @@ static constexpr float DISPLACEMENT_DIST = 16.0f;
 extern void set_add_lod_bias(float add, const char *name); // TODO: This should NOT be here
 extern void set_add_lod_bias_cb(void (*cb)());
 extern void reset_bindless_samplers();
-extern void update_land_micro_details_sampler(eastl::optional<float> mip_bias = {});
 
-ShaderBlockIdHolder globalConstBlockId{"global_const_block"};
 ShaderBlockIdHolder globalFrameBlockId{"global_frame"};
 ShaderBlockIdHolder rendinstDepthSceneBlockId{"rendinst_depth_scene"};
 ShaderBlockIdHolder rendinstTransSceneBlockId{"rendinst_trans_scene"};
 ShaderBlockIdHolder rendinstVoxelizeSceneBlockId{"rendinst_voxelize_scene"};
 ShaderBlockIdHolder dynamicSceneBlockId{"dynamic_scene"};
 ShaderBlockIdHolder dynamicDepthSceneBlockId{"dynamic_depth_scene"};
-ShaderBlockIdHolder dynamicSceneTransBlockId{"dynamic_trans_scene"};
+ShaderBlockIdHolder dynamicTransSceneBlockId{"dynamic_trans_scene"};
 ShaderBlockIdHolder landMeshPrepareClipmapBlockId{"land_mesh_prepare_clipmap"};
 ShaderBlockIdHolder water3dBlockId{"water3d_block"};
 
@@ -281,7 +354,6 @@ enum
   MAX_SETTINGS_SUBDIV = 2
 };
 
-CONSOLE_BOOL_VAL("render", shouldRenderWaterRipples, true);
 CONSOLE_BOOL_VAL("render", vrsEnable, true);
 
 CONSOLE_INT_VAL("render", water_quality, 0, 0, 2);
@@ -319,10 +391,16 @@ CONSOLE_BOOL_VAL("render", sort_transparent_riex_instances, false);
 
 CONSOLE_BOOL_VAL("render", envi_cover_disable_fg_nodes, false);
 CONSOLE_BOOL_VAL("render", envi_cover_use_NBS, false);
+CONSOLE_BOOL_VAL("render", toggle_normal_packing, false);
+
+CONSOLE_BOOL_VAL("render", camcam_force_world_fov, false);
+
+CONSOLE_BOOL_VAL("render", process_reactive_gbuffer_data, false);
 
 inline bool is_gbuffer_cascade(int cascade) { return cascade == RENDER_MAIN || cascade == RENDER_CUBE; }
 static String root_fog_graph;
 static String root_envi_cover_graph;
+static String root_clouds_graph;
 #if DA_PROFILER_ENABLED
 static carray<da_profiler::desc_id_t, CascadeShadows::MAX_CASCADES> animchar_csm_desc;
 #endif
@@ -336,9 +414,23 @@ webui::HttpPlugin http_renderer_plugins[128] = {nullptr};
 
 namespace var
 {
-static ShaderVariableInfo envi_cover_use_in_resolve("envi_cover_use_in_resolve", true);
 static ShaderVariableInfo layered_material_detail_quality("layered_material_detail_quality", true);
+static ShaderVariableInfo packed_gbuf_normals("packed_gbuf_normals");
+static ShaderVariableInfo packed_gbuf_1_tex("packed_gbuf_1_tex");
+static ShaderVariableInfo hmap_object_tess_factor("hmap_object_tess_factor", true);
+static ShaderVariableInfo force_in_editor("force_in_editor", true);
 } // namespace var
+
+WRDispatcher::ScopedForceInEditor::ScopedForceInEditor(bool a) : active(a)
+{
+  if (var::force_in_editor && active)
+    var::force_in_editor.set_int(1);
+}
+WRDispatcher::ScopedForceInEditor::~ScopedForceInEditor()
+{
+  if (var::force_in_editor && active)
+    var::force_in_editor.set_int(0);
+}
 
 uint32_t get_water_quality()
 {
@@ -387,6 +479,7 @@ public:
   shaders::UniqueOverrideStateId flipCullStateId;
   ViewProjMatrixContainer oviewproj;
   TMatrix viewTm;
+  Point3 hmapOrigin = Point3(0.f, 0.f, 0.f); // heightmap LOD origin prepared for this tile batch
 
   LandmeshCMRenderer(LandMeshRenderer &r, LandMeshManager &p) :
     renderer(r), provider(p), minZ(-5), maxZ(100), omode(LMeshRenderingMode::RENDERING_LANDMESH)
@@ -403,20 +496,21 @@ public:
   virtual void startRenderTiles(const Point2 &center)
   {
     Point3 pos(center.x, ::grs_cur_view.pos.y, center.y);
+    hmapOrigin = pos;
     ((WorldRenderer *)get_world_renderer())->getMinMaxZ(minZ, maxZ);
     BBox3 landBox = provider.getBBox();
     maxZ = max(maxZ, landBox[1].y + 1);
 
-    omode = renderer.setLMeshRenderingMode(LMeshRenderingMode::RENDERING_CLIPMAP);
-    renderer.prepare(provider, pos, 2.f);
+    omode = renderer.getLMeshRenderingMode();
+    renderer.prepare(provider, HmapOrigin(pos));
     d3d_get_view_proj(oviewproj);
     d3d::settm(TM_VIEW, viewTm);
     shaders::overrides::set(flipCullStateId);
   }
   virtual void endRenderTiles()
   {
-    renderer.setRenderInBBox(BBox3());
     ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_SCENE);
+    // restore the ambient mode shadervar for passes that still rely on inheriting it
     renderer.setLMeshRenderingMode(omode);
     d3d_set_view_proj(oviewproj);
     shaders::overrides::reset();
@@ -430,10 +524,13 @@ public:
     BBox3 region3(Point3(region[0].x, minZ, region[0].y), Point3(region[1].x, maxZ + 500, region[1].y));
     ShaderGlobal::setBlock(globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
     ShaderGlobal::setBlock(landMeshPrepareClipmapBlockId, ShaderGlobal::LAYER_SCENE);
-    renderer.setRenderInBBox(region3);
+    LandMeshRenderDesc desc;
+    desc.mode = LMeshRenderingMode::RENDERING_CLIPMAP;
+    desc.renderInBBox = region3;
+    desc.invGeomLodDist = renderer.getInvGeomLodDist();
     TMatrix4_vec4 globTm = TMatrix4_vec4(viewTm) * proj;
-    renderer.render(reinterpret_cast<mat44f_cref>(globTm), proj, Frustum{globTm}, provider, renderer.RENDER_CLIPMAP,
-      ::grs_cur_view.pos);
+    renderer.render(reinterpret_cast<mat44f_cref>(globTm), proj, Frustum{globTm}, provider, renderer.RENDER_CLIPMAP, desc,
+      ::grs_cur_view.pos, HmapOrigin(hmapOrigin));
     clipmap_decals_mgr::render(false);
 
     ViewProjMatrixContainer viewProj;
@@ -457,6 +554,8 @@ void WorldRenderer::clearLegacyGPUObjectsVisibility()
   if (legacyGPUObjectsVisibilityInitialized)
   {
     rendinst::gpuobjects::disable_for_visibility(mainCameraVisibilityMgr.getRiMainVisibility());
+    if (hasFeature(CAMERA_IN_CAMERA))
+      rendinst::gpuobjects::disable_for_visibility(camcamVisibilityMgr.getRiMainVisibility());
     shadowsManager.disableGPUObjsCSM();
     rendinst::gpuobjects::disable_for_visibility(rendinst_dynamic_shadow_visibility);
     legacyGPUObjectsVisibilityInitialized = false;
@@ -471,9 +570,13 @@ void WorldRenderer::closeNBSShaders()
   if (enviCover)
   {
     enviCover->setValidNBS(false);
+    setEnviCover(false);
     envi_cover_use_NBS.set(false);
     enviCover->closeShaders();
   }
+
+  if (auto *skies = get_daskies())
+    skies->closeCloudsNBS();
 }
 void WorldRenderer::beforeResetNBS()
 {
@@ -496,10 +599,15 @@ void WorldRenderer::afterResetNBS()
 void WorldRenderer::unloadLevel()
 {
   // Should be first, because BVH holds texture references to items released below
-  g_entity_mgr->broadcastEventImmediate(UnloadLevel());
+  g_entity_mgr->broadcastEventImmediate(EventRenderSceneUnload());
 
-  staticSceneCollisionResource.reset();
+  staticSceneCollisionResource = nullptr;
   shadowsManager.resetShadowsVisibilityTesting();
+  // free mission-sized cull buffers; visibilities are lazily recreated on next render
+  shadowsManager.closeAllStaticShadowsVisibility();
+  shrinkRendinstVisibilities();
+  dynmodel_renderer::shrink_states();
+  lights.shrinkShadowVolumes();
   clearLegacyGPUObjectsVisibility();
 
   if (auto *skies = get_daskies())
@@ -513,6 +621,7 @@ void WorldRenderer::unloadLevel()
 
   lowresWaterHeightmap.close();
   clipmap_decals_mgr::clear();
+  clipmap_decals_cb = nullptr;
   binSceneBbox.setempty();
   closeGround();
   closeClipmap();
@@ -527,14 +636,14 @@ void WorldRenderer::unloadLevel()
   closeDistantHeightmap();
 
   binScene = NULL;
-  binSceneTransparencyNode = {};
   lmeshMgr = NULL;
   water = NULL;
-  if (water_ssr_id >= 0)
-  {
-    d3d::free_predicate(water_ssr_id);
-    water_ssr_id = -1;
-  }
+  for (int &id : water_ssr_ids)
+    if (id >= 0)
+    {
+      d3d::free_predicate(id);
+      id = -1;
+    }
   if (depthAOAboveCtx)
     depthAOAboveCtx->invalidateAO(true);
 
@@ -546,24 +655,27 @@ void WorldRenderer::unloadLevel()
 
   reset_fx_textures_used();
   paintColorsTex.close();
+
+  requestFgRecreation("unloadLevel");
 }
-void WorldRenderer::setWater(FFTWater *fftWater)
+void WorldRenderer::setWater(FFTWater *in_water)
 {
-  water = fftWater;
-  waterDistant[fft_water::RenderMode::WATER_SHADER] = PostFxRenderer("water_distant");
-  waterDistant[fft_water::RenderMode::WATER_DEPTH_SHADER] = PostFxRenderer("water_depth_distant");
+  water = in_water;
   waterLevel = 0;
   if (water)
   {
+    waterDistant[fft_water::RenderMode::WATER_SHADER] = PostFxRenderer("water_distant");
+    waterDistant[fft_water::RenderMode::WATER_DEPTH_SHADER] = PostFxRenderer("water_depth_distant");
+
     const DataBlock *graphics = ::dgs_get_settings()->getBlockByNameEx("graphics");
-    const char *fftWaterQualitySettingStr = graphics->getStr("fftWaterQuality", "ultra");
-    fftWaterQualitySetting = fft_water::RENDER_EXCELLENT;
+    const char *fftWaterQualitySettingStr = graphics->getStr("fftWaterQuality", "high");
+    fftWaterQualitySetting = fft_water::RENDER_GOOD;
     if (stricmp(fftWaterQualitySettingStr, "low") == 0)
       fftWaterQualitySetting = fft_water::RENDER_VERY_LOW;
     else if (stricmp(fftWaterQualitySettingStr, "medium") == 0)
       fftWaterQualitySetting = fft_water::RENDER_LOW;
     else if (stricmp(fftWaterQualitySettingStr, "high") == 0)
-      fftWaterQualitySetting = fft_water::RENDER_GOOD;
+      fftWaterQualitySetting = fft_water::RENDER_GOOD; // -V1048
     else if (stricmp(fftWaterQualitySettingStr, "ultra") == 0)
       fftWaterQualitySetting = fft_water::RENDER_EXCELLENT;
     else
@@ -571,13 +683,13 @@ void WorldRenderer::setWater(FFTWater *fftWater)
 
     const bool ssrEnabled = isWaterSSREnabled();
     const bool oneToFourCascades = graphics->getBool("fftWaterOneToFourCascades", false);
-    invalidateNodeBasedResources();
     fft_water::init_render(water, fftWaterQualitySetting, ssrEnabled, ssrEnabled, oneToFourCascades);
     waterLevel = fft_water::get_level(water);
-    water_ssr_id = d3d::create_predicate();
+    for (int &id : water_ssr_ids)
+      if (id == -1)
+        id = d3d::create_predicate();
 
-    const bool ripples =
-      graphics->getBool("shouldRenderWaterRipples", shouldRenderWaterRipples) && hasFeature(FeatureRenderFlags::RIPPLES);
+    const bool ripples = graphics->getBool("shouldRenderWaterRipples", true) && hasFeature(FeatureRenderFlags::RIPPLES);
 
     if (ripples && hasFeature(FeatureRenderFlags::WAKE))
     {
@@ -590,13 +702,13 @@ void WorldRenderer::setWater(FFTWater *fftWater)
     }
 
     static int wetness_paramsVarId = ::get_shader_variable_id("wetness_params", true);
-    Color4 wetnessParams = ShaderGlobal::get_color4(wetness_paramsVarId);
+    Color4 wetnessParams = ShaderGlobal::get_float4(wetness_paramsVarId);
     wetnessParams.g = waterLevel;
-    ShaderGlobal::set_color4(wetness_paramsVarId, wetnessParams);
+    ShaderGlobal::set_float4(wetness_paramsVarId, wetnessParams);
   }
   else
   {
-    ShaderGlobal::set_real(water_levelVarId, waterLevel = HeightmapHeightCulling::NO_WATER_ON_LEVEL);
+    ShaderGlobal::set_float(water_levelVarId, waterLevel = HeightmapHeightCulling::NO_WATER_ON_LEVEL);
   }
 
   setupWaterQuality();
@@ -620,6 +732,8 @@ ShoreRenderer *WorldRenderer::getShore() { return &shoreRenderer; }
 
 bool WorldRenderer::isWaterPlanarReflectionTerrainEnabled() const { return water_quality == 2; }
 
+bool WorldRenderer::hasWaterSSRAlternateReflections() const { return water_quality == 2; }
+
 void WorldRenderer::setupWaterQuality()
 {
   waterPlanarReflectionTerrainNode = {};
@@ -629,7 +743,7 @@ void WorldRenderer::setupWaterQuality()
   static const int water_qualityVarId = get_shader_glob_var_id("water_quality", true);
   static const int water_refraction_base_mipVarId = get_shader_glob_var_id("water_refraction_base_mip", true);
   ShaderGlobal::set_int(water_qualityVarId, water_quality);
-  ShaderGlobal::set_real(water_refraction_base_mipVarId, water_quality == 2 ? 0.f : 1.f);
+  ShaderGlobal::set_float(water_refraction_base_mipVarId, water_quality == 2 ? 0.f : 1.f);
 
   fft_water::set_grid_lod0_additional_tesselation(water, water_quality > 0 ? maxWaterTessellation : 0);
   fft_water::force_actual_waves(water, water_quality > 0);
@@ -679,6 +793,7 @@ void WorldRenderer::resetMainSkies(DaSkies *skies)
   mainSkiesParams.transmittanceColorQuality = chosenQuality;
   mainSkiesParams.scatteringRangeScale = 1;
   mainSkiesParams.minScatteringRange = 80000;
+  mainSkiesParams.strataInLowres = false;
 
   main_pov_data = skies->createSkiesData("main_bounding", mainSkiesParams);
 }
@@ -688,6 +803,8 @@ void WorldRenderer::setSkies(DaSkies *skies)
   G_ASSERT(!main_pov_data && !cube_pov_data);
 
   resetMainSkies(skies);
+  if (DngSkies *dngSkies = get_daskies())
+    dngSkies->applyCloudsTraceCheckerboardSetting();
 
   PreparedSkiesParams cubicSkiesParams;
   cubicSkiesParams.panoramic = PreparedSkiesParams::Panoramic::ON;
@@ -705,7 +822,7 @@ void WorldRenderer::setSkies(DaSkies *skies)
 void WorldRenderer::onSceneLoaded(BaseStreamingSceneHolder *scn)
 {
   binScene = scn;
-  initBinSceneTransparencyNode();
+  requestFgRecreation("onSceneLoaded");
 
   if (scn)
   {
@@ -715,24 +832,23 @@ void WorldRenderer::onSceneLoaded(BaseStreamingSceneHolder *scn)
     binSceneBbox = box;
   }
   if (!water)
-    ShaderGlobal::set_real(water_levelVarId, waterLevel = HeightmapHeightCulling::NO_WATER_ON_LEVEL);
+    ShaderGlobal::set_float(water_levelVarId, waterLevel = HeightmapHeightCulling::NO_WATER_ON_LEVEL);
   shadowsManager.shadowsInvalidate(false);
   shadowsManager.staticShadowsSetWorldSize();
-  invalidateGI(true);
-}
+  invalidateAllGI();
 
-void WorldRenderer::updateLevelGraphicsSettings(const DataBlock &level_blk)
-{
-  levelSettings.reset(new DataBlock(*(level_blk.getBlockByNameEx("graphics"))));
-  update_settings_entity(levelSettings.get());
-  initIndoorProbesIfNecessary();
+#if DAGOR_DBGLEVEL == 0
+  Color4 validationDebugColor = params_validation_debug_colorVarId.get_float4();
+  validationDebugColor.a = 0; // disable debug visualization in release
+  params_validation_debug_colorVarId.set_float4(validationDebugColor);
+#endif
 }
 
 void WorldRenderer::prefetchPartsOfPaintingTexture()
 {
   localPaintTex = SharedTex(localPaintTexId);
-  globalPaintTex = dag::get_tex_gameres("assets_color_global_tex_palette");
-  G_ASSERT(globalPaintTex);
+  globalPaintTex = dag::get_tex_gameres(globalPaintTexName.c_str());
+  G_ASSERTF(globalPaintTex, "global paint palette <%s> not found", globalPaintTexName.c_str());
   if (!localPaintTex)
   {
     localPaintTex = globalPaintTex;
@@ -760,7 +876,7 @@ void WorldRenderer::generatePaintingTexture()
   if (!combinedPaintTex)
     return;
   paintColorsTex.close();
-  paintColorsTex = UniqueTexHolder(eastl::move(combinedPaintTex), "paint_details_tex");
+  paintColorsTex = UniqueTexWithShaderVar(eastl::move(combinedPaintTex), "paint_details_tex");
   {
     d3d::SamplerInfo smpInfo;
     smpInfo.filter_mode = d3d::FilterMode::Point;
@@ -772,6 +888,10 @@ void WorldRenderer::generatePaintingTexture()
 }
 void WorldRenderer::onLevelLoaded(const DataBlock &level_blk)
 {
+#if DAGOR_DBGLEVEL > 0
+  settings_validator::ensure_no_duplicates(dgs_get_settings()->getBlockByName("graphics"), "", false);
+  settings_validator::ensure_no_duplicates(dgs_get_settings()->getBlockByName("video"), "", true);
+#endif
   // this is workaround for race in texture manager
   if (characterMicrodetailsId != BAD_TEXTUREID)
   {
@@ -785,35 +905,35 @@ void WorldRenderer::onLevelLoaded(const DataBlock &level_blk)
 
   sort_transparent_riex_instances.set(
     ::dgs_get_game_params()->getBool("rendinstExtraSortTransparentInstances", sort_transparent_riex_instances.get()));
+  process_reactive_gbuffer_data.set(level_blk.getBlockByNameEx("graphics")->getBool("process_reactive_gbuffer_data", false));
 
-  if (!isForwardRender())
-    createGbufferControlNodes();
+  requestFgRecreation("onLevelLoaded");
+
+  for (const char *nodeTemplate : {"dng_camera_nodes", "dng_ao_camera_nodes", "dng_ssr_camera_nodes"})
+  {
+    G_ASSERT_LOG_ONCE(g_entity_mgr->getTemplateDB().getTemplateByName(nodeTemplate),
+      "%s template missing (renderer danetlib not linked or vromfs out of date)", nodeTemplate);
+    g_entity_mgr->getOrCreateSingletonEntity(ECS_HASH_SLOW(nodeTemplate));
+  }
 
   createFinalOpaqueControlNodes();
-  createTransparentControlNodes();
 
-  updateLevelGraphicsSettings(level_blk);
-  createShadowPassNodes();
-  g_entity_mgr->broadcastEventImmediate(OnLevelLoaded(level_blk));
+  g_entity_mgr->broadcastEventImmediate(EventRenderSceneLoaded(level_blk));
   defrag_shaders_stateblocks(true);
   d3d::driver_command(Drv3dCommand::ACQUIRE_OWNERSHIP);
   if (DngSkies *daskies = get_daskies())
   {
-    update_delayed_weather_selection();
-    daskies->prepare(get_daskies()->getSunDir(), false, 0);
+    ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
+    daskies->prepare(get_daskies()->getSunDir(), 0);
     dir_to_sun.realTime = daskies->getPrimarySunDir();
   }
   dirToSunFlush();
-  if (!renderer_has_feature(FeatureRenderFlags::FORWARD_RENDERING))
-    rendinst::render::renderRendinstShadowsToTextures(-getDirToSun(IShadowInfoProvider::DirToSunType::CSM));
   cameraSpeed = 0;
   invalidateClipmap(false);
   d3d::driver_command(Drv3dCommand::RELEASE_OWNERSHIP);
   prepareLastClip();
   d3d::driver_command(Drv3dCommand::ACQUIRE_OWNERSHIP);
-  if (lmeshMgr)
-    lmeshMgr->setHmapLodDistance(2);
-  else
+  if (!lmeshMgr)
     loadLandMicroDetails(level_blk.getBlockByName("micro_details"));
 
   if (lmeshMgr)
@@ -837,30 +957,30 @@ void WorldRenderer::onLevelLoaded(const DataBlock &level_blk)
   giInvalidateDeferred = 0;
   setGIQualityFromSettings();
   setSettingsSSR();
-  if (isMobileDeferred())
-  {
-    initMobileTerrainSettings();
-    initMobileShadowSettings();
-    initMobileShadersSettings();
-  }
+  updateSettingsSSR(-1, -1);
+  resetSSAOImpl();
   d3d::driver_command(Drv3dCommand::RELEASE_OWNERSHIP);
 
   localPaintTexId = ShaderGlobal::get_tex(get_shader_variable_id("paint_details_tex", true));
+  globalPaintTexName = level_blk.getStr("global_paint_details_tex", "assets_color_global_tex_palette");
   prefetchPartsOfPaintingTexture();
   const DataBlock *overrideRiLodRangeLevel = level_blk.getBlockByNameEx("overrideRiLodRange");
   rendinst::overrideLodRanges(*overrideRiLodRangeLevel);
   rendinst::scheduleRIGenPrepare(make_span(&grs_cur_view.pos, 1)); //==
 
+  changeGrassShadowQuality();
   changeDynamicShadowResolution();
 
-  invalidateGI(true);
+  invalidateAllGI();
   if (getEnviProbeRenderFlags() & ENVI_PROBE_USE_GEOMETRY)
-    invalidateCube();
+    scheduleEnviProbeReRender();
 
   d3d::driver_command(Drv3dCommand::SAVE_PIPELINE_CACHE);
 
   initPortalRendererCallbacks();
   camera_in_camera::setup(hasFeature(CAMERA_IN_CAMERA));
+
+  renderedFrames = 0;
 }
 
 void WorldRenderer::initPortalRendererCallbacks()
@@ -871,16 +991,19 @@ void WorldRenderer::initPortalRendererCallbacks()
 
   auto portalParamsGetterCb = [this]() -> PortalRenderer::CallbackParams {
     PortalRenderer::CallbackParams cb;
-    cb.renderWater = [this](Texture *color_target, const TMatrix &itm, Texture *depth) -> void {
+    cb.renderWater = [this](Texture *color_target, const CameraParams &camera, Texture *depth) -> void {
       d3d::set_render_target({depth, 0}, DepthAccess::SampledRO, {{color_target, 0}});
-      renderWater(itm, WorldRenderer::DistantWater::No, false);
+      renderWater(camera, WorldRenderer::DistantWater::No, false);
     };
     cb.renderLandmesh = [this](mat44f_cref globtm, const TMatrix4 &proj, const Frustum &frustum, const Point3 &view_pos) -> void {
       if (lmeshRenderer && clipmap)
       {
-        lmeshRenderer->setLMeshRenderingMode(LMeshRenderingMode::RENDERING_LANDMESH);
+        LandMeshRenderDesc desc;
+        desc.invGeomLodDist = lmeshRenderer->getInvGeomLodDist();
         clipmap->startSecondaryFeedback();
-        lmeshRenderer->render(globtm, proj, frustum, *lmeshMgr, LandMeshRenderer::RENDER_WITH_CLIPMAP, view_pos);
+        // terrain LOD follows the portal view (view-local), so terrain near the portal focus is detailed
+        lmeshRenderer->render(globtm, proj, frustum, *lmeshMgr, LandMeshRenderer::RENDER_WITH_CLIPMAP, desc, view_pos,
+          HmapOrigin(view_pos));
         clipmap->endSecondaryFeedback();
       }
     };
@@ -910,6 +1033,21 @@ void WorldRenderer::initPortalRendererCallbacks()
     return cb;
   };
   portalRenderer->initCallbacks(portalParamsGetterCb);
+}
+
+void WorldRenderer::changeGrassShadowQuality()
+{
+  const uint32_t GRASS_SHADOWS_QUALITY_COUNT = 5;
+  const uint32_t GRASS_SHADOWS_DEFAULT_QUALITY = 2;
+  const eastl::array<const char *, GRASS_SHADOWS_QUALITY_COUNT> grassShadowsQualityNames = {"off", "low", "medium", "high", "ultra"};
+  const eastl::array<int, GRASS_SHADOWS_QUALITY_COUNT> grassSelfShadowSamples = {0, 2, 4, 8, 16};
+
+  const char *str = ::dgs_get_settings()
+                      ->getBlockByNameEx("graphics")
+                      ->getStr("grassShadowsQuality", grassShadowsQualityNames[GRASS_SHADOWS_DEFAULT_QUALITY]);
+  uint32_t grassShadowQuality = parse_quality_option(str, grassShadowsQualityNames, GRASS_SHADOWS_DEFAULT_QUALITY);
+  static int fast_grass_self_shadow_samplesVarId = ::get_shader_variable_id("fast_grass_self_shadow_samples", true);
+  ShaderGlobal::set_int(fast_grass_self_shadow_samplesVarId, grassSelfShadowSamples[grassShadowQuality]);
 }
 
 int WorldRenderer::getDynamicShadowQuality()
@@ -942,11 +1080,13 @@ void WorldRenderer::setDynamicShadowsMaxUpdatePerFrame()
   lights.setMaxShadowsToUpdateOnFrame(
     ::dgs_get_settings()
       ->getBlockByNameEx("graphics")
-      ->getInt("dynamicShadowsMaxUpdatePerFrame", ClusteredLights::DEFAULT_MAX_SHADOWS_TO_UPDATE_PER_FRAME));
+      ->getInt("dynamicShadowsMaxUpdatePerFrame", DynamicLightShadows::DEFAULT_MAX_SHADOWS_TO_UPDATE_PER_FRAME));
 }
 
 void WorldRenderer::beforeLoadLevel(const DataBlock &level_blk)
 {
+  levelSettings.reset(new DataBlock(*(level_blk.getBlockByNameEx("graphics"))));
+
   // tend to be long action, executed in blocking manner, note it for reports
 #if _TARGET_ANDROID || _TARGET_IOS
   crashlytics::AppState appState("render_beforeLoadLevel");
@@ -954,9 +1094,9 @@ void WorldRenderer::beforeLoadLevel(const DataBlock &level_blk)
 
   worldBBox = BBox3();
   originalLevelBlk = DataBlock(level_blk);
-  giBlk = eastl::make_unique<DataBlock>(*level_blk.getBlockByNameEx("gi"));
-  giMaxUpdateHeightAboveFloor = giBlk->getReal("maxHeightUpdateAboveFloor", 32.0f);
+  giMaxUpdateHeightAboveFloor = ::dgs_get_settings()->getBlockByNameEx("graphics")->getReal("maxHeightGIUpdateAboveFloor", 32.0f);
   giHmapOffsetFromUp = giMaxUpdateHeightAboveFloor - 8.0f; // default 32-8 = 24
+  daGdpRangeScale = 1;
 
   const DataBlock *clustered_lights = originalLevelBlk.getBlockByNameEx("clustered_lights");
   float maxClusteredDist = clustered_lights->getReal("maxClusteredDist", 500.0f);
@@ -986,14 +1126,18 @@ void WorldRenderer::beforeLoadLevel(const DataBlock &level_blk)
     ddsx::tex_pack2_perform_delayed_data_loading(); // or it will crash here
   d3d::set_render_target();
 
-  setSpecularCubesContainerForReinit();
-  reinitCube(level_blk.getPoint3("enviProbePos", Point3(0, 100, 0)));
+  shadowsManager.initShadows();
+
+  setEnviProbePos(level_blk.getPoint3("enviProbePos", Point3(0, 100, 0)));
+  setCubeResolution(dgs_get_settings()->getBlockByNameEx("graphics")->getInt("envi_cube_size", 128));
+  scheduleEnviProbeFullReload();
+
   if (auto *skies = get_daskies())
   {
     const DataBlock &blk = *level_blk.getBlockByNameEx("skies");
     timeDynamic = blk.getBool("isTimeDynamic", false);
     sky_is_unreachable.set(blk.getBool("skyIsUnreachable", true));
-    setupSkyPanoramaAndReflectionFromSetting(true);
+    setupSkyPanoramaAndReflectionFromSetting();
     rendinst::setDirFromSun(-skies->getPrimarySunDir());
   }
   const DataBlock &depthAOAboveBlk = *level_blk.getBlockByNameEx("depthAOAbove");
@@ -1045,13 +1189,8 @@ void WorldRenderer::onLandmeshLoaded(const DataBlock &level_blk, const char *fn,
     if (lightmapTexId == BAD_TEXTUREID)
       logerr("lightmapFileName =<%s> NOT found ", lightmapFileName);
   }
-  constexpr int HMAP_DEFAULT_LOD_COUNT = 5;
-  int hmapLodCnt = level_blk.getInt("hmapLodCount", ::dgs_get_game_params()->getInt("hmapDefaultLodCount", HMAP_DEFAULT_LOD_COUNT));
   LmeshMirroringParams lmeshMirror = load_lmesh_mirroring(level_blk);
-  execute_delayed_action_on_main_thread(make_delayed_action([this, lmeshMirror, lmesh, lmRenderer, hmapLodCnt]() {
-    if (lmesh->getHmapHandler())
-      lmesh->getHmapHandler()->setLodCount(hmapLodCnt);
-
+  execute_delayed_action_on_main_thread(make_delayed_action([this, lmeshMirror, lmesh, lmRenderer]() {
     BBox2 lightmapBbox;
     lightmapBbox.lim[0].x = lmesh->getCellOrigin().x * lmesh->getLandCellSize();
     lightmapBbox.lim[0].y = lmesh->getCellOrigin().y * lmesh->getLandCellSize();
@@ -1064,12 +1203,11 @@ void WorldRenderer::onLandmeshLoaded(const DataBlock &level_blk, const char *fn,
       1.f / (lmesh->getNumCellsY() * lmesh->getLandCellSize()), -(float)lmesh->getCellOrigin().x / lmesh->getNumCellsX(),
       -(float)lmesh->getCellOrigin().y / lmesh->getNumCellsY());
 
-    ShaderGlobal::set_color4(get_shader_variable_id("world_to_lightmap"), world_to_lightmap);
+    ShaderGlobal::set_float4(get_shader_variable_id("world_to_lightmap"), world_to_lightmap);
 
     // init mirroring
     lmRenderer->setMirroring(*lmesh, lmeshMirror.numBorderCellsXPos, lmeshMirror.numBorderCellsXNeg, lmeshMirror.numBorderCellsZPos,
-      lmeshMirror.numBorderCellsZNeg, lmeshMirror.mirrorShrinkXPos, lmeshMirror.mirrorShrinkXNeg, lmeshMirror.mirrorShrinkZPos,
-      lmeshMirror.mirrorShrinkZNeg);
+      lmeshMirror.numBorderCellsZNeg);
     lmeshRenderer = lmRenderer;
     lmeshMgr = lmesh;
 
@@ -1081,6 +1219,35 @@ void WorldRenderer::onLandmeshLoaded(const DataBlock &level_blk, const char *fn,
   }));
 
   debug("lmesh loaded");
+}
+
+void WorldRenderer::setLandmesh(LandMeshManager *lmesh_mgr, LandMeshRenderer *lmesh_renderer, void (*decals_cb)(const BBox3 &landPart))
+{
+  if (!lmesh_mgr || !lmesh_renderer)
+  {
+    lmeshMgr = nullptr;
+    lmeshRenderer = nullptr;
+    clipmap_decals_cb = nullptr;
+    editorHeightmapActive = false;
+
+    closeDeformHeightmap();
+    return;
+  }
+
+  lmeshMgr = lmesh_mgr;
+  lmeshRenderer = lmesh_renderer;
+  clipmap_decals_cb = decals_cb;
+  editorHeightmapActive = true;
+  initDeformHeightmap();
+  if (!clipmap)
+    initClipmap();
+
+  prepareLastClip();
+
+  const DataBlock *clipBlk = ::dgs_get_settings()->getBlockByNameEx("clipmap");
+  float texelSize = clipBlk->getReal("texelSize", 4.0 / 1024);
+  debug("clipmap texelSize = %f", texelSize);
+  clipmap->setStartTexelSize(texelSize);
 }
 
 void WorldRenderer::initDeformHeightmap()
@@ -1187,8 +1354,8 @@ void WorldRenderer::setSharpeningFromSettings()
   if (!hasFeature(FeatureRenderFlags::POSTFX))
     return;
 
-  const float sharpening = ::dgs_get_settings()->getBlockByNameEx("graphics")->getReal("sharpening", 0.f);
-  ShaderGlobal::set_real(contrast_adaptive_sharpeningVarId, -1 / lerp(8.f, 6.f, sharpening / 100.f));
+  const float sharpening = bareMinimumPreset ? 0 : ::dgs_get_settings()->getBlockByNameEx("graphics")->getReal("sharpening", 0.f);
+  ShaderGlobal::set_float(contrast_adaptive_sharpening_strengthVarId, sharpening / 100.f);
 }
 
 void WorldRenderer::createDebugTexOverlay(const int w, const int h)
@@ -1227,18 +1394,16 @@ void WorldRenderer::resetDynamicQuality()
 {
   dynamicQuality.reset();
   if (::dgs_get_settings()->getBlockByNameEx("graphics")->getBool("dynamicQuality", false))
-    dynamicQuality = eastl::make_unique<DynamicQuality>(::dgs_get_settings()->getBlockByName("dynamicQuality"));
+    dynamicQuality = eastl::make_unique<DynamicQuality>(*g_entity_mgr, ::dgs_get_settings()->getBlockByName("dynamicQuality"));
 }
 
 
 void WorldRenderer::onSettingsChanged(const FastNameMap &changed_fields, bool apply_after_reset)
 {
   dafg::invalidate_history();
+  resetConvergenceMarkers();
 
   d3d::GpuAutoLock gpu_al;
-
-  if (changed_fields.getNameId("video/resolution") >= 0)
-    applyAutoResolution();
 
   cachedStaticResolutionScale =
     dgs_get_settings()->getBlockByNameEx("video")->getReal("staticResolutionScale", get_default_static_resolution_scale());
@@ -1255,7 +1420,7 @@ void WorldRenderer::onSettingsChanged(const FastNameMap &changed_fields, bool ap
     reset_anisotropy("*");
     if (lmeshRenderer && lmeshMgr)
       lmeshRenderer->updateCustomSamplers(*lmeshMgr);
-    update_land_micro_details_sampler(getMipmapBias());
+    ShaderGlobal::set_int(dgs_tex_anisotropyVarId, ::dgs_tex_anisotropy);
   }
 
   // we need call this function after changePreset, because it change RenderFeatures
@@ -1294,7 +1459,6 @@ void WorldRenderer::onSettingsChanged(const FastNameMap &changed_fields, bool ap
 
   if (changed_fields.getNameId("graphics/anisotropy") >= 0)
   {
-    apply_last_clip_anisotropy(last_clip_sampler);
     if (!apply_after_reset)
       initClipmap();
     else
@@ -1328,18 +1492,12 @@ void WorldRenderer::onSettingsChanged(const FastNameMap &changed_fields, bool ap
   if (changed_fields.getNameId("graphics/giAlgorithm") >= 0 || changed_fields.getNameId("graphics/giAlgorithmQuality") >= 0)
     setGIQualityFromSettings();
 
-  if (isMobileDeferred())
-  {
-    if (changed_fields.getNameId("graphics/mobileTerrainQuality") >= 0)
-      initMobileTerrainSettings();
-    if (changed_fields.getNameId("graphics/mobileShadowsQuality") >= 0)
-      initMobileShadowSettings();
-    if (changed_fields.getNameId("grapihics/mobileShadersQuality") >= 0)
-      initMobileShadersSettings();
-  }
-
   if (changed_fields.getNameId("graphics/cloudsQuality") >= 0)
-    setupSkyPanoramaAndReflectionFromSetting(false);
+    setupSkyPanoramaAndReflectionFromSetting();
+
+  if (changed_fields.getNameId("graphics/cloudsTraceCheckerboard") >= 0 || changed_fields.getNameId("graphics/cloudsQuality") >= 0)
+    if (DngSkies *dngSkies = get_daskies())
+      dngSkies->applyCloudsTraceCheckerboardSetting();
 
   if (changed_fields.getNameId("graphics/waterQuality") >= 0)
   {
@@ -1362,7 +1520,10 @@ void WorldRenderer::onSettingsChanged(const FastNameMap &changed_fields, bool ap
     setWater(water);
 
   if (changed_fields.getNameId("graphics/environmentDetailsQuality") >= 0)
-    setEnviromentDetailsQuality();
+  {
+    setEnvironmentDetailsQuality();
+    setNbsQuality();
+  }
 
   if (changed_fields.getNameId("graphics/fxTarget") >= 0)
     setFxQuality();
@@ -1371,7 +1532,10 @@ void WorldRenderer::onSettingsChanged(const FastNameMap &changed_fields, bool ap
     setSettingsSSR();
 
   if (changed_fields.getNameId("renderFeatures/cameraInCamera") >= 0)
+  {
+    clearLegacyGPUObjectsVisibility();
     setFeatureFromSettings(CAMERA_IN_CAMERA);
+  }
 
   if (hasMotionVectors != needMotionVectors())
     toggleMotionVectors();
@@ -1385,30 +1549,21 @@ void WorldRenderer::onSettingsChanged(const FastNameMap &changed_fields, bool ap
   if (changed_fields.getNameId("video/perfMetrics") >= 0)
     resetPerformanceMetrics();
 
-  if (changed_fields.getNameId("graphics/gi/inlineRaytracing") >= 0)
-  {
-    d3d::GpuAutoLock gpuLock;
-    setGIQualityFromSettings();
-  }
-
   if (changed_fields.getNameId("graphics/HQProbeReflections") >= 0)
     toggleProbeReflectionQuality();
 
   if (changed_fields.getNameId("graphics/staticUpsampleQuality") >= 0)
     applyStaticUpsampleQuality();
 
-  if (changed_fields.getNameId("renderFeatures/android_mobile_deferred/staticShadows") >= 0)
-    setFeatureFromSettings(STATIC_SHADOWS);
-
-  if (changed_fields.getNameId("renderFeatures/android_mobile_deferred/mobileSimplifiedMaterials") >= 0)
-    setFeatureFromSettings(MOBILE_SIMPLIFIED_MATERIALS);
+  if (changed_fields.getNameId("graphics/grassShadowsQuality") >= 0)
+    changeGrassShadowQuality();
 
   if (changed_fields.getNameId("graphics/dynamicShadowsQuality") >= 0)
     changeDynamicShadowResolution();
   if (changed_fields.getNameId("graphics/dynamicShadowsMaxUpdatePerFrame") >= 0)
     setDynamicShadowsMaxUpdatePerFrame();
 
-  if (changed_fields.getNameId("graphics/sharpening") >= 0)
+  if (changed_fields.getNameId("graphics/sharpening") >= 0 || changed_fields.getNameId("graphics/preset") >= 0)
     setSharpeningFromSettings();
 
   if (changed_fields.getNameId("graphics/fxaaQuality") >= 0)
@@ -1419,7 +1574,7 @@ void WorldRenderer::onSettingsChanged(const FastNameMap &changed_fields, bool ap
       changed_fields.getNameId("graphics/consolePreset") >= 0)
     setChromaticAberrationFromSettings();
 
-  if (changed_fields.getNameId("graphics/filmGrain") >= 0 || changed_fields.getNameId("cinematicEffects/filmGrain") >= 0 ||
+  if (changed_fields.getNameId("graphics/filmGrain") >= 0 || changed_fields.getNameId("cinematicEffects/filmGrainNoise") >= 0 ||
       changed_fields.getNameId("graphics/preset") >= 0 || changed_fields.getNameId("graphics/consolePreset") >= 0)
     setFilmGrainFromSettings();
 }
@@ -1430,15 +1585,25 @@ void WorldRenderer::beforeDeviceReset(bool full_reset)
 
   if (full_reset)
   {
+    if (clipmap)
+      clipmap->beforeReset();
+
     ddsx::cease_delayed_data_loading(ddsx::hq_tex_priority);
     ddsx::cease_delayed_data_loading(0);
     DEBUG_CP();
   }
+  else
+  {
+    if (clipmap)
+      clipmap->finalizeFeedback(); // just for good measure.
+  }
+
   acesfx::before_reset();
-  HeightmapRenderer::beforeResetDevice();
+  lod_grid_vdata_before_reset_device();
   clearLegacyGPUObjectsVisibility();
-  if (clipmap)
-    clipmap->beforeReset();
+
+  if (full_reset)
+    lights.beforeResetDevice();
 }
 
 void WorldRenderer::afterDeviceReset(bool full_reset)
@@ -1460,7 +1625,8 @@ void WorldRenderer::afterDeviceReset(bool full_reset)
 
   {
     d3d::GpuAutoLock gpuLock;
-    HeightmapRenderer::afterResetDevice();
+    lod_grid_vdata_after_reset_device();
+    rendinst::gpuobjects::after_device_reset();
     ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
     acesfx::after_reset();
 
@@ -1472,6 +1638,11 @@ void WorldRenderer::afterDeviceReset(bool full_reset)
   }
 
   afterResetNBS();
+
+  if (auto portalRenderer = portal_renderer_mgr::query_portal_renderer())
+    portalRenderer->afterDeviceReset();
+
+  after_device_reset_fluid_wind();
 
   if (full_reset)
   {
@@ -1507,30 +1678,34 @@ void WorldRenderer::afterDeviceReset(bool full_reset)
     initResetable();
     resetGI();
     delayedRenderCtx.invalidate();
-    invalidateCube();
-    reinitSpecularCubesContainerIfNeeded();
+    scheduleEnviProbeFullReload();
     onSceneLoaded(binScene);
-    g_entity_mgr->broadcastEventImmediate(AfterDeviceReset(full_reset));
+    g_entity_mgr->broadcastEventImmediate(EventAfterDeviceReset(full_reset));
 
     clipmap_decals_mgr::after_reset();
 
     ddsx::tex_pack2_perform_delayed_data_loading(0);
-    if (!renderer_has_feature(FeatureRenderFlags::FORWARD_RENDERING))
-      rendinst::render::renderRendinstShadowsToTextures(-getDirToSun(IShadowInfoProvider::DirToSunType::CSM));
     prepareLastClip();
     fft_water::reset_render(water);
-    if (water_ssr_id == -1)
-      water_ssr_id = d3d::create_predicate();
-    lights.afterReset();
+    for (int &id : water_ssr_ids)
+      if (id == -1)
+        id = d3d::create_predicate();
+    lights.afterResetDevice();
     if (paintColorsTex)
     {
       paintColorsTex.close();
       prefetchPartsOfPaintingTexture();
+
+      // re-attach initial paint details texture, to avoid OOB access to null texture
+      // localPaintTexId is stale here, so use localPaintTex instead, that prefetchPartsOfPaintingTexture() just set
+      ShaderGlobal::set_texture(get_shader_variable_id("paint_details_tex", true), localPaintTex.getTexId());
     }
   }
   ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
 
   shadowsManager.afterDeviceReset();
+
+  createDeforms();
 
   backbufferTex.close();
   updateBackBufferTex();
@@ -1552,15 +1727,17 @@ void WorldRenderer::applySettingsChanged()
 {
   d3d::GpuAutoLock gpuLock;
   setResolution();
-  createFramegraphNodes();
+  requestFgRecreation("applySettingsChanged");
 }
 
-void WorldRenderer::createFramegraphNodes()
+void WorldRenderer::processPendingFgRecreation()
 {
-  if (isForwardRender())
-    createNodesForward();
-  else
+  if (hasPendingFgRecreation)
+  {
+    TIME_PROFILE(createFramegraphNodes);
     createNodes();
+    hasPendingFgRecreation = false;
+  }
 }
 
 void WorldRenderer::changeStateFOMShadows()
@@ -1581,10 +1758,13 @@ void WorldRenderer::changeStateFOMShadows()
 
 void WorldRenderer::resetSSAOImpl()
 {
-  aoFGNodes = {};
+  const ecs::EntityId aoNodesEid = g_entity_mgr->getSingletonEntity(ECS_HASH("dng_ao_camera_nodes"));
+  const ecs::string *registratorName = g_entity_mgr->getNullable<ecs::string>(aoNodesEid, ECS_HASH("dafg_camera_registrator__name"));
+
+  G_ASSERT_RETURN(!aoNodesEid || registratorName, );
 
   int aoW, aoH;
-  getRenderingResolution(aoW, aoH);
+  getMaxPossibleRenderingResolution(aoW, aoH);
   aoW /= 2;
   aoH /= 2;
   const bool ssaoOn = hasFeature(SSAO) && lvl_override::getBool(levelSettings.get(), "ssao_enabled", true);
@@ -1593,6 +1773,9 @@ void WorldRenderer::resetSSAOImpl()
   {
     g_entity_mgr->destroyEntity(g_entity_mgr->getSingletonEntity(ECS_HASH("capsules_ao"))); // destroy capsules AO
     g_entity_mgr->broadcastEventImmediate(ResetAoEvent(IPoint2(aoW, aoH), ResetAoEvent::CLOSE));
+
+    if (registratorName)
+      disable_camera_registrator_nodes(*registratorName, aoNodesEid);
     return;
   }
 
@@ -1603,15 +1786,19 @@ void WorldRenderer::resetSSAOImpl()
     aoQuality = AoQuality::LOW;
   else if (strcmp(aoQualityStr, "high") == 0)
     aoQuality = AoQuality::HIGH;
+  else if (strcmp(aoQualityStr, "ultra") == 0)
+    aoQuality = AoQuality::ULTRA;
   else
     aoQuality = AoQuality::MEDIUM;
+
+  ShaderGlobal::set_int(parallax_ao_enabledVarId, aoQuality == AoQuality::ULTRA ? 1 : 0);
 
   if (!hasFeature(DOWNSAMPLED_NORMALS))
     aoQuality = AoQuality::LOW;
   if (is_rtao_enabled() || is_ptgi_enabled())
     aoQuality = AoQuality::LOW;
 
-  if (aoQuality == AoQuality::HIGH)
+  if (aoQuality >= AoQuality::HIGH)
   {
     g_entity_mgr->getOrCreateSingletonEntity(ECS_HASH("capsules_ao")); // create capsules AO
   }
@@ -1620,7 +1807,7 @@ void WorldRenderer::resetSSAOImpl()
     g_entity_mgr->destroyEntity(g_entity_mgr->getSingletonEntity(ECS_HASH("capsules_ao"))); // destroy capsules AO
   }
   g_entity_mgr->broadcastEventImmediate(
-    ResetAoEvent(IPoint2(aoW, aoH), aoQuality == AoQuality::HIGH ? ResetAoEvent::INIT : ResetAoEvent::CLOSE));
+    ResetAoEvent(IPoint2(aoW, aoH), aoQuality >= AoQuality::HIGH ? ResetAoEvent::INIT : ResetAoEvent::CLOSE));
 
   uint32_t creationFlags = SSAO_NONE;
   if (hasFeature(CONTACT_SHADOWS))
@@ -1629,18 +1816,19 @@ void WorldRenderer::resetSSAOImpl()
     creationFlags |= SSAO_USE_WSAO;
   if (getGiQuality().algorithm == GiAlgorithm::LOW && hasFeature(CONTACT_SHADOWS))
     creationFlags |= SSAO_USE_CONTACT_SHADOWS_SIMPLIFIED;
-  if (isThinGBuffer() || is_rtao_enabled() || is_ptgi_enabled())
+  if (isThinGBuffer())
     creationFlags |= SSAO_IMMEDIATE;
 
-  bool hq = aoQuality != AoQuality::LOW;
-  aoFGNodes = makeAmbientOcclusionNodes(hq ? AoAlgo::GTAO : AoAlgo::SSAO, aoW, aoH, creationFlags);
+  bool useGTAO = aoQuality != AoQuality::LOW;
+  g_entity_mgr->broadcastEventImmediate(ResetAoNodes(useGTAO, aoW, aoH, creationFlags));
+  ShaderGlobal::set_int(ssao_is_gtaoVarId, useGTAO ? 1 : 0);
 
-  if (!hq)
+  if (!useGTAO)
   {
     int quality = hasFeature(DOWNSAMPLED_NORMALS) ? 1 : (getGiQuality().algorithm == GiAlgorithm::LOW ? -1 : 0);
     ShaderGlobal::set_int(ssao_qualityVarId, quality);
     ShaderGlobal::set_int(blur_qualityVarId, quality);
-    ShaderGlobal::set_real(ssao_strengthVarId, 1.0f);
+    ShaderGlobal::set_float(ssao_strengthVarId, 1.0f);
   }
 }
 
@@ -1682,7 +1870,7 @@ void WorldRenderer::setSettingsSSR()
     ssr_quality.set(0);
   else if (ssrQuality == eastl::string_view("medium"))
     ssr_quality.set(1);
-  else if (ssrQuality == eastl::string_view("high"))
+  else if (ssrQuality == eastl::string_view("high") || ssrQuality == eastl::string_view("movie"))
     ssr_quality.set(2);
   else
   {
@@ -1692,8 +1880,7 @@ void WorldRenderer::setSettingsSSR()
 
   ShaderGlobal::set_int(glass_dynamic_lightVarId, ssr_quality >= 1 ? 1 : 0);
 
-  if (is_rtr_enabled())
-    ssr_quality.set(0);
+  ssr_enable.set(!is_rtr_enabled());
 }
 
 void WorldRenderer::getMaxPossibleRenderingResolution(int &width, int &height) const
@@ -1706,37 +1893,52 @@ void WorldRenderer::getMaxPossibleRenderingResolution(int &width, int &height) c
 
 void WorldRenderer::updateSettingsSSR(int width, int height)
 {
-  ssrFGNodes.clear();
+  const ecs::EntityId ssrNodesEid = g_entity_mgr->getSingletonEntity(ECS_HASH("dng_ssr_camera_nodes"));
+  const ecs::string *registratorName = g_entity_mgr->getNullable<ecs::string>(ssrNodesEid, ECS_HASH("dafg_camera_registrator__name"));
 
-  const DataBlock *graphicsBlk = ::dgs_get_settings()->getBlockByNameEx("graphics");
-  if (isSSREnabled())
+  G_ASSERT_RETURN(!ssrNodesEid || registratorName, );
+
+  if (!isSSREnabled())
   {
-    bool ssrHQ = graphicsBlk->getBool("hqSSR", false);
-    if (width < 0 || height < 0)
-      getMaxPossibleRenderingResolution(width, height);
-
-    struct
-    {
-      bool alternateReflections;
-      int qualityShaderVar;
-      SSRQuality quality;
-    } qualityPresets[] = {
-      // SDFrefl, ShaderVar, SSRQuality
-      {false, 0, SSRQuality::Compute}, // 0 Compute Low
-      {false, 2, SSRQuality::Compute}, // 2 Compute High
-      {true, 3, SSRQuality::Compute},  // 3 Compute Highest
-    };
-    G_ASSERT(ssr_quality.getMax() == eastl::size(qualityPresets) - 1);
-    const auto qualityPreset = qualityPresets[ssr_quality.get()];
-
-    ShaderGlobal::set_int(get_shader_variable_id("ssr_resolution", true), ssr_fullres.get());
-    ShaderGlobal::set_int(get_shader_variable_id("ssr_quality", true), qualityPreset.qualityShaderVar);
-    ssrWantsAlternateReflections = qualityPreset.alternateReflections;
-    ssrFGNodes = makeScreenSpaceReflectionNodes(width, height, ssr_fullres.get(), ssr_denoiser.get(), ssrHQ ? TEXFMT_A16B16G16R16F : 0,
-      qualityPreset.quality);
-  }
-  else
     ssrWantsAlternateReflections = false;
+
+    if (registratorName)
+      disable_camera_registrator_nodes(*registratorName, ssrNodesEid);
+
+    return;
+  }
+
+  const bool ssrHQ = ::dgs_get_settings()->getBlockByNameEx("graphics")->getBool("hqSSR", false);
+  if (width < 0 || height < 0)
+    getMaxPossibleRenderingResolution(width, height);
+
+  struct
+  {
+    bool alternateReflections;
+    int qualityShaderVar;
+    SSRQuality quality;
+  } qualityPresets[] = {
+    // SDFrefl, ShaderVar, SSRQuality
+    {false, 0, SSRQuality::Compute}, // 0 Compute Low
+    {false, 2, SSRQuality::Compute}, // 2 Compute High
+    {true, 3, SSRQuality::Compute},  // 3 Compute Highest
+  };
+  G_ASSERT(ssr_quality.getMax() == eastl::size(qualityPresets) - 1);
+  const auto qualityPreset = qualityPresets[ssr_quality.get()];
+
+  ShaderGlobal::set_int(get_shader_variable_id("ssr_resolution", true), ssr_fullres.get());
+  ShaderGlobal::set_int(get_shader_variable_id("ssr_quality", true), qualityPreset.qualityShaderVar);
+  ssrWantsAlternateReflections = qualityPreset.alternateReflections;
+
+  SsrNodesConfig config;
+  config.w = width;
+  config.h = height;
+  config.fmt = ssrHQ ? TEXFMT_A16B16G16R16F : 0;
+  config.denoiserType = ssr_denoiser.get();
+  config.quality = qualityPreset.quality;
+  config.isFullres = ssr_fullres.get();
+
+  g_entity_mgr->broadcastEventImmediate(ResetSsrNodes(config));
 }
 
 #if !_TARGET_PC && !_TARGET_ANDROID && !_TARGET_IOS && !_TARGET_C3
@@ -1802,7 +2004,11 @@ void WorldRenderer::getPostFxInternalResolution(int &w, int &h) const
 #endif
 
   if (currentAntiAliasingMode == AntiAliasingMode::DLSS || currentAntiAliasingMode == AntiAliasingMode::XESS ||
-      currentAntiAliasingMode == AntiAliasingMode::FSR2 || currentAntiAliasingMode == AntiAliasingMode::PSSR)
+      currentAntiAliasingMode == AntiAliasingMode::FSR
+#if _TARGET_C2
+
+#endif
+  )
   {
     // DLSS/XeSS/TSR run before the postfx pass, and upscale the image, so the postfx will be done at display resolution.
     return;
@@ -1813,17 +2019,8 @@ void WorldRenderer::getPostFxInternalResolution(int &w, int &h) const
   {
     resolution = getSSAAResolution(displayResolution);
   }
-  else if (currentAntiAliasingMode == AntiAliasingMode::TSR)
-  {
-    // TAA cannot be used to scale resolution by itself, but we can scale after the postfx pass
-    if (isFsrEnabled())
-    {
-      resolution = getFsrScaledResolution(displayResolution);
-    }
-  }
   else
   {
-    // MSAA always renders at 100%
     // FXAA and OFF scale up after postfx
     resolution = getStaticScaledResolution(displayResolution);
   }
@@ -1858,17 +2055,14 @@ void WorldRenderer::resetResolutionOverride()
 float WorldRenderer::getMipmapBias() const
 {
   float lodBias = antiAliasing ? antiAliasing->getLodBias() : 0.f;
-  lodBias += isFsrEnabled() ? fsrMipBias : 0.0f;
   lodBias += isSSAAEnabled() ? ssaaMipBias : 0.0f;
   return taa_base_mip_scale.get() + lodBias;
 }
 
-void WorldRenderer::invalidateNodeBasedResources() { NodeBasedShaderManager::clearAllCachedResources(); }
-
 eastl::optional<IPoint2> WorldRenderer::getDimsForVrsTexture(int screenWidth, int screenHeight)
 {
-  const Driver3dDesc &drvDesc = d3d::get_driver_desc();
-  if (!d3d::get_driver_desc().caps.hasVariableRateShadingTexture)
+  auto &drvDesc = d3d::get_driver_desc();
+  if (!drvDesc.caps.hasVariableRateShadingTexture)
     return eastl::nullopt;
 
   int tileSizeX = static_cast<int>(drvDesc.variableRateTextureTileSizeX);
@@ -1883,56 +2077,46 @@ void WorldRenderer::setAntialiasing()
   prepareForPostfxNoAANode = {};
   fxaaNode = {};
   ssaaNode = {};
+
+  antiAliasing.reset();
+
+  render::antialiasing::reinit();
+
+  const auto antialiasingMethod = render::antialiasing::get_method();
+  currentAntiAliasingMode = convertAntialiasingMethod(antialiasingMethod);
+
   IPoint2 postFxResolution;
   getPostFxInternalResolution(postFxResolution.x, postFxResolution.y);
-
-  // fallback to TAA if external AA methods are set but not available
-  if ((currentAntiAliasingMode == AntiAliasingMode::DLSS && !DeepLearningSuperSampling::is_enabled()) ||
-      (currentAntiAliasingMode == AntiAliasingMode::XESS && !XeSuperSampling::is_enabled()) ||
-      (currentAntiAliasingMode == AntiAliasingMode::FSR2 && !FSR2::is_enabled())
-#if _TARGET_C2
-
-#endif
-  )
-  {
-    currentAntiAliasingMode = AntiAliasingMode::TSR;
-  }
+  ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::TEMPORAL); // default
 
   switch (currentAntiAliasingMode)
   {
     case AntiAliasingMode::DLSS:
-      if (DeepLearningSuperSampling::is_enabled())
-      {
-        antiAliasing = eastl::make_unique<DeepLearningSuperSampling>(postFxResolution);
-        ShaderGlobal::set_int(antialiasing_typeVarId, AA_TYPE_DLSS);
-      }
+      antiAliasing = eastl::make_unique<DeepLearningSuperSampling>(postFxResolution);
+      ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::TEMPORAL);
       break;
     case AntiAliasingMode::XESS:
-      if (XeSuperSampling::is_enabled())
-      {
-        antiAliasing = eastl::make_unique<XeSuperSampling>(postFxResolution);
-        ShaderGlobal::set_int(antialiasing_typeVarId, AA_TYPE_DLSS);
-      }
+      antiAliasing = eastl::make_unique<XeSuperSampling>(postFxResolution);
+      ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::TEMPORAL);
       break;
     case AntiAliasingMode::TSR:
       antiAliasing = eastl::make_unique<TemporalSuperResolution>(postFxResolution);
-      ShaderGlobal::set_int(antialiasing_typeVarId, AA_TYPE_TSR);
+      ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::TSR);
       break;
-    case AntiAliasingMode::FSR2:
-      if (FSR2::is_enabled())
-      {
-        antiAliasing = eastl::make_unique<FSR2>(postFxResolution);
-        ShaderGlobal::set_int(antialiasing_typeVarId, AA_TYPE_DLSS);
-      }
+    case AntiAliasingMode::FSR:
+      antiAliasing = eastl::make_unique<FSR>(postFxResolution);
+      ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::TEMPORAL);
       break;
     case AntiAliasingMode::FXAA:
       fxaaNode = makeFXAANode(isStaticUpsampleEnabled() ? "frame_to_upscale" : "frame_after_postfx", !isStaticUpsampleEnabled());
       prepareForPostfxNoAANode = makePrepareForPostfxNoAANode();
+      ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::NON_TEMPORAL);
       break;
     case AntiAliasingMode::SSAA:
       ssaaNode = makeSSAANode();
       ssaaMipBias = log2(float(getSSAAResolution(postFxResolution).y) / float(postFxResolution.y));
       prepareForPostfxNoAANode = makePrepareForPostfxNoAANode();
+      ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::NON_TEMPORAL);
       break;
 #if _TARGET_C2
 
@@ -1942,74 +2126,43 @@ void WorldRenderer::setAntialiasing()
 #endif
     default: prepareForPostfxNoAANode = makePrepareForPostfxNoAANode(); break;
   }
-}
 
-void WorldRenderer::applyAutoResolution()
-{
-#ifdef _TARGET_PC_WIN
-  auto &video = *::dgs_get_settings()->getBlockByNameEx("video");
-  const char *resolution = video.getStr("resolution", "auto");
-  const bool overrideResolution = video.getBool("overrideAAforAutoResolution", false);
-  if (overrideResolution && strcmp(resolution, "auto") == 0)
+  // if for some reason selected AA mode fails to init, use TSR as fallback and no AA if TSR fails too
+  if (antiAliasing && !antiAliasing->isAvailable())
   {
-    int w, h;
-    WorldRenderer::getDisplayResolution(w, h);
-
-    // use TSR upscaler if the display area is larger than full hd in upscalerThreshold times
-    constexpr float fullHdArea = 1920 * 1080;
-    const float upscalerThreshold = video.getReal("autoResolutionUpscalerThreshold");
-    if (float(w * h) / fullHdArea >= upscalerThreshold)
+    if (currentAntiAliasingMode != AntiAliasingMode::TSR)
     {
-      DataBlock overriddenSettings;
-      auto &overriddenVideo = *overriddenSettings.addBlock("video");
-
-      // DPI based scaling, will get value in range (50, 101, 5)
-      const float resolutionScale = ((eastl::max(int(100 / eastl::max(d3d::get_display_scale(), 1.f)), 50) + 2) / 5) * 5;
-      const auto aaMode = AntiAliasingMode::TSR;
-
-      overriddenVideo.setInt("antiAliasingMode", eastl::to_underlying(aaMode));
-      overriddenSettings.addBlock("graphics")->addInt("tsrQuality", eastl::to_underlying(TemporalSuperResolution::Preset::High));
-      overriddenVideo.setReal("temporalUpsamplingRatio", resolutionScale);
-
-      dgs_apply_config_blk(overriddenSettings, false, false);
+      currentAntiAliasingMode = AntiAliasingMode::TSR;
+      render::antialiasing::set_method(render::antialiasing::AntialiasingMethod::TSR);
+      antiAliasing = eastl::make_unique<TemporalSuperResolution>(postFxResolution);
+      ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::TSR);
+    }
+    if (!antiAliasing->isAvailable())
+    {
+      render::antialiasing::set_method(render::antialiasing::AntialiasingMethod::None);
+      currentAntiAliasingMode = AntiAliasingMode::OFF;
+      prepareForPostfxNoAANode = makePrepareForPostfxNoAANode();
     }
   }
-#endif
+
+  g_entity_mgr->broadcastEventImmediate(SetAntialiasing());
 }
 
 void WorldRenderer::setResolution()
 {
-  // Some WorldRenderer's textures (downsampled_close_depth_tex at least) can be acquired
-  // in node based shaders, so we need to reset them from there.
-  // Otherwise we can't recreate these textures
-  NodeBasedShaderManager::clearAllCachedResources();
-
-  if (isForwardRender())
-  {
-    setResolutionForward();
-    return;
-  }
-
   int w, h;
   WorldRenderer::getDisplayResolution(w, h);
 
   createDebugTexOverlay(w, h);
 
-  loadAntiAliasingSettings();
-  loadFsrSettings();
+  antiAliasing.reset();
+  closeStaticUpsample();
+  prepareForPostfxNoAANode = {};
 
   IPoint2 displayResolution(w, h);
 #if !_TARGET_PC && !_TARGET_ANDROID && !_TARGET_IOS && !_TARGET_C3
   fixedPostfxResolution = getFixedPostfxResolution(displayResolution);
 #endif
-  IPoint2 postFxResolution(w, h);
-  getPostFxInternalResolution(postFxResolution.x, postFxResolution.y);
-  dafg::set_resolution("post_fx", postFxResolution);
-
-  antiAliasing.reset();
-  closeStaticUpsample();
-  closeFsr();
-  prepareForPostfxNoAANode = {};
 
   if (hasFeature(FeatureRenderFlags::TAA))
   {
@@ -2017,9 +2170,15 @@ void WorldRenderer::setResolution()
   }
   else
   {
+    currentAntiAliasingMode = AntiAliasingMode::FXAA;
     ssaaNode = {};
     prepareForPostfxNoAANode = makePrepareForPostfxNoAANode();
   }
+
+  IPoint2 postFxResolution(w, h);
+  getPostFxInternalResolution(postFxResolution.x, postFxResolution.y);
+  dafg::set_resolution("post_fx", postFxResolution);
+
   motion_vector_access::set_motion_vector_type(
     needMotionVectors() ? motion_vector_access::MotionVectorType::DynamicUVZ : motion_vector_access::MotionVectorType::StaticUVZ);
   initStaticUpsample(displayResolution, postFxResolution); // Used on consoles and bareMinimum
@@ -2029,25 +2188,29 @@ void WorldRenderer::setResolution()
   dynamicResolution.reset();
   if (::dgs_get_settings()->getBlockByNameEx("video")->getBlockByNameEx("dynamicResolution")->getInt("targetFPS", 0) > 0)
   {
-    if (antiAliasing && antiAliasing->supportsDynamicResolution() && d3d::get_driver_desc().caps.hasAliasedTextures &&
-        d3d::get_driver_desc().caps.hasResourceHeaps && !is_bvh_enabled())
+    if (auto &caps = d3d::get_driver_desc().caps;
+        antiAliasing && antiAliasing->supportsDynamicResolution() && caps.hasAliasedTextures && caps.hasResourceHeaps)
     {
-      antiAliasing->setInputResolution(postFxResolution);
       dynamicResolution = eastl::make_unique<DynamicResolution>(postFxResolution.x, postFxResolution.y);
+      IPoint2 currentRes;
+      dynamicResolution->getCurrentResolution(currentRes.x, currentRes.y);
+      antiAliasing->setInputResolution(currentRes);
     }
     else
       debug("Dynamic Resolution was enabled in settings but not available due to %s",
-        currentAntiAliasingMode != AntiAliasingMode::TSR && currentAntiAliasingMode != AntiAliasingMode::PSSR
+        currentAntiAliasingMode != AntiAliasingMode::TSR
+#if _TARGET_C2
+
+#endif
           ? "anti-aliasing (need TSR)"
-        : !d3d::get_driver_desc().caps.hasAliasedTextures ? "driver (need alias support)"
-        : !d3d::get_driver_desc().caps.hasResourceHeaps   ? "driver (need heaps support)"
-        : is_bvh_enabled()                                ? "enabled ray tracing"
-                                                          : "unknown");
+          : !caps.hasAliasedTextures ? "driver (need alias support)"
+            : !caps.hasResourceHeaps ? "driver (need heaps support)"
+                                     : "unknown");
   }
 
-  darg::bhv_fps_bar.setRenderingResolution(dynamicResolution ? eastl::make_optional(postFxResolution) : eastl::nullopt);
-
-  IPoint2 renderingResolution = antiAliasing ? antiAliasing->getInputResolution() : postFxResolution; //-V574
+  IPoint2 renderingResolution;
+  getMaxPossibleRenderingResolution(renderingResolution.x, renderingResolution.y);
+  darg::bhv_fps_bar.setRenderingResolution(dynamicResolution ? eastl::make_optional(renderingResolution) : eastl::nullopt);
   w = renderingResolution.x;
   h = renderingResolution.y;
 
@@ -2058,7 +2221,7 @@ void WorldRenderer::setResolution()
   const int reflW = w / 2, reflH = h / 2;
 
   if (isWaterSSREnabled())
-    ShaderGlobal::set_color4(get_shader_variable_id("water_reflection_size", true), reflW, reflH, 1.0f / reflW, 1.0f / reflH);
+    ShaderGlobal::set_float4(get_shader_variable_id("water_reflection_size", true), reflW, reflH, 1.0f / reflW, 1.0f / reflH);
   // initCloseDepth();
 
   // water-
@@ -2067,12 +2230,12 @@ void WorldRenderer::setResolution()
 
   initClipmap();
 
-  ShaderGlobal::set_color4(rendering_resVarId, w, h, 1.0f / w, 1.0f / h);
+  ShaderGlobal::set_float4(rendering_resVarId, w, h, 1.0f / w, 1.0f / h);
 
   int halfW = w / 2, halfH = h / 2;
-  ShaderGlobal::set_color4(lowres_rt_paramsVarId, halfW, halfH, 0, 0);
+  ShaderGlobal::set_float4(lowres_rt_paramsVarId, halfW, halfH, 0, 0);
 
-  ShaderGlobal::set_color4(lowres_tex_sizeVarId, w / 2, h / 2, 1.0f / (w / 2), 1.0f / (h / 2));
+  ShaderGlobal::set_float4(lowres_tex_sizeVarId, w / 2, h / 2, 1.0f / (w / 2), 1.0f / (h / 2));
 
   // bool ssrCompute = ::dgs_get_settings()->getBool("ssrCompute", false);       // compute ssr turned off for now
   setSettingsSSR();
@@ -2089,7 +2252,6 @@ void WorldRenderer::setResolution()
     storeDownsampledTexturesInEsram = h <= 944;
     downsampledTexturesMipCount = max(min(get_log2w(w / 2), get_log2w(h / 2)) - 1, 4);
     ShaderGlobal::set_int(downsampled_depth_mip_countVarId, downsampledTexturesMipCount);
-    createDownsampleDepthNode(); // Depends on storeDownsampledTexturesInEsram and downsampledTexturesMipCount.
   }
 
   copyDepth.init("copy_depth");
@@ -2108,15 +2270,26 @@ void WorldRenderer::setResolution()
   if (hdrrender::is_hdr_enabled())
   {
     auto prevt = hdrrender::get_render_target_tex();
-    hdrrender::set_resolution(displayResolution.x, displayResolution.y, isFsrEnabled()); // This might re-create tex
+    hdrrender::set_resolution(displayResolution.x, displayResolution.y, false); // This might re-create tex
     setRtControl(RtControl::RT, /*force*/ prevt != hdrrender::get_render_target_tex());
     setFinalTargetTex(&hdrrender::get_render_target(), "[HDR, RT]");
   }
   else if (!d3d::get_backbuffer_tex() || overrideDisplayRes)
   {
     setRtControl(RtControl::OWNED_RT, /*force*/ true);
-    ownedBackbufferTex = dag::create_tex(NULL, displayResolution.x, displayResolution.y,
-      TEXCF_RTARGET | (isFsrEnabled() ? TEXCF_UNORDERED : 0), 1, "final_target_frame");
+    // FIXME: finalTargetTex registered in FG as external texture
+    // somehow if its format changes when switching from BB mode to OwnedRT mode
+    // FG check is triggered about "changed formats in rendering", while it should not
+    // here is workaround - use BB format to make check happy
+    int bbFmt = TEXFMT_DEFAULT;
+    if (d3d::get_backbuffer_tex())
+    {
+      TextureInfo info;
+      d3d::get_backbuffer_tex()->getinfo(info);
+      bbFmt = info.cflg & TEXFMT_MASK;
+    }
+    ownedBackbufferTex =
+      dag::create_tex(NULL, displayResolution.x, displayResolution.y, TEXCF_RTARGET | bbFmt, 1, "final_target_frame");
     setFinalTargetTex(&ownedBackbufferTex, "[OwnedRT]");
   }
   else
@@ -2124,15 +2297,6 @@ void WorldRenderer::setResolution()
     setRtControl(RtControl::BACKBUFFER, /*force*/ !backbufferTex || backbufferTex.getBaseTex() != d3d::get_backbuffer_tex());
     updateBackBufferTex();
   }
-
-  if (isFsrEnabled())
-  {
-    initFsr(postFxResolution, displayResolution);
-  }
-  ShaderGlobal::set_int(get_shader_glob_var_id("fsr_on", true), isFsrEnabled());
-
-  if (isForwardRender())
-    G_ASSERT(target);
 
   changeStateFOMShadows();
 
@@ -2143,8 +2307,10 @@ void WorldRenderer::setResolution()
     volumeLight->setResolution(volResW, volResH, volResD, w, h);
   }
   setPostFxResolution(postFxResolution.x, postFxResolution.y);
-  g_entity_mgr->broadcastEventImmediate(
-    SetResolutionEvent(SetResolutionEvent::Type::SETTINGS_CHANGED, displayResolution, renderingResolution, postFxResolution));
+  IPoint2 maxPossibleRenderResolution;
+  getMaxPossibleRenderingResolution(maxPossibleRenderResolution.x, maxPossibleRenderResolution.y);
+  g_entity_mgr->broadcastEventImmediate(SetResolutionEvent(SetResolutionEvent::Type::SETTINGS_CHANGED, displayResolution,
+    renderingResolution, postFxResolution, maxPossibleRenderResolution));
   initSubDivSettings();
 
   lights.setResolution(w, h);
@@ -2155,20 +2321,23 @@ void WorldRenderer::setResolution()
   dafg::set_resolution("texel_per_vrs_tile", vrsDims ? vrsDims.value() : IPoint2());
 
   if (hdrrender::is_hdr_enabled())
-    hdrrender::init(displayResolution.x, displayResolution.y, true, isFsrEnabled());
+    hdrrender::init(displayResolution.x, displayResolution.y, true, false);
   else
     hdrrender::shutdown();
 
   resetVsyncMode();
+  set_fps_limit_from_level();
+
+  requestFgRecreation("setResolution");
 }
 
 void WorldRenderer::changeSingleTexturesResolution(int width, int height)
 {
   int halfW = width / 2, halfH = height / 2;
 
-  ShaderGlobal::set_color4(rendering_resVarId, width, height, 1.0f / width, 1.0f / height);
-  ShaderGlobal::set_color4(lowres_rt_paramsVarId, halfW, halfH, 0, 0);
-  ShaderGlobal::set_color4(lowres_tex_sizeVarId, halfW, halfH, 1.0f / halfW, 1.0f / halfH);
+  ShaderGlobal::set_float4(rendering_resVarId, width, height, 1.0f / width, 1.0f / height);
+  ShaderGlobal::set_float4(lowres_rt_paramsVarId, halfW, halfH, 0, 0);
+  ShaderGlobal::set_float4(lowres_tex_sizeVarId, halfW, halfH, 1.0f / halfW, 1.0f / halfH);
 
   if (target)
     target->changeResolution(width, height);
@@ -2177,13 +2346,16 @@ void WorldRenderer::changeSingleTexturesResolution(int width, int height)
   IPoint2 displayResolution, postFxResolution;
   getDisplayResolution(displayResolution.x, displayResolution.y);
   getPostFxInternalResolution(postFxResolution.x, postFxResolution.y);
-  g_entity_mgr->broadcastEventImmediate(
-    SetResolutionEvent(SetResolutionEvent::Type::DYNAMIC_RESOLUTION, displayResolution, IPoint2(width, height), postFxResolution));
+  IPoint2 maxPossibleRenderResolution;
+  getMaxPossibleRenderingResolution(maxPossibleRenderResolution.x, maxPossibleRenderResolution.y);
+  g_entity_mgr->broadcastEventImmediate(SetResolutionEvent(SetResolutionEvent::Type::DYNAMIC_RESOLUTION, displayResolution,
+    IPoint2(width, height), postFxResolution, maxPossibleRenderResolution));
 }
 
 void WorldRenderer::initSubDivSettings()
 {
   subdivSettings = dgs_get_settings()->getBlockByNameEx("graphics")->getInt("groundDisplacementQuality", 0);
+  ShaderGlobal::set_float(var::hmap_object_tess_factor, is_rendinst_tessellation_supported() && subdivSettings != 0 ? 1.0f : 0.0f);
 }
 
 void WorldRenderer::initIndoorProbesIfNecessary()
@@ -2212,12 +2384,6 @@ void WorldRenderer::initIndoorProbesIfNecessary()
 
 void WorldRenderer::initResetable()
 {
-  if (isForwardRender())
-  {
-    initResetableForward();
-    return;
-  }
-
   initPostFx();
   const bool compatibilityMode = !hasFeature(FeatureRenderFlags::FULL_DEFERRED);
   if (!compatibilityMode)
@@ -2239,7 +2405,6 @@ void WorldRenderer::initResetable()
 
   cube.reset(new RenderDynamicCube);
 
-  WorldRenderer::applyAutoResolution();
   WorldRenderer::setResolution();
   initRendinstVisibility();
 }
@@ -2264,34 +2429,27 @@ void WorldRenderer::closeResetable()
 bool WorldRenderer::forceEnableMotionVectors() const
 {
   const DataBlock *graphics = ::dgs_get_settings()->getBlockByNameEx("graphics");
-  return graphics->getBool("forceEnableMotionVectors", false) || is_denoiser_enabled();
+  return graphics->getBool("forceEnableMotionVectors", false) || is_denoiser_enabled() || can_use_motion_vrs();
 }
 
 bool WorldRenderer::needMotionVectors() const
 {
-  return (antiAliasing && antiAliasing->needMotionVectors()) || forceEnableMotionVectors();
+  return (antiAliasing && antiAliasing->needMotionVectors()) || (!isThinGBuffer() && forceEnableMotionVectors());
 }
 
 bool WorldRenderer::needSeparatedUI() const { return antiAliasing && antiAliasing->isFrameGenerationEnabled(); }
 
-void WorldRenderer::loadAntiAliasingSettings()
+bool WorldRenderer::needUIBlendingForScreenshot() const
 {
-  const DataBlock *videoBlk = ::dgs_get_settings()->getBlockByNameEx("video");
-  currentAntiAliasingMode = static_cast<AntiAliasingMode>(videoBlk->getInt("antiAliasingMode", int(AntiAliasingMode::TSR)));
+  return antiAliasing && antiAliasing->isFrameGenerationEnabled() && !antiAliasing->needsUIBlending();
+}
 
-  if (currentAntiAliasingMode == AntiAliasingMode::TAA)
-    currentAntiAliasingMode = AntiAliasingMode::TSR; // fallback to TSR if TAA is chosen
-
-  if (!hasFeature(FeatureRenderFlags::TAA) && int(currentAntiAliasingMode) >= int(AntiAliasingMode::TSR))
-    currentAntiAliasingMode = AntiAliasingMode::FXAA; // fallback to FXAA if TAA is not supported
-
-  if (currentAntiAliasingMode == AntiAliasingMode::MSAA)
-    DAG_FATAL("MSAA is not supported with deferred rendering!");
-
-  debug("Selected antialiasing mode is %d", int(currentAntiAliasingMode));
-
-  TemporalSuperResolution::load_settings();
-  DeepLearningSuperSampling::load_settings();
+void WorldRenderer::requireStencilGbuf(bool require)
+{
+  if (stencilGbufRequired == require)
+    return;
+  stencilGbufRequired = require;
+  requestFgRecreation("requireStencilGbuf");
 }
 
 void WorldRenderer::toggleMotionVectors()
@@ -2299,9 +2457,7 @@ void WorldRenderer::toggleMotionVectors()
   hasMotionVectors = needMotionVectors();
   initTarget();
 
-  // Depends on `hasMotionVectors` flag
-  createDownsampleDepthNode();
-  createPrepareMotionVectorsAfterTransparentNode();
+  requestFgRecreation("toggleMotionVectors");
 
   ShaderGlobal::set_int(has_motion_vectorsVarId, hasMotionVectors);
 }
@@ -2333,6 +2489,8 @@ void WorldRenderer::printResolutionScaleInfo() const
   int w, h;
   getRenderingResolution(w, h);
   console::print_d("Render resolution: %dx%d", w, h);
+  getMaxPossibleRenderingResolution(w, h);
+  console::print_d("Max possible rendering resolution: %dx%d", w, h);
   getPostFxInternalResolution(w, h);
   console::print_d("PostFx Internal resolution: %dx%d", w, h);
   getDisplayResolution(w, h);
@@ -2356,16 +2514,16 @@ void WorldRenderer::printResolutionScaleInfo() const
     case AntiAliasingMode::FXAA: aaMode = "FXAA"; break;
     case AntiAliasingMode::TSR: aaMode = "TSR"; break;
     case AntiAliasingMode::DLSS: aaMode = "DLSS"; break;
-    case AntiAliasingMode::MSAA: aaMode = "MSAA"; break;
     case AntiAliasingMode::XESS: aaMode = "XESS"; break;
-    case AntiAliasingMode::FSR2: aaMode = "FSR2"; break;
+    case AntiAliasingMode::FSR: aaMode = "FSR"; break;
     case AntiAliasingMode::SSAA: aaMode = "SSAA"; break;
-    case AntiAliasingMode::PSSR: aaMode = "PSSR"; break;
+#if _TARGET_C2
+
+#endif
     default: aaMode = "Invalid"; break;
   }
   console::print_d("AA mode: %s", aaMode);
   auto bool_to_string = [](bool b) { return b ? "true" : "false"; };
-  console::print_d("Fsr enabled: %s", bool_to_string(isFsrEnabled()));
   console::print_d("Static Upsampling enabled: %s", bool_to_string(isStaticUpsampleEnabled()));
 }
 
@@ -2375,7 +2533,7 @@ int WorldRenderer::getSubPixels() const
   if (camera_in_camera::is_lens_render_active())
     return 1;
   if (!VariableMap::isGlobVariablePresent(sub_pixelsVarId) || isUpsampling() || applySettingsAfterResetDevice ||
-      isGeneratingFrames() || isForwardRender() || is_bvh_enabled())
+      isGeneratingFrames() || is_bvh_enabled())
     return 1;
   // TODO:: temporarily ignore resource hog settings in order to reduce audio out - of - sync / glitching issues
   if (is_recording())
@@ -2394,7 +2552,7 @@ int WorldRenderer::getSuperPixels() const
     return 1;
   if (!VariableMap::isGlobVariablePresent(super_pixelsVarId) || !VariableMap::isGlobVariablePresent(interleave_pixelsVarId) ||
       !VariableMap::isGlobVariablePresent(super_screenshot_texVarId) || isUpsampling() || applySettingsAfterResetDevice ||
-      isGeneratingFrames() || isForwardRender() || is_bvh_enabled())
+      isGeneratingFrames() || is_bvh_enabled())
     return 1;
   // TODO:: temporarily ignore resource hog settings in order to reduce audio out - of - sync / glitching issues
   if (is_recording())
@@ -2417,64 +2575,33 @@ void WorldRenderer::forceStaticResolutionScaleOff(const bool force)
     setResolution();
 }
 
-void WorldRenderer::initTarget()
+void WorldRenderer::updateEnviCoverCompatibility()
 {
-  int w, h;
-  getRenderingResolution(w, h);
-
-  dag::RelocatableFixedVector<uint32_t, FULL_GBUFFER_RT_COUNT, false> main_gbuf_fmts{};
-  uint32_t gbuf_cnt = FULL_GBUFFER_RT_COUNT, globalFlags = GBUF_TARGET_GLOBAL_FLAGS;
-  if (isForwardRender())
+  if (!hasFeature(FeatureRenderFlags::FULL_DEFERRED))
   {
-    if (currentAntiAliasingMode == AntiAliasingMode::MSAA)
+    isEnviCoverCompatible = false;
+    return;
+  }
+
+  const int gbuffFmtCount = needMotionVectors() ? FULL_GBUFFER_RT_COUNT : NO_MOTION_GBUFFER_RT_COUNT;
+  for (int i = 0; i < gbuffFmtCount; i++)
+  {
+    if (!(d3d::get_texformat_usage(FULL_GBUFFER_FORMATS[i] | TEXCF_UNORDERED) & d3d::USAGE_UNORDERED_LOAD))
     {
-      gbuf_cnt = 1;
-      msaaQuality = ::dgs_get_settings()->getBlockByNameEx("graphics")->getInt("msaaQuality", 0);
-      globalFlags |= make_sample_count_flag(msaaQuality);
-
-      TextureInfo info;
-      d3d::get_backbuffer_tex()->getinfo(info);
-      main_gbuf_fmts.push_back(info.cflg);
+      isEnviCoverCompatible = false;
+      return;
     }
-    else
-      gbuf_cnt = 0;
-  }
-  else if (!isThinGBuffer())
-  {
-    gbuf_cnt = needMotionVectors() ? FULL_GBUFFER_RT_COUNT : NO_MOTION_GBUFFER_RT_COUNT;
-    for (uint32_t i = 0; i < FULL_GBUFFER_RT_COUNT; ++i)
-      main_gbuf_fmts.push_back(FULL_GBUFFER_FORMATS[i]);
-  }
-  else
-  {
-    G_ASSERTF(!needMotionVectors(), "motion vectors not supported on forward");
-    gbuf_cnt = THIN_GBUFFER_RT_COUNT;
-    for (uint32_t i = 0; i < THIN_GBUFFER_RT_COUNT; ++i)
-      main_gbuf_fmts.push_back(THIN_GBUFFER_RT_FORMATS[i]);
   }
 
-  createResolveGbufferNode();
-
-  if (isForwardRender())
-  {
-    target.reset();
-    target = eastl::make_unique<DeferredRT>("main", w, h, DeferredRT::StereoMode::MonoOrMultipass, globalFlags, gbuf_cnt,
-      main_gbuf_fmts.data(), get_gbuffer_depth_format());
-  }
-  else
-  {
-    prepareGbufferFGNode = makePrepareGbufferNode(globalFlags, gbuf_cnt, main_gbuf_fmts, hasMotionVectors);
-    createMotionVectorResolveAndEnviCoverNodes();
-
-    reactiveMaskClearNode = antiAliasing && antiAliasing->supportsReactiveMask() ? makeReactiveMaskClearNode() : dafg::NodeHandle();
-  }
+  isEnviCoverCompatible = true;
 }
 
-void WorldRenderer::initGbufferDepthProducer()
+void WorldRenderer::initTarget()
 {
-  const bool hasStencilTest = hasRenderFeature(FeatureRenderFlags::CAMERA_IN_CAMERA);
-  const int gbufDepthFormat = get_gbuffer_depth_format(hasStencilTest);
-  prepareGbufferDepthFGNode = makePrepareGbufferDepthNode(GBUF_TARGET_GLOBAL_FLAGS, gbufDepthFormat);
+  updateEnviCoverCompatibility();
+  prepareGbufferFGNode = makePrepareGbufferNode();
+
+  requestFgRecreation("initTarget");
 }
 
 void WorldRenderer::resetVolumeLights()
@@ -2489,7 +2616,7 @@ void WorldRenderer::resetVolumeLights()
     volumeLight.reset();
   }
 
-  createVolumetricLightsNode();
+  requestFgRecreation("resetVolumeLights");
 }
 
 static UniqueTex gpu_hang_uav;
@@ -2524,6 +2651,8 @@ void WorldRenderer::ctorCommon()
 
   if (d3d::get_driver_code().is(d3d::dx12))
     d3d::driver_command(Drv3dCommand::SET_DRIVER_NETWORD_MANAGER, new DriverNetworkManager(get_exe_version_str()));
+
+  ShaderGlobal::set_int(dgs_tex_anisotropyVarId, ::dgs_tex_anisotropy);
 
 #if DA_PROFILER_ENABLED
   char dapMarkerName[32] = "prepare_render_csm_0";
@@ -2564,27 +2693,33 @@ void WorldRenderer::ctorCommon()
 
   auto satelliteParamsGetterCb = [this]() -> SatelliteRenderer::CallbackParams {
     SatelliteRenderer::CallbackParams satelliteCb;
-    satelliteCb.renderWater = [this](Texture *color_target, const TMatrix &itm, Texture *depth) -> void {
+    satelliteCb.renderWater = [this](Texture *color_target, const CameraParams &camera, Texture *depth) -> void {
       d3d::set_render_target({depth, 0}, DepthAccess::SampledRO, {{color_target, 0}});
-      renderWater(itm, WorldRenderer::DistantWater::No, false);
+      renderWater(camera, WorldRenderer::DistantWater::No, false);
     };
     satelliteCb.renderLandmesh = [this](mat44f_cref globtm, const TMatrix4 &proj, const Frustum &frustum,
                                    const Point3 &view_pos) -> void {
       if (lmeshRenderer && clipmap)
       {
-        lmeshRenderer->setLMeshRenderingMode(LMeshRenderingMode::RENDERING_LANDMESH);
+        LandMeshRenderDesc desc;
+        desc.invGeomLodDist = lmeshRenderer->getInvGeomLodDist();
         clipmap->startUAVFeedback();
-        lmeshRenderer->render(globtm, proj, frustum, *lmeshMgr, LandMeshRenderer::RENDER_WITH_CLIPMAP, view_pos);
+        // terrain LOD follows the satellite view (view-local), so the mapped area is detailed
+        lmeshRenderer->render(globtm, proj, frustum, *lmeshMgr, LandMeshRenderer::RENDER_WITH_CLIPMAP, desc, view_pos,
+          HmapOrigin(view_pos));
         clipmap->endUAVFeedback();
       }
     };
     satelliteCb.clipmapGetLastUpdatedTileCount = [this]() -> int { return clipmap ? clipmap->getLastUpdatedTileCount() : 0; };
+    satelliteCb.texStreamingGetPendingCount = []() -> int { return get_managed_textures_streaming_pending_count(); };
     satelliteCb.landmeshHeightGetter = [this](const Point2 &pos2d, float &height) -> bool {
       return lmeshMgr->getHeight(pos2d, height, NULL);
     };
     return satelliteCb;
   };
   satelliteRenderer.initParamsGetter(satelliteParamsGetterCb);
+
+  setWater(nullptr);
 }
 
 void WorldRenderer::ctorDeferred()
@@ -2602,6 +2737,8 @@ void WorldRenderer::ctorDeferred()
   waterReflectionEnabled = graphicsBlk->getBool("water_reflection_enabled", true);
   ShaderGlobal::set_int(get_shader_variable_id("ssr_alternate_reflections_ignore_roughness", true),
     ::dgs_get_settings()->getBlockByNameEx("graphics")->getBool("HQSSR", false) ? 1 : 0);
+
+  toggle_normal_packing.set(hasFeature(GBUFFER_PACKED_NORMALS));
 
   if (VariableMap::isGlobVariablePresent(compatibility_modeVarId))
     ShaderGlobal::set_int(compatibility_modeVarId, hasFeature(FeatureRenderFlags::FULL_DEFERRED) ? 0 : 1);
@@ -2621,7 +2758,7 @@ void WorldRenderer::ctorDeferred()
     shadowRenderExtender.reset(new DynamicShadowRenderExtender([this] {
       // TODO: if many extensions are registered one by one, this clearly wastes work.
       // However, currently there is only 1 (or zero).
-      this->createShadowPassNodes();
+      this->requestFgRecreation("DynamicShadowRenderExtender callback");
     }));
   }
   prepass.set(graphicsBlk->getBool("prepass", prepass.get()));
@@ -2659,11 +2796,11 @@ void WorldRenderer::ctorDeferred()
   if (::dgs_get_game_params()->getBool("use_glass_scratch_render", true))
   {
     const DataBlock *glassScratchesBlk = ::dgs_get_game_params()->getBlockByNameEx("glassScratches");
-    ShaderGlobal::set_color4(scratch_paramsVarId, glassScratchesBlk->getReal("texcoord_mul", 10.f),
+    ShaderGlobal::set_float4(scratch_paramsVarId, glassScratchesBlk->getReal("texcoord_mul", 10.f),
       glassScratchesBlk->getReal("alpha_mul", 0.f), glassScratchesBlk->getReal("radius_pow", 45.f),
       glassScratchesBlk->getReal("mul", 4.f));
     glassShadowK = ::dgs_get_game_params()->getReal("glassShadowK", 0.7f);
-    ShaderGlobal::set_real(glass_shadow_kVarId, glassShadowK);
+    ShaderGlobal::set_float(glass_shadow_kVarId, glassShadowK);
     const char *scratchTexName = "glass_scratch_n";
     TEXTUREID scratchTexId = ::get_tex_gameres(scratchTexName);
     const char *scratchTexVarName = "scratch_tex";
@@ -2681,14 +2818,6 @@ void WorldRenderer::ctorDeferred()
       if (scratchTexId == BAD_TEXTUREID)
         logerr("WorldRenderer::init: Couldn't find gameres tex '%s", scratchTexName);
     }
-  }
-
-  {
-    d3d::SamplerInfo smpInfo;
-    smpInfo.filter_mode = d3d::FilterMode::Linear;
-    smpInfo.mip_map_mode = d3d::MipMapMode::Linear;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
-    ShaderGlobal::set_sampler(::get_shader_variable_id("global_linear_clamp_sampler", true), d3d::request_sampler(smpInfo));
   }
 
   rendinst::render::tmInstColored = false; // rendinst::render::tmInstColored = true; it is used only on one stone in landing
@@ -2715,14 +2844,12 @@ void WorldRenderer::ctorDeferred()
       init_daskies();
     if (get_daskies())
     {
-      setSkies(get_daskies());
-      if (hasFeature(FeatureRenderFlags::VOLUME_LIGHTS))
-        get_daskies()->projectUses2DShadows(true); // volfog can only use 2d cloud shadows
+      setSkies(get_daskies()); // volfog cloud shadows come from the Beer shadow map
     }
     else
     {
       ShaderGlobal::set_int4(get_shader_variable_id("skies_froxels_resolution", true), 1, 1, 1, 1);
-      ShaderGlobal::set_real(get_shader_variable_id("clouds_thickness2", true), 1);
+      ShaderGlobal::set_float(get_shader_variable_id("clouds_thickness2", true), 1);
     }
   }
 
@@ -2740,18 +2867,23 @@ void WorldRenderer::ctorDeferred()
   updateImpostorSettings();
   resetLatencyMode();
   resetVsyncMode();
+  set_fps_limit_from_level();
   resetPerformanceMetrics();
   resetDynamicQuality();
 
-  createNodes();
-  dynmodel_renderer::init_dynmodel_rendering(ShadowsManager::CSM_MAX_CASCADES);
+  requestFgRecreation("ctorDeferred");
+  if (!dynrend::is_initialized())
+    dynrend::init();
 
   setSharpeningFromSettings();
   setChromaticAberrationFromSettings();
   setFilmGrainFromSettings();
-  setEnviromentDetailsQuality();
+  setEnvironmentDetailsQuality();
 
   camera_in_camera::setup(hasFeature(CAMERA_IN_CAMERA));
+
+  render::antialiasing::close(); // in case if we have initialized it before already
+  render::antialiasing::init(&aaGlue);
 
 #if DAGOR_DBGLEVEL > 0
   gpu_mem_dumper::init();
@@ -2765,54 +2897,26 @@ void WorldRenderer::setChromaticAberrationFromSettings()
     dgs_get_settings()->getBlockByNameEx("graphics")->getBool("chromaticAberration", false) && !bareMinimumPreset;
   Point3 value = dgs_get_settings()->getBlockByNameEx("cinematicEffects")->getPoint3("chromaticAberration", Point3(0.02, 0.01, 0.75));
   if (chromaticAberration)
-    PriorityShadervar::set_color4(chromatic_aberration_paramsVarId.get_var_id(), CHROMATIC_ABERRATION_PRIORITY, Point4::xyz0(value));
+    PriorityShadervar::set_float4(chromatic_aberration_paramsVarId.get_var_id(), CHROMATIC_ABERRATION_PRIORITY, Point4::xyz0(value));
   else
     PriorityShadervar::clear(chromatic_aberration_paramsVarId.get_var_id(), CHROMATIC_ABERRATION_PRIORITY);
 }
 
 void WorldRenderer::setFilmGrainFromSettings()
 {
+  if (get_film_grain_mode() != FilmGrainMode::NOISE_BASED)
+    return;
   static constexpr int FILM_GRAIN_PRIORITY = 0;
   bool filmGrain = dgs_get_settings()->getBlockByNameEx("graphics")->getBool("filmGrain", false) && !bareMinimumPreset;
-  Point3 value = dgs_get_settings()->getBlockByNameEx("cinematicEffects")->getPoint3("filmGrain", Point3(0.2, 1.0, 0.75));
+  Point3 value = dgs_get_settings()->getBlockByNameEx("cinematicEffects")->getPoint3("filmGrainNoise", Point3(0.2, 1.0, 0.75));
   if (filmGrain)
-    PriorityShadervar::set_color4(film_grain_paramsVarId.get_var_id(), FILM_GRAIN_PRIORITY, Point4::xyz0(value));
+    PriorityShadervar::set_float4(film_grain_paramsVarId.get_var_id(), FILM_GRAIN_PRIORITY, Point4::xyz0(value));
   else
     PriorityShadervar::clear(film_grain_paramsVarId.get_var_id(), FILM_GRAIN_PRIORITY);
 }
 
 template <typename T>
 using BlobHandle = dafg::VirtualResourceHandle<T, false, false>;
-
-void WorldRenderer::makePrepareDepthForPostFxNode()
-{
-  const bool aaNeedsHistory = antiAliasing && antiAliasing->needDepthHistory();
-  const bool giNeedsHistory = giNeedsReprojection();
-  const bool needHistory = aaNeedsHistory || giNeedsHistory;
-  if (hasDepthHistory != needHistory || !prepareDepthForPostFxNode)
-    prepareDepthForPostFxNode = ::makePrepareDepthForPostFxNode(hasDepthHistory = needHistory);
-}
-
-void set_dissolve_frame_counter(const uint16_t sub_samples,
-  const uint16_t sub_sample_index,
-  const uint16_t super_sample_index,
-  const int temporal_shadow_frames_count)
-{
-  uint32_t tempCount, frameNo;
-  if (sub_samples > 1)
-  {
-    tempCount = sub_samples;
-    // offset a bit with super index as well
-    frameNo = (sub_sample_index + super_sample_index * 13) % sub_samples;
-  }
-  else
-  {
-    tempCount = temporal_shadow_frames_count;
-    frameNo = ::dagor_frame_no();
-  }
-  ShaderGlobal::set_int(dissolve_frame_counterVarId, frameNo % tempCount);
-  ShaderGlobal::setBlock(globalConstBlockId, ShaderGlobal::LAYER_GLOBAL_CONST);
-}
 
 // TODO: put it in FG
 void WorldRenderer::recreateCloudsVolume()
@@ -2834,41 +2938,20 @@ void WorldRenderer::recreateCloudsVolume()
   }
 }
 
-void WorldRenderer::recreateWaterNodes()
-{
-  prepareWaterNode = makePrepareWaterNode();
-  for (auto i : {WaterRenderMode::EARLY_BEFORE_ENVI, WaterRenderMode::EARLY_AFTER_ENVI, WaterRenderMode::LATE})
-  {
-    waterNodes[eastl::to_underlying(i)] = makeWaterNode(i);
-    waterSSRNodes[eastl::to_underlying(i)] = makeWaterSSRNode(i);
-  }
-}
-
-void WorldRenderer::initBinSceneTransparencyNode()
-{
-  binSceneTransparencyNode = {};
-
-  if (!binScene)
-    return;
-
-  auto nodeNs = dafg::root() / "transparent" / "close";
-  binSceneTransparencyNode = nodeNs.registerNode("bin_scene_node", DAFG_PP_NODE_SRC, [this](dafg::Registry registry) {
-    request_common_transparent_state(registry);
-    registry.setPriority(TRANSPARENCY_NODE_PRIORITY_BIN_SCENE);
-
-    registry.requestState().setFrameBlock("global_frame");
-    return [this](const dafg::multiplexing::Index &multiplexing_index) {
-      if (!binScene || is_level_unloading() || !is_level_loaded())
-        return;
-
-      const camera_in_camera::ApplyMasterState camcam{multiplexing_index};
-      binScene->renderTrans();
-    };
-  });
-}
-
 void WorldRenderer::createNodes()
 {
+  // ██████████████████████████████████████████████████████████████
+  // ╔════════════════════════════════════════════════════════════╗
+  // ║                       (ﾉಥ益ಥ)ﾉ彡┻━┻                       ║
+  // ║                                                            ║
+  // ║         !!!DO NOT CREATE ANY MORE FG NODES!!!              ║
+  // ║         !!!DO NOT CREATE ANY MORE FG NODES!!!              ║
+  // ║         !!!DO NOT CREATE ANY MORE FG NODES!!!              ║
+  // ║               !!!!IN WORLD RENDERER!!!!                    ║
+  // ╚════════════════════════════════════════════════════════════╝
+  // ██████████████████████████████████████████████████████████████
+
+
   fgNodeHandles.clear();
   resSlotHandles.clear();
 
@@ -2876,587 +2959,180 @@ void WorldRenderer::createNodes()
     dafg::multiplexing::Mode::SubSampling | dafg::multiplexing::Mode::SuperSampling | dafg::multiplexing::Mode::Viewport,
     dafg::multiplexing::Mode::Viewport | dafg::multiplexing::Mode::CameraInCamera);
 
-  initBinSceneTransparencyNode();
-  initGbufferDepthProducer();
+  if (isFXAAEnabled())
+    fxaaNode = makeFXAANode(isStaticUpsampleEnabled() ? "frame_to_upscale" : "frame_after_postfx", !isStaticUpsampleEnabled());
 
-  // clang-format off
-  dafg::NodeHandle (*nodeHandleFactories[])()
-  {
-    makeTransparentEcsNode,
-    makeHideAnimcharNodesEcsNode,
-    makeTargetRenameBeforeMotionBlurNode,
-    makeDecalsOnStaticNode,
-    makeDecalsOnDynamicNode,
-    makeAcesFxUpdateNode,
-    makeAcesFxOpaqueNode,
-    makePrepareLightsNode,
-    makeRenameDepthNode,
-    makeDelayedRenderCubeNode,
-    makeDelayedRenderDepthAboveNode,
-    makeAfterWorldRenderNode,
-    makeReprojectedHzbImportNode,
-    makeGrassGenerationNode,
-    makeOcclusionFinalizeNode,
-    makeUnderWaterFogNode,
-    makeUnderWaterParticlesNode,
-    makeOpaqueInWorldPanelsNode,
-    makeTranslucentInWorldPanelsNode,
-    makeTransparentSceneLateNode,
-    makeMainHeroTransNode,
-    makeRendinstTransparentNode,
-    makeRendinstUpdateNode,
-  };
-  // clang-format on
+  if (isStaticUpsampleEnabled())
+    fgNodeHandles.emplace_back(makeStaticUpsampleNode(isFXAAEnabled() ? "frame_to_upscale" : "postfxed_frame"));
 
-  if (hasRenderFeature(CAMERA_IN_CAMERA))
-  {
-    auto nodes = makeCameraInCameraSetupNodes();
-    eastl::move(nodes.begin(), nodes.end(), eastl::back_inserter(fgNodeHandles));
-  }
-
-  {
-    auto nodes = makeCreateVrsTextureNode();
-    eastl::move(nodes.begin(), nodes.end(), eastl::back_inserter(fgNodeHandles));
-  }
-
-  for (auto factory : nodeHandleFactories)
-  {
-    fgNodeHandles.emplace_back(factory());
-  }
-
-  makePrepareDepthForPostFxNode();
-  fgNodeHandles.emplace_back(makePrepareDepthAfterTransparent());
-  createPrepareMotionVectorsAfterTransparentNode();
-
-  fgNodeHandles.push_back(makeOpaqueDynamicsNode());
-  fgNodeHandles.push_back(makeFrameBeforeDistortionProducerNode());
-  fgNodeHandles.push_back(makeDistortionFxNode());
-
-  resource_slot::NodeHandleWithSlotsAccess (*resSlotFactories[])(){
-    makePostFxInputSlotProviderNode,
-    makePostFxNode,
-    makePreparePostFxNode,
-  };
-
-  for (auto factory : resSlotFactories)
-  {
-    resSlotHandles.emplace_back(factory());
-  }
-
-#if DAGOR_DBGLEVEL == 0 && _TARGET_PC
-  if (has_in_game_editor())
-#elif DAGOR_DBGLEVEL == 0
-  if constexpr (false)
-#endif
-  {
-    if (isUpsampling())
-      fgNodeHandles.emplace_back(makeUpsampleDepthForSceneDebugNode());
-    fgNodeHandles.emplace_back(makeShowSceneDebugNode());
-  }
-
-  const DataBlock *graphicsBlk = ::dgs_get_settings()->getBlockByNameEx("graphics");
-  bool shaderAssertsEnabled = graphicsBlk->getBool("enableShaderAsserts", false);
-
-  if (shaderAssertsEnabled)
-    fgNodeHandles.emplace_back(makeShaderAssertNode());
-
-  if (isFsrEnabled())
-  {
-    auto fsrNodes = makeFsrNodes();
-    for (auto &node : fsrNodes)
-      fgNodeHandles.push_back(eastl::move(node));
-  }
-  else
-  {
-    if (isFXAAEnabled())
-      fxaaNode = makeFXAANode(isStaticUpsampleEnabled() ? "frame_to_upscale" : "frame_after_postfx", !isStaticUpsampleEnabled());
-
-    if (isStaticUpsampleEnabled())
-      fgNodeHandles.emplace_back(makeStaticUpsampleNode(isFXAAEnabled() ? "frame_to_upscale" : "postfxed_frame"));
-  }
-
-  // pull game specific FG nodes
-  extern dag::Vector<dafg::NodeHandle> get_game_specific_fg_node_handles();
-
-  for (auto &node : get_game_specific_fg_node_handles())
-  {
-    fgNodeHandles.emplace_back(eastl::move(node));
-  }
-
-  if (hasFeature(FeatureRenderFlags::TILED_LIGHTS))
-    fgNodeHandles.emplace_back(makePrepareTiledLightsNode());
-
-  if (hasFeature(FeatureRenderFlags::PREV_OPAQUE_TEX) && !isForwardRender())
-  {
-    fgNodeHandles.emplace_back(makeFrameDownsampleNode());
-    fgNodeHandles.emplace_back(makeFrameDownsampleSamplerNode());
-    fgNodeHandles.emplace_back(makeNoFxFrameNode());
-  }
-
-  fgNodeHandles.emplace_back(makeGroundNode(tiledRenderArch));
-  fgNodeHandles.emplace_back(dafg::register_node("clipmap_copy_uav_feedback_node", DAFG_PP_NODE_SRC, [this](dafg::Registry registry) {
-    registry.multiplex(dafg::multiplexing::Mode::None);
-    registry.orderMeAfter("after_world_render_node");
-    registry.executionHas(dafg::SideEffects::External);
-    return [this] {
-      if (this->getClipmap())
-        this->getClipmap()->copyUAVFeedback();
-    };
-  }));
-
-  recreateWaterNodes();
-
-  createOpaqueStaticNodes();
-  createResolveGbufferNode();
-  createVolumetricLightsNode();
-  createDownsampleDepthNode();
-  createAsyncAnimcharRenderingStartNode();
-  createGbufferControlNodes();
-  createTransparentControlNodes();
-  createHzbResolveNode();
-  createTransparentParticlesNode();
-  createDownsampleDepthWithWaterNode();
-  createEnvironmentNode();
-  createMotionBlurControlNodes();
   shadowsManager.initVisibilityNode();
   shadowsManager.initShadowsDownsampleNode();
-  createShadowPassNodes();
-  createUINodes();
 
   // Clearing this will force postfxTargetProducerNode and externalFinalFrameControlNodes to be recreated next frame
   subSuperSamplingNodes.clear();
 
   recreate_motion_blur_nodes({&motionBlurAccumulateNode, &motionBlurApplyNode, &motionBlurStatus});
 
-  // TODO: A lot of ifs inside the following nodes should become graph
-  // compilation time ifs instead of graph execution time ifs.
-
-  fgNodeHandles.emplace_back(
-    dafg::register_node("before_setup_ordering_token_provider", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-      registry.multiplex(dafg::multiplexing::Mode::None);
-      registry.createBlob<OrderingToken>("before_world_render_setup_token", dafg::History::No);
-    }));
-
-  fgNodeHandles.emplace_back(
-    dafg::register_node("after_world_render_setup_token_provider", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-      registry.multiplex(dafg::multiplexing::Mode::None);
-      registry.renameBlob<OrderingToken>("before_world_render_setup_token", "after_world_render_setup_token", dafg::History::No);
-    }));
-
-  fgNodeHandles.emplace_back(dafg::register_node("setup_world_rendering_node", DAFG_PP_NODE_SRC, [this](dafg::Registry registry) {
-    registry.modifyBlob<OrderingToken>("after_world_render_setup_token");
-
-    registry.multiplex(dafg::multiplexing::Mode::Viewport);
-    registry.requestState().setFrameBlock("global_frame");
-
-    if (!shouldRenderGbufferDebug() && !hasFeature(FeatureRenderFlags::POSTFX))
-    {
-      registry.registerTexture("opaque_resolved", [this](const dafg::multiplexing::Index &) -> ManagedTexView {
-        G_ASSERTF(!isFsrEnabled(), "FSR make no sense without postfx");
-        if (currentAntiAliasingMode != AntiAliasingMode::MSAA && currentAntiAliasingMode != AntiAliasingMode::OFF)
-          logerr("Only MSAA or no-AA will work without postfx: %d", int(currentAntiAliasingMode));
-
-        return *finalTargetFrame;
-      });
-    }
-    else
-    {
-      registry.create("opaque_resolved", dafg::History::No)
-        .texture({get_frame_render_target_format() | TEXCF_RTARGET | TEXCF_UNORDERED, registry.getResolution<2>("main_view")});
-    }
-    {
-      d3d::SamplerInfo smpInfo;
-      smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
-      registry.create("frame_sampler", dafg::History::No).blob<d3d::SamplerHandle>(d3d::request_sampler(smpInfo));
-    }
-    struct HandlesToInit
-    {
-      BlobHandle<bool> belowCloudHndl;
-      BlobHandle<WaterRenderMode> waterRenderModeHndl;
-      BlobHandle<float> waterLevelHndl;
-      BlobHandle<TexStreamingContext> strmCtxHndl;
-      BlobHandle<float> gameTimeHndl;
-      BlobHandle<float> frameDtHndl;
-      BlobHandle<IPoint2> subSuperPixelsHndl;
-      // It is used only to keep all drawcalls related to the same sub/super pixel intermediate, otherwise we will override external
-      // resources
-      BlobHandle<bool> fakeBlobHndl;
-      BlobHandle<bool> isUnderwaterHndl;
-      BlobHandle<AntiAliasingMode> antiAliasingModeHndl;
-      BlobHandle<SunParams> sunParamsHndl;
-    };
-
-    return [this, handles = eastl::shared_ptr<HandlesToInit>(
-                    new HandlesToInit{registry.createBlob<bool>("below_clouds", dafg::History::No).handle(),
-                      registry.createBlob<WaterRenderMode>("water_render_mode", dafg::History::No).handle(),
-                      registry.createBlob<float>("water_level", dafg::History::No).handle(),
-                      registry.createBlob<TexStreamingContext>("tex_ctx", dafg::History::No).handle(),
-                      registry.createBlob<float>("game_time", dafg::History::No).handle(),
-                      registry.createBlob<float>("frame_delta_time", dafg::History::No).handle(),
-                      registry.createBlob<IPoint2>("super_sub_pixels", dafg::History::No).handle(),
-                      registry.createBlob<bool>("fake_blob", dafg::History::No).handle(),
-                      registry.createBlob<bool>("is_underwater", dafg::History::No).handle(),
-                      registry.createBlob<AntiAliasingMode>("anti_aliasing_mode", dafg::History::No).handle(),
-                      registry.createBlob<SunParams>("current_sun", dafg::History::No).handle()})] {
-      if (volumeLight)
-        volumeLight->switchOff(); // we should switch off volume light, until it is prepared
-
-      d3d::settm(TM_WORLD, TMatrix::IDENT);
-      d3d::settm(TM_VIEW, currentFrameCamera.viewTm);
-      d3d::setpersp(currentFrameCamera.noJitterPersp);
-
-      ShaderGlobal::set_int(depth_bounds_supportVarId, ::depth_bounds_enabled() ? 1 : 0);
-      const bool hasUavInVSCapability = false; // TODO get from driver
-      if (ShaderGlobal::is_glob_interval_presented(ShaderGlobal::interval<"has_uav_in_vs_capability"_h>))
-        ShaderGlobal::set_variant(
-          {ShaderGlobal::interval<"has_uav_in_vs_capability"_h>, ShaderGlobal::Subinterval(hasUavInVSCapability ? "yes"_h : "no"_h)});
-
-      const Point3 camPos = currentFrameCamera.viewItm.getcol(3);
-
-      Point3 panoramaDirToSun = dir_to_sun.curr;
-      auto skies = get_daskies();
-      if (skies != nullptr)
-        panoramaDirToSun = skies->calcPanoramaSunDir(camPos);
-
-      handles->subSuperPixelsHndl.ref() = IPoint2(superPixels, subPixels);
-      handles->strmCtxHndl.ref() = currentTexCtx;
-      handles->gameTimeHndl.ref() = gameTime;
-      handles->frameDtHndl.ref() = realDeltaTime;
-      handles->isUnderwaterHndl.ref() = is_underwater();
-      handles->antiAliasingModeHndl.ref() = currentAntiAliasingMode;
-      handles->sunParamsHndl.ref() = {dir_to_sun.curr, sun, panoramaDirToSun};
-
-      {
-        const float water_level = water ? fft_water::get_level(water) : HeightmapHeightCulling::NO_WATER_ON_LEVEL;
-        const bool belowClouds = get_daskies() ? max(camPos.y, water_level) < get_daskies()->getCloudsStartAlt() - 10.0f : true;
-        handles->waterLevelHndl.ref() = water_level;
-        handles->belowCloudHndl.ref() = belowClouds;
-
-        handles->waterRenderModeHndl.ref() = determineWaterRenderMode(handles->isUnderwaterHndl.ref(), belowClouds);
-      }
-    };
-  }));
-
-  fgNodeHandles.emplace_back(dafg::register_node("unified_setup_node", DAFG_PP_NODE_SRC, [this](dafg::Registry registry) {
-    registry.multiplex(dafg::multiplexing::Mode::None);
-    registry.orderMeAfter("setup_world_rendering_node");
-
-    registry.executionHas(dafg::SideEffects::External);
-    // TODO: Temporary solution, needed to prevent this node being pruned with a logerr. The only consumer of
-    // `current_camera_unified` is currently daGdp, which might not be active in all scenes.
-
-    auto cameraHndl =
-      registry.createBlob<CameraParamsUnified>("current_camera_unified", dafg::History::ClearZeroOnFirstFrame).handle();
-
-    auto mainPovSkiesDataHndl = registry.create("main_pov_skies_data", dafg::History::No).blob<SkiesData *>().handle();
-
-    return [cameraHndl, mainPovSkiesDataHndl, this] {
-      // TODO: this is a cheap approximation. In reality, we need a "union" of all multiplexing frustums.
-      //
-      // It should be fine for SubSampling and SuperSampling multiplexing, as the offsets are very small,
-      // and for culling purposes, we can probably ignore them without any apparent visual bugs.
-      //
-      // But for Viewport multiplexing (which is currently not used in DNG), this needs to be done properly.
-      CameraParamsUnified &camera = cameraHndl.ref();
-      camera.unionFrustum = this->currentFrameCamera.noJitterFrustum;
-      camera.cameraWorldPos = this->currentFrameCamera.cameraWorldPos;
-      camera.rangeScale = this->daGdpRangeScale;
-
-      mainPovSkiesDataHndl.ref() = main_pov_data;
-    };
-  }));
-
-  fgNodeHandles.emplace_back(dafg::register_node("multisampling_setup_node", DAFG_PP_NODE_SRC, [this](dafg::Registry registry) {
-    registry.orderMeAfter("setup_world_rendering_node");
-    registry.requestState().setFrameBlock("global_frame");
-
-    struct HandlesToInit
-    {
-      BlobHandle<CameraParams> cameraHndl;
-      BlobHandle<ViewVecs> viewVecsHndl;
-      BlobHandle<Point4> worldViewPosHndl;
-      BlobHandle<SubFrameSample> subFrameSampleHndl;
-      BlobHandle<const IPoint2> subSuperPixelsHndl;
-      BlobHandle<TMatrix4> motionVecReprojectTmHndl;
-    };
-
-    const auto displayResolution = registry.getResolution<2>("display");
-    return [this, displayResolution,
-             handles = eastl::make_unique<HandlesToInit>(
-               HandlesToInit{registry.createBlob<CameraParams>("current_camera", dafg::History::ClearZeroOnFirstFrame).handle(),
-                 registry.createBlob<ViewVecs>("view_vectors", dafg::History::ClearZeroOnFirstFrame).handle(),
-                 registry.createBlob<Point4>("world_view_pos", dafg::History::No).handle(),
-                 registry.createBlob<SubFrameSample>("sub_frame_sample", dafg::History::No).handle(),
-                 registry.readBlob<IPoint2>("super_sub_pixels").handle(),
-                 registry.createBlob<TMatrix4>("motion_vec_reproject_tm", dafg::History::ClearZeroOnFirstFrame).handle()})](
-             dafg::multiplexing::Index multiplexing_index) {
-      auto [cameraHndl, viewVecsHndl, worldViewPosHndl, subFrameSampleHndl, subSuperPixelsHndl, motionVecReprojectTmHndl] = *handles;
-
-      auto &subFrameSample = subFrameSampleHndl.ref();
-      auto [superPixels, subPixels] = subSuperPixelsHndl.ref();
-
-      auto superSample = multiplexing_index.superSample;
-      auto subSample = multiplexing_index.subSample;
-      currentFrameCamera.subSampleIndex = subSample;
-      currentFrameCamera.subSamples = subPixels * subPixels;
-      currentFrameCamera.superSampleIndex = superSample;
-      currentFrameCamera.superSamples = superPixels * superPixels;
-
-      set_dissolve_frame_counter(currentFrameCamera.subSamples, multiplexing_index.subSample, multiplexing_index.superSample,
-        getTemporalShadowFramesCount());
-
-      // NOTE: Last and first are intentionally inverted here, that's
-      // just how the hack inside FG works for preserving sequential
-      // execution of multiplexing stages.
-      // In the future, all of this should be purged and replaced with
-      // undermultiplexed nodes.
-      if (superPixels == 1 && subPixels == 1)
-        subFrameSample = SubFrameSample::Single;
-      else if (superSample == 0 && subSample == 0)
-        subFrameSample = SubFrameSample::First;
-      else if (superSample == superPixels * superPixels - 1 && subSample == subPixels * subPixels - 1)
-        subFrameSample = SubFrameSample::Last;
-      else
-        subFrameSample = SubFrameSample::Intermediate;
-
-      Driver3dPerspective jitterPersp = currentFrameCamera.noJitterPersp;
-      auto displayRes = displayResolution.get();
-
-      {
-        jitterPersp.ox = jitterPersp.oy = 0;
-        if (subPixels > 1)
-        {
-          const uint32_t subx = subSample / subPixels;
-          const uint32_t suby = subSample % subPixels;
-
-          const float ox = (float(subx - 0.5f * subPixels) / subPixels) * (2.0f / (float(displayRes.x * superPixels)));
-          const float oy = (float(suby - 0.5f * subPixels) / subPixels) * (2.0f / (float(displayRes.y * superPixels)));
-
-          if (subPixels == 2)
-          {
-            // rotate by atg( 0.5 ), optimal rotation angle
-            constexpr float sinA = 0.4472135954999579;
-            constexpr float cosA = 0.8944271909999159;
-            jitterPersp.ox = ox * cosA - oy * sinA;
-            jitterPersp.oy = ox * sinA + oy * cosA;
-          }
-          else
-          {
-            jitterPersp.ox = ox;
-            jitterPersp.oy = oy;
-          }
-        }
-        if (superPixels > 1)
-        {
-          const uint32_t superx = superSample / superPixels;
-          const uint32_t supery = superSample % superPixels;
-
-          jitterPersp.ox -= float(superx - 0.5f * superPixels) / superPixels * (2.0f / displayRes.x);
-          jitterPersp.oy += float(supery - 0.5f * superPixels) / superPixels * (2.0f / displayRes.y);
-        }
-      }
-
-      // TODO: we can completely stop camera for being accessible
-      // outside of FG and guarantee correct multiplexing behaviour
-      // (cameras should differ for different viewports and sub/super samples)
-
-      Point2 jitterOffset(0, 0);
-      if (antiAliasing)
-        jitterOffset = antiAliasing->update(jitterPersp);
-
-      currentFrameCamera.jitterOffsetUv = jitterOffset;
-      // todo: replce that with 'double' version!
-      d3d::setpersp(jitterPersp, &currentFrameCamera.jitterProjTm);
-      d3d::settm(TM_VIEW, currentFrameCamera.viewTm);
-      currentFrameCamera.jitterPersp = jitterPersp;
-      currentFrameCamera.jitterGlobtm = TMatrix4(currentFrameCamera.viewTm) * currentFrameCamera.jitterProjTm;
-      currentFrameCamera.jitterFrustum = currentFrameCamera.jitterGlobtm;
-      ShaderGlobal::set_color4(uv_temporal_jitterVarId, jitterPersp.ox * 0.5, jitterPersp.oy * -0.5,
-        prevFrameCamera.jitterPersp.ox * 0.5, prevFrameCamera.jitterPersp.oy * -0.5);
-
-      TMatrix4D viewRotTm = currentFrameCamera.viewTm;
-      viewRotTm.setrow(3, 0.0f, 0.0f, 0.0f, 1.0f);
-      currentFrameCamera.viewRotJitterProjTm = TMatrix4(viewRotTm * currentFrameCamera.jitterProjTm);
-
-      const DPoint3 move = currentFrameCamera.cameraWorldPos - prevFrameCamera.cameraWorldPos;
-      const ReprojectionTransforms reprojectionTms = calc_reprojection_transforms(prevFrameCamera, currentFrameCamera);
-      currentFrameCamera.jitteredCamPosToUnjitteredHistoryClip = reprojectionTms.jitteredCamPosToUnjitteredHistoryClip;
-
-      updateTransformations(move, reprojectionTms.jitteredCamPosToUnjitteredHistoryClip, reprojectionTms.prevOrigoRelativeViewProjTm);
-
-      auto &camera = cameraHndl.ref();
-      camera = currentFrameCamera;
-      camera.jobsMgr = &mainCameraVisibilityMgr;
-      worldViewPosHndl.ref() = Point4::xyz1(camera.viewItm.col[3]);
-      viewVecsHndl.ref() = calc_view_vecs(camera.viewTm, camera.jitterProjTm);
-
-      motionVecReprojectTmHndl.ref() = reprojectionTms.motionVecReprojectionTm;
-    };
-  }));
-
-  fgNodeHandles.emplace_back(dafg::register_node("hero_matrix_setup_node", DAFG_PP_NODE_SRC, [this](dafg::Registry registry) {
-    registry.executionHas(dafg::SideEffects::External);
-
-    auto cameraHndl = registry.readBlob<CameraParams>("current_camera").handle();
-    auto prevCameraHndl = registry.readBlobHistory<CameraParams>("current_camera").handle();
-    auto heroGunOrVehicleTmHndl =
-      registry.createBlob<TMatrix>("hero_gun_or_vehicle_tm", dafg::History::ClearZeroOnFirstFrame).handle();
-    auto prevHeroGunOrVehicleTmHndl = registry.readBlobHistory<TMatrix>("hero_gun_or_vehicle_tm").handle();
-    auto heroMatrixParamsHndl =
-      registry.createBlob<eastl::optional<motion_vector_access::HeroMatrixParams>>("hero_matrix_params", dafg::History::No).handle();
-
-    return [this, cameraHndl, prevCameraHndl, heroGunOrVehicleTmHndl, prevHeroGunOrVehicleTmHndl, heroMatrixParamsHndl] {
-      const DPoint3 &worldPos = cameraHndl.ref().cameraWorldPos;
-      const DPoint3 &oldWorldPos = prevCameraHndl.ref().cameraWorldPos;
-      mat44f oldHeroGunOrVehicleTm;
-      v_mat44_make_from_43cu(oldHeroGunOrVehicleTm, prevHeroGunOrVehicleTmHndl.ref().array);
-
-      if (heroData.resReady)
-      {
-        heroData.resWtm.col[3] += Point3(DPoint3(heroData.resWofs) - worldPos);
-
-        const mat44f oldHeroGunOrVehicleNoReprojectedWposTm = oldHeroGunOrVehicleTm;
-        oldHeroGunOrVehicleTm.col3 = v_add(oldHeroGunOrVehicleTm.col3,
-          v_make_vec4f(oldWorldPos.x - worldPos.x, oldWorldPos.y - worldPos.y, oldWorldPos.z - worldPos.z, 0));
-
-        vec3f lbc = v_bbox3_center(v_ldu_bbox3(heroData.resLbox));
-        vec3f lbsize = v_sub(v_ldu_p3(&heroData.resLbox.lim[1].x), lbc);
-        ShaderGlobal::set_real(gi_hero_cockpit_distanceVarId, v_extract_x(v_length3_x(lbsize)));
-        lbsize = v_sel(lbsize, v_add(lbsize, lbsize), (vec4f)V_CI_MASK1000); // increase size in one direction, to catch hands
-
-        mat44f resWtm, invHeroGun;
-        v_mat44_make_from_43cu(resWtm, heroData.resWtm.m[0]);
-        v_mat44_inverse43(invHeroGun, resWtm);
-
-        mat44f boxMatrix, heroMatrix;
-        boxMatrix.col0 = v_and(v_div(V_C_UNIT_1000, lbsize), (vec4f)V_CI_MASK1110);
-        boxMatrix.col1 = v_and(v_div(V_C_UNIT_0100, lbsize), (vec4f)V_CI_MASK1110);
-        boxMatrix.col2 = v_and(v_div(V_C_UNIT_0010, lbsize), (vec4f)V_CI_MASK1110);
-        boxMatrix.col3 = v_sel(V_C_ONE, v_sub(v_zero(), v_div(lbc, lbsize)), (vec4f)V_CI_MASK1110);
-        v_mat44_mul43(heroMatrix, boxMatrix, invHeroGun);
-
-        mat44f worldToPrev;
-        v_mat44_mul43(worldToPrev, oldHeroGunOrVehicleTm, invHeroGun);
-
-        mat43f wtm, wtmPrev;
-        v_mat44_transpose_to_mat43(wtmPrev, worldToPrev);
-        v_mat44_transpose_to_mat43(wtm, heroMatrix);
-
-        ShaderGlobal::set_color4(prev_hero_matrixXVarId, Color4((float *)&wtmPrev.row0));
-        ShaderGlobal::set_color4(prev_hero_matrixYVarId, Color4((float *)&wtmPrev.row1));
-        ShaderGlobal::set_color4(prev_hero_matrixZVarId, Color4((float *)&wtmPrev.row2));
-
-        ShaderGlobal::set_color4(hero_matrixXVarId, Color4((float *)&wtm.row0));
-        ShaderGlobal::set_color4(hero_matrixYVarId, Color4((float *)&wtm.row1));
-        ShaderGlobal::set_color4(hero_matrixZVarId, Color4((float *)&wtm.row2));
-        ShaderGlobal::set_int(hero_is_cockpitVarId, heroData.resFlags == heroData.WEAPON);
-
-        auto toTMatrix = [](const mat43f &m) {
-          Point4 rows[3];
-          v_stu(&rows[0].x, m.row0);
-          v_stu(&rows[1].x, m.row1);
-          v_stu(&rows[2].x, m.row2);
-
-          TMatrix tm;
-          tm.setcol(0, rows[0].x, rows[1].x, rows[2].x);
-          tm.setcol(1, rows[0].y, rows[1].y, rows[2].y);
-          tm.setcol(2, rows[0].z, rows[1].z, rows[2].z);
-          tm.setcol(3, rows[0].w, rows[1].w, rows[2].w);
-          return tm;
-        };
-
-        heroMatrixParamsHndl.ref() =
-          motion_vector_access::HeroMatrixParams{toTMatrix(wtm), toTMatrix(wtmPrev), heroData.resFlags == heroData.WEAPON};
-
-        mat44f worldToPrevNoReprojectedWPos;
-        mat43f wtmPrevNoReprojectedWpos;
-        v_mat44_mul43(worldToPrevNoReprojectedWPos, oldHeroGunOrVehicleNoReprojectedWposTm, invHeroGun);
-        v_mat44_transpose_to_mat43(wtmPrevNoReprojectedWpos, worldToPrevNoReprojectedWPos);
-
-        ShaderGlobal::set_color4(hero_bbox_reprojectionXVarId, Color4((float *)&wtmPrevNoReprojectedWpos.row0));
-        ShaderGlobal::set_color4(hero_bbox_reprojectionYVarId, Color4((float *)&wtmPrevNoReprojectedWpos.row1));
-        ShaderGlobal::set_color4(hero_bbox_reprojectionZVarId, Color4((float *)&wtmPrevNoReprojectedWpos.row2));
-
-        heroGunOrVehicleTmHndl.ref() = heroData.resWtm;
-      }
-      else
-      {
-        ShaderGlobal::set_real(gi_hero_cockpit_distanceVarId, 0);
-        ShaderGlobal::set_color4(hero_matrixXVarId, 0, 0, 0, 2);
-        ShaderGlobal::set_color4(hero_matrixYVarId, 0, 0, 0, 2);
-        ShaderGlobal::set_color4(hero_matrixZVarId, 0, 0, 0, 2);
-        heroGunOrVehicleTmHndl.ref() = prevHeroGunOrVehicleTmHndl.ref();
-        heroMatrixParamsHndl.ref() = eastl::nullopt;
-      }
-    };
-  }));
-
-  fgNodeHandles.emplace_back(dafg::register_node("motion_vector_access_setup_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    registry.executionHas(dafg::SideEffects::External);
-
-    auto cameraHndl = registry.readBlob<CameraParams>("current_camera").handle();
-    auto prevCameraHndl = registry.readBlobHistory<CameraParams>("current_camera").handle();
-    auto heroMatrixParamsHndl =
-      registry.readBlob<eastl::optional<motion_vector_access::HeroMatrixParams>>("hero_matrix_params").handle();
-
-    registry.createBlob<OrderingToken>("motion_vector_access_token", dafg::History::No); // something to use in dependent
-                                                                                         // nodes
-
-    return [cameraHndl, prevCameraHndl, heroMatrixParamsHndl] {
-      motion_vector_access::CameraParams currentCamera{cameraHndl.ref().viewTm, cameraHndl.ref().viewItm,
-        cameraHndl.ref().noJitterProjTm, cameraHndl.ref().cameraWorldPos, cameraHndl.ref().znear, cameraHndl.ref().zfar};
-      motion_vector_access::CameraParams previousCamera{prevCameraHndl.ref().viewTm, prevCameraHndl.ref().viewItm,
-        prevCameraHndl.ref().noJitterProjTm, prevCameraHndl.ref().cameraWorldPos, prevCameraHndl.ref().znear,
-        prevCameraHndl.ref().zfar};
-      motion_vector_access::set_params(currentCamera, previousCamera, cameraHndl.ref().jitterOffsetUv,
-        prevCameraHndl.ref().jitterOffsetUv, heroMatrixParamsHndl.ref());
-    };
-  }));
-
-  // TODO move this and all of the above to a new file to avoid cluttering WorldRenderer.cpp
-  fgNodeHandles.emplace_back(dafg::register_node("monotonic_frame_counter_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    auto frameCounterHndl = registry.createBlob<uint32_t>("monotonic_frame_counter", dafg::History::No).handle();
-
-    return [frameCounterHndl]() { frameCounterHndl.ref() = dagor_get_global_frame_id(); };
-  }));
-
-
-#if DAGOR_DBGLEVEL == 0
-#if _TARGET_PC
-  bool requestDebugNodes = app_profile::get().devMode;
-#else
-  constexpr bool requestDebugNodes = false;
-#endif
-#else
-  constexpr bool requestDebugNodes = true;
-#endif
-
-  if (requestDebugNodes)
-    makeDebugVisualizationNodes(fgNodeHandles);
-  else
-    fgNodeHandles.emplace_back(makeEmptyDebugVisualizationNode());
-
-  g_entity_mgr->broadcastEventImmediate(OnCameraNodeConstruction{&fgNodeHandles});
+  const bool aaNeedsHistory = antiAliasing && antiAliasing->needDepthHistory();
+  const bool giNeedsHistory = giNeedsReprojection();
+  const bool needDepthHistory = aaNeedsHistory || giNeedsHistory;
+
+  OnCameraNodeConstruction perCameraConstructionEvent{
+    &fgNodeHandles, prepass.get(), giNeedsReprojection(), needDepthHistory, bareMinimumPreset, hasMotionVectors};
+  g_entity_mgr->broadcastEventImmediate(perCameraConstructionEvent);
+  g_entity_mgr->broadcastEventImmediate(OnCameraNodeWithSlotsConstruction{&resSlotHandles});
+
+  toggleCameraInCamera(false);
+  mainViewCameraProviderNode = camera_in_camera::make_view_camera_provider_node("view0", "current_camera");
+  mainViewNodes.clear();
+  for (auto &[name, slot] : nodesRegistrators)
+  {
+    slot.mainOffset = slot.mainCount = 0;
+    dispatchCameraViewNodes(slot, true);
+  }
+  toggleCameraInCamera(camera_in_camera::is_lens_render_active());
 }
 
-bool WorldRenderer::isFsrEnabled() const
+void WorldRenderer::toggleCameraInCamera(bool active)
 {
-  return fsrEnabled && currentAntiAliasingMode == AntiAliasingMode::TSR &&
-         TemporalSuperResolution::parse_preset() == TemporalSuperResolution::Preset::Low;
+  if (active == lensViewNodesActive)
+    return;
+  lensViewNodesActive = active;
+  if (active)
+  {
+    lensViewCameraProviderNode = camera_in_camera::make_view_camera_provider_node("view1", "lens_area_camera");
+    for (auto &[name, slot] : nodesRegistrators)
+      dispatchCameraViewNodes(slot, false);
+  }
+  else
+  {
+    lensViewNodes.clear();
+    for (auto &[name, slot] : nodesRegistrators)
+      slot.lensOffset = slot.lensCount = 0;
+    lensViewCameraProviderNode = {};
+  }
 }
 
-void WorldRenderer::debugRecreateNodesLate()
+void WorldRenderer::dispatchCameraViewNodes(NodesRegistratorSlot &slot, bool is_main_view)
+{
+  if (!slot.enabled)
+    return;
+
+  auto &nodes = is_main_view ? mainViewNodes : lensViewNodes;
+  uint32_t &offset = is_main_view ? slot.mainOffset : slot.lensOffset;
+  uint32_t &count = is_main_view ? slot.mainCount : slot.lensCount;
+  CameraNodesRegistratorStorage storage(nodes, offset, count);
+
+  if (is_main_view)
+    g_entity_mgr->sendEventImmediate(slot.eid, OnCameraMainViewNodeConstruction{"", &storage, prepass.get()});
+
+  g_entity_mgr->sendEventImmediate(slot.eid,
+    OnCameraPerViewNodeConstruction{is_main_view, is_main_view ? "view0" : "view1", &storage, prepass.get()});
+  storage.clearUnused();
+  if (count == 0 || storage.isOverflowed())
+  {
+    offset = storage.getOffset();
+    count = storage.getWritten();
+  }
+}
+
+void WorldRenderer::registerCameraViewNodes(const char *name, ecs::EntityId eid)
+{
+  auto it = nodesRegistrators.find_as(name, eastl::less<>());
+
+  if (it != nodesRegistrators.end())
+  {
+    const char *prevEntityTemplate = g_entity_mgr->getEntityTemplateName(it->second.eid);
+    const char *newEntityTemplate = g_entity_mgr->getEntityTemplateName(eid);
+    logerr("render: camera view nodes registrator '%s' already registered. previous eid-template: [%d-%s], new eid-template: [%d-%s]",
+      name, it->second.eid, prevEntityTemplate, eid, newEntityTemplate);
+    return;
+  }
+
+  NodesRegistratorSlot &slot = nodesRegistrators[name];
+  slot.eid = eid;
+  if (!mainViewCameraProviderNode)
+    return;
+
+  dispatchCameraViewNodes(slot, true);
+  if (lensViewNodesActive)
+    dispatchCameraViewNodes(slot, false);
+}
+
+void WorldRenderer::clearCameraSlot(const NodesRegistratorSlot &slot)
+{
+  for (uint32_t i = slot.mainOffset; i < slot.mainOffset + slot.mainCount; ++i)
+    mainViewNodes[i] = {};
+  for (uint32_t i = slot.lensOffset; i < slot.lensOffset + slot.lensCount; ++i)
+    lensViewNodes[i] = {};
+}
+
+void WorldRenderer::unregisterCameraViewNodes(const char *name, ecs::EntityId eid)
+{
+  auto it = nodesRegistrators.find_as(name, eastl::less<>());
+  if (it == nodesRegistrators.end() || it->second.eid != eid)
+    return;
+
+  const NodesRegistratorSlot &slot = it->second;
+  clearCameraSlot(slot);
+
+  nodesRegistrators.erase(it);
+}
+
+void WorldRenderer::disableCameraViewNodes(const char *name, ecs::EntityId eid)
+{
+  auto it = nodesRegistrators.find_as(name, eastl::less<>());
+  if (it == nodesRegistrators.end())
+    return;
+
+  if (it->second.eid != eid)
+  {
+    const char *prevEntityTemplate = g_entity_mgr->getEntityTemplateName(it->second.eid);
+    const char *newEntityTemplate = g_entity_mgr->getEntityTemplateName(eid);
+    logerr("render: camera view nodes registrator '%s' attempt to disable with mismatched eid. previous eid-template: [%d-%s], new "
+           "eid-template: [%d-%s]",
+      name, it->second.eid, prevEntityTemplate, eid, newEntityTemplate);
+    return;
+  }
+
+  NodesRegistratorSlot &slot = it->second;
+  clearCameraSlot(slot);
+  slot.enabled = false;
+}
+
+void WorldRenderer::reCreateCameraViewNodes(const char *name)
+{
+  auto it = nodesRegistrators.find_as(name, eastl::less<>());
+  if (it == nodesRegistrators.end())
+    return;
+
+  NodesRegistratorSlot &slot = it->second;
+  slot.enabled = true;
+
+  dispatchCameraViewNodes(slot, true);
+  if (lensViewNodesActive)
+    dispatchCameraViewNodes(slot, false);
+}
+
+void WorldRenderer::debugRecreateNodes()
 {
   if (resolveHZBBeforeDynamic.pullValueChange())
   {
-    createGbufferControlNodes();
-    createHzbResolveNode();
+    requestFgRecreation("resolveHZBBeforeDynamic value changed");
+  }
+
+  if (process_reactive_gbuffer_data.pullValueChange())
+    requestFgRecreation("process_reactive_gbuffer_data value changed");
+
+  if (toggle_normal_packing.pullValueChange())
+  {
+    toggleFeatures(FeatureRenderFlagMask{}.set(FeatureRenderFlags::GBUFFER_PACKED_NORMALS), toggle_normal_packing.get());
   }
 
   if (volfog_enabled.pullValueChange())
   {
     shadowsManager.initShadowsDownsampleNode();
-    createVolumetricLightsNode();
+    requestFgRecreation("volfog_enabled value changed");
     // TODO: Why is this here? Why is this siwtchOff needed?
     // Who turns it back on?
     if (volumeLight != nullptr && !volfog_enabled.get())
@@ -3465,93 +3141,20 @@ void WorldRenderer::debugRecreateNodesLate()
 
   if (envi_cover_disable_fg_nodes.pullValueChange() || envi_cover_use_NBS.pullValueChange())
   {
-    createMotionVectorResolveAndEnviCoverNodes();
+    requestFgRecreation("Envi Cover setting change");
   }
 
   if (::pull_depth_bounds_enabled())
   {
-    createResolveGbufferNode();
+    requestFgRecreation("pull_depth_bounds_enabled");
     shadowsManager.initCombineShadowsNode();
   }
 
   if (dynamic_lights.pullValueChange())
-    createShadowPassNodes();
+    requestFgRecreation("dynamic_lights value changed");
 
   if (async_animchars_main.pullValueChange())
-    createAsyncAnimcharRenderingStartNode();
-
-  if (prepass.pullValueChange())
-  {
-    createOpaqueStaticNodes();
-  }
-}
-
-void WorldRenderer::createDownsampleDepthNode()
-{
-  downsampleDepthFGNodes = makeDownsampleDepthNodes(DownsampleNodeParams{downsampledTexturesMipCount, hasFeature(UPSCALE_SAMPLING_TEX),
-    hasFeature(DOWNSAMPLED_NORMALS), hasMotionVectors, storeDownsampledTexturesInEsram});
-}
-
-void WorldRenderer::createPrepareMotionVectorsAfterTransparentNode()
-{
-  if (needMotionVectors())
-    prepareMotionVectorsAfterTransparentNode =
-      makePrepareMotionVectorsAfterTransparent(antiAliasing && antiAliasing->needMotionVectorHistory());
-  else
-    prepareMotionVectorsAfterTransparentNode = {};
-}
-
-void WorldRenderer::createGbufferControlNodes()
-{
-  auto closeupsNs = dafg::root() / "opaque" / "closeups";
-  gbufferCloseupsControlNodes.clear();
-  gbufferCloseupsControlNodes.push_back(closeupsNs.registerNode("begin", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    auto ns = registry.root() / "init";
-    start_gbuffer_rendering_region(registry, ns, true);
-
-    auto cameraHndl = registry.readBlob<CameraParams>("current_camera").handle();
-
-    // closeups require a viewtm without translation
-    auto closeupsViewTm = registry.create("viewtm_no_offset", dafg::History::No).blob<TMatrix>().handle();
-
-    return [cameraHndl, closeupsViewTm]() {
-      auto &viewTm = closeupsViewTm.ref();
-      viewTm = cameraHndl.ref().viewTm;
-      viewTm.setcol(3, 0, 0, 0);
-    };
-  }));
-  gbufferCloseupsControlNodes.push_back(closeupsNs.registerNode("complete_prepass", DAFG_PP_NODE_SRC,
-    [](dafg::Registry registry) { complete_prepass_of_gbuffer_rendering_region(registry); }));
-  gbufferCloseupsControlNodes.push_back(
-    closeupsNs.registerNode("end", DAFG_PP_NODE_SRC, [](dafg::Registry registry) { end_gbuffer_rendering_region(registry); }));
-
-  const bool dynamicsAfterStatics = resolveHZBBeforeDynamic.get();
-  gbufferStaticsControlNodes = makeControlOpaqueStaticsNodes(dynamicsAfterStatics ? "closeups" : "dynamics");
-  gbufferDynamicsControlNodes = makeControlOpaqueDynamicsNodes(dynamicsAfterStatics ? "statics" : "closeups");
-
-  auto decoNs = dafg::root() / "opaque" / "decorations";
-  gbufferDecorationsControlNodes.clear();
-  gbufferDecorationsControlNodes.push_back(
-    decoNs.registerNode("begin", DAFG_PP_NODE_SRC, [dynamicsAfterStatics](dafg::Registry registry) {
-      auto ns = registry.root() / "opaque" / (dynamicsAfterStatics ? "dynamics" : "statics");
-      start_gbuffer_rendering_region(registry, ns, true);
-    }));
-  gbufferDecorationsControlNodes.push_back(decoNs.registerNode("complete_prepass", DAFG_PP_NODE_SRC,
-    [](dafg::Registry registry) { complete_prepass_of_gbuffer_rendering_region(registry); }));
-  gbufferDecorationsControlNodes.push_back(
-    decoNs.registerNode("end", DAFG_PP_NODE_SRC, [](dafg::Registry registry) { end_gbuffer_rendering_region(registry); }));
-
-  // We expose the gbuffer to the outside world by renaming it to
-  // "/gbuf_X", i.e. moving it to the global namespace
-  gbufferPublishNode = dafg::register_node("gbuffer_publish_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    auto ns = registry.root() / "opaque" / "decorations";
-    start_gbuffer_rendering_region(registry, ns, false);
-
-    d3d::SamplerInfo smpInfo;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
-    smpInfo.filter_mode = d3d::FilterMode::Point;
-    registry.create("gbuf_sampler", dafg::History::No).blob<d3d::SamplerHandle>(d3d::request_sampler(smpInfo));
-  });
+    requestFgRecreation("async_animchars_main value changed");
 }
 
 void WorldRenderer::createFinalOpaqueControlNodes()
@@ -3565,212 +3168,27 @@ void WorldRenderer::createFinalOpaqueControlNodes()
   // but right now refactoring it that way is very hard.
 
   finalOpaqueControlNodes.push_back(dafg::register_node("start_water_before_clouds", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    registry.rename("opaque_resolved", "opaque_with_water_before_clouds", dafg::History::No).texture();
-    registry.rename("gbuf_depth_after_resolve", "opaque_depth_with_water_before_clouds", dafg::History::No).texture();
+    registry.rename("opaque_resolved", "opaque_with_water_before_clouds").texture();
+    registry.rename("gbuf_depth_after_resolve", "opaque_depth_with_water_before_clouds").texture();
   }));
 
-  finalOpaqueControlNodes.push_back(dafg::register_node("start_envi", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    registry.rename("opaque_with_water_before_clouds", "opaque_with_envi", dafg::History::No).texture();
-  }));
+  finalOpaqueControlNodes.push_back(dafg::register_node("start_envi", DAFG_PP_NODE_SRC,
+    [](dafg::Registry registry) { registry.rename("opaque_with_water_before_clouds", "opaque_with_envi").texture(); }));
 
   finalOpaqueControlNodes.push_back(dafg::register_node("start_opaque_postprocessing", DAFG_PP_NODE_SRC,
-    [](dafg::Registry registry) { registry.rename("opaque_with_envi", "opaque_processed", dafg::History::No).texture(); }));
+    [](dafg::Registry registry) { registry.rename("opaque_with_envi", "opaque_processed").texture(); }));
 
   finalOpaqueControlNodes.push_back(dafg::register_node("start_water_after_clouds", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    registry.rename("opaque_processed", "opaque_with_envi_and_water", dafg::History::No).texture();
-    registry.rename("opaque_depth_with_water_before_clouds", "opaque_depth_with_water", dafg::History::No).texture();
+    registry.rename("opaque_processed", "opaque_with_envi_and_water").texture();
+    registry.rename("opaque_depth_with_water_before_clouds", "opaque_depth_with_water").texture();
   }));
-}
-
-void WorldRenderer::createTransparentControlNodes()
-{
-  transparentControlNodes.clear();
-  {
-    auto beforeZoneNs = dafg::root() / "transparent" / "far";
-    transparentControlNodes.push_back(beforeZoneNs.registerNode("begin", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-      const char *targetFrom;
-      const char *depthFrom;
-      if (renderer_has_feature(FeatureRenderFlags::MOBILE_DEFERRED))
-      {
-        targetFrom = "target_for_transparency_setup";
-        depthFrom = "depth_for_transparency_setup";
-      }
-      else if (renderer_has_feature(FeatureRenderFlags::FORWARD_RENDERING))
-      {
-        targetFrom = "target_after_water";
-        depthFrom = "depth_after_opaque";
-      }
-      else
-      {
-        targetFrom = "opaque_with_envi_and_water";
-        depthFrom = "opaque_depth_with_water";
-      }
-      registry.requestRenderPass()
-        .color({registry.rename(targetFrom, "color_target", dafg::History::No).texture()})
-        .depthRo(registry.rename(depthFrom, "depth", dafg::History::No).texture());
-
-      return []() {
-        // This is the most convenient place to do this.
-        debug_mesh::deactivate_mesh_coloring_master_override();
-
-        // TODO: Maybe we are paranoid about "setCascadesToShader" and we can delete that.
-        if (CascadeShadows *csm = WRDispatcher::getShadowsManager().getCascadeShadows())
-          csm->setCascadesToShader();
-      };
-    }));
-    transparentControlNodes.push_back(
-      beforeZoneNs.registerNode("end", DAFG_PP_NODE_SRC, [](dafg::Registry registry) { end_transparent_region(registry); }));
-  }
-  {
-    auto zoneNs = dafg::root() / "transparent" / "middle";
-    transparentControlNodes.push_back(zoneNs.registerNode("begin", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-      auto prevNs = registry.root() / "transparent" / "far";
-      start_transparent_region(registry, prevNs);
-    }));
-    transparentControlNodes.push_back(
-      zoneNs.registerNode("end", DAFG_PP_NODE_SRC, [](dafg::Registry registry) { end_transparent_region(registry); }));
-  }
-  {
-    auto afterZoneNs = dafg::root() / "transparent" / "close";
-    transparentControlNodes.push_back(afterZoneNs.registerNode("begin", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-      auto prevNs = registry.root() / "transparent" / "middle";
-      start_transparent_region(registry, prevNs);
-    }));
-    transparentControlNodes.push_back(
-      afterZoneNs.registerNode("end", DAFG_PP_NODE_SRC, [](dafg::Registry registry) { end_transparent_region(registry); }));
-  }
-
-  // We expose the transparent attachements to the outside world
-  transparentPublishNode = dafg::register_node("transparent_publish_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    registry.orderMeBefore("water_ssr_late_node");
-    auto prevNs = registry.root() / "transparent" / "close";
-    registry.requestRenderPass()
-      .color({prevNs.rename("color_target_done", "target_for_transparency", dafg::History::No).texture()})
-      .depthRo(prevNs.rename("depth_done", "depth_for_transparency", dafg::History::No).texture());
-  });
-}
-
-void WorldRenderer::createAsyncAnimcharRenderingStartNode()
-{
-  asyncAnimcharRenderingStartFGNode = dafg::NodeHandle();
-  if (async_animchars_main.get())
-    asyncAnimcharRenderingStartFGNode = makeAsyncAnimcharRenderingStartNode(hasMotionVectors);
-}
-
-void WorldRenderer::createHzbResolveNode()
-{
-  if (isForward())
-    return;
-
-  hzbResolveFGNode = makeHzbResolveNode(resolveHZBBeforeDynamic.get());
-}
-
-void WorldRenderer::createEnvironmentNode()
-{
-  if (auto *skies = get_daskies())
-  {
-    environmentFGNodes = makeEnvironmentNodes();
-  }
-}
-
-void WorldRenderer::createMotionBlurControlNodes()
-{
-  motionBlurControlNodes.clear();
-  { // Cinematic
-    auto motionBlurNs = dafg::root() / "motion_blur" / "cinematic_motion_blur";
-    motionBlurControlNodes.push_back(motionBlurNs.registerNode("begin", DAFG_PP_NODE_SRC,
-      [](dafg::Registry registry) { registry.rename("target_before_motion_blur", "color_target", dafg::History::No).texture(); }));
-    motionBlurControlNodes.push_back(motionBlurNs.registerNode("end", DAFG_PP_NODE_SRC,
-      [](dafg::Registry registry) { registry.rename("color_target", "color_target_done", dafg::History::No).texture(); }));
-  }
-
-  { // object motion
-    auto motionBlurNs = dafg::root() / "motion_blur" / "object_motion_blur";
-    motionBlurControlNodes.push_back(motionBlurNs.registerNode("begin", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-      auto prevNs = registry.root() / "motion_blur" / "cinematic_motion_blur";
-      prevNs.rename("color_target_done", "color_target", dafg::History::No).texture();
-    }));
-    // If object_motion_blur is presented, it will control this node
-    if (g_entity_mgr->getSingletonEntity(ECS_HASH("object_motion_blur")) == ecs::INVALID_ENTITY_ID)
-    {
-      motionBlurControlNodes.push_back(motionBlurNs.registerNode("end", DAFG_PP_NODE_SRC,
-        [](dafg::Registry registry) { registry.rename("color_target", "color_target_done", dafg::History::No); }));
-    }
-  }
-
-  // We expose the motionblur attachements to the outside world
-  motionBlurControlNodes.push_back(dafg::register_node("motionblur_publish_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
-    auto prevNs = registry.root() / "motion_blur" / "object_motion_blur";
-    prevNs.rename("color_target_done", "final_target_with_motion_blur", dafg::History::No).texture();
-  }));
-}
-
-void WorldRenderer::createShadowPassNodes()
-{
-  if (isForwardRender())
-    return;
-
-  shadowPassFGNodes = {};
-  if (dynamic_lights.get())
-    shadowPassFGNodes = makeSceneShadowPassNodes(getLevelSettings());
-}
-
-void WorldRenderer::createUINodes()
-{
-  beforeUIControlNodes = makeBeforeUIControlNodes();
-
-  if (needSeparatedUI())
-  {
-    // this is currently only used for frame generation, so currently always true in this branch
-    const bool needHistory = true;
-    uiRenderNode = makeUIRenderNode(needHistory);
-    uiBlendNode = makeUIBlendNode();
-  }
-  else
-  {
-    uiRenderNode = {};
-    uiBlendNode = {};
-  }
 }
 
 void WorldRenderer::setEnviCover(bool envi_cover)
 {
   isEnviCover = envi_cover && !bareMinimumPreset;
-  createMotionVectorResolveAndEnviCoverNodes();
-}
-
-void WorldRenderer::createMotionVectorResolveAndEnviCoverNodes()
-{
-  bool isValidNBS = enviCover->getValidNBS() && envi_cover_use_NBS.get();
-
-  if (!isValidNBS && envi_cover_use_NBS.get())
-  {
-    console::print_d("Tried to turn on envi_cover NBS, but there is no root_graph defined in the .blk!");
-    envi_cover_use_NBS.set(false);
-  }
-
-  isValidNBS = isValidNBS && isEnviCover;
-  bool isValidNode = !envi_cover_disable_fg_nodes.get() && isEnviCover;
-
-  ShaderGlobal::set_int(var::envi_cover_use_in_resolve, (!isValidNBS && !isValidNode && isEnviCover) ? 1 : 0);
-  resolveMotionVectorsAndEnviCoverNodes = makeResolveMotionAndEnviCoverNode(needMotionVectors(), isValidNode, isValidNBS);
-}
-
-void WorldRenderer::createOpaqueStaticNodes()
-{
-  opaqueStaticNodes.clear();
-  opaqueStaticNodes = makeOpaqueStaticNodes(prepass.get());
-}
-
-void WorldRenderer::createVolumetricLightsNode()
-{
-  if (isForwardRender())
-    return;
-
-  volumetricLightsFGNodes = {};
-
-  if (volumeLight && volfog_enabled.get())
-    volumetricLightsFGNodes = makeVolumetricLightsNodes();
+  initTarget(); // Need target recreation for optional UAV flag
+  requestFgRecreation("Envi Cover ecs loaded");
 }
 
 WaterRenderMode WorldRenderer::determineWaterRenderMode(bool underWater, bool belowClouds)
@@ -3778,25 +3196,34 @@ WaterRenderMode WorldRenderer::determineWaterRenderMode(bool underWater, bool be
   return underWater ? WaterRenderMode::LATE : belowClouds ? WaterRenderMode::EARLY_AFTER_ENVI : WaterRenderMode::EARLY_BEFORE_ENVI;
 }
 
-void WorldRenderer::createTransparentParticlesNode()
+void WorldRenderer::recreateWaterNodes()
 {
-  acesFxTransparentNode = dafg::NodeHandle();
-  acesFxLowresTransparentNodes.clear();
-  if (isForward())
-    return;
-
-  acesFxTransparentNode = makeAcesFxTransparentNode();
-  if (getFxRtOverride() != FX_RT_OVERRIDE_HIGHRES)
-    acesFxLowresTransparentNodes = makeAcesFxLowresTransparentNodes();
+  waterNodes.clear();
+  for (auto &&node : makeWaterDepthRenameNodes())
+    waterNodes.push_back(eastl::move(node));
+  waterNodes.push_back(makePrepareWaterNode());
+  waterNodes.push_back(makeWaterNode(waterRenderMode));
+  for (auto &&node : makeWaterSSRNode(waterRenderMode))
+    waterNodes.push_back(eastl::move(node));
+  recreate_water_rt_node();
 }
 
-void WorldRenderer::createDownsampleDepthWithWaterNode()
+bool WorldRenderer::isCameraBelowClouds() const
 {
-  downsampledDepthWithWaterNode = dafg::NodeHandle();
-  if (fxRtOverride == FX_RT_OVERRIDE_HIGHRES)
-    return;
+  auto *skies = get_daskies();
+  if (!skies)
+    return true;
+  const Point3 camPos = currentFrameCamera.viewItm.getcol(3);
+  return max(camPos.y, getWaterLevel()) < skies->getCloudsStartAlt() - 10.0f;
+}
 
-  downsampledDepthWithWaterNode = makeDownsampleDepthWithWaterNode();
+void WorldRenderer::updateWaterRenderMode()
+{
+  const WaterRenderMode mode = determineWaterRenderMode(is_underwater(), isCameraBelowClouds());
+  if (mode == waterRenderMode)
+    return;
+  waterRenderMode = mode;
+  recreateWaterNodes();
 }
 
 // Note: unfortunately can't be put in header due to dtor req of incomplete types (e.g. unique_ptr) for exception handlers
@@ -3804,10 +3231,7 @@ WorldRenderer::WorldRenderer()
 {
   // Note: do not put anything here, use one of the methods below
   ctorCommon();
-  if (!isForwardRender())
-    ctorDeferred();
-  else
-    ctorForward();
+  ctorDeferred();
 }
 
 WorldRenderer::~WorldRenderer()
@@ -3818,7 +3242,6 @@ WorldRenderer::~WorldRenderer()
 
 void WorldRenderer::close()
 {
-  NodeBasedShaderManager::clearAllCachedResources();
   satelliteRenderer.cleanupResources();
   shader_assert::close();
   free_gpu_hang_resources();
@@ -3836,13 +3259,10 @@ void WorldRenderer::close()
   get_daskies()->destroy_skies_data(main_pov_data);
   get_daskies()->destroy_skies_data(cube_pov_data);
   closeWaterPlanarReflection();
-  aoFGNodes = {};
-  ssrFGNodes.clear();
   shadowsManager.closeShadows();
   fomShadowManager.reset();
   closeOverrideStates();
   binScene = NULL;
-  binSceneTransparencyNode = {};
   // closeGround();
   close_draw_cached_debug();
 
@@ -3854,6 +3274,7 @@ void WorldRenderer::close()
 
 
   ShaderGlobal::reset_textures();
+  refined_block::clear();
 
   del_it(debug_tex_overlay);
   target.reset();
@@ -3873,10 +3294,10 @@ void WorldRenderer::close()
   resetBackBufferTex();
   reset_fx_textures_used();
 
-  ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_GLOBAL_CONST);
-  dynmodel_renderer::close_dynmodel_rendering();
+  dynrend::close();
   giWindows.reset();
   hzbUploadStagingTex.close();
+  render::antialiasing::close();
 }
 
 void WorldRenderer::initOverrideStates()
@@ -3935,8 +3356,9 @@ void WorldRenderer::updateLightShadow(light_id light, const LightShadowParams &s
   bool had_shadows =
     getShadowProperties(light, old_casters, old_hint_dynamic, old_quality, old_priority, old_shadow_size_srl, old_render_gpu_objects);
   bool shadows_changed = (had_shadows != need_shadows);
-  ShadowCastersFlag casters = ShadowCastersFlag(uint32_t(shadow_params.supportsDynamicObjects ? DYNAMIC_CASTERS : 0) |
-                                                (shadow_params.approximateStatic ? APPROXIMATE_STATIC_CASTERS : 0));
+  ShadowCastersFlag casters = (shadow_params.supportsDynamicObjects ? ShadowCastersFlag::Dynamic : ShadowCastersFlag::None) |
+                              (shadow_params.approximateStatic ? ShadowCastersFlag::ApproximateStatic : ShadowCastersFlag::None) |
+                              (shadow_params.isTwoSided ? ShadowCastersFlag::TwoSided : ShadowCastersFlag::None);
   if (!shadows_changed && had_shadows)
     shadows_changed = casters != old_casters || old_hint_dynamic != shadow_params.isDynamic || old_quality != shadow_params.quality ||
                       old_priority != shadow_params.priority || old_shadow_size_srl != shadow_params.shadowShrink ||
@@ -3992,7 +3414,7 @@ void WorldRenderer::update(float dt, float, const TMatrix &itm)
     if (sw_occlusion)
     {
       mainCameraVisibilityMgr.runOcclusionRasterizerCleaners();
-      if (camera_in_camera::activate_view())
+      if (camera_in_camera::is_lens_render_active())
         camcamVisibilityMgr.runOcclusionRasterizerCleaners();
     }
 
@@ -4027,17 +3449,19 @@ void update_world_renderer(float dt, float rdt, const TMatrix &itm, bool scene_l
     uirender::update_all_gui_scenes_mainthread(dt);
 }
 
+extern void prepare_scene_shadows_in_lights_job(WorldRenderer &wr, vec3f view_pos, mat44f_cref globtm, float hk);
+
 void WorldRenderer::cullFrustumLights(
-  Occlusion *occlusion, vec3f viewPos, mat44f_cref globtm, mat44f_cref view, mat44f_cref proj, float zn)
+  Occlusion *occlusion, vec3f viewPos, mat44f_cref globtm, mat44f_cref view, mat44f_cref proj, float zn, float zf, float hk)
 {
-  std::lock_guard<std::mutex> scopedLock(lightLock);
-  lights.cullFrustumLights(viewPos, globtm, view, proj, zn, occlusion, SpotLightMaskType::SPOT_LIGHT_MASK_NONE,
+  lights.cullFrustumLights(viewPos, globtm, view, proj, zn, zf, occlusion, SpotLightMaskType::SPOT_LIGHT_MASK_NONE,
     OmniLightMaskType::OMNI_LIGHT_MASK_NONE); // least important Job, needed only at resolve pass
+  prepare_scene_shadows_in_lights_job(*this, viewPos, globtm, hk);
 }
 
 inline DPoint3 floor(const DPoint3 &a) { return DPoint3(floor(a.x), floor(a.y), floor(a.z)); }
 
-CameraParams get_camera_params(TMatrix view_itm, const DPoint3 &view_pos, const Driver3dPerspective &persp)
+CameraParams get_camera_params(TMatrix view_itm, const DPoint3 &view_pos, const Driver3dPerspective &persp, const TMatrix4D &projTm)
 {
   TIME_PROFILE(get_camera_params);
 
@@ -4063,9 +3487,6 @@ CameraParams get_camera_params(TMatrix view_itm, const DPoint3 &view_pos, const 
   }
 
   TMatrix4D viewTm = calc_camera_view(view_itm, view_pos);
-  //--
-  // projection in doubles
-  TMatrix4D projTm = dmatrix_perspective_reverse(persp.wk, persp.hk, persp.zn, persp.zf, persp.ox, persp.oy);
   TMatrix4D globtm = viewTm * projTm;
   // globtm in doubles
 
@@ -4085,7 +3506,8 @@ CameraParams get_camera_params(TMatrix view_itm, const DPoint3 &view_pos, const 
   cameraParams.negRoundedCamPos = negRoundedPos;
   cameraParams.negRemainderCamPos = negRemainderPos;
   cameraParams.noJitterPersp = persp;
-  cameraParams.viewRotJitterProjTm = TMatrix4(viewRotTm * projTm);
+  cameraParams.viewRotProjTm = TMatrix4(viewRotTm * projTm);
+  cameraParams.viewRotJitterProjTm = cameraParams.viewRotProjTm;
   cameraParams.viewRotTm = TMatrix(viewRotTm);
   cameraParams.viewItm = view_itm;
   cameraParams.viewTm = TMatrix(viewTm);
@@ -4100,40 +3522,59 @@ CameraParams get_camera_params(TMatrix view_itm, const DPoint3 &view_pos, const 
   return cameraParams;
 }
 
-void WorldRenderer::setUpView(const TMatrix &view_itm, const DPoint3 &view_pos, const Driver3dPerspective &persp)
+void WorldRenderer::setUpView(
+  const TMatrix &view_itm, const DPoint3 &view_pos, const Driver3dPerspective &persp, const TMatrix4D &proj_tm)
 {
   TIME_D3D_PROFILE(setUpView);
 
   prevFrameCamera = currentFrameCamera;
 
+  const CameraSetup &camSetup = get_active_camera_setup(true);
+  int w, h;
+  d3d::get_screen_size(w, h);
+
   if (camera_in_camera::is_lens_only_zoom_enabled())
   {
-    int w, h;
-    d3d::get_screen_size(w, h);
-    const CameraSetup &camSetup = get_active_camera_setup();
     const Driver3dPerspective unzoomedPerspective =
       calc_camera_perspective(camSetup.fovSettings, camSetup.fovMode, persp.zn, persp.zf, w, h);
 
-    camcamParams = get_camera_params(view_itm, view_pos, persp);
-    currentFrameCamera = get_camera_params(view_itm, view_pos, unzoomedPerspective);
+    const TMatrix4D unzoomedProjTm = dmatrix_perspective_reverse(unzoomedPerspective.wk, unzoomedPerspective.hk,
+      unzoomedPerspective.zn, unzoomedPerspective.zf, unzoomedPerspective.ox, unzoomedPerspective.oy);
+    const Driver3dPerspective &lensAreaPerspective = persp;
+
+    prevCamcamParams = camcamParams;
+    camcamParams = get_camera_params(view_itm, view_pos, camcam_force_world_fov ? unzoomedPerspective : lensAreaPerspective, proj_tm);
+    currentFrameCamera = get_camera_params(view_itm, view_pos, unzoomedPerspective, unzoomedProjTm);
   }
   else
   {
-    currentFrameCamera = get_camera_params(view_itm, view_pos, persp);
-    camcamParams = eastl::nullopt;
+    currentFrameCamera = get_camera_params(view_itm, view_pos, persp, proj_tm);
+    camcamParams = prevCamcamParams = eastl::nullopt;
   }
 
+  if (camSetup.cockpitFov > 0.0f)
+  {
+    const Driver3dPerspective cockpitPersp = calc_camera_perspective(camSetup.cockpitFov, camSetup.fovMode, persp.zn, persp.zf, w, h);
+    const TMatrix4D cockpitProjTm = dmatrix_perspective_reverse(cockpitPersp.wk, cockpitPersp.hk, cockpitPersp.zn, cockpitPersp.zf,
+      cockpitPersp.ox, cockpitPersp.oy);
+    cockpitCameraParams = get_camera_params(view_itm, view_pos, cockpitPersp, cockpitProjTm);
+  }
+  else
+    cockpitCameraParams = currentFrameCamera;
 
   d3d::settm(TM_WORLD, TMatrix::IDENT);
   d3d::settm(TM_VIEW, currentFrameCamera.viewTm);
-  d3d::setpersp(currentFrameCamera.noJitterPersp);
+  d3d::settm(TM_PROJ, &currentFrameCamera.noJitterProjTm);
 
-  ShaderGlobal::set_color4(world_view_posVarId, view_pos.x, view_pos.y, view_pos.z, 1);
+  dynrend::set_prev_view_proj(TMatrix4(prevFrameCamera.viewRotTm),
+    get_prev_proj_tm_with_cur_jitter(prevFrameCamera, currentFrameCamera));
 
-  ShaderGlobal::set_color4(projection_centerVarId, persp.ox, persp.oy, 0, 0);
+  ShaderGlobal::set_float4(world_view_posVarId, view_pos.x, view_pos.y, view_pos.z, 1);
 
-  ShaderGlobal::set_color4(camera_rightVarId, view_itm.getcol(0));
-  ShaderGlobal::set_color4(camera_upVarId, view_itm.getcol(1));
+  ShaderGlobal::set_float4(projection_centerVarId, persp.ox, persp.oy, 0, 0);
+
+  ShaderGlobal::set_float4(camera_rightVarId, view_itm.getcol(0));
+  ShaderGlobal::set_float4(camera_upVarId, view_itm.getcol(1));
 }
 
 void WorldRenderer::updateLodsScaling()
@@ -4148,9 +3589,8 @@ void WorldRenderer::updateLodsScaling()
   riDistMul = max(riDistMul, defRiDistMul);
   impostorsDistMul = max(impostorsDistMul, defImpostorDistMul);
 
-  if (camera_in_camera::is_lens_render_active())
+  if (camera_in_camera::is_lens_only_zoom_enabled())
   {
-    camcamVisibilityMgr.updateLodsScaling(riDistMul, impostorsDistMul);
     rendinst::setImpostorsDistAddMul(defImpostorDistMul);
     rendinst::setDistMul(defRiDistMul, 0.0f);
   }
@@ -4159,6 +3599,9 @@ void WorldRenderer::updateLodsScaling()
     rendinst::setImpostorsDistAddMul(impostorsDistMul);
     rendinst::setDistMul(riDistMul, 0.0f);
   }
+
+  if (camera_in_camera::is_lens_render_active())
+    camcamVisibilityMgr.updateLodsScaling(riDistMul, impostorsDistMul);
 
   bool impostorRangeIncreased = impostorsDistMul > defImpostorDistMul;
   bool rendinstRangeIncreased = riDistMul > defRiDistMul;
@@ -4186,22 +3629,90 @@ struct DriverFallbackCallback : public FrameEvents
 DriverFallbackCallback driverFallbackCallback{};
 } // namespace
 
+static constexpr unsigned RECENTLY_USED_TEX_FRAMES = 30;
+static constexpr unsigned CONVERGENCE_BLOCKED_LOG_PERIOD = 600;
+
+// the sweep must not stop at the first failure: every incomplete texture needs its prefetch request issued
+static TEXTUREID first_incomplete_recently_used_texture()
+{
+  const unsigned curFrame = ::dagor_frame_no();
+  TEXTUREID incomplete = BAD_TEXTUREID;
+  for (TEXTUREID i = first_managed_texture(1); i != BAD_TEXTUREID; i = next_managed_texture(i, 1))
+    if (get_managed_res_lfu(i) + RECENTLY_USED_TEX_FRAMES > curFrame && is_managed_texture_incomplete(i))
+      if (!prefetch_and_check_managed_texture_loaded(i, true) && incomplete == BAD_TEXTUREID)
+        incomplete = i;
+  return incomplete;
+}
+
+void WorldRenderer::resetConvergenceMarkers()
+{
+  giConvergenceLogged = false;
+  texStreamingConvergenceLogged = false;
+  staticShadowsConvergenceLogged = false;
+}
+
+auto WorldRenderer::logStaticShadowsConvergence() -> StaticShadowsConvergenceState
+{
+  StaticShadowsConvergenceState state = {
+    .completelyValidFrames = shadowsManager.getStaticShadows()->getMinCompletelyValidFramesAcrossAllCascades(),
+    .completelyValidFramesNeed = (uint32_t)dgs_get_settings()->getBlockByNameEx("debug")->getInt("staticShadowsConvergenceFrames", 30),
+  };
+  const bool converged = state.completelyValidFrames >= state.completelyValidFramesNeed;
+  if (converged && !staticShadowsConvergenceLogged)
+    debug("[convergence] staticShadows");
+  staticShadowsConvergenceLogged = converged;
+  return state;
+}
+
+void WorldRenderer::logConvergenceMarkers()
+{
+  static const bool enabled = ::dgs_get_settings()->getBlockByNameEx("debug")->getBool("logRenderConvergence", false);
+  if (!enabled)
+    return;
+  const GIConvergenceState gi = logGIConvergence();
+  const int texPending = get_managed_textures_streaming_pending_count();
+  const int riVdataPending = unitedvdata::riUnitedVdata.getPendingReloadResCount();
+  const int dmVdataPending = unitedvdata::dmUnitedVdata.getPendingReloadResCount();
+  const StaticShadowsConvergenceState staticShadows = logStaticShadowsConvergence();
+  // the per-texture sweep is the expensive part: once converged, renewed
+  // streaming activity shows up in the cheap pending counter first
+  const TEXTUREID incompleteTex =
+    texPending == 0 && !texStreamingConvergenceLogged ? first_incomplete_recently_used_texture() : BAD_TEXTUREID;
+  const bool texComplete = texPending == 0 && incompleteTex == BAD_TEXTUREID;
+  const bool texStreaming = texComplete && riVdataPending == 0 && dmVdataPending == 0;
+  if (texStreaming && !texStreamingConvergenceLogged)
+    debug("[convergence] texStreaming");
+  texStreamingConvergenceLogged = texStreaming;
+  if ((!giConvergenceLogged || !texStreamingConvergenceLogged || !staticShadowsConvergenceLogged) &&
+      ::dagor_frame_no() % CONVERGENCE_BLOCKED_LOG_PERIOD == 0)
+    debug("[convergence] blocked by: giRequiresUpdate=%d giHistoryFrames=%u/%u texPending=%d incompleteTex=%s riVdataPending=%d "
+          "dmVdataPending=%d staticShadowsCompletelyValidFrames=%u/%u",
+      (int)gi.requiresUpdate, gi.historyFrames, gi.historyFramesNeed, texPending,
+      incompleteTex == BAD_TEXTUREID ? "none" : get_managed_texture_name(incompleteTex), riVdataPending, dmVdataPending,
+      staticShadows.completelyValidFrames, staticShadows.completelyValidFramesNeed);
+}
+
 void WorldRenderer::beforeRender(float scaled_dt,
   float act_dt,
   float real_dt,
   float game_time,
   const TMatrix &view_itm_,
   const DPoint3 &view_pos,
-  const Driver3dPerspective &persp)
+  const Driver3dPerspective &persp,
+  const TMatrix4D &proj_tm)
 {
   if (sceneload::is_scene_switch_in_progress())
     return;
+
+  ShaderGlobal::set_float(var::sky_polarization_filter_term, get_sky_polarization_filter_term());
+
   realDeltaTime = real_dt;
   gameTime = game_time;
   set_shader_global_time(gameTime);
+  logConvergenceMarkers();
 
-  ShaderGlobal::set_real(foam_timeVarId, gameTime);
-  ShaderGlobal::set_real(scroll_timeVarId, gameTime);
+  ShaderGlobal::set_float(foam_timeVarId, gameTime);
+  ShaderGlobal::set_float(scroll_timeVarId, gameTime);
 
   if (crash_fallback_helper)
     driverFallbackCallback.registerSelf();
@@ -4226,7 +3737,7 @@ void WorldRenderer::beforeRender(float scaled_dt,
   TIME_D3D_PROFILE(world_render__beforeRender);
 
   if (dynamicQuality)
-    dynamicQuality->onFrameStart();
+    dynamicQuality->onFrameStart(*g_entity_mgr);
   if (dynamicResolution)
   {
     dynamicResolution->setMinimumMsPerFrame(safediv(1000.f, get_fps_limit()));
@@ -4248,7 +3759,10 @@ void WorldRenderer::beforeRender(float scaled_dt,
     }
   }
 
-  setUpView(view_itm_, view_pos, persp);
+  setUpView(view_itm_, view_pos, persp, proj_tm);
+
+  processHeroTeleportation();
+  processGIInvalidationRequests();
 
   updateBackBufferTex();
 
@@ -4293,21 +3807,29 @@ void WorldRenderer::beforeRender(float scaled_dt,
       htb = max(waterLevel, htb);
       cameraHeight = max(cameraHeight, viewPos.y - 0.5f * (ht + htb));
     }
-    lmeshRenderer->setUseHmapTankSubDiv(displacementSubDiv);
   }
+  cameraActualHeight = cameraHeight;
+
   canChangeAltitudeUnexpectedly = can_change_altitude_unexpectedly();
   if (canChangeAltitudeUnexpectedly)
     cameraHeight += fast_move_camera_height_offset.get();
 
+  constexpr uint32_t cameraInitialPositionRelaxationFrames = 5;
   const float speed = length(prevViewPos - itm.getcol(3)) / max(0.001f, real_dt);
-  if (speed > 330.f && fabsf(cameraSpeed - speed) / max(0.001f, real_dt) > 1000.f)
-    cameraSpeed = 0; // new speed exceeds speed of sound, and acceleration exceed 100g, so teleportation
+  const bool cameraMovementSimilarToTeleportation =
+    speed > 330.f && fabsf(cameraSpeed - speed) / max(0.001f, real_dt) > 1000.f; // new speed exceeds speed of sound, and acceleration
+                                                                                 // exceed 100g, so teleportation
+  if (renderedFrames < cameraInitialPositionRelaxationFrames || cameraMovementSimilarToTeleportation)
+    cameraSpeed = 0;
   else
     cameraSpeed = lerp(cameraSpeed, speed, 1.0f - expf(-real_dt)); // exponential average
 
-  // 10.f here is g-force.
-  bool highEnergy = (cameraHeight * 10.f + cameraSpeed * cameraSpeed * 0.5f) > switch_ri_gen_mode_threshold.get();
+  // the RI mode switch counts the fast-move height offset in, the clouds gate
+  // wants the physical height
+  bool highEnergy = camera_specific_energy(cameraHeight, cameraSpeed) > switch_ri_gen_mode_threshold.get();
   rendinst::render::setRIGenRenderMode(!canChangeAltitudeUnexpectedly || !highEnergy ? -1 : 0);
+  if (DngSkies *dngSkies = get_daskies())
+    dngSkies->updateCloudsFullresProximity(cameraActualHeight, cameraSpeed);
 
   {
     Occlusion *occlusion = getMainCameraOcclusion();
@@ -4327,12 +3849,6 @@ void WorldRenderer::beforeRender(float scaled_dt,
     bool cablesChanged = get_cables_mgr()->beforeRender();
     if (cablesChanged)
       bvh_cables_changed();
-  }
-
-  // dispatch performed in this function, so it should be done in beforeRender
-  {
-    TIME_D3D_PROFILE(heightmap_query_update)
-    heightmap_query::update();
   }
 
   if (ecs::EntityId zoneEid = g_entity_mgr->getSingletonEntity(ECS_HASH("transparent_partition")))
@@ -4365,7 +3881,11 @@ void WorldRenderer::beforeRender(float scaled_dt,
   if (ssr_quality.pullValueChange() || ssr_fullres.pullValueChange() || ssr_enable.pullValueChange() || ssr_denoiser.pullValueChange())
     updateSettingsSSR(-1, -1);
 
+  rendinst::before_culling();
   rendinst::before_render();
+
+  if (prepass.pullValueChange())
+    requestFgRecreation("prepass shvar changed");
 }
 
 enum
@@ -4417,46 +3937,55 @@ void WorldRenderer::updateTransformations(const DPoint3 &move,
 {
   TMatrix4_vec4 globtm = (const TMatrix4_vec4 &)currentFrameCamera.jitterGlobtm;
   globtm = globtm.transpose();
-  ShaderGlobal::set_color4(globtm_psf_0VarId, Color4(globtm[0]));
-  ShaderGlobal::set_color4(globtm_psf_1VarId, Color4(globtm[1]));
-  ShaderGlobal::set_color4(globtm_psf_2VarId, Color4(globtm[2]));
-  ShaderGlobal::set_color4(globtm_psf_3VarId, Color4(globtm[3]));
+  ShaderGlobal::set_float4(globtm_psf_0VarId, Color4(globtm[0]));
+  ShaderGlobal::set_float4(globtm_psf_1VarId, Color4(globtm[1]));
+  ShaderGlobal::set_float4(globtm_psf_2VarId, Color4(globtm[2]));
+  ShaderGlobal::set_float4(globtm_psf_3VarId, Color4(globtm[3]));
 
   TMatrix4_vec4 prevGlobTm = (const TMatrix4_vec4 &)prevFrameCamera.jitterGlobtm;
   prevGlobTm = prevGlobTm.transpose();
-  ShaderGlobal::set_color4(prev_globtm_psf_0VarId, Color4(prevGlobTm[0]));
-  ShaderGlobal::set_color4(prev_globtm_psf_1VarId, Color4(prevGlobTm[1]));
-  ShaderGlobal::set_color4(prev_globtm_psf_2VarId, Color4(prevGlobTm[2]));
-  ShaderGlobal::set_color4(prev_globtm_psf_3VarId, Color4(prevGlobTm[3]));
+  ShaderGlobal::set_float4(prev_globtm_psf_0VarId, Color4(prevGlobTm[0]));
+  ShaderGlobal::set_float4(prev_globtm_psf_1VarId, Color4(prevGlobTm[1]));
+  ShaderGlobal::set_float4(prev_globtm_psf_2VarId, Color4(prevGlobTm[2]));
+  ShaderGlobal::set_float4(prev_globtm_psf_3VarId, Color4(prevGlobTm[3]));
 
   ShaderGlobal::set_float4x4(jitteredCamPosToUnjitteredHistoryClipVarId, jittered_cam_pos_to_unjittered_history_clip);
-  ShaderGlobal::set_color4(prev_to_cur_origin_moveVarId, move.x, move.y, move.z, length(move));
+  ShaderGlobal::set_float4(prev_to_cur_origin_moveVarId, move.x, move.y, move.z, length(move));
 
-  ShaderGlobal::set_color4(prevOrigoRelativeViewProjTm0VarId, Color4(prev_origo_relative_view_proj_tm[0]));
-  ShaderGlobal::set_color4(prevOrigoRelativeViewProjTm1VarId, Color4(prev_origo_relative_view_proj_tm[1]));
-  ShaderGlobal::set_color4(prevOrigoRelativeViewProjTm2VarId, Color4(prev_origo_relative_view_proj_tm[2]));
-  ShaderGlobal::set_color4(prevOrigoRelativeViewProjTm3VarId, Color4(prev_origo_relative_view_proj_tm[3]));
+  ShaderGlobal::set_float4(prevOrigoRelativeViewProjTm0VarId, Color4(prev_origo_relative_view_proj_tm[0]));
+  ShaderGlobal::set_float4(prevOrigoRelativeViewProjTm1VarId, Color4(prev_origo_relative_view_proj_tm[1]));
+  ShaderGlobal::set_float4(prevOrigoRelativeViewProjTm2VarId, Color4(prev_origo_relative_view_proj_tm[2]));
+  ShaderGlobal::set_float4(prevOrigoRelativeViewProjTm3VarId, Color4(prev_origo_relative_view_proj_tm[3]));
 }
 
 static void set_mip_bias(float bias_value)
 {
   TIME_PROFILE(set_mip_bias);
   acesfx::set_default_mip_bias(bias_value);
-  update_land_micro_details_sampler(bias_value);
   const LODBiasRule lodBiasRules[] = {
     {"*", bias_value}, {"impostor", bias_value}, {"character_micro_details*", 0}, {"gen_cloud_detail", 0}, {"gen_cloud_shape", 0}};
   set_add_lod_bias_batch(make_span(lodBiasRules));
-  ShaderGlobal::set_real(mip_biasVarId, bias_value);
+  ShaderGlobal::set_float(mip_biasVarId, bias_value);
 }
 
 void WorldRenderer::draw(uint32_t frame_id, float realDt)
 {
+  int renderResW, renderResH;
+  getRenderingResolution(renderResW, renderResH);
+  int displayResW, displayResH;
+  getDisplayResolution(displayResW, displayResH);
+  DA_PROFILE_TAG(resolution, "render:%d x %d, display:%d x %d", renderResW, renderResH, displayResW, displayResH);
+
+  debugRecreateNodes();
+  processPendingFgRecreation();
+  updateWaterRenderMode();
+
+  ShaderGlobal::set_int(var::packed_gbuf_normals, hasFeature(GBUFFER_PACKED_NORMALS));
   auto callBeforePUFD = []() { // `PUFD` is abbr ParallelUpdateFrameDelayed
     rendinst::applyTiledScenesUpdateForRIGenExtra(2000, 1000);
   };
-  callBeforePUFD();            // Must be called before additional job (aka PUFD) to avoid data races & lock order inversions
-  if (!delay_PUFD_after_bvh()) // It'll be started after bvh_update_instances instead, runs parallel with bvh_update node
-    start_async_game_tasks(frame_id, AGT_ADDITIONAL, /*wake*/ true); // Note: long job - start as early as possible
+  callBeforePUFD(); // Must be called before additional job (aka PUFD) to avoid data races & lock order inversions
+  start_async_game_tasks(frame_id, AGT_ADDITIONAL, /*wake*/ true); // Note: long job - start as early as possible
 
   const TMatrix &itm = currentFrameCamera.viewItm;
   const Point3_vec4 viewPos = itm.getcol(3);
@@ -4474,10 +4003,14 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
 
   calcWaterPlanarReflectionMatrix();
 
+  ShaderGlobal::set_int(render_with_normalmapVarId, VTEX_RENDER_DISPLACEMENT); // set default rendering state
+
   // initialize visibility for legacy gpu objects on demand
   if (DAGOR_UNLIKELY(rendinst::gpuobjects::has_manager() && !legacyGPUObjectsVisibilityInitialized))
   {
     rendinst::gpuobjects::enable_for_visibility(mainCameraRiMainVisibility);
+    if (hasFeature(CAMERA_IN_CAMERA))
+      rendinst::gpuobjects::enable_for_visibility(camcamVisibilityMgr.getRiMainVisibility());
     shadowsManager.conditionalEnableGPUObjsCSM();
     rendinst::gpuobjects::enable_for_visibility(rendinst_dynamic_shadow_visibility);
     legacyGPUObjectsVisibilityInitialized = true;
@@ -4487,7 +4020,7 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
   if (!app_profile::get().devMode)
     currentType = debug_mesh::Type::NONE;
 #endif
-  bool needDepthReinit = (!isForwardRender() && debug_mesh::enable_debug(currentType));
+  bool needDepthReinit = debug_mesh::enable_debug(currentType);
 
 #if DAGOR_DBGLEVEL > 0
   needDepthReinit |= use_24bit_depth.pullValueChange();
@@ -4496,8 +4029,14 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
 
   if (needDepthReinit)
   {
-    initGbufferDepthProducer();
+    requestFgRecreation("depth format change or debug mesh mode change during the draw");
     initTarget();
+  }
+
+  if (attemptsToUpdateSkySph == 0 && !!enviProbe && light_probe::hasNans(enviProbe))
+  {
+    logerr("EnviProbe has NaNs, attempting to update it.");
+    attemptsToUpdateSkySph = 1;
   }
 
   if (attemptsToUpdateSkySph != 0) // It means that we have failed attempts to compute sky spherical harmonic
@@ -4508,7 +4047,7 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
     bool renderHmap = true;
     if (hide_heightmap_on_planes.get() && canChangeAltitudeUnexpectedly)
       renderHmap = false; // low poly landmesh will be rendered instead
-    if (lmeshMgr->mayRenderHmap != renderHmap)
+    if (!editorHeightmapActive && lmeshMgr->mayRenderHmap != renderHmap)
     {
       lmeshMgr->mayRenderHmap = renderHmap;
       shadowsManager.shadowsInvalidate(false);
@@ -4531,7 +4070,6 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
       displacementSubDiv = floorf(log2(hmapCellSize / subdivCellSize.get()) + 0.5f);
     else
       displacementSubDiv = 0;
-
     displacementSubDiv = clamp((int)displacementSubDiv + min(subdivSettings, (int)MAX_SETTINGS_SUBDIV), (int)0, (int)MAX_SUBDIV);
   }
 
@@ -4539,13 +4077,14 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
   if (preIntegratedGF)
     preIntegratedGF->update();
 
-  // Update heightmap.
+  // Update heightmap once per frame (textures, pending terrain edits, dev tessellation upkeep) before any
+  // terrain rendering / clipmap update. prepare() no longer does this implicitly.
   if (lmeshMgr)
   {
     HeightmapHandler *hmapHandler = lmeshMgr->getHmapHandler();
     if (hmapHandler)
     {
-      hmapHandler->prepareHmapModificaton();
+      hmapHandler->makeBookKeeping();
     }
   }
 
@@ -4559,7 +4098,7 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
   {
     TIME_D3D_PROFILE(water_render_simulate);
     fft_water::setAnisotropy(water, waterAnisotropy.get());
-    fft_water::before_render(water);
+    fft_water::before_render(water, realDt);
   }
 
   beforeDrawPostFx();
@@ -4582,29 +4121,22 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
   if (indoorProbeMgr)
     indoorProbeMgr->update(itm.getcol(3));
 
-  ShaderGlobal::set_color4(world_view_posVarId, Color4(viewPos.x, viewPos.y, viewPos.z, 1));
-  ShaderGlobal::set_color4(prev_world_view_posVarId, Color4(prevViewPos.x, prevViewPos.y, prevViewPos.z, 1));
+  ShaderGlobal::set_float4(world_view_posVarId, Color4(viewPos.x, viewPos.y, viewPos.z, 1));
+  ShaderGlobal::set_float4(prev_world_view_posVarId, Color4(prevViewPos.x, prevViewPos.y, prevViewPos.z, 1));
 
 
   int renderingWidth, renderingHeight;
   getRenderingResolution(renderingWidth, renderingHeight);
-  ShaderGlobal::set_real(pixel_scaleVarId, 1.0 / (persp.hk * renderingHeight));
+  ShaderGlobal::set_float(pixel_scaleVarId, 1.0 / (persp.hk * renderingHeight));
 
   // TODO: figure out why this causes gray flickering on screen when put before probes update
-  ShaderGlobal::set_color4(zn_zfarVarId, persp.zn, persp.zf, 0, 0);
+  ShaderGlobal::set_float4(zn_zfarVarId, persp.zn, persp.zf, 0, 0);
 
   {
     // walkers should be beforeRender'ed here
   }
 
-  // TODO: Move grassgen before deform hmap render when we implement async compute for it, because result of grassgen
-  //       is needed earlier than result of deform hmap. For now it's best place is after those, otherwise it would
-  //       stall the beginning of deform hmap calculation on the async pipeline, because it can't start until deforming
-  //       depth is rendered on the graphics pipeline.
   d3d::set_render_target();
-
-  if (!hasFeature(CAMERA_IN_CAMERA))
-    grass_prepare(currentFrameCamera, camcamParams);
 
   createDeforms();
 
@@ -4616,11 +4148,7 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
                                                                        : camera_speed_to_additional_height.get() * cameraSpeed;
   const float cameraSpeedDependHeight = cameraHeight + additionalHeight;
   const float cameraHeightLimit = giMaxUpdateHeightAboveFloor; // default: 32 meters above ground.
-  const bool isCameraInsideCustomGiZone = is_camera_inside_custom_gi_zone();
-  const bool requiresGroundDetails = (cameraSpeedDependHeight < cameraHeightLimit) || isCameraInsideCustomGiZone;
-
-  // must be called before prepareClipmap
-  renderDisplacementRiLandclasses(viewPos);
+  const bool requiresGroundDetails = (cameraSpeedDependHeight < cameraHeightLimit);
 
   if (requiresGroundDetails)
   {
@@ -4642,12 +4170,18 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
     renderDisplacementAndHmapPatches(displacementCenter, DISPLACEMENT_DIST);
   }
 
-  prepareClipmap(itm.getcol(3), additionalHeight, itm, currentFrameCamera.noJitterGlobtm);
+  // based on old virtualtexture zoom calculations, assuming it was tuned for 4/512 texel size.
+  const int cameraSpeedDependMinimumClipmapZoom =
+    get_closest_pow2(clipmap ? (int)(((4.f / 512.f) / clipmap->getStartTexelSize()) * additionalHeight / 10.f) : 1);
+  const int minimumClipmapZoom = max(cameraSpeedDependMinimumClipmapZoom, can_change_altitude_unexpectedly() ? 2 : 1);
+  const float clipmapWk = camera_in_camera::is_lens_render_active()
+                            ? max(currentFrameCamera.noJitterPersp.wk, camcamParams->noJitterPersp.wk)
+                            : currentFrameCamera.noJitterPersp.wk;
+  prepareClipmapState(itm.getcol(3), itm, currentFrameCamera.noJitterGlobtm, clipmapWk, minimumClipmapZoom);
 
-  {
-    TIME_D3D_PROFILE(biome_query_update)
-    biome_query::update(); // depends on prepareClipmap because sample it.
-  }
+  // During prepareClipmapState, prepareFeedback has updated latest RI landclasses list. List can be used (GPU data are later uploaded
+  // at Clipmap::prepareRender).
+  renderDisplacementRiLandclasses(viewPos);
 
   Point3 giPos = itm.getcol(3);
   float hmin = -100000., hmax = 100000.;
@@ -4675,19 +4209,13 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
       if (groundHolesZone & giBbox)
         hmin = min(hmin, groundHolesZone.boxMin().y);
     }
-    if (isCameraInsideCustomGiZone)
-    {
-      BBox3 customGiZone = get_custom_gi_zone_bbox();
-      hmin = min(hmin, customGiZone.boxMin().y);
-      hmax = max(hmax, customGiZone.boxMax().y);
-    }
   }
 
-  acesfx::wait_fx_managers_update_and_allow_accum_cmds(); // aces fx use ClusteredLights/OmniLightsManager that affect on gi
-
   giBeforeRender();
-  if (requiresGroundDetails || isTimeDynamic())
+  if (requiresGroundDetails || isTimeDynamic() || requiresGIUpdate())
     updateGIPos(giPos, itm, hmin, hmax);
+  if (daGI2)
+    daGI2->updateConstants();
 
   BBox3 riBox;
   if (rendinst::render::notRenderedStaticShadowsBBox(riBox))
@@ -4697,9 +4225,10 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
 
   satelliteRenderer.renderScripted(currentFrameCamera);
 
+  // TODO: move portal rendering to a node scheduled after vtex_clipmap_prepare_render.
   if (clipmap)
     clipmap->resetSecondaryFeedbackCenter();
-  if (auto portalRenderer = portal_renderer_mgr::query_portal_renderer()) // TODO: maybe not the best place
+  if (auto portalRenderer = portal_renderer_mgr::query_portal_renderer())
     portalRenderer->render(currentFrameCamera);
 
   if (get_daskies())
@@ -4711,8 +4240,14 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
       TIME_D3D_PROFILE(changeData)
       if (main_pov_data)
       {
-        get_daskies()->changeSkiesData(1, 1, 1, renderingWidth, renderingHeight, main_pov_data,
-          useFullresClouds ? CloudsResolution::ForceFullresClouds : CloudsResolution::Default);
+        // size the clouds from the stable maximum, not the per-frame dynamic resolution:
+        // any size change here recreates the clouds targets and drops the clouds TAA
+        // history, which the checkerboard trace relies on every frame
+        int cloudsW = renderingWidth, cloudsH = renderingHeight;
+        getMaxPossibleRenderingResolution(cloudsW, cloudsH);
+        get_daskies()->changeSkiesData(1, 1, 1, cloudsW, cloudsH, main_pov_data,
+          useFullresClouds ? CloudsResolution::ForceFullresClouds : CloudsResolution::Default, /*use_blurred_clouds*/ false,
+          /*ignore_panorama_state*/ false, IPoint2(renderingWidth, renderingHeight));
       }
     }
 
@@ -4728,12 +4263,12 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
     {
       TIME_D3D_PROFILE(buildCloudVolume);
       static constexpr float CLOUD_VOLUME_RANGE = 10000;
-      get_daskies()->renderCloudVolume(cloudsVolume.getVolTex(), CLOUD_VOLUME_RANGE, viewTm, projJitter);
+      get_daskies()->renderCloudVolume(cloudsVolume.getVolTex(), BAD_TEXTUREID, CLOUD_VOLUME_RANGE, viewTm, projJitter,
+        TMatrix::IDENT);
       cloudsVolume.setVar();
       d3d::resource_barrier({cloudsVolume.getVolTex(), RB_RO_SRV | RB_STAGE_PIXEL | RB_STAGE_COMPUTE, 0, 0});
     }
 
-    if (!isForwardRender())
     {
       TIME_D3D_PROFILE(useFog)
       get_daskies()->useFog(itm.getcol(3), main_pov_data, viewTm, projJitter);
@@ -4764,17 +4299,23 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
       TIME_PROFILE(animchar_shadows_parallel);
       G_ASSERT(g_entity_mgr->isConstrainedMTMode());
       ShaderGlobal::set_int(dyn_model_render_passVarId, eastl::to_underlying(dynmodel::RenderPass::Depth));
-      dynmodel_renderer::DynModelRenderingState *dStates[AnimcharRenderAsyncFilter::ARF_IDX_COUNT][CascadeShadows::MAX_CASCADES];
+      dynrend::ContextId ctxIds[AnimcharRenderAsyncFilter::ARF_IDX_COUNT][CascadeShadows::MAX_CASCADES];
       Frustum frustums[CascadeShadows::MAX_CASCADES];
       // Pad to 2 cache lines to avoid false sharing
       volatile int workLeft[CascadeShadows::MAX_CASCADES][(EA_CACHE_LINE_SIZE * 2) / sizeof(int)];
 #define CSM_CASCADE_JOBS_STARTED(i_) (*(eastl::end(workLeft[i_]) - 1)) // Via macros to avoid blow up sizeof capture context of labmda
       for (int i = 0; i < numCascades; ++i)
       {
+        const TMatrix4 &csmViewTm = csm->getRenderViewMatrix(i);
+        const TMatrix4 &csmProjTm = csm->getRenderProjMatrix(i);
+        TMatrix4 csmViewTmRel = csmViewTm;
+        csmViewTmRel.setrow(3, 0, 0, 0, 1);
         for (int j = 0; j < AnimcharRenderAsyncFilter::ARF_IDX_COUNT; j++)
         {
           char tmps[] = "csm#000";
-          dStates[j][i] = dynmodel_renderer::create_state(fmt_csm_render_pass_name(RENDER_SHADOWS_CSM + i, tmps, j));
+          ctxIds[j][i] = dynrend::get_or_create_context(fmt_csm_render_pass_name(RENDER_SHADOWS_CSM + i, tmps, j));
+          dynrend::clear(ctxIds[j][i]);
+          dynrend::set_context_view_proj(ctxIds[j][i], csmViewTmRel, csmProjTm, csmViewTmRel, csmProjTm);
         }
         frustums[i] = csm->getFrustum(i);
         interlocked_relaxed_store(workLeft[i][0], AnimcharRenderAsyncFilter::ARF_IDX_COUNT);
@@ -4787,22 +4328,23 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
         int cascade = i / AnimcharRenderAsyncFilter::ARF_IDX_COUNT;
         interlocked_decrement(CSM_CASCADE_JOBS_STARTED(cascade));
         auto eidFilter = AnimcharRenderAsyncFilter(i & AnimcharRenderAsyncFilter::ARF_IDX_MASK);
-        dynmodel_renderer::DynModelRenderingState *pState = dStates[eidFilter][cascade];
+        dynrend::ContextId ctx = ctxIds[eidFilter][cascade];
         // todo: interlocked_or uint8_t
-        const animchar_visbits_t add_vis_bits = VISFLG_CSM_SHADOW_RENDERED;   //(VISFLG_MAIN_VISIBLE | VISFLG_MAIN_CAMERA_RENDERED)
-        const animchar_visbits_t check_bits = VISFLG_MAIN_AND_SHADOW_VISIBLE; //(VISFLG_MAIN_AND_SHADOW_VISIBLE|VISFLG_MAIN_VISIBLE)
+        const animchar_visbits_t add_vis_bits = VISFLG_CSM_SHADOW_RENDERED; //(VISFLG_MAIN_VISIBLE | VISFLG_MAIN_CAMERA_RENDERED)
+        const animchar_visbits_t require_any_vis_bits =
+          VISFLG_MAIN_AND_SHADOW_VISIBLE; //(VISFLG_MAIN_AND_SHADOW_VISIBLE|VISFLG_MAIN_VISIBLE)
+        const animchar_visbits_t reject_if_any_vis_bits = 0;
         const uint8_t filterMask = UpdateStageInfoRender::RENDER_SHADOW;
-        g_entity_mgr->broadcastEventImmediate(AnimcharRenderAsyncEvent(*pState, &globalVarsState,
+        g_entity_mgr->broadcastEventImmediate(AnimcharRenderAsyncEvent(ctx, &globalVarsState,
           NULL,              //&occlusion
           frustums[cascade], // : Frustum(currentFrameCamera.noJitterGlobtm),
-          add_vis_bits, check_bits, filterMask, false /*hasMotionVectors*/, eidFilter));
+          add_vis_bits, require_any_vis_bits, reject_if_any_vis_bits, filterMask, false /*hasMotionVectors*/, eidFilter));
         if (interlocked_decrement(workLeft[cascade][0]) == 0) // Last one finalizes and prepares for render
         {
           TIME_PROFILE_DEV(finalize_render_csm);
-          dynmodel_renderer::DynModelRenderingState *dstState = dStates[0][cascade];
           for (int j = 1; j < AnimcharRenderAsyncFilter::ARF_IDX_COUNT; j++)
-            dstState->addStateFrom(eastl::move(*dStates[j][cascade]));
-          dstState->prepareForRender();
+            dynrend::merge_context(ctxIds[0][cascade], ctxIds[j][cascade]);
+          dynrend::prepare_render_finalize(ctxIds[0][cascade]);
         }
       };
       using JobType = AnimcharRenderShadowsJob<decltype(render_shadow_cb)>;
@@ -4901,20 +4443,15 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
     waitMainVisibility();
   }
 
-  if (lmeshMgr)
-  {
-    const bool isUpsampling = antiAliasing && antiAliasing->isUpsampling();
-    const int sub_pixels = (!isUpsampling && VariableMap::isGlobVariablePresent(sub_pixelsVarId)) ? screencap::subsamples() : 1;
-    int lod = clamp((int)floor(currentFrameCamera.noJitterPersp.wk + 0.5f) + sub_pixels - 1, 2, 3);
-    lmeshMgr->setHmapLodDistance(lod);
-  }
   bool hasGpuObjs = rendinst::gpuobjects::has_manager();
   startGroundVisibility();           // we have to call it after all other ground renders are complete
   startGroundReflectionVisibility(); // we have to call it after all other ground renders are complete
   startLightsCullingJob();
-  bvh_update_instances(viewPos, currentFrameCamera.noJitterFrustum);
+  bvh_update_instances(viewPos, get_daskies() ? -get_daskies()->getPrimarySunDir() : Point3(0, -1, 0), itm,
+    currentFrameCamera.viewRotTm, reinterpret_cast<const TMatrix4 &>(proj), prevFrameCamera.viewRotTm, prevFrameCamera.noJitterProjTm,
+    currentFrameCamera.noJitterFrustum);
   start_async_game_tasks(frame_id, AGT_ALL, /*wake*/ false); // Start the rest of tasks in case it wasnt started earlier
-  bool tpEarlyWakeUp = hasGpuObjs || rendinst::render::pendingRebuild() || enviProbeInvalid || enviProbeNeedsReload;
+  bool tpEarlyWakeUp = hasGpuObjs || rendinst::render::pendingRebuild() || enviProbeState != EnviProbeState::Ready;
   if (tpEarlyWakeUp)
     threadpool::wake_up_all_delayed(threadpool::PRIO_HIGH); // Wake threadpool for all previously added jobs
 
@@ -4924,54 +4461,44 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
       waitMainVisibility();
     rendinst::gpuobjects::update(itm.getcol(3));
   }
-  rendinst::render::before_draw(rendinst::RenderPass::Normal, mainCameraRiMainVisibility, frustum,
-    (hasGpuObjs && use_occlusion_for_gpu_objs) ? mainCameraOcclusion : nullptr);
 
-  reinitCubeIfInvalid();
-
-  if (enviProbeNeedsReload)
   {
-    reloadCube(true);
-    if (get_daskies())
+    const bool useOcclusion = (hasGpuObjs && use_occlusion_for_gpu_objs);
+    eastl::fixed_vector<rendinst::render::RiBeforeDrawPerViewParams, 2, false> perViewParams;
+
+    perViewParams.push_back({mainCameraRiMainVisibility, &frustum, useOcclusion ? mainCameraOcclusion : nullptr});
+    if (hasFeature(CAMERA_IN_CAMERA) && camcamParams.has_value())
     {
-      // workaround to make sure panorama is generated from the correct origin
-      // otherwise, reloadCube will update panorama with a different origin, causing incorrect panorama
-      updateSky(0);
-      d3d::GpuAutoLock lock;
-      ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
-      get_daskies()->prepareSkyAndClouds(true, dpoint3(panoramaPosition), DPoint3(1, 0, 0), 3, TextureIDPair(), TextureIDPair(),
-        main_pov_data, viewTm, projJitter, UpdateSky::OnWithoutCloudsVisibilityCheck, false);
+      perViewParams.push_back({camcamVisibilityMgr.getRiMainVisibility(), &camcamParams->jitterFrustum,
+        useOcclusion ? camcamVisibilityMgr.getOcclusion() : nullptr});
     }
-    enviProbeNeedsReload = false;
+
+    rendinst::render::before_draw(rendinst::RenderPass::Normal, perViewParams);
   }
+
+  updateEnviProbe();
 
   bool tpLateWakeUp = !tpEarlyWakeUp;
   if (hasFeature(FeatureRenderFlags::STATIC_SHADOWS))
   {
     FRAME_LAYER_GUARD(globalFrameBlockId);
-    bool canUseLastCascadeOptimization = !isCameraInsideCustomGiZone; // more explicit check, because it's not only GI related
-    bool updateOnlyLastCascade = !requiresGroundDetails && !is_free_camera_enabled() && canUseLastCascadeOptimization;
+    bool updateOnlyLastCascade = !requiresGroundDetails && !is_free_camera_enabled();
     tpLateWakeUp |= shadowsManager.updateStaticShadowAround(itm.getcol(3), updateOnlyLastCascade);
   }
   shadowsManager.prepareVSM(viewPos);
+  shadowsManager.prepareVoxelShadows(viewPos);
   tpLateWakeUp |= prepareDelayedRender(itm);
   if (tpLateWakeUp)
     threadpool::wake_up_all_delayed(threadpool::PRIO_HIGH); // Wake threadpool for all previously added jobs
 
-  if (currentAntiAliasingMode == AntiAliasingMode::FSR2 && antiAliasing)
-    ((FSR2 *)antiAliasing.get())->setDt(realDt);
-
-  if (hasFeature(FeatureRenderFlags::MOBILE_DEFERRED))
-    VertexDensityOverlay::before_render();
+  if (currentAntiAliasingMode == AntiAliasingMode::FSR && antiAliasing)
+    ((FSR *)antiAliasing.get())->setDt(realDt);
 
   // NOTE: Adding new code is HIGHLY UNDESIRABLE!!!
   // Use framegraph nodes instead!
   int w, h;
   getDisplayResolution(w, h);
   currentTexCtx = TexStreamingContext(currentFrameCamera.noJitterPersp, w);
-
-  if (!isForwardRender())
-    debugRecreateNodesLate();
 
   AimRenderingData aimRenderingData = get_aim_rendering_data();
 
@@ -4981,6 +4508,7 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
 
   const bool requiresSubsamplingThisFrame = (subPixels = getSubPixels()) > 1;
   const bool requiresSuperSamplingThisFrame = (superPixels = getSuperPixels()) > 1;
+  const bool isScreenshotScheduledThisFrame = screencap::is_screenshot_scheduled();
   if (requiresSuperSamplingThisFrame)
   {
     int superW = w * superPixels, superH = h * superPixels;
@@ -4998,29 +4526,39 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
   else
     screenshotSuperFrame.close();
 
-  const bool subSuperSamplingAvailable = !renderer_has_feature(FeatureRenderFlags::FORWARD_RENDERING);
-
-  if (requiresSubsampling != requiresSubsamplingThisFrame || requiresSupersampling != requiresSuperSamplingThisFrame ||
-      (subSuperSamplingNodes.empty() && subSuperSamplingAvailable))
+  const bool subSuperSamplingAvailable = true;
+  const bool subSuperSamplingChanged =
+    requiresSubsampling != requiresSubsamplingThisFrame || requiresSupersampling != requiresSuperSamplingThisFrame;
+  const bool screenshotChanged = isScreenshotScheduled != isScreenshotScheduledThisFrame;
+  if (subSuperSamplingChanged || screenshotChanged || (subSuperSamplingNodes.empty() && subSuperSamplingAvailable))
   {
     requiresSubsampling = requiresSubsamplingThisFrame;
     requiresSupersampling = requiresSuperSamplingThisFrame;
+    isScreenshotScheduled = isScreenshotScheduledThisFrame;
     const bool multisampling = requiresSubsampling || requiresSupersampling;
-    if (multisampling)
+    if (subSuperSamplingChanged || subSuperSamplingNodes.empty())
     {
-      antiAliasing.reset();
-      // Does the coc calculation in the postfx shader
-      // There is a cheaper version, but we only need it for screenshots, so this saves shader variants.
-      ShaderGlobal::set_int(antialiasing_typeVarId, AA_TYPE_DLSS);
-      prepareForPostfxNoAANode = makePrepareForPostfxNoAANode();
-      fxaaNode = {};
+      if (multisampling)
+      {
+        antiAliasing.reset();
+        // Does the coc calculation in the postfx shader
+        ShaderGlobal::set_int(antialiasing_typeVarId, AntiAliasingType::NON_TEMPORAL);
+        prepareForPostfxNoAANode = makePrepareForPostfxNoAANode();
+        fxaaNode = {};
+      }
+      else
+      {
+        setAntialiasing();
+        if (dynamicResolution && antiAliasing && antiAliasing->supportsDynamicResolution())
+        {
+          IPoint2 currentRes;
+          dynamicResolution->getCurrentResolution(currentRes.x, currentRes.y);
+          antiAliasing->setInputResolution(currentRes);
+        }
+      }
     }
-    else if (!subSuperSamplingNodes.empty())
-    {
-      setAntialiasing();
-    }
-    subSuperSamplingNodes = makeSubsamplingNodes(requiresSubsampling, requiresSupersampling);
-    if (multisampling)
+    subSuperSamplingNodes = makeSubsamplingNodes(requiresSubsampling, requiresSupersampling, isScreenshotScheduled);
+    if (multisampling || isScreenshotScheduled)
       frameToPresentProducerNode = makeFrameToPresentProducerNode();
     else
       frameToPresentProducerNode = dafg::NodeHandle();
@@ -5032,10 +4570,23 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
   state.wireframeModeEnabled = ::grs_draw_wire;
   state.vrsMaskEnabled = shouldToggleVRS(aimRenderingData);
   dafg::update_external_state(state);
+  const bool shouldEnableMotionVrs = can_use_motion_vrs() && state.vrsMaskEnabled;
+  const bool motionVrsDispatches = shouldEnableMotionVrs && has_motion_vrs_strength();
+  if (vrsNodeHandles.empty() || vrsNodesUseMotionVrs != shouldEnableMotionVrs || vrsNodesUseMotionVrsDispatches != motionVrsDispatches)
+  {
+    vrsNodeHandles = makeCreateVrsTextureNode(shouldEnableMotionVrs, motionVrsDispatches);
+    vrsNodesUseMotionVrs = shouldEnableMotionVrs;
+    vrsNodesUseMotionVrsDispatches = motionVrsDispatches;
+  }
 
+  toggleCameraInCamera(camera_in_camera::is_lens_render_active());
   const uint32_t cameraMultiplexCount = camera_in_camera::is_lens_render_active() ? 2 : 1;
-  dafg::set_multiplexing_extents(dafg::multiplexing::Extents{
-    static_cast<uint32_t>(superPixels * superPixels), static_cast<uint32_t>(subPixels * subPixels), 1, cameraMultiplexCount});
+  dafg::multiplexing::Extents multiplexingExtents{
+    static_cast<uint32_t>(superPixels * superPixels), static_cast<uint32_t>(subPixels * subPixels), 1, cameraMultiplexCount};
+  // A feature (e.g. the AA benchmark) may raise a dimension left at 1 to
+  // multiplex extra passes over it.
+  g_entity_mgr->broadcastEventImmediate(QueryMultiplexingExtents(&multiplexingExtents));
+  dafg::set_multiplexing_extents(multiplexingExtents);
 
   // todo: FG should clear block itself, or at least logerr that blocks should be cleared before run_nodes
   ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
@@ -5054,9 +4605,11 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
 
   // TODO frame graph assumes this is off by default, we should get rid of grs_draw_wire changing wireframe mode everywhere
   d3d::setwire(false);
+  ShaderGlobal::set_float4(zn_zfarVarId, persp.zn, persp.zf, 0, 0);
 
   resource_slot::resolve_access();
-  [[maybe_unused]] bool fgWasRun = dafg::run_nodes();
+  dafg::metronome::update();
+  [[maybe_unused]] bool fgWasRun = dafg::run_nodes(dafg::PreExecuteAction::FlushRefinedBlocks);
 
   if (allsamples > 1)
     set_mip_bias(last_mip_scale);
@@ -5066,11 +4619,6 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
   if (auto ds = get_daskies())
     ds->unsetSkyLightParams();
 
-  if (dynamicQuality)
-    dynamicQuality->onFrameEnd();
-  if (dynamicResolution)
-    dynamicResolution->endFrame();
-
 #if _TARGET_PC   // Assume that only PC can reset
   if (!fgWasRun) // Dev lost?
     waitAllJobs();
@@ -5079,6 +4627,22 @@ void WorldRenderer::draw(uint32_t frame_id, float realDt)
   // Stuff after this point is GUI and debug visualization, they don't
   // support the `global_frame` block.
   ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
+
+  ++renderedFrames;
+}
+
+void on_ui_finished()
+{
+  if (WorldRenderer *wr = static_cast<WorldRenderer *>(get_world_renderer()))
+    wr->onUIFinished();
+}
+
+void WorldRenderer::onUIFinished()
+{
+  if (dynamicQuality)
+    dynamicQuality->onFrameEnd();
+  if (dynamicResolution)
+    dynamicResolution->endFrame();
 }
 
 void WorldRenderer::debugDraw()
@@ -5088,6 +4652,8 @@ void WorldRenderer::debugDraw()
   if (debug_tonemap_overlay)
     debug_tonemap_overlay->render();
   draw_rtr_validation();
+  draw_ptgi_validation();
+  shadowsManager.debugRenderVoxelShadows();
 }
 
 void WorldRenderer::getSunSph0Color(float /*height*/, Color3 &oSun, Color3 &sph0)
@@ -5124,7 +4690,7 @@ void WorldRenderer::setDirToSun()
         if (rendinst::rendinstGlobalShadows)
           rendinst::startUpdateRIGenGlobalShadows();
         rendinst::render::invalidateRIGenExtraShadowsVisibility();
-        set_nightly_spot_lights();
+        g_entity_mgr->broadcastEventImmediate(CmdRecreateSpotLights());
       }
     }
     break;
@@ -5143,7 +4709,7 @@ void WorldRenderer::setDirToSun()
     }
     case DirToSun::RELOAD_CUBE:
       dir_to_sun.sunDirectionUpdateStage++;
-      reloadCube(true);
+      scheduleEnviProbeReRender();
       break;
     case DirToSun::IMPOSTOR_PRESHADOWS:
       rendinst::render::impostorPreshadowNeedUpdate = true;
@@ -5161,8 +4727,7 @@ void WorldRenderer::setDirToSun()
     dir_to_sun.sunDirectionUpdateStage = DirToSun::NO_UPDATE;
   }
 
-  ShaderGlobal::set_color4(from_sun_directionVarId, -dir_to_sun.realTime);
-  ShaderGlobal::setBlock(globalConstBlockId, ShaderGlobal::LAYER_GLOBAL_CONST);
+  ShaderGlobal::set_float4(from_sun_directionVarId, -dir_to_sun.realTime);
 
   shadowsManager.updateShadowsQFromSunAndReinit();
 }
@@ -5185,12 +4750,38 @@ void WorldRenderer::loadFogNodes(const String &graph_name, float low_range, floa
 
   volumeLight->setRange(volumeLightLowRange);
   volumeLight->initShaders(graph_name);
+  setNbsQuality();
   add_volfog_optional_graphs();
+}
+
+void WorldRenderer::loadCloudsNodes(const String &graph_name)
+{
+  G_ASSERT(is_main_thread());
+
+  root_clouds_graph = graph_name;
+  if (graph_name.empty())
+    return;
+
+  if (DaSkies *skies = get_daskies())
+    skies->initCloudsNBS(graph_name.str());
+
+  add_clouds_optional_graphs();
+}
+
+void WorldRenderer::enableCloudsOptionalShader(const String &shader_name, bool enable)
+{
+  if (DaSkies *skies = get_daskies())
+    skies->enableCloudsNBSOptionalGraph(shader_name.str(), enable);
 }
 
 void WorldRenderer::loadEnviCoverNodes(const String &graph_name)
 {
   G_ASSERT(is_main_thread());
+
+  // Disable NBS on cards not supporting UAVs for necessary formats
+  updateEnviCoverCompatibility();
+  if (!isEnviCoverCompatible)
+    return;
 
   root_envi_cover_graph = graph_name;
 
@@ -5200,16 +4791,24 @@ void WorldRenderer::loadEnviCoverNodes(const String &graph_name)
   if (root_envi_cover_graph.empty())
     return;
 
+  setEnviCover(true);
   enviCover->setValidNBS(true);
   enviCover->initShader(graph_name);
+  setNbsQuality();
   envi_cover_use_NBS.set(true);
   add_envi_cover_optional_graphs();
+  // Need here for safety is this is called after node initializations because of async load
+  requestFgRecreation("Envi Cover NBS loaded");
 }
 
 void WorldRenderer::closeGround()
 {
   closeLandMicroDetails();
-  del_it(lmeshRenderer);
+  if (editorHeightmapActive)
+    lmeshRenderer = nullptr; // not owned, belongs to the editor's heightmap plugin
+  else
+    del_it(lmeshRenderer);
+  lmeshMgr = nullptr;
   ShaderGlobal::reset_from_vars(lightmapTexId);
   release_managed_tex(lightmapTexId);
   lightmapTexId = BAD_TEXTUREID;
@@ -5217,7 +4816,41 @@ void WorldRenderer::closeGround()
 
 bool WorldRenderer::useClipmapFeedbackOversampling() { return Clipmap::is_uav_supported(); }
 
-void WorldRenderer::closeClipmap() { del_it(clipmap); }
+void clipmap_prepare_render_callback(dag::ConstSpan<Texture *> bufferTex, dag::ConstSpan<Texture *> compressorTex)
+{
+  WorldRenderer *wr = (WorldRenderer *)get_world_renderer();
+  if (wr && wr->clipmap && wr->lmeshMgr)
+  {
+    wr->getClipmap()->finalizeFeedback();
+
+    int w, h;
+    wr->getRenderingResolution(w, h);
+    wr->clipmap->setTargetSize(w, h, wr->getMipmapBias());
+
+    {
+      STATE_GUARD(ShaderGlobal::set_int(render_with_normalmapVarId, VALUE), VTEX_RENDER_NORMAL, VTEX_RENDER_DISPLACEMENT);
+      LandmeshCMRenderer landmeshCMRenderer(*wr->lmeshRenderer, *wr->lmeshMgr);
+      wr->getClipmap()->prepareRender(landmeshCMRenderer, bufferTex, compressorTex);
+      ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
+    }
+  }
+
+  // Finish GPU queries depending on clipmap state (set by updateRendinstLandclassRenderState).
+  {
+    TIME_D3D_PROFILE(heightmap_query_update)
+    heightmap_query::update();
+  }
+  {
+    TIME_D3D_PROFILE(biome_query_update)
+    biome_query::update();
+  }
+}
+
+void WorldRenderer::closeClipmap()
+{
+  clipmapPrepareRenderNode = {};
+  del_it(clipmap);
+}
 void WorldRenderer::initClipmap()
 {
   if (!lmeshMgr)
@@ -5251,7 +4884,7 @@ void WorldRenderer::initClipmap()
       feedbackProperties.feedbackSize.y);
   }
 
-  int lastTexMips = clipmap ? clipmap->getTexMips() : -1;
+  int lastTexMips = clipmap ? clipmap->getMaxTexMips() : -1;
   const DataBlock *clipBlk = ::dgs_get_settings()->getBlockByNameEx("clipmap");
   if (lastTexMips <= 0)
     lastTexMips = clipBlk->getInt("texMips", 7);
@@ -5285,36 +4918,28 @@ void WorldRenderer::initClipmap()
 
   // There is no a special pass for non uav hardware feedback so switch to the cpu one instead
   clipmap->init(texelSize, Clipmap::is_uav_supported() ? Clipmap::CPU_HW_FEEDBACK : Clipmap::SOFTWARE_FEEDBACK, feedbackProperties,
-    lastTexMips, 256, 1, clipmapAnisotropic);
+    lastTexMips, false);
 
   struct CacheFormats
   {
     uint32_t full[3];
-    uint32_t simplifiedMaterials[2];
 
     struct FormatsAndCount
     {
       const uint32_t *fmt;
       const size_t count;
     };
-    FormatsAndCount get(const bool is_simplified_mats) const
-    {
-      return is_simplified_mats ? FormatsAndCount{simplifiedMaterials, 2} : FormatsAndCount{full, 3};
-    }
+    FormatsAndCount get() const { return FormatsAndCount{full, 3}; }
   };
 
-  CacheFormats compressedFormats{
-    {TEXFMT_DXT5 | TEXCF_SRGBREAD, TEXFMT_ATI2N, TEXFMT_DXT5}, {TEXFMT_DXT5 | TEXCF_SRGBREAD, TEXFMT_ATI2N}};
-  CacheFormats compressedEtcFormats{
-    {TEXFMT_ETC2_RGBA | TEXCF_SRGBREAD, TEXFMT_ETC2_RG, TEXFMT_ETC2_RGBA}, {TEXFMT_ETC2_RGBA | TEXCF_SRGBREAD, TEXFMT_ETC2_RG}};
-  CacheFormats uncompressedFormats{{TEXFMT_DEFAULT | TEXCF_SRGBREAD, TEXFMT_R8G8, TEXFMT_DEFAULT}, // check for 565
-    {TEXFMT_DEFAULT | TEXCF_SRGBREAD, TEXFMT_R8G8}};
+  CacheFormats compressedFormats{{TEXFMT_DXT5 | TEXCF_SRGBREAD, TEXFMT_ATI2N, TEXFMT_DXT5}};
+  CacheFormats compressedEtcFormats{{TEXFMT_ETC2_RGBA | TEXCF_SRGBREAD, TEXFMT_ETC2_RG, TEXFMT_ETC2_RGBA}};
+  CacheFormats uncompressedFormats{{TEXFMT_DEFAULT | TEXCF_SRGBREAD, TEXFMT_R8G8, TEXFMT_DEFAULT}};
 
-  const bool isSimplifiedMaterials = renderer_has_feature(FeatureRenderFlags::MOBILE_SIMPLIFIED_MATERIALS);
   const auto &cacheFmtInfo = useCompression ? hasETC2 ? compressedEtcFormats : compressedFormats : uncompressedFormats;
 
-  const auto [cacheFormats, cachesCount] = cacheFmtInfo.get(isSimplifiedMaterials);
-  const auto [cacheFormatsFallback, cachesCountFallback] = uncompressedFormats.get(isSimplifiedMaterials);
+  const auto [cacheFormats, cachesCount] = cacheFmtInfo.get();
+  const auto [cacheFormatsFallback, cachesCountFallback] = uncompressedFormats.get();
   G_ASSERT(cachesCount == cachesCountFallback);
 
   const uint32_t buf_formats[3] = {TEXFMT_DEFAULT | TEXCF_SRGBWRITE, TEXFMT_DEFAULT, TEXFMT_DEFAULT};
@@ -5322,14 +4947,16 @@ void WorldRenderer::initClipmap()
 
   // use ARGB16F, as hw race workaround
   bool useCompatBufFormats = d3d::get_driver_desc().issues.hasRenderPassClearDataRace;
-  if (useCompatBufFormats)
-    ShaderGlobal::set_int(get_shader_variable_id("uncompressed_clipmap_buffer_srgb_mode"), 1);
+  ShaderGlobal::set_int(get_shader_variable_id("cache_buffer_tex0_srgb_mode", true), (int)useCompatBufFormats);
 
   const float maxEffectiveTargetResolution = 2 * 1920 * 1080;
-  clipmap->initVirtualTexture(cw, ch, maxEffectiveTargetResolution);
+  clipmap->initVirtualTexture(cw, ch, 256, 1, clipmapAnisotropic, maxEffectiveTargetResolution);
 
   clipmap->createCaches(cacheFormats, cacheFormatsFallback, cachesCount, useCompatBufFormats ? buf_formats_compat : buf_formats, 3);
   clipmap->setMaxTileUpdateCount(clipBlk->getInt("updateTileCount", defaultUpdateCount));
+
+  clipmapPrepareRenderNode = {};
+  clipmapPrepareRenderNode = clipmap->createPrepareRenderNode(clipmap_prepare_render_callback);
 }
 
 void WorldRenderer::updateSky(float realDt)
@@ -5355,7 +4982,7 @@ void WorldRenderer::updateSky(float realDt)
   }
 
   get_daskies()->updateSkyLightParams();
-  get_daskies()->prepare(get_daskies()->getSunDir(), false, 0);
+  get_daskies()->prepare(get_daskies()->getSunDir(), realDt);
   setDirToSun();
 
   Color3 amb, moon, moonamb;
@@ -5371,10 +4998,9 @@ void WorldRenderer::updateSky(float realDt)
     amb *= get_daskies()->getSkyLightEnviAttenuation();
     sun = sun / PI;
     // optimize
-    ShaderGlobal::set_color4(sun_light_colorVarId, color4(sun, 0));
-    ShaderGlobal::set_color4(sun_color_0VarId, no_sun.get() ? Color4(0, 0, 0, 0) : color4(sun, 0));
-    ShaderGlobal::set_color4(sky_colorVarId, color4(amb, 0));
-    ShaderGlobal::setBlock(globalConstBlockId, ShaderGlobal::LAYER_GLOBAL_CONST);
+    ShaderGlobal::set_float4(sun_light_colorVarId, color4(sun, 0));
+    ShaderGlobal::set_float4(sun_color_0VarId, no_sun.get() ? Color4(0, 0, 0, 0) : color4(sun, 0));
+    ShaderGlobal::set_float4(sky_colorVarId, color4(amb, 0));
     acesfx::setSkyParams(-get_daskies()->getPrimarySunDir(), sun, amb);
   }
   else
@@ -5415,12 +5041,6 @@ void WorldRenderer::initHmapPatches(int texSize)
   if (!hmapPatchesEnabled)
     return;
   hmapPatchesDepthTex = dag::create_tex(NULL, texSize, texSize, TEXCF_RTARGET | TEXFMT_DEPTH16, 1, "hmap_patches_depth_tex");
-  {
-    d3d::SamplerInfo smpInfo;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Wrap;
-    smpInfo.filter_mode = d3d::FilterMode::Point;
-    ShaderGlobal::set_sampler(get_shader_variable_id("hmap_patches_depth_tex_samplerstate"), d3d::request_sampler(smpInfo));
-  }
   hmapPatchesTex = dag::create_tex(NULL, texSize, texSize, TEXCF_RTARGET | TEXFMT_L16, 1, "hmap_patches_tex");
   {
     d3d::SamplerInfo smpInfo;
@@ -5466,6 +5086,7 @@ struct HmapPatchesCallback
   RiGenVisibility *visibility;
   LMeshRenderingMode prevLandmeshRenderingMode;
   TMatrix4 viewTm;
+  Point3 hmapOrigin = Point3(0.f, 0.f, 0.f); // heightmap LOD origin prepared in start()
 
   HmapPatchesCallback(float texel,
     LandMeshRenderer &lm_renderer,
@@ -5500,10 +5121,11 @@ struct HmapPatchesCallback
     ivtm = orthonormalized_inverse(tmatrix(viewTm));
     BBox3 landBox = provider.getBBox();
     maxZ = max(maxZ, landBox[1].y + 1);
-    ShaderGlobal::set_color4(hmap_patches_min_max_zVarId, minZ, maxZ, 0.0, 1.0);
+    ShaderGlobal::set_float4(hmap_patches_min_max_zVarId, minZ, maxZ, 0.0, 1.0);
 
-    prevLandmeshRenderingMode = renderer.setLMeshRenderingMode(LMeshRenderingMode::RENDERING_CLIPMAP);
-    renderer.prepare(provider, Point3(texelOrigin.x * texelSize, viewPosY, texelOrigin.y * texelSize), 2.f);
+    prevLandmeshRenderingMode = renderer.getLMeshRenderingMode();
+    hmapOrigin = Point3(texelOrigin.x * texelSize, viewPosY, texelOrigin.y * texelSize);
+    renderer.prepare(provider, HmapOrigin(hmapOrigin));
     IPoint2 texelsFrom = IPoint2(newOrigin.x - texSize / 2, newOrigin.y - texSize / 2);
     IPoint2 wd = IPoint2(texSize, texSize);
     BBox2 box(point2(texelsFrom) * texelSize, point2(texelsFrom + wd) * texelSize);
@@ -5526,16 +5148,20 @@ struct HmapPatchesCallback
     BBox3 region(Point3(box[0].x, minZ, box[0].y), Point3(box[1].x, maxZ + 500, box[1].y));
     ShaderGlobal::setBlock(globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
     ShaderGlobal::setBlock(landMeshPrepareClipmapBlockId, ShaderGlobal::LAYER_SCENE);
-    renderer.setRenderInBBox(region);
+    LandMeshRenderDesc desc;
+    desc.mode = LMeshRenderingMode::RENDERING_CLIPMAP;
+    desc.renderInBBox = region;
+    desc.invGeomLodDist = renderer.getInvGeomLodDist();
     TMatrix4_vec4 globTm = viewTm * proj;
-    renderer.render(reinterpret_cast<mat44f_cref>(globTm), proj, Frustum{globTm}, provider, renderer.RENDER_PATCHES, ivtm.getcol(3));
+    renderer.render(reinterpret_cast<mat44f_cref>(globTm), proj, Frustum{globTm}, provider, renderer.RENDER_PATCHES, desc,
+      ivtm.getcol(3), HmapOrigin(hmapOrigin));
   }
   void end()
   {
     ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_SCENE);
+    // restore the ambient mode shadervar for passes that still rely on inheriting it
     renderer.setLMeshRenderingMode(prevLandmeshRenderingMode);
     d3d_set_view_proj(oviewproj);
-    renderer.setRenderInBBox(BBox3());
   }
 };
 
@@ -5598,19 +5224,14 @@ void WorldRenderer::renderDisplacementRiLandclasses(const Point3 &camera_pos)
     if (i >= riLandclassIndicesPrev.size() || riLandclassIndices[i] != riLandclassIndicesPrev[i])
       riLandclassDisplacementDataArr[i].resetOrigin();
   }
-  riLandclassIndicesPrev = riLandclassIndices;
-
   // lazy init
   if (!riLandclassDepthTextureArr || riLandclassIndices.size() > riLandclassIndicesPrev.size())
   {
     riLandclassDepthTextureArr.close();
     riLandclassDepthTextureArr = dag::create_array_tex(DISPLACEMENT_TEX_SIZE, DISPLACEMENT_TEX_SIZE, riLandclassIndices.size(),
       TEXCF_RTARGET | TEXFMT_R8, 1, "deform_hmap_ri_landclass_arr");
-    d3d::SamplerInfo smpInfo;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Wrap;
-    ShaderGlobal::set_sampler(get_shader_variable_id("deform_hmap_ri_landclass_arr_samplerstate", true),
-      d3d::request_sampler(smpInfo));
   }
+  riLandclassIndicesPrev = riLandclassIndices;
 
   if (::grs_draw_wire)
     d3d::setwire(0);
@@ -5622,7 +5243,7 @@ void WorldRenderer::renderDisplacementRiLandclasses(const Point3 &camera_pos)
     int riOffset = ri_index + 1;
     Point3 origin = clipmap->getMappedRelativeRiPos(riOffset, camera_pos, distToGround);
 
-    static constexpr float DISPLACEMENT_CULLING_DIST_BIAS = 1.0f; // must be > ShaderGlobal::get_real(hmap_displacement_upVarId))
+    static constexpr float DISPLACEMENT_CULLING_DIST_BIAS = 1.0f; // must be > ShaderGlobal::get_float(hmap_displacement_upVarId))
     static constexpr float DISPLACEMENT_CULLING_DIST = DISPLACEMENT_DIST + DISPLACEMENT_CULLING_DIST_BIAS;
     if (distToGround > DISPLACEMENT_CULLING_DIST)
       continue;
@@ -5635,13 +5256,11 @@ void WorldRenderer::renderDisplacementRiLandclasses(const Point3 &camera_pos)
                                 int fullUpdateThresholdTexels) {
       TIME_D3D_PROFILE(updateDisplacement);
       SCOPE_RENDER_TARGET;
-      ShaderGlobal::set_int(clipmap_writes_height_onlyVarId, 1);
-      d3d::set_render_target();
-      d3d::set_render_target(0, riLandclassDepthTextureArr.getArrayTex(), ri_index, 0);
+
+      d3d::set_render_target({}, DepthAccess::RW, {{riLandclassDepthTextureArr.getArrayTex(), 0, static_cast<uint32_t>(ri_index)}});
       DisplacementCallback cb(texelSize, *lmeshRenderer, *lmeshMgr);
       toroidal_update(newTexelsOrigin, displacementData, fullUpdateThresholdTexels, cb);
       d3d::resource_barrier({riLandclassDepthTextureArr.getArrayTex(), RB_RO_SRV | RB_STAGE_VERTEX, (unsigned)ri_index, 1});
-      ShaderGlobal::set_int(clipmap_writes_height_onlyVarId, 0);
       targetTexelSize = texelSize;
     };
     const bool forceInvalidate = false;
@@ -5657,8 +5276,6 @@ void WorldRenderer::renderDisplacementRiLandclasses(const Point3 &camera_pos)
         Point4(ofs.x, ofs.y, 0, 0));
     }
   }
-
-  clipmap->updateLandclassData();
 
   if (::grs_draw_wire)
     d3d::setwire(1);
@@ -5677,10 +5294,7 @@ void WorldRenderer::renderDisplacementAndHmapPatches(const Point3 &origin, float
       d3d::setwire(0);
     SCOPE_RENDER_TARGET;
 
-    ShaderGlobal::set_int(clipmap_writes_height_onlyVarId, 1);
-
-    d3d::set_render_target();
-    d3d::set_render_target(0, heightmapAround.getTex2D(), 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{heightmapAround.getTex2D(), 0, 0}});
     DisplacementCallback cb(texelSize, *lmeshRenderer, *lmeshMgr);
     if (displacementInvalidationBoxes.size())
     {
@@ -5698,14 +5312,12 @@ void WorldRenderer::renderDisplacementAndHmapPatches(const Point3 &origin, float
     }
     Point2 ofs =
       point2((displacementData.mainOrigin - displacementData.curOrigin) % displacementData.texSize) / displacementData.texSize;
-    ShaderGlobal::set_color4(world_to_hmap_tex_ofsVarId, ofs.x, ofs.y, 0, 0);
+    ShaderGlobal::set_float4(world_to_hmap_tex_ofsVarId, ofs.x, ofs.y, 0, 0);
     Point2 aligned = point2(displacementData.curOrigin) * texelSize;
-    ShaderGlobal::set_color4(world_to_hmap_ofsVarId, 1.0f / fullDistance, 1.0f / fullDistance, -aligned.x / fullDistance + 0.5,
+    ShaderGlobal::set_float4(world_to_hmap_ofsVarId, 1.0f / fullDistance, 1.0f / fullDistance, -aligned.x / fullDistance + 0.5,
       -aligned.y / fullDistance + 0.5);
     if (::grs_draw_wire)
       d3d::setwire(1);
-
-    ShaderGlobal::set_int(clipmap_writes_height_onlyVarId, 0);
   };
   bool invalidateDisplacement = displacementInvalidationBoxes.size() > 0;
   // when heightmapAround is not initialized, there should be no invalidations
@@ -5720,8 +5332,7 @@ void WorldRenderer::renderDisplacementAndHmapPatches(const Point3 &origin, float
                          int fullUpdateThresholdTexels) {
     SCOPE_RENDER_TARGET;
     TIME_D3D_PROFILE(updateHeightmapPatches);
-    d3d::set_render_target((Texture *)nullptr, 0);
-    d3d::set_depth(hmapPatchesDepthTex.getTex2D(), DepthAccess::RW);
+    d3d::set_render_target({hmapPatchesDepthTex.getTex2D(), 0, 0}, DepthAccess::RW, {});
     float minZ, maxZ;
     getMinMaxZ(minZ, maxZ);
     HmapPatchesCallback patchCb(texelSize, *lmeshRenderer, *lmeshMgr, newTexelsOrigin, hmapPatchesData.texSize, minZ, maxZ, origin.y,
@@ -5729,21 +5340,21 @@ void WorldRenderer::renderDisplacementAndHmapPatches(const Point3 &origin, float
     toroidal_update(newTexelsOrigin, displacementData, fullUpdateThresholdTexels, patchCb);
     TIME_D3D_PROFILE(updateHeightmapPatchesFiltering);
     d3d::resource_barrier({hmapPatchesDepthTex.getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
-    d3d::set_render_target(0, hmapPatchesTex.getTex2D(), 0);
-    d3d::set_depth((Texture *)nullptr, DepthAccess::RW);
+    d3d::set_render_target({}, DepthAccess::RW, {{hmapPatchesTex.getTex2D(), 0, 0}});
     processHmapPatchesDepth.render();
     d3d::resource_barrier({hmapPatchesTex.getTex2D(), RB_RO_SRV | RB_STAGE_VERTEX | RB_STAGE_COMPUTE, 0, 0});
     Point2 ofs =
       point2((displacementData.mainOrigin - displacementData.curOrigin) % displacementData.texSize) / displacementData.texSize;
-    ShaderGlobal::set_color4(world_to_hmap_patches_tex_ofsVarId, ofs.x, ofs.y, 0, 0);
+    ShaderGlobal::set_float4(world_to_hmap_patches_tex_ofsVarId, ofs.x, ofs.y, 0, 0);
     alignedOrigin = point2(displacementData.curOrigin) * texelSize;
-    ShaderGlobal::set_color4(world_to_hmap_patches_ofsVarId, 1.0f / fullDistance, 1.0f / fullDistance,
+    ShaderGlobal::set_float4(world_to_hmap_patches_ofsVarId, 1.0f / fullDistance, 1.0f / fullDistance,
       -alignedOrigin.x / fullDistance + 0.5, -alignedOrigin.y / fullDistance + 0.5);
   };
   render_toroidal_update_helper(alignedOrigin, fullDistance, hmapPatchesData, renderPatches);
 }
 
-void WorldRenderer::prepareClipmap(const Point3 &origin, float additional_height, const TMatrix &view_itm, const TMatrix4 &globtm)
+void WorldRenderer::prepareClipmapState(
+  const Point3 &origin, const TMatrix &view_itm, const TMatrix4 &globtm, float wk, int minimum_zoom)
 {
   if (!lmeshMgr)
     return;
@@ -5752,8 +5363,9 @@ void WorldRenderer::prepareClipmap(const Point3 &origin, float additional_height
   if (::grs_draw_wire)
     d3d::setwire(0);
 
-  const float water_level = water ? fft_water::get_level(water) : HeightmapHeightCulling::NO_WATER_ON_LEVEL;
-  lmeshRenderer->prepare(*lmeshMgr, origin, cameraHeight, water_level);
+  WRDispatcher::ScopedForceInEditor forceEditorHmap(editorHeightmapActive);
+
+  lmeshRenderer->prepare(*lmeshMgr, HmapOrigin(origin));
 
   if (lmeshMgr->getHmapHandler())
   {
@@ -5766,7 +5378,6 @@ void WorldRenderer::prepareClipmap(const Point3 &origin, float additional_height
     hmapTerrainStateVersion = newTerrainState;
   }
 
-  clipmap->finalizeFeedback();
   static int land_load_generation = 0;
   if (land_load_generation != interlocked_relaxed_load(textag_get_info(TEXTAG_LAND).loadGeneration))
   {
@@ -5790,19 +5401,14 @@ void WorldRenderer::prepareClipmap(const Point3 &origin, float additional_height
     clipmap->invalidate(true);
 #endif
 
-  int w, h;
-  getRenderingResolution(w, h);
-  clipmap->setTargetSize(w, h, getMipmapBias());
+  ZoomFeeedbackParams zoomParams = {cameraActualHeight, wk, minimum_zoom, {clipmapCutoffZoom, clipmapCutoffMipsCnt}};
+  SoftwareFeedbackParams swFbParams = {view_itm, 0.0, 0.0f, cameraHeight /* should be < maxDist for planes! */};
+  clipmap->prepareFeedback(origin, globtm, nullptr, zoomParams, swFbParams, false, UpdateFeedbackThreadPolicy::PRIO_NORMAL);
 
-  LandmeshCMRenderer landmeshCMRenderer(*lmeshRenderer, *lmeshMgr);
-  clipmap->prepareRender(landmeshCMRenderer);
-
-  clipmap->prepareFeedback(origin, view_itm, globtm, cameraHeight + additional_height, 0.0, 0.0f,
-    cameraHeight /* should be < maxDist for planes! */);
   const float fallBackTexelSize =
-    /* 8 times bigger than last aligned clip */ (1 << (clipmap->getAlignMips() - 1)) * clipmap->getPixelRatio() * 8.f;
+    /* 8 times bigger than last aligned clip */ (1 << (clipmap->getMaxTexMips() - 1)) * clipmap->getPixelRatio() * 8.f;
 
-  // (1 << (clipmap->getAlignMips() - 1)) * (sqrtf(clipmap->getZoom()) * clipmap->getStartTexelSize() * 8.f);
+  // (1 << (clipmap->getMaxTexMips() - 1)) * (sqrtf(clipmap->getZoom()) * clipmap->getStartTexelSize() * 8.f);
   // 8 times bigger than last aligned clip, with sqrt on current zoom
 
   // if texel size is 64 metes, we seeing almost all location anyway
@@ -5823,9 +5429,12 @@ void WorldRenderer::prepareDeformHmap()
     deformHmap->beforeRenderDepth();
     ShaderGlobal::set_int(dyn_model_render_passVarId, eastl::to_underlying(dynmodel::RenderPass::DeformHmap));
     ShaderGlobal::setBlock(globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
+    d3d::driver_command(Drv3dCommand::ASYNC_PIPELINE_COMPILE_RANGE_BEGIN);
     g_entity_mgr->broadcastEventImmediate(
       RenderHmapDeform(deformHmap->getDeformRect(), currentFrameCamera.negRoundedCamPos, currentFrameCamera.negRemainderCamPos,
-        currentFrameCamera.viewTm, deformHmap->getInverseViewTm(), currentFrameCamera.viewItm.getcol(3)));
+        deformHmap->getViewTm(), deformHmap->getInverseViewTm(), currentFrameCamera.viewItm.getcol(3)));
+
+    d3d::driver_command(Drv3dCommand::ASYNC_PIPELINE_COMPILE_RANGE_END);
 
     ShaderGlobal::set_int(dyn_model_render_passVarId, eastl::to_underlying(dynmodel::RenderPass::Color));
     ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
@@ -5841,20 +5450,37 @@ void WorldRenderer::renderGround(const LandMeshCullingData &lmesh_culling_data, 
   if (!lmeshMgr)
     return;
 
-  if (!clipmap)
-    initClipmap();
+  if (editorHeightmapActive && !lmeshMgr->forceHeightmapRendering)
+    return;
 
   TIME_D3D_PROFILE(render_ground);
 
+  WRDispatcher::ScopedForceInEditor forceEditorHmap(editorHeightmapActive);
+
   ShaderGlobal::set_int(autodetect_land_selfillum_enabledVarId,
-    autodetect_land_selfillum_colorVarId >= 0 ? ShaderGlobal::get_color4(autodetect_land_selfillum_colorVarId).a > 0.0f : 0);
+    autodetect_land_selfillum_colorVarId >= 0 ? ShaderGlobal::get_float4(autodetect_land_selfillum_colorVarId).a > 0.0f : 0);
 
   if (clipmap && is_first_iter)
     clipmap->startUAVFeedback();
-  lmeshRenderer->setLMeshRenderingMode(LMeshRenderingMode::RENDERING_LANDMESH);
 
-  lmeshRenderer->setUseHmapTankSubDiv(displacementSubDiv);
-  lmeshRenderer->renderCulled(*lmeshMgr, LandMeshRenderer::RENDER_WITH_CLIPMAP, lmesh_culling_data, currentFrameCamera.cameraWorldPos);
+  if (editorHeightmapActive)
+  {
+    d3d::settm(TM_VIEW, ::grs_cur_view.tm);
+    ShaderGlobal::set_float4(camera_base_offsetVarId, Point4::ZERO);
+  }
+
+  LandMeshRenderDesc groundDesc;
+  groundDesc.invGeomLodDist = lmeshRenderer->getInvGeomLodDist();
+  lmeshRenderer->renderCulled(*lmeshMgr, LandMeshRenderer::RENDER_WITH_CLIPMAP, groundDesc, lmesh_culling_data,
+    editorHeightmapActive ? ::grs_cur_view.pos : currentFrameCamera.cameraWorldPos);
+
+  if (editorHeightmapActive)
+  {
+    TMatrix offsetedView = ::grs_cur_view.tm;
+    offsetedView.setcol(3, Point3::ZERO);
+    d3d::settm(TM_VIEW, offsetedView);
+    ShaderGlobal::set_float4(camera_base_offsetVarId, -Point4::xyz0(currentFrameCamera.cameraWorldPos));
+  }
 
   if (clipmap && is_first_iter)
     clipmap->endUAVFeedback();
@@ -5865,8 +5491,11 @@ namespace d3d
 void resummarize_htile(BaseTexture *tex);
 }
 #endif
-void WorldRenderer::renderStaticSceneOpaque(
-  int cascade, const Point3 &camera_pos, const TMatrix &view_itm, const Frustum &culling_frustum)
+void WorldRenderer::renderStaticSceneOpaque(int cascade,
+  const Point3 &camera_pos,
+  const TMatrix &view_itm,
+  const Frustum &culling_frustum,
+  RiGenVisibility *scene_shadow_ri_visibility)
 {
   TIME_D3D_PROFILE(renderStaticSceneOpaque);
 
@@ -5885,9 +5514,7 @@ void WorldRenderer::renderStaticSceneOpaque(
       d3d::get_render_target(prevRT);
       currentDepth = static_cast<Texture *>(prevRT.getDepth().tex);
 
-      d3d::set_render_target();
-      d3d::set_render_target(nullptr, 0);
-      d3d::set_depth(currentDepth, DepthAccess::RW);
+      d3d::set_render_target({currentDepth, 0, 0}, DepthAccess::RW, {});
       mainCameraVisibilityMgr.waitVisibility(cascade);
       if (async_riex_opaque.get()) // wait until vb is filled by async opaque render (prepass re-uses same buf struct)
         mainCameraVisibilityMgr.waitAsyncRIGenExtraOpaqueRenderVbFill();
@@ -5900,7 +5527,7 @@ void WorldRenderer::renderStaticSceneOpaque(
       renderRITreePrepass(view_itm);
       if (vehicle_cockpit_in_depth_prepass.get())
       {
-        g_entity_mgr->broadcastEventImmediate(VehicleCockpitPrepass(currentFrameCamera.viewTm));
+        g_entity_mgr->broadcastEventImmediate(VehicleCockpitPrepass(currentFrameCamera.viewTm, currentTexCtx));
       }
     }
   }
@@ -5926,7 +5553,7 @@ void WorldRenderer::renderStaticSceneOpaque(
       binScene->render(vf, 0, 0xFFFFFFFF);
     }
   }
-  renderRendinst(cascade, view_itm);
+  renderRendinst(cascade, view_itm, scene_shadow_ri_visibility);
 
   if (is_gbuffer_cascade(cascade) && cascade != RENDER_CUBE)
     renderGiCollision(view_itm, culling_frustum);
@@ -5945,9 +5572,7 @@ void WorldRenderer::renderStaticSceneOpaque(
   {
     Driver3dRenderTarget prevRT;
     d3d::get_render_target(prevRT);
-    d3d::set_render_target();
-    d3d::set_render_target((Texture *)NULL, 0);
-    d3d::set_depth((Texture *)(prevRT.getDepth().tex), DepthAccess::RW);
+    d3d::set_render_target({prevRT.getDepth().tex, 0, 0}, DepthAccess::RW, {});
     render_grass_prepass(GrassView::Main);
     d3d::set_render_target(prevRT);
     d3d::resummarize_htile(currentDepth);
@@ -5994,23 +5619,23 @@ void WorldRenderer::renderDynamicOpaque(
   }
 
   Occlusion *occl = cascade == RENDER_MAIN ? getMainCameraOcclusion() : nullptr;
-  const dynmodel_renderer::DynModelRenderingState *pState = NULL;
+  dynrend::ContextId asyncAnimcharCtx = dynrend::ContextId::Invalid;
   char tmps[] = "csm#000";
   if (async_animchars_shadows.get() && cascade >= RENDER_SHADOWS_CSM && cascade - RENDER_SHADOWS_CSM < csm->getNumCascadesToRender())
   {
-    pState = dynmodel_renderer::get_state(fmt_csm_render_pass_name(cascade, tmps));
+    asyncAnimcharCtx = dynrend::find_context(fmt_csm_render_pass_name(cascade, tmps));
   }
   else if (async_animchars_main.get())
     if (cascade == RENDER_MAIN)
     {
       mainCameraVisibilityMgr.waitAsyncAnimcharMainRender();
-      pState = mainCameraVisibilityMgr.getAsyncAnimcharMainRenderState();
+      asyncAnimcharCtx = mainCameraVisibilityMgr.getAsyncAnimcharMainRenderCtx();
     }
 
   {
     TIME_D3D_PROFILE(ecs_render);
     g_entity_mgr->broadcastEventImmediate(UpdateStageInfoRender(hints, frustum, view_itm, view_tm, proj_tm, cam_pos,
-      currentFrameCamera.negRoundedCamPos, currentFrameCamera.negRemainderCamPos, occl, cascade, pState, texCtx));
+      currentFrameCamera.negRoundedCamPos, currentFrameCamera.negRemainderCamPos, occl, cascade, asyncAnimcharCtx, texCtx));
   }
 
   ShaderGlobal::set_int(dyn_model_render_passVarId, eastl::to_underlying(dynmodel::RenderPass::Color));
@@ -6036,7 +5661,7 @@ void WorldRenderer::renderDynamicsForShadowPass(int cascade, const TMatrix &itm,
   renderDynamicOpaque(cascade, itm, viewTm, projTm, cam_pos);
 }
 
-void WorldRenderer::renderRendinst(int cascade, const TMatrix &view_itm)
+void WorldRenderer::renderRendinst(int cascade, const TMatrix &view_itm, RiGenVisibility *scene_shadow_ri_visibility)
 {
   TIME_D3D_PROFILE(rendinst);
 
@@ -6058,16 +5683,20 @@ void WorldRenderer::renderRendinst(int cascade, const TMatrix &view_itm)
     if (cascade == RENDER_DYNAMIC_SHADOW)
     {
       SCENE_LAYER_GUARD(rendinstDepthSceneBlockId);
-      rendinst::render::renderRIGen(rendinst::RenderPass::Depth, rendinst_dynamic_shadow_visibility, view_itm,
+      RiGenVisibility *vis = scene_shadow_ri_visibility ? scene_shadow_ri_visibility : rendinst_dynamic_shadow_visibility;
+      rendinst::render::renderRIGen(rendinst::RenderPass::Depth, vis, view_itm,
         rendinst::LayerFlag::Opaque | rendinst::LayerFlag::NotExtra, rendinst::OptimizeDepthPass::No);
     }
     else if (cascade == RENDER_MAIN)
     {
       RiGenVisibility *mainCameraRiMainVisibility = mainCameraVisibilityMgr.getRiMainVisibility();
       mainCameraVisibilityMgr.waitVisibility(RENDER_MAIN);
+      rendinst::render::RiExtraRenderer *staticRiExtraRenderer = mainCameraVisibilityMgr.waitAsyncRIGenExtraOpaqueRender();
       rendinst::render::renderRIGen(rendinst::RenderPass::Normal, mainCameraRiMainVisibility, view_itm, rendinst::LayerFlag::Opaque,
-        rendinst::OptimizeDepthPass::No, /*count_multiply*/ 1, rendinst::AtestStage::All,
-        mainCameraVisibilityMgr.waitAsyncRIGenExtraOpaqueRender(), currentTexCtx);
+        rendinst::OptimizeDepthPass::No, /*count_multiply*/ 1, rendinst::AtestStage::All, staticRiExtraRenderer, currentTexCtx);
+      rendinst::render::renderRIGen(rendinst::RenderPass::Normal, mainCameraRiMainVisibility, view_itm, rendinst::LayerFlag::Opaque,
+        rendinst::OptimizeDepthPass::No, /*count_multiply*/ 1, rendinst::AtestStage::All, nullptr, currentTexCtx,
+        rendinst::RiExtraRenderingSubset::OnlyDynamic);
     }
     else if (cascade == RENDER_CUBE)
     {
@@ -6091,8 +5720,7 @@ void WorldRenderer::renderFullresRITreePrepass(const TMatrix &view_itm)
 {
   ScopeRenderTarget scopeRt;
 
-  d3d::set_render_target((Texture *)NULL, 0);
-  d3d::set_depth(scopeRt.prevRT.getDepth().tex, DepthAccess::RW);
+  d3d::set_render_target({scopeRt.prevRT.getDepth().tex, 0, 0}, DepthAccess::RW, {});
 
   rendinst::render::renderRITreeDepth(mainCameraVisibilityMgr.getRiMainVisibility(), view_itm);
 }
@@ -6115,7 +5743,7 @@ void WorldRenderer::renderFullresRITree()
 void WorldRenderer::setRendinstTesselation()
 {
   bool rendinstTesselation = isRendeinstTesselationEnabled();
-  ShaderGlobal::set_real(object_tess_factorVarId, rendinstTesselation ? 1.0f : 0.0f);
+  ShaderGlobal::set_float(object_tess_factorVarId, rendinstTesselation ? 1.0f : 0.0f);
 }
 
 bool WorldRenderer::prepareDelayedRender(const TMatrix &itm)
@@ -6143,7 +5771,7 @@ bool WorldRenderer::prepareDelayedRender(const TMatrix &itm)
   {
     float minZ, maxZ;
     getMinMaxZ(minZ, maxZ);
-    tpJobsAdded = depthAOAboveCtx->prepare(currentFrameCamera.viewItm.getcol(3), minZ, maxZ);
+    tpJobsAdded |= depthAOAboveCtx->prepare(currentFrameCamera.viewItm.getcol(3), minZ, maxZ);
     delayedRenderCtx.depthAOAboveData.itm = itm;
     delayedRenderCtx.depthAOAboveData.render = true;
   }
@@ -6165,67 +5793,44 @@ void WorldRenderer::renderDelayedDepthAbove()
     depthAOAboveCtx->render(*this, data.itm);
 }
 
-void WorldRenderer::reinitCubeIfInvalid()
+void WorldRenderer::updateEnviProbe()
 {
-  if (!enviProbeInvalid)
+  if (enviProbeState == EnviProbeState::Ready)
     return;
 
   uint32_t enviProbeRenderFlags = getEnviProbeRenderFlags();
   uint32_t checkFlags = ENVI_PROBE_SUN_ENABLED | ENVI_PROBE_USE_GEOMETRY;
-  bool needeReinitCube = true;
+  bool canReinitCube = true;
   // In case we use geometry and sun, the shadows must be rendered at the time of probe rendering.
   if ((enviProbeRenderFlags & checkFlags) == checkFlags)
   {
     BBox3 worldBox = getWorldBBox3();
     float checkRadius = length(worldBox.width()) * 0.5f;
-    needeReinitCube &= shadowsManager.fullyUpdatedStaticShadows(worldBox.center(), checkRadius);
+    canReinitCube &= shadowsManager.fullyUpdatedStaticShadows(worldBox.center(), checkRadius);
   }
   // Do not reinit envi probe until skies are not ready, otherwise we will have wrong sky color and missed clouds
   if (auto *skies = get_daskies())
-    needeReinitCube &= skies->isCloudsReady();
-  if (needeReinitCube)
+    canReinitCube &= skies->isCloudsReady() && skies->isScatteringReady();
+  if (canReinitCube)
   {
-    reinitCube();
-    enviProbeInvalid = false;
-    enviProbeNeedsReload = false;
+    if (enviProbeState == EnviProbeState::NeedsFullReload)
+      recreateEnviProbe();
+    renderEnviProbe();
+    enviProbeState = EnviProbeState::Ready;
   }
   else
     debug("WR:cube reinit skipped because dependent systems are not ready");
 }
 
-static int get_envi_cube_size() { return dgs_get_settings()->getBlockByNameEx("graphics")->getInt("envi_cube_size", 128); }
-
-void WorldRenderer::reinitCube(const Point3 &at)
+void WorldRenderer::recreateEnviProbe()
 {
-  cubeResolution = get_envi_cube_size();
-  reinitCube(cubeResolution, at);
-}
-
-void WorldRenderer::reinitSpecularCubesContainerIfNeeded(int cube_size)
-{
-  if (!specularCubesContainerNeedsReinit)
-    return;
-
-  if (specularCubesContainer)
-  {
-    specularCubesContainer->init(cube_size < 0 ? get_envi_cube_size() : cube_size, TEXFMT_A16B16G16R16F);
-    specularCubesContainerNeedsReinit = false;
-  }
-}
-
-void WorldRenderer::reinitCube(int ew, const Point3 &at)
-{
-  enviProbePos = at;
-  cube->init(ew);
+  cube->init(cubeResolution);
   light_probe::destroy(enviProbe);
-  enviProbe = light_probe::create("envi", ew, TEXFMT_A16B16G16R16F);
+  enviProbe = light_probe::create("envi", cubeResolution, TEXFMT_A16B16G16R16F);
   ShaderGlobal::set_texture(envi_probe_specularVarId, *light_probe::getManagedTex(enviProbe));
-  ShaderGlobal::set_sampler(envi_probe_specular_samplerstateVarId, d3d::request_sampler({}));
-  reinitSpecularCubesContainerIfNeeded(ew);
+  if (specularCubesContainer)
+    specularCubesContainer->init(cubeResolution, TEXFMT_A16B16G16R16F);
   initIndoorProbesIfNecessary();
-  g_entity_mgr->broadcastEventImmediate(RenderReinitCube{});
-  beforeDrawPostFx();
-  reloadCube(true);
 }
 
 void WorldRenderer::updateSkyProbeDiffuse()
@@ -6254,7 +5859,7 @@ void WorldRenderer::updateSkyProbeDiffuse()
     for (int i = 0; i < SphHarmCalc::SPH_COUNT; ++i)
     {
       sphValues[i] = sphHarm[i];
-      ShaderGlobal::set_color4(get_shader_variable_id(String(128, "enviSPH%d", i)), sphValues[i]);
+      ShaderGlobal::set_float4(get_shader_variable_id(String(128, "enviSPH%d", i)), sphValues[i]);
     }
 
     Point4 normal1(0, 1, 0, 1);
@@ -6296,8 +5901,26 @@ void WorldRenderer::updateSkyProbeDiffuse()
   }
 }
 
-void WorldRenderer::reloadCube(bool first)
+void WorldRenderer::clearEnviProbe()
 {
+  SCOPE_RENDER_TARGET;
+  for (int i = 0; i < 6; ++i)
+  {
+    d3d::set_render_target({}, DepthAccess::RW, {{light_probe::getManagedTex(enviProbe)->getCubeTex(), 0, static_cast<uint32_t>(i)}});
+    d3d::clearview(CLEAR_TARGET, 0, 0, 0);
+  }
+  for (int i = 0; i < SphHarmCalc::SPH_COUNT; ++i)
+    ShaderGlobal::set_float4(get_shader_variable_id(String(128, "enviSPH%d", i)), 1e-9, 1e-9, 1e-9, 1e-9);
+  light_probe::update(enviProbe, NULL);
+}
+
+void WorldRenderer::renderEnviProbe()
+{
+  const float oldSkyFilterTerm = ShaderGlobal::get_float(var::sky_polarization_filter_term);
+  ShaderGlobal::set_float(var::sky_polarization_filter_term, 1.0f);
+
+  beforeDrawPostFx();
+
   const uint32_t enviProbeRenderFlags = getEnviProbeRenderFlags();
   const bool sunEnabled = enviProbeRenderFlags & ENVI_PROBE_SUN_ENABLED;
   const bool useGeometry = enviProbeRenderFlags & ENVI_PROBE_USE_GEOMETRY;
@@ -6305,22 +5928,11 @@ void WorldRenderer::reloadCube(bool first)
   d3d::GpuAutoLock gpu_al;
   static int local_light_probe_texVarId = get_shader_variable_id("local_light_probe_tex", true);
   updateSky(0);
-  ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
+  // the guard re-runs the entry block on exit, flushing the restored sun_color_0 into its cbuf
+  FRAME_LAYER_GUARD(-1);
   if (!sunEnabled)
-    ShaderGlobal::set_color4(sun_color_0VarId, 0, 0, 0, 0);
-  ShaderGlobal::setBlock(globalConstBlockId, ShaderGlobal::LAYER_GLOBAL_CONST);
-  if (first)
-  {
-    SCOPE_RENDER_TARGET;
-    for (int i = 0; i < 6; ++i)
-    {
-      d3d::set_render_target(light_probe::getManagedTex(enviProbe)->getCubeTex(), i, 0);
-      d3d::clearview(CLEAR_TARGET, 0, 0, 0);
-    }
-    for (int i = 0; i < SphHarmCalc::SPH_COUNT; ++i)
-      ShaderGlobal::set_color4(get_shader_variable_id(String(128, "enviSPH%d", i)), 1e-9, 1e-9, 1e-9, 1e-9);
-    light_probe::update(enviProbe, NULL);
-  }
+    ShaderGlobal::set_float4(sun_color_0VarId, 0, 0, 0, 0);
+
   Point3 origin = enviProbePos;
   if (lmeshMgr && lmeshMgr->getHmapHandler())
   {
@@ -6333,6 +5945,7 @@ void WorldRenderer::reloadCube(bool first)
     TIME_D3D_PROFILE(cubeRender)
     if (!render_custom_envi_probe(light_probe::getManagedTex(enviProbe), -1))
     {
+      clearEnviProbe();
       mainCameraVisibilityMgr.waitLightProbeVisibility(); // Async visibility shouldn't be running here, but wait for safety.
       if (!get_daskies()->isPanoramaValid())
         get_daskies()->temporarilyDisablePanorama(true);
@@ -6347,12 +5960,12 @@ void WorldRenderer::reloadCube(bool first)
   }
   updateSkyProbeDiffuse();
   if (!sunEnabled)
-    ShaderGlobal::set_color4(sun_color_0VarId, color4(sun, 0));
-  ShaderGlobal::setBlock(globalConstBlockId, ShaderGlobal::LAYER_GLOBAL_CONST);
+    ShaderGlobal::set_float4(sun_color_0VarId, color4(sun, 0));
 
   ShaderGlobal::set_texture(local_light_probe_texVarId, *light_probe::getManagedTex(enviProbe));
-  ShaderGlobal::set_sampler(get_shader_variable_id("local_light_probe_tex_samplerstate", true), d3d::request_sampler({}));
-  invalidateGI(true);
+  invalidateAllGI();
+
+  ShaderGlobal::set_float(var::sky_polarization_filter_term, oldSkyFilterTerm);
 }
 
 void WorldRenderer::prepareLightProbeRIVisibility(const mat44f &globtm, const Point3 &view_pos)
@@ -6377,13 +5990,15 @@ void WorldRenderer::prepareLightProbeRIVisibility(const mat44f &globtm, const Po
 void WorldRenderer::renderLightProbeOpaque(const Point3 &view_pos, const TMatrix &view_itm, const Frustum &culling_frustum)
 {
   ShaderGlobal::setBlock(globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
-  renderStaticSceneOpaque(RENDER_CUBE, view_pos, view_itm, culling_frustum);
+  renderStaticSceneOpaque(RENDER_CUBE, view_pos, view_itm, culling_frustum, nullptr);
   //
   if (lmeshMgr)
   {
-    lmeshRenderer->setLMeshRenderingMode(LMeshRenderingMode::RENDERING_REFLECTION);
-    lmeshRenderer->setUseHmapTankSubDiv(0);
-    lmeshRenderer->render(*lmeshMgr, LandMeshRenderer::RENDER_REFLECTION, view_pos); // no async culling
+    LandMeshRenderDesc desc;
+    desc.mode = LMeshRenderingMode::RENDERING_REFLECTION;
+    desc.invGeomLodDist = lmeshRenderer->getInvGeomLodDist();
+    // reflection probe renders from the probe view; terrain LOD follows that view (view-local)
+    lmeshRenderer->render(*lmeshMgr, LandMeshRenderer::RENDER_REFLECTION, desc, view_pos, HmapOrigin(view_pos)); // no async culling
     ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_SCENE);
   }
   ShaderGlobal::set_texture(ssao_texVarId, BAD_TEXTUREID);
@@ -6400,9 +6015,11 @@ void WorldRenderer::renderLightProbeEnvi(const TMatrix &view, const TMatrix4 &pr
   itm = orthonormalized_inverse(view);
   if (DAGOR_LIKELY(!try_render_custom_sky(view, proj, persp)))
   {
+    // cube faces are disjoint views sharing cube_pov_data: restart clouds TAA per face
     get_daskies()->renderEnvi(sky_is_unreachable, dpoint3(itm.getcol(3)), dpoint3(itm.getcol(2)), 2, UniqueTex{}, UniqueTex{},
-      BAD_TEXTUREID, // fixme: it should be with cube depth buffer
-      cube_pov_data, view, proj, persp, UpdateSky::Off, true, probes_sky_prepare_altitude_tolerance.get(), nullptr);
+      nullptr, // fixme: it should be with cube depth buffer
+      cube_pov_data, view, proj, persp, UpdateSky::Off, true, probes_sky_prepare_altitude_tolerance.get(),
+      CloudsRenderFlags::Default | CloudsRenderFlags::RestartTAA);
   }
 }
 
@@ -6413,11 +6030,10 @@ void WorldRenderer::renderLmeshReflection(const LandMeshCullingData &lmesh_refl_
     return;
 
   ShaderGlobal::setBlock(globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
-  lmeshRenderer->setLMeshRenderingMode(LMeshRenderingMode::RENDERING_REFLECTION);
-  lmeshRenderer->setUseHmapTankSubDiv(0);
-  lmeshRenderer->forceLowQuality(true);
-  lmeshRenderer->renderCulled(*lmeshMgr, LandMeshRenderer::RENDER_REFLECTION, lmesh_refl_culling_data, ::grs_cur_view.pos);
-  lmeshRenderer->forceLowQuality(false);
+  LandMeshRenderDesc desc;
+  desc.mode = LMeshRenderingMode::RENDERING_REFLECTION;
+  desc.invGeomLodDist = lmeshRenderer->getInvGeomLodDist();
+  lmeshRenderer->renderCulled(*lmeshMgr, LandMeshRenderer::RENDER_REFLECTION, desc, lmesh_refl_culling_data, ::grs_cur_view.pos);
   ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
 }
 
@@ -6435,41 +6051,47 @@ Occlusion *WorldRenderer::getMainCameraOcclusion()
   return camera_in_camera::is_lens_render_active() ? nullptr : mainCameraVisibilityMgr.getOcclusion();
 }
 
+Occlusion *get_main_occlusion_safe()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  return wr ? wr->getMainCameraOcclusion() : nullptr;
+}
 
-void WorldRenderer::renderWaterSSR(const TMatrix &itm, const Driver3dPerspective &persp)
+void WorldRenderer::renderWaterNormals(const CameraParams &camera, int sub_camera)
 {
   if (!water)
     return;
 
-  TIME_D3D_PROFILE(reflection)
-  if (is_underwater())
-    shaders::overrides::set(flipCullStateId);
-  fft_water::render(water, itm.getcol(3), shoreRenderer.getDistanceFieldTexId(), currentFrameCamera.noJitterFrustum, persp,
-    fft_water::GEOM_NORMAL, water_ssr_id, nullptr, fft_water::RenderMode::WATER_SSR_SHADER);
-  if (is_underwater())
-    shaders::overrides::reset();
+  G_ASSERT_RETURN(sub_camera >= 0 && sub_camera < countof(water_ssr_ids), );
+  TIME_D3D_PROFILE(water_normals)
+  fft_water::render(water, camera.viewItm.getcol(3), shoreRenderer.getDistanceFieldTexId(), camera.noJitterFrustum, nullptr,
+    camera.jitterPersp, fft_water::GEOM_LOD_NORMAL, water_ssr_ids[sub_camera], nullptr, fft_water::RenderMode::WATER_SSR_SHADER);
 }
-void WorldRenderer::renderWater(const TMatrix &itm, DistantWater render_distant_water, bool render_ssr)
+
+static ShaderVariableInfo far_water_transparencyVarId("far_water_transparency", true);
+
+void WorldRenderer::renderWater(const CameraParams &camera, DistantWater render_distant_water, bool render_ssr, int sub_camera)
 {
   if (!water || is_water_hidden())
     return;
 
+  G_ASSERT_RETURN(sub_camera >= 0 && sub_camera < countof(water_ssr_ids), );
+  bind_water_refraction_stub_if_unset();
+
   TIME_D3D_PROFILE(water);
   if (render_ssr)
-    d3d::begin_conditional_render(water_ssr_id);
-  if (is_underwater())
-    shaders::overrides::set(flipCullStateId);
-  fft_water::render(water, itm.getcol(3), shoreRenderer.getDistanceFieldTexId(), currentFrameCamera.noJitterFrustum,
-    currentFrameCamera.jitterPersp, fft_water::GEOM_NORMAL);
-  if (is_underwater())
-    shaders::overrides::reset();
+    d3d::begin_conditional_render(water_ssr_ids[sub_camera]);
+  ShaderGlobal::set_int(far_water_transparencyVarId, 0);
+  fft_water::render(water, camera.viewItm.getcol(3), shoreRenderer.getDistanceFieldTexId(), camera.noJitterFrustum, nullptr,
+    camera.jitterPersp, fft_water::GEOM_LOD_NORMAL);
   if (render_ssr)
-    d3d::end_conditional_render(water_ssr_id);
+    d3d::end_conditional_render(water_ssr_ids[sub_camera]);
 
   if (render_distant_water == DistantWater::Yes)
   {
     TIME_D3D_PROFILE(distant_water);
     FRAME_LAYER_GUARD(water3dBlockId);
+
     waterDistant[fft_water::RenderMode::WATER_DEPTH_SHADER].render(); // depth prepass
     waterDistant[fft_water::RenderMode::WATER_SHADER].render();       // color pass
   }
@@ -6477,8 +6099,11 @@ void WorldRenderer::renderWater(const TMatrix &itm, DistantWater render_distant_
 
 bool WorldRenderer::shouldToggleVRS(const AimRenderingData &aim_data)
 {
-  static ShaderVariableInfo motion_vrs_strength("motion_vrs_strength", true);
-  const bool motionVrs = can_use_motion_vrs() && motion_vrs_strength && motion_vrs_strength.get_real() > 0;
+  if (::dgs_get_game_params()->getBool("forceDisableVrs", false)) // TODO: remove it after VRS is stable
+    vrsEnable = false;
+  if (render::antialiasing::is_ray_reconstruction_enabled())
+    return false;
+  const bool motionVrs = can_use_motion_vrs() && has_motion_vrs_strength();
   const bool dofVrs = aim_data.farDofEnabled && vrs_dof;
   return (motionVrs || dofVrs) && d3d::get_driver_desc().caps.hasVariableRateShadingTexture && vrsEnable;
 }
@@ -6510,22 +6135,17 @@ void WorldRenderer::setFxQuality()
   if (fxRes == FX_HIGH_RESOLUTION)
     fxRtOverride = FX_RT_OVERRIDE_HIGHRES;
 
-  // non native fx res can't be used on forward
-  if (isForwardRender())
-    fxRtOverride = FX_RT_OVERRIDE_HIGHRES;
-
   acesfx::set_rt_override(fxRtOverride);
 
   FxQuality fxQuality = acesfx::getFxQualityMask();
 
   acesfx::set_quality_mask(fxQuality);
 
-  createTransparentParticlesNode();
-  createDownsampleDepthWithWaterNode();
+  requestFgRecreation("setFxQuality");
   g_entity_mgr->broadcastEventImmediate(SetFxQuality(fxQuality));
 }
 
-void WorldRenderer::setEnviromentDetailsQuality()
+void WorldRenderer::setEnvironmentDetailsQuality()
 {
   const DataBlock *graphics = ::dgs_get_settings()->getBlockByNameEx("graphics");
 
@@ -6533,12 +6153,17 @@ void WorldRenderer::setEnviromentDetailsQuality()
   if (stricmp(environmentDetailQualityStr, "low") == 0)
   {
     ShaderGlobal::set_int(var::layered_material_detail_quality, 0);
-    console::command("grass.grassUseSdfEraser 0");
+    g_entity_mgr->broadcastEventImmediate(SetGrassSdfEareaser{false});
+  }
+  else if (stricmp(environmentDetailQualityStr, "medium") == 0)
+  {
+    ShaderGlobal::set_int(var::layered_material_detail_quality, 0);
+    g_entity_mgr->broadcastEventImmediate(SetGrassSdfEareaser{false});
   }
   else if (stricmp(environmentDetailQualityStr, "high") == 0)
   {
     ShaderGlobal::set_int(var::layered_material_detail_quality, 1);
-    console::command("grass.grassUseSdfEraser 1");
+    g_entity_mgr->broadcastEventImmediate(SetGrassSdfEareaser{true});
   }
   else
   {
@@ -6546,13 +6171,32 @@ void WorldRenderer::setEnviromentDetailsQuality()
   }
 }
 
+void WorldRenderer::setNbsQuality()
+{
+  const DataBlock *graphics = ::dgs_get_settings()->getBlockByNameEx("graphics");
+  const char *environmentDetailQualityStr = graphics->getStr("environmentDetailsQuality", "low");
+
+  NodeBasedShaderQuality nbsQuality = NodeBasedShaderQuality::Low;
+
+  if (stricmp(environmentDetailQualityStr, "medium") == 0)
+    nbsQuality = NodeBasedShaderQuality::Medium;
+  else if (stricmp(environmentDetailQualityStr, "high") == 0)
+    nbsQuality = NodeBasedShaderQuality::High;
+  else if (stricmp(environmentDetailQualityStr, "low") != 0)
+    logerr("unknown environment detail quality <%s>", environmentDetailQualityStr);
+
+  if (enviCover)
+    enviCover->setNbsQuality(nbsQuality);
+
+  if (volumeLight)
+    volumeLight->setNbsQuality(nbsQuality);
+}
+
 void WorldRenderer::copyClipmapUAVFeedback()
 {
   if (clipmap)
     clipmap->copyUAVFeedback();
 }
-
-bool WorldRenderer::renderParticlesSpecial(uint8_t render_tag) { return acesfx::renderTransSpecial(render_tag); }
 
 String WorldRenderer::showTexCommand(const char *argv[], int argc)
 {
@@ -6687,8 +6331,9 @@ void WorldRenderer::prepareLastClip()
   LandMeshData data;
   data.lmeshMgr = lmeshMgr;
   data.lmeshRenderer = lmeshRenderer;
-  data.texture_size = ::dgs_get_settings()->getBlockByNameEx("clipmap")->getInt("lastClipTexSize", 2048);
+  data.texture_size = ::dgs_get_settings()->getBlockByNameEx("clipmap")->getInt("lastClipTexSz", 2048);
   data.use_dxt = true;
+  data.decals_cb = clipmap_decals_cb;
   data.global_frame_id = globalFrameBlockId;
   data.flipCullStateId = flipCullStateId.get();
   data.land_mesh_prepare_clipmap_blockid = landMeshPrepareClipmapBlockId;
@@ -6701,7 +6346,7 @@ void WorldRenderer::closeDistantHeightmap()
 {
   distantHeightmapTex.close(); // to force reinit distant hmap
   static constexpr float INF_DIST = 10000000;
-  ShaderGlobal::set_color4(distant_heightmap_target_boxVarId, Color4(0, 0, INF_DIST, INF_DIST));
+  ShaderGlobal::set_float4(distant_heightmap_target_boxVarId, Color4(0, 0, INF_DIST, INF_DIST));
   // distant heightmap is never sampled this way
 }
 void WorldRenderer::updateDistantHeightmap()
@@ -6711,9 +6356,6 @@ void WorldRenderer::updateDistantHeightmap()
 
   if (hasDistantHeightmap == needsDistantHeightmap)
     return;
-
-  if (hasDistantHeightmap)
-    NodeBasedShaderManager::clearAllCachedResources();
 
   if (!needsDistantHeightmap)
   {
@@ -6740,7 +6382,7 @@ void WorldRenderer::updateDistantHeightmap()
   BBox3 landmeshBBox = lmeshMgr->getBBox();
   float scale = landmeshBBox.width().y;
   float offset = landmeshBBox.boxMin().y;
-  ShaderGlobal::set_color4(get_shader_variable_id("heightmap_min_max", true), Color4(1.0f / scale, -offset / scale, scale, offset));
+  ShaderGlobal::set_float4(get_shader_variable_id("heightmap_min_max", true), Color4(1.0f / scale, -offset / scale, scale, offset));
 
   BBox3 hmapBBox = lmeshMgr->getHmapHandler()->getWorldBox();
   Point2 origin = Point2::xz(hmapBBox.center());
@@ -6748,35 +6390,34 @@ void WorldRenderer::updateDistantHeightmap()
   BBox2 targetBox = BBox2(origin - extent, origin + extent);
 
   Point4 world_to_heightmap;
-  const float water_level = water ? fft_water::get_level(water) : HeightmapHeightCulling::NO_WATER_ON_LEVEL;
-  render_landmesh_to_heightmap(distantHeightmapTex.getTex2D(), distantHeightmapRange, origin, &targetBox, water_level,
-    world_to_heightmap);
+  // flush pending hmap texture uploads/edits so the bake includes them; stateless prepare() no longer does this
+  lmeshMgr->getHmapHandler()->makeBookKeeping();
+  render_landmesh_to_heightmap(distantHeightmapTex.getTex2D(), distantHeightmapRange, origin, &targetBox, world_to_heightmap);
   d3d::resource_barrier({distantHeightmapTex.getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
 
   Point2 worldPosOfs = targetBox.getMin();
   Point2 worldSize = targetBox.size();
-  ShaderGlobal::set_color4(distant_world_to_hmap_lowVarId,
+  ShaderGlobal::set_float4(distant_world_to_hmap_lowVarId,
     Color4(1.0f / worldSize.x, 1.0f / worldSize.y, -worldPosOfs.x / worldSize.x, -worldPosOfs.y / worldSize.y));
 
-  ShaderGlobal::set_color4(distant_heightmap_scaleVarId, Color4(scale, offset, 0, 0));
+  ShaderGlobal::set_float4(distant_heightmap_scaleVarId, Color4(scale, offset, 0, 0));
 
-  ShaderGlobal::set_color4(distant_heightmap_target_boxVarId,
+  ShaderGlobal::set_float4(distant_heightmap_target_boxVarId,
     Color4(hmapBBox.center().x, hmapBBox.center().z, hmapBBox.width().x / 2, hmapBBox.width().z / 2));
 }
 
 void WorldRenderer::renderWaterHeightmapLowres()
 {
-  Color4 underwater_fade = ShaderGlobal::get_color4(underwater_fadeVarId);
+  Color4 underwater_fade = ShaderGlobal::get_float4(underwater_fadeVarId);
   bool needsHeightmap = needs_water_heightmap(underwater_fade);
   needsHeightmap = needsHeightmap && water && fft_water::get_heightmap(water);
   if (needsHeightmap && !lowresWaterHeightmap)
   {
     lowresWaterHeightmap = dag::create_tex(nullptr, lowresWaterHeightmapSize, lowresWaterHeightmapSize, TEXCF_RTARGET | TEXFMT_R16F, 1,
       "water_heightmap_lowres");
-    ShaderGlobal::set_sampler(get_shader_variable_id("water_heightmap_lowres_samplerstate", true), d3d::request_sampler({}));
     lowresWaterHeightmapRenderer.init("water_heightmap_lowres");
     SCOPE_RENDER_TARGET;
-    d3d::set_render_target(lowresWaterHeightmap.getTex2D(), 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{lowresWaterHeightmap.getTex2D(), 0, 0}});
     lowresWaterHeightmapRenderer.render();
   }
   else if (!needsHeightmap && lowresWaterHeightmap)
@@ -6817,15 +6458,8 @@ void WorldRenderer::getMinMaxZ(float &minHt, float &maxHt) const
 int WorldRenderer::getTemporalShadowFramesCount() const
 {
   if (!screencap::is_screenshot_scheduled())
-  {
-    if (antiAliasing)
-    {
-      int taaFrameCount = antiAliasing->getTemporalFrameCount();
-      if (taaFrameCount > 0)
-        return taaFrameCount;
-    }
-    return 1;
-  }
+    return render::antialiasing::get_jitter_sequence_length();
+
   // Count how many samples will be taken to avoid repeating dithering pattern
   return subPixels * subPixels;
 }
@@ -6833,15 +6467,8 @@ int WorldRenderer::getTemporalShadowFramesCount() const
 int WorldRenderer::getShadowFramesCount() const
 {
   if (!screencap::is_screenshot_scheduled())
-  {
-    if (antiAliasing)
-    {
-      int taaFrameCount = antiAliasing->getTemporalFrameCount();
-      if (taaFrameCount > 0)
-        return taaFrameCount;
-    }
-    return 8;
-  }
+    return max(8, render::antialiasing::get_jitter_sequence_length());
+
   // Count how many samples will be taken to avoid repeating dithering pattern
   return subPixels * subPixels;
 }
@@ -6851,8 +6478,9 @@ bool WorldRenderer::isTimeDynamic() const { return timeDynamic || dynamic_time_s
 void WorldRenderer::initIndoorProbeShapes(eastl::unique_ptr<IndoorProbeScenes> &&scene_ptr)
 {
   indoorProbesScene = eastl::move(scene_ptr);
-  initIndoorProbesIfNecessary();
+  scheduleEnviProbeFullReload();
   set_up_omni_lights();
+  g_entity_mgr->broadcastEvent(UpdateEffectRestrictionBoxes());
 }
 
 void WorldRenderer::initRestrictionBoxes(eastl::unique_ptr<scene::TiledScene> &&boxes) { restrictionBoxesScene = eastl::move(boxes); }
@@ -6874,7 +6502,7 @@ bool WorldRenderer::getBoxAround(const Point3 &position, TMatrix &box) const
     mat44f invMat;
     v_mat44_inverse43(invMat, m);
     vec3f localPos = v_abs(v_mat44_mul_vec3p(invMat, lightPos));
-    if ((v_signmask(v_cmp_gt(V_C_HALF, localPos)) & 0b111) != 0b111)
+    if (!v_check_xyz_all_true(v_cmp_gt(V_C_HALF, localPos)))
       return;
     vec4f vDist = v_min(localPos, v_min(v_splat_y(localPos), v_splat_z(localPos))); // result is in the x component
     float value = v_extract_x(vDist);
@@ -6919,10 +6547,6 @@ bool WorldRenderer::isThinGBuffer() const
   return thinGBuffer;
 }
 
-bool WorldRenderer::isForwardRender() const { return hasFeature(FeatureRenderFlags::FORWARD_RENDERING); }
-
-bool WorldRenderer::isMobileDeferred() const { return hasFeature(FeatureRenderFlags::MOBILE_DEFERRED); }
-
 bool WorldRenderer::isSSREnabled() const
 {
   return ::dgs_get_settings()->getBlockByNameEx("graphics")->getBool("ssr_enabled", true) && hasFeature(FeatureRenderFlags::SSR) &&
@@ -6935,8 +6559,6 @@ bool WorldRenderer::isLowResLUT() const { return ::dgs_get_settings()->getBlockB
 
 WorldRenderer::GiQuality WorldRenderer::getGiQuality() const
 {
-  if (isForwardRender())
-    return {GiAlgorithm::OFF, 0};
   auto getGiAlgorithm = [](const char *a, GiAlgorithm def = GiAlgorithm::MEDIUM) -> GiAlgorithm {
     if (!a)
       return def;
@@ -6980,9 +6602,8 @@ void WorldRenderer::changePreset()
 #if DAGOR_DBGLEVEL > 0
   const char *preset = ::dgs_get_settings()->getBlockByNameEx("graphics")->getStr("preset", "medium");
   const bool isMediumPreset = strcmp(preset, "medium") == 0;
-  // This shader interval is only assumed in _fast compile configs, so it's a good indicator.
-  // If this changes in the future and this assert triggers false, positives, tested variable should be changed.
-  const bool usesFastCompiledShaders = ShaderGlobal::is_var_assumed(antialiasing_typeVarId);
+  const bool usesFastCompiledShaders =
+    VariableMap::isVariablePresent(VariableMap::getVariableId("shaders_compiled_for_medium_preset"));
   // Fast compiled shaders are only usable with the medium preset.
   // If someone tries to modify graphics settings without compile fully shader configs, an error message can save a lot of headache
   G_ASSERTF(isMediumPreset || !usesFastCompiledShaders, "Fast compiled shaders only work with medium preset.\n"
@@ -6999,27 +6620,19 @@ void WorldRenderer::changePreset()
   onBareMinimumSettingsChanged();
 }
 
-static bool has_main_menu_tag(ecs::EntityId level_eid) { return g_entity_mgr->has(level_eid, ECS_HASH("menu_level")); }
-
 FeatureRenderFlagMask WorldRenderer::getOverridenRenderFeatures()
 {
   ecs::EntityId level_eid = ::get_current_level_eid();
   if (g_entity_mgr->getOr(level_eid, ECS_HASH("level__renderFeaturesOverrideFromLevelBlk"), false))
   {
-    if (has_main_menu_tag(level_eid))
-      return load_render_features(originalLevelBlk.getBlockByNameEx("renderFeatures"));
-    else
-      logerr("level has level__renderFeaturesOverrideFromLevelBlk:b=yes but misses menu_level:tag. Overrides are ignored");
+    return load_render_features(originalLevelBlk.getBlockByNameEx("renderFeatures"));
   }
   else if (
     const ecs::Object *overrides = g_entity_mgr->getNullable<ecs::Object>(level_eid, ECS_HASH("level__renderFeaturesOverrides")))
   {
     if (!overrides->empty())
     {
-      if (has_main_menu_tag(level_eid))
-        return apply_render_features_override(defaultFeatureRenderFlags, *overrides);
-      else
-        logerr("level has not empty level__renderFeaturesOverrides but misses menu_level:tag. Overrides are ignored");
+      return apply_render_features_override(defaultFeatureRenderFlags, *overrides);
     }
   }
 
@@ -7038,7 +6651,7 @@ void WorldRenderer::onBareMinimumSettingsChanged()
     return;
   bareMinimumPreset = bare_minimum;
   setWater(water);
-  setEnviromentDetailsQuality();
+  setEnvironmentDetailsQuality();
   setGIQualityFromSettings();
   resetSSAOImpl();
   initTarget();
@@ -7083,16 +6696,11 @@ void WorldRenderer::toggleFeatures(const FeatureRenderFlagMask &f, bool turn_on)
   changeFeatures(newFeatures);
 }
 
-void WorldRenderer::validateFeatures(FeatureRenderFlagMask &features, const FeatureRenderFlagMask &changed_features)
+void WorldRenderer::validateFeatures(FeatureRenderFlagMask &features, const FeatureRenderFlagMask &)
 {
-  if (changed_features.test(FeatureRenderFlags::FORWARD_RENDERING))
+  if (features.test(FeatureRenderFlags::SSR) && !features.test(FeatureRenderFlags::FULL_DEFERRED))
   {
-    logerr("forward is not toggleable in runtime");
-    features.flip(FeatureRenderFlags::FORWARD_RENDERING);
-  }
-  if (features.test(FeatureRenderFlags::SSR) && (isThinGBuffer() || isForwardRender()))
-  {
-    logerr("SSR currently not implemented for thinGBuffer and forward");
+    logerr("SSR currently not implemented for thinGBuffer");
     features.flip(FeatureRenderFlags::SSR);
   }
   // TODO: detect that other features toggling is not supported in special cases and disable them
@@ -7142,36 +6750,6 @@ void WorldRenderer::changeFeatures(const FeatureRenderFlagMask &f)
     recreateResettable |= true;
     reapplySettings |= true;
   }
-  else if (changedFeatures.test(FeatureRenderFlags::MOBILE_DEFERRED))
-  {
-    const char *sh_bindump_prefix = hasFeature(FeatureRenderFlags::MOBILE_DEFERRED)
-                                      ? ::dgs_get_settings()->getStr("deferredShaders", "compiledShaders/gameAndroidDeferred")
-                                      : ::dgs_get_settings()->getStr("forwardShaders", "compiledShaders/gameAndroidForward");
-    load_shaders_bindump_with_fence(sh_bindump_prefix, 5.0_sm);
-    rendinst::render::reinitOnShadersReload();
-    recreateResettable |= true;
-    reapplySettings |= true;
-
-    if (hasFeature(FeatureRenderFlags::MOBILE_DEFERRED))
-    {
-      mobileRp = MobileDeferredResources(get_frame_render_target_format(), get_gbuffer_depth_format(),
-        hasFeature(FeatureRenderFlags::MOBILE_SIMPLIFIED_MATERIALS));
-    }
-    else
-    {
-      mobileRp.destroy();
-    }
-  }
-  else if (changedFeatures.test(FeatureRenderFlags::MOBILE_SIMPLIFIED_MATERIALS))
-  {
-    recreateResettable |= true;
-    reapplySettings |= true;
-    mobileRp.initRenderPasses(get_frame_render_target_format(), get_gbuffer_depth_format(),
-      hasFeature(FeatureRenderFlags::MOBILE_SIMPLIFIED_MATERIALS));
-    initClipmap();
-  }
-
-  NodeBasedShaderManager::clearAllCachedResources();
 
   if (changedFeatures.test(FeatureRenderFlags::CLUSTERED_LIGHTS) || changedFeatures.test(FeatureRenderFlags::DYNAMIC_LIGHTS_SHADOWS))
   {
@@ -7195,7 +6773,7 @@ void WorldRenderer::changeFeatures(const FeatureRenderFlagMask &f)
   if (changedFeatures.test(FeatureRenderFlags::VOLUME_LIGHTS))
   {
     resetVolumeLights();
-    loadFogNodes(root_fog_graph, volumeLightLowRange, volumeLightHighRange, volumeLightLowHeight, volumeLightHighRange);
+    volfog_load_from_resources(root_fog_graph, volumeLightLowRange, volumeLightHighRange, volumeLightLowHeight, volumeLightHighHeight);
     reapplySettings |= true;
   }
 
@@ -7218,34 +6796,39 @@ void WorldRenderer::changeFeatures(const FeatureRenderFlagMask &f)
   if (changedFeatures.test(FeatureRenderFlags::CAMERA_IN_CAMERA))
   {
     recreateResettable |= true;
-    recreateFramegraph |= true;
     camera_in_camera::setup(hasFeature(CAMERA_IN_CAMERA));
   }
 
+  if (changedFeatures.test(FeatureRenderFlags::GBUFFER_PACKED_NORMALS) || changedFeatures.test(FeatureRenderFlags::CAMERA_IN_CAMERA))
+    recreateFramegraph |= true;
+
   // VolumetricLightsNode depends on UPSCALE_SAMPLING_TEX which changed by presets
   if (changedFeatures.test(FeatureRenderFlags::UPSCALE_SAMPLING_TEX))
-    createVolumetricLightsNode();
+    recreateFramegraph |= true;
+
+  g_entity_mgr->broadcastEventImmediate(ChangeRenderFeaturesEarly{});
 
   if (recreateResettable)
   {
     closeResetable();
     initResetable();
-    setSpecularCubesContainerForReinit();
-    reinitCube();
+    scheduleEnviProbeFullReload();
   }
 
   if (reapplySettings)
     applySettingsChanged();
   else if (recreateFramegraph)
-    createFramegraphNodes();
+  {
+    requestFgRecreation("changeFeatures");
+  }
 
   updateDistantHeightmap(); // currently it depends on distant fog
 
   if (changedFeatures.test(FeatureRenderFlags::SPECULAR_CUBES))
-    invalidateCube();
+    scheduleEnviProbeFullReload();
 
   if (changedFeatures.test(FeatureRenderFlags::UPSCALE_SAMPLING_TEX) || changedFeatures.test(FeatureRenderFlags::TAA))
-    createTransparentParticlesNode();
+    requestFgRecreation("changeFeatures: UPSCALE_SAMPLING_TEX or TAA");
 
   if (changedFeatures.test(FeatureRenderFlags::FOM_SHADOWS))
     changeStateFOMShadows();
@@ -7261,7 +6844,6 @@ void WorldRenderer::requestDepthAboveRenderTransparent()
 {
   if (depthAOAboveCtx && transparentDepthAOAboveRequests == 0)
   {
-    invalidateNodeBasedResources();
     depthAOAboveCtx.reset(nullptr);
     depthAOAboveCtx =
       eastl::make_unique<DepthAOAboveContext>(DEPTH_AROUND_TEX_SIZE, DEPTH_AROUND_DISTANCE, needTransparentDepthAOAbove);
@@ -7273,7 +6855,6 @@ void WorldRenderer::revokeDepthAboveRenderTransparent()
 {
   if (depthAOAboveCtx && transparentDepthAOAboveRequests == 1)
   {
-    invalidateNodeBasedResources();
     depthAOAboveCtx.reset(nullptr);
     depthAOAboveCtx = eastl::make_unique<DepthAOAboveContext>(DEPTH_AROUND_TEX_SIZE, DEPTH_AROUND_DISTANCE, false);
   }
@@ -7285,8 +6866,8 @@ int WorldRenderer::getDynamicResolutionTargetFps() const { return dynamicResolut
 BaseTexture *WorldRenderer::initAndGetHZBUploadStagingTex()
 {
   if (!hzbUploadStagingTex)
-    hzbUploadStagingTex =
-      dag::create_tex(nullptr, OCCLUSION_W + (OCCLUSION_W >> 1), OCCLUSION_H, TEXFMT_R32F | TEXCF_DYNAMIC, 1, "hzb_readback_staging");
+    hzbUploadStagingTex = dag::create_tex(nullptr, OcclusionZBuffer::WIDTH + (OcclusionZBuffer::WIDTH >> 1), OcclusionZBuffer::HEIGHT,
+      TEXFMT_R32F | TEXCF_DYNAMIC, 1, "hzb_readback_staging");
   return hzbUploadStagingTex.getTex2D();
 }
 
@@ -7304,33 +6885,36 @@ webui::HttpPlugin *get_renderer_http_plugins()
 {
   http_renderer_plugins[0] = get_fog_shader_graph_editor_http_plugin();
   http_renderer_plugins[1] = get_envi_cover_shader_graph_editor_http_plugin();
+  http_renderer_plugins[2] = get_clouds_shader_graph_editor_http_plugin();
   return http_renderer_plugins;
 }
 
-
-bool fog_shader_compiler(uint32_t variant_id, const String &name, const String &code, const DataBlock &shader_blk, String &out_errors)
+static String getShaderNameWithPath(const String &name)
 {
-  G_UNUSED(variant_id);
-  G_UNUSED(code);
-  G_UNUSED(out_errors);
-
-  char buf[300];
-  const char *shaderBinaryDir = dd_get_fname_location(buf, root_fog_graph.str());
-
-  return world_renderer->volumeLight->updateShaders(String(0, "%s/%s", shaderBinaryDir, name), shader_blk, out_errors);
-}
-
-bool envi_cover_shader_compiler(
-  uint32_t variant_id, const String &name, const String &code, const DataBlock &shader_blk, String &out_errors)
-{
-  G_UNUSED(variant_id);
-  G_UNUSED(code);
-  G_UNUSED(out_errors);
-
   char buf[300];
   const char *shaderBinaryDir = dd_get_fname_location(buf, root_envi_cover_graph.str());
+  return String(0, "%s/%s", shaderBinaryDir, name);
+}
 
-  return world_renderer->enviCover->updateShaders(String(0, "%s/%s", shaderBinaryDir, name), shader_blk, out_errors);
+bool fog_shader_compiler(const String &name, const DataBlock &shader_blk, String &out_errors)
+{
+  return world_renderer->volumeLight->updateShaders(getShaderNameWithPath(name), shader_blk, out_errors);
+}
+
+bool envi_cover_shader_compiler(const String &name, const DataBlock &shader_blk, String &out_errors)
+{
+  return world_renderer->enviCover->updateShaders(getShaderNameWithPath(name), shader_blk, out_errors);
+}
+
+bool clouds_shader_compiler(const String &name, const DataBlock &shader_blk, String &out_errors)
+{
+  DaSkies *skies = get_daskies();
+  if (!skies)
+  {
+    out_errors = "no skies";
+    return false;
+  }
+  return skies->updateCloudsNBSShaders(getShaderNameWithPath(name), shader_blk, out_errors);
 }
 #endif // HAS_SHADER_GRAPH_COMPILE_SUPPORT
 
@@ -7340,12 +6924,6 @@ bool has_renderer_http_plugins_requirements()
   if (!dd_dir_exists("../develop/assets/loc_shaders"))
   {
     debug("has_renderer_http_plugins_requirements: develop/assets/loc_shaders does not exist, shader_recompiler disabled");
-    return false;
-  }
-
-  if (!dd_dir_exists("../../tools/dagor_cdk/commonData/graphEditor"))
-  {
-    debug("has_renderer_http_plugins_requirements: tools/dagor_cdk/commonData/graphEditor does not exist, shader_recompiler disabled");
     return false;
   }
 
@@ -7399,7 +6977,36 @@ void init_envi_cover_graph_plugin()
 #endif
 }
 
-IRenderWorld *create_world_renderer() { return world_renderer.demandInit(); }
+void init_clouds_shader_graph_plugin()
+{
+#if HAS_SHADER_GRAPH_COMPILE_SUPPORT
+  if (!has_renderer_http_plugins_requirements())
+    return;
+
+  if (root_clouds_graph.empty())
+  {
+    debug("init_clouds_shader_graph_plugin: root_clouds_graph is empty");
+    return;
+  }
+
+  char name_buf[260];
+  const char *shadersFolderName = ::dgs_get_game_params()->getStr("nodeBasedShadersFolder", "common");
+  String rootGraphFileName(0, "../develop/assets/loc_shaders/%s/%s.json", shadersFolderName,
+    dd_get_fname_without_path_and_ext(name_buf, sizeof(name_buf), root_clouds_graph));
+
+  NodeBasedShaderManager::initCompilation();
+  ShaderGraphRecompiler::initialize(NodeBasedShaderType::Clouds, clouds_shader_compiler, rootGraphFileName);
+#endif
+}
+
+IRenderWorld *create_world_renderer()
+{
+  const bool isFirstInit = !world_renderer;
+  WorldRenderer *wr = world_renderer.demandInit();
+  if (wr && isFirstInit)
+    g_entity_mgr->broadcastEventImmediate(OnWorldRendererCreated{});
+  return wr;
+}
 
 void destroy_world_renderer() { world_renderer.demandDestroy(); }
 
@@ -7434,7 +7041,7 @@ void term_renderer_per_game()
 }
 
 #if _TARGET_PC_WIN
-void send_gpu_net_event(const char *event_name, GpuVendor gpu_vendor, const uint32_t *drv_ver)
+void send_gpu_net_event(const char *event_name, GpuVendor gpu_vendor, const DriverVersion *drv_ver)
 {
   static const char EVENT_LOG_COLLECTION_NAME[] = "enl_events"; // name is predefined on backend. Contact ops if you want to change it
   Json::Value meta;
@@ -7445,8 +7052,10 @@ void send_gpu_net_event(const char *event_name, GpuVendor gpu_vendor, const uint
   {
     Json::Value &jver = meta[Json::StaticString{"vid_drv_ver"}];
     jver.resize(4);
-    for (Json::ArrayIndex i = 0; i < 4; ++i)
-      jver[i] = drv_ver[i];
+    jver[0] = drv_ver->product;
+    jver[1] = drv_ver->major;
+    jver[2] = drv_ver->minor;
+    jver[3] = drv_ver->build;
   }
   meta["event"] = "gpu_event";
   event_log::send_udp(EVENT_LOG_COLLECTION_NAME, nullptr, 0, &meta);
@@ -7459,7 +7068,9 @@ static void verify_driver_caps()
   if (d3d::get_driver_code().is(d3d::dx12 || d3d::vulkan)) // these drivers did all the testing at init.
     return;
 
-  if (d3d::get_driver_desc().shaderModel < 5.0_sm)
+  auto &drvDesc = d3d::get_driver_desc();
+
+  if (drvDesc.shaderModel < 5.0_sm)
   {
     send_gpu_net_event("not_dx11_hw", GpuVendor::UNKNOWN, nullptr);
     os_message_box("This game requires a DirectX 11 compatible video card.", "Initialization error", GUI_MB_OK | GUI_MB_ICON_ERROR);
@@ -7467,25 +7078,23 @@ static void verify_driver_caps()
   }
 
   const GpuUserConfig &gcfg = d3d_get_gpu_cfg();
-  String drv_str(128, "vendor %d: driver version [%d] [%d] [%d] [%d]", eastl::to_underlying(gcfg.primaryVendor), gcfg.driverVersion[0],
-    gcfg.driverVersion[1], gcfg.driverVersion[2], gcfg.driverVersion[3]);
-  debug("%s", drv_str.str());
+  debug("vendor %s: driver version: %s", d3d_get_vendor_name(drvDesc.info.vendor), drvDesc.info.driverVersion.toString().c_str());
 
-  if (gcfg.primaryVendor == GpuVendor::AMD &&
-      (gcfg.driverVersion[0] <= 8 && gcfg.driverVersion[1] <= 17 && gcfg.driverVersion[2] <= 10 &&
-        gcfg.driverVersion[3] <= 1404 /* this driver version found empirically */) &&
-      !(gcfg.driverVersion[0] == 0 && gcfg.driverVersion[1] == 0 && gcfg.driverVersion[2] == 0 &&
-        gcfg.driverVersion[3] == 0 /* driver version was not detected at all */))
+  if (drvDesc.info.vendor == GpuVendor::AMD &&                        //
+      drvDesc.info.driverVersion <= DriverVersion{8, 17, 10, 1404} && // this driver version found empirically
+      drvDesc.info.driverVersion != DriverVersion{})                  // driver version was not detected at all
   {
-    send_gpu_net_event("old_amd_vid_drv", gcfg.primaryVendor, gcfg.driverVersion);
+    send_gpu_net_event("old_amd_vid_drv", drvDesc.info.vendor, &drvDesc.info.driverVersion);
     if (!dgs_execute_quiet)
+    {
       os_message_box("The driver for this AMD videocard is outdated. Install Catalyst 16.X.X+ driver (at least Beta version)",
         "Initialization error", GUI_MB_OK | GUI_MB_ICON_ERROR);
+    }
     breakpad::shutdown(); // allow to continue, but don't report fatals in this case
   }
-  if (gcfg.outdatedDriver || gcfg.disableUav)
+  if (gcfg.outdatedDriver || !drvDesc.caps.hasProperUAVSupport)
   {
-    send_gpu_net_event("old_vid_drv", gcfg.primaryVendor, gcfg.driverVersion);
+    send_gpu_net_event("old_vid_drv", drvDesc.info.vendor, &drvDesc.info.driverVersion);
     if (!dgs_execute_quiet)
     {
       const char *address = "https://support.gaijin.net/hc/articles/4405867465489";
@@ -7506,6 +7115,90 @@ static void verify_driver_caps()
 #endif
 }
 
+static void recommend_gpu_driver_switch()
+{
+#if _TARGET_PC_WIN
+  if (dgs_execute_quiet)
+    return;
+
+  const DriverCode recommended = d3d_get_gpu_driver_switch_hint();
+  const DataBlock *videoBlk = dgs_get_settings()->getBlockByNameEx("video");
+  const int runCounter = videoBlk->getInt("gpuDriverHintCounter", 0);
+
+  if (recommended == d3d::undefined)
+  {
+    if (runCounter != 0)
+    {
+      get_settings_override_blk()->addBlock("video")->setInt("gpuDriverHintCounter", 0);
+      save_settings(nullptr, false);
+    }
+    return;
+  }
+
+  if (runCounter % 30 == 0)
+  {
+    const char *hintText =
+      recommended.is(d3d::dx12)
+        ? get_localized_text("video/recommend_dx12",
+            "Your GPU performs best with the DirectX 12 graphics API. You can change it in the graphics options.")
+        : get_localized_text("video/recommend_dx11",
+            "Your GPU performs best with the DirectX 11 graphics API. You can change it in the graphics options.");
+    os_message_box(hintText, get_localized_text("video/header512", "Video"), GUI_MB_OK | GUI_MB_ICON_INFORMATION);
+  }
+
+  get_settings_override_blk()->addBlock("video")->setInt("gpuDriverHintCounter", runCounter + 1);
+  save_settings(nullptr, false);
+#endif
+}
+
+shadercache::WarmupParams get_shader_warmup_params()
+{
+  const bool supportsRT = d3d::get_driver_desc().caps.hasRayQuery;
+  const bool hasTess = d3d::get_driver_desc().caps.hasQuadTessellation;
+  const bool hasHalfPrecision = d3d::get_driver_desc().caps.hasShaderFloat16Support;
+  const bool supportsR8UavLoad = d3d::get_texformat_usage(TEXFMT_R8 | TEXCF_UNORDERED) & d3d::USAGE_UNORDERED_LOAD;
+  const bool supportsR11G11B10FUavLoad = d3d::get_texformat_usage(TEXFMT_R11G11B10F | TEXCF_UNORDERED) & d3d::USAGE_UNORDERED_LOAD;
+  const bool supportIrradGridUnorderedLoad =
+    (d3d::get_texformat_usage(TEXFMT_A8R8G8B8 | TEXCF_UNORDERED) & d3d::USAGE_UNORDERED_LOAD) &&
+    (d3d::get_texformat_usage(TEXFMT_A16B16G16R16F | TEXCF_UNORDERED) & d3d::USAGE_UNORDERED_LOAD);
+  const bool supportLitSceneUnorderedLoad = supportsR8UavLoad && supportsR11G11B10FUavLoad;
+
+  shadercache::WarmupParams params{};
+  params.invalidVars = {{"use_hw_rt_gi", supportsRT ? 0 : 1},  //
+    {"world_sdf_support_uav_load", supportsR8UavLoad ? 0 : 1}, //
+    {"can_use_half_precision", hasHalfPrecision ? 0 : 1},      //
+    {"use_satellite_rendering", 1},                            // not needed for release builds
+    {"water_tess_factor", hasTess ? 0 : 1},                    // if we have tesselation support, by default it will be used in water
+    {"dagi_rad_grid_support_uav_load", supportsR11G11B10FUavLoad ? 0 : 1}};
+
+  if (!supportsRT)
+  {
+    params.invalidVars.push_back({"water_rt_enabled", 1});
+    params.invalidVars.push_back({"water_refraction_tex", 0});
+  }
+
+  if ((get_water_quality() >= 2) && dgs_get_settings()->getBlockByNameEx("graphics")->getBool("useFoamFx", false))
+    params.invalidVars.push_back({"wfx_effects_tex_enabled", 0}); // will always have wfx_effects_tex under this condition
+
+  if (!supportIrradGridUnorderedLoad)
+  {
+    params.shadersToSkip = {
+      "dagi_irradiance_grid_toroidal_movement_interpolate_cs",
+      "dagi_irradiance_grid_toroidal_movement_trace_cs",
+      "dagi_irradiance_grid_spatial_filter_cs",
+      "dagi_irradiance_grid_calc_temporal_cs",
+    };
+  }
+
+  if (!supportsR11G11B10FUavLoad)
+    params.shadersToSkip.push_back("dagi_radiance_grid_calc_temporal_cs");
+
+  if (!supportLitSceneUnorderedLoad)
+    params.shadersToSkip.push_back("dagi_voxel_lit_scene_from_gbuf_cs");
+
+  return params;
+}
+
 void init_world_renderer()
 {
 #if _TARGET_PC_WIN
@@ -7513,6 +7206,7 @@ void init_world_renderer()
 #endif
 
   verify_driver_caps();
+  recommend_gpu_driver_switch();
 
 #if _TARGET_PC
   // only PC integrated videocards tend to have low VRAM amounts
@@ -7562,7 +7256,10 @@ void init_world_renderer()
     load_pso_cache(get_exe_version_str());
   }
   else
-    shadercache::warmup_shaders_from_settings(true /*is_loadindg_thread*/);
+  {
+    shadercache::WarmupParams params = get_shader_warmup_params();
+    shadercache::warmup_shaders_from_settings(params, true /*is_loadindg_thread*/, false /*backgroundWarmup*/);
+  }
 
   dafg::startup(); // Note: FG might be referenced before world rendered creation from ecs code
 
@@ -7607,11 +7304,234 @@ bool is_point_under_water(const Point3 &point)
 static constexpr char const *WR_WAS_NULL_ERR_MSG = "Tried to access WorldRenderer components "
                                                    "when WorldRenderer did not exist!";
 
+bool WRDispatcher::needSeparatedUI()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->needSeparatedUI();
+}
+
+bool WRDispatcher::needMotionVectors()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->needMotionVectors();
+}
+
+bool WRDispatcher::isUpsampling()
+{
+  if (isReadyToUse())
+    return static_cast<WorldRenderer *>(get_world_renderer())->isUpsampling();
+  return false;
+}
+
+int WRDispatcher::getCurrentAntiAliasingMode()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return static_cast<int>(wr->getAntiAliasingMode()); //-V522
+}
+
+CameraParams &WRDispatcher::getCurrentCameraParams()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->currentFrameCamera; //-V522
+}
+
+const CameraParams &WRDispatcher::getPreviousCameraParams()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->prevFrameCamera; //-V522
+}
+
+const CameraParams &WRDispatcher::getCurrentCockpitCameraParams()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->cockpitCameraParams; //-V522
+}
+
+int WRDispatcher::getTemporalShadowFramesCount()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->getTemporalShadowFramesCount(); //-V522
+}
+
+void WRDispatcher::updateTransformations(const DPoint3 &move,
+  const TMatrix4_vec4 &jittered_cam_pos_to_unjittered_history_clip,
+  const TMatrix4_vec4 &prev_origo_relative_view_proj_tm)
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  wr->updateTransformations(move, jittered_cam_pos_to_unjittered_history_clip, prev_origo_relative_view_proj_tm);
+}
+
+CameraViewVisibilityMgr *WRDispatcher::getMainCameraVisibilityMgr()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return &wr->mainCameraVisibilityMgr; //-V522
+}
+
+HeroWtmAndBox &WRDispatcher::getHeroData()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->heroData; //-V522
+}
+
+float WRDispatcher::getDaGdpRangeScale()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->daGdpRangeScale; //-V522
+}
+
+float WRDispatcher::getLodDistanceScaleBase()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->lodDistanceScaleBase; //-V522
+}
+
+SkiesData *WRDispatcher::getMainPovSkiesData()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->main_pov_data; //-V522
+}
+
+const ManagedTex &WRDispatcher::getFinalTargetFrame()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return *wr->finalTargetFrame; //-V522
+}
+
 bool WRDispatcher::isReadyToUse() { return get_world_renderer() != nullptr; }
 
 bool WRDispatcher::hasHighResFx()
 {
   return static_cast<WorldRenderer *>(get_world_renderer())->getFxRtOverride() == FX_RT_OVERRIDE_HIGHRES;
+}
+
+bool WRDispatcher::isStencilGbufRequired()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->stencilGbufRequired;
+}
+
+IPoint2 WRDispatcher::getSubSuperPixels()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return IPoint2(wr->superPixels, wr->subPixels); //-V522
+}
+
+Point3 WRDispatcher::getSunDirection()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->dir_to_sun.curr; //-V522
+}
+
+Color3 WRDispatcher::getSunColor()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->sun; //-V522
+}
+
+const DataBlock *WRDispatcher::getLevelSettings()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->getLevelSettings(); //-V522
+}
+
+float WRDispatcher::GetWaterLevel()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->water ? fft_water::get_level(wr->water) : HeightmapHeightCulling::NO_WATER_ON_LEVEL;
+}
+
+WaterRenderMode WRDispatcher::getWaterRenderMode()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->getWaterRenderMode(); //-V522
+}
+
+bool WRDispatcher::isCameraBelowClouds()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->isCameraBelowClouds(); //-V522
+}
+
+void WRDispatcher::getDisplayResolution(int &w, int &h)
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  wr->getDisplayResolution(w, h); //-V522
+}
+
+void WRDispatcher::getDownsampledDepthParams(uint32_t &downsampledTexturesMipCount, bool &storeDownsampledTexturesInEsram)
+{
+  downsampledTexturesMipCount = 1;
+  storeDownsampledTexturesInEsram = false;
+
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+
+  downsampledTexturesMipCount = wr->downsampledTexturesMipCount;
+  storeDownsampledTexturesInEsram = wr->storeDownsampledTexturesInEsram;
+}
+
+float WRDispatcher::getGameTime()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->gameTime; //-V522
+}
+float WRDispatcher::getRealDeltaTime()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->realDeltaTime; //-V522
+}
+
+EnviCover *WRDispatcher::getEnviCover()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->enviCover.get(); //-V522
+}
+
+bool WRDispatcher::isEnviCover()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->isEnviCover; //-V522
+}
+
+bool WRDispatcher::isEnviCoverCompatible()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->isEnviCoverCompatible; //-V522
+}
+
+AntiAliasing *WRDispatcher::getAntialiasing()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+  return wr->antiAliasing.get(); //-V522
 }
 
 ShadowsManager &WRDispatcher::getShadowsManager()
@@ -7661,6 +7581,13 @@ VolumeLight *WRDispatcher::getVolumeLight()
   auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
   G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
   return wr->volumeLight.get(); //-V522
+}
+
+Clipmap *WRDispatcher::getClipmap()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERTF_RETURN(wr != nullptr, nullptr, WR_WAS_NULL_ERR_MSG);
+  return wr->getClipmap(); //-V522
 }
 
 LandMeshManager *WRDispatcher::getLandMeshManager()
@@ -7751,6 +7678,13 @@ bool WRDispatcher::shouldHideGui()
   return wr && wr->applySettingsAfterResetDevice && wr->needSeparatedUI();
 }
 
+bool WRDispatcher::isBareMinimum()
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERTF_RETURN(wr != nullptr, false, WR_WAS_NULL_ERR_MSG);
+  return wr->getBareMinimumPreset();
+}
+
 bool WRDispatcher::usesDepthPrepass() { return prepass.get(); }
 
 void WRDispatcher::updateWorldBBox(const BBox3 &additional_bbox)
@@ -7767,17 +7701,13 @@ void WRDispatcher::recreateRayTracingDependentNodes(uint32_t features_to_reset)
     return;
 
   bool needSetResolution = false;
-  if (::dgs_get_settings()->getBlockByNameEx("video")->getBlockByNameEx("dynamicResolution")->getInt("targetFPS", 0) > 0)
-  {
-    if (features_to_reset & WRDispatcher::DYNAMIC_RESOLUTION)
-      needSetResolution |= true;
-  }
-
   if (wr->hasMotionVectors != wr->needMotionVectors())
-  {
-    if (features_to_reset & WRDispatcher::MOTION_VECTOR)
-      needSetResolution |= true;
-  }
+    needSetResolution |= true;
+  // DLSS RR needs a device reset anyway, so we should avoid doing it twice.
+  // This code is still needed, because on startup DLSS RR might be on
+  // but RT wasn't initialized yet, so nodes were created wrong.
+  if (features_to_reset & WRDispatcher::REINIT_TARGET && !wr->applySettingsAfterResetDevice)
+    needSetResolution |= true;
 
   if (needSetResolution)
     wr->setResolution();
@@ -7791,6 +7721,11 @@ void WRDispatcher::recreateRayTracingDependentNodes(uint32_t features_to_reset)
     wr->setSettingsSSR();
 }
 
+ECS_REGISTER_EVENT(GatherSplinegenBVHDataEvent);
+ECS_REGISTER_EVENT(OnCameraMainViewNodeConstruction);
+ECS_REGISTER_EVENT(OnCameraPerViewNodeConstruction);
+ECS_REGISTER_EVENT(GatherSmokeTracersBVHDataEvent);
+ECS_REGISTER_EVENT(RemoveSplinegenBVHEvent);
 ECS_REGISTER_EVENT(AfterRenderWorld)
 ECS_REGISTER_EVENT(RenderPostFx)
 ECS_REGISTER_EVENT(BeforeDrawPostFx)
@@ -7803,14 +7738,63 @@ ECS_REGISTER_EVENT(QueryUnexpectedAltitudeChange)
 ECS_REGISTER_EVENT(CustomSkyRender);
 ECS_REGISTER_EVENT(CustomDmPanelRender);
 ECS_REGISTER_EVENT(ResetAoEvent);
+ECS_REGISTER_EVENT(ResetAoNodes);
+ECS_REGISTER_EVENT(ResetSsrNodes);
 ECS_REGISTER_EVENT(BeforeLoadLevel);
-ECS_REGISTER_EVENT(OnLevelLoaded);
+ECS_REGISTER_EVENT(EventRenderSceneLoaded);
 ECS_REGISTER_EVENT(UpdateStageInfoBeforeRender);
 ECS_REGISTER_EVENT(UpdateStageInfoRender);
 ECS_REGISTER_EVENT(UpdateStageInfoRenderTrans);
 ECS_REGISTER_EVENT(QueryHeroWtmAndBoxForRender);
 ECS_REGISTER_EVENT(AfterHeightmapChange);
-ECS_REGISTER_EVENT(RenderReinitCube);
 ECS_REGISTER_EVENT(BeforeDraw);
 
 bool have_renderer() { return true; }
+
+#if DAGOR_DBGLEVEL > 0
+void WRDispatcher::reloadMainPovSkiesData(bool use_compute)
+{
+  auto *wr = static_cast<WorldRenderer *>(get_world_renderer());
+  G_ASSERT_AND_DO(wr != nullptr, DAG_FATAL(WR_WAS_NULL_ERR_MSG));
+
+  wr->resetMainSkies(get_daskies());
+
+  get_daskies()->overrideSkiesDataCloudsUseCompute(wr->main_pov_data, use_compute);
+}
+
+static bool clouds_debug_console_handler(const char *argv[], int argc)
+{
+  int found = 0;
+  CONSOLE_CHECK_NAME("clouds", "enable_compute", 1, 2)
+  {
+    if (d3d::get_driver_desc().shaderModel >= 5.0_sm)
+    {
+      bool useCompute = true;
+      if (argc == 1)
+      {
+        console::print_d("usage: clouds.enable_compute true or clouds.enable_compute false");
+      }
+      else if (argc >= 2)
+      {
+        useCompute = console::to_bool(argv[1]);
+      }
+
+      auto mainPovData = WRDispatcher::getMainPovSkiesData();
+      if (mainPovData)
+      {
+        d3d::GpuAutoLock gpuLock;
+        SCOPE_RESET_SHADER_BLOCKS;
+
+        WRDispatcher::reloadMainPovSkiesData(useCompute);
+      }
+    }
+    else
+    {
+      console::print_d("command is not available for systems with no compute shaders");
+    }
+  }
+
+  return found;
+}
+REGISTER_CONSOLE_HANDLER(clouds_debug_console_handler);
+#endif

@@ -33,7 +33,7 @@ Texture *create_phys_map_ht_tex(PhysMapTexData *data)
 {
   if (!data)
     return NULL;
-  Texture *tex = d3d::create_tex(NULL, TEXSIZE, TEXSIZE, data->texFmt, 1, "physMatHt");
+  Texture *tex = d3d::create_tex(NULL, TEXSIZE, TEXSIZE, data->texFmt, 1, "physMatHt", RESTAG_PHYSMAP);
   if (!tex)
   {
     logerr("can not create physmatht texture");
@@ -65,10 +65,11 @@ Texture *create_phys_map_ht_tex(PhysMapTexData *data)
 
 #define FILL_TWO_TEXELS_WITH_0 2
 
-PhysMapTexData *render_phys_map_ht_data(const PhysMap &phys_map, const BBox2 &region, float &maxHt, float ht_scale, bool apply_decals)
+PhysMapTexData *render_phys_map_ht_data(const PhysMap &phys_map, const BBox2 &region, float &maxHt, float ht_scale, bool apply_decals,
+  bool force_r8)
 {
   uint32_t texFmt = TEXFMT_ATI1N;
-  if (!(d3d::get_texformat_usage(texFmt) & d3d::USAGE_VERTEXTEXTURE))
+  if (!(d3d::get_texformat_usage(texFmt) & d3d::USAGE_VERTEXTEXTURE) || force_r8)
   {
     if (!(d3d::get_texformat_usage(TEXFMT_R8) & d3d::USAGE_VERTEXTEXTURE))
     {

@@ -13,8 +13,8 @@ CONSOLE_INT_VAL("clouds", weather_resolution, 128, 64, 768); // for 65536 meters
 void GenWeather::init()
 {
   clouds_weather_texture.close();
-  clouds_weather_texture = dag::create_tex(NULL, size, size, TEXCF_RTARGET | CLOUDS_ESRAM_ONLY, 1, "clouds_weather_texture");
-  ShaderGlobal::set_sampler(::get_shader_variable_id("clouds_weather_texture_samplerstate"), d3d::request_sampler({}));
+  clouds_weather_texture =
+    dag::create_tex(NULL, size, size, TEXCF_RTARGET | CLOUDS_ESRAM_ONLY, 1, "clouds_weather_texture", RESTAG_DASKIES2);
   gen_weather.init("gen_weather");
   invalidate();
 }
@@ -33,8 +33,8 @@ CloudsChangeFlags GenWeather::render()
   if (externalWeatherTexture == BAD_TEXTUREID)
   {
     SCOPE_RENDER_TARGET;
-    d3d::set_render_target(clouds_weather_texture.getTex2D(), 0);
-    d3d::clearview(CLEAR_DISCARD_TARGET, 0, 0, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{clouds_weather_texture.getTex2D(), 0, 0}});
+    d3d::clearview(DISCARD_TARGET, 0, 0, 0);
     gen_weather.render();
     d3d::resource_barrier({clouds_weather_texture.getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL | RB_STAGE_COMPUTE, 0, 0});
   }

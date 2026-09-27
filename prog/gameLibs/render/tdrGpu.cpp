@@ -6,7 +6,9 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0501
 #endif
+#define PSAPI_VERSION 2
 #include <windows.h>
+#include <Psapi.h> // GetProcessMemoryInfo
 #endif
 #include <supp/dag_cpuControl.h>
 
@@ -40,18 +42,19 @@ void dump_tdr_settings()
   }
 }
 
-void dump_proc_memory()
+unsigned dump_proc_memory()
 {
-  MEMORYSTATUSEX ms;
-  ms.dwLength = sizeof(ms);
-  if (GlobalMemoryStatusEx(&ms))
-  {
-#define MB (1 << 20)
-    debug("CPU memory (available/total MB) phys:%u/%u, page:%u/%u, virtual:%u/%u", (uint32_t)(ms.ullAvailPhys / MB),
-      (uint32_t)(ms.ullTotalPhys / MB), (uint32_t)(ms.ullAvailPageFile / MB), (uint32_t)(ms.ullTotalPageFile / MB),
-      (uint32_t)(ms.ullAvailVirtual / MB), (uint32_t)(ms.ullTotalVirtual / MB));
-#undef MB
-  }
+#define TO_MB(x) uint32_t((x) >> 20)
+  MEMORYSTATUSEX ms{sizeof(MEMORYSTATUSEX)};
+  GlobalMemoryStatusEx(&ms);
+  PROCESS_MEMORY_COUNTERS_EX pmc = {sizeof(PROCESS_MEMORY_COUNTERS_EX)};
+  GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc));
+  debug("Sys (MB): avail/total %u/%u (load %u%%); Commit avail/limit: %u/%u; "
+        "Proc (MB): working set/peak/commit %u/%u/%u",
+    TO_MB(ms.ullAvailPhys), TO_MB(ms.ullTotalPhys), ms.dwMemoryLoad, TO_MB(ms.ullAvailPageFile), TO_MB(ms.ullTotalPageFile),
+    TO_MB(pmc.WorkingSetSize), TO_MB(pmc.PeakWorkingSetSize), TO_MB(pmc.PrivateUsage));
+  return TO_MB(ms.ullAvailPageFile);
+#undef TO_MB
 }
 
 void dump_gpu_memory()
@@ -89,7 +92,7 @@ void dump_gpu_freq() {}
 void dump_gpu_temperature() {}
 #else
 void dump_tdr_settings() {}
-void dump_proc_memory() {}
+unsigned dump_proc_memory() { return ~0u; }
 void dump_gpu_memory() {}
 void dump_gpu_freq() {}
 void dump_gpu_temperature() {}
@@ -98,14 +101,24 @@ void dump_gpu_temperature() {}
 void dump_periodic_gpu_info()
 {
 #if (_TARGET_PC_WIN || _TARGET_XBOX)
-  static constexpr int TEMPERATURE_PERIOD_MSEC = 60000;
-  static int nextTemperatureTime = 0;
-  if (get_time_msec() > nextTemperatureTime)
+  static int nextProcMemDumpTime = 0, nextTempDumpTime = 0;
+  int timeNow = get_time_msec();
+  if (timeNow >= nextTempDumpTime)
   {
-    nextTemperatureTime = get_time_msec() + TEMPERATURE_PERIOD_MSEC;
+    nextTempDumpTime = timeNow + 60000;
     dump_gpu_temperature();
-    dump_proc_memory();
     dump_gpu_memory();
+  }
+  if (timeNow >= nextProcMemDumpTime)
+  {
+    if (unsigned commitAvailMB = dump_proc_memory(); commitAvailMB > 3072) // To consider: tune these consts for XB1
+      nextProcMemDumpTime = timeNow + 60000;
+    else if (commitAvailMB > 2048)
+      nextProcMemDumpTime = timeNow + 15000;
+    else if (commitAvailMB > 1024)
+      nextProcMemDumpTime = timeNow + 10000;
+    else // <= 1024
+      nextProcMemDumpTime = timeNow + 5000;
   }
 #endif
 }

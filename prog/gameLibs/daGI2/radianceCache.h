@@ -8,6 +8,7 @@
 #include <shaders/dag_computeShaders.h>
 #include <math/dag_Point3.h>
 #include <math/integer/dag_IPoint3.h>
+#include <render/voxelClip.h>
 
 class RingCPUBufferLock;
 
@@ -61,32 +62,24 @@ protected:
   void initAtlasInternal(int probes_w, int probes_h, int probe_oct_size);
   int validateCache(const char *step);
   float getProbeSizeClip(uint32_t clip) const { return probeSize0 * (1 << clip); }
-  IPoint3 getNewClipCenter(uint32_t clip, const Point3 &world_pos) const
-  {
-    return ipoint3(floor(Point3::xzy(world_pos) / getProbeSizeClip(clip) + 0.5));
-  }
-  IPoint3 getNewClipLT(uint32_t clip, const Point3 &world_pos) const
-  {
-    return getNewClipCenter(clip, world_pos) - IPoint3(clipW, clipW, clipD) / 2;
-  }
 
-  bool updateClip(uint32_t clip_no);
-  void set_clip_vars(int clip_no) const;
+  bool updateClip(uint32_t clip_no, const Point3 &world_pos);
+  void set_clip_vars(int clip_no, float probe_size, const IPoint3 &prev_lt) const;
   void initVars();
   uint32_t updateInFrames = 16, // temporality how many frames to update all active probes
     probeFramesKeep = 4,        // new probe will be kept at least that amount of frames
     updateOldProbeFreq = 4;     // will skip each N-1 frames for non-active probes. Non-active probes will be updated in each
                                 // updateInFrames*updateOldProbeFreq frames
   // the cache
-  UniqueTexHolder current_radiance_cache, current_radiance_cache_hit_distance;
-  UniqueBufHolder radiance_cache_positions; // current positions of radiance cache, (currently in absolute values)
-  UniqueBufHolder radiance_cache_age;       // current age of radiance cache probes (latest frame it was used in)
-  UniqueBufHolder radiance_cache_selected_temporal_probes;
+  UniqueTexWithShaderVar current_radiance_cache, current_radiance_cache_hit_distance;
+  UniqueBufWithShaderVar radiance_cache_positions; // current positions of radiance cache, (currently in absolute values)
+  UniqueBufWithShaderVar radiance_cache_age;       // current age of radiance cache probes (latest frame it was used in)
+  UniqueBufWithShaderVar radiance_cache_selected_temporal_probes;
 
   // clipmap
-  UniqueBufHolder radiance_cache_indirection_clipmap; // positions of radiance cache
+  UniqueBufWithShaderVar radiance_cache_indirection_clipmap; // positions of radiance cache
   UniqueBuf used_radiance_cache_mask;
-  UniqueBufHolder new_radiance_cache_probes_needed, free_radiance_cache_indices_list;
+  UniqueBufWithShaderVar new_radiance_cache_probes_needed, free_radiance_cache_indices_list;
 
   UniqueBuf radiance_cache_indirect_buffer;
   eastl::unique_ptr<ComputeShaderElement> get_fake_radiance_cache_res_cs;
@@ -102,7 +95,7 @@ protected:
   eastl::unique_ptr<ComputeShaderElement> radiance_cache_create_dispatch_indirect_cs;
   eastl::unique_ptr<RingCPUBufferLock> readBackData;
   // irradiance
-  UniqueTexHolder radiance_cache_irradiance;
+  UniqueTexWithShaderVar radiance_cache_irradiance;
   eastl::unique_ptr<ComputeShaderElement> rd_calc_irradiance_cache_new_cs, rd_calc_irradiance_cache_temporal_cs;
 
   void initIrradiance();
@@ -122,15 +115,7 @@ protected:
 
   uint32_t clipW = 0, clipD = 0;
   float probeSize0 = 0;
-  struct Clip
-  {
-    IPoint3 prevLt = {0, 0, 0}; // yz are swizzled to worldPos
-    float prevProbeSize = 0;
-
-    IPoint3 lt = {0, 0, 0}; // yz are swizzled to worldPos
-    float probeSize = 0;
-  };
-  dag::Vector<Clip> clipmap;
+  dag::Vector<VoxelClip> clipmap;
   uint32_t frame = 0;
   bool supportUnorderedLoad = false;
   bool filterWithDataRace = false; // filtering with data race is not stable, so switch it off

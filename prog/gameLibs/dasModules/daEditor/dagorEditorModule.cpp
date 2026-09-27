@@ -28,11 +28,14 @@ public:
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("ecs"));
     addBuiltinDependency(lib, require("DagorDataBlock"));
-    addAnnotation(das::make_smart<EntityObjAnnotation>(lib));
-    addAnnotation(das::make_smart<UndoSystemAnnotation>(lib));
+    addAnnotation(new EntityObjAnnotation(lib));
+    addAnnotation(new UndoSystemAnnotation(lib));
 
     das::addExtern<DAS_BIND_FUN(::EntityObjEditor::saveComponent)>(*this, lib, "entity_obj_editor_saveComponent",
       das::SideEffects::accessExternal, "::EntityObjEditor::saveComponent");
+    das::addExtern<DAS_BIND_FUN(::EntityObjEditor::getChangedComponentsToDataBlock)>(*this, lib,
+      "entity_obj_editor_getChangedComponentsToDataBlock", das::SideEffects::accessExternal,
+      "::EntityObjEditor::getChangedComponentsToDataBlock");
 
     das::addExtern<DAS_BIND_FUN(::EntityObjEditor::saveAddTemplate)>(*this, lib, "entity_obj_editor_saveAddTemplate",
       das::SideEffects::accessExternal, "::EntityObjEditor::saveAddTemplate");
@@ -109,7 +112,7 @@ public:
     using method_UndoSystem_begin = DAS_CALL_MEMBER(UndoSystem::begin);
     das::addExtern<DAS_CALL_METHOD(method_UndoSystem_begin)>(*this, lib, "begin", das::SideEffects::modifyArgument,
       DAS_CALL_MEMBER_CPP(UndoSystem::begin))
-      ->args({"undo_system"});
+      ->args({"undo_system", "can_cancel"});
 
     using method_UndoSystem_accept = DAS_CALL_MEMBER(UndoSystem::accept);
     das::addExtern<DAS_CALL_METHOD(method_UndoSystem_accept)>(*this, lib, "accept", das::SideEffects::modifyArgument,

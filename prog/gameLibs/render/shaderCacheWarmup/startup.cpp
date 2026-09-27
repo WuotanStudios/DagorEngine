@@ -3,6 +3,7 @@
 #include <render/shaderCacheWarmup/shaderCacheWarmup.h>
 
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
 #include <ioSys/dag_dataBlock.h>
 #include <ioSys/dag_dataBlockUtils.h>
@@ -17,7 +18,8 @@ static bool warmup_enabled(const DataBlock *blk)
   return blk->getBool(platform, false) && blk->getBool(d3d::get_driver_name(), false);
 }
 
-static Tab<const char *> get_shaders_to_warmup(const char *pipeline_type, const DataBlock *blk)
+static Tab<const char *> get_shaders_to_warmup(const char *pipeline_type, const DataBlock *blk,
+  const dag::Vector<const char *> &shaders_to_skip)
 {
   const DataBlock *shaders = blk->getBlockByName(pipeline_type);
 
@@ -29,6 +31,14 @@ static Tab<const char *> get_shaders_to_warmup(const char *pipeline_type, const 
     for (size_t i = 0; i < shaders->paramCount(); ++i)
     {
       const char *name = shaders->getParamName(i);
+      const bool value = shaders->getBool(i);
+      const bool skip = !value || eastl::find_if(shaders_to_skip.begin(), shaders_to_skip.end(),
+                                    [name](const char *s) { return strcmp(s, name) == 0; }) != shaders_to_skip.end();
+      if (skip)
+      {
+        debug("shader warmup: skipping %s (%s) due to unsupported HW feature", name, pipeline_type);
+        continue;
+      }
       shaderNames.push_back(name);
     }
   }
@@ -47,13 +57,23 @@ void warmup_shaders_from_settings(const WarmupParams &params, const bool is_load
 
   if (warmup_enabled(warmupBlk))
   {
+    if (const DataBlock *disable = warmupBlk->getBlockByName("disable"))
+      if (const DataBlock *vendor = disable->getBlockByName(d3d_get_vendor_name(d3d::get_driver_desc().info.vendor)))
+      {
+        if (vendor->getBool(d3d::get_driver_name(), false))
+        {
+          debug("shaders warmup disabled on %s for %s", d3d::get_driver_name(),
+            d3d_get_vendor_name(d3d::get_driver_desc().info.vendor));
+          return;
+        }
+      }
     debug("starting shaders warmup");
 
     if (backgroundWarmup)
       warmupBlk = warmupBlk->getBlockByNameEx("backgroundWarmup");
 
-    Tab<const char *> graphicsShaders = get_shaders_to_warmup("graphics", warmupBlk);
-    Tab<const char *> computeShaders = get_shaders_to_warmup("compute", warmupBlk);
+    Tab<const char *> graphicsShaders = get_shaders_to_warmup("graphics", warmupBlk, params.shadersToSkip);
+    Tab<const char *> computeShaders = get_shaders_to_warmup("compute", warmupBlk, params.shadersToSkip);
 
     warmup_shaders(graphicsShaders, computeShaders, params, is_loading_thread);
   }

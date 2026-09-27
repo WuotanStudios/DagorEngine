@@ -1,0 +1,2 @@
+script done
+await subclass, value == 7: true

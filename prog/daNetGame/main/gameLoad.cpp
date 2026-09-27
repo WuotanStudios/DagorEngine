@@ -23,6 +23,7 @@
 #include "main/vromfs.h"
 #include "main/watchdog.h"
 #include "net/net.h"
+#include "net/mainThreadNetInits.h"
 #include "net/replay.h"
 #include "net/dedicated.h"
 #include <daECS/net/netEvents.h>
@@ -30,14 +31,17 @@
 #include "net/userid.h"
 #include "render/renderer.h"
 #include "render/hdrRender.h"
-#include "render/renderLibsAllowed.h"
 #include "sound/dngSound.h"
 #include "ui/userUi.h"
 #include "ui/uiShared.h"
+#include "ui/uiRender.h"
+#include <daRg/dag_guiScene.h>
+#include <math/random/dag_random.h>
 
 #include <gameRes/dag_gameResources.h>
 #include <gameRes/dag_gameResSystem.h>
 #include <gameRes/dag_stdGameRes.h>
+#include <gameRes/stripDescRenderInfo.h>
 #include <nodeBasedShaderManager/nodeBasedShaderManager.h>
 #include <osApiWrappers/dag_vromfs.h>
 #include <osApiWrappers/dag_basePath.h>
@@ -50,8 +54,10 @@
 #include <util/dag_string.h>
 #include <ioSys/dag_dataBlockUtils.h>
 #include <ioSys/dag_findFiles.h>
-#include <ecs/core/entityManager.h>
-#include <ecs/scene/scene.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/scene/scene.h>
 #include <ecs/scripts/dascripts.h>
 #include <daScript/daScript.h>
 #include <daScript/ast/ast_serializer.h>
@@ -66,7 +72,7 @@
 #include <sqstdblob.h>
 #include "main.h"
 #include "render/renderSettings.h"
-#include "render/animatedSplashScreen.h"
+#include <animated_splash_screen_api.h>
 #include <gui/dag_visualLog.h>
 #include <forceFeedback/forceFeedback.h>
 #include <3d/dag_picMgr.h>
@@ -94,9 +100,12 @@
 #include <osApiWrappers/dag_atomic_types.h>
 #include <osApiWrappers/basePath.h>
 #include <osApiWrappers/fs_hlp.h>
+#include <drv/3d/dag_commands.h>
+#include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_renderTarget.h>
 #include "updaterEvents.h"
 #include "gameProjConfig.h"
+#include <rendInst/rendInstGen.h>
 
 extern void (*get_memcollect_cur_thread_cb())(); // FIXME: move to engine header (dag_memBase.h)
 
@@ -184,6 +193,26 @@ static dag::AtomicInteger<bool> switch_scene_flag(false);
 static UserGameModeInfo user_game_mode_info;
 bool unload_in_progress = false;
 
+static DataBlock riGenExtraConfig;
+static void load_and_register_rigenextra_config()
+{
+  rendinst::RIGenLoadingAutoLock riGenLd;
+  const char *rendinstDmgBlkFn = get_rendinst_dmg_blk_fn();
+  if (dd_file_exists(rendinstDmgBlkFn))
+    riGenExtraConfig.load(rendinstDmgBlkFn);
+  else
+    riGenExtraConfig.reset();
+  debug("registerRIGenExtraConfig(%s, %d blocks)", rendinstDmgBlkFn, riGenExtraConfig.blockCount());
+  rendinst::registerRIGenExtraConfig(&riGenExtraConfig);
+}
+static void unregister_and_unload_rigenextra_config()
+{
+  rendinst::RIGenLoadingAutoLock riGenLd;
+  debug("unregisterRIGenExtraConfig()");
+  rendinst::registerRIGenExtraConfig(nullptr);
+  riGenExtraConfig.resetAndReleaseRoNameMap();
+}
+
 const UserGameModeInfo &get_user_mode_info()
 {
   static UserGameModeInfo empty;
@@ -260,8 +289,11 @@ void setup_base_resources(const GamePackage &game_info, dag::ConstSpan<VromLoadI
         appendRawAddon(ugmAddon);
       }
     }
-    gameres_final_optimize_desc(gameres_rendinst_desc, "riDesc");
-    gameres_final_optimize_desc(gameres_dynmodel_desc, "dynModelDesc");
+    // on dedicated server model resources are stubs, mat/tex descriptions are never read
+    const dag::ConstSpan<const char *> stripBlocks =
+      dedicated::is_dedicated() ? gameres_render_only_desc_block_names() : dag::ConstSpan<const char *>();
+    gameres_final_optimize_desc(gameres_rendinst_desc, "riDesc", stripBlocks);
+    gameres_final_optimize_desc(gameres_dynmodel_desc, "dynModelDesc", stripBlocks);
   }
   watchdog_kick();
 }
@@ -279,7 +311,7 @@ void add_operator_vromfs(GamePackage &gameInfo)
   String vrom_path(0, "%s.vromfs.bin", operatorStr);
   if (dd_file_exists(vrom_path))
   {
-    debug("[%s] use partner vroms %s", vrom_path);
+    debug("[VROM] use partner vroms %s for %s operator", vrom_path, operatorStr);
     gameInfo.addonVroms.push_back({operatorStr, vrom_path.str(), "", false});
   }
   else
@@ -419,8 +451,6 @@ GamePackage load_game_package()
 
   app_profile::apply_settings_blk(gameInfo.gameSettings);
 
-  String consoleBindsFn(0, "console_binds.blk");
-  console_keybindings::set_binds_file_path(consoleBindsFn);
   console_keybindings::load_binds_from_file();
 
   bool useAddonVromSrc = false;
@@ -446,7 +476,31 @@ GamePackage load_game_package()
   if (const DataBlock *addons = gameInfo.gameSettings.getBlockByName("addonBasePath"))
     parse_addons(gameInfo, *addons, useAddonVromSrc);
 
+
 #if _TARGET_XBOX | _TARGET_C1 | _TARGET_C2
+
+  eastl::unordered_map<eastl::string, eastl::vector<uint32_t>> chunksMap;
+
+  auto collectAddonChunks = [&](const char *addon_name, const DataBlock *blk, eastl::vector<uint32_t> &chunks_list) {
+#if _TARGET_XBOX
+    static constexpr uint32_t LAUNCH_CHUNK_ID = 1001;
+    static const char *PARAMETER_NAME = "id";
+#elif _TARGET_C1 | _TARGET_C2
+
+
+#endif
+    int nid = blk->getNameId(PARAMETER_NAME);
+    for (int i = 0; i < blk->paramCount(); i++)
+    {
+      if (blk->getParamNameId(i) == nid && blk->getParamType(i) == DataBlock::TYPE_INT)
+      {
+        uint32_t chunkId = blk->getInt(i);
+        if (chunkId != LAUNCH_CHUNK_ID)
+          chunks_list.push_back(chunkId);
+      }
+    }
+  };
+
   if (const DataBlock *chunksMapping = gameInfo.gameSettings.getBlockByName("chunksMapping"))
   {
     for (int i = 0, nid = chunksMapping->getNameId("chunk"); i < chunksMapping->blockCount(); ++i)
@@ -455,22 +509,14 @@ GamePackage load_game_package()
       if (chunkBlk->getBlockNameId() == nid)
       {
         const char *addonFolder = chunkBlk->getStr("folder", nullptr);
-#if _TARGET_XBOX
-        static constexpr uint32_t XBOX_LAUNCH_CHUNK_ID = 1001;
-        uint32_t chunkId = chunkBlk->getInt("id", XBOX_LAUNCH_CHUNK_ID);
-        if (chunkId == XBOX_LAUNCH_CHUNK_ID)
-          continue;
-#elif _TARGET_C1 | _TARGET_C2
-
-
-
-
-#endif
         if (addonFolder)
-          gameInfo.chunksMap.emplace(addonFolder, chunkId);
+        {
+          eastl::vector<uint32_t> &chunksList = chunksMap[addonFolder];
+          collectAddonChunks(addonFolder, chunkBlk, chunksList);
+        }
       }
     }
-    debug("Loaded %u entries into chunks map", gameInfo.chunksMap.size());
+    debug("Loaded %u entries into chunks map", chunksMap.size());
   }
   else
     logwarn("Chunks mapping wasn't found");
@@ -481,43 +527,55 @@ GamePackage load_game_package()
       for (int i = 0, nid = addons->getNameId("folder"); i < addons->paramCount(); i++)
         if (addons->getParamNameId(i) == nid || strncmp(addons->getParamName(i), "folder", 6) == 0)
         {
-          String addon_name(addons->getStr(i));
-          if (addon_name.find('{'))
+          String addonName(addons->getStr(i));
+          if (addonName.find('{'))
           {
             // replace known keywords
-            addon_name.replaceAll("{SHADER_SUFFIX}", node_based_shader_current_platform_suffix());
+            addonName.replaceAll("{SHADER_SUFFIX}", node_based_shader_current_platform_suffix());
 
             // skip loading packages with unresolved keywords
-            if (addon_name.find('{'))
+            if (addonName.find('{'))
             {
-              logerr("skip unsupported package %s", addon_name);
+              logerr("skip unsupported package %s", addonName);
               continue;
             }
           }
 #if _TARGET_XBOX | _TARGET_C1 | _TARGET_C2
-          eastl::unordered_map<eastl::string, uint32_t>::iterator it = gameInfo.chunksMap.find(addon_name.c_str());
-          if (it != gameInfo.chunksMap.end())
+          eastl::unordered_map<eastl::string, eastl::vector<uint32_t>>::iterator it = chunksMap.find(addonName.c_str());
+          if (it != chunksMap.end())
           {
-            uint32_t chunkId = it->second;
+            eastl::vector<uint32_t> &chunksList = it->second;
+            bool allChunksAvailable = true;
+            for (uint32_t chunkId : chunksList)
+            {
 #if _TARGET_XBOX
-            bool chunkAvailable = gdk::is_game_chunk_available(chunkId);
+              allChunksAvailable &=
+                gdk::get_package_chunk_availability(gdk::get_package_id(), chunkId) == gdk::PackageChunkAvailability::Ready;
 #elif _TARGET_C1 | _TARGET_C2
 
 
 #endif
-            if (!chunkAvailable)
+              if (!allChunksAvailable)
+              {
+                logwarn("Chunk %u with folder %s is not available. Skipping.", chunkId, addonName.c_str());
+                break;
+              }
+            }
+
+            if (!allChunksAvailable)
             {
-              logwarn("Chunk %u with folder %s is not available. Skipping.", chunkId, addon_name.c_str());
+              logwarn("Not all chunks are available for addon: %s, skipping", addonName.c_str());
               continue;
             }
           }
 #endif // end _TARGET_XBOX | _TARGET_C1 | _TARGET_C2
-          buffer.push_back((addon_name + "/res").str());
+          buffer.push_back((addonName + "/res").str());
         }
   };
 
   initAddons("addons", gameInfo.addons);
   initAddons("rawAddons", gameInfo.rawAddons);
+  add_operator_vromfs(gameInfo);
   return gameInfo;
 }
 
@@ -543,9 +601,9 @@ void unload_current_game()
   }
 
   // Explicitly flush delayed actions that might hold sq callbacks (which in turn might need entities, not empty tdb, etc...)
-  perform_delayed_actions();
+  flush_delayed_actions();
 
-  net_on_before_emgr_clear();
+  net_on_about_to_clear_all_entities(*g_entity_mgr);
 
   {
     debug("clear g_entity_mgr");
@@ -565,11 +623,8 @@ void unload_current_game()
 
   g_entity_mgr->broadcastEventImmediate(EventOnGameUnloadEnd());
 
-  ::reset_required_res_list_restriction();
   ::free_unused_game_resources();
-  ::reset_game_resources();
-  gameres_rendinst_desc.reset();
-  gameres_dynmodel_desc.reset();
+  unregister_and_unload_rigenextra_config();
   prepare_united_vdata_setup(nullptr); // Reset to default
 
   current_game.gameSettings.resetAndReleaseRoNameMap();
@@ -598,28 +653,8 @@ static bool load_game_scene(const DataBlock &scene_blk, const char *scene_path, 
     if (!ecs::g_scenes && has_in_game_editor())
       ecs::g_scenes.demandInit();
 
-    ecs::template_allowed_cb_t template_allowed_cb = [](const char *templ_name) -> bool {
-      if (const ecs::Template *templ = g_entity_mgr->getTemplateDB().getTemplateByName(templ_name))
-      {
-        if (const char *libNameStart = strstr(templ->getPath(), "%danetlibs/"))
-        {
-          libNameStart += 11;
-          if (const char *libNameEnd = strchr(libNameStart, '/'))
-          {
-            String libName(libNameStart, libNameEnd - libNameStart);
-            if (!is_render_lib_allowed(libName.c_str()))
-            {
-              debug("Template '%s' is skipped because library '%s' is disabled", templ_name, libName.c_str());
-              return false;
-            }
-          }
-        }
-      }
-      return true;
-    };
-
     ecs::SceneManager::loadScene(ecs::g_scenes.get(), scene_blk, scene_path, &ecs::SceneManager::entityCreationCounter, import_depth,
-      load_type, template_allowed_cb);
+      load_type);
   }
   return res;
 }
@@ -674,6 +709,7 @@ static void load_scene(const char *name, const eastl::vector<eastl::string> &imp
     // Before any entity creation (including the ones from common scenes) as it might request resources
     apply_united_vdata_settings(sceneLoaded ? &sceneBlk : nullptr);
   }
+  load_and_register_rigenextra_config();
   if (app_profile::get().haveGraphicsWindow && (is_server() || !app_profile::get().replay.playFile.empty()))
     load_common_game_client_scenes(&load_game_scene); // Otherwise it will be loaded on connect to server (see `apply_scene_level`)
   if (!is_server() || !app_profile::get().replay.playFile.empty())
@@ -884,17 +920,19 @@ static void load_scene_impl(const eastl::string_view &scene_name,
   {
     TIME_PROFILE(load_package_files)
 
-    load_package_files(gameInfo);
+    load_package_files(gameInfo, false);
     current_game = eastl::move(gameInfo);
   }
   ::dagor_idle_cycle();
 
   load_gameparams();
-  dng_load_localization();
 
-  set_timespeed(1.f);
+  reset_timespeed();
+  if (dgs_get_settings()->getBlockByNameEx("debug")->getBool("resetRndSeedOnSceneLoad", false))
+    dagor_random::set_rnd_seed(0);
+
   bool hasServerUrls = !connect_params.serverUrls.empty();
-  if (!app_profile::get().devMode && (hasServerUrls || !app_profile::get().replay.playFile.empty()))
+  if (is_main_thread_network() && !app_profile::get().devMode && (hasServerUrls || !app_profile::get().replay.playFile.empty()))
     net_init_late_client(eastl::move(connect_params), *g_entity_mgr);
 
   init_renderer_per_game();
@@ -917,7 +955,8 @@ static void load_scene_impl(const eastl::string_view &scene_name,
       if (!dd_file_exist(ugm_entities_import_fn.c_str() + 1))
         ugm_entities_import_fn.clear();
     }
-    ecs_set_global_tags_context(*g_entity_mgr, ugm_entities_es_order_fn.empty() ? nullptr : ugm_entities_es_order_fn.c_str());
+    ecs_reset_global_tags_and_load_es_order(*g_entity_mgr,
+      ugm_entities_es_order_fn.empty() ? nullptr : ugm_entities_es_order_fn.c_str());
 
     gamescripts::das_load_ecs_templates();
     debug("load_ecs_templates");
@@ -936,7 +975,8 @@ static void load_scene_impl(const eastl::string_view &scene_name,
       logerr("Tried to load attachmentSlotsInitBlk '%s' but it does not exist.", anim_attachments_fn);
   }
   // on server net_init must be called after templates had been loaded and before scene is starting to load
-  net_init_late_server(*g_entity_mgr);
+  if (is_main_thread_network())
+    net_init_late_server(*g_entity_mgr);
 
   if (current_game.sceneName.empty() && !hasServerUrls)
   {
@@ -964,14 +1004,6 @@ static void load_scene_impl(const eastl::string_view &scene_name,
   controls::init_control(ugm_input_cfg_fn.empty() ? nullptr : ugm_input_cfg_fn.c_str());
   init_glob_input();
 
-  bool fsrEnabled = false;
-  // We have to check for fsr here, bacause otherwise hdrrender and gamma_pass will be created without
-  // uav usage support and if worldRenderer is not recrated (this is behaviour for all scenes except first loaded),
-  // textures will have incorrect flags for fsr
-  const char *quality = ::dgs_get_settings()->getBlockByNameEx("video")->getStr("fsr", nullptr);
-  if (quality && strcmp(quality, "off") != 0)
-    fsrEnabled = true;
-
   // ui init can be long, process inputs to avoid application not responding status
   ::dagor_idle_cycle();
   uishared::init();
@@ -980,7 +1012,7 @@ static void load_scene_impl(const eastl::string_view &scene_name,
 
   int width, height;
   d3d::get_render_target_size(width, height, 0, 0);
-  hdrrender::init(width, height, true, fsrEnabled);
+  hdrrender::init(width, height, true, false);
 
   g_entity_mgr->broadcastEventImmediate(
     EventOnBeforeSceneLoad(current_game.sceneName.c_str(), current_game.importScenes, current_game.gameSettings));
@@ -996,34 +1028,47 @@ static void prepare_to_switch_scene()
   force_feedback::rumble::reset();
   set_fps_limit(30);
   start_animated_splash_screen_in_thread();
-  animated_splash_screen_allow_watchdog_kick(false);
+  if (!d3d::driver_command(Drv3dCommand::GET_PIPELINE_COMPILATION_QUEUE_LENGTH))
+    animated_splash_screen_allow_watchdog_kick(false);
   g_entity_mgr->tick(); // create/destroy delayed entities
   unload_current_game();
   animated_splash_screen_allow_watchdog_kick(true);
 }
 
+struct LoadSceneAfterDasReloadAction final : public DelayedAction
+{
+  eastl::string scene;
+  explicit LoadSceneAfterDasReloadAction(eastl::string &&s) : scene(eastl::move(s)) {}
+  void performAction() override
+  {
+    load_scene_impl(scene, {}, {}, {});
+    switch_scene_flag.store(false);
+  }
+};
+
 struct ReloadDasModulesJob final : public cpujobs::IJob
 {
   das::daScriptEnvironment *bound;
-  explicit ReloadDasModulesJob(das::daScriptEnvironment *bound_) : bound(bound_) {}
-  const char *getJobName(bool &) const override { return "ReloadDasModulesJob"; }
+  eastl::string scene;
+  ReloadDasModulesJob(das::daScriptEnvironment *bound_, eastl::string_view scene_) : bound(bound_), scene(scene_) {}
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("ReloadDasModulesJob"); }
   void doJob() override
   {
-    *das::daScriptEnvironment::bound = bound;
+    das::daScriptEnvironment::setBound(bound);
     int rt = gamescripts::get_game_das_reload_threads();
     if (rt)
       gamescripts::set_load_threads_num(eastl::exchange(rt, gamescripts::get_load_threads_num()));
     gamescripts::reload_das_modules();
     if (rt)
       gamescripts::set_load_threads_num(rt); // restore
-    *das::daScriptEnvironment::bound = nullptr;
+    das::daScriptEnvironment::setBound(nullptr);
   }
 
   void releaseJob() override
   {
     bind_dascript::main_thread_post_load();
     g_entity_mgr->broadcastEvent(EventDaScriptReloaded());
-    switch_scene_flag.store(false);
+    add_delayed_action(new LoadSceneAfterDasReloadAction(eastl::move(scene)));
     delete this;
     mem_collect_threads(/*loading_job_only*/ true);
   }
@@ -1074,34 +1119,40 @@ void on_apply_sync_vroms_diffs_msg(const net::IMessage *_msg)
     debug("[SyncVroms]: Applied diffs version: %s", maxVersion.to_string());
     updater::binarycache::set_cache_version(updater::binarycache::get_cache_folder().c_str(), maxVersion);
 
-    const int remountedCount = remount_changed_vroms();
-    debug("[SyncVroms]: Remounted %d vroms after diffs has been applied", remountedCount);
+    // Do not reload templates while inside ES event hanlder hence the delayed call.
+    add_delayed_callback(
+      [](void *) {
+        const int remountedCount = remount_changed_vroms();
+        debug("[SyncVroms]: Remounted %d vroms after diffs has been applied", remountedCount);
 
-    const bool isOk = reload_ecs_templates(*g_entity_mgr, [](const char *name, ecs::EntityManager::UpdateTemplateResult result) {
-      switch (result)
-      {
-        case ecs::EntityManager::UpdateTemplateResult::Same: break;
-        case ecs::EntityManager::UpdateTemplateResult::Added: debug("[SyncVroms]: %s added", name); break;
-        case ecs::EntityManager::UpdateTemplateResult::Updated: debug("[SyncVroms]: %s updated", name); break;
-        case ecs::EntityManager::UpdateTemplateResult::Removed: debug("[SyncVroms]: %s removed", name); break;
-        case ecs::EntityManager::UpdateTemplateResult::InvalidName: debug("[SyncVroms]: %s wrong name", name); break;
-        case ecs::EntityManager::UpdateTemplateResult::RemoveHasEntities:
-          logerr("[SyncVroms]: %s has entities and cant be removed", name);
-          break;
-        case ecs::EntityManager::UpdateTemplateResult::DifferentTag:
-          logerr("[SyncVroms]: %s is registered with different tag and can't be updated", name);
-          break;
-        default: logerr("[SyncVroms]: Unknown error %d for template '%s'", (int)result, name); break;
-      }
-    });
+        const bool isOk = reload_ecs_templates(*g_entity_mgr, [](const char *name, ecs::EntityManager::UpdateTemplateResult result) {
+          switch (result)
+          {
+            case ecs::EntityManager::UpdateTemplateResult::Same: break;
+            case ecs::EntityManager::UpdateTemplateResult::Added: debug("[SyncVroms]: %s added", name); break;
+            case ecs::EntityManager::UpdateTemplateResult::Updated: debug("[SyncVroms]: %s updated", name); break;
+            case ecs::EntityManager::UpdateTemplateResult::Removed: debug("[SyncVroms]: %s removed", name); break;
+            case ecs::EntityManager::UpdateTemplateResult::InvalidName: debug("[SyncVroms]: %s wrong name", name); break;
+            case ecs::EntityManager::UpdateTemplateResult::RemoveHasEntities:
+              logerr("[SyncVroms]: %s has entities and cant be removed", name);
+              break;
+            case ecs::EntityManager::UpdateTemplateResult::DifferentTag:
+              logerr("[SyncVroms]: %s is registered with different tag and can't be updated", name);
+              break;
+            default: logerr("[SyncVroms]: Unknown error %d for template '%s'", (int)result, name); break;
+          }
+        });
 
-    if (!isOk)
-      statsd::counter("syncvroms.error", 1, {"error", "reload_ecs_templates"});
+        if (!isOk)
+          statsd::counter("syncvroms.error", 1, {"error", "reload_ecs_templates"});
 
-    debug("[SyncVroms]: Templates has been reloaded: %s", isOk ? "success" : "fail");
+        debug("[SyncVroms]: Templates has been reloaded: %s", isOk ? "success" : "fail");
+        G_VERIFY(send_net_msg(net::get_msg_sink(), SyncVromsDone()) > 0);
+      },
+      nullptr, "SyncVromsReloadTemplatesDelayedCall");
   }
-
-  G_VERIFY(send_net_msg(net::get_msg_sink(), SyncVromsDone()) > 0);
+  else
+    G_VERIFY(send_net_msg(net::get_msg_sink(), SyncVromsDone()) > 0);
 }
 
 static void switch_scene_and_apply_update(eastl::string_view scene)
@@ -1151,8 +1202,6 @@ static void switch_scene_and_apply_update(eastl::string_view scene)
   else
     debug("Vroms are up-to-date %s == %s", updatedVersion.to_string(), cacheVersion.to_string());
 
-  load_scene_impl(scene, {}, {}, {});
-
   // Use game's version after vroms has been remounted.
   // Remount of vroms might change game's version.
   const updater::Version currentVersion = get_updated_game_version();
@@ -1191,7 +1240,6 @@ static void switch_scene_and_apply_update(eastl::string_view scene)
           "debugEnableDataReload: %@",
       currentVersion.to_string(), cacheVersion.to_string(), alwaysReloadOverlay, alwaysReloadGameSq, alwaysReloadDas,
       debugEnableDataReload);
-    switch_scene_flag.store(false);
   }
   else
   {
@@ -1213,6 +1261,10 @@ static void switch_scene_and_apply_update(eastl::string_view scene)
     {
       statsd::counter("gameload.reload_scripts", 1, {"reload", "das"});
 
+      // in-flight daRg das jobs reference shared modules deleted by the unload below
+      for (darg::IGuiScene *scn : uirender::get_all_scenes())
+        scn->waitAllDasJobsDone();
+
       gamescripts::unload_all_das_scripts_without_debug_agents();
       // game_init.das is very small and contains only events, load it synchronously before sq
       debug("Reload synchronously game_init.das.");
@@ -1232,14 +1284,15 @@ static void switch_scene_and_apply_update(eastl::string_view scene)
     {
       debug("Start a job to reload das modules.");
 
-      G_VERIFY(cpujobs::add_job(ecs::get_common_loading_job_mgr(), new ReloadDasModulesJob(*das::daScriptEnvironment::bound)));
+      G_VERIFY(
+        cpujobs::add_job(ecs::get_common_loading_job_mgr(), new ReloadDasModulesJob(das::daScriptEnvironment::getBound(), scene)));
+      return; // ReloadDasModulesJob release will load the scene
     }
-    else
-    {
-      debug("Game scripts (daScript) has't been reloaded");
-      switch_scene_flag.store(false);
-    }
+    debug("Game scripts (daScript) has't been reloaded");
   }
+
+  load_scene_impl(scene, {}, {}, {});
+  switch_scene_flag.store(false);
 }
 
 bool is_load_in_progress() { return switch_scene_flag.load() || is_level_loading(); }
@@ -1251,7 +1304,7 @@ struct SwitchSceneDelayedAction : public DelayedAction
   eastl::string scene;
   eastl::vector<eastl::string> importScenes;
   UserGameModeContext ugmCtx;
-  bool precondition() override { return !is_load_in_progress() && !dng_is_app_terminated(); }
+  bool precondition() override { return !is_load_in_progress() && !dng_is_app_terminating(); }
   void performAction() override
   {
     debug("switch current scene to '%.*s' (+%d imports)", (int)scene.size(), scene.data(), importScenes.size());
@@ -1334,19 +1387,20 @@ static SQInteger request_ugm_manifest_sq(HSQUIRRELVM vm)
 
     void releaseJob() override
     {
-      Json::Value data;
-      data["result"] = result;
-      data["vromfs"] = vromFn.c_str();
-      data["contentId"] = contentId.c_str();
-      data["manifestStr"] = manifestJsonStr.c_str();
-      data["sceneBlkFound"] = (flist.getNameId("scene.blk") >= 0);
-      Json::Value files(Json::arrayValue);
-      iterate_names(flist, [&](int, const char *name) {
-        files.append(name);
-        debug(name);
+      sqeventbus::write_event_main_thread(eventId.c_str(), [&](auto &data) {
+        data["result"] = result;
+        data["vromfs"] = vromFn.c_str();
+        data["contentId"] = contentId.c_str();
+        data["manifestStr"] = manifestJsonStr.c_str();
+        data["sceneBlkFound"] = (flist.getNameId("scene.blk") >= 0);
+        eastl::remove_cvref_t<decltype(data)> files(data.getVM(), flist.nameCount());
+        int i = 0;
+        iterate_names(flist, [&](int, const char *name) {
+          files[i++] = name;
+          debug("%s", name);
+        });
+        data["modFiles"] = files;
       });
-      data["modFiles"] = files;
-      sqeventbus::send_event(eventId.c_str(), data);
       delete this;
     }
   };

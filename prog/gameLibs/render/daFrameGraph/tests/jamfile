@@ -12,6 +12,13 @@ TargetType  = exe ;
 OutDir      = $(Root)/$(Location)/bin/$(LegacyPlatformSuffix) ;
 Target      = testFrameGraph ;
 
+UseD3DMulti = yes ;
+UseD3DMultiList = DX12 vulkan stub ;
+UseD3DMultiForced = windows ;
+LinuxUseGUI = yes ;
+include $(Root)/prog/engine/drv/drv3d_DX12/copy_bundles.jam ;
+include $(Root)/prog/engine/drv/drv3d_commonCode/copy_bundles.jam ;
+
 if $(PlatformSpec) = clang
 {
   # These warnings are enabled by default on some systems and are
@@ -29,24 +36,32 @@ UseProgLibs =
   engine/memory
   engine/kernel
   engine/osApiWrappers
+  engine/coreUtil
   engine/baseUtil
   engine/ioSys
   engine/math
-  engine/drv/drv3d_stub
   engine/shaders
   engine/lib3d
   engine/image
   engine/startup
+  engine/workCycle
+  engine/perfMon/stub
+
+  engine/drv/drv3d_pc_multi
 
   3rdPartyLibs/eastl
   3rdPartyLibs/catch2
 
-  engine/perfMon/daProfilerStub
-  engine/perfMon/perfTimerStub
   gameLibs/render/daFrameGraph
 ;
 
-ShaderVarsStub ?= yes ;
+if $(Platform) = linux {
+  UseProgLibs +=
+    engine/osApiWrappers/messageBox
+  ;
+}
+
+ShaderVarsStub ?= mock ;
 
 AddIncludes =
   $(Root)/$(Location)/..
@@ -56,9 +71,21 @@ AddIncludes =
 
 Sources =
   main.cpp
+  benchmark.cpp
   packer.cpp
   performance.cpp
   runtime.cpp
+  multiplexing.cpp
+  idContainers.cpp
+  barrierScheduler.cpp
+  cycAlloc.cpp
+  bitSearch.cpp
+  irGraphBuilder.cpp
+  nodeStateDeltas.cpp
+  nodeRemap.cpp
+  resourceScheduler.cpp
+  virtualPassRequest.cpp
+  refinedBlock.cpp
 ;
 
 include $(Root)/prog/_jBuild/build.jam ;

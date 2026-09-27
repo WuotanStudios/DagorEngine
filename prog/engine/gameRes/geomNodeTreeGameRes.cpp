@@ -6,8 +6,7 @@
 #include <generic/dag_initOnDemand.h>
 #include <util/dag_globDef.h>
 #include <util/dag_string.h>
-#include <EASTL/vector.h>
-#include <EASTL/unique_ptr.h>
+#include <dag/dag_vector.h>
 #include <debug/dag_log.h>
 #include <gameRes/dag_dumpResRefCountImpl.h>
 #include <osApiWrappers/dag_critSec.h>
@@ -20,10 +19,10 @@ public:
   {
     int resId;
     int refCount;
-    eastl::unique_ptr<GeomNodeTree> nodeTree;
+    GeomNodeTreeUniquePtr nodeTree;
   };
 
-  eastl::vector<TreeData> treeData;
+  dag::Vector<TreeData> treeData;
 
 
   int findResData(int res_id) const
@@ -57,19 +56,20 @@ public:
   bool isResLoaded(int res_id) override { return findResData(::validate_game_res_id(res_id)) >= 0; }
   bool checkResPtr(GameResource *res) override { return findTree((GeomNodeTree *)res) >= 0; }
 
-  GameResource *getGameResource(int res_id) override
+  GameResource *getGameResource(RRL rrl, int res_id) override
   {
     // get real-res id
     if (::validate_game_res_id(res_id) == NULL_GAMERES_ID)
       return NULL;
 
+    WinAutoLock lock(get_gameres_main_cs());
+
     int id = findResData(res_id);
-
-    // no resource - load pack
     if (id < 0)
-      ::load_game_resource_pack(res_id);
-
-    id = findResData(res_id);
+    {
+      load_game_resource_pack_gameres_main_cs_locked(res_id, rrl);
+      id = findResData(res_id);
+    }
     if (id < 0)
       return NULL;
 
@@ -125,12 +125,12 @@ public:
   }
 
 
-  bool freeUnusedResources(bool forced_free_unref_packs, bool once /*= false*/) override
+  bool freeUnusedResources(RRL rrl, bool forced_free_unref_packs, bool once /*= false*/) override
   {
     bool result = false;
     for (int i = treeData.size() - 1; i >= 0; --i)
     {
-      if (get_refcount_game_resource_pack_by_resid(treeData[i].resId) > 0)
+      if (rrl && is_res_required(rrl, treeData[i].resId))
         continue;
       if (treeData[i].refCount != 0)
       {
@@ -157,8 +157,7 @@ public:
         return;
     }
 
-    TreeData td{res_id, 0, eastl::make_unique<GeomNodeTree>()};
-    td.nodeTree->load(cb);
+    TreeData td{res_id, 0, GeomNodeTreeUniquePtr(GeomNodeTree::load(cb))};
     td.nodeTree->partialCalcWtm(dag::Index16(td.nodeTree->nodeCount()));
 
     WinAutoLock lock2(cs);
@@ -166,12 +165,13 @@ public:
   }
 
 
-  void createGameResource(int /*res_id*/, const int * /*reference_ids*/, int /*num_refs*/) override {}
+  void createGameResource(RRL, int, const int *, int) override {}
 
   void reset() override { treeData.clear(); }
 
   IMPLEMENT_DUMP_RESOURCES_REF_COUNT(treeData, resId, refCount)
 };
+DAG_DECLARE_RELOCATABLE(GeomNodeTreeGameResFactory::TreeData);
 
 static InitOnDemand<GeomNodeTreeGameResFactory> geom_node_tree_factory;
 
@@ -180,3 +180,18 @@ void register_geom_node_tree_gameres_factory()
   geom_node_tree_factory.demandInit();
   ::add_factory(geom_node_tree_factory);
 }
+
+static bool resolve_res_name(String &nm, const GeomNodeTree *r)
+{
+  if (!geom_node_tree_factory.get())
+    return false;
+  for (auto &res : geom_node_tree_factory->treeData)
+    if (res.nodeTree.get() == r)
+    {
+      get_game_resource_name(res.resId, nm);
+      return true;
+    }
+  return false;
+}
+
+bool resolve_game_resource_name(String &name, const GeomNodeTree *r) { return resolve_res_name(name, r); }

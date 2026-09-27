@@ -1,10 +1,12 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <EASTL/optional.h>
 #include <propPanel/control/propertyControlBase.h>
+#include <propPanel/colors.h>
 #include <propPanel/imguiHelper.h>
 #include <propPanel/immediateFocusLossHandler.h>
-#include "spinEditStandalone.h"
+#include <propPanel/control/spinEditStandalone.h>
 #include "../scopedImguiBeginDisabled.h"
 
 namespace PropPanel
@@ -22,7 +24,9 @@ public:
     controlCaption(caption),
     widthIncludesLabel(width_includes_label),
     spinEdit(0, 0, 1, 1)
-  {}
+  {
+    spinEdit.setIntegerValues(true);
+  }
 
   ~SpinEditIntPropertyControl() override
   {
@@ -32,6 +36,8 @@ public:
 
   unsigned getTypeMaskForSet() const override { return CONTROL_DATA_TYPE_INT | CONTROL_DATA_MIN_MAX_STEP | CONTROL_CAPTION; }
   unsigned getTypeMaskForGet() const override { return CONTROL_DATA_TYPE_INT; }
+
+  unsigned getWidth() const override { return mW > 0 ? mW : ImguiHelper::getDefaultRightSideEditWidth(); }
 
   int getIntValue() const override { return floor(spinEdit.getValue()); }
   void setIntValue(int value) override { spinEdit.setValue(value); }
@@ -43,6 +49,8 @@ public:
 
   void setCaptionValue(const char value[]) override { controlCaption = value; }
 
+  void setValueHighlight(ColorOverride::ColorIndex color) override { valueHighlightColor = color; }
+
   void reset() override
   {
     setIntValue(floor(spinEdit.getMinValue()));
@@ -51,6 +59,26 @@ public:
   }
 
   void setEnabled(bool enabled) override { controlEnabled = enabled; }
+
+  bool isDefaultValueSet() const override { return defaultValue ? *defaultValue == spinEdit.getValue() : true; }
+
+  void applyDefaultValue() override
+  {
+    if (isDefaultValueSet())
+    {
+      return;
+    }
+
+    if (defaultValue)
+    {
+      spinEdit.setValue(*defaultValue);
+      onWcChange(nullptr);
+    }
+  }
+
+  void setDefaultValue(Variant var) override { defaultValue = var.convert<int>(); }
+
+  const char *getImguiTypeName() const override { return "EditInt"; }
 
   void updateImgui() override
   {
@@ -68,7 +96,7 @@ public:
       if (availableSpaceForLabel > 0.0f)
       {
         ImGui::SetNextItemWidth(availableSpaceForLabel);
-        ImguiHelper::labelOnly(controlCaption);
+        labelWithTooltip(controlCaption.begin(), controlCaption.end());
 
         ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
       }
@@ -79,7 +107,7 @@ public:
     }
     else
     {
-      ImguiHelper::labelOnly(controlCaption.begin(), controlCaption.end(), true);
+      labelWithTooltip(controlCaption.begin(), controlCaption.end(), true);
       ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
 
       const float availableSpace = mW > 0 ? min((float)mW, ImGui::GetContentRegionAvail().x) : ImGui::GetContentRegionAvail().x;
@@ -88,7 +116,16 @@ public:
 
     ImGui::SetNextItemWidth(spinEditWidth);
     setFocusToNextImGuiControlIfRequested();
-    spinEdit.updateImgui(*this, &controlTooltip, this);
+
+    // Override the background color of the edit box.
+    const bool valueHighlightColorSet = valueHighlightColor != ColorOverride::NONE;
+    if (valueHighlightColorSet)
+      ImGui::PushStyleColor(ImGuiCol_FrameBg, getOverriddenColor(valueHighlightColor));
+
+    spinEdit.updateImgui(*this, &controlTooltip, this, this);
+
+    if (valueHighlightColorSet)
+      ImGui::PopStyleColor();
 
     if (spinEdit.isTextInputFocused())
       set_focused_immediate_focus_loss_handler(this);
@@ -97,12 +134,14 @@ public:
   }
 
 private:
-  void onImmediateFocusLoss() override { spinEdit.sendWcChangeIfVarChanged(*this); }
+  void onImmediateFocusLoss() override { spinEdit.sendWcChangeAndFinishIfVarChanged(*this); }
 
   String controlCaption;
   bool controlEnabled = true;
   const bool widthIncludesLabel;
   SpinEditControlStandalone spinEdit;
+  eastl::optional<int> defaultValue;
+  ColorOverride::ColorIndex valueHighlightColor = ColorOverride::NONE;
 };
 
 } // namespace PropPanel

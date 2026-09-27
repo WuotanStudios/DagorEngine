@@ -15,13 +15,10 @@
 #include "bvh_context.h"
 #include "bvh_tools.h"
 #include "bvh_generic_connection.h"
-
-#include "../commonFx/commonFxGame/modfx/modfx_bvh.hlsli"
+#include "bvh_particles.h"
 
 namespace bvh
 {
-
-Sbuffer *alloc_scratch_buffer(uint32_t size, uint32_t &offset);
 
 namespace fx
 {
@@ -42,6 +39,8 @@ static UniqueBuf billboard_ib;
 static uint32_t bindless_indices_index;
 static uint32_t bindless_vertices_index;
 
+static float min_screen_height = 0;
+
 void create_billboard_blases()
 {
   const BillboardVertex vertices[] = {
@@ -56,13 +55,13 @@ void create_billboard_blases()
     {Point3(0, -1, 1), Point2(0, 0)},
   };
 
-  const BillboardIndex indices[] = {0, 1, 2, 0, 2, 3, /**/ 4, 5, 6, 5, 6, 7};
+  const BillboardIndex indices[] = {0, 1, 2, 0, 2, 3, /**/ 4, 5, 6, 4, 6, 7};
 
-  billboard_ib =
-    dag::buffers::create_persistent_sr_byte_address(divide_up(sizeof(BillboardIndex) * countof(indices), 4), "bvh_billboard_ib");
+  billboard_ib = dag::buffers::create_persistent_sr_byte_address(divide_up(sizeof(BillboardIndex) * countof(indices), 4),
+    "bvh_billboard_ib", d3d::buffers::Init::No, RESTAG_BVH);
   HANDLE_LOST_DEVICE_STATE(billboard_ib, );
-  billboard_vb =
-    dag::buffers::create_persistent_sr_byte_address(divide_up(sizeof(BillboardVertex) * countof(vertices), 4), "bvh_billboard_vb");
+  billboard_vb = dag::buffers::create_persistent_sr_byte_address(divide_up(sizeof(BillboardVertex) * countof(vertices), 4),
+    "bvh_billboard_vb", d3d::buffers::Init::No, RESTAG_BVH);
   HANDLE_LOST_DEVICE_STATE(billboard_vb, );
 
   billboard_ib->updateData(0, sizeof(indices), indices, 0);
@@ -80,7 +79,7 @@ void create_billboard_blases()
   desc.data.triangles.indexOffset = 0;
   desc.data.triangles.flags = RaytraceGeometryDescription::Flags::NONE;
 
-  RaytraceBuildFlags buildFlags = RaytraceBuildFlags::FAST_TRACE;
+  RaytraceBuildFlags buildFlags = RaytraceBuildFlags::FAST_TRACE | RaytraceBuildFlags::LOW_MEMORY;
 
   billboard_blas = UniqueBLAS::create(&desc, 1, buildFlags);
   HANDLE_LOST_DEVICE_STATE(billboard_blas, );
@@ -115,8 +114,10 @@ static MeshMetaAllocator::AllocId get_particle_meta(ContextId context_id, TEXTUR
   if (iter != context_id->particleMeta.end())
     return iter->second.metaAllocId;
 
-  auto metaAllocId = context_id->allocateMetaRegion(1);
-  auto &meta = context_id->meshMetaAllocator.get(metaAllocId)[0];
+  TIME_PROFILE(meta_lock_particle);
+  auto metaAllocId = context_id->allocateMetaRegion(1, "particle");
+  LockedMetaAccess lockedMeta(*context_id, metaAllocId);
+  auto &meta = lockedMeta[0];
 
   meta.markInitialized();
 
@@ -140,9 +141,7 @@ static MeshMetaAllocator::AllocId get_particle_meta(ContextId context_id, TEXTUR
 
 struct BVHConnection : public bvh::BVHConnection
 {
-  BVHConnection(const char *name) : bvh::BVHConnection(name) {}
-
-  UniqueBuf particleData;
+  BVHConnection(const char *name) : bvh::BVHConnection(name) { instanceBufferAlign = particles::FX_CAPACITY_ALIGN; }
 
   void textureUsed(TEXTUREID texture_id) override
   {
@@ -157,10 +156,12 @@ struct BVHConnection : public bvh::BVHConnection
   {
     if (!bvh::BVHConnection::prepare())
       return false;
+    if (!particles::is_ready())
+      return false;
 
     static int dafx_modfx_bvh_max_countVarId = get_shader_variable_id("dafx_modfx_bvh_max_count");
     static int dafx_modfx_bvh_blas_addressVarId = get_shader_variable_id("dafx_modfx_bvh_blas_address");
-    static int bvh_particle_dataVarId = get_shader_variable_id("bvh_particle_data");
+    static int dafx_modfx_bvh_min_screen_heightVarId = get_shader_variable_id("dafx_modfx_bvh_min_screen_height");
 
     static int dafx_modfx_bvh_instance_buffer_regno =
       ShaderGlobal::get_int(get_shader_variable_id("dafx_modfx_bvh_instance_buffer_regno"));
@@ -169,35 +170,32 @@ struct BVHConnection : public bvh::BVHConnection
     static int dafx_modfx_bvh_instance_data_regno =
       ShaderGlobal::get_int(get_shader_variable_id("dafx_modfx_bvh_instance_data_regno"));
 
-    if (particleData && particleData->getNumElements() < maxCount)
-      particleData.close();
-
-    if (!particleData && maxCount)
-    {
-      particleData = dag::buffers::create_ua_sr_structured(sizeof(ModfxBVHParticleData), maxCount, "bvh_fx_particle_data");
-      HANDLE_LOST_DEVICE_STATE(particleData, false);
-      ShaderGlobal::set_buffer(bvh_particle_dataVarId, particleData);
-    }
-
     d3d::set_rwbuffer(STAGE_VS, dafx_modfx_bvh_instance_buffer_regno, getInstancesBuffer().getBuf());
     d3d::set_rwbuffer(STAGE_VS, dafx_modfx_bvh_instance_count_regno, getInstanceCounter().getBuf());
-    d3d::set_rwbuffer(STAGE_VS, dafx_modfx_bvh_instance_data_regno, particleData.getBuf());
+    d3d::set_rwbuffer(STAGE_VS, dafx_modfx_bvh_instance_data_regno, particles::get_data_buf());
 
     auto blasAddress = billboard_blas.getGPUAddress();
     auto shadowBlasAddress = billboard_shadow_blas.getGPUAddress();
 
-    ShaderGlobal::set_int(dafx_modfx_bvh_max_countVarId, getInstancesBuffer() ? getInstancesBuffer()->getNumElements() : 0);
-    ShaderGlobal::set_int4(dafx_modfx_bvh_blas_addressVarId, blasAddress & 0xFFFFFFFFLLU, blasAddress >> 32,
-      shadowBlasAddress & 0xFFFFFFFFLLU, shadowBlasAddress >> 32);
+    const int fxInstancesCap = getInstancesBuffer() ? (int)getInstancesBuffer()->getNumElements() : 0;
+    ShaderGlobal::set_int(dafx_modfx_bvh_max_countVarId, min(fxInstancesCap, particles::get_fx_capacity()));
+    ShaderGlobal::set_int4(dafx_modfx_bvh_blas_addressVarId, blasAddress & GPU_ADDRESS_LOW_MASK, blasAddress >> GPU_ADDRESS_HIGH_SHIFT,
+      shadowBlasAddress & GPU_ADDRESS_LOW_MASK, shadowBlasAddress >> GPU_ADDRESS_HIGH_SHIFT);
+
+    ShaderGlobal::set_float(dafx_modfx_bvh_min_screen_heightVarId, min_screen_height);
 
     return true;
   }
 
-  void teardown() override
+  void done() override
   {
-    bvh::BVHConnection::teardown();
-    particleData.close();
+    bvh::BVHConnection::done();
+
+    if (Sbuffer *particleData = particles::get_data_buf())
+      d3d::resource_barrier({particleData, RB_STAGE_COMPUTE | RB_SOURCE_STAGE_VERTEX});
   }
+
+  void teardown() override { bvh::BVHConnection::teardown(); }
 
 } bvhConnection("fx");
 
@@ -205,16 +203,25 @@ void on_unload_scene(ContextId context_id)
 {
   for (auto &meta : context_id->particleMeta)
   {
-    context_id->releaseTexure(meta.second.textureId);
+    context_id->releaseTexture(meta.second.textureId);
     context_id->freeMetaRegion(meta.second.metaAllocId);
   }
   context_id->particleMeta.clear();
 }
 
-void init()
+void init(const AdditionalSettings &settings)
 {
+  min_screen_height = settings.fxMinScreenHeight;
   bvhConnection.init();
   create_billboard_blases();
+}
+
+void collect_blas_addresses(dag::Vector<uint64_t> &addresses)
+{
+  if (billboard_blas)
+    addresses.push_back(billboard_blas.getGPUAddress());
+  if (billboard_shadow_blas)
+    addresses.push_back(billboard_shadow_blas.getGPUAddress());
 }
 
 void teardown()
@@ -229,7 +236,7 @@ void teardown()
 
 void init(ContextId context_id)
 {
-  if (!context_id->has(Features::Fx))
+  if (!context_id->hasAny(Features::Fx))
     return;
 
   G_ASSERT(bvhConnection.contexts.empty());
@@ -245,7 +252,7 @@ void init(ContextId context_id)
 
 void teardown(ContextId context_id)
 {
-  if (!context_id->has(Features::Fx))
+  if (!context_id->hasAny(Features::Fx))
     return;
 
   bvhConnection.contexts.erase(context_id);
@@ -253,15 +260,13 @@ void teardown(ContextId context_id)
   context_id->releaseBuffer(billboard_ib.getBuf());
   context_id->releaseBuffer(billboard_vb.getBuf());
   bvh::fx::on_unload_scene(context_id);
-
-  bvhConnection.contexts.erase(context_id);
 }
 
 void connect(fx_connect_callback callback) { callback(&bvhConnection); }
 
 void get_instances(ContextId context_id, Sbuffer *&instances, Sbuffer *&instance_count)
 {
-  if (context_id->has(Features::Fx))
+  if (context_id->hasAny(Features::Fx))
   {
     instances = bvhConnection.instances.getBuf();
     instance_count = bvhConnection.counter.getBuf();

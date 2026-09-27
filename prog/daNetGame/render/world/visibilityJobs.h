@@ -17,6 +17,7 @@
 
 class CascadeShadows;
 class Occlusion;
+class OcclusionMaskApplier;
 class ParallelOcclusionRasterizer;
 class ShadowsManager;
 struct RiGenVisibility;
@@ -45,7 +46,7 @@ struct VisibilityReprojectJob final : public cpujobs::IJob
   Occlusion *occlusion;
 
   void start(Occlusion *occl);
-  const char *getJobName(bool &) const override { return "VisibilityReprojectJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("VisibilityReprojectJob"); }
   void doJob() override;
 };
 
@@ -56,7 +57,7 @@ struct OcclusionReadbackGPUJob final : public cpujobs::IJob
   Occlusion *occlusion = nullptr;
 
   void start(const VisibilityJobsContext *jobs, Occlusion *occl);
-  const char *getJobName(bool &) const override { return "OcclusionReadbackGPUJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("OcclusionReadbackGPUJob"); }
   virtual void doJob() override;
   void performJob();
 };
@@ -83,7 +84,7 @@ struct RendinstVisibilityPrepareJob final : public cpujobs::IJob
     bool shadow_,
     threadpool::JobPriority prio_);
 
-  const char *getJobName(bool &) const override { return "RendinstVisibilityPrepareJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("RendinstVisibilityPrepareJob"); }
   void doJob() override;
 };
 
@@ -112,7 +113,7 @@ struct RendinstExtraVisibilityPrepareJob final : public cpujobs::IJob
     threadpool::JobPriority prio_,
     eastl::optional<IPoint2> target_ = {},
     bool is_main_job = false);
-  const char *getJobName(bool &) const override { return "RendinstExtraVisibilityPrepareJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("RendinstExtraVisibilityPrepareJob"); }
   void doJob() override;
 };
 
@@ -128,6 +129,7 @@ struct VisibilityPrepareJob final : public cpujobs::IJob
   PartitionSphere transparentPartitionSphere;
   bool hasGpuDepth = false;
   ShadowVisibilityContext shadowCtx;
+  OcclusionMaskApplier *occlusionMaskApplier = nullptr;
   eastl::optional<IPoint2> target = {};
 
   void start(const VisibilityJobsContext *jobs,
@@ -137,8 +139,9 @@ struct VisibilityPrepareJob final : public cpujobs::IJob
     const CameraParams &cur_frame_camera,
     const PartitionSphere &transparentPartitionSphere_,
     const IPoint2 &rendering_resolution,
-    const ShadowVisibilityContext &shadow_ctx);
-  const char *getJobName(bool &) const override { return "VisibilityPrepareJob"; }
+    const ShadowVisibilityContext &shadow_ctx,
+    OcclusionMaskApplier *occlusion_mask_applier);
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("VisibilityPrepareJob"); }
   void doJob() override;
   void prepareVisibility();
   void finalize();
@@ -150,65 +153,48 @@ struct LodsByDistanceJob final : public cpujobs::IJob
   Point3 cameraPos;
 
   void start(const Point3 &camera_pos);
-  const char *getJobName(bool &) const override { return "LodsByDistanceJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("LodsByDistanceJob"); }
   void doJob() override;
 };
 
 struct GroundCullingJob final : public cpujobs::IJob
 {
   const VisibilityJobsContext *jobs = nullptr;
-  LandMeshCullingState lmeshCullingState;
+  // Fully captured at start() on the render thread (incl. the per-frame useExclBox bit);
+  // doJob() is a pure landmesh::frustum_cull over stable level data.
+  LandMeshCullDesc cullDesc;
   LandMeshCullingData *lmeshCullingData = nullptr;
   LandMeshManager *lmeshMgr = nullptr;
-  LandMeshRenderer *lmeshRenderer = nullptr;
-  Occlusion *occlusion = nullptr;
-  Frustum frustum;
-  TMatrix4 viewProj = TMatrix4::IDENT;
-  Point3 viewPos = {0, 0, 0};
-  float hmapCameraHeight = 0.0f;
-  float waterLevel = 0.0f;
-  int displacementSubDiv = 1;
 
   void start(const VisibilityJobsContext *jobs,
     LandMeshCullingData *culling_data,
     LandMeshManager *lmesh_mgr,
-    LandMeshRenderer *lmesh_renderer,
     Occlusion *occlusion,
     const Frustum &frustum_,
     const Point3 &viewPos_,
     const TMatrix4 &viewProj_,
-    const float hmap_camera_height,
-    const float water_level,
     const int displacement_sub_div,
+    const float displacement_radius,
     threadpool::JobPriority prio);
-  const char *getJobName(bool &) const override { return "GroundCullingJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("GroundCullingJob"); }
   void doJob() override;
 };
 
 struct GroundReflectionCullingJob final : public cpujobs::IJob
 {
   const VisibilityJobsContext *jobs = nullptr;
-  LandMeshCullingState lmeshCullingState;
+  LandMeshCullDesc cullDesc;
   LandMeshCullingData *lmeshCullingData = nullptr;
   LandMeshManager *lmeshMgr = nullptr;
-  LandMeshRenderer *lmeshRenderer = nullptr;
-  Frustum frustum;
-  TMatrix4 viewProj = TMatrix4::IDENT;
-  Point3 viewPos = {0, 0, 0};
-  float hmapCameraHeight = 0.0f;
-  float waterLevel = 0.0f;
 
   void start(const VisibilityJobsContext *jobs,
     LandMeshCullingData *culling_data,
     LandMeshManager *lmesh_mgr,
-    LandMeshRenderer *lmesh_renderer,
     const Frustum &frustum_,
     const Point3 &viewPos_,
     const TMatrix4 &viewProj_,
-    const float hmap_camera_height,
-    const float water_level,
     threadpool::JobPriority prio);
-  const char *getJobName(bool &) const override { return "GroundReflectionCullingJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("GroundReflectionCullingJob"); }
   virtual void doJob() override;
 };
 
@@ -218,9 +204,11 @@ struct LightsCullingJob final : public cpujobs::IJob
   mat44f globtm, view, proj;
   vec4f viewPos;
   float zn = 0.1;
+  float zf = 10000.f;
+  float hk = 1.f;
 
   void start(Occlusion *occlusion, const CameraParams &cur_frame_camera, threadpool::JobPriority prio);
-  const char *getJobName(bool &) const override { return "LightsCullingJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("LightsCullingJob"); }
   void doJob() override;
 };
 
@@ -230,6 +218,6 @@ struct LightProbeVisibilityJob final : public cpujobs::IJob
   Point3 viewPos;
 
   void start(const mat44f &globtm_, const Point3 &view_pos);
-  const char *getJobName(bool &) const override { return "LightProbeVisibilityJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("LightProbeVisibilityJob"); }
   virtual void doJob() override;
 };

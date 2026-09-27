@@ -1,8 +1,9 @@
 
+#define MIN_POSSIBLE_WARP_SIZE 32 // Xbox Series (RDNA2)
+
 #define WAVE_INTRINSICS 1
 #define WaveReadLaneAt __XB_ReadLane
 #define WaveReadFirstLane(a) __XB_MakeUniform((a))
-#define WaveIsHelperLane  WaveIsFirstLane
 #define WaveGetLaneIndex __XB_GetLaneID
 #define WaveAllBitOr __XB_WaveOR
 #define WaveAllBitAnd __XB_WaveAND
@@ -46,3 +47,5 @@ struct TextureCubeArraySampler
   TextureCubeArray tex;
   SamplerState smp;
 };
+
+#define ACCESS_FORMAT(fmt)

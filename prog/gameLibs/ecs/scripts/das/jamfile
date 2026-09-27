@@ -18,6 +18,9 @@ AddIncludes =
 
 local AllSources = [ GLOB $(Root)/$(Location) : *.cpp ] ;
 Sources = $(AllSources:D=) ;
+
+# selects policies.jit_enabled, so the host hashes the same program the .o was emitted from
+if $(NeedDasLLVMAotCompile) = yes { CPPopt += -DDAS_LLVM_AOT ; }
 SourceDAS =
   ecs.das
 ;
@@ -35,7 +38,7 @@ if $(Platform) in windows xboxOne scarlett
   CPPopt = /bigobj ;
 }
 
-if [ GLOB $(Root)/prog/gameLibs/daECS/net : * ] {
+if [ GLOB $(Root)/prog/engine/daECS/net : * ] {
   CPPopt += -DHAS_DANET ;
 }
 

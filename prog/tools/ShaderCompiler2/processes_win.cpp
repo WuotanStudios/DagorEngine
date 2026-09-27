@@ -164,7 +164,10 @@ eastl::optional<ProcessHandle> spawn_process(ExecutionState &state, ProcessTask 
   if (task.cwd.has_value())
   {
     if (is_path_abs(task.cwd->c_str()))
+    {
       strncpy(cwdStorage, task.cwd->c_str(), sizeof(cwdStorage));
+      cwdStorage[sizeof(cwdStorage) - 1] = '\0';
+    }
     else
     {
       DWORD len = GetCurrentDirectory(sizeof(cwdStorage), cwdStorage);
@@ -207,6 +210,16 @@ void serve_process_output(ExecutionState &state, ProcessHandle &hnd)
 
   sink.lastTs = get_time_msec();
   hnd.hasCommunicated = true;
+}
+
+eastl::string convert_message(eastl::string_view msg)
+{
+  eastl::string out{""};
+  out.reserve(msg.length());
+  for (char c : msg)
+    if (c != '\r')
+      out.push_back(c);
+  return out;
 }
 
 void send_interrupt_signal_to_process(const ProcessHandle &process)

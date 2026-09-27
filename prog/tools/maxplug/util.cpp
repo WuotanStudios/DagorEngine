@@ -10,12 +10,21 @@
 #include <mnmath.h>
 #include <splshape.h>
 #include <ilayer.h>
-#include <ilayerproperties.h>
+#include <ILayerProperties.h>
+#include <modstack.h>
+#include <iskin.h>
+#include <dummy.h>
 
 #include <vector>
 #include <string>
+#include <string_view>
 #include <sstream>
+#include <fstream>
 #include <memory>
+#include <algorithm>
+#include <locale>
+#include <unordered_set>
+#include <filesystem>
 
 #include "dagor.h"
 #include "enumnode.h"
@@ -24,53 +33,37 @@
 #include "resource.h"
 #include "cfg.h"
 #include "mathAng.h"
-#include "dag_auto_ptr.h"
+#include "datablk.h"
+#include "common.h"
+#include "dagorLogWindow.h"
 
 #include "layout.h"
-#include "common.h"
 
+namespace fs = std::filesystem;
 
 #define ERRMSG_DELAY 3000
 
-#define MAX_CLSNAME 64
+static const wchar_t *ENUMERATE_MATERIALS_FILENAME = L"d:/materials.txt";
+static const wchar_t *CONVERT_MATERIALS_FILENAME = L"d:/materials_conv.txt";
 
-static Tab<char *> dagpath;
+static std::vector<fs::path> dagpath;
 
-char dagor_path[256] = "";
-void debug(char *s, ...);
+fs::path dagor_path;
 
 void import_milkshape_anim(Interface *ip, HWND hpanel);
+
+std::vector<std::wstring> get_blk_shader_list(const DataBlock *dataBlk);
 
 class Dag2DagnewCB : public ENodeCB
 {
 public:
-  Interface *ip;
-  TimeValue time;
   bool onImport;
-  CfgShader *cfg;
 
   std::map<Mtl *, Mtl *> convertedMat;
 
-  Dag2DagnewCB(Interface *iptr, bool on_import)
-  {
-    ip = iptr;
-    time = ip->GetTime();
+  explicit Dag2DagnewCB(bool on_import) : onImport(on_import) {}
 
-    onImport = on_import;
-
-    if (onImport)
-    {
-      TCHAR filename[MAX_PATH];
-      CfgShader::GetCfgFilename(_T("DagorShaders.cfg"), filename);
-      cfg = new CfgShader(filename);
-    }
-    else
-    {
-      cfg = NULL;
-    }
-  }
-
-  ~Dag2DagnewCB() override {}
+  ~Dag2DagnewCB() override = default;
 
   Mtl *conv_mat(Mtl *&m)
   {
@@ -78,22 +71,6 @@ public:
     if (cid == DagorMat_CID)
     {
       IDagorMat *d = (IDagorMat *)m->GetInterface(I_DAGORMAT);
-
-      if (onImport && d->get_classname() != NULL && d->get_classname()[0] != 0)
-      {
-        StringVector *shaders = cfg->GetShaderNames();
-        bool found = false;
-        for (unsigned int shaderNo = 0; shaderNo < shaders->size(); shaderNo++)
-        {
-          if (!_tcsicmp(d->get_classname(), shaders->at(shaderNo).c_str()))
-          {
-            found = true;
-            break;
-          }
-        }
-        if (!found)
-          return NULL;
-      }
 
       Mtl *nm = (Mtl *)CreateInstance(MATERIAL_CLASS_ID, DagorMat2_CID);
       IDagorMat *nd = (IDagorMat *)nm->GetInterface(I_DAGORMAT);
@@ -105,25 +82,22 @@ public:
       nd->set_emis(d->get_emis());
       nd->set_power(d->get_power());
       nd->set_spec(d->get_spec());
-      nd->set_script(d->get_script());
 
       if (onImport && (d->get_classname() == NULL || d->get_classname()[0] == 0))
-      {
-        nd->set_classname(_T("simple"));
-        nd->set_script(_T("lighting=lightmap\r\n"));
-      }
+        nd->set_classname(_T("gi_black"));
 
       nm->SetName(m->GetName());
 
-
-      for (int i = 0; i < NUMTEXMAPS; ++i)
+      if (!isProxymatName(nd->get_classname()))
       {
-        Texmap *tex = m->GetSubTexmap(i);
-        if (tex)
-          nm->SetSubTexmap(i, tex);
+        nd->set_script(d->get_script());
 
-        // nd->set_param(i, d->get_param(i));
-        // nd->set_texname(i, d->get_texname(i));
+        for (int i = 0; i < NUMTEXMAPS; ++i)
+        {
+          Texmap *tex = m->GetSubTexmap(i);
+          if (tex)
+            nm->SetSubTexmap(i, tex);
+        }
       }
 
       m->ReleaseInterface(I_DAGORMAT, d);
@@ -138,7 +112,6 @@ public:
     if (!n)
       return ECB_CONT;
     Mtl *m = n->GetMtl();
-    char cnv = 0;
     if (m)
     {
       if (m->IsMultiMtl())
@@ -193,7 +166,7 @@ void convertnew(Interface *ip, bool on_import)
   if (!ip)
     return;
 
-  Dag2DagnewCB cbv(ip, on_import);
+  Dag2DagnewCB cbv(on_import);
   enum_nodes(ip->GetRootNode(), &cbv);
   ip->RedrawViews(ip->GetTime());
 }
@@ -223,21 +196,7 @@ struct MappingInfo
   }
 };
 
-typedef int FaceNGr[3];
-// typedef float real;
-#define INLINE   __forceinline
-#define MAX_REAL FLT_MAX
-#define MIN_REAL (-FLT_MAX)
-//__forceinline real rabs(real a){return fabsf(a);}
-
-/*INLINE unsigned real2uchar(float p) {
-  float _n=p+1.0f;
-  unsigned i=*(unsigned*)&_n;
-  if(i>=0x40000000) i=0xFF;
-  else if(i<=0x3F800000) i=0;
-  else i=(i>>15)&0xFF;
-  return i;
-}*/
+#define INLINE __forceinline
 
 template <typename To, typename From>
 To bitwise_cast(const From &from)
@@ -259,20 +218,13 @@ INLINE int real2int(float x)
 }
 
 
-static void spaces_to_underscores(TCHAR *string)
-{
-  for (TCHAR *cur = string; *cur; cur++)
-    if (*cur == ' ')
-      *cur = '_';
-}
-
-
 class TopologyAdapter
 {
 public:
   Mesh *mesh;
 
   TopologyAdapter(Mesh *in_mesh) { mesh = in_mesh; }
+  virtual ~TopologyAdapter() = default;
   virtual unsigned int getNumVerts() = 0;
   virtual void setNumVerts(unsigned int num_verts) = 0;
   virtual unsigned int getIndex(unsigned int face_no, unsigned int index_no) = 0;
@@ -310,7 +262,7 @@ public:
   float gs_xydiap[2], gs_zdiap[2];
   float gs_slope;
   int gs_seed, gs_objnum;
-  TCHAR gs_sname[512];
+  WStr gs_sname;
 
   // splines & smooth
   HWND splinesAndSmoothRoll;
@@ -325,13 +277,20 @@ public:
 
   // materials
   HWND materialsRoll;
-  TCHAR clsname[MAX_CLSNAME];
+  WStr clsname;
   ICustEdit *eclsname;
+
+  // export to json (UE5)
+  HWND exportToJsonRoll;
+  fs::path exp_fname;
+  bool exp_selected;
+  std::wstring asset_prefix;
 
 protected:
   bool editableMeshFound;
   unsigned int degenerateFacesRemovedNum;
   unsigned int isolatedVerticesRemovedNum;
+  ToolTipExtender tooltip;
 
 public:
   DagUtil();
@@ -343,6 +302,7 @@ public:
 
   BOOL dagor_util_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam);
   BOOL materials_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam);
+  BOOL export_to_json_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam);
   BOOL uv_util_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam);
   BOOL spline_and_smooth_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam);
   BOOL scatter_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -385,8 +345,16 @@ public:
   void maxtures2materials();
   void maxtures2materials(Mesh &m, INode *node);
   void collapse();
-  void convert();
-  void enumerate();
+  bool convert();
+  bool enumerate();
+
+  // export to json
+  void resolveNamesForJson();
+  void exportToJson();
+  void resolveHierarchy();
+  void removeSkinModifiers();
+
+  void updateTooltips(HWND hw);
 
 protected:
   void dagor_util_update_ui(HWND hw);
@@ -401,8 +369,6 @@ protected:
 };
 
 static DagUtil util;
-// Compute per-vertex normal in 3dsMax way
-void ComputeVertexNormals(Mesh *mesh, Tab<Point3> &vnrm, Tab<FaceNGr> &fngr, Point3 *trvert = NULL);
 
 
 class DagUtilDesc : public ClassDesc
@@ -411,11 +377,7 @@ public:
   int IsPublic() override { return 1; }
   void *Create(BOOL loading = FALSE) override { return &util; }
   const TCHAR *ClassName() override { return GetString(IDS_DAGUTIL_NAME); }
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
   const MCHAR *NonLocalizedClassName() override { return ClassName(); }
-#else
-  const MCHAR *NonLocalizedClassName() { return ClassName(); }
-#endif
   SClass_ID SuperClassID() override { return UTILITY_CLASS_ID; }
   Class_ID ClassID() override { return DagUtil_CID; }
   const TCHAR *Category() override { return GetString(IDS_UTIL_CAT); }
@@ -474,7 +436,7 @@ IOResult DagUtilDesc::Save(ISave *io)
     return IO_ERROR;
   if (io->Write(&util.gs_objnum, 4, &nw) != IO_OK)
     return IO_ERROR;
-  if (io->Write(util.gs_sname, (int)_tcslen(util.gs_sname), &nw) != IO_OK)
+  if (io->Write(util.gs_sname.data(), ULONG((util.gs_sname.length() + 1) * sizeof(wchar_t)), &nw) != IO_OK)
     return IO_ERROR;
   io->EndChunk();
   io->BeginChunk(CH_GS2);
@@ -541,8 +503,10 @@ IOResult DagUtilDesc::Load(ILoad *io)
           return IO_ERROR;
         if (io->Read(&util.gs_objnum, 4, &nr) != IO_OK)
           return IO_ERROR;
-        if (io->Read(util.gs_sname, sizeof(util.gs_sname), &nr) != IO_OK)
+        wchar_t name[512] = {};
+        if (io->Read(name, (_countof(name) - 1) * sizeof(wchar_t), &nr) != IO_OK)
           return IO_ERROR;
+        util.gs_sname = name;
       }
       break;
       case CH_GS2:
@@ -627,121 +591,89 @@ const TCHAR *make_path_rel(const TCHAR *p)
     return p;
   if (*p == 0)
     return p;
-  for (int i = 0; i < dagpath.Count(); ++i)
+  for (const fs::path &dp : dagpath)
   {
-    const TCHAR *s = stripbasepath(p, strToWide(dagpath[i]).c_str());
+    const TCHAR *s = stripbasepath(p, dp.c_str());
     if (s)
       return s;
   }
-  /*
-      if(p[1]==':') p+=2;
-      for(;*p=='\\' || *p=='/';++p);
-  */
-
 
   return p;
 }
 
-static void add_dagpath(char *p, bool first)
+static void add_dagpath(const fs::path &p, bool first)
 {
-  int i;
-  for (i = 0; i < dagpath.Count(); ++i)
-    if (stricmp(p, dagpath[i]) == 0)
+  size_t i;
+  for (i = 0; i < dagpath.size(); ++i)
+    if (iequal(p.native(), dagpath[i].native()))
       break;
-  if (i < dagpath.Count())
+  if (i < dagpath.size())
   {
     if (first)
     {
-      char *dp = dagpath[i];
-      dagpath.Delete(i, 1);
-      dagpath.Insert(0, 1, &dp);
+      fs::path dp = dagpath[i];
+      dagpath.erase(dagpath.begin() + i);
+      dagpath.insert(dagpath.begin(), dp);
     }
     return;
   }
-  p = strdup(p);
-  assert(p);
   if (first)
-    dagpath.Insert(0, 1, &p);
+    dagpath.insert(dagpath.begin(), p);
   else
-    dagpath.Append(1, &p);
+    dagpath.push_back(p);
 }
 
-
-void AppendSlash(char *p)
-{
-  char last = p[strlen(p) - 1];
-  if (last != '\\' && last != '/')
-    strcat(p, "\\");
-}
 
 void load_dagorpath_cfg()
 {
-  TCHAR fname[256];
-
-  CfgShader::GetCfgFilename(_T("DagorPath.cfg"), fname);
-  FILE *h = _tfopen(fname, _T("rt"));
-  if (h)
+  fs::path cfg_path = get_cfg_filename(_T("DagorPath.cfg"));
+  std::ifstream is(cfg_path);
+  if (is)
   {
-    int i;
-    for (i = 0; i < dagpath.Count(); ++i)
-      free(dagpath[i]);
-    dagpath.ZeroCount();
+    dagpath.clear();
 
-
-    char fn[256];
-
-    while (fgets(fn, 256, h))
+    std::string line;
+    while (std::getline(is, line))
     {
-      for (i = (int)strlen(fn) - 1; i >= 0; --i)
-        if (fn[i] != '\r' && fn[i] != '\n' && fn[i] != '\t' && fn[i] != ' ')
-          break;
-      fn[i + 1] = 0;
-      char *p;
-      for (p = fn; *p; ++p)
-        if (*p != '\r' && *p != '\n' && *p != '\t' && *p != ' ')
-          break;
-      if (!*p)
+      static const char *WHITESPACE = "\r\n\t ";
+      size_t begin = line.find_first_not_of(WHITESPACE);
+      if (begin == std::string::npos)
         continue;
+      size_t end = line.find_last_not_of(WHITESPACE);
+      std::string_view trimmed(line.data() + begin, end - begin + 1);
 
+      std::wstring wp = strToWide(trimmed);
+      if (!wp.empty() && wp.back() != L'\\' && wp.back() != L'/')
+        wp += L'\\';
 
-      // BMMAppendSlash(p);
-
-      AppendSlash(p);
-
-      add_dagpath(p, false);
+      add_dagpath(wp, false);
     }
-    fclose(h);
-    if (dagpath.Count())
-      strcpy(dagor_path, dagpath[0]);
+    if (!dagpath.empty())
+      dagor_path = dagpath[0];
     else
-      strcpy(dagor_path, "");
+      dagor_path.clear();
   }
 }
 
 
-void set_dagor_path(const char *p)
+void set_dagor_path(std::wstring_view p)
 {
-  if (!p)
-    return;
   load_dagorpath_cfg();
 
-  strcpy(dagor_path, p);
-  // BMMAppendSlash(dagor_path);
+  dagor_path = p;
 
-  AppendSlash(dagor_path);
+  const std::wstring &native = dagor_path.native();
+  if (!native.empty() && native.back() != L'\\' && native.back() != L'/')
+    dagor_path += L'\\';
+
   add_dagpath(dagor_path, true);
 
-  TCHAR fn[256];
-  CfgShader::GetCfgFilename(_T("DagorPath.cfg"), fn);
-  FILE *h = _tfopen(fn, _T("wt"));
-  if (h)
+  fs::path cfg_path = get_cfg_filename(_T("DagorPath.cfg"));
+  std::ofstream os(cfg_path);
+  if (os)
   {
-    for (int i = 0; i < dagpath.Count(); ++i)
-    {
-      fputs(dagpath[i], h);
-      fputs("\n", h);
-    }
-    fclose(h);
+    for (const fs::path &dp : dagpath)
+      os << wideToStr(dp.c_str()) << "\n";
   }
 }
 
@@ -820,15 +752,12 @@ BOOL DagUtil::selection_brightness_dlg_proc(HWND hWnd, UINT msg, WPARAM wParam, 
         SelectObject(hdc, GetStockObject(SYSTEM_FIXED_FONT));
         TCHAR buf[32];
         _stprintf(buf, _T("alfa=%.3frad -> d=%i"), alfa, d);
-        // debug(buf);
         TextOut(hdc, 150, 200 + 40, buf, (int)_tcslen(buf));
         _stprintf(buf, _T("%.6f>%.6f"), br, part);
         TextOut(hdc, 150, 220 + 40, buf, (int)_tcslen(buf));
-        // debug(buf);
       }
       ReleaseICustEdit(iEdit);
       EndPaint(hWnd, &ps);
-      ReleaseDC(hWnd, hdc);
     }
     break;
 
@@ -909,14 +838,14 @@ BOOL DagUtil::dagor_util_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lPara
         case IDC_SELECT_FLOOR: selectFloorFaces(); break;
         case IDC_SET_DAGORPATH:
         {
-          TCHAR dir[256];
-          _tcscpy(dir, strToWide(dagor_path).c_str());
+          TCHAR dir[MAX_PATH];
+          _tcsncpy_s(dir, _countof(dir), dagor_path.c_str(), _TRUNCATE);
 
           ip->ChooseDirectory(hw, GetString(IDS_CHOOSE_DAGOR_PATH), dir);
           if (dir[0])
           {
-            set_dagor_path(wideToStr(dir).c_str());
-            SetDlgItemText(hw, IDC_DAGORPATH, strToWide(dagor_path).c_str());
+            set_dagor_path(dir);
+            SetDlgItemText(hw, IDC_DAGORPATH, dagor_path.c_str());
           }
           break;
         }
@@ -985,7 +914,12 @@ BOOL DagUtil::materials_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam
         }
         case IDC_ENUMERATE:
         {
-          enumerate();
+          if (!enumerate())
+          {
+            TSTR msg;
+            msg.printf(_T("Failed to write '%s'."), ENUMERATE_MATERIALS_FILENAME);
+            MessageBox(dagorUtilRoll, msg, _T("Enumerate materials"), MB_ICONERROR);
+          }
           break;
         }
         case IDC_COLLAPSE:
@@ -995,7 +929,12 @@ BOOL DagUtil::materials_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam
         }
         case IDC_CONVERT:
         {
-          convert();
+          if (!convert())
+          {
+            TSTR msg;
+            msg.printf(_T("Failed to write '%s'."), CONVERT_MATERIALS_FILENAME);
+            MessageBox(dagorUtilRoll, msg, _T("Convert materials"), MB_ICONERROR);
+          }
           break;
         }
         case IDC_CONVERT_NEW:
@@ -1005,10 +944,74 @@ BOOL DagUtil::materials_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam
         }
         case IDC_CLSNAME:
         {
-          eclsname->GetText(clsname, MAX_CLSNAME);
+          eclsname->GetText(clsname);
           break;
         }
       }
+      break;
+
+    default: return FALSE;
+  }
+  return TRUE;
+#undef reled
+}
+
+static INT_PTR CALLBACK export_to_json_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  return util.export_to_json_dlg_proc(hw, msg, wParam, lParam);
+}
+
+BOOL DagUtil::export_to_json_dlg_proc(HWND hw, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  switch (msg)
+  {
+    case WM_INITDIALOG:
+      SetWindowText(GetDlgItem(hw, IDC_ASSET_PREFIX), asset_prefix.data());
+      CheckDlgButton(hw, IDC_EXPSEL, exp_selected);
+      updateTooltips(hw);
+      break;
+
+    case WM_COMMAND:
+
+      // resolve
+
+      if (wParam == MAKEWPARAM(IDC_ASSET_PREFIX, EN_SETFOCUS))
+        DisableAccelerators();
+
+      else if (wParam == MAKEWPARAM(IDC_ASSET_PREFIX, EN_KILLFOCUS))
+      {
+        EnableAccelerators();
+        asset_prefix = get_window_text(GetDlgItem(hw, IDC_ASSET_PREFIX));
+      }
+
+      else if (wParam == MAKEWPARAM(IDC_RESOLVE_NAMES, BN_CLICKED))
+        resolveNamesForJson();
+
+      else if (wParam == MAKEWPARAM(IDC_RESOLVE_HIER, BN_CLICKED))
+        resolveHierarchy();
+
+      // export
+
+      else if (LOWORD(wParam) == IDC_EXPSEL)
+      {
+        exp_selected = IsDlgButtonChecked(hw, LOWORD(wParam));
+        updateTooltips(hw);
+      }
+
+      else if (wParam == MAKEWPARAM(IDC_EXPORT, BN_CLICKED))
+      {
+        FilterList fl;
+        fl.Append(_T("JSON"));
+        fl.Append(_T("*.json"));
+        if (get_save_filename(exportToJsonRoll, _T("Export Dagor materials to JSON"), fl, _T("json"), exp_fname))
+          exportToJson();
+      }
+
+      // modifiers
+
+      else if (wParam == MAKEWPARAM(IDC_REMOVE_SKIN_MOD, BN_CLICKED))
+        removeSkinModifiers();
+
       break;
 
     default: return FALSE;
@@ -1331,8 +1334,10 @@ DagUtil::DagUtil()
 
   // materials
   materialsRoll = NULL;
-  _tcscpy(clsname, _T(""));
   eclsname = NULL;
+
+  // export to json
+  exportToJsonRoll = NULL;
 }
 
 void DagUtil::BeginEditParams(Interface *ip, IUtil *iu)
@@ -1342,6 +1347,8 @@ void DagUtil::BeginEditParams(Interface *ip, IUtil *iu)
 
   dagorUtilRoll = add_rollup_page(ip, IDD_DAGUTIL, ::dagor_util_dlg_proc, GetString(IDS_DAGUTIL_ROLL));
   materialsRoll = add_rollup_page(ip, IDD_MATERIALS, ::materials_dlg_proc, GetString(IDS_MATERIALS_ROLL), 0, APPENDROLL_CLOSED);
+  exportToJsonRoll =
+    add_rollup_page(ip, IDD_EXPORT_MAT_TO_JSON, ::export_to_json_dlg_proc, GetString(IDS_EXPORT_TO_JSON), 0, APPENDROLL_CLOSED);
   uvUtilsRoll = add_rollup_page(ip, IDD_UV_UTILS, ::uv_util_dlg_proc, GetString(IDS_UV_UTILS_ROLL), 0, APPENDROLL_CLOSED);
   splinesAndSmoothRoll = add_rollup_page(ip, IDD_SPLINES_AND_SMOOTH, ::spline_and_smooth_dlg_proc,
     GetString(IDS_SPLINES_AND_SMOOTH_ROLL), 0, APPENDROLL_CLOSED);
@@ -1355,6 +1362,7 @@ void DagUtil::EndEditParams(Interface *ip, IUtil *iu)
 
   delete_rollup_page(ip, &dagorUtilRoll);
   delete_rollup_page(ip, &materialsRoll);
+  delete_rollup_page(ip, &exportToJsonRoll);
   delete_rollup_page(ip, &uvUtilsRoll);
   delete_rollup_page(ip, &splinesAndSmoothRoll);
   delete_rollup_page(ip, &scatterRoll);
@@ -1370,22 +1378,20 @@ void DagUtil::EndEditParams(Interface *ip, IUtil *iu)
 void DagUtil::dagor_util_update_ui(HWND hw)
 {
   if (hw)
-  {
-    SetDlgItemText(hw, IDC_DAGORPATH, strToWide(dagor_path).c_str());
-  }
+    SetDlgItemText(hw, IDC_DAGORPATH, dagor_path.c_str());
 }
 
 
 void DagUtil::materials_update_ui(HWND hw)
 {
   if (eclsname)
-    eclsname->SetText(clsname);
+    eclsname->SetText(clsname.data());
 }
 
 void DagUtil::materials_update_vars(HWND hw)
 {
   if (eclsname)
-    eclsname->GetText(clsname, sizeof(clsname));
+    eclsname->GetText(clsname);
 }
 
 
@@ -1498,7 +1504,7 @@ void DagUtil::splines_and_smooth_update_vars(HWND hw)
 void DagUtil::scatter_update_ui(HWND hw)
 {
   if (egs_sname)
-    egs_sname->SetText(gs_sname);
+    egs_sname->SetText(gs_sname.data());
   if (egs_objnum)
     egs_objnum->SetText(gs_objnum);
   if (egs_slope)
@@ -1528,7 +1534,7 @@ void DagUtil::scatter_update_ui(HWND hw)
 void DagUtil::scatter_update_vars(HWND hw)
 {
   if (egs_sname)
-    egs_sname->GetText(gs_sname, sizeof(gs_sname));
+    egs_sname->GetText(gs_sname);
   get_edfloat(egs_xydiap[0], gs_xydiap[0]);
   get_edfloat(egs_xydiap[1], gs_xydiap[1]);
   get_edfloat(egs_zdiap[0], gs_zdiap[0]);
@@ -1727,7 +1733,7 @@ public:
         d->set_emis(Color(1, 1, 1) * si);
         dm->SetSubTexmap(0, tex);
       }
-      d->set_classname(util.clsname);
+      d->set_classname(util.clsname.data());
       dm->ReleaseInterface(I_DAGORMAT, d);
       cm.nm = dm;
       mat.Append(1, &cm);
@@ -1829,7 +1835,6 @@ public:
       sm->SetSpecular(d->get_spec(), time);
       sm->SetShinStr(1, time);
 
-      // d->set_power( powf(2.0f,sm->GetShininess(time)*10.0f) *4.0f );
       float pw = d->get_power();
       if (pw != 0)
         pw = log((float)pw / 4) / log((float)2) / 10;
@@ -1898,48 +1903,15 @@ void DagUtil::dagmat_to_stdmat()
 
 ////////////////////////////////////////////////////////////
 
-typedef dag_auto_ptr<Mtl> MtlPtr;
+typedef std::map<std::wstring, std::wstring> StrMap;
 
-typedef std::vector<M_STD_STRING> StrVec;
-typedef std::vector<MtlPtr> MtlVec;
-typedef std::map<M_STD_STRING, M_STD_STRING> StrMap;
-
-
-M_STD_STRING CfgReplace(M_STD_STRING str, M_STD_STRING dst, M_STD_STRING src)
-{
-  M_STD_STRING res;
-
-  res = str;
-
-  size_t pos = 0;
-
-  while ((pos = res.find(dst, pos)) != std::string::npos)
-  {
-    res.replace(pos, dst.length(), src);
-    pos += src.length();
-  }
-
-  return res;
-}
 
 class Dag2EnumeratorCB : public ENodeCB
 {
 public:
-  StrVec materials;
-  StrVec scripts;
-
   StrMap mats;
 
-  Interface *ip;
-  TimeValue time;
-
-  Dag2EnumeratorCB(Interface *iptr)
-  {
-    ip = iptr;
-    time = ip->GetTime();
-  }
-
-  ~Dag2EnumeratorCB() override {}
+  ~Dag2EnumeratorCB() override = default;
 
   int enumerate(Mtl *&m)
   {
@@ -1947,16 +1919,14 @@ public:
     if (cid == DagorMat_CID)
     {
       IDagorMat *d = (IDagorMat *)m->GetInterface(I_DAGORMAT);
-      M_STD_STRING name = d->get_classname();
-      M_STD_STRING script = d->get_script();
+      std::wstring name = d->get_classname();
+      std::wstring script = d->get_script();
 
-      script = CfgReader::Replace(script, _T("\r"), _T("\\r"));
-      script = CfgReader::Replace(script, _T("\n"), _T("\\n"));
+      script = replace_all(script, L"\r", L"\\r");
+      script = replace_all(script, L"\n", L"\\n");
 
 
-      materials.push_back(name);
-      scripts.push_back(script);
-      M_STD_STRING mat;
+      std::wstring mat;
 
       mat += _T("cn=\"");
       mat += name;
@@ -1971,34 +1941,6 @@ public:
       {
         mats[mat] = _T("ok");
       }
-
-
-      /*
-
-        IDagorMat *d = (IDagorMat *) m->GetInterface(I_DAGORMAT);
-      std::string name = d->get_classname();
-      std::string script = d->get_script();
-
-      script = CfgReader::Replace(script, "\r", "\\r");
-      script = CfgReader::Replace(script, "\n", "\\n");
-
-      materials.push_back(name);
-      scripts.push_back(script);
-      std::string mat;
-
-      mat += "cn=\"";
-      mat += name;
-      mat += "\"";
-      mat += "\n";
-      mat += "sc=\"";
-      mat += script;
-      mat += "\"";
-      mat += "\n";
-
-      if ( mats.find(mat) == mats.end() )
-      {
-        mats[mat] = "ok";
-      }*/
     }
     return 0;
   }
@@ -2034,20 +1976,9 @@ public:
 class Dag2UniqueCB : public ENodeCB
 {
 public:
-  CfgShader *cfg;
-
   Tab<Mtl *> mats;
 
-  Interface *ip;
-  TimeValue time;
-
-  Dag2UniqueCB(Interface *iptr)
-  {
-    ip = iptr;
-    time = ip->GetTime();
-  }
-
-  ~Dag2UniqueCB() override {}
+  ~Dag2UniqueCB() override = default;
 
   Mtl *unique_mat(Mtl *mf)
   {
@@ -2060,8 +1991,8 @@ public:
 
       for (int i = 0; i < NUMTEXMAPS; i++)
       {
-        M_STD_STRING texd = d->get_texname(i) ? d->get_texname(i) : M_STD_STRING();
-        M_STD_STRING texc = c->get_texname(i) ? c->get_texname(i) : M_STD_STRING();
+        std::wstring texd = d->get_texname(i) ? d->get_texname(i) : std::wstring();
+        std::wstring texc = c->get_texname(i) ? c->get_texname(i) : std::wstring();
 
         if (texd.compare(texc) == 0 && d->get_param(i) == c->get_param(i))
         {
@@ -2075,18 +2006,18 @@ public:
       }
 
 
-      M_STD_STRING named = d->get_classname() ? d->get_classname() : M_STD_STRING();
-      M_STD_STRING namec = c->get_classname() ? c->get_classname() : M_STD_STRING();
+      std::wstring named = d->get_classname() ? d->get_classname() : std::wstring();
+      std::wstring namec = c->get_classname() ? c->get_classname() : std::wstring();
 
-      M_STD_STRING scriptd = d->get_script() ? d->get_script() : M_STD_STRING();
-      M_STD_STRING scriptc = c->get_script() ? c->get_script() : M_STD_STRING();
+      std::wstring scriptd = d->get_script() ? d->get_script() : std::wstring();
+      std::wstring scriptc = c->get_script() ? c->get_script() : std::wstring();
 
       if (!same)
         continue;
 
       if (d->get_2sided() == c->get_2sided() && d->get_amb() == c->get_amb() && named.compare(namec) == 0 &&
           d->get_diff() == c->get_diff() && d->get_emis() == c->get_emis() && scriptd.compare(scriptc) == 0 &&
-          d->get_spec() == d->get_spec() && (fabs(d->get_power()) - fabs(c->get_power())) < 0.000001f)
+          d->get_spec() == c->get_spec() && fabs(d->get_power() - c->get_power()) < (0.000001f * fabs(d->get_power())))
       {
         return mats[pos];
       }
@@ -2106,7 +2037,6 @@ public:
     if (!n)
       return ECB_CONT;
     Mtl *m = n->GetMtl();
-    char cnv = 0;
     if (m)
     {
       if (m->IsMultiMtl())
@@ -2143,7 +2073,7 @@ void collapse_materials(Interface *ip)
   if (!ip)
     return;
 
-  Dag2UniqueCB cbv(ip);
+  Dag2UniqueCB cbv;
   enum_nodes(ip->GetRootNode(), &cbv);
   ip->RedrawViews(ip->GetTime());
 }
@@ -2157,30 +2087,22 @@ public:
   StrMap mats_name;
   StrMap mats_script;
 
-  Interface *ip;
-  TimeValue time;
-
-  Dag2DagCB(Interface *iptr)
+  Dag2DagCB()
   {
-    ip = iptr;
-    time = ip->GetTime();
-
-    TCHAR filename[MAX_PATH];
-    CfgShader::GetCfgFilename(_T("DagorConvert.cfg"), filename);
-    cfg = new CfgShader(filename);
+    cfg = new CfgShader(get_cfg_filename(_T("DagorConvert.cfg")).native());
 
     cfg->GetShaderNames();
 
     for (int pos = 0; pos < cfg->shader_names.size(); ++pos)
     {
-      M_STD_STRING cn = cfg->GetKeyValue(_T("cn"), cfg->shader_names.at(pos));
-      M_STD_STRING sc = cfg->GetKeyValue(_T("sc"), cfg->shader_names.at(pos));
-      M_STD_STRING sh = cfg->GetKeyValue(_T("sh"), cfg->shader_names.at(pos));
-      M_STD_STRING pm = cfg->GetKeyValue(_T("pm"), cfg->shader_names.at(pos));
-      pm = CfgReader::Replace(pm, _T("\\r"), _T("\r"));
-      pm = CfgReader::Replace(pm, _T("\\n"), _T("\n"));
+      std::wstring cn = cfg->GetKeyValue(_T("cn"), cfg->shader_names.at(pos));
+      std::wstring sc = cfg->GetKeyValue(_T("sc"), cfg->shader_names.at(pos));
+      std::wstring sh = cfg->GetKeyValue(_T("sh"), cfg->shader_names.at(pos));
+      std::wstring pm = cfg->GetKeyValue(_T("pm"), cfg->shader_names.at(pos));
+      pm = replace_all(pm, L"\\r", L"\r");
+      pm = replace_all(pm, L"\\n", L"\n");
 
-      M_STD_STRING mat;
+      std::wstring mat;
 
       mat += cn;
       mat += _T("/");
@@ -2194,6 +2116,10 @@ public:
 
   ~Dag2DagCB() override { delete cfg; }
 
+  // owns cfg via raw pointer: forbid copies so a shallow copy can't double-free it
+  Dag2DagCB(const Dag2DagCB &) = delete;
+  Dag2DagCB &operator=(const Dag2DagCB &) = delete;
+
   int conv_mat(Mtl *&m)
   {
     Class_ID cid = m->ClassID();
@@ -2201,15 +2127,14 @@ public:
     {
       IDagorMat *d = (IDagorMat *)m->GetInterface(I_DAGORMAT);
 
-      M_STD_STRING cn = d->get_classname();
-      cn = CfgReader::Remove(cn, _T(" "));
+      std::wstring cn = d->get_classname();
+      cn = collapse_repeats(cn, L" ");
 
-      M_STD_STRING sc = d->get_script();
-      sc = CfgReader::Replace(sc, _T("\r"), _T("\\r"));
-      sc = CfgReader::Replace(sc, _T("\n"), _T("\\n"));
-      //                      sc = CfgReader::Remove(sc, " ");
+      std::wstring sc = d->get_script();
+      sc = replace_all(sc, L"\r", L"\\r");
+      sc = replace_all(sc, L"\n", L"\\n");
 
-      M_STD_STRING mat;
+      std::wstring mat;
 
       mat += cn;
       mat += _T("/");
@@ -2217,8 +2142,8 @@ public:
 
       if (mats_name.find(mat) != mats_name.end() && mats_script.find(mat) != mats_script.end())
       {
-        M_STD_STRING sh = mats_name[mat];
-        M_STD_STRING pm = mats_script[mat];
+        std::wstring sh = mats_name[mat];
+        std::wstring pm = mats_script[mat];
         d->set_classname(sh.c_str());
         d->set_script(pm.c_str());
       } // else debug("<%s>",(LPSTR)mat.c_str());
@@ -2231,7 +2156,6 @@ public:
     if (!n)
       return ECB_CONT;
     Mtl *m = n->GetMtl();
-    char cnv = 0;
     if (m)
     {
       if (m->IsMultiMtl())
@@ -2255,52 +2179,34 @@ public:
   }
 };
 
-void DagUtil::enumerate()
+bool DagUtil::enumerate()
 {
   if (!ip)
-    return;
-  Dag2EnumeratorCB cb(ip);
+    return false;
+
+  std::ofstream os(ENUMERATE_MATERIALS_FILENAME);
+  if (!os)
+    return false;
+  os.imbue(std::locale::classic());
+
+  Dag2EnumeratorCB cb;
   enum_nodes(ip->GetRootNode(), &cb);
   ip->RedrawViews(ip->GetTime());
-  int pos = 0;
-
-  for (pos = 0; pos < cb.materials.size(); ++pos)
-  {
-    M_STD_STRING str1 = cb.materials.at(pos);
-    M_STD_STRING str2 = cb.scripts.at(pos);
-  }
 
   StrMap::iterator itr = cb.mats.begin();
 
-  std::string buffer;
-  pos = 0;
+  int pos = 0;
   while (itr != cb.mats.end())
   {
-    std::ostringstream index;
-    index << pos;
-
-    buffer += "[";
-    buffer += index.str();
-    buffer += "]";
-    buffer += "\n";
-    buffer += "\n";
-
-    buffer += wideToStr(itr->first.c_str());
-
-    buffer += "\n";
-    buffer += "sh=\"\"";
-    buffer += "\n";
-    buffer += "pm=\"\"";
-    buffer += "\n";
-    buffer += "\n";
+    os << "[" << pos << "]\n\n";
+    os << wideToStr(itr->first) << "\nsh=\"\"\npm=\"\"\n\n";
 
     itr++;
     ++pos;
   }
 
-  FILE *f = fopen("d:/materials.txt", "w+t");
-  fwrite(buffer.c_str(), 1, buffer.length(), f);
-  fclose(f);
+  os.flush();
+  return os.good();
 }
 
 void DagUtil::collapse()
@@ -2308,84 +2214,553 @@ void DagUtil::collapse()
   if (!ip)
     return;
 
-  Dag2UniqueCB cbv(ip);
+  Dag2UniqueCB cbv;
   enum_nodes(ip->GetRootNode(), &cbv);
   ip->RedrawViews(ip->GetTime());
 }
 
-void DagUtil::convert()
+bool DagUtil::convert()
 {
   if (!ip)
-    return;
+    return false;
 
-  Dag2DagCB cbv(ip);
+  std::ofstream os(CONVERT_MATERIALS_FILENAME);
+  if (!os)
+    return false;
+  os.imbue(std::locale::classic());
+
+  Dag2DagCB cbv;
   enum_nodes(ip->GetRootNode(), &cbv);
   ip->RedrawViews(ip->GetTime());
 
-  Dag2EnumeratorCB cb(ip);
+  Dag2EnumeratorCB cb;
   enum_nodes(ip->GetRootNode(), &cb);
   ip->RedrawViews(ip->GetTime());
-  int pos = 0;
-
-  for (pos = 0; pos < cb.materials.size(); ++pos)
-  {
-    M_STD_STRING str1 = cb.materials.at(pos);
-    M_STD_STRING str2 = cb.scripts.at(pos);
-  }
 
   StrMap::iterator itr = cb.mats.begin();
 
-  std::string buffer;
-  pos = 0;
+  int pos = 0;
   while (itr != cb.mats.end())
   {
-    std::ostringstream index;
-    index << pos;
-
-    buffer += "[";
-    buffer += index.str();
-    buffer += "]";
-    buffer += "\n";
-    buffer += "\n";
-
-    buffer += wideToStr(itr->first.c_str());
-
-    // buffer += itr->first;
-
-    buffer += "\n";
-    buffer += "sh=\"\"";
-    buffer += "\n";
-    buffer += "pm=\"\"";
-    buffer += "\n";
-    buffer += "\n";
+    os << "[" << pos << "]\n\n";
+    os << wideToStr(itr->first) << "\nsh=\"\"\npm=\"\"\n\n";
 
     itr++;
     ++pos;
   }
 
-  FILE *f = fopen("d:/materials_conv.txt", "w+t");
-  fwrite(buffer.c_str(), 1, buffer.length(), f);
-  fclose(f);
+  os.flush();
+  return os.good();
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
-static int intersects(const Box3 &a, const Box3 &b)
+static std::wstring sanitize_material_name(std::wstring name)
 {
-  if (a.Max().x < b.Min().x)
-    return 0;
-  if (a.Max().y < b.Min().y)
-    return 0;
-  if (a.Max().z < b.Min().z)
-    return 0;
-  if (a.Min().x > b.Max().x)
-    return 0;
-  if (a.Min().y > b.Max().y)
-    return 0;
-  if (a.Min().z > b.Max().z)
-    return 0;
-  return 1;
+  std::replace_if(
+    name.begin(), name.end(),
+    [](wchar_t c) {
+      // latin
+      if ((L'A' <= c && c <= L'Z') || (L'a' <= c && c <= L'z'))
+        return false; // keep
+
+      // digits
+      if (L'0' <= c && c <= L'9')
+        return false; // keep
+
+      // delimiters
+      if (c == '_' || c == '-' || c == '+')
+        return false; // keep
+
+      return true; // replace otherwise
+    },
+    L'_');
+  return name;
 }
+
+static std::wstring make_json_material_name(const std::wstring &raw_name, const std::wstring &raw_prefix)
+{
+  std::wstring name = sanitize_material_name(raw_name);
+  std::wstring prefix = sanitize_material_name(raw_prefix);
+
+  if (prefix.empty() || name.starts_with(prefix))
+    return name;
+
+  if (prefix.back() != L'_')
+    prefix += L'_';
+  return prefix + name;
+}
+
+static std::wstring make_name_suffix(int index) // a, b, ... z, a1, b1, ...
+{
+  std::wstring suffix(1, wchar_t(L'a' + index % 26));
+  if (index >= 26)
+    suffix += std::to_wstring(index / 26);
+  return suffix;
+}
+
+class Dag2EnumMatCB : public ENodeCB
+{
+public:
+  ~Dag2EnumMatCB() override = default;
+
+  std::vector<Mtl *> sorted_materials() const
+  {
+    std::vector<Mtl *> res(materials.begin(), materials.end());
+    std::ranges::sort(res, [](Mtl *a, Mtl *b) {
+      int cmp = _tcscmp(a->GetName().data(), b->GetName().data());
+      return cmp != 0 ? cmp < 0 : Animatable::GetHandleByAnim(a) < Animatable::GetHandleByAnim(b);
+    });
+    return res;
+  }
+
+  int proc(INode *n) override
+  {
+    if (!n)
+      return ECB_CONT;
+
+    if (util.exp_selected && !n->Selected())
+    {
+      if (iequal(n->GetName(), L"ORIGIN"))
+        explog(_T("skip non-selected origin\r\n" ));
+
+      return ECB_CONT;
+    }
+
+    Mtl *m = n->GetMtl();
+    if (!m)
+      return ECB_CONT;
+
+    if (m->IsMultiMtl())
+    {
+      int num = m->NumSubMtls();
+      for (int i = 0; i < num; ++i)
+      {
+        Mtl *sm = m->GetSubMtl(i);
+        if (!sm)
+          continue;
+
+        Class_ID cid = sm->ClassID();
+        if (cid != DagorMat2_CID)
+          continue;
+
+        materials.insert(sm);
+      }
+    }
+    else
+    {
+      Class_ID cid = m->ClassID();
+      if (cid != DagorMat2_CID)
+        return ECB_CONT;
+
+      materials.insert(m);
+    }
+
+    return ECB_CONT;
+  }
+
+private:
+  std::unordered_set<Mtl *> materials;
+};
+
+class MtlNameRestore : public RestoreObj
+{
+public:
+  Mtl *mtl;
+  MSTR undoName, redoName;
+
+  MtlNameRestore(Mtl *m, const MSTR &new_name) : mtl(m), undoName(m->GetName()), redoName(new_name) {}
+  ~MtlNameRestore() override = default;
+
+  void Restore(int) override { mtl->SetName(undoName); }
+  void Redo() override { mtl->SetName(redoName); }
+
+  int Size() override { return sizeof(MtlNameRestore); }
+  MSTR Description() override { return MSTR(L"material name"); }
+};
+
+void DagUtil::resolveNamesForJson()
+{
+  if (!ip)
+    return;
+
+  if (exp_selected)
+    explog(L"only selected objects are processed\r\n");
+
+  Dag2EnumMatCB cb;
+  enum_nodes(ip->GetRootNode(), &cb);
+
+  std::unordered_set<std::wstring> names;
+  std::vector<std::pair<Mtl *, std::wstring>> to_rename;
+
+  for (Mtl *m : cb.sorted_materials())
+  {
+    std::wstring name = make_json_material_name(m->GetName().data(), asset_prefix);
+    if (name == m->GetName().data() && names.insert(name).second)
+      continue;
+
+    to_rename.emplace_back(m, std::move(name));
+  }
+
+  if (to_rename.empty())
+    return;
+
+  theHold.Begin();
+
+  for (const auto &[m, resolved_name] : to_rename)
+  {
+    std::wstring name = resolved_name;
+    for (int i = 0; !names.insert(name).second; ++i)
+    {
+      name = resolved_name;
+      if (!name.empty() && name.back() != L'_')
+        name += L'_';
+      name += make_name_suffix(i);
+    }
+
+    MSTR new_name = name.data();
+    theHold.Put(new MtlNameRestore(m, new_name));
+    m->SetName(new_name);
+  }
+
+  theHold.Accept(L"resolve names");
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+static const wchar_t *ROOT_NODE_NAME = L"root";
+static const Class_ID MAX_DUMMY_CID = Class_ID(DUMMY_CLASS_ID, 0);
+static const float ROOT_NODE_BOX_SIDE = 20.0f;
+
+void DagUtil::resolveHierarchy()
+{
+  if (!ip)
+    return;
+
+  if (exp_selected)
+    explog(L"only selected objects are processed\r\n");
+
+  INode *scene_root = ip->GetRootNode();
+  INode *root = ip->GetINodeByName(ROOT_NODE_NAME);
+
+  if (root)
+  {
+    Object *obj = root->GetObjectRef();
+    if (!obj || obj->FindBaseObject()->ClassID() != MAX_DUMMY_CID)
+    {
+      explog(L"node '%s' is not a dummy, cant use it as a hierarchy root\r\n", ROOT_NODE_NAME);
+      return;
+    }
+
+    INode *parent = root->GetParentNode();
+    if (parent && !parent->IsRootNode())
+    {
+      explog(L"node '%s' is not at the top level, cant use it as a hierarchy root\r\n", ROOT_NODE_NAME);
+      return;
+    }
+  }
+
+  std::vector<INode *> orphans;
+  for (int i = 0, num = scene_root->NumberOfChildren(); i < num; ++i)
+  {
+    INode *n = scene_root->GetChildNode(i);
+    if (!n || n == root)
+      continue;
+
+    if (exp_selected && !n->Selected())
+      continue;
+
+    orphans.push_back(n);
+  }
+
+  if (orphans.empty())
+  {
+    explog(L"no nodes to attach to '%s'\r\n", ROOT_NODE_NAME);
+    return;
+  }
+
+  theHold.Begin();
+
+  if (!root)
+  {
+    DummyObject *obj = (DummyObject *)ip->CreateInstance(HELPER_CLASS_ID, MAX_DUMMY_CID);
+    root = obj ? ip->CreateObjectNode(obj) : nullptr;
+    if (!root)
+    {
+      explog(L"cant create '%s' node\r\n", ROOT_NODE_NAME);
+      if (obj)
+        obj->DeleteMe();
+      theHold.Cancel();
+      return;
+    }
+
+    Box3 box;
+    box.MakeCube(Point3(0, 0, 0), ROOT_NODE_BOX_SIDE);
+    obj->SetBox(box);
+
+    root->SetName(ROOT_NODE_NAME);
+
+    explog(L"'%s' node created\r\n", ROOT_NODE_NAME);
+  }
+
+  for (INode *n : orphans)
+  {
+    explog(L"%s: attached to '%s'\r\n", n->GetName(), ROOT_NODE_NAME);
+    root->AttachChild(n, 1);
+  }
+
+  explog(L"%d nodes attached to '%s'\r\n", (int)orphans.size(), ROOT_NODE_NAME);
+
+  theHold.Accept(L"resolve hierarchy");
+
+  ip->RedrawViews(ip->GetTime());
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+class Dag2RemoveSkinCB : public ENodeCB
+{
+public:
+  int removedNum = 0;
+
+  ~Dag2RemoveSkinCB() override = default;
+
+  int proc(INode *n) override
+  {
+    if (!n)
+      return ECB_CONT;
+
+    if (util.exp_selected && !n->Selected())
+      return ECB_CONT;
+
+    std::vector<Modifier *> skins;
+    for (Object *obj = n->GetObjectRef(); obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID;)
+    {
+      IDerivedObject &derived = *(IDerivedObject *)obj;
+
+      for (int i = 0, num = derived.NumModifiers(); i < num; ++i)
+      {
+        Modifier *mod = derived.GetModifier(i);
+        if (mod && mod->ClassID() == SKIN_CLASSID)
+          skins.push_back(mod);
+      }
+
+      obj = derived.GetObjRef();
+    }
+
+    int num = 0;
+    for (Modifier *mod : skins)
+    {
+      if (ip7->DeleteModifier(*n, *mod) == Interface7::kRES_SUCCESS)
+        ++num;
+      else
+        explogWarning(L"%s: cant remove skin modifier\r\n", n->GetName());
+    }
+
+    if (num)
+      explog(L"%s: %d skin modifiers removed\r\n", n->GetName(), num);
+
+    removedNum += num;
+
+    return ECB_CONT;
+  }
+
+private:
+  Interface7 *ip7 = GetCOREInterface7();
+};
+
+void DagUtil::removeSkinModifiers()
+{
+  if (!ip)
+    return;
+
+  if (exp_selected)
+    explog(L"only selected objects are processed\r\n");
+
+  Dag2RemoveSkinCB cb;
+
+  theHold.Begin();
+
+  enum_nodes(ip->GetRootNode(), &cb);
+
+  if (cb.removedNum)
+    theHold.Accept(L"remove skin mod");
+  else
+    theHold.Cancel();
+
+  explog(L"%d skin modifiers removed\r\n", cb.removedNum);
+
+  ip->RedrawViews(ip->GetTime());
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void DagUtil::updateTooltips(HWND hw)
+{
+  if (exp_selected)
+  {
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_EXPSEL), L"Apply to only selected nodes");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_ASSET_PREFIX), L"Optional prefix for material names");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_RESOLVE_NAMES),
+      L"Checks if every material on selected nodes has unique name that starts with prefix and uses only valid characters. Fixes "
+      L"names if some flaws found.");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_EXPORT), L"Export materials of selected nodes to json file");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_RESOLVE_HIER),
+      L"For every selected node without a parent sets a helper named 'root' as a parent. Creates 'root' helper if it does not exists");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_REMOVE_SKIN_MOD),
+      L"For every selected node check if it has 'Skin' modifier. Removes it if found");
+  }
+  else
+  {
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_EXPSEL), L"Apply to every node in scene");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_ASSET_PREFIX), L"Optional prefix for material names");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_RESOLVE_NAMES), L"Checks if every material in scene has unique name that starts with prefix "
+                                                          L"and uses only valid characters. Fixes names if some flaws found.");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_EXPORT), L"Export scene materials to json file");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_RESOLVE_HIER),
+      L"For every node in scene without a parent sets a helper named 'root' as a parent. Creates 'root' helper if it does not exists");
+    tooltip.SetToolTip(GetDlgItem(hw, IDC_REMOVE_SKIN_MOD),
+      L"For every node in scene check if it has 'Skin' modifier. Removes it if found");
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+struct ExpEnumTexCB : IDagorMat2::EnumTexCB
+{
+  std::ofstream &os;
+  int count;
+
+  ExpEnumTexCB(std::ofstream &ofs) : os(ofs), count(0) {}
+  int proc(const TCHAR *name, const TCHAR *path) override
+  {
+    if (count++)
+      os << ',';
+    os << "\"" << escape_json_string(wideToStr(name)) << "\":\"" << escape_json_string(wideToStr(fs::path(path).stem().c_str()))
+       << '\"';
+    return ECB_CONT;
+  }
+};
+
+struct ExpEnumParamCB : IDagorMat2::EnumParamCB
+{
+  std::ofstream &os;
+  int count;
+
+  ExpEnumParamCB(std::ofstream &ofs) : os(ofs), count(0) {}
+  int proc(const TCHAR *group, const TCHAR *name, int type, const TCHAR *value) override
+  {
+    auto t = DataBlock::ParamType(type);
+    if (t == DataBlock::ParamType::TYPE_STRING || t == DataBlock::ParamType::TYPE_MATRIX)
+      return ECB_CONT;
+
+    if (count++)
+      os << ',';
+
+    os << "\"" << escape_json_string(wideToStr(name)) << "\":";
+
+    const std::string narrow = wideToStr(value);
+
+    switch (t)
+    {
+      case DataBlock::ParamType::TYPE_BOOL:
+        os << "{\"type\":\"scalar\",\"value\":" << (iequal(value, L"no") || iequal(value, L"false") || iequal(value, L"0") ? 0 : 1)
+           << '}';
+        break;
+
+      case DataBlock::ParamType::TYPE_INT:
+      case DataBlock::ParamType::TYPE_REAL:
+      {
+        float f = 0;
+        parse_nums(narrow, f);
+        os << "{\"type\":\"scalar\",\"value\":" << f << '}';
+      }
+      break;
+
+      case DataBlock::ParamType::TYPE_IPOINT2:
+      case DataBlock::ParamType::TYPE_POINT2:
+      {
+        Point2 p2(0.f, 0.f);
+        parse_nums(narrow, p2.x, p2.y);
+        os << "{\"type\":\"vector\",\"value\":" << "{\"x\":" << p2.x << ",\"y\": " << p2.y << ",\"z\": 0,\"w\": 0}}";
+      }
+      break;
+
+      case DataBlock::ParamType::TYPE_IPOINT3:
+      case DataBlock::ParamType::TYPE_POINT3:
+      {
+        Point3 p3(0.f, 0.f, 0.f);
+        parse_nums(narrow, p3.x, p3.y, p3.z);
+        os << "{\"type\":\"vector\",\"value\": " << "{\"x\":" << p3.x << ",\"y\": " << p3.y << ",\"z\": " << p3.z << ",\"w\":0}}";
+      }
+      break;
+
+      case DataBlock::ParamType::TYPE_POINT4:
+      case DataBlock::ParamType::TYPE_E3DCOLOR:
+      {
+        Point4 p4(0.f, 0.f, 0.f, 0.f);
+        parse_nums(narrow, p4.x, p4.y, p4.z, p4.w);
+        os << "{\"type\":\"vector\",\"value\":" << "{\"x\":" << p4.x << ",\"y\": " << p4.y << ",\"z\": " << p4.z << ",\"w\": " << p4.w
+           << "}}";
+      }
+      break;
+
+      default: break;
+    }
+
+    return ECB_CONT;
+  }
+};
+
+void DagUtil::exportToJson()
+{
+  if (!ip)
+    return;
+
+  std::ofstream os(exp_fname, std::ios::binary);
+  if (!os)
+  {
+    explog(_T("cant open '%s' file for writing"), exp_fname.c_str());
+    return;
+  }
+  os.imbue(std::locale::classic());
+
+  Dag2EnumMatCB cb;
+  enum_nodes(ip->GetRootNode(), &cb);
+
+  os << "{";
+
+  int count = 0;
+  for (Mtl *m : cb.sorted_materials())
+  {
+    IDagorMat2 *d = (IDagorMat2 *)m->GetInterface(I_DAGORMAT2);
+    if (!d)
+      continue;
+
+    if (count++)
+      os << ',';
+
+    os << "\"" << escape_json_string(wideToStr(m->GetName().data())) << "\":{";
+    os << "\"class\":\"" << escape_json_string(wideToStr(d->get_classname())) << "\",";
+
+    Color cold = m->GetDiffuse();
+    os << "\"diff\":{\"x\":" << cold.r << ",\"y\": " << cold.g << ",\"z\": " << cold.b << ",\"w\":0},";
+
+    ExpEnumTexCB tcb(os);
+    os << "\"textures\":{";
+    d->enumerate_textures(tcb);
+    os << "},";
+
+    ExpEnumParamCB pcb(os);
+    os << "\"parameters\":{";
+    d->enumerate_parameters(pcb);
+    os << "}}";
+  }
+
+  os << '}' << std::endl;
+}
+
+//////////////////////////////////////////////////////////////////////////////
 
 bool DagUtil::copy_tch_buf(Mesh &m, MappingInfo &mi, int c)
 {
@@ -2420,9 +2795,6 @@ static struct
 
 bool DagUtil::copy_tch1(Mesh &m, TCCOPY tc, int src, int dst, int mapa, bool sel_faces)
 {
-  // if(src<0) src=0;
-  // if(dst<0) dst=0;
-  // if(mapa<0) mapa=0;
   if (tc == CTC_COPY || tc == CTC_MOVE)
   {
     if (!m.mapSupport(src))
@@ -2464,7 +2836,6 @@ bool DagUtil::copy_tch1(Mesh &m, TCCOPY tc, int src, int dst, int mapa, bool sel
     dstfcs.Append(m.getNumFaces(), m.mapFaces(dst));
     Tab<UVVert> dstvrts;
     dstvrts.Append(m.getNumMapVerts(dst), m.mapVerts(dst));
-    TVFace *srctf = m.mapFaces(src);
     m.setNumMapVerts(dst, m.getNumMapVerts(src));
     m.setNumMapFaces(dst, m.getNumFaces());
     memcpy(m.mapVerts(dst), m.mapVerts(src), sizeof(Point3) * m.getNumMapVerts(src));
@@ -2565,28 +2936,6 @@ bool DagUtil::copy_tch1(Mesh &m, TCCOPY tc, int src, int dst, int mapa, bool sel
 }
 
 
-// void DagUtil::fix_edgevis(){
-//         update_vars();
-//         TimeValue time=ip->GetTime();
-//         int n=ip->GetSelNodeCount();
-//         for(int i=0;i<n;++i) {
-//                 INode *node=ip->GetSelNode(i);
-//                 if(!node) continue;
-//                 Object *o=node->GetObjectRef();
-//                 if(!o) continue;
-//                 if(!o->IsSubClassOf(Class_ID(TRIOBJ_CLASS_ID,0))) {continue;}
-//                 Mesh &m=((TriObject*)o)->mesh;
-//                 for(int i=0;i<m.numFaces;++i) {
-//                         Face &f=m.faces[i];
-//                         f.flags=(f.flags&~(EDGE_A|EDGE_C))|(f.flags&EDGE_A?EDGE_C:0)|(f.flags&EDGE_C?EDGE_A:0);
-//                 }
-//                 node->InvalidateWS();
-//                 break;
-//         }
-//         ip->RedrawViews(time);
-// }
-
-
 void DagUtil::convertSpacesRecursive(INode *node)
 {
   if (!node)
@@ -2594,11 +2943,10 @@ void DagUtil::convertSpacesRecursive(INode *node)
 
   if (node != ip->GetRootNode()) // 'Scene Root' shouldn't be exported anyway.
   {
-    static TCHAR newName[10000];
-    _tcscpy(newName, node->GetName());
-    spaces_to_underscores(newName);
-    if (_tcscmp(node->GetName(), newName))
-      node->SetName(newName);
+    std::wstring newName = node->GetName();
+    std::replace(newName.begin(), newName.end(), L' ', L'_');
+    if (newName != node->GetName())
+      node->SetName(newName.c_str());
   }
 
   for (int childNo = 0; childNo < node->NumberOfChildren(); childNo++)
@@ -2617,9 +2965,8 @@ void DagUtil::convertSpaces()
 
 void DagUtil::removeIsolatedVertices(TopologyAdapter &adapter)
 {
-  bool *isReferencedArray = new bool[adapter.getNumVerts()];
-  unsigned int *newIndicesArray = new unsigned int[adapter.getNumVerts()];
-  ZeroMemory(isReferencedArray, adapter.getNumVerts() * sizeof(bool));
+  std::vector<bool> isReferencedArray(adapter.getNumVerts(), false);
+  std::vector<unsigned int> newIndicesArray(adapter.getNumVerts());
   for (unsigned int faceNo = 0; faceNo < adapter.mesh->getNumFaces(); faceNo++)
   {
     isReferencedArray[adapter.getIndex(faceNo, 0)] = true;
@@ -2644,9 +2991,6 @@ void DagUtil::removeIsolatedVertices(TopologyAdapter &adapter)
     adapter.setIndex(faceNo, 1, newIndicesArray[adapter.getIndex(faceNo, 1)]);
     adapter.setIndex(faceNo, 2, newIndicesArray[adapter.getIndex(faceNo, 2)]);
   }
-
-  delete[] isReferencedArray;
-  delete[] newIndicesArray;
 }
 
 
@@ -2666,40 +3010,6 @@ public:
   void copyVertex(unsigned int from, unsigned int to) override { mesh->verts[to] = mesh->verts[from]; }
 
   bool countRemovedVertices() override { return true; }
-};
-
-
-class TextureTopologyAdapter : public TopologyAdapter
-{
-  int channel;
-
-public:
-  TextureTopologyAdapter(Mesh *in_mesh, int ch) : TopologyAdapter(in_mesh), channel(ch) {}
-
-  unsigned int getNumVerts() override { return mesh->getNumMapVerts(channel); }
-
-  void setNumVerts(unsigned int num_verts) override { mesh->setNumMapVerts(channel, num_verts, TRUE); }
-
-  unsigned int getIndex(unsigned int face_no, unsigned int index_no) override
-  {
-    TVFace *tvFace = mesh->mapFaces(channel);
-    assert(tvFace);
-    return tvFace[face_no].t[index_no];
-  }
-
-  void setIndex(unsigned int face_no, unsigned int index_no, unsigned int index) override
-  {
-    TVFace *tvFace = mesh->mapFaces(channel);
-    assert(tvFace);
-    tvFace[face_no].t[index_no] = index;
-  }
-
-  void copyVertex(unsigned int from, unsigned int to) override
-  {
-    TVFace *tvFace = mesh->mapFaces(channel);
-    assert(tvFace);
-    tvFace[to] = tvFace[from];
-  }
 };
 
 
@@ -2772,11 +3082,7 @@ void DagUtil::removeDegeneratesRecursive(INode *node)
       Matrix3 otm;
       otm = get_scaled_object_tm(node, time);
       otm = otm * Inverse(get_scaled_stretch_node_tm(node, time));
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
-      otm *= (float)GetSystemUnitScale(UNITS_METERS);
-#else
-      otm *= (float)GetMasterScale(UNITS_METERS);
-#endif
+      otm *= static_cast<float>(GetSystemUnitScale(UNITS_METERS));
 
       // Remove degenerate faces.
 
@@ -2814,13 +3120,6 @@ void DagUtil::removeDegeneratesRecursive(INode *node)
         removeIsolatedVertices(gta);
       }
 
-      /*  for ( int ch = 0; ch < MAX_MESHMAPS; ++ch )
-        {
-          if ( ! mesh->mapSupport (ch) || !  mesh->mapFaces (ch) )
-            continue;
-          removeIsolatedVertices(TextureTopologyAdapter(mesh, ch));
-        }*/
-
       if (mesh->vertCol)
       {
         ColorTopologyAdapter cta(mesh);
@@ -2841,7 +3140,7 @@ void DagUtil::removeDegeneratesRecursive(INode *node)
     }
 
     if (triObject && triObject != state.obj)
-      delete triObject;
+      triObject->DeleteMe();
   }
 
 
@@ -3113,163 +3412,6 @@ void DagUtil::select_face(bool vert)
   ip->RedrawViews(time);
 }
 
-class MultiBooleanCB : public ENodeCB
-{
-public:
-  Interface *ip;
-  Tab<INode *> nodes;
-  MultiBooleanCB(Interface *iptr) { ip = iptr; }
-  bool add(MNMesh &to, MNMesh &from, int inst)
-  {
-    // if(tm1) to.Transform(*tm1);
-    // if(tm2) from.Transform(*tm2);
-    to.PrepForBoolean();
-    from.PrepForBoolean();
-    MNMesh m3;
-    if (!m3.MakeBoolean(to, from, MESHBOOL_UNION, NULL))
-    {
-      // if(inst){to=m3;}
-      return false;
-    }
-    m3.selLevel = MNM_SL_FACE;
-    BitArray selected(m3.numf);
-    selected.ClearAll();
-    m3.ElementFromFace(0, selected);
-    int nm = selected.NumberSet();
-    // debug("%d %d",nm,m3.numf);
-    if (nm != m3.numf)
-    {
-      if (inst)
-        to = m3;
-      return false;
-    }
-    to = m3;
-    return true;
-  }
-  void adjust_matrix(Matrix3 &m, Mesh &me)
-  {
-    if (m.Parity())
-    {
-      for (int i = 0; i < me.getNumFaces(); ++i)
-      {
-        int v = me.faces[i].v[2];
-        me.faces[i].v[2] = me.faces[i].v[1];
-        me.faces[i].v[1] = v;
-      }
-    }
-  }
-  /*bool intersects(MNMesh &from,MNMesh &to){
-          to.PrepForBoolean();
-          from.PrepForBoolean();
-          MNMesh m3;
-          if(!m3.MakeBoolean(to, from, MESHBOOL_UNION, NULL)) return false;
-          m3.selLevel=MNM_SL_FACE;
-          BitArray selected(m3.numf);
-          selected.ClearAll();
-          m3.ElementFromFace(0,selected);
-          int nm=selected.NumberSet();
-          debug("%d %d",nm,m3.numf);
-          if(nm!=m3.numf) return false;
-          return true;
-  }*/
-  void boolean()
-  {
-    if (nodes.Count() < 2)
-      return;
-    // sort_ip=ip;
-
-    Object *obj = nodes[0]->EvalWorldState(ip->GetTime()).obj;
-    assert(obj);
-    TriObject *tri = (TriObject *)obj->ConvertToType(ip->GetTime(), Class_ID(TRIOBJ_CLASS_ID, 0));
-    assert(tri);
-    Mesh m1 = tri->GetMesh();
-    MNMesh result(m1);
-    Matrix3 tm = nodes[0]->GetObjTMAfterWSM(ip->GetTime());
-    adjust_matrix(tm, m1);
-    // sort_pos=tm.GetTrans();
-    // base_sort=nodes[0];
-    // nodes.Sort(CompTable);
-    // Matrix3 tm=nodes[0]->GetObjectTM(ip->GetTime());
-    result.Transform(tm);
-    BitArray aligned(nodes.Count());
-    aligned.ClearAll();
-    aligned.Set(0);
-    int crtm = ip->GetTime();
-    bool flg = false;
-    do
-    {
-      flg = false;
-      for (int i = 1; i < nodes.Count(); ++i)
-      {
-        if (aligned[i])
-          continue;
-        Object *obj1 = nodes[i]->EvalWorldState(crtm).obj;
-        assert(obj1);
-        TriObject *tri1 = (TriObject *)obj1->ConvertToType(crtm, Class_ID(TRIOBJ_CLASS_ID, 0));
-        assert(tri1);
-        Mesh m2 = tri1->GetMesh();
-        Matrix3 tm1 = nodes[i]->GetObjTMAfterWSM(crtm);
-        adjust_matrix(tm1, m2);
-        // Matrix3 tm1=nodes[i]->GetObjectTM(ip->GetTime());
-        MNMesh ad(m2);
-        ad.Transform(tm1);
-        // if(!intersects(ad,result)) continue;
-        if (!add(result, ad, 0))
-          continue;
-        if (tri1 != obj1)
-          delete tri1;
-        aligned.Set(i);
-        flg = true;
-      }
-    } while (flg);
-    {
-      for (int i = 0; i < nodes.Count(); ++i)
-        if (!aligned[i])
-          ip->DeSelectNode(nodes[i]);
-    }
-
-    if (tri != obj)
-      delete tri;
-    Object *resobj = (Object *)ip->CreateInstance(GEOMOBJECT_CLASS_ID, triObjectClassID);
-    assert(resobj);
-    TSTR ss;
-    resobj->GetClassName(ss);
-    result.OutToTri(((TriObject *)resobj)->mesh);
-
-    INode *resn = ip->CreateObjectNode(resobj);
-    assert(resn);
-    TSTR name(_T("MultiBoolResult"));
-    ip->MakeNameUnique(name);
-    resn->SetName(name);
-    Matrix3 idm;
-    idm.IdentityMatrix();
-    resn->SetNodeTM(0, idm);
-  }
-  int proc(INode *n) override
-  {
-    if (!n)
-      return ECB_CONT;
-    if (!n->Selected())
-      return ECB_CONT;
-    Object *obj = n->EvalWorldState(ip->GetTime()).obj;
-
-    if (!obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0)))
-      return ECB_CONT;
-
-
-    nodes.Append(1, &n);
-    return ECB_CONT;
-  }
-};
-
-// void DagUtil::perform_multiboolean(){
-//         if(!ip) return;
-//         MultiBooleanCB cb(ip);
-//         enum_nodes(ip->GetRootNode(),&cb);
-//         cb.boolean();
-//         ip->RedrawViews(ip->GetTime());
-// }
-
 void DagUtil::get_ntrk()
 {
   if (ip->GetSelNodeCount() != 1)
@@ -3337,187 +3479,6 @@ void DagUtil::put_ntrk()
   node->AddNoteTrack(nt);
 }
 
-///*
-// void DagUtil::flatten_mesh(Mesh &m,Matrix3 wtm,INode *node) {
-//         Point3 tnorm=Normalize(VectorTransform(Inverse(wtm),Point3(0,0,1)));
-//         Tab<Point3> dv; dv.SetCount(m.numVerts);
-//         Tab<int> dvn; dvn.SetCount(m.numVerts);
-//         typedef float FaceEL[3];
-//         Tab<FaceEL> fel; fel.SetCount(m.numFaces);
-//         for(int i=0;i<m.numFaces;++i) {
-//                 Point3 v0=m.verts[m.faces[i].v[0]];
-//                 Point3 v1=m.verts[m.faces[i].v[1]];
-//                 Point3 v2=m.verts[m.faces[i].v[2]];
-//                 fel[i][0]=Length(v1-v0);
-//                 fel[i][1]=Length(v2-v1);
-//                 fel[i][2]=Length(v0-v2);
-//         }
-//         float ek=.1f;
-//         float da=DegToRad(3);
-//         float cosda=cosf(da);
-//         for(int iter=0;;++iter) {
-//                 for(int i=0;i<dv.Count();++i) {dv[i]=Point3(0,0,0);dvn[i]=0;}
-//                 for(i=0;i<m.numFaces;++i) {
-//                         Point3 v0=m.verts[m.faces[i].v[0]];
-//                         Point3 v1=m.verts[m.faces[i].v[1]];
-//                         Point3 v2=m.verts[m.faces[i].v[2]];
-//                         Point3 n=Normalize(CrossProd(v1-v0,v2-v0));
-//                         float dc=DotProd(n,tnorm);
-//                         float a;
-//                         if(dc>cosda) {
-//                                 if(dc>=1) a=0; else a=acosf(dc);
-//                         }else a=da;
-//                         Point3 w=Normalize(CrossProd(n,tnorm))*a;
-//                         Point3 c=(v0+v1+v2)/3;
-//                         dv[m.faces[i].v[0]]+=CrossProd(w,v0-c); dvn[m.faces[i].v[0]]++;
-//                         dv[m.faces[i].v[1]]+=CrossProd(w,v1-c); dvn[m.faces[i].v[1]]++;
-//                         dv[m.faces[i].v[2]]+=CrossProd(w,v2-c); dvn[m.faces[i].v[2]]++;
-//                 }
-//                 for(i=0;i<dv.Count();++i) {
-//                         if(dvn[i]) m.verts[i]+=dv[i]/dvn[i];
-//                         dv[i]=Point3(0,0,0); dvn[i]=0;
-//                 }
-//                 for(i=0;i<m.numFaces;++i) {
-//                         Point3 v0=m.verts[m.faces[i].v[0]];
-//                         Point3 v1=m.verts[m.faces[i].v[1]];
-//                         Point3 v2=m.verts[m.faces[i].v[2]];
-//                         float l,dl,el; Point3 e;
-//                         e=v1-v0; l=Length(e); el=fel[i][0]; dl=el-l;
-//                                 e*=dl*ek/l;
-//                                 dv[m.faces[i].v[1]]+=e; dv[m.faces[i].v[0]]-=e;
-//                                 dvn[m.faces[i].v[1]]++; dvn[m.faces[i].v[0]]++;
-//                         e=v2-v1; l=Length(e); el=fel[i][1]; dl=el-l;
-//                                 e*=dl*ek/l;
-//                                 dv[m.faces[i].v[2]]+=e; dv[m.faces[i].v[1]]-=e;
-//                                 dvn[m.faces[i].v[2]]++; dvn[m.faces[i].v[1]]++;
-//                         e=v0-v2; l=Length(e); el=fel[i][2]; dl=el-l;
-//                                 e*=dl*ek/l;
-//                                 dv[m.faces[i].v[0]]+=e; dv[m.faces[i].v[2]]-=e;
-//                                 dvn[m.faces[i].v[0]]++; dvn[m.faces[i].v[2]]++;
-//                 }
-//                 for(i=0;i<dv.Count();++i) if(dvn[i]) m.verts[i]+=dv[i]/dvn[i];
-//                 if((iter&31)==0) {
-//                         m.InvalidateGeomCache();
-//                         node->InvalidateWS();
-//                         ip->RedrawViews(ip->GetTime());
-//                         ip->ProgressUpdate(0);
-//                 }
-//                 if(ip->GetCancel()) break;
-//         }
-//         m.InvalidateGeomCache();
-// }
-//*/
-
-/*
-void DagUtil::flatten_mesh(Mesh &m,Matrix3 wtm,INode *node) {
-        Point3 tnorm=Normalize(VectorTransform(Inverse(wtm),Point3(0,0,1)));
-        AdjEdgeList ael(m);
-        Tab<Point3> dv; dv.SetCount(m.numVerts);
-        Tab<int> dvn; dvn.SetCount(m.numVerts);
-        Tab<Point3> fn; fn.SetCount(m.numFaces);
-        typedef int AdjVert[2];
-        Tab<AdjVert> av; av.SetCount(ael.edges.Count());
-        Tab<float> el; el.SetCount(ael.edges.Count());
-        float ak=.1f,ek=.1f;
-        float da=DegToRad(3);
-        float cosda=cosf(da);
-        float maxel=0;
-        for(int i=0;i<ael.edges.Count();++i) {
-                int v0=ael.edges[i].v[0],v1=ael.edges[i].v[1];
-                el[i]=Length(m.verts[v0]-m.verts[v1]);
-                if(el[i]>maxel) maxel=el[i];
-                int f=ael.edges[i].f[0],j;
-                if(f!=UNDEFINED) {
-                        for(j=0;j<2;++j) if(m.faces[f].v[j]!=v0 && m.faces[f].v[j]!=v1) break;
-                        av[i][0]=m.faces[f].v[j];
-                }else av[i][0]=UNDEFINED;
-                f=ael.edges[i].f[1];
-                if(f!=UNDEFINED) {
-                        for(j=0;j<2;++j) if(m.faces[f].v[j]!=v0 && m.faces[f].v[j]!=v1) break;
-                        av[i][1]=m.faces[f].v[j];
-                }else av[i][1]=UNDEFINED;
-        }
-        Point3 center;
-        {
-                Box3 box;
-                for(int i=0;i<m.numVerts;++i) box+=m.verts[i];
-                center=box.Center();
-        }
-//      float da=DegToRad(3);
-//      float sinda=sinf(da);
-        for(int iter=0;;++iter) {
-                for(int i=0;i<dv.Count();++i) {dv[i]=Point3(0,0,0);dvn[i]=0;}
-                for(i=0;i<m.numFaces;++i) {
-                        Point3 v0=m.verts[m.faces[i].v[0]];
-                        Point3 v1=m.verts[m.faces[i].v[1]];
-                        Point3 v2=m.verts[m.faces[i].v[2]];
-                        Point3 n=Normalize(CrossProd(v1-v0,v2-v0));
-                        float dc=DotProd(n,tnorm);
-                        float a;
-                        if(dc>cosda) {
-                                if(dc>=1) a=0; else a=acosf(dc);
-                        }else a=da;
-                        Point3 w=Normalize(CrossProd(n,tnorm))*a;
-                        Point3 c=(v0+v1+v2)/3;
-                        dv[m.faces[i].v[0]]+=CrossProd(w,v0-c); dvn[m.faces[i].v[0]]++;
-                        dv[m.faces[i].v[1]]+=CrossProd(w,v1-c); dvn[m.faces[i].v[1]]++;
-                        dv[m.faces[i].v[2]]+=CrossProd(w,v2-c); dvn[m.faces[i].v[2]]++;
-                }
-                for(i=0;i<dv.Count();++i) if(dvn[i]) m.verts[i]+=dv[i]/dvn[i];
-                for(i=0;i<dv.Count();++i) {dv[i]=Point3(0,0,0);dvn[i]=0;}
-                for(i=0;i<fn.Count();++i) {
-                        Point3 v0=m.verts[m.faces[i].v[0]];
-                        Point3 v1=m.verts[m.faces[i].v[1]];
-                        Point3 v2=m.verts[m.faces[i].v[2]];
-                        fn[i]=Normalize(CrossProd(v1-v0,v2-v0));
-                };
-                for(i=0;i<ael.edges.Count();++i) {
-                        Point3 p0=m.verts[ael.edges[i].v[0]];
-                        Point3 e=Normalize(m.verts[ael.edges[i].v[1]]-p0);
-                        float ds=DotProd(e,CrossProd(fn[ael.edges[i].f[0]],fn[ael.edges[i].f[1]]));
-                        float a;
-//                      if(-sinda<ds && ds<sinda) a=asinf(ds);
-//                      else if(ds>0) a=da; else a=-da;
-                        if(ds>=1) a=HALFPI; else if(ds<=-1) a=-HALFPI; else a=asinf(ds);
-                        Point3 w=e*(a*ak);
-                        if(av[i][0]!=UNDEFINED)
-                                {dv[av[i][0]]+=CrossProd(w,m.verts[av[i][0]]-p0); dvn[av[i][0]]++;}
-                        if(av[i][1]!=UNDEFINED)
-                                {dv[av[i][1]]-=CrossProd(w,m.verts[av[i][1]]-p0); dvn[av[i][1]]++;}
-                }
-//              for(i=0;i<3;++i) dvn[m.faces[0].v[i]]=0;
-                for(i=0;i<dv.Count();++i) if(dvn[i]) m.verts[i]+=dv[i]/dvn[i];
-                for(i=0;i<dv.Count();++i) {dv[i]=Point3(0,0,0);dvn[i]=0;}
-                for(i=0;i<ael.edges.Count();++i) {
-                        Point3 p0=m.verts[ael.edges[i].v[0]];
-                        Point3 e=m.verts[ael.edges[i].v[1]]-p0;
-//                      float l=Length(e),dl=el[i]-l;
-                        float l=Length(e),dl=maxel-l;
-                        if(dl<0) {
-                                e*=dl*ek/l;
-                                dv[ael.edges[i].v[1]]+=e; dv[ael.edges[i].v[0]]-=e;
-                                dvn[ael.edges[i].v[1]]++; dvn[ael.edges[i].v[0]]++;
-                        }
-                }
-//              for(i=0;i<3;++i) dvn[m.faces[0].v[i]]=0;
-                for(i=0;i<dv.Count();++i) if(dvn[i]) m.verts[i]+=dv[i];///dvn[i];
-                Box3 box;
-                for(i=0;i<m.numVerts;++i) box+=m.verts[i];
-                Point3 d=center-box.Center();
-                for(i=0;i<m.numVerts;++i) m.verts[i]+=d;
-                if((iter&31)==0) {
-                        m.InvalidateGeomCache();
-                        node->InvalidateWS();
-                        ip->RedrawViews(ip->GetTime());
-                        ip->ProgressUpdate(0);
-                }
-                if(ip->GetCancel()) break;
-                //break;
-        }
-        m.InvalidateGeomCache();
-}
-*/
-
 static DWORD WINAPI dummyprogressfn(LPVOID arg) { return 0; }
 
 
@@ -3562,7 +3523,6 @@ void DagUtil::maxtures2materials(Mesh &m, INode *node)
             lastmat = mi + 1;
           mats[mi] = mat[wi];
           maps[mi] = map[wi];
-          // if(weights[mi]<w[wi]) weights[mi]=w[wi];
           weights[mi] += w[wi];
         }
     }
@@ -3621,232 +3581,6 @@ void DagUtil::maxtures2materials()
   SetCursor(hCur);
 }
 
-// void DagUtil::flatten() {
-//         HCURSOR hCur=SetCursor(LoadCursor(NULL,IDC_WAIT));
-//         ip->ProgressStart(_T("Wait..."),FALSE,dummyprogressfn,NULL);
-//         TimeValue time=ip->GetTime();
-//         int n=ip->GetSelNodeCount();
-//         for(int i=0;i<n;++i) {
-//                 INode *node=ip->GetSelNode(i);
-//                 if(!node) continue;
-//                 Object *o=node->GetObjectRef();
-//                 if(!o) continue;
-//                 if(!o->IsSubClassOf(Class_ID(TRIOBJ_CLASS_ID,0))) continue;
-//                 node->InvalidateWS();
-//                 flatten_mesh(((TriObject*)o)->mesh,node->GetObjectTM(time),node);
-//                 node->InvalidateWS();
-//                 if(ip->GetCancel()) break;
-//         }
-//         ip->ProgressEnd();
-//         ip->RedrawViews(time);
-//         SetCursor(hCur);
-// }
-
-/*
-static void break_sel_edges(Mesh &m) {
-        AdjEdgeList ael(m);
-        Tab<int> bv;
-        BitArray em(ael.edges.Count());
-        em.ClearAll();
-        for(int i=0;i<ael.edges.Count();++i) if(ael.edges[i].Selected(m.faces,m.edgeSel)) {
-                for(int vi=0;vi<2;++vi) {
-                        int v=ael.edges[i].v[vi];
-                        for(int j=0;j<bv.Count();++j) if(bv[j]==v) break;
-                        if(j>=bv.Count()) bv.Append(1,&v);
-                }
-        }
-        for(i=0;i<bv.Count();++i) if(ael.list[bv[i]].Count()!=2) break;
-        int e;
-        int v1=bv[i],v2=ael.edges[e=ael.list[v1][0]].OtherVert(v1);
-        for(;;) {
-                em.Set(e);
-                Face &f=m.faces[ael.edges[e].f[0]];
-                int fi;
-                if((f.v[0]==v1 && f.v[1]==v2)
-                || (f.v[1]==v1 && f.v[2]==v2)
-                || (f.v[2]==v1 && f.v[0]==v2) fi=ael.edges[e].f[1];
-                        else fi=ael.edges[e].f[0];
-                for(int j=0;j<3;++j)
-                        if(m.faces[fi].v[j]==v1) m.faces[fi].v[j]=nv1;
-                if(ael.list[v2].Count()!=2) break;
-        }
-}
-*/
-
-/*
-void DagUtil::break_edges() {
-        TimeValue time=ip->GetTime();
-        int n=ip->GetSelNodeCount();
-        for(int i=0;i<n;++i) {
-                INode *node=ip->GetSelNode(i);
-                if(!node) continue;
-                Object *o=node->GetObjectRef();
-                if(!o) continue;
-                if(!o->IsSubClassOf(Class_ID(TRIOBJ_CLASS_ID,0))) continue;
-                node->InvalidateWS();
-//              break_sel_edges(((TriObject*)o)->mesh);
-                node->InvalidateWS();
-        }
-        ip->RedrawViews(time);
-}
-*/
-
-static void save_shape(Mesh &m, int ch)
-{
-  m.setMapSupport(ch);
-  m.setNumMapVerts(ch, m.numVerts);
-  m.setNumMapFaces(ch, m.numFaces);
-  TVFace *tf = m.mapFaces(ch);
-  for (int i = 0; i < m.numFaces; ++i)
-    for (int j = 0; j < 3; ++j)
-      tf[i].t[j] = m.faces[i].v[j];
-  memcpy(m.mapVerts(ch), m.verts, m.numVerts * sizeof(Point3));
-}
-
-static void restore_shape(Mesh &m, int ch)
-{
-  if (!m.mapSupport(ch))
-    return;
-  TVFace *tf = m.mapFaces(ch);
-  Point3 *tv = m.mapVerts(ch);
-  for (int i = 0; i < m.numFaces; ++i)
-    for (int j = 0; j < 3; ++j)
-      m.verts[m.faces[i].v[j]] = tv[tf[i].t[j]];
-  m.InvalidateGeomCache();
-}
-
-// void DagUtil::save_shp() {
-//         TimeValue time=ip->GetTime();
-//         int n=ip->GetSelNodeCount();
-//         for(int i=0;i<n;++i) {
-//                 INode *node=ip->GetSelNode(i);
-//                 if(!node) continue;
-//                 Object *o=node->GetObjectRef();
-//                 if(!o) continue;
-//                 if(!o->IsSubClassOf(Class_ID(TRIOBJ_CLASS_ID,0))) continue;
-//                 node->InvalidateWS();
-//                 save_shape(((TriObject*)o)->mesh,2);
-//                 node->InvalidateWS();
-//         }
-//         ip->RedrawViews(time);
-// }
-
-// void DagUtil::restore_shp() {
-//         TimeValue time=ip->GetTime();
-//         int n=ip->GetSelNodeCount();
-//         for(int i=0;i<n;++i) {
-//                 INode *node=ip->GetSelNode(i);
-//                 if(!node) continue;
-//                 Object *o=node->GetObjectRef();
-//                 if(!o) continue;
-//                 if(!o->IsSubClassOf(Class_ID(TRIOBJ_CLASS_ID,0))) continue;
-//                 node->InvalidateWS();
-//                 restore_shape(((TriObject*)o)->mesh,2);
-//                 node->InvalidateWS();
-//         }
-//         ip->RedrawViews(time);
-// }
-
-int apply_ltmap(Mesh &m, int mati, int mch, int w, int h, float psz, int &usage_percent);
-
-// void DagUtil::map_ltmap(bool autostep) {
-//         get_edint(elm_matid,lm_matid);
-//         get_edint(elm_wd,lm_wd);
-//         get_edint(elm_ht,lm_ht);
-//         get_edfloat(elm_step,lm_step);
-//         get_edint(elm_mapch,lm_mapch);
-//         TimeValue time=ip->GetTime();
-//         if(ip->GetSelNodeCount()!=1)
-//                 {ip->DisplayTempPrompt(GetString(IDS_SEL_1_OBJ));return;}
-//         INode *node=ip->GetSelNode(0);
-//         if(!node) return;
-//         Object *o=node->GetObjectRef();
-//         if(!o)
-//                 {ip->DisplayTempPrompt(GetString(IDS_MUST_BE_EDMESH));return;}
-//         if(!o->IsSubClassOf(Class_ID(TRIOBJ_CLASS_ID,0)))
-//                 {ip->DisplayTempPrompt(GetString(IDS_MUST_BE_EDMESH));return;}
-//         float bstep=-1,astep;
-//         int bperc=0;
-//         if(autostep) {
-//                 ip->ProgressStart(_T("Wait... or press ESC to stop"),FALSE,dummyprogressfn,NULL);
-//                 ip->ProgressUpdate(0,FALSE,_T(""));
-//         }else ip->DisplayTempPrompt(_T("Wait..."));
-//         for(int iter=0;;) {
-//                 if(bstep>0) {
-//                         lm_step=(bstep+astep)*.5f;
-//                 }
-//                 int perc;
-//                 if(!apply_ltmap(((TriObject*)o)->mesh,lm_matid-1,lm_mapch,lm_wd,lm_ht,lm_step,perc)) {
-//                         if(autostep) {
-//                                 TSTR s; s.printf(_T("%d: error (best %d%%)"),iter+1,bperc);
-//                                 ip->ProgressUpdate(0,FALSE,s);
-//                                 if(bstep<0) lm_step*=2;
-//                                 else{
-//                                         astep=lm_step;
-//                                 }
-//                         }else{
-//                                 ip->DisplayTempPrompt(GetString(IDS_LTMAP_ERR));
-//                         }
-//                 }else{
-//                         if(autostep) {
-//                                 TSTR s; s.printf(_T("%d: %d%% used"),iter+1,perc);
-//                                 ip->ProgressUpdate(0,FALSE,s);
-//                                 bperc=perc;
-//                                 if(bstep<0) {
-//                                         bstep=lm_step;
-//                                         astep=lm_step*.5f;
-//                                 }else{
-//                                         bstep=lm_step;
-//                                 }
-//                         }else{
-//                                 TSTR s; s.printf(GetString(IDS_LTMAP_OK),perc);
-//                                 ip->DisplayTempPrompt(s);
-//                         }
-//                 }
-//                 if(!autostep) break;
-//                 if(++iter>=50 || ip->GetCancel()) {
-//                         if(lm_step!=bstep && bstep>0) {
-//                                 lm_step=bstep;
-//                                 if(!apply_ltmap(((TriObject*)o)->mesh,lm_matid-1,lm_mapch,lm_wd,lm_ht,lm_step,perc))
-//                                         ip->DisplayTempPrompt(GetString(IDS_LTMAP_ERR));
-//                                 else{
-//                                         TSTR s; s.printf(GetString(IDS_LTMAP_OK),perc);
-//                                         ip->DisplayTempPrompt(s);
-//                                 }
-//                         }
-//                         break;
-//                 }
-//         }
-//         if(autostep) {
-//                 ip->ProgressEnd();
-//                 update_ui();
-//         }
-//         node->InvalidateWS();
-//         ip->RedrawViews(time);
-// }
-
-static class SuperLight : public ObjLightDesc
-{
-public:
-  SuperLight() : ObjLightDesc(NULL)
-  {
-    affectDiffuse = TRUE;
-    affectSpecular = FALSE;
-    ambientOnly = FALSE;
-  }
-  void DeleteThis() override {}
-  BOOL Illuminate(ShadeContext &sc, Point3 &normal, Color &color, Point3 &dir, float &dot_nl, float &diffuseCoef) override
-  {
-    color.White();
-    dir = normal;
-    dot_nl = 1;
-    diffuseCoef = 1;
-    return TRUE;
-  }
-} superlight;
-
-static Point3 pabs(const Point3 &a) { return Point3(fabs(a.x), fabs(a.y), fabs(a.z)); }
-
 float ComputeFaceCurvature(Point3 *n, Point3 *v)
 {
   Point3 nc = (n[0] + n[1] + n[2]) / 3.0f;
@@ -3899,485 +3633,6 @@ void compute_bump_vectors(const Point3 tv[3], const Point3 v[3], Point3 bvec[3])
   }
   bvec[2] = Point3(0, 0, 1);
 }
-
-class GetLightsCB : public ENodeCB
-{
-public:
-  TimeValue time;
-  Tab<ObjLightDesc *> &light;
-
-  GetLightsCB(TimeValue t, Tab<ObjLightDesc *> &lt) : light(lt) { time = t; }
-  int proc(INode *n) override
-  {
-    if (!n)
-      return ECB_CONT;
-    if (n->IsNodeHidden())
-      return ECB_CONT;
-    Object *o = n->EvalWorldState(time).obj;
-    if (o->SuperClassID() != LIGHT_CLASS_ID)
-      return ECB_CONT;
-    LightObject *lo = ((LightObject *)o);
-    LightState lst;
-    Interval lv_FOREVER = FOREVER;
-    lo->EvalLightState(time, lv_FOREVER, &lst);
-    ObjLightDesc *l = lo->CreateLightDesc(n);
-    if (!l)
-      return ECB_CONT;
-    n->SetRenderData(l);
-    light.Append(1, &l);
-    return ECB_CONT;
-  }
-};
-
-static void get_lights(TimeValue time, Interface *ip, Tab<ObjLightDesc *> &light)
-{
-  Interval lv_FOREVER = FOREVER;
-  GetLightsCB cb(time, light);
-  enum_nodes(ip->GetRootNode(), &cb);
-  class MyRC : public RendContext
-  {
-  public:
-    Color gll;
-    Color GlobalLightLevel() const override { return gll; }
-  } rc;
-  rc.gll = ip->GetLightTint(time, lv_FOREVER) * ip->GetLightLevel(time, lv_FOREVER);
-  for (int i = 0; i < light.Count(); ++i)
-  {
-    light[i]->Update(time, rc, NULL, TRUE, TRUE);
-    light[i]->UpdateGlobalLightLevel(rc.gll);
-    light[i]->UpdateViewDepParams(Matrix3(1));
-  }
-}
-
-class RenderMapSC : public ShadeContext
-{
-public:
-  TimeValue curtime;
-  INode *node;
-  Mesh *mesh;
-  int face;
-  Matrix3 cam2obj, obj2cam;
-  Box3 objbox;
-  Point3 bary, norm, normal, facenorm, view, orgview, pt, dpt, dpt_dx, dpt_dy, vp[3], bv[3], bo;
-  Point3 tv[MAX_MESHMAPS][3];
-  Color back_color;
-  float curve, face_sz, sz_ratio, facecurve;
-  Tab<Point3> fnorm;
-  Tab<Point3[3]> vnorm;
-  Tab<ObjLightDesc *> light;
-  bool hastv[MAX_MESHMAPS];
-  char lighting;
-
-  RenderMapSC(TimeValue t, char lt, Interface *ip)
-  {
-    Interval lv_FOREVER = FOREVER;
-    curtime = t;
-    doMaps = TRUE;
-    filterMaps = TRUE;
-    backFace = FALSE;
-    node = NULL;
-    mesh = NULL;
-    face = -1;
-    lighting = lt;
-    if (lighting)
-    {
-      ambientLight = ip->GetAmbient(t, lv_FOREVER);
-      get_lights(t, ip, light);
-      nLights = light.Count();
-    }
-    else
-    {
-      ambientLight = Color(0, 0, 0);
-      light.SetCount(1);
-      light[0] = &superlight;
-      nLights = 1;
-    }
-    back_color = ip->GetBackGround(t, lv_FOREVER);
-  }
-  void setnode(INode *n)
-  {
-    node = n;
-    if (n)
-    {
-      obj2cam = n->GetObjectTM(curtime);
-      cam2obj = Inverse(obj2cam);
-    }
-  }
-  void setmesh(Mesh &m)
-  {
-    mesh = &m;
-    objbox = m.getBoundingBox();
-    fnorm.SetCount(m.numFaces);
-    int i;
-    for (i = 0; i < m.numFaces; ++i)
-      fnorm[i] = Normalize(VectorTransform(
-        CrossProd(m.verts[m.faces[i].v[1]] - m.verts[m.faces[i].v[0]], m.verts[m.faces[i].v[2]] - m.verts[m.faces[i].v[0]]), obj2cam));
-    Tab<int> *vfc = new Tab<int>[m.numVerts];
-    assert(vfc);
-    for (i = 0; i < m.numFaces; ++i)
-      for (int j = 0; j < 3; ++j)
-      {
-        int v = m.faces[i].v[j];
-        // assert(v>=0 && v<m.numVerts);
-        vfc[v].Append(1, &i, 8);
-      }
-    vnorm.SetCount(m.numFaces);
-    for (i = 0; i < m.numFaces; ++i)
-    {
-      DWORD sgr = m.faces[i].smGroup;
-      for (int j = 0; j < 3; ++j)
-      {
-        Point3 n = fnorm[i];
-        int v = m.faces[i].v[j];
-        // assert(v>=0 && v<m.numVerts);
-        for (int k = 0; k < vfc[v].Count(); ++k)
-          if (vfc[v][k] != i)
-            if (m.faces[vfc[v][k]].smGroup & sgr)
-              n += fnorm[vfc[v][k]];
-        vnorm[i][j] = Normalize(n);
-      }
-    }
-    delete[] vfc;
-  }
-  void gettv(int ch)
-  {
-    if (hastv[ch])
-      return;
-    if (mesh->mapSupport(ch))
-    {
-      Point3 *t = mesh->mapVerts(ch);
-      TVFace &f = *(mesh->mapFaces(ch) + face);
-      for (int i = 0; i < 3; ++i)
-        tv[ch][i] = t[f.t[i]];
-    }
-    else
-    {
-      tv[ch][0] = Point3(0, 0, 0);
-      tv[ch][1] = Point3(0, 0, 0);
-      tv[ch][2] = Point3(0, 0, 0);
-    }
-    hastv[ch] = true;
-  }
-  void setface(int fi, int ch)
-  {
-    face = fi;
-    Face &f = mesh->faces[fi];
-    mtlNum = f.getMatID();
-    int i;
-    for (i = 0; i < 3; ++i)
-      vp[i] = mesh->verts[f.v[i]] * obj2cam;
-    for (i = 0; i < MAX_MESHMAPS; ++i)
-      hastv[i] = false;
-    face_sz = fabsf(vp[1].x - vp[0].x);
-    face_sz += fabsf(vp[1].y - vp[0].y);
-    face_sz += fabsf(vp[1].z - vp[0].z);
-    face_sz += fabsf(vp[2].x - vp[0].x);
-    face_sz += fabsf(vp[2].y - vp[0].y);
-    face_sz += fabsf(vp[2].z - vp[0].z);
-    face_sz /= 6;
-    facenorm = fnorm[fi];
-    facecurve = ComputeFaceCurvature(vnorm[fi], vp);
-    gettv(ch);
-    compute_bump_vectors(tv[ch], vp, bv);
-    bo = vp[0] - (bv[0] * tv[ch][0].x + bv[1] * tv[ch][0].y);
-  }
-  void setpt(float u, float v, float du, float dv)
-  {
-    pt = bv[0] * u + bv[1] * v + bo;
-    dpt_dx = bv[0] * du;
-    dpt_dy = bv[1] * dv;
-    dpt = (pabs(dpt_dx) + pabs(dpt_dy)) * .5f;
-    sz_ratio = (fabsf(dpt.x) + fabsf(dpt.y) + fabsf(dpt.z)) / (face_sz * 3);
-    curve = facecurve * (fabsf(du) + fabsf(dv)) * .5f;
-    bary = BaryCoords(vp[0], vp[1], vp[2], pt);
-    normal = Normalize(vnorm[face][0] * bary[0] + vnorm[face][1] * bary[1] + vnorm[face][2] * bary[2]);
-    orgview = -normal;
-    norm = normal;
-    view = orgview;
-  }
-  BOOL InMtlEditor() override { return FALSE; }
-  int Antialias() override { return TRUE; }
-  int ProjType() override { return 0; }
-  LightDesc *Light(int n) override { return light[n]; }
-  TimeValue CurTime() override { return curtime; }
-  INode *Node() override { return node; }
-  Object *GetEvalObject() override
-  {
-    if (!node)
-      return NULL;
-    return node->EvalWorldState(curtime).obj;
-  }
-  Point3 BarycentricCoords() override { return bary; }
-  int FaceNumber() override { return face; }
-  Point3 Normal() override { return norm; }
-  void SetNormal(Point3 p) override { norm = p; }
-  Point3 OrigNormal() override { return normal; }
-  float Curve() override { return curve; }
-  Point3 GNormal() override { return facenorm; }
-  Point3 CamPos() override { return Point3(0, 0, 0); }
-  Point3 V() override { return view; }
-  void SetView(Point3 p) override { view = p; }
-  Point3 OrigView() override { return orgview; }
-  Point3 ReflectVector() override
-  {
-    float VN = -DotProd(view, norm);
-    return Normalize(2.0f * VN * norm + view);
-  }
-  Point3 RefractVector(float ior) override
-  {
-    Point3 N = Normal();
-    float VN, nur, k;
-    VN = DotProd(-view, N);
-    if (backFace)
-      nur = ior;
-    else
-      nur = (ior != 0.0f) ? 1.0f / ior : 1.0f;
-    k = 1.0f - nur * nur * (1.0f - VN * VN);
-    if (k <= 0.0f)
-    {
-      // Total internal reflection:
-      return ReflectVector();
-    }
-    else
-    {
-      return (nur * VN - sqrtf(k)) * N + nur * view;
-    }
-  }
-  Point3 P() override { return pt; }
-  Point3 DP() override { return dpt; }
-  void DP(Point3 &dx, Point3 &dy) override
-  {
-    dx = dpt_dx;
-    dy = dpt_dy;
-  }
-  Point3 PObj() override { return pt * cam2obj; }
-  Point3 DPObj() override { return VectorTransform(dpt, cam2obj); }
-  Box3 ObjectBox() override { return objbox; }
-  Point3 PObjRelBox() override
-  {
-    Point3 w = objbox.Width() * .5f, c = objbox.Center();
-    Point3 p = PObj();
-    p.x = (p.x - c.x) / w.x;
-    p.y = (p.y - c.y) / w.y;
-    p.z = (p.z - c.z) / w.z;
-    return p;
-  }
-  Point3 DPObjRelBox() override
-  {
-    Point3 w = objbox.Width() * .5f;
-    Point3 p = DPObj();
-    p.x = (p.x) / w.x;
-    p.y = (p.y) / w.y;
-    p.z = (p.z) / w.z;
-    return p;
-  }
-  void ScreenUV(Point2 &uv, Point2 &duv) override
-  {
-    uv = Point2(0.f, 0.f);
-    duv = Point2(0.f, 0.f);
-  }
-  IPoint2 ScreenCoord() override { return IPoint2(0, 0); }
-  Point3 UVW(int ch) override
-  {
-    gettv(ch);
-    return tv[ch][0] * bary[0] + tv[ch][1] * bary[1] + tv[ch][2] * bary[2];
-  }
-  Point3 DUVW(int ch) override
-  {
-    gettv(ch);
-    return (pabs(tv[ch][1] - tv[ch][0]) + pabs(tv[ch][2] - tv[ch][0])) * .5f * sz_ratio;
-  }
-  void DPdUVW(Point3 dP[3], int ch) override
-  {
-    gettv(ch);
-    Point3 bvec[3];
-    ComputeBumpVectors(tv[ch], vp, bvec);
-    for (int i = 0; i < 3; ++i)
-      dP[i] = Normalize(bvec[i]);
-  }
-  void GetBGColor(Color &co, Color &tr, int fogBG) override
-  {
-    co = back_color;
-    tr.Black();
-  }
-  Point3 PointTo(const Point3 &p, RefFrame ito) override
-  {
-    switch (ito)
-    {
-      case REF_WORLD:
-      case REF_CAMERA: return p;
-      case REF_OBJECT: return p * cam2obj;
-    }
-    return p;
-  }
-  Point3 PointFrom(const Point3 &p, RefFrame ito) override
-  {
-    switch (ito)
-    {
-      case REF_WORLD:
-      case REF_CAMERA: return p;
-      case REF_OBJECT: return p * obj2cam;
-    }
-    return p;
-  }
-  Point3 VectorTo(const Point3 &p, RefFrame ito) override
-  {
-    switch (ito)
-    {
-      case REF_WORLD:
-      case REF_CAMERA: return p;
-      case REF_OBJECT: return VectorTransform(p, cam2obj);
-    }
-    return p;
-  }
-  Point3 VectorFrom(const Point3 &p, RefFrame ito) override
-  {
-    switch (ito)
-    {
-      case REF_WORLD:
-      case REF_CAMERA: return p;
-      case REF_OBJECT: return VectorTransform(p, obj2cam);
-    }
-    return p;
-  }
-};
-
-// void DagUtil::render_map() {
-//         if(!ip->GetSelNodeCount())
-//                 {ip->DisplayTempPrompt(GetString(IDS_NO_SEL));return;}
-//         get_edint(elm_wd,lm_wd);
-//         get_edint(elm_ht,lm_ht);
-//         get_edint(elm_mapch,lm_mapch);
-//         if(!TheManager->SelectFileOutput(&rmap_bi,ip->GetMAXHWnd())) return;
-//         rmap_bi.SetType(BMM_TRUE_32);
-//         rmap_bi.SetWidth(lm_wd);
-//         rmap_bi.SetHeight(lm_ht);
-//         rmap_bi.SetFlags(MAP_HAS_ALPHA);
-//         Bitmap *bm=TheManager->Create(&rmap_bi);
-//         if(!bm) {ip->DisplayTempPrompt(GetString(IDS_CANT_SAVE_BITMAP));return;}
-//         char *map=new char[lm_wd*lm_ht];
-//         assert(map);
-//         memset(map,0,lm_wd*lm_ht);
-//         TimeValue time=ip->GetTime();
-//         RenderMapSC sc(time,rmap_lighting,ip);
-//         int nn=ip->GetSelNodeCount(),nr=0;
-//         float du=1.f/lm_wd;
-//         float dv=1.f/lm_ht;
-//         int lastperc=0,perc;
-//         ip->ProgressStart(_T("Rendering..."),TRUE,dummyprogressfn,NULL);
-//         bm->Display();
-//         for(int ni=0;ni<nn;++ni) {
-//                 INode *node=ip->GetSelNode(ni);
-//                 if(!node) continue;
-//                 Mtl *mtl=node->GetMtl();
-//                 if(!mtl) continue;
-//                 mtl->Update(time,FOREVER);
-//                 ip->ProgressUpdate(perc=ni*100/nn);
-//                 sc.setnode(node);
-//                 const ObjectState &os=node->EvalWorldState(time);
-//                 if(!os.obj) continue;
-//                 if(!os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID,0))) continue;
-//                 TriObject *tri=(TriObject*)os.obj->ConvertToType(time,Class_ID(TRIOBJ_CLASS_ID,0));
-//                 if(!tri) continue;
-//                 Mesh &m=tri->mesh;
-//                 if(m.mapSupport(lm_mapch)) {
-//                         ++nr;
-//                         sc.setmesh(m);
-//                         Face *f=m.faces;
-//                         TVFace *tf=m.mapFaces(lm_mapch);
-//                         Point3 *tv=m.mapVerts(lm_mapch);
-//                         for(int fi=0;fi<m.numFaces;++fi,++f,++tf) {
-//                                 if((fi&31)==0) {
-//                                         if(ip->GetCancel()) break;
-//                                         ip->ProgressUpdate(perc=(ni*m.numFaces+fi)*100/(nn*m.numFaces));
-//                                         if(perc-lastperc>=10) {
-//                                                 bm->RefreshWindow();
-//                                                 lastperc=perc;
-//                                         }
-//                                 }
-//                                 sc.setface(fi,lm_mapch);
-//                                 Point3 t0=tv[tf->t[0]]-Point3(du,dv,0.f)*.5f;
-//                                 Point3 t1=tv[tf->t[1]]-Point3(du,dv,0.f)*.5f;
-//                                 Point3 t2=tv[tf->t[2]]-Point3(du,dv,0.f)*.5f;
-//                                 Box3 box;
-//                                 box+=t0; box+=t1; box+=t2;
-//                                 int u0=floorf(box.pmin.x*lm_wd);
-//                                 int v0=floorf(box.pmin.y*lm_ht);
-//                                 int u1=ceilf(box.pmax.x*lm_wd);
-//                                 int v1=ceilf(box.pmax.y*lm_ht);
-//                                 float A[3],B[3],C[3];
-// #define  MAKELINE(p0,p1,A,B,C) { \
-//        double a=-(p1.y-p0.y)*lm_ht; \
-//        double b=(p1.x-p0.x)*lm_wd; \
-//        double l=sqrt(a*a+b*b); \
-//        if(l==0) A=B=0; else {A=a/l;B=b/l;} \
-//        C=-(A*p0.x*lm_wd+B*p0.y*lm_ht); \
-//}
-//                                 MAKELINE(t0,t1,A[0],B[0],C[0]);
-//                                 MAKELINE(t1,t2,A[1],B[1],C[1]);
-//                                 MAKELINE(t2,t0,A[2],B[2],C[2]);
-// #undef MAKELINE
-//                                 if(A[0]*t2.x*lm_wd+B[0]*t2.y*lm_ht+C[0]<0)
-//                                         for(int i=0;i<3;++i) {
-//                                                 A[i]=-A[i];
-//                                                 B[i]=-B[i];
-//                                                 C[i]=-C[i];
-//                                         }
-//                                 int y=v0%lm_ht; if(y<0) y+=lm_ht;
-//                                 int x0=u0%lm_wd; if(x0<0) x0+=lm_wd;
-//                                 for(int v=v0;v<=v1;++v,y=(++y>=lm_ht?0:y)) {
-//                                         float tv=v/float(lm_ht)+dv*.5f;
-//                                         float de[3];
-//                                         for(int i=0;i<3;++i) de[i]=B[i]*v+C[i];
-//                                         for(int u=u0,x=x0;u<=u1;++u,x=(++x>=lm_wd?0:x)) {
-//                                                 bool bord=false;
-//                                                 for(i=0;i<3;++i) {
-//                                                         float d=A[i]*u+de[i];
-//                                                         if(d>=0) continue;
-//                                                         if(d<=-1.5f) break;
-//                                                         bord=true;
-//                                                 }
-//                                                 if(i<3) continue;
-//                                                 if(map[y*lm_wd+x]==1) continue;
-//                                                 float tu=u/float(lm_wd)+du*.5f;
-//                                                 sc.ResetOutput();
-//                                                 sc.setpt(tu,tv,du,dv);
-//                                                 mtl->Shade(sc);
-//                                                 sc.out.c.ClampMinMax();
-//                                                 float a=1-(sc.out.t.r+sc.out.t.g+sc.out.t.b)/3;
-//                                                 if(a<0) a=0; else if(a>1) a=1;
-//                                                 BMM_Color_64 c;
-//                                                 c.r=sc.out.c.r*0xFFFF;
-//                                                 c.g=sc.out.c.g*0xFFFF;
-//                                                 c.b=sc.out.c.b*0xFFFF;
-//                                                 c.a=a*0xFFFF;
-//                                                 verify(bm->PutPixels(x,lm_ht-1-y,1,&c));
-//                                                 map[y*lm_wd+x]=(bord?2:1);
-//                                         }
-//                                 }
-//                         }
-//                 }
-//                 if(tri!=os.obj) delete tri;
-//                 if(ip->GetCancel()) break;
-//                 bm->RefreshWindow(); lastperc=perc;
-//         }
-//         delete[] map;
-//         bm->UnDisplay();
-//         ip->ProgressUpdate(100,FALSE,_T("Saving bitmap..."));
-//         if(nr && !ip->GetCancel()) {
-//                 if(bm->OpenOutput(&rmap_bi)!=BMMRES_SUCCESS)
-//                         {ip->DisplayTempPrompt(GetString(IDS_CANT_SAVE_BITMAP));return;}
-//                 if(bm->Write(&rmap_bi)!=BMMRES_SUCCESS)
-//                         {ip->DisplayTempPrompt(GetString(IDS_CANT_SAVE_BITMAP));return;}
-//                 bm->Close(&rmap_bi);
-//         }
-//         bm->DeleteThis();
-//         ip->ProgressEnd();
-//         {
-//         TSTR s; s.printf(GetString(IDS_OBJS_RENDERED),nr);
-//         ip->DisplayTempPrompt(s);
-//         }
-// }
 
 void extrude_spline(TimeValue time, INode &node, BezierShape &, Mesh &, float ht, float tile, float grav, int segs, int steps, bool up,
   bool usetang);
@@ -4492,10 +3747,8 @@ static inline Point3 get_pt(Point3 &v1, Point3 &v2, Point3 &nrm1, Point3 &nrm2, 
 {
   Point3 pr1 = (v2 - v1), pr2 = pr1; // Normalize
   pr1 = (pr1 - DotProd(nrm1, pr1) * nrm1);
-  // pr1=nrm1;
   pr1 *= pow;
   pr2 = (pr2 - DotProd(nrm2, pr2) * nrm2);
-  // pr2=nrm2;
   pr2 *= pow;
   float dx = v1.x, cx = pr1.x, ax = pr2.x - 2 * v2.x + 2 * dx + cx, bx = v2.x - ax - cx - dx;
   float dy = v1.y, cy = pr1.y, ay = pr2.y - 2 * v2.y + 2 * dy + cy, by = v2.y - ay - cy - dy;
@@ -4506,7 +3759,6 @@ static inline Point3 get_pt(Point3 &v1, Point3 &v2, Point3 &nrm1, Point3 &nrm2, 
 static inline void neighbedge(Face &f, DWORD a, int &hh1, int &hh2)
 {
   DWORD *v = f.getAllVerts();
-  //      hh1=hh2=-1;
   if (a == v[0])
   {
     hh1 = 0;
@@ -4622,9 +3874,6 @@ static void _recurse(int eds[4], int vedb1, int vedb2)
   {
     int ed1[2], ed2[2];
     {
-      /*int vv1=m.faces[eds[k]/3].v[eds[k]%3];
-      int vv2=m.faces[eds[k]/3].v[(eds[k]+)%3];
-      int me=ae.FindEdge(vv1,vv2);*/
       int meee = eds[k];
       int vv1 = recurse_ae->edges[meee].v[0];
       int vv2 = recurse_ae->edges[meee].v[1];
@@ -4636,7 +3885,6 @@ static void _recurse(int eds[4], int vedb1, int vedb2)
           continue;
         if (!mesh_face_sel(*recurse_m)[f1] || !mesh_face_sel(*recurse_m)[f2])
           continue;
-        // debug("fc %d %d",f1,f2);
         if ((*recurse_fcs)[f1] && (*recurse_fcs)[f2])
           continue;
         if ((*recurse_fcs)[f1])
@@ -4675,8 +3923,6 @@ static void _recurse(int eds[4], int vedb1, int vedb2)
               break;
           ed2[1] = k;
         }
-        // ed1[0]+=f1*3;ed1[1]+=f1*3;
-        // ed2[0]+=f2*3;ed2[1]+=f2*3;
         int e;
         e = ed1[1];
         ed1[1] = ed2[1];
@@ -4729,7 +3975,6 @@ static void _recurse(int eds[4], int vedb1, int vedb2)
       eds[1] = ed1[1];
       eds[2] = ed2[0];
       eds[3] = ed2[1];
-      // debug("rec");
       _recurse(eds, vedb1, vedb2);
     }
   }
@@ -4800,7 +4045,6 @@ int calc_sm_normals(Tab<Point3> &norms, Mesh &m, char use_sm, float pow)
           n += norm[(*vrfs[v])[j]];
         }
       ng[vi] = Normalize(n);
-      // debug("nrm %g %g %g",ng[vi].x,ng[vi].y,ng[vi].z);
     }
     nrms[i][0] = ng[0];
     nrms[i][1] = ng[1];
@@ -4811,10 +4055,8 @@ int calc_sm_normals(Tab<Point3> &norms, Mesh &m, char use_sm, float pow)
   for (i = 0; i < norms.Count(); ++i)
   {
     Point3 n(0, 0, 0);
-    // debug("fc %d",vrfs[i]->Count());
     for (int j = 0; j < vrfs[i]->Count(); ++j)
     {
-      // if (!use_sm)if(!mesh_face_sel(m)[(*vrfs[i])[j]]) continue;
       int fc = (*vrfs[i])[j];
       int k;
       for (k = 0; k < 3; ++k)
@@ -4863,31 +4105,14 @@ static inline void gettvrt(Mesh &m, float at, int v0, int v1, AdjEdgeList &ae, i
   }
 }
 
-static int int_lcmp(void const *a, void const *b) { return *((int *)(b)) - *((int *)(a)); }
-
 struct TQuad
 {
-  // int v[4];
-  // int cred4;//0: 1-3 1-4 2-3 2-4
-  // int nrm1;//0 1
   Face f[2];
   TVFace tf[MESHSMOOTHMAPS_SUPPORT][2];
   int v2v1[3], v2v2[3];
-  // int t2t1[3],t2t2[3];
-  TQuad() {}
+  TQuad() {};
   TQuad(int vr[4], int fc1, int fc2, Mesh &m)
   {
-    //,AdjEdgeList &ae,int ed1,int ed2//int tr[4],
-    /*for(int k=0;k<3;++k)
-            if(!m.faces[fc1].getEdgeVis(k)) break;
-    int vv[2];vv[0]=m.faces[fc1].v[k];vv[1]=m.faces[fc1].v[(k+1)%3];
-    if(vv[0]==v[0]) {
-            if(vv[1]==v[2]) cred4=0;
-            else cred4=1;
-    } else {
-            if(vv[1]==v[2]) cred4=2;
-            else cred4=3;
-    }*/
     f[0] = m.faces[fc1];
     f[1] = m.faces[fc2];
     {
@@ -4921,18 +4146,6 @@ struct TQuad
       else
         v2v2[k] = 3;
     }
-    /*              for(k=0;k<3;++k){
-                            if(tf[0].t[k]==tr[0]) t2t1[k]=0;
-                            else if(tf[0].t[k]==tr[1]) t2t1[k]=1;
-                            else if(tf[0].t[k]==tr[2]) t2t1[k]=2;
-                            else t2t1[k]=3;
-                    }
-                    for(k=0;k<3;++k){
-                            if(tf[1].t[k]==tr[0]) t2t2[k]=0;
-                            else if(tf[1].t[k]==tr[1]) t2t2[k]=1;
-                            else if(tf[1].t[k]==tr[2]) t2t2[k]=2;
-                            else t2t2[k]=3;
-                    }*/
   }
   void GetAnalogueQuad(int fv[4], int ft[MESHSMOOTHMAPS_SUPPORT][4], Face &fc1, Face &fc2, TVFace tfc1[MESHSMOOTHMAPS_SUPPORT][2])
   {
@@ -4982,7 +4195,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
   BitArray presel = mesh_face_sel(m);
   if (!smooth_selected)
     mesh_face_sel(m).SetAll();
-  // debug("!!! %d",tmselectf);
   AdjEdgeList ae(mesh);
   Tab<int> divEdges;
   divEdges.Resize(ae.edges.Count());
@@ -5087,8 +4299,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
           else
             s = mesh_smoothtu;
         }
-        // ed1[0]+=f1*3;ed1[1]+=f1*3;
-        // ed2[0]+=f2*3;ed2[1]+=f2*3;
         int e;
         e = ed1[1];
         ed1[1] = ed2[1];
@@ -5100,7 +4310,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
       }
       if (mesh_smoothtu)
         s = !s;
-      // debug("s %d %d",s,mesh_smoothtu);
       if (!s)
       {
         divEdges[ed1[0]] = 1;
@@ -5137,14 +4346,12 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
       if (m.mapSupport(mi))
         addtverts[mi].Append(m.getNumMapVerts(mi), m.mapVerts(mi));
   }
-  // debug("calc smooth %g",sharpness);
   calc_sm_normals(normals, mesh, use_smooth_grps, 1);
   int i;
   for (i = 0; i < divEdges.Count(); ++i)
   {
     if (divEdges[i] != 1)
       continue;
-    // debug("%d",i);
     DivideE *de = new DivideE;
     int rc = ded.Append(1, &de);
     ded[rc]->ed = i;
@@ -5162,7 +4369,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
           ded[rc]->order[uu] = 0;
       }
     }
-    // debug("%g",Length(normals[v0]));
     for (int ki = 0; ki < iterations; ++ki)
     {
       float at = float(ki + 1) / float(iterations + 1);
@@ -5247,19 +4453,15 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
         continue;
       if (fcsquads[fc1] != -1)
       {
-        // debug("1212");
         int fc2 = fcsquads[fc1];
-        // debug("fc2 %d",fc2);
         fcsdivd[fc1] = 1;
         fcsdivd[fc2] = 1;
         int ii2 = fcsedg[0][fc2];
         if (ii2 == i || ii2 < 0)
           ii2 = fcsedg[1][fc2];
-        // debug("ed2 %d",ii2);
         if (ii2 < 0)
           continue;
         int fr2p, whe2, whe1;
-        // int vsm1[3],vsm2[3];
         {
           MEdge &me = ae.edges[ded[ii2]->ed];
           fr2p = 0;
@@ -5271,9 +4473,7 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
           }
           whe2 = whichEdge(m.faces[fc2], me.v[0], me.v[1]);
         }
-        // debug("edg2 %d %d",whe2,fr2p);
         whe1 = whichEdge(m.faces[fc1], me.v[0], me.v[1]);
-        // debug("edg1 %d",whe1);
         int vr[4];
         vr[0] = whe1;
         vr[1] = (vr[0] + 1) % 3;
@@ -5300,7 +4500,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
           vr[2] = vr[3];
           vr[3] = cc;
         }
-        // debug("order %d %d",ded[ii2]->order[fr2p],ded[i]->order[kf]);
         {
           for (int mi = 0; mi < m.getNumMaps(); ++mi)
             if (m.mapSupport(mi))
@@ -5327,9 +4526,7 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
             curv[p] = vr[p];
           }
         }
-        // debug("11");
         TQuad qd(vr, fc1, fc2, m);
-        // debug("vr2 %d vr1 %d",ded[ii2]->vrt.Count(),ded[i]->vrt.Count());
         for (int r = 0; r <= ded[i]->vrt.Count(); ++r)
         {
           if (r < ded[i]->vrt.Count())
@@ -5341,14 +4538,11 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
             }
             curv[1] = ded[i]->vrt[r1];
             curv[3] = ded[ii2]->vrt[r2];
-            // int tr=r;
-            // if(ded[i]->order[kf]) tr=ded[i]->tvrt.Count()-r-1;
             {
               for (int mi = 0; mi < m.getNumMaps(); ++mi)
                 if (m.mapSupport(mi))
                 {
                   curt[mi][1] = ded[i]->tvrt[mi][r1][kf];
-                  // if(ded[ii2]->order[fr2p]) tr=ded[ii2]->tvrt.Count()-r-1;
                   curt[mi][3] = ded[ii2]->tvrt[mi][r2][fr2p];
                 }
             }
@@ -5365,12 +4559,10 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
                   curt[mi][3] = tr[mi][3];
                 }
             }
-            // curt[1]=0;curt[3]=0;
           }
           Face fc[2];
           TVFace tfc[MESHSMOOTHMAPS_SUPPORT][2];
           qd.GetAnalogueQuad(curv, curt, fc[0], fc[1], tfc);
-          // debug("frst tv1(%g %g %g) tv2(%g %g %g)",P3D(addtverts[curt[0]]),P3D(addtverts[curt[2]]));
           curv[0] = curv[1];
           curv[2] = curv[3];
           {
@@ -5381,7 +4573,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
                 curt[mi][2] = curt[mi][3];
               }
           }
-          // debug("sec tv1(%g %g %g) tv2(%g %g %g)",P3D(addtverts[curt[0]]),P3D(addtverts[curt[2]]));
           if (r > 0)
           {
             int fad = newfcs.Append(2, fc);
@@ -5398,7 +4589,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
           }
           else
           {
-            // qd.GetAnalogueQuad(vr,tr,fc[0],fc[1],tfc[0],tfc[1]);
             newfcs[fc1] = fc[0];
             newfcs[fc2] = fc[1];
             {
@@ -5428,7 +4618,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
               ttt[mi] = m.mapFaces(mi)[fc1];
             }
         }
-        // if(LengthSquared(addvrts[ded[i]->vrt[0]]-addvrts[fff.v[frstv]])>LengthSquared(addvrts[ded[i]->vrt[0]]-addvrts[fff.v[secv]])){
         if (ded[i]->order[kf])
         {
           int cc = frstv;
@@ -5495,7 +4684,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
                 }
             }
           }
-          // todel.Append(1,&fc1);
         }
         fcsdivd[fc1] = 1;
       }
@@ -5503,11 +4691,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
     delete ded[i];
   }
   ded.SetCount(0);
-  /*todel.Sort(int_lcmp);
-  {for(int p=0;p<todel.Count();++p) {newfcs.Delete(todel[p],1);newtvfcs.Delete(todel[p],1);}}*/
-  // if(newtvfcs.Count()!=newfcs.Count())
-  // theHold.Begin();
-  // theHold.Put(new MeshSmoothRestore());
   m.setNumFaces(newfcs.Count());
   memcpy(m.faces, &newfcs[0], newfcs.Count() * sizeof(Face));
   {
@@ -5534,7 +4717,6 @@ void DagUtil::smooth_mesh(INode *node, Mesh &m)
         }
       }
   }
-  // theHold.Accept(GetString(IDS_MESHSMOOTH));
 }
 
 void DagUtil::mesh_smooth()
@@ -5547,8 +4729,6 @@ void DagUtil::mesh_smooth()
     INode *node = ip->GetSelNode(nn);
     if (!node)
       continue;
-    // debug("!!!!cd");
-    // if(!node->IsSubClassOf(Class_ID(TRIOBJ_CLASS_ID,0))) continue;
     Object *meshobj = node->EvalWorldState(time).obj;
     TriObject *to = (TriObject *)meshobj->ConvertToType(time, Class_ID(TRIOBJ_CLASS_ID, 0));
     if (!to)
@@ -5559,7 +4739,6 @@ void DagUtil::mesh_smooth()
       continue;
     }
     Mesh &mesh = to->mesh;
-    // debug("!!!12!cd");
     smooth_mesh(node, mesh);
     mesh.InvalidateGeomCache();
     node->InvalidateWS();
@@ -5567,13 +4746,12 @@ void DagUtil::mesh_smooth()
   ip->RedrawViews(time);
 }
 
-void put_meshes_on_mesh(Interface *ip, TCHAR *selsname, Tab<INode *> &snode, int objnum, int seed, bool set_to_norm, bool use_smgr,
-  bool rotatez, float slope, bool selfaces, float xydiap[2], float zdiap[2], bool xys, char zs);
+void put_meshes_on_mesh(Interface *ip, const wchar_t *selsname, Tab<INode *> &snode, int objnum, int seed, bool set_to_norm,
+  bool use_smgr, bool rotatez, float slope, bool selfaces, float xydiap[2], float zdiap[2], bool xys, char zs);
 
 void DagUtil::genobjonsurf()
 {
   update_vars();
-  TimeValue time = ip->GetTime();
   int nc = ip->GetSelNodeCount();
   if (!nc)
     return;
@@ -5581,17 +4759,13 @@ void DagUtil::genobjonsurf()
   snode.SetCount(nc);
   for (int i = 0; i < nc; ++i)
     snode[i] = ip->GetSelNode(i);
-  put_meshes_on_mesh(ip, gs_sname, snode, gs_objnum, gs_seed, bool(gs_set2norm != 0), bool(gs_usesmgr != 0), bool(gs_rotatez != 0),
-    DegToRad(gs_slope), bool(gs_selfaces != 0), gs_xydiap, gs_zdiap, bool(gs_scalexy != 0), gs_scalez);
+  put_meshes_on_mesh(ip, gs_sname.data(), snode, gs_objnum, gs_seed, bool(gs_set2norm != 0), bool(gs_usesmgr != 0),
+    bool(gs_rotatez != 0), DegToRad(gs_slope), bool(gs_selfaces != 0), gs_xydiap, gs_zdiap, bool(gs_scalexy != 0), gs_scalez);
 }
 
 Matrix3 get_scaled_stretch_node_tm(INode *node, TimeValue time)
 {
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
-  float masterScale = (float)GetSystemUnitScale(UNITS_METERS);
-#else
-  float masterScale = (float)GetMasterScale(UNITS_METERS);
-#endif
+  float masterScale = static_cast<float>(GetSystemUnitScale(UNITS_METERS));
   Matrix3 tm = node->GetStretchTM(time) * node->GetNodeTM(time);
   tm.SetTrans(tm.GetTrans() * masterScale);
   return tm;
@@ -5600,11 +4774,7 @@ Matrix3 get_scaled_stretch_node_tm(INode *node, TimeValue time)
 
 Matrix3 get_scaled_object_tm(INode *node, TimeValue time)
 {
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
-  float masterScale = (float)GetSystemUnitScale(UNITS_METERS);
-#else
-  float masterScale = (float)GetMasterScale(UNITS_METERS);
-#endif
+  float masterScale = static_cast<float>(GetSystemUnitScale(UNITS_METERS));
   Matrix3 tm = node->GetObjectTM(time);
   tm.SetTrans(tm.GetTrans() * masterScale);
   return tm;

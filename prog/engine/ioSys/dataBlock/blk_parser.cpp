@@ -10,6 +10,8 @@
 #include <ioSys/dag_zstdIo.h>
 #include <ioSys/dag_memIo.h>
 #include <ioSys/dag_dataBlockCommentsDef.h>
+#include <memory/dag_framemem.h>
+#include <util/dag_finally.h>
 #include <util/le2be.h>
 #include <util/dag_string.h>
 #include <math/integer/dag_IPoint2.h>
@@ -66,6 +68,7 @@ public:
   Tab<int> includeStackPrevCurLine;
   DataBlock *blkRef = nullptr;
   bool robustParsing;
+  bool forbidIncludes;
   bool wasNewlineAfterStatement = false;
   int lastStatement = -1; // -1=none, 0=param, 1=block
   struct PendingComment
@@ -76,7 +79,7 @@ public:
   Tab<PendingComment> pendCmnt;
   DataBlock::IFileNotify *fnotify;
 
-  DataBlockParser(Tab<char> &buf, const char *fn, bool robust_parsing, DataBlock::IFileNotify *fnot) :
+  DataBlockParser(Tab<char> &buf, const char *fn, bool robust_parsing, bool forbid_includes, DataBlock::IFileNotify *fnot) :
     buffer(buf),
     text(&buf[0]),
     curp(&buf[0]),
@@ -86,6 +89,7 @@ public:
     includeStack(tmpmem),
     curLineP(curp),
     robustParsing(robust_parsing),
+    forbidIncludes(forbid_includes),
     fnotify(fnot)
   {
     for (char *c = buf.data(); c < textend; ++c)
@@ -628,7 +632,8 @@ static void makeFullPathFromRelative(String &path, const char *base_filename)
   {                                                                                                       \
     logmessage(blk.shared->blkRobustLoad() ? LOGLEVEL_WARN : LOGLEVEL_ERR,                                \
       "DataBlockParser: invalid value '%s' at line %d of file '%s'", (VALUE).c_str(), curLine, fileName); \
-    return false;                                                                                         \
+    if (!blk.shared->blkRobustLoad())                                                                     \
+      return false;                                                                                       \
   }
 
 static inline int is_digit(char value) { return value >= '0' && value <= '9'; }
@@ -711,9 +716,13 @@ inline const char *parse_naive(const char *__restrict value, const char *__restr
 #ifdef _DEBUG_TAB_
   if (endPtr)
   {
+    char *endPtr2 = NULL;
     long long int i2 = 0;
-    int res = sscanf(value, "%lld", &i2);
-    if (res != 1 || v != i2)
+    if (value[0] == '0') // for hex
+      i2 = strtoull(value, &endPtr2, 0);
+    else
+      i2 = strtoll(value, &endPtr2, 0);
+    if (endPtr != endPtr2 || v != i2)
     {
       logerr("Parsed incorrectly, %d != %d, <%s>", v, i2, value);
       return nullptr;
@@ -1443,6 +1452,10 @@ bool DataBlockParser::parse(DataBlock &blk, bool isTop)
     }
     else if (dd_stricmp(name, "include") == 0)
     {
+      if (forbidIncludes)
+      {
+        SYNTAX_ERROR("include is not allowed");
+      }
       // We have to cache 'filename' here because 'getValue()' might incorrectly change it
       // in case when this include is last one in file (which breaks relative pathes)
       String cachedFileName(fileName);
@@ -1505,7 +1518,7 @@ bool DataBlockParser::parse(DataBlock &blk, bool isTop)
       }
 
       if ((/*new binaryformats*/ len > 1 && buffer[pos] >= dblk::BBF_full_binary_in_stream &&
-            buffer[pos] <= dblk::BBF_binary_with_shared_nm_zd) ||
+            buffer[pos] <= dblk::BBF_full_binary_in_stream_dedup) ||
           (/* old BBF3 format */ len >= 4 && *(int *)&buffer[pos] == _MAKE4C('BBF')))
       {
         logwarn("including binary file '%s', not fastest codepath", valueStr.str());
@@ -1522,7 +1535,7 @@ bool DataBlockParser::parse(DataBlock &blk, bool isTop)
         inc_blk.loadFromStream(crd, valueStr, fnotify, len);
         erase_items(buffer, pos, len + 2);
 
-        DynamicMemGeneralSaveCB cwr(tmpmem, len * 2, 4 << 10);
+        DynamicMemGeneralSaveCB cwr(framemem_ptr(), len * 2, 4 << 10);
         inc_blk.saveToTextStream(cwr);
         len = cwr.size();
         insert_items(buffer, pos, len + 2);
@@ -1554,7 +1567,8 @@ bool DataBlockParser::parse(DataBlock &blk, bool isTop)
 }
 
 
-static bool parse_from_text(DataBlock &blk, Tab<char> &text, const char *filename, bool robust_load, DataBlock::IFileNotify *fnotify)
+static bool parse_from_text(DataBlock &blk, Tab<char> &text, const char *filename, bool robust_load, bool forbid_includes,
+  DataBlock::IFileNotify *fnotify)
 {
   char *end = text.size() ? (char *)memchr(text.data(), 0, text.size()) : (char *)NULL;
   if (end)
@@ -1563,7 +1577,7 @@ static bool parse_from_text(DataBlock &blk, Tab<char> &text, const char *filenam
   if (text.size() >= 3 && memcmp(text.data(), "\xEF\xBB\xBF", 3) == 0)
     memcpy(text.data(), "   ", 3);
 
-  DataBlockParser parser(text, filename, robust_load, fnotify);
+  DataBlockParser parser(text, filename, robust_load, forbid_includes, fnotify);
   return parser.parse(blk, true);
 }
 
@@ -1584,7 +1598,7 @@ bool DataBlock::loadText(const char *text, int len, const char *filename, DataBl
     return true;
   }
 
-  Tab<char> buf(tmpmem);
+  Tab<char> buf(framemem_ptr());
   buf.reserve(len + 3); // +3 because of append in loadText
   buf.resize(len);      // don't use copyFrom because it does realloc despite of total (i.e. reserved) memory
   memcpy(buf.data(), text, len);
@@ -1596,11 +1610,12 @@ bool DataBlock::loadText(const char *text, int len, const char *filename, DataBl
       shared->setSrc(filename);
 #if DAGOR_DBGLEVEL > 0
     else
-      shared->setSrc(String(0, "BLK\n%.*s", min(buf.size(), 512u), buf.size() ? buf.data() : ""));
+      shared->setSrc(String(0, framemem_ptr(), "BLK\n%.*s%s", min(len, int(512 - sizeof("..."))), buf.data(),
+        (len < (512 - sizeof("..."))) ? "" : "..."));
 #endif
   }
 
-  bool ret = parse_from_text(*this, buf, filename, shared->blkRobustLoad(), fnotify);
+  bool ret = parse_from_text(*this, buf, filename, shared->blkRobustLoad(), shared->blkNoIncludes(), fnotify);
   shared->setBlkValid(ret);
   return ret;
 }
@@ -1726,13 +1741,25 @@ bool DataBlock::loadFromStream(IGenLoad &crd, const char *fname, DataBlock::IFil
     }
     else if (label == dblk::BBF_full_binary_in_stream)
       valid = loadFromBinDump(crd, nullptr);
+    else if (label == dblk::BBF_full_binary_in_stream_dedup)
+      valid = loadFromBinDump(crd, nullptr, /*dedup_ofs*/ true);
     else if (label == dblk::BBF_full_binary_in_stream_z)
     {
       unsigned csz = 0;
       crd.read(&csz, 3);
       ZstdLoadCB zcrd(crd, csz, nullptr, zstdtmp);
-      G_VERIFY(zcrd.readIntP<1>() == dblk::BBF_full_binary_in_stream);
-      valid = loadFromBinDump(zcrd, nullptr);
+      if (!shared->blkRobustLoad())
+      {
+        G_VERIFY(zcrd.readIntP<1>() == dblk::BBF_full_binary_in_stream);
+        valid = loadFromBinDump(zcrd, nullptr);
+      }
+      else
+      {
+        // In robust mode, allow parser to stop early on bad data without tripping
+        // zstd wrapper invariant asserts in its destructor.
+        FINALLY([&zcrd] { zcrd.ceaseReading(); }); // RAII wrapper for exception safety
+        valid = zcrd.readIntP<1>() == dblk::BBF_full_binary_in_stream && loadFromBinDump(zcrd, nullptr);
+      }
     }
     else
     {
@@ -1819,7 +1846,7 @@ bool DataBlock::loadFromStream(IGenLoad &crd, const char *fname, DataBlock::IFil
 #endif
         }
 
-        bool ret = parse_from_text(*this, text, fname, shared->blkRobustLoad(), fnotify);
+        bool ret = parse_from_text(*this, text, fname, shared->blkRobustLoad(), shared->blkNoIncludes(), fnotify);
         shared->setBlkValid(ret);
         return ret;
       }

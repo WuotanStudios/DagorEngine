@@ -1,13 +1,13 @@
 from "%scripts/ui/ui_library.nut" import *
 from "%scripts/ui/widgets/style.nut" import *
 import "math" as math
-let {sound_play} = require("%dngscripts/sound_system.nut")
+from "%dngscripts/sound_system.nut" import sound_play
 
 let calcFrameColor = @(sf) (sf & S_KB_FOCUS)
     ? BtnBgFocused
     : (sf & S_HOVER) ? BtnBdSelected : CheckBoxContentDefault
 
-let opaque = Color(0,0,0,255)
+const opaque = Color(0,0,0,255)
 let calcKnobColor =  @(sf) (sf & S_KB_FOCUS) ? (TextActive | opaque)
                            : (sf & S_HOVER)    ? (TextHover | opaque)
                                                : (TextNormal | opaque)
@@ -51,7 +51,7 @@ function slider(orient, var, options={}) {
   function knob() {
     return {
       rendObj = ROBJ_SOLID
-      size  = static [fsh(1), fsh(2)]
+      size  = const [fsh(1), fsh(2)]
       group = group
       color = calcKnobColor(knobStateFlags.get())
       watch = knobStateFlags

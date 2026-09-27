@@ -236,6 +236,21 @@ bool ax::NodeEditor::Link(LinkId id, PinId startPinId, PinId endPinId, const ImV
     return s_Editor->DoLink(id, startPinId, endPinId, ImColor(color), thickness);
 }
 
+void ax::NodeEditor::SetNextLinkDashSize(float dashSize)
+{
+    s_Editor->SetNextLinkDashSize(dashSize);
+}
+
+ax::NodeEditor::LinkBezierCurve ax::NodeEditor::GetLinkCurve(LinkId id)
+{
+    if (auto* link = s_Editor->FindLink(id); link && link->m_IsLive)
+    {
+        auto c = link->GetCurve();
+        return {c.P0, c.P1, c.P2, c.P3};
+    }
+    return {};
+}
+
 void ax::NodeEditor::Flow(LinkId linkId, FlowDirection direction)
 {
     if (auto link = s_Editor->FindLink(linkId))
@@ -413,6 +428,14 @@ void ax::NodeEditor::CenterNodeOnScreen(NodeId nodeId)
         node->CenterOnScreenInNextFrame();
 }
 
+// MODIFICATION BY GAIJIN
+ImVec2 ax::NodeEditor::GetPinPosition(PinId pinId)
+{
+    if (auto pin = s_Editor->FindPin(pinId))
+        return pin->m_Bounds.GetCenter();
+    return ImVec2(0.0f, 0.0f);
+}
+
 void ax::NodeEditor::SetNodeZPosition(NodeId nodeId, float z)
 {
     s_Editor->SetNodeZPosition(nodeId, z);
@@ -574,6 +597,12 @@ void ax::NodeEditor::NavigateToContent(float duration)
 void ax::NodeEditor::NavigateToSelection(bool zoomIn, float duration)
 {
     s_Editor->NavigateTo(s_Editor->GetSelectionBounds(), zoomIn, duration);
+}
+
+// MODIFICATION BY GAIJIN
+void ax::NodeEditor::ScrollCanvasPointToScreen(const ImVec2& canvasPoint, const ImVec2& screenPoint)
+{
+    s_Editor->ScrollCanvasPointToScreen(canvasPoint, screenPoint);
 }
 
 bool ax::NodeEditor::ShowNodeContextMenu(NodeId* nodeId)

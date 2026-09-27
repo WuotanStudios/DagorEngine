@@ -8,6 +8,9 @@
 #include <generic/dag_span.h>
 #include <dag/dag_vector.h>
 #include <EASTL/string.h>
+#include <osApiWrappers/dag_miscApi.h>
+#include <daECS/net/authority.h>
+#include <debug/dag_assert.h>
 
 class String;
 
@@ -16,9 +19,13 @@ namespace net
 class Object;
 class IConnection;
 class Connection;
+class CNetwork;
 class IMessage;
 class MessageClass;
 struct MessageNetDesc;
+
+// Compat name; maps to net authority thread (or unset).
+bool is_this_thread_net_em_owner();
 
 enum class ServerFlags : uint16_t
 {
@@ -34,22 +41,15 @@ DAGOR_ENABLE_ENUM_BITMASK(ServerFlags)
 
 ServerFlags get_server_flags();
 
-enum ConnFlags : uint32_t
-{
-  CF_NONE = 0,
-  CF_PENDING = 1 << 0, // Not yet authenticated
-  // resv    =  1<<1,
-  // resv    =  1<<2,
-  // resv    =  1<<3,
-};
-
 struct ConnectParams
 {
   dag::Vector<eastl::string> serverUrls;
   dag::Vector<uint8_t> encryptKey;
   dag::Vector<uint8_t> authKey;
   eastl::string sessionId;
+  eastl::string relayStunRequestAddr; // if set, UDP punch to this relay addr is queued on connect
 };
+
 } // namespace net
 
 uint32_t get_current_server_route_id();
@@ -73,16 +73,43 @@ void net_disconnect(net::IConnection &conn, DisconnectionCause cause = DC_CONNEC
 // Return number of successfull sends
 int send_net_msg(ecs::EntityManager &mgr, ecs::EntityId eid, net::IMessage &&msg, const net::MessageNetDesc *msg_net_desc = nullptr);
 int send_net_msg(ecs::EntityId eid, net::IMessage &&msg, const net::MessageNetDesc *msg_net_desc = nullptr);
+
+// Untargeted send: no EntityManager parameter -- routing is per-NetContext (GET_NET_CTX is thread-aware).
+int send_net_msg(net::IMessage &&msg, const net::MessageNetDesc *msg_net_desc = nullptr);
 #endif
+
+net::CNetwork *get_net_or_null_unchecked(); // do not call directly; use GET_NET()
+
+// Active session's CNetwork or nullptr. No owner-thread assert.
+#define GET_NET() (get_net_or_null_unchecked())
+
+bool send_msg_to_client(net::IMessage &&msg, int client_conn_id); // may run off-owner (unchecked)
+void debug_verify_net_connection_ptr(net::IConnection *conn);     // may run off-owner; debug-only
+
+void disconnect_from_relay();
+bool establish_relay_connection(const char *relay_url);
+bool set_relay_connection_handler(void (*relayConnectionHandler)(bool));
+
+eastl::string get_received_stun_system_address_str();
+void request_udp_punch_via_relay(const char *relay_addr);
 
 int get_no_packets_time_ms(); // time, in milliseconds, since last packet from server was received
 
-bool net_init_early(ecs::EntityManager &mgr);
-bool net_init_late_client(net::ConnectParams &&connect_params, ecs::EntityManager &mgr);
-void net_init_late_server(ecs::EntityManager &mgr);
 void net_create_time_if_not_exist();
-void net_update();
+void net_update(ecs::EntityManager &mgr);
 void net_sleep_server();
-void net_destroy(ecs::EntityManager &mgr, bool final = false);
-void net_on_before_emgr_clear();
+// Returns true when teardown ran; false on wrong-thread no-op or nothing to destroy.
+bool net_destroy(ecs::EntityManager &mgr, bool final = false);
+// Returns true when broadcast fired; false on wrong-thread no-op or no ctx for mgr.
+bool net_on_about_to_clear_all_entities(ecs::EntityManager &mgr);
 void net_stop();
+
+enum class NetworkVariant : int
+{
+  None = 0,
+  MainNet = 1,
+  UserNet = 2,
+};
+
+NetworkVariant network_variant();
+bool is_main_thread_network(); // network_variant() == MainNet

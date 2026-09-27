@@ -51,9 +51,9 @@ terminal
          "<=" (SHTOK_smallereq),
          ">=" (SHTOK_greatereq),
          "##" (SHTOK_macro_concat),
+         "#rb" (SHTOK_rb_tag),
          "always_referenced" (SHTOK_always_referenced),
          "no_warnings" (SHTOK_no_warnings),
-         "undefined_value" (SHTOK_undefined_value),
          "ambient" (SHTOK_ambient),
          "blend_asrc" (SHTOK_blend_asrc),
          "blend_adst" (SHTOK_blend_adst),
@@ -65,6 +65,7 @@ terminal
          "channel" (SHTOK_channel),
          "int4" (SHTOK_int4),
          "float4x4" (SHTOK_float4x4),
+         "float4x3" (SHTOK_float4x3),
          "color8" (SHTOK_color8),
          "cull_mode" (SHTOK_cull_mode),
          "alpha_to_coverage" (SHTOK_alpha_to_coverage),
@@ -91,6 +92,7 @@ terminal
          "vulkan" (SHTOK_vulkan),
          "metal" (SHTOK_metal),
          "metaliOS" (SHTOK_metaliOS),
+         "android" (SHTOK_android),
          "fsh_4_0" (SHTOK_fsh_4_0),
          "fsh_4_1" (SHTOK_fsh_4_1),
          "fsh_5_0" (SHTOK_fsh_5_0),
@@ -140,6 +142,8 @@ terminal
          "const_buffer" (SHTOK_const_buffer),
          "tlas" (SHTOK_tlas),
          "render_stage" (SHTOK_render_stage),
+         "max_recursion" (SHTOK_max_recursion),
+         "allow_opacity_micromaps" (SHTOK_allow_opacity_micromaps),
          "render_trans" (SHTOK_render_trans),
          "true" (SHTOK__true),
          "ubyte4" (SHTOK_ubyte4),
@@ -159,6 +163,7 @@ terminal
          "local" (SHTOK_local),
          "global" (SHTOK_global),
          "const" (SHTOK_const),
+         "literal" (SHTOK_literal),
          "register" (SHTOK_register),
          "signed_pack" (SHTOK_signed_pack),
          "unsigned_pack" (SHTOK_unsigned_pack),
@@ -271,6 +276,7 @@ shader-stat(shader_stat) ->
   immediate-const-block = imm_const_block |
   supports-stat=supports |
   render-stage-stat=render_stage |
+  raytrace-pipeline-stat=rt_pipeline |
   assume-stat=assume |
   assume-if-not-assumed-stat=assume_if_not_assumed |
   error-stat=error |
@@ -289,7 +295,7 @@ block-stat(block_stat) ->
 
 
 local-var-type(local_var_type) ->
-  ("float4"|"float"|"int4"|"float4x4")=type;
+  ("float4"|"float"|"int4"|"float4x4"|"float4x3")=type;
 
 local-decl(local_var_decl) ->
   "local"=nothing local-var-type=type ident=name
@@ -330,20 +336,23 @@ arithmetic-color(arithmetic_color) ->
   ")"=nothing;
 
 static-var-type(static_var_type) ->
-  ("const_buffer"|"tlas"|"buffer"|"texture"|"float4"|"int4"|"float4x4"|"float"|"int")=type;
+  ("const_buffer"|"tlas"|"buffer"|"texture"|"float4"|"int4"|"float4x4"|"float4x3"|"float"|"int")=type;
 
 static-var-mode(static_var_mode) -> ("static"|"dynamic")=mode;
+
+static-attrib(static_attrib_decl) -> ident=name "="=nothing ((ident=value)|(arithmetic-expr=expr));
 
 static-decl(static_var_decl) ->
   [static-var-mode=mode] static-var-type=type ident=name
   ["="=nothing sh-init-value=init]
   ["no_warnings"=no_warnings]
+  [(static-attrib=attrib)*]
   ";"=nothing;
 
 global-decl(global_var_decl) ->
+  ["literal"=is_literal]
   static-var-type=type ident=name ["["=nothing int-number=size "]"=nothing]
   ["="=nothing ((arithmetic-expr=expr)|("{"=nothing arithmetic-expr=arr0 (","=nothing arithmetic-expr=arrN)* "}"=nothing))]
-  ["undefined_value"=undefined]
   ["always_referenced"=is_always_referenced]
   ";"=nothing
   {add_global_var(n);};
@@ -364,6 +373,7 @@ interval-decl(interval)->
   "interval"=nothing ident=name ":"=nothing
   (interval-var-decl=var_decl)+
    ident=last_var_name
+  ["always_referenced"=is_always_referenced]
   ";"=nothing;
 
 bool-decl(bool_decl) ->
@@ -409,7 +419,7 @@ equal-op(equal_op) ->
   ("=="|"!="|"<"|"<="|">"|">=")=op;
 
 hardware-support(hardware_support) ->
-  ("metal"|"metaliOS"|"vulkan"|"pc"|"dx11"|"dx12"|"xbox"|"scarlett"|"ps4"|"ps5"|"fsh_4_0"|"fsh_5_0"|"fsh_6_0"|"fsh_6_2"|"fsh_6_6"|"mesh"|"bindless")=var;
+  ("metal"|"metaliOS"|"android"|"vulkan"|"pc"|"dx11"|"dx12"|"xbox"|"scarlett"|"ps4"|"ps5"|"fsh_4_0"|"fsh_5_0"|"fsh_6_0"|"fsh_6_2"|"fsh_6_6"|"mesh"|"bindless")=var;
 
 bool-value(bool_value) ->
   ("shader"=nothing equal-op=cmpop ident=shader) |
@@ -500,11 +510,13 @@ zbias-state-stat(zbias_state_stat) ->
 external-var-name(external_var_name) ->
   (ident|"diffuse"|"specular"|"globtm"|"projtm"|"viewprojtm"|"local_view_x"|"local_view_y"|"local_view_z"|"local_view_pos"|
   "world_local_x"|"world_local_y"|"world_local_z"|"world_local_pos")=name
-  type_ident=nameSpace;
+  type_ident=nameSpace
+  ["#rb"=refined_tag];
 
 external-var-value-single(external_var_value_single) ->
   ("globtm"|"projtm"|"viewprojtm"|"local_view_x"|"local_view_y"|"local_view_z"|"local_view_pos"|
    "world_local_x"|"world_local_y"|"world_local_z"|"world_local_pos")=builtin_var
+  | "material"=mat "."=nothing sh-mat-texture=tex [(static-attrib=attrib)*]
   | arithmetic-expr=expr;
 
 external-variable(external_variable) ->
@@ -514,7 +526,7 @@ external-variable(external_variable) ->
 
 external-register(external_register) ->
   external-var-name=var ":"=nothing
-  "register"=nothing "("=nothing ident=shader_var ")"=nothing
+  "register"=nothing "("=nothing (ident=shader_var | int-number=literal_id) ")"=nothing
   [hlsl=nothing hlsl_text = hlsl_var_text]
   [";"=nothing];
 
@@ -524,8 +536,8 @@ external-variable-array(external_variable_array) ->
   [";"=nothing];
 
 external-register-array(external_register_array) ->
-  external-var-name=var "["=nothing ident=size_shader_var "]"=nothing ":"=nothing
-  "register"=nothing "("=nothing ident=shader_var ")"=nothing
+  external-var-name=var "["=nothing (ident=size_shader_var | int-number=literal_size) "]"=nothing ":"=nothing
+  "register"=nothing "("=nothing (ident=shader_var | int-number=literal_id) ")"=nothing
   [hlsl=nothing hlsl_text = hlsl_var_text]
   [";"=nothing];
 
@@ -557,14 +569,37 @@ shader-directive(shader_directive) ->
 render-stage-stat(render_stage_stat) ->
   "render_stage"=nothing (ident=name | string=name_s) ";"=nothing ;
 
+raytrace-pipeline-stat(raytrace_pipeline_stat) ->
+  ("max_recursion"=max_recursion "="=nothing int-number=recursion_value ";"=nothing) |
+  ("allow_opacity_micromaps"=allow_opacity_micromaps ";"=nothing) ;
+
 assume-stat(assume_stat) ->
-  "assume"=nothing ident=interval "="=nothing ident=value ";"=nothing ;
+  ("assume"=nothing ident=interval "="=nothing ident=value ";"=nothing) |
+  ("assume"=nothing ident=interval "="=nothing "NULL"=null_value ";"=nothing) |
+  ("assume"=nothing ident=interval "!="=is_not_null "NULL"=nothing ";"=nothing) ;
 
 assume-if-not-assumed-stat(assume_if_not_assumed_stat) ->
-  "assume_if_not_assumed"=nothing ident=interval "="=nothing ident=value ";"=nothing ;
+  ("assume_if_not_assumed"=nothing ident=interval "="=nothing ident=value ";"=nothing) |
+  ("assume_if_not_assumed"=nothing ident=interval "="=nothing "NULL"=null_value ";"=nothing) |
+  ("assume_if_not_assumed"=nothing ident=interval "!="=is_not_null "NULL"=nothing ";"=nothing) ;
 
 error-stat(error_stat) ->
   "error"=nothing "("=nothing string=message ")"=nothing ";"=nothing;
 
 supports-stat(supports_stat) ->
   "supports"=nothing iteration_pair((ident|"none")=name, ","=nothing) ";"=nothing ;
+
+code_in_class[bool_decl]={
+  int resolvedNid = -1;
+};
+
+// @TODO(boolvar_opt): add separate production for top level bool expr -- so as not to store redundant fields
+code_in_class[bool_expr]={
+  eastl::vector<uint64_t> bytecode{};
+  eastl::optional<bool> constvalue{};
+  bool compiled = false;
+};
+
+code_in_class[external_var_name]={
+  int rbVarId = -1;
+};

@@ -6,8 +6,8 @@ namespace rendinstdestr
 {
 bool apply_damage_to_riextra(rendinst::riex_handle_t, float, const Point3 &, const Point3 &, float) { G_ASSERT_RETURN(false, false); }
 void remove_ri_without_collision_in_radius(const Point3 &, float) { G_ASSERT(0); }
-void damage_ri_in_sphere(const Point3 &, float, const Point2 &, float, float, bool, on_riextra_destroyed_callback &&,
-  riextra_should_damage &&)
+void damage_ri_in_sphere(const Point3 &, float, const Point2 &, float, float, bool, on_riextra_destroyed_callback,
+  riextra_should_damage)
 {
   G_ASSERT(0);
 }
@@ -73,6 +73,11 @@ Point3 get_wind()
   G_ASSERT(0);
   return Point3();
 }
+float pressure(float)
+{
+  G_ASSERT(0);
+  return 0.0f;
+}
 float temperature(float)
 {
   G_ASSERT(0);
@@ -85,8 +90,6 @@ float sonicSpeed(float)
 }
 } // namespace atmosphere
 void Orient::setYP0(const Point3 &) { G_ASSERT(0); }
-void Orient::setQuat(const Quat &) { G_ASSERT(0); }
-void Orient::wrap() { G_ASSERT(0); }
 void extrapolate_circular(const Point3 &, const Point3 &, const Point3 &, float, Point3 &, Point3 &) { G_ASSERT(0); }
 } // namespace gamephys
 

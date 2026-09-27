@@ -5,7 +5,7 @@ from "math" import max
 
 let dtext = @(text, style=null) {text, rendObj=ROBJ_TEXT, color = Color(180,180,180)}.__update(style ?? {})
 
-let cursorC = Color(255,255,255,255)
+const cursorC = Color(255,255,255,255)
 let cursor = {
   rendObj = ROBJ_VECTOR_CANVAS
   size = fsh(2)
@@ -56,10 +56,10 @@ let drCorner = mkCorner([0,1,1,0], {hplace = ALIGN_RIGHT, vplace = ALIGN_BOTTOM}
 let dlCorner = mkCorner([0,0,1,1], {vplace = ALIGN_BOTTOM})
 let corners = freeze({children = [ulCorner, dlCorner, urCorner, drCorner] size = flex()})
 
-let menuBtnTextColorNormal = Color(150,250,200)
-let menuBtnTextColorHover = Color(255,255,255)
-let menuBtnFillColorNormal = 0
-let menuBtnFillColorHover = Color(50,50,50,60)
+const menuBtnTextColorNormal = Color(150,250,200)
+const menuBtnTextColorHover = Color(255,255,255)
+const menuBtnFillColorNormal = 0
+const menuBtnFillColorHover = Color(50,50,50,60)
 
 function menuBtn(text, onClick, style = null) {
   let stateFlags = Watched(0)
@@ -71,6 +71,7 @@ function menuBtn(text, onClick, style = null) {
     key = stateFlags.get() & S_HOVER ? keyOnHover : key
     watch = stateFlags
     behavior = Behaviors.Button
+    sound = buttonSound
     onClick
     onElemState = @(s) stateFlags.set(s)
     rendObj = ROBJ_SOLID
@@ -78,7 +79,7 @@ function menuBtn(text, onClick, style = null) {
     children = [
       corners
       {
-        padding = static [hdpx(4), hdpx(10)]
+        padding = const [hdpx(4), hdpx(10)]
         children = {
           rendObj = ROBJ_TEXT
           text
@@ -100,7 +101,7 @@ function input(text_state, state_flags, group, placeholder, fontSize) {
     borderColor = (sf & S_HOVER) ? Color(195,195,195) : ((sf & S_KB_FOCUS) ? Color(155,155,155) : Color(40,40,40))
     group
     size = flex()
-    padding = static [hdpx(2), hdpx(5)]
+    padding = const [hdpx(2), hdpx(5)]
     watch = [state_flags, text_state]
     valign = ALIGN_CENTER
     children = {
@@ -138,7 +139,7 @@ let textInput = kwarg(function(state, title=null, placeholder=null, width = hdpx
 })
 let headerTxt = @(text) freeze({rendObj = ROBJ_TEXT text fontSize = hdpx(70) color = Color(70,70,70,70)})
 
-let itemGap = freeze({rendObj=ROBJ_FRAME size=static [flex(),hdpx(1)] color=Color(90,90,90)})
+let itemGap = freeze({rendObj=ROBJ_FRAME size=const [flex(),hdpx(1)] color=Color(90,90,90)})
 function itemToOption(value){
   let t = type(value)
   let val = t!="table" ? value : value.value
@@ -160,7 +161,7 @@ function listItem(text, onClick, isCurrent) {
     behavior = Behaviors.Button
     watch = stateFlags
     onElemState = @(s) stateFlags.set(s)
-    padding = static [hdpx(5), hdpx(10)]
+    padding = const [hdpx(5), hdpx(10)]
     fillColor = stateFlags.get() & S_HOVER ? menuBtnFillColorHover : menuBtnFillColorNormal
     children = {
       color = (stateFlags.get() & S_HOVER)
@@ -213,7 +214,7 @@ function mkCombo(opt, _group=null, _xmbNode=null) {
     color = Color(0,0,0, 150)
     eventPassThrough = true
     onClick = close
-    rendObj = ROBJ_SOLID pos = [-sw(101), -sh(101)] size = static [sw(202), sh(202)]
+    rendObj = ROBJ_SOLID pos = [-sw(101), -sh(101)] size = const [sw(202), sh(202)]
   })
 
   function popup(){

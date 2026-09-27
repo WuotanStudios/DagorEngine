@@ -44,6 +44,7 @@
 
 
 #ifdef __cplusplus
+#include <util/dag_compilerDefs.h>
 #ifdef _DEBUG_TAB_
 #include <util/dag_globDef.h>
 #include <debug/dag_debug.h>
@@ -77,7 +78,7 @@ typedef unsigned int Bitarraybits;
  * perfomance.
  * @todo cyclic(rotation) shift operations.
  */
-class Bitarray
+class DAGOR_WARN_IF_UNUSED Bitarray
 {
 protected:
   /// total in ints
@@ -373,6 +374,17 @@ public:
       set(i);
     else
       reset(i);
+  }
+
+  /** sets i-th bit with 1 if v is not zero, and 0 otherwise. Returns previous value of that bit.
+   * @param i bit to set with v.
+   * @param v value to set in i-th bit.
+   */
+  int exchange(int i, unsigned v)
+  {
+    int old = get(i);
+    set(i, v);
+    return old;
   }
 
   /** fills n bits from at with v.

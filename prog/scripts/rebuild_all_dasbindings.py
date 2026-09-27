@@ -20,21 +20,12 @@ bindings_checks = [
     ("jam  -sPlatformArch=x86_64 -sRoot=../.. -f aot/jamfile",)
   },
   {"wdir":"../../skyquake/prog/scripts","cmds":
-    ("genDasevents_x86_64.bat",)
+    ("genDasevents_wt_x86_64.bat", "genDasevents_wtm_x86_64.bat", "genDasevents_vrt_x86_64.bat",)
   },
   {"wdir":"../../enlisted/prog","cmds":
     ("jam  -sPlatformArch=x86_64 -sRoot=../.. -f aot/jamfile", "genDasevents.bat")
   },
   {"wdir":"../../active_matter/prog","cmds":
-    ("jam  -sPlatformArch=x86_64 -sRoot=../.. -f aot/jamfile", "genDasevents.bat")
-  },
-  {"wdir":"../../cuisine_royale/prog","cmds":
-    ("jam  -sPlatformArch=x86_64 -sRoot=../.. -f aot/jamfile", "genDasevents.bat")
-  },
-  {"wdir":"../../modern_conflict/prog","cmds":
-    ("jam  -sPlatformArch=x86_64 -sRoot=../.. -f aot/jamfile", "genDasevents.bat")
-  },
-  {"wdir":"../../to_the_sky/prog","cmds":
     ("jam  -sPlatformArch=x86_64 -sRoot=../.. -f aot/jamfile", "genDasevents.bat")
   },
 ]

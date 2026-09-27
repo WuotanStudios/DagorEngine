@@ -5,8 +5,9 @@
 #include <osApiWrappers/dag_miscApi.h>
 #include <osApiWrappers/dag_unicode.h>
 #include <memory/dag_framemem.h>
+#include <util/dag_compilerDefs.h>
 
-#if _TARGET_APPLE | _TARGET_PC_LINUX
+#if _TARGET_APPLE | _TARGET_PC_LINUX | _TARGET_ANDROID | _TARGET_IOS
 #include <unistd.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -24,6 +25,14 @@
 #define THREAD_YIELD sleep_msec(0)
 #else
 #define THREAD_YIELD sleep_msec(0)
+#endif
+
+// glibc serves posix aio with helper threads that tsan knows nothing about, and
+// the first allocation made in such a thread crashes the tsan runtime
+#if _TARGET_APPLE | (_TARGET_PC_LINUX && !DAGOR_THREAD_SANITIZER)
+#define USE_POSIX_AIO 1
+#else
+#define USE_POSIX_AIO 0
 #endif
 
 #if _TARGET_PC_WIN | _TARGET_XBOX
@@ -47,7 +56,7 @@ class AsyncWriterCB final : public IGenSave
   const int bufMaxSize;
   Tab<char> buf, bufNext;
 
-#if _TARGET_APPLE | _TARGET_PC_LINUX
+#if USE_POSIX_AIO
   aiocb aio;
 #elif _TARGET_PC_WIN | _TARGET_XBOX
   OVERLAPPED overlapped;
@@ -66,8 +75,9 @@ public:
   {
     (done == WRITE_IN_PROGRESS) ? (void)SleepEx(0, TRUE) : ((void)0);
   } // aleartable sleep to be able get AIO callbacks
-#elif _TARGET_APPLE | _TARGET_PC_LINUX
+#elif _TARGET_APPLE | _TARGET_PC_LINUX | _TARGET_ANDROID | _TARGET_IOS
   void poll_aio_result();
+  void writeBufSync();
 #else
   inline void poll_aio_result() {}
 #endif
@@ -116,7 +126,7 @@ AsyncWriterCB::AsyncWriterCB(int buf_size) :
   bufMaxSize(buf_size),
   fileHandle(INVALID_FILE_HANDLE)
 {
-#if _TARGET_APPLE | _TARGET_PC_LINUX
+#if USE_POSIX_AIO
   memset(&aio, 0, sizeof(aio));
 #elif _TARGET_PC_WIN | _TARGET_XBOX
   memset(&overlapped, 0, sizeof(overlapped));
@@ -125,7 +135,7 @@ AsyncWriterCB::AsyncWriterCB(int buf_size) :
 
 bool AsyncWriterCB::open(const char *fname, AsyncWriterMode mode)
 {
-#if _TARGET_APPLE | _TARGET_PC_LINUX
+#if _TARGET_APPLE | _TARGET_PC_LINUX | _TARGET_ANDROID | _TARGET_IOS
   fileHandle = ::open(fname, O_WRONLY | O_CREAT | (mode == AsyncWriterMode::TRUNC ? O_TRUNC : O_APPEND), 0666);
 #elif _TARGET_PC_WIN | _TARGET_XBOX
   Tab<wchar_t> fname_u16(framemem_ptr());
@@ -140,7 +150,7 @@ bool AsyncWriterCB::open(const char *fname, AsyncWriterMode mode)
 
 bool AsyncWriterCB::openTemp(char *fname)
 {
-#if _TARGET_APPLE | _TARGET_PC_LINUX
+#if _TARGET_APPLE | _TARGET_PC_LINUX | _TARGET_ANDROID | _TARGET_IOS
   fileHandle = mkstemp(fname);
 #elif _TARGET_PC_WIN | _TARGET_XBOX
   Tab<wchar_t> fname_u16(tmpmem);
@@ -160,7 +170,7 @@ void AsyncWriterCB::close()
   if (fileHandle == INVALID_FILE_HANDLE)
     return;
   flush();
-#if _TARGET_APPLE | _TARGET_PC_LINUX
+#if _TARGET_APPLE | _TARGET_PC_LINUX | _TARGET_ANDROID | _TARGET_IOS
   G_VERIFY(::close(fileHandle) == 0);
 #elif _TARGET_PC_WIN | _TARGET_XBOX
   G_VERIFY(CloseHandle(fileHandle));
@@ -170,6 +180,44 @@ void AsyncWriterCB::close()
   buf.clear();
   bufNext.clear();
 }
+
+#if _TARGET_APPLE | _TARGET_PC_LINUX | _TARGET_ANDROID | _TARGET_IOS
+void AsyncWriterCB::writeBufSync()
+{
+  if (buf.empty())
+  {
+    done = WRITE_DONE;
+    return;
+  }
+
+  if (offs >= 0 && ::lseek(fileHandle, offs, SEEK_SET) < 0)
+  {
+    done = WRITE_FAILED;
+    return;
+  }
+
+  int left = buf.size();
+  const char *p = buf.data();
+  while (left > 0)
+  {
+    const ssize_t w = ::write(fileHandle, p, left);
+    if (w > 0)
+    {
+      p += w;
+      left -= (int)w;
+      offs += (int)w;
+    }
+    else if (errno != EINTR)
+    {
+      done = WRITE_FAILED;
+      return;
+    }
+  }
+
+  buf.clear();
+  done = WRITE_DONE;
+}
+#endif
 
 #if _TARGET_PC_WIN | _TARGET_XBOX
 void __stdcall AsyncWriterCB::on_write_done_cb(DWORD dwErr, DWORD cbWritten, OVERLAPPED *lpOverLap)
@@ -189,24 +237,35 @@ void __stdcall AsyncWriterCB::on_write_done_cb(DWORD dwErr, DWORD cbWritten, OVE
     clear_and_shrink(wcb->bufNext);
   }
 }
-#elif _TARGET_APPLE | _TARGET_PC_LINUX
+#elif USE_POSIX_AIO
 void AsyncWriterCB::poll_aio_result()
 {
-  int bwr = 0;
+  if (done != WRITE_IN_PROGRESS)
+    return;
+
+  const int err = aio_error(&aio);
+  if (err == EINPROGRESS)
+    return;
+
+  // every completed request must be released by aio_return exactly once
+  const ssize_t bwr = aio_return(&aio);
+  if (err != 0)
+  {
+    done = WRITE_FAILED;
+    return;
+  }
+
+  G_ASSERT(buf.size() == bwr);
+  offs += (int)bwr;
+  G_FAST_ASSERT(offs >= 0); // Attempt to write > 2G of data?
+  buf.clear();
+  done = WRITE_DONE;
+}
+#elif _TARGET_ANDROID | _TARGET_IOS | _TARGET_PC_LINUX
+void AsyncWriterCB::poll_aio_result()
+{
   if (done == WRITE_IN_PROGRESS)
-    switch (aio_error(&aio))
-    {
-      case EINPROGRESS: return;
-      case 0:
-        bwr = aio_return(&aio);
-        G_ASSERT(buf.size() == bwr);
-        offs += bwr;
-        G_FAST_ASSERT(offs >= 0); // Attempt to write > 2G of data?
-        buf.clear();
-        done = WRITE_DONE;
-        break;
-      default: done = WRITE_FAILED; break;
-    }
+    writeBufSync();
 }
 #endif
 
@@ -242,7 +301,7 @@ void AsyncWriterCB::write(const void *ptr, int size)
     return;
 
   TIME_PROFILE(AsyncWriterCB__asyncWriteBegin)
-#if _TARGET_APPLE | _TARGET_PC_LINUX
+#if USE_POSIX_AIO
   G_ASSERT(offs >= 0);
   memset(&aio, 0, sizeof(aio));
   aio.aio_fildes = fileHandle;
@@ -257,18 +316,14 @@ void AsyncWriterCB::write(const void *ptr, int size)
 
   done = WRITE_IN_PROGRESS;
 
-#if _TARGET_APPLE | _TARGET_PC_LINUX
-  int failcnt = 0;
-  while (aio_write(&aio) != 0)
-    if (errno == EAGAIN)
-      continue;
-    else if (failcnt < ERRORS_BEFORE_FAILING)
-      failcnt++;
+#if USE_POSIX_AIO
+  if (aio_write(&aio) != 0)
+  {
+    if (errno == EAGAIN) // no free darwin slot or no glibc worker: the queue is busy, not the file
+      writeBufSync();
     else
-    {
       done = WRITE_FAILED;
-      break;
-    }
+  }
 #elif _TARGET_PC_WIN | _TARGET_XBOX
   BOOL result = WriteFileEx(fileHandle, buf.data(), buf.size(), &overlapped, on_write_done_cb);
   // APC can't be delivered to different thread then the one that done prior request,

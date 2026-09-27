@@ -18,8 +18,12 @@
 #include "render/fx/effectEntity.h"
 #include <levelSplines/levelSplines.h>
 #include "main/gameProjConfig.h"
+#include <render/dasModules/bvh.h>
+#include <generic/dag_functionRef.h>
 
 const char *gameproj::game_telemetry_name() { return nullptr; }
+
+bool NEED_DAS_AOT_COMPILE = false; // AOT compiler tool itself doesn't load AOT-compiled scripts at runtime
 
 float dagor_game_act_time = 0.f;
 
@@ -32,13 +36,21 @@ class StubTimeManager final : public ITimeManager
   int getType4CC() const override { return 0; }
 };
 
+void auth_get_country_code(ecs::EntityManager &, eastl::string &) { G_ASSERT(0); }
+
+float get_sync_time() { G_ASSERT_RETURN(false, 0.); }
+double get_sync_time_d() { G_ASSERT_RETURN(false, 0.); }
+int get_sync_millis() { G_ASSERT_RETURN(false, 0); }
+int get_async_millis() { G_ASSERT_RETURN(false, 0); }
+double advance_time(float, float &) { G_ASSERT_RETURN(false, 0.); }
+void reset_time_mgr(ITimeManager *) { G_ASSERT(0); }
+bool is_dummy_time() { G_ASSERT_RETURN(false, true); }
 ITimeManager &get_time_mgr()
 {
   G_ASSERT(0);
-  static StubTimeManager stub;
-  return stub;
+  static DummyTimeManager d;
+  return d;
 }
-float get_sync_time() { G_ASSERT_RETURN(false, 0.); }
 
 std::uint32_t get_current_server_route_id() { G_ASSERT_RETURN(false, {}); }
 const char *get_server_route_host(std::uint32_t) { G_ASSERT_RETURN(false, {}); }
@@ -49,6 +61,12 @@ void send_echo_msg(uint32_t) { G_ASSERT(0); }
 bool is_server() { G_ASSERT_RETURN(false, false); }
 bool is_true_net_server() { G_ASSERT_RETURN(false, false); }
 bool has_network() { G_ASSERT_RETURN(false, false); }
+bool is_main_thread_network() { G_ASSERT_RETURN(false, true); }
+NetworkVariant network_variant() { return NetworkVariant::MainNet; }
+namespace net
+{
+bool is_this_thread_net_em_owner() { G_ASSERT_RETURN(false, true); }
+} // namespace net
 bool dedicated::is_dedicated() { G_ASSERT_RETURN(false, false); }
 int get_build_number() { G_ASSERT_RETURN(false, 0); }
 net::IConnection *get_server_conn() { G_ASSERT_RETURN(false, nullptr); }
@@ -61,6 +79,7 @@ const char *BasePhysActor::getPhysTypeStr() const { return nullptr; }
 
 int send_net_msg(ecs::EntityManager &, ecs::EntityId, net::IMessage &&, const net::MessageNetDesc *) { G_ASSERT_RETURN(false, -1); }
 int send_net_msg(ecs::EntityId, net::IMessage &&, const net::MessageNetDesc *) { G_ASSERT_RETURN(false, -1); }
+int send_net_msg(net::IMessage &&, const net::MessageNetDesc *) { G_ASSERT_RETURN(false, -1); }
 
 void send_transform_snapshots_targeted_event(ecs::EntityId, danet::BitStream &) { G_ASSERT(0); }
 void send_transform_snapshots_event(danet::BitStream &) { G_ASSERT(0); }
@@ -110,12 +129,13 @@ void send_dasevent(ecs::EntityManager *,
   bind_dascript::DasEvent *,
   const char *,
   eastl::optional<dag::ConstSpan<net::IConnection *>>,
-  eastl::fixed_function<sizeof(void *), eastl::string()>)
+  dag::FunctionRef<eastl::string() const>)
 {
   G_ASSERT(0);
 }
 } // namespace net
-net::CNetwork *get_net_internal() { G_ASSERT_RETURN(false, nullptr); }
+bool send_msg_to_client(net::IMessage &&, int) { G_ASSERT_RETURN(false, false); }
+void debug_verify_net_connection_ptr(net::IConnection *) { G_ASSERT(false); }
 
 #include <game/player.h>
 namespace game
@@ -171,7 +191,7 @@ const char *app_profile_get_session_id() { G_ASSERT_RETURN(false, nullptr); }
 const char *get_gun_stat_type_by_props_id(int gun_props_id) { G_ASSERT_RETURN(false, nullptr); }
 const char *get_shell_template_by_shell_id(int) { G_ASSERT_RETURN(false, nullptr); }
 const char *get_gun_template_by_props_id(int) { G_ASSERT_RETURN(false, nullptr); }
-Tab<const char *> ecs_get_global_tags_context() { return {}; }
+Tab<const char *> ecs_get_global_tags_context(ecs::EntityManager &) { return {}; }
 
 void TheEffect::reset() { G_ASSERT(0); }
 
@@ -186,6 +206,7 @@ public:
   void setColorMult(struct Color4 const &);
   void setVelocity(const Point3 &vel);
   void setGravityTm(const Matrix3 &);
+  void setSplineControlPoints(const Point4 &, const Point4 &, const Point4 &, const Point4 &);
   void hide(bool);
 };
 void AcesEffect::unlock() { G_ASSERT(0); }
@@ -196,6 +217,7 @@ void AcesEffect::setSpawnRate(float) { G_ASSERT(0); }
 void AcesEffect::setColorMult(struct Color4 const &) { G_ASSERT(0); }
 void AcesEffect::setVelocity(const Point3 &vel) { G_ASSERT(0); }
 void AcesEffect::setGravityTm(const Matrix3 &) { G_ASSERT(0); }
+void AcesEffect::setSplineControlPoints(const Point4 &, const Point4 &, const Point4 &, const Point4 &) { G_ASSERT(0); }
 void AcesEffect::hide(bool) { G_ASSERT(0); }
 namespace acesfx
 {
@@ -240,6 +262,8 @@ void move_strata_clouds(const Point2 &) { G_ASSERT(0); }
 
 void select_weather_preset_delayed(const char *) { G_ASSERT(0); }
 
+void update_delayed_weather_selection() { G_ASSERT(0); }
+
 Point3 calculate_server_sun_dir() { G_ASSERT_RETURN(false, Point3()); }
 
 #include "phys/gridCollision.h"
@@ -272,7 +296,7 @@ bool trace_entities_in_grid_by_capsule(uint32_t, const Point3 &, const Point3 &,
 }
 bool rayhit_entities_in_grid(uint32_t, const Point3 &, const Point3 &, float, ecs::EntityId) { G_ASSERT_RETURN(false, false); }
 bool query_entities_intersections_in_grid(
-  uint32_t, dag::ConstSpan<plane3f>, const TMatrix &, float, bool, IntersectedEntities &, SortIntersections)
+  uint32_t, dag::ConstSpan<plane3f>, const TMatrix &, const BBox3 &, bool, IntersectedEntities &, SortIntersections)
 {
   G_ASSERT_RETURN(false, false);
 }
@@ -298,11 +322,6 @@ void add_debug_text_mark(
 void add_debug_text_mark(const Point3 &wp, const char *str, int length, float line_ofs, E3DCOLOR frame_color) { G_ASSERT(0); }
 
 bool check_action_precondition(ecs::EntityId, int) { G_ASSERT_RETURN(false, false); }
-
-#include <gamePhys/common/loc.h>
-void gamephys::Loc::interpolate(const Loc &, const Loc &, const float) { G_ASSERT(0); }
-void gamephys::Loc::substract(const Loc &lhs, const Loc &rhs) { G_ASSERT(0); }
-void gamephys::Loc::add(const Loc &lhs, const Loc &rhs) { G_ASSERT(0); }
 
 namespace circuit
 {
@@ -365,8 +384,6 @@ namespace camera_in_camera
 bool is_lens_only_zoom_enabled() { G_ASSERT_RETURN(false, false); }
 } // namespace camera_in_camera
 
-float get_scope_lens_magnification_limit_term() { return 1.0f; }
-
 bool is_looking_into_optics_scope() { return false; }
 
 #include "main/gameLoad.h"
@@ -384,7 +401,7 @@ void BasePhysActor::resizeSyncStates(int) { G_ASSERT(0); }
 float BasePhysActor::minTimeStep = 0.0f;
 float BasePhysActor::maxTimeStep = 0.0f;
 void teleport_phys_actor(ecs::EntityId, TMatrix const &) { G_ASSERT(0); }
-int calc_phys_update_to_tick(float, float, int, int, int) { G_ASSERT_RETURN(false, -1); }
+int calc_phys_update_to_tick(double, float, int, int, int) { G_ASSERT_RETURN(false, -1); }
 
 #include <daInput/input_api.h>
 namespace dainput
@@ -399,6 +416,7 @@ bool is_action_enabled(action_handle_t) { G_ASSERT_RETURN(false, false); }
 void set_action_enabled(action_handle_t, bool) { G_ASSERT(0); }
 void set_action_mask_immediate(action_handle_t, bool) { G_ASSERT(0); }
 bool is_action_mask_immediate(action_handle_t) { G_ASSERT_RETURN(false, false); }
+void action_binding_changed(action_handle_t, int) { G_ASSERT(0); }
 DigitalActionBinding *get_digital_action_binding(action_handle_t, int) { G_ASSERT_RETURN(false, nullptr); }
 AnalogAxisActionBinding *get_analog_axis_action_binding(action_handle_t, int) { G_ASSERT_RETURN(false, nullptr); }
 AnalogStickActionBinding *get_analog_stick_action_binding(action_handle_t, int) { G_ASSERT_RETURN(false, nullptr); }
@@ -426,6 +444,8 @@ bool set_analog_axis_action_state(action_handle_t, float) { G_ASSERT_RETURN(fals
 
 action_handle_t get_action_set_handle(const char *action_set_name) { G_ASSERT_RETURN(false, BAD_ACTION_SET_HANDLE); }
 void activate_action_set(action_set_handle_t set, bool activate) { G_ASSERT(0); }
+int get_action_set_priority(action_set_handle_t) { G_ASSERT_RETURN(false, 0); }
+bool are_action_sets_exclusive(action_set_handle_t, action_set_handle_t) { G_ASSERT_RETURN(false, false); }
 bool reset_digital_action_sticky_toggle(action_handle_t) { G_ASSERT_RETURN(false, false); }
 void send_action_event(action_handle_t action) { G_ASSERT(0); }
 
@@ -498,7 +518,7 @@ int register_net_props(const char *blk_name, const char *class_name) { G_ASSERT_
 #include "net/netStat.h"
 namespace netstat
 {
-dag::ConstSpan<Sample> get_aggregations() { G_ASSERT_RETURN(false, {}); }
+StaticTab<Sample, NUM_AG_TYPES> get_aggregations() { G_ASSERT_RETURN(false, {}); }
 } // namespace netstat
 
 Tab<TMatrix> get_points_on_road_route(
@@ -583,7 +603,10 @@ void worldRenderer_shadowsInvalidate(const BBox3 &bbox) { G_ASSERT(0); }
 void worldRenderer_invalidateAllShadows() { G_ASSERT(0); }
 int worldRenderer_getDynamicResolutionTargetFps() { G_ASSERT_RETURN(false, 0); }
 void worldRenderer_setDaGdpRangeScale(float) { G_ASSERT(0); }
+void worldRenderer_setCockpitReprojectionMode(CockpitReprojectionMode) { G_ASSERT(0); }
 bool does_world_renderer_exist() { G_ASSERT_RETURN(false, 0); }
+bool is_bvh_enabled() { G_ASSERT_RETURN(false, false); }
+bool is_rr_enabled() { G_ASSERT_RETURN(false, false); }
 } // namespace bind_dascript
 
 #include <render/resolution.h>
@@ -603,6 +626,7 @@ void clipmap_decals_mgr::createDecal(int, const Point2 &, float, const Point2 &,
 void erase_grass(const Point3 &, float) { G_ASSERT(0); }
 void invalidate_after_heightmap_change(const BBox3 &box) { G_ASSERT(0); }
 void invalidate_ssr_history(int) { G_ASSERT(0); }
+void luminance_filter_ssr_history(int) { G_ASSERT(0); }
 void remove_puddles_in_crater(const Point3 &, float) { G_ASSERT(0); }
 
 struct PortalParams;
@@ -645,17 +669,17 @@ void add_decal(Point3, Point3)
 
 #include <animChar/dag_animCharacter2.h>
 
-bool recreate_material_with_new_params(AnimV20::AnimcharRendComponent &, eastl::function<void(ShaderMaterial *)> &&)
+bool recreate_material_with_new_params(AnimV20::AnimcharRendComponent &, dag::FunctionRef<void(ShaderMaterial *) const>)
 {
   G_ASSERT_RETURN(false, false);
 }
-bool recreate_material_with_new_params(AnimV20::AnimcharRendComponent &, const char *, eastl::function<void(ShaderMaterial *)> &&)
+bool recreate_material_with_new_params(AnimV20::AnimcharRendComponent &, const char *, dag::FunctionRef<void(ShaderMaterial *) const>)
 {
   G_ASSERT_RETURN(false, false);
 }
 bool recreate_material_with_new_params(AnimV20::AnimcharRendComponent &,
   const eastl::vector<const char *, framemem_allocator> &,
-  eastl::function<void(ShaderMaterial *)> &&)
+  dag::FunctionRef<void(ShaderMaterial *) const>)
 {
   G_ASSERT_RETURN(false, false);
 }
@@ -666,6 +690,9 @@ Point2 get_collres_slice_mean_and_dispersion(const CollisionResource &collres, f
 {
   G_ASSERT_RETURN(false, {});
 }
+
+bool apply_collres_node_flag_rules(ecs::EntityManager &, ecs::EntityId, const ecs::Array &) { G_ASSERT_RETURN(false, false); }
+bool clone_collres(ecs::EntityManager &, ecs::EntityId) { G_ASSERT_RETURN(false, false); }
 
 namespace systeminfo
 {
@@ -682,25 +709,21 @@ void stop() { G_ASSERT(0); }
 
 #include <projectiveDecals/projectiveDecals.h>
 
-ProjectiveDecals::~ProjectiveDecals() { G_ASSERT(0); }
-void ProjectiveDecals::updateDecal(
-  unsigned int, TMatrix const &, float, unsigned short, unsigned short, Point4 const &, unsigned short)
-{
-  G_ASSERT(0);
-}
-bool ProjectiveDecals::init(const char *, const char *, const char *, const char *) { G_ASSERT_RETURN(false, false); }
-void ProjectiveDecals::prepareRender(const Frustum &) { G_ASSERT(0); }
-void ProjectiveDecals::render() { G_ASSERT(0); }
-void ProjectiveDecals::afterReset() { G_ASSERT(0); }
-int RingBufferDecals::allocate_decal_id() { G_ASSERT_RETURN(false, -1); }
-void RingBufferDecals::init_buffer(uint32_t) { G_ASSERT(0); }
-void RingBufferDecals::clear() { G_ASSERT(0); }
-
-
-#include <projectiveDecals/projectiveDecals.h>
-
-void ProjectiveDecals::updateParams(uint32_t, const Point4 &, uint16_t) { G_ASSERT(0); }
-
+ProjectiveDecalsBase::~ProjectiveDecalsBase() { G_ASSERT(0); }
+void ProjectiveDecalsBase::updateDecal(dag::ConstSpan<Point4>) { G_ASSERT(0); }
+bool ProjectiveDecalsBase::init(const char *, const char *, const char *, const char *, size_t) { G_ASSERT_RETURN(false, false); }
+void ProjectiveDecalsBase::prepareRender(const Frustum &) { G_ASSERT(0); }
+void ProjectiveDecalsBase::render() { G_ASSERT(0); }
+void ProjectiveDecalsBase::afterReset() { G_ASSERT(0); }
+dag::Span<class Point4> ProjectiveDecalsBase::getSrcData(unsigned int) { G_ASSERT_RETURN(false, dag::Span<Point4>()); }
+int RingBufferDecalsBase::allocate_decal_id() { G_ASSERT_RETURN(false, -1); }
+void RingBufferDecalsBase::init_buffer(uint32_t, size_t) { G_ASSERT(0); }
+void RingBufferDecalsBase::clear() { G_ASSERT(0); }
+int RingBufferDecalsBase::addDecal(dag::Span<Point4>) { G_ASSERT_RETURN(false, 0); }
+int ResizableDecalsBase::addDecal(dag::Span<Point4>) { G_ASSERT_RETURN(false, 0); }
+DefaultDecalData::DefaultDecalData(uint32_t, const TMatrix &, float, uint16_t, uint16_t, const Point4 &, uint16_t) { G_ASSERT(0); }
+DefaultDecalData::DefaultDecalData(uint32_t, const Point4 &) { G_ASSERT(0); }
+void DefaultDecalData::partialUpdate(class dag::Span<class Point4>) const { G_ASSERT(0); }
 
 #include <daECS/utility/createInstantiated.h>
 namespace ecs
@@ -709,7 +732,12 @@ EntityId createInstantiatedEntitySync(EntityManager &, const char *, ComponentsI
 } // namespace ecs
 
 #include <contentUpdater/fsUtils.h>
-eastl::string updater::fs::join_path(std::initializer_list<const char *> parts) { G_ASSERT_RETURN(false, eastl::string{}); }
+template <>
+eastl::string updater::fs::join_path<EASTLAllocatorType>(std::initializer_list<const char *> parts)
+{
+  G_ASSERT(0);
+  return eastl::string{};
+}
 
 #include <videoPlayer/dag_videoPlayer.h>
 class IGenVideoPlayer *IGenVideoPlayer::create_ogg_video_player(char const *, int) { G_ASSERT_RETURN(false, nullptr); }
@@ -745,20 +773,23 @@ const eastl::unordered_map<matching::UserId, Json::Value> &dedicated_matching::g
   static eastl::unordered_map<matching::UserId, Json::Value> r;
   return r;
 }
+void dedicated_matching::notify_network_is_up() { G_ASSERT(0); }
 void dedicated_matching::on_level_loaded() { G_ASSERT(0); }
 void dedicated_matching::on_player_team_changed(matching::UserId, int) { G_ASSERT(0); }
 void dedicated_matching::player_kick_from_room(matching::UserId) { G_ASSERT(0); }
 void dedicated_matching::ban_player_in_room(matching::UserId) { G_ASSERT(0); }
+void dedicated_matching::leave_room() { G_ASSERT(0); }
 int dedicated_matching::get_room_members_count() { G_ASSERT_RETURN(false, 0); }
 int dedicated_matching::get_player_req_teams_num(matching::UserId) { G_ASSERT_RETURN(false, 0); }
 const char *dedicated_matching::get_player_custom_info(matching::UserId) { G_ASSERT_RETURN(false, ""); }
+bool dedicated_matching::has_player_penalty(matching::UserId, const char *) { G_ASSERT_RETURN(false, false); }
 
 #include <render/priorityManagedShadervar.h>
 namespace PriorityShadervar
 {
-void set_real(int, int, float) { G_ASSERT(0); }
+void set_float(int, int, float) { G_ASSERT(0); }
 void set_int(int, int, int) { G_ASSERT(0); }
-void set_color4(int, int, Point4) { G_ASSERT(0); }
+void set_float4(int, int, Point4) { G_ASSERT(0); }
 void set_int4(int, int, IPoint4) { G_ASSERT(0); }
 void clear(int, int) { G_ASSERT(0); }
 } // namespace PriorityShadervar
@@ -791,20 +822,20 @@ void render_picture(StdGuiRender::GuiContext &, Picture *, Point2, Point2, E3DCO
 
 #include <compressionUtils/compression.h>
 
-float lag_compensation_time(ecs::EntityId avatar_eid,
+double lag_compensation_time(ecs::EntityId avatar_eid,
   ecs::EntityId lc_eid,
-  float at_time,
+  double at_time,
   int interp_delay_ticks_packed,
   float additional_interp_delay,
   BasePhysActor **out_lc_eid_phys_actor)
 {
-  G_ASSERT_RETURN(false, 0.f);
+  G_ASSERT_RETURN(false, 0.0);
 }
 
 class StubLagCompensationMgr final : public ILagCompensationMgr
 {
-  void startLagCompensation(float, ecs::EntityId) override {}
-  LCError backtrackEntity(ecs::EntityId, float) override { return LCError::UnknownEntity; }
+  void startLagCompensation(double, ecs::EntityId) override {}
+  LCError backtrackEntity(ecs::EntityId, double) override { return LCError::UnknownEntity; }
   void finishLagCompensation() override {}
 };
 
@@ -814,3 +845,32 @@ ILagCompensationMgr &get_lag_compensation()
   static StubLagCompensationMgr stub;
   return stub;
 }
+
+#include "main/hostedServerLauncher.h"
+bool is_hosted_internal_server_active() { G_ASSERT_RETURN(false, false); }
+const char *get_hosted_internal_server_uid() { G_ASSERT_RETURN(false, ""); }
+const char *allocate_hosted_server_uid() { G_ASSERT_RETURN(false, ""); }
+void set_hosted_server_start_uid(const char *) { G_ASSERT(0); }
+const char *resolve_hosted_server_start_uid(const char *) { G_ASSERT_RETURN(false, ""); }
+void kill_internal_server_uid(const char *, bool) { G_ASSERT(0); }
+bool try_begin_hosted_server_start(const char *) { G_ASSERT_RETURN(false, false); }
+void clear_hosted_server_start_pending() { G_ASSERT(0); }
+void cancel_scheduled_internal_server_start() { G_ASSERT(0); }
+bool is_hosted_server_start_pending() { G_ASSERT_RETURN(false, false); }
+
+#include <perFrameStat/perFrameStat.h>
+namespace benchmark_perframe_stat
+{
+namespace gpu_time
+{
+void init() { G_ASSERT(0); }
+bool initialized() { G_ASSERT_RETURN(0, false); }
+void close() { G_ASSERT(0); }
+} // namespace gpu_time
+void init(unsigned) { G_ASSERT(0); }
+void reset() { G_ASSERT(0); }
+void add_last_frame() { G_ASSERT(0); }
+void dump_to_file(const char *) { G_ASSERT(0); }
+void set_dump_to_file(void (*)(const char *)) { G_ASSERT(0); }
+dag::ConstSpan<PerFrameData> get_per_frame_data() { G_ASSERT_RETURN(0, {}); }
+} // namespace benchmark_perframe_stat

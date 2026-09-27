@@ -1,0 +1,191 @@
+//
+// Dagor Engine 6.5
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+//
+#pragma once
+
+#include <3d/dag_resPtr.h>
+#include <drv/3d/dag_resId.h>
+#include <math/dag_TMatrix4.h>
+#include <math/dag_TMatrix.h>
+#include <generic/dag_expected.h>
+#include <EASTL/variant.h>
+
+struct RaytraceTopAccelerationStructure;
+
+namespace refined_block
+{
+
+struct BindlessTexVar
+{
+  BaseTexture *tex;
+};
+
+struct CbufVar
+{
+  Sbuffer *buf;
+};
+
+struct RWTexVar
+{
+  BaseTexture *tex;
+};
+
+struct RWBufVar
+{
+  Sbuffer *buf;
+};
+
+struct BindlessSamplerVar
+{
+  d3d::SamplerHandle handle;
+};
+
+using VarValue = eastl::variant<int, float, Color4, IPoint4, TMatrix4, TMatrix, BaseTexture *, BindlessTexVar, Sbuffer *, CbufVar,
+  d3d::SamplerHandle, BindlessSamplerVar, RaytraceTopAccelerationStructure *, RWTexVar, RWBufVar>;
+
+struct FlushedVar
+{
+  int stage;
+  int slotOrBindlessId;
+  VarValue var;
+};
+
+enum class GetError
+{
+  VarNotFound,
+  WrongVarType,
+};
+
+enum class FlushError : uint8_t
+{
+  NoDump,
+  CbufCreationFailed,
+  CbufUpdateFailed
+};
+
+class GlobalBlockHandle;
+class ViewBlockHandle;
+class PassBlockHandle;
+struct GlobalBlock;
+struct ViewBlock;
+struct PassBlock;
+
+template <typename BlockHandle>
+class BaseBlockHandle
+{
+  template <typename>
+  friend class BaseBlockHandle;
+
+  template <typename T>
+  friend T stcode_get_from_block(const PassBlockHandle &block, int id);
+
+  uint32_t id;
+  template <typename T>
+  dag::Expected<T, GetError> getByGid(int gid) const;
+  template <typename T>
+  dag::Expected<T, GetError> getById(int var_id) const;
+
+protected:
+  BaseBlockHandle(uint32_t id) : id(id) {}
+
+public:
+  static constexpr uint32_t invalidId = static_cast<uint32_t>(-1);
+
+  uint32_t getId() const { return id; }
+
+  const char *getName() const;
+
+  template <typename T>
+  BlockHandle set(int var_id, const T &val);
+
+  template <typename T>
+  BlockHandle set(const ShaderVariableInfo &var_info, const T &val)
+  {
+    return set(var_info.get_var_id(), val);
+  }
+
+  template <typename T>
+  dag::Expected<T, GetError> get(int var_id) const;
+
+  template <typename T>
+  dag::Expected<T, GetError> get(const ShaderVariableInfo &var_info) const
+  {
+    return get<T>(var_info.get_var_id());
+  }
+};
+
+class GlobalBlockHandle : public BaseBlockHandle<GlobalBlockHandle>
+{
+public:
+  using BlockType = GlobalBlock;
+  using ChildHandle = ViewBlockHandle;
+
+  GlobalBlockHandle() : BaseBlockHandle<GlobalBlockHandle>(invalidId) {}
+  GlobalBlockHandle(const GlobalBlockHandle &) = default;
+  GlobalBlockHandle &operator=(const GlobalBlockHandle &) = default;
+  GlobalBlockHandle(GlobalBlockHandle &&) = default;
+  GlobalBlockHandle &operator=(GlobalBlockHandle &&) = default;
+
+  ViewBlockHandle refineBlock(const char *name);
+
+private:
+  friend GlobalBlockHandle get_global();
+  friend BaseBlockHandle<GlobalBlockHandle>;
+
+  GlobalBlockHandle(uint32_t id) : BaseBlockHandle<GlobalBlockHandle>(id) {}
+};
+
+
+class ViewBlockHandle : public BaseBlockHandle<ViewBlockHandle>
+{
+public:
+  using BlockType = ViewBlock;
+  using ParentHandle = GlobalBlockHandle;
+  using ChildHandle = PassBlockHandle;
+
+  ViewBlockHandle() : ViewBlockHandle(invalidId) {};
+  ViewBlockHandle(const ViewBlockHandle &) = default;
+  ViewBlockHandle &operator=(const ViewBlockHandle &) = default;
+  ViewBlockHandle(ViewBlockHandle &&) = default;
+  ViewBlockHandle &operator=(ViewBlockHandle &&) = default;
+
+  PassBlockHandle refineBlock(const char *name);
+
+private:
+  template <typename ParentHandle>
+  friend typename ParentHandle::ChildHandle refine_block(const char *name, ParentHandle parent);
+  friend BaseBlockHandle<ViewBlockHandle>;
+
+  ViewBlockHandle(uint32_t id) : BaseBlockHandle<ViewBlockHandle>(id) {}
+};
+
+class PassBlockHandle : public BaseBlockHandle<PassBlockHandle>
+{
+public:
+  using BlockType = PassBlock;
+  using ParentHandle = ViewBlockHandle;
+
+  PassBlockHandle() : PassBlockHandle(invalidId) {};
+  PassBlockHandle(const PassBlockHandle &) = default;
+  PassBlockHandle &operator=(const PassBlockHandle &) = default;
+  PassBlockHandle(PassBlockHandle &&) = default;
+  PassBlockHandle &operator=(PassBlockHandle &&) = default;
+
+  void setState() const;
+
+private:
+  template <typename ParentHandle>
+  friend typename ParentHandle::ChildHandle refine_block(const char *name, ParentHandle parent);
+  friend BaseBlockHandle<PassBlockHandle>;
+
+  friend void flush();
+
+  PassBlockHandle(uint32_t id);
+};
+
+GlobalBlockHandle get_global();
+void clear();
+void flush();
+
+} // namespace refined_block

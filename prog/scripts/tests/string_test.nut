@@ -1,6 +1,6 @@
 let string = require("%sqstd/string.nut")
 
-function testFunction(func, tests=[], shouldPass=true, testname = null) {
+function testFunction(func: function, tests=[], shouldPass=true, testname = null) {
   let funcname = testname ?? func.getfuncinfos().name
   foreach (test in tests) {
     let test_ = test?.name ?? test
@@ -11,7 +11,7 @@ function testFunction(func, tests=[], shouldPass=true, testname = null) {
         failed = true
     }
     catch(e) {
-      failed = !shouldPass
+      failed = shouldPass
     }
     if (failed)
       print("test for func: {0}  failed. Func argument: {1}\n".subst(funcname , test_))

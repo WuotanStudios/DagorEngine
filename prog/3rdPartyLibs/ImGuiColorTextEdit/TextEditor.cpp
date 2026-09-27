@@ -447,7 +447,7 @@ void TextEditor::ApplyAutocompleteSuggestion()
 void TextEditor::SetPalette(PaletteId aValue)
 {
 	mPaletteId = aValue;
-	const Palette* palletteBase;
+	const Palette* palletteBase = &(GetDarkPalette());
 	switch (mPaletteId)
 	{
 	case PaletteId::Dark:
@@ -482,6 +482,9 @@ void TextEditor::SetLanguageDefinition(LanguageDefinitionId aValue)
 		break;
 	case LanguageDefinitionId::Daslang:
 		mLanguageDefinition = &(LanguageDefinition::Daslang());
+		break;
+	case LanguageDefinitionId::Blk:
+		mLanguageDefinition = &(LanguageDefinition::Blk());
 		break;
 	default:
 		mLanguageDefinition = nullptr;
@@ -529,11 +532,11 @@ void TextEditor::SelectRegion(int aStartLine, int aStartChar, int aEndLine, int 
 	SetSelection(aStartLine, aStartChar, aEndLine, aEndChar);
 }
 
-bool TextEditor::SelectNextOccurrenceOf(const char* aText, int aTextSize, bool aCaseSensitive, bool aWholeWords)
+bool TextEditor::SelectNextOccurrenceOf(const char* aText, int aTextSize, bool aCaseSensitive, bool aWholeWords, bool reverse)
 {
 	ClearSelections();
 	ClearExtraCursors();
-	return SelectNextOccurrenceOf(aText, aTextSize, -1, aCaseSensitive, aWholeWords);
+	return SelectNextOccurrenceOf(aText, aTextSize, -1, aCaseSensitive, aWholeWords, reverse);
 }
 
 void TextEditor::SelectAllOccurrencesOf(const char* aText, int aTextSize, bool aCaseSensitive, bool aWholeWords)
@@ -871,10 +874,19 @@ void TextEditor::Redo(bool group)
 	CancelAutocomplete();
 }
 
-void TextEditor::SetText(const eastl::string& aText)
+void TextEditor::SetText(const eastl::string& aText, bool resetUndo)
 {
 	eastl::string buffer;
 	const eastl::string &validText = FixUtf8String(aText, buffer);
+
+	// Save current state for undo
+	UndoRecord u;
+	if (!resetUndo)
+	{
+		u.mBefore = mState;
+		u.mOperations.push_back({ GetText(), Coordinates(0, 0), Coordinates((int)mLines.size() - 1, GetLineMaxColumn((int)mLines.size() - 1)), UndoOperationType::Delete });
+	}
+
 	mLines.clear();
 	mLines.emplace_back(Line());
 	for (auto chr : validText)
@@ -892,8 +904,20 @@ void TextEditor::SetText(const eastl::string& aText)
 
 //	mScrollToTop = true;
 
-	mUndoBuffer.clear();
-	mUndoIndex = 0;
+	if (!resetUndo)
+	{
+		u.mOperations.push_back({ validText, Coordinates(0, 0), Coordinates((int)mLines.size() - 1, GetLineMaxColumn((int)mLines.size() - 1)), UndoOperationType::Add });
+		u.mAfter = mState;
+
+		AddUndo(u);
+		mUndoIndex = (int)mUndoBuffer.size();
+		undoIndexInDisk = GetUndoIndex();
+	}
+	else
+	{
+		mUndoBuffer.clear();
+		mUndoIndex = 0;
+	}
 
 	ColorizeAll();
 	CancelCloseChars();
@@ -941,13 +965,26 @@ eastl::string TextEditor::GetText(const Coordinates& aStart, const Coordinates& 
 	return result;
 }
 
-void TextEditor::SetTextLines(const eastl::vector<eastl::string>& aLines)
+void TextEditor::SetTextLines(const eastl::vector<eastl::string>& aLines, bool resetUndo)
 {
-	mLines.clear();
 	eastl::string buffer;
 
+	// Save current state for undo
+	UndoRecord u;
+	if (!resetUndo)
+	{
+		u.mBefore = mState;
+		u.mOperations.push_back({ GetText(), Coordinates(0, 0), Coordinates((int)mLines.size() - 1, GetLineMaxColumn((int)mLines.size() - 1)), UndoOperationType::Delete });
+	}
+
+	mLines.clear();
+
 	if (aLines.empty())
+	{
 		mLines.emplace_back(Line());
+		if (!resetUndo)
+			u.mOperations.push_back({ "", Coordinates(0, 0), Coordinates(0, 0), UndoOperationType::Add });
+	}
 	else
 	{
 		mLines.resize(aLines.size());
@@ -959,13 +996,27 @@ void TextEditor::SetTextLines(const eastl::vector<eastl::string>& aLines)
 			mLines[i].reserve(aLine.size());
 			for (size_t j = 0; j < aLine.size(); ++j)
 				mLines[i].emplace_back(Glyph(aLine[j], PaletteIndex::Default));
+
+			if (!resetUndo)
+				u.mOperations.push_back({ aLine, Coordinates((int)i, 0), Coordinates((int)i, (int)aLine.size()), UndoOperationType::Add });
 		}
 	}
 
 //	mScrollToTop = true;
 
-	mUndoBuffer.clear();
-	mUndoIndex = 0;
+	if (!resetUndo)
+	{
+		u.mAfter = mState;
+
+		AddUndo(u);
+		mUndoIndex = (int)mUndoBuffer.size();
+		undoIndexInDisk = GetUndoIndex();
+	}
+	else
+	{
+		mUndoBuffer.clear();
+		mUndoIndex = 0;
+	}
 
 	ColorizeAll();
 }
@@ -997,14 +1048,12 @@ bool TextEditor::Render(const char* aTitle, bool aParentIsFocused, bool aMenuIsF
 	{
 		mCursorPositionChanged = false;
 		OnCursorPositionChanged();
-		ClearHighlights();
 		HighlightSelectedText();
 	}
 
 	if (colorizeTime != 0.0 && ImGui::GetTime() > colorizeTime)
 	{
 		ColorizeAll();
-		ClearHighlights();
 		HighlightSelectedText();
 	}
 
@@ -1113,6 +1162,7 @@ void TextEditor::UndoRecord::Undo(TextEditor* aEditor)
 
 	aEditor->mState = mBefore;
 	aEditor->EnsureCursorVisible();
+	aEditor->HighlightSelectedText(true);
 }
 
 void TextEditor::UndoRecord::Redo(TextEditor* aEditor)
@@ -1143,6 +1193,7 @@ void TextEditor::UndoRecord::Redo(TextEditor* aEditor)
 
 	aEditor->mState = mAfter;
 	aEditor->EnsureCursorVisible();
+	aEditor->HighlightSelectedText(true);
 }
 
 
@@ -1815,8 +1866,14 @@ void TextEditor::Delete(bool aWordMode, const EditorState* aEditorState)
 	}
 }
 
-void TextEditor::HighlightSelectedText()
+int TextEditor::HighlightSelectedText(bool aroundLine, int highlightedCount)
 {
+	if (aroundLine)
+		ClearHighlights();
+
+	if (highlightedCount >= MAX_HIGHLIGHTS_PER_FILE)
+		return highlightedCount;
+
 	eastl::string sel = GetSelectedText(0);
 	bool spacesOnly = true;
 
@@ -1826,50 +1883,54 @@ void TextEditor::HighlightSelectedText()
 			spacesOnly = false;
 
 		if (c == '\n')
-			return;
+			return highlightedCount;
 	}
 
 	if (spacesOnly)
-		return;
+		return highlightedCount;
 
-	int highlightedCount = 0;
+	int currentHighlightedCount = highlightedCount;
 	int highlightAroundLine = mState.mCursors[0].mInteractiveStart.mLine;
 
-	for (int pass = 0; pass < 2; pass++)
+	for (int k = 0; k < Min((int)mLines.size(), HIGHLIGHT_MAX_FILE_LINES); k++)
 	{
-		for (int k = 0; k < Min((int)mLines.size(), HIGHLIGHT_MAX_FILE_LINES); k++)
+		bool insideRange = abs(k - highlightAroundLine) < HIGHLIGHT_FIRST_PASS_LINES_DISTANCE;
+		if (aroundLine != insideRange)
+			continue;
+
+		auto & line = mLines[k];
+		for (int i = 0; i <= (int)line.size() - (int)sel.length(); i++)
 		{
-			bool insideRange = abs(k - highlightAroundLine) < HIGHLIGHT_FIRST_PASS_LINES_DISTANCE;
-			if ((pass == 0) != (insideRange))
-				continue;
-
-			auto & line = mLines[k];
-			for (int i = 0; i <= (int)line.size() - (int)sel.length(); i++)
+			if (line[i].mChar == sel[0])
 			{
-				if (line[i].mChar == sel[0])
+				bool found = true;
+				for (int j = 1; j < (int)sel.length(); j++)
 				{
-					bool found = true;
-					for (int j = 1; j < (int)sel.length(); j++)
+					if (line[i + j].mChar != sel[j])
 					{
-						if (line[i + j].mChar != sel[j])
-						{
-							found = false;
-							break;
-						}
+						found = false;
+						break;
 					}
+				}
 
-					if (found)
-					{
-						AddHighlight(k, i, i + (int)sel.length());
-						i += (int)sel.length() - 1;
-						highlightedCount++;
-						if (highlightedCount > MAX_HIGHLIGHTS_PER_FILE)
-							return;
-					}
+				if (found)
+				{
+					AddHighlight(k, i, i + (int)sel.length());
+					i += (int)sel.length() - 1;
+					currentHighlightedCount++;
+					if (currentHighlightedCount >= MAX_HIGHLIGHTS_PER_FILE)
+						return currentHighlightedCount;
 				}
 			}
 		}
 	}
+	return currentHighlightedCount;
+}
+
+void TextEditor::HighlightSelectedText()
+{
+	int highlightedCount = HighlightSelectedText(true);
+	HighlightSelectedText(false, highlightedCount);
 }
 
 void TextEditor::SetSelection(Coordinates aStart, Coordinates aEnd, int aCursor)
@@ -1892,7 +1953,6 @@ void TextEditor::SetSelection(Coordinates aStart, Coordinates aEnd, int aCursor)
 	mState.mCursors[aCursor].mInteractiveStart = aStart;
 	SetCursorPosition(aEnd, aCursor, false);
 
-	ClearHighlights();
 	HighlightSelectedText();
 }
 
@@ -1903,12 +1963,13 @@ void TextEditor::SetSelection(int aStartLine, int aStartChar, int aEndLine, int 
 	SetSelection(startCoords, endCoords, aCursor);
 }
 
-bool TextEditor::SelectNextOccurrenceOf(const char* aText, int aTextSize, int aCursor, bool aCaseSensitive, bool aWholeWords)
+bool TextEditor::SelectNextOccurrenceOf(const char* aText, int aTextSize, int aCursor, bool aCaseSensitive, bool aWholeWords, bool reverse)
 {
 	if (aCursor == -1)
 		aCursor = mState.mCurrentCursor;
 	Coordinates nextStart, nextEnd;
-	if (!FindNextOccurrence(aText, aTextSize, mState.mCursors[aCursor].mInteractiveEnd, nextStart, nextEnd, aCaseSensitive, aWholeWords))
+	if (!(reverse ? FindPrevOccurrence(aText, aTextSize, mState.mCursors[aCursor].mInteractiveStart, nextStart, nextEnd, aCaseSensitive, aWholeWords)
+		: FindNextOccurrence(aText, aTextSize, mState.mCursors[aCursor].mInteractiveEnd, nextStart, nextEnd, aCaseSensitive, aWholeWords)))
 		return false;
 	SetSelection(nextStart, nextEnd, aCursor);
 	EnsureCursorVisible(aCursor, true);
@@ -1916,35 +1977,54 @@ bool TextEditor::SelectNextOccurrenceOf(const char* aText, int aTextSize, int aC
 }
 
 
-bool TextEditor::Replace(const char* find, int findLength, const char * replaceWith, int replaceLength, bool aCaseSensitive, bool aWholeWords, bool all)
+bool TextEditor::Replace(const char* find, int findLength, const char * replaceWith, int replaceLength, bool aCaseSensitive, bool aWholeWords)
 {
-	(void)replaceLength;
 	bool replaceOccurred = false;
+	if (replaceLength == 0)
+		return false;
 
-	do
+	(void)replaceLength;
+
+	if (mState.mCursors[0].GetSelectionStart() < mState.mCursors[0].GetSelectionEnd() &&
+	mState.mCursors[0].GetSelectionStart().mLine == mState.mCursors[0].GetSelectionEnd().mLine)
 	{
 		int aCursor = mState.mCurrentCursor;
-		Coordinates nextStart, nextEnd;
 
-		if (!FindNextOccurrence(find, findLength, mState.mCursors[aCursor].mInteractiveEnd, nextStart, nextEnd, aCaseSensitive, aWholeWords))
-			break;
-
-		SetSelection(nextStart, nextEnd, aCursor);
 		PasteText(replaceWith);
 		replaceOccurred = true;
 
-		if (!all && nextStart != mState.mCursors[aCursor].mInteractiveEnd)
-			SetSelection(nextStart, mState.mCursors[aCursor].mInteractiveEnd, aCursor);
-
 		EnsureCursorVisible(aCursor, true);
 	}
-	while (all);
 
 	return replaceOccurred;
 }
 
 
-void TextEditor::AddCursorForNextOccurrence(bool aCaseSensitive, bool aWholeWords)
+bool TextEditor::ReplaceAll(const char* find, int findLength, const char* replaceWith, int replaceLength, bool aCaseSensitive, bool aWholeWords)
+{
+	bool replaceOccurred = false;
+	if (findLength == 0)
+		return false;
+
+	Coordinates searchStart = Coordinates(0, 0);
+	Coordinates nextStart, nextEnd;
+
+	while (FindNextOccurrence(find, findLength, searchStart, nextStart, nextEnd, aCaseSensitive, aWholeWords))
+	{
+		SetSelection(nextStart, nextEnd, 0);
+		PasteText(replaceWith);
+		replaceOccurred = true;
+
+		searchStart = nextStart;
+		MoveCoords(searchStart, MoveDirection::Right, false);
+	}
+
+	EnsureCursorVisible(0, true);
+	return replaceOccurred;
+}
+
+
+void TextEditor::AddCursorForNextOccurrence(bool aCaseSensitive, bool aWholeWords, bool reverse)
 {
 	const Cursor& currentCursor = mState.mCursors[mState.GetLastAddedCursorIndex()];
 	if (currentCursor.GetSelectionStart() == currentCursor.GetSelectionEnd())
@@ -1952,7 +2032,8 @@ void TextEditor::AddCursorForNextOccurrence(bool aCaseSensitive, bool aWholeWord
 
 	eastl::string selectionText = GetText(currentCursor.GetSelectionStart(), currentCursor.GetSelectionEnd());
 	Coordinates nextStart, nextEnd;
-	if (!FindNextOccurrence(selectionText.c_str(), selectionText.length(), currentCursor.GetSelectionEnd(), nextStart, nextEnd, aCaseSensitive))
+	if (!(reverse ? FindPrevOccurrence(selectionText.c_str(), selectionText.length(), currentCursor.GetSelectionStart(), nextStart, nextEnd, aCaseSensitive)
+		: FindNextOccurrence(selectionText.c_str(), selectionText.length(), currentCursor.GetSelectionEnd(), nextStart, nextEnd, aCaseSensitive)))
 		return;
 
 	mState.AddCursor();
@@ -1962,9 +2043,12 @@ void TextEditor::AddCursorForNextOccurrence(bool aCaseSensitive, bool aWholeWord
 	EnsureCursorVisible(-1, true);
 }
 
+
 bool TextEditor::FindNextOccurrence(const char* aText, int aTextSize, const Coordinates& aFrom, Coordinates& outStart, Coordinates& outEnd, bool aCaseSensitive, bool aWholeWords)
 {
-	EASTL_ASSERT(aTextSize > 0);
+	if (aTextSize <= 0)
+		return false;
+
 	bool fmatches = false;
 	int fline, ifline;
 	int findex, ifindex;
@@ -2047,6 +2131,116 @@ bool TextEditor::FindNextOccurrence(const char* aText, int aTextSize, const Coor
 		}
 		else
 			findex++;
+
+		// detect complete scan
+		if (findex == ifindex && fline == ifline)
+			return false;
+	}
+
+	return false;
+}
+
+bool TextEditor::FindPrevOccurrence(const char* aText, int aTextSize, const Coordinates& aFrom, Coordinates& outStart, Coordinates& outEnd, bool aCaseSensitive, bool aWholeWords)
+{
+	if (aTextSize <= 0)
+		return false;
+
+	bool fmatches = false;
+	int fline, ifline;
+	int findex, ifindex;
+
+	int startLine = aFrom.mLine;
+	int startIndex = GetCharacterIndexR(aFrom) - aTextSize;
+	while (startIndex < 0 && startLine > 0)
+	{
+		startLine--;
+		startIndex += mLines[startLine].size();
+	}
+	if (startIndex < 0)
+	{
+		startLine = mLines.size() - 1;
+		startIndex = mLines[startLine].size() - 1;
+	}
+
+
+	ifline = fline = startLine;
+	ifindex = findex = startIndex;
+
+	while (true)
+	{
+		bool matches;
+		{ // match function
+			int lineOffset = 0;
+			int currentCharIndex = findex;
+			int i = aTextSize - 1;
+			for (; i >= 0; i--)
+			{
+				if (currentCharIndex == -1)
+				{
+					if (aText[i] == '\n' && fline + lineOffset > 0)
+					{
+						lineOffset--;
+						currentCharIndex = mLines[fline + lineOffset].size() - 1;
+					}
+					else
+						break;
+				}
+				else
+				{
+					char toCompareA = mLines[fline + lineOffset][currentCharIndex].mChar;
+					char toCompareB = aText[i];
+					toCompareA = (!aCaseSensitive && toCompareA >= 'A' && toCompareA <= 'Z') ? toCompareA - 'A' + 'a' : toCompareA;
+					toCompareB = (!aCaseSensitive && toCompareB >= 'A' && toCompareB <= 'Z') ? toCompareB - 'A' + 'a' : toCompareB;
+					if (toCompareA != toCompareB)
+						break;
+					else
+						currentCharIndex--;
+				}
+			}
+			matches = i == -1;
+			if (matches)
+			{
+				if (aWholeWords)
+				{
+					if (findex > aTextSize - 1)
+					{
+						char charBefore = mLines[fline][findex - aTextSize].mChar;
+						if (CharIsWordChar(charBefore))
+							matches = false;
+					}
+					if (matches && findex + 1 < mLines[fline].size())
+					{
+						char charAfter = mLines[fline][findex + 1].mChar;
+						if (CharIsWordChar(charAfter))
+							matches = false;
+					}
+				}
+
+				if (matches)
+				{
+					outStart = { fline + lineOffset, GetCharacterColumn(fline + lineOffset, currentCharIndex + 1) };
+					outEnd = { fline, GetCharacterColumn(fline, findex + 1) };
+					return true;
+				}
+			}
+		}
+
+		// move backward
+		if (findex == -1)
+		{
+			if (fline == 0)
+			{
+				fline = mLines.size() - 1;
+				findex = mLines[fline].size() - 1;
+			}
+			else
+			{
+				fline--;
+				findex = mLines[fline].size() - 1;
+			}
+		}
+		else
+			findex--;
 
 		// detect complete scan
 		if (findex == ifindex && fline == ifline)
@@ -2168,11 +2362,26 @@ void TextEditor::ChangeCurrentLinesIndentation(bool aIncrease)
 				continue;
 
 			ChangeSingleLineIndentation(u, currentLine, aIncrease);
+
+			if (mState.mCursors[c].mInteractiveStart.mLine == currentLine || mState.mCursors[c].mInteractiveEnd.mLine == currentLine)
+			{
+				int offset = aIncrease ? mTabSize : -mTabSize;
+				Coordinates newStart = mState.mCursors[c].mInteractiveStart;
+				Coordinates newEnd = mState.mCursors[c].mInteractiveEnd;
+				if (newStart.mLine == currentLine)
+					newStart.mColumn = Max(0, newStart.mColumn + offset);
+				if (newEnd.mLine == currentLine)
+					newEnd.mColumn = Max(0, newEnd.mColumn + offset);
+				SetSelection(newStart, newEnd, c);
+			}
 		}
 	}
 
 	if (u.mOperations.size() > 0)
+	{
+		u.mAfter = mState;
 		AddUndo(u);
+	}
 }
 
 void TextEditor::MoveUpCurrentLines()
@@ -2413,8 +2622,10 @@ void TextEditor::EnsureCursorVisible(int aCursor, bool aStartToo)
 
 TextEditor::Coordinates TextEditor::SanitizeCoordinates(const Coordinates& aValue) const
 {
-	auto line = aValue.mLine;
-	auto column = aValue.mColumn;
+	// Clamp in document and line limits
+	auto line = Max(aValue.mLine, 0);
+	auto column = Max(aValue.mColumn, 0);
+	Coordinates out;
 	if (line >= (int) mLines.size())
 	{
 		if (mLines.empty())
@@ -2427,13 +2638,26 @@ TextEditor::Coordinates TextEditor::SanitizeCoordinates(const Coordinates& aValu
 			line = (int) mLines.size() - 1;
 			column = GetLineMaxColumn(line);
 		}
-		return Coordinates(line, column);
+		out = Coordinates(line, column);
 	}
 	else
 	{
 		column = mLines.empty() ? 0 : GetLineMaxColumn(line, column);
-		return Coordinates(line, column);
+		out = Coordinates(line, column);
 	}
+
+	// Move if inside a tab character
+	int charIndex = GetCharacterIndexL(out);
+	if (charIndex > -1 && charIndex < mLines[out.mLine].size() && mLines[out.mLine][charIndex].mChar == '\t')
+	{
+		int columnToLeft = GetCharacterColumn(out.mLine, charIndex);
+		int columnToRight = GetCharacterColumn(out.mLine, GetCharacterIndexR(out));
+		if (out.mColumn - columnToLeft <= columnToRight - out.mColumn)
+			out.mColumn = columnToLeft;
+		else
+			out.mColumn = columnToRight;
+	}
+	return out;
 }
 
 TextEditor::Coordinates TextEditor::GetActualCursorCoordinates(int aCursor, bool aStart) const
@@ -2456,18 +2680,8 @@ TextEditor::Coordinates TextEditor::ScreenPosToCoordinates(const ImVec2& aPositi
 		Max(0, (int)floor(local.y / mCharAdvance.y)),
 		Max(0, (int)floor((local.x - mTextStart) / mCharAdvance.x))
 	};
-	int charIndex = GetCharacterIndexL(out);
-	if (charIndex > -1 && charIndex < mLines[out.mLine].size() && mLines[out.mLine][charIndex].mChar == '\t')
-	{
-		int columnToLeft = GetCharacterColumn(out.mLine, charIndex);
-		int columnToRight = GetCharacterColumn(out.mLine, GetCharacterIndexR(out));
-		if (out.mColumn - columnToLeft < columnToRight - out.mColumn)
-			out.mColumn = columnToLeft;
-		else
-			out.mColumn = columnToRight;
-	}
-	else
-		out.mColumn = Max(0, (int)floor((local.x - mTextStart + POS_TO_COORDS_COLUMN_OFFSET * mCharAdvance.x) / mCharAdvance.x));
+	out.mColumn = Max(0, (int)floor((local.x - mTextStart + POS_TO_COORDS_COLUMN_OFFSET * mCharAdvance.x) / mCharAdvance.x));
+
 	return SanitizeCoordinates(out);
 }
 
@@ -2691,7 +2905,13 @@ void TextEditor::RemoveLines(int aStart, int aEnd)
 		{
 			int targetLine = mState.mCursors[c].mInteractiveEnd.mLine - (aEnd - aStart);
 			targetLine = targetLine < 0 ? 0 : targetLine;
-			SetCursorPosition({ targetLine , mState.mCursors[c].mInteractiveEnd.mColumn }, c);
+			mState.mCursors[c].mInteractiveEnd.mLine = targetLine;
+		}
+		if (mState.mCursors[c].mInteractiveStart.mLine >= aStart)
+		{
+			int targetLine = mState.mCursors[c].mInteractiveStart.mLine - (aEnd - aStart);
+			targetLine = targetLine < 0 ? 0 : targetLine;
+			mState.mCursors[c].mInteractiveStart.mLine = targetLine;
 		}
 	}
 
@@ -2742,17 +2962,14 @@ void TextEditor::DeleteRange(const Coordinates& aStart, const Coordinates& aEnd)
 			AddGlyphsToLine(aStart.mLine, firstLine.size(), lastLine.begin(), lastLine.end());
 			for (int c = 0; c <= mState.mCurrentCursor; c++) // move up cursors in line that is being moved up
 			{
+				// if cursor is selecting the same range we are deleting, it's because this is being called from
+				// DeleteSelection which already sets the cursor position after the range is deleted
+				if (mState.mCursors[c].GetSelectionStart() == aStart && mState.mCursors[c].GetSelectionEnd() == aEnd)
+					continue;
 				if (mState.mCursors[c].mInteractiveEnd.mLine > aEnd.mLine)
 					break;
 				else if (mState.mCursors[c].mInteractiveEnd.mLine != aEnd.mLine)
 					continue;
-
-				if (mState.mCursors[c].mInteractiveStart == aStart && mState.mCursors[c].mInteractiveEnd == aEnd)
-				{
-					SetCursorPosition(aStart, c, false);
-					continue;
-				}
-
 				int otherCursorEndCharIndex = GetCharacterIndexR(mState.mCursors[c].mInteractiveEnd);
 				int otherCursorStartCharIndex = GetCharacterIndexR(mState.mCursors[c].mInteractiveStart);
 				int otherCursorNewEndCharIndex = GetCharacterIndexR(aStart) + otherCursorEndCharIndex;
@@ -2775,9 +2992,10 @@ void TextEditor::DeleteSelection(int aCursor)
 	if (mState.mCursors[aCursor].GetSelectionEnd() == mState.mCursors[aCursor].GetSelectionStart())
 		return;
 
-	DeleteRange(mState.mCursors[aCursor].GetSelectionStart(), mState.mCursors[aCursor].GetSelectionEnd());
-	SetCursorPosition(mState.mCursors[aCursor].GetSelectionStart(), aCursor);
-	ColorizeLine(mState.mCursors[aCursor].GetSelectionStart().mLine);
+	Coordinates newCursorPos = mState.mCursors[aCursor].GetSelectionStart();
+	DeleteRange(newCursorPos, mState.mCursors[aCursor].GetSelectionEnd());
+	SetCursorPosition(newCursorPos, aCursor);
+	ColorizeLine(newCursorPos.mLine);
 }
 
 void TextEditor::RemoveGlyphsFromLine(int aLine, int aStartChar, int aEndChar)
@@ -2946,7 +3164,7 @@ void TextEditor::HandleKeyboardInputs(bool aParentIsFocused)
 		else if (!alt && !ctrl && !super && ImGui::IsKeyDown(ImGuiKey_Escape) && !autocompleteSuggestions.empty())
 			CancelAutocomplete();
 
-		if (!mReadOnly && !io.InputQueueCharacters.empty() && ctrl == alt && !super)
+		if (!mReadOnly && !io.InputQueueCharacters.empty() && !(ctrl && !alt) && !super) // See https://github.com/santaclose/ImGuiColorTextEdit/pull/34
 		{
 			for (int i = 0; i < io.InputQueueCharacters.Size; i++)
 			{
@@ -3276,14 +3494,14 @@ void TextEditor::Render(bool aParentIsFocused)
 				auto end = ImVec2(lineStartScreenPos.x + mTextStart + 4000, lineStartScreenPos.y + mCharAdvance.y);
 				drawList->AddRectFilled(start, end, mPalette[(int)PaletteIndex::ErrorMarker]);
 
-				if (ImGui::IsMouseHoveringRect(lineStartScreenPos, end))
+				if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && ImGui::IsMouseHoveringRect(lineStartScreenPos, end))
 				{
 					ImGui::BeginTooltip();
-					ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.2f, 0.2f, 1.0f));
+					ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(0xcf2c43ff));
 					ImGui::Text("Error at line %d:", errorIt->line);
 					ImGui::PopStyleColor();
 					ImGui::Separator();
-					ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 0.2f, 1.0f));
+					ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(0xe600b3ff));
 					ImGui::Text("%s", errorIt->text.c_str());
 					ImGui::PopStyleColor();
 					ImGui::EndTooltip();
@@ -3414,7 +3632,7 @@ void TextEditor::Render(bool aParentIsFocused)
 
 			if (errorIt != mErrorMarkers.end() && column + 4 <= mLastVisibleColumn)
 			{
-				ImVec2 targetGlyphPos = { lineStartScreenPos.x + mTextStart + TextDistanceToLineStart({lineNo, column + 4}, false), lineStartScreenPos.y };
+				ImVec2 targetGlyphPos = { lineStartScreenPos.x + mTextStart + TextDistanceToLineStart({lineNo, (int)mLines[lineNo].size() + 4}, false), lineStartScreenPos.y };
 				drawList->AddText(targetGlyphPos, mPalette[(int)PaletteIndex::ErrorText], errorIt->text.c_str(), strchr(errorIt->text.c_str(), '\n'));
 			}
 		}
@@ -3701,6 +3919,8 @@ void TextEditor::ColorizeRange(int from, int to)
 
 	from = eastl::max(from, 0);
 	to = eastl::min((int)mLines.size() - 1, to);
+	if (to < from)
+		return;
 
 	eastl::string commentStart = mLanguageDefinition->mCommentStart;
 	eastl::string commentEnd = mLanguageDefinition->mCommentEnd;
@@ -3875,7 +4095,7 @@ void TextEditor::ColorizeRange(int from, int to)
 }
 
 
-bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
+bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId, bool &isFocused)
 {
 	ImFont* codeFontEditor = FontManager::GetCodeFont();
 	ImFont* codeFontTopBar = FontManager::GetCodeFont();
@@ -3895,10 +4115,8 @@ bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
 
 	currentDockId = ImGui::GetWindowDockID();
 
-	bool isFocused = ImGui::IsWindowFocused();
+	isFocused = ImGui::IsWindowFocused();
 	bool requestingGoToLinePopup = false;
-	bool requestingFindPopup = false;
-	bool requestingReplacePopup = false;
 	bool requestingFontSizeIncrease = false;
 	bool requestingFontSizeDecrease = false;
 	if (ImGui::BeginMenuBar())
@@ -3909,8 +4127,10 @@ bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
 				OnReloadCommand();*/
 			/*if (ImGui::MenuItem("Load from"))
 				OnLoadFromCommand();*/
-			if (ImGui::MenuItem("Save", "Ctrl+S"))
+			if (ImGui::MenuItem("Save"))
 				OnSaveCommand();
+			if (ImGui::MenuItem("Save all", "Ctrl+S"))
+				OnSaveAllCommand();
 			/*if (this->hasAssociatedFile && ImGui::MenuItem("Show in file explorer"))
 				Utils::ShowInFileExplorer(this->associatedFile);
 			if (this->hasAssociatedFile &&
@@ -4001,16 +4221,18 @@ bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
 			if (ImGui::MenuItem("Go to line", "Ctrl+G"))
 				requestingGoToLinePopup = true;
 			if (ImGui::MenuItem("Find", "Ctrl+F"))
-				requestingFindPopup = true;
+				mRequestingFind = true;
+				GetSuitableTextToFind(ctrlfTextToFind, FIND_POPUP_TEXT_FIELD_LENGTH);
 			if (ImGui::MenuItem("Replace", "Ctrl+H"))
-				requestingReplacePopup = true;
+				mRequestingReplace = true;
+				GetSuitableTextToFind(ctrlfTextToFind, FIND_POPUP_TEXT_FIELD_LENGTH);
 			ImGui::EndMenu();
 		}
 
 		int line, column;
 		GetCursorPosition(line, column);
 
-		if (codeFontTopBar != nullptr) ImGui::PushFont(codeFontTopBar);
+		if (codeFontTopBar != nullptr) ImGui::PushFont(codeFontTopBar, 0.0f);
 		ImGui::Text("%6d/%-6d %6d lines | %s | %s", line + 1, column + 1, GetLineCount(),
 			IsOverwriteEnabled() ? "Ovr" : "Ins",
 			GetLanguageDefinitionName());
@@ -4019,7 +4241,110 @@ bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
 		ImGui::EndMenuBar();
 	}
 
-	if (codeFontEditor != nullptr) ImGui::PushFont(codeFontEditor);
+	mSearchBarOpen = mSearchBarOpen || mReplaceBarOpen || mRequestingFind || mRequestingReplace;
+	mReplaceBarOpen = mReplaceBarOpen || mRequestingReplace;
+	if (mRequestingFind || mRequestingReplace)
+		GetSuitableTextToFind(ctrlfTextToFind, FIND_POPUP_TEXT_FIELD_LENGTH);
+
+	if (mSearchBarOpen)
+	{
+		ImGui::Separator();
+		ImGui::BeginChild("FindReplaceToolbar", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
+
+		bool isSearchBarFocused = ImGui::IsWindowFocused();
+
+		if (ImGui::ArrowButton("Toggle Replace", mReplaceBarOpen ? ImGuiDir_Up : ImGuiDir_Down))
+			mReplaceBarOpen = !mReplaceBarOpen;
+		ImGui::SameLine();
+		ImGui::BeginGroup();
+		ImGui::PushID("FindBar");
+		ImGui::SetNextItemWidth(300.0f);
+		if (mRequestingFind) ImGui::SetKeyboardFocusHere();
+		ImGui::InputTextWithHint("##Find", "Find...", ctrlfTextToFind, FIND_POPUP_TEXT_FIELD_LENGTH, ImGuiInputTextFlags_AutoSelectAll);
+		ImGui::SameLine();
+
+		bool shiftPressed = ImGui::GetIO().KeyShift;
+		int toFindTextSize = strlen(ctrlfTextToFind);
+		int toReplaceTextSize = strlen(ctrlfTextToReplace);
+		if (ImGui::Button("Next") || (((isSearchBarFocused && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) || ImGui::IsKeyPressed(ImGuiKey_F3)) && !shiftPressed))
+		{
+			ClearExtraCursors();
+			if (mReplaceBarOpen)
+				Replace(ctrlfTextToFind, toFindTextSize, ctrlfTextToReplace, toReplaceTextSize, ctrlfCaseSensitive, ctrlfWholeWords);
+			if (SelectNextOccurrenceOf(ctrlfTextToFind, toFindTextSize, ctrlfCaseSensitive, ctrlfWholeWords))
+			{
+				int nextOccurrenceLine, _;
+				GetCursorPosition(nextOccurrenceLine, _);
+				CenterViewAtLine(nextOccurrenceLine);
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Prev") || (((isSearchBarFocused && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) || ImGui::IsKeyPressed(ImGuiKey_F3)) && shiftPressed))
+		{
+			ClearExtraCursors();
+			if (mReplaceBarOpen)
+				Replace(ctrlfTextToFind, toFindTextSize, ctrlfTextToReplace, toReplaceTextSize, ctrlfCaseSensitive, ctrlfWholeWords);
+			if (SelectNextOccurrenceOf(ctrlfTextToFind, toFindTextSize, ctrlfCaseSensitive, ctrlfWholeWords, /*reverse*/ true))
+			{
+				int nextOccurrenceLine, _;
+				GetCursorPosition(nextOccurrenceLine, _);
+				CenterViewAtLine(nextOccurrenceLine);
+			}
+		}
+
+		ImGui::SameLine();
+		ImGui::Checkbox("Aa", &ctrlfCaseSensitive);
+		ImGui::SameLine();
+		ImGui::Checkbox("Whole words", &ctrlfWholeWords);
+		ImGui::SameLine(ImGui::GetContentRegionAvail().x - 24.0f); // Move to right corner
+		float buttonSize = ImGui::CalcTextSize("x").y + ImGui::GetStyle().FramePadding.y * 2.f;
+		if (ImGui::Button("x", ImVec2(buttonSize, buttonSize)) || (ImGui::IsKeyDown(ImGuiKey_Escape) && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootWindow)))
+		{
+			mSearchBarOpen = false;
+			mReplaceBarOpen = false;
+		}
+
+		if (mReplaceBarOpen)
+		{
+			ImGui::BeginGroup();
+			ImGui::PushID("ReplaceBar");
+			ImGui::SetNextItemWidth(180.0f);
+			if (mRequestingReplace) ImGui::SetKeyboardFocusHere();
+			ImGui::InputTextWithHint("##Replace", "Replace...", ctrlfTextToReplace, FIND_POPUP_TEXT_FIELD_LENGTH, ImGuiInputTextFlags_AutoSelectAll);
+			ImGui::SameLine();
+			if (ImGui::Button("Replace") && toFindTextSize > 0)
+			{
+				ClearExtraCursors();
+				if (Replace(ctrlfTextToFind, toFindTextSize, ctrlfTextToReplace, toReplaceTextSize, ctrlfCaseSensitive, ctrlfWholeWords))
+				{
+					int nextOccurrenceLine, _;
+					GetCursorPosition(nextOccurrenceLine, _);
+					CenterViewAtLine(nextOccurrenceLine);
+				}
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Replace all") && toFindTextSize > 0)
+			{
+				if (ReplaceAll(ctrlfTextToFind, toFindTextSize, ctrlfTextToReplace, toReplaceTextSize, ctrlfCaseSensitive, ctrlfWholeWords))
+				{
+					int nextOccurrenceLine, _;
+					GetCursorPosition(nextOccurrenceLine, _);
+					CenterViewAtLine(nextOccurrenceLine);
+				}
+			}
+			ImGui::PopID();
+			ImGui::EndGroup();
+		}
+
+		ImGui::PopID();
+		ImGui::EndGroup();
+		ImGui::EndChild();
+
+		mRequestingFind = false;
+		mRequestingReplace = false;
+	}
+
+	if (codeFontEditor != nullptr) ImGui::PushFont(codeFontEditor, 0.0f);
 	bool isMenuFocused = ImGui::GetCurrentContext()->NavLayer == ImGuiNavLayer_Menu;
 	isFocused |= Render("TextEditor", isFocused, isMenuFocused);
 	if (codeFontEditor != nullptr) ImGui::PopFont();
@@ -4032,15 +4357,15 @@ bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
 		if (ctrlPressed && !shiftPressed && !altPressed)
 		{
 			if (ImGui::IsKeyPressed(ImGuiKey_S, false))
-				OnSaveCommand();
+				OnSaveAllCommand();
 			if (ImGui::IsKeyPressed(ImGuiKey_R, false))
 				OnReloadCommand();
 			if (ImGui::IsKeyDown(ImGuiKey_G))
 				requestingGoToLinePopup = true;
 			if (ImGui::IsKeyDown(ImGuiKey_F))
-				requestingFindPopup = true;
+				mRequestingFind = true;
 			if (ImGui::IsKeyDown(ImGuiKey_H))
-				requestingReplacePopup = true;
+				mRequestingReplace = true;
 			if (ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::GetIO().MouseWheel > 0.0f)
 				requestingFontSizeIncrease = true;
 			if (ImGui::IsKeyPressed(ImGuiKey_Minus) || ImGui::GetIO().MouseWheel < 0.0f)
@@ -4059,7 +4384,7 @@ bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
 	{
 		static int targetLine;
 		ImGui::SetKeyboardFocusHere();
-		ImGui::InputInt("Line", &targetLine);
+		ImGui::InputInt("Line", &targetLine, 0);
 		if (ImGui::IsKeyDown(ImGuiKey_Enter) || ImGui::IsKeyDown(ImGuiKey_KeypadEnter))
 		{
 			static int targetLineFixed;
@@ -4076,79 +4401,6 @@ bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
 		ImGui::EndPopup();
 	}
 
-	if (requestingFindPopup)
-	{
-		ImGui::OpenPopup("code_editor_find_popup");
-		GetSuitableTextToFind(ctrlfTextToFind, FIND_POPUP_TEXT_FIELD_LENGTH);
-	}
-
-	if (ImGui::BeginPopup("code_editor_find_popup"))
-	{
-		ImGui::Checkbox("Case sensitive", &ctrlfCaseSensitive);
-		ImGui::Checkbox("Whole words", &ctrlfWholeWords);
-		if (requestingFindPopup)
-			ImGui::SetKeyboardFocusHere();
-		ImGui::InputText("Search for", ctrlfTextToFind, FIND_POPUP_TEXT_FIELD_LENGTH, ImGuiInputTextFlags_AutoSelectAll);
-		int toFindTextSize = strlen(ctrlfTextToFind);
-		if ((ImGui::Button("Find next") || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) && toFindTextSize > 0)
-		{
-			ClearExtraCursors();
-			if (SelectNextOccurrenceOf(ctrlfTextToFind, toFindTextSize, ctrlfCaseSensitive, ctrlfWholeWords))
-			{
-				int nextOccurrenceLine, _;
-				GetCursorPosition(nextOccurrenceLine, _);
-				CenterViewAtLine(nextOccurrenceLine);
-			}
-		}
-
-		if (ImGui::IsKeyDown(ImGuiKey_Escape))
-			ImGui::CloseCurrentPopup();
-
-		ImGui::EndPopup();
-	}
-
-	if (requestingReplacePopup)
-	{
-		ImGui::OpenPopup("code_editor_replace_popup");
-		GetSuitableTextToFind(ctrlfTextToFind, FIND_POPUP_TEXT_FIELD_LENGTH);
-	}
-
-	if (ImGui::BeginPopup("code_editor_replace_popup"))
-	{
-		ImGui::Checkbox("Case sensitive", &ctrlfCaseSensitive);
-		ImGui::Checkbox("Whole words", &ctrlfWholeWords);
-		if (requestingFindPopup)
-			ImGui::SetKeyboardFocusHere();
-		ImGui::InputText("Search for", ctrlfTextToFind, FIND_POPUP_TEXT_FIELD_LENGTH, ImGuiInputTextFlags_AutoSelectAll);
-		ImGui::InputText("Replace with", ctrlfTextToReplace, FIND_POPUP_TEXT_FIELD_LENGTH, ImGuiInputTextFlags_AutoSelectAll);
-		int toFindTextSize = strlen(ctrlfTextToFind);
-		int toReplaceTextSize = strlen(ctrlfTextToReplace);
-		if ((ImGui::Button("Replace") || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) && toFindTextSize > 0)
-		{
-			ClearExtraCursors();
-			if (Replace(ctrlfTextToFind, toFindTextSize, ctrlfTextToReplace, toReplaceTextSize, ctrlfCaseSensitive, ctrlfWholeWords, false))
-			{
-				int nextOccurrenceLine, _;
-				GetCursorPosition(nextOccurrenceLine, _);
-				CenterViewAtLine(nextOccurrenceLine);
-			}
-		}
-		ImGui::SameLine();
-		if (ImGui::Button("Replace all") && toFindTextSize > 0)
-		{
-			if (Replace(ctrlfTextToFind, toFindTextSize, ctrlfTextToReplace, toReplaceTextSize, ctrlfCaseSensitive, ctrlfWholeWords, true))
-			{
-				int nextOccurrenceLine, _;
-				GetCursorPosition(nextOccurrenceLine, _);
-				CenterViewAtLine(nextOccurrenceLine);
-			}
-		}
-		else if (ImGui::IsKeyDown(ImGuiKey_Escape))
-			ImGui::CloseCurrentPopup();
-
-		ImGui::EndPopup();
-	}
-
 	//if (requestingFontSizeIncrease && codeFontSize < FontManager::GetMaxCodeFontSize())
 	//	codeFontSize++;
 	//if (requestingFontSizeDecrease && codeFontSize > FontManager::GetMinCodeFontSize())
@@ -4159,6 +4411,10 @@ bool TextEditor::OnImGui(bool windowIsOpen, uint32_t &currentDockId)
 	return windowIsOpen;
 }
 
+void TextEditor::OnIndirectSave()
+{
+	undoIndexInDisk = GetUndoIndex();
+}
 
 void TextEditor::SetCursorPosition(int line, int column, bool center_view)
 {
@@ -4244,6 +4500,11 @@ void TextEditor::OnSaveCommand()
 		outFile.close();
 	}
 	*/
+}
+
+void TextEditor::OnSaveAllCommand()
+{
+	pushEditorRequest(EDITOR_REQ_SAVE_ALL);
 }
 
 
@@ -4394,10 +4655,20 @@ eastl::unordered_map<eastl::string, TextEditor::LanguageDefinitionId> TextEditor
 	{".das", TextEditor::LanguageDefinitionId::Daslang},
 };
 
+void TextEditor::RegisterExtensionLanguage(const eastl::string& extension, LanguageDefinitionId language)
+{
+	if (extension.empty())
+		return;
+	if (language < LanguageDefinitionId::None || language >= LanguageDefinitionId::LanguageDefinitionCount)
+		return;
+	extensionToLanguageDefinition[extension] = language;
+}
+
 eastl::unordered_map<TextEditor::LanguageDefinitionId, const char *> TextEditor::languageDefinitionToName = {
 	{TextEditor::LanguageDefinitionId::None, "None"},
 	{TextEditor::LanguageDefinitionId::Cpp, "C++"},
 	{TextEditor::LanguageDefinitionId::Daslang, "Daslang"},
+	{TextEditor::LanguageDefinitionId::Blk, "BLK"},
 };
 
 eastl::unordered_map<TextEditor::PaletteId, const char *> TextEditor::colorPaletteToName = {

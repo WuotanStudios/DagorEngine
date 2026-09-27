@@ -29,7 +29,7 @@ int DagorWinMain(bool debugmode)
   if (dgs_argc < 2 || dgs_argc > 3)
   {
     printf("imageReadTest tool\n"
-           "Copyright (C) Gaijin Games KFT, 2025\n\n");
+           "Copyright (C) Gaijin Games KFT, 2026\n\n");
     printf("usage: imageReadTest-dev.exe source_image_filename [dest_tga_filename]\n");
     return -1;
   }
@@ -98,5 +98,3 @@ int DagorWinMain(bool debugmode)
 #define __UNLIMITED_BASE_PATH 1
 #define __DEBUG_FILEPATH      "*"
 #include <startup/dag_mainCon.inc.cpp>
-
-size_t dagormem_max_crt_pool_sz = 512 << 20;

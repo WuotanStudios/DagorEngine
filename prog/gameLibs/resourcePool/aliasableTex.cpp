@@ -1,10 +1,12 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
+#include <drv/3d/dag_resetDevice.h>
 #include <resourcePool/aliasableTex.h>
 #include <debug/dag_debug.h>
 #include <EASTL/fixed_string.h>
 #include <EASTL/algorithm.h>
+#include <EASTL/unique_ptr.h>
 #include <drv/3d/dag_texture.h>
 
 namespace resptr_detail
@@ -34,17 +36,33 @@ void AliasableManagedTex2D::recreate(int width, int height, int flags, int level
         "recreated",
     originalTexture->getTexName());
 
-  BaseTexture *previous =
-    eastl::exchange(mResource, d3d::create_tex(nullptr, width, height, flags, levels, originalTexture->getTexName()));
+  BaseTexture *previous = eastl::exchange(mResource,
+    d3d::create_tex(nullptr, width, height, flags, levels, originalTexture->getTexName(), RESTAG_ALIASABLE));
 
   G_ASSERT(mResource);
   change_managed_texture(mResId, mResource);
+  ShaderGlobal::sync_managed_resource(mResId, previous);
 
   currentKey = new_key;
   originalTexture = mResource;
 
   aliasesMap.clear();
   del_d3dres(previous);
+}
+
+// the alias cache is only valid for the device generation it was built on: a device
+// recovery recreates every texture independently, so old aliases no longer share memory.
+// The counter also advances on mode resets, where dropping the cache only costs a re-alias
+void AliasableManagedTex2D::resetAliasCacheIfStale()
+{
+  const uint32_t generation = get_d3d_reset_counter();
+  if (lastResId == mResId && lastResetGeneration == generation)
+    return;
+
+  aliasesMap.clear();
+  calcKey();
+  originalTexture = mResource;
+  lastResetGeneration = generation;
 }
 
 using namespace aliasable_detail;
@@ -64,12 +82,7 @@ static UniqueBaseTex extract_existing(key_t key, AliasableManagedTex2D::AliasMap
 
 void AliasableManagedTex2D::alias(int width, int height, int flags, int levels)
 {
-  if (lastResId != mResId)
-  {
-    aliasesMap.clear();
-    calcKey();
-    originalTexture = mResource;
-  }
+  resetAliasCacheIfStale();
 
   const key_t newKey = make_key(width, height, flags, levels);
   if (currentKey == newKey)
@@ -106,6 +119,7 @@ void AliasableManagedTex2D::alias(int width, int height, int flags, int levels)
 
   change_managed_texture(mResId, mResource);
   d3d::resource_barrier({{previous, mResource}, {RB_ALIAS_FROM, RB_ALIAS_TO_AND_DISCARD}, {0, 0}, {0, 0}});
+  ShaderGlobal::sync_managed_resource(mResId, previous);
 
   currentKey = newKey;
   lastResId = mResId;
@@ -113,12 +127,7 @@ void AliasableManagedTex2D::alias(int width, int height, int flags, int levels)
 
 void AliasableManagedTex2D::resize(int width, int height)
 {
-  if (lastResId != mResId)
-  {
-    aliasesMap.clear();
-    calcKey();
-    originalTexture = mResource;
-  }
+  resetAliasCacheIfStale();
 
   TextureInfo tex_info;
   originalTexture->getinfo(tex_info);
@@ -148,6 +157,12 @@ void AliasableManagedTex2D::resize(int width, int height)
   {
     recreate(width, height, tex_info.cflg, tex_info.mipLevels, newKey);
   }
+}
+
+void AliasableManagedTex2D::resetDefaultSize()
+{
+  if (defaultWidth > 0 && defaultHeight > 0)
+    resize(defaultWidth, defaultHeight);
 }
 
 uint32_t AliasableManagedTex2D::getResSizeBytes() const

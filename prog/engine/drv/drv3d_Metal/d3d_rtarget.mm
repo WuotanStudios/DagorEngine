@@ -13,6 +13,7 @@
 #include <image/dag_texPixel.h>
 #include <drv/3d/dag_renderPass.h>
 #include <drv/3d/dag_renderTarget.h>
+#include <drv/shadersMetaData/renderPassLowering.h>
 
 #include <vecmath/dag_vecMath.h>
 #include <math/dag_vecMathCompatibility.h>
@@ -23,8 +24,19 @@
 #include "textureloader.h"
 #include "drv_log_defs.h"
 #include "drv_assert_defs.h"
+#include "renderPassValidation.h"
+#include <validateUpdateSubRegion.h>
 
 using namespace drv3d_metal;
+
+// The backbuffer is a stable proxy texture, so it is stored in color0 like any other target and
+// tested by pointer. Do not bring back a null color0 as a second spelling for it: two spellings for
+// one target compare as different render targets and break the render encoder on a bind that
+// changes nothing.
+static bool is_backbuffer_color(const Driver3dRenderTarget &rt)
+{
+  return (rt.used & Driver3dRenderTarget::COLOR0) && rt.color[0].tex == d3d::get_backbuffer_tex();
+}
 
 struct TrackDriver3dRenderTarget : public Driver3dRenderTarget
 {
@@ -37,7 +49,7 @@ struct TrackDriver3dRenderTarget : public Driver3dRenderTarget
       return false;
     }
 
-    if (used&DEPTH && depth.tex != a.depth.tex || depth.face != a.depth.face || depth.level != a.depth.level)
+    if (used&DEPTH && (depth.tex != a.depth.tex || depth.face != a.depth.face || depth.level != a.depth.level))
     {
       return false;
     }
@@ -52,11 +64,6 @@ struct TrackDriver3dRenderTarget : public Driver3dRenderTarget
     if (!used_left)
     {
       return true;
-    }
-
-    if (isBackBufferColor() != a.isBackBufferColor())
-    {
-      return false;
     }
 
     for (uint32_t ri = 0; used_left; used_left >>= 1, ri++)
@@ -80,7 +87,7 @@ struct TrackDriver3dRenderTarget : public Driver3dRenderTarget
       return false;
     }
 
-    if (isBackBufferColor() && a.srgb_bb != srgb_bb)
+    if (is_backbuffer_color(*this) && a.srgb_bb != srgb_bb)
     {
       return false;
     }
@@ -124,6 +131,7 @@ struct RenderPass
       uint32_t index = ~0u;
       uint32_t resolve_index = ~0u;
       MTLLoadAction load_action = MTLLoadActionDontCare;
+      MTLLoadAction stencil_load_action = MTLLoadActionDontCare;
       MTLStoreAction store_action = MTLStoreActionDontCare;
     };
     struct PassInput
@@ -156,8 +164,8 @@ static inline bool is_depth_format(unsigned int f)
 
 bool setRtState(TrackDriver3dRenderTarget &oldrt, TrackDriver3dRenderTarget &rt)
 {
-  bool isBackBufferColor = rt.isBackBufferColor();
-  if (isBackBufferColor && (!oldrt.isBackBufferColor() ||
+  bool isBackBufferColor = is_backbuffer_color(rt);
+  if (isBackBufferColor && (!is_backbuffer_color(oldrt) ||
     (rt.used&Driver3dRenderTarget::COLOR_MASK) != (oldrt.used&Driver3dRenderTarget::COLOR_MASK)))
     render.restoreRT();
 
@@ -200,7 +208,7 @@ bool setRtState(TrackDriver3dRenderTarget &oldrt, TrackDriver3dRenderTarget &rt)
 
   if (!rt.isDepthUsed())// && oldrt.isDepthUsed())
   {
-    render.setDepth(drv3d_metal::RenderAttachment { .store_action = MTLStoreActionDontCare });
+    render.setDepth(drv3d_metal::RenderAttachment { .store_action = MTLStoreActionDontCare }, drv3d_metal::RenderAttachment { .store_action = MTLStoreActionDontCare });
   }
   else
   if (rt.isDepthUsed())
@@ -223,12 +231,7 @@ bool setRtState(TrackDriver3dRenderTarget &oldrt, TrackDriver3dRenderTarget &rt)
       }
 
     }
-    render.setDepth(attach);
-
-    if (!rt.isColorUsed())
-    {
-      //NULL RT
-    }
+    render.setDepth(attach, attach);
   }
 
   return true;
@@ -330,7 +333,9 @@ bool d3d::clearview(int what, E3DCOLOR c, float z, uint32_t stencil)
 
 bool d3d::set_render_target()
 {
-  nextRtState.setBackbufColor();
+  for (int i = 0; i < Driver3dRenderTarget::MAX_SIMRT; ++i)
+    nextRtState.removeColor(i);
+  nextRtState.setColor(0, d3d::get_backbuffer_tex(), 0, 0);
   nextRtState.removeDepth();
   nextRtState.changed = true;
 
@@ -352,16 +357,6 @@ bool d3d::set_depth(BaseTexture *tex, int face, DepthAccess access)
   return true;
 }
 
-bool d3d::set_render_target(int rt_index, BaseTexture* rt, uint8_t level)
-{
-  return set_render_target_impl(rt_index, rt, level, 0);
-}
-
-bool d3d::set_render_target(int rt_index, BaseTexture* rt, int fc, uint8_t level)
-{
-  return set_render_target_impl(rt_index, rt, level, fc);
-}
-
 void d3d::get_render_target(Driver3dRenderTarget& out_rt)
 {
   out_rt = nextRtState;
@@ -377,6 +372,32 @@ bool d3d::set_render_target(const Driver3dRenderTarget& rt)
   return true;
 }
 
+// Bulk setter: sets all color targets, clears unused slots, and sets depth in one call.
+void d3d::set_render_target(RenderTarget depth, DepthAccess depth_access, dag::ConstSpan<RenderTarget> colors)
+{
+  nextRtState.changed = true;
+  vp.used = false;
+
+  D3D_CONTRACT_ASSERTF(colors.size() <= Driver3dRenderTarget::MAX_SIMRT, "Metal: too many color render targets: %d, max %d",
+    colors.size(), Driver3dRenderTarget::MAX_SIMRT);
+
+  int i = 0;
+  for (; i < colors.size() && i < Driver3dRenderTarget::MAX_SIMRT; ++i)
+  {
+    if (colors[i].tex)
+      nextRtState.setColor(i, colors[i].tex, colors[i].mip_level, colors[i].layer);
+    else
+      nextRtState.removeColor(i);
+  }
+  for (; i < Driver3dRenderTarget::MAX_SIMRT; ++i)
+    nextRtState.removeColor(i);
+
+  if (depth.tex)
+    nextRtState.setDepth(depth.tex, depth.layer, depth_access == DepthAccess::SampledRO);
+  else
+    nextRtState.removeDepth();
+}
+
 bool d3d::get_target_size(int &w, int &h)
 {
   TrackDriver3dRenderTarget* rt = &currentRtState;
@@ -386,7 +407,7 @@ bool d3d::get_target_size(int &w, int &h)
     rt = &nextRtState;
   }
 
-  if (rt->isBackBufferColor())
+  if (is_backbuffer_color(*rt))
   {
     d3d::get_screen_size(w, h);
     return true;
@@ -488,7 +509,7 @@ bool d3d::getview(int &x, int &y, int &w, int &h, float &minz, float &maxz)
     rs = &nextRtState;
   }
 
-  if (rs->isBackBufferColor())
+  if (is_backbuffer_color(*rs))
   {
     w = render.scr_wd;
     h = render.scr_ht;
@@ -533,6 +554,25 @@ float d3d::get_screen_aspect_ratio()
   return (float)render.scr_wd / (float)render.scr_ht;
 }
 
+int d3d::update_sub_region(::BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d, ::BaseTexture *dst, int dst_subres_idx, int dst_x, int dst_y, int dst_z)
+{
+  drv3d_metal::Texture *dtex = (drv3d_metal::Texture *)dst;
+  D3D_CONTRACT_ASSERT(!dtex->isStub());
+
+  if (!validate_update_sub_region_params(src, src_subres_idx, src_x, src_y, src_z, src_w, src_h, src_d, dst, dst_subres_idx, dst_x,
+        dst_y, dst_z))
+    return 0;
+
+  render.copyTexRegion((drv3d_metal::Texture *)src, src_subres_idx, src_x, src_y, src_z, src_w, src_h, src_d, dtex, dst_subres_idx,
+    dst_x, dst_y, dst_z);
+  return 1;
+}
+
+int d3d::update_sub_region_no_order(::BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d, ::BaseTexture *dst, int dst_subres_idx, int dst_x, int dst_y, int dst_z)
+{
+  return d3d::update_sub_region(src, src_subres_idx, src_x, src_y, src_z, src_w, src_h, src_d, dst, dst_subres_idx, dst_x, dst_y, dst_z);
+}
+
 bool d3d::stretch_rect(BaseTexture *src, BaseTexture *dst, const RectInt *rsrc, const RectInt *rdst)
 {
   if (!src)
@@ -555,7 +595,7 @@ bool d3d::copy_from_current_render_target(BaseTexture* to_tex)
 {
   TrackDriver3dRenderTarget* rs = nextRtState.changed ? &nextRtState : &currentRtState;
 
-  drv3d_metal::Texture* src = rs->isBackBufferColor() ? render.backbuffer : (drv3d_metal::Texture*)rs->color[0].tex;
+  drv3d_metal::Texture* src = (drv3d_metal::Texture*)rs->color[0].tex;
   D3D_CONTRACT_ASSERT(src);
   render.copyTex(src, (drv3d_metal::Texture*)to_tex);
 
@@ -603,7 +643,7 @@ void RenderPass::bind()
     nextRtState.removeColor(index);
   }
   nextRtState.removeDepth();
-  render.setDepth({});
+  render.setDepth({}, {});
 
   int samples = -1, layers = -1;
   for (auto &color : pass.colors)
@@ -615,9 +655,13 @@ void RenderPass::bind()
 
   if (pass.depth_stencil.index != ~0u)
   {
-    auto attach = toRenderAttachment(pass.depth_stencil, active->textures);
-    render.setDepth(attach);
-    set_depth_impl(attach.resolve_target ? attach.resolve_target : attach.texture, attach.layer, attach.store_action == MTLStoreActionDontCare);
+    const RenderPassTarget &target = active->textures[pass.depth_stencil.index];
+    auto depth = toRenderAttachment(pass.depth_stencil, active->textures);
+    auto stencil = depth;
+    stencil.load_action = pass.depth_stencil.stencil_load_action;
+    stencil.clear_value[0] = target.clearValue.asStencil;
+    render.setDepth(depth, stencil);
+    set_depth_impl(depth.resolve_target ? depth.resolve_target : depth.texture, depth.layer, depth.store_action == MTLStoreActionDontCare);
   }
 
   for (auto &tex : pass.inputs)
@@ -652,22 +696,30 @@ static uint32_t decodeSubpassAction(RenderPass::Subpass &pass, uint32_t action, 
   return bind.target;
 }
 
-static MTLLoadAction decodeLoadAction(RenderPass::Subpass &pass, uint32_t load_action, const RenderPassBind &bind)
+static void decodeLoadAction(RenderPass::Subpass::Attachment &attach, const RenderPassBind &bind)
 {
-  switch (load_action)
+  uint32_t load_action = bind.action & RP_TA_LOAD_MASK;
+  if (load_action == RP_TA_NONE)
   {
-    case RP_TA_NONE:
-      return MTLLoadActionLoad;
-    case RP_TA_LOAD_READ:
-      return MTLLoadActionLoad;
-    case RP_TA_LOAD_CLEAR:
-      return MTLLoadActionClear;
-    case RP_TA_LOAD_NO_CARE:
-      return MTLLoadActionDontCare;
-    default:
-      G_ASSERTF(0, "Unknown subpass load action %d for subpass %d", load_action, bind.subpass);
+    attach.load_action = MTLLoadActionLoad;
+    attach.stencil_load_action = MTLLoadActionLoad;
   }
-  return MTLLoadActionDontCare;
+  else
+  {
+    if (load_action & RP_TA_LOAD_READ)
+      attach.stencil_load_action = attach.load_action = MTLLoadActionLoad;
+    else if (load_action & RP_TA_LOAD_CLEAR)
+      attach.stencil_load_action = attach.load_action = MTLLoadActionClear;
+    else if (load_action & RP_TA_LOAD_NO_CARE)
+      attach.stencil_load_action = attach.load_action = MTLLoadActionDontCare;
+
+    if (load_action & RP_TA_LOAD_STENCIL_READ)
+      attach.stencil_load_action = MTLLoadActionLoad;
+    else if (load_action & RP_TA_LOAD_STENCIL_CLEAR)
+      attach.stencil_load_action = MTLLoadActionClear;
+    else if (load_action & RP_TA_LOAD_STENCIL_NO_CARE)
+      attach.stencil_load_action = MTLLoadActionDontCare;
+  }
 }
 
 static MTLStoreAction decodeStoreAction(RenderPass::Subpass &pass, uint32_t store_action, const RenderPassBind &bind)
@@ -689,12 +741,14 @@ static MTLStoreAction decodeStoreAction(RenderPass::Subpass &pass, uint32_t stor
 
 RenderPass *create_render_pass(const RenderPassDesc &rp_desc)
 {
+  if (!validate_render_pass_desc(rp_desc))
+    return nullptr;
+
   RenderPass* rp = new RenderPass;
 
   int subpass_count = -1;
   for (uint32_t i = 0; i < rp_desc.bindCount; ++i)
     subpass_count = std::max(subpass_count, rp_desc.binds[i].subpass);
-  D3D_CONTRACT_ASSERTF(subpass_count >= 0, "Render pass %s doesn't have any passes", rp_desc.debugName ? rp_desc.debugName : "(unknown)");
 
   rp->name = rp_desc.debugName ? rp_desc.debugName : "unknown rp";
   rp->textures.resize(rp_desc.targetCount);
@@ -717,7 +771,6 @@ RenderPass *create_render_pass(const RenderPassDesc &rp_desc)
       continue;
 
     uint32_t subpass_action = bind.action & RP_TA_SUBPASS_MASK;
-    uint32_t load_action = bind.action & RP_TA_LOAD_MASK;
     uint32_t store_action = bind.action & RP_TA_STORE_MASK;
 
     RenderPass::Subpass &pass = rp->subpasses[render.has_image_blocks ? 0 : bind.subpass];
@@ -725,21 +778,24 @@ RenderPass *create_render_pass(const RenderPassDesc &rp_desc)
     {
       RenderPass::Subpass::Attachment attach;
       attach.index = bind.target;
-      attach.load_action = decodeLoadAction(pass, load_action, bind);
+      decodeLoadAction(attach, bind);
       attach.store_action = decodeStoreAction(pass, store_action, bind);
       if (subpass_action == RP_TA_SUBPASS_WRITE)
         attach.store_action = MTLStoreActionStore;
 
       if (subpass_action == RP_TA_SUBPASS_READ)
       {
-        RenderPass::Subpass::PassInput input;
-        input.dst_slot = bind.slot + rp_desc.subpassBindingOffset;
-        input.src_slot = bind.target;
-
         if (bind.slot == RenderPassExtraIndexes::RP_SLOT_DEPTH_STENCIL)
           pass.depth_stencil = attach;
         else
+        {
+          G_ASSERTF_CONTINUE(subpass_read_fits_window(MAX_SHADER_TEXTURES, bind.slot),
+            "subpass read slot %d is out of the T register window in bind %u of render pass '%s'", bind.slot, i, rp->name.c_str());
+          RenderPass::Subpass::PassInput input;
+          input.dst_slot = subpass_read_register(MAX_SHADER_TEXTURES, bind.slot);
+          input.src_slot = bind.target;
           pass.inputs.push_back(input);
+        }
       }
       else if (subpass_action == RP_TA_SUBPASS_RESOLVE)
       {
@@ -762,7 +818,7 @@ RenderPass *create_render_pass(const RenderPassDesc &rp_desc)
 
       int index = bind.slot != RenderPassExtraIndexes::RP_SLOT_DEPTH_STENCIL ? bind.target : Program::MAX_SIMRT;
       if (bind.action & RP_TA_LOAD_MASK)
-        attachments[index].load_action = decodeLoadAction(pass, load_action, bind);
+        decodeLoadAction(attachments[index], bind);
       if (bind.action & RP_TA_STORE_MASK)
         attachments[index].store_action = decodeStoreAction(pass, store_action, bind);
 
@@ -789,13 +845,15 @@ void delete_render_pass(RenderPass *rp)
   delete rp;
 }
 
-void begin_render_pass(RenderPass *rp, const RenderPassArea area, const RenderPassTarget *targets)
+void begin_render_pass(RenderPass *rp, const RenderPassArea area, dag::ConstSpan<RenderPassTarget> targets)
 {
   D3D_CONTRACT_ASSERT(rp);
   D3D_CONTRACT_ASSERT(RenderPass::active == nullptr);
   RenderPass::active = rp;
 
-  for (size_t i = 0; i < rp->textures.size(); ++i)
+  D3D_CONTRACT_ASSERTF(rp->textures.size() == targets.size(),
+    "missing/excessive targets for rp %s, expected %u got %u", rp->name, rp->textures.size(), targets.size());
+  for (size_t i = 0; i < targets.size(); ++i)
     rp->textures[i] = targets[i];
   rp->area = area;
 
@@ -811,7 +869,10 @@ void next_subpass()
   D3D_CONTRACT_ASSERT(RenderPass::active_subpass + 1 < RenderPass::active->subpasses.size());
   RenderPass::active_subpass++;
   if (render.has_image_blocks == false)
+  {
     RenderPass::bind();
+    render.updateEncoder();
+  }
   else
   {
     render.setViewport(RenderPass::active->area.left, RenderPass::active->area.top, RenderPass::active->area.width, RenderPass::active->area.height, RenderPass::active->area.minZ, RenderPass::active->area.maxZ);

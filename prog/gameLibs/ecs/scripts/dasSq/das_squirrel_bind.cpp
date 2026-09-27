@@ -1,20 +1,21 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <dasModules/dasModulesCommon.h>
-#include <quirrel/sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
 
 
 namespace das
 {
-extern void register_bound_funcs(HSQUIRRELVM vm, function<void(const char *module_name, HSQOBJECT tab)> cb);
+extern void register_bound_funcs(HSQUIRRELVM vm, daScriptEnvironment *environment,
+  function<void(const char *module_name, HSQOBJECT tab)> cb);
 }
 
 namespace bind_dascript
 {
-void bind_das(SqModules *modules_mgr)
+void bind_das(SqModules *modules_mgr, das::daScriptEnvironment *environment)
 {
   HSQUIRRELVM vm = modules_mgr->getVM();
-  das::register_bound_funcs(vm, [&](const char *module_name, HSQOBJECT tab) {
+  das::register_bound_funcs(vm, environment, [&](const char *module_name, HSQOBJECT tab) {
     Sqrat::Table dasBindings(tab, vm);
     if (Sqrat::Object *existingModule = modules_mgr->findNativeModule(module_name))
     {

@@ -43,7 +43,8 @@ public:
         } blend[shaders::RenderState::NumIndependentBlendParameters];
 
         uint32_t writeMask;
-        uint8_t a2c;
+        uint8_t a2c : 4 = 0;
+        uint8_t is_dual_blend : 4 = 0;
         uint8_t pad[2];
       };
       uint8_t state[RasterizerStateSizeInBytes];
@@ -65,7 +66,7 @@ public:
     {
       for (int i = 0; i < MAX_SIMRT; i++)
       {
-        pixelFormat[0] = MTLPixelFormatInvalid;
+        pixelFormat[i] = MTLPixelFormatInvalid;
       }
 
       for (int i = 0; i < BUFFER_POINT_COUNT; i++)
@@ -108,11 +109,21 @@ public:
 
   VDecl *vdecl = nullptr;
 
-  Shader *vshader = nullptr;
-  Shader *pshader = nullptr;
-  Shader *cshader = nullptr;
-  Shader *mshader = nullptr;
-  Shader *ashader = nullptr;
+  union
+  {
+    // the order matters
+    struct
+    {
+      Shader *cshader = nullptr;
+      Shader *pshader = nullptr;
+      Shader *vshader = nullptr;
+      Shader *mshader = nullptr;
+      Shader *ashader = nullptr;
+    };
+    Shader *shaders[STAGE_TOTAL];
+  };
+
+  eastl::string name = "(none)";
 
   id<MTLComputePipelineState> csPipeline;
 

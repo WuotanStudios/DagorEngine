@@ -5,7 +5,8 @@
 #include <osApiWrappers/dag_miscApi.h>
 #include <ioSys/dag_dataBlock.h>
 #include <drv/3d/dag_vertexIndexBuffer.h>
-#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
+#include <drv_assert_defs.h>
 
 #include "drv_log_defs.h"
 #include "render.h"
@@ -281,6 +282,7 @@ namespace drv3d_metal
       render.rt.colors[i] = {};
 
     render.rt.depth = {};
+    render.rt.stencil = {};
     render.need_change_rt = 1;
     render.cached_viewport.originX = -FLT_MAX;
     render.checkNoRenderPass();
@@ -303,6 +305,7 @@ namespace drv3d_metal
     Program::RenderState old_rstate;
     Render::DepthState old_depthstate;
     Render::RenderTargetConfig old_rt;
+    uint8_t old_stencil_ref = 0;
 
     Render::StageBinding::TextureSlot old_texture;
 
@@ -326,7 +329,7 @@ namespace drv3d_metal
     int vs_cbuffer_num_stored = 0;
     int ps_cbuffer_num_stored = 0;
 
-    StateSaver(Render& render, bool save_tex, bool save_rt, bool color_write, bool depth_write)
+    StateSaver(Render& render, bool save_tex, bool save_rt, bool color_write, bool depth_write, bool stencil_write = false, uint8_t stencil = 0)
       : save_tex(save_tex)
       , save_rt(save_rt)
     {
@@ -335,6 +338,7 @@ namespace drv3d_metal
       old_rt = render.rt;
       old_cull = render.cur_cull;
       old_fill = render.cur_fill;
+      old_stencil_ref = render.stencil_ref;
 
       Render::StageBinding &old_vs_stage = render.stages[STAGE_VS];
       Render::StageBinding &old_ps_stage = render.stages[STAGE_PS];
@@ -352,7 +356,19 @@ namespace drv3d_metal
       render.cur_depthstate.zenable = depth_write ? 1 : 0;
       render.cur_depthstate.depth_write_on = depth_write ? 1 : 0;
       render.cur_depthstate.zfunc = MTLCompareFunctionAlways;
+
+      render.cur_depthstate.stencil_enable = stencil_write ? 1 : 0;
+      render.cur_depthstate.stencil_func = MTLCompareFunctionAlways;
+      render.cur_depthstate.stencil_read_mask = 0xff;
+      render.cur_depthstate.stencil_write_mask = 0xff;
+      render.cur_depthstate.sfail = MTLStencilOperationReplace;
+      render.cur_depthstate.szfail = MTLStencilOperationReplace;
+      render.cur_depthstate.spass = MTLStencilOperationReplace;
+      render.stencil_ref = stencil;
+
       render.dirty_state |= DirtyFlags::DepthState;
+      if (render.stencil_ref != old_stencil_ref)
+        render.dirty_state |= DirtyFlags::StencilRef;
 
       render.setCull(MTLCullModeNone);
       render.setFill(MTLTriangleFillModeFill);
@@ -361,6 +377,7 @@ namespace drv3d_metal
         render.cur_rstate.raster_state.blend[i].ablend = false;
       render.cur_rstate.raster_state.writeMask = color_write ? 0xffffffff : MTLColorWriteMaskNone;
       render.cur_rstate.raster_state.a2c = 0;
+      render.cur_rstate.raster_state.is_dual_blend = 0;
       render.cur_rstate.raster_state.pad[0] = render.cur_rstate.raster_state.pad[1] = 0;
 
       scissor_on = render.scissor_on;
@@ -382,14 +399,19 @@ namespace drv3d_metal
       render.cur_depthstate.zfunc = old_depthstate.zfunc;
       render.dirty_state |= DirtyFlags::DepthState;
 
+      if (render.stencil_ref != old_stencil_ref)
+        render.dirty_state |= DirtyFlags::StencilRef;
+      render.stencil_ref = old_stencil_ref;
+
       for (int i = 0; i < shaders::RenderState::NumIndependentBlendParameters; ++i)
         render.cur_rstate.raster_state.blend[i].ablend = old_rstate.raster_state.blend[i].ablend;
       render.cur_rstate.raster_state.writeMask = old_rstate.raster_state.writeMask;
       render.cur_rstate.raster_state.a2c = 0;
+      render.cur_rstate.raster_state.is_dual_blend = 0;
       render.cur_rstate.raster_state.pad[0] = render.cur_rstate.raster_state.pad[1] = 0;
       render.cur_rstate.vbuffer_stride[0] = old_rstate.vbuffer_stride[0];
 
-      render.stages[STAGE_VS].setBuf(render.storages[STAGE_VS], 0, old_buffers_0, old_buffers_offset_0);
+      render.stages[STAGE_VS].setBuf(render.storages[STAGE_VS], render.cur_prog ? render.cur_prog->shaders[STAGE_VS] : nullptr, 0, old_buffers_0, old_buffers_offset_0);
       render.setCull(old_cull);
       render.setFill(old_fill);
 
@@ -403,7 +425,7 @@ namespace drv3d_metal
       }
 
       if (save_tex)
-        render.stages[STAGE_PS].setTex(render.storages[STAGE_PS], 0, old_texture.texture, old_texture.read_stencil, old_texture.mip_level, old_texture.slice, old_texture.as_uint);
+        render.stages[STAGE_PS].setTex(render.storages[STAGE_PS], render.cur_prog ? render.cur_prog->shaders[STAGE_PS] : nullptr, 0, old_texture.texture, old_texture.mip_level, old_texture.slice, old_texture.as_uint);
 
       memcpy(render.stages[STAGE_VS].cbuffer.cbuffer, vs_cbuffer, 16);
       memcpy(render.stages[STAGE_PS].cbuffer.cbuffer, ps_cbuffer, 16);
@@ -425,9 +447,6 @@ namespace drv3d_metal
     return tex->base_format == TEXFMT_R32SI;
   }
 
-#if DAGOR_DBGLEVEL > 0
-  #define ADD_SIGNPOSTS 1
-
   static const char * MTLCommandEncoderErrorStateToString(MTLCommandEncoderErrorState state)
   {
      switch (state)
@@ -445,48 +464,72 @@ namespace drv3d_metal
      }
      return "unknown";
    }
-#endif
 
   static id<MTLCommandBuffer> createCommandBuffer(id<MTLCommandQueue> queue, const char* name)
   {
     id<MTLCommandBuffer> cmdBuf = nil;
-#if DAGOR_DBGLEVEL > 0
-    MTLCommandBufferDescriptor* desc = [[MTLCommandBufferDescriptor alloc] init];
-    desc.retainedReferences = NO;
-    desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
-    cmdBuf = [queue commandBufferWithDescriptor:desc];
-    [desc release];
+    if (render.enable_postmortem)
+    {
+      MTLCommandBufferDescriptor* desc = [[MTLCommandBufferDescriptor alloc] init];
+      desc.retainedReferences = NO;
+      desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+      cmdBuf = [queue commandBufferWithDescriptor:desc];
+      [desc release];
 
-    [cmdBuf addCompletedHandler : ^ (id<MTLCommandBuffer> buffer)
-    {
-      NSError *error = buffer.error;
-      if (error)
-      {
-        logerr("[METAL] Achtung! command buffer %s failed to execute\nerror summary: %s", [buffer.label UTF8String], [error.localizedDescription UTF8String]);
-        NSArray<id<MTLCommandBufferEncoderInfo>>* infos = error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
-        for (id<MTLCommandBufferEncoderInfo> info in infos)
+      [cmdBuf addCompletedHandler : ^ (id<MTLCommandBuffer> buffer)
+       {
+        // API validation environment variable /wo XCODE : MTL_DEBUG_LAYER=1
+        NSError *error = buffer.error;
+        if (error)
         {
-          debug("[METAL] encoder %s, status %s", [info.label UTF8String], MTLCommandEncoderErrorStateToString(info.errorState));
-          auto signposts = [info.debugSignposts componentsJoinedByString:@", "];
-          if (signposts.length > 0u && info.errorState == MTLCommandEncoderErrorStateFaulted)
-            debug("[METAL] faulted encoder signposts %s", [signposts UTF8String]);
+          NSArray<id<MTLCommandBufferEncoderInfo>>* infos = error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+          for (id<MTLCommandBufferEncoderInfo> info in infos)
+          {
+            debug("[METAL] encoder %s, status %s", [info.label UTF8String], MTLCommandEncoderErrorStateToString(info.errorState));
+            auto signposts = [info.debugSignposts componentsJoinedByString:@", "];
+            if (signposts.length > 0u && info.errorState == MTLCommandEncoderErrorStateFaulted)
+              debug("[METAL] faulted encoder signposts %s", [signposts UTF8String]);
+          }
+          debug("[METAL] queued stuff");
         }
-      }
-    }];
-    {
-      std::unique_lock<std::mutex> lock(render.frame_mutex);
-      uint64_t submit_number = render.submits_scheduled;
-      cmdBuf.label = [NSString stringWithFormat:@"%s %llu (%llu)", name, render.frame, submit_number];
-    }
-#else
-    cmdBuf = [queue commandBufferWithUnretainedReferences];
+        {
+          std::lock_guard<std::mutex> scopedLock(render.command_buffer_mutex);
+          if (error)
+          {
+            const auto &manual_signposts = render.command_buffers[buffer];
+            for (const auto &str : manual_signposts)
+              debug("[METAL] %s", str.c_str());
+          }
+          render.command_buffers.erase(buffer);
+        }
+        if (error)
+          LOGERR_ONCE("[METAL] Achtung! command buffer %s failed to execute\nerror summary: %s", [buffer.label UTF8String], [error.localizedDescription UTF8String]);
+#if DAGOR_DBGLEVEL > 0
+        // Shader validation environment variable /wo XCODE : MTL_SHADER_VALIDATION=1
+        id<MTLLogContainer> logs = buffer.logs;
+        if (logs != nil)
+          for (id<MTLFunctionLog> log in logs)
+            debug("[METAL] GPUDebug %s", [log.description UTF8String]);
 #endif
+      }];
+#if DAGOR_DBGLEVEL > 0
+      {
+        std::unique_lock<std::mutex> lock(render.frame_mutex);
+        uint64_t submit_number = render.submits_scheduled;
+        cmdBuf.label = [NSString stringWithFormat:@"%s %llu (%llu)", name, render.frame, submit_number];
+      }
+#endif
+    }
+    else
+    {
+      cmdBuf = [queue commandBufferWithUnretainedReferences];
+    }
     return [cmdBuf retain];
   }
 
   static void setupCommadBufferErrorHandler(id<MTLCommandBuffer> commandBuffer)
   {
-    if (render.max_number_of_frames_to_skip_after_error == 0 && !render.report_gpu_errors)
+    if (!render.report_gpu_errors)
       return;
     [commandBuffer addCompletedHandler : ^ (id<MTLCommandBuffer> buffer)
     {
@@ -576,7 +619,9 @@ namespace drv3d_metal
       render.nextSubmittedSample = render.nextSample;
     }
 
-    setupCommadBufferErrorHandler(commandBuffer);
+    if (!render.enable_postmortem)
+      setupCommadBufferErrorHandler(commandBuffer);
+
     [commandBuffer commit];
 
     if (wait)
@@ -622,6 +667,8 @@ namespace drv3d_metal
             G_ASSERT(render.computeEncoder);
             [render.computeEncoder setSamplerState : res.metal_resource atIndex : res.slot];
           }
+          else
+            G_ASSERT(0 && "Uknown stage");
           break;
         case Render::Resource::Type::Texture:
           if (res.resource)
@@ -640,6 +687,8 @@ namespace drv3d_metal
             G_ASSERT(render.computeEncoder);
             [render.computeEncoder setTexture : res.metal_resource atIndex : res.slot];
           }
+          else
+            G_ASSERT(0 && "Uknown stage");
           break;
         case Render::Resource::Type::Buffer:
           if (res.resource)
@@ -674,6 +723,8 @@ namespace drv3d_metal
             else
               [render.computeEncoder setBuffer : res.metal_resource offset : res.offset atIndex : res.slot];
           }
+          else
+            G_ASSERT(0 && "Uknown stage");
           break;
       }
     }
@@ -716,6 +767,36 @@ namespace drv3d_metal
     num_stored = 0;
   }
 
+  void Render::StageBinding::apply_biases(StageStorage &storage, Shader *shader, ResourceArray &resources)
+  {
+    uint32_t size = (StageStorage::MAX_SAMPLERS + render.bindlessSamplerBiases.size()) * sizeof(float);
+
+    G_ASSERT(shader);
+    for (int i = 0; i < shader->num_samplers; i++)
+    {
+      int slot = shader->sampler_binding[i];
+      uint32_t tslot = shader->sampler_remap[i];
+      G_ASSERT(slot < StageStorage::MAX_SAMPLERS);
+      G_ASSERT(tslot < StageStorage::MAX_SAMPLERS);
+      sampler_biases_remapped[tslot] = sampler_biases[slot];
+    }
+
+    if (storage.samplers_bound == size && memcmp(sampler_biases_remapped, storage.sampler_biases, size) == 0)
+      return;
+
+    int offset = -1;
+    id<MTLBuffer> buf = render.AllocateConstants(size, offset);
+    uint8_t* ptr = (uint8_t*)buf.contents + offset;
+    G_ASSERT(offset + size <= RingBufferItem::max_constant_size);
+
+    memcpy(ptr, sampler_biases_remapped, size);
+    memcpy(storage.sampler_biases, sampler_biases_remapped, size);
+
+    storage.bindBuffer(BIND_POINT + 1, nullptr, buf, offset, false, resources);
+
+    storage.samplers_bound = size;
+  }
+
   void Render::StageBinding::bindVertexStream(StageStorage &storage, uint32_t stream, uint32_t offset, ResourceArray &resources)
   {
     G_ASSERT(stream < 2);
@@ -734,8 +815,7 @@ namespace drv3d_metal
   {
     G_ASSERTF(stage.immediate_dword_count > 0, "Shader name and variant: %s", getShaderName(shader->src == nil ? "" : [shader->src cStringUsingEncoding:[NSString defaultCStringEncoding]]).c_str());
 
-    if (shader->immediate_slot == storage.immediate_slot && stage.immediate_dword_count <= storage.immediate_dword_count
-        && memcmp(stage.immediate_dwords, storage.immediate_dwords, stage.immediate_dword_count*sizeof(uint32_t)) == 0)
+    if (stage.immediate_dword_count <= storage.immediate_dword_count && memcmp(stage.immediate_dwords, storage.immediate_dwords, stage.immediate_dword_count*sizeof(uint32_t)) == 0)
       return;
 
     int buf_imm_offset = 0;
@@ -782,11 +862,6 @@ namespace drv3d_metal
       }
 
       int target = shader->buffers[i].slot;
-
-      // reset cached immediate binding if something overrides the slot
-      if (shader->immediate_slot == -1 && target == storage.immediate_slot)
-        storage.immediate_slot = -1;
-
       storage.bindBuffer(target, buffers[index], buffer, offset + dynamic_offset, is_uav, resources);
     }
     storage.buffer_dirty_mask &= ~shader->buffer_mask;
@@ -827,14 +902,14 @@ namespace drv3d_metal
         auto buf_tex = buffers[slot] ? buffers[slot]->getTexture() : nullptr;
         if (buf_tex)
         {
-          buf_tex->apply(texture, false, 0, 0, false, false);
+          buf_tex->apply(texture, 0, 0, false, false);
           resource = buffers[slot];
         }
       }
       else if (cache.texture)
       {
-        cache.texture->apply(texture, cache.read_stencil, cache.mip_level, cache.slice, is_uav, cache.as_uint);
-        resource = cache.texture;
+        cache.texture->apply(texture, cache.mip_level, cache.slice, is_uav, cache.as_uint);
+        resource = cache.texture->apiTex;
       }
 
       if (texture == nil)
@@ -842,11 +917,11 @@ namespace drv3d_metal
         int index = int(type);
         G_ASSERT(index < int(MetalImageType::Count));
         if (is_uav)
-          render.blank_tex_rw[index]->apply(texture, false, 0, 0, false, false);
+          render.blank_tex_rw[index]->apply(texture, 0, 0, false, false);
         else if (shader->tex_type[i].is_uint)
-          render.blank_tex_uint[index]->apply(texture, false, 0, 0, false, false);
+          render.blank_tex_uint[index]->apply(texture, 0, 0, false, false);
         else
-          render.blank_tex[index]->apply(texture, false, 0, 0, false, false);
+          render.blank_tex[index]->apply(texture, 0, 0, false, false);
       }
 
       if (texture && storage.textures[tslot] != texture)
@@ -880,7 +955,7 @@ namespace drv3d_metal
 
       id<MTLSamplerState> sampler = nil;
 
-      G_ASSERT(slot < 16);
+      G_ASSERT(slot < StageStorage::MAX_SAMPLERS);
       if (samplers[slot])
         sampler = samplers[slot];
       else
@@ -939,7 +1014,7 @@ namespace drv3d_metal
     G_ASSERT(shader);
 
     // early out if nothing was bound since last time
-    if (storage.is_vertex() && (storage.buffer_dirty_mask & GEOM_BUFFER_MASK))
+    if (storage.is_vertex())
       apply_vertex_streams(storage, resources);
     if (storage.buffer_dirty_mask & shader->buffer_mask)
       apply_buffers(storage, shader, resources);
@@ -947,7 +1022,14 @@ namespace drv3d_metal
     if (shader->num_bindless_buffers)
     {
       G_ASSERT(d3d::get_driver_desc().caps.hasBindless);
-      render.prepareBindlessResources(shader->bindless_type_mask);
+
+      // drain pending sampler registrations before snapshotting biases
+      render.prepareBindlessResources(shader->bindless_type_mask, storage.is_vertex());
+      if (shader->bindless_type_mask & BindlessTypeSampler) // update bindless sampler biases
+      {
+        for (size_t i = 0; i < render.bindlessSamplerBiases.size(); ++i)
+          sampler_biases_remapped[StageStorage::MAX_SAMPLERS + i] = render.bindlessSamplerBiases[i];
+      }
       for (int i = 0; i < shader->num_bindless_buffers; ++i)
       {
         const auto &remap = shader->bindless_buffers[i];
@@ -966,6 +1048,10 @@ namespace drv3d_metal
             bindless_buffer = render.bindlessTextureCubeIdBuffer;
           else if (remap.texture_type == MetalImageType::Tex2DArray)
             bindless_buffer = render.bindlessTexture2DArrayIdBuffer;
+          else if (remap.texture_type == MetalImageType::Tex3D)
+            bindless_buffer = render.bindlessTexture3DIdBuffer;
+          else if (remap.texture_type == MetalImageType::TexCubeArray)
+            bindless_buffer = render.bindlessTextureCubeArrayIdBuffer;
           else
             G_ASSERTF(0, "Unsupported bindless texture array type %d", int(remap.texture_type));
         }
@@ -980,6 +1066,16 @@ namespace drv3d_metal
 
     if (storage.texture_dirty_mask & shader->texture_mask)
       apply_textures(storage, shader, resources);
+#if DAGOR_DBGLEVEL > 0
+    {
+      for (int i = 0; i < shader->num_tex; i++)
+      {
+        MetalImageType type = shader->tex_type[i].type;
+        id<MTLTexture> tex = storage.textures[shader->tex_remap[i]];
+        G_ASSERTF(tex.textureType == ConvertTextureType(type), "Texture %s is bound as %d but expected to be %d", [tex.label UTF8String], (int)tex.textureType, (int)ConvertTextureType(type));
+      }
+    }
+#endif
 
     if (storage.sampler_dirty_mask & shader->sampler_mask)
       apply_samplers(storage, shader, resources);
@@ -988,6 +1084,9 @@ namespace drv3d_metal
       apply_acceleration_structs(storage, shader, resources);
 
     cbuffer.applyBuffer(storage, shader->num_reg, resources);
+
+    if (shader->has_biases)
+      apply_biases(storage, shader, resources);
   }
 
   void Render::StageBinding::reset()
@@ -995,37 +1094,9 @@ namespace drv3d_metal
     for (int i = 0; i < MAX_STAGE_TEXTURES; i++)
         textures[i] = {};
     for (int i = 0; i < BUFFER_POINT_COUNT; i++)
-    {
-      if (buffers[i])
-        buffers[i]->bound_slots = 0;
       buffers[i] = nil;
-    }
     for (uint32_t j = 0; j < MAX_SHADER_ACCELERATION_STRUCTURES; ++j)
         acceleration_structures[j] = nullptr;
-  }
-
-  void Render::StageBinding::removeBuf(Buffer* buf)
-  {
-    G_ASSERT(buf);
-    buf->bound_slots = 0;
-    for (int i = 0; i < BUFFER_POINT_COUNT; i++)
-    {
-      if (buffers[i] == buf)
-      {
-        buffers[i] = nullptr;
-      }
-    }
-  }
-
-  void Render::StageBinding::removeTex(Texture* tex)
-  {
-    for (int i = 0; i < MAX_STAGE_TEXTURES; i++)
-    {
-      if (textures[i].texture == tex)
-      {
-        textures[i] = {};
-      }
-    }
   }
 
   Render::Render()
@@ -1033,6 +1104,7 @@ namespace drv3d_metal
     , progs(midmem_ptr(), 128)
     , vdecls(midmem_ptr(), 128)
     , blases(midmem_ptr(), 128)
+    , queries("query_pool")
   {
     inited = false;
 
@@ -1055,8 +1127,6 @@ namespace drv3d_metal
     need_change_rt = 0;
 
     depth_clip = MTLDepthClipModeClip;
-
-    main_thread = 0;
 
     device_name[0] = 0;
 
@@ -1088,6 +1158,7 @@ namespace drv3d_metal
     vshader->num_va = 1;
     vshader->va[0].reg = 0;
     vshader->va[0].vsdr = VSDR_POS;
+    vshader->buffer_mask = 1;
   }
 
   id<MTLAccelerationStructure> createDefaultBlas(id<MTLDevice> device)
@@ -1208,7 +1279,7 @@ namespace drv3d_metal
       return false;
     }
 
-    sampler_states.reserve(256);
+    sampler_states.reserve(BINDLESS_SAMPLER_COUNT);
 #if HAVE_SAMPLE_QUERIES
     if ([device supportsCounterSampling : MTLCounterSamplingPointAtStageBoundary])
     {
@@ -1240,17 +1311,28 @@ namespace drv3d_metal
     if (@available(iOS 16, macos 13, *))
     {
       upscale.supported = [MTLFXSpatialScalerDescriptor supportsDevice: device];
+      upscale.temporalSupported = [MTLFXTemporalScalerDescriptor supportsDevice: device];
     }
 #endif
 
 #if _TARGET_IOS
     has_image_blocks = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("has_image_blocks", true);
+    caps.hasClampToBorder = [device supportsFamily : MTLGPUFamilyApple7];
 #else
     has_image_blocks = false;
 #endif
 
     caps.readWriteTextureTier1 = device.readWriteTextureSupport == MTLReadWriteTextureTier1 || device.readWriteTextureSupport == MTLReadWriteTextureTier2;
     caps.readWriteTextureTier2 = device.readWriteTextureSupport == MTLReadWriteTextureTier2;
+
+    queries.safeReserve(QUERIES_MAX);
+
+    // pool entries are raw memory; generation must start defined and is never
+    // reset afterwards, createQuery keeps it across reuse
+    queries.lock();
+    for (int i = 0; i < QUERIES_MAX; i++)
+      queries[i].generation = 0;
+    queries.unlock();
 
     // we need to init caps before loading pre cache
     // and caps use clear_cs_pipeline
@@ -1264,21 +1346,33 @@ namespace drv3d_metal
 
       if (error == nil && [[lib functionNames] count] > 0)
       {
-        id<MTLFunction> func = [[lib newFunctionWithName : [[lib functionNames] objectAtIndex:0]] retain];
+        id<MTLFunction> func = [lib newFunctionWithName : [[lib functionNames] objectAtIndex:0]];
 
         clear_cs_pipeline = [device newComputePipelineStateWithFunction : func error : &error];
         if (error)
           clear_cs_pipeline = nil;
+        [func release];
       }
+      [lib release];
     }
     d3d::get_driver_desc();
     shadersPreCache.init(get_shader_cache_version());
 
-    max_number_of_frames_to_skip_after_error = ::dgs_get_settings()->getBlockByNameEx("metal")->getInt("framesToSkip", 0);
     report_gpu_errors = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("report_gpu_errors", true);
+    enable_postmortem = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("enable_postmortem", DAGOR_DBGLEVEL > 0);
     validate_framemem_bounds = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("validate_framem_bounds", false);
     manual_hazard_tracking = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("enable_manual_hazard_tracking", true);
+    use_separate_command_buffer_for_each_encoder = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("enable_per_encoder_cb", false);
+    disable_cpu_gpu_overlap = !::dgs_get_settings()->getBlockByNameEx("video")->getBool("cpuGpuOverlap", true);
+    if (disable_cpu_gpu_overlap)
+      debug("metal: CPU-GPU overlap disabled (video/cpuGpuOverlap:b=off), GPU will be synced after every frame");
     hadError = false;
+
+    debug("[METAL] enable_postmortem : %s", enable_postmortem ? "true" : "false");
+    debug("[METAL] validate_framemem_bounds : %s", validate_framemem_bounds ? "true" : "false");
+    debug("[METAL] manual_hazard_tracking : %s", manual_hazard_tracking ? "true" : "false");
+    debug("[METAL] use_separate_command_buffer_for_each_encoder : %s", use_separate_command_buffer_for_each_encoder ? "true" : "false");
+    debug("[METAL] max available video memory %lluMB", device.recommendedMaxWorkingSetSize >> 20u);
 
     commandQueue = [device newCommandQueue];
 
@@ -1286,12 +1380,8 @@ namespace drv3d_metal
     stub_buffer = createBuffer(MAX_CBUFFER_SIZE, MTLResourceStorageModeShared, "stub_buffer");
     memset(stub_buffer.contents, 0, MAX_CBUFFER_SIZE);
 
-    used_query = 0;
-
-    for (int i = 0; i < QUERIES_MAX; i++)
-    {
-        queries[i].offset = i * sizeof(uint64_t);
-    }
+    TEXQL_ON_PERSISTENT_ALLOC_SZ(MAX_CBUFFER_SIZE);
+    TEXQL_ON_PERSISTENT_ALLOC_SZ(QUERIES_MAX * sizeof(uint64_t));
 
     cur_query_offset = -1;
 
@@ -1303,18 +1393,13 @@ namespace drv3d_metal
 
     forceClearOnCreate = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("forceClear", 0);
 
-    D3DResourceType cube_array_type = D3DResourceType::CUBEARRTEX;
-#if _TARGET_IOS
-    if (![device supportsFamily:MTLGPUFamilyApple4])
-      cube_array_type = D3DResourceType::CUBETEX;
-#endif
     blank_tex[int(MetalImageType::Tex2D)] = new Texture(1, 1, 1, 1, D3DResourceType::TEX, TEXCF_RTARGET, TEXFMT_A8R8G8B8, "blanktex_2d", false, true);
     blank_tex[int(MetalImageType::Tex2DArray)] = new Texture(1, 1, 1, 1, D3DResourceType::ARRTEX, TEXCF_RTARGET, TEXFMT_A8R8G8B8, "blanktex_array", false, true);
     blank_tex[int(MetalImageType::Tex2DDepth)] = new Texture(1, 1, 1, 1, D3DResourceType::TEX, TEXCF_RTARGET, TEXFMT_DEPTH24, "blank_depth", false, true);
     blank_tex[int(MetalImageType::TexCube)] = new Texture(1, 1, 1, 1, D3DResourceType::CUBETEX, TEXCF_RTARGET, TEXFMT_A8R8G8B8, "blank_cube", false, true);
     blank_tex[int(MetalImageType::Tex3D)] = new Texture(1, 1, 1, 1, D3DResourceType::VOLTEX, TEXCF_RTARGET, TEXFMT_A8R8G8B8, "blank_3d", false, true);
     blank_tex[int(MetalImageType::TexBuffer)] = new Texture(1, 1, 1, 1, D3DResourceType::TEX, TEXCF_RTARGET, TEXFMT_A8R8G8B8, "blanktex_buffer", false, true);
-    blank_tex[int(MetalImageType::TexCubeArray)] = new Texture(1, 1, 1, 1, cube_array_type, TEXCF_RTARGET, TEXFMT_A8R8G8B8, "blank_cube_array", false, true);
+    blank_tex[int(MetalImageType::TexCubeArray)] = new Texture(1, 1, 1, 1, D3DResourceType::CUBEARRTEX, TEXCF_RTARGET, TEXFMT_A8R8G8B8, "blank_cube_array", false, true);
 
     blank_tex_uint[int(MetalImageType::Tex2D)] = new Texture(1, 1, 1, 1, D3DResourceType::TEX, TEXCF_RTARGET, TEXFMT_R32UI, "blanktex_uint_2d", false, true);
     blank_tex_uint[int(MetalImageType::Tex2DArray)] = new Texture(1, 1, 1, 1, D3DResourceType::ARRTEX, TEXCF_RTARGET, TEXFMT_R32UI, "blanktex_uint_array", false, true);
@@ -1322,7 +1407,7 @@ namespace drv3d_metal
     blank_tex_uint[int(MetalImageType::TexCube)] = new Texture(1, 1, 1, 1, D3DResourceType::CUBETEX, TEXCF_RTARGET, TEXFMT_R32UI, "blank_uint_cube", false, true);
     blank_tex_uint[int(MetalImageType::Tex3D)] = new Texture(1, 1, 1, 1, D3DResourceType::VOLTEX, TEXCF_RTARGET, TEXFMT_R32UI, "blank_uint_3d", false, true);
     blank_tex_uint[int(MetalImageType::TexBuffer)] = new Texture(1, 1, 1, 1, D3DResourceType::TEX, TEXCF_RTARGET, TEXFMT_R32UI, "blanktex_uint_buffer", false, true);
-    blank_tex_uint[int(MetalImageType::TexCubeArray)] = new Texture(1, 1, 1, 1, cube_array_type, TEXCF_RTARGET, TEXFMT_R32UI, "blank_cube_array", false, true);
+    blank_tex_uint[int(MetalImageType::TexCubeArray)] = new Texture(1, 1, 1, 1, D3DResourceType::CUBEARRTEX, TEXCF_RTARGET, TEXFMT_R32UI, "blank_cube_array", false, true);
 
     blank_tex_rw[int(MetalImageType::Tex2D)] = new Texture(1, 1, 1, 1, D3DResourceType::TEX, TEXCF_UNORDERED, TEXFMT_A8R8G8B8, "blanktexrw_2d", false, true);
     blank_tex_rw[int(MetalImageType::Tex2DArray)] = new Texture(1, 1, 1, 1, D3DResourceType::ARRTEX, TEXCF_UNORDERED, TEXFMT_A8R8G8B8, "blanktexrw_array", false, true);
@@ -1330,23 +1415,25 @@ namespace drv3d_metal
     blank_tex_rw[int(MetalImageType::TexCube)] = new Texture(1, 1, 1, 1, D3DResourceType::CUBETEX, TEXCF_UNORDERED, TEXFMT_A8R8G8B8, "blankrw_cube", false, true);
     blank_tex_rw[int(MetalImageType::Tex3D)] = new Texture(1, 1, 1, 1, D3DResourceType::VOLTEX, TEXCF_UNORDERED, TEXFMT_A8R8G8B8, "blankrw_3d", false, true);
     blank_tex_rw[int(MetalImageType::TexBuffer)] = new Texture(1, 1, 1, 1, D3DResourceType::TEX, TEXCF_UNORDERED, TEXFMT_A8R8G8B8, "blanktexrw_buffer", false, true);
-    blank_tex_rw[int(MetalImageType::TexCubeArray)] = new Texture(1, 1, 1, 1, cube_array_type, TEXCF_UNORDERED, TEXFMT_A8R8G8B8, "blankrw_cube_array", false, true);
+    blank_tex_rw[int(MetalImageType::TexCubeArray)] = new Texture(1, 1, 1, 1, D3DResourceType::CUBEARRTEX, TEXCF_UNORDERED, TEXFMT_A8R8G8B8, "blankrw_cube_array", false, true);
 
-    blank_tex[int(MetalImageType::Tex2D)]->apply(blank_tex_2d, false, 0, 0, false, false);
+    blank_tex[int(MetalImageType::Tex2D)]->apply(blank_tex_2d, 0, 0, false, false);
     G_ASSERT(blank_tex_2d);
 
-    blank_tex[int(MetalImageType::TexCube)]->apply(blank_tex_cube, false, 0, 0, false, false);
+    blank_tex[int(MetalImageType::TexCube)]->apply(blank_tex_cube, 0, 0, false, false);
     G_ASSERT(blank_tex_cube);
 
-    blank_tex[int(MetalImageType::Tex2DArray)]->apply(blank_tex_2dArray, false, 0, 0, false, false);
+    blank_tex[int(MetalImageType::Tex2DArray)]->apply(blank_tex_2dArray, 0, 0, false, false);
     G_ASSERT(blank_tex_2dArray);
+
+    blank_tex[int(MetalImageType::Tex3D)]->apply(blank_tex_3d, 0, 0, false, false);
+    G_ASSERT(blank_tex_3d);
+
+    blank_tex[int(MetalImageType::TexCubeArray)]->apply(blank_tex_cubeArray, 0, 0, false, false);
+    G_ASSERT(blank_tex_cubeArray);
 
     // create default one
     free_encoders.clear();
-    if (manual_hazard_tracking)
-      current_enqueued_encoder = allocate_encoder();
-    current_enqueued_resources = 0;
-
     last_encoders.clear();
     last_encoders_current.clear();
 
@@ -1368,17 +1455,14 @@ namespace drv3d_metal
       blank_tex_uint[i]->unlockimg();
     }
 
-    backbuffer = new Texture(nil, TEXFMT_A8R8G8B8, "backbuffer");
+    backbuffer = new Texture(nil, [mainview hdrEnabled] ? TEXFMT_A2R10G10B10 : TEXFMT_A8R8G8B8, "backbuffer");
     backbuffer->width = wnd_wd;
     backbuffer->height = wnd_ht;
     backbuffer->cflg = TEXCF_RTARGET;
+    TEXQL_ON_PERSISTENT_ALLOC_SZ([mainview getDrawableSize]);
 
     ::create_critical_section(acquireSec);
     ::create_critical_section(rcSec);
-
-    pthread_threadid_np(NULL, &main_thread);
-
-    cur_thread = main_thread;
 
     cur_prog = nil;
     vdecl = nil;
@@ -1397,6 +1481,7 @@ namespace drv3d_metal
     }
     cur_rstate.raster_state.writeMask = WRITEMASK_ALL;
     cur_rstate.raster_state.a2c = 0;
+    cur_rstate.raster_state.is_dual_blend = 0;
     cur_rstate.raster_state.pad[0] = cur_rstate.raster_state.pad[1] = 0;
     cur_rstate.sample_count = 1;
     cur_rstate.pixelFormat[0] = MTLPixelFormatBGRA8Unorm;
@@ -1409,10 +1494,10 @@ namespace drv3d_metal
 
     cur_state = NULL;
 
-    clear_vshd = createVertexShader((const uint8_t*)clear_vs_metal);
-    clear_pshdi = createPixelShader((const uint8_t*)clear_ps_metal_i);
-    clear_pshdui = createPixelShader((const uint8_t*)clear_ps_metal_ui);
-    clear_pshdf = createPixelShader((const uint8_t*)clear_ps_metal_f);
+    clear_vshd = createVertexShader((const uint8_t*)clear_vs_metal, nullptr, "builtin_clear_vs");
+    clear_pshdi = createPixelShader((const uint8_t*)clear_ps_metal_i, nullptr, "builtin_clear_ps_i");
+    clear_pshdui = createPixelShader((const uint8_t*)clear_ps_metal_ui, nullptr, "builtin_clear_ps_ui");
+    clear_pshdf = createPixelShader((const uint8_t*)clear_ps_metal_f, nullptr, "builtin_clear_ps_f");
     clear_vdecl = createVDdecl(clear_dcl);
 
     PatchShader(clear_vshd, 1, 0);
@@ -1425,8 +1510,8 @@ namespace drv3d_metal
     clear_progui = createProgram(clear_vshd, clear_pshdui, clear_vdecl, 0, 0);
     clear_progf = createProgram(clear_vshd, clear_pshdf, clear_vdecl, 0, 0);
 
-    copy_vshd = createVertexShader((const uint8_t*)copy_vs_metal);
-    copy_pshd = createPixelShader((const uint8_t*)copy_ps_metal);
+    copy_vshd = createVertexShader((const uint8_t*)copy_vs_metal, nullptr, "builtin_copy_vs");
+    copy_pshd = createPixelShader((const uint8_t*)copy_ps_metal, nullptr, "builtin_copy_ps");
 
     PatchShader(copy_vshd, 1, 0);
     PatchVertexShader(copy_vshd);
@@ -1451,14 +1536,9 @@ namespace drv3d_metal
 
     [render.mainview isHDRAvailable];
 
-    if (d3d::get_driver_desc().caps.hasBindless)
+    bool use_residency = d3d::get_driver_desc().caps.hasBindless || render.device.supportsRaytracing;
+    if (use_residency)
     {
-      bindlessTexture2DIdBuffer = new Buffer(BINDLESS_TEXTURE_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless texture 2d id buffer");
-      bindlessTexture2DArrayIdBuffer = new Buffer(BINDLESS_TEXTURE_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless texture 2d array id buffer");
-      bindlessTextureCubeIdBuffer = new Buffer(BINDLESS_TEXTURE_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless texture cube id buffer");
-      bindlessBufferIdBuffer = new Buffer(BINDLESS_BUFFER_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless buffer id buffer");
-      bindlessSamplerIdBuffer = new Buffer(BINDLESS_SAMPLER_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless sampler id buffer");
-
       if (@available(iOS 18, macOS 15.0, *))
       {
         MTLResidencySetDescriptor *setDescriptor = [[MTLResidencySetDescriptor alloc] init];
@@ -1470,23 +1550,43 @@ namespace drv3d_metal
                                                        error : &error];
         [setDescriptor release];
 
-        [residencySet addAllocation : blank_tex_2d];
-        [residencySet addAllocation : blank_tex_2dArray];
-        [residencySet addAllocation : blank_tex_cube];
-        [residencySet addAllocation : stub_buffer];
-
         if (error)
           DAG_FATAL("Couldn't create residency set because of %s", [error.localizedDescription UTF8String]);
 
+        [residencySet addAllocation : blank_tex_2d];
+        [residencySet addAllocation : blank_tex_2dArray];
+        [residencySet addAllocation : blank_tex_cube];
+        [residencySet addAllocation : blank_tex_3d];
+        [residencySet addAllocation : blank_tex_cubeArray];
+        [residencySet addAllocation : stub_buffer];
+      }
+    }
+
+    debug("[METAL] bindless : %s", d3d::get_driver_desc().caps.hasBindless ? "true" : "false");
+    if (d3d::get_driver_desc().caps.hasBindless)
+    {
+      bindlessTexture2DIdBuffer = new Buffer(BINDLESS_TEXTURE_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless texture 2d id buffer");
+      bindlessTexture2DArrayIdBuffer = new Buffer(BINDLESS_TEXTURE_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless texture 2d array id buffer");
+      bindlessTextureCubeIdBuffer = new Buffer(BINDLESS_TEXTURE_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless texture cube id buffer");
+      bindlessTexture3DIdBuffer = new Buffer(BINDLESS_TEXTURE_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless texture 3d id buffer");
+      bindlessTextureCubeArrayIdBuffer = new Buffer(BINDLESS_TEXTURE_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless texture cube array id buffer");
+      bindlessBufferIdBuffer = new Buffer(BINDLESS_BUFFER_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless buffer id buffer");
+      bindlessSamplerIdBuffer = new Buffer(BINDLESS_SAMPLER_COUNT, sizeof(uint64_t), SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, "bindless sampler id buffer");
+
+      if (@available(iOS 18, macOS 15.0, *))
+      {
         bindlessTextures2D.init(ToResourceID(blank_tex_2d));
         bindlessTexturesCube.init(ToResourceID(blank_tex_cube));
         bindlessTextures2DArray.init(ToResourceID(blank_tex_2dArray));
+        bindlessTextures3D.init(ToResourceID(blank_tex_3d));
+        bindlessTexturesCubeArray.init(ToResourceID(blank_tex_cubeArray));
         bindlessBuffers.init(stub_buffer.gpuAddress);
       }
     }
 
     if (@available(iOS 17, macOS 13.0, *))
     {
+      debug("[METAL] raytracing : %s", render.device.supportsRaytracing ? "true" : "false");
       if (render.device.supportsRaytracing)
       {
         defaultBlas = createDefaultBlas(device);
@@ -1494,8 +1594,17 @@ namespace drv3d_metal
 
         int defaultIndex = blases.getFreeIndex(nullptr);
         G_ASSERT(defaultIndex == 0);
-        nativeBlases = [[NSMutableArray alloc] initWithCapacity : 4096];
-        [nativeBlases addObject : defaultBlas];
+        nativeBlases.reserve(4096);
+        nativeBlases.push_back(defaultBlas);
+
+        if (use_residency)
+        {
+          if (@available(iOS 18, macOS 15.0, *))
+          {
+            if (residencySet)
+              [residencySet addAllocation : defaultBlas];
+          }
+        }
 
         defaultTlas = createDefaultTlas(device);
         G_ASSERT(defaultTlas);
@@ -1514,16 +1623,38 @@ namespace drv3d_metal
                              }];
 #endif
 
+    getSampler({});
+
+    debug("[METAL] init done");
     return true;
   }
 
-  void Render::executeUpscale(Texture *color, Texture *output, uint32_t colorMode)
+  void Render::executeSpatialUpscale(Texture *color, Texture *output, uint32_t colorMode)
   {
     checkRenderAcquired();
 
 #if USE_METALFX_UPSCALE
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::None);
     command_encoder.write(CommandType::DoMetalFX).write(color).write(output).write(colorMode);
+#endif
+  }
+
+  void Render::executeTemporalUpscale(Texture *color, Texture *motion, Texture *depth, Texture *output, float jitterX, float jitterY,
+    float motionScaleX, float motionScaleY)
+  {
+    checkRenderAcquired();
+
+#if USE_METALFX_UPSCALE
+    ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::None);
+    command_encoder.write(CommandType::DoMetalFXTemporal)
+      .write(color)
+      .write(motion)
+      .write(depth)
+      .write(output)
+      .write(jitterX)
+      .write(jitterY)
+      .write(motionScaleX)
+      .write(motionScaleY);
 #endif
   }
 
@@ -1538,8 +1669,23 @@ namespace drv3d_metal
       TIME_PROFILE(free_queued);
 
       std::lock_guard<std::mutex> scopedLock(delete_lock);
+      const uint64_t completed = submits_completed;
+      {
+        int freed_items = 0;
+        for (freed_items; freed_items < residency2delete.size(); ++freed_items)
+        {
+          const auto &res = residency2delete[freed_items];
+          if (res.submit > completed)
+            break;
+          G_ASSERT(res.type == DeletedResource::Type::RemoveFromResidency);
+          removeResource(res.native_resource);
+        }
+        if (freed_items)
+          residency2delete.erase(residency2delete.begin(), residency2delete.begin() + freed_items);
+        commitResidencySet();
+      }
 
-      if (resources2delete.empty() || resources2delete[0].submit > submits_completed)
+      if (resources2delete.empty() || resources2delete[0].submit > completed)
         return;
 
       progs.lock();
@@ -1549,7 +1695,7 @@ namespace drv3d_metal
       for (freed_items; freed_items < resources2delete.size(); ++freed_items)
       {
         const auto &res = resources2delete[freed_items];
-        if (res.submit > submits_completed)
+        if (res.submit > completed)
           break;
         switch (res.type)
         {
@@ -1565,8 +1711,16 @@ namespace drv3d_metal
               G_ASSERTF(res.texture != tex.tex, "Texture %s beging released is in bindless 2darray array", res.texture->getName());
             for (auto &tex : bindlessTexturesCube.cache)
               G_ASSERTF(res.texture != tex.tex, "Texture %s beging released is in bindless cube array", res.texture->getName());
+            for (auto &tex : bindlessTextures3D.cache)
+              G_ASSERTF(res.texture != tex.tex, "Texture %s beging released is in bindless 3d array", res.texture->getName());
+            for (auto &tex : bindlessTexturesCubeArray.cache)
+              G_ASSERTF(res.texture != tex.tex, "Texture %s beging released is in bindless cube array array", res.texture->getName());
 #endif
             res.texture->release();
+            break;
+          case DeletedResource::Type::ApiTexture:
+            G_ASSERT(res.apiTexture);
+            delete res.apiTexture;
             break;
           case DeletedResource::Type::Buffer:
             G_ASSERT(res.buffer);
@@ -1589,8 +1743,16 @@ namespace drv3d_metal
           case DeletedResource::Type::Program:
             progs.freeIndex(res.program)->release();
             break;
+          case DeletedResource::Type::AccelerationStructure:
+            G_ASSERT(resource_residency.find(res.as->acceleration_struct) == resource_residency.end());
+            [res.as->acceleration_struct release];
+            delete res.as;
+            break;
+          case DeletedResource::Type::RemoveFromResidency:
+            G_ASSERT(0 && "Shouldn't be here");
+            break;
           case DeletedResource::Type::NativeResource:
-            G_ASSERT(resource_residency.find(res.native_resource) == resource_residency.end());
+            G_ASSERTF(resource_residency.find(res.native_resource) == resource_residency.end(), "Residency set still has the deleted resource %s", [res.native_resource.label UTF8String]);
             [res.native_resource release];
             break;
           case DeletedResource::Type::Heap:
@@ -1638,29 +1800,26 @@ namespace drv3d_metal
 
   void Render::endFrame()
   {
-    flush(false, true);
+    // video/cpuGpuOverlap:b=off: wait for the GPU to finish this frame before the CPU starts the next one
+    flush(disable_cpu_gpu_overlap, true);
 
     last_gpu_time = current_gpu_time.load();
     current_gpu_time.store(0);
 
-    if (number_of_frames_to_skip_after_error)
-      number_of_frames_to_skip_after_error--;
     int error = hadError.load();
     if (error)
     {
-      if ((report_gpu_errors || max_number_of_frames_to_skip_after_error) && number_of_frames_to_skip_after_error == 0)
+      if (report_gpu_errors)
       {
         // 6 - insufficient permission
         if (error == 6 || error == MTLCommandBufferErrorNotPermitted)
         {
-          D3D_ERROR("METAL has error during command buffer execution, drawing in background");
+          LOGWARN_ONCE("METAL has error during command buffer execution, drawing in background");
         }
         else
         {
-          D3D_ERROR("METAL has error during command buffer execution %d, skipping %d frames",
-                 error, max_number_of_frames_to_skip_after_error);
+          LOGERR_ONCE("METAL has error during command buffer execution %d", error);
         }
-        number_of_frames_to_skip_after_error = max_number_of_frames_to_skip_after_error;
       }
       hadError.store(0);
     }
@@ -1689,9 +1848,9 @@ namespace drv3d_metal
     if (base_format == TEXFMT_ASTC4)
     {
       // For astc "all zeroes" isn't considered a valid compressed block
-      // so this uint4{ 98371, 0, 0, 0 } (tied to quant method used in shader)
-      // value should be placed instead to be treated like a black color
-      const uint32_t black_block[] = { 98371, 0, 0, 0 };
+      // so this void-extent values should be placed instead to be treated
+      // like a black color
+      const uint32_t black_block[] = { 0xFFFFFDFC, 0xFFFFFFFF, 0, 0 };
       const int blocked_size = copy_size / (sizeof(black_block));
       uint8_t *dst = (uint8_t *)copy_src.contents + src_offset;
       for (int i = 0; i < blocked_size; i++, dst += sizeof(black_block))
@@ -1753,7 +1912,9 @@ namespace drv3d_metal
     if (cmd.dst_format == MTLPixelFormatBC3_RGBA_sRGB ||
         cmd.dst_format == MTLPixelFormatBC3_RGBA ||
         cmd.dst_format == MTLPixelFormatBC6H_RGBFloat ||
-        cmd.dst_format == MTLPixelFormatBC5_RGUnorm)
+        cmd.dst_format == MTLPixelFormatBC6H_RGBUfloat ||
+        cmd.dst_format == MTLPixelFormatBC5_RGUnorm ||
+        cmd.dst_format == MTLPixelFormatBC5_RGSnorm)
     {
       koef = 16;
     }
@@ -1869,7 +2030,10 @@ namespace drv3d_metal
   {
     Buffer *scratch = nullptr;
     uint32_t offset = 0;
-    bool update = false;
+    uint32_t size : 31 = 0;
+    uint32_t update : 1 = 0;
+    Buffer *compactSizeBuffer = nullptr;
+    uint32_t compactSizeOffset = 0;
   };
 
   void Render::executeCommands(bool wait, bool present)
@@ -1884,8 +2048,8 @@ namespace drv3d_metal
 
     if (@available(macOS 15.0, iOS 18.0, *))
     {
-      if (d3d::get_driver_desc().caps.hasBindless)
-        [commandBuffer useResidencySet:residencySet];
+      if (residencySet)
+        [commandBuffer useResidencySet : residencySet];
     }
 
     if (needBlit)
@@ -1898,6 +2062,10 @@ namespace drv3d_metal
       track_resource_write(*buf_ptr);
 
       G_ASSERT(buf->buffer);
+#if DAGOR_DBGLEVEL > 0
+      if (enable_postmortem)
+        command_buffer_labels.push_back(String(0, "\tb2cl %s", [buf->buffer.label UTF8String]).c_str());
+#endif
       [blitEncoder fillBuffer : buf->buffer
                         range : NSMakeRange(0, buf->bufsize)
                         value : 0];
@@ -1913,11 +2081,23 @@ namespace drv3d_metal
 
       G_ASSERT(rc.dst);
       G_ASSERT(rc.src);
+      D3D_CONTRACT_ASSERT(rc.buf_tex->initialized);
+#if DAGOR_DBGLEVEL > 0
+      if (enable_postmortem)
+        command_buffer_labels.push_back(String(0, "\tb2c %s", [rc.dst.label UTF8String]).c_str());
+#endif
       [blitEncoder copyFromBuffer : rc.src
                      sourceOffset : rc.src_offset
                          toBuffer : rc.dst
                 destinationOffset : rc.dst_offset
                              size : rc.size];
+    }
+
+    for (const auto &t : textures2clear)
+    {
+      G_ASSERT(t.tracker);
+      track_resource_write(*t.tracker);
+      doClearTexture(t.width, t.height, t.slices, t.depth, t.levels, t.metalTex, t.base_format, t.use_dxt);
     }
 
     for (const auto &rc : textures2upload)
@@ -1928,6 +2108,10 @@ namespace drv3d_metal
       G_ASSERT(rc.tex_ptr);
       track_resource_write(*rc.tex_ptr);
 
+#if DAGOR_DBGLEVEL > 0
+      if (enable_postmortem)
+        command_buffer_labels.push_back(String(0, "\tt2u %s", [rc.tex.label UTF8String]).c_str());
+#endif
       [blitEncoder copyFromBuffer : rc.buf
                      sourceOffset : 0
                 sourceBytesPerRow : rc.pitch
@@ -1937,13 +2121,6 @@ namespace drv3d_metal
                  destinationSlice : rc.layer
                  destinationLevel : rc.level
                 destinationOrigin : origin];
-    }
-
-    for (const auto &t : textures2clear)
-    {
-      G_ASSERT(t.tex);
-      track_resource_write(*t.tex);
-      doClearTexture(t.width, t.height, t.slices, t.depth, t.levels, t.metalTex, t.base_format, t.use_dxt);
     }
 
     for (const auto &r : regions2copy)
@@ -1976,9 +2153,12 @@ namespace drv3d_metal
           ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Render);
           G_ASSERT(render_desc);
           renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor : render_desc];
-      #if DAGOR_DBGLEVEL > 0
-          renderEncoder.label = render_desc.colorAttachments[0].texture ? render_desc.colorAttachments[0].texture.label : (render_desc.depthAttachment.texture ? render_desc.depthAttachment.texture.label : @"DagorRenderEncoder");
-      #endif
+
+          Texture *tex = render_targets.colors[0].texture ? render_targets.colors[0].texture : render_targets.depth.texture;
+          if (enable_postmortem || DAGOR_DBGLEVEL > 0)
+            renderEncoder.label = [NSString stringWithUTF8String:(tex ? tex->getName() : "DagorRenderEncoder")];
+          if (enable_postmortem)
+            command_buffer_labels.push_back(tex ? tex->getName() : "DagorRenderEncoder");
           if (renderEncoder == nil)
             DAG_FATAL("Failed to allocate render encoder");
           [render_desc release];
@@ -1988,30 +2168,31 @@ namespace drv3d_metal
             if (render_targets.colors[i].texture)
             {
               if (render_targets.colors[i].store_action == MTLStoreActionDontCare)
-                track_resource_read(*render_targets.colors[i].texture, true);
+                track_resource_read(*render_targets.colors[i].texture->apiTex, true);
               else
-                track_resource_write(*render_targets.colors[i].texture, true);
+                track_resource_write(*render_targets.colors[i].texture->apiTex, true);
             }
             if (render_targets.colors[i].resolve_target)
-              track_resource_write(*render_targets.colors[i].resolve_target);
+              track_resource_write(*render_targets.colors[i].resolve_target->apiTex);
           }
           if (render_targets.depth.texture)
           {
             if (render_targets.depth.store_action == MTLStoreActionDontCare)
-              track_resource_read(*render_targets.depth.texture, true);
+              track_resource_read(*render_targets.depth.texture->apiTex, true);
             else
-              track_resource_write(*render_targets.depth.texture, true);
+              track_resource_write(*render_targets.depth.texture->apiTex, true);
           }
           if (render_targets.depth.resolve_target)
-            track_resource_write(*render_targets.depth.resolve_target);
+            track_resource_write(*render_targets.depth.resolve_target->apiTex);
         }
         break;
         case CommandType::SetResources:
         {
+          FRAMEMEM_VALIDATE;
           uint8_t resource_count;
           command_encoder.read(resource_count);
 
-          eastl::vector<Resource, framemem_allocator> resources(resource_count);
+          dag::Vector<Resource, framemem_allocator> resources(resource_count);
           command_encoder.read(resources.data(), resource_count * sizeof(Resource));
 
           G_ASSERT(renderEncoder || computeEncoder);
@@ -2020,24 +2201,33 @@ namespace drv3d_metal
         break;
         case CommandType::SetPipelineState:
         {
+          Program *prog = nullptr;
           id<MTLRenderPipelineState> state = nil;
-          command_encoder.read(state);
+          command_encoder.read(state).read(prog);
 
+          G_ASSERT(prog);
           G_ASSERT(renderEncoder);
           G_ASSERT(state);
           [renderEncoder setRenderPipelineState : state];
+
+          if (enable_postmortem)
+            command_buffer_labels.push_back(String(0, "\t%s", prog->name.c_str()).c_str());
         }
         break;
         case CommandType::SetComputePipelineState:
         {
+          Program *prog = nullptr;
           id<MTLComputePipelineState> state = nil;
-          command_encoder.read(state);
+          command_encoder.read(state).read(prog);
 
           ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Compute);
 
           G_ASSERT(computeEncoder);
           G_ASSERT(state);
           [computeEncoder setComputePipelineState : state];
+
+          if (enable_postmortem)
+            command_buffer_labels.push_back(String(0, "\t%s", prog ? prog->name.c_str() : "clear_cs").c_str());
         }
         break;
         case CommandType::SetDepthState:
@@ -2275,6 +2465,10 @@ namespace drv3d_metal
             G_ASSERT(buf);
             track_resource_write(*buf);
 
+#if DAGOR_DBGLEVEL > 0
+            if (enable_postmortem)
+              command_buffer_labels.push_back(String(0, "\tfillBuffer %s", [buf_metal.label UTF8String]).c_str());
+#endif
             [blitEncoder fillBuffer : buf_metal
                               range : NSMakeRange(0, buffer_size)
                               value : (val[0] & 0xff)];
@@ -2333,13 +2527,17 @@ namespace drv3d_metal
         break;
         case CommandType::GenerateMips:
         {
-          Texture *tex = nullptr;
+          HazardTracker *tex = nullptr;
           id<MTLTexture> tex_metal = nil;
           command_encoder.read(tex).read(tex_metal);
 
           ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Blit, "GenerateMips");
 
           track_resource_write(*tex);
+#if DAGOR_DBGLEVEL > 0
+          if (enable_postmortem)
+            command_buffer_labels.push_back(String(0, "\tgentmips %s", [tex_metal.label UTF8String]).c_str());
+#endif
           [blitEncoder generateMipmapsForTexture : tex_metal];
         }
         break;
@@ -2350,14 +2548,19 @@ namespace drv3d_metal
 
           ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Blit, "CopyTex");
 
-          track_resource_read(*src);
-          track_resource_write(*dest);
+          track_resource_read(*src->apiTex);
+          track_resource_write(*dest->apiTex);
 
           MTLOrigin origin = { 0, 0, 0 };
           MTLSize size = { 1, 1, 1 };
 
           G_ASSERT(dest);
           G_ASSERT(src);
+#if DAGOR_DBGLEVEL > 0
+          if (enable_postmortem)
+            command_buffer_labels.push_back(String(0, "\tcopytex %s", [dest->apiTex->texture.label UTF8String]).c_str());
+#endif
+
           for (int i = 0; i < dest->mipLevels; i++)
           {
             size.width = max(dest->width >> i, 1);
@@ -2375,9 +2578,10 @@ namespace drv3d_metal
             int count = 1;
             if (dest->type == D3DResourceType::CUBETEX)
               count = 6;
-            else
-            if (dest->type == D3DResourceType::ARRTEX)
+            else if (dest->type == D3DResourceType::ARRTEX)
                 count = dest->depth;
+            else if (dest->type == D3DResourceType::CUBEARRTEX)
+                count = 6*dest->depth;
 
             G_ASSERT(src != backbuffer || drawable_acquired);
             id<MTLTexture> src_tex = src->apiTex->texture;
@@ -2410,6 +2614,10 @@ namespace drv3d_metal
           if (dst)
             track_resource_write(*dst);
 
+#if DAGOR_DBGLEVEL > 0
+          if (enable_postmortem)
+            command_buffer_labels.push_back(String(0, "\tcopybuf %s", [dst_metal.label UTF8String]).c_str());
+#endif
           [blitEncoder copyFromBuffer : src_metal
                          sourceOffset : srcOffset
                              toBuffer : dst_metal
@@ -2431,8 +2639,12 @@ namespace drv3d_metal
           ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Blit, "ReadbackTexture");
 
           G_ASSERT(tex_ptr);
-          track_resource_read(*tex_ptr);
+          track_resource_read(*tex_ptr->apiTex);
 
+#if DAGOR_DBGLEVEL > 0
+          if (enable_postmortem)
+            command_buffer_labels.push_back(String(0, "\treadback %s", [tex.label UTF8String]).c_str());
+#endif
           [blitEncoder copyFromTexture : tex
                            sourceSlice : layer
                            sourceLevel : level
@@ -2461,31 +2673,44 @@ namespace drv3d_metal
         case CommandType::TrackBindless:
         {
           uint32_t type = 0;
-          command_encoder.read(type);
+          uint8_t is_from_vs = 0;
+          command_encoder.read(type).read(is_from_vs);
 
           if (type == BindlessTypeBuffer)
           {
             for (auto &buf : bindlessBuffers.cache)
               if (buf.buf)
-                track_resource_read(*buf.buf);
+                track_resource_read(*buf.buf, is_from_vs);
           }
           else if (type == BindlessTypeTexture2DArray)
           {
             for (auto &tex : bindlessTextures2DArray.cache)
               if (tex.tex)
-                track_resource_read(*tex.tex);
+                track_resource_read(*tex.tex->apiTex, is_from_vs);
           }
           else if (type == BindlessTypeTextureCube)
           {
             for (auto &tex : bindlessTexturesCube.cache)
               if (tex.tex)
-                track_resource_read(*tex.tex);
+                track_resource_read(*tex.tex->apiTex, is_from_vs);
           }
           else if (type == BindlessTypeTexture2D)
           {
             for (auto &tex : bindlessTextures2D.cache)
               if (tex.tex)
-                track_resource_read(*tex.tex);
+                track_resource_read(*tex.tex->apiTex, is_from_vs);
+          }
+          else if (type == BindlessTypeTexture3D)
+          {
+            for (auto &tex : bindlessTextures3D.cache)
+              if (tex.tex)
+                track_resource_read(*tex.tex->apiTex, is_from_vs);
+          }
+          else if (type == BindlessTypeTextureCubeArray)
+          {
+            for (auto &tex : bindlessTexturesCubeArray.cache)
+              if (tex.tex)
+                track_resource_read(*tex.tex->apiTex, is_from_vs);
           }
         }
         break;
@@ -2493,7 +2718,8 @@ namespace drv3d_metal
         {
           RaytraceAccelerationStructure *dst = nullptr, *src = nullptr;
           id<MTLAccelerationStructure> as_dst = nil, as_src = nil;
-          command_encoder.read(src).read(dst).read(as_src).read(as_dst);
+          uint8_t compact_flag = 0;
+          command_encoder.read(src).read(dst).read(as_src).read(as_dst).read(compact_flag);
 
           ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Acceleration);
 
@@ -2503,8 +2729,24 @@ namespace drv3d_metal
           track_resource_write(*dst);
           track_resource_read(*src);
 
-          [accelerationEncoder copyAccelerationStructure : as_src
-                                 toAccelerationStructure : as_dst];
+          if (compact_flag)
+          {
+            if (@available(macOS 13.0, iOS 16.0, *))
+            {
+              [accelerationEncoder copyAndCompactAccelerationStructure : as_src
+                                              toAccelerationStructure  : as_dst];
+            }
+            else
+            {
+              D3D_ERROR("AS compaction called on unsupported os version");
+              [accelerationEncoder copyAccelerationStructure : as_src
+                                   toAccelerationStructure   : as_dst];
+            }
+          }
+          else
+            [accelerationEncoder copyAccelerationStructure : as_src
+                                   toAccelerationStructure : as_dst];
+          dst->was_built = true;
         }
         break;
         case CommandType::BuildAccelerationStructure:
@@ -2517,11 +2759,24 @@ namespace drv3d_metal
 
           ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Acceleration);
 
-          for (uint32_t i = 0; i < count; ++i)
           {
-            Buffer *buf = nullptr;
-            command_encoder.read(buf);
-            track_resource_read(*buf);
+            std::lock_guard<std::mutex> scopedLock(delete_lock);
+
+            if (info.scratch)
+              residency2delete.push_back({ .type = DeletedResource::Type::RemoveFromResidency, .submit = submits_scheduled, .native_resource = info.scratch->getBuffer() });
+
+            if (info.compactSizeBuffer)
+              residency2delete.push_back({ .type = DeletedResource::Type::RemoveFromResidency, .submit = submits_scheduled, .native_resource = info.compactSizeBuffer->getBuffer() });
+
+            for (uint32_t i = 0; i < count; ++i)
+            {
+              Buffer *buf = nullptr;
+              command_encoder.read(buf);
+
+              G_ASSERT(!buf->is_fast_discard());
+              track_resource_read(*buf);
+              residency2delete.push_back({ .type = DeletedResource::Type::RemoveFromResidency, .submit = submits_scheduled, .native_resource = buf->getBuffer() });
+            }
           }
 
           if (as->index == -1)
@@ -2535,7 +2790,7 @@ namespace drv3d_metal
             blases.unlock();
           }
 
-          buildAccelerationStructure(as, desc, info.scratch, info.offset, info.update);
+          buildAccelerationStructure(as, desc, info);
           G_ASSERT(as->acceleration_struct);
         }
         break;
@@ -2546,8 +2801,26 @@ namespace drv3d_metal
           uint32_t colorMode = 0;
           command_encoder.read(color).read(output).read(colorMode);
 
+          uint32_t colFlg = color->cflg, outFlg = output->cflg;
+          bool color_srgb = (colFlg & (TEXCF_SRGBREAD | TEXCF_SRGBWRITE)) &&
+            (drv3d_metal::Texture::format2Metal(colFlg & TEXFMT_MASK) == drv3d_metal::Texture::format2MetalsRGB(colFlg & TEXFMT_MASK));
+          bool output_srgb = (outFlg & (TEXCF_SRGBREAD | TEXCF_SRGBWRITE)) &&
+            (drv3d_metal::Texture::format2Metal(outFlg & TEXFMT_MASK) == drv3d_metal::Texture::format2MetalsRGB(outFlg & TEXFMT_MASK));
+          // upscale breaks when input is srgb and output is not, even though the formats are passed correctly
+          G_ASSERT(color_srgb == output_srgb);
+
+          id<MTLFence> fence = nil;
           if (@available(iOS 16, macos 13, *))
           {
+            // create fake blit encoder that's gonna wait for corresponding encoders
+            if (manual_hazard_tracking)
+            {
+              ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Blit);
+              track_resource_read(*color->apiTex);
+              track_resource_write(*output->apiTex);
+              G_ASSERT(current_encoder);
+              fence = encoders[current_encoder->index].fence;
+            }
             ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::None);
 
             uint64_t hash = 0;
@@ -2559,7 +2832,7 @@ namespace drv3d_metal
             hash_combine(hash, output->metal_format);
             hash_combine(hash, colorMode);
 
-            if (upscale.spatialScalers.find(hash) == upscale.spatialScalers.end())
+            if (upscale.scalers.find(hash) == upscale.scalers.end())
             {
               constexpr static MTLFXSpatialScalerColorProcessingMode color_modes[] = {MTLFXSpatialScalerColorProcessingModePerceptual,
                 MTLFXSpatialScalerColorProcessingModeLinear, MTLFXSpatialScalerColorProcessingModeHDR};
@@ -2573,11 +2846,16 @@ namespace drv3d_metal
               spatialScalerDescriptor.outputHeight = output->getHeight();
               spatialScalerDescriptor.outputTextureFormat = output->metal_format;
               spatialScalerDescriptor.colorProcessingMode = color_modes[colorMode];
-              upscale.spatialScalers[hash] = [spatialScalerDescriptor newSpatialScalerWithDevice : device];
+              upscale.scalers[hash] = [spatialScalerDescriptor newSpatialScalerWithDevice : device];
               [spatialScalerDescriptor release];
             }
-            id<MTLFXSpatialScaler> scaler = upscale.spatialScalers[hash];
+            id<MTLFXSpatialScaler> scaler = upscale.scalers[hash];
 
+            if (manual_hazard_tracking)
+            {
+              G_ASSERT(fence != nil);
+              scaler.fence = fence;
+            }
             scaler.outputTexture = output->apiTex->texture;
             scaler.colorTexture = color->apiTex->texture;
             [scaler encodeToCommandBuffer : commandBuffer];
@@ -2587,15 +2865,111 @@ namespace drv3d_metal
 #endif
         }
         break;
+        case CommandType::DoMetalFXTemporal:
+        {
+#if USE_METALFX_UPSCALE
+          Texture *color = nullptr, *motion = nullptr, *depth = nullptr, *output = nullptr;
+          float jitterX = 0.f, jitterY = 0.f, motionScaleX = 0.f, motionScaleY = 0.f;
+          command_encoder.read(color).read(motion).read(depth).read(output).read(jitterX).read(jitterY).read(motionScaleX)
+            .read(motionScaleY);
+
+          uint32_t colFlg = color->cflg, outFlg = output->cflg;
+          bool color_srgb = (colFlg & (TEXCF_SRGBREAD | TEXCF_SRGBWRITE)) &&
+            (drv3d_metal::Texture::format2Metal(colFlg & TEXFMT_MASK) == drv3d_metal::Texture::format2MetalsRGB(colFlg & TEXFMT_MASK));
+          bool output_srgb = (outFlg & (TEXCF_SRGBREAD | TEXCF_SRGBWRITE)) &&
+            (drv3d_metal::Texture::format2Metal(outFlg & TEXFMT_MASK) == drv3d_metal::Texture::format2MetalsRGB(outFlg & TEXFMT_MASK));
+          // upscale breaks when input is srgb and output is not, even though the formats are passed correctly
+          G_ASSERT(color_srgb == output_srgb);
+
+          id<MTLFence> fence = nil;
+          if (@available(iOS 16, macos 13, *))
+          {
+            // create fake blit encoder that's gonna wait for corresponding encoders
+            if (manual_hazard_tracking)
+            {
+              ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::Blit);
+              track_resource_read(*color->apiTex);
+              track_resource_read(*motion->apiTex);
+              track_resource_read(*depth->apiTex);
+              track_resource_write(*output->apiTex);
+              G_ASSERT(current_encoder);
+              fence = encoders[current_encoder->index].fence;
+            }
+            ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::None);
+
+            uint64_t hash = 0;
+            hash_combine(hash, color->getWidth());
+            hash_combine(hash, color->getHeight());
+            hash_combine(hash, color->metal_format);
+            hash_combine(hash, motion->metal_format);
+            hash_combine(hash, depth->metal_format);
+            hash_combine(hash, output->getWidth());
+            hash_combine(hash, output->getHeight());
+            hash_combine(hash, output->metal_format);
+
+            if (upscale.scalers.find(hash) == upscale.scalers.end())
+            {
+              MTLFXTemporalScalerDescriptor *temporalScalerDescriptor = [[MTLFXTemporalScalerDescriptor alloc] init];
+
+              temporalScalerDescriptor.inputWidth = color->getWidth();
+              temporalScalerDescriptor.inputHeight = color->getHeight();
+              temporalScalerDescriptor.colorTextureFormat = color->metal_format;
+              temporalScalerDescriptor.motionTextureFormat = motion->metal_format;
+              temporalScalerDescriptor.depthTextureFormat = depth->metal_format;
+              temporalScalerDescriptor.outputWidth = output->getWidth();
+              temporalScalerDescriptor.outputHeight = output->getHeight();
+              temporalScalerDescriptor.outputTextureFormat = output->metal_format;
+              temporalScalerDescriptor.inputContentPropertiesEnabled = false;
+              temporalScalerDescriptor.autoExposureEnabled = true;
+              upscale.scalers[hash] = [temporalScalerDescriptor newTemporalScalerWithDevice : device];
+              [temporalScalerDescriptor release];
+            }
+            id<MTLFXTemporalScaler> scaler = upscale.scalers[hash];
+
+            if (manual_hazard_tracking)
+            {
+              G_ASSERT(fence != nil);
+              scaler.fence = fence;
+            }
+            scaler.jitterOffsetX = jitterX;
+            scaler.jitterOffsetY = jitterY;
+            scaler.motionVectorScaleX = motionScaleX;
+            scaler.motionVectorScaleY = motionScaleY;
+            scaler.inputContentWidth = color->getWidth();
+            scaler.inputContentHeight = color->getHeight();
+            scaler.depthReversed = true;
+            scaler.outputTexture = output->apiTex->texture;
+            scaler.colorTexture = color->apiTex->texture;
+            scaler.depthTexture = depth->apiTex->texture;
+            scaler.motionTexture = motion->apiTex->texture;
+            [scaler encodeToCommandBuffer : commandBuffer];
+            scaler.outputTexture = nullptr;
+            scaler.colorTexture = nullptr;
+            scaler.depthTexture = nullptr;
+            scaler.motionTexture = nullptr;
+          }
+#endif
+        }
+        break;
         case CommandType::DoQuery:
         {
           Query *query = nullptr;
-          command_encoder.read(query);
+          uint32_t generation = 0;
+          uint64_t submit = 0;
+          command_encoder.read(query).read(generation).read(submit);
 
           G_ASSERT(query);
-          [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
-            query->value = *((uint64_t *)((uint8_t *)[query_buffer contents] + query->offset));
-            query->status = 0;
+          [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer)
+          {
+            // generation mismatch means the query was released (and maybe reused),
+            // submit mismatch means it was restarted; both make this result stale
+            render.queries.lock();
+            if (generation == query->generation && submit == query->submit)
+            {
+              query->value = *((uint64_t *)((uint8_t *)[query_buffer contents] + query->index*sizeof(uint64_t)));
+              query->status = Query::Status::Done;
+            }
+            render.queries.unlock();
           }];
         }
         break;
@@ -2647,7 +3021,6 @@ namespace drv3d_metal
     wait |= copyBackbuffer(commandBuffer);
 
     ensureHaveEncoderExceptRender(commandBuffer, Render::EncoderType::None);
-    ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::None);
 
     if (present && drawable_acquired)
     {
@@ -2657,8 +3030,40 @@ namespace drv3d_metal
       backbuffer->apiTex->texture = nil;
       backbuffer->apiTex->sub_texture = nil;
     }
+    if (enable_postmortem)
+    {
+      std::lock_guard<std::mutex> scopedLock(command_buffer_mutex);
+      command_buffers[commandBuffer] = command_buffer_labels;
+      command_buffer_labels.clear();
+    }
     frames_completed[frame % MAX_FRAMES_TO_RENDER] = submitCommandBuffer(commandBuffer, wait);
     commandBuffer = nil;
+  }
+
+  // Only the swapchain layer changes: device, shaders and resources all stay. Called between frames,
+  // so no drawable is held and the layer can be reconfigured in place.
+  bool Render::applyHdrModeChange()
+  {
+    G_ASSERT_RETURN(is_main_thread(), false); // CAMetalLayer state belongs to the ui thread
+    G_ASSERT(!drawable_acquired);
+
+    // Gated like view creation: the setting alone can ask for hdr on a display that cannot show it.
+    const bool wantHdr = [mainview isHDREnabled] && [mainview isHDRAvailable];
+    const int fmt = wantHdr ? TEXFMT_A2R10G10B10 : TEXFMT_A8R8G8B8;
+    if (backbuffer->base_format == fmt)
+      return true;
+
+    flush(true); // retire command buffers still referencing a drawable of the old format
+    [mainview setHDR:wantHdr];
+
+    // Patched in place instead of recreated: the backbuffer is recognized by object identity, so a
+    // new one would orphan the bound render target and everything holding get_backbuffer_tex().
+    backbuffer->base_format = fmt;
+    backbuffer->metal_format = Texture::format2Metal(fmt);
+    backbuffer->metal_rt_format = Texture::format2Metal(fmt);
+
+    debug("metal: hdr mode changed, backbuffer is %s", wantHdr ? "hdr" : "sdr");
+    return true;
   }
 
   void Render::flush(bool wait, bool present)
@@ -2667,7 +3072,16 @@ namespace drv3d_metal
 
     checkRenderAcquired();
 
+    applyQueuedBindlessUpdates();
+
+    ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::None);
+
     std::lock_guard<std::mutex> scopedLock(copy_tex_lock);
+
+    for (auto blas : blases2create)
+      addResource(blas);
+    commitResidencySet();
+    blases2create.clear();
 
     executeCommands(wait, present);
     command_encoder.clear();
@@ -2688,6 +3102,7 @@ namespace drv3d_metal
     cur_prog = nullptr;
     cur_state = nullptr;
     bindless_resources_bound = 0;
+    bindless_resources_bound_vs = 0;
   }
 
   bool Render::setBlendFactor(E3DCOLOR factor)
@@ -2727,7 +3142,7 @@ namespace drv3d_metal
           attach.load_action = MTLLoadActionClear;
         }
       }
-      if (what & CLEAR_DISCARD_TARGET)
+      if (what & DISCARD_TARGET)
       {
         for (int i = 0; i < Program::MAX_SIMRT; ++i)
         {
@@ -2737,15 +3152,15 @@ namespace drv3d_metal
       }
       if (what & (CLEAR_ZBUFFER | CLEAR_STENCIL))
       {
-        G_ASSERT(what & CLEAR_ZBUFFER);
-        rt.depth.load_action = MTLLoadActionClear;
+        rt.depth.load_action = what & CLEAR_ZBUFFER ? MTLLoadActionClear : MTLLoadActionLoad;
         rt.depth.clear_value[0] = z;
-        rt.depth.clear_value[1] = stencil;
+        rt.stencil.load_action = what & CLEAR_STENCIL ? MTLLoadActionClear : MTLLoadActionLoad;
+        rt.stencil.clear_value[0] = stencil;
       }
-      if (what & (CLEAR_DISCARD_ZBUFFER | CLEAR_DISCARD_STENCIL))
+      if (what & (DISCARD_ZBUFFER | DISCARD_STENCIL))
       {
-        G_ASSERT(what & CLEAR_DISCARD_ZBUFFER);
-        rt.depth.load_action = MTLLoadActionDontCare;
+        rt.depth.load_action = what & DISCARD_ZBUFFER ? MTLLoadActionDontCare : MTLLoadActionLoad;
+        rt.stencil.load_action = what & DISCARD_STENCIL ? MTLLoadActionDontCare : MTLLoadActionLoad;
       }
       updateEncoder(what, c, z, stencil);
     }
@@ -2753,7 +3168,7 @@ namespace drv3d_metal
     {
       if (encoder_type != EncoderType::Render)
         updateEncoder();
-      doClear(nullptr, 0, 0, z, c, false, what & CLEAR_TARGET, what & CLEAR_ZBUFFER);
+      doClear(nullptr, nullptr, 0, 0, z, stencil, c, false, what & CLEAR_TARGET, what & CLEAR_ZBUFFER, what & CLEAR_STENCIL);
     }
   }
 
@@ -2801,7 +3216,7 @@ namespace drv3d_metal
       G_ASSERT(stride < 256);
       cur_rstate.vbuffer_stride[slot] = stride;
     }
-    stage.setBuf(storages[rstage], RemapBufferSlot(bf_type, slot), buffer, offset);
+    stage.setBuf(storages[rstage], cur_prog ? cur_prog->shaders[rstage] : nullptr, RemapBufferSlot(bf_type, slot), buffer, offset);
   }
 
   void Render::setImmediateConst(unsigned rstage, const uint32_t *data, unsigned num_words)
@@ -2826,7 +3241,7 @@ namespace drv3d_metal
     checkRenderAcquired();
 
     Render::StageBinding &stage = stages[rstage];
-    stage.setTex(storages[rstage], slot, tex, tex ? tex->isReadStencil() : false, mip_level, slice, as_uint);
+    stage.setTex(storages[rstage], cur_prog ? cur_prog->shaders[rstage] : nullptr, slot, tex, mip_level, slice, as_uint);
   }
 
   int Render::setSampler(unsigned rstage, int slot, int sampler, float bias)
@@ -2841,40 +3256,45 @@ namespace drv3d_metal
 
   void Render::removeResource(id<MTLResource> res)
   {
-    if (res == nil)
-      return;
-    auto it = resource_residency.find(res);
-    if (it != resource_residency.end())
+    if (@available(iOS 18, macOS 15.0, *))
     {
-      if (it->second == 1)
+      if (res == nil || residencySet == nil)
+        return;
+
+      auto it = resource_residency.find(res);
+      if (it != resource_residency.end())
       {
-        if (@available(iOS 18, macOS 15.0, *))
+        if (it->second == 1)
         {
           [residencySet removeAllocation:res];
-          bindless_set_dirty = true;
+          resource_residency.erase(it);
+
+          residency_set_dirty = true;
         }
-        resource_residency.erase(it);
+        else
+          it->second--;
       }
-      else
-        it->second--;
     }
   }
 
   void Render::addResource(id<MTLResource> res)
   {
     G_ASSERT(res);
-    auto it = resource_residency.find(res);
-    if (it == resource_residency.end())
+    if (@available(iOS 18, macOS 15.0, *))
     {
-      if (@available(iOS 18, macOS 15.0, *))
+      if (residencySet == nil)
+        return;
+      auto it = resource_residency.find(res);
+      if (it == resource_residency.end())
       {
+
         [residencySet addAllocation:res];
-        bindless_set_dirty = true;
+        residency_set_dirty = true;
+        resource_residency[res] = 1;
       }
-      resource_residency[res] = 1;
+      else
+        it->second++;
     }
-    else
-      it->second++;
   }
 
   bool Render::BindlessTextureCache::update(uint32_t index, D3dResource *res)
@@ -2885,13 +3305,16 @@ namespace drv3d_metal
 
     id<MTLTexture> metal_tex = nil;
     if (texture)
-      texture->apply(metal_tex, false, 0, 0, false, false);
+      texture->apply(metal_tex, 0, 0, false, false);
 
     if (cache[index].tex == texture && cache[index].metal_tex == metal_tex)
       return false;
 
-    if (res)
-      render.removeResource(cache[index].metal_tex);
+    if (cache[index].metal_tex)
+    {
+      std::lock_guard<std::mutex> scopedLock(render.delete_lock);
+      render.residency2delete.push_back({ .type = DeletedResource::Type::RemoveFromResidency, .submit = render.submits_scheduled, .native_resource = cache[index].metal_tex });
+    }
     cache[index] = { texture, metal_tex };
     if (res)
       render.addResource(cache[index].metal_tex);
@@ -2916,8 +3339,11 @@ namespace drv3d_metal
     if (cache[index].buf == buffer && cache[index].metal_buf == metal_buffer)
       return false;
 
-    if (res)
-      render.removeResource(cache[index].metal_buf);
+    if (cache[index].metal_buf)
+    {
+      std::lock_guard<std::mutex> scopedLock(render.delete_lock);
+      render.residency2delete.push_back({ .type = DeletedResource::Type::RemoveFromResidency, .submit = render.submits_scheduled, .native_resource = cache[index].metal_buf });
+    }
     cache[index] = { buffer, metal_buffer };
     if (res)
       render.addResource(cache[index].metal_buf);
@@ -2961,50 +3387,19 @@ namespace drv3d_metal
         return false;
       bindless_resources_bound &= ~BindlessTypeTexture2DArray;
     }
+    else if (D3DResourceType::VOLTEX == resType)
+    {
+      if (!bindlessTextures3D.update(index, res))
+        return false;
+      bindless_resources_bound &= ~BindlessTypeTexture3D;
+    }
+    else if (D3DResourceType::CUBEARRTEX == resType)
+    {
+      if (!bindlessTexturesCubeArray.update(index, res))
+        return false;
+      bindless_resources_bound &= ~BindlessTypeTextureCubeArray;
+    }
     return true;
-  }
-
-  int Render::copyBindlessResources(D3DResourceType type, uint32_t src, uint32_t dst, uint32_t count)
-  {
-    checkRenderAcquired();
-
-    if (D3DResourceType::SBUF == type)
-    {
-      for (uint32_t i = 0; i < count; i++)
-      {
-        bindlessBuffers.update(dst + i, bindlessBuffers.cache[src + i].buf);
-        bindlessBuffers.update(src + i, nullptr);
-      }
-      bindless_resources_bound &= ~BindlessTypeBuffer;
-    }
-    else if (D3DResourceType::TEX == type)
-    {
-      for (uint32_t i = 0; i < count; i++)
-      {
-        bindlessTextures2D.update(dst + i, bindlessTextures2D.cache[src + i].tex);
-        bindlessTextures2D.update(src + i, nullptr);
-      }
-      bindless_resources_bound &= ~BindlessTypeTexture2D;
-    }
-    else if (D3DResourceType::CUBETEX == type)
-    {
-      for (uint32_t i = 0; i < count; i++)
-      {
-        bindlessTexturesCube.update(dst + i, bindlessTexturesCube.cache[src + i].tex);
-        bindlessTexturesCube.update(src + i, nullptr);
-      }
-      bindless_resources_bound &= ~BindlessTypeTextureCube;
-    }
-    else if (D3DResourceType::ARRTEX == type)
-    {
-      for (uint32_t i = 0; i < count; i++)
-      {
-        bindlessTextures2DArray.update(dst + i, bindlessTextures2DArray.cache[src + i].tex);
-        bindlessTextures2DArray.update(src + i, nullptr);
-      }
-      bindless_resources_bound &= ~BindlessTypeTexture2DArray;
-    }
-    return 1;
   }
 
   int Render::updateBindlessResourcesToNull(D3DResourceType type, uint32_t index, uint32_t count)
@@ -3043,8 +3438,169 @@ namespace drv3d_metal
       if (update)
         bindless_resources_bound &= ~BindlessTypeTexture2DArray;
     }
+    else if (D3DResourceType::VOLTEX == type)
+    {
+      bool update = false;
+      for (uint32_t i = 0; i < count; i++)
+        update |= bindlessTextures3D.update(index + i, nullptr);
+      if (update)
+        bindless_resources_bound &= ~BindlessTypeTexture3D;
+    }
+    else if (D3DResourceType::CUBEARRTEX == type)
+    {
+      bool update = false;
+      for (uint32_t i = 0; i < count; i++)
+        update |= bindlessTexturesCubeArray.update(index + i, nullptr);
+      if (update)
+        bindless_resources_bound &= ~BindlessTypeTextureCubeArray;
+    }
 
     return 1;
+  }
+
+  void Render::resizeBindlessArray(D3DResourceType type, uint32_t new_size)
+  {
+    if (D3DResourceType::SBUF == type)
+    {
+      G_ASSERTF(new_size <= BINDLESS_BUFFER_COUNT, "bindless buffer slot out of range: %d (max slot id: %d)", new_size,
+        BINDLESS_BUFFER_COUNT);
+      bindlessBuffers.resize(new_size);
+    }
+    else
+    {
+      G_ASSERTF(new_size <= BINDLESS_TEXTURE_COUNT, "bindless texture slot out of range: %d (max slot id: %d)", new_size,
+        BINDLESS_TEXTURE_COUNT);
+      if (type == D3DResourceType::TEX)
+        bindlessTextures2D.resize(new_size);
+      else if (type == D3DResourceType::CUBETEX)
+        bindlessTexturesCube.resize(new_size);
+      else if (type == D3DResourceType::ARRTEX)
+        bindlessTextures2DArray.resize(new_size);
+      else if (type == D3DResourceType::VOLTEX)
+        bindlessTextures3D.resize(new_size);
+      else if (type == D3DResourceType::CUBEARRTEX)
+        bindlessTexturesCubeArray.resize(new_size);
+      else
+        G_ASSERTF(0, "Unknown bindless array type %d", int(type));
+    }
+  }
+
+  bool Render::updateBindlessResourceAnyThread(D3DResourceType type, uint32_t index, const dag::ConstSpan<D3dResource *>& resources)
+  {
+    if (isRenderAcquiredInThisThread())
+    {
+      applyQueuedBindlessUpdates();
+      bool result = true;
+      for (uint32_t i = 0; i < resources.size(); ++i)
+        if (resources[i])
+          result &= updateBindlessResource(type, index + i, resources[i]);
+        else
+          updateBindlessResourcesToNull(type, index + i, 1);
+      return result;
+    }
+
+    std::lock_guard<std::mutex> lock(pending_bindless_lock);
+    for (uint32_t i = 0; i < resources.size(); ++i)
+      if (resources[i])
+        pending_bindless_updates.push_back({PendingBindlessUpdate::Op::Update, type, index + i, 0, resources[i]});
+      else
+        pending_bindless_updates.push_back({PendingBindlessUpdate::Op::Null, type, index + i, 1, nullptr});
+    pending_bindless_count.fetch_add(resources.size(), std::memory_order_release);
+    return true;
+  }
+
+  void Render::updateBindlessResourcesToNullAnyThread(D3DResourceType type, uint32_t index, uint32_t count)
+  {
+    if (isRenderAcquiredInThisThread())
+    {
+      applyQueuedBindlessUpdates();
+      updateBindlessResourcesToNull(type, index, count);
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(pending_bindless_lock);
+    pending_bindless_updates.push_back({PendingBindlessUpdate::Op::Null, type, index, count, nullptr});
+    pending_bindless_count.fetch_add(1, std::memory_order_release);
+  }
+
+  void Render::resizeBindlessArrayAnyThread(D3DResourceType type, uint32_t new_size)
+  {
+    if (isRenderAcquiredInThisThread())
+    {
+      resizeBindlessArray(type, new_size);
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(pending_bindless_lock);
+    pending_bindless_updates.push_back({PendingBindlessUpdate::Op::Resize, type, new_size, 0, nullptr});
+    pending_bindless_count.fetch_add(1, std::memory_order_release);
+  }
+
+  void Render::updateBindlessSampler(uint32_t slot, float bias, uint64_t sampler_res_id)
+  {
+    G_ASSERT(slot < BINDLESS_SAMPLER_COUNT);
+    if (bindlessSamplerBiases.size() < slot + 1)
+    {
+      bindlessSamplerBiases.resize(slot + 1);
+      bindlessSamplersCache.resize(slot + 1);
+    }
+    bindlessSamplerBiases[slot] = bias;
+    bindlessSamplersCache[slot] = sampler_res_id;
+    bindless_resources_bound &= ~BindlessTypeSampler;
+  }
+
+  void Render::updateBindlessSamplerAnyThread(uint32_t slot, float bias, uint64_t sampler_res_id)
+  {
+    if (isRenderAcquiredInThisThread())
+    {
+      applyQueuedBindlessUpdates();
+      updateBindlessSampler(slot, bias, sampler_res_id);
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(pending_bindless_lock);
+    pending_bindless_updates.push_back(
+      {PendingBindlessUpdate::Op::Sampler, D3DResourceType::TEX, slot, 0, nullptr, bias, sampler_res_id});
+    pending_bindless_count.fetch_add(1, std::memory_order_release);
+  }
+
+  void Render::purgeQueuedBindlessUpdates(D3dResource *res)
+  {
+    if (pending_bindless_count.load(std::memory_order_acquire) == 0)
+      return;
+
+    std::lock_guard<std::mutex> lock(pending_bindless_lock);
+    for (auto &u : pending_bindless_updates)
+      if (u.op == PendingBindlessUpdate::Op::Update && u.res == res)
+      {
+        u.op = PendingBindlessUpdate::Op::Null;
+        u.res = nullptr;
+        u.count = 1;
+      }
+  }
+
+  void Render::applyQueuedBindlessUpdates()
+  {
+    if (pending_bindless_count.load(std::memory_order_acquire) == 0)
+      return;
+
+    checkRenderAcquired();
+
+    // held across the whole drain, so a delete on another thread lands either before an entry is applied
+    // (purgeQueuedBindlessUpdates turns it into Null) or after, never in between
+    std::lock_guard<std::mutex> lock(pending_bindless_lock);
+    for (const auto &u : pending_bindless_updates)
+    {
+      switch (u.op)
+      {
+        case PendingBindlessUpdate::Op::Resize: resizeBindlessArray(u.type, u.index); break;
+        case PendingBindlessUpdate::Op::Update: updateBindlessResource(u.type, u.index, u.res); break;
+        case PendingBindlessUpdate::Op::Null: updateBindlessResourcesToNull(u.type, u.index, u.count); break;
+        case PendingBindlessUpdate::Op::Sampler: updateBindlessSampler(u.index, u.bias, u.samplerResId); break;
+      }
+    }
+    pending_bindless_updates.clear();
+    pending_bindless_count.store(0, std::memory_order_release);
   }
 
   bool Render::draw(int prim_type, int start_vertex, int vertex_count, uint32_t num_instances, uint32_t start_instance)
@@ -3053,9 +3609,6 @@ namespace drv3d_metal
 
     if (prim_type == 6 || vertex_count == 0)
       return false;
-
-    if (number_of_frames_to_skip_after_error)
-      return true;
 
     if (num_instances == 0)
       return false;
@@ -3074,9 +3627,6 @@ namespace drv3d_metal
     checkRenderAcquired();
     if (prim_type == 6 || index_count == 0)
       return false;
-
-    if (number_of_frames_to_skip_after_error)
-      return true;
 
     if (num_instances == 0)
       return false;
@@ -3109,9 +3659,6 @@ namespace drv3d_metal
     if (prim_type == 6)
       return false;
 
-    if (number_of_frames_to_skip_after_error)
-      return true;
-
     if (applyStates() == false)
       return true;
 
@@ -3138,9 +3685,6 @@ namespace drv3d_metal
 
     if (prim_type == 6)
       return false;
-
-    if (number_of_frames_to_skip_after_error)
-      return true;
 
     if (applyStates() == false)
       return true;
@@ -3204,6 +3748,12 @@ namespace drv3d_metal
       return false;
     }
 
+    // TODO: a proper limit for X dimension
+    constexpr uint32_t MAX_THREAD_GROUPS_PER_DIMENSION = 65535;
+    D3D_CONTRACT_ASSERT(x <= MAX_THREAD_GROUPS_PER_DIMENSION);
+    D3D_CONTRACT_ASSERT(y == 1);
+    D3D_CONTRACT_ASSERT(z == 1);
+
     if (applyStates() == false)
       return true;
 
@@ -3260,11 +3810,13 @@ namespace drv3d_metal
 #endif
   }
 
-  int Render::createVertexShader(const uint8_t* code)
+  int Render::createVertexShader(const uint8_t* code, const uint8_t *meta, const char *name)
   {
     Shader* shader = new Shader();
+    if (name)
+      shader->name = name;
 
-    if (!shader->compileShader((const char*)code, async_pso_compilation && can_use_async_pso_compilation))
+    if (!shader->compileShader(meta, (const char*)code, 0, async_pso_compilation && can_use_async_pso_compilation))
     {
       shader->release();
 
@@ -3284,11 +3836,13 @@ namespace drv3d_metal
     resources2delete.push_back({ .type = DeletedResource::Type::Shader, .submit = submits_scheduled, .shader = vs });
   }
 
-  int Render::createPixelShader(const uint8_t* code)
+  int Render::createPixelShader(const uint8_t* code, const uint8_t *meta, const char *name)
   {
     Shader* shader = new Shader();
+    if (name)
+      shader->name = name;
 
-    if (!shader->compileShader((const char*)code, async_pso_compilation && can_use_async_pso_compilation))
+    if (!shader->compileShader(meta, (const char*)code, 0, async_pso_compilation && can_use_async_pso_compilation))
     {
       delete shader;
       return BAD_FSHADER;
@@ -3436,11 +3990,13 @@ namespace drv3d_metal
     resources2delete.push_back({ .type = DeletedResource::Type::Program, .submit = submits_scheduled, .program = prog });
   }
 
-  int Render::createComputeProgram(const uint8_t* code)
+  int Render::createComputeProgram(const uint8_t* code, const uint8_t *meta, const char *name)
   {
     Shader* shader = new Shader();
+    if (name)
+      shader->name = name;
 
-    if (!shader->compileShader((const char*)code, false))
+    if (!shader->compileShader(meta, (const char*)code, 0, false))
     {
       delete shader;
       return BAD_FSHADER;
@@ -3510,7 +4066,10 @@ namespace drv3d_metal
     {
       ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Compute);
       if (current_cs_pipeline != clear_cs_pipeline)
-        command_encoder.write(CommandType::SetComputePipelineState).write(clear_cs_pipeline);
+      {
+        Program *prog = nullptr;
+        command_encoder.write(CommandType::SetComputePipelineState).write(clear_cs_pipeline).write(prog);
+      }
       current_cs_pipeline = clear_cs_pipeline;
     }
     command_encoder.write(CommandType::ClearBuffer).write(buf).write(buf_metal).write(buffer_size).write(channels).write(val, sizeof(unsigned)*4);
@@ -3521,31 +4080,43 @@ namespace drv3d_metal
     // called on buffer creation, can be queued to the beginning of the flush
     std::lock_guard<std::mutex> scopedLock(copy_tex_lock);
     G_ASSERT(buf);
-    track_resource_write_enqueued(*buf);
     buffers2clear.emplace_back(buf, buff);
+  }
+
+  void Render::commitResidencySet()
+  {
+    if (!residency_set_dirty)
+      return;
+
+    if (@available(iOS 18, macOS 15.0, *))
+    {
+      if (residencySet)
+        [residencySet commit];
+    }
+    residency_set_dirty = false;
   }
 
   void Render::dispatch(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z)
   {
+    FRAMEMEM_VALIDATE;
     checkRenderAcquired();
-
-    if (number_of_frames_to_skip_after_error)
-      return;
 
     G_ASSERT(thread_group_x);
     G_ASSERT(thread_group_y);
     G_ASSERT(thread_group_z);
 
-    if (!cur_prog || !cur_prog->cshader)
+    if (!cur_prog || !cur_prog->cshader || !cur_prog->csPipeline)
       return;
 
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Compute);
 
     if (current_cs_pipeline != cur_prog->csPipeline)
-      command_encoder.write(CommandType::SetComputePipelineState).write(cur_prog->csPipeline);
+      command_encoder.write(CommandType::SetComputePipelineState).write(cur_prog->csPipeline).write(cur_prog);
     current_cs_pipeline = cur_prog->csPipeline;
 
-    eastl::vector<Resource, framemem_allocator> resources;
+    commitResidencySet();
+
+    dag::Vector<Resource, framemem_allocator> resources;
     stages[STAGE_CS].apply(storages[STAGE_CS], cur_prog->cshader, resources);
 
     G_ASSERT(resources.size() < 256);
@@ -3561,6 +4132,7 @@ namespace drv3d_metal
 
   void Render::dispatch_indirect(Sbuffer* buffer, uint32_t offset)
   {
+    FRAMEMEM_VALIDATE;
     checkRenderAcquired();
 
     if (!d3d::get_driver_desc().caps.hasIndirectSupport)
@@ -3568,19 +4140,19 @@ namespace drv3d_metal
       D3D_ERROR("Metal: trying to use unsupported dispatch_indirect");
       return;
     }
-    if (number_of_frames_to_skip_after_error)
-      return;
 
-    if (!cur_prog || !cur_prog->cshader)
+    if (!cur_prog || !cur_prog->cshader || !cur_prog->csPipeline)
       return;
 
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Compute);
 
     if (current_cs_pipeline != cur_prog->csPipeline)
-      command_encoder.write(CommandType::SetComputePipelineState).write(cur_prog->csPipeline);
+      command_encoder.write(CommandType::SetComputePipelineState).write(cur_prog->csPipeline).write(cur_prog);
     current_cs_pipeline = cur_prog->csPipeline;
 
-    eastl::vector<Resource, framemem_allocator> resources;
+    commitResidencySet();
+
+    dag::Vector<Resource, framemem_allocator> resources;
     stages[STAGE_CS].apply(storages[STAGE_CS], cur_prog->cshader, resources);
 
     G_ASSERT(resources.size() < 256);
@@ -3604,7 +4176,7 @@ namespace drv3d_metal
 
     G_ASSERT(tex);
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Blit);
-    command_encoder.write(CommandType::GenerateMips).write(tex).write(tex->apiTex->texture);
+    command_encoder.write(CommandType::GenerateMips).write(tex->apiTex).write(tex->apiTex->texture);
   }
 
   static inline bool is_depth_format(unsigned int f)
@@ -3624,6 +4196,7 @@ namespace drv3d_metal
       for (int i = 0; i < Program::MAX_SIMRT; i++)
         rt.colors[i] = {};
       rt.depth = {};
+      rt.stencil = {};
       dirty_state &= ~DirtyFlags::Viewport;
       need_change_rt = 1;
 
@@ -3634,6 +4207,8 @@ namespace drv3d_metal
       attach.layer = 0;
       attach.load_action = MTLLoadActionLoad;
       attach.store_action = MTLStoreActionMultisampleResolve;
+      if (is_depth_format(src->cflg))
+        rt.stencil = rt.depth;
 
       checkNoRenderPass();
 
@@ -3642,8 +4217,21 @@ namespace drv3d_metal
       return;
     }
 
+    G_ASSERT(dest->mipLevels <= src->mipLevels);
+    G_ASSERT(dest->type == src->type);
+    G_ASSERT(dest->depth <= src->depth);
+    G_ASSERT(dest->width <= src->width);
+    G_ASSERT(dest->height <= src->height);
     command_encoder.write(CommandType::CopyTex).write(src).write(dest);
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Blit);
+  }
+
+  bool Render::isRenderAcquiredInThisThread()
+  {
+    uint64_t cur_thread = 0;
+    pthread_threadid_np(NULL, &cur_thread);
+
+    return render.acquire_depth > 0 && cur_thread == render.cur_thread;
   }
 
   void Render::copyTexRegion(Texture* src,
@@ -3651,16 +4239,13 @@ namespace drv3d_metal
                              Texture* dest, int dest_level, int dest_x, int dest_y, int dest_z)
   {
     G_ASSERT(!src->isStub());
-    uint64_t cur_thread = 0;
-    pthread_threadid_np(NULL, &cur_thread);
 
-    bool from_thread = render.acquire_depth == 0 || cur_thread != render.cur_thread;
+    bool from_thread = !isRenderAcquiredInThisThread();
 
     TexCopyRegion region(dest, dest_level, dest_x, dest_y, dest_z, src, src_level, src_x, src_y, src_z, src_w, src_h, src_d);
     if (from_thread)
     {
       std::lock_guard<std::mutex> scopedLock(copy_tex_lock);
-      track_resource_write_enqueued(*dest);
       regions2copy.push_back(region);
     }
     else
@@ -3694,26 +4279,28 @@ namespace drv3d_metal
     }
   }
 
-  void Render::setDepth(const RenderAttachment& attach)
+  void Render::setDepth(const RenderAttachment& depth, const RenderAttachment& stencil)
   {
     checkNoRenderPass();
     checkRenderAcquired();
 
-    G_ASSERT(!attach.texture || !attach.texture->memoryless || attach.load_action != MTLLoadActionLoad);
+    G_ASSERT(!depth.texture || !depth.texture->memoryless || depth.load_action != MTLLoadActionLoad);
+    G_ASSERT(stencil.texture == nullptr || stencil.texture == depth.texture);
 
-    rt.depth = attach;
+    rt.depth = depth;
+    rt.stencil = stencil;
 
     need_change_rt = 1;
     cached_viewport.originX = -FLT_MAX;
 
     dirty_state &= ~DirtyFlags::Viewport;
 
-    if (attach.texture)
+    if (depth.texture)
     {
       sci_x = 0;
       sci_y = 0;
-      sci_w = max(1, attach.texture->width >> attach.level);
-      sci_h = max(1, attach.texture->height >> attach.level);
+      sci_w = max(1, depth.texture->width >> depth.level);
+      sci_h = max(1, depth.texture->height >> depth.level);
     }
   }
 
@@ -3721,7 +4308,7 @@ namespace drv3d_metal
   {
     acquireOwnership();
 
-    doClear(tex, level, layer, 0.0f, (float *)val, true, true, false);
+    doClear(tex, nullptr, level, layer, 0.0f, 0, (float *)val, true, true, false, false);
 
     releaseOwnership();
   }
@@ -3730,7 +4317,7 @@ namespace drv3d_metal
   {
     acquireOwnership();
 
-    doClear(tex, level, layer, 0.0f, (float *)val, true, true, false);
+    doClear(tex, nullptr, level, layer, 0.0f, 0, (float *)val, true, true, false, false);
 
     releaseOwnership();
   }
@@ -3739,7 +4326,17 @@ namespace drv3d_metal
   {
     acquireOwnership();
 
-    doClear(tex, level, layer, 0.0f, (float *)val, false, true, false);
+    doClear(tex, nullptr, level, layer, 0.0f, 0, (float *)val, false, true, false, false);
+
+    releaseOwnership();
+  }
+
+  void Render::clearDepthStencil(Texture *tex, float z, uint8_t stencil, int level, int layer)
+  {
+    acquireOwnership();
+
+    float col[4] = {};
+    doClear(nullptr, tex, level, layer, z, stencil, col, false, false, true, true);
 
     releaseOwnership();
   }
@@ -3747,7 +4344,6 @@ namespace drv3d_metal
   void Render::clearTexture(Texture* tex)
   {
     std::lock_guard<std::mutex> scopedLock(copy_tex_lock);
-    track_resource_write_enqueued(*tex);
     textures2clear.emplace_back(tex);
   }
 
@@ -3767,6 +4363,10 @@ namespace drv3d_metal
     G_ASSERT(dst);
     G_ASSERTF(dst->getDynamicOffset() == 0, "Buffer %s should have zero dynamic offset, but got %d", dst->getName(),
               dst->getDynamicOffset());
+    // blit copy needs 4 byte aligned offsets and size
+    D3D_CONTRACT_ASSERTF_AND_DO((srcOffset & 3) == 0, return, "unaligned copy src offset %d of buffer %s", srcOffset, src->getName());
+    D3D_CONTRACT_ASSERTF_AND_DO((dstOffset & 3) == 0, return, "unaligned copy dst offset %d of buffer %s", dstOffset, dst->getName());
+    D3D_CONTRACT_ASSERTF_AND_DO((size & 3) == 0, return, "unaligned copy size %d of buffer %s", size, src->getName());
 
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Blit);
     command_encoder.write(CommandType::CopyBuf).write(src).write(src_metal).write(dst).write(dst_metal).write(srcOffset).write(dstOffset).write(size);
@@ -3798,13 +4398,13 @@ namespace drv3d_metal
     StageBinding& vs_stage = stages[STAGE_VS];
     StageBinding& ps_stage = stages[STAGE_PS];
 
-    vs_stage.setBuf(storages[STAGE_VS], 0, (Buffer*)clear_mesh_buffer);
+    vs_stage.setBuf(storages[STAGE_VS], cur_prog ? cur_prog->shaders[STAGE_VS] : nullptr, 0, (Buffer*)clear_mesh_buffer);
     cur_rstate.vbuffer_stride[0] = 8;
 
     setProgram(copy_prog);
     setRenderTarget(dst, 0, 0);
 
-    ps_stage.setTex(storages[STAGE_PS], 0, src);
+    ps_stage.setTex(storages[STAGE_PS], cur_prog ? cur_prog->shaders[STAGE_PS] : nullptr, 0, src);
     setConstants(vs_stage, src_rect);
 
     if (dst_rect[0] != -1)
@@ -3822,23 +4422,31 @@ namespace drv3d_metal
 
   void Render::restoreDepth()
   {
-    setDepth({ .texture = nullptr });
+    setDepth({ .texture = nullptr }, { .texture = nullptr });
   }
 
-  void Render::doClear(Texture* dst, int dst_level, int dst_layer, float z, float color[4],
-                       bool clear_int, bool color_write, bool depth_write)
+  void Render::doClear(Texture *dst_col, Texture *dst_depth, int dst_level, int dst_layer, float z, uint8_t stencil, float color[4],
+                       bool clear_int, bool color_write, bool depth_write, bool stencil_write)
   {
-    StateSaver saver(*this, false, dst != nullptr, color_write, depth_write);
+    StateSaver saver(*this, false, dst_col != nullptr || dst_depth != nullptr, color_write, depth_write, stencil_write, stencil);
 
     StageBinding& vs_stage = stages[STAGE_VS];
     StageBinding& ps_stage = stages[STAGE_PS];
 
-    vs_stage.setBuf(storages[STAGE_VS], 0, (Buffer*)clear_mesh_buffer);
+    vs_stage.setBuf(storages[STAGE_VS], cur_prog ? cur_prog->shaders[STAGE_VS] : nullptr, 0, (Buffer*)clear_mesh_buffer);
     cur_rstate.vbuffer_stride[0] = 8;
 
-    setProgram(clear_int ? (is_signed_int_format(dst) ? clear_progi : clear_progui) : clear_progf);
-    if (dst)
-      setRenderTarget(dst, dst_level, dst_layer);
+    setProgram(clear_int ? (is_signed_int_format(dst_col) ? clear_progi : clear_progui) : clear_progf);
+    if (dst_col)
+      setRenderTarget(dst_col, dst_level, dst_layer);
+    else if (dst_depth)
+    {
+      for (int i = 0; i < Program::MAX_SIMRT; i++)
+        rt.colors[i] = {};
+
+      RenderAttachment depth_attach {.texture = dst_depth, .level = uint32_t(dst_level), .layer = uint32_t(dst_layer)};
+      setDepth(depth_attach, depth_attach);
+    }
 
     setConstants(vs_stage, z);
     setConstants(ps_stage, color);
@@ -3870,7 +4478,7 @@ namespace drv3d_metal
         G_ASSERT(has_color || rt.depth.texture || (!has_color && !rt.depth.texture && cur_prog->pshader->output_mask == 0));
       }
 #endif
-      command_encoder.write(CommandType::SetPipelineState).write(cur_state);
+      command_encoder.write(CommandType::SetPipelineState).write(cur_state).write(cur_prog);
     }
     return true;
   }
@@ -3887,8 +4495,11 @@ namespace drv3d_metal
       {
         cur_depthstate.zenable = 0;
         cur_depthstate.depth_write_on = 0;
-        cur_depthstate.stencil_enable = false;
+
       }
+      bool has_stencil = rt.stencil.texture && rt.stencil.texture->metal_format == MTLPixelFormatDepth32Float_Stencil8;
+      if (!has_stencil)
+        cur_depthstate.stencil_enable = false;
 
       updateDepthState();
 
@@ -3896,8 +4507,9 @@ namespace drv3d_metal
       {
         cur_depthstate.zenable = prev_zenable;
         cur_depthstate.depth_write_on = prev_depth_write_on;
-        cur_depthstate.stencil_enable = prev_stencil;
       }
+      if (!has_stencil)
+        cur_depthstate.stencil_enable = prev_stencil;
 
       command_encoder.write(CommandType::SetDepthState).write(cur_depthstate.depthState);
     }
@@ -3972,6 +4584,8 @@ namespace drv3d_metal
 
   bool Render::applyStates()
   {
+    FRAMEMEM_VALIDATE;
+
     if (need_change_rt)
       updateEncoder();
 
@@ -3982,6 +4596,8 @@ namespace drv3d_metal
       updateStates();
 
     TIME_PROFILE(applyStates);
+
+    commitResidencySet();
 
     ResourceArray resources;
     if (cur_prog->vshader)
@@ -4025,7 +4641,9 @@ namespace drv3d_metal
     }
     if (tex->type == D3DResourceType::VOLTEX && attach.layer != d3d::RENDER_TO_WHOLE_ARRAY)
       desc.depthPlane = attach.layer;
-    else if ((tex->type == D3DResourceType::CUBETEX || tex->type == D3DResourceType::ARRTEX) && attach.layer != d3d::RENDER_TO_WHOLE_ARRAY)
+    else if ((tex->type == D3DResourceType::CUBETEX || tex->type == D3DResourceType::ARRTEX ||
+               tex->type == D3DResourceType::CUBEARRTEX) &&
+             attach.layer != d3d::RENDER_TO_WHOLE_ARRAY)
       desc.slice = attach.layer;
 
     G_ASSERT(samples == -1 || samples == desc.texture.sampleCount);
@@ -4083,7 +4701,8 @@ namespace drv3d_metal
     MTLRenderPassDescriptor *render_desc = [MTLRenderPassDescriptor renderPassDescriptor];
 
     int samples = -1, layers = -1, clear_mask = 0;
-    float clear_depth = 0.0f, clear_color[4];
+    float clear_depth = 0.0f, clear_color[4] = {};
+    uint8_t clear_stencil = 0;
 
     bool has_color = false;
     for (int i = 0; i < Program::MAX_SIMRT; i++)
@@ -4133,30 +4752,37 @@ namespace drv3d_metal
           render_desc.depthAttachment.loadAction = MTLLoadActionLoad;
         }
       }
-
-      if (render_desc.depthAttachment.texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
-      {
-        fillAttachment(render_desc.stencilAttachment, attach, samples, layers, true);
-        if (attach.load_action == MTLLoadActionClear)
-          render_desc.stencilAttachment.clearStencil = attach.clear_value[1];
-      }
-
       if (!has_color)
       {
         cur_wd = max(1, attach.texture->width>>attach.level);
         cur_ht = max(1, attach.texture->height>>attach.level);
       }
+
+      if (render_desc.depthAttachment.texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
+      {
+        RenderAttachment& attach = rt.stencil;
+        fillAttachment(render_desc.stencilAttachment, attach, samples, layers, true);
+        if (attach.load_action == MTLLoadActionClear)
+        {
+          render_desc.stencilAttachment.clearStencil = attach.clear_value[0];
+          if (!fullscreen_vp && render_pass)
+          {
+            clear_stencil = attach.clear_value[0];
+            clear_mask |= CLEAR_STENCIL;
+            render_desc.stencilAttachment.loadAction = MTLLoadActionLoad;
+          }
+        }
+      }
     }
     else if (!has_color)
     {
-      G_ASSERT(dirty_state & DirtyFlags::Viewport);
-      G_ASSERT(rt.vp.w > 0);
-      G_ASSERT(rt.vp.h > 0);
+      G_ASSERT(rt.vp.w >= 0);
+      G_ASSERT(rt.vp.h >= 0);
 
       // apple hardware only supports 4 so lets use 4 if any msaa is set
       samples = forcedSampleCount < 2 ? 1 : 4;
-      render_desc.renderTargetWidth = rt.vp.x + rt.vp.w;
-      render_desc.renderTargetHeight = rt.vp.y + rt.vp.h;
+      render_desc.renderTargetWidth = max(rt.vp.x + rt.vp.w, 1.f);
+      render_desc.renderTargetHeight = max(rt.vp.y + rt.vp.h, 1.f);
       render_desc.defaultRasterSampleCount = samples;
     }
 
@@ -4181,13 +4807,14 @@ namespace drv3d_metal
     }
 #endif
 
-    command_encoder.write(CommandType::BeginPass).write(rt).write([render_desc retain]);
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Render);
+    command_encoder.write(CommandType::BeginPass).write(rt).write([render_desc retain]);
 
     // if there's gonna be pass break ensure its gonna be loaded back properly
     for (int i = 0; i < Program::MAX_SIMRT; i++)
       rt.colors[i].load_action = MTLLoadActionLoad;
     rt.depth.load_action = MTLLoadActionLoad;
+    rt.stencil.load_action = MTLLoadActionLoad;
 
     storages[STAGE_VS].reset();
     storages[STAGE_MS].reset();
@@ -4200,7 +4827,7 @@ namespace drv3d_metal
 
     if (depth_clip != MTLDepthClipModeClip)
       dirty_state |= DirtyFlags::DepthClip;
-    if ((fabs(depth_bias) > 0.00000001f && fabs(depth_slopebias) > 0.00000001f))
+    if ((fabs(depth_bias) > 0.00000001f || fabs(depth_slopebias) > 0.00000001f))
       dirty_state |= DirtyFlags::DepthBias;
     if (cur_cull != MTLCullModeNone)
       dirty_state |= DirtyFlags::Cull;
@@ -4210,6 +4837,8 @@ namespace drv3d_metal
       dirty_state |= DirtyFlags::Query;
     if (scissor_on)
       dirty_state |= DirtyFlags::Scissor;
+    if (stencil_ref != 0)
+      dirty_state |= DirtyFlags::StencilRef;
     if (blend_factor[0] != 0 || blend_factor[1] != 0 || blend_factor[2] != 0 || blend_factor[3] != 0)
       dirty_state |= DirtyFlags::BlendFactor;
 
@@ -4219,7 +4848,7 @@ namespace drv3d_metal
 
     if (!fullscreen_vp && render_pass && clear_mask)
     {
-      render.doClear(nullptr, 0, 0, clear_depth, clear_color, false, clear_mask & CLEAR_TARGET, clear_mask & CLEAR_ZBUFFER);
+      render.doClear(nullptr, nullptr, 0, 0, clear_depth, clear_stencil, clear_color, false, clear_mask & CLEAR_TARGET, clear_mask & CLEAR_ZBUFFER, clear_mask & CLEAR_STENCIL);
     }
   }
 
@@ -4294,7 +4923,6 @@ namespace drv3d_metal
     G_ASSERT(acquire_depth > 0);
     if (acquire_depth == 1)
     {
-      cur_thread = main_thread;
       ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::None);
 
       cur_prog = nullptr;
@@ -4314,48 +4942,49 @@ namespace drv3d_metal
     {
       G_ASSERT(acquire_depth <= 1);
       acquire_depth = 0;
-      cur_thread = main_thread;
       return ::full_leave_critical_section(acquireSec);
     }
     return -1;
   }
 
-  Render::Query* Render::createQuery()
+  Render::Query* Render::createQuery(Query::Type type)
   {
-    Query* q = NULL;
+    G_ASSERT(type == Query::Type::Event || type == Query::Type::Visibility);
+    queries.lock();
 
-    for (int i = 0; i < used_query; i++)
+    if (queries.totalUsed() >= QUERIES_MAX)
     {
-      if (!queries[i].used)
-      {
-        q = &queries[i];
-        break;
-      }
+      queries.unlock();
+      DAG_FATAL("Count of used queries was exceeded of max available value");
+      return NULL;
     }
 
-    if (!q)
-    {
-      if (used_query >= QUERIES_MAX)
-      {
-        DAG_FATAL("Count of used queries was exceeded of max available value");
-        return NULL;
-      }
+    int query = queries.alloc();
 
-      q = &queries[used_query];
-
-      used_query++;
-    }
-
-    q->status = 0;
-    q->used = 1;
+    // init under the lock so a stale handler of the previous incarnation can not
+    // observe or clobber a half initialized entry. generation is kept as is
+    Query* q = &queries[query];
+    q->ref_bit = 0; // clear the free bit left over from the free list link
+    q->value = 0;
+    q->submit = 0;
+    q->status = Query::Status::Invalid;
+    q->type = type;
+    q->index = query;
+    queries.unlock();
 
     return q;
   }
 
   void Render::startFence(Query* query)
   {
-    query->value = render.submits_scheduled;
-    query->status = 2;
+    checkRenderAcquired();
+
+    G_ASSERT(query);
+    G_ASSERT(query->type == Query::Type::Event);
+
+    query->value = 1;
+    query->submit = render.submits_scheduled;
+    query->status = Query::Status::Queued;
   }
 
   void Render::startQuery(Query* query)
@@ -4363,27 +4992,31 @@ namespace drv3d_metal
     checkRenderAcquired();
 
     G_ASSERT(query);
-    if (query)
-    {
-      Render::Query *local_query = query;
-      cur_query_offset = local_query->offset;
-      command_encoder.write(CommandType::DoQuery).write(query);
-    }
-    else
-    {
-      cur_query_offset = -1;
-    }
+    G_ASSERT(query->type == Query::Type::Visibility);
 
+    queries.lock();
+    query->status = Query::Status::Queued;
+    queries.unlock();
+
+    cur_query_offset = query->index*sizeof(uint64_t);
     dirty_state |= DirtyFlags::Query;
-    query->status = 1;
   }
 
   void Render::finishQuery(Query* query)
   {
     checkRenderAcquired();
 
+    G_ASSERT(query);
+    G_ASSERT(query->type == Query::Type::Visibility);
+
+    queries.lock();
+    query->submit = submits_scheduled;
+    uint32_t generation = query->generation;
+    queries.unlock();
+    command_encoder.write(CommandType::DoQuery).write(query).write(generation).write(submits_scheduled);
+
     cur_query_offset = -1;
-    query->status = 2;
+    dirty_state |= DirtyFlags::Query;
   }
 
   void Render::setRenderPass(bool set)
@@ -4410,23 +5043,60 @@ namespace drv3d_metal
     return set;
   }
 
-  uint64_t Render::getQueryResult(Query* query, bool force_flush)
+  int64_t Render::getQueryResult(Query* query, bool force_flush)
   {
-    if (query->status != 2)
-      return 1;
-    if (render.submits_completed < query->value && force_flush)
+    if (query->type == Query::Type::Visibility)
+    {
+      queries.lock();
+      Query::Status status = query->status;
+      int64_t value = query->value;
+      queries.unlock();
+
+      if (status != Query::Status::Done)
+      {
+        if (!force_flush)
+          return -1;
+
+        // never flush while holding the pool lock: the DoQuery completed handler
+        // takes it, and flush waits for completed handlers to run
+        @autoreleasepool
+        {
+          render.flush(true);
+        }
+
+        queries.lock();
+        value = query->value;
+        queries.unlock();
+      }
+      return value;
+    }
+
+    G_ASSERT(query->type == Query::Type::Event);
+    if (render.submits_completed < query->submit && force_flush)
     {
       @autoreleasepool
       {
         render.flush(true);
       }
     }
-    return render.submits_completed < query->value && !force_flush ? -1 : 1;
+    return render.submits_completed < query->submit && !force_flush ? -1 : 1;
   }
 
   void Render::releaseQuery(Query* query)
   {
-    query->used = 0;
+    G_ASSERT(query);
+    if (query->type == Query::Type::Timestamp)
+    {
+      delete query;
+      return;
+    }
+    G_ASSERT(query->index < QUERIES_MAX);
+
+    queries.lock();
+    // invalidate pending completion handlers of this incarnation
+    query->generation++;
+    queries.releaseEntryUnsafe(query->index);
+    queries.unlock();
   }
 
   void Render::release()
@@ -4444,17 +5114,23 @@ namespace drv3d_metal
     backbuffer->apiTex->sub_texture = nil;
     backbuffer->destroy();
 
+    TEXQL_ON_PERSISTENT_RELEASE_SZ([mainview getDrawableSize]);
+
     if (d3d::get_driver_desc().caps.hasBindless)
     {
       bindlessTexture2DIdBuffer->destroy();
       bindlessTexture2DArrayIdBuffer->destroy();
       bindlessTextureCubeIdBuffer->destroy();
+      bindlessTexture3DIdBuffer->destroy();
+      bindlessTextureCubeArrayIdBuffer->destroy();
       bindlessBufferIdBuffer->destroy();
       bindlessSamplerIdBuffer->destroy();
 
       bindlessTexture2DIdBuffer = nullptr;
       bindlessTexture2DArrayIdBuffer = nullptr;
       bindlessTextureCubeIdBuffer = nullptr;
+      bindlessTexture3DIdBuffer = nullptr;
+      bindlessTextureCubeArrayIdBuffer = nullptr;
       bindlessBufferIdBuffer = nullptr;
       bindlessSamplerIdBuffer = nullptr;
 
@@ -4487,12 +5163,13 @@ namespace drv3d_metal
     [query_buffer release];
     [stub_buffer release];
 
+    TEXQL_ON_PERSISTENT_RELEASE_SZ(MAX_CBUFFER_SIZE);
+    TEXQL_ON_PERSISTENT_RELEASE_SZ(QUERIES_MAX * sizeof(uint64_t));
+
     for (auto fence : encoders)
       [fence.fence release];
     encoders.clear();
     free_encoders.clear();
-    current_enqueued_encoder = nullptr;
-    current_enqueued_resources = 0;
 
 #if DAGOR_DBGLEVEL > 0
     [signpost_event release];
@@ -4513,6 +5190,8 @@ namespace drv3d_metal
     G_ASSERT(regions2copy.empty());
     G_ASSERT(textures2clear.empty());
     G_ASSERT(buffers2clear.empty());
+    G_ASSERT(blases2create.empty());
+    G_ASSERT(residency2delete.empty());
 
     [commandQueue release];
 
@@ -4524,6 +5203,7 @@ namespace drv3d_metal
 
     Buffer::cleanup();
     Texture::cleanup();
+    queries.clear();
 
     if (defaultBlas)
     {
@@ -4538,46 +5218,25 @@ namespace drv3d_metal
     if (sampleBuffer)
         [sampleBuffer release];
 #endif
-    if (nativeBlases)
-      [nativeBlases release];
-    nativeBlases = nil;
+    nativeBlases.clear();
+
+    if (@available(iOS 18, macOS 15.0, *))
+    {
+      if (residencySet)
+        [residencySet release];
+      residencySet = nil;
+      residency_set_dirty = true;
+    }
+
+    for (const auto& s : sampler_states)
+      [s.sampler release];
+    sampler_states.clear();
 
     debug("[METAL_INIT] render released at frame %llu", frame);
     frame = 0;
     submits_scheduled = 1;
     submits_completed = 0;
     memset(frames_completed, 0, sizeof(frames_completed));
-  }
-
-  int Render::getSupportedMTLVersion(void* mtl_version)
-  {
-    static int v[4] = {0, 0, 0, 0};
-    if (mtl_version)
-        *(const void**)mtl_version = v;
-    auto mkDrvDesc = [] (char a, char b, char c, char d) { v[0] = a; v[1] = b; v[2] = c; v[3] = d; };
-#if _TARGET_TVOS
-    if ([device supportsFeatureSet: (MTLFeatureSet)30000 /*MTLFeatureSet_tvOS_GPUFamily1_v1*/])
-      mkDrvDesc('T', 'V', '1', '1');
-    if ([device supportsFeatureSet: (MTLFeatureSet)30001 /*MTLFeatureSet_tvOS_GPUFamily1_v2*/])
-      mkDrvDesc('T', 'V', '1', '2');
-    if ([device supportsFeatureSet: (MTLFeatureSet)30002 /*MTLFeatureSet_tvOS_GPUFamily1_v3*/])
-      mkDrvDesc('T', 'V', '1', '3');
-    if ([device supportsFeatureSet: (MTLFeatureSet)30003 /*MTLFeatureSet_tvOS_GPUFamily2_v1*/])
-      mkDrvDesc('T', 'V', '2', '1');
-#elif _TARGET_PC_MACOSX
-    if ([device supportsFeatureSet: (MTLFeatureSet)10000 /*MTLFeatureSet_macOS_GPUFamily1_v1*/])
-      mkDrvDesc('M', 'C', '1', '1');
-    if ([device supportsFeatureSet: (MTLFeatureSet)10001 /*MTLFeatureSet_macOS_GPUFamily1_v2*/])
-      mkDrvDesc('M', 'C', '1', '2');
-    if ([device supportsFeatureSet: (MTLFeatureSet)10003 /*MTLFeatureSet_macOS_GPUFamily1_v3*/])
-      mkDrvDesc('M', 'C', '1', '3');
-    if ([device supportsFeatureSet: (MTLFeatureSet)10004 /*MTLFeatureSet_macOS_GPUFamily1_v4*/])
-      mkDrvDesc('M', 'C', '1', '4');
-    if ([device supportsFeatureSet: (MTLFeatureSet)10005 /*MTLFeatureSet_macOS_GPUFamily2_v1*/])
-      mkDrvDesc('M', 'C', '2', '1');
-#endif
-
-    return 0;
   }
 
   void Render::readbackTexture(Texture *tex_ptr, int level, int layer, int w, int h, int d, id<MTLBuffer> buf, int offset, int pitch, int imageSize)
@@ -4607,9 +5266,7 @@ namespace drv3d_metal
   {
     std::lock_guard<std::mutex> scopedLock(copy_tex_lock);
     G_ASSERT(tex_ptr);
-    track_resource_write_enqueued(*tex_ptr);
-    textures2upload.push_back( {tex_ptr, tex, buf, (uint32_t)pitch, (uint32_t)imageSize, (uint16_t)x, (uint16_t)y, (uint16_t)z, (uint16_t)w, (uint16_t)h, (uint16_t)d,
-        (uint8_t)level, (uint8_t)layer} );
+    textures2upload.push_back( {tex_ptr->apiTex, tex, buf, (uint32_t)pitch, (uint32_t)imageSize, (uint16_t)x, (uint16_t)y, (uint16_t)z, (uint16_t)w, (uint16_t)h, (uint16_t)d, (uint8_t)level, (uint8_t)layer} );
   }
 
   void Render::queueResourceForDeletion(id<MTLResource> buf)
@@ -4626,12 +5283,31 @@ namespace drv3d_metal
 
   void Render::deleteBuffer(Buffer* buff)
   {
+    purgeQueuedBindlessUpdates(buff);
+
     std::lock_guard<std::mutex> scopedLock(delete_lock);
     resources2delete.push_back({ .type = DeletedResource::Type::Buffer, .submit = submits_scheduled, .buffer = buff });
+
+    if (buff && isRenderAcquiredInThisThread())
+    {
+      for (uint32_t i = 0; i < STAGE_MAX; ++i)
+      {
+        for (uint32_t j = 0; j < BUFFER_POINT_COUNT; ++j)
+        {
+          if (stages[i].buffers[j] == buff)
+          {
+            stages[i].buffers[j] = nullptr;
+            stages[i].buffers_offset[j] = 0;
+          }
+        }
+      }
+    }
   }
 
   void Render::deleteTexture(Texture* tex)
   {
+    purgeQueuedBindlessUpdates(tex);
+
     if (tex->isStub())
       tex->apiTex = nullptr; // hack?
 
@@ -4646,7 +5322,7 @@ namespace drv3d_metal
     id<MTLTexture> mtlTex = tex->apiTex ? tex->apiTex->texture : nil;
     for (uint32_t i = 0; i < STAGE_MAX; ++i)
     {
-      for (uint32_t j = 0; j < StageBinding::MAX_STAGE_TEXTURES; ++j)
+      for (uint32_t j = 0; j < MAX_STAGE_TEXTURES; ++j)
       {
         if (stages[i].textures[j].texture == tex)
           stages[i].textures[j] = {};
@@ -4659,20 +5335,24 @@ namespace drv3d_metal
     }
     if (rt.depth.texture == tex)
       rt.depth = {};
+    if (rt.stencil.texture == tex)
+      rt.stencil = {};
   }
 
-  void Render::queueCopyBuffer(Buffer *dst_buf, id<MTLBuffer> src, int src_offset, id<MTLBuffer> dst, int dst_offset, int size)
+  void Render::queueCopyBuffer(Buffer *dst_buf, Buffer::BufTex *buf_tex, id<MTLBuffer> src, int src_offset, id<MTLBuffer> dst, int dst_offset, int size)
   {
     std::lock_guard<std::mutex> scopedLock(copy_tex_lock);
     G_ASSERT(dst_buf);
-    track_resource_write_enqueued(*dst_buf);
-    buffers2copy.push_back({ dst_buf, src, dst, src_offset, dst_offset, size });
+    buffers2copy.push_back({ dst_buf, buf_tex, src, dst, src_offset, dst_offset, size });
   }
 
   void Render::queueUpdateBuffer(id<MTLBuffer> src, int src_offset, Buffer *dst_buf, int dst_offset, int size)
   {
     checkRenderAcquired();
     G_ASSERT(dst_buf);
+    G_ASSERTF((src_offset & 3) == 0, "unaligned src offset %d of buffer %s", src_offset, dst_buf->getName());
+    G_ASSERTF((dst_offset & 3) == 0, "unaligned dst offset %d of buffer %s", dst_offset, dst_buf->getName());
+    G_ASSERTF((size & 3) == 0, "unaligned size %d of buffer %s", size, dst_buf->getName());
 
     id<MTLBuffer> dst = dst_buf->getBuffer();
     G_ASSERT(dst);
@@ -4695,9 +5375,9 @@ namespace drv3d_metal
       rstate.depth_state.stencil_func = convertCompareFunction(state.stencil.func);
       rstate.depth_state.stencil_read_mask = state.stencil.readMask;
       rstate.depth_state.stencil_write_mask = state.stencil.writeMask;
-      rstate.depth_state.sfail = state.stencil.fail;
-      rstate.depth_state.szfail = state.stencil.zFail;
-      rstate.depth_state.spass = state.stencil.pass;
+      rstate.depth_state.sfail = state.stencil.fail - 1;
+      rstate.depth_state.szfail = state.stencil.zFail - 1;
+      rstate.depth_state.spass = state.stencil.pass - 1;
     }
     rstate.depth_state.zenable = state.ztest;
     rstate.depth_state.depth_write_on = state.zwrite;
@@ -4712,6 +5392,7 @@ namespace drv3d_metal
     rstate.forcedSampleCount = state.forcedSampleCount;
 
     rstate.raster_state.a2c = state.alphaToCoverage;
+    rstate.raster_state.is_dual_blend = state.dualSourceBlendEnabled;
     rstate.raster_state.writeMask = state.colorWr;
     if (state.dualSourceBlendEnabled)
     {
@@ -4727,14 +5408,15 @@ namespace drv3d_metal
     else
       for (int i = 0; i < shaders::RenderState::NumIndependentBlendParameters; ++i)
       {
-        rstate.raster_state.blend[i].ablend = state.blendParams[i].ablend;
-        rstate.raster_state.blend[i].ablendScr = convBlendArgForAlpha(state.blendParams[i].sepablendFactors.src);
-        rstate.raster_state.blend[i].ablendDst = convBlendArgForAlpha(state.blendParams[i].sepablendFactors.dst);
-        rstate.raster_state.blend[i].ablendOp = convertBlendOp(state.blendParams[i].sepablendOp);
-        rstate.raster_state.blend[i].sepblend = state.blendParams[i].sepablend;
-        rstate.raster_state.blend[i].rgbblendScr = convBlendArg(state.blendParams[i].ablendFactors.src);
-        rstate.raster_state.blend[i].rgbblendDst = convBlendArg(state.blendParams[i].ablendFactors.dst);
-        rstate.raster_state.blend[i].rgbblendOp = convertBlendOp(state.blendParams[i].blendOp);
+        uint32_t blendStateId = state.independentBlendEnabled ? i : 0;
+        rstate.raster_state.blend[i].ablend = state.blendParams[blendStateId].ablend;
+        rstate.raster_state.blend[i].ablendScr = convBlendArgForAlpha(state.blendParams[blendStateId].sepablendFactors.src);
+        rstate.raster_state.blend[i].ablendDst = convBlendArgForAlpha(state.blendParams[blendStateId].sepablendFactors.dst);
+        rstate.raster_state.blend[i].ablendOp = convertBlendOp(state.blendParams[blendStateId].sepablendOp);
+        rstate.raster_state.blend[i].sepblend = state.blendParams[blendStateId].sepablend;
+        rstate.raster_state.blend[i].rgbblendScr = convBlendArg(state.blendParams[blendStateId].ablendFactors.src);
+        rstate.raster_state.blend[i].rgbblendDst = convBlendArg(state.blendParams[blendStateId].ablendFactors.dst);
+        rstate.raster_state.blend[i].rgbblendOp = convertBlendOp(state.blendParams[blendStateId].blendOp);
       }
 
 
@@ -4820,7 +5502,7 @@ namespace drv3d_metal
     id<MTLBuffer> buf = [device newBufferWithLength : size
                                             options : flags];
     if (buf == nil)
-      DAG_FATAL("Failed to allocate buffer %s with size %d", name, size);
+      DAG_FATAL("Failed to allocate buffer %s with size %d, available %llukb of %llukb", name, size, device.currentAllocatedSize >> 10, device.recommendedMaxWorkingSetSize >> 10);
 #if DAGOR_DBGLEVEL > 0
     buf.label = [NSString stringWithUTF8String : name];
 #endif
@@ -4832,59 +5514,66 @@ namespace drv3d_metal
     RaytraceAccelerationStructure *as = new RaytraceAccelerationStructure { .createFlags = flags };
     G_ASSERT(size);
     as->acceleration_struct = [device newAccelerationStructureWithSize : size];
+    if (as->acceleration_struct == nil)
+      DAG_FATAL("Failed to allocate acceleration structure with size %u, available %llukb of %llukb", size,
+        device.currentAllocatedSize >> 10, device.recommendedMaxWorkingSetSize >> 10);
+    TEXQL_ON_PERSISTENT_ALLOC_SZ(as->acceleration_struct.allocatedSize);
     if (blas)
     {
       blases.lock();
       as->index = blases.getFreeIndex(as);
-      while (as->index >= nativeBlases.count)
-        [nativeBlases addObject : defaultBlas];
-      [nativeBlases replaceObjectAtIndex : as->index withObject : as->acceleration_struct];
+      if (as->index >= nativeBlases.size())
+        nativeBlases.resize(as->index + 1, defaultBlas);
+      nativeBlases[as->index] = as->acceleration_struct;
 #if DAGOR_DBGLEVEL > 0
       as->acceleration_struct.label = [NSString stringWithFormat:@"blas_%d %llu", as->index, render.frame];
 #endif
       blases.unlock();
       G_ASSERT(as->index >= 0);
+
+      std::lock_guard<std::mutex> scopedLock(copy_tex_lock);
+      blases2create.emplace_back(as->acceleration_struct);
     }
     return as;
   }
 
   void Render::deleteAccelerationStructure(RaytraceAccelerationStructure *as)
   {
-    if (as)
-    {
-      if (as->index >= 0)
-      {
-        blases.lock();
-        if (nativeBlases.count > as->index)
-          [nativeBlases replaceObjectAtIndex : as->index withObject : defaultBlas];
-        blases.freeIndex(as->index);
-        blases.unlock();
-        as->index = -1;
-      }
-      else
-      {
-        uint64_t cur_thread = 0;
-        pthread_threadid_np(NULL, &cur_thread);
+    if (!as)
+      return;
 
-        bool from_thread = render.acquire_depth == 0 || cur_thread != render.cur_thread;
-        if (!from_thread)
+    bool is_blas = as->index >= 0;
+    if (is_blas)
+    {
+      blases.lock();
+      if (nativeBlases.size() > as->index)
+        nativeBlases[as->index] = defaultBlas;
+      blases.freeIndex(as->index);
+      blases.unlock();
+      as->index = -1;
+    }
+    else
+    {
+      bool from_thread = !isRenderAcquiredInThisThread();
+      if (!from_thread)
+      {
+        for (uint32_t i = 0; i < STAGE_MAX; ++i)
         {
-          for (uint32_t i = 0; i < STAGE_MAX; ++i)
+          for (uint32_t j = 0; j < MAX_SHADER_ACCELERATION_STRUCTURES; ++j)
           {
-            for (uint32_t j = 0; j < MAX_SHADER_ACCELERATION_STRUCTURES; ++j)
-            {
-              if (stages[i].acceleration_structures[j] == as)
-                stages[i].acceleration_structures[j] = nullptr;
-            }
+            if (stages[i].acceleration_structures[j] == as)
+              stages[i].acceleration_structures[j] = nullptr;
           }
         }
       }
-
-      std::lock_guard<std::mutex> scopedLock(delete_lock);
-      resources2delete.push_back({ .type = DeletedResource::Type::NativeResource, .submit = submits_scheduled, .native_resource = as->acceleration_struct });
-
-      delete as;
     }
+
+    TEXQL_ON_PERSISTENT_RELEASE_SZ(as->acceleration_struct.allocatedSize);
+
+    std::lock_guard<std::mutex> scopedLock(delete_lock);
+    if (is_blas)
+      residency2delete.push_back({ .type = DeletedResource::Type::RemoveFromResidency, .submit = submits_scheduled, .native_resource = as->acceleration_struct });
+    resources2delete.push_back({ .type = DeletedResource::Type::AccelerationStructure, .submit = submits_scheduled, .as = as });
   }
 
   void Render::setTLAS(RaytraceTopAccelerationStructure *tlas, ShaderStage rstage, int slot)
@@ -4899,7 +5588,7 @@ namespace drv3d_metal
     stage.setAccStruct(slot, tlas);
   }
 
-  void Render::copyAccelerationStruct(RaytraceAccelerationStructure *dst, RaytraceAccelerationStructure *src)
+  void Render::copyAccelerationStruct(RaytraceAccelerationStructure *dst, RaytraceAccelerationStructure *src, bool compact)
   {
     checkRenderAcquired();
 
@@ -4907,14 +5596,13 @@ namespace drv3d_metal
     G_ASSERT(dst->acceleration_struct);
 
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Acceleration);
-    command_encoder.write(CommandType::CopyAccelerationStruct).write(src).write(dst).write(src->acceleration_struct).write(dst->acceleration_struct);
+    uint8_t compact_flag = compact ? 1 : 0;
+    command_encoder.write(CommandType::CopyAccelerationStruct).write(src).write(dst).write(src->acceleration_struct).write(dst->acceleration_struct).write(compact_flag);
   }
 
-  void Render::buildAccelerationStructure(RaytraceAccelerationStructure *as, MTLAccelerationStructureDescriptor *desc, Sbuffer *space_buffer, uint32_t space_buffer_offset, bool refit)
+  void Render::buildAccelerationStructure(RaytraceAccelerationStructure *as, MTLAccelerationStructureDescriptor *desc, ASBuildInfo &info)
   {
     checkRenderAcquired();
-
-    G_ASSERT(space_buffer);
 
     MTLAccelerationStructureSizes sizes = [device accelerationStructureSizesWithDescriptor: desc];
 
@@ -4924,41 +5612,64 @@ namespace drv3d_metal
     id<MTLAccelerationStructure> accStruct = as->acceleration_struct;
     G_ASSERT(accStruct.size >= sizes.accelerationStructureSize);
 
-    Buffer *sbuffer = (Buffer *)space_buffer;
-    G_ASSERT(sbuffer && !sbuffer->is_fast_discard());
-    track_resource_read(*sbuffer);
+    Buffer *sbuffer = (Buffer *)info.scratch;
+    if (sbuffer)
+    {
+      G_ASSERT(sbuffer && !sbuffer->is_fast_discard());
+      track_resource_read(*sbuffer);
+    }
 
-    id<MTLBuffer> spaceBuf = sbuffer->getBuffer();
+    if (info.compactSizeBuffer)
+    {
+      if (@available(macOS 13.0, iOS 16.0, *))
+      {
+        G_ASSERT(!info.compactSizeBuffer->is_fast_discard());
+        track_resource_write(*info.compactSizeBuffer);
+      }
+      else
+      {
+        D3D_ERROR("AS compaction called on unsupported os version");
+      }
+    }
 
-    if (refit && as->was_built)
+    id<MTLBuffer> spaceBuf = sbuffer ? sbuffer->getBuffer() : nil;
+
+    if (info.update && as->was_built)
     {
       G_ASSERT(as->was_built);
 
       G_ASSERT(desc.usage & MTLAccelerationStructureUsageRefit);
 
-      G_ASSERT(sizes.refitScratchBufferSize + space_buffer_offset <= spaceBuf.length);
+      G_ASSERT(sizes.refitScratchBufferSize == 0 || sizes.refitScratchBufferSize + info.offset <= spaceBuf.length);
 
       [accelerationEncoder refitAccelerationStructure: accStruct
                                            descriptor: desc
                                           destination: accStruct
                                         scratchBuffer: spaceBuf
-                                  scratchBufferOffset: space_buffer_offset];
+                                  scratchBufferOffset: info.offset];
     }
     else
     {
-      G_ASSERT(sizes.buildScratchBufferSize + space_buffer_offset <= spaceBuf.length);
+      G_ASSERT(sizes.buildScratchBufferSize + info.offset <= spaceBuf.length);
 
       [accelerationEncoder buildAccelerationStructure: accStruct
                                            descriptor: desc
                                         scratchBuffer: spaceBuf
-                                  scratchBufferOffset: space_buffer_offset];
+                                  scratchBufferOffset: info.offset];
       as->was_built = true;
     }
-
-    // Here struct compression can be done to reduce the size
-    // but it is really performance heavy (requires a flush ([commandBuffer waitUntilCompleted]))
-    // and doing it every frame is too much
     [desc release];
+
+    if (@available(macOS 13.0, iOS 16.0, *))
+    {
+      if (info.compactSizeBuffer)
+      {
+        [accelerationEncoder writeCompactedAccelerationStructureSize : as->acceleration_struct
+                                                            toBuffer : info.compactSizeBuffer->getBuffer()
+                                                              offset : info.compactSizeOffset
+                                                        sizeDataType : MTLDataTypeULong];
+      }
+    }
   }
 
   void Render::buildTLAS(RaytraceTopAccelerationStructure *as, const ::raytrace::TopAccelerationStructureBuildInfo &tasbi)
@@ -4978,13 +5689,22 @@ namespace drv3d_metal
     G_ASSERT(instanceBuf.length >= d3d::get_driver_desc().raytrace.topAccelerationStructureInstanceElementSize * tasbi.instanceCount);
 
     blases.lock();
-    accDesc.instanceDescriptorBuffer = instanceBuf;
-    accDesc.instancedAccelerationStructures = nativeBlases;
+    @autoreleasepool
+    {
+      accDesc.instanceDescriptorBuffer = instanceBuf;
+      accDesc.instancedAccelerationStructures = [NSArray arrayWithObjects : nativeBlases.data() count : nativeBlases.size()];
+    }
     blases.unlock();
 
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Acceleration);
 
-    ASBuildInfo info {.scratch = (Buffer *)tasbi.scratchSpaceBuffer, .offset = tasbi.scratchSpaceBufferOffsetInBytes, .update = tasbi.doUpdate};
+    ASBuildInfo info {.scratch = (Buffer *)tasbi.scratchSpaceBuffer, .offset = tasbi.scratchSpaceBufferOffsetInBytes, .size = tasbi.scratchSpaceBufferSizeInBytes, .update = tasbi.doUpdate ? 1u : 0u};
+
+    addResource(instanceBuf);
+    if (info.scratch)
+      addResource(info.scratch->getBuffer());
+
+    commitResidencySet();
 
     uint8_t count = 1;
     command_encoder.write(CommandType::BuildAccelerationStructure).write(as).write([accDesc retain]).write(info).write(count).write(ibuffer);
@@ -5002,50 +5722,71 @@ namespace drv3d_metal
 
     ensureHaveEncoderExceptRenderFrontend(Render::EncoderType::Acceleration);
 
-    ASBuildInfo info {.scratch = (Buffer *)basbi.scratchSpaceBuffer, .offset = basbi.scratchSpaceBufferOffsetInBytes, .update = basbi.doUpdate};
+    G_ASSERT(basbi.doUpdate || basbi.scratchSpaceBufferSizeInBytes);
+    G_ASSERT(basbi.scratchSpaceBufferSizeInBytes == 0 || basbi.scratchSpaceBuffer);
+    ASBuildInfo info {
+      .scratch = (Buffer *)basbi.scratchSpaceBuffer,
+      .offset = basbi.scratchSpaceBufferOffsetInBytes,
+      .size = basbi.scratchSpaceBufferSizeInBytes,
+      .update = basbi.doUpdate ? 1u : 0u,
+      .compactSizeBuffer = basbi.compactedSizeOutputBuffer ? (Buffer *)basbi.compactedSizeOutputBuffer : nullptr,
+      .compactSizeOffset = basbi.compactedSizeOutputBufferOffsetInBytes,
+    };
+
+    for (const auto &buf : resources)
+      addResource(buf->getBuffer());
+    if (info.scratch)
+      addResource(info.scratch->getBuffer());
+    if (info.compactSizeBuffer)
+      addResource(info.compactSizeBuffer->getBuffer());
+
+    commitResidencySet();
 
     uint8_t count = uint8_t(resources.size());
     command_encoder.write(CommandType::BuildAccelerationStructure).write(blas).write([accDesc retain]).write(info).write(count).write(resources.data(), resources.size()*sizeof(Buffer *));
   }
 
-  void Render::prepareBindlessResources(uint32_t requestedTypes)
+  void Render::prepareBindlessResources(uint32_t requestedTypes, bool is_from_vs)
   {
     if (!d3d::get_driver_desc().caps.hasBindless || requestedTypes == 0)
       return;
 
-    if ((requestedTypes & bindless_resources_bound) == requestedTypes)
+    applyQueuedBindlessUpdates();
+
+    // a fence before the fragment stage does not cover a vertex stage read
+    uint32_t tracked = bindless_resources_bound;
+    if (is_from_vs)
+      tracked &= bindless_resources_bound_vs;
+    uint32_t mask = requestedTypes & ~tracked;
+    if (mask == 0)
       return;
 
     TIME_PROFILE(prepareBindlessResources);
 
-    if (bindless_set_dirty)
-    {
-      if (@available(iOS 18, macOS 15.0, *))
-      {
-        [residencySet commit];
-      }
-      bindless_set_dirty = false;
-    }
-
     uint64_t tex_2d = 0;
     uint64_t tex_2dArray = 0;
     uint64_t tex_cube = 0;
+    uint64_t tex_3d = 0;
+    uint64_t tex_cubeArray = 0;
     uint64_t buffer_stub = 0;
     if (@available(macOS 13.0, iOS 16.0, *))
     {
       G_ASSERT(blank_tex_2d);
       G_ASSERT(blank_tex_2dArray);
       G_ASSERT(blank_tex_cube);
+      G_ASSERT(blank_tex_3d);
+      G_ASSERT(blank_tex_cubeArray);
       tex_2d = ToResourceID(blank_tex_2d);
       tex_2dArray = ToResourceID(blank_tex_2dArray);
       tex_cube = ToResourceID(blank_tex_cube);
+      tex_3d = ToResourceID(blank_tex_3d);
+      tex_cubeArray = ToResourceID(blank_tex_cubeArray);
       buffer_stub = stub_buffer.gpuAddress;
     }
 
-    uint32_t mask = (requestedTypes ^ bindless_resources_bound) & requestedTypes;
     if (mask & (BindlessTypeTexture2D))
     {
-      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeTexture2D);
+      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeTexture2D).write(uint8_t(is_from_vs));
       if (bindlessTextures2D.id_cache.empty())
         bindlessTexture2DIdBuffer->updateDataWithLock(0, sizeof(uint64_t), &tex_2d, VBLOCK_DISCARD);
       else
@@ -5053,7 +5794,7 @@ namespace drv3d_metal
     }
     if (mask & (BindlessTypeTextureCube))
     {
-      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeTextureCube);
+      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeTextureCube).write(uint8_t(is_from_vs));
       if (bindlessTexturesCube.id_cache.empty())
         bindlessTextureCubeIdBuffer->updateDataWithLock(0, sizeof(uint64_t), &tex_cube, VBLOCK_DISCARD);
       else
@@ -5061,15 +5802,31 @@ namespace drv3d_metal
     }
     if (mask & (BindlessTypeTexture2DArray))
     {
-      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeTexture2DArray);
+      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeTexture2DArray).write(uint8_t(is_from_vs));
       if (bindlessTextures2DArray.id_cache.empty())
         bindlessTexture2DArrayIdBuffer->updateDataWithLock(0, sizeof(uint64_t), &tex_2dArray, VBLOCK_DISCARD);
       else
         bindlessTexture2DArrayIdBuffer->updateDataWithLock(0, sizeof(uint64_t)*bindlessTextures2DArray.id_cache.size(), bindlessTextures2DArray.id_cache.data(), VBLOCK_DISCARD);
     }
+    if (mask & (BindlessTypeTexture3D))
+    {
+      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeTexture3D).write(uint8_t(is_from_vs));
+      if (bindlessTextures3D.id_cache.empty())
+        bindlessTexture3DIdBuffer->updateDataWithLock(0, sizeof(uint64_t), &tex_3d, VBLOCK_DISCARD);
+      else
+        bindlessTexture3DIdBuffer->updateDataWithLock(0, sizeof(uint64_t)*bindlessTextures3D.id_cache.size(), bindlessTextures3D.id_cache.data(), VBLOCK_DISCARD);
+    }
+    if (mask & (BindlessTypeTextureCubeArray))
+    {
+      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeTextureCubeArray).write(uint8_t(is_from_vs));
+      if (bindlessTexturesCubeArray.id_cache.empty())
+        bindlessTextureCubeArrayIdBuffer->updateDataWithLock(0, sizeof(uint64_t), &tex_cubeArray, VBLOCK_DISCARD);
+      else
+        bindlessTextureCubeArrayIdBuffer->updateDataWithLock(0, sizeof(uint64_t)*bindlessTexturesCubeArray.id_cache.size(), bindlessTexturesCubeArray.id_cache.data(), VBLOCK_DISCARD);
+    }
     if (mask & BindlessTypeBuffer)
     {
-      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeBuffer);
+      command_encoder.write(CommandType::TrackBindless).write(BindlessTypeBuffer).write(uint8_t(is_from_vs));
       if (bindlessBuffers.cache.empty())
           bindlessBufferIdBuffer->updateDataWithLock(0, sizeof(uint64_t), &buffer_stub, VBLOCK_DISCARD);
       else
@@ -5078,7 +5835,7 @@ namespace drv3d_metal
 
     if (mask & BindlessTypeSampler)
     {
-      if (bindlessSamplers.empty())
+      if (bindlessSamplerBiases.empty())
       {
         id<MTLSamplerState> sampler_state_dummy = sampler_states[render.getSampler({})].sampler;
 
@@ -5093,6 +5850,10 @@ namespace drv3d_metal
     }
 
     bindless_resources_bound |= requestedTypes;
+    if (is_from_vs)
+      bindless_resources_bound_vs |= requestedTypes;
+    else // types fenced here for the first time got a fragment stage fence only
+      bindless_resources_bound_vs &= ~mask;
   }
 
   void Render::pushAsyncPsoCompilation(bool enable)
@@ -5111,7 +5872,7 @@ namespace drv3d_metal
     async_pso_compilation = async_pso_compilation_stack.size() ? async_pso_compilation_stack.back() : false;
   }
 
-  static MTLSamplerAddressMode getAddressMode(int mode)
+  static MTLSamplerAddressMode getAddressMode(int mode, bool hasClampToBorder)
   {
     switch (mode)
     {
@@ -5119,11 +5880,7 @@ namespace drv3d_metal
       case TEXADDR_MIRROR:   return MTLSamplerAddressModeMirrorRepeat;
       case TEXADDR_CLAMP:    return MTLSamplerAddressModeClampToEdge;
       case TEXADDR_MIRRORONCE: return MTLSamplerAddressModeMirrorClampToEdge;
-  #if !_TARGET_IOS
-      case TEXADDR_BORDER:   return MTLSamplerAddressModeClampToBorderColor;
-  #else
-      case TEXADDR_BORDER:   return MTLSamplerAddressModeClampToZero;
-  #endif
+      case TEXADDR_BORDER:   return hasClampToBorder ? MTLSamplerAddressModeClampToBorderColor : MTLSamplerAddressModeClampToZero;
     }
 
     return MTLSamplerAddressModeRepeat;
@@ -5144,10 +5901,12 @@ namespace drv3d_metal
       }
     }
 
+    G_ASSERT_RETURN(sampler_states.size() < sampler_states.capacity(), 0);
+
     MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
-    samplerDescriptor.sAddressMode = getAddressMode(sampler_state.addrU);
-    samplerDescriptor.tAddressMode = getAddressMode(sampler_state.addrV);
-    samplerDescriptor.rAddressMode = getAddressMode(sampler_state.addrW);
+    samplerDescriptor.sAddressMode = getAddressMode(sampler_state.addrU, caps.hasClampToBorder);
+    samplerDescriptor.tAddressMode = getAddressMode(sampler_state.addrV, caps.hasClampToBorder);
+    samplerDescriptor.rAddressMode = getAddressMode(sampler_state.addrW, caps.hasClampToBorder);
 
     if (sampler_state.texFilter == d3d::FilterMode::Point)
     {
@@ -5164,6 +5923,10 @@ namespace drv3d_metal
     {
       samplerDescriptor.mipFilter = MTLSamplerMipFilterNearest;
     }
+    else if (sampler_state.mipmap == d3d::MipMapMode::Disabled)
+    {
+      samplerDescriptor.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    }
     else
     {
       samplerDescriptor.mipFilter = MTLSamplerMipFilterLinear;
@@ -5174,18 +5937,19 @@ namespace drv3d_metal
 
     samplerDescriptor.maxAnisotropy = min(16, sampler_state.anisotropy);
 
-#if !_TARGET_IOS
-    if (sampler_state.border_color.r > 0 ||
-        sampler_state.border_color.g > 0 ||
-        sampler_state.border_color.b > 0)
+    if (caps.hasClampToBorder)
     {
-      samplerDescriptor.borderColor = MTLSamplerBorderColorOpaqueWhite;
+      if (sampler_state.border_color.r > 0 ||
+          sampler_state.border_color.g > 0 ||
+          sampler_state.border_color.b > 0)
+      {
+        samplerDescriptor.borderColor = MTLSamplerBorderColorOpaqueWhite;
+      }
+      else
+      {
+        samplerDescriptor.borderColor = sampler_state.border_color.a > 0 ? MTLSamplerBorderColorOpaqueBlack : MTLSamplerBorderColorTransparentBlack;
+      }
     }
-    else
-    {
-      samplerDescriptor.borderColor = sampler_state.border_color.a > 0 ? MTLSamplerBorderColorOpaqueBlack : MTLSamplerBorderColorTransparentBlack;
-    }
-#endif
 
     samplerDescriptor.compareFunction = MTLCompareFunctionLessEqual;
     samplerDescriptor.supportArgumentBuffers = d3d::get_driver_desc().caps.hasBindless;

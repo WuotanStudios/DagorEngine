@@ -24,7 +24,7 @@ int transparent = 0;
 interval transparent: transOff < 1, transOn < 2, transNonpremultiplied < 3, transAdditive;
 
 int hasTexture = 0;
-interval hasTexture: texOff < 1, texOn < 2, texFontL8 < 3, texFontL8v < 4, twoTexOn;
+interval hasTexture: texOff < 1, texOn < 2, texInSRGB < 3, texFontL8 < 4, texFontL8v < 5, twoTexOn;
 
 int fontFxType = 0;
 interval fontFxType: no < 1, shadow < 2, glow < 3, outline < 4, undefined;
@@ -52,6 +52,8 @@ float4x4 guiGlobTm;
 int use_gui_glob_tm = 0;
 interval use_gui_glob_tm: no < 1, yes;
 
+float gui_use_inv_viewport_tm = 1.0;
+
 shader gui_default
 {
   if (fontFxType == undefined) { dont_render; }
@@ -62,6 +64,7 @@ shader gui_default
   z_test = false;
 
   (vs) {
+    gui_use_inv_viewport_tm@f1 = gui_use_inv_viewport_tm;
     viewport@f4 = viewportRect;
     gui_text_depth@f2 = gui_text_depth;//(gui_text_depth.r, gui_text_depth.g, gui_cockpit_depth, 0, 0);
   }
@@ -224,16 +227,19 @@ shader gui_default
       float2 glyphSizeTexels = abs(float2(v.glyphSize)) + 1.0; // I don't know why it's encoded as glyphSize - 1. So have to add 1.
       float2 glyphTcSize = glyphSizeTexels * invFontTexSize;
       bool2 cornerMask = v.glyphSize > 0;
-      float2 offsetTexels = cornerMask ? extentRightBottomTexels : extentLeftTopTexels;
+      float2 offsetTexels = select(cornerMask, extentRightBottomTexels, extentLeftTopTexels);
 
-      o.glyphTcBox.xy = tc - (cornerMask ? glyphTcSize : 0.0);
+      o.glyphTcBox.xy = tc - select(cornerMask, glyphTcSize, 0.0);
       o.glyphTcBox.zw = o.glyphTcBox.xy + glyphTcSize;
 
       o.tc += offsetTexels * invFontTexSize;
       // Vertex position is transformed on CPU side to fit the effect.
     ##endif
 
-      float4 screenPos = float4((fpos * viewport.xy + viewport.zw) * gui_text_depth.y, gui_text_depth.xy);
+      float2 vpPos = gui_use_inv_viewport_tm ?
+                      fpos * viewport.xy + viewport.zw :
+                      fpos;
+      float4 screenPos = float4(vpPos * gui_text_depth.y, gui_text_depth.xy);
     ##if use_gui_glob_tm == yes
       o.pos = mul(guiGlobTm, screenPos);
     ##else
@@ -386,7 +392,7 @@ shader gui_default
     ##else
       half select(half4 tc_xyxy, half4 box_ltrb, half inside, half outside)
       {
-        return all(tc_xyxy > box_ltrb ? bool4(1,1,0,0) : bool4(0,0,1,1)) ? inside : outside;
+        return all(select(tc_xyxy > box_ltrb, bool4(1,1,0,0), bool4(0,0,1,1))) ? inside : outside;
       }
       #define stepCount 3
       float GaussianBlur( float2 centreUV, float pixelXOffset, float4 box)

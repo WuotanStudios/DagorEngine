@@ -72,8 +72,10 @@ bool HmapLandPlugin::traceRayPrivate(const Point3 &p, const Point3 &dir, real &m
   int st_mask = DAEDITOR3.getEntitySubTypeMask(IObjEntityFilter::STMASK_TYPE_RENDER);
   if (exportType == EXPORT_LANDMESH && !landMeshMap.isEmpty() && (st_mask & lmeshSubtypeMask) && !(st_mask & hmapSubtypeMask))
   {
+    if (st_mask & lmeshDetSubtypeMask)
+      return landMeshMap.traceRay(true, p, dir, maxt, norm);
     bool ret = detDivisor ? ::trace_ray_midpoint_heightmap(det_hm_tr, p, dir, maxt, norm) : false;
-    return landMeshMap.traceRay(p, dir, maxt, norm) || ret;
+    return landMeshMap.traceRay(false, p, dir, maxt, norm) || ret;
   }
 
   applyHmModifiers(false);
@@ -108,10 +110,12 @@ bool HmapLandPlugin::traceRay(const Point3 &pt, const Point3 &dir, real &maxt, P
     return false;
 
   HMDetTR det_hm_tr;
-  if (exportType == EXPORT_LANDMESH && !landMeshMap.isEmpty())
+  if (exportType == EXPORT_LANDMESH && !landMeshMap.isEmpty() && (st_mask & lmeshSubtypeMask))
   {
+    if ((st_mask & lmeshDetSubtypeMask) && !(st_mask & hmapSubtypeMask))
+      return landMeshMap.traceRay(true, pt, dir, maxt, norm);
     bool ret = detDivisor ? ::trace_ray_midpoint_heightmap(det_hm_tr, pt, dir, maxt, norm) : false;
-    return landMeshMap.traceRay(pt, dir, maxt, norm) || ret;
+    return landMeshMap.traceRay(false, pt, dir, maxt, norm) || ret;
   }
 
   applyHmModifiers(false);
@@ -135,16 +139,6 @@ bool HmapLandPlugin::traceRay(const Point3 &pt, const Point3 &dir, real &maxt, P
   bool ret = detDivisor ? ::trace_ray_midpoint_heightmap(det_hm_tr, pt, dir, maxt, norm) : false;
   return ::trace_ray_midpoint_heightmap(*this, pt, dir, maxt, norm) || ret;
 }
-
-bool HmapLandPlugin::shadowRayHitTest(const Point3 &pt, const Point3 &dir, real maxt)
-{
-  if (!heightMap.isFileOpened() || !isVisible || exportType == EXPORT_PSEUDO_PLANE || calculating_shadows)
-    return false;
-
-  applyHmModifiers(false);
-  return ray_hit_midpoint_heightmap_approximate(*this, pt, dir, maxt);
-}
-
 
 bool HmapLandPlugin::getHeightmapCell5Pt(const IPoint2 &cell, real &h0, real &hx, real &hy, real &hxy, real &hmid) const
 {
@@ -189,6 +183,10 @@ bool HmapLandPlugin::getHeightmapPointHt(Point3 &inout_p, Point3 *out_norm) cons
   if (exportType == EXPORT_PSEUDO_PLANE)
     return false;
 
+  int st_mask = DAEDITOR3.getEntitySubTypeMask(IObjEntityFilter::STMASK_TYPE_COLLISION);
+  if ((st_mask & lmeshSubtypeMask) && (st_mask & lmeshDetSubtypeMask) && (exportType == EXPORT_LANDMESH && !landMeshMap.isEmpty()) &&
+      !(st_mask & hmapSubtypeMask))
+    return landMeshMap.getHeight(true, Point2::xz(inout_p), inout_p.y, out_norm);
   if (detDivisor && (detRect & Point2::xz(inout_p)))
   {
     HMDetTR det_hm;
@@ -196,7 +194,7 @@ bool HmapLandPlugin::getHeightmapPointHt(Point3 &inout_p, Point3 *out_norm) cons
   }
   if (exportType == EXPORT_LANDMESH && !landMeshMap.isEmpty())
   {
-    return landMeshMap.getHeight(Point2::xz(inout_p), inout_p.y, out_norm);
+    return landMeshMap.getHeight(false, Point2::xz(inout_p), inout_p.y, out_norm);
   }
 
   return get_height_midpoint_heightmap(*this, Point2(inout_p.x, inout_p.z), inout_p.y, out_norm);

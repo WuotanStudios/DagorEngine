@@ -12,7 +12,7 @@
 DAS_BASE_BIND_ENUM_98(::DataBlock::ParamType, DataBlockParamType, TYPE_NONE, TYPE_STRING, TYPE_INT, TYPE_REAL, TYPE_POINT2,
   TYPE_POINT3, TYPE_POINT4, TYPE_IPOINT2, TYPE_IPOINT3, TYPE_BOOL, TYPE_E3DCOLOR, TYPE_MATRIX, TYPE_INT64, TYPE_IPOINT4)
 
-DAS_BASE_BIND_ENUM(dblk::ReadFlag, DataBlockReadFlag, ROBUST, BINARY_ONLY, RESTORE_FLAGS, ALLOW_SS, ROBUST_IN_REL)
+DAS_BASE_BIND_ENUM_IMPL(dblk::ReadFlag, DataBlockReadFlag, ROBUST, BINARY_ONLY, RESTORE_FLAGS, ALLOW_SS, ROBUST_IN_REL)
 
 static bool dblk_load(DataBlock &b, const char *fn, dblk::ReadFlag flg) { return dblk::load(b, fn, flg); }
 
@@ -30,13 +30,21 @@ struct DataBlockAnnotation : das::ManagedStructureAnnotation<DataBlock, true, tr
 #if DAGOR_DBGLEVEL > 0
   virtual void walk(das::DataWalker &walker, void *obj) override
   {
-    DataBlock *blk = (DataBlock *)obj;
+    if (walker.collecting)
+    {
+      das::ManagedStructureAnnotation<DataBlock, true, true>::walk(walker, obj);
+      return;
+    }
+    if (!walker.reading)
+    {
+      DataBlock *blk = (DataBlock *)obj;
 
-    DynamicMemGeneralSaveCB cwr(framemem_ptr(), 0, 2 << 10);
-    blk->saveToTextStream(cwr);
-    cwr.writeInt(0);
-    unsigned char *data = cwr.data();
-    walker.String(*(char **)&data);
+      DynamicMemGeneralSaveCB cwr(framemem_ptr(), 0, 2 << 10);
+      blk->saveToTextStream(cwr);
+      cwr.writeInt(0);
+      unsigned char *data = cwr.data();
+      walker.String(*(char **)&data);
+    }
   }
 #endif
 };
@@ -58,6 +66,12 @@ static char dagorDataBlock_das[] =
   ;
 
 void datablock_debug_print_datablock(const char *name, const DataBlock &blk) { ::debug_print_datablock(name, &blk); }
+
+// Editing tools that rewrite a whole .blk (load + mutate + save) must enable
+// this around the load/save pair, or the rewrite strips every comment in the
+// file. Global and not thread safe, like the quirrel binding; main thread only.
+void datablock_set_parse_comments_as_params(bool v) { DataBlock::parseCommentsAsParams = v; }
+bool datablock_get_parse_comments_as_params() { return DataBlock::parseCommentsAsParams; }
 
 const char *datablock_to_string(const DataBlock &blk, das::Context *context, das::LineInfoArg *at)
 {
@@ -87,11 +101,11 @@ public:
     addBuiltinDependency(lib, require("math"));
     addBuiltinDependency(lib, require("DagorMath"));
 
-    addEnumeration(das::make_smart<EnumerationDataBlockParamType>());
-    addEnumeration(das::make_smart<EnumerationDataBlockReadFlag>());
+    addEnumeration(new EnumerationDataBlockParamType());
+    addEnumeration(new EnumerationDataBlockReadFlag());
 
-    addAnnotation(das::make_smart<DataBlockAnnotation>(lib));
-    addAnnotation(das::make_smart<SharedDataBlockAnnotation>(lib));
+    addAnnotation(new DataBlockAnnotation(lib));
+    addAnnotation(new SharedDataBlockAnnotation(lib));
     das::addUsing<DataBlock>(*this, lib, "DataBlock");
 
 #define BIND_BLK(FUNC_NAME, SIDE_EFFECT) \
@@ -120,25 +134,11 @@ public:
       SIDE_EFFECT, "das_call_member<" #SIGNATURE ", &DataBlock::" #FUNC_NAME ">::invoke");                                \
   }
 
-    struct removeRefFn : das::defaultTempFn
-    {
-      removeRefFn(int idx_) : idx{idx_} {}
-      ___noinline bool operator()(das::Function *fn)
-      {
-        defaultTempFn::operator()(fn);
-        fn->arguments[idx]->type->ref = false;
-        return true;
-      }
-      const int idx = 2;
-    };
-
-// macro for bind class member function and remove ref from 1 argument.
-//  void f(const Point3 &) -> void f(Point3). It's need to pass rvalue in this functions
-#define BLK_MEMBER_REMOVE_REF(FUNC_NAME, SYNONIM, SIDE_EFFECT, SIGNATURE, REF_IDX)                                         \
-  {                                                                                                                        \
-    using memberMethod = das::das_call_member<SIGNATURE, &DataBlock::FUNC_NAME>;                                           \
-    das::addExtern<DAS_CALL_METHOD(memberMethod), das::SimNode_ExtFuncCall, removeRefFn>(*this, lib, SYNONIM, SIDE_EFFECT, \
-      "das_call_member<" #SIGNATURE ", &DataBlock::" #FUNC_NAME ">::invoke", removeRefFn(REF_IDX));                        \
+#define BLK_MEMBER_REMOVE_REF(FUNC_NAME, SYNONIM, SIDE_EFFECT, SIGNATURE, REF_IDX)       \
+  {                                                                                      \
+    using memberMethod = das::das_call_member_no_ref2<SIGNATURE, &DataBlock::FUNC_NAME>; \
+    das::addExtern<DAS_CALL_METHOD(memberMethod)>(*this, lib, SYNONIM, SIDE_EFFECT,      \
+      "das_call_member_no_ref2<" #SIGNATURE ", &DataBlock::" #FUNC_NAME ">::invoke");    \
   }
 
     BLK_MEMBER(clearData, "datablock_clear_data", das::SideEffects::modifyArgument, void(DataBlock::*)())
@@ -146,6 +146,11 @@ public:
     BLK_MEMBER(load, "datablock_load", das::SideEffects::modifyArgument, bool(DataBlock::*)(const char *))
 
     das::addExtern<DAS_BIND_FUN(dblk_load)>(*this, lib, "datablock_load", das::SideEffects::modifyArgumentAndExternal, "dblk::load");
+
+    das::addExtern<DAS_BIND_FUN(datablock_set_parse_comments_as_params)>(*this, lib, "datablock_set_parse_comments_as_params",
+      das::SideEffects::modifyExternal, "bind_dascript::datablock_set_parse_comments_as_params");
+    das::addExtern<DAS_BIND_FUN(datablock_get_parse_comments_as_params)>(*this, lib, "datablock_get_parse_comments_as_params",
+      das::SideEffects::accessExternal, "bind_dascript::datablock_get_parse_comments_as_params");
 
     BLK_MEMBER_CONST(getBlock, "datablock_get_block", das::SideEffects::none, const DataBlock *(DataBlock::*)(uint32_t) const)
     BLK_MEMBER(getBlock, "datablock_get_block", das::SideEffects::none, DataBlock * (DataBlock::*)(uint32_t))
@@ -268,6 +273,13 @@ public:
       das::SideEffects::modifyArgument, "bind_dascript::read_interpolate_tab_as_params");
     das::addExtern<DAS_BIND_FUN(bind_dascript::read_interpolate_tab_float_p2)>(*this, lib, "read_interpolate_tab_float_p2",
       das::SideEffects::modifyArgument, "bind_dascript::read_interpolate_tab_float_p2");
+
+    das::addExtern<DAS_BIND_FUN(bind_dascript::read_interpolate_tab_mem_ptr_as_params)>(*this, lib,
+      "read_interpolate_tab_mem_ptr_as_params", das::SideEffects::modifyArgument,
+      "bind_dascript::read_interpolate_tab_mem_ptr_as_params");
+    das::addExtern<DAS_BIND_FUN(bind_dascript::read_interpolate_tab_mem_ptr_float_p2)>(*this, lib,
+      "read_interpolate_tab_mem_ptr_float_p2", das::SideEffects::modifyArgument,
+      "bind_dascript::read_interpolate_tab_mem_ptr_float_p2");
 
     compileBuiltinModule("dagorDataBlock.das", (unsigned char *)dagorDataBlock_das, sizeof(dagorDataBlock_das));
 

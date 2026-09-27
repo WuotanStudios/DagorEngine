@@ -31,12 +31,13 @@ static float lerp_hue(float from, float to, float k)
   return fmodf(from + d * k + 360.0f, 360.0f);
 }
 
-static ColorHsva lerp_hsva(const ColorHsva &from, const ColorHsva &to, float k)
+
+static ColorOklcha lerp_oklcha(const ColorOklcha &from, const ColorOklcha &to, float k)
 {
-  ColorHsva res;
+  ColorOklcha res;
+  res.l = lerp(from.l, to.l, k);
+  res.c = lerp(from.c, to.c, k);
   res.h = lerp_hue(from.h, to.h, k);
-  res.s = lerp(from.s, to.s, k);
-  res.v = lerp(from.v, to.v, k);
   res.a = lerp(from.a, to.a, k);
   return res;
 }
@@ -74,20 +75,14 @@ void AnimDesc::reset()
 }
 
 
-// Provide shortest interpolation path in HSV in case
-// if calculated hue or saturation is undefined
-static void adjust_color_for_animation(ColorHsva &a, ColorHsva &b)
+// An achromatic end has no hue of its own: borrow the other end's, so the
+// transition stays on one hue.
+static void adjust_color_for_animation(ColorOklcha &a, ColorOklcha &b)
 {
-  const float eps = 1e-5f;
-  if (a.s < eps && b.s >= eps)
+  if (a.c < OKLCH_ACHROMATIC_CHROMA && b.c >= OKLCH_ACHROMATIC_CHROMA)
     a.h = b.h;
-  else if (b.s < eps && a.s >= eps)
+  else if (b.c < OKLCH_ACHROMATIC_CHROMA && a.c >= OKLCH_ACHROMATIC_CHROMA)
     b.h = a.h;
-
-  if (a.v < eps && b.v >= eps)
-    a.s = b.s;
-  else if (b.v < eps && a.v >= eps)
-    b.s = a.s;
 }
 
 
@@ -173,8 +168,8 @@ Animation *create_anim(const AnimDesc &desc, Element *elem)
     case AP_FVALUE:
     case AP_PICSATURATE:
     case AP_BRIGHTNESS: anim = new FloatAnim(elem); break;
-    case AP_SCALE:
-    case AP_TRANSLATE: anim = new Point2Anim(elem); break;
+    case AP_SCALE: anim = new Point2Anim(elem, Point2::ONE); break;
+    case AP_TRANSLATE: anim = new Point2Anim(elem, Point2::ZERO); break;
     default: G_ASSERTF(0, "Unexpected anim prop %d", desc.prop); break;
   }
 
@@ -210,6 +205,8 @@ bool Animation::baseUpdate(int64_t dt)
 {
   if (isFinished())
     return false;
+  if (isPaused)
+    return true;
 
   if (delayLeft > 0)
   {
@@ -229,7 +226,10 @@ bool Animation::baseUpdate(int64_t dt)
   if (isPlayingLoop)
   {
     if (desc.globalTimer)
-      t = get_time_usec(get_anim_ref_time()) % desc.fullDuration();
+    {
+      int64_t ticksDelta = ref_time_ticks() - get_anim_ref_time();
+      t = ref_time_delta_to_usec(ticksDelta) % desc.fullDuration();
+    }
     else
       t = t % desc.fullDuration();
   }
@@ -301,6 +301,9 @@ void Animation::skipDelay()
 }
 
 
+void Animation::setPause(bool on) { isPaused = on; }
+
+
 void Animation::init(const AnimDesc &desc_)
 {
   desc = desc_;
@@ -312,6 +315,8 @@ void Animation::init(const AnimDesc &desc_)
 
 
 bool Animation::isFinished() const { return t >= desc.fullDuration(); }
+
+bool Animation::isFadingOut() const { return desc.playFadeOut && elem->isDetached(); }
 
 
 void Animation::start()
@@ -334,6 +339,8 @@ void Animation::start()
   if (doStart)
   {
     rewind();
+    if (isFadingOut() && desc.fromElemProp())
+      snapshotFromCurrent();
     callHandler(desc.onEnter, true);
     if (delayLeft <= 0)
     {
@@ -382,9 +389,7 @@ float Animation::applyEasing(float k)
   else
   {
     Sqrat::Function f(sqfunc.GetVM(), Sqrat::Object(sqfunc.GetVM()), sqfunc.GetObject());
-    float res = k;
-    f.Evaluate(k, res);
-    return res;
+    return f.Eval<float>(k).value_or(k);
   }
 }
 
@@ -398,14 +403,14 @@ void ColorAnim::setup(bool /*initial*/)
   output = (elem->robjParams && elem->robjParams->getAnimColor(desc.prop, &ptr)) ? ptr : nullptr;
 
   if (!desc.fromElemProp())
-    cFrom = rgb2hsv(color4(script_decode_e3dcolor(desc.from.Cast<SQInteger>())));
+    cFrom = e3dcolor_to_oklch(script_decode_e3dcolor(desc.from.Cast<SQInteger>()));
   else
-    cFrom = ColorHsva(0, 0, 0, 0);
+    cFrom = ColorOklcha();
 
   if (!desc.toElemProp())
-    cTo = rgb2hsv(color4(script_decode_e3dcolor(desc.to.Cast<SQInteger>())));
+    cTo = e3dcolor_to_oklch(script_decode_e3dcolor(desc.to.Cast<SQInteger>()));
   else
-    cTo = ColorHsva(0, 0, 0, 0);
+    cTo = ColorOklcha();
 
   if (!desc.fromElemProp() && !desc.toElemProp())
     adjust_color_for_animation(cFrom, cTo);
@@ -439,24 +444,34 @@ void ColorAnim::update(int64_t dt)
 }
 
 
+void ColorAnim::snapshotFromCurrent()
+{
+  // all animated colors live in rendObj params, there is no style override to read
+  cFrom = e3dcolor_to_oklch(output ? *output : baseElemColor);
+}
+
+
 void ColorAnim::apply()
 {
-  ColorHsva valFrom = cFrom;
-  ColorHsva valTo = cTo;
+  ColorOklcha valFrom = cFrom;
+  ColorOklcha valTo = cTo;
 
-  if (desc.fromElemProp())
-    valFrom = rgb2hsv(baseElemColor);
+  // a fading out 'from' was resolved once at start(), do not overwrite it
+  const bool readFromElem = desc.fromElemProp() && !isFadingOut();
+
+  if (readFromElem)
+    valFrom = e3dcolor_to_oklch(baseElemColor);
   if (desc.toElemProp())
-    valTo = rgb2hsv(baseElemColor);
+    valTo = e3dcolor_to_oklch(baseElemColor);
   if (desc.fromElemProp() || desc.toElemProp())
     adjust_color_for_animation(valFrom, valTo);
 
   float k = applyEasing(effectiveK());
 
-  ColorHsva res = lerp_hsva(valFrom, valTo, k);
-  E3DCOLOR val = e3dcolor(hsv2rgb(res));
+  ColorOklcha res = lerp_oklcha(valFrom, valTo, k);
+  E3DCOLOR val = oklch_to_e3dcolor(res);
 
-  if (isFinished() && !desc.playFadeOut)
+  if (isFinished() && !isFadingOut())
   {
     if (output)
       *output = baseElemColor;
@@ -486,43 +501,69 @@ void FloatAnim::update(int64_t dt)
 }
 
 
+void FloatAnim::snapshotFromCurrent()
+{
+  switch (desc.prop)
+  {
+    case AP_OPACITY: fFrom = elem->props.getCurrentOpacity(); break;
+
+    // transform->rotate is radians, while from/to and fFrom/fTo are script degrees
+    case AP_ROTATE:
+      if (elem->transform)
+        fFrom = RadToDeg(elem->transform->getCurRotate());
+      break;
+
+    case AP_FVALUE: fFrom = elem->props.getCurrentFloat(elem->csk->fValue, 0.0f); break;
+
+    case AP_PICSATURATE: fFrom = output ? *output : elem->props.getFloat(elem->csk->picSaturate, 1.0f); break;
+
+    case AP_BRIGHTNESS: fFrom = output ? *output : elem->props.getFloat(elem->csk->brightness, 1.0f); break;
+
+    default: G_ASSERTF(0, "Unsupported anim prop %d", desc.prop);
+  }
+}
+
+
 void FloatAnim::apply()
 {
   float valFrom = fFrom;
   float valTo = fTo;
 
+  // re-reading a fading out element would feed this function's own output back into the lerp
+  const bool readFromElem = desc.fromElemProp() && !isFadingOut();
+
   switch (desc.prop)
   {
     case AP_OPACITY:
-      if (desc.fromElemProp())
+      if (readFromElem)
         valFrom = elem->props.getBaseOpacity();
       if (desc.toElemProp())
         valTo = elem->props.getBaseOpacity();
       break;
 
     case AP_ROTATE:
-      if (desc.fromElemProp() && elem->transform)
-        valFrom = elem->transform->rotate;
+      if (readFromElem && elem->transform)
+        valFrom = RadToDeg(elem->transform->rotate);
       if (desc.toElemProp() && elem->transform)
-        valTo = elem->transform->rotate;
+        valTo = RadToDeg(elem->transform->rotate);
       break;
 
     case AP_FVALUE:
-      if (desc.fromElemProp())
+      if (readFromElem)
         valFrom = elem->props.getFloat(elem->csk->fValue, 0.0f);
       if (desc.toElemProp())
         valTo = elem->props.getFloat(elem->csk->fValue, 0.0f);
       break;
 
     case AP_PICSATURATE:
-      if (desc.fromElemProp())
+      if (readFromElem)
         valFrom = elem->props.getFloat(elem->csk->picSaturate, 1.0f);
       if (desc.toElemProp())
         valTo = elem->props.getFloat(elem->csk->picSaturate, 1.0f);
       break;
 
     case AP_BRIGHTNESS:
-      if (desc.fromElemProp())
+      if (readFromElem)
         valFrom = elem->props.getFloat(elem->csk->brightness, 1.0f);
       if (desc.toElemProp())
         valTo = elem->props.getFloat(elem->csk->brightness, 1.0f);
@@ -539,7 +580,7 @@ void FloatAnim::apply()
   switch (desc.prop)
   {
     case AP_OPACITY:
-      if (isFinished() && !desc.playFadeOut)
+      if (isFinished() && !isFadingOut())
         elem->props.resetCurrentOpacity();
       else
         elem->props.setCurrentOpacity(val);
@@ -548,7 +589,7 @@ void FloatAnim::apply()
     case AP_ROTATE:
       if (elem->transform)
       {
-        if (isFinished() && !desc.playFadeOut)
+        if (isFinished() && !isFadingOut())
           elem->transform->haveCurRotate = false;
         else
         {
@@ -559,7 +600,7 @@ void FloatAnim::apply()
       break;
 
     case AP_FVALUE:
-      if (isFinished() && !desc.playFadeOut)
+      if (isFinished() && !isFadingOut())
         elem->props.resetOverride(elem->csk->fValue);
       else
         elem->props.overrideFloat(elem->csk->fValue, val);
@@ -578,14 +619,28 @@ void FloatAnim::apply()
 void Point2Anim::setup(bool /*initial*/)
 {
   if (!desc.fromElemProp())
-    p2From = script_get_point2(desc.from);
+    p2From = script_get_point2(desc.from, defVal);
   else
-    p2From.zero();
+    p2From = defVal;
 
   if (!desc.toElemProp())
-    p2To = script_get_point2(desc.to);
+    p2To = script_get_point2(desc.to, defVal);
   else
-    p2To.zero();
+    p2To = defVal;
+}
+
+
+void Point2Anim::snapshotFromCurrent()
+{
+  if (!elem->transform)
+    return;
+
+  if (desc.prop == AP_SCALE)
+    p2From = elem->transform->getCurScale();
+  else if (desc.prop == AP_TRANSLATE)
+    p2From = elem->transform->getCurTranslate();
+  else
+    G_ASSERTF(0, "Unsupported anim prop %d", desc.prop);
 }
 
 
@@ -610,7 +665,7 @@ void Point2Anim::apply()
 
   if (srcField)
   {
-    if (desc.fromElemProp())
+    if (desc.fromElemProp() && !isFadingOut())
       valFrom = *srcField;
     if (desc.toElemProp())
       valTo = *srcField;
@@ -625,7 +680,7 @@ void Point2Anim::apply()
     case AP_SCALE:
       if (elem->transform)
       {
-        if (isFinished() && !desc.playFadeOut)
+        if (isFinished() && !isFadingOut())
           elem->transform->haveCurScale = false;
         else
         {
@@ -639,7 +694,7 @@ void Point2Anim::apply()
     case AP_TRANSLATE:
       if (elem->transform)
       {
-        if (isFinished() && !desc.playFadeOut)
+        if (isFinished() && !isFadingOut())
           elem->transform->haveCurTranslate = false;
         else
         {
@@ -702,8 +757,8 @@ bool Transition::checkStart(AnimProp p, bool *reset)
           return true;
         }
 
-        colorFrom = rgb2hsv(curColor);
-        colorTo = rgb2hsv(elemColor);
+        colorFrom = e3dcolor_to_oklch(curColor);
+        colorTo = e3dcolor_to_oklch(elemColor);
         adjust_color_for_animation(colorFrom, colorTo);
         lastElemColor = elemColor;
 
@@ -782,8 +837,8 @@ void Transition::recalcCurValues(AnimProp p, float k)
 
   if (colorOutput)
   {
-    ColorHsva val = lerp_hsva(colorFrom, colorTo, k);
-    *colorOutput = e3dcolor(hsv2rgb(val));
+    ColorOklcha val = lerp_oklcha(colorFrom, colorTo, k);
+    *colorOutput = oklch_to_e3dcolor(val);
     curColor = *colorOutput;
   }
   else if (p == AP_OPACITY || p == AP_FVALUE || p == AP_ROTATE)
@@ -861,9 +916,7 @@ void Transition::update(int64_t dt)
     else
     {
       Sqrat::Function f(sqEasingFunc.GetVM(), Sqrat::Object(sqEasingFunc.GetVM()), sqEasingFunc.GetObject());
-      float res = k;
-      f.Evaluate(k, res);
-      k = res;
+      k = f.Eval<float>(k).value_or(k);
     }
 
     recalcCurValues(prop, k);

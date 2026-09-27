@@ -29,7 +29,9 @@
 #include <osApiWrappers/dag_miscApi.h>
 #include <math/random/dag_random.h>
 #include <util/dag_threadPool.h>
-
+#include "refinedBlockLayout.h"
+#include <dag/dag_vector.h>
+#include <ska_hash_map/flat_hash_map2.hpp>
 #include <atomic>
 #include <EASTL/deque.h>
 
@@ -46,8 +48,6 @@ int opcode_usage[2][256];
 namespace shc
 {
 
-static DataBlock *reqShadersBlock = NULL;
-static bool defShaderReq = false;
 static bool defTreatInvalidAsNull = false;
 static String updbPath;
 bool relinkOnly = false;
@@ -118,16 +118,7 @@ static void init_job_execution()
   }
 }
 
-Job::Job()
-{
-  G_ASSERT(is_main_thread());
-
-  if (!shc::config().useThreadpool)
-  {
-    // Must always seq-before (in program order) the respective notifyJobRelease
-    jobs_in_flight_count.fetch_add(1, dag::memory_order_relaxed);
-  }
-}
+Job::Job() { G_ASSERT(is_main_thread()); }
 
 void Job::doJob()
 {
@@ -137,18 +128,7 @@ void Job::doJob()
   doJobBody();
 }
 
-void Job::releaseJob()
-{
-  releaseJobBody();
-
-  if (!shc::config().useThreadpool)
-  {
-    // @HACK: allowed from jobs to enable termination from error processing (that can happen in jobs)
-
-    // Sync is needed when releasing in worker and detecting it in syncpoint
-    jobs_in_flight_count.fetch_sub(1, dag::memory_order_release);
-  }
-}
+void Job::releaseJob() { releaseJobBody(); }
 
 static eastl::pair<unsigned, unsigned> calculate_jobs_x_processes_caps(unsigned requested_num_workers)
 {
@@ -158,7 +138,7 @@ static eastl::pair<unsigned, unsigned> calculate_jobs_x_processes_caps(unsigned 
   // very small benefit from 24+ processes, but noticeable memory consumption
   constexpr unsigned PROC_CAP = 24;
 
-#if _CROSS_TARGET_C2
+#if _CROSS_TARGET_C1 || _CROSS_TARGET_C2
 
 
 #else
@@ -181,10 +161,7 @@ void init_jobs(unsigned num_workers)
 {
   G_ASSERT(is_main_thread());
 
-  if (shc::config().useThreadpool)
-    cpujobs::init(-1, false);
-  else
-    cpujobs::init();
+  cpujobs::init(-1, false);
 
   auto [workers, processesCap] = calculate_jobs_x_processes_caps(num_workers);
 
@@ -202,37 +179,8 @@ void init_jobs(unsigned num_workers)
     return;
   }
 
-  if (shc::config().useThreadpool)
-  {
-    threadpool::init(worker_cnt, THREADPOOL_QUEUE_SIZE, WORKER_STACK_SIZE);
-    debug("started threadpool");
-  }
-  else
-  {
-    int logicalCores = cpujobs::get_logical_core_count();
-    int physicalCores = cpujobs::get_physical_core_count();
-    int coreRatio = max(1, logicalCores / physicalCores);
-
-    G_ASSERTF(worker_cnt <= logicalCores, "There is not enough logic cores (%u) to run %u jobs", logicalCores, worker_cnt);
-
-    if (coreRatio > 1)
-    {
-      // occupy cores properly, start with physical, then use logical HT ones
-      // use virtual job manager, otherwise job indexing will be broken
-      cpujobs_job_mgr_base = logicalCores;
-      for (int i = 0; i < worker_cnt; i++)
-      {
-        uint64_t affinity = 1ull << ((i * coreRatio) % logicalCores + i / physicalCores);
-        G_VERIFY(cpujobs::create_virtual_job_manager(WORKER_STACK_SIZE, affinity) == cpujobs_job_mgr_base + i);
-      }
-    }
-    else
-    {
-      for (int i = 0; i < worker_cnt; i++)
-        G_VERIFY(cpujobs::start_job_manager(i, WORKER_STACK_SIZE));
-    }
-    debug("inited %d job managers", worker_cnt);
-  }
+  threadpool::init(worker_cnt, THREADPOOL_QUEUE_SIZE, WORKER_STACK_SIZE);
+  debug("started threadpool");
 }
 
 void deinit_jobs()
@@ -242,73 +190,38 @@ void deinit_jobs()
   if (!is_multithreaded())
     return;
 
-  if (shc::config().useThreadpool)
-  {
-    // @TODO: specific drop & shutdown? If so, do up threadpool or spoof jobs w/ flag?
-    threadpool::shutdown();
-    cpujobs::term(false);
-    debug("terminated threadpool");
-  }
-  else
-  {
-    if (!cpujobs::is_inited())
-      return;
-
-    for (int i = 0; i < worker_cnt; i++)
-      cpujobs::reset_job_queue(cpujobs_job_mgr_base + i, true);
-
-    await_all_jobs();
-
-    debug("terminating jobs");
-    cpujobs::term(true);
-    debug("jobs termination done");
-  }
+  // @TODO: specific drop & shutdown? If so, do up threadpool or spoof jobs w/ flag?
+  threadpool::shutdown();
+  cpujobs::term(false);
+  debug("terminated threadpool");
 }
 
 unsigned worker_count() { return worker_cnt; }
 unsigned max_allowed_process_count() { return max_proc_count_for_worker_count; }
 bool is_multithreaded() { return worker_cnt > 1; }
-
-bool is_in_worker() { return shc::config().useThreadpool ? threadpool::get_current_worker_id() != -1 : cpujobs::is_in_job(); }
+int current_worker() { return threadpool::get_current_worker_id(); }
+bool is_in_worker() { return current_worker() != -1; }
 
 void await_all_jobs(void (*on_released_cb)())
 {
   G_ASSERT(!is_in_worker());
 
-  if (shc::config().useThreadpool)
-  {
-    if (jobs_in_flight.empty())
-      return;
+  if (jobs_in_flight.empty())
+    return;
 
-    threadpool::barrier_active_wait_for_job(jobs_in_flight.back(), threadpool::PRIO_HIGH, queue_pos);
-    for (auto &j : jobs_in_flight)
-    {
-      threadpool::wait(j);
-      j->releaseJob();
-      if (on_released_cb)
-        (*on_released_cb)();
-    }
-
-    jobs_in_flight.clear();
-  }
-  else
+  threadpool::barrier_active_wait_for_job(jobs_in_flight.back(), threadpool::PRIO_HIGH, queue_pos);
+  for (auto &j : jobs_in_flight)
   {
-    cpujobs::release_done_jobs();
+    threadpool::wait(j);
+    j->releaseJob();
     if (on_released_cb)
       (*on_released_cb)();
-
-    // Sync is needed when reading result of notifyJobRelease called from worker
-    while (jobs_in_flight_count.load(dag::memory_order_acquire) > 0)
-    {
-      sleep_msec(1);
-      cpujobs::release_done_jobs();
-      if (on_released_cb)
-        (*on_released_cb)();
-    }
   }
+
+  jobs_in_flight.clear();
 }
 
-void add_job(Job *job, JobMgrChoiceStrategy mgr_choice_strat)
+void add_job(Job *job)
 {
   G_ASSERT(is_main_thread());
 
@@ -319,62 +232,9 @@ void add_job(Job *job, JobMgrChoiceStrategy mgr_choice_strat)
     return;
   }
 
-  if (shc::config().useThreadpool)
-  {
-    jobs_in_flight.push_back(job);
-    threadpool::add(jobs_in_flight.back(), threadpool::PRIO_DEFAULT, queue_pos, threadpool::AddFlags::IgnoreNotDone);
-    threadpool::wake_up_all();
-  }
-  else
-  {
-    switch (mgr_choice_strat)
-    {
-      case JobMgrChoiceStrategy::ROUND_ROBIN:
-      {
-        static int cpu = grnd();
-        cpu = (cpu + 1) % shc::worker_cnt;
-
-        cpujobs::add_job(cpujobs_job_mgr_base + cpu, job);
-      }
-      break;
-
-      case JobMgrChoiceStrategy::LEAST_BUSY_COOPERATIVE:
-      {
-        const int jobload_per_worker = 2;
-
-        static int curWorker = 0;
-        static int curWorkerLoad = 0;
-
-        // check all workers and if anyone is idle, give it the next batch of work
-        for (; curWorker < worker_cnt; ++curWorker)
-        {
-          if (!cpujobs::is_job_manager_busy(cpujobs_job_mgr_base + curWorker))
-          {
-            cpujobs::add_job(cpujobs_job_mgr_base + curWorker, job);
-
-            ++curWorkerLoad;
-            if (curWorkerLoad >= jobload_per_worker)
-            {
-              ++curWorker;
-              curWorkerLoad = 0;
-            }
-
-            return;
-          }
-
-          curWorkerLoad = 0;
-        }
-
-        // do one job if jobs are available
-        job->doJob();
-        job->releaseJob();
-
-        curWorker = 0;
-        curWorkerLoad = 0;
-      }
-      break;
-    }
-  }
+  jobs_in_flight.push_back(job);
+  threadpool::add(jobs_in_flight.back(), threadpool::PRIO_DEFAULT, queue_pos, threadpool::AddFlags::IgnoreNotDone);
+  threadpool::wake_up_all();
 }
 
 void startup()
@@ -387,11 +247,7 @@ void startup()
 void shutdown() { enable_sh_debug_con(false); }
 
 // reset shader compiler internal structures (before next compilation)
-void resetCompiler()
-{
-  reset_source_file();
-  reqShadersBlock = NULL;
-}
+void resetCompiler() { reset_source_file(); }
 
 void reset_source_file()
 {
@@ -414,15 +270,29 @@ String get_obj_file_name_from_source(const String &source_file_name, const ShCom
   return objFileName;
 }
 
-// check shader file cache & return true, if cache needs recompilation
-bool should_recompile_sh(const ShCompilationInfo &comp, const String &sourceFileName)
+String get_global_rb_layout_name(const ShCompilationInfo &comp)
 {
-  String objFileName = get_obj_file_name_from_source(sourceFileName, comp);
-  return check_scripted_shader(objFileName, {}, comp, shc::config().compileCppStcode()) != CompilerAction::NOTHING;
+  char intermediateDir[260];
+  strcpy(intermediateDir, comp.intermDir().c_str());
+  dd_append_slash_c(intermediateDir);
+
+  String objFileName = String(intermediateDir) + dd_get_fname("rblock.layout");
+  comp.hwopts().appendOptsTo(objFileName);
+  objFileName += ".obj";
+
+  return objFileName;
 }
-CompilerAction should_recompile(const ShCompilationInfo &comp)
+
+// check shader file cache & return true, if cache needs recompilation
+bool should_recompile_sh(const CompilationContext &ctx, const String &sourceFileName)
 {
-  CompilerAction dumpCheckResult = check_scripted_shader(comp.dest().c_str(), comp.sources(), comp, false);
+  String objFileName = get_obj_file_name_from_source(sourceFileName, ctx.compInfo());
+  return check_scripted_shader(objFileName, {}, ctx, shc::config().compileCppStcode()) != CompilerAction::NOTHING;
+}
+CompilerAction should_recompile(const CompilationContext &ctx)
+{
+  const auto &comp = ctx.compInfo();
+  CompilerAction dumpCheckResult = check_scripted_shader(comp.dest().c_str(), comp.sources(), ctx, false);
   if (dumpCheckResult == CompilerAction::COMPILE_AND_LINK)
     return dumpCheckResult;
 
@@ -442,14 +312,55 @@ CompilerAction should_recompile(const ShCompilationInfo &comp)
     if (objFileTime > destFileTime)
       return CompilerAction::COMPILE_AND_LINK;
 
-    if (should_recompile_sh(comp, sourceFileName))
+    if (should_recompile_sh(ctx, sourceFileName))
       return CompilerAction::COMPILE_AND_LINK;
   }
   return dumpCheckResult;
 }
 
+void runPreshaderParse(const ShCompilationInfo &compInfo, CompilationContext &comp)
+{
+  if (config().dependencyDumpMode)
+    return;
+
+  if (!config().compileRefinedBlock)
+    return;
+
+  const bool forceRebuild = config().forceRebuild;
+
+  dag::Vector<String> recompiledSources;
+  for (const String &sourceFileName : compInfo.sources())
+  {
+    if (!forceRebuild && !should_recompile_sh(comp, sourceFileName))
+    {
+      if (!load_local_rb_layout(get_obj_file_name_from_source(sourceFileName, compInfo), comp))
+        recompiledSources.push_back(sourceFileName);
+    }
+    else
+      recompiledSources.push_back(sourceFileName);
+  }
+
+  int64_t totalReft = ref_time_ticks();
+  for (const String &sourceFileName : recompiledSources)
+  {
+    TargetContext targetCtx = comp.makeTargetContext(sourceFileName.c_str(), true);
+    sh_process_errors();
+    reset_source_file();
+    CodeSourceBlocks::incFiles.reset();
+    int64_t reft = ref_time_ticks();
+    parse_shader_script(sourceFileName, nullptr, targetCtx);
+    sh_printf("[INFO] Parsed preshader '%s' in %gms\n", sourceFileName.c_str(), get_time_usec(reft) / 1000.);
+  }
+
+  sh_printf("[INFO] Parsed preshaders in %gms\n", get_time_usec(totalReft) / 1000.);
+
+  String rbLayoutCacheName = get_global_rb_layout_name(comp.compInfo());
+  sh_printf("[INFO] Built '%s'\n", rbLayoutCacheName.c_str());
+  save_global_rb_layout(rbLayoutCacheName, comp);
+}
+
 // compile shader files & generate variants to disk. return false, if error occurs
-void compileShader(CompilerAction compiler_action, bool no_save, bool should_rebuild, const shc::CompilationContext &comp)
+void compileShader(CompilerAction compiler_action, bool no_save, bool should_rebuild, shc::CompilationContext &comp)
 {
   // Sanity check, args should be validated before calling the function
   G_ASSERT(!should_rebuild || (compiler_action != CompilerAction::NOTHING && compiler_action != CompilerAction::LINK_ONLY));
@@ -470,12 +381,30 @@ void compileShader(CompilerAction compiler_action, bool no_save, bool should_reb
 
   if (compiler_action != CompilerAction::LINK_ONLY)
   {
+    dag::Vector<bool> rbLoadFailed;
+    rbLoadFailed.assign(compInfo.sources().size(), false);
+    if (config().compileRefinedBlock)
+    {
+      if (shc::config().singleCompilationShName && shc::config().workerMode)
+        load_global_rb_layout(get_global_rb_layout_name(comp.compInfo()), comp);
+      else
+      {
+        for (size_t i = 0; i < compInfo.sources().size(); ++i)
+        {
+          if (should_rebuild || should_recompile_sh(comp, compInfo.sources()[i]))
+            continue;
+          if (!load_local_rb_layout(get_obj_file_name_from_source(compInfo.sources()[i], compInfo), comp))
+            rbLoadFailed[i] = true;
+        }
+      }
+    }
+
     for (unsigned int sourceFileNo = 0; sourceFileNo < compInfo.sources().size(); sourceFileNo++)
     {
       const String &sourceFileName = compInfo.sources()[sourceFileNo];
       String objFileName = get_obj_file_name_from_source(sourceFileName, compInfo);
 
-      bool need_recompile = should_rebuild || should_recompile_sh(compInfo, sourceFileName);
+      bool need_recompile = should_rebuild || should_recompile_sh(comp, sourceFileName) || rbLoadFailed[sourceFileNo];
       if (!need_recompile)
       {
         sh_debug(SHLOG_INFO, "No changes in '%s', skipping", sourceFileName.str());
@@ -492,6 +421,7 @@ void compileShader(CompilerAction compiler_action, bool no_save, bool should_reb
         Tab<SimpleString> dependenciesList(tmpmem_ptr());
 
         TargetContext targetCtx = comp.makeTargetContext(sourceFileName.c_str());
+        sh_process_errors();
 
         reset_source_file();
 
@@ -506,6 +436,13 @@ void compileShader(CompilerAction compiler_action, bool no_save, bool should_reb
         dependenciesList.reserve(dependenciesList.size() + CodeSourceBlocks::incFiles.nameCount());
         for (int i = 0, e = CodeSourceBlocks::incFiles.nameCount(); i < e; i++)
           dependenciesList.push_back() = CodeSourceBlocks::incFiles.getName(i);
+
+        if (shc::config().dependencyDumpMode)
+        {
+          for (const auto &dep : dependenciesList)
+            comp.reportDepFile(dep);
+          continue;
+        }
 
         update_shaders_timestamps(dependenciesList, targetCtx);
         if (!no_save)
@@ -544,7 +481,19 @@ void compileShader(CompilerAction compiler_action, bool no_save, bool should_reb
   {
     int64_t reft = ref_time_ticks();
 
+    Tab<SimpleString> dependenciesList(tmpmem_ptr());
+    for (const String &source : compInfo.sources())
+      dependenciesList.push_back(SimpleString(source.c_str()));
+
+    if (shc::config().dependencyDumpMode)
+    {
+      for (const auto &dep : dependenciesList)
+        comp.reportDepFile(dep);
+      return;
+    }
+
     TargetContext targetCtx = comp.makeTargetContext(compInfo.dest().c_str());
+    sh_process_errors();
 
     for (unsigned int sourceFileNo = 0; sourceFileNo < compInfo.sources().size(); sourceFileNo++)
     {
@@ -565,14 +514,16 @@ void compileShader(CompilerAction compiler_action, bool no_save, bool should_reb
 #endif
       df_close(objFile);
     }
+
+    ShaderGlobal::validate_linked_gvar_collection(targetCtx);
+
+    if (!targetCtx.refinedBlockLayout().empty())
+      targetCtx.refinedBlockLayout().generateStcode();
+
     sh_debug(SHLOG_NORMAL, "[INFO] linked in %gms", get_time_usec(reft) / 1000.);
 
     reft = ref_time_ticks();
     sh_debug(SHLOG_NORMAL, "[INFO] Saving...");
-
-    Tab<SimpleString> dependenciesList(tmpmem_ptr());
-    for (const String &source : compInfo.sources())
-      dependenciesList.push_back(SimpleString(source.c_str()));
 
     // Don't save cppstcode for the lib, it would be gibberish
     save_scripted_shaders(compInfo.dest().c_str(), dependenciesList, targetCtx, false);
@@ -584,7 +535,7 @@ void compileShader(CompilerAction compiler_action, bool no_save, bool should_reb
 }
 
 bool buildShaderBinDump(const char *bindump_fn, const char *sh_fn, bool forceRebuild, bool minidump, BindumpPackingFlags packing_flags,
-  const shc::CompilationContext &comp)
+  shc::CompilationContext &comp)
 {
   if (!forceRebuild)
   {
@@ -610,13 +561,21 @@ bool buildShaderBinDump(const char *bindump_fn, const char *sh_fn, bool forceReb
       if (dump_time >= sh_time)
       {
         FullFileLoadCB crd(bindump_fn);
-        int hdr[4];
-        if (crd.tryRead(hdr, 16) == 16)
+        shader_layout::ScriptedShadersBinDumpCompressedHeader hdr{};
+        if (crd.tryRead(&hdr, sizeof(hdr)) == sizeof(hdr))
         {
-          if (hdr[0] == _MAKE4C('VSPS') && hdr[1] == _MAKE4C('dump') && hdr[2] == SHADER_BINDUMP_VER)
+          if (hdr.magicPart1 == _MAKE4C('VSPS') && hdr.magicPart2 == _MAKE4C('dump') && hdr.version == SHADER_BINDUMP_VER)
           {
-            sh_debug(SHLOG_INFO, "Skipping up-to-date binary %sdump '%s'\n", minidump ? "mini" : "", bindump_fn);
-            return true;
+            if (memcmp(hdr.buildBlkHash, comp.compInfo().targetBlkHash().data(), sizeof(hdr.buildBlkHash)) == 0)
+            {
+              sh_debug(SHLOG_NORMAL, "[INFO] Skipping up-to-date binary %sdump '%s'", minidump ? "mini" : "", bindump_fn);
+              return true;
+            }
+            else
+            {
+              sh_debug(SHLOG_NORMAL, "[INFO] Outdated blk hash '%s' in header of %sdump '%s'", hash_string(hdr.buildBlkHash).c_str(),
+                minidump ? "mini" : "", bindump_fn);
+            }
           }
         }
       }
@@ -642,14 +601,6 @@ bool buildShaderBinDump(const char *bindump_fn, const char *sh_fn, bool forceReb
 
   sh_debug(SHLOG_INFO, "+++ Built shaders binary %sdump: '%s'\n", minidump ? "mini" : "", bindump_fn);
   return true;
-}
-
-void setRequiredShadersBlock(DataBlock *block) { reqShadersBlock = block; }
-void setRequiredShadersDef(bool on) { defShaderReq = on; }
-
-bool isShaderRequired(const char *shader_name)
-{
-  return reqShadersBlock ? reqShadersBlock->getBool(shader_name, defShaderReq) : defShaderReq;
 }
 
 void clearFlobVarRefList() { explicitGlobVarRef.reset(); }
@@ -783,7 +734,7 @@ struct ShaderValidVariantList
         int mid2 = map2[vvData[j].nameId];
         G_ASSERT(mid >= 0 || mid2 >= 0);
         if ((mid >= 0 && vt.normalizeValue(mid, vvData[j].val) != v.getNormalizedValue(mid)) ||
-            (mid2 >= 0 && vt.normalizeValue(mid2, vvData[j].val) != v2.getNormalizedValue(mid2)))
+            (mid2 >= 0 && vt2.normalizeValue(mid2, vvData[j].val) != v2.getNormalizedValue(mid2)))
         {
           all_eq = false;
           break;

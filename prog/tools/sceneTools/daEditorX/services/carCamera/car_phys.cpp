@@ -27,6 +27,7 @@
 #include <libTools/util/binDumpUtil.h>
 
 #include <scene/dag_frtdumpMgr.h>
+#include <gameRes/dag_collisionResource.h>
 
 
 extern void phys_bullet_init();
@@ -36,13 +37,12 @@ extern void phys_bullet_create_phys_world(DynamicPhysObjectData *base_obj);
 extern void *phys_bullet_get_phys_world();
 extern void phys_bullet_set_phys_body(void *phbody);
 extern void phys_bullet_clear_phys_world();
-extern void phys_bullet_before_render();
+extern void phys_bullet_before_render(const Point3 &cam_pos);
 extern void phys_bullet_render_trans();
 extern void phys_bullet_render();
 extern bool phys_bullet_get_phys_tm(int body_id, TMatrix &phys_tm, bool &obj_active);
 extern void phys_bullet_add_impulse(int body_ind, const Point3 &pos, const Point3 &delta, real spring_factor, real damper_factor,
   real dt);
-extern bool phys_bullet_load_collision(IGenLoad &crd);
 extern void phys_bullet_install_tracer(bool (*traceray)(const Point3 &p, const Point3 &d, float &mt, Point3 &out_n, int &out_pmid));
 
 
@@ -51,9 +51,13 @@ static int physType = 0;
 static Ptr<PhysicsResource> simObjRes = NULL;
 static float curSimDt = 0.01;
 
-static FastRtDumpManager phys_frt;
+static FastRtDumpManager phys_frt;              // an old level's FRT block
+static Ptr<CollisionResource> phys_static_coll; // a current level's SCol block
+static const mat44f phys_coll_tm = {V_C_UNIT_1000, V_C_UNIT_0100, V_C_UNIT_0010, V_C_UNIT_0001};
 static inline bool phys_traceray_normal(const Point3 &p, const Point3 &dir, real &t, Point3 &n, int &pmid)
 {
+  if (phys_static_coll)
+    return phys_static_coll->traceRay(phys_coll_tm, p, dir, t, &n, pmid);
   return phys_frt.traceray(p, dir, t, pmid, n);
 }
 
@@ -153,6 +157,10 @@ bool setCollisionsToWorld(mkbindump::BinDumpSaveCB &cwr)
   // loading dump
   DAEDITOR3.conNote("+++ Loading ...");
 
+  // The trace reads the resource before the tracer, so a level that carries only an FRT block must
+  // not find the last one's resource still here.
+  phys_static_coll = nullptr;
+
   MemoryLoadCB crd(cwr.getRawWriter().getMem(), false);
   int tag = 0;
   unsigned bindump_id = 0xFFFFFFFF;
@@ -173,10 +181,17 @@ bool setCollisionsToWorld(mkbindump::BinDumpSaveCB &cwr)
       }
       break;
 
-      case _MAKE4C('B_RT'):
-        if (!phys_bullet_load_collision(crd))
+      case _MAKE4C('SCol'):
+      {
+        phys_static_coll = CollisionResource::loadResource(crd, -1); // a refused stream lands empty, never null
+        if (phys_static_coll->getAllNodes().empty())
+        {
+          phys_static_coll = nullptr;
           break;
-        break;
+        }
+        phys_bullet_install_tracer(&phys_traceray_normal);
+      }
+      break;
 
       case _MAKE4C('END'): need_break = true; break;
 
@@ -205,12 +220,11 @@ void setTargetObj(void *phys_body, const char *res)
   simObjRes = NULL;
   if (res)
   {
-    DynamicPhysObjectData *podata =
-      (DynamicPhysObjectData *)get_one_game_resource_ex(GAMERES_HANDLE_FROM_STRING(res), PhysObjGameResClassId);
+    DynamicPhysObjectData *podata = (DynamicPhysObjectData *)get_one_game_resource_ex(res, PhysObjGameResClassId);
     if (podata)
     {
       simObjRes = podata->physRes;
-      release_game_resource((GameResource *)podata);
+      release_game_resource_ex(podata, PhysObjGameResClassId);
     }
     else
     {
@@ -268,15 +282,16 @@ void end()
 
   phys_bullet_install_tracer(nullptr);
   phys_frt.delAllRtDumps();
+  phys_static_coll = nullptr; // a closed level holds no collision, as the dumps above
   phys_bullet_close();
 }
 
 void close() { phys_bullet_close(); }
 
-void beforeRender()
+void beforeRender(const Point3 &cam_pos)
 {
   if (physType == PHYS_BULLET)
-    phys_bullet_before_render();
+    phys_bullet_before_render(cam_pos);
 }
 
 void renderTrans(bool render_collision, bool render_geom, bool draw_cmass)

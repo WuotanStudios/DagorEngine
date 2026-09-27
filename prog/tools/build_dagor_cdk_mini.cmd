@@ -18,6 +18,8 @@ jam -s Root=../.. -f AssetViewer/jamfile
   if errorlevel 1 goto error
 jam -s Root=../.. -f sceneTools/findUnusedTex/jamfile
   if errorlevel 1 goto error
+jam -s Root=../.. -f blkEditor/jamfile
+  if errorlevel 1 goto error
 
 rem daImpostorBaker
 jam -s Root=../.. -f sceneTools/impostorBaker/tool/jamfile
@@ -46,16 +48,18 @@ jam -s Root=../.. -f shaderCompiler2/jamfile-dx12
   if errorlevel 1 goto error
 jam -s Root=../.. -f shaderCompiler2/jamfile-stub
   if errorlevel 1 goto error
-jam -s Root=../.. -f shaderCompiler2/hlslCompiler/jamfile
-  if errorlevel 1 goto error
 jam -s Root=../.. -f shaderCompiler2/nodeBased/jamfile
   if errorlevel 1 goto error
 jam -s Root=../.. -f shaderInfo/jamfile
+  if errorlevel 1 goto error
+jam -s Root=../.. -f ../3rdPartyLibs/scripts/duktape/jamfile
   if errorlevel 1 goto error
 
 rem common minimal gui shaders for tools
 pushd sceneTools\guiShaders_commonData
 call compile_gui_shaders_dx11.cmd
+call compile_gui_shaders_dx12.cmd
+call compile_gui_shaders_spirv.cmd
 popd
 
 rem utils
@@ -99,13 +103,13 @@ __build_pack.py FINAL
 popd
 
 rem 3ds Max plugins, we don't care if these plugins fail to compile (this could happen due to missing SDK or compiler)
+jam -s Root=../.. -s MaxVer=Max2026 -f maxplug/jamfile
+
 jam -s Root=../.. -s MaxVer=Max2025 -f maxplug/jamfile
 
 jam -s Root=../.. -s MaxVer=Max2024 -f maxplug/jamfile
 
 jam -s Root=../.. -s MaxVer=Max2023 -f maxplug/jamfile
-
-jam -s Root=../.. -s MaxVer=Max2022 -f maxplug/jamfile
 if errorlevel 1 goto EOF
 
 goto EOF

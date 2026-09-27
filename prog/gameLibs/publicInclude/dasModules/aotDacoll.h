@@ -16,6 +16,7 @@
 #include <memory/dag_framemem.h>
 #include <ioSys/dag_dataBlock.h>
 #include <dasModules/aotRendInst.h>
+#include <ecs/phys/traceMeshFaces.h>
 
 DAS_BIND_ENUM_CAST_98_IN_NAMESPACE(::dacoll::PhysLayer, PhysLayer);
 DAS_BIND_ENUM_CAST_98_IN_NAMESPACE(::dacoll::CollType, CollType);
@@ -73,6 +74,12 @@ inline bool dacoll_tracedown_normalized_with_mat_id_ex(Point3 p, float &out_t, P
   return dacoll::tracedown_normalized(p, out_t, nullptr, &out_norm, flags, nullptr, ray_mat_id);
 }
 
+inline bool dacoll_tracedown_normalized_trace_handle_with_mat_id_ex(Point3 p, float &out_t, Point3 &out_norm, int flags,
+  int ray_mat_id, const TraceMeshFaces *handle)
+{
+  return dacoll::tracedown_normalized(p, out_t, nullptr, &out_norm, flags, nullptr, ray_mat_id, handle);
+}
+
 inline bool dacoll_tracedown_normalized_with_norm(Point3 p, float &out_t, Point3 &out_norm, int flags)
 {
   return dacoll::tracedown_normalized(p, out_t, nullptr, &out_norm, flags);
@@ -103,6 +110,12 @@ inline float dacoll_traceht_water_at_time(Point3 p, float t, float time, bool &u
 inline bool dacoll_rayhit_normalized(const Point3 &p, const Point3 &dir, real t, int flags, int ray_mat_id)
 {
   return dacoll::rayhit_normalized(p, dir, t, flags, ray_mat_id);
+}
+inline bool trace_game_objects_with_grid_filter(const Point3 &from, const Point3 &dir, float &t, Point3 &out_vel,
+  int ignore_game_obj_id, int ray_mat_id, const das::TArray<uint32_t> &grid_types)
+{
+  return dacoll::trace_game_objects_with_grid_filter(from, dir, t, out_vel, ignore_game_obj_id, ray_mat_id,
+    dag::ConstSpan<uint32_t>(reinterpret_cast<uint32_t *>(grid_types.data), grid_types.size));
 }
 
 inline bool dacoll_rayhit_normalized_trace_handle(const Point3 &p, const Point3 &dir, real t, int flags, int ray_mat_id,
@@ -146,10 +159,7 @@ inline void get_min_max_hmap_list_in_circle(das::float2 center, float rad,
   dacoll::get_min_max_hmap_list_in_circle(Point2::xy(center), rad, list);
 
   das::Array arr;
-  arr.data = (char *)list.data();
-  arr.size = uint32_t(list.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, list.data(), list.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -177,6 +187,12 @@ inline bool dacoll_sphere_cast_ex(const Point3 &from, const Point3 &to, float ra
   return dacoll::sphere_cast_ex(from, to, rad, out, cast_mat_id, dag::ConstSpan<CollisionObject>(), handle, mask);
 }
 
+inline bool dacoll_sphere_cast_ex_ref_trace_handle(const Point3 &from, const Point3 &to, float rad, dacoll::ShapeQueryOutput &out,
+  int cast_mat_id, const TraceMeshFaces &handle, int mask)
+{
+  return dacoll::sphere_cast_ex(from, to, rad, out, cast_mat_id, dag::ConstSpan<CollisionObject>(), &handle, mask);
+}
+
 inline bool dacoll_sphere_query_ri(const Point3 &from, const Point3 &to, float rad, dacoll::ShapeQueryOutput &out, int cast_mat_id,
   TraceMeshFaces *handle, const das::TBlock<void, const das::TTemporary<const das::TArray<rendinst::RendInstDesc>>> &block,
   das::Context *context, das::LineInfoArg *at)
@@ -184,10 +200,7 @@ inline bool dacoll_sphere_query_ri(const Point3 &from, const Point3 &to, float r
   Tab<rendinst::RendInstDesc> out_desc(framemem_ptr());
   bool result = dacoll::sphere_query_ri(from, to, rad, out, cast_mat_id, &out_desc, handle);
   das::Array arr;
-  arr.data = (char *)out_desc.data();
-  arr.size = uint32_t(out_desc.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, out_desc.data(), out_desc.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -242,10 +255,7 @@ inline bool dacoll_test_collision_world_ex(const CollisionObject &coll_obj, cons
 
   // TODO: make invoke generic for reuse
   das::Array arr;
-  arr.data = (char *)contacts.data();
-  arr.size = uint32_t(contacts.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, contacts.data(), contacts.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -262,10 +272,7 @@ inline bool dacoll_test_collision_ri_ex(const CollisionObject &coll_obj, const B
   bool result = dacoll::test_collision_ri(coll_obj, box, contacts, nullptr, mat_id);
 
   das::Array arr;
-  arr.data = (char *)contacts.data();
-  arr.size = uint32_t(contacts.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, contacts.data(), contacts.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -288,10 +295,7 @@ inline bool dacoll_test_collision_ri_sph(const CollisionObject &coll_obj, const 
   bool result = dacoll::test_collision_ri(coll_obj, sphere, contacts, nullptr, PHYSMAT_INVALID);
 
   das::Array arr;
-  arr.data = (char *)contacts.data();
-  arr.size = uint32_t(contacts.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, contacts.data(), contacts.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -307,10 +311,7 @@ inline bool dacoll_test_collision_frt(const CollisionObject &coll_obj, int mat_i
   bool result = dacoll::test_collision_frt(coll_obj, contacts, mat_id);
 
   das::Array arr;
-  arr.data = (char *)contacts.data();
-  arr.size = uint32_t(contacts.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, contacts.data(), contacts.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -326,10 +327,7 @@ inline bool dacoll_test_sphere_collision_world(const DPoint3 &pos, float boundin
   bool result = dacoll::test_sphere_collision_world(pos, bounding_radius, mat_id, contacts, group, mask);
 
   das::Array arr;
-  arr.data = (char *)contacts.data();
-  arr.size = uint32_t(contacts.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, contacts.data(), contacts.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -345,10 +343,7 @@ inline bool dacoll_test_box_collision_world(const TMatrix &tm, int mat_id, dacol
   bool result = dacoll::test_box_collision_world(tm, mat_id, contacts, group, mask);
 
   das::Array arr;
-  arr.data = (char *)contacts.data();
-  arr.size = uint32_t(contacts.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, contacts.data(), contacts.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -364,10 +359,7 @@ inline bool dacoll_test_capsule_collision_world(const TMatrix &tm, float radius,
   bool result = dacoll::test_capsule_collision_world(tm, radius, height, mat_id, contacts, group, mask);
 
   das::Array arr;
-  arr.data = (char *)contacts.data();
-  arr.size = uint32_t(contacts.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, contacts.data(), contacts.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -395,8 +387,6 @@ inline void use_capsule_collision(const das::TBlock<void, CollisionObject> &bloc
   vec4f arg = das::cast<CollisionObject &>::from(coll);
   context->invoke(block, &arg, nullptr, at);
 }
-
-inline void dacoll_fetch_sim_res(bool wait) { dacoll::fetch_sim_res(wait); }
 
 inline void dacoll_add_dynamic_sphere_collision(CollisionObject &obj, float rad, bool add_to_world)
 {

@@ -5,6 +5,7 @@
 #endif
 
 #include <osApiWrappers/dag_critSec.h>
+#include <osApiWrappers/dag_atomic_types.h>
 #include <EASTL/fixed_string.h>
 #include <EASTL/vector.h>
 #include <memory/dag_framemem.h>
@@ -16,24 +17,28 @@
 #include "camera/sceneCam.h"
 #include <util/dag_convar.h>
 #include <util/dag_string.h>
+#include <util/dag_console.h>
 #include <propsRegistry/commonPropsRegistry.h>
 #include <soundSystem/soundSystem.h>
 #include <soundSystem/debug.h>
 #include <soundSystem/banks.h>
 #include <soundSystem/dsp.h>
+#include <soundSystem/occlusionGPU.h>
 #include <soundSystem/quirrel/sqSoundSystem.h>
 #include <perfMon/dag_statDrv.h>
 #include <daRg/soundSystem/uiSoundSystem.h>
 #include "actionSoundProps.h"
 #include <math/dag_mathUtils.h>
-#include <ecs/delayedAct/actInThread.h>
+#include <daECS/delayedAct/actInThread.h>
+#include <gamePhys/collision/collisionLib.h>
 
 #include <daECS/core/updateStage.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include "sound/ecsEvents.h"
 #include "camera/sceneCam.h"
 #include "main/app.h"
-#include <osApiWrappers/dag_atomic_types.h>
 
 #include <main/gameLoad.h>
 #include "main/level.h"
@@ -54,6 +59,7 @@ namespace cvars
 {
 static CONSOLE_BOOL_VAL("snd", debug, false);
 static CONSOLE_BOOL_VAL("snd", mute, false);
+static CONSOLE_BOOL_VAL("snd", debug_occlusion_gpu, true);
 } // namespace cvars
 
 static bool g_master_preset_loaded = false;
@@ -64,6 +70,7 @@ static float g_mute_vol = FLT_EPSILON;
 using vca_name_t = eastl::fixed_string<char, 16>;
 static eastl::vector<vca_name_t> g_vca_names;
 static int g_muteable_vca_index = -1;
+static bool g_mute_inactive_app = true;
 
 static dag::AtomicInteger<bool> g_is_record_list_changed = false;
 static dag::AtomicInteger<bool> g_is_output_list_changed = false;
@@ -169,6 +176,42 @@ static void com_initialize() {}
 static void com_uninitialize() {}
 #endif
 
+static float height_above_ground_impl(const Point3 &pos)
+{
+  const float lmeshHt = dacoll::traceht_lmesh(Point2::xz(pos));
+  return pos.y - lmeshHt; // if no grnd or there is a hole then result should be far
+}
+
+static dag::AtomicFloat<float> g_listener_height_above_ground = 0.f;
+static constexpr float g_underground_depth_dist_inv = 1. / 3.;
+static constexpr float g_default_occlusion_suppress_value = 2.f;
+static float g_occlusion_suppress_value = g_default_occlusion_suppress_value; // fmod-specific value in banks to completely mute sound
+static float underground_factor(const Point3 &source)
+{
+  const float sourceHeightAboveGround = height_above_ground_impl(source);
+  const float listenerHeightAboveGround = g_listener_height_above_ground.load();
+  if (listenerHeightAboveGround > 0.f && sourceHeightAboveGround < 0.f)
+  {
+    // listener is above, source is underground
+    const float undergroundDepth = -sourceHeightAboveGround;
+    return saturate(undergroundDepth * g_underground_depth_dist_inv);
+  }
+  if (listenerHeightAboveGround < 0.f && sourceHeightAboveGround > 0.f)
+  {
+    // listener is underground, source is above
+    const float undergroundDepth = -listenerHeightAboveGround;
+    return saturate(undergroundDepth * g_underground_depth_dist_inv);
+  }
+  return 0;
+}
+
+static void occlusion_gpu_external_factor(
+  const Point3 & /*listener*/, const Point3 &blob_pos, float distance_sq, float occlusion, bool occlusion_valid, Point3 &factor)
+{
+  factor.x = (occlusion > 0.5f || !occlusion_valid || distance_sq > 50.f * 50.f) ? underground_factor(blob_pos) : 0.f;
+  factor.y = g_occlusion_suppress_value;
+}
+
 void init()
 {
   DNGSND_IS_MAIN_THREAD;
@@ -202,6 +245,7 @@ void init()
   {
     if (dgs_get_argv("snddbg") || sndblk.getBool("debug", false))
       cvars::debug.set(true);
+    cvars::debug_occlusion_gpu.set(sndblk.getBool("debugOcclusionGpu", true));
   }
 #endif
 
@@ -262,6 +306,10 @@ void init()
       ctype.device_list_changed = true;
       ctype.record_list_changed = true;
       sndsys::set_system_callbacks(ctype);
+
+      g_occlusion_suppress_value = sndblk.getReal("occlusionSuppressValue", g_default_occlusion_suppress_value);
+      if (g_occlusion_suppress_value > 1.f)
+        sndsys::occlusion_gpu::set_external_factor(occlusion_gpu_external_factor);
     }
   }
 
@@ -282,7 +330,8 @@ void close()
   com_uninitialize();
 }
 
-static inline const DataBlock &get_vol_blk() { return *::dgs_get_settings()->getBlockByNameEx("sound")->getBlockByNameEx("volume"); }
+static inline const DataBlock &get_snd_blk() { return *::dgs_get_settings()->getBlockByNameEx("sound"); }
+static inline const DataBlock &get_vol_blk() { return *get_snd_blk().getBlockByNameEx("volume"); }
 static inline void apply_volume(int vca_id, const DataBlock &blk_vol)
 {
   float vol = blk_vol.getReal(g_vca_names[vca_id].c_str(), 1.f);
@@ -295,7 +344,7 @@ static void update_master_volume_for_app_in_background(float dt)
 {
   if (g_muteable_vca_index == -1)
     return;
-  const bool isMute = (!::dgs_app_active || cvars::mute.get()) && !cvars::debug.get();
+  const bool isMute = ((!::dgs_app_active && g_mute_inactive_app) || cvars::mute.get()) && !cvars::debug.get();
   if (isMute && g_mute_vol > 0.f)
   {
     SNDSYS_PRESET_BLOCK;
@@ -319,6 +368,7 @@ static void update_master_volume_for_app_in_background(float dt)
 void apply_config_volumes()
 {
   SNDSYS_PRESET_BLOCK;
+  g_mute_inactive_app = get_snd_blk().getBool("muteInactiveApp", true);
   if (!is_master_preset_loaded())
     return;
   const DataBlock &blkVol = get_vol_blk();
@@ -356,7 +406,7 @@ static Point3 g_listener_side = {};
 static Point3 g_listener_up = {};
 static bool g_is_previous_user_listener_valid = false;
 
-void update(float dt)
+void sync_update(float dt)
 {
   TIME_PROFILE(dngsound_update);
 
@@ -366,10 +416,7 @@ void update(float dt)
 
   sndsys::set_time_speed(get_timespeed());
 
-  // compensatory update if sndsys was not updated [from start_async_game_tasks] for some long time
-  // to update from loading screen or when ParallelUpdateFrameDelayed is not working
-  // to prevent possible command buffer overflow or missing [ui] sound right after scene was loaded
-  sndsys::lazy_update();
+  sndsys::sync_update();
 
   if (g_is_record_list_changed.load())
   {
@@ -386,9 +433,19 @@ void update(float dt)
   ++g_update_frame_idx;
 }
 
+void gpu_update() { sndsys::gpu_update(); }
+
 } // namespace dngsound
 
 using namespace dngsound;
+
+static bool dngsound_console_handler(const char *argv[], int argc)
+{
+  int found = 0;
+  CONSOLE_CHECK_NAME("snd", "debug_filter", 1, 2) { sndsys::set_debug_filter(argc > 1 ? argv[1] : ""); }
+  return found;
+}
+REGISTER_CONSOLE_HANDLER(dngsound_console_handler);
 
 ECS_TAG(sound, dev)
 ECS_REQUIRE(ecs::Tag msg_sink)
@@ -401,10 +458,14 @@ static void dng_sound_set_cur_scene_name_es(const ecs::Event &)
 ECS_TAG(sound, render, dev)
 ECS_REQUIRE(ecs::Tag msg_sink)
 ECS_NO_ORDER
-static void dng_sound_debug_draw_es(const ecs::UpdateStageInfoRenderDebug &)
+static void dng_sound_debug_draw_es(const ecs::UpdateStageInfoRenderDebug &, ecs::EntityManager &manager)
 {
   if (cvars::debug.get())
-    g_entity_mgr->broadcastEventImmediate(EventSoundDrawDebug());
+  {
+    manager.broadcastEventImmediate(EventSoundDrawDebug());
+    if (cvars::debug_occlusion_gpu.get())
+      sndsys::occlusion_gpu::debug_render_3d();
+  }
 }
 
 // - expected correct order: -
@@ -414,23 +475,24 @@ static void dng_sound_debug_draw_es(const ecs::UpdateStageInfoRenderDebug &)
 // sound_end_update_es(ParallelUpdateFrameDelayed)
 
 template <typename Callable>
-static void dng_sound_listener_ecs_query(Callable c);
+static void dng_sound_listener_ecs_query(ecs::EntityManager &manager, Callable c);
 
 ECS_TAG(sound)
 ECS_REQUIRE(ecs::Tag msg_sink)
 ECS_AFTER(after_net_phys_sync) // may need some better points
-static void sound_begin_update_es(const ParallelUpdateFrameDelayed &evt)
+static void sound_begin_update_es(const ParallelUpdateFrameDelayed &evt, ecs::EntityManager &manager)
 {
   TMatrix userListenerTm;
   bool userListenerValid = false;
 
-  dng_sound_listener_ecs_query([&](ECS_REQUIRE(ecs::Tag dngSoundListener) bool dng_sound_listener_enabled, const TMatrix &transform) {
-    if (dng_sound_listener_enabled)
-    {
-      userListenerValid = true;
-      userListenerTm = transform;
-    }
-  });
+  dng_sound_listener_ecs_query(manager,
+    [&](ECS_REQUIRE(ecs::Tag dngSoundListener) bool dng_sound_listener_enabled, const TMatrix &transform) {
+      if (dng_sound_listener_enabled)
+      {
+        userListenerValid = true;
+        userListenerTm = transform;
+      }
+    });
 
   const TMatrix listenerTm = userListenerValid ? userListenerTm : get_cam_itm();
 
@@ -452,6 +514,8 @@ static void sound_begin_update_es(const ParallelUpdateFrameDelayed &evt)
       if (g_is_previous_user_listener_valid != userListenerValid)
         sndsys::reset_3d_listener();
       sndsys::update_listener(evt.dt, listenerTm);
+
+      g_listener_height_above_ground.store(height_above_ground_impl(g_listener_pos));
     }
     else
       sndsys::reset_3d_listener();

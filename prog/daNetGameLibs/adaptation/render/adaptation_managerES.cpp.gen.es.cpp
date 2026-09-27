@@ -6,20 +6,19 @@ ECS_DEF_PULL_VAR(adaptation_manager);
 #include <daECS/core/internal/performQuery.h>
 static constexpr ecs::ComponentDesc adaptation_settings_tracking_es_comps[] =
 {
-//start of 4 ro components at [0]
+//start of 3 ro components at [0]
   {ECS_HASH("render_settings__gpuResidentAdaptation"), ecs::ComponentTypeInfo<bool>()},
   {ECS_HASH("render_settings__adaptation"), ecs::ComponentTypeInfo<bool>()},
-  {ECS_HASH("render_settings__fullDeferred"), ecs::ComponentTypeInfo<bool>()},
-  {ECS_HASH("render_settings__forwardRendering"), ecs::ComponentTypeInfo<bool>()}
+  {ECS_HASH("render_settings__fullDeferred"), ecs::ComponentTypeInfo<bool>()}
 };
 static void adaptation_settings_tracking_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     adaptation_settings_tracking_es(evt
-        , ECS_RO_COMP(adaptation_settings_tracking_es_comps, "render_settings__gpuResidentAdaptation", bool)
+        , components.manager()
+    , ECS_RO_COMP(adaptation_settings_tracking_es_comps, "render_settings__gpuResidentAdaptation", bool)
     , ECS_RO_COMP(adaptation_settings_tracking_es_comps, "render_settings__adaptation", bool)
     , ECS_RO_COMP(adaptation_settings_tracking_es_comps, "render_settings__fullDeferred", bool)
-    , ECS_RO_COMP(adaptation_settings_tracking_es_comps, "render_settings__forwardRendering", bool)
     );
   while (++comp != compE);
 }
@@ -29,12 +28,13 @@ static ecs::EntitySystemDesc adaptation_settings_tracking_es_es_desc
   "prog/daNetGameLibs/adaptation/render/adaptation_managerES.cpp.inl",
   ecs::EntitySystemOps(nullptr, adaptation_settings_tracking_es_all_events),
   empty_span(),
-  make_span(adaptation_settings_tracking_es_comps+0, 4)/*ro*/,
+  make_span(adaptation_settings_tracking_es_comps+0, 3)/*ro*/,
   empty_span(),
   empty_span(),
-  ecs::EventSetBuilder<OnRenderSettingsReady>::build(),
+  ecs::EventSetBuilder<AdaptationRebuildNodes,
+                       OnRenderSettingsReady>::build(),
   0
-,"render","render_settings__adaptation,render_settings__forwardRendering,render_settings__fullDeferred,render_settings__gpuResidentAdaptation");
+,"render","render_settings__adaptation,render_settings__fullDeferred,render_settings__gpuResidentAdaptation");
 static constexpr ecs::ComponentDesc adaptation_level_settings_es_comps[] =
 {
 //start of 1 rq components at [0]
@@ -42,9 +42,9 @@ static constexpr ecs::ComponentDesc adaptation_level_settings_es_comps[] =
 };
 static void adaptation_level_settings_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   adaptation_level_settings_es(evt
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc adaptation_level_settings_es_es_desc
 (
@@ -68,9 +68,9 @@ static constexpr ecs::ComponentDesc adaptation_default_settings_es_comps[] =
 };
 static void adaptation_default_settings_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   adaptation_default_settings_es(evt
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc adaptation_default_settings_es_es_desc
 (
@@ -94,9 +94,9 @@ static constexpr ecs::ComponentDesc adaptation_override_settings_es_comps[] =
 };
 static void adaptation_override_settings_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   adaptation_override_settings_es(evt
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc adaptation_override_settings_es_es_desc
 (
@@ -135,7 +135,7 @@ static ecs::EntitySystemDesc adaptation_after_device_reset_es_es_desc
   empty_span(),
   empty_span(),
   empty_span(),
-  ecs::EventSetBuilder<AfterDeviceReset>::build(),
+  ecs::EventSetBuilder<EventAfterDeviceReset>::build(),
   0
 ,"render");
 static constexpr ecs::ComponentDesc adaptation_update_time_es_comps[] =
@@ -150,7 +150,8 @@ static void adaptation_update_time_es_all_events(const ecs::Event &__restrict ev
   G_FAST_ASSERT(evt.is<UpdateStageInfoBeforeRender>());
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     adaptation_update_time_es(static_cast<const UpdateStageInfoBeforeRender&>(evt)
-        , ECS_RW_COMP(adaptation_update_time_es_comps, "adaptation__manager", AdaptationManager)
+        , components.manager()
+    , ECS_RW_COMP(adaptation_update_time_es_comps, "adaptation__manager", AdaptationManager)
     , ECS_RO_COMP(adaptation_update_time_es_comps, "adaptation__track_changes", bool)
     );
   while (++comp != compE);
@@ -167,32 +168,6 @@ static ecs::EntitySystemDesc adaptation_update_time_es_es_desc
   ecs::EventSetBuilder<UpdateStageInfoBeforeRender>::build(),
   0
 ,"render",nullptr,nullptr,"animchar_before_render_es");
-static constexpr ecs::ComponentDesc on_reset_exposure_evt_es_comps[] =
-{
-//start of 1 rw components at [0]
-  {ECS_HASH("adaptation__manager"), ecs::ComponentTypeInfo<AdaptationManager>()}
-};
-static void on_reset_exposure_evt_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
-{
-  G_FAST_ASSERT(evt.is<RenderReinitCube>());
-  auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
-    on_reset_exposure_evt_es(static_cast<const RenderReinitCube&>(evt)
-        , ECS_RW_COMP(on_reset_exposure_evt_es_comps, "adaptation__manager", AdaptationManager)
-    );
-  while (++comp != compE);
-}
-static ecs::EntitySystemDesc on_reset_exposure_evt_es_es_desc
-(
-  "on_reset_exposure_evt_es",
-  "prog/daNetGameLibs/adaptation/render/adaptation_managerES.cpp.inl",
-  ecs::EntitySystemOps(nullptr, on_reset_exposure_evt_es_all_events),
-  make_span(on_reset_exposure_evt_es_comps+0, 1)/*rw*/,
-  empty_span(),
-  empty_span(),
-  empty_span(),
-  ecs::EventSetBuilder<RenderReinitCube>::build(),
-  0
-,"render");
 static constexpr ecs::ComponentDesc on_set_no_exposure_evt_es_comps[] =
 {
 //start of 1 rw components at [0]
@@ -232,9 +207,9 @@ static ecs::CompileTimeQueryDesc get_set_exposure_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_set_exposure_ecs_query(Callable function)
+inline void get_set_exposure_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_set_exposure_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_set_exposure_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -260,9 +235,9 @@ static ecs::CompileTimeQueryDesc get_adaptation_center_weight_override_ecs_query
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_adaptation_center_weight_override_ecs_query(Callable function)
+inline void get_adaptation_center_weight_override_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_adaptation_center_weight_override_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_adaptation_center_weight_override_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -277,7 +252,7 @@ inline void get_adaptation_center_weight_override_ecs_query(Callable function)
 }
 static constexpr ecs::ComponentDesc adaptation_node_init_ecs_query_comps[] =
 {
-//start of 8 rw components at [0]
+//start of 9 rw components at [0]
   {ECS_HASH("adaptation__manager"), ecs::ComponentTypeInfo<AdaptationManager>()},
   {ECS_HASH("adaptation__update_readback_exposure_node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()},
   {ECS_HASH("adaptation__create_histogram_node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()},
@@ -285,19 +260,20 @@ static constexpr ecs::ComponentDesc adaptation_node_init_ecs_query_comps[] =
   {ECS_HASH("adaptation__gen_histogram_node"), ecs::ComponentTypeInfo<resource_slot::NodeHandleWithSlotsAccess>()},
   {ECS_HASH("adaptation__accumulate_histogram"), ecs::ComponentTypeInfo<dafg::NodeHandle>()},
   {ECS_HASH("adaptation__adapt_exposure_node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()},
-  {ECS_HASH("adaptation__set_exposure_node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()}
+  {ECS_HASH("adaptation__set_exposure_node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()},
+  {ECS_HASH("adaptation__register_exposure_node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()}
 };
 static ecs::CompileTimeQueryDesc adaptation_node_init_ecs_query_desc
 (
   "adaptation_node_init_ecs_query",
-  make_span(adaptation_node_init_ecs_query_comps+0, 8)/*rw*/,
+  make_span(adaptation_node_init_ecs_query_comps+0, 9)/*rw*/,
   empty_span(),
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void adaptation_node_init_ecs_query(ecs::EntityId eid, Callable function)
+inline void adaptation_node_init_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, adaptation_node_init_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, adaptation_node_init_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -311,6 +287,7 @@ inline void adaptation_node_init_ecs_query(ecs::EntityId eid, Callable function)
             , ECS_RW_COMP(adaptation_node_init_ecs_query_comps, "adaptation__accumulate_histogram", dafg::NodeHandle)
             , ECS_RW_COMP(adaptation_node_init_ecs_query_comps, "adaptation__adapt_exposure_node", dafg::NodeHandle)
             , ECS_RW_COMP(adaptation_node_init_ecs_query_comps, "adaptation__set_exposure_node", dafg::NodeHandle)
+            , ECS_RW_COMP(adaptation_node_init_ecs_query_comps, "adaptation__register_exposure_node", dafg::NodeHandle)
             );
 
         }
@@ -330,9 +307,9 @@ static ecs::CompileTimeQueryDesc get_adaptation_manager_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_adaptation_manager_ecs_query(ecs::EntityId eid, Callable function)
+inline void get_adaptation_manager_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, get_adaptation_manager_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, get_adaptation_manager_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -358,9 +335,9 @@ static ecs::CompileTimeQueryDesc get_default_settings_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_default_settings_ecs_query(Callable function)
+inline void get_default_settings_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_default_settings_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_default_settings_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -386,9 +363,9 @@ static ecs::CompileTimeQueryDesc get_level_settings_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_level_settings_ecs_query(Callable function)
+inline void get_level_settings_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_level_settings_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_level_settings_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -414,9 +391,9 @@ static ecs::CompileTimeQueryDesc get_override_settings_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_override_settings_ecs_query(Callable function)
+inline void get_override_settings_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_override_settings_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_override_settings_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do

@@ -7,7 +7,8 @@ bool calculate_envi_cover_influence(float3 worldPos, float3 normal, EnviSnowPara
   {
     enviInfluence = depthNormalFactor.x * depthNormalFactor.y;
     enviInfluence = sqrt(enviInfluence);
-    enviInfluence *= saturate(worldPos.y * enviParams.water_level_fade_factor + enviParams.water_level_fade_factor * (envi_water_level));
+    // fade snow out below the water surface, same as USE_DEFERRED_SNOW_COVER
+    enviInfluence *= saturate((worldPos.y - envi_water_level) * enviParams.water_level_fade_factor);
 
     return false;
   }
@@ -52,7 +53,9 @@ void lerp_envi_cover(float3 worldPos, float3 normal, float skylight_progress_val
   translucency = lerp(translucency, enviParams.translucency, enviInfluence);
   material = material == SHADING_FOLIAGE ? SHADING_FOLIAGE : SHADING_SUBSURFACE;
 
+#ifndef ENVI_COVER_NO_SPARKLES
   computeSnowSparkle(worldPos, world_view_pos.xyz, min(0.99, 1 - skylight_progress_value), normal, smoothness);
+#endif
 }
 
 bool apply_envi_cover(float3 worldPos, float skylight_progress_value, EnviSnowParams enviParams, inout UnpackedGbuffer gbuffer)

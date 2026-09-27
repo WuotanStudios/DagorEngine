@@ -27,10 +27,8 @@ class AnimData;
 
 // general anim interfaces
 class IGenericIrq;
-class AnimCommonStateHolder;
+class AnimGraphStateHolder;
 class IAnimBlendNode;
-typedef AnimCommonStateHolder IPureAnimStateHolder;
-typedef AnimCommonStateHolder IAnimStateHolder;
 
 // shareable animation graph
 class AnimationGraph;
@@ -60,19 +58,24 @@ class AnimPostBlendAlignCtrl;
 class IMotionMatchingController;
 
 // general anim character interfaces
-class IAnimStateDirector2;
-class IAnimStateDirector2Debug;
 struct AnimCharCreationProps;
 class AnimcharBaseComponent;
 class AnimcharRendComponent;
+struct AnimcharFinalMat44;
 class IAnimCharacter2;
 
 // generally internal structures
 struct AnimTmpWeightedNode;
 struct AnimFifo3Queue;
+enum FifoMorphType : unsigned char
+{
+  MT_LINEAR,
+  MT_QUAD_IN,
+  MT_QUAD_OUT,
+  MT_QUAD_IN_OUT,
+  MT_COUNT,
+};
 
 // generally internal classes and interface implementations
 class AnimBlender;
-class AnimCondState;
-class AnimStateDirector;
 } // namespace AnimV20

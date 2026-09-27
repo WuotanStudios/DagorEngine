@@ -1,8 +1,12 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "physObj.h"
-#include <ecs/core/entityManager.h>
-#include <ecs/core/attributeEx.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/entityComponent.h>
 #include <ecs/phys/turretControl.h>
 #include <daECS/net/netbase.h>
 #include <daECS/net/connection.h>
@@ -11,6 +15,7 @@
 
 #include "phys/physUtils.h"
 #include "phys/netPhys.cpp.inl"
+#include <ecs/game/generic/gridEvent.h>
 
 ECS_NET_DECL_MSG(PhysObjSnapshotsMsg, danet::BitStream);
 ECS_NET_IMPL_MSG(PhysObjSnapshotsMsg,
@@ -39,6 +44,8 @@ ECS_AUTO_REGISTER_COMPONENT_DEPS(PhysObjActor,
 struct PhysObjActorUpdateContext : public BasePhysActor::UpdateContext
 {
   int *prevRShadowTick = nullptr;
+  const TMatrix *initialTransform;
+  const Point3 *initialVel;
 };
 
 template class PhysActor<PhysObj, PhysObjCustomPhys, PhysType::PHYSOBJ>;
@@ -76,22 +83,29 @@ ECS_BEFORE(after_net_phys_sync)
 ECS_AFTER(before_net_phys_sync)
 ECS_REQUIRE_NOT(ecs::Tag disableUpdate)
 static inline void phys_obj_phys_es(const UpdatePhysEvent &info,
+  ecs::EntityManager &manager,
+  ecs::EntityId eid,
   PhysObjActor &phys_obj_net_phys,
   TMatrix &transform,
   int *net_phys__prevTick,
-  const ecs::Tag *phys__broadcastAAS)
+  const ecs::Tag *phys__broadcastAAS,
+  const TMatrix *initial_transform,
+  const Point3 *initial_velocity)
 {
   PhysObjActorUpdateContext uctx;
   uctx.transform = &transform;
   uctx.physObjBroadcastAAS = phys__broadcastAAS != nullptr;
   if (net_phys__prevTick && phys_obj_net_phys.getRole() == IPhysActor::ROLE_REMOTELY_CONTROLLED_SHADOW)
     uctx.prevRShadowTick = net_phys__prevTick;
+  uctx.initialTransform = initial_transform;
+  uctx.initialVel = initial_velocity;
 
   net_phys_update_es(info, phys_obj_net_phys, uctx);
   phys_obj_net_phys.phys.updatePhysInWorld(transform);
+  manager.sendEventImmediate(eid, CmdUpdateGrid());
 
   if (uctx.prevRShadowTick)
-    *uctx.prevRShadowTick = gamephys::nearestPhysicsTickNumber(get_sync_time(), phys_obj_net_phys.phys.timeStep);
+    *uctx.prevRShadowTick = gamephys::nearestPhysicsTickNumber(info.curTimeD, phys_obj_net_phys.phys.timeStep);
 }
 
 ECS_ON_EVENT(NET_PHYS_ES_EVENT_SET)
@@ -130,6 +144,8 @@ void PhysObjActor::serializePhysSnapshotImpl(danet::BitStream &bs, PhysSnapSeria
   bs.AlignWriteToByteBoundary();
 }
 
+void PhysObj::additionalCollisionChecks(const CollisionObject &, const TMatrix &, Tab<gamephys::CollisionContactData> &) {}
+
 template <>
 bool PhysObjActor::deserializePhysSnapshot(
   const danet::BitStream &bs, PhysSnapSerializeType pst, BasePhysSnapshot &basesnap, net::IConnection &conn)
@@ -137,13 +153,17 @@ bool PhysObjActor::deserializePhysSnapshot(
   PhysObjSnapshot &snap = *new (&basesnap, _NEW_INPLACE) PhysObjActor::SnapshotType;
 
   uint8_t turretsCount = 0;
-  bool isOk = bs.ReadBits(&turretsCount, CHAR_BIT - PST_BITS);
+  if (!bs.ReadBits(&turretsCount, CHAR_BIT - PST_BITS))
+    return false;
 
-  isOk &= deserializeBasePhysSnapshot(bs, pst, snap, conn);
+  // bail before reading the tail fields below so they are not decoded from a corrupted offset
+  if (!deserializeBasePhysSnapshot(bs, pst, snap, conn))
+    return false;
 
   if (pst > PhysSnapSerializeType::MIN)
-    return isOk;
+    return true;
 
+  bool isOk = true;
   if (turretsCount)
   {
     snap.turrets.resize(turretsCount);
@@ -172,7 +192,7 @@ void PhysObjActor::processSnapshotNoEntity(uint16_t netPhysId, BasePhysSnapshot 
 }
 
 template <>
-void PhysObjActor::updateRemoteShadow(float remote_time, float dt, const BasePhysActor::UpdateContext &uctx_)
+void PhysObjActor::updateRemoteShadow(double remote_time, float dt, const BasePhysActor::UpdateContext &uctx_)
 {
   if (ECS_GET_NULLABLE(ecs::Tag, getEid(), phys__disableSnapshots) == nullptr)
   {
@@ -196,7 +216,7 @@ PhysObjActor &PhysObjCustomPhys::getPhysObj()
 void PhysObjCustomPhys::onPostInit(ecs::EntityId eid, BasePhysActor &act)
 {
   auto &phys = static_cast<PhysObjActor &>(act).phys;
-  float curTimeDelayed = max(get_sync_time() - phys_get_present_time_delay_sec(act.tickrateType, phys.timeStep), 0.f);
+  double curTimeDelayed = max(get_sync_time_d() - phys_get_present_time_delay_sec(act.tickrateType, phys.timeStep), 0.0);
   phys.currentState.atTick = gamephys::nearestPhysicsTickNumber(curTimeDelayed, phys.timeStep);
   phys.currentState.velocity = g_entity_mgr->getOr(eid, ECS_HASH("start_vel"), phys.currentState.velocity);
   phys.previousState.velocity = phys.currentState.velocity;
@@ -213,9 +233,35 @@ void PhysObjCustomPhys::onPostUpdate(float, const BasePhysActor::UpdateContext &
   auto &physobj = getPhysObj();
   auto &uctx = static_cast<const PhysObjActorUpdateContext &>(uctx_);
   if (uctx.prevRShadowTick)
-    if (gamephys::ceilPhysicsTickNumber(get_sync_time(), physobj.phys.timeStep) > *uctx.prevRShadowTick)
+    if (gamephys::ceilPhysicsTickNumber(get_sync_time_d(), physobj.phys.timeStep) > *uctx.prevRShadowTick)
       g_entity_mgr->sendEventImmediate(physobj.getEid(),
         CmdPostPhysUpdateRemoteShadow(physobj.phys.currentState.atTick, physobj.phys.timeStep));
+}
+
+template <>
+void PhysObjActor::loadPhysFromBlk(const DataBlock *blk, const CollisionResource *coll_res, const char *blk_name)
+{
+  const ecs::Object *propsOverride = g_entity_mgr->getNullable<ecs::Object>(eid, ECS_HASH("phys_obj__collisionPropsOverride"));
+  if (!propsOverride || propsOverride->empty())
+  {
+    phys.loadFromBlk(blk, coll_res, blk_name, true);
+    return;
+  }
+
+  DataBlock mergedBlk;
+  mergedBlk.setFrom(blk);
+  DataBlock *propsBlk = mergedBlk.addBlock("collisionResource")->addBlock("props");
+  for (const auto &entry : *propsOverride)
+  {
+    if (entry.second.is<ecs::string>())
+      propsBlk->setStr(entry.first.c_str(), entry.second.get<ecs::string>().c_str());
+    else if (entry.second.is<bool>())
+      propsBlk->setBool(entry.first.c_str(), entry.second.get<bool>());
+    else
+      logerr("phys_obj__collisionPropsOverride entry '%s' has unsupported type for entity %d<%s>", entry.first.c_str(),
+        (ecs::entity_id_t)eid, g_entity_mgr->getEntityTemplateName(eid));
+  }
+  phys.loadFromBlk(&mergedBlk, coll_res, blk_name, true);
 }
 
 PHYS_IMPLEMENT_ON_TICKRATE_CHANGED_ES(PhysObjActor, phys_obj_net_phys)

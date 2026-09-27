@@ -6,9 +6,11 @@
 #include <generic/dag_span.h>
 #include <generic/dag_tabExt.h>
 #include <osApiWrappers/dag_critSec.h>
+#include <debug/dag_fatal.h>
 #include <stdio.h>
 #include <string.h>
 #include "keyMapPools.h"
+#include "drv_log_defs.h"
 
 namespace drv3d_generic
 {
@@ -28,27 +30,21 @@ struct PodPool
 
   Entry *entries = nullptr;                                   //[_max]
   eastl::fixed_vector<eastl::unique_ptr<Entry[]>, 1> garbage; // entries to be deleted
-#if DAGOR_DBGLEVEL > 0
   const char *debugName = nullptr;
-#endif
 
   int freeList = BAD_HANDLE;
   int totalElements = 0;
   int usedElements = 0;
 
-  PodPool(const char *dbg_name = nullptr)
-#if DAGOR_DBGLEVEL > 0
-    :
-    debugName(dbg_name)
-#endif
-  {
-    G_UNUSED(dbg_name);
-  }
+  PodPool(const char *dbg_name = nullptr) : debugName(dbg_name ? dbg_name : "unnamed") {}
 
   void destroy()
   {
+    debug("PodPool %s: destroy entries=%p", debugName, entries);
     delete[] entries;
     entries = NULL;
+    if (garbage.size() > 0)
+      debug("PodPool %s: clear garbage freeOverflow=true, garbage size=%u", debugName, garbage.size());
     garbage.clear(/*freeOverflow*/ true);
     freeList = BAD_HANDLE;
     totalElements = 0;
@@ -57,7 +53,12 @@ struct PodPool
 
   ~PodPool() { destroy(); }
 
-  void clearGarbage() { garbage.clear(); }
+  void clearGarbageImpl()
+  {
+    if (garbage.size() > 0)
+      debug("PodPool %s: clearGarbage, garbage size=%u", debugName, garbage.size());
+    garbage.clear();
+  }
 
   int size() { return totalElements; }
 
@@ -78,15 +79,21 @@ struct PodPool
     if (elements <= totalElements)
       return true;
 
+    if (freeList != BAD_HANDLE)
+      DAG_FATAL("freeList %d is not equal to BAD_HANDLE, which means elements (%d) must be less than totalElements (%d)!", freeList,
+        elements, totalElements);
+
 #if DAGOR_DBGLEVEL > 0
     debug("%s reserve %u -> %u elements", debugName, totalElements, elements);
 #endif
 
     Entry *newEntries = new Entry[elements];
+    debug("PodPool %s: create newEntries[%u] at %p", debugName, elements, newEntries);
     if (totalElements > 0)
     {
       G_FAST_ASSERT(entries != NULL);
       memcpy(newEntries, entries, sizeof(Entry) * totalElements);
+      debug("PodPool %s: move entries[%u] at %p to garbage", debugName, totalElements, entries);
       garbage.emplace_back(entries);
     }
 
@@ -106,6 +113,9 @@ struct PodPool
       reserve(totalElements ? (totalElements + totalElements / 2) : InitialCapacity); // x1.5 grow factor
 
     G_FAST_ASSERT(freeList >= 0);
+    if (freeList >= totalElements || freeList < 0)
+      DAG_FATAL("freeList %d is out of range - the pool has %d of %d elements", freeList, usedElements, totalElements);
+
     int index = freeList;
     freeList = entries[index].link >> 1; // unlink from free list
     usedElements++;
@@ -136,11 +146,14 @@ struct PodPoolWithLock : protected PodPool<T, InitialCapacity>
   typedef PodPool<T, InitialCapacity> PodPoolType;
 
 protected:
-  mutable CritSecStorage critSec;
+  mutable WinCritSec poolMutex;
+
+  using PodPoolType::clearGarbageImpl;
   using PodPoolType::destroy;
   using PodPoolType::entries;
   using PodPoolType::freeList;
   using PodPoolType::reserve;
+  using PodPoolType::totalElements;
   using PodPoolType::usedElements;
 
 public:
@@ -148,36 +161,16 @@ public:
 
   using PodPoolType::alloc;
   using PodPoolType::operator[];
-  using PodPoolType::clearGarbage;
   using PodPoolType::fillEntryAsInvalid;
   using PodPoolType::isEntryUsed;
   using PodPoolType::isIndexValid;
   using PodPoolType::size;
   using PodPoolType::totalUsed;
 
+  PodPoolWithLock(const char *dbg_name) : PodPool<T, InitialCapacity>(dbg_name) {}
 
-  class AutoLock;
-  friend class AutoLock;
-  class AutoLock
-  {
-  private:
-    void *pCritSec;
-    AutoLock(const AutoLock &) = delete;
-    AutoLock &operator=(const AutoLock &) = delete;
-    friend struct PodPoolWithLock;
-
-  public:
-    AutoLock(PodPoolWithLock &op) : pCritSec(op.critSec) { ::enter_critical_section(pCritSec); }
-    ~AutoLock() { ::leave_critical_section(pCritSec); }
-  };
-
-  PodPoolWithLock(const char *dbg_name) : PodPool<T, InitialCapacity>(dbg_name) //-V730
-  {
-    ::create_critical_section(critSec);
-  }
-  ~PodPoolWithLock() { ::destroy_critical_section(critSec); }
-  void lock() const { ::enter_critical_section(critSec); }
-  void unlock() const { ::leave_critical_section(critSec); }
+  void lock() const { poolMutex.lock(); }
+  void unlock() const { poolMutex.unlock(); }
 
   // returns handle, returns in locked state if allocation succeeded
   int safeAllocAndSet(T value)
@@ -189,6 +182,13 @@ public:
     G_FAST_ASSERT(entries[index].isUsed());
     unlock();
     return index;
+  }
+
+  void clearGarbage()
+  {
+    lock();
+    clearGarbageImpl();
+    unlock();
   }
 
   void safeReleaseEntry(int index)
@@ -229,6 +229,10 @@ public:
   void releaseEntryUnsafe(int index)
   {
     G_FAST_ASSERT(isIndexValid(index));
+    if (!(freeList == BAD_HANDLE || isIndexValid(freeList)))
+      DAG_FATAL("freeList %d must be either BAD_HANDLE or valid index, pool has %d elements", freeList, totalElements);
+    if (!isIndexValid(index))
+      DAG_FATAL("releaseEntryUnsafe tries to free incorrect entry %d, pool has %d elements", index, totalElements);
     entries[index].link = (freeList << 1) | 1;
     freeList = index;
     G_VERIFY(--usedElements >= 0);

@@ -10,22 +10,23 @@ var
 
 let
   commonMountPointPrefixes <- {
-    "ecs" => "%dasGameLibs/ecs",
-    "docs" => "%dasGameLibs/docs",
-    "math" => "%dasGameLibs/math",
-    "daFrameGraph" => "%dasGameLibs/daFrameGraph",
+    "ecs" => "%gameLibs/das/ecs",
+    "docs" => "%gameLibs/das/docs",
+    "math" => "%gameLibs/das/math",
+    "daFrameGraph" => "%gameLibs/das/daFrameGraph",
     "daslib" => "%daslib",
     "imgui" => "%dasImgui",
+    "llvm" => "%dasLLVM",
     "debug" => "%dngdas/debug",
     "remote" => "%dngdas/remote"
   }
   commonAliasPath <- {
-    "daFrameGraph" => "%dasGameLibs/daFrameGraph.daFG.das"
+    "daFrameGraph" => "%gameLibs/das/daFrameGraph.daFG.das"
   }
 
 
 [export]
-def module_get(req, from : string) : tuple<string; string; string> const
+def module_get(req, _from : string) : tuple<string; string; string> const
   reqCount += 1
   if reqCount > 1000
     unsafe
@@ -43,7 +44,11 @@ def module_get(req, from : string) : tuple<string; string; string> const
 
   let mod_name = rs[length(rs) - 1]
 
-  if is_in_aot() && (path_name == "daslib/debug.das" || path_name |> ends_with("profiler.das"))
+  if is_in_aot() && (
+    path_name == "daslib/debug.das" ||
+    path_name |> ends_with("profiler.das") ||
+    path_name == "daslib/just_in_time.das"
+  )
     return ("", "", "")
 
   if rs[0] == "%daslib"
@@ -64,5 +69,5 @@ def module_get(req, from : string) : tuple<string; string; string> const
 
 
 [export]
-def include_get(inc, from : string) : string
+def include_get(inc, _from : string) : string
   return starts_with(inc, "%") ? inc : "{DAS_PAK_ROOT}{inc}"

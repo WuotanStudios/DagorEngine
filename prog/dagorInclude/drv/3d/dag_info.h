@@ -4,7 +4,8 @@
 //
 #pragma once
 
-#include "dag_driverCode.h"
+#include <drv/3d/dag_driverCode.h>
+#include <drv/3d/dag_multi_interface.h>
 
 #include <EASTL/initializer_list.h>
 
@@ -12,7 +13,7 @@
 
 
 struct DagorDateTime;
-struct Driver3dDesc;
+struct DriverDesc;
 
 /**
  * @brief Callback class for initializing the 3D driver.
@@ -68,7 +69,7 @@ public:
    * @return something
    * @todo This fucntion is not used anywhere. Remove it?
    */
-  virtual int validateDesc(Driver3dDesc &desc) const = 0;
+  virtual int validateDesc(DriverDesc &desc) const = 0;
 
   /**
    * @brief Compares two driver descriptions.
@@ -77,7 +78,7 @@ public:
    * @return something
    * @todo This fucntion is not used anywhere. Remove it?
    */
-  virtual int compareDesc(Driver3dDesc &A, Driver3dDesc &B) const = 0;
+  virtual int compareDesc(DriverDesc &A, DriverDesc &B) const = 0;
 
   /**
    * @brief Checks if stereo rendering is desired.
@@ -132,7 +133,7 @@ enum class APISupport
 
 enum class GpuVendor : uint8_t;
 
-namespace d3d
+namespace d3d _MULTI_INTERFACE
 {
 
 /**
@@ -164,6 +165,12 @@ unsigned get_dedicated_gpu_memory_size_kb();
  * @return The size of the free dedicated GPU memory in KB
  */
 unsigned get_free_dedicated_gpu_memory_size_kb();
+
+/**
+ * @brief Determines and returns the size of the dedicated GPU memory in KB used for internal backend needs
+ * @return The used size of the dedicated GPU memory in KB
+ */
+unsigned get_dedicated_gpu_memory_system_internal_overhead_kb();
 
 /**
  * @brief Gets the current GPU memory during the game (supports only Nvidia GPUs).
@@ -215,7 +222,9 @@ const char *get_driver_name();
  * @brief Gets the driver code.
  * @return The driver code
  */
-#if _TARGET_XBOX
+#if DAGOR_HOSTED_INTERNAL_SERVER
+inline constexpr DriverCode get_driver_code() { return DriverCode::make(d3d::stub); }
+#elif _TARGET_XBOX
 inline constexpr DriverCode get_driver_code() { return DriverCode::make(d3d::dx12); }
 #elif _TARGET_C1
 
@@ -234,13 +243,6 @@ DriverCode get_driver_code();
  * @return True if the d3d-stub driver is used, false otherwise
  */
 static inline bool is_stub_driver() { return get_driver_code().is(d3d::stub); }
-
-/**
- * @brief Gets the device driver version.
- * @return The device driver version
- * @note Work only for Vulkan. On other platforms returns "1.0"
- */
-const char *get_device_driver_version();
 
 /**
  * @brief Gets the device name.
@@ -273,12 +275,6 @@ void *get_device();
 void *get_context();
 
 /**
- * @brief Gets the driver description.
- * @return The driver description
- */
-const Driver3dDesc &get_driver_desc();
-
-/**
  * @brief Checks if the device is in device reset or being reset.
  * @return True if the device is in device reset or being reset, false otherwise
  */
@@ -298,21 +294,23 @@ bool is_window_occluded();
  */
 bool should_use_compute_for_image_processing(std::initializer_list<unsigned> formats);
 
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 #if _TARGET_D3D_MULTI
 #include <drv/3d/dag_interface_table.h>
 namespace d3d
 {
 inline const char *get_driver_name() { return d3di.driverName; }
-inline const char *get_device_driver_version() { return d3di.driverVer; }
 inline const char *get_device_name() { return d3di.deviceName; }
 inline const char *get_last_error() { return d3di.get_last_error(); }
 inline uint32_t get_last_error_code() { return d3di.get_last_error_code(); }
 
 inline void *get_device() { return d3di.get_device(); }
 
-inline const Driver3dDesc &get_driver_desc() { return d3di.drvDesc; }
+inline unsigned get_dedicated_gpu_memory_system_internal_overhead_kb()
+{
+  return d3di.get_dedicated_gpu_memory_system_internal_overhead_kb();
+}
 
 inline bool is_in_device_reset_now() { return d3di.is_in_device_reset_now(); }
 inline bool is_window_occluded() { return d3di.is_window_occluded(); }

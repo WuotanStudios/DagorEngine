@@ -2,16 +2,18 @@ import "dagor.math" as dagorMath
 import "math" as math
 from "string" import regexp, strip, format
 from "%sqstd/string.nut" import tostring_r
-from "console" import command
 from "%darg/ui_imports.nut" import *
 from "%sqstd/ecs.nut" import *
+from "types" import String
+
+let entity_editor = require_optional("entity_editor")
 let rexFloat = regexp(@"(\+|-)?([0-9]+\.?[0-9]*|\.[0-9]+)([eE](\+|-)?[0-9]+)?")
 let rexInt = regexp(@"[\+\-]?[0-9]+")
-let tofloat = @(v) v.tofloat()
-let tointeger = @(v) v.tointeger()
-let isStrInt = @(v) rexInt.match(strip(v))
-let isStrFloat = @(v) rexFloat.match(strip(v))
-function isStrBool(text){
+let tofloat = @(v): float v.tofloat()
+let tointeger = @(v): int v.tointeger()
+let isStrInt = @(v: string) rexInt.match(strip(v))
+let isStrFloat = @(v: string) rexFloat.match(strip(v))
+function isStrBool(text: string): bool {
   let s = strip(text)
   return (s == "true" || s == "1" || s == "false" || s == "0")
 }
@@ -35,7 +37,7 @@ function isValueTextValid(comp_type, text) {
     let fields = text.split(",")
     if (fields.len()!=nFields[0])
       return false
-    return fields.reduce(@(a,b) a && nFields[1](b))
+    return fields.reduce(@(a,b) (a instanceof String ? nFields[1](a) : a) && nFields[1](b))
   }
   return false
 }
@@ -89,17 +91,17 @@ let convertTextToValFuncs = {
   }
 }
 
-function convertTextToVal(cur_value, comp_type, text) {
+function convertTextToVal(comp_type, text) {
   if (convertTextToValFuncs?[comp_type] != null)
     return convertTextToValFuncs[comp_type](text)
 
   let fields = text.split(",")
   let floatDagorMathTypes = ["Point2", "Point3", "DPoint3", "Point4"]
-  if (floatDagorMathTypes.indexof(comp_type) != null)
+  if (floatDagorMathTypes.contains(comp_type))
     return convertTextToValForDagorClass(comp_type, fields.map(pipe(strip, tofloat)))
 
   let intDagorMathTypes = ["IPoint2", "IPoint3", "IPoint4"]
-  if (intDagorMathTypes.indexof(comp_type) != null)
+  if (intDagorMathTypes.contains(comp_type))
     return convertTextToValForDagorClass(comp_type, fields.map(pipe(strip, tointeger)))
 
   if (comp_type == "E3DCOLOR") {
@@ -113,11 +115,8 @@ function convertTextToVal(cur_value, comp_type, text) {
     return res
   }
 
-  if (comp_type == "TMatrix") {
-    let res = cur_value
-    res[3] = convertTextToValForDagorClass("Point3", fields.map(pipe(strip, tofloat)))
-    return res
-  }
+  if (comp_type == "TMatrix") // the position only; the row writes it as column 3
+    return convertTextToValForDagorClass("Point3", fields.map(pipe(strip, tofloat)))
 
   return null
 }
@@ -125,7 +124,7 @@ function convertTextToVal(cur_value, comp_type, text) {
 let map_type_to_str = {
   float =  function(v){
     let tf = v.tostring()
-    return (tf.indexof(".") != null || tf.indexof("e") != null) ? tf : $"{tf}.0"
+    return (tf.contains(".") || tf.contains("e")) ? tf : $"{tf}.0"
   },
   ["null"] = @(_) "null",
 }
@@ -144,7 +143,7 @@ let map_class_to_str = {
   },
 }
 
-function instance_to_str(v, max_cvstr_len, compValToString_){
+function instance_to_str(v, max_cvstr_len, compValToString_): string {
   function objToStr(o){
     local s = format("[%d]={", o.len())
     foreach (val in o) {
@@ -188,7 +187,7 @@ function instance_to_str(v, max_cvstr_len, compValToString_){
   return res
 }
 
-function compValToString(v, max_cvstr_len = 80){
+function compValToString(v, max_cvstr_len = 80): string {
   let compValToString_ = callee()
   return type(v) == "instance"
     ? instance_to_str(v, max_cvstr_len, compValToString_)
@@ -200,55 +199,55 @@ function isCompReadOnly(eid, comp_name){
   return object?.isReadOnly() ?? false
 }
 
-function getValFromObj(eid, comp_name, path=null){
-  local object = _dbg_get_comp_val_inspect(eid, comp_name)
-  object = object?.getAll() ?? object
+// Stops at the deepest key that exists, so a stale path yields the parent value.
+function valueAtPath(object, path) {
   local res = object
   foreach (key in (path ?? [])) {
-    if (key in res) {
-      res = res[key]
-    }
-    else
+    if (key not in res)
       break
+    res = res[key]
   }
   return res
 }
 
-function setValToObj(eid, comp_name, path, val){
+// The one way the panel changes a component: the ECS write and the editor's
+// save record together, so no path can do one without the other.
+function writeComponent(eid, comp_name, path, val): bool {
   let comp = _dbg_get_comp_val_inspect(eid, comp_name)
   if (comp?.isReadOnly() ?? false)
-    return
-  let object = comp.getAll()
-  local res = object
-  let lastkey = path?[path.len()-1]
-  if (lastkey == null)
-    return
-  foreach (idx, key in path) {
-    if (idx < path.len()-1) {
-      if (!(res?[key] != null || key in object || object?.indexof(key)!=null))
-        return
+    return false
+  local object = val
+  if ((path?.len() ?? 0) > 0) {
+    object = comp?.getAll() ?? comp // a TMatrix has no getAll and takes a column by index
+    local res = object
+    foreach (key in path.slice(0, -1)) {
+      if (!(res?[key] != null || key in res || res?.contains(key)))
+        return false
       res = res[key]
     }
-    else {
-      res[lastkey] = val
-      obsolete_dbg_set_comp_val(eid, comp_name, object)
-      break
-    }
+    res[path.top()] = val
   }
-}
-
-function updateComp(eid, comp_name){
-  command?($"ecs.update_component {eid} {comp_name}")
+  local written = false
+  try {
+    // null, not an exception, when the component or the entity is gone; the call logs that itself
+    written = obsolete_dbg_set_comp_val(eid, comp_name, object) == true
+  }
+  catch (e) {
+    logerr($"Failed to write component {comp_name} of {eid}, reason: {e}")
+  }
+  if (!written)
+    return false
+  entity_editor?.save_component(eid, comp_name)
+  return true
 }
 
 let exports = {
   isCompReadOnly
-  getValFromObj
-  setValToObj
+  valueAtPath
+  writeComponent
   isValueTextValid
   convertTextToVal
   compValToString
-  updateComp
 
   ecsTypeToSquirrelType = {
     //[TYPE_NULL] = null

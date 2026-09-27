@@ -67,9 +67,9 @@ struct SharedTexAnnotation final : ManagedResAnnotation<SharedTex>
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getVolTex)>("getVolTex");
   }
 };
-struct SharedTexHolderAnnotation final : ManagedResAnnotation<SharedTexHolder>
+struct SharedTexWithShaderVarAnnotation final : ManagedResAnnotation<SharedTexWithShaderVar>
 {
-  SharedTexHolderAnnotation(das::ModuleLibrary &ml) : ManagedResAnnotation("SharedTexHolder", ml)
+  SharedTexWithShaderVarAnnotation(das::ModuleLibrary &ml) : ManagedResAnnotation("SharedTexWithShaderVar", ml)
   {
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getTexId)>("getTexId");
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getTex2D)>("getTex2D");
@@ -89,9 +89,9 @@ struct UniqueTexAnnotation final : ManagedResAnnotation<UniqueTex>
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getVolTex)>("getVolTex");
   }
 };
-struct UniqueTexHolderAnnotation final : ManagedResAnnotation<UniqueTexHolder>
+struct UniqueTexWithShaderVarAnnotation final : ManagedResAnnotation<UniqueTexWithShaderVar>
 {
-  UniqueTexHolderAnnotation(das::ModuleLibrary &ml) : ManagedResAnnotation("UniqueTexHolder", ml)
+  UniqueTexWithShaderVarAnnotation(das::ModuleLibrary &ml) : ManagedResAnnotation("UniqueTexWithShaderVar", ml)
   {
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getTexId)>("getTexId");
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getTex2D)>("getTex2D");
@@ -107,9 +107,9 @@ struct SharedBufAnnotation final : ManagedResAnnotation<SharedBuf>
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getBufId)>("getBufId");
   }
 };
-struct SharedBufHolderAnnotation final : ManagedResAnnotation<SharedBufHolder>
+struct SharedBufWithShaderVarAnnotation final : ManagedResAnnotation<SharedBufWithShaderVar>
 {
-  SharedBufHolderAnnotation(das::ModuleLibrary &ml) : ManagedResAnnotation("SharedBufHolder", ml)
+  SharedBufWithShaderVarAnnotation(das::ModuleLibrary &ml) : ManagedResAnnotation("SharedBufWithShaderVar", ml)
   {
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getBufId)>("getBufId");
   }
@@ -121,9 +121,9 @@ struct UniqueBufAnnotation final : ManagedResAnnotation<UniqueBuf>
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getBufId)>("getBufId");
   }
 };
-struct UniqueBufHolderAnnotation final : ManagedResAnnotation<UniqueBufHolder>
+struct UniqueBufWithShaderVarAnnotation final : ManagedResAnnotation<UniqueBufWithShaderVar>
 {
-  UniqueBufHolderAnnotation(das::ModuleLibrary &ml) : ManagedResAnnotation("UniqueBufHolder", ml)
+  UniqueBufWithShaderVarAnnotation(das::ModuleLibrary &ml) : ManagedResAnnotation("UniqueBufWithShaderVar", ml)
   {
     addPropertyForManagedType<DAS_BIND_MANAGED_PROP(getBufId)>("getBufId");
   }
@@ -140,18 +140,18 @@ public:
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, das::Module::require("DagorTexture3D"), true);
 
-    addAnnotation(das::make_smart<ManagedTexAnnotation>(lib));
-    addAnnotation(das::make_smart<ManagedTexViewAnnotation>(lib));
-    addAnnotation(das::make_smart<ManagedBufViewAnnotation>(lib));
+    addAnnotation(new ManagedTexAnnotation(lib));
+    addAnnotation(new ManagedTexViewAnnotation(lib));
+    addAnnotation(new ManagedBufViewAnnotation(lib));
 
-    addAnnotation(das::make_smart<SharedBufAnnotation>(lib));
-    addAnnotation(das::make_smart<SharedBufHolderAnnotation>(lib));
-    addAnnotation(das::make_smart<UniqueBufAnnotation>(lib));
-    addAnnotation(das::make_smart<UniqueBufHolderAnnotation>(lib));
-    addAnnotation(das::make_smart<SharedTexAnnotation>(lib));
-    addAnnotation(das::make_smart<SharedTexHolderAnnotation>(lib));
-    addAnnotation(das::make_smart<UniqueTexAnnotation>(lib));
-    addAnnotation(das::make_smart<UniqueTexHolderAnnotation>(lib));
+    addAnnotation(new SharedBufAnnotation(lib));
+    addAnnotation(new SharedBufWithShaderVarAnnotation(lib));
+    addAnnotation(new UniqueBufAnnotation(lib));
+    addAnnotation(new UniqueBufWithShaderVarAnnotation(lib));
+    addAnnotation(new SharedTexAnnotation(lib));
+    addAnnotation(new SharedTexWithShaderVarAnnotation(lib));
+    addAnnotation(new UniqueTexAnnotation(lib));
+    addAnnotation(new UniqueTexWithShaderVarAnnotation(lib));
 
     das::addExtern<DAS_BIND_FUN(bind_dascript::get_tex2d)>(*this, lib, "get_tex2d", das::SideEffects::none,
       " ::bind_dascript::get_tex2d");
@@ -164,12 +164,12 @@ public:
 
     das::addExtern<DAS_BIND_FUN(bind_dascript::SharedBuf_get_buf)>(*this, lib, "getBuf", das::SideEffects::modifyExternal,
       " ::bind_dascript::SharedBuf_get_buf");
-    das::addExtern<DAS_BIND_FUN(bind_dascript::SharedBufHolder_get_buf)>(*this, lib, "getBuf", das::SideEffects::modifyExternal,
-      " ::bind_dascript::SharedBufHolder_get_buf");
+    das::addExtern<DAS_BIND_FUN(bind_dascript::SharedBufWithShaderVar_get_buf)>(*this, lib, "getBuf", das::SideEffects::modifyExternal,
+      " ::bind_dascript::SharedBufWithShaderVar_get_buf");
     das::addExtern<DAS_BIND_FUN(bind_dascript::UniqueBuf_get_buf)>(*this, lib, "getBuf", das::SideEffects::modifyExternal,
       " ::bind_dascript::UniqueBuf_get_buf");
-    das::addExtern<DAS_BIND_FUN(bind_dascript::UniqueBufHolder_get_buf)>(*this, lib, "getBuf", das::SideEffects::modifyExternal,
-      " ::bind_dascript::UniqueBufHolder_get_buf");
+    das::addExtern<DAS_BIND_FUN(bind_dascript::UniqueBufWithShaderVar_get_buf)>(*this, lib, "getBuf", das::SideEffects::modifyExternal,
+      " ::bind_dascript::UniqueBufWithShaderVar_get_buf");
 
 #define BIND_FUNCTION(function, sinonim, side_effect) \
   das::addExtern<DAS_BIND_FUN(function)>(*this, lib, sinonim, side_effect, "bind_dascript::" #function);

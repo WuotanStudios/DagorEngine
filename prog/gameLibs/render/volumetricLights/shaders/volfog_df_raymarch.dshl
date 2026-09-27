@@ -16,12 +16,14 @@ include "volfog_hardcoded_media.dshl"
 
 
 
-texture clouds_shadows_2d;
+include "clouds2/clouds_bsm.dshl"
+
 float4 nbs_world_pos_to_clouds_alt__inv_clouds_weather_size__neg_clouds_thickness_m;
 float4 clouds_origin_offset;
 float4 clouds_hole_pos;
+float clouds_start_altitude2;
+float clouds_thickness2;
 
-// statistical cloud shadows, without relying on preshader
 macro USE_FOG_SHADOWS(code)
   (code){
     nbs_world_pos_to_clouds_alt__inv_clouds_weather_size__neg_clouds_thickness_m@f4 =
@@ -29,8 +31,10 @@ macro USE_FOG_SHADOWS(code)
     skies_primary_sun_light_dir@f3 = skies_primary_sun_light_dir;
     clouds_origin_offset@f3 = clouds_origin_offset;
     clouds_hole_pos@f4 = clouds_hole_pos;
-    clouds_shadows_2d@smp2d = clouds_shadows_2d;
   }
+  //Beer shadow map replaced the legacy 2D map: valid at any receiver altitude
+  INIT_CLOUDS_BSM(code)
+  USE_CLOUDS_BSM(code)
   hlsl(code) {
     #include <atmosphere/statistical_clouds_shadow.hlsli>
   }
@@ -67,6 +71,7 @@ endmacro
 float4 distant_fog_local_view_z;
 float4 distant_fog_raymarch_resolution;
 float4 distant_fog_reconstruction_resolution;
+float4 distant_fog_raymarch_dyn_scales= (1, 1, 1, 1);
 
 float4 distant_fog_raymarch_params_0;
 float4 distant_fog_raymarch_params_1;
@@ -89,8 +94,9 @@ shader distant_fog_raymarch_cs
 {
   INIT_AND_USE_ON_TOP_CAMERA_IN_CAMERA(cs)
 
-  supports global_const_block;
   (cs) {
+    from_sun_direction@f3 = from_sun_direction;
+    sun_color_0@f3 = sun_color_0;
     inv_volfog_froxel_volume_res@f3 = (inv_volfog_froxel_volume_res.x,inv_volfog_froxel_volume_res.y,inv_volfog_froxel_volume_res.z,0)
     distant_fog_local_view_z@f3 = distant_fog_local_view_z;
     distant_fog_raymarch_resolution@f4 = distant_fog_raymarch_resolution;
@@ -102,6 +108,8 @@ shader distant_fog_raymarch_cs
     distant_fog_raymarch_params_0@f4 = distant_fog_raymarch_params_0;
     distant_fog_raymarch_params_1@f4 = distant_fog_raymarch_params_1;
     distant_fog_raymarch_params_2@f4 = distant_fog_raymarch_params_2;
+    distant_fog_raymarch_dyn_scales@f4 = distant_fog_raymarch_dyn_scales;
+    distant_fog_reconstruction_dyn_scales@f4 = distant_fog_reconstruction_dyn_scales;
     volfog_blended_slice_start_depth@f1 = (volfog_blended_slice_start_depth);
     distant_fog_use_static_shadows@i1 = distant_fog_use_static_shadows;
   }
@@ -116,7 +124,6 @@ shader distant_fog_raymarch_cs
   INIT_AND_USE_VOLFOG_MODIFIERS(cs)
   GET_MEDIA_HARDCODED(cs)
   USE_BASE_AMBIENT_COLOR(cs)
-  ENABLE_ASSERT(cs)
 
   USE_FOG_SHADOWS(cs)
 
@@ -125,9 +132,8 @@ shader distant_fog_raymarch_cs
     #define FASTEST_STATIC_SHADOW_PCF 1
   }
 
-  INIT_STATIC_SHADOW_BASE_ONE_CASCADE(cs)
-  INIT_STATIC_SHADOW_BASE_SECOND_CASCADE_STCODE(cs)
-  USE_STATIC_SHADOW_BASE_NUM(cs, 2)
+  INIT_STATIC_SHADOW_BASE(cs)
+  USE_STATIC_SHADOW_BASE(cs)
 
   if (distant_fog_use_smart_raymarching_pattern == off)
   {

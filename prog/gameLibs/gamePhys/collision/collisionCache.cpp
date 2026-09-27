@@ -4,18 +4,41 @@
 #include <gamePhys/collision/collisionLib.h>
 #include <gamePhys/phys/physDebugDraw.h>
 #include <math/dag_Point2.h>
+#include <math/dag_mathUtils.h>
 #include <math/integer/dag_IPoint2.h>
-#include <gameMath/traceUtils.h>
+#include <rendInst/traceUtils.h>
 #include <perfMon/dag_statDrv.h>
 #include <rendInst/rendInstCollision.h>
 #include <landMesh/lmeshManager.h>
-#include <landMesh/landRayTracer.h>
+#include <landMesh/landRayTracerSoA4.h>
 #include <heightmap/heightmapHandler.h>
-#include <sceneRay/dag_sceneRay.h>
-#include <sceneRay/dag_cachedRtVecFaces.h>
+#include <gameRes/dag_collisionResource.h>
 #include <physMap/physMap.h>
 #include <physMap/physMatSwRenderer.h>
 #include "collisionGlobals.h"
+
+bool dacoll::append_static_collision_tris(bbox3f_cref box, vec4f *out_tris, int &left)
+{
+  const CollisionResource *res = get_static_collision_resource();
+  if (!res)
+    return false;
+  const bool overflow = res->visitTrianglesInBox(box, CollisionNode::TRACEABLE, [&](vec3f a, vec3f b, vec3f c, int mat, int) {
+    if (left <= 0)
+      return true;
+    out_tris[0] = v_perm_xyzd(a, v_cast_vec4f(v_splatsi(static_cache_pack_tri_mat(mat))));
+    out_tris[1] = v_sub(b, a);
+    out_tris[2] = v_sub(c, a);
+    out_tris += 3;
+    --left;
+    return false;
+  });
+  return !overflow;
+}
+
+int dacoll::resolve_static_cache_tri_mat(int packed_w)
+{
+  return (packed_w & STATIC_CACHE_TRI_MAT_TAG) ? (packed_w & STATIC_CACHE_TRI_MAT_MASK) : -1;
+}
 
 static bool can_use_trace_cache(const bbox3f &query_box, const TraceMeshFaces *handle)
 {
@@ -41,6 +64,17 @@ void dacoll::validate_trace_cache_oobb(const TMatrix &tm, const bbox3f &oobb, co
   validate_trace_cache(aabb, expands, physmap_expands, handle);
 }
 
+void dacoll::validate_trace_cache_ri_only(TraceMeshFaces *handle)
+{
+  if (handle->isRendinstsValid && !rendinst::checkCachedRiData(handle))
+  {
+    TIME_PROFILE(validate_trace_cache_ri);
+    handle->isRendinstsValid = rendinst::initializeCachedRiData(handle);
+    TRACE_HANDLE_DEBUG_STAT(handle, numRIInvalidates++);
+    gamephys::draw_trace_handle_debug_invalidate(handle, true);
+  }
+}
+
 void dacoll::validate_trace_cache(const bbox3f &query_box, const vec3f &expands, float physmap_expands, TraceMeshFaces *handle,
   float rel_shift_threshold /* = 0.2f */)
 {
@@ -49,7 +83,7 @@ void dacoll::validate_trace_cache(const bbox3f &query_box, const vec3f &expands,
   float shiftThreshold = v_extract_x(v_length3_x(v_bbox3_size(query_box))) * rel_shift_threshold;
   vec3f queryBoxcenter = v_bbox3_center(query_box);
   vec3f cacheBoxCenter = v_bbox3_center(v_ldu_bbox3(handle->box));
-  bool validated = v_extract_x(v_length3_x(v_sub(queryBoxcenter, cacheBoxCenter))) < shiftThreshold;
+  bool validated = v_extract_x(v_length3_x(v_sub(queryBoxcenter, cacheBoxCenter))) < shiftThreshold && !handle->box.isempty();
 
   if (validated)
   {
@@ -58,13 +92,7 @@ void dacoll::validate_trace_cache(const bbox3f &query_box, const vec3f &expands,
     // Note that we're only doing it when the cache is not overflowed,
     // if it gets overflowed then it doesn't make sense, wait until next box
     // update with fewer RIs.
-    if (handle->isRendinstsValid && !rendinst::checkCachedRiData(handle))
-    {
-      TIME_PROFILE(validate_trace_cache_ri);
-      handle->isRendinstsValid = rendinst::initializeCachedRiData(handle);
-      TRACE_HANDLE_DEBUG_STAT(handle, numRIInvalidates++);
-      gamephys::draw_trace_handle_debug_invalidate(handle, true);
-    }
+    validate_trace_cache_ri_only(handle);
     return;
   }
 
@@ -77,7 +105,7 @@ void dacoll::validate_trace_cache(const bbox3f &query_box, const vec3f &expands,
 
   v_stu_bbox3(handle->box, extBox);
 
-  if (LandRayTracer *landTracer = dacoll::get_lmesh() ? dacoll::get_lmesh()->getLandTracer() : nullptr)
+  if (auto *landTracer = dacoll::get_lmesh() ? dacoll::get_lmesh()->getLandTracer() : nullptr)
   {
     int leftForLandmesh = TraceMeshFaces::MAX_TRIANGLES_PER_SYSTEM;
     handle->isLandmeshValid = landTracer->getFaces(extBox, handle->triangles.data(), leftForLandmesh);
@@ -91,19 +119,10 @@ void dacoll::validate_trace_cache(const bbox3f &query_box, const vec3f &expands,
   else
     handle->isLandmeshValid = false;
 
-  if (const StaticSceneRayTracer *sceneRay = dacoll::get_frt())
-  {
-    int leftForSceneRay = TraceMeshFaces::MAX_TRIANGLES_PER_SYSTEM;
-    handle->isStaticValid = sceneRay->getVecFacesCached(extBox, handle->triangles.data() + trianglesAdded * 3, leftForSceneRay);
-    int numTriangles = (TraceMeshFaces::MAX_TRIANGLES_PER_SYSTEM - leftForSceneRay);
-    if (handle->isStaticValid)
-    {
-      trianglesAdded += numTriangles;
-      left -= numTriangles;
-    }
-  }
-  else
-    handle->isStaticValid = false;
+  int leftForStatic = TraceMeshFaces::MAX_TRIANGLES_PER_SYSTEM;
+  handle->isStaticValid = append_static_collision_tris(extBox, handle->triangles.data() + trianglesAdded * 3, leftForStatic);
+  if (handle->isStaticValid)
+    left -= TraceMeshFaces::MAX_TRIANGLES_PER_SYSTEM - leftForStatic;
   handle->trianglesCount = handle->MAX_TRIANGLES - left;
 
   if (HeightmapHandler *heightMap = dacoll::get_lmesh() ? dacoll::get_lmesh()->getHmapHandler() : nullptr)

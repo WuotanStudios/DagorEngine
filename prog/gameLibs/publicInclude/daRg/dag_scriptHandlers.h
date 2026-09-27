@@ -24,6 +24,11 @@ public:
 
   bool allowOnShutdown = false;
 
+  // ElementRef instance. When set, the handler is skipped if that element was
+  // detached before the call (see Element::releaseRef). Only for handlers whose
+  // sole input is the element itself; deletion side effects belong in onDetach.
+  Sqrat::Object requiredElem;
+
 #if DA_PROFILER_ENABLED
   uint32_t dapDescription = 0;
 #endif
@@ -42,8 +47,8 @@ public:
     SQFunctionInfo fi;
     if (SQ_SUCCEEDED(sq_ext_getfuncinfo(func.GetFunc(), &fi)))
     {
-      const char *fnSlash = ::max(strrchr(fi.source, '/'), strrchr(fi.source, _SC('\\')));
-      dapFuncName.printf(0, "%s(%s:%d)", fi.name, fnSlash ? (fnSlash + 1) : fi.source, fi.source);
+      const char *fnSlash = ::max(strrchr(fi.source, '/'), strrchr(fi.source, '\\'));
+      dapFuncName.printf(0, "%s(%s:%d)", fi.name, fnSlash ? (fnSlash + 1) : fi.source, int(fi.line));
       dapDescription = DA_PROFILE_ADD_DESCRIPTION(fi.source, fi.line, dapFuncName.c_str());
     }
 #endif

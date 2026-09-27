@@ -116,6 +116,9 @@ public:
   // Zero mass makes body static.
   void setMassMatrix(real mass, real ixx, real iyy, real izz);
 
+  // Lock a body in place (make it static) or release it back to dynamic using the given mass/inertia.
+  void setLockedStatic(bool locked, real mass, const Point3 &momj);
+
   real getMass() const { return safeinv(body->getInvMass()); /*safeinv(0)==0*/ }
   real getInvMass() const { return body->getInvMass(); }
   void getMassMatrix(real &mass, real &ixx, real &iyy, real &izz);
@@ -342,7 +345,7 @@ public:
   bool fetchSimRes(bool wait, PhysBody *destroying_body = nullptr);
   void clear();
 
-  const char *getJobName(bool &) const override { return "bullet_phys_simulate"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("bullet_phys_simulate"); }
 
   virtual void doJob();
 

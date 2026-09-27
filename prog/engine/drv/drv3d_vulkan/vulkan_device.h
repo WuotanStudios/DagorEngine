@@ -14,6 +14,7 @@
 #include "vulkan_loader.h"
 #include "vk_entry_points.h"
 #include "vulkan_allocation_callbacks.h"
+#include "util/unsafe_call.h"
 
 // No need to have raytracing extension if we can not use it.
 #if !VULKAN_HAS_RAYTRACING
@@ -28,6 +29,13 @@ VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
 VULKAN_END_EXTENSION_FUCTION_PACK(ImagelessFramebufferKHR);
 
 VULKAN_DECLARE_EXTENSION(ImagelessFramebufferKHR, KHR_IMAGELESS_FRAMEBUFFER);
+#endif
+
+#if VK_EXT_scalar_block_layout
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(ScalarBlockLayoutEXT);
+
+VULKAN_DECLARE_EXTENSION(ScalarBlockLayoutEXT, EXT_SCALAR_BLOCK_LAYOUT);
 #endif
 
 #if VK_KHR_shader_draw_parameters
@@ -136,6 +144,34 @@ VULKAN_DECLARE_EXTENSION(AccelerationStructureKHR, KHR_ACCELERATION_STRUCTURE);
 
 #endif // VK_KHR_acceleration_structure
 
+#if VK_EXT_opacity_micromap // depends on VK_KHR_acceleration_structure
+
+DEFINE_VULKAN_NON_DISPATCHABLE_HANDLE(VulkanMicromapHandle, VkMicromapEXT);
+
+#define VK_FUNC_LIST                  \
+  VK_FUNC(vkCreateMicromapEXT)        \
+  VK_FUNC(vkDestroyMicromapEXT)       \
+  VK_FUNC(vkCmdBuildMicromapsEXT)     \
+  VK_FUNC(vkCmdCopyMicromapEXT)       \
+  VK_FUNC(vkGetMicromapBuildSizesEXT) \
+  VK_FUNC(vkCmdWriteMicromapsPropertiesEXT)
+
+#define VK_FUNC(name) VULKAN_MAKE_EXTENSION_FUNCTION_DEF(name)
+VK_FUNC_LIST
+#undef VK_FUNC
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+#define VK_FUNC(name) VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(name)
+VK_FUNC_LIST
+#undef VK_FUNC
+VULKAN_END_EXTENSION_FUCTION_PACK(OpacityMicromapEXT);
+
+VULKAN_DECLARE_EXTENSION(OpacityMicromapEXT, EXT_OPACITY_MICROMAP);
+
+#undef VK_FUNC_LIST
+
+#endif // VK_EXT_opacity_micromap
+
 #if VK_EXT_descriptor_indexing // required by VK_KHR_acceleration_structure
 
 VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
@@ -173,6 +209,7 @@ VULKAN_END_EXTENSION_FUCTION_PACK(BufferDeviceAddressKHR);
 
 VULKAN_DECLARE_EXTENSION(BufferDeviceAddressKHR, KHR_BUFFER_DEVICE_ADDRESS);
 
+#undef VK_FUNC_LIST
 #endif // VK_KHR_buffer_device_address
 
 #if VK_KHR_deferred_host_operations // required by VK_KHR_acceleration_structure
@@ -334,6 +371,16 @@ VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(vkQueuePresentKHR)
 VULKAN_END_EXTENSION_FUCTION_PACK(SwapchainKHR);
 
 VULKAN_DECLARE_EXTENSION(SwapchainKHR, KHR_SWAPCHAIN);
+
+#if VK_EXT_hdr_metadata
+VULKAN_MAKE_EXTENSION_FUNCTION_DEF(vkSetHdrMetadataEXT)
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(vkSetHdrMetadataEXT)
+VULKAN_END_EXTENSION_FUCTION_PACK(HdrMetadataEXT);
+
+VULKAN_DECLARE_EXTENSION(HdrMetadataEXT, EXT_HDR_METADATA);
+#endif
 
 VULKAN_MAKE_EXTENSION_FUNCTION_DEF(vkCmdPipelineBarrier2KHR)
 
@@ -560,6 +607,185 @@ VULKAN_END_EXTENSION_FUCTION_PACK(TileMemoryHeapQCOM);
 VULKAN_DECLARE_EXTENSION(TileMemoryHeapQCOM, QCOM_TILE_MEMORY_HEAP);
 #endif
 
+#if VK_KHR_format_feature_flags2
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(FormatFeatureFlags2KHR);
+VULKAN_DECLARE_EXTENSION(FormatFeatureFlags2KHR, KHR_FORMAT_FEATURE_FLAGS_2);
+#endif
+
+#if VK_AMD_anti_lag
+VULKAN_MAKE_EXTENSION_FUNCTION_DEF(vkAntiLagUpdateAMD)
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(vkAntiLagUpdateAMD)
+VULKAN_END_EXTENSION_FUCTION_PACK(AntiLagAMD);
+VULKAN_DECLARE_EXTENSION(AntiLagAMD, AMD_ANTI_LAG);
+#endif
+
+#if VK_AMD_device_coherent_memory
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(DeviceCoherentMemoryAMD);
+VULKAN_DECLARE_EXTENSION(DeviceCoherentMemoryAMD, AMD_DEVICE_COHERENT_MEMORY);
+#endif
+
+#if VK_KHR_external_memory
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(ExternalMemoryKHR);
+VULKAN_DECLARE_EXTENSION(ExternalMemoryKHR, KHR_EXTERNAL_MEMORY);
+#endif
+
+#if VK_KHR_external_memory_win32
+
+VULKAN_MAKE_EXTENSION_FUNCTION_DEF(vkGetMemoryWin32HandleKHR)
+VULKAN_MAKE_EXTENSION_FUNCTION_DEF(vkGetMemoryWin32HandlePropertiesKHR)
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(vkGetMemoryWin32HandleKHR)
+VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(vkGetMemoryWin32HandlePropertiesKHR)
+VULKAN_END_EXTENSION_FUCTION_PACK(ExternalMemoryWin32KHR);
+VULKAN_DECLARE_EXTENSION(ExternalMemoryWin32KHR, KHR_EXTERNAL_MEMORY_WIN32);
+#endif
+
+#if VK_KHR_fragment_shader_barycentric
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(FragmentShaderBarycentricKHR);
+VULKAN_DECLARE_EXTENSION(FragmentShaderBarycentricKHR, KHR_FRAGMENT_SHADER_BARYCENTRIC);
+#endif
+
+#if VK_KHR_fragment_shading_rate
+
+VULKAN_MAKE_EXTENSION_FUNCTION_DEF(vkCmdSetFragmentShadingRateKHR)
+VULKAN_MAKE_INSTANCE_EXTENSION_FUNCTION_DEF(vkGetPhysicalDeviceFragmentShadingRatesKHR)
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(vkCmdSetFragmentShadingRateKHR)
+VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(vkGetPhysicalDeviceFragmentShadingRatesKHR)
+VULKAN_END_EXTENSION_FUCTION_PACK(FragmentShadingRateKHR);
+VULKAN_DECLARE_EXTENSION(FragmentShadingRateKHR, KHR_FRAGMENT_SHADING_RATE);
+#endif
+
+#if VK_KHR_maintenance7
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(Maintenance7KHR);
+
+VULKAN_DECLARE_EXTENSION(Maintenance7KHR, KHR_MAINTENANCE_7);
+#endif
+
+#if VK_KHR_shader_subgroup_extended_types
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(ShaderSubgroupExtendedTypesKHR);
+VULKAN_DECLARE_EXTENSION(ShaderSubgroupExtendedTypesKHR, KHR_SHADER_SUBGROUP_EXTENDED_TYPES);
+#endif
+
+#if VK_KHR_vulkan_memory_model
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(VulkanMemoryModelKHR);
+VULKAN_DECLARE_EXTENSION(VulkanMemoryModelKHR, KHR_VULKAN_MEMORY_MODEL);
+#endif
+
+#if VK_KHR_shader_maximal_reconvergence
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(ShaderMaximalReconvergenceKHR);
+VULKAN_DECLARE_EXTENSION(ShaderMaximalReconvergenceKHR, KHR_SHADER_MAXIMAL_RECONVERGENCE);
+#endif
+
+#if VK_KHR_shader_quad_control
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(ShaderQuadControlKHR);
+VULKAN_DECLARE_EXTENSION(ShaderQuadControlKHR, KHR_SHADER_QUAD_CONTROL);
+#endif
+
+#if VK_EXT_extended_dynamic_state
+#define VK_FUNC_LIST                        \
+  VK_FUNC(vkCmdSetCullModeEXT)              \
+  VK_FUNC(vkCmdSetFrontFaceEXT)             \
+  VK_FUNC(vkCmdSetPrimitiveTopologyEXT)     \
+  VK_FUNC(vkCmdSetViewportWithCountEXT)     \
+  VK_FUNC(vkCmdSetScissorWithCountEXT)      \
+  VK_FUNC(vkCmdBindVertexBuffers2EXT)       \
+  VK_FUNC(vkCmdSetDepthTestEnableEXT)       \
+  VK_FUNC(vkCmdSetDepthWriteEnableEXT)      \
+  VK_FUNC(vkCmdSetDepthCompareOpEXT)        \
+  VK_FUNC(vkCmdSetDepthBoundsTestEnableEXT) \
+  VK_FUNC(vkCmdSetStencilTestEnableEXT)     \
+  VK_FUNC(vkCmdSetStencilOpEXT)
+
+#define VK_FUNC(name) VULKAN_MAKE_EXTENSION_FUNCTION_DEF(name)
+VK_FUNC_LIST
+#undef VK_FUNC
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+#define VK_FUNC(name) VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(name)
+VK_FUNC_LIST
+#undef VK_FUNC
+VULKAN_END_EXTENSION_FUCTION_PACK(ExtendedDynamicStateEXT);
+VULKAN_DECLARE_EXTENSION(ExtendedDynamicStateEXT, EXT_EXTENDED_DYNAMIC_STATE);
+
+#undef VK_FUNC_LIST
+#endif // VK_EXT_extended_dynamic_state
+
+#if VK_EXT_extended_dynamic_state2
+#define VK_FUNC_LIST                          \
+  VK_FUNC(vkCmdSetPatchControlPointsEXT)      \
+  VK_FUNC(vkCmdSetRasterizerDiscardEnableEXT) \
+  VK_FUNC(vkCmdSetDepthBiasEnableEXT)         \
+  VK_FUNC(vkCmdSetLogicOpEXT)                 \
+  VK_FUNC(vkCmdSetPrimitiveRestartEnableEXT)
+
+#define VK_FUNC(name) VULKAN_MAKE_EXTENSION_FUNCTION_DEF(name)
+VK_FUNC_LIST
+#undef VK_FUNC
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+#define VK_FUNC(name) VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(name)
+VK_FUNC_LIST
+#undef VK_FUNC
+VULKAN_END_EXTENSION_FUCTION_PACK(ExtendedDynamicState2EXT);
+VULKAN_DECLARE_EXTENSION(ExtendedDynamicState2EXT, EXT_EXTENDED_DYNAMIC_STATE_2);
+
+#undef VK_FUNC_LIST
+#endif // VK_EXT_extended_dynamic_state2
+
+#if VK_EXT_extended_dynamic_state3
+// only the core VK_EXT_extended_dynamic_state3 commands are loaded here; the NV-suffixed
+// commands from this extension depend on additional NV extensions being enabled
+#define VK_FUNC_LIST                                   \
+  VK_FUNC(vkCmdSetDepthClampEnableEXT)                 \
+  VK_FUNC(vkCmdSetPolygonModeEXT)                      \
+  VK_FUNC(vkCmdSetRasterizationSamplesEXT)             \
+  VK_FUNC(vkCmdSetSampleMaskEXT)                       \
+  VK_FUNC(vkCmdSetAlphaToCoverageEnableEXT)            \
+  VK_FUNC(vkCmdSetAlphaToOneEnableEXT)                 \
+  VK_FUNC(vkCmdSetLogicOpEnableEXT)                    \
+  VK_FUNC(vkCmdSetColorBlendEnableEXT)                 \
+  VK_FUNC(vkCmdSetColorBlendEquationEXT)               \
+  VK_FUNC(vkCmdSetColorWriteMaskEXT)                   \
+  VK_FUNC(vkCmdSetTessellationDomainOriginEXT)         \
+  VK_FUNC(vkCmdSetRasterizationStreamEXT)              \
+  VK_FUNC(vkCmdSetConservativeRasterizationModeEXT)    \
+  VK_FUNC(vkCmdSetExtraPrimitiveOverestimationSizeEXT) \
+  VK_FUNC(vkCmdSetDepthClipEnableEXT)                  \
+  VK_FUNC(vkCmdSetSampleLocationsEnableEXT)            \
+  VK_FUNC(vkCmdSetColorBlendAdvancedEXT)               \
+  VK_FUNC(vkCmdSetProvokingVertexModeEXT)              \
+  VK_FUNC(vkCmdSetLineRasterizationModeEXT)            \
+  VK_FUNC(vkCmdSetLineStippleEnableEXT)                \
+  VK_FUNC(vkCmdSetDepthClipNegativeOneToOneEXT)
+
+#define VK_FUNC(name) VULKAN_MAKE_EXTENSION_FUNCTION_DEF(name)
+VK_FUNC_LIST
+#undef VK_FUNC
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+#define VK_FUNC(name) VULKAN_EXTENSION_FUNCTION_PACK_ENTRY(name)
+VK_FUNC_LIST
+#undef VK_FUNC
+VULKAN_END_EXTENSION_FUCTION_PACK(ExtendedDynamicState3EXT);
+VULKAN_DECLARE_EXTENSION(ExtendedDynamicState3EXT, EXT_EXTENDED_DYNAMIC_STATE_3);
+
+#undef VK_FUNC_LIST
+#endif // VK_EXT_extended_dynamic_state3
+
 template <typename... Extensions>
 class VulkanDeviceCore : public Extensions...
 {
@@ -603,8 +829,13 @@ private:
     if (extRef != listEnd)
     {
       loaded = true;
-      this->T::enumerateFunctions([this, &loaded](const char *f_name, PFN_vkVoidFunction &function) {
-        function = VULKAN_LOG_CALL_R(Globals::VK::loader.vkGetDeviceProcAddr(device, f_name));
+      this->T::enumerateFunctions([this, &loaded](const char *f_name, PFN_vkVoidFunction &function, bool is_instance_function) {
+        if (!is_instance_function)
+        {
+          function = VULKAN_LOG_CALL_R(Globals::VK::loader.vkGetDeviceProcAddr(device, f_name));
+        }
+        else
+          function = nullptr;
 
         // try to find function in instance, if it is not device tied
         if (!function)
@@ -630,7 +861,7 @@ private:
   {
     if (extensionEnabled.test(TypeIndexOf<T, ExtensionTypePack>::value))
     {
-      this->T::enumerateFunctions([](const char *, PFN_vkVoidFunction &function) { function = nullptr; });
+      this->T::enumerateFunctions([](const char *, PFN_vkVoidFunction &function, bool) { function = nullptr; });
       extensionEnabled.reset(TypeIndexOf<T, ExtensionTypePack>::value);
     }
   }
@@ -650,9 +881,31 @@ private:
   }
 
 public:
+  struct CreateDeviceParams
+  {
+    VulkanPhysicalDeviceHandle pd;
+    const VkDeviceCreateInfo &dci;
+    VkAllocationCallbacks *allocCb;
+    VkDevice *retPtr;
+    VkResult &rc;
+  };
+
+  static void create_device_unsafe(void *raw_params)
+  {
+    CreateDeviceParams *params = (CreateDeviceParams *)raw_params;
+    params->rc = Globals::VK::inst.vkCreateDevice(params->pd, &params->dci, params->allocCb, params->retPtr);
+  }
+
   bool init(VulkanPhysicalDeviceHandle pd, const VkDeviceCreateInfo &dci)
   {
-    VkResult rc = Globals::VK::inst.vkCreateDevice(pd, &dci, VKALLOC(device), ptr(device));
+    VkResult rc;
+    CreateDeviceParams callParams{pd, dci, VKALLOC(device), ptr(device), rc};
+    if (!execute_unsafe(&create_device_unsafe, &callParams))
+    {
+      logwarn("vulkan: device create crashed");
+      return false;
+    }
+
     if (VULKAN_CHECK_FAIL(rc))
     {
       logwarn("vulkan: device create failed with error %08lX:%s", rc, vulkan_error_string(rc));
@@ -760,6 +1013,10 @@ class VulkanDevice : public VulkanDeviceCore<SwapchainKHR
                        ,
                        AccelerationStructureKHR
 #endif
+#if VK_EXT_opacity_micromap
+                       ,
+                       OpacityMicromapEXT
+#endif
 #if VK_EXT_descriptor_indexing
                        ,
                        DescriptorIndexingEXT
@@ -799,6 +1056,10 @@ class VulkanDevice : public VulkanDeviceCore<SwapchainKHR
 #if VK_EXT_conditional_rendering
                        ,
                        ConditionalRenderingEXT
+#endif
+#if VK_EXT_scalar_block_layout
+                       ,
+                       ScalarBlockLayoutEXT
 #endif
 #if VK_NV_device_diagnostic_checkpoints
                        ,
@@ -923,6 +1184,70 @@ class VulkanDevice : public VulkanDeviceCore<SwapchainKHR
 #if VK_QCOM_tile_memory_heap
                        ,
                        TileMemoryHeapQCOM
+#endif
+#if VK_KHR_format_feature_flags2
+                       ,
+                       FormatFeatureFlags2KHR
+#endif
+#if VK_AMD_anti_lag
+                       ,
+                       AntiLagAMD
+#endif
+#if VK_AMD_device_coherent_memory
+                       ,
+                       DeviceCoherentMemoryAMD
+#endif
+#if VK_KHR_external_memory
+                       ,
+                       ExternalMemoryKHR
+#endif
+#if VK_KHR_external_memory_win32
+                       ,
+                       ExternalMemoryWin32KHR
+#endif
+#if VK_KHR_fragment_shader_barycentric
+                       ,
+                       FragmentShaderBarycentricKHR
+#endif
+#if VK_KHR_fragment_shading_rate
+                       ,
+                       FragmentShadingRateKHR
+#endif
+#if VK_KHR_maintenance7
+                       ,
+                       Maintenance7KHR
+#endif
+#if VK_KHR_shader_subgroup_extended_types
+                       ,
+                       ShaderSubgroupExtendedTypesKHR
+#endif
+#if VK_KHR_vulkan_memory_model
+                       ,
+                       VulkanMemoryModelKHR
+#endif
+#if VK_KHR_shader_maximal_reconvergence
+                       ,
+                       ShaderMaximalReconvergenceKHR
+#endif
+#if VK_KHR_shader_quad_control
+                       ,
+                       ShaderQuadControlKHR
+#endif
+#if VK_EXT_extended_dynamic_state
+                       ,
+                       ExtendedDynamicStateEXT
+#endif
+#if VK_EXT_extended_dynamic_state2
+                       ,
+                       ExtendedDynamicState2EXT
+#endif
+#if VK_EXT_extended_dynamic_state3
+                       ,
+                       ExtendedDynamicState3EXT
+#endif
+#if VK_EXT_hdr_metadata
+                       ,
+                       HdrMetadataEXT
 #endif
                        >
 {

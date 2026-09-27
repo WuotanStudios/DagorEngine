@@ -2,14 +2,19 @@
 
 #include "waterPhys.h"
 #include "waterRender.h"
+#include "chopWaterPhysics.h"
+#include "chopWaterRender.h"
+#include "waterRenderCommon.h"
 #include <limits.h>
 #include <fftWater/fftWater.h>
+#include <fftWater/chopWaterGen.h>
 #include <fftWater/gpuFetch.h>
 #include <debug/dag_debug3d.h>
 #include <util/dag_convar.h>
 #include <util/dag_console.h>
 #include <waterDecals/waterDecalsRenderer.h>
 #include <math/dag_adjpow2.h>
+#include <math/dag_check_nan.h>
 #include <math/dag_mathUtils.h>
 #include <math/dag_hlsl_floatx.h>
 #include <generic/dag_initOnDemand.h>
@@ -22,26 +27,52 @@
 #include <ioSys/dag_btagCompr.h>
 #include <supp/dag_alloca.h>
 #include <osApiWrappers/dag_atomic_types.h>
+#include <osApiWrappers/dag_sharedMem.h>
+#include <imgui/imgui.h>
+#include <gui/dag_imgui.h>
+#include <gui/dag_imguiUtil.h>
 
 #if DAGOR_DBGLEVEL > 0
 CONSOLE_BOOL_VAL("water", phys_tex_on, false);
 #endif
 
+namespace convar
+{
+CONSOLE_BOOL_VAL("water", chop_gen, false);
+CONSOLE_FLOAT_VAL("chop", wind_speed_chop, 1.0f);
+} // namespace convar
+
+#define GLOBAL_VARS_LIST VAR(chop_water_enabled)
+
+#define VAR(a) static ShaderVariableInfo a##VarId(#a, true);
+GLOBAL_VARS_LIST
+#undef VAR
+
 class FFTWater
 {
   eastl::unique_ptr<fft_water::WaterFlowmap> waterFlowmap;
   eastl::unique_ptr<fft_water::WaterHeightmap> waterHeightmap;
+  eastl::unique_ptr<HeightmapHeightCulling> heightmapCulling;
+
+  WaterRenderCommon renderCommon;
+
   WaterNVRender *render;
   WaterNVPhysics *physics;
+
+  ChopWaterRender *renderChop;
+  ChopWaterPhysics *physicsChop;
+  ChopWaterGenerator *chopWaterGenerator;
+
 #if DAGOR_DBGLEVEL > 0
   UniqueTex physTex;
 #endif
   dag::AtomicFloat<double> currentPhysTime;
   double lastTime;
   NVWaveWorks_FFT_CPU_Simulation::Params params;
-  float waterLevel;
+  float minWaterLevel, maxWaterLevel;
   int numRenderCascades;
   int minRenderResBits;
+  int enforceRenderCascadeCount;
 
 public:
   void setCurrentTime(double time) { currentPhysTime.store(time, dag::memory_order_release); }
@@ -58,10 +89,19 @@ public:
       render->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
     if (physics)
       physics->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
+
+    renderCommon.setMaxWaveHeight(getMaxWaveHeight()); // FFT maxWaveHeight depends on fft_period
+    updateHeightCullingWaveHeight();
   }
   float getPeriod() const { return params.fft_period; }
   FFTWater(int num_render_cascades, int min_render_res_bits) :
-    render(NULL), physics(NULL), numRenderCascades(num_render_cascades), currentPhysTime(0.0)
+    render(NULL),
+    physics(NULL),
+    renderChop(NULL),
+    physicsChop(NULL),
+    chopWaterGenerator(NULL),
+    numRenderCascades(num_render_cascades),
+    currentPhysTime(0.0)
   {
     minRenderResBits = max<int>(min_render_res_bits, MIN_FFT_RESOLUTION);
     params.fft_resolution_bits = minRenderResBits;
@@ -72,20 +112,24 @@ public:
     params.wave_amplitude = 0.7f;
     params.fft_period = 1000.0f;
     lastTime = 0.0;
-    waterLevel = 0;
-    setWind(1.0f, Point2(0.8, 0.6));
+    minWaterLevel = 0.0f;
+    maxWaterLevel = 0.0f;
+    enforceRenderCascadeCount = -1;
+    setWind(1.0f, 1.0f, Point2(0.8, 0.6));
   }
   void getWind(float &out_speed, Point2 &out_wind_dir) const
   {
     out_speed = params.wind_speed;
     out_wind_dir = Point2(params.wind_dir_x, params.wind_dir_y);
   }
-  void setWind(float speed, const Point2 &wind_dir)
+  void setWind(float speed, float chop_wind_speed, const Point2 &wind_dir)
   {
-    if (fabsf(params.wind_speed - speed) < 0.05f && wind_dir * Point2(params.wind_dir_x, params.wind_dir_y) > 0.999f)
+    Point2 windDirNorm = normalize(wind_dir);
+    const bool chopWindSpeedChanged = chopWaterGenerator && fabs(chop_wind_speed - chopWaterGenerator->getWindSpeed()) > 0.05f;
+    if (!chopWindSpeedChanged && fabsf(params.wind_speed - speed) < 0.05f &&
+        windDirNorm * Point2(params.wind_dir_x, params.wind_dir_y) > 0.999f)
       return;
 
-    Point2 windDirNorm = normalize(wind_dir);
     params.wind_dir_x = windDirNorm.x;
     params.wind_dir_y = windDirNorm.y;
     params.wind_speed = speed;
@@ -94,6 +138,19 @@ public:
       render->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
     if (physics)
       physics->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
+
+    if (chopWaterGenerator)
+      chopWaterGenerator->setWind(chop_wind_speed, Point2(params.wind_dir_x, params.wind_dir_y));
+    if (renderChop)
+      renderChop->reinit();
+    if (physicsChop)
+      physicsChop->calcWaveHeight();
+
+    renderCommon.setWind(params.wind_dir_x, params.wind_dir_y, params.wind_speed); // use FFT wind_speed for shader (todo: check)
+    renderCommon.setMaxWaveHeight(getMaxWaveHeight());
+    updateHeightCullingWaveHeight();
+
+    convar::wind_speed_chop = chop_wind_speed;
   }
   int getFFTRenderResolution() const { return params.fft_resolution_bits; }
   void setFFTRenderResolution(float resolution_bits)
@@ -122,6 +179,7 @@ public:
       render->setSmallWaveFraction(smallWaveFraction);
       render->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
     }
+    updateHeightCullingWaveHeight();
   }
   fft_water::SimulationParams getSimulationParams() const
   {
@@ -143,6 +201,7 @@ public:
       render->setSimulationParams(simulation);
       render->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
     }
+    updateHeightCullingWaveHeight();
   }
   float getCascadeWindowLength() const
   {
@@ -166,6 +225,7 @@ public:
       render->setCascadeWindowLength(value);
       render->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
     }
+    updateHeightCullingWaveHeight();
   }
   float getCascadeFacetSize() const
   {
@@ -189,8 +249,13 @@ public:
       render->setCascadeFacetSize(value);
       render->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
     }
+    updateHeightCullingWaveHeight();
   }
-  void closeRender() { del_it(render); }
+  void closeRender()
+  {
+    del_it(render);
+    del_it(renderChop);
+  }
 
   int getActualFFTResolutionBits(int quality)
   {
@@ -199,8 +264,21 @@ public:
     return params.fft_resolution_bits;
   }
 
+  int renderCascadeCountValidation(int v)
+  {
+    if (enforceRenderCascadeCount >= 0)
+    {
+      if (v != enforceRenderCascadeCount)
+      {
+        logerr("fftwater: enforced cascade count dont match with required count: %d %d", enforceRenderCascadeCount, v);
+        return enforceRenderCascadeCount;
+      }
+    }
+    return v;
+  }
+
   void initRender(int quality, int geom_quality, bool depth_renderer, bool ssr_renderer, bool one_to_four_cascades,
-    bool water_heightmap_draw_patches)
+    bool water_heightmap_draw_patches, int enforce_render_cascade_count)
   {
     bool saveParams = render != NULL;
     int aniso = saveParams ? render->getAnisotropy() : 0;
@@ -213,52 +291,106 @@ public:
     if (saveParams)
       render->getRoughness(roughnessBase, cascadesRoughnessBase);
     Point2 waveDisplacementDistance = saveParams ? render->getWaveDisplacementDistance() : Point2(0, 0);
-    bool shoreEnable = saveParams ? render->isShoreEnabled() : false;
+
+    enforceRenderCascadeCount = enforce_render_cascade_count;
+    numRenderCascades = renderCascadeCountValidation(numRenderCascades);
 
     closeRender();
     NVWaveWorks_FFT_CPU_Simulation::Params newParams = params;
     newParams.fft_resolution_bits = getActualFFTResolutionBits(quality);
     render = new WaterNVRender(newParams, simulation, quality, geom_quality, depth_renderer, ssr_renderer, one_to_four_cascades,
-      numRenderCascades, cascadeWindowLength, cascadeFacetSize, waterHeightmap.get(), water_heightmap_draw_patches);
+      numRenderCascades, cascadeWindowLength, cascadeFacetSize, waterHeightmap.get(), heightmapCulling.get(),
+      water_heightmap_draw_patches);
+    if (chopWaterGenerator)
+      initRenderChop();
 
+    renderCommon.init();
     if (saveParams)
     {
-      render->setLevel(waterLevel);
+      bool shoreEnable = renderCommon.isShoreEnabled();
+      render->setMinMaxLevel(minWaterLevel, maxWaterLevel);
       render->setAnisotropy(aniso, mipBias);
       render->setFoamParams(foam);
       render->setRoughness(roughnessBase, cascadesRoughnessBase);
       render->setWaveDisplacementDistance(waveDisplacementDistance);
-      render->shoreEnable(shoreEnable);
+      renderCommon.shoreEnable(shoreEnable);
+      renderCommon.setWaterLevel(minWaterLevel);
     }
+    else
+    {
+      renderCommon.shoreEnable(false);
+      renderCommon.setWaterLevel(0.0f);
+    }
+    if (renderChop)
+      renderChop->setMinMaxLevel(minWaterLevel, maxWaterLevel);
+
+    updateHeightCullingWaveHeight();
+  }
+  void initChopWaterGen()
+  {
+    if (chopWaterGenerator)
+    {
+      del_it(chopWaterGenerator);
+    }
+    chopWaterGenerator = new ChopWaterGenerator();
+  }
+  void initRenderChop()
+  {
+    G_ASSERT(chopWaterGenerator);
+    G_ASSERT(!renderChop);
+    renderChop = new ChopWaterRender(*chopWaterGenerator, render->getQuality(), render->getGeomQuality(),
+      render->isDepthRendererEnabled(), render->isSSRRendererEnabled(), waterHeightmap.get(), heightmapCulling.get());
+    renderChop->setMinMaxLevel(minWaterLevel, maxWaterLevel);
+    updateHeightCullingWaveHeight();
+  }
+  void initPhysicsChop()
+  {
+    G_ASSERT(chopWaterGenerator);
+    G_ASSERT(!physicsChop);
+    physicsChop = new ChopWaterPhysics(*chopWaterGenerator, WATER_CPU_CASCADES_COUNT, waterHeightmap.get());
   }
   void resetRender()
   {
     if (render)
       initRender(render->getQuality(), render->getGeomQuality(), render->isDepthRendererEnabled(), render->isSSRRendererEnabled(),
-        render->getOneToFourCascades(), render->isWaterHeightmapDrawPatches());
+        render->getOneToFourCascades(), render->isWaterHeightmapDrawPatches(), enforceRenderCascadeCount);
   }
   int getNumCascades() const { return numRenderCascades; }
   void setNumCascades(int cascades)
   {
     if (numRenderCascades == cascades)
       return;
-    numRenderCascades = cascades;
+    numRenderCascades = renderCascadeCountValidation(cascades);
     if (render)
       initRender(render->getQuality(), render->getGeomQuality(), render->isDepthRendererEnabled(), render->isSSRRendererEnabled(),
-        render->getOneToFourCascades(), render->isWaterHeightmapDrawPatches());
+        render->getOneToFourCascades(), render->isWaterHeightmapDrawPatches(), enforceRenderCascadeCount);
   }
   void resetPhysics()
   {
     if (physics)
       physics->reset();
+    if (physicsChop)
+      physicsChop->reset();
   }
   void waitPhysics()
   {
     if (physics)
       physics->wait();
+    if (physicsChop)
+      physicsChop->wait();
   }
-  void closePhysics() { del_it(physics); }
-  bool validateNextTimeTick(double time) const { return physics ? physics->validateNextTimeTick(time) : true; }
+  void closePhysics()
+  {
+    del_it(physics);
+    del_it(physicsChop);
+  }
+  bool validateNextTimeTick(double time) const
+  {
+    if (chopEnabled())
+      return physicsChop ? physicsChop->validateNextTimeTick(time) : true;
+    else
+      return physics ? physics->validateNextTimeTick(time) : true;
+  }
   void initPhysics()
   {
     G_ASSERT(physics == NULL);
@@ -267,6 +399,9 @@ public:
     newParams.fft_resolution_bits = DEF_PHYS_FFT_RESOLUTION;
     physics = new WaterNVPhysics(newParams, fft_water::SimulationParams(), NUM_PHYS_CASCADES, getCascadeWindowLength(),
       getCascadeFacetSize(), waterHeightmap.get());
+
+    if (chopWaterGenerator)
+      initPhysicsChop();
 
     lastTime = 0;
     currentPhysTime.store(0);
@@ -277,36 +412,70 @@ public:
   void removeFlowmap() { waterFlowmap.reset(nullptr); }
 
   const fft_water::WaterHeightmap *getHeightmap() const { return waterHeightmap.get(); }
+  const HeightmapHeightCulling *getHeightmapCulling() const { return heightmapCulling.get(); }
   void setHeightmap(eastl::unique_ptr<fft_water::WaterHeightmap> &&water_heightmap)
   {
     waterHeightmap = eastl::move(water_heightmap);
     waterHeightmap->heightMax = waterHeightmap->heightOffset + waterHeightmap->heightScale;
+    waterHeightmap->waterLevel = minWaterLevel;
+    setMinMaxLevel(minWaterLevel, maxWaterLevel);
+
+    heightmapCulling = eastl::make_unique<HeightmapHeightCulling>();
+    heightmapCulling->init(waterHeightmap.get());
+    updateHeightCullingWaveHeight();
+
     if (physics)
     {
       physics->setHeightmap(waterHeightmap.get());
       physics->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
     }
+    if (physicsChop)
+    {
+      physicsChop->setHeightmap(waterHeightmap.get());
+      physicsChop->calcWaveHeight();
+    }
+  }
+  void setHeightmapExtraBoundings(const dag::Vector<BBox3> &extra_boundings)
+  {
+    if (waterHeightmap && heightmapCulling)
+    {
+      waterHeightmap->extraBoundings = extra_boundings;
+      heightmapCulling->init(waterHeightmap.get());
+    }
   }
   void removeHeightmap()
   {
+    heightmapCulling.reset(nullptr);
     waterHeightmap.reset(nullptr);
+    setMinMaxLevel(minWaterLevel, minWaterLevel);
+
     if (physics)
     {
       physics->setHeightmap(waterHeightmap.get());
       physics->reinit(Point2(params.wind_dir_x, params.wind_dir_y), params.wind_speed, params.fft_period);
+    }
+    if (physicsChop)
+    {
+      physicsChop->setHeightmap(nullptr);
+      physicsChop->calcWaveHeight();
     }
   }
   ~FFTWater()
   {
     del_it(render);
     del_it(physics);
+    del_it(renderChop);
+    del_it(physicsChop);
+    del_it(chopWaterGenerator);
   }
-  void simulateAllAt(double time)
+  void simulateAllAt(double time, bool is_chop)
   {
     lastTime = time;
     setCurrentTime(time);
-    if (physics)
+    if (physics && !is_chop)
       physics->increaseTime(time);
+    if (physicsChop && is_chop)
+      physicsChop->increaseTime(time);
 
 #if DAGOR_DBGLEVEL > 0
     if (physics && phys_tex_on)
@@ -314,7 +483,7 @@ public:
       const int TEX_R = (1 << DEF_PHYS_FFT_RESOLUTION);
       if (!physTex.getTex2D())
       {
-        physTex = dag::create_tex(NULL, TEX_R, TEX_R, TEXCF_DYNAMIC | TEXFMT_A16B16G16R16F, 1, "water_phys_tex");
+        physTex = dag::create_tex(NULL, TEX_R, TEX_R, TEXCF_DYNAMIC | TEXFMT_A16B16G16R16F, 1, "water_phys_tex", RESTAG_WATER);
       }
 
       int fifo1, fifo2;
@@ -344,45 +513,110 @@ public:
       physTex.close();
 #endif
   }
-  float getLevel() const { return waterLevel; }
+  float getLevel() const { return minWaterLevel; }
   void setLevel(float level)
   {
-    waterLevel = level;
+    minWaterLevel = level;
+    maxWaterLevel = level;
     if (render)
-      render->setLevel(level);
+      render->setMinMaxLevel(level, level);
+    if (renderChop)
+      renderChop->setMinMaxLevel(level, level);
     if (physics)
       physics->setLevel(level);
+    if (physicsChop)
+      physicsChop->setLevel(level);
+    if (render || renderChop)
+      renderCommon.setWaterLevel(level);
+    // Flat ocean culling bounds depend on the water level, so rebake the height-culling LUT when the level changes.
+    if (waterHeightmap && heightmapCulling && waterHeightmap->waterLevel != level)
+    {
+      waterHeightmap->waterLevel = level;
+      heightmapCulling->init(waterHeightmap.get());
+    }
   }
-  float getMinLevel() const
+  void updateHeightCullingWaveHeight()
   {
-    if (render)
-      return render->getMinLevel();
-    return waterLevel;
+    if (!waterHeightmap || !heightmapCulling)
+      return;
+    // At dead calm wave == 0, so flat ocean keeps a zero-thickness box at the water level. This is correct (no waves to
+    // contain); do not force a minimum here or elevated water bodies lose their tight culling bounds.
+    const float maxWaveHeight =
+      chopEnabled() && renderChop ? renderChop->getMaxWaveHeight() : (render ? render->getMaxWaveHeight() : 0.0f);
+    waterHeightmap->waveCullingMargin = maxWaveHeight;
+    heightmapCulling->setUpDisplacement(maxWaveHeight);
+    heightmapCulling->setDownDisplacement(maxWaveHeight);
   }
-  float getMaxLevel() const
-  {
-    if (render)
-      return render->getMaxLevel();
-    return waterLevel;
-  }
+  float getMinLevel() const { return minWaterLevel; }
+  float getMaxLevel() const { return maxWaterLevel; }
   void setMinMaxLevel(float min_level, float max_level)
   {
+    minWaterLevel = min_level;
+    maxWaterLevel = max_level;
+    if (waterHeightmap)
+      maxWaterLevel = max(maxWaterLevel, waterHeightmap->heightMax);
+
     if (render)
-      render->setMinMaxLevel(min_level, max_level);
+      render->setMinMaxLevel(minWaterLevel, maxWaterLevel);
+    if (renderChop)
+      renderChop->setMinMaxLevel(minWaterLevel, maxWaterLevel);
   }
   float getHeight(const Point3 &point) const
   {
+    if (chopEnabled() && physicsChop)
+    {
+      vec4f disp = physicsChop->getHeightmapDataBilinear(point.x, point.z);
+      return v_extract_z(disp);
+    }
     if (physics)
     {
       vec4f disp = physics->getHeightmapDataBilinear(point.x, point.z);
       return v_extract_z(disp);
     }
-    return waterLevel;
+    return minWaterLevel;
   }
-  float getMaxWaveHeight() const { return physics ? physics->getMaxWaveHeight() : 0.0f; }
-  float getSignificantWaveHeight() const { return physics ? physics->getSignificantWaveHeight() : 0.0f; }
+  float getMinHeight() const
+  {
+    if (render)
+      return render->getMinHeight();
+    if (renderChop)
+      return renderChop->getMinHeight();
+    return minWaterLevel;
+  }
+  float getMaxHeight() const
+  {
+    if (render)
+      return render->getMaxHeight();
+    if (renderChop)
+      return renderChop->getMaxHeight();
+    return maxWaterLevel;
+  }
+  float getMaxWaveHeight() const
+  {
+    if (chopEnabled())
+      return physicsChop ? physicsChop->getMaxWaveHeight() : 0.0f;
+    else
+      return physics ? physics->getMaxWaveHeight() : 0.0f;
+  }
+  float getSignificantWaveHeight() const
+  {
+    if (chopEnabled())
+      return physicsChop ? physicsChop->getSignificantWaveHeight() : 0.0f;
+    else
+      return physics ? physics->getSignificantWaveHeight() : 0.0f;
+  }
+
+  bool chopEnabled() const { return chopWaterGenerator && convar::chop_gen; }
+
+  WaterRenderCommon &getRenderCommon() { return renderCommon; }
+  const WaterRenderCommon &getRenderCommon() const { return renderCommon; }
+
   WaterNVRender *getRender() const { return render; }
   WaterNVPhysics *getPhysics() const { return physics; }
+
+  ChopWaterGenerator *getChopWaterGen() const { return chopWaterGenerator; }
+  ChopWaterRender *getRenderChop() const { return renderChop; }
+  ChopWaterPhysics *getPhysicsChop() const { return physicsChop; }
 };
 
 #if DAGOR_DBGLEVEL > 0
@@ -706,16 +940,23 @@ void init() { init_nv_wave_works(); }
 void close() { close_nv_wave_works(); }
 
 FFTWater *create_water(RenderQuality quality, float period, int res_bits, bool depth_renderer, bool ssr_renderer,
-  bool one_to_four_cascades, int min_render_res_bits, RenderQuality geom_quality, bool water_heightmap_draw_patches)
+  bool one_to_four_cascades, int min_render_res_bits, RenderQuality geom_quality, bool water_heightmap_draw_patches,
+  int enforce_render_cascade_count, bool chop_generator_init)
 {
   FFTWater *water = new FFTWater(fft_water::DEFAULT_NUM_CASCADES, min_render_res_bits);
   water->setFFTRenderResolution(res_bits);
   water->setPeriod(period);
   if (quality != DONT_RENDER)
-    water->initRender(quality, geom_quality != RenderQuality::UNDEFINED ? geom_quality : quality, depth_renderer, ssr_renderer,
-      one_to_four_cascades, water_heightmap_draw_patches);
+    water->initRender(quality, geom_quality != RenderQuality::UNDEFINED ? geom_quality : min(quality, RENDER_GOOD), depth_renderer,
+      ssr_renderer, one_to_four_cascades, water_heightmap_draw_patches, enforce_render_cascade_count);
   water->initPhysics();
-  water->simulateAllAt(0);
+  water->simulateAllAt(0, false); // sim only FFT on creation
+
+  if (chop_generator_init)
+  {
+    water->initChopWaterGen();
+    water->initPhysicsChop();
+  }
 
 #if DAGOR_DBGLEVEL > 0
   water_consoleproc.demandInit();
@@ -725,274 +966,389 @@ FFTWater *create_water(RenderQuality quality, float period, int res_bits, bool d
 
   return water;
 }
-void init_render(FFTWater *handle, int quality, bool depth_renderer, bool ssr_renderer, bool one_to_four_cascades,
-  RenderQuality geom_quality, bool water_heightmap_draw_patches)
+void init_render(FFTWater *water, int quality, bool depth_renderer, bool ssr_renderer, bool one_to_four_cascades,
+  RenderQuality geom_quality, bool water_heightmap_draw_patches, int enforce_render_cascade_count)
 {
-  if (!handle)
+  if (!water)
     return;
   if (quality != DONT_RENDER)
-    handle->initRender(quality, geom_quality != RenderQuality::UNDEFINED ? geom_quality : quality, depth_renderer, ssr_renderer,
-      one_to_four_cascades, water_heightmap_draw_patches);
+    water->initRender(quality,
+      geom_quality != RenderQuality::UNDEFINED ? geom_quality : min(static_cast<RenderQuality>(quality), RenderQuality::RENDER_GOOD),
+      depth_renderer, ssr_renderer, one_to_four_cascades, water_heightmap_draw_patches, enforce_render_cascade_count);
   else
-    handle->closeRender();
+    water->closeRender();
 }
-bool one_to_four_render_enabled(const FFTWater *handle)
+bool one_to_four_render_enabled(const FFTWater *water)
 {
-  if (handle && handle->getRender())
-    return handle->getRender()->getOneToFourCascades();
+  if (water && water->getRender())
+    return water->getRender()->getOneToFourCascades();
   return false;
 }
-void set_grid_lod0_additional_tesselation(FFTWater *a, float amount)
+void set_grid_lod0_additional_tesselation(FFTWater *water, float amount)
 {
-  if (a)
-    a->getRender()->setGridLod0AdditionalTesselation(amount);
+  if (water && water->getRender())
+    water->getRender()->setGridLod0AdditionalTesselation(amount);
+  if (water && water->getRenderChop())
+    water->getRenderChop()->setGridLod0AdditionalTesselation(amount);
 }
-void set_grid_lod0_area_radius(FFTWater *a, float radius)
+void set_grid_lod0_area_radius(FFTWater *water, float radius)
 {
-  if (a)
-    a->getRender()->setLod0AreaSize(radius);
+  if (water && water->getRender())
+    water->getRender()->setLod0AreaSize(radius);
+  if (water && water->getRenderChop())
+    water->getRenderChop()->setLod0AreaSize(radius);
 }
-void set_period(FFTWater *a, float period)
+void set_last_lod_extension(FFTWater *water, float extension)
 {
-  if (a)
-    a->setPeriod(period);
+  if (water && water->getRender())
+    water->getRender()->setLastLodExtension(extension);
+  if (water && water->getRenderChop())
+    water->getRenderChop()->setLastLodExtension(extension);
 }
-float get_period(const FFTWater *handle) { return handle ? handle->getPeriod() : 0.f; }
-void delete_water(FFTWater *&a)
+void set_period(FFTWater *water, float period)
+{
+  if (water)
+    water->setPeriod(period);
+}
+float get_period(const FFTWater *water) { return water ? water->getPeriod() : 0.f; }
+void delete_water(FFTWater *&water)
 {
 #if DAGOR_DBGLEVEL > 0
-  if (water_consoleproc && water_consoleproc->water == a)
+  if (water_consoleproc && water_consoleproc->water == water)
     water_consoleproc->water = NULL;
 #endif
-  del_it(a);
+  del_it(water);
 }
-void set_render_quad(FFTWater *handle, const BBox2 &quad)
+void set_render_quad(FFTWater *water, const BBox2 &quad)
 {
-  if (handle && handle->getRender())
-    handle->getRender()->setRenderQuad(quad);
+  if (water && water->getRender())
+    water->getRender()->setRenderQuad(quad);
+  if (water && water->getRenderChop())
+    water->getRenderChop()->setRenderQuad(quad);
 }
-void simulate(FFTWater *handle, double time)
+void simulate(FFTWater *water, double time)
 {
-  if (!handle)
+  if (!water)
     return;
 
-  handle->simulateAllAt(time);
+  const bool chopEnabled = water->chopEnabled();
+  const bool hasAnyRenderer = water->getRender() || water->getRenderChop();
+
+  // update shader consts after changing generators
+  if (hasAnyRenderer && chopEnabled != water->getRenderCommon().getChopEnabled())
+  {
+    water->getRenderCommon().setMaxWaveHeight(water->getMaxWaveHeight());
+    water->getRenderCommon().setChopEnabled(chopEnabled);
+    water->updateHeightCullingWaveHeight();
+  }
+  // apply wind_speed_chop changed via convar
+  if (chopEnabled && water->getChopWaterGen() && fabs(water->getChopWaterGen()->getWindSpeed() - convar::wind_speed_chop) > 0.05f)
+  {
+    float fftSpeed;
+    Point2 windDir;
+    get_wind_speed(water, fftSpeed, windDir);
+    set_wind_speed(water, fftSpeed, convar::wind_speed_chop, windDir);
+  }
+
+  if (chopEnabled && !hasAnyRenderer) // server-case, for client see before_render
+  {
+    if (!water->getChopWaterGen() || !water->getPhysicsChop())
+    {
+      water->initChopWaterGen();
+      water->initPhysicsChop();
+    }
+    water->getChopWaterGen()->Update(water->getLastTime(), 0.0f, false);
+  }
+  water->simulateAllAt(time, chopEnabled);
 }
-void before_render(const FFTWater *handle)
+void before_render(const FFTWater *water, float scaled_dt)
 {
-  if (!handle->getRender())
-    return;
-  handle->getRender()->simulateAllAt(handle->getLastTime());
-  handle->getRender()->updateTexturesAll();
-  handle->getRender()->calculateGradients();
+  if (water->getRender() || water->getRenderChop())
+  {
+    ShaderGlobal::set_int(chop_water_enabledVarId, water->chopEnabled() ? 1 : 0);
+    water->getRenderCommon().setGlobalShaderConsts(water->chopEnabled());
+  }
+  if (water->chopEnabled())
+  {
+    if (water->getRenderChop()) // client-case
+    {
+      water->getChopWaterGen()->Update(water->getLastTime(), scaled_dt, water->getRenderChop()->isDetailWavesEnabled());
+    }
+  }
+  else
+  {
+    if (!water->getRender())
+      return;
+    water->getRender()->simulateAllAt(water->getLastTime());
+    water->getRender()->updateTexturesAll();
+    water->getRender()->calculateGradients();
+  }
 }
 
-float getGridLod0AreaSize(const FFTWater *handle)
+float getGridLod0AreaSize(const FFTWater *water)
 {
-  if (!handle->getRender())
+  if (water->chopEnabled() && water->getRenderChop())
+  {
+    return water->getRenderChop()->getLod0AreaSize();
+  }
+  if (!water->getRender())
     return 0.f;
-  return handle->getRender()->getLod0AreaSize();
+  return water->getRender()->getLod0AreaSize();
 }
 
-void setGridLod0AdditionalTesselation(FFTWater *handle, float additional_tesselation)
+void setGridLod0AdditionalTesselation(FFTWater *water, float additional_tesselation)
 {
-  if (handle->getRender() != NULL)
-    handle->getRender()->setGridLod0AdditionalTesselation(additional_tesselation);
+  if (water->getRender() != NULL)
+    water->getRender()->setGridLod0AdditionalTesselation(additional_tesselation);
+  if (water->getRenderChop() != NULL)
+    water->getRenderChop()->setGridLod0AdditionalTesselation(additional_tesselation);
 }
 
-void render(const FFTWater *handle, const Point3 &pos, TEXTUREID distance_tex_id, const Frustum &frustum,
+void render(const FFTWater *water, const Point3 &pos, TEXTUREID distance_tex_id, const Frustum &frustum, Occlusion *occlusion,
   const Driver3dPerspective &persp, int geom_lod_quality, int survey_id, IWaterDecalsRenderHelper *decals_renderer,
-  RenderMode render_mode)
+  RenderMode render_mode, eastl::function<bool(const Point3_vec4 &pos, const Point3_vec4 &posRB)> cullCb)
 {
   TIME_D3D_PROFILE(fft_water_render);
 
-  if (!handle->getRender())
-    return;
+  if (water->chopEnabled())
+  {
+    if (water->getRenderChop())
+      water->getRenderChop()->render(pos, distance_tex_id, geom_lod_quality, survey_id, frustum, occlusion, persp,
+        water->getRenderCommon(), decals_renderer, render_mode);
+  }
+  else
+  {
+    if (!water->getRender())
+      return;
+    // render() call runs begin_survey, because we have a fence inside function, fence cannot be between
+    // start survey and end survey. So here we should just call end_survey.
+    water->getRender()->render(pos, distance_tex_id, geom_lod_quality, survey_id, frustum, occlusion, persp, water->getRenderCommon(),
+      decals_renderer, render_mode, cullCb);
 
-  // render() call runs begin_survey, becouse we have a fence inside function, fence cannot be between
-  // start survey and end survey. So here we should just call end_survey.
-  handle->getRender()->render(pos, distance_tex_id, geom_lod_quality, survey_id, frustum, persp, decals_renderer, render_mode);
-
-  d3d::end_survey(survey_id);
+    d3d::end_survey(survey_id);
+  }
 }
 
-void prepare_refraction(FFTWater *handle, Texture *scene_target_tex)
+float get_level(const FFTWater *water) { return water->getLevel(); }
+void set_level(FFTWater *water, float level) { water->setLevel(level); }
+float get_min_level(const FFTWater *water) { return water->getMinLevel(); }
+float get_max_level(const FFTWater *water) { return water->getMaxLevel(); }
+void set_min_max_level(FFTWater *water, float min_level, float max_level) { water->setMinMaxLevel(min_level, max_level); }
+float get_height(const FFTWater *water, const Point3 &point) { return water->getHeight(point); }
+float get_min_height(const FFTWater *water) { return water->getMinHeight(); }
+float get_max_height(const FFTWater *water) { return water->getMaxHeight(); }
+float get_max_wave_height(const FFTWater *water) { return water->getMaxWaveHeight(); }
+float get_significant_wave_height(const FFTWater *water) { return water->getSignificantWaveHeight(); }
+void set_wave_displacement_distance(FFTWater *water, const Point2 &value)
 {
-  if (!handle->getRender())
-    return;
-  handle->getRender()->prepareRefraction(scene_target_tex);
-}
-float get_level(const FFTWater *handle) { return handle->getLevel(); }
-void set_level(FFTWater *handle, float level) { handle->setLevel(level); }
-float get_min_level(const FFTWater *handle) { return handle->getMinLevel(); }
-float get_max_level(const FFTWater *handle) { return handle->getMaxLevel(); }
-void set_min_max_level(FFTWater *handle, float min_level, float max_level) { handle->setMinMaxLevel(min_level, max_level); }
-float get_height(const FFTWater *handle, const Point3 &point) { return handle->getHeight(point); }
-float get_max_wave(const FFTWater *handle) { return handle->getMaxWaveHeight(); }
-float get_significant_wave_height(const FFTWater *handle) { return handle->getSignificantWaveHeight(); }
-void set_wave_displacement_distance(FFTWater *handle, const Point2 &value)
-{
-  if (handle && handle->getRender())
-    handle->getRender()->setWaveDisplacementDistance(value);
+  if (water && water->getRender())
+    water->getRender()->setWaveDisplacementDistance(value);
 }
 
-void shore_enable(FFTWater *handle, bool enable)
+void shore_enable(FFTWater *water, bool enable)
 {
-  if (handle && handle->getRender())
-    handle->getRender()->shoreEnable(enable);
+  if (water && water->getRenderCommon().isInited())
+    water->getRenderCommon().shoreEnable(enable);
 }
 
-bool is_shore_enabled(const FFTWater *handle)
+bool is_shore_enabled(const FFTWater *water)
 {
-  if (handle && handle->getRender())
-    return handle->getRender()->isShoreEnabled();
+  if (water && water->getRenderCommon().isInited())
+    return water->getRenderCommon().isShoreEnabled();
   return false;
 }
 
-float get_shore_wave_threshold(const FFTWater *handle)
+float get_shore_wave_threshold(const FFTWater *water)
 {
-  if (handle && handle->getRender())
-    return handle->getRender()->getShoreWaveThreshold();
+  if (water && water->getRenderCommon().isInited())
+    return water->getRenderCommon().getShoreWaveThreshold();
   return 0;
 }
 
-void set_shore_wave_threshold(FFTWater *handle, float value)
+void set_shore_wave_threshold(FFTWater *water, float value)
 {
-  if (handle && handle->getRender())
-    handle->getRender()->setShoreWaveThreshold(value);
+  if (water && water->getRenderCommon().isInited())
+    water->getRenderCommon().setShoreWaveThreshold(value);
 }
 
-int get_fft_resolution(const FFTWater *handle)
+float get_shore_damp_min(const FFTWater *water)
 {
-  if (handle)
-    return handle->getFFTRenderResolution();
+  if (water && water->getRenderCommon().isInited())
+    return water->getRenderCommon().getShoreDampMin();
+  return 0.f;
+}
+
+void set_shore_damp_min(FFTWater *water, float value)
+{
+  if (water && water->getRenderCommon().isInited())
+    water->getRenderCommon().setShoreDampMin(value);
+}
+
+int get_fft_resolution(const FFTWater *water)
+{
+  if (water)
+    return water->getFFTRenderResolution();
   return TARGET_FFT_RESOLUTION;
 }
 
-void set_fft_resolution(FFTWater *handle, int res_bits)
+void set_fft_resolution(FFTWater *water, int res_bits)
 {
-  if (handle)
-    handle->setFFTRenderResolution(res_bits);
+  if (water)
+    water->setFFTRenderResolution(res_bits);
 }
 
-void reset_render(FFTWater *handle)
+void reset_render(FFTWater *water)
 {
-  if (handle)
-    handle->resetRender();
+  if (water)
+    water->resetRender();
 }
 
-int get_num_cascades(const FFTWater *handle)
+int get_num_cascades(const FFTWater *water)
 {
-  if (handle)
-    return handle->getNumCascades();
+  if (water)
+    return water->getNumCascades();
   return fft_water::DEFAULT_NUM_CASCADES;
 }
 
-void set_num_cascades(FFTWater *handle, int cascades)
+void set_num_cascades(FFTWater *water, int cascades)
 {
-  if (handle)
-    handle->setNumCascades(cascades);
+  if (water)
+    water->setNumCascades(cascades);
 }
 
-void set_render_quality(FFTWater *handle, int quality, bool depth_renderer, bool ssr_renderer)
+void set_render_quality(FFTWater *water, int quality, bool depth_renderer, bool ssr_renderer, int enforce_render_cascade_count)
 {
-  if (handle && handle->getRender() && handle->getRender()->getQuality() != quality)
-    handle->initRender(quality, handle->getRender()->getGeomQuality(), depth_renderer, ssr_renderer,
-      handle->getRender()->getOneToFourCascades(), handle->getRender()->isWaterHeightmapDrawPatches());
+  if (water && water->getRender() && water->getRender()->getQuality() != quality)
+    water->initRender(quality, water->getRender()->getGeomQuality(), depth_renderer, ssr_renderer,
+      water->getRender()->getOneToFourCascades(), water->getRender()->isWaterHeightmapDrawPatches(), enforce_render_cascade_count);
 }
 
-void setAnisotropy(FFTWater *handle, int aniso, float mip_bias)
+void setAnisotropy(FFTWater *water, int aniso, float mip_bias)
 {
-  if (handle && handle->getRender())
-    handle->getRender()->setAnisotropy(aniso, mip_bias);
+  if (water && water->getRender())
+    water->getRender()->setAnisotropy(aniso, mip_bias);
 }
 
-float get_small_wave_fraction(const FFTWater *handle)
+float get_small_wave_fraction(const FFTWater *water)
 {
-  if (handle)
-    return handle->getSmallWaveFraction();
+  if (water)
+    return water->getSmallWaveFraction();
   return 0.0f;
 }
 
-void set_small_wave_fraction(FFTWater *handle, float smallWaveFraction)
+void set_small_wave_fraction(FFTWater *water, float smallWaveFraction)
 {
-  if (handle)
-    handle->setSmallWaveFraction(smallWaveFraction);
+  if (water)
+    water->setSmallWaveFraction(smallWaveFraction);
 }
 
-float get_cascade_window_length(const FFTWater *handle)
+float get_cascade_window_length(const FFTWater *water)
 {
-  if (handle)
-    return handle->getCascadeWindowLength();
+  if (water)
+    return water->getCascadeWindowLength();
   return 0.0f;
 }
 
-void set_cascade_window_length(FFTWater *handle, float value)
+void set_cascade_window_length(FFTWater *water, float value)
 {
-  if (handle)
-    handle->setCascadeWindowLength(value);
+  if (water)
+    water->setCascadeWindowLength(value);
 }
 
-float get_cascade_facet_size(const FFTWater *handle)
+float get_cascade_facet_size(const FFTWater *water)
 {
-  if (handle)
-    return handle->getCascadeFacetSize();
+  if (water)
+    return water->getCascadeFacetSize();
   return 0.0f;
 }
 
-void set_cascade_facet_size(FFTWater *handle, float value)
+void set_cascade_facet_size(FFTWater *water, float value)
 {
-  if (handle)
-    handle->setCascadeFacetSize(value);
+  if (water)
+    water->setCascadeFacetSize(value);
 }
 
-SimulationParams get_simulation_params(const FFTWater *handle)
+SimulationParams get_simulation_params(const FFTWater *water)
 {
-  if (handle)
-    return handle->getSimulationParams();
+  if (water)
+    return water->getSimulationParams();
   return SimulationParams();
 }
 
-void set_simulation_params(FFTWater *handle, const SimulationParams &scales)
+void set_simulation_params(FFTWater *water, const SimulationParams &scales)
 {
-  if (handle)
-    handle->setSimulationParams(scales);
+  if (water)
+    water->setSimulationParams(scales);
 }
 
-void set_foam(FFTWater *handle, const FoamParams &params)
+void set_foam(FFTWater *water, const FoamParams &params)
 {
-  if (handle && handle->getRender())
-    handle->getRender()->setFoamParams(params);
+  if (water && water->getRender())
+    water->getRender()->setFoamParams(params);
 }
 
-FoamParams get_foam(const FFTWater *handle)
+FoamParams get_foam(const FFTWater *water)
 {
-  if (handle && handle->getRender())
-    return handle->getRender()->getFoamParams();
+  if (water && water->getRender())
+    return water->getRender()->getFoamParams();
   return FoamParams();
 }
 
-void enable_graphic_feature(FFTWater *handle, GraphicFeature feature, bool enable)
+void set_chop_water_props(FFTWater *water, const ChopWaterProps &props)
+{
+  if (water && water->getChopWaterGen())
+  {
+    water->getChopWaterGen()->setProps(props);
+    const float curChopWindSpeed = water->getChopWaterGen()->getWindSpeed();
+    if (fabs(curChopWindSpeed - props.wind_speed) > 0.05f)
+    {
+      float fftSpeed;
+      Point2 windDir;
+      get_wind_speed(water, fftSpeed, windDir);
+      set_wind_speed(water, fftSpeed, props.wind_speed, windDir);
+    }
+  }
+}
+
+ChopWaterProps get_chop_water_props(const FFTWater *water)
+{
+  if (water && water->getChopWaterGen())
+    return water->getChopWaterGen()->getProps();
+  return ChopWaterProps();
+}
+
+void create_chop_water_renderer(FFTWater *water, TEXTUREID chopWaterDetailCombined, TEXTUREID foamDissolveTex,
+  TEXTUREID whiteNoise64Tex, TEXTUREID detailWaveletTexture)
+{
+  water->getChopWaterGen()->setWaveletTextures(chopWaterDetailCombined, foamDissolveTex, whiteNoise64Tex, detailWaveletTexture);
+  if (!water->getRenderChop())
+    water->initRenderChop();
+}
+
+void set_chop_water_enabled(bool chop_enabled) { convar::chop_gen = chop_enabled; }
+bool get_chop_water_enabled() { return convar::chop_gen; }
+
+void enable_graphic_feature(FFTWater *water, GraphicFeature feature, bool enable)
 {
 #if DAGOR_DBGLEVEL > 0
   if (feature < 0 || feature >= GRAPHIC_FEATURE_END)
     return;
-  if (handle && handle->getRender())
-    handle->getRender()->enableGraphicFeature(feature, enable);
+  if (water && water->getRender())
+    water->getRender()->enableGraphicFeature(feature, enable);
 #else
-  G_UNREFERENCED(handle);
+  G_UNREFERENCED(water);
   G_UNREFERENCED(feature);
   G_UNREFERENCED(enable);
 #endif
 }
 
-void get_cascade_period(const FFTWater *handle, int cascade_no, float &out_period, float &out_window_in, float &out_window_out)
+void get_cascade_period(const FFTWater *water, int cascade_no, float &out_period, float &out_window_in, float &out_window_out)
 {
 #if DAGOR_DBGLEVEL > 0
-  if (handle && handle->getRender())
-    handle->getRender()->getCascadePeriod(cascade_no, out_period, out_window_in, out_window_out);
+  if (water && water->getRender())
+    water->getRender()->getCascadePeriod(cascade_no, out_period, out_window_in, out_window_out);
 #else
-  G_UNREFERENCED(handle);
+  G_UNREFERENCED(water);
   G_UNREFERENCED(cascade_no);
   G_UNREFERENCED(out_period);
   G_UNREFERENCED(out_window_in);
@@ -1000,109 +1356,215 @@ void get_cascade_period(const FFTWater *handle, int cascade_no, float &out_perio
 #endif
 }
 
-void set_current_time(FFTWater *handle, double time) { return handle->setCurrentTime(time); }
-void reset_physics(FFTWater *handle) { handle->resetPhysics(); }
-void wait_physics(FFTWater *handle) { handle->waitPhysics(); }
-bool validate_next_time_tick(const FFTWater *handle, double next_time) { return handle->validateNextTimeTick(next_time); }
-int intersect_segment(const FFTWater *handle, const Point3 &start, const Point3 &end, float &result)
+void set_current_time(FFTWater *water, double time) { return water->setCurrentTime(time); }
+void reset_physics(FFTWater *water) { water->resetPhysics(); }
+void wait_physics(FFTWater *water) { water->waitPhysics(); }
+bool validate_next_time_tick(const FFTWater *water, double next_time) { return water->validateNextTimeTick(next_time); }
+int intersect_segment(const FFTWater *water, const Point3 &start, const Point3 &end, float &result)
 {
-  return handle->getPhysics()->intersectSegment(handle->getCurrentTime(), start, end, result);
+  if (water->chopEnabled())
+  {
+    return water->getPhysicsChop()->intersectSegment(water->getCurrentTime(), start, end, result);
+  }
+  return water->getPhysics()->intersectSegment(water->getCurrentTime(), start, end, result);
 }
-int intersect_segment_at_time(const FFTWater *handle, double time, const Point3 &start, const Point3 &end, float &result)
+int intersect_segment_at_time(const FFTWater *water, double time, const Point3 &start, const Point3 &end, float &result)
 {
-  return handle->getPhysics()->intersectSegment(time, start, end, result);
+  if (water->chopEnabled())
+  {
+    return water->getPhysicsChop()->intersectSegment(time, start, end, result);
+  }
+  return water->getPhysics()->intersectSegment(time, start, end, result);
 }
-int getHeightAboveWater(const FFTWater *handle, const Point3 &in_point, float &result, bool matchRenderGrid)
+int getHeightAboveWater(const FFTWater *water, const Point3 &in_point, float &result, bool matchRenderGrid)
 {
-  return handle->getPhysics()->getHeightAboveWater(handle->getCurrentTime(), in_point, result, nullptr, matchRenderGrid);
+  if (water->chopEnabled())
+  {
+    return water->getPhysicsChop()->getHeightAboveWater(water->getCurrentTime(), in_point, result, nullptr, matchRenderGrid);
+  }
+  return water->getPhysics()->getHeightAboveWater(water->getCurrentTime(), in_point, result, nullptr, matchRenderGrid);
 }
-void setRenderParamsToPhysics(FFTWater *handle)
+void setRenderParamsToPhysics(FFTWater *water)
 {
-  if (!handle->getRender() || !handle->getPhysics())
+  if (!water->getRender())
     return;
   float gridAlign;
   Point2 gridOffset;
-  handle->getRender()->getGridDataAtCamera(gridAlign, gridOffset);
-  handle->getPhysics()->setRenderParams(gridAlign, gridOffset);
+  water->getRender()->getGridDataAtCamera(gridAlign, gridOffset);
+  if (water->getPhysics())
+    water->getPhysics()->setRenderParams(gridAlign, gridOffset);
+  if (water->getPhysicsChop())
+    water->getPhysicsChop()->setRenderParams(gridAlign, gridOffset);
 }
-int getHeightAboveWaterAtTime(const FFTWater *handle, double at_time, const Point3 &in_point, float &result, Point3 *displacement)
+int getHeightAboveWaterAtTime(const FFTWater *water, double at_time, const Point3 &in_point, float &result, Point3 *displacement)
 {
-  return handle->getPhysics()->getHeightAboveWater(at_time, in_point, result, displacement);
+  if (water->chopEnabled())
+  {
+    return water->getPhysicsChop()->getHeightAboveWater(at_time, in_point, result, displacement);
+  }
+  return water->getPhysics()->getHeightAboveWater(at_time, in_point, result, displacement);
 }
-void get_wind_speed(const FFTWater *handle, float &out_speed, Point2 &out_wind_dir) { handle->getWind(out_speed, out_wind_dir); }
-void set_wind_speed(FFTWater *handle, float speed, const Point2 &wind_dir) { handle->setWind(speed, wind_dir); }
-void get_roughness(const FFTWater *handle, float &out_roughness_base, float &out_cascades_roughness_base)
+void get_wind_speed(const FFTWater *water, float &out_speed, Point2 &out_wind_dir) { water->getWind(out_speed, out_wind_dir); }
+void set_wind_speed(FFTWater *water, float speed, float chop_wind_speed, const Point2 &wind_dir)
+{
+  water->setWind(speed, chop_wind_speed, wind_dir);
+}
+void get_roughness(const FFTWater *water, float &out_roughness_base, float &out_cascades_roughness_base)
 {
   out_roughness_base = 0;
   out_cascades_roughness_base = 0;
-  if (handle && handle->getRender())
-    handle->getRender()->getRoughness(out_roughness_base, out_cascades_roughness_base);
+  if (water && water->getRender())
+    water->getRender()->getRoughness(out_roughness_base, out_cascades_roughness_base);
 }
-void set_roughness(FFTWater *handle, float roughness_base, float cascades_roughness_base)
+void set_roughness(FFTWater *water, float roughness_base, float cascades_roughness_base)
 {
-  if (handle && handle->getRender())
-    handle->getRender()->setRoughness(roughness_base, cascades_roughness_base);
+  if (water && water->getRender())
+    water->getRender()->setRoughness(roughness_base, cascades_roughness_base);
 }
 
-void setVertexSamplers(FFTWater *handle, int samplersCount)
+void setVertexSamplers(FFTWater *water, int samplersCount)
 {
-  if (!handle->getRender())
+  if (!water->getRender()) // FFT only
     return;
-  handle->getRender()->setVertexSamplers(samplersCount);
+  water->getRender()->setVertexSamplers(samplersCount); // FFT only
 }
-int setWaterCell(FFTWater *handle, float water_cell_size, bool auto_set_samplers_cnt)
+int setWaterCell(FFTWater *water, float water_cell_size, bool auto_set_samplers_cnt)
 {
-  if (!handle->getRender())
+  if (!water->getRender())
     return 0;
-  return handle->getRender()->setWaterCell(water_cell_size, auto_set_samplers_cnt);
+  return water->getRender()->setWaterCell(water_cell_size, auto_set_samplers_cnt);
 }
-void set_water_dim(FFTWater *handle, int dim_bits)
+void set_water_dim(FFTWater *water, int dim_bits)
 {
-  if (!handle->getRender())
-    return;
-  return handle->getRender()->setWaterDim(dim_bits);
-}
-
-void setWakeHtTex(FFTWater *handle, TEXTUREID wake_ht_tex_id)
-{
-  if (handle->getRender())
-    handle->getRender()->setWakeHtTex(wake_ht_tex_id);
+  if (water->getRender())
+    water->getRender()->setWaterDim(dim_bits);
+  if (water->getRenderChop())
+    water->getRenderChop()->setWaterDim(dim_bits);
 }
 
-void force_actual_waves(FFTWater *handle, bool enforce)
+float get_render_significant_wave_height(FFTWater *water)
 {
-  if (handle->getRender())
+  if (water && water->getRender())
+    return water->getRender()->getSignificantWaveHeight();
+  return 0;
+}
+
+void setWakeHtTex(FFTWater *water, TEXTUREID wake_ht_tex_id) { water->getRenderCommon().setWakeHtTex(wake_ht_tex_id); }
+
+void force_actual_waves(FFTWater *water, bool enforce)
+{
+  if (water->getRender())
   {
-    handle->getPhysics()->setForceActualWaves(enforce);
-    handle->getRender()->setForceTessellation(enforce);
+    water->getPhysics()->setForceActualWaves(enforce);
+    water->getRender()->setForceTessellation(enforce);
   }
 }
 
-fft_water::WaterFlowmap *get_flowmap(const FFTWater *handle)
+void force_physics_waves(FFTWater *water, bool enforce)
 {
-  if (handle)
-    return handle->getFlowmap();
+  if (water->getPhysics())
+    water->getPhysics()->setForceActualWaves(enforce);
+}
+
+void force_render_waves(FFTWater *water, bool enforce)
+{
+  if (water->getRender())
+    water->getRender()->setForceTessellation(enforce);
+}
+
+fft_water::WaterFlowmap *get_flowmap(const FFTWater *water)
+{
+  if (water)
+    return water->getFlowmap();
   return nullptr;
 }
 
-void create_flowmap(FFTWater *handle)
+void create_flowmap(FFTWater *water)
 {
-  if (handle)
-    handle->createFlowmap();
+  if (water)
+    water->createFlowmap();
 }
 
-void remove_flowmap(FFTWater *handle)
+void remove_flowmap(FFTWater *water)
 {
-  if (handle)
-    handle->removeFlowmap();
+  if (water)
+    water->removeFlowmap();
 }
 
-const fft_water::WaterHeightmap *get_heightmap(const FFTWater *handle) { return handle->getHeightmap(); }
-void set_heightmap(FFTWater *handle, eastl::unique_ptr<WaterHeightmap> &&heightmap) { handle->setHeightmap(eastl::move(heightmap)); }
-void remove_heightmap(FFTWater *handle) { handle->removeHeightmap(); }
+const fft_water::WaterHeightmap *get_heightmap(const FFTWater *water) { return water->getHeightmap(); }
+const HeightmapHeightCulling *get_heightmap_culling(const FFTWater *water) { return water->getHeightmapCulling(); }
+void set_heightmap(FFTWater *water, eastl::unique_ptr<WaterHeightmap> &&heightmap) { water->setHeightmap(eastl::move(heightmap)); }
+void remove_heightmap(FFTWater *water) { water->removeHeightmap(); }
+void set_heightmap_extra_boundings(FFTWater *water, const dag::Vector<BBox3> &extra_boundings)
+{
+  water->setHeightmapExtraBoundings(extra_boundings);
+}
+
+size_t WaterHeightmap::calcDumpSize() const
+{
+  return //
+    POW2_ALIGN(elem_size(pages) * pagesX * pagesY * PAGE_SIZE_PADDED * PAGE_SIZE_PADDED + elem_size(grid) * gridSize * gridSize, 4) +
+    elem_size(patchHeights) * PATCHES_GRID_SIZE * PATCHES_GRID_SIZE;
+}
+void WaterHeightmap::arrangeDataLayout(size_t dump_sz)
+{
+  G_ASSERT(dataPtr);
+  pages.set(POW2_ALIGN_PTR(dataPtr, 2, uint16_t), pagesX * pagesY * PAGE_SIZE_PADDED * PAGE_SIZE_PADDED);
+  grid.set(POW2_ALIGN_PTR(pages.end(), 2, uint16_t), gridSize * gridSize);
+  patchHeights.set(POW2_ALIGN_PTR(grid.end(), 4, Point2), PATCHES_GRID_SIZE * PATCHES_GRID_SIZE);
+  G_ASSERTF(uintptr_t(patchHeights.end()) <= uintptr_t(dataPtr) + dump_sz,
+    "data={%p..%p, %d} pages={%p..%p, %d} grid={%p..%p, %d} patchHeights={%p..%p, %d}", //
+    dataPtr, dump_sz + (char *)dataPtr, dump_sz, pages.data(), pages.end(), pages.size(), grid.data(), grid.end(), grid.size(),
+    patchHeights.data(), patchHeights.end(), patchHeights.size());
+}
+void WaterHeightmap::loadData(IGenLoad &crd)
+{
+  unsigned fmt = 0;
+  crd.beginBlock(&fmt);
+  IGenLoad *zcrd = NULL;
+  if (fmt == btag_compr::OODLE)
+    zcrd = new (alloca(sizeof(OodleLoadCB)), _NEW_INPLACE) OodleLoadCB(crd, crd.getBlockRest(), data_size(pages) + data_size(grid));
+  else if (fmt == btag_compr::ZSTD)
+    zcrd = new (alloca(sizeof(ZstdLoadCB)), _NEW_INPLACE) ZstdLoadCB(crd, crd.getBlockRest());
+  else
+    zcrd = new (alloca(sizeof(LzmaLoadCB)), _NEW_INPLACE) LzmaLoadCB(crd, crd.getBlockRest());
+
+  uint16_t *pages_data = const_cast<uint16_t *>(pages.data());
+  uint16_t *grid_data = const_cast<uint16_t *>(grid.data());
+  zcrd->read(pages_data, data_size(pages));
+  zcrd->read(grid_data, data_size(grid));
+  zcrd->ceaseReading();
+  zcrd->~IGenLoad();
+  for (int w = pagesX * PAGE_SIZE_PADDED, h = pagesY * PAGE_SIZE_PADDED, y = 0; y < h; ++y, pages_data += w)
+    for (int x = 1; x < w; ++x)
+      pages_data[x] = (uint16_t)(int(pages_data[x]) + pages_data[x - 1]);
+  crd.endBlock();
+  int rest = crd.getBlockRest();
+  if (rest >= data_size(patchHeights))
+    crd.readExact(const_cast<Point2 *>(patchHeights.data()), data_size(patchHeights));
+  else
+  {
+    memset(const_cast<Point2 *>(patchHeights.data()), 0, data_size(patchHeights));
+    logerr("Missing water heightmap patches data. Level re-export is needed for correct water heightmap rendering");
+  }
+}
+WaterHeightmap::~WaterHeightmap()
+{
+  pages.reset();
+  grid.reset();
+  patchHeights.reset();
+  if (dataPtr && sharedMem && sharedMem->doesPtrBelong(dataPtr))
+    sharedMem->releasePtr(SM_DATA_TAG, dataPtr);
+  else if (dataPtr)
+    memfree(dataPtr, midmem);
+  extraBoundings.clear();
+}
 
 void load_heightmap(IGenLoad &loadCb, FFTWater *water)
 {
+  char sm_ptr_name[256];
+  SNPRINTF(sm_ptr_name, sizeof(sm_ptr_name), "%s:%X", loadCb.getTargetName(), loadCb.tell());
+
   eastl::unique_ptr<WaterHeightmap> heightmap(new WaterHeightmap());
   heightmap->gridSize = loadCb.readInt();
   heightmap->pagesX = loadCb.readInt();
@@ -1115,56 +1577,63 @@ void load_heightmap(IGenLoad &loadCb, FFTWater *water)
   heightmap->tcOffsetScale.z = loadCb.readReal();
   heightmap->tcOffsetScale.w = loadCb.readReal();
 
-  heightmap->pages.resize(heightmap->pagesX * heightmap->pagesY * heightmap->PAGE_SIZE_PADDED * heightmap->PAGE_SIZE_PADDED);
-  heightmap->grid.resize(heightmap->gridSize * heightmap->gridSize);
-  uint16_t *pages_data = heightmap->pages.data();
-  uint16_t *grid_data = heightmap->grid.data();
-  IGenLoad *zcrd_p = NULL;
-  unsigned fmt = 0;
-  loadCb.beginBlock(&fmt);
-  if (fmt == btag_compr::OODLE)
-    zcrd_p = new (alloca(sizeof(OodleLoadCB)), _NEW_INPLACE)
-      OodleLoadCB(loadCb, loadCb.getBlockRest(), (heightmap->pages.size() + heightmap->grid.size()) * sizeof(uint16_t));
-  else if (fmt == btag_compr::ZSTD)
-    zcrd_p = new (alloca(sizeof(ZstdLoadCB)), _NEW_INPLACE) ZstdLoadCB(loadCb, loadCb.getBlockRest());
-  else
-    zcrd_p = new (alloca(sizeof(LzmaLoadCB)), _NEW_INPLACE) LzmaLoadCB(loadCb, loadCb.getBlockRest());
-  IGenLoad &zcrd = *zcrd_p;
-  zcrd.read(pages_data, heightmap->pages.size() * sizeof(uint16_t));
-  zcrd.read(grid_data, heightmap->grid.size() * sizeof(uint16_t));
-  zcrd.ceaseReading();
-  zcrd.~IGenLoad();
-  int h = heightmap->pagesY * heightmap->PAGE_SIZE_PADDED;
-  int w = heightmap->pagesX * heightmap->PAGE_SIZE_PADDED;
-  for (int y = 0; y < h; ++y, pages_data += w)
-    for (int x = 1; x < w; ++x)
-      pages_data[x] = (uint16_t)(int(pages_data[x]) + pages_data[x - 1]);
-  loadCb.endBlock();
-  int patchHeightsSize = heightmap->PATCHES_GRID_SIZE * heightmap->PATCHES_GRID_SIZE;
-  heightmap->patchHeights.resize(patchHeightsSize);
-  int rest = loadCb.getBlockRest();
-  if (rest >= patchHeightsSize * sizeof(Point2))
-    loadCb.readExact(heightmap->patchHeights.data(), heightmap->patchHeights.size() * sizeof(Point2));
-  else
-    logerr("Missing water heightmap patches data. Level re-export is needed for correct water heightmap rendering");
+  size_t dump_sz = heightmap->calcDumpSize();
+  if (GlobalSharedMemStorage *sm = WaterHeightmap::sharedMem)
+  {
+    bool smNew = false;
+    heightmap->dataPtr = sm->findOrAlloc(sm_ptr_name, WaterHeightmap::SM_DATA_TAG, dump_sz, smNew);
+    if (heightmap->dataPtr && !smNew)
+    {
+      logmessage(_MAKE4C('SHMM'), "reusing Water-HMAP dump from shared mem: %p, %dK, '%s'", heightmap->dataPtr, dump_sz >> 10,
+        sm_ptr_name);
+      G_ASSERTF_RETURN(dump_sz <= sm->getPtrSize(heightmap->dataPtr), , "dump_sz=%d, foundPtrSize=%d", dump_sz,
+        sm->getPtrSize(heightmap->dataPtr));
+      heightmap->arrangeDataLayout(dump_sz);
+      return set_heightmap(water, eastl::move(heightmap));
+    }
+    if (heightmap->dataPtr)
+    {
+      logmessage(_MAKE4C('SHMM'), "allocated Water-HMAP dump in shared mem: %p, %dK, '%s' (mem %lluK/%lluK, rec=%d)",
+        heightmap->dataPtr, dump_sz >> 10, sm_ptr_name, ((uint64_t)sm->getMemUsed()) >> 10, ((uint64_t)sm->getMemSize()) >> 10,
+        sm->getRecUsed());
+      heightmap->arrangeDataLayout(dump_sz);
+      heightmap->loadData(loadCb);
+      mark_global_shared_mem_readonly(heightmap->dataPtr, dump_sz, true);
+      sm->markPtrDataReady(heightmap->dataPtr);
+      return set_heightmap(water, eastl::move(heightmap));
+    }
+    logmessage(_MAKE4C('SHMM'),
+      "failed to allocate HMAP dump in shared mem: %p, %dK, '%s' (mem %lluK/%lluK, rec=%d); "
+      "falling back to conventional allocator",
+      heightmap->dataPtr, dump_sz >> 10, sm_ptr_name, ((uint64_t)sm->getMemUsed()) >> 10, ((uint64_t)sm->getMemSize()) >> 10,
+      sm->getRecUsed());
+  }
+  if (!heightmap->dataPtr)
+    heightmap->dataPtr = memalloc(dump_sz, midmem);
+  G_ASSERT_RETURN(heightmap->dataPtr, );
+  heightmap->arrangeDataLayout(dump_sz);
+  heightmap->loadData(loadCb);
   set_heightmap(water, eastl::move(heightmap));
 }
 
-void WaterHeightmap::getHeightmapDataBilinear(float x, float z, float &result) const
+bool WaterHeightmap::getHeightmapDataBilinear(float x, float z, float &result) const
 {
+  [[maybe_unused]] const float srcX = x, srcZ = z;
   x = (x * tcOffsetScale.z + tcOffsetScale.x) * gridSize;
   z = (z * tcOffsetScale.w + tcOffsetScale.y) * gridSize;
-  if (x < 0.0f || z < 0.0f || x > gridSize - 1 || z > gridSize - 1)
-    return;
-  uint16_t cellData = grid[((int)z) * gridSize + (int)x];
+  G_ASSERTF(check_finite(x) && check_finite(z) && Point2(srcX, srcZ).lengthSq() < 1e12f, "bad hmap sample (%f, %f)", srcX, srcZ);
+  const int ix = (int)floorf(x), iz = (int)floorf(z);
+  if (unsigned(ix) >= unsigned(gridSize) || unsigned(iz) >= unsigned(gridSize))
+    return false;
+  uint16_t cellData = grid[iz * gridSize + ix];
   if (cellData == 0xFFFF)
-    return;
+    return false;
   int pageSize = PAGE_SIZE_PADDED;
   int gridX = (cellData >> 1) & 0x7F;
   int gridZ = (cellData >> 8) & 0xFF;
-  float crdScale = (cellData & 1) ? 1.0 : scale;
-  x = fmod(x / crdScale, 1.0);
-  z = fmod(z / crdScale, 1.0);
+  float crdScale = (cellData & 1) ? 1.0f : scale;
+  x = fmod(x / crdScale, 1.0f);
+  z = fmod(z / crdScale, 1.0f);
   float pageScale = (HEIGHTMAP_PAGE_SIZE / (HEIGHTMAP_PAGE_SIZE + 2.0f));
   float pageOffset = 1.0f / (HEIGHTMAP_PAGE_SIZE + 2.0f);
   x = (x * pageScale + pageOffset) * pageSize;
@@ -1186,7 +1655,159 @@ void WaterHeightmap::getHeightmapDataBilinear(float x, float z, float &result) c
   G_ASSERT(rt < pages.size());
   float height = (heights[lb] * wb + heights[lt] * wt) * wl + (heights[rb] * wb + heights[rt] * wt) * wr;
   result = round(height) * (heightScale / UINT16_MAX) + heightOffset;
+  return true;
 }
+
+bool WaterHeightmap::isFlat(int x, int z) const
+{
+  uint16_t cellData = grid[((int)z) * gridSize + (int)x];
+  return cellData == 0xFFFF;
+}
+
+bool WaterHeightmap::isDetailed(int x, int z) const
+{
+  uint16_t cellData = grid[((int)z) * gridSize + (int)x];
+  return cellData & 1;
+}
+
+float WaterHeightmap::getMaxUpwardDisplacement() const { return waveCullingMargin; }
+
+float WaterHeightmap::getMaxDownwardDisplacement() const { return waveCullingMargin; }
+
+IPoint2 WaterHeightmap::getHeightmapSize() const
+{
+  // Cell = page, return the count of pages
+  return {gridSize, gridSize};
+}
+
+Point3 WaterHeightmap::getHeightmapOffset() const
+{
+  return {-tcOffsetScale.x / tcOffsetScale.z, heightOffset, -tcOffsetScale.y / tcOffsetScale.w};
+}
+
+float WaterHeightmap::getHeightmapCellSize() const { return max(1.f / tcOffsetScale.z / gridSize, 1.f / tcOffsetScale.w / gridSize); }
+
+// Half-open texel span of one padded page axis covered by the grid cell's texel steps [k0, k1), for a page shared by
+// cells_per_page grid cells. This is the integer form of the fmod(x / crdScale, 1) remap in getHeightmapDataBilinear.
+// The span reaches one texel past the last covered one: the surface interpolates towards that neighbour, which is what the
+// 1-texel page padding exists for.
+static inline IPoint2 water_page_texel_span(int sub, int k0, int k1, int cells_per_page)
+{
+  const int page = WaterHeightmap::HEIGHTMAP_PAGE_SIZE;
+  const int padded = WaterHeightmap::PAGE_SIZE_PADDED;
+  const int begin = min((sub * page + k0) / cells_per_page + 1, padded - 2);
+  const int last = (sub * page + k1 - 1) / cells_per_page + 1;
+  return IPoint2(begin, clamp(last + 2, begin + 1, padded));
+}
+
+bool WaterHeightmap::getHeightmapHeightMinMaxInChunk(const Point2 &pos, const real &chunk_size, real &hmin, real &hmax) const
+{
+  G_ASSERTF(check_finite(pos.x) && check_finite(pos.y) && pos.lengthSq() < 1e12f, "bad hmap chunk query (%f, %f)", pos.x, pos.y);
+  const Point2 pageSize = Point2(1.f / tcOffsetScale.z, 1.f / tcOffsetScale.w) / gridSize;
+  const Point2 texelSize = pageSize / HEIGHTMAP_PAGE_SIZE;
+
+  // Add a texel to account for region of interpolation between two texels
+  const Point2 extendedStartPos = pos - texelSize;
+  const Point2 extendedChunkSize = Point2(chunk_size, chunk_size) + texelSize;
+
+  IPoint2 pageStart = IPoint2((extendedStartPos.x * tcOffsetScale.z + tcOffsetScale.x) * gridSize,
+    (extendedStartPos.y * tcOffsetScale.w + tcOffsetScale.y) * gridSize);
+  IPoint2 pageEnd = IPoint2(((extendedStartPos.x + extendedChunkSize.x) * tcOffsetScale.z + tcOffsetScale.x) * gridSize,
+    ((extendedStartPos.y + extendedChunkSize.y) * tcOffsetScale.w + tcOffsetScale.y) * gridSize);
+  if (pageStart.x >= gridSize || pageStart.y >= gridSize || pageEnd.x < 0 || pageEnd.y < 0 || pageEnd.x < pageStart.x ||
+      pageEnd.y < pageStart.y)
+  {
+    hmin = hmax = waterLevel;
+    return false;
+  }
+  pageStart = {max(0, pageStart.x), max(0, pageStart.y)};
+  pageEnd = {min(pageEnd.x, gridSize - 1), min(pageEnd.y, gridSize - 1)};
+
+  // Reduce over the raw page texels rather than calling getHeightmapDataBilinear per texel: whole-texel steps put every sample
+  // on a texel boundary, so its 2x2 blend never reaches past the immediate neighbour and the raw min/max over the span bounds
+  // it. Below is in global texel units (grid cell units scaled by the page texel count), half-open [texelStart, texelStop).
+  const float texelsPerCell = float(gridSize) * HEIGHTMAP_PAGE_SIZE;
+  const Point2 texelBegin = Point2((extendedStartPos.x * tcOffsetScale.z + tcOffsetScale.x) * texelsPerCell,
+    (extendedStartPos.y * tcOffsetScale.w + tcOffsetScale.y) * texelsPerCell);
+  const Point2 texelLimit = Point2(((extendedStartPos.x + extendedChunkSize.x) * tcOffsetScale.z + tcOffsetScale.x) * texelsPerCell,
+    ((extendedStartPos.y + extendedChunkSize.y) * tcOffsetScale.w + tcOffsetScale.y) * texelsPerCell);
+  const IPoint2 texelStart = IPoint2(floorf(texelBegin.x), floorf(texelBegin.y));
+  const IPoint2 texelStop = IPoint2(ceilf(texelLimit.x), ceilf(texelLimit.y));
+
+  // Reduce over the raw uint16 heights: round(h) * (heightScale / UINT16_MAX) + heightOffset is monotone in h, so converting
+  // only the two extremes at the end yields exactly the floats a per-texel conversion would have produced.
+  uint16_t texelMin = UINT16_MAX, texelMax = 0;
+  const int pageStride = PAGE_SIZE_PADDED * pagesX;
+
+  hmin = 1000000;
+  hmax = -1000000;
+  for (int pageY = pageStart.y; pageY <= pageEnd.y; ++pageY)
+  {
+    for (int pageX = pageStart.x; pageX <= pageEnd.x; ++pageX)
+    {
+      const uint16_t cellData = grid[pageY * gridSize + pageX];
+      // Flat (no-data) pages are rendered at the global water level, not at heightOffset, so treat such a page as a sample at
+      // waterLevel. Otherwise flat ocean gets a culling box offset from where it is actually drawn and pops out of the frustum.
+      if (cellData == 0xFFFF)
+      {
+        hmin = min(hmin, waterLevel);
+        hmax = max(hmax, waterLevel);
+        continue;
+      }
+
+      const int gridX = (cellData >> 1) & 0x7F;
+      const int gridZ = (cellData >> 8) & 0xFF;
+      // A non-detailed page is shared by scale x scale grid cells, so this cell only owns a HEIGHTMAP_PAGE_SIZE / scale
+      // sub-block of it.
+      const int cellsPerPage = (cellData & 1) ? 1 : max(scale, 1);
+
+      const int kx0 = max(texelStart.x - pageX * HEIGHTMAP_PAGE_SIZE, 0);
+      const int kx1 = min(texelStop.x - pageX * HEIGHTMAP_PAGE_SIZE, HEIGHTMAP_PAGE_SIZE);
+      const int kz0 = max(texelStart.y - pageY * HEIGHTMAP_PAGE_SIZE, 0);
+      const int kz1 = min(texelStop.y - pageY * HEIGHTMAP_PAGE_SIZE, HEIGHTMAP_PAGE_SIZE);
+      if (kx1 <= kx0 || kz1 <= kz0)
+        continue;
+
+      const IPoint2 spanX = water_page_texel_span(pageX % cellsPerPage, kx0, kx1, cellsPerPage);
+      const IPoint2 spanZ = water_page_texel_span(pageY % cellsPerPage, kz0, kz1, cellsPerPage);
+
+      const uint16_t *pageRow = pages.data() + (gridZ * PAGE_SIZE_PADDED + spanZ.x) * pageStride + gridX * PAGE_SIZE_PADDED;
+      G_ASSERT((gridZ * PAGE_SIZE_PADDED + spanZ.y - 1) * pageStride + gridX * PAGE_SIZE_PADDED + spanX.y - 1 < pages.size());
+      for (int tz = spanZ.x; tz < spanZ.y; ++tz, pageRow += pageStride)
+        for (int tx = spanX.x; tx < spanX.y; ++tx)
+        {
+          texelMin = min(texelMin, pageRow[tx]);
+          texelMax = max(texelMax, pageRow[tx]);
+        }
+    }
+  }
+
+  if (texelMin <= texelMax)
+  {
+    G_ASSERT(heightScale >= 0.0f);
+    const float toHeight = heightScale / UINT16_MAX;
+    hmin = min(hmin, texelMin * toHeight + heightOffset);
+    hmax = max(hmax, texelMax * toHeight + heightOffset);
+  }
+
+  BBox2 chunkBox(pos, pos + Point2(chunk_size, chunk_size));
+  for (int i = 0; i < extraBoundings.size(); i++)
+  {
+    const BBox3 &bbox = extraBoundings[i];
+    if ((chunkBox.lim[0].x <= bbox.lim[1].x) && (chunkBox.lim[0].y <= bbox.lim[1].z) && (chunkBox.lim[1].x >= bbox.lim[0].x) &&
+        (chunkBox.lim[1].y >= bbox.lim[0].z))
+    {
+      hmin = min(hmin, bbox.lim[0].y);
+      hmax = max(hmax, bbox.lim[1].y);
+    }
+  }
+
+  // No page contributed anything (every data page in range ended up with an empty texel span): fall back to the water level.
+  if (hmin > hmax)
+    hmin = hmax = waterLevel;
+  return true;
+}
+
 
 struct WaterQueryUser
 {
@@ -1399,4 +2020,24 @@ bool query_gpu_water_height(uint32_t query_handle, uint32_t &ref_query_result, c
   waterQueryUserCount = max(waterQueryUserCount, ref_query_result + 1);
   return userRef.hasResult;
 }
+
+#if DAGOR_DBGLEVEL > 0
+static void imguiWindow()
+{
+  using namespace convar;
+
+  bool chopGen = chop_gen;
+  if (ImGui::Checkbox("Chop generator enabled", &chopGen))
+    chop_gen = chopGen;
+
+  float chopWindSpeed = wind_speed_chop;
+  if (ImGui::SliderFloat("Chop wind speed", &chopWindSpeed, 0.0f, 10.0f, "%.2f"))
+    wind_speed_chop = chopWindSpeed;
+}
+
+REGISTER_IMGUI_WINDOW("Render", "Water", imguiWindow);
+#endif
+
 } // namespace fft_water
+
+GlobalSharedMemStorage *fft_water::WaterHeightmap::sharedMem = nullptr;

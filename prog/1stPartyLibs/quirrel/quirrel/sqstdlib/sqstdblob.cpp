@@ -16,9 +16,9 @@
 #define SETUP_BLOB(v) \
     SQBlob *self = NULL; \
     { if(SQ_FAILED(sq_getinstanceup(v,1,(SQUserPointer*)&self,(SQUserPointer)SQSTD_BLOB_TYPE_TAG))) \
-        return sq_throwerror(v,_SC("invalid type tag"));  } \
+        return sq_throwerror(v,"invalid type tag");  } \
     if(!self || !self->IsValid())  \
-        return sq_throwerror(v,_SC("the blob is invalid"));
+        return sq_throwerror(v,"the blob is invalid");
 
 
 static SQInteger _blob_resize(HSQUIRRELVM v)
@@ -27,7 +27,7 @@ static SQInteger _blob_resize(HSQUIRRELVM v)
     SQInteger size;
     sq_getinteger(v,2,&size);
     if(!self->Resize(size))
-        return sqstd_throwerrorf(v,_SC("resize failed, cur size=%d, requested=%d"), int(self->Len()), int(size));
+        return sqstd_throwerrorf(v,"resize failed, cur size=%d, requested=%d", int(self->Len()), int(size));
     return 0;
 }
 
@@ -73,7 +73,7 @@ static SQInteger _blob__set(HSQUIRRELVM v)
     sq_getinteger(v,2,&idx);
     sq_getinteger(v,3,&val);
     if(idx < 0 || idx >= self->Len())
-        return sq_throwerror(v,_SC("index out of range"));
+        return sq_throwerror(v,"index out of range");
     ((unsigned char *)self->GetBuf())[idx] = (unsigned char) val;
     sq_push(v,3);
     return 1;
@@ -91,7 +91,7 @@ static SQInteger _blob__get(HSQUIRRELVM v)
     }
     sq_getinteger(v,2,&idx);
     if(idx < 0 || idx >= self->Len())
-        return sq_throwerror(v,_SC("index out of range"));
+        return sq_throwerror(v,"index out of range");
     sq_pushinteger(v,((unsigned char *)self->GetBuf())[idx]);
     return 1;
 }
@@ -105,23 +105,23 @@ static SQInteger _blob__nexti(HSQUIRRELVM v)
     }
     SQInteger idx;
     if(SQ_SUCCEEDED(sq_getinteger(v, 2, &idx))) {
-        if(idx+1 < self->Len()) {
+        if(idx >= -1 && idx < self->Len() - 1) {
             sq_pushinteger(v, idx+1);
             return 1;
         }
         sq_pushnull(v);
         return 1;
     }
-    return sq_throwerror(v,_SC("internal error (_nexti) wrong argument type"));
+    return sq_throwerror(v,"internal error (_nexti) wrong argument type");
 }
 
 static SQInteger _blob__typeof(HSQUIRRELVM v)
 {
-    sq_pushstring(v,_SC("blob"),-1);
+    sq_pushstring(v,"blob",-1);
     return 1;
 }
 
-static SQInteger _blob_releasehook(SQUserPointer p, SQInteger SQ_UNUSED_ARG(size))
+static SQInteger _blob_releasehook(HSQUIRRELVM SQ_UNUSED_ARG(vm), SQUserPointer p, SQInteger SQ_UNUSED_ARG(size))
 {
     SQBlob *self = (SQBlob*)p;
     SQAllocContext alloc_ctx = self->_alloc_ctx;
@@ -137,7 +137,7 @@ static SQInteger _blob_constructor(HSQUIRRELVM v)
     if(nparam == 2) {
         sq_getinteger(v, 2, &size);
     }
-    if(size < 0) return sq_throwerror(v, _SC("cannot create blob with negative size"));
+    if(size < 0) return sq_throwerror(v, "cannot create blob with negative size");
     //SQBlob *b = new SQBlob(size);
 
     SQAllocContext alloc_ctx = sq_getallocctx(v);
@@ -145,7 +145,7 @@ static SQInteger _blob_constructor(HSQUIRRELVM v)
     if(SQ_FAILED(sq_setinstanceup(v,1,b))) {
         b->~SQBlob();
         sq_free(alloc_ctx,b,sizeof(SQBlob));
-        return sq_throwerror(v, _SC("cannot create blob"));
+        return sq_throwerror(v, "cannot create blob");
     }
     sq_setreleasehook(v,1,_blob_releasehook);
     return 0;
@@ -165,32 +165,37 @@ static SQInteger _blob__cloned(HSQUIRRELVM v)
     if(SQ_FAILED(sq_setinstanceup(v,1,thisone))) {
         thisone->~SQBlob();
         sq_free(alloc_ctx,thisone,sizeof(SQBlob));
-        return sq_throwerror(v, _SC("cannot clone blob"));
+        return sq_throwerror(v, "cannot clone blob");
     }
     sq_setreleasehook(v,1,_blob_releasehook);
     return 0;
 }
 
+static SQInteger _blob_tostring(HSQUIRRELVM v)
+{
+    return SQ_SUCCEEDED(sq_tostring(v, 1)) ? 1 : SQ_ERROR;
+}
+
 static SQInteger _blob_as_string(HSQUIRRELVM v)
 {
     SETUP_BLOB(v);
-    sq_pushstring(v, (const SQChar *)self->GetBuf(), self->Len() / sizeof(SQChar));
+    sq_pushstring(v, (const char *)self->GetBuf(), self->Len() / sizeof(char));
     return 1;
 }
 
-#define _DECL_BLOB_FUNC(name,nparams,typecheck) {_SC(#name),_blob_##name,nparams,typecheck}
-static const SQRegFunction _blob_methods[] = {
-    _DECL_BLOB_FUNC(constructor,-1,_SC("xn")),
-    _DECL_BLOB_FUNC(resize,2,_SC("xn")),
-    _DECL_BLOB_FUNC(swap2,1,_SC("x")),
-    _DECL_BLOB_FUNC(swap4,1,_SC("x")),
-    _DECL_BLOB_FUNC(as_string,-1,_SC("xn")),
-    _DECL_BLOB_FUNC(_set,3,_SC("xnn")),
-    _DECL_BLOB_FUNC(_get,2,_SC("x.")),
-    _DECL_BLOB_FUNC(_typeof,1,_SC("x")),
-    _DECL_BLOB_FUNC(_nexti,2,_SC("x")),
-    _DECL_BLOB_FUNC(_cloned,2,_SC("xx")),
-    {NULL,(SQFUNCTION)0,0,NULL}
+static const SQRegFunctionFromStr _blob_methods[] = {
+    { _blob_constructor, "constructor([size: int]): instance",      SQ_DOC("Creates a blob of the given size (default 0)") },
+    { _blob_resize,      "instance.resize(size: int)",              SQ_DOC("Resizes the blob to the given size") },
+    { _blob_swap2,       "instance.swap2()",                        SQ_DOC("Byte-swaps the blob contents as an array of 16-bit values") },
+    { _blob_swap4,       "instance.swap4()",                        SQ_DOC("Byte-swaps the blob contents as an array of 32-bit values") },
+    { _blob_as_string,   "instance.as_string(): string",            SQ_DOC("Returns the blob contents as a string") },
+    { _blob_tostring,    "instance.tostring(): string",             SQ_DOC("Allows calling .tostring() on blob instances (bypassing _get)")},
+    { _blob__set,        "instance._set(idx: int, val: int): int",  SQ_DOC("Sets the byte at the given index") },
+    { _blob__get,        "instance._get(idx: int): int",            SQ_DOC("Returns the byte at the given index") },
+    { _blob__typeof,     "instance._typeof(): string",              SQ_DOC("Returns 'blob'") },
+    { _blob__nexti,      "instance._nexti(prev): int|null",         SQ_DOC("Iterator support: returns the next index or null") },
+    { _blob__cloned,     "instance._cloned(other: instance)",       SQ_DOC("Clones the given blob into this instance") },
+    { NULL, NULL, NULL }
 };
 
 
@@ -201,7 +206,9 @@ static SQInteger _g_blob_casti2f(HSQUIRRELVM v)
 {
     SQInteger i;
     sq_getinteger(v,2,&i);
-    sq_pushfloat(v,*((const SQFloat *)&i));
+    SQFloat f = 0;
+    memcpy(&f, &i, sizeof(f));  //-V1086
+    sq_pushfloat(v,f);
     return 1;
 }
 
@@ -209,7 +216,9 @@ static SQInteger _g_blob_castf2i(HSQUIRRELVM v)
 {
     SQFloat f;
     sq_getfloat(v,2,&f);
-    sq_pushinteger(v,*((const SQInteger *)&f));
+    SQInteger result = 0;
+    memcpy(&result, &f, sizeof(f));  //-V1086
+    sq_pushinteger(v, result);
     return 1;
 }
 
@@ -241,14 +250,13 @@ static SQInteger _g_blob_swapfloat(HSQUIRRELVM v)
     return 1;
 }
 
-#define _DECL_GLOBALBLOB_FUNC(name,nparams,typecheck) {_SC(#name),_g_blob_##name,nparams,typecheck}
-static const SQRegFunction bloblib_funcs[]={
-    _DECL_GLOBALBLOB_FUNC(casti2f,2,_SC(".n")),
-    _DECL_GLOBALBLOB_FUNC(castf2i,2,_SC(".n")),
-    _DECL_GLOBALBLOB_FUNC(swap2,2,_SC(".n")),
-    _DECL_GLOBALBLOB_FUNC(swap4,2,_SC(".n")),
-    _DECL_GLOBALBLOB_FUNC(swapfloat,2,_SC(".n")),
-    {NULL,(SQFUNCTION)0,0,NULL}
+static const SQRegFunctionFromStr bloblib_funcs[] = {
+    { _g_blob_casti2f,   "pure fastcall casti2f(i: int): float",        SQ_DOC("Reinterprets the bits of an integer as a float") },
+    { _g_blob_castf2i,   "pure fastcall castf2i(f: number): int",       SQ_DOC("Reinterprets the bits of a float as an integer") },
+    { _g_blob_swap2,     "pure fastcall swap2(val: number): int",       SQ_DOC("Byte-swaps a 16-bit value") },
+    { _g_blob_swap4,     "pure fastcall swap4(val: number): int",       SQ_DOC("Byte-swaps a 32-bit value") },
+    { _g_blob_swapfloat, "pure fastcall swapfloat(val: number): float", SQ_DOC("Byte-swaps the bits of a float") },
+    { NULL, NULL, NULL }
 };
 
 SQRESULT sqstd_getblob(HSQUIRRELVM v,SQInteger idx,SQUserPointer *ptr)
@@ -272,7 +280,7 @@ SQUserPointer sqstd_createblob(HSQUIRRELVM v, SQInteger size)
 {
     SQInteger top = sq_gettop(v);
     sq_pushregistrytable(v);
-    sq_pushstring(v,_SC("std_blob"),-1);
+    sq_pushstring(v,"std_blob",-1);
     if(SQ_SUCCEEDED(sq_get(v,-2))) {
         sq_remove(v,-2); //removes the registry
         sq_push(v,1); // push the this
@@ -290,6 +298,6 @@ SQUserPointer sqstd_createblob(HSQUIRRELVM v, SQInteger size)
 
 SQRESULT sqstd_register_bloblib(HSQUIRRELVM v)
 {
-    return declare_stream(v,_SC("blob"),(SQUserPointer)SQSTD_BLOB_TYPE_TAG,_SC("std_blob"),_blob_methods,bloblib_funcs);
+    return declare_stream(v,"blob",(SQUserPointer)SQSTD_BLOB_TYPE_TAG,"std_blob",_blob_methods,bloblib_funcs);
 }
 

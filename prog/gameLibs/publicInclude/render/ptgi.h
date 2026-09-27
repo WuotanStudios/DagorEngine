@@ -45,7 +45,10 @@ void teardown();
 
 void turn_off();
 
-void render(bvh::ContextId context_id, const TMatrix4 &proj_tm, TEXTUREID depth, bool in_cockpit, const denoiser::TexMap &textures,
-  Quality quality, bool checkerboard = true);
+void render(bvh::ContextId context_id, const TMatrix4 &proj_tm, Texture *depth, bool in_cockpit, const denoiser::TexMap &textures,
+  Quality quality, bool checkerboard = true, bool half_rate = false);
+
+bool is_validation_layer_enabled();
+void render_validation_layer();
 
 } // namespace ptgi

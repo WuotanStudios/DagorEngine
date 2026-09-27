@@ -2,6 +2,7 @@
 
 #include "blk_cache.h"
 #include <device.h>
+#include <shaders/psoCacheVersion.h>
 
 
 using namespace drv3d_dx12;
@@ -319,7 +320,7 @@ bool drv3d_dx12::pipeline::FramebufferLayoutDeEncoder::decodeDX12(const DataBloc
     int lastParamIndex = blk.findParam(formatNameId);
     while (lastParamIndex != -1)
     {
-      FormatStore fmt(blk.getInt(lastParamIndex));
+      FormatStore fmt{.index = static_cast<uint8_t>(blk.getInt(lastParamIndex))};
       for (uint32_t i = 0; i < Driver3dRenderTarget::MAX_SIMRT; ++i)
       {
         auto bit = 1u << i;
@@ -338,7 +339,8 @@ bool drv3d_dx12::pipeline::FramebufferLayoutDeEncoder::decodeDX12(const DataBloc
     target.colorMsaaLevels = blk.getInt("colorMsaaLevels", 0);
   }
   if (blk.paramExists("depthStencilFormat"))
-    target.setDepthStencilAttachment(blk.getInt("depthMsaaLevel", 0), FormatStore(blk.getInt("depthStencilFormat", 0)));
+    target.setDepthStencilAttachment(blk.getInt("depthMsaaLevel", 0),
+      FormatStore{.index = static_cast<uint8_t>(blk.getInt("depthStencilFormat", 0))});
 
   hash = decode_hash(blk, target);
   return true;
@@ -405,93 +407,15 @@ bool drv3d_dx12::pipeline::FramebufferLayoutDeEncoder::encode(DataBlock &blk, co
       {
         continue;
       }
-      blk.addInt("colorFormats", source.colorFormats[i].wrapper.value);
+      blk.addInt("colorFormats", source.colorFormats[i].index);
     }
     blk.addInt("colorMsaaLevels", source.colorMsaaLevels);
   }
   if (0 != source.hasDepth)
   {
-    blk.setInt("depthStencilFormat", source.depthStencilFormat.wrapper.value);
+    blk.setInt("depthStencilFormat", source.depthStencilFormat.index);
     blk.setInt("depthMsaaLevel", source.depthMsaaLevel);
   }
-  return true;
-}
-
-bool drv3d_dx12::pipeline::GraphicsPipelineVariantDeEncoder::decode(const DataBlock &blk, GraphicsPipelineVariantState &target) const
-{
-  if (!blk.paramExists("renderState") || !blk.paramExists("outputFormat") || !blk.paramExists("inputLayout") ||
-      !blk.paramExists("primitiveTopology"))
-  {
-    return false;
-  }
-  target.staticRenderStateIndex = blk.getInt("renderState", 0);
-  target.framebufferLayoutIndex = blk.getInt("outputFormat", 0);
-  target.inputLayoutIndex = blk.getInt("inputLayout", 0);
-  target.isWireFrame = blk.getBool("wireFrame", false);
-  target.topology = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(blk.getInt("primitiveTopology", 0));
-  return true;
-}
-
-bool drv3d_dx12::pipeline::GraphicsPipelineVariantDeEncoder::encode(DataBlock &blk, const GraphicsPipelineVariantState &source,
-  int feature_set_id) const
-{
-  if (-1 != feature_set_id)
-  {
-    blk.addInt("featureSet", feature_set_id);
-  }
-  blk.setInt("renderState", source.staticRenderStateIndex);
-  blk.setInt("outputFormat", source.framebufferLayoutIndex);
-  blk.setInt("inputLayout", source.inputLayoutIndex);
-  blk.setBool("wireFrame", 0 != source.isWireFrame);
-  blk.setInt("primitiveTopology", static_cast<int>(source.topology));
-  return true;
-}
-
-bool drv3d_dx12::pipeline::MeshPipelineVariantDeEncoder::decode(const DataBlock &blk, MeshPipelineVariantState &target) const
-{
-  if (!blk.paramExists("renderState") || !blk.paramExists("outputFormat"))
-  {
-    return false;
-  }
-  target.staticRenderStateIndex = blk.getInt("renderState", 0);
-  target.framebufferLayoutIndex = blk.getInt("outputFormat", 0);
-  target.isWireFrame = blk.getBool("wireFrame", false);
-  return true;
-}
-
-bool drv3d_dx12::pipeline::MeshPipelineVariantDeEncoder::encode(DataBlock &blk, const MeshPipelineVariantState &source,
-  int feature_set_id) const
-{
-  if (-1 != feature_set_id)
-  {
-    blk.addInt("featureSet", feature_set_id);
-  }
-  blk.setInt("renderState", source.staticRenderStateIndex);
-  blk.setInt("outputFormat", source.framebufferLayoutIndex);
-  blk.setBool("wireFrame", 0 != source.isWireFrame);
-  return true;
-}
-
-bool drv3d_dx12::pipeline::ComputePipelineDeEncoder::decode(const DataBlock &blk, ComputePipelineIdentifier &target) const
-{
-  auto hash = blk.getStr("hash", nullptr);
-  if (!hash)
-  {
-    return false;
-  }
-  target.hash = dxil::HashValue::fromString(hash);
-  return true;
-}
-
-bool drv3d_dx12::pipeline::ComputePipelineDeEncoder::encode(DataBlock &blk, const ComputePipelineIdentifier &source,
-  int feature_set_id) const
-{
-  ComputePipelineIdentifierHashSet set = source;
-  if (-1 != feature_set_id)
-  {
-    blk.addInt("featureSet", feature_set_id);
-  }
-  blk.setStr("hash", set.hash);
   return true;
 }
 
@@ -522,10 +446,16 @@ bool drv3d_dx12::pipeline::SignatueHashDeEncoder::decode(const DataBlock &blk, c
   auto stampParamIndex = blk.findParam("stamp");
   if (DataBlock::TYPE_INT64 != blk.getParamType(stampParamIndex))
     return false;
+  auto psoCacheVersionParamIndex = blk.findParam("psoCacheVersion");
+  if (psoCacheVersionParamIndex >= 0 && DataBlock::TYPE_INT != blk.getParamType(psoCacheVersionParamIndex))
+    return false;
 
   target.name = blk.getBlockName();
   target.hash = blk.getStr(hashParamIndex);
   target.timestamp = blk.getInt64(stampParamIndex);
+  // set psoCacheVersion 0 by default to avoid breaking changes and invalidation of existing PSO cache
+  target.psoCacheVersion = blk.getInt("psoCacheVersion", 0);
+
   return true;
 }
 
@@ -536,16 +466,19 @@ bool drv3d_dx12::pipeline::SignatueHashDeEncoder::encode(DataBlock &blk, const c
     return false;
   subBlk->setStr("hash", source.hash.c_str());
   subBlk->setInt64("stamp", source.timestamp);
+  subBlk->setInt("psoCacheVersion", source.psoCacheVersion);
   return true;
 }
 
-bool drv3d_dx12::pipeline::SignatueHashDeEncoder::encode(DataBlock &blk, const char *name, const char *hash, int64_t timestamp) const
+bool drv3d_dx12::pipeline::SignatueHashDeEncoder::encode(DataBlock &blk, const char *name, const char *hash, int64_t timestamp,
+  int32_t psoCacheVersion) const
 {
   auto subBlk = blk.addNewBlock(name);
   if (!subBlk)
     return false;
   subBlk->setStr("hash", hash);
   subBlk->setInt64("stamp", timestamp);
+  subBlk->setInt("psoCacheVersion", psoCacheVersion);
   return true;
 }
 

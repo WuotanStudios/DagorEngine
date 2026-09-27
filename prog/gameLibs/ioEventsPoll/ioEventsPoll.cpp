@@ -232,7 +232,7 @@ public:
   void removeUpdateAction(ActionCallback *cb) override;
 
 private:
-  EvLoop *loop;
+  EvLoop *volatile loop;
 
   IOSubsMap readSubscribers;
   IOSubsMap writeSubscribers;
@@ -259,12 +259,15 @@ IOEventsPollImpl::~IOEventsPollImpl()
 {
   debug("[ioevents] IOEventsPollImpl::%s", __FUNCTION__);
   poll();
-  unsubscribe_io_all(loop, readSubscribers, EventFlag::READ);
-  unsubscribe_io_all(loop, writeSubscribers, EventFlag::WRITE);
-  unsubscribe_child_all(loop, childProcSubscribers);
+  if (EvLoop *l = interlocked_exchange_ptr<EvLoop>(loop, nullptr))
+  {
+    unsubscribe_io_all(l, readSubscribers, EventFlag::READ);
+    unsubscribe_io_all(l, writeSubscribers, EventFlag::WRITE);
+    unsubscribe_child_all(l, childProcSubscribers);
 
-  if (!useDefaultLoop)
-    ev_loop_destroy(loop);
+    if (!useDefaultLoop)
+      ev_loop_destroy(l);
+  }
 }
 
 void IOEventsPollImpl::addDelayedAction(eastl::unique_ptr<ActionCallback> cb) { delayedActions.add(eastl::move(cb)); }
@@ -378,6 +381,7 @@ IOEventsPollLoopImpl::IOEventsPollLoopImpl(int tick_ms, bool use_default_loop)
     loop = get_default_loop();
   else
     loop = ev_loop_new(0);
+  ev_set_syserr_cb(syserr_cb);
   ev_set_userdata(loop, this);
   ev_async_init(&wakeupEvent, dummy_cb); //-V1027
   ev_async_start(loop, &wakeupEvent);
@@ -406,9 +410,9 @@ void IOEventsPollLoopImpl::run()
   ev_check_stop(loop, &delayedActionsWatcher);
   ev_timer_stop(loop, &timerWatcher);
 
+  EvLoop *l = interlocked_exchange_ptr<EvLoop>(loop, nullptr);
   if (!useDefaultLoop)
-    ev_loop_destroy(loop);
-  loop = nullptr;
+    ev_loop_destroy(l);
   debug("[ioevents] IOEventsPollLoopImpl::%s finished", __FUNCTION__);
 
   if (onStoppedCb)
@@ -435,13 +439,17 @@ void IOEventsPollLoopImpl::stopSync()
   os_event_create(&event);
 
   os_event_t *pevent = &event;
-  stop(make_delayed_action([pevent]() mutable { os_event_set(pevent); }));
+  stop(make_delayed_action([pevent]() mutable { os_event_set_strict(pevent); }));
 
   os_event_wait(&event, OS_WAIT_INFINITE);
   os_event_destroy(&event);
 }
 
-void IOEventsPollLoopImpl::wakeup() { ev_async_send(loop, &wakeupEvent); }
+void IOEventsPollLoopImpl::wakeup()
+{
+  if (EvLoop *l = interlocked_acquire_load_ptr(loop))
+    ev_async_send(l, &wakeupEvent);
+}
 
 void IOEventsPollLoopImpl::performDelayedActions(EvLoop *loop, ev_check *, int)
 {

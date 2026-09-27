@@ -14,7 +14,9 @@
 #include <ioSys/dag_dataBlock.h>
 #include <3d/dag_lowLatency.h>
 #include <EASTL/fixed_vector.h>
-#include <osApiWrappers/dag_miscApi.h>
+#include <osApiWrappers/dag_winVersionQuery.h>
+#include <osApiWrappers/dag_versionQuery.h>
+#include <perfMon/dag_cpuFreq.h>
 
 #include <sl.h>
 #include <sl_helpers.h>
@@ -24,6 +26,12 @@
 #include <sl_dlss_d.h>
 #include <sl_dlss_g.h>
 #include <sl_reflex.h>
+
+// DLSS-NR only ships in the NDA SDK; projects on the public one must still build.
+#if __has_include(<sl_dlss_nr.h>)
+#include <sl_dlss_nr.h>
+#define HAS_STREAMLINE_DLSS_NR 1
+#endif
 
 #include <dxgi.h>
 #include <d3d12video.h>
@@ -46,7 +54,7 @@ SL_FUN_DECL(slIsFeatureLoaded);
 SL_FUN_DECL(slGetFeatureFunction);
 SL_FUN_DECL(slGetNewFrameToken);
 SL_FUN_DECL(slSetConstants);
-SL_FUN_DECL(slSetTag);
+SL_FUN_DECL(slSetTagForFrame);
 SL_FUN_DECL(slEvaluateFeature);
 SL_FUN_DECL(slAllocateResources);
 SL_FUN_DECL(slFreeResources);
@@ -54,6 +62,7 @@ SL_FUN_DECL(slGetFeatureVersion);
 
 SL_FUN_DECL(slDLSSGetOptimalSettings);
 SL_FUN_DECL(slDLSSSetOptions);
+SL_FUN_DECL(slDLSSGetState);
 
 SL_FUN_DECL(slPCLSetMarker);
 SL_FUN_DECL(slReflexSetOptions);
@@ -65,6 +74,11 @@ SL_FUN_DECL(slDLSSGGetState);
 
 SL_FUN_DECL(slDLSSDGetOptimalSettings);
 SL_FUN_DECL(slDLSSDSetOptions);
+SL_FUN_DECL(slDLSSDGetState);
+
+#if HAS_STREAMLINE_DLSS_NR
+SL_FUN_DECL(slDLSSNRSetOptions);
+#endif
 
 void load_interposer(void *module)
 {
@@ -82,7 +96,7 @@ void load_interposer(void *module)
   LOAD_FUNC(slGetFeatureFunction);
   LOAD_FUNC(slGetNewFrameToken);
   LOAD_FUNC(slSetConstants);
-  LOAD_FUNC(slSetTag);
+  LOAD_FUNC(slSetTagForFrame);
   LOAD_FUNC(slEvaluateFeature);
   LOAD_FUNC(slAllocateResources);
   LOAD_FUNC(slFreeResources);
@@ -102,7 +116,7 @@ bool unload_interposer(void *module)
   slGetFeatureFunction = nullptr;
   slGetNewFrameToken = nullptr;
   slSetConstants = nullptr;
-  slSetTag = nullptr;
+  slSetTagForFrame = nullptr;
   slEvaluateFeature = nullptr;
   slAllocateResources = nullptr;
   slFreeResources = nullptr;
@@ -115,12 +129,14 @@ void load_dlss()
   G_VERIFY(sl_funcs::slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", (void *&)slDLSSGetOptimalSettings) ==
            sl::Result::eOk);
   G_VERIFY(sl_funcs::slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", (void *&)slDLSSSetOptions) == sl::Result::eOk);
+  G_VERIFY(sl_funcs::slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSGetState", (void *&)slDLSSGetState) == sl::Result::eOk);
 }
 
 void unload_dlss()
 {
   slDLSSGetOptimalSettings = nullptr;
   slDLSSSetOptions = nullptr;
+  slDLSSGetState = nullptr;
 }
 
 void load_reflex()
@@ -156,13 +172,24 @@ void load_dlss_d()
   G_VERIFY(sl_funcs::slGetFeatureFunction(sl::kFeatureDLSS_RR, "slDLSSDGetOptimalSettings", (void *&)slDLSSDGetOptimalSettings) ==
            sl::Result::eOk);
   G_VERIFY(sl_funcs::slGetFeatureFunction(sl::kFeatureDLSS_RR, "slDLSSDSetOptions", (void *&)slDLSSDSetOptions) == sl::Result::eOk);
+  G_VERIFY(sl_funcs::slGetFeatureFunction(sl::kFeatureDLSS_RR, "slDLSSDGetState", (void *&)slDLSSDGetState) == sl::Result::eOk);
 }
 
 void unload_dlss_d()
 {
   slDLSSDGetOptimalSettings = nullptr;
   slDLSSDSetOptions = nullptr;
+  slDLSSDGetState = nullptr;
 }
+
+#if HAS_STREAMLINE_DLSS_NR
+void load_dlss_nr()
+{
+  G_VERIFY(sl_funcs::slGetFeatureFunction(sl::kFeatureDLSS_NR, "slDLSSNRSetOptions", (void *&)slDLSSNRSetOptions) == sl::Result::eOk);
+}
+
+void unload_dlss_nr() { slDLSSNRSetOptions = nullptr; }
+#endif
 
 bool is_feature_available(sl::Feature feature)
 {
@@ -178,6 +205,10 @@ void load_all_available_features()
     load_dlss_d();
   if (is_feature_available(sl::kFeatureDLSS_G))
     load_dlss_g();
+#if HAS_STREAMLINE_DLSS_NR
+  if (is_feature_available(sl::kFeatureDLSS_NR))
+    load_dlss_nr();
+#endif
   if (is_feature_available(sl::kFeatureReflex) && is_feature_available(sl::kFeaturePCL))
     load_reflex();
 }
@@ -187,6 +218,9 @@ void unload_all_available_features()
   unload_dlss();
   unload_dlss_d();
   unload_dlss_g();
+#if HAS_STREAMLINE_DLSS_NR
+  unload_dlss_nr();
+#endif
   unload_reflex();
 }
 
@@ -209,20 +243,61 @@ void logMessageCallback(sl::LogType type, const char *msg)
     logmessage(toDagorLogLevel(type), "sl: %.*s", length - 1, msg); // extract the extra \n character
 }
 
+#ifdef SL_GAIJIN_EXT
+// Mirrors ngx::ngxLog in sl.common. Values are NVSDK_NGX_Feature / NVSDK_NGX_Logging_Level.
+static const char *ngxFeatureName(int feature)
+{
+  switch (feature)
+  {
+    case 1: return "SuperSampling";
+    case 2: return "InPainting";
+    case 3: return "ImageSuperResolution";
+    case 4: return "SlowMotion";
+    case 5: return "VideoSuperResolution";
+    case 9: return "ImageSignalProcessing";
+    case 10: return "DeepResolve";
+    case 11: return "FrameGeneration";
+    case 12: return "DeepDVC";
+    case 13: return "RayReconstruction";
+    default: return "Unknown";
+  }
+}
+
+void hostNgxLog(const char *message, int, int sourceComponent)
+{
+  if (auto length = strlen(message); length > 1)
+    logdbg("sl: [%s] %.*s", ngxFeatureName(sourceComponent), length - 1, message);
+}
+#endif
+
 } // namespace
 
 sl::FrameToken &FrameTracker::getFrameToken(uint32_t frame_id)
 {
-  sl::FrameToken *&token = frameTokens[frame_id % MAX_CONCURRENT_FRAMES];
-  if (!token)
-    sl_funcs::slGetNewFrameToken(token, &frame_id);
-  return *token;
+  auto &slot = frameTokens[frame_id % MAX_CONCURRENT_FRAMES];
+  sl::FrameToken *token = slot.load(dag::mo::acquire);
+  // if we already have a token with this frame's id, then let's use that
+
+  for (;;)
+  {
+    if (token && uint32_t(*token) == frame_id)
+      return *token;
+
+    sl::FrameToken *newToken = nullptr;
+    sl_funcs::slGetNewFrameToken(newToken, &frame_id);
+
+    if (slot.compare_exchange_weak(token, newToken, dag::mo::acq_rel, dag::mo::acquire))
+      return *newToken;
+  }
 }
 
-void FrameTracker::startFrame(uint32_t frame_id)
+void FrameTracker::startFrame(uint32_t frame_id) { frameTokens[frame_id % MAX_CONCURRENT_FRAMES].store(nullptr, dag::mo::release); }
+
+void FrameTracker::reset()
 {
-  frameTokens[frame_id % MAX_CONCURRENT_FRAMES] = nullptr;
-  constantsInitialized[frame_id % MAX_CONCURRENT_FRAMES] = {};
+  for (auto &token : frameTokens)
+    token.store(nullptr, dag::mo::release);
+  constantsFrameId = {};
 }
 
 // COMMON STUFF
@@ -252,12 +327,12 @@ static void set_camera_constants(sl::Constants &constants, const nv::Camera &cam
   constants.cameraAspectRatio = camera.aspect;
 }
 
-static void set_common_constants(sl::Constants &constants)
+static void set_common_constants(sl::Constants &constants, bool reset)
 {
   constants.depthInverted = sl::Boolean::eTrue;
   constants.cameraMotionIncluded = sl::Boolean::eTrue;
   constants.motionVectors3D = sl::Boolean::eFalse;
-  constants.reset = sl::Boolean::eFalse;
+  constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 }
 
 static void set_motion_vector_constants(sl::Constants &constants, Point2 mv_scale, Point2 jitter_offset)
@@ -266,19 +341,60 @@ static void set_motion_vector_constants(sl::Constants &constants, Point2 mv_scal
   constants.jitterOffset = {jitter_offset.x, jitter_offset.y};
 }
 
+#ifdef VULKAN_CORE_H_
+// The vulkan driver hands over its Image object, the DX12 one the ID3D12Resource itself.
+struct NativeImage
+{
+  VkImage image;
+  VkImageCreateInfo info;
+  VkImageView view;
+};
+#endif
+
+static void process_vk_image(sl::Resource &res, bool out = false)
+{
+#ifdef VULKAN_CORE_H_
+  auto &native = *(NativeImage *)res.native;
+  res.native = native.image;
+  res.view = native.view;
+  res.width = native.info.extent.width;
+  res.height = native.info.extent.height;
+  res.nativeFormat = native.info.format;
+  res.mipLevels = 1;
+  res.arrayLayers = 1;
+  res.usage = out ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT;
+#endif
+}
+
+static IPoint2 get_native_texture_resolution(void *native)
+{
+  if (!native)
+    return {0, 0};
+#ifdef VULKAN_CORE_H_
+  if (d3d::get_driver_code().is(d3d::vulkan))
+  {
+    const VkExtent3D &extent = ((const NativeImage *)native)->info.extent;
+    return {int(extent.width), int(extent.height)};
+  }
+#endif
+  D3D12_RESOURCE_DESC desc = ((ID3D12Resource *)native)->GetDesc();
+  return {int(desc.Width), int(desc.Height)};
+}
+
 template <typename Params>
-void FrameTracker::initConstants(const Params &params, int viewport_id)
+void FrameTracker::initConstants(const Params &params, sl::FrameToken &token, int viewport_id)
 {
   const uint32_t frameId = params.frameId;
-  if (constantsInitialized[frameId % MAX_CONCURRENT_FRAMES][viewport_id])
+  // constants for this frame might already be initialized
+  if (constantsFrameId[viewport_id] == frameId)
     return;
 
   sl::Constants constants{};
   set_motion_vector_constants(constants, {params.inMVScaleX, params.inMVScaleY}, {params.inJitterOffsetX, params.inJitterOffsetY});
-  set_common_constants(constants);
+  set_common_constants(constants, params.inReset);
   set_camera_constants(constants, params.camera);
 
-  sl::Result result = sl_funcs::slSetConstants(constants, getFrameToken(frameId), viewport_id);
+  sl::Result result = sl_funcs::slSetConstants(constants, token, viewport_id);
   switch (result)
   {
     case sl::Result::eOk: break;
@@ -286,8 +402,34 @@ void FrameTracker::initConstants(const Params &params, int viewport_id)
     default: D3D_ERROR("DLSS(-RR/-G): Failed to set constants. Result: %s", sl::getResultAsStr(result));
   }
 
-  constantsInitialized[frameId % MAX_CONCURRENT_FRAMES][viewport_id] = true;
+  constantsFrameId[viewport_id] = frameId;
 }
+
+#if _TARGET_PC_WIN && _TARGET_64BIT
+static bool is_incompatible_msvcp140_loaded(const DataBlock *settings)
+{
+  HMODULE module = GetModuleHandleW(L"msvcp140.dll");
+  if (!module)
+    return false;
+
+  auto loadedVer = get_library_version(module);
+  if (!loadedVer)
+    return false;
+
+  LibraryVersion minVer{};
+  sscanf(settings->getStr("minVcRedistVer", "14.40.35211.0"), " %hu . %hu . %hu . %hu", &minVer.major, &minVer.minor, &minVer.build,
+    &minVer.revision);
+  if (*loadedVer >= minVer)
+    return false;
+
+  wchar_t path[MAX_PATH] = {};
+  GetModuleFileNameW(module, path, MAX_PATH);
+  logwarn("sl: loaded msvcp140.dll %s ('%ls') is older than the required %s; Streamline will be disabled "
+          "for this session to avoid a startup crash.",
+    loadedVer->toString().c_str(), path, minVer.toString().c_str());
+  return true;
+}
+#endif
 
 StreamlineAdapter::InterposerHandleType StreamlineAdapter::loadInterposer()
 {
@@ -303,12 +445,17 @@ StreamlineAdapter::InterposerHandleType StreamlineAdapter::loadInterposer()
   }
 #endif
 
-  if (WindowsVersion winVersion = get_windows_version(); winVersion.MajorVersion < 10)
+  if (auto winVersion = get_windows_version(); !winVersion || winVersion->major < 10)
     return {nullptr, nullptr};
 
   auto settings = ::dgs_get_settings();
   if (settings->getBlockByNameEx("video")->getBool("disableStreamline", false))
     return {nullptr, nullptr};
+
+#if _TARGET_PC_WIN && _TARGET_64BIT
+  if (is_incompatible_msvcp140_loaded(settings))
+    return {nullptr, nullptr};
+#endif
 
   if (int appId = settings->getInt("nvidia_app_id", 0); appId == 0)
   {
@@ -343,7 +490,7 @@ struct StreamlineAdapter::InitArgs
   }
 
   sl::Preferences preferences;
-  eastl::fixed_vector<sl::Feature, 5> features;
+  eastl::fixed_vector<sl::Feature, 6> features;
   eastl::string projectId;
 };
 
@@ -362,16 +509,32 @@ bool StreamlineAdapter::init(eastl::optional<StreamlineAdapter> &adapter, Render
   initArgs->preferences.applicationId = settings->getInt("nvidia_app_id", 0);
   initArgs->preferences.logLevel = DAGOR_DBGLEVEL > 0 ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
   initArgs->preferences.logMessageCallback = &logMessageCallback;
+#ifdef SL_GAIJIN_EXT
+  initArgs->preferences.ngxLogMessageCallback = hostNgxLog;
+#endif
 
-  initArgs->preferences.flags = sl::PreferenceFlags::eDisableCLStateTracking;
+  initArgs->preferences.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
   if (api == RenderAPI::DX12 || api == RenderAPI::Vulkan)
     initArgs->preferences.flags |= sl::PreferenceFlags::eUseManualHooking;
 
-  initArgs->features = {sl::kFeatureDLSS, sl::kFeatureReflex, sl::kFeaturePCL};
+  auto isKnownUnsupported = [&support_override](sl::Feature feature) {
+    auto it = support_override.find(feature);
+    return it != support_override.end() && it->second != nv::SupportState::Supported;
+  };
+
+  initArgs->features = {sl::kFeatureReflex, sl::kFeaturePCL};
+  if (!isKnownUnsupported(sl::kFeatureDLSS))
+    initArgs->features.push_back(sl::kFeatureDLSS);
   if (api == RenderAPI::DX12 || api == RenderAPI::Vulkan)
   {
-    initArgs->features.push_back(sl::kFeatureDLSS_G);
-    initArgs->features.push_back(sl::kFeatureDLSS_RR);
+    if (!isKnownUnsupported(sl::kFeatureDLSS_G))
+      initArgs->features.push_back(sl::kFeatureDLSS_G);
+    if (!isKnownUnsupported(sl::kFeatureDLSS_RR))
+      initArgs->features.push_back(sl::kFeatureDLSS_RR);
+#if HAS_STREAMLINE_DLSS_NR
+    if (!isKnownUnsupported(sl::kFeatureDLSS_NR))
+      initArgs->features.push_back(sl::kFeatureDLSS_NR);
+#endif
   }
 
   initArgs->preferences.featuresToLoad = initArgs->features.data();
@@ -391,6 +554,8 @@ bool StreamlineAdapter::init(eastl::optional<StreamlineAdapter> &adapter, Render
   };
 
   initArgs->preferences.renderAPI = toSlRenderApi(api);
+
+  const int64_t invocation_start_time = ref_time_ticks_qpc();
   if (SL_FAILED(result, sl_funcs::slInit(initArgs->preferences, sl::kSDKVersion)))
   {
     logwarn("sl: Failed to initialize Streamline: %s. DLSS and Reflex will be disabled.", getResultAsStr(result));
@@ -398,6 +563,7 @@ bool StreamlineAdapter::init(eastl::optional<StreamlineAdapter> &adapter, Render
     G_VERIFY(sl_funcs::slShutdown() == sl::Result::eOk);
     return false;
   }
+  logdbg("sl: Streamline initialized in %f ms", double(ref_time_delta_to_usec(ref_time_ticks_qpc() - invocation_start_time)) / 1000.0);
 
   adapter.emplace(eastl::move(initArgs), eastl::move(support_override));
   return true;
@@ -415,10 +581,13 @@ StreamlineAdapter::~StreamlineAdapter()
   {
     dlssFeatures[i].reset();
     dlssGFeatures[i].reset();
+    dlssNRFeatures[i].reset();
   }
   reflexFeature.reset();
   sl_funcs::unload_all_available_features();
+  debug("sl: slShutdown begin (app_active=%d)", (int)::dgs_app_active);
   sl::Result result = sl_funcs::slShutdown();
+  debug("sl: slShutdown done (%s)", getResultAsStr(result));
   G_ASSERT(result == sl::Result::eOk);
 }
 
@@ -506,7 +675,7 @@ void StreamlineAdapter::recover()
     // slShutdown will set PluginManager::s_status to ePluginsUnloaded to make sure we can try again later
     G_VERIFY(sl_funcs::slShutdown() == sl::Result::eOk);
   }
-  frameTracker = {};
+  frameTracker.reset();
 }
 
 static nv::SupportState toSupportState(sl::Result result)
@@ -563,6 +732,15 @@ nv::SupportState StreamlineAdapter::isDlssRRSupported() const
   return isFeatureSupported(sl::kFeatureDLSS_RR, adapter.Get(), supportOverride);
 }
 
+nv::SupportState StreamlineAdapter::isDlssNRSupported() const
+{
+#if HAS_STREAMLINE_DLSS_NR
+  return isFeatureSupported(sl::kFeatureDLSS_NR, adapter.Get(), supportOverride);
+#else
+  return nv::SupportState::NotSupported;
+#endif
+}
+
 nv::SupportState StreamlineAdapter::isReflexSupported() const
 {
   return isFeatureSupported(sl::kFeatureReflex, adapter.Get(), supportOverride);
@@ -614,92 +792,30 @@ static nv::DLSS::Mode parse_mode_from_settings()
 static bool parse_ray_reconstruction_mode_from_settings()
 {
   const DataBlock &blk_video = *dgs_get_settings()->getBlockByNameEx("video");
-  return blk_video.getBool("rayReconstruction", false);
-}
-
-static void setup_dummy_frame(int viewport_id, IPoint2 output_resolution, nv::DLSS::Mode mode, void *command_buffer)
-{
-  sl::DLSSOptimalSettings optimalSettings{};
-  sl::DLSSOptions options{};
-
-  options.mode = toDLSSMode(mode);
-  options.outputWidth = output_resolution.x;
-  options.outputHeight = output_resolution.y;
-  sl_funcs::slDLSSGetOptimalSettings(options, optimalSettings);
-
-  int renderWidth = optimalSettings.optimalRenderWidth;
-  int renderHeight = optimalSettings.optimalRenderHeight;
-
-  if (renderHeight <= 0 || renderWidth <= 0)
-    return;
-
-  sl_funcs::slDLSSSetOptions(viewport_id, options);
-
-  // we are going to create a dummy frame to trigger initialization
-  sl::FrameToken *frameToken;
-  uint32_t frameIndex = 0;
-  auto result = sl_funcs::slGetNewFrameToken(frameToken, &frameIndex);
-  G_ASSERT(result == sl::Result::eOk);
-
-  // dummy constants, the below flags set up DLSS correctly, even though SL complains
-  // about missing jitter and matrices. Those are not needed for initialization.
-  sl::Constants constants{};
-  constants.depthInverted = sl::Boolean::eTrue;
-  constants.cameraMotionIncluded = sl::Boolean::eTrue;
-  constants.motionVectors3D = sl::Boolean::eFalse;
-  constants.reset = sl::Boolean::eTrue;
-
-  result = sl_funcs::slSetConstants(constants, *frameToken, viewport_id);
-  G_ASSERT(result == sl::Result::eOk || result == sl::Result::eErrorDuplicatedConstants);
-
-  // Dummy resources passed to SL, only the extent is used, the resources are never touched.
-  struct DummyResource : public IUnknown
+  // TODO We need to make DLSS get parametrized from the outside.
+  // Depending on game specific settings in driver is not good!
+  if (blk_video.getBool("dlss_rr_reads_rt_settings", false))
   {
-    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, _COM_Outptr_ void __RPC_FAR *__RPC_FAR *ppvObject) { return 0; }
-    virtual ULONG STDMETHODCALLTYPE AddRef(void) { return ++cntr; }
-    virtual ULONG STDMETHODCALLTYPE Release(void)
-    {
-      if (cntr == 1)
-      {
-        delete this;
-        return 0;
-      }
-      else
-        return --cntr;
-    }
-    ULONG cntr = 0;
-  } *dummyResource = new DummyResource;
-
-  sl::Resource inColor{sl::ResourceType::eTex2d, dummyResource, 0};
-  sl::Resource inDepth{sl::ResourceType::eTex2d, dummyResource, 0};
-  sl::Resource inMotionVectors{sl::ResourceType::eTex2d, dummyResource, 0};
-  sl::Resource inExposure{sl::ResourceType::eTex2d, dummyResource, 0};
-  sl::Resource outColor{sl::ResourceType::eTex2d, dummyResource, 0};
-
-  sl::Extent outputExtent = {0, 0, output_resolution.x, output_resolution.y};
-  sl::Extent renderExtent = {0, 0, renderWidth, renderHeight};
-  sl::Extent exposureExtent = {0, 0, 1, 1};
-
-  eastl::fixed_vector<sl::ResourceTag, 5> tags = {
-    {&inColor, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilPresent, &renderExtent},
-    {&inDepth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &renderExtent},
-    {&inMotionVectors, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &renderExtent},
-    {&inExposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilPresent, &exposureExtent},
-    {&outColor, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent, &outputExtent}};
-
-  result = sl_funcs::slSetTag(viewport_id, tags.data(), tags.size(), command_buffer);
-  G_ASSERT(result == sl::Result::eOk);
+    const DataBlock &blk_graphics = *dgs_get_settings()->getBlockByNameEx("graphics");
+    auto bvhMode = blk_graphics.getStr("bvhMode", "off");
+    if (!strcmp(bvhMode, "off"))
+      return false;
+    if (!strcmp(bvhMode, "custom"))
+      if (!blk_graphics.getBool("enableBVH", false))
+        return false;
+  }
+  return blk_video.getBool("rayReconstruction", false);
 }
 
 DLSSSuperResolution::DLSSSuperResolution(int viewport_id, void *command_buffer, FrameTracker &frame_tracker) :
   viewportId(viewport_id), frameTracker(frame_tracker)
-{
-  sl::Result result = sl_funcs::slAllocateResources(command_buffer, sl::kFeatureDLSS, viewportId);
-  if (result != sl::Result::eOk)
-    D3D_ERROR("DLSS: Failed to initialize. Error: %s", sl::getResultAsStr(result));
-}
+{}
 
-DLSSSuperResolution::~DLSSSuperResolution() { G_VERIFY(sl_funcs::slFreeResources(sl::kFeatureDLSS, viewportId) == sl::Result::eOk); }
+DLSSSuperResolution::~DLSSSuperResolution()
+{
+  if (initialized)
+    G_VERIFY(sl_funcs::slFreeResources(sl::kFeatureDLSS, viewportId) == sl::Result::eOk);
+}
 
 eastl::optional<nv::DLSS::OptimalSettings> DLSSSuperResolution::getOptimalSettings(nv::DLSS::Mode mode,
   IPoint2 output_resolution) const
@@ -711,22 +827,25 @@ eastl::optional<nv::DLSS::OptimalSettings> DLSSSuperResolution::getOptimalSettin
   options.outputWidth = output_resolution.x;
   options.outputHeight = output_resolution.y;
 
-  options.dlaaPreset = sl::DLSSPreset::ePresetJ;
-  options.qualityPreset = sl::DLSSPreset::ePresetJ;
-  options.balancedPreset = sl::DLSSPreset::ePresetJ;
-  options.performancePreset = sl::DLSSPreset::ePresetJ;
+  bool success = sl_funcs::slDLSSGetOptimalSettings(options, optimalSettings) == sl::Result::eOk;
+  // sometimes library may give us optimal = OK but resolution will be 0x0 which is not OK
+  // catch this!
+  success &= (optimalSettings.optimalRenderWidth != 0) && (optimalSettings.optimalRenderHeight != 0);
 
-  return sl_funcs::slDLSSGetOptimalSettings(options, optimalSettings) == sl::Result::eOk
-           ? eastl::make_optional<OptimalSettings>(optimalSettings.optimalRenderWidth, optimalSettings.optimalRenderHeight, false)
-           : eastl::nullopt;
+  return success ? eastl::make_optional<OptimalSettings>(optimalSettings.optimalRenderWidth, optimalSettings.optimalRenderHeight,
+                     optimalSettings.renderWidthMin, optimalSettings.renderHeightMin, optimalSettings.renderWidthMax,
+                     optimalSettings.renderHeightMax, false)
+                 : eastl::nullopt;
 }
 
-bool DLSSSuperResolution::setOptions(nv::DLSS::Mode mode, IPoint2 output_resolution)
+bool DLSSSuperResolution::setOptions(nv::DLSS::Mode mode, IPoint2 output_resolution, bool, bool use_legacy_model)
 {
   sl::DLSSOptions options{};
   options.mode = toDLSSMode(mode);
   options.outputWidth = output_resolution.x;
   options.outputHeight = output_resolution.y;
+  options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset = options.ultraPerformancePreset =
+    options.ultraQualityPreset = use_legacy_model ? sl::DLSSPreset::ePresetK : sl::DLSSPreset::eDefault;
 
   return sl_funcs::slDLSSSetOptions(viewportId, options) == sl::Result::eOk;
 }
@@ -745,7 +864,8 @@ bool DLSSSuperResolution::isModeAvailableAtResolution(nv::DLSS::Mode mode, const
 
 bool DLSSSuperResolution::evaluate(const nv::DlssParams<void> &params, void *command_buffer)
 {
-  frameTracker.initConstants(params, viewportId);
+  auto &currentFrameToken = frameTracker.getFrameToken(params.frameId);
+  frameTracker.initConstants(params, currentFrameToken, viewportId);
 
   sl::Resource inColor{sl::ResourceType::eTex2d, params.inColor, params.inColorState};
   sl::Resource inDepth{sl::ResourceType::eTex2d, params.inDepth, params.inDepthState};
@@ -753,43 +873,31 @@ bool DLSSSuperResolution::evaluate(const nv::DlssParams<void> &params, void *com
   sl::Resource inExposure{sl::ResourceType::eTex2d, params.inExposure, params.inExposureState};
   sl::Resource outColor{sl::ResourceType::eTex2d, params.outColor, params.outColorState};
 
-#if _TARGET_PC_WIN && _TARGET_64BIT
   if (d3d::get_driver_code().is(d3d::vulkan))
   {
-    auto proc = [](sl::Resource &res, bool out = false) {
-      auto &[image, info, view] = *(eastl::tuple<VkImage, VkImageCreateInfo, VkImageView> *)(res.native);
-      res.native = image;
-      res.view = view;
-      res.width = info.extent.width;
-      res.height = info.extent.height;
-      res.nativeFormat = info.format;
-      res.mipLevels = 1;
-      res.arrayLayers = 1;
-      res.usage = out ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT;
-    };
-
-    proc(inColor);
-    proc(inDepth);
-    proc(inMotionVectors);
-    proc(inExposure);
-    proc(outColor, true);
+    process_vk_image(inColor);
+    process_vk_image(inDepth);
+    process_vk_image(inMotionVectors);
+    process_vk_image(outColor, true);
+    if (params.inExposure)
+      process_vk_image(inExposure);
   }
-#endif
+
+  const sl::Extent commonExtent = {params.inColorDepthOffsetY, params.inColorDepthOffsetX, params.inWidth, params.inHeight};
 
   eastl::fixed_vector<sl::ResourceTag, 5> tags = {
-    {&inColor, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate},
-    {&inDepth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate},
-    {&inMotionVectors, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate},
-    {&inExposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilEvaluate},
+    {&inColor, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &commonExtent},
+    {&inDepth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &commonExtent},
+    {&inMotionVectors, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &commonExtent},
+    {&inExposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilEvaluate, &commonExtent},
     {&outColor, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate}};
 
-  sl::Result result = sl_funcs::slSetTag(viewportId, tags.data(), tags.size(), command_buffer);
+  sl::Result result = sl_funcs::slSetTagForFrame(currentFrameToken, viewportId, tags.data(), tags.size(), command_buffer);
   G_ASSERT(result == sl::Result::eOk);
 
   const sl::ViewportHandle viewport(viewportId);
   const sl::BaseStructure *inputs[] = {&viewport};
-  if (SL_FAILED(result, sl_funcs::slEvaluateFeature(sl::kFeatureDLSS, frameTracker.getFrameToken(params.frameId), inputs,
-                          eastl::size(inputs), command_buffer)))
+  if (SL_FAILED(result, sl_funcs::slEvaluateFeature(sl::kFeatureDLSS, currentFrameToken, inputs, eastl::size(inputs), command_buffer)))
   {
     if (result == sl::Result::eWarnOutOfVRAM)
     {
@@ -802,7 +910,16 @@ bool DLSSSuperResolution::evaluate(const nv::DlssParams<void> &params, void *com
     }
   }
 
+  initialized = true;
+
   return true;
+}
+
+uint64_t DLSSSuperResolution::getMemorySize() const
+{
+  sl::DLSSState state{};
+  sl_funcs::slDLSSGetState(viewportId, state);
+  return state.estimatedVRAMUsageInBytes;
 }
 
 nv::DLSS *StreamlineAdapter::createDlssFeature(int viewport_id, IPoint2 output_resolution, void *command_buffer)
@@ -811,12 +928,7 @@ nv::DLSS *StreamlineAdapter::createDlssFeature(int viewport_id, IPoint2 output_r
   if (modeFromSettings == nv::DLSS::Mode::Off)
     return nullptr;
 
-  // On VK it is not possible to make dummy resources. Also not needed.
-  if (initArgs->preferences.renderAPI != sl::RenderAPI::eVulkan)
-    setup_dummy_frame(viewport_id, output_resolution, modeFromSettings, command_buffer);
-
-  bool wantRayReconstruction =
-    this->initArgs->preferences.renderAPI == sl::RenderAPI::eD3D12 && parse_ray_reconstruction_mode_from_settings();
+  bool wantRayReconstruction = parse_ray_reconstruction_mode_from_settings();
   bool hasRayReconstruction = isFeatureSupported(sl::kFeatureDLSS_RR, adapter.Get(), supportOverride) == nv::SupportState::Supported;
   if (wantRayReconstruction && !hasRayReconstruction)
   {
@@ -824,11 +936,12 @@ nv::DLSS *StreamlineAdapter::createDlssFeature(int viewport_id, IPoint2 output_r
     logwarn("sl: Ray reconstruction requested but feature is not supported. Likely a .dll is missing. Falling back to regular DLSS.");
   }
 
-  dlssFeatures[viewport_id] =
-    wantRayReconstruction &&
-        eastl::find(initArgs->features.begin(), initArgs->features.end(), sl::kFeatureDLSS_RR) != initArgs->features.end()
-      ? static_cast<eastl::unique_ptr<nv::DLSS>>(eastl::make_unique<DLSSRayReconstruction>(viewport_id, command_buffer, frameTracker))
-      : static_cast<eastl::unique_ptr<nv::DLSS>>(eastl::make_unique<DLSSSuperResolution>(viewport_id, command_buffer, frameTracker));
+  dlssFeatures[viewport_id] = wantRayReconstruction && eastl::find(initArgs->features.begin(), initArgs->features.end(),
+                                                         sl::kFeatureDLSS_RR) != initArgs->features.end()
+                                ? static_cast<eastl::unique_ptr<DLSSWithSizeQuery>>(
+                                    eastl::make_unique<DLSSRayReconstruction>(viewport_id, command_buffer, frameTracker))
+                                : static_cast<eastl::unique_ptr<DLSSWithSizeQuery>>(
+                                    eastl::make_unique<DLSSSuperResolution>(viewport_id, command_buffer, frameTracker));
   return dlssFeatures[viewport_id].get();
 }
 
@@ -859,56 +972,123 @@ DLSSFrameGeneration::DLSSFrameGeneration(int viewport_id, void *command_buffer, 
 
 DLSSFrameGeneration::~DLSSFrameGeneration() { G_VERIFY(sl_funcs::slFreeResources(sl::kFeatureDLSS_G, viewportId) == sl::Result::eOk); }
 
-static bool change_dlssg_mode(int viewport_id, bool retain_resources, int frames_to_generate)
+static sl::DLSSGOptions make_dlssg_options(bool retain_resources, int frames_to_generate, IPoint2 display_resolution,
+  IPoint2 render_resolution)
 {
   sl::DLSSGOptions options{};
-  options.mode = frames_to_generate > 0 ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+  if (frames_to_generate > 0)
+    options.mode = sl::DLSSGMode::eOn;
+  else if (frames_to_generate < 0)
+    options.mode = sl::DLSSGMode::eDynamic;
+  else
+    options.mode = sl::DLSSGMode::eOff;
   options.flags = retain_resources ? sl::DLSSGFlags::eRetainResourcesWhenOff : sl::DLSSGFlags(0);
   options.onErrorCallback = &api_error_callback;
   options.numFramesToGenerate = eastl::max(1, frames_to_generate);
-  G_VERIFY(sl_funcs::slDLSSGSetOptions(viewport_id, options) == sl::Result::eOk);
+  options.colorWidth = display_resolution.x;
+  options.colorHeight = display_resolution.y;
+  options.mvecDepthWidth = render_resolution.x;
+  options.mvecDepthHeight = render_resolution.y;
+  return options;
+}
+
+// Runs on the render backend thread. Optionally returns the queried state so the caller can cache the
+// parts the main thread needs (slDLSSGGetState is not thread safe, so the main thread must not call it).
+static bool change_dlssg_mode(int viewport_id, bool retain_resources, int frames_to_generate, IPoint2 display_resolution,
+  IPoint2 render_resolution, sl::DLSSGState *out_state = nullptr)
+{
+  auto options = make_dlssg_options(retain_resources, frames_to_generate, display_resolution, render_resolution);
+  if (SL_FAILED(result, sl_funcs::slDLSSGSetOptions(viewport_id, options)))
+  {
+    if (result == sl::Result::eWarnOutOfVRAM)
+    {
+      logwarn("sl: DLSS-G ran out of VRAM. We can still continue but expects severe performance degradation.");
+    }
+    else
+    {
+      D3D_ERROR("sl: Failed to change DLSS-G mode. Result: %s", getResultAsStr(result));
+      return false;
+    }
+  }
 
   sl::DLSSGState state;
-  G_VERIFY(sl_funcs::slDLSSGGetState(viewport_id, state, &options) == sl::Result::eOk);
+  // Request the VRAM estimate on the state query only (not on slDLSSGSetOptions) so getMemorySize can be
+  // served from the cached state instead of an extra main-thread query.
+  auto stateOptions = options;
+  stateOptions.flags |= sl::DLSSGFlags::eRequestVRAMEstimate;
+  sl::Result stateQueryResult = sl_funcs::slDLSSGGetState(viewport_id, state, &stateOptions);
+  G_ASSERT(stateQueryResult == sl::Result::eOk || stateQueryResult == sl::Result::eWarnOutOfVRAM);
+  if (out_state)
+    *out_state = state;
   if (state.status != sl::DLSSGStatus::eOk)
-    logerr("DLSSG: failed to set to %s state", frames_to_generate > 0 ? "enabled" : "disabled");
+    D3D_ERROR("DLSSG: failed to set to %s state", frames_to_generate != 0 ? "enabled" : "disabled");
   return state.status == sl::DLSSGStatus::eOk ? frames_to_generate : 0;
+}
+
+dag::AtomicPod<nv::DLSSFrameGenerationCapabilities> DLSSFrameGeneration::cachedFrameGenerationCapabilities{};
+
+void DLSSFrameGeneration::updateCachedState(const sl::DLSSGState &state)
+{
+  lastPresentedFrames = state.numFramesActuallyPresented;
+  cachedMemorySize.store(state.estimatedVRAMUsageInBytes, dag::mo::relaxed);
+  cachedFrameGenerationCapabilities.store(
+    nv::DLSSFrameGenerationCapabilities{state.numFramesToGenerateMax, static_cast<uint32_t>(state.bIsDynamicMFGSupported), true},
+    dag::mo::relaxed);
 }
 
 void DLSSFrameGeneration::setEnabled(int frames_to_generate)
 {
-  if (frames_to_generate > 0)
+  if (frames_to_generate != 0)
   {
     this->framesToGenerate = frames_to_generate;
   }
   else
-    this->framesToGenerate = change_dlssg_mode(viewportId, false, frames_to_generate);
+  {
+    sl::DLSSGState state;
+    // The mode is off here, so the resolution hints are unused.
+    this->framesToGenerate = change_dlssg_mode(viewportId, false, frames_to_generate, {}, {}, &state);
+    updateCachedState(state);
+  }
 }
-
-void DLSSFrameGeneration::setSuppressed(bool suppressed) { this->suppressed = suppressed; }
 
 bool DLSSFrameGeneration::evaluate(const nv::DlssGParams<void> &params, void *command_buffer)
 {
-  if (framesToGenerate <= 0)
+  if (framesToGenerate == 0)
     return true;
 
-  if (suppressed)
+  // HUDless and UI are display sized, depth and motion vectors come at the upscaler input size.
+  const IPoint2 displayResolution = get_native_texture_resolution(params.inHUDless);
+  const IPoint2 renderResolution = get_native_texture_resolution(params.inDepth);
+
+  sl::DLSSGState state;
+  if (params.suppressed)
   {
     // this is a workaround to a bug causing DLSS-G to only retain resources when options are passed in each frame
-    change_dlssg_mode(viewportId, true, 0);
+    change_dlssg_mode(viewportId, true, 0, displayResolution, renderResolution, &state);
+    updateCachedState(state);
     return true;
   }
   else
   {
-    change_dlssg_mode(viewportId, true, framesToGenerate);
+    change_dlssg_mode(viewportId, true, framesToGenerate, displayResolution, renderResolution, &state);
+    updateCachedState(state);
   }
 
-  frameTracker.initConstants(params, viewportId);
+  auto &currentFrameToken = frameTracker.getFrameToken(params.frameId);
+  frameTracker.initConstants(params, currentFrameToken, viewportId);
 
   sl::Resource inHUDless{sl::ResourceType::eTex2d, params.inHUDless, params.inHUDlessState};
   sl::Resource inUI{sl::ResourceType::eTex2d, params.inUI, params.inUIState};
   sl::Resource inDepth{sl::ResourceType::eTex2d, params.inDepth, params.inDepthState};
   sl::Resource inMotionVectors{sl::ResourceType::eTex2d, params.inMotionVectors, params.inMotionVectorsState};
+
+  if (d3d::get_driver_code().is(d3d::vulkan))
+  {
+    process_vk_image(inHUDless);
+    process_vk_image(inUI);
+    process_vk_image(inDepth);
+    process_vk_image(inMotionVectors);
+  }
 
   sl::ResourceTag tags[] = {
     {&inHUDless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eOnlyValidNow},
@@ -917,36 +1097,46 @@ bool DLSSFrameGeneration::evaluate(const nv::DlssGParams<void> &params, void *co
     {&inMotionVectors, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent},
   };
 
-  bool success = sl_funcs::slSetTag(viewportId, tags, eastl::size(tags), command_buffer) == sl::Result::eOk;
+  bool success = sl_funcs::slSetTagForFrame(currentFrameToken, viewportId, tags, eastl::size(tags), command_buffer) == sl::Result::eOk;
   G_ASSERT(success);
 
   return success;
 }
 
-unsigned DLSSFrameGeneration::getActualFramesPresented() const
+unsigned DLSSFrameGeneration::getActualFramesPresented() const { return framesToGenerate == 0 ? 1 : lastPresentedFrames; }
+
+nv::DLSSFrameGenerationCapabilities DLSSFrameGeneration::getFrameGenerationCapabilities()
 {
-  if (framesToGenerate <= 0)
-    return 1;
+  // numFramesToGenerateMax is a fixed GPU capability. While FG is active the backend keeps this cached, so
+  // the main thread never calls the (non-thread-safe) slDLSSGGetState concurrently. The cold query below
+  // only runs when nothing has been cached yet, which implies FG is not running, hence no concurrent call.
+  if (auto cached = cachedFrameGenerationCapabilities.load(dag::mo::relaxed); cached.valid)
+    return cached;
 
   sl::DLSSGState state;
   auto result = sl_funcs::slDLSSGGetState(0, state, nullptr);
-  G_ASSERT_RETURN(result == sl::Result::eOk && state.status == sl::DLSSGStatus::eOk, 1);
-  return state.numFramesActuallyPresented;
+  G_ASSERT_RETURN((result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM) && state.status == sl::DLSSGStatus::eOk,
+    nv::DLSSFrameGenerationCapabilities{});
+  nv::DLSSFrameGenerationCapabilities candidate{state.numFramesToGenerateMax, state.bIsDynamicMFGSupported, true};
+  cachedFrameGenerationCapabilities.store(candidate, dag::mo::relaxed);
+  return candidate;
 }
 
-int DLSSFrameGeneration::getMaximumNumberOfGeneratedFrames()
+uint64_t DLSSFrameGeneration::getMemorySize() const
 {
-  sl::DLSSGState state;
-  auto result = sl_funcs::slDLSSGGetState(0, state, nullptr);
-  G_ASSERT_RETURN(result == sl::Result::eOk && state.status == sl::DLSSGStatus::eOk, 0);
-  return state.numFramesToGenerateMax;
+  if (framesToGenerate == 0)
+  {
+    return 0;
+  }
+  // Served from the estimate the backend cached during evaluate (see change_dlssg_mode).
+  return cachedMemorySize.load(dag::mo::relaxed);
 }
 
 static bool is_frame_generation_enabled_in_settings()
 {
   const DataBlock &blk_video = *dgs_get_settings()->getBlockByNameEx("video");
   return blk_video.getInt("dlssFrameGenerationCount", 0) > 0 ||
-         (stricmp(blk_video.getStr("antialiasing_mode", "off"), "dlss") == 0 && blk_video.getInt("antialiasing_fgc", 0) > 0);
+         (stricmp(blk_video.getStr("antialiasing_mode", "off"), "dlss") == 0 && blk_video.getInt("antialiasing_fgc", 0) != 0);
 }
 
 DLSSFrameGeneration *StreamlineAdapter::createDlssGFeature(int viewport_id, void *command_buffer)
@@ -984,45 +1174,42 @@ bool Reflex::setMarker(uint32_t frame_id, lowlatency::LatencyMarkerType marker_t
   return sl_funcs::slPCLSetMarker(toPCLMarker(marker_type), frameTracker.getFrameToken(frame_id)) == sl::Result::eOk;
 }
 
-static sl::ReflexMode toReflexMode(nv::Reflex::ReflexMode mode)
+static sl::ReflexMode toReflexMode(GpuLatency::Mode mode)
 {
   switch (mode)
   {
-    case nv::Reflex::ReflexMode::Off: return sl::ReflexMode::eOff;
-    case nv::Reflex::ReflexMode::On: return sl::ReflexMode::eLowLatency;
-    case nv::Reflex::ReflexMode::OnPlusBoost: return sl::ReflexMode::eLowLatencyWithBoost;
+    case GpuLatency::Mode::Off: return sl::ReflexMode::eOff;
+    case GpuLatency::Mode::On: return sl::ReflexMode::eLowLatency;
+    case GpuLatency::Mode::OnPlusBoost: return sl::ReflexMode::eLowLatencyWithBoost;
   }
   return {};
 }
 
-static nv::Reflex::ReflexStats toReflexStats(const sl::ReflexReport &report)
+static Reflex::Stats toReflexStats(const sl::ReflexReport &report)
 {
-  return nv::Reflex::ReflexStats{report.frameID, report.inputSampleTime, report.simStartTime, report.simEndTime,
-    report.renderSubmitStartTime, report.renderSubmitEndTime, report.presentStartTime, report.presentEndTime, report.driverStartTime,
-    report.driverEndTime, report.osRenderQueueStartTime, report.osRenderQueueEndTime, report.gpuRenderStartTime,
-    report.gpuRenderEndTime, report.gpuActiveRenderTimeUs, report.gpuFrameTimeUs};
+  return Reflex::Stats{report.frameID, report.inputSampleTime, report.simStartTime, report.simEndTime, report.renderSubmitStartTime,
+    report.renderSubmitEndTime, report.presentStartTime, report.presentEndTime, report.driverStartTime, report.driverEndTime,
+    report.osRenderQueueStartTime, report.osRenderQueueEndTime, report.gpuRenderStartTime, report.gpuRenderEndTime,
+    report.gpuActiveRenderTimeUs, report.gpuFrameTimeUs};
 }
 
-bool Reflex::setOptions(nv::Reflex::ReflexMode mode, unsigned frame_limit_us)
+bool Reflex::setOptions(GpuLatency::Mode mode_, unsigned frame_limit_us)
 {
+  mode = mode_;
   sl::ReflexOptions options;
+  options.mode = toReflexMode(mode_);
   options.frameLimitUs = frame_limit_us;
-  options.mode = toReflexMode(mode);
-  currentReflexMode = mode;
-  bool ok = sl_funcs::slReflexSetOptions(options) == sl::Result::eOk;
-  if (ok)
-    currentReflexMode = mode;
-  return ok;
+  return sl_funcs::slReflexSetOptions(options) == sl::Result::eOk;
 }
 
-eastl::optional<nv::Reflex::ReflexState> Reflex::getState() const
+eastl::optional<Reflex::State> Reflex::getState() const
 {
   sl::ReflexState state;
   bool ok = sl_funcs::slReflexGetState(state) == sl::Result::eOk;
   if (!ok)
     return eastl::nullopt;
 
-  nv::Reflex::ReflexState result{state.lowLatencyAvailable, state.latencyReportAvailable, state.flashIndicatorDriverControlled};
+  Reflex::State result{state.lowLatencyAvailable, state.latencyReportAvailable, state.flashIndicatorDriverControlled};
   static_assert(eastl::size(state.frameReport) == eastl::size(result.stats));
   eastl::transform(eastl::begin(state.frameReport), eastl::end(state.frameReport), result.stats, toReflexStats);
   return result;
@@ -1035,28 +1222,32 @@ bool Reflex::sleep(uint32_t frame_id)
   return result == sl::Result::eOk;
 }
 
-Reflex::ReflexMode Reflex::getCurrentMode() const { return currentReflexMode; }
+Reflex *StreamlineAdapter::createReflexFeature() { return &reflexFeature.emplace(frameTracker); }
 
-Reflex *StreamlineAdapter::createReflexFeature()
+uint64_t StreamlineAdapter::getMemorySize() const
 {
-  reflexFeature.emplace(frameTracker);
-  return &reflexFeature.value();
+  uint64_t totalSize = 0;
+  for (auto &f : dlssFeatures)
+  {
+    totalSize += f ? f->getMemorySize() : 0;
+  }
+  for (auto &f : dlssGFeatures)
+  {
+    totalSize += f ? f->getMemorySize() : 0;
+  }
+  return totalSize;
 }
 
 // DLSSD
 
 DLSSRayReconstruction::DLSSRayReconstruction(int viewport_id, void *command_buffer, FrameTracker &frame_tracker) :
   viewportId(viewport_id), frameTracker(frame_tracker)
-{
-  sl::Result result = sl_funcs::slAllocateResources(command_buffer, sl::kFeatureDLSS_RR, viewportId);
-  if (result != sl::Result::eOk)
-    D3D_ERROR("DLSS: Failed to initialize. Error: %s", sl::getResultAsStr(result));
-  isRR = true;
-}
+{}
 
 DLSSRayReconstruction::~DLSSRayReconstruction()
 {
-  G_VERIFY(sl_funcs::slFreeResources(sl::kFeatureDLSS_RR, viewportId) == sl::Result::eOk);
+  if (initialized)
+    G_VERIFY(sl_funcs::slFreeResources(sl::kFeatureDLSS_RR, viewportId) == sl::Result::eOk);
 }
 
 eastl::optional<nv::DLSS::OptimalSettings> DLSSRayReconstruction::getOptimalSettings(nv::DLSS::Mode mode,
@@ -1069,7 +1260,9 @@ eastl::optional<nv::DLSS::OptimalSettings> DLSSRayReconstruction::getOptimalSett
   options.outputWidth = output_resolution.x;
   options.outputHeight = output_resolution.y;
   return sl_funcs::slDLSSDGetOptimalSettings(options, optimalSettings) == sl::Result::eOk
-           ? eastl::make_optional<OptimalSettings>(optimalSettings.optimalRenderWidth, optimalSettings.optimalRenderHeight, true)
+           ? eastl::make_optional<OptimalSettings>(optimalSettings.optimalRenderWidth, optimalSettings.optimalRenderHeight,
+               optimalSettings.renderWidthMin, optimalSettings.renderHeightMin, optimalSettings.renderWidthMax,
+               optimalSettings.renderHeightMax, true)
            : eastl::nullopt;
 }
 
@@ -1083,11 +1276,13 @@ static bool dlssd_set_options(int viewport_id, nv::DLSS::Mode mode, IPoint2 outp
   options.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;
   options.worldToCameraView = toFloat4x4(worldToView);
   options.cameraViewToWorld = toFloat4x4(viewToWorld);
+  options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset = options.ultraPerformancePreset =
+    options.ultraQualityPreset = sl::DLSSDPreset::ePresetE;
 
   return sl_funcs::slDLSSDSetOptions(viewport_id, options) == sl::Result::eOk;
 }
 
-bool DLSSRayReconstruction::setOptions(nv::DLSS::Mode mode, IPoint2 output_resolution)
+bool DLSSRayReconstruction::setOptions(nv::DLSS::Mode mode, IPoint2 output_resolution, bool, bool)
 {
   bool ok = dlssd_set_options(viewportId, mode, output_resolution, TMatrix4::IDENT, TMatrix4::IDENT);
   if (ok)
@@ -1100,7 +1295,8 @@ bool DLSSRayReconstruction::setOptions(nv::DLSS::Mode mode, IPoint2 output_resol
 
 bool DLSSRayReconstruction::evaluate(const nv::DlssParams<void> &params, void *command_buffer)
 {
-  frameTracker.initConstants(params, viewportId);
+  auto &currentFrameToken = frameTracker.getFrameToken(params.frameId);
+  frameTracker.initConstants(params, currentFrameToken, viewportId);
 
   dlssd_set_options(viewportId, currentMode, currentOutputResolution, params.camera.worldToView, params.camera.viewToWorld);
 
@@ -1112,26 +1308,57 @@ bool DLSSRayReconstruction::evaluate(const nv::DlssParams<void> &params, void *c
   sl::Resource inSpecularAlbedo{sl::ResourceType::eTex2d, params.inSpecularAlbedo, params.inSpecularAlbedoState};
   sl::Resource inNormalRoughness{sl::ResourceType::eTex2d, params.inNormalRoughness, params.inNormalRoughnessState};
   sl::Resource inHitDist{sl::ResourceType::eTex2d, params.inHitDist, params.inHitDistState};
+  sl::Resource inSsssGuide{sl::ResourceType::eTex2d, params.inSsssGuide, params.inSsssGuideState};
+  sl::Resource inColorBeforeTransparency{
+    sl::ResourceType::eTex2d, params.inColorBeforeTransparency, params.inColorBeforeTransparencyState};
   sl::Resource outColor{sl::ResourceType::eTex2d, params.outColor, params.outColorState};
 
-  eastl::fixed_vector<sl::ResourceTag, 9> tags = {
+  if (d3d::get_driver_code().is(d3d::vulkan))
+  {
+    process_vk_image(inColor);
+    process_vk_image(inDepth);
+    process_vk_image(inMotionVectors);
+    process_vk_image(inAlbedo);
+    process_vk_image(inSpecularAlbedo);
+    process_vk_image(inNormalRoughness);
+    process_vk_image(inHitDist);
+    process_vk_image(outColor, true);
+
+    if (params.inExposure)
+      process_vk_image(inExposure);
+    if (params.inSsssGuide)
+      process_vk_image(inSsssGuide);
+    if (params.inColorBeforeTransparency)
+      process_vk_image(inColorBeforeTransparency);
+  }
+
+  eastl::fixed_vector<sl::ResourceTag, 11> tags = {
     {&inColor, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate},
     {&inDepth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate},
     {&inMotionVectors, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate},
-    {&inExposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilEvaluate},
     {&inAlbedo, sl::kBufferTypeAlbedo, sl::ResourceLifecycle::eValidUntilEvaluate},
     {&inSpecularAlbedo, sl::kBufferTypeSpecularAlbedo, sl::ResourceLifecycle::eValidUntilEvaluate},
     {&inNormalRoughness, sl::kBufferTypeNormalRoughness, sl::ResourceLifecycle::eValidUntilEvaluate},
     {&inHitDist, sl::kBufferTypeSpecularHitDistance, sl::ResourceLifecycle::eValidUntilEvaluate},
     {&outColor, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate}};
 
-  sl::Result result = sl_funcs::slSetTag(viewportId, tags.data(), tags.size(), command_buffer);
+  auto addIfNotNull = [&](void *ptr, sl::Resource &r, sl::BufferType t, sl::ResourceLifecycle l) {
+    if (ptr)
+      tags.push_back(sl::ResourceTag{&r, t, l});
+  };
+  addIfNotNull(params.inExposure, inExposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilEvaluate);
+  addIfNotNull(params.inSsssGuide, inSsssGuide, sl::kBufferTypeScreenSpaceSubsurfaceScatteringGuide,
+    sl::ResourceLifecycle::eValidUntilEvaluate);
+  addIfNotNull(params.inColorBeforeTransparency, inColorBeforeTransparency, sl::kBufferTypeColorBeforeTransparency,
+    sl::ResourceLifecycle::eValidUntilEvaluate);
+
+  sl::Result result = sl_funcs::slSetTagForFrame(currentFrameToken, viewportId, tags.data(), tags.size(), command_buffer);
   G_ASSERT(result == sl::Result::eOk);
 
   const sl::ViewportHandle viewport(viewportId);
   const sl::BaseStructure *inputs[] = {&viewport};
-  if (SL_FAILED(result, sl_funcs::slEvaluateFeature(sl::kFeatureDLSS_RR, frameTracker.getFrameToken(params.frameId), inputs,
-                          eastl::size(inputs), command_buffer)))
+  if (SL_FAILED(result,
+        sl_funcs::slEvaluateFeature(sl::kFeatureDLSS_RR, currentFrameToken, inputs, eastl::size(inputs), command_buffer)))
   {
     if (result == sl::Result::eWarnOutOfVRAM)
     {
@@ -1144,5 +1371,131 @@ bool DLSSRayReconstruction::evaluate(const nv::DlssParams<void> &params, void *c
     }
   }
 
+  initialized = true;
+
   return true;
+}
+
+uint64_t DLSSRayReconstruction::getMemorySize() const
+{
+  sl::DLSSDState state{};
+  sl_funcs::slDLSSDGetState(viewportId, state);
+  return state.estimatedVRAMUsageInBytes;
+}
+
+// DLSSNR
+
+DLSSNeuralRendering::DLSSNeuralRendering(int viewport_id, void *command_buffer, FrameTracker &frame_tracker) :
+  viewportId(viewport_id), frameTracker(frame_tracker)
+{}
+
+DLSSNeuralRendering::~DLSSNeuralRendering()
+{
+#if HAS_STREAMLINE_DLSS_NR
+  if (initialized)
+    G_VERIFY(sl_funcs::slFreeResources(sl::kFeatureDLSS_NR, viewportId) == sl::Result::eOk);
+#endif
+}
+
+bool DLSSNeuralRendering::setOptions(const nv::DlssNROptions &new_options)
+{
+#if HAS_STREAMLINE_DLSS_NR
+  sl::DLSSNRConstants options{};
+  options.mode = new_options.enabled ? sl::DLSSNRMode::eOn : sl::DLSSNRMode::eOff;
+  options.intensity = new_options.intensity;
+  options.localToneStrength = new_options.localToneStrength;
+  options.localStructureStrength = new_options.localStructureStrength;
+  options.globalToneStrength = new_options.globalToneStrength;
+  options.style = new_options.style;
+  options.preset = sl::DLSSNRPreset(new_options.preset);
+  options.useAutoMask = new_options.useAutoMask;
+  options.skinStructureStrength = new_options.skinStructureStrength;
+  options.performanceMode = toDLSSMode(new_options.performanceMode);
+
+  if (SL_FAILED(result, sl_funcs::slDLSSNRSetOptions(viewportId, options)))
+  {
+    D3D_ERROR("sl: Failed to set DLSS-NR options. Result: %s", getResultAsStr(result));
+    return false;
+  }
+
+  enabled = new_options.enabled;
+  return true;
+#else
+  G_UNUSED(new_options);
+  return false;
+#endif
+}
+
+bool DLSSNeuralRendering::evaluate(const nv::DlssNRParams<void> &params, void *command_buffer)
+{
+#if HAS_STREAMLINE_DLSS_NR
+  if (!enabled)
+    return true;
+
+  auto &currentFrameToken = frameTracker.getFrameToken(params.frameId);
+  frameTracker.initConstants(params, currentFrameToken, viewportId);
+
+  sl::Resource inColor{sl::ResourceType::eTex2d, params.inColor, params.inColorState};
+  sl::Resource inDepth{sl::ResourceType::eTex2d, params.inDepth, params.inDepthState};
+  sl::Resource inMotionVectors{sl::ResourceType::eTex2d, params.inMotionVectors, params.inMotionVectorsState};
+  sl::Resource inControlMask{sl::ResourceType::eTex2d, params.inControlMask, params.inControlMaskState};
+  sl::Resource outColor{sl::ResourceType::eTex2d, params.outColor, params.outColorState};
+
+  if (d3d::get_driver_code().is(d3d::vulkan))
+  {
+    process_vk_image(inColor);
+    process_vk_image(inDepth);
+    process_vk_image(inMotionVectors);
+    process_vk_image(outColor, true);
+
+    if (params.inControlMask)
+      process_vk_image(inControlMask);
+  }
+
+  // Only depth and motion vectors need an extent: they come at render resolution, while the
+  // uplifted color pair is at output resolution and covers its whole resource.
+  const sl::Extent renderExtent = {0, 0, params.inWidth, params.inHeight};
+
+  eastl::fixed_vector<sl::ResourceTag, 5> tags = {
+    {&inColor, sl::kBufferTypeUpliftInputColor, sl::ResourceLifecycle::eValidUntilEvaluate},
+    {&outColor, sl::kBufferTypeUpliftOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate},
+    {&inDepth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &renderExtent},
+    {&inMotionVectors, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &renderExtent}};
+
+  if (params.inControlMask)
+    tags.push_back(sl::ResourceTag{&inControlMask, sl::kBufferTypeUpliftControlMask, sl::ResourceLifecycle::eValidUntilEvaluate});
+
+  sl::Result result = sl_funcs::slSetTagForFrame(currentFrameToken, viewportId, tags.data(), tags.size(), command_buffer);
+  G_ASSERT(result == sl::Result::eOk);
+
+  const sl::ViewportHandle viewport(viewportId);
+  const sl::BaseStructure *inputs[] = {&viewport};
+  if (SL_FAILED(result,
+        sl_funcs::slEvaluateFeature(sl::kFeatureDLSS_NR, currentFrameToken, inputs, eastl::size(inputs), command_buffer)))
+  {
+    if (result == sl::Result::eWarnOutOfVRAM)
+    {
+      logwarn("sl: DLSS-NR ran out of VRAM. We can still continue but expects severe performance degradation.");
+    }
+    else
+    {
+      D3D_ERROR("sl: Failed to evaluate DLSS-NR. Result: %s", getResultAsStr(result));
+      return false;
+    }
+  }
+
+  initialized = true;
+
+  return true;
+#else
+  G_UNUSED(params);
+  G_UNUSED(command_buffer);
+  return true;
+#endif
+}
+
+DLSSNeuralRendering *StreamlineAdapter::createDlssNRFeature(int viewport_id, void *command_buffer)
+{
+  dlssNRFeatures[viewport_id].emplace(viewport_id, command_buffer, frameTracker);
+  return &dlssNRFeatures[viewport_id].value();
 }

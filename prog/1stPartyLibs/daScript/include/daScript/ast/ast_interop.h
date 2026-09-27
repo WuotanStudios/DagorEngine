@@ -25,39 +25,58 @@ namespace das
         }
     };
 
-#if DAS_SLOW_CALL_INTEROP
     template  <typename FuncT, typename SimNodeT, typename FuncArgT>
-#else
-    template  <typename FuncT, FuncT fn, typename SimNodeT, typename FuncArgT>
-#endif
     class ExternalFn : public ExternalFnBase {
         static_assert ( is_base_of<SimNode_CallBase, SimNodeT>::value, "only call-based nodes allowed" );
     public:
-#if DAS_SLOW_CALL_INTEROP
         FuncT fn;
-        __forceinline ExternalFn(FuncT fnp, const char * name, const ModuleLibrary & lib, const char * cppName = nullptr)
-        : ExternalFnBase(name,cppName), fn(fnp) {
+        // the JIT-callable address, captured at the bind site where fn is still a
+        // compile-time constant: the raw fn for plain-ABI binds, an ImplWrapCall
+        // wrapper for cmres and vector-ABI binds
+        void * jitAddress = nullptr;
+        // out-of-line on purpose: the construction body is per-signature COMDAT,
+        // so each bind site costs a call, not an inlined copy of constructExternal
+        ___noinline ExternalFn(FuncT fnp, void * jitAddr, const char * name, const ModuleLibrary & lib, const char * cppName = nullptr)
+        : ExternalFnBase(name,cppName), fn(fnp), jitAddress(jitAddr) {
             constructExternal(makeFuncArgs<FuncArgT>::make(lib));
         }
-#else
-        __forceinline ExternalFn(const char * name, const ModuleLibrary & lib, const char * cppName = nullptr)
-        : ExternalFnBase(name,cppName) {
-            constructExternal(makeFuncArgs<FuncArgT>::make(lib));
+        ___noinline ExternalFn(FuncT fnp, void * jitAddr, const char * name, const char * cppName = nullptr)
+        : ExternalFnBase(name,cppName), fn(fnp), jitAddress(jitAddr) {
         }
-        __forceinline ExternalFn(const char * name, const char * cppName = nullptr)
-        : ExternalFnBase(name,cppName) {
-        }
-#endif
         virtual SimNode * makeSimNode ( Context & context, const vector<ExpressionPtr> & ) override {
             const char * fnName = context.code->allocateName(this->name);
-#if DAS_SLOW_CALL_INTEROP
             return context.code->makeNode<SimNodeT>(at, fnName, fn);
-#else
-            return context.code->makeNode<SimNodeT>(at, fnName);
-#endif
         }
         virtual void * getBuiltinAddress() const override {
-            return ImplWrapCall<SimNodeT::IS_CMRES, NeedVectorWrap<FuncT>::value, FuncT, fn>::get_builtin_address();
+            return jitAddress;
+        }
+    };
+
+    // captures the JIT-callable address for a bind while fn is a compile-time
+    // constant; the per-function wrapper code only materializes for cmres and
+    // vector-ABI signatures
+    template <typename SimNodeType, typename FuncT, FuncT fn>
+    __forceinline void * makeJitAddress () {
+        return ImplWrapCall<SimNodeType::IS_CMRES, NeedVectorWrap<FuncT>::value, FuncT, fn>::get_builtin_address();
+    }
+
+    // registration for the NTTP node flavor (SimNode_ExtFuncCallInline)
+    template  <typename FuncT, FuncT fn, typename SimNodeT, typename FuncArgT>
+    class ExternalFnInline : public ExternalFnBase {
+        static_assert ( is_base_of<SimNode_CallBase, SimNodeT>::value, "only call-based nodes allowed" );
+    public:
+        void * jitAddress = nullptr;
+        ___noinline ExternalFnInline(void * jitAddr, const char * name, const ModuleLibrary & lib, const char * cppName = nullptr)
+        : ExternalFnBase(name,cppName), jitAddress(jitAddr) {
+            this->nttp = true;
+            constructExternal(makeFuncArgs<FuncArgT>::make(lib));
+        }
+        virtual SimNode * makeSimNode ( Context & context, const vector<ExpressionPtr> & ) override {
+            const char * fnName = context.code->allocateName(this->name);
+            return context.code->makeNode<SimNodeT>(at, fnName);
+        }
+        virtual void * getBuiltinAddress() const override {
+            return jitAddress;
         }
     };
 
@@ -182,97 +201,136 @@ namespace das
         virtual void * getBuiltinAddress() const override { return (void *) &usingFunc; }
     };
 
-    void addExternFunc(Module& mod, const FunctionPtr & fx, bool isCmres, SideEffects seFlags);
+#define VERIFY_JIT_ARGUMENTS 0
+#if VERIFY_JIT_ARGUMENTS
+    template <typename Func, Func Fn>
+    struct VerifyFn;
 
-#if DAS_SLOW_CALL_INTEROP
-    template <typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
-#else
-    template <typename FuncT, FuncT fn, template <typename FuncTT, FuncTT fnt> class SimNodeT = SimNode_ExtFuncCall>
+    template <typename RetT, typename... Args, RetT(*fn)(Args...)>
+    struct VerifyFn<RetT(*)(Args...), fn> {
+        static void verify(FunctionPtr fn_info) {
+            size_t index = 0;
+            [[maybe_unused]] int dummy[] = {0, (verifySingleArgumentType<Args>(index++, fn_info), 0)...};
+        }
+    private:
+
+        template <typename ArgT>
+        static void verifySingleArgumentType(size_t /*idx*/, FunctionPtr /*fn_info*/) {
+            auto & type = fn_info->arguments[idx]->type;
+            if (type->isVectorType()) {
+                using CleanType = remove_cv_t<remove_reference_t<ArgT>>;
+                using WrappedType = WrapType<CleanType>;
+
+                bool is_same_type = is_same_v<typename WrappedType::type, vec4f>;
+                bool is_same_rettype = is_same_v<typename WrappedType::rettype, vec4f>;
+
+                DAS_VERIFYF(is_same_type,
+                    "To make c++-jit interop work vec-types should be provided with WrapType::type "
+                    "and optionally WrapArgType, WrapRetType (if vec4f conversion is not implemented "
+                    "in type itself). Failed argument %zu type: %s in function %s",
+                    idx, debug_type_name<ArgT>(), fn_info->name.c_str());
+                DAS_VERIFYF(is_same_rettype,
+                    "To make c++-jit interop work vec-types should be provided with WrapType::rettype "
+                    "and optionally WrapArgType, WrapRetType (if vec4f conversion is not implemented "
+                    "in type itself). Failed argument %zu type: %s in function %s",
+                    idx, debug_type_name<ArgT>(), fn_info->name.c_str());
+            }
+            using ProcessedT = conditional_t<JitConstRefByValue<ArgT>::value,
+                                                  remove_cv_t<remove_reference_t<ArgT>>, ArgT>;
+            DAS_VERIFYF((type->ref || type->isRefType()) == is_reference_v<ProcessedT>,
+                "Reference type mismatch %s in function %s. It makes jit work incorrectly. "
+                "You must be manually changed ref, but not implemented JitConstRefByValue for this type.",
+                debug_type_name<ArgT>(), fn_info->name.c_str());
+        }
+    };
 #endif
+
+    DAS_API void addExternFunc(Module& mod, const FunctionPtr & fx, bool isCmres, SideEffects seFlags);
+
+    template <typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall>
     inline auto addExternProperty ( Module & mod, const ModuleLibrary & lib, const char * name, const char * cppName = nullptr,
                                     bool explicitConst=false, SideEffects sideEffects = SideEffects::none ) {
-#if DAS_SLOW_CALL_INTEROP
         using SimNodeType = SimNodeT<FuncT>;
-        auto fnX = make_smart<ExternalFn<FuncT, SimNodeType, FuncT>>(fn, name, lib, cppName);
-#else
-        using SimNodeType = SimNodeT<FuncT, fn>;
-        auto fnX = make_smart<ExternalFn<FuncT, fn, SimNodeType, FuncT>>(name, lib, cppName);
-#endif
+        auto fnX = new ExternalFn<FuncT, SimNodeType, FuncT>(fn, makeJitAddress<SimNodeType,FuncT,fn>(), name, lib, cppName);
         defaultTempFn tempFn;
-        tempFn(fnX.get());
+        tempFn(fnX);
         fnX->arguments[0]->type->explicitConst = explicitConst;
         fnX->setSideEffects(sideEffects);
         fnX->propertyFunction = true;
         DAS_ASSERTF(!fnX->result->isSmartPointer(), "property function can't return smart pointer %s::%s", mod.name.c_str(), name);
+#if VERIFY_JIT_ARGUMENTS
+        VerifyFn<FuncT, fn>::verify(fnX);
+#endif
         mod.addFunction(fnX,true);  // yes, this one can fail. same C++ bound property can be in multiple classes before or after refactor
         return fnX;
     }
 
-#if DAS_SLOW_CALL_INTEROP
-    template <typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
-#else
-    template <typename ArgType, int ArgConst, typename RetType, typename FuncT, FuncT fn, template <typename FuncTT, FuncTT fnt> class SimNodeT = SimNode_ExtFuncCall>
-#endif
+    template <typename ArgType, int ArgConst, typename RetType, typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall>
     inline auto addExternPropertyForType ( Module & mod, const ModuleLibrary & lib, const char * name, const char * cppName = nullptr,
                                     bool explicitConst=false, SideEffects sideEffects = SideEffects::none) {
-#if DAS_SLOW_CALL_INTEROP
         using SimNodeType = SimNodeT<FuncT>;
-        auto fnX = make_smart<ExternalFn<FuncT, fn, SimNodeType, FuncT>>(name, cppName);
-#else
-        using SimNodeType = SimNodeT<FuncT, fn>;
-        auto fnX = make_smart<ExternalFn<FuncT, fn, SimNodeType, FuncT>>(name, cppName);
-#endif
+        auto fnX = new ExternalFn<FuncT, SimNodeType, FuncT>(fn, makeJitAddress<SimNodeType,FuncT,fn>(), name, cppName);
         vector<TypeDeclPtr> types(2);
         types[0] = makeType<RetType>(lib);
         types[1] = makeType<ArgType>(lib);
         types[1]->constant = ArgConst;
         fnX->constructExternal(types);
         defaultTempFn tempFn;
-        tempFn(fnX.get());
+        tempFn(fnX);
         fnX->arguments[0]->type->explicitConst = explicitConst;
         fnX->setSideEffects(sideEffects);
         fnX->propertyFunction = true;
         DAS_ASSERTF(!fnX->result->isSmartPointer(), "property function can't return smart pointer %s::%s", mod.name.c_str(), name);
+#if VERIFY_JIT_ARGUMENTS
+        VerifyFn<FuncT, fn>::verify(fnX);
+#endif
         mod.addFunction(fnX,true);  // yes, this one can fail. same C++ bound property can be in multiple classes before or after refactor
         return fnX;
     }
 
-#if DAS_SLOW_CALL_INTEROP
-    template <typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
-#else
-    template <typename FuncT, FuncT fn, template <typename FuncTT, FuncTT fnt> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
-#endif
-    inline auto addExtern ( Module & mod, const ModuleLibrary & lib, const char * name, SideEffects seFlags,
+    // the NTTP flavor: same contract as addExtern, but the bind gets its own
+    // SimNode_ExtFuncCallInline<FuncT, fn> so the callee can inline into the
+    // interpreter's call node; opt-in for hot, inline-friendly functions
+    template <typename FuncT, FuncT fn, typename QQ = defaultTempFn>
+    inline auto addExternInline ( Module & mod, const ModuleLibrary & lib, const char * name, SideEffects seFlags,
                                   const char * cppName = nullptr, QQ && tempFn = QQ() ) {
-#if DAS_SLOW_CALL_INTEROP
-        using SimNodeType = SimNodeT<FuncT>;
-        auto fnX = make_smart<ExternalFn<FuncT, SimNodeType, FuncT>>(fn, name, lib, cppName);
-#else
-        using SimNodeType = SimNodeT<FuncT, fn>;
-        auto fnX = make_smart<ExternalFn<FuncT, fn, SimNodeType, FuncT>>(name, lib, cppName);
-#endif
-
-        tempFn(fnX.get());
+        using SimNodeType = SimNode_ExtFuncCallInline<FuncT, fn>;
+        auto fnX = new ExternalFnInline<FuncT, fn, SimNodeType, FuncT>(makeJitAddress<SimNodeType,FuncT,fn>(), name, lib, cppName);
+        tempFn(fnX);
         addExternFunc(mod, fnX, SimNodeType::IS_CMRES, seFlags);
         return fnX;
     }
 
-#if DAS_SLOW_CALL_INTEROP
+    // addExternEx's NTTP sibling: explicit FuncArgT for signature-adjusted binds
+    template <typename FuncArgT, typename FuncT, FuncT fn, typename QQ = defaultTempFn>
+    inline auto addExternInlineEx ( Module & mod, const ModuleLibrary & lib, const char * name, SideEffects seFlags,
+                                    const char * cppName = nullptr, QQ && tempFn = QQ() ) {
+        using SimNodeType = SimNode_ExtFuncCallInline<FuncT, fn>;
+        auto fnX = new ExternalFnInline<FuncT, fn, SimNodeType, FuncArgT>(makeJitAddress<SimNodeType,FuncT,fn>(), name, lib, cppName);
+        tempFn(fnX);
+        addExternFunc(mod, fnX, SimNodeType::IS_CMRES, seFlags);
+        return fnX;
+    }
+
     template <typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
-#else
-    template <typename FuncT, FuncT fn, template <typename FuncTT, FuncTT fnt> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
+    inline auto addExtern ( Module & mod, const ModuleLibrary & lib, const char * name, SideEffects seFlags,
+                                  const char * cppName = nullptr, QQ && tempFn = QQ() ) {
+        using SimNodeType = SimNodeT<FuncT>;
+        auto fnX = new ExternalFn<FuncT, SimNodeType, FuncT>(fn, makeJitAddress<SimNodeType,FuncT,fn>(), name, lib, cppName);
+        tempFn(fnX);
+#if VERIFY_JIT_ARGUMENTS
+        VerifyFn<FuncT, fn>::verify(fnX);
 #endif
+        addExternFunc(mod, fnX, SimNodeType::IS_CMRES, seFlags);
+        return fnX;
+    }
+
+    template <typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
     inline auto makeExtern ( const ModuleLibrary & lib, const char * name,
                                 const char * cppName = nullptr, QQ && tempFn = QQ() ) {
-#if DAS_SLOW_CALL_INTEROP
         using SimNodeType = SimNodeT<FuncT>;
-        auto fnX = make_smart<ExternalFn<FuncT, SimNodeType, FuncT>>(fn, name, lib, cppName);
-#else
-        using SimNodeType = SimNodeT<FuncT, fn>;
-        auto fnX = make_smart<ExternalFn<FuncT, fn, SimNodeType, FuncT>>(name, lib, cppName);
-#endif
-
-        tempFn(fnX.get());
+        auto fnX = new ExternalFn<FuncT, SimNodeType, FuncT>(fn, makeJitAddress<SimNodeType,FuncT,fn>(), name, lib, cppName);
+        tempFn(fnX);
 
         if (!SimNodeType::IS_CMRES) {
             if (fnX->result->isRefType() && !fnX->result->ref) {
@@ -283,46 +341,36 @@ namespace das
                     fnX->name.c_str(), fnX->name.c_str());
             }
         }
-
+#if VERIFY_JIT_ARGUMENTS
+        VerifyFn<FuncT, fn>::verify(fnX);
+#endif
         return fnX;
     }
 
-#if DAS_SLOW_CALL_INTEROP
-    template <typename FuncArgT, typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall>
-#else
-    template <typename FuncArgT, typename FuncT, FuncT fn, template <typename FuncTT, FuncTT fnt> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
-#endif
+    template <typename FuncArgT, typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCall, typename QQ = defaultTempFn>
     inline auto addExternEx ( Module & mod, const ModuleLibrary & lib, const char * name, SideEffects seFlags,
                                   const char * cppName = nullptr, QQ && tempFn = QQ() ) {
-#if DAS_SLOW_CALL_INTEROP
         using SimNodeType = SimNodeT<FuncT>;
-        auto fnX = make_smart<ExternalFn<FuncT, SimNodeType, FuncArgT>>(fn, name, lib, cppName);
-#else
-        using SimNodeType = SimNodeT<FuncT, fn>;
-        auto fnX = make_smart<ExternalFn<FuncT, fn, SimNodeType, FuncArgT>>(name, lib, cppName);
+        auto fnX = new ExternalFn<FuncT, SimNodeType, FuncArgT>(fn, makeJitAddress<SimNodeType,FuncT,fn>(), name, lib, cppName);
+        tempFn(fnX);
+#if VERIFY_JIT_ARGUMENTS
+        VerifyFn<FuncT, fn>::verify(fnX);
 #endif
-        tempFn(fnX.get());
         addExternFunc(mod, fnX, SimNodeType::IS_CMRES, seFlags);
         return fnX;
     }
 
-#if DAS_SLOW_CALL_INTEROP
     template <typename FuncT, FuncT fn, template <typename FuncTT> class SimNodeT = SimNode_ExtFuncCallRef, typename QQ = defaultTempFn>
-#else
-    template <typename FuncT, FuncT fn, template <typename FuncTT, FuncTT fnt> class SimNodeT = SimNode_ExtFuncCallRef, typename QQ = defaultTempFn>
-#endif
     inline auto addExternTempRef ( Module & mod, const ModuleLibrary & lib, const char * name, SideEffects seFlags,
         const char * cppName = nullptr, QQ && tempFn = QQ() )
     {
-#if DAS_SLOW_CALL_INTEROP
         using SimNodeType = SimNodeT<FuncT>;
-        auto fnX = make_smart<ExternalFn<FuncT, SimNodeType, FuncT>>(fn, name, lib, cppName);
-#else
-        using SimNodeType = SimNodeT<FuncT, fn>;
-        auto fnX = make_smart<ExternalFn<FuncT, fn, SimNodeType, FuncT>>(name, lib, cppName);
-#endif
-        tempFn(fnX.get());
+        auto fnX = new ExternalFn<FuncT, SimNodeType, FuncT>(fn, makeJitAddress<SimNodeType,FuncT,fn>(), name, lib, cppName);
+        tempFn(fnX);
         fnX->result->temporary = true;
+#if VERIFY_JIT_ARGUMENTS
+        VerifyFn<FuncT, fn>::verify(fnX);
+#endif
         addExternFunc(mod, fnX, SimNodeType::IS_CMRES, seFlags);
         return fnX;
     }
@@ -330,14 +378,14 @@ namespace das
     template <InteropFunction func, typename RetT, typename ...Args>
     inline auto addInterop ( Module & mod, const ModuleLibrary & lib, const char * name, SideEffects seFlags,
                                    const char * cppName = nullptr ) {
-        auto fnX = make_smart<InteropFn<func, RetT, Args...>>(name, lib, cppName);
+        auto fnX = new InteropFn<func, RetT, Args...>(name, lib, cppName);
         addExternFunc(mod, fnX, true, seFlags);
         return fnX;
     }
 
     template <typename CType, typename ...Args>
     inline auto addCtor ( Module & mod, const ModuleLibrary & lib, const char * name, const char * cppName = nullptr ) {
-        auto fn = make_smart<BuiltIn_PlacementNew<CType,Args...>>(name,lib,cppName);
+        auto fn = new BuiltIn_PlacementNew<CType,Args...>(name,lib,cppName);
         DAS_ASSERT(fn->result->isRefType() && "can't add ctor to by-value types");
         mod.addFunction(fn);
         return fn;
@@ -345,17 +393,17 @@ namespace das
 
     template <typename CType, typename ...Args>
     inline auto addUsing ( Module & mod, const ModuleLibrary & lib, const char * cppName ) {
-        auto fn = make_smart<BuiltIn_Using<CType,Args...>>(lib,cppName);
+        auto fn = new BuiltIn_Using<CType,Args...>(lib,cppName);
         mod.addFunction(fn);
         return fn;
     }
 
     template <typename CType, typename ...Args>
     inline auto addCtorAndUsing ( Module & mod, const ModuleLibrary & lib, const char * name, const char * cppName ) {
-        auto fn = make_smart<BuiltIn_PlacementNew<CType,Args...>>(name,lib,cppName);
+        auto fn = new BuiltIn_PlacementNew<CType,Args...>(name,lib,cppName);
         DAS_ASSERT(fn->result->isRefType() && "can't add ctor to by-value types");
         mod.addFunction(fn);
-        mod.addFunction(make_smart<BuiltIn_Using<CType,Args...>>(lib,cppName));
+        mod.addFunction(new BuiltIn_Using<CType,Args...>(lib,cppName));
         return fn;
     }
 
@@ -391,5 +439,9 @@ namespace das
         addExtern<void (*)(ET&,ET),method_and_equ::invoke>(mod, lib, "&=", SideEffects::modifyArgument,
             ("das_operator_enum_AND_EQU<" + cppName + ">::invoke").c_str());
     }
+
+#ifdef VERIFY_JIT_ARGUMENTS
+#undef VERIFY_JIT_ARGUMENTS
+#endif
 }
 

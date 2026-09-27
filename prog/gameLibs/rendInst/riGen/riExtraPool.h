@@ -13,10 +13,12 @@
 
 class RenderableInstanceLodsResource;
 class CollisionResource;
+class DynamicPhysObjectData;
 
 namespace rendinst
 {
 
+inline SmartReadWriteFifoLock riXYZRLock;
 
 struct RiExtraPool
 {
@@ -26,6 +28,10 @@ struct RiExtraPool
   RenderableInstanceLodsResource *res = nullptr;
   CollisionResource *collRes = nullptr;
   void *collHandle = nullptr;
+  uint8_t hideMask = 0;
+  uint8_t destrPhysResLodMask = 0;
+  uint8_t scaleDebris : 1, isDestroyedPhysResExist : 1, isDynamicRendinst : 1;
+  int tsIndex = -1;
 
   vec4f bsphXYZR = v_make_vec4f(0, 0, 0, 1);
 
@@ -35,6 +41,7 @@ struct RiExtraPool
     unsigned distSqLOD_i[MAX_LODS];
   };
   int riPoolRef = -1;
+  int customPropsId = -1;
   LayerFlags layers = {};
   unsigned riPoolRefLayer : 4;
   unsigned useShadow : 1, posInst : 1, destroyedColl : 1, immortal : 1, hasColoredShaders : 1, isTree : 1;
@@ -42,7 +49,7 @@ struct RiExtraPool
   unsigned patchesHeightmap : 1, usingClipmap : 1;
   unsigned killsNearEffects : 1, hasTransitionLod : 1;
   unsigned isGrassify : 1;
-  uint8_t hideMask = 0;
+  unsigned underwaterOnly : 1;
   struct ElemMask
   {
     uint32_t atest, cullN, tessellation, plod;
@@ -81,11 +88,11 @@ struct RiExtraPool
         lastDmgTime = t;
     }
   };
-
+  int parentForDestroyedRiIdx = -1;
   Tab<mat43f> riTm;
   Tab<vec4f> riXYZR; // R<0 mean 'not in grid'
   E3DCOLOR poolColors[2] = {};
-  Tab<uint16_t> uuIdx;
+  Tab<uint32_t> uuIdx;
   Tab<HPandLDT> riHP;
   Tab<ElemUniqueData> riUniqueData; // This way we'll identify them after generation, so we can keep them synced
   bbox3f lbb = {};
@@ -93,37 +100,29 @@ struct RiExtraPool
   bbox3f fullWabb = {};
 
   dag::Vector<uint32_t> tsNodeIdx; //(2:20) TiledScene node_index for each instanse (highest 2 bits select TileScene index)
-  int tsIndex = -1;
 
   dag::Vector<int> variableIdsToUpdateMaxHeight;
   float initialHP = -1;
   float regenHpRate = 0;
   int destroyedRiIdx = -1;
-  int parentForDestroyedRiIdx = -1;
-  bool scaleDebris = false;
   int destrDepth = 0;
-  class DynamicPhysObjectData *destroyedPhysRes = nullptr;
-  bool isDestroyedPhysResExist = false;
+  DynamicPhysObjectData *destroyedPhysRes = nullptr;
+  float scaleForPrepasses = 1.0f;
   int destrFxType = -1;
   int destrCompositeFxId = -1;
   float destrFxScale = 0;
-  float destrTimeToLive = -1.f;
-  float destrDefaultTimeToLive = -1.f;
-  float destrTimeToKinematic = -1.f;
-  float destrTimeToSinkUnderground = -1.f;
   int dmgFxType = -1;
   float dmgFxScale = 1.f;
   float damageThreshold = 0;
   uint8_t destrStopsBullets : 1;
-
+  bool isRendinstClipmap = false;
+  bool isPaintFxOnHit = false;
+  bool indestructibleByNuke = false;
   float sphereRadius = 1.f;
   float sphCenterY = 0.f;
   float radiusFadeDrown = 0.f;
   float radiusFade = 0.f;
   unsigned lodLimits = defLodLimits;
-  bool isRendinstClipmap = false;
-  bool isPaintFxOnHit = false;
-  bool isDynamicRendinst = false;
 
   struct RiLandclassCachedData
   {
@@ -144,10 +143,11 @@ struct RiExtraPool
 
   SimpleString materialMarkedForHiding;
 
-  float scaleForPrepasses = 1.0f;
-
   // NOTE: bitfields can only be default-initialized in C++20
   RiExtraPool() :
+    scaleDebris(false),
+    isDestroyedPhysResExist(false),
+    isDynamicRendinst(false),
     riPoolRefLayer(0),
     useShadow(false),
     posInst(false),
@@ -165,7 +165,8 @@ struct RiExtraPool
     usingClipmap(false),
     killsNearEffects(false),
     hasTransitionLod(false),
-    destrStopsBullets(true)
+    destrStopsBullets(true),
+    underwaterOnly(false)
   {
     memset(distSqLOD, 0, sizeof(distSqLOD));
     memset(elemMask, 0, sizeof(elemMask));
@@ -184,6 +185,7 @@ struct RiExtraPool
   bool isValid(uint32_t idx) const { return idx < riTm.size() && riex_is_instance_valid(riTm.data()[idx]); }
   bool isInGrid(int idx) const
   {
+    ScopedLockRead lock(riXYZRLock);
     if (idx < 0 || idx >= riXYZR.size())
       return false;
     uint32_t r_code = ((uint32_t *)&riXYZR[idx])[3];
@@ -207,11 +209,32 @@ struct RiExtraPool
     else if (hp != 0.0f) // -1 or > 0
       riHP[idx].makeNonRegenerating();
   }
-  scene::node_index getNodeIdx(int idx) const
+  bool isInvincible(int idx)
+  {
+    if (idx < 0 || idx >= riHP.size())
+      return false;
+    return riHP[idx].isInvincible();
+  }
+  void setupDestrPhysResLodMask(const char *res_nm_for_debug);
+  void updateDestrModelReqLod(unsigned ri_lod) const
+  {
+    if (unsigned destr_lod = ri_lod < 2 ? (destrPhysResLodMask >> (ri_lod * 4)) & 0xF : 0)
+      updateModelReqLod(destroyedPhysRes, destr_lod - 1);
+  }
+  static void updateModelReqLod(DynamicPhysObjectData *physRes, unsigned lod);
+
+  struct NodeIdxAndTs
+  {
+    uint32_t tsIndex;
+    scene::node_index nodeIdx;
+  };
+
+  NodeIdxAndTs getNodeIdx(int idx) const
   {
     if (idx < 0 || idx >= tsNodeIdx.size())
-      return scene::INVALID_NODE;
-    return tsNodeIdx.data()[idx] & 0x3fffffff;
+      return {0, scene::INVALID_NODE};
+    uint32_t tsData = tsNodeIdx.data()[idx];
+    return {tsData >> 30u, tsData & 0x3fffffffu};
   }
   float bsphRad() const { return v_extract_w(bsphXYZR); }
 

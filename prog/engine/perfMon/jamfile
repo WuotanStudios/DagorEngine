@@ -20,12 +20,46 @@ Sources =
   tdrProfile.cpp
   statStd.cpp
   perfMonStat.cpp
+  platformEvents.cpp
   sleepPrecise.cpp
   memoryReport.cpp
   memoryReportVramQuery.cpp
   memoryReportLog.cpp
-  pix.cpp
 ;
+
+if $(Config) != rel {
+  Sources += alternateProfiler.cpp ;
+
+  if $(Platform) = windows && $(PlatformArch) in arm64 x86_64 {
+    local winpixeventruntimeDir = $(Root)/prog/3rdPartyLibs/winpixeventruntime ;
+    if [ GLOB $(winpixeventruntimeDir) : * ] {
+      AddIncludes += $(winpixeventruntimeDir)/Include/WinPixEventRuntime ;
+      if $(PlatformArch) = arm64 {
+        AddLibs += $(winpixeventruntimeDir)/bin/ARM64/WinPixEventRuntime.lib ;
+      } else if $(PlatformArch) = x86_64 {
+        AddLibs += $(winpixeventruntimeDir)/bin/x64/WinPixEventRuntime.lib ;
+      }
+      AddLibs += delayimp.lib -delayload:WinPixEventRuntime.dll ;
+      opt on platformEvents.cpp += -DUSE_PIX -DPIX_USE_GPU_MARKERS_V2 ;
+    }
+  } else if $(Platform) in xboxOne scarlett {
+    AddLibs += PIXEvt.lib ;
+    opt on platformEvents.cpp += -DUSE_PIX ;
+  }
+
+  if $(Platform) = windows && $(PlatformArch) = x86_64 {
+    local NvtxSdkDir = $(_DEVTOOL)/NVTX-$(NvtxSdkVersion) ;
+    if [ GLOB $(NvtxSdkDir) : * ] {
+      AddIncludes += $(NvtxSdkDir)/include ;
+      opt on platformEvents.cpp += -DUSE_NVTX ;
+      if $(PlatformSpec) = clang {
+        opt on platformEvents.cpp += -Wno-duplicate-decl-specifier ;
+      } else if $(PlatformSpec) in msvc vc17 {
+        opt on platformEvents.cpp += /wd4191 ;
+      }
+    }
+  }
+}
 
 UseGpu ?= yes ;
 
@@ -33,6 +67,7 @@ if $(UseGpu) = yes {
   Sources += gpuProfiler.cpp ;
 }
 else {
+  Target = $(Target:S=~noGPU.lib) ;
   UseProgLibs += engine/perfMon/gpuProfilerStub ;
 }
 

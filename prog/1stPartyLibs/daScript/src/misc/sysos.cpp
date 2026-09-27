@@ -2,7 +2,11 @@
 
 #include "daScript/misc/sysos.h"
 
-#if defined(_MSC_VER) && !defined(_GAMING_XBOX) && !defined(_DURANGO)
+#if defined(_WIN32) && !defined(_GAMING_XBOX) && !defined(_DURANGO)
+// All Windows toolchains use the same <windows.h> Win32 API for executable
+// path, dynamic loader, and hardware breakpoints. The old _MSC_VER gate sent
+// clang-mingw / gcc-mingw to the platform-fallback branch, which fatally
+// throws on getExecutablePathName().
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
     namespace das {
@@ -50,6 +54,27 @@
             return 0;
         }
 
+        int GetPhysicalCoreCountInWindows() {
+            DWORD returnLength = 0;
+            vector<unsigned char> buffer;
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = nullptr;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &returnLength);
+            buffer.resize(returnLength);
+            if (GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buffer.data()), &returnLength)) {
+                int coreCount = 0;
+                DWORD offset = 0;
+                while (offset < returnLength) {
+                    info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buffer.data() + offset);
+                    if (info->Relationship == RelationProcessorCore) {
+                        coreCount++;    // one record per physical core, SMT siblings collapsed
+                    }
+                    offset += info->Size;
+                }
+                return coreCount;
+            }
+            return 0;
+        }
+
         bool g_isVHSet = false;
         void ( * g_HwBpHandler ) ( int, void * ) = nullptr;
 
@@ -76,13 +101,13 @@
                 AddVectoredExceptionHandler(1, VEH_handler);
             }
             CONTEXT cxt;
-	        HANDLE thisThread = GetCurrentThread();
-        	cxt.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            HANDLE thisThread = GetCurrentThread();
+            cxt.ContextFlags = CONTEXT_DEBUG_REGISTERS;
             if ( !GetThreadContext(thisThread, &cxt) ) return -1;
             int bp_index = 0;
             for ( bp_index=0; bp_index!=4; ++bp_index ) {
                 uint32_t mask = uint32_t(1) << (bp_index*2);
-        		if ( (uint32_t(cxt.Dr7) & mask) == 0u ) {
+                if ( (uint32_t(cxt.Dr7) & mask) == 0u ) {
                     break;
                 }
             }
@@ -93,10 +118,10 @@
             case 3:     cxt.Dr3 = intptr_t(address); break;
             default:    return -1;
             }
-	        setBits(cxt.Dr7, 16 + (bp_index*4), 2, when);
-	        setBits(cxt.Dr7, 18 + (bp_index*4), 2, len);
-	        setBits(cxt.Dr7, bp_index*2,        1, 1);
-        	if ( !SetThreadContext(thisThread, &cxt) ) return -1;
+            setBits(cxt.Dr7, 16 + (bp_index*4), 2, when);
+            setBits(cxt.Dr7, 18 + (bp_index*4), 2, len);
+            setBits(cxt.Dr7, bp_index*2,        1, 1);
+            if ( !SetThreadContext(thisThread, &cxt) ) return -1;
             return bp_index;
         }
 
@@ -120,7 +145,28 @@
             return GetModuleFileNameA(NULL, pathName, (DWORD)pathNameCapacity);
         }
         void * loadDynamicLibrary ( const char * fileName ) {
-            return LoadLibraryA(fileName);
+            // Bare names (e.g. "msvcrt") need to flow through unchanged so
+            // LOAD_LIBRARY_SEARCH_DEFAULT_DIRS resolves them via system32.
+            // GetFullPathNameA on a bare name produces <CWD>/<name>, an absolute
+            // non-existent path that LoadLibraryEx then refuses to load.
+            const char * loadPath = fileName;
+            char fullPath[MAX_PATH];
+            const bool hasPath = fileName && (strchr(fileName, '/') || strchr(fileName, '\\'));
+            if ( hasPath ) {
+                DWORD got = GetFullPathNameA(fileName, MAX_PATH, fullPath, nullptr);
+                if ( got > 0 && got < MAX_PATH ) loadPath = fullPath;
+            }
+            // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR  — also search the loaded DLL's own dir
+            //                                     for its imports (lets bundles ship a
+            //                                     module's native deps colocated under
+            //                                     <bundle>/modules/<X>/).
+            // LOAD_LIBRARY_SEARCH_APPLICATION_DIR — preserves the legacy behavior
+            //                                       (deps next to the .exe still resolve).
+            // LOAD_LIBRARY_SEARCH_DEFAULT_DIRS — system32 / safe defaults.
+            return LoadLibraryExA(loadPath, NULL,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         }
         void * getFunctionAddress ( void * module, const char * func ) {
             return (void*)GetProcAddress(HMODULE(module),func);
@@ -128,10 +174,36 @@
         void * getLibraryHandle ( const char * moduleName ) {
             return GetModuleHandleA(moduleName);
         }
+        string getDynamicLibraryError ( void ) {
+            DWORD err = GetLastError();
+            if ( err == 0 ) return "";
+            LPSTR buf = nullptr;
+            DWORD n = FormatMessageA(
+                FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                (LPSTR)&buf, 0, nullptr);
+            string msg = (n && buf) ? string(buf, n) : ("error code " + to_string(err));
+            if ( buf ) LocalFree(buf);
+            while ( !msg.empty() && (msg.back()=='\r' || msg.back()=='\n') ) msg.pop_back();
+            return msg;
+        }
         string normalizeFileName ( const char * fileName ) {
-            char buffer[MAX_PATH ];
-            auto ret = GetFullPathNameA(fileName,MAX_PATH,buffer,nullptr);
-            return ret ? buffer : "";
+            // das strings are UTF-8; the ANSI variant misreads non-ANSI names, so go wide
+            wchar_t wideName[MAX_PATH];
+            if ( !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, fileName ? fileName : "", -1, wideName, MAX_PATH) )
+                return "";
+            wchar_t buffer[MAX_PATH];
+            auto ret = GetFullPathNameW(wideName, MAX_PATH, buffer, nullptr);
+            if ( !ret || ret >= MAX_PATH ) return "";
+            char utf8[MAX_PATH * 4];
+            if ( !WideCharToMultiByte(CP_UTF8, 0, buffer, -1, utf8, int(sizeof(utf8)), nullptr, nullptr) )
+                return "";
+            string result = utf8;
+            // GetFullPathNameW may leave a trailing backslash for directory
+            // paths (e.g. "./" -> "D:\foo\"). Trim it for consistency.
+            if ( result.size()>3 && (result.back()=='\\' || result.back()=='/') )
+                result.pop_back();
+            return result;
         }
         bool closeLibrary ( void * module ) {
             return FreeLibrary(HMODULE(module));
@@ -149,22 +221,41 @@
             return false;
         }
         size_t getExecutablePathName(char* pathName, size_t pathNameCapacity) {
+#if defined(_EMSCRIPTEN_VER)
+            // wasm-standalone has no /proc/self/exe; readlink would import
+            // env::__syscall_readlinkat which wasi-only hosts can't satisfy.
+            if (pathNameCapacity > 0) pathName[0] = '\0';
+            return 0;
+#else
             size_t pathNameSize = readlink("/proc/self/exe", pathName, pathNameCapacity - 1);
             pathName[pathNameSize] = '\0';
             return pathNameSize;
+#endif
         }
         void * loadDynamicLibrary ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY);
+            // RTLD_GLOBAL so symbols from loaded .shared_module files
+            // (e.g. live_host_*) are visible to dlsym(RTLD_DEFAULT) in
+            // host executables like daslang-live.
+            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
         }
         void * getFunctionAddress ( void * lib, const char * name ) {
             return lib ? dlsym(lib, name) : nullptr;
         }
         void * getLibraryHandle ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY);
+            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+        }
+        string getDynamicLibraryError ( void ) {
+            const char * e = dlerror();
+            return e ? e : "";
         }
         string normalizeFileName ( const char * fileName ) {
-            // TODO: implement
-            return "";
+            char buffer[PATH_MAX];
+            if ( realpath(fileName, buffer) != nullptr ) {
+                return buffer;
+            } else {
+                // If realpath fails (e.g., file doesn't exist), fallback
+                return fileName ? fileName : "";
+            }
         }
         bool closeLibrary ( void * module ) {
             return dlclose(module) == 0;
@@ -212,19 +303,19 @@
             __forceinline int ffs(int x)   {
                 return __builtin_ffs(x);
             }
-            uint64_t get_distance_from_watchpoint (uint64_t addr, uint64_t val,	int len ) {
-	            uint64_t wp_low, wp_high;
-	            uint32_t lens, lene;
-	            lens = ffs(len);
-	            lene = fls(len);
-	            wp_low = val + lens;
-	            wp_high = val + lene;
-	            if (addr < wp_low)
-		            return wp_low - addr;
-	            else if (addr > wp_high)
-		            return addr - wp_high;
-	            else
-		            return 0;
+            uint64_t get_distance_from_watchpoint (uint64_t addr, uint64_t val,    int len ) {
+                uint64_t wp_low, wp_high;
+                uint32_t lens, lene;
+                lens = ffs(len);
+                lene = fls(len);
+                wp_low = val + lens;
+                wp_high = val + lene;
+                if (addr < wp_low)
+                    return wp_low - addr;
+                else if (addr > wp_high)
+                    return addr - wp_high;
+                else
+                    return 0;
             }
 
             uint64_t encode_ctrl_reg ( HwBpSize len, HwBpType type, bool enabled ) {
@@ -352,7 +443,7 @@
             int bp_index = 0;
             for ( bp_index=0; bp_index!=4; ++bp_index ) {
                 uint32_t mask = uint32_t(1) << (bp_index*2);
-        		if ( (uint32_t(dr.uds.ds64.__dr7) & mask) == 0u ) {
+                if ( (uint32_t(dr.uds.ds64.__dr7) & mask) == 0u ) {
                     break;
                 }
             }
@@ -363,9 +454,9 @@
             case 3:     dr.uds.ds64.__dr3 = intptr_t(address); break;
             default:    return -1;
             }
-	        setBits(dr.uds.ds64.__dr7, 16 + (bp_index*4), 2, when);
-	        setBits(dr.uds.ds64.__dr7, 18 + (bp_index*4), 2, len);
-	        setBits(dr.uds.ds64.__dr7, bp_index*2,        1, 1);
+            setBits(dr.uds.ds64.__dr7, 16 + (bp_index*4), 2, when);
+            setBits(dr.uds.ds64.__dr7, 18 + (bp_index*4), 2, len);
+            setBits(dr.uds.ds64.__dr7, bp_index*2,        1, 1);
             dr_count = x86_DEBUG_STATE_COUNT;
             thread_set_state(mythread, x86_DEBUG_STATE, (thread_state_t) &dr, dr_count);
             return bp_index;
@@ -430,17 +521,29 @@
             return 0;
         }
         void * loadDynamicLibrary ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY);
+            // RTLD_GLOBAL — see Linux note above.
+            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
         }
         void * getFunctionAddress ( void * lib, const char * name ) {
             return lib ? dlsym(lib, name) : nullptr;
         }
         void * getLibraryHandle ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY);
+            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+        }
+        string getDynamicLibraryError ( void ) {
+            const char * e = dlerror();
+            return e ? e : "";
         }
         string normalizeFileName ( const char * fileName ) {
-            // TODO: implement
-            return "";
+            char buffer[PATH_MAX];
+
+            // Use realpath to resolve the absolute path and normalize it
+            if (realpath(fileName, buffer) != nullptr) {
+                return buffer;
+            } else {
+                // If realpath fails (e.g., file doesn't exist), fallback
+                return fileName ? fileName : "";
+            }
         }
         bool closeLibrary ( void * module ) {
             return dlclose(module) == 0;
@@ -469,13 +572,18 @@
             return snprintf(pathName, pathNameCapacity, "%s", executablePath);
         }
         void * loadDynamicLibrary ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY);
+            // RTLD_GLOBAL — see Linux note above.
+            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
         }
         void * getFunctionAddress ( void * lib, const char * name ) {
             return lib ? dlsym(lib, name) : nullptr;
         }
         void * getLibraryHandle ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY);
+            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+        }
+        string getDynamicLibraryError ( void ) {
+            const char * e = dlerror();
+            return e ? e : "";
         }
         string normalizeFileName ( const char * fileName ) {
             // TODO: implement
@@ -510,6 +618,9 @@
         void * getLibraryHandle ( const char *  ) {
             // TODO: implement
             return nullptr;
+        }
+        string getDynamicLibraryError ( void ) {
+            return "";
         }
         string normalizeFileName ( const char * fileName ) {
             // TODO: implement

@@ -14,6 +14,7 @@
 #include "gatherVar.h"
 #include "globVar.h"
 #include "boolVar.h"
+#include "boolExpr.h"
 #include "codeBlocks.h"
 #include "cppStcodeAssembly.h"
 #include "cppStcode.h"
@@ -97,6 +98,8 @@ void ShaderSemCode::dump()
 
 void SemanticShaderPass::dump(ShaderSemCode &code)
 {
+  dag::ConstSpan<int> stcode = preshader->dynStBytecode;
+  dag::ConstSpan<int> stblkcode = preshader->stBlkBytecode;
   debug("  state code: %d tokens", stcode.size());
   for (int i = 0; i < stcode.size(); ++i)
     debug("    %10d %s", stcode[i], ShUtils::shcod_tokname(shaderopcode::getOp(stcode[i])));
@@ -119,40 +122,36 @@ int ShaderSemCode::find_var(const int variable_id)
 
 bool SemanticShaderPass::equal(SemanticShaderPass &p)
 {
-  if (fsh.size() != p.fsh.size())
-    return false;
-  if (fsh.data() != p.fsh.data() && !mem_eq(fsh, p.fsh.data()))
+  if (fsh != p.fsh)
     return false;
 
-  if (vpr.size() != p.vpr.size())
-    return false;
-  if (vpr.data() != p.vpr.data() && !mem_eq(vpr, p.vpr.data()))
+  if (vpr != p.vpr)
     return false;
 
-  if (hs.size() != p.hs.size())
-    return false;
-  if (hs.data() != p.hs.data() && !mem_eq(hs, p.hs.data()))
+  if (hs != p.hs)
     return false;
 
-  if (ds.size() != p.ds.size())
-    return false;
-  if (ds.data() != p.ds.data() && !mem_eq(ds, p.ds.data()))
+  if (ds != p.ds)
     return false;
 
-  if (gs.size() != p.gs.size())
-    return false;
-  if (gs.data() != p.gs.data() && !mem_eq(gs, p.gs.data()))
+  if (gs != p.gs)
     return false;
 
-  if (stcode.size() != p.stcode.size())
+  if (preshader->dynStBytecode.size() != p.preshader->dynStBytecode.size())
     return false;
-  if (stcode.data() != p.stcode.data() && !mem_eq(stcode, p.stcode.data()))
+  if (preshader->dynStBytecode.data() != p.preshader->dynStBytecode.data() &&
+      !mem_eq(preshader->dynStBytecode, p.preshader->dynStBytecode.data()))
+  {
     return false;
+  }
 
-  if (stblkcode.size() != p.stblkcode.size())
+  if (preshader->stBlkBytecode.size() != p.preshader->stBlkBytecode.size())
     return false;
-  if (stblkcode.data() != p.stblkcode.data() && !mem_eq(stblkcode, p.stblkcode.data()))
+  if (preshader->stBlkBytecode.data() != p.preshader->stBlkBytecode.data() &&
+      !mem_eq(preshader->stBlkBytecode, p.preshader->stBlkBytecode.data()))
+  {
     return false;
+  }
 
 #define COMPARE_V(v) \
   if (v != p.v)      \
@@ -259,7 +258,6 @@ const char *ShaderSemCode::equal(ShaderSemCode &c, bool compare_passes_and_vars)
 
 namespace ShaderParser
 {
-PerHlslStage<CodeSourceBlocks *> curHlslBlks{};
 SCFastNameMap renderStageToIdxMap;
 
 static void eval_shader_stat(shader_stat &s, ShaderEvalCB &cb);
@@ -300,6 +298,8 @@ static void eval_shader_stat(shader_stat &s, ShaderEvalCB &cb)
     cb.eval_channel_decl(*s.channel);
   else if (s.render_stage)
     cb.eval_render_stage(*s.render_stage);
+  else if (s.rt_pipeline)
+    cb.eval_raytrace_pipeline(*s.rt_pipeline);
   else if (s.assume)
     cb.eval_assume_stat(*s.assume);
   else if (s.assume_if_not_assumed)
@@ -342,10 +342,18 @@ static bool is_compute(hlsl_compile_class &hlsl_compile)
   return dd_strnicmp(hlsl_compile.profile->text, "target_cs", 9) == 0 || dd_strnicmp(hlsl_compile.profile->text, "cs_", 3) == 0;
 }
 
-void eval_shader(shader_decl &sh, ShaderEvalCB &cb)
+void eval_shader(shader_decl &sh, ShaderEvalCB &cb, Parser &parser)
 {
-  for (int i = 0; i < sh.stat.size(); ++i)
-    eval_shader_stat(sh.stat[i], cb);
+  parser.get_lexer().begin_shader();
+  try
+  {
+    for (int i = 0; i < sh.stat.size(); ++i)
+      eval_shader_stat(sh.stat[i], cb);
+    cb.end_eval(sh);
+  }
+  catch (ShaderEvalCB::GsclStopProcessingException e)
+  {}
+  parser.get_lexer().end_shader();
 }
 
 // ³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³³//
@@ -430,16 +438,8 @@ static eastl::optional<EvaluatedShaderVariant> evalShaderVariant(shader_decl *sh
   shc::VariantContext variantCtx = ctx.makeVariantContext(variant, res.semcode, res.pass.get());
 
   // evaluate shader
-  parser.get_lexer().begin_shader();
   AssembleShaderEvalCB cb{variantCtx};
-  try
-  {
-    eval_shader(*sh, cb);
-    cb.end_eval(*sh);
-  }
-  catch (ShaderEvalCB::GsclStopProcessingException e)
-  {}
-  parser.get_lexer().end_shader();
+  eval_shader(*sh, cb, parser);
 
   if (cb.dont_render)
   {
@@ -450,18 +450,12 @@ static eastl::optional<EvaluatedShaderVariant> evalShaderVariant(shader_decl *sh
   return res;
 }
 
-static void shaderError(Parser &parser, const char *msg, Terminal *t)
+static void gatherLocalVars(shader_decl *sh, Parser &parser, const ShaderVariant::VariantInfo &variant, shc::ShaderContext &ctx)
 {
-  if (t)
-    parser.get_lexer().set_error(t->file_start, t->line_start, t->col_start, msg);
-  else
-    parser.get_lexer().set_error(msg);
-}
-
-static void shaderWarn(Parser &parser, const char *msg, Terminal *t)
-{
-  G_ASSERT(t);
-  parser.get_lexer().set_warning(t->file_start, t->line_start, t->col_start, msg);
+  ShaderSemCode stubSemCode{ctx.tgtCtx()};
+  shc::VariantContext variantCtx = ctx.makeVariantContext(variant, stubSemCode, nullptr, false);
+  GatherVariantLocalVarsCB cb{variantCtx};
+  eval_shader(*sh, cb, parser);
 }
 
 static bool validate_cs(const ShaderClass &sclass, ShaderSemCode *ssc, int staticVariantCount)
@@ -474,11 +468,11 @@ static bool validate_cs(const ShaderClass &sclass, ShaderSemCode *ssc, int stati
     {
       if (ssc->passes[m]->pass)
       {
-        if (ssc->passes[m]->pass->cs.size())
+        if (!ssc->passes[m]->pass->cs.empty())
           has_cs = true;
-        if (ssc->passes[m]->pass->vpr.size() || ssc->passes[m]->pass->fsh.size())
+        if (!ssc->passes[m]->pass->vpr.empty() || !ssc->passes[m]->pass->fsh.empty())
           has_non_cs = true;
-        if (!ssc->passes[m]->pass->fsh.size() && !ssc->passes[m]->pass->vpr.size() && !ssc->passes[m]->pass->cs.size())
+        if (ssc->passes[m]->pass->fsh.empty() && ssc->passes[m]->pass->vpr.empty() && ssc->passes[m]->pass->cs.empty())
           has_void = true;
       }
     }
@@ -508,7 +502,8 @@ static bool validate_cs(const ShaderClass &sclass, ShaderSemCode *ssc, int stati
   {
     if (!ssc->passes[m])
       continue;
-    const int *cod = ssc->passes[m]->pass->stblkcode.data(), *cod_e = cod + ssc->passes[m]->pass->stblkcode.size();
+    const int *cod = ssc->passes[m]->pass->preshader->stBlkBytecode.data(),
+              *cod_e = cod + ssc->passes[m]->pass->preshader->stBlkBytecode.size();
     int unexp_stcod = -1;
 
     for (const int *codp = cod; codp < cod_e && unexp_stcod < 0; codp++)
@@ -529,7 +524,8 @@ static bool validate_cs(const ShaderClass &sclass, ShaderSemCode *ssc, int stati
       ShUtils::shcod_dump(dag::ConstSpan<int>(cod, cod_e - cod));
       break;
     }
-    ssc->passes[m]->pass->stblkcode.reset();
+
+    ssc->passes[m]->pass->preshader->stBlkBytecode.clear();
   }
 
   return ErrorCounter::curShader().err == 0;
@@ -537,7 +533,7 @@ static bool validate_cs(const ShaderClass &sclass, ShaderSemCode *ssc, int stati
 
 static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::TargetContext &ctx)
 {
-  if (!shc::isShaderRequired(shname->text))
+  if (!shc::config().shaderIsRequired(shname->text))
     return;
 
   sh_set_current_shader(shname->text);
@@ -545,6 +541,7 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
 
   shc::ShaderContext shContext = ctx.makeShaderContext(shname->text, ShaderBlockLevel::SHADER, shname);
   ShaderClass &sclass = shContext.compiledShader();
+  sh_process_errors();
 
   if (ErrorCounter::curShader().err > 0)
   {
@@ -558,37 +555,22 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
   semantic::initialize_debug_mode(shContext);
 
   // gather static variant vars
-  parser.get_lexer().begin_shader();
   GatherVarShaderEvalCB stVarCB{shContext};
-
-  eval_shader(*sh, stVarCB);
-  parser.get_lexer().end_shader();
-
-  // set globals ShaderParser::curVsCode etc. for lifetime of this function
-  class LocalSourceBlocks
-  {
-  public:
-    LocalSourceBlocks()
-    {
-      for (HlslCompilationStage stage : HLSL_ALL_LIST)
-        curHlslBlks.all[stage] = &blks.all[stage];
-    }
-    ~LocalSourceBlocks()
-    {
-      shc::await_all_jobs();
-      curHlslBlks = {};
-    }
-
-    PerHlslStage<CodeSourceBlocks> blks{};
-  };
-  LocalSourceBlocks lsb;
+  eval_shader(*sh, stVarCB, parser);
 
   // parse code blocks
-  if (!semantic::parse_hlsl_source_to_blocks(curHlslBlks, stVarCB, shContext))
+  if (!ctx.isPreshaderOnly())
   {
-    sh_debug(SHLOG_ERROR, "cannot parse shader code in <%s>", shname->text);
-    return;
+    if (!semantic::parse_hlsl_source_to_blocks(shContext, stVarCB))
+    {
+      sh_debug(SHLOG_ERROR, "cannot parse shader code in <%s>", shname->text);
+      return;
+    }
   }
+
+  // All main-line hlsl includes are collected right above, and preshader hlsl includes are collected via GatherVarShaderEvalCB
+  if (shc::config().dependencyDumpMode)
+    return;
 
   const shc::TypeTables &types = shContext.typeTables();
   const IntervalList &intervals = shContext.intervals();
@@ -630,19 +612,6 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
     it->second.fromVar(var);
   };
 
-  if (shContext.isDebugModeEnabled())
-  {
-    const ShaderMessages &messages = shContext.messages();
-    const auto &table = messages.strings;
-    for (int i = 0; i < table.nameCount(); i++)
-    {
-      if (messages.isFilenameMessage(i))
-        sclass.messages.emplace_back(table.getName(i));
-      else
-        sclass.messages.emplace_back(string_f("%s: %s", shname->text, table.getName(i)));
-    }
-  }
-
   Tab<eastl::unique_ptr<ShaderSemCode>> semcode{};
   Tab<int> shInitCodeLast{};
 
@@ -656,13 +625,14 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
     sclass.shInitCode.clear();
 
     ShaderVariant::VariantSrc *staticVariant = staticVariants.getVariant(i);
+    sh_set_current_variant(staticVariant);
     if (!shc::isValidVariant(staticVariant, NULL))
     {
+      gatherLocalVars(sh, parser, ShaderVariant::VariantInfo{*staticVariant, nullptr}, shContext);
+      sclass.shInitCode.clear(); // discard stub-color init opcodes gathered from this invalid variant's body
       staticVariant->codeId = shc::shouldMarkInvalidAsNull() ? -1 : -2;
       continue;
     }
-
-    sh_set_current_variant(staticVariant);
 
     // empty class for storage
     eastl::unique_ptr<ShaderSemCode> ssc{};
@@ -682,6 +652,20 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
       else if ((parsedSsc.flags & SC_STAGE_IDX_MASK) != render_stage_idx)
         sh_debug(SHLOG_WARNING, "shader(%s): different renderStageIdx used in dynvariants: %d and %d", shname->text, render_stage_idx,
           (parsedSsc.flags & SC_STAGE_IDX_MASK));
+
+      {
+        // Storing both in shContext for persistent memory allocation
+        for (int intervalNameId : shContext.typeTables().uniqueIntervalNameIdsReferencedInBoolExpressions)
+        {
+          int varNameId = ctx.varNameMap().getVarId(ctx.intervalNameMap().getName(intervalNameId));
+          if (varNameId < 0)
+            continue;
+          int varLinearId = parsedSsc.find_var(varNameId);
+          if (varLinearId < 0)
+            continue;
+          parsedSsc.vars[varLinearId].used = true;
+        }
+      }
 
       if (!passCount)
       {
@@ -736,71 +720,87 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
     };
 
     ShaderVariant::VariantTableSrc dynamicVariants{ctx};
-    dynamicVariants.generateFromTypes(types.allDynamicTypes, intervals, false);
 
-    if (types.allDynamicTypes.getCount())
+    if (ctx.isPreshaderOnly())
     {
-      // dynamic variants present
-
-      int dynamicVariantCount = dynamicVariants.getVarCount();
-      shc::prepareTestVariant(NULL, &dynamicVariants.getTypes());
-      FastIntList invalidVariants;
-
-      // for each dynamic variant:
-      for (int d = 0; d < dynamicVariantCount; d++)
-      {
-        if (!shc::isValidVariant(staticVariant, dynamicVariants.getVariant(d)))
-        {
-          if (!shc::shouldMarkInvalidAsNull())
-            invalidVariants.addInt(d);
-          continue;
-        }
-
-        ShaderVariant::VariantSrc *dynamicVariant = dynamicVariants.getVariant(d);
-        sh_set_current_dyn_variant(dynamicVariant);
-
-        auto evaluatedVariantMaybe =
-          evalShaderVariant(sh, parser, ShaderVariant::VariantInfo(*staticVariant, dynamicVariant), shContext);
-
-        if (evaluatedVariantMaybe)
-        {
-          dynamicVariant->codeId = d;
-          addVariantEvaluationResult(eastl::move(*evaluatedVariantMaybe), d, dynamicVariantCount);
-        }
-
-        sh_set_current_dyn_variant(nullptr);
-      }
-
-      if (invalidVariants.getList().size() == dynamicVariantCount)
-        staticVariant->codeId = shc::shouldMarkInvalidAsNull() ? -1 : -2;
-      else if (invalidVariants.getList().size())
-      {
-        for (int i = 0; i < invalidVariants.getList().size(); i++)
-          dynamicVariants.getVariant(invalidVariants.getList()[i])->codeId = -2; // @TODO: use markInvalidAsNull here too?
-      }
+      evalShaderVariant(sh, parser, ShaderVariant::VariantInfo{*staticVariant, nullptr}, shContext);
     }
     else
     {
-      // no dynamic variants present
-      auto parsedSscMaybe = evalShaderVariant(sh, parser, ShaderVariant::VariantInfo{*staticVariant, nullptr}, shContext);
-      if (parsedSscMaybe)
-        addVariantEvaluationResult(eastl::move(*parsedSscMaybe), 0, 1);
+      dynamicVariants.generateFromTypes(types.allDynamicTypes, intervals, false);
+
+      if (types.allDynamicTypes.getCount())
+      {
+        // dynamic variants present
+
+        int dynamicVariantCount = dynamicVariants.getVarCount();
+        shc::prepareTestVariant(NULL, &dynamicVariants.getTypes());
+        FastIntList invalidVariants;
+
+        // for each dynamic variant:
+        for (int d = 0; d < dynamicVariantCount; d++)
+        {
+          ShaderVariant::VariantSrc *dynamicVariant = dynamicVariants.getVariant(d);
+          sh_set_current_dyn_variant(dynamicVariant);
+
+          if (!shc::isValidVariant(staticVariant, dynamicVariant))
+          {
+            // discard init code for invalid variants
+            int shInitCodeSizeBeforeInvalidVariant = sclass.shInitCode.size();
+            gatherLocalVars(sh, parser, ShaderVariant::VariantInfo(*staticVariant, dynamicVariant), shContext);
+            sclass.shInitCode.resize(shInitCodeSizeBeforeInvalidVariant);
+            if (!shc::shouldMarkInvalidAsNull())
+              invalidVariants.addInt(d);
+            sh_set_current_dyn_variant(nullptr);
+            continue;
+          }
+
+          auto evaluatedVariantMaybe =
+            evalShaderVariant(sh, parser, ShaderVariant::VariantInfo(*staticVariant, dynamicVariant), shContext);
+
+          if (evaluatedVariantMaybe)
+          {
+            dynamicVariant->codeId = d;
+            addVariantEvaluationResult(eastl::move(*evaluatedVariantMaybe), d, dynamicVariantCount);
+          }
+
+          sh_set_current_dyn_variant(nullptr);
+        }
+
+        if (invalidVariants.getList().size() == dynamicVariantCount)
+          staticVariant->codeId = shc::shouldMarkInvalidAsNull() ? -1 : -2;
+        else if (invalidVariants.getList().size())
+        {
+          for (int i = 0; i < invalidVariants.getList().size(); i++)
+            dynamicVariants.getVariant(invalidVariants.getList()[i])->codeId = -2; // @TODO: use markInvalidAsNull here too?
+        }
+      }
       else
-        staticVariant->codeId = -1;
+      {
+        // no dynamic variants present
+        auto parsedSscMaybe = evalShaderVariant(sh, parser, ShaderVariant::VariantInfo{*staticVariant, nullptr}, shContext);
+        if (parsedSscMaybe)
+          addVariantEvaluationResult(eastl::move(*parsedSscMaybe), 0, 1);
+        else
+          staticVariant->codeId = -1;
+      }
     }
 
     if (passCount)
     {
       // check for variable usage
-      eastl::for_each(usageInfo.cbegin(), usageInfo.cend(), [&](const auto &pair) {
-        auto [name, var] = pair;
-        if (!var.used && !var.noWarnings)
-        {
-          if (strcmp("instancing_const_begin", name) != 0 && strcmp("instancing_const_end", name) != 0)
-            shaderWarn(parser,
-              "variable '" + String{name} + "' not used in static variant '" + staticVariant->getVarStringInfo() + "'", var.terminal);
-        }
-      });
+      if (!ctx.isPreshaderOnly())
+        eastl::for_each(usageInfo.cbegin(), usageInfo.cend(), [&](const auto &pair) {
+          auto [name, var] = pair;
+          if (!var.used && !var.noWarnings)
+          {
+            if (strcmp("instancing_const_begin", name) != 0 && strcmp("instancing_const_end", name) != 0)
+            {
+              report_warning(parser, *var.terminal,
+                "variable '" + String{name} + "' not used in static variant '" + staticVariant->getVarStringInfo() + "'");
+            }
+          }
+        });
 
       if ((ssc->flags & SC_STAGE_IDX_MASK) != render_stage_idx)
         sh_debug(SHLOG_WARNING, "shader(%s): staticvariant uses renderStageIdx=%d, while dynvariants uses %d", shContext.name(),
@@ -820,34 +820,45 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
         if (semcode[j]->equal(*ssc, true) == NULL)
           break;
 
-      if (j >= semcode.size())
+      if (j >= semcode.size() && !ctx.isPreshaderOnly())
       {
         j = semcode.size();
         ShaderCode *sc = ssc->generateShaderCode(dynamicVariants);
 
         if (shc::config().cppStcodeMode == shader_layout::ExternalStcodeMode::BRANCHED_CPP)
         {
+          auto buildBranchlessDynstcode = [&] {
+            if (lastParsedPass->preshader->postedToTarget)
+            {
+              return lastParsedPass->preshader->cppStcodeId;
+            }
+            else
+            {
+              lastParsedPass->preshader->cppStcodeId =
+                ctx.cppStcode().addCode(eastl::move(lastParsedPass->preshader->cppStcode.cppStcode), lastParsedPass->psOrCsConstRange,
+                  lastParsedPass->vsConstRange);
+              lastParsedPass->preshader->postedToTarget = true;
+              return lastParsedPass->preshader->cppStcodeId;
+            }
+          };
+
           if (passCount > 1)
           {
             shc::VariantContext variantCtx =
               shContext.makeVariantContext(ShaderVariant::VariantInfo{*staticVariant, nullptr}, *ssc, nullptr, true);
 
-            auto &cppcode = variantCtx.cppStcode();
+            StcodePass cppcode{};
 
-            StcodeBranchedBuildEvalCB cb{variantCtx};
+            StcodeBranchedBuildEvalCB cb{cppcode, variantCtx};
+            eval_shader(*sh, cb, parser);
 
-            parser.get_lexer().begin_shader();
-            eval_shader(*sh, cb);
-            parser.get_lexer().end_shader();
-
-            assembly::build_cpp_declarations_for_used_bool_vars(variantCtx);
-            assembly::build_cpp_declarations_for_used_local_vars(variantCtx);
+            assembly::build_cpp_declarations_for_used_bool_vars(cppcode, variantCtx);
+            assembly::build_cpp_declarations_for_used_local_vars(cppcode, variantCtx);
 
             // If the code is flat, just use base variant without dynamic elements
             if (!cppcode.cppStcode.hasCodeUnderConditions)
             {
-              sc->branchedCppStcodeId = ctx.cppStcode().addCode(eastl::move(lastParsedPass->cppstcode.cppStcode),
-                lastParsedPass->psOrCsConstRange, lastParsedPass->vsConstRange);
+              sc->branchedCppStcodeId = buildBranchlessDynstcode();
             }
 
             if (sc->branchedCppStcodeId == -1)
@@ -870,14 +881,13 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
           }
           else
           {
-            sc->branchedCppStcodeId = ctx.cppStcode().addCode(eastl::move(lastParsedPass->cppstcode.cppStcode),
-              lastParsedPass->psOrCsConstRange, lastParsedPass->vsConstRange);
+            sc->branchedCppStcodeId = buildBranchlessDynstcode();
           }
         }
 
         for (auto &pt : ssc->passes)
           if (pt && pt->pass)
-            pt->pass->clearCppStcodeData();
+            pt->pass->clearIntermediateData();
 
         semcode.push_back(eastl::move(ssc));
         sclass.code.push_back(sc);
@@ -905,6 +915,15 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
     }
   }
 
+  sh_set_current_variant(NULL);
+  sh_set_current_dyn_variant(NULL);
+
+  if (ctx.isPreshaderOnly())
+  {
+    ErrorCounter::curShader().reset();
+    return;
+  }
+
   if (shContext.isDebugModeEnabled())
     for (int i = 0; i < sclass.uniqueStrings.nameCount(); i++)
       sclass.messages.emplace_back(sclass.uniqueStrings.getName(i));
@@ -918,6 +937,34 @@ static void add_shader(shader_decl *sh, Parser &parser, Terminal *shname, shc::T
   sclass.sortStaticVarsByMode();
 
   staticVariants.fillVariantTable(sclass.staticVariants);
+
+  {
+    auto validateIntervalBacking = [&](const auto &type) {
+      if (!type.interval)
+        return;
+      int intervalNameId = type.interval->getNameId();
+      if (intervalNameId < 0)
+        return;
+      const char *intervalName = ctx.intervalNameMap().getName(intervalNameId);
+      int varNameId = ctx.varNameMap().getVarId(intervalName);
+      if (varNameId < 0 || (ctx.globVars().getVarInternalIndex(varNameId) < 0 && sclass.find_static_var(varNameId) < 0))
+      {
+        sh_debug(SHLOG_ERROR,
+          "Interval '%s' is used in type table but is not backed by a var. This may have been due to excessive 'invalid' "
+          "variants pruning any references to the var. Examine the blk for bugs in invalid variants.\n",
+          intervalName);
+      }
+    };
+    for (int ti = 0; ti < sclass.staticVariants.getTypes().getCount(); ++ti)
+      validateIntervalBacking(sclass.staticVariants.getTypes().getType(ti));
+    for (const ShaderCode *cd : sclass.code)
+    {
+      if (!cd)
+        continue;
+      for (int ti = 0; ti < cd->dynVariants.getTypes().getCount(); ++ti)
+        validateIntervalBacking(cd->dynVariants.getTypes().getType(ti));
+    }
+  }
 
   sh_set_current_variant(NULL);
   sh_set_current_dyn_variant(NULL);
@@ -1020,9 +1067,7 @@ void add_block(block_decl *bl, Parser &parser, shc::TargetContext &ctx)
     return;
 
   ShaderBlockLevel level = ShaderBlockLevel::UNDEFINED;
-  if (strcmp(bl->block_scope->text, "global_const") == 0)
-    level = ShaderBlockLevel::GLOBAL_CONST;
-  else if (strcmp(bl->block_scope->text, "frame") == 0)
+  if (strcmp(bl->block_scope->text, "frame") == 0)
     level = ShaderBlockLevel::FRAME;
   else if (strcmp(bl->block_scope->text, "scene") == 0)
     level = ShaderBlockLevel::SCENE;
@@ -1050,6 +1095,7 @@ void add_block(block_decl *bl, Parser &parser, shc::TargetContext &ctx)
 
   shc::ShaderContext shaderBlockCtx = ctx.makeShaderContext(bl->name->text, level, bl->name);
   shc::VariantContext variantCtx = shaderBlockCtx.makeVariantContext(variant, targetSsc);
+  sh_process_errors();
 
   // evaluate shader
   AssembleShaderEvalCB cb{variantCtx};
@@ -1058,27 +1104,32 @@ void add_block(block_decl *bl, Parser &parser, shc::TargetContext &ctx)
   eval_block(*bl, cb, parser);
   parser.get_lexer().end_block();
 
-  cb.compilePreshader();
+  if (shc::config().dependencyDumpMode)
+    return;
 
-  const auto &bytecode = variantCtx.stBytecode();
+  if (ctx.isPreshaderOnly())
+    return;
+
+  auto preshaderCompilationOutputMaybe = compile_variant_preshader(cb.preshaderSource, variantCtx);
+  if (!preshaderCompilationOutputMaybe)
+    return;
+
+  auto &compiledPreshader = preshaderCompilationOutputMaybe->code;
 
   Tab<int> stcode{};
-  append_items(stcode, bytecode.stblkcode.size(), bytecode.stblkcode.data());
-  append_items(stcode, bytecode.stcode.size(), bytecode.stcode.data());
+  append_items(stcode, compiledPreshader.stBlkBytecode.size(), compiledPreshader.stBlkBytecode.data());
+  append_items(stcode, compiledPreshader.dynStBytecode.size(), compiledPreshader.dynStBytecode.data());
 
-  assembly::build_cpp_declarations_for_used_local_vars(variantCtx);
+  DynamicStcodeRoutine collectedScript = eastl::move(compiledPreshader.cppStcode.cppStcode);
+  collectedScript.merge(eastl::move((StcodeRoutine &)compiledPreshader.cppStcode.cppStblkcode));
 
-  DynamicStcodeRoutine collectedScript = eastl::move(variantCtx.cppStcode().cppStcode);
-  collectedScript.merge(eastl::move((StcodeRoutine &)variantCtx.cppStcode().cppStblkcode));
-
-  ShaderStateBlock *blk = new ShaderStateBlock(bl->name->text, level, eastl::move(variantCtx.namedConstTable()), make_span(stcode),
-    &collectedScript, bytecode.regAllocator->requiredRegCount(), ctx);
+  ShaderStateBlock *blk = new ShaderStateBlock(bl->name->text, level, eastl::move(compiledPreshader.namedConstTable),
+    make_span(stcode), &collectedScript, compiledPreshader.requiredRegCount, ctx);
 
   if (!ctx.blocks().registerBlock(blk))
   {
     REPORT_ERR("cannot add block", bl->name);
     delete blk;
-    return;
   }
 }
 
@@ -1107,12 +1158,17 @@ void add_hlsl(hlsl_global_decl_class &sh, Parser &parser, shc::TargetContext &ct
 }
 #undef REPORT_ERR
 
-void add_global_bool(ShaderTerminal::bool_decl &bool_var, Parser &parser, shc::TargetContext &ctx)
+void add_global_bool(ShaderTerminal::bool_decl &decl, Parser &parser, shc::TargetContext &ctx)
 {
-  ctx.globBoolVars().add(bool_var, parser);
+  G_ASSERT(decl.resolvedNid < 0);
+  decl.resolvedNid = ctx.boolVarNameMap().addVarId(decl.name->text);
+  ctx.globBoolVars().add(decl.resolvedNid, decl.expr, parser, decl.name);
 
-  String hlsl_bool_var(0, "##bool %s\n", bool_var.name->text);
+  String hlsl_bool_var(0, "##bool %s\n", decl.name->text);
   ctx.globHlslSrc().forEach([&](String &src) { src.append(hlsl_bool_var); });
+
+  G_ASSERT(!decl.expr->compiled);
+  compile_bool_expr_cached(*decl.expr, ctx);
 }
 }; // namespace ShaderParser
 

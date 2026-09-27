@@ -15,12 +15,29 @@ void CachedStates::makeState(const StateKey &key)
             (key.s.zfunc != ZFUNC_GREATER_EQUAL ? shaders::OverrideState::Z_FUNC : 0));
   state.sblend = BLEND_SRCALPHA;
   state.dblend = BLEND_INVSRCALPHA;
-  state.sblenda = BLEND_ZERO;
+  state.sblenda = BLEND_ONE;
   state.dblenda = BLEND_ZERO;
 
   if (key.s.zfunc == ZFUNC_LESS)
     state.zFunc = CMPF_LESS;
+
+  if (zBias != 0.f || slopeZBias != 0.f)
+  {
+    state.set(shaders::OverrideState::Z_BIAS);
+    state.zBias = zBias;
+    state.slopeZBias = slopeZBias;
+  }
+
   stateOverrides[key.k] = shaders::overrides::create(state);
+}
+
+void CachedStates::setZBias(float z_bias, float slope_z_bias)
+{
+  if (zBias == z_bias && slopeZBias == slope_z_bias)
+    return;
+  zBias = z_bias;
+  slopeZBias = slope_z_bias;
+  clearStateOverrides();
 }
 
 shaders::UniqueOverrideStateId &CachedStates::getState(const StateKey &key)

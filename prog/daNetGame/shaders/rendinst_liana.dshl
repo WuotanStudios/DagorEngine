@@ -7,6 +7,7 @@ include "emissive.dshl"
 include "glass.dshl"
 include "indoor_light_probes.dshl"
 include "rendinst_voxelize_albedo_inc.dshl"
+include "unpack_unit_vector_inc.dshl"
 float liana_growth_time = 20;
 
 shader rendinst_liana
@@ -15,6 +16,7 @@ shader rendinst_liana
   if (rendinst_render_pass == rendinst_render_pass_voxelize_albedo) { dont_render; }
   if (rendinst_render_pass == rendinst_render_pass_grassify) { dont_render; }
   if (rendinst_render_pass == rendinst_render_pass_to_heightmap) { dont_render; }
+  if (rendinst_render_pass == rendinst_render_pass_impostor_voxel) { dont_render; }
   if (rendinst_render_pass == rendinst_render_pass_impostor_color  ||  rendinst_render_pass == rendinst_render_pass_impostor_shadow)
   {
     dont_render;
@@ -54,6 +56,7 @@ shader rendinst_liana
   ENABLE_MULTI_DRAW(rendinst_render_pass == rendinst_render_pass_to_shadow || rendinst_render_pass == rendinst_render_pass_depth)
   RENDINST_BLOCK()
   RENDINST_INSTANCING()
+  USE_UNPACK_UNIT_VECTOR_VS()
   if (rendinst_render_pass == rendinst_render_pass_normal)
   {
     USE_MICRODETAIL_BASED_WETNESS()
@@ -116,7 +119,7 @@ shader rendinst_liana
         SET_DRAW_CALL_ID(GET_MATERIAL_OFFSET);
       #endif
 
-      float3 localNormal = normalize(BGR_SWIZZLE(input.normal)*2-1);
+      float3 localNormal = normalize(unpack_unit_vector(input.normal.xyz));
 
       float normalized_time = 1;// = big_phase < 0.5 ? saturate(big_phase*8-phaseOfGrowthSource) : 0;
 
@@ -129,8 +132,8 @@ shader rendinst_liana
         uint hashVal2 = 0;
         uint3 inst_offset2 = inst_offset;
         HW_INSTANCE_OFFSET(inst_offset2);
-        BRANCH if (inst_offset2.y > 3)
-          hashVal2 = asuint((per_instance_data[instance_id*inst_offset2.y+inst_offset2.x+3]).x);
+        BRANCH if (inst_offset2.z & RI_CBUFFER_FLAGS__HASH_VAL)
+          hashVal2 = asuint((per_instance_data[instance_id*inst_offset2.y+inst_offset2.x+3]).z);
         //float4 tm_line_0 = per_instance_data[instance_id*inst_offset2.y+inst_offset2.x+0];\
         //float4 tm_line_1 = per_instance_data[instance_id*inst_offset2.y+inst_offset2.x+1];\
         //float4 tm_line_2 = per_instance_data[instance_id*inst_offset2.y+inst_offset2.x+2];\
@@ -162,7 +165,7 @@ shader rendinst_liana
         float3 hash = floor(input.pos-localNormal*thickness + 0.5);
         float3 phaseOfMovement = frac(sin(hash*111)*43.18127);
         input.pos += localNormal*(-thickness + 1.5*thickness*normalizedThickness);
-        float3 speedOfMovement = 3*(float3(11, 11.3, 11.7)*(phaseOfMovement*0.5+0.5) * (frac(phaseOfMovement*43.1717)>0.5 ? -1:1));
+        float3 speedOfMovement = 3*(float3(11, 11.3, 11.7)*(phaseOfMovement*0.5+0.5) * select(frac(phaseOfMovement*43.1717)>0.5, float3(-1,-1,-1), float3(1,1,1)));
         float3 amplitudeMovement = 0.1*float3(1,2,1);
         input.pos += saturate(phaseOfGrowth*4)*saturate(1-phaseOfGrowth*2)*float3(amplitudeMovement*sin(lianaLength.y*speedOfMovement + phaseOfMovement*2*PI));
         //input.pos += -localNormal*thickness;
@@ -187,7 +190,7 @@ shader rendinst_liana
         output.pointToEye.w = worldPos.y - worldLocalPos.y;
 ##endif
       #else
-##if (rendinst_render_pass != rendinst_render_pass_to_shadow)
+##if (rendinst_render_pass != rendinst_render_pass_to_shadow && !is_triangle_size_debug)
         output.normal.w = worldPos.y - worldLocalPos.y;
 ##endif
       #endif
@@ -204,24 +207,24 @@ shader rendinst_liana
         clip(input.phaseOfGrowth);
       }
     }
-  } else
+  }
+  else if(!is_triangle_size_debug)
   {
     USE_PIXEL_TANGENT_SPACE()
     WRITE_GBUFFER()
     (ps) {
-      diffuse_tex@static = tex;
-      normal_tex@static = normal;
+      diffuse_tex@staticSmp = tex;
+      normal_tex@staticSmp = normal;
     }
 
     USE_CHARACTER_MICRODETAIL()
-    ENABLE_ASSERT(ps)
 
     hlsl(ps) {
 
-      #define parallax_tex_sampler(tex, tc) tex2DBindless(tex, tc.xy)
+      #define parallax_tex_sampler(sample, tex, tc) sample = tex2DBindless(tex, tc.xy)
       #define PARALLAX_TEX get_diffuse_tex()
       #define PARALLAX_ATTR a
-      #include "./parallax.hlsl"
+      #include <parallax.hlsl>
       GBUFFER_OUTPUT simple_ps(VsOutput input INPUT_VFACE HW_USE_SCREEN_POS)//, out float depth : SV_DepthLessEqual)
       {
         #if SET_UP_MULTIDRAW
@@ -291,7 +294,14 @@ shader rendinst_liana
       }
     }
   }
-  compile("target_ps", "simple_ps");
+  if (is_triangle_size_debug)
+  {
+    RI_TRIANGLE_SIZE_DEBUG_PS()
+  }
+  else
+  {
+    compile("target_ps", "simple_ps");
+  }
   compile("target_vs", "simple_vs");
 }
 

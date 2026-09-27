@@ -1,18 +1,21 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "de_appwnd.h"
-#include "de_batch.h"
 #include <de3_lightService.h>
 #include <de3_interface.h>
 #include <de3_editorEvents.h>
 #include <de3_dynRenderService.h>
+#include <de3_hmapService.h>
 #include <de3_skiesService.h>
 #include <de3_waterSrv.h>
 
+#include <EditorCore/ec_imguiInitialization.h>
 #include <EditorCore/ec_startup.h>
+#include <EditorCore/ec_shaders.h>
 #include <libTools/dtx/ddsxPlugin.h>
 #include <libTools/util/makeBindump.h>
 #include <libTools/util/setupTexStreaming.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <oldEditor/de_workspace.h>
 
 #include <workCycle/dag_gameSettings.h>
@@ -20,7 +23,6 @@
 #include <workCycle/dag_startupModules.h>
 
 #include <shaders/dag_dynSceneRes.h>
-#include <shaders/dag_dynSceneWithTreeRes.h>
 
 #include <gameRes/dag_stdGameRes.h>
 #include <gameRes/dag_gameResSystem.h>
@@ -30,6 +32,7 @@
 #include <startup/dag_restart.h>
 #include <gui/dag_stdGuiRender.h>
 
+#include <osApiWrappers/dag_files.h>
 #include <osApiWrappers/dag_progGlobals.h>
 #include <osApiWrappers/dag_symHlp.h>
 #include <osApiWrappers/dag_vromfs.h>
@@ -40,12 +43,30 @@
 #include <obsolete/dag_cfg.h>
 
 #include <drv/3d/dag_resetDevice.h>
+#include <drv/3d/dag_driverDesc.h>
+#include <drv/3d/dag_info.h>
 #include <3d/dag_texPackMgr2.h>
 #include <libTools/util/strUtil.h>
 #include <render/dynmodelRenderer.h>
 
 #include <scene/dag_visibility.h>
 #include <gui/dag_imgui.h>
+
+namespace environment
+{
+void after_d3d_reset(bool full_reset);
+}
+
+namespace workcycle_internal
+{
+extern bool window_initing;
+}
+
+bool is_generic_water_service_initialized();
+bool is_generic_hmap_service_initialized();
+
+static constexpr const char *INITIAL_CAPTION = "DaEditorX";
+static constexpr const char *INITIAL_ICON = "RES_DE_ICON";
 
 static struct DagorEdReset3DCallback : public IDrv3DResetCB
 {
@@ -54,6 +75,9 @@ static struct DagorEdReset3DCallback : public IDrv3DResetCB
     DAEDITOR3.conNote("notifying services (onBeforeReset3dDevice)...");
     if (IDynRenderService *drSrv = EDITORCORE->queryEditorInterface<IDynRenderService>())
       drSrv->beforeD3DReset(full_reset);
+    if (is_generic_hmap_service_initialized())
+      if (IHmapService *hmapSrv = EDITORCORE->queryEditorInterface<IHmapService>())
+        hmapSrv->beforeD3DReset(full_reset);
     ((DagorEdAppWindow *)DAGORED2)->onBeforeReset3dDevice();
   }
 
@@ -65,20 +89,29 @@ static struct DagorEdReset3DCallback : public IDrv3DResetCB
     rebuild_shaders_stateblocks();
     StdGuiRender::after_device_reset();
 
+    if (is_generic_hmap_service_initialized())
+      if (IHmapService *hmapSrv = EDITORCORE->queryEditorInterface<IHmapService>())
+        hmapSrv->afterD3DReset(full_reset);
     if (IDynRenderService *drSrv = EDITORCORE->queryEditorInterface<IDynRenderService>())
       drSrv->afterD3DReset(full_reset);
     if (ISkiesService *skiesSrv = EDITORCORE->queryEditorInterface<ISkiesService>())
       skiesSrv->afterD3DReset(full_reset);
-    if (IWaterService *waterSrv = EDITORCORE->queryEditorInterface<IWaterService>())
-      waterSrv->afterD3DReset(full_reset);
+
+    // Querying IWaterService will initialize it. The initialization in WaterService::initSrv() disables the service if
+    // the "fft_source_texture_no" shader variable does not exist, so prevent calling it too early (for example from the
+    // project selector).
+    if (is_generic_water_service_initialized())
+      if (IWaterService *waterSrv = EDITORCORE->queryEditorInterface<IWaterService>())
+        waterSrv->afterD3DReset(full_reset);
 
     if (full_reset)
     {
       DAEDITOR3.conNote("reloading textures...");
       ddsx::reload_active_textures(0);
     }
+    environment::after_d3d_reset(full_reset);
     DAEDITOR3.conNote("notifying services (reset finished)...");
-    DAGORED2->spawnEvent(HUID_AfterD3DReset, NULL);
+    DAGORED2->spawnEvent(HUID_AfterD3DReset, (void *)(uintptr_t)full_reset);
   }
 } drv_3d_reset_cb;
 
@@ -143,22 +176,36 @@ void load_exp_shaders_for_target(unsigned tc)
     DAG_FATAL("failed to load shaders: %s", fn);
 }
 
+static E3DCOLOR load_window_background_color()
+{
+  const String settingsPath = make_full_path(sgg::get_exe_path_full(), "../.local/de3_settings.blk");
+  DataBlock settingsBlock;
+  dblk::load(settingsBlock, settingsPath, dblk::ReadFlag::ROBUST);
+  const DataBlock *settingsThemeBlock = settingsBlock.getBlockByNameEx("theme");
+  const char *themeName = settingsThemeBlock->getStr("name", "light");
+  return editor_core_load_window_background_color(String::mk_str_cat(themeName, ".blk"));
+}
+
 void init3d_early()
 {
-  dgs_all_shader_vars_optionals = true;
-  EDITORCORE->getWndManager()->init3d(de3_drv_name, nullptr);
+  // Initialize the startup scene before init3d(), so VideoRestartProc can use it to draw the first frame.
+  startup_editor_core_select_startup_scene(load_window_background_color());
 
-  ::startup_shaders(String(260, "%s/../commonData/guiShaders", sgg::get_exe_path_full()));
+  dgs_all_shader_vars_optionals = true;
+  EDITORCORE->getWndManager()->init3d(de3_drv_name, nullptr, INITIAL_CAPTION, INITIAL_ICON);
+
+  const char *commonData = sgg::get_common_data_dir();
+  ::startup_shaders(String(260, "%s/guiShaders", commonData));
   ::startup_game(RESTART_ALL);
   ShaderGlobal::enableAutoBlockChange(true);
 
   DataBlock fontsBlk;
-  fontsBlk.addBlock("fontbins")->addStr("name", String(260, "%s/../commonData/default", sgg::get_exe_path_full()));
+  fontsBlk.addBlock("fontbins")->addStr("name", String(260, "%s/default", commonData));
   if (auto *b = fontsBlk.addBlock("dynamicGen"))
   {
     b->setInt("texCount", 2);
     b->setInt("texSz", 256);
-    b->setStr("prefix", String(260, "%s/../commonData", sgg::get_exe_path_full()));
+    b->setStr("prefix", commonData);
   }
   StdGuiRender::init_dynamic_buffers(32 << 10, 8 << 10);
   StdGuiRender::init_fonts(fontsBlk);
@@ -176,23 +223,42 @@ namespace tools3d
 {
 extern void destroy();
 }
-void init3d()
+
+static void load_main_window_position_and_size(const char *window_layout_blk_path)
 {
-  const char *appdir = DAGORED2->getWorkspace().getAppDir();
-  DataBlock appblk(DAGORED2->getWorkspace().getAppPath());
-  String sh_file;
-  if (appblk.getStr("shaders", NULL))
-    sh_file.printf(260, "%s/%s", appdir, appblk.getStr("shaders", NULL));
-  else
-    sh_file.printf(260, "%s/../commonData/compiledShaders/classic/tools", sgg::get_exe_path_full());
+  FullFileLoadCB crd(window_layout_blk_path, DF_READ | DF_IGNORE_MISSING);
+  DataBlock windowLayoutBlk;
+  if (crd.fileHandle && windowLayoutBlk.loadFromStream(crd, window_layout_blk_path, crd.getTargetDataSize()))
+    if (const DataBlock *mainWindowBlk = windowLayoutBlk.getBlockByName("mainWindow"))
+    {
+      logdbg("Loading last used main window position and size from \"%s\".", window_layout_blk_path);
+      EDITORCORE->getWndManager()->loadMainWindowPositionAndSize(*mainWindowBlk);
+    }
+}
+
+void init3d(const char *window_layout_blk_path)
+{
+  DataBlock appblk(DAGORED2->getWorkspace().getAppBlkPath());
+
+  const bool useDngBasedSceneRender = DAGORED2->getWorkspace().isUsingDngBasedSceneRender();
+  String sh_file = tools3d::get_shaders_path(appblk, useDngBasedSceneRender);
 
   // shutdown imGui, render, shaders, d3d before reiniting
   imgui_shutdown();
   StdGuiRender::close_fonts();
   StdGuiRender::close_render();
   enable_res_mgr_mt(false, 0);
-  ::startup_shaders(sh_file); // set new name before restarting
+
+  // Shut down shaders explicitly because it would restart earlier than the d3d driver, and shaders expect d3d to be inited.
+  shutdown_shaders();
+
+  // By setting window_initing to true we prevent the destruction of the main window mark the application inactive in main_wnd_proc().
+  // window_initing will be set true when the device is recreated by init3d(), so the application would remain in erroneous inactive
+  // state without this prevention.
+  workcycle_internal::window_initing = true;
   shutdown_game(RESTART_VIDEODRV | RESTART_VIDEO);
+  workcycle_internal::window_initing = false;
+
   tools3d::destroy();
 
   // reinit 3d with actual shaders and texStreaming/texMgr setup for a project
@@ -202,35 +268,45 @@ void init3d()
     if (strcmp(blk_game.getBlock(i)->getBlockName(), "vromfs") == 0)
     {
       const DataBlock &blk_vrom = *blk_game.getBlock(i);
-      VirtualRomFsData *vrom = ::load_vromfs_dump(String(0, "%s/%s", appdir, blk_vrom.getStr("file")), tmpmem);
-      String mnt(blk_vrom.getStr("mnt"));
+      String vrom_fn = make_eff_app_relative_path(blk_vrom.getStr("file"));
+      String mnt = make_eff_app_relative_path(blk_vrom.getStr("mnt"));
+      VirtualRomFsData *vrom = ::load_vromfs_dump(vrom_fn, tmpmem);
       if (mnt.empty())
       {
         ::add_vromfs(vrom);
-        mnt.printf(0, "%s/%s/", appdir, blk_game.getStr("game_folder", "."));
-        vrom = ::load_vromfs_dump(String(0, "%s/%s", appdir, blk_vrom.getStr("file")), tmpmem);
+        make_eff_app_relative_path(mnt, blk_game.getStr("game_folder", "."));
+        vrom = ::load_vromfs_dump(vrom_fn, tmpmem);
       }
       ::add_vromfs(vrom, false, str_dup(mnt, tmpmem));
     }
 
   DataBlock texStreamingBlk;
-  ::load_tex_streaming_settings(DAGORED2->getWorkspace().getAppPath(), &texStreamingBlk);
-  EDITORCORE->getWndManager()->init3d(de3_drv_name, &texStreamingBlk);
+  ::load_tex_streaming_settings(DAGORED2->getWorkspace().getAppBlkPath(), &texStreamingBlk);
+
+  load_main_window_position_and_size(window_layout_blk_path);
+
+  EDITORCORE->getWndManager()->init3d(de3_drv_name, &texStreamingBlk, INITIAL_CAPTION, INITIAL_ICON);
   if (int resv_tid_count = appblk.getInt("texMgrReserveTIDcount", 128 << 10))
   {
     enable_res_mgr_mt(false, 0);
     enable_res_mgr_mt(true, resv_tid_count);
   }
 
+  ::startup_shaders(sh_file);
+
   if (const char *gp_file = appblk.getBlockByNameEx("game")->getStr("params", NULL))
   {
     DataBlock *b = const_cast<DataBlock *>(dgs_get_game_params());
-    b->load(String(0, "%s/%s", appdir, gp_file));
+    b->load(make_eff_app_relative_path(gp_file));
     b->removeBlock("rendinstExtra");
     b->removeBlock("rendinstOpt");
   }
-  const_cast<DataBlock *>(dgs_get_game_params())->setBool("rendinstExtraAutoSubst", false);
-  const_cast<DataBlock *>(dgs_get_game_params())->setInt("rendinstExtraMaxCnt", 0);
+
+  bool forceRiExtra =
+    appblk.getBlockByNameEx("assets")->getBlockByNameEx("build")->getBlockByNameEx("rendInst")->getBool("forceRiExtra", false);
+  forceRiExtra |= DAGORED2->getWorkspace().isUsingDngBasedSceneRender();
+  const_cast<DataBlock *>(dgs_get_game_params())->setBool("rendinstExtraAutoSubst", forceRiExtra && !d3d::is_stub_driver());
+  const_cast<DataBlock *>(dgs_get_game_params())->setInt("rendinstExtraMaxCnt", 4096);
 
   const char *ver_suffix = "ps50.shdump.bin";
   String full_sh_file;
@@ -290,13 +366,14 @@ void init3d()
   ::startup_game(RESTART_ALL);
   ShaderGlobal::enableAutoBlockChange(true);
 
+  const char *commonData = sgg::get_common_data_dir();
   DataBlock fontsBlk;
-  fontsBlk.addBlock("fontbins")->addStr("name", String(260, "%s/../commonData/default", sgg::get_exe_path_full()));
+  fontsBlk.addBlock("fontbins")->addStr("name", String(260, "%s/default", commonData));
   if (auto *b = fontsBlk.addBlock("dynamicGen"))
   {
     b->setInt("texCount", 2);
     b->setInt("texSz", 256);
-    b->setStr("prefix", String(260, "%s/../commonData", sgg::get_exe_path_full()));
+    b->setStr("prefix", commonData);
   }
   StdGuiRender::init_dynamic_buffers(appblk.getInt("guiMaxQuad", 256 << 10), appblk.getInt("guiMaxVert", 64 << 10));
   StdGuiRender::init_fonts(fontsBlk);
@@ -305,6 +382,9 @@ void init3d()
 
   ShaderGlobal::set_int(get_shader_variable_id("in_editor"), 1);
   ShaderGlobal::set_int(get_shader_variable_id("fake_lighting_computations", true), 1);
+
+  ShaderGlobal::set_int(get_shader_variable_id("dgs_tex_anisotropy", true), ::dgs_tex_anisotropy);
+  ShaderGlobal::set_float(get_shader_variable_id("mip_bias", true), 0.f);
 
   if (appblk.getBool("useDynrend", false))
     dynrend::init();
@@ -356,7 +436,15 @@ extern void init_dynmodel_mgr_service(const DataBlock &app_blk);
 extern void init_csg_mgr_service();
 extern void init_spline_gen_mgr_service();
 extern void init_ecs_mgr_service(const DataBlock &app_blk, const char *app_dir);
+extern void init_ecs_animchar_mgr_service(const DataBlock &app_blk);
 extern void init_webui_service();
+extern void init_hmap_debug_shading_service();
+extern void init_texgen_service();
+extern void init_landscape_preview_service();
+extern void init_das_mgr_service(const DataBlock &app_blk, bool dng_based_render_used);
+
+// used instead of init_ecs_mgr_service when using DNG based render to get templates for plugins
+extern void preload_ecs_templates_without_mgr(const DataBlock &app_blk, const char *app_dir);
 
 extern void init_plugin_heightmapland();
 extern void init_plugin_csg();
@@ -377,6 +465,8 @@ void dagored_init_all_plugins(const DataBlock &app_blk)
   else                                          \
     debug("skipped initing service for \"%s\", asset manager did not declare such type", TYPE_NAME);
 
+  const bool useDngBasedSceneRender = DAGORED2->getWorkspace().isUsingDngBasedSceneRender();
+
   ::setup_water_service(app_blk);
   ::setup_grass_service(app_blk);
   ::setup_gpu_grass_service(app_blk);
@@ -390,17 +480,25 @@ void dagored_init_all_plugins(const DataBlock &app_blk)
   INIT_SERVICE("gameObj", ::init_gameobj_mgr_service());
   ::init_built_scene_view_service();
   ::init_invalid_entity_service();
-  INIT_SERVICE("animChar", ::init_animchar_mgr_service(app_blk));
+  INIT_SERVICE("animChar", useDngBasedSceneRender ? ::init_ecs_animchar_mgr_service(app_blk) : ::init_animchar_mgr_service(app_blk));
   INIT_SERVICE("dynModel", ::init_dynmodel_mgr_service(app_blk));
   INIT_SERVICE("csg", ::init_csg_mgr_service());
   INIT_SERVICE("spline", ::init_spline_gen_mgr_service());
 #undef INIT_SERVICE
 
-  ::init_ecs_mgr_service(app_blk, DAGORED2->getWorkspace().getAppDir());
+  if (!useDngBasedSceneRender)
+    ::init_ecs_mgr_service(app_blk, DAGORED2->getWorkspace().getAppDir());
+  else
+    ::preload_ecs_templates_without_mgr(app_blk, DAGORED2->getWorkspace().getAppDir());
+
   if (app_blk.getBlockByNameEx("game")->getBool("enable_webui_de3", true))
     ::init_webui_service();
   else
     debug("webUi disabled with game{ enable_webui_de3:b=no;");
+
+  ::init_hmap_debug_shading_service();
+  ::init_texgen_service();
+  ::init_landscape_preview_service();
 
   ::init_plugin_ecs_editor();
   ::init_plugin_environment();

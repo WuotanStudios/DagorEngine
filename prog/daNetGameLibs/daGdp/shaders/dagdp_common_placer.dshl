@@ -37,12 +37,13 @@ macro USE_DAGDP_COMMON_PLACER()
       if (occlusionRange < 0.001)
         return true;
 
-      float occ = compute_simple_sdf_occlusion(worldPos, worldNorm, occlusionRange);
+      const float normalBias = 0.5;
+      float occ = compute_simple_sdf_occlusion(worldPos, worldNorm, occlusionRange, normalBias);
       float w = smoothstep(occlusionMin, occlusionMax, occ);
       return r <= w;
     }
 
-    void writeInstance(PlaceableGpuData placeable, float3 instancePos, float3 surfaceNormal, int2 stablePos,
+    void writeInstance(PlaceableGpuData placeable, float3 instancePos, float3 surfaceNormal, float3 randRot,
       float randScale, uint instanceElementOffset, float3 extra = float3(0, 0, 0))
     {
       float3 yawAxis;
@@ -87,9 +88,9 @@ macro USE_DAGDP_COMMON_PLACER()
       basis[0] = normalize(cross(basis[1], basis[2]));
 
       float3x3 basisT = transpose(basis);
-      float yawRadians = lerp(placeable.yawRadiansMin, placeable.yawRadiansMax, stableRand(stablePos, prng_seed_yaw));
-      float pitchRadians = lerp(placeable.pitchRadiansMin, placeable.pitchRadiansMax, stableRand(stablePos, prng_seed_pitch));
-      float rollRadians = lerp(placeable.rollRadiansMin, placeable.rollRadiansMax, stableRand(stablePos, prng_seed_roll));
+      float yawRadians = lerp(placeable.yawRadiansMin, placeable.yawRadiansMax, randRot.x);
+      float pitchRadians = lerp(placeable.pitchRadiansMin, placeable.pitchRadiansMax, randRot.y);
+      float rollRadians = lerp(placeable.rollRadiansMin, placeable.rollRadiansMax, randRot.z);
 
       // Rotate around local Y axis ("yaw").
       {
@@ -160,30 +161,22 @@ macro USE_DAGDP_COMMON_PLACER()
 
     uint getRenderableIndex(VariantGpuData variant, uint placeableIndex, float3 instancePos, float3 viewportPos, float randScale)
     {
-      uint rangeOffset = ~0u;
+      if (placeableIndex == ~0u)
+        return placeableIndex;
 
-      FLATTEN
-      if (placeableIndex != ~0u) {
-        float dist = distance(instancePos, viewportPos) / randScale;
+      float dist = distance(instancePos, viewportPos) / randScale;
 
-        LOOP
-        for (uint i = variant.drawRangeStartIndex; i < variant.drawRangeEndIndex; ++i)
+      LOOP
+      for (uint i = variant.drawRangeStartIndex; i < variant.drawRangeEndIndex; ++i)
+      {
+        if (dist < structuredBufferAt(draw_ranges, i))
         {
-          if (dist < structuredBufferAt(draw_ranges, i))
-          {
-            rangeOffset = i - variant.drawRangeStartIndex;
-            break;
-          }
+          uint rangeOffset = i - variant.drawRangeStartIndex;
+          return structuredBufferAt(renderable_indices, variant.renderableIndicesStartIndex + rangeOffset * variant.placeableCount + placeableIndex - variant.placeableStartIndex);
         }
       }
 
-      uint renderableIndex = ~0u;
-
-      FLATTEN
-      if (rangeOffset != ~0u)
-        renderableIndex = structuredBufferAt(renderable_indices, variant.renderableIndicesStartIndex + rangeOffset * variant.placeableCount + placeableIndex - variant.placeableStartIndex);
-
-      return renderableIndex;
+      return ~0u;
     }
   }
 endmacro
@@ -196,7 +189,7 @@ macro USE_DAGDP_COMMON_PLACER_THREADGROUP(threadgroup_size, g_storage, g_cond)
     {
       // The branch below can confuse FXC and lead to failed uniform flow control checks.
       // This additional sync satifies the compiler, and unlike the previous workaround, prevents device hang on Intel GPUs.
-      ##if hardware.dx11
+      ##if hardware.dx11 || hardware.dx12
         GroupMemoryBarrierWithGroupSync();
       ##endif
 
@@ -209,8 +202,10 @@ macro USE_DAGDP_COMMON_PLACER_THREADGROUP(threadgroup_size, g_storage, g_cond)
       #if WAVE_INTRINSICS
         bool waveCond = WaveAllBitOr(cond ? 1 : 0) != 0;
 
+        // due to branch above we have divergent groups that must be handled via first lanes
+        // instead of trivial zero line check
         BRANCH
-        if (WaveGetLaneIndex() == 0)
+        if (WaveIsFirstLane())
           InterlockedOr(g_cond, waveCond);
       #else
         InterlockedOr(g_cond, cond);

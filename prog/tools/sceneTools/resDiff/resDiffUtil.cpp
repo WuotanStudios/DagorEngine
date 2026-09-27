@@ -11,6 +11,7 @@
 #include <osApiWrappers/dag_vromfs.h>
 #include <osApiWrappers/dag_direct.h>
 #include <osApiWrappers/dag_files.h>
+#include <gameRes/dag_stdGameResId.h>
 #include <util/dag_strUtil.h>
 #include <util/dag_texMetaData.h>
 #include <util/dag_fastIntList.h>
@@ -452,6 +453,13 @@ static bool make_gameres_desc_diff(const char *desc_fn, const char *mnt_dir, con
   return true;
 }
 
+static void close_any_cache_file(dag::Span<FullFileLoadCB *> crd_cache, int but_i)
+{
+  for (auto &crd : crd_cache)
+    if (crd && &crd - crd_cache.data() != but_i)
+      del_it(crd);
+}
+
 int64_t make_game_resources_diff(const char *base_root_dir, const char *new_root_dir, const char *patch_dest_dir, bool dryRun,
   const char *vrom_name, const char *res_blk_name, const char *rel_mount_dir, int &out_diff_files)
 {
@@ -543,6 +551,51 @@ int64_t make_game_resources_diff(const char *base_root_dir, const char *new_root
   crd_cache.resize(old_grp.size());
   mem_set_0(crd_cache);
 
+  for (int i = 0; i < old_grp.size(); i++)
+  {
+    int pair_idx = find_the_same_pack(new_grp, old_grp[i].fn + strlen(base_root_dir), strlen(new_root_dir));
+    if (pair_idx >= 0 && file_equal(old_grp[i].fn, new_grp[pair_idx].fn, old_grp[i].hashMD5, new_grp[pair_idx].hashMD5))
+      continue;
+    for (int j = 0; j < old_grp[i].data->resTable.size(); j++)
+    {
+      const char *res_name = old_grp[i].data->getName(old_grp[i].data->resTable[j].resId);
+      int old_idx = -1, old_rec_idx = -1;
+      if (GrpBinData::findRes(make_span(new_grp), pair_idx, res_name, old_idx, old_rec_idx))
+        continue;
+
+      if (old_grp[i].data->resData[j].classId == DynModelGameResClassId)
+      {
+        debug("found removed dynModel %s", res_name);
+        return -2;
+      }
+
+      if (old_grp[i].data->resData[j].classId == RendInstGameResClassId)
+      {
+        debug("found removed rendInst %s", res_name);
+        return -2;
+      }
+    }
+  }
+
+  for (int i = 0; i < old_dxp.size(); i++)
+  {
+    int pair_idx = find_the_same_pack(new_dxp, old_dxp[i].fn + strlen(base_root_dir), strlen(new_root_dir));
+    if (pair_idx >= 0 && file_equal(old_dxp[i].fn, new_dxp[pair_idx].fn, old_dxp[i].hashMD5, new_dxp[pair_idx].hashMD5))
+      continue;
+    for (int j = 0; j < old_dxp[i].data->texNames.map.size(); j++)
+    {
+      TextureMetaData tmd;
+      const ddsx::Header &nhdr = old_dxp[i].data->texHdr[j];
+      const char *tex_name = tmd.decode(old_dxp[i].data->texNames.map[j], &stor);
+      int old_idx = -1, old_rec_idx = -1;
+      if (DxpBinData::findTex(new_dxp, pair_idx, tex_name, nhdr, old_idx, old_rec_idx))
+        continue;
+
+      debug("found removed tex %s", tex_name);
+      return -2;
+    }
+  }
+
   for (int i = 0; i < new_grp.size(); i++)
   {
     new_grp_total += new_grp[i].fullSz;
@@ -569,6 +622,14 @@ int64_t make_game_resources_diff(const char *base_root_dir, const char *new_root
           crd_cache[old_idx] = new FullFileLoadCB(old_grp[old_idx].fn);
           if (!crd_cache[old_idx]->fileHandle)
           {
+            if (game_resources_diff_verbose)
+              debug("  cannot open <%s>, close any cache and retry", old_grp[old_idx].fn);
+            close_any_cache_file(make_span(crd_cache), old_idx);
+            crd_cache[old_idx] = new FullFileLoadCB(old_grp[old_idx].fn);
+          }
+          if (!crd_cache[old_idx]->fileHandle)
+          {
+            debug("  cannot open <%s>!", old_grp[old_idx].fn);
             del_it(crd_cache[old_idx]);
             continue;
           }
@@ -684,6 +745,14 @@ int64_t make_game_resources_diff(const char *base_root_dir, const char *new_root
           crd_cache[old_idx] = new FullFileLoadCB(old_dxp[old_idx].fn);
           if (!crd_cache[old_idx]->fileHandle)
           {
+            if (game_resources_diff_verbose)
+              debug("  cannot open <%s>, close any cache and retry", old_dxp[old_idx].fn);
+            close_any_cache_file(make_span(crd_cache), old_idx);
+            crd_cache[old_idx] = new FullFileLoadCB(old_dxp[old_idx].fn);
+          }
+          if (!crd_cache[old_idx]->fileHandle)
+          {
+            debug("  cannot open <%s>!", old_dxp[old_idx].fn);
             del_it(crd_cache[old_idx]);
             continue;
           }

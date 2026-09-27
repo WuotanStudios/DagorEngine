@@ -11,8 +11,10 @@
 
 #include <coolConsole/coolConsole.h>
 
+#include <EditorCore/ec_editorCommandSystem.h>
 #include <EditorCore/ec_geneditordata.h>
 #include <EditorCore/ec_genappwnd.h>
+#include <EditorCore/ec_modelessWindowControllerList.h>
 #include <EditorCore/ec_wndPublic.h>
 
 #include <generic/dag_tab.h>
@@ -28,10 +30,17 @@
 
 #define HOTKEY_COUNT (16 + 1)
 
+namespace PropPanel
+{
+class ToolbarContainerPropertyControl;
+}
 
 class AboutDlg;
 class IWaterService;
 class StartupDlg;
+class AssetTagManager;
+class CameraPresetsManager;
+class KeyboardShortcutsPanel;
 
 enum
 {
@@ -117,13 +126,13 @@ private:
 
 class DagorEdAppWindow : public GenericEditorAppWindow,
                          public IDagorEd2Engine,
-                         public IConsoleCmd,
                          public PropPanel::ControlEventHandler,
                          public IWndManagerWindowHandler,
-                         public PropPanel::IDelayedCallbackHandler,
+                         public IEditorCommandKeyChordChangeEventHandler,
                          public IMainWindowImguiRenderingService
 {
   friend class DagorEdAppEventHandler;
+  friend class DagorEdConsoleCommandProcessor;
 
 public:
   DagorEdAppWindow(IWndManager *manager, const char *open_fname);
@@ -148,6 +157,7 @@ public:
 
   const DeWorkspace &getWorkspace() const override;
   const EditorWorkspace &getBaseWorkspace() override;
+  const char *getTestScriptMount() const override { return "%daeditorx_tests"; }
 
   bool isInBatchOp() override { return on_batch_exit != NULL; }
 
@@ -155,7 +165,7 @@ public:
   void enablePluginsRender() override;
 
   void preparePluginsListmenu() override;
-  void startWithWorkspace(const char *def_workspace_name) override;
+  void startWithWorkspace(const char *def_workspace_name, const char *app_blk_path, const char *refused_arguments) override;
 
   int getPluginCount() override;
   IGenEditorPlugin *getPlugin(int idx) override;
@@ -193,18 +203,11 @@ public:
   // custom colliders
   void registerCustomCollider(IDagorEdCustomCollider *coll) const override;
   void unregisterCustomCollider(IDagorEdCustomCollider *coll) const override;
-  void enableCustomShadow(const char *name) const override;
-  void disableCustomShadow(const char *name) const override;
   void enableCustomCollider(const char *name) const override;
   void disableCustomCollider(const char *name) const override;
 
-  bool isCustomShadowEnabled(const IDagorEdCustomCollider *collider) const override;
   int getCustomCollidersCount() const override;
   IDagorEdCustomCollider *getCustomCollider(int idx) const override;
-  bool fillCustomCollidersList(PropPanel::ContainerPropertyControl &panel, const char *grp_caption, int grp_pid, int collider_pid,
-    bool shadow, bool open_grp) const override;
-
-  bool onPPColliderCheck(int pid, const PropPanel::ContainerPropertyControl &panel, int collider_pid, bool shadow) const override;
 
   bool getUseOnlyVisibleColliders() const override;
   void setUseOnlyVisibleColliders(bool use) override;
@@ -223,7 +226,6 @@ public:
   void repaint() override;
 
   void correctCursorInSurfMove(const Point3 &delta) override;
-  bool shadowRayHitTest(const Point3 &src, const Point3 &dir, real dist) override;
   int getNextUniqueId() override;
   bool spawnEvent(unsigned event_huid, void *user_data) override;
   // ==========================================================================
@@ -248,12 +250,15 @@ public:
   void managePropPanels() override;
   void skipManagePropPanels(bool skip) override;
   PropPanel::PanelWindowPropertyControl *createPropPanel(PropPanel::ControlEventHandler *eh, const char *caption) override;
+  eastl::unique_ptr<PropPanel::IMenu> createContextMenu() override;
+  bool renderContextMenu(PropPanel::IMenu &menu) override;
   PropPanel::IMenu *getMainMenu() override;
 
   void deleteCustomPanel(PropPanel::ContainerPropertyControl *panel) override;
 
   PropPanel::DialogWindow *createDialog(hdpi::Px w, hdpi::Px h, const char *title) override;
   void deleteDialog(PropPanel::DialogWindow *dlg) override;
+  void sendImmediateFocusLossNotification() override;
 
   // viewport methods
   int getViewportCount() override;
@@ -272,6 +277,7 @@ public:
   float clipCapsuleStatic(const Capsule &c, Point3 &cap_pt, Point3 &world_pt) override;
 
   bool getSelectionBox(BBox3 &box) override;
+  bool getGlobalBox(BBox3 & /*box*/) override { return false; }
 
   void zoomAndCenter() override;
 
@@ -302,6 +308,13 @@ public:
   void setUiCursorProps(float size, bool always_xz) override;
 
   void showSelectWindow(IObjectsList *obj_list, const char *obj_list_owner_name) override;
+
+  void showTagManager(bool show);
+  void showShortcutsEditor(bool show);
+  void showCameraPresets(bool show);
+
+  bool isProjectLoaded() const override { return projectLoaded; };
+  bool getPendingTextureLoadTotalCount(unsigned int &total_count) override;
 
   UndoSystem *getUndoSystem() override { return undoSystem; }
   CoolConsole &getConsole() override
@@ -337,7 +350,7 @@ public:
 
   void onTabSelChange(int id);
 
-  void screenshotRender(bool skip_debug_objects) override;
+  void screenshotRender(const Driver3dPerspective &persp, bool is_ortho, bool skip_debug_objects) override;
 
   static void splitProjectFilename(const char *filename, String &path, String &name);
   bool loadWorkspace(const char *wsp_name);
@@ -349,10 +362,6 @@ public:
   bool forceSaveProject();
   bool reloadProject();
 
-  // IConsoleCmd
-  bool onConsoleCommand(const char *cmd, dag::ConstSpan<const char *> params) override;
-  const char *onConsoleCommandHelp(const char *cmd) override;
-
   // IWndManagerWindowHandler
   void *onWmCreateWindow(int type) override;
   bool onWmDestroyWindow(void *window) override;
@@ -361,14 +370,10 @@ public:
   void showMessageAt() override;
   using GenericEditorAppWindow::renderInTex;
 
-protected:
-  enum class ModelessWindowResetReason
-  {
-    LoadingProject,
-    ResettingLayout,
-    ExitingApplication,
-  };
+  int getToolbarScalePercent() const { return toolbarScalePercent; }
+  void setToolbarScalePercent(int scale_percent);
 
+protected:
   Tab<Plugin> plugin;
   Tab<int> panelsToAdd;
   Tab<int> panelsToAddWidth;
@@ -425,13 +430,15 @@ protected:
   int findPlugin(IGenEditorPlugin *p);
   void sortPlugins();
   void switchToPlugin(int plgId);
+  void switchToUndoOpOwner(void *owner);
 
   void initPlugins(const DataBlock &global_settings, const DataBlock &per_app_settings);
   void fillPluginSettings();
   void fillPluginTabs();
   void switchPluginTab(bool next = true);
 
-  void resetModelessWindows(ModelessWindowResetReason reset_reason);
+  ModelessWindowControllerList getModelessWindowControllers();
+
   void terminateInterface();
   void resetCore();
 
@@ -472,8 +479,11 @@ private:
   // if true, GeomObject uses direct light, otherwise GeomObject uses SH3Light
   bool useDirectLight;
 
+  // IEditorCommandKeyChordChangeEventHandler
+  void onEditorCommandKeyChordChanged() override;
+
   void renderUIViewport(ViewportWindow &viewport, const Point2 &size, float item_spacing);
-  void renderUIViewports();
+  bool renderUIViewports();
   void renderUI();
 
   // IMainWindowImguiRenderingService
@@ -487,8 +497,10 @@ private:
 
   void registerConsoleCommands();
   bool runExitCmd(dag::ConstSpan<const char *> params);
-  bool runCameraPosCmd(dag::ConstSpan<const char *> params);
-  bool runCameraDirCmd(dag::ConstSpan<const char *> params);
+  void runCameraAtCmd(dag::ConstSpan<const char *> params);
+  void runCameraPosCmd(dag::ConstSpan<const char *> params);
+  void runCameraDirCmd(dag::ConstSpan<const char *> params);
+  void runCameraSaveCmd(dag::ConstSpan<const char *> params);
   bool runProjectOpenCmd(dag::ConstSpan<const char *> params);
   bool runProjectExportCmd(dag::ConstSpan<const char *> params, int export_fmt);
   bool runProjectExportCmd(dag::ConstSpan<const char *> params);
@@ -509,6 +521,11 @@ private:
   // It returns with an empty string if there is no loaded workspace.
   String getPerApplicationSettingsBlkPath() const;
 
+  // Full path of the per application window layout DataBlock file.
+  // For example: "d:\dagor\tools\dagor_cdk\.local\de3_window_layout_enlisted.blk".
+  // It returns with an empty string if there is no loaded workspace.
+  String getPerApplicationWindowLayoutBlkPath() const;
+
   void initDllPlugins(const char *plug_dir);
 
   void updateRecentMenu();
@@ -522,22 +539,31 @@ private:
 
   void updateUseOccluders();
 
+  void makeDefaultLayout(bool for_initial_layout);
+  void saveLayout(const char *path);
+  bool loadLayout(const DataBlock &blk);
+  void loadLastUsedLayout();
 
-  void makeDefaultLayout();
   void fillMainToolBar();
 
-  void addCameraAccelerators();
+  void registerEditorCommands();
   void addEditorAccelerators();
 
   // From Editor means that not from the initial project selector dialog.
   void loadProjectFromEditor(const char *path);
 
   static bool gracefulFatalExit(const char *msg, const char *call_stack, const char *file, int line);
+  static String getSwitchToPluginEditorCommandId(const IGenEditorPlugin &p);
 
-  static const int LATEST_DOCK_SETTINGS_VERSION = 1; // Increasing this will reset the dock settings.
+  static const int LATEST_DOCK_SETTINGS_VERSION = 3; // Increasing this will reset the dock settings.
 
-  PropPanel::ContainerPropertyControl *mToolPanel, *mTabWindow, *mPlugTools;
+  PropPanel::ToolbarContainerPropertyControl *mToolPanel;
+  PropPanel::ToolbarContainerPropertyControl *mPlugTools;
+  PropPanel::ContainerPropertyControl *mTabWindow;
   PropPanel::ContainerPropertyControl *mTabPanel;
+  AssetTagManager *mTagManager;
+  CameraPresetsManager *mCameraPresets = nullptr;
+  KeyboardShortcutsPanel *mShortcutsPanel = nullptr;
 
   bool mNeedSuppress;
   int mMsgBoxResult;
@@ -556,12 +582,18 @@ private:
   SimpleString messageAt;
 
   Point2 viewportSplitRatio = Point2(0.5f, 0.5f);
+  bool projectLoaded = false;
+  bool lastUsedLayoutLoaded = false;
   bool dockPositionsInitialized = false;
   bool consoleCommandsAndVariableWindowsVisible = false;
   bool consoleWindowVisible = false;
   bool imguiDebugWindowsVisible = false;
+  bool testRuntimeWindowVisible = false;
+  int toolbarScalePercent = 100;
 
   bool skipRenderObjects = false;
 };
+
+DagorEdAppWindow &get_app();
 
 void send_event_error(const char *s, const char *callstack);

@@ -1,19 +1,22 @@
 int4 clouds_tiled_res;
 texture clouds_tile_distance;
+//SCALE on scene_exposure; 1 = accumulate exactly in display space, 0 = off
+//default value in shader wont matter, we always overwrite it.
+float clouds_taa_exposure = 0.4;
 
 int clouds_use_fullres = 0;
 interval clouds_use_fullres: no < 1, yes;
 
 macro USE_CLOUDS_DISTANCE(code)
   (code) {
-    clouds_tile_distance@smp2d = clouds_tile_distance;
+    clouds_tile_distance@tex2d = clouds_tile_distance;
   }
   hlsl(code) {
   ##if clouds_tile_distance != NULL
     #define CLOUDS_HAS_TILED_DIST 1
     float closest_tiled_dist_packed(uint2 scrPos)
     {
-      return clouds_tile_distance[scrPos>>3].x;
+      return clouds_tile_distance[uint2(scrPos)>>3].x;
     }
     float closest_tiled_dist(uint2 scrPos)
     {
@@ -37,6 +40,7 @@ endmacro
 macro USE_CLOUDS_DISTANCE_STUB(code)
   hlsl(code) {
     #if !CLOUDS_HAS_TILED_DIST
+    float closest_tiled_dist(uint2 scrPos) { return 0; }
     void closest_tiled_dist_clamp(float start, uint2 scr){}
     bool tile_is_empty(uint2 scrPos) { return false; }
     #endif

@@ -12,7 +12,7 @@
 namespace bind_dascript
 {
 #ifndef DAS_HAS_DIRECTORY_WATCH
-#if _TARGET_PC_WIN && DAGOR_DBGLEVEL > 0
+#if (_TARGET_PC_WIN || _TARGET_PC_LINUX) && DAGOR_DBGLEVEL > 0
 #define DAS_HAS_DIRECTORY_WATCH 1
 #endif
 #endif
@@ -25,6 +25,9 @@ struct LoadScriptCtx
   DasSyntax syntax;
   EnableDebugger enableDebugger;
   void *userData;
+  bool reload;
+  bool verySafeContext;
+  bool forceInscopePod;
 };
 
 struct Scripts
@@ -55,18 +58,19 @@ struct Scripts
     uint64_t nextGcMsec;
   };
   ska::flat_hash_map<eastl::string, ScriptMemory> scriptsMemory;
-  enum
-  {
-    MODULE_FS_ACCESS,
-    SANDBOX_FS_ACCESS
-  };
-  DagFileAccessContainer<MODULE_FS_ACCESS> moduleFileAccess;
-  DagFileAccessContainer<SANDBOX_FS_ACCESS> sandboxModuleFileAccess;
+
+  DagFileAccessContainer moduleFileAccess;
+  DagFileAccessContainer sandboxModuleFileAccess;
 
   // flags to turn on/off loading of some kind of files
   bool loadDebugCode = true;
   bool loadEvents = true;
   bool profileLoading = false;
+#if DAS_HAS_DIRECTORY_WATCH
+  bool keepFileName = true;
+#else
+  bool keepFileName = false;
+#endif
 
   das::atomic<uint32_t> linkAotErrorsCount{0};
   das::atomic<int> compileErrorsCount{0}; //-1 if this value is unknown
@@ -123,6 +127,8 @@ struct Scripts
   int getPendingQueriesNum(das::ModuleGroup &group) const;
 
   void storeSharedQueries(das::ModuleGroup &group);
+
+  void preserveSharedQueries(LoadedScript &script);
 
   bool postProcessModuleGroupUserData(const das::string &fname, das::ModuleGroup &group);
 

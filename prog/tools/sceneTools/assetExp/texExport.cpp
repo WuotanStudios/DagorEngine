@@ -2,6 +2,7 @@
 
 #include "daBuild.h"
 #include <libTools/dtx/ddsxPlugin.h>
+#include <libTools/dtx/makeDDS.h>
 #include <libTools/util/conLogWriter.h>
 #include <libTools/util/progressInd.h>
 #include <libTools/util/strUtil.h>
@@ -172,25 +173,23 @@ public:
     crd->read((char *)b.ptr + sizeof(ddsx::Header), rec[id].packedDataSize);
     return true;
   }
+  int findDDSx(const char *name) const
+  {
+    int namelen = (int)strlen(name);
+    for (int i = 0; i < texNames.map.size(); i++)
+      if (strnicmp(texNames.map[i], name, namelen) == 0 && texNames.map[i][namelen] == '*')
+        return i;
+    return -1;
+  }
   void removeDDSx(const char *name)
   {
-    int namelen = (int)strlen(name);
-    for (int i = 0; i < texNames.map.size(); i++)
-      if (strnicmp(texNames.map[i], name, namelen) == 0 && texNames.map[i][namelen] == '*')
-      {
-        debug("removed changed %s: %s", name, texNames.map[i]);
-        rec[i].packedDataSize = -1;
-        return;
-      }
+    if (int i = findDDSx(name); i >= 0)
+    {
+      debug("removed changed %s: %s", name, texNames.map[i]);
+      rec[i].packedDataSize = -1;
+    }
   }
-  bool hasDDSx(const char *name)
-  {
-    int namelen = (int)strlen(name);
-    for (int i = 0; i < texNames.map.size(); i++)
-      if (strnicmp(texNames.map[i], name, namelen) == 0 && texNames.map[i][namelen] == '*')
-        return true;
-    return false;
-  }
+  bool hasDDSx(const char *name) const { return findDDSx(name) >= 0; }
 };
 
 class Pack2TexGatherHelper
@@ -334,6 +333,7 @@ public:
 #define GET_PROP(TYPE, PROP, DEF) props.get##TYPE(PROP, &props != &a->props ? a->props.get##TYPE(PROP, DEF) : DEF)
       const DataBlock &props = a->getProfileTargetProps(cwr.getTarget(), cwr.getProfile());
       cp.imgGamma = GET_PROP(Real, "gamma", 2.2);
+      fix_gamma_for_fmt(cp.imgGamma, GET_PROP(Str, "fmt", "ARGB"));
       cp.mipOrdRev = GET_PROP(Bool, "mipOrdRev", cp.mipOrdRev);
       cp.splitHigh = GET_PROP(Bool, "splitHigh", false);
       cp.splitAt = GET_PROP(Int, "splitAt", 0);
@@ -445,11 +445,20 @@ public:
 
     cwr.align32();
     pt_ddsx.startData(cwr, ddsx_buf.size());
-    unsigned ddsx_sz = 0;
+    uint64_t ddsx_sz = 0;
     for (int i = 0; i < ddsx_buf.size(); i++)
     {
       cwr.writeRaw(ddsx_buf[i].ptr, sizeof(ddsx::Header));
       ddsx_sz += ddsx_buf[i].len;
+      if (ddsx_sz >= (2000u << 20))
+      {
+        cwr.popOrigin();
+        cwr.endBlock();
+        cwr.reset(0);
+        log.addMessage(ILogWriter::ERROR, "Can't write texture pack: %s, content is too big (DDSx size >= %llu Mb)", pack_fname,
+          ddsx_sz >> 20);
+        return false;
+      }
     }
     pt_ddsx.finishTab(cwr);
 
@@ -615,6 +624,19 @@ bool buildDdsxTexPack(mkbindump::BinDumpSaveCB &cwr, dag::ConstSpan<DagorAsset *
     if (!changed && AssetExportCache::sharedDataIsAssetInForceRebuildList(*assets[i]))
       changed = true;
 
+    if (!changed && prev_pack)
+    {
+      if (int id = prev_pack->findDDSx(assets[i]->getName()); id >= 0 && prev_pack->rec[id].packedDataSize >= 0)
+      {
+        const ddsx::Header &h = prev_pack->hdr[id];
+        if (!is_srgb_config_valid(h))
+        {
+          log.addMessage(ILogWriter::NOTE, "%s: has no FLG_GAMMA_EQ_1 flag and sRGB-incompatible D3D format %i", assets[i]->getName(),
+            h.d3dFormat);
+          changed = true;
+        }
+      }
+    }
     if (prev_pack && changed)
       prev_pack->removeDDSx(assets[i]->getName());
 
@@ -626,6 +648,11 @@ bool buildDdsxTexPack(mkbindump::BinDumpSaveCB &cwr, dag::ConstSpan<DagorAsset *
     del_it(prev_pack);
     return false;
   }
+
+  // The per-asset loop above already touched every currently-relevant file/prop entry regardless of whether the pack itself
+  // needs rebuilding, so this is safe to run unconditionally here (same fix as buildGameResPack()'s: a pack that stays
+  // up-to-date across many build-server runs would otherwise never get its cache pruned).
+  c4.removeUntouched();
 
   if (prev_pack && !trh.needsPacking(*prev_pack))
   {
@@ -707,6 +734,53 @@ bool buildDdsxTexPack(mkbindump::BinDumpSaveCB &cwr, dag::ConstSpan<DagorAsset *
   return true;
 }
 
+// Separate from checkDdsxTexPackUpToDate() below: checks the whole pack still matches the cache from the
+// last real build, never calls gatherSrcDataFiles(), and never pinpoints which asset is stale - a UI-only
+// indicator, not suitable for a real build decision. Unlike the precise version, it also doesn't detect a
+// texture removed from the pack (that needs the same gatherSrcDataFiles-adjacent work this skips) - fine
+// here since that only affects whether a rebuild could trim the pack, not whether existing data is stale.
+bool quickCheckDdsxTexPackReady(unsigned tc, bool be, dag::ConstSpan<DagorAsset *> assets, AssetExportCache &c4,
+  const char *pack_fname)
+{
+  if (dabuild_build_tex_separate)
+    return true;
+
+  FullFileLoadCB prev_fcrd(pack_fname);
+  BinDumpReader prev_crd(&prev_fcrd, tc, be);
+  DDSxTexPack2Serv *prev_pack = NULL;
+  IDagorAssetExporter *exp = assets[0]->getMgr().getAssetExporter(assets[0]->getType());
+  int gameres_ver = exp ? exp->getGameResVersion() : 0;
+
+  if (!dabuild_force_dxp_rebuild && prev_fcrd.fileHandle && (df_length(prev_fcrd.fileHandle) >= 16) &&
+      !c4.checkAssetExpVerChanged(assets[0]->getType(), gameres_ver, DDSX_EXP_VER) && !c4.checkTargetFileChanged(pack_fname))
+    prev_pack = DDSxTexPack2Serv::make(prev_crd);
+
+  if (dd_file_exist(tq_split_fn) && c4.checkFileChanged(tq_split_fn, -1))
+    del_it(prev_pack);
+
+  bool ready = prev_pack && prev_pack->getFormatVer() == dabuild_dxp_write_ver;
+  for (int i = 0; ready && i < assets.size(); i++)
+  {
+    if (!prev_pack->hasDDSx(assets[i]->getName())) //-V522
+      ready = false;
+    else if (c4.checkDataBlockChanged(assets[i]->getNameTypified(), assets[i]->props, -1))
+      ready = false;
+    else if (AssetExportCache::sharedDataIsAssetInForceRebuildList(*assets[i]))
+      ready = false;
+    else if (c4.checkFileChanged(assets[i]->getTargetFilePath(), -1))
+      ready = false;
+    else if (int id = prev_pack->findDDSx(assets[i]->getName());
+             id < 0 || prev_pack->rec[id].packedDataSize < 0 || !is_srgb_config_valid(prev_pack->hdr[id]))
+      ready = false;
+  }
+
+  ready = ready && c4.allTrackedFilesUpToDate(pack_fname);
+
+  prev_fcrd.close();
+  del_it(prev_pack);
+  return ready;
+}
+
 bool checkDdsxTexPackUpToDate(unsigned tc, const char *profile, bool be, dag::ConstSpan<DagorAsset *> assets, AssetExportCache &c4,
   const char *pack_fname, int ch_bit)
 {
@@ -779,6 +853,13 @@ bool checkDdsxTexPackUpToDate(unsigned tc, const char *profile, bool be, dag::Co
       for (int j = target_file_checked ? 1 : 0; j < a_files.size(); j++)
         if (c4.checkFileChanged(a_files[j]))
           goto cur_changed;
+    }
+
+    if (int id = prev_pack->findDDSx(assets[i]->getName()); id >= 0 && prev_pack->rec[id].packedDataSize >= 0)
+    {
+      const ddsx::Header &h = prev_pack->hdr[id];
+      if (!is_srgb_config_valid(h))
+        goto cur_changed;
     }
 
     assets[i]->setUserFlags(ch_bit);

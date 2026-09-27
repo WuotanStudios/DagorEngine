@@ -17,6 +17,7 @@ static eastl::vector_map<int, float> variableIdToMaxHeight;
 
 static bool ri_extra_max_height_check_pool_variable_set(rendinst::RiExtraPool &pool, int variableId)
 {
+  G_ASSERT_RETURN(pool.res, false);
   for (int i = 0; i < pool.res->lods.size(); ++i)
   {
     ShaderMesh *m = pool.res->lods[i].scene->getMesh()->getMesh()->getMesh();
@@ -66,9 +67,7 @@ float ri_extra_max_height_get_max_height(int variableId)
 
   rendinst::ScopedRIExtraWriteLock wr;
   auto it = variableIdToMaxHeight.insert(variableId).first;
-  for (int id = 0; id < rendinst::riExtra.size(); ++id)
-  {
-    rendinst::RiExtraPool &pool = rendinst::riExtra[id];
+  rendinst::iterateRIExtra([&](int, rendinst::RiExtraPool &pool) {
     if (ri_extra_max_height_check_pool_variable_set(pool, variableId))
     {
       pool.variableIdsToUpdateMaxHeight.push_back(variableId);
@@ -83,6 +82,6 @@ float ri_extra_max_height_get_max_height(int variableId)
         it->second = max(it->second, v_extract_y(wabb.bmax));
       }
     }
-  }
+  });
   return it->second;
 }

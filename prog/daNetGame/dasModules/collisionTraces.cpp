@@ -29,6 +29,9 @@ struct IntersectedEntityAnnotation : das::ManagedStructureAnnotation<Intersected
   }
   bool hasNonTrivialCopy() const override { return false; } // for emplace(push_clone) to the containers in das
   bool canBePlacedInContainer() const override { return true; }
+  bool isLocal() const override { return true; }
+  bool hasNonTrivialCtor() const override { return false; }
+  bool hasNonTrivialDtor() const override { return false; }
 };
 
 namespace bind_dascript
@@ -41,21 +44,23 @@ public:
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("ecs"));
 
-    addEnumeration(das::make_smart<EnumerationSortIntersections>());
-    addAnnotation(das::make_smart<IntersectedEntityDataAnnotation>(lib));
-    addAnnotation(das::make_smart<IntersectedEntityAnnotation>(lib));
+    addEnumeration(new EnumerationSortIntersections());
+    addAnnotation(new IntersectedEntityDataAnnotation(lib));
+    addAnnotation(new IntersectedEntityAnnotation(lib));
 
     das::addExtern<DAS_BIND_FUN(das_trace_to_collision_nodes)>(*this, lib, "trace_to_collision_nodes",
       das::SideEffects::accessExternal, "bind_dascript::das_trace_to_collision_nodes");
     das::addExtern<DAS_BIND_FUN(das_trace_to_capsule_approximation)>(*this, lib, "trace_to_capsule_approximation",
       das::SideEffects::accessExternal, "bind_dascript::das_trace_to_capsule_approximation");
+    das::addExtern<DAS_BIND_FUN(trace_to_capsule_approximation)>(*this, lib, "trace_to_capsule_approximation",
+      das::SideEffects::modifyArgument, "::trace_to_capsule_approximation");
     das::addExtern<DAS_BIND_FUN(rayhit_to_collision_nodes)>(*this, lib, "rayhit_to_collision_nodes", das::SideEffects::accessExternal,
       "rayhit_to_collision_nodes");
     das::addExtern<DAS_BIND_FUN(rayhit_to_capsule_approximation)>(*this, lib, "rayhit_to_capsule_approximation",
       das::SideEffects::accessExternal, "rayhit_to_capsule_approximation");
 
     das::addCtorAndUsing<IntersectedEntity>(*this, lib, "IntersectedEntity", "::IntersectedEntity");
-    das::addCtorAndUsing<IntersectedEntities>(*this, lib, "IntersectedEntities", "::IntersectedEntities");
+    das::addUsing<IntersectedEntities>(*this, lib, "::IntersectedEntities");
 
     verifyAotReady();
   }

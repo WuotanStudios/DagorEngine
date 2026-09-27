@@ -2,13 +2,19 @@
 
 #include <rendInst/rendInstDebug.h>
 #include <rendInst/rendInstAccess.h>
+#include <rendInst/rendInstCollision.h>
+#include <gameRes/dag_collisionResource.h>
 #include "../riGen/riGenData.h"
 #include "../riGen/riGenExtra.h"
+#include "../riGen/riRotationPalette.h"
+#include "../riGen/riUtil.h"
 #include <debug/dag_debug3d.h>
 #include <debug/dag_textMarks.h>
+#include <math/dag_mathBase.h>
 #include <cstdio>
 
-void rendinst::draw_rendinst_info(const Point3 &intersection_pos, const TMatrix &cam_tm, const rendinst::RendInstDesc &desc)
+void rendinst::draw_rendinst_info(const Point3 &intersection_pos, const TMatrix &cam_tm, const rendinst::RendInstDesc &desc,
+  int mat_id)
 {
   begin_draw_cached_debug_lines();
 
@@ -24,10 +30,13 @@ void rendinst::draw_rendinst_info(const Point3 &intersection_pos, const TMatrix 
     AutoLockReadPrimaryAndExtra lock;
     TMatrix tm = rendinst::getRIGenMatrixNoLock(desc);
     const char *name = rendinst::getRIGenResName(desc);
-    const RendInstGenData *rgl = RendInstGenData::getGenDataByLayer(desc);
-    rendinst::RiExtraPool &rxPool = rendinst::riExtra[desc.pool];
-    int riPoolRef = desc.isRiExtra() ? rxPool.riPoolRef : desc.pool;
-    const RendInstGenData::RendinstProperties &riProp = rgl->rtData->riProperties[riPoolRef];
+    rendinst::RiExtraPool *rxPool = desc.isRiExtra() ? &rendinst::riExtra[desc.pool] : nullptr;
+    int riPoolRef = rxPool ? rxPool->riPoolRef : desc.pool;
+    int riPoolRefLayer = rxPool ? rxPool->riPoolRefLayer : desc.layer;
+    const RendInstGenData *rgl = rendinst::getRgLayer(riPoolRefLayer);
+    const bool hasGenData = rgl != nullptr && rgl->rtData != nullptr;
+    const rendinst::props::RendinstProperties *riProp =
+      (hasGenData && (uint32_t)riPoolRef < rgl->rtData->riProperties.size()) ? &rgl->rtData->riProperties[riPoolRef] : nullptr;
 
     draw_cached_matrix_axis(tm);
 
@@ -38,13 +47,112 @@ void rendinst::draw_rendinst_info(const Point3 &intersection_pos, const TMatrix 
     draw_cached_debug_box(colBb, E3DCOLOR(0xFFFFC000), tm);
 
     // canopy bbox
-    if (!desc.isRiExtra() && (uint32_t)desc.pool < rgl->rtData->riProperties.size())
+    if (!desc.isRiExtra() && riProp)
     {
       BBox3 canopyBox;
-      rendinst::getRIGenCanopyBBox(riProp, fullBb, canopyBox);
+      rendinst::getRIGenCanopyBBox(*riProp, fullBb, canopyBox);
       draw_cached_debug_box(canopyBox, E3DCOLOR(0xFF08FF08), tm);
     }
 
+    float markOffsetScale = dist * 0.22f;
+    Point3 markPos = intersection_pos + cam_tm.getcol(0) * markOffsetScale + cam_tm.getcol(1) * markOffsetScale * 0.75f;
+    char block[2048];
+    block[0] = '\0';
+    int blockLen = 0;
+    auto addLine = [&block, &blockLen](const char *s, ...) DAGOR_NOINLINE {
+      if (blockLen > 0 && blockLen + 1 < (int)sizeof(block))
+        block[blockLen++] = '\n';
+      va_list arguments;
+      va_start(arguments, s);
+      const int avail = (int)sizeof(block) - blockLen;
+      int n = vsnprintf(block + blockLen, avail, s, arguments);
+      va_end(arguments);
+      if (n < 0)
+        block[blockLen] = '\0'; // encoding error, keep what we have
+      else
+        blockLen += (n < avail) ? n : (avail - 1); // clamp to what actually fit
+    };
+
+    addLine("%s: %s", desc.isRiExtra() ? "RiExtra" : "RiGen", name);
+    if (rxPool)
+    {
+      addLine("Pool=%i Idx=%i PoolRef=%i PoolRefLayer=%i", desc.pool, desc.idx, riPoolRef, riPoolRefLayer);
+      addLine("riExtra.handle = %llx", desc.getRiExtraHandle());
+      addLine("    bsphXYZR: (%.1f %.1f %.1f) r=%.1f", V4D(rxPool->bsphXYZR));
+      addLine("    posInst: %i; isTree %i; isWalls: %i", rxPool->posInst, rxPool->isTree, rxPool->isWalls);
+      addLine("    hp: %.1f/%.1f; immortal: %i", rxPool->getHp(desc.idx), rxPool->initialHP, rxPool->immortal);
+      addLine("    DYNAMIC_SCENE: %i; tsIndex: %i", rxPool->tsIndex == DYNAMIC_SCENE, rxPool->tsIndex);
+    }
+    else
+    {
+      addLine("Cell=%i Pool=%i Idx=%i Offs=%i Layer=%i", desc.cellIdx, desc.pool, desc.idx, desc.offs, desc.layer);
+      const bool posInst = rendinst::isRIGenOnlyPosInst(riPoolRefLayer, riPoolRef);
+      const bool paletteRot = posInst && hasGenData && (uint32_t)riPoolRef < rgl->rtData->riPaletteRotation.size() &&
+                              rgl->rtData->riPaletteRotation[riPoolRef];
+      addLine("    storage type: %s%s", posInst ? "pos" : "tm", paletteRot ? " (palette rot)" : "");
+      if (paletteRot)
+      {
+        RendInstGenData::Cell *cell = nullptr;
+        mat44f tm44;
+        uint32_t palId = 0;
+        const int16_t *data = riutil::get_data_by_desc(desc, cell);
+        if (data && riutil::get_rendinst_matrix(desc, const_cast<RendInstGenData *>(rgl), data, cell, tm44, palId))
+        {
+          const auto palette = rendinst::gen::get_rotation_palette_manager()->getPalette({riPoolRefLayer, riPoolRef});
+          if (palId < palette.count)
+            addLine("    palette: id=%u of %u, yaw=%.1f deg", palId, unsigned(palette.count),
+              RadToDeg(palette.rotations[palId].rotationY));
+          else
+            addLine("    palette: id=%u is out of range for %u entries, identity yaw", palId, unsigned(palette.count));
+        }
+      }
+    }
+    if (const CollisionResource *collRes = rendinst::getRiGenCollisionResource(desc))
+      addLine("collision: %d nodes", (int)collRes->getAllNodes().size());
+    else
+      addLine("collision: none");
+    if (riProp)
+    {
+      addLine("riProperties[%i]", riPoolRef);
+      addLine("    immortal: %i", riProp->immortal);
+      addLine("    damageable: %i", riProp->damageable);
+      addLine("    stopsBullets: %i", riProp->stopsBullets);
+      addLine("    treeBehaviour: %i; bushBehaviour %i", riProp->treeBehaviour, riProp->bushBehaviour);
+      addLine("    overrideMaterialForTraces: %i", riProp->overrideMaterialForTraces);
+      const PhysMat::MaterialData &riPropMat = PhysMat::getMaterial(riProp->matId);
+      addLine("    rendinst_dmg matId: %i (%s)", riProp->matId, riPropMat.name.c_str());
+    }
+    else
+      addLine("riProperties[%i]: <none>", riPoolRef);
+    const PhysMat::MaterialData &mat = PhysMat::getMaterial(mat_id);
+    addLine("trace matId: %i (%s)", mat_id, mat.name.c_str());
+    addLine("tm.scale: %.1f %.1f %.1f", length(tm.getcol(0)), length(tm.getcol(1)), length(tm.getcol(2)));
+    addLine("tm.pos: %.1f %.1f %.1f", P3D(tm.getcol(3)));
+
+    add_debug_text_mark(markPos, block);
+  }
+
+  end_draw_cached_debug_lines();
+}
+
+void rendinst::draw_rendinst_canopy(const Point3 &intersection_pos, const TMatrix &cam_tm, const RendInstDesc &desc)
+{
+  begin_draw_cached_debug_lines();
+  if (desc.isValid())
+  {
+    AutoLockReadPrimaryAndExtra lock;
+    TMatrix tm = rendinst::getRIGenMatrixNoLock(desc);
+    BBox3 canopyBBox;
+    getRIGenCanopyBBox(desc, tm, canopyBBox, false);
+    draw_cached_debug_box(canopyBBox, E3DCOLOR(0xFF08FF08));
+
+    Point3 dir = normalize(intersection_pos - cam_tm.getcol(3));
+    float traceDist = 4000.f;
+    rendinst::traceTransparencyRayRIGenNormalizedWithDist(cam_tm.getcol(3), dir, traceDist, 0.01);
+    float hitRad = pow(traceDist / 300.0f, 0.8f);
+    draw_cached_debug_sphere(cam_tm.getcol(3) + dir * traceDist, hitRad, E3DCOLOR(0xFFFFFF00), 24);
+
+    float dist = length(cam_tm.getcol(3) - intersection_pos);
     float markOffsetScale = dist * 0.22f;
     Point3 markPos = intersection_pos + cam_tm.getcol(0) * markOffsetScale + cam_tm.getcol(1) * markOffsetScale * 0.75f;
     float curLine = 0.f;
@@ -58,23 +166,8 @@ void rendinst::draw_rendinst_info(const Point3 &intersection_pos, const TMatrix 
       curLine += 1.2f;
     };
 
-    addLine("%s: %s", desc.isRiExtra() ? "RiExtra" : "RiGen", name);
-    if (desc.isRiExtra())
-    {
-      addLine("Cell=%i Pool=i Idx=%i Offs=%i Layer=%i", desc.cellIdx, desc.pool, desc.idx, desc.offs, desc.layer);
-      addLine("riExtra.handle = %llx", desc.getRiExtraHandle());
-      addLine(" collRes: %s", rxPool.collRes ? "yes" : "no");
-      addLine(" bsphXYZR: (%.1f %.1f %.1f) r=%.1f", V4D(rxPool.bsphXYZR));
-      addLine(" riPoolRef: %i", rxPool.riPoolRef);
-      addLine(" posInst: %i; isWalls: %i", rxPool.posInst, rxPool.isWalls);
-      addLine(" hp: %.1f/%.1f; immortal: %i", rxPool.getHp(desc.idx), rxPool.initialHP, rxPool.immortal);
-    }
-    addLine("riProperties[%i]", riPoolRef);
-    addLine(" matId: %i", riProp.matId);
-    addLine(" immortal: %i", riProp.immortal);
-    addLine("tm.scale: %.1f %.1f %.1f", length(tm.getcol(0)), length(tm.getcol(1)), length(tm.getcol(2)));
-    addLine("tm.pos: %.1f %.1f %.1f", P3D(tm.getcol(3)));
+    const char *name = rendinst::getRIGenResName(desc);
+    addLine("ri: %s", name);
   }
-
   end_draw_cached_debug_lines();
 }

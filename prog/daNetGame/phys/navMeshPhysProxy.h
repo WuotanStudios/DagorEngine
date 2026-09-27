@@ -8,7 +8,7 @@
 
 // atm only functions needed for net_phys_collision_es_impl are overrided semi-properly, the rest are stubbed
 
-class NavMeshPhysProxy : public IPhysBase
+class NavMeshPhysProxy final : public IPhysBase
 {
   gamephys::Loc loc;
   float mass;
@@ -19,8 +19,6 @@ class NavMeshPhysProxy : public IPhysBase
   float timeStep;
 
 public:
-  static void *vtblPtr;
-
   // Warn: for perfomace reasons dtor isn't called (and ctor might get called multiple times)
   NavMeshPhysProxy(ecs::EntityId target_eid, float dt);
   ~NavMeshPhysProxy() = delete;
@@ -30,7 +28,7 @@ public:
     g_entity_mgr->sendEventImmediate(eid, CmdNavPhysCollisionApply(&velocity, &pseudoVelDelta));
   }
   void validateTraceCache() override {}
-  void updatePhys(float, float, bool) override {}
+  void updatePhys(float, float, bool) {}
   int applyUnapprovedCTAsAt(int32_t, bool, int, uint8_t) override { return -1; }
 
   void applyOffset(const Point3 &) override {}
@@ -72,7 +70,7 @@ public:
   void setTmSoft(TMatrix) override {}
   void setVelocityRough(Point3) override {}
   void saveAllStates(int32_t) override {}
-  void interpolateVisualPosition(float) override {}
+  void interpolateVisualPosition(double) override {}
   void calcPosVelAtTime(double, DPoint3 &, DPoint3 &) const override {}
   void calcQuatOmegaAtTime(double, Quat &, DPoint3 &) const override {}
 

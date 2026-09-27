@@ -13,13 +13,14 @@ static uint32_t get_dagor_texformat_image_size_alignment(uint32_t f)
     case TEXFMT_DXT5:
     case TEXFMT_ATI1N:
     case TEXFMT_ATI2N:
+    case TEXFMT_BC5S:
     case TEXFMT_BC7:
     case TEXFMT_BC6H: return 4; break;
     default: return 0;
   }
 }
 
-Texture *create_dds_texture(bool srgb, const ImageInfoDDS &image_info, const char *tex_name, int flags)
+Texture *create_dds_texture(bool srgb, const ImageInfoDDS &image_info, const char *tex_name, int flags, ResourceTagType tag)
 {
   // We don't support loading in compressed dds textures that are not aligned
   int image_size_alignment = max<uint32_t>(1, get_dagor_texformat_image_size_alignment(image_info.format));
@@ -30,7 +31,8 @@ Texture *create_dds_texture(bool srgb, const ImageInfoDDS &image_info, const cha
   }
 
   Texture *tex = d3d::create_tex(NULL, image_info.width, image_info.height,
-    (srgb ? TEXCF_SRGBREAD : 0) | image_info.format | TEXCF_LOADONCE | flags, image_info.nlevels, tex_name ? tex_name : "dds_texture");
+    (srgb ? TEXCF_SRGBREAD : 0) | image_info.format | TEXCF_LOADONCE | flags, image_info.nlevels, tex_name ? tex_name : "dds_texture",
+    tag ? tag : RESTAG_DDS_TEXTURE);
   if (!tex)
     return NULL;
 

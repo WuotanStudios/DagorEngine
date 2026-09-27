@@ -8,6 +8,7 @@
 #include <rendInst/rendInstDesc.h>
 #include <rendInst/constants.h>
 #include <rendInst/layerFlags.h>
+#include <rendInst/ccExtra.h>
 
 #include <vecmath/dag_vecMath.h>
 #include <generic/dag_tab.h>
@@ -51,8 +52,9 @@ dag::Vector<BBox3, framemem_allocator> getRIGenExtraInstancesWorldBboxesByGrid(i
 bbox3f getRIGenExtraOverallInstancesWorldBbox(int res_idx);
 
 const char *getRIGenExtraName(uint32_t res_idx);
-void iterateRIExtraMap(eastl::fixed_function<sizeof(void *) * 3, void(int, const char *)> cb);
-int getRIExtraMapSize();
+void iterateRIExtraMap(const eastl::fixed_function<sizeof(void *) * 4, void(int, const char *)> &cb);
+
+int getRIGenExtraInstancesCount();
 
 int getRIExtraPoolRef(int res_idx);
 
@@ -62,11 +64,15 @@ bool updateRiExtraReqLod(uint32_t res_idx, unsigned lod);
 
 void applyTiledScenesUpdateForRIGenExtra(int max_quota_usec, int max_maintenance_quota_usec);
 
+float getRIGenExtraTiledScenesMaxObjectHeight();
+
 riex_handle_t addRIGenExtra43(int res_idx, mat43f_cref tm, bool collision, int orig_cell, int orig_offset, int add_data_dwords = 0,
   const int32_t *add_data = nullptr, bool on_loading = false);
 riex_handle_t addRIGenExtra44(int res_idx, mat44f_cref tm, bool collision, int orig_cell, int orig_offset, int add_data_dwords = 0,
   const int32_t *add_data = nullptr, bool on_loading = false);
 void processDelayedGridAdds(int cell_idx);
+
+riex_handle_t replaceRIGenWithRIExtra(const RendInstDesc &desc);
 
 void moveToOriginalScene(riex_handle_t id);
 void removeFromTiledScene(riex_handle_t id);
@@ -79,6 +85,46 @@ inline bool moveRIGenExtra44(riex_handle_t id, mat44f_cref tm, bool moved, bool 
   return moveRIGenExtra43(id, m43, moved, do_not_wait);
 }
 
+// Batches the per-instance bookkeeping of a burst of moves (e.g. moving a whole composit of thousands of
+// sub-entities in the editor). While open, moveRIGenExtra* only records the spatial-grid cells it touches,
+// and every riExtra tiled scene keeps a moved instance in its old tile with only the tile bounds grown, so
+// queries stay conservative; end() rebuilds each recorded cell once, applies the tiled scenes' deferred
+// moves (main thread only) and re-buckets their touched tiles. Ref-counted so nested scopes are safe.
+// Not thread-safe -- intended for the single-threaded editor move path.
+void beginRIExtraBulkUpdate();
+void endRIExtraBulkUpdate();
+bool isRIExtraBulkUpdateInProgress(); // callers may skip per-instance tiled-scene flushes while true
+
+// While set, moveRIGenExtra* takes a moved instance out of the collision grid instead of re-inserting
+// it at every step (the tiled scene still moves it, so it renders). The instance is absent from the
+// grid rather than present at a stale position, so a query can never hit it in the wrong place; it is
+// put back by flushRIExtraGridDefer(), or by the normal add path if the object is recreated.
+// Used while an object is interactively dragged, where its own collision volume is not queried.
+// Not thread-safe -- intended for the single-threaded editor move path, like the bulk update above.
+void setRIExtraDeferGridUpdate(bool defer);
+bool getRIExtraDeferGridUpdate();
+// re-inserts every deferred instance at its current position; deferring stays on, so a drag can flush
+// mid-way. Only setRIExtraDeferGridUpdate(false) or the scope below turns it off.
+void flushRIExtraGridDefer();
+// defer is "should this scope defer", not "force the flag": false does nothing at all, and the
+// destructor restores what it found, so an inner scope never ends an outer one's deferral
+struct ScopedRIExtraDeferGridUpdate
+{
+  bool prev;
+  ScopedRIExtraDeferGridUpdate(bool defer) : prev(getRIExtraDeferGridUpdate())
+  {
+    if (defer)
+      setRIExtraDeferGridUpdate(true);
+  }
+  ~ScopedRIExtraDeferGridUpdate() { setRIExtraDeferGridUpdate(prev); }
+};
+
+struct ScopedRIExtraBulkUpdate
+{
+  ScopedRIExtraBulkUpdate() { beginRIExtraBulkUpdate(); }
+  ~ScopedRIExtraBulkUpdate() { endRIExtraBulkUpdate(); }
+};
+
 using riex_render_info_t = uint32_t;
 __forceinline rendinst::riex_render_info_t make_riex_render_info_handle(uint32_t scene, uint32_t node_index)
 {
@@ -90,6 +136,8 @@ void setCASRIGenExtraData(riex_render_info_t id, uint32_t start, const uint32_t 
   uint32_t cnt); // this would set new data only if it was equal to wasdata
 void setRIGenExtraNodeShadowsVisibility(riex_render_info_t id, bool visible);
 const mat44f &getRIGenExtraTiledSceneNode(rendinst::riex_render_info_t);
+
+void setRIGenExtraRenderVisible(riex_handle_t id, bool visible);
 
 bool isRiGenExtraValid(riex_handle_t id);
 bool delRIGenExtra(riex_handle_t id); // return true if ri exta was actually deleted and false otherwise
@@ -173,19 +221,30 @@ void decodeRiExtraPerInstanceRenderData(uint32_t data, uint32_t &offset, uint32_
 void clearAllRiPerInstanceRenderAdditionalData();
 void clearRiPerInstanceRenderAdditionalData(uint32_t scene, uint32_t node_id);
 
+void prepare_instances();
+void before_culling();
 void before_render();
+void before_clear();
 
 struct RiGenCollidableData;
 using riex_collidable_t = dag::RelocatableFixedVector<riex_handle_t, 64, true, framemem_allocator>;
 void gatherRIGenExtraCollidable(riex_collidable_t &out_handles, const BBox3 &box, bool read_lock);
+// same walk, but a pool set rejects objects inside the grid query: gathering everything and
+// filtering after pays for handles nobody wants. bit (pool - first_pool) set = pool passes
+void gatherRIGenExtraCollidable(riex_collidable_t &out_handles, const BBox3 &box, uint32_t first_pool,
+  dag::ConstSpan<uint32_t> pool_bits, bool read_lock);
 void gatherRIGenExtraCollidable(riex_collidable_t &out_handles, const BSphere3 &sphere, bool read_lock);
 void gatherRIGenExtraCollidable(riex_collidable_t &out_handles, const Capsule &capsule, bool read_lock);
 void gatherRIGenExtraCollidable(riex_collidable_t &out_handles, const TMatrix &tm, const BBox3 &box, bool read_lock);
 void gatherRIGenExtraCollidable(riex_collidable_t &out_handles, const Point3 &p0, const Point3 &dir, float len, bool read_lock);
+// Both overloads append; several boxes can accumulate into one container.
 void gatherRIGenExtraCollidableMin(riex_collidable_t &out_handles, bbox3f_cref box, float min_bsph_rad);
+// Heap-backed variant for results that cross threads (riex_collidable_t is framemem).
+void gatherRIGenExtraCollidableMin(Tab<riex_handle_t> &out_handles, bbox3f_cref box, float min_bsph_rad);
 void gatherRIGenExtraCollidableMax(riex_collidable_t &out_handles, const BSphere3 &sphere, float max_bsph_rad);
 void gatherRIGenExtraCollidable(dag::RelocatableFixedVector<RiGenCollidableData, 64, true, framemem_allocator> &out_data,
   const Point3 &pos, float radius, bool read_lock);
+void gatherRIGenExtraAllSlow(riex_collidable_t &out_handles, const BBox3 &box, bool read_lock);
 
 // if res_idx == nullptr, would get all, otherwise only those with res_idx in sorted_res_idx array.
 // if fast, it will be checked using spheres only
@@ -208,10 +267,21 @@ struct pos_and_render_info_t
 };
 typedef dag::RelocatableFixedVector<pos_and_render_info_t, 128, true /*overflow*/> riex_pos_and_ri_tab_t;
 void gatherRIGenExtraRenderableNotCollidable(riex_pos_and_ri_tab_t &out, bbox3f_cref box, bool fast, SceneSelection s);
+void gatherRIGenExtraRenderableNotCollidable(bbox3f_cref box, bool fast, SceneSelection s,
+  const eastl::fixed_function<sizeof(void *) * 2, void(scene::node_index, mat44f_cref)> &cb);
 bool gatherRIGenExtraBboxes(const RiGenVisibility *main_visibility, mat44f_cref volume_box,
   eastl::function<void(mat44f_cref, const BBox3 &, const char *)> callback);
 
-uint32_t getRiGenExtraResCount();
+int getRiGenExtraResCount();
+bool isRiGenExtraResIdValid(int id);
+
+template <class CB>
+inline void iterateRiGenExtraResId(const CB &callback)
+{
+  int size = getRiGenExtraResCount();
+  for (int id = 0; id < size; ++id)
+    callback(id);
+}
 
 enum class HasRIClipmap
 {
@@ -227,27 +297,9 @@ int getRiGenExtraInstances(Tab<riex_handle_t> &out_handles, uint32_t res_idx, co
 
 void updateRiExtraBBoxScalesForPrepasses(const DataBlock &blk);
 void updateRiExtraForceDisableShadowList(const DataBlock &blk);
+void updateRiExtraUnderwaterOnlyList(const DataBlock &blk);
 
 bool hasRIExtraOnLayers(const RiGenVisibility *visibility, LayerFlags layer_flags);
-
-
-void riex_lock_write(const char *locker_nm = nullptr);
-void riex_unlock_write();
-
-void riex_lock_read();
-void riex_unlock_read();
-
-struct ScopedRIExtraWriteLock
-{
-  ScopedRIExtraWriteLock(const char *n = "riEx::wr") { riex_lock_write(n); }
-  ~ScopedRIExtraWriteLock() { riex_unlock_write(); }
-};
-
-struct ScopedRIExtraReadLock
-{
-  ScopedRIExtraReadLock() { riex_lock_read(); }
-  ~ScopedRIExtraReadLock() { riex_unlock_read(); }
-};
 
 void rigrid_debug_pos(const Point3 &pos, const Point3 &camera_pos);
 

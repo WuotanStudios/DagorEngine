@@ -7,19 +7,25 @@
 #include <EASTL/initializer_list.h>
 
 #include <generic/dag_span.h>
+#include <generic/dag_stridedSpan.h>
 #include <generic/dag_tabFwd.h>
 #include <math/dag_TMatrix4.h>
 
 #include <drv/3d/dag_consts_base.h>
 #include <drv/3d/dag_samplerHandle.h>
 #include <drv/3d/dag_barrier.h>
+#include <drv/3d/dag_enhanced_barrier.h>
 #include <drv/3d/dag_consts.h>
+#include <drv/3d/dag_driverCode.h>
+#include <drv/3d/dag_driverDesc.inl>
 #include <drv/3d/dag_resource.h>
 #include <drv/3d/dag_renderStateId.h>
 #include <drv/3d/dag_shaderLibraryObject.h>
 #include <drv/3d/rayTrace/dag_drvRayTrace.h>
+#include <generic/dag_functionRef.h>
 
 class D3dEventQuery;
+struct ShaderSourceExt;
 namespace d3d
 {
 typedef D3dEventQuery EventQuery;
@@ -35,7 +41,6 @@ class BaseTexture;
 class Sbuffer;
 class IGenLoad;
 class D3dResource;
-struct Driver3dDesc;
 struct TexImage32;
 struct RectInt;
 struct Driver3dPerspective;
@@ -63,7 +68,12 @@ enum class D3DResourceType : uint8_t;
 enum class ResourceActivationAction : unsigned;
 using ResourceHeapCreateFlags = uint32_t;
 
+struct ResourceTypeFilter;
+struct TaggedResourceInfo;
+using ResourceVisitor = dag::FunctionRef<void(const TaggedResourceInfo &res) const>;
+
 typedef BaseTexture Texture;
+
 
 namespace ddsx
 {
@@ -74,13 +84,12 @@ struct Header;
 struct D3dInterfaceTable
 {
   const char *(*get_driver_name)();
-  const char *(*get_device_driver_version)();
   const char *(*get_device_name)();
   const char *(*get_last_error)();
   uint32_t (*get_last_error_code)();
 
   void *(*get_device)();
-  const Driver3dDesc &(*get_driver_desc)();
+  const DriverDesc &(*get_driver_desc)();
   int (*driver_command)(Drv3dCommand command, void *par1, void *par2, void *par3);
   bool (*device_lost)(bool *can_reset_now);
   bool (*reset_device)();
@@ -96,11 +105,11 @@ struct D3dInterfaceTable
   bool (*issame_texformat)(int cflg1, int cflg2);
   bool (*check_cubetexformat)(int cflg);
   bool (*check_voltexformat)(int cflg);
-  BaseTexture *(*create_tex_0)(TexImage32 *img, int w, int h, int flg, int levels, const char *stat_name);
-  BaseTexture *(*create_cubetex_0)(int size, int flg, int levels, const char *stat_name);
-  BaseTexture *(*create_voltex)(int w, int h, int d, int flg, int levels, const char *stat_name);
-  BaseTexture *(*create_array_tex)(int w, int h, int d, int flg, int levels, const char *stat_name);
-  BaseTexture *(*create_cube_array_tex)(int side, int d, int flg, int levels, const char *stat_name);
+  BaseTexture *(*create_tex_0)(TexImage32 *img, int w, int h, int flg, int levels, const char *stat_name, ResourceTagType tag);
+  BaseTexture *(*create_cubetex_0)(int size, int flg, int levels, const char *stat_name, ResourceTagType tag);
+  BaseTexture *(*create_voltex)(int w, int h, int d, int flg, int levels, const char *stat_name, ResourceTagType tag);
+  BaseTexture *(*create_array_tex)(int w, int h, int d, int flg, int levels, const char *stat_name, ResourceTagType tag);
+  BaseTexture *(*create_cube_array_tex)(int side, int d, int flg, int levels, const char *stat_name, ResourceTagType tag);
 
   BaseTexture *(*create_ddsx_tex)(IGenLoad &crd, int flg, int q, int lev, const char *stat_name);
   BaseTexture *(*alloc_ddsx_tex)(const ddsx::Header &hdr, int flg, int q, int lev, const char *stat_name, int stub_tex_idx);
@@ -114,6 +123,11 @@ struct D3dInterfaceTable
   bool (*stretch_rect_0)(BaseTexture *src, BaseTexture *dst, const RectInt *rsrc, const RectInt *rdst);
   bool (*copy_from_current_render_target)(BaseTexture *to_tex);
 
+  BaseTexture *(*down_size_tex)(BaseTexture *tex, int width, int height, int depth, int mips, unsigned start_src_level,
+    unsigned level_offset);
+  BaseTexture *(*up_size_tex)(BaseTexture *tex, int width, int height, int depth, int mips, unsigned start_src_level,
+    unsigned level_offset);
+
   void (*get_texture_statistics)(uint32_t *num_textures, uint64_t *total_mem, String *out_dump);
 
   d3d::SamplerHandle (*request_sampler)(const d3d::SamplerInfo &sampler_info);
@@ -123,16 +137,13 @@ struct D3dInterfaceTable
   bool (*settex_vs)(int stage, BaseTexture *);
 
   PROGRAM (*create_program_0)(VPROG, FSHADER, VDECL, unsigned *, unsigned);
-  PROGRAM (*create_program_1)(const uint32_t *, const uint32_t *, VDECL, unsigned *, unsigned);
 
-  PROGRAM (*create_program_cs)(const uint32_t *cs_native, CSPreloaded preloaded);
+  PROGRAM (*create_program_cs)(const ShaderSourceExt &cs_native, CSPreloaded preloaded);
 
   bool (*set_program)(PROGRAM);
   void (*delete_program)(PROGRAM);
 
-  VPROG (*create_vertex_shader)(const uint32_t *native_code);
-  VPROG (*create_vertex_shader_dagor)(const VPRTYPE *tokens, int len);
-  VPROG (*create_vertex_shader_asm)(const char *asm_text);
+  VPROG (*create_vertex_shader)(const ShaderSourceExt &native_code);
   VPROG (*create_vertex_shader_hlsl)(const char *hlsl_text);
   void (*delete_vertex_shader)(VPROG vs);
 
@@ -140,24 +151,23 @@ struct D3dInterfaceTable
   bool (*set_const)(unsigned stage, unsigned reg_base, const void *data, unsigned num_regs);
   bool (*set_immediate_const)(unsigned stage, const uint32_t *data, unsigned num_words);
 
-  FSHADER (*create_pixel_shader)(const uint32_t *native_code);
-  FSHADER (*create_pixel_shader_dagor)(const FSHTYPE *tokens, int len);
-  FSHADER (*create_pixel_shader_asm)(const char *asm_text);
+  FSHADER (*create_pixel_shader)(const ShaderSourceExt &native_code);
   FSHADER (*create_pixel_shader_hlsl)(const char *hlsl_text);
   void (*delete_pixel_shader)(FSHADER ps);
 
   bool (*set_pixel_shader)(FSHADER ps);
-  int (*set_vs_constbuffer_size)(int required_size);
-  int (*set_cs_constbuffer_size)(int required_size);
-  bool (*set_const_buffer)(unsigned stage, unsigned slot, Sbuffer *buffer, uint32_t consts_offset, uint32_t consts_size);
+  bool (*set_const_buffer)(unsigned stage, unsigned slot, Sbuffer *buffer);
 
   uint32_t (*register_bindless_sampler)(d3d::SamplerHandle sampler);
 
   uint32_t (*allocate_bindless_resource_range)(D3DResourceType type, uint32_t count);
-  uint32_t (*resize_bindless_resource_range)(D3DResourceType type, uint32_t index, uint32_t current_count, uint32_t new_count);
   void (*free_bindless_resource_range)(D3DResourceType type, uint32_t index, uint32_t count);
+  void (*update_bindless_resource_range)(D3DResourceType type, uint32_t index, const dag::ConstSpan<D3dResource *> &resources);
   bool (*update_bindless_resource)(D3DResourceType type, uint32_t index, D3dResource *res);
   void (*update_bindless_resources_to_null)(D3DResourceType type, uint32_t index, uint32_t count);
+  uint32_t (*add_bindless_resource)(D3DResourceType type, D3dResource *res);
+  void (*add_bindless_resources)(dag::StridedConstSpan<D3DResourceType> types, dag::StridedConstSpan<D3dResource *> resources,
+    dag::StridedSpan<uint32_t> ids);
 
   bool (*set_tex)(unsigned shader_stage, unsigned slot, BaseTexture *tex);
   bool (*set_rwtex)(unsigned shader_stage, unsigned slot, BaseTexture *tex, uint32_t, uint32_t, bool);
@@ -169,19 +179,23 @@ struct D3dInterfaceTable
 
   bool (*discard_tex)(BaseTexture *tex);
 
+  int (*update_sub_region)(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
+    BaseTexture *dst, int dst_subres_idx, int dst_x, int dst_y, int dst_z);
+  int (*update_sub_region_no_order)(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h,
+    int src_d, BaseTexture *dst, int dst_subres_idx, int dst_x, int dst_y, int dst_z);
+
   bool (*set_buffer)(unsigned shader_stage, unsigned slot, Sbuffer *buffer);
   bool (*set_rwbuffer)(unsigned shader_stage, unsigned slot, Sbuffer *buffer);
 
-  Sbuffer *(*create_vb_0)(int size_bytes, int flags, const char *name);
-  Sbuffer *(*create_ib)(int size_bytes, int flags, const char *stat_name);
-  Sbuffer *(*create_sbuffer)(int struct_size, int elements, unsigned flags, unsigned texfmt, const char *);
+  Sbuffer *(*create_vb_0)(int size_bytes, int flags, const char *name, ResourceTagType tag);
+  Sbuffer *(*create_ib)(int size_bytes, int flags, const char *stat_name, ResourceTagType tag);
+  Sbuffer *(*create_sbuffer)(int struct_size, int elements, unsigned flags, unsigned texfmt, const char *, ResourceTagType tag);
 
   bool (*set_depth_0)(BaseTexture *, DepthAccess);
   bool (*set_depth_1)(BaseTexture *tex, int layer, DepthAccess);
   bool (*set_render_target_0)();
-  bool (*set_render_target_1)(int rt_index, BaseTexture *, uint8_t level);
-  bool (*set_render_target_2)(int rt_index, BaseTexture *, int fc, uint8_t level);
   bool (*set_render_target_3)(const Driver3dRenderTarget &rt);
+  void (*set_render_target_4)(RenderTarget depth, DepthAccess depth_access, dag::ConstSpan<RenderTarget> colors);
   void (*get_render_target)(Driver3dRenderTarget &out_rt);
   bool (*get_target_size)(int &w, int &h);
   bool (*get_render_target_size)(int &w, int &h, BaseTexture *rt_tex, uint8_t level);
@@ -222,7 +236,6 @@ struct D3dInterfaceTable
   bool (*clearview)(int what, E3DCOLOR, float z, uint32_t stencil);
 
   bool (*update_screen)(uint32_t frame_id, bool app_active);
-  void (*wait_for_async_present)(bool force);
   void (*begin_frame)(uint32_t frame_id, bool allow_wait);
   void (*mark_simulation_start)(uint32_t frame_id);
   void (*mark_simulation_end)(uint32_t frame_id);
@@ -237,8 +250,6 @@ struct D3dInterfaceTable
 
   bool (*draw_base)(int type, int start, int numprim, uint32_t num_instances, uint32_t start_instance);
   bool (*drawind_base)(int type, int startind, int numprim, int base_vertex, uint32_t num_instances, uint32_t start_instance);
-  bool (*draw_up)(int type, int numprim, const void *ptr, int stride_bytes);
-  bool (*drawind_up)(int type, int minvert, int numvert, int numprim, const uint16_t *ind, const void *ptr, int stride_bytes);
 
   bool (*draw_indirect)(int type, Sbuffer *buffer, uint32_t offset);
   bool (*draw_indexed_indirect)(int type, Sbuffer *buffer, uint32_t offset);
@@ -290,8 +301,6 @@ struct D3dInterfaceTable
   void (*begin_conditional_render)(int index);
   void (*end_conditional_render)(int id);
 
-  VDECL (*get_program_vdecl)(PROGRAM p);
-
   bool (*get_vrr_supported)();
   bool (*get_vsync_enabled)();
   bool (*enable_vsync)(bool enable);
@@ -315,24 +324,31 @@ struct D3dInterfaceTable
   void (*beginEvent)(const char *s);
   void (*endEvent)();
 
+  unsigned (*get_dedicated_gpu_memory_system_internal_overhead_kb)();
+
   Texture *(*get_backbuffer_tex)();
   Texture *(*get_secondary_backbuffer_tex)();
 
 #include "rayTrace/rayTrace3di.inl.h"
 
   void (*resource_barrier)(const ResourceBarrierDesc &desc, GpuPipeline gpu_pipeline /* = GpuPipeline::GRAPHICS*/);
+  void (*enhanced_texture_barrier)(const d3d::TextureBarrier &barrier, BaseTexture *texture);
+  void (*enhanced_buffer_barrier)(const d3d::BufferBarrier &barrier, Sbuffer *buffer);
+  void (*enhanced_barrier_batch)(dag::ConstSpan<d3d::TextureBarrierBatchItem> texture_barriers,
+    dag::ConstSpan<d3d::BufferBarrierBatchItem> buffer_barriers);
 
   d3d::RenderPass *(*create_render_pass)(const RenderPassDesc &rp_desc);
   void (*delete_render_pass)(d3d::RenderPass *rp);
 
-  void (*begin_render_pass)(d3d::RenderPass *rp, const RenderPassArea area, const RenderPassTarget *targets);
+  void (*begin_render_pass)(d3d::RenderPass *rp, const RenderPassArea area, dag::ConstSpan<RenderPassTarget> targets);
   void (*next_subpass)();
   void (*end_render_pass)();
 
   void (*allow_render_pass_target_load)();
 
   ResourceAllocationProperties (*get_resource_allocation_properties)(const ResourceDescription &desc);
-  ResourceHeap *(*create_resource_heap)(ResourceHeapGroup *heap_group, size_t size, ResourceHeapCreateFlags flags);
+  ResourceHeap *(*create_resource_heap)(ResourceHeapGroup *heap_group, size_t size, ResourceHeapCreateFlags flags,
+    ResourceTagType tag);
   void (*destroy_resource_heap)(ResourceHeap *heap);
   Sbuffer *(*place_buffer_in_resource_heap)(ResourceHeap *heap, const ResourceDescription &desc, size_t offset,
     const ResourceAllocationProperties &alloc_info, const char *name);
@@ -365,11 +381,17 @@ struct D3dInterfaceTable
   bool (*start_capture)(const char *name, const char *savepath);
   void (*stop_capture)();
 
+  void (*visit_tagged_resources)(const ResourceTypeFilter &filter, const ResourceVisitor &visitor);
+
   // inline wrappers for overloaded function pointers
-  Sbuffer *create_vb(int size_bytes, int flags, const char *name = "") { return create_vb_0(size_bytes, flags, name); }
-  BaseTexture *create_tex(TexImage32 *img, int w, int h, int flg, int levels, const char *stat_name = NULL)
+  Sbuffer *create_vb(int size_bytes, int flags, const char *name = "", ResourceTagType tag = nullptr)
   {
-    return create_tex_0(img, w, h, flg, levels, stat_name);
+    return create_vb_0(size_bytes, flags, name, tag);
+  }
+  BaseTexture *create_tex(TexImage32 *img, int w, int h, int flg, int levels, const char *stat_name = NULL,
+    ResourceTagType tag = nullptr)
+  {
+    return create_tex_0(img, w, h, flg, levels, stat_name, tag);
   }
   bool stretch_rect(BaseTexture *src, BaseTexture *dst, const RectInt *rsrc = NULL, const RectInt *rdst = NULL)
   {
@@ -377,9 +399,9 @@ struct D3dInterfaceTable
   }
 
   inline bool setvsrc(int stream, Sbuffer *vb, int stride_bytes) { return setvsrc_ex(stream, vb, 0, stride_bytes); }
-  BaseTexture *create_cubetex(int size, int flg, int levels, const char *stat_name = NULL)
+  BaseTexture *create_cubetex(int size, int flg, int levels, const char *stat_name = NULL, ResourceTagType tag = nullptr)
   {
-    return create_cubetex_0(size, flg, levels, stat_name);
+    return create_cubetex_0(size, flg, levels, stat_name, tag);
   }
 
   BaseTexture *alias_tex(BaseTexture *baseTexture, TexImage32 *img, int w, int h, int flg, int levels, const char *stat_name = NULL)
@@ -408,8 +430,6 @@ struct D3dInterfaceTable
   }
 
   bool set_render_target() { return set_render_target_0(); }
-  bool set_render_target(int ri, BaseTexture *tex, int fc, int level) { return set_render_target_2(ri, tex, fc, level); }
-  bool set_render_target(int rt_index, BaseTexture *tex, int level) { return set_render_target_1(rt_index, tex, level); }
   bool set_render_target(const Driver3dRenderTarget &rt) { return set_render_target_3(rt); }
   inline bool set_depth(BaseTexture *tex, DepthAccess access) { return set_depth_0(tex, access); }
   inline bool set_depth(BaseTexture *tex, int layer, DepthAccess access) { return set_depth_1(tex, layer, access); }
@@ -428,7 +448,7 @@ struct D3dInterfaceTable
   const char *driverName;
   const char *driverVer;
   const char *deviceName;
-  Driver3dDesc drvDesc;
+  DriverDesc drvDesc;
 };
 
 // function-pointers table instance (coud be used for deferred d3d API calls)

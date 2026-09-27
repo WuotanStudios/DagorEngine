@@ -3,8 +3,9 @@
 
 #include "driver.h"
 #include "util.h"
+#include "constants.h"
 
-#include <supp/dag_comPtr.h>
+#include <util/dag_globDef.h>
 
 
 inline bool operator==(D3D12_CPU_DESCRIPTOR_HANDLE l, D3D12_CPU_DESCRIPTOR_HANDLE r) { return l.ptr == r.ptr; }
@@ -78,6 +79,31 @@ inline const char *to_string(D3D12_MEMORY_POOL pool)
     case D3D12_MEMORY_POOL_L0: return "L0";
     case D3D12_MEMORY_POOL_L1: return "L1";
   }
+  return "??";
+}
+
+inline const char *to_string(D3D_FEATURE_LEVEL feature_level)
+{
+  switch (feature_level)
+  {
+#if _TARGET_PC_WIN
+    case D3D_FEATURE_LEVEL_1_0_GENERIC: return "generic 1.0";
+    case D3D_FEATURE_LEVEL_1_0_CORE: return "core 1.0";
+#endif
+    case D3D_FEATURE_LEVEL_9_1: return "9.1";
+    case D3D_FEATURE_LEVEL_9_2: return "9.2";
+    case D3D_FEATURE_LEVEL_9_3: return "9.3";
+    case D3D_FEATURE_LEVEL_10_0: return "10.0";
+    case D3D_FEATURE_LEVEL_10_1: return "10.1";
+    case D3D_FEATURE_LEVEL_11_0: return "11.0";
+    case D3D_FEATURE_LEVEL_11_1: return "11.1";
+    case D3D_FEATURE_LEVEL_12_0: return "12.0";
+    case D3D_FEATURE_LEVEL_12_1: return "12.1";
+#if _TARGET_PC_WIN
+    case D3D_FEATURE_LEVEL_12_2: return "12.2";
+#endif
+  }
+
   return "??";
 }
 

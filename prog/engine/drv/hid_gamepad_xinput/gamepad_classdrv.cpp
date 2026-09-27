@@ -4,12 +4,7 @@
 #include "gamepad_device.h"
 #include <drv/hid/dag_hiGlobals.h>
 #include <supp/_platform.h>
-#if _TARGET_PC_WIN
 #include <xinput.h>
-#pragma comment(lib, "xinput9_1_0.lib")
-#elif _TARGET_XBOX
-#include "xboxOneGamepad.h"
-#endif
 #include <debug/dag_debug.h>
 #include <string.h>
 #include <osApiWrappers/dag_threads.h>
@@ -17,13 +12,33 @@
 #include <startup/dag_inpDevClsDrv.h>
 #include <osApiWrappers/dag_miscApi.h>
 #include <osApiWrappers/dag_atomic.h>
+#include <EASTL/type_traits.h>
 
 #define MS_IN_SEC       1000
 #define RESCAN_ATTEMPTS 10
 
+#if _TARGET_PC_WIN
+#ifndef WIN_NOEXCEPT
+#define WIN_NOEXCEPT
+#endif
 
-#if _TARGET_XBOX
-void refresh_xbox_gamepads_list();
+static FARPROC get_xinput_proc(const char *name)
+{
+  static HMODULE mod = LoadLibraryA("xinput9_1_0.dll");
+  return mod ? GetProcAddress(mod, name) : nullptr;
+}
+
+DWORD WINAPI XInputGetState(DWORD user_index, XINPUT_STATE *state) WIN_NOEXCEPT
+{
+  static auto fn = (eastl::add_pointer_t<decltype(::XInputGetState)>)(void *)get_xinput_proc("XInputGetState");
+  return fn ? fn(user_index, state) : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+DWORD WINAPI XInputSetState(DWORD user_index, XINPUT_VIBRATION *vibration) WIN_NOEXCEPT
+{
+  static auto fn = (eastl::add_pointer_t<decltype(::XInputSetState)>)(void *)get_xinput_proc("XInputSetState");
+  return fn ? fn(user_index, vibration) : ERROR_DEVICE_NOT_CONNECTED;
+}
 #endif
 
 
@@ -37,7 +52,7 @@ HumanInput::Xbox360GamepadClassDriver::Xbox360GamepadClassDriver(bool emulate_si
   memset(&device, 0, sizeof(device));
   deviceNum = 0;
   deviceStateMask = 0;
-  deviceConfigChanged = false;
+  deviceConfigChanged = true;
   defJoy = NULL;
   enableAutoDef = false;
   prevUpdateRefTime = get_time_msec();
@@ -50,26 +65,26 @@ HumanInput::Xbox360GamepadClassDriver::Xbox360GamepadClassDriver(bool emulate_si
   add_wnd_proc_component(this);
 }
 
+
 HumanInput::Xbox360GamepadClassDriver::~Xbox360GamepadClassDriver()
 {
   del_wnd_proc_component(this);
   destroyDevices();
 }
 
+
 bool HumanInput::Xbox360GamepadClassDriver::init()
 {
   stg_joy.enabled = false;
 
+  deviceConfigChanged = true;
   refreshDeviceList();
   if (getDeviceCount() > 0)
     enable(true);
 
-#if _TARGET_XBOX
-  initXbox();
-#endif
-
   return true;
 }
+
 
 void HumanInput::Xbox360GamepadClassDriver::destroyDevices()
 {
@@ -86,53 +101,49 @@ void HumanInput::Xbox360GamepadClassDriver::destroyDevices()
   }
 }
 
+
 void HumanInput::Xbox360GamepadClassDriver::refreshDeviceList()
 {
-  destroyDevices();
-
   bool was_enabled = enabled;
-  int i;
-
-  enable(false);
-
-  DEBUG_CTX("Xbox360GamepadClassDriver::refreshDeviceList");
-
-#if _TARGET_XBOX
-  refresh_xbox_gamepads_list();
-  updateXboxGamepads(); // Update XInputGetState shadow states.
-#endif
-
-  XINPUT_STATE st;
-  deviceStateMask = 0;
-  for (i = 0; i < GAMEPAD_MAX; i++)
+  if (deviceConfigChanged)
   {
-    deviceStateMask <<= 1;
-    if (XInputGetState(i, &st) == ERROR_DEVICE_NOT_CONNECTED)
-      continue;
+    TIME_PROFILE(HID_XDRV_refreshDeviceList);
+    destroyDevices();
+    deviceConfigChanged = false;
 
-    device[deviceNum] = new (inimem) Xbox360GamepadDevice(i, gamepadName[i], deviceNum);
-    for (int s = 0; s < 2; s++)
-      device[deviceNum]->setStickDeadZoneScale(s, stickDeadZoneScale[s]);
+    enable(false);
 
-    deviceNum++;
-    deviceStateMask |= 1;
+    DEBUG_CTX("Xbox360GamepadClassDriver::refreshDeviceList");
+
+    XINPUT_STATE st;
+    deviceStateMask = 0;
+    for (int i = 0; i < GAMEPAD_MAX; i++)
+    {
+      deviceStateMask <<= 1;
+      if (XInputGetState(i, &st) == ERROR_DEVICE_NOT_CONNECTED)
+        continue;
+
+      device[deviceNum] = new (inimem) Xbox360GamepadDevice(i, gamepadName[i], deviceNum);
+      for (int s = 0; s < 2; s++)
+        device[deviceNum]->setStickDeadZoneScale(s, stickDeadZoneScale[s]);
+
+      deviceNum++;
+      deviceStateMask |= 1;
+    }
+    if (emulateSingleDevice && virtualDevice == NULL)
+    {
+      virtualDevice = new Xbox360GamepadDevice(0, "Controller", 0, true);
+      for (int s = 0; s < 2; s++)
+        virtualDevice->setStickDeadZoneScale(s, stickDeadZoneScale[s]);
+    }
+    DEBUG_CTX("deviceNum=%d", deviceNum);
   }
-  if (emulateSingleDevice && virtualDevice == NULL)
-  {
-    virtualDevice = new Xbox360GamepadDevice(0, "Controller", 0, true);
-    for (int s = 0; s < 2; s++)
-      virtualDevice->setStickDeadZoneScale(s, stickDeadZoneScale[s]);
-  }
-  DEBUG_CTX("deviceNum=%d", deviceNum);
+
+  if (secDrv && secDrv->isDeviceConfigChanged())
+    secDrv->refreshDeviceList();
 
   if (deviceNum > 0)
     setDefaultJoystick(device[0]); // The most recent gamepad is enumerated first. Make it a default one.
-
-  if (secDrv)
-  {
-    secDrv->refreshDeviceList();
-    secDrv->setDefaultJoystick(defJoy);
-  }
 
   // update global settings
   if (getDeviceCount() > 0)
@@ -149,11 +160,9 @@ void HumanInput::Xbox360GamepadClassDriver::refreshDeviceList()
   useDefClient(defClient);
   prevUpdateRefTime = get_time_msec();
 
-  for (i = 0; i < deviceNum; i++)
+  for (int i = 0; i < deviceNum; i++)
     device[i]->updateState(0, defJoy == device[i], defJoy != NULL);
   updateVirtualDevice();
-
-  deviceConfigChanged = false;
 }
 
 // generic hid class driver interface
@@ -165,6 +174,8 @@ void HumanInput::Xbox360GamepadClassDriver::enable(bool en)
   if (secDrv)
     secDrv->enable(en);
 }
+
+
 void HumanInput::Xbox360GamepadClassDriver::destroy()
 {
   terminateInputUpdaterThread();
@@ -244,11 +255,13 @@ public:
   }
 };
 
+
 void HumanInput::Xbox360GamepadClassDriver::terminateInputUpdaterThread()
 {
   if (inputUpdater)
     inputUpdater->terminate(true);
 }
+
 
 void HumanInput::Xbox360GamepadClassDriver::setDeviceMask(const unsigned int new_mask)
 {
@@ -259,6 +272,7 @@ void HumanInput::Xbox360GamepadClassDriver::setDeviceMask(const unsigned int new
   }
   rescanCount--;
 }
+
 
 void HumanInput::Xbox360GamepadClassDriver::updateVirtualDevice()
 {
@@ -288,13 +302,14 @@ void HumanInput::Xbox360GamepadClassDriver::updateVirtualDevice()
 
 int HumanInput::Xbox360GamepadClassDriver::getDeviceCount() const
 {
-  int emulatedDeviceNum = emulateSingleDevice ? 1 : deviceNum;
+  int emulatedDeviceNum = (emulateSingleDevice && virtualDevice) ? 1 : deviceNum;
   return emulatedDeviceNum + (secDrv ? secDrv->getDeviceCount() : 0);
 }
 
 
 void HumanInput::Xbox360GamepadClassDriver::updateDevices()
 {
+  TIME_PROFILE(HID_XDRV_updateDevices);
   int curTimeMs = get_time_msec();
   int dt = curTimeMs - prevUpdateRefTime;
   prevUpdateRefTime = curTimeMs;
@@ -303,21 +318,12 @@ void HumanInput::Xbox360GamepadClassDriver::updateDevices()
     for (int i = 0; i < deviceNum; i++)
       device[i]->copyStickDeadZoneScales(*virtualDevice);
 
-#if _TARGET_XBOX
-  updateXboxGamepads();
-  rescanCount = 1; // Always rescan on xbox instead of relying on WM_DEVICECHANGE.
-#endif
-
   if (prevUpdateRefTime >= nextUpdatePresenseTime && rescanCount > 0 && (!inputUpdater || !inputUpdater->isThreadRunnning()))
   {
     nextUpdatePresenseTime = prevUpdateRefTime + MS_IN_SEC;
 
-#if _TARGET_XBOX
-    setDeviceMask(get_device_state_mask());
-#else
     inputUpdater.reset(new XInputUpdater(*this));
     inputUpdater->start();
-#endif //_TARGET_XBOX
   }
 
   if (defJoy || !enableAutoDef)
@@ -366,6 +372,8 @@ HumanInput::IGenJoystick *HumanInput::Xbox360GamepadClassDriver::getDevice(int i
     return NULL;
   }
 }
+
+
 void HumanInput::Xbox360GamepadClassDriver::useDefClient(HumanInput::IGenJoystickClient *cli)
 {
   defClient = cli;
@@ -375,6 +383,7 @@ void HumanInput::Xbox360GamepadClassDriver::useDefClient(HumanInput::IGenJoystic
     secDrv->useDefClient(cli);
 }
 
+
 HumanInput::IGenJoystick *HumanInput::Xbox360GamepadClassDriver::getDeviceByUserId(unsigned short userId) const
 {
   for (int i = 0; i < deviceNum; i++)
@@ -382,6 +391,7 @@ HumanInput::IGenJoystick *HumanInput::Xbox360GamepadClassDriver::getDeviceByUser
       return device[i];
   return secDrv ? secDrv->getDeviceByUserId(userId) : NULL;
 }
+
 
 void HumanInput::Xbox360GamepadClassDriver::setDefaultJoystick(IGenJoystick *ref)
 {
@@ -398,6 +408,7 @@ void HumanInput::Xbox360GamepadClassDriver::setDefaultJoystick(IGenJoystick *ref
     secDrv->setDefaultJoystick(ref);
 }
 
+
 void HumanInput::Xbox360GamepadClassDriver::setStickDeadZoneScale(int stick_idx, bool main_dev, float scale)
 {
   if (!main_dev)
@@ -408,6 +419,8 @@ void HumanInput::Xbox360GamepadClassDriver::setStickDeadZoneScale(int stick_idx,
     if (dev)
       dev->setStickDeadZoneScale(stick_idx, scale);
 }
+
+
 float HumanInput::Xbox360GamepadClassDriver::getStickDeadZoneAbs(int stick_idx, bool main_dev, IGenJoystick *for_joy) const
 {
   if (!main_dev)
@@ -423,93 +436,3 @@ float HumanInput::Xbox360GamepadClassDriver::getStickDeadZoneAbs(int stick_idx, 
   }
   return stickDeadZoneScale[stick_idx] * axis_dead_thres[0][stick_idx] / JOY_XINPUT_MAX_AXIS_VAL;
 }
-
-
-#if _TARGET_XBOX
-
-#include <osApiWrappers/gdk/gameinput.h>
-
-static constexpr size_t GAMEPADS_MAX = gdk::gameinput::MAX_DEVICES_PER_TYPE;
-static DagorXboxOneGamepadState g_st[GAMEPADS_MAX] = {0};
-static gdk::gameinput::DevicesList devices;
-
-void refresh_xbox_gamepads_list() {}
-
-void HumanInput::Xbox360GamepadClassDriver::initXbox() {}
-
-int XInputGetState(int idx, DagorXboxOneGamepadState *st)
-{
-  if (idx < 0 || idx >= GAMEPADS_MAX || !devices[idx])
-    return ERROR_DEVICE_NOT_CONNECTED;
-  if (st)
-    *st = g_st[idx];
-  return 0;
-}
-int XInputSetState(int idx, DagorXboxOneGamepadVibro *xiv)
-{
-  if (idx < 0 || idx >= GAMEPADS_MAX || !devices[idx])
-    return ERROR_DEVICE_NOT_CONNECTED;
-  const GameInputRumbleParams params = {xiv->wLeftMotorSpeed / 65535.0f, xiv->wRightMotorSpeed / 65535.0f, 0, 0};
-  if (devices[idx])
-    devices[idx]->SetRumbleState(&params);
-  return 0;
-}
-
-void HumanInput::Xbox360GamepadClassDriver::updateXboxGamepads()
-{
-  gdk::gameinput::get_devices(GameInputKindGamepad, devices);
-
-#define REMAP_BTN(X, B)                    \
-  if (state.buttons & GameInputGamepad##X) \
-  st.wButtons |= HumanInput::JOY_XINPUT_REAL_MASK_##B
-#define REMAP_AXIS(X, A, S) st.A = (int)floorf(state.X * (S))
-
-  for (size_t i = 0; i < GAMEPADS_MAX; ++i)
-  {
-    if (devices[i])
-    {
-      gdk::gameinput::Reading reading = gdk::gameinput::get_current_reading(GameInputKindGamepad, devices[i]);
-      if (reading)
-      {
-        GameInputGamepadState state;
-        if (SUCCEEDED(reading->GetGamepadState(&state)))
-        {
-          DagorXboxOneGamepadState::Data st = {0};
-
-          REMAP_BTN(A, A);
-          REMAP_BTN(B, B);
-          REMAP_BTN(X, X);
-          REMAP_BTN(Y, Y);
-          REMAP_BTN(DPadDown, D_DOWN);
-          REMAP_BTN(DPadLeft, D_LEFT);
-          REMAP_BTN(DPadRight, D_RIGHT);
-          REMAP_BTN(DPadUp, D_UP);
-          REMAP_BTN(LeftShoulder, L_SHOULDER);
-          REMAP_BTN(LeftThumbstick, L_THUMB);
-          REMAP_BTN(Menu, START);
-          REMAP_BTN(RightShoulder, R_SHOULDER);
-          REMAP_BTN(RightThumbstick, R_THUMB);
-          REMAP_BTN(View, BACK);
-
-          REMAP_AXIS(leftTrigger, bLeftTrigger, 255);
-          REMAP_AXIS(rightTrigger, bRightTrigger, 255);
-          REMAP_AXIS(leftThumbstickX, sThumbLX, JOY_XINPUT_MAX_AXIS_VAL);
-          REMAP_AXIS(leftThumbstickY, sThumbLY, JOY_XINPUT_MAX_AXIS_VAL);
-          REMAP_AXIS(rightThumbstickX, sThumbRX, JOY_XINPUT_MAX_AXIS_VAL);
-          REMAP_AXIS(rightThumbstickY, sThumbRY, JOY_XINPUT_MAX_AXIS_VAL);
-
-          if (memcmp(&st, &g_st[i].Gamepad, sizeof(st)) == 0)
-            continue;
-
-          g_st[i].Gamepad = st;
-          g_st[i].dwPacketNumber++;
-        }
-      }
-    }
-  }
-
-#undef REMAP_AXIS
-#undef REMAP_BTN
-}
-
-#endif

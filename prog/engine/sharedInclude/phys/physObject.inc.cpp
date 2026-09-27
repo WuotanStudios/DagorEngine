@@ -1,33 +1,25 @@
 #include <phys/dag_physObject.h>
 #include <phys/dag_physSysInst.h>
 #include <phys/dag_physics.h>
+#include <phys/dag_physTwistCtrl.h>
 #include <math/dag_geomTree.h>
 #include <math/dag_geomNodeUtils.h>
 #include <shaders/dag_dynSceneRes.h>
 #include <generic/dag_tabUtils.h>
 #include <debug/dag_debug.h>
-#include <math/twistCtrl.h>
 #include <3d/dag_render.h>
-
-
-template <>
-DynamicPhysObject::DynamicPhysObjectClass() : physSys(NULL), nodeTree(NULL)
-{}
 
 
 template <>
 DynamicPhysObject::~DynamicPhysObjectClass()
 {
-#ifndef NO_3D_GFX
   for (int i = 0; i < modelEntries.size(); i++)
   {
     del_it(modelEntries[i]->model);
     del_it(modelEntries[i]);
   }
-#endif
 
   del_it(physSys);
-  del_it(nodeTree);
 }
 
 
@@ -46,9 +38,8 @@ void DynamicPhysObject::init(const DynamicPhysObjectData *phys_obj_data, PhysWor
   if (phys_obj_data->physRes && world)
     physSys = new PhysSystemInstance(phys_obj_data->physRes, world, &tm, &ud, fgroup, fmask);
   if (phys_obj_data->nodeTree)
-    nodeTree = new GeomNodeTree(*phys_obj_data->nodeTree);
+    nodeTree.reset(GeomNodeTree::make(*phys_obj_data->nodeTree));
 
-#ifndef NO_3D_GFX
   for (int nModel = 0; nModel < phys_obj_data->models.size(); nModel++)
   {
     if (!phys_obj_data->models[nModel])
@@ -70,11 +61,20 @@ void DynamicPhysObject::init(const DynamicPhysObjectData *phys_obj_data, PhysWor
     {
       const RoNameMapEx &map = entry->model->getLodsResource()->getNames().node;
 
+      Tab<int> treeNodeToBody(framemem_ptr());
       clear_and_resize(entry->nodeHelpers, nodeTree->nodeCount());
+      treeNodeToBody.resize(entry->nodeHelpers.size());
       for (dag::Index16 j(0), je(entry->nodeHelpers.size()); j != je; ++j)
-        entry->nodeHelpers[j.index()] = physSys->getTmHelper(nodeTree->getNodeName(j));
+      {
+        int bodyId = -1;
+        entry->nodeHelpers[j.index()] = physSys->getTmHelper(nodeTree->getNodeName(j), &bodyId);
+        treeNodeToBody[j.index()] = bodyId;
+      }
 
       clear_and_resize(entry->treeIndex, map.nameCount());
+      clear_and_resize(entry->nodeToBody, map.nameCount());
+      for (int &bodyId : entry->nodeToBody)
+        bodyId = -1;
       iterate_names(map, [&](int i, const char *name) {
         entry->treeIndex[i] = nodeTree->findNodeIndex(name);
         G_ASSERT((int)entry->treeIndex[i] < 0x8000);
@@ -85,47 +85,33 @@ void DynamicPhysObject::init(const DynamicPhysObjectData *phys_obj_data, PhysWor
             G_ASSERT(entry->treeIndex[i]);
             entry->treeIndex[i] = dag::Index16(entry->treeIndex[i].index() | 0x8000);
           }
+        if (entry->treeIndex[i])
+          entry->nodeToBody[i] = treeNodeToBody[entry->treeIndex[i].index() & ~0x8000];
       });
 
-      dag::ConstSpan<PhysicsResource::NodeAlignCtrl> c = phys_obj_data->physRes->getNodeAlignCtrl();
-      entry->nodeAlignCtrl.reserve(c.size());
-      for (int i = 0; i < c.size(); i++)
-      {
-        NodeAlignCtrl &ctrl = entry->nodeAlignCtrl.push_back();
-        ctrl.node0Id = nodeTree->findNodeIndex(c[i].node0);
-        ctrl.node1Id = nodeTree->findNodeIndex(c[i].node1);
-        ctrl.angDiff = c[i].angDiff;
-        for (int j = 0; j < countof(c[i].twist) && !c[i].twist[j].empty(); j++)
-        {
-          ctrl.twistId[j] = nodeTree->findNodeIndex(c[i].twist[j]);
-          if (!ctrl.twistId[j])
-          {
-            ctrl.twistCnt = 0;
-            break;
-          }
-          ctrl.twistCnt = j + 1;
-        }
-        if (!ctrl.node0Id || !ctrl.node1Id || !ctrl.twistCnt)
-          entry->nodeAlignCtrl.pop_back();
-      }
+      entry->twistCtrl = make_phys_twist_ctrls(*phys_obj_data->physRes, *nodeTree);
     }
     else if (physSys)
     {
       const RoNameMapEx &map = entry->model->getLodsResource()->getNames().node;
       clear_and_resize(entry->nodeHelpers, map.nameCount());
       mem_set_0(entry->nodeHelpers);
+      clear_and_resize(entry->nodeToBody, map.nameCount());
+      for (int &bodyId : entry->nodeToBody)
+        bodyId = -1;
 
       iterate_names(map, [&](int i, const char *name) {
-        if (TMatrix *tmHelper = physSys->getTmHelper(name))
+        int bodyId = -1;
+        if (TMatrix *tmHelper = physSys->getTmHelper(name, &bodyId))
         {
           entry->nodeHelpers[i] = tmHelper;
-          if (!entry->nodeHelpers[0])
+          entry->nodeToBody[i] = bodyId;
+          if (!entry->nodeHelpers[0]) // -V1051
             entry->nodeHelpers[0] = tmHelper;
         }
       });
     }
   }
-#endif // NO_3D_GFX
 }
 
 
@@ -144,7 +130,6 @@ DynamicPhysObject *DynamicPhysObject::create(const DynamicPhysObjectData *data, 
 }
 
 
-#ifndef NO_3D_GFX
 template <>
 void DynamicPhysObject::replaceModel(int index, DynamicRenderableSceneLodsResource *res)
 {
@@ -155,14 +140,18 @@ void DynamicPhysObject::replaceModel(int index, DynamicRenderableSceneLodsResour
 }
 
 template <>
-void DynamicPhysObject::beforeRender(const Point3 &cam_pos)
+void DynamicPhysObject::beforeRender(const Point3 &cam_pos, dag::FunctionRef<TMatrix(int)> get_body_tm,
+  dag::FunctionRef<bool(int)> is_body_visible)
 {
   if (physSys && modelEntries.size() == 1 && physSys->getBodyCount() == 1)
   {
     // "single-body at root" case
     TMatrix itm = physSys->getPhysicsResource()->getBodies()[0].tmInvert;
     TMatrix tm;
-    physSys->getBody(0)->getTm(tm);
+    if (get_body_tm)
+      tm = get_body_tm(0);
+    else
+      physSys->getBody(0)->getTm(tm);
 
     tm = tm * itm;
     if (nodeTree)
@@ -175,6 +164,8 @@ void DynamicPhysObject::beforeRender(const Point3 &cam_pos)
     modelEntries[0]->model->setNodeWtm(0, tm);
     if (modelEntries[0]->model->getLodsResource()->getNames().node.nameCount() == 1)
     {
+      if (is_body_visible)
+        modelEntries[0]->model->showNode(0, is_body_visible(0));
       modelEntries[0]->model->beforeRender(cam_pos);
       return;
     }
@@ -182,7 +173,7 @@ void DynamicPhysObject::beforeRender(const Point3 &cam_pos)
 
   if (physSys)
   {
-    physSys->updateTms();
+    physSys->updateTms(get_body_tm);
 
     for (ModelEntry *entry : modelEntries)
     {
@@ -196,9 +187,8 @@ void DynamicPhysObject::beforeRender(const Point3 &cam_pos)
             nodeTree->setNodeWtmScalar(i, *entry->nodeHelpers[i.index()]);
             nodeTree->invalidateWtm(i);
           }
-        for (int j = 0; j < entry->nodeAlignCtrl.size(); j++)
-          apply_twist_ctrl(*nodeTree, entry->nodeAlignCtrl[j].node0Id, entry->nodeAlignCtrl[j].node1Id,
-            make_span(entry->nodeAlignCtrl[j].twistId, entry->nodeAlignCtrl[j].twistCnt), entry->nodeAlignCtrl[j].angDiff);
+        for (const TwistCtrlParams &ctrl : entry->twistCtrl)
+          apply_phys_twist_ctrl(*nodeTree, ctrl);
 
         nodeTree->calcWtm();
         for (int i = 0; i < entry->treeIndex.size(); ++i)
@@ -216,6 +206,12 @@ void DynamicPhysObject::beforeRender(const Point3 &cam_pos)
           entry->model->setNodeWtm(i, *entry->nodeHelpers[i]);
     }
   }
+
+  if (is_body_visible)
+    for (ModelEntry *entry : modelEntries)
+      for (int i = 0; i < entry->nodeToBody.size(); ++i)
+        if (entry->nodeToBody[i] >= 0)
+          entry->model->showNode(i, is_body_visible(entry->nodeToBody[i]));
 
   if (nodeTree)
   {
@@ -252,5 +248,3 @@ void DynamicPhysObject::getBodyVisualTm(int index, TMatrix &tm)
 
   physSys->getBody(index)->getTm(tm);
 }
-
-#endif // NO_3D_GFX

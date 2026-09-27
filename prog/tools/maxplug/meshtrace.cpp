@@ -1,7 +1,8 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
+#include <algorithm>
+
 #include "math3d.h"
-#include "qsort.h"
 #include "debug.h"
 
 template <class T>
@@ -9,7 +10,7 @@ inline T *__memchk(T *o, const char *f, int l)
 {
   if (!o)
   {
-    debug("Not enough memory in file <%s>, line <%d>", f, l);
+    debug("Not enough memory in file <{}>, line <{}>", f, l);
     assert(false);
   }
   return o;
@@ -17,21 +18,11 @@ inline T *__memchk(T *o, const char *f, int l)
 
 #define nomemchk(o) __memchk(o, __FILE__, __LINE__)
 
-#ifndef nomem
-#define nomem(a)                                                              \
-  {                                                                           \
-    if (!(a))                                                                 \
-      fatal("Not enough memory in file <%s>, line <%d>", __FILE__, __LINE__); \
-  }
-#endif
-
 #define bugchk(a) assert(a)
 
 #define MAX_LEAF_FACES  16
 #define MAX_LEAF_LENGTH MAX_REAL
 #define MIN_LEAF_FACES  16
-
-#define MAX_SCENE_LEAF_FACES 16
 
 
 class StaticMeshRTracer : public StaticMeshRayTracer
@@ -320,22 +311,13 @@ StaticMeshRTracer::Node *StaticMeshRTracer::build_node(Mesh &m, int *fc, int num
     BNode *n = nomemchk(new BNode);
     n->bsc = c;
     n->bsr2 = r;
-    /*Point3 wd=box.width();
-    int md=0;
-    real ms=wd[0];
-    for(i=1;i<3;++i) if(wd[i]>ms) ms=wd[md=i];*/
-    real dp = c[md] * 3;
     for (i = 0; i < numf; ++i)
     {
       int f = fc[i];
-      // fgrp[f]=((m.vert[m.face[f].v[0]][md]+m.vert[m.face[f].v[1]][md]+
-      // m.vert[m.face[f].v[2]][md])>=dp);
       fgrp2[f] = ((m.verts[m.faces[f].v[0]][md] + m.verts[m.faces[f].v[1]][md] + m.verts[m.faces[f].v[2]][md]));
     }
-    // DataSimpleQsort<int,MapSimpleAscentCompare<char>,char> qs;
-    // qs.sort(fc,numf,fgrp);
-    DataSimpleQsort<int, MapSimpleAscentCompare<float>, float> qs;
-    qs.sort(fc, numf, fgrp2.Addr(0));
+    const float *key = fgrp2.Addr(0);
+    std::sort(fc, fc + numf, [key](int a, int b) { return key[a] < key[b]; });
     int df = numf >> 1;
     n->sub0 = build_node(m, fc, df);
     n->sub1 = build_node(m, fc + df, numf - df);
@@ -383,17 +365,10 @@ void StaticMeshRTracer::build(Mesh &m)
   }
   Tab<int> fc;
   fc.SetCount(m.numFaces);
-  // nomem(fgrp.resize(m.face.size()));
   fgrp2.SetCount(m.numFaces);
   for (int i = 0; i < fc.Count(); ++i)
     fc[i] = i;
   root = build_node(m, fc.Addr(0), fc.Count());
-}
-
-StaticMeshRayTracer *create_staticmeshraytracer()
-{
-  StaticMeshRTracer *rt = nomemchk(new StaticMeshRTracer);
-  return rt;
 }
 
 StaticMeshRayTracer *create_staticmeshraytracer(Mesh &m)

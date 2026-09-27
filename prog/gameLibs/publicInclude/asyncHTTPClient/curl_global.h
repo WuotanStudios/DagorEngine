@@ -10,7 +10,7 @@
 namespace curl_global
 {
 void init();
+// Shuts the async http client down first: its handles are built on these globals
 void shutdown();
 void was_initialized_externally(bool value);
-void set_requests_limit(uint32_t limit);
 } // namespace curl_global

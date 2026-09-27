@@ -44,6 +44,7 @@ macro DAGI_SKY_VIS_SW_TRILINEAR(code)
     uint dagi_sky_vis_get_best_enclosing_clip_border_skip(float3 worldPos, out float3 coordF, uint skip, float border)
     {
       uint i = 0;
+      uint clipCount = dagi_sky_vis_get_searched_clip_count();
       LOOP
       do {
         if (i == skip)
@@ -51,10 +52,10 @@ macro DAGI_SKY_VIS_SW_TRILINEAR(code)
         int4 lt = sample_dagi_sky_vis_clipmap_lt_coord(i);
         coordF = worldPos.xzy/asfloat(lt.w);
         float3 coordLt = coordF - lt.xyz;
-        if (all(coordLt >= border && coordLt < float3(dagi_sky_vis_get_clip_size().xxy)-border))
+        if (all(and(coordLt >= border, coordLt < float3(dagi_sky_vis_get_clip_size().xxy)-border)))
           return i;
         ++i;// moving that to while () causes invalid shader compilation on dx11
-      } while (i < dagi_sky_vis_get_clip_count());
+      } while (i < clipCount);
       return DAGI_MAX_SKY_VIS_CLIPS;
     }
 
@@ -226,7 +227,8 @@ macro SKY_VIS_RAY_CAST(code)
       if (sdfStart < MAX_WORLD_SDF_CLIPS)
       {
         uint sdfClip;
-        bool hit = world_sdf_trace_start(sdfStart, worldPos, rayDir, maxT, t, sdfClip);
+        float distAtRayStart;
+        bool hit = world_sdf_trace_start(sdfStart, worldPos, rayDir, maxT, t, distAtRayStart, sdfClip);
         if (hit)
         {
           cVis = get_sky_vis(worldPos, rayDir, t, sdfClip, clip, ambientStrength, skipClip);
@@ -257,7 +259,6 @@ endmacro
 
 shader dagi_sky_visibility_toroidal_movement_interpolate_cs
 {
-  ENABLE_ASSERT(cs)
   DAGI_SKY_VIS_UAV(cs)
   DAGI_SKY_VIS_CLIPMAP_MATH(cs)
   DAGI_SKY_VIS_SW_TRILINEAR(cs)
@@ -290,13 +291,13 @@ shader dagi_sky_visibility_toroidal_movement_interpolate_cs
       float3 coordOtherF = absCoord*2.f + 1.f;
       int3 ltOther = dagi_sky_vis_abs_coord_lt(min(otherClip, uint(dagi_sky_vis_get_clip_count() - 1)));
       BRANCH
-      if (clip == 0 || any(coordOtherF - ltOther < 0.5 || coordOtherF - ltOther > dagi_sky_vis_get_clip_size().xxy-0.5))
+      if (clip == 0 || any(or(coordOtherF - ltOther < 0.5, coordOtherF - ltOther > dagi_sky_vis_get_clip_size().xxy-0.5)))
       {
         otherClip = clip + 1;
         coordOtherF = absCoord*0.5 + 0.25;
         ltOther = dagi_sky_vis_abs_coord_lt(otherClip);
         BRANCH
-        if (any(coordOtherF - ltOther < 0.5 || coordOtherF - ltOther > dagi_sky_vis_get_clip_size().xxy-0.5))
+        if (any(or(coordOtherF - ltOther < 0.5, coordOtherF - ltOther > dagi_sky_vis_get_clip_size().xxy-0.5)))
           return 0;
       }
 
@@ -331,7 +332,6 @@ shader dagi_sky_visibility_toroidal_movement_trace_cs
   hlsl {
     #define DAGI_SKY_VIS_UPDATE_USE_SKY 1
   }
-  ENABLE_ASSERT(cs)
   DAGI_SKY_VIS_UAV(cs)
   DAGI_SKY_VIS_CLIPMAP_MATH(cs)
   (cs) {
@@ -410,7 +410,6 @@ shader dagi_sky_visibility_toroidal_movement_spatial_filter_split_cs
     dagi_sky_vis_update_sz_coord@i4 = dagi_sky_vis_update_sz_coord;
   }
   DAGI_SKY_VIS_SELECTED_PROBES_UAV(cs)
-  ENABLE_ASSERT(cs)
   DAGI_SKY_VIS_SAMPLE(cs)
   hlsl(cs) {
 
@@ -433,7 +432,7 @@ shader dagi_sky_visibility_toroidal_movement_spatial_filter_split_cs
       UNROLL
       for (uint i = 0; i < 8; ++i)
       {
-        float3 ofs = uint3(i&1, i&2, i&4) ? 1.f : 0;
+        float3 ofs = select(uint3(i&1, i&2, i&4) != 0, float3(1,1,1), float3(0,0,0));
         float3 absCoord1 = clamp(ofs + absCoordF, minCoordF, maxCoordF);
         float3 worldTc = absCoord1*dagi_sky_vis_sizef.zzw;
         worldTc.z = frac(worldTc.z)*decodeClip.x + decodeClip.y;
@@ -454,7 +453,6 @@ shader dagi_sky_visibility_toroidal_movement_spatial_filter_split_apply_cs
     dagi_sky_vis_update_lt_coord@i4 = dagi_sky_vis_update_lt_coord;
     dagi_sky_vis_update_sz_coord@i4 = dagi_sky_vis_update_sz_coord;
   }
-  ENABLE_ASSERT(cs)
   DAGI_SKY_VIS_UAV(cs)
   DAGI_SKY_VIS_CLIPMAP_MATH(cs)
   (cs) {
@@ -498,7 +496,6 @@ hlsl {
 }
 shader dagi_sky_visibility_select_temporal_cs
 {
-  ENABLE_ASSERT(cs)
   SKY_VIS_AGE_SRV(cs)
   DAGI_SKY_VIS_SAMPLE(cs)
   INIT_AND_USE_FRUSTUM_CHECK_BASE(cs)
@@ -606,7 +603,6 @@ shader dagi_sky_visibility_select_temporal_cs
 
 shader dagi_sky_visibility_create_indirect_cs
 {
-  ENABLE_ASSERT(cs)
   DAGI_SKY_VIS_CLIPMAP_MATH(cs)
   DAGI_SKY_VIS_PROBABILITIES_UAV(cs)
   (cs)
@@ -643,7 +639,6 @@ shader dagi_sky_visibility_create_indirect_cs
 
 shader dagi_sky_visibility_clear_temporal_cs
 {
-  ENABLE_ASSERT(cs)
   DAGI_SKY_VIS_PROBABILITIES_UAV(cs)
   hlsl(cs) {
     #include <dagi_sky_vis.hlsli>
@@ -664,7 +659,6 @@ shader dagi_sky_visibility_calc_temporal_cs
   hlsl {
     #define DAGI_SKY_VIS_UPDATE_USE_SKY 1
   }
-  ENABLE_ASSERT(cs)
   SKY_VIS_AGE_UAV(cs)
   PROJECT_ADDITIONAL_SKY_VIS_TEMPORAL(cs)
   DAGI_SKY_VIS_UAV(cs)

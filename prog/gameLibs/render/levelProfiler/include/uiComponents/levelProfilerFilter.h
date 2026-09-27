@@ -12,7 +12,7 @@ namespace levelprofiler
 using FilterDrawCallback = eastl::function<void()>;
 
 class RIModule;
-enum TableColumn;
+class TextureModule;
 struct TextureData;
 
 
@@ -182,6 +182,25 @@ public:
       absoluteMax = default_max_value;
   }
 
+  // Moves the bounds onto freshly collected data. Each side the user did not set follows its new
+  // bound, so no thumb is left off the slider track; a side they did set is kept, because pass()
+  // works against a range wider than the data and clamping would collapse a partly overlapping
+  // range with no way back. Inverted input means nothing in the data is selectable, so it does
+  // nothing at all.
+  void rebind(T new_min_value, T new_max_value)
+  {
+    if (new_min_value > new_max_value)
+      return;
+
+    defaultMin = absoluteMin = new_min_value;
+    defaultMax = absoluteMax = new_max_value;
+
+    if (!useMin)
+      minValue = new_min_value;
+    if (!useMax)
+      maxValue = new_max_value;
+  }
+
   void setRange(T new_min_value, T new_max_value)
   {
     minValue = new_min_value;
@@ -213,147 +232,6 @@ public:
   T getDefaultMin() const { return defaultMin; }
 
   T getDefaultMax() const { return defaultMax; }
-
-  // Returns true if the range values were changed by the user.
-  // The 'speed' parameter controls the increment/decrement speed of the drag.
-  // 'flags' can be used to customize ImGui slider behavior.
-  bool drawRangeSlider(const char *label, const char *format_min = "Min: %.3f", const char *format_max = "Max: %.3f",
-    float speed = 1.0f, ImGuiSliderFlags flags = 0)
-  {
-    bool changed = false;
-
-    T currentMin = minValue;
-    T currentMax = maxValue;
-
-    if constexpr (eastl::is_integral<T>::value)
-    {
-      changed = ImGui::DragIntRange2(label, reinterpret_cast<int *>(&currentMin), reinterpret_cast<int *>(&currentMax), speed,
-        static_cast<int>(absoluteMin), static_cast<int>(absoluteMax), format_min, format_max, flags);
-    }
-    else if constexpr (eastl::is_floating_point<T>::value)
-    {
-      changed = ImGui::DragFloatRange2(label, reinterpret_cast<float *>(&currentMin), reinterpret_cast<float *>(&currentMax), speed,
-        static_cast<float>(absoluteMin), static_cast<float>(absoluteMax), format_min, format_max, flags);
-    }
-
-    if (changed)
-    {
-      minValue = currentMin;
-      maxValue = currentMax;
-
-      useMin = (minValue > absoluteMin);
-      useMax = (maxValue < absoluteMax);
-    }
-
-    return changed;
-  }
-
-  // Returns true if the input values were changed.
-  bool drawInputs(const char *min_label, const char *max_label, const char *format = "%.3f")
-  {
-    bool changed = false;
-    ImGui::PushID("RangeInputs"); // Ensures unique IDs for ImGui elements within this section.
-
-    bool tempUseMin = useMin;
-    bool tempUseMax = useMax;
-    T currentMin = minValue;
-    T currentMax = maxValue;
-
-    ImGui::Columns(2, nullptr, false);            // Use 2 columns for a compact layout.
-    if (ImGui::Checkbox("##UseMin", &tempUseMin)) // Checkbox to enable/disable the min value.
-    {
-      useMin = tempUseMin;
-      changed = true;
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!tempUseMin);
-
-    if constexpr (eastl::is_integral<T>::value)
-    {
-      int tempMin = static_cast<int>(currentMin);
-      // ImGuiInputTextFlags_EnterReturnsTrue makes the input apply on Enter key press.
-      if (ImGui::InputInt(min_label, &tempMin, 1, 100, ImGuiInputTextFlags_EnterReturnsTrue))
-      {
-        minValue = static_cast<T>(tempMin);
-        useMin = true; // Automatically enable if value is changed.
-        changed = true;
-      }
-    }
-    else
-    {
-      float tempMin = static_cast<float>(currentMin);
-      // ImGuiInputTextFlags_EnterReturnsTrue makes the input apply on Enter key press.
-      if (ImGui::InputFloat(min_label, &tempMin, 0.1f, 1.0f, format, ImGuiInputTextFlags_EnterReturnsTrue))
-      {
-        minValue = static_cast<T>(tempMin);
-        useMin = true; // Automatically enable if value is changed.
-        changed = true;
-      }
-    }
-    ImGui::EndDisabled();
-
-    ImGui::NextColumn();
-    if (ImGui::Checkbox("##UseMax", &tempUseMax))
-    {
-      useMax = tempUseMax;
-      changed = true;
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!tempUseMax);
-
-    if constexpr (eastl::is_integral<T>::value)
-    {
-      int tempMax = static_cast<int>(currentMax);
-      // ImGuiInputTextFlags_EnterReturnsTrue makes the input apply on Enter key press.
-      if (ImGui::InputInt(max_label, &tempMax, 1, 100, ImGuiInputTextFlags_EnterReturnsTrue))
-      {
-        maxValue = static_cast<T>(tempMax);
-        useMax = true; // Automatically enable if value is changed.
-        changed = true;
-      }
-    }
-    else
-    {
-      float tempMax = static_cast<float>(currentMax);
-      // ImGuiInputTextFlags_EnterReturnsTrue makes the input apply on Enter key press.
-      if (ImGui::InputFloat(max_label, &tempMax, 0.1f, 1.0f, format, ImGuiInputTextFlags_EnterReturnsTrue))
-      {
-        maxValue = static_cast<T>(tempMax);
-        useMax = true; // Automatically enable if value is changed.
-        changed = true;
-      }
-    }
-    ImGui::EndDisabled();
-
-    ImGui::Columns(1);
-    ImGui::PopID();
-
-    return changed;
-  }
-
-  // Returns true if any part of the range filter UI changed its state.
-  bool drawRangeFilterUI(const char *label, const char *format_min = "Min: %.3f", const char *format_max = "Max: %.3f",
-    float speed = 1.0f, ImGuiSliderFlags flags = 0)
-  {
-    bool changed = false;
-
-    if (ImGui::Button("Clear")) // Button to reset the filter to its default state.
-    {
-      reset();
-      changed = true;
-    }
-
-    ImGui::Separator();
-
-    bool inputsChanged = drawInputs(format_min, format_max);
-    changed |= inputsChanged;
-
-    ImGui::Separator();
-
-    bool sliderChanged = drawRangeSlider(label, format_min, format_max, speed, flags);
-
-    return changed || sliderChanged;
-  }
 
 protected:
   bool useMin = false, useMax = false;
@@ -408,30 +286,6 @@ private:
   bool isClicked;
 };
 
-
-// Defines an entry for a filter popup, associating a table column with a drawing function.
-struct PopupEntry
-{
-  TableColumn column = COLUMN_NONE;
-  const char *popupId = nullptr;
-  FilterDrawCallback drawFunction;
-};
-
-class LpFilterPopupManager
-{
-public:
-  void registerPopup(TableColumn table_column, const char *popup_identifier, FilterDrawCallback draw_func);
-
-  void open(TableColumn table_column);
-
-  void drawAll();
-
-private:
-  eastl::vector<PopupEntry> entries;
-  TableColumn columnToOpen{COLUMN_NONE};
-};
-
-
 // === Master Filter Manager ===
 
 
@@ -449,12 +303,27 @@ public:
   bool passesAllFilters(const ProfilerString &texture_name, const TextureData &texture_data, const TextureUsage *texture_usage_ptr);
 
   void resetAllFilters();
+  // Recollect counterpart of resetAllFilters: moves the data-derived bounds onto the new data and
+  // keeps every user setting. resetAllFilters stays the explicit "reset filters" action.
+  void rebindFiltersToData();
+
+  // Which filters take their bounds from collected data, and from where. Both resetAllFilters
+  // and rebindFiltersToData drive the same four, so the choice lives in one place.
+  struct DataBounds
+  {
+    int mipMin = 0, mipMax = 0;
+    float sizeMin = 0.0f, sizeMax = 0.0f;
+    int usageMin = 0, usageMax = 0;
+    int instMin = 0, instMax = 0;
+  };
+  DataBounds gatherDataBounds() const;
   void applyFilters();
-  bool isColumnFilterActive(TableColumn table_column) const;
+  bool isColumnFilterActive(ColumnIndex column_index) const;
 
 
-  // Call in UI right after filter creation
-  void setRIModule(RIModule *module_instance);
+  // Both modules come from the owning TextureProfilerUI, which holds them. Call in UI right
+  // after filter creation: every filter path reads one or the other.
+  void setModules(TextureModule *texture_module, RIModule *ri_module);
 
   CheckFilter<ProfilerString> &getFormatFilter() { return formatFilter; }
   CheckFilter<int> &getWidthFilter() { return widthFilter; }
@@ -466,6 +335,7 @@ public:
   LpRangeFilter<int> &getLodsRangeFilter() { return lodsRangeFilter; }
   LpRangeFilter<int> &getResolutionRangeFilter() { return resolutionRangeFilter; }
   LpRangeFilter<int> &getTextureUsageRangeFilter() { return textureUsageRangeFilter; }
+  LpRangeFilter<int> &getAssetInstanceCountRangeFilter() { return assetInstanceCountRangeFilter; }
 
   void setTextureUsageFilters(bool non_ri_flag, bool unique_flag, bool shared_flag);
   bool getTextureUsageFilterNonRI() const { return isTextureUsageFilterNonRI; }
@@ -536,6 +406,9 @@ public:
   LpIncludeExcludeFilter &getTextureUsageFilterComponent() { return textureUsageFilter; }
 
 private:
+  // Both are set once by setModules and stay non-null for the manager's lifetime, so the
+  // filter paths dereference them without checking.
+  TextureModule *textureModule = nullptr;
   RIModule *riModule = nullptr;
   LpIncludeExcludeFilter nameFilter;
   LpIncludeExcludeFilter textureUsageFilter;
@@ -549,6 +422,7 @@ private:
   LpRangeFilter<int> resolutionRangeFilter;
   LpRangeFilter<int> mipRangeFilter;
   LpRangeFilter<int> textureUsageRangeFilter;
+  LpRangeFilter<int> assetInstanceCountRangeFilter;
 
   bool isTextureUsageFilterNonRI = true;
   bool isTextureUsageFilterUnique = true;

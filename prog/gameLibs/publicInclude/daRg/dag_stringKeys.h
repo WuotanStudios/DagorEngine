@@ -9,19 +9,25 @@
 
 typedef struct SQVM *HSQUIRRELVM;
 
+// Please keep this list sorted alphabetically for easier navigation
+
 namespace darg
 {
 #define DARG_STRING_KEYS_LIST    \
   KEY(action)                    \
   KEY(active)                    \
+  KEY(allowTags)                 \
   KEY(angle)                     \
   KEY(animations)                \
   KEY(attach)                    \
   KEY(behavior)                  \
   KEY(bgColor)                   \
+  KEY(bindProps)                 \
   KEY(borderColor)               \
   KEY(borderRadius)              \
   KEY(borderWidth)               \
+  KEY(boundPropsData)            \
+  KEY(breakLongWords)            \
   KEY(brightness)                \
   KEY(btnId)                     \
   KEY(btnName)                   \
@@ -50,18 +56,21 @@ namespace darg
   KEY(devId)                     \
   KEY(disableInput)              \
   KEY(drag)                      \
+  KEY(dragAndDropState)          \
+  KEY(dragByPivot)               \
+  KEY(dragMouseButton)           \
+  KEY(dragStartDelay)            \
   KEY(draw)                      \
   KEY(drawFunc)                  \
-  KEY(dragAndDropState)          \
-  KEY(dragMouseButton)           \
   KEY(dropData)                  \
   KEY(duration)                  \
   KEY(easing)                    \
   KEY(editableText)              \
   KEY(elem)                      \
   KEY(ellipsis)                  \
-  KEY(eventId)                   \
+  KEY(embed)                     \
   KEY(eventHandlers)             \
+  KEY(eventId)                   \
   KEY(eventName)                 \
   KEY(eventPassThrough)          \
   KEY(fValue)                    \
@@ -87,6 +96,10 @@ namespace darg
   KEY(formattedText)             \
   KEY(from)                      \
   KEY(gap)                       \
+  KEY(gestureDragDistanceMax)    \
+  KEY(gesturePinchDistanceMin)   \
+  KEY(gestureRotateDistanceMin)  \
+  KEY(globalScroll)              \
   KEY(globalTimer)               \
   KEY(group)                     \
   KEY(h)                         \
@@ -106,6 +119,7 @@ namespace darg
   KEY(image)                     \
   KEY(imageAffectsLayout)        \
   KEY(imageHalign)               \
+  KEY(imageLoading)              \
   KEY(imageValign)               \
   KEY(imeNoAutoCap)              \
   KEY(imeNoCopy)                 \
@@ -119,8 +133,8 @@ namespace darg
   KEY(joystickScroll)            \
   KEY(keepAspect)                \
   KEY(key)                       \
+  KEY(kineticScrollOnTouchEnd)   \
   KEY(knob)                      \
-  KEY(knobOffset)                \
   KEY(last)                      \
   KEY(lastT)                     \
   KEY(lastX)                     \
@@ -137,6 +151,7 @@ namespace darg
   KEY(maxChars)                  \
   KEY(maxContentWidth)           \
   KEY(maxHeight)                 \
+  KEY(maxTime)                   \
   KEY(maxWidth)                  \
   KEY(min)                       \
   KEY(minFontSize)               \
@@ -148,7 +163,6 @@ namespace darg
   KEY(movie)                     \
   KEY(movieFileName)             \
   KEY(moviePlayer)               \
-  KEY(soundPlayer)               \
   KEY(onAbort)                   \
   KEY(onAttach)                  \
   KEY(onBlur)                    \
@@ -164,26 +178,31 @@ namespace darg
   KEY(onExit)                    \
   KEY(onFinish)                  \
   KEY(onFocus)                   \
-  KEY(onHover)                   \
-  KEY(onSliderMouseMove)         \
-  KEY(onMouseMove)               \
-  KEY(onMouseWheel)              \
-  KEY(onPointerPress)            \
-  KEY(onPointerMove)             \
-  KEY(onPointerRelease)          \
+  KEY(onGestureActive)           \
   KEY(onGestureBegin)            \
   KEY(onGestureEnd)              \
-  KEY(onGestureActive)           \
+  KEY(onHover)                   \
+  KEY(onJoystickScroll)          \
+  KEY(onMouseMove)               \
+  KEY(onMouseWheel)              \
+  KEY(onPointerMove)             \
+  KEY(onPointerPress)            \
+  KEY(onPointerRelease)          \
+  KEY(onKeyPress)                \
+  KEY(onKeyRelease)              \
   KEY(onRecalcLayout)            \
   KEY(onReturn)                  \
   KEY(onScroll)                  \
-  KEY(onWheelScroll)             \
+  KEY(onSliderMouseMove)         \
   KEY(onStart)                   \
-  KEY(onTouchHold)               \
   KEY(onTouchBegin)              \
-  KEY(touchHoldTime)             \
+  KEY(onTouchHold)               \
+  KEY(onWheelScroll)             \
   KEY(onWrongInput)              \
+  KEY(onlyWhenParentInScreen)    \
   KEY(opacity)                   \
+  KEY(opacityCenterMinMult)      \
+  KEY(opacityCenterRelativeDist) \
   KEY(orientation)               \
   KEY(padding)                   \
   KEY(pageScroll)                \
@@ -191,6 +210,7 @@ namespace darg
   KEY(parSpacing)                \
   KEY(parallaxK)                 \
   KEY(password)                  \
+  KEY(pauseOnHover)              \
   KEY(phase)                     \
   KEY(picSaturate)               \
   KEY(pivot)                     \
@@ -205,11 +225,9 @@ namespace darg
   KEY(rotate)                    \
   KEY(rtAlwaysUpdate)            \
   KEY(rtRecalcLayout)            \
-  KEY(onlyWhenParentInScreen)    \
   KEY(rumble)                    \
   KEY(safeAreaMargin)            \
   KEY(saturation)                \
-  KEY(setupFunc)                 \
   KEY(scale)                     \
   KEY(screenOffs)                \
   KEY(script)                    \
@@ -226,11 +244,16 @@ namespace darg
   KEY(scrollSpeed)               \
   KEY(scrollToEdge)              \
   KEY(sectorsCount)              \
+  KEY(setupFunc)                 \
+  KEY(shaderName)                \
+  KEY(shaderParams)              \
+  KEY(shaderSource)              \
   KEY(size)                      \
   KEY(skipDirPadNav)             \
   KEY(sortChildren)              \
   KEY(sortOrder)                 \
   KEY(sound)                     \
+  KEY(soundPlayer)               \
   KEY(soundVolume)               \
   KEY(spacing)                   \
   KEY(speed)                     \
@@ -247,6 +270,7 @@ namespace darg
   KEY(subPixel)                  \
   KEY(tagsTable)                 \
   KEY(target)                    \
+  KEY(targetSize)                \
   KEY(texOffs)                   \
   KEY(text)                      \
   KEY(textAreaEditorData)        \
@@ -256,6 +280,8 @@ namespace darg
   KEY(tint)                      \
   KEY(title)                     \
   KEY(to)                        \
+  KEY(touchHoldTime)             \
+  KEY(touchMarginPriority)       \
   KEY(transform)                 \
   KEY(transitions)               \
   KEY(translate)                 \
@@ -265,21 +291,22 @@ namespace darg
   KEY(updateCounterElem)         \
   KEY(validateStaticText)        \
   KEY(valign)                    \
+  KEY(virtualInitialCount)       \
+  KEY(virtualItemHeight)         \
+  KEY(virtualItemHeights)        \
+  KEY(virtualItems)              \
+  KEY(virtualOverscan)           \
+  KEY(virtualTail)               \
   KEY(viscosity)                 \
   KEY(vplace)                    \
   KEY(w)                         \
-  KEY(watch)                     \
   KEY(waitForChildrenFadeOut)    \
+  KEY(watch)                     \
   KEY(xmbNode)                   \
-  KEY(zOrder)                    \
-  KEY(opacityCenterMinMult)      \
-  KEY(opacityCenterRelativeDist) \
-  KEY(gestureDragDistanceMax)    \
-  KEY(gesturePinchDistanceMin)   \
-  KEY(gestureRotateDistanceMin)  \
-  KEY(touchMarginPriority)       \
-  KEY(kineticScrollOnTouchEnd)   \
-  KEY(dragStartDelay)
+  KEY(zOrder)
+
+
+// ^ Please keep this list sorted alphabetically for easier navigation
 
 class StringKeys
 {

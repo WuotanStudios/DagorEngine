@@ -4,9 +4,12 @@ HaveRenderer ?= yes ;
 Root    ?= ../../.. ;
 Module = collimatorMoaCore ;
 Location = prog/gameLibs/render/$(Module) ;
+local DasModule = gameLibs_collimatorMoaCore_DAS_pull_AOT ;
 
 AddIncludes =
+  $(Root)/prog/1stPartyLibs/daScript/include
   $(Root)/prog/gameLibs/publicInclude
+  $(Root)/prog/gameLibs
 ;
 
 local AllSrcFolder_CPP = ;
@@ -15,6 +18,9 @@ local AllSrcFolder_DAS = ;
 
 if $(HaveRenderer) = yes {
   AllSrcFolder_ES +=
+    render
+  ;
+  AllSrcFolder_DAS +=
     render
   ;
 }

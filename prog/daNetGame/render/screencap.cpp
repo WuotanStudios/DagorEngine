@@ -16,10 +16,11 @@
 #include <ioSys/dag_dataBlock.h>
 #include <util/dag_simpleString.h>
 #include <util/dag_convar.h>
-#include <util/dag_aviWriter.h>
+#include <aviWriter/aviWriter.h>
 #include <gui/dag_imgui.h>
 #include <math/dag_mathBase.h>
 #include <drv/3d/dag_lock.h>
+#include <drv/3d/dag_renderTarget.h>
 #include <drv/3d/dag_tex3d.h>
 #include <debug/dag_debug3d.h>
 #include <bindQuirrelEx/autoBind.h>
@@ -89,6 +90,8 @@ static bool capturing_gui = false;
 static String comments;
 static int sequence_num = -1;
 static eastl::unique_ptr<Video360> video360;
+static bool hdr_screenshot_scheduled = false;
+static String hdr_screenshot_name;
 
 void screencap::set_comments(const char *set_comments) { comments = set_comments; }
 
@@ -114,6 +117,18 @@ static bool save_exr_triplanar_shot(const char *fn, TexPixel32 *im, int wd, int 
   ht /= eastl::size(planeNames);
   uint8_t *planePixels[] = {(uint8_t *)im + 2 * stride * ht, (uint8_t *)im + stride * ht, (uint8_t *)im};
   return ::save_exr(fn, planePixels, wd, ht, eastl::size(planePixels), stride, planeNames, comments.empty() ? NULL : comments.str());
+}
+
+static bool is_compressed(Format format)
+{
+  switch (format)
+  {
+    case Format::JPEG:
+    case Format::TGA: return true;
+    case Format::EXR:
+    case Format::PNG: return false;
+    default: G_ASSERT(false); return false; // unreachable
+  }
 }
 
 static const char *to_extension(Format format)
@@ -183,7 +198,7 @@ static UniqueTex convert_linear_to_srgb(const ManagedTex &linear)
   UniqueTex sdrHostTex = dag::create_tex(nullptr, ti.w, ti.h, TEXFMT_DEFAULT | TEXCF_SYSMEM | TEXCF_UNORDERED, 1, "sdr_host");
   static int linearTexVarId = get_shader_variable_id("linear_tex", false);
   ShaderGlobal::set_texture(linearTexVarId, linear.getTexId());
-  d3d::set_render_target(sdrTex.getTex2D(), 0);
+  d3d::set_render_target({}, DepthAccess::RW, {{sdrTex.getTex2D(), 0, 0}});
 
   tonemap.render();
 
@@ -215,11 +230,10 @@ static eastl::array<UniqueTex, 3> split_planes(const ManagedTex &linear)
   static int linearTexVarId = get_shader_variable_id("linear_tex", false);
   ShaderGlobal::set_texture(linearTexVarId, linear.getTexId());
 
+  d3d::set_render_target({}, DepthAccess::RW,
+    {{planesTex[0].getTex2D(), 0, 0}, {planesTex[1].getTex2D(), 0, 0}, {planesTex[2].getTex2D(), 0, 0}});
   for (int i : {0, 1, 2})
-  {
-    d3d::set_render_target(i, planesTex[i].getTex2D(), 0);
     d3d::resource_barrier({planesTex[i].getTex2D(), RB_RW_RENDER_TARGET | RB_STAGE_PIXEL, 0, 0});
-  }
 
   splitPlanes.render();
 
@@ -244,7 +258,7 @@ void screencap::make_screenshot(
   Format format = settings.format;
   if (force_tga)
     format = Format::TGA;
-  else if (uncompressed_screenshots.get())
+  else if (uncompressed_screenshots.get() && is_compressed(format))
     format = Format::PNG;
 
   const char *ext = to_extension(format);
@@ -313,6 +327,27 @@ bool screencap::is_screenshot_scheduled()
   return screenshot_scheduled;
 }
 
+void screencap::schedule_hdr_screenshot(const char *name_override)
+{
+  hdr_screenshot_name.setStr(name_override);
+  hdr_screenshot_scheduled = true;
+}
+
+bool screencap::is_hdr_screenshot_scheduled() { return hdr_screenshot_scheduled; }
+
+void screencap::make_hdr_screenshot(const ManagedTex &linear_frame)
+{
+  hdr_screenshot_scheduled = false;
+  // linear EXR is the point of this capture - the split_planes EXR path is
+  // only reachable through the format setting, so force it for this shot
+  Format prevFormat = settings.format;
+  settings.format = Format::EXR;
+  make_screenshot(linear_frame, hdr_screenshot_name.empty() ? nullptr : hdr_screenshot_name.str(), false, ColorSpace::Linear,
+    hdr_screenshot_name.empty() ? "_hdr" : nullptr);
+  settings.format = prevFormat;
+  hdr_screenshot_name.clear();
+}
+
 void screencap::schedule_screenshot(bool with_gui, int sequence_number, const char *name_override)
 {
   debug("schedule_screenshot: with_gui:%d, sequence_number:%d", with_gui, sequence_number);
@@ -323,7 +358,7 @@ void screencap::schedule_screenshot(bool with_gui, int sequence_number, const ch
 
 #ifdef CAPTURE_SCREENSHOT_FRAMES
   pending_delay = 3;
-  PIX_GPU_CAPTURE_NEXT_FRAMES(D3D11X_PIX_CAPTURE_API, L"", 2);
+  PIX_GPU_CAPTURE_NEXT_FRAMES(D3D12XBOX_PIX_CAPTURE_API, L"", 2);
 #endif
 }
 
@@ -459,6 +494,10 @@ static bool screencap_console_handler(const char *argv[], int argc)
   int found = 0;
   CONSOLE_CHECK_NAME("screencap", "take_screenshot", 1, 1) { screencap::schedule_screenshot(true); }
   CONSOLE_CHECK_NAME("screencap", "take_screenshot_nogui", 1, 1) { screencap::schedule_screenshot(false); }
+  CONSOLE_CHECK_NAME_EX("screencap", "take_screenshot_hdr", 1, 2, "save pre-tonemap linear frame as EXR", "[name]")
+  {
+    screencap::schedule_hdr_screenshot(argc > 1 ? argv[1] : nullptr);
+  }
   CONSOLE_CHECK_NAME("screencap", "take_screenshot_ext", 4, 4)
   {
     screencap::schedule_screenshot(console::to_bool(argv[1]), console::to_int(argv[2]), argv[3]);

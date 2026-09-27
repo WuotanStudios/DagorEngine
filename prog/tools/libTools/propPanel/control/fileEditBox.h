@@ -4,6 +4,7 @@
 #include <propPanel/control/propertyControlBase.h>
 #include <propPanel/constants.h>
 #include <propPanel/imguiHelper.h>
+#include <propPanel/immediateFocusLossHandler.h>
 #include <propPanel/messageQueue.h>
 #include "../scopedImguiBeginDisabled.h"
 #include <gui/dag_imguiUtil.h>
@@ -15,13 +16,24 @@
 namespace PropPanel
 {
 
-class FileEditBoxPropertyControl : public PropertyControlBase, public IDelayedCallbackHandler
+class FileEditBoxPropertyControl : public PropertyControlBase, public IDelayedCallbackHandler, public IImmediateFocusLossHandler
 {
 public:
   FileEditBoxPropertyControl(ControlEventHandler *event_handler, ContainerPropertyControl *parent, int id, int x, int y, hdpi::Px w,
     const char caption[]) :
     PropertyControlBase(id, event_handler, parent, x, y, w, hdpi::Px(0)), controlCaption(caption), masks("All|*.*||")
   {}
+
+  ~FileEditBoxPropertyControl() override
+  {
+    // Never leave a destroyed control registered, and stop ImGui re-applying an unfinished edit to a
+    // same-address replacement control (panel rebuilds recreate controls in place).
+    preventReapplyingEditAtFocusLoss();
+    if (get_focused_immediate_focus_loss_handler() == this)
+      set_focused_immediate_focus_loss_handler(nullptr);
+  }
+
+  void onImmediateFocusLoss() override { onWcChangeFinished(nullptr); }
 
   unsigned getTypeMaskForSet() const override
   {
@@ -100,11 +112,13 @@ public:
 
   void setEnabled(bool enabled) override { controlEnabled = enabled; }
 
+  const char *getImguiTypeName() const override { return "FileEditBox"; }
+
   void updateImgui() override
   {
     ScopedImguiBeginDisabled scopedDisabled(!controlEnabled);
 
-    ImguiHelper::separateLineLabel(controlCaption);
+    separateLineLabelWithTooltip(controlCaption.begin(), controlCaption.end());
     setFocusToNextImGuiControlIfRequested();
 
     const float buttonWidth = ImGui::GetFrameHeight(); // Simply use a square button.
@@ -113,14 +127,29 @@ public:
     ImGui::SetNextItemWidth(editBoxWidth);
 
     const bool textChanged = ImGuiDagor::InputText("##it", &controlValue);
+    setImguiTestItemInfo();
     textInputActive = ImGui::IsItemActive();
+    textInputFocused = ImGui::IsItemFocused();
+    const bool deactivatedAfterEdit = ImGui::IsItemDeactivatedAfterEdit();
     setPreviousImguiControlTooltip();
 
     if (textChanged)
       onWcChange(nullptr);
 
+    // onWcChange fires on every keystroke; onWcChangeFinished only when the edit is committed
+    // (Enter or focus loss after a change, via deactivation-after-edit), matching editBox so consumers
+    // can defer expensive work to commit time. onImmediateFocusLoss covers focus taken away by code.
+    if (deactivatedAfterEdit)
+      onWcChangeFinished(nullptr);
+
+    if (textInputFocused)
+      set_focused_immediate_focus_loss_handler(this);
+    else if (get_focused_immediate_focus_loss_handler() == this)
+      set_focused_immediate_focus_loss_handler(nullptr);
+
     ImGui::SameLine(0.0f, spaceBetweenControls);
     const bool clickedOnPickButton = ImGui::Button("...", ImVec2(buttonWidth, 0.0f));
+    setImguiTestItemInfo("browse");
     setPreviousImguiControlTooltip();
 
     if (clickedOnPickButton)
@@ -182,6 +211,7 @@ private:
 
       controlValue = result;
       onWcChange(nullptr);
+      onWcChangeFinished(nullptr); // a pick is a completed edit; the input was never active.
     }
   }
 
@@ -191,6 +221,14 @@ private:
     onWcChange(nullptr);
   }
 
+  void preventReapplyingEditAtFocusLoss()
+  {
+    if (!textInputFocused)
+      return;
+    if (ImGuiContext *context = ImGui::GetCurrentContext())
+      context->DeactivatedItemData.HasBeenEditedBefore = false; // checked by ImGui::IsItemDeactivatedAfterEdit()
+  }
+
   String controlCaption;
   String controlValue;
   bool controlEnabled = true;
@@ -198,6 +236,7 @@ private:
   String basePath;
   String masks;
   bool textInputActive = false;
+  bool textInputFocused = false;
 };
 
 } // namespace PropPanel

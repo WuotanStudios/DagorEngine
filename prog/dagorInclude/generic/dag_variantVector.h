@@ -184,7 +184,7 @@ public:
   const U *getIf(size_t index) const
   {
     G_ASSERT(index < size());
-    return getTypes()[index].template getIf<U>(getTypes()[index].addressOf());
+    return getTypes()[index].template getIf<U>(getValues()[index].addressOf());
   }
 
   template <typename U>
@@ -266,6 +266,10 @@ public:
   template <typename U>
   void resize(size_t new_size, const U &u)
   {
+    while (count > new_size)
+    {
+      pop_back();
+    }
     reserve(new_size);
     while (count < new_size)
     {

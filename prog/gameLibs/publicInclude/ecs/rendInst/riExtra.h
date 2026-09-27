@@ -8,11 +8,13 @@
 #include <daECS/core/entityComponent.h>
 #include <daECS/core/entityId.h>
 #include <daECS/core/event.h>
+#include <daECS/core/componentTypes.h>
 #include <math/dag_Point3.h>
 #include <math/dag_bounds3.h>
 #include <math/dag_TMatrix.h>
 #include <rendInst/constants.h>
 #include <rendInst/rendInstDesc.h>
+#include <rendInst/clientRiexPool.h>
 #include <3d/dag_resPtr.h>
 
 struct RiExtraComponent
@@ -26,6 +28,10 @@ struct RiExtraComponent
 };
 
 ECS_DECLARE_RELOCATABLE_TYPE(RiExtraComponent);
+ECS_DECLARE_RELOCATABLE_TYPE(rendinst::ClientRiexPoolId);
+using ClientRiexPoolList = ecs::List<rendinst::ClientRiexPoolId>;
+ECS_DECLARE_RELOCATABLE_TYPE(ClientRiexPoolList);
+
 ECS_BROADCAST_EVENT_TYPE(EventRendinstsLoaded);
 ECS_BROADCAST_EVENT_TYPE(EventRendinstInitForLevel, rendinst::riex_handle_t /*riex_handle*/);
 ECS_BROADCAST_EVENT_TYPE(EventOnRendinstDamage, rendinst::riex_handle_t, TMatrix, BBox3);
@@ -45,6 +51,7 @@ void request_ri_resources(const ecs::resource_request_cb_t &res_cb, const char *
 bool replace_ri_extra_res(ecs::EntityId eid, const char *res_name, bool destroy = false, bool add_restorable = false,
   bool create_destr = true);
 int get_or_add_ri_extra_res_id(const char *res_name, rendinst::AddRIFlags ri_flags);
+void add_rigenextra_debris(int res_idx);
 void update_per_draw_gathered_data(uint32_t id);
 const UniqueBuf &get_per_draw_gathered_data();
 

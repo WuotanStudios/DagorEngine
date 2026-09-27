@@ -25,7 +25,7 @@ struct HazardEncoder
   uint64_t encoder : 16 = 0;
 
   bool operator!=(const HazardEncoder &rhs) const { return encoder != rhs.encoder || submit != rhs.submit; }
-  bool operator==(const HazardEncoder &rhs) const { return encoder == rhs.encoder && submit != rhs.submit; }
+  bool operator==(const HazardEncoder &rhs) const { return encoder == rhs.encoder && submit == rhs.submit; }
 };
 
 struct HazardTracker
@@ -37,7 +37,7 @@ struct HazardTracker
   uint32_t heap_size = 0;
 };
 
-class Texture final : public D3dResourceNameImpl<BaseTexture>, public HazardTracker
+class Texture final : public D3dResourceNameImpl<BaseTexture>
 {
 public:
   struct SubMip
@@ -49,7 +49,7 @@ public:
     id<MTLTexture> tex;
   };
 
-  struct ApiTexture
+  struct ApiTexture : public HazardTracker
   {
     Texture *base = nullptr;
     id<MTLTexture> texture = nil;
@@ -65,6 +65,7 @@ public:
 
     ApiTexture(Texture *base, id<MTLTexture> tex, const char *name);
     ApiTexture(Texture *base);
+    // if immediate is false the deletion is queued until the frame is done
     void release(bool immediate);
     id<MTLTexture> allocateOrCreateSubmip(int set_minlevel, int set_maxlevel, bool is_uav, int start_slice);
     void destroyObject() {}
@@ -129,8 +130,7 @@ public:
 
   int level_count() const override;
   virtual int texmiplevel(int minlevel, int maxlevel);
-  virtual void setReadStencil(bool on) override { read_stencil = on; }
-  bool isReadStencil() const { return read_stencil; }
+  virtual void setReadStencil(bool on) override;
 
   virtual int lockimg(void **, int &stride_bytes, int level, unsigned flags);
   virtual int lockimg(void **, int &stride_bytes, int layer, int level, unsigned flags);
@@ -142,22 +142,19 @@ public:
   virtual int generateMips();
 
   virtual int update(BaseTexture *src);
-  virtual int updateSubRegion(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
-    int dest_subres_idx, int dest_x, int dest_y, int dest_z);
 
   virtual void setApiName(const char * /*name*/) const;
 
   bool isCubeArray() const override { return type == D3DResourceType::CUBEARRTEX; }
   int getinfo(TextureInfo &ti, int level) const override;
 
-  int calcBaseLevel(int w, int h);
   void setBaseLevel(int base_level);
   void setMinMipLevel(int min_mip_level);
 
   void *lock(int &row_pitch, int &slice_pitch, int level, int face, unsigned flags, bool readback = false);
   void unlock();
 
-  void apply(id<MTLTexture> &out_tex, bool is_read_stencil, int mip_level, int start_slice, bool is_uav, bool as_uint);
+  void apply(id<MTLTexture> &out_tex, int mip_level, int start_slice, bool is_uav, bool as_uint);
 
   virtual void destroy();
   void release();

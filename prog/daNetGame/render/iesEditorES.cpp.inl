@@ -1,7 +1,9 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entityManager.h>
-#include <ecs/core/utility/ecsRecreate.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/utility/ecsRecreate.h>
 #include <daECS/core/coreEvents.h>
 #include <gui/dag_imgui.h>
 #include <imgui/imgui.h>
@@ -14,9 +16,11 @@
 #include <ecs/render/updateStageRender.h>
 #include <shaders/dag_postFxRenderer.h>
 #include <math/dag_TMatrix4D.h>
-#include <sstream>
+#include <EASTL/string.h>
+#include <string.h>
+#include <stdlib.h>
 
-#include <render/renderLightsConsts.hlsli>
+#include <render/lights/renderLightsConsts.hlsli>
 
 #define INSIDE_RENDERER 1
 #include "world/private_worldRenderer.h"
@@ -74,66 +78,76 @@ static void ies_edited_light_unselect_es_event_handler(const ecs::Event &,
 }
 
 template <typename Callable>
-inline void selected_light_entity_ecs_query(Callable c);
+inline void selected_light_entity_ecs_query(ecs::EntityManager &manager, Callable c);
 
 void edit_selected_light_entity()
 {
-  selected_light_entity_ecs_query([&](ecs::EntityId eid ECS_REQUIRE(const ecs::string &light__texture_name,
-                                    ecs::Tag daeditor__selected) ECS_REQUIRE_NOT(ecs::Tag ies__editor__editing)) {
+  selected_light_entity_ecs_query(*g_entity_mgr, [&](ecs::EntityId eid ECS_REQUIRE(const ecs::string &light__texture_name,
+                                                   ecs::Tag daeditor__selected) ECS_REQUIRE_NOT(ecs::Tag ies__editor__editing)) {
     add_sub_template_async(eid, "ies_editor_editing");
     return ecs::QueryCbResult::Continue;
   });
 }
 
-static std::string generate_ies_text(const IesEditor *ies_editor)
+static eastl::string generate_ies_text(const IesEditor *ies_editor)
 {
-  std::stringstream ss;
-  ss << "IESNA:\n";
-  ss << "TILT=NONE\n";
-  ss << "1 -1 1 " << ies_editor->getNumControlPoints() << " 1 1 1 0.0 0.0 0.0\n";
-  ss << "1.0 1.0 0\n";
-  for (int i = 0; i < ies_editor->getNumControlPoints(); ++i)
-    ss << (RAD_TO_DEG * ies_editor->getPhotometryControlPoints()[i].theta) << '\n';
-  ss << "0\n";
-  for (int i = 0; i < ies_editor->getNumControlPoints(); ++i)
-    ss << ies_editor->getPhotometryControlPoints()[i].lightIntensity << '\n';
-  return ss.str();
+  const int n = ies_editor->getNumControlPoints();
+  const PhotometryControlPoint *cp = ies_editor->getPhotometryControlPoints();
+  eastl::string s;
+  s.append_sprintf("IESNA:\nTILT=NONE\n1 -1 1 %d 1 1 1 0.0 0.0 0.0\n1.0 1.0 0\n", n);
+  for (int i = 0; i < n; ++i)
+    s.append_sprintf("%g\n", RAD_TO_DEG * cp[i].theta);
+  s.append_sprintf("0\n");
+  for (int i = 0; i < n; ++i)
+    s.append_sprintf("%g\n", cp[i].lightIntensity);
+  return s;
 }
 
 static bool load_ies_text(IesEditor *ies_editor, const char *text)
 {
-  std::stringstream ss(text);
-  std::string line;
-  while (std::getline(ss, line) && strncmp(line.c_str(), "TILT=", 5) != 0)
-    ;
-  int numLamps, numVerticalAngles, numHorizontalAngles;
-  float ignored;
-  ss >> numLamps;
-  ss >> ignored; // lumensPerLamp
-  ss >> ignored; // multiplier
-  ss >> numVerticalAngles;
-  ss >> numHorizontalAngles;
-  ss >> ignored; // photometricType
-  ss >> ignored; // unitsType
-  ss >> ignored; // dirX
-  ss >> ignored; // dirY
-  ss >> ignored; // dirZ
-  ss >> ignored; // ballastFactor
-  ss >> ignored; // futureUse
-  ss >> ignored; // inputWatts
+  // skip lines until one starting with "TILT="; parsing resumes after it
+  const char *p = text;
+  for (;;)
+  {
+    if (!*p)
+      return false;
+    const bool isTilt = strncmp(p, "TILT=", 5) == 0;
+    const char *eol = strchr(p, '\n');
+    p = eol ? eol + 1 : p + strlen(p);
+    if (isTilt)
+      break;
+  }
+
+  // IES values are whitespace-separated; strto* skip leading ws and advance p
+  auto nextInt = [&p]() -> int {
+    char *e;
+    long v = strtol(p, &e, 10);
+    p = e;
+    return int(v);
+  };
+  auto nextFloat = [&p]() -> float {
+    char *e;
+    float v = strtof(p, &e);
+    p = e;
+    return v;
+  };
+
+  const int numLamps = nextInt();
+  nextFloat(); // lumensPerLamp
+  nextFloat(); // multiplier
+  const int numVerticalAngles = nextInt();
+  const int numHorizontalAngles = nextInt();
+  for (int i = 0; i < 8; ++i)
+    nextFloat(); // photometricType, unitsType, dirX/Y/Z, ballastFactor, futureUse, inputWatts
   if (numLamps != 1 || numVerticalAngles < 0 || numHorizontalAngles != 1)
     return false;
   eastl::vector<float> angles(numVerticalAngles);
   eastl::vector<float> intensities(numVerticalAngles);
   for (int i = 0; i < numVerticalAngles; ++i)
-  {
-    float angle;
-    ss >> angle;
-    angles[i] = angle * DEG_TO_RAD;
-  }
-  ss >> ignored; // the only horizontal angle
+    angles[i] = nextFloat() * DEG_TO_RAD;
+  nextFloat(); // the only horizontal angle
   for (int i = 0; i < numVerticalAngles; ++i)
-    ss >> intensities[i];
+    intensities[i] = nextFloat();
   ies_editor->clearControlPoints();
   for (int i = 0; i < numVerticalAngles; ++i)
     ies_editor->addPointWithoutUpdate(angles[i], intensities[i]);

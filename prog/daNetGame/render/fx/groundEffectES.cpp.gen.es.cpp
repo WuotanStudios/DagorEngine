@@ -16,6 +16,7 @@ static void update_ground_effects_es_all(const ecs::UpdateStageInfo &__restrict 
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE);
   do
     update_ground_effects_es(*info.cast<ecs::UpdateStageInfoAct>()
+    , components.manager()
     , ECS_RO_COMP(update_ground_effects_es_comps, "eid", ecs::EntityId)
     , ECS_RW_COMP(update_ground_effects_es_comps, "ground_effect__manager", GroundEffectManager)
     );
@@ -37,11 +38,10 @@ static constexpr ecs::ComponentDesc update_ground_effect_params_es_event_handler
 {
 //start of 1 rw components at [0]
   {ECS_HASH("ground_effect__manager"), ecs::ComponentTypeInfo<GroundEffectManager>()},
-//start of 18 ro components at [1]
+//start of 17 ro components at [1]
   {ECS_HASH("eid"), ecs::ComponentTypeInfo<ecs::EntityId>()},
   {ECS_HASH("ground_effect__fx_name"), ecs::ComponentTypeInfo<ecs::string>()},
   {ECS_HASH("ground_effect__biome_group_name"), ecs::ComponentTypeInfo<ecs::string>()},
-  {ECS_HASH("ground_effect__biome_ids"), ecs::ComponentTypeInfo<ecs::Array>()},
   {ECS_HASH("ground_effect__grid_cell_size"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("ground_effect__grid_world_origin"), ecs::ComponentTypeInfo<Point2>()},
   {ECS_HASH("ground_effect__vis_radius"), ecs::ComponentTypeInfo<float>()},
@@ -66,7 +66,6 @@ static void update_ground_effect_params_es_event_handler_all_events(const ecs::E
     , ECS_RW_COMP(update_ground_effect_params_es_event_handler_comps, "ground_effect__manager", GroundEffectManager)
     , ECS_RO_COMP(update_ground_effect_params_es_event_handler_comps, "ground_effect__fx_name", ecs::string)
     , ECS_RO_COMP(update_ground_effect_params_es_event_handler_comps, "ground_effect__biome_group_name", ecs::string)
-    , ECS_RO_COMP(update_ground_effect_params_es_event_handler_comps, "ground_effect__biome_ids", ecs::Array)
     , ECS_RO_COMP(update_ground_effect_params_es_event_handler_comps, "ground_effect__grid_cell_size", float)
     , ECS_RO_COMP(update_ground_effect_params_es_event_handler_comps, "ground_effect__grid_world_origin", Point2)
     , ECS_RO_COMP(update_ground_effect_params_es_event_handler_comps, "ground_effect__vis_radius", float)
@@ -90,7 +89,7 @@ static ecs::EntitySystemDesc update_ground_effect_params_es_event_handler_es_des
   "prog/daNetGame/render/fx/groundEffectES.cpp.inl",
   ecs::EntitySystemOps(nullptr, update_ground_effect_params_es_event_handler_all_events),
   make_span(update_ground_effect_params_es_event_handler_comps+0, 1)/*rw*/,
-  make_span(update_ground_effect_params_es_event_handler_comps+1, 18)/*ro*/,
+  make_span(update_ground_effect_params_es_event_handler_comps+1, 17)/*ro*/,
   empty_span(),
   empty_span(),
   ecs::EventSetBuilder<ecs::EventEntityCreated,
@@ -110,9 +109,9 @@ static ecs::CompileTimeQueryDesc ground_fx_stop_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void ground_fx_stop_ecs_query(ecs::EntityId eid, Callable function)
+inline void ground_fx_stop_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, ground_fx_stop_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, ground_fx_stop_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -138,9 +137,9 @@ static ecs::CompileTimeQueryDesc get_camera_position_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_camera_position_ecs_query(ecs::EntityId eid, Callable function)
+inline void get_camera_position_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, get_camera_position_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, get_camera_position_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;

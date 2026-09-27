@@ -8,6 +8,22 @@
 struct TexImage32;
 struct TexPixel32;
 class IGenLoad;
+class IMemAlloc;
+class DataBlock;
+class String;
+
+inline bool check_pic_dimension(const char *s)
+{
+  int len = 0;
+  while (*s && *s != ':')
+  {
+    if (*s < '0' || *s > '9')
+      return false;
+    ++s;
+    ++len;
+  }
+  return len > 0 && len < 6;
+}
 
 
 struct IAllocImg
@@ -40,3 +56,4 @@ TexImage32 *load_image(const char *fn, IMemAlloc *mem, bool *out_alpha_used = NU
 TexImage32 *load_image(IGenLoad &crd, const char *fn_ext, IMemAlloc *mem, bool *out_alpha_used = NULL);
 void *load_image2(const char *fn, IAllocImg &a, const char *fn_ext = NULL);
 void *load_image2(IGenLoad &crd, const char *fn_ext, IAllocImg &a);
+bool load_meta_info_from_image(const char *fn, DataBlock &meta_info, String &error_message);

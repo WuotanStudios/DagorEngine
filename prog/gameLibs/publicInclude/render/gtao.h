@@ -34,19 +34,19 @@ public:
 
   void setCurrentView(int viewIndex);
 
-  void renderGTAO(const TMatrix &view_tm, const TMatrix4 &proj_tm, const ManagedTex *ssao_tex, const DPoint3 *world_pos);
-  void applyGTAOFilter(const ManagedTex *ssao_tex, const ManagedTex *prev_ssao_tex, const ManagedTex *tmp_tex,
+  void renderGTAO(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssao_tex, const DPoint3 *world_pos);
+  void applyGTAOFilter(BaseTexture *ssao_tex, BaseTexture *prev_ssao_tex, BaseTexture *tmp_tex,
     SubFrameSample sub_sample = SubFrameSample::Single);
 
 private:
-  void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssaoDepthTexUse, const ManagedTex *ssaoTex,
-    const ManagedTex *prevSsaoTex, const ManagedTex *tmpTex, const DPoint3 *world_pos,
+  void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssaoDepthTexUse, BaseTexture *ssaoTex,
+    BaseTexture *prevSsaoTex, BaseTexture *tmpTex, const DPoint3 *world_pos,
     SubFrameSample sub_sample = SubFrameSample::Single) override;
 
   void updateCurFrameIdxs();
-  void renderGTAO(const ManagedTex &rawTex);
-  void applySpatialFilter(const ManagedTex &rawTex, const ManagedTex &spatialTex);
-  void applyTemporalFilter(const ManagedTex &rawTex, const ManagedTex &prevGtaoTex, const ManagedTex &spatialTex);
+  void renderGTAO(BaseTexture *rawTex);
+  void applySpatialFilter(BaseTexture *rawTex, BaseTexture *spatialTex);
+  void applyTemporalFilter(BaseTexture *rawTex, BaseTexture *prevGtaoTex, BaseTexture *spatialTex);
 
   static constexpr const char *gtao_sh_name = "gtao_main";
   static constexpr const char *spatial_filter_sh_name = "gtao_spatial";

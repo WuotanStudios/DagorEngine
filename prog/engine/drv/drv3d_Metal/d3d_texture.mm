@@ -9,12 +9,13 @@
 #include <drv/3d/dag_texture.h>
 #include <drv/3d/dag_commands.h>
 #include <drv/3d/dag_tex3d.h>
+#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <math/dag_TMatrix.h>
 #include <math/dag_TMatrix4.h>
 #include <debug/dag_debug.h>
 #include <ioSys/dag_genIo.h>
 #include <image/dag_texPixel.h>
-#include <3d/dag_gpuConfig.h>
 
 #include <vecmath/dag_vecMath.h>
 #include <math/dag_vecMathCompatibility.h>
@@ -27,7 +28,6 @@
 
 #include <osApiWrappers/dag_critSec.h>
 #include <image/dag_dxtCompress.h>
-#include <drv/3d/dag_tex3d.h>
 #include <math/dag_imageFunctions.h>
 #include <vecmath/dag_vecMath.h>
 #include <validation/texture.h>
@@ -38,7 +38,64 @@ using namespace drv3d_metal;
 
 namespace drv3d_metal
 {
-  extern Driver3dDesc g_device_desc;
+  extern DriverDesc g_device_desc;
+}
+
+static bool is_depth_format_flg(uint32_t cflg)
+{
+  cflg &= TEXFMT_MASK;
+  return cflg >= TEXFMT_FIRST_DEPTH && cflg <= TEXFMT_LAST_DEPTH;
+}
+
+static const char *resource_type_create_func(D3DResourceType type)
+{
+  switch (type)
+  {
+    case D3DResourceType::CUBETEX:   return "create_cubetex";
+    case D3DResourceType::VOLTEX:    return "create_voltex";
+    case D3DResourceType::ARRTEX:    return "create_array_tex";
+    case D3DResourceType::CUBEARRTEX: return "create_cube_array_tex";
+    default:                          return "create_tex";
+  }
+}
+
+static bool check_texformat(int cflg, D3DResourceType type, bool assert_on_fail = false, const char *tex_name = nullptr)
+{
+  unsigned flags = d3d::get_texformat_usage(cflg, type);
+#define FAIL(reason)                                                                        \
+  {                                                                                         \
+    if (assert_on_fail)                                                                     \
+    {                                                                                       \
+      const char *fmt_name = get_tex_format_name(cflg);                                     \
+      D3D_CONTRACT_ASSERT_FAIL("Metal: %s('%s'): format %s (flags 0x%08X) %s",              \
+        resource_type_create_func(type), tex_name ? tex_name : "<unnamed>",                 \
+        fmt_name ? fmt_name : "unknown", cflg, reason);                                     \
+    }                                                                                       \
+    return false;                                                                           \
+  }
+  if (!(flags & d3d::USAGE_TEXTURE))
+    FAIL("format not supported as texture on this Metal device")
+  if (is_depth_format_flg(cflg))
+  {
+    if (!(flags & d3d::USAGE_DEPTH))
+      FAIL("depth format not supported")
+  }
+  else
+  {
+    if ((cflg & TEXCF_RTARGET) && !(flags & d3d::USAGE_RTARGET))
+      FAIL("format does not support render target")
+    if ((cflg & TEXCF_UNORDERED) && !(flags & d3d::USAGE_UNORDERED))
+      FAIL("format does not support unordered access")
+  }
+#undef FAIL
+  return true;
+}
+
+
+// Texture management
+bool d3d::check_texformat(int cflg)
+{
+  return check_texformat(cflg, D3DResourceType::TEX, false);
 }
 
 /// create texture; if img==NULL, size (w/h) must be specified
@@ -47,9 +104,13 @@ namespace drv3d_metal
 /// if levels==0, whole mipmap set will be created if device supports mipmaps
 /// img format is TexPixel32
 /// returns NULL on error
-::Texture *d3d::create_tex(TexImage32 *img, int w, int h, int flg, int levels, const char* name)
+::Texture *d3d::create_tex(TexImage32 *img, int w, int h, int flg, int levels, const char* name, ResourceTagType)
 {
   check_texture_creation_args(w, h, flg, name);
+
+  if (!check_texformat(flg, D3DResourceType::TEX, true, name))
+    return nullptr;
+
   if (img != NULL)
   {
     w = img->w;
@@ -123,12 +184,15 @@ BaseTexture *d3d::alloc_ddsx_tex(const ddsx::Header &hdr, int flg, int quality_i
   else if (hdr.flags & ddsx::Header::FLG_ARRTEX)
     type = D3DResourceType::ARRTEX;
 
-  drv3d_metal::Texture* tex = new drv3d_metal::Texture(hdr.w, hdr.h, hdr.levels, hdr.depth, type, fmt, fmt & TEXFMT_MASK, name, false, false);
+  if (levels <= 0)
+    levels = hdr.levels;
 
   int skip_levels = hdr.getSkipLevels(hdr.getSkipLevelsFromQ(quality_id), levels);
   int w = max(hdr.w>>skip_levels, 1), h = max(hdr.h>>skip_levels, 1), d = max(hdr.depth>>skip_levels, 1);
   if (!(hdr.flags & hdr.FLG_VOLTEX))
     d = (hdr.flags & hdr.FLG_ARRTEX) ? hdr.depth : 1;
+
+  drv3d_metal::Texture* tex = new drv3d_metal::Texture(w, h, levels, d, type, fmt, fmt & TEXFMT_MASK, name, false, false);
 
   tex->stubTexIdx = stub_tex_idx;
   if (stub_tex_idx >= 0)
@@ -147,23 +211,31 @@ BaseTexture *d3d::alloc_ddsx_tex(const ddsx::Header &hdr, int flg, int quality_i
   return tex;
 }
 
-CubeTexture *d3d::create_cubetex(int size, int flg, int levels, const char *name)
+CubeTexture *d3d::create_cubetex(int size, int flg, int levels, const char *name, ResourceTagType)
 {
+  if (!check_texformat(flg, D3DResourceType::CUBETEX, true, name))
+    return nullptr;
   return new drv3d_metal::Texture(size, size, levels, 1, D3DResourceType::CUBETEX, flg, flg &TEXFMT_MASK, name, false, true);
 }
 
-VolTexture *d3d::create_voltex(int w, int h, int d, int flg, int levels, const char* name)
+VolTexture *d3d::create_voltex(int w, int h, int d, int flg, int levels, const char* name, ResourceTagType)
 {
+  if (!check_texformat(flg, D3DResourceType::VOLTEX, true, name))
+    return nullptr;
   return new drv3d_metal::Texture(w, h, levels, d, D3DResourceType::VOLTEX, flg, flg &TEXFMT_MASK, name, false, true);
 }
 
-ArrayTexture *d3d::create_cube_array_tex(int size, int d, int flg, int levels, const char *name)
+ArrayTexture *d3d::create_cube_array_tex(int size, int d, int flg, int levels, const char *name, ResourceTagType)
 {
+  if (!check_texformat(flg, D3DResourceType::CUBEARRTEX, true, name))
+    return nullptr;
   return new drv3d_metal::Texture(size, size, levels, d, D3DResourceType::CUBEARRTEX, flg, flg &TEXFMT_MASK, name, false, true);
 }
 
-ArrayTexture *d3d::create_array_tex(int w, int h, int d, int flg, int levels, const char* name)
+ArrayTexture *d3d::create_array_tex(int w, int h, int d, int flg, int levels, const char* name, ResourceTagType)
 {
+  if (!check_texformat(flg, D3DResourceType::ARRTEX, true, name))
+    return nullptr;
   return new drv3d_metal::Texture(w, h, levels, d, D3DResourceType::ARRTEX, flg, flg &TEXFMT_MASK, name, false, true);
 }
 
@@ -216,20 +288,12 @@ bool d3d::clear_rwtexf(BaseTexture *tex, const float val[4], uint32_t face, uint
   return true;
 }
 
-static bool is_depth_format_flg(uint32_t cflg)
-{
-  cflg &= TEXFMT_MASK;
-  return cflg >= TEXFMT_FIRST_DEPTH && cflg <= TEXFMT_LAST_DEPTH;
-}
-
 bool d3d::clear_rt(const RenderTarget &rt, const ResourceClearValue &clear_val)
 {
   auto texture = (drv3d_metal::Texture*)rt.tex;
   if (is_depth_format_flg(texture->cflg))
   {
-    SCOPE_RENDER_TARGET;
-    set_depth(texture, DepthAccess::RW);
-    clearview(CLEAR_ZBUFFER|CLEAR_STENCIL, 0x00000000, clear_val.asDepth, clear_val.asStencil);
+    render.clearDepthStencil(texture, clear_val.asDepth, clear_val.asStencil, rt.mip_level, rt.layer);
   }
   else
   {
@@ -303,6 +367,7 @@ static bool isReadWriteTier2Format(int fmt)
     case TEXFMT_R16F:
     case TEXFMT_R16UI:
     case TEXFMT_R8:
+    case TEXFMT_R8G8:
     case TEXFMT_R8UI:
       return true;
   }
@@ -323,28 +388,42 @@ unsigned d3d::get_texformat_usage(int cflg, D3DResourceType type)
   {
     case TEXFMT_R8:
     case TEXFMT_R8G8:
-    case TEXFMT_A8R8G8B8:
+      return USAGE_RTARGET | USAGE_TEXTURE | USAGE_VERTEXTEXTURE | USAGE_FILTER | USAGE_BLEND | USAGE_SRGBREAD | USAGE_SRGBWRITE | USAGE_UNORDERED | ret;
+    case TEXFMT_R8G8B8A8:
         return USAGE_RTARGET | USAGE_TEXTURE | USAGE_VERTEXTEXTURE | USAGE_FILTER | USAGE_BLEND | USAGE_SRGBREAD | USAGE_SRGBWRITE | ret;
+    case TEXFMT_A8R8G8B8:
+      return USAGE_RTARGET | USAGE_TEXTURE | USAGE_VERTEXTEXTURE | USAGE_FILTER | USAGE_BLEND | USAGE_SRGBREAD | USAGE_SRGBWRITE |
+             USAGE_UNORDERED | ret;
     case TEXFMT_A1R5G5B5:
     case TEXFMT_R5G6B5:
+      return USAGE_RTARGET | USAGE_TEXTURE | USAGE_VERTEXTEXTURE | USAGE_FILTER | USAGE_BLEND | ret;
     case TEXFMT_A16B16G16R16F:
     case TEXFMT_A32B32G32R32F:
-    case TEXFMT_A2R10G10B10:
-    case TEXFMT_R32F:      return USAGE_RTARGET | USAGE_TEXTURE | USAGE_VERTEXTEXTURE | USAGE_FILTER | USAGE_BLEND | ret;
+    case TEXFMT_R32F:
+      return USAGE_RTARGET | USAGE_TEXTURE | USAGE_VERTEXTEXTURE | USAGE_FILTER | USAGE_BLEND | USAGE_UNORDERED | ret;
 
     case TEXFMT_A8:        return USAGE_TEXTURE | USAGE_VERTEXTEXTURE | USAGE_FILTER | USAGE_BLEND | ret;
 
-    case TEXFMT_R11G11B10F: return USAGE_RTARGET | USAGE_TEXTURE | USAGE_FILTER | USAGE_SRGBREAD | USAGE_SRGBWRITE | USAGE_BLEND | USAGE_VERTEXTEXTURE | ret;
+    case TEXFMT_R11G11B10F: return USAGE_RTARGET | USAGE_TEXTURE | USAGE_FILTER | USAGE_SRGBREAD | USAGE_SRGBWRITE | USAGE_BLEND | USAGE_VERTEXTEXTURE | USAGE_UNORDERED | ret;
 
-    case TEXFMT_A2B10G10R10:
+    case TEXFMT_A2R10G10B10:
+    case TEXFMT_A2B10G10R10: return USAGE_RTARGET | USAGE_TEXTURE | USAGE_FILTER | USAGE_VERTEXTEXTURE | USAGE_BLEND | USAGE_UNORDERED | ret;
+
     case TEXFMT_A16B16G16R16:
-    case TEXFMT_G32R32F:
     case TEXFMT_R16F:
-    case TEXFMT_A4R4G4B4:
-    case TEXFMT_L16:
-    case TEXFMT_G16R16:
-    case TEXFMT_G16R16F:     return USAGE_RTARGET | USAGE_TEXTURE | USAGE_FILTER | USAGE_VERTEXTEXTURE | USAGE_BLEND | ret;
+    case TEXFMT_A4R4G4B4:  return USAGE_RTARGET | USAGE_TEXTURE | USAGE_FILTER | USAGE_VERTEXTEXTURE | USAGE_BLEND | ret;
 
+
+    case TEXFMT_L16: return USAGE_RTARGET | USAGE_TEXTURE | USAGE_FILTER | USAGE_VERTEXTEXTURE | USAGE_BLEND | USAGE_UNORDERED | ret;
+
+    case TEXFMT_A32B32G32R32UI:
+    case TEXFMT_R32UI:
+    case TEXFMT_R8UI:    return USAGE_RTARGET | USAGE_TEXTURE | USAGE_UNORDERED | ret;
+    case TEXFMT_R32G32UI:   return USAGE_RTARGET | USAGE_TEXTURE | USAGE_UNORDERED | ret;
+    case TEXFMT_G16R16:
+    case TEXFMT_G16R16F: return USAGE_RTARGET | USAGE_TEXTURE | USAGE_FILTER | USAGE_VERTEXTEXTURE | USAGE_BLEND | USAGE_UNORDERED | ret;
+    case TEXFMT_R8G8S:   return USAGE_RTARGET | USAGE_TEXTURE | USAGE_FILTER | USAGE_UNORDERED | ret;
+    case TEXFMT_G32R32F:   return USAGE_RTARGET | USAGE_TEXTURE | USAGE_VERTEXTEXTURE | USAGE_FILTER | USAGE_BLEND | USAGE_UNORDERED | ret;
     case TEXFMT_R9G9B9E5:   return USAGE_TEXTURE | USAGE_FILTER | ([render.device supportsFamily:MTLGPUFamilyMac2] ? 0 : USAGE_UNORDERED | USAGE_RTARGET);
 
     case TEXFMT_DEPTH16:
@@ -359,34 +438,13 @@ unsigned d3d::get_texformat_usage(int cflg, D3DResourceType type)
       return USAGE_TEXTURE | USAGE_FILTER | ret;
     case TEXFMT_ATI1N:
     case TEXFMT_ATI2N:
+    case TEXFMT_BC5S:
     case TEXFMT_DXT1:
     case TEXFMT_DXT3:
     case TEXFMT_DXT5:      return (supportsCompressedTexture(type) ? (USAGE_TEXTURE | USAGE_FILTER | USAGE_SRGBREAD) : 0) | ret;
     default:
         return USAGE_TEXTURE | USAGE_FILTER | USAGE_SRGBREAD | USAGE_SRGBWRITE | USAGE_BLEND | USAGE_VERTEXTEXTURE | ret;
   }
-}
-
-bool check_texformat(int cflg, D3DResourceType type)
-{
-  unsigned flags = d3d::get_texformat_usage(cflg, type);
-  unsigned mask = d3d::USAGE_TEXTURE;
-  if (is_depth_format_flg(cflg))
-    mask |= d3d::USAGE_DEPTH;
-  else
-  {
-    if (cflg & TEXCF_RTARGET)
-      mask |= d3d::USAGE_RTARGET;
-    if (cflg & TEXCF_UNORDERED)
-      mask |= d3d::USAGE_UNORDERED;
-  }
-  return (flags & mask) == mask ? true : false;
-}
-
-// Texture management
-bool d3d::check_texformat(int cflg)
-{
-  return check_texformat(cflg, D3DResourceType::TEX);
 }
 
 int d3d::get_max_sample_count(int cflg)
@@ -398,6 +456,18 @@ int d3d::get_max_sample_count(int cflg)
   }
 
   return 1;
+}
+
+bool d3d::should_use_compute_for_image_processing(std::initializer_list<unsigned> formats)
+{
+  const uint32_t UAV_OPERATIONS = d3d::USAGE_UNORDERED | d3d::USAGE_UNORDERED_LOAD;
+  for (unsigned format : formats)
+    if ((d3d::get_texformat_usage(format, D3DResourceType::TEX) & UAV_OPERATIONS) != UAV_OPERATIONS)
+    {
+      logdbg("d3d::should_use_compute_for_image_processing is false due to lack of UAV support for %u.", (format & TEXFMT_MASK));
+      return false;
+    }
+  return true;
 }
 
 /// check whether this cube texture format is available

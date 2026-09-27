@@ -111,6 +111,11 @@
 // some bugs, improve performance, and to make the codebase easier to maintain
 // going forward.
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
 #include <stdint.h>
 #include <functional>
 
@@ -912,6 +917,10 @@ IVHACD* CreateVHACD_ASYNC();    // Create an asynchronous (non-blocking) impleme
 #include <unordered_set>
 #include <utility>
 #include <vector>
+// Dagor: use EASTL hash maps for the containers whose contents reach serialized output. EASTL is
+// bundled and identical on every target, so its iteration order is platform-independent, unlike each
+// vendor's std::unordered_map (collision-asset dumps must be byte-identical across the build farm).
+#include <EASTL/hash_map.h>
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -5965,7 +5974,7 @@ public:
     VHACD::Vector3<uint32_t>                    m_1{ 0 };
     VHACD::Vector3<uint32_t>                    m_2{ 0 };
     AABBTree                                    m_AABBTree;
-    std::unordered_map<uint32_t, uint32_t>      m_voxelIndexMap; // Maps from a voxel coordinate space into a vertex index space
+    eastl::hash_map<uint32_t, uint32_t>         m_voxelIndexMap; // Maps from a voxel coordinate space into a vertex index space
     std::vector<VHACD::Vertex>                  m_vertices;
     std::vector<VHACD::Triangle>                m_indices;
     static uint32_t                             m_voxelHullCount;
@@ -6930,7 +6939,7 @@ public:
 #if !VHACD_DISABLE_THREADING
     std::unique_ptr<ThreadPool>                         m_threadPool{ nullptr };
 #endif
-    std::unordered_map<uint32_t, IVHACD::ConvexHull*>   m_hulls;
+    eastl::hash_map<uint32_t, IVHACD::ConvexHull*>      m_hulls;
 
     double                                              m_overallProgress{ double(0.0) };
     double                                              m_stageProgress{ double(0.0) };
@@ -8363,5 +8372,9 @@ IVHACD* CreateVHACD_ASYNC()
 #endif // __GNUC__
 
 #endif // ENABLE_VHACD_IMPLEMENTATION
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #endif // VHACD_H

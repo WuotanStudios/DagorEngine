@@ -8,6 +8,37 @@
 class DaSkies;
 class DataBlock;
 class Point2;
+namespace ecs
+{
+class ComponentsInitializer;
+}
+
+struct SkiesPanel
+{
+  float time = 9.f;
+  int day = 21;
+  int month = 6;
+  int year = 1941;
+
+  float latitude = 55.f;
+  float longtitude = 37.f;
+
+  int seed = -1;
+#if DAGOR_DBGLEVEL > 0
+  bool reload = false;
+#endif
+
+  bool operator==(const SkiesPanel &rhs) const
+  {
+    return
+#if DAGOR_DBGLEVEL > 0
+      reload == rhs.reload &&
+#endif
+      time == rhs.time && day == rhs.day && month == rhs.month && year == rhs.year && latitude == rhs.latitude &&
+      longtitude == rhs.longtitude && seed == rhs.seed;
+  }
+  bool operator!=(const SkiesPanel &rhs) const { return !(*this == rhs); }
+};
 
 struct DngSkies : public DaSkies
 {
@@ -22,6 +53,7 @@ struct DngSkies : public DaSkies
   void setSkyLightParams(float progress, float sun_atten, float envi_atten, float gi_atten, float sky_atten, float base_sky_atten);
   void unsetSkyLightParams();
   void setAltitudeOffset(float alt_ofs) { altitudeOfs = alt_ofs; }
+  float getAltitudeOffset() const { return altitudeOfs; }
   void useFog(const Point3 &origin,
     SkiesData *data,
     const TMatrix &view_tm,
@@ -34,10 +66,16 @@ struct DngSkies : public DaSkies
     const TMatrix4 &proj_tm,
     UpdateSky update_sky = UpdateSky::On,
     float altitude_tolerance = SKY_PREPARE_THRESHOLD);
-  void prepare(const Point3 &dir_to_sun, bool force_update_cpu, float dt);
+  void prepare(const Point3 &dir_to_sun, float dt);
 
   // basically turns off sky influence completely (but doesn't spare computational cost)
   void enableBlackSkyRendering(bool black_sky_on);
+
+  // re-apply the checkerboard trace decision from settings and the proximity gate
+  void applyCloudsTraceCheckerboardSetting();
+  // ground-proximity gate for full-res clouds tracing: fed per frame with the camera
+  // height above ground and its smoothed speed; honored only on the top clouds preset
+  void updateCloudsFullresProximity(float camera_height_above_ground, float camera_speed);
 
   Point3 calcViewPos(const Point3 &view_pos) const { return view_pos + Point3(0, altitudeOfs, 0); }
   DPoint3 calcViewPos(const TMatrix &view_itm) const { return dpoint3(view_itm.getcol(3)) + DPoint3(0, altitudeOfs, 0); }
@@ -66,20 +104,17 @@ protected:
   float altitudeOfs = 0;
 
   bool renderBlackSky = false;
+  bool cloudsFullresProximity = false;
 };
 
 void init_daskies();
 void term_daskies();
 DngSkies *get_daskies();
-void load_daskies(const DataBlock &blk,
-  float time_of_day = -1.f,
-  const char *weather_blk = nullptr,
-  int year = 1941,
-  int month = 6,
-  int day = 21,
-  float lat = 55,
-  float lon = 37,
-  int seed = -1);
+// specific mechanical energy (g * h + v^2 / 2) of the camera; the RI gen mode
+// switch and the clouds proximity gate measure their thresholds in this unit
+inline float camera_specific_energy(float height, float speed) { return height * 10.f + speed * speed * 0.5f; }
+void load_daskies(const DataBlock &blk, const SkiesPanel &skies_data, const char *weather_blk = nullptr);
+void load_daskies(const DataBlock &blk, const SkiesPanel &skies_data, const DataBlock &weather_blk, bool reuse_weather_blk = false);
 void save_daskies(DataBlock &blk);
 void update_delayed_weather_selection();
 void before_render_daskies();
@@ -95,3 +130,5 @@ DPoint2 get_strata_clouds_origin();
 DPoint2 get_clouds_origin();
 void set_strata_clouds_origin(DPoint2 pos);
 void set_clouds_origin(DPoint2 pos);
+void update_level_sky_data(const SkiesPanel &data);
+void load_daskies_to_components_initializer(ecs::ComponentsInitializer &init, const DataBlock &weather_blk);

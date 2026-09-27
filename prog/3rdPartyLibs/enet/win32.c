@@ -23,8 +23,8 @@
 static enet_uint32 timeBase = 0;
 
 #define UDP_HEADER_SIZE 28
-size_t enet_rx_bytes = 0, enet_rx_packets = 0;
-size_t enet_tx_bytes = 0, enet_tx_dropped_bytes = 0, enet_tx_packets = 0;
+uint64_t enet_rx_bytes = 0, enet_rx_packets = 0;
+uint64_t enet_tx_bytes = 0, enet_tx_dropped_bytes = 0, enet_tx_packets = 0;
 
 int
 enet_initialize (void)
@@ -387,13 +387,16 @@ enet_socket_receive_impl (ENetSocket socket,
        case WSAEWOULDBLOCK:
        case WSAECONNRESET:
           return 0;
+       case WSAEINTR:
+       case WSAEMSGSIZE:
+          return -2;
+       default:
+          return -1;
        }
-
-       return -1;
     }
 
     if (flags & MSG_PARTIAL)
-      return -1;
+      return -2;
 
 #if DAGOR_DBGLEVEL > 0 || _TARGET_PC // dagor - debug statistics
     enet_rx_bytes += recvLength + UDP_HEADER_SIZE;

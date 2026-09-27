@@ -7,7 +7,6 @@
 #include <drv/3d/dag_shaderLibrary.h>
 #include <drv/shadersMetaData/dxil/compiled_shader_header.h>
 #include <EASTL/string.h>
-#include <EASTL/utility.h>
 #include <supp/dag_comPtr.h>
 
 
@@ -17,10 +16,11 @@ namespace drv3d_dx12
 class ShaderLibrary
 {
   eastl::string libName;
-  eastl::wstring libPrefix;
   dxil::LibraryResourceInformation libraryResourceInfo;
   DynamicArray<dxil::LibraryShaderProperties> shaderProperties;
+  DynamicArray<DynamicArray<wchar_t>> nameTable;
   ComPtr<ID3D12StateObject> object;
+  DynamicArray<uint8_t> embeddedDxil;
   bool allowExpandableUse;
 
   ShaderLibrary() = delete;
@@ -31,12 +31,14 @@ class ShaderLibrary
 
 public:
   ~ShaderLibrary() = default;
-  ShaderLibrary(eastl::string &&lib_name, eastl::wstring &&lib_prefix, const dxil::LibraryResourceInformation &lib_res_info,
-    dag::ConstSpan<dxil::LibraryShaderProperties> shader_properties, ComPtr<ID3D12StateObject> &&obj, bool allow_expandable_use) :
+  ShaderLibrary(eastl::string &&lib_name, const dxil::LibraryResourceInformation &lib_res_info,
+    dag::ConstSpan<dxil::LibraryShaderProperties> shader_properties, DynamicArray<DynamicArray<wchar_t>> &&name_table,
+    ComPtr<ID3D12StateObject> &&obj, bool allow_expandable_use, DynamicArray<uint8_t> &&embedded_dxil = {}) :
     libName{eastl::move(lib_name)},
-    libPrefix{eastl::move(lib_prefix)},
     libraryResourceInfo{lib_res_info},
+    nameTable{eastl::move(name_table)},
     object{eastl::move(obj)},
+    embeddedDxil{eastl::move(embedded_dxil)},
     allowExpandableUse{allow_expandable_use}
   {
     shaderProperties.resize(shader_properties.size());
@@ -44,16 +46,16 @@ public:
   }
 
   ID3D12StateObject *get() const { return object.Get(); }
+  bool isEmbeddable() const { return !embeddedDxil.empty(); }
+  D3D12_SHADER_BYTECODE getEmbeddableDxil() const { return {embeddedDxil.data(), embeddedDxil.size()}; }
   const dxil::LibraryShaderProperties &getShaderPropertiesOf(uint32_t index) const { return shaderProperties[index]; }
   const dxil::LibraryResourceInformation &getGlobalResourceInfo() const { return libraryResourceInfo; }
   size_t shaderCount() const { return shaderProperties.size(); }
   bool canBeUsedByExpandablePipelines() const { return allowExpandableUse; }
   const eastl::string &name() const { return libName; }
-  const eastl::wstring &prefix() const { return libPrefix; }
-  void appendNameOfTo(uint32_t index, eastl::wstring &target) const;
-  DynamicArray<wchar_t> makeNameOfAsDynArray(uint32_t index) const;
+  eastl::wstring_view nameOf(uint32_t index) const;
 
-  static ShaderLibrary *build(ID3D12Device5 *device, const ::ShaderLibraryCreateInfo &ci);
+  static ShaderLibrary *build(ID3D12Device5 *device, const ::ShaderLibraryCreateInfo &ci, bool embeddable = false);
 };
 } // namespace drv3d_dx12
 #endif

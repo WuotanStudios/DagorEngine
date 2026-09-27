@@ -1,0 +1,43 @@
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+
+bool init();
+void shutdown();
+
+bool changeGamma(float value);
+void getDisplaySize(int &width, int &height, bool for_primary_output = false);
+void getVideoModeList(Tab<String> &list);
+void getMonitors(Tab<String> &monitorNames);
+bool getMonitorInfo(const char *monitorName, String *friendlyName, int *monitorIndex);
+void getResolutionsFromMonitor(const char *monitorName, Tab<String> &resolutions);
+void *getMainWindowPtrHandle() const;
+bool isMainWindow(void *wnd) const;
+void destroyMainWindow();
+
+bool initWindow(const char *title, int winWidth, int winHeight, const linux_GUI::WindowCreationOptions &options);
+void getWindowPosition(void *w, int &cx, int &cy);
+void getWindowFramePosition(void *w, int &x, int &y);
+bool isWindowMaximized(void *w);
+void setTitle(const char *title, const char *tooltip = NULL);
+void setTitleUTF8(const char *title, const char *tooltip = NULL);
+
+int getScreenRefreshRate();
+void setFullscreenMode(bool enable);
+
+void processMessages();
+bool getWindowClientSize(void *w, int &width, int &height);
+bool getWindowScreenRect(void *w, linux_GUI::RECT *rect, linux_GUI::RECT *rect_unclipped);
+bool getLastCursorPos(int *cx, int *cy, void *w);
+void setCursor(void *w, const char *cursor_name);
+void setCursorPosition(int cx, int cy, void *w);
+void getAbsoluteCursorPosition(int &cx, int &cy);
+bool getCursorDelta(int &cx, int &cy, void *w);
+void clipCursor();
+void unclipCursor();
+void hideCursor(bool hide);
+void *getNativeDisplay();
+void *getNativeWindow(void *w);
+
+void lockWindow(void *w);
+void unlockWindow(void *w);
+bool getClipboardUTF8Text(char *dest, int buf_size);
+bool setClipboardUTF8Text(const char *text);

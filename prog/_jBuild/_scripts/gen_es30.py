@@ -1,5 +1,5 @@
 import os
-
+import sys
 
 def strip_end(text, suffix):
     if not text.endswith(suffix):
@@ -110,6 +110,12 @@ def checkForPresenceAndRemoveOptional(noParam, paramsList, name):
         paramsList.remove(param)
 
 
+def red_text(txt):
+  if sys.stdout.isatty():
+    return f"\033[91m{txt}\033[0m"
+  else:
+    return txt
+
 def es_function_from_parsed_function(fun):
   for fid in range(0, len(fun.call_params)):
     if ("type" in fun.call_params[fid]):
@@ -151,7 +157,13 @@ def es_function_from_parsed_function(fun):
   esFun.annotatedTags += gather_annotate_list("@tag:", fun.functionDeclAnnotation)
   esFun.annotatedBefore = gather_annotate_list("@before:", fun.annotations)
   esFun.annotatedAfter = gather_annotate_list("@after:", fun.annotations)
-  if "*" in esFun.annotatedBefore or "*" in esFun.annotatedAfter:
+
+  hasBeforeAny = "*" in esFun.annotatedBefore
+  hasAfterAny = "*" in esFun.annotatedAfter
+  if hasBeforeAny or hasAfterAny:
+    if hasBeforeAny and len(esFun.annotatedAfter) != 0 or hasAfterAny and len(esFun.annotatedBefore) != 0:
+      print(f"{red_text('[E]')} ES {red_text(fun.funcName)} is explicitly marked with no-order(ECS_NO_ORDER or ECS_AFTER=(*) or ECS_BEFORE=(*)). But it has additional non empty ECS_AFTER/ECS_BEFORE, this is forbidden!")
+      exit(1)
     esFun.annotatedBefore = ["*"]
     esFun.annotatedAfter = []
 
@@ -229,6 +241,10 @@ def es_function_from_parsed_function(fun):
     elif optional is False:
       i = {"name": name, "type": type_name, "param_type": "rq", "optional": False}
       esFun.rq_params.append(i)
+    else:
+      print(f"[E] {fun.funcName} in {global_input_file_name}: ECS_REQUIRE({type_name} {name} = ...) - default argument is not supported for {type_name}")
+      exit(1)
+
   for reqs in esFun.annotatedRequirementNots:
     optional = False
     if reqs.rfind('=') != -1:
@@ -247,9 +263,16 @@ def es_function_from_parsed_function(fun):
       name = name[1:]
     while (type_name.endswith('&') or type_name.endswith(' ')):
       type_name = type_name[:len(type_name) - 1]
-    if optional is False:
-      i = {"name": name, "type": type_name, "param_type": "no", "optional": False}
-      esFun.no_params.append(i)
+
+    if is_flag_type(type_name):
+      print(f"[E] {fun.funcName} in {global_input_file_name}: ECS_REQUIRE_NOT({type_name} {name}) is not supported - use ECS_REQUIRE(...) instead")
+      exit(1)
+    if optional:
+      print(f"[E] {fun.funcName} in {global_input_file_name}: ECS_REQUIRE_NOT({type_name} {name} = ...) - default argument is not supported for ECS_REQUIRE_NOT")
+      exit(1)
+
+    i = {"name": name, "type": type_name, "param_type": "no", "optional": False}
+    esFun.no_params.append(i)
 
   for noParam in esFun.no_params:
     checkForPresenceAndRemoveOptional(noParam, esFun.rw_params, "RW")
@@ -459,8 +482,6 @@ def gen_es_simd(esFunction):
       genCode += '''{indent2}if (!{funcName}_should_process({infoCasted}))
 {indent2}  return;\n'''.format(indent2=indent2, funcName=esFunction.funcName, infoCasted=infoCasted)
     if (esFunction.contextsTypes[index] != ''):
-#     genCode += indent2 + 'if (!ecs::optional_should_process<{context_type}>({infoCasted}))\n'.format(context_type = esFunction.contextsTypes[index], infoCasted = infoCasted)
-#     genCode += indent2+'  return;\n'
       genCode += indent2
       genCode += esFunction.contextsTypes[index] + ' ctx({info});\n'.format(info=infoCasted)
 

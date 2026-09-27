@@ -3,11 +3,13 @@
 
 #include <rendInst/rendInstRenderJob.h>
 #include <render/occlusion/parallelOcclusionRasterizer.h>
+#include <render/occlusion/occlusionMaskApplier.h>
 
 #include <render/world/animCharRenderJob.h>
-#include <render/world/cameraParams.h>
+#include <render/cameraParams.h>
 #include <render/world/occlusionLandMeshManager.h>
 #include <render/world/visibilityJobs.h>
+
 
 struct RiGenVisibility;
 class ParallelOcclusionRasterizer;
@@ -19,30 +21,14 @@ namespace rendinst
 {
 struct RIOcclusionData;
 }
-
-enum class CameraViewVisibilityFlags : uint8_t
-{
-  None = 0,
-  DontReprojectCockpitOcclusion = 1
-};
-
-inline CameraViewVisibilityFlags operator|(const CameraViewVisibilityFlags a, const CameraViewVisibilityFlags b)
-{
-  return static_cast<CameraViewVisibilityFlags>(eastl::to_underlying(a) | eastl::to_underlying(b));
-}
-
-inline CameraViewVisibilityFlags operator&(const CameraViewVisibilityFlags a, const CameraViewVisibilityFlags b)
-{
-  return static_cast<CameraViewVisibilityFlags>(eastl::to_underlying(a) & eastl::to_underlying(b));
-}
+struct OcclusionEllipse;
 
 class CameraViewVisibilityMgr
 {
 public:
-  CameraViewVisibilityMgr(const int ri_extra_vb_ctx_id,
-    const char *cam_prefix,
-    const CameraViewVisibilityFlags vis_flags = CameraViewVisibilityFlags::None) :
-    flags(vis_flags), riExtraRenderJob(ri_extra_vb_ctx_id), cameraPrefix(cam_prefix)
+  constexpr static bool SUB_VIEW = true;
+  CameraViewVisibilityMgr(const int ri_extra_vb_ctx_id, const char *cam_prefix, const bool is_sub_view = false) :
+    riExtraRenderJob(ri_extra_vb_ctx_id), cameraPrefix(cam_prefix), isSubView(is_sub_view)
   {}
 
   ~CameraViewVisibilityMgr() { close(); }
@@ -56,12 +42,15 @@ public:
 
   void prepareLightProbeRIVisibilityAsync(const mat44f &globtm, const Point3 &view_pos);
 
-  void startOcclusionAndSwRaster(
-    rendinst::RIOcclusionData &ri_occlusion_data, const CameraParams &cur_frame_cam, const LandMeshManager *lmesh_mgr);
+  void startOcclusionAndSwRaster(rendinst::RIOcclusionData &ri_occlusion_data,
+    const CameraParams &cur_frame_cam,
+    const LandMeshManager *lmesh_mgr,
+    mat44f_cref cockpit_proj);
 
   void waitVisibilityReproject();
 
-  void startOcclusionFrame(const TMatrix &itm, const mat44f &viewTm, const mat44f &projTm, const mat44f &globtm);
+  void startOcclusionFrame(
+    const TMatrix &itm, const mat44f &viewTm, const mat44f &projTm, const mat44f &globtm, mat44f_cref cockpit_proj);
 
   void startVisibilityReproject();
 
@@ -77,20 +66,11 @@ public:
     const IPoint2 &rendering_resolution,
     const ShadowVisibilityContext &shadow_ctx);
 
-  void startGroundVisibility(LandMeshManager *lmesh_mgr,
-    LandMeshRenderer *lmesh_renderer,
-    const float hmap_camera_height,
-    const float water_level,
-    const int displacement_sub_div,
-    const CameraParams &cur_frame_camera);
+  void startGroundVisibility(
+    LandMeshManager *lmesh_mgr, const int displacement_sub_div, const float displacement_radius, const CameraParams &cur_frame_camera);
 
-  void startGroundReflectionVisibility(LandMeshManager *lmesh_mgr,
-    LandMeshRenderer *lmesh_renderer,
-    const Frustum &frustum,
-    const Point3 &viewPos,
-    const TMatrix4 &viewProj,
-    const float hmap_camera_height,
-    const float water_level);
+  void startGroundReflectionVisibility(
+    LandMeshManager *lmesh_mgr, const Frustum &frustum, const Point3 &viewPos, const TMatrix4 &viewProj);
 
   void startLightsCullingJob(const CameraParams &cur_frame_camera, const bool use_occlusion_culling = true);
 
@@ -114,17 +94,27 @@ public:
   const LandMeshCullingData &getLandMeshCullingData() const { return lmeshCullingData; }
   const LandMeshCullingData &getLandMeshReflectionCullingData() const { return lmeshReflectionCullingData; }
 
-  void startAsyncAnimcharMainRender(const Frustum &fg_blob_frustum, uint32_t hints, TexStreamingContext tex_ctx);
+  void startAsyncAnimcharMainRender(const Frustum &fg_blob_frustum,
+    uint32_t hints,
+    TexStreamingContext tex_ctx,
+    const TMatrix4 &view_tm,
+    const TMatrix4 &proj_tm,
+    const TMatrix4 &prev_view_tm,
+    const TMatrix4 &prev_proj_tm);
   void waitAsyncAnimcharMainRender();
-  const dynmodel_renderer::DynModelRenderingState *getAsyncAnimcharMainRenderState() { return animcharMainRenderJobs[0].dstate; }
+  dynrend::ContextId getAsyncAnimcharMainRenderCtx() { return animcharMainRenderJobs[0].dynCtx; }
 
   void updateLodsScaling(const float ri_dist_mul, const float impostors_dist_mul);
 
+  void setCockpitReprojectionMode(CockpitReprojectionMode mode) { cockpitMode = mode; }
+
 private:
-  const CameraViewVisibilityFlags flags = CameraViewVisibilityFlags::None;
+  bool isSubView = false;
+  CockpitReprojectionMode cockpitMode = COCKPIT_REPROJECT_ANIMATED;
   const char *cameraPrefix = nullptr;
 
   Occlusion occlusion;
+  OcclusionMaskApplier occlusionMaskApplier;
   eastl::unique_ptr<ParallelOcclusionRasterizer> occlusionRasterizer;
   eastl::unique_ptr<OcclusionLandMeshManager> occlusionLandMeshManager;
 

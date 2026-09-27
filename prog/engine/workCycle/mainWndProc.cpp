@@ -17,7 +17,6 @@
 #include "drv/3d/dag_resetDevice.h"
 #include <util/dag_globDef.h>
 #include <supp/_platform.h>
-#include <supp/dag_cpuControl.h>
 #include <debug/dag_logSys.h>
 #include <util/dag_watchdog.h>
 
@@ -39,6 +38,14 @@ namespace workcycle_internal
 #if _TARGET_PC_WIN
 namespace windows
 {
+
+static bool is_any_window_active()
+{
+  DWORD windowProcessId;
+  GetWindowThreadProcessId(GetForegroundWindow(), &windowProcessId);
+  return windowProcessId == GetCurrentProcessId();
+}
+
 eastl::pair<bool, intptr_t> main_wnd_proc(void *hwnd, unsigned message, uintptr_t wParam, [[maybe_unused]] intptr_t lParam)
 {
   static bool shouldquit = false;
@@ -61,14 +68,14 @@ eastl::pair<bool, intptr_t> main_wnd_proc(void *hwnd, unsigned message, uintptr_
         {
           set_priority(true);
           dgs_app_active = true;
-          if (!is_float_exceptions_enabled())
-            _fpreset();
+          debug("app activated (WM_ACTIVATE)");
         }
-        else if (::dgs_app_active && (fActive == WA_INACTIVE))
+        else if (::dgs_app_active && (fActive == WA_INACTIVE) && !is_any_window_active())
         {
           if (interlocked_relaxed_load(enable_idle_priority))
             set_priority(false);
           dgs_app_active = false;
+          debug("app deactivated (WM_ACTIVATE, iconic=%d)", (int)IsIconic((HWND)hwnd));
           debug_flush(false);
         }
       }
@@ -85,14 +92,15 @@ eastl::pair<bool, intptr_t> main_wnd_proc(void *hwnd, unsigned message, uintptr_
           if (::global_cls_drv_pnt && ::global_cls_drv_pnt->isMouseCursorHidden())
             SetCursor((HCURSOR)win32_empty_mouse_cursor);
           dgs_app_active = true;
-          if (!is_float_exceptions_enabled())
-            _fpreset();
+          debug("app activated (WM_ACTIVATEAPP)");
         }
-        else if (::dgs_app_active && !n_app_active)
+        else if (::dgs_app_active && !n_app_active && !is_any_window_active())
         {
           if (interlocked_relaxed_load(enable_idle_priority))
             set_priority(false);
           dgs_app_active = false;
+          debug("app deactivated (WM_ACTIVATEAPP, iconic=%d)", (int)IsIconic((HWND)hwnd));
+          debug_flush(false);
         }
       }
       break;
@@ -115,10 +123,15 @@ eastl::pair<bool, intptr_t> main_wnd_proc(void *hwnd, unsigned message, uintptr_
 
     case WM_DESTROY:
     case WM_DAGOR_DESTROY:
-      win32_set_main_wnd(NULL);
-      d3d::window_destroyed(hwnd);
-      if (shouldquit)
-        quit_game(0);
+      if (hwnd && hwnd == win32_get_main_wnd())
+      {
+        win32_set_main_wnd(nullptr);
+        d3d::window_destroyed(hwnd);
+        if (shouldquit)
+          quit_game(0);
+      }
+      else
+        d3d::window_destroyed(hwnd);
       break;
 
     case WM_SETCURSOR:
@@ -127,9 +140,8 @@ eastl::pair<bool, intptr_t> main_wnd_proc(void *hwnd, unsigned message, uintptr_
           break;
       if (::global_cls_drv_pnt)
       {
-        HCURSOR cursor = ::global_cls_drv_pnt->isMouseCursorHidden()
-                           ? (HCURSOR)win32_empty_mouse_cursor
-                           : (win32_current_mouse_cursor ? (HCURSOR)win32_current_mouse_cursor : LoadCursor(NULL, IDC_ARROW));
+        HCURSOR cursor =
+          ::global_cls_drv_pnt->isMouseCursorHidden() ? (HCURSOR)win32_empty_mouse_cursor : (HCURSOR)win32_current_mouse_cursor;
         if (is_window_in_thread)
           PostMessageW((HWND)hwnd, WM_DAGOR_SETCURSOR, 0, (LPARAM)cursor);
         else
@@ -205,29 +217,10 @@ eastl::pair<bool, intptr_t> default_wnd_proc(void *hwnd, unsigned message, uintp
 
     case WM_SIZE:
     {
-      const eastl::pair<bool, intptr_t> handledResult = {true, 0};
-
-      static bool isMinimized = false;
-      if (wParam == SIZE_MINIMIZED)
-      {
-        isMinimized = true;
-        return handledResult;
-      }
-      // On windows, when the window is minimized, it is "resized" to (0,0),
-      // and afterwards, when it is un-minimized, the size is restored to
-      // the previous one.
-      // But there is no dedicated "un-minimization" event type, and the
-      // ambiguously named SIZE_RESTORED event comes for ANY type of resize
-      // (except for minimization & maximization), including the "un-minimization",
-      // so we have to keep track of the "first" restore event after a minimize
-      // to avoid unnecessary resets.
-      if (wParam == SIZE_RESTORED && isMinimized)
-      {
-        isMinimized = false;
-        return handledResult;
-      }
+      if (wParam == SIZE_MINIMIZED || wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED)
+        debug("window size event %d (%dx%d)", (int)wParam, (int)LOWORD(lParam), (int)HIWORD(lParam));
       notify_window_resized(LOWORD(lParam), HIWORD(lParam));
-      return handledResult;
+      return {true, 0};
     }
 
     case WM_GETMINMAXINFO:
@@ -265,8 +258,6 @@ static intptr_t wnd_proc([[maybe_unused]] void *hwnd, unsigned message, uintptr_
           set_priority(true);
           dgs_app_active = true;
           debug("activate");
-          // if (!is_float_exceptions_enabled())
-          //   _fpreset();
         }
         else if (::dgs_app_active && (fActive == GPCMP1_Inactivate))
         {

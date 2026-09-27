@@ -26,6 +26,7 @@ struct EntityActionAnnotation : das::ManagedStructureAnnotation<EntityAction, fa
     addField<DAS_BIND_MANAGED_FIELD(propsId)>("propsId");
     addField<DAS_BIND_MANAGED_FIELD(varId)>("varId");
     addField<DAS_BIND_MANAGED_FIELD(blocksSprint)>("blocksSprint");
+    addField<DAS_BIND_MANAGED_FIELD(isAnimStateFullBody)>("isAnimStateFullBody");
     addField<DAS_BIND_MANAGED_FIELD(name)>("name");
     addField<DAS_BIND_MANAGED_FIELD(classHash)>("classHash");
   }
@@ -49,8 +50,8 @@ public:
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("ecs"));
 
-    addAnnotation(das::make_smart<EntityActionAnnotation>(lib));
-    addAnnotation(das::make_smart<EntityActionsAnnotation>(lib));
+    addAnnotation(new EntityActionAnnotation(lib));
+    addAnnotation(new EntityActionsAnnotation(lib));
 
     das::addExtern<DAS_BIND_FUN(check_action_precondition)>(*this, lib, "check_action_precondition", das::SideEffects::accessExternal,
       "::check_action_precondition");

@@ -12,6 +12,7 @@
 #include <libTools/shaderResBuilder/rendInstResSrc.h>
 #include <libTools/shaderResBuilder/lodsEqMatGather.h>
 #include <libTools/shaderResBuilder/matSubst.h>
+#include <libTools/shaderResBuilder/validateAlphaTest.h>
 #include <generic/dag_tabUtils.h>
 #include <generic/dag_smallTab.h>
 #include <libTools/shaderResBuilder/globalVertexDataConnector.h>
@@ -29,8 +30,6 @@
 #include <debug/dag_debug.h>
 #include <util/dag_bitArray.h>
 #include <obsolete/dag_cfg.h>
-#include <sceneRay/dag_sceneRay.h>
-#include <libTools/ambientOcclusion/ambientOcclusion.h>
 #include <supp/dag_alloca.h>
 #include <EASTL/vector_set.h>
 #include <EASTL/string.h>
@@ -56,6 +55,30 @@ static const char *curDagFname = NULL;
 
 extern void prepare_billboard_mesh(Mesh &mesh, const TMatrix &wtm, dag::ConstSpan<Point3> org_verts);
 
+static void remove_parameter_from_mat_script(eastl::string &script, const eastl::string &parameter_name)
+{
+  size_t start = script.find(parameter_name);
+  if (start == eastl::string::npos)
+    return;
+
+  size_t end = script.find("\n", start);
+  script.erase(start, end - start);
+}
+
+static bool get_mat_script_bool(const SimpleString &mat_script, const char *name, bool def)
+{
+  CfgReader c;
+  c.getdiv_text(String(128, "[q]\r\n%s\r\n", mat_script.str()), "q");
+  return c.getbool(name, def);
+}
+
+static void remove_mat_script_param(MaterialData &mat, const char *name)
+{
+  eastl::string script = mat.matScript.c_str();
+  remove_parameter_from_mat_script(script, name);
+  mat.matScript = script.c_str();
+}
+
 
 void RenderableInstanceLodsResSrc::splitRealTwoSided(Mesh &m, Bitarray &is_material_real_two_sided_array)
 {
@@ -64,8 +87,7 @@ void RenderableInstanceLodsResSrc::splitRealTwoSided(Mesh &m, Bitarray &is_mater
 
 
 // add mesh node
-void RenderableInstanceLodsResSrc::addMeshNode(Lod &lod, Node *n_, Node *key_node, LodsEqualMaterialGather &mat_gather,
-  StaticSceneRayTracer *ao_tracer)
+void RenderableInstanceLodsResSrc::addMeshNode(int lod_no, Lod &lod, Node *n_, Node *key_node, LodsEqualMaterialGather &mat_gather)
 {
   if (!n_)
     return;
@@ -105,7 +127,7 @@ void RenderableInstanceLodsResSrc::addMeshNode(Lod &lod, Node *n_, Node *key_nod
         lod.bsph += ::mesh_bounding_sphere(mesh.getVert().data(), mesh.getVert().size());
 
         for (int i = 0; i < n.child.size(); ++i)
-          addMeshNode(lod, n.child[i], key_node, mat_gather, NULL);
+          addMeshNode(lod_no, lod, n.child[i], key_node, mat_gather);
         return;
       }
 
@@ -124,10 +146,8 @@ void RenderableInstanceLodsResSrc::addMeshNode(Lod &lod, Node *n_, Node *key_nod
 
         matSubst.substMatClass(*subMat);
         subMat = processMaterial(subMat, false);
-        CfgReader c;
-        c.getdiv_text(String(128, "[q]\r\n%s\r\n", subMat->matScript.str()), "q");
 
-        if (c.getbool("real_two_sided", false))
+        if (get_mat_script_bool(subMat->matScript, "real_two_sided", false))
           isMaterialRealTwoSidedArray.set(materialNo);
         else
           isMaterialRealTwoSidedArray.reset(materialNo);
@@ -243,6 +263,8 @@ void RenderableInstanceLodsResSrc::addMeshNode(Lod &lod, Node *n_, Node *key_nod
           int flags = 0;
           shmat[i]->enum_channels(extra_chans_used, flags);
         }
+        if (log && shmat[i])
+          AlphaTestValidation::validate(mesh, i, *subMat, *shmat[i], lod.fileName, n.name, *log);
       }
 
       if (find_value_idx(extra_chans_used.extraIdx, 53) >= 0)
@@ -319,7 +341,7 @@ void RenderableInstanceLodsResSrc::addMeshNode(Lod &lod, Node *n_, Node *key_nod
       if (buildImpostorDataNow)
         processImpostorMesh(mesh, shmat);
 
-      md.build(mesh, shmat.data(), numMat, IdentColorConvert::object, false);
+      md.build(mesh, shmat.data(), numMat, IdentColorConvert::object, false, 128, lod_no, n.name);
 
       if (::generate_quads && billboard)
       {
@@ -798,71 +820,17 @@ void RenderableInstanceLodsResSrc::addMeshNode(Lod &lod, Node *n_, Node *key_nod
 
   for (int i = 0; i < n.child.size(); ++i)
   {
-    addMeshNode(lod, n.child[i], key_node, mat_gather, ao_tracer);
+    addMeshNode(lod_no, lod, n.child[i], key_node, mat_gather);
   }
 }
 
-void RenderableInstanceLodsResSrc::addNode(Lod &lod, Node *n, Node *key_node, LodsEqualMaterialGather &mat_gather,
-  StaticSceneRayTracer *ao_tracer)
+void RenderableInstanceLodsResSrc::addNode(int lod_no, Lod &lod, Node *n, Node *key_node, LodsEqualMaterialGather &mat_gather)
 {
   // enum meshes
-  addMeshNode(lod, n, key_node, mat_gather, ao_tracer);
+  addMeshNode(lod_no, lod, n, key_node, mat_gather);
 }
 
-static const int AO_INDEX = 100;
-
-class HasAOChanCB : public ShaderChannelsEnumCB
-{
-public:
-  bool hasAO;
-  int aoIndex;
-  HasAOChanCB(int ind) : hasAO(false), aoIndex(ind) {}
-
-  void enum_shader_channel(int u, int ui, int t, int vbu, int vbui, ChannelModifier mod, int /*stream*/) override
-  {
-    if (u == SCUSAGE_EXTRA && ui == aoIndex)
-      hasAO = true;
-  }
-};
-
-static bool has_ao(Node &n, RenderableInstanceLodsResSrc *ri)
-{
-  if (n.mat)
-    for (unsigned int materialNo = 0; materialNo < n.mat->subMatCount(); materialNo++)
-    {
-      Ptr<MaterialData> subMat = n.mat->getSubMat(materialNo);
-      if (!subMat)
-        continue;
-      matSubst.substMatClass(*subMat);
-      subMat = ri->processMaterial(subMat, false);
-      Ptr<ShaderMaterial> m = new_shader_material(*subMat, true, false);
-      if (m)
-      {
-        HasAOChanCB hasAOcb(AO_INDEX);
-        int flags = 0;
-        m->enum_channels(hasAOcb, flags);
-        if (hasAOcb.hasAO)
-          return true;
-      }
-    }
-
-  for (int i = 0; i < n.child.size(); ++i)
-    if (has_ao(*n.child[i], ri))
-      return true;
-  return false;
-}
-
-static void remove_parameter_from_mat_script(eastl::string &script, const eastl::string &parameter_name)
-{
-  size_t start = script.find(parameter_name);
-  if (start == eastl::string::npos)
-    return;
-
-  size_t end = script.find("\n", start);
-  script.erase(start, end - start);
-}
-
-bool RenderableInstanceLodsResSrc::addLod(int lod_index, const char *filename, real range, LodsEqualMaterialGather &mat_gather,
+bool RenderableInstanceLodsResSrc::addLod(const char *filename, real range, LodsEqualMaterialGather &mat_gather,
   Tab<AScene *> &scene_list, const DataBlock &material_overrides, const char *add_mat_script)
 {
   struct RenderSW : public RenderSWNoInterp<512, 512>
@@ -1091,8 +1059,6 @@ bool RenderableInstanceLodsResSrc::addLod(int lod_index, const char *filename, r
 
   override_materials(matList, material_overrides, nullptr);
 
-  bool hasAO = has_ao(*sc.root, this);
-
   if (add_mat_script)
   {
     for (auto &mat : matList)
@@ -1103,23 +1069,17 @@ bool RenderableInstanceLodsResSrc::addLod(int lod_index, const char *filename, r
     }
   }
 
-  if (lod_index != 0)
+  const bool canUseTessellation = lods.size() == 0; // only for first lod
+  if (!canUseTessellation)
   {
     for (auto &mat : matList)
-    {
-      eastl::string script = mat->matScript.c_str();
-      remove_parameter_from_mat_script(script, "material_pn_triangulation");
-      mat->matScript = script.c_str();
-    }
+      remove_mat_script_param(*mat, "material_pn_triangulation");
   }
 
-  BuildableStaticSceneRayTracer *rayTracer = NULL;
   sc.root->calc_wtm();
   if (log)
     if (!matSubst.checkMatClasses(sc.root, filename, *log))
       return false;
-  if (hasAO)
-    rayTracer = create_buildable_staticmeshscene_raytracer(Point3(1, 1, 1), 7); // fixme
 
   int lodId = append_items(lods, 1);
   Lod &lod = lods[lodId];
@@ -1134,18 +1094,11 @@ bool RenderableInstanceLodsResSrc::addLod(int lod_index, const char *filename, r
       if (!delete_parameters_from_lod.shader_name.empty() && delete_parameters_from_lod.shader_name != mat->className.c_str())
         continue;
 
-      eastl::string script = mat->matScript.c_str();
-
-      CfgReader cfg_reader;
-      cfg_reader.getdiv_text(String(128, "[q]\r\n%s\r\n", script.c_str()), "q");
-      if (!cfg_reader.getbool("autoLodOptimization", true))
+      if (!get_mat_script_bool(mat->matScript, "autoLodOptimization", true))
         continue;
 
       for (const auto &param : delete_parameters_from_lod.parameters)
-      {
-        remove_parameter_from_mat_script(script, param);
-      }
-      mat->matScript = script.c_str();
+        remove_mat_script_param(*mat, param.c_str());
     }
   }
 
@@ -1157,7 +1110,7 @@ bool RenderableInstanceLodsResSrc::addLod(int lod_index, const char *filename, r
   skip_nodes.addNameId("occluder_box");
   skip_nodes.addNameId("floater_box");
   ::collapse_nodes(sc.root, sc.root, false, false, curDagFname, skip_nodes, true);
-  addNode(lod, sc.root, sc.root, mat_gather, rayTracer);
+  addNode(lodId, lod, sc.root, sc.root, mat_gather);
   curDagFname = NULL;
 
   if (hasOccl && !explicitOccl && lodId == 0)
@@ -1276,7 +1229,6 @@ bool RenderableInstanceLodsResSrc::addLod(int lod_index, const char *filename, r
   //     lod.rigid.meshData.elem[elemNo].si,
   //     lod.rigid.meshData.elem[elemNo].numf);
   // }
-  del_it(rayTracer);
   return true;
 }
 
@@ -1295,7 +1247,8 @@ static RenderableInstanceLodsResSrc::Lod merge_lods(const RenderableInstanceLods
   return result;
 }
 
-bool RenderableInstanceLodsResSrc::build(const DataBlock &blk)
+bool RenderableInstanceLodsResSrc::build(const DataBlock &blk, voxelcache::CacheDump *voxel_cache,
+  const DataBlock *default_voxel_params)
 {
   // debug("building rendInst from %s", (char*)inputFileName);
   buildImpostorDataNow = false;
@@ -1310,11 +1263,6 @@ bool RenderableInstanceLodsResSrc::build(const DataBlock &blk)
   forceLeftSideMatrices = blk.getBool("forceLeftSideMatrices", false);
   doNotSplitLods = blk.getBool("dont_split_lods", false);
 
-  // TODO: this check is not correct, hasImpostor is changed later in this function
-  // for now, it doesn't matter much, because of max lod limit being 8
-  // to fix it, insert the tessellation split lod at the end, then change order
-  const bool hasTransitionLod = hasImpostor && blk.getNameId("transition_lod") != -1;
-
   int lodNameId = blk.getNameId("lod");
   int plodNameId = blk.getNameId("plod");
 
@@ -1323,19 +1271,13 @@ bool RenderableInstanceLodsResSrc::build(const DataBlock &blk)
 
   const int numBlk = blk.blockCount();
   int lastLodBlkIdx = -1, beforeLastLodBlkIdx = -1;
-  int numLods = 0;
   for (int blkId = 0; blkId < numBlk; ++blkId)
     if (blk.getBlock(blkId)->getBlockNameId() == lodNameId)
     {
-      numLods++;
       beforeLastLodBlkIdx = lastLodBlkIdx;
       lastLodBlkIdx = blkId;
     }
 
-  const int availableLods = rendinst::RI_MAX_LODS - (hasTransitionLod ? 1 : 0);
-  const bool canSplitTessellationLods = numLods < availableLods;
-
-  int lodId = 0;
   for (int blkId = 0; blkId < numBlk; ++blkId)
   {
     const DataBlock &lodBlk = *blk.getBlock(blkId);
@@ -1347,68 +1289,15 @@ bool RenderableInstanceLodsResSrc::build(const DataBlock &blk)
     const DataBlock *materialOverrides = lodBlk.getBlockByNameEx("materialOverrides");
 
     buildImpostorDataNow = (blkId == beforeLastLodBlkIdx);
-    if (!addLod(lodId, fileName, range, matGather, curScenes, *materialOverrides))
+    if (!addLod(fileName, range, matGather, curScenes, *materialOverrides))
     {
       clear_all_ptr_items(curScenes);
       return false;
     }
-
-    lodId++;
-    if (lodId == 1)
-    {
-      // get tesselation range
-      int material_pn_triangulation_var_id = VariableMap::getVariableId("material_pn_triangulation", true);
-      int max_tessellation_distance_var_id = VariableMap::getVariableId("max_tessellation_distance", true);
-      int max_dispacement_distance_var_id = VariableMap::getVariableId("max_dispacement_distance", true);
-      int tessellation_transition_distance_var_id = VariableMap::getVariableId("tessellation_transition_distance", true);
-
-      float tessRange = -1;
-      for (const auto &elem : lods[0].rigid.meshData.elems)
-      {
-        int pnTrig = 0;
-        bool got = elem.mat->getIntVariable(material_pn_triangulation_var_id, pnTrig);
-        if (pnTrig == 0)
-          continue;
-
-        const char *shaderName = elem.mat->getShaderClassName();
-        bool isClipmap = strcmp(shaderName, "rendinst_clipmap") == 0;
-        bool isLandclass = strcmp(shaderName, "rendinst_landclass") == 0;
-        float matRange = -1;
-        if (!elem.mat->getRealVariable(
-              ((isLandclass || isClipmap) ? max_dispacement_distance_var_id : max_tessellation_distance_var_id), matRange))
-        {
-          ISSUE_FATAL("Material is missing tesselation range parameter in %s", fileName);
-          continue;
-        }
-        float transRange = 0;
-        elem.mat->getRealVariable(tessellation_transition_distance_var_id, transRange);
-        matRange += transRange;
-        matRange += lods[0].bsph.r;
-        tessRange = max(tessRange, matRange);
-      }
-
-      if (tessRange > 0 && tessRange < lods[0].range)
-      {
-        if (!canSplitTessellationLods)
-        {
-          ISSUE_FATAL("Tessellation: too many LODs in %s (%d+1 > %d), cannot split at tesselation range!", fileName, numLods,
-            availableLods);
-          continue;
-        }
-        // split lod 0 at tessRange
-        debug("%s : tesselation split at %g .. %g", fileName, tessRange, range);
-        lods[0].range = tessRange;
-        if (!addLod(lodId, fileName, range, matGather, curScenes, *materialOverrides)) // -V1051
-        {
-          clear_all_ptr_items(curScenes);
-          return false;
-        }
-        lodId++;
-      }
-    }
   }
 
-  if (hasImpostor && blk.getNameId("transition_lod") != -1)
+  // add impostor transition lod
+  if (hasImpostor && !voxel_cache && blk.getNameId("transition_lod") != -1)
   {
     const DataBlock *block = blk.getBlockByName("transition_lod");
     int transitionRangeNameId = block->getNameId("transition_range");
@@ -1417,7 +1306,6 @@ bool RenderableInstanceLodsResSrc::build(const DataBlock &blk)
     String addMatScript;
 
     float transitionLodRange = 0;
-    int lodId = 0;
     for (int blkId = 0; blkId < numBlk; ++blkId)
     {
       const DataBlock &lodBlk = *blk.getBlock(blkId);
@@ -1434,26 +1322,105 @@ bool RenderableInstanceLodsResSrc::build(const DataBlock &blk)
         float crossDissolveAdd = safediv(-(transitionLodRange - transitionRange), transitionRange);
         addMatScript = String(128, "\r\nuse_cross_dissolve=1\r\ncross_dissolve_mul=%f\r\ncross_dissolve_add=%f\r\n", crossDissolveMul,
           crossDissolveAdd);
-        addLod(lodId, fileName, transitionLodRange, matGather, curScenes, *materialOverrides, addMatScript.c_str());
+        addLod(fileName, transitionLodRange, matGather, curScenes, *materialOverrides, addMatScript.c_str());
       }
       else if (blkId == lastLodBlkIdx)
       {
-        addLod(lodId, fileName, transitionLodRange, matGather, curScenes, *materialOverrides, addMatScript.c_str());
+        addLod(fileName, transitionLodRange, matGather, curScenes, *materialOverrides, addMatScript.c_str());
       }
-      lodId++;
     }
 
-    int lodNum = lods.size();
-    Lod tmpImpostorLod = lods[lodNum - 3];
+    const int lodNum = lods.size();
+    Lod tmpImpostorLod = eastl::move(lods[lodNum - 3]);
     Lod &transitionLod = lods[lodNum - 3];
     Lod &impostorLod = lods[lodNum - 2];
-    Lod &lastMeshLod = lods[lodNum - 4];
-
-    transitionLod = merge_lods(lods[lodNum - 2], lods[lodNum - 1]);
-    impostorLod = eastl::move(tmpImpostorLod);
+    transitionLod = merge_lods(lods[lodNum - 2], lods[lodNum - 1]); // merge "virtual" transition lods
+    impostorLod = eastl::move(tmpImpostorLod);                      // make impostor lod the last one
     lods.pop_back();
 
     transitionLod.range = transitionLodRange;
+  }
+
+  // add tessellation split lod if needed
+  for (int blkId = 0; blkId < numBlk; ++blkId)
+  {
+    const DataBlock &lodBlk = *blk.getBlock(blkId);
+    // iterate until the first valid lod block (lod0)
+    if (lodBlk.getBlockNameId() != lodNameId && lodBlk.getBlockNameId() != plodNameId)
+      continue;
+
+    const char *fileName = lodBlk.getStr("scene", NULL);
+    real range = lodBlk.getReal("range", MAX_REAL);
+    const DataBlock *materialOverrides = lodBlk.getBlockByNameEx("materialOverrides");
+
+    const bool canSplitTessellationLods = lods.size() < rendinst::RI_MAX_LODS;
+
+    // get tesselation range
+    int material_pn_triangulation_var_id = VariableMap::getVariableId("material_pn_triangulation", true);
+    int max_tessellation_distance_var_id = VariableMap::getVariableId("max_tessellation_distance", true);
+    int max_dispacement_distance_var_id = VariableMap::getVariableId("max_dispacement_distance", true);
+    int tessellation_transition_distance_var_id = VariableMap::getVariableId("tessellation_transition_distance", true);
+
+    float tessRange = -1;
+    for (const auto &elem : lods[0].rigid.meshData.elems)
+    {
+      int pnTrig = 0;
+      bool got = elem.mat->getIntVariable(material_pn_triangulation_var_id, pnTrig);
+      if (pnTrig == 0)
+        continue;
+
+      const char *shaderName = elem.mat->getShaderClassName();
+      bool isClipmap = strcmp(shaderName, "rendinst_clipmap") == 0;
+      bool isLandclass = strcmp(shaderName, "rendinst_landclass") == 0;
+      float matRange = -1;
+      if (!elem.mat->getRealVariable(((isLandclass || isClipmap) ? max_dispacement_distance_var_id : max_tessellation_distance_var_id),
+            matRange))
+      {
+        ISSUE_FATAL("Material is missing tesselation range parameter in %s", fileName);
+        continue;
+      }
+      float transRange = 0;
+      elem.mat->getRealVariable(tessellation_transition_distance_var_id, transRange);
+      matRange += transRange;
+      matRange += lods[0].bsph.r;
+      tessRange = max(tessRange, matRange);
+    }
+
+    if (tessRange > 0 && tessRange < lods[0].range)
+    {
+      if (canSplitTessellationLods)
+      {
+        // split lod 0 at tessRange
+        debug("%s : tesselation split at %g .. %g", fileName, tessRange, range);
+        lods[0].range = tessRange;
+        if (!addLod(fileName, range, matGather, curScenes, *materialOverrides)) // -V1051
+        {
+          clear_all_ptr_items(curScenes);
+          return false;
+        }
+
+        lods.insert(lods.begin() + 1, eastl::move(lods.back())); // new lod is right after lod0
+        lods.pop_back();
+      }
+      else
+      {
+        ISSUE_FATAL("Tessellation: too many LODs in %s (%d+1 > %d), cannot split at tesselation range!", fileName, lods.size(),
+          rendinst::RI_MAX_LODS);
+      }
+    }
+
+    break; // only process lod0
+  }
+
+  // add voxel lods
+  if (voxel_cache)
+  {
+    G_ASSERT(default_voxel_params);
+    if (!buildVoxels(blk, *default_voxel_params, voxel_cache, matGather, matSubst))
+    {
+      clear_all_ptr_items(curScenes);
+      return false;
+    }
   }
 
   matGather.copyToMatSaver(matSaver, texSaver);
@@ -1506,7 +1473,7 @@ void RenderableInstanceLodsResSrc::processImpostorMesh(Mesh &m, dag::ConstSpan<S
 
     if ((flg & SC_STAGE_IDX_MASK) > ShaderMesh::STG_decal)
       mat_type[i] = MAT_SKIP;
-    else if (flId >= 0 && strstr(mat[i]->getInfo().str(), "facing_leaves"))
+    else if (flId >= 0 && strstr(mat[i]->getShaderClassName(), "facing_leaves"))
       mat_type[i] = MAT_FACING_LEAVES;
     else
       mat_type[i] = MAT_OPAQUE;
@@ -1589,8 +1556,17 @@ void RenderableInstanceLodsResSrc::RigidObj::presave(ShaderMeshDataSaveCB &mdcb)
 int RenderableInstanceLodsResSrc::Lod::save(mkbindump::BinDumpSaveCB &cwr, ShaderMeshDataSaveCB &mdcb)
 {
   int sz_pos = cwr.tell();
-  cwr.writePtr64e(0);
+  cwr.writeInt32e(0);
+  cwr.writeInt32e(voxelHullVerts);
   cwr.writeInt32eAt(rigid.meshData.save(cwr, mdcb, true), sz_pos);
+
+  if (voxelHullVerts != 0)
+  {
+    int surfPos = cwr.tell();
+    cwr.writeInt32e(0);
+    if (voxelSurface)
+      cwr.writeInt32eAt(voxelSurface->save(cwr), surfPos);
+  }
 
   return 8;
 }

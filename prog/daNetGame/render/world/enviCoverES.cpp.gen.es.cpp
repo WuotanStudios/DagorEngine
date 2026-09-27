@@ -26,7 +26,7 @@ static ecs::EntitySystemDesc envi_cover_es_es_desc
   make_span(envi_cover_es_comps+0, 1)/*ro*/,
   empty_span(),
   empty_span(),
-  ecs::EventSetBuilder<OnLevelLoaded>::build(),
+  ecs::EventSetBuilder<EventRenderSceneLoaded>::build(),
   0
 ,"render");
 static constexpr ecs::ComponentDesc envi_cover_unload_es_comps[] =
@@ -109,6 +109,79 @@ static ecs::EntitySystemDesc set_envi_cover_params_es_es_desc
   make_span(set_envi_cover_params_es_comps+0, 18)/*ro*/,
   empty_span(),
   empty_span(),
-  ecs::EventSetBuilder<OnLevelLoaded>::build(),
+  ecs::EventSetBuilder<EventRenderSceneLoaded>::build(),
   0
 ,"render",nullptr,"*");
+static constexpr ecs::ComponentDesc envi_cover_intensity_map_unload_es_comps[] =
+{
+//start of 1 rq components at [0]
+  {ECS_HASH("envi_cover_intensity_map"), ecs::ComponentTypeInfo<ecs::string>()}
+};
+static void envi_cover_intensity_map_unload_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
+{
+  G_UNUSED(components);
+  envi_cover_intensity_map_unload_es(evt
+        );
+}
+static ecs::EntitySystemDesc envi_cover_intensity_map_unload_es_es_desc
+(
+  "envi_cover_intensity_map_unload_es",
+  "prog/daNetGame/render/world/enviCoverES.cpp.inl",
+  ecs::EntitySystemOps(nullptr, envi_cover_intensity_map_unload_es_all_events),
+  empty_span(),
+  empty_span(),
+  make_span(envi_cover_intensity_map_unload_es_comps+0, 1)/*rq*/,
+  empty_span(),
+  ecs::EventSetBuilder<ecs::EventEntityDestroyed,
+                       ecs::EventComponentsDisappear>::build(),
+  0
+,"render");
+static constexpr ecs::ComponentDesc envi_cover_rt_on_es_comps[] =
+{
+//start of 1 ro components at [0]
+  {ECS_HASH("envi_cover_rt"), ecs::ComponentTypeInfo<bool>()}
+};
+static void envi_cover_rt_on_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
+{
+  auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
+    envi_cover_rt_on_es(evt
+        , ECS_RO_COMP(envi_cover_rt_on_es_comps, "envi_cover_rt", bool)
+    );
+  while (++comp != compE);
+}
+static ecs::EntitySystemDesc envi_cover_rt_on_es_es_desc
+(
+  "envi_cover_rt_on_es",
+  "prog/daNetGame/render/world/enviCoverES.cpp.inl",
+  ecs::EntitySystemOps(nullptr, envi_cover_rt_on_es_all_events),
+  empty_span(),
+  make_span(envi_cover_rt_on_es_comps+0, 1)/*ro*/,
+  empty_span(),
+  empty_span(),
+  ecs::EventSetBuilder<EventRenderSceneLoaded>::build(),
+  0
+,"render");
+static constexpr ecs::ComponentDesc envi_cover_rt_off_es_comps[] =
+{
+//start of 1 rq components at [0]
+  {ECS_HASH("envi_cover_rt"), ecs::ComponentTypeInfo<bool>()}
+};
+static void envi_cover_rt_off_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
+{
+  G_UNUSED(components);
+  envi_cover_rt_off_es(evt
+        );
+}
+static ecs::EntitySystemDesc envi_cover_rt_off_es_es_desc
+(
+  "envi_cover_rt_off_es",
+  "prog/daNetGame/render/world/enviCoverES.cpp.inl",
+  ecs::EntitySystemOps(nullptr, envi_cover_rt_off_es_all_events),
+  empty_span(),
+  empty_span(),
+  make_span(envi_cover_rt_off_es_comps+0, 1)/*rq*/,
+  empty_span(),
+  ecs::EventSetBuilder<ecs::EventEntityDestroyed,
+                       ecs::EventComponentsDisappear>::build(),
+  0
+,"render");

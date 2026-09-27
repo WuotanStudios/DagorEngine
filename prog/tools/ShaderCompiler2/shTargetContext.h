@@ -17,6 +17,7 @@
 #include "namedConst.h"
 #include "shAssumes.h"
 #include "globalConfig.h"
+#include "refinedBlockLayout.h"
 #include <EASTL/optional.h>
 
 
@@ -30,28 +31,33 @@ class TargetContext
   const char *mFname;
   VarNameMap mVarNameMap{};
   HashStrings mIntervalNameMap{}; // @TODO: unify name map technology
+  VarNameMap mBoolVarNameMap{};
+  HashStrings mShaderNameMap{};
   ShaderGlobal::VarTable mGvarTable;
   SamplerTable mSamplerTable;
   StcodeShader mCppstcodeAccum;
-  BoolVarTable mBoolVarTable{};
+  BoolVarTable mBoolVarTable;
   PerHlslStage<String> mGlobalHlslSource{};
   ShaderBlockTable mStateBlockTable{};
   ShaderAssumesTable mGlobalAssumes;
   SCFastNameMap mGlobalMessages{};
   ShaderTargetStorage mDataStorage{};
   ShaderBytecodeCache mShBytecodeCache{}; // @TODO: this lifetime conforms with previous impl. But maybe we want a persistent cache?
-  StcodeBytecodeCache mStcodeBytecodeCache{};
+  RefinedBlockLayout mRefinedBlockLayout{};
 
   //...
+
+  bool preshaderOnlyMode = false;
 
   // Only valid when target is source file -> obj
   eastl::optional<SourceFileParseState> mSourceFileState{};
 
-  const CompilationContext &mParent;
+  CompilationContext &mParent;
 
 public:
   PINNED_TYPE(TargetContext)
 
+  CompilationContext &compCtx() { return mParent; }
   const CompilationContext &compCtx() const { return mParent; }
 
   const char *fname() const { return mFname; }
@@ -61,6 +67,12 @@ public:
 
   HashStrings &intervalNameMap() { return mIntervalNameMap; }
   const HashStrings &intervalNameMap() const { return mIntervalNameMap; }
+
+  VarNameMap &boolVarNameMap() { return mBoolVarNameMap; }
+  const VarNameMap &boolVarNameMap() const { return mBoolVarNameMap; }
+
+  HashStrings &shaderNameMap() { return mShaderNameMap; }
+  const HashStrings &shaderNameMap() const { return mShaderNameMap; }
 
   ShaderGlobal::VarTable &globVars() { return mGvarTable; }
   const ShaderGlobal::VarTable &globVars() const { return mGvarTable; }
@@ -92,8 +104,8 @@ public:
   ShaderBytecodeCache &bytecodeCache() { return mShBytecodeCache; }
   const ShaderBytecodeCache &bytecodeCache() const { return mShBytecodeCache; }
 
-  StcodeBytecodeCache &stcodeCache() { return mStcodeBytecodeCache; }
-  const StcodeBytecodeCache &stcodeCache() const { return mStcodeBytecodeCache; }
+  RefinedBlockLayout &refinedBlockLayout() { return mRefinedBlockLayout; }
+  const RefinedBlockLayout &refinedBlockLayout() const { return mRefinedBlockLayout; }
 
   SourceFileParseState &sourceParseState()
   {
@@ -105,6 +117,8 @@ public:
     G_ASSERT(mSourceFileState);
     return *mSourceFileState;
   }
+
+  bool isPreshaderOnly() const { return preshaderOnlyMode; }
 
   class SourceFileScope
   {
@@ -124,18 +138,23 @@ public:
 private:
   friend class CompilationContext;
 
-  explicit TargetContext(const char *fname, const CompilationContext &parent) :
+  explicit TargetContext(const char *fname, CompilationContext &parent, bool preshader_only = false) :
     mFname{fname},
     mGvarTable{mVarNameMap, mIntervalNameMap},
     mSamplerTable{mVarNameMap, mGvarTable, mCppstcodeAccum},
-    mGlobalAssumes{*shc::config().assumedVarsConfig},
-    mParent{parent}
+    mBoolVarTable{mBoolVarNameMap},
+    mGlobalAssumes{*shc::config().assumedVarsConfig, mIntervalNameMap},
+    mParent{parent},
+    preshaderOnlyMode{preshader_only}
   {
     if (fname)
       mCppstcodeAccum.shaderName = stcode::extract_shader_name_from_path(fname);
   }
 };
 
-inline TargetContext CompilationContext::makeTargetContext(const char *fname) const { return TargetContext{fname, *this}; }
+inline TargetContext CompilationContext::makeTargetContext(const char *fname, bool preshader_only)
+{
+  return TargetContext{fname, *this, preshader_only};
+}
 
 } // namespace shc

@@ -1,0 +1,530 @@
+#ifndef RT_COMMON_HLSLI
+#define RT_COMMON_HLSLI 1
+
+#define kEpsilon 0.00001
+#define TRACE_EPSILON          0.0000004f
+#define TRACE_ONE_PLUS_EPSILON (1.f + TRACE_EPSILON)
+#define TRACE_ONE_PLUS_EPSILON2 (1.f + 2.f*TRACE_EPSILON)
+
+bool RayIntersectsBoxT0T1(float3 t0, float3 t1, float ray_extent)
+{
+  const float3 tmax = max(t0, t1);
+  const float3 tmin = min(t0, t1);
+
+  const float a1 = min( min(tmax.x,tmax.y), min(tmax.z, ray_extent));
+  const float a0 = max( max(tmin.x,tmin.y), max(tmin.z, 0.0f) );
+
+  return a1 >= a0;
+}
+
+bool RayIntersectsBoxInf(float3 t0, float3 t1)
+{
+  const float3 tmax = max(t0, t1);
+  const float3 tmin = min(t0, t1);
+
+  const float a1 = min3(tmax.x, tmax.y, tmax.z);
+  const float a0 = max3(tmin.x, tmin.y, tmin.z);
+
+  return a1 >= a0;
+}
+
+
+bool RayIntersectsBoxT0TInf(float3 t0, float3 t1)
+{
+  const float3 tmax = max(t0, t1);
+  const float3 tmin = min(t0, t1);
+
+  const float a1 = min3(tmax.x, tmax.y, tmax.z);
+  const float a0 = max( max(tmin.x,tmin.y), max(tmin.z, 0.0f) );
+
+  return a1 >= a0;
+}
+
+bool RayIntersectsBoxT0T1(float3 t0, float3 t1, float ray_extent, inout float t)
+{
+  const float3 tmax = max(t0, t1);
+  const float3 tmin = min(t0, t1);
+
+  const float a1 = min( min(tmax.x,tmax.y), min(tmax.z, ray_extent));
+  const float a0 = max( max(tmin.x,tmin.y), max(tmin.z, 0.0f) );
+  t = a0;
+  return a1 >= a0;
+}
+
+bool RayIntersectsBox(float3 origin, float3 rayDirInv, float3 BboxMin, float3 BboxMax, float ray_extent)
+{
+  return RayIntersectsBoxT0T1((BboxMin - origin) * rayDirInv, (BboxMax - origin) * rayDirInv, ray_extent);
+}
+
+bool RayIntersectsBoxInf(
+    float3 ray_origin,
+    float3 ray_inv_dir,
+    float3 bmin,
+    float3 bmax)
+{
+  // When an element of Direction is 0, its inverse needs to be NAN rather than INF.
+  // IEEE float math won't propogate NANs, so this element won't affect min_t or max_t.
+
+  float3 t_plane_min = (bmin - ray_origin) * ray_inv_dir;
+  float3 t_plane_max = (bmax - ray_origin) * ray_inv_dir;
+
+  float3 min_interval = select(ray_inv_dir > 0.0, t_plane_min, t_plane_max);
+  float3 max_interval = select(ray_inv_dir > 0.0, t_plane_max, t_plane_min);
+
+  float min_t = max(max(min_interval.x, min_interval.y), max(min_interval.z, 0.0));
+  float max_t = min3(max_interval.x, max_interval.y, max_interval.z);
+  return min_t <= max_t;
+}
+
+bool RayIntersectsBoxT(
+    float3 ray_origin,
+    float3 ray_inv_dir,
+    float3 bmin,
+    float3 bmax,
+    float ray_extent,
+    out float t)
+{
+  // When an element of Direction is 0, its inverse needs to be NAN rather than INF.
+  // IEEE float math won't propogate NANs, so this element won't affect min_t or max_t.
+
+  float3 t_plane_min = (bmin - ray_origin) * ray_inv_dir;
+  float3 t_plane_max = (bmax - ray_origin) * ray_inv_dir;
+
+  float3 min_interval = select(ray_inv_dir > 0.0, t_plane_min, t_plane_max);
+  float3 max_interval = select(ray_inv_dir > 0.0, t_plane_max, t_plane_min);
+
+  float min_t = max(max(min_interval.x, min_interval.y), max(min_interval.z, 0.0));
+  float max_t = min(min(max_interval.x, max_interval.y), min(max_interval.z, ray_extent));
+  t = min_t;
+  return min_t <= max_t;
+}
+
+float RayIntersectsBoxInfT(
+    float3 ray_origin,
+    float3 ray_inv_dir,
+    float3 bmin,
+    float3 bmax)
+{
+  // When an element of Direction is 0, its inverse needs to be NAN rather than INF.
+  // IEEE float math won't propogate NANs, so this element won't affect min_t or max_t.
+
+  float3 t_plane_min = (bmin - ray_origin) * ray_inv_dir;
+  float3 t_plane_max = (bmax - ray_origin) * ray_inv_dir;
+
+  float3 min_interval = select(ray_inv_dir > 0.0, t_plane_min, t_plane_max);
+  float3 max_interval = select(ray_inv_dir > 0.0, t_plane_max, t_plane_min);
+
+  float min_t = max(max(min_interval.x, min_interval.y), max(min_interval.z, 0.0));
+  float max_t = min3(max_interval.x, max_interval.y, max_interval.z);
+  return min_t <= max_t ? min_t : -1;
+}
+
+bool RayIntersectsBoxTNormal(
+    float3 ray_origin,
+    float3 ray_inv_dir,
+    float3 bmin,
+    float3 bmax,
+    inout float t,
+    out float3 normal)
+{
+  // When an element of Direction is 0, its inverse needs to be NAN rather than INF.
+  // IEEE float math won't propogate NANs, so this element won't affect min_t or max_t.
+
+  float3 t_plane_min = (bmin - ray_origin) * ray_inv_dir;
+  float3 t_plane_max = (bmax - ray_origin) * ray_inv_dir;
+
+  float3 min_interval = select(ray_inv_dir > 0.0, t_plane_min, t_plane_max);
+  float3 max_interval = select(ray_inv_dir > 0.0, t_plane_max, t_plane_min);
+
+  float min_t = max(max(min_interval.x, min_interval.y), max(min_interval.z, 0.0));
+  float max_t = min(min(max_interval.x, max_interval.y), min(max_interval.z, t));
+  t = min_t;
+  normal = -(min_t == min_interval.x ? float3(sign(ray_inv_dir.x),0,0) : min_t == min_interval.y ? float3(0, sign(ray_inv_dir.y),0) : float3(0, 0, sign(ray_inv_dir.z)));
+  return min_t <= max_t;
+}
+
+
+bool RayIntersectsBoxTNormal(
+    float3 ray_origin,
+    float3 ray_inv_dir,
+    float3 bmin,
+    float3 bmax,
+    float ray_extent,
+    inout float t,
+    inout float3 normal)
+{
+  // When an element of Direction is 0, its inverse needs to be NAN rather than INF.
+  // IEEE float math won't propogate NANs, so this element won't affect min_t or max_t.
+
+  float3 t_plane_min = (bmin - ray_origin) * ray_inv_dir;
+  float3 t_plane_max = (bmax - ray_origin) * ray_inv_dir;
+
+  float3 min_interval = select(ray_inv_dir > 0.0, t_plane_min, t_plane_max);
+  float3 max_interval = select(ray_inv_dir > 0.0, t_plane_max, t_plane_min);
+
+  float min_t = max(max(min_interval.x, min_interval.y), max(min_interval.z, 0.0));
+  float max_t = min(min(max_interval.x, max_interval.y), min(max_interval.z, ray_extent));
+  FLATTEN
+  if (min_t <= max_t)
+  {
+    t = min_t;
+    normal = -(min_t == min_interval.x ? float3(sign(ray_inv_dir.x),0,0) : min_t == min_interval.y ? float3(0, sign(ray_inv_dir.y),0) : float3(0, 0, sign(ray_inv_dir.z)));
+  }
+  return min_t <= max_t;
+}
+
+
+
+// watertight edge equation
+//doesn't return false if t < 0. Check yourself
+bool RayTriangleIntersectInf(
+  in  float3 rayOrigin,
+  in  float3 rayDirection,
+  in  float3 v0, in  float3 v1, in  float3 v2,
+  inout float  t,
+  inout float3  bary)
+{
+  // 1. Select dominant axis (kz) to minimize projection error
+  float3 absDir = abs(rayDirection);
+  uint kz, kx, ky;
+
+  float3 a = v0 - rayOrigin;
+  float3 b = v1 - rayOrigin;
+  float3 c = v2 - rayOrigin;
+  float3 d = rayDirection.xyz;
+
+  // Permute coordinates so z becomes the new z-axis (dominant)
+  if (absDir.x >= absDir.y && absDir.x >= absDir.z)
+  {
+    d = rayDirection.yzx;
+    a = a.yzx;
+    b = b.yzx;
+    c = c.yzx;
+  }
+  else if (absDir.y >= absDir.z)
+  {
+    d = rayDirection.zxy;
+    a = a.zxy;
+    b = b.zxy;
+    c = c.zxy;
+  }
+
+  // 2. Shear transformation (projects away from dominant axis)
+  float3 S = float3(-d.xy, 1.f) * rcp(d.z);
+
+  float3 abcZ = float3(a.z, b.z, c.z);
+  float2 axy = a.xy + S.xy * abcZ.x;
+  float2 bxy = b.xy + S.xy * abcZ.y;
+  float2 cxy = c.xy + S.xy * abcZ.z;
+
+  // 3. 2D edge functions (oriented area tests)
+  float3 UVW;
+  UVW.x = cxy.x * bxy.y - cxy.y * bxy.x;
+  UVW.y = axy.x * cxy.y - axy.y * cxy.x;
+  UVW.z = bxy.x * axy.y - bxy.y * axy.x;
+
+  // All three must have the same sign (or zero) -> inside projected triangle
+  // We allow exactly zero to support watertight edges/vertices
+  if (any(UVW < 0.0) & any(UVW > 0.0)) return false;
+
+  float det = dot(UVW, 1);
+  if (abs(det) <= 1e-18)
+    return false;               // degenerate projected triangle
+
+  // Optional backface culling (using original normal)
+#if BACKFACE_CULLING
+  {
+    if (dot(cross(v1-v0, v2-v0), rayDirection) >= 0.0) return false;
+  }
+#endif
+  // 5. Output results
+  bary = UVW/det;
+  // baryW = W * rcpDet;  // usually not needed
+  // 4. Depth along ray (in sheared space)
+  t = dot(abcZ, bary) * S.z;
+  return true;
+}
+
+// Watertightness contract for this file's ray-triangle tests:
+//   * Closest-hit (RayTriangleIntersect) and any-hit/shadow (RayTriangle2_SoA_AnyHit,
+//     RayTriangleIntersectShadow) use non-watertight Moller-Trumbore with epsilon edge bands.
+//     Shared edges/vertices can crack or double-hit by a pixel; acceptable for SWRT shadows
+//     because soft-sun-disk sampling and blue-noise dither mask it.
+//   * The XZ heightmap path (RayTriangleIntersectInfXZ, and RayTriangleIntersectInf under
+//     USE_WATERTIGHT_TRACE) uses an edge-function test that admits exactly-zero edges, so it is
+//     crack-free along shared edges -- required for terrain height queries.
+
+//Adapted from https://github.com/kayru/RayTracedShadows/blob/master/Source/Shaders/RayTracedShadows.comp
+bool RayTriangleIntersect(
+    float3 orig,
+    float3 dir,
+    float3 v0,
+    float3 v1,
+    float3 v2,
+    inout float t,
+    out float2 bc)
+{
+  #if USE_WATERTIGHT_TRACE
+  float T;
+  if (RayTriangleIntersectInf(orig, dir, v0, v1, v2, T, bc))
+  {
+    if ( T <= 0 || T >= t)
+      return false;
+    t = T;
+    return true;
+  }
+  return false;
+  #endif
+  float3 e0 = v1-v0, e1 = v2-v0;
+  float3 s1 = cross(dir.xyz, e1);
+  float det  = dot(s1, e0);
+  // Reject zero/denormal det branchlessly: a true rcp(0)=inf makes bc.x = 0*inf = NaN, and every
+  // NaN compare in the rejection chain is false, so we would return a hit with t = NaN and poison
+  // closest-hit state. detSafe keeps the divide finite; the `degenerate` term then rejects the tri.
+  // Mirrors the SoA RayTriangle2_SoA path and the CPU v_rcp_safe(det).
+  bool degenerate = abs(det) < 1e-37f;
+  float invd = rcp(degenerate ? 1.0f : det);
+  float3 d = orig.xyz - v0;
+  bc.x = dot(d, s1) * invd;
+  const float3 s2 = cross(d, e0);
+  bc.y = dot(dir.xyz, s2) * invd;
+  float ct = dot(e1, s2) * invd;
+  FLATTEN
+  if (degenerate ||
+#if BACKFACE_CULLING
+    det < -kEpsilon ||
+#endif
+    bc.x < -TRACE_EPSILON || bc.y < -TRACE_EPSILON || (bc.x + bc.y) > TRACE_ONE_PLUS_EPSILON2 || ct < 0.0 || ct >= t)
+  {
+    return false;
+  }
+  else
+  {
+    t = ct;
+    return true;
+  }
+}
+
+bool RayTriangleIntersectInfXZ(
+    float3 rayOrigin,
+    float3 v0,
+    float3 v1,
+    float3 v2,
+    inout float t,
+    inout float3 bc)
+{
+  float3 v012y = float3(v0.y, v1.y, v2.y);
+  float3 abc_x = float3(v0.z, v1.z, v2.z) - rayOrigin.z;
+  float3 abc_y = float3(v0.x, v1.x, v2.x) - rayOrigin.x;
+  // 3. 2D edge functions (oriented area tests)
+  float3 UVW = abc_x.zxy*abc_y.yzx - abc_y.zxy*abc_x.yzx;
+
+  // All three must have the same sign (or zero) -> inside projected triangle
+  // We allow exactly zero to support watertight edges/vertices
+  if (any(UVW < 0.f) & any(UVW > 0.f))
+    return false;
+
+  float det = UVW.x + UVW.y + UVW.z;
+  if (abs(det) <= 1e-9f) return false;               // degenerate projected triangle
+
+  bc = UVW/det;
+  t = dot(v012y, bc);
+  return true;
+}
+
+// Jolt-style 2-wide SoA ray-vs-2-triangles for closest-hit rays. Sized for our quad-leaf use case
+// (2 triangles per leaf). Behavior-preserving against the scalar RayTriangleIntersect in this
+// file -- read its cull and bary-tolerance code first.
+// Returns 2 distances (+inf = miss) and SoA bary coords (u, v) per lane.
+//
+// Cull / degeneracy contract matches scalar RayTriangleIntersect:
+//   * BACKFACE_CULLING: reject only signed det < -kEpsilon (front-facing tiny-det hits are kept;
+//     near-degenerate is rejected later by bary-tolerance check via |det|-scaled thresholds).
+//   * Zero-area / degenerate triangles (det effectively zero) are rejected by the algorithm itself.
+//     Real meshes can contain degenerates (T-junctions, bad authoring, FTZ-flushed thin geom);
+//     the Jolt sign-flip trick has a blind spot at det=u=v=t=0 where all bary checks trivially
+//     pass, so an explicit "true-zero" guard is required. Threshold is "true zero / denormal"
+//     (~FLT_MIN) -- well below any real triangle's area, so not a precision compromise.
+//
+// Bary tolerance: u >= -eps*|det|, v >= -eps*|det|, u+v <= |det|*(1+2*eps). Mirrors scalar's
+// `bc.x < -TRACE_EPSILON || bc.y < -TRACE_EPSILON || bc.x+bc.y > TRACE_ONE_PLUS_EPSILON2` checks.
+// NOTE: GPU scalar does NOT have a `bc.x > 1+eps` upper-bound check (CPU scalar does); we omit it
+// here to match the GPU contract.
+void RayTriangle2_SoA(
+    float3 orig, float3 dir,
+    float2 v0x, float2 v0y, float2 v0z,
+    float2 v1x, float2 v1y, float2 v1z,
+    float2 v2x, float2 v2y, float2 v2z,
+    out float2 outT, out float2 outU, out float2 outV)
+{
+  float2 e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
+  float2 e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+  float2 px = dir.y * e2z - dir.z * e2y;
+  float2 py = dir.z * e2x - dir.x * e2z;
+  float2 pz = dir.x * e2y - dir.y * e2x;
+  float2 det = e1x * px + e1y * py + e1z * pz;
+  uint2 detSignMask = asuint(det) & 0x80000000u;
+  float2 absDet = abs(det);
+#if BACKFACE_CULLING
+  // Match scalar's `det < -kEpsilon`: reject only strong backfaces. Front-facing 0 <= det < kEpsilon
+  // hits must still be considered; bary tolerance below filters near-degenerate naturally.
+  bool2 cullReject = det < -kEpsilon;
+#else
+  bool2 cullReject = bool2(false, false);
+#endif
+  // NaN guard for the division: clamp true-zero/denormal det to 1.0 so rcp doesn't produce inf.
+  // Uses the SAME threshold as the `degenerate` mask below so the two cannot disagree -- if a lane
+  // is bumped to detSafe=1, it must also be excluded from noHit, otherwise t/bc are computed with
+  // the wrong divisor.
+  bool2 degenerate = absDet < 1.0e-37f;
+  float2 detSafe = select(degenerate, 1.0f, absDet);
+
+  float2 sx = orig.x - v0x, sy = orig.y - v0y, sz = orig.z - v0z;
+  float2 u = asfloat(asuint(sx * px + sy * py + sz * pz) ^ detSignMask);
+  float2 qx = sy * e1z - sz * e1y;
+  float2 qy = sz * e1x - sx * e1z;
+  float2 qz = sx * e1y - sy * e1x;
+  float2 v = asfloat(asuint(dir.x * qx + dir.y * qy + dir.z * qz) ^ detSignMask);
+  float2 t = asfloat(asuint(e2x * qx + e2y * qy + e2z * qz) ^ detSignMask);
+
+  float2 epsAbsDet = absDet * TRACE_EPSILON;
+  bool2 noHit = cullReject | degenerate |
+                (u < -epsAbsDet) | (v < -epsAbsDet) | ((u + v) > absDet + 2.0f * epsAbsDet) | (t < 0);
+  float2 invDet = rcp(detSafe);
+  outU = u * invDet;
+  outV = v * invDet;
+  outT = select(noHit, asfloat(0x7F800000u), t * invDet); // +inf for misses
+}
+
+// Lean 2-wide ray-vs-2-triangles for any-hit (shadow) rays. No epsilon, no division, no t/u/v
+// output -- just "does any lane hit?". Saves a rcp + 3 muls + the select vs RayTriangle2_SoA.
+//
+// Degenerate (zero-area) triangles are rejected internally via `absDet < 1e-37` -- the algorithm
+// cannot trust the caller to filter them (real meshes have degenerates from T-junctions, bad
+// authoring, single-leaf padding, etc.). The Jolt sign-flip trick has a blind spot at det=u=v=t=0
+// where all bary checks trivially pass, so an explicit "true-zero" guard is required.
+//
+// NOT behavior-preserving against the scalar RayTriangleIntersectShadow: this path drops the
+// TRACE_EPSILON edge band (u/v < 0 instead of < -eps*|det|, u+v > |det| instead of |det|*(1+2eps)).
+// Intentional trade-off: shadow rays don't need shared-edge precision -- soft-sun-disk sampling
+// and blue-noise dither already mask single-pixel edge misses. Use RayTriangle2_SoA for closest-hit.
+bool RayTriangle2_SoA_AnyHit(
+    float3 orig, float3 dir,
+    float2 v0x, float2 v0y, float2 v0z,
+    float2 v1x, float2 v1y, float2 v1z,
+    float2 v2x, float2 v2y, float2 v2z)
+{
+  float2 e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
+  float2 e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+  float2 px = dir.y * e2z - dir.z * e2y;
+  float2 py = dir.z * e2x - dir.x * e2z;
+  float2 pz = dir.x * e2y - dir.y * e2x;
+  float2 det = e1x * px + e1y * py + e1z * pz;
+  uint2 detSignMask = asuint(det) & 0x80000000u;
+  float2 absDet  = abs(det);                       // bit-clear, independent of signDet
+  float2 sx = orig.x - v0x, sy = orig.y - v0y, sz = orig.z - v0z;
+  float2 u = asfloat(asuint(sx * px + sy * py + sz * pz) ^ detSignMask);
+  float2 qx = sy * e1z - sz * e1y;
+  float2 qy = sz * e1x - sx * e1z;
+  float2 qz = sx * e1y - sy * e1x;
+  float2 v = asfloat(asuint(dir.x * qx + dir.y * qy + dir.z * qz) ^ detSignMask);
+  float2 t = asfloat(asuint(e2x * qx + e2y * qy + e2z * qz) ^ detSignMask);
+  bool2 degenerate = absDet < 1.0e-37f;
+  bool2 noHit = degenerate | (u < 0) | (v < 0) | ((u + v) > absDet) | (t < 0);
+  return !noHit.x || !noHit.y;
+}
+
+// 4-wide SoA closest-hit, sized for a whole double-quad leaf (4 sub-triangles: quad A tri 0/1,
+// quad B tri 0/1). Returns 4 hit distances (+inf = miss or >= tMax). No u/v output on purpose:
+// closest-hit traversal only needs the distance to pick the winning lane, and bary/normal are
+// recovered by a single refetch on that lane (see rayBLAS). Dropping the per-lane u/v keeps the
+// live-register count down -- the reason the 2-wide SoA closest path previously lost to scalar.
+// Cull / degeneracy / edge-tolerance contract matches RayTriangle2_SoA.
+float4 RayTriangle4_SoA(
+    float3 orig, float3 dir, float tMax,
+    float4 v0x, float4 v0y, float4 v0z,
+    float4 v1x, float4 v1y, float4 v1z,
+    float4 v2x, float4 v2y, float4 v2z)
+{
+  float4 e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
+  float4 e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+  float4 px = dir.y * e2z - dir.z * e2y;
+  float4 py = dir.z * e2x - dir.x * e2z;
+  float4 pz = dir.x * e2y - dir.y * e2x;
+  float4 det = e1x * px + e1y * py + e1z * pz;
+  uint4 detSignMask = asuint(det) & 0x80000000u;
+  float4 absDet = abs(det);
+#if BACKFACE_CULLING
+  bool4 cullReject = det < -kEpsilon;
+#else
+  bool4 cullReject = bool4(false, false, false, false);
+#endif
+  bool4 degenerate = absDet < 1.0e-37f;
+  float4 detSafe = select(degenerate, 1.0f, absDet);
+  float4 sx = orig.x - v0x, sy = orig.y - v0y, sz = orig.z - v0z;
+  float4 u = asfloat(asuint(sx * px + sy * py + sz * pz) ^ detSignMask);
+  float4 qx = sy * e1z - sz * e1y;
+  float4 qy = sz * e1x - sx * e1z;
+  float4 qz = sx * e1y - sy * e1x;
+  float4 v = asfloat(asuint(dir.x * qx + dir.y * qy + dir.z * qz) ^ detSignMask);
+  float4 t = asfloat(asuint(e2x * qx + e2y * qy + e2z * qz) ^ detSignMask);
+  float4 epsAbsDet = absDet * TRACE_EPSILON;
+  bool4 noHit = cullReject | degenerate |
+                (u < -epsAbsDet) | (v < -epsAbsDet) | ((u + v) > absDet + 2.0f * epsAbsDet) | (t < 0);
+  float4 tDist = t * rcp(detSafe);
+  return select(noHit | (tDist >= tMax), asfloat(0x7F800000u), tDist); // +inf for misses / beyond tMax
+}
+
+// 4-wide any-hit (shadow) over a whole double-quad leaf. Lean variant matching RayTriangle2_SoA_AnyHit:
+// no division, no edge-tolerance band. Degenerate lanes (single quad / single tri / absent quad B
+// collapse to zero area) are rejected by the absDet < 1e-37 guard.
+bool RayTriangle4_SoA_AnyHit(
+    float3 orig, float3 dir,
+    float4 v0x, float4 v0y, float4 v0z,
+    float4 v1x, float4 v1y, float4 v1z,
+    float4 v2x, float4 v2y, float4 v2z)
+{
+  float4 e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
+  float4 e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+  float4 px = dir.y * e2z - dir.z * e2y;
+  float4 py = dir.z * e2x - dir.x * e2z;
+  float4 pz = dir.x * e2y - dir.y * e2x;
+  float4 det = e1x * px + e1y * py + e1z * pz;
+  uint4 detSignMask = asuint(det) & 0x80000000u;
+  float4 absDet  = abs(det);                       // bit-clear, independent of signDet
+  float4 sx = orig.x - v0x, sy = orig.y - v0y, sz = orig.z - v0z;
+  float4 u = asfloat(asuint(sx * px + sy * py + sz * pz) ^ detSignMask);
+  float4 qx = sy * e1z - sz * e1y;
+  float4 qy = sz * e1x - sx * e1z;
+  float4 qz = sx * e1y - sy * e1x;
+  float4 v = asfloat(asuint(dir.x * qx + dir.y * qy + dir.z * qz) ^ detSignMask);
+  float4 t = asfloat(asuint(e2x * qx + e2y * qy + e2z * qz) ^ detSignMask);
+
+  bool4 degenerate = absDet < 1.0e-37f;
+  bool4 noHit = degenerate | (u < 0) | (v < 0) | ((u + v) > absDet) | (t < 0);
+  return any(!noHit);
+}
+
+bool RayTriangleIntersectShadow(
+    float3 orig,
+    float3 dir,
+    float3 v0,
+    float3 v1,
+    float3 v2)
+{
+  float3 e0 = v1-v0, e1 = v2-v0;
+  float3 s1 = cross(dir.xyz, e1);
+  float det = dot(s1, e0);
+  bool degenerate = abs(det) < 1e-37f; // detSafe divide, same as RayTriangleIntersect
+  float  invd = rcp(degenerate ? 1.0f : det);
+  float3 d = orig.xyz - v0;
+  float2 bc;
+  bc.x = dot(d, s1) * invd;
+  const float3 s2 = cross(d, e0);
+  bc.y = dot(dir.xyz, s2) * invd;
+  float ct = dot(e1, s2) * invd;
+  bool hit = bc.x >= -TRACE_EPSILON & bc.y >= -TRACE_EPSILON & (bc.x + bc.y) <= TRACE_ONE_PLUS_EPSILON2 & ct >= 0.0;
+  return hit & !degenerate;
+}
+
+#endif

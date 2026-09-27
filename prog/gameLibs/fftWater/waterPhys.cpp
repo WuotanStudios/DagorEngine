@@ -203,7 +203,7 @@ void WaterNVPhysics::syncRun(int nextLastTick)
   currentJobSize = totalJobSize;
   int64_t reft = ref_time_ticks();
   doJob();
-  debug("sync to %d in %dus", nextLastTick, get_time_usec(reft));
+  // debug("sync to %d in %dus", nextLastTick, get_time_usec(reft));
 
   /*int64_t reft = ref_time_ticks();
   updateH0();
@@ -555,10 +555,13 @@ int WaterNVPhysics::intersectRayWithOcean(double time, Point3 &result, float &T,
     }
     // getting t to travel along the ray
     t = t_multiplier * (v_extract_y(position) - v_extract_z(displacements));
+    if (outT >= T && t > 0.f) // at the segment end and still above the surface: no hit inside it
+      return 0;
 
-    // traveling along the ray
-    position = v_madd(v_splats(t), v_dir, position);
-    outT += t;
+    // traveling along the ray, never past the segment end: an overshoot may have crossed the surface before it
+    const float nextT = min(outT + t, T);
+    position = v_madd(v_splats(nextT - outT), v_dir, position);
+    outT = nextT;
 
     if (t < t_threshold || verticalTrace)
     {
@@ -640,7 +643,7 @@ int WaterNVPhysics::intersectRayWithOcean(double time, Point3 &result, float &T,
   return 0;
 }
 
-// Public function available for exteral code
+// Public function available for external code
 int WaterNVPhysics::intersectSegment(double time, const Point3 &vStart, const Point3 &vEnd, float &fResult)
 {
   // G_ASSERT(!check_nan(vStart));
@@ -697,8 +700,10 @@ vec4f WaterNVPhysics::getRenderedHeight(float x, float z)
     return v_ldu(result);
   int triangleX = floorf((x - renderGridOffset.x) / renderGridAlign);
   int triangleZ = floorf((z - renderGridOffset.y) / renderGridAlign);
-  float px = floorf(x / renderGridAlign) * renderGridAlign;
-  float pz = floorf(z / renderGridAlign) * renderGridAlign;
+  // quad corners must lie on the same offset grid as the triangle parity above,
+  // otherwise the chosen diagonal does not match the render mesh triangulation
+  float px = renderGridOffset.x + triangleX * renderGridAlign;
+  float pz = renderGridOffset.y + triangleZ * renderGridAlign;
   float d = renderGridAlign;
   Point2 p(x, z);
   Point2 points[4] = {Point2(px, pz), Point2(px + d, pz), Point2(px, pz + d), Point2(px + d, pz + d)};

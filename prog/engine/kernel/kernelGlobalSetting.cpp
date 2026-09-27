@@ -7,7 +7,6 @@
 #include <startup/dag_globalSettings.h>
 #include <debug/dag_traceInpDev.h>
 #include <startup/dag_demoMode.h>
-#include <util/dag_loadingProgress.h>
 #include <debug/dag_debug.h>
 #include <debug/dag_logSys.h>
 #if __GNUC__
@@ -15,10 +14,26 @@
 #endif
 #include <stdio.h>
 #include <string.h>
-#include <supp/dag_define_KRNLIMP.h>
 
+#if _TARGET_PC_WIN
+#include <osApiWrappers/dag_symHlp.h>
+#include <Windows.h>
+#endif
 
 bool dgs_execute_quiet = false;
+
+void (*dgs_on_memory_leak_detected_handler)(const char *) =
+#if _TARGET_PC_WIN
+  [](const char *text) {
+    if (!dgs_execute_quiet)
+      ::MessageBoxA(NULL, text, "Memory leak", MB_ICONERROR);
+    symhlp_close();
+    ExitProcess(113);
+  };
+#else
+  [](const char *) {};
+#endif
+
 void (*dgs_post_shutdown_handler)() = NULL;
 void (*dgs_pre_shutdown_handler)() = NULL;
 bool (*dgs_fatal_handler)(const char *msg, const char *call_stack, const char *file, int line) = NULL;
@@ -30,7 +45,8 @@ thread_local int (*dgs_fill_fatal_context)(char *buff, int sz, bool terse) = NUL
 int (*dgs_fill_fatal_context)(char *buff, int sz, bool terse) = NULL;
 #endif
 void (*dgs_report_fatal_error)(const char *title, const char *msg, const char *call_stack) = NULL;
-void (*loading_progress_point_cb)() = NULL;
+void (*dgs_report_video_driver_init_failed)() = NULL;
+void (*dgs_report_gpu_out_of_memory)() = NULL;
 void (*dgs_on_swap_callback)() = NULL;
 void (*dgs_on_dagor_cycle_start)() = NULL;
 void (*dgs_on_promoted_log_tag)(int tag, const char *fmt, const void *arg, int anum) = NULL;
@@ -47,6 +63,7 @@ bool dagor_demo_mode = false;
 
 WindowMode dgs_window_mode = WindowMode::FULLSCREEN_EXCLUSIVE;
 int dagor_frame_no_int = 0;
+int dagor_frames_presented_int = 0;
 
 uint32_t dagor_global_frame_id = 0;
 

@@ -3,6 +3,7 @@
 #include "scriptBinding.h"
 #include "guiScene.h"
 #include "dargDebugUtils.h"
+#include "statefulComp.h"
 
 #include <daRg/dag_element.h>
 #include <daRg/dag_renderObject.h>
@@ -19,7 +20,6 @@
 #include "behaviors/bhvSlider.h"
 #include "behaviors/bhvPannable.h"
 #include "behaviors/bhvPannable2Touch.h"
-#include "behaviors/bhvSwipeScroll.h"
 #include "behaviors/bhvMoveResize.h"
 #include "behaviors/bhvSmoothScrollStack.h"
 #include "behaviors/bhvMarquee.h"
@@ -27,6 +27,8 @@
 #include "behaviors/bhvScrollEvent.h"
 #include "behaviors/bhvInspectPicker.h"
 #include "behaviors/bhvRtPropUpdate.h"
+#include "behaviors/bhvBoundProps.h"
+#include "behaviors/bhvVirtualList.h"
 #include "behaviors/bhvRecalcHandler.h"
 #include "behaviors/bhvDragAndDrop.h"
 #include "behaviors/bhvEatInput.h"
@@ -41,8 +43,11 @@
 #include "behaviors/bhvTrackMouse.h"
 #include "behaviors/bhvMoveToArea.h"
 #include "behaviors/bhvProcessPointingInput.h"
+#include "behaviors/bhvProcessKeyInput.h"
 #include "behaviors/bhvProcessGesture.h"
 #include "behaviors/bhvTextAreaEdit.h"
+#include "behaviors/bhvJoystickScroll.h"
+#include "behaviors/bhvImageLoadState.h"
 #include "guiGlobals.h"
 
 #include "scriptUtil.h"
@@ -64,7 +69,7 @@
 #include <videoPlayer/dag_videoPlayer.h>
 #include <sound/dag_genAudio.h>
 
-#include <sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
 #include <drv/hid/dag_hiXInputMappings.h>
 #include <gesture/gestureDetector.h>
 
@@ -131,6 +136,7 @@ static void register_constants(HSQUIRRELVM vm)
     .Const("ALIGN_RIGHT", ALIGN_RIGHT)
     .Const("ALIGN_BOTTOM", ALIGN_BOTTOM)
     .Const("ALIGN_CENTER", ALIGN_CENTER)
+    .Const("PLACE_DEFAULT", PLACE_DEFAULT)
 
     .CONST(VECTOR_WIDTH)
     .CONST(VECTOR_COLOR)
@@ -162,6 +168,10 @@ static void register_constants(HSQUIRRELVM vm)
 
     .CONST(O_HORIZONTAL)
     .CONST(O_VERTICAL)
+
+    .Const("TEXFMT_SRGB_IN_UNORM", SRGB_IN_UNORM)
+    .Const("TEXFMT_UNORM", UNORM)
+    .Const("TEXFMT_SRGB_DECAL", SRGB_DECAL)
 
     .CONST(TOVERFLOW_CLIP)
     .CONST(TOVERFLOW_CHAR)
@@ -422,7 +432,7 @@ Keeps Aspect ratio and cover all component size. So image can be outside compone
 
 static SQInteger get_def_font(HSQUIRRELVM vm)
 {
-  const SQChar *name;
+  const char *name;
   sq_getstring(vm, 2, &name);
   logerr("UI font %s not found", name ? name : "<n/a>");
   sq_pushinteger(vm, 0);
@@ -536,13 +546,14 @@ static void register_std_behaviors(SqModules *module_mgr)
 #define REG_BHV_DATA(name) Sqrat::Class<name, Sqrat::NoConstructor<name>> sq##name(vm, #name);
   REG_BHV_DATA(BhvButtonData)
   REG_BHV_DATA(BhvPannableData)
-  REG_BHV_DATA(BhvSwipeScrollData)
   REG_BHV_DATA(BhvPannable2touchData)
   REG_BHV_DATA(BhvTransitionSizeData)
   REG_BHV_DATA(BhvMarqueeData)
   REG_BHV_DATA(BhvSliderData)
   REG_BHV_DATA(BhvMoveResizeData)
   REG_BHV_DATA(BhvPieMenuData)
+  REG_BHV_DATA(BhvBoundPropsData)
+  REG_BHV_DATA(BhvVirtualListData)
 #undef REG_BHV_DATA
 
   Sqrat::Table tblBhv(vm);
@@ -587,9 +598,6 @@ static void register_std_behaviors(SqModules *module_mgr)
   @code Properties for behavior and rendObj:
     text: string
     textOverflowY = TOVERFLOW_LINE // TOVERFLOW_CLIP, TOVERFLOW_CHAR, TOVERFLOW_WORD
-    textOverflowX = TOVERFLOW_CHAR // TOVERFLOW_CLIP, TOVERFLOW_CHAR, TOVERFLOW_WORD
-    ellipsis = true
-    ellipsisSepLine = true
   code@
   */
   BHV(TextArea, bhv_text_area)
@@ -601,8 +609,6 @@ static void register_std_behaviors(SqModules *module_mgr)
   BHV(Pannable, bhv_pannable)
   ///@const Pannable2touch
   BHV(Pannable2touch, bhv_pannable_2touch)
-  ///@const SwipeScroll
-  BHV(SwipeScroll, bhv_swipe_scroll)
   ///@const MoveResize
   BHV(MoveResize, bhv_move_resize)
   ///@const ComboPopup
@@ -621,6 +627,36 @@ static void register_std_behaviors(SqModules *module_mgr)
     code@
   */
   BHV(Marquee, bhv_marquee)
+  /* qdox @const VirtualList
+
+    Builds only the items inside the scroll viewport. Items come from
+    'virtualItems' instead of 'children'; the skipped runs become empty spacer
+    children so the content extent, and the scrollbar with it, cover the whole
+    list. Every item must lay out at exactly its declared height, carry no
+    margin on the flow axis, and the container no gap.
+
+    The component must be defined by a function: moving the window rebuilds it.
+    'children', 'gap' and 'sortChildren' must be left unset - each of them
+    breaks the child-to-item mapping - and the flow axis must stay aligned to
+    its start, since the other alignments offset by the size of what was built.
+
+    @code Properties:
+      virtualItems: array of component descriptions (used instead of children).
+                    Unlike 'children', a null entry is not skipped - it keeps the
+                    height declared for it, leaving an empty slot. To drop a row,
+                    leave it out of both this and virtualItemHeights. A builder
+                    entry must return a description, never null: a null result
+                    lays out at nothing and loses the height declared for it
+      virtualItemHeight: float, size of one item along the flow axis
+      virtualItemHeights: array of float, per item, overrides virtualItemHeight
+      virtualTail: array of component descriptions built after every item, whatever
+                   the window; their own size covers the end of the content, so
+                   their height need not be declared
+      virtualOverscan: integer, items kept built beyond the viewport, default 3
+      virtualInitialCount: integer, window size before the first layout, default 32
+    code@
+  */
+  BHV(VirtualList, bhv_virtual_list)
   /* qdox @const WheelScroll
 
     @code Properties:
@@ -640,6 +676,8 @@ static void register_std_behaviors(SqModules *module_mgr)
   BHV(InspectPicker, bhv_inspect_picker)
   ///@const RtPropUpdate
   BHV(RtPropUpdate, bhv_rt_prop_update)
+  ///@const BoundProps
+  BHV(BoundProps, bhv_bound_props)
   ///@const RecalcHandler
   BHV(RecalcHandler, bhv_recalc_handler)
   ///@const DragAndDrop
@@ -684,12 +722,29 @@ static void register_std_behaviors(SqModules *module_mgr)
   BHV(MoveToArea, bhv_move_to_area)
   ///@const ProcessPointingInput
   BHV(ProcessPointingInput, bhv_process_pointing_input)
+  ///@const ProcessKeyInput
+  BHV(ProcessKeyInput, bhv_process_key_input)
   ///@const ProcessGesture
   BHV(ProcessGesture, bhv_process_gesture)
   ///@const EatInput
   BHV(EatInput, bhv_eat_input)
   ///@const TextAreaEdit
   BHV(TextAreaEdit, bhv_text_area_edit)
+  ///@const JoystickScroll
+  BHV(JoystickScroll, bhv_joystick_scroll)
+  /* qdox @const ImageLoadState
+
+    Reports async loading state of a Picture, so that script can show its own placeholder.
+
+    @code fields
+      image:Picture = picture to observe. The behavior never starts the load, it only reports it
+      imageLoading:Watched = true while the load is in flight. Seed it with Picture.prefetch(), which starts the load
+    code@
+
+    @note
+      See mkAsyncImage in darg_library.nut, it wires both up.
+  */
+  BHV(ImageLoadState, bhv_image_load_state)
 
 #undef BHV
   ///@resetscope
@@ -806,7 +861,8 @@ SQInteger calc_str_box(HSQUIRRELVM vm)
     if (tp == OT_NULL)
       continue;
 
-    G_ASSERT(params.IsNull());
+    if (!params.IsNull())
+      return sq_throwerror(vm, "Multiple params tables provided; only one is allowed");
 
     if (tp == OT_TABLE)
       params = Sqrat::Var<Sqrat::Table>(vm, arg).value;
@@ -814,8 +870,10 @@ SQInteger calc_str_box(HSQUIRRELVM vm)
     {
       G_ASSERT(tp == OT_CLOSURE || tp == OT_NATIVECLOSURE);
       Sqrat::Function f(vm, Sqrat::Object(vm), Sqrat::Var<Sqrat::Object>(vm, arg).value);
-      if (!f.Evaluate(params))
+      auto evalRes = f.Eval<Sqrat::Object>();
+      if (!evalRes)
         return sq_throwerror(vm, "Function call failed");
+      params = SQRAT_STD::move(evalRes.value());
       if (params.GetType() != OT_TABLE && params.GetType() != OT_NULL)
         return sq_throwerror(vm, "Function must return table or null");
     }
@@ -850,12 +908,12 @@ SQInteger calc_str_box(HSQUIRRELVM vm)
   Offsets padding;
   Sqrat::Object objPadding = params.RawGetSlot(csk->padding);
   const char *errMsg = nullptr;
-  if (!script_parse_offsets(nullptr, objPadding, &padding.x, &errMsg))
+  if (!script_parse_offsets(nullptr, objPadding, padding.ptr(), &errMsg))
     darg_assert_trace_var(errMsg, params, csk->padding);
 
   Sqrat::Array res(vm, 2);
-  res.SetValue(SQInteger(0), box.x + padding.left() + padding.right());
-  res.SetValue(SQInteger(1), box.y + padding.top() + padding.bottom());
+  res.SetValue(SQInteger(0), box.x + padding.l + padding.r);
+  res.SetValue(SQInteger(1), box.y + padding.t + padding.b);
   sq_pushobject(vm, res);
   return 1;
 }
@@ -871,6 +929,34 @@ static SQInteger scrollhandler_ctor(HSQUIRRELVM vm)
 }
 
 
+static SQInteger scrollhandler_scroll_to_children(HSQUIRRELVM vm)
+{
+  ScrollHandler *handler = Sqrat::Var<ScrollHandler *>(vm, 1).value;
+  if (!handler)
+    return sq_throwerror(vm, "scrollToChildren: bad 'this'");
+
+  Sqrat::Object finder = Sqrat::Var<Sqrat::Object>(vm, 2).value;
+
+  SQInteger depth = 0;
+  sq_getinteger(vm, 3, &depth);
+
+  SQBool xb = SQFalse, yb = SQFalse;
+  sq_getbool(vm, 4, &xb);
+  sq_getbool(vm, 5, &yb);
+
+  SQInteger alignX = PLACE_DEFAULT;
+  SQInteger alignY = PLACE_DEFAULT;
+  const SQInteger nargs = sq_gettop(vm);
+  if (nargs >= 6)
+    sq_getinteger(vm, 6, &alignX);
+  if (nargs >= 7)
+    sq_getinteger(vm, 7, &alignY);
+
+  handler->scrollToChildren(finder, (int)depth, xb != SQFalse, yb != SQFalse, (int)alignX, (int)alignY);
+  return 0;
+}
+
+
 ///@module daRg
 void bind_script_classes(SqModules *module_mgr, Sqrat::Table &exports)
 {
@@ -879,17 +965,19 @@ void bind_script_classes(SqModules *module_mgr, Sqrat::Table &exports)
   G_ASSERT(sqvm == exports.GetVM());
 
   ///@class daRg/ScrollHandler
-  Sqrat::DerivedClass<ScrollHandler, BaseObservable, Sqrat::NoCopy<ScrollHandler>> scrollHandler(sqvm, "ScrollHandler");
+  Sqrat::DerivedClass<ScrollHandler, WatchedHandle, Sqrat::NoCopy<ScrollHandler>> scrollHandler(sqvm, "ScrollHandler");
   scrollHandler //
     .SquirrelCtor(scrollhandler_ctor, 1, "x")
     .Func("scrollToX", &ScrollHandler::scrollToX)
     .Func("scrollToY", &ScrollHandler::scrollToY)
-    .Func("scrollToChildren", &ScrollHandler::scrollToChildren)
+    .SquirrelFuncDeclString(scrollhandler_scroll_to_children,
+      "instance.scrollToChildren(finder: function, depth: int, x: bool, y: bool, [align_x: int, align_y: int]): null")
     .Prop("elem", &ScrollHandler::getElem)
     /**/;
 
   ///@class daRg/JoystickAxisObservable
-  Sqrat::DerivedClass<JoystickAxisObservable, BaseObservable> joyAxisObservable(sqvm, "JoystickAxisObservable");
+  Sqrat::DerivedClass<JoystickAxisObservable, WatchedHandle, Sqrat::NoCopy<JoystickAxisObservable>> joyAxisObservable(sqvm,
+    "JoystickAxisObservable");
   joyAxisObservable //
     .Func("get", &JoystickAxisObservable::getValue)
     .Prop("value", &JoystickAxisObservable::getValue)
@@ -906,16 +994,18 @@ void bind_script_classes(SqModules *module_mgr, Sqrat::Table &exports)
   ///@class daRg/Picture
   Sqrat::Class<Picture, Sqrat::NoCopy<Picture>> pictureClass(sqvm, "Picture");
   pictureClass //
-    .SquirrelCtor(picture_script_ctor<Picture>, 0, ".o|s")
+    .SquirrelCtor(picture_script_ctor<Picture>, 0, ". o|s o|t")
     .Func("getLoadedPicSize", &Picture::getLoadedPicSize)
+    .Func("prefetch", &Picture::prefetch)
     /**/;
 
   ///@class daRg/PictureImmediate
   ///@extends Picture
   Sqrat::DerivedClass<PictureImmediate, Picture, Sqrat::NoCopy<PictureImmediate>> immediatePictureClass(sqvm, "PictureImmediate");
   immediatePictureClass //
-    .SquirrelCtor(picture_script_ctor<PictureImmediate>, 0, ".o|s")
+    .SquirrelCtor(picture_script_ctor<PictureImmediate>, 0, ". o|s o|t")
     .Func("getLoadedPicSize", &PictureImmediate::getLoadedPicSize)
+    .Func("prefetch", &PictureImmediate::prefetch)
     /**/;
 
   ///@class daRg/FormattedText
@@ -974,6 +1064,8 @@ void bind_script_classes(SqModules *module_mgr, Sqrat::Table &exports)
     .Func("clear", &BhvMoveToAreaTarget::clear)
     /**/;
 
+  bind_stateful_comp(sqvm, exports);
+
   exports.Bind("ElemGroup", elemGroup);
   exports.Bind("ScrollHandler", scrollHandler);
   exports.Bind("Picture", pictureClass);
@@ -982,15 +1074,15 @@ void bind_script_classes(SqModules *module_mgr, Sqrat::Table &exports)
   exports.Bind("MoveToAreaTarget", sqBhvMoveToAreaTarget);
   ///@module daRg
   exports //
-    .SquirrelFuncDeclString(encode_e3dcolor, "pure Color(r: number, g: number, b: number, [alpha: number]): int")
-    .SquirrelFuncDeclString(calc_screen_w_percent, "pure sw(percent: number): number")
-    .SquirrelFuncDeclString(calc_screen_h_percent, "pure sh(percent: number): number")
-    .SquirrelFuncDeclString(make_size<SizeSpec::FLEX>, "pure flex([weight: number]): userdata")
-    .SquirrelFunc("fontH", make_size<SizeSpec::FONT_H>, 2, ".n")
-    .SquirrelFuncDeclString(make_size<SizeSpec::PARENT_W>, "pure pw(percent: number): userdata")
-    .SquirrelFuncDeclString(make_size<SizeSpec::PARENT_H>, "pure ph(percent: number): userdata")
-    .SquirrelFuncDeclString(make_size<SizeSpec::ELEM_SELF_W>, "pure elemw(percent: number): userdata")
-    .SquirrelFuncDeclString(make_size<SizeSpec::ELEM_SELF_H>, "pure elemh(percent: number): userdata")
+    .SquirrelFuncDeclString(encode_e3dcolor, "pure fastcall Color(r: number, g: number, b: number, [alpha: number]): int")
+    .SquirrelFuncDeclString(calc_screen_w_percent, "pure fastcall sw(percent: number): number")
+    .SquirrelFuncDeclString(calc_screen_h_percent, "pure fastcall sh(percent: number): number")
+    .SquirrelFuncDeclString(make_size<SizeSpec::FLEX>, "pure fastcall flex([weight: number]): userdata")
+    .SquirrelFuncDeclString(make_size<SizeSpec::FONT_H>, "pure fastcall fontH(percent: number): userdata")
+    .SquirrelFuncDeclString(make_size<SizeSpec::PARENT_W>, "pure fastcall pw(percent: number): userdata")
+    .SquirrelFuncDeclString(make_size<SizeSpec::PARENT_H>, "pure fastcall ph(percent: number): userdata")
+    .SquirrelFuncDeclString(make_size<SizeSpec::ELEM_SELF_W>, "pure fastcall elemw(percent: number): userdata")
+    .SquirrelFuncDeclString(make_size<SizeSpec::ELEM_SELF_H>, "pure fastcall elemh(percent: number): userdata")
     .SquirrelFunc("locate_element_source", locate_element_source, 2, ".x")
     .SquirrelFunc("get_element_info", get_element_info, 2, ".x")
     .SquirrelFunc("resolve_button", resolve_button, 2, ".s")

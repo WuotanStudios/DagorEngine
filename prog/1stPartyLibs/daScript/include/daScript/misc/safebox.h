@@ -216,11 +216,11 @@ namespace das {
     template <typename V>
     using safebox_map = das_hash_map<uint64_t,V,skip_hash,das::equal_to<uint64_t>>;
 
-    template <typename DataType>
+    template <typename DataType, typename VT = smart_ptr<DataType>>
     struct safebox {
     public:
-        typedef smart_ptr<DataType> ValueType;
-        typedef safebox<ValueType> this_type;
+        typedef VT ValueType;
+        typedef safebox<DataType,VT> this_type;
     public:
         safebox() {}
         safebox( this_type && sb ) {
@@ -279,6 +279,15 @@ namespace das {
             }
             locked = saveLock;
             tryResolve();
+        }
+        template <typename TT>
+        __forceinline void foreach ( TT && closure ) const {
+            auto saveLock = locked;
+            locked = true;
+            for ( auto & obj : objectsInOrder ) {
+                closure(obj);
+            }
+            locked = saveLock;
         }
         template <typename TT>
         __forceinline void foreach_with_hash ( TT && closure ) {
@@ -386,6 +395,6 @@ namespace das {
         safebox_map<ValueType>           objects;
         vector<ValueType>                objectsInOrder;
         vector<pair<uint64_t,ValueType>> postponed;
-        bool                             locked = false;
+        mutable bool                     locked = false;
     };
 }

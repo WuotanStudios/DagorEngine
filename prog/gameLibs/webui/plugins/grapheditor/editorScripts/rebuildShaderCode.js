@@ -2,18 +2,56 @@
 
 var offlineSettings = {};
 
+var isWindows = (function() {
+  try {
+    var args = getCommandLineArgs();
+    for (var i = 0; i < args.length; i++)
+      if (args[i].length >= 2 && args[i][1] === ':')
+        return true;
+    return false;
+  } catch(e) {
+    return true;
+  }
+})();
+
 function normalizeSlashes(s)
 {
-  return s.split("/").join("\\");
+  if (isWindows)
+    return s.split("/").join("\\");
+  return s.split("\\").join("/");
 }
 
-
-function getDirectoryFilesList(dir)
+function runCommandGetOutput(cmd, tag)
 {
-  var tmpFileName = normalizeSlashes(dir) + "\\__temp__";
-  systemExec("call dir /b " + normalizeSlashes(offlineSettings.globalSubgraphsDir) + " > " + tmpFileName);
-  var files = offlineReadFileToString(tmpFileName);
-  systemExec("del " + tmpFileName);
+  var tmpFileName = "__temp__" + tag;
+  if (isWindows)
+    systemExec("(" + cmd + ")" + " > " + tmpFileName);
+  else
+    systemExec(cmd + " > " + tmpFileName);
+  var output = offlineReadFileToString(tmpFileName);
+  if (isWindows)
+    systemExec("del " + tmpFileName);
+  else
+    systemExec("rm -f " + tmpFileName);
+  return output;
+}
+
+function getDirectoryFilesList(dir, tag)
+{
+  if (isWindows)
+  {
+    var exists = runCommandGetOutput("if exist " + dir + " (echo yes) else (echo no)", tag);
+    if (exists.includes("no"))
+      return [];
+    var files = runCommandGetOutput("dir /b " + dir, tag);
+  }
+  else
+  {
+    var exists = runCommandGetOutput("if [ -d " + dir + " ]; then echo yes; else echo no; fi", tag);
+    if (exists.includes("no"))
+      return [];
+    var files = runCommandGetOutput("ls " + dir, tag);
+  }
   files = files.split("\r").join("");
   return files.split("\n");
 }
@@ -23,11 +61,14 @@ function renameFile(source, dest)
 {
   source = normalizeSlashes(source);
   dest = normalizeSlashes(dest);
-  systemExec('copy /b/v/y "' + source + '" "' + dest + '">nul && del "' + source + '">nul');
+  if (isWindows)
+    systemExec('copy /b/v/y "' + source + '" "' + dest + '">nul && del "' + source + '">nul');
+  else
+    systemExec('cp "' + source + '" "' + dest + '" && rm -f "' + source + '"');
 }
 
 
-function collectSubgraphs(dir)
+function collectSubgraphs(dir, tag)
 {
   var getSubstring = function(s, begin, end)
   {
@@ -36,13 +77,13 @@ function collectSubgraphs(dir)
 
   var out_file_names = [];
   var out_descriptions = "";
-  var files = getDirectoryFilesList(dir);
+  var files = getDirectoryFilesList(dir, tag);
   for (var i = 0; i < files.length; i++)
     if (files[i].indexOf(".json") >= 0)
     {
       var fname = files[i].split(".json")[0];
       out_file_names.push(fname);
-      var txt = offlineReadFileToString(offlineSettings.globalSubgraphsDir + "\\" + files[i]);
+      var txt = offlineReadFileToString(offlineSettings.globalSubgraphsDir + (isWindows ? "\\" : "/") + files[i]);
        
       if (txt.indexOf("[[plugin:" + pluginName + "]]") < 0)
         continue;
@@ -61,6 +102,20 @@ function collectSubgraphs(dir)
   return {fileNames: out_file_names, descriptions: out_descriptions};
 }
 
+function getFilename(path)
+{
+  if (path.length == 0)
+    return path;
+  var i = path.length - 1;
+  while (i >= 0)
+  {
+    if (path[i] == "/" || path[i] == "\\")
+      break;
+    --i;
+  }
+  return path.slice(i + 1, path.length);
+}
+
 
 function offlineRun()
 {
@@ -75,12 +130,85 @@ function offlineRun()
   }
 
   var additionalIncludesFn = offlineSettings["includes"] ? offlineSettings["includes"].split(';') : [];
+  var additionalIncludesPermTable = [];
+
+  var additionalIncludesFnFlat = [];
+
+  var maxGroupCount = NBS_PERM_LIMS.MAX_GROUP_COUNT;
+  var maxPermsPerGroup = NBS_PERM_LIMS.MAX_PERMS_PER_GROUP;
+
+  var group = 0;
+  for (var groupFnamesId in additionalIncludesFn)
+  {
+    var groupFnames = additionalIncludesFn[groupFnamesId];
+    if (groupFnames[0] !== '(' || groupFnames[groupFnames.length - 1] !== ')')
+    {
+      alert("dshl opt graph groups must be enclosed in parens");
+      return;
+    }
+    var permFiles = groupFnames.slice(1, -1).split(':');
+
+    // @HACK: coalesce disc identifiers back with their pathes
+    // @TODO: change identifiers to not have this issue (requires altering locShadersExp and a tools build)
+
+    {
+      var i = 0;
+      for (; i < permFiles.length; ++i)
+      {
+        if (permFiles[i].length <= 1 && i < permFiles.length - 1)
+        {
+          if (permFiles[i].length == 1)
+            permFiles[i + 1] = permFiles[i] + ":" + permFiles[i + 1];
+          permFiles.splice(i, 1);
+          --i;
+        }
+      }
+    }
+
+    if (permFiles.length < 1)
+    {
+      alert("Empty opt graph groups () are not allowed.");
+      return;
+    }
+    if (group >= maxGroupCount)
+    {
+      alert(
+        "NBS shader can't use more than " +
+        maxGroupCount + " permutation groups");
+      return;
+    }
+
+    var perm = 0;
+    for (var permFnameId in permFiles)
+    {
+      var permFname = permFiles[permFnameId];
+      if (perm >= maxPermsPerGroup)
+      {
+        alert(
+          "NBS shader can't use more than " +
+          maxPermsPerGroup + " optional permutation graphs in one group");
+        return;
+      }
+
+      var permFname = permFiles[permFnameId];
+      additionalIncludesFnFlat.push(permFname);
+      additionalIncludesPermTable.push({g: group, p: perm});
+
+      ++perm;
+    }
+
+    ++group;
+  }
+
+  additionalIncludesFn = additionalIncludesFnFlat;
 
   pluginName = offlineSettings.pluginName;
 
-  var subgraphs = collectSubgraphs(offlineSettings.globalSubgraphsDir);
+  var subgraphs = collectSubgraphs(offlineSettings.globalSubgraphsDir, getFilename(offlineSettings.outputFileName));
 
-  offlineBuild(offlineSettings.rootFileName, offlineSettings.outputFileName + ".x", subgraphs, additionalIncludesFn);
+  offlineBuild(
+    offlineSettings.rootFileName, offlineSettings.outputFileName + ".x",
+    subgraphs, additionalIncludesFn, additionalIncludesPermTable);
   renameFile(offlineSettings.outputFileName + ".x", offlineSettings.outputFileName);
 }
 

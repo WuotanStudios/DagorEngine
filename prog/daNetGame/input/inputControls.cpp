@@ -3,6 +3,8 @@
 #include <util/dag_string.h>
 #include <generic/dag_initOnDemand.h>
 
+#include "render/screencap.h"
+
 #include <ioSys/dag_fileIo.h>
 #include <ioSys/dag_dataBlock.h>
 #include <osApiWrappers/dag_direct.h>
@@ -12,6 +14,7 @@
 #include <startup/dag_globalSettings.h>
 #include <startup/dag_inpDevClsDrv.h>
 #include <drv/hid/dag_hiPointing.h>
+#include <drv/hid/dag_hiKeyboard.h>
 #include <drv/hid/dag_hiJoystick.h>
 #include <drv/hid/dag_hiGlobals.h>
 #include <drv/hid/dag_hiComposite.h>
@@ -22,11 +25,15 @@
 
 #include <sqrat.h>
 #include <quirrel_json/quirrel_json.h>
-#include <sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
+#include <sqEventBus/sqEventBus.h>
+#include <json/json.h>
 #include <ecs/scripts/sqBindEvent.h>
 #include <bindQuirrelEx/autoBind.h>
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <ecs/input/input.h>
 #include <ecs/input/message.h>
 
@@ -43,7 +50,9 @@
 #include <drv/dag_vr.h>
 #include <util/dag_delayedAction.h>
 
-#if _TARGET_C1 | _TARGET_C2
+#if _TARGET_PC_WIN
+#include <windows.h>
+#elif _TARGET_C1 | _TARGET_C2
 
 #endif
 
@@ -60,6 +69,10 @@ namespace controls
 {
 static eastl::unique_ptr<uiinput::MouseKbdHandler> ui_input_handler_val;
 static String user_setup_fname;
+
+#if _TARGET_PC_WIN
+static bool is_print_screen_key_down = false;
+#endif
 
 static bool input_controls_were_reset = false;
 static bool controls_were_reset() { return input_controls_were_reset; }
@@ -326,6 +339,10 @@ void init_control(const char *user_game_mode_input_cfg_fn)
   dblk::iterate_child_blocks(*gameControlsBlk.getBlockByNameEx("activateActionSetsOnInit"),
     [](const DataBlock &b) { dainput::activate_action_set(dainput::get_action_set_handle(b.getBlockName())); });
   // dainput::dump_action_bindings();
+#if _TARGET_PC_WIN
+  if (!RegisterHotKey(NULL, 1, 0, VK_SNAPSHOT)) // disable system printscreen (too slow and can be overriden by Win11)
+    debug("RegisterHotKey failed with %d", GetLastError());
+#endif
 }
 
 
@@ -357,9 +374,53 @@ void process_input(double /*dt*/)
     }
   }
 
+  static int prevGamepads = -1, prevKeyboards = -1, prevMice = -1;
+  int gamepads = 0;
+  if (::global_cls_drv_joy)
+    for (int i = 0, n = ::global_cls_drv_joy->getDeviceCount(); i < n; i++)
+      if (HumanInput::IGenJoystick *joy = ::global_cls_drv_joy->getDevice(i))
+        gamepads += joy->isConnected() ? 1 : 0;
+  int keyboards = ::global_cls_drv_kbd ? ::global_cls_drv_kbd->getDeviceCount() : 0;
+  int mice = ::global_cls_drv_pnt ? ::global_cls_drv_pnt->getDeviceCount() : 0;
+  if (gamepads != prevGamepads || keyboards != prevKeyboards || mice != prevMice)
+  {
+    prevGamepads = gamepads;
+    prevKeyboards = keyboards;
+    prevMice = mice;
+    Json::Value data;
+    data["gamepads"] = gamepads;
+    data["keyboards"] = keyboards;
+    data["mice"] = mice;
+    sqeventbus::send_event("input.devices_num_changed", data);
+  }
+
   dainput::process_actions_tick();
 }
 
+void check_system_keys()
+{
+#if _TARGET_PC_WIN
+  if (dgs_app_active && GetAsyncKeyState(VK_SNAPSHOT)) // PrintScreen
+  {
+    if (!is_print_screen_key_down)
+    {
+      // Only fire on plain PrintScreen. Shift+PrintScreen is the
+      // Global.ScreenshotNoGUI daInput action (RegisterHotKey above is
+      // registered without a modifier mask, so modified combos still reach
+      // the normal key dispatch); firing here too would produce a duplicate
+      // screenshot on every Shift+PrintScreen press.
+      const bool anyModifier = GetAsyncKeyState(VK_SHIFT) || GetAsyncKeyState(VK_CONTROL) || GetAsyncKeyState(VK_MENU) ||
+                               GetAsyncKeyState(VK_LWIN) || GetAsyncKeyState(VK_RWIN);
+      if (!anyModifier)
+        screencap::schedule_screenshot(true);
+    }
+
+    is_print_screen_key_down = true;
+  }
+  else
+    is_print_screen_key_down = false;
+#endif //_TARGET_PC_WIN
+}
 
 void bind_script_api(SqModules *moduleMgr)
 {

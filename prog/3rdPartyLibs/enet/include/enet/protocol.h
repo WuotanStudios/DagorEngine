@@ -6,6 +6,7 @@
 #define __ENET_PROTOCOL_H__
 
 #include "enet/types.h"
+#include "enet/enet_dagor_types.h"
 
 enum
 {
@@ -35,9 +36,7 @@ typedef enum _ENetProtocolCommand
    ENET_PROTOCOL_COMMAND_BANDWIDTH_LIMIT    = 10,
    ENET_PROTOCOL_COMMAND_THROTTLE_CONFIGURE = 11,
    ENET_PROTOCOL_COMMAND_SEND_UNRELIABLE_FRAGMENT = 12,
-   ENET_PROTOCOL_COMMAND_PING_TARGET_PORT_FOR_RELAY = 13,
-   ENET_PROTOCOL_COMMAND_COUNT              = 14,
-
+   _DAGOR_ENET_INJECT_PROTOCOL_COMMANDS_AND_COUNT,
    ENET_PROTOCOL_COMMAND_MASK               = 0x0F
 } ENetProtocolCommand;
 
@@ -54,7 +53,7 @@ typedef enum _ENetProtocolFlag
    ENET_PROTOCOL_HEADER_SESSION_SHIFT   = 12
 } ENetProtocolFlag;
 
-#ifdef _MSC_VER_
+#ifdef _MSC_VER
 #pragma pack(push, 1)
 #define ENET_PACKED
 #elif defined(__GNUC__)
@@ -144,12 +143,6 @@ typedef struct _ENetProtocolPing
    ENetProtocolCommandHeader header;
 } ENET_PACKED ENetProtocolPing;
 
-typedef struct _ENetProtocolPingTargetPortForRelay
-{
-   ENetProtocolCommandHeader header;
-   enet_uint16 port;
-} ENET_PACKED ENetProtocolPingTargetPortForRelay;
-
 typedef struct _ENetProtocolSendReliable
 {
    ENetProtocolCommandHeader header;
@@ -181,6 +174,7 @@ typedef struct _ENetProtocolSendFragment
    enet_uint32 fragmentOffset;
 } ENET_PACKED ENetProtocolSendFragment;
 
+_DAGOR_ENET_EXT_PROTOCOL_TYPES;
 typedef union _ENetProtocol
 {
    ENetProtocolCommandHeader header;
@@ -195,10 +189,10 @@ typedef union _ENetProtocol
    ENetProtocolSendFragment sendFragment;
    ENetProtocolBandwidthLimit bandwidthLimit;
    ENetProtocolThrottleConfigure throttleConfigure;
-   ENetProtocolPingTargetPortForRelay pingTargetPortForRelay;
+   _DAGOR_ENET_INJECT_PROTOCOL_TYPES
 } ENET_PACKED ENetProtocol;
 
-#ifdef _MSC_VER_
+#ifdef _MSC_VER
 #pragma pack(pop)
 #endif
 

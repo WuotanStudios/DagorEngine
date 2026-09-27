@@ -14,7 +14,9 @@
 #include <daRg/dag_joystick.h>
 #include <daRg/dag_guiScene.h>
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 
 #include <ioSys/dag_dataBlock.h>
 
@@ -99,6 +101,22 @@ void activate_ui_elem_action_set(dainput::action_set_handle_t ash, bool on)
 }
 
 
+static int visuallog_logerrs = -1;
+static void apply_visuallog_max_items()
+{
+  visuallog::setMaxItems(visuallog_logerrs > 0
+                           ? min(visuallog_logerrs, 10)
+                           : ::dgs_get_settings()->getBlockByNameEx("debug")->getInt("visualLogItems", DEFAULT_VISUALLOG_MAX_ITEMS));
+}
+
+void set_visuallog_logerrs(int count)
+{
+  visuallog_logerrs = count;
+  visuallog::setDrawDisabled(
+    count == 0 || ::dgs_get_settings()->getBool("disableVisualLog", false) || circuit::get_conf()->getBool("disableVisualLog", false));
+  apply_visuallog_max_items();
+}
+
 static bool is_inited_once = false;
 void init_early()
 {
@@ -112,8 +130,7 @@ void init_early()
   joystick_handler.reset(new darg::JoystickHandler());
 
   visuallog::setFont("small_text");
-  visuallog::setDrawDisabled(
-    ::dgs_get_settings()->getBool("disableVisualLog", false) || circuit::get_conf()->getBool("disableVisualLog", false));
+  set_visuallog_logerrs(-1);
 }
 
 
@@ -125,7 +142,7 @@ void init()
   TIME_PROFILE(ui_shared_init);
   term();
 
-  visuallog::setMaxItems(::dgs_get_settings()->getBlockByNameEx("debug")->getInt("visualLogItems", DEFAULT_VISUALLOG_MAX_ITEMS));
+  apply_visuallog_max_items();
 
   apply_resolution_change_after_reset = false;
   need_initial_dev_type_notify = true;
@@ -200,9 +217,7 @@ static void notify_gamepad_type_change()
   if (vendor_id != prev_gamepad_vendor_id && vendor_id != HumanInput::GAMEPAD_VENDOR_UNKNOWN)
   {
     prev_gamepad_vendor_id = vendor_id;
-    Json::Value data;
-    data["ctype"] = vendor_id;
-    sqeventbus::send_event("input_gamepad_type", data);
+    sqeventbus::write_event_main_thread("input_gamepad_type", [=](auto &data) { data["ctype"] = vendor_id; });
   }
 }
 
@@ -238,9 +253,7 @@ static void notify_input_devices_used()
 
     if (needEvent)
     {
-      Json::Value msg;
-      msg["val"] = last_type;
-      sqeventbus::send_event("input_dev_used", msg);
+      sqeventbus::write_event_main_thread("input_dev_used", [](auto &msg) { msg["val"] = last_type; });
       need_initial_dev_type_notify = false;
     }
   }
@@ -270,6 +283,9 @@ void update()
   const bool isOverlayCursorModeForced =
     overlay_ui::gui_scene() && overlay_ui::gui_scene()->getForcedCursorMode(forcedOverlayCursorActive);
 
+  const bool isUiCursorModeForced =
+    (isOverlayCursorModeForced && forcedOverlayCursorActive) || (isUserUiCursorModeForced && forcedUserUiCursorActive);
+
   if (overlay_ui::gui_scene())
     overlay_ui::gui_scene()->setSceneInputActive(setUiScenesActive || (isOverlayCursorModeForced && forcedOverlayCursorActive));
 
@@ -294,7 +310,7 @@ void update()
 
     const bool absoluteForImGui = imgui_get_state() == ImGuiState::ACTIVE;
 
-    const bool newRelative = (!hasDargClickableGui || relativeDueToFreeCam) && !absoluteForImGui;
+    const bool newRelative = (!hasDargClickableGui || relativeDueToFreeCam) && !absoluteForImGui && !isUiCursorModeForced;
     const bool isRelative = mouse->getRelativeMovementMode();
 
     // window rect for the cursor can be outdated at this point (driver mode reset is AFTER UI and cursor update),

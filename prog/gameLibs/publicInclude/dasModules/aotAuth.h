@@ -6,20 +6,19 @@
 
 #include <daScript/daScript.h>
 #include <EASTL/string.h>
-#include <cstdint>
+#include <daECS/core/entityManager.h>
+#include <dasModules/aotEcs.h>
 
-namespace auth
-{
-eastl::string get_country_code();
-}
-
+extern void auth_get_country_code(ecs::EntityManager &mgr, eastl::string &country);
 
 namespace bind_dascript
 {
 
 inline const char *get_country_code(das::Context *context, das::LineInfoArg *at)
 {
-  eastl::string country{auth::get_country_code()};
+  eastl::string country{};
+  ecs::EntityManager *mgr = cast_es_context(context)->mgr;
+  auth_get_country_code(mgr ? *mgr : *g_entity_mgr, country);
   return context->allocateString(country, at);
 }
 

@@ -1,6 +1,10 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <math.h>
+#include <string_view>
+#include <filesystem>
+
 #define FontUtil_CID       Class_ID(0x3409613e, 0x754e4800)
 #define DagorMat_CID       Class_ID(0x70a066e2, 0x18a04e07)
 #define DagorMat2_CID      Class_ID(0x72fcfac4, 0xddfb36f0)
@@ -41,13 +45,13 @@ ClassDesc *GetObjectPropertiesEditorCD();
 ClassDesc *GetDAGEXPCD();
 ClassDesc *GetImpUtilCD();
 
-TCHAR *GetString(int id);
+const TCHAR *GetString(int id);
 
 const TCHAR *make_path_rel(const TCHAR *);
 
-void set_dagor_path(const char *p);
+void set_dagor_path(std::wstring_view p);
 
-extern char dagor_path[];
+extern std::filesystem::path dagor_path;
 
 extern HINSTANCE hInstance;
 
@@ -61,19 +65,19 @@ enum
   EXP_HLP = 0x0020,
   EXP_MAT = 0x0040,
   // EXP_ANI = 0x0080,   // unused
-  EXP_ARNG = 0x0100,
-  EXP_LTARG = 0x0200,
-  EXP_CTARG = 0x0400,
-  EXP_UKEYS = 0x0800,
-  EXP_UNTKEYS = 0x1000,
+  // EXP_ARNG = 0x0100, // no longer used
+  // EXP_LTARG = 0x0200, // no longer used
+  // EXP_CTARG = 0x0400, // no longer used
+  // EXP_UKEYS = 0x0800, // no longer used
+  // EXP_UNTKEYS = 0x1000, // no longer used
   EXP_SPLINE = 0x2000,
-  EXP_DONTCHKKEYS = 0x4000,
+  // EXP_DONTCHKKEYS = 0x4000, // no longer used
   EXP_NO_VNORM = 0x8000,
 
-  EXP_DONT_REDUCE_POS = 0x00010000,
-  EXP_DONT_REDUCE_ROT = 0x00020000,
-  EXP_DONT_REDUCE_SCL = 0x00040000,
-  EXP_LOOPED_ANIM = 0x00080000,
+  // EXP_DONT_REDUCE_POS = 0x00010000, // no longer used
+  // EXP_DONT_REDUCE_ROT = 0x00020000, // no longer used
+  // EXP_DONT_REDUCE_SCL = 0x00040000, // no longer used
+  // EXP_LOOPED_ANIM = 0x00080000,     // no longer used
   EXP_MATOPT = 0x00100000,
 
   EXP_DONT_CALC_MOMJ = 0x01000000,
@@ -86,15 +90,10 @@ enum
 
 #define DEGENERATE_VERTEX_DELTA 1e-5f // 0.01mm
 
-inline bool is_equal_float(float left, float right, float delta = 1e-4f)
-{
-  float diff = left - right;
-  (*(DWORD *)&diff) &= 0x7FFFFFFF; // fabsf()
-  return diff < delta;
-}
+inline bool is_equal_float(float left, float right, float delta = 1e-4f) { return fabsf(left - right) < delta; }
 
 
-inline bool is_equal_point(Point3 &left, Point3 &right, float delta = 1e-4f)
+inline bool is_equal_point(const Point3 &left, const Point3 &right, float delta = 1e-4f)
 {
   return is_equal_float(left.x, right.x, delta) && is_equal_float(left.y, right.y, delta) && is_equal_float(left.z, right.z, delta);
 }

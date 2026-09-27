@@ -32,9 +32,12 @@
 #include <libTools/util/makeBindump.h>
 #include <rendInst/rendInstGen.h>
 #include <libTools/util/setupTexStreaming.h>
+#include <libTools/util/setupNamedMounts.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <assets/assetPlugin.h>
 #include <assets/texAssetBuilderTextureFactory.h>
 
+#define __DEBUG_FILEPATH nullptr
 #include <startup/dag_winMain.inc.cpp>
 
 #include <generic/dag_initOnDemand.h>
@@ -78,7 +81,7 @@ void DagorWinMainInit(int, bool)
   char stamp_buf[256];
   printf("--------------------------------------------\n"
          "PLOD generator v0.1\n"
-         "Copyright (C) Gaijin Games KFT, 2024\n"
+         "Copyright (C) Gaijin Games KFT, 2026\n"
          "--------------------------------------------\n"
          "%s\n\n\n",
     dagor_get_build_stamp_str(stamp_buf, sizeof(stamp_buf), ""));
@@ -156,23 +159,26 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   if (!::symhlp_load("daKernel" DAGOR_DLL))
     DEBUG_CTX("can't load sym for: %s", "daKernel" DAGOR_DLL);
 
-  String path_to_blk;
+  char app_dir[512];
+  dd_get_fname_location(app_dir, options.appBlk.c_str());
+  set_canonical_app_dir_mount(app_dir);
+  if (const char *path = dd_get_named_mount_path("appDir", 6))
+  {
+    strncpy(app_dir, path, sizeof(app_dir));
+    app_dir[sizeof(app_dir) - 1] = '\0';
+  }
+  else if (!app_dir[0])
+    strcpy(app_dir, "./");
+
   DataBlock appBlk;
   if (!appBlk.load(options.appBlk.c_str()))
   {
     logerr("cannot load %s", options.appBlk.c_str());
     return 1;
   }
-  else
-  {
-    path_to_blk = String(options.appBlk.c_str());
-    ::dd_get_fname_location(path_to_blk, options.appBlk.c_str());
-  }
+  setup_named_mount_points(*appBlk.getBlockByNameEx("mountPoints"));
 
   engine.demandInit();
-
-  char fpath_buf[512];
-  const char *app_dir = ::_fullpath(fpath_buf, path_to_blk.c_str(), 512);
 
   DataBlock *global_settings_blk = const_cast<DataBlock *>(::dgs_get_settings());
 
@@ -183,13 +189,12 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 
   const DataBlock &blk = *appBlk.getBlockByNameEx("assets");
   const DataBlock *expBlk = blk.getBlockByName("export");
-  const DataBlock *gameBlk = appBlk.getBlockByName("game");
 
   const char *sh_file = appBlk.getStr("shaders", "compiledShaders/tools");
-  appBlk.setStr("appDir", app_dir);
+  appBlk.setStr("appDir", dd_get_named_mount_path("appDir"));
 
   DataBlock texStreamingBlk;
-  ::load_tex_streaming_settings(String(0, "%s/application.blk", appBlk.getStr("appDir")), &texStreamingBlk);
+  ::load_tex_streaming_settings(options.appBlk.c_str(), &texStreamingBlk);
 
   global_settings_blk->removeBlock("texStreaming");
   global_settings_blk->addNewBlock(&texStreamingBlk, "texStreaming");
@@ -198,7 +203,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   ::dagor_init_video("DagorWClass", nCmdShow, NULL, "PLOD gen");
   dagor_install_dev_fatal_handler(NULL);
 
-  ::startup_shaders(String(0, "%s/%s", app_dir, sh_file).c_str());
+  ::startup_shaders(make_eff_app_relative_path(sh_file).c_str());
   ::startup_game(RESTART_ALL);
 
   CALL_AT_END_OF_SCOPE(flush_files());
@@ -211,15 +216,15 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   ShaderGlobal::set_int(get_shader_variable_id("in_editor", true), 0);
   ShaderGlobal::set_vars_from_blk(*::dgs_get_settings()->getBlockByNameEx("shaderVar"), true);
 
+  ShaderGlobal::set_int(get_shader_variable_id("dgs_tex_anisotropy", true), ::dgs_tex_anisotropy);
+  ShaderGlobal::set_float(get_shader_variable_id("mip_bias", true), 0.f);
+
   startup_game(RESTART_ALL);
 
   bool loadDDSxPacks = blk.getStr("ddsxPacks", nullptr) != nullptr;
   if (expBlk)
-  {
-    ::set_gameres_sys_ver(2);
     if (!loadDDSxPacks)
       texconvcache::init_build_on_demand_tex_factory(engine->getAssetManager(), engine->getConsoleLogWriter());
-  }
   if (blk.getStr("gameRes", nullptr) || blk.getStr("ddsxPacks", nullptr))
   {
     int nid = blk.getNameId("prebuiltGameResFolder");
@@ -227,12 +232,12 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
     for (int i = 0; i < blk.paramCount(); i++)
       if (blk.getParamType(i) == DataBlock::TYPE_STRING && blk.getParamNameId(i) == nid)
       {
-        resDir.printf(DAGOR_MAX_PATH, "%s/%s/", app_dir, blk.getStr(i));
+        make_eff_app_relative_path(resDir, blk.getStr(i));
         ::scan_for_game_resources(resDir, true, blk.getStr("ddsxPacks", nullptr));
       }
   }
 
-  G_ASSERT(DAEDITOR3.initAssetBase(app_dir));
+  G_ASSERT(DAEDITOR3.initAssetBase(app_dir, appBlk));
 
   rendinst::configurateRIGen(*appBlk.getBlockByNameEx("projectDefaults")->getBlockByNameEx("riMgr")->getBlockByNameEx("config"));
   rendinst::initRIGen(true, 80, 8000.0f);

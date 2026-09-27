@@ -3,6 +3,7 @@
 #include <drv/3d/dag_renderStates.h>
 #include <drv/3d/dag_shader.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_query.h>
 #include <drv/3d/dag_variableRateShading.h>
@@ -11,9 +12,12 @@
 
 #include "render.h"
 #include "drv_assert_defs.h"
+#include "drv_log_defs.h"
 #include <drv/3d/dag_res.h>
 #include <util/dag_string.h>
 #include <ioSys/dag_dataBlock.h>
+#include <osApiWrappers/dag_localConv.h>
+#include <osApiWrappers/dag_miscApi.h>
 
 using namespace drv3d_metal;
 
@@ -35,7 +39,7 @@ namespace drv3d_metal
 
   bool desc_prepared = false;
 
-  Driver3dDesc g_device_desc =
+  DriverDesc g_device_desc =
   {
     0, 0,   //int zcmpfunc,acmpfunc;
     0, 0,   //int sblend,dblend;
@@ -46,12 +50,12 @@ namespace drv3d_metal
     1, 16384, //int minvolsize,maxvolsize;
     0,    //int maxtexaspect; ///< 1 means texture should be square, 0 means no limit
     65536,  //int maxtexcoord;
-    16,     //int maxsimtex;
-    16,    //int maxlights;
+    metal::MAX_T_REGISTERS, //int maxsimtex;
+    metal::MAX_S_REGISTERS, //int maxlights;
     0,    //int maxclipplanes;
     64,     //int maxstreams;
     64,     //int maxstreamstr;
-    1024,   //int maxvpconsts;
+    4096,   //int maxvpconsts;
 
 
     65536 * 4, 65536 * 4, //int maxprims,maxvertind;
@@ -116,8 +120,6 @@ namespace drv3d_metal
   PROGRAM d3d_debug_prog = BAD_PROGRAM;
 }
 
-extern void mac_get_vdevice_info(int& vram, GpuVendor& vendor, String &gpu_desc, bool &web_driver);
-
 const char *d3d::get_driver_name()
 {
   return "Metal";
@@ -126,11 +128,6 @@ const char *d3d::get_driver_name()
 #if _TARGET_PC_MACOSX
 DriverCode d3d::get_driver_code() { return DriverCode::make(d3d::metal); }
 #endif
-
-const char *d3d::get_device_driver_version()
-{
-  return "1.0";
-}
 
 const char *d3d::get_device_name()
 {
@@ -157,23 +154,95 @@ bool supports_hw_raytracing()
   return supports_any_raytracing() && [render.device supportsFamily: MTLGPUFamilyApple9];
 }
 
-const Driver3dDesc &d3d::get_driver_desc()
+static GpuVendor parse_vendor(const char *gpu_str)
+{
+  #undef INTEL
+  GpuVendor out_vendor = GpuVendor::UNKNOWN;
+  if (char *lower = str_dup(gpu_str, tmpmem))
+  {
+    lower = dd_strlwr(lower);
+    if (strstr(lower, "geforce") || strstr(lower, "nvidia"))
+    {
+      out_vendor = GpuVendor::NVIDIA;
+    }
+    else if (strstr(lower, "ati") || strstr(lower, "amd") || strstr(lower, "radeon"))
+    {
+      out_vendor = GpuVendor::ATI;
+    }
+    else if (strstr(lower, "intel"))
+    {
+      out_vendor = GpuVendor::INTEL;
+    }
+    else if (strstr(lower, "apple"))
+    {
+      out_vendor = GpuVendor::APPLE;
+    }
+    memfree(lower, tmpmem);
+  }
+  return out_vendor;
+}
+
+extern bool get_lowpower_mode();
+
+static id<MTLDevice> getSelectedDevce()
+{
+  id<MTLDevice> device = nil;
+#if _TARGET_PC_MACOSX
+  for (id<MTLDevice> dev in MTLCopyAllDevices())
+  {
+    if (dev.lowPower == get_lowpower_mode())
+      device = [dev retain];
+  }
+#endif
+  if (device == nil)
+    device = MTLCreateSystemDefaultDevice();
+  G_ASSERT(device);
+  return device;
+}
+
+GpuVendor d3d::guess_gpu_vendor(String *out_gpu_desc, uint32_t *out_drv_ver, DagorDateTime *out_drv_date, uint32_t *device_id)
+{
+  id<MTLDevice> device = render.device ? [render.device retain] : getSelectedDevce();
+  String name;
+  name = [device.name UTF8String];
+  if (out_gpu_desc)
+    *out_gpu_desc = name;
+  if (out_drv_ver)
+  {
+    NSOperatingSystemVersion ver = [[NSProcessInfo processInfo] operatingSystemVersion];
+    *out_drv_ver = ver.majorVersion << 24 | ver.minorVersion << 16 | ver.patchVersion << 8;
+  }
+  if (out_drv_date)
+    *out_drv_date = {};
+  if (device_id)
+    *device_id = device.registryID;
+  [device release];
+  return parse_vendor(name);
+}
+
+#if _TARGET_PC_MACOSX
+unsigned d3d::get_dedicated_gpu_memory_size_kb()
+{
+  id<MTLDevice> device = render.device ? [render.device retain] : getSelectedDevce();
+  unsigned mem = unsigned(device.recommendedMaxWorkingSetSize >> 10);
+  [device release];
+  return mem;
+}
+#endif
+
+const DriverDesc &d3d::get_driver_desc()
 {
   D3D_CONTRACT_ASSERTF(render.device, "d3d::get_driver_desc: render.device is nil. The function must be called after video init");
   if (!desc_prepared)
   {
+    g_device_desc.info.deviceId = render.device.registryID;
+    const DataBlock *metalBlk = ::dgs_get_settings()->getBlockByNameEx("metal");
 #if _TARGET_PC_MACOSX
-    GpuVendor vendor;
-    int vram;
-    String gpu_desc;
-    bool web_driver;
-
-    mac_get_vdevice_info(vram, vendor, gpu_desc, web_driver);
-
-    metal_use_queries = (vendor != GpuVendor::NVIDIA);
+    g_device_desc.info.vendor = parse_vendor([render.device.name UTF8String]);
+    metal_use_queries = (g_device_desc.info.vendor != GpuVendor::NVIDIA);
 
     g_device_desc.caps.hasBindless = false;
-    const bool isBindlessAllowed = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("allowBindless", false);
+    const bool isBindlessAllowed = metalBlk->getBool("allowBindless", false);
     if (@available(macOS 15.0, iOS 18.0, *))
     {
       if (isBindlessAllowed)
@@ -181,6 +250,8 @@ const Driver3dDesc &d3d::get_driver_desc()
     }
 
     g_device_desc.caps.hasUAVOnlyForcedSampleCount = true;
+    g_device_desc.issues.hasBrokenUAVOnlyPasses =
+      metalBlk->getBool("brokenUAVOnlyPasses", ![render.device supportsFamily:MTLGPUFamilyMac2]);
 
     g_device_desc.shaderModel = 5.0_sm;
 #else //_TARGET_IOS | _TARGET_TVOS
@@ -190,6 +261,7 @@ const Driver3dDesc &d3d::get_driver_desc()
 
     g_device_desc.caps.hasIndirectSupport = [render.device supportsFamily:MTLGPUFamilyApple3];
     g_device_desc.caps.hasCompareSampler = [render.device supportsFamily:MTLGPUFamilyApple3];
+    g_device_desc.issues.hasBrokenUAVOnlyPasses = metalBlk->getBool("brokenUAVOnlyPasses", true);
 #endif
     g_device_desc.caps.hasRenderPassDepthResolve = [render.device supportsFamily:MTLGPUFamilyApple3];
     g_device_desc.caps.hasBaseVertexSupport = [render.device supportsFamily:MTLGPUFamilyApple3];
@@ -199,6 +271,7 @@ const Driver3dDesc &d3d::get_driver_desc()
     }
     else
       g_device_desc.caps.hasMeshShader = false;
+    g_device_desc.caps.hasMeshShaderIndirectCount = false;
     if (g_device_desc.caps.hasRenderPassDepthResolve)
     {
       g_device_desc.depthResolveModes =
@@ -235,7 +308,14 @@ const Driver3dDesc &d3d::get_driver_desc()
   }
 #endif
 
-    g_device_desc.caps.hasResourceHeaps = ::dgs_get_settings()->getBlockByNameEx("metal")->getBool("allowResourceHeaps", true);
+    // can only have heaps when manual hazard tracking is enabled
+    g_device_desc.caps.hasResourceHeaps = metalBlk->getBool("allowResourceHeaps", true);
+    g_device_desc.caps.hasResourceHeaps &= render.manual_hazard_tracking;
+#if _TARGET_PC_MACOSX
+    // placement heaps, the only kind we create, abort the process on a device without support
+    g_device_desc.caps.hasResourceHeaps &= [render.device supportsFamily:MTLGPUFamilyMac2];
+#endif
+    debug("[METAL] resource heaps: %s", g_device_desc.caps.hasResourceHeaps ? "enabled" : "disabled");
 
     desc_prepared = true;
   }
@@ -247,6 +327,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
 {
   switch (command)
   {
+    case Drv3dCommand::GET_PRESENTED_FRAME_COUNT: return 1;
     case Drv3dCommand::D3D_FLUSH:
     case Drv3dCommand::GPU_BARRIER_WAIT_ALL_COMMANDS: // TODO: Implement GPU_BARRIER_WAIT_ALL_COMMANDS separately
       @autoreleasepool
@@ -278,7 +359,13 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
           const Dx12HWInstance &inst = *src++;
           MTLAccelerationStructureUserIDInstanceDescriptor &ret = *dst++;
 
-          G_ASSERTF(inst.blasGpuAddress < render.nativeBlases.count, "Blas index is out of bounds, %llu is bigger than %d", inst.blasGpuAddress, int(render.nativeBlases.count));
+#if DAGOR_DBGLEVEL > 0
+          {
+            render.blases.lock();
+            G_ASSERTF(inst.blasGpuAddress < render.nativeBlases.size(), "Blas index is out of bounds, %llu is bigger than %d", inst.blasGpuAddress, int(render.nativeBlases.size()));
+            render.blases.unlock();
+          }
+#endif
           ret.accelerationStructureIndex = inst.blasGpuAddress;
           ret.options = 0;
           ret.intersectionFunctionTableOffset = 0; // instance.instanceContributionToHitGroupIndex;
@@ -311,6 +398,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
       break;
     case Drv3dCommand::PROCESS_PENDING_RESOURCE_UPDATED:
     case Drv3dCommand::FLUSH_STATES:
+    case Drv3dCommand::D3D_FLUSH_COMMAND_BUFFER:
       @autoreleasepool
       {
         render.acquireOwnership();
@@ -340,7 +428,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
 
       if (!q[0])
       {
-        q[0] = render.createQuery();
+        q[0] = render.createQuery(Render::Query::Type::Visibility);
       }
 
       render.startQuery(q[0]);
@@ -377,7 +465,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
         return 0;
       }
 
-      return (int)render.getQueryResult(q, par2 ? 0 : 1);
+      return (int)render.getQueryResult(q, par2 ? 1 : 0);
     }
     case Drv3dCommand::RELEASE_QUERY:
     {
@@ -413,9 +501,16 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
     case Drv3dCommand::TIMESTAMPISSUE:
     {
       G_ASSERTF(par1, "metal: par1 for Drv3dCommand::TIMESTAMPISSUE must be not null");
-      uint64_t &query = *(reinterpret_cast<uint64_t *>(par1));
+
+      Render::Query** q = (Render::Query**)par1;
+      if (!q[0])
+      {
+        q[0] = new Render::Query {};
+        q[0]->type = Render::Query::Type::Timestamp;
+      }
+
       // we're using floor, so render.nextSample effectively means last scheduled sample + 1
-      query = render.nextSample;
+      q[0]->value = render.nextSample;
       break;
     }
     case Drv3dCommand::TIMESTAMPGET:
@@ -430,7 +525,11 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
         if (!par1)
           return 0;
 
-        uint64_t gpuTimeStamp = render.getTimestampResult(reinterpret_cast<uint64_t>(par1));
+        Render::Query* q = (Render::Query*)par1;
+        if (!q)
+          return 0;
+
+        uint64_t gpuTimeStamp = render.getTimestampResult(q->value);
         if (!gpuTimeStamp)
           return 0;
 
@@ -452,17 +551,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
     }
     case Drv3dCommand::GET_VIDEO_MEMORY_BUDGET:
     {
-      int gpuMaxAvailableKb = 0;
-      #if _TARGET_PC_MACOSX
-        GpuVendor vendor;
-        String gpu_desc;
-        bool web_driver;
-
-        mac_get_vdevice_info(gpuMaxAvailableKb, vendor, gpu_desc, web_driver);
-      #else
-        gpuMaxAvailableKb = d3d::get_dedicated_gpu_memory_size_kb();
-      #endif
-
+      int gpuMaxAvailableKb = int(render.device.recommendedMaxWorkingSetSize >> 10);
       if (par1)
         *reinterpret_cast<uint32_t *>(par1) = gpuMaxAvailableKb;
 
@@ -481,11 +570,9 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
     {
       if (par1)
         *(const void**)par1 = render.device_name;
-      render.getSupportedMTLVersion(par2);
       return GpuVendor::APPLE;
     }
 #endif
-      //return drv3d_vulkan::api_state.device.getDeviceVendor();
       break;
     case Drv3dCommand::START_CAPTURE_FRAME:
     {
@@ -501,7 +588,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
           [man startCaptureWithDescriptor : desc
                                     error : &error];
           if (error)
-            logerr("Failed to start capture, error %s",
+            D3D_ERROR("Failed to start capture, error %s",
                   [[error localizedDescription] UTF8String]);
           [desc release];
 
@@ -549,24 +636,37 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, void *par3
     {
       return [render.mainview isHDRAvailable];
     }
-    case Drv3dCommand::SET_HDR:
+    case Drv3dCommand::HDR_HEADROOM:
     {
-      bool enable = *static_cast<bool*>(par1);
-      [render.mainview setHDR: enable];
+      *reinterpret_cast<float *>(par1) = [render.mainview getRelativeHeadroom];
       break;
     }
+    case Drv3dCommand::APPLY_HDR_MODE:
+      return render.applyHdrModeChange() ? 1 : 0;
     case Drv3dCommand::GET_METALFX_UPSCALE_STATE:
     {
 #if USE_METALFX_UPSCALE
-      return render.upscale.supported ? (int)MtlfxUpscaleState::READY : (int)MtlfxUpscaleState::UNSUPPORTED;
+      return (render.upscale.supported ? (int)MtlfxUpscaleState::SPATIAL : (int)MtlfxUpscaleState::UNSUPPORTED) |
+        (render.upscale.temporalSupported ? (int)MtlfxUpscaleState::TEMPORAL : (int)MtlfxUpscaleState::UNSUPPORTED);
 #else
       return (int)MtlfxUpscaleState::UNSUPPORTED;
 #endif
-  }
+    }
+    case Drv3dCommand::UNLOAD_SHADER_MEMORY:
+    {
+      render.shadersPreCache.unloadShaders();
+      return 1;
+    }
     case Drv3dCommand::EXECUTE_METALFX_UPSCALE:
     {
       MtlFxUpscaleParams *params = static_cast<MtlFxUpscaleParams*>(par1);
-      render.executeUpscale((drv3d_metal::Texture*)params->color, (drv3d_metal::Texture*)params->output, (uint32_t)params->colorMode);
+      if (params->temporal)
+        render.executeTemporalUpscale((drv3d_metal::Texture*)params->color, (drv3d_metal::Texture*)params->motion,
+          (drv3d_metal::Texture*)params->depth, (drv3d_metal::Texture*)params->output, params->jitterX, params->jitterY,
+          params->motionScaleX, params->motionScaleY);
+      else
+        render.executeSpatialUpscale((drv3d_metal::Texture*)params->color, (drv3d_metal::Texture*)params->output,
+          (uint32_t)params->colorMode);
       break;
     }
     default:
@@ -593,8 +693,6 @@ bool d3d::device_lost(bool *can_reset_now)
 bool d3d::is_in_device_reset_now() { return false; }
 
 bool d3d::is_window_occluded() { return false; }
-
-bool d3d::should_use_compute_for_image_processing(std::initializer_list<unsigned>) { return false; }
 
 bool d3d::reset_device()
 {
@@ -638,8 +736,26 @@ PROGRAM d3d::get_debug_program()
 {
   if (d3d_debug_prog == BAD_PROGRAM)
   {
+    ShaderSourceExt vs_src{
+      {
+        .compressedData = make_span_const((const uint8_t *)debug_vs_metal, (uint32_t)strlen(debug_vs_metal) + 1),
+        .uncompressedSize = (uint32_t)strlen(debug_vs_metal) + 1,
+        .dictionary = nullptr
+      },
+      c_countof("debug_vs_metal") - 1,
+      "debug_vs_metal"};
+    ShaderSourceExt ps_src{
+      {
+        .compressedData = make_span_const((const uint8_t *)debug_ps_metal, (uint32_t)strlen(debug_ps_metal) + 1),
+        .uncompressedSize = (uint32_t)strlen(debug_ps_metal) + 1,
+        .dictionary = nullptr
+      },
+      c_countof("debug_ps_metal") - 1,
+      "debug_ps_metal"};
     d3d_debug_vdecl = render.createVDdecl(debug_vdecl);
-    d3d_debug_prog = create_program((const uint32_t*)debug_vs_metal, (const uint32_t*)debug_ps_metal, d3d_debug_vdecl, 0, 0);
+    VPROG vs = create_vertex_shader(vs_src);
+    FSHADER ps = create_pixel_shader(ps_src);
+    d3d_debug_prog = create_program(vs, ps, d3d_debug_vdecl, 0, 0);
   }
 
   return d3d_debug_prog;
@@ -647,7 +763,7 @@ PROGRAM d3d::get_debug_program()
 
 d3d::EventQuery* d3d::create_event_query()
 {
-  return (d3d::EventQuery*)render.createQuery();
+  return (d3d::EventQuery*)render.createQuery(Render::Query::Type::Event);
 }
 
 void d3d::release_event_query(d3d::EventQuery *q)
@@ -657,7 +773,9 @@ void d3d::release_event_query(d3d::EventQuery *q)
     return;
   }
 
-  render.releaseQuery((Render::Query*)q);
+  Render::Query *query = (Render::Query *)q;
+  G_ASSERT(query->type == Render::Query::Type::Event);
+  render.releaseQuery(query);
 }
 
 bool d3d::issue_event_query(d3d::EventQuery *q)
@@ -741,10 +859,37 @@ static bool is_depth_format_flg(uint32_t cflg)
   return cflg >= TEXFMT_FIRST_DEPTH && cflg <= TEXFMT_LAST_DEPTH;
 }
 
+static bool canAliasToUint(uint32_t fmt)
+{
+  switch (fmt)
+  {
+    case TEXFMT_A8R8G8B8:
+    case TEXFMT_A2R10G10B10:
+    case TEXFMT_A2B10G10R10:
+    case TEXFMT_G16R16:
+    case TEXFMT_G16R16F:
+    case TEXFMT_R32F:
+    case TEXFMT_R8G8B8A8:
+    case TEXFMT_R32UI:
+    case TEXFMT_R32SI:
+    case TEXFMT_R11G11B10F:
+    case TEXFMT_R9G9B9E5:
+    case TEXFMT_DEPTH32:
+      return true;
+  }
+  return false;
+}
+
 static MTLTextureDescriptor *createTextureDescriptor(const ResourceDescription &desc, bool& is_rt, bool& is_depth_stencil)
 {
   MTLTextureDescriptor *pTexDesc = [[MTLTextureDescriptor alloc] init];
-  switch (desc.type)
+  D3DResourceType type = desc.type;
+#if _TARGET_IOS
+  // some ios devices don't support cube array textures
+  if (![drv3d_metal::render.device supportsFamily:MTLGPUFamilyApple4] && type == D3DResourceType::CUBEARRTEX)
+    type = D3DResourceType::CUBETEX;
+#endif
+  switch (type)
   {
     case D3DResourceType::TEX:
       pTexDesc.textureType = MTLTextureType2D;
@@ -764,8 +909,8 @@ static MTLTextureDescriptor *createTextureDescriptor(const ResourceDescription &
       break;
     case D3DResourceType::VOLTEX:
       pTexDesc.textureType = MTLTextureType3D;
-      pTexDesc.width = desc.asVolTexRes.depth;
-      pTexDesc.height = desc.asVolTexRes.depth;
+      pTexDesc.width = desc.asVolTexRes.width;
+      pTexDesc.height = desc.asVolTexRes.height;
       pTexDesc.depth = desc.asVolTexRes.depth;
       pTexDesc.mipmapLevelCount = desc.asVolTexRes.mipLevels;
       pTexDesc.arrayLength = 1;
@@ -792,7 +937,10 @@ static MTLTextureDescriptor *createTextureDescriptor(const ResourceDescription &
   G_ASSERT(get_sample_count(cflag) == 1);
 
   pTexDesc.storageMode = MTLStorageModePrivate;
-  pTexDesc.pixelFormat = drv3d_metal::Texture::format2Metal(cflag & TEXFMT_MASK);
+  bool srgb_read = cflag & TEXCF_SRGBREAD, srgb_write = cflag & TEXCF_SRGBWRITE;
+  MTLPixelFormat linear_format = drv3d_metal::Texture::format2Metal(cflag & TEXFMT_MASK);
+  MTLPixelFormat pixel_format = srgb_read ? drv3d_metal::Texture::format2MetalsRGB(cflag & TEXFMT_MASK) : linear_format;
+  pTexDesc.pixelFormat = pixel_format;
 
   if (pTexDesc.pixelFormat == MTLPixelFormatDepth32Float ||
       pTexDesc.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
@@ -804,6 +952,11 @@ static MTLTextureDescriptor *createTextureDescriptor(const ResourceDescription &
 
   is_rt = cflag & TEXCF_RTARGET;
   is_depth_stencil = is_rt && is_depth_format_flg(cflag);
+
+  bool as_uint = (cflag & TEXCF_UNORDERED) && canAliasToUint(cflag & TEXFMT_MASK);
+  bool no_srgb = (cflag & TEXCF_UNORDERED) && srgb_read && pixel_format != linear_format;
+  if (pTexDesc.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || as_uint || no_srgb || (is_rt && (srgb_write != srgb_read)))
+    pTexDesc.usage |= MTLTextureUsagePixelFormatView;
 
   return pTexDesc;
 }
@@ -852,7 +1005,7 @@ ResourceAllocationProperties get_resource_allocation_properties(const ResourceDe
   return ret;
 }
 
-ResourceHeap *create_resource_heap(ResourceHeapGroup *heap_group, size_t size, ResourceHeapCreateFlags flags)
+ResourceHeap *create_resource_heap(ResourceHeapGroup *heap_group, size_t size, ResourceHeapCreateFlags flags, ResourceTagType /*tag*/)
 {
   ResourceHeap *ret = new ResourceHeap;
 
@@ -867,6 +1020,8 @@ ResourceHeap *create_resource_heap(ResourceHeapGroup *heap_group, size_t size, R
   ret->group = heap_group;
   ret->size = size;
 
+  TEXQL_ON_PERSISTENT_ALLOC_SZ(size);
+
   return ret;
 }
 
@@ -874,6 +1029,8 @@ void destroy_resource_heap(ResourceHeap *heap)
 {
   if (heap == nullptr)
     return;
+
+  TEXQL_ON_PERSISTENT_RELEASE_SZ(heap->size);
 
   render.queueHeapForDeletion(heap->heap);
 
@@ -890,6 +1047,11 @@ Sbuffer *place_buffer_in_resource_heap(ResourceHeap *heap, const ResourceDescrip
   G_ASSERT(alloc_info.heapGroup == heap->group);
   G_ASSERT(alloc_info.sizeInBytes + offset <= heap->size);
   G_ASSERT(heap->heap);
+
+  D3D_CONTRACT_ASSERTF(!(desc.asBufferRes.cFlags & SBCF_MISC_DRAWINDIRECT) || desc.asBufferRes.elementSizeInBytes == 4,
+    "Metal: SBCF_MISC_DRAWINDIRECT requires 4 byte elements, got %u", desc.asBufferRes.elementSizeInBytes);
+  D3D_CONTRACT_ASSERTF(!(desc.asBufferRes.cFlags & SBCF_MISC_ALLOW_RAW) || desc.asBufferRes.elementSizeInBytes == 4,
+    "Metal: SBCF_MISC_ALLOW_RAW requires 4 byte elements, got %u", desc.asBufferRes.elementSizeInBytes);
 
   id<MTLBuffer> buf = [heap->heap newBufferWithLength : desc.asBufferRes.elementSizeInBytes * desc.asBufferRes.elementCount
                                                  options : MTLResourceStorageModePrivate
@@ -924,9 +1086,9 @@ BaseTexture *place_texture_in_resource_heap(ResourceHeap *heap, const ResourceDe
     return nullptr;
 
   drv3d_metal::Texture *texture = new drv3d_metal::Texture(tex, tex_desc, desc.asBasicRes.cFlags, name);
-  texture->heap_offset = uint32_t(offset);
-  texture->heap_size = alloc_info.sizeInBytes;
-  texture->heap = heap;
+  texture->apiTex->heap_offset = uint32_t(offset);
+  texture->apiTex->heap_size = alloc_info.sizeInBytes;
+  texture->apiTex->heap = heap;
   return texture;
 }
 
@@ -946,25 +1108,25 @@ ResourceHeapGroupProperties get_resource_heap_group_properties(ResourceHeapGroup
 }
 }
 
-void ResourceHeap::track_resource_read(drv3d_metal::HazardTracker &resource)
+void ResourceHeap::track_resource_read(drv3d_metal::HazardTracker &resource, bool is_from_vs)
 {
   resources.erase(eastl::remove_if(resources.begin(), resources.end(), [this](const Resource &a) { return a.enc.submit <= render.submits_completed; }), resources.end());
 
   for (auto &res : resources)
     if (res.offset < resource.heap_offset + resource.heap_size && res.offset + res.size > resource.heap_offset && res.type != Resource::Access::Read)
-      render.track_resource_read_impl(res.enc);
+      render.track_resource_read_impl(res.enc, is_from_vs);
 
   drv3d_metal::HazardEncoder enc = {render.submits_scheduled, render.current_encoder->index};
   if (resources.size())
   {
     const auto &last = resources.back();
-    if (last.enc == enc && last.type == Resource::Access::Read)
+    if (last.enc == enc && last.type == Resource::Access::Read && last.offset == resource.heap_offset && last.size == resource.heap_size)
       return;
   }
   resources.emplace_back(enc, resource.heap_offset, resource.heap_size, Resource::Access::Read);
 }
 
-void ResourceHeap::track_resource_write(drv3d_metal::HazardTracker &resource)
+void ResourceHeap::track_resource_write(drv3d_metal::HazardTracker &resource, bool is_from_vs)
 {
   resources.erase(eastl::remove_if(resources.begin(), resources.end(), [this](const Resource &a) { return a.enc.submit <= render.submits_completed; }), resources.end());
 
@@ -972,7 +1134,7 @@ void ResourceHeap::track_resource_write(drv3d_metal::HazardTracker &resource)
   {
     const auto& res = *it;
     if (res.offset < resource.heap_offset + resource.heap_size && res.offset + res.size > resource.heap_offset)
-      render.track_resource_read_impl(res.enc);
+      render.track_resource_read_impl(res.enc, is_from_vs);
     // when tracking writes we basically wait for everything that was before so replacing all accesses with current write would be enough
     if (res.offset == resource.heap_offset && res.size == resource.heap_size)
       it = resources.erase(it);

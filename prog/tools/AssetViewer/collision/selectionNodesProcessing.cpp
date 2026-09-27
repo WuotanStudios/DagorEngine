@@ -197,13 +197,13 @@ void SelectionNodesProcessing::fillInfoTree(PropPanel::ContainerPropertyControl 
   create_tree_leaf_from_container(convexsComputerSettings, tree);
   create_tree_leaf_from_container(convexsVhacdSettings, tree);
 
-  dag::ConstSpan<CollisionNode> nodes = collisionRes->getAllNodes();
-  for (const auto &node : nodes)
-  {
-    if (!contains_node(skipNodes, node.name))
+  if (collisionRes)
+    for (const auto &node : collisionRes->getAllNodes())
     {
+      if (contains_node(skipNodes, collisionRes->getNodeName(node.nodeIndex)))
+        continue;
       const char *iconName = "";
-      String nodeName{node.name};
+      String nodeName{collisionRes->getNodeName(node.nodeIndex)};
       if (node.behaviorFlags & CollisionNode::PHYS_COLLIDABLE)
         nodeName.insert(0, "[phys]");
       if (node.behaviorFlags & CollisionNode::TRACEABLE)
@@ -221,7 +221,6 @@ void SelectionNodesProcessing::fillInfoTree(PropPanel::ContainerPropertyControl 
       TLeafHandle leaf = tree->createTreeLeaf(0, nodeName, iconName);
       tree->setCheckboxValue(leaf, true);
     }
-  }
 
   updateHiddenNodes();
   init_checkbox_icons(tree);
@@ -259,13 +258,14 @@ void SelectionNodesProcessing::fillNodeNamesTab(Tab<String> &node_names)
   fill_nodes_name(convexsComputerSettings, node_names);
 
   fillConvexVhacdNamesBlk(node_names, skipNodes);
-
+  if (!collisionRes)
+    return;
   dag::ConstSpan<CollisionNode> nodes = collisionRes->getAllNodes();
   for (const auto &node : nodes)
   {
-    if (!contains_node(skipNodes, node.name))
+    if (!contains_node(skipNodes, collisionRes->getNodeName(node.nodeIndex)))
     {
-      node_names.push_back() = node.name;
+      node_names.push_back() = collisionRes->getNodeName(node.nodeIndex);
     }
   }
 }
@@ -495,11 +495,9 @@ bool SelectionNodesProcessing::checkNodeName(const char *node_name)
     return false;
 
   dag::Vector<String> nodeNames;
-  dag::ConstSpan<CollisionNode> nodes = collisionRes->getAllNodes();
-  for (const auto &node : nodes)
-  {
-    nodeNames.push_back() = node.name;
-  }
+  if (collisionRes)
+    for (const auto &node : collisionRes->getAllNodes())
+      nodeNames.push_back() = collisionRes->getNodeName(node.nodeIndex);
   fill_nodes_name(combinedNodesSettings, nodeNames);
   fill_nodes_name(kdopsSettings, nodeNames);
   fill_nodes_name(convexsVhacdSettings, nodeNames);
@@ -681,8 +679,8 @@ void SelectionNodesProcessing::selectNode(const char *node_name, bool ctrl_press
   });
 }
 
-static void update_hidden_nodes(const SelectedNodesSettings &settings, const dag::ConstSpan<CollisionNode> &nodes,
-  dag::Vector<bool> &hidden_nodes)
+static void update_hidden_nodes(const SelectedNodesSettings &settings, const CollisionResource &collres,
+  const dag::ConstSpan<CollisionNode> &nodes, dag::Vector<bool> &hidden_nodes)
 {
   if (settings.replaceNodes)
   {
@@ -690,7 +688,7 @@ static void update_hidden_nodes(const SelectedNodesSettings &settings, const dag
     {
       for (int i = 0; i < nodes.size(); ++i)
       {
-        if (refNode == nodes[i].name.c_str())
+        if (refNode == collres.getNodeName(nodes[i].nodeIndex))
         {
           hidden_nodes[i] = true;
           break;
@@ -701,34 +699,36 @@ static void update_hidden_nodes(const SelectedNodesSettings &settings, const dag
 }
 
 template <typename T>
-void update_hidden_nodes_from_contianer(const T &container, const dag::ConstSpan<CollisionNode> &nodes,
-  dag::Vector<bool> &hidden_nodes)
-{
-  for (const auto &settings : container)
-  {
-    update_hidden_nodes(settings.selectedNodes, nodes, hidden_nodes);
-  }
-}
-
-template <>
-void update_hidden_nodes_from_contianer(const dag::Vector<SelectedNodesSettings> &container,
+void update_hidden_nodes_from_contianer(const T &container, const CollisionResource &collres,
   const dag::ConstSpan<CollisionNode> &nodes, dag::Vector<bool> &hidden_nodes)
 {
   for (const auto &settings : container)
   {
-    update_hidden_nodes(settings, nodes, hidden_nodes);
+    update_hidden_nodes(settings.selectedNodes, collres, nodes, hidden_nodes);
+  }
+}
+
+template <>
+void update_hidden_nodes_from_contianer(const dag::Vector<SelectedNodesSettings> &container, const CollisionResource &collres,
+  const dag::ConstSpan<CollisionNode> &nodes, dag::Vector<bool> &hidden_nodes)
+{
+  for (const auto &settings : container)
+  {
+    update_hidden_nodes(settings, collres, nodes, hidden_nodes);
   }
 }
 
 void SelectionNodesProcessing::updateHiddenNodes()
 {
+  if (!collisionRes)
+    return hiddenNodes.clear();
   dag::ConstSpan<CollisionNode> collisionNodes = collisionRes->getAllNodes();
   hiddenNodes.clear();
   hiddenNodes.resize(collisionNodes.size(), false);
-  update_hidden_nodes_from_contianer(combinedNodesSettings, collisionNodes, hiddenNodes);
-  update_hidden_nodes_from_contianer(kdopsSettings, collisionNodes, hiddenNodes);
-  update_hidden_nodes_from_contianer(convexsComputerSettings, collisionNodes, hiddenNodes);
-  update_hidden_nodes_from_contianer(convexsVhacdSettings, collisionNodes, hiddenNodes);
+  update_hidden_nodes_from_contianer(combinedNodesSettings, *collisionRes, collisionNodes, hiddenNodes);
+  update_hidden_nodes_from_contianer(kdopsSettings, *collisionRes, collisionNodes, hiddenNodes);
+  update_hidden_nodes_from_contianer(convexsComputerSettings, *collisionRes, collisionNodes, hiddenNodes);
+  update_hidden_nodes_from_contianer(convexsVhacdSettings, *collisionRes, collisionNodes, hiddenNodes);
 }
 
 template <typename T>

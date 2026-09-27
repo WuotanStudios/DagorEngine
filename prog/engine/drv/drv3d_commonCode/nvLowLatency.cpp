@@ -1,29 +1,47 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <3d/dag_nvFeatures.h>
-#include <drv/3d/dag_commands.h>
-#include <perfMon/dag_statDrv.h>
-#include <debug/dag_debug.h>
-#include <nvapi.h>
+#include "streamline_adapter.h"
+#include "drv_log_defs.h"
 #include <3d/gpuLatency.h>
-#include <dag/dag_vector.h>
+#include <debug/dag_debug.h>
+#include <drv/3d/dag_commands.h>
+#include <drv/3d/dag_consts.h>
+#include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_info.h>
+#include <generic/dag_staticTab.h>
+#include <perfMon/dag_statDrv.h>
+
 
 template <int id, typename... Args>
 static bool CheckOnce(bool cond, const char *msg, const Args &...args)
 {
-  if (cond)
+  if (cond) [[likely]]
     return true;
 
   static bool firstError = true;
   if (firstError)
   {
-    logerr(msg, args...);
+    D3D_ERROR(msg, args...);
     firstError = false;
   }
   return false;
 }
 
-static bool is_report_valid(const nv::Reflex::ReflexStats &report)
+static bool is_device_lost_suppressed()
+{
+  if (!d3d::device_lost(nullptr))
+    return false;
+
+  static bool firstTime = true;
+  if (firstTime)
+  {
+    logdbg("[Reflex] device lost, suppressing Streamline calls");
+    firstTime = false;
+  }
+  return true;
+}
+
+static bool is_report_valid(const Reflex::Stats &report)
 {
   uint64_t maxDifference = 16667 * 100; // 100 frames
   const uint64_t startTime = report.simStartTime;
@@ -53,7 +71,7 @@ class StreamlineGpuLatency : public GpuLatency
 public:
   StreamlineGpuLatency()
   {
-    if (auto sl = getStreamline())
+    if (StreamlineAdapter * sl; d3d::driver_command(Drv3dCommand::GET_STREAMLINE, &sl))
     {
       modes = {Mode::Off};
       if (sl->isReflexSupported() == nv::SupportState::Supported)
@@ -62,8 +80,6 @@ public:
       if (reflex)
         if (auto state = reflex->getState(); state.has_value() && state->lowLatencyAvailable)
           modes = {Mode::Off, Mode::On, Mode::OnPlusBoost};
-
-      latencyIndicatorEnabled = false;
     }
   }
 
@@ -73,7 +89,7 @@ public:
     {
       setOptions(Mode::Off, 0);
 
-      if (auto sl = getStreamline())
+      if (StreamlineAdapter * sl; d3d::driver_command(Drv3dCommand::GET_STREAMLINE, &sl))
       {
         reflex = nullptr;
         sl->releaseReflexFeature();
@@ -86,7 +102,7 @@ public:
 
   void startFrame(uint32_t frame_id) override
   {
-    if (reflex)
+    if (reflex && !is_device_lost_suppressed())
       reflex->startFrame(frame_id);
   }
 
@@ -95,7 +111,7 @@ public:
     if (!reflex)
       return;
 
-    if (marker_type == lowlatency::LatencyMarkerType::TRIGGER_FLASH && !latencyIndicatorEnabled)
+    if (is_device_lost_suppressed())
       return;
 
     CheckOnce<__LINE__>(reflex->setMarker(frame_id, marker_type), "Reflex: setMarker has failed with frame_id: %d, and marker: %d",
@@ -104,25 +120,19 @@ public:
 
   void setOptions(Mode mode, uint32_t frame_limit_us) override
   {
-    if (reflex)
+    if (reflex && !is_device_lost_suppressed())
     {
       debug("[Reflex] Set latency mode: latency mode: %d, interval: %dus", eastl::to_underlying(mode), frame_limit_us);
-
-      bool success = false;
-      switch (mode)
-      {
-        case Mode::Off: success = reflex->setOptions(nv::Reflex::ReflexMode::Off, frame_limit_us); break;
-        case Mode::On: success = reflex->setOptions(nv::Reflex::ReflexMode::On, frame_limit_us); break;
-        case Mode::OnPlusBoost: success = reflex->setOptions(nv::Reflex::ReflexMode::OnPlusBoost, frame_limit_us); break;
-      }
-
-      CheckOnce<__LINE__>(success, "[Reflex] setReflexOptions has failed");
+      CheckOnce<__LINE__>(reflex->setOptions(mode, frame_limit_us), "[Reflex] setReflexOptions has failed");
     }
   }
 
   void sleep(uint32_t frame_id) override
   {
     if (!reflex)
+      return;
+
+    if (is_device_lost_suppressed())
       return;
 
     TIME_PROFILE(nv_low_latency_sleep);
@@ -136,27 +146,33 @@ public:
     if (!reflex)
       return ret;
 
+    if (is_device_lost_suppressed())
+      return ret;
+
     auto state = reflex->getState();
     if (!state)
       return ret; // frameCount = 0
 
-    if (max_count == 0 || max_count > nv::Reflex::ReflexState::FRAME_COUNT)
-      max_count = nv::Reflex::ReflexState::FRAME_COUNT;
+    if (max_count == 0 || max_count > Reflex::State::FRAME_COUNT)
+      max_count = Reflex::State::FRAME_COUNT;
 
-    for (uint32_t i = nv::Reflex::ReflexState::FRAME_COUNT;
-         i > nv::Reflex::ReflexState::FRAME_COUNT - max_count && state->stats[i - 1].frameID > frame_id; --i)
+    for (uint32_t i = Reflex::State::FRAME_COUNT; i > Reflex::State::FRAME_COUNT - max_count && state->stats[i - 1].frameID > frame_id;
+         --i)
     {
-      const nv::Reflex::ReflexStats &report = state->stats[i - 1];
+      const Reflex::Stats &report = state->stats[i - 1];
       if (!is_report_valid(report))
         continue;
-      const NvU64 startTime = report.simStartTime;
+      const uint64_t startTime = report.simStartTime;
       const float gpuRenderEndTime = (report.gpuRenderEndTime - startTime) / 1000.f;
       const float renderSubmitEndTime = (report.renderSubmitEndTime - startTime) / 1000.f;
       const float osRenderQueueStartTime = (report.osRenderQueueStartTime - startTime) / 1000.f;
 
       ret.latestFrameId = eastl::max(ret.latestFrameId, static_cast<uint32_t>(report.frameID));
 
-      ret.gameToRenderLatency.apply(gpuRenderEndTime);
+      // on vulkan despite misattribution correction, results are still unstable and wrong-ish
+      // mask them out same way as NV driver overlay does - show 0
+      if (!d3d::get_driver_code().is(d3d::vulkan))
+        ret.gameToRenderLatency.apply(gpuRenderEndTime);
       ret.gameLatency.apply(renderSubmitEndTime);
       ret.renderLatency.apply(gpuRenderEndTime - osRenderQueueStartTime);
 
@@ -199,24 +215,16 @@ public:
   {
     if (!reflex)
       return false;
-    return reflex->getCurrentMode() != nv::Reflex::ReflexMode::Off;
+    return reflex->getMode() != Mode::Off;
   }
 
   GpuVendor getVendor() const override { return GpuVendor::NVIDIA; }
 
-  bool isVsyncAllowed() const override { return !reflex || reflex->getCurrentMode() == nv::Reflex::ReflexMode::Off; }
+  bool isVsyncAllowed() const override { return !reflex || reflex->getMode() == Mode::Off; }
 
 private:
-  static nv::Streamline *getStreamline()
-  {
-    nv::Streamline *sl = nullptr;
-    d3d::driver_command(Drv3dCommand::GET_STREAMLINE, &sl);
-    return sl;
-  }
-
-  nv::Reflex *reflex = nullptr;
-  dag::Vector<Mode> modes = {Mode::Off};
-  bool latencyIndicatorEnabled = false;
+  Reflex *reflex = nullptr;
+  StaticTab<Mode, 3> modes = {Mode::Off};
 };
 
 GpuLatency *create_gpu_latency_nvidia() { return new StreamlineGpuLatency(); }

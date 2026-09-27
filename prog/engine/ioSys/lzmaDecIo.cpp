@@ -160,7 +160,7 @@ int BufferedLzmaLoadCB::tryRead(void *_ptr, int size)
     return size;
   }
 
-  if (totalOut - curPos && totalOut - curPos < size)
+  if (totalOut - curPos != 0 && totalOut - curPos < size)
   {
     memcpy(ptr, outBuf + curPos, totalOut - curPos);
     ptr += totalOut - curPos;
@@ -185,10 +185,12 @@ int BufferedLzmaLoadCB::tryRead(void *_ptr, int size)
   else
   {
     totalOut = LzmaLoadCB::tryReadImpl(outBuf, OUT_BUF_SZ);
-    G_ASSERT(totalOut >= size);
-    memcpy(ptr, outBuf, size);
-    ptr += size;
-    curPos = size;
+    // the tail of the stream yields less than a full buffer, so only what was
+    // decoded is valid here
+    unsigned avail = totalOut < (unsigned)size ? totalOut : (unsigned)size;
+    memcpy(ptr, outBuf, avail);
+    ptr += avail;
+    curPos = avail;
   }
   return ptr - (char *)_ptr;
 }

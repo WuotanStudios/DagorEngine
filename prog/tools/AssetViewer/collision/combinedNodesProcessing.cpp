@@ -17,8 +17,10 @@ void CombinedNodesProcessing::calcSelectedCombinedNode() { calcCombinedNode(sele
 
 void CombinedNodesProcessing::calcCombinedNode(const SelectedNodesSettings &settings)
 {
-  dag::ConstSpan<CollisionNode> collisionNodes = collisionRes->getAllNodes();
   clearSelectedNode();
+  if (!collisionRes)
+    return;
+  dag::ConstSpan<CollisionNode> collisionNodes = collisionRes->getAllNodes();
   switch (settings.type)
   {
     case ExportCollisionNodeType::MESH:
@@ -26,9 +28,15 @@ void CombinedNodesProcessing::calcCombinedNode(const SelectedNodesSettings &sett
     case ExportCollisionNodeType::CONVEX_COMPUTER:
     case ExportCollisionNodeType::CONVEX_VHACD:
       for (const auto &refNode : settings.refNodes)
-      {
-        add_verts_and_indices_from_node(collisionNodes, refNode, selectedNode.vertices, selectedNode.indices);
-      }
+        if (!add_verts_and_indices_from_node(*collisionRes, collisionNodes, refNode, selectedNode.vertices, selectedNode.indices))
+        {
+          // Ref empty/overflowed the 16-bit merged buffer (callee logerr'd) or missing (no log there):
+          // the partial merge is incomplete, so drop it instead of previewing a combined node with
+          // geometry silently omitted.
+          logerr("Combined node ref <%s> not found or not merged", refNode);
+          clearSelectedNode();
+          break;
+        }
       break;
 
     case ExportCollisionNodeType::BOX:
@@ -36,13 +44,14 @@ void CombinedNodesProcessing::calcCombinedNode(const SelectedNodesSettings &sett
       {
         for (const auto &node : collisionNodes)
         {
-          if (refNode == node.name.c_str())
+          if (refNode == collisionRes->getNodeName(node.nodeIndex))
           {
+            BBox3 nodeBBox = collisionRes->getNodeBBox(node.nodeIndex);
             if (node.type == COLLISION_NODE_TYPE_MESH || node.type == COLLISION_NODE_TYPE_CAPSULE ||
                 node.type == COLLISION_NODE_TYPE_CONVEX)
-              selectedNode.boundingBox += node.tm * node.modelBBox;
+              selectedNode.boundingBox += collisionRes->getNodeTm(node.nodeIndex) * nodeBBox;
             else
-              selectedNode.boundingBox += node.modelBBox;
+              selectedNode.boundingBox += nodeBBox;
           }
         }
       }
@@ -53,9 +62,14 @@ void CombinedNodesProcessing::calcCombinedNode(const SelectedNodesSettings &sett
       {
         for (const auto &node : collisionNodes)
         {
-          if (refNode == node.name.c_str())
+          if (refNode == collisionRes->getNodeName(node.nodeIndex))
           {
-            selectedNode.boundingSphere += node.tm * node.boundingSphere;
+            // a SPHERE node's bounding sphere already carries the placement; other types stay stored-frame
+            BSphere3 nodeBSphere = collisionRes->getNodeBSphere(node.nodeIndex);
+            if (node.type == COLLISION_NODE_TYPE_SPHERE)
+              selectedNode.boundingSphere += nodeBSphere;
+            else
+              selectedNode.boundingSphere += collisionRes->getNodeTm(node.nodeIndex) * nodeBSphere;
           }
         }
       }
@@ -93,7 +107,7 @@ void CombinedNodesProcessing::renderCombinedNodes(bool is_faded, bool draw_solid
     {
       case ExportCollisionNodeType::MESH:
       {
-        if (draw_solid)
+        if (draw_solid && !node.indices.empty())
         {
           draw_debug_solid_mesh(node.indices.data(), node.indices.size() / 3, &node.vertices.data()->x, elem_size(node.vertices),
             node.vertices.size(), TMatrix::IDENT, color, false, DrawSolidMeshCull::FLIP);

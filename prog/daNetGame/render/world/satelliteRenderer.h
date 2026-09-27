@@ -3,6 +3,7 @@
 
 #include <3d/dag_resPtr.h>
 #include <EASTL/functional.h>
+#include <EASTL/unique_ptr.h>
 
 #include <math/integer/dag_IPoint2.h>
 #include <math/dag_Point2.h>
@@ -17,10 +18,11 @@ class SatelliteRenderer
 {
 public:
   using LandmeshHeightGetterCb = eastl::function<bool(const Point2 &pos2d, float &height)>;
-  using RenderWaterCb = eastl::function<void(Texture *color_target, const TMatrix &itm, Texture *depth)>;
+  using RenderWaterCb = eastl::function<void(Texture *color_target, const CameraParams &camera, Texture *depth)>;
   using RenderLandmeshCb =
     eastl::function<void(mat44f_cref globtm, const TMatrix4 &proj, const Frustum &frustum, const Point3 &view_pos)>;
   using ClipmapGetLastUpdatedTileCountCb = eastl::function<int()>;
+  using TexStreamingGetPendingCountCb = eastl::function<int()>;
 
   struct CallbackParams
   {
@@ -28,6 +30,7 @@ public:
     RenderWaterCb renderWater;
     RenderLandmeshCb renderLandmesh;
     ClipmapGetLastUpdatedTileCountCb clipmapGetLastUpdatedTileCount;
+    TexStreamingGetPendingCountCb texStreamingGetPendingCount;
   };
 
   using GetParamsCb = eastl::function<CallbackParams()>;
@@ -40,12 +43,12 @@ private:
   void ensureTargets();
   void renderFromPos(Point3 in_pos, const CallbackParams &callback_params, CameraParams &camera_params);
   void adjustRenderHeight(Point3 &in_pos, const CallbackParams &callback_params);
-  void scanSettleCheck(int vtex_updates);
+  void scanSettleCheck(int vtex_updates, int tex_streaming_pending);
 
   GetParamsCb getParamsCb;
 
   eastl::unique_ptr<DeferredRenderTarget> renderTargetGbuf;
-  UniqueTexHolder targetTex;
+  UniqueTexWithShaderVar targetTex;
   RiGenVisibility *riGenVisibility = nullptr;
 
   IPoint2 scanIndex = IPoint2::ZERO;

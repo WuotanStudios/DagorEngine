@@ -1,9 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
-#include <EASTL/fixed_vector.h>
-#include <free_list_utils.h>
-#include <value_range.h>
+#include "debug/names.h"
 
 #if _TARGET_XBOX
 #define REPORT_HEAP_INFO 1
@@ -23,6 +21,12 @@
 #include "resource_manager/buffer_components.h"
 #include "resource_manager/rtx_components.h"
 
+#include <value_range.h>
+#include <drv/3d/dag_resourceTag.h>
+
+#include <EASTL/fixed_vector.h>
+
+
 struct ResourceDumpTexture;
 struct ResourceDumpBuffer;
 struct ResourceDumpRayTrace;
@@ -32,6 +36,8 @@ namespace drv3d_dx12
 {
 struct ScratchBuffer
 {
+  static constexpr char debug_name[] = "ScratchBuffer";
+
   ID3D12Resource *buffer = nullptr;
   size_t offset = 0;
 
@@ -57,18 +63,31 @@ protected:
   }
 
   void freeView(const ImageViewInfo &view);
+  static eastl::pair<D3D12_RESOURCE_DESC, D3D12_RESOURCE_ALLOCATION_INFO> calculate_texture_desc_allocation_info(ID3D12Device *device,
+    Image *original);
 
 public:
-  ImageCreateResult createTexture(DXGIAdapter *adapter, Device &device, const ImageInfo &ii, const char *name);
+  dag::Expected<ImageCreateResult, MemoryAllocationError> createTexture(DXGIAdapter *adapter, Device &device, const ImageInfo &ii,
+    const char *name);
+  using ImageCloneResult = dag::Expected<eastl::optional<Image *>, MemoryAllocationError>;
+  using ImageResult = dag::Expected<Image *, MemoryAllocationError>;
+
+  // Can not fail, the image object pool aborts when it is out of memory.
   Image *adoptTexture(ID3D12Resource *texture, const char *name);
 #if _TARGET_PC_WIN
-  Image *cloneRenderTarget(DXGIAdapter *adapter, ID3D12Device *device, Image *original,
+  ImageResult cloneRenderTarget(DXGIAdapter *adapter, Device &device, Image *original,
     D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_RENDER_TARGET);
 #endif
 
   void destroyTextureOnFrameCompletion(Image *texture)
   {
     accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>([=](auto &data) { data.deletedImages.push_back(texture); });
+  }
+
+  void destroyTextureOnFrameCompletionNoLock(Image *texture) DAG_TS_REQUIRES(recodingPendingFrameCompletionMutex)
+  {
+    accessRecodingPendingFrameCompletionNoLock<PendingForCompletedFrameData>(
+      [=](auto &data) { data.deletedImages.push_back(texture); });
   }
 
   bool tryDestroyTextureOnFrameCompletion(Image *texture)
@@ -86,12 +105,47 @@ public:
     return !isAlreadyRemoved;
   }
 
-  Image *tryCloneTexture(DXGIAdapter *adapter, ID3D12Device *device, Image *original, D3D12_RESOURCE_STATES initialState,
+  bool tryDestroyTextureOnFrameCompletionNoLock(Image *texture) DAG_TS_REQUIRES(recodingPendingFrameCompletionMutex)
+  {
+    bool isAlreadyRemoved = false;
+    accessRecodingPendingFrameCompletionNoLock<PendingForCompletedFrameData>([=, &isAlreadyRemoved](auto &data) {
+      auto it = eastl::find(data.deletedImages.begin(), data.deletedImages.end(), texture);
+      if (it != data.deletedImages.end())
+      {
+        isAlreadyRemoved = true;
+        return;
+      }
+      data.deletedImages.push_back(texture);
+    });
+    return !isAlreadyRemoved;
+  }
+
+  /// Empty when no memory could be found for the copy, which is how defragmentation learns that a
+  /// heap group is full. A rejected request or a failed resource creation is an error.
+  ImageCloneResult tryCloneTexture(DXGIAdapter *adapter, ID3D12Device *device, Image *original, D3D12_RESOURCE_STATES initialState,
     AllocationFlags allocation_flags);
+  /// The memory is provided by the caller, so this either creates the texture or fails hard.
+  ImageResult tryCloneTextureToMemory(ID3D12Device *device, Image *original, D3D12_RESOURCE_STATES initial_state,
+    const D3D12_RESOURCE_DESC &desc, const ResourceMemory &memory, ImagePoolState::AccessToken &access);
 
 protected:
   void destroyTextures(eastl::span<Image *> textures, frontend::BindlessManager &bindless_manager);
 };
+
+/// d3d user heap handles are indices into the alias heap table, biased by one, because index zero
+/// would be a nullptr and that means "no heap" to d3d.
+inline ::ResourceHeap *make_user_heap_handle(uintptr_t index) { return reinterpret_cast<::ResourceHeap *>(index + 1); }
+inline uintptr_t user_heap_handle_to_index(const ::ResourceHeap *handle) { return reinterpret_cast<uintptr_t>(handle) - 1; }
+
+/// Index of the handle that Device::newUserHeap hands out when the device is ill and no heap was
+/// created. It is not a nullptr, so the caller does not walk into its out of memory path, and the
+/// alias heap table can never grow far enough to contain it. The functions that act on a heap test
+/// for it and refuse: placing a buffer or a texture, mapping tiles and freeing the heap.
+/// getUserHeapMemory is the exception, it answers with an empty memory range for every handle it can
+/// not resolve, and its only caller tests the handle before it asks.
+inline constexpr uintptr_t ill_device_user_heap_index = 0xFFFFFFFE;
+inline ::ResourceHeap *make_ill_device_user_heap_handle() { return make_user_heap_handle(ill_device_user_heap_index); }
+inline bool is_ill_device_user_heap_handle(const ::ResourceHeap *handle) { return make_ill_device_user_heap_handle() == handle; }
 
 class AliasHeapProvider : public TextureImageFactory
 {
@@ -99,15 +153,11 @@ class AliasHeapProvider : public TextureImageFactory
 
   struct AliasHeap
   {
-    enum class Flag
-    {
-      AUTO_FREE,
-      COUNT
-    };
     ResourceMemory memory;
     dag::Vector<Image *> images;
     dag::Vector<BufferGlobalId> buffers;
-    TypedBitSet<Flag> flags;
+    bool autoFree = false;
+    ResourceTagType tag = nullptr;
 #if _TARGET_XBOX
     HANDLE heapRegHandle = nullptr;
 #endif
@@ -121,7 +171,7 @@ class AliasHeapProvider : public TextureImageFactory
       memory = {};
     }
 
-    bool shouldBeFreed() const { return flags.test(Flag::AUTO_FREE) && images.empty() && buffers.empty(); }
+    bool shouldBeFreed() const { return autoFree && images.empty() && buffers.empty(); }
   };
 
   static D3D12_RESOURCE_DESC as_desc(const BasicTextureResourceDescription &desc);
@@ -175,20 +225,32 @@ protected:
         continue;
       ResourceHeapProperties properties;
       properties.raw = heap.memory.getHeapID().group;
-      recordDeletedUserResourceHeap(heap.memory.size(), !properties.isCPUVisible());
-      free(heap.memory, false);
+      recordDeletedUserResourceHeap(heap.memory.size(), properties.isOnDevice(getFeatureSet()));
+      free(heap.memory);
       heap.reset();
     }
     BaseType::preRecovery();
   }
 
 public:
-  ::ResourceHeap *newUserHeap(DXGIAdapter *adapter, Device &device, ::ResourceHeapGroup *group, size_t size,
-    ResourceHeapCreateFlags flags);
+  using UserHeapResult = dag::Expected<::ResourceHeap *, MemoryAllocationError>;
+
+  /// E_UNEXPECTED means the allocation failed and the device is ill, so the failure must not be
+  /// read as an out of memory, see the sentinel handling in Device::newUserHeap.
+  UserHeapResult newUserHeap(DXGIAdapter *adapter, Device &device, ::ResourceHeapGroup *group, size_t size,
+    ResourceHeapCreateFlags flags, ResourceTagType tag);
   // assumes mutex is locked
   void freeUserHeap(ID3D12Device *device, ::ResourceHeap *ptr);
-  ResourceAllocationProperties getResourceAllocationProperties(ID3D12Device *device, const ResourceDescription &desc);
-  ImageCreateResult placeTextureInHeap(DXGIAdapter *adapter, ID3D12Device *device, ::ResourceHeap *heap,
+  using ResourceAllocationPropertiesResult = dag::Expected<ResourceAllocationProperties, MemoryAllocationError>;
+
+  /// Fails with E_INVALIDARG when the runtime rejects the description, no allocation is attempted.
+  ResourceAllocationPropertiesResult getResourceAllocationProperties(ID3D12Device *device, const ResourceDescription &desc);
+  /// How placeTextureInHeap, placeBufferInHeap and aliasTexture classify a failure: E_INVALIDARG for
+  /// a request the caller got wrong, like a heap handle the table does not know, E_UNEXPECTED for the
+  /// handle of an ill device, and the HRESULT of the call that failed for a resource creation.
+  using ImageCreateResultOrError = dag::Expected<ImageCreateResult, MemoryAllocationError>;
+
+  ImageCreateResultOrError placeTextureInHeap(DXGIAdapter *adapter, ID3D12Device *device, ::ResourceHeap *heap,
     const ResourceDescription &desc, size_t offset, const ResourceAllocationProperties &alloc_info, const char *name);
   ResourceHeapGroupProperties getResourceHeapGroupProperties(::ResourceHeapGroup *heap_group);
 
@@ -199,11 +261,14 @@ protected:
   void processAutoFree();
 
 public:
-  BufferState placeBufferInHeap(DXGIAdapter *adapter, ID3D12Device *device, ::ResourceHeap *heap, const ResourceDescription &desc,
-    size_t offset, const ResourceAllocationProperties &alloc_info, const char *name);
+  /// Fails as described on ImageCreateResultOrError.
+  BufferAllocationResult placeBufferInHeap(DXGIAdapter *adapter, ID3D12Device *device, ::ResourceHeap *heap,
+    const ResourceDescription &desc, size_t offset, const ResourceAllocationProperties &alloc_info, const char *name);
   bool detachBuffer(const BufferState &buf);
 
-  ImageCreateResult aliasTexture(DXGIAdapter *adapter, ID3D12Device *device, const ImageInfo &ii, Image *base, const char *name);
+  /// Fails as described on ImageCreateResultOrError.
+  ImageCreateResultOrError aliasTexture(DXGIAdapter *adapter, ID3D12Device *device, const ImageInfo &ii, Image *base,
+    const char *name);
 
   void freeUserHeapOnFrameCompletion(::ResourceHeap *ptr)
   {
@@ -222,7 +287,7 @@ public:
       {
         continue;
       }
-      clb.visitAliasingHeap(i, heap.memory, heap.images, heap.buffers, heap.flags.test(AliasHeap::Flag::AUTO_FREE));
+      clb.visitAliasingHeap(i, heap.memory, heap.images, heap.buffers, heap.autoFree);
     }
     clb.endVisit();
   }
@@ -238,17 +303,22 @@ protected:
     dag::Vector<BasicBuffer> deletedScratchBuffers;
   };
 
+  using ScratchBufferResult = dag::Expected<ScratchBuffer, MemoryAllocationError>;
+
   struct TempScratchBufferState
   {
     BasicBuffer buffer = {};
     size_t allocatedSpace = 0;
 
-    bool ensureSize(DXGIAdapter *adapter, ID3D12Device *device, size_t size, size_t alignment, ScratchBufferProvider *heap)
+    /// Every way this can fail carries a reason, either from the heap allocator or from the
+    /// resource creation, so there is no plain "did not grow" answer.
+    dag::Expected<void, MemoryAllocationError> ensureSize(DXGIAdapter *adapter, ID3D12Device *device, size_t size, size_t alignment,
+      ScratchBufferProvider *heap)
     {
       auto spaceNeeded = align_value(allocatedSpace, alignment) + size;
       if (spaceNeeded <= buffer.getBufferMemorySize())
       {
-        return true;
+        return {};
       }
       // default to times 2 so we stop to realloc at some point
       auto nextSize = max<size_t>(scartch_buffer_min_size, buffer.getBufferMemorySize() * 2);
@@ -286,58 +356,57 @@ protected:
       allocInfo.Alignment = desc.Alignment;
 
       auto memoryProperties = heap->getScratchBufferHeapProperties();
-      auto memory = heap->allocate(adapter, device, memoryProperties, allocInfo, {});
-      if (!memory)
-      {
-        return false;
-      }
+      return heap->allocate(adapter, device, memoryProperties, allocInfo, {})
+        .and_then([&, this](auto &&memory) -> dag::Expected<void, MemoryAllocationError> {
+          auto errorCode = buffer.create(device, desc, memory, D3D12_RESOURCE_STATE_INITIAL_BUFFER_STATE, false,
+            debug::make_pool_object_name(ScratchBuffer::debug_name));
 
-      auto errorCode = buffer.create(device, desc, memory, D3D12_RESOURCE_STATE_INITIAL_BUFFER_STATE, false);
+          allocatedSpace = 0;
+          if (DX12_CHECK_FAIL(errorCode))
+          {
+            heap->free(memory);
+            return unexpected_memory_allocation_error(errorCode);
+          }
 
-      allocatedSpace = 0;
-      if (DX12_CHECK_OK(errorCode))
-      {
-        heap->recordScratchBufferAllocated(desc.Width);
-        heap->updateMemoryRangeUse(memory, ScratchBufferReference{buffer.getResourcePtr()});
-      }
-      else
-      {
-        heap->free(memory, false);
-      }
+          heap->recordScratchBufferAllocated(desc.Width);
+          heap->updateMemoryRangeUse(memory, ScratchBufferReference{buffer.getResourcePtr()});
 
-      return DX12_CHECK_OK(errorCode);
+          return {};
+        });
     }
 
-    ScratchBuffer getSpace(DXGIAdapter *adapter, ID3D12Device *device, size_t size, size_t alignment, ScratchBufferProvider *heap)
+    ScratchBufferResult getSpace(DXGIAdapter *adapter, ID3D12Device *device, size_t size, size_t alignment,
+      ScratchBufferProvider *heap)
     {
-      ScratchBuffer result{};
-      ensureSize(adapter, device, size, alignment, heap);
-      if (buffer)
-      {
+      return ensureSize(adapter, device, size, alignment, heap).and_then([&, this]() -> ScratchBufferResult {
+        if (!buffer)
+        {
+          return unexpected_memory_allocation_error(E_FAIL);
+        }
+
+        ScratchBuffer result{};
         result.buffer = buffer.getResourcePtr();
         result.offset = align_value(allocatedSpace, alignment);
         // keep allocatedSpace as it is only used for one operation and can be reused on the next
-      }
-      return result;
+        return result;
+      });
     }
 
-    ScratchBuffer getPersistentSpace(DXGIAdapter *adapter, ID3D12Device *device, size_t size, size_t alignment,
+    ScratchBufferResult getPersistentSpace(DXGIAdapter *adapter, ID3D12Device *device, size_t size, size_t alignment,
       ScratchBufferProvider *heap)
     {
-      auto space = getSpace(adapter, device, size, alignment, heap);
-      if (space)
-      {
+      return getSpace(adapter, device, size, alignment, heap).transform([&, this](auto space) {
         // alter allocatedSpace to turn this transient space into persistent
         allocatedSpace = space.offset + size;
-      }
-      return space;
+        return space;
+      });
     }
 
     void reset(ScratchBufferProvider *heap)
     {
       if (buffer)
       {
-        buffer.reset(heap);
+        buffer.reset(heap, true);
       }
     }
   };
@@ -348,8 +417,7 @@ protected:
   static constexpr size_t scartch_buffer_min_size = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
 
 protected:
-  BasicBuffer allocateNewScratchBuffer(DXGIAdapter *adapter, ID3D12Device *device, uint32_t size, AllocationFlags allocation_flags,
-    ScratchBufferWrapper::AccessToken &scratchBufferAccess)
+  static eastl::pair<D3D12_RESOURCE_DESC, D3D12_RESOURCE_ALLOCATION_INFO> get_scratch_buffer_desc_alloc_info(size_t size)
   {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -368,34 +436,65 @@ protected:
     allocInfo.SizeInBytes = desc.Width;
     allocInfo.Alignment = desc.Alignment;
 
+    G_ASSERT(size >= scartch_buffer_min_size);
+
+    return {desc, allocInfo};
+  }
+
+  /// Empty for the two ordinary answers defragmentation has to live with: no memory is left for a
+  /// second scratch buffer, or the attempt was refused because the defragmentation generation moved
+  /// on. A failed resource creation is an error.
+  dag::Expected<eastl::optional<BasicBuffer>, MemoryAllocationError> allocateNewScratchBuffer(DXGIAdapter *adapter,
+    ID3D12Device *device, uint32_t size, AllocationFlags allocation_flags)
+  {
+    const auto [desc, allocInfo] = get_scratch_buffer_desc_alloc_info(size);
+
     auto memoryProperties =
       getProperties(D3D12_RESOURCE_FLAG_NONE, DeviceMemoryClass::DEVICE_RESIDENT_BUFFER, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
-    auto memory = allocate(adapter, device, memoryProperties, allocInfo, allocation_flags);
+    auto allocationResult = allocate(adapter, device, memoryProperties, allocInfo, allocation_flags);
+    if (!allocationResult.has_value())
+    {
+      if (is_oom_error_code(allocationResult.error().errorCode) || E_ABORT == allocationResult.error().errorCode)
+      {
+        return eastl::optional<BasicBuffer>{};
+      }
+      return dag::Unexpected{allocationResult.error()};
+    }
+    auto &memory = allocationResult.value();
+
     BasicBuffer newBuffer;
-    if (!memory)
+    const auto errorCode = newBuffer.create(device, desc, memory, D3D12_RESOURCE_STATE_INITIAL_BUFFER_STATE, false,
+      debug::make_pool_object_name(ScratchBuffer::debug_name));
+    if (DX12_CHECK_FAIL(errorCode))
     {
-      return newBuffer;
+      free(memory);
+      return unexpected_memory_allocation_error(errorCode);
     }
-    const auto errorCode = newBuffer.create(device, desc, memory, D3D12_RESOURCE_STATE_INITIAL_BUFFER_STATE, false);
-    if (DX12_CHECK_OK(errorCode))
-    {
-      recordScratchBufferAllocated(desc.Width);
-      updateMemoryRangeUse(memory, ScratchBufferReference{scratchBufferAccess->buffer.getResourcePtr()});
-    }
-    else
-      free(memory, allocation_flags.test(AllocationFlag::DEFRAGMENTATION_OPERATION));
-    return newBuffer;
+
+    recordScratchBufferAllocated(desc.Width);
+    // Has to name the buffer this memory belongs to. Defragmentation compares the tag against the
+    // current scratch buffer to decide whether the range can still be moved.
+    updateMemoryRangeUse(memory, ScratchBufferReference{newBuffer.getResourcePtr()});
+    return eastl::optional<BasicBuffer>{eastl::move(newBuffer)};
   }
 
   bool tryMoveScratchBuffer(ScratchBufferWrapper::AccessToken &scratchBufferAccess, DXGIAdapter *adapter, ID3D12Device *device,
-    AllocationFlags allocation_flags)
+    AllocationFlags allocation_flags, HeapID heap_id, bool is_emergency_defragmentation)
   {
-    auto movedBuffer = allocateNewScratchBuffer(adapter, device, scratchBufferAccess->buffer.getBufferMemorySize(), allocation_flags,
-      scratchBufferAccess);
-    if (!movedBuffer)
+    auto allocationResult =
+      allocateNewScratchBuffer(adapter, device, scratchBufferAccess->buffer.getBufferMemorySize(), allocation_flags);
+    if (!allocationResult.has_value())
+    {
+      D3D_ERROR("DX12: Unable to move scratch buffer %p out of heap %u (%u:%u) during %s defragmentation, %s",
+        scratchBufferAccess->buffer.getResourcePtr(), heap_id.raw, heap_id.group, heap_id.index,
+        is_emergency_defragmentation ? "emergency" : "regular", dxgi_error_code_to_string(allocationResult.error().errorCode));
+      return false;
+    }
+    if (!allocationResult.value())
     {
       return false;
     }
+    auto movedBuffer = eastl::move(allocationResult.value().value());
     // queue current buffer for deletion and replace it with the new one
     accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>(
       [=, &scratchBufferAccess](auto &data) { data.deletedScratchBuffers.push_back(eastl::move(scratchBufferAccess->buffer)); });
@@ -419,17 +518,17 @@ protected:
 public:
   // Memory is used for one operation an can be reused by the next (for inter resource copy for
   // example)
-  ScratchBuffer getTempScratchBufferSpace(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment);
+  ScratchBufferResult getTempScratchBufferSpace(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment);
 
   // Memory can be used anytime by multiple distinct operations until the frame has ended.
-  ScratchBuffer getPersistentScratchBufferSpace(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment);
+  ScratchBufferResult getPersistentScratchBufferSpace(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment);
 
   void completeFrameExecution(const CompletedFrameExecutionInfo &info, PendingForCompletedFrameData &data)
   {
     for (auto &buffer : data.deletedScratchBuffers)
     {
       recordScratchBufferFreed(buffer.getBufferMemorySize());
-      buffer.reset(this);
+      buffer.reset(this, true);
     }
     data.deletedScratchBuffers.clear();
 
@@ -456,24 +555,32 @@ class SamplerDescriptorProvider : public ScratchBufferProvider
 
   using SamplerInfo = SamplerDescriptorAndState;
 
+  using SamplerLookupResult = dag::Expected<dag::Vector<SamplerInfo>::const_iterator, MemoryAllocationError>;
+
   struct State
   {
     dag::Vector<SamplerInfo> samplers;
     DescriptorHeap<SamplerStagingPolicy> descriptors;
 
-    dag::Vector<SamplerInfo>::const_iterator get(ID3D12Device *device, SamplerState state)
+    /// Nothing is stored when the descriptor can not be allocated. Sampler entries live as long as
+    /// the driver does and their index is the handle, so a null descriptor stored here would be
+    /// handed out for the rest of the run.
+    SamplerLookupResult get(ID3D12Device *device, SamplerState state)
     {
       auto ref = eastl::find_if(begin(samplers), end(samplers), [state](auto &info) { return state == info.state; });
-      if (ref == end(samplers))
+      if (ref != end(samplers))
       {
-        SamplerInfo sampler{descriptors.allocate(device), state};
-
-        D3D12_SAMPLER_DESC desc = state.asDesc();
-        device->CreateSampler(&desc, sampler.sampler);
-
-        ref = samplers.insert(ref, sampler);
+        return dag::Vector<SamplerInfo>::const_iterator{ref};
       }
-      return ref;
+
+      return descriptors.allocate(device)
+        .transform_error([](HRESULT errorCode) { return memory_allocation_error(errorCode); })
+        .transform([&, this](auto descriptor) {
+          D3D12_SAMPLER_DESC desc = state.asDesc();
+          device->CreateSampler(&desc, descriptor);
+
+          return dag::Vector<SamplerInfo>::const_iterator{samplers.insert(ref, SamplerInfo{descriptor, state})};
+        });
     }
   };
   ContainerMutexWrapper<State, OSSpinlock> samplers;
@@ -503,12 +610,20 @@ protected:
 
     auto access = samplers.access();
     access->descriptors.init(setup.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
-    // if we are restoring try to restore all samplers
+    // if we are restoring try to restore all samplers. Entries have to keep their index because it
+    // is the handle the callers hold, so one that can not be restored stays with a null descriptor.
     for (auto &info : access->samplers)
     {
+      auto descriptorResult = access->descriptors.allocate(setup.device);
+      if (!descriptorResult.has_value())
+      {
+        D3D_ERROR("DX12: Unable to restore sampler descriptor, %s", dxgi_error_code_to_string(descriptorResult.error()));
+        info.sampler = {};
+        continue;
+      }
       D3D12_SAMPLER_DESC desc = info.state.asDesc();
-      info.sampler = access->descriptors.allocate(setup.device);
-      setup.device->CreateSampler(&desc, info.sampler);
+      setup.device->CreateSampler(&desc, descriptorResult.value());
+      info.sampler = descriptorResult.value();
     }
   }
 
@@ -530,14 +645,18 @@ protected:
     // keep sampler list as we can restore it later
   }
 
-  d3d::SamplerHandle createSampler(ID3D12Device *device, SamplerState state)
+  using SamplerHandleResult = dag::Expected<d3d::SamplerHandle, MemoryAllocationError>;
+  using SamplerDescriptorResult = dag::Expected<D3D12_CPU_DESCRIPTOR_HANDLE, MemoryAllocationError>;
+
+  SamplerHandleResult createSampler(ID3D12Device *device, SamplerState state)
   {
     state.normalizeSelf();
 
     auto access = samplers.access();
-    auto ref = access->get(device, state);
-    uint64_t index = ref - begin(access->samplers) + 1;
-    return d3d::SamplerHandle(index);
+    return access->get(device, state).transform([&access](auto ref) {
+      // the handle is the index of the entry, biased by one so that it is never zero
+      return d3d::SamplerHandle(ref - begin(access->samplers) + 1);
+    });
   }
   D3D12_CPU_DESCRIPTOR_HANDLE getSampler(d3d::SamplerHandle handle)
   {
@@ -545,13 +664,12 @@ protected:
     accessSampler(handle, [&descriptor](auto &info) { descriptor = info.sampler; });
     return descriptor;
   }
-  D3D12_CPU_DESCRIPTOR_HANDLE getSampler(ID3D12Device *device, SamplerState state)
+  SamplerDescriptorResult getSampler(ID3D12Device *device, SamplerState state)
   {
     state.normalizeSelf();
 
     auto access = samplers.access();
-    auto ref = access->get(device, state);
-    return ref->sampler;
+    return access->get(device, state).transform([](auto ref) { return ref->sampler; });
   }
   SamplerDescriptorAndState getSamplerInfo(d3d::SamplerHandle handle)
   {
@@ -564,7 +682,7 @@ protected:
 #define DEFRAG_LOGGING_ENABLED 0
 
 template <class... ARG_TYPE>
-void defragLogdbg(bool is_emergency_defragmentation, ARG_TYPE... args)
+void defragLogdbg(bool is_emergency_defragmentation, const ARG_TYPE &...args)
 {
   bool isRegularDefragmentationLogsEnabled = false;
 #if DEFRAG_LOGGING_ENABLED
@@ -575,7 +693,7 @@ void defragLogdbg(bool is_emergency_defragmentation, ARG_TYPE... args)
 }
 
 template <class... ARG_TYPE>
-void defragLogdbg(ARG_TYPE... args)
+void defragLogdbg(const ARG_TYPE &...args)
 {
   defragLogdbg(false, args...);
 }
@@ -584,6 +702,36 @@ void defragLogdbg(ARG_TYPE... args)
 
 class HeapFragmentationManager : public SamplerDescriptorProvider
 {
+public:
+  struct DefragmentationState
+  {
+    bool isInProgress : 1;
+    bool wasMemoryUpdated : 1;
+  };
+
+  eastl::pair<uint64_t, float> getFreeMemorySizeAndFragmentation(uint64_t group);
+
+  void processDefragmentationForAllGroups(Device &device, DXGIAdapter *adapter, frontend::BindlessManager &bindless_manager);
+  void processDefragmentationForGroup(Device &device, DXGIAdapter *adapter, frontend::BindlessManager &bindless_manager,
+    uint32_t group);
+
+  DefragmentationState processGroup(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device,
+    frontend::BindlessManager &bindless_manager, uint32_t index, bool is_emergency_defragmentation);
+
+  DefragmentationState tryDefragmentHeap(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device,
+    frontend::BindlessManager &bindless_manager, uint32_t index, bool is_emergency_defragmentation);
+
+  DefragmentationState recomposeGroup(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device,
+    frontend::BindlessManager &bindless_manager, uint32_t group_index);
+
+  void beforeEmergencyDefragmentation(uint32_t group_index);
+  void afterEmergencyDefragmentation(uint32_t group_index);
+  bool isDefragmentationRequired(uint32_t group_index);
+  bool isDefragmentationRequiredOom(uint32_t group_index, bool in_progress, uint32_t requested_group, bool is_alternate_heap_allowed,
+    bool is_uav, bool is_rtv, uint64_t requested_size, bool is_dedicated_heap);
+  static uint32_t constexpr get_memory_groups_count() { return ResourceHeapProperties::group_count; }
+
+private:
   using BaseType = SamplerDescriptorProvider;
 
   enum class ResourceMoveResolution
@@ -600,15 +748,17 @@ class HeapFragmentationManager : public SamplerDescriptorProvider
     STAYING,
   };
 
-  void onMoveStandbyBufferEntriesSuccess(const dag::Vector<Heap> &buffer_heaps,
-    BufferHeapStateWrapper::AccessToken &buffer_heap_state_access, BufferGlobalId old_buffer, BufferGlobalId moved_buffer,
-    HeapID heap_id, bool is_emergency_defragmentation);
+  uint64_t getEnoughFreeSpaceSizeRequirement(ResourceHeapProperties props);
+  BudgetPressureLevels getMemoryBudgetPressureLevel(ResourceHeapProperties props);
+
   void moveBufferDeviceObject(GenericBufferInterface *buffer_object, BufferGlobalId moved_buffer,
     frontend::BindlessManager &bindless_manager, DeviceContext &ctx, ID3D12Device *device,
     BufferHeapStateWrapper::AccessToken &buffer_heap_state_access, bool is_emergency_defragmentation);
   void findBufferOwnersAndReplaceDeviceObjects(BufferGlobalId old_buffer, BufferGlobalId moved_buffer,
     frontend::BindlessManager &bindless_manager, DeviceContext &ctx, ID3D12Device *device,
-    BufferHeapStateWrapper::AccessToken &buffer_heap_state_access, bool is_emergency_defragmentation);
+    BufferHeapStateWrapper::AccessToken &buffer_heap_state_access, bool is_emergency_defragmentation, uint64_t buffer_resource_size,
+    const ScratchBuffer &scratch = {});
+  bool hasLockedOwners(BufferGlobalId buffer_id);
 
   ResourceMoveResolution moveResourceAway(DeviceContext &, DXGIAdapter *, ID3D12Device *, frontend::BindlessManager &, HeapID,
     eastl::monostate, AllocationFlags, bool)
@@ -629,12 +779,6 @@ class HeapFragmentationManager : public SamplerDescriptorProvider
     frontend::BindlessManager &bindless_manager, HeapID heap_id, ScratchBufferReference ref, AllocationFlags allocation_flags,
     bool is_emergency_defragmentation);
   ResourceMoveResolution moveResourceAway(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device,
-    frontend::BindlessManager &bindless_manager, HeapID heap_id, PushRingBufferReference ref, AllocationFlags allocation_flags,
-    bool is_emergency_defragmentation);
-  ResourceMoveResolution moveResourceAway(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device,
-    frontend::BindlessManager &bindless_manager, HeapID heap_id, UploadRingBufferReference ref, AllocationFlags allocation_flags,
-    bool is_emergency_defragmentation);
-  ResourceMoveResolution moveResourceAway(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device,
     frontend::BindlessManager &bindless_manager, HeapID heap_id, TempUploadBufferReference ref, AllocationFlags allocation_flags,
     bool is_emergency_defragmentation);
   ResourceMoveResolution moveResourceAway(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device,
@@ -647,11 +791,67 @@ class HeapFragmentationManager : public SamplerDescriptorProvider
     frontend::BindlessManager &bindless_manager, HeapID heap_id, PersistentBidirectionalBufferReference ref,
     AllocationFlags allocation_flags, bool is_emergency_defragmentation);
 
-  bool processGroup(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device, frontend::BindlessManager &bindless_manager,
-    uint32_t index);
+  enum class ResourceLocationUpdateResult
+  {
+    UPDATED,
+    IMMOVABLE,
+    QUEUED_FOR_DELETION,
+    FAILED
+  };
 
-  bool tryDefragmentHeap(DeviceContext &ctx, DXGIAdapter *adapter, ID3D12Device *device, frontend::BindlessManager &bindless_manager,
-    uint32_t index, bool is_emergency_defragmentation);
+  struct DefragmentationAccessTokens
+  {
+    TexturePoolWrapper::AccessToken texturePool;
+    ImagePoolState::AccessToken imagePool;
+    ScratchBufferWrapper::AccessToken scratchBuffer;
+    BufferHeapStateWrapper::AccessToken bufferHeapState;
+    TempMemoryStateWrapper::AccessToken tempBufferState;
+  };
+
+  struct SystemResources
+  {
+    DeviceContext *ctx;
+    DXGIAdapter *adapter;
+    ID3D12Device *device;
+    frontend::BindlessManager *bindlessManager;
+  };
+
+  struct ResourceLocation
+  {
+    HeapID heapId;
+    uint32_t freeRangeIndex;
+    bool hasOverlap;
+  };
+
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &, eastl::monostate, const ResourceLocation &,
+    DefragmentationAccessTokens &);
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &system_resources, Image *texture,
+    const ResourceLocation &new_location, DefragmentationAccessTokens &access);
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &system_resources, BufferGlobalId buffer_id,
+    const ResourceLocation &new_location, DefragmentationAccessTokens &access);
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &system_resources, AliasHeapReference ref,
+    const ResourceLocation &new_location, DefragmentationAccessTokens &access);
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &system_resources, ScratchBufferReference ref,
+    const ResourceLocation &new_location, DefragmentationAccessTokens &access);
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &system_resources, TempUploadBufferReference ref,
+    const ResourceLocation &new_location, DefragmentationAccessTokens &access);
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &system_resources, PersistentUploadBufferReference ref,
+    const ResourceLocation &new_location, DefragmentationAccessTokens &access);
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &system_resources, PersistentReadBackBufferReference ref,
+    const ResourceLocation &new_location, DefragmentationAccessTokens &access);
+  ResourceLocationUpdateResult updateResourceLocation(SystemResources &system_resources, PersistentBidirectionalBufferReference ref,
+    const ResourceLocation &new_location, DefragmentationAccessTokens &access);
+
+  uint64_t getAlignmentRequirement(eastl::monostate, ID3D12Device *, DefragmentationAccessTokens &) { return 0; }
+  uint64_t getAlignmentRequirement(Image *texture, ID3D12Device *device, DefragmentationAccessTokens &access);
+  uint64_t getAlignmentRequirement(BufferGlobalId buffer_id, ID3D12Device *device, DefragmentationAccessTokens &access);
+  uint64_t getAlignmentRequirement(AliasHeapReference ref, ID3D12Device *device, DefragmentationAccessTokens &access);
+  uint64_t getAlignmentRequirement(ScratchBufferReference ref, ID3D12Device *device, DefragmentationAccessTokens &access);
+  uint64_t getAlignmentRequirement(TempUploadBufferReference ref, ID3D12Device *device, DefragmentationAccessTokens &access);
+  uint64_t getAlignmentRequirement(PersistentUploadBufferReference ref, ID3D12Device *device, DefragmentationAccessTokens &access);
+  uint64_t getAlignmentRequirement(PersistentReadBackBufferReference ref, ID3D12Device *device, DefragmentationAccessTokens &access);
+  uint64_t getAlignmentRequirement(PersistentBidirectionalBufferReference ref, ID3D12Device *device,
+    DefragmentationAccessTokens &access);
 
   using HeapIterator = dag::Vector<ResourceHeap>::iterator;
   using RangeIterator = ResourceHeap::FreeRangeSetType::iterator;
@@ -707,15 +907,6 @@ protected:
 
   void completeFrameRecording(Device &device, DXGIAdapter *adapter, frontend::BindlessManager &bindless_manager,
     uint32_t history_index);
-
-  void processEmergencyDefragmentationForGroup(Device &device, DXGIAdapter *adapter, frontend::BindlessManager &bindless_manager,
-    uint32_t group_index);
-
-public:
-  void processEmergencyDefragmentation(Device &device, DXGIAdapter *adapter, frontend::BindlessManager &bindless_manager,
-    uint32_t group_index, bool is_alternate_heap_allowed, bool is_uav, bool is_rtv);
-
-  void processDefragmentationForAllGroups(Device &device, DXGIAdapter *adapter, frontend::BindlessManager &bindless_manager);
 };
 
 class FrameFinalizer : public HeapFragmentationManager
@@ -745,7 +936,6 @@ protected:
   {
     // On shutdown we run over all finalizer data to be sure everything has been cleaned up
     CompletedFrameExecutionInfo info;
-    info.progressIndex = 0xFFFFFFFFFFFFFFFFull;
     info.historyIndex = 0;
     info.bindlessManager = bindless_manager;
 #if _TARGET_PC_WIN
@@ -770,7 +960,6 @@ protected:
   {
     // Also here we run over all data to be sure its properly cleaned up
     CompletedFrameExecutionInfo info;
-    info.progressIndex = 0xFFFFFFFFFFFFFFFFull;
     info.historyIndex = 0;
     info.bindlessManager = bindless_manager;
 #if _TARGET_PC_WIN
@@ -838,15 +1027,13 @@ class DebugViewBase : public FrameFinalizer
   using BaseType = FrameFinalizer;
 
 protected:
-  enum class StatusFlag
+  struct StatusFlags
   {
-    PIN_MIN_EVENT_FRAME_RANGE_TO_MAX,
-    PIN_MAX_EVENT_FRAME_RANGE_TO_MAX,
-    LOAD_VIEWS_FROM_CONFIG,
-    STORE_VIEWS_TO_CONFIG,
-    COUNT
+    bool pinMinEventFrameRangeToMax : 1 = false;
+    bool pinMaxEventFrameRangeToMax : 1 = false;
+    bool loadViewsFromConfig : 1 = false;
+    bool storeViewsToConfig : 1 = false;
   };
-  using StatusFlags = TypedBitSet<StatusFlag>;
 
 private:
   struct MetricsVisualizerState
@@ -856,14 +1043,17 @@ private:
     StatusFlags statusFlags;
     MetricBits shownBits{};
     char eventObjectNameFilter[MAX_OBJECT_NAME_LENGTH]{};
+#if DX12_DEBUG_RESOURCE_ALLOCATOR_ENABLED
+    eastl::array<int, ResourceHeapProperties::group_count> debugAllocationSizeMb{};
+#endif
   };
   MetricsVisualizerState metricsVisualizerState;
 
 protected:
   void setup(const SetupInfo &setup)
   {
-    metricsVisualizerState.statusFlags.set(StatusFlag::PIN_MAX_EVENT_FRAME_RANGE_TO_MAX);
-    metricsVisualizerState.statusFlags.set(StatusFlag::LOAD_VIEWS_FROM_CONFIG);
+    metricsVisualizerState.statusFlags.pinMaxEventFrameRangeToMax = true;
+    metricsVisualizerState.statusFlags.loadViewsFromConfig = true;
 
     BaseType::setup(setup);
   }
@@ -872,9 +1062,8 @@ protected:
 
   size_t getEventObjectNameFilterMaxLength() { return countof(metricsVisualizerState.eventObjectNameFilter); }
 
-  bool checkStatusFlag(StatusFlag flag) const { return metricsVisualizerState.statusFlags.test(flag); }
-
-  void setStatusFlag(StatusFlag flag, bool value) { metricsVisualizerState.statusFlags.set(flag, value); }
+  StatusFlags &getStatusFlags() { return metricsVisualizerState.statusFlags; }
+  const StatusFlags &getStatusFlags() const { return metricsVisualizerState.statusFlags; }
 
   const GraphDisplayInfo &getGraphDisplayInfo(Graph graph)
   {
@@ -886,7 +1075,7 @@ protected:
     auto &target = metricsVisualizerState.graphDisplayInfos[static_cast<uint32_t>(graph)];
     if (target != info)
     {
-      setStatusFlag(StatusFlag::STORE_VIEWS_TO_CONFIG, true);
+      getStatusFlags().storeViewsToConfig = true;
       target = info;
     }
   }
@@ -908,6 +1097,12 @@ protected:
 
   void setShownMetric(Metric metric, bool value) { metricsVisualizerState.shownBits.set(metric, value); }
 
+#if DX12_DEBUG_RESOURCE_ALLOCATOR_ENABLED
+  int getDebugAllocationSizeMb(int group) { return metricsVisualizerState.debugAllocationSizeMb[group]; }
+
+  void setDebugAllocationSizeMb(int group, int value) { metricsVisualizerState.debugAllocationSizeMb[group] = value; }
+#endif
+
   void storeViewSettings();
   void restoreViewSettings();
 };
@@ -920,7 +1115,7 @@ class MetricsVisualizer : public DebugViewBase
 private:
   struct PlotData
   {
-    ConcurrentMetricsStateAccessToken &self;
+    ConcurrentMetricsState::AccessToken &self;
     ValueRange<uint64_t> viewRange;
     uint64_t selectedFrameIndex;
 
@@ -977,7 +1172,7 @@ private:
   GraphDisplayInfo drawGraphViewControls(Graph graph);
   void setupPlotY2CountRange(uint64_t max_value, bool has_data);
   void setupPlotYMemoryRange(uint64_t max_value, bool has_data);
-  PlotData setupPlotXRange(ConcurrentMetricsStateAccessToken &access, const GraphDisplayInfo &display_state, bool has_data);
+  PlotData setupPlotXRange(ConcurrentMetricsState::AccessToken &access, const GraphDisplayInfo &display_state, bool has_data);
 
 protected:
   void drawMetricsCaptureControls();
@@ -993,8 +1188,6 @@ protected:
   void drawBuffersPlot();
   void drawConstRingMemoryPlot();
   void drawConstRingBasicMetricsTable();
-  void drawUploadRingMemoryPlot();
-  void drawUploadRingBasicMetricsTable();
   void drawTempuraryUploadMemoryPlot();
   void drawTemporaryUploadMemoryBasicMetrics();
   void drawRaytracePlot();
@@ -1006,6 +1199,7 @@ protected:
   void drawPersistenReadBackMemoryPlot();
   void drawPersistenBidirectioanlMemoryPlot();
   void drawRaytraceSummaryTable();
+  void drawDebugAllocationControls();
 };
 #else
 class MetricsVisualizer : public DebugViewBase
@@ -1026,8 +1220,6 @@ protected:
   void drawBuffersPlot();
   void drawConstRingMemoryPlot();
   void drawConstRingBasicMetricsTable();
-  void drawUploadRingMemoryPlot();
-  void drawUploadRingBasicMetricsTable();
   void drawTempuraryUploadMemoryPlot();
   void drawTemporaryUploadMemoryBasicMetrics();
   void drawRaytracePlot();
@@ -1039,6 +1231,7 @@ protected:
   void drawPersistenReadBackMemoryPlot();
   void drawPersistenBidirectioanlMemoryPlot();
   void drawRaytraceSummaryTable();
+  void drawDebugAllocationControls();
 };
 #endif
 
@@ -1056,8 +1249,11 @@ class DebugView : public MetricsVisualizer
   void drawUserHeapsSummaryTable();
   void drawRaytraceTopStructureTable();
   void drawRaytraceBottomStructureTable();
+  void drawRaytraceOMMStructureTable();
+#if D3D_HAS_RAY_TRACING
+  void drawRaytraceStructureTable(const char *tree_label, const char *table_id, RaytraceAccelerationStructure::Type filter_type);
+#endif
   void drawTempuraryUploadMemorySegmentsTable();
-  void drawUploadRingSegmentsTable();
   void drawConstRingSegmentsTable();
   void drawTextureTable();
   void drawBuffersTable();
@@ -1066,7 +1262,6 @@ class DebugView : public MetricsVisualizer
   void drawESRamInfoView();
 #endif
   void drawTemporaryUploadMemoryInfoView();
-  void drawUploadRingBufferInfoView();
   void drawConstRingBufferInfoView();
   void drawBuffersInfoView();
   void drawTexturesInfoView();
@@ -1087,11 +1282,63 @@ public:
 #else
 using DebugView = FrameFinalizer;
 #endif
+
+class DebugResourceAllocator : public DebugView
+{
+private:
+  using BaseType = DebugView;
+
+#if DX12_DEBUG_RESOURCE_ALLOCATOR_ENABLED
+  eastl::array<ComPtr<ID3D12Heap>, ResourceHeapProperties::group_count> debugAllocations{};
+
+  void processDebugAllocations(ID3D12Device1 *device);
+  void clearDebugAllocations();
+#endif
+
+protected:
+#if DX12_DEBUG_RESOURCE_ALLOCATOR_ENABLED
+  struct SetupInfo : BaseType::SetupInfo
+  {
+    int debugAllocationGroup = 0;
+    int debugAllocationSizeMb = 0;
+  };
+
+  void setup(const SetupInfo &setup)
+  {
+    BaseType::setup(setup);
+    if (setup.debugAllocationGroup < 0 || setup.debugAllocationGroup >= ResourceHeapProperties::group_count)
+    {
+      D3D_ERROR("DX12: Invalid debug allocation group (%d)", setup.debugAllocationGroup);
+      return;
+    }
+    setDebugAllocationSizeMb(setup.debugAllocationGroup, setup.debugAllocationSizeMb);
+  }
+#endif
+
+  void completeFrameRecording(Device &device, DXGIAdapter *adapter, frontend::BindlessManager &bindless_manager,
+    uint32_t history_index);
+
+  void shutdown(DXGIAdapter *adapter, frontend::BindlessManager *bindless_manager)
+  {
+#if DX12_DEBUG_RESOURCE_ALLOCATOR_ENABLED
+    clearDebugAllocations();
+#endif
+    BaseType::shutdown(adapter, bindless_manager);
+  }
+
+  void preRecovery(DXGIAdapter *adapter, frontend::BindlessManager *bindless_manager)
+  {
+#if DX12_DEBUG_RESOURCE_ALLOCATOR_ENABLED
+    clearDebugAllocations();
+#endif
+    BaseType::preRecovery(adapter, bindless_manager);
+  }
+};
 } // namespace resource_manager
 
-class ResourceMemoryHeap : private resource_manager::DebugView
+class ResourceMemoryHeap : private resource_manager::DebugResourceAllocator
 {
-  using BaseType = resource_manager::DebugView;
+  using BaseType = DebugResourceAllocator;
 
 public:
   ResourceMemoryHeap() = default;
@@ -1115,18 +1362,24 @@ public:
 
   using BaseType::completeFrameExecution;
 
+  using BaseType::recordCommittedResourceAllocated;
+  using BaseType::recordCommittedResourceFreed;
+
   using BaseType::beginFrameRecording;
 
 #if D3D_HAS_RAY_TRACING
   using BaseType::createAccelerationStructure;
   using BaseType::createAccelerationStructurePool;
+  using BaseType::createOpacityMicroMapTriangleArray;
   using BaseType::deleteRaytraceBottomAccelerationStructureOnFrameCompletion;
+  using BaseType::deleteRaytraceOpacityMicroMapTriangleArrayOnFrameCompletion;
   using BaseType::deleteRaytraceTopAccelerationStructureOnFrameCompletion;
   using BaseType::destroyAccelerationStructureOnFrameCompletion;
   using BaseType::destroyAccelerationStructurePoolOnFrameCompletion;
   using BaseType::getRaytraceAccelerationStructuresGpuMemoryUsage;
   using BaseType::newRaytraceBottomAccelerationStructure;
   using BaseType::newRaytraceTopAccelerationStructure;
+  using BaseType::visitRaytraceAccelerationStructurePools;
 #endif
 
   using BaseType::getSwapchainColorGlobalId;
@@ -1147,14 +1400,12 @@ public:
 
   using BaseType::getResourceAllocationProperties;
 
+  using BaseType::getActiveTextureObjectCount;
   using BaseType::getFramePushRingMemorySize;
   using BaseType::getPersistentBidirectionalMemorySize;
   using BaseType::getPersistentReadBackMemorySize;
   using BaseType::getPersistentUploadMemorySize;
   using BaseType::getTemporaryUploadMemorySize;
-  using BaseType::getUploadRingMemorySize;
-
-  using BaseType::getActiveTextureObjectCount;
   using BaseType::getTextureObjectCapacity;
   using BaseType::reserveTextureObjects;
 
@@ -1170,7 +1421,6 @@ public:
   using BaseType::allocatePushMemory;
   using BaseType::allocateTempUpload;
   using BaseType::allocateTempUploadForUploadBuffer;
-  using BaseType::allocateUploadRingMemory;
   using BaseType::freeHostDeviceSharedMemoryRegionForUploadBufferOnFrameCompletion;
   using BaseType::freeHostDeviceSharedMemoryRegionOnFrameCompletion;
 
@@ -1210,6 +1460,7 @@ public:
   using BaseType::createBufferTextureUAV;
   using BaseType::discardBuffer;
   using BaseType::freeBufferOnFrameCompletion;
+  using BaseType::isBufferPlacedInUserHeap;
   using BaseType::newBufferObject;
   using BaseType::visitBufferObjects;
   using BaseType::visitBufferObjectsExplicit;
@@ -1217,22 +1468,29 @@ public:
 
   using BaseType::getDeviceLocalAvailablePoolBudget;
   using BaseType::getDeviceLocalBudget;
+  using BaseType::getDeviceLocalCurrentUsage;
 #if _TARGET_PC_WIN
   using BaseType::getDeviceLocalPhysicalLimit;
 #endif
+  using BaseType::getFeatureSet;
   using BaseType::getHostLocalAvailablePoolBudget;
   using BaseType::getHostLocalBudget;
-  using BaseType::isUMASystem;
-
-  using BaseType::setTempBufferShrinkThresholdSize;
+  using BaseType::getHostLocalCurrentUsage;
 
   using BaseType::popEvent;
   using BaseType::pushEvent;
 
   using BaseType::completeFrameRecording;
 
+  using BaseType::afterEmergencyDefragmentation;
+  using BaseType::beforeEmergencyDefragmentation;
+  using BaseType::get_memory_groups_count;
+  using BaseType::getFreeMemorySizeAndFragmentation;
+  using BaseType::isDefragmentationRequired;
+  using BaseType::isDefragmentationRequiredOom;
   using BaseType::processDefragmentationForAllGroups;
-  using BaseType::processEmergencyDefragmentation;
+  using BaseType::processDefragmentationForGroup;
+  using BaseType::tryDefragmentHeap;
 
 #if DX12_USE_ESRAM
   using BaseType::aliasESRamTexture;
@@ -1261,7 +1519,7 @@ public:
         logdbg("DX12: Waiting for too long, exiting, risking crashes...");
         break;
       }
-      logdbg("DX12: Wating 10ms to complete temporary memory uses...");
+      logdbg("DX12: Waiting 10ms to complete temporary memory uses...");
       sleep_msec(10);
     }
     logdbg("DX12: Finished waiting for temporary memory uses...");
@@ -1271,19 +1529,18 @@ public:
 
   using BaseType::AliasHeapReference;
   using BaseType::AnyResourceReference;
+  using BaseType::isImageAlive;
   using BaseType::PersistentBidirectionalBufferReference;
   using BaseType::PersistentReadBackBufferReference;
   using BaseType::PersistentUploadBufferReference;
-  using BaseType::PushRingBufferReference;
   using BaseType::reportOOMInformation;
   using BaseType::ScratchBufferReference;
   using BaseType::TempUploadBufferReference;
-  using BaseType::UploadRingBufferReference;
-
-  using BaseType::isImageAlive;
 
   using BaseType::createSampler;
   using BaseType::getSampler;
   using BaseType::getSamplerInfo;
+
+  void visitTaggedResources(ID3D12Device *device, const ResourceTypeFilter &filter, const ResourceVisitor &visitor);
 };
 } // namespace drv3d_dx12

@@ -5,6 +5,7 @@
 #include <videoEncoder/videoEncoder.h>
 #include <daECS/core/componentTypes.h>
 #include <render/fx/flare.h>
+#include <render/filmGrain.h>
 
 class CinematicMode
 {
@@ -28,14 +29,14 @@ public:
   static constexpr int VIGNETTE_PRIORITY = 1;
   static constexpr int FILM_GRAIN_PRIORITY = 1;
   void setChromaticAberration(Point3 chromatic_aberration);
-  void setFilmGrain(Point3 film_grain);
+  void setFilmGrain(float strength_mul, Point3 film_grain_noise, Point4 film_grain_lut);
   void setFps(int fps);
   void setSubPixels(int sub_pixels);
   void setSuperPixels(int super_pixels);
   void setLenseFlareIntesity(float intensity);
   void toggleLenseFlareCovering(bool use_covering);
   void initLenseFlare(const char *covering_tex_name, const char *readial_tex_name);
-  void renderLenseFlare(ManagedTexView prev_frame_tex);
+  void renderLenseFlare(Texture *prev_frame_tex);
   void setFName(const char *fname);
   void setAudioDataFName(const eastl::string &fname);
   void setBitrate(int bitrate);

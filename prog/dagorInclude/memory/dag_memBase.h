@@ -20,7 +20,7 @@ using size_t = decltype(sizeof(int));
 
 #ifdef DAGOR_PREFER_HEAP_ALLOCATION
 #elif defined(__clang__) && defined(__has_feature)
-#if __has_feature(address_sanitizer)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer)
 #define DAGOR_PREFER_HEAP_ALLOCATION 1
 #endif
 #elif defined(__GNUC__) && defined(__SANITIZE_ADDRESS__)
@@ -303,7 +303,7 @@ KRNLIMP int memresizeinplace_default(void *, size_t sz);
 #else
 // disabling compilation of new/delete code for C++
 #ifndef __cplusplus
-#define new :.:
-#define delete :.:
+#define new    :.: //-V1059
+#define delete :.: //-V1059
 #endif
 #endif //__B_NO_MEM_BASE_INCLUDE

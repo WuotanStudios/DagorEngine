@@ -13,9 +13,17 @@
 #include <util/dag_delayedAction.h>
 #include <mutex>
 #include <util/dag_multicastEvent.h>
+#include <ska_hash_map/flat_hash_map2.hpp>
 
 
 class DataBlock;
+namespace cpujobs
+{
+class IJob;
+}
+
+template <typename T, bool hasRange>
+class ConVarT;
 
 namespace unitedvdata
 {
@@ -82,11 +90,15 @@ struct BufPool
   int maxVbSize = 64 << 20;
   bool allowRebuild = true, allowDelRes = false;
   char nameChar;
-  int maxIBUseKb = INT_MAX;
-  int maxVBUseKb = INT_MAX;
   std::mutex updateMutex;
 
-  BufPool(char nc) : nameChar(nc) { sbuf.push_back(nullptr); } // pre-alloc for IB
+  volatile int64_t blasTotalBytes = 0;
+
+  // Per-pool convars, bound in the ctor from the owning ShaderResUnitedVdata.
+  ConVarT<int, true> *maxIbUseCv = nullptr, *maxVbUseCv = nullptr, *maxBlasUseCv = nullptr;
+  ConVarT<int, true> *noDiscardFramesCv = nullptr, *keepIfNeedLodFramesCv = nullptr;
+
+  BufPool(char nc, const void *owner); // owner: the owning ShaderResUnitedVdata (selects the per-pool convars)
   BufChunk allocChunkForStride(int stride, int req_avail_sz, const BufConfig &hints, bool use_soft_limit);
   bool arrangeVdata(dag::ConstSpan<Ptr<ShaderMatVdata>> smvd_list, BufChunkTab &out_c, Sbuffer *ib, bool can_fail, bool use_soft_limit,
     const BufConfig &hints, int *vbShortage = nullptr, int *ibShortage = nullptr);
@@ -132,7 +144,8 @@ public:
   bool addRes(RES *res) { return addRes(make_span(&res, 1)); }
   bool delRes(RES *res);
 
-  bool reloadRes(RES *res);
+  void reloadRes(RES *res);
+  void reloadResList(PtrTab<RES> &&resources);
   void downgradeRes(RES *res, int upper_lod);
   void discardUnusedResToFreeReqMem();
 
@@ -158,6 +171,9 @@ public:
   int getResCount() const { return resList.size(); }
 
   void buildStatusStrNoLock(String &out_str, bool full_res_list, bool (*resolve_res_name)(String &nm, const RES *r) = nullptr);
+  // fills out_str (framed by blank lines) at most once per period and always while reloads
+  // fail; a throttled call leaves it untouched
+  void buildStatusStrThrottled(String &out_str, unsigned period_usec);
   void buildStatusStr(String &out_str, bool full_res_list, bool (*resolve_res_name)(String &nm, const RES *r) = nullptr)
   {
     std::lock_guard<std::mutex> scopedLock(appendMutex);
@@ -165,13 +181,14 @@ public:
   }
   void dumpMemBlocks(String *out_str_summary = nullptr);
   int getPendingReloadResCount() const { return interlocked_acquire_load(pendingVdataReloadResCount); }
-  int getFailedReloadResCount() const { return failedVdataReloadResList.size(); }
+  int getFailedReloadResCount() const { return failedVdataReloadResSet.size(); }
   void setHints(const DataBlock &hints_blk);
 
   // This even is triggered whenever a resource was changed due to
   // vertex buffer defrag and things like RElem::bv and RElem::si are no
   // longer the same as before.
   inline static MulticastEvent<void(const RES *, bool /*deleted*/, int /*upper_lod*/)> on_mesh_relems_updated;
+  inline static MulticastEvent<void(const RES *, bool /*deleted*/, int /*upper_lod*/)> on_mesh_relems_about_to_be_updated;
 
   typedef void (*availableRElemsAccessorFct)(dag::Span<RES *>);
   void availableRElemsAccessor(availableRElemsAccessorFct access_cb);
@@ -179,6 +196,22 @@ public:
   inline int getRequestLodsByDistanceFrames() const { return requestLodsByDistanceFrames; }
 
   void setAllocationLimits(int ibKb, int vbKb);
+  void setBlasAllocationLimit(int limitKb);
+
+  // frames <= 0 resets to the default
+  void setNoDiscardFrames(int frames);
+  void setKeepIfNeedLodFrames(int frames);
+
+  void adjustBlasSize(int64_t delta_bytes)
+  {
+    int64_t total = interlocked_add(buf.blasTotalBytes, delta_bytes);
+    G_ASSERT(total >= 0);
+    G_UNUSED(total);
+  }
+
+  static bool isStreamingEnabled() { return ResType::on_higher_lod_required != nullptr; }
+
+  bool canUseVbAsSr() const;
 
 protected:
   unitedvdata::BufPool buf;
@@ -189,21 +222,28 @@ protected:
   Tab<SmallTab<unitedvdata::BufChunk, MidmemAlloc>> resUsedChunks;
   int64_t maxIbTotalUsed = 0, maxVbTotalUsed = 0;
   int reloadJobMgrId = -1;
-  volatile int vbSizeToFree = 0, ibSizeToFree = 0;
+  volatile int vbSizeToFree = 0, ibSizeToFree = 0, rgbaAtlasToFree = 0, normAtlasToFree = 0;
   int uselessDiscardAttempts = 0;
-  Tab<RES *> failedVdataReloadResList;
+  volatile int discardJobIsPending = 0;
+  ska::flat_hash_set<RES *> failedVdataReloadResSet;
+  int64_t lastStatusReft = 0; // written under appendMutex by buildStatusStrThrottled
   volatile int pendingVdataReloadResCount = 0;
   unitedvdata::BufConfig hints;
   mutable std::mutex hintsMutex;
-  int noDiscardFrames = 120;
-  int keepIfNeedLodFrames = 600;
   int requestLodsByDistanceFrames = 0;
 
   unitedvdata::BufConfig getHints() const;
+  void initReloadJobMgrIdNoLock();
+
+  [[nodiscard]] cpujobs::IJob *reloadResNoLock(RES *res);
 
   void rebuildUnitedVdata(dag::Span<RES *> res, bool in_d3d_reset);
+  void addResToTightVdata(RES *r, Tab<int> &dviOfs, Tab<uint8_t> &buf_stor, String &tight_stats, bool &bad_tight_detected);
   static void updateVdata(RES *r, unitedvdata::BufPool &buf, Tab<int> &dviOfs_stor, Tab<uint8_t> &buf_stor,
     dag::ConstSpan<unitedvdata::BufChunk> c);
+
+  bool shouldDowngradeRes(int idx, int upper_lod);
+  void doDowngradeRes(int idx, int upper_lod);
 
   static void prepareVdataBaseOfs(dag::ConstSpan<Ptr<ShaderMatVdata>> smvd_list, Tab<int> &dviOfs);
   static void updateVdata(dag::ConstSpan<Ptr<ShaderMatVdata>> smvd_list, unitedvdata::BufPool &buf, Tab<uint8_t> &buf_stor,
@@ -216,7 +256,12 @@ protected:
   }
 
   void updateLocalMaximum(bool out_peak_to_debug);
-  void discardUnusedResToFreeReqMemNoLock(bool forced);
+  template <typename F>
+  void discardUnusedResGather(F &&);
+  void discardUnusedResToFreeReqMemImpl(bool lock, bool forced, bool async);
+  int64_t blasBytesToFree() const;
+
+  void debugEvictUnrequestedToCoarsest(int idle_frames);
 
   struct UpdateModelCtx
   {

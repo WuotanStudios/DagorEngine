@@ -2,6 +2,18 @@
 
 #include "winapi_helpers.h"
 
+#include <dag/dag_vector.h>
+#include <debug/dag_log.h>
+#include <util/dag_finally.h>
+
+#include <winternl.h>
+#include <cfgmgr32.h>
+#include <devguid.h>
+#include <d3dkmthk.h> // Isn't self-contained, so we need to include winternl.h first.
+#include <setupapi.h>
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
+
 
 #if DEBUG_REPORT_REGISTRY_INSPECTION
 #define DEBUG_REG debug
@@ -49,7 +61,7 @@ eastl::tuple<DWORD, DWORD, DWORD> RegistryKey::queryValueCountMaxLengthAndSize()
   return eastl::make_tuple(count, length, value);
 }
 
-eastl::string_view RegistryKey::enumKeyName(DWORD index, eastl::span<char> buffer)
+eastl::string_view RegistryKey::enumKeyName(DWORD index, eastl::span<char> buffer) const
 {
   auto maxLength = static_cast<DWORD>(buffer.size());
   if (ERROR_SUCCESS == RegEnumKeyExA(ptr.get(), index, buffer.data(), &maxLength, nullptr, nullptr, nullptr, nullptr))
@@ -64,7 +76,7 @@ eastl::string_view RegistryKey::enumKeyName(DWORD index, eastl::span<char> buffe
   }
 }
 
-eastl::string_view RegistryKey::enumValueName(DWORD index, eastl::span<char> buffer)
+eastl::string_view RegistryKey::enumValueName(DWORD index, eastl::span<char> buffer) const
 {
   auto maxNameLength = static_cast<DWORD>(buffer.size());
   if (ERROR_SUCCESS == RegEnumValueA(ptr.get(), index, buffer.data(), &maxNameLength, nullptr, nullptr, nullptr, nullptr))
@@ -80,7 +92,7 @@ eastl::string_view RegistryKey::enumValueName(DWORD index, eastl::span<char> buf
 }
 
 eastl::tuple<eastl::string_view, eastl::span<char>> RegistryKey::enumValueNameAndValue(DWORD index, eastl::span<char> name_buffer,
-  eastl::span<char> data_buffer)
+  eastl::span<char> data_buffer) const
 {
   auto maxNameLength = static_cast<DWORD>(name_buffer.size());
   auto maxDataLength = static_cast<DWORD>(data_buffer.size());
@@ -95,4 +107,124 @@ eastl::tuple<eastl::string_view, eastl::span<char>> RegistryKey::enumValueNameAn
     DEBUG_REG("enumValueNameAndValue of %p at %u failed", ptr.get(), index);
     return {};
   }
+}
+
+eastl::fixed_vector<DeviceDesc, 8> getDisplayDevices()
+{
+  // Parses "PCI\VEN_XXXX&DEV_XXXX&..." — returns false if the format doesn't match.
+  //         ^       ^    ^   ^
+  //         0       8   12   17
+  auto parseHardwareId = [](const wchar_t *hwid, uint16_t &vendor_id, uint16_t &device_id) {
+    auto parseHex4 = [](const wchar_t *s, uint16_t &out) {
+      uint16_t value = 0;
+      for (int i = 0; i < 4; ++i)
+      {
+        wchar_t c = s[i];
+        uint16_t digit;
+        if (c >= L'0' && c <= L'9')
+          digit = static_cast<uint16_t>(c - L'0');
+        else if (c >= L'A' && c <= L'F')
+          digit = static_cast<uint16_t>(c - L'A' + 10);
+        else if (c >= L'a' && c <= L'f')
+          digit = static_cast<uint16_t>(c - L'a' + 10);
+        else
+          return false;
+        value = static_cast<uint16_t>((value << 4) | digit);
+      }
+      out = value;
+      return true;
+    };
+
+    if (wcsncmp(hwid, L"PCI\\VEN_", 8) != 0)
+      return false;
+    if (!parseHex4(hwid + 8, vendor_id))
+      return false;
+    if (wcsncmp(hwid + 12, L"&DEV_", 5) != 0)
+      return false;
+    if (!parseHex4(hwid + 17, device_id))
+      return false;
+    return true;
+  };
+
+  HDEVINFO devInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, nullptr, nullptr, DIGCF_PRESENT);
+  if (devInfo == INVALID_HANDLE_VALUE)
+    return {};
+
+  FINALLY([=] { SetupDiDestroyDeviceInfoList(devInfo); });
+
+  eastl::fixed_vector<DeviceDesc, 8> displayDevices;
+
+  logdbg("[DRV_MULTI] Display Devices:");
+
+  dag::Vector<wchar_t> hwId;
+  SP_DEVINFO_DATA devData{.cbSize = sizeof(SP_DEVINFO_DATA)};
+  for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &devData); ++i)
+  {
+    // Shortest valid hardware ID is "PCI\VEN_XXXX&DEV_XXXX\0" = 22 wchars.
+    constexpr DWORD minBytes = 22 * sizeof(wchar_t);
+
+    DWORD bufSize = 0;
+    SetupDiGetDeviceRegistryPropertyW(devInfo, &devData, SPDRP_HARDWAREID, nullptr, nullptr, 0, &bufSize);
+    if (bufSize < minBytes)
+      continue;
+
+    hwId.resize_noinit(bufSize / sizeof(wchar_t));
+    if (!SetupDiGetDeviceRegistryPropertyW(devInfo, &devData, SPDRP_HARDWAREID, nullptr, reinterpret_cast<PBYTE>(hwId.data()), bufSize,
+          nullptr))
+      continue;
+
+    logdbg("%ls", hwId.data());
+
+    uint16_t vendorId, deviceId;
+    if (!parseHardwareId(hwId.data(), vendorId, deviceId))
+      continue;
+
+    // Skip Microsoft Basic Render Driver.
+    if (DeviceDesc{vendorId, deviceId}.isSoftwareDevice())
+      continue;
+
+    ULONG devStatus = 0, devProblem = 0;
+    if (auto ret = CM_Get_DevNode_Status(&devStatus, &devProblem, devData.DevInst, 0); ret != CR_SUCCESS || devStatus & DN_HAS_PROBLEM)
+    {
+      logdbg(" ^ unavailable (result: 0x%08X , problem: 0x%08X)", ret, devProblem); // e.g. CM_PROB_DISABLED
+      continue;
+    }
+
+    displayDevices.push_back({vendorId, deviceId});
+  }
+
+  return displayDevices;
+}
+
+GpuHwSchedulingState get_hw_scheduling_from_luid(const LUID &luid)
+{
+  HMODULE gdi32 = GetModuleHandleW(L"gdi32.dll");
+  auto openAdapterFromLuid =
+    gdi32 ? reinterpret_cast<PFND3DKMT_OPENADAPTERFROMLUID>(GetProcAddress(gdi32, "D3DKMTOpenAdapterFromLuid")) : nullptr;
+  if (!openAdapterFromLuid)
+    return GpuHwSchedulingState::Unknown;
+
+  D3DKMT_OPENADAPTERFROMLUID openAdapter{.AdapterLuid = luid};
+  if (NTSTATUS status = openAdapterFromLuid(&openAdapter); !NT_SUCCESS(status))
+    return GpuHwSchedulingState::Unknown;
+
+  FINALLY([=] {
+    D3DKMT_CLOSEADAPTER closeAdapter{openAdapter.hAdapter};
+    D3DKMTCloseAdapter(&closeAdapter);
+  });
+
+  D3DKMT_WDDM_2_7_CAPS caps{};
+  D3DKMT_QUERYADAPTERINFO queryInfo{
+    .hAdapter = openAdapter.hAdapter,
+    .Type = KMTQAITYPE_WDDM_2_7_CAPS,
+    .pPrivateDriverData = &caps,
+    .PrivateDriverDataSize = sizeof(caps),
+  };
+  if (NTSTATUS status = D3DKMTQueryAdapterInfo(&queryInfo); NT_SUCCESS(status))
+  {
+    return !caps.HwSchSupported ? GpuHwSchedulingState::NotSupported
+                                : (caps.HwSchEnabled ? GpuHwSchedulingState::Enabled : GpuHwSchedulingState::Disabled);
+  }
+
+  return GpuHwSchedulingState::Unknown;
 }

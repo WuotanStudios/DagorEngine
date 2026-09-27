@@ -9,6 +9,7 @@
 #include <libTools/util/makeBindump.h>
 #include <libTools/util/iLogWriter.h>
 #include <libTools/dagFileRW/dagFileNode.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <libTools/util/strUtil.h>
 #include <ioSys/dag_memIo.h>
 #include <ioSys/dag_dataBlockUtils.h>
@@ -27,7 +28,7 @@ enum
 
 static const char *curDagFname = NULL;
 static DataBlock defRagdollBlk;
-static SimpleString appBlkFname;
+static SimpleString ragdollBlkFname;
 
 class PhysObjExporter : public IDagorAssetExporter
 {
@@ -46,7 +47,7 @@ public:
     files.clear();
     files.push_back() = a.getTargetFilePath();
     if (a.props.getBool("ragdoll", false))
-      files.push_back() = appBlkFname;
+      files.push_back() = ragdollBlkFname;
   }
 
   bool __stdcall isExportableAsset(DagorAsset &a) override { return true; }
@@ -209,8 +210,8 @@ public:
     }
     curDagFname = NULL;
 
-    exportPhysSys(bodies, cwr, !a.props.getBool("expAllHelpers", a.props.getBool("ragdoll", false)),
-      a.props.getBool("ragdoll", false));
+    exportPhysSys(bodies, cwr, !a.props.getBool("expAllHelpers", a.props.getBool("ragdoll", false)), a.props.getBool("ragdoll", false),
+      a.props.getBlockByName("ragdoll"));
     clear_all_ptr_items(bodies);
     return true;
   }
@@ -236,7 +237,7 @@ protected:
       {
         if (!(c.flags & NODEFLG_RCVSHADOW))
           return 0;
-        if (c.name && stricmp(c.name, "::mainBody") == 0)
+        if (!c.name.empty() && stricmp(c.name, "::mainBody") == 0)
           return 0;
 
         if (!checkBodyNode(&c))
@@ -310,7 +311,8 @@ protected:
     return rec;
   }
 
-  void exportPhysSys(dag::ConstSpan<PhBodyRec *> po, mkbindump::BinDumpSaveCB &cwr, bool min_hlp, bool ragdoll)
+  void exportPhysSys(dag::ConstSpan<PhBodyRec *> po, mkbindump::BinDumpSaveCB &cwr, bool min_hlp, bool ragdoll,
+    const DataBlock *asset_ragdoll_blk = nullptr)
   {
     cwr.writeFourCC(_MAKE4C('po1s'));
     cwr.beginBlock();
@@ -332,7 +334,9 @@ protected:
           logerr("failed to find <%s> for joint in <%s>", dest_nm, po[i]->bodyBlk.getStr("name", ""));
       }
 
-    if (ragdoll) // write align controllers for ragdoll
+    if (ragdoll)
+    {
+      // write align controllers for ragdoll
       for (int i = 0, nid = defRagdollBlk.getNameId("twist_ctrl"); i < defRagdollBlk.blockCount(); i++)
         if (defRagdollBlk.getBlock(i)->getBlockNameId() == nid)
         {
@@ -347,6 +351,48 @@ protected:
               cwr.writeDwString(b.getStr(j));
           cwr.endBlock();
         }
+
+      // wriite no_collision body pairs
+      const DataBlock *ncBlk = asset_ragdoll_blk ? asset_ragdoll_blk->getBlockByName("no_collision") : nullptr;
+      if (!ncBlk)
+        ncBlk = defRagdollBlk.getBlockByName("no_collision");
+      if (ncBlk)
+      {
+        Tab<int> pairIdx(tmpmem);
+        for (int i = 0, pnid = ncBlk->getNameId("pair"); i < ncBlk->blockCount(); i++)
+        {
+          const DataBlock &pb = *ncBlk->getBlock(i);
+          if (pb.getBlockNameId() != pnid)
+            continue;
+          const char *n0 = pb.getStr("body0", "");
+          const char *n1 = pb.getStr("body1", "");
+          int i0 = -1, i1 = -1;
+          for (int j = 0; j < po.size(); j++)
+          {
+            const char *bn = po[j]->bodyBlk.getStr("name", "");
+            if (i0 < 0 && strcmp(bn, n0) == 0)
+              i0 = j;
+            if (i1 < 0 && strcmp(bn, n1) == 0)
+              i1 = j;
+          }
+          if (i0 >= 0 && i1 >= 0 && i0 != i1)
+          {
+            pairIdx.push_back(i0);
+            pairIdx.push_back(i1);
+          }
+          else
+            logerr("failed to resolve no_collision body pair: body1: %s idx: %d  body2: %s idx: %d", n0, i0, n1, i1);
+        }
+        if (pairIdx.size())
+        {
+          cwr.beginBlock();
+          cwr.writeFourCC(_MAKE4C('NCol'));
+          for (int p : pairIdx)
+            cwr.writeInt32e(p);
+          cwr.endBlock();
+        }
+      }
+    }
     cwr.endBlock();
   }
 
@@ -736,10 +782,27 @@ class PhysObjExporterPlugin : public IDaBuildPlugin
 public:
   bool __stdcall init(const DataBlock &appblk) override
   {
-    defRagdollBlk =
-      *appblk.getBlockByNameEx("assets")->getBlockByNameEx("build")->getBlockByNameEx("physObj")->getBlockByNameEx("ragdoll");
-    if (!defRagdollBlk.isEmpty())
-      appBlkFname = appblk.resolveFilename();
+    const DataBlock &physObjBlk = *appblk.getBlockByNameEx("assets")->getBlockByNameEx("build")->getBlockByNameEx("physObj");
+    const DataBlock *ragdollBlk = physObjBlk.getBlockByName("ragdoll");
+    const char *ragdollFname = physObjBlk.getStr("ragdoll", nullptr);
+
+    if (ragdollBlk && ragdollFname)
+      logerr("physObj: ragdoll setup is given both as a block and as ragdoll:t=\"%s\" in %s; using the file", ragdollFname,
+        appblk.resolveFilename());
+
+    // the setup file replaces application.blk as the tracked dependency, so an edit elsewhere in
+    // application.blk no longer rebuilds every pack that holds a ragdoll physObj
+    if (ragdollFname)
+    {
+      ragdollBlkFname = make_eff_app_relative_path(ragdollFname).str();
+      if (!dblk::load(defRagdollBlk, ragdollBlkFname, dblk::ReadFlags()))
+        logerr("physObj: cannot load ragdoll setup <%s>", ragdollBlkFname);
+    }
+    else if (ragdollBlk && !ragdollBlk->isEmpty())
+    {
+      defRagdollBlk = *ragdollBlk;
+      ragdollBlkFname = appblk.resolveFilename();
+    }
     return true;
   }
   void __stdcall destroy() override { delete this; }

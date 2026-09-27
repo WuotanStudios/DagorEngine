@@ -111,9 +111,18 @@ inline void logwarn_func(const char *s, das::LineInfoArg *at)
 }
 
 inline uint32_t get_dagor_frame_no() { return ::dagor_frame_no(); }
+inline uint32_t get_dagor_frames_presented() { return ::dagor_frames_presented(); }
 inline float get_dagor_game_act_time() { return ::dagor_game_act_time; }
 
 inline int get_DAGOR_DBGLEVEL() { return DAGOR_DBGLEVEL; }
+inline int get_TARGET_PC()
+{
+#if _TARGET_PC
+  return _TARGET_PC;
+#else
+  return 0;
+#endif
+}
 inline int get_DAGOR_ADDRESS_SANITIZER()
 {
 #ifdef DAGOR_ADDRESS_SANITIZER

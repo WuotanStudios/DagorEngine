@@ -1,13 +1,10 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <asyncHTTPClient/curl_global.h>
+#include <asyncHTTPClient/asyncHTTPClient.h>
 #include <debug/dag_debug.h>
 
-#if defined(USE_XCURL)
-#include <Xcurl.h>
-#else
 #include <curl/curl.h>
-#endif
 
 #define TRACE(...) debug("[CURL_GLOBAL] " __VA_ARGS__)
 
@@ -38,6 +35,10 @@ void init()
 
 void shutdown()
 {
+  // the multi and share handles live on the globals, so the async client goes
+  // first; its own atexit shutdown would free them after this cleanup
+  httprequests::shutdown_async();
+
   if (!is_initialized_externally)
   {
     if (is_initialized)
@@ -61,16 +62,6 @@ void was_initialized_externally(bool value)
   G_ASSERT(!is_initialized);
   TRACE("was_initialized_externally(%d)", value);
   is_initialized_externally = value;
-}
-
-
-void set_requests_limit(uint32_t limit)
-{
-  G_UNUSED(limit);
-#if defined(USE_XCURL)
-  xcurl_global_set_request_limit(limit);
-  TRACE("XCurl requests limit was set to: %u", limit);
-#endif
 }
 
 } // namespace curl_global

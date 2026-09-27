@@ -5,6 +5,7 @@
 #include <drv/3d/dag_renderPass.h>
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_tex3d.h>
+#include <drv/3d/dag_variableRateShading.h>
 
 #include "driver.h"
 #include "pipeline_state.h"
@@ -13,6 +14,8 @@
 #include "frontend.h"
 #include "device_context.h"
 #include "global_lock.h"
+#include "backend/cmd/draw_dispatch.h"
+#include "backend/cmd/framebuffer.h"
 
 using namespace drv3d_vulkan;
 
@@ -31,7 +34,7 @@ struct LocalAccessor
 StateFieldFramebufferAttachment::RawFrontData make_back_buffer_attachment()
 {
   StateFieldFramebufferAttachment::RawFrontData bb;
-  bb.tex = Frontend::swapchain.getCurrentTargetTex();
+  bb.tex = Frontend::currentSwapchainToPresent->getCurrentTargetTex();
   bb.layer = 0;
   bb.mip = 0;
   return bb;
@@ -93,7 +96,7 @@ bool d3d::copy_from_current_render_target(BaseTexture *to_tex)
   blit.srcOffsets[1].z = 1;
   blit.dstOffsets[1].z = 1;
 
-  Globals::ctx.blitImage(srcImg, dstImg, blit, /*whole_subres*/ true);
+  Globals::ctx.dispatchCmd<CmdBlitImage>({srcImg, dstImg, blit, /*whole_subres*/ true});
   return true;
 }
 
@@ -135,28 +138,6 @@ bool d3d::set_depth(BaseTexture *tex, int layer, DepthAccess access)
     access == DepthAccess::SampledRO);
 
   la.pipeState.set<StateFieldGraphicsViewport, StateFieldGraphicsViewport::RestoreFromFramebuffer, FrontGraphicsState>({});
-  return true;
-}
-
-bool d3d::set_render_target(int ri, Texture *tex, uint8_t level) { return d3d::set_render_target(ri, tex, 0, level); }
-
-bool d3d::set_render_target(int ri, BaseTexture *tex, int layer, uint8_t level)
-{
-  D3D_CONTRACT_ASSERTF(ri >= 0, "vulkan: no meaning of negative render target index is present");
-
-  LocalAccessor la;
-  using Bind = StateFieldFramebufferAttachment;
-
-  la.pipeState.set<StateFieldFramebufferAttachments, Bind::RawIndexed, FrontGraphicsState, FrontFramebufferState>(
-    {(uint32_t)ri, {tex, level, layer}});
-
-  if (0 == ri)
-  {
-    la.pipeState.set<StateFieldFramebufferAttachments, Bind::Indexed, FrontGraphicsState, FrontFramebufferState>(
-      {MRT_INDEX_DEPTH_STENCIL, Bind::empty});
-
-    la.pipeState.set<StateFieldGraphicsViewport, StateFieldGraphicsViewport::RestoreFromFramebuffer, FrontGraphicsState>({});
-  }
   return true;
 }
 
@@ -208,6 +189,41 @@ bool d3d::set_render_target(const Driver3dRenderTarget &rt)
   return true;
 }
 
+// Bulk setter: sets all color targets, clears unused slots, and sets depth in one call.
+void d3d::set_render_target(RenderTarget depth, DepthAccess depth_access, dag::ConstSpan<RenderTarget> colors)
+{
+  LocalAccessor la;
+  using Bind = StateFieldFramebufferAttachment;
+
+  D3D_CONTRACT_ASSERTF(colors.size() <= Driver3dRenderTarget::MAX_SIMRT, "Vulkan: too many color render targets: %d, max %d",
+    colors.size(), Driver3dRenderTarget::MAX_SIMRT);
+
+  int i = 0;
+  for (; i < colors.size() && i < Driver3dRenderTarget::MAX_SIMRT; ++i)
+  {
+    if (colors[i].tex)
+      la.pipeState.set<StateFieldFramebufferAttachments, Bind::RawIndexed, FrontGraphicsState, FrontFramebufferState>(
+        {(uint32_t)i, {colors[i].tex, (int)colors[i].mip_level, (int)colors[i].layer}});
+    else
+      la.pipeState.set<StateFieldFramebufferAttachments, Bind::Indexed, FrontGraphicsState, FrontFramebufferState>(
+        {(uint32_t)i, Bind::empty});
+  }
+  for (; i < Driver3dRenderTarget::MAX_SIMRT; ++i)
+    la.pipeState.set<StateFieldFramebufferAttachments, Bind::Indexed, FrontGraphicsState, FrontFramebufferState>(
+      {(uint32_t)i, Bind::empty});
+
+  if (depth.tex)
+    la.pipeState.set<StateFieldFramebufferAttachments, Bind::RawIndexed, FrontGraphicsState, FrontFramebufferState>(
+      {MRT_INDEX_DEPTH_STENCIL, {depth.tex, 0, (int)depth.layer}});
+  else
+    la.pipeState.set<StateFieldFramebufferAttachments, Bind::Indexed, FrontGraphicsState, FrontFramebufferState>(
+      {MRT_INDEX_DEPTH_STENCIL, Bind::empty});
+
+  la.pipeState.set<StateFieldGraphicsViewport, StateFieldGraphicsViewport::RestoreFromFramebuffer, FrontGraphicsState>({});
+  la.pipeState.set<StateFieldFramebufferReadOnlyDepth, bool, FrontGraphicsState, FrontFramebufferState>(
+    depth_access == DepthAccess::SampledRO);
+}
+
 void d3d::get_render_target(Driver3dRenderTarget &out_rt)
 {
   LocalAccessor la;
@@ -233,7 +249,7 @@ bool d3d::get_render_target_size(int &w, int &h, BaseTexture *rt_tex, uint8_t le
 {
   if (!rt_tex)
   {
-    VkExtent2D size = Frontend::swapchain.getMode().extent;
+    VkExtent2D size = Frontend::swapchain.getMode().backbufferExtent;
     w = size.width;
     h = size.height;
   }
@@ -255,7 +271,13 @@ bool d3d::clearview(int what, E3DCOLOR color, float z, uint32_t stencil)
   la.pipeState.set<StateFieldFramebufferClearColor, E3DCOLOR, FrontGraphicsState, FrontFramebufferState>(color);
   la.pipeState.set<StateFieldFramebufferClearDepth, float, FrontGraphicsState, FrontFramebufferState>(z);
   la.pipeState.set<StateFieldFramebufferClearStencil, uint8_t, FrontGraphicsState, FrontFramebufferState>((uint8_t)stencil);
-  la.ctx.clearView(what);
+
+  if (Globals::cfg.bits.brokenClearsOnNonLinearUAVRT)
+    la.pipeState
+      .set<StateFieldFramebufferClearColor, StateFieldFramebufferClearColor::InvalidateTag, FrontGraphicsState, FrontFramebufferState>(
+        {});
+
+  la.ctx.dispatchPipeline<CmdClearView>({what}, "clearView");
   return true;
 }
 
@@ -265,6 +287,16 @@ void d3d::allow_render_pass_target_load()
   LocalAccessor la;
   // No need to insert an extra command if the validation is disabled.
   if (Globals::cfg.bits.validateRenderPassSplits)
-    Globals::ctx.allowOpLoad();
+    Globals::ctx.dispatchCmd<CmdAllowOpLoad>({});
 }
 #endif
+
+void d3d::set_variable_rate_shading_texture(BaseTexture *tex)
+{
+  D3D_CONTRACT_ASSERTF(Globals::VK::phy.hasAttachmentFragmentShadingRate, "vulkan: VRS used on device without tex rate VRS support!");
+  LocalAccessor la;
+  using Bind = StateFieldFramebufferAttachment;
+
+  la.pipeState.set<StateFieldFramebufferAttachments, Bind::RawIndexed, FrontGraphicsState, FrontFramebufferState>(
+    {MRT_INDEX_SHADING_RATE, {tex, 0, 0}});
+}

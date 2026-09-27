@@ -3,6 +3,7 @@ from "dagor.clipboard" import set_clipboard_text
 from "%darg/ui_imports.nut" import *
 import "inspectorViews.nut" as fieldsMap
 import "simpleCursors.nut" as cursors
+from "types" import String, Function, Class
 
 //let {locate_element_source, sh, ph} = require("daRg")
 let utf8 = require_optional("utf8")
@@ -12,15 +13,15 @@ let wndHalign      = persist("wndHalign", @() Watched(ALIGN_RIGHT))
 let pickerActive   = persist("pickerActive", @() Watched(false))
 let highlight      = persist("highlight", @() Watched(null))
 let animHighlight  = Watched(null)
-let pickedList     = persist("pickedList", @() Watched([], FRP_DONT_CHECK_NESTED))
+let pickedList     = persist("pickedList", @() Watched([]))
 let viewIdx        = persist("viewIdx", @() Watched(0))
 let showRootsInfo  = persist("showRoots", @() Watched(false))
 let showChildrenInfo=persist("showChildrenInfo", @() Watched(false))
 
 let curData        = Computed(@() pickedList.get()?[viewIdx.get()])
 
-let fontSize = sh(1.5)
-let valColor = Color(155,255,50)
+const fontSize = sh(1.5)
+const valColor = Color(155,255,50)
 
 function inspectorToggle() {
   shown.modify(@(v) !v)
@@ -36,8 +37,8 @@ function textButton(text, action, isEnabled = true) {
   let override = isEnabled
     ? {
         watch = stateFlags
-        onElemState = isEnabled ? @(val) stateFlags.set(val) : null
-        onClick = isEnabled ? action : null
+        onElemState = @(val) stateFlags.set(val)
+        onClick = action
       }
     : {}
 
@@ -54,7 +55,7 @@ function textButton(text, action, isEnabled = true) {
       behavior = Behaviors.Button
       focusOnClick = true
       color = color
-      padding = static [hdpx(5), hdpx(10)]
+      padding = const [hdpx(5), hdpx(10)]
       children = {
         rendObj = ROBJ_TEXT
         text
@@ -70,11 +71,11 @@ function mkDirBtn(text, dir) {
   return @() {
     watch = [isVisible, isEnabled]
     children = !isVisible.get() ? null
-      : textButton(text, @() isEnabled.get() ? viewIdx.set(viewIdx.get() + dir) : null, isEnabled.get())
+      : textButton(text, @() isEnabled.get() ? viewIdx.modify(@(v) v + dir) : null, isEnabled.get())
   }
 }
 
-let gap = static { size = flex() }
+let gap = const { size = flex() }
 let pickBtn = textButton("Pick", @() pickerActive.set(true))
 let prevBtn = mkDirBtn("Prev", -1)
 let nextBtn = mkDirBtn("Next", 1)
@@ -127,7 +128,7 @@ let mkImageCtor = @(image) @(content) {
 
 let IMAGE_KEYS = {"image":1, "fallbackImage":1}
 
-function getPropValueTexts(desc, key, textLimit = 0) {
+function getPropValueTexts(desc, key, textLimit = 0): table {
   let val = desc[key]
   let tp = type(val)
 
@@ -141,11 +142,11 @@ function getPropValueTexts(desc, key, textLimit = 0) {
   } else if (key in IMAGE_KEYS) {
     text = val.tostring()
     valCtor = mkImageCtor(val)
-  } else if (tp == "integer" && key.tolower().indexof("color") != null) {
+  } else if (tp == "integer" && key.tolower().contains("color")) {
     text = "".concat("0x", format("%16X", val).slice(8))
     valCtor = mkColorCtor(val)
-  } else if (tp == "userdata" || tp == "userpointer") {
-    text = "<userdata/userpointer>"
+  } else if (tp == "userdata") {
+    text = "<userdata>"
   } else {
     let s = val.tostring()
     if (textLimit <= 0)
@@ -161,14 +162,14 @@ function getPropValueTexts(desc, key, textLimit = 0) {
   return { text, valCtor }
 }
 
-let textColor = @(sf) sf & S_ACTIVE ? 0xFFFFFF00
+let textColor = @(sf: int): int sf & S_ACTIVE ? 0xFFFFFF00
   : sf & S_HOVER ? 0xFF80A0FF
   : 0xFFFFFFFF
 
 function mkPropContent(desc, key, sf) {
   let { text, valCtor } = getPropValueTexts(desc, key, 200)
   local keyValue = $"{key.tostring()} = <color={valColor}>{text}</color>"
-  if (type(valCtor) == "string")
+  if (valCtor instanceof String)
     keyValue = $"{keyValue} {valCtor}"
   local content = {
     rendObj = ROBJ_TEXTAREA
@@ -179,14 +180,14 @@ function mkPropContent(desc, key, sf) {
     hangingIndent = sh(3)
     text = keyValue
   }
-  if (type(valCtor) == "function")
+  if (valCtor instanceof Function)
     content = valCtor?(content)
   return content
 }
 
 function propPanel(desc) {
   local pKeys = []
-  if (type(desc) == "class")
+  if (desc instanceof Class)
     foreach (key, _ in desc)
       pKeys.append(key)
   else
@@ -206,7 +207,7 @@ function propPanel(desc) {
   })
 }
 
-function elemLocationText(elem, builder, builder_func_name) {
+function elemLocationText(elem, builder, builder_func_name): string {
   local text = "Source: unknown"
 
   let location = locate_element_source(elem)
@@ -225,7 +226,7 @@ function updatePickedList(data) {
   animHighlight.set(null)
 }
 
-let prepareCallstackText = @(text) //add /t for line wraps
+let prepareCallstackText = @(text: string): string //add /t for line wraps
   text.replace("/", "/\t")
 
 function clickableText(labelText, valueText, onClick = null, highlightBB = null) {
@@ -233,8 +234,8 @@ function clickableText(labelText, valueText, onClick = null, highlightBB = null)
   return @() {
     watch = elemSF
     rendObj = ROBJ_TEXTAREA
-    behavior = static [Behaviors.TextArea, Behaviors.Button]
-    function onElemState(sf) {
+    behavior = const [Behaviors.TextArea, Behaviors.Button]
+    onElemState = function(sf) {
       elemSF.set(sf)
       if (highlightBB)
         animHighlight.set(sf & S_HOVER ? highlightBB : null)
@@ -314,14 +315,14 @@ function details() {
 
   return res.__update({
     flow = FLOW_VERTICAL
-    padding = static [hdpx(5), hdpx(10)]
+    padding = const [hdpx(5), hdpx(10)]
     children = [ bbox ]
       .extend(propPanel(sel.componentDesc))
       .append(rootsPanel(sel.roots), childrenPanel(sel.children), summaryText)
   })
 }
 
-let help = static {
+let help = const {
   rendObj = ROBJ_TEXTAREA
   size = FLEX_H
   behavior = Behaviors.TextArea
@@ -331,7 +332,7 @@ let help = static {
   text = @"L.Ctrl + L.Shift + I - switch inspector off\nL.Ctrl + L.Shift + P - switch picker on/off"
 }
 
-let hr = static {
+let hr = const {
   rendObj = ROBJ_SOLID
   color = 0x333333
   size = [flex(), hdpx(1)]
@@ -341,7 +342,7 @@ let inspectorPanel = @() {
   watch = wndHalign
   rendObj = ROBJ_SOLID
   color = Color(0, 0, 50, 50)
-  size = static [sw(30), sh(100)]
+  size = const [sw(30), sh(100)]
   hplace = wndHalign.get()
   behavior = Behaviors.Button
   clipChildren = true
@@ -378,7 +379,7 @@ function highlightRect() {
 function animHighlightRect() {
   let res = {
     watch = animHighlight
-    animations = static [{
+    animations = const [{
       prop = AnimProp.opacity, from = 0.5, to = 1.0, duration = 0.5, easing = CosineFull, play = true, loop = true
     }]
   }
@@ -396,7 +397,7 @@ function animHighlightRect() {
 
 
 let elementPicker = @() {
-  size = static [sw(100), sh(100)]
+  size = const [sw(100), sh(100)]
   behavior = Behaviors.InspectPicker
   cursor = cursors.normal
   rendObj = ROBJ_SOLID
@@ -410,7 +411,7 @@ let elementPicker = @() {
 function inspectorRoot() {
   let res = {
     watch = [pickerActive, shown]
-    size = [sw(100), sh(100)]
+    size = const [sw(100), sh(100)]
     zOrder = getroottable()?.Layers.Inspector ?? 10
     skipInspection = true
   }

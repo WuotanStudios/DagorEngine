@@ -4,6 +4,7 @@
 #include "../av_appwnd.h"
 #include "../av_viewportWindow.h"
 #include <assets/asset.h>
+#include <assets/assetMgr.h>
 #include <de3_interface.h>
 #include <de3_lodController.h>
 #include <de3_animCtrl.h>
@@ -37,15 +38,19 @@
 
 #include <EditorCore/ec_input.h>
 #include <propPanel/control/container.h>
+#include <propPanel/control/dragAndDropHandler.h>
 #include <propPanel/c_control_event_handler.h>
 #include <libTools/util/conTextOutStream.h>
 #include <libTools/util/strUtil.h>
 #include <impostorUtil/impostorBaker.h>
 #include <regExp/regExp.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 
 #include "../physObj/phys.h"        // for ragdoll
 #include "../collision/collision.h" // for colliders
+#include "../canopyEditor.h"
 
 #include <math/dag_rayIntersectBox.h>                      // for position gizmo
 #include <libTools/util/positionReconstructionFromDepth.h> // for position gizmo (surface "raycast")
@@ -59,16 +64,65 @@
 #include "objPropEditor.h"
 #include "../av_cm.h"
 #include "../assetStats.h"
+#include <assetsGui/av_assetTreeDragHandler.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
 #include <EASTL/bonus/fixed_ring_buffer.h>
+#include <render/debug3dSolid.h>
+
+using PropPanel::DragAndDropResult;
 
 extern void export_texture_as_dds(const char *fn, DagorAsset &a);
 extern void rimgr_set_force_lod_no(int lod_no);
+
+static void register_entity_console_command_processor();
 
 static bool trace_ray_enabled = true;
 static float coll_plane_ht_front = 0.0, coll_plane_ht_rear = 0.05;
 static constexpr int SAVE_LAST_STATES_COUNT = 4;
 static const int auto_inst_seed0 = mem_hash_fnv1(ZERO_PTR<const char>(), 12);
+
+namespace rendinst
+{
+extern bool persistentRiExtraInstances;
+} // namespace rendinst
+
+static void draw_canopy_preview(const CanopyEditorWindow::ViewportCanopyParams &params, const BBox3 &local_bbox, const TMatrix &tm)
+{
+  if (!params.valid || local_bbox.isempty())
+    return;
+
+  float canopyWidth = params.widthPart * (local_bbox[1].y - local_bbox[0].y) * 0.5f;
+  float boxHeight = local_bbox[1].y - local_bbox[0].y;
+  Point3 boxCenter = local_bbox.center();
+
+  BBox3 canopyBox;
+  canopyBox[0].set(boxCenter.x - canopyWidth, local_bbox[1].y - boxHeight * (params.topPart + params.topOffset),
+    boxCenter.z - canopyWidth);
+  canopyBox[1].set(boxCenter.x + canopyWidth, local_bbox[1].y - boxHeight * params.topOffset, boxCenter.z + canopyWidth);
+
+  static const Color4 boxColor(0.5f, 1.0f, 1.0f, 0.5f);
+  static const Color4 coneColor(1.0f, 0.5f, 0.5f, 0.5f);
+  static const Color4 spheroidColor(1.0f, 1.0f, 0.0f, 0.5f);
+
+  if (params.shape == CanopyEditorWindow::ViewportCanopyParams::CONE)
+  {
+    float canopyHeight = canopyBox.boxMax().y - canopyBox.boxMin().y;
+    Point3 bottomCenter(canopyBox.center().x, canopyBox.boxMin().y, canopyBox.center().z);
+    draw_debug_solid_cone(tm * bottomCenter, normalize(tm % Point3(0, 1, 0)), canopyWidth, canopyHeight, 8, coneColor);
+  }
+  else if (params.shape == CanopyEditorWindow::ViewportCanopyParams::SPHEROID)
+  {
+    TMatrix canopyTm = TMatrix::IDENT;
+    canopyTm[0][0] = canopyTm[2][2] = canopyBox.width().x * 0.5f;
+    canopyTm[1][1] = canopyBox.width().y * 0.5f;
+    canopyTm.setcol(3, canopyBox.center());
+    draw_debug_solid_sphere(Point3::ZERO, 1.0f, tm * canopyTm, spheroidColor);
+  }
+  else
+  {
+    draw_debug_solid_cube(canopyBox, tm, boxColor);
+  }
+}
 
 class PositionGizmoWrapper
 {
@@ -87,11 +141,9 @@ class PositionGizmoWrapper
     int sx, sy;
     wnd->getViewportSize(sx, sy);
 
-    // TODO: these are soon to be deprecated
-    TMatrix viewRot;
-    d3d::gettm(TM_VIEW, viewRot);
-    TMatrix4 projTm;
-    d3d::gettm(TM_PROJ, &projTm);
+    const ViewportWindow *vpw = static_cast<ViewportWindow *>(wnd);
+    const TMatrix viewRot = vpw->getViewTm();
+    const TMatrix4 projTm = vpw->getProjTm();
 
     // downsampled_far_depth_tex is already downsampled and ready to use
     return position_reconstruction_from_depth::get_position_from_depth(viewRot, projTm,
@@ -252,7 +304,6 @@ private:
 class EntityViewPlugin : public IGenEditorPlugin,
                          public PropPanel::ControlEventHandler,
                          public AnimV20::IGenericIrq,
-                         public IConsoleCmd,
                          public IEntityViewPluginInterface
 {
 public:
@@ -278,12 +329,20 @@ public:
     PID_ANIM_SHOW_IKSOL,
     PID_ANIM_SHOW_WABB,
     PID_ANIM_SHOW_BSPH,
+    PID_ANIM_DRAW_FLOOR,
     PID_ANIM_LOG_IRQ,
     PID_ANIM_ACT_RESTART,
     PID_ANIM_ACT_PAUSE,
     PID_ANIM_ACT_SLOWMO,
     PID_ANIM_RAGDOLL_GROUP,
     PID_ANIM_RAGDOLL_START,
+    PID_ANIM_RAGDOLL_ENGINE_GRP,
+    PID_ANIM_RAGDOLL_DRIVE_GRP,
+    PID_ANIM_RAGDOLL_DRIVE,
+    PID_ANIM_RAGDOLL_MOTOR_TWIST_FREQ,
+    PID_ANIM_RAGDOLL_MOTOR_TWIST_DAMP,
+    PID_ANIM_RAGDOLL_MOTOR_SWING_FREQ,
+    PID_ANIM_RAGDOLL_MOTOR_SWING_DAMP,
     PID_ANIM_RAGDOLL_SPRING_FACTOR,
     PID_ANIM_RAGDOLL_DAMPER_FACTOR,
     PID_ANIM_RAGDOLL_BULLET_IMPULSE,
@@ -300,7 +359,7 @@ public:
     PID_ANIM_STATE_LAST = PID_ANIM_STATE0 + 1024,
     PID_ANIM_PARAMS_GROUP,
     PID_ANIM_PARAM0,
-    PID_ANIM_PARAM_LAST = PID_ANIM_PARAM0 + 4096,
+    PID_ANIM_PARAM_LAST = PID_ANIM_PARAM0 + 8192,
     PID_ANIM_TRACE_GROUP,
     PID_ANIM_TRACE_CP_HT_F,
     PID_ANIM_TRACE_CP_HT_R,
@@ -312,6 +371,7 @@ public:
     PID_MASK_NODES_UPDATE_BTN,
     PID_MASK_NODES_UNCHECK_ALL,
     PID_MASK_NODES,
+    PID_MASK_NODES_LAST = PID_MASK_NODES + 64,
     PID_SHOW_POSITION_GIZMO,
     PID_POSITION_GIZMO,
     PID_GENERATE_PER_INSTANCE_SEED,
@@ -351,6 +411,9 @@ public:
       TEXTUREID textureId_asad;
     } impostor;
   } riex;
+  IObjEntity *canopyFxEntity = nullptr;
+  String canopyFxAssetName;
+  float canopyFxRestartTime = 0.0f;
   struct FpsCameraView
   {
     SimpleString name;
@@ -394,7 +457,7 @@ public:
 
   void updateAllMaskFilters(PropPanel::ContainerPropertyControl *panel)
   {
-    const int blockCount = nodeFilterMasksBlk.blockCount();
+    const int blockCount = min(PID_MASK_NODES_LAST - PID_MASK_NODES, (int)nodeFilterMasksBlk.blockCount());
     RegExp re;
     ILodController *iLodCtrl = entity->queryInterface<ILodController>();
     if (iLodCtrl)
@@ -404,7 +467,7 @@ public:
     }
   }
 
-  EntityViewPlugin() : entity(NULL)
+  EntityViewPlugin() : entity(NULL), textureDragAndDropHandler(*this)
   {
     riex.resIdx = -1;
     riex.handle = rendinst::RIEX_HANDLE_NULL;
@@ -415,6 +478,7 @@ public:
     showSkeleton = showEffectors = showIKSolution = false;
     showSkeletonNodeNames = false;
     showWABB = false;
+    drawFloor = true;
     showBSPH = false;
     logIrqs = false;
     rotX = rotY = 0;
@@ -429,13 +493,9 @@ public:
     updatePnTriangulation();
     updateLayeredBumpmapping();
     updateGlassDualSourceBlending();
+    register_entity_console_command_processor();
 
-    ::get_app().getConsole().registerCommand("animchar.blender", this);
-    ::get_app().getConsole().registerCommand("animchar.unusedBlendNodes", this);
-    ::get_app().getConsole().registerCommand("animchar.nodemask", this);
-    ::get_app().getConsole().registerCommand("animchar.vars", this);
-
-    DataBlock appBlk(::get_app().getWorkspace().getAppPath());
+    DataBlock appBlk(::get_app().getWorkspace().getAppBlkPath());
     animCharVarSetts = *appBlk.getBlockByNameEx("animCharView")->getBlockByNameEx("vars");
     nodeFilterMasksBlk = *appBlk.getBlockByNameEx("nodeFilterMasks");
 
@@ -471,9 +531,13 @@ public:
       appBlk.getBlockByNameEx("assets")->getBlockByNameEx("build")->getBlockByNameEx("rendInst")->getBool("forceRiExtra", false);
     if (forceRiExtra)
       DAEDITOR3.conNote("rendInst uses forceRiExtra");
+
+    if (!rendinst::persistentRiExtraInstances)
+      DAEDITOR3.conNote("rendInst uses non-persistentRiExtraInstances");
   }
   ~EntityViewPlugin() override
   {
+    destroyCanopyFxPreview();
     destroy_it(entity);
     releaseRiExtra();
   }
@@ -483,9 +547,17 @@ public:
   void registered() override { physsimulator::init(); }
   void unregistered() override { physsimulator::close(); }
 
-  void loadSettings(const DataBlock &settings) override { matEditor.loadSettings(settings); }
+  void loadSettings(const DataBlock &settings) override
+  {
+    matEditor.loadSettings(settings);
+    showImguiAnimTree = settings.getBool("showImguiAnimTree", showImguiAnimTree);
+  }
 
-  void saveSettings(DataBlock &settings) const override { matEditor.saveSettings(settings); }
+  void saveSettings(DataBlock &settings) const override
+  {
+    matEditor.saveSettings(settings);
+    settings.addBool("showImguiAnimTree", showImguiAnimTree);
+  }
 
   void enableImguiAnimtree() { currentAnimcharEid = g_entity_mgr->createEntityAsync("anim_tree_viewer", {}); }
 
@@ -499,7 +571,7 @@ public:
     showTexQualityOption = asset && (asset->getType() == dynModelEntityClassId || asset->getType() == animCharEntityClassId ||
                                       asset->getType() == rendInstEntityClassId || asset->getType() == compositEntityClassId);
 
-    phys_bullet_delete_ragdoll(ragdoll);
+    physsimulator::deleteRagdoll(ragdoll);
     lastAnimStatesSet.clear();
     animPersCoursePid = -1;
     animPersCourseDeltaPid = -1;
@@ -528,10 +600,13 @@ public:
         }
       }
 
-      riex.resIdx = rendinst::addRIGenExtraResIdx(asset->getName(), -1, -1, rendinst::AddRIFlag::UseShadow);
-      riex.res = rendinst::getRIGenExtraRes(riex.resIdx);
-      bad_ri = !riex.res;
-      if (!bad_ri && !riex.res->hasImpostor() &&
+      if (!forceRiExtra)
+      {
+        riex.resIdx = rendinst::addRIGenExtraResIdx(asset->getName(), -1, -1, rendinst::AddRIFlag::UseShadow);
+        riex.res = rendinst::getRIGenExtraRes(riex.resIdx);
+        bad_ri = !riex.res;
+      }
+      if (riex.res && !riex.res->hasImpostor() &&
           (forceRiExtra || lod_cnt > 2 || riex.res->getOccluderBox() || riex.res->getOccluderQuadPts()))
       {
         mat33f m3;
@@ -600,11 +675,53 @@ public:
       collisionAssetName.append("_collision");
       if (DagorAsset *collisionAsset = assetMgr.findAsset(collisionAssetName.c_str(), collisionAtype))
       {
-        InitCollisionResource(*collisionAsset, &collisionResource, &collisionResourceNodeTree);
+        InitCollisionResource(*collisionAsset, &collisionResource, collisionResourceNodeTree);
+        if (collisionResource)
+          colliderPhysMats.build(*collisionResource);
         DAEDITOR3.conNote("Found and inited collision '%s'", collisionAssetName.c_str());
       }
       else
         DAEDITOR3.conNote("Tried to init collision but no asset '%s' was found.", collisionAssetName.c_str());
+    }
+
+    if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
+    {
+      drawFloor = false; // calculate this before fillPluginPanel call for correct default checkbox state
+      if (AnimV20::AnimationGraph *ag = animCtrl->getAnimGraph())
+      {
+        int anim_nodes_cnt = 0;
+        for (int i = 0; i < ag->getAnimNodeCount(); i++)
+        {
+          AnimV20::IAnimBlendNode *node = ag->getBlendNodePtr(i);
+          if (!node)
+            continue;
+          if (!node->isSubOf(AnimV20::AnimBlendNodeNullCID))
+            anim_nodes_cnt++;
+          if (node->isSubOf(AnimV20::LegsIKCtrlCID) || node->isSubOf(AnimV20::FootLockerIKCtrlCID))
+            drawFloor = true;
+        }
+        int param_cnt = 0;
+        iterate_names(ag->getParamNames(), [&](int id, const char *) {
+          if (ag->getParamType(id) != AnimV20::AnimGraphStateHolder::PT_Reserved)
+            param_cnt++;
+        });
+        DAEDITOR3.conNote("animchar %s: %d animNodes (%d with NULLs),  %d BNLs,  %d PBCs\n"
+                          "  %d params, stateSz=%d bytes\n"
+                          "  %d states (%d channels)",
+          asset->getName(), anim_nodes_cnt, ag->getAnimNodeCount(), ag->getBNLCount(), ag->getPBCCount(), param_cnt,
+          animCtrl->getAnimState()->getSize(), animCtrl->getStatesCount(), ag->getStDest().size());
+        if (auto *ac = animCtrl->getAnimCharBase())
+        {
+          for (int irq_id = 0; irq_id < 1024; irq_id++)
+            if (AnimV20::getIrqName(irq_id))
+              ac->registerIrqHandler(irq_id, this);
+            else
+              break;
+        }
+        if (animCtrl->getAnimCharBase()->getPhysicsResource())
+          physsimulator::begin(NULL, ragdollPhysType, 1, physsimulator::SCENE_TYPE_GROUP, 0.0f, coll_plane_ht_front,
+            coll_plane_ht_rear);
+      }
     }
 
     if (entity)
@@ -629,43 +746,20 @@ public:
       if (IRandomSeedHolder *irsh = entity->queryInterface<IRandomSeedHolder>())
         irsh->setPerInstanceSeed(auto_inst_seed0);
 
-      fillPluginPanel();
+      if (getPluginPanel() == nullptr)
+        postFillPropPanel();
+      else
+        fillPluginPanel();
     }
     else if (riex.res)
     {
       if (ILodController *iLodCtrl = riex.vEntity->queryInterface<ILodController>())
         iLodCtrl->setCurLod(-1);
-      fillPluginPanel();
+      if (getPluginPanel() == nullptr)
+        postFillPropPanel();
+      else
+        fillPluginPanel();
     }
-    if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
-      if (AnimV20::AnimationGraph *ag = animCtrl->getAnimGraph())
-      {
-        int anim_nodes_cnt = 0;
-        for (int i = 0; i < ag->getAnimNodeCount(); i++)
-          if (ag->getBlendNodePtr(i) && !ag->getBlendNodePtr(i)->isSubOf(AnimV20::AnimBlendNodeNullCID))
-            anim_nodes_cnt++;
-        int param_cnt = 0;
-        iterate_names(ag->getParamNames(), [&](int id, const char *) {
-          if (ag->getParamType(id) != AnimV20::IPureAnimStateHolder::PT_Reserved)
-            param_cnt++;
-        });
-        DAEDITOR3.conNote("animchar %s: %d animNodes (%d with NULLs),  %d BNLs,  %d PBCs\n"
-                          "  %d params, stateSz=%d bytes\n"
-                          "  %d states (%d channels)",
-          asset->getName(), anim_nodes_cnt, ag->getAnimNodeCount(), ag->getBNLCount(), ag->getPBCCount(), param_cnt,
-          animCtrl->getAnimState()->getSize(), animCtrl->getStatesCount(), ag->getStDest().size());
-        if (auto *ac = animCtrl->getAnimChar())
-        {
-          for (int irq_id = 0; irq_id < 1024; irq_id++)
-            if (AnimV20::getIrqName(irq_id))
-              ac->registerIrqHandler(irq_id, this);
-            else
-              break;
-        }
-        if (animCtrl->getAnimChar()->getPhysicsResource())
-          physsimulator::begin(NULL, physsimulator::PHYS_BULLET, 1, physsimulator::SCENE_TYPE_GROUP, 0.0f, coll_plane_ht_front,
-            coll_plane_ht_rear);
-      }
 
     if (showImguiAnimTree)
       enableImguiAnimtree();
@@ -686,10 +780,11 @@ public:
     if (spEditor)
       spEditor->destroyPanel();
     if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
-      if (auto *ac = animCtrl->getAnimChar())
+      if (auto *ac = animCtrl->getAnimCharBase())
         ac->unregisterIrqHandler(-1, this);
     destroy_it(entity);
-    phys_bullet_delete_ragdoll(ragdoll);
+    physsimulator::deleteRagdoll(ragdoll);
+    destroyCanopyFxPreview();
     releaseRiExtra();
     texNames.reset();
     lastForceAnimSet = 0;
@@ -703,40 +798,55 @@ public:
     positionGizmoWrapper.reset();
 
     clearAssetStats();
-    ReleaseCollisionResource(&collisionResource, &collisionResourceNodeTree);
+    ReleaseCollisionResource(&collisionResource, collisionResourceNodeTree);
+    colliderPhysMats.clear();
 
     if (currentAnimcharEid)
       g_entity_mgr->destroyEntity(currentAnimcharEid);
     return true;
   }
 
+  void registerEditorCommands(IEditorCommandSystem &command_system) override
+  {
+    CompositeEditorViewport::registerEditorCommands(command_system);
+
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_AUTO, ImGuiKey_Backspace, ImGuiKey_KeypadDecimal);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_0, ImGuiKey_0, ImGuiKey_Keypad0);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_1, ImGuiKey_1, ImGuiKey_Keypad1);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_2, ImGuiKey_2, ImGuiKey_Keypad2);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_3, ImGuiKey_3, ImGuiKey_Keypad3);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_4, ImGuiKey_4, ImGuiKey_Keypad4);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_5, ImGuiKey_5, ImGuiKey_Keypad5);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_6, ImGuiKey_6, ImGuiKey_Keypad6);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_7, ImGuiKey_7, ImGuiKey_Keypad7);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_8, ImGuiKey_8, ImGuiKey_Keypad8);
+    command_system.addCommand(EditorCommandIds::ENTITY_CHANGE_LOD_9, ImGuiKey_9, ImGuiKey_Keypad9);
+  }
+
   void registerMenuAccelerators() override
   {
     IWndManager &wndManager = *EDITORCORE->getWndManager();
 
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_AUTO, ImGuiKey_Backspace);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_0, ImGuiKey_0);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_1, ImGuiKey_1);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_2, ImGuiKey_2);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_3, ImGuiKey_3);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_4, ImGuiKey_4);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_5, ImGuiKey_5);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_6, ImGuiKey_6);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_7, ImGuiKey_7);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_8, ImGuiKey_8);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_9, ImGuiKey_9);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_AUTO, EditorCommandIds::ENTITY_CHANGE_LOD_AUTO);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_0, EditorCommandIds::ENTITY_CHANGE_LOD_0);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_1, EditorCommandIds::ENTITY_CHANGE_LOD_1);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_2, EditorCommandIds::ENTITY_CHANGE_LOD_2);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_3, EditorCommandIds::ENTITY_CHANGE_LOD_3);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_4, EditorCommandIds::ENTITY_CHANGE_LOD_4);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_5, EditorCommandIds::ENTITY_CHANGE_LOD_5);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_6, EditorCommandIds::ENTITY_CHANGE_LOD_6);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_7, EditorCommandIds::ENTITY_CHANGE_LOD_7);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_8, EditorCommandIds::ENTITY_CHANGE_LOD_8);
+    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_9, EditorCommandIds::ENTITY_CHANGE_LOD_9);
 
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_AUTO, ImGuiKey_KeypadDecimal);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_0, ImGuiKey_Keypad0);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_1, ImGuiKey_Keypad1);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_2, ImGuiKey_Keypad2);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_3, ImGuiKey_Keypad3);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_4, ImGuiKey_Keypad4);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_5, ImGuiKey_Keypad5);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_6, ImGuiKey_Keypad6);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_7, ImGuiKey_Keypad7);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_8, ImGuiKey_Keypad8);
-    wndManager.addViewportAccelerator(CM_ENTITY_CHANGE_LOD_9, ImGuiKey_Keypad9);
+    wndManager.addViewportAccelerator(CM_COMPOSITE_EDITOR_CREATE_NODE, EditorCommandIds::ENTITY_CREATE_NODE);
+
+    wndManager.addViewportAccelerator(CM_COMPOSITE_EDITOR_COPY_ASSET, EditorCommandIds::ENTITY_COPY_ASSET);
+    wndManager.addViewportAccelerator(CM_COMPOSITE_EDITOR_PASTE_ASSET, EditorCommandIds::ENTITY_PASTE_ASSET);
+    wndManager.addViewportAccelerator(CM_COMPOSITE_EDITOR_DUPLICATE_ASSETS, EditorCommandIds::ENTITY_DUPLICATE_ASSET);
+
+    wndManager.addViewportAccelerator(CM_COMPOSITE_EDITOR_MAKE_PARENT, EditorCommandIds::ENTITY_MAKE_PARENT);
+    wndManager.addViewportAccelerator(CM_COMPOSITE_EDITOR_CLEAR_PARENT, EditorCommandIds::ENTITY_CLEAR_PARENT);
 
     compositeEditorViewport.registerMenuAccelerators();
   }
@@ -835,14 +945,14 @@ public:
     IAnimCharController *animCtrl = entity->queryInterface<IAnimCharController>();
     if (!animCtrl || !animCtrl->getAnimGraph())
       return;
-    AnimV20::IAnimStateHolder &st = *animCtrl->getAnimState();
+    AnimV20::AnimGraphStateHolder &st = *animCtrl->getAnimState();
 
     iterate_names(animCtrl->getAnimGraph()->getParamNames(), [&](int i, const char *nm) {
       switch (animCtrl->getAnimGraph()->getParamType(i))
       {
-        case AnimV20::IPureAnimStateHolder::PT_ScalarParam:
-        case AnimV20::IPureAnimStateHolder::PT_TimeParam: state.setReal(nm, st.getParam(i)); break;
-        case AnimV20::IPureAnimStateHolder::PT_ScalarParamInt: state.setInt(nm, st.getParamInt(i)); break;
+        case AnimV20::AnimGraphStateHolder::PT_ScalarParam:
+        case AnimV20::AnimGraphStateHolder::PT_TimeParam: state.setReal(nm, st.getParam(i)); break;
+        case AnimV20::AnimGraphStateHolder::PT_ScalarParamInt: state.setInt(nm, st.getParamInt(i)); break;
       }
     });
 
@@ -866,14 +976,14 @@ public:
     IAnimCharController *animCtrl = entity->queryInterface<IAnimCharController>();
     if (!animCtrl || !animCtrl->getAnimGraph())
       return;
-    AnimV20::IAnimStateHolder &st = *animCtrl->getAnimState();
+    AnimV20::AnimGraphStateHolder &st = *animCtrl->getAnimState();
 
     iterate_names(animCtrl->getAnimGraph()->getParamNames(), [&](int i, const char *nm) {
       switch (animCtrl->getAnimGraph()->getParamType(i))
       {
-        case AnimV20::IPureAnimStateHolder::PT_ScalarParam:
-        case AnimV20::IPureAnimStateHolder::PT_TimeParam: st.setParam(i, state.getReal(nm, st.getParam(i))); break;
-        case AnimV20::IPureAnimStateHolder::PT_ScalarParamInt: st.setParamInt(i, state.getInt(nm, st.getParamInt(i))); break;
+        case AnimV20::AnimGraphStateHolder::PT_ScalarParam:
+        case AnimV20::AnimGraphStateHolder::PT_TimeParam: st.setParam(i, state.getReal(nm, st.getParam(i))); break;
+        case AnimV20::AnimGraphStateHolder::PT_ScalarParamInt: st.setParamInt(i, state.getInt(nm, st.getParamInt(i))); break;
       }
     });
 
@@ -919,6 +1029,11 @@ public:
   {
     if (compositeEditorViewport.getSelectionBox(entity, box))
       return true;
+    return getGlobalBox(box);
+  }
+
+  bool getGlobalBox(BBox3 &box) const override
+  {
     if (riex.res)
     {
       box = riex.res->bbox;
@@ -930,8 +1045,117 @@ public:
     return true;
   }
 
+  bool getCanopyPreviewBoxAndTm(BBox3 &box, TMatrix &tm) const
+  {
+    if (riex.res)
+    {
+      box = riex.res->bbox;
+      tm = rotyTM(rotY * DEG_TO_RAD) * rotxTM(rotX * DEG_TO_RAD);
+      return true;
+    }
+
+    if (!entity)
+      return false;
+
+    box = entity->getBbox();
+    entity->getTm(tm);
+    return true;
+  }
+
+  bool getCanopyPreviewTm(TMatrix &tm) const
+  {
+    if (riex.res)
+    {
+      tm = rotyTM(rotY * DEG_TO_RAD) * rotxTM(rotX * DEG_TO_RAD);
+      return true;
+    }
+
+    if (!entity)
+      return false;
+
+    entity->getTm(tm);
+    return true;
+  }
+
+  void updateCanopyFxPreviewViewports()
+  {
+    IEditorCoreEngine::get()->invalidateViewportCache();
+    IEditorCoreEngine::get()->updateViewports();
+  }
+
+  bool destroyCanopyFxPreview()
+  {
+    const bool hadEntity = canopyFxEntity != nullptr;
+    destroy_it(canopyFxEntity);
+    canopyFxAssetName.clear();
+    canopyFxRestartTime = 0.0f;
+    return hadEntity;
+  }
+
+  bool recreateCanopyFxPreview(const char *fx_asset_name)
+  {
+    const bool changed = destroyCanopyFxPreview();
+
+    if (is_empty_string(fx_asset_name))
+      return changed;
+
+    DagorAsset *effectAsset = resolve_canopy_fx_asset(fx_asset_name);
+    if (!effectAsset)
+      return changed;
+
+    canopyFxEntity = DAEDITOR3.createEntity(*effectAsset);
+    if (!canopyFxEntity)
+      return changed;
+
+    canopyFxEntity->setSubtype(DAEDITOR3.registerEntitySubTypeId("rend_ent_geom"));
+    canopyFxAssetName = fx_asset_name;
+    canopyFxRestartTime = 0.0f;
+    return true;
+  }
+
+  void syncCanopyFxPreview(float dt)
+  {
+    const char *desiredFxAssetName = nullptr;
+    if (CanopyEditorWindow *canopyEditor = get_app().getCanopyEditorWindow())
+      desiredFxAssetName = canopyEditor->getViewportFxAssetName();
+
+    if (is_empty_string(desiredFxAssetName))
+    {
+      if (destroyCanopyFxPreview())
+        updateCanopyFxPreviewViewports();
+      return;
+    }
+
+    bool fxPreviewChanged = false;
+    if (!canopyFxEntity || strcmp(canopyFxAssetName, desiredFxAssetName) != 0)
+      fxPreviewChanged = recreateCanopyFxPreview(desiredFxAssetName);
+    else
+    {
+      canopyFxRestartTime += dt;
+      if (canopyFxRestartTime >= 3.0f)
+        fxPreviewChanged = recreateCanopyFxPreview(desiredFxAssetName);
+    }
+
+    if (!canopyFxEntity)
+      return;
+
+    TMatrix fxTm;
+    if (!getCanopyPreviewTm(fxTm))
+    {
+      if (destroyCanopyFxPreview())
+        updateCanopyFxPreviewViewports();
+      return;
+    }
+
+    canopyFxEntity->setTm(fxTm);
+    if (fxPreviewChanged)
+      updateCanopyFxPreviewViewports();
+  }
+
   void actObjects(float dt) override
   {
+    syncCanopyFxPreview(dt);
+
     if (getPluginPanel())
       if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
       {
@@ -940,17 +1164,20 @@ public:
             physsimulator::simulate(animCtrl->getTimeScale() * dt);
 
         AnimV20::AnimationGraph *anim = animCtrl->getAnimGraph();
-        AnimV20::IAnimStateHolder *st = animCtrl->getAnimState();
+        AnimV20::AnimGraphStateHolder *st = animCtrl->getAnimState();
         if (anim && st)
         {
           iterate_names(anim->getParamNames(), [&](int i, const char *paramName) {
+            if (i >= PID_ANIM_PARAM_LAST - PID_ANIM_PARAM0)
+              return;
+
             if (i < enumParamMask.size() && enumParamMask.get(i))
             {
               PropPanel::PropertyControlBase *c = getPluginPanel()->getById(PID_ANIM_PARAM0 + i);
               int v = 0;
-              if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+              if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
                 v = (int)st->getParam(i);
-              else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+              else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
                 v = st->getParamInt(i);
               else
                 DAEDITOR3.conError("param[%d] <%s> type=%d unexpected", i, paramName, anim->getParamType(i));
@@ -967,23 +1194,23 @@ public:
             {
               PropPanel::PropertyControlBase *c = getPluginPanel()->getById(PID_ANIM_PARAM0 + i);
               bool v = false;
-              if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+              if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
                 v = st->getParam(i) > 0.5f;
-              else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+              else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
                 v = st->getParamInt(i) >= 1;
               else
                 DAEDITOR3.conError("param[%d] <%s> type=%d unexpected", i, paramName, anim->getParamType(i));
               if (c && c->getBoolValue() != v)
                 c->setBoolValue(v);
             }
-            else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+            else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
             {
               PropPanel::PropertyControlBase *c = getPluginPanel()->getById(PID_ANIM_PARAM0 + i);
               float v = st->getParam(i);
               if (c && c->getFloatValue() != v)
                 c->setFloatValue(v);
             }
-            else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+            else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
             {
               PropPanel::PropertyControlBase *c = getPluginPanel()->getById(PID_ANIM_PARAM0 + i);
               int v = st->getParamInt(i);
@@ -1006,8 +1233,7 @@ public:
         if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
         {
           FpsCameraView &fvc = fpsCamView[fpsCamViewId - PID_FPSCAM_FIRST];
-          auto _ac = animCtrl->getAnimChar();
-          auto ac = _ac ? &_ac->baseComp() : NULL;
+          auto ac = animCtrl->getAnimCharBase();
 
           if (!fvc.slot.empty() && ac)
             ac = ac->getAttachedChar(AnimCharV20::getSlotId(fvc.slot));
@@ -1027,7 +1253,7 @@ public:
             else if (!fvc.pitchParam.empty() || !fvc.yawParam.empty())
             {
               AnimV20::AnimationGraph *anim = animCtrl->getAnimGraph();
-              AnimV20::IAnimStateHolder *st = animCtrl->getAnimState();
+              AnimV20::AnimGraphStateHolder *st = animCtrl->getAnimState();
               if (anim && st)
               {
                 float yaw = 0, pitch = 0;
@@ -1123,14 +1349,14 @@ public:
     if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
     {
       AnimV20::AnimationGraph *anim = animCtrl->getAnimGraph();
-      AnimV20::IAnimStateHolder *st = animCtrl->getAnimState();
-      if (showSkeleton && animCtrl->getAnimChar())
+      AnimV20::AnimGraphStateHolder *st = animCtrl->getAnimState();
+      if (auto *ac = animCtrl->getAnimCharBase(); ac && showSkeleton)
       {
-        animCtrl->getAnimChar()->getNodeTree().partialCalcWtm(dag::Index16(animCtrl->getAnimChar()->getNodeTree().nodeCount()));
+        ac->getNodeTree().partialCalcWtm(dag::Index16(ac->getNodeTree().nodeCount()));
         begin_draw_cached_debug_lines(false, false);
         set_cached_debug_lines_wtm(TMatrix::IDENT);
-        DynamicRenderableSceneInstance *scn = animCtrl->getAnimChar()->getSceneInstance();
-        const GeomNodeTree &tree = animCtrl->getAnimChar()->getNodeTree();
+        DynamicRenderableSceneInstance *scn = animCtrl->getAnimCharRend()->getSceneInstance();
+        const GeomNodeTree &tree = ac->getNodeTree();
         if (!tree.empty())
           for (int i = 0; i < tree.getChildCount(dag::Index16(0)); i++)
             drawSkeletonLinks(tree, tree.getChildNodeIdx(dag::Index16(0), i), scn, nodeAxisLen, showSkeletonNodeNames);
@@ -1141,15 +1367,15 @@ public:
         begin_draw_cached_debug_lines(false, false);
         set_cached_debug_lines_wtm(TMatrix::IDENT);
         iterate_names(anim->getParamNames(), [&](int id, const char *nm) {
-          if (anim->getParamType(id) == AnimV20::IPureAnimStateHolder::PT_Effector)
+          if (anim->getParamType(id) == AnimV20::AnimGraphStateHolder::PT_Effector)
           {
-            int id = anim->getParamId(nm, AnimV20::IAnimStateHolder::PT_Effector);
-            int id2 = anim->getParamId(String(0, "%s.m", nm), AnimV20::IAnimStateHolder::PT_InlinePtr);
-            AnimV20::IAnimStateHolder::EffectorVar eff = st->getParamEffector(id);
+            int id = anim->getParamId(nm, AnimV20::AnimGraphStateHolder::PT_Effector);
+            int id2 = anim->getParamId(String(0, "%s.m", nm), AnimV20::AnimGraphStateHolder::PT_InlinePtr);
+            AnimV20::AnimGraphStateHolder::EffectorVar eff = st->getParamEffector(id);
             if (eff.type == eff.T_useEffector)
               draw_cached_debug_sphere(Point3(eff.x, eff.y, eff.z), 0.005, E3DCOLOR(255, 0, 0, 255));
             else if (eff.nodeId)
-              draw_cached_debug_sphere(animCtrl->getAnimChar()->getNodeTree().getNodeWposRelScalar(eff.nodeId), 0.005,
+              draw_cached_debug_sphere(animCtrl->getAnimCharBase()->getNodeTree().getNodeWposRelScalar(eff.nodeId), 0.005,
                 E3DCOLOR(255, 128, 0, 255));
 
             if (id2 >= 0)
@@ -1182,12 +1408,12 @@ public:
       if (showIKSolution && anim)
       {
         iterate_names(anim->getParamNames(), [&](int id, const char *nm) {
-          if (anim->getParamType(id) == AnimV20::IPureAnimStateHolder::PT_InlinePtrCTZ)
+          if (anim->getParamType(id) == AnimV20::AnimGraphStateHolder::PT_InlinePtrCTZ)
           {
             if (!trail_strcmp(nm, "$dbg0"))
               return;
-            int id0 = anim->getParamId(nm, AnimV20::IAnimStateHolder::PT_InlinePtrCTZ);
-            int id1 = anim->getParamId(String(0, "%.*s1", strlen(nm) - 1, nm), AnimV20::IAnimStateHolder::PT_InlinePtrCTZ);
+            int id0 = anim->getParamId(nm, AnimV20::AnimGraphStateHolder::PT_InlinePtrCTZ);
+            int id1 = anim->getParamId(String(0, "%.*s1", strlen(nm) - 1, nm), AnimV20::AnimGraphStateHolder::PT_InlinePtrCTZ);
             auto *c0 = id0 >= 0 ? (AnimV20::MultiChainFABRIKCtrl::debug_state_t *)st->getInlinePtr(id0) : nullptr;
             auto *c1 = id1 >= 0 ? (AnimV20::MultiChainFABRIKCtrl::debug_state_t *)st->getInlinePtr(id1) : nullptr;
 
@@ -1214,7 +1440,7 @@ public:
       if (showWABB)
       {
         bbox3f wbb;
-        if (animCtrl->getAnimChar()->calcWorldBox(wbb))
+        if (animCtrl->getAnimCharRend()->calcWorldBox(wbb, *animCtrl->getAnimCharFinalWTM()))
         {
           Point3_vec4 b[2];
           v_st(&b[0].x, wbb.bmin);
@@ -1229,20 +1455,42 @@ public:
       {
         begin_draw_cached_debug_lines(false, false);
         set_cached_debug_lines_wtm(TMatrix::IDENT);
-        draw_cached_debug_sphere(animCtrl->getAnimChar()->getBoundingSphere().c, animCtrl->getAnimChar()->getBoundingSphere().r,
-          0xFFFF8080);
+        draw_cached_debug_sphere(animCtrl->getAnimCharBoundingSphere().c, animCtrl->getAnimCharBoundingSphere().r, 0xFFFF8080);
         end_draw_cached_debug_lines();
       }
     }
     if (physsimulator::getPhysWorld())
-      physsimulator::renderTrans(true, false, false, false, false, false);
+      physsimulator::renderTrans(true, false, false, false, false, false, drawFloor);
 
     if (showCollider && collisionResource)
-      RenderCollisionResource(*collisionResource, collisionResourceNodeTree, showColliderBbox, showColliderPhysCollidable,
-        showColliderTraceable);
+      if (const ViewportWindow *vpw = static_cast<ViewportWindow *>(EDITORCORE->getRenderViewport()))
+      {
+        CollisionRenderOptions opts;
+        opts.showBbox = showColliderBbox;
+        opts.showPhysCollidable = showColliderPhysCollidable;
+        opts.showTraceable = showColliderTraceable;
+        // The hue follows the clusters of the asset in view, so the Collision plugin can draw a material differently.
+        opts.colorByPhysMat = true; // no material panel here, so no filter
+        opts.physMats = &colliderPhysMats;
+        RenderCollisionResource(*collisionResource, collisionResourceNodeTree.get(), vpw->getViewTm(), vpw->getProjTm(), opts);
+      }
 
-    compositeEditorViewport.renderTransObjects(entity);
+    if (CanopyEditorWindow *canopyEditor = get_app().getCanopyEditorWindow())
+    {
+      CanopyEditorWindow::ViewportCanopyParams canopyParams;
+      BBox3 canopyBox;
+      TMatrix canopyTm;
+      if (canopyEditor->getViewportCanopyParams(canopyParams) && getCanopyPreviewBoxAndTm(canopyBox, canopyTm))
+        draw_canopy_preview(canopyParams, canopyBox, canopyTm);
+    }
+
+    IGenViewportWnd *wnd = EDITORCORE->getRenderViewport();
+    if (wnd)
+      compositeEditorViewport.renderTransObjects(*wnd, entity);
   }
+
+  void updateImgui() override { compositeEditorViewport.updateImgui(); }
+
   static void drawIKStructure(Tab<Tab<vec3f>> &chains, bool initial)
   {
     E3DCOLOR color(initial ? 128 : 255, initial ? 128 : 255, initial ? 128 : 255, 255);
@@ -1394,13 +1642,13 @@ public:
     if (IAnimCharController *animCtrl = _ent->queryInterface<IAnimCharController>())
     {
       PropPanel::ContainerPropertyControl *animPanel = grpSpec->createGroup(PID_ANIMATION_GROUP, "Animation");
-      if (fpsCamView.size() && animCtrl->getAnimChar())
+      if (fpsCamView.size() && animCtrl->getAnimCharBase())
       {
         Tab<int> cam_ids;
         for (int i = 0, ie = fpsCamView.size(); i < ie; ++i)
-          if (!fpsCamView[i].slot.empty() && animCtrl->getAnimChar()->getSlotNodeWtm(AnimCharV20::getSlotId(fpsCamView[i].slot)))
+          if (!fpsCamView[i].slot.empty() && animCtrl->getAnimCharBase()->getSlotNodeWtm(AnimCharV20::getSlotId(fpsCamView[i].slot)))
             cam_ids.push_back(i);
-          else if (fpsCamView[i].slot.empty() && animCtrl->getAnimChar()->findINodeIndex(fpsCamView[i].node))
+          else if (fpsCamView[i].slot.empty() && animCtrl->getAnimCharBase()->findINodeIndex(fpsCamView[i].node))
             cam_ids.push_back(i);
           else if (fpsCamViewId == PID_FPSCAM_FIRST + i)
             fpsCamViewId = PID_FPSCAM_DEF;
@@ -1419,9 +1667,9 @@ public:
         fpsCamViewId = PID_FPSCAM_DEF;
 
       animPanel->createSeparator();
-      if (animCtrl->getAnimChar())
+      if (animCtrl->getAnimCharBase())
       {
-        const GeomNodeTree &t = animCtrl->getAnimChar()->getNodeTree();
+        const GeomNodeTree &t = animCtrl->getAnimCharBase()->getNodeTree();
         animPanel->createCheckBox(PID_ANIM_SHOW_SKELETON,
           String(0, "Show skeleton (%d total, %d important)", t.nodeCount(), t.importantNodeCount()), showSkeleton);
         animPanel->createCheckBox(PID_ANIM_SHOW_SKELETON_NAMES, "Show skeleton node names", showSkeletonNodeNames);
@@ -1431,6 +1679,7 @@ public:
       animPanel->createCheckBox(PID_ANIM_SHOW_IKSOL, "Show FABRIK solution", showIKSolution);
       animPanel->createCheckBox(PID_ANIM_SHOW_WABB, "Show WABB", showWABB);
       animPanel->createCheckBox(PID_ANIM_SHOW_BSPH, "Show BSphere", showBSPH);
+      animPanel->createCheckBox(PID_ANIM_DRAW_FLOOR, "Draw Floor", drawFloor);
       animPanel->createCheckBox(PID_ANIM_LOG_IRQ, "Log IRQs to console", logIrqs);
       animPanel->createButton(PID_ANIM_ACT_RESTART, "restart", true);
       animPanel->createButton(PID_ANIM_ACT_PAUSE, animCtrl->isPaused() ? "resume" : "pause", true, false);
@@ -1444,10 +1693,24 @@ public:
         animPanel->createButton(PID_ANIM_TREE_IMGUI, "Anim tree imgui");
       }
 
-      if (animCtrl->getAnimChar() && animCtrl->getAnimChar()->getPhysicsResource())
+      if (auto *ac = animCtrl->getAnimCharBase(); ac && ac->getPhysicsResource())
       {
         PropPanel::ContainerPropertyControl &rdGrp = *animPanel->createGroup(PID_ANIM_RAGDOLL_GROUP, "Ragdoll test");
         rdGrp.createButton(PID_ANIM_RAGDOLL_START, ragdoll ? "stop" : "START");
+
+        if (ragdollPhysType == physsimulator::PHYS_DEFAULT)
+          ragdollPhysType = physsimulator::getDefaultPhys();
+        PropPanel::ContainerPropertyControl &engineGrp = *rdGrp.createRadioGroup(PID_ANIM_RAGDOLL_ENGINE_GRP, "Phys Engine:");
+        engineGrp.createRadio(physsimulator::PHYS_BULLET, "bullet");
+        engineGrp.createRadio(physsimulator::PHYS_JOLT, "jolt");
+        rdGrp.setInt(PID_ANIM_RAGDOLL_ENGINE_GRP, ragdollPhysType);
+
+        PropPanel::ContainerPropertyControl &motoGrp = *rdGrp.createGroup(PID_ANIM_RAGDOLL_DRIVE_GRP, "Motorised Ragdoll");
+        motoGrp.createCheckBox(PID_ANIM_RAGDOLL_DRIVE, "drive bodies to anim pose (motorized)", ragdollDriveToAnim);
+        motoGrp.createEditFloat(PID_ANIM_RAGDOLL_MOTOR_TWIST_FREQ, "twist frequency, Hz", ragdollMotorTwistFreq);
+        motoGrp.createEditFloat(PID_ANIM_RAGDOLL_MOTOR_TWIST_DAMP, "twist damping (ratio)", ragdollMotorTwistDamp);
+        motoGrp.createEditFloat(PID_ANIM_RAGDOLL_MOTOR_SWING_FREQ, "swing frequency, Hz", ragdollMotorSwingFreq);
+        motoGrp.createEditFloat(PID_ANIM_RAGDOLL_MOTOR_SWING_DAMP, "swing damping (ratio)", ragdollMotorSwingDamp);
         rdGrp.createStatic(0, "Spring settings (activated with LMB)");
         rdGrp.createEditFloat(PID_ANIM_RAGDOLL_SPRING_FACTOR, "Spring factor, N/m", physsimulator::springFactor);
         rdGrp.createEditFloat(PID_ANIM_RAGDOLL_DAMPER_FACTOR, "Damper factor", physsimulator::damperFactor);
@@ -1455,10 +1718,10 @@ public:
         rdGrp.createEditFloat(PID_ANIM_RAGDOLL_BULLET_IMPULSE, "Bullet impulse, kg*m/s", ragdollBulletImpulse);
         animPanel->setBool(PID_ANIM_RAGDOLL_GROUP, true);
       }
-      if (animCtrl->getAnimChar())
+      if (auto *ac = animCtrl->getAnimCharBase())
       {
         float pyOfs, pxScale, pyScale, pzScale, sScale;
-        if (animCtrl->getAnimChar()->getCharDepScales(pyOfs, pxScale, pyScale, pzScale, sScale))
+        if (ac->getCharDepScales(pyOfs, pxScale, pyScale, pzScale, sScale))
         {
           PropPanel::ContainerPropertyControl &cdcGrp =
             *animPanel->createGroup(PID_ANIM_CHARDEP_GROUP, "Char-dependant customization");
@@ -1483,7 +1746,7 @@ public:
       animPanel->createSortedCombo(PID_ANIM_SET_NODE, "Force anim node", anims, lastForceAnimSet);
 
       AnimV20::AnimationGraph *anim = animCtrl->getAnimGraph();
-      AnimV20::IAnimStateHolder *st = animCtrl->getAnimState();
+      AnimV20::AnimGraphStateHolder *st = animCtrl->getAnimState();
       if (anim && anim->getStateCount())
       {
         PropPanel::ContainerPropertyControl &animGrp = *animPanel->createGroup(PID_ANIM_STATES_GROUP, "Anim states");
@@ -1521,12 +1784,12 @@ public:
 
       if (anim && st)
       {
-        animPersCoursePid = anim->getParamId("pers_course", AnimV20::IAnimStateHolder::PT_ScalarParam);
-        animPersCourseDeltaPid = anim->getParamId("pers_course:delta", AnimV20::IAnimStateHolder::PT_ScalarParam);
+        animPersCoursePid = anim->getParamId("pers_course", AnimV20::AnimGraphStateHolder::PT_ScalarParam);
+        animPersCourseDeltaPid = anim->getParamId("pers_course:delta", AnimV20::AnimGraphStateHolder::PT_ScalarParam);
         bool has_params = false;
         for (int i = 0; i < anim->getParamCount(); i++)
-          if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam ||
-              anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+          if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam ||
+              anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
           {
             has_params = true;
             break;
@@ -1540,8 +1803,14 @@ public:
           PropPanel::ContainerPropertyControl &astGrp = *animPanel->createGroup(PID_ANIM_PARAMS_GROUP, "Anim params");
           enumParamMask.resize(anim->getParamCount());
           boolParamMask.resize(anim->getParamCount());
+          if (anim->getParamCount() > PID_ANIM_PARAM_LAST - PID_ANIM_PARAM0)
+            logerr("Param count %d exceeds max display param count %d. Please increase it in code to display all parameters.",
+              anim->getParamCount(), PID_ANIM_PARAM_LAST - PID_ANIM_PARAM0);
           iterate_names_in_lexical_order(anim->getParamNames(), [&](int i, const char *nm) {
             if (nm[0] == ':')
+              return;
+
+            if (i >= PID_ANIM_PARAM_LAST - PID_ANIM_PARAM0)
               return;
 
             const DataBlock *param_b = animCharVarSetts.getBlockByName(nm);
@@ -1554,9 +1823,9 @@ public:
               enumParamBlk.addNewBlock(&bEnum, nm);
               Tab<String> enumNm(tmpmem);
               int value = 0;
-              if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+              if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
                 value = (int)st->getParam(i);
-              else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+              else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
                 value = st->getParamInt(i);
 
               int sel_idx = -1;
@@ -1574,16 +1843,16 @@ public:
             if (param_b && param_b->getBool("bool", false))
             {
               bool v = false;
-              if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+              if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
                 v = st->getParam(i) > 0.5f;
-              else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+              else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
                 v = st->getParamInt(i) >= 1;
 
               astGrp.createCheckBox(PID_ANIM_PARAM0 + i, nm, v);
               boolParamMask.set(i);
               return;
             }
-            if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+            if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
             {
               if (param_b && param_b->getBool("trackbar", false))
                 astGrp.createTrackFloat(PID_ANIM_PARAM0 + i, nm, st->getParam(i), param_b->getReal("min", 0),
@@ -1591,7 +1860,7 @@ public:
               else
                 astGrp.createEditFloat(PID_ANIM_PARAM0 + i, nm, st->getParam(i));
             }
-            else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+            else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
               astGrp.createEditInt(PID_ANIM_PARAM0 + i, nm, st->getParamInt(i));
             if (param_b)
               astGrp.setMinMaxStep(PID_ANIM_PARAM0 + i, param_b->getReal("min"), param_b->getReal("max"), param_b->getReal("step"));
@@ -1599,7 +1868,7 @@ public:
         }
       }
 
-      if (animCtrl->getAnimChar())
+      if (animCtrl->getAnimCharBase())
       {
         PropPanel::ContainerPropertyControl &traceGrp = *animPanel->createGroup(PID_ANIM_TRACE_GROUP, "Legs IK test");
         traceGrp.createEditFloat(PID_ANIM_TRACE_CP_HT_F, "Floor H, front side", coll_plane_ht_front);
@@ -1643,6 +1912,7 @@ public:
           else
             texGrp.createStatic(0, nm);
         }
+        texGrp.setDropTargetHandler(&textureDragAndDropHandler);
         if (l >= 0)
           grpSpec->setBool(PID_TEX_GROUP + l + 1, true);
       }
@@ -1695,7 +1965,11 @@ public:
       nodesFilterByMask.createButton(PID_MASK_NODES_UNCHECK_ALL, "Uncheck all");
 
       const int blockCount = nodeFilterMasksBlk.blockCount();
-      for (int i = 0; i < blockCount; ++i)
+      const int count = min(PID_MASK_NODES_LAST - PID_MASK_NODES, blockCount);
+      if (PID_MASK_NODES_LAST - PID_MASK_NODES < blockCount)
+        logerr("Node filter mask count %d exceeds max display node filter mask count %d. Please increase it in code to display all.",
+          blockCount, PID_MASK_NODES_LAST - PID_MASK_NODES);
+      for (int i = 0; i < count; ++i)
       {
         const DataBlock *maskBlk = nodeFilterMasksBlk.getBlock(i);
         const char *maskText = maskBlk->getStr("name", "");
@@ -1786,6 +2060,8 @@ public:
       showWABB = panel->getBool(pcb_id);
     else if (pcb_id == PID_ANIM_SHOW_BSPH)
       showBSPH = panel->getBool(pcb_id);
+    else if (pcb_id == PID_ANIM_DRAW_FLOOR)
+      drawFloor = panel->getBool(pcb_id);
     else if (pcb_id == PID_ANIM_LOG_IRQ)
       logIrqs = panel->getBool(pcb_id);
     else if (pcb_id >= PID_ANIM_PARAM0 && pcb_id < PID_ANIM_PARAM_LAST)
@@ -1793,7 +2069,7 @@ public:
       if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
       {
         AnimV20::AnimationGraph *anim = animCtrl->getAnimGraph();
-        AnimV20::IAnimStateHolder *st = animCtrl->getAnimState();
+        AnimV20::AnimGraphStateHolder *st = animCtrl->getAnimState();
         if (anim && st)
         {
           int i = pcb_id - PID_ANIM_PARAM0;
@@ -1804,25 +2080,25 @@ public:
             if (const DataBlock *b = enumParamBlk.getBlockByName(anim->getParamName(i)))
               if (v >= 0 && v < b->blockCount())
               {
-                if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+                if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
                   st->setParam(i, b->getBlock(v)->getInt("_enumValue"));
-                else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+                else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
                   st->setParamInt(i, b->getBlock(v)->getInt("_enumValue"));
               }
           }
           else if (boolParamMask.get(i))
           {
-            if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+            if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
               st->setParam(i, panel->getBool(pcb_id) ? 1.0f : 0.0f);
-            else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+            else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
               st->setParamInt(i, panel->getBool(pcb_id) ? 1 : 0);
           }
-          else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParam)
+          else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParam)
           {
             float v = panel->getFloat(pcb_id);
             st->setParam(i, v);
           }
-          else if (anim->getParamType(i) == AnimV20::IPureAnimStateHolder::PT_ScalarParamInt)
+          else if (anim->getParamType(i) == AnimV20::AnimGraphStateHolder::PT_ScalarParamInt)
             st->setParamInt(i, panel->getInt(pcb_id));
 
           if (i == animPersCoursePid)
@@ -1869,40 +2145,83 @@ public:
       physsimulator::damperFactor = panel->getFloat(pcb_id);
     else if (pcb_id == PID_ANIM_RAGDOLL_BULLET_IMPULSE)
       ragdollBulletImpulse = panel->getFloat(pcb_id);
+    else if (pcb_id == PID_ANIM_RAGDOLL_ENGINE_GRP)
+    {
+      int newType = panel->getInt(pcb_id);
+      if (newType != PropPanel::RADIO_SELECT_NONE && newType != ragdollPhysType)
+      {
+        stopRagdoll();
+        ragdollPhysType = newType;
+        if (physsimulator::getPhysWorld())
+          physsimulator::end();
+        physsimulator::begin(NULL, ragdollPhysType, 1, physsimulator::SCENE_TYPE_GROUP, 0.0f, coll_plane_ht_front, coll_plane_ht_rear);
+        panel->setCaption(PID_ANIM_RAGDOLL_START, ragdoll ? "stop" : "START");
+      }
+    }
+    else if (pcb_id == PID_ANIM_RAGDOLL_DRIVE)
+    {
+      ragdollDriveToAnim = panel->getBool(pcb_id);
+      if (ragdoll)
+      {
+        physsimulator::setRagdollDriveToAnimchar(ragdoll, ragdollDriveToAnim);
+        if (ragdollDriveToAnim)
+          physsimulator::setJointsMotorSettings(ragdollMotorTwistFreq, ragdollMotorTwistDamp, ragdollMotorSwingFreq,
+            ragdollMotorSwingDamp);
+      }
+    }
+    else if (pcb_id == PID_ANIM_RAGDOLL_MOTOR_TWIST_FREQ || pcb_id == PID_ANIM_RAGDOLL_MOTOR_TWIST_DAMP ||
+             pcb_id == PID_ANIM_RAGDOLL_MOTOR_SWING_FREQ || pcb_id == PID_ANIM_RAGDOLL_MOTOR_SWING_DAMP)
+    {
+      ragdollMotorTwistFreq = panel->getFloat(PID_ANIM_RAGDOLL_MOTOR_TWIST_FREQ);
+      ragdollMotorTwistDamp = panel->getFloat(PID_ANIM_RAGDOLL_MOTOR_TWIST_DAMP);
+      ragdollMotorSwingFreq = panel->getFloat(PID_ANIM_RAGDOLL_MOTOR_SWING_FREQ);
+      ragdollMotorSwingDamp = panel->getFloat(PID_ANIM_RAGDOLL_MOTOR_SWING_DAMP);
+      if (ragdoll && ragdollDriveToAnim)
+        physsimulator::setJointsMotorSettings(ragdollMotorTwistFreq, ragdollMotorTwistDamp, ragdollMotorSwingFreq,
+          ragdollMotorSwingDamp);
+    }
     else if (pcb_id == PID_ANIM_CHARDEP_PY_OFS || pcb_id == PID_ANIM_CHARDEP_P_SCL || pcb_id == PID_ANIM_CHARDEP_S_SCL)
     {
       if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
-        if (animCtrl->getAnimChar())
+        if (auto *ac = animCtrl->getAnimCharBase())
         {
           if (pcb_id == PID_ANIM_CHARDEP_S_SCL)
           {
-            animCtrl->getAnimChar()->applyCharDepScale(panel->getFloat(PID_ANIM_CHARDEP_S_SCL));
+            ac->applyCharDepScale(panel->getFloat(PID_ANIM_CHARDEP_S_SCL));
             float pyOfs, pxScale, pyScale, pzScale, sScale;
-            if (animCtrl->getAnimChar()->getCharDepScales(pyOfs, pxScale, pyScale, pzScale, sScale))
+            if (ac->getCharDepScales(pyOfs, pxScale, pyScale, pzScale, sScale))
             {
               panel->setFloat(PID_ANIM_CHARDEP_PY_OFS, pyOfs);
               panel->setPoint3(PID_ANIM_CHARDEP_P_SCL, Point3(pxScale, pyScale, pzScale));
             }
           }
           else
-            animCtrl->getAnimChar()->updateCharDepScales(panel->getFloat(PID_ANIM_CHARDEP_PY_OFS),
-              panel->getPoint3(PID_ANIM_CHARDEP_P_SCL).x, panel->getPoint3(PID_ANIM_CHARDEP_P_SCL).y,
-              panel->getPoint3(PID_ANIM_CHARDEP_P_SCL).z, panel->getFloat(PID_ANIM_CHARDEP_S_SCL));
+            ac->updateCharDepScales(panel->getFloat(PID_ANIM_CHARDEP_PY_OFS), panel->getPoint3(PID_ANIM_CHARDEP_P_SCL).x,
+              panel->getPoint3(PID_ANIM_CHARDEP_P_SCL).y, panel->getPoint3(PID_ANIM_CHARDEP_P_SCL).z,
+              panel->getFloat(PID_ANIM_CHARDEP_S_SCL));
         }
     }
     else if (pcb_id == PID_ANIM_TRACE_CP_HT_F || pcb_id == PID_ANIM_TRACE_CP_HT_R)
     {
+      drawFloor = true;
+      panel->setBool(PID_ANIM_DRAW_FLOOR, true);
       coll_plane_ht_front = panel->getFloat(PID_ANIM_TRACE_CP_HT_F);
       coll_plane_ht_rear = panel->getFloat(PID_ANIM_TRACE_CP_HT_R);
       if (!ragdoll)
       {
         physsimulator::end();
-        physsimulator::begin(NULL, physsimulator::PHYS_BULLET, 1, physsimulator::SCENE_TYPE_GROUP, 0.0f, coll_plane_ht_front,
-          coll_plane_ht_rear);
+        physsimulator::begin(NULL, ragdollPhysType, 1, physsimulator::SCENE_TYPE_GROUP, 0.0f, coll_plane_ht_front, coll_plane_ht_rear);
       }
     }
     else if (pcb_id == PID_ANIM_TRACE_ENABLED)
+    {
       trace_ray_enabled = panel->getBool(pcb_id);
+      if (trace_ray_enabled)
+      {
+        drawFloor = true;
+        panel->setBool(PID_ANIM_DRAW_FLOOR, true);
+      }
+    }
     else if (pcb_id == PID_SHOW_COLLIDER)
     {
       showCollider = panel->getBool(pcb_id);
@@ -1916,7 +2235,7 @@ public:
       showColliderPhysCollidable = panel->getBool(pcb_id);
     else if (pcb_id == PID_SHOW_COLLIDER_TRACEABLE)
       showColliderTraceable = panel->getBool(pcb_id);
-    else if (pcb_id >= PID_MASK_NODES)
+    else if (pcb_id >= PID_MASK_NODES && pcb_id < PID_MASK_NODES_LAST)
     {
       if (ILodController *iLodCtrl = entity->queryInterface<ILodController>())
       {
@@ -1979,6 +2298,9 @@ public:
         int stateIdx = pcb_id - PID_ANIM_STATE0;
         animCtrl->enqueueState(stateIdx, forceSpd);
         addAnimStateToHistory(stateIdx);
+        // Sleeping bodies would ignore the new pose, so let them follow the state just selected.
+        if (ragdoll)
+          physsimulator::wakeUpRagdoll(ragdoll);
       }
     }
 
@@ -2006,6 +2328,8 @@ public:
       }
     if (pcb_id == PID_ANIM_RAGDOLL_START)
     {
+      drawFloor = true;
+      panel->setBool(PID_ANIM_DRAW_FLOOR, true);
       if (!ragdoll)
         startRagdoll();
       else
@@ -2021,15 +2345,14 @@ public:
         if (ec_is_shift_key_down())
           params.push_back("tm");
         DAEDITOR3.conWarning("--- animchar blend-state dump ---");
-        onConsoleCommand("animchar.blender", params);
+        runAnimcharBlenderCmd(params);
         ::get_app().getConsole().showConsole();
       }
     if (pcb_id == PID_ANIM_DUMP_UNUSED_BN)
       if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
       {
-        Tab<const char *> params;
         DAEDITOR3.conWarning("--- animchar unused blend nodes dump ---");
-        onConsoleCommand("animchar.unusedBlendNodes", params);
+        runAnimcharUnusedBlendNodesCmd();
         ::get_app().getConsole().showConsole();
       }
     if (pcb_id == PID_MASK_NODES_UPDATE_BTN)
@@ -2038,7 +2361,7 @@ public:
     }
     else if (pcb_id == PID_MASK_NODES_UNCHECK_ALL)
     {
-      const int blockCount = nodeFilterMasksBlk.blockCount();
+      const int blockCount = min(PID_MASK_NODES_LAST - PID_MASK_NODES, (int)nodeFilterMasksBlk.blockCount());
       for (int i = 0; i < blockCount; ++i)
         panel->setBool(PID_MASK_NODES + i, false);
 
@@ -2062,190 +2385,242 @@ public:
     }
   }
 
-  bool onConsoleCommand(const char *cmd, dag::ConstSpan<const char *> params) override
+  class AllTexturesDragAndDropHandler : public PropPanel::IDropTargetHandler
   {
-    if (stricmp(cmd, "animchar.blender") == 0)
-    {
-      bool tm = false, terse = false;
-      bool no_skel = false, no_bn = false;
-      for (int i = 0; i < params.size(); i++)
-        if (strcmp(params[i], "tm") == 0)
-          tm = true;
-        else if (strcmp(params[i], "terse") == 0)
-          terse = true;
-        else if (strcmp(params[i], "no_skel") == 0)
-          no_skel = true;
-        else if (strcmp(params[i], "no_bn") == 0)
-          no_bn = true;
-        else
-        {
-          DAEDITOR3.conError("unknown option %s", params[i]);
-          return true;
-        }
+  public:
+    AllTexturesDragAndDropHandler(EntityViewPlugin &e) : editor(e) {}
 
-      if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
+    DragAndDropResult handleDropTarget(int pcb_id, PropPanel::ContainerPropertyControl *panel) override
+    {
+      const ImGuiPayload *dragAndDropPayload = PropPanel::acceptDragDropPayloadBeforeDelivery(ASSET_DRAG_AND_DROP_TYPE);
+      if (!dragAndDropPayload)
+        return DragAndDropResult::NONE;
+
+      AssetDragData dragData;
+      PropPanel::getDragAndDropPayloadData<AssetDragData>(dragAndDropPayload, &dragData);
+
+      // Only allow dropping into the same asset type!
+      DagorAsset *asset = dragData.asset;
+      if (asset == nullptr || asset->getType() != asset->getMgr().getTexAssetTypeId())
+        return DragAndDropResult::NOT_ALLOWED;
+
+      const char *newMatTexName = asset->getName();
+      if (!newMatTexName)
+        return DragAndDropResult::NONE;
+
+      PropPanel::ContainerPropertyControl *grpObjectGroup = panel->getParent();
+      PropPanel::ContainerPropertyControl *grpObjectSpecParams = grpObjectGroup ? grpObjectGroup->getParent() : nullptr;
+      PropPanel::ContainerPropertyControl *grpMaterialList =
+        grpObjectSpecParams ? grpObjectSpecParams->getContainerById(PID_MATERIAL_EDITOR_GROUP) : nullptr;
+      if (!grpMaterialList)
+        return DragAndDropResult::NONE;
+
+      if (dragAndDropPayload->IsDelivery())
       {
-        if (AnimV20::IAnimCharacter2 *ac = animCtrl->getAnimChar())
+        const int lodLevel = panel->getID() - (PID_TEX_GROUP + 1);
+        const SimpleString oldTexName = panel->getText(pcb_id);
+        const int swapped = editor.matEditor.swapTexture(lodLevel, oldTexName.c_str(), asset, *grpMaterialList);
+        if (swapped > 0)
         {
-          ac->createDebugBlenderContext(!terse);
-          if (const DataBlock *b = ac->getDebugBlenderState(tm))
+          IObjEntity *_ent = editor.entity ? editor.entity : editor.riex.vEntity;
+          ILodController *iLodCtrl = _ent ? _ent->queryInterface<ILodController>() : nullptr;
+          int lods = iLodCtrl ? iLodCtrl->getLodCount() : 0;
+          if (lodLevel == -1 || lods == 1)
           {
-            DataBlock bcopy;
-            if (no_skel || no_bn)
+            for (int l = -1; l < lods && l < 16; l++)
             {
-              bcopy = *b;
-              if (no_skel)
-                bcopy.removeBlock("skeleton");
-              if (no_bn)
-                bcopy.removeBlock("animNodes");
-              b = &bcopy;
+              PropPanel::ContainerPropertyControl *grpTex = grpObjectGroup->getContainerById(PID_TEX_GROUP + l + 1);
+              if (!grpTex)
+                continue;
+
+              const int childCount = grpTex->getChildCount();
+              for (int i = 0; i < childCount; ++i)
+              {
+                PropPanel::PropertyControlBase *btn = grpTex->getByIndex(i);
+                if (btn && grpTex->getText(btn->getID()) == oldTexName)
+                  grpTex->setText(btn->getID(), newMatTexName);
+              }
             }
-            ConTextOutStream cwr(::get_app().getConsole());
-            dblk::export_to_json_text_stream(*b, cwr, true);
           }
           else
-            DAEDITOR3.conError("cannot get debug blend state for animChar");
+            panel->setText(pcb_id, newMatTexName);
+        }
+
+        return DragAndDropResult::ACCEPTED;
+      }
+
+      return DragAndDropResult::NONE;
+    }
+
+  private:
+    EntityViewPlugin &editor;
+  };
+
+
+  void runAnimcharBlenderCmd(dag::ConstSpan<const char *> params)
+  {
+    bool tm = false, terse = false;
+    bool no_skel = false, no_bn = false;
+    for (int i = 0; i < params.size(); i++)
+      if (strcmp(params[i], "tm") == 0)
+        tm = true;
+      else if (strcmp(params[i], "terse") == 0)
+        terse = true;
+      else if (strcmp(params[i], "no_skel") == 0)
+        no_skel = true;
+      else if (strcmp(params[i], "no_bn") == 0)
+        no_bn = true;
+      else
+      {
+        DAEDITOR3.conError("unknown option %s", params[i]);
+        return;
+      }
+
+    if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
+    {
+      if (auto *ac = animCtrl->getAnimCharBase())
+      {
+        ac->createDumpBlenderDataContext(!terse);
+        if (const DataBlock *b = ac->getDebugBlenderState(tm))
+        {
+          DataBlock bcopy;
+          if (no_skel || no_bn)
+          {
+            bcopy = *b;
+            if (no_skel)
+              bcopy.removeBlock("skeleton");
+            if (no_bn)
+              bcopy.removeBlock("animNodes");
+            b = &bcopy;
+          }
+          ConTextOutStream cwr(::get_app().getConsole());
+          dblk::export_to_json_text_stream(*b, cwr, true);
         }
         else
-          DAEDITOR3.conError("cannot get animChar interface");
+          DAEDITOR3.conError("cannot get debug blend state for animChar");
       }
       else
-        DAEDITOR3.conError("current asset is not animChar");
-      return true;
-    }
-    if (stricmp(cmd, "animchar.unusedBlendNodes") == 0)
-    {
-      IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL;
-      if (!animCtrl)
-      {
-        DAEDITOR3.conError("current asset is not animChar");
-        return true;
-      }
-
-      AnimV20::IAnimCharacter2 *ac = animCtrl->getAnimChar();
-      if (!ac)
-      {
         DAEDITOR3.conError("cannot get animChar interface");
-        return true;
-      }
-
-      AnimV20::AnimationGraph *graph = ac->getAnimGraph();
-      if (!graph)
-      {
-        DAEDITOR3.conError("cannot get animGraph for animChar");
-        return true;
-      }
-
-      AnimV20::IAnimBlendNode::used_blend_nodes_t usedNodes;
-      graph->getUsedBlendNodes(usedNodes);
-
-      for (int i = 0; i < graph->getAnimNodeCount(); i++)
-        if (AnimV20::IAnimBlendNode *node = graph->getBlendNodePtr(i))
-          if (!usedNodes.count(node) && !node->isSubOf(AnimV20::AnimBlendNodeNullCID))
-            DAEDITOR3.getCon().addMessage(ILogWriter::NOTE, "unused node: %s", graph->getBlendNodeName(node));
-
-      return true;
     }
-    if (stricmp(cmd, "animchar.nodemask") == 0)
+    else
+      DAEDITOR3.conError("current asset is not animChar");
+  }
+
+  void runAnimcharUnusedBlendNodesCmd()
+  {
+    IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL;
+    if (!animCtrl)
     {
-      if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
+      DAEDITOR3.conError("current asset is not animChar");
+      return;
+    }
+
+    auto *ac = animCtrl->getAnimCharBase();
+    if (!ac)
+    {
+      DAEDITOR3.conError("cannot get animChar interface");
+      return;
+    }
+
+    AnimV20::AnimationGraph *graph = ac->getAnimGraph();
+    if (!graph)
+    {
+      DAEDITOR3.conError("cannot get animGraph for animChar");
+      return;
+    }
+
+    AnimV20::IAnimBlendNode::used_blend_nodes_t usedNodes;
+    graph->getUsedBlendNodes(usedNodes);
+
+    for (int i = 0; i < graph->getAnimNodeCount(); i++)
+      if (AnimV20::IAnimBlendNode *node = graph->getBlendNodePtr(i))
+        if (!usedNodes.count(node) && !node->isSubOf(AnimV20::AnimBlendNodeNullCID))
+          DAEDITOR3.getCon().addMessage(ILogWriter::NOTE, "unused node: %s", graph->getBlendNodeName(node));
+  }
+
+  void runAnimcharNodemaskCmd(dag::ConstSpan<const char *> params)
+  {
+    if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
+    {
+      if (auto *ac = animCtrl->getAnimCharBase())
       {
-        if (AnimV20::IAnimCharacter2 *ac = animCtrl->getAnimChar())
+        if (const DataBlock *b = ac->getDebugNodemasks())
         {
-          if (const DataBlock *b = ac->getDebugNodemasks())
+          if (!params.size())
           {
-            if (!params.size())
+            DAEDITOR3.conNote("animchar: %d nodemasks:", b->blockCount());
+            for (int i = 0; i < b->blockCount(); i++)
+              DAEDITOR3.conNote("  %s", b->getBlock(i)->getBlockName());
+          }
+          else
+          {
+            if (strcmp(params[0], "@all") == 0)
             {
-              DAEDITOR3.conNote("animchar: %d nodemasks:", b->blockCount());
-              for (int i = 0; i < b->blockCount(); i++)
-                DAEDITOR3.conNote("  %s", b->getBlock(i)->getBlockName());
+              DAEDITOR3.conNote("animchar: %d nodemasks", b->blockCount());
+              ConTextOutStream cwr(::get_app().getConsole());
+              dblk::export_to_json_text_stream(*b, cwr, true);
+            }
+            else if (const DataBlock *b2 = b->getBlockByName(params[0]))
+            {
+              DAEDITOR3.conNote("animchar: nodemask %s", b2->getBlockName());
+              ConTextOutStream cwr(::get_app().getConsole());
+              dblk::export_to_json_text_stream(*b2, cwr, true);
             }
             else
-            {
-              if (strcmp(params[0], "@all") == 0)
-              {
-                DAEDITOR3.conNote("animchar: %d nodemasks", b->blockCount());
-                ConTextOutStream cwr(::get_app().getConsole());
-                dblk::export_to_json_text_stream(*b, cwr, true);
-              }
-              else if (const DataBlock *b2 = b->getBlockByName(params[0]))
-              {
-                DAEDITOR3.conNote("animchar: nodemask %s", b2->getBlockName());
-                ConTextOutStream cwr(::get_app().getConsole());
-                dblk::export_to_json_text_stream(*b2, cwr, true);
-              }
-              else
-                DAEDITOR3.conError("missing nodemask named <%s>", params[0]);
-            }
+              DAEDITOR3.conError("missing nodemask named <%s>", params[0]);
           }
-          else
-            DAEDITOR3.conError("cannot get debug blend state for animChar");
         }
         else
-          DAEDITOR3.conError("cannot get animChar interface");
+          DAEDITOR3.conError("cannot get debug blend state for animChar");
       }
       else
-        DAEDITOR3.conError("current asset is not animChar");
+        DAEDITOR3.conError("cannot get animChar interface");
     }
-    if (stricmp(cmd, "animchar.vars") == 0)
-    {
-      using namespace AnimV20;
-      if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
-      {
-        AnimationGraph *anim = animCtrl->getAnimGraph();
-        IAnimStateHolder *st = animCtrl->getAnimState();
-        if (anim && st)
-        {
-          int total_cnt = 0, listed_cnt = 0;
-          DAEDITOR3.conNote("animState=%p  %d words, sz=%d", st, anim->getParamNames().nameCount(), st->getSize());
-          iterate_names(anim->getParamNames(), [&](int id, const char *name) {
-            if (anim->getParamType(id) == AnimCommonStateHolder::PT_Reserved)
-              return;
-            total_cnt++;
-            if (params.size() && !strstr(name, params[0]))
-              return;
-            listed_cnt++;
-            switch (anim->getParamType(id))
-            {
-              case AnimCommonStateHolder::PT_ScalarParam: DAEDITOR3.conNote("[%d] %40s float=%g", id, name, st->getParam(id)); break;
-              case AnimCommonStateHolder::PT_ScalarParamInt:
-                DAEDITOR3.conNote("[%d] %40s int  =%d", id, name, st->getParamInt(id));
-                break;
-              case AnimCommonStateHolder::PT_TimeParam: DAEDITOR3.conNote("[%d] %40s timer=%g", id, name, st->getParam(id)); break;
+    else
+      DAEDITOR3.conError("current asset is not animChar");
+  }
 
-              case AnimCommonStateHolder::PT_InlinePtr:
-              case AnimCommonStateHolder::PT_InlinePtrCTZ:
-              case AnimCommonStateHolder::PT_Fifo3:
-              case AnimCommonStateHolder::PT_Effector:
-                DAEDITOR3.conNote("[%d] %40s inline(T:%d)=%p, %d", id, name, anim->getParamType(id), st->getInlinePtr(id),
-                  st->getInlinePtrMaxSz(id));
-                break;
-            }
-          });
-          DAEDITOR3.conNote("listed %d params (of %d total)", listed_cnt, total_cnt);
-        }
+  void runAnimcharVarsCmd(dag::ConstSpan<const char *> params)
+  {
+    using namespace AnimV20;
+    if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
+    {
+      AnimationGraph *anim = animCtrl->getAnimGraph();
+      AnimGraphStateHolder *st = animCtrl->getAnimState();
+      if (anim && st)
+      {
+        int total_cnt = 0, listed_cnt = 0;
+        DAEDITOR3.conNote("animState=%p  %d words, sz=%d", st, anim->getParamNames().nameCount(), st->getSize());
+        iterate_names(anim->getParamNames(), [&](int id, const char *name) {
+          if (anim->getParamType(id) == AnimGraphStateHolder::PT_Reserved)
+            return;
+          total_cnt++;
+          if (params.size() && !strstr(name, params[0]))
+            return;
+          listed_cnt++;
+          switch (anim->getParamType(id))
+          {
+            case AnimGraphStateHolder::PT_ScalarParam: DAEDITOR3.conNote("[%d] %40s float=%g", id, name, st->getParam(id)); break;
+            case AnimGraphStateHolder::PT_ScalarParamInt:
+              DAEDITOR3.conNote("[%d] %40s int  =%d", id, name, st->getParamInt(id));
+              break;
+            case AnimGraphStateHolder::PT_TimeParam: DAEDITOR3.conNote("[%d] %40s timer=%g", id, name, st->getParam(id)); break;
+
+            case AnimGraphStateHolder::PT_InlinePtr:
+            case AnimGraphStateHolder::PT_InlinePtrCTZ:
+            case AnimGraphStateHolder::PT_Fifo3:
+            case AnimGraphStateHolder::PT_Effector:
+              DAEDITOR3.conNote("[%d] %40s inline(T:%d)=%p, %d", id, name, anim->getParamType(id), st->getInlinePtr(id),
+                st->getInlinePtrMaxSz(id));
+              break;
+          }
+        });
+        DAEDITOR3.conNote("listed %d params (of %d total)", listed_cnt, total_cnt);
       }
     }
-    return false;
-  }
-  const char *onConsoleCommandHelp(const char *cmd) override
-  {
-    if (stricmp(cmd, "animchar.blender") == 0)
-      return "animchar.blender [tm] [terse] [no_skel] [no_bn]\n"
-             "  dumps current per-node animstate for current animChar asset";
-    if (stricmp(cmd, "animchar.unusedBlendNodes") == 0)
-      return "animchar.unusedBlendNodes\n"
-             "  dumps blend nodes not referenced by root node or any states for current animChar asset";
-    if (stricmp(cmd, "animchar.nodemask") == 0)
-      return "animchar.nodemask [mask_name|@all]\n"
-             "  dumps list of nodemasks or nodes for specified mask_name";
-    if (stricmp(cmd, "animchar.vars") == 0)
-      return "animchar.vars [subst_filter]\n"
-             "  dumps (optinally filtered) animState's var values for current animChar asset";
-    return NULL;
   }
 
-  intptr_t irq(int type, intptr_t p1, intptr_t p2, intptr_t p3) override
+  intptr_t irq(int type, intptr_t p1, intptr_t p2, intptr_t p3, ecs::EntityManager *) override
   {
     if (logIrqs)
       if (IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL)
@@ -2278,9 +2653,9 @@ public:
       entity->setTm(rotyTM(fullRotY * DEG_TO_RAD) * rotxTM(rotX * DEG_TO_RAD));
       if (IAnimCharController *animCtrl = entity->queryInterface<IAnimCharController>())
       {
-        if (AnimV20::IAnimStateHolder *st = animCtrl->getAnimState())
+        if (AnimV20::AnimGraphStateHolder *st = animCtrl->getAnimState())
           st->advance(0);
-        if (AnimV20::IAnimCharacter2 *ac = animCtrl->getAnimChar())
+        if (auto *ac = animCtrl->getAnimCharBase())
           ac->doRecalcAnimAndWtm();
       }
     }
@@ -2293,13 +2668,20 @@ public:
       tm.set33(m3);
       rendinst::moveRIGenExtra44(riex.handle, tm, false, false);
     }
+
+    if (canopyFxEntity)
+    {
+      TMatrix fxTm;
+      if (getCanopyPreviewTm(fxTm))
+        canopyFxEntity->setTm(fxTm);
+    }
     compositeEditorViewport.invalidateCache();
   }
 
   void updatePnTriangulation()
   {
     static int object_tess_factorVarId = ::get_shader_variable_id("object_tess_factor", true);
-    ShaderGlobal::set_real(object_tess_factorVarId, pnTriangulation ? 1.0f : 0.0f);
+    ShaderGlobal::set_float(object_tess_factorVarId, pnTriangulation ? 1.0f : 0.0f);
   }
 
   void updateLayeredBumpmapping()
@@ -2330,8 +2712,8 @@ public:
     }
     fpsCamViewId = id;
 
-    if (animCtrl && animCtrl->getAnimChar())
-      if (DynamicRenderableSceneInstance *scn = animCtrl->getAnimChar()->getSceneInstance())
+    if (auto *ac_rend = animCtrl ? animCtrl->getAnimCharRend() : nullptr)
+      if (DynamicRenderableSceneInstance *scn = ac_rend->getSceneInstance())
         for (int i = 0; i < scn->getNodeCount(); i++)
           scn->showNode(i, true);
 
@@ -2348,8 +2730,8 @@ public:
     {
       // apply fps camera settings
       FpsCameraView &fvc = fpsCamView[fpsCamViewId - PID_FPSCAM_FIRST];
-      if (animCtrl && animCtrl->getAnimChar())
-        if (DynamicRenderableSceneInstance *scn = animCtrl->getAnimChar()->getSceneInstance())
+      if (auto *ac_rend = animCtrl ? animCtrl->getAnimCharRend() : nullptr)
+        if (DynamicRenderableSceneInstance *scn = ac_rend->getSceneInstance())
         {
           iterate_names(fvc.hideNodes, [&](int, const char *name) {
             int id = scn->getNodeId(name);
@@ -2363,25 +2745,31 @@ public:
   void startRagdoll()
   {
     IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL;
-    auto *animChar = animCtrl ? animCtrl->getAnimChar() : NULL;
+    auto *animChar = animCtrl ? animCtrl->getAnimCharBase() : NULL;
     if (!animChar || ragdoll)
       return;
 
-    ragdoll = phys_bullet_start_ragdoll(animChar, ZERO<Point3>());
+    ragdoll = physsimulator::startRagdoll(animChar, const_cast<AnimV20::AnimcharFinalMat44 *>(animCtrl->getAnimCharFinalWTM()),
+      ZERO<Point3>());
+    if (ragdoll && ragdollDriveToAnim)
+    {
+      physsimulator::setRagdollDriveToAnimchar(ragdoll, true);
+      physsimulator::setJointsMotorSettings(ragdollMotorTwistFreq, ragdollMotorTwistDamp, ragdollMotorSwingFreq,
+        ragdollMotorSwingDamp);
+    }
     physsimulator::simulate(0.001);
   }
   void stopRagdoll()
   {
     IAnimCharController *animCtrl = entity ? entity->queryInterface<IAnimCharController>() : NULL;
-    auto *animChar = animCtrl ? animCtrl->getAnimChar() : NULL;
+    auto *animChar = animCtrl ? animCtrl->getAnimCharBase() : nullptr;
     if (!animChar || !ragdoll)
       return;
     animChar->setPostController(NULL);
-    phys_bullet_delete_ragdoll(ragdoll);
+    physsimulator::deleteRagdoll(ragdoll);
 
     physsimulator::end();
-    physsimulator::begin(NULL, physsimulator::PHYS_BULLET, 1, physsimulator::SCENE_TYPE_GROUP, 0.0f, coll_plane_ht_front,
-      coll_plane_ht_rear);
+    physsimulator::begin(NULL, ragdollPhysType, 1, physsimulator::SCENE_TYPE_GROUP, 0.0f, coll_plane_ht_front, coll_plane_ht_rear);
   }
 
   AnimV20::AnimcharBaseComponent *try_get_entity_animchar_base_comp()
@@ -2390,11 +2778,7 @@ public:
       return nullptr;
 
     if (IAnimCharController *animCtrl = entity->queryInterface<IAnimCharController>())
-    {
-      AnimV20::IAnimCharacter2 *animChar = animCtrl->getAnimChar();
-      if (animChar)
-        return &animChar->baseComp();
-    }
+      return animCtrl->getAnimCharBase();
 
     return nullptr;
   }
@@ -2403,7 +2787,7 @@ public:
   {
     if (!inside)
       return false;
-    compositeEditorViewport.handleMouseLBPress(wnd, x, y, entity);
+    compositeEditorViewport.handleMouseLBPress(wnd, x, y, entity, key_modif);
     positionGizmoWrapper.onDragPress(rotX, rotY, wnd, x, y);
     if (!physsimulator::getPhysWorld())
       return false;
@@ -2448,6 +2832,18 @@ public:
     return physsimulator::shootAtObject(world, dir, ragdollBulletImpulse);
   }
 
+  bool handleMouseRBRelease(IGenViewportWnd *wnd, int x, int y, bool inside, int buttons, int key_modif) override
+  {
+    if (!inside)
+      return false;
+    return compositeEditorViewport.handleMouseRBRelease(wnd, x, y, entity, key_modif);
+  }
+
+  bool handleMouseDoubleClick(IGenViewportWnd *wnd, int x, int y, int key_modif) override
+  {
+    return compositeEditorViewport.handleMouseDoubleClick(wnd, x, y, entity, key_modif);
+  }
+
   // IEntityViewPluginInterface
   bool isMouseOverSelectedCompositeSubEntity(IGenViewportWnd *wnd, int x, int y, IObjEntity *main_entity) override
   {
@@ -2474,6 +2870,7 @@ private:
   float nodeAxisLen = 0.0;
   bool showWABB;
   bool showBSPH;
+  bool drawFloor;
   bool logIrqs;
   bool pnTriangulation;
   bool layeredBumpmapping;
@@ -2488,6 +2885,7 @@ private:
   DataBlock nodeFilterMasksBlk;
   EntityMaterialEditor matEditor;
   ObjectPropertyEditor objPropEditor;
+  AllTexturesDragAndDropHandler textureDragAndDropHandler;
   Bitarray enumParamMask;
   Bitarray boolParamMask;
   Tab<FpsCameraView> fpsCamView;
@@ -2500,13 +2898,17 @@ private:
   void *ragdoll = NULL;
   bool springConnected = false;
   float ragdollBulletImpulse = 2;
+  int ragdollPhysType = physsimulator::PHYS_DEFAULT;
+  bool ragdollDriveToAnim = false;
+  float ragdollMotorTwistFreq = 20.f, ragdollMotorTwistDamp = 2.f, ragdollMotorSwingFreq = 20.f, ragdollMotorSwingDamp = 2.f;
 
   bool showCollider = false;
   bool showColliderBbox = false;
   bool showColliderPhysCollidable = false;
   bool showColliderTraceable = false;
   CollisionResource *collisionResource = NULL;
-  GeomNodeTree *collisionResourceNodeTree = NULL;
+  GeomNodeTreeUniquePtr collisionResourceNodeTree;
+  PhysMatLegend colliderPhysMats; // colors only, every material stays checked
   eastl::string assetName;
   ecs::EntityId currentAnimcharEid;
   bool showImguiAnimTree = false;
@@ -2514,6 +2916,52 @@ private:
 };
 
 static InitOnDemand<EntityViewPlugin> plugin;
+
+class EntityConsoleCommandProcessor : public console::ICommandProcessor
+{
+public:
+  void destroy() override { delete this; }
+
+  bool processCommand(const char *argv[], int argc) override
+  {
+    if (argc < 1)
+      return false;
+
+    const dag::Span<const char *> params = make_span(&argv[1], argc - 1);
+    int found = 0;
+
+    CONSOLE_CHECK_NAME_EX("animchar", "blender", 1, 5, "dumps current per-node animstate for current animChar asset",
+      "[tm] [terse] [no_skel] [no_bn]")
+    {
+      if (plugin)
+        plugin->runAnimcharBlenderCmd(params);
+    }
+
+    CONSOLE_CHECK_NAME_EX("animchar", "nodemask", 1, 2, "dumps list of nodemasks or nodes for specified mask_name", "[mask_name|@all]")
+    {
+      if (plugin)
+        plugin->runAnimcharNodemaskCmd(params);
+    }
+
+    CONSOLE_CHECK_NAME_EX("animchar", "unusedBlendNodes", 1, 1,
+      "dumps blend nodes not referenced by root node or any states for current animChar asset", "")
+    {
+      if (plugin)
+        plugin->runAnimcharUnusedBlendNodesCmd();
+    }
+
+    CONSOLE_CHECK_NAME_EX("animchar", "vars", 1, 2, "dumps (optinally filtered) animState's var values for current animChar asset",
+      "[subst_filter]")
+    {
+      if (plugin)
+        plugin->runAnimcharVarsCmd(params);
+    }
+
+    return found != 0;
+  }
+};
+
+static void register_entity_console_command_processor() { add_con_proc(new EntityConsoleCommandProcessor()); }
 
 AnimV20::AnimcharBaseComponent *try_get_entity_animchar_base_comp()
 {
@@ -2545,20 +2993,61 @@ static bool animchar_trace_static_ray_down(const Point3 &from, float max_t, floa
 }
 static bool animchar_trace_static_ray_dir(const Point3 &from, Point3 dir, float max_t, float &out_t, intptr_t ctx)
 {
-  // not implemented
-  return false;
+  if (!trace_ray_enabled)
+    return false;
+  if (fabsf(dir.y) < 1e-6f) // ray parallel to the horizontal floor planes
+    return false;
+  // Two half-planes split at z=0: front (z<0) and rear (z>=0), each at its own height.
+  // Test both, keep only hits whose intersection point lands on the matching side, take the nearest.
+  bool hit = false;
+  float best_t = max_t;
+  for (int side = 0; side < 2; side++)
+  {
+    bool front = (side == 0);
+    float plane_h = front ? coll_plane_ht_front : coll_plane_ht_rear;
+    float t = (plane_h - from.y) / dir.y;
+    if (t < 0 || t > best_t)
+      continue;
+    float hit_z = from.z + t * dir.z;
+    if ((front && hit_z < 0) || (!front && hit_z >= 0))
+    {
+      best_t = t;
+      hit = true;
+    }
+  }
+  if (hit)
+    out_t = best_t;
+  return hit;
 }
-static bool animchar_trace_static_multiray(dag::Span<AnimCharV20::LegsIkRay> traces, bool down, intptr_t ctx)
+static bool animchar_trace_static_multiray(dag::Span<AnimCharV20::TraceRayInfo> traces, bool down, intptr_t ctx)
 {
   if (!trace_ray_enabled)
     return false;
   bool hit = false;
   for (auto &ray : traces)
+  {
+    bool traceHit = false;
     if (down)
-      hit |= animchar_trace_static_ray_down(ray.pos, ray.t, ray.t, ctx);
+      traceHit = animchar_trace_static_ray_down(ray.pos, ray.t, ray.t, ctx);
     else
-      hit |= animchar_trace_static_ray_dir(ray.pos, ray.dir, ray.t, ray.t, ctx);
+      traceHit = animchar_trace_static_ray_dir(ray.pos, ray.dir, ray.t, ray.t, ctx);
+    if (traceHit)
+    {
+      hit = true;
+      ray.outNormal = Point3(0.0, 1.0, 0.0);
+    }
+  }
   return hit;
+}
+
+PropPanel::ContainerPropertyControl *get_material_editor_group()
+{
+  IGenEditorPlugin *curPlugin = IEditorCoreEngine::get()->curPlugin();
+  if (curPlugin && curPlugin == plugin.get())
+    if (PropPanel::ContainerPropertyControl *pluginPanel = curPlugin->getPluginPanel())
+      return pluginPanel->getContainerById(EntityViewPlugin::PID_MATERIAL_EDITOR_GROUP);
+
+  return nullptr;
 }
 
 void init_plugin_entities()

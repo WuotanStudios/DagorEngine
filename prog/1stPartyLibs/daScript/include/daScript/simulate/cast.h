@@ -3,13 +3,33 @@
 #include "daScript/misc/vectypes.h"
 #include "daScript/misc/arraytype.h"
 #include "daScript/misc/rangetype.h"
-#include <limits.h> // ULLONG_MAX
+#include <limits.h> // ULONG_MAX
 
 namespace das
 {
     template <typename TT> struct WrapType { enum { value = false }; typedef TT type; typedef TT rettype; };
+    template <typename TT> struct JitConstRefByValue { enum { value = false }; };
     template <typename TT> struct WrapArgType { typedef TT type; };
     template <typename TT> struct WrapRetType { typedef TT type; };
+
+    // gcc fails to deduce auto field type. We should manually add it
+    template <typename T, typename Element, Element T::*BaseField = &T::x>
+    struct WrapVec2Arg : T {
+        WrapVec2Arg(vec4f t) : T(vec_extract<Element>::x(t), vec_extract<Element>::y(t)) {}
+        operator vec4f() const { return das::vec_loadu_half(&(this->*BaseField)); }
+    };
+
+    template <typename T, typename Element, Element T::*BaseField = &T::x>
+    struct WrapVec3Arg : T {
+        WrapVec3Arg(vec4f t) : T(vec_extract<Element>::x(t), vec_extract<Element>::y(t), vec_extract<Element>::z(t)) {}
+        operator vec4f() const { return das::vec_loadu3(&(this->*BaseField)); }
+    };
+
+    template <typename T, typename Element, Element T::*BaseField = &T::x>
+    struct WrapVec4Arg : T {
+        WrapVec4Arg(vec4f t) : T(vec_extract<Element>::x(t), vec_extract<Element>::y(t), vec_extract<Element>::z(t), vec_extract<Element>::w(t)) {}
+        operator vec4f() const { return das::vec_loadu(&(this->*BaseField)); }
+    };
 
     template <typename TT>
     struct das_alias;
@@ -43,10 +63,16 @@ namespace das
               return v_ldu_p3_safe((const float*)&v);
             else if constexpr (sizeof(PT) == sizeof(float) * 2)
               return v_ldu_half((const float*)&v);
+            else if constexpr (sizeof(PT) == sizeof(float))
+              return v_set_x(*(const float*)&v);
             else
             {
-              static_assert(sizeof(PT) == sizeof(float));
-              return v_set_x(*(const float*)&v);
+              // odd sizes (2/3/6 bytes: float16, byte2/3, half3, short3...) — memcpy is the
+              // only over-read-safe load (a 6-byte value at the end of a page must not use
+              // vector loads)
+              vec4f r = v_zero();
+              memcpy(&r, &v, sizeof(PT));
+              return r;
             }
 #endif
         }
@@ -214,6 +240,12 @@ namespace das
     };
 
     template <>
+    struct cast <float16_t> {   // scalar convention: bits ride widened in lane 0, like int16
+        static __forceinline float16_t to ( vec4f x )          { float16_t h; h.bits = uint16_t(v_extract_xi(v_cast_vec4i(x))); return h; }
+        static __forceinline vec4f from ( float16_t x )        { return v_cast_vec4f(v_seti_x(x.bits)); }
+    };
+
+    template <>
     struct cast <int32_t> {
         static __forceinline int32_t to ( vec4f x )            { return v_extract_xi(v_cast_vec4i(x)); }
         static __forceinline vec4f from ( int32_t x )          { return v_cast_vec4f(v_seti_x(x)); }
@@ -231,6 +263,24 @@ namespace das
         static __forceinline vec4f from ( Bitfield x )         { return v_cast_vec4f(v_seti_x(x.value)); }
     };
 
+
+    template <>
+    struct cast <Bitfield8> {
+        static __forceinline Bitfield8 to ( vec4f x )           { return v_extract_xi(v_cast_vec4i(x)); }
+        static __forceinline vec4f from ( Bitfield8 x )         { return v_cast_vec4f(v_seti_x(x.value)); }
+    };
+
+    template <>
+    struct cast <Bitfield16> {
+        static __forceinline Bitfield16 to ( vec4f x )           { return v_extract_xi(v_cast_vec4i(x)); }
+        static __forceinline vec4f from ( Bitfield16 x )         { return v_cast_vec4f(v_seti_x(x.value)); }
+    };
+
+    template <>
+    struct cast <Bitfield64> {
+        static __forceinline Bitfield64 to ( vec4f x )           { return v_extract_xi64(v_cast_vec4i(x)); }
+        static __forceinline vec4f from ( Bitfield64 x )         { return v_cast_vec4f(v_ldui_half(&x)); }
+    };
 
     template <>
     struct cast <int64_t> {
@@ -262,7 +312,7 @@ namespace das
     template <>
     struct cast <long double> {
         static __forceinline long double to(vec4f x)            { union { vec4f v; long double t; } A; A.v = x; return A.t; }
-        static __forceinline vec4f from ( long double x )       { union { vec4f v; long double t; } A; A.t = x; return A.v; }
+        static __forceinline vec4f from ( long double x )       { union { vec4f v; long double t; } A; A.v = v_zero(); A.t = x; return A.v; }
     };
 
     template <>
@@ -300,7 +350,7 @@ namespace das
         static __forceinline vec4f from ( uint64_t x )         { return v_cast_vec4f(v_ldui_half(&x)); }
     };
 
-#if !defined(_MSC_VER) && !defined(__APPLE__) && !defined(_EMSCRIPTEN_VER) && defined(ULLONG_MAX) && ULLONG_MAX == 0xffffffffffffffffULL
+#if !defined(_MSC_VER) && !defined(__APPLE__) && !defined(_EMSCRIPTEN_VER) && defined(ULONG_MAX) && ULONG_MAX == UINT64_MAX
     template <>
     struct cast <long long int> {
         static __forceinline long long int to ( vec4f x )            { return v_extract_xi64(v_cast_vec4i(x)); }
@@ -332,7 +382,7 @@ namespace das
     template <>
     struct cast <double> {
         static __forceinline double to(vec4f x)                { union { vec4f v; double t; } A; A.v = x; return A.t; }
-        static __forceinline vec4f from ( double x )           { union { vec4f v; double t; } A; A.t = x; return A.v; }
+        static __forceinline vec4f from ( double x )           { union { vec4f v; double t; } A; A.v = v_zero(); A.t = x; return A.v; }
     };
 
     template <>
@@ -416,6 +466,35 @@ namespace das
 
     template <> struct cast <range64> : cast_iVec<range64> {};
     template <> struct cast <urange64> : cast_iVec<urange64> {};
+
+    // 16/8-bit lattice vectors — byte-packed in the low bytes of the slot; prune handles
+    // every size (incl. the odd 2/3/6-byte widths) after the generic-memcpy branch above
+    template <> struct cast <half2>   : cast_fVec<half2> {};
+    template <> struct cast <half3>   : cast_fVec<half3> {};
+    template <> struct cast <half4>   : cast_fVec<half4> {};
+    template <> struct cast <half8>   : cast_fVec<half8> {};
+
+    template <> struct cast <short2>  : cast_iVec<short2> {};
+    template <> struct cast <short3>  : cast_iVec<short3> {};
+    template <> struct cast <short4>  : cast_iVec<short4> {};
+    template <> struct cast <short8>  : cast_iVec<short8> {};
+
+    template <> struct cast <ushort2> : cast_iVec<ushort2> {};
+    template <> struct cast <ushort3> : cast_iVec<ushort3> {};
+    template <> struct cast <ushort4> : cast_iVec<ushort4> {};
+    template <> struct cast <ushort8> : cast_iVec<ushort8> {};
+
+    template <> struct cast <byte2>   : cast_iVec<byte2> {};
+    template <> struct cast <byte3>   : cast_iVec<byte3> {};
+    template <> struct cast <byte4>   : cast_iVec<byte4> {};
+    template <> struct cast <byte8>   : cast_iVec<byte8> {};
+    template <> struct cast <byte16>  : cast_iVec<byte16> {};
+
+    template <> struct cast <ubyte2>  : cast_iVec<ubyte2> {};
+    template <> struct cast <ubyte3>  : cast_iVec<ubyte3> {};
+    template <> struct cast <ubyte4>  : cast_iVec<ubyte4> {};
+    template <> struct cast <ubyte8>  : cast_iVec<ubyte8> {};
+    template <> struct cast <ubyte16> : cast_iVec<ubyte16> {};
 
     template <typename TT>
     struct cast_enum {

@@ -5,6 +5,7 @@
 #include <anim/dag_animKeyInterp.h>
 #include <anim/dag_animBlendCtrl.h>
 #include <anim/dag_animIrq.h>
+#include <animChar/dag_animCharacter2.h>
 #include <math/dag_quatInterp.h>
 #include <math/dag_vecMathCompatibility.h>
 #include <debug/dag_debug.h>
@@ -22,6 +23,7 @@
 #include <gameRes/dag_gameResources.h>
 #include <gameRes/dag_gameResSystem.h>
 #include "animInternal.h"
+#include "animFifo.h"
 #include <ioSys/dag_dataBlock.h>
 #include <regExp/regExp.h>
 #include <ctype.h>
@@ -35,13 +37,36 @@ using namespace AnimV20;
 
 static constexpr int PROFILE_BLENDING = 0;
 
+// construct-on-first-use so blend_node_creator registering at static-init time
+// cannot touch an unconstructed vector regardless of TU init order
+static eastl::vector<AnimV20::blend_node_creator_t> &get_blend_node_creators()
+{
+  static eastl::vector<AnimV20::blend_node_creator_t> creators;
+  return creators;
+}
+
+void AnimV20::register_blend_node_creator(AnimV20::blend_node_creator_t creator)
+{
+  auto &creators = get_blend_node_creators();
+  if (creator && eastl::find(creators.begin(), creators.end(), creator) == creators.end())
+    creators.push_back(creator);
+}
+
+bool AnimV20::create_blend_node_from_creators(AnimationGraph &graph, const DataBlock &blk)
+{
+  for (AnimV20::blend_node_creator_t creator : get_blend_node_creators())
+    if (creator(graph, blk))
+      return true;
+  return false;
+}
+
 
 struct AnimBlender::NodeSamplers
 {
+  // union to hold the sampler as raw storage: entries are placement-new constructed and never destroyed
   union Entry
   {
     AnimV20Math::PrsAnimNodeSampler<AnimV20Math::OneShotConfig> sampler;
-    dag::Index16 trackId;
     ~Entry() = delete;
   };
 
@@ -102,7 +127,7 @@ static void finish_blending_dump()
   clear_and_shrink(blending_graphs);
 }
 
-static void write_blending(IPureAnimStateHolder &st)
+static void write_blending(AnimGraphStateHolder &st)
 {
   OSSpinlockScopedLock guard(blending_lock);
 
@@ -169,7 +194,7 @@ AnimationGraph::~AnimationGraph()
 void AnimationGraph::setInitState(const DataBlock &b)
 {
   del_it(initState);
-  if (b.paramCount() + b.blockCount())
+  if (b.paramCount() + b.blockCount() != 0)
   {
     initState = new DataBlock;
     *initState = b;
@@ -184,6 +209,7 @@ const DataBlock &AnimationGraph::getEnumList(const char *enum_cls) const
 void AnimationGraph::initChannelsForStates(const DataBlock &stDescBlk, dag::ConstSpan<AnimResManagerV20::NodeMask *> nodemask)
 {
   char tmpbuf[SIZE_OF_FATAL_CTX_TMPBUF];
+  int nid_morph = stDescBlk.getNameId("morph");
   int nid_chan = stDescBlk.getNameId("chan");
   int nid_state = stDescBlk.getNameId("state");
   int nid_alias = stDescBlk.getNameId("state_alias"), alias_cnt = 0;
@@ -195,7 +221,7 @@ void AnimationGraph::initChannelsForStates(const DataBlock &stDescBlk, dag::Cons
       state_num++;
     else if (stDescBlk.getBlock(i)->getBlockNameId() == nid_alias)
       alias_cnt++;
-    else
+    else if (stDescBlk.getBlock(i)->getBlockNameId() != nid_morph)
       logerr("unsupported block %s%s", stDescBlk.getBlock(i)->getBlockName(), dgs_get_fatal_context(tmpbuf, sizeof(tmpbuf)));
 
   clear_and_resize(stDest, chan_num);
@@ -283,6 +309,8 @@ void AnimationGraph::initStates(const DataBlock &stDescBlk)
   int nid_alias = stDescBlk.getNameId("state_alias");
   const char *def_node_name = stDescBlk.getStr("defNodeName", "");
   float defMorphTime = stDescBlk.getReal("defMorphTime", 0.15f);
+  FifoMorphType defMorphType = (FifoMorphType)lup(stDescBlk.getStr("defMorphType", "linear"), fifoMorphTypeNames,
+    countof(fifoMorphTypeNames), FifoMorphType::MT_LINEAR);
   float defMinTsc = stDescBlk.getReal("minTimeScale", 0.f);
   float defMaxTsc = stDescBlk.getReal("maxTimeScale", FLT_MAX);
 
@@ -322,6 +350,8 @@ void AnimationGraph::initStates(const DataBlock &stDescBlk)
       stateStrIndices.push_back(id);
       float defDur = b.getReal("forceDur", -1);
       float defSpd = b.getReal("forceSpd", -1);
+      FifoMorphType stMorphType =
+        (FifoMorphType)lup(b.getStr("morphType", ""), fifoMorphTypeNames, countof(fifoMorphTypeNames), defMorphType);
       float stMorphTime = b.getReal("morphTime", defMorphTime);
       float stMinTsc = b.getReal("minTimeScale", defMinTsc);
       float stMaxTsc = b.getReal("maxTimeScale", defMaxTsc);
@@ -331,14 +361,30 @@ void AnimationGraph::initStates(const DataBlock &stDescBlk)
       if (strcmp(def_node_name, "*") == 0)
         def_node_id = StateRec::NODEID_LEAVECUR;
       for (int j = 0; j < stDest.size(); j++)
-        stRec[sidx + j].nodeId = def_node_id, stRec[sidx + j].morphTime = stMorphTime;
+      {
+        stRec[sidx + j].nodeId = def_node_id;
+        stRec[sidx + j].morphTime = stMorphTime;
+        stRec[sidx + j].morphType = stMorphType;
+      }
 
       for (int j = 0; j < b.blockCount(); j++)
       {
         const DataBlock &b2 = *b.getBlock(j);
+#if DAGOR_DBGLEVEL > 0
+        int blockCountWithName = b.blockCountByName(b2.getBlockName());
+        if (blockCountWithName > 1)
+          logerr("Anim state '%s' has defined channel '%s' %d times. This does not make sense. Only one block should be present per "
+                 "channel.%s",
+            name, b2.getBlockName(), blockCountWithName, dgs_get_fatal_context(tmpbuf, sizeof(tmpbuf)));
+#endif
         int cid = chanNm.getNameId(b2.getBlockName());
+        if (cid < 0)
+        {
+          logerr("Can't find channel named '%s' referenced in anim state '%s'.%s", b2.getBlockName(), name,
+            dgs_get_fatal_context(tmpbuf, sizeof(tmpbuf)));
+          continue;
+        }
         const char *node_nm = b2.getStr("name", def_node_name);
-        G_ASSERTF(cid >= 0, "chan=%s", b2.getBlockName());
         if (!node_nm[0])
           stRec[sidx + cid].nodeId = StateRec::NODEID_NULL;
         else if (strcmp(node_nm, "*") == 0)
@@ -364,6 +410,8 @@ void AnimationGraph::initStates(const DataBlock &stDescBlk)
             dgs_get_fatal_context(tmpbuf, sizeof(tmpbuf)));
           stRec[sidx + cid].nodeId = StateRec::NODEID_NULL;
         }
+        stRec[sidx + cid].morphType =
+          (FifoMorphType)lup(b2.getStr("morphType", ""), fifoMorphTypeNames, countof(fifoMorphTypeNames), stMorphType);
         stRec[sidx + cid].morphTime = b2.getReal("morphTime", stMorphTime);
         stRec[sidx + cid].forcedStateDur = b2.getReal("forceDur", defDur);
         stRec[sidx + cid].forcedStateSpd = b2.getReal("forceSpd", defSpd);
@@ -437,14 +485,14 @@ void AnimationGraph::initStates(const DataBlock &stDescBlk)
   if (err_cnt)
     ANIM_ERR("error count: %d, see logerr for details", err_cnt);
 }
-void AnimationGraph::enqueueState(IPureAnimStateHolder &st, dag::ConstSpan<StateRec> state, float force_dur, float force_speed)
+void AnimationGraph::enqueueState(AnimGraphStateHolder &st, dag::ConstSpan<StateRec> state, float force_dur, float force_speed)
 {
   TIME_PROFILE(AnimationGraph__enqueueState);
   if (state.size() != stDest.size())
     return;
   for (int i = 0; i < stDest.size(); i++)
     if (state[i].nodeId == StateRec::NODEID_NULL)
-      stDest[i].fifo->enqueueState(st, nullAnim, state[i].morphTime, 0);
+      stDest[i].fifo->enqueueState(st, nullAnim, state[i].morphTime, state[i].morphType);
     else if (state[i].nodeId != StateRec::NODEID_LEAVECUR)
     {
       G_ASSERTF(int(stDest[i].condNodemaskTarget) < int(state.size()), "stDest[%d].condNodemaskTarget=%d state.size()=%d", i,
@@ -466,15 +514,32 @@ void AnimationGraph::enqueueState(IPureAnimStateHolder &st, dag::ConstSpan<State
         if (spd > 0 && spd0 > 0)
           st.setParam(tsp, clamp(spd / spd0, state[i].minTimeScale, state[i].maxTimeScale));
         else
-          st.setParam(tsp, dur > 0 ? n->getDuration(st) / state[i].forcedStateDur : 1.0f);
+          st.setParam(tsp, dur > 0 ? n->getDuration(st) / dur : 1.0f);
       }
       if (!stDest[i].fifo->isEnqueued(st, n))
         n->resume(st, true);
-      stDest[i].fifo->enqueueState(st, n, state[i].morphTime, 0);
+
+      real time = state[i].morphTime;
+      FifoMorphType type = state[i].morphType;
+      IAnimBlendNode *fromNode = stDest[i].fifo->getNextInQueue(st);
+      if (morphParamsOverride.size() && fromNode != NULL)
+      {
+        for (auto &override : morphParamsOverride)
+        {
+          if (override.from == fromNode && override.to == n)
+          {
+            time = override.morphTime;
+            type = override.morphType;
+            break;
+          }
+        }
+      }
+
+      stDest[i].fifo->enqueueState(st, n, time, type);
     }
 }
 
-void AnimationGraph::setStateSpeed(IPureAnimStateHolder &st, dag::ConstSpan<StateRec> state, float force_speed)
+void AnimationGraph::setStateSpeed(AnimGraphStateHolder &st, dag::ConstSpan<StateRec> state, float force_speed)
 {
   TIME_PROFILE(AnimationGraph__setStateSpeed);
   if (state.size() != stDest.size())
@@ -499,13 +564,13 @@ void AnimationGraph::setStateSpeed(IPureAnimStateHolder &st, dag::ConstSpan<Stat
     }
 }
 
-void AnimationGraph::onSingleAnimFinished(IPureAnimStateHolder &st, IAnimBlendNode *n)
+void AnimationGraph::onSingleAnimFinished(AnimGraphStateHolder &st, IAnimBlendNode *n)
 {
   if (!stDest.size())
     return;
   for (int i = 0; i < stDest.size(); i++)
     if (stDest[i].morphTimeToSetNullOnSingleAnimFinished >= 0 && stDest[i].fifo->isEnqueued(st, n))
-      stDest[i].fifo->enqueueState(st, nullAnim, stDest[i].morphTimeToSetNullOnSingleAnimFinished, 0);
+      stDest[i].fifo->enqueueState(st, nullAnim, stDest[i].morphTimeToSetNullOnSingleAnimFinished);
 }
 
 int AnimationGraph::addPbcWtParamId(const char *name)
@@ -528,7 +593,7 @@ int AnimationGraph::addParamId(const char *name, int type)
   if (id == paramTypes.size())
   {
     paramTypes.push_back(type);
-    if (type == AnimCommonStateHolder::PT_TimeParam)
+    if (type == AnimGraphStateHolder::PT_TimeParam)
       paramTimeInd.push_back(id);
     return id;
   }
@@ -542,18 +607,18 @@ int AnimationGraph::addInlinePtrParamId(const char *name, size_t size_bytes, int
   int id = paramNames.addNameId(name);
   if (id < 0)
     return -1;
-  size_t word_sz = sizeof(AnimCommonStateHolder::ParamState);
+  size_t word_sz = sizeof(AnimGraphStateHolder::ParamState);
   size_t num_words = size_bytes ? (size_bytes + word_sz - 1) / word_sz : 1;
 
   if (id == paramTypes.size())
   {
     int pt_base = append_items(paramTypes, num_words);
     paramTypes[pt_base] = type;
-    if (type == AnimCommonStateHolder::PT_Fifo3)
+    if (type == AnimGraphStateHolder::PT_Fifo3)
       paramFifo3Ind.push_back(id);
     for (int i = 1; i < num_words; i++)
     {
-      paramTypes[pt_base + i] = IPureAnimStateHolder::PT_Reserved;
+      paramTypes[pt_base + i] = AnimGraphStateHolder::PT_Reserved;
       G_VERIFYF(paramNames.addNameId(String(0, "?%d", pt_base + i)) == pt_base + i,
         "failed to create unique nameId: resv[%d] for param <%s> size_bytes=%d", i, name, size_bytes);
     }
@@ -561,16 +626,16 @@ int AnimationGraph::addInlinePtrParamId(const char *name, size_t size_bytes, int
     return id;
   }
 
-  G_ASSERTF_RETURN(AnimCommonStateHolder::getInlinePtrWords(paramTypes, id) * word_sz >= size_bytes, -1,
+  G_ASSERTF_RETURN(AnimGraphStateHolder::getInlinePtrWords(paramTypes, id) * word_sz >= size_bytes, -1,
     "adding param <%s> type=%d while such param with type %d already exists (max_size=%d need_size=%d)!", name, type, paramTypes[id],
-    AnimCommonStateHolder::getInlinePtrWords(paramTypes, id), size_bytes);
+    AnimGraphStateHolder::getInlinePtrWords(paramTypes, id), size_bytes);
   return id;
 }
 
 int AnimationGraph::getInlinePtrParamMaxSize(int param_id)
 {
-  size_t word_sz = sizeof(AnimCommonStateHolder::ParamState);
-  return AnimCommonStateHolder::getInlinePtrWords(paramTypes, param_id) * word_sz;
+  size_t word_sz = sizeof(AnimGraphStateHolder::ParamState);
+  return AnimGraphStateHolder::getInlinePtrWords(paramTypes, param_id) * word_sz;
 }
 
 int AnimationGraph::getParamId(const char *name, int type) const
@@ -580,7 +645,7 @@ int AnimationGraph::getParamId(const char *name, int type) const
     return -1;
   if (paramTypes[id] == type)
     return id;
-  DEBUG_CTX("param <%s> of type %d is absent; present with type %d", name, type, paramTypes[id]);
+  G_ASSERTF(false, "param <%s> of type %d is absent; present with type %d", name, type, paramTypes[id]);
   return -1;
 }
 
@@ -612,7 +677,7 @@ void AnimationGraph::replaceRoot(IAnimBlendNode *new_root)
   //==
   root = new_root;
 }
-void AnimationGraph::resetBlendNodes(IPureAnimStateHolder &st)
+void AnimationGraph::resetBlendNodesState(AnimGraphStateHolder &st)
 {
   const DataBlock *fifo3Init = initState ? initState->getBlockByName("fifo3") : NULL;
   if (fifo3Init && fifo3Init->isEmpty())
@@ -621,44 +686,148 @@ void AnimationGraph::resetBlendNodes(IPureAnimStateHolder &st)
   {
     if (!nodePtr[i])
       continue;
-    nodePtr[i]->reset(st);
+    nodePtr[i]->setDefaultState(st);
     if (fifo3Init && nodePtr[i]->isSubOf(AnimBlendCtrl_Fifo3CID))
       if (const char *nm = fifo3Init->getStr(getBlendNodeName(nodePtr[i]), NULL))
         if (IAnimBlendNode *n = getBlendNodePtr(nm))
-          static_cast<AnimBlendCtrl_Fifo3 *>(nodePtr[i].get())->enqueueState(st, n, 0, 0);
+          static_cast<AnimBlendCtrl_Fifo3 *>(nodePtr[i].get())->enqueueState(st, n, 0);
   }
 }
-void AnimationGraph::sortPbCtrl(const DataBlock &ord)
+
+void AnimationGraph::clearBlendNodeAllocatedMemoryFromState(AnimGraphStateHolder &st)
 {
-  // force order
-  for (int i = 0, nid = ord.getNameId("name"), dest = 0; i < ord.paramCount(); i++)
-    if (ord.getParamNameId(i) == nid && ord.getParamType(i) == ord.TYPE_STRING)
+  for (int i = 0; i < nodePtr.size(); i++)
+  {
+    if (!nodePtr[i])
+      continue;
+    nodePtr[i]->clearAllocatedMemory(st);
+  }
+}
+
+int getGraphPbcIndexFromBlock(AnimationGraph &graph, const DataBlock &ord, int i)
+{
+  IAnimBlendNode *n = graph.getBlendNodePtr(ord.getStr(i));
+  if (!n)
+  {
+    logerr("Blend node '%s' is present in postBlendCtrlOrder block (idx: %d) but it does not exist.", ord.getStr(i), i);
+    return -1;
+  }
+  if (!n->isSubOf(AnimPostBlendCtrlCID))
+  {
+    logerr("Blend node '%s' is present in postBlendCtrlOrder block (idx: %d) but it is not a post blend controller. Its type is: "
+           "%s. Should be some post blend controller.",
+      ord.getStr(i), i, n->class_name());
+    return -1;
+  }
+  return find_value_idx(graph.getBlender().pbCtrl, static_cast<AnimPostBlendCtrl *>(n));
+}
+
+void AnimationGraph::sortPbCtrl(const DataBlock &initAnimState)
+{
+  const char *orderBlockName = "postBlendCtrlOrder";
+  int orderBlockCount = initAnimState.blockCountByName(orderBlockName);
+  if (orderBlockCount <= 1)
+  {
+    const DataBlock &ord = *initAnimState.getBlockByNameEx(orderBlockName);
+    // force order
+    for (int i = 0, nid = ord.getNameId("name"), dest = 0; i < ord.paramCount(); i++)
+      if (ord.getParamNameId(i) == nid && ord.getParamType(i) == ord.TYPE_STRING)
+      {
+        int idx = getGraphPbcIndexFromBlock(*this, ord, i);
+        if (idx < dest)
+        {
+          logerr("Blend node '%s' is present in postBlendCtrlOrder twice. One post blend controller must be mentioned only once.",
+            ord.getStr(i));
+          continue;
+        }
+        if (idx > dest)
+        {
+          Ptr<AnimPostBlendCtrl> pbn = blender.pbCtrl[idx];
+          erase_items(blender.pbCtrl, idx, 1);
+          insert_items(blender.pbCtrl, dest, 1, &pbn);
+        }
+        dest++;
+      }
+  }
+  else
+  {
+    // Multiple postBlendCtrlOrder blocks: each block is a chain of 'name' params where every
+    // ctrl must precede the next one in the same block. Merge all chains via topological sort,
+    // keeping ctrls that are not mentioned in their current relative order.
+    struct Node
     {
-      IAnimBlendNode *n = getBlendNodePtr(ord.getStr(i));
-      if (!n)
-      {
-        logerr("unresolved postBlendCtrlOrder[%d]=%s", i, ord.getStr(i));
+      int pbIdx = -1;  // index into blender.pbCtrl
+      Tab<int> before; // pbCtrl indices that must be sorted to be before this node
+      Node() : before(framemem_ptr()) {}
+    };
+
+    Tab<Node> nodes(framemem_ptr());
+    nodes.resize(blender.pbCtrl.size());
+    for (int i = 0; i < nodes.size(); i++)
+      nodes[i].pbIdx = i;
+
+    // Collect order for each node from postBlendCtrlOrder blocks
+    const int orderNid = initAnimState.getNameId(orderBlockName);
+    for (int bi = 0; bi < initAnimState.blockCount(); bi++)
+    {
+      const DataBlock &ord = *initAnimState.getBlock(bi);
+      if (ord.getBlockNameId() != orderNid)
         continue;
-      }
-      if (!n->isSubOf(AnimPostBlendCtrlCID))
+
+      int prevIdx = -1;
+      for (int i = 0, nid = ord.getNameId("name"); i < ord.paramCount(); i++)
       {
-        logerr("postBlendCtrlOrder[%d]=%s is not PBC!", i, ord.getStr(i));
-        continue;
+        if (ord.getParamNameId(i) != nid || ord.getParamType(i) != ord.TYPE_STRING)
+          continue;
+        int idx = getGraphPbcIndexFromBlock(*this, ord, i);
+        if (idx < 0)
+          continue;
+        // prevIdx must be sorted before idx
+        if (prevIdx >= 0 && prevIdx != idx && find_value_idx(nodes[idx].before, prevIdx) < 0)
+          nodes[idx].before.push_back(prevIdx);
+        prevIdx = idx;
       }
-      int idx = find_value_idx(blender.pbCtrl, static_cast<AnimPostBlendCtrl *>(n));
-      if (idx < dest)
-      {
-        logerr("double mention of postBlendCtrlOrder[%d]=%s ?", i, ord.getStr(i));
-        continue;
-      }
-      if (idx > dest)
-      {
-        Ptr<AnimPostBlendCtrl> pbn = blender.pbCtrl[idx];
-        erase_items(blender.pbCtrl, idx, 1);
-        insert_items(blender.pbCtrl, dest, 1, &pbn);
-      }
-      dest++;
     }
+
+    // Topo sort by colected order
+    Tab<int> sorted(framemem_ptr());
+    sorted.reserve(nodes.size());
+    while (!nodes.empty())
+    {
+      int removed = 0;
+      for (int i = 0; i < nodes.size();)
+      {
+        if (nodes[i].before.empty())
+        {
+          const int pbIdx = nodes[i].pbIdx;
+          sorted.push_back(pbIdx);
+          erase_items(nodes, i, 1);
+          for (Node &other : nodes)
+            for (int j = other.before.size() - 1; j >= 0; j--)
+              if (other.before[j] == pbIdx)
+                erase_items(other.before, j, 1);
+          removed++;
+        }
+        else
+          i++;
+      }
+      if (removed == 0)
+      {
+        logerr("postBlendCtrlOrder: cyclic dependency detected among %d remaining post blend controllers.", nodes.size());
+        break;
+      }
+    }
+
+    // Reorder blender.pbCtrl into the sorted order
+    if (sorted.size() == blender.pbCtrl.size())
+    {
+      PtrTab<AnimPostBlendCtrl> reordered(midmem);
+      reordered.reserve(blender.pbCtrl.size());
+      for (int idx : sorted)
+        reordered.push_back(blender.pbCtrl[idx]);
+      blender.pbCtrl = eastl::move(reordered);
+    }
+  }
 
   // update pbcId
   for (int i = 0; i < blender.pbCtrl.size(); i++)
@@ -702,6 +871,16 @@ void AnimationGraph::getUsedBlendNodes(IAnimBlendNode::used_blend_nodes_t &usedN
           }
         }
     }
+}
+
+void AnimationGraph::atIrq(int irq_type, IAnimBlendNode *src, AnimGraphStateHolder &st)
+{
+  if (irq_type == GIRQT_EndOfSingleAnim || irq_type == GIRQT_EndOfContinuousAnim || irq_type == GIRQT_EndOfParametricAnim)
+  {
+    for (int i = 0; i < resetRandomOnIRQFromNode.size(); ++i)
+      if (src == resetRandomOnIRQFromNode[i])
+        ((AnimBlendCtrl_RandomSwitcher *)resetRandomOnIRQFromNodeTarget[i].get())->resume(st, true);
+  }
 }
 
 static void delete_ctx_recursive(AnimBlender::TlsContext *c)
@@ -966,7 +1145,7 @@ static PerformanceTimer2 __pm_prepare(false);
 static PerformanceTimer2 __pm_outer(false);
 static int __pm_anim_cnt = 0;
 
-bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNode *root, const CharNodeModif *cmm,
+bool AnimBlender::blend(TlsContext &tls, AnimGraphStateHolder &st, IAnimBlendNode *root, const CharNodeModif *cmm,
   const AnimationGraph &graph)
 {
   G_UNUSED(graph);
@@ -1056,18 +1235,23 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
     chXfm[i].totalNum = 0;
   }
 
-  auto add_sampler = [](NodeSamplers &smp, int i, int j, int targetChN, const AnimDataChan &chan) {
+  auto add_sampler = [](NodeSamplers &smp, int i, int j, int targetChN, const AnimDataChan &chan, const AnimData *anim, int wa_pos) {
     G_UNUSED(targetChN);
     if (DAGOR_UNLIKELY(smp.totalNum >= MAX_ANIMS_IN_NODE))
     {
 #if DAGOR_DBGLEVEL > 0
-      LOGERR_ONCE("xfm: Need to increase max anims for node %d/%s, j=%d, targetChN=%d: %dn", i, chan.nodeName[j].get(), j, targetChN,
-        smp.totalNum);
+      static bool logged_ = false;
+      if (!logged_)
+      {
+        logged_ = true;
+        logwarn("xfm: Need to increase max anims for node %d/%s, j=%d, targetChN=%d: %dn", i, chan.nodeName[j].get(), j, targetChN,
+          smp.totalNum);
+      }
 #endif
       return false;
     }
     auto &s = smp.samplers[smp.totalNum];
-    s.trackId = chan.nodeTrack[j];
+    new (&s.sampler, _NEW_INPLACE) decltype(s.sampler)(anim, chan.nodeTrack[j], wa_pos);
     smp.totalNum++;
     smp.lastBnl = i;
     return true;
@@ -1114,7 +1298,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
         {
           logged_ = true;
           log_active_bnls(bnlWt, bnl, bnlNum, graph);
-          logerr("pos: Need to increase max anims for node %d/%s, j=%d, targetChN=%d: %d. See log for active bnls dump.", i,
+          logwarn("pos: Need to increase max anims for node %d/%s, j=%d, targetChN=%d: %d. See log for active bnls dump.", i,
             pos.nodeName[j].get(), j, targetChN, ch_w.totalNum);
         }
 #endif
@@ -1124,7 +1308,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
       NodeSamplers &smp = chXfm[targetChN];
       // we couldn't have already added animation for this BNL, unless there are nodes with duplicate names
       if (smp.lastBnl != i)
-        if (!add_sampler(smp, i, j, targetChN, pos))
+        if (!add_sampler(smp, i, j, targetChN, pos, anim, wa_pos))
           continue;
 
       ch.blendWt[ch_w.totalNum] = w;
@@ -1135,8 +1319,6 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
       ch_w.totalNum++;
       if (!additive)
         ch_w.wTotal += w;
-      else if (ch_w.totalNum == 1)
-        ch_w.wTotal = 1.0f; //< only additive anims for node, mark wTotal as 'used'
     }
 
     for (j = 0; j < scl.nodeNum; j++)
@@ -1163,7 +1345,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
         {
           logged_ = true;
           log_active_bnls(bnlWt, bnl, bnlNum, graph);
-          logerr("scl: Need to increase max anims for node %d/%s, j=%d, targetChN=%d: %d. See log for active bnls dump.", i,
+          logwarn("scl: Need to increase max anims for node %d/%s, j=%d, targetChN=%d: %d. See log for active bnls dump.", i,
             scl.nodeName[j].get(), j, targetChN, ch_w.totalNum);
         }
 #endif
@@ -1172,7 +1354,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
 
       NodeSamplers &smp = chXfm[targetChN];
       if (smp.lastBnl != i)
-        if (!add_sampler(smp, i, j, targetChN, scl))
+        if (!add_sampler(smp, i, j, targetChN, scl, anim, wa_pos))
           continue;
 
       ch.blendWt[ch_w.totalNum] = w;
@@ -1181,8 +1363,6 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
       ch_w.totalNum++;
       if (!additive)
         ch_w.wTotal += w;
-      else if (ch_w.totalNum == 1)
-        ch_w.wTotal = 1.0f; //< only additive anims for node, mark wTotal as 'used'
     }
 
     for (j = 0; j < rot.nodeNum; j++)
@@ -1207,7 +1387,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
         {
           logged_ = true;
           log_active_bnls(bnlWt, bnl, bnlNum, graph);
-          logerr("rot: Need to increase max anims for node %d/%s, j=%d, targetChN=%d: %d. See log for active bnls dump.", i,
+          logwarn("rot: Need to increase max anims for node %d/%s, j=%d, targetChN=%d: %d. See log for active bnls dump.", i,
             rot.nodeName[j].get(), j, targetChN, ch_w.totalNum);
         }
 #endif
@@ -1216,7 +1396,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
 
       NodeSamplers &smp = chXfm[targetChN];
       if (smp.lastBnl != i)
-        if (!add_sampler(smp, i, j, targetChN, rot))
+        if (!add_sampler(smp, i, j, targetChN, rot, anim, wa_pos))
           continue;
 
       ch.blendWt[ch_w.totalNum] = w;
@@ -1225,18 +1405,6 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
       ch_w.totalNum++;
       if (!additive)
         ch_w.wTotal += w;
-      else if (ch_w.totalNum == 1)
-        ch_w.wTotal = 1.0f; //< only additive anims for node, mark wTotal as 'used'
-    }
-
-    // create added samplers
-    for (j = 0; j < nodenum; j++)
-    {
-      NodeSamplers &smp = chXfm[j];
-      if (smp.lastBnl != i)
-        continue;
-      auto &s = smp.samplers[smp.totalNum - 1];
-      new (&s.sampler, _NEW_INPLACE) decltype(s.sampler)(anim, s.trackId, wa_pos);
     }
   }
   if (PROFILE_BLENDING)
@@ -1251,11 +1419,12 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
   for (i = 0; i < nodenum; i++)
   {
     const NodeWeight &ch_w = wtPos[i];
+    WeightedNode &ch = chPos[i];
     int bnum = ch_w.totalNum;
-    if (!bnum || fabsf(ch_w.wTotal) < 1e-6f)
+    const bool hasAdditive = ch.readyFlg & RM_POS_A;
+    if (!bnum || (fabsf(ch_w.wTotal) < 1e-6f && !hasAdditive))
       continue;
 
-    WeightedNode &ch = chPos[i];
     NodeSamplers &smp = chXfm[i];
 
     real *bwgt = ch.blendWt;
@@ -1282,7 +1451,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
     else
     {
       w4 = v_splats(*bwgt);
-      vec4f inv_total = v_rcp(v_splats(ch_w.wTotal));
+      vec4f inv_total = v_rcp_safe(v_splats(ch_w.wTotal));
       res = v_mul(v, !(*bmod & BMOD_ADDITIVE) ? v_mul(w4, inv_total) : w4);
       bwgt++;
       bmod++;
@@ -1303,11 +1472,12 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
   for (i = 0; i < nodenum; i++)
   {
     const NodeWeight &ch_w = wtScl[i];
+    WeightedNode &ch = chScl[i];
     int bnum = ch_w.totalNum;
-    if (!bnum || fabsf(ch_w.wTotal) < 1e-6f)
+    const bool hasAdditive = ch.readyFlg & RM_SCL_A;
+    if (!bnum || (fabsf(ch_w.wTotal) < 1e-6f && !hasAdditive))
       continue;
 
-    WeightedNode &ch = chScl[i];
     NodeSamplers &smp = chXfm[i];
 
     real *bwgt = ch.blendWt;
@@ -1334,7 +1504,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
     else
     {
       w4 = v_splats(*bwgt);
-      vec4f inv_total = v_rcp(v_splats(ch_w.wTotal));
+      vec4f inv_total = v_rcp_safe(v_splats(ch_w.wTotal));
       if (!(*bmod & BMOD_ADDITIVE))
         res = v_mul(v, v_mul(w4, inv_total));
       else
@@ -1367,11 +1537,12 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
   for (i = 0; i < nodenum; i++)
   {
     const NodeWeight &ch_w = wtRot[i];
+    WeightedNode &ch = chRot[i];
     int bnum = ch_w.totalNum;
-    if (!bnum || fabsf(ch_w.wTotal) < 1e-6f)
+    const bool hasAdditive = ch.readyFlg & RM_ROT_A;
+    if (!bnum || (fabsf(ch_w.wTotal) < 1e-6f && !hasAdditive))
       continue;
 
-    WeightedNode &ch = chRot[i];
     NodeSamplers &smp = chXfm[i];
 
     real *bwgt = ch.blendWt;
@@ -1464,7 +1635,7 @@ bool AnimBlender::blend(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNod
 #endif
   return true;
 }
-void AnimBlender::blendOriginVel(TlsContext &tls, IPureAnimStateHolder &st, IAnimBlendNode *root, bool rebuild_list)
+void AnimBlender::blendOriginVel(TlsContext &tls, AnimGraphStateHolder &st, IAnimBlendNode *root, bool rebuild_list)
 {
 #if MEASURE_PERF
   perf_tm.go();
@@ -1493,7 +1664,7 @@ void AnimBlender::blendOriginVel(TlsContext &tls, IPureAnimStateHolder &st, IAni
   // construct blending lists
   for (i = 0; i < bnlNum; i++)
   {
-    if (!*(int *)&bnlWt[i] || !bnl[i] || bnl[i]->dontUseOriginVel || !bnl[i]->anim)
+    if (fabsf(bnlWt[i]) <= 1e-6f || !bnl[i] || bnl[i]->dontUseOriginVel || !bnl[i]->anim)
       continue;
 
     vec3f pts = v_splats(bnlWt[i]);
@@ -1528,7 +1699,7 @@ void AnimBlender::blendOriginVel(TlsContext &tls, IPureAnimStateHolder &st, IAni
   }
   else
   {
-    originVelWt = v_rcp(originVelWt);
+    originVelWt = v_rcp_safe(originVelWt);
     tls.originLinVel = v_mul(originVel, originVelWt);
     tls.originAngVel = v_mul(originWVel, originVelWt);
   }
@@ -1559,7 +1730,11 @@ bool AnimBlender::getBlendedNodePRS(TlsContext &tls, int id, const vec4f **p, co
   PrsResult &prs = tls.chPrs[id];
 
   if (mark & RM_POS_B)
+  {
     *p = &prs.pos;
+    if (orig_prs && tls.wtPos[id].wTotal < 1.0f)
+      prs.pos = v_lerp_vec4f(v_splats(tls.wtPos[id].wTotal), orig_prs[0], prs.pos);
+  }
   else if (!(mark & RM_POS_A))
     *p = orig_prs ? orig_prs + 0 : NULL;
   else if (orig_prs)
@@ -1572,7 +1747,11 @@ bool AnimBlender::getBlendedNodePRS(TlsContext &tls, int id, const vec4f **p, co
     *p = NULL;
 
   if (mark & RM_ROT_B)
+  {
     *r = &prs.rot;
+    if (orig_prs && tls.wtRot[id].wTotal < 1.0f)
+      prs.rot = v_quat_qslerp(tls.wtRot[id].wTotal, orig_prs[1], prs.rot);
+  }
   else if (!(mark & RM_ROT_A))
     *r = orig_prs ? orig_prs + 1 : NULL;
   else if (orig_prs)
@@ -1585,7 +1764,11 @@ bool AnimBlender::getBlendedNodePRS(TlsContext &tls, int id, const vec4f **p, co
     *r = NULL;
 
   if (mark & RM_SCL_B)
+  {
     *s = &prs.scl;
+    if (orig_prs && tls.wtScl[id].wTotal < 1.0f)
+      prs.scl = v_lerp_vec4f(v_splats(tls.wtScl[id].wTotal), orig_prs[2], prs.scl);
+  }
   else if (!(mark & RM_SCL_A))
     *s = orig_prs ? orig_prs + 2 : NULL;
   else if (orig_prs)
@@ -1611,19 +1794,31 @@ bool AnimBlender::getBlendedNodeTm(TlsContext &tls, int id, mat44f &tm, const ve
   return true;
 }
 
-void AnimBlender::postBlendInit(IPureAnimStateHolder &st, const GeomNodeTree &tree)
+void AnimBlender::postBlendInit(AnimGraphStateHolder &st, const GeomNodeTree &tree)
 {
   for (int i = 0, e = pbCtrl.size(); i < e; i++)
     if (pbCtrl[i])
       pbCtrl[i]->init(st, tree);
 }
-void AnimBlender::postBlendProcess(TlsContext &tls, IPureAnimStateHolder &st, GeomNodeTree &tree, AnimPostBlendCtrl::Context &ctx)
+void AnimBlender::postBlendProcess(TlsContext &tls, AnimGraphStateHolder &st, GeomNodeTree &tree, AnimPostBlendCtrl::Context &ctx)
 {
   TIME_PROFILE_DEV(postBlendProcess);
   dag::Span<real> pbcWt = tls.pbcWt;
   for (int i = 0, e = pbCtrl.size(); i < e; i++)
-    if (pbCtrl[i])
-      pbCtrl[i]->process(st, pbcWt[i], tree, ctx);
+  {
+    if (!pbCtrl[i])
+      continue;
+    real wt = pbcWt[i];
+#if DAGOR_DBGLEVEL > 0
+    AnimV20::AnimcharDebugContext *debugContext = ctx.ac->animcharDebugContext;
+    // PBC count can change in runtime anim graph editor and the context is resized lazily
+    if (debugContext && i < debugContext->pbcWtHasOverride.size() && debugContext->pbcWtHasOverride[i])
+    {
+      wt = debugContext->pbcWtOverride[i];
+    }
+#endif
+    pbCtrl[i]->process(st, wt, tree, ctx);
+  }
 }
 
 void AnimPostBlendCtrl::buildBlendingList(BlendCtx &ctx, real w) { ctx.pbcWt[pbcId] += w; }
@@ -1675,10 +1870,10 @@ public:
   bool isNameRejected(const char *nm) { return ((nmInclRe && !nmInclRe->test(nm)) || (nmExclRe && nmExclRe->test(nm))); }
 };
 
-static void add_bnl(AnimationGraph &graph, const DataBlock &blk, AnimData *anim, bool ignoredAnimation, bool def_foreign,
+void add_bnl(AnimationGraph &graph, const DataBlock &blk, AnimData *anim, bool ignoredAnimation, bool def_foreign,
   const char *nm_suffix = 0)
 {
-  fatal_context_push(String(256, "bnl: %s", blk.getStr("name", "n/a")));
+  fatal_context_push(String(256, "bnl: %s, class: <%s>", blk.getStr("name", "n/a"), blk.getBlockName()));
 
   if (dd_stricmp(blk.getBlockName(), "continuous") == 0)
     AnimBlendNodeContinuousLeaf::createNode(graph, blk, anim, ignoredAnimation, def_foreign, nm_suffix);
@@ -1698,9 +1893,9 @@ static void add_bnl(AnimationGraph &graph, const DataBlock &blk, AnimData *anim,
   fatal_context_pop();
 }
 
-static void add_bn(AnimationGraph &graph, const DataBlock &blk, const char *nm_suffix)
+void add_bn(AnimationGraph &graph, const DataBlock &blk, const char *nm_suffix)
 {
-  fatal_context_push(String(256, "ctrl: %s", blk.getStr("name", "n/a")));
+  fatal_context_push(String(256, "ctrl: %s, class: <%s>", blk.getStr("name", "n/a"), blk.getBlockName()));
 
   if (dd_stricmp(blk.getBlockName(), "fifo3") == 0)
     AnimBlendCtrl_Fifo3::createNode(graph, blk);
@@ -1777,6 +1972,9 @@ static void add_bn(AnimationGraph &graph, const DataBlock &blk, const char *nm_s
   else if (dd_stricmp(blk.getBlockName(), "legsIK") == 0)
     LegsIKCtrl::createNode(graph, blk);
 
+  else if (dd_stricmp(blk.getBlockName(), "twoBonesIK") == 0)
+    AnimPostBlendTwoBonesIK::createNode(graph, blk);
+
   else if (dd_stricmp(blk.getBlockName(), "multiChainFABRIK") == 0)
     MultiChainFABRIKCtrl::createNode(graph, blk);
 
@@ -1822,11 +2020,17 @@ static void add_bn(AnimationGraph &graph, const DataBlock &blk, const char *nm_s
   else if (dd_stricmp(blk.getBlockName(), "deltaRotateShiftCalc") == 0)
     DeltaRotateShiftCtrl::createNode(graph, blk);
 
-  else if (dd_stricmp(blk.getBlockName(), "footLockerIK") == 0)
-    FootLockerIKCtrl::createNode(graph, blk);
+  else if (dd_stricmp(blk.getBlockName(), "hasAttachment") == 0)
+    AnimPostBlendHasAttachment::createNode(graph, blk);
+
+  else if (dd_stricmp(blk.getBlockName(), "humanAim") == 0)
+    AnimPostBlendHumanAimCtrl::createNode(graph, blk);
 
   else if (dd_stricmp(blk.getBlockName(), "animateAndProcNode") == 0)
     createNodeApbAnimateAndPostBlendProc(graph, blk, nm_suffix, add_bn);
+
+  else if (AnimV20::create_blend_node_from_creators(graph, blk))
+    ; // handled by a registered custom node creator (e.g. a daScript-defined controller)
 
   else if (dd_stricmp(blk.getBlockName(), "alias") != 0)
   {
@@ -1940,6 +2144,18 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
 
   graph.allocateGlobalTimer();
 
+#if DAGOR_DBGLEVEL > 0
+  for (i = 0; i < blk.blockCount(); i++)
+  {
+    const char *blockName = blk.getBlock(i)->getBlockName();
+    if (!strstr("nodeMask AnimBlendNodeLeaf AnimBlendCtrl stateDesc preview initAnimState", blockName))
+      ANIM_ERR(
+        "Found unexpected block named <%s> inside anim graph blk.\nThis block does nothing! You probably meant to put it somewhere "
+        "else (inside AnimBlendCtrl block?).",
+        blockName);
+  }
+#endif
+
   // read all node masks (can be used in leaf nodes)
   nid = blk.getNameId("nodeMask");
   nid2 = blk.getNameId("node");
@@ -1950,6 +2166,7 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
       NodeMask *nm = new (tmpmem) NodeMask;
 
       nm->anim = NULL;
+      nm->animInverted = NULL;
       nm->name = b->getStr("name", "");
       for (j = 0; j < b->paramCount(); j++)
         if (b->getParamType(j) == DataBlock::TYPE_STRING && b->getParamNameId(j) == nid2)
@@ -1972,6 +2189,8 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
   // append all leaf nodes first
   bool def_foreign = blk.getBool("defaultForeignAnim", false);
   nid = blk.getNameId("AnimBlendNodeLeaf");
+  // save leafs with their blks so that we can post init them when all graph nodes are created
+  dag::Vector<ControllerDependencyLoadHelper> leafs;
   for (int pass = 0; pass < 2; pass++)
     for (i = 0; i < blk.blockCount(); i++)
       if (blk.getBlock(i)->getBlockNameId() == nid)
@@ -2005,6 +2224,9 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
           if (nodemask[j]->anim)
             nodemask[j]->anim->delRef();
           nodemask[j]->anim = NULL;
+          if (nodemask[j]->animInverted)
+            nodemask[j]->animInverted->delRef();
+          nodemask[j]->animInverted = NULL;
         }
         AnimNodeMaskApplyFilter nmFilter(*b);
 
@@ -2018,6 +2240,8 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
               continue;
             if (pass == 1 && !cb2.getBool("additive", false))
               continue;
+            if (cb2.getStr("exclude_node_mask", NULL))
+              logerr("anim <%s> exclude_node_mask is not supported with splitting by channels", cb2.getStr("name"));
             if (const char *applyNodeMask = cb2.getStr("apply_node_mask", NULL))
             {
               NodeMask *nm = NULL;
@@ -2039,11 +2263,13 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
                 nm->anim->addRef();
               }
               add_bnl(graph, cb2, nm->anim, ignoredAnimation, def_foreign, NULL);
+              leafs.emplace_back(
+                ControllerDependencyLoadHelper{graph.getBlendNodePtr(cb2.getStr("name", NULL), nullptr), &cb2, nullptr});
               if (const char *anim_name = cb2.getStr("name", NULL))
                 for (int k = 0; k < chan_cnt; k++)
                   if (graph.getStDest()[k].defNodemaskIdx >= 0)
                     graph.registerBlendNode(nullAnim, anim_name, nodemask[graph.getStDest()[k].defNodemaskIdx]->name);
-              chan_cnt = -1; // to skip next for()
+              continue;
             }
             for (int k = -1; k < chan_cnt; k++)
             {
@@ -2061,7 +2287,10 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
                 nm->anim = new (midmem) AnimData(anim, nm->nm, midmem);
                 nm->anim->addRef();
               }
-              add_bnl(graph, cb2, nm ? nm->anim : anim.get(), ignoredAnimation, def_foreign, nm ? nm->name.str() : NULL);
+              const char *maskName = nm ? nm->name.str() : NULL;
+              add_bnl(graph, cb2, nm ? nm->anim : anim.get(), ignoredAnimation, def_foreign, maskName);
+              leafs.emplace_back(
+                ControllerDependencyLoadHelper{graph.getBlendNodePtr(cb2.getStr("name", NULL), maskName), &cb2, maskName});
             }
           }
         }
@@ -2075,30 +2304,54 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
               continue;
 
             const char *applyNodeMask = cb2.getStr("apply_node_mask", NULL);
-            if (!applyNodeMask)
+            const char *excludeNodeMask = cb2.getStr("exclude_node_mask", NULL);
+            if (applyNodeMask && excludeNodeMask)
+            {
+              logerr("anim <%s> has both apply_node_mask and exclude_node_mask; ignoring both", cb2.getStr("name"));
+              applyNodeMask = excludeNodeMask = NULL;
+            }
+            if (!applyNodeMask && !excludeNodeMask)
+            {
               add_bnl(graph, cb2, anim, ignoredAnimation, def_foreign);
+              leafs.emplace_back(
+                ControllerDependencyLoadHelper{graph.getBlendNodePtr(cb2.getStr("name", NULL), nullptr), &cb2, nullptr});
+            }
             else
             {
+              const char *maskName = applyNodeMask ? applyNodeMask : excludeNodeMask;
+              G_ASSERT(maskName);
               NodeMask *nm = NULL;
               for (int k = 0; k < nodemask.size(); k++)
-                if (strcmp(nodemask[k]->name, applyNodeMask) == 0)
+                if (strcmp(nodemask[k]->name, maskName) == 0) //-V575
                 {
                   nm = nodemask[k];
                   break;
                 }
               if (!nm)
               {
-                DEBUG_CTX("can't find nodemask: <%s>", applyNodeMask);
+                DEBUG_CTX("can't find nodemask: <%s>", maskName);
                 continue;
               }
 
-              if (!nm->anim)
+              if (applyNodeMask && !nm->anim)
               {
                 nm->anim = new (midmem) AnimData(anim, nm->nm, midmem);
                 nm->anim->addRef();
               }
-
-              add_bnl(graph, cb2, nm->anim, ignoredAnimation, def_foreign);
+              else if (excludeNodeMask && !nm->animInverted)
+              {
+                NameMap invertedNodeMask;
+                const AnimDataChan *chans[] = {&anim->anim.pos, &anim->anim.rot, &anim->anim.scl};
+                for (const AnimDataChan *ch : chans)
+                  for (unsigned n = 0; n < ch->nodeNum; n++)
+                    if (nm->nm.getNameId(ch->nodeName[n]) == -1)
+                      invertedNodeMask.addNameId(ch->nodeName[n]);
+                nm->animInverted = new (midmem) AnimData(anim, invertedNodeMask, midmem);
+                nm->animInverted->addRef();
+              }
+              add_bnl(graph, cb2, applyNodeMask ? nm->anim : nm->animInverted, ignoredAnimation, def_foreign);
+              leafs.emplace_back(
+                ControllerDependencyLoadHelper{graph.getBlendNodePtr(cb2.getStr("name", NULL), nullptr), &cb2, nullptr});
             }
           }
         fatal_context_pop();
@@ -2110,6 +2363,9 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
     if (nodemask[j]->anim)
       nodemask[j]->anim->delRef();
     nodemask[j]->anim = NULL;
+    if (nodemask[j]->animInverted)
+      nodemask[j]->animInverted->delRef();
+    nodemask[j]->animInverted = NULL;
   }
 
   // append other controllers
@@ -2176,6 +2432,13 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
   for (ControllerDependencyLoadHelper &controller : controllersWithDependency)
     controller.node->checkHasLoop(graph, animNodeState);
 
+  for (int i = 0; i < leafs.size(); i++)
+  {
+    if (!leafs[i].node)
+      continue;
+    leafs[i].node->initChilds(graph, *leafs[i].settings, leafs[i].nodeMaskSuffix);
+  }
+
   // clear nodemask
   clear_all_ptr_items_and_shrink(nodemask);
 
@@ -2196,7 +2459,7 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
   }
   graph.replaceRoot(node);
 
-  graph.sortPbCtrl(*blk.getBlockByNameEx("initAnimState")->getBlockByNameEx("postBlendCtrlOrder"));
+  graph.sortPbCtrl(*blk.getBlockByNameEx("initAnimState"));
 
   int null_used = 0;
   for (int i = 0; i < graph.getAnimNodeCount(); i++)
@@ -2206,6 +2469,49 @@ static bool load_generic_graph(AnimationGraph &graph, const DataBlock &blk, dag:
   if (null_used > 0)
     logerr("missing (Null) animNode is used for %d blendNodes, see logerr for details", null_used);
 #endif
+
+  int nid_morph = stDescBlk.getNameId("morph");
+  for (int i = 0; i < stDescBlk.blockCount(); i++)
+    if (stDescBlk.getBlock(i)->getBlockNameId() == nid_morph)
+    {
+      const DataBlock *nblk = stDescBlk.getBlock(i);
+
+      const char *nameFrom = nblk->getStr("from", NULL);
+      const char *nameTo = nblk->getStr("to", NULL);
+      real time = nblk->getReal("morphTime", 0.0);
+      FifoMorphType type = (FifoMorphType)lup(nblk->getStr("morphType", "linear"), fifoMorphTypeNames, countof(fifoMorphTypeNames),
+        FifoMorphType::MT_LINEAR);
+      if (!nameFrom)
+      {
+        ANIM_ERR("missing 'from' blend node name parameter in morph block");
+        continue;
+      }
+      if (!nameTo)
+      {
+        ANIM_ERR("missing 'to' blend node name parameter in morph block");
+        continue;
+      }
+      IAnimBlendNode *from = graph.getBlendNodePtr(nameFrom);
+      IAnimBlendNode *to = graph.getBlendNodePtr(nameTo);
+
+      if (!from)
+      {
+        ANIM_ERR("Node <%s> referenced in 'from' parameter of a morph block does not exist", nameFrom);
+        continue;
+      }
+
+      if (!to)
+      {
+        ANIM_ERR("Node <%s> referenced in 'to' parameter of a morph block does not exist", nameTo);
+        continue;
+      }
+
+      graph.morphParamsOverride.push_back({from, to, time, type});
+      if (nblk->getBool("twoSided", false))
+        graph.morphParamsOverride.push_back({to, from, time, type});
+    }
+
+  graph.morphParamsOverride.shrink_to_fit();
 
   if (stDescBlk.blockCount())
     graph.initStates(stDescBlk);
@@ -2249,6 +2555,21 @@ AnimationGraph *loadUniqueAnimGraph(const DataBlock &blk, dag::ConstSpan<AnimDat
 }
 } // namespace AnimResManagerV20
 
+bool IAnimBlendNode::isAnimNodeNameValid(const char *name)
+{
+  if (!name)
+  {
+    ANIM_ERR("<name> param not found");
+    return false;
+  }
+  else if (!*name)
+  {
+    ANIM_ERR("empty <name> param is not allowed");
+    return false;
+  }
+  return true;
+}
+
 #if DAGOR_DBGLEVEL > 0
 static String get_anim_res_name(AnimData *anim)
 {
@@ -2264,6 +2585,19 @@ static String get_anim_res_name(AnimData *anim)
   return resName;
 }
 #endif
+
+int getKeyTime(AnimData *anim, const char *key)
+{
+  if (!anim)
+  {
+    DEBUG_CTX("getKeyTime ( %s ) while anim=NULL", key);
+    return -1;
+  }
+  int t = anim->getLabelTime(key, !isdigit(key[0]));
+  if (t < 0)
+    t = atoi(key) * TIME_TicksPerSec / 30;
+  return t;
+}
 
 //
 // creator functions for supported IAnimBlendNodeTypes
@@ -2283,8 +2617,8 @@ static void common_leaf_setup(AnimBlendNodeContinuousLeaf *node, const DataBlock
   const char *key_start = blk.getStr("key_start", key_start_def);
   const char *key_end = blk.getStr("key_end", key_end_def);
 
-  int tKeyStart = node->getKeyTime(key_start);
-  int tKeyEnd = node->getKeyTime(key_end);
+  int tKeyStart = getKeyTime(node->anim, key_start);
+  int tKeyEnd = getKeyTime(node->anim, key_end);
   int tStart = blk.getInt("start", tKeyStart);
   int tEnd = blk.getInt("end", tKeyEnd);
   real time = blk.getReal("time", (float)(tEnd - tStart) / (float)AnimV20::TIME_TicksPerSec);
@@ -2334,11 +2668,8 @@ void AnimBlendNodeContinuousLeaf::createNode(AnimationGraph &graph, const DataBl
   bool def_foreign, const char *nm_suffix)
 {
   const char *name = blk.getStr("name", NULL);
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
   bool ownTimer = blk.getBool("own_timer", false);
   bool eoaIrq = blk.getBool("eoa_irq", false);
   const char *timeScaleParam = blk.getStr("timeScaleParam", NULL);
@@ -2378,11 +2709,8 @@ void AnimBlendNodeSingleLeaf::createNode(AnimationGraph &graph, const DataBlock 
   bool def_foreign, const char *nm_suffix)
 {
   const char *name = blk.getStr("name", NULL);
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
   String timer;
   if (blk.getBool("own_timer", true))
     timer = String(name) + "::timer";
@@ -2410,11 +2738,8 @@ void AnimBlendNodeStillLeaf::createNode(AnimationGraph &graph, const DataBlock &
   bool def_foreign, const char *nm_suffix)
 {
   const char *name = blk.getStr("name", NULL);
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
   const char *key = blk.getStr("key", name);
 
   int tStart = blk.getInt("start", -1);
@@ -2434,11 +2759,8 @@ void AnimBlendNodeParametricLeaf::createNode(AnimationGraph &graph, const DataBl
   bool def_foreign, const char *nm_suffix)
 {
   const char *name = blk.getStr("name", NULL);
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
   const char *key = blk.getStr("key", name);
   const char *varname = blk.getStr("varname", NULL);
 
@@ -2459,6 +2781,7 @@ void AnimBlendNodeParametricLeaf::createNode(AnimationGraph &graph, const DataBl
   const char *key_start = blk.getStr("key_start", key_start_def);
   const char *key_end = blk.getStr("key_end", key_end_def);
 
+  node->eoaIrq = blk.getBool("eoa_irq", false);
   node->setRange(key_start, key_end, blk.getReal("p_start", 0.0f), blk.getReal("p_end", 1.0f), name);
   node->setLooping(blk.getBool("looping", false));
   common_nontime_leaf_setup(node, blk, ignoredAnimation, def_foreign);
@@ -2492,11 +2815,8 @@ void AnimBlendCtrl_1axis::createNode(AnimationGraph &graph, const DataBlock &blk
   const char *_vname = blk.getStr("varname", NULL);
   String var_name;
 
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
 
   if (_vname)
     var_name = _vname;
@@ -2566,11 +2886,8 @@ void AnimBlendCtrl_LinearPoly::createNode(AnimationGraph &graph, const DataBlock
   const char *_vname = blk.getStr("varname", NULL);
   String var_name;
 
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
 
   if (_vname)
     var_name = _vname;
@@ -2587,29 +2904,33 @@ void AnimBlendCtrl_LinearPoly::createNode(AnimationGraph &graph, const DataBlock
 
 void AnimBlendCtrl_LinearPoly::initChilds(AnimationGraph &graph, const DataBlock &blk, const char *nm_suffix)
 {
-  const char *name = blk.getStr("name");
-  int child_nid = blk.getNameId("child"), i;
-  if (child_nid != -1)
-    for (i = 0; i < blk.blockCount(); i++)
-      if (blk.getBlock(i)->getBlockNameId() == child_nid)
-      {
-        const DataBlock *cblk = blk.getBlock(i);
-        const char *nm = cblk->getStr("name", NULL);
-        if (!nm)
-        {
-          ANIM_ERR("<name> is not defined in hub child");
-          continue;
-        }
+  int child_nid = blk.getNameId("child");
+  if (child_nid == -1)
+    return;
 
-        IAnimBlendNode *n = graph.getBlendNodePtr(nm, nm_suffix);
-        if (!n)
-        {
-          if (!is_ignoring_unavailable_resources())
-            ANIM_ERR("blend node <%s> (suffix=%s) not found!", nm, nm_suffix);
-          continue;
-        }
-        addBlendNode(n, cblk->getReal("val", 0), graph, name);
+  const char *controller_name = blk.getStr("name");
+  for (int i = 0; i < blk.blockCount(); i++)
+    if (blk.getBlock(i)->getBlockNameId() == child_nid)
+    {
+      const DataBlock *cblk = blk.getBlock(i);
+      const char *nm = cblk->getStr("name", NULL);
+      if (!nm)
+      {
+        ANIM_ERR("<name> is not defined in hub child");
+        continue;
       }
+
+      IAnimBlendNode *n = graph.getBlendNodePtr(nm, nm_suffix);
+      if (!n)
+      {
+        if (!is_ignoring_unavailable_resources())
+          ANIM_ERR("blend node <%s> (suffix=%s) not found!", nm, nm_suffix);
+        continue;
+      }
+      addBlendNode(n, cblk->getReal("val", 0), graph, controller_name);
+    }
+
+  sort(poly, &anim_point_p0_cmp);
 }
 
 void AnimBlendCtrl_LinearPoly::checkHasLoop(AnimationGraph &graph,
@@ -2642,17 +2963,20 @@ void AnimBlendCtrl_LinearPoly::checkHasLoop(AnimationGraph &graph,
 void AnimBlendCtrl_Fifo3::createNode(AnimationGraph &graph, const DataBlock &blk)
 {
   const char *name = blk.getStr("name", NULL);
-  const char *varname = blk.getStr("varname", NULL);
+  const char *_vname = blk.getStr("varname", NULL);
+  String var_name;
 
-  if (!varname)
-  {
-    ANIM_ERR("not found 'varname' param");
+  if (!isAnimNodeNameValid(name))
     return;
-  }
 
-  IAnimBlendNode *node = new AnimBlendCtrl_Fifo3(graph, varname);
-  if (name)
-    graph.registerBlendNode(node, name);
+  if (_vname)
+    var_name = _vname;
+  else
+    var_name = String("var") + name;
+
+  IAnimBlendNode *node = new AnimBlendCtrl_Fifo3(graph, var_name);
+
+  graph.registerBlendNode(node, name);
 }
 
 void AnimBlendCtrl_RandomSwitcher::createNode(AnimationGraph &graph, const DataBlock &blk, const char *nm_suffix)
@@ -2661,11 +2985,8 @@ void AnimBlendCtrl_RandomSwitcher::createNode(AnimationGraph &graph, const DataB
   const char *_vname = blk.getStr("varname", NULL);
   String var_name;
 
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
 
   if (_vname)
     var_name = _vname;
@@ -2682,6 +3003,7 @@ void AnimBlendCtrl_RandomSwitcher::initChilds(AnimationGraph &graph, const DataB
   // create anim list
   const DataBlock *cblk = blk.getBlockByName("weight");
   const DataBlock *rblk = blk.getBlockByName("maxrepeat");
+  const int defaultMaxRepeat = blk.getInt("maxrepeat", 1);
   int i;
 
   if (cblk)
@@ -2699,7 +3021,7 @@ void AnimBlendCtrl_RandomSwitcher::initChilds(AnimationGraph &graph, const DataB
           ANIM_ERR("blend node <%s> (suffix=%s) not found!", nm, nm_suffix);
         continue;
       }
-      addBlendNode(n, cblk->getReal(i), rblk ? rblk->getInt(nm, 1) : 1);
+      addBlendNode(n, cblk->getReal(i), rblk ? rblk->getInt(nm, defaultMaxRepeat) : defaultMaxRepeat);
     }
   }
 
@@ -2739,11 +3061,8 @@ void AnimBlendCtrl_ParametricSwitcher::createNode(AnimationGraph &graph, const D
   const char *_vname = blk.getStr("varname", NULL);
   String var_name;
 
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
 
   if (_vname)
     var_name = _vname;
@@ -2753,6 +3072,8 @@ void AnimBlendCtrl_ParametricSwitcher::createNode(AnimationGraph &graph, const D
   AnimBlendCtrl_ParametricSwitcher *node = new AnimBlendCtrl_ParametricSwitcher(graph, var_name, blk.getStr("varname_residual", NULL));
 
   node->morphTime = blk.getReal("morphTime", 0.15f);
+  node->morphType =
+    (FifoMorphType)lup(blk.getStr("morphType", "linear"), fifoMorphTypeNames, countof(fifoMorphTypeNames), FifoMorphType::MT_LINEAR);
   graph.registerBlendNode(node, name, nm_suffix);
 }
 
@@ -2878,6 +3199,55 @@ void AnimBlendCtrl_ParametricSwitcher::initChilds(AnimationGraph &graph, const D
       }
     }
   }
+
+  const DataBlock *mtblk = blk.getBlockByName("morphTimes");
+  if (mtblk)
+  {
+    morphParamsOverride.reserve(mtblk->blockCount());
+    for (int i = 0; i < mtblk->blockCount(); i++)
+    {
+      const DataBlock *nblk = mtblk->getBlock(i);
+
+      const char *nameFrom = nblk->getStr("from", NULL);
+      const char *nameTo = nblk->getStr("to", NULL);
+      real time = nblk->getReal("morphTime", 0.0);
+      FifoMorphType type = (FifoMorphType)lup(nblk->getStr("morphType", "linear"), fifoMorphTypeNames, countof(fifoMorphTypeNames),
+        FifoMorphType::MT_LINEAR);
+      if (!nameFrom)
+      {
+        ANIM_ERR("Blend node <%s> missing 'from' blend node name parameter in morphTimes block", name);
+        continue;
+      }
+      if (!nameTo)
+      {
+        ANIM_ERR("Blend node <%s> missing 'to' blend node name parameter in morphTimes block", name);
+        continue;
+      }
+      IAnimBlendNode *from = graph.getBlendNodePtr(nameFrom, nm_suffix);
+      IAnimBlendNode *to = graph.getBlendNodePtr(nameTo, nm_suffix);
+
+      // We might be tempted add some logerrs to the validation below but we can't be sure about it.
+      // Some nodes in paramSwitch can be marked optional and then the only way to check
+      // if we are requiring some non existant nodes would be to reparse blk nodes list.
+      // I don't want to bother with that
+      if (!from || !to)
+        continue;
+      bool foundFrom = false;
+      bool foundTo = false;
+      for (ItemAnim &a : list)
+      {
+        if (from == a.node)
+          foundFrom = true;
+        if (to == a.node)
+          foundTo = true;
+      }
+      if (!foundFrom || !foundTo)
+        continue;
+
+      morphParamsOverride.push_back({from, to, time, type});
+    }
+  }
+
   if (dd_stricmp(blk.getBlockName(), "paramSwitchS") == 0)
     continuousAnimMode = false;
 
@@ -2920,11 +3290,8 @@ void AnimBlendCtrl_ParametricSwitcher::checkHasLoop(AnimationGraph &graph,
 void AnimBlendCtrl_Hub::createNode(AnimationGraph &graph, const DataBlock &blk, const char *nm_suffix)
 {
   const char *name = blk.getStr("name", NULL);
-  if (!name)
-  {
-    ANIM_ERR("%s <name> param not found for <%s>", __FUNCTION__, blk.getBlockName());
+  if (!isAnimNodeNameValid(name))
     return;
-  }
 
   AnimBlendCtrl_Hub *node = new AnimBlendCtrl_Hub;
   graph.registerBlendNode(node, name, nm_suffix);
@@ -2968,7 +3335,7 @@ void AnimBlendCtrl_Hub::initChilds(AnimationGraph &graph, const DataBlock &blk, 
         }
         addBlendNode(n, cblk->getBool("enabled", true), cblk->getReal("weight", 1.0f));
       }
-  if (!blk.getBool("const", false))
+  if (!blk.getBool("const", true))
     finalizeInit(graph, varName);
 }
 
@@ -2980,7 +3347,7 @@ void AnimBlendCtrl_Hub::checkHasLoop(AnimationGraph &graph,
     return;
 
   visited_nodes[id] = true;
-  for (const Ptr<IAnimBlendNode> child : nodes)
+  for (const Ptr<IAnimBlendNode> &child : nodes)
   {
     int childId = child->getAnimNodeId();
     if (childId == -1)
@@ -3005,11 +3372,8 @@ void AnimBlendCtrl_Blender::createNode(AnimationGraph &graph, const DataBlock &b
   const char *_vname = blk.getStr("varname", NULL);
   String var_name;
 
-  if (!name)
-  {
-    ANIM_ERR("not found 'name' param");
+  if (!isAnimNodeNameValid(name))
     return;
-  }
 
   if (_vname)
     var_name = _vname;
@@ -3054,7 +3418,7 @@ void AnimBlendCtrl_Blender::checkHasLoop(AnimationGraph &graph,
     return;
 
   visited_nodes[id] = true;
-  for (const Ptr<IAnimBlendNode> child : node)
+  for (const Ptr<IAnimBlendNode> &child : node)
   {
     int childId = child->getAnimNodeId();
     if (childId == -1)
@@ -3081,11 +3445,8 @@ void AnimBlendCtrl_BinaryIndirectSwitch::createNode(AnimationGraph &graph, const
   String var_name;
 
 
-  if (!name)
-  {
-    ANIM_ERR("not found 'name' param");
+  if (!isAnimNodeNameValid(name))
     return;
-  }
 
   if (_vname)
     var_name = _vname;
@@ -3167,7 +3528,7 @@ void AnimBlendCtrl_BinaryIndirectSwitch::checkHasLoop(AnimationGraph &graph,
     return;
 
   visited_nodes[id] = true;
-  for (const Ptr<IAnimBlendNode> child : node)
+  for (const Ptr<IAnimBlendNode> &child : node)
   {
     int childId = child->getAnimNodeId();
     if (childId == -1)
@@ -3190,20 +3551,13 @@ void AnimBlendCtrl_BinaryIndirectSwitch::checkHasLoop(AnimationGraph &graph,
 void AnimBlendCtrl_SetMotionMatchingTag::createNode(AnimationGraph &graph, const DataBlock &blk, const char *nm_suffix)
 {
   const char *name = blk.getStr("name", NULL);
-  if (!name)
-  {
-    ANIM_ERR("not found 'name' param");
+  if (!isAnimNodeNameValid(name))
     return;
-  }
   const char *tag = blk.getStr("mmTag", NULL);
-  if (!tag)
-  {
-    ANIM_ERR("not found 'mmTag' param");
-    return;
-  }
+
   AnimBlendCtrl_SetMotionMatchingTag *node = new AnimBlendCtrl_SetMotionMatchingTag;
   int tagsMaskSize = (MAX_TAGS_COUNT + 7) / 8; // one bit for each tag
-  node->tagsMaskParamId = graph.addInlinePtrParamId("motion_matching_tags", tagsMaskSize, IPureAnimStateHolder::PT_InlinePtr);
+  node->tagsMaskParamId = graph.addInlinePtrParamId("motion_matching_tags", tagsMaskSize, AnimGraphStateHolder::PT_InlinePtr);
   node->tagName = tag;
   graph.registerBlendNode(node, name, nm_suffix);
 }

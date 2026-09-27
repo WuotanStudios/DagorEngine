@@ -72,7 +72,7 @@ shader ssr
       float3 oldExactUVZ = float3(oldExactUV, clamp(linearize_z(prevScreenExact.z, prev_zn_zfar.zw), prev_zn_zfar.x, prev_zn_zfar.y));
       float currentPosToPrevW = oldExactUVZ.z;
 
-      float rayLength = length(cameraToPoint);
+      float rayLength = max(1e-4f, length(cameraToPoint));
       float4 prevReflClip = mul(float4(prevViewVec*(reflectionDistance + rayLength)/rayLength, 1), prev_globtm_no_ofs_psf);
       float3 prevReflScreen = prevReflClip.w > 1e-6 ? prevReflClip.xyz/prevReflClip.w : float3(2,2,0);
       float2 prevUV = prevReflScreen.xy*float2(0.5,-0.5) + float2(0.5,0.5);

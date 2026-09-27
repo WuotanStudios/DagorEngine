@@ -8,16 +8,16 @@ let settingsPlaformId = dgs_get_settings().getStr("platform", systemPlatformId)
 let platformId = DBGLEVEL > 0 ? (get_arg_value_by_name("platform") ?? settingsPlaformId) : settingsPlaformId
 let oneOf = @(...) vargv.contains(platformId)
 let consoleModel = get_console_model()
-let isModel = @(model) consoleModel == model
+let isModel = @(model): bool consoleModel == model
 let consoleRevision = get_console_model_revision(consoleModel)
-let pcPlatforms = ["win32", "win64", "macosx", "linux64"]
+let pcPlatforms = ["win32", "win64", "macosx", "linux64"].totable()
 
 let is_pc = oneOf("win32", "win64", "macosx", "linux64")
 let is_sony = oneOf("ps4", "ps5")
-let isPlatformSony = @(pl) ["ps4", "ps5"].contains(pl)
+let isPlatformSony = @(pl): bool ["ps4", "ps5"].contains(pl)
 let is_xbox = oneOf("xboxOne", "xboxScarlett")
 let is_gdk = is_gdk_used()
-let isPlatformXbox = @(pl) ["xboxOne", "xboxScarlett"].contains(pl)
+let isPlatformXbox = @(pl): bool ["xboxOne", "xboxScarlett"].contains(pl)
 let is_nswitch = oneOf("nswitch")
 let is_mobile = oneOf("iOS", "android")
 let is_android = platformId == "android"
@@ -48,13 +48,12 @@ let platformAlias = is_sony ? "sony"
   : is_pc && is_gdk ? "xbox"
   : is_mobile ? "mobile"
   : is_pc ? "pc"
-  : is_android ? "android"
   : platformId
 
 function getPlatformAlias(pl) {
   return isPlatformXbox(pl) ? "xbox"
     : isPlatformSony(pl) ? "sony"
-    : pcPlatforms.contains(pl) ? "pc"
+    : (pl in pcPlatforms) ? "pc"
     : ["iOS", "android"].contains(pl) ? "mobile"
     : pl
 }

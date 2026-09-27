@@ -1,17 +1,22 @@
 options gen2
 options indenting = 4
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options strict_smart_pointers
 
 module archive shared private
+
+//! Binary serialization and deserialization framework.
+//!
+//! Provides ``serialize`` generics that read/write daslang values to binary
+//! archives. The `Archive` structure wraps a stream and tracks
+//! read vs. write direction. Supports primitive types, arrays, tables,
+//! variants, tuples, smart pointers, and user-extensible overloads.
 
 require daslib/contracts
 require daslib/apply
 require daslib/templates
 require math
 require strings
-require rtti
+require daslib/rtti
 
 class public Serializer {
     //! Base class for serializers.
@@ -28,6 +33,7 @@ class public MemSerializer : Serializer {
         pass    // writing
     }
     def MemSerializer(from : array<uint8>) {
+        //! Initialize the serializer for reading from the given data.
         data := from
     }
     def extractData : array<uint8> {
@@ -35,9 +41,8 @@ class public MemSerializer : Serializer {
         return <- data
     }
     def getCopyOfData : array<uint8> {
-        //! Returns copy of the data from the seiralizer.
-        var cdata := data
-        return <- cdata
+        //! Returns copy of the data from the serializer.
+        return clone_to_move(data)
     }
     def getLastError {
         //! Returns last serialization error.
@@ -50,6 +55,9 @@ class public MemSerializer : Serializer {
     def override write(bytes : void? implicit; size : int) : bool {
         //! Appends bytes at the end of the data.
         let pos = length(data)
+        // eager grow: no alias into `data` survives a write, and a very_safe_context would
+        // otherwise abandon every doubling generation - roughly one payload of garbage per serialize
+        unsafe(data |> scratch_ensure_capacity(pos + size))
         data |> resize_no_init(pos + size)
         unsafe {
             memcpy(addr(data[pos]), bytes, size)
@@ -61,7 +69,9 @@ class public MemSerializer : Serializer {
         let newOffset = readOffset + size
         let maxOffset = length(data)
         if (newOffset > maxOffset) {
-            error("reading past the end of stream")
+            // self-> matters: a bare error(...) resolves to the BUILTIN error (a stderr
+            // print), leaving lastError unset — OK() then reports a truncated stream as fine
+            self->error("reading past the end of stream")   // nolint:STYLE028 — dropping self-> rebinds to the builtin, probe-verified 2026-07-17
             readOffset = maxOffset
             return false
         }
@@ -75,16 +85,16 @@ class public MemSerializer : Serializer {
         //! Sets the last error code.
         lastError = code
     }
-    private data : array<uint8>
-    private readOffset : int
-    private lastError : string
+    private data : array<uint8> //! internal data buffer
+    private readOffset : int    //! current reading offset
+    private lastError : string  //! last error code
 }
 
 struct public Archive {
     //! Archive is a combination of serialization stream, and state (version, and reading status).
-    version : uint
-    reading : bool
-    stream  : Serializer?
+    version : uint //! Version of the archive format.
+    reading : bool //! True if the archive is for reading, false for writing.
+    stream  : Serializer? //! Serialization stream.
 }
 
 def public serialize_raw(var arch : Archive; var value : auto(TT)&) {
@@ -116,6 +126,7 @@ def public serialize(var arch : Archive; var value : auto(TT)&) {
 
 [expect_any_function(value)]
 def public serialize(var arch : Archive; var value : auto(TT)&) {
+    //! Serializes function pointer by its mangled name hash.
     if (arch.reading) {
         var mnh : uint64
         arch |> read_raw(mnh)
@@ -131,86 +142,118 @@ def public serialize(var arch : Archive; var value : auto(TT)&) {
 }
 
 def public serialize(var arch : Archive; var value : float3x3) {
+    //! Serializes float3x3 matrix
     arch |> serialize_raw(value)
 }
 
 def public serialize(var arch : Archive; var value : float3x4) {
+    //! Serializes float3x4 matrix
     arch |> serialize_raw(value)
 }
 
 def public serialize(var arch : Archive; var value : float4x4) {
+    //! Serializes float4x4 matrix
     arch |> serialize_raw(value)
 }
 
 [expect_any_struct(value)]
 def public serialize(var arch : Archive; var value : auto(TT)&) {
+    //! Serializes struct by serializing each field.
     if (arch.reading) {
-        delete value
+        unsafe { delete value; }
     }
-    apply(value) <| $ [unused_argument(name)] (name : string; field) {
+    apply(value) $ [unused_argument(name)] (name : string; field) {
         arch |> _::serialize(field)
     }
 }
 
 [expect_any_tuple(value)]
 def public serialize(var arch : Archive; var value : auto(TT)&) {
+    //! Serializes tuple by serializing each field.
     if (arch.reading) {
-        delete value
+        unsafe { delete value; }
     }
-    apply(value) <| $ [unused_argument(name)] (name : string; field) {
+    apply(value) $ [unused_argument(name)] (name : string; field) {
         arch |> _::serialize(field)
     }
 }
 
 [expect_any_variant(value)]
 def public serialize(var arch : Archive; var value : auto(TT)&) {
+    //! Serializes variant by serializing the index and the active field.
     if (arch.reading) {
-        delete value
+        unsafe { delete value; }
         var index : int
         arch |> read_raw(index)
-        unsafe {
-            value |> set_variant_index(index)
-        }
+        unsafe(value |> set_variant_index(index))
     } else {
         var index = variant_index(value)
         arch |> write_raw(index)
     }
-    apply(value) <| $ [unused_argument(name)] (name : string; field) {
+    apply(value) $ [unused_argument(name)] (name : string; field) {
         arch |> _::serialize(field)
     }
 }
 
 def public serialize(var arch : Archive; var value : auto(TT)[]) {
-    for (element in value) {
-        arch |> _::serialize(element)
+    //! Serializes fixed-size array of any depth. Bulk memcpy when the whole block is raw
+    //! (workhorse leaf, or nested fixed array of raw), element-wise recursion otherwise.
+    static_if (typeinfo is_raw(type<TT>) && (typeinfo is_workhorse(type<TT>) || typeinfo is_dim(type<TT>))) {
+        let sz = typeinfo sizeof(value)
+        if (arch.reading) {
+            arch.stream->read(unsafe(addr(value)), sz)
+        } else {
+            arch.stream->write(unsafe(addr(value)), sz)
+        }
+    } else {
+        for (element in value) {
+            arch |> _::serialize(element)
+        }
     }
 }
 
 def public serialize(var arch : Archive; var value : array<auto(TT)>) {
+    //! Serializes array. Bulk memcpy for raw workhorse types, element-wise otherwise.
     if (arch.reading) {
         var len : int
         unsafe {
             delete value
         }
         arch |> read_raw(len)
-        value |> resize(len)
-        for (element in value) {
-            arch |> _::serialize(element)
+        static_if (typeinfo is_workhorse(type<TT>) && typeinfo is_raw(type<TT>)) {
+            value |> reserve(len)   // read side knows the final size: the resize never grows
+            value |> resize_no_init(len)
+            if (len > 0) {
+                arch.stream->read(unsafe(addr(value[0])), len * typeinfo sizeof(type<TT>))
+            }
+        } else {
+            value |> reserve(len)
+            unsafe(value |> resize(len))
+            for (element in value) {
+                arch |> _::serialize(element)
+            }
         }
     } else {
         var len = length(value)
         arch |> write_raw(len)
-        for (element in value) {
-            arch |> _::serialize(element)
+        static_if (typeinfo is_workhorse(type<TT>) && typeinfo is_raw(type<TT>)) {
+            if (len > 0) {
+                arch.stream->write(unsafe(addr(value[0])), len * typeinfo sizeof(type<TT>))
+            }
+        } else {
+            for (element in value) {
+                arch |> _::serialize(element)
+            }
         }
     }
 }
 
 def public serialize(var arch : Archive; var value : table<auto(KT); auto(VT)>) {
+    //! Serializes table by serializing its length and each key-value pair.
     if (arch.reading) {
         var len : int
         arch |> read_raw(len)
-        delete value
+        unsafe { delete value; }
         for (_ in range(len)) {
             var k : KT -const -& -#
             arch |> _::serialize(k)
@@ -228,6 +271,7 @@ def public serialize(var arch : Archive; var value : table<auto(KT); auto(VT)>) 
 }
 
 def public serialize(var arch : Archive; var value : string&) {
+    //! Serializes string by serializing its length and characters.
     unsafe {
         if (arch.reading) {
             var len : int
@@ -237,7 +281,7 @@ def public serialize(var arch : Archive; var value : string&) {
                 tbuf |> resize_no_init(len + 1)                         // todo: implement preallocat string with raii
                 arch.stream->read(addr(tbuf[0]), len)
                 tbuf[len] = 0u8
-                value = clone_string(reinterpret<string#> addr(tbuf[0]))
+                value = clone_string(reinterpret<string#>(addr(tbuf[0])))
                 delete tbuf
             } else {
                 value = ""
@@ -246,13 +290,14 @@ def public serialize(var arch : Archive; var value : string&) {
             var len = length(value)
             arch |> write_raw(len)
             if (len > 0) {
-                arch.stream->write(reinterpret<void?> value, len)
+                arch.stream->write(reinterpret<void?>(value), len)
             }
         }
     }
 }
 
 def public serialize(var arch : Archive; var value : auto(TT)?) {
+    //! Serializes nullable type by serializing a flag and the value if present.
     if (arch.reading) {
         value = null
     }
@@ -263,7 +308,11 @@ def public mem_archive_save(var t : auto&) {
     var mems = new MemSerializer()
     var sarch = Archive(reading = false, stream = mems)
     sarch |> serialize(t)
-    return <- mems->extractData()
+    var result <- mems->extractData()
+    unsafe {
+        delete mems
+    }
+    return <- result
 }
 
 def public mem_archive_load(var data : array<uint8>; var t : auto&; canfail : bool = false) : bool {
@@ -271,11 +320,29 @@ def public mem_archive_load(var data : array<uint8>; var t : auto&; canfail : bo
     var memr = new MemSerializer(data)
     var rarch = Archive(reading = true, stream = memr)
     rarch |> serialize(t)
-    if (!memr->OK()) {
+    let ok = memr->OK()
+    if (!ok) {
         if (!canfail) {
-            panic(memr->getLastError())
+            let lastErr = memr->getLastError()
+            unsafe {
+                delete memr
+            }
+            panic(lastErr)
+        }
+        unsafe {
+            delete memr
         }
         return false
     }
+    unsafe {
+        delete memr
+    }
     return true
+}
+
+def public mem_archive_load(data : array<uint8># -const; var t : auto&; canfail : bool = false) : bool {
+    //! Loads the object from a memory archive, reading from a borrowed view without cloning.
+    //! `data` must outlive the call. Reinterprets the borrowed view as a regular array;
+    //! the MemSerializer only reads and never mutates or frees it.
+    return mem_archive_load(unsafe(reinterpret<array<uint8>>(data)), t, canfail)
 }

@@ -12,14 +12,18 @@ Sources =
   meshDataSave.cpp
   processMat.cpp
   validateLods.cpp
+  validateUv.cpp
+  validateAlphaTest.cpp
 
   dynSceneResSrc.cpp
+  clothProxyBuild.cpp
   rendInstResSrc.cpp
+  rendInstVoxel.cpp
 
   tristrip/stripobj.cpp
   tristrip/tristrip.cpp
 
-  forsythTriangleReorderopt.cpp 
+  forsythTriangleReorderopt.cpp
 ;
 
 AddIncludes =
@@ -32,9 +36,17 @@ AddIncludes =
 UseProgLibs =
   3rdPartyLibs/meshoptimizer
   3rdPartyLibs/eastl
+  gameLibs/render/omm
 ;
 
-CPPopt = -D_DEBUG_TAB_ ;
+if $(PlatformArch) = e2k {
+  CPPopt += -DTEX_CANNOT_USE_ISPC ;
+} else {
+  AddIncludes += $(Root)/prog/3rdPartyLibs/convert/ispc_texcomp ;
+  UseProgLibs += 3rdPartyLibs/convert/ispc_texcomp ;
+}
+
+CPPopt += -D_DEBUG_TAB_ ;
 
 
 include $(Root)/prog/_jBuild/build.jam ;

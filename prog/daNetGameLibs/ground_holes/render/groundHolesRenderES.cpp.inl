@@ -1,7 +1,10 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entityManager.h>
-#include <ecs/core/attributeEx.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
 #include <daECS/core/entityComponent.h>
 #include <daECS/core/coreEvents.h>
 #include <ecs/render/updateStageRender.h>
@@ -19,8 +22,8 @@
 #include <render/dasModules/worldRenderer.h>
 #include <heightmap/heightmapHandler.h>
 #include <landMesh/lmeshManager.h>
-#include <landMesh/heightmap_holes_zones.hlsli>
 #include <util/dag_convar.h>
+#include <debug/dag_debug3d.h>
 #include "render/boundsUtils.h"
 #include "main/level.h"
 #include <groundHolesCore/helpers.h>
@@ -34,6 +37,8 @@
 #include <ecs/render/compute_shader.h>
 
 #include <groundHolesCore/render/groundHolesCoreRender.h>
+
+CONSOLE_BOOL_VAL("render", debug_underground_zones, false);
 
 ECS_TAG(render)
 ECS_ON_EVENT(on_appear)
@@ -50,7 +55,7 @@ static inline void ground_holes_initialize_es(const ecs::Event &,
 ECS_TAG(render)
 ECS_ON_EVENT(on_disappear)
 static inline void ground_holes_on_disappear_es(
-  const ecs::Event &, int hmap_holes_scale_step_offset_varId, UniqueTexHolder &hmapHolesTex)
+  const ecs::Event &, int hmap_holes_scale_step_offset_varId, UniqueTexWithShaderVar &hmapHolesTex)
 {
   ground_holes::on_disappear(hmap_holes_scale_step_offset_varId, hmapHolesTex);
 }
@@ -58,9 +63,9 @@ static inline void ground_holes_on_disappear_es(
 ECS_TAG(render)
 ECS_NO_ORDER
 static void ground_hole_render_es(const UpdateStageInfoRender &,
-  UniqueTexHolder &hmapHolesTex,
-  UniqueTexHolder &hmapHolesTmpTex,
-  UniqueBufHolder &hmapHolesBuf,
+  UniqueTexWithShaderVar &hmapHolesTex,
+  UniqueTexWithShaderVar &hmapHolesTmpTex,
+  UniqueBufWithShaderVar &hmapHolesBuf,
   PostFxRenderer &hmapHolesProcessRenderer,
   PostFxRenderer &hmapHolesMipmapRenderer,
   ShadersECS &hmapHolesPrepareRenderer,
@@ -86,12 +91,15 @@ static void ground_hole_render_es(const UpdateStageInfoRender &,
 }
 
 template <typename Callable>
-static void spawn_hole_ecs_query(Callable c);
+static void spawn_hole_ecs_query(ecs::EntityManager &manager, Callable c);
 
 ECS_TAG(render)
 ECS_AFTER(animchar_before_render_es) // require for execute animchar_before_render_es as early as possible
-void ground_holes_before_render_es(
-  const UpdateStageInfoBeforeRender &, ecs::Point4List &holes, ecs::Point3List &invalidate_bboxes, bool should_render_ground_holes)
+void ground_holes_before_render_es(const UpdateStageInfoBeforeRender &,
+  ecs::EntityManager &manager,
+  ecs::Point4List &holes,
+  ecs::Point3List &invalidate_bboxes,
+  bool should_render_ground_holes)
 {
   // A `ground_hole` can initialize after `EventLevelLoaded` event.
   // TODO: Render hmapHolesTex only once.
@@ -102,7 +110,7 @@ void ground_holes_before_render_es(
   invalidate_bboxes.clear();
   if (!ground_holes::get_debug_hide())
   {
-    spawn_hole_ecs_query([&](const TMatrix &transform, bool ground_hole_sphere_shape, bool ground_hole_shape_intersection) {
+    spawn_hole_ecs_query(manager, [&](const TMatrix &transform, bool ground_hole_sphere_shape, bool ground_hole_shape_intersection) {
       ground_holes::spawn_hole(holes, transform, ground_hole_sphere_shape, ground_hole_shape_intersection);
       ground_holes::get_invalidation_bbox(invalidate_bboxes, transform, ground_hole_shape_intersection);
     });
@@ -118,46 +126,23 @@ void ground_holes_convar_helper_es(const UpdateStageInfoBeforeRender &, bool &sh
 }
 
 ECS_TAG(render)
-ECS_ON_EVENT(EventLevelLoaded, AfterDeviceReset)
+ECS_ON_EVENT(EventLevelLoaded, EventAfterDeviceReset)
 static void ground_holes_render_when_event_es(const ecs::Event &, bool &should_render_ground_holes)
 {
   should_render_ground_holes = true;
 }
 
-void get_underground_zones_data(Tab<Point3_vec4> &bboxes);
-
 template <typename Callable>
-static void get_underground_zones_buf_ecs_query(Callable c);
+static void underground_zones_draw_debug_ecs_query(ecs::EntityManager &manager, Callable c);
 
-ECS_TAG(render)
-ECS_REQUIRE(ecs::Tag underground_zone)
-ECS_ON_EVENT(on_appear, on_disappear)
-static void ground_hole_zone_on_appear_es(const ecs::Event &)
-{
-  get_underground_zones_buf_ecs_query([&](bool &should_update_ground_holes_zones) { should_update_ground_holes_zones = true; });
-}
-
-ECS_TAG(render)
+ECS_TAG(render, dev)
 ECS_NO_ORDER
-static void ground_holes_zones_before_render_es(
-  const UpdateStageInfoBeforeRender &, UniqueBufHolder &hmapHolesZonesBuf, bool &should_update_ground_holes_zones)
+static void underground_zones_draw_debug_es(
+  const ecs::UpdateStageInfoRenderDebug &, ecs::EntityManager &manager, bool should_render_ground_holes)
 {
-  Tab<Point3_vec4> bboxes(framemem_ptr());
-  get_underground_zones_data(bboxes);
-  ground_holes::zones_before_render(hmapHolesZonesBuf, should_update_ground_holes_zones, bboxes);
-}
-
-ECS_TAG(render)
-ECS_ON_EVENT(AfterDeviceReset)
-static void ground_holes_zones_after_device_reset_es(
-  const ecs::Event &, UniqueBufHolder &hmapHolesZonesBuf, bool &should_update_ground_holes_zones)
-{
-  ground_holes::zones_after_device_reset(hmapHolesZonesBuf, should_update_ground_holes_zones);
-}
-
-ECS_TAG(render)
-ECS_ON_EVENT(on_disappear)
-static void ground_holes_zones_manager_on_disappear_es(const ecs::Event &, UniqueBufHolder &hmapHolesZonesBuf)
-{
-  ground_holes::zones_manager_on_disappear(hmapHolesZonesBuf);
+  if (!debug_underground_zones || !should_render_ground_holes)
+    return;
+  underground_zones_draw_debug_ecs_query(manager, [](ECS_REQUIRE(ecs::Tag underground_zone) const TMatrix &transform) {
+    draw_debug_box_buffered(get_containing_box(transform), E3DCOLOR_MAKE(32, 255, 32, 255), 1);
+  });
 }

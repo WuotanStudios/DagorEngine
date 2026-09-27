@@ -1,29 +1,29 @@
 from "string" import format
+from "math" import min, max
 from "%darg/ui_imports.nut" import *
 from "%sqstd/ecs.nut" import *
 from "components/style.nut" import colors
 from "%darg/laconic.nut" import *
-from "%sqstd/underscore.nut" import partition, flatten
 
 let entity_editor = require_optional("entity_editor")
-let { EntitySelectWndId, selectedEntities, markedScenes, de4workMode } = require("state.nut")
+let { EntitySelectWndId, selectedEntities, de4workMode } = require("state.nut")
+let { sceneIdMap } = require("sceneModel.nut")
 let textButton = require("components/textButton.nut")
 let closeButton = require("components/closeButton.nut")
 let { setTooltip } = require("components/cursors.nut")
-let nameFilter = require("components/nameFilter.nut")
+let { mkFilteredList, mkListFilter } = require("components/mkFilteredList.nut")
 let { makeVertScroll } = require("%daeditor/components/scrollbar.nut")
-let { getEntityExtraName, getSceneLoadTypeText, getSceneIndicies, sceneGenerated, sceneSaved, getNumMarkedScenes, matchEntityByScene } = require("%daeditor/daeditor_es.nut")
+let { getEntityExtraName, getSceneLoadTypeText } = require("%daeditor/daeditor_es.nut")
+let { selection, matchEntityByScene } = require("selection.nut")
 let mkSortModeButton = require("components/mkSortModeButton.nut")
 let { addModalWindow, removeModalWindow } = require("%daeditor/components/modalWindows.nut")
 
 let selectedGroup = Watched("")
-let selectionState = mkWatched(persist, "selectionState", {})
+// Own ticks, not the outliner marks: Select here must select entities only
+let markedEids = mkWatched(persist, "markedEids", {})
 let filterString = mkWatched(persist, "filterString", "")
 let filterEntitiesByMarkedScenes = mkWatched(persist, "filterEntitiesByMarkedScenes", true)
-let scrollHandler = ScrollHandler()
 let allEntities = mkWatched(persist, "allEntities", [])
-let allScenes = mkWatched(persist, "allScenes", [])
-let allSceneIndices = mkWatched(persist, "allSceneIndices", [])
 
 let statusAnimTrigger = { lastN = null }
 local locateOnDoubleClick = false
@@ -32,18 +32,8 @@ let entitySortState = Watched({})
 // for trigger filteredEntites computed only once
 local entitySortFuncCache = null
 
-let numSelectedEntities = Computed(function() {
-  local nSel = 0
-  foreach (v in selectionState.get()) {
-    if (v)
-      ++nSel
-  }
-  return nSel
-})
-
-
-function matchEntityByText(eid, text) {
-  if (text==null || text=="" || eid.tostring().indexof(text)!=null)
+function matchEntityByText(eid, text): bool {
+  if (text==null || text=="" || eid.tostring().contains(text))
     return true
   let tplName = g_entity_mgr.getEntityTemplateName(eid)
   if (tplName==null)
@@ -61,65 +51,47 @@ let filteredEntites = Computed(function() {
   if (filterString.get() != "")
     entities = entities.filter(@(eid) matchEntityByText(eid, filterString.get()))
 
-  if (filterEntitiesByMarkedScenes.get()) {
-    if (getNumMarkedScenes() > 0) {
-      local savedMarked = markedScenes.get()?[sceneSaved.id]
-      local generatedMarked = markedScenes.get()?[sceneGenerated.id]
-      entities = entities.filter(@(eid) matchEntityByScene(eid, savedMarked, generatedMarked))
-    }
+  let markedScenes = selection.get().scenes
+  if (filterEntitiesByMarkedScenes.get() && markedScenes.len() > 0) {
+    entities = entities.filter(@(eid) matchEntityByScene(eid, markedScenes))
   }
 
-  if (entitySortFuncCache != null)
+  if (entitySortFuncCache != null) {
+    entities = entities.slice(0)
     entities.sort(entitySortFuncCache)
+  }
   return entities
 })
 
 let filteredEntitiesCount = Computed(@() filteredEntites.get().len())
 
-function applySelection(cb) {
-  selectionState.mutate(function(value) {
-    foreach (k, v in value)
-      value[k] = cb(k, v)
-  })
+let numMarkedEntities = Computed(@() markedEids.get().len())
+
+let toMarks = @(eids) eids.map(@(eid) [eid, true]).totable()
+
+let listedByText = @() allEntities.get().filter(@(eid) matchEntityByText(eid, filterString.get()))
+
+let selectAllFiltered = @() markedEids.set(toMarks(listedByText()))
+
+let selectNone = @() markedEids.set({})
+
+// invert the text matches, unmark the rest
+function selectInvert() {
+  let marked = markedEids.get()
+  markedEids.set(toMarks(listedByText().filter(@(eid) eid not in marked)))
 }
-
-// use of filteredEntites here would be more correct here, but reapplying name check should faster than
-// linear search in array (O(N) vs O(N^2))
-let selectAllFiltered = @() applySelection(@(eid, _cur) matchEntityByText(eid, filterString.get()))
-
-let selectNone = @() applySelection(@(_eid, _cur) false)
-
-// invert filtered, deselect unfiltered
-let selectInvert = @() applySelection(@(eid, cur) matchEntityByText(eid, filterString.get()) ? !cur : false)
-
-
-function scrollBySelection() {
-  scrollHandler.scrollToChildren(function(desc) {
-    return ("eid" in desc) && selectionState.get()?[desc.eid]
-  }, 2, false, true)
-}
-
 
 function doSelect() {
-  let eids = []
-  foreach (k, v in selectionState.get()) if (v) eids.append(k)
-  entity_editor?.get_instance().selectEntities(eids)
-  gui_scene.resetTimeout(0.1, function() {
-    selectedEntities.trigger()
-    selectionState.trigger()
-  })
-//  filterString.set("")
+  entity_editor?.get_instance().selectEntities(markedEids.get().keys())
 }
 
 function doLocate() {
-  let eids = []
-  foreach (k, v in selectionState.get()) if (v) eids.append(k)
-  entity_editor?.get_instance().selectEntities(eids)
+  doSelect()
   entity_editor?.get_instance().zoomAndCenter()
 }
 
 function statusLine() {
-  let nMrk = numSelectedEntities.get()
+  let nMrk = numMarkedEntities.get()
   let nSel = selectedEntities.get().len()
 
   if (statusAnimTrigger.lastN != null && statusAnimTrigger.lastN != nSel)
@@ -127,7 +99,7 @@ function statusLine() {
   statusAnimTrigger.lastN = nSel
 
   return {
-    watch = [numSelectedEntities, filteredEntitiesCount, selectedEntities]
+    watch = [numMarkedEntities, filteredEntitiesCount, selectedEntities]
     size = FLEX_H
     flow = FLOW_HORIZONTAL
     children = [
@@ -151,26 +123,7 @@ function statusLine() {
 }
 
 
-let filter = nameFilter(filterString, {
-  placeholder = "Filter by name"
-
-  function onChange(text) {
-    filterString.set(text)
-  }
-
-  function onEscape() {
-    set_kb_focus(null)
-  }
-
-  function onReturn() {
-    set_kb_focus(null)
-  }
-
-  function onClear() {
-    filterString.set("")
-    set_kb_focus(null)
-  }
-})
+let filter = mkListFilter(filterString)
 
 function doSelectEid(eid, mod) {
   let eids = []
@@ -184,24 +137,22 @@ function doSelectEid(eid, mod) {
   if (!found)
     eids.append(eid)
   entity_editor?.get_instance().selectEntities(eids)
-  gui_scene.resetTimeout(0.1, @() selectionState.trigger())
 }
 
 let removeSelectedByEditorTemplate = @(tname) tname.replace("+daeditor_selected+","+").replace("+daeditor_selected","").replace("daeditor_selected+","")
 
-let sceneInfoStyle = static { fontSize = hdpx(17), color=Color(180,180,180,120) }
+let sceneInfoStyle = const { fontSize = hdpx(17), color=Color(180,180,180,120) }
 
-function mkEntitySceneTooltip(loadType, index) {
-  if (loadType > 0 && index >= 0) {
+function mkEntitySceneTooltip(loadType, id) {
+  if (loadType > 0 && id >= 0) {
     local loadTypeText = "MAIN"
     local idSeparator = ""
     local indexText = ""
-    local loadTypeIndex = allSceneIndices.get()[loadType]
-    local sceneInfo = allScenes.get()[loadTypeIndex + index]
-    if (sceneInfo.importDepth != 0) {
+    local sceneInfo = sceneIdMap.get()?[id]
+    if (sceneInfo && sceneInfo.importDepth != 0) {
       loadTypeText = getSceneLoadTypeText(sceneInfo)
       idSeparator = ":"
-      indexText = sceneInfo.index
+      indexText = sceneInfo.id
     }
     return @() {
       rendObj = ROBJ_BOX
@@ -220,150 +171,126 @@ function mkEntitySceneTooltip(loadType, index) {
   return null
 }
 
-function listRow(eid, idx) {
-  return watchElemState(function(sf) {
-    let isSelected = selectionState.get()?[eid]
-    let textColor = isSelected ? colors.TextDefault : colors.TextDarker
-    let color = isSelected ? colors.Active
-      : sf & S_TOP_HOVER ? colors.GridRowHover
-      : colors.GridBg[idx % colors.GridBg.len()]
+// The label watches the editor selection because selecting adds a template to
+// the entity. Marked (row.isSelected) is the list's own check state.
+function mkEntityLabel(eid, row) {
+  let isMarked = row.isSelected
+  let isSelected = row.scope.Computed(@() eid in selectedEntities.get())
 
+  return function() {
     let extraName = getEntityExtraName(eid)
     let extra = (extraName != null) ? $"/ {extraName}" : ""
 
-    local tplName = g_entity_mgr.getEntityTemplateName(eid) ?? ""
+    let tplName = g_entity_mgr.getEntityTemplateName(eid) ?? ""
     let name = removeSelectedByEditorTemplate(tplName)
     let div = (tplName != name) ? "•" : "|"
 
-    local loadTypeVal = entity_editor?.get_instance().getEntityRecordLoadType(eid) ?? 0
-    local indexVal = entity_editor?.get_instance().getEntityRecordIndex(eid) ?? -1
+    let loadTypeVal = entity_editor?.get_instance().getEntityRecordLoadType(eid) ?? 0
+    let sceneId = entity_editor?.get_instance().getEntityRecordSceneId(eid) ?? -1
     local loadType = "MAIN"
     local idSeparator = ""
     local index = ""
-    if (loadTypeVal > 0 && indexVal >= 0) {
-      local loadTypeIndex = allSceneIndices.get()[loadTypeVal]
-      local scene = allScenes.get()[loadTypeIndex + indexVal]
-      if (scene.importDepth != 0) {
+    if (loadTypeVal > 0 && sceneId >= 0) {
+      let scene = sceneIdMap.get()?[sceneId]
+      if (scene != null && scene.importDepth != 0) {
         loadType = getSceneLoadTypeText(scene)
         idSeparator = ":"
-        index = scene.index
+        index = scene.id
       }
     } else {
       loadType = ""
     }
 
-    let tooltip = mkEntitySceneTooltip(loadTypeVal, indexVal)
-
     return {
-      rendObj = ROBJ_SOLID
-      size = FLEX_H
-      color
-      eid
-      behavior = Behaviors.Button
-
-      function onClick(evt) {
-        if (evt.shiftKey) {
-          local selCount = 0
-          foreach (_k, v in selectionState.get()) {
-            if (v)
-              ++selCount
-          }
-          if (selCount > 0) {
-            local idx1 = -1
-            local idx2 = -1
-            foreach (i, filteredEid in filteredEntites.get()) {
-              if (eid == filteredEid) {
-                idx1 = i
-                idx2 = i
-              }
-            }
-            foreach (i, filteredEid in filteredEntites.get()) {
-              if (selectionState.get()?[filteredEid]) {
-                if (idx1 > i)
-                  idx1 = i
-                if (idx2 < i)
-                  idx2 = i
-              }
-            }
-            if (idx1 >= 0 && idx2 >= 0) {
-              if (idx1 > idx2) {
-                let tmp = idx1
-                idx1 = idx2
-                idx2 = tmp
-              }
-              selectionState.mutate(function(value) {
-                for (local i = idx1; i <= idx2; i++) {
-                  let filteredEid = filteredEntites.get()[i]
-                  value[filteredEid] <- !evt.ctrlKey
-                }
-              })
-            }
-          }
-        }
-        else if (evt.ctrlKey) {
-          selectionState.mutate(function(value) {
-            value[eid] <- !value?[eid]
-          })
-        }
-        else {
-          applySelection(@(eid_, _cur) eid_==eid)
-        }
-      }
-
-      onDoubleClick = function(evt) {
-        if (locateOnDoubleClick) { doLocate(); return }
-        locateOnDoubleClick = true
-        gui_scene.resetTimeout(0.3, @() locateOnDoubleClick = false)
-        doSelectEid(eid, evt.ctrlKey)
-      }
-
-      onHover = tooltip != null ? @(on) setTooltip(on ? tooltip : null) : null
-
-      children = {
-        rendObj = ROBJ_TEXT
-        text = $"{eid}  {div}  {name} {extra}  {loadType}{idSeparator}{index}"
-        color = textColor
-        margin = fsh(0.5)
-      }
+      watch = [isSelected, isMarked, sceneIdMap]
+      rendObj = ROBJ_TEXT
+      text = $"{eid}  {div}  {name} {extra}  {loadType}{idSeparator}{index}"
+      color = isMarked.get() ? colors.TextDefault : colors.TextDarker
+      margin = fsh(0.5)
     }
-  })
+  }
 }
 
-function listRowMoreLeft(num, idx) {
-  return watchElemState(function(sf) {
-    let color = (sf & S_TOP_HOVER) ? colors.GridRowHover : colors.GridBg[idx % colors.GridBg.len()]
-    return {
-      rendObj = ROBJ_SOLID
-      size = FLEX_H
-      color
-      children = {
-        rendObj = ROBJ_TEXT
-        text = $"{num} more ..."
-        color = colors.TextReadOnly
-        margin = fsh(0.5)
+function setMark(marks, eid, on) {
+  if (on) {
+    marks[eid] <- true
+  }
+  else {
+    marks.$rawdelete(eid)
+  }
+}
+
+function onEntityClick(eid, evt) {
+  if (evt.shiftKey) {
+    let marked = markedEids.get()
+    let listed = filteredEntites.get()
+    let clicked = listed.indexof(eid)
+    if (marked.len() == 0 || clicked == null) {
+      return
+    }
+    local idx1 = clicked
+    local idx2 = clicked
+    foreach (i, listedEid in listed) {
+      if (listedEid in marked) {
+        idx1 = min(idx1, i)
+        idx2 = max(idx2, i)
       }
     }
-  })
+    markedEids.mutate(function(marks) {
+      foreach (listedEid in listed.slice(idx1, idx2 + 1)) {
+        setMark(marks, listedEid, !evt.ctrlKey)
+      }
+    })
+  }
+  else if (evt.ctrlKey) {
+    markedEids.mutate(@(marks) setMark(marks, eid, eid not in marks))
+  }
+  else {
+    markedEids.set({ [eid] = true })
+  }
 }
+
+function onEntityDoubleClick(eid, evt) {
+  if (locateOnDoubleClick) { doLocate(); return }
+  locateOnDoubleClick = true
+  gui_scene.resetTimeout(0.3, @() locateOnDoubleClick = false)
+  doSelectEid(eid, evt.ctrlKey)
+}
+
+function onEntityHover(eid, on) {
+  if (!on) {
+    setTooltip(null)
+    return
+  }
+  let loadType = entity_editor?.get_instance().getEntityRecordLoadType(eid) ?? 0
+  let sceneId = entity_editor?.get_instance().getEntityRecordSceneId(eid) ?? -1
+  setTooltip(mkEntitySceneTooltip(loadType, sceneId))
+}
+
+// Several rows can be marked; the list shows the first marked one on open and
+// then stays where the user scrolls it.
+let entitiesList = mkFilteredList({
+  items = filteredEntites
+  selected = markedEids
+  isSelected = @(marked, eid) eid in marked
+  revealOnSelect = false
+  revealOnItems = false
+  mkRow = mkEntityLabel
+  onClick = onEntityClick
+  onDoubleClick = onEntityDoubleClick
+  onHover = onEntityHover
+})
 
 
 function initEntitiesList() {
-  local scenes = entity_editor?.get_instance().getSceneImports() ?? []
-  allScenes.set(scenes)
-  allSceneIndices.set(getSceneIndicies(scenes))
   let entities = entity_editor?.get_instance().getEntities(selectedGroup.get()) ?? []
-  foreach (eid in entities) {
-    let isSelected = selectedEntities.get()?[eid] ?? false
-    selectionState.get()[eid] <- isSelected
-  }
+  let selected = selectedEntities.get()
+  markedEids.set(toMarks(entities.filter(@(eid) eid in selected)))
   allEntities.set(entities)
-  selectionState.trigger()
 }
 
 entitySortState.subscribe_with_nasty_disregard_of_frp_update(function(v) {
   entitySortFuncCache = v?.func
-  selectedEntities.trigger()
-  selectionState.trigger()
   initEntitiesList()
 })
 
@@ -387,7 +314,7 @@ function entitySceneFilterCheckbox() {
         rendObj = ROBJ_SOLID
         color = (hoverFlag.get() != 0) ? colors.Hover : colors.Interactive
         group
-        size = [pw(50), ph(50)]
+        size = const [pw(50), ph(50)]
         hplace = ALIGN_CENTER
         vplace = ALIGN_CENTER
       }
@@ -403,7 +330,7 @@ function entitySceneFilterCheckbox() {
 
       children = [
         {
-          size = [fontH(80), fontH(80)]
+          size = const [fontH(80), fontH(80)]
           rendObj = ROBJ_SOLID
           color = colors.ControlBg
 
@@ -431,43 +358,18 @@ function entitySceneFilterCheckbox() {
 function mkEntitySelect() {
   let templatesGroups = ["(all workset entities)"].extend(entity_editor?.get_instance().getEcsTemplatesGroups())
 
-  function listContent() {
-    const maxVisibleItems = 500
-    let rows = filteredEntites.get().slice(0, maxVisibleItems).map(@(eid, idx) listRow(eid, idx))
-    if (rows.len() < filteredEntites.get().len())
-      rows.append(listRowMoreLeft(filteredEntites.get().len() - rows.len(), rows.len()))
-
-    return {
-      watch = [selectionState, markedScenes, filteredEntites, filterEntitiesByMarkedScenes]
-      size = FLEX_H
-      flow = FLOW_VERTICAL
-      children = rows
-      behavior = Behaviors.Button
-    }
-  }
-
-
-  let scrollList = makeVertScroll(listContent, {
-    scrollHandler
-    rootBase = {
-      size = flex()
-      function onAttach() {
-        scrollBySelection()
-      }
-    }
-  })
   const WORKSET_FILTER = "workset filter"
   let closeWorkset = @() removeModalWindow(WORKSET_FILTER)
-  let mkSelectWorkSet = function(ws) {
+  function mkSelectWorkSet(ws) {
     let hovered = Watched(false)
     let group = ElemGroup()
     return @() {
       watch = [hovered, selectedGroup]
       rendObj = ROBJ_BOX
-      size = static [hdpx(300), SIZE_TO_CONTENT]
+      size = const [hdpx(300), SIZE_TO_CONTENT]
       group
       children = { rendObj = ROBJ_TEXT text = ws group, behavior = Behaviors.Marquee, scrollOnHover = true, size = FLEX_H delay = [0.1, 0.5], speed = hdpx(80)}
-      padding = static [hdpx(1), hdpx(5)]
+      padding = const [hdpx(1), hdpx(5)]
       key = ws
       borderWidth = hovered.get() ? hdpx(1) : 0
       fillColor = hovered.get()
@@ -493,12 +395,12 @@ function mkEntitySelect() {
         flow = FLOW_HORIZONTAL
         children = [
           mkSortModeButton(entitySortState)
-          static { size = [sw(0.2), SIZE_TO_CONTENT] }
+          const { size = [sw(0.2), SIZE_TO_CONTENT] }
           filter
           function() {
             //let [left, right] = partition(templatesGroups, @(_, i) i%2==0)
             return {
-              size = static [sw(11), sh(2.7)]
+              size = const [sw(11), sh(2.7)]
               watch = selectedGroup
 
               children = textButton((selectedGroup.get() ?? "")=="" ? "_unspecified_" : selectedGroup.get(), @() addModalWindow({
@@ -523,7 +425,7 @@ function mkEntitySelect() {
         size = FLEX_H
         children = entitySceneFilterCheckbox()
       }
-      { size = flex() children = scrollList }
+      entitiesList
       statusLine
       {
         flow = FLOW_HORIZONTAL
@@ -552,4 +454,5 @@ return {
   id = EntitySelectWndId
   mkContent = mkEntitySelect
   saveState=true
+  headerText = "Entity Select"
 }

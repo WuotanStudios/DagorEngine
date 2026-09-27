@@ -252,6 +252,15 @@ VULKAN_END_EXTENSION_FUCTION_PACK(GetSurfaceCapabilities2KHR);
 VULKAN_DECLARE_EXTENSION(GetSurfaceCapabilities2KHR, KHR_GET_SURFACE_CAPABILITIES_2);
 #endif
 
+#if VK_EXT_swapchain_colorspace
+
+VULKAN_BEGIN_EXTENSION_FUNCTION_PACK
+VULKAN_END_EXTENSION_FUCTION_PACK(SwapchainColorSpaceExt);
+
+VULKAN_DECLARE_EXTENSION(SwapchainColorSpaceExt, EXT_SWAPCHAIN_COLOR_SPACE);
+#endif
+
+
 // Implements vulkan core instance handling
 template <typename... Extensions>
 class VulkanInstanceCore : public Extensions...
@@ -287,7 +296,7 @@ private:
     if (extRef != listEnd)
     {
       loaded = true;
-      this->T::enumerateFunctions([this, &loaded](const char *f_name, PFN_vkVoidFunction &function) {
+      this->T::enumerateFunctions([this, &loaded](const char *f_name, PFN_vkVoidFunction &function, bool) {
         function = VULKAN_LOG_CALL_R(Globals::VK::loader.vkGetInstanceProcAddr(instance, f_name));
         if (!function)
           loaded = false;
@@ -306,7 +315,7 @@ private:
   {
     if (extensionEnabled.test(TypeIndexOf<T, ExtensionTypePack>::value))
     {
-      this->T::enumerateFunctions([](const char *, PFN_vkVoidFunction &function) { function = nullptr; });
+      this->T::enumerateFunctions([](const char *, PFN_vkVoidFunction &function, bool) { function = nullptr; });
       extensionEnabled.reset(TypeIndexOf<T, ExtensionTypePack>::value);
     }
   }
@@ -462,6 +471,10 @@ class VulkanInstance : public VulkanInstanceCore<SurfaceKHR
 #if VK_KHR_get_surface_capabilities2
                          ,
                          GetSurfaceCapabilities2KHR
+#endif
+#if VK_EXT_swapchain_colorspace
+                         ,
+                         SwapchainColorSpaceExt
 #endif
                          >
 {

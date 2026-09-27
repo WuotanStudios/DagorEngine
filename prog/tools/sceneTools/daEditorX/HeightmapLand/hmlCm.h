@@ -2,6 +2,7 @@
 #pragma once
 
 #include <oldEditor/de_cm.h>
+#include <de3_hmapDebugShadingService.h>
 #include "GPUGrassTypePID.h"
 #include "GPUGrassDecalPID.h"
 
@@ -11,17 +12,23 @@ enum
   PROPBAR_EDITOR_WTYPE = 133,
   PROPBAR_WIDTH = 280,
 
-  CM_SHOW_PANEL = CM_PLUGIN_BASE + 1,
+  CM_HEIGHTMAP_TOOLBAR_PANEL_FIRST = CM_PLUGIN_BASE + 1, // The first toolbar panel on the Landscape toolbar.
+  CM_HEIGHTMAP_TOOLBAR_PANEL_SECOND,
+  CM_SHOW_PANEL,
   CM_TOGGLE_PROPERTIES_AND_OBJECT_PROPERTIES,
   CM_CREATE_HEIGHTMAP,
   CM_ERASE_HEIGHTMAP,
   CM_IMPORT_HEIGHTMAP,
   CM_REIMPORT,
   CM_EXPORT_HEIGHTMAP,
+  CM_EXPORT_HEIGHTMAP_MAIN,
+  CM_EXPORT_HEIGHTMAP_DETAILED,
   CM_IMPORT_WATER_DET_HMAP,
   CM_IMPORT_WATER_MAIN_HMAP,
   CM_ERASE_WATER_HEIGHTMAPS,
   CM_EXPORT_COLORMAP,
+  CM_EXPORT_WATER_HEIGHTMAP_MAIN,
+  CM_EXPORT_WATER_HEIGHTMAP_DETAILED,
   CM_REBUILD,
   CM_BUILD_COLORMAP,
   CM_BUILD_LIGHTMAP,
@@ -34,7 +41,10 @@ enum
   CM_INCREASE_BRUSH_SIZE,
 
   CM_SHOW_LAND_OBJECTS,
-  CM_HIDE_SPLINES,
+  CM_TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS,
+  CM_TOGGLE_SPLINE_DEBUG_CONTROLS,
+  CM_TOGGLE_POLYGON_DEBUG_CONTROLS,
+  CM_TOGGLE_NOTE_DEBUG_CONTROLS,
   CM_SHOW_PHYSMAT,
   CM_SHOW_PHYSMAT_COLORS,
   CM_CREATE_HOLEBOX_MODE,
@@ -46,16 +56,16 @@ enum
   CM_SCRIPT,
 
   CM_CREATE_POLYGON,
-  CM_CREATE_LT,
-  CM_CREATE_SNOW_SOURCE,
 
   CM_SELECT_NONE,
+  CM_SELECT_SPLINES_AND_POLYGONS,
   CM_SELECT_SPLINES,
-  CM_SELECT_PT,
+  CM_SELECT_POLYGONS,
+  CM_SELECT_POINTS_ALL,
+  CM_SELECT_POINTS_SPLINE,
+  CM_SELECT_POINTS_POLYGON,
   CM_SELECT_ENT,
   CM_SELECT_SPL_ENT,
-  CM_SELECT_LT,
-  CM_SELECT_SNOW,
   CM_USE_PIXEL_PERFECT_SELECTION,
   CM_SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT,
 
@@ -100,7 +110,97 @@ enum
   CM_MOVE_TO_LAYER,
   CM_MOVE_TO_LAYER_FIRST,
   CM_MOVE_TO_LAYER_LAST = CM_MOVE_TO_LAYER_FIRST + 100,
+  CM_BUILD_NAVMESH,
 };
+
+namespace EditorCommandIds
+{
+
+static constexpr const char *SPLINE_REGEN = "Plugin.Landscape.SplineRegen";
+static constexpr const char *SPLINE_REGEN_CTRL = "Plugin.Landscape.SplineRegenCtrl";
+static constexpr const char *REBUILD_SPLINES_BITMASK = "Plugin.Landscape.RebuildSplinesBitmask";
+static constexpr const char *SELECT_POINTS_ALL = "Plugin.Landscape.Select.Points.All";
+static constexpr const char *SELECT_POINTS_SPLINE = "Plugin.Landscape.Select.Points.Spline";
+static constexpr const char *SELECT_POINTS_POLYGON = "Plugin.Landscape.Select.Points.Polygon";
+static constexpr const char *SELECT_SPLINES_AND_POLYGONS = "Plugin.Landscape.Select.SplinesAndPolygons";
+static constexpr const char *SELECT_SPLINES = "Plugin.Landscape.Select.Splines";
+static constexpr const char *SELECT_POLYGONS = "Plugin.Landscape.Select.Polygons";
+static constexpr const char *SELECT_ENT = "Plugin.Landscape.Select.Entities";
+static constexpr const char *SELECT_NONE = "Plugin.Landscape.Select.None";
+static constexpr const char *SELECT_SPL_ENT = "Plugin.Landscape.Select.SplinesAndEntities";
+static constexpr const char *TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS = "Plugin.Landscape.ToggleDebugControls.SplineAndPolygon";
+static constexpr const char *TOGGLE_SPLINE_DEBUG_CONTROLS = "Plugin.Landscape.ToggleDebugControls.Spline";
+static constexpr const char *TOGGLE_POLYGON_DEBUG_CONTROLS = "Plugin.Landscape.ToggleDebugControls.Polygon";
+static constexpr const char *TOGGLE_NOTE_DEBUG_CONTROLS = "Plugin.Landscape.ToggleDebugControls.Note";
+static constexpr const char *SHOW_PHYSMAT = "Plugin.Landscape.ShowPhysmat";
+static constexpr const char *SHOW_PHYSMAT_COLORS = "Plugin.Landscape.ShowPhysmatColor";
+static constexpr const char *USE_PIXEL_PERFECT_SELECTION = "Plugin.Landscape.UsePixelPerfectSelection";
+static constexpr const char *SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT = "Plugin.Landscape.SelectOnlyIfEntireObjectInRectangle";
+static constexpr const char *CREATE_ENTITY = "Plugin.Landscape.Create.Entity";
+static constexpr const char *ROTATION_NONE = "Plugin.Landscape.NoRotation";
+static constexpr const char *ROTATION_X = "Plugin.Landscape.XToNormal";
+static constexpr const char *ROTATION_Y = "Plugin.Landscape.YToNormal";
+static constexpr const char *ROTATION_Z = "Plugin.Landscape.ZToNormal";
+static constexpr const char *CREATE_SPLINE = "Plugin.Landscape.Create.Spline";
+static constexpr const char *CREATE_POLYGON = "Plugin.Landscape.Create.Polygon";
+static constexpr const char *REFINE_SPLINE = "Plugin.Landscape.RefineSpline";
+static constexpr const char *SPLIT_SPLINE = "Plugin.Landscape.SplitSpline";
+static constexpr const char *SPLIT_POLY = "Plugin.Landscape.SplitPoly";
+static constexpr const char *REVERSE_SPLINE = "Plugin.Landscape.ReverseSpline";
+static constexpr const char *CLOSE_SPLINE = "Plugin.Landscape.CloseSelectedSpline";
+static constexpr const char *OPEN_SPLINE = "Plugin.Landscape.OpenSplineAtSelectedPoint";
+static constexpr const char *MANUAL_SPLINE_REGEN_MODE = "Plugin.Landscape.UseManualObjGeomUpdateForSplinePoly";
+
+static constexpr const char *CREATE_HEIGHTMAP = "Plugin.Landscape.CreateHeightmap";
+static constexpr const char *IMPORT_HEIGHTMAP = "Plugin.Landscape.ImportHeightmap";
+static constexpr const char *ERASE_HEIGHTMAP = "Plugin.Landscape.EraseHeightmap";
+static constexpr const char *IMPORT_WATER_DET_HMAP = "Plugin.Landscape.ImportWaterDetHmap";
+static constexpr const char *IMPORT_WATER_MAIN_HMAP = "Plugin.Landscape.ImportWaterMainHmap";
+static constexpr const char *ERASE_WATER_HEIGHTMAPS = "Plugin.Landscape.EraseWaterHeightmaps";
+static constexpr const char *REIMPORT = "Plugin.Landscape.Reimport";
+static constexpr const char *RESCALE_HMAP = "Plugin.Landscape.RescaleHeightmap";
+static constexpr const char *MOVE_OBJECTS = "Plugin.Landscape.MoveObjects";
+static constexpr const char *BUILD_COLORMAP = "Plugin.Landscape.BuildColormap";
+static constexpr const char *BUILD_LIGHTMAP = "Plugin.Landscape.RebuildLighting";
+static constexpr const char *REBUILD_RIVERS = "Plugin.Landscape.RebuildRivers";
+static constexpr const char *BUILD_NAVMESH = "Plugin.Landscape.BuildNavMesh";
+static constexpr const char *EXPORT_AS_COMPOSIT = "Plugin.Landscape.ExportAsComposit";
+static constexpr const char *SPLIT_COMPOSIT = "Plugin.Landscape.SplitComposit";
+static constexpr const char *INSTANTIATE_GENOBJ_INTO_ENTITIES = "Plugin.Landscape.InstantiateGenObjectsIntoEntities";
+static constexpr const char *EXPORT_LAND_TO_GAME = "Plugin.Landscape.ExportLandToGame";
+static constexpr const char *EXPORT_HEIGHTMAP_MAIN = "Plugin.Landscape.ExportHeightmap.Main";
+static constexpr const char *EXPORT_HEIGHTMAP_DETAILED = "Plugin.Landscape.ExportHeightmap.Detailed";
+static constexpr const char *EXPORT_COLORMAP = "Plugin.Landscape.ExportColormap";
+static constexpr const char *EXPORT_WATER_HEIGHTMAP_MAIN = "Plugin.Landscape.ExportWaterHeightmap.Main";
+static constexpr const char *EXPORT_WATER_HEIGHTMAP_DETAILED = "Plugin.Landscape.ExportWaterHeightmap.Detailed";
+static constexpr const char *EXPORT_LAYERS = "Plugin.Landscape.ExportLandClassLayers";
+static constexpr const char *EXPORT_LOFT_MASKS = "Plugin.Landscape.ExportLoftMasks";
+static constexpr const char *SPLINE_IMPORT_FROM_DAG = "Plugin.Landscape.ImportFromDag";
+static constexpr const char *SPLINE_EXPORT_TO_DAG = "Plugin.Landscape.ExportToDag";
+static constexpr const char *UNIFY_OBJ_NAMES = "Plugin.Landscape.UnifyObjectNames";
+static constexpr const char *SET_PT_VIS_DIST = "Plugin.Landscape.SetSplinePointsVisibilityRange";
+static constexpr const char *AUTO_ATACH = "Plugin.Landscape.AutoAttachSplines";
+static constexpr const char *MAKE_SPLINES_CROSSES = "Plugin.Landscape.MakeCrosspointsForSplines";
+static constexpr const char *MAKE_BOTTOM_SPLINES = "Plugin.Landscape.MakeBottomSplinesForPolygons";
+
+static constexpr const char *TOGGLE_PROPERTIES_AND_OBJECT_PROPERTIES = "Plugin.Landscape.TogglePropertiesAndObjectProperties";
+
+static constexpr const char *DECREASE_BRUSH_SIZE = "Plugin.Landscape.DecreaseBrushSize";
+static constexpr const char *INCREASE_BRUSH_SIZE = "Plugin.Landscape.IncreaseBrushSize";
+static constexpr const char *COMMIT_HM_CHANGES = "Plugin.Landscape.SaveHeightmapChanges";
+static constexpr const char *RESTORE_HM_BACKUP = "Plugin.Landscape.RevertHeightmapChanges";
+static constexpr const char *HIDE_UNSELECTED_SPLINES = "Plugin.Landscape.HideUnselectedSplines";
+static constexpr const char *UNHIDE_ALL_SPLINES = "Plugin.Landscape.UnhideAllSplines";
+static constexpr const char *COLLAPSE_MODIFIERS = "Plugin.Landscape.CollapseModifiers";
+static constexpr const char *REBUILD = "Plugin.Landscape.Rebuild";
+static constexpr const char *HILL_UP = "Plugin.Landscape.HillUp";
+static constexpr const char *HILL_DOWN = "Plugin.Landscape.HillDown";
+static constexpr const char *ALIGN = "Plugin.Landscape.Align";
+static constexpr const char *SMOOTH = "Plugin.Landscape.Smooth";
+static constexpr const char *SHADOWS = "Plugin.Landscape.Shadows";
+static constexpr const char *SCRIPT = "Plugin.Landscape.Script";
+
+} // namespace EditorCommandIds
 
 // settings
 enum
@@ -153,6 +253,7 @@ enum
   NM_PARAM_TYPE,
   NM_PARAM_TILE_SZ,
   NM_PARAM_BUCKET_SZ,
+  NM_PARAM_INCLUDE_DETAILED_DATA,
   NM_PARAM_PREFAB_COLLISION,
   NM_PARAM_TRACE_STEP,
   NM_PARAM_CROSSING_WATER_DEPTH,
@@ -277,6 +378,8 @@ enum
   PID_RENDER_RADIOGROUP_HM,
   PID_RENDER_INITIAL_HM,
   PID_RENDER_FINAL_HM,
+  PID_RENDER_HM_METRICS,
+  PID_RENDER_HM_MIRROR,
   PID_RENDER_DEBUG_LINES,
   PID_RENDER_ALL_SPLINES_ALWAYS,
   PID_RENDER_SEL_SPLINES_ALWAYS,
@@ -310,9 +413,6 @@ enum
   PID_SHADOW_BIAS,
   PID_SHADOW_TRACE_DIST,
   PID_SHADOW_DENSITY,
-  PID_SHADOW_CASTERS_GRP,
-  PID_SHADOW_CASTER_FIRST,
-  PID_SHADOW_CASTER_LAST = PID_SHADOW_CASTER_FIRST + 200,
 
   PID_BOX_SIZE_X,
   PID_BOX_SIZE_Y,
@@ -345,9 +445,6 @@ enum
   PID_CANYON_FADE_ANGLE,
 
   PID_SCRIPT_PARAMS_GRP,
-  PID_SCRIPT_FILE,
-  PID_RESET_SCRIPT,
-  PID_RELOAD_SCRIPT,
   PID_GENERATE_COLORMAP,
   PID_IMPORT_SCRIPT_IMAGE,
   PID_CREATE_MASK,
@@ -394,9 +491,19 @@ enum
   PID_GRASS_HELICOPTER_TO_DIRECT_WIND_MUL,
   PID_GRASS_HELICOPTER_FALLOFF,
 
-  PID_SHOWMASK,
+  PID_DEBUG_VIEW_MODE,
+  PID_DEBUG_EXPR_EDIT,
+  PID_DEBUG_EXPR_APPLY,
   PID_ADDLAYER,
+  PID_COMMON_EXPR_EDIT,
+  PID_COMMON_EXPR_APPLY,
 
+  // Typed land variables (Float / Range / Mask / Curve). Each row gets a
+  // contiguous slice of LV_PID_PER_VAR PIDs starting at PID_LAND_VAR_PARAM_START.
+  PID_LAND_VAR_GRP,
+  PID_LAND_VAR_ADD,
+  PID_LAND_VAR_PARAM_START,
+  PID_LAST_LAND_VAR_PARAM = PID_LAND_VAR_PARAM_START + 2048,
 
   PID_HORIZONTAL_TEX_GRP,
   PID_HORIZONTAL_TEX_NAME,
@@ -483,6 +590,14 @@ enum
   PID_DEBUG_CELLS,
   PID_MONOLAND,
   PID_MONOLAND_COL,
+
+  PID_RENDERER_LANDSCAPE_DEBUG_SHADING_GROUP,
+  PID_RENDERER_LANDSCAPE_DEBUG_SHADING_MONOCHROME_GROUP,
+  PID_RENDERER_LANDSCAPE_DEBUG_SHADING_START,
+  PID_RENDERER_LANDSCAPE_DEBUG_SHADING_END =
+    PID_RENDERER_LANDSCAPE_DEBUG_SHADING_START + IHmapDebugShadingService::REQUIRED_PROPERTY_IDS,
+  PID_RENDERER_LANDSCAPE_DEBUG_SHADING_HEIGHT_LEVEL_CURVES_GROUP,
+
   PID_GROUND_OBJECTS_COL,
   PID_HTLEVELS,
   PID_HTLEVELS_STEP,
@@ -490,6 +605,7 @@ enum
   PID_HTLEVELS_THICK,
   PID_HTLEVELS_DARK,
 
+  PID_RI_MIN_CELL_SIZE,
   PID_RI_MAX_CELL_SIZE,
   PID_RI_MAX_GEN_LAYER_CELL_DIVISOR,
 

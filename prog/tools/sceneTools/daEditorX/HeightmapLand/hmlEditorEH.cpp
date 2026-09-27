@@ -8,7 +8,6 @@
 #include "hmlOutliner.h"
 #include "hmlSplineUndoRedo.h"
 #include "hmlCm.h"
-#include "common.h"
 #include "hmlEntity.h"
 #include <de3_interface.h>
 #include <de3_objEntity.h>
@@ -18,6 +17,7 @@
 #include <de3_baseInterfaces.h>
 #include <obsolete/dag_cfg.h>
 
+#include <EditorCore/ec_editorCommandSystem.h>
 #include <EditorCore/ec_IEditorCore.h>
 #include <EditorCore/ec_ObjectCreator.h>
 #include <EditorCore/ec_gridobject.h>
@@ -44,7 +44,18 @@ static Ptr<SplinePointObject> startPt = NULL, dispPt = NULL;
 static SplineObject *refSpline = NULL, *splPoly = NULL;
 static int pointsCnt = 0;
 static bool splittingPolyFirstPoint = true;
-static int splittingFirstPointId, splittingSecondPointId;
+// held between two clicks: fillet reconciliation reshuffles points[] on any rebuild in between, so an index would go stale
+static Ptr<SplinePointObject> splittingFirstPoint = nullptr;
+
+// neighbours in source points: generated ones sit between them and would make two adjacent corners look far apart
+static bool split_pts_too_close(int ord_a, int ord_b, int src_cnt)
+{
+  if (ord_a < 0 || ord_b < 0)
+    return true;
+
+  const int d = abs(ord_a - ord_b);
+  return d <= 1 || d == src_cnt - 1; // same, next or previous around the loop
+}
 
 inline bool is_creating_entity_mode(int m) { return m == CM_CREATE_ENTITY; }
 
@@ -101,22 +112,88 @@ SplineObject *HmapLandObjectEditor::findSplineAndDirection(IGenViewportWnd *wnd,
 }
 
 
+void HmapLandObjectEditor::registerEditorCommands(IEditorCommandSystem &command_system)
+{
+  ObjectEditor::registerEditorCommands(command_system);
+
+  command_system.addCommand(EditorCommandIds::SPLINE_REGEN, ImGuiKey_F1);
+  command_system.addCommand(EditorCommandIds::SPLINE_REGEN_CTRL, ImGuiMod_Ctrl | ImGuiKey_F1);
+  command_system.addCommand(EditorCommandIds::REBUILD_SPLINES_BITMASK, ImGuiKey_F2);
+  command_system.addCommand(EditorCommandIds::SELECT_POINTS_ALL, "Select only spline and polygon points", ImGuiMod_Ctrl | ImGuiKey_1);
+  command_system.addCommand(EditorCommandIds::SELECT_POINTS_SPLINE, "Select only spline points");
+  command_system.addCommand(EditorCommandIds::SELECT_POINTS_POLYGON, "Select only polygon points");
+  command_system.addCommand(EditorCommandIds::SELECT_SPLINES_AND_POLYGONS, "Select only splines and polygons",
+    ImGuiMod_Ctrl | ImGuiKey_2);
+  command_system.addCommand(EditorCommandIds::SELECT_SPLINES, "Select only splines");
+  command_system.addCommand(EditorCommandIds::SELECT_POLYGONS, "Select only polygons");
+  command_system.addCommand(EditorCommandIds::SELECT_ENT, ImGuiMod_Ctrl | ImGuiKey_3);
+  command_system.addCommand(EditorCommandIds::SELECT_NONE, ImGuiMod_Ctrl | ImGuiKey_6);
+  command_system.addCommand(EditorCommandIds::SELECT_SPL_ENT, ImGuiMod_Ctrl | ImGuiKey_7);
+  command_system.addCommand(EditorCommandIds::TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS, "Hide spline and polygon controls",
+    ImGuiMod_Ctrl | ImGuiKey_0);
+  command_system.addCommand(EditorCommandIds::TOGGLE_SPLINE_DEBUG_CONTROLS, "Hide only spline controls");
+  command_system.addCommand(EditorCommandIds::TOGGLE_POLYGON_DEBUG_CONTROLS, "Hide only polygon controls");
+  command_system.addCommand(EditorCommandIds::TOGGLE_NOTE_DEBUG_CONTROLS);
+  command_system.addCommand(EditorCommandIds::SHOW_PHYSMAT);
+  command_system.addCommand(EditorCommandIds::SHOW_PHYSMAT_COLORS);
+  command_system.addCommand(EditorCommandIds::USE_PIXEL_PERFECT_SELECTION, ImGuiMod_Ctrl | ImGuiKey_Q);
+  command_system.addCommand(EditorCommandIds::SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT);
+  command_system.addCommand(EditorCommandIds::CREATE_ENTITY);
+  command_system.addCommand(EditorCommandIds::ROTATION_NONE);
+  command_system.addCommand(EditorCommandIds::ROTATION_X);
+  command_system.addCommand(EditorCommandIds::ROTATION_Y);
+  command_system.addCommand(EditorCommandIds::ROTATION_Z);
+  command_system.addCommand(EditorCommandIds::CREATE_SPLINE);
+  command_system.addCommand(EditorCommandIds::CREATE_POLYGON);
+  command_system.addCommand(EditorCommandIds::REFINE_SPLINE);
+  command_system.addCommand(EditorCommandIds::SPLIT_SPLINE);
+  command_system.addCommand(EditorCommandIds::SPLIT_POLY);
+  command_system.addCommand(EditorCommandIds::REVERSE_SPLINE);
+  command_system.addCommand(EditorCommandIds::CLOSE_SPLINE);
+  command_system.addCommand(EditorCommandIds::OPEN_SPLINE);
+  command_system.addCommand(EditorCommandIds::MANUAL_SPLINE_REGEN_MODE);
+}
+
+
 void HmapLandObjectEditor::registerViewportAccelerators(IWndManager &wndManager)
 {
   ObjectEditor::registerViewportAccelerators(wndManager);
 
-  wndManager.addViewportAccelerator(CM_SPLINE_REGEN, ImGuiKey_F1);
-  wndManager.addViewportAccelerator(CM_SPLINE_REGEN_CTRL, ImGuiMod_Ctrl | ImGuiKey_F1);
-  wndManager.addViewportAccelerator(CM_REBUILD_SPLINES_BITMASK, ImGuiKey_F2);
-  wndManager.addViewportAccelerator(CM_SELECT_PT, ImGuiMod_Ctrl | ImGuiKey_1);
-  wndManager.addViewportAccelerator(CM_SELECT_SPLINES, ImGuiMod_Ctrl | ImGuiKey_2);
-  wndManager.addViewportAccelerator(CM_SELECT_ENT, ImGuiMod_Ctrl | ImGuiKey_3);
-  wndManager.addViewportAccelerator(CM_SELECT_LT, ImGuiMod_Ctrl | ImGuiKey_4);
-  wndManager.addViewportAccelerator(CM_SELECT_SNOW, ImGuiMod_Ctrl | ImGuiKey_5);
-  wndManager.addViewportAccelerator(CM_SELECT_NONE, ImGuiMod_Ctrl | ImGuiKey_6);
-  wndManager.addViewportAccelerator(CM_SELECT_SPL_ENT, ImGuiMod_Ctrl | ImGuiKey_7);
-  wndManager.addViewportAccelerator(CM_HIDE_SPLINES, ImGuiMod_Ctrl | ImGuiKey_0);
-  wndManager.addViewportAccelerator(CM_USE_PIXEL_PERFECT_SELECTION, ImGuiMod_Ctrl | ImGuiKey_Q);
+  wndManager.addViewportAccelerator(CM_SPLINE_REGEN, EditorCommandIds::SPLINE_REGEN);
+  wndManager.addViewportAccelerator(CM_SPLINE_REGEN_CTRL, EditorCommandIds::SPLINE_REGEN_CTRL);
+  wndManager.addViewportAccelerator(CM_REBUILD_SPLINES_BITMASK, EditorCommandIds::REBUILD_SPLINES_BITMASK);
+  wndManager.addViewportAccelerator(CM_SELECT_POINTS_ALL, EditorCommandIds::SELECT_POINTS_ALL);
+  wndManager.addViewportAccelerator(CM_SELECT_POINTS_SPLINE, EditorCommandIds::SELECT_POINTS_SPLINE);
+  wndManager.addViewportAccelerator(CM_SELECT_POINTS_POLYGON, EditorCommandIds::SELECT_POINTS_POLYGON);
+  wndManager.addViewportAccelerator(CM_SELECT_SPLINES_AND_POLYGONS, EditorCommandIds::SELECT_SPLINES_AND_POLYGONS);
+  wndManager.addViewportAccelerator(CM_SELECT_SPLINES, EditorCommandIds::SELECT_SPLINES);
+  wndManager.addViewportAccelerator(CM_SELECT_POLYGONS, EditorCommandIds::SELECT_POLYGONS);
+  wndManager.addViewportAccelerator(CM_SELECT_ENT, EditorCommandIds::SELECT_ENT);
+  wndManager.addViewportAccelerator(CM_SELECT_NONE, EditorCommandIds::SELECT_NONE);
+  wndManager.addViewportAccelerator(CM_SELECT_SPL_ENT, EditorCommandIds::SELECT_SPL_ENT);
+  wndManager.addViewportAccelerator(CM_TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS,
+    EditorCommandIds::TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS);
+  wndManager.addViewportAccelerator(CM_TOGGLE_SPLINE_DEBUG_CONTROLS, EditorCommandIds::TOGGLE_SPLINE_DEBUG_CONTROLS);
+  wndManager.addViewportAccelerator(CM_TOGGLE_POLYGON_DEBUG_CONTROLS, EditorCommandIds::TOGGLE_POLYGON_DEBUG_CONTROLS);
+  wndManager.addViewportAccelerator(CM_TOGGLE_NOTE_DEBUG_CONTROLS, EditorCommandIds::TOGGLE_NOTE_DEBUG_CONTROLS);
+  wndManager.addViewportAccelerator(CM_SHOW_PHYSMAT, EditorCommandIds::SHOW_PHYSMAT);
+  wndManager.addViewportAccelerator(CM_SHOW_PHYSMAT_COLORS, EditorCommandIds::SHOW_PHYSMAT_COLORS);
+  wndManager.addViewportAccelerator(CM_USE_PIXEL_PERFECT_SELECTION, EditorCommandIds::USE_PIXEL_PERFECT_SELECTION);
+  wndManager.addViewportAccelerator(CM_SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT, EditorCommandIds::SELECT_ONLY_IF_ENTIRE_OBJECT_IN_RECT);
+  wndManager.addViewportAccelerator(CM_CREATE_ENTITY, EditorCommandIds::CREATE_ENTITY);
+  wndManager.addViewportAccelerator(CM_ROTATION_NONE, EditorCommandIds::ROTATION_NONE);
+  wndManager.addViewportAccelerator(CM_ROTATION_X, EditorCommandIds::ROTATION_X);
+  wndManager.addViewportAccelerator(CM_ROTATION_Y, EditorCommandIds::ROTATION_Y);
+  wndManager.addViewportAccelerator(CM_ROTATION_Z, EditorCommandIds::ROTATION_Z);
+  wndManager.addViewportAccelerator(CM_CREATE_SPLINE, EditorCommandIds::CREATE_SPLINE);
+  wndManager.addViewportAccelerator(CM_CREATE_POLYGON, EditorCommandIds::CREATE_POLYGON);
+  wndManager.addViewportAccelerator(CM_REFINE_SPLINE, EditorCommandIds::REFINE_SPLINE);
+  wndManager.addViewportAccelerator(CM_SPLIT_SPLINE, EditorCommandIds::SPLIT_SPLINE);
+  wndManager.addViewportAccelerator(CM_SPLIT_POLY, EditorCommandIds::SPLIT_POLY);
+  wndManager.addViewportAccelerator(CM_REVERSE_SPLINE, EditorCommandIds::REVERSE_SPLINE);
+  wndManager.addViewportAccelerator(CM_CLOSE_SPLINE, EditorCommandIds::CLOSE_SPLINE);
+  wndManager.addViewportAccelerator(CM_OPEN_SPLINE, EditorCommandIds::OPEN_SPLINE);
+  wndManager.addViewportAccelerator(CM_MANUAL_SPLINE_REGEN_MODE, EditorCommandIds::MANUAL_SPLINE_REGEN_MODE);
 }
 
 
@@ -125,11 +202,49 @@ bool HmapLandObjectEditor::handleMouseMove(IGenViewportWnd *wnd, int x, int y, b
   if (objCreator)
     return objCreator->handleMouseMove(wnd, x, y, inside, buttons, key_modif, false);
 
+  lastMouseX = x;
+  lastMouseY = y;
+
   if (inside)
   {
     Point3 pos;
     if (getEditMode() == CM_CREATE_SPLINE || getEditMode() == CM_CREATE_POLYGON)
     {
+      if (shapeCenterPlaced)
+      {
+        if (curPt && findTargetPos(wnd, x, y, pos, dagInput->isShiftKeyDown()))
+        {
+          if (DAGORED2->getGrid().getMoveSnap())
+            pos = DAGORED2->snapToGrid(pos);
+          curPt->setPos(pos);
+          curPt->visible = true;
+          if (dagInput->isCtrlKeyDown())
+            for (int i = 0; i < splines.size(); i++)
+            {
+              bool snapped = false;
+              for (int j = 0; j < splines[i]->points.size(); j++)
+              {
+                real ddist = screenDistBetweenPoints(wnd, curPt, splines[i]->points[j]);
+                if (ddist <= 9 && ddist > 0)
+                {
+                  pos = splines[i]->points[j]->getPos();
+                  curPt->setPos(pos);
+                  snapped = true;
+                  break;
+                }
+              }
+              if (snapped)
+                break;
+            }
+          Point2 delta(pos.x - shapeCenter.x, pos.z - shapeCenter.z);
+          shapeRadius = length(delta);
+          shapeRotation = atan2f(-delta.x, delta.y);
+          wnd->invalidateCache();
+        }
+        updateShapeToast(x, y);
+        return true;
+      }
+
       const bool placeOnRiCollision = dagInput->isShiftKeyDown();
       if (curPt && findTargetPos(wnd, x, y, pos, placeOnRiCollision))
       {
@@ -175,8 +290,13 @@ bool HmapLandObjectEditor::handleMouseMove(IGenViewportWnd *wnd, int x, int y, b
         if (!splines[i]->points.size() || splines[i]->isPoly() || splines[i]->isClosed())
           continue;
 
+        if (isObjectLocked(*splines[i]))
+          continue;
+
         for (int j = 0; j < splines[i]->points.size(); j++)
         {
+          if (splines[i]->points[j]->isFilletGen) // split() refuses these, so do not offer them
+            continue;
           if (splines[i]->points[j]->arrId <= 0 || splines[i]->points[j]->arrId + 1 >= splines[i]->points.size())
             continue;
 
@@ -206,7 +326,7 @@ bool HmapLandObjectEditor::handleMouseMove(IGenViewportWnd *wnd, int x, int y, b
       bool is = false;
       for (int i = 0; i < splines.size(); i++)
       {
-        if (EditLayerProps::layerProps[splines[i]->getEditLayerIdx()].lock)
+        if (isObjectLocked(*splines[i]))
           continue;
 
         Point3 p;
@@ -245,29 +365,18 @@ bool HmapLandObjectEditor::handleMouseMove(IGenViewportWnd *wnd, int x, int y, b
         if (!splines[i]->points.size() || !splines[i]->isPoly())
           continue;
 
-        for (int j = 0; j < splines[i]->points.size(); j++)
+        if (isObjectLocked(*splines[i]))
+          continue;
+
+        if (SplinePointObject *cand = splitPolyCandidate(*splines[i], wnd, x, y))
         {
-          if (!splittingPolyFirstPoint)
-          {
-            int nextIdx = (splittingFirstPointId + 1) % splines[i]->points.size();
-            int prevIdx = (splittingFirstPointId == 0 ? splines[i]->points.size() - 1 : splittingFirstPointId - 1);
-            if (j == splittingFirstPointId || j == nextIdx || j == prevIdx)
-              continue;
-          }
-
-          real dist = screenDistBetweenCursorAndPoint(wnd, x, y, splines[i]->points[j]);
-          if (dist > 0 && dist <= 20)
-          {
-            Point3 p = splines[i]->points[j]->getPt();
-            curPt->visible = true;
-            splPoly = splines[i];
-            curPt->setPos(p);
-            if (!splittingPolyFirstPoint && debugP2)
-              *debugP2 = p;
-            is = true;
-
-            break;
-          }
+          Point3 p = cand->getPt();
+          curPt->visible = true;
+          splPoly = splines[i];
+          curPt->setPos(p);
+          if (!splittingPolyFirstPoint && debugP2)
+            *debugP2 = p;
+          is = true;
         }
 
         if (is)
@@ -364,6 +473,60 @@ bool HmapLandObjectEditor::usesRendinstPlacement() const
   return true;
 }
 
+// a first pick that outlived its mode would leave the mode waiting for a second point the user has forgotten,
+// or for one that no longer exists once the picked point is deleted
+void HmapLandObjectEditor::stopPolySplitting()
+{
+  splittingPolyFirstPoint = true;
+  splittingFirstPoint = nullptr;
+  del_it(debugP1);
+  del_it(debugP2);
+}
+
+SplinePointObject *HmapLandObjectEditor::splitPolyCandidate(SplineObject &poly, IGenViewportWnd *wnd, int x, int y)
+{
+  // the cut runs inside one polygon, so once the first point is picked only its own polygon can offer the second one
+  if (!splittingPolyFirstPoint && (!splittingFirstPoint || splittingFirstPoint->spline != &poly))
+    return nullptr;
+
+  const int firstOrd = splittingPolyFirstPoint ? -1 : poly.sourcePointOrdinal(splittingFirstPoint);
+  const int srcCnt = firstOrd < 0 ? 0 : poly.sourcePointCount();
+
+  int ord = -1;
+  for (int j = 0; j < poly.points.size(); j++)
+  {
+    if (poly.points[j]->isFilletGen)
+      continue; // derived points cannot be split at
+    ord++;
+    if (firstOrd >= 0 && split_pts_too_close(firstOrd, ord, srcCnt))
+      continue;
+
+    real dist = screenDistBetweenCursorAndPoint(wnd, x, y, poly.points[j]);
+    if (dist > 0 && dist <= 20)
+      return poly.points[j];
+  }
+  return nullptr;
+}
+
+void HmapLandObjectEditor::dropHoverState()
+{
+  if (curPt)
+    curPt->visible = false;
+  refSpline = splPoly = NULL;
+  if (debugP1 && debugP2)
+    *debugP2 = *debugP1; // the rubber line collapses until the next mouse move gives it an end again
+}
+
+void HmapLandObjectEditor::stopPolySplittingIfPickGone()
+{
+  if (splittingPolyFirstPoint)
+    return;
+  if (splittingFirstPoint && splittingFirstPoint->spline && splittingFirstPoint->spline->sourcePointOrdinal(splittingFirstPoint) >= 0)
+    return;
+
+  stopPolySplitting();
+}
+
 bool HmapLandObjectEditor::handleMouseLBPress(IGenViewportWnd *wnd, int x, int y, bool inside, int buttons, int key_modif)
 {
   if (objCreator)
@@ -375,6 +538,28 @@ bool HmapLandObjectEditor::handleMouseLBPress(IGenViewportWnd *wnd, int x, int y
 
     if (getEditMode() == CM_CREATE_SPLINE || getEditMode() == CM_CREATE_POLYGON)
     {
+      if (shapeCenterPlaced)
+        return true;
+
+      if (!startPt && dagInput->isAltKeyDown())
+      {
+        Point3 pos;
+        if (!findTargetPos(wnd, x, y, pos, dagInput->isShiftKeyDown()))
+          return true;
+        if (DAGORED2->getGrid().getMoveSnap())
+          pos = DAGORED2->snapToGrid(pos);
+        if (dagInput->isCtrlKeyDown() && curPt)
+          pos = curPt->getPos();
+        curPt->setPos(pos);
+        curPt->visible = true;
+        shapeCenter = pos;
+        shapeCenterPlaced = true;
+        shapeReadyToConfirm = false;
+        wnd->invalidateCache();
+        updateShapeToast(x, y);
+        return true;
+      }
+
       Ptr<SplinePointObject> newPt = new SplinePointObject;
       bool needReverse = false, wasResumed = false;
       ;
@@ -418,7 +603,7 @@ bool HmapLandObjectEditor::handleMouseLBPress(IGenViewportWnd *wnd, int x, int y
 
         if (curSpline)
         {
-          getUndoSystem()->begin();
+          getUndoSystem()->begin(true);
 
           if (needReverse)
           {
@@ -428,7 +613,7 @@ bool HmapLandObjectEditor::handleMouseLBPress(IGenViewportWnd *wnd, int x, int y
             spls.resize(1);
             spls[0] = curSpline;
 
-            getUndoSystem()->put(new UndoReverse(spls));
+            getUndoSystem()->put<UndoReverse>(spls);
           }
 
           if (!curSplineAsset.empty())
@@ -468,15 +653,20 @@ bool HmapLandObjectEditor::handleMouseLBPress(IGenViewportWnd *wnd, int x, int y
                 spls.resize(1);
                 spls[0] = att;
 
-                getUndoSystem()->put(new UndoReverse(spls));
+                getUndoSystem()->put<UndoReverse>(spls);
               }
 
               pointsCnt += att->points.size();
-              int pt_idx = curSpline->points.size() - 2;
-              att->attachTo(curSpline, curSpline->points.size() - 1);
+              // attachTo strips derived points, and points[] holds the only reference to them:
+              // walk back to a source point, which survives the strip and is the one the smoothing window needs anyway
+              int catmulIdx = curSpline->points.size() - 2;
+              while (catmulIdx > 0 && curSpline->points[catmulIdx]->isFilletGen)
+                catmulIdx--;
+              SplinePointObject *catmulPt = curSpline->points[catmulIdx];
+              att->attachTo(curSpline, SplineObject::ATTACH_BEFORE_LAST);
 
               memset(catmul, 0, sizeof(catmul));
-              prepareCatmul(curSpline->points[pt_idx], curPt);
+              prepareCatmul(catmulPt, curPt);
 
               curSpline->pointChanged(-1);
               curSpline->getSpline();
@@ -557,56 +747,47 @@ bool HmapLandObjectEditor::handleMouseLBPress(IGenViewportWnd *wnd, int x, int y
     }
     else if (getEditMode() == CM_REFINE_SPLINE)
     {
-      if (curPt->visible && refSpline && !EditLayerProps::layerProps[refSpline->getEditLayerIdx()].lock)
+      if (curPt->visible && refSpline && !isObjectLocked(*refSpline))
       {
         real refT;
         int segId;
         Point3 p;
         refSpline->getPosOnSpline(wnd, x, y, 4, &segId, &refT, &p);
 
-        refSpline->refine(segId, refT, p);
+        // baking the fillet of the segment can reshape points[] and skip the insert; the corner is real knots now,
+        // so the same click lands on the rebuilt curve
+        if (!refSpline->refine(segId, refT, p))
+          if (refSpline->getPosOnSpline(wnd, x, y, 4, &segId, &refT, &p))
+            refSpline->refine(segId, refT, p);
       }
     }
     else if (getEditMode() == CM_SPLIT_POLY)
     {
       if (curPt->visible && splPoly)
       {
-        for (int j = 0; j < splPoly->points.size(); j++)
+        // the same rule that offered the point under the cursor
+        if (SplinePointObject *cand = splitPolyCandidate(*splPoly, wnd, x, y))
         {
-          real dist = screenDistBetweenCursorAndPoint(wnd, x, y, splPoly->points[j]);
-          if (dist > 0 && dist <= 20)
+          if (splittingPolyFirstPoint)
           {
-            if (splittingPolyFirstPoint)
-            {
-              splittingPolyFirstPoint = false;
+            splittingPolyFirstPoint = false;
 
-              debugP1 = new Point3;
-              debugP2 = new Point3;
+            debugP1 = new Point3;
+            debugP2 = new Point3;
 
-              splittingFirstPointId = j;
+            splittingFirstPoint = cand;
+            *debugP1 = *debugP2 = cand->getPt();
+          }
+          else
+          {
+            splPoly->splitOnTwoPolys(splittingFirstPoint->arrId, cand->arrId);
 
-              *debugP1 = splPoly->points[splittingFirstPointId]->getPt();
-              *debugP2 = splPoly->points[splittingFirstPointId]->getPt();
-            }
-            else
-            {
-              splittingSecondPointId = j;
+            splittingPolyFirstPoint = true;
+            splittingFirstPoint = nullptr;
+            setEditMode(CM_OBJED_MODE_SELECT);
 
-              int nextIdx = (j + 1) % splPoly->points.size();
-              int prevIdx = (j == 0 ? splPoly->points.size() - 1 : j - 1);
-
-              if (splittingFirstPointId != splittingSecondPointId && splittingFirstPointId != nextIdx &&
-                  splittingFirstPointId != prevIdx)
-              {
-                splPoly->splitOnTwoPolys(splittingFirstPointId, splittingSecondPointId);
-
-                splittingPolyFirstPoint = true;
-                setEditMode(CM_OBJED_MODE_SELECT);
-
-                del_it(debugP1);
-                del_it(debugP2);
-              }
-            }
+            del_it(debugP1);
+            del_it(debugP2);
           }
         }
       }
@@ -625,6 +806,12 @@ bool HmapLandObjectEditor::stopSplineCreation()
 {
   if (getEditMode() != CM_CREATE_SPLINE && getEditMode() != CM_CREATE_POLYGON)
     return false;
+
+  shapeCenterPlaced = false;
+  shapeReadyToConfirm = false;
+  shapeRadius = 0.f;
+  shapeRotation = 0.f;
+  IEditorCoreEngine::get()->setShowMessageAt(0, 0, SimpleString());
 
   if (pointsCnt > 0)
   {
@@ -661,6 +848,18 @@ bool HmapLandObjectEditor::stopSplineCreation()
   return true;
 }
 
+bool HmapLandObjectEditor::handleMouseWheel(IGenViewportWnd *wnd, int wheel_d, int x, int y, int key_modif)
+{
+  if (shapeCenterPlaced)
+  {
+    shapeSegments = clamp(shapeSegments + (wheel_d > 0 ? 1 : -1), 3, 32);
+    wnd->invalidateCache();
+    updateShapeToast(x, y);
+    return true;
+  }
+  return ObjectEditor::handleMouseWheel(wnd, wheel_d, x, y, key_modif);
+}
+
 bool HmapLandObjectEditor::handleMouseRBPress(IGenViewportWnd *wnd, int x, int y, bool inside, int buttons, int key_modif)
 {
   if (objCreator)
@@ -694,6 +893,7 @@ bool HmapLandObjectEditor::handleMouseRBPress(IGenViewportWnd *wnd, int x, int y
     if (!splittingPolyFirstPoint)
     {
       splittingPolyFirstPoint = true;
+      splittingFirstPoint = nullptr;
       setEditMode(CM_OBJED_MODE_SELECT);
     }
   }
@@ -718,9 +918,32 @@ bool HmapLandObjectEditor::handleMouseLBRelease(IGenViewportWnd *wnd, int x, int
   if (inside && wnd->isActive())
     wnd->invalidateCache();
 
+  if (shapeCenterPlaced)
+  {
+    if (!shapeReadyToConfirm)
+    {
+      shapeReadyToConfirm = true;
+    }
+    else if (shapeRadius > 0.01f)
+    {
+      createRegularShape(shapeCenter, shapeRadius, getEditMode() == CM_CREATE_POLYGON);
+      shapeCenterPlaced = false;
+      shapeReadyToConfirm = false;
+      shapeRadius = 0.f;
+      shapeRotation = 0.f;
+      IEditorCoreEngine::get()->setShowMessageAt(0, 0, SimpleString());
+      setEditMode(CM_OBJED_MODE_SELECT);
+    }
+    else
+    {
+      updateShapeToast(x, y);
+    }
+    return true;
+  }
+
   bool needResetRenderer = false;
 
-  if (objectWasMoved || objectWasRotated || objectWasScaled)
+  if (SplineObject::objectWasMoved || SplineObject::objectWasRotated || SplineObject::objectWasScaled)
   {
     Tab<SplineObject *> transfSplines(tmpmem);
     Tab<SplinePointObject *> transfPoints(tmpmem);
@@ -741,7 +964,7 @@ bool HmapLandObjectEditor::handleMouseLBRelease(IGenViewportWnd *wnd, int x, int
         if (!is)
           transfSplines.push_back(s);
       }
-      else if (objectWasMoved)
+      else if (SplineObject::objectWasMoved)
       {
         SplinePointObject *p = RTTI_cast<SplinePointObject>(selection[i]);
 
@@ -761,7 +984,7 @@ bool HmapLandObjectEditor::handleMouseLBRelease(IGenViewportWnd *wnd, int x, int
       }
 
       HmapLandHoleObject *ho = RTTI_cast<HmapLandHoleObject>(selection[i]);
-      if (ho && objectWasScaled)
+      if (ho && SplineObject::objectWasScaled)
         needResetRenderer = true;
     }
 
@@ -811,7 +1034,7 @@ bool HmapLandObjectEditor::handleMouseLBRelease(IGenViewportWnd *wnd, int x, int
       transfSplines[i]->pointChanged(-1);
   }
 
-  objectWasMoved = objectWasRotated = objectWasScaled = false;
+  SplineObject::objectWasMoved = SplineObject::objectWasRotated = SplineObject::objectWasScaled = false;
 
   return ObjectEditor::handleMouseLBRelease(wnd, x, y, inside, buttons, key_modif);
 }
@@ -844,10 +1067,16 @@ void HmapLandObjectEditor::onClick(int pcb_id, PropPanel::ContainerPropertyContr
       updateToolbarButtons();
       DAGORED2->repaint();
       break;
-    case CM_HIDE_SPLINES:
-      hideSplines = !hideSplines;
+    case CM_TOGGLE_SPLINE_AND_POLYGON_DEBUG_CONTROLS:
+    case CM_TOGGLE_SPLINE_DEBUG_CONTROLS:
+    case CM_TOGGLE_POLYGON_DEBUG_CONTROLS:
+      hideSplinesAndPolygonsMode = hideSplinesAndPolygonsMode == pcb_id ? -1 : pcb_id;
       updateToolbarButtons();
       DAGORED2->repaint();
+      break;
+    case CM_TOGGLE_NOTE_DEBUG_CONTROLS:
+      hideNotes = !hideNotes;
+      updateToolbarButtons();
       break;
     case CM_SHOW_PHYSMAT:
       showPhysMat = !showPhysMat;
@@ -862,9 +1091,7 @@ void HmapLandObjectEditor::onClick(int pcb_id, PropPanel::ContainerPropertyContr
     case CM_SHADOWS:
     case CM_SCRIPT: HmapLandPlugin::self->onPluginMenuClick(pcb_id); break;
 
-    case CM_CREATE_HOLEBOX_MODE:
-    case CM_CREATE_LT:
-    case CM_CREATE_SNOW_SOURCE: setEditMode(pcb_id); break;
+    case CM_CREATE_HOLEBOX_MODE: setEditMode(pcb_id); break;
 
     case CM_CREATE_ENTITY:
       setEditMode(pcb_id);
@@ -881,7 +1108,10 @@ void HmapLandObjectEditor::onClick(int pcb_id, PropPanel::ContainerPropertyContr
     case CM_ROTATION_NONE:
     case CM_ROTATION_X:
     case CM_ROTATION_Y:
-    case CM_ROTATION_Z: selectedPlacementRotation = buttonIdToPlacementRotation(pcb_id); break;
+    case CM_ROTATION_Z:
+      selectedPlacementRotation = buttonIdToPlacementRotation(pcb_id);
+      updateToolbarButtons();
+      break;
 
     case CM_CREATE_SPLINE:
     case CM_CREATE_POLYGON:
@@ -971,7 +1201,7 @@ void HmapLandObjectEditor::onClick(int pcb_id, PropPanel::ContainerPropertyContr
       for (int i = 0; i < spl.size(); i++)
         spl[i]->reverse();
 
-      getUndoSystem()->put(new UndoReverse(spl));
+      getUndoSystem()->put<UndoReverse>(spl);
       getUndoSystem()->accept("Reverse spline(s)");
     }
     break;
@@ -1073,12 +1303,14 @@ void HmapLandObjectEditor::onClick(int pcb_id, PropPanel::ContainerPropertyContr
 
     case CM_SELECT_NONE: setSelectMode(-1); return;
 
-    case CM_SELECT_PT:
+    case CM_SELECT_POINTS_ALL:
+    case CM_SELECT_POINTS_SPLINE:
+    case CM_SELECT_POINTS_POLYGON:
+    case CM_SELECT_SPLINES_AND_POLYGONS:
     case CM_SELECT_SPLINES:
+    case CM_SELECT_POLYGONS:
     case CM_SELECT_ENT:
     case CM_SELECT_SPL_ENT:
-    case CM_SELECT_LT:
-    case CM_SELECT_SNOW:
       setEditMode(CM_OBJED_MODE_SELECT);
       setSelectMode(selectMode == pcb_id ? -1 : pcb_id);
       return;
@@ -1465,7 +1697,7 @@ void HmapLandObjectEditor::autoAttachSplines()
             Tab<SplineObject *> spls(tmpmem);
             spls.resize(1);
             spls[0] = splines[i];
-            getUndoSystem()->put(new UndoReverse(spls));
+            getUndoSystem()->put<UndoReverse>(spls);
 
             removeObject(splines[i]->points[splines[i]->points.size() - 1]);
             splines[j]->attachTo(splines[i]);
@@ -1480,7 +1712,7 @@ void HmapLandObjectEditor::autoAttachSplines()
               Tab<SplineObject *> spls(tmpmem);
               spls.resize(1);
               spls[0] = splines[j];
-              getUndoSystem()->put(new UndoReverse(spls));
+              getUndoSystem()->put<UndoReverse>(spls);
 
               removeObject(splines[i]->points[splines[i]->points.size() - 1]);
               splines[j]->attachTo(splines[i]);
@@ -1534,11 +1766,11 @@ void HmapLandObjectEditor::makeBottomSplines()
     double tolerance = panel->getFloat(3);
 
     getUndoSystem()->begin();
+    Tab<Point3> pts(tmpmem), poly_pts(tmpmem);
     for (int j = 0; j < poly.size(); j++)
     {
-      Tab<Point3> pts(tmpmem);
-      poly[j]->buildInnerSpline(pts, border_w, bottom_y, tolerance);
-      if (pts.size())
+      poly[j]->getSmoothPoly(poly_pts);
+      if (HmapLandPlugin::splSrv->buildInnerSpline(pts, poly_pts, border_w, bottom_y, tolerance))
       {
         SplineObject *so = new SplineObject(false);
         so->setEditLayerIdx(EditLayerProps::activeLayerIdx[so->lpIndex()]);
@@ -1568,6 +1800,23 @@ void HmapLandObjectEditor::makeBottomSplines()
   updateToolbarButtons();
 }
 
+void HmapLandObjectEditor::setNewObjInteractiveMove(bool on)
+{
+  if (newObj.get())
+    newObj->setInteractiveMove(on);
+}
+
+// The sample outlives create mode, so every exit has to stop it from following the mouse. This is the
+// one place all of them go through; newObj itself is released on only one of those paths.
+void HmapLandObjectEditor::setCreateBySampleMode(RenderableEditableObject *sample_)
+{
+  if (!sample_)
+    setNewObjInteractiveMove(false);
+  ObjectEditor::setCreateBySampleMode(sample_);
+  if (sample_ && sample_ == newObj.get())
+    setNewObjInteractiveMove(true);
+}
+
 void HmapLandObjectEditor::selectNewObjEntity(const char *name)
 {
   if (!newObj.get())
@@ -1595,7 +1844,10 @@ void HmapLandObjectEditor::selectNewObjEntity(const char *name)
     newObj->getEntity()->setSubtype(IObjEntity::ST_NOT_COLLIDABLE);
 
   if (!name && !is_creating_entity_mode(getEditMode()))
+  {
+    setNewObjInteractiveMove(false);
     newObj = NULL;
+  }
 }
 
 void HmapLandObjectEditor::createObjectBySample(RenderableEditableObject *sample)
@@ -1624,6 +1876,7 @@ void HmapLandObjectEditor::createObjectBySample(RenderableEditableObject *sample
   no->setProps(o->getProps());
   no->setSavedPlacementNormal(sample->getSavedPlacementNormal());
   no->setWtm(tm);
+  no->generatePinnedPerInstSeed();
   getUndoSystem()->begin();
   addObject(no);
   unselectAll();
@@ -1671,6 +1924,8 @@ void HmapLandObjectEditor::onObjectEntityNameChanged(RenderableEditableObject &o
 {
   if (outlinerWindow)
     outlinerWindow->onObjectAssetNameChanged(object);
+
+  invalidateObjectProps();
 }
 
 void HmapLandObjectEditor::onObjectEditLayerChanged(RenderableEditableObject &object)
@@ -1687,10 +1942,6 @@ void HmapLandObjectEditor::showOutlinerWindow(bool show)
   if (!outlinerWindow)
   {
     outlinerWindow.reset(DAEDITOR3.createOutlinerWindow());
-
-    G_ASSERT(!outlinerInterface);
-    outlinerInterface.reset(new HeightmapLandOutlinerInterface(*this));
-
     outlinerWindow->setTreeInterface(outlinerInterface.get());
     outlinerWindow->fillTypesAndLayers();
     outlinerWindow->loadOutlinerSettings(outlinerSettings);

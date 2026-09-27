@@ -18,25 +18,6 @@ struct OrientAnnotation : das::ManagedStructureAnnotation<gamephys::Orient, fals
   }
 };
 
-struct LocalOrientAnnotation : das::ManagedStructureAnnotation<gamephys::SimpleLoc::LocalOrient, false>
-{
-  LocalOrientAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("LocalOrient", ml)
-  {
-    cppName = " ::gamephys::SimpleLoc::LocalOrient";
-    addField<DAS_BIND_MANAGED_FIELD(quat)>("quat");
-  }
-};
-
-struct SimpleLocAnnotation : das::ManagedStructureAnnotation<gamephys::SimpleLoc, false>
-{
-  SimpleLocAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("SimpleLoc", ml)
-  {
-    cppName = " ::gamephys::SimpleLoc";
-    addField<DAS_BIND_MANAGED_FIELD(P)>("P");
-    addField<DAS_BIND_MANAGED_FIELD(O)>("O");
-  }
-};
-
 struct LocAnnotation : das::ManagedStructureAnnotation<gamephys::Loc, false>
 {
   LocAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("Loc", ml)
@@ -133,6 +114,28 @@ struct VolumetricDamageDataAnnotation : das::ManagedStructureAnnotation<gamephys
   }
 };
 
+struct FuelTankPropsAnnotation : das::ManagedStructureAnnotation<gamephys::FuelTankProps, false>
+{
+  FuelTankPropsAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("FuelTankProps", ml)
+  {
+    cppName = " ::gamephys::FuelTankProps";
+    addField<DAS_BIND_MANAGED_FIELD(capacity)>("capacity");
+    addField<DAS_BIND_MANAGED_FIELD(fuelSystemNum)>("fuelSystemNum");
+    addField<DAS_BIND_MANAGED_FIELD(priority)>("priority");
+    addField<DAS_BIND_MANAGED_FIELD(external)>("external");
+  }
+};
+
+struct FuelTankStateAnnotation : das::ManagedStructureAnnotation<gamephys::FuelTankState, false>
+{
+  FuelTankStateAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("FuelTankState", ml)
+  {
+    cppName = " ::gamephys::FuelTankState";
+    addField<DAS_BIND_MANAGED_FIELD(currentFuel)>("currentFuel");
+    addField<DAS_BIND_MANAGED_FIELD(available)>("available");
+  }
+};
+
 struct ECSCustomPhysStateSyncerDataAnnotation : das::ManagedStructureAnnotation<ECSCustomPhysStateSyncer, false>
 {
   ECSCustomPhysStateSyncerDataAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("ECSCustomPhysStateSyncer", ml)
@@ -152,20 +155,20 @@ public:
     addBuiltinDependency(lib, require("math"));
     addBuiltinDependency(lib, require("DagorMath"));
 
-    addEnumeration(das::make_smart<EnumerationDamageReason>());
+    addEnumeration(new EnumerationDamageReason());
 
-    addAnnotation(das::make_smart<LocalOrientAnnotation>(lib));
-    addAnnotation(das::make_smart<SimpleLocAnnotation>(lib));
-    addAnnotation(das::make_smart<OrientAnnotation>(lib));
-    addAnnotation(das::make_smart<LocAnnotation>(lib));
-    addAnnotation(das::make_smart<CommonPhysPartialStateAnnotation>(lib));
-    addAnnotation(das::make_smart<GamePhysMassPropsAnnotation>(lib));
-    addAnnotation(das::make_smart<GamePhysMassStateAnnotation>(lib));
-    addAnnotation(das::make_smart<GamePhysMassAnnotation>(lib));
-    addAnnotation(das::make_smart<FloatingVolumeAnnotation>(lib));
-    addAnnotation(das::make_smart<VolumetricDamageDataAnnotation>(lib));
+    addAnnotation(new OrientAnnotation(lib));
+    addAnnotation(new LocAnnotation(lib));
+    addAnnotation(new CommonPhysPartialStateAnnotation(lib));
+    addAnnotation(new GamePhysMassPropsAnnotation(lib));
+    addAnnotation(new GamePhysMassStateAnnotation(lib));
+    addAnnotation(new GamePhysMassAnnotation(lib));
+    addAnnotation(new FloatingVolumeAnnotation(lib));
+    addAnnotation(new VolumetricDamageDataAnnotation(lib));
+    addAnnotation(new FuelTankPropsAnnotation(lib));
+    addAnnotation(new FuelTankStateAnnotation(lib));
 
-    addAnnotation(das::make_smart<ECSCustomPhysStateSyncerDataAnnotation>(lib));
+    addAnnotation(new ECSCustomPhysStateSyncerDataAnnotation(lib));
 
     das::addExtern<DAS_BIND_FUN(gamephys::atmosphere::g)>(*this, lib, "gravity", das::SideEffects::accessExternal,
       "gamephys::atmosphere::g");
@@ -180,6 +183,8 @@ public:
       ->arg("height");
     das::addExtern<DAS_BIND_FUN(gamephys::atmosphere::sonicSpeed)>(*this, lib, "atmosphere_sonicSpeed",
       das::SideEffects::accessExternal, "gamephys::atmosphere::sonicSpeed");
+    das::addExtern<DAS_BIND_FUN(gamephys::atmosphere::pressure)>(*this, lib, "pressure", das::SideEffects::accessExternal,
+      "gamephys::atmosphere::pressure");
     das::addExtern<DAS_BIND_FUN(orient_setYP0)>(*this, lib, "orient_setYP0", das::SideEffects::modifyArgument,
       "bind_dascript::orient_setYP0");
     das::addExtern<DAS_BIND_FUN(orient_transformInv)>(*this, lib, "orient_transformInv", das::SideEffects::modifyArgument,
@@ -188,12 +193,6 @@ public:
       "bind_dascript::location_toTM");
     das::addExtern<DAS_BIND_FUN(location_makeTM), das::SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "location_makeTM",
       das::SideEffects::none, "bind_dascript::location_makeTM");
-    das::addExtern<DAS_BIND_FUN(make_empty_SimpleLoc), das::SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "SimpleLoc",
-      das::SideEffects::none, "bind_dascript::make_empty_SimpleLoc");
-
-    using method_gamephysSimpleLocFromTM = DAS_CALL_MEMBER(gamephys::SimpleLoc::fromTM);
-    das::addExtern<DAS_CALL_METHOD(method_gamephysSimpleLocFromTM)>(*this, lib, "fromTM", das::SideEffects::modifyArgument,
-      DAS_CALL_MEMBER_CPP(gamephys::SimpleLoc::fromTM));
 
     using method_gamephysOrientSetQuat = DAS_CALL_MEMBER(gamephys::Orient::setQuat);
     das::addExtern<DAS_CALL_METHOD(method_gamephysOrientSetQuat)>(*this, lib, "orient_setQuat", das::SideEffects::modifyArgument,
@@ -235,7 +234,7 @@ public:
       using method_init = DAS_CALL_MEMBER(ECSCustomPhysStateSyncer::init);
       das::addExtern<DAS_CALL_METHOD(method_init)>(*this, lib, "init", das::SideEffects::modifyArgument,
         DAS_CALL_MEMBER_CPP(ECSCustomPhysStateSyncer::init))
-        ->arg_init(/*resv*/ 1, das::make_smart<das::ExprConstInt>(0));
+        ->arg_init(/*resv*/ 2, new das::ExprConstInt(0));
 
       using method_registerSyncComponentFloat = das::das_call_member<void (ECSCustomPhysStateSyncer::*)(const char *, float &),
         &ECSCustomPhysStateSyncer::registerSyncComponent>;
@@ -258,6 +257,12 @@ public:
         "das::das_call_member< void (ECSCustomPhysStateSyncer::*)(const char*, bool&), "
         "&ECSCustomPhysStateSyncer::registerSyncComponent >::invoke");
     }
+
+    das::addExtern<DAS_BIND_FUN(massProps_getFuelTankProps), das::SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "getFuelTankProps",
+      das::SideEffects::none, "bind_dascript::massProps_getFuelTankProps");
+
+    das::addExtern<DAS_BIND_FUN(massState_getFuelTankState), das::SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "getFuelTankState",
+      das::SideEffects::none, "bind_dascript::massState_getFuelTankState");
 
     das::addConstant(*this, "MAIN_FUEL_SYSTEM", (int)gamephys::FuelTankProps::MAIN_SYSTEM);
     das::addConstant(*this, "MAX_FUEL_SYSTEMS", (int)gamephys::FuelTankProps::MAX_SYSTEMS);

@@ -2,7 +2,6 @@
 
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_interop.h"
-#include "daScript/ast/ast_typefactory_bind.h"
 #include "daScript/src/builtin/module_builtin_rtti.h"
 #include "daScript/ast/ast_handle.h"
 
@@ -22,6 +21,8 @@ static mutex lock;
 static das_hash_map<uint64_t, Context*> bindedFunctions;
 static das_hash_map<uint64_t, string> bindedFunctionNames;
 static das_hash_map</* module name */string, vector<SqFuncDesc>> bindedFunctionDescs;
+// environment passed to register_bound_funcs; bound calls may come from threads without one
+static daScriptEnvironment *bindedEnvironment = nullptr;
 
 void sqdas_bind_func( Context &ctx, uint64_t fnHash, const char * name, const char * moduleName, int paramsNum, const char * paramsCheck) {
     lock_guard<mutex> guard(lock);
@@ -52,6 +53,17 @@ SQInteger call_binded_func(HSQUIRRELVM vm) {
     }
 
     lock_guard<mutex> guard(lock);
+    daScriptEnvironmentGuard envGuard(bindedEnvironment ? bindedEnvironment : daScriptEnvironment::getBound(),
+                                      daScriptEnvironment::getOwned());
+    daScriptEnvironment *env = daScriptEnvironment::getBound();
+    if (!env) {
+        return sq_throwerror(vm, string(string::CtorSprintf{},
+                    "Unable to call function '%s', no daScript environment on this thread",
+                    bindedFunctionNames[funcHash].c_str()).c_str());
+    }
+    bool gResolve = env->g_resolve_annotations;
+    env->g_resolve_annotations = false;
+
     vec4f args[1];
     args[0] = cast<HSQUIRRELVM>::from(vm);
     vec4f res{};
@@ -63,17 +75,20 @@ SQInteger call_binded_func(HSQUIRRELVM vm) {
     } else {
         res = ctx->evalWithCatch(simFn, args);
     }
-    if (auto exp = ctx->getException()) {
+    const char *expCstr = ctx->getException();
+    const bool hasException = expCstr != nullptr;
+    das::string exp = expCstr ? expCstr : "";
+    if (hasException && !ctx->alwaysStackWalkOnException)
         ctx->stackWalk(&ctx->exceptionAt, true, true);
-        ctx->unlock();
-        return sq_throwerror(vm, exp);
-    }
     ctx->unlock();
-    return cast<SQInteger>::to(res);
+    env->g_resolve_annotations = gResolve;
+    return hasException ? sq_throwerror(vm, exp.c_str()) : cast<SQInteger>::to(res);
 }
 
-void register_bound_funcs(HSQUIRRELVM vm, function<void(const char *module_name, HSQOBJECT tab)> cb) {
+void register_bound_funcs(HSQUIRRELVM vm, daScriptEnvironment *environment, function<void(const char *module_name, HSQOBJECT tab)> cb) {
     lock_guard<mutex> guard(lock);
+    DAS_ASSERTF(environment != nullptr, "register_bound_funcs: environment is null, called before daScript environment is ready?");
+    bindedEnvironment = environment;
     for (auto &modules : bindedFunctionDescs)
     {
         HSQOBJECT obj;

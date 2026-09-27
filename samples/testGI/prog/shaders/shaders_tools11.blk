@@ -28,8 +28,9 @@ Compile
 {
   fsh:t = 5.0
   assume_static {
+    normal_repacking_needed:i = 0
     use_hw_rt_gi:i=0
-    supports_sh_6_1:i = 0
+    supports_barycentrics:i = 0
     in_editor_assume:i=1
     dynamic_lights_count:i=0
     shore_waves_on:i= 0
@@ -44,7 +45,6 @@ Compile
     hero_ao:i = 0
     num_of_cascades:i=4
     compatibility_mode:i = 0
-    mobile_render:i=0
     render_inline_raytracing:i = 0
     use_postfx:i = 1
     use_extended_global_frame_block:i=0
@@ -65,7 +65,6 @@ explicit_var_ref
   ref:t = impostor_normal_mip
   ref:t = fom_shadows_cos
   ref:t = fom_shadows_sin
-  ref:t = random_pattern_tex
   ref:t = downsampled_far_depth_tex
   ref:t = lowres_fx_source_tex
   ref:t = cables_buf

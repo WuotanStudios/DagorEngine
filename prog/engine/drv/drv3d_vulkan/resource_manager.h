@@ -1,6 +1,10 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <atomic>
+#include <generic/dag_objectPool.h>
+#include <perfMon/dag_daProfileMemory.h>
+
 #include "driver.h"
 #include "device_memory.h"
 #include "device_resource.h"
@@ -11,15 +15,11 @@
 #include "sampler_resource.h"
 #include "render_pass_resource.h"
 #include "memory_heap_resource.h"
-#include <atomic>
-#include <generic/dag_objectPool.h>
 #include "physical_device_set.h"
 #include "buffer_resource.h"
 
 namespace drv3d_vulkan
 {
-
-class ExecutionContext;
 
 enum class AllocationMethodName
 {
@@ -69,6 +69,14 @@ struct ResourceMemory
   AllocationMethodName allocator;
   uint32_t memType;
   VkDeviceSize originalSize;
+#if DAGOR_DBGLEVEL > 0
+  da_profiler::profile_mem_data_t profilerData;
+  void profilerOnAllocation();
+  void profilerOnFree();
+#else
+  void profilerOnAllocation() {}
+  void profilerOnFree() {}
+#endif
 
   bool isValid() const { return handle != 0; }
   void invalidate() { handle = 0; }
@@ -459,6 +467,7 @@ class ResourceManager
 
   bool allowMixedPages;
   bool allowBufferSuballoc;
+  bool allowBufferSuballocOnTempRings;
   bool allowAligmentTailOverlap;
   AllocationMethodPriorityList getAllocationMethods(const AllocationDesc &desc);
 
@@ -470,6 +479,7 @@ class ResourceManager
   Tab<ResourceMemoryId> hotMemPools[hotMemPoolCount];
   uint32_t hotMemPushIdx;
   uint32_t hotMemClearIdx();
+  void clearHotMem();
   void processHotMem();
   void shutdownMemory(ResourceMemoryId memory_id);
   ResourceMemoryId allocFromHotMem(const AllocationDesc &desc, const AllocationMethodPriorityList &prio);
@@ -496,8 +506,15 @@ class ResourceManager
 #endif
   } resPools;
 
+#if DAGOR_DBGLEVEL > 0
+  uint32_t allocsCounter;
+  void incrementAllocsCounter() { ++allocsCounter; }
+#else
+  void incrementAllocsCounter() {}
+#endif
+
 public:
-  bool evictResourcesFor(ExecutionContext &ctx, VkDeviceSize desired_size, bool evict_used);
+  bool evictResourcesFor(VkDeviceSize desired_size, bool evict_used);
   void processPendingEvictions();
 
   //////////
@@ -528,6 +545,7 @@ public:
   template <typename ResType>
   ResType *alloc(const typename ResType::Description desc, bool manage = true)
   {
+    incrementAllocsCounter();
     ResType *ret = resPool<ResType>().allocate(desc, manage);
     ResourceAlgorithm<ResType> alg(*ret);
     if (alg.create() != ResourceAlgorithm<ResType>::CreateResult::OK)
@@ -560,6 +578,12 @@ public:
   {
     return resPool<ResType>().size();
   }
+
+#if DAGOR_DBGLEVEL > 0
+  uint32_t getAllocationsCounter() { return allocsCounter; }
+#else
+  uint32_t getAllocationsCounter() { return 0; }
+#endif
 
   void onBackFrameEnd();
 

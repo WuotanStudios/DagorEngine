@@ -1,7 +1,13 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <daECS/core/coreEvents.h>
-#include <ecs/core/entitySystem.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/ecsQuery.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/entityComponent.h>
 #include <generic/dag_enumerate.h>
 #include <gui/dag_imgui.h>
 #include <imgui.h>
@@ -12,6 +18,10 @@ namespace dagdp
 
 void GlobalManager::imgui()
 {
+  if (ImGui::SliderFloat("Global density multiplier", &globalDensityMul, MIN_GLOBAL_DENSITY_MUL, 1.0f))
+    invalidateViews(); // consumed at view build time
+
+
   // Just after invalidation, these will not match.
   if (debug.builders.size() != views.size())
     return;
@@ -41,10 +51,10 @@ void GlobalManager::imgui()
     ImGui::BulletText("Reserved for dynamic instances: (~%.1f MiB)", reservedDynamicMiB);
     ImGui::Unindent();
 
-    const float availableDynamicMiB = reservedDynamicMiB * DYNAMIC_THRESHOLD_MULTIPLIER;
-    const uint32_t availableDynamicInstances = rulesBuilder.maxObjects * DYNAMIC_THRESHOLD_MULTIPLIER;
-    ImGui::BulletText("Available dynamic memory budget: (~%.1f MiB). Debug threshold: (%d %%)", availableDynamicMiB,
-      static_cast<int>(100 * DYNAMIC_THRESHOLD_MULTIPLIER));
+    const float availableDynamicMiB = reservedDynamicMiB * DYNAMIC_GROW_THRESHOLD;
+    const uint32_t availableDynamicInstances = rulesBuilder.maxObjects * DYNAMIC_GROW_THRESHOLD;
+    ImGui::BulletText("Available dynamic memory budget: (~%.1f MiB). Grow threshold: (%d %%)", availableDynamicMiB,
+      static_cast<int>(100 * DYNAMIC_GROW_THRESHOLD));
 
     ImGui::BulletText("Used dynamic memory budget: ");
     eastl::string progressBarText({}, "%.1f%% (%.1f MiB / %.1f MiB)",
@@ -80,11 +90,12 @@ void GlobalManager::imgui()
 }
 
 template <typename Callable>
-static inline void global_manager_debug_imgui_ecs_query(Callable);
+static inline void global_manager_debug_imgui_ecs_query(ecs::EntityManager &manager, Callable);
 
 static void imgui_callback()
 {
-  global_manager_debug_imgui_ecs_query([](dagdp::GlobalManager &dagdp__global_manager) { dagdp__global_manager.imgui(); });
+  global_manager_debug_imgui_ecs_query(*g_entity_mgr,
+    [](dagdp::GlobalManager &dagdp__global_manager) { dagdp__global_manager.imgui(); });
 }
 
 } // namespace dagdp

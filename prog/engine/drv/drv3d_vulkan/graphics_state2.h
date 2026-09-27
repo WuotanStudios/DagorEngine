@@ -33,6 +33,7 @@ struct FrontGraphicsStateStorage
   StateFieldStageResourceBinds<STAGE_VS> bindsVS;
   StateFieldGraphicsViewport viewport;
   StateFieldGraphicsQueryState queryState;
+  StateFieldGraphicsShadingRate shadingRate;
   FrontRenderPassState renderpass;
   FrontFramebufferState framebuffer;
 
@@ -64,8 +65,10 @@ struct BackGraphicsStateStorage
   StateFieldRenderPassResource nativeRenderPass;
   StateFieldGraphicsQueryScopeOpener queryOpener;
   StateFieldGraphicsRenderPassArea renderPassArea;
+  StateFieldGraphicsShadingRate shadingRate;
 
   BackDynamicGraphicsState dynamic;
+  BackExtDynamicGraphicsState extDynamic;
 
   void reset() {}
   void dumpLog() const { debug("BackGraphicsStateStorage end"); }
@@ -79,7 +82,8 @@ class FrontGraphicsState
       StateFieldGraphicsBlendConstantFactor, StateFieldGraphicsDepthBounds, StateFieldGraphicsScissorRect,
       StateFieldGraphicsInputLayoutOverride, StateFieldGraphicsRenderState, StateFieldGraphicsConditionalRenderingState,
       StateFieldGraphicsQueryState, StateFieldGraphicsStencilRefOverride, StateFieldGraphicsVertexBuffers,
-      StateFieldGraphicsIndexBuffer, StateFieldStageResourceBinds<STAGE_PS>, StateFieldStageResourceBinds<STAGE_VS>>
+      StateFieldGraphicsIndexBuffer, StateFieldGraphicsShadingRate, StateFieldStageResourceBinds<STAGE_PS>,
+      StateFieldStageResourceBinds<STAGE_VS>>
 {
 public:
   VULKAN_TRACKED_STATE_DEFAULT_NESTED_FIELD_CB();
@@ -93,8 +97,8 @@ class BackGraphicsState
       StateFieldGraphicsConditionalRenderingScopeOpener,
 
       StateFieldGraphicsPrimitiveTopology, StateFieldGraphicsDynamicRenderStateIndex, BackDynamicGraphicsState,
-      StateFieldGraphicsPipeline, StateFieldGraphicsDepthBounds, StateFieldGraphicsBlendConstantFactor, StateFieldGraphicsIndexBuffer,
-      StateFieldGraphicsVertexBuffersBindArray>
+      BackExtDynamicGraphicsState, StateFieldGraphicsPipeline, StateFieldGraphicsDepthBounds, StateFieldGraphicsBlendConstantFactor,
+      StateFieldGraphicsIndexBuffer, StateFieldGraphicsVertexBuffersBindArray, StateFieldGraphicsShadingRate>
 {
 public:
   template <typename T>

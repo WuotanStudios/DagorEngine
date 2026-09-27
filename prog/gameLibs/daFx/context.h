@@ -20,7 +20,6 @@
 
 namespace dafx
 {
-
 struct SamplerHandles
 {
   float mipBias = invalidMipBias;
@@ -46,7 +45,8 @@ struct AsyncPrepareJob final : public cpujobs::IJob
   ContextId cid;
   float dt = 0.f;
   bool gpu_fetch = false;
-  const char *getJobName(bool &) const override { return "dafx_prepare"; }
+  bool clear_debug_lods = false;
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("dafx_prepare"); }
   void doJob() override;
 };
 
@@ -56,7 +56,7 @@ struct AsyncCpuComputeJob final : public cpujobs::IJob
   bool emission = false;
   int depth = 0;
   int threadId = 0;
-  const char *getJobName(bool &) const override { return "dafx_cpu_compute_tasks"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("dafx_cpu_compute_tasks"); }
   void doJob() override;
 };
 
@@ -66,7 +66,7 @@ struct AsyncStartNextComputeBatchJob final : public cpujobs::IJob
   int depth;
   bool emission;
   cpujobs::IJob *prepare(ContextId cid_, int depth_, bool emi);
-  const char *getJobName(bool &) const override { return "AsyncStartNextComputeBatchJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("AsyncStartNextComputeBatchJob"); }
   void doJob() override;
 };
 
@@ -75,7 +75,14 @@ struct AsyncCpuCullJob final : public cpujobs::IJob
   ContextId cid;
   int start = 0;
   int count = 0;
-  const char *getJobName(bool &) const override { return "AsyncCpuCullJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("AsyncCpuCullJob"); }
+  void doJob() override;
+};
+
+struct AsyncCpuDefragJob final : public cpujobs::IJob
+{
+  ContextId cid;
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("AsyncCpuDefragJob"); }
   void doJob() override;
 };
 
@@ -92,24 +99,83 @@ struct AsyncStats
 };
 
 using WorkersByDepth = eastl::array<eastl::vector<int>, Config::max_system_depth>;
+
+struct Workers
+{
+  WorkersByDepth cpuEmissionWorkers{};
+  WorkersByDepth gpuEmissionWorkers{};
+  WorkersByDepth cpuSimulationWorkers{};
+  WorkersByDepth gpuSimulationWorkers{};
+  eastl::vector<int> allRenderWorkers{};
+  eastl::array<eastl::vector<int>, Config::max_render_tags> cpuRenderWorkers{};
+  eastl::vector<int> gpuTransferWorkers{};
+  eastl::vector<int> allEmissionWorkers{};
+  eastl::vector<int> cullingCpuWorkers{};
+  eastl::vector<int> cullingGpuWorkers{};
+
+  void clear()
+  {
+    for (int i = 0; i < Config::max_system_depth; ++i)
+    {
+      cpuEmissionWorkers[i].clear();
+      gpuEmissionWorkers[i].clear();
+      cpuSimulationWorkers[i].clear();
+      gpuSimulationWorkers[i].clear();
+    }
+    allRenderWorkers.clear();
+    for (int i = 0; i < Config::max_render_tags; ++i)
+      cpuRenderWorkers[i].clear();
+    gpuTransferWorkers.clear();
+    allEmissionWorkers.clear();
+    cullingCpuWorkers.clear();
+    cullingGpuWorkers.clear();
+  }
+};
+
+struct WorkerStats
+{
+  eastl::array<int, Config::max_simulation_lods> cpuElemTotalSimLods{};
+  eastl::array<int, Config::max_simulation_lods> gpuElemTotalSimLods{};
+  int cpuEmissionWorkers = 0;
+  int cpuSimulationWorkers = 0;
+  int allRenderWorkers = 0;
+  int activeInstances = 0;
+  int renderInstances = 0;
+  int genVisibilityLod = 0;
+
+  // @TODO: are these supposed to be reported as well? Were not in orig code.
+  // int gpuEmissionWorkers;
+  // int gpuSimulationWorkers;
+
+  void clear()
+  {
+#if DAFX_STAT
+    memset(this, 0, sizeof(*this));
+#endif
+  }
+};
+
 struct Context
 {
   Config cfg;
+  Config pendingCfg;
   Stats stats;
   AsyncStats asyncStats;
+  dag::Vector<bool> statParticlesCounted;
   dag::Vector<SystemUsageStat> systemUsageStats;
-  uint32_t debugFlags;
+  uint32_t debugFlags = 0;
 
   Binds binds;
   Shaders shaders;
   GlobalData globalData;
+  uint32_t lastUploadedGlobalDataFrame = 0;
   GenerationReferencedData<RefDataId, RefData> refDatas;
   eastl::fixed_vector<SamplerHandles, 4, true> samplersCache;
 
   Culling culling;
   StagingRing staging;
   eastl::array<RenderBuffer, Config::max_render_tags> renderBuffers;
-  uint32_t beforeRenderUpdatedTags;
+  uint32_t beforeRenderUpdatedTags = 0;
 
   VDECL instancingVdecl;
   serial_buffer::SerialBufferCounter serialBuf;
@@ -118,7 +184,7 @@ struct Context
 
   static constexpr int multiDrawBufferRingSize = 3;
   eastl::vector<UniqueBuf> multidrawBufers[multiDrawBufferRingSize];
-  eastl::vector<GpuResourcePtr> renderDispatchBuffers;
+  eastl::vector<RenderDispatchBuffer> renderDispatchBuffers;
   eastl::vector<GpuResourcePtr> computeDispatchBuffers;
   int currentRenderDispatchBuffer = 0;
   int currentMutltidrawBuffer = 0;
@@ -128,6 +194,11 @@ struct Context
   Systems systems;
   Instances instances;
   CullingStates cullingStates;
+
+  eastl::vector<Workers> workersPrepByThreads;
+  eastl::vector<WorkerStats> workersPrepStatsByThreads;
+  Workers warmupWorkers{};
+  WorkerStats warmupWorkerStats{};
 
   WorkersByDepth cpuEmissionWorkers;
   WorkersByDepth gpuEmissionWorkers;
@@ -146,35 +217,46 @@ struct Context
   CommandQueue commandQueue;
   CommandQueue commandQueueNext;
 
+  eastl::vector<CommandQueue::InstanceWarmup> instanceWarmupRequests;
+  eastl::vector<CommandQueue::InstanceWarmup> instanceWarmupScheduled;
+
   AsyncPrepareJob asyncPrepareJob;
   AsyncStartNextComputeBatchJob startNextComputeBatchJob;
   dag::RelocatableFixedVector<AsyncCpuComputeJob, 10> asyncCpuComputeJobs;
   dag::RelocatableFixedVector<AsyncCpuCullJob, 10> asyncCpuCullJobs;
 
+  AsyncCpuDefragJob asyncCpuDefragJob;
+  int nextPageToDefrag = 0;
+
   dag::Vector<bool> activeQueryContainer;
   SimLodGenParams simLodGenParams;
 
   volatile int asyncCounter = -1;
+  volatile unsigned allAsyncCpuJobsDone = 0; // 0|1
+  void asyncCpuJobsCompleted();
 
   unsigned int currentFrame = 0;
   int renderBufferMaxUsage = 0;
   bool updateInProgress = false;
   bool simulationIsPaused = false;
   bool app_was_inactive = false;
+  bool use32BitIndex = false;
 
   int systemDataVarId = -1;
   int renderCallsVarId = -1;
+  int renderCallsCountVarId = -1;
   int computeDispatchVarId = -1;
-  int updateGpuCullingVarId = -1;
+  int reducedRenderVarId = -1;
+  int sbufferSupportedVarId = -1;
   bool supportsNoOverwrite = true;
   volatile int maxTextureSlotsAllocated = 0;
 
   FrameBoundaryBufferManager frameBoundaryBufferManager;
 
   os_spinlock_t queueLock;
+  os_spinlock_t configLock;
 
   Context() = default;
-  ~Context() = default;
   Context(Context &&) = default;
   Context(const Context &) = delete;
   Context &operator=(const Context &) = delete;

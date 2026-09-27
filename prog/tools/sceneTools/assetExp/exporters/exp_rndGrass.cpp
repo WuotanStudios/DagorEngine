@@ -2,9 +2,11 @@
 
 #include <assets/assetExporter.h>
 #include <assets/assetRefs.h>
+#include <assets/assetRefsCache.h>
 #include <assets/asset.h>
 #include <libTools/util/makeBindump.h>
 #include <libTools/shaderResBuilder/rendInstResSrc.h>
+#include <libTools/shaderResBuilder/validateUv.h>
 #include <libTools/util/prepareBillboardMesh.h>
 #include <gameRes/dag_stdGameRes.h>
 #include "fatalHandler.h"
@@ -12,7 +14,6 @@
 #include <stdlib.h>
 
 static const char *TYPE = "rndGrass";
-extern bool shadermeshbuilder_strip_d3dres;
 
 BEGIN_DABUILD_PLUGIN_NAMESPACE(rndGrass)
 
@@ -70,6 +71,13 @@ public:
   bool __stdcall exportAsset(DagorAsset &a, mkbindump::BinDumpSaveCB &cwr, ILogWriter &log) override
   {
     ShaderMeshData::reset_channel_cvt_errors();
+    UvValidationSettings uvs;
+    uvs.loadValidationSettings(*appBlkCopy.getBlockByNameEx("assets")
+                                  ->getBlockByNameEx("build")
+                                  ->getBlockByNameEx("rndGrass")
+                                  ->getBlockByNameEx("validateUVs"));
+    ScopedUvValidation uvScope(uvs.validate);
+    ShaderMeshData::reset_uv_range_errors();
     AutoContext auto_ctx(a, log);
     String sn;
 
@@ -151,6 +159,22 @@ public:
         ShaderMeshData::get_channel_cvt_errors(), crit_cvt_err);
 
     ShaderMeshData::reset_channel_cvt_errors();
+
+    int uvErr = ShaderMeshData::get_uv_range_error_count();
+    if (uvErr)
+    {
+      log.addMessage(uvs.warnOnly ? ILogWriter::WARNING : ILogWriter::ERROR,
+        "%s: %d UV verts enormous/non-finite (worst |uv|=%g), clamped to [0,1] at build. "
+        "Fix the source mesh texcoords! Affected nodes:",
+        a.getName(), uvErr, ShaderMeshData::get_uv_range_max_abs());
+      for (const ShaderMeshData::UvRangeError &e : ShaderMeshData::get_uv_range_errors())
+        log.addMessage(uvs.warnOnly ? ILogWriter::WARNING : ILogWriter::ERROR,
+          "  lod%d node '%s', tc channel %d: %d verts (worst |uv|=%g)", e.lod, e.node.c_str(), e.channel, e.count, e.maxAbs);
+    }
+    ShaderMeshData::reset_uv_range_errors();
+    if (uvErr && !uvs.warnOnly)
+      return false;
+
     if (crit_cvt_err)
     {
       log.addMessage(ILogWriter::FATAL, "%s: %d critical channel conversion errors", a.getName(), crit_cvt_err);
@@ -167,26 +191,41 @@ public:
 
   const char *__stdcall getAssetType() const override { return TYPE; }
 
-  void __stdcall onRegister() override {}
-  void __stdcall onUnregister() override {}
+  void __stdcall onRegister() override
+  {
+    G_ASSERT(!refsCache);
+    refsCache = AssetRefsCache::createCache(getAssetType(), RndGrassGameResClassId, appBlkCopy);
+  }
+
+  void __stdcall onUnregister() override { refsCache.reset(); }
 
   void __stdcall getAssetRefs(DagorAsset &a, Tab<Ref> &refs) override
   {
-    int nid = a.props.getNameId("lod"), id = 0;
-    const char *basePath = a.getFolderPath();
-    String fn, sn;
-
-    refs.clear();
+    // NOTE: increase ASSET_REFERENCES_CACHE_FILE_VERSION if the asset reference gathering logic changes.
 
     setup_tex_subst(a.props);
-    for (int i = 0; DataBlock *blk = a.props.getBlock(i); i++)
-      if (blk->getBlockNameId() == nid)
-      {
-        sn.printf(260, "%s.lod%02d.dag", a.props.getStr("lod_fn_prefix", a.getName()), id++);
-        fn.printf(260, "%s/%s", basePath, blk->getStr("fname", sn));
-        add_dag_texture_and_proxymat_refs(fn, refs, a);
-      }
+
+    Tab<SimpleString> lodDags(tmpmem);
+    gather_model_lod_dags(a, lodDags);
+
+    if (!refsCache || !refsCache->get(a, lodDags, {}, refs))
+    {
+      refs.clear();
+
+      bool parsedOk = true;
+      for (const SimpleString &fn : lodDags)
+        if (!add_dag_texture_and_proxymat_refs(fn, refs, a))
+          parsedOk = false;
+
+      if (refsCache)
+        refsCache->put(a, lodDags, {}, refs, parsedOk);
+    }
+
+    reset_tex_subst();
   }
+
+private:
+  eastl::unique_ptr<AssetRefsCache> refsCache;
 };
 
 END_DABUILD_PLUGIN_NAMESPACE(rndGrass)

@@ -35,6 +35,8 @@ void debug_log_tvos(const char *);
 #endif
 #endif
 
+extern const unsigned MAX_LOG_FILE_SIZE = (64 << 20) - 16384;
+
 bool debug_internal::append_files = false;
 int debug_internal::append_files_stage = 0;
 
@@ -91,7 +93,13 @@ static CryptLog cryptLog;
 void crypt_debug_setup(const unsigned char *nkey, unsigned)
 {
   if (nkey && *nkey)
+  {
     memcpy(cryptLog.key.data(), nkey, cryptLog.key.size());
+#if _TARGET_IOS | _TARGET_TVOS
+    // on iOS the console handle is the log file itself
+    set_debug_console_crypted(true);
+#endif
+  }
 }
 
 static void crypt_out_str(unsigned char *buf, size_t sz)
@@ -125,20 +133,10 @@ int uncrypt_out_str(unsigned char *buf, size_t sz, int key_offset)
 int uncrypt_out_str(unsigned char *, size_t, int) { return 0; }
 #endif
 
-#if _TARGET_IOS | _TARGET_TVOS | _TARGET_ANDROID
-extern char ios_global_log_fname[];
-static FILE *ios_global_fp = NULL;
-#elif _TARGET_XBOX
+#if _TARGET_XBOX
 static FILE *xbox_debug_file = NULL;
 static bool file_was_created_this_launch = false;
 #endif
-
-#define PFUN(fmt, ...)                                                                 \
-  do                                                                                   \
-  {                                                                                    \
-    snprintf(buf + buf_used_len, sizeof(vlog_buf) - buf_used_len, fmt, ##__VA_ARGS__); \
-    buf_used_len += (int)strlen(buf + buf_used_len);                                   \
-  } while (0)
 
 #define LOG_TAIL_BUF (_TARGET_XBOX || _TARGET_C1 || _TARGET_C2 || _TARGET_ANDROID || _TARGET_IOS)
 
@@ -158,7 +156,7 @@ void debug_set_thread_name(const char *persistent_thread_name_ptr)
 #endif
 }
 
-static thread_local char vlog_buf[8 << 10];
+static thread_local debug_internal::PrintBuffer<> lineBuf;
 
 #if LOG_TAIL_BUF
 #include <util/dag_ringBuf.h>
@@ -347,7 +345,6 @@ static void log_write(char *data, size_t len)
   if (xbox_debug_file)
   {
     fwrite(data, 1, len, xbox_debug_file);
-    fflush(xbox_debug_file);
   }
   out_debug_str(data); // There is no XR-008 anymore.
 
@@ -355,21 +352,11 @@ static void log_write(char *data, size_t len)
 #if _TARGET_SIMD_NEON
   if (is_debug_console_ios_file_output() && get_debug_console_handle() != invalid_console_handle)
   {
-    if (!ios_global_fp && ios_global_log_fname[0])
+    intptr_t fp = get_debug_console_handle();
+    if (fp && fp != invalid_console_handle)
     {
-      ios_global_fp = fopen(ios_global_log_fname, "wt");
-      out_debug_str_fmt("Creating log file: %s", ios_global_log_fname);
-      if (!ios_global_fp)
-      {
-        out_debug_str("failed to create log file");
-        ios_global_log_fname[0] = 0;
-        set_debug_console_handle(invalid_console_handle);
-      }
-    }
-    if (ios_global_fp)
-    {
-      fwrite(data, 1, len, ios_global_fp);
-      fflush(ios_global_fp);
+      fwrite(data, 1, len, (FILE *)fp);
+      fflush((FILE *)fp);
     }
   }
   if (is_enabled_copy_debug_to_ios_console())
@@ -411,8 +398,6 @@ void debug_internal::vlog(int tag, const char *format, const void *arg, int anum
 {
   if (!logimpl_ctors_inited)
     return;
-  char *buf = vlog_buf;
-  int buf_used_len = (int)strlen(buf);
 
 #if !DAGOR_FORCE_LOGS || DAGOR_DBGLEVEL > 0 || FORCE_THREAD_IDS
   if (!dbg_tid_enabled || (&dbg_ctx)->threadId)
@@ -422,7 +407,10 @@ void debug_internal::vlog(int tag, const char *format, const void *arg, int anum
   else
   {
     (&dbg_ctx)->threadId = interlocked_increment(next_thread_id);
-    PFUN("---$%02X %s ---\n", (&dbg_ctx)->threadId - 1, (&dbg_ctx)->threadName);
+#if DAGOR_HOSTED_INTERNAL_SERVER
+    lineBuf.sprintf("%s", "{HIS} ");
+#endif
+    lineBuf.sprintf("---$%02X %s ---\n", (&dbg_ctx)->threadId - 1, (&dbg_ctx)->threadName);
   }
 #endif
 
@@ -437,61 +425,56 @@ void debug_internal::vlog(int tag, const char *format, const void *arg, int anum
 #endif
   bool addSlashN = !(&dbg_ctx)->holdLine;
   bool new_debug_line = !(&dbg_ctx)->nextSameLine;
+#if DAGOR_HOSTED_INTERNAL_SERVER
+  lineBuf.sprintf("%s", "{HIS} ");
+#endif
   if (thread_id > 0)
   {
     if ((&dbg_ctx)->file)
     {
       if (debug_internal::timestampEnabled)
-        PFUN("%d.%02d $%02X . %s,%d: ", t / 1000, (t % 1000) / 10, thread_id, (&dbg_ctx)->file, (&dbg_ctx)->line);
+        lineBuf.sprintf("%d.%02d $%02X . %s,%d: ", t / 1000, (t % 1000) / 10, thread_id, (&dbg_ctx)->file, (&dbg_ctx)->line);
       else
-        PFUN("$%02X %s,%d: ", thread_id, (&dbg_ctx)->file, (&dbg_ctx)->line);
+        lineBuf.sprintf("$%02X %s,%d: ", thread_id, (&dbg_ctx)->file, (&dbg_ctx)->line);
       (&dbg_ctx)->reset();
     }
     else if (new_debug_line && debug_internal::timestampEnabled)
-      PFUN("%d.%02d $%02X ", t / 1000, (t % 1000) / 10, thread_id);
+      lineBuf.sprintf("%d.%02d $%02X ", t / 1000, (t % 1000) / 10, thread_id);
   }
   else if ((&dbg_ctx)->file)
   {
     if (debug_internal::timestampEnabled)
-      PFUN("%d.%02d . %s,%d: ", t / 1000, (t % 1000) / 10, (&dbg_ctx)->file, (&dbg_ctx)->line);
+      lineBuf.sprintf("%d.%02d . %s,%d: ", t / 1000, (t % 1000) / 10, (&dbg_ctx)->file, (&dbg_ctx)->line);
     else
-      PFUN("%s,%d: ", (&dbg_ctx)->file, (&dbg_ctx)->line);
+      lineBuf.sprintf("%s,%d: ", (&dbg_ctx)->file, (&dbg_ctx)->line);
     (&dbg_ctx)->reset();
   }
   else if (new_debug_line && debug_internal::timestampEnabled)
-    PFUN("%d.%02d ", t / 1000, (t % 1000) / 10);
+    lineBuf.sprintf("%d.%02d ", t / 1000, (t % 1000) / 10);
 
   const int rt = (uint32_t)tag <= LOGLEVEL_REMARK ? debug_internal::stdTags[tag] : tag;
   if (rt != debug_internal::stdTags[LOGLEVEL_DEBUG]) // I'm not sure whether we need or not print debug tag
-    PFUN("%c%c%c%c ", _DUMP4C(rt));
+    lineBuf.sprintf("%c%c%c%c ", _DUMP4C(rt));
 
-  DagorSafeArg::mixed_print_fmt(buf + buf_used_len, sizeof(vlog_buf) - buf_used_len, format, arg, anum);
-  buf[sizeof(vlog_buf) - 2] = 0;
-
-  size_t bufLen = buf_used_len + strlen(buf + buf_used_len);
-  if (addSlashN)
-    strcpy(buf + bufLen, "\n");
-  bool term = addSlashN || (bufLen > 0 && buf[bufLen - 1] == '\n');
+  lineBuf.appendFmt(addSlashN, format, arg, anum);
+  bool term = lineBuf.endsWithNewline();
 
   if (term)
   {
 #if _TARGET_XBOX
-    for (char *pos = buf; *pos; pos++) // Watson is sensitive to non-printable characters and can terminate the log with 0x83750007
-                                       // WEB_E_INVALID_JSON_STRING.
+    // Watson is sensitive to non-printable characters and can terminate the log with 0x83750007 WEB_E_INVALID_JSON_STRING
+    for (char *pos = lineBuf.data(); *pos; pos++)
       if ((uint8_t)*pos < ' ' && *pos != '\n' && *pos != '\r' && *pos != '\t')
         *pos = '*';
 #endif
 
-    log_write(buf, bufLen + (int)addSlashN);
-    buf[0] = 0;
+    log_write(lineBuf.data(), lineBuf.length());
+    lineBuf.reset();
   }
 
   (&dbg_ctx)->nextSameLine = !term;
-  if (!term)
-    (&dbg_ctx)->holdLine = false;
+  (&dbg_ctx)->holdLine = false;
 }
-
-#undef PFUN
 
 void debug_override_log_timestamp_format(debug_override_timestamp_cb_t) {}
 
@@ -583,8 +566,10 @@ bool debug_internal::on_log_handler(int tag, const char *fmt, const void *arg, i
 
 ret_l:
 
-  if (r && dgs_on_promoted_log_tag && feq(tag, promoted_tags, countof(promoted_tags)))
-    (*dgs_on_promoted_log_tag)(tag, fmt, arg, anum);
+  if (r)
+    if (auto *func = interlocked_relaxed_load_ptr(dgs_on_promoted_log_tag))
+      if (feq(tag, promoted_tags, countof(promoted_tags)))
+        (*func)(tag, fmt, arg, anum);
 
   if (debug_log_callback_t cb = interlocked_relaxed_load_ptr(debug_internal::log_callback))
     r = cb(tag, fmt, arg, anum, (&dbg_ctx)->file, (&dbg_ctx)->line) > 0;
@@ -690,7 +675,7 @@ void close_debug_files()
 void debug_flush(bool df)
 {
   flush_debug_file();
-  debug_internal::flush_debug = df || debug_internal::always_flush_debug;
+  debug_internal::flush_debug.store(df || debug_internal::always_flush_debug, dag::mo::_Release{});
 }
 
 void force_debug_flush(bool df)
@@ -704,21 +689,23 @@ void debug_allow_level_files(bool en) { debug_internal::level_files = en; }
 #elif _TARGET_IOS | _TARGET_TVOS
 void flush_debug_file()
 {
-  if (ios_global_fp)
+  intptr_t fp = get_debug_console_handle();
+  if (fp && fp != invalid_console_handle)
   {
-    out_debug_str_fmt("flushing %s", ios_global_log_fname);
-    fflush(ios_global_fp);
+    out_debug_str_fmt("flushing %s\n", get_log_filename());
+    fflush((FILE *)fp);
   }
 }
 
 void close_debug_files()
 {
-  if (ios_global_fp)
+  intptr_t fp = get_debug_console_handle();
+  if (fp && fp != invalid_console_handle)
   {
-    out_debug_str_fmt("closing %s", ios_global_log_fname);
-    fclose(ios_global_fp);
+    out_debug_str_fmt("closing %s\n", get_log_filename());
+    fclose((FILE *)fp);
   }
-  ios_global_fp = NULL;
+  set_debug_console_handle(invalid_console_handle);
 }
 
 void debug_flush(bool) {}

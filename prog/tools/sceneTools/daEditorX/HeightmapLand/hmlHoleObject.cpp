@@ -2,7 +2,6 @@
 
 #include "hmlHoleObject.h"
 #include "hmlCm.h"
-#include "common.h"
 
 #include <EditorCore/ec_IEditorCore.h>
 #include <math/dag_math2d.h>
@@ -180,6 +179,7 @@ public:
   void redo() override { redoParams.setTo(object); }
 
   size_t size() override { return sizeof(*this); }
+  UNDO_MERGE_SNAPSHOT_BY_TARGET(0xEBE4BE24u, object.get()) // UndoHmapLandObjectParams
   void accepted() override {}
   void get_description(String &s) override { s = "UndoHmapLandObjectParams"; }
 };
@@ -211,20 +211,20 @@ void HmapLandHoleObject::fillProps(PropPanel::ContainerPropertyControl &panel, D
 void HmapLandHoleObject::onPPChange(int pid, bool edit_finished, PropPanel::ContainerPropertyControl &panel,
   dag::ConstSpan<RenderableEditableObject *> objects)
 {
-#define CHANGE_VAL(type, pname, getfunc)                                     \
-  {                                                                          \
-    if (!edit_finished)                                                      \
-      return;                                                                \
-    type val = panel.getfunc(pid);                                           \
-    if (fabsf(val) < 1e-6)                                                   \
-      val = 1;                                                               \
-    for (int i = 0; i < objects.size(); ++i)                                 \
-    {                                                                        \
-      HmapLandHoleObject *o = (HmapLandHoleObject *)objects[i];              \
-      getObjEditor()->getUndoSystem()->put(new UndoHmapLandObjectParams(o)); \
-      o->pname = val;                                                        \
-    }                                                                        \
-    HmapLandPlugin::self->resetRenderer();                                   \
+#define CHANGE_VAL(type, pname, getfunc)                                 \
+  {                                                                      \
+    if (!edit_finished)                                                  \
+      return;                                                            \
+    type val = panel.getfunc(pid);                                       \
+    if (fabsf(val) < 1e-6)                                               \
+      val = 1;                                                           \
+    for (int i = 0; i < objects.size(); ++i)                             \
+    {                                                                    \
+      HmapLandHoleObject *o = (HmapLandHoleObject *)objects[i];          \
+      getObjEditor()->getUndoSystem()->put<UndoHmapLandObjectParams>(o); \
+      o->pname = val;                                                    \
+    }                                                                    \
+    HmapLandPlugin::self->resetRenderer();                               \
   }
 
   if (pid == PID_BOX_SIZE_X)
@@ -249,7 +249,7 @@ void HmapLandHoleObject::scaleObject(const Point3 &delta, const Point3 &origin, 
   boxSize.y = matrix.getcol(1).y;
   boxSize.z = matrix.getcol(2).z;
 
-  objectWasScaled = true;
+  SplineObject::objectWasScaled = true;
 }
 
 void HmapLandHoleObject::setBoxSize(Point3 &s)

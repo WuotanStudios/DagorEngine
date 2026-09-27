@@ -16,37 +16,22 @@ static const int LOGMESSAGE_LEVEL = LOGLEVEL_ERR;
 static const int LOGMESSAGE_LEVEL = LOGLEVEL_WARN;
 #endif
 
-float rendinst::get_riextra_destr_time_to_live(rendinst::riex_handle_t handle)
-{
-  G_ASSERT_RETURN(handle != RIEX_HANDLE_NULL, -1.0f);
-  return rendinst::riExtra[rendinst::handle_to_ri_type(handle)].destrTimeToLive;
-}
-float rendinst::get_riextra_destr_default_time_to_live(rendinst::riex_handle_t handle)
-{
-  G_ASSERT_RETURN(handle != RIEX_HANDLE_NULL, -1.0f);
-  return rendinst::riExtra[rendinst::handle_to_ri_type(handle)].destrDefaultTimeToLive;
-}
-float rendinst::get_riextra_destr_time_to_kinematic(rendinst::riex_handle_t handle)
-{
-  G_ASSERT_RETURN(handle != RIEX_HANDLE_NULL, -1.0f);
-  return rendinst::riExtra[rendinst::handle_to_ri_type(handle)].destrTimeToKinematic;
-}
-float rendinst::get_riextra_destr_time_to_sink_underground(rendinst::riex_handle_t handle)
-{
-  G_ASSERT_RETURN(handle != RIEX_HANDLE_NULL, -1.0f);
-  return rendinst::riExtra[rendinst::handle_to_ri_type(handle)].destrTimeToSinkUnderground;
-}
-
 bool rendinst::get_riextra_immortality(rendinst::riex_handle_t handle)
 {
   return rendinst::riExtra[rendinst::handle_to_ri_type(handle)].immortal;
 }
 
+bool rendinst::is_riextra_rendinst_clipmap(rendinst::riex_handle_t handle)
+{
+  G_ASSERT_RETURN(handle != RIEX_HANDLE_NULL, false);
+  return rendinst::riExtra[rendinst::handle_to_ri_type(handle)].isRendinstClipmap;
+}
+
 uint32_t rendinst::get_riextra_instance_seed(rendinst::riex_handle_t handle)
 {
   uint32_t instSeed = 0;
-  if (const uint32_t *userData = rendinst::get_user_data(handle))
-    instSeed = userData[0]; // correct while instSeed lying at the start of data
+  if (dag::ConstSpan<int32_t> userData = rendinst::get_user_data(handle); !userData.empty())
+    instSeed = uint32_t(userData[0]); // correct while instSeed lying at the start of data
   return instSeed;
 }
 
@@ -58,7 +43,7 @@ void rendinst::set_riextra_instance_seed(rendinst::riex_handle_t handle, int32_t
 
   uint32_t res_idx = handle_to_ri_type(handle);
   uint32_t idx = handle_to_ri_inst(handle);
-  G_ASSERT_RETURN(res_idx < riExtra.size(), );
+  G_ASSERT_RETURN(riExtra.isValid(res_idx), );
   RiExtraPool &pool = riExtra[res_idx];
   if (!pool.isValid(idx))
   {
@@ -79,7 +64,7 @@ const mat43f &rendinst::getRIGenExtra43(riex_handle_t id)
 {
   uint32_t res_idx = handle_to_ri_type(id);
   uint32_t idx = handle_to_ri_inst(id);
-  if (res_idx < riExtra.size())
+  if (riExtra.isValid(res_idx))
   {
     RiExtraPool &pool = riExtra[res_idx];
     if (idx < pool.riTm.size())
@@ -112,10 +97,15 @@ void rendinst::getRIGenExtra44(riex_handle_t id, mat44f &out_tm)
   getRIGenExtra44NoLock(id, out_tm);
 }
 
+dag::ConstSpan<mat43f> rendinst::getAllRIGenExtra43FromPool(uint32_t pool)
+{
+  return riExtra.isValid(pool) ? riExtra[pool].riTm : dag::ConstSpan<mat43f>();
+}
+
 void rendinst::getRIExtraCollInfo(riex_handle_t id, CollisionResource **out_collision, BSphere3 *out_bsphere)
 {
   uint32_t resIdx = handle_to_ri_type(id);
-  G_ASSERT(resIdx < riExtra.size());
+  G_ASSERT(riExtra.isValid(resIdx));
 
   if (out_collision)
     *out_collision = riExtra[resIdx].collRes;
@@ -142,36 +132,48 @@ const CollisionResource *rendinst::getDestroyedRIExtraCollInfo(riex_handle_t han
 float rendinst::getInitialHP(riex_handle_t id)
 {
   uint32_t resIdx = handle_to_ri_type(id);
-  G_ASSERT(resIdx < riExtra.size());
+  G_ASSERT(riExtra.isValid(resIdx));
   return riExtra[resIdx].initialHP;
 }
 
 float rendinst::getHP(riex_handle_t id)
 {
   uint32_t resIdx = handle_to_ri_type(id);
-  G_ASSERT(resIdx < riExtra.size());
+  G_ASSERT(riExtra.isValid(resIdx));
   return riExtra[resIdx].getHp(handle_to_ri_inst(id));
+}
+float rendinst::getDamageThreshold(riex_handle_t id)
+{
+  uint32_t resIdx = handle_to_ri_type(id);
+  G_ASSERT_RETURN(riExtra.isValid(resIdx), 0.f);
+  return riExtra[resIdx].damageThreshold;
+}
+bool rendinst::isInvincible(riex_handle_t id)
+{
+  uint32_t resIdx = handle_to_ri_type(id);
+  G_ASSERT_RETURN(riExtra.isValid(resIdx), false);
+  return riExtra[resIdx].isInvincible(handle_to_ri_inst(id));
 }
 
 bool rendinst::isPaintFxOnHit(riex_handle_t id)
 {
   uint32_t resIdx = handle_to_ri_type(id);
-  G_ASSERT(resIdx < riExtra.size());
+  G_ASSERT(riExtra.isValid(resIdx));
   return riExtra[resIdx].isPaintFxOnHit;
 }
 
 bool rendinst::isKillsNearEffects(riex_handle_t id)
 {
   uint32_t resIdx = handle_to_ri_type(id);
-  G_ASSERT(resIdx < riExtra.size());
+  G_ASSERT(riExtra.isValid(resIdx));
   return riExtra[resIdx].killsNearEffects;
 }
 
 void rendinst::setRIGenExtraImmortal(uint32_t pool, bool value)
 {
-  if (pool >= riExtra.size())
+  if (!riExtra.isValid(pool))
   {
-    logerr("failed to set 'immortal' property of invalid pool '%ull'", pool);
+    logerr("failed to set 'immortal' property of invalid pool '%u'", pool);
     return;
   }
   riExtra[pool].immortal = value;
@@ -179,46 +181,70 @@ void rendinst::setRIGenExtraImmortal(uint32_t pool, bool value)
 
 bool rendinst::isRIGenExtraImmortal(uint32_t pool)
 {
-  if (pool < riExtra.size())
+  if (riExtra.isValid(pool))
     return riExtra[pool].immortal;
 
-  logerr("failed to get 'immortal' property of invalid pool '%ull'", pool);
+  logerr("failed to get 'immortal' property of invalid pool '%u'", pool);
   return true;
 }
 
 bool rendinst::isRIGenExtraWalls(uint32_t pool)
 {
-  if (pool < riExtra.size())
+  if (riExtra.isValid(pool))
     return riExtra[pool].isWalls;
 
-  logerr("failed to get 'isWalls' property of invalid pool '%ull'", pool);
+  logerr("failed to get 'isWalls' property of invalid pool '%u'", pool);
   return true;
+}
+
+vec4f rendinst::getRIGenExtraPoolBSphere(uint32_t pool)
+{
+  if (riExtra.isValid(pool))
+    return riExtra[pool].bsphXYZR;
+
+  logerr("failed to get 'bsphXYZR' property of invalid pool '%u'", pool);
+  return v_zero();
+}
+
+float rendinst::getMaxLodDist(uint32_t pool)
+{
+  if (riExtra.isValid(pool))
+  {
+    const RiExtraPool &riexPool = riExtra[pool];
+
+    const int llm = riexPool.lodLimits >> ((rendinst::ri_game_render_mode + 1) * 8);
+    const int max_lod = (llm >> 4) & 0xF;
+    return riexPool.distSqLOD[max_lod];
+  }
+
+  logerr("failed to get 'maxLodDist' property of invalid pool '%u'", pool);
+  return 0;
 }
 
 float rendinst::getRIGenExtraBsphRad(uint32_t pool)
 {
-  if (pool < riExtra.size())
+  if (riExtra.isValid(pool))
     return abs(riExtra[pool].bsphRad()); // radius is negative sometimes
 
-  logerr("failed to get 'bsphRad' property of invalid pool '%ull'", pool);
+  logerr("failed to get 'bsphRad' property of invalid pool '%u'", pool);
   return 0.0f;
 }
 
 Point3 rendinst::getRIGenExtraBsphPos(uint32_t pool)
 {
-  if (pool < riExtra.size())
+  if (riExtra.isValid(pool))
   {
     vec4f xyzr = riExtra[pool].bsphXYZR;
     return Point3(v_extract_x(xyzr), v_extract_y(xyzr), v_extract_z(xyzr));
   }
 
-  logerr("failed to get 'bsphPos' property of invalid pool '%ull'", pool);
+  logerr("failed to get 'bsphPos' property of invalid pool '%u'", pool);
   return Point3(0.0f, 0.0f, 0.0f);
 }
 
 Point4 rendinst::getRIGenExtraBSphereByTM(uint32_t pool, const TMatrix &tm)
 {
-  if (pool < riExtra.size())
+  if (riExtra.isValid(pool))
   {
     const vec4f xyzr = riExtra[pool].bsphXYZR;
     const float radius = abs(v_extract_w(xyzr)); // radius is negative sometimes
@@ -228,42 +254,51 @@ Point4 rendinst::getRIGenExtraBSphereByTM(uint32_t pool, const TMatrix &tm)
     return Point4(pos.x, pos.y, pos.z, radius * maxScale);
   }
 
-  logerr("failed to get 'bsphereByTM' of invalid pool '%ull'", pool);
+  logerr("failed to get 'bsphereByTM' of invalid pool '%u'", pool);
   return Point4(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 int rendinst::getRIGenExtraParentForDestroyedRiIdx(uint32_t pool)
 {
-  if (pool < riExtra.size())
+  if (riExtra.isValid(pool))
     return riExtra[pool].parentForDestroyedRiIdx;
 
-  logerr("failed to get 'parentForDestroyedRiIdx' property of invalid pool '%ull'", pool);
+  logerr("failed to get 'parentForDestroyedRiIdx' property of invalid pool '%u'", pool);
   return -1;
 }
 
 bool rendinst::isRIGenExtraDestroyedPhysResExist(uint32_t pool)
 {
-  if (pool < riExtra.size())
+  if (riExtra.isValid(pool))
     return riExtra[pool].isDestroyedPhysResExist;
 
-  logerr("failed to get 'isDestroyedPhysResExist' property of invalid pool '%ull'", pool);
+  logerr("failed to get 'isDestroyedPhysResExist' property of invalid pool '%u'", pool);
   return false;
 }
 
 int rendinst::getRIGenExtraDestroyedRiIdx(uint32_t pool)
 {
-  if (pool < riExtra.size())
+  if (riExtra.isValid(pool))
     return riExtra[pool].destroyedRiIdx;
 
-  logerr("failed to get 'destroyedRiIdx' property of invalid pool '%ull'", pool);
+  logerr("failed to get 'destroyedRiIdx' property of invalid pool '%u'", pool);
   return -1;
+}
+
+bool rendinst::isRIGenExtraRendinstClipmapOrLandclass(uint32_t pool)
+{
+  if (riExtra.isValid(pool))
+    return riExtra[pool].isRendinstClipmap || !riExtra[pool].riLandclassCachedData.empty();
+
+  logerr("failed to get 'isRendinstClipmap' or 'riLandclassCachedData' property of invalid pool '%u'", pool);
+  return false;
 }
 
 vec4f rendinst::getRIGenExtraBSphere(riex_handle_t id)
 {
   uint32_t resIdx = handle_to_ri_type(id);
   uint32_t instIdx = handle_to_ri_inst(id);
-  G_ASSERT(resIdx < riExtra.size() && instIdx < riExtra[resIdx].riXYZR.size());
+  G_ASSERT(riExtra.isValid(resIdx) && instIdx < riExtra[resIdx].riXYZR.size());
   return riExtra[resIdx].riXYZR[instIdx];
 }
 
@@ -271,7 +306,7 @@ void rendinst::setRiGenExtraHp(riex_handle_t id, float hp)
 {
   uint32_t resIdx = handle_to_ri_type(id);
   uint32_t instIdx = handle_to_ri_inst(id);
-  G_ASSERT(resIdx < riExtra.size() && instIdx < riExtra[resIdx].riHP.size());
+  G_ASSERT(riExtra.isValid(resIdx) && instIdx < riExtra[resIdx].riHP.size());
   riExtra[resIdx].setHp(instIdx, hp);
 }
 
@@ -281,10 +316,9 @@ const char *rendinst::getRIGenExtraName(uint32_t res_idx)
   return riExtraMap.getName(res_idx);
 }
 
-int rendinst::getRIGenExtraPreferrableLodRawDistance(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod_arg)
+int rendinst::getRIGenExtraPreferableLodRawDistanceUnsafe(uint32_t res_idx, float squared_distance, bool &over_max_lod,
+  int &last_lod_arg)
 {
-  if (res_idx >= rendinst::riExtra.size())
-    return -1;
   const rendinst::RiExtraPool &riPool = rendinst::riExtra[res_idx];
   int lod = find_lod<rendinst::RiExtraPool::MAX_LODS>(riPool.distSqLOD, squared_distance);
   const int llm = riPool.lodLimits >> ((rendinst::ri_game_render_mode + 1) * 8);
@@ -295,29 +329,36 @@ int rendinst::getRIGenExtraPreferrableLodRawDistance(uint32_t res_idx, float squ
   return lod;
 }
 
-int rendinst::getRIGenExtraPreferrableLod(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod)
+int rendinst::getRIGenExtraPreferableLodRawDistance(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod_arg)
 {
-  squared_distance *= rendinst::riExtraCullDistSqMul;
-  return getRIGenExtraPreferrableLodRawDistance(res_idx, squared_distance, over_max_lod, last_lod);
+  if (!rendinst::riExtra.isValid(res_idx))
+    return -1;
+  return getRIGenExtraPreferableLodRawDistanceUnsafe(res_idx, squared_distance, over_max_lod, last_lod_arg);
 }
 
-int rendinst::getRIGenExtraPreferrableLod(uint32_t res_idx, float squared_distance)
+int rendinst::getRIGenExtraPreferableLod(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod)
+{
+  squared_distance *= rendinst::riExtraCullDistSqMul;
+  return getRIGenExtraPreferableLodRawDistance(res_idx, squared_distance, over_max_lod, last_lod);
+}
+
+int rendinst::getRIGenExtraPreferableLod(uint32_t res_idx, float squared_distance)
 {
   bool over_max_lod;
   int max_lod;
   squared_distance *= rendinst::riExtraCullDistSqMul;
-  return getRIGenExtraPreferrableLodRawDistance(res_idx, squared_distance, over_max_lod, max_lod);
+  return getRIGenExtraPreferableLodRawDistance(res_idx, squared_distance, over_max_lod, max_lod);
 }
 
 bool rendinst::isRIExtraGenPosInst(uint32_t res_idx)
 {
-  G_ASSERT_RETURN(res_idx < riExtra.size(), false);
+  G_ASSERT_RETURN(riExtra.isValid(res_idx), false);
   return rendinst::riExtra[res_idx].posInst;
 }
 
 bool rendinst::updateRiExtraReqLod(uint32_t res_idx, unsigned lod)
 {
-  G_ASSERT_RETURN(res_idx < riExtra.size(), false);
+  G_ASSERT_RETURN(riExtra.isValid(res_idx), false);
   RenderableInstanceLodsResource *riRes = rendinst::riExtra[res_idx].res;
   if (!riRes)
     return false;
@@ -328,42 +369,42 @@ bool rendinst::updateRiExtraReqLod(uint32_t res_idx, unsigned lod)
 
 bbox3f rendinst::riex_get_lbb(int res_idx)
 {
-  if (res_idx < 0 || res_idx >= riExtra.size())
+  if (!riExtra.isValid(res_idx))
     return bbox3f();
   return riExtra[res_idx].lbb;
 }
 
 float rendinst::riex_get_bsph_rad(int res_idx)
 {
-  if (res_idx >= riExtra.size())
+  if (!riExtra.isValid(res_idx))
     return 0.f;
   return riExtra[res_idx].sphereRadius;
 }
 
 void rendinst::setRiGenResMatId(uint32_t res_idx, int matId)
 {
-  G_ASSERT_RETURN(res_idx < riExtra.size(), );
+  G_ASSERT_RETURN(riExtra.isValid(res_idx), );
   const rendinst::RiExtraPool &pool = rendinst::riExtra[res_idx];
   if (RendInstGenData *rgl = (pool.riPoolRef >= 0) ? rendinst::getRgLayer(pool.riPoolRefLayer) : nullptr)
   {
-    RendInstGenData::RendinstProperties &riProp = rgl->rtData->riProperties[pool.riPoolRef];
+    rendinst::props::RendinstProperties &riProp = rgl->rtData->riProperties[pool.riPoolRef];
     riProp.matId = matId;
   }
 }
 
 void rendinst::setRiGenResHp(uint32_t res_idx, float hp)
 {
-  G_ASSERT_RETURN(res_idx < riExtra.size(), );
+  G_ASSERT_RETURN(riExtra.isValid(res_idx), );
   rendinst::riExtra[res_idx].initialHP = hp;
 }
 
 void rendinst::setRiGenResDestructionImpulse(uint32_t res_idx, float impulse)
 {
-  G_ASSERT_RETURN(res_idx < riExtra.size(), );
+  G_ASSERT_RETURN(riExtra.isValid(res_idx), );
   const rendinst::RiExtraPool &pool = rendinst::riExtra[res_idx];
   if (RendInstGenData *rgl = (pool.riPoolRef >= 0) ? rendinst::getRgLayer(pool.riPoolRefLayer) : nullptr)
   {
-    RendInstGenData::DestrProps &riDestr = rgl->rtData->riDestr[pool.riPoolRef];
+    rendinst::props::DestrProps &riDestr = rgl->rtData->riDestr[pool.riPoolRef];
     riDestr.destructionImpulse = impulse;
   }
 }
@@ -372,51 +413,90 @@ vec4f rendinst::getNodeBsphere(riex_handle_t handle, float &pool_rad) { return r
 
 void rendinst::prefetchNode(riex_handle_t handle)
 {
-  rendinst::prefetch_node(handle);
-
   uint32_t res_idx = handle_to_ri_type(handle);
   uint32_t idx = handle_to_ri_inst(handle);
-  if (DAGOR_UNLIKELY(res_idx >= riExtra.size()))
+  if (DAGOR_UNLIKELY(!riExtra.isValid(res_idx)))
     return;
-  auto &pool = riExtra.data()[res_idx];
 
-  G_UNUSED(idx);
+  auto &pool = riExtra.data()[res_idx];
+  RiExtraPool::NodeIdxAndTs tsNodeIdx = pool.getNodeIdx(idx);
+  if (DAGOR_UNLIKELY(tsNodeIdx.nodeIdx == scene::INVALID_NODE))
+    return;
+
+  riExTiledScenes[tsNodeIdx.tsIndex].prefetchNode(tsNodeIdx.nodeIdx);
   G_UNUSED(pool);
 
-  // mat43f is 16 byte aligned, so it is possible that it is on 2 cache lines.
-  // Make sure the whole thing is fetched.
-  PREFETCH_DATA(0, &pool.riTm.data()[idx].row0);
-  PREFETCH_DATA(0, &pool.riTm.data()[idx].row2);
   PREFETCH_DATA(0, &pool.lodLimits);
   PREFETCH_DATA(0, &pool.distSqLOD);
 }
 
-bool rendinst::isVisibleByLodEst(riex_handle_t id, vec4f view_pos, float dist_sq_mul, const mat43f *&mat_out, vec3f &pos,
-  uint32_t &hash)
+bool rendinst::isNodeVisible(riex_handle_t id, uint32_t res_idx, const mat44f *&mat_out, uint32_t &hash)
+{
+#if DAGOR_DBGLEVEL > 0
+  if (DAGOR_UNLIKELY(res_idx != handle_to_ri_type(id)))
+  {
+    LOGERR_ONCE("res_idx mismatch: %u (arg) vs %u (from id)", res_idx, handle_to_ri_type(id));
+    res_idx = handle_to_ri_type(id); // original behavior
+  }
+#endif
+
+  uint32_t idx = handle_to_ri_inst(id);
+  const RiExtraPool &pool = riExtra[res_idx];
+
+  RiExtraPool::NodeIdxAndTs tsNodeIdx = pool.getNodeIdx(idx);
+  if (tsNodeIdx.nodeIdx == scene::INVALID_NODE)
+    return false;
+
+  RendinstTiledScene &scene = riExTiledScenes[tsNodeIdx.tsIndex];
+  if (!scene.isAliveNodeFast(tsNodeIdx.nodeIdx))
+    return false;
+
+  const mat44f &m = scene.getAliveNode(tsNodeIdx.nodeIdx);
+  const uint32_t flags = scene::get_node_flags(m);
+  const uint32_t visibleFlag = rendinst::ri_game_render_mode == 0   ? rendinst::RendinstTiledScene::VISIBLE_0
+                               : rendinst::ri_game_render_mode == 2 ? rendinst::RendinstTiledScene::VISIBLE_2
+                                                                    : 0;
+  if ((flags & visibleFlag) != visibleFlag)
+    return false;
+
+  mat_out = &m;
+
+  uint32_t *userDataPtr = (uint32_t *)scene.getUserData(tsNodeIdx.nodeIdx);
+  hash = userDataPtr ? userDataPtr[0] : 0;
+
+  return true;
+}
+
+bool rendinst::isNodeAlive(riex_handle_t id, vec4f &bsphere, float &pool_rad)
 {
   uint32_t res_idx = handle_to_ri_type(id);
   uint32_t idx = handle_to_ri_inst(id);
-  if (res_idx >= riExtra.size())
-    return false;
+
   const RiExtraPool &pool = riExtra[res_idx];
-  if (idx >= pool.riTm.size())
+
+  RiExtraPool::NodeIdxAndTs tsNodeIdx = pool.getNodeIdx(idx);
+  if (tsNodeIdx.nodeIdx == scene::INVALID_NODE)
     return false;
-  mat_out = &pool.riTm[idx];
-  const mat43f &m43 = *mat_out;
-  pos = v_mat43_extract_pos(m43);
-  vec3f pointToEye = v_sub(view_pos, pos);
-  float squared_distance = v_extract_x(v_length3_sq(pointToEye)) * dist_sq_mul;
 
-  const int llm = pool.lodLimits >> ((rendinst::ri_game_render_mode + 1) * 8);
-  const int max_lod = (llm >> 4) & 0xF;
-  bool over_max_lod = pool.distSqLOD[max_lod] <= squared_distance;
+  RendinstTiledScene &scene = riExTiledScenes[tsNodeIdx.tsIndex];
+  if (!scene.isAliveNodeFast(tsNodeIdx.nodeIdx))
+    return false;
 
-  if (!over_max_lod)
-    hash = get_riextra_instance_seed(id); // saves a function vall when called here
+  const mat44f &m = scene.getAliveNode(tsNodeIdx.nodeIdx);
+  bsphere = scene::get_node_bsphere(m);
+  pool_rad = scene.getPoolSphereRad(res_idx);
 
-  return !over_max_lod;
+  return true;
 }
 
+bool rendinst::isNodeAllocated(riex_handle_t id)
+{
+  uint32_t res_idx = handle_to_ri_type(id);
+  uint32_t idx = handle_to_ri_inst(id);
+  return riExtra[res_idx].getNodeIdx(idx).nodeIdx != scene::INVALID_NODE;
+}
+
+bool rendinst::isRIGenExtraPlacedInTiledScenes(int res_idx) { return riExtra.isValid(res_idx) && riExtra[res_idx].tsIndex >= 0; }
 
 float rendinst::getCullDistSqMul() { return riExtraCullDistSqMul; }
 

@@ -26,21 +26,26 @@ class GPUGrassService : public IGPUGrassService
   RandomGPUGrassRenderHelper grassHelper;
   eastl::vector<GPUGrassType> grassTypes;
   eastl::vector<GPUGrassDecal> grassDecals;
+  DataBlock *grassBlock = nullptr;
   void enumerateGrassTypes(DataBlock &grassBlk);
   void enumerateGrassDecals(DataBlock &grassBlk);
   int findFreeDecalId() const;
+
+  bool smallGrass = false;
 
 public:
   bool srvEnabled;
   void createGrass(DataBlock &grassBlk) override;
   void closeGrass() override;
   DataBlock *createDefaultGrass() override;
+  DataBlock *getSettings() override;
   void enableGrass(bool flag) override;
   void beforeRender(Stage stage) override;
   void renderGeometry(Stage stage) override;
   BBox3 *getGrassBbox() override;
 
   bool isGrassEnabled() const override;
+  bool isGrassValid() const override;
   int getTypeCount() const override;
   GPUGrassType &getType(int index) override;
   GPUGrassType &addType(const char *name) override;
@@ -55,4 +60,7 @@ public:
   bool findDecalId(int id) const override;
 
   void invalidate() override;
+
+  void setIsSmallGrass(bool flag) override;
+  bool isSmallGrass() const override;
 };

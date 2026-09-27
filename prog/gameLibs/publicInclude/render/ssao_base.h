@@ -38,26 +38,20 @@ public:
   virtual Texture *getSSAOTex() = 0;
   virtual TEXTUREID getSSAOTexId() = 0;
 
-  virtual void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *tex, const ManagedTex *ssaoTex,
-    const ManagedTex *prevSsaoTex, const ManagedTex *tmpTex, const DPoint3 &world_pos,
-    SubFrameSample sub_sample = SubFrameSample::Single)
+  virtual void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *tex, BaseTexture *ssaoTex,
+    BaseTexture *prevSsaoTex, BaseTexture *tmpTex, const DPoint3 &world_pos, SubFrameSample sub_sample = SubFrameSample::Single)
   {
     render(view_tm, proj_tm, tex, ssaoTex, prevSsaoTex, tmpTex, &world_pos, sub_sample);
   }
   virtual void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *tex = nullptr)
   {
-    render(view_tm, proj_tm, tex, nullptr, nullptr, nullptr, nullptr);
-  }
-  virtual void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, const ManagedTex &tex)
-  {
-    render(view_tm, proj_tm, tex.getTex2D(), nullptr, nullptr, nullptr, nullptr);
+    render(view_tm, proj_tm, tex, nullptr, nullptr, nullptr, nullptr, SubFrameSample::Single);
   }
   virtual void setCurrentView(int view) = 0;
 
 protected:
-  virtual void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssaoDepthTexUse, const ManagedTex *ssaoTex,
-    const ManagedTex *prevSsaoTex, const ManagedTex *tmpTex, const DPoint3 *world_pos,
-    SubFrameSample sub_sample = SubFrameSample::Single) = 0;
+  virtual void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssaoDepthTexUse, BaseTexture *ssaoTex,
+    BaseTexture *prevSsaoTex, BaseTexture *tmpTex, const DPoint3 *world_pos, SubFrameSample sub_sample = SubFrameSample::Single) = 0;
 
   int aoWidth, aoHeight;
   eastl::unique_ptr<PostFxRenderer> aoRenderer;

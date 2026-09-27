@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <osApiWrappers/dag_basePath.h>
+#include <osApiWrappers/dag_direct.h>
 #include <dasModules/aotDagorFiles.h>
 
 namespace bind_dascript
@@ -76,10 +77,7 @@ int dag_builtin_df_load(const DagFile *fp, int32_t len,
   char *buf = (char *)malloc(len);
   int rlen = df_read((file_ptr_t)fp, buf, len);
   das::Array arr;
-  arr.data = buf;
-  arr.size = rlen;
-  arr.capacity = rlen;
-  arr.lock = 1;
+  das::array_mark_locked(arr, buf, rlen);
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -112,6 +110,8 @@ int dag_df_stat(const char *path, DagorStat &buf)
 }
 
 int dag_df_fstat(const DagFile *fp, DagorStat &buf) { return df_fstat((file_ptr_t)fp, &buf); }
+
+bool das_dd_file_exists(const char *fname) { return fname && dd_file_exists(fname); }
 
 char *dag_df_get_real_name(const char *fname, das::Context *context, das::LineInfoArg *at)
 {
@@ -160,8 +160,8 @@ public:
   {
     das::ModuleLibrary lib(this);
     // file annotation
-    addAnnotation(das::make_smart<DagFileAnnotation>(lib));
-    addAnnotation(das::make_smart<DagorStatAnnotation>(lib));
+    addAnnotation(new DagFileAnnotation(lib));
+    addAnnotation(new DagorStatAnnotation(lib));
     // file constants
     das::addConstant(*this, "DF_READ", (int32_t)DF_READ);
     das::addConstant(*this, "DF_WRITE", (int32_t)DF_WRITE);
@@ -190,6 +190,8 @@ public:
       "bind_dascript::dag_df_stat");
     das::addExtern<DAS_BIND_FUN(dag_df_fstat)>(*this, lib, "df_fstat", das::SideEffects::modifyArgumentAndAccessExternal,
       "bind_dascript::dag_df_fstat");
+    das::addExtern<DAS_BIND_FUN(das_dd_file_exists)>(*this, lib, "dd_file_exists", das::SideEffects::accessExternal,
+      "bind_dascript::das_dd_file_exists");
     das::addExtern<DAS_BIND_FUN(dag_df_get_real_name)>(*this, lib, "df_get_real_name", das::SideEffects::modifyExternal,
       "bind_dascript::dag_df_get_real_name");
     // builtin file functions

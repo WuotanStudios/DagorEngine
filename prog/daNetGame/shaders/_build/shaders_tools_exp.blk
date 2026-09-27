@@ -2,30 +2,28 @@ include shaders_dx12_fast.blk
 
 "@override:outDumpName":t="*"
 outMiniDumpName:t="../../tools/common/compiledShaders/tools.exp"
+compileRefinedBlock:b=no
 
 "@delete:source" {}
 source
 {
   includePath:t="../../../prog/daNetGame/shaders"
 
-  file:t = "../rendinst_layered.dshl"
-  file:t = "../rendinst_simple.dshl"
   file:t = "../rendinst_uv_debug.dshl"
-  file:t = "../rendinst_simple_painted.dshl"
-  file:t = "../rendinst_perlin_layered.dshl"
   file:t = "../rendinst_vcolor_layered.dshl"
   file:t = "../rendinst_cliff.dshl"
-  file:t = "../rendinst_decal.dshl"
 
   file:t = "../dynamic_simple.dshl"
   file:t = "../dynamic_transparent.dshl"
   file:t = "../dynamic_simple_painted.dshl"
   file:t = "../dynamic_alpha_blend.dshl"
   file:t = "../dynamic_masked_chrome.dshl"
+  file:t = "../dynamic_cloth_sim.dshl"
   file:t = "../heightmap.dshl"
   file:t = "../rendinst_clipmap.dshl"
   file:t = "../heightmap_patches.dshl"
   file:t = "spline_solid.dshl"
+  file:t = "rendinst_voxel.dshl"
 
   include rendinstImpostorbakeableShadersList.blk
 }

@@ -3,7 +3,9 @@
 #include <math/random/dag_random.h>
 #include <ecs/anim/anim.h>
 #include <daECS/core/coreEvents.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <perfMon/dag_cpuFreq.h>
 #include <perfMon/dag_statDrv.h>
 #include <math/dag_mathBase.h>
@@ -20,6 +22,9 @@ CONSOLE_FLOAT_VAL("lightning", debug_strike_time, 1.0f);
 CONSOLE_FLOAT_VAL("lightning", debug_sleep_time, 2.0f);
 CONSOLE_FLOAT_VAL("lightning", debug_azimuth, -1.0f);
 CONSOLE_FLOAT_VAL("lightning", debug_distance, 6000.0f);
+
+CONSOLE_FLOAT_VAL("lightning", cloud_trace_threshold, 0.5f);
+CONSOLE_FLOAT_VAL("lightning", cloud_trace_margin, 200.0f);
 
 #define GLOBAL_VARS_LIST                                     \
   VAR(lightning_point_light_pos)                             \
@@ -79,22 +84,22 @@ static void get_debug_parameters(Point2 &azimuth_interval, Point2 &sleep_interva
 
 void setShaderEnabled(bool f) { ShaderGlobal::set_int(lightning_in_cloudsVarId, f); }
 
-void setPointLightColor(Point3 p) { ShaderGlobal::set_color4(lightning_point_light_colorVarId, Point4::xyzV(p, 0)); }
+void setPointLightColor(Point3 p) { ShaderGlobal::set_float4(lightning_point_light_colorVarId, Point4::xyzV(p, 0)); }
 
-void setPointLightPos(Point3 p) { ShaderGlobal::set_color4(lightning_point_light_posVarId, Point4::xyzV(p, 0)); }
+void setPointLightPos(Point3 p) { ShaderGlobal::set_float4(lightning_point_light_posVarId, Point4::xyzV(p, 0)); }
 
 void setPointLightEnable(bool render) { ShaderGlobal::set_int(lightning_render_additional_point_lightVarId, render); }
 
 
 void setPointLightNaturalFade(bool render) { ShaderGlobal::set_int(lightning_additional_point_light_natural_fadeVarId, render); }
 
-void setPointLightRadius(float r) { ShaderGlobal::set_real(lightning_additional_point_light_radiusVarId, r); }
+void setPointLightRadius(float r) { ShaderGlobal::set_float(lightning_additional_point_light_radiusVarId, r); }
 
-void setPointLightStrength(float r) { ShaderGlobal::set_real(lightning_additional_point_light_strengthVarId, r); }
+void setPointLightStrength(float r) { ShaderGlobal::set_float(lightning_additional_point_light_strengthVarId, r); }
 
 void setPointLightExtinctionThreshold(float r)
 {
-  ShaderGlobal::set_real(lightning_additional_point_light_extinction_thresholdVarId, r);
+  ShaderGlobal::set_float(lightning_additional_point_light_extinction_thresholdVarId, r);
 }
 
 float getCloudsAlt()
@@ -122,14 +127,14 @@ struct LightningFX
     rotzTM.identity();
     rotzTM.rotzTM(-90.0f * DEG_TO_RAD);
     defaultRotTM = rotzTM * rotyTM;
-    defaultStepsPerSequence = ShaderGlobal::get_real(clouds_steps_per_sequenceVarId);
+    defaultStepsPerSequence = ShaderGlobal::get_float(clouds_steps_per_sequenceVarId);
   };
   LightningFX(LightningFX &&) = default;
 
   ~LightningFX()
   {
-    ShaderGlobal::set_real(clouds_taa_min_new_frame_weightVarId, 0);
-    ShaderGlobal::set_real(clouds_steps_per_sequenceVarId, defaultStepsPerSequence);
+    ShaderGlobal::set_float(clouds_taa_min_new_frame_weightVarId, 0);
+    ShaderGlobal::set_float(clouds_steps_per_sequenceVarId, defaultStepsPerSequence);
   };
 
   void updateTM(TMatrix &transform, const float azimuth, const float dist, const float meshOffset)
@@ -156,14 +161,14 @@ struct LightningFX
 
   void startLowQualityFrames()
   {
-    ShaderGlobal::set_real(clouds_taa_min_new_frame_weightVarId, 0);
-    ShaderGlobal::set_real(clouds_steps_per_sequenceVarId, defaultStepsPerSequence);
+    ShaderGlobal::set_float(clouds_taa_min_new_frame_weightVarId, 0);
+    ShaderGlobal::set_float(clouds_steps_per_sequenceVarId, defaultStepsPerSequence);
   }
 
   void startHighQualityFrames()
   {
-    ShaderGlobal::set_real(clouds_taa_min_new_frame_weightVarId, min_new_frame_weight);
-    ShaderGlobal::set_real(clouds_steps_per_sequenceVarId, steps_per_sequence);
+    ShaderGlobal::set_float(clouds_taa_min_new_frame_weightVarId, min_new_frame_weight);
+    ShaderGlobal::set_float(clouds_steps_per_sequenceVarId, steps_per_sequence);
   }
 
   float strengthCurrent = 0.0f;
@@ -193,6 +198,12 @@ struct LightningFX
   Point3 sunDir;
   bool doFlickering = false;
 
+  // Sky-trace cloud gating: a vertical ray is traced through the cloud layer at
+  // the upcoming strike's XZ to only spawn lightning where clouds exist
+  int cloudTraceId = -1;    // in-flight trace id, -1 = none
+  bool cloudPresent = true; // verdict for the current strike (default/fail-open: allow)
+  bool suppressed = false;  // current strike hidden (no clouds at its XZ)
+
 private:
   TMatrix defaultRotTM;
 
@@ -212,13 +223,13 @@ ECS_DECLARE_RELOCATABLE_TYPE(LightningFX);
 ECS_REGISTER_RELOCATABLE_TYPE(LightningFX, nullptr);
 
 template <typename Callable>
-static void enable_lightning_animchar_ecs_query(ecs::EntityId eid, Callable c);
+static void enable_lightning_animchar_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable c);
 template <typename Callable>
-static void disable_lightning_animchar_ecs_query(ecs::EntityId eid, Callable c);
+static void disable_lightning_animchar_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable c);
 template <typename Callable>
-static void get_animchar_eids_ecs_query(Callable c);
+static void get_animchar_eids_ecs_query(ecs::EntityManager &manager, Callable c);
 template <typename Callable>
-static void get_lightnings_ecs_query(Callable c);
+static void get_lightnings_ecs_query(ecs::EntityManager &manager, Callable c);
 
 ECS_TAG(render)
 ECS_ON_EVENT(on_disappear)
@@ -263,16 +274,17 @@ static void lightning_manager_created_es(const ecs::Event &, const ecs::StringLi
   }
 
   // find lightnings replicated before manager
-  get_lightnings_ecs_query(
+  get_lightnings_ecs_query(manager,
     [&](ecs::EidList &lightning__animchars_eids) { lightning__animchars_eids = lightning__animchars_eids_base; });
 }
 
 ECS_TAG(render)
 ECS_ON_EVENT(on_appear)
-static void lightning_created_es(const ecs::Event &, LightningFX &lightning, ecs::EidList &lightning__animchars_eids)
+static void lightning_created_es(const ecs::Event &, ecs::EntityManager &manager, LightningFX &lightning,
+  ecs::EidList &lightning__animchars_eids)
 {
   lightning__animchars_eids.clear();
-  get_animchar_eids_ecs_query(
+  get_animchar_eids_ecs_query(manager,
     [&](ecs::EidList &lightning__animchars_eids_base) { lightning__animchars_eids = lightning__animchars_eids_base; });
 
   lightning.animcharNum = lightning__animchars_eids.size();
@@ -282,11 +294,11 @@ static void lightning_created_es(const ecs::Event &, LightningFX &lightning, ecs
 
 ECS_TAG(render)
 ECS_NO_ORDER
-static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX &lightning, TMatrix &transform,
-  bool lightning__is_volumetric, Point2 lightning__base_strike_time_interval, Point2 lightning__base_sleep_time_interval,
-  Point2 lightning__base_distance_interval, Point2 lightning__base_azimuth_interval, float lightning__base_offset,
-  Point2 lightning__series_radius_interval, Point2 lightning__series_strength_interval, Point2 lightning__series_size_interval,
-  Point2 lightning__series_sleep_time_interval, Point2 lightning__series_strike_time_interval,
+static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, ecs::EntityManager &manager, LightningFX &lightning,
+  TMatrix &transform, bool lightning__is_volumetric, Point2 lightning__base_strike_time_interval,
+  Point2 lightning__base_sleep_time_interval, Point2 lightning__base_distance_interval, Point2 lightning__base_azimuth_interval,
+  float lightning__base_offset, Point2 lightning__series_radius_interval, Point2 lightning__series_strength_interval,
+  Point2 lightning__series_size_interval, Point2 lightning__series_sleep_time_interval, Point2 lightning__series_strike_time_interval,
   float lightning__series_distance_deviation, float lightning__series_azimuth_deviation, float lightning__series_fadeout_time,
   float lightning__series_probability, bool lightning__series_create_bolt, float lightning__bolt_probability,
   float lightning__bolt_strike_time, int lightning__bolt_step_size, float lightning__emissive_multiplier,
@@ -297,7 +309,7 @@ static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX 
   Point2 lightning__point_light_strength_interval, float lightning__point_light_extinction_threshold,
   bool lightning__point_light_natural_fade, Point3 lightning__point_light_color, float lightning__scene_illumination_multiplier,
   bool lightning__scene_illumination_enable_for_flash, float lightning__scene_illumination_near_sun_threshold,
-  ecs::EidList &lightning__animchars_eids)
+  ecs::EidList &lightning__animchars_eids, bool lightning__cloud_density_check = false)
 {
   auto skies = lightning_get_skies();
   if (!skies || !lightning.animcharNum)
@@ -331,18 +343,39 @@ static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX 
   bool earlyExitOnUnmatchedSkies = lightning__is_volumetric != !lightning_get_skies()->panoramaEnabled();
   if (earlyExitOnUnmatchedSkies)
   {
+    lightning.cloudPresent = true;
+    lightning.suppressed = false;
+    lightning.cloudTraceId = -1;
+
     // disable current animchar when swtiching skies settings
     if (lightning.started)
     {
       lightning.started = false;
       if (lightning__animchars_eids.empty())
         return;
-      disable_lightning_animchar_ecs_query(lightning__animchars_eids[lightning.currentAnimcharId],
+      disable_lightning_animchar_ecs_query(manager, lightning__animchars_eids[lightning.currentAnimcharId],
         [&](bool &animchar_render__enabled) { animchar_render__enabled = false; });
     }
     return;
   }
   bool isSeries = lightning.isNextSeries;
+
+  if (lightning__cloud_density_check && lightning.cloudTraceId >= 0)
+  {
+    float traceT, traceTransmittance;
+    if (skies->getCloudsTraceResult(lightning.cloudTraceId, traceT, traceTransmittance))
+    {
+      // traceT >= 0: cloud hit. traceT < 0 with high transmittance: ray cleared the layer -> no cloud.
+      // traceT < 0 with ~0 transmittance: tracer frame-timeout (not a real result) -> fail open.
+      if (traceT >= 0.f)
+        lightning.cloudPresent = true;
+      else if (traceTransmittance >= cloud_trace_threshold)
+        lightning.cloudPresent = false;
+      else
+        lightning.cloudPresent = true;
+      lightning.cloudTraceId = -1;
+    }
+  }
 
   // enable lightning effect if currently in between strike start time and end time
   if (lightning.strikeStartTime < currentTime && currentTime < lightning.strikeEndTime && !lightning.isFadingOut)
@@ -352,12 +385,18 @@ static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX 
       float timeDiff = lightning.strikeEndTime - lightning.strikeStartTime;
       lightning.strikeStartTime = currentTime;
       lightning.strikeEndTime = currentTime + timeDiff;
-
-      lightning.startHighQualityFrames();
       lightning.started = true;
-      lightning.updateTM(transform, lightning.azimuthCurrent * TWOPI, lightning.distanceCurrent, lightning__base_offset);
+      lightning.suppressed = lightning__cloud_density_check && !lightning.cloudPresent;
+
       bool doBolt = lightning__bolt_probability > _rnd_float(lightning.rngSeed, 0.0f, 1.0f);
       doBolt = (doBolt && lightning__series_create_bolt) || (doBolt && !isSeries);
+      lightning.doFlickering = lightning__point_light_flickering_probability > _rnd_float(lightning.rngSeed, 0.0f, 1.0f);
+
+      if (lightning.suppressed)
+        return;
+
+      lightning.startHighQualityFrames();
+      lightning.updateTM(transform, lightning.azimuthCurrent * TWOPI, lightning.distanceCurrent, lightning__base_offset);
       float cloudsHeight = getCloudsAlt();
       Point3 lightPos = transform.getcol(3);
       lightPos.y = cloudsHeight + lightning__point_light_offset;
@@ -366,24 +405,23 @@ static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX 
       lightPos2D.normalize();
       sunDir2D.normalize();
       bool isNearSun = dot(lightPos2D, sunDir2D) > cos(lightning__scene_illumination_near_sun_threshold * DEG_TO_RAD);
-      lightning.doFlickering = lightning__point_light_flickering_probability > _rnd_float(lightning.rngSeed, 0.0f, 1.0f);
       if ((doBolt || lightning__scene_illumination_enable_for_flash) && isNearSun)
       {
         Point3 towardsLightDir = lightPos;
         towardsLightDir.normalize();
         ShaderGlobal::set_int(lightning_scene_illuminationVarId, 1);
-        ShaderGlobal::set_color4(lightning_scene_illumination_dirVarId, towardsLightDir);
+        ShaderGlobal::set_float4(lightning_scene_illumination_dirVarId, towardsLightDir);
       }
       if (lightning__animchars_eids.empty())
         return;
 
       ecs::EntityId eid = lightning__animchars_eids[lightning.currentAnimcharId];
-      enable_lightning_animchar_ecs_query(eid,
+      enable_lightning_animchar_ecs_query(manager, eid,
         [&, &parentTransform = transform](bool &animchar_render__enabled, float &animchar_render__dist_sq, TMatrix &transform) {
           transform = parentTransform;
 
           float height = transform.getcol(3).y;
-          float padding = 1000;
+          float padding = 10000.f;
 
           if (doBolt)
           {
@@ -399,34 +437,37 @@ static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX 
           setPointLightStrength(lightning__point_light_strength_interval.x * lightning.strengthMultiplierCurrentSeries);
           setPointLightExtinctionThreshold(lightning__point_light_extinction_threshold);
           setPointLightNaturalFade(lightning__point_light_natural_fade);
-          ShaderGlobal::set_real(lightning_current_bottomVarId, floor(cloudsHeight / lightning__bolt_step_size));
-          ShaderGlobal::set_real(lightning_vert_noise_scaleVarId, lightning__vert_noise_scale);
-          ShaderGlobal::set_real(lightning_vert_noise_strengthVarId, lightning__vert_noise_strength);
-          ShaderGlobal::set_real(lightning_vert_noise_speedVarId, lightning__vert_noise_speed);
+          ShaderGlobal::set_float(lightning_current_bottomVarId, floor(cloudsHeight / lightning__bolt_step_size));
+          ShaderGlobal::set_float(lightning_vert_noise_scaleVarId, lightning__vert_noise_scale);
+          ShaderGlobal::set_float(lightning_vert_noise_strengthVarId, lightning__vert_noise_strength);
+          ShaderGlobal::set_float(lightning_vert_noise_speedVarId, lightning__vert_noise_speed);
 
           float heightEps = 1.0f;
-          ShaderGlobal::set_real(lightning_inverse_height_differenceVarId,
+          ShaderGlobal::set_float(lightning_inverse_height_differenceVarId,
             1.0f / (eastl::max(transform.getcol(3).y - cloudsHeight, 0.0f) + heightEps));
-          ShaderGlobal::set_real(lightning_top_heightVarId, transform.getcol(3).y);
+          ShaderGlobal::set_float(lightning_top_heightVarId, transform.getcol(3).y);
 
-          ShaderGlobal::set_real(lightning_step_sizeVarId, 1.0f / float(lightning__bolt_step_size));
+          ShaderGlobal::set_float(lightning_step_sizeVarId, 1.0f / float(lightning__bolt_step_size));
           setPointLightEnable(true);
 
           lightning.strengthCurrent = lightning__point_light_strength_interval.x;
         });
     }
 
+    if (lightning.suppressed)
+      return;
+
     float bottomLerpVal = (currentTime - lightning.strikeStartTime) / lightning__bolt_strike_time;
     float currentNoise = eastl::max(1 - (currentTime - lightning.strikeStartTime) / lightning__vert_noise_time, 0.0f);
     float currentBottom = eastl::max(lerp(getCloudsAlt(), 0.0f, bottomLerpVal), 0.0f);
-    ShaderGlobal::set_real(lightning_current_bottomVarId, floor(currentBottom / lightning__bolt_step_size));
-    ShaderGlobal::set_real(lightning_vert_noise_time_multiplierVarId, currentNoise);
+    ShaderGlobal::set_float(lightning_current_bottomVarId, floor(currentBottom / lightning__bolt_step_size));
+    ShaderGlobal::set_float(lightning_vert_noise_time_multiplierVarId, currentNoise);
 
     float emissiveLerpFadeInVal = clamp((currentTime - lightning.strikeStartTime) / lightning__emissive_fadein_time, 0.0f, 1.0f);
     float emissiveLerpFadeOutVal = clamp((lightning.strikeEndTime - currentTime) / lightning__emissive_fadeout_time, 0.0f, 1.0f);
     float emissiveLerpValue = clamp(emissiveLerpFadeInVal * emissiveLerpFadeOutVal, 0.0f, 1.0f);
     float emissiveCurrent = eastl::max(lerp(0.0f, lightning__emissive_multiplier, emissiveLerpValue), 0.0f);
-    ShaderGlobal::set_real(lightning_emissive_multiplierVarId, emissiveCurrent);
+    ShaderGlobal::set_float(lightning_emissive_multiplierVarId, emissiveCurrent);
 
     float strengthCurrent =
       lerp(lightning__point_light_strength_interval.x, lightning__point_light_strength_interval.y, emissiveLerpValue) *
@@ -438,7 +479,7 @@ static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX 
 
     Point3 currentIllumColor = lightning__point_light_color;
     float illumMulCurrent = lerp(0.0f, lightning__scene_illumination_multiplier, emissiveLerpValue);
-    ShaderGlobal::set_color4(lightning_scene_illumination_colorVarId, currentIllumColor * strengthCurrent * illumMulCurrent);
+    ShaderGlobal::set_float4(lightning_scene_illumination_colorVarId, currentIllumColor * strengthCurrent * illumMulCurrent);
     return;
   }
 
@@ -452,11 +493,12 @@ static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX 
 
     if (lightning__animchars_eids.empty())
       return;
-    disable_lightning_animchar_ecs_query(lightning__animchars_eids[lightning.currentAnimcharId],
+    disable_lightning_animchar_ecs_query(manager, lightning__animchars_eids[lightning.currentAnimcharId],
       [&](bool &animchar_render__enabled) { animchar_render__enabled = false; });
   }
 
   // player, who joined after some time, will catch up and will have lightning synchronized; catching up 2 hours takes ~3usec
+  bool newStrikeGenerated = false;
   while (lightning.strikeEndTime < currentTime)
   {
     // Determine if next strike would be a part of series or not
@@ -507,6 +549,30 @@ static void lightning_update_es(const ecs::UpdateStageInfoAct &evt, LightningFX 
 
     lightning.currentAnimcharId =
       (lightning.currentAnimcharId + _rnd_int(lightning.rngSeed, 1, lightning.animcharNum - 1)) % (lightning.animcharNum);
+
+    newStrikeGenerated = true;
+  }
+
+  if (lightning__cloud_density_check && newStrikeGenerated)
+  {
+    lightning.cloudTraceId = -1; // abandon any stale in-flight trace from the previous strike
+
+    // vertical ray straight down at the strike's XZ; only volumetric clouds participate (clouds_field, not strata).
+    float startAlt = skies->getCloudsStartAlt();
+    float topAlt = skies->getCloudsTopAlt();
+    if (startAlt >= 0.f && topAlt > startAlt)
+    {
+      lightning.cloudPresent = true;
+      float azimuth = lightning.azimuthCurrent * TWOPI;
+      float dist = lightning.distanceCurrent;
+      Point3 traceOrigin = Point3(cos(azimuth) * dist, topAlt + cloud_trace_margin, sin(azimuth) * dist);
+      float traceDist = (topAlt - startAlt) + 2.0f * cloud_trace_margin;
+      lightning.cloudTraceId = skies->addCloudsTrace(traceOrigin, Point3(0.0f, -1.0f, 0.0f), traceDist, cloud_trace_threshold, 0.0f);
+    }
+    else
+    {
+      lightning.cloudPresent = false;
+    }
   }
 
   // Update point light radius and strength for fadeout effect

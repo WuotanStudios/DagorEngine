@@ -29,6 +29,7 @@
 #include <startup/dag_restart.h>
 #include <startup/dag_startupTex.h>
 #include <workCycle/dag_gameScene.h>
+#include <workCycle/dag_startupModules.h>
 #include <winGuiWrapper/wgw_dialogs.h>
 
 #include <imgui/imgui.h>
@@ -91,7 +92,6 @@ public:
       d3d::set_render_target();
       d3d::clearview(CLEAR_TARGET, 0, 0, 0);
       imgui_render();
-      d3d::pcwin::set_present_wnd(wndManager.getMainWindow());
     }
   }
 
@@ -129,17 +129,23 @@ BlkEditorApp::~BlkEditorApp()
   del_it(undoSystem);
 
   mManager->unregisterWindowHandler(this);
+
+  PropPanel::release();
+  imgui_shutdown();
 }
 
 
 void BlkEditorApp::init3d()
 {
   dgs_all_shader_vars_optionals = true;
-  mManager->init3d("auto", nullptr);
+  mManager->init3d("auto", nullptr, "Datablock Editor", "guiEditorIcon");
 
-  ::startup_shaders(String(260, "%s/../commonData/guiShaders", sgg::get_exe_path_full()));
+  ::startup_shaders(String(260, "%s/guiShaders", sgg::get_common_data_dir()));
   ::startup_game(RESTART_ALL);
   ShaderGlobal::enableAutoBlockChange(true);
+
+  ShaderGlobal::set_int(get_shader_variable_id("dgs_tex_anisotropy", true), ::dgs_tex_anisotropy);
+  ShaderGlobal::set_float(get_shader_variable_id("mip_bias", true), 0.f);
 
   set_default_file_texture_factory();
   register_loadable_tex_create_factory();
@@ -169,12 +175,18 @@ void BlkEditorApp::init()
   getMainMenu()->setEventHandler(this);
 
   updateWindowText();
+  init3d();
+
+  dagor_init_keyboard_win();
+  dagor_init_mouse_win();
+  editor_core_initialize_input_handler();
+  startup_game(RESTART_ALL);
+
+  editor_core_initialize_imgui();
+  dagor_select_game_scene(new BlkEditorScene(*this, *mManager));
+
   mManager->show();
   makeDefaultLayout();
-
-  init3d();
-  editor_core_initialize_imgui(nullptr); // The path is not set to avoid saving the settings.
-  dagor_select_game_scene(new BlkEditorScene(*this, *mManager));
 
   // Needed because of the Scintilla child window.
   const HWND mainWindow = (HWND)mManager->getMainWindow();
@@ -310,7 +322,7 @@ void BlkEditorApp::repaint() {}
 
 void BlkEditorApp::fillToolBar()
 {
-  PropPanel::ContainerPropertyControl *tool = mToolPanel->createToolbarPanel(CM_TOOLS, "");
+  PropPanel::ContainerPropertyControl *tool = mToolPanel->createToolbarPanel(CM_TOOLS);
 
   tool->setEventHandler(this);
 
@@ -698,7 +710,7 @@ void BlkEditorApp::updateImgui()
     PropPanel::pushToolBarColorOverrides();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, PropPanel::Constants::TOOLBAR_WINDOW_PADDING);
 
-    ImGui::BeginChild("Toolbar", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Border,
+    ImGui::BeginChild("Toolbar", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders,
       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking);
 
     ImGui::PopStyleVar();

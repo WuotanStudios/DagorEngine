@@ -2,6 +2,7 @@
 
 #include "shader_library.h"
 #include "d3d12_error_handling.h"
+#include "debug/names.h"
 
 #include <perfMon/dag_autoFuncProf.h>
 
@@ -54,7 +55,7 @@ public:
 template <typename T>
 inline void append_name_for_shader_lib_at(eastl::wstring_view lib_prefix, uint32_t index, T &target)
 {
-  char buf[5];
+  char buf[9];
   auto count = sprintf_s(buf, "%04X", index);
 
   ConcatWrapper<T> doConcat{target, lib_prefix.length() + count + 1};
@@ -71,7 +72,11 @@ struct AutoLifetimeTimer
   AutoLifetimeTimer(T maker) : timingFormatString{maker()}, timingData{timingFormatString.c_str()}
   {}
 
-  void abbortTiming() { timingData.fmt = nullptr; }
+  void abbortTiming()
+  {
+    if constexpr (requires { timingData.fmt; })
+      timingData.fmt = nullptr;
+  }
 };
 
 class ShaderLibraryBuilder : AutoLifetimeTimer<AFP_MSEC>
@@ -98,7 +103,7 @@ public:
     ci{create_info}
   {}
 
-  drv3d_dx12::ShaderLibrary *build(ID3D12Device5 *device)
+  drv3d_dx12::ShaderLibrary *build(ID3D12Device5 *device, bool embeddable)
   {
     eastl::string libName;
     if (ci.debugName)
@@ -130,36 +135,32 @@ public:
       return onError("DX12: Shader library calculated hash does not match stored hash for <%s>", libName);
     }
 
-    char strBuf[sizeof(ShaderHashValue) * 2 + 1];
-    libContainer->binaryHash.convertToString(strBuf, sizeof(strBuf));
-    eastl::wstring libPrefix;
-    // -1, as we don't need to push back the terminating 0 into the string
-    eastl::copy(eastl::begin(strBuf), eastl::end(strBuf) - 1, eastl::back_inserter(libPrefix));
-
-    DynamicArray<D3D12_EXPORT_DESC> exportTable;
     DynamicArray<DynamicArray<wchar_t>> nameTable;
-    exportTable.resize(libContainer->shaderProperties.size());
-    nameTable.resize(libContainer->shaderProperties.size() * 2);
+    nameTable.resize(libContainer->shaderProperties.size());
     for (uint32_t i = 0; i < libContainer->shaderProperties.size(); ++i)
     {
       eastl::string_view srcName = ci.nameTable[i];
-      auto &inHLSLName = nameTable[i * 2 + 0];
-      auto &publicName = nameTable[i * 2 + 1];
+      auto &inHLSLName = nameTable[i];
       inHLSLName.resize(srcName.length() + 1);
       inHLSLName[srcName.length()] = L'\0';
       eastl::copy(srcName.begin(), srcName.end(), inHLSLName.data());
-      append_name_for_shader_lib_at(libPrefix, i, publicName);
-      auto &desc = exportTable[i];
-      desc.Name = publicName.data();
-      desc.ExportToRename = inHLSLName.data();
-      desc.Flags = D3D12_EXPORT_FLAG_NONE;
+    }
+
+    if (embeddable)
+    {
+      DynamicArray<uint8_t> dxilCopy;
+      dxilCopy.resize(libContainer->dxilBinary.size());
+      eastl::copy(libContainer->dxilBinary.data(), libContainer->dxilBinary.data() + libContainer->dxilBinary.size(), dxilCopy.data());
+      logdbg("DX12: ...completed, creating embeddable shader library object for <%s>...", libName);
+      return new drv3d_dx12::ShaderLibrary(eastl::move(libName), libContainer->resourceUsageInfo, libContainer->shaderProperties,
+        eastl::move(nameTable), {}, ci.mayBeUsedByExpandablePipeline, eastl::move(dxilCopy));
     }
 
     D3D12_DXIL_LIBRARY_DESC libDesc{};
     libDesc.DXILLibrary.pShaderBytecode = libContainer->dxilBinary.data();
     libDesc.DXILLibrary.BytecodeLength = libContainer->dxilBinary.size();
-    libDesc.NumExports = exportTable.size();
-    libDesc.pExports = exportTable.data();
+    libDesc.NumExports = 0;
+    libDesc.pExports = nullptr;
 
     D3D12_STATE_OBJECT_CONFIG config{};
     // we allow state objects to be incomplete so that they can be used to glue stuff together
@@ -185,35 +186,28 @@ public:
     {
       return onError("DX12: Unable to create shader library <%s>", libName);
     }
+    drv3d_dx12::debug::name_object(object.Get(), drv3d_dx12::debug::format_object_name("ShaderLibrary:%s", libName.c_str()));
 
     logdbg("DX12: ...completed, creating shader library object for <%s>...", libName);
 
-    return new drv3d_dx12::ShaderLibrary(eastl::move(libName), eastl::move(libPrefix), libContainer->resourceUsageInfo,
-      libContainer->shaderProperties, eastl::move(object), ci.mayBeUsedByExpandablePipeline);
+    return new drv3d_dx12::ShaderLibrary(eastl::move(libName), libContainer->resourceUsageInfo, libContainer->shaderProperties,
+      eastl::move(nameTable), eastl::move(object), ci.mayBeUsedByExpandablePipeline);
   }
 };
 } // namespace
 
-void drv3d_dx12::ShaderLibrary::appendNameOfTo(uint32_t index, eastl::wstring &target) const
+eastl::wstring_view drv3d_dx12::ShaderLibrary::nameOf(uint32_t index) const
 {
-  if (index >= shaderProperties.size())
+  if (index >= nameTable.size())
   {
-    return;
+    return {};
   }
-  append_name_for_shader_lib_at(libPrefix, index, target);
-}
-DynamicArray<wchar_t> drv3d_dx12::ShaderLibrary::makeNameOfAsDynArray(uint32_t index) const
-{
-  DynamicArray<wchar_t> result;
-  if (index < shaderProperties.size())
-  {
-    append_name_for_shader_lib_at(libPrefix, index, result);
-  }
-  return result;
+  return {nameTable[index].begin(), nameTable[index].size() - 1};
 }
 
-drv3d_dx12::ShaderLibrary *drv3d_dx12::ShaderLibrary::build(ID3D12Device5 *device, const ::ShaderLibraryCreateInfo &ci)
+drv3d_dx12::ShaderLibrary *drv3d_dx12::ShaderLibrary::build(ID3D12Device5 *device, const ::ShaderLibraryCreateInfo &ci,
+  bool embeddable)
 {
   ShaderLibraryBuilder shaderLibraryBuilder{ci};
-  return shaderLibraryBuilder.build(device);
+  return shaderLibraryBuilder.build(device, embeddable);
 }

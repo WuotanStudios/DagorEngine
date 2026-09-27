@@ -7,6 +7,14 @@ include "underwater_fog.dshl"
 include "flow_map_inc.dshl"
 include "dafx_blocks.dshl"
 include "camera_in_camera.dshl"
+include "voxel_shadows_use.dshl"
+include "clouds2/clouds_rain_map.dshl"
+include "water_heightmap.dshl"
+
+texture water_heightmap_lowres;
+
+int modfx_debug_render = 0;
+interval modfx_debug_render : off < 1, on;
 
 int dafx_use_underwater_fog = 0;
 int dafx_is_water_proj = 0;
@@ -18,6 +26,17 @@ int dafx_use_gravity_zone = 0; // should be assumed
 interval dafx_use_gravity_zone : no < 1, yes;
 buffer dafx_gravity_zone_buffer;
 
+int4 temporal_shadow_frame;
+
+int dafx_use_voxel_shadows = 0;
+interval dafx_use_voxel_shadows: no < 1, yes_vs < 2, yes_ps;
+
+bool dafx_has_voxel_shadows = dafx_use_voxel_shadows != no;
+
+bool dafx_use_cluster_lights = modfx_debug_render == off && modfx_bboard_lighting_from_clustered_lights == yes && dynamic_lights_count != lights_off;
+
+bool dafx_apply_volfog_per_pixel = fx_apply_volfog_per_pixel == yes;
+
 hlsl
 {
   #define DAFXEX_USE_REACTIVE_MASK 1
@@ -26,11 +45,11 @@ hlsl
 macro DAFXEX_USE_DEPTH(stage)
   if ( in_editor_assume == no )
   {
-    (stage) { fx_depth_tex@smp2d = effects_depth_tex; }
+    (stage) { fx_depth_tex@tex2d = effects_depth_tex; }
   }
   else
   {
-    (stage) { fx_depth_tex@smp2d = downsampled_far_depth_tex; }
+    (stage) { fx_depth_tex@tex2d = downsampled_far_depth_tex; }
   }
 
   hlsl { #include "dafx_globals.hlsli" }
@@ -69,7 +88,7 @@ macro DAFXEX_USE_SCENE_BLOCK()
   else
   {
     supports dynamic_scene_trans;
-    supports global_const_block;
+    GLOBAL_CONSTS(vs)
   }
 
 endmacro
@@ -132,13 +151,13 @@ if (shader != dafx_modfx_bboard_render_fom)
 {
   hlsl
   {
-    #if !MOBILE_DEVICE
-      #define MODFX_USE_SHADOW 1
+    ##if use_dng_mobile_optimizations == no
+      #define MODFX_USE_FAKE_BRIGHTNESS 1
+      #define MODFX_USE_STATIC_SHADOW 1
       #define HAS_STATIC_SHADOW 1
-    #endif
+    ##endif
   }
-  USE_STATIC_SHADOW_BASE_NUM(vs, 1)
-  USE_STATIC_SHADOW_BASE_NUM(ps, 1)
+  USE_STATIC_SHADOW_VS()
   USE_FOM_SHADOWS(vs)
   SQ_CLOUDS_SHADOW(vs)
 }
@@ -199,6 +218,15 @@ macro DAFXEX_USE_DEPTH_ABOVE(stage)
   }
 endmacro
 
+macro DAFXEX_USE_RAIN_MAP(stage)
+  if (in_editor_assume == no)
+  {
+    hlsl(stage) { #define DAFX_USE_RAIN_MAP 1 }
+    INIT_CLOUDS_RAIN_MAP(stage)
+    USE_CLOUDS_RAIN_MAP(stage)
+  }
+endmacro
+
 macro DAFXEX_USE_HMAP(stage)
   if (in_editor_assume == no)
   {
@@ -213,11 +241,16 @@ macro DAFXEX_USE_PARTICLE_PLACEMENT()
   (vs)
   {
     water_level@f1 = (water_level);
+    water_heightmap_lowres@tex2d = water_heightmap_lowres;
+    water_heightmap_lowres_exists@i1 = exists_tex(water_heightmap_lowres);
+    world_to_water_heightmap@f4 = (world_to_water_heightmap);
   }
+  INIT_GLOBAL_LINEAR_WRAP_SAMPLER(vs)
   DAFXEX_USE_DEPTH_ABOVE(vs)
   DAFXEX_USE_HMAP(vs)
   hlsl (vs)
   {
+    #define water_heightmap_lowres_samplerstate global_linear_wrap_sampler
     #include "modfx/modfx_gpu_placement_flags.hlsli"
 
     bool place_fx_above(inout float3 wpos, float placement_threshold, uint flags)
@@ -228,7 +261,15 @@ macro DAFXEX_USE_PARTICLE_PLACEMENT()
 
 ##if (in_editor_assume == no)
       FLATTEN if (flags & MODFX_GPU_PLACEMENT_WATER)
-        height = max(height, water_level);
+      {
+        float wl = water_level;
+        if (water_heightmap_lowres_exists)
+        {
+          float2 uv = wpos.xz * world_to_water_heightmap.zw + world_to_water_heightmap.xy;
+          wl = tex2Dlod(water_heightmap_lowres, float4(uv, 0, 0)).r;
+        }
+        height = max(height, wl);
+      }
 ##endif
 
 #if DAFX_USE_HMAP
@@ -239,9 +280,13 @@ macro DAFXEX_USE_PARTICLE_PLACEMENT()
 #if DAFX_USE_DEPTH_ABOVE
       if (flags & MODFX_GPU_PLACEMENT_DEPTH_ABOVE)
       {
+        FLATTEN if ((flags == MODFX_GPU_PLACEMENT_DEPTH_ABOVE) && !is_inside_depth_above_bounds(wpos))
+          return false;
+
         float vignette = 0;
         float suggestedHeight = get_depth_above_fast(wpos, vignette);
-        height = max(lerp(suggestedHeight, wpos.y, vignette), height); // must be checked last because of vignette
+        float fallbackHeight = (height <= INVALID_HEIGHT + EPS) ? wpos.y : height;
+        height = max(lerp(suggestedHeight, fallbackHeight, vignette), height); // must be checked last because of vignette
       }
 #endif
 
@@ -266,6 +311,46 @@ macro DAFXEX_USE_WATER_FLOWMAP(stage)
   if (in_editor_assume == no && compatibility_mode == compatibility_mode_off)
   {
     FX_USE_WATER_FLOWMAP(stage)
+  }
+endmacro
+
+macro DAFXEX_USE_VOXEL_SHADOWS()
+  if (dafx_use_voxel_shadows == yes_vs)
+  {
+    hlsl { #define DAFX_USE_VOXEL_SHADOWS_VS 1 }
+
+    VOXEL_SHADOWS_USE(vs)
+    hlsl(vs)
+    {
+      float apply_voxel_shadows(float3 wpos, float shadow)
+      {
+        uint cascade_id;
+        float fade;
+        float voxelShadow = get_voxel_shadows(wpos, cascade_id, fade);
+        return lerp(shadow, voxelShadow, fade); // in DNG, voxel shadows take over, and original shadow is faded out as fallback
+      }
+    }
+  }
+  else if (dafx_use_voxel_shadows == yes_ps)
+  {
+    hlsl { #define DAFX_USE_VOXEL_SHADOWS_PS 1 }
+
+    (ps)
+    {
+      shadow_frame@f1 = temporal_shadow_frame.x;
+    }
+
+    VOXEL_SHADOWS_USE_DITHER(ps)
+    hlsl(ps)
+    {
+      float apply_voxel_shadows(float3 wpos, float2 pixel_pos, float3 sun_dir, float dither_rad, float shadow)
+      {
+        uint cascade_id;
+        float fade;
+        float voxelShadow = get_voxel_shadows_dithered(wpos, pixel_pos, sun_dir, dither_rad, 0.5, cascade_id, fade);
+        return lerp(shadow, voxelShadow, fade); // in DNG, voxel shadows take over, and original shadow is faded out as fallback
+      }
+    }
   }
 endmacro
 

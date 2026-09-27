@@ -9,38 +9,32 @@
 #include "buffBindPoints.h"
 #include "buffers.h"
 
+#include <drv/3d/dag_bindless.h>
 #include <util/dag_globDef.h>
 #include <debug/dag_assert.h>
+#include <debug/dag_fatal.h>
 #include <drv_assert_defs.h>
+#include "drv_log_defs.h"
+#include <osApiWrappers/dag_critSec.h>
 
 #include "free_list_utils.h"
 
 using namespace drv3d_metal;
 
-static void resizeBindlessArrays(D3DResourceType type, uint32_t count)
-{
-  if (D3DResourceType::SBUF == type)
-  {
-    render.bindlessBuffers.resize(count);
-    G_ASSERTF(count <= Render::BINDLESS_BUFFER_COUNT, "bindless buffer slot out of range: %d (max slot id: %d)", count, Render::BINDLESS_BUFFER_COUNT);
-  }
-  else
-  {
-    if (type == D3DResourceType::TEX)
-      render.bindlessTextures2D.resize(count);
-    else if (type == D3DResourceType::CUBETEX)
-      render.bindlessTexturesCube.resize(count);
-    else if (type == D3DResourceType::ARRTEX)
-      render.bindlessTextures2DArray.resize(count);
-    else
-      G_ASSERTF(0, "Unknown bindless array type %d", int(type));
-    G_ASSERTF(count <= Render::BINDLESS_TEXTURE_COUNT, "bindless texture slot out of range: %d (max slot id: %d)", count, Render::BINDLESS_TEXTURE_COUNT);
-  }
-}
+// d3d:: calls that allocate/resize/free bindless ranges have no external sync requirement, so do sync internally.
+static WinCritSec rangesMutex;
+static WinCritSec samplerTableMutex;
 
 uint32_t BindlessManager::allocateBindlessResourceRange(D3DResourceType type, uint32_t count)
 {
-  G_ASSERT(D3DResourceType::TEX == type || D3DResourceType::CUBETEX == type || D3DResourceType::ARRTEX == type || D3DResourceType::SBUF == type);
+  WinAutoLock lock(rangesMutex);
+  return allocateBindlessResourceRangeNoLock(type, count);
+}
+
+uint32_t BindlessManager::allocateBindlessResourceRangeNoLock(D3DResourceType type, uint32_t count)
+{
+  G_ASSERT(D3DResourceType::TEX == type || D3DResourceType::CUBETEX == type || D3DResourceType::ARRTEX == type ||
+           D3DResourceType::VOLTEX == type || D3DResourceType::CUBEARRTEX == type || D3DResourceType::SBUF == type);
 
   ResourceArray &res = getArray(type);
 
@@ -48,8 +42,15 @@ uint32_t BindlessManager::allocateBindlessResourceRange(D3DResourceType type, ui
   if (range.empty())
   {
     auto r = res.size;
+    if (r + count > ::bindless::MAX_RESOURCE_INDEX_COUNT)
+    {
+      D3D_CONTRACT_ERROR("Metal: Out of bindless slots, asked for %u while limit is %u and %u is already allocated", count,
+        ::bindless::MAX_RESOURCE_INDEX_COUNT, r);
+      DAG_FATAL("Metal: Critical D3D contract violation, out of bindless slots, can not continue");
+      return 0;
+    }
     res.size += count;
-    resizeBindlessArrays(type, res.size);
+    render.resizeBindlessArrayAnyThread(type, res.size);
     return r;
   }
   else
@@ -58,41 +59,16 @@ uint32_t BindlessManager::allocateBindlessResourceRange(D3DResourceType type, ui
   }
 }
 
-uint32_t BindlessManager::resizeBindlessResourceRange(D3DResourceType type, uint32_t index, uint32_t currentCount, uint32_t newCount)
-{
-  G_ASSERT(D3DResourceType::TEX == type || D3DResourceType::CUBETEX == type || D3DResourceType::ARRTEX == type || D3DResourceType::SBUF == type);
-
-  ResourceArray &res = getArray(type);
-
-  if (newCount == currentCount)
-  {
-    return index;
-  }
-
-  uint32_t rangeEnd = index + currentCount;
-  if (rangeEnd == res.size)
-  {
-    // the range is in the end of the heap, so we just update the heap size
-    res.size = index + newCount;
-    resizeBindlessArrays(type, res.size);
-    return index;
-  }
-  if (free_list_try_resize(res.freeSlotRanges, make_value_range(index, currentCount), newCount))
-  {
-    return index;
-  }
-  // we are unable to expand the resource range, so we have to reallocate elsewhere and copy the existing descriptors :/
-  uint32_t newIndex = allocateBindlessResourceRange(type, newCount);
-
-  render.copyBindlessResources(type, index, newIndex, currentCount);
-
-  freeBindlessResourceRange(type, index, currentCount);
-  return newIndex;
-}
-
 void BindlessManager::freeBindlessResourceRange(D3DResourceType type, uint32_t index, uint32_t count)
 {
-  G_ASSERT(D3DResourceType::TEX == type || D3DResourceType::CUBETEX == type || D3DResourceType::ARRTEX == type || D3DResourceType::SBUF == type);
+  WinAutoLock lock(rangesMutex);
+  freeBindlessResourceRangeNoLock(type, index, count);
+}
+
+void BindlessManager::freeBindlessResourceRangeNoLock(D3DResourceType type, uint32_t index, uint32_t count)
+{
+  G_ASSERT(D3DResourceType::TEX == type || D3DResourceType::CUBETEX == type || D3DResourceType::ARRTEX == type ||
+           D3DResourceType::VOLTEX == type || D3DResourceType::CUBEARRTEX == type || D3DResourceType::SBUF == type);
 
   ResourceArray &res = getArray(type);
 
@@ -101,9 +77,7 @@ void BindlessManager::freeBindlessResourceRange(D3DResourceType type, uint32_t i
     "%u, bindless count %u",
     index, index + count, res.size);
 
-  render.acquireOwnership();
-  render.updateBindlessResourcesToNull(type, index, count);
-  render.releaseOwnership();
+  render.updateBindlessResourcesToNullAnyThread(type, index, count);
 
   if (index + count != res.size)
   {
@@ -122,10 +96,22 @@ uint32_t BindlessManager::registerBindlessSampler(int index, float bias)
 {
   D3D_CONTRACT_ASSERTF_RETURN(index >= 0, 0, "Trying to register an invalid bindless sampler");
 
-  id<MTLSamplerState> sampler = render.sampler_states[index].sampler;
+  id<MTLSamplerState> sampler = nil;
+  {
+    std::lock_guard<std::mutex> lock(render.samplerStatesMutex);
+    sampler = render.sampler_states[index].sampler;
+  }
+
+  uint64_t samplerResId = 0;
+  if (@available(iOS 16, macOS 13.0, *))
+  {
+    MTLResourceID res = sampler.gpuResourceID;
+    memcpy(&samplerResId, &res, sizeof(res));
+  }
 
   uint32_t newIndex;
   {
+    WinAutoLock lock(samplerTableMutex);
     auto ref = eastl::find(begin(samplerTable), end(samplerTable), sampler);
     if (ref != end(samplerTable))
     {
@@ -133,22 +119,16 @@ uint32_t BindlessManager::registerBindlessSampler(int index, float bias)
     }
 
     newIndex = static_cast<uint32_t>(samplerTable.size());
+    if (newIndex >= Render::BINDLESS_SAMPLER_COUNT)
+    {
+      D3D_CONTRACT_ERROR("Metal: out of bindless sampler slots, limit is %u", Render::BINDLESS_SAMPLER_COUNT);
+      DAG_FATAL("Metal: Critical D3D contract violation, out of bindless sampler slots, can not continue");
+      return 0;
+    }
     samplerTable.push_back(sampler);
   }
 
-  G_ASSERTF(newIndex < Render::BINDLESS_SAMPLER_COUNT, "bindless sampler slot out of range: %d (max slot id: %d)", newIndex, Render::BINDLESS_SAMPLER_COUNT);
-  if (render.bindlessSamplers.size() < newIndex + 1)
-  {
-    render.bindlessSamplers.resize(newIndex + 1);
-    render.bindlessSamplersCache.resize(newIndex + 1);
-  }
-  render.bindlessSamplers[newIndex] = sampler;
-  if (@available(iOS 16, macOS 13.0, *))
-  {
-    MTLResourceID res = sampler.gpuResourceID;
-    memcpy(&render.bindlessSamplersCache[newIndex], &res, sizeof(res));
-  }
-  render.bindless_resources_bound &= ~BindlessTypeSampler;
+  render.updateBindlessSamplerAnyThread(newIndex, bias, samplerResId);
 
   return newIndex;
 }

@@ -47,6 +47,8 @@ public:
   void setVelocityScaleMinMax(const Point2 &scale);
   void setSpawnRate(float rate);
   void setLightRadiusMultiplier(float multiplier);
+  void setLightFlags(uint32_t flags);
+  void setLightSourceRadius(float radius);
   void setColorMult(const Color4 &colorMult);
   void setVisibility(uint32_t visibility);
   void hide(bool hidden);
@@ -57,7 +59,11 @@ public:
   void setFxScale(float scale); // TODO: rename to setLightIntensity
   void setWindScale(float scale);
   void setGravityTm(const Matrix3 &tm);
+  void setSplineControlPoints(const Point4 &p0, const Point4 &p1, const Point4 &p2, const Point4 &p3);
   void setRestrictionBox(const TMatrix &box);
+  // pre-simulate the effect. time < 0 = auto (one full particle lifetime, i.e. steady state); auto wins
+  // over other requested times. step_dt = 0: keep an earlier requested step, else the dafx config default.
+  void warmup(float time, float step_dt = 0.f);
 
   bool hasSound() const;
   void pauseSound(bool pause);
@@ -99,7 +105,7 @@ DAG_DECLARE_RELOCATABLE(AcesEffect);
 struct EffectManagerAsyncLoad : public cpujobs::IJob
 {
   EffectManager *mgr;
-  const char *getJobName(bool &) const override { return "EffectManagerAsyncLoad"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("EffectManagerAsyncLoad"); }
   void doJob() override;
 };
 
@@ -114,12 +120,16 @@ struct FxLightParams
 class EffectManager
 {
 public:
+  static constexpr size_t SFX_PATH_BUF_SIZE = 48;
+  static constexpr size_t SFX_EVENT_BUF_SIZE = 24;
+
   friend class AcesEffect;
   friend struct EffectManagerAsyncLoad;
   friend void acesfx::start_effect_client(int, const TMatrix &, const TMatrix &, bool, bool, AcesEffect **, float, FxErrorType *);
   friend void acesfx::start_effect_client(const acesfx::StartFxParams &, AcesEffect **, FxErrorType *);
 
-  EffectManager(const char *_name, const DataBlock *blk, const char *effect_name, acesfx::PrefetchType prefetch_type);
+  EffectManager(const char *_name, const DataBlock *blk, const char *effect_name, acesfx::PrefetchType prefetch_type,
+    const acesfx::FXSoundInitParams *sound_init = nullptr);
   ~EffectManager();
 
   void initAsync();
@@ -133,7 +143,8 @@ public:
   void updateDelayedLights();
   float lifeTime() const;
 
-  AcesEffect *startEffect(const Point3 &pos, bool lock, bool is_player, FxErrorType *perr = nullptr, bool with_sound = true);
+  AcesEffect *startEffect(const Point3 &pos, bool lock, bool is_player, FxErrorType *perr = nullptr, bool with_sound = true,
+    bool with_biome_query = false);
   void stopAllEffects();
   void clearAllSoundsExt();
 
@@ -143,6 +154,7 @@ public:
   const char *getName() const { return params.name.c_str(); }
 
   bool hasLockedEffects();
+  void teleportAllRandomRad(float r); // for debug only
   static void updateCmdBuff();
   static void clearCmdBuff();
 
@@ -151,12 +163,13 @@ public:
   static void onSettingsChanged(bool shadows_enabled, int max_active_shadows);
   static void onSettingsChangedExt();
   static void setMagnification(float magnification);
+  static void loadGlobalConfig(const DataBlock &fx_blk);
 
   void getFxMatrices(dag::Vector<TMatrix, framemem_allocator> &matrices);
   void getDebugInfo(dag::Vector<Point3, framemem_allocator> &positions, dag::Vector<int, framemem_allocator> &elems,
-    dag::Vector<eastl::string_view, framemem_allocator> &names);
+    dag::Vector<eastl::string_view, framemem_allocator> &names, bool only_visible);
   void getResDebugInfo(dag::Vector<Point3, framemem_allocator> &positions, dag::Vector<eastl::string, framemem_allocator> &names,
-    dag::Vector<int, framemem_allocator> &out_elems);
+    dag::Vector<int, framemem_allocator> &out_elems, bool only_visible);
   int getStats(eastl::string &out);
   static void renderSortedRenderTransListExt(Tab<SortedRenderTransItem> &sorted_render_transList, TexStreamingContext &main_tex_ctx,
     bool &inside_render_trans_list_processing, bool do_clear = true);
@@ -182,8 +195,9 @@ private:
     float spawnRangeLimit = 0;
     int maxNumInstances = 0;
     bool lightEnabled = false;
-    char sfxPath[48] = {0};
-    char sfxEvent[24] = {0};
+    char sfxPath[SFX_PATH_BUF_SIZE] = {0};
+    char sfxPathInf[SFX_EVENT_BUF_SIZE] = {0};
+    char sfxEvent[SFX_EVENT_BUF_SIZE] = {0};
     sndsys::VarId intenseParamId = sndsys::VarId(sndsys::INVALID_VAR_ID);
     eastl::string name;
     eastl::string resName;
@@ -231,20 +245,24 @@ private:
   void setFxVelocitySoundExt(BaseEffect &fx, const Point3 &vel);
   void setFxVelocityScaleMinMax(BaseEffect &fx, const Point2 &scale);
   void setFxSpawnRate(BaseEffect &fx, float value);
+  void setFxWarmup(BaseEffect &fx, float time, float step_dt = 0.f);
   void setFxLightRadiusMultiplier(BaseEffect &fx, float multiplier);
+  void setFxLightFlags(BaseEffect &fx, uint32_t flags);
+  void setFxLightSourceRadius(BaseEffect &fx, float radius);
   void setFxLightIntensity(BaseEffect &fx, float intensity);
   void setFxLightFadeout(BaseEffect &fx, float fadeout);
   void setFxLightBox(BaseEffect &fx, const TMatrix &box);
   void setFxWindScale(BaseEffect &fx, float scale);
   void setFxGravityTm(BaseEffect &fx, const Matrix3 &tm);
+  void setFxSplineGenControlPoints(BaseEffect &fx, const TMatrix4 &data);
   void setFxColorMult(BaseEffect &fx, const Color4 &value);
   void unsetFxEmitter(BaseEffect &fx);
   void stopFx(BaseEffect &fx);
   void setFxLight(BaseEffect &fx);
-  void loadSoundParamsExt();
+  void loadSoundParamsExt(const acesfx::FXSoundInitParams *sound_init = nullptr);
   void tryPlayFxSoundExt(SoundEffect &se);
   void pauseFxSoundExt(BaseEffect &fx, bool paused);
-  void createFxRes(AcesEffect::FxId fx_id, const Point3 &pos);
+  void createFxRes(AcesEffect::FxId fx_id, bool is_player, const Point3 &pos);
   void updateFxSoundsExt(float dt);
 
   void setFxTmBuff(AcesEffect::FxId fx_id, const TMatrix &tm, bool is_emitter_tm);
@@ -254,11 +272,15 @@ private:
   void setFxVelocityBuff(AcesEffect::FxId fx_idx, const Point3 &vel);
   void setFxVelocityScaleMinMaxBuff(AcesEffect::FxId fx_id, const Point2 &scale);
   void setFxSpawnRateBuff(AcesEffect::FxId fx_id, float value);
+  void setFxWarmupBuff(AcesEffect::FxId fx_id, float time, float step_dt = 0.f);
   void setFxLightRadiusMultiplierBuff(AcesEffect::FxId fx_id, float multiplier);
+  void setFxLightFlagsBuff(AcesEffect::FxId fx_id, uint32_t flags);
+  void setFxLightSourceRadiusBuff(AcesEffect::FxId fx_id, float radius);
   void setFxLightIntensityBuff(AcesEffect::FxId fx_id, float intensity);
   void setFxLightFadeoutBuff(AcesEffect::FxId fx_id, float fadeout);
   void setFxLightBoxBuff(AcesEffect::FxId fx_id, const TMatrix &box);
   void setFxWindScaleBuff(AcesEffect::FxId fx_id, float scale);
+  void setFxSplineControlPointsBuff(AcesEffect::FxId fx_id, const Point4 &p0, const Point4 &p1, const Point4 &p2, const Point4 &p3);
   void setFxGravityTmBuff(AcesEffect::FxId fx_id, const Matrix3 &tm);
   void setFxColorMultBuff(AcesEffect::FxId fx_id, const Color4 &value);
   void unsetFxEmitterBuff(AcesEffect::FxId fx_id);

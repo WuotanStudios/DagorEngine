@@ -36,6 +36,7 @@
 
 #include <EditorCore/ec_ObjectCreator.h>
 #include <EditorCore/ec_colors.h>
+#include <EditorCore/ec_IEditorCore.h>
 #include <EditorCore/ec_wndGlobal.h>
 
 #include <libTools/dagFileRW/dagUtil.h>
@@ -53,8 +54,8 @@
 #include <drv/3d/dag_texture.h>
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_info.h>
+#include <drv/3d/dag_lock.h>
 #include <3d/dag_render.h>
-#include <render/dag_cur_view.h>
 #include <math/dag_colorMatrix.h>
 
 #include <debug/dag_debug.h>
@@ -126,6 +127,47 @@ enum
 
 #define ENVI_DAG "single_envi.dag"
 
+namespace
+{
+
+class EnvironmentPluginConsoleCommandProcessor : public console::ICommandProcessor
+{
+public:
+  EnvironmentPluginConsoleCommandProcessor(EnvironmentPlugin &in_plugin) : plugin(in_plugin) {}
+
+  void destroy() override {}
+
+  bool processCommand(const char *argv[], int argc) override
+  {
+    if (argc < 1)
+      return false;
+
+    const dag::Span<const char *> params = make_span(&argv[1], argc - 1);
+    int found = 0;
+
+    if (plugin.isAcesPlugin)
+    {
+      CONSOLE_CHECK_NAME_EX("envi", "set", 2, 2, "Type:\n'envi.set <envi_name>' to set current environment/daytime", "")
+      {
+        CONSOLE_COMMAND_BATCH_MODE_RESULT(plugin.runEnviSetCmd(params));
+      }
+    }
+
+    CONSOLE_CHECK_NAME_EX("envi", "sun_from_time", 1, 7, "", "year month day time lattitude longtitude")
+    {
+      plugin.runEnvSunFromTime(params);
+    }
+
+    return found != 0;
+  }
+
+private:
+  EnvironmentPlugin &plugin;
+};
+
+EnvironmentPluginConsoleCommandProcessor *console_command_processor = nullptr;
+
+} // namespace
 
 static E3DCOLOR color4ToE3dcolor(Color4 col, float &brightness)
 {
@@ -183,7 +225,7 @@ EnvironmentPlugin::EnvironmentPlugin() :
   colorTex(NULL),
   gameHttpServerAddr(INADDR_NONE)
 {
-  DataBlock app_blk(DAGORED2->getWorkspace().getAppPath());
+  DataBlock app_blk(DAGORED2->getWorkspace().getAppBlkPath());
   const DataBlock &envi_def = *app_blk.getBlockByNameEx("projectDefaults")->getBlockByNameEx("envi");
 
   memset(&envParams, 0, sizeof(envParams));
@@ -256,11 +298,9 @@ void EnvironmentPlugin::registered()
 {
   if (!isAcesPlugin)
     setFogDefaults();
-  else if (!DAGORED2->getConsole().registerCommand("envi.set", this))
-    DAEDITOR3.conError("[%s] Couldn't register command 'envi.set'", getMenuCommandName());
-  if (!DAGORED2->getConsole().registerCommand("envi.sun_from_time", this))
-    DAEDITOR3.conError("[%s] Couldn't register command 'envi.sun_from_time'", getMenuCommandName());
 
+  console_command_processor = new EnvironmentPluginConsoleCommandProcessor(*this);
+  editorcore_extapi::dagConsole->addConProc(console_command_processor);
 
   isVisible = true;
 
@@ -282,9 +322,9 @@ void EnvironmentPlugin::unregistered()
 {
   if (windSrv)
     windSrv->term();
-  if (isAcesPlugin)
-    DAGORED2->getConsole().unregisterCommand("envi.set", this);
-  DAGORED2->getConsole().unregisterCommand("envi.sun_from_time", this);
+
+  editorcore_extapi::dagConsole->delConProc(console_command_processor);
+  del_it(console_command_processor);
 }
 
 
@@ -308,16 +348,29 @@ bool EnvironmentPlugin::catchEvent(unsigned ev_huid, void *userData)
 }
 
 
+void EnvironmentPlugin::registerEditorCommands(IEditorCommandSystem &command_system)
+{
+  command_system.addCommand(EditorCommandIds::SHOW_PANEL, ImGuiKey_P);
+  command_system.addCommand(EditorCommandIds::RESET_GIZMO, ImGuiKey_Delete);
+  command_system.addCommand(EditorCommandIds::IMPORT, ImGuiMod_Ctrl | ImGuiKey_O);
+  command_system.addCommand(EditorCommandIds::HTTP_GAME_SERVER);
+  command_system.addCommand(EditorCommandIds::COLOR_CORRECTION);
+}
+
+
 //==============================================================================
 void EnvironmentPlugin::registerMenuAccelerators()
 {
   IWndManager &wndManager = *DAGORED2->getWndManager();
 
-  wndManager.addViewportAccelerator(CM_SHOW_PANEL, ImGuiKey_P);
-  wndManager.addViewportAccelerator(CM_RESET_GIZMO, ImGuiKey_Delete);
+  wndManager.addAccelerator(CM_SHOW_PANEL, EditorCommandIds::SHOW_PANEL);
+  wndManager.addViewportAccelerator(CM_RESET_GIZMO, EditorCommandIds::RESET_GIZMO);
 
   if (!isAcesPlugin)
-    wndManager.addViewportAccelerator(CM_IMPORT, ImGuiMod_Ctrl | ImGuiKey_O);
+    wndManager.addViewportAccelerator(CM_IMPORT, EditorCommandIds::IMPORT);
+
+  wndManager.addViewportAccelerator(CM_HTTP_GAME_SERVER, EditorCommandIds::HTTP_GAME_SERVER);
+  wndManager.addViewportAccelerator(CM_COLOR_CORRECTION, EditorCommandIds::COLOR_CORRECTION);
 }
 
 
@@ -325,23 +378,27 @@ void EnvironmentPlugin::registerMenuAccelerators()
 bool EnvironmentPlugin::begin(int toolbar_id, unsigned menu_id)
 {
   PropPanel::IMenu *mainMenu = DAGORED2->getMainMenu();
+  IEditorCommandSystem *commandSystem = DAGORED2->queryEditorInterface<IEditorCommandSystem>();
+  G_ASSERT(commandSystem);
 
   if (!isAcesPlugin)
   {
-    mainMenu->addItem(menu_id, CM_IMPORT, "Import DAG...\tCtrl+O");
+    commandSystem->addMenuItem(*mainMenu, menu_id, CM_IMPORT, EditorCommandIds::IMPORT, "Import DAG...");
     mainMenu->addSeparator(menu_id);
   }
 
-  mainMenu->addItem(menu_id, CM_SHOW_PANEL, "Show settings\tP");
+  commandSystem->addMenuItem(*mainMenu, menu_id, CM_SHOW_PANEL, EditorCommandIds::SHOW_PANEL, "Show settings");
   if (!skiesSrv)
   {
     mainMenu->addItem(menu_id, CM_SHOW_POSTFX_PANEL, "Show PostFX settings");
     mainMenu->addItem(menu_id, CM_SHOW_SHGV_PANEL, "Show Shader Global Vars");
     mainMenu->addItem(menu_id, CM_HDR_VIEW_SETTINGS, "HDR settings...");
   }
-  mainMenu->addItem(menu_id, CM_HTTP_GAME_SERVER, "Connect To Game HTTP Server");
+  commandSystem->addMenuItem(*mainMenu, menu_id, CM_HTTP_GAME_SERVER, EditorCommandIds::HTTP_GAME_SERVER,
+    "Connect to game HTTP server...");
 
-  mainMenu->addItem(menu_id, CM_COLOR_CORRECTION, "Color correction..."); // debug
+  commandSystem->addMenuItem(*mainMenu, menu_id, CM_COLOR_CORRECTION, EditorCommandIds::COLOR_CORRECTION,
+    "Color correction..."); // debug
 
   if (!isAcesPlugin)
   {
@@ -354,13 +411,13 @@ bool EnvironmentPlugin::begin(int toolbar_id, unsigned menu_id)
   G_ASSERT(toolbar);
   toolbar->setEventHandler(this);
 
-  PropPanel::ContainerPropertyControl *tool = toolbar->createToolbarPanel(CM_TOOL, "");
+  PropPanel::ContainerPropertyControl *tool = toolbar->createToolbarPanel(CM_TOOL);
 
-  tool->createButton(CM_IMPORT, "Import DAG (Ctrl+O)");
+  commandSystem->createToolbarButton(*tool, CM_IMPORT, EditorCommandIds::IMPORT, "Import DAG");
   tool->setButtonPictures(CM_IMPORT, "import_dag");
   tool->createSeparator();
 
-  tool->createCheckBox(CM_SHOW_PANEL, "Show settings (P)");
+  commandSystem->createToolbarToggleButton(*tool, CM_SHOW_PANEL, EditorCommandIds::SHOW_PANEL, "Show settings");
   tool->setButtonPictures(CM_SHOW_PANEL, "show_panel");
   if (!skiesSrv)
   {
@@ -372,7 +429,7 @@ bool EnvironmentPlugin::begin(int toolbar_id, unsigned menu_id)
     tool->setButtonPictures(CM_HDR_VIEW_SETTINGS, "hdr_view_settings");
   }
   tool->createSeparator();
-  tool->createButton(CM_HTTP_GAME_SERVER, "Connect to game http server");
+  commandSystem->createToolbarButton(*tool, CM_HTTP_GAME_SERVER, EditorCommandIds::HTTP_GAME_SERVER, "Connect to game HTTP server...");
   tool->setButtonPictures(CM_HTTP_GAME_SERVER, "terr_up_vertex");
 
   if (!isAcesPlugin)
@@ -476,86 +533,72 @@ void EnvironmentPlugin::resetEnvi()
 }
 
 
-bool EnvironmentPlugin::onConsoleCommand(const char *cmd, dag::ConstSpan<const char *> params)
+bool EnvironmentPlugin::runEnviSetCmd(dag::ConstSpan<const char *> params)
 {
   CoolConsole &con = DAGORED2->getConsole();
 
-  if (!stricmp(cmd, "envi.set") && params.size() == 1)
-  {
-    int errCnt = con.getErrorsCount() + con.getFatalsCount();
-    for (int i = 0; i < environmentNamesList.size(); i++)
-      if (strcmp(params[0], environmentNamesList[i]) == 0)
-      {
-        if (propPanel)
-          propPanel->setInt(CM_PID_ENVIRONMENTS_LIST, i);
-        if (selectedEnvironmentNo != -1)
-          getSettingsFromPlugins();
-
-        selectedEnvironmentNo = i;
-        setSettingsToPlugins();
-
-        updateLight();
-
-        if (postfxPanel)
-          recreatePostfxPanel();
-        if (shgvPanel)
-          recreateShGVPanel();
-        return con.getErrorsCount() + con.getFatalsCount() == errCnt;
-      }
-    DAEDITOR3.conError("unrecognized envi name <%s>", params[0]);
-  }
-  else if (!stricmp(cmd, "envi.sun_from_time"))
-  {
-    if (params.size() < 6)
+  int errCnt = con.getErrorsCount() + con.getFatalsCount();
+  for (int i = 0; i < environmentNamesList.size(); i++)
+    if (strcmp(params[0], environmentNamesList[i]) == 0)
     {
-      DAEDITOR3.conError("usage envi.sun_from_time year month day time lattitude longtitude");
-      return true;
-    }
-    unsigned year = atoi(params[0]);
-    unsigned month = atoi(params[1]);
-    unsigned day = atoi(params[2]);
-    double time = atof(params[3]);
-    real lat = atof(params[4]);
-    real lon = atof(params[5]);
-    float timeDelta = lon * 24.0 / 360.0;
-    double utctime = time - timeDelta;
-    if (utctime < 0)
-      utctime += 24.0;
-    {
-      double jd = julian_day(year, month, day, utctime);
-      double lst = calc_lst_hours(jd, lon);
+      if (propPanel)
+        propPanel->setInt(CM_PID_ENVIRONMENTS_LIST, i);
+      if (selectedEnvironmentNo != -1)
+        getSettingsFromPlugins();
 
-      // Get brightness of brightest star
-      star_catalog::StarDesc s = get_sun(jd, s);
-      radec_2_altaz(s.rightAscension, s.declination, lst, lat, s.altitude, s.azimuth);
-      s.azimuth = norm_s_ang(HALFPI - s.azimuth);
-      DAEDITOR3.conNote("Azimuth = %g Zenith = %f, for %d:%d:%d UTC time %d:%d lat =%g lon =%g", RadToDeg(s.azimuth),
-        RadToDeg(s.altitude), year, month, day, int(floor(utctime)), int(utctime * 60) % 60, lat, lon);
-      if (ltService->getSun(0))
-      {
-        ltService->getSun(0)->zenith = s.altitude;
-        ltService->getSun(0)->azimuth = s.azimuth;
-        updateLight();
-        onLightingSettingsChanged();
-        DAEDITOR3.conNote("Set");
-      }
-    }
-    return true;
-  }
+      selectedEnvironmentNo = i;
+      setSettingsToPlugins();
 
+      updateLight();
+
+      if (postfxPanel)
+        recreatePostfxPanel();
+      if (shgvPanel)
+        recreateShGVPanel();
+      return con.getErrorsCount() + con.getFatalsCount() == errCnt;
+    }
+
+  DAEDITOR3.conError("unrecognized envi name <%s>", params[0]);
   return false;
 }
 
 
-const char *EnvironmentPlugin::onConsoleCommandHelp(const char *cmd)
+void EnvironmentPlugin::runEnvSunFromTime(dag::ConstSpan<const char *> params)
 {
-  if (!stricmp(cmd, "envi.set"))
-    return "Type:\n"
-           "'envi.set <envi_name>' to set current environment/daytime.\n";
-  if (!stricmp(cmd, "envi.sun_from_time"))
-    return "Type:\n"
-           "envi.sun_from_time year month day time lattitude longtitude\n";
-  return NULL;
+  if (params.size() < 6)
+  {
+    DAEDITOR3.conError("usage envi.sun_from_time year month day time lattitude longtitude");
+    return;
+  }
+  unsigned year = atoi(params[0]);
+  unsigned month = atoi(params[1]);
+  unsigned day = atoi(params[2]);
+  double time = atof(params[3]);
+  real lat = atof(params[4]);
+  real lon = atof(params[5]);
+  float timeDelta = lon * 24.0 / 360.0;
+  double utctime = time - timeDelta;
+  if (utctime < 0)
+    utctime += 24.0;
+  {
+    double jd = julian_day(year, month, day, utctime);
+    double lst = calc_lst_hours(jd, lon);
+
+    // Get brightness of brightest star
+    star_catalog::StarDesc s = get_sun(jd, s);
+    radec_2_altaz(s.rightAscension, s.declination, lst, lat, s.altitude, s.azimuth);
+    s.azimuth = norm_s_ang(HALFPI - s.azimuth);
+    DAEDITOR3.conNote("Azimuth = %g Zenith = %f, for %d:%d:%d UTC time %d:%d lat =%g lon =%g", RadToDeg(s.azimuth),
+      RadToDeg(s.altitude), year, month, day, int(floor(utctime)), int(utctime * 60) % 60, lat, lon);
+    if (ltService->getSun(0))
+    {
+      ltService->getSun(0)->zenith = s.altitude;
+      ltService->getSun(0)->azimuth = s.azimuth;
+      updateLight();
+      onLightingSettingsChanged();
+      DAEDITOR3.conNote("Set");
+    }
+  }
 }
 
 bool EnvironmentPlugin::onPluginMenuClickInternal(unsigned id, PropPanel::ContainerPropertyControl *panel)
@@ -730,7 +773,7 @@ void EnvironmentPlugin::saveObjects(DataBlock &blk, DataBlock &local_data, const
   {
     getSettingsFromPlugins();
 
-    if (skiesSrv)
+    if (skiesSrv && !DAGORED2->getWorkspace().isUsingDngBasedSceneRender())
     {
       blk.setStr("weatherPreset", ::make_path_relative(weatherPresetsList[selectedWeatherPreset], DAGORED2->getSdkDir()));
       blk.setStr("weatherType", weatherTypesList[selectedWeatherType]);
@@ -749,7 +792,8 @@ void EnvironmentPlugin::saveObjects(DataBlock &blk, DataBlock &local_data, const
 #undef SAVE_ETS
     }
     local_data.setReal("znzfScale", envParams.znzfScale);
-    blk.setStr("enviName", environmentNamesList[selectedEnvironmentNo]);
+    if (unsigned(selectedEnvironmentNo) < environmentNamesList.size())
+      blk.setStr("enviName", environmentNamesList[selectedEnvironmentNo]);
     blk.setStr("commonFile", commonFileName);
     blk.setStr("levelFile", levelFileName);
 
@@ -769,6 +813,9 @@ void EnvironmentPlugin::saveObjects(DataBlock &blk, DataBlock &local_data, const
 
 void EnvironmentPlugin::getSettingsFromPlugins()
 {
+  if (DAGORED2->getWorkspace().isUsingDngBasedSceneRender())
+    return;
+
   G_ASSERT(!skiesSrv || selectedWeatherPreset != -1);
   G_ASSERT(!skiesSrv || selectedWeatherType != -1);
   G_ASSERT(selectedEnvironmentNo != -1);
@@ -862,6 +909,9 @@ void EnvironmentPlugin::getSettingsFromPlugins()
 
 void EnvironmentPlugin::setSettingsToPlugins()
 {
+  if (DAGORED2->getWorkspace().isUsingDngBasedSceneRender())
+    return;
+  d3d::GpuAutoLock gpuLock;
   G_ASSERT(!skiesSrv || selectedWeatherPreset != -1);
   G_ASSERT(!skiesSrv || selectedWeatherType != -1);
   G_ASSERT(selectedEnvironmentNo != -1);
@@ -961,10 +1011,10 @@ void EnvironmentPlugin::setSettingsToPlugins()
     float puddlesPower = get_point2lerp_or_real(*skiesSrv->getWeatherTypeBlk(), "puddlesPower", 0.0f, ets.rndSeed);
     puddlesPower *= powerScale;
 
-    ShaderGlobal::set_real(puddles_powerVarId, puddlesPower);
+    ShaderGlobal::set_float(puddles_powerVarId, puddlesPower);
 
-    ShaderGlobal::set_real(puddles_noise_influenceVarId, noiseInfluence);
-    ShaderGlobal::set_real(puddles_seedVarId, seed);
+    ShaderGlobal::set_float(puddles_noise_influenceVarId, noiseInfluence);
+    ShaderGlobal::set_float(puddles_seedVarId, seed);
 
     hmlService->invalidateClipmap(false, false);
   }
@@ -1020,8 +1070,8 @@ void EnvironmentPlugin::loadObjects(const DataBlock &blk, const DataBlock &local
     postfxBlk.load(postFxPath);
 
     DataBlock app_blk;
-    if (!app_blk.load(DAGORED2->getWorkspace().getAppPath()))
-      DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppPath());
+    if (!app_blk.load(DAGORED2->getWorkspace().getAppBlkPath()))
+      DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppBlkPath());
 
     const char *hdr_mode = postfxBlk.getBlockByNameEx("hdr")->getStr("mode", "none");
     if (strcmp(hdr_mode, "none") != 0 && !app_blk.getBlockByNameEx("hdr_mode")->getBool(hdr_mode, false))
@@ -1119,7 +1169,6 @@ void EnvironmentPlugin::loadObjects(const DataBlock &blk, const DataBlock &local
       skiesSrv->fillPresets(weatherPresetsList, environmentNamesList, weatherTypesList);
 
       String preset = ::make_full_path(DAGORED2->getSdkDir(), String(blk.getStr("weatherPreset", "")));
-      dd_strlwr(preset);
       selectedWeatherPreset = find_value_idx(weatherPresetsList, preset);
       if (selectedWeatherPreset < 0 && weatherPresetsList.size())
         selectedWeatherPreset = 0;
@@ -1133,7 +1182,7 @@ void EnvironmentPlugin::loadObjects(const DataBlock &blk, const DataBlock &local
         selectedEnvironmentNo = 0;
 
 #define LOAD_ETS(NM, TYPE) ets.NM = local_data.get##TYPE(#NM, ets.NM)
-      // LOAD_ETS(forceWeather, Bool);
+      LOAD_ETS(forceWeather, Bool);
       // LOAD_ETS(forceGeoDate, Bool);
       // LOAD_ETS(forceTime, Bool);
       // LOAD_ETS(forceSeed, Bool);
@@ -1239,10 +1288,12 @@ void EnvironmentPlugin::beforeRenderObjects(IGenViewportWnd *renderVp)
 
   if (renderVp && !renderVp->isOrthogonal())
   {
+    // transient driver-only z range override: keeps current wk/hk/ox/oy and view, and must
+    // not touch viewport state (persisted; VR/screenshot passes set their own matrices)
     Driver3dPerspective p;
     d3d::getpersp(p);
     d3d::setpersp(Driver3dPerspective(p.wk, p.hk, !isAcesPlugin ? envParams.z_near : currentEnvironmentAces.envParams.z_near,
-      !isAcesPlugin ? envParams.z_far : currentEnvironmentAces.envParams.z_far, 0, 0));
+      !isAcesPlugin ? envParams.z_far : currentEnvironmentAces.envParams.z_far, p.ox, p.oy));
   }
 
   static float old_lfd = 0, old_bfd = 0;
@@ -1259,17 +1310,17 @@ void EnvironmentPlugin::beforeRenderObjects(IGenViewportWnd *renderVp)
     {
       if (old_lfd == 0 && old_bfd == 0)
       {
-        old_lfd = ShaderGlobal::get_real_fast(lfd_id);
-        old_bfd = ShaderGlobal::get_real_fast(bfd_id);
+        old_lfd = ShaderGlobal::get_float(lfd_id);
+        old_bfd = ShaderGlobal::get_float(bfd_id);
       }
 
-      ShaderGlobal::set_real_fast(lfd_id, 0.f);
-      ShaderGlobal::set_real_fast(bfd_id, 0.f);
+      ShaderGlobal::set_float(lfd_id, 0.f);
+      ShaderGlobal::set_float(bfd_id, 0.f);
     }
     else if (old_lfd != 0 || old_bfd != 0)
     {
-      ShaderGlobal::set_real_fast(lfd_id, old_lfd);
-      ShaderGlobal::set_real_fast(bfd_id, old_bfd);
+      ShaderGlobal::set_float(lfd_id, old_lfd);
+      ShaderGlobal::set_float(bfd_id, old_bfd);
       old_lfd = old_bfd = 0;
     }
   }
@@ -1313,6 +1364,7 @@ void EnvironmentPlugin::renderGeometry(Stage stage)
         break;
       // intended fallthrough
     case STG_RENDER_ENVI:
+    {
       int l, t, w, h;
       float minZ, maxZ;
 
@@ -1329,11 +1381,11 @@ void EnvironmentPlugin::renderGeometry(Stage stage)
         {
           TMatrix worldMat = rotyTM(DegToRad(envParams.rotY));
 
-          ShaderGlobal::set_color4_fast(skyWorldXVarId, worldMat[0][0], worldMat[0][1], worldMat[0][2], 0.f);
+          ShaderGlobal::set_float4(skyWorldXVarId, worldMat[0][0], worldMat[0][1], worldMat[0][2], 0.f);
 
-          ShaderGlobal::set_color4_fast(skyWorldYVarId, worldMat[1][0], worldMat[1][1], worldMat[1][2], 0.f);
+          ShaderGlobal::set_float4(skyWorldYVarId, worldMat[1][0], worldMat[1][1], worldMat[1][2], 0.f);
 
-          ShaderGlobal::set_color4_fast(skyWorldZVarId, worldMat[2][0], worldMat[2][1], worldMat[2][2], 0.f);
+          ShaderGlobal::set_float4(skyWorldZVarId, worldMat[2][0], worldMat[2][1], worldMat[2][2], 0.f);
         }
         else
         {
@@ -1345,7 +1397,7 @@ void EnvironmentPlugin::renderGeometry(Stage stage)
       d3d::settm(TM_VIEW, tm);
 
       if (!isAcesPlugin)
-        ShaderGlobal::set_real(skyScaleVarId, envParams.skyHdrMultiplier);
+        ShaderGlobal::set_float(skyScaleVarId, envParams.skyHdrMultiplier);
 
       geom.render();
       d3d::settm(TM_VIEW, vtm);
@@ -1359,6 +1411,9 @@ void EnvironmentPlugin::renderGeometry(Stage stage)
           skiesSrv->renderClouds();
       }
       break;
+    }
+
+    default: break;
   }
 }
 
@@ -1374,7 +1429,11 @@ void EnvironmentPlugin::renderObjectsToViewport(IGenViewportWnd *vp)
 
   Point3 sunDir = -Point3(cosf(HALFPI - sunAzimuth) * cosf(sunZenith), sinf(sunZenith), sinf(HALFPI - sunAzimuth) * cosf(sunZenith));
 
-  Point3 pos = ::grs_cur_view.pos - sunDir * 50;
+  TMatrix cameraTm;
+  vp->getCameraTransform(cameraTm);
+  const Point3 cameraPos = cameraTm.getcol(3);
+
+  Point3 pos = cameraPos - sunDir * 50;
 
 
   Point2 cp;
@@ -1397,7 +1456,7 @@ void EnvironmentPlugin::renderObjectsToViewport(IGenViewportWnd *vp)
 
   sunDir = -Point3(cosf(HALFPI - sunAzimuth) * cosf(sunZenith), sinf(sunZenith), sinf(HALFPI - sunAzimuth) * cosf(sunZenith));
 
-  pos = ::grs_cur_view.pos - sunDir * 50;
+  pos = cameraPos - sunDir * 50;
 
   if (vp->worldToClient(pos, cp))
   {
@@ -2352,8 +2411,8 @@ void EnvironmentPlugin::setFogDefaults()
   envParams.fog.lfogMaxHeight = 1;
 
   DataBlock app_blk;
-  if (!app_blk.load(DAGORED2->getWorkspace().getAppPath()))
-    DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppPath());
+  if (!app_blk.load(DAGORED2->getWorkspace().getAppBlkPath()))
+    DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppBlkPath());
   const DataBlock &envi_def = *app_blk.getBlockByNameEx("projectDefaults")->getBlockByNameEx("envi");
 
   envParams.z_near = envi_def.getReal("znear", 0.10);

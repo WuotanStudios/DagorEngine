@@ -29,7 +29,7 @@ struct PortalParams
 class PortalRenderer
 {
 public:
-  using RenderWaterCb = eastl::function<void(Texture *color_target, const TMatrix &itm, Texture *depth)>;
+  using RenderWaterCb = eastl::function<void(Texture *color_target, const CameraParams &camera, Texture *depth)>;
   using RenderLandmeshCb =
     eastl::function<void(mat44f_cref globtm, const TMatrix4 &proj, const Frustum &frustum, const Point3 &view_pos)>;
   using RenderSkyCb = eastl::function<void(const TMatrix &view, const TMatrix4 &proj, const Driver3dPerspective &persp)>;
@@ -68,6 +68,8 @@ public:
   void freePortal(int portal_index);
   int getActivePortalCubeSlot(int portal_index) const;
   int getRenderedPortalCubeSlot(int portal_index, TMatrix &portal_tm, float &life, bool &is_bidirectional) const;
+  void afterDeviceReset();
+  static void waitVisibilityJob();
 
 private:
   static constexpr int MAX_RENDERED_CUBES = 4;
@@ -90,6 +92,7 @@ private:
   };
 
   void renderCube(int portal_cube_index, CameraParams &camera_params);
+  void setTransparentRt();
   void copyFrame(int cube_index, int cube_face);
   void copyFrameImpl(int cube_index, int face_start, int face_count, int from_mip, int mips_count);
 
@@ -108,7 +111,7 @@ private:
 
   PortalVisibility portalVisibility;
 
-  UniqueTexHolder envCubeTexArr;
+  UniqueTexWithShaderVar envCubeTexArr;
   UniqueTex tmpRenderTargetTex;
 
   PostFxRenderer copyTargetRenderer;
@@ -229,7 +232,7 @@ private:
 
   BakingData bakingData;
 
-  SharedTexHolder shatteredGlassMaskTex;
+  SharedTexWithShaderVar shatteredGlassMaskTex;
 
   int skipFrameCount = 0;
 };

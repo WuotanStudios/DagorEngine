@@ -3,6 +3,7 @@ include "viewVecVS.dshl"
 include "globtm.dshl"
 include "prev_screen_tc.dshl"
 include "csm.dshl"
+include "esm.dshl"
 include "static_shadow.dshl"
 include "fom_shadows.dshl"
 include "skies_shadows.dshl"
@@ -72,8 +73,6 @@ float skies_scattering_effect = 1.; // it's only purpose is cuisine royale eclip
 
 int4 channel_swizzle_indices = (1, 0, 0, 0);
 
-float volfog_gi_amount_weight = 0.9;
-
 
 texture prev_initial_inscatter;
 texture prev_initial_extinction;
@@ -130,6 +129,7 @@ macro VOLFOG_USE_DYNAMIC_LIGHTS(stage)
     INIT_AND_USE_LIGHT_SHADOWS(stage)
     INIT_AND_USE_COMMON_LIGHTS_SHADOWS_CB(stage)
     INIT_AND_USE_LIGHTS_CLUSTERED_CB(stage)
+    USE_CLUSTERED_LIGHTS_WORD_COUNTS(stage)
     USE_OMNI_LIGHT_MASK(stage)
     USE_SPOT_LIGHT_MASK(stage)
     hlsl(stage)
@@ -146,11 +146,17 @@ macro VOLFOG_USE_DYNAMIC_LIGHTS(stage)
           if ( !check_spot_light(spot_light_index, SPOT_LIGHT_MASK_VOLFOG))
             return false;
         #endif
+        #if SPOT_SHADOWS
+          ##assert(spot_light_index < (uint)spotCnt_omniCnt_firstOmni.x, "volfog: spot light shadow index %d out of range %d", spot_light_index, (uint)spotCnt_omniCnt_firstOmni.x);
+          if (spot_light_index >= (uint)spotCnt_omniCnt_firstOmni.x)
+            return false;
+        #endif
         RenderSpotLight sl = spot_lights_cb[spot_light_index];
-        float4 lightPosRadius = sl.lightPosRadius;
+        float4 lightPosRadius = decode_spot_light_pos_radius(sl);
         half4 lightColor = half4(sl.lightColorAngleScale);
         half4 lightDirection = half4(sl.lightDirectionAngleOffset);
-        half2 texId_scale = half2(sl.texId_scale_illuminatingplane_shadow_contactshadow.xy);
+        half2 texId_scale = half2(sl.texId_scale_illuminatingplane_packedDataBits.xy);
+        float lightRollAngle = decode_light_roll_angle(sl);
 
         half lightAngleScale = lightColor.a;
         half lightAngleOffset = lightDirection.a;
@@ -175,8 +181,7 @@ macro VOLFOG_USE_DYNAMIC_LIGHTS(stage)
 
         //shlick phase can result in temporal changes, but overall looking better
         half phase = half(phaseSchlickTwoLobe(dot(dirFromLight, jitteredView), mieG0*1.5h, mieG1*1.5h));
-        half intensity = applyPhotometryIntensity(-dirFromLight, lightDirection.xyz, texId_scale.x,
-                                                  texId_scale.y, phase *attenuation *lightsEffect);
+        half intensity = applySpotLightPhotometry(-dirFromLight, lightDirection.xyz, lightRollAngle, texId_scale.x, texId_scale.y, phase * attenuation * lightsEffect);
         dynamicLighting += intensity * lightColor.xyz;
 
         return true;
@@ -188,8 +193,14 @@ macro VOLFOG_USE_DYNAMIC_LIGHTS(stage)
           if ( !check_omni_light(omni_light_index, OMNI_LIGHT_MASK_VOLFOG))
             return false;
         #endif
+        #if OMNI_SHADOWS
+          ##assert(omni_light_index < (uint)spotCnt_omniCnt_firstOmni.y, "volfog: omni light shadow index %d out of range %d", omni_light_index, (uint)spotCnt_omniCnt_firstOmni.y);
+          if (omni_light_index >= (uint)spotCnt_omniCnt_firstOmni.y)
+            return false;
+        #endif
         RenderOmniLight ol = omni_lights_cb[omni_light_index];
         float4 pos_and_radius = ol.posRadius;
+        float2 shadowZnZfar = ol.shadowZnZf_flags_packedDataBits.xy;
         half4 color_and_specular = getFinalColor(ol, worldPos);
         half3 point2light = half3(pos_and_radius.xyz-worldPos.xyz);
         half distSqFromLight = dot(point2light,point2light);
@@ -203,7 +214,7 @@ macro VOLFOG_USE_DYNAMIC_LIGHTS(stage)
         half attenuation = getDistanceAtt( distSqFromLight, invSqrRad );
 
         #if OMNI_SHADOWS
-          attenuation *= getOmniShadow(getOmniLightShadowData(omni_light_index), pos_and_radius, worldPos, 1, half2(0, 0));
+          attenuation *= getOmniShadow(getOmniLightShadowData(omni_light_index), pos_and_radius, worldPos, 1, half2(0, 0), shadowZnZfar);
         #endif
 
         //ambient phase. shlick phase is heavier and will cause to much temporal difference
@@ -225,64 +236,28 @@ macro VOLFOG_USE_DYNAMIC_LIGHTS(stage)
         #define OMNI_SHADOWS 1
 
         half lightsEffect = 1;
-        uint sliceId = min(getSliceAtDepth(nextDepth, depthSliceScale, depthSliceBias), CLUSTERS_D);
-        uint clusterIndex = getClusterIndex(half2(screenTcJittered.xy), sliceId);
-        uint wordsPerOmni = omniLightsWordCount;
-        uint wordsPerSpot = spotLightsWordCount;
-        uint omniAddress = clusterIndex*wordsPerOmni;
-
-        ##if dynamic_lights_count == lights_omnispot_1
-          wordsPerOmni = 1;
-          wordsPerSpot = 1;
-        ##endif
-        ##if dynamic_lights_count == lights_omni_1
-          wordsPerOmni = 1;
-          wordsPerSpot = 0;
-        ##endif
-        ##if dynamic_lights_count == lights_spot_1
-          wordsPerOmni = 0;
-          wordsPerSpot = 1;
-        ##endif
+        uint clusterIndex = frustum_clusters_get_cluster_index(half2(screenTcJittered.xy), nextDepth, depthSliceScale, depthSliceBias);
+        uint wordsPerOmni, wordsPerSpot;
+        get_clustered_light_word_counts(wordsPerOmni, wordsPerSpot);
+        uint omniAddress = get_cluster_grid_omni_address(clusterIndex, wordsPerOmni);
 
         ##if (dynamic_lights_count == lights_omnispot_1 || dynamic_lights_count == lights_omni_1 || dynamic_lights_count == lights_spot_1)
-          UNROLL
+          #define CLUSTER_GRID_WALK_WORD_LOOP_ATTR UNROLL
         ##endif
-        for ( uint omniWordIndex = 0; omniWordIndex < wordsPerOmni; omniWordIndex++ )
-        {
-          // Load bit mask data per lane
-          uint mask = flatBitArray[omniAddress + omniWordIndex];
-          uint mergedMask = MERGE_MASK(mask);
-          while ( mergedMask != 0 ) // processed per lane
-          {
-            uint bitIndex = firstbitlow( mergedMask );
-            mergedMask ^= ( 1U << bitIndex );
-            uint omni_light_index = ((omniWordIndex<<5) + bitIndex);
+        #define CLUSTER_GRID_WALK_ADDRESS omniAddress
+        #define CLUSTER_GRID_WALK_WORD_COUNT wordsPerOmni
+        #define CLUSTER_GRID_WALK_LIGHT_BODY(omni_light_index) calc_omni_light(omni_light_index, worldPos, ambPhase, lightsEffect, dynamicLighting);
+        #include <cluster_grid_lights_walk.hlsli>
 
-            if (!calc_omni_light(omni_light_index, worldPos, ambPhase, lightsEffect, dynamicLighting))
-              continue;
-          }
-        }
-
-        uint spotAddress = clusterIndex*wordsPerSpot + ((CLUSTERS_D+1)*CLUSTERS_H*CLUSTERS_W*wordsPerOmni);
+        uint spotAddress = get_cluster_grid_spot_address(clusterIndex, wordsPerSpot, wordsPerOmni);
 
         ##if (dynamic_lights_count == lights_omnispot_1 || dynamic_lights_count == lights_omni_1 || dynamic_lights_count == lights_spot_1)
-          UNROLL
+          #define CLUSTER_GRID_WALK_WORD_LOOP_ATTR UNROLL
         ##endif
-        for ( uint spotWordIndex = 0; spotWordIndex < wordsPerSpot; spotWordIndex++ )
-        {
-          // Load bit mask data per lane
-          uint mask = flatBitArray[spotAddress + spotWordIndex];
-          uint mergedMask = MERGE_MASK(mask);
-          while ( mergedMask != 0 ) // processed per lane
-          {
-            uint bitIndex = firstbitlow( mergedMask );
-            mergedMask ^= ( 1U << bitIndex );
-            uint spot_light_index = ((spotWordIndex<<5) + bitIndex);
-
-            if (!calc_spot_light(spot_light_index, jitteredWorldPos, jitteredView, lightsEffect, mieG0, mieG1, dynamicLighting))
-              continue;
-          }
-        }
+        #define CLUSTER_GRID_WALK_ADDRESS spotAddress
+        #define CLUSTER_GRID_WALK_WORD_COUNT wordsPerSpot
+        #define CLUSTER_GRID_WALK_LIGHT_BODY(spot_light_index) calc_spot_light(spot_light_index, jitteredWorldPos, jitteredView, lightsEffect, mieG0, mieG1, dynamicLighting);
+        #include <cluster_grid_lights_walk.hlsli>
       ##endif
       return dynamicLighting;
     }
@@ -292,8 +267,10 @@ endmacro
 
 macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
   bool use_improved_light_leak_offset = true; // only disable for testing
-
-  supports global_const_block;
+  (stage) {
+    from_sun_direction@f3 = from_sun_direction;
+    sun_color_0@f3 = sun_color_0;
+  }
 
   VIEW_VEC_OPTIMIZED(stage)
   INIT_ESM_SHADOW(stage)
@@ -335,7 +312,6 @@ macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
     initial_media@smp3d = initial_media;
     volfog_occlusion@tex2d = volfog_occlusion;
     prev_volfog_weight@smp3d = prev_volfog_weight;
-    volfog_gi_amount_weight@f1 = volfog_gi_amount_weight;
 
     volfog_froxel_range@f1 = volfog_froxel_range_params.x;
     channel_swizzle_indices@i2 = (channel_swizzle_indices.x, channel_swizzle_indices.y, 0, 0);
@@ -408,9 +384,15 @@ macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
     #define NUM_CASCADES 3
   }
 
-  INIT_CSM_SHADOW_STCODE(stage)
+  INIT_CSM_SHADOW_STCODE_BASE(stage)
   VOLUME_DEPTH_CONVERSION(stage)
   VOLFOG_USE_DYNAMIC_LIGHTS(stage)
+
+  if (shadows_quality == high)
+  {
+    INIT_CSM_OFFSET_TO_CULLING_NEAR_PLANE(stage)
+    USE_CSM_OFFSET_TO_CULLING_NEAR_PLANE(stage)
+  }
 
   if (use_improved_light_leak_offset)
   {
@@ -442,7 +424,7 @@ macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
       RWTexture3D<float4> volfog_ff_accumulated_inscatter_rw@uav;
     }
     volfog_ff_initial_inscatter_rw@uav : register(volfog_ff_initial_inscatter_const_no) hlsl {
-      RWTexture3D<float3> volfog_ff_initial_inscatter_rw@uav;
+      RWTexture3D<float4> volfog_ff_initial_inscatter_rw@uav;
     }
     volfog_ff_initial_extinction_rw@uav : register(volfog_ff_initial_extinction_const_no) hlsl {
       RWTexture3D<float3> volfog_ff_initial_extinction_rw@uav;
@@ -484,16 +466,16 @@ macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
     {
       float3 staticShadowPointToEye = world_view_pos.xyz - world_pos;
 
-      float shadowEffect = 0;
       uint cascade_id;
-      float3 shadowTc = get_csm_shadow_tc(staticShadowPointToEye, cascade_id, shadowEffect);
+      float3 shadowTc = get_csm_shadow_tc(staticShadowPointToEye, cascade_id);
 
       half shadow = 1;
       ##if shadows_quality == high
         shadow = get_downsampled_shadows(shadowTc);
-        BRANCH
-        if (cascade_id > 2)
-          shadow *= getStaticShadow(world_pos);
+        float3 staticShadowPos = world_pos;
+        if (cascade_id < 3)
+          staticShadowPos = projectToShadowFrustumNearPlane(world_pos, cascade_id);
+        shadow *= getStaticShadow(staticShadowPos);
       ##else
         shadow = getStaticShadow(world_pos);
         #if HAS_DOWNSAMPLED_SHADOWS
@@ -537,9 +519,10 @@ macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
       }
 ##endif
 
+##if !hardware.scarlett
     #define __XBOX_REGALLOC_VGPR_LIMIT 48
     #define __XBOX_ENABLE_LIFETIME_SHORTENING 1
-
+##endif
 
     void calc_impl(uint3 dtId, uint3 tid, uint baseFlatId)
     {
@@ -777,8 +760,7 @@ macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
       shadow *= selfShadow;
 ##endif
 
-      #define VOLFOG_NIGHT_SUN_COS 0.046f // at this magic value it seems to be consistent with surface shadows // TODO: make it make sense!
-      const half shadowMul = from_sun_direction.y > -VOLFOG_NIGHT_SUN_COS ? 0 : 1;
+      const half shadowMul = -from_sun_direction.y < NIGHT_SUN_COS ? 0 : 1;
       shadow *= shadowMul;
       shadowForScattering *= shadowMul;
 
@@ -816,7 +798,7 @@ macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
       FLATTEN if (is_voxel_occluded(result_inscatter)) // justincase to avoid any NaNs
         result_inscatter = 0;
 
-      texture3DAt(volfog_ff_initial_inscatter_rw, dtId) = get_swizzled_color_inv(result_inscatter.rgb, channel_swizzle_indices.x);
+      texture3DAt(volfog_ff_initial_inscatter_rw, dtId) = float4(get_swizzled_color_inv(result_inscatter.rgb, channel_swizzle_indices.x), 0);
       texture3DAt(volfog_ff_initial_extinction_rw, dtId) = isOccluded ? NaN : float3(result_inscatter.a, temporalShadows);
 
 
@@ -872,7 +854,8 @@ macro VOLFOG_INITIAL_COMMON(stage, warp_size_z)
           }
         }
 
-        half2 prevExtinction = tid.z == 0 ? accumulatedExtinction : sharedTmpAccumulatedExtinction[flatId - 1];
+        // access index should be valid, even if resulting value is not used to avoid gpu OOB
+        half2 prevExtinction = tid.z == 0 ? accumulatedExtinction : sharedTmpAccumulatedExtinction[max(flatId, 1) - 1];
         half2 finalExtinction = prevExtinction * volfogTransmittance;
 
         // then evaluate transmittance-dependent inscatter
@@ -1003,8 +986,6 @@ shader froxel_fog_light_calc_propagate_cs
         groupshared half2 sharedTmpAccumulatedExtinction[WARP_SIZE_X*WARP_SIZE_Y*WARP_SIZE_Z];
     ##endif
   }
-
-  ENABLE_ASSERT(cs)
   if (froxel_fog_dispatch_mode == merged_parallel)
   {
     VOLFOG_INITIAL_COMMON(cs, 4)
@@ -1055,9 +1036,6 @@ shader froxel_fog_light_calc_propagate_ps
 
   assume froxel_fog_dispatch_mode = merged_linear;
 
-  supports global_frame; // needed for world_view_pos
-
-  ENABLE_ASSERT(ps)
   VOLFOG_INITIAL_COMMON(ps, 1)
 
   hlsl
@@ -1069,6 +1047,7 @@ shader froxel_fog_light_calc_propagate_ps
   (ps)
   {
     volfog_froxel_volume_res@f3 = (volfog_froxel_volume_res);
+    world_view_pos@f3 = world_view_pos;
   }
 
   hlsl(ps) {

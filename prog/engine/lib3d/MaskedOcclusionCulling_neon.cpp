@@ -21,19 +21,15 @@
 #include <string.h>
 
 #include <math/dag_declAlign.h>
-#include <math/dag_occlusionTest.h>
+#include <math/dag_occlusionZBuffer.h>
 
 #define DEPTH_VMIN occlusion_depth_vmin
 
-#if OCCLUSION_BUFFER == OCCLUSION_WBUFFER
-#define CONVERT_MASKED_TO_DEPTH(a) v_rcp(a)
-#elif OCCLUSION_BUFFER == OCCLUSION_INVWBUFFER
 #define CONVERT_MASKED_TO_DEPTH(a) (a)
-#else
-#error unselected occlusion type
-#endif
 
 #include <3d/dag_maskedOcclusionCulling.h>
+#include <daBVH/dag_swBLAS_leaf.h>
+#include <daBVH/dag_swBLAS_soa4.h>
 #if DAGOR_DBGLEVEL > 0
 #define OCCLUSION_ASSERT assert
 #else
@@ -215,6 +211,12 @@ typedef int32x4_t __m128i;
 #define _mm_setr_epi32 _mmw_setr_epi32
 
 #define _mm_loadu_ps vld1q_f32
+
+// float unpack/interleave for AoS-to-SoA transpose
+FORCE_INLINE __m128 _mm_unpacklo_ps(__m128 a, __m128 b) { return vzip1q_f32(a, b); }
+FORCE_INLINE __m128 _mm_unpackhi_ps(__m128 a, __m128 b) { return vzip2q_f32(a, b); }
+FORCE_INLINE __m128 _mm_movelh_ps(__m128 a, __m128 b) { return vcombine_f32(vget_low_f32(a), vget_low_f32(b)); }
+FORCE_INLINE __m128 _mm_movehl_ps(__m128 a, __m128 b) { return vcombine_f32(vget_high_f32(b), vget_high_f32(a)); }
 
 #define _mm_movemask_ps _mmw_movemask_ps
 #define _mm_xor_ps      _mmw_xor_ps
@@ -444,6 +446,24 @@ MaskedOcclusionCulling::CullingResult MaskedOcclusionCulling::RenderTriangles(co
   int nTris, const float *modelToClipMatrix, BackfaceWinding bfWinding, ClipPlanes clipPlaneMask)
 {
   return MOC_STATIC_UPCAST(this)->RenderTriangles(inVtx, inTris, nTris, modelToClipMatrix, bfWinding, clipPlaneMask);
+}
+
+MaskedOcclusionCulling::CullingResult MaskedOcclusionCulling::RenderBlasStackless(const unsigned char *blasData, int vertOffset,
+  int treeStart, int treeEnd, const float *rawToClipMatrix, uint32_t *cacheIndices, uint32_t cacheIndicesCapacity,
+  uint32_t &cacheTriCount, CacheMode cacheMode, BackfaceWinding bfWinding, ClipPlanes clipPlaneMask, uint32_t triSkip,
+  uint32_t triLimit)
+{
+  return MOC_STATIC_UPCAST(this)->RenderBlasStackless(blasData, vertOffset, treeStart, treeEnd, rawToClipMatrix, cacheIndices,
+    cacheIndicesCapacity, cacheTriCount, cacheMode, bfWinding, clipPlaneMask, triSkip, triLimit);
+}
+
+MaskedOcclusionCulling::CullingResult MaskedOcclusionCulling::RenderBlasSOA4(const unsigned char *blasData, int vertOffset,
+  const soa4::RootRef &root, const float *rawToClipMatrix, uint32_t *cacheIndices, uint32_t cacheIndicesCapacity,
+  uint32_t &cacheTriCount, CacheMode cacheMode, BackfaceWinding bfWinding, ClipPlanes clipPlaneMask, uint32_t triSkip,
+  uint32_t triLimit)
+{
+  return MOC_STATIC_UPCAST(this)->RenderBlasSOA4(blasData, vertOffset, root, rawToClipMatrix, cacheIndices, cacheIndicesCapacity,
+    cacheTriCount, cacheMode, bfWinding, clipPlaneMask, triSkip, triLimit);
 }
 
 MaskedOcclusionCulling::CullingResult MaskedOcclusionCulling::TestRect(float xmin, float ymin, float xmax, float ymax,

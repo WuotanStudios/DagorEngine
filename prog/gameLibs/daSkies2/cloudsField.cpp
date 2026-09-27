@@ -5,17 +5,29 @@
 
 #include <drv/3d/dag_rwResource.h>
 #include <drv/3d/dag_draw.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
+#include <drv/3d/dag_texture.h>
 #include <3d/dag_lockTexture.h>
 #include <render/viewVecs.h>
 
 #include <util/dag_convar.h>
 #include <osApiWrappers/dag_miscApi.h>
+#include "shaders/clouds2/cloud_settings.hlsli"
 
 CONSOLE_BOOL_VAL("clouds", regenField, false);
 
+CONSOLE_BOOL_VAL("clouds", use_nbs_field, false);
+
 // todo: move it to gameParams
 CONSOLE_INT_VAL("clouds", downsampled_field_res, 1, 1, 3); // 1<<(4+x)
+
+static eastl::unique_ptr<NodeBasedShader> createNodeBasedClouds(NodeBasedShaderCloudsVariant variant)
+{
+  return eastl::move(
+    eastl::make_unique<NodeBasedShader>(NodeBasedShaderType::Clouds, String(::get_shader_name(NodeBasedShaderType::Clouds)),
+      String(::get_shader_suffix(NodeBasedShaderType::Clouds)), static_cast<uint32_t>(variant)));
+}
 
 bool CloudsField::getReadbackData(float &alt_start, float &alt_top) const
 {
@@ -40,8 +52,8 @@ void CloudsField::initCompressed()
   // todo: on consoles we don't need temp, we can alias memory
   genCloudsFieldCmpr.initVoltex(cloudsFieldVolTemp, resXZ / 4, resXZ / 4, resY, TEXFMT_R32G32UI | CLOUDS_ESRAM_ONLY, 1,
     "clouds_field_volume_tmp");
-  cloudsFieldVolCompressed =
-    dag::create_voltex(resXZ, resXZ, resY, TEXFMT_ATI1N | TEXCF_UPDATE_DESTINATION, 1, "clouds_field_volume_compressed");
+  cloudsFieldVolCompressed = dag::create_voltex(resXZ, resXZ, resY, TEXFMT_ATI1N | TEXCF_UPDATE_DESTINATION | TEXCF_CLEAR_ON_CREATE, 1,
+    "clouds_field_volume_compressed", RESTAG_DASKIES2);
   d3d::SamplerInfo smpInfo;
   smpInfo.address_mode_u = d3d::AddressMode::Wrap;
   smpInfo.address_mode_v = d3d::AddressMode::Wrap;
@@ -62,8 +74,8 @@ void CloudsField::genFieldGeneral(VoltexRenderer &renderer, DynamicShaderHelper 
   if (!renderer.isComputeLoaded()) // we didn't fill layersPixelCount
   {
     SCOPE_RENDER_TARGET;
-    ShaderGlobal::set_color4(dispatch_sizeVarId, resXZ, resXZ, resY, 0);
-    d3d::set_render_target(layersPixelCount.getTex2D(), 0);
+    ShaderGlobal::set_float4(dispatch_sizeVarId, resXZ, resXZ, resY, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{layersPixelCount.getTex2D(), 0, 0}});
     non_empty_fill.shader->setStates(0, true);
     d3d::setvsrc(0, 0, 0);
     d3d::draw_instanced(PRIM_TRILIST, 0, 1, resXZ * resXZ);
@@ -71,17 +83,22 @@ void CloudsField::genFieldGeneral(VoltexRenderer &renderer, DynamicShaderHelper 
   d3d::resource_barrier({layersPixelCount.getTex2D(), RB_RO_SRV | RB_STAGE_COMPUTE | RB_STAGE_PIXEL, 0, 0});
 }
 
+void CloudsField::copyFieldCompressed()
+{
+  // todo: remove me on consoles - we can alias memory
+  TIME_D3D_PROFILE(copy_compr);
+  d3d::update_sub_region(cloudsFieldVolTemp.getVolTex(), 0, 0, 0, 0, // source tex, mip, x,y,z
+    max(1, resXZ / 4), max(1, resXZ / 4), resY,                      // width x height x depth
+    cloudsFieldVolCompressed.getBaseTex(), 0, 0, 0, 0);              // dest tex, mip, x,y,z
+  // todo: we can remove temp texture
+}
+
 void CloudsField::genFieldCompressed()
 {
   TIME_D3D_PROFILE(cloud_field_vol_cmpr);
   genFieldGeneral(genCloudsFieldCmpr, genCloudLayersNonEmptyCmpr, cloudsFieldVolTemp);
 
-  // todo: remove me on consoles - we can alias memory
-  TIME_D3D_PROFILE(copy_compr);
-  cloudsFieldVolCompressed->updateSubRegion(cloudsFieldVolTemp.getVolTex(), 0, 0, 0, 0, // source mip, x,y,z
-    max(1, resXZ / 4), max(1, resXZ / 4), resY,                                         // width x height x depth
-    0, 0, 0, 0);                                                                        // dest mip, x,y,z
-  // todo: we can remove temp texture
+  copyFieldCompressed();
 }
 
 void CloudsField::genField()
@@ -91,12 +108,107 @@ void CloudsField::genField()
   d3d::resource_barrier({cloudsFieldVol.getVolTex(), RB_RO_SRV | RB_STAGE_COMPUTE | RB_STAGE_PIXEL, 0, 0});
 }
 
+void CloudsField::genFieldNBS()
+{
+  TIME_D3D_PROFILE(cloud_field_vol_nbs);
+  // register slots must match cloudsShaderTemplate.dshl (u0 output, u1 layerHt)
+  STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 1, VALUE, 0, 0), layersPixelCount.getTex2D());
+
+  if (useCompression)
+  {
+    const int blockW = max(1, resXZ / 4), blockH = max(1, resXZ / 4);
+
+    STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 0, VALUE, 0, 0), cloudsFieldVolTemp.getVolTex());
+    nbsFieldCompressedCs->dispatch((blockW + CLOUD_WARP_SIZE - 1) / CLOUD_WARP_SIZE, (blockH + CLOUD_WARP_SIZE - 1) / CLOUD_WARP_SIZE,
+      (resY + CLOUD_WARP_SIZE - 1) / CLOUD_WARP_SIZE);
+
+    d3d::resource_barrier({cloudsFieldVolTemp.getVolTex(), RB_RO_SRV | RB_STAGE_COMPUTE | RB_STAGE_PIXEL, 0, 0});
+
+    copyFieldCompressed();
+  }
+  else
+  {
+    STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 0, VALUE, 0, 0), cloudsFieldVol.getVolTex());
+    nbsFieldCs->dispatch((resXZ + CLOUD_WARP_SIZE - 1) / CLOUD_WARP_SIZE, (resXZ + CLOUD_WARP_SIZE - 1) / CLOUD_WARP_SIZE,
+      (resY + CLOUD_WARP_SIZE - 1) / CLOUD_WARP_SIZE);
+
+    d3d::resource_barrier({cloudsFieldVol.getVolTex(), RB_RO_SRV | RB_STAGE_COMPUTE | RB_STAGE_PIXEL, 0, 0});
+  }
+  d3d::resource_barrier({layersPixelCount.getTex2D(), RB_RO_SRV | RB_STAGE_COMPUTE | RB_STAGE_PIXEL, 0, 0});
+}
+
+bool CloudsField::isNBSActive() const { return use_nbs_field.get() && useNBS; }
+
+void CloudsField::initNBS(const String &root_graph)
+{
+  if (!VoltexRenderer::is_compute_supported())
+    return;
+
+  useNBS = true;
+
+  if (!nbsFieldCs)
+    nbsFieldCs = createNodeBasedClouds(NodeBasedShaderCloudsVariant::Field);
+
+  if (!nbsFieldCompressedCs)
+    nbsFieldCompressedCs = createNodeBasedClouds(NodeBasedShaderCloudsVariant::FieldCompressed);
+
+  nbsFieldCs->init(root_graph);
+  nbsFieldCompressedCs->init(root_graph);
+
+  invalidate();
+}
+
+bool CloudsField::updateNBSShaders(const String &shader_name, const DataBlock &shader_blk, String &out_errors)
+{
+  if (!VoltexRenderer::is_compute_supported())
+    return false;
+
+  if (!nbsFieldCs)
+    nbsFieldCs = createNodeBasedClouds(NodeBasedShaderCloudsVariant::Field);
+
+  if (!nbsFieldCompressedCs)
+    nbsFieldCompressedCs = createNodeBasedClouds(NodeBasedShaderCloudsVariant::FieldCompressed);
+
+  if (!(nbsFieldCs->update(shader_name, shader_blk, out_errors)))
+    return false;
+
+  if (!(nbsFieldCompressedCs->update(shader_name, shader_blk, out_errors)))
+    return false;
+
+  invalidate();
+  return true;
+}
+
+void CloudsField::enableNBSOptionalGraph(const String &graph_name, bool enable)
+{
+  if (nbsFieldCs)
+    nbsFieldCs->enableOptionalGraph(graph_name, enable);
+
+  if (nbsFieldCompressedCs)
+    nbsFieldCompressedCs->enableOptionalGraph(graph_name, enable);
+}
+
+void CloudsField::closeNBS()
+{
+  useNBS = false;
+
+  if (nbsFieldCs)
+    nbsFieldCs->closeShader();
+  nbsFieldCs.reset();
+
+  if (nbsFieldCompressedCs)
+    nbsFieldCompressedCs->closeShader();
+  nbsFieldCompressedCs.reset();
+
+  invalidate();
+}
+
 void CloudsField::initDownsampledField()
 {
   cloudsDownSampledField.close();
   downsampleCloudsField.initVoltex(cloudsDownSampledField, (resXZ + downsampleRatio - 1) / downsampleRatio,
-    (resXZ + downsampleRatio - 1) / downsampleRatio, (resY + downsampleRatio - 1) / downsampleRatio, TEXFMT_R8, 1,
-    "clouds_field_volume_low");
+    (resXZ + downsampleRatio - 1) / downsampleRatio, (resY + downsampleRatio - 1) / downsampleRatio, TEXFMT_R8 | TEXCF_CLEAR_ON_CREATE,
+    1, "clouds_field_volume_low");
   d3d::SamplerInfo smpInfo;
   smpInfo.address_mode_u = d3d::AddressMode::Wrap;
   smpInfo.address_mode_v = d3d::AddressMode::Wrap;
@@ -126,7 +238,7 @@ void CloudsField::init()
   if (!cloudsFieldVolTemp)
   {
     genCloudsField.init("gen_cloud_field", "gen_cloud_field_ps");
-    genCloudsField.initVoltex(cloudsFieldVol, resXZ, resXZ, resY, TEXFMT_R8, 1, "clouds_field_volume");
+    genCloudsField.initVoltex(cloudsFieldVol, resXZ, resXZ, resY, TEXFMT_R8 | TEXCF_CLEAR_ON_CREATE, 1, "clouds_field_volume");
     if (!genCloudsField.isComputeLoaded())
       genCloudLayersNonEmpty.init("gen_cloud_layers_non_empty", nullptr, 0, "gen_cloud_layers_non_empty", false);
     {
@@ -144,7 +256,8 @@ void CloudsField::init()
 
   layersPixelCount.close();
   layersPixelCount = dag::create_tex(nullptr, resY, 1,
-    (genCloudsField.isComputeLoaded() ? TEXCF_UNORDERED : 0) | TEXCF_RTARGET | TEXFMT_R32F, 1, "cloud_layers_non_empty");
+    ((genCloudsField.isComputeLoaded() || genCloudsFieldCmpr.isComputeLoaded()) ? TEXCF_UNORDERED : 0) | TEXCF_RTARGET | TEXFMT_R32F,
+    1, "cloud_layers_non_empty", RESTAG_DASKIES2);
 
   if (VoltexRenderer::is_compute_supported())
     refineAltitudes.reset(new_compute_shader("clouds_refine_altitudes", false));
@@ -152,8 +265,9 @@ void CloudsField::init()
     refineAltitudesPs.init("clouds_refine_altitudes_ps");
   if (!layersHeights)
   {
-    layersHeights = dag::create_tex(nullptr, 2, 1, (refineAltitudes ? TEXCF_UNORDERED : TEXCF_RTARGET) | TEXFMT_A32B32G32R32F, 1,
-      "cloud_layers_altitudes_tex");
+    layersHeights = dag::create_tex(nullptr, 2, 1,
+      (refineAltitudes ? TEXCF_UNORDERED : TEXCF_RTARGET) | TEXFMT_A32B32G32R32F | TEXCF_CLEAR_ON_CREATE, 1,
+      "cloud_layers_altitudes_tex", RESTAG_DASKIES2);
   }
   if (!readbackData.query)
   {
@@ -168,7 +282,7 @@ void CloudsField::layersHeightsBarrier() { d3d::resource_barrier({layersHeights.
 
 void CloudsField::setParams(const DaSkies::CloudsSettingsParams &params)
 {
-  const int xz = clamp(256 * params.quality, 128, 2048), y = clamp(32, 32 * params.quality, 192);
+  const int xz = clamp(256 * params.quality, 128, 2048), y = clamp(32 * params.quality, 32, 192);
   const bool nextCompression = !params.fastEvolution && d3d::check_voltexformat(TEXFMT_ATI1N | CLOUDS_ESRAM_ONLY) &&
                                d3d::get_driver_desc().caps.hasResourceCopyConversion;
   const bool compressionChanged = nextCompression != useCompression;
@@ -183,7 +297,7 @@ void CloudsField::setParams(const DaSkies::CloudsSettingsParams &params)
   int txz = xz, ty = y;
   if (params.competitive_advantage)
   {
-    txz = clamp(256 * params.target_quality, 128, 2048), ty = clamp(32, 32 * params.target_quality, 192);
+    txz = clamp(256 * params.target_quality, 128, 2048), ty = clamp(32 * params.target_quality, 32, 192);
     if (targetXZ != txz || targetY != ty || averaging != params.maximum_averaging_ratio)
       invalidate();
   }
@@ -215,6 +329,13 @@ void CloudsField::doReadback()
 
 CloudsChangeFlags CloudsField::render()
 {
+  static bool previousFrameWasNBS = false;
+
+  if (isNBSActive() != previousFrameWasNBS)
+    invalidate();
+
+  previousFrameWasNBS = isNBSActive();
+
   if (frameValid && !regenField.get())
   {
     int ratio = resXZ >= 512 ? 3 : 2;
@@ -233,9 +354,11 @@ CloudsChangeFlags CloudsField::render()
     d3d_err(d3d::clear_rt({layersPixelCount.getTex2D()}));
   }
   {
-    ShaderGlobal::set_color4(clouds_field_resVarId, resXZ, resY, targetXZ, targetY);
-    ShaderGlobal::set_real(clouds_average_weightVarId, averaging);
-    if (useCompression)
+    ShaderGlobal::set_float4(clouds_field_resVarId, resXZ, resY, targetXZ, targetY);
+    ShaderGlobal::set_float(clouds_average_weightVarId, averaging);
+    if (isNBSActive())
+      genFieldNBS();
+    else if (useCompression)
       genFieldCompressed();
     else
       genField();
@@ -249,7 +372,7 @@ CloudsChangeFlags CloudsField::render()
     else
     {
       SCOPE_RENDER_TARGET;
-      d3d::set_render_target(layersHeights.getTex2D(), 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{layersHeights.getTex2D(), 0, 0}});
       refineAltitudesPs.render();
     }
     d3d::resource_barrier({layersHeights.getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
@@ -277,7 +400,8 @@ void CloudsField::initCloudsVolumeRenderer()
     build_dacloud_volume_ps.init("build_dacloud_volume_ps");
 }
 
-void CloudsField::renderCloudVolume(VolTexture *cloud_volume, float max_dist, const TMatrix &view_tm, const TMatrix4 &proj_tm)
+void CloudsField::renderCloudVolume(VolTexture *cloud_volume, TEXTUREID prev_cloud_volume, float max_dist, const TMatrix &view_tm,
+  const TMatrix4 &proj_tm, const TMatrix4 &prev_glob_tm)
 {
   if (!cloud_volume)
     return;
@@ -285,7 +409,18 @@ void CloudsField::renderCloudVolume(VolTexture *cloud_volume, float max_dist, co
   cloud_volume->getinfo(tinfo);
   set_viewvecs_to_shader(view_tm, proj_tm);
   ShaderGlobal::set_int4(cloud_volume_resVarId, tinfo.w, tinfo.h, tinfo.d, 0);
-  ShaderGlobal::set_real(cloud_volume_distVarId, max_dist);
+  ShaderGlobal::set_float(cloud_volume_distVarId, max_dist);
+  ShaderGlobal::set_texture(prev_clouds_volume_transmittanceVarId, prev_cloud_volume);
+  if (prev_cloud_volume != BAD_TEXTUREID)
+  {
+    ShaderGlobal::set_float4(prev_skies_globtm_0VarId, Color4(prev_glob_tm[0]));
+    ShaderGlobal::set_float4(prev_skies_globtm_1VarId, Color4(prev_glob_tm[1]));
+    ShaderGlobal::set_float4(prev_skies_globtm_2VarId, Color4(prev_glob_tm[2]));
+    ShaderGlobal::set_float4(prev_skies_globtm_3VarId, Color4(prev_glob_tm[3]));
+
+    frameNo++;
+    ShaderGlobal::set_int(cloud_frame_noVarId, frameNo);
+  }
   if ((tinfo.cflg & TEXCF_UNORDERED) && build_dacloud_volume_cs.get())
   {
     STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 0, VALUE, 0, 0), cloud_volume);
@@ -294,7 +429,7 @@ void CloudsField::renderCloudVolume(VolTexture *cloud_volume, float max_dist, co
   else
   {
     SCOPE_RENDER_TARGET;
-    d3d::set_render_target(0, cloud_volume, d3d::RENDER_TO_WHOLE_ARRAY, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{cloud_volume, 0, d3d::RENDER_TO_WHOLE_ARRAY}});
     build_dacloud_volume_ps.getElem()->setStates();
     d3d::draw_instanced(PRIM_TRILIST, 0, 1, tinfo.d);
   }

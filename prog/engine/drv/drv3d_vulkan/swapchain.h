@@ -18,20 +18,25 @@ struct CmdBlitImage;
 // used to represent frontend, backend & other intermediate modes
 struct SwapchainMode
 {
-  VulkanSurfaceKHRHandle surface;
+  eastl::pair<VulkanSurfaceKHRHandle, void *> surfaceAndWindow;
   VkPresentModeKHR presentMode;
-  VkExtent2D extent;
+  VkExtent2D displayExtent;
+  VkExtent2D backbufferExtent;
   FormatStore format;
   uint8_t extraBusyImages;
   uint8_t enableSrgb : 1;
   uint8_t fullscreen : 1;
   bool mutableFormat : 1;
   bool mismatchedExtents : 1;
+  bool usesHdr : 1;
+  bool canUseHdr : 1;
   const char *modifySource;
 
   bool isFullscreenExclusiveAllowed();
-  bool isVsyncOn() const { return VK_PRESENT_MODE_IMMEDIATE_KHR != presentMode; }
-  void setHeadless() { surface = VulkanSurfaceKHRHandle{}; }
+  bool isVsyncOn() const { return VK_PRESENT_MODE_FIFO_KHR == presentMode || VK_PRESENT_MODE_FIFO_RELAXED_KHR == presentMode; }
+  void setHeadless() { surfaceAndWindow = {VulkanSurfaceKHRHandle{}, nullptr}; }
+  bool isHdr() const { return usesHdr; }
+  bool canDoHdr() const { return canUseHdr; }
 
   void setPresentModeFromConfig();
 };
@@ -65,9 +70,12 @@ struct SwapchainQueryCache
   VkSurfaceCapabilitiesKHR caps;
   PresentModeStore modes;
   FormatStore format;
+  bool canUseHDRFormat;
+  VulkanSurfaceKHRHandle cachedSurface;
 
   void init();
-  bool update(VulkanSurfaceKHRHandle surf);
+  bool updateModesAndFormats(VulkanSurfaceKHRHandle surf);
+  void updateBaseCaps(VulkanSurfaceKHRHandle surf);
   VkPresentModeKHR mode(VkPresentModeKHR requested) const;
 
 private:
@@ -120,6 +128,8 @@ private:
   // prerotation stuff
   BaseTex *wrappedRotatedTex = nullptr;
   bool rotateNeeded = false;
+  bool rotateInApp = false;
+  int appRotationAngle = 0;
   shaders::DriverRenderStateId rotateRenderState;
 
   // still image for system preview of non focused application
@@ -142,6 +152,8 @@ private:
   bool acquireSwapImage();
   bool updateImageList(const VkSwapchainCreateInfoKHR &sci);
   void fillSemaphoresRing();
+  // pushes HDR10 mastering metadata to the presentation engine (VK_EXT_hdr_metadata) for the current swapchain
+  void applyHdrMetadata();
 
   void ensureOffscreenBuffer();
   void destroyOffscreenBuffer();
@@ -165,7 +177,9 @@ public:
   Swapchain &operator=(Swapchain &&) = delete;
 
   const SwapchainMode &getMode() const { return currentMode; }
-  void setMode(const SwapchainMode &new_mode);
+  bool setMode(const SwapchainMode &new_mode);
+
+  int getAppPreRotationAngle() const { return rotateInApp ? appRotationAngle : 0; }
 
   bool init();
   void shutdown();
@@ -187,6 +201,35 @@ public:
   }
 
   bool blitStillImage();
+  bool isBackendOnlyAcquire() { return onlyBackendAcquire; }
+  void toggleBackendOnlyAcquire() { onlyBackendAcquire = !onlyBackendAcquire; }
+
+#if DAGOR_DBGLEVEL > 0
+  static constexpr uint32_t ACQUIRE_IDX_HISTORY_SZ = 32;
+  uint32_t acquireIdxHistory[ACQUIRE_IDX_HISTORY_SZ] = {};
+  uint32_t acquireIdxHistoryIdx = 0;
+
+  void recordAcquiredIndex(uint32_t idx);
+  int getPresentedRingSize();
+#else
+  void recordAcquiredIndex(uint32_t) {}
+  int getPresentedRingSize() { return 0; }
+#endif
+};
+
+class SecondarySwapchainStorage
+{
+public:
+  Swapchain *find(void *window);
+  Swapchain *allocate(void *window);
+  void free(void *window);
+
+  void shutdown();
+
+private:
+  eastl::array<Swapchain, MAX_SECONDARY_SWAPCHAIN_COUNT> swapchains;
+  static_assert(MAX_SECONDARY_SWAPCHAIN_COUNT <= 32);
+  uint32_t freeSwapchainsMask = ~0u;
 };
 
 } // namespace drv3d_vulkan

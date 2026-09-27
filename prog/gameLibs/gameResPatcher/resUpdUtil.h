@@ -2,6 +2,11 @@
 #pragma once
 
 #include <util/dag_globDef.h>
+#include <stdint.h>
+
+class DataBlock;
+class IGenSave;
+class IGenLoad;
 
 class IGameResPatchProgressBar
 {
@@ -26,5 +31,29 @@ int patch_update_game_resources_mem(const char *game_dir, const char *cache_dir,
   const char *rel_mount_dir, IGameResPatchProgressBar *pbar = NULL, bool dryRun = false, const char *vrom_name = "grp_hdr.vromfs.bin",
   const char *res_blk_name = "resPacks.blk");
 
+enum class PatchGameResourcesStrategy
+{
+  Full, //!< Expecting that upcoming update will download all of the files from package. Allow to create non-existing files accouring
+        //!< to grp_hdr.vromfs.bin (Default strategy).
+
+  PatchOnlyExisting, //!< Patch only existing files on the disk. Deny creating new files. Suitable in case when the package has been
+                     //!< downladed partially (per file) and upcoming update won't add new files and only update existing ones.
+};
+
+PatchGameResourcesStrategy set_patch_update_game_resources_strategy(PatchGameResourcesStrategy strategy);
+
+int patch_update_vromfs_pack(const char *old_vromfs_pack, const DataBlock &new_vromfs_index);
+
+bool write_index_for_sound_bank_to_stream(const char *bank_path, IGenSave &index_cwr);
+
+bool patch_update_sound_bank(const char *index_path, const char *sound_dir);
+bool patch_update_sound_bank_mem(IGenLoad &index_crd, const char *sound_dir);
+
 //! global settings for path verbosity level (default=0)
 extern int patch_update_game_resources_verbose;
+
+//! optional sanity cap (in bytes) for a single pack's body allocation when the on-disk file size is unknown
+//! (cache-files, file_size<0). Packs with a known file size are always bounded by that size, and a bogus size
+//! is already handled gracefully by tryAlloc; this cap is an extra guard to reject an absurdly large size
+//! early. Default=0 (disabled); set to a positive value per game/platform to enable.
+extern int64_t patch_update_game_resources_max_pack_data_size;

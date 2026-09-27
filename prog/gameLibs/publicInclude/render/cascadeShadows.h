@@ -7,6 +7,8 @@
 #include "cascadeShadowsDecl.h"
 #include <EASTL/fixed_function.h>
 #include <3d/dag_resPtr.h>
+#include <vecmath/dag_vecMathDecl.h>
+#include <generic/dag_span.h>
 
 
 class DataBlock;
@@ -23,11 +25,13 @@ class CascadeShadowsPrivate;
 class BaseTexture;
 
 typedef eastl::fixed_function<sizeof(void *) * 5, void(int num_cascades_to_render, bool clear_per_view)> csm_render_cascades_cb_t;
+typedef eastl::fixed_function<sizeof(void *) * 5, void()> csm_render_cascade_depth_cb_t;
 
 class ICascadeShadowsClient
 {
 public:
   // The returned point is used as an origin for shadow pixel-wise alignment.
+  // Should be in camera relative space.
   // If .w > 0.0, then it is treated as a sphere around which to render the cascade.
   // If .w <= 0.0 for cascade i, then it must be <= 0 for all the subsequent cascades.
   virtual Point4 getCascadeShadowAnchor(int cascade_no) = 0;
@@ -45,6 +49,8 @@ public:
   static constexpr int MAX_CASCADES = CSM_MAX_CASCADES;
   static constexpr int SSSS_CASCADES = CSM_SSSS_CASCADES;
 
+  static constexpr eastl::array<int, 5> ALLOWED_CASCADES_VALUES = {1, 2, 3, 4, 6};
+
   struct Settings
   {
     int cascadeWidth = 1024;
@@ -60,6 +66,16 @@ public:
     // Skip rendering to CSM any destructable whose bounding box radius is less than
     // (static shadow texel size) * (this multiplier)
     float destructablesMinBboxRadiusTexelMul = 0.f;
+    // Extend shadow projection box along the sun's depth axis to include the next cascade's frustum.
+    // Cascade doesn't depend on the orientation of the camera, it only depends on direction of the sun.
+    // So you only extend cascade in a single direction. If you're aligned with the sun direction, you'll
+    // see extended cascade. If you turn back, you'll see real cascade range.
+    // So I highly recommend to opt out of this feature.
+    bool extendZBoxToNextCascade = true;
+    // Provides rotation invariance by ensuring that size of cascade is constant.
+    // Provides translation invariance by snapping ortho camera position to texel grid.
+    // Trades orientation dependant resolution for stability.
+    bool constantCascadeSize = false;
     enum class ResourceAccessStrategy
     {
       Internal,
@@ -83,7 +99,10 @@ public:
     float cascade0Dist; // if cascade0Dist is >0, it will be used as minimum of auto calculated cascade dist and this one. This is to
                         // artificially create high quality cascade for 'cockpit'
     float overrideZNearForCascadeDistribution;
+    float cameraFov = -1;
     bool useFixedShadowCascade;
+    bool snapAnchorToHero = false;
+    float cascadeTransitionZoneWidth = 0.0f;
 
     bool operator==(const ModeSettings &rhs) const = default;
   };
@@ -103,8 +122,9 @@ public:
   void setDepthBiasSettings(const Settings &set);
   void setCascadeWidth(int cascadeWidth);
   void renderShadowsCascades();
-  void renderShadowsCascadesCb(const csm_render_cascades_cb_t &cb, ManagedTexView external_cascades = {});
-  void renderShadowCascadeDepth(int cascadeNo, bool clearPerView, ManagedTexView external_cascades = {});
+  void renderShadowsCascadesCb(const csm_render_cascades_cb_t &cb, BaseTexture *external_cascades = {}, bool clear_per_view = false);
+  void renderShadowCascadeDepth(int cascadeNo, bool clearPerView, BaseTexture *external_cascades = {});
+  void renderShadowCascadeDepthCb(int cascadeNo, const csm_render_cascade_depth_cb_t &cb);
 
   void setSamplingBiasToShader(float value);
   void setCascadesToShader();
@@ -122,8 +142,10 @@ public:
   const TMatrix4_vec4 &getWorldRenderMatrix(int cascade_no) const;
   const TMatrix4_vec4 &getRenderViewMatrix(int cascade_no) const;
   const TMatrix4_vec4 &getRenderProjMatrix(int cascade_no) const;
+  float getCameraFov() const;
   const Point3 &shadowWidth(int cascade_no) const;
   const BBox3 &getWorldBox(int cascade_no) const;
+  Point2 getCascadeViewDepthRange(int cascade_no) const;
   bool shouldUpdateCascade(int cascade_no) const;
   bool isCascadeValid(int cascade_no) const;
   void copyFromSparsed(int cascade_no);
@@ -132,9 +154,13 @@ public:
   float getMaxShadowDistance() const;
   const Frustum &getWholeCoveredFrustum() const;
   BaseTexture *getShadowsCascade() const;
+  ManagedTexView getShadowsCascadeView() const;
   d3d::SamplerHandle getShadowsCascadeSampler() const;
   const TextureInfo &getShadowCascadeTexInfo() const;
   const Point2 &getZnZf(int cascade_no) const;
+  dag::ConstSpan<plane3f> getShadowRegionPlanes(int cascade_no) const;
+  dag::ConstSpan<plane3f> getShadowRegionBackPlanes(int cascade_no) const;
+  dag::ConstSpan<plane3f> getShadowRegionSilhouettePlanes(int cascade_no) const;
 
   const String &setShadowCascadeDistanceDbg(const Point2 &scene_z_near_far, int tex_size, int splits_w, int splits_h,
     float shadow_distance, float pow_weight);

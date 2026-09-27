@@ -8,7 +8,7 @@
 #define TRACER_COMMAND_WARP_SIZE 16
 #define TRACER_CULL_WARP_SIZE 16
 #define CONST_BUF_MAX_SIZE 4096 /* in float4 */
-#define TRACER_CMD_BUF_MAX_SIZE (CONST_BUF_MAX_SIZE-4)
+#define TRACER_CMD_BUF_MAX_SIZE (CONST_BUF_MAX_SIZE-4-1) /* 1 additional pad for sentinel */
 #define TRACER_SMOKE_UPDATE_COMMAND_SIZE 1 /* TracerUpdateCommand in float4 */
 #define TRACER_SMOKE_MAX_UPDATE_COMMANDS (TRACER_CMD_BUF_MAX_SIZE / TRACER_SMOKE_UPDATE_COMMAND_SIZE)
 #define TRACER_SMOKE_CREATE_COMMAND_SIZE 5 /* TracerCreateCommand in float4 */
@@ -82,11 +82,11 @@ struct GPUSmokeTracerTailRender//todo: compress me!
 struct GPUSmokeTracerHeadRender//todo: compress me!
 {
   float3 p0;
-  float pad0;
+  float radius0; // radius at p0
   float3 p1;
-  float radius;//can be compressed
+  float radius1; // radius at p1
 
-  float4 color;//can be compressed
+  float4 color;//can be compressed ; // color.a is fade at p1
 };
 
 struct TracerCreateCommand
@@ -112,6 +112,17 @@ float get_tracers_max_wind_radius(float radiusStart){return TRACERS_WIND_RADIUS_
 float3 get_tracers_wind(float time)
 {
   return -time*TRACERS_WIND_RADIUS_STR*float3(1,0,1);//todo: unified wind solution (particles, volumetrics, tracers)
+}
+
+void smoke_tracer_unpack_verts(uint packedData, out uint firstVert, out uint totalVerts)
+{
+  totalVerts = packedData & 0xFFFFu;
+  firstVert  = packedData >> 16;
+}
+
+uint smoke_tracer_pack_verts(uint firstVert, uint totalVerts)
+{
+  return totalVerts | (firstVert << 16);
 }
 
 #endif

@@ -4,6 +4,9 @@ include "dagi_irrad_grid_sample.dshl"
 include "dagi_common_ambient.dshl"
 include "clustered/gi_dynamic_lights.dshl"
 
+int gi_enable_lights_at_radiance_trace = 0;
+interval gi_enable_lights_at_radiance_trace: no < 1, yes;
+
 macro SUN_LIGHT_POINT_TRACE_HIT(code)//at trace hit when calculating probes
   SQ_INIT_CLOUDS_SHADOW(code)
   SQ_CLOUDS_SHADOW(code)
@@ -63,13 +66,13 @@ macro PROJECT_ADDITIONAL_SKY_VIS_TEMPORAL(code)
   //only on temporal recalc we use csm shadows - for performance
   SHADOWS_QUALITY_DEFINE(code)
   INIT_CSM_SHADOW(code)
-  BASE_USE_CSM_SHADOW_DEF_NUM(code)
+  BASE_USE_CSM_SHADOW_DEF_NUM_DEFAULT(code)
 endmacro
 
 macro PROJECT_ADDITIONAL_SKY_VIS(code)//at trace hit when calculating sky vis probes
   //SHADOWS_QUALITY_DEFINE(code)
   //INIT_CSM_SHADOW(code)
-  //BASE_USE_CSM_SHADOW_DEF_NUM(code)
+  //BASE_USE_CSM_SHADOW_DEF_NUM_DEFAULT(code)
   SUN_LIGHT_POINT_TRACE_HIT(code)
   DAGI_SKY_VIS_THROUGH(code)
 endmacro
@@ -78,17 +81,17 @@ macro SUN_SKY_LIGHT_POINT_TRACE_HIT(code)//at trace hit when calculating probes 
   SUN_LIGHT_POINT_TRACE_HIT(code)
   DAGI_GET_COMMON_VOXELIZATION_AMBIENT(code)
   hlsl(code) {
-    float3 get_sun_sky_lit_color(float3 ambientWorldPos, float3 worldPos, float3 worldNormal, float3 albedo, float shadow_offset = 0, float ambient_loss = 1, float3 def_ambient = 0)
+    float3 get_sun_sky_lit_color(float3 ambientWorldPos, float3 worldPos, float3 worldNormal, float3 albedo, float shadow_offset = 0, float ambient_loss = 1, float3 def_ambient = 0, float4 toCameraBiasDirAndLimit = 0)
     {
-      float3 ambient = dagi_get_common_offscreen_ambient(ambientWorldPos, worldNormal, def_ambient);
+      float3 ambient = dagi_get_common_offscreen_ambient(ambientWorldPos, worldNormal, def_ambient, toCameraBiasDirAndLimit);
       float3 litColor = (ambient*ambient_loss + dagi_get_sun_color(worldPos, worldNormal, shadow_offset))*albedo;
       //fixme: add direct lights from camera
       return litColor;
     }
     #define DAGI_LIGHT_TRANSLUCENT_SCENE 1
-    float3 get_sun_sky_lit_color_both(float3 ambientWorldPos, float3 worldPos, float3 worldNormal, float3 albedo, float3 translucencyColor, inout float3 ambient, inout float3 back_ambient, float shadow_offset = 0, float ambient_loss = 1)
+    float3 get_sun_sky_lit_color_both(float3 ambientWorldPos, float3 worldPos, float3 worldNormal, float3 albedo, float3 translucencyColor, inout float3 ambient, inout float3 back_ambient, float shadow_offset = 0, float ambient_loss = 1, float4 toCameraBiasDirAndLimit = 0)
     {
-      dagi_get_common_offscreen_ambient_both(ambientWorldPos, worldNormal, ambient, back_ambient);
+      dagi_get_common_offscreen_ambient_both(ambientWorldPos, worldNormal, ambient, back_ambient, toCameraBiasDirAndLimit);
       float3 litColor = (ambient_loss*ambient + dagi_get_sun_color(worldPos, worldNormal, shadow_offset))*albedo +
                         (ambient_loss*back_ambient + dagi_get_sun_color(worldPos, -worldNormal, shadow_offset))*translucencyColor;
       //fixme: add direct lights from camera
@@ -190,16 +193,28 @@ macro PROJECT_LIGHT_POINT_SCREEN_VOXEL(code) // when updating radiance from gbuf
 endmacro
 
 macro PROJECT_LIGHT_POINT_TRACE_HIT(code)//at trace hit when calculating probes
+  if (gi_enable_lights_at_radiance_trace == yes)
+  {
+    GI_DYNLIGHTS_MIN_PROCESSED_GBUFFER(code)
+    GI_OUT_OF_SCREEN_VOXELIZE_LIGHT_HELPER(code)
+  }
   SUN_SKY_LIGHT_POINT_TRACE_HIT(code)
   //SHADOWS_QUALITY_DEFINE(code)
   //INIT_CSM_SHADOW(code)
-  //BASE_USE_CSM_SHADOW_DEF_NUM(code)
+  //BASE_USE_CSM_SHADOW_DEF_NUM_DEFAULT(code)
   hlsl(code) {
-    float3 project_get_lit_color_at_trace_hit(float3 worldPos, float3 worldNormal, float3 albedo)
+    float3 project_get_lit_color_at_trace_hit(float3 worldPos, float3 worldNormal, float3 albedo, float4 toCameraBiasDirAndLimit = 0)
     {
       float3 ambientWorldPos = worldPos;//fixme!
       float shadowBiasMeters = 0;//fixme: we should add bias based on distance
-      return get_sun_sky_lit_color(ambientWorldPos, worldPos, worldNormal, albedo, shadowBiasMeters);
+      float3 litColor = get_sun_sky_lit_color(ambientWorldPos, worldPos, worldNormal, albedo, shadowBiasMeters, 1, 0, toCameraBiasDirAndLimit);
+      #if GI_HAS_DYNAMIC_LIGHTS
+        ProcessedGbuffer gbuf;
+        gbuf.diffuseColor = albedo;
+        gbuf.normal = worldNormal;
+        litColor += getGiDynamicLighting(gbuf, worldPos, 0, 0, 0);
+      #endif
+      return litColor;
     }
   }
 endmacro
@@ -207,7 +222,7 @@ endmacro
 macro PROJECT_LIGHT_POINT_VOXELIZE_NO_STEP_OUT(code) // when voxelizing radiance of radiance voxel scene
   SHADOWS_QUALITY_DEFINE(code)
   INIT_CSM_SHADOW(code)
-  BASE_USE_CSM_SHADOW_DEF_NUM(code)
+  BASE_USE_CSM_SHADOW_DEF_NUM_DEFAULT(code)
   SUN_SKY_LIGHT_POINT_TRACE_HIT(code)
   hlsl(code) {
     float3 project_get_lit_color_at_voxelize(float3 worldPos, float3 worldNormal, float3 albedo, float ambient_loss = 0.5, float3 def_ambient = 0)
@@ -245,8 +260,11 @@ macro PROJECT_LIGHT_POINT_VOXELIZE(code) // when voxelizing radiance of radiance
 endmacro
 
 macro PROJECT_LIGHT_POINT_VOXELIZE_OFF_SCREEN_VOXEL_LIT_SCENE(code)
-  GI_DYNLIGHTS_MIN_PROCESSED_GBUFFER(code)
-  GI_OUT_OF_SCREEN_VOXELIZE_LIGHT_HELPER(code)
+  if (compatibility_mode == compatibility_mode_off)
+  {
+    GI_DYNLIGHTS_MIN_PROCESSED_GBUFFER(code)
+    GI_OUT_OF_SCREEN_VOXELIZE_LIGHT_HELPER(code)
+  }
   PROJECT_LIGHT_POINT_VOXELIZE(code)
 endmacro
 
@@ -258,7 +276,11 @@ macro PROJECT_LIGHT_POINT_SCREEN_VOXEL_LIT_SCENE(code)
 endmacro
 
 macro PROJECT_GET_SKY_RADIANCE_AT(code)
-  (code) { envi_probe_specular@smpCube = envi_probe_specular; }//todo: use pre-averaged octahedral of a reasonable resolution!
+  (code) { envi_probe_specular@texCube = envi_probe_specular; }//todo: use pre-averaged octahedral of a reasonable resolution!
+  INIT_GLOBAL_LINEAR_WRAP_SAMPLER(code)
+  hlsl(code) {
+    #define envi_probe_specular_samplerstate global_linear_wrap_sampler
+  }
   hlsl(code) {
     //when ray miss the scene
     float3 dagi_get_sky_radiance_at(float3 worldPosAt, float3 rayDir)
@@ -275,6 +297,32 @@ macro PROJECT_GET_SKY_RADIANCE_AT(code)
       #endif
 
       return darkening*texCUBElod(envi_probe_specular, float4(rayDir,3)).rgb;// todo: better use preintegrated octahedral!
+    }
+  }
+endmacro
+
+// media voxel lit color for the daGI2 media volumes: static shadowed sun + GI ambient on
+// the front side, the back side lit through the translucency color (a leaf cloud
+// transmits); the ambient is lost to the canopy above (dagi_media_vols_atten)
+macro PROJECT_DAGI_MEDIA_VOLS_AMBIENT(code)
+  SUN_SKY_LIGHT_POINT_TRACE_HIT(code)
+  (code) {
+    dagi_media_vols_sky_mean@f3 = (enviSPH0.w, enviSPH1.w, enviSPH2.w, 0);
+  }
+  hlsl(code) {
+    float3 dagi_media_vols_ambient(float3 world_pos, float3 world_normal, float3 albedo, float3 translucency_color,
+      float voxel_size)
+    {
+      float atten = dagi_media_vols_atten(world_pos, voxel_size);
+      // the irradiance grid sampler writes the inouts only inside its clips (bool return
+      // it cannot surface through this call): everywhere else the mean sky irradiance is
+      // the fallback, an uninitialized register otherwise ends up stored in the scene
+      float3 ambient = dagi_media_vols_sky_mean, backAmbient = dagi_media_vols_sky_mean;
+      // the step samples the ambient above the voxel and the sun shadow toward the sun: a
+      // crown center otherwise reads both through its own crown slab
+      float step = dagi_media_vols_light_step(voxel_size);
+      return get_sun_sky_lit_color_both(world_pos + float3(0, step, 0), world_pos, world_normal, albedo, translucency_color,
+        ambient, backAmbient, step, atten);
     }
   }
 endmacro

@@ -1,6 +1,7 @@
 include "sky_shader_global.dshl"
 include "viewVecVS.dshl"
 include "clouds_tiled_dist.dshl"
+include "clouds_used_uv.dshl"
 include "clouds_close_layer_outside.dshl"
 include "skies_special_vision.dshl"
 include "distanceToClouds2.dshl"
@@ -8,6 +9,8 @@ include "vr_reprojection.dshl"
 include "use_custom_fog_sky.dshl"
 include "flexible_scale_rasterization.dshl"
 include "cloud_volume_mask.dshl"
+include "sky_polarization_filter_term_inc.dshl"
+include "camera_in_camera.dshl"
 
 float min_ground_offset;
 texture clouds_color;
@@ -16,7 +19,20 @@ texture clouds_color_close;
 texture clouds_target_depth_gbuf;
 float4 clouds_target_depth_gbuf_transform = (1, 1, 0, 0);
 texture clouds_depth_gbuf;
+// really sampled size of clouds_depth_gbuf, (w, h, 1/w, 1/h): follows dynamic
+// resolution, not the clouds res. 0 = not fed, derive from the clouds res
+float4 clouds_depth_gbuf_dims;
+sampler clouds_depth_gbuf_samplerstate
+{
+  mipmap_mode = point;
+  filter = point;
+  address_u = border;
+  address_v = border;
+  address_w = border;
+  border_color = (0, 0, 0, 0);
+};
 int4 clouds2_resolution;
+int4 clouds2_far_res_last_texel_index;
 int clouds_has_close_sequence = 1;
 int clouds_apply_simple_ztest = 1;
 
@@ -53,6 +69,8 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
 
   bool is_simple_array = clouds_depth_gbuf == NULL;
 
+  INIT_SKY_POLARIZATION_FILTER_TERM(ps)
+  USE_SKY_POLARIZATION_FILTER_TERM(ps)
   USE_CLOUDS_DISTANCE(ps)
   USE_CLOUDS_DISTANCE_STUB(ps)
   USE_SPECIAL_VISION()
@@ -64,10 +82,10 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
 
   CLOUD_VOLUME_MASK()
 
+  INIT_AND_USE_ON_TOP_CAMERA_IN_CAMERA(ps)
   USE_CUSTOM_FOG_SKY(ps)
 
   VIEW_VEC_OPTIMIZED(ps)
-  ENABLE_ASSERT(ps)
 
   hlsl {
     struct VsOutput
@@ -108,14 +126,16 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
   (ps) {
     fullres_depth_gbuf@smp2d = clouds_target_depth_gbuf;
     fullres_depth_gbuf_transform@f4 = clouds_target_depth_gbuf_transform;
-    clouds_depth_gbuf@smp2d = clouds_depth_gbuf;
+    clouds_depth_gbuf@tex2d = clouds_depth_gbuf;
+    clouds_depth_gbuf_samplerstate@sampler = clouds_depth_gbuf_samplerstate;
     clouds_close_depth_tex@smp2d = clouds_close_depth_tex;
 
     clouds_color@smp2d = clouds_color;
-    clouds_color_close@smp2d = clouds_color_close;
+    clouds_color_close@tex2d = clouds_color_close;
     clouds2_far_res@f4 = (clouds2_resolution.xy, 1/clouds2_resolution.xy);
     clouds2_far_resI@u2 = (clouds2_resolution.xy);
-    clouds2_close_res@f2 = (clouds2_resolution.zw,0,0);
+    clouds2_far_res_last_texel_index@i2 = (clouds2_far_res_last_texel_index.xy);
+    clouds_depth_gbuf_dims@f4 = clouds_depth_gbuf_dims;
     clouds_has_close_sequence@f1 = clouds_has_close_sequence;
 
     world_view_pos@f3 = world_view_pos;
@@ -125,8 +145,12 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
 
     dynamic_bit_texture@smp2d = dynamic_bit_texture;
   }
+  INIT_CLOUDS_USED_UV(ps)
+  INIT_CLOUDS_USED_UV_CLOSE(ps)
+  INIT_GLOBAL_LINEAR_CLAMP_SAMPLER(ps)
   hlsl(ps){
     #define clouds_close_depth_tex_samplerstate clouds_depth_gbuf_samplerstate
+    #define clouds_color_close_samplerstate global_linear_clamp_sampler
   }
   INIT_ZNZFAR()
   DISTANCE_TO_CLOUDS2(ps)
@@ -162,8 +186,7 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
       ##else
         uv = uv * fullres_depth_gbuf_transform.xy + fullres_depth_gbuf_transform.zw;
         uint shadowPacked = uint(tex2Dlod(dynamic_bit_texture, float4(uv,0,0)).w * 255.0 + 0.1);
-        uint impostorLandscapeMotionMask = shadowPacked >> 5;
-        return (impostorLandscapeMotionMask & 1) == 1;
+        return (shadowPacked & 1) == 1;
       ##endif
     }
 
@@ -173,6 +196,14 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
       return worldPos.y < clouds_start_alt && world_view_pos.y < clouds_start_alt;
     }
 
+    ##if clouds_use_fullres == yes
+      #define USE_FULLRES_CLOUDS 1
+    ##endif
+
+    ##if clouds_close_depth_tex != NULL // DNG-specific // TODO: use it everywhere, without dynamic bit
+      #define CLOUD_APPLY_USE_SMART_UPSCALING 1
+    ##endif
+
     float get_alpha_mask(float3 view_vec, float2 texcoord, float2 depth_texcoord, float linear_depth)
     {
       BRANCH
@@ -181,7 +212,7 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
 
       bool varyingDepth = false;
       float maskScale = 1;
-      ##if clouds_close_depth_tex != NULL // DNG-specific // TODO: use it everywhere, without dynamic bit
+      #if CLOUD_APPLY_USE_SMART_UPSCALING
         BRANCH
         if (check_full_ray_below_clouds(view_vec, linear_depth))
         {
@@ -197,7 +228,7 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
         FLATTEN
         if (varyingDepth)
           maskScale = 1 - pow2(saturate(linear_depth * cloud_volume_remap)); // fade out mask far away
-      ##endif
+      #endif
 
       BRANCH
       if (varyingDepth || getDynamic(depth_texcoord))
@@ -209,11 +240,12 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
     #include <tex2d_bicubic.hlsl>
     half4 getBicubicClose( float2 p )
     {
-##if clouds_use_fullres == yes
-      return tex2Dlod(clouds_color_close, float4(p,0,0));
-##else
-      return tex2D_bicubic_lod(clouds_color_close, clouds_color_close_samplerstate, p, clouds2_close_res, 0);
-##endif
+      #if USE_FULLRES_CLOUDS || CLOUD_APPLY_USE_SMART_UPSCALING
+        return tex2Dlod(clouds_color_close, float4(screen_to_clouds_close_uv(p),0,0));
+      #else
+        return tex2D_bicubic_lod(clouds_color_close, clouds_color_close_samplerstate, screen_to_clouds_close_uv(p),
+                                 clouds2_close_allocated_res, 0);
+      #endif
     }
 
     half4 bilateral_get(float3 viewVec, float2 texcoord, float2 depth_texcoord, float linearDepth, bool sky_is_visible)
@@ -222,49 +254,72 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
         return half4(0,0,0,0);
 
 ##if clouds_use_fullres == yes || clouds_use_blur_apply == yes || use_bounding_vr_reprojection == on
-      return tex2Dlod(clouds_color, float4(texcoord,0,0));
+      return tex2Dlod(clouds_color, float4(screen_to_clouds_uv(texcoord),0,0));
 ##else
+      //the depth texel math below must use the real depth size: the clouds grid is
+      //normally locked to clouds_depth_gbuf; the grids differ only for a non-integer
+      //quality divider or an unfed dims var. Same (w, h, 1/w, 1/h)
+      //layout as the clouds2_far_res fallback (an exe older than the dump).
+      //When the grids differ, each color texel's weight must come from the depth
+      //AT that texel (a co-located point sample), or the edge guidance
+      //decorrelates from the color it weights; equal grids keep the original
+      //quad fetch, bit-identical
+      float4 depthGbufDims = clouds_depth_gbuf_dims.x > 0 ? clouds_depth_gbuf_dims : clouds2_far_res;
+      int2 depthGbufLastTexel = int2(depthGbufDims.xy) - 1;
+      bool depthGridMatches = depthGbufDims.x == clouds2_far_res.x && depthGbufDims.y == clouds2_far_res.y;
+      //clouds texel center scaled into the depth grid = the depth texel covering
+      //it (identity when the grids match)
+      float2 depthGridScale = depthGbufDims.xy * clouds2_far_res.zw;
   ##if clouds_bilateral_size == small
     #define GET_LOWRES_COORD(ofs, tc)\
       float2 lowResCoords = tc*clouds2_far_res.xy - ofs;\
       int4 lowResCoordsI;\
       lowResCoordsI.xy = int2(lowResCoords);\
-      lowResCoordsI.zw = min(lowResCoordsI.xy+int2(1,1), int2(clouds2_far_resI) - 1);
+      lowResCoordsI.zw = min(lowResCoordsI.xy+int2(1,1), clouds2_far_res_last_texel_index);
 
     ##if use_gather4
-      float4 lowResRawDepth = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, depth_texcoord).wzxy;
+      GET_LOWRES_COORD(0.499, texcoord)
     ##else
       GET_LOWRES_COORD(0.5, depth_texcoord)
-      float4 lowResRawDepth;
-      lowResRawDepth.x = clouds_depth_gbuf[lowResCoordsI.xy].x;
-      lowResRawDepth.y = clouds_depth_gbuf[lowResCoordsI.zy].x;
-      lowResRawDepth.z = clouds_depth_gbuf[lowResCoordsI.xw].x;
-      lowResRawDepth.w = clouds_depth_gbuf[lowResCoordsI.zw].x;
     ##endif
+      float4 lowResRawDepth;
+    ##if use_gather4
+      BRANCH
+      if (depthGridMatches)
+        lowResRawDepth = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, depth_texcoord).wzxy;
+      else
+    ##endif
+      {
+        int4 crd = min(int4((lowResCoordsI + 0.5)*depthGridScale.xyxy), depthGbufLastTexel.xyxy);
+        lowResRawDepth.x = texelFetch(clouds_depth_gbuf, crd.xy, 0).x;
+        lowResRawDepth.y = texelFetch(clouds_depth_gbuf, crd.zy, 0).x;
+        lowResRawDepth.z = texelFetch(clouds_depth_gbuf, crd.xw, 0).x;
+        lowResRawDepth.w = texelFetch(clouds_depth_gbuf, crd.zw, 0).x;
+      }
     float4 linearLowResDepth = linearize_z4(lowResRawDepth, zn_zfar.zw);
     float4 maxDiff4 = abs(linearLowResDepth-linearDepth);
     float maxDiff = max(max(maxDiff4.x, maxDiff4.y), max(maxDiff4.z, maxDiff4.w));
     float minDiff = min(min(maxDiff4.x, maxDiff4.y), min(maxDiff4.z, maxDiff4.w));
     BRANCH
     if (maxDiff<linearDepth*0.05 || minDiff>linearDepth*0.5)//if difference is within 5%  - just use bilinear
-      return tex2Dlod(clouds_color, float4(texcoord,0,0));
+      return tex2Dlod(clouds_color, float4(screen_to_clouds_uv(texcoord),0,0));
 
-    ##if use_gather4
-      GET_LOWRES_COORD(0.499, texcoord)
-    ##endif
     float4 bilateralWeights = getZWeights(linearLowResDepth, linearDepth);
     bilateralWeights*=bilateralWeights;
     bilateralWeights /= dot(bilateralWeights, 1);
 
     return clouds_color[lowResCoordsI.xy]*bilateralWeights.x+
-            clouds_color[lowResCoordsI.zy]*bilateralWeights.y+
-            clouds_color[lowResCoordsI.xw]*bilateralWeights.z+
-            clouds_color[lowResCoordsI.zw]*bilateralWeights.w;
+           clouds_color[lowResCoordsI.zy]*bilateralWeights.y+
+           clouds_color[lowResCoordsI.xw]*bilateralWeights.z+
+           clouds_color[lowResCoordsI.zw]*bilateralWeights.w;
   ##else // clouds_bilateral_size == big
     // Sample the 3x3 lowres depth around the texcoord, bilaterally filter them
     // Store values for the 9 pixels in 3 float4s (w comp is not used)
+    //the origin walks the CLOUDS grid: the color phase below pairs texel k's depth
+    //diff with texel k's color and bilinear weight, so both phases must agree on
+    //the grid; on a differing depth grid the value is a co-located point sample
     float2 lowResCoordsOrigin = depth_texcoord * clouds2_far_res.xy;
-    float2 lowResCoordsOriginI = (int2)lowResCoordsOrigin;
+    int2 lowResCoordsOriginI = (int2)lowResCoordsOrigin;
 
     int i;
     float4 packedSamples[3];
@@ -272,29 +327,38 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
     float maxDiff = 0;
 
     ##if use_gather4
-      float2 gatherTc = floor(lowResCoordsOrigin) * clouds2_far_res.zw;
-      // top left
-      float4 samples = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, gatherTc + float2(-0.5, -0.5) * clouds2_far_res.zw).wzxy;
-      packedSamples[0].xy = samples.xy;
-      packedSamples[1].xy = samples.zw;
+      BRANCH
+      if (depthGridMatches)
+      {
+        float2 gatherTc = floor(lowResCoordsOrigin) * clouds2_far_res.zw;
+        // top left
+        float4 samples = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, gatherTc + float2(-0.5, -0.5) * clouds2_far_res.zw).wzxy;
+        packedSamples[0].xy = samples.xy;
+        packedSamples[1].xy = samples.zw;
 
-      // top right
-      samples = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, gatherTc + float2(+0.5, -0.5) * clouds2_far_res.zw).wzxy;
-      packedSamples[0].zw = samples.yy;
-      packedSamples[1].zw = samples.ww;
+        // top right
+        samples = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, gatherTc + float2(+0.5, -0.5) * clouds2_far_res.zw).wzxy;
+        packedSamples[0].zw = samples.yy;
+        packedSamples[1].zw = samples.ww;
 
-      // bottom left
-      samples = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, gatherTc + float2(-0.5, +0.5) * clouds2_far_res.zw).wzxy;
-      packedSamples[2].xy = samples.zw;
+        // bottom left
+        samples = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, gatherTc + float2(-0.5, +0.5) * clouds2_far_res.zw).wzxy;
+        packedSamples[2].xy = samples.zw;
 
-      // bottom right
-      samples = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, gatherTc + float2(+0.5, +0.5) * clouds2_far_res.zw).wzxy;
-      packedSamples[2].zw = samples.ww;
-    ##else
-      UNROLL
-      for(i = 0; i < 9; i++)
-        packedSamples[i / 3][i % 3] = clouds_depth_gbuf[lowResCoordsOriginI + int2(i % 3 - 1, i / 3 - 1)].r;
+        // bottom right
+        samples = clouds_depth_gbuf.GatherRed(clouds_depth_gbuf_samplerstate, gatherTc + float2(+0.5, +0.5) * clouds2_far_res.zw).wzxy;
+        packedSamples[2].zw = samples.ww;
+      }
+      else
     ##endif
+      {
+        UNROLL
+        for(i = 0; i < 9; i++)
+        {
+          int2 cloudsCrd = clamp(lowResCoordsOriginI + int2(int(uint(i) % 3u) - 1, int(uint(i) / 3u) - 1), int2(0, 0), clouds2_far_res_last_texel_index);
+          packedSamples[uint(i) / 3u][uint(i) % 3u] = texelFetch(clouds_depth_gbuf, min(int2((cloudsCrd + 0.5)*depthGridScale), depthGbufLastTexel), 0).x;
+        }
+      }
 
     // calculate depth diff between lowres samples and shaded pixel's depth, store it in packedSamples
     float4 diff = abs(linearize_z4(packedSamples[0], zn_zfar.zw) - linearDepth);
@@ -317,7 +381,7 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
     const float depthDiffMaxThreshold = 0.5;
     BRANCH
     if (maxDiff<linearDepth*depthDiffMinThreshold || minDiff>linearDepth*depthDiffMaxThreshold)
-      return tex2Dlod(clouds_color, float4(texcoord,0,0));
+      return tex2Dlod(clouds_color, float4(screen_to_clouds_uv(texcoord),0,0));
 
     float weightSum = 0;
     float4 result = 0;
@@ -348,7 +412,7 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
     UNROLL
     for(i = 0; i < 9; i++)
     {
-      int2 lowResCoordsInt = lowResCoordsOriginI + int2(i % 3 - 1, i / 3 - 1);
+      int2 lowResCoordsInt = clamp(lowResCoordsOriginI + int2(i % 3 - 1, i / 3 - 1), int2(0, 0), clouds2_far_res_last_texel_index);
       float colorWeight = bilateralWeights[i / 3][i % 3];
       float4 cloudColorSample = clouds_color[lowResCoordsInt];
       result += cloudColorSample * colorWeight;
@@ -405,7 +469,7 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
       ##if is_simple_array
         half4 distPlane = 0;
         if (HAS_EMPTY_TILES==0 || !tile_is_empty(uint2(texcoord.xy*clouds2_far_res.xy)))
-          distPlane = tex2Dlod(clouds_color, float4(texcoord,0,0));
+          distPlane = tex2Dlod(clouds_color, float4(screen_to_clouds_uv(texcoord),0,0));
         return half4(TAA_BRIGHTNESS_SCALE*distPlane.rgb, distPlane.a);
       ##else
         //we can exit early doing bilteral sample apply, if (for bilinear):
@@ -432,11 +496,12 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
 
         half4 distPlane = 0;
         half4 closePlane = 0;
+        // also gate on the per-frame flag: SM<5 has no early-exit buffer (stub returns false)
         BRANCH
-        if (!close_layer_should_early_exit())
+        if (clouds_has_close_sequence && !close_layer_should_early_exit())
         {
           #if SIMPLER_CLOSE_CLOUDS_APPLY
-          closePlane = tex2Dlod(clouds_color_close, float4(texcoord,0,0));
+          closePlane = tex2Dlod(clouds_color_close, float4(screen_to_clouds_close_uv(texcoord),0,0));
           #else
           closePlane = getBicubicClose(texcoord);
           #endif
@@ -450,8 +515,13 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
         } else
         #endif
         {
-          if (linearDist > closeSequenceEndDist && (HAS_EMPTY_TILES==0 || !tile_is_empty(uint2(texcoord.xy*clouds2_far_res.xy))))
-            distPlane = bilateral_get(input.viewVect, texcoord, distortedTc, linearDepth, sky_is_visible);
+          uint2 cloudsScrPos = uint2(texcoord.xy*clouds2_far_res.xy);
+          if (linearDist > closeSequenceEndDist && (HAS_EMPTY_TILES==0 || !tile_is_empty(cloudsScrPos)))
+          {
+            BRANCH
+            if (sky_is_visible || closest_tiled_dist(cloudsScrPos) <= linearDist)
+              distPlane = bilateral_get(input.viewVect, texcoord, distortedTc, linearDepth, sky_is_visible);
+          }
         }
 
         float mask = get_alpha_mask(input.viewVect, texcoord, distortedTc, linearDepth);
@@ -465,13 +535,14 @@ shader clouds2_apply, clouds2_apply_has_empty, clouds2_apply_no_empty
       float4 screenpos = GET_SCREEN_POS(input.pos);
       bool skyIsVisisble;
       half4 result = apply_clouds_ps_main(input, screenpos, skyIsVisisble);
+      result.rgb *= apply_sky_polarization_filter();
 
       applySpecialVision(result);
 
       // fog is applied here, in clouds apply instead of sky rendering, as clouds are drawn later, but we don't want +1 pass for fog apply
       // we assume volfog is always in front of clouds (we already assume that for every surface in the depth buffer anyway)
       // otherwise we would apply fog multiple times in a certain range (from encode_depth.z)
-      if (skyIsVisisble)
+      if (skyIsVisisble && sky_special_vision.x == 0)
       {
         result.a = 1 - result.a; // transmittance is the inverse of blending alpha
         float2 jitteredVolfogTc = get_volfog_dithered_screen_tc(screenpos.xy, input.tc.xy);
@@ -501,10 +572,12 @@ shader clouds_create_indirect
   (cs) {
     tiles_threshold@f1 = (clouds_tiled_res.x*clouds_tiled_res.y*0.9, clouds2_dispatch_groups.x,clouds2_dispatch_groups.y,0);//90% of tiles should be non empty so we ignore non-empty tiles completely
     clouds2_dispatch_groups@f4 = clouds2_dispatch_groups;
+    indirect_buffer@uav : register(0) hlsl {
+      RWByteAddressBuffer indirect_buffer@uav;
+    }
   }
 
   hlsl(cs) {
-    RWByteAddressBuffer indirect_buffer:register(u0);
     #include <clouds2/cloud_settings.hlsli>
 
     [numthreads(CLOUDS_APPLY_COUNT, 1, 1)]
@@ -538,6 +611,7 @@ macro CLOUD_BLUR(stage)
     clouds_color@smp2d = clouds_color;
     clouds2_far_res@f4 = (clouds2_resolution.xy, 1/clouds2_resolution.xy);
   }
+  INIT_CLOUDS_USED_UV(stage)
 
   hlsl(stage) {
     float4 get_simple_blur(float2 texcoord)
@@ -568,7 +642,7 @@ macro CLOUD_BLUR(stage)
       float4 outputColor = float4(0.0, 0.0, 0.0, 0.0);
       UNROLL
       for (int i = 0; i < 8; i++) {
-        outputColor += tex2Dlod(clouds_color, float4(texcoord + offsets[i], 0, 0)) * offsetsWeights[i];
+        outputColor += tex2Dlod(clouds_color, float4(screen_to_clouds_uv(texcoord + offsets[i]), 0, 0)) * offsetsWeights[i];
       }
 
       outputColor /= 3.8972; // sum of weights
@@ -579,12 +653,15 @@ endmacro
 
 shader clouds2_apply_blur_cs
 {
-  ENABLE_ASSERT(cs)
   CLOUD_BLUR(cs)
 
+  (cs) {
+    target0@uav : register(0) hlsl {
+      RWTexture2D<float4> target0@uav;
+    }
+  }
   hlsl(cs) {
     #include "cloud_settings.hlsli"
-    RWTexture2D<float4> target0: register(u0);
 
     [numthreads(CLOUD_TRACE_WARP_X, CLOUD_TRACE_WARP_Y, 1)]
     void cs_main(uint2 dtid : SV_DispatchThreadID)

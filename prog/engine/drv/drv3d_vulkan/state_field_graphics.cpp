@@ -11,12 +11,13 @@
 #include "pipeline_cache.h"
 #include "backend.h"
 #include "execution_async_compile_state.h"
-#include "execution_context.h"
+#include "backend/context.h"
 #include "vk_to_string.h"
 #include "frontend.h"
 #include "device_context.h"
 #include "wrapped_command_buffer.h"
 #include "swapchain.h"
+#include "backend/cmd/state.h"
 
 namespace drv3d_vulkan
 {
@@ -38,6 +39,7 @@ VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsBlendConstantFactor, blendConst
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsVertexBufferStrides, vertexBufferStrides, FrontGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsViewport, viewport, FrontGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsQueryState, queryState, FrontGraphicsStateStorage)
+VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsShadingRate, shadingRate, FrontGraphicsStateStorage);
 // back fields
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsRenderPassClass, rpClass, BackGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsBasePipeline, basePipeline, BackGraphicsStateStorage);
@@ -57,6 +59,10 @@ VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsDepthBounds, depthBounds, BackG
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsStencilRef, stencilRef, BackDynamicGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsStencilRefOverride, stencilRefOverride, BackDynamicGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsStencilMask, stencilMask, BackDynamicGraphicsStateStorage);
+VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsExtCullMode, cullMode, BackExtDynamicGraphicsStateStorage);
+VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsExtDepthTest, depthTest, BackExtDynamicGraphicsStateStorage);
+VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsExtDepthBoundsTestEnable, depthBoundsTestEnable, BackExtDynamicGraphicsStateStorage);
+VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsExtStencilTest, stencilTest, BackExtDynamicGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsDynamicRenderStateIndex, dynamicRenderStateIndex, BackGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsBlendConstantFactor, blendConstantFactor, BackGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsIndexBuffer, indexBuffer, BackGraphicsStateStorage);
@@ -68,6 +74,7 @@ VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsRenderPassEarlyScopeOpener, ren
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsQueryScopeOpener, queryOpener, BackGraphicsStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsQueryScopeCloser, graphicsQueryCloser, BackScopeStateStorage);
 VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsRenderPassArea, renderPassArea, BackGraphicsStateStorage);
+VULKAN_TRACKED_STATE_FIELD_REF(StateFieldGraphicsShadingRate, shadingRate, BackGraphicsStateStorage);
 
 // front fields
 
@@ -87,8 +94,7 @@ void StateFieldGraphicsPolygonLine::applyTo(FrontGraphicsStateStorage &, Executi
 template <>
 void StateFieldGraphicsPolygonLine::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetPolygonLineEnable cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetPolygonLineEnable>({data});
 }
 
 template <>
@@ -103,8 +109,7 @@ void StateFieldGraphicsRenderState::applyTo(FrontGraphicsStateStorage &, Executi
 template <>
 void StateFieldGraphicsRenderState::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetRenderState cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetRenderState>({data});
 }
 
 template <>
@@ -127,8 +132,7 @@ void StateFieldGraphicsInputLayoutOverride::applyTo(FrontGraphicsStateStorage &,
 template <>
 void StateFieldGraphicsInputLayoutOverride::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetInputLayout cmd{handle};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetInputLayout>({handle});
 }
 
 template <>
@@ -148,7 +152,7 @@ void StateFieldGraphicsConditionalRenderingState::applyTo(FrontGraphicsStateStor
 }
 
 template <>
-void StateFieldGraphicsConditionalRenderingScopeOpener::applyTo(BackGraphicsStateStorage &state, ExecutionContext &target)
+void StateFieldGraphicsConditionalRenderingScopeOpener::applyTo(BackGraphicsStateStorage &state, BEContext &target)
 {
   G_UNUSED(state);
 
@@ -172,7 +176,7 @@ void StateFieldGraphicsConditionalRenderingScopeOpener::applyTo(BackGraphicsStat
 }
 
 template <>
-void StateFieldGraphicsConditionalRenderingScopeCloser::applyTo(BackScopeStateStorage &, ExecutionContext &)
+void StateFieldGraphicsConditionalRenderingScopeCloser::applyTo(BackScopeStateStorage &, BEContext &)
 {
   // we should close on next field apply if follow up code will open scope
   bool askingForOpener = data != ConditionalRenderingState{};
@@ -190,7 +194,7 @@ void StateFieldGraphicsNativeRenderPassScopeCloser::dumpLog(const BackScopeState
 }
 
 template <>
-void StateFieldGraphicsNativeRenderPassScopeCloser::applyTo(BackScopeStateStorage &, ExecutionContext &target)
+void StateFieldGraphicsNativeRenderPassScopeCloser::applyTo(BackScopeStateStorage &, BEContext &target)
 {
   if (Globals::cfg.bits.fatalOnNRPSplit &&
       (shouldClose && stage != ActiveExecutionStage::GRAPHICS &&
@@ -220,7 +224,7 @@ void StateFieldGraphicsRenderPassScopeCloser::dumpLog(const BackScopeStateStorag
 }
 
 template <>
-void StateFieldGraphicsRenderPassScopeCloser::applyTo(BackScopeStateStorage &state, ExecutionContext &target)
+void StateFieldGraphicsRenderPassScopeCloser::applyTo(BackScopeStateStorage &state, BEContext &target)
 {
 
   // we should close on next field apply if follow up code will open scope
@@ -236,8 +240,7 @@ void StateFieldGraphicsRenderPassScopeCloser::applyTo(BackScopeStateStorage &sta
 template <>
 void StateFieldGraphicsConditionalRenderingState::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetConditionalRender cmd{data.buffer, data.offset};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetConditionalRender>({data.buffer, data.offset});
 }
 
 template <>
@@ -270,21 +273,17 @@ void StateFieldGraphicsConditionalRenderingScopeCloser::dumpLog(const BackScopeS
 template <>
 void StateFieldGraphicsProgram::applyTo(FrontGraphicsStateStorage &, ExecutionState &target) const
 {
-  ShaderProgramDatabase &spdb = Globals::shaderProgramDatabase;
   if (handle != ProgramID::Null())
   {
-    InputLayoutID layoutID = spdb.getGraphicsProgInputLayout(handle);
-    if (layoutID != InputLayoutID::Null())
-    {
-      VariatedGraphicsPipeline &newPipeline = Globals::pipelines.get<VariatedGraphicsPipeline>(handle);
-      target.get<BackGraphicsState, BackGraphicsState>().pipelineState.inputLayout = layoutID;
-      target.set<StateFieldGraphicsBasePipeline, VariatedGraphicsPipeline *, BackGraphicsState>(&newPipeline);
-      target.set<StateFieldGraphicsPipelineLayout, GraphicsPipelineLayout *, BackGraphicsState>(newPipeline.getLayout());
-      target.set<StateFieldGraphicsPrimitiveTopology, StateFieldGraphicsPrimitiveTopology::TessOverride, BackGraphicsState>(
-        newPipeline.hasTesselationStage() ? true : false);
-      target.set<StateFieldGraphicsPipeline, StateFieldGraphicsPipeline::Invalidate, BackGraphicsState>(1);
-      return;
-    }
+    G_ASSERT(Globals::shaderProgramDatabase.getGraphicsProgInputLayout(handle) != InputLayoutID::Null());
+    VariatedGraphicsPipeline &newPipeline = Globals::pipelines.get<VariatedGraphicsPipeline>(handle);
+    target.get<BackGraphicsState, BackGraphicsState>().pipelineState.inputLayout = newPipeline.getBaseInputLayout();
+    target.set<StateFieldGraphicsBasePipeline, VariatedGraphicsPipeline *, BackGraphicsState>(&newPipeline);
+    target.set<StateFieldGraphicsPipelineLayout, GraphicsPipelineLayout *, BackGraphicsState>(newPipeline.getLayout());
+    target.set<StateFieldGraphicsPrimitiveTopology, StateFieldGraphicsPrimitiveTopology::TessOverride, BackGraphicsState>(
+      newPipeline.hasTesselationStage() ? true : false);
+    target.set<StateFieldGraphicsPipeline, StateFieldGraphicsPipeline::Invalidate, BackGraphicsState>(1);
+    return;
   }
 
   // if invalid graphics program will be really used, it will trigger error at usage time
@@ -298,8 +297,7 @@ void StateFieldGraphicsProgram::applyTo(FrontGraphicsStateStorage &, ExecutionSt
 template <>
 void StateFieldGraphicsProgram::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetGraphicsProgram cmd{handle};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetGraphicsProgram>({handle});
 }
 
 template <>
@@ -324,7 +322,7 @@ void StateFieldGraphicsRenderPassScopeOpener::dumpLog(const BackGraphicsStateSto
 }
 
 template <>
-void StateFieldGraphicsRenderPassScopeOpener::applyTo(BackGraphicsStateStorage &state, ExecutionContext &target) const
+void StateFieldGraphicsRenderPassScopeOpener::applyTo(BackGraphicsStateStorage &state, BEContext &target) const
 {
   TIME_PROFILE(vulkan_render_pass_scope_opener);
   D3D_CONTRACT_ASSERTF(data, "vulkan: can't use graphics stage without render pass");
@@ -370,7 +368,7 @@ void StateFieldGraphicsRenderPassEarlyScopeOpener::dumpLog(const BackGraphicsSta
 }
 
 template <>
-void StateFieldGraphicsRenderPassEarlyScopeOpener::applyTo(BackGraphicsStateStorage &, ExecutionContext &target) const
+void StateFieldGraphicsRenderPassEarlyScopeOpener::applyTo(BackGraphicsStateStorage &, BEContext &target) const
 {
   D3D_CONTRACT_ASSERTF(data, "vulkan: can't use graphics stage without render pass");
 
@@ -380,7 +378,7 @@ void StateFieldGraphicsRenderPassEarlyScopeOpener::applyTo(BackGraphicsStateStor
 }
 
 template <>
-void StateFieldGraphicsRenderPassClass::applyTo(BackGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsRenderPassClass::applyTo(BackGraphicsStateStorage &, BEContext &) const
 {}
 
 template <>
@@ -393,7 +391,7 @@ void StateFieldGraphicsRenderPassClass::dumpLog(const BackGraphicsStateStorage &
 }
 
 template <>
-void StateFieldGraphicsBasePipeline::applyTo(BackGraphicsStateStorage &state, ExecutionContext &target)
+void StateFieldGraphicsBasePipeline::applyTo(BackGraphicsStateStorage &state, BEContext &target)
 {
   if (!state.flush.needPipeline)
     return;
@@ -411,14 +409,10 @@ void StateFieldGraphicsBasePipeline::applyTo(BackGraphicsStateStorage &state, Ex
       "vulkan: trying to use pipeline with input attachment while render pass is not bound. Additional info %s",
       ptr->printDebugInfoBuffered());
     const auto &header = regs.fs().header;
-    uint32_t iaCnt = regs.fs().header.inputAttachmentCount;
-    for (uint32_t i = 0; i < header.registerCount && iaCnt > 0; ++i)
+    for (uint32_t i = 0; i < regs.fs().header.inputAttachmentCount; ++i)
     {
-      if (header.inputAttachmentIndex[i] == spirv::INVALID_INPUT_ATTACHMENT_INDEX)
-        continue;
-      state.nativeRenderPass.ptr->bindInputAttachments(target, Backend::State::exec.getResBinds(STAGE_PS),
-        header.inputAttachmentIndex[i], header.registerIndex[i], ptr);
-      --iaCnt;
+      state.nativeRenderPass.ptr->bindInputAttachments(Backend::State::exec.getResBinds(STAGE_PS),
+        header.inputAttachmentIndexRegPairs[i].index, header.inputAttachmentIndexRegPairs[i].flatBinding, ptr);
     }
   }
 }
@@ -437,7 +431,7 @@ void StateFieldGraphicsBasePipeline::dumpLog(const BackGraphicsStateStorage &) c
 }
 
 template <>
-void StateFieldGraphicsPipeline::applyTo(BackGraphicsStateStorage &state, ExecutionContext &target)
+void StateFieldGraphicsPipeline::applyTo(BackGraphicsStateStorage &state, BEContext &target)
 {
   // TODO: refactor this checks to separate nested field
   if (!state.basePipeline.ptr)
@@ -459,7 +453,8 @@ void StateFieldGraphicsPipeline::applyTo(BackGraphicsStateStorage &state, Execut
     GraphicsPipelineVariantDescription varDsc = {Backend::State::exec.get<BackGraphicsState, BackGraphicsState>().pipelineState,
       state.rpClass.ptr ? state.rpClass.ptr->getIdentifier() : RenderPassClass::Identifier(),
       state.nativeRenderPass.ptr ? state.nativeRenderPass.ptr->getHash() : 0,
-      state.nativeRenderPass.ptr ? state.nativeRenderPass.ptr->getCurrentSubpass() : 0, state.primTopo.data};
+      state.nativeRenderPass.ptr ? state.nativeRenderPass.ptr->getCurrentSubpass() : 0, state.primTopo.data,
+      (uint8_t)(state.shadingRate.isDefault() ? 0 : 1)};
 
     VariatedGraphicsPipeline::CompilationContext compCtx = {Backend::renderStateSystem, Globals::pipeCache.getHandle(),
       state.nativeRenderPass.ptr, &Backend::State::asyncCompileState.currentSkippedCount,
@@ -474,6 +469,7 @@ void StateFieldGraphicsPipeline::applyTo(BackGraphicsStateStorage &state, Execut
   target.renderAllowed = ptr != nullptr;
   if (ptr)
   {
+    oldPtr = ptr;
     VULKAN_LOG_CALL(Backend::cb.wCmdBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, ptr->getHandle()));
   }
 }
@@ -488,7 +484,7 @@ void StateFieldGraphicsPipeline::dumpLog(const BackGraphicsStateStorage &) const
 }
 
 template <>
-void StateFieldGraphicsPipelineLayout::applyTo(BackGraphicsStateStorage &state, ExecutionContext &target) const
+void StateFieldGraphicsPipelineLayout::applyTo(BackGraphicsStateStorage &state, BEContext &target) const
 {
   if (!ptr)
   {
@@ -497,7 +493,7 @@ void StateFieldGraphicsPipelineLayout::applyTo(BackGraphicsStateStorage &state, 
     return;
   }
 
-  Backend::bindless.bindSets(VK_PIPELINE_BIND_POINT_GRAPHICS, ptr->handle);
+  Backend::bindless.bindSets(VK_PIPELINE_BIND_POINT_GRAPHICS, ptr->handle, ptr->bindlessSetsUsed);
   Backend::State::exec.getResBinds(STAGE_VS).invalidateState();
   Backend::State::exec.getResBinds(STAGE_PS).invalidateState();
 }
@@ -541,7 +537,7 @@ void StateFieldGraphicsPipelineLayout::dumpLog(const BackGraphicsStateStorage &)
 }
 
 template <>
-void StateFieldGraphicsFramebuffer::applyTo(BackGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsFramebuffer::applyTo(BackGraphicsStateStorage &, BEContext &) const
 {}
 
 template <>
@@ -551,7 +547,7 @@ void StateFieldGraphicsFramebuffer::dumpLog(const BackGraphicsStateStorage &) co
 }
 
 template <>
-void StateFieldGraphicsInPass::applyTo(BackGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsInPass::applyTo(BackGraphicsStateStorage &, BEContext &) const
 {}
 
 template <>
@@ -575,12 +571,11 @@ void StateFieldGraphicsScissorRect::dumpLog(const FrontGraphicsStateStorage &) c
 template <>
 void StateFieldGraphicsScissorRect::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetScissorRect cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetScissorRect>({data});
 }
 
 template <>
-void StateFieldGraphicsScissor::applyTo(BackDynamicGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsScissor::applyTo(BackDynamicGraphicsStateStorage &, BEContext &) const
 {
   VULKAN_LOG_CALL(Backend::cb.wCmdSetScissor(0, 1, enabled ? &rect : &viewRect));
 }
@@ -593,10 +588,8 @@ void StateFieldGraphicsScissor::dumpLog(const BackDynamicGraphicsStateStorage &)
 }
 
 template <>
-void StateFieldGraphicsDepthBias::applyTo(BackDynamicGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsDepthBias::applyTo(BackDynamicGraphicsStateStorage &, BEContext &) const
 {
-  // FIXME: restore dyn mask feature
-  // if (dynamicStateMask.hasDepthBias)
   VULKAN_LOG_CALL(Backend::cb.wCmdSetDepthBias(data.bias / MINIMUM_REPRESENTABLE_D16, 0.f, data.slopedBias));
 }
 
@@ -608,10 +601,8 @@ void StateFieldGraphicsDepthBias::dumpLog(const BackDynamicGraphicsStateStorage 
 }
 
 template <>
-void StateFieldGraphicsDepthBounds::applyTo(BackGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsDepthBounds::applyTo(BackGraphicsStateStorage &, BEContext &) const
 {
-  // FIXME: restore dyn mask feature
-  // if (dynamicStateMask.hasDepthBoundsTest)
   VULKAN_LOG_CALL(Backend::cb.wCmdSetDepthBounds(data.min, data.max));
 }
 
@@ -625,8 +616,7 @@ void StateFieldGraphicsDepthBounds::applyTo(FrontGraphicsStateStorage &, Executi
 template <>
 void StateFieldGraphicsDepthBounds::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetDepthBoundsRange cmd{data.min, data.max};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetDepthBoundsRange>({data.min, data.max});
 }
 
 template <>
@@ -642,7 +632,7 @@ void StateFieldGraphicsDepthBounds::dumpLog(const FrontGraphicsStateStorage &) c
 }
 
 template <>
-void StateFieldGraphicsStencilRef::applyTo(BackDynamicGraphicsStateStorage &state, ExecutionContext &) const
+void StateFieldGraphicsStencilRef::applyTo(BackDynamicGraphicsStateStorage &state, BEContext &) const
 {
   if (state.stencilRefOverride.data == STENCIL_REF_OVERRIDE_DISABLE)
     VULKAN_LOG_CALL(Backend::cb.wCmdSetStencilReference(VK_STENCIL_FACE_BOTH_BIT, data));
@@ -663,12 +653,11 @@ void StateFieldGraphicsStencilRefOverride::applyTo(FrontGraphicsStateStorage &, 
 template <>
 void StateFieldGraphicsStencilRefOverride::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetStencilRefOverride cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetStencilRefOverride>({data});
 }
 
 template <>
-void StateFieldGraphicsStencilRefOverride::applyTo(BackDynamicGraphicsStateStorage &state, ExecutionContext &) const
+void StateFieldGraphicsStencilRefOverride::applyTo(BackDynamicGraphicsStateStorage &state, BEContext &) const
 {
   auto newStencilRef = state.stencilRef.data;
   if (data != STENCIL_REF_OVERRIDE_DISABLE)
@@ -695,7 +684,7 @@ void StateFieldGraphicsStencilRefOverride::dumpLog(const FrontGraphicsStateStora
 }
 
 template <>
-void StateFieldGraphicsStencilMask::applyTo(BackDynamicGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsStencilMask::applyTo(BackDynamicGraphicsStateStorage &, BEContext &) const
 {
   VULKAN_LOG_CALL(Backend::cb.wCmdSetStencilWriteMask(VK_STENCIL_FACE_BOTH_BIT, data & 0xFF));
   VULKAN_LOG_CALL(Backend::cb.wCmdSetStencilCompareMask(VK_STENCIL_FACE_BOTH_BIT, (data >> 8) & 0xFF));
@@ -707,21 +696,102 @@ void StateFieldGraphicsStencilMask::dumpLog(const BackDynamicGraphicsStateStorag
   debug("stencilMask: %u", data);
 }
 
+// VK_EXT_extended_dynamic_state fields. Each applyTo bails out when the device lacks the extension,
+// because state reset marks all fields dirty and would otherwise call unloaded entry points.
+
 template <>
-void StateFieldGraphicsDynamicRenderStateIndex::applyTo(BackGraphicsStateStorage &state, ExecutionContext &) const
+void StateFieldGraphicsExtCullMode::applyTo(BackExtDynamicGraphicsStateStorage &, BEContext &) const
+{
+  if (!Globals::VK::phy.hasExtendedDynamicState)
+    return;
+
+  // same mapping as the baked pipeline cull mode (main_pipelines.cpp)
+  VkCullModeFlags cullMode = VK_CULL_MODE_NONE;
+  if (data == (CULL_CW - CULL_NONE))
+    cullMode = VK_CULL_MODE_FRONT_BIT;
+  else if (data == (CULL_CCW - CULL_NONE))
+    cullMode = VK_CULL_MODE_BACK_BIT;
+  VULKAN_LOG_CALL(Backend::cb.wCmdSetCullModeEXT(cullMode));
+}
+
+template <>
+void StateFieldGraphicsExtCullMode::dumpLog(const BackExtDynamicGraphicsStateStorage &) const
+{
+  debug("extCullMode: %u", data);
+}
+
+template <>
+void StateFieldGraphicsExtDepthTest::applyTo(BackExtDynamicGraphicsStateStorage &, BEContext &) const
+{
+  if (!Globals::VK::phy.hasExtendedDynamicState)
+    return;
+
+  VULKAN_LOG_CALL(Backend::cb.wCmdSetDepthTestEnableEXT(data.testEnable ? VK_TRUE : VK_FALSE));
+  VULKAN_LOG_CALL(Backend::cb.wCmdSetDepthCompareOpEXT((VkCompareOp)data.func));
+}
+
+template <>
+void StateFieldGraphicsExtDepthTest::dumpLog(const BackExtDynamicGraphicsStateStorage &) const
+{
+  debug("extDepthTest: enable %u func %u", data.testEnable, data.func);
+}
+
+template <>
+void StateFieldGraphicsExtDepthBoundsTestEnable::applyTo(BackExtDynamicGraphicsStateStorage &, BEContext &) const
+{
+  if (!Globals::VK::phy.hasExtendedDynamicState)
+    return;
+
+  VULKAN_LOG_CALL(Backend::cb.wCmdSetDepthBoundsTestEnableEXT(data ? VK_TRUE : VK_FALSE));
+}
+
+template <>
+void StateFieldGraphicsExtDepthBoundsTestEnable::dumpLog(const BackExtDynamicGraphicsStateStorage &) const
+{
+  debug("extDepthBoundsTestEnable: %u", data);
+}
+
+template <>
+void StateFieldGraphicsExtStencilTest::applyTo(BackExtDynamicGraphicsStateStorage &, BEContext &) const
+{
+  if (!Globals::VK::phy.hasExtendedDynamicState)
+    return;
+
+  VULKAN_LOG_CALL(Backend::cb.wCmdSetStencilTestEnableEXT(data.testEnable ? VK_TRUE : VK_FALSE));
+  VULKAN_LOG_CALL(Backend::cb.wCmdSetStencilOpEXT(VK_STENCIL_FACE_BOTH_BIT, (VkStencilOp)data.failOp, (VkStencilOp)data.passOp,
+    (VkStencilOp)data.depthFailOp, (VkCompareOp)data.compareOp));
+}
+
+template <>
+void StateFieldGraphicsExtStencilTest::dumpLog(const BackExtDynamicGraphicsStateStorage &) const
+{
+  debug("extStencilTest: enable %u fail %u pass %u depthFail %u func %u", data.testEnable, data.failOp, data.passOp, data.depthFailOp,
+    data.compareOp);
+}
+
+template <>
+void StateFieldGraphicsDynamicRenderStateIndex::applyTo(BackGraphicsStateStorage &state, BEContext &) const
 {
   auto dynamicStateDesc = Backend::renderStateSystem.getDynamic(data);
-
-  // FIXME: restore dyn mask feature
-  // GraphicsPipelineDynamicStateMask dynamicStateMask(0);
-  // if (pipeline)
-  //   dynamicStateMask = pipeline->getDynamicStateMask();
 
   using DBias = StateFieldGraphicsDepthBias;
   state.dynamic.set<DBias, DBias::DataType>({dynamicStateDesc.depthBias, dynamicStateDesc.slopedDepthBias});
   state.dynamic.set<StateFieldGraphicsStencilMask>(dynamicStateDesc.stencilMask);
   state.dynamic.set<StateFieldGraphicsStencilRef>(dynamicStateDesc.stencilRef);
   state.dynamic.set<StateFieldGraphicsScissor>(dynamicStateDesc.enableScissor);
+
+  // states moved to the command buffer by VK_EXT_extended_dynamic_state; the values are populated
+  // in extractDynamicState only when the extension is available, so guard the push accordingly
+  if (Globals::VK::phy.hasExtendedDynamicState)
+  {
+    state.extDynamic.set<StateFieldGraphicsExtCullMode>(dynamicStateDesc.extCullMode);
+    using DTest = StateFieldGraphicsExtDepthTest;
+    state.extDynamic.set<DTest, DTest::DataType>({dynamicStateDesc.extDepthTestEnable, dynamicStateDesc.extDepthTestFunc});
+    state.extDynamic.set<StateFieldGraphicsExtDepthBoundsTestEnable>(dynamicStateDesc.extDepthBoundsTestEnable);
+    using STest = StateFieldGraphicsExtStencilTest;
+    state.extDynamic.set<STest, STest::DataType>({dynamicStateDesc.extStencilTestEnable, dynamicStateDesc.extStencilTestOpStencilFail,
+      dynamicStateDesc.extStencilTestOpPass, dynamicStateDesc.extStencilTestOpDepthFail, dynamicStateDesc.extStencilTestFunc});
+  }
 }
 
 template <>
@@ -731,10 +801,8 @@ void StateFieldGraphicsDynamicRenderStateIndex::dumpLog(const BackGraphicsStateS
 }
 
 template <>
-void StateFieldGraphicsBlendConstantFactor::applyTo(BackGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsBlendConstantFactor::applyTo(BackGraphicsStateStorage &, BEContext &) const
 {
-  // FIXME: restore dyn mask feature
-  // if (dynamicStateMask.hasBlendConstants)
   const float values[] = //
     {data.r / 255.f, data.g / 255.f, data.b / 255.f, data.a / 255.f};
   VULKAN_LOG_CALL(Backend::cb.wCmdSetBlendConstants(values));
@@ -743,8 +811,7 @@ void StateFieldGraphicsBlendConstantFactor::applyTo(BackGraphicsStateStorage &, 
 template <>
 void StateFieldGraphicsBlendConstantFactor::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetBlendConstantFactor cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetBlendConstantFactor>({data});
 }
 
 template <>
@@ -766,7 +833,7 @@ void StateFieldGraphicsBlendConstantFactor::dumpLog(const FrontGraphicsStateStor
 }
 
 template <>
-void StateFieldGraphicsIndexBuffer::applyTo(BackGraphicsStateStorage &, ExecutionContext &target) const
+void StateFieldGraphicsIndexBuffer::applyTo(BackGraphicsStateStorage &, BEContext &target) const
 {
   if (!data.buffer)
     return;
@@ -800,8 +867,7 @@ void StateFieldGraphicsIndexBuffer::dumpLog(const FrontGraphicsStateStorage &) c
 template <>
 void StateFieldGraphicsIndexBuffer::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetIndexBuffer cmd{data, indexType};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetIndexBuffer>({data, indexType});
 }
 
 template <>
@@ -846,7 +912,7 @@ void StateFieldGraphicsViewport::set(const RestoreFromFramebuffer &)
 
   data.rect2D.offset.x = 0;
   data.rect2D.offset.y = 0;
-  data.rect2D.extent = Frontend::swapchain.getMode().extent;
+  data.rect2D.extent = Frontend::swapchain.getMode().backbufferExtent;
 
   if (!rt.isBackBufferColor())
   {
@@ -906,12 +972,11 @@ void StateFieldGraphicsViewport::applyTo(FrontGraphicsStateStorage &state, Execu
 template <>
 void StateFieldGraphicsViewport::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetViewport cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetViewport>({data});
 }
 
 template <>
-void StateFieldGraphicsViewport::applyTo(BackGraphicsStateStorage &state, ExecutionContext &) const
+void StateFieldGraphicsViewport::applyTo(BackGraphicsStateStorage &state, BEContext &) const
 {
   VkViewport translatedViewport = viewport_state_to_vk_viewport(data);
   // update scissor copy of viewport that is used when scissor is off
@@ -942,8 +1007,7 @@ void StateFieldGraphicsVertexBufferBind::dumpLog(uint32_t index, const FrontGrap
 template <>
 void StateFieldGraphicsVertexBufferBind::transit(uint32_t index, FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetVertexBuffer cmd{index, bRef, offset};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetVertexBuffer>({.buffer = bRef, .stream = index, .offset = offset});
 }
 
 template <>
@@ -964,38 +1028,33 @@ void StateFieldGraphicsVertexBufferBind::set(const StateFieldGraphicsVertexBuffe
 }
 
 template <>
-void StateFieldGraphicsVertexBuffersBindArray::applyTo(BackGraphicsStateStorage &, ExecutionContext &target) const
+void StateFieldGraphicsVertexBuffersBindArray::applyTo(BackGraphicsStateStorage &, BEContext &target) const
 {
-  if (!countMask)
-    return;
-
-  uint32_t cnt = 0;
-  for (uint32_t i = countMask; i != 0; i >>= 1)
+  for (uint32_t first = 0; first < MAX_VERTEX_INPUT_STREAMS; ++first)
   {
-    // by default no allowance to have empty slots in bind-vector (bubble)
-    if ((i & 1) == 0)
-      D3D_ERROR("vulkan: vb binding filtered due empty slot %u (mask %u)", cnt + 1, countMask);
-    else
-      ++cnt;
-  }
+    if (!(countMask & (1u << first)))
+      continue;
 
-  for (uint32_t i = 0; i < cnt; ++i)
-  {
-    //    G_ASSERTF(offsets[i] >= resPtrs[i]->bufOffsetLoc(0),
-    //      "vulkan: old discard index is referenced/invalid offset (zero offset %u specified %u) for vb[%u] %p:%s",
-    //      resPtrs[i]->bufOffsetLoc(0), offsets[i], i, resPtrs[i], resPtrs[i]->getDebugName());
-    target.verifyResident(resPtrs[i]);
-    Backend::sync.addBufferAccess({VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT}, resPtrs[i],
-      {offsets[i], resPtrs[i]->getBlockSize() - (offsets[i] % resPtrs[i]->getBlockSize())});
-  }
+    uint32_t last = first;
+    while (last + 1 < MAX_VERTEX_INPUT_STREAMS && (countMask & (1u << (last + 1))))
+      ++last;
 
-  VULKAN_LOG_CALL(Backend::cb.wCmdBindVertexBuffers(0, cnt, ary(buffers), offsets));
+    for (uint32_t i = first; i <= last; ++i)
+    {
+      target.verifyResident(resPtrs[i]);
+      Backend::sync.addBufferAccess({VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT}, resPtrs[i],
+        {offsets[i], resPtrs[i]->getBlockSize() - (offsets[i] % resPtrs[i]->getBlockSize())});
+    }
+
+    VULKAN_LOG_CALL(Backend::cb.wCmdBindVertexBuffers(first, last - first + 1, ary(buffers + first), offsets + first));
+    first = last;
+  }
 }
 
 template <>
 void StateFieldGraphicsVertexBuffersBindArray::dumpLog(const BackGraphicsStateStorage &) const
 {
-  debug("vertexBuffersArray: mask %u");
+  debug("vertexBuffersArray: mask %u", countMask);
   for (uint32_t i = 0; i < MAX_VERTEX_INPUT_STREAMS; ++i)
   {
     if (countMask & (1 << i))
@@ -1014,8 +1073,7 @@ void StateFieldGraphicsVertexBufferStride::dumpLog(uint32_t index, const FrontGr
 template <>
 void StateFieldGraphicsVertexBufferStride::transit(uint32_t index, FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetVertexStride cmd{index, data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetVertexStride>({index, data});
 }
 
 template <>
@@ -1028,7 +1086,7 @@ void StateFieldGraphicsVertexBufferStride::applyTo(uint32_t index, FrontGraphics
 ///
 
 template <>
-void StateFieldGraphicsPrimitiveTopology::applyTo(BackGraphicsStateStorage &state, ExecutionContext &ctx) const
+void StateFieldGraphicsPrimitiveTopology::applyTo(BackGraphicsStateStorage &state, BEContext &ctx) const
 {
 #if DAGOR_DBGLEVEL > 0
   if (!state.basePipeline.ptr || !state.flush.needPipeline)
@@ -1056,7 +1114,7 @@ void StateFieldGraphicsPrimitiveTopology::dumpLog(const BackGraphicsStateStorage
   debug("primTopo: %s tessOverride: %s", formatPrimitiveTopology(data), useTessOverride ? "yes" : "no");
 }
 
-void StateFieldGraphicsFlush::syncTLayoutsToRenderPass(BackGraphicsStateStorage &state, ExecutionContext &target) const
+void StateFieldGraphicsFlush::syncTLayoutsToRenderPass(BackGraphicsStateStorage &state, BEContext &target) const
 {
   if (state.inPass.data == InPassStateFieldType::NONE && !state.nativeRenderPass.ptr)
     target.ensureStateForDepthAttachment(state.viewport.data.rect2D);
@@ -1064,7 +1122,7 @@ void StateFieldGraphicsFlush::syncTLayoutsToRenderPass(BackGraphicsStateStorage 
     target.ensureStateForNativeRPDepthAttachment();
 }
 
-void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, ExecutionContext &) const
+void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, BEContext &) const
 {
   if (Backend::State::asyncCompileState.nonDrawCompile)
     return;
@@ -1073,7 +1131,6 @@ void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, 
   VulkanPipelineLayoutHandle layoutHandle = layout.handle;
   auto &regs = layout.registers;
 
-  const ResourceDummySet &dummyResTbl = Globals::dummyResources.getTable();
   size_t frameIndex = Backend::gpuJob->index;
   PipelineStageStateBase &vsResBinds = Backend::State::exec.getResBinds(STAGE_VS);
 
@@ -1089,7 +1146,7 @@ void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, 
   Backend::State::exec.getResBinds(STAGE_PS).applyPushConstants(regs.fs(), layoutHandle, VK_SHADER_STAGE_FRAGMENT_BIT,
     ExtendedShaderStage::PS);
 
-  vsResBinds.apply(dummyResTbl, frameIndex, regs.vs(), ExtendedShaderStage::VS,
+  vsResBinds.setResources(frameIndex, regs.vs(), ExtendedShaderStage::VS,
     [layoutHandle](VulkanDescriptorSetHandle set, const uint32_t *offsets, uint32_t offset_count) //
     {
       VULKAN_LOG_CALL(Backend::cb.wCmdBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle,
@@ -1097,7 +1154,7 @@ void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, 
         offset_count, offsets));
     });
 
-  Backend::State::exec.getResBinds(STAGE_PS).apply(dummyResTbl, frameIndex, regs.fs(), ExtendedShaderStage::PS,
+  Backend::State::exec.getResBinds(STAGE_PS).setResources(frameIndex, regs.fs(), ExtendedShaderStage::PS,
     [layoutHandle](VulkanDescriptorSetHandle set, const uint32_t *offsets, uint32_t offset_count) //
     {
       VULKAN_LOG_CALL(Backend::cb.wCmdBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle,
@@ -1105,9 +1162,12 @@ void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, 
         offset_count, offsets));
     });
 
+  if (layout.hasGS() || layout.hasTC() || layout.hasTE())
+    vsResBinds.invalidateState();
+
   if (layout.hasGS())
   {
-    vsResBinds.applyNoDiff(dummyResTbl, frameIndex, regs.gs(), ExtendedShaderStage::GS,
+    vsResBinds.setResourcesNoDiff(frameIndex, regs.gs(), ExtendedShaderStage::GS,
       [layoutHandle](VulkanDescriptorSetHandle set, const uint32_t *offsets, uint32_t offset_count) //
       {
         VULKAN_LOG_CALL(Backend::cb.wCmdBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle,
@@ -1118,7 +1178,7 @@ void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, 
 
   if (layout.hasTC())
   {
-    vsResBinds.applyNoDiff(dummyResTbl, frameIndex, regs.tc(), ExtendedShaderStage::TC,
+    vsResBinds.setResourcesNoDiff(frameIndex, regs.tc(), ExtendedShaderStage::TC,
       [layoutHandle](VulkanDescriptorSetHandle set, const uint32_t *offsets, uint32_t offset_count) //
       {
         VULKAN_LOG_CALL(Backend::cb.wCmdBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle,
@@ -1129,7 +1189,7 @@ void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, 
 
   if (layout.hasTE())
   {
-    vsResBinds.applyNoDiff(dummyResTbl, frameIndex, regs.te(), ExtendedShaderStage::TE,
+    vsResBinds.setResourcesNoDiff(frameIndex, regs.te(), ExtendedShaderStage::TE,
       [layoutHandle](VulkanDescriptorSetHandle set, const uint32_t *offsets, uint32_t offset_count) //
       {
         VULKAN_LOG_CALL(Backend::cb.wCmdBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layoutHandle,
@@ -1151,32 +1211,13 @@ void StateFieldGraphicsFlush::applyDescriptors(BackGraphicsStateStorage &state, 
   }
 }
 
-void StateFieldGraphicsFlush::applyBarriers(BackGraphicsStateStorage &state, ExecutionContext &target) const
-{
-  VariatedGraphicsPipeline *ptr = state.basePipeline.ptr;
-  GraphicsPipelineLayout &layout = *ptr->getLayout();
-  auto &regs = layout.registers;
-
-  target.trackStageResAccesses(regs.vs().header, ExtendedShaderStage::VS);
-  target.trackStageResAccesses(regs.fs().header, ExtendedShaderStage::PS);
-  if (layout.hasGS())
-    target.trackStageResAccesses(regs.gs().header, ExtendedShaderStage::GS);
-  if (layout.hasTC())
-    target.trackStageResAccesses(regs.tc().header, ExtendedShaderStage::TC);
-  if (layout.hasTE())
-    target.trackStageResAccesses(regs.te().header, ExtendedShaderStage::TE);
-}
-
 template <>
-void StateFieldGraphicsFlush::applyTo(BackGraphicsStateStorage &state, ExecutionContext &target) const
+void StateFieldGraphicsFlush::applyTo(BackGraphicsStateStorage &state, BEContext &target) const
 {
   syncTLayoutsToRenderPass(state, target);
 
   if (state.basePipeline.ptr && needPipeline)
-  {
-    applyBarriers(state, target);
     applyDescriptors(state, target);
-  }
 }
 
 template <>
@@ -1193,7 +1234,7 @@ void StateFieldGraphicsQueryState::applyTo(FrontGraphicsStateStorage &, Executio
 }
 
 template <>
-void StateFieldGraphicsQueryScopeOpener::applyTo(BackGraphicsStateStorage &state, ExecutionContext &target)
+void StateFieldGraphicsQueryScopeOpener::applyTo(BackGraphicsStateStorage &state, BEContext &target)
 {
   G_UNUSED(state);
 
@@ -1202,7 +1243,7 @@ void StateFieldGraphicsQueryScopeOpener::applyTo(BackGraphicsStateStorage &state
 }
 
 template <>
-void StateFieldGraphicsQueryScopeCloser::applyTo(BackScopeStateStorage &, ExecutionContext &target)
+void StateFieldGraphicsQueryScopeCloser::applyTo(BackScopeStateStorage &, BEContext &target)
 {
   // we should close on next field apply if follow up code will open scope
   bool askingForOpener = data != GraphicsQueryState{};
@@ -1216,8 +1257,7 @@ void StateFieldGraphicsQueryScopeCloser::applyTo(BackScopeStateStorage &, Execut
 template <>
 void StateFieldGraphicsQueryState::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
 {
-  CmdSetGraphicsQuery cmd{data.pool, data.index};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetGraphicsQuery>({data.pool, data.index});
 }
 
 template <>
@@ -1248,7 +1288,7 @@ void StateFieldGraphicsQueryScopeCloser::dumpLog(const BackScopeStateStorage &) 
 }
 
 template <>
-void StateFieldGraphicsRenderPassArea::applyTo(BackGraphicsStateStorage &, ExecutionContext &) const
+void StateFieldGraphicsRenderPassArea::applyTo(BackGraphicsStateStorage &, BEContext &) const
 {}
 
 template <>
@@ -1256,6 +1296,45 @@ void StateFieldGraphicsRenderPassArea::dumpLog(const BackGraphicsStateStorage &)
 {
   debug("renderPassArea: ofs (%i, %i) ext (%u, %u)", data.offset.x, data.offset.y, data.extent.width, data.extent.height);
 }
+
+
+template <>
+void StateFieldGraphicsShadingRate::applyTo(BackGraphicsStateStorage &, BEContext &) const
+{
+#if VK_KHR_fragment_shading_rate
+  if (!Globals::VK::phy.hasPipelineFragmentShadingRate || isDefault())
+    return;
+
+  VkFragmentShadingRateCombinerOpKHR combinerOps[2] = {getCombinerV(), getCombinerP()};
+  Backend::cb.wCmdSetFragmentShadingRateKHR(getFragmentSize(), combinerOps);
+#endif
+}
+
+template <>
+void StateFieldGraphicsShadingRate::applyTo(FrontGraphicsStateStorage &, ExecutionState &target) const
+{
+  target.set<StateFieldGraphicsShadingRate, uint32_t, BackGraphicsState>(data);
+  target.set<StateFieldGraphicsPipeline, StateFieldGraphicsPipeline::Invalidate, BackGraphicsState>(1);
+}
+
+template <>
+void StateFieldGraphicsShadingRate::transit(FrontGraphicsStateStorage &, DeviceContext &target) const
+{
+  target.dispatchCmdNoLock<CmdTransitShadingRate>({data});
+}
+
+template <>
+void StateFieldGraphicsShadingRate::dumpLog(const FrontGraphicsStateStorage &) const
+{
+  debug("encoded shading rate %08X", data);
+}
+
+template <>
+void StateFieldGraphicsShadingRate::dumpLog(const BackGraphicsStateStorage &) const
+{
+  debug("encoded shading rate %08X", data);
+}
+
 
 } // namespace drv3d_vulkan
 

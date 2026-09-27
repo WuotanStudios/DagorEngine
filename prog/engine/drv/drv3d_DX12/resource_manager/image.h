@@ -11,6 +11,7 @@
 #include <image_view_state.h>
 #include <resource_memory.h>
 #include <texture_subresource_util.h>
+#include <d3d12_utils.h>
 
 #include <dag/dag_vector.h>
 #include <osApiWrappers/dag_spinlock.h>
@@ -178,6 +179,7 @@ public:
   const ViewInfo &getRecentView() const { return recentView; }
   void updateRecentView(old_views_t::const_iterator iter)
   {
+    G_FAST_ASSERT(recentView.state.isValid());
     eastl::swap(oldViews[eastl::distance(oldViews.cbegin(), iter)], recentView); // update LRU entry
   }
   void addView(const ViewInfo &view)
@@ -185,6 +187,15 @@ public:
     if (recentView.state.isValid())
       oldViews.push_back(recentView);
     recentView = view;
+  }
+
+  D3D12_TEXTURE_LAYOUT getLayout() const
+  {
+#if _TARGET_XBOX
+    return textureLayout;
+#else
+    return D3D12_TEXTURE_LAYOUT_UNKNOWN;
+#endif
   }
   D3D12_RESOURCE_DIMENSION getType() const { return imageType; }
   void setDebugName(const char *name) { *debugName.access() = name; }
@@ -241,6 +252,10 @@ public:
   ArrayLayerIndex stateIndexToArrayIndex(SubresourceIndex id) const
   {
     return ArrayLayerIndex::make(calculate_array_slice_from_index(id.index(), mipLevels.count(), layerCount.count()));
+  }
+  FormatPlaneIndex stateIndexToPlaneIndex(SubresourceIndex id) const
+  {
+    return FormatPlaneIndex::make(calculate_plane_slice_from_index(id.index(), mipLevels.count(), layerCount.count()));
   }
   SubresourceIndex mipAndLayerIndexToStateIndex(MipMapIndex mip, ArrayLayerIndex layer) const
   {

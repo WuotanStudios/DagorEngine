@@ -42,7 +42,6 @@ IMPLEMENT_EXTERNAL_TYPE_FACTORY(TypeMacro,TypeMacro)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ReaderMacro,ReaderMacro)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(CommentReader,CommentReader)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(CallMacro,CallMacro)
-IMPLEMENT_EXTERNAL_TYPE_FACTORY(ModuleGroup,ModuleGroup)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ModuleLibrary,ModuleLibrary)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(AstContext,AstContext)
 
@@ -120,6 +119,7 @@ IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprConstEnumeration,ExprConstEnumeration);
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprConstBitfield,ExprConstBitfield);
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprConstInt8,ExprConstInt8);
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprConstInt16,ExprConstInt16);
+IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprConstFloat16,ExprConstFloat16);
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprConstInt64,ExprConstInt64);
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprConstInt,ExprConstInt);
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprConstInt2,ExprConstInt2);
@@ -152,8 +152,8 @@ IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprCallMacro,ExprCallMacro);
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(ExprUnsafe,ExprUnsafe);
 
 namespace das {
-    void getAstContext ( smart_ptr_raw<Program> prog, smart_ptr_raw<Expression> expr, const TBlock<void,bool,AstContext> & block, Context * context, LineInfoArg * at ) {
-        AstContext astc = generateAstContext(prog,expr.get());
+    void getAstContext ( smart_ptr_raw<Program> prog, Expression * expr, const TBlock<void,bool,AstContext> & block, Context * context, LineInfoArg * at ) {
+        AstContext astc = generateAstContext(prog,expr);
         vec4f args[2];
         args[0] = cast<bool>::from ( astc.valid );
         args[1] = astc.valid ? cast<AstContext&>::from(astc) : v_zero();
@@ -173,6 +173,7 @@ namespace das {
         ann.addFieldEx("name", "name", offsetof(ExprLooksLikeCall, name), makeType<string>(*ann.mlib));
         ann.addFieldEx("arguments", "arguments", offsetof(ExprLooksLikeCall, arguments), makeType<vector<ExpressionPtr>>(*ann.mlib));
         ann.addFieldEx("argumentsFailedToInfer", "argumentsFailedToInfer", offsetof(ExprLooksLikeCall, argumentsFailedToInfer), makeType<bool>(*ann.mlib));
+        ann.addFieldEx("pipedCallArgument", "pipedCallArgument", offsetof(ExprLooksLikeCall, pipedCallArgument), makeType<bool>(*ann.mlib));
         ann.addFieldEx("atEnclosure", "atEnclosure", offsetof(ExprLooksLikeCall, atEnclosure), makeType<LineInfo>(*ann.mlib));
     }
 
@@ -199,14 +200,15 @@ namespace das {
         AstExprCallMacroAnnotation(ModuleLibrary & ml)
             :  AstExprLooksLikeCallAnnotation<ExprCallMacro> ("ExprCallMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(macro)>("macro");
+            addField<DAS_BIND_MANAGED_FIELD(inFunction)>("inFunction");
         }
     };
 
     struct SimNode_AstGetTypeDecl : SimNode_CallBase {
         DAS_PTR_NODE;
-        SimNode_AstGetTypeDecl ( const LineInfo & at, const TypeDeclPtr & d, char * dE )
+        SimNode_AstGetTypeDecl ( const LineInfo & at, TypeDeclPtr d, char * dE )
             : SimNode_CallBase(at,"") {
-            typeExpr = d.get();
+            typeExpr = d;
             descr = dE;
         }
         virtual SimNode * copyNode ( Context & context, NodeAllocator * code ) override {
@@ -222,8 +224,7 @@ namespace das {
         }
         __forceinline char * compute(Context &) {
             DAS_PROFILE_NODE
-            typeExpr->addRef();
-            return (char *) typeExpr;
+            return (char *) new TypeDecl(*typeExpr);
         }
         TypeDecl *  typeExpr;   // requires RTTI
         char *      descr;
@@ -231,18 +232,18 @@ namespace das {
 
     struct AstTypeDeclMacro : TypeInfoMacro {
         AstTypeDeclMacro() : TypeInfoMacro("ast_typedecl") {}
-        virtual TypeDeclPtr getAstType ( ModuleLibrary & lib, const ExpressionPtr &, string & ) override {
-            return typeFactory<smart_ptr<TypeDecl>>::make(lib);
+        virtual TypeDeclPtr getAstType ( ModuleLibrary & lib, ExpressionPtr, string & ) override {
+            return typeFactory<TypeDecl *>::make(lib);
         }
-        virtual SimNode * simluate ( Context * context, const ExpressionPtr & expr, string & error ) override {
+        virtual SimNode * simluate ( Context * context, ExpressionPtr expr, string & error ) override {
 
-            if ( !context->thisProgram->isCompilingMacros && !context->thisProgram->folding && !(*daScriptEnvironment::bound)->g_isInAot ) {
+            if ( !context->thisProgram->isCompilingMacros && !context->thisProgram->folding && !daScriptEnvironment::getBound()->g_isInAot ) {
                 if ( !context->thisProgram->options.getBoolOption("rtti",context->thisProgram->policies.rtti) ) {
                     error = "ast_typedecl requires `options rtti` or rtti to be enabled in policies";
                     return nullptr;
                 }
             }
-            auto exprTypeInfo = static_pointer_cast<ExprTypeInfo>(expr);
+            auto exprTypeInfo = static_cast<ExprTypeInfo*>(expr);
             auto tName = exprTypeInfo->typeexpr->getMangledName();
             auto hashValue = hash_blockz64((uint8_t *)tName.c_str());
             if ( auto oldType = context->thisProgram->astTypeInfo[hashValue] ) {
@@ -251,11 +252,11 @@ namespace das {
                     return nullptr;
                 }
             }
-            context->thisProgram->astTypeInfo[hashValue] = exprTypeInfo->typeexpr.get();
+            context->thisProgram->astTypeInfo[hashValue] = exprTypeInfo->typeexpr;
             char * descr = context->code->allocateName(exprTypeInfo->typeexpr->getMangledName());
             return context->code->makeNode<SimNode_AstGetTypeDecl>(expr->at, exprTypeInfo->typeexpr, descr);
         }
-        virtual bool noAot ( const ExpressionPtr & ) const override {
+        virtual bool noAot ( ExpressionPtr ) const override {
             return true;
         }
     };
@@ -289,13 +290,13 @@ namespace das {
 
     struct AstFunctionMacro : TypeInfoMacro {
         AstFunctionMacro() : TypeInfoMacro("ast_function") {}
-        virtual TypeDeclPtr getAstType ( ModuleLibrary & lib, const ExpressionPtr &, string & ) override {
-            return typeFactory<smart_ptr<Function>>::make(lib);
+        virtual TypeDeclPtr getAstType ( ModuleLibrary & lib, ExpressionPtr, string & ) override {
+            return typeFactory<Function *>::make(lib);
         }
-        virtual SimNode * simluate ( Context * context, const ExpressionPtr & expr, string & errors ) override {
-            auto exprTypeInfo = static_pointer_cast<ExprTypeInfo>(expr);
+        virtual SimNode * simluate ( Context * context, ExpressionPtr expr, string & errors ) override {
+            auto exprTypeInfo = static_cast<ExprTypeInfo*>(expr);
             if ( exprTypeInfo->subexpr && exprTypeInfo->subexpr->rtti_isAddr() ) {
-                auto exprAddr = static_pointer_cast<ExprAddr>(exprTypeInfo->subexpr);
+                auto exprAddr = static_cast<ExprAddr*>(exprTypeInfo->subexpr);
                 char * descr = context->code->allocateName(exprAddr->func->getMangledName());
                 return context->code->makeNode<SimNode_AstGetFunction>(expr->at, exprAddr->func, descr);
             } else {
@@ -303,22 +304,22 @@ namespace das {
                 return nullptr;
             }
         }
-        virtual bool noAot ( const ExpressionPtr & ) const override {
+        virtual bool noAot ( ExpressionPtr ) const override {
             return true;
         }
     };
 
     void Module_Ast::registerAnnotations(ModuleLibrary &) {
         // ENUMS
-        addEnumeration(make_smart<EnumerationSideEffects>());
-        addEnumeration(make_smart<EnumerationCaptureMode>());
+        addEnumeration(new EnumerationSideEffects());
+        addEnumeration(new EnumerationCaptureMode());
         // THE MAGNIFICENT TWO
-        addTypeInfoMacro(make_smart<AstTypeDeclMacro>());
-        addTypeInfoMacro(make_smart<AstFunctionMacro>());
+        addTypeInfoMacro(new AstTypeDeclMacro());
+        addTypeInfoMacro(new AstFunctionMacro());
     }
 
     void Module_Ast::registerMacroExpressions(ModuleLibrary & lib){
-        addExpressionAnnotation(make_smart<AstExprReaderAnnotation>(lib))->from("Expression");
-        addExpressionAnnotation(make_smart<AstExprCallMacroAnnotation>(lib))->from("ExprLooksLikeCall");
+        addExpressionAnnotation(new AstExprReaderAnnotation(lib))->from("Expression");
+        addExpressionAnnotation(new AstExprCallMacroAnnotation(lib))->from("ExprLooksLikeCall");
     }
 }

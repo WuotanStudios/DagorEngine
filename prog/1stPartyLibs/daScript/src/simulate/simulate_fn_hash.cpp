@@ -194,12 +194,12 @@ namespace das {
         das_hash_set<const Variable *> variables;
     };
 
-    void collectDependencies ( FunctionPtr fun, const TBlock<void,TArray<Function *>,TArray<Variable *>> & block, Context * context, LineInfoArg * line ) {
-        auto program = (*daScriptEnvironment::bound)->g_Program;
+    DAS_API void collectDependencies ( FunctionPtr fun, const TBlock<void,TArray<Function *>,TArray<Variable *>> & block, Context * context, LineInfoArg * line ) {
+        auto program = daScriptEnvironment::getBound()->g_Program;
         if ( !program ) context->throw_error_at(line, "Can't collect dependencies outside of compilation.");
         program->markExecutableSymbolUse();
         DependencyCollector collector;
-        collector.collect(fun.get());
+        collector.collect(fun);
         auto vecFunc = collector.getStableDependencies();
         auto vecVars = collector.getStableVariableDependencies();
         vector<const Function *> tfun;
@@ -212,26 +212,22 @@ namespace das {
         for ( auto & fn : vecVars ) {
             tvar.push_back(fn.first);
         }
+        // Always call array_mark_locked, even when the dependency list is empty: an
+        // un-marked Array carries uninitialised `magic` which fails the lock-magic check
+        // on the das-side `for (... in ...)` iterator, crashing the macro with
+        // "array magic mismatch on lock" on a function whose body references neither
+        // a function dependency nor a global variable (e.g. an empty-body [compute_shader]).
         Array afun, avar;
-        if ( tfun.size() ) {
-            afun.data = (char *) tfun.data();
-            afun.capacity = afun.size = uint32_t(tfun.size());
-            afun.lock = 1;
-            afun.flags = 0;
-        }
-        if ( tvar.size() ) {
-            avar.data = (char *) tvar.data();
-            avar.capacity = avar.size = uint32_t(tvar.size());
-            avar.lock = 1;
-            avar.flags = 0;
-        }
+        array_mark_locked(afun, tfun.size() ? (void*)tfun.data() : nullptr, uint32_t(tfun.size()));
+        array_mark_locked(avar, tvar.size() ? (void*)tvar.data() : nullptr, uint32_t(tvar.size()));
         vec4f args[2];
         args[0] = cast<Array &>::from(afun);
         args[1] = cast<Array &>::from(avar);
         context->invoke(block, args, nullptr, line);
     }
 
-    uint64_t getFunctionAotHash ( const Function * fun ) {
+    uint64_t getFunctionAotHash ( Function * fun ) {
+        if ( fun->aotHash != 0 ) return fun->aotHash; // cached
         DependencyCollector collector;
         collector.collect(fun);
         auto vec = collector.getStableDependencies();
@@ -244,12 +240,28 @@ namespace das {
                 DAS_ASSERTF(fn.first->hash,"%s has dependency on %s, which hash hash of 0",
                     fun->getMangledName().c_str(), fn.first->getMangledName().c_str());
                 uvec.push_back(fn.first->hash);
-                debug_aot_hash("\t%s " PRIx64 "\n", fn.second.c_str(), fn.first->hash);
+                debug_aot_hash("\t%s %" PRIx64 "\n", fn.second.c_str(), fn.first->hash);
             }
         }
         uint64_t res = hash_block64((const uint8_t *)uvec.data(), uint32_t(uvec.size()*sizeof(uint64_t)));
         debug_aot_hash("AOT HASH %" PRIx64 "\n", res);
+        fun->aotHash = res;
         return res;
+    }
+
+    string getAotHashComment ( const Function * fun ) {
+        DependencyCollector collector;
+        collector.collect(fun);
+        auto vec = collector.getStableDependencies();
+        TextWriter tw;
+        tw << fun->getMangledName() << " hash=0x" << HEX << fun->hash;
+        for ( const auto & fn : vec ) {
+            if ( !fn.first->noAot && !fn.first->builtIn && fn.first != fun ) {
+                tw << ", " << fn.second << "=0x" << fn.first->hash;
+            }
+        }
+        tw << DEC;
+        return tw.str();
     }
 
     uint64_t getVariableListAotHash ( const vector<const Variable *> & globs, uint64_t initHash ) {

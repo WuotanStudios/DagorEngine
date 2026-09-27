@@ -16,6 +16,7 @@ namespace das {
         bool unescape = false;
         bool embed = false;
         bool optional = false; // if true, we do not write zero values, only non-zero ones
+        bool inTableKey = false; // vec/range emit as array form here to fit inside the outer "..." quote
         vector<bool> ignoreNextFields;
         vector<bool> anyStructFields;
     // data structures
@@ -29,31 +30,35 @@ namespace das {
                 anyStructFields.pop_back();
             }
         }
-        virtual void beforeStructureField ( char * ps, StructInfo *si, char * pf, VarInfo * vi, bool ) override {
+        virtual void beforeStructureField ( char * /*ps*/, StructInfo *si, char * pf, VarInfo * vi, bool ) override {
             enumAsInt = false;
             unescape = false;
             embed = false;
             optional = false;
             string name = vi->name ? vi->name : "";
-            if ( vi->annotation_arguments ) {
-                auto aa = (AnnotationArguments *) vi->annotation_arguments;
-                for ( auto arg : *aa ) {
-                    if ( arg.name=="enum_as_int" && arg.type==Type::tBool ) {
-                        enumAsInt = arg.bValue;
-                    } else if ( arg.name=="unescape" && arg.type==Type::tBool ) {
-                        unescape = arg.bValue;
-                    } else if ( arg.name=="embed" && arg.type==Type::tBool ) {
-                        embed = arg.bValue;
-                    } else if ( arg.name=="optional" && arg.type==Type::tBool ) {
-                        optional = arg.bValue;
-                    } else if ( arg.name=="rename" && arg.type==Type::tString ) {
+            for ( uint32_t ai=0, ais=vi->annotation_argument_count; ai!=ais; ++ai ) {
+                const auto & arg = vi->annotation_arguments[ai];
+                if ( strcmp(arg.name,"enum_as_int")==0 && arg.type==Type::tBool ) {
+                    enumAsInt = arg.bValue;
+                } else if ( strcmp(arg.name,"unescape")==0 && arg.type==Type::tBool ) {
+                    unescape = arg.bValue;
+                } else if ( strcmp(arg.name,"embed")==0 && arg.type==Type::tBool ) {
+                    embed = arg.bValue;
+                } else if ( strcmp(arg.name,"optional")==0 && arg.type==Type::tBool ) {
+                    optional = arg.bValue;
+                } else if ( strcmp(arg.name,"rename")==0 ) {
+                    if ( arg.type==Type::tString ) {
                         name = arg.sValue;
+                    } else if ( arg.type==Type::tBool && !name.empty() && name[0]=='_' ) {
+                        name = name.substr(1);
                     }
                 }
             }
             bool ignoreNextField = false;
             if ( si->flags & StructInfo::flag_class ) {
-                if (name == "__rtti" || name == "__finalize") {
+                // A class carries its methods as function-pointer fields. They aren't data —
+                // skip them entirely (rather than emit "kek":null) along with the class plumbing.
+                if (name == "__rtti" || name == "__finalize" || (vi->flags & TypeInfo::flag_classMethod)) {
                     ignoreNextField = true;
                 }
             }
@@ -100,10 +105,10 @@ namespace das {
             }
             ignoreNextFields.push_back(ignoreNextField);
         }
-        virtual bool canVisitArray ( Array * ar, TypeInfo * ) override {
+        virtual bool canVisitArray ( Array * /*ar*/, TypeInfo * ) override {
             return ignoreNextFields.empty() || !ignoreNextFields.back();
         }
-        virtual bool canVisitTable ( char * ps, TypeInfo * ) override {
+        virtual bool canVisitTable ( char * /*ps*/, TypeInfo * ) override {
             return ignoreNextFields.empty() || !ignoreNextFields.back();
         }
         virtual void afterStructureField ( char *, StructInfo *, char *, VarInfo *, bool ) override {
@@ -121,7 +126,7 @@ namespace das {
         virtual void afterTuple ( char *, TypeInfo * ) override {
             ss << "}";
         }
-        virtual void beforeTupleEntry ( char *, TypeInfo * ti, char *, int idx, bool ) override {
+        virtual void beforeTupleEntry ( char *, TypeInfo * /*ti*/, char *, int idx, bool ) override {
             ss << "\"_" << idx << "\":";
         }
         virtual void afterTupleEntry ( char *, TypeInfo *, char *, int, bool last ) override {
@@ -134,25 +139,33 @@ namespace das {
         virtual void afterVariant ( char *, TypeInfo * ) override {
             ss << "}";
         }
-        virtual void beforeArrayData ( char *, uint32_t, uint32_t, TypeInfo * ) override {
+        virtual void beforeArrayData ( char *, uint32_t, uint64_t, TypeInfo * ) override {
             ss << "[";
         }
-        virtual void afterArrayData ( char *, uint32_t, uint32_t, TypeInfo * ) override {
+        virtual void afterArrayData ( char *, uint32_t, uint64_t, TypeInfo * ) override {
             ss << "]";
         }
-        virtual void afterArrayElement ( char *, TypeInfo *, char *, uint32_t, bool last ) override {
+        virtual void afterArrayElement ( char *, TypeInfo *, char *, uint64_t, bool last ) override {
             if ( !last ) ss << ",";
         }
         virtual void beforeTable ( Table *, TypeInfo * ) override {
             ss << "{";
         }
-        virtual void beforeTableKey ( Table *, TypeInfo *, char *, TypeInfo * ki, uint32_t, bool ) override {
-            if ( ki->type!=Type::tString ) ss << "\"";
+        virtual void beforeTableKey ( Table *, TypeInfo *, char *, TypeInfo * ki, uint64_t, bool ) override {
+            if ( ki->type!=Type::tString ) {
+                ss << "\"";
+                inTableKey = true;
+            }
         }
-        virtual void afterTableKey ( Table *, TypeInfo *, char *, TypeInfo * ki, uint32_t, bool ) override {
-            if ( ki->type!=Type::tString ) ss << "\":"; else ss << ":";
+        virtual void afterTableKey ( Table *, TypeInfo *, char *, TypeInfo * ki, uint64_t, bool ) override {
+            if ( ki->type!=Type::tString ) {
+                ss << "\":";
+                inTableKey = false;
+            } else {
+                ss << ":";
+            }
         }
-        virtual void afterTableValue ( Table *, TypeInfo *, char *, TypeInfo *, uint32_t, bool last ) override {
+        virtual void afterTableValue ( Table *, TypeInfo *, char *, TypeInfo *, uint64_t, bool last ) override {
             if ( !last ) ss << ",";
         }
         virtual void afterTable ( Table *, TypeInfo * ) override {
@@ -169,7 +182,7 @@ namespace das {
         }
         virtual void Int8 ( int8_t & value ) override {
             if ( !ignoreNextFields.empty() && ignoreNextFields.back() ) return;
-            ss << value;
+            ss << int32_t(value);
         }
         virtual void UInt8 ( uint8_t & value ) override {
             if ( !ignoreNextFields.empty() && ignoreNextFields.back() ) return;
@@ -177,7 +190,7 @@ namespace das {
         }
         virtual void Int16 ( int16_t & value ) override {
             if ( !ignoreNextFields.empty() && ignoreNextFields.back() ) return;
-            ss << value;
+            ss << int32_t(value);
         }
         virtual void UInt16 ( uint16_t & value ) override {
             if ( !ignoreNextFields.empty() && ignoreNextFields.back() ) return;
@@ -220,33 +233,119 @@ namespace das {
         virtual void Bitfield ( uint32_t & value, TypeInfo * ) override {
             ss << value;
         }
+        virtual void Bitfield8 ( uint8_t & value, TypeInfo * ) override {
+            ss << int32_t(value);
+        }
+        virtual void Bitfield16 ( uint16_t & value, TypeInfo * ) override {
+            ss << int32_t(value);
+        }
+        virtual void Bitfield64 ( uint64_t & value, TypeInfo * ) override {
+            ss << int64_t(value);
+        }
         virtual void Int2 ( int2 & value ) override {
-            ss << "[" << value.x << "," << value.y << "]";
+            if ( inTableKey ) ss << "[" << value.x << "," << value.y << "]";
+            else ss << "{\"x\":" << value.x << ",\"y\":" << value.y << "}";
         }
         virtual void Int3 ( int3 & value ) override {
-            ss << "[" << value.x << "," << value.y << "," << value.z << "]";
+            if ( inTableKey ) ss << "[" << value.x << "," << value.y << "," << value.z << "]";
+            else ss << "{\"x\":" << value.x << ",\"y\":" << value.y << ",\"z\":" << value.z << "}";
         }
         virtual void Int4 ( int4 & value ) override {
-            ss << "[" << value.x << "," << value.y << "," << value.z << "," << value.w << "]";
+            if ( inTableKey ) ss << "[" << value.x << "," << value.y << "," << value.z << "," << value.w << "]";
+            else ss << "{\"x\":" << value.x << ",\"y\":" << value.y << ",\"z\":" << value.z << ",\"w\":" << value.w << "}";
         }
         virtual void UInt2 ( uint2 & value ) override {
-            ss << "[" << int64_t(value.x) << "," << int64_t(value.y) << "]";
+            if ( inTableKey ) ss << "[" << int64_t(value.x) << "," << int64_t(value.y) << "]";
+            else ss << "{\"x\":" << int64_t(value.x) << ",\"y\":" << int64_t(value.y) << "}";
         }
         virtual void UInt3 ( uint3 & value ) override {
-            ss << "[" << int64_t(value.x) << "," << int64_t(value.y) << "," << int64_t(value.z) << "]";
+            if ( inTableKey ) ss << "[" << int64_t(value.x) << "," << int64_t(value.y) << "," << int64_t(value.z) << "]";
+            else ss << "{\"x\":" << int64_t(value.x) << ",\"y\":" << int64_t(value.y) << ",\"z\":" << int64_t(value.z) << "}";
         }
         virtual void UInt4 ( uint4 & value ) override {
-            ss << "[" << int64_t(value.x) << "," << int64_t(value.y) << "," << int64_t(value.z) << "," << int64_t(value.w) << "]";
+            if ( inTableKey ) ss << "[" << int64_t(value.x) << "," << int64_t(value.y) << "," << int64_t(value.z) << "," << int64_t(value.w) << "]";
+            else ss << "{\"x\":" << int64_t(value.x) << ",\"y\":" << int64_t(value.y) << ",\"z\":" << int64_t(value.z) << ",\"w\":" << int64_t(value.w) << "}";
         }
         virtual void Float2 ( float2 & value ) override {
-            ss << "[" << value.x << "," << value.y << "]";
+            if ( inTableKey ) ss << "[" << value.x << "," << value.y << "]";
+            else ss << "{\"x\":" << value.x << ",\"y\":" << value.y << "}";
         }
         virtual void Float3 ( float3 & value ) override {
-            ss << "[" << value.x << "," << value.y << "," << value.z << "]";
+            if ( inTableKey ) ss << "[" << value.x << "," << value.y << "," << value.z << "]";
+            else ss << "{\"x\":" << value.x << ",\"y\":" << value.y << ",\"z\":" << value.z << "}";
         }
         virtual void Float4 ( float4 & value ) override {
-            ss << "[" << value.x << "," << value.y << "," << value.z << "," << value.w << "]";
+            if ( inTableKey ) ss << "[" << value.x << "," << value.y << "," << value.z << "," << value.w << "]";
+            else ss << "{\"x\":" << value.x << ",\"y\":" << value.y << ",\"z\":" << value.z << ",\"w\":" << value.w << "}";
         }
+        // 16/8-bit lattice: arity <=4 mirrors the xyzw object/array form of Float2..4;
+        // 8/16-lane forms are always JSON arrays (no field names past w)
+        template <typename TT, typename PT>
+        void printSVec2 ( const TT & value ) {
+            if ( inTableKey ) ss << "[" << PT(value.x) << "," << PT(value.y) << "]";
+            else ss << "{\"x\":" << PT(value.x) << ",\"y\":" << PT(value.y) << "}";
+        }
+        template <typename TT, typename PT>
+        void printSVec3 ( const TT & value ) {
+            if ( inTableKey ) ss << "[" << PT(value.x) << "," << PT(value.y) << "," << PT(value.z) << "]";
+            else ss << "{\"x\":" << PT(value.x) << ",\"y\":" << PT(value.y) << ",\"z\":" << PT(value.z) << "}";
+        }
+        template <typename TT, typename PT>
+        void printSVec4 ( const TT & value ) {
+            if ( inTableKey ) ss << "[" << PT(value.x) << "," << PT(value.y) << "," << PT(value.z) << "," << PT(value.w) << "]";
+            else ss << "{\"x\":" << PT(value.x) << ",\"y\":" << PT(value.y) << ",\"z\":" << PT(value.z) << ",\"w\":" << PT(value.w) << "}";
+        }
+        template <typename TT, typename PT, int N>
+        void printSVecN ( const TT & value ) {
+            ss << "[";
+            for ( int i = 0; i != N; ++i ) {
+                if ( i ) ss << ",";
+                ss << PT(value.s[i]);
+            }
+            ss << "]";
+        }
+        static __forceinline float f16v ( const float16_t & h ) { return h.toFloat(); }
+        virtual void Float16 ( float16_t & value ) override {
+            ss << value.toFloat();
+        }
+        virtual void Half2 ( half2 & value ) override {
+            if ( inTableKey ) ss << "[" << f16v(value.x) << "," << f16v(value.y) << "]";
+            else ss << "{\"x\":" << f16v(value.x) << ",\"y\":" << f16v(value.y) << "}";
+        }
+        virtual void Half3 ( half3 & value ) override {
+            if ( inTableKey ) ss << "[" << f16v(value.x) << "," << f16v(value.y) << "," << f16v(value.z) << "]";
+            else ss << "{\"x\":" << f16v(value.x) << ",\"y\":" << f16v(value.y) << ",\"z\":" << f16v(value.z) << "}";
+        }
+        virtual void Half4 ( half4 & value ) override {
+            if ( inTableKey ) ss << "[" << f16v(value.x) << "," << f16v(value.y) << "," << f16v(value.z) << "," << f16v(value.w) << "]";
+            else ss << "{\"x\":" << f16v(value.x) << ",\"y\":" << f16v(value.y) << ",\"z\":" << f16v(value.z) << ",\"w\":" << f16v(value.w) << "}";
+        }
+        virtual void Half8 ( half8 & value ) override {
+            ss << "[";
+            for ( int i = 0; i != 8; ++i ) {
+                if ( i ) ss << ",";
+                ss << value.s[i].toFloat();
+            }
+            ss << "]";
+        }
+        virtual void Short2 ( short2 & value ) override { printSVec2<short2, int32_t>(value); }
+        virtual void Short3 ( short3 & value ) override { printSVec3<short3, int32_t>(value); }
+        virtual void Short4 ( short4 & value ) override { printSVec4<short4, int32_t>(value); }
+        virtual void Short8 ( short8 & value ) override { printSVecN<short8, int32_t, 8>(value); }
+        virtual void UShort2 ( ushort2 & value ) override { printSVec2<ushort2, uint32_t>(value); }
+        virtual void UShort3 ( ushort3 & value ) override { printSVec3<ushort3, uint32_t>(value); }
+        virtual void UShort4 ( ushort4 & value ) override { printSVec4<ushort4, uint32_t>(value); }
+        virtual void UShort8 ( ushort8 & value ) override { printSVecN<ushort8, uint32_t, 8>(value); }
+        virtual void Byte2 ( byte2 & value ) override { printSVec2<byte2, int32_t>(value); }
+        virtual void Byte3 ( byte3 & value ) override { printSVec3<byte3, int32_t>(value); }
+        virtual void Byte4 ( byte4 & value ) override { printSVec4<byte4, int32_t>(value); }
+        virtual void Byte8 ( byte8 & value ) override { printSVecN<byte8, int32_t, 8>(value); }
+        virtual void Byte16 ( byte16 & value ) override { printSVecN<byte16, int32_t, 16>(value); }
+        virtual void UByte2 ( ubyte2 & value ) override { printSVec2<ubyte2, uint32_t>(value); }
+        virtual void UByte3 ( ubyte3 & value ) override { printSVec3<ubyte3, uint32_t>(value); }
+        virtual void UByte4 ( ubyte4 & value ) override { printSVec4<ubyte4, uint32_t>(value); }
+        virtual void UByte8 ( ubyte8 & value ) override { printSVecN<ubyte8, uint32_t, 8>(value); }
+        virtual void UByte16 ( ubyte16 & value ) override { printSVecN<ubyte16, uint32_t, 16>(value); }
         virtual void Range ( range & value ) override {
             ss << "[" << value.x << "," << value.y << "]";
         }
@@ -277,26 +376,58 @@ namespace das {
                         return;
                     }
                 }
+                // No enumerator matches this value (e.g. an OR-combined flag enum like
+                // `OpenOnArrow | DefaultOpen`). Emit the number rather than nothing — emitting
+                // nothing produced invalid JSON ({"flags": ,...}) and dropped the whole object.
+                // The numeric form round-trips: scanEnum already accepts a bare integer.
+                ss << value;
             }
         }
         virtual void WalkEnumeration ( int32_t & value, EnumInfo * info ) override {
-            Enum(value,info);
+            // Same sign-extension trap as the 8/16-bit walkers: uint32-backed values > INT32_MAX
+            // come in as negative int32_t, promote to negative int64_t, and miss the lookup against
+            // the positive int64_t-stored field value.
+            int64_t v = (info && (info->flags & EnumInfo::flag_unsigned))
+                ? int64_t(uint32_t(value)) : int64_t(value);
+            Enum(v,info);
         }
         virtual void WalkEnumeration8  ( int8_t & value, EnumInfo * info ) override {
-            Enum(value,info);
+            // For uint8-backed enums the byte represents an unsigned value; promoting via int8_t
+            // sign-extends so the lookup against the int64_t-stored field value would miss.
+            int64_t v = (info && (info->flags & EnumInfo::flag_unsigned))
+                ? int64_t(uint8_t(value)) : int64_t(value);
+            Enum(v,info);
         }
         virtual void WalkEnumeration16 ( int16_t & value, EnumInfo * info ) override {
-            Enum(value,info);
+            int64_t v = (info && (info->flags & EnumInfo::flag_unsigned))
+                ? int64_t(uint16_t(value)) : int64_t(value);
+            Enum(v,info);
         }
         virtual void WalkEnumeration64 ( int64_t & value, EnumInfo * info ) override {
+            // No promotion happens here — int64_t reads at its native width, so signedness can't
+            // wrap during the implicit conversion to Enum()'s int64_t parameter. The lookup against
+            // uint64_t-backed values with the top bit set will compare bit-for-bit equal because the
+            // stored value already round-tripped through int64_t at EnumValueInfo build time.
             Enum(value,info);
         }
+        // A function pointer / block isn't JSON data. Emit `null` rather than nothing so the output
+        // stays valid JSON. Class methods are dropped earlier (flag_classMethod); this still guards
+        // the __lambda/__finalize fields inside a lambda's capture struct and any function-typed
+        // field, which otherwise left a dangling `:` and produced invalid JSON.
+        virtual void WalkFunction ( Func * ) override {
+            if ( !ignoreNextFields.empty() && ignoreNextFields.back() ) return;
+            ss << "null";
+        }
+        virtual void WalkBlock ( Block * ) override {
+            if ( !ignoreNextFields.empty() && ignoreNextFields.back() ) return;
+            ss << "null";
+        }
 
-        virtual bool revisitStructure ( char * ps, StructInfo * si ) override {
+        virtual bool revisitStructure ( char * /*ps*/, StructInfo * /*si*/ ) override {
             ss << "null";
             return false;
         }
-        virtual bool revisitHandle ( char * ps, TypeInfo * ti ) override {
+        virtual bool revisitHandle ( char * /*ps*/, TypeInfo * /*ti*/ ) override {
             ss << "null";
             return false;
         }

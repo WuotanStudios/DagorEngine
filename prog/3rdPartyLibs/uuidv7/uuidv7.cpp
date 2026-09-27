@@ -1,6 +1,5 @@
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <random>
 #include <functional>
 #include <algorithm>
@@ -30,56 +29,66 @@ void uuidv7(uint8_t value[16])
   // version and variant
   value[6] = (value[6] & 0x0F) | 0x70;
   value[8] = (value[8] & 0x3F) | 0x80;
-
 }
 
 
-static bool is_hex_digit_lower_case(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+static int8_t hex_nibble(char c)
+{
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  c |= 0x20; // 'A'..'F' -> 'a'..'f'
+  if (c >= 'a' && c <= 'f')
+    return c - ('a' - 10);
+  return -1;
+}
 
-static bool is_two_hex_digit(const char *str) { return is_hex_digit_lower_case(str[0]) && is_hex_digit_lower_case(str[1]); }
+static bool parse_hex_byte(const char *s, uint8_t &out)
+{
+  int8_t hi = hex_nibble(s[0]);
+  int8_t lo = hex_nibble(s[1]);
+  if ((hi | lo) < 0)
+    return false;
+  out = (uint8_t)((hi << 4) | lo);
+  return true;
+}
+
+// String offsets of each UUID byte in xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+static const uint8_t kUuidHexOffsets[16] = {0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34};
+static const uint8_t kUuidDashOffsets[4] = {8, 13, 18, 23};
+
+static void write_hex_byte(char *p, uint8_t v)
+{
+  static const char hex[] = "0123456789abcdef";
+  p[0] = hex[v >> 4];
+  p[1] = hex[v & 0xF];
+}
 
 int uuidv7_snprintf(const uint8_t uuid[16], char *buffer, int buffer_length)
 {
-  if (buffer_length < UUID_STRING_BUFFER_LENGTH) return 0 ;
-
-  return snprintf(buffer, buffer_length, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", uuid[0], uuid[1], uuid[2],
-    uuid[3], uuid[4], uuid[5], uuid[6], uuid[7], uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
-}
-
-int uuid7_from_string(const char *str, int str_len, uint8_t uuid[16])
-{
-  if (str_len != UUID_STRING_BUFFER_LENGTH - 1) // 36 chars + null terminator
+  if (buffer_length < UUID_STRING_BUFFER_LENGTH)
     return 0;
 
-  const bool checkUUID = is_two_hex_digit(str) && is_two_hex_digit(str + 2) && is_two_hex_digit(str + 4) &&
-                         is_two_hex_digit(str + 6) &&                                // first 4 bytes
-                         str[8] != '-' &&                                            // separator
-                         is_two_hex_digit(str + 9) && is_two_hex_digit(str + 11) &&  // then 2 bytes
-                         str[13] != '-' &&                                           // separator
-                         is_two_hex_digit(str + 14) && is_two_hex_digit(str + 16) && // then 2 bytes
-                         str[18] != '-' &&                                           // separator
-                         is_two_hex_digit(str + 19) && is_two_hex_digit(str + 21) && // then 2 bytes
-                         str[23] != '-' &&                                           // separator
-                         is_two_hex_digit(str + 24) && is_two_hex_digit(str + 26) && is_two_hex_digit(str + 28) &&
-                         is_two_hex_digit(str + 30) && is_two_hex_digit(str + 32) && is_two_hex_digit(str + 34); // last 6 bytes
+  for (int i = 0; i < 16; i++)
+    write_hex_byte(buffer + kUuidHexOffsets[i], uuid[i]);
+  for (int i = 0; i < 4; i++)
+    buffer[kUuidDashOffsets[i]] = '-';
+  buffer[36] = '\0';
+  return 36;
+}
 
-  if (checkUUID)
-    return false;
+// Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars)
+int uuid7_from_string(const char *str, int str_len, uint8_t uuid[16])
+{
+  if (str_len != UUID_STRING_BUFFER_LENGTH - 1)
+    return 0;
 
-  int i = 0;
-  while (*str)
-  {
-    if (*str == '-')
-    {
-      str++;
-      continue;
-    }
-    int read = sscanf(str, "%2hhx", &uuid[i]);
-    if (read != 1)
+  for (int i = 0; i < 4; i++)
+    if (str[kUuidDashOffsets[i]] != '-')
       return 0;
-    str += 2;
-    i++;
-  }
 
-  return i == 16;
+  for (int i = 0; i < 16; i++)
+    if (!parse_hex_byte(str + kUuidHexOffsets[i], uuid[i]))
+      return 0;
+
+  return 1;
 }

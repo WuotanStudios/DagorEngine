@@ -8,11 +8,14 @@
 #include <3d/dag_resPtr.h>
 #include <generic/dag_tab.h>
 #include <math/dag_Point2.h>
+#include <math/dag_bounds2.h>
 #include <vecmath/dag_vecMathDecl.h>
 #include <render/toroidalHelper.h>
 #include <shaders/dag_postFxRenderer.h>
 #include <shaders/dag_overrideStateId.h>
 #include <generic/dag_relocatableFixedVector.h>
+#include <EASTL/unique_ptr.h>
+#include <util/dag_fixedBitArray.h>
 
 class DynamicShaderHelper;
 
@@ -30,14 +33,22 @@ enum RenderDepthAOType : uint32_t
 class IRenderDepthAOCB
 {
 public:
-  virtual void renderDepthAO(const Point3 &, mat44f_cref, const float, int region, RenderDepthAOType type = RenderDepthAOType::ALL,
-    int cascade_no = 0) = 0;
+  enum class RenderRegionState
+  {
+    DontCare,
+    FullyLoaded,
+  };
+  virtual RenderRegionState prepareRegionToRender(int region, bool is_refresh_tile) = 0;
+  virtual void renderDepthAO(const Point3 &, mat44f_cref, const float, int region, RenderDepthAOType type, int cascade_no) = 0;
   virtual void getMinMaxZ(float &, float &) = 0;
 };
 
 
 class DepthAOAboveRenderer
 {
+  static constexpr int TEXEL_ALIGN = 4;
+  static constexpr int THRESHOLD = TEXEL_ALIGN * 4;
+
   enum class RenderDepthAOClearFirst
   {
     Yes,
@@ -49,13 +60,13 @@ class DepthAOAboveRenderer
     RegionToRender(ToroidalQuadRegion &r) : cullViewProj(), reg(r) {}
     TMatrix4_vec4 cullViewProj;
     ToroidalQuadRegion reg;
+    bool isRefreshTile = false;
   };
 
   class BlurDepthRenderer
   {
-
-    int blurred_depthVarId = -1;
     eastl::unique_ptr<DynamicShaderHelper> blurDepth;
+    UniqueBuf quadsBuffer;
 
   public:
     struct Vertex
@@ -80,30 +91,51 @@ class DepthAOAboveRenderer
   {
     ToroidalHelper worldAODepthData;
     Tab<IBBox2> invalidAORegions;
+    Tab<BBox2> refreshedRegions;
     float depthAroundDistance = 0;
     Tab<RegionToRender> regionsToRender;
-  };
-  // Note: the code assumes that MAX_CASCADES == 2 and cannot handle more for now
-  // Need more? Move cascade dependant shadervars and etc to an array
-  static constexpr int MAX_CASCADES = 2;
-  float extraCascadeMult = 2.0f;
-  dag::RelocatableFixedVector<CascadeDependantData, MAX_CASCADES, false> cascadeDependantData;
 
-  unsigned int texSize;
-  UniqueTexHolder worldAODepth;
-  UniqueTexHolder worldAODepthWithTransparency;
-  UniqueTexHolder blurredDepth;
-  UniqueTexHolder blurredDepthWithTransparency;
+    static constexpr int REFRESH_TILE_DIM = 16;
+    static constexpr int REFRESH_TILE_DIM_SQ = REFRESH_TILE_DIM * REFRESH_TILE_DIM;
+    using TileMap = FixedBitArray<REFRESH_TILE_DIM * REFRESH_TILE_DIM>;
+    TileMap refreshTileMap;
+    int cycleId = 0;
+    bool validAtAnyQuality = false;
+  };
+
+public:
+  // Note: the code assumes that MAX_DEPTH_ABOVE_CASCADES == 2 and cannot handle more for now
+  // Need more? Move cascade dependant shadervars and etc to an array
+  static constexpr int MAX_DEPTH_ABOVE_CASCADES = 2;
+
+private:
+  float extraCascadeMult = 2.0f;
+  dag::RelocatableFixedVector<CascadeDependantData, MAX_DEPTH_ABOVE_CASCADES, false> cascadeDependantData;
+
+  const unsigned int texSize;
+  const unsigned int refreshTileSize;
+  UniqueTex debugRegionMap;
+  UniqueTexWithShaderVar worldAODepth;
+  UniqueTexWithShaderVar worldAODepthWithTransparency;
+  UniqueTexWithShaderVar blurredDepth;
+  UniqueTexWithShaderVar blurredDepthWithTransparency;
   Point2 sceneMinMaxZ;
 
   bool renderTransparent = false;
 
   void renderAODepthQuads(dag::ConstSpan<RegionToRender> regions, IRenderDepthAOCB &renderDepthCb, int cascade_no);
   void renderAODepthQuads(dag::ConstSpan<RegionToRender> regions, IRenderDepthAOCB &renderDepthCb, BaseTexture *depthTex,
-    RenderDepthAOType type, RenderDepthAOClearFirst clear_mode, int cascade_no);
+    RenderDepthAOType type, RenderDepthAOClearFirst clear_mode, int cascade_no, bool collect_refreshed);
   void renderAODepthQuadsTransparent(dag::ConstSpan<RegionToRender> regions, IRenderDepthAOCB &renderDepthCb,
     RenderDepthAOClearFirst clear_mode, int cascade_no);
   void copyDepthAboveRegions(dag::ConstSpan<RegionToRender> regions, BaseTexture *depthTex, int cascade_no);
+  void updateInvalidRegionsToRender(CascadeDependantData &cascadeData, float splitThreshold);
+
+  static void fill_tile_map(CascadeDependantData::TileMap &region_map, IBBox2 raw_region, bool set_value);
+  static IBBox2 get_refresh_tile_region(int cycle_id, int tile_size);
+  void fillRefreshTiles(int cascade_no, IBBox2 region, bool set_value);
+  void updateRefreshTilesToRender(CascadeDependantData &cascadeData);
+  void refreshDebugRegionMap(int cascade_no);
 
 public:
   DepthAOAboveRenderer(int texSize, float depth_around_distance, bool render_extra = false, bool use_extra_cascade = false,
@@ -132,4 +164,11 @@ public:
   void setVars();
   void setInvalidVars();
   bool isValid() const;
+  bool isValidAtAnyQuality() const;
+
+  const Tab<BBox2> &getRefreshedRegionsForCascade(int cascade_no) const
+  {
+    G_ASSERT(cascade_no < cascadeDependantData.size());
+    return cascadeDependantData[cascade_no].refreshedRegions;
+  }
 };

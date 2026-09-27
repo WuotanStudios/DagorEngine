@@ -1,5 +1,6 @@
 from "%darg/ui_imports.nut" import *
 from "%sqstd/frp.nut" import *
+from "types" import Array
 
 function Bar(has_scroll) {
   if (has_scroll) {
@@ -22,9 +23,9 @@ let Knob = freeze({
     : Color(110, 120, 140, 160)
 })
 
-let ContentRoot = freeze({
+const ContentRoot = {
   size = flex()
-})
+}
 
 
 function calcBarSize(bar_style, axis) {
@@ -73,7 +74,7 @@ function scrollbar(scroll_handler, options={}) {
     }
 
 
-    let minV = 0
+    const minV = 0
     let maxV = contentSize - elemSize
     let fValue = scrollPos
 
@@ -130,6 +131,16 @@ let DEF_SIDE_SCROLL_OPTIONS = { //const
   needReservePlace = true //need reserve place for scrollbar when it not visible
   clipChildren  = true
   joystickScroll = true
+  // when virtualItems is set, the content root builds only the visible items
+  // (see Behaviors.VirtualList) and 'content' is ignored. An observable here
+  // makes the content root watch it. The rest left null keeps the behavior's
+  // own default, so this does not name it twice
+  virtualItems = null
+  virtualItemHeight = null
+  virtualItemHeights = null
+  virtualOverscan = null
+  virtualInitialCount = null
+  virtualTail = null
 }
 
 function makeSideScroll(content, options = DEF_SIDE_SCROLL_OPTIONS) {
@@ -141,13 +152,17 @@ function makeSideScroll(content, options = DEF_SIDE_SCROLL_OPTIONS) {
 
   function contentRoot() {
     local bhv = rootBase?.behavior ?? []
-    if (type(bhv) != "array")
+    if (!(bhv instanceof Array))
       bhv = [bhv]
     else
       bhv = clone bhv
     bhv.append(Behaviors.WheelScroll, Behaviors.ScrollEvent)
+    let vitems = options.virtualItems
+    let virtual = vitems != null
+    if (virtual)
+      bhv.append(Behaviors.VirtualList)
 
-    return rootBase.__merge({
+    let rootDesc = rootBase.__merge({
       size = options.size
       behavior = bhv
       scrollHandler = scrollHandler
@@ -156,8 +171,31 @@ function makeSideScroll(content, options = DEF_SIDE_SCROLL_OPTIONS) {
       joystickScroll = options.joystickScroll
       maxHeight = options.maxHeight
       maxWidth = options.maxWidth
-      children = content
     })
+    if (!virtual)
+      return rootDesc.__merge({ children = content })
+
+    // VirtualList takes the items itself; passing 'children' too would shift
+    // the item indices it maps focus and windows onto
+    let virtualDesc = rootDesc.__merge({
+      // the flow axis has to be the scroll axis: VirtualList stacks the
+      // items and the skipped-run spacers along it, and the default
+      // ContentRoot declares no flow at all
+      flow = options.orientation == O_VERTICAL ? FLOW_VERTICAL : FLOW_HORIZONTAL
+      virtualItems = isObservable(vitems) ? vitems.get() : vitems
+      virtualItemHeight = options.virtualItemHeight
+      virtualItemHeights = options.virtualItemHeights
+      virtualOverscan = options.virtualOverscan
+      virtualInitialCount = options.virtualInitialCount
+      virtualTail = options.virtualTail
+    })
+    if (isObservable(vitems)) {
+      local watch = rootBase?.watch ?? []
+      watch = watch instanceof Array ? clone watch : [watch]
+      watch.append(vitems)
+      virtualDesc.watch <- watch
+    }
+    return virtualDesc
   }
 
   let childrenContent = scrollAlign == ALIGN_LEFT || scrollAlign == ALIGN_TOP
@@ -182,7 +220,7 @@ function makeHVScrolls(content, options={}) {
 
   function contentRoot() {
     local bhv = rootBase?.behavior ?? []
-    if (type(bhv) != "array")
+    if (!(bhv instanceof Array))
       bhv = [bhv]
     else
       bhv = clone bhv

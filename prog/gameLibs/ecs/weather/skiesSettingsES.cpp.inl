@@ -2,9 +2,13 @@
 
 #include <ecs/weather/skiesSettings.h>
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <daECS/core/coreEvents.h>
-#include <ecs/core/attributeEx.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/entityComponent.h>
 #include <daSkies2/daSkies.h>
 #include <daSkies2/daScattering.h>
 #include <dag_noise/dag_uint_noise.h>
@@ -67,10 +71,20 @@ static void skies_settings_skies_loaded_es_event_handler(const EventSkiesLoaded 
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
 ECS_TRACK(*)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
-static __forceinline void clouds_rendering_es_event_handler(const ecs::Event &, float clouds_rendering__forward_eccentricity,
-  float clouds_rendering__back_eccentricity, float clouds_rendering__forward_eccentricity_weight,
-  float clouds_rendering__erosion_noise_size, float clouds_rendering__ambient_desaturation, float clouds_rendering__ms_contribution,
-  float clouds_rendering__ms_attenuation, float clouds_rendering__ms_ecc_attenuation, float clouds_rendering__erosionWindSpeed)
+static __forceinline void clouds_rendering_es_event_handler(const ecs::Event &, ecs::EntityManager &manager,
+  float clouds_rendering__forward_eccentricity, float clouds_rendering__back_eccentricity,
+  float clouds_rendering__forward_eccentricity_weight, float clouds_rendering__erosion_noise_size,
+  float clouds_rendering__ambient_desaturation, float clouds_rendering__ms_contribution, float clouds_rendering__ms_attenuation,
+  float clouds_rendering__ms_ecc_attenuation, float clouds_rendering__erosionWindSpeed,
+  // optional (defaults mirror CLOUDS_RENDERING_PARAMS) so older templates still match
+  float clouds_rendering__droplet_diameter_um = 20.f, float clouds_rendering__edge_albedo = 0.8f,
+  float clouds_rendering__edge_albedo_sharpness = 4.f, float clouds_rendering__taa_exposure_scale = 0.4f,
+  float clouds_rendering__layer0_aerosolness = 0.35f, float clouds_rendering__layer1_aerosolness = 0.35f,
+  float clouds_rendering__cumulonimbus_aerosolness = 0.5f, float clouds_rendering__cloudAerosolDropletsMieStrength = 1.f,
+  float clouds_rendering__aerosol_reach_below_km = 0.5f, int clouds_rendering__bsm_log2_amortize_frames = 4,
+  float clouds_rendering__bsm_scattering_physicality = 1.f, float clouds_rendering__erosion_strength = 0.15f,
+  float clouds_rendering__erosion_height_bias = 0.5f, float clouds_rendering__erosion_edge_mul = 2.f,
+  float clouds_rendering__erosion_edge_add = 0.25f)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
@@ -86,16 +100,50 @@ static __forceinline void clouds_rendering_es_event_handler(const ecs::Event &, 
   cloudsRendering.ms_attenuation = clouds_rendering__ms_attenuation;
   cloudsRendering.ms_ecc_attenuation = clouds_rendering__ms_ecc_attenuation;
   cloudsRendering.erosionWindSpeed = clouds_rendering__erosionWindSpeed;
+  cloudsRendering.droplet_diameter_um = clouds_rendering__droplet_diameter_um;
+  cloudsRendering.edge_albedo = clouds_rendering__edge_albedo;
+  cloudsRendering.edge_albedo_sharpness = clouds_rendering__edge_albedo_sharpness;
+  cloudsRendering.taa_exposure_scale = clouds_rendering__taa_exposure_scale;
+  cloudsRendering.layer0_aerosolness = clouds_rendering__layer0_aerosolness;
+  cloudsRendering.layer1_aerosolness = clouds_rendering__layer1_aerosolness;
+  cloudsRendering.cumulonimbus_aerosolness = clouds_rendering__cumulonimbus_aerosolness;
+  cloudsRendering.cloudAerosolDropletsMieStrength = clouds_rendering__cloudAerosolDropletsMieStrength;
+  cloudsRendering.aerosol_reach_below_km = clouds_rendering__aerosol_reach_below_km;
+  cloudsRendering.bsm_log2_amortize_frames = clouds_rendering__bsm_log2_amortize_frames;
+  cloudsRendering.bsm_scattering_physicality = clouds_rendering__bsm_scattering_physicality;
+  cloudsRendering.erosion_strength = clouds_rendering__erosion_strength;
+  cloudsRendering.erosion_height_bias = clouds_rendering__erosion_height_bias;
+  cloudsRendering.erosion_edge_mul = clouds_rendering__erosion_edge_mul;
+  cloudsRendering.erosion_edge_add = clouds_rendering__erosion_edge_add;
+  // aerosol controls only change the atmosphere medium: DaSkies::prepare re-derives
+  // them every frame and re-bakes scattering through its own generation counter, so
+  // aerosol-only edits must not trigger the full clouds invalidate
+  DaSkies::CloudsRendering compare = skies->getCloudsRendering();
+  compare.copyAerosolFrom(cloudsRendering);
+  const bool nonAerosolChanged = !(compare == cloudsRendering);
   skies->setCloudsRendering(cloudsRendering);
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  if (nonAerosolChanged)
+    manager.broadcastEventImmediate(CmdSkiesInvalidate());
+}
+
+ECS_ON_EVENT(on_appear, EventSkiesLoaded)
+ECS_TRACK(*)
+static inline void sky_wind_es(const ecs::Event &, float wind__dir)
+{
+  DaSkies *skies = get_daskies_impl();
+  if (!skies)
+    return;
+
+  Point2 windDir = Point2(cosf(DegToRad(wind__dir)), sinf(DegToRad(wind__dir)));
+  skies->setWindDirection(windDir);
 }
 
 // strata_clouds
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
 ECS_TRACK(*)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
-static __forceinline void strata_clouds_es_event_handler(const ecs::Event &, const Point2 &strata_clouds__amount,
-  const Point2 &strata_clouds__altitude)
+static __forceinline void strata_clouds_es_event_handler(const ecs::Event &, ecs::EntityManager &manager,
+  const Point2 &strata_clouds__amount, const Point2 &strata_clouds__altitude)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
@@ -106,21 +154,21 @@ static __forceinline void strata_clouds_es_event_handler(const ecs::Event &, con
   strataClouds.amount = clamp(STRATA_CLOUDS(amount), 0.f, 1.f);
   strataClouds.altitude = STRATA_CLOUDS(altitude);
   skies->setStrataClouds(strataClouds);
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 }
 
 // strata_clouds_texture
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
 ECS_TRACK(*)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
-static void strata_clouds_tex_es(const ecs::Event &, const ecs::string &strata_clouds__tex)
+static void strata_clouds_tex_es(const ecs::Event &, ecs::EntityManager &manager, const ecs::string &strata_clouds__tex)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
     return;
 
   skies->setStrataCloudsTexture(strata_clouds__tex.c_str());
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 };
 
 void validate_volumetric_clouds_settings();
@@ -129,9 +177,9 @@ void validate_volumetric_clouds_settings();
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
 ECS_TRACK(*)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
-static __forceinline void clouds_form_es_event_handler(const ecs::Event &, const ecs::Array &clouds_form__layers,
-  const Point2 &clouds_form__extinction, const Point2 &clouds_form__turbulenceStrength, int clouds_form__shapeNoiseScale,
-  int clouds_form__cumulonimbusShapeScale, int clouds_form__turbulenceFreq)
+static __forceinline void clouds_form_es_event_handler(const ecs::Event &, ecs::EntityManager &manager,
+  const ecs::Array &clouds_form__layers, const Point2 &clouds_form__extinction, const Point2 &clouds_form__turbulenceStrength,
+  int clouds_form__shapeNoiseScale, int clouds_form__cumulonimbusShapeScale, int clouds_form__turbulenceFreq)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
@@ -158,16 +206,16 @@ static __forceinline void clouds_form_es_event_handler(const ecs::Event &, const
   cloudsForm.cumulonimbusShapeScale = clouds_form__cumulonimbusShapeScale;
   cloudsForm.turbulenceFreq = clouds_form__turbulenceFreq;
   skies->setCloudsForm(cloudsForm);
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 }
 
 // clouds_settings
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
 ECS_TRACK(*)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
-static __forceinline void clouds_settings_es_event_handler(const ecs::Event &, float clouds_settings__maximum_averaging_ratio,
-  int clouds_settings__quality, int clouds_settings__target_quality, bool clouds_settings__competitive_advantage,
-  bool clouds_settings__fastEvolution)
+static __forceinline void clouds_settings_es_event_handler(const ecs::Event &, ecs::EntityManager &manager,
+  float clouds_settings__maximum_averaging_ratio, int clouds_settings__quality, int clouds_settings__target_quality,
+  bool clouds_settings__competitive_advantage, bool clouds_settings__fastEvolution)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
@@ -180,16 +228,17 @@ static __forceinline void clouds_settings_es_event_handler(const ecs::Event &, f
   cloudsSettings.competitive_advantage = clouds_settings__competitive_advantage;
   cloudsSettings.fastEvolution = clouds_settings__fastEvolution;
   skies->setCloudsGameSettingsParams(cloudsSettings);
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 }
 
 // clouds_weather_gen
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
 ECS_TRACK(*)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
-static __forceinline void clouds_weather_gen_es_event_handler(const ecs::Event &, const ecs::Array &clouds_weather_gen__layers,
-  float clouds_weather_gen__epicness, const Point2 &clouds_weather_gen__cumulonimbusCoverage,
-  const Point2 &clouds_weather_gen__cumulonimbusSeed, float clouds_weather_gen__worldSize)
+static __forceinline void clouds_weather_gen_es_event_handler(const ecs::Event &, ecs::EntityManager &manager,
+  const ecs::Array &clouds_weather_gen__layers, float clouds_weather_gen__epicness,
+  const Point2 &clouds_weather_gen__cumulonimbusCoverage, const Point2 &clouds_weather_gen__cumulonimbusSeed,
+  float clouds_weather_gen__worldSize)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
@@ -210,25 +259,27 @@ static __forceinline void clouds_weather_gen_es_event_handler(const ecs::Event &
   cloudsWeatherGen.cumulonimbusSeed = CLOUDS_WEATHER_GEN(cumulonimbusSeed);
   cloudsWeatherGen.worldSize = clouds_weather_gen__worldSize;
   skies->setWeatherGen(cloudsWeatherGen);
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 }
 
 // sky_atmosphere
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
 ECS_TRACK(*)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
-static __forceinline void sky_atmosphere_es_event_handler(const ecs::Event &, float sky_atmosphere__average_ground_albedo,
-  float sky_atmosphere__min_ground_offset, float sky_settings__haze_strength, float sky_settings__haze_min_angle,
-  float sky_settings__haze_peak_hour_offset, const Point3 &sky_atmosphere__ground_color, const Point2 &sky_atmosphere__mie2_thickness,
-  const Point2 &sky_atmosphere__mie2_altitude, const Point2 &sky_atmosphere__mie2_scale, const Point2 &sky_atmosphere__mie_height,
-  const Point2 &sky_atmosphere__mie_scale, const Point2 &sky_atmosphere__mie_absorption_scale,
-  const Point3 &sky_atmosphere__mie_scattering_color, const Point3 &sky_atmosphere__mie_absorption_color,
-  const Point2 &sky_atmosphere__mie_assymetry, const Point2 &sky_atmosphere__mie_back_assymetry, float sky_atmosphere__planet_scale,
-  float sky_atmosphere__atmosphere_scale, const Point2 &sky_atmosphere__rayleigh_scale,
-  const Point2 &sky_atmosphere__rayleigh_alt_scale, const Point3 &sky_atmosphere__rayleigh_color,
-  float sky_atmosphere__multiple_scattering_factor, float sky_atmosphere__ozone_alt_dist, float sky_atmosphere__ozone_max_alt,
-  const Point2 &sky_atmosphere__ozone_scale, float sky_atmosphere__sun_brightness, float sky_atmosphere__moon_brightness,
-  const Point3 &sky_atmosphere__moon_color, bool sky_disable_sky_influence = false)
+static __forceinline void sky_atmosphere_es_event_handler(const ecs::Event &, ecs::EntityManager &manager,
+  float sky_atmosphere__average_ground_albedo, float sky_atmosphere__min_ground_offset, float sky_settings__haze_strength,
+  float sky_settings__haze_min_angle, float sky_settings__haze_peak_hour_offset, const Point3 &sky_atmosphere__ground_color,
+  const Point2 &sky_atmosphere__mie2_thickness, const Point2 &sky_atmosphere__mie2_altitude, const Point2 &sky_atmosphere__mie2_scale,
+  const Point2 &sky_atmosphere__mie_height, const Point2 &sky_atmosphere__mie_scale,
+  const Point2 &sky_atmosphere__mie_absorption_scale, const Point3 &sky_atmosphere__mie_scattering_color,
+  const Point3 &sky_atmosphere__mie_absorption_color, const Point2 &sky_atmosphere__mie_assymetry,
+  const Point2 &sky_atmosphere__mie_back_assymetry, float sky_atmosphere__planet_scale, float sky_atmosphere__atmosphere_scale,
+  const Point2 &sky_atmosphere__rayleigh_scale, const Point2 &sky_atmosphere__rayleigh_alt_scale,
+  const Point3 &sky_atmosphere__rayleigh_color, float sky_atmosphere__multiple_scattering_factor, float sky_atmosphere__ozone_alt_dist,
+  float sky_atmosphere__ozone_max_alt, const Point2 &sky_atmosphere__ozone_scale, float sky_atmosphere__sun_brightness,
+  float sky_atmosphere__moon_brightness, const Point3 &sky_atmosphere__moon_color,
+  // optional (default mirrors SKY_PARAMS) so older templates still match
+  float sky_atmosphere__polarization_strength = 0.f, bool sky_disable_sky_influence = false)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
@@ -259,6 +310,7 @@ static __forceinline void sky_atmosphere_es_event_handler(const ecs::Event &, fl
   skyAtmosphereParams.ozone_alt_dist = sky_atmosphere__ozone_alt_dist;
   skyAtmosphereParams.ozone_max_alt = sky_atmosphere__ozone_max_alt;
   skyAtmosphereParams.ozone_scale = SKY_ATMOSPHERE(ozone_scale);
+  skyAtmosphereParams.polarization_strength = sky_atmosphere__polarization_strength;
   skyAtmosphereParams.sun_brightness = sky_atmosphere__sun_brightness;
   skyAtmosphereParams.haze_strength = sky_settings__haze_strength;
   skyAtmosphereParams.haze_min_angle = sky_settings__haze_min_angle;
@@ -276,7 +328,7 @@ static __forceinline void sky_atmosphere_es_event_handler(const ecs::Event &, fl
   }
 
   skies->setSkyParams(skyAtmosphereParams);
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 }
 
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
@@ -289,51 +341,53 @@ static __forceinline void use_clouds_hole_es_event_handler(const ecs::Event &, b
 }
 
 template <typename Callable>
-static void is_cloud_hole_enabled_for_preset_ecs_query(Callable c);
+static void is_cloud_hole_enabled_for_preset_ecs_query(ecs::EntityManager &manager, Callable c);
 
 ECS_REQUIRE(ecs::Tag clouds_hole_tag)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
 ECS_TRACK(transform, density)
-static __forceinline void clouds_hole_es_event_handler(const ecs::Event &, const TMatrix &transform, const float &density)
+static __forceinline void clouds_hole_es_event_handler(const ecs::Event &, ecs::EntityManager &manager, const TMatrix &transform,
+  const float &density)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
     return;
 
   bool enabled = false;
-  is_cloud_hole_enabled_for_preset_ecs_query([&](bool level__cloudsHoleEnabled) { enabled = level__cloudsHoleEnabled; });
+  is_cloud_hole_enabled_for_preset_ecs_query(manager, [&](bool level__cloudsHoleEnabled) { enabled = level__cloudsHoleEnabled; });
 
   if (!enabled)
     skies->resetCloudsHole();
   else
     skies->setCloudsHole(transform.getcol(3), density);
 
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 }
 
 ECS_REQUIRE(ecs::Tag clouds_hole_tag)
 ECS_ON_EVENT(on_disappear)
 ECS_TAG(render)
-static __forceinline void disappear_clouds_hole_es(const ecs::Event &)
+static __forceinline void disappear_clouds_hole_es(const ecs::Event &, ecs::EntityManager &manager)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
     return;
 
   skies->resetCloudsHole();
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 }
 
 ECS_REQUIRE(ecs::Tag moon_params)
 ECS_ON_EVENT(on_appear, EventSkiesLoaded)
-static __forceinline void moon_params_es_event_handler(const ecs::Event &, const ecs::string &moon_res_name, float moon_size)
+static __forceinline void moon_params_es_event_handler(const ecs::Event &, ecs::EntityManager &manager,
+  const ecs::string &moon_res_name, float moon_size)
 {
   DaSkies *skies = get_daskies_impl();
   if (!skies)
     return;
   skies->setMoonResourceName(moon_res_name.c_str());
   skies->setMoonSize(moon_size);
-  g_entity_mgr->broadcastEventImmediate(CmdSkiesInvalidate());
+  manager.broadcastEventImmediate(CmdSkiesInvalidate());
 }
 
 ECS_TAG(dev)
@@ -348,45 +402,47 @@ static void randomize_skies_setting_seed_es_event_handler(const ecs::Event &, bo
 
 template <typename Callable>
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
-static void is_panorama_forced_ecs_query(Callable c);
+static void is_panorama_forced_ecs_query(ecs::EntityManager &manager, Callable c);
 
 bool is_panorama_forced()
 {
   bool forcePanorama = false;
-  is_panorama_forced_ecs_query([&](bool clouds_settings__force_panorama) { forcePanorama = clouds_settings__force_panorama; });
+  is_panorama_forced_ecs_query(*g_entity_mgr,
+    [&](bool clouds_settings__force_panorama) { forcePanorama = clouds_settings__force_panorama; });
   return forcePanorama;
 }
 
 template <typename Callable>
 ECS_REQUIRE(ecs::Tag skies_settings_tag)
-void validate_volumetric_clouds_settings_ecs_query(Callable c);
+void validate_volumetric_clouds_settings_ecs_query(ecs::EntityManager &manager, Callable c);
 
 void validate_volumetric_clouds_settings()
 {
   DaSkies *skies = get_daskies_impl();
-  if (!skies)
+  if (!skies || skies->isCpuOnly())
     return;
-  validate_volumetric_clouds_settings_ecs_query([&](const ecs::Array &clouds_form__layers, bool clouds_settings__force_panorama) {
-    // thickness can affect volumetric clouds worse than panoramic, hiding wrong params, so we
-    // only check if volumetric can be turned on in release, or is turned on through console commands
-    if (!clouds_settings__force_panorama || !skies->panoramaEnabled())
-    {
-      for (int i = 0; i < clouds_form__layers.size(); i++)
+  validate_volumetric_clouds_settings_ecs_query(*g_entity_mgr,
+    [&](const ecs::Array &clouds_form__layers, bool clouds_settings__force_panorama) {
+      // thickness can affect volumetric clouds worse than panoramic, hiding wrong params, so we
+      // only check if volumetric can be turned on in release, or is turned on through console commands
+      if (!clouds_settings__force_panorama || !skies->panoramaEnabled())
       {
-        ecs::Object layer = clouds_form__layers[i].get<ecs::Object>();
-
-        const Point2 &thicknessRange = layer.getMemberOr<Point2>(ECS_HASH("thickness"), Point2());
-        float minCloudThickness = skies->getMinCloudThickness();
-        if (thicknessRange.x < minCloudThickness || thicknessRange.y < minCloudThickness)
+        for (int i = 0; i < clouds_form__layers.size(); i++)
         {
-          eastl::string extraInfo = clouds_settings__force_panorama
-                                      ? "This error message shouldn't happen on release builds, because "
-                                        "clouds_settings__force_panorama is true. However volumetric clouds may be broken now."
-                                      : "Either increase thickness, or enable clouds_settings__force_panorama for the preset!";
-          logerr("Cloud layer thickness must be at least %f. It has a range of [%f,%f] on layer %d!\n%s", minCloudThickness,
-            thicknessRange.x, thicknessRange.y, i, extraInfo.c_str());
+          ecs::Object layer = clouds_form__layers[i].get<ecs::Object>();
+
+          const Point2 &thicknessRange = layer.getMemberOr<Point2>(ECS_HASH("thickness"), Point2());
+          float minCloudThickness = skies->getMinCloudThickness();
+          if (thicknessRange.x < minCloudThickness || thicknessRange.y < minCloudThickness)
+          {
+            eastl::string extraInfo = clouds_settings__force_panorama
+                                        ? "This error message shouldn't happen on release builds, because "
+                                          "clouds_settings__force_panorama is true. However volumetric clouds may be broken now."
+                                        : "Either increase thickness, or enable clouds_settings__force_panorama for the preset!";
+            logerr("Cloud layer thickness must be at least %f. It has a range of [%f,%f] on layer %d!\n%s", minCloudThickness,
+              thicknessRange.x, thicknessRange.y, i, extraInfo.c_str());
+          }
         }
       }
-    }
-  });
+    });
 }

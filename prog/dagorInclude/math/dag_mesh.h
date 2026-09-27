@@ -120,6 +120,25 @@ struct FaceNGr
 #define FACEFLG_ALLEDGES (FACEFLG_EDGE0 | FACEFLG_EDGE1 | FACEFLG_EDGE2)
 #define FACEFLG_HIDDEN   8
 
+struct BoneIndices
+{
+  int16_t x, y, z, w;
+  BoneIndices() = default;
+  BoneIndices(int16_t ix, int16_t iy, int16_t iz, int16_t iw) : x(ix), y(iy), z(iz), w(iw) {}
+  bool operator==(const BoneIndices &rhs) const = default;
+  BoneIndices operator-(const BoneIndices &rhs)
+  {
+    BoneIndices res;
+    res.x = x - rhs.x;
+    res.y = y - rhs.y;
+    res.z = z - rhs.z;
+    res.w = w - rhs.w;
+    return res;
+  }
+};
+
+inline float lengthSq(const BoneIndices &a) { return (float)a.x * a.x + (float)a.y * a.y + (float)a.z * a.z + (float)a.w * a.w; }
+
 class MeshData
 {
 public:
@@ -147,6 +166,7 @@ public:
     CHT_FLOAT3,
     CHT_FLOAT4,
     CHT_E3DCOLOR,
+    CHT_SHORT4
   };
 
   struct ExtraChannel
@@ -228,8 +248,8 @@ public:
   void kill_unused_verts(float sqThreshold = -1.0);
   // remove degenerate faces (faces with two or more equal vertex indices) and faces which doubled square area is less then this
   void kill_bad_faces(float face_area_threshold = 1e-20f);
-  // remove degenerates by face's area and perimeter to area ratio
-  void kill_bad_faces2(float fa_thresh, float fa_to_check_thresh, float fa_to_perim_ratio_thresh);
+  // remove degenerates by face's area and perimeter to doubled area ratio
+  void kill_sliver_faces(float fa_thresh, float perim_to_2fa_ratio_thresh);
   // optimize mapping by removing unused texture coordinate vertices
   // and welding equal ones with squared threshold sqThreshold. If sqThreshold<0 - do not weld
   void optimize_tverts(float sqThreshold = 0.0);

@@ -14,6 +14,7 @@
 class IMemAlloc;
 class String;
 class IGenSave;
+class GlobalSharedMemStorage;
 
 struct VirtualRomFsData;
 struct VirtualRomFsPack;
@@ -31,7 +32,7 @@ struct VirtualRomFsDataHdr
   unsigned fullSz;
   unsigned hw32;
 
-  unsigned packedSz() const { return hw32 & 0x3FFFFFFU; }
+  unsigned packedSz() const { return hw32 & 0x3FFFFFFFU; }
   bool zstdPacked() const { return (hw32 & 0x40000000U) != 0; }
   bool signedContents() const { return (hw32 & 0x80000000U) != 0; }
 };
@@ -89,6 +90,9 @@ struct VirtualRomFsPack : public VirtualRomFsData
     vromfs_user_get_file_data_t getData = NULL;
     void *getDataArg = NULL;
     VirtualRomFsSingleFile *resolvedFilesLinkedList = NULL;
+    // off-main resolves of this pack that dropped the vromfs read lock across the web wait;
+    // an unmount waits for it to reach 0 before the pack is freed (see vromfs.cpp)
+    volatile int resolvesInFlight = 0;
   };
 
   int hdrSz;
@@ -178,9 +182,12 @@ typedef VromfsSignatureCheckerPtr (*signature_checker_factory_cb)();
 KRNLIMP bool check_vromfs_dump_signature(VromfsSignatureChecker &checker, const VromfsDumpSections &vfsdump,
   const dag::ConstSpan<uint8_t> *to_verify = NULL);
 
-//! loads vromfs dump from file into memory (to be released with mem->free(fs))
+//! loads vromfs dump from file into memory (to be released with release_vromfs(fs, mem));
+//! if allow_shared_mem=true, fs may be shared via set_vromfs_shared_mem_storage().
+//! checker_cb/to_verify always run in full, but only for the process that actually decompresses the vrom;
+//! others trust its already-shared data
 KRNLIMP VirtualRomFsData *load_vromfs_dump(const char *fname, IMemAlloc *mem, signature_checker_factory_cb checker_cb = NULL,
-  const dag::ConstSpan<uint8_t> *to_verify = NULL, int file_flags = 0);
+  const dag::ConstSpan<uint8_t> *to_verify = NULL, int file_flags = 0, bool allow_shared_mem = false);
 
 //! loads vromfs dump from cryped file into memory (to be released with mem->free(fs))
 KRNLIMP VirtualRomFsData *load_crypted_vromfs_dump(const char *fname, IMemAlloc *mem);
@@ -193,8 +200,22 @@ KRNLIMP bool android_get_asset_data(const char *asset_name, Tab<char> &out_stora
 KRNLIMP VirtualRomFsData *load_vromfs_from_asset(const char *asset_name, IMemAlloc *mem);
 #endif
 
-//! loads vromfs dump from memory into memory (to be released with mem->free(fs))
-KRNLIMP VirtualRomFsData *load_vromfs_dump_from_mem(dag::ConstSpan<char> data, IMemAlloc *mem);
+//! loads vromfs dump from memory into memory (to be released with release_vromfs(fs, mem));
+//! if shared_vrom_name != nullptr, vromfs may be shared via set_vromfs_shared_mem_storage(),
+//! keyed by "<shared_vrom_name>:<md5>" (the md5 already embedded in the dump, so data must
+//! be the whole serialized dump, not just the body);
+//! optional mtime, if non-negative, is assigned to fs->mtime before shared vromfs becomes read-only
+KRNLIMP VirtualRomFsData *load_vromfs_dump_from_mem(dag::ConstSpan<char> data, IMemAlloc *mem, const char *shared_vrom_name = nullptr,
+  int64_t mtime = -1);
+
+//! sets (or clears) the shared mem storage used by load_vromfs_dump()/load_vromfs_dump_from_mem()
+KRNLIMP void set_vromfs_shared_mem_storage(GlobalSharedMemStorage *sm);
+
+//! releases a VirtualRomFsData* returned by load_vromfs_dump()/load_vromfs_dump_from_mem():
+//! frees it (via mem->free() if mem is given, else using delete; mem must match what it was loaded with),
+//! unless shared-mem-backed (in which case it just drops the shared ref);
+//! always nulls vromfs afterwards, same as del_it()
+KRNLIMP void release_vromfs(VirtualRomFsData *&vromfs, IMemAlloc *mem = nullptr);
 
 //! allocates VirtualRomFsData for headers only and resolves vromfs data from unpacked dump without changing it
 //! returns vromfs object to access dump or nullptr on error;
@@ -233,6 +254,9 @@ KRNLIMP uint32_t get_vromfs_dump_version(const char *fname);
 KRNLIMP void add_vromfs(VirtualRomFsData *fs, bool insert_first = false, char *mount_path = 0);
 //! removes vromfs from list of active file systems; returns mount path (to be freed when needed)
 KRNLIMP char *remove_vromfs(VirtualRomFsData *fs);
+//! set the callback (cpujobs::release_done_jobs) that drives pending job completions while a
+//! main-thread unmount waits out in-flight off-main backed resolves; keeps this lib off cpujobs
+KRNLIMP void set_vromfs_backed_resolve_pump(void (*pump)());
 //! replaces vromfs by index (mount path remains the same); returns previously mounted vromfs for that index
 KRNLIMP VirtualRomFsData *replace_vromfs(int idx, VirtualRomFsData *fs);
 

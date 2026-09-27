@@ -2,8 +2,12 @@
 
 #include "state_field_framebuffer.h"
 #include "texture.h"
-#include "execution_context.h"
+#include "backend/context.h"
 #include "device_context.h"
+#include "backend/cmd/framebuffer.h"
+#include "globals.h"
+
+#include <supp/dag_math.h>
 
 namespace drv3d_vulkan
 {
@@ -20,10 +24,15 @@ void StateFieldFramebufferAttachment::applyTo(uint32_t index, FrontFramebufferSt
 {
   D3D_CONTRACT_ASSERTF(view.isRenderTarget || !image, "vulkan: trying to use non RT view for FB attachment");
   ImageViewState actualView = view;
-  if (image && image->getDescription().memFlags & Image::MEM_SWAPCHAIN)
-    actualView.setFormat(
-      state.swapchainSrgbWrite.data ? actualView.getFormat().getSRGBVariant() : actualView.getFormat().getLinearVariant());
-  ExecutionContext &ctx = target.getExecutionContext();
+  // note: we may use swapchainSrgbWrite here early only while there
+  // is no TEXCF_SRGBWRITE on backbuffer user visible texture, even when swapchainSrgbWrite is true
+  if (image && state.swapchainSrgbWrite.data)
+  {
+    const ImageDescription &dsc = image->getDescription();
+    if ((dsc.memFlags & Image::MEM_SWAPCHAIN) && (dsc.ici.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
+      actualView.setFormat(actualView.getFormat().getSRGBVariant());
+  }
+  BEContext &ctx = Backend::ctx;
 
   if (image)
     ctx.verifyResident(image);
@@ -34,7 +43,7 @@ void StateFieldFramebufferAttachment::applyTo(uint32_t index, FrontFramebufferSt
   FramebufferState &fbs = target.get<BackGraphicsState, BackGraphicsState>().framebufferState;
 
   // depth
-  if (index >= MRT_INDEX_DEPTH_STENCIL)
+  if (index == MRT_INDEX_DEPTH_STENCIL)
   {
     if (image)
     {
@@ -51,6 +60,24 @@ void StateFieldFramebufferAttachment::applyTo(uint32_t index, FrontFramebufferSt
       fbs.renderPassClass.depthStencilFormat = FormatStore(0);
       fbs.renderPassClass.depthSamples = UCHAR_MAX;
       fbs.frameBufferInfo.depthStencilAttachment = RenderPassClass::FramebufferDescription::AttachmentInfo();
+    }
+  }
+  else if (index >= MRT_INDEX_SHADING_RATE)
+  {
+    if (image)
+    {
+      fbs.renderPassClass.shadingRateAttachment = true;
+      fbs.renderPassClass.shadingRateAttachmentFormat = actualView.getFormat();
+      fbs.renderPassClass.shadingRateAttachmentSamples = image->getSampleCount();
+      fbs.frameBufferInfo.shadingRateAttachment =
+        RenderPassClass::FramebufferDescription::AttachmentInfo(image, image->getImageView(actualView), actualView);
+    }
+    else
+    {
+      fbs.renderPassClass.shadingRateAttachment = false;
+      fbs.renderPassClass.shadingRateAttachmentFormat = FormatStore(0);
+      fbs.renderPassClass.shadingRateAttachmentSamples = UCHAR_MAX;
+      fbs.frameBufferInfo.shadingRateAttachment = RenderPassClass::FramebufferDescription::AttachmentInfo();
     }
   }
   else
@@ -79,8 +106,7 @@ void StateFieldFramebufferAttachment::applyTo(uint32_t index, FrontFramebufferSt
 template <>
 void StateFieldFramebufferAttachment::transit(uint32_t index, FrontFramebufferStateStorage &, DeviceContext &target) const
 {
-  CmdSetFramebufferAttachment cmd{index, image, view};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetFramebufferAttachment>({index, image, view});
 }
 
 template <>
@@ -101,8 +127,7 @@ void StateFieldFramebufferReadOnlyDepth::applyTo(FrontFramebufferStateStorage &,
 template <>
 void StateFieldFramebufferReadOnlyDepth::transit(FrontFramebufferStateStorage &, DeviceContext &target) const
 {
-  CmdSetDepthStencilRWState cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetDepthStencilRWState>({data});
 }
 
 template <>
@@ -121,14 +146,28 @@ void StateFieldFramebufferClearColor::applyTo(FrontFramebufferStateStorage &, Ex
     fbs.colorClearValue[i].float32[1] = data.g / 255.f;
     fbs.colorClearValue[i].float32[2] = data.b / 255.f;
     fbs.colorClearValue[i].float32[3] = data.a / 255.f;
+
+    if (Globals::cfg.bits.brokenClearsOnNonLinearUAVRT)
+    {
+      auto &att = fbs.frameBufferInfo.colorAttachments[i];
+      bool isNonLinearViewOnLinearUAVImage =
+        att.img && att.view.getFormat().isSrgb && !att.img->getFormat().isSrgb && (att.img->getUsage() & VK_IMAGE_USAGE_STORAGE_BIT);
+      if (isNonLinearViewOnLinearUAVImage)
+      {
+        for (uint32_t c = 0; c < 3; ++c)
+        {
+          float v = fbs.colorClearValue[i].float32[c];
+          fbs.colorClearValue[i].float32[c] = v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+        }
+      }
+    }
   }
 }
 
 template <>
 void StateFieldFramebufferClearColor::transit(FrontFramebufferStateStorage &, DeviceContext &target) const
 {
-  CmdSetFramebufferClearColor cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetFramebufferClearColor>({data});
 }
 
 template <>
@@ -147,8 +186,7 @@ void StateFieldFramebufferClearDepth::applyTo(FrontFramebufferStateStorage &, Ex
 template <>
 void StateFieldFramebufferClearDepth::transit(FrontFramebufferStateStorage &, DeviceContext &target) const
 {
-  CmdSetFramebufferClearDepth cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetFramebufferClearDepth>({data});
 }
 
 template <>
@@ -167,8 +205,7 @@ void StateFieldFramebufferClearStencil::applyTo(FrontFramebufferStateStorage &, 
 template <>
 void StateFieldFramebufferClearStencil::transit(FrontFramebufferStateStorage &, DeviceContext &target) const
 {
-  CmdSetFramebufferClearStencil cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetFramebufferClearStencil>({data});
 }
 
 template <>
@@ -186,8 +223,7 @@ void StateFieldFramebufferSwapchainSrgbWrite::dumpLog(const FrontFramebufferStat
 template <>
 void StateFieldFramebufferSwapchainSrgbWrite::transit(FrontFramebufferStateStorage &, DeviceContext &target) const
 {
-  CmdSetFramebufferSwapchainSrgbWrite cmd{data};
-  target.dispatchCommandNoLock(cmd);
+  target.dispatchCmdNoLock<CmdSetFramebufferSwapchainSrgbWrite>({data});
 }
 
 template <>

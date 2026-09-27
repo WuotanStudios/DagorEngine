@@ -19,12 +19,24 @@ void ConvexHullComputerProcessing::calcSelectedComputer()
 
 void ConvexHullComputerProcessing::calcComputer(const ConvexComputerSettings &settings)
 {
+  if (!collisionRes)
+    return;
   dag::Vector<Point3_vec4> verts;
   dag::ConstSpan<CollisionNode> nodes = collisionRes->getAllNodes();
   float shrink = settings.shrink;
   for (const auto &refNode : settings.selectedNodes.refNodes)
   {
-    G_ASSERT_LOG(add_verts_from_node(nodes, refNode, verts), "Collision node not found: %s", refNode);
+    if (!add_verts_from_node(*collisionRes, nodes, refNode, verts))
+    {
+      // Missing/empty ref: abort so the hull is not silently computed with this node omitted.
+      // Also drop the previous hull -- render/save read selectedComputer after we return, so a
+      // stale one could be previewed or saved under the new settings (cf. selectedKdop.reset()).
+      logerr("Collision node not found or empty: %s", refNode);
+      selectedComputer.vertices.clear();
+      selectedComputer.faces.clear();
+      selectedComputer.edges.clear();
+      return;
+    }
   }
 
   if (!verts.empty())

@@ -1,7 +1,6 @@
 from "%darg/ui_imports.nut" import *
 from "json" import parse_json
-
-let { httpRequest, HTTP_SUCCESS, HTTP_FAILED, HTTP_ABORTED } = require("dagor.http")
+from "dagor.http" import httpRequest, HTTP_SUCCESS, HTTP_FAILED, HTTP_ABORTED
 
 const ASSERT_MSG = "provided value should be Monad"
 
@@ -78,8 +77,10 @@ function HttpPostTask(url, args=null) {
 
 let mkJsonHttpReq = @(apiUrl, onError, onSuccess) function(data=null, jsondata=null) {
   let params = data != null || jsondata!=null ? {} : null
-  if (data != null && params)
+  if (data && params) {
     params.data <- data
+    params.headers <- {"content-type" : "application/x-www-form-urlencoded"}
+  }
   if (jsondata && params)
     params.json <- jsondata
   HttpPostTask(apiUrl, params)

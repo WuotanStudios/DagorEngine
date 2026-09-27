@@ -1,6 +1,6 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#if _TARGET_PC_WIN
+#if _TARGET_PC_WIN | _TARGET_XBOX
 #include <windows.h>
 #endif
 
@@ -19,12 +19,12 @@
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_lock.h>
 #include "drv/3d/dag_resetDevice.h"
+#include <drv/3d/dag_shader.h>
 #include "drv_returnAddrStore.h"
+#include "drv_assert_defs.h"
 #include <util/dag_string.h>
 #include <util/dag_watchdog.h>
 
-#include <ioSys/dag_memIo.h>
-#include <memory/dag_framemem.h>
 #include <EASTL/algorithm.h>
 
 
@@ -188,6 +188,16 @@ void get_current_display_screen_mode(int &out_def_left, int &out_def_top, int &o
   }
 }
 
+static uint32_t get_window_style(WindowMode mode)
+{
+  uint32_t style = WS_POPUP;
+  if (mode == WindowMode::WINDOWED || mode == WindowMode::WINDOWED_RESIZABLE)
+    style |= WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_BORDER;
+  if (mode == WindowMode::WINDOWED_RESIZABLE)
+    style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
+  return style;
+}
+
 void get_current_main_window_rect(int &out_def_left, int &out_def_top, int &out_def_width, int &out_def_height)
 {
   out_def_left = 0;
@@ -201,6 +211,19 @@ void get_current_main_window_rect(int &out_def_left, int &out_def_top, int &out_
     return;
   }
   debug("get_current_display_screen_mode - GetWindowRect: %d,%d-%d,%d", rect.left, rect.top, rect.right, rect.bottom);
+  if (is_window_minimized())
+  {
+    int resW, resH;
+    get_unminimized_window_resolution(resW, resH);
+    debug("get_current_display_screen_mode - minimized window detected, adjust rect to use the last non-minimized resolution %dx%d",
+      resW, resH);
+    // After getting client area resolution, we need to account for window borders.
+    RECT refRect = {0, 0, resW, resH};
+    uint32_t winStyle = get_window_style(dgs_get_window_mode());
+    AdjustWindowRectEx(&refRect, winStyle, FALSE, WS_EX_APPWINDOW);
+    rect.right = rect.left + refRect.right - refRect.left;
+    rect.bottom = rect.top + refRect.bottom - refRect.top;
+  }
   out_def_left = rect.left;
   out_def_top = rect.top;
   out_def_width = rect.right - rect.left;
@@ -237,16 +260,10 @@ void get_render_window_settings(RenderWindowSettings &p, Driver3dInitCallback *c
   bool force_window_caption_visible = blk_video.getBool("force_window_caption_visible", false);
 
   RECT wr = {0}, cr = {0};
-  p.winStyle = WS_POPUP;
-  if (windowMode == WindowMode::WINDOWED || windowMode == WindowMode::WINDOWED_RESIZABLE)
-    p.winStyle |= WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_BORDER;
-  if (windowMode == WindowMode::WINDOWED_RESIZABLE)
-  {
-    p.winStyle |= WS_THICKFRAME | WS_MAXIMIZEBOX;
-    if (!win32_get_main_wnd() && isAutoResolution)
-      p.winStyle |= WS_MAXIMIZE; // In windowed resizable mode by default we use work area size. So it is better to use maximized
-                                 // window.
-  }
+  p.winStyle = get_window_style(windowMode);
+  if (windowMode == WindowMode::WINDOWED_RESIZABLE && !win32_get_main_wnd() && isAutoResolution)
+    p.winStyle |= WS_MAXIMIZE; // In windowed resizable mode by default we use work area size. So it is better to use maximized
+                               // window.
 
   if (windowMode == WindowMode::WINDOWED_FULLSCREEN ||
       (windowMode == WindowMode::FULLSCREEN_EXCLUSIVE && d3d::get_driver_code().is(d3d::dx12)))
@@ -267,6 +284,15 @@ void get_render_window_settings(RenderWindowSettings &p, Driver3dInitCallback *c
     wr.right = base_scr_left + base_scr_wdt;
     wr.bottom = base_scr_top + base_scr_hgt;
     cr = wr;
+  }
+  else if (windowMode == WindowMode::WINDOWED_RESIZABLE && win32_get_main_wnd() && is_current_main_window_maximized())
+  {
+    // If the resizable window is maximized then do not try to adjust the window's size to the requested client resolution
+    // because it will not work. It will result in a continuous device reset in every frame. Adjust the resolution instead.
+    GetWindowRect((HWND)win32_get_main_wnd(), &wr);
+    GetClientRect((HWND)win32_get_main_wnd(), &cr);
+    scr_wdt = cr.right - cr.left;
+    scr_hgt = cr.bottom - cr.top;
   }
   else if (windowMode != WindowMode::FULLSCREEN_EXCLUSIVE)
   {
@@ -325,9 +351,17 @@ void get_render_window_settings(RenderWindowSettings &p, Driver3dInitCallback *c
     {
       int dy = wr.top + 3;
       int dsz = scr_hgt - ((scr_hgt + dy) & ~0xF);
-      scr_hgt -= dsz;
-      wr.top -= dy;
-      wr.bottom -= dy + dsz;
+      if ((scr_hgt - dsz) > 0)
+      {
+        scr_hgt -= dsz;
+        wr.top -= dy;
+        wr.bottom -= dy + dsz;
+      }
+      else
+      {
+        wr.top -= dy;
+        wr.bottom -= dy;
+      }
     }
 
     cr.left = cr.top = 0; // -V1048
@@ -357,7 +391,7 @@ void get_render_window_settings(RenderWindowSettings &p, Driver3dInitCallback *c
 
 bool set_render_window_params(RenderWindowParams &p, const RenderWindowSettings &s)
 {
-  if (!p.rwnd)
+  if (!p.hwnd)
   {
     static wchar_t wcsbuf[2][256];
 
@@ -384,9 +418,9 @@ bool set_render_window_params(RenderWindowParams &p, const RenderWindowSettings 
 
     debug("window = %dx%d .. %dx%d", s.winRectLeft, s.winRectTop, s.winRectRight, s.winRectBottom);
 
-    p.hwnd = p.rwnd = CreateWindowExW(WS_EX_APPWINDOW, utf8_to_wcs(p.wcname, wcsbuf[0], 256), utf8_to_wcs(p.title, wcsbuf[1], 256),
-      s.winStyle, s.winRectLeft, s.winRectTop, s.winRectRight - s.winRectLeft, s.winRectBottom - s.winRectTop, NULL, NULL,
-      (HINSTANCE)p.hinst, NULL);
+    p.hwnd = CreateWindowExW(WS_EX_APPWINDOW, utf8_to_wcs(p.wcname, wcsbuf[0], 256), utf8_to_wcs(p.title, wcsbuf[1], 256), s.winStyle,
+      s.winRectLeft, s.winRectTop, s.winRectRight - s.winRectLeft, s.winRectBottom - s.winRectTop, NULL, NULL, (HINSTANCE)p.hinst,
+      NULL);
 
     if (!p.hwnd)
     {
@@ -419,9 +453,9 @@ bool set_render_window_params(RenderWindowParams &p, const RenderWindowSettings 
   }
   else if (!is_window_resizing_by_mouse())
   {
-    bool isVisible = IsWindowVisible((HWND)p.rwnd);
-    SetWindowLong((HWND)p.rwnd, GWL_STYLE, s.winStyle);
-    SetWindowPos((HWND)p.rwnd, HWND_TOP, s.winRectLeft, s.winRectTop, s.winRectRight - s.winRectLeft, s.winRectBottom - s.winRectTop,
+    bool isVisible = IsWindowVisible((HWND)p.hwnd);
+    SetWindowLong((HWND)p.hwnd, GWL_STYLE, s.winStyle);
+    SetWindowPos((HWND)p.hwnd, HWND_TOP, s.winRectLeft, s.winRectTop, s.winRectRight - s.winRectLeft, s.winRectBottom - s.winRectTop,
       isVisible ? SWP_SHOWWINDOW : 0); // don't change visibility for hidden windows
   }
 
@@ -584,32 +618,77 @@ DAGOR_NOINLINE void paint_window(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 }
 #endif
 
-static bool isHDRBlackListed(const DataBlock &blk, const char *name)
+#if _TARGET_XBOX
+// Xbox window is only an input sink; present is HWND-independent (PresentX), so its size is
+// irrelevant and the swapchain resolution is chosen by the driver, not by these settings.
+void get_render_window_settings(RenderWindowSettings &p, Driver3dInitCallback *)
+{
+  p.resolutionX = 1920;
+  p.resolutionY = 1080;
+  p.clientWidth = p.resolutionX;
+  p.clientHeight = p.resolutionY;
+  p.aspect = float(p.resolutionX) / float(p.resolutionY);
+  p.winRectLeft = p.winRectTop = 0;
+  p.winRectRight = p.resolutionX;
+  p.winRectBottom = p.resolutionY;
+  p.winStyle = WS_OVERLAPPEDWINDOW;
+}
+
+bool set_render_window_params(RenderWindowParams &p, const RenderWindowSettings &s)
+{
+  if (p.hwnd)
+    return true;
+
+  const char *className = p.wcname ? p.wcname : "DagorWindow";
+  WNDCLASSEXA wcex = {};
+  wcex.cbSize = sizeof(WNDCLASSEXA);
+  wcex.style = CS_HREDRAW | CS_VREDRAW;
+  wcex.lpfnWndProc = (WNDPROC)p.mainProc;
+  wcex.hInstance = (HINSTANCE)p.hinst;
+  wcex.lpszClassName = className;
+  wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+  if (!RegisterClassExA(&wcex))
+  {
+    int err = GetLastError();
+    if (err && err != ERROR_ALREADY_EXISTS && err != ERROR_CLASS_ALREADY_EXISTS)
+    {
+      D3D_ERROR("Can't register window class (%08X)", err);
+      return false;
+    }
+  }
+
+  p.hwnd = CreateWindowExA(0, className, p.title ? p.title : "Game", s.winStyle, CW_USEDEFAULT, CW_USEDEFAULT, s.resolutionX,
+    s.resolutionY, nullptr, nullptr, (HINSTANCE)p.hinst, nullptr);
+  if (!p.hwnd)
+  {
+    D3D_ERROR("Can't create window (%08X)", GetLastError());
+    return false;
+  }
+
+  ShowWindow((HWND)p.hwnd, p.ncmdshow);
+  return true;
+}
+#endif
+
+static bool isHDRBlackListed(const DataBlock &videoBlk, const char *name)
 {
   if (!name || name[0] == 0)
     return false;
   bool result = false;
-  dblk::iterate_params_by_name(blk, "hdrBlackList",
-    [&](int param_idx, auto, auto) { result |= strcmp(blk.getStr(param_idx), name) == 0; });
+  const DataBlock &blockedDevices = *videoBlk.getBlockByNameEx("hdrBlackList");
+  dblk::iterate_params_by_name(blockedDevices, "blocked",
+    [&](int param_idx, auto, auto) { result |= strcmp(blockedDevices.getStr(param_idx), name) == 0; });
   return result;
 }
 
 bool get_enable_hdr_from_settings(const char *name)
 {
   const DataBlock &blk_video = *dgs_get_settings()->getBlockByNameEx("video");
-  // directx/enableHdr should become deprecated in time
-#if _TARGET_IOS | _TARGET_TVOS
-  const char *drvName = "metal_ios";
-#elif _TARGET_PC_MACOSX
-  const char *drvName = "metal";
-#else
-  const char *drvName = "directx";
-#endif
+
   const DataBlock *hdrSupport = blk_video.getBlockByNameEx("hdrSupport");
   bool gameSupportsHDROnDriver = hdrSupport->getBool(d3d::get_driver_name(), true);
-  const DataBlock &blkDrv = *dgs_get_settings()->getBlockByNameEx(drvName);
-  return gameSupportsHDROnDriver && blk_video.getBool("enableHdr", blkDrv.getBool("enableHdr", false)) &&
-         !isHDRBlackListed(blkDrv, name);
+
+  return gameSupportsHDROnDriver && blk_video.getBool("enableHdr", false) && !isHDRBlackListed(blk_video, name);
 }
 
 bool get_hfr_preference_from_settings()
@@ -648,6 +727,19 @@ int drv_message_box(const char *utf8_text, const char *utf8_caption, int flags)
   return GUI_MB_CLOSE;
 }
 
+const char *to_string(ShaderStage stage)
+{
+  switch (stage)
+  {
+    case STAGE_CS: return "CS";
+    case STAGE_PS: return "PS";
+    case STAGE_VS: return "VS";
+    default: break;
+  }
+  G_ASSERT_FAIL("Unknown shader stage %d", eastl::to_underlying(stage));
+  return "UNKNOWN";
+}
+
 d3d::GpuAutoLock::GpuAutoLock()
 {
   BEFORE_LOCK();
@@ -655,3 +747,16 @@ d3d::GpuAutoLock::GpuAutoLock()
   AFTER_SUCCESSFUL_LOCK();
 }
 d3d::GpuAutoLock::~GpuAutoLock() { driver_command(Drv3dCommand::RELEASE_OWNERSHIP); }
+
+int get_presentation_interval_from_settings()
+{
+  if (const DataBlock *videoBlk = ::dgs_get_settings()->getBlockByNameEx("video"))
+  {
+    if (!videoBlk->getBool("vsync", false))
+      return 0;
+
+    return clamp(videoBlk->getInt("vsync_interval", 1), 1, 4);
+  }
+
+  return 0;
+}

@@ -4,7 +4,6 @@
 #define __SUPPRESS_BLK_VALIDATION 1
 #include <startup/dag_mainCon.inc.cpp>
 
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -55,7 +54,7 @@ int DagorWinMain(bool debugmode)
 {
   debug_enable_timestamps(false);
   printf("Dagor Unused Texture Checker\n"
-         "Copyright (C) Gaijin Games KFT, 2023\n");
+         "Copyright (C) Gaijin Games KFT, 2026\n");
 
   if (__argc < 2)
   {

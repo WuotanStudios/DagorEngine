@@ -4,8 +4,12 @@
 
 #include "gradientControlStandalone.h"
 #include <propPanel/commonWindow/colorDialog.h>
+#include <propPanel/control/menu.h>
+#include <propPanel/imguiHelper.h>
 #include "../c_constants.h"
 #include <math/dag_rectInt.h>
+#include <ioSys/dag_dataBlock.h>
+#include <libTools/util/blkUtil.h>
 
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>
@@ -19,11 +23,10 @@ namespace PropPanel
 
 TrackGradientButton::TrackGradientButton(WindowControlEventHandler *event_handler, E3DCOLOR color, bool moveable,
   GradientControlStandalone *owner, float _value) :
-  mEventHandler(event_handler), value(0)
+  mEventHandler(event_handler)
 {
   mOwner = owner;
-  value = _value > 1.0f ? 1.0f : _value;
-  value = value < 0.0f ? 0.0f : value;
+  value = clamp(_value, owner->getMinValue(), owner->getMaxValue());
   mColor = color;
   canMove = moveable;
   useful = true;
@@ -79,8 +82,8 @@ intptr_t TrackGradientButton::onDrag(int new_x, int new_y)
 
   if (canMove)
   {
-    float valueNew = (float)(new_x) / (float)(mOwner->getGradientDisplayWidth());
-    valueNew = (valueNew > 1.0f) ? 1.0f : (valueNew < 0.0f) ? 0.0f : valueNew;
+    const float valueNewNormalized = (float)(new_x) / (float)(mOwner->getGradientDisplayWidth());
+    const float valueNew = clamp(mOwner->getValueFromNormalized(valueNewNormalized), mOwner->getMinValue(), mOwner->getMaxValue());
 
     if (valueNew != value)
     {
@@ -116,14 +119,12 @@ void TrackGradientButton::markForDeletion()
   useful = false;
 }
 
-int TrackGradientButton::getPosInGradientDisplaySpace() const { return (getValue() * mOwner->getGradientDisplayWidth()); }
-
-void TrackGradientButton::setValue(float new_value)
+int TrackGradientButton::getPosInGradientDisplaySpace() const
 {
-  value = new_value;
-  value = value > 1.0f ? 1.0f : value;
-  value = value < 0.0f ? 0.0f : value;
+  return (mOwner->getNormalizedFromValue(value) * mOwner->getGradientDisplayWidth());
 }
+
+void TrackGradientButton::setValue(float new_value) { value = clamp(new_value, mOwner->getMinValue(), mOwner->getMaxValue()); }
 
 void TrackGradientButton::updateTooltipText()
 {
@@ -149,7 +150,7 @@ bool TrackGradientButton::updateImgui(const Point2 &view_offset, const Point2 &m
 
   for (int i = 0; i < my; ++i)
   {
-    int j = lerp(0, mx, i / (my - 1.0));
+    int j = lerp<float>(0, mx, i / (my - 1.0));
 
     drawList->AddLine(ImVec2(cur_pos.x - j, cur_pos.y - i) + view_offset, ImVec2(cur_pos.x + j, cur_pos.y - i) + view_offset, color);
   }
@@ -163,6 +164,29 @@ bool TrackGradientButton::updateImgui(const Point2 &view_offset, const Point2 &m
 
   return hovered;
 }
+
+namespace ContextMenu
+{
+enum
+{
+  COPY,
+  PASTE,
+};
+}
+
+class GradientControlContextMenuEventHandler : public IMenuEventHandler
+{
+public:
+  GradientControlContextMenuEventHandler(GradientControlStandalone &gradient_control) : gradientControl(gradient_control) {}
+  int onMenuItemClick(unsigned id) override
+  {
+    gradientControl.processContextMenu(id);
+    return 0;
+  }
+
+private:
+  GradientControlStandalone &gradientControl;
+};
 
 // -------------- Gradient ---------------------------
 
@@ -213,7 +237,6 @@ void GradientControlStandalone::draw()
   {
     E3DCOLOR startColor = mKeys[i]->getColorValue();
     E3DCOLOR endColor = mKeys[i + 1]->getColorValue();
-    E3DCOLOR color = startColor;
 
     float step[3];
     int w = mKeys[i + 1]->getPosInGradientDisplaySpace() - mKeys[i]->getPosInGradientDisplaySpace();
@@ -242,7 +265,8 @@ void GradientControlStandalone::draw()
   // draw current X value
   if (mCurValue)
   {
-    const ImVec2 leftTop(gradientDisplayStart.x + (gradientDisplaySize.x * mCurValue), gradientDisplayStart.y);
+    const float normalizedValue = getNormalizedFromValue(mCurValue);
+    const ImVec2 leftTop(gradientDisplayStart.x + (gradientDisplaySize.x * normalizedValue), gradientDisplayStart.y);
     const ImVec2 rightBottom(leftTop.x, leftTop.y + gradientDisplaySize.y - 1);
     const E3DCOLOR curColor = getColor(mCurValue);
     const int mid_value = (curColor.r + curColor.g + curColor.b) / 3;
@@ -265,18 +289,34 @@ void GradientControlStandalone::onLButtonDClick(float x_pos_in_canvas_space)
 
   mEventHandler->onWcChanging(windowBaseForEventHandler);
 
-  const float position = (x_pos_in_canvas_space - gradientDisplayStart.x) / ((float)gradientDisplaySize.x);
-  addKey(position, nullptr, /*check_distance = */ true);
+  const float normalizedPosition = (x_pos_in_canvas_space - gradientDisplayStart.x) / ((float)gradientDisplaySize.x);
+  addKey(getValueFromNormalized(normalizedPosition), nullptr, /*check_distance = */ true);
 
   mEventHandler->onWcChange(windowBaseForEventHandler);
 }
 
+void GradientControlStandalone::onRButtonDown()
+{
+  contextMenuEventHandler.reset(new GradientControlContextMenuEventHandler(*this));
+  contextMenu.reset(create_context_menu());
+  contextMenu->setEventHandler(contextMenuEventHandler.get());
+  contextMenu->addItem(ROOT_MENU_ITEM, ContextMenu::COPY, "Copy\tCtrl+C");
+  contextMenu->addItem(ROOT_MENU_ITEM, ContextMenu::PASTE, "Paste\tCtrl+V");
+  bool pasteEnabled = false;
+  if (const char *text = ImGui::GetClipboardText())
+  {
+    DataBlock blk;
+    dblk::load_text(blk, make_span(text, (int)strlen(text)), dblk::ReadFlag::ROBUST | dblk::ReadFlag::RESTORE_FLAGS);
+    pasteEnabled = blk.isValid() && !strcmp(blk.getStr("DataType", ""), "Gradient");
+  }
+  contextMenu->setEnabledById(ContextMenu::PASTE, pasteEnabled);
+}
 
 bool GradientControlStandalone::canRemove() { return (mKeys.size() > mMinPtCount); }
 
 void GradientControlStandalone::addKey(float position, E3DCOLOR *color, bool check_distance)
 {
-  if ((position < 0) || (position > 1))
+  if (position < minValue || position > maxValue)
     return;
 
   if (mKeys.size() >= mMaxPtCount)
@@ -292,7 +332,7 @@ void GradientControlStandalone::addKey(float position, E3DCOLOR *color, bool che
   // yet. Also what if there are a lot of keys and the property panel is narrow?
   if (check_distance)
   {
-    int posTest = position * gradientDisplaySize.x;
+    int posTest = getNormalizedFromValue(position) * gradientDisplaySize.x;
     for (int i = 0; i < mKeys.size(); i++)
     {
       if (abs(posTest - mKeys[i]->getPosInGradientDisplaySpace()) < _pxS(TRACK_GRADIENT_BUTTON_WIDTH))
@@ -315,14 +355,13 @@ void GradientControlStandalone::addKey(float position, E3DCOLOR *color, bool che
 
 E3DCOLOR GradientControlStandalone::getColor(float position)
 {
-  int x = position * gradientDisplaySize.x;
+  int x = getNormalizedFromValue(position) * gradientDisplaySize.x;
   int curX = 0;
 
   for (int i = 0; i < (int)mKeys.size() - 1; i++)
   {
     E3DCOLOR startColor = mKeys[i]->getColorValue();
     E3DCOLOR endColor = mKeys[i + 1]->getColorValue();
-    E3DCOLOR color = startColor;
 
     float step[3];
     int w = mKeys[i + 1]->getPosInGradientDisplaySpace() - mKeys[i]->getPosInGradientDisplaySpace();
@@ -380,7 +419,7 @@ void GradientControlStandalone::setValue(PGradient source)
 
   for (int i = 0; i < value.size(); i++)
   {
-    if ((value[i].position < 0) || (value[i].position > 1.0f))
+    if (value[i].position < minValue || value[i].position > maxValue)
       return;
   }
 
@@ -388,8 +427,9 @@ void GradientControlStandalone::setValue(PGradient source)
   cancelColorPickerShowRequest();
   mouseClickKeyIndex = -1;
 
-  TrackGradientButton *left = new TrackGradientButton(mEventHandler, value[0].color, false, this, 0);
-  TrackGradientButton *right = new TrackGradientButton(mEventHandler, (mCycled) ? value[0].color : value.back().color, false, this, 1);
+  TrackGradientButton *left = new TrackGradientButton(mEventHandler, value[0].color, false, this, minValue);
+  TrackGradientButton *right =
+    new TrackGradientButton(mEventHandler, (mCycled) ? value[0].color : value.back().color, false, this, maxValue);
 
   mKeys.push_back(left);
   mKeys.push_back(right);
@@ -401,7 +441,22 @@ void GradientControlStandalone::setValue(PGradient source)
 void GradientControlStandalone::setCurValue(float value) { mCurValue = value; }
 
 
-void GradientControlStandalone::setMinMax(int min, int max)
+void GradientControlStandalone::setMinMax(float min, float max)
+{
+  if (min <= max)
+  {
+    minValue = min;
+    maxValue = max;
+  }
+  else
+  {
+    minValue = max;
+    maxValue = min;
+  }
+}
+
+
+void GradientControlStandalone::setMinMaxPointCount(int min, int max)
 {
   mMinPtCount = min;
   mMaxPtCount = max;
@@ -434,14 +489,27 @@ void GradientControlStandalone::getValue(PGradient destGradient) const
   }
 }
 
+
+float GradientControlStandalone::getNormalizedFromValue(float value) const
+{
+  const float range = maxValue - minValue;
+  return range > 0.0f ? ((value - minValue) / range) : 0.0f;
+}
+
+float GradientControlStandalone::getValueFromNormalized(float normalized_value) const
+{
+  const float range = maxValue - minValue;
+  return minValue + (range * normalized_value);
+}
+
 void GradientControlStandalone::reset()
 {
   clear_all_ptr_items(mKeys);
   cancelColorPickerShowRequest();
   mouseClickKeyIndex = -1;
 
-  TrackGradientButton *left = new TrackGradientButton(mEventHandler, E3DCOLOR(255, 255, 255), false, this, 0);
-  TrackGradientButton *right = new TrackGradientButton(mEventHandler, E3DCOLOR(0, 0, 0), false, this, 1);
+  TrackGradientButton *left = new TrackGradientButton(mEventHandler, E3DCOLOR(255, 255, 255), false, this, minValue);
+  TrackGradientButton *right = new TrackGradientButton(mEventHandler, E3DCOLOR(0, 0, 0), false, this, maxValue);
 
   mKeys.push_back(left);
   mKeys.push_back(right);
@@ -456,6 +524,16 @@ void GradientControlStandalone::updateCycled(TrackGradientButton *button)
   int j = (i == 0) ? mKeys.size() - 1 : 0;
 
   mKeys[j]->setColorValue(mKeys[i]->getColorValue());
+}
+
+void GradientControlStandalone::processContextMenu(unsigned id)
+{
+  switch (id)
+  {
+    case ContextMenu::COPY: copyGradient(); break;
+    case ContextMenu::PASTE: pasteGradient(); break;
+    default: break;
+  }
 }
 
 void GradientControlStandalone::calculateSizes(int total_width, int total_height)
@@ -475,6 +553,35 @@ void GradientControlStandalone::cancelColorPickerShowRequest()
 {
   remove_delayed_callback(*this);
   showColorPickerForKeyIndex = -1;
+}
+
+void GradientControlStandalone::handleKeyPresses(unsigned canvas_id)
+{
+  if (mEventHandler && ImguiHelper::isKeyChordPressedOwned(ImGuiMod_Ctrl | ImGuiKey_C, canvas_id))
+    copyGradient();
+  else if (mEventHandler && ImguiHelper::isKeyChordPressedOwned(ImGuiMod_Ctrl | ImGuiKey_V, canvas_id))
+    pasteGradient();
+}
+
+void GradientControlStandalone::copyGradient()
+{
+  DataBlock blk;
+  mEventHandler->onWcClipboardCopy(nullptr, blk);
+
+  SimpleString text = blk_util::blkTextData(blk);
+  if (!text.empty())
+    ImGui::SetClipboardText(text);
+}
+
+void GradientControlStandalone::pasteGradient()
+{
+  if (const char *text = ImGui::GetClipboardText())
+  {
+    DataBlock blk;
+    dblk::load_text(blk, make_span(text, (int)strlen(text)), dblk::ReadFlag::ROBUST | dblk::ReadFlag::RESTORE_FLAGS);
+    if (blk.isValid())
+      mEventHandler->onWcClipboardPaste(nullptr, blk);
+  }
 }
 
 void GradientControlStandalone::onImguiDelayedCallback(void *user_data)
@@ -554,10 +661,18 @@ void GradientControlStandalone::updateImgui(int width, int height)
       mKeys[mouseClickKeyIndex]->onDrag(mousePosInCanvas.x, mousePosInCanvas.y);
     }
   }
-  else if (isHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left, canvasId))
+  else if (isHovered)
   {
-    onLButtonDClick(mousePosInCanvas.x);
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left, canvasId))
+      onLButtonDClick(mousePosInCanvas.x);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+      onRButtonDown();
+    else
+      handleKeyPresses(canvasId);
   }
+
+  if (contextMenu && !render_context_menu(*contextMenu))
+    contextMenu.reset();
 
   ImGui::PopID();
 }

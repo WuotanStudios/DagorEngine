@@ -3,10 +3,12 @@
 #include <assets/daBuildExpPluginChain.h>
 #include <assets/assetExporter.h>
 #include <libTools/pageAsg/asg_sysHelper.h>
+#include <3d/dag_texMgr.h>
 #include <ioSys/dag_dataBlock.h>
 #include <osApiWrappers/dag_direct.h>
 #include <util/dag_simpleString.h>
 #include <util/dag_string.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <debug/dag_log.h>
 #include <debug/dag_debug.h>
 
@@ -62,12 +64,11 @@ public:
     const char *p =
       appblk.getBlockByNameEx("assets")->getBlockByNameEx("build")->getBlockByNameEx("stateGraph")->getStr("cppOutDir", NULL);
     if (p)
-    {
-      sysHelper.sgOutDir = String(260, "%s/%s", appblk.getStr("appDir", "."), p);
-      ::dd_simplify_fname_c(sysHelper.sgOutDir);
-    }
+      sysHelper.sgOutDir = make_eff_app_relative_path(p);
 
     ::page_sys_hlp = &sysHelper;
+    if (first_managed_d3dres() == BAD_TEXTUREID)
+      enable_tex_mgr_mt(true, appblk.getInt("texMgrReserveTIDcount", 128 << 10));
     return true;
   }
   void __stdcall destroy() override

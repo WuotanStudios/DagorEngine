@@ -29,7 +29,11 @@ namespace event_log
 char net_assert_version[64] = "";
 
 const char *get_net_assert_version() { return net_assert_version; }
-void set_net_assert_version(const char *s) { strncpy(net_assert_version, s, sizeof(net_assert_version)); }
+void set_net_assert_version(const char *s)
+{
+  strncpy(net_assert_version, s, sizeof(net_assert_version));
+  net_assert_version[sizeof(net_assert_version) - 1] = '\0';
+}
 
 bool fatal_on_net_assert = false;
 
@@ -203,8 +207,11 @@ bool init(EventLogInitParams const &init_params)
   if (!id.empty())
     defaults::meta["system_id"] = id.c_str();
 
-  const debug_log_callback_t prevCb = debug_set_log_callback(netlog_handler);
-  interlocked_exchange_ptr(orig_debug_log, prevCb);
+  if (init_params.use_net_assert_log)
+  {
+    const debug_log_callback_t prevCb = debug_set_log_callback(netlog_handler);
+    interlocked_exchange_ptr(orig_debug_log, prevCb);
+  }
 
   return true;
 }

@@ -80,13 +80,25 @@ namespace das {
 #endif
     }
 
-    void MemoryModel::setInitialSize ( uint32_t size ) {
+    void MemoryModel::setInitialSize ( uint64_t size ) {
         initialSize = size;
     }
 
-    uint32_t MemoryModel::grow ( uint32_t si ) {
+    void MemoryModel::setTrackAllocations ( bool on ) {
+#if DAS_TRACK_ALLOCATIONS
+        DAS_ASSERTF(totalAllocated == 0 && bigStuff.empty() && shoe.depth() == 0,
+            "setTrackAllocations must be called before any allocation");
+        trackAllocations = on;
+        maxShoeAllocation = on ? 0u : uint32_t(DAS_MAX_SHOE_ALLOCATION);
+#else
+        (void)on;
+        DAS_ASSERTF(!on, "DAS_TRACK_ALLOCATIONS=0 at compile time, cannot enable at runtime");
+#endif
+    }
+
+    uint64_t MemoryModel::grow ( uint32_t si ) {
         if ( shoe.chunks[si] ) {
-            uint32_t size = shoe.chunks[si]->total;
+            uint64_t size = shoe.chunks[si]->total;
             if ( customGrow ) {
                 size = customGrow(size);
             } else {
@@ -97,55 +109,53 @@ namespace das {
             if ( !initialSize ) {
                 initialSize = default_initial_size;
             }
-            return initialSize / ((si+1)<<4); // fit in initial size
+            // Entry count for the first chunk of this size-class. 64-bit throughout
+            // (Deck::total and totalBytes are 64-bit), so no UINT32 clamp is needed.
+            return initialSize / ((uint64_t(si)+1)<<4);
         }
     }
 
-    char * MemoryModel::allocate ( uint32_t size ) {
+    char * MemoryModel::allocate ( uint64_t size ) {
         if ( !size ) return nullptr;
         size = (size + alignMask) & ~alignMask;
         totalAllocated += size;
         maxAllocated = das::max(maxAllocated, totalAllocated);
-#if !DAS_TRACK_ALLOCATIONS
-        if ( size > DAS_MAX_SHOE_ALLOCATION ) {
-#endif
+        if ( size > maxShoeAllocation ) {
             char * ptr = (char *) das_aligned_alloc16(size);
             bigStuff[ptr] = size;
 #if DAS_TRACK_ALLOCATIONS
-            INSCRIBE_INSANE_POINTER(ptr, this);
-            if ( g_tracker==g_breakpoint ) os_debug_break();
-            bigStuffId[ptr] = g_tracker ++;
+            if ( trackAllocations ) {
+                INSCRIBE_INSANE_POINTER(ptr, this);
+                if ( g_tracker==g_breakpoint ) os_debug_break();
+                bigStuffId[ptr] = g_tracker ++;
+            }
 #endif
             return ptr;
-#if !DAS_TRACK_ALLOCATIONS
         } else {
-            if ( char * res = shoe.allocate(size) ) {
+            if ( char * res = shoe.allocate(uint32_t(size)) ) {
                 return res;
             }
             size = (size + 15) & ~15;
             DAS_ASSERT(size && size<=DAS_MAX_SHOE_ALLOCATION);
-            uint32_t si = (size >> 4) - 1;
-            uint32_t total = grow(si);
-            shoe.chunks[si] = new Deck(total, size, shoe.chunks[si]);
+            uint32_t si = uint32_t((size >> 4) - 1);
+            uint64_t total = grow(si);
+            shoe.chunks[si] = new Deck(total, uint32_t(size), shoe.chunks[si]);
             return shoe.chunks[si]->allocate();
         }
-#endif
     }
 
-    bool MemoryModel::free ( char * ptr, uint32_t size ) {
+    bool MemoryModel::free ( char * ptr, uint64_t size ) {
         if ( !size ) return true;
         size = (size + alignMask) & ~alignMask;
 
 #if DAS_SANITIZER
         memset(ptr, 0xcd, size);
 #endif
-#if !DAS_TRACK_ALLOCATIONS
-        if ( size <= DAS_MAX_SHOE_ALLOCATION ) {
-            shoe.free(ptr, size);
+        if ( size <= maxShoeAllocation ) {
+            shoe.free(ptr, uint32_t(size));
             totalAllocated -= size;
             return true;
         }
-#endif
 #if DAS_SANITIZER
         auto itd = deletedBigStuff.find(ptr);
         if ( itd!= deletedBigStuff.end() ) {
@@ -154,7 +164,7 @@ namespace das {
 #endif
         auto itb = bigStuff.find(ptr);
         if ( itb!=bigStuff.end() ) {
-            DAS_ASSERTF(itb->second==size, "free size mismatch, %u allocated vs %u freed", itb->second, size );
+            DAS_ASSERTF(itb->second==size, "free size mismatch, %llu allocated vs %llu freed", (unsigned long long)itb->second, (unsigned long long)size );
 #if DAS_SANITIZER
             memset(ptr, 0xcd, size);
             deletedBigStuff[itb->first] = itb->second;
@@ -165,9 +175,11 @@ namespace das {
             bigStuff.erase(itb);
             totalAllocated -= size;
 #if DAS_TRACK_ALLOCATIONS
-            bigStuffId.erase(ptr);
-            bigStuffAt.erase(ptr);
-            bigStuffComment.erase(ptr);
+            if ( trackAllocations ) {
+                bigStuffId.erase(ptr);
+                bigStuffAt.erase(ptr);
+                bigStuffComment.erase(ptr);
+            }
 #endif
             return true;
         }
@@ -175,21 +187,28 @@ namespace das {
         return false;
     }
 
-    char * MemoryModel::reallocate ( char * ptr, uint32_t size, uint32_t nsize ) {
+    char * MemoryModel::reallocate ( char * ptr, uint64_t size, uint64_t nsize ) {
         if ( !ptr ) return allocate(nsize);
         size = (size + alignMask) & ~alignMask;
         nsize = (nsize + alignMask) & ~alignMask;
         char * nptr = allocate(nsize);
-        DAS_VERIFYF(nptr,"out of memory?");
+        // Fail the way allocate() does — by returning null. Context::reallocate
+        // already turns that into throw_out_of_memory, so the caller gets a real
+        // daslang error naming the request size. Asserting here instead reached
+        // neither: it fired before the null could propagate, so an out-of-memory
+        // during array growth could never be reported or recovered, only aborted.
+        if ( !nptr ) return nullptr;
         memcpy ( nptr, ptr, das::min(size,nsize) );
 #if DAS_TRACK_ALLOCATIONS
-        auto pAt = bigStuffAt.find(ptr);
-        if ( pAt != bigStuffAt.end() ) {
-            bigStuffAt[nptr] = pAt->second;
-        }
-        auto pCm = bigStuffComment.find(ptr);
-        if ( pCm != bigStuffComment.end() ) {
-            bigStuffComment[nptr] = pCm->second;
+        if ( trackAllocations ) {
+            auto pAt = bigStuffAt.find(ptr);
+            if ( pAt != bigStuffAt.end() ) {
+                bigStuffAt[nptr] = pAt->second;
+            }
+            auto pCm = bigStuffComment.find(ptr);
+            if ( pCm != bigStuffComment.end() ) {
+                bigStuffComment[nptr] = pCm->second;
+            }
         }
 #endif
         free(ptr, size);
@@ -208,11 +227,32 @@ namespace das {
         }
         bigStuff.clear();
 #if DAS_TRACK_ALLOCATIONS
-        bigStuffId.clear();
-        bigStuffAt.clear();
-        bigStuffComment.clear();
+        if ( trackAllocations ) {
+            bigStuffId.clear();
+            bigStuffAt.clear();
+            bigStuffComment.clear();
+        }
 #endif
         shoe.reset();
+    }
+
+    void MemoryModel::shrink() {
+        if constexpr (has_shrink_to_fit<decltype(bigStuff)>::value) {
+            bigStuff.shrink_to_fit();
+        }
+#if DAS_TRACK_ALLOCATIONS
+        if ( trackAllocations ) {
+            if constexpr (has_shrink_to_fit<decltype(bigStuffId)>::value) {
+                bigStuffId.shrink_to_fit();
+            }
+            if constexpr (has_shrink_to_fit<decltype(bigStuffAt)>::value) {
+                bigStuffAt.shrink_to_fit();
+            }
+            if constexpr (has_shrink_to_fit<decltype(bigStuffComment)>::value) {
+                bigStuffComment.shrink_to_fit();
+            }
+        }
+#endif
     }
 
     uint64_t MemoryModel::totalAlignedMemoryAllocated() const {
@@ -225,26 +265,32 @@ namespace das {
 
     void MemoryModel::sweep() {
         totalAllocated = 0;
-#if !DAS_TRACK_ALLOCATIONS
+        // When trackAllocations is on, maxShoeAllocation==0, so no shoe chunks exist
+        // and this loop is naturally a no-op (chunks[si] is always nullptr).
         for ( uint32_t si=0; si!=DAS_MAX_SHOE_CUNKS; ++si ) {   // we re-track all small allocations
             for ( auto ch=shoe.chunks[si]; ch; ch=ch->next ) {
                 ch->afterGC();
-                uint32_t utotal = ch->total / 32;
-                for ( uint32_t i=0; i!=utotal; ++i ) {
+                uint64_t utotal = ch->total / 32;
+#if DAS_SANITIZER
+                for ( uint64_t i=0; i!=utotal; ++i ) {
                     uint32_t b = ch->bits[i];
-                    for ( uint32_t j=0; j!=32; ++j ) {          // TODO: this is COUNTBITS * size
+                    for ( uint32_t j=0; j!=32; ++j ) {
                         if ( b & (1<<j) ) {
                             totalAllocated += ch->size;
                         } else {
-#if DAS_SANITIZER
                             memset ( ch->data + (i*32+j)*ch->size, 0xcd, ch->size );
-#endif
                         }
                     }
                 }
+#else
+                uint64_t live = 0;                              // popcount instead of per-bit scan
+                for ( uint64_t i=0; i!=utotal; ++i ) {
+                    live += das_popcount(ch->bits[i]);
+                }
+                totalAllocated += live * ch->size;
+#endif
             }
         }
-#endif
         for ( auto it = bigStuff.begin(); it!=bigStuff.end() ; ) {
             if ( it->second & DAS_PAGE_GC_MASK ) {
                 it->second &= ~DAS_PAGE_GC_MASK;
@@ -263,7 +309,7 @@ namespace das {
         }
     }
 
-    char * LinearChunkAllocator::reallocate ( char * ptr, uint32_t size, uint32_t nsize ) {
+    char * LinearChunkAllocator::reallocate ( char * ptr, uint64_t size, uint64_t nsize ) {
         if ( !ptr ) return allocate(nsize);
         size = (size + alignMask) & ~alignMask;
         nsize = (nsize + alignMask) & ~alignMask;
@@ -274,7 +320,7 @@ namespace das {
         return nptr;
     }
 
-    void LinearChunkAllocator::free ( char * ptr, uint32_t s ) {
+    void LinearChunkAllocator::free ( char * ptr, uint64_t s ) {
         s = (s + alignMask) & ~alignMask;
         for ( auto ch=chunk; ch; ch=ch->next ) {
             if ( ch->isOwnPtr(ptr) ) {
@@ -284,38 +330,65 @@ namespace das {
         }
     }
 
-    uint32_t LinearChunkAllocator::grow ( uint32_t size ) {
+    uint64_t LinearChunkAllocator::grow ( uint64_t size ) {
         return customGrow ? customGrow(size) : size * 2;
     }
 
-    char * LinearChunkAllocator::allocate ( uint32_t s ) {
+    char * LinearChunkAllocator::allocate ( uint64_t s ) {
         if ( !s ) return nullptr;
         s = (s + alignMask) & ~alignMask;
+#if SIZE_MAX < UINT64_MAX
+        // 32-bit: no size_t allocation can back a >SIZE_MAX request. Fail it as OOM here and cap
+        // chunk sizes below — otherwise HeapChunk's das_aligned_alloc16(size_t) truncates the malloc
+        // while HeapChunk::size records the full uint64, handing out unbacked memory. The cap is
+        // 16-aligned so HeapChunk's own round-up can't push it past SIZE_MAX.
+        const uint64_t chunkCap = uint64_t(SIZE_MAX) & ~uint64_t(15);
+        if ( s > chunkCap ) return nullptr;
+        auto capChunk = [&]( uint64_t sz ) { return das::min(chunkCap, sz); };
+#else
+        auto capChunk = []( uint64_t sz ) { return sz; };
+#endif
         if ( !chunk ) {
             if ( !initialSize ) {
                 initialSize = default_initial_size;
             }
-            chunk = new HeapChunk ( das::max(initialSize, s), nullptr );
-            // printf("[HC] %i\n", chunk->size);
+            chunk = new HeapChunk ( capChunk(das::max(initialSize, s)), nullptr );
+            if ( !chunk->data ) {   // backing malloc failed: fail as OOM, don't install a dead chunk
+                delete chunk;
+                chunk = nullptr;
+                return nullptr;
+            }
         }
         for ( ;; ) {
             if ( char * res = chunk->allocate(s) ) {
-                // printf("[A] %i bytes, offs=%i\n", int(s), int(res-chunk->data));
                 return res;
             }
-            chunk = new HeapChunk ( das::max(grow(chunk->size), s), chunk);
-            // printf("[HC] %i bytes\n", chunk->size);
+            auto nc = new HeapChunk ( capChunk(das::max(grow(chunk->size), s)), chunk);
+            if ( !nc->data ) {      // backing malloc failed: OOM, not an excuse to spin the grow loop
+                nc->next = nullptr; // detach — ~HeapChunk would otherwise free the whole live chain
+                delete nc;
+                return nullptr;
+            }
+            chunk = nc;
         }
     }
 
     void LinearChunkAllocator::reset() {
         if ( chunk && chunk->next ) {
-            auto maxAllocated = (uint32_t(bytesAllocated())+1023) & ~1023;
+            auto maxAllocated = (bytesAllocated()+1023) & ~uint64_t(1023);
             initialSize = das::max(initialSize, maxAllocated);
             delete chunk;
             chunk = nullptr;
         } else if ( chunk ) {
             chunk->offset = 0;
+        }
+    }
+
+    void LinearChunkAllocator::shrink() {
+        initialSize = unadjustedInitialSize;
+        if ( chunk && !chunk->next && chunk->offset==0 ) {
+            delete chunk;
+            chunk = nullptr;
         }
     }
 

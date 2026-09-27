@@ -10,10 +10,6 @@
 #include <signal.h>
 #include <vromfsPacker/vromfsPacker.h>
 
-size_t dagormem_max_crt_pool_sz = 256 << 20;
-size_t dagormem_first_pool_sz = 512 << 20;
-size_t dagormem_next_pool_sz = 256 << 20;
-
 
 static void __cdecl ctrl_break_handler(int) { quit_game(0); }
 
@@ -43,7 +39,7 @@ int DagorWinMain(bool debugmode)
   debug_enable_timestamps(false);
   if (!dgs_get_argv("dumpver"))
     printf("Virtual ROM file system (vromfs) pack builder v1.96\n%s\n",
-      !::dgs_execute_quiet ? "Copyright (C) Gaijin Games KFT, 2023\n" : "");
+      !::dgs_execute_quiet ? "Copyright (C) Gaijin Games KFT, 2026\n" : "");
 
   signal(SIGINT, ctrl_break_handler);
 

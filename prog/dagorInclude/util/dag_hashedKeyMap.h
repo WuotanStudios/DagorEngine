@@ -8,6 +8,7 @@
 #include <EASTL/unique_ptr.h>
 #include <hash/wyhash.h>
 #include <debug/dag_assert.h>
+#include <util/dag_compilerDefs.h>
 
 // this is simple Open Addressing hash table with separated (hashed, integral type) keys and values map. Keys==EmptyKey Key(), are
 // special and not allowed although that results in two cache miss in a case of hit, it also allows keys to be of a different size than
@@ -191,7 +192,7 @@ struct DefaultValCB
 
 template <class Key, class Value, Key EmptyKey = Key(), class Hasher = oa_hashmap_util::NoHash<Key>,
   class allocator_type = EASTLAllocatorType, int load_factor_nom = 3, int load_factor_denom = 4>
-struct HashedKeyMap
+struct DAGOR_WARN_IF_UNUSED HashedKeyMap
 {
   typedef Key key_t;
   typedef Value val_t;
@@ -210,7 +211,9 @@ struct HashedKeyMap
     if (DAGOR_UNLIKELY(used >= mask * load_factor_nom / load_factor_denom))
       rehash(oa_hashmap_util::max(4, mask + mask + 2));
     bool emplacedNew = false;
-    new (vals + oa_hashmap_util::emplace<key_t, EmptyKey, Hasher>(key, keys.first(), mask, emplacedNew), _NEW_INPLACE) val_t(val);
+    auto id = oa_hashmap_util::emplace<key_t, EmptyKey, Hasher>(key, keys.first(), mask, emplacedNew);
+    if (emplacedNew)
+      new (vals + id, _NEW_INPLACE) val_t(val);
     used += uint32_t(emplacedNew);
     return emplacedNew;
   }
@@ -222,7 +225,10 @@ struct HashedKeyMap
     bool emplacedNew = false;
     auto id = oa_hashmap_util::emplace<key_t, EmptyKey, Hasher>(key, keys.first(), mask, emplacedNew);
     used += uint32_t(emplacedNew);
-    return eastl::pair<val_t *, bool>{vals + id, emplacedNew};
+    auto v = vals + id;
+    if (emplacedNew)
+      new (v, _NEW_INPLACE) val_t();
+    return eastl::pair<val_t *, bool>{v, emplacedNew};
   }
   void emplace_new(key_t key, const val_t &val) // that's unsafe emplace, it requires that key hasn't been added before
   {
@@ -380,20 +386,41 @@ struct HashedKeyMap
   }
 
   template <typename Cb>
-  void iterate(Cb cb)
+  void iterate(Cb cb, size_t from = 0)
   {
-    val_t *v = vals;
-    for (const key_t *i = keys.first(), *e = i + bucket_count(); i != e; ++i, ++v)
+    val_t *v = vals + from;
+    for (const key_t *i = keys.first() + from, *e = keys.first() + bucket_count(); i < e; ++i, ++v)
       if (*i != EmptyKey)
         cb(*i, *v);
   }
   template <typename Cb>
-  void iterate(Cb cb) const
+  void iterate(Cb cb, size_t from = 0) const
   {
-    const val_t *v = vals;
-    for (const key_t *i = keys.first(), *e = i + bucket_count(); i != e; ++i, ++v)
+    const val_t *v = vals + from;
+    for (const key_t *i = keys.first() + from, *e = keys.first() + bucket_count(); i < e; ++i, ++v)
       if (*i != EmptyKey)
         cb(*i, *v);
+  }
+
+  template <typename Cb>
+  size_t iterate_until(Cb cb, size_t from = 0)
+  {
+    val_t *v = vals + from;
+    for (const key_t *i = keys.first() + from, *e = keys.first() + bucket_count(); i < e; ++i, ++v)
+      if (*i != EmptyKey)
+        if (cb(*i, *v))
+          return i - keys.first();
+    return bucket_count();
+  }
+  template <typename Cb>
+  size_t iterate_until(Cb cb, size_t from = 0) const
+  {
+    const val_t *v = vals + from;
+    for (const key_t *i = keys.first() + from, *e = keys.first() + bucket_count(); i < e; ++i, ++v)
+      if (*i != EmptyKey)
+        if (cb(*i, *v))
+          return i - keys.first();
+    return bucket_count();
   }
 
 protected:
@@ -478,7 +505,7 @@ public:
 
 template <class Key, Key EmptyKey = Key(), class Hasher = oa_hashmap_util::NoHash<Key>, class allocator_type = EASTLAllocatorType,
   int load_factor_nom = 3, int load_factor_denom = 4>
-struct HashedKeySet
+struct DAGOR_WARN_IF_UNUSED HashedKeySet
 {
   typedef Key key_t;
   typedef HashedKeySet<Key, EmptyKey, Hasher, allocator_type, load_factor_nom, load_factor_denom> this_type_t;

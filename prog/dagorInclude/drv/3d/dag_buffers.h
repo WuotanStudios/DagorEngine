@@ -11,6 +11,8 @@
 #include <drv/3d/dag_decl.h>
 #include <drv/3d/dag_tex3d.h>
 #include <drv/3d/dag_resourceChecker.h>
+#include <drv/3d/dag_multi_interface.h>
+#include <3d/dag_resourceTags.h>
 
 /**
  * @brief The Sbuffer class represents a buffer used for 3D rendering.
@@ -119,7 +121,7 @@ public:
    * @param dest The destination buffer.
    * @param dst_ofs_bytes The offset in bytes from the beginning of the destination buffer.
    * @param src_ofs_bytes The offset in bytes from the beginning of the source buffer.
-   * @param size_bytes The size in bytes of the portion to copy.
+   * @param size_bytes The size in bytes of the portion to copy. If 0, nothing is copied.
    * @return true if the buffer was successfully copied, false otherwise.
    */
   virtual bool copyTo(Sbuffer *dest, uint32_t dst_ofs_bytes, uint32_t src_ofs_bytes, uint32_t size_bytes)
@@ -224,7 +226,7 @@ public:
   }
 };
 
-namespace d3d
+namespace d3d _MULTI_INTERFACE
 {
 /**
  * @brief Creates a buffer with the specified parameters.
@@ -240,14 +242,15 @@ namespace d3d
  * @param name The name of the buffer.
  * @return A pointer to the created buffer.
  */
-Sbuffer *create_sbuffer(int struct_size, int elements, unsigned flags, unsigned texfmt, const char *name);
+Sbuffer *create_sbuffer(int struct_size, int elements, unsigned flags, unsigned texfmt, const char *name,
+  ResourceTagType tag = nullptr);
 
 /**
- * @brief Sets an Sbuffer for a specific shader stage and slot.
+ * @brief Binds an Sbuffer as a shader resource (SRV) for a specific shader stage and slot.
  *
  * @param shader_stage The shader stage to set the buffer for. One of STAGE_ values.
- * @param slot The slot to bind the buffer to.
- * @param buffer A pointer to the Sbuffer to set.
+ * @param slot The slot to bind the buffer to. Must be less than the platform SRV slot count (32).
+ * @param buffer A pointer to the Sbuffer to set. When non-null it must have SBCF_BIND_SHADER_RES.
  * @return True if the buffer was successfully set, false otherwise.
  */
 bool set_buffer(unsigned shader_stage, unsigned slot, Sbuffer *buffer);
@@ -262,7 +265,7 @@ bool set_buffer(unsigned shader_stage, unsigned slot, Sbuffer *buffer);
  */
 bool set_rwbuffer(unsigned shader_stage, unsigned slot, Sbuffer *buffer);
 
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 /*!
  * \file
@@ -299,6 +302,11 @@ enum class Indirect : uint32_t
   Dispatch,
   Draw,
   DrawIndexed,
+  DrawWithDrawId,
+  DrawIndexedWithDrawId,
+  DispatchComputeAsRayGen,
+  DispatchMesh,
+  DispatchMeshWithDrawId
 };
 
 
@@ -357,9 +365,9 @@ inline uint32_t cb_struct_reg_count()
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return Created persistent constant buffer.
  */
-inline Sbuffer *create_persistent_cb(uint32_t registers_count, const char *name)
+inline Sbuffer *create_persistent_cb(uint32_t registers_count, const char *name, ResourceTagType tag = nullptr)
 {
-  return d3d::create_sbuffer(CBUFFER_REGISTER_SIZE, registers_count, SBCF_CB_PERSISTENT, 0, name);
+  return d3d::create_sbuffer(CBUFFER_REGISTER_SIZE, registers_count, SBCF_CB_PERSISTENT, 0, name, tag);
 }
 
 /**
@@ -374,9 +382,9 @@ inline Sbuffer *create_persistent_cb(uint32_t registers_count, const char *name)
  * \param buffer_init The initialization option for the buffer.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_one_frame_cb(uint32_t registers_count, const char *name)
+inline Sbuffer *create_one_frame_cb(uint32_t registers_count, const char *name, ResourceTagType tag = nullptr)
 {
-  return d3d::create_sbuffer(CBUFFER_REGISTER_SIZE, registers_count, SBCF_CB_ONE_FRAME, 0, name);
+  return d3d::create_sbuffer(CBUFFER_REGISTER_SIZE, registers_count, SBCF_CB_ONE_FRAME, 0, name, tag);
 }
 
 /*!
@@ -390,10 +398,11 @@ inline Sbuffer *create_one_frame_cb(uint32_t registers_count, const char *name)
  * \param buffer_init The initialization option for the buffer.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_ua_sr_byte_address(uint32_t size_in_dwords, const char *name, Init buffer_init = Init::No)
+inline Sbuffer *create_ua_sr_byte_address(uint32_t size_in_dwords, const char *name, Init buffer_init = Init::No,
+  ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(BYTE_ADDRESS_ELEMENT_SIZE, size_in_dwords,
-    SBCF_UA_SR_BYTE_ADDRESS | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name);
+    SBCF_UA_SR_BYTE_ADDRESS | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name, tag);
 }
 
 /**
@@ -409,10 +418,10 @@ inline Sbuffer *create_ua_sr_byte_address(uint32_t size_in_dwords, const char *n
  * \return A pointer to the created buffer.
  */
 inline Sbuffer *create_ua_sr_structured(uint32_t structure_size, uint32_t elements_count, const char *name,
-  Init buffer_init = Init::No)
+  Init buffer_init = Init::No, ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(structure_size, elements_count, SBCF_UA_SR_STRUCTURED | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0,
-    name);
+    name, tag);
 }
 
 
@@ -426,9 +435,9 @@ inline Sbuffer *create_ua_sr_structured(uint32_t structure_size, uint32_t elemen
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_ua_byte_address(uint32_t size_in_dwords, const char *name)
+inline Sbuffer *create_ua_byte_address(uint32_t size_in_dwords, const char *name, ResourceTagType tag = nullptr)
 {
-  return d3d::create_sbuffer(BYTE_ADDRESS_ELEMENT_SIZE, size_in_dwords, SBCF_UA_BYTE_ADDRESS, 0, name);
+  return d3d::create_sbuffer(BYTE_ADDRESS_ELEMENT_SIZE, size_in_dwords, SBCF_UA_BYTE_ADDRESS, 0, name, tag);
 }
 
 /**
@@ -440,9 +449,9 @@ inline Sbuffer *create_ua_byte_address(uint32_t size_in_dwords, const char *name
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_ua_structured(uint32_t structure_size, uint32_t elements_count, const char *name)
+inline Sbuffer *create_ua_structured(uint32_t structure_size, uint32_t elements_count, const char *name, ResourceTagType tag = nullptr)
 {
-  return d3d::create_sbuffer(structure_size, elements_count, SBCF_UA_STRUCTURED, 0, name);
+  return d3d::create_sbuffer(structure_size, elements_count, SBCF_UA_STRUCTURED, 0, name, tag);
 }
 
 /**
@@ -455,10 +464,11 @@ inline Sbuffer *create_ua_structured(uint32_t structure_size, uint32_t elements_
  * \param buffer_init The initialization option for the buffer.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_ua_byte_address_readback(uint32_t size_in_dwords, const char *name, Init buffer_init = Init::No)
+inline Sbuffer *create_ua_byte_address_readback(uint32_t size_in_dwords, const char *name, Init buffer_init = Init::No,
+  ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(BYTE_ADDRESS_ELEMENT_SIZE, size_in_dwords,
-    SBCF_UA_BYTE_ADDRESS_READBACK | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name);
+    SBCF_UA_BYTE_ADDRESS_READBACK | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name, tag);
 }
 
 
@@ -472,10 +482,10 @@ inline Sbuffer *create_ua_byte_address_readback(uint32_t size_in_dwords, const c
  * \return A pointer to the created buffer.
  */
 inline Sbuffer *create_ua_structured_readback(uint32_t structure_size, uint32_t elements_count, const char *name,
-  Init buffer_init = Init::No)
+  Init buffer_init = Init::No, ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(structure_size, elements_count,
-    SBCF_UA_STRUCTURED_READBACK | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name);
+    SBCF_UA_STRUCTURED_READBACK | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name, tag);
 }
 
 
@@ -486,16 +496,26 @@ inline Sbuffer *create_ua_structured_readback(uint32_t structure_size, uint32_t 
  *
  * \return The amount of dwords per indirect command parameters.
  */
-inline uint32_t dword_count_per_call(Indirect indirect_type)
+constexpr inline uint32_t dword_count_per_call(Indirect indirect_type)
 {
   switch (indirect_type)
   {
     case Indirect::Dispatch: return DISPATCH_INDIRECT_NUM_ARGS;
     case Indirect::Draw: return DRAW_INDIRECT_NUM_ARGS;
     case Indirect::DrawIndexed: return DRAW_INDEXED_INDIRECT_NUM_ARGS;
+    case Indirect::DrawWithDrawId: return DRAW_INDIRECT_WITH_DRAW_ID_NUM_ARGS;
+    case Indirect::DrawIndexedWithDrawId: return DRAW_INDEXED_INDIRECT_WITH_DRAW_ID_NUM_ARGS;
+    case Indirect::DispatchComputeAsRayGen: return DISPATCH_COMPUTE_AS_RAY_GEN_NUM_ARGS;
+    case Indirect::DispatchMesh: return DISPATCH_MESH_INDIRECT_NUM_ARGS;
+    case Indirect::DispatchMeshWithDrawId: return DISPATCH_MESH_INDIRECT_WITH_DRAW_ID_NUM_ARGS;
   }
   G_ASSERT(false); // impossible situation
   return 0;
+}
+
+constexpr inline uint32_t bytes_count_per_call(Indirect indirect_type)
+{
+  return INDIRECT_BUFFER_ELEMENT_SIZE * dword_count_per_call(indirect_type);
 }
 
 /**
@@ -506,10 +526,10 @@ inline uint32_t dword_count_per_call(Indirect indirect_type)
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_ua_indirect(Indirect indirect_type, uint32_t records_count, const char *name)
+inline Sbuffer *create_ua_indirect(Indirect indirect_type, uint32_t records_count, const char *name, ResourceTagType tag = nullptr)
 {
   const uint32_t dwordsCount = records_count * dword_count_per_call(indirect_type);
-  return d3d::create_sbuffer(BYTE_ADDRESS_ELEMENT_SIZE, dwordsCount, SBCF_UA_INDIRECT, 0, name);
+  return d3d::create_sbuffer(INDIRECT_BUFFER_ELEMENT_SIZE, dwordsCount, SBCF_UA_INDIRECT, 0, name, tag);
 }
 
 
@@ -521,10 +541,10 @@ inline Sbuffer *create_ua_indirect(Indirect indirect_type, uint32_t records_coun
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_indirect(Indirect indirect_type, uint32_t records_count, const char *name)
+inline Sbuffer *create_indirect(Indirect indirect_type, uint32_t records_count, const char *name, ResourceTagType tag = nullptr)
 {
   const uint32_t dwordsCount = records_count * dword_count_per_call(indirect_type);
-  return d3d::create_sbuffer(BYTE_ADDRESS_ELEMENT_SIZE, dwordsCount, SBCF_INDIRECT, 0, name);
+  return d3d::create_sbuffer(INDIRECT_BUFFER_ELEMENT_SIZE, dwordsCount, SBCF_INDIRECT, 0, name, tag);
 }
 
 
@@ -535,9 +555,9 @@ inline Sbuffer *create_indirect(Indirect indirect_type, uint32_t records_count, 
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_staging(uint32_t size_in_bytes, const char *name)
+inline Sbuffer *create_staging(uint32_t size_in_bytes, const char *name, ResourceTagType tag = nullptr)
 {
-  return d3d::create_sbuffer(1, size_in_bytes, SBCF_STAGING_BUFFER, 0, name);
+  return d3d::create_sbuffer(1, size_in_bytes, SBCF_STAGING_BUFFER, 0, name, tag);
 }
 
 
@@ -557,10 +577,11 @@ inline Sbuffer *create_staging(uint32_t size_in_bytes, const char *name)
  * \param buffer_init The initialization option for the buffer.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_persistent_sr_tbuf(uint32_t elements_count, uint32_t format, const char *name, Init buffer_init = Init::No)
+inline Sbuffer *create_persistent_sr_tbuf(uint32_t elements_count, uint32_t format, const char *name, Init buffer_init = Init::No,
+  ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(get_tex_format_desc(format).bytesPerElement, elements_count,
-    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), format, name);
+    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), format, name, tag);
 }
 
 
@@ -575,10 +596,11 @@ inline Sbuffer *create_persistent_sr_tbuf(uint32_t elements_count, uint32_t form
  * \param buffer_init The initialization option for the buffer.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_persistent_sr_byte_address(uint32_t size_in_dwords, const char *name, Init buffer_init = Init::No)
+inline Sbuffer *create_persistent_sr_byte_address(uint32_t size_in_dwords, const char *name, Init buffer_init = Init::No,
+  ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(BYTE_ADDRESS_ELEMENT_SIZE, size_in_dwords,
-    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_MISC_ALLOW_RAW | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name);
+    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_MISC_ALLOW_RAW | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name, tag);
 }
 
 
@@ -597,10 +619,11 @@ inline Sbuffer *create_persistent_sr_byte_address(uint32_t size_in_dwords, const
  * \return A pointer to the created buffer.
  */
 inline Sbuffer *create_persistent_sr_structured(uint32_t structure_size, uint32_t elements_count, const char *name,
-  Init buffer_init = Init::No)
+  Init buffer_init = Init::No, ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(structure_size, elements_count,
-    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_MISC_STRUCTURED | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name);
+    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_MISC_STRUCTURED | (buffer_init == Init::Zero ? SBCF_ZEROMEM : 0), 0, name,
+    tag);
 }
 
 
@@ -619,10 +642,10 @@ inline Sbuffer *create_persistent_sr_structured(uint32_t structure_size, uint32_
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_one_frame_sr_tbuf(uint32_t elements_count, uint32_t format, const char *name)
+inline Sbuffer *create_one_frame_sr_tbuf(uint32_t elements_count, uint32_t format, const char *name, ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(get_tex_format_desc(format).bytesPerElement, elements_count,
-    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_DYNAMIC | SBCF_FRAMEMEM, format, name);
+    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_DYNAMIC | SBCF_FRAMEMEM, format, name, tag);
 }
 
 
@@ -637,10 +660,10 @@ inline Sbuffer *create_one_frame_sr_tbuf(uint32_t elements_count, uint32_t forma
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_one_frame_sr_byte_address(uint32_t size_in_dwords, const char *name)
+inline Sbuffer *create_one_frame_sr_byte_address(uint32_t size_in_dwords, const char *name, ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(BYTE_ADDRESS_ELEMENT_SIZE, size_in_dwords,
-    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_MISC_ALLOW_RAW | SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, name);
+    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_MISC_ALLOW_RAW | SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, name, tag);
 }
 
 
@@ -658,10 +681,11 @@ inline Sbuffer *create_one_frame_sr_byte_address(uint32_t size_in_dwords, const 
  * \param name The name of the buffer, used for debugging purposes, like showing in in statistcs, and frame debuggers like PIX.
  * \return A pointer to the created buffer.
  */
-inline Sbuffer *create_one_frame_sr_structured(uint32_t structure_size, uint32_t elements_count, const char *name)
+inline Sbuffer *create_one_frame_sr_structured(uint32_t structure_size, uint32_t elements_count, const char *name,
+  ResourceTagType tag = nullptr)
 {
   return d3d::create_sbuffer(structure_size, elements_count,
-    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_MISC_STRUCTURED | SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, name);
+    SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE | SBCF_MISC_STRUCTURED | SBCF_DYNAMIC | SBCF_FRAMEMEM, 0, name, tag);
 }
 
 /**
@@ -680,9 +704,9 @@ inline Sbuffer *create_one_frame_sr_structured(uint32_t structure_size, uint32_t
  * \return A pointer to the created buffer. Returns nullptr on failure. Possible failures are device lost state or out of memory.
  *
  */
-inline Sbuffer *create_raytrace_scratch_buffer(uint32_t size_in_bytes, const char *name)
+inline Sbuffer *create_raytrace_scratch_buffer(uint32_t size_in_bytes, const char *name, ResourceTagType tag = nullptr)
 {
-  return d3d::create_sbuffer(1, size_in_bytes, SBCF_USAGE_ACCELLERATION_STRUCTURE_BUILD_SCRATCH_SPACE, 0, name);
+  return d3d::create_sbuffer(1, size_in_bytes, SBCF_USAGE_ACCELLERATION_STRUCTURE_BUILD_SCRATCH_SPACE, 0, name, tag);
 }
 
 } // namespace d3d::buffers
@@ -692,9 +716,9 @@ inline Sbuffer *create_raytrace_scratch_buffer(uint32_t size_in_bytes, const cha
 namespace d3d
 {
 
-inline Sbuffer *create_sbuffer(int struct_size, int elements, unsigned flags, unsigned texfmt, const char *name)
+inline Sbuffer *create_sbuffer(int struct_size, int elements, unsigned flags, unsigned texfmt, const char *name, ResourceTagType tag)
 {
-  return d3di.create_sbuffer(struct_size, elements, flags, texfmt, name);
+  return d3di.create_sbuffer(struct_size, elements, flags, texfmt, name, tag);
 }
 
 inline bool set_buffer(unsigned shader_stage, unsigned slot, Sbuffer *buffer) { return d3di.set_buffer(shader_stage, slot, buffer); }

@@ -14,7 +14,7 @@
 //  - simple resolve (static shadows + regular PBR stuff)
 
 #include "satelliteRenderer.h"
-#include <render/world/cameraParams.h>
+#include <render/cameraParams.h>
 #include <util/dag_convar.h>
 #include <math/dag_mathUtils.h>
 #include "global_vars.h"
@@ -41,7 +41,7 @@ CONSOLE_FLOAT_VAL("render_sat", height, 40);
 // fixed height of camera
 CONSOLE_FLOAT_VAL("render_sat", height_fixed, 40);
 // height offset from land if use_land_based_height_offset enabled
-CONSOLE_FLOAT_VAL("render_sat", height_ofs, 40);
+CONSOLE_FLOAT_VAL("render_sat", height_ofs, 80);
 // use offset from land height instead of constant height
 CONSOLE_BOOL_VAL("render_sat", use_land_based_height_offset, true);
 // size of targets in pixels
@@ -82,16 +82,16 @@ struct ScopedShVars
 
   ScopedShVars(Point3 in_pos)
   {
-    originalZnZfar = ShaderGlobal::get_color4(zn_zfarVarId);
-    originalWorldPos = ShaderGlobal::get_color4(world_view_posVarId);
-    ShaderGlobal::set_color4(world_view_posVarId, in_pos.x, in_pos.y, in_pos.z, 1);
-    ShaderGlobal::set_color4(zn_zfarVarId, zn, zf, 0, 0);
+    originalZnZfar = ShaderGlobal::get_float4(zn_zfarVarId);
+    originalWorldPos = ShaderGlobal::get_float4(world_view_posVarId);
+    ShaderGlobal::set_float4(world_view_posVarId, in_pos.x, in_pos.y, in_pos.z, 1);
+    ShaderGlobal::set_float4(zn_zfarVarId, zn, zf, 0, 0);
   }
 
   ~ScopedShVars()
   {
-    ShaderGlobal::set_color4(zn_zfarVarId, originalZnZfar);
-    ShaderGlobal::set_color4(world_view_posVarId, originalWorldPos);
+    ShaderGlobal::set_float4(zn_zfarVarId, originalZnZfar);
+    ShaderGlobal::set_float4(world_view_posVarId, originalWorldPos);
   }
 };
 } // namespace WorldRenderSatellite
@@ -118,7 +118,7 @@ void SatelliteRenderer::ensureTargets()
   {
     riGenVisibility = rendinst::createRIGenVisibility(midmem);
     rendinst::setRIGenVisibilityMinLod(riGenVisibility, 0, 0);
-    rendinst::setRIGenVisibilityDistMul(riGenVisibility, 0);
+    rendinst::setRIGenVisibilityDistMul(riGenVisibility, 10);
   }
 }
 
@@ -212,7 +212,6 @@ void SatelliteRenderer::renderFromPos(Point3 in_pos, const CallbackParams &callb
     view.setcol(3, 0, 0, 1);
 
     globtm_ = TMatrix4(view) * proj;
-    mat44f globtm;
     v_mat44_make_from_44cu(globtm, globtm_.m[0]);
     frustum = Frustum{globtm};
   }
@@ -222,8 +221,16 @@ void SatelliteRenderer::renderFromPos(Point3 in_pos, const CallbackParams &callb
   d3d::settm(TM_VIEW, view);
   set_viewvecs_to_shader(view, proj);
   set_inv_globtm_to_shader(view, proj, true);
+  camera_params.viewTm = view;
+  camera_params.viewItm = view_itm;
   camera_params.jitterFrustum = frustum;
   camera_params.noJitterFrustum = frustum;
+
+  float halfW = (box[1].x - box[0].x) * 0.5f;
+  float halfH = (box[1].z - box[0].z) * 0.5f;
+  Driver3dPerspective orthoPersp(1.0f / halfW, 1.0f / halfH, zn, zf);
+  camera_params.jitterPersp = orthoPersp;
+  camera_params.noJitterPersp = orthoPersp;
 
   STATE_GUARD_0(ShaderGlobal::set_int(var::use_satellite_rendering, VALUE), 1);
 
@@ -265,7 +272,7 @@ void SatelliteRenderer::renderFromPos(Point3 in_pos, const CallbackParams &callb
   // render water on top of resolved content with simplified shader
   {
     ShaderGlobal::set_texture(downsampled_far_depth_texVarId, renderTargetGbuf->getDepthId());
-    callback_params.renderWater(targetTex.getBaseTex(), view_itm, renderTargetGbuf->getDepth());
+    callback_params.renderWater(targetTex.getBaseTex(), camera_params, renderTargetGbuf->getDepth());
   }
 
   // save if requested
@@ -280,11 +287,11 @@ void SatelliteRenderer::renderFromPos(Point3 in_pos, const CallbackParams &callb
   }
 }
 
-void SatelliteRenderer::scanSettleCheck(int vtex_updates)
+void SatelliteRenderer::scanSettleCheck(int vtex_updates, int tex_streaming_pending)
 {
   if (scanSettleFrameId < scan_settle_frames)
   {
-    if (vtex_updates == 0)
+    if (vtex_updates == 0 && tex_streaming_pending == 0)
       ++scanSettleFrameId;
   }
   else if (scanSettleFrameId == scan_settle_frames)
@@ -342,7 +349,7 @@ void SatelliteRenderer::renderScripted(CameraParams &camera_params)
   citm.col[3] = {x, height * 1.1f, y};
   set_cam_itm(citm);
 
-  scanSettleCheck(callbackParams.clipmapGetLastUpdatedTileCount());
+  scanSettleCheck(callbackParams.clipmapGetLastUpdatedTileCount(), callbackParams.texStreamingGetPendingCount());
   renderFromPos({x, height, y}, callbackParams, camera_params);
 
   if (scanIndex.y >= (1 << zlevels))

@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <rendInst/rendInstAccess.h>
+#include <rendInst/rendInstExtraAccess.h>
 
 #include "riGen/riGenData.h"
 #include "riGen/riGenExtra.h"
@@ -36,7 +37,7 @@ rendinst::AutoLockWritePrimary::~AutoLockWritePrimary()
 {
   for (int l = rendinst::rgPrimaryLayers - 1; l >= 0; l--)
     if (RendInstGenData *rgl = rendinst::rgLayer[l])
-      rgl->rtData->riRwCs.lockWrite();
+      rgl->rtData->riRwCs.unlockWrite();
 }
 
 rendinst::AutoLockReadPrimaryAndExtra::AutoLockReadPrimaryAndExtra() { rendinst::ccExtra.lockRead(); }
@@ -45,7 +46,7 @@ rendinst::AutoLockReadPrimaryAndExtra::~AutoLockReadPrimaryAndExtra() { rendinst
 
 rendinst::AutoLockWritePrimaryAndExtra::AutoLockWritePrimaryAndExtra() { rendinst::ccExtra.lockWrite(); }
 
-rendinst::AutoLockWritePrimaryAndExtra::~AutoLockWritePrimaryAndExtra() { rendinst::ccExtra.lockWrite(); }
+rendinst::AutoLockWritePrimaryAndExtra::~AutoLockWritePrimaryAndExtra() { rendinst::ccExtra.unlockWrite(); }
 
 int rendinst::getRIGenMaterialId(const RendInstDesc &desc, bool need_lock)
 {
@@ -61,6 +62,53 @@ int rendinst::getRIGenMaterialId(const RendInstDesc &desc, bool need_lock)
     return rgl->rtData->riProperties[pool].matId;
   }
   return -1;
+}
+
+template <SimpleString rendinst::props::DestrProps::*field>
+static const char *get_ri_gen_destr_str(const rendinst::RendInstDesc &desc)
+{
+  int pool = desc.isRiExtra() ? rendinst::riExtra[desc.pool].riPoolRef : desc.pool;
+  if (pool < 0)
+    return "";
+  RendInstGenData *rgl = rendinst::getRgLayer(desc.isRiExtra() ? rendinst::riExtra[desc.pool].riPoolRefLayer : desc.layer);
+  if (!rgl)
+    return "";
+  G_ASSERTF_RETURN(pool < rgl->rtData->riDestr.size(), "", "pool %i < %i", pool, rgl->rtData->riDestr.size());
+  return (rgl->rtData->riDestr[pool].*field).c_str();
+}
+
+const char *rendinst::getRIGenDestrPropsTag(const RendInstDesc &desc) { return get_ri_gen_destr_str<&props::DestrProps::tag>(desc); }
+
+const char *rendinst::getRIGenDestrPropsDestroyedByTag(const RendInstDesc &desc)
+{
+  return get_ri_gen_destr_str<&props::DestrProps::destroyedByTag>(desc);
+}
+
+const char *rendinst::getRIGenDestrPropsFxTemplate(const RendInstDesc &desc)
+{
+  return get_ri_gen_destr_str<&props::DestrProps::destrFxTemplate>(desc);
+}
+
+bool rendinst::getRIGenOverrideMaterialForTraces(const RendInstDesc &desc, bool need_lock)
+{
+  int pool = desc.isRiExtra() ? rendinst::riExtra[desc.pool].riPoolRef : desc.pool;
+  if (pool < 0)
+    return false;
+  RendInstGenData *rgl = rendinst::getRgLayer(desc.isRiExtra() ? rendinst::riExtra[desc.pool].riPoolRefLayer : desc.layer);
+  if (rgl)
+  {
+    ScopedLockRead lock(need_lock ? &rgl->rtData->riRwCs : nullptr);
+    G_ASSERTF(pool < rgl->rtData->riProperties.size(), "getRIGenOverrideMaterialForTraces failed pool %i < %i", pool,
+      rgl->rtData->riProperties.size());
+    return rgl->rtData->riProperties[pool].overrideMaterialForTraces;
+  }
+  return false;
+}
+
+int rendinst::getRIGenCanopyShape(const RendInstDesc &desc)
+{
+  RendInstGenData *rgl = RendInstGenData::getGenDataByLayer(desc);
+  return (int)rgl->rtData->riProperties[desc.pool].canopyShape;
 }
 
 
@@ -82,6 +130,9 @@ bool rendinst::getRIGenCanopyBBox(const RendInstDesc &desc, const TMatrix &tm, B
     logerr("getRIGenCanopyBBox: no 'riProperties' for an invalid pool id '%i', totalPoolsCount=%i", pool, riProps.size());
     return false;
   }
+
+  if (pool >= rgl->rtData->riRes.size())
+    return false;
 
   const auto &riRes = rgl->rtData->riRes[pool];
   if (!riRes)
@@ -113,25 +164,41 @@ CollisionResource *rendinst::getRIGenCollInfo(const rendinst::RendInstDesc &desc
 void *rendinst::getCollisionResourceHandle(const RendInstDesc &desc)
 {
   if (desc.isRiExtra())
-    return (desc.pool >= 0 && desc.pool < riExtra.size()) ? riExtra[desc.pool].collHandle : nullptr;
-  RendInstGenData *rgl = getRgLayer(desc.layer);
-  return (rgl && desc.pool >= 0 && desc.pool < rgl->rtData->riCollRes.size()) ? rgl->rtData->riCollRes[desc.pool].handle : nullptr;
+    return riExtra.isValid(desc.pool) ? riExtra[desc.pool].collHandle : nullptr;
+  else
+  {
+    RendInstGenData *rgl = getRgLayer(desc.layer);
+    return (rgl && desc.pool >= 0 && desc.pool < rgl->rtData->riCollRes.size()) ? rgl->rtData->riCollRes[desc.pool].handle : nullptr;
+  }
 }
 
 const CollisionResource *rendinst::getRiGenCollisionResource(const RendInstDesc &desc)
 {
   if (desc.isRiExtra())
-    return (desc.pool >= 0 && desc.pool < riExtra.size()) ? riExtra[desc.pool].collRes : nullptr;
-  RendInstGenData *rgl = getRgLayer(desc.layer);
-  return (rgl && desc.pool >= 0 && desc.pool < rgl->rtData->riCollRes.size()) ? rgl->rtData->riCollRes[desc.pool].collRes : nullptr;
+    return riExtra.isValid(desc.pool) ? riExtra[desc.pool].collRes : nullptr;
+  else
+  {
+    RendInstGenData *rgl = getRgLayer(desc.layer);
+    return (rgl && desc.pool >= 0 && desc.pool < rgl->rtData->riCollRes.size()) ? rgl->rtData->riCollRes[desc.pool].collRes : nullptr;
+  }
+}
+
+const DynamicPhysObjectData *rendinst::getRIGenDestroyedPhysRes(const RendInstDesc &desc)
+{
+  if (desc.isRiExtra())
+    return riExtra.isValid(desc.pool) ? riExtra[desc.pool].destroyedPhysRes : nullptr;
+  else
+  {
+    RendInstGenData *rgl = getRgLayer(desc.layer);
+    return (rgl && desc.pool >= 0 && desc.pool < rgl->rtData->riDestr.size()) ? rgl->rtData->riDestr[desc.pool].res : nullptr;
+  }
 }
 
 bool rendinst::isRIGenPosInst(const RendInstDesc &desc)
 {
   if (desc.isRiExtra())
-    return desc.pool >= 0 && desc.pool < riExtra.size() && riExtra[desc.pool].isPosInst();
-  RendInstGenData *rgl = getRgLayer(desc.layer);
-  return rgl && desc.pool >= 0 && desc.pool < rgl->rtData->riPosInst.size() && rgl->rtData->riPosInst[desc.pool];
+    return riExtra.isValid(desc.pool) && riExtra[desc.pool].isPosInst();
+  return isRIGenOnlyPosInst(desc.layer, desc.pool);
 }
 
 bool rendinst::isRIGenOnlyPosInst(int layer_ix, int pool_ix)
@@ -143,7 +210,7 @@ bool rendinst::isRIGenOnlyPosInst(int layer_ix, int pool_ix)
 bool rendinst::isValidRILayerAndPool(const RendInstDesc &desc)
 {
   if (desc.isRiExtra())
-    return unsigned(desc.pool) < rendinst::riExtra.size();
+    return rendinst::riExtra.isValid(desc.pool);
   const RendInstGenData *rgl = rendinst::getRgLayer(desc.layer);
   return rgl != nullptr && rgl->rtData != nullptr && unsigned(desc.pool) < rgl->rtData->rtPoolData.size();
 }
@@ -153,10 +220,7 @@ bool rendinst::isDestroyedRIExtraFromNextRes(const RendInstDesc &desc)
   return desc.isRiExtra() && riExtra[desc.pool].parentForDestroyedRiIdx > 0;
 }
 
-int rendinst::getRIExtraNextResIdx(int pool_id)
-{
-  return (pool_id >= 0 && pool_id < riExtra.size()) ? riExtra[pool_id].destroyedRiIdx : -1;
-}
+int rendinst::getRIExtraNextResIdx(int pool_id) { return riExtra.isValid(pool_id) ? riExtra[pool_id].destroyedRiIdx : -1; }
 
 static TMatrix get_ri_matrix_from_data(const rendinst::RendInstDesc &desc, const RendInstGenData::Cell *cell, const int16_t *data)
 {
@@ -164,7 +228,7 @@ static TMatrix get_ri_matrix_from_data(const rendinst::RendInstDesc &desc, const
   if (!rgl)
     return TMatrix::IDENT;
 
-  const RendInstGenData::CellRtData &crt = *cell->rtData;
+  const RendInstGenData::CellRtData &crt = *cell->cellRtData;
 
   float subcellSz = rgl->grid2world * rgl->cellSz;
   vec3f v_cell_add = crt.cellOrigin;
@@ -202,7 +266,6 @@ static inline TMatrix getRIGenMatrixImpl(const rendinst::RendInstDesc &desc)
   {
     if (bLock)
       rendinst::ccExtra.lockRead();
-    mat44f tm44;
     if (desc.idx >= rendinst::riExtra[desc.pool].riTm.size()) // Temporary apex RI proxy may be removed at any time.
     {
       if (bLock)
@@ -210,8 +273,7 @@ static inline TMatrix getRIGenMatrixImpl(const rendinst::RendInstDesc &desc)
       tm = TMatrix::IDENT;
       return tm;
     }
-    v_mat43_transpose_to_mat44(tm44, rendinst::riExtra[desc.pool].riTm[desc.idx]);
-    v_mat_43cu_from_mat44(tm.m[0], tm44);
+    v_mat_43cu_from_mat43(tm.m[0], rendinst::riExtra[desc.pool].riTm[desc.idx]);
     if (bLock)
       rendinst::ccExtra.unlockRead();
     return tm;
@@ -235,45 +297,36 @@ static inline TMatrix getRIGenMatrixImpl(const rendinst::RendInstDesc &desc)
 TMatrix rendinst::getRIGenMatrix(const RendInstDesc &desc) { return getRIGenMatrixImpl(desc); }
 TMatrix rendinst::getRIGenMatrixNoLock(const RendInstDesc &desc) { return getRIGenMatrixImpl</*bLock*/ false>(desc); }
 
-TMatrix rendinst::getRIGenMatrixDestr(const RendInstDesc &desc)
+eastl::pair<const RendInstGenData *, int> get_props_ref_layer_and_pool(const rendinst::RendInstDesc &desc)
 {
-  if (desc.isRiExtra())
-  {
-    rendinst::ccExtra.lockRead();
-    int idx = desc.cellIdx == -1 ? desc.idx : -1;
-    for (int i = 0; i < riExtra[desc.pool].riUniqueData.size(); ++i)
-    {
-      if (riExtra[desc.pool].riUniqueData[i].cellId != -(desc.cellIdx + 1) || riExtra[desc.pool].riUniqueData[i].offset != desc.offs)
-        continue;
-      idx = i;
-      break;
-    }
-    if (idx >= 0)
-    {
-      TMatrix tm;
-      mat44f tm44;
-      v_mat43_transpose_to_mat44(tm44, riExtra[desc.pool].riTm[idx]);
-      v_mat_43cu_from_mat44(tm.m[0], tm44);
-      rendinst::ccExtra.unlockRead();
-      return tm;
-    }
-    rendinst::ccExtra.unlockRead();
-    return TMatrix::IDENT;
-  }
-
-  ScopedLockRead lock(rendinst::rgLayer[desc.layer]->rtData->riRwCs);
-
-  TMatrix tm;
-  RendInstGenData::Cell *cell = nullptr;
-  int16_t *data = riutil::get_data_by_desc_no_subcell(desc, cell);
-  if (data)
-    tm = get_ri_matrix_from_data(desc, cell, data);
-  else
-    tm = TMatrix::IDENT;
-
-  return tm;
+  if (!desc.isValid() || (desc.isRiExtra() && !rendinst::riExtra.isValid(desc.pool)))
+    return {nullptr, -1};
+  const RendInstGenData *rgl = rendinst::getRgLayer(desc.isRiExtra() ? rendinst::riExtra[desc.pool].riPoolRefLayer : desc.layer);
+  const int pool = desc.isRiExtra() ? rendinst::riExtra[desc.pool].riPoolRef : desc.pool;
+  return {rgl, pool};
 }
 
+template <>
+const rendinst::props::RendinstProperties *rendinst::props::get_by_desc<rendinst::props::RendinstProperties>(
+  const rendinst::RendInstDesc &desc)
+{
+  const auto [rgl, pool] = get_props_ref_layer_and_pool(desc);
+  return rgl && unsigned(pool) < rgl->rtData->riProperties.size() ? &rgl->rtData->riProperties[pool] : nullptr;
+}
+
+template <>
+const rendinst::props::DebrisProps *rendinst::props::get_by_desc<rendinst::props::DebrisProps>(const rendinst::RendInstDesc &desc)
+{
+  const auto [rgl, pool] = get_props_ref_layer_and_pool(desc);
+  return rgl && unsigned(pool) < rgl->rtData->riDebrisMap.size() ? &rgl->rtData->riDebrisMap[pool] : nullptr;
+}
+
+template <>
+const rendinst::props::DestrProps *rendinst::props::get_by_desc<rendinst::props::DestrProps>(const rendinst::RendInstDesc &desc)
+{
+  const auto [rgl, pool] = get_props_ref_layer_and_pool(desc);
+  return rgl && unsigned(pool) < rgl->rtData->riDestr.size() ? &rgl->rtData->riDestr[pool] : nullptr;
+}
 
 const char *rendinst::getRIGenResName(const RendInstDesc &desc)
 {
@@ -281,6 +334,12 @@ const char *rendinst::getRIGenResName(const RendInstDesc &desc)
     return rendinst::riExtraMap.getName(desc.pool);
   RendInstGenData *rgl = getRgLayer(desc.layer);
   return rgl && desc.pool >= 0 && desc.pool < rgl->rtData->riResName.size() ? rgl->rtData->riResName[desc.pool] : nullptr;
+}
+
+const char *rendinst::getRIGenResNameByPool(int layer, int pool)
+{
+  RendInstGenData *rgl = getRgLayer(layer);
+  return (rgl && rgl->rtData && pool >= 0 && pool < rgl->rtData->riResName.size()) ? rgl->rtData->riResName[pool] : nullptr;
 }
 
 const char *rendinst::getRIGenDestrFxTemplateName(const RendInstDesc &desc)
@@ -322,6 +381,45 @@ bool rendinst::isRIGenDestr(const RendInstDesc &desc)
   return rgl && desc.pool >= 0 && desc.pool < rgl->rtData->riDestr.size() && rgl->rtData->riDestr[desc.pool].destructable;
 }
 
+bool rendinst::fillRendInstBufferData(const RendInstDesc &desc, RendInstBufferData &out_buffer)
+{
+  if (!isRiGenDescValid(desc))
+    return false;
+  if (desc.isRiExtra())
+  {
+    out_buffer.desc = get_restorable_desc(desc);
+    if (out_buffer.desc.isValid())
+      out_buffer.desc.idx = desc.idx;
+    else
+      out_buffer.desc = desc; // no restorable desc found, store original desc
+    getRIGenExtra44(desc.getRiExtraHandle(), out_buffer.tm);
+    dag::ConstSpan<int32_t> userData = get_user_data(desc.getRiExtraHandle());
+    mem_set_0(out_buffer.riExUserData);
+    int32_t &wordCnt = out_buffer.riExUserData[15];
+    wordCnt = eastl::min<int32_t>(15, userData.size());
+    if (wordCnt != 0)
+      memcpy(out_buffer.riExUserData.data(), userData.data(), sizeof(int32_t) * wordCnt);
+    return true;
+  }
+  else
+  {
+    RendInstGenData *rgl = RendInstGenData::getGenDataByLayer(desc);
+    G_ASSERT_RETURN(rgl, false);
+    G_ASSERT_RETURN(rgl->rtData, false);
+    ScopedLockRead rd(rgl->rtData->riRwCs);
+    RendInstGenData::Cell *cell = nullptr;
+    int16_t *data = riutil::get_data_by_desc(desc, cell);
+    if (!data)
+      return false;
+    if (!riutil::extract_buffer_data(desc, rgl, data, out_buffer))
+      return false;
+    out_buffer.desc = desc;
+    uint32_t paletteId;
+    G_VERIFY(riutil::get_rendinst_matrix(desc, rgl, data, cell, out_buffer.tm, paletteId));
+    return true;
+  }
+}
+
 int rendinst::getRIGenStrideRaw(int layer_idx, int pool_id)
 {
   RendInstGenData *rgl = getRgLayer(layer_idx);
@@ -335,6 +433,22 @@ int rendinst::getRIGenStrideRaw(int layer_idx, int pool_id)
 int rendinst::getRIGenStride(int layer_idx, int cell_id, int pool_id)
 {
   return cell_id < 0 ? 16 : getRIGenStrideRaw(layer_idx, pool_id);
+}
+
+BBox3 rendinst::getRIGenCellBBox(int layer_idx, int cell_id)
+{
+  RendInstGenData *rgl = getRgLayer(layer_idx);
+  if (!rgl)
+    return BBox3();
+  if (unsigned(cell_id) >= rgl->cells.size())
+    return BBox3();
+  if (auto *crt = rgl->cells[cell_id].isReady())
+  {
+    BBox3 bbox;
+    v_stu_bbox3(bbox, crt->bbox[0]);
+    return bbox;
+  }
+  return BBox3();
 }
 
 Point4 rendinst::getRIGenBSphere(const RendInstDesc &desc)
@@ -408,21 +522,25 @@ int rendinst::get_debris_fx_type_id(RendInstGenData *rgl, const rendinst::RendIn
 rendinst::RiDestrData rendinst::gather_ri_destr_data(const RendInstDesc &ri_desc, bool destroyedByDamage)
 {
   RiDestrData result;
+  G_ASSERT(!ri_desc.isRiExtra() || riExtra[ri_desc.pool].riPoolRef >= 0);
 
-  if (ri_desc.layer < rgLayer.size() && rgLayer[ri_desc.layer] != nullptr)
-    if (const auto *rtData = rgLayer[ri_desc.layer]->rtData)
+  int riGenPool = ri_desc.isRiExtra() ? riExtra[ri_desc.pool].riPoolRef : ri_desc.pool;
+  int riGenLayer = ri_desc.isRiExtra() ? riExtra[ri_desc.pool].riPoolRefLayer : ri_desc.layer;
+
+  if (riGenLayer < rgLayer.size() && rgLayer[riGenLayer] != nullptr)
+    if (const auto *rtData = rgLayer[riGenLayer]->rtData)
     {
-      const rendinstdestr::BranchDestr &branchDestr = destroyedByDamage ? rtData->riProperties[ri_desc.pool].treeBranchDestrFromDamage
-                                                                        : rtData->riProperties[ri_desc.pool].treeBranchDestrOther;
+      const rendinstdestr::BranchDestr &branchDestr = destroyedByDamage ? rtData->riProperties[riGenPool].treeBranchDestrFromDamage
+                                                                        : rtData->riProperties[riGenPool].treeBranchDestrOther;
       result.branchDestr = &branchDestr;
-      result.collisionHeightScale = rtData->riDestr[ri_desc.pool].collisionHeightScale;
-      result.bushBehaviour = rtData->riProperties[ri_desc.pool].bushBehaviour;
-      result.canopyTriangle = rtData->riProperties[ri_desc.pool].canopyShape == RendInstGenData::CanopyShape::CONE;
-      if (ri_desc.pool < rtData->riDebrisMap.size())
+      result.collisionHeightScale = rtData->riDestr[riGenPool].collisionHeightScale;
+      result.bushBehaviour = rtData->riProperties[riGenPool].bushBehaviour;
+      result.canopyTriangle = rtData->riProperties[riGenPool].canopyShape == rendinst::props::CanopyShape::CONE;
+      if (riGenPool < rtData->riDebrisMap.size())
       {
-        result.fxScale = rtData->riDebrisMap[ri_desc.pool].fxScale;
-        result.fxType = rtData->riDebrisMap[ri_desc.pool].fxType;
-        result.fxTemplate = rtData->riDebrisMap[ri_desc.pool].fxTemplate.c_str();
+        result.fxScale = rtData->riDebrisMap[riGenPool].fxScale;
+        result.fxType = rtData->riDebrisMap[riGenPool].fxType;
+        result.fxTemplate = rtData->riDebrisMap[riGenPool].fxTemplate.c_str();
       }
     }
 
@@ -459,7 +577,7 @@ rendinst::RendInstDesc rendinst::get_restorable_desc(const RendInstDesc &ri_desc
 
 int rendinst::find_restorable_data_index(const RendInstDesc &desc)
 {
-  if (unsigned(desc.pool) >= riExtra.size())
+  if (!riExtra.isValid(desc.pool))
     return -1;
   const auto &ud = riExtra[desc.pool].riUniqueData;
   for (int r = 0; r < ud.size(); ++r)
@@ -467,6 +585,37 @@ int rendinst::find_restorable_data_index(const RendInstDesc &desc)
       return r;
 
   return -1;
+}
+
+bool rendinst::resolve_rigen_desc_subcell(RendInstDesc &desc)
+{
+  G_ASSERT_RETURN(!desc.isRiExtra(), true);
+
+  RendInstGenData *rgl = getRgLayer(desc.layer);
+  if (!rgl || !rgl->rtData)
+    return false;
+
+  ScopedLockRead lock(rgl->rtData->riRwCs);
+
+  RendInstGenData::CellRtData *pcrt = riutil::get_cell_rtdata_by_desc(desc);
+  if (!pcrt || pcrt->scsRemap.empty())
+    return false;
+
+  const RendInstGenData::CellRtData::SubCellSlice &firstScs = pcrt->getCellSlice(desc.pool, 0);
+  const uint32_t target = firstScs.ofs + desc.offs;
+
+  constexpr int totalSubcells = RendInstGenData::SUBCELL_DIV * RendInstGenData::SUBCELL_DIV;
+  for (int sc = 0; sc < totalSubcells; ++sc)
+  {
+    const RendInstGenData::CellRtData::SubCellSlice &scs = pcrt->getCellSlice(desc.pool, sc);
+    if (scs.sz && target >= scs.ofs && target < scs.ofs + scs.sz)
+    {
+      desc.idx = sc;
+      desc.offs = target - scs.ofs;
+      return true;
+    }
+  }
+  return false;
 }
 
 RenderableInstanceLodsResource *rendinst::getRIGenRes(RendInstGenData *rgl, const RendInstDesc &desc)
@@ -484,6 +633,36 @@ RenderableInstanceLodsResource *rendinst::getRIGenRes(int layer_ix, int pool_ix)
     return nullptr;
 
   return rgl->rtData->riRes[pool_ix];
+}
+
+RenderableInstanceLodsResource *rendinst::getRIGenResAddRef(int layer_ix, int pool_ix, const char **out_res_name)
+{
+  if (out_res_name)
+    *out_res_name = nullptr;
+  // the loading path fills the pool tables with no lock, and every threaded fill runs
+  // inside the isLoading window (loadRIGen asserts it off the main thread): defer until
+  // the window closes; outside it the tables only append under the same discipline
+  if (RendInstGenData::isLoading)
+    return nullptr;
+  RendInstGenData *rgl = getRgLayer(layer_ix);
+  if (!rgl || !rgl->rtData)
+    return nullptr;
+  if (pool_ix < 0 || pool_ix >= rgl->rtData->riRes.size())
+    return nullptr;
+  RenderableInstanceLodsResource *res = rgl->rtData->riRes[pool_ix];
+  if (res)
+    res->addRef();
+  if (out_res_name)
+    *out_res_name = rgl->rtData->riResName[pool_ix];
+  return res;
+}
+
+int rendinst::getRIGenLayersCount() { return rgLayer.size(); }
+
+int rendinst::getRIGenPoolsCount(int layer_ix)
+{
+  RendInstGenData *rgl = getRgLayer(layer_ix);
+  return rgl && rgl->rtData ? rgl->rtData->riRes.size() : 0;
 }
 
 static inline vec4f v_frac(vec4f value) { return v_sub(value, v_round(value)); }
@@ -559,11 +738,16 @@ void rendinst::build_ri_gen_thread_accel(RiGenVisibility *visibility, dag::Vecto
 
 void rendinst::foreachRiGenInstance(RiGenVisibility *visibility, RiGenIterator callback, void *user_data,
   const dag::Vector<uint32_t> &accel1, const dag::Vector<uint64_t> &accel2, volatile int &cursor1, volatile int &cursor2,
-  bool simplified_impostor_matrix)
+  bool simplified_impostor_matrix, bool &early_termination)
 {
   rendinst::AutoLockReadPrimary lock;
-  for (int index = interlocked_increment(cursor1) - 1; index < accel1.size(); index = interlocked_increment(cursor1) - 1)
+  while (true)
   {
+    if (DAGOR_UNLIKELY(early_termination))
+      break;
+    int index = interlocked_increment(cursor1) - 1;
+    if (DAGOR_UNLIKELY(index >= (int)accel1.size()))
+      break;
     TIME_PROFILE(process_lod_1);
 
     uint32_t key = accel1[index];
@@ -580,7 +764,7 @@ void rendinst::foreachRiGenInstance(RiGenVisibility *visibility, RiGenIterator c
     int pool_idx = iter1.x;
     if (pool_idx < 0)
       continue;
-    if (pool_idx > rgl->rtData->rtPoolData.size() || pool_idx > rgl->rtData->riRes.size())
+    if (pool_idx >= rgl->rtData->rtPoolData.size() || pool_idx >= rgl->rtData->riRes.size())
     {
       logerr("Pool idx is out of bound pool_idx: %d, rtPoolData.size: %d, riRes.size: %d", pool_idx, rgl->rtData->rtPoolData.size(),
         rgl->rtData->riRes.size());
@@ -633,12 +817,17 @@ void rendinst::foreachRiGenInstance(RiGenVisibility *visibility, RiGenIterator c
       auto colors = &rgl->rtData->riColPair[pool_idx * 2];
 
       callback(_layer, pool_idx, realLodIx, isBakedImpostor ? lodCnt - 2 : lodCnt - 1, isBakedImpostor && isImpostorLod, tm, colors,
-        bvhId, user_data);
+        bvhId, layerVisibility.instanceIds[lodIx][instIx], user_data, v_extract_xi(paletteId));
     }
   }
 
-  for (int index = interlocked_increment(cursor2) - 1; index < accel2.size(); index = interlocked_increment(cursor2) - 1)
+  while (true)
   {
+    if (DAGOR_UNLIKELY(early_termination))
+      break;
+    int index = interlocked_increment(cursor2) - 1;
+    if (DAGOR_UNLIKELY(index >= (int)accel2.size()))
+      break;
     TIME_PROFILE(process_lod_2);
 
     uint64_t key = accel2[index];
@@ -662,7 +851,7 @@ void rendinst::foreachRiGenInstance(RiGenVisibility *visibility, RiGenIterator c
 
     auto &cellRange = layerVisibility.cellsLod[lodIx][iter];
     auto cellIx = cellRange.z * rgl->cellNumW + cellRange.x;
-    auto crt = rgl->cells[cellIx].rtData;
+    auto crt = rgl->cells[cellIx].cellRtData;
     auto ptr = crt->sysMemData.get();
     if (!ptr)
       continue;
@@ -678,8 +867,10 @@ void rendinst::foreachRiGenInstance(RiGenVisibility *visibility, RiGenIterator c
       auto &subCell = layerVisibility.subCells[subCellIx + cellRange.startSubCell];
       for (int instIx = 0; instIx < subCell.cnt; ++instIx)
       {
-        const int16_t *data = (int16_t *)(ptr + cellRange.startVbOfs + (subCell.ofs + instIx) * stride);
+        const uint32_t byteOfs = cellRange.startVbOfs + (subCell.ofs + instIx) * stride;
+        const int16_t *data = (int16_t *)(ptr + byteOfs);
 
+        uint32_t paletteId = 0;
         mat44f tm;
         if (rgl->rtData->riPosInst[poolIx])
         {
@@ -689,13 +880,14 @@ void rendinst::foreachRiGenInstance(RiGenVisibility *visibility, RiGenIterator c
             vec4f v_pos, v_scale;
             vec4i v_palette_id;
             rendinst::gen::unpack_tm_pos(v_pos, v_scale, data, v_cell_add, v_cell_mul, palette_rotation, &v_palette_id);
+            paletteId = static_cast<uint32_t>(v_extract_xi(v_palette_id));
             if (EASTL_LIKELY(simplified_impostor_matrix && isImpostorLod))
             {
               v_mat44_compose(tm, v_pos, V_C_UNIT_0001, v_scale);
             }
             else
             {
-              quat4f v_rot = rendinst::gen::RotationPaletteManager::get_quat(palette, v_extract_xi(v_palette_id));
+              quat4f v_rot = rendinst::gen::RotationPaletteManager::get_quat(palette, paletteId);
               v_mat44_compose(tm, v_pos, v_rot, v_scale);
             }
           }
@@ -711,7 +903,8 @@ void rendinst::foreachRiGenInstance(RiGenVisibility *visibility, RiGenIterator c
 
         auto colors = &rgl->rtData->riColPair[poolIx * 2];
 
-        callback(_layer, poolIx, lodIx, hasImpostor ? lodCount - 2 : lodCount - 1, isImpostorLod, tm, colors, bvhId, user_data);
+        callback(_layer, poolIx, lodIx, hasImpostor ? lodCount - 2 : lodCount - 1, isImpostorLod, tm, colors, bvhId,
+          crt->getUniqueId(byteOfs), user_data, paletteId);
       }
     }
   }

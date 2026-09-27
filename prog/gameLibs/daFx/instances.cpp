@@ -22,7 +22,7 @@ void unload_local_textures(eastl::vector<TextureDesc> &tex_descs)
 {
   for (auto [tid, a] : tex_descs)
   {
-    release_gameres_or_texres((GameResource *)(uintptr_t) unsigned(tid));
+    release_managed_tex(tid);
     tid = BAD_TEXTUREID;
   }
 }
@@ -48,6 +48,22 @@ void adjust_buffer_size_by_quality(Context &ctx, const SystemTemplate &sys, int 
   }
   for (const SystemTemplate &subSys : sys.subsystems)
     adjust_buffer_size_by_quality(ctx, subSys, cpu_size, gpu_size, force_dummy);
+};
+
+void gather_subinstances(Context &ctx, int sid, uint32_t req_flags, uint32_t excl_flags, eastl::vector<int, framemem_allocator> &dst)
+{
+  if (sid == dummy_instance_sid || sid == queue_instance_sid)
+    return;
+
+  const uint32_t flags = ctx.instances.groups.get<INST_FLAGS>(sid);
+  if (!(flags & SYS_VALID))
+    return;
+  if ((flags & req_flags) && !(flags & excl_flags))
+    dst.push_back(sid);
+
+  const eastl::vector<int> &subinstances = ctx.instances.groups.get<INST_SUBINSTANCES>(sid); // -V758
+  for (int sub : subinstances)
+    gather_subinstances(ctx, sub, req_flags, excl_flags, dst);
 };
 
 static inline InstanceId create_subinstance(Context &ctx, InstanceId queued_iid, SystemId sys_id, const SystemTemplate &sys,
@@ -101,11 +117,9 @@ static inline InstanceId create_subinstance(Context &ctx, InstanceId queued_iid,
   }
 
   CpuBuffer cpuBuffer;
-  if (sys.localCpuDataSize > 0)
-  {
-    cpuBuffer = group_cpu_buf;
-    cpuBuffer.size = sys.localCpuDataSize;
-  }
+  // We need a page id the root instance for defrag
+  cpuBuffer = group_cpu_buf;
+  cpuBuffer.size = sys.localCpuDataSize;
 
   eastl::vector<TextureDesc> texturesVs = sys.resources[STAGE_VS];
   eastl::vector<TextureDesc> texturesPs = sys.resources[STAGE_PS];
@@ -213,6 +227,8 @@ static inline InstanceId create_subinstance(Context &ctx, InstanceId queued_iid,
   SETV(INST_VISIBILITY, 0xffffffff);
   if constexpr (INST_RENDERABLE_TRIS >= 0)
     *stream.getOpt<INST_RENDERABLE_TRIS, uint>(sid) = 0;
+  if constexpr (INST_STAT_GROUP >= 0)
+    *stream.getOpt<INST_STAT_GROUP, uint8_t>(sid) = sys.statGroup;
 
   RefData *renderRefData = ctx.refDatas.get(sys.renderRefDataId);
   RefData *simulationRefData = ctx.refDatas.get(sys.simulationRefDataId);
@@ -389,19 +405,19 @@ void create_instances_from_queue(Context &ctx)
     bool forceDummy = (sys->refFlags & SYS_DUMMY_SYSTEM) ? true : false;
     adjust_buffer_size_by_quality(ctx, *sys, cpuDataSize, gpuDataSize, forceDummy);
 
-    if (cpuDataSize > ctx.cfg.data_buffer_size || gpuDataSize > ctx.cfg.data_buffer_size)
+    if (cpuDataSize > ctx.cfg.cpu_data_buffer_size || gpuDataSize > ctx.cfg.gpu_data_buffer_size)
     {
-      logerr("total data size of fx: %s is exceeding buffer limit (%d | %d) > %d", sys->name.c_str(), cpuDataSize, gpuDataSize,
-        ctx.cfg.data_buffer_size);
+      logerr("total data size of fx: %s is exceeding buffer limit (cpu %d | gpu %d) > (cpu limit %d | gpu limit %d)",
+        sys->name.c_str(), cpuDataSize, gpuDataSize, ctx.cfg.cpu_data_buffer_size, ctx.cfg.gpu_data_buffer_size);
       cpuDataSize = 0;
       gpuDataSize = 0;
     }
 
     if (gpuDataSize > 0)
     {
-      if (!create_gpu_buffer(ctx.gpuBufferPool, gpuDataSize, gpuBuf))
+      if (!create_gpu_buffer(ctx, gpuDataSize, gpuBuf))
       {
-        logerr("dafx: sys: %s, can't create gpu buffer");
+        logerr("dafx: sys: %s, can't create gpu buffer", sys->name);
         ctx.instances.list.destroyReference(cq.iid);
         continue;
       }
@@ -409,20 +425,24 @@ void create_instances_from_queue(Context &ctx)
 
     if (cpuDataSize > 0)
     {
-      if (!create_cpu_buffer(ctx.cpuBufferPool, cpuDataSize, cpuBuf))
+      if (!create_cpu_buffer(ctx, cpuDataSize, cpuBuf))
       {
-        logerr("dafx: sys: %s, can't create cpu buffer");
+        logerr("dafx: sys: %s, can't create cpu buffer", sys->name);
         ctx.instances.list.destroyReference(cq.iid);
         continue;
       }
     }
+
+    CpuBuffer initialCpuBuf = cpuBuf; // cpuBuf gets modified in create_subinstance
 
     InstanceId iid = create_subinstance(ctx, cq.iid, cq.sid, *sys, -1, gpuBuf, cpuBuf, -1, -1, 0.0f, 0);
     G_ASSERT_CONTINUE(gpuBuf.size == 0);
     G_ASSERT_CONTINUE(cpuBuf.size == 0);
     G_ASSERT_CONTINUE(iid == cq.iid);
 
-    if (!iid)
+    if (iid)
+      report_cpu_buffer_allocation_for_sid(ctx.cpuBufferPool, initialCpuBuf, *ctx.instances.list.get(iid));
+    else
       ctx.instances.list.destroyReference(cq.iid);
   }
 }
@@ -464,11 +484,12 @@ inline void destroy_subinstance(Context &ctx, int sid, int depth)
 
   GpuBuffer &gpuBuffer = stream.get<INST_GPU_BUFFER>(sid);
   if (gpuBuffer.size > 0)
-    release_gpu_buffer(ctx.gpuBufferPool, gpuBuffer, ctx.cfg.delayed_release_gpu_buffers);
+    release_gpu_buffer(ctx, gpuBuffer, ctx.cfg.delayed_release_gpu_buffers);
 
   CpuBuffer &cpuBuffer = stream.get<INST_CPU_BUFFER>(sid);
+  CpuPageId cpuPageId = cpuBuffer.pageId;
   if (cpuBuffer.size > 0)
-    release_cpu_buffer(ctx.cpuBufferPool, cpuBuffer);
+    release_cpu_buffer(ctx, cpuBuffer);
 
   unload_local_textures(stream.get<INST_LOCAL_RES_CS>(sid));
   unload_local_textures(stream.get<INST_LOCAL_RES_VS>(sid));
@@ -479,6 +500,9 @@ inline void destroy_subinstance(Context &ctx, int sid, int depth)
   eastl::vector<int> &subinstances = stream.get<INST_SUBINSTANCES>(sid);
   for (int subSid : subinstances)
     destroy_subinstance(ctx, subSid, depth + 1);
+
+  if (depth == 0)
+    report_all_cpu_subbuffers_released(ctx.cpuBufferPool, cpuPageId, sid);
 
   stream.get<INST_FLAGS>(sid) = 0;
   stream.get<INST_REF_FLAGS>(sid) = 0;
@@ -657,12 +681,12 @@ void reset_instance_from_queue(Context &ctx)
   }
 }
 
-void warmup_instance(ContextId cid, InstanceId iid, float time)
+void warmup_instance(ContextId cid, InstanceId iid, float time, bool per_instance_mode, float step_dt)
 {
   GET_CTX();
-  G_ASSERT_RETURN(time > 0, );
+  G_ASSERT_RETURN(time != 0.f, ); // negative = auto: one full particle lifetime, i.e. warmup to steady state
   os_spinlock_lock(&ctx.queueLock);
-  ctx.commandQueueNext.instanceWarmup.push_back({iid, time});
+  ctx.instanceWarmupRequests.push_back({iid, time, step_dt, per_instance_mode});
   os_spinlock_unlock(&ctx.queueLock);
 }
 DAGOR_NOINLINE
@@ -679,7 +703,7 @@ __forceinline bool compare_and_copy_64_bytes(void *__restrict dst, const void *_
   vec4i src0 = v_ldui((int *)src), src1 = v_ldui((int *)src + 4), src2 = v_ldui((int *)src + 8), src3 = v_ldui((int *)src + 12);
   vec4i cmp = v_andi(v_andi(v_cmp_eqi(v_ldui((int *)dst), src0), v_cmp_eqi(v_ldui((int *)dst + 4), src1)),
     v_andi(v_cmp_eqi(v_ldui((int *)dst + 8), src2), v_cmp_eqi(v_ldui((int *)dst + 12), src3)));
-  if (v_signmask(v_cast_vec4f(cmp)) == 0xF) // all dwords are equal to source
+  if (v_check_xyzw_all_true(v_cast_vec4f(cmp))) // all dwords are equal to source
     return false;
   v_stui((int *)dst, src0);
   v_stui((int *)dst + 4, src1);
@@ -905,6 +929,39 @@ eastl::string get_instance_info(ContextId cid, InstanceId iid)
     }
   }
   result.append_sprintf(" }");
+  return result;
+}
+
+static void collect_instance_bbox(InstanceGroups &stream, int sid, bbox3f &out_bbox)
+{
+  if (sid == queue_instance_sid || sid == dummy_instance_sid)
+    return;
+
+  const uint32_t &flags = stream.get<INST_FLAGS>(sid);
+  if (flags & SYS_RENDERABLE)
+    v_bbox3_add_box(out_bbox, stream.get<INST_BBOX>(sid));
+
+  const eastl::vector<int> &subinstances = stream.get<INST_SUBINSTANCES>(sid);
+  for (int subSid : subinstances)
+    collect_instance_bbox(stream, subSid, out_bbox);
+}
+
+BBox3 get_instance_bbox(ContextId cid, InstanceId iid)
+{
+  BBox3 result;
+  GET_CTX_RET(result);
+  INST_TUPLE_LOCK_GUARD;
+
+  int *pid = ctx.instances.list.get(iid);
+  G_ASSERT_RETURN(pid, result);
+  int sid = *pid;
+
+  InstanceGroups &stream = ctx.instances.groups;
+  bbox3f vBbox;
+  v_bbox3_init_empty(vBbox);
+  collect_instance_bbox(stream, sid, vBbox);
+  v_stu_bbox3(result, vBbox);
+
   return result;
 }
 
@@ -1391,6 +1448,14 @@ bool get_subinstances(ContextId cid, InstanceId iid, eastl::vector<InstanceId> &
     out.push_back(ctx.instances.groups.get<INST_RID>(subSid));
 
   return true;
+}
+
+void sync_instance_flags(ContextId cid)
+{
+  GET_CTX();
+  InstanceGroups &stream = ctx.instances.groups;
+  for (int sid = 0, end_sid = stream.size(); sid < end_sid; ++sid)
+    stream.get<INST_SYNCED_FLAGS>(sid) = stream.cget<INST_FLAGS>(sid);
 }
 
 void reset_instances_after_reset(Context &ctx)

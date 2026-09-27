@@ -9,6 +9,8 @@
 #include <propPanel/control/menu.h>
 #include <libTools/util/hdpiUtil.h>
 
+#include <EASTL/unique_ptr.h>
+
 // forward declarations for external classes
 namespace PropPanel
 {
@@ -137,7 +139,8 @@ public:
 
   /// Convert viewport world coordinates to normal device coordinates.
   /// @param[in] world - world coordinates
-  /// @param[out] ndc - normal device coordinates
+  /// @param[out] ndc - normal device coordinates; ndc.z is forward depth (0 at znear,
+  ///                   1 at zfar), NOT the reverse-Z the projection matrix produces
   virtual void worldToNDC(const Point3 &world, Point3 &ndc) const = 0;
 
   /// Convert viewport world coordinates to screen coordinates.
@@ -600,6 +603,18 @@ public:
   virtual PropPanel::DialogWindow *createDialog(hdpi::Px w, hdpi::Px h, const char *title) = 0;
   /// Delete dialog
   virtual void deleteDialog(PropPanel::DialogWindow *dlg) = 0;
+
+  /// Notify the currently focused edit control that it is about to lose focus immediately (e.g.
+  /// before a panel rebuild destroys it), so it commits its in-progress value. Wraps
+  /// PropPanel::send_immediate_focus_loss_notification(), which lives in the editor host and is not
+  /// linkable from a plugin -- so plugins reach it through this interface (same reason createDialog
+  /// goes through here). Default no-op for hosts that don't manage prop panels.
+  virtual void sendImmediateFocusLossNotification() {}
+
+  // Create a context menu.
+  virtual eastl::unique_ptr<PropPanel::IMenu> createContextMenu() = 0;
+  // Render the context menu created by createContextMenu. See the comment at PropPanel::render_context_menu() about usage.
+  virtual bool renderContextMenu(PropPanel::IMenu &menu) = 0;
   //@}
 
 
@@ -715,6 +730,11 @@ public:
   /// @param[out] box - selection box
   /// @return @b true if operation successful, @b false in other case
   virtual bool getSelectionBox(BBox3 &box) = 0;
+
+  /// Get global bounding box.
+  /// @param[out] box - global box
+  /// @return @b true if operation successful, @b false in other case
+  virtual bool getGlobalBox(BBox3 &box) = 0;
 
   /// Zoom and center objects.
   virtual void zoomAndCenter() = 0;
@@ -834,6 +854,16 @@ public:
   /// @return pointer to editor's render buffer
   // virtual DynRenderBuffer *getDRB() = 0;
 
+  /// Checks whether a project is fully loaded or is in progress yet.
+  /// (E.g.: viewport/UI/Gizmo/object functions are active or not)
+  ///@return @b true if a load project operation is complete.
+  virtual bool isProjectLoaded() const = 0;
+
+  /// Get the total number of pending textures loaded asynchronously.
+  /// @param[out] total_count the total number of pending textures
+  /// @return @b false if the internal texture load factory is not inited
+  virtual bool getPendingTextureLoadTotalCount(unsigned int &total_count) = 0;
+
   /// Get pointer to editor's undo system.
   /// @return pointer to editor's undo system
   virtual UndoSystem *getUndoSystem() = 0;
@@ -910,6 +940,8 @@ public:
   virtual void restoreEditorColliders() const = 0;
   virtual float getMaxTraceDistance() const = 0;
   virtual const EditorWorkspace &getBaseWorkspace() = 0;
+  // Returns the named VFS mount for the test script directory of the app (e.g. "%asset_viewer_tests") or null.
+  virtual const char *getTestScriptMount() const { return nullptr; }
 
   virtual void setShowMessageAt(int x, int y, const SimpleString &msg) = 0;
   virtual void showMessageAt() = 0;

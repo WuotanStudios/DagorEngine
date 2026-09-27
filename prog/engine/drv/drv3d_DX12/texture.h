@@ -1,7 +1,6 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
-#include "constants.h"
 #include "device_memory_class.h"
 #include "extents.h"
 #include "format_store.h"
@@ -22,13 +21,10 @@ namespace drv3d_dx12
 class BaseTex;
 class Image;
 
-void notify_delete(BaseTex *texture, const Bitset<dxil::MAX_T_REGISTERS> *srvs, const Bitset<dxil::MAX_U_REGISTERS> *uavs,
-  Bitset<Driver3dRenderTarget::MAX_SIMRT> rtvs, bool dsv);
+void notify_delete(BaseTex *texture, const Bitset<dxil::MAX_T_REGISTERS> *srvs, const Bitset<dxil::MAX_U_REGISTERS> *uavs);
 void mark_texture_stages_dirty_no_lock(BaseTex *texture, const Bitset<dxil::MAX_T_REGISTERS> *srvs,
   const Bitset<dxil::MAX_U_REGISTERS> *uavs, Bitset<Driver3dRenderTarget::MAX_SIMRT> rtvs, bool dsv);
 void dirty_srv_no_lock(BaseTex *texture, uint32_t stage, Bitset<dxil::MAX_T_REGISTERS> slots);
-void dirty_srv(BaseTex *texture, uint32_t stage, Bitset<dxil::MAX_T_REGISTERS> slots);
-void dirty_sampler(BaseTex *texture, uint32_t stage, Bitset<dxil::MAX_T_REGISTERS> slots);
 void dirty_sampler_no_lock(BaseTex *texture, uint32_t stage, Bitset<dxil::MAX_T_REGISTERS> slots);
 void dirty_srv_and_sampler_no_lock(BaseTex *texture, uint32_t stage, Bitset<dxil::MAX_T_REGISTERS> slots);
 void dirty_uav_no_lock(BaseTex *texture, uint32_t stage, Bitset<dxil::MAX_U_REGISTERS> slots);
@@ -39,6 +35,7 @@ class BaseTex final : public D3dResourceNameImpl<BaseTexture>
 public:
   bool isRenderTarget() const { return 0 != (cflg & TEXCF_RTARGET); }
   bool isUav() const { return 0 != (cflg & TEXCF_UNORDERED); }
+  bool isUpdateDestination() const { return 0 != (cflg & TEXCF_UPDATE_DESTINATION); }
   bool isMultisampled() const { return 0 != (cflg & TEXCF_SAMPLECOUNT_MASK); }
 
   bool isLocked() const { return lockFlags != 0; }
@@ -73,13 +70,23 @@ public:
 #if DAGOR_DBGLEVEL > 0
   bool wasUsed() const { return stateBitSet.test(active_binding_was_used_offset); }
   void setWasUsed() { stateBitSet.set(active_binding_was_used_offset); }
+#else
+  bool wasUsed() const { return true; }
+  void setWasUsed() {}
 #endif
+  void adoptWasUsed(BaseTex *other)
+  {
+    if (other->wasUsed())
+    {
+      other->setWasUsed();
+    }
+  }
   bool isPreallocBeforeLoad() const { return stateBitSet.test(active_binding_is_prealloc_before_load_offset); }
   void setIsPreallocBeforeLoad(bool s) { stateBitSet.set(active_binding_is_prealloc_before_load_offset, s); }
   bool isSampleStencil() const { return stateBitSet.test(active_binding_is_sample_stencil); }
   void setIsSampleStencil(bool s) { stateBitSet.set(active_binding_is_sample_stencil, s); }
-  bool isArrayCube() const { return stateBitSet.test(active_binding_is_array_cube_offset); }
-  void setIsArrayCube(bool s) { stateBitSet.set(active_binding_is_array_cube_offset, s); }
+  bool isExcludedFromDefragmentation() const { return stateBitSet.test(exclude_from_defragmentation_offset); }
+  void setExcludedFromDefragmentation(bool s) { stateBitSet.set(exclude_from_defragmentation_offset, s); }
 
   DECLARE_TQL_TID_AND_STUB()
 
@@ -87,7 +94,7 @@ public:
 
   ArrayLayerCount getArrayCount() const;
 
-  BaseTex(D3DResourceType type, uint32_t cflg);
+  BaseTex(D3DResourceType type, uint32_t cflg, ResourceTagType tg);
 
   /// ->>
   void setReadStencil(bool on) override { setIsSampleStencil(on && getFormat().isStencil()); }
@@ -109,8 +116,6 @@ public:
   int lockimg(void **, int &stride_bytes, int level = 0, unsigned flags = TEXLOCK_DEFAULT) override;
   int lockimg(void **, int &stride_bytes, int face, int level = 0, unsigned flags = TEXLOCK_DEFAULT) override;
   int update(BaseTexture *src) override;
-  int updateSubRegion(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
-    int dest_subres_idx, int dest_x, int dest_y, int dest_z) override;
   int unlockimg() override;
   int lockbox(void **data, int &row_pitch, int &slice_pitch, int level, unsigned flags = TEXLOCK_DEFAULT) override;
   int unlockbox() override;
@@ -121,16 +126,9 @@ public:
   bool allocateTex() override;
   void discardTex() override;
 
-  bool isCubeArray() const override { return isArrayCube(); }
-
   bool updateTexResFormat(unsigned d3d_format) override;
   BaseTexture *makeTmpTexResCopy(int w, int h, int d, int l) override;
   void replaceTexResObject(BaseTexture *&other_tex) override;
-
-  BaseTexture *downSize(int new_width, int new_height, int new_depth, int new_mips, unsigned start_src_level,
-    unsigned level_offset) override;
-  BaseTexture *upSize(int new_width, int new_height, int new_depth, int new_mips, unsigned start_src_level,
-    unsigned level_offset) override;
 
   static uint32_t update_flags_for_linear_layout(uint32_t cflags, FormatStore format);
   static DeviceMemoryClass get_memory_class(uint32_t cflags);
@@ -171,14 +169,16 @@ public:
 
   SamplerState samplerState;
 
+  ResourceTagType tag = nullptr;
+
   dag::AtomicFlag usedInBindless{};
 
   struct ImageMem
   {
     void *ptr = nullptr;
     uint32_t rowPitch = 0;
-    uint32_t slicePitch = 0;
-    uint32_t memSize = 0;
+    uint64_t slicePitch = 0;
+    uint64_t memSize = 0;
   };
 
   static HostDeviceSharedMemoryRegion allocate_read_write_staging_memory(const Image *image,
@@ -235,9 +235,9 @@ private:
   static constexpr uint32_t active_binding_was_used_offset = 1 + active_binding_dsv_offset;
   static constexpr uint32_t active_binding_is_prealloc_before_load_offset = 1 + active_binding_was_used_offset;
   static constexpr uint32_t active_binding_is_sample_stencil = 1 + active_binding_is_prealloc_before_load_offset;
-  static constexpr uint32_t active_binding_is_array_cube_offset = 1 + active_binding_is_sample_stencil;
-  static constexpr uint32_t unlock_image_is_upload_skipped = active_binding_is_array_cube_offset + 1;
-  static constexpr uint32_t texture_state_bits_count = unlock_image_is_upload_skipped + 1;
+  static constexpr uint32_t unlock_image_is_upload_skipped = active_binding_is_sample_stencil + 1;
+  static constexpr uint32_t exclude_from_defragmentation_offset = unlock_image_is_upload_skipped + 1;
+  static constexpr uint32_t texture_state_bits_count = exclude_from_defragmentation_offset + 1;
   Bitset<texture_state_bits_count> stateBitSet;
   Bitset<dxil::MAX_T_REGISTERS> srvBindingStages[STAGE_MAX_EXT];
   Bitset<dxil::MAX_U_REGISTERS> uavBindingStages[STAGE_MAX_EXT];

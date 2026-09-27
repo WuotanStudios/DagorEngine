@@ -5,10 +5,12 @@
 #include <3d/dag_texMgr.h>
 #include <generic/dag_tab.h>
 #include <generic/dag_DObject.h>
+#include <generic/dag_carray.h>
 #include <memory/dag_mem.h>
 #include <util/dag_stdint.h>
 #include <util/dag_globDef.h>
 #include <math/dag_color.h>
+#include <EASTL/string.h>
 
 
 class ShaderElement;
@@ -35,6 +37,21 @@ public:
   Color4 convert(Color4 from) override { return from; }
 
   static IdentColorConvert object;
+};
+
+class VoxelSurfaceSrc : public DObject
+{
+public:
+  Tab<carray<uint8_t, 4 * 4 * 2>> rgbaBlocks;
+  Tab<carray<uint8_t, 4 * 4>> normBlocks;
+
+  VoxelSurfaceSrc();
+  ~VoxelSurfaceSrc() override;
+  decl_class_name(VoxelSurfaceSrc);
+
+  int save(mkbindump::BinDumpSaveCB &cwr);
+
+  static int zstdCompressionLevel;
 };
 
 /*********************************
@@ -85,6 +102,8 @@ public:
 
   // attach one part
   void attachDataPart(const GlobalVertexDataSrc &other_data, int _sv, int _numv, int _si, int _numf, int num_parts);
+
+  dag::Span<uint8_t> attachRawData(int size_bytes);
 
   void convertToIData32();
 
@@ -148,7 +167,7 @@ public:
 
   // build meshdata
   bool build(class Mesh &m, ShaderMaterial **mats, int nummats, IColorConvert &color_convert, bool allow_32_bit = false,
-    int node_id = 128);
+    int node_id = 128, int uv_err_lod = -1, const char *uv_err_node = nullptr);
 
   // optimize data for cache
   void optimizeForCache(bool opt_overdraw_too = true);
@@ -180,6 +199,22 @@ public:
   static void reset_channel_cvt_errors();
   static int get_channel_cvt_errors();
   static int get_channel_cvt_critical_errors();
+
+  // aggregated per (lod, node, tc channel): count of offending verts and worst |uv|
+  struct UvRangeError
+  {
+    eastl::string node;
+    int lod;
+    int channel;
+    int count;
+    float maxAbs;
+  };
+
+  static void reset_uv_range_errors();
+  static int get_uv_range_error_count();
+  static float get_uv_range_max_abs();
+  static const Tab<UvRangeError> &get_uv_range_errors();
+  static bool exchange_uv_validation(bool on);
 
   RElem *addElem(int stage)
   {
@@ -231,6 +266,13 @@ private:
   void AddRElems(Tab<RElem> &elem, const Tab<RElem> &other_elem, bool allow_32_bit);
 };
 DAG_DECLARE_RELOCATABLE(ShaderMeshData);
+
+struct ScopedUvValidation
+{
+  bool prev;
+  ScopedUvValidation(bool on) : prev(ShaderMeshData::exchange_uv_validation(on)) {}
+  ~ScopedUvValidation() { ShaderMeshData::exchange_uv_validation(prev); }
+};
 
 
 bool can_combine_elems(const ShaderMeshData::RElem &left, const ShaderMeshData::RElem &right, bool allow_32_bit = false,

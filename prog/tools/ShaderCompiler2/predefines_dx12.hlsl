@@ -1,4 +1,6 @@
 
+#define MIN_POSSIBLE_WARP_SIZE 8 // PC worst case (Intel)
+
 struct TextureSampler
 {
   Texture2D tex;
@@ -33,7 +35,6 @@ struct TextureCubeArraySampler
 //#define WaveReadLaneAt    ReadLane
 #define WaveReadFirstLane WaveReadLaneFirst
 //#define WaveGetLaneIndex
-#define WaveIsHelperLane  WaveIsFirstLane
 #define WaveAllBitOr      WaveActiveBitOr
 #define WaveAllBitAnd     WaveActiveBitAnd
 #define WaveAllSum_F32    WaveActiveSum
@@ -45,3 +46,5 @@ struct TextureCubeArraySampler
 #define WaveAllMin_U32    WaveActiveMin
 
 #define NOP
+
+#define ACCESS_FORMAT(fmt)

@@ -33,7 +33,7 @@ static void create_hmap_displacement_invalidators_manager_es(
 }
 
 static void hmap_displacement_invalidators_count_under_limit_update_buffer(const HmapDisplacementInvalidators &data,
-  UniqueBufHolder &buffer)
+  UniqueBufWithShaderVar &buffer)
 {
   if (!data.empty())
   {
@@ -48,14 +48,14 @@ static void hmap_displacement_invalidators_count_under_limit_update_buffer(const
 
 ECS_TAG(render)
 ECS_ON_EVENT(on_appear)
-static void init_hmap_displacement_invalidation_es(const ecs::Event &, UniqueBufHolder &hmap_displacement_invalidators__buffer)
+static void init_hmap_displacement_invalidation_es(const ecs::Event &, UniqueBufWithShaderVar &hmap_displacement_invalidators__buffer)
 {
   hmap_displacement_invalidators__buffer = dag::buffers::create_persistent_sr_structured(sizeof(HmapDisplacementInvalidator),
     HMAP_DISPLACEMENT_INVALIDATORS_MAX_COUNT, "hmap_displacement_invalidators_buffer");
 }
 
 template <typename Callable>
-static void add_hmap_displacement_invalidator_ecs_query(ecs::EntityId eid, Callable c);
+static void add_hmap_displacement_invalidator_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable c);
 
 ECS_TAG(render)
 ECS_ON_EVENT(on_appear)
@@ -71,9 +71,9 @@ static void add_hmap_displacement_invalidator_es(const ecs::Event &,
     return;
 
   const Point3 &objectPos = transform.getcol(3);
-  add_hmap_displacement_invalidator_ecs_query(invalidatorsManagerEid,
+  add_hmap_displacement_invalidator_ecs_query(manager, invalidatorsManagerEid,
     [&objectPos, hmap_displacement_invalidator__inner_radius, hmap_displacement_invalidator__outer_radius, eid](
-      bool &hmap_displacement_invalidators__count_over_limit, UniqueBufHolder &hmap_displacement_invalidators__buffer,
+      bool &hmap_displacement_invalidators__count_over_limit, UniqueBufWithShaderVar &hmap_displacement_invalidators__buffer,
       HmapDisplacementInvalidators &hmap_displacement_invalidators__data) {
       HmapDisplacementInvalidator objectToAdd = {
         objectPos, hmap_displacement_invalidator__inner_radius, hmap_displacement_invalidator__outer_radius, ecs::entity_id_t(eid)};
@@ -89,7 +89,7 @@ static void add_hmap_displacement_invalidator_es(const ecs::Event &,
 }
 
 template <typename Callable>
-static void move_hmap_displacement_invalidator_ecs_query(ecs::EntityId eid, Callable c);
+static void move_hmap_displacement_invalidator_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable c);
 
 ECS_TAG(render)
 ECS_TRACK(transform)
@@ -102,8 +102,8 @@ static void move_hmap_displacement_invalidator_es(
     return;
 
   const Point3 &newOjectPos = transform.getcol(3);
-  move_hmap_displacement_invalidator_ecs_query(invalidatorsManagerEid,
-    [&newOjectPos, eid](UniqueBufHolder &hmap_displacement_invalidators__buffer,
+  move_hmap_displacement_invalidator_ecs_query(manager, invalidatorsManagerEid,
+    [&newOjectPos, eid](UniqueBufWithShaderVar &hmap_displacement_invalidators__buffer,
       HmapDisplacementInvalidators &hmap_displacement_invalidators__data) {
       if (auto it = eastl::find_if(hmap_displacement_invalidators__data.begin(), hmap_displacement_invalidators__data.end(),
             [&](const HmapDisplacementInvalidator &object) { return object.eid == ecs::entity_id_t(eid); });
@@ -121,7 +121,7 @@ static void move_hmap_displacement_invalidator_es(
 }
 
 template <typename Callable>
-static void remove_hmap_displacement_invalidator_ecs_query(ecs::EntityId eid, Callable c);
+static void remove_hmap_displacement_invalidator_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable c);
 
 ECS_TAG(render)
 ECS_ON_EVENT(on_disappear)
@@ -132,8 +132,8 @@ static void remove_hmap_displacement_invalidator_es(const ecs::Event &, ecs::Ent
   if (!invalidatorsManagerEid)
     return;
 
-  remove_hmap_displacement_invalidator_ecs_query(invalidatorsManagerEid,
-    [eid](bool &hmap_displacement_invalidators__count_over_limit, UniqueBufHolder &hmap_displacement_invalidators__buffer,
+  remove_hmap_displacement_invalidator_ecs_query(manager, invalidatorsManagerEid,
+    [eid](bool &hmap_displacement_invalidators__count_over_limit, UniqueBufWithShaderVar &hmap_displacement_invalidators__buffer,
       HmapDisplacementInvalidators &hmap_displacement_invalidators__data) {
       if (auto it = eastl::find_if(hmap_displacement_invalidators__data.begin(), hmap_displacement_invalidators__data.end(),
             [&](const HmapDisplacementInvalidator &object) { return object.eid == ecs::entity_id_t(eid); });
@@ -158,7 +158,7 @@ ECS_TAG(render)
 ECS_REQUIRE(eastl::true_type hmap_displacement_invalidators__count_over_limit)
 static void hmap_displacement_invalidators_count_over_limit_update_buffer_es(const UpdateStageInfoBeforeRender &,
   HmapDisplacementInvalidators &hmap_displacement_invalidators__data,
-  UniqueBufHolder &hmap_displacement_invalidators__buffer)
+  UniqueBufWithShaderVar &hmap_displacement_invalidators__buffer)
 {
   // When we go above the limit of allowed concurrent objects, we update the objects vector every frame since the decision which
   // objects disable heightmap displacement around them is driven by their closeness to the camera (the effect is applied only to

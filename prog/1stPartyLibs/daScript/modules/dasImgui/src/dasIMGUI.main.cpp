@@ -2,7 +2,6 @@
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_interop.h"
 #include "daScript/ast/ast_handle.h"
-#include "daScript/ast/ast_typefactory_bind.h"
 #include "daScript/simulate/bind_enum.h"
 #include "dasIMGUI.h"
 #include "need_dasIMGUI.h"
@@ -145,7 +144,7 @@ namespace das {
         drawList.AddText(pos, col, text);
     }
 
-    void AddText2( ImDrawList & drawList, const ImFont* font, float font_size, const ImVec2& pos, ImU32 col,
+    void AddText2( ImDrawList & drawList, ImFont* font, float font_size, const ImVec2& pos, ImU32 col,
         const char* text_begin, float wrap_width, const ImVec4* cpu_fine_clip_rect) {
         drawList.AddText(font,font_size,pos,col,text_begin,nullptr,wrap_width,cpu_fine_clip_rect);
     }
@@ -296,20 +295,21 @@ namespace das {
         addExtern<DAS_BIND_FUN(das::PassFilter), SimNode_ExtFuncCall, imguiTempFn>(*this, lib, "PassFilter",
             SideEffects::worstDefault, "das::PassFilter");
         addExtern<DAS_BIND_FUN(das::text_range_string), SimNode_ExtFuncCall, imguiTempFn>(*this, lib, "string",
-            SideEffects::worstDefault, "das::text_range_string");
+            SideEffects::worstDefault, "das::text_range_string")
+                ->setTempStringResult();
         // imcolor
         addExtern<DAS_BIND_FUN(das::HSV), SimNode_ExtFuncCall, imguiTempFn>(*this, lib, "HSV",
             SideEffects::none, "das::HSV")
                 ->args({"h","s","v","a"})
-                    ->arg_init(3,make_smart<ExprConstFloat>(1.0f));
+                    ->arg_init(3,new ExprConstFloat(1.0f));
         // imgui draw list
         addExtern<DAS_BIND_FUN(das::AddText), SimNode_ExtFuncCall, imguiTempFn>(*this, lib, "AddText",
             SideEffects::worstDefault, "das::AddText");
         addExtern<DAS_BIND_FUN(das::AddText2), SimNode_ExtFuncCall, imguiTempFn>(*this, lib, "AddText",
             SideEffects::worstDefault, "das::AddText2")
                 ->args({"drawList","font","font_size","pos","col","text","wrap_width","cpu_fine_clip_rect"})
-                    ->arg_init(6,make_smart<ExprConstFloat>(0.0f))
-                    ->arg_init(7,make_smart<ExprConstPtr>());
+                    ->arg_init(6,new ExprConstFloat(0.0f))
+                    ->arg_init(7,new ExprConstPtr());
         // variadic functions
         addExtern<DAS_BIND_FUN(das::Text), SimNode_ExtFuncCall, imguiTempFn>(*this,lib,"Text",
             SideEffects::worstDefault,"das::Text");
@@ -352,7 +352,8 @@ namespace das {
         addExtern<DAS_BIND_FUN(das::ImGTB_SetAt), SimNode_ExtFuncCall, imguiTempFn>(*this,lib,"set_at",   // TODO: do we need to learn to map operator []?
             SideEffects::worstDefault,"das::ImGTB_SetAt");
         addExtern<DAS_BIND_FUN(das::ImGTB_Slice), SimNode_ExtFuncCall, imguiTempFn>(*this,lib,"slice",
-            SideEffects::worstDefault,"das::ImGTB_Slice");
+            SideEffects::worstDefault,"das::ImGTB_Slice")
+                ->setTempStringResult();
         // ImGuiInputTextCallbackData
         addExtern<DAS_BIND_FUN(das::InsertChars), SimNode_ExtFuncCall, imguiTempFn>(*this,lib,"InsertChars",
             SideEffects::worstDefault,"das::InsertChars");
@@ -368,8 +369,8 @@ namespace das {
         // CalcTextSize
         addExtern<DAS_BIND_FUN(das::CalcTextSize), SimNode_ExtFuncCall, imguiTempFn>(*this, lib, "CalcTextSize",SideEffects::worstDefault, "das::CalcTextSize")
         ->args({"text","hide_text_after_double_hash","wrap_width"})
-            ->arg_init(1,make_smart<ExprConstBool>(false))
-            ->arg_init(2,make_smart<ExprConstFloat>(-1.0f));
+            ->arg_init(1,new ExprConstBool(false))
+            ->arg_init(2,new ExprConstFloat(-1.0f));
         // combo
         addExtern<DAS_BIND_FUN(das::Combo), SimNode_ExtFuncCall, imguiTempFn>(*this, lib, "_builtin_Combo",
             SideEffects::worstDefault, "das::Combo");
@@ -380,45 +381,38 @@ namespace das {
             SideEffects::worstDefault, "das::PlotHistogram");
         // additional default values
         findUniqueFunction("AddRect")
-            ->arg_init(5, make_smart<ExprConstEnumeration>("RoundCornersAll",makeType<ImDrawFlags_>(lib)));
+            ->arg_init(5, new ExprConstEnumeration("RoundCornersAll",makeType<ImDrawFlags_>(lib)));
         findUniqueFunction("AddRectFilled")
-            ->arg_init(5, make_smart<ExprConstEnumeration>("RoundCornersAll",makeType<ImDrawFlags_>(lib)));
+            ->arg_init(5, new ExprConstEnumeration("RoundCornersAll",makeType<ImDrawFlags_>(lib)));
         findUniqueFunction("BeginTable")
-            ->arg_init(3, make_smart<ExprCall>(LineInfo(), "ImVec2"));
+            ->arg_init(3, new ExprCall(LineInfo(), "ImVec2"));
         for ( auto & fn : functionsByName[hash64z("Selectable")] ) {
-            fn->arg_init(3, make_smart<ExprCall>(LineInfo(), "ImVec2"));
+            fn->arg_init(3, new ExprCall(LineInfo(), "ImVec2"));
         }
         findUniqueFunction("SetNextWindowPos")
-            ->arg_init(2, make_smart<ExprCall>(LineInfo(), "ImVec2"));
+            ->arg_init(2, new ExprCall(LineInfo(), "ImVec2"));
         findUniqueFunction("Button")
-            ->arg_init(1, make_smart<ExprCall>(LineInfo(), "ImVec2"));
+            ->arg_init(1, new ExprCall(LineInfo(), "ImVec2"));
         for ( auto & fn : functionsByName[hash64z("PlotHistogram")] ) {
             if ( fn->arguments.size()==9 ) {
-                fn->arg_init(7, make_smart<ExprCall>(LineInfo(), "ImVec2"));
-                fn->arg_init(8, make_smart<ExprConstInt>(int32_t(sizeof(float))));
+                fn->arg_init(7, new ExprCall(LineInfo(), "ImVec2"));
+                fn->arg_init(8, new ExprConstInt(int32_t(sizeof(float))));
             }
         }
         findUniqueFunction("TableSetupColumn")
-            ->arg_init(3, make_smart<ExprConstUInt>(uint32_t(0)));
+            ->arg_init(3, new ExprConstUInt(uint32_t(0)));
         findUniqueFunction("BeginListBox")
-            ->arg_init(1, make_smart<ExprCall>(LineInfo(), "ImVec2"));
+            ->arg_init(1, new ExprCall(LineInfo(), "ImVec2"));
         findUniqueFunction("ColorButton")
-            ->arg_init(3, make_smart<ExprCall>(LineInfo(), "ImVec2"));
+            ->arg_init(3, new ExprCall(LineInfo(), "ImVec2"));
         // time to fix-up const & ImVec2 and const & ImVec4
         for ( auto & pfn : this->functions.each() ) {
-            bool anyString = false;
             for ( auto & arg : pfn->arguments ) {
-                if ( arg->type->constant && arg->type->ref && arg->type->dim.size()==0 ) {
+                if ( arg->type->constant && arg->type->ref && !arg->type->isFixedArray() ) {
                     if ( arg->type->baseType==Type::tFloat2 || arg->type->baseType==Type::tFloat4 ) {
                         arg->type->ref = false;
                     }
                 }
-                if ( arg->type->isString() && !arg->type->ref ) {
-                    anyString = true;
-                }
-            }
-            if ( anyString ) {
-                pfn->needStringCast = true;
             }
         }
     }

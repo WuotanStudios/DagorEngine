@@ -6,6 +6,7 @@
 
 #include <dag/dag_vector.h>
 #include <generic/dag_tabFwd.h>
+#include <drv/3d/dag_texFlags.h>
 
 #include <utility>
 
@@ -16,8 +17,10 @@ namespace shadercache
 struct WarmupParams
 {
   dag::Vector<eastl::pair<const char *, unsigned>> invalidVars;
-  BaseTexture *colorTarget = nullptr;
-  BaseTexture *depthTarget = nullptr;
+  dag::Vector<const char *> shadersToSkip;
+  int colorTargetCount = 0;
+  int colorTargetFormat = TEXFMT_DEFAULT;
+  int depthTargetFormat = 0;
 };
 
 // NOTE: requires GPU acquire!

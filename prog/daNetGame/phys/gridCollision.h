@@ -17,7 +17,13 @@ struct CollisionObject;
 typedef eastl::fixed_function<sizeof(intptr_t) * 4, float(ecs::EntityId /*eid*/)> get_capsule_radius_cb_t;
 using GameObjectsCollisionsCb = eastl::fixed_function<6 * sizeof(void *), void(CollisionObject obj)>;
 
-bool grid_trace_main_entities(const Point3 &from, const Point3 &dir, float &t, Point3 &out_vel, int ignore_id, int ray_mat_id);
+bool grid_trace_main_entities(const Point3 &from,
+  const Point3 &dir,
+  float &t,
+  Point3 &out_vel,
+  int ignore_id,
+  int ray_mat_id,
+  const dag::ConstSpan<uint32_t> grid_types);
 void grid_process_main_entities_collision_objects_on_ray(
   const Point3 &from, const Point3 &to, float radius, GameObjectsCollisionsCb coll_cb);
 bool trace_entities_in_grid(uint32_t grid_hash,
@@ -48,10 +54,13 @@ bool trace_entities_in_grid_by_capsule(uint32_t grid_hash,
 bool trace_entities_in_grid_by_capsule(
   uint32_t grid_hash, const Point3 &from, const Point3 &dir, float &t, float radius, ecs::EntityId ignore_eid);
 bool rayhit_entities_in_grid(uint32_t grid_hash, const Point3 &from, const Point3 &dir, float t, ecs::EntityId ignore_eid);
+// convex and local_bbox are both in tm's local space. local_bbox drives the search region: one that
+// contains the convex searches the whole volume, a smaller one caps the range. The grid query only
+// narrows candidates, collres testInclusion is exact.
 bool query_entities_intersections_in_grid(uint32_t grid_hash,
   dag::ConstSpan<plane3f> convex,
   const TMatrix &tm,
-  float rad,
+  const BBox3 &local_bbox,
   bool rayhit,
   IntersectedEntities &entities,
   SortIntersections do_sort);

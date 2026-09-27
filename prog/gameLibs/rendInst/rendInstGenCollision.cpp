@@ -14,8 +14,7 @@
 #include <math/dag_wooray2d.h>
 #include <EASTL/fixed_vector.h>
 #include <memory/dag_framemem.h>
-#include <gameMath/traceUtils.h>
-#include <util/dag_bitArray.h>
+#include <rendInst/traceUtils.h>
 
 #define debug(...) logmessage(_MAKE4C('RGEN'), __VA_ARGS__)
 
@@ -40,6 +39,12 @@ static __forceinline T roll_bit(T bit)
   return (bit << 1) | (bit >> ((sizeof(bit) * CHAR_BIT) - 1));
 }
 
+// reach of the collision bounding sphere from the instance origin, at unit scale
+static __forceinline vec4f bounding_rad_from_origin(const CollisionResource *coll_res)
+{
+  return v_add_x(v_length3_x(coll_res->vBoundingSphere), v_set_x(coll_res->getBoundingSphereRad()));
+}
+
 #if DAGOR_DBGLEVEL > 0
 static inline void verify_trace(const Trace &trace)
 {
@@ -52,6 +57,19 @@ static inline void verify_trace(const Trace &trace)
 #else
 static inline void verify_trace(const Trace &) {}
 #endif
+
+static inline bool should_override_material_from_ri_props(int mat_id, const rendinst::props::RendinstProperties &ri_prop)
+{
+  return ri_prop.overrideMaterialForTraces || mat_id == PHYSMAT_INVALID || mat_id == PHYSMAT_DEFAULT;
+}
+
+static inline void try_override_material_from_ri_props(int &mat_id, int layer_idx, int pool, int cell_idx)
+{
+  const rendinst::props::RendinstProperties *riProp =
+    props::get_by_desc<props::RendinstProperties>(RendInstDesc(cell_idx, 0, pool, 0, layer_idx));
+  if (riProp && should_override_material_from_ri_props(mat_id, *riProp))
+    mat_id = riProp->matId;
+}
 
 struct TraceRayStrat : public MaterialRayStrat
 {
@@ -80,13 +98,7 @@ struct TraceRayStrat : public MaterialRayStrat
         ri_desc->pool = pool;
         ri_desc->offs = offs;
       }
-      if (out_mat_id == PHYSMAT_INVALID || out_mat_id == PHYSMAT_DEFAULT)
-      {
-        int poolRef = cell_idx == -1 ? rendinst::riExtra[pool].riPoolRef : pool;
-        RendInstGenData *rgl = rendinst::getRgLayer(cell_idx == -1 ? rendinst::riExtra[pool].riPoolRefLayer : layer_idx);
-        if (poolRef >= 0 && rgl)
-          out_mat_id = rgl->rtData->riProperties[poolRef].matId;
-      }
+      try_override_material_from_ri_props(out_mat_id, layer_idx, pool, cell_idx);
     }
     have_collision |= meshCollision;
     return false;
@@ -108,13 +120,7 @@ struct TraceRayStrat : public MaterialRayStrat
         ri_desc->pool = pool;
         ri_desc->offs = offs;
       }
-      if (out_mat_id == PHYSMAT_INVALID || out_mat_id == PHYSMAT_DEFAULT)
-      {
-        int poolRef = cell_idx == -1 ? rendinst::riExtra[pool].riPoolRef : pool;
-        RendInstGenData *rgl = rendinst::getRgLayer(cell_idx == -1 ? rendinst::riExtra[pool].riPoolRefLayer : layer_idx);
-        if (poolRef >= 0 && rgl)
-          out_mat_id = rgl->rtData->riProperties[poolRef].matId;
-      }
+      try_override_material_from_ri_props(out_mat_id, layer_idx, pool, cell_idx);
     }
     have_collision |= meshCollision;
     return false;
@@ -139,6 +145,70 @@ struct TraceRayStrat : public MaterialRayStrat
 
     return !PhysMat::isMaterialsCollide(rayMatId, mat_id);
   }
+
+  static constexpr bool hasRiExtraIgnoreFunction = false;
+  // executeForMesh shrinks out_t on a closer hit, so a near-to-far sweep can stop early
+  static constexpr bool shrinksOutT = true;
+};
+
+// Closest-hit trace that also records the hit RendInstDesc per ray into a caller span.
+// Geometry (outT/outNorm/outMatId) is produced by the base strategy unchanged; this only
+// adds per-ray desc capture, detected by the ray's outT shrinking on a closer hit. This
+// covers the non-cached paths (where executeForMesh/Pos get the real cell_idx); the cached
+// path fills the same span directly via rayTestIndividualNoLock, which is authoritative.
+struct TraceRayMultiDescStrat : public TraceRayStrat
+{
+  dag::Span<rendinst::RendInstDesc> outDescs;
+
+  TraceRayMultiDescStrat(PhysMat::MatID ray_mat, TraceFlags trace_flags, dag::Span<rendinst::RendInstDesc> descs) :
+    TraceRayStrat(ray_mat, trace_flags), outDescs(descs)
+  {}
+
+  __forceinline void storeDesc(int ray_idx, int layer_idx, int idx, int pool, int offs, int cell_idx)
+  {
+    if (ray_idx >= outDescs.size())
+      return;
+    rendinst::RendInstDesc &d = outDescs[ray_idx];
+    d.layer = layer_idx;
+    d.idx = idx;
+    d.pool = pool;
+    d.offs = offs;
+    d.cellIdx = cell_idx;
+  }
+
+  bool executeForMesh(CollisionResource *coll_res, mat44f_cref tm, int ray_idx, const Point3 &pos, const Point3 &dir, float &out_t,
+    Point3 &out_norm, rendinst::RendInstDesc *ri_desc, bool &have_collision, int layer_idx, int idx, int pool, int offs,
+    int &out_mat_id, int cell_idx)
+  {
+    float prevT = out_t;
+    bool r = TraceRayStrat::executeForMesh(coll_res, tm, ray_idx, pos, dir, out_t, out_norm, ri_desc, have_collision, layer_idx, idx,
+      pool, offs, out_mat_id, cell_idx);
+    if (out_t < prevT)
+      storeDesc(ray_idx, layer_idx, idx, pool, offs, cell_idx);
+    return r;
+  }
+
+  bool executeForPos(CollisionResource *coll_res, mat44f_cref tm, const BBox3 &box_collision, int ray_idx, const Point3 &pos,
+    const Point3 &dir, float &out_t, Point3 &out_norm, rendinst::RendInstDesc *ri_desc, bool &have_collision, int layer_idx, int idx,
+    int pool, int offs, int &out_mat_id, int cell_idx, const BBox3 &bbox_all)
+  {
+    float prevT = out_t;
+    bool r = TraceRayStrat::executeForPos(coll_res, tm, box_collision, ray_idx, pos, dir, out_t, out_norm, ri_desc, have_collision,
+      layer_idx, idx, pool, offs, out_mat_id, cell_idx, bbox_all);
+    if (out_t < prevT)
+      storeDesc(ray_idx, layer_idx, idx, pool, offs, cell_idx);
+    return r;
+  }
+};
+
+struct TraceRayStratWithRiExtraIgnoreFunction : TraceRayStrat
+{
+  using TraceRayStrat::TraceRayStrat;
+
+  // Non-owning ref: this strategy is a stack local of the trace call that sets it.
+  TraceRayIgnoreRiExtraCbType riExtraIgnoreFunction;
+
+  static constexpr bool hasRiExtraIgnoreFunction = true;
 };
 
 struct TraceRayListStrat : public TraceRayStrat
@@ -171,19 +241,15 @@ struct TraceRayListStrat : public TraceRayStrat
         ri_desc->pool = pool;
         ri_desc->offs = offs;
       }
-      if (out_mat_id == PHYSMAT_INVALID || out_mat_id == PHYSMAT_DEFAULT)
-      {
-        int poolRef = cell_idx == -1 ? rendinst::riExtra[pool].riPoolRef : pool;
-        RendInstGenData *rgl = rendinst::getRgLayer(cell_idx == -1 ? rendinst::riExtra[pool].riPoolRefLayer : layer_idx);
-        if (poolRef >= 0 && rgl)
-          out_mat_id = rgl->rtData->riProperties[poolRef].matId;
-      }
+      try_override_material_from_ri_props(out_mat_id, layer_idx, pool, cell_idx);
       data.matId = out_mat_id;
     }
     out_t = dist;
     have_collision |= meshCollision;
     return false;
   }
+
+  static constexpr bool shrinksOutT = false; // restores out_t after every hit
 };
 
 template <typename ListT, typename TransparencyStratT = void>
@@ -222,7 +288,7 @@ struct TraceRayAllUnsortedListStrat : public TraceRayStrat
 
   bool executeForMesh(CollisionResource *coll_res, mat44f_cref tm, int ray_idx, const Point3 &pos, const Point3 &dir, float &in_out_t,
     Point3 & /* out_norm */, rendinst::RendInstDesc * /* ri_desc */, bool &have_collision, int layer_idx, int idx, int pool, int offs,
-    int &out_mat_id, int cell_idx)
+    int &out_mat_id, int cell_idx, const float &transparency = -1.f)
   {
     if (coll_res->traceRay(tm,
           /* geom_node_tree */ nullptr, pos, dir, /* in_t */ in_out_t + extendRay, intersectedNodes,
@@ -232,15 +298,16 @@ struct TraceRayAllUnsortedListStrat : public TraceRayStrat
       have_collision = true;
 
       int defPhysMatId = -1;
-      const int poolRef = cell_idx == -1 ? rendinst::riExtra[pool].riPoolRef : pool;
-      const RendInstGenData *rgl = rendinst::getRgLayer(cell_idx == -1 ? rendinst::riExtra[pool].riPoolRefLayer : layer_idx);
-      if (poolRef >= 0 && rgl != nullptr)
-        out_mat_id = defPhysMatId = rgl->rtData->riProperties[poolRef].matId;
+      const rendinst::props::RendinstProperties *riProp =
+        props::get_by_desc<props::RendinstProperties>(RendInstDesc(cell_idx, 0, pool, 0, layer_idx));
+      if (riProp)
+        out_mat_id = defPhysMatId = riProp->matId;
 
       for (const IntersectedNode &node : intersectedNodes)
       {
-        int physMatId = coll_res->getNode(node.collisionNodeId)->physMatId;
-        if (physMatId == PHYSMAT_INVALID || physMatId == PHYSMAT_DEFAULT)
+        const uint32_t nodeId = tri_ref::nodeIndex(node.triRef);
+        int physMatId = coll_res->getHitPhysMat(node.triRef);
+        if (riProp && should_override_material_from_ri_props(physMatId, *riProp))
           physMatId = defPhysMatId;
         out_mat_id = physMatId;
 
@@ -250,7 +317,7 @@ struct TraceRayAllUnsortedListStrat : public TraceRayStrat
         riDesc.pool = pool;
         riDesc.offs = offs;
         riDesc.cellIdx = cell_idx;
-        addIntersection(ray_idx, riDesc, node.intersectionT, node.normal, node.collisionNodeId, physMatId, -1.0f);
+        addIntersection(ray_idx, riDesc, node.intersectionT, node.normal, nodeId, physMatId, transparency);
         // in_out_t = eastl::max(in_out_t, node.intersectionT);
       }
     }
@@ -258,15 +325,21 @@ struct TraceRayAllUnsortedListStrat : public TraceRayStrat
   }
 
   __forceinline bool executeForPos(CollisionResource *coll_res, mat44f_cref tm, const BBox3 &box_collision, int ray_idx,
-    const Point3 &pos, const Point3 &dir, float &out_t, Point3 &out_norm, rendinst::RendInstDesc *ri_desc, bool &have_collision,
+    const Point3 &pos, const Point3 &dir, float &in_out_t, Point3 &out_norm, rendinst::RendInstDesc *ri_desc, bool &have_collision,
     int layer_idx, int idx, int pool, int offs, int &out_mat_id, int cell_idx, const BBox3 &bbox_all)
   {
     if (transparencyStrat == nullptr)
       return false;
+    // trace tree trunk for all intersections here, and not in transparency strat, otherwise we will get only 1 intersection
+    if (float at = 1.f; does_line_intersect_box(box_collision, pos, pos + dir * in_out_t, at))
+    {
+      executeForMesh(coll_res, tm, ray_idx, pos, dir, in_out_t, out_norm, ri_desc, have_collision, layer_idx, idx, pool, offs,
+        out_mat_id, cell_idx, treeTrunkOpacity);
+    }
     if constexpr (!eastl::is_same_v<TransparencyStratT, void>)
     {
       out_norm = -dir; // in case it is not written
-      const bool result = transparencyStrat->executeForPos(coll_res, tm, box_collision, ray_idx, pos, dir, out_t, out_norm, ri_desc,
+      const bool result = transparencyStrat->executeForPos(coll_res, tm, box_collision, ray_idx, pos, dir, in_out_t, out_norm, ri_desc,
         have_collision, layer_idx, idx, pool, offs, out_mat_id, cell_idx, bbox_all);
       if (result)
       {
@@ -276,17 +349,24 @@ struct TraceRayAllUnsortedListStrat : public TraceRayStrat
         riDesc.pool = pool;
         riDesc.offs = offs;
         riDesc.cellIdx = cell_idx;
-        addIntersection(ray_idx, riDesc, out_t, out_norm, 0, out_mat_id, transparencyStrat->getAccumulatedTransparency(ray_idx));
+        addIntersection(ray_idx, riDesc, in_out_t, out_norm, 0, out_mat_id, transparencyStrat->getAccumulatedTransparency(ray_idx));
         transparencyStrat->resetAccumulatedTransparency(ray_idx);
       }
     }
     return false;
   }
+
+  static constexpr bool shrinksOutT = false; // leaves in_out_t unchanged
 };
 
 struct RayHitStrat : public MaterialRayStrat
 {
-  RayHitStrat(PhysMat::MatID ray_mat) : MaterialRayStrat(ray_mat) {}
+  uint8_t behaviorFlag = CollisionNode::TRACEABLE;
+
+  RayHitStrat(PhysMat::MatID ray_mat, TraceFlags trace_flags = TraceFlag::Destructible) :
+    MaterialRayStrat(ray_mat, bool(trace_flags & TraceFlag::Trees)),
+    behaviorFlag(trace_flags & TraceFlag::Phys ? CollisionNode::PHYS_COLLIDABLE : CollisionNode::TRACEABLE)
+  {}
 
   bool isCheckBBoxAll() { return false; }
 
@@ -294,7 +374,7 @@ struct RayHitStrat : public MaterialRayStrat
     Point3 & /*out_norm*/, rendinst::RendInstDesc *ri_desc, bool &have_collision, int layer_idx, int idx, int pool, int offs,
     int &out_mat_id, int /*cell_idx*/)
   {
-    if (coll_res->rayHit(tm, pos, dir, in_t, rayMatId, out_mat_id))
+    if (coll_res->rayHit(tm, pos, dir, in_t, rayMatId, out_mat_id, behaviorFlag))
     {
       if (ri_desc)
       {
@@ -313,7 +393,7 @@ struct RayHitStrat : public MaterialRayStrat
     const Point3 &dir, float in_t, Point3 & /*out_norm*/, rendinst::RendInstDesc *ri_desc, bool &have_collision, int layer_idx,
     int idx, int pool, int offs, int &out_mat_id, int /*cell_idx*/, const BBox3 & /*bbox_all*/)
   {
-    if (coll_res->rayHit(tm, pos, dir, in_t, rayMatId, out_mat_id))
+    if (coll_res->rayHit(tm, pos, dir, in_t, rayMatId, out_mat_id, behaviorFlag))
     {
       if (ri_desc)
       {
@@ -332,6 +412,9 @@ struct RayHitStrat : public MaterialRayStrat
   {
     return cell_result; // exit of first hit cell
   }
+
+  static constexpr bool hasRiExtraIgnoreFunction = false;
+  static constexpr bool shrinksOutT = false; // in_t is by value, a boolean hit test
 };
 
 static bool does_line_intersect_vert_circle(float r, Point3 center, Point3 line_start, Point3 line_end, float &at)
@@ -437,15 +520,16 @@ struct RayTransparencyStrat
   {
     float accumulatedTransparency = 0.0f;
   };
-  dag::RelocatableFixedVector<PerTraceData, 1, true, framemem_allocator> perTraceData;
+  dag::RelocatableFixedVector<PerTraceData, 8, true, framemem_allocator> perTraceData;
   const float transparencyThreshold;
   const bool checkCanopy;
+  const bool checkTrunk;
   float secondLayerMinCapsuleHeightSq = FLT_MAX;
 
-  RayTransparencyStrat(float transparency_threshold, bool check_canopy, PhysMat::MatID ray_mat) :
-    rayMatId(ray_mat), checkCanopy(check_canopy), transparencyThreshold(transparency_threshold)
+  RayTransparencyStrat(int traces_count, float transparency_threshold, bool check_canopy, bool check_trunk, PhysMat::MatID ray_mat) :
+    rayMatId(ray_mat), checkCanopy(check_canopy), checkTrunk(check_trunk), transparencyThreshold(transparency_threshold)
   {
-    perTraceData.resize(1);
+    perTraceData.resize(traces_count);
   }
 
   bool isCheckBBoxAll()
@@ -469,19 +553,20 @@ struct RayTransparencyStrat
     int idx, int pool, int offs, int &out_mat_id, int cell_idx, const BBox3 &bbox_all)
   {
     RendInstGenData *rgl = rendinst::rgLayer[layer_idx];
-    const RendInstGenData::RendinstProperties &riProp = rgl->rtData->riProperties[pool];
+    const rendinst::props::RendinstProperties &riProp = rgl->rtData->riProperties[pool];
     float at = 1.f;
     bool traceToCanopy = checkCanopy && riProp.canopyOpacity > 0.f;
-    if (does_line_intersect_box(box_collision, pos, pos + dir * out_t, at))
+    if (checkTrunk && v_test_ray_box_intersection(v_ldu(&pos.x), v_ldu(&dir.x), v_set_x(out_t), v_ldu_bbox3(box_collision)))
     {
       // check coll resource for more then 1 capsule
-      bool traceToCollRes =
-        coll_res->boxNodesHead || coll_res->meshNodesHead || (coll_res->capsuleNodesHead && coll_res->capsuleNodesHead->nextNode);
+      bool traceToCollRes = !coll_res->boxNodes().empty() || !coll_res->meshNodes().empty() || coll_res->capsuleNodes().size() > 1;
       bool haveCollision = !traceToCollRes;
       if (!traceToCollRes && layer_idx >= rendinst::rgPrimaryLayers)
-        haveCollision =
-          coll_res->capsuleNodesHead &&
-          secondLayerMinCapsuleHeightSq < (coll_res->capsuleNodesHead->capsule.a - coll_res->capsuleNodesHead->capsule.b).lengthSq();
+        haveCollision = !coll_res->capsuleNodes().empty() && [&]() {
+          Capsule cap;
+          return coll_res->getNodeCapsule(coll_res->capsuleNodes()[0], cap) &&
+                 secondLayerMinCapsuleHeightSq < (cap.a - cap.b).lengthSq();
+        }();
       if (traceToCollRes)
       {
         int outMatId;
@@ -499,7 +584,7 @@ struct RayTransparencyStrat
       BBox3 canopyBox; // synthetical tree canopy box
       getRIGenCanopyBBox(riProp, bbox_all, canopyBox);
       float dist = 0.0f;
-      if (riProp.canopyShape == RendInstGenData::CanopyShape::CONE)
+      if (riProp.canopyShape == rendinst::props::CanopyShape::CONE)
       {
         Point3 canopyBoxCenter = canopyBox.center();
         float coneHeight = canopyBox.boxMax().y - canopyBox.boxMin().y;
@@ -546,7 +631,7 @@ struct RayTransparencyStrat
             dist = out_t * (1.0f - at);
         }
       }
-      else if (riProp.canopyShape == RendInstGenData::CanopyShape::SPHEROID)
+      else if (riProp.canopyShape == rendinst::props::CanopyShape::SPHEROID)
       {
         Point3 canopyCenter = canopyBox.center();
         float canopyHeight = canopyBox.boxMax().y - canopyBox.boxMin().y;
@@ -710,256 +795,357 @@ struct RaySoundOcclusionStrat
       return true;
     return false;
   }
+
+  static constexpr bool hasRiExtraIgnoreFunction = false;
+  static constexpr bool shrinksOutT = false; // rayHit does not move out_t
 };
 
-template <typename Strategy>
-static bool traverseRayCell(RendInstGenData::Cell &cell, bbox3f_cref rayBox, dag::Span<Trace> traces, bool /*trace_meshes*/,
-  int layer_idx, rendinst::RendInstDesc *ri_desc, Strategy &strategy, int cell_idx)
+namespace
 {
-  const RendInstGenData::CellRtData *crt_ptr = cell.isReady();
-  if (DAGOR_UNLIKELY(!crt_ptr))
-    return false;
-  const RendInstGenData::CellRtData &crt = *crt_ptr;
-
-  if (DAGOR_UNLIKELY(!v_bbox3_test_box_intersect(crt.bbox[0], rayBox)))
-    return false;
-
-  static const IBBox2 cell_leaf_lim(IPoint2(0, 0), IPoint2(SUBCELL_DIV - 1, SUBCELL_DIV - 1));
-  RendInstGenData *rgl = rendinst::rgLayer[layer_idx];
-  float cellSz = rgl->grid2world * rgl->cellSz;
-  float subcellSz = cellSz / SUBCELL_DIV;
-
-  int pcnt = crt.pools.size();
-  float cell_x0 = v_extract_x(crt.cellOrigin), cell_z0 = v_extract_z(crt.cellOrigin);
-  vec3f v_cell_add = crt.cellOrigin;
-  vec3f v_cell_mul = v_mul(rendinst::gen::VC_1div32767, v_make_vec4f(cellSz, crt.cellHeight, cellSz, 0));
-
-  carray<uint16_t, SUBCELL_DIV * SUBCELL_DIV> subcellIndices;
-  // carray<uint64_t, SUBCELL_DIV*SUBCELL_DIV> subcellIndicesTraces(framemem_ptr());// if we want to mask which traces in which
-  // subCell. However MultiRay are CLOSE and subcells are BIG G_ASSERT(traces.size()<=64);
-  int64_t subcellIndicesCnt = 0;
-  uint64_t alreadyHas = 0;
-  G_STATIC_ASSERT(is_pow2(SUBCELL_DIV));
-  G_STATIC_ASSERT(SUBCELL_DIV * SUBCELL_DIV <= 64);
-  bool haveCollision = false;
-  const int tracesCnt = traces.size();
-  for (int i = 0; i < tracesCnt; ++i)
+// NOTE: actually, it is a template function, but declared as struct with static method.
+// It is a hack: scarlett clang doesn't support DAG_TS_REQUIRES for template function
+template <typename Strategy>
+struct TraverseRayCell
+{
+  static bool traverse(const RendInstGenData &rgl, RendInstGenData::Cell &cell, bbox3f_cref ray_box, dag::Span<Trace> traces,
+    bool /*trace_meshes*/, int layer_idx, rendinst::RendInstDesc *ri_desc, Strategy &strategy, int cell_idx)
+    DAG_TS_REQUIRES_SHARED(rgl.rtData->riRwCs)
   {
-    vec3f rayStart = v_ldu(&traces[i].pos.x);
-    vec3f rayDir = v_ldu(&traces[i].dir.x);
-    if (!v_test_ray_box_intersection(rayStart, rayDir, v_set_x(traces[i].pos.outT), crt.bbox[0]))
-      continue;
+    const RendInstGenData::CellRtData *crt_ptr = cell.isReady();
+    if (DAGOR_UNLIKELY(!crt_ptr))
+      return false;
+    const RendInstGenData::CellRtData &crt = *crt_ptr;
 
-    WooRay2d ray(Point2(traces[i].pos.x - cell_x0, traces[i].pos.z - cell_z0), Point2::xz(traces[i].dir), traces[i].pos.outT,
-      Point2(subcellSz, subcellSz), cell_leaf_lim);
-    double nextT = 0;
-    bool cellIntersected = false;
-    do
+    if (DAGOR_UNLIKELY(!v_bbox3_test_box_intersect(crt.bbox[0], ray_box)))
+      return false;
+
+    static const IBBox2 cell_leaf_lim(IPoint2(0, 0), IPoint2(SUBCELL_DIV - 1, SUBCELL_DIV - 1));
+    float cellSz = rgl.grid2world * rgl.cellSz;
+    float subcellSz = cellSz / SUBCELL_DIV;
+
+    int pcnt = crt.pools.size();
+    float cell_x0 = v_extract_x(crt.cellOrigin), cell_z0 = v_extract_z(crt.cellOrigin);
+    vec3f v_cell_add = crt.cellOrigin;
+    vec3f v_cell_mul = v_mul(rendinst::gen::VC_1div32767, v_make_vec4f(cellSz, crt.cellHeight, cellSz, 0));
+
+    carray<uint16_t, SUBCELL_DIV * SUBCELL_DIV> subcellIndices;
+    // carray<uint64_t, SUBCELL_DIV*SUBCELL_DIV> subcellIndicesTraces(framemem_ptr());// if we want to mask which traces in which
+    // subCell. However MultiRay are CLOSE and subcells are BIG G_ASSERT(traces.size()<=64);
+    int64_t subcellIndicesCnt = 0;
+    uint64_t alreadyHas = 0;
+    uint64_t neighborsExpanded = 0;
+    G_STATIC_ASSERT(is_pow2(SUBCELL_DIV));
+    G_STATIC_ASSERT(SUBCELL_DIV * SUBCELL_DIV <= 64);
+    bool haveCollision = false;
+    const int tracesCnt = traces.size();
+    const int minCellsWidthForWooRay = 4;
+    bbox3f rayBoxExt = ray_box;
+    v_bbox3_extend(rayBoxExt, v_splats(rgl.rtData->maxSubcellMargin));
+    vec4f rayBox2d = v_perm_xzac(rayBoxExt.bmin, rayBoxExt.bmax);
+    vec4f rayBoxRegion = v_sub(rayBox2d, v_perm_xzxz(crt.cellOrigin));
+    vec4i rayBoxCells = v_cvt_floori(v_div(rayBoxRegion, v_splats(subcellSz)));
+    rayBoxCells = v_clampi(rayBoxCells, v_zeroi(), v_splatsi(SUBCELL_DIV - 1));
+    IBBox2 subCells;
+    v_stui(&subCells.lim[0].x, rayBoxCells);
+    if (subCells.width().x >= minCellsWidthForWooRay && subCells.width().y >= minCellsWidthForWooRay)
     {
-      uint64_t outOfCellMask = uint32_t(~(SUBCELL_DIV - 1));
-      outOfCellMask |= outOfCellMask << 32;
-      uint64_t xy = uint64_t(ray.currentCell().x) | (uint64_t(ray.currentCell().y) << 32);
-      if (DAGOR_LIKELY((xy & outOfCellMask) == 0))
+      for (int i = 0; i < tracesCnt; ++i)
       {
-        cellIntersected = true;
-        int idx = ray.currentCell().y * SUBCELL_DIV + ray.currentCell().x;
-        uint64_t mask = 1ULL << idx;
-        if (alreadyHas & mask)
+        vec3f rayStart = v_ldu(&traces[i].pos.x);
+        vec3f rayDir = v_ldu(&traces[i].dir.x);
+        if (!v_test_ray_box_intersection(rayStart, rayDir, v_set_x(traces[i].pos.outT), crt.bbox[0]))
           continue;
 
-        if (v_test_ray_box_intersection(rayStart, rayDir, v_set_x(traces[i].pos.outT), crt.bbox[idx + 1]))
+        WooRay2d ray(Point2(traces[i].pos.x - cell_x0, traces[i].pos.z - cell_z0), Point2::xz(traces[i].dir), traces[i].pos.outT,
+          Point2(subcellSz, subcellSz), cell_leaf_lim);
+
+        uint64_t testedMask = 0;
+        double nextT = 0;
+        bool cellIntersected = false;
+        do
         {
-          subcellIndices[subcellIndicesCnt] = idx;
-          alreadyHas |= mask;
-          subcellIndicesCnt++;
-        }
+          uint64_t outOfCellMask = uint32_t(~(SUBCELL_DIV - 1));
+          outOfCellMask |= outOfCellMask << 32;
+          uint64_t xy = uint64_t(ray.currentCell().x) | (uint64_t(ray.currentCell().y) << 32);
+          if (DAGOR_LIKELY((xy & outOfCellMask) == 0))
+          {
+            cellIntersected = true;
+            int idx = ray.currentCell().y * SUBCELL_DIV + ray.currentCell().x;
+            uint64_t mask = 1ULL << idx;
+            if (!((alreadyHas | testedMask) & mask))
+            {
+              testedMask |= mask;
+              if (v_test_ray_box_intersection(rayStart, rayDir, v_set_x(traces[i].pos.outT), crt.bbox[idx + 1]))
+              {
+                subcellIndices[subcellIndicesCnt] = idx;
+                alreadyHas |= mask;
+                subcellIndicesCnt++;
+              }
+            }
+
+            if (!(neighborsExpanded & mask))
+            {
+              neighborsExpanded |= mask;
+              const int sx = idx % SUBCELL_DIV;
+              const int sy = idx / SUBCELL_DIV;
+              for (int dy = -1; dy <= 1; ++dy)
+              {
+                const int ny = sy + dy;
+                if (ny < 0 || ny >= SUBCELL_DIV)
+                  continue;
+                for (int dx = -1; dx <= 1; ++dx)
+                {
+                  if ((dx | dy) == 0)
+                    continue;
+                  const int nx = sx + dx;
+                  if (nx < 0 || nx >= SUBCELL_DIV)
+                    continue;
+                  const int nidx = ny * SUBCELL_DIV + nx;
+                  const uint64_t nmask = 1ULL << nidx;
+                  if ((alreadyHas | testedMask) & nmask)
+                    continue;
+                  testedMask |= nmask;
+                  if (v_test_ray_box_intersection(rayStart, rayDir, v_set_x(traces[i].pos.outT), crt.bbox[nidx + 1]))
+                  {
+                    subcellIndices[subcellIndicesCnt++] = (uint16_t)nidx;
+                    alreadyHas |= nmask;
+                  }
+                }
+              }
+            }
+          }
+          else if (cellIntersected) // ray tail is out of cell
+            break;
+        } while (ray.nextCell(nextT));
       }
-      else if (cellIntersected) // ray tail is out of cell
-        break;
-    } while (ray.nextCell(nextT));
-  }
-  const eastl::BitvectorWordType *riPosInstData = rgl->rtData->riPosInst.data();
-  const eastl::BitvectorWordType *riPaletteRotationData = rgl->rtData->riPaletteRotation.data();
-  for (int i = 0; i < subcellIndicesCnt; ++i)
-  {
-    int idx = subcellIndices[i];
-    eastl::BitvectorWordType riPosInstBit = 1;
-    for (int p = 0; DAGOR_LIKELY(p < pcnt); p++, riPosInstBit = roll_bit(riPosInstBit))
+    }
+    else
     {
-      const RendInstGenData::CellRtData::SubCellSlice &scs = crt.getCellSlice(p, idx);
-      if (DAGOR_LIKELY(!scs.sz)) // very hot place, hits is ~2% of 1000+
-        continue;
-      v_prefetch(crt.sysMemData.get() + scs.ofs);
-      CollisionResource *collRes = rgl->rtData->riCollRes[p].collRes;
-      if (DAGOR_UNLIKELY(!collRes))
-        continue;
-      bool isPosInst = (riPosInstData[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0;
-      const RendInstGenData::RendinstProperties &riProp = rgl->rtData->riProperties[p];
-      if (strategy.shouldIgnoreRendinst(isPosInst, riProp.immortal, riProp.damageable, riProp.matId))
-        continue;
-      if (DAGOR_UNLIKELY(!isPosInst))
+      for (int y = subCells.getMin().y; y <= subCells.getMax().y; y++)
       {
-        const int16_t *data_s = (int16_t *)(crt.sysMemData.get() + scs.ofs);
-        int stride_w =
-          RIGEN_TM_STRIDE_B((rgl->rtData->riZeroInstSeeds.data()[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0,
-            rgl->perInstDataDwords) /
-          2;
-        for (const int16_t *__restrict data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
+        for (int x = subCells.getMin().x; x <= subCells.getMax().x; x++)
         {
-          mat44f tm;
-          if (!rendinst::gen::unpack_tm_full(tm, data, v_cell_add, v_cell_mul))
-            continue;
-#if RIGEN_PERINST_ADD_DATA_FOR_TOOLS // ignore riZeroInstSeeds here since we use this code for tools only
-          if (is_rendinst_marked_collision_ignored(data, rgl->perInstDataDwords, RIGEN_TM_STRIDE_B(false, 0) / 2))
-            continue;
-#endif
-
-          bbox3f transformedBox;
-          v_bbox3_init(transformedBox, tm, collRes->vFullBBox);
-          // globalBoxCollided = (tm * collRes->boundingBox) & _objWorldBB;
-          if (!v_bbox3_test_box_intersect(transformedBox, rayBox))
-            continue;
-          for (int rayId = 0; rayId < tracesCnt; ++rayId)
+          int idx = y * SUBCELL_DIV + x;
+          for (int i = 0; i < tracesCnt; ++i)
           {
-            bool stop = strategy.executeForMesh(collRes, tm, rayId, traces[rayId].pos, traces[rayId].dir, traces[rayId].pos.outT,
-              traces[rayId].outNorm, ri_desc, haveCollision, layer_idx, idx, p, int(intptr_t(data) - intptr_t(data_s)),
-              traces[rayId].outMatId, cell_idx);
-            if (stop)
-              return haveCollision;
-          }
-        }
-      }
-      else if (bool paletteRotation = (riPaletteRotationData[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0)
-      {
-        bool checkBBoxAll = riProp.canopyOpacity > 0.f && strategy.isCheckBBoxAll();
-        rendinst::gen::RotationPaletteManager::Palette palette =
-          rendinst::gen::get_rotation_palette_manager()->getPalette({layer_idx, p});
-        vec4f posBoundingRad = v_add_x(v_length3_x(collRes->vBoundingSphere), v_set_x(collRes->getBoundingSphereRad()));
-
-        const int16_t *data_s = (int16_t *)(crt.sysMemData.get() + scs.ofs);
-        int stride_w =
-          RIGEN_POS_STRIDE_B((riZeroInstSeeds[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0, rgl->perInstDataDwords) / 2;
-        for (const int16_t *__restrict data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
-        {
-          vec3f v_pos, v_scale;
-          vec4i paletteId;
-          if (!rendinst::gen::unpack_tm_pos(v_pos, v_scale, data, v_cell_add, v_cell_mul, paletteRotation, &paletteId))
-            continue;
-
-          if (!checkBBoxAll)
-          {
-            // unprecise, but fast and it filter most of instances
-            vec4f posBoundingRadSq = v_sqr_x(v_mul_x(posBoundingRad, v_hmax3(v_scale)));
-            if (tracesCnt == 1)
+            vec3f rayStart = v_ldu(&traces[i].pos.x);
+            vec3f rayDir = v_ldu(&traces[i].dir.x);
+            if (v_test_ray_box_intersection(rayStart, rayDir, v_set_x(traces[i].pos.outT), crt.bbox[idx + 1]))
             {
-              vec3f rayStart = v_ldu(&traces[0].pos.x);
-              vec3f rayDir = v_ldu(&traces[0].dir.x);
-              vec3f rayLen = v_splats(traces[0].pos.outT);
-              if (DAGOR_LIKELY(!v_test_ray_sphere_intersection(rayStart, rayDir, rayLen, v_pos, posBoundingRadSq)))
-                continue;
+              subcellIndices[subcellIndicesCnt++] = idx;
+              break;
             }
-            else if (!v_bbox3_test_sph_intersect(rayBox, v_pos, posBoundingRadSq)) // usually trace down, so we can use rayBox here
-              continue;
-          }
-
-          quat4f v_rot = rendinst::gen::RotationPaletteManager::get_quat(palette, v_extract_xi(paletteId));
-          mat44f tm;
-          v_mat44_compose(tm, v_pos, v_rot, v_scale);
-
-          bbox3f riBBox;
-          v_bbox3_init(riBBox, tm, collRes->vFullBBox);
-          BBox3 riWorldCollisionBox, treeWithCanopyWorldCollisionBox;
-          v_stu_bbox3(riWorldCollisionBox, riBBox);
-          if (checkBBoxAll)
-          {
-            bbox3f allBBox;
-            v_bbox3_init(allBBox, tm, rgl->rtData->riResBb[p]);
-            v_stu_bbox3(treeWithCanopyWorldCollisionBox, allBBox);
-
-            if (traces.size() == 1)
-            {
-              vec3f rayStart = v_ldu(&traces[0].pos.x);
-              vec3f rayDir = v_ldu(&traces[0].dir.x);
-              vec3f rayLen = v_splats(traces[0].pos.outT);
-              if (DAGOR_LIKELY(!v_test_ray_box_intersection(rayStart, rayDir, rayLen, allBBox)))
-                continue;
-            }
-            else if (DAGOR_LIKELY(!v_bbox3_test_box_intersect(allBBox, rayBox)))
-              continue;
-          }
-
-          for (int rayId = 0; rayId < tracesCnt; ++rayId)
-          {
-            bool stop = strategy.executeForPos(collRes, tm, riWorldCollisionBox, rayId, traces[rayId].pos, traces[rayId].dir,
-              traces[rayId].pos.outT, traces[rayId].outNorm, ri_desc, haveCollision, layer_idx, idx, p,
-              int(intptr_t(data) - intptr_t(data_s)), traces[rayId].outMatId, cell_idx, treeWithCanopyWorldCollisionBox);
-            if (stop)
-              return haveCollision;
-          }
-        }
-      }
-      else
-      {
-        vec3f v_tree_min = collRes->vFullBBox.bmin;
-        vec3f v_tree_max = collRes->vFullBBox.bmax;
-
-        const int16_t *data_s = (int16_t *)(crt.sysMemData.get() + scs.ofs);
-        int stride_w =
-          RIGEN_POS_STRIDE_B((riZeroInstSeeds[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0, rgl->perInstDataDwords) / 2;
-        for (const int16_t *data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
-        {
-          vec3f v_pos, v_scale;
-          if (!rendinst::gen::unpack_tm_pos(v_pos, v_scale, data, v_cell_add, v_cell_mul, false /*paletteRotation*/))
-            continue;
-
-          bbox3f treeBBox;
-          treeBBox.bmin = v_add(v_pos, v_mul(v_scale, v_tree_min));
-          treeBBox.bmax = v_add(v_pos, v_mul(v_scale, v_tree_max));
-
-          bool isIntersec = v_bbox3_test_box_intersect(treeBBox, rayBox);
-          bool checkBBoxAll = riProp.canopyOpacity > 0.f && strategy.isCheckBBoxAll();
-
-          BBox3 worldBoxCollision;
-          BBox3 worldBoxAll;
-          if (isIntersec || checkBBoxAll)
-          {
-            v_stu_bbox3(worldBoxCollision, treeBBox);
-            if (checkBBoxAll)
-            {
-              bbox3f &box = rgl->rtData->riResBb[p];
-              treeBBox.bmin = v_add(v_pos, v_mul(v_scale, box.bmin));
-              treeBBox.bmax = v_add(v_pos, v_mul(v_scale, box.bmax));
-              isIntersec = isIntersec || v_bbox3_test_box_intersect(treeBBox, rayBox);
-              if (!isIntersec)
-                continue;
-              v_stu_bbox3(worldBoxAll, treeBBox);
-            }
-          }
-          else
-            continue;
-
-          mat44f tm;
-          v_mat44_compose(tm, v_pos, V_C_UNIT_0001, v_scale);
-          for (int rayId = 0; rayId < tracesCnt; ++rayId)
-          {
-            bool stop = strategy.executeForPos(collRes, tm, worldBoxCollision, rayId, traces[rayId].pos, traces[rayId].dir,
-              traces[rayId].pos.outT, traces[rayId].outNorm, ri_desc, haveCollision, layer_idx, idx, p,
-              int(intptr_t(data) - intptr_t(data_s)), traces[rayId].outMatId, cell_idx, worldBoxAll);
-            if (stop)
-              return haveCollision;
           }
         }
       }
     }
+    const eastl::BitvectorWordType *riPosInstData = rgl.rtData->riPosInst.data();
+    const eastl::BitvectorWordType *riPaletteRotationData = rgl.rtData->riPaletteRotation.data();
+    for (int i = 0; i < subcellIndicesCnt; ++i)
+    {
+      int idx = subcellIndices[i];
+      eastl::BitvectorWordType riPosInstBit = 1;
+      for (int p = 0; DAGOR_LIKELY(p < pcnt); p++, riPosInstBit = roll_bit(riPosInstBit))
+      {
+        const RendInstGenData::CellRtData::SubCellSlice &scs = crt.getCellSlice(p, idx);
+        if (DAGOR_LIKELY(!scs.sz)) // very hot place, hits is ~2% of 1000+
+          continue;
+        v_prefetch(crt.sysMemData.get() + scs.ofs);
+        CollisionResource *collRes = rgl.rtData->riCollRes[p].collRes;
+        if (DAGOR_UNLIKELY(!collRes))
+          continue;
+        bool isPosInst = (riPosInstData[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0;
+        const rendinst::props::RendinstProperties &riProp = rgl.rtData->riProperties[p];
+        if (strategy.shouldIgnoreRendinst(isPosInst, riProp.immortal, riProp.damageable, riProp.matId))
+          continue;
+        if (DAGOR_UNLIKELY(!isPosInst))
+        {
+          const int16_t *data_s = (int16_t *)(crt.sysMemData.get() + scs.ofs);
+          int stride_w =
+            RIGEN_TM_STRIDE_B((rgl.rtData->riZeroInstSeeds.data()[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0,
+              rgl.perInstDataDwords) /
+            2;
+          for (const int16_t *__restrict data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
+          {
+            mat44f tm;
+            if (!rendinst::gen::unpack_tm_full(tm, data, v_cell_add, v_cell_mul))
+              continue;
+#if RIGEN_PERINST_ADD_DATA_FOR_TOOLS // ignore riZeroInstSeeds here since we use this code for tools only
+            if (is_rendinst_marked_collision_ignored(data, rgl.perInstDataDwords, RIGEN_TM_STRIDE_B(false, 0) / 2))
+              continue;
+#endif
+
+            bbox3f transformedBox;
+            v_bbox3_init(transformedBox, tm, collRes->vFullBBox);
+            // globalBoxCollided = (tm * collRes->boundingBox) & _objWorldBB;
+            if (!v_bbox3_test_box_intersect(transformedBox, ray_box))
+              continue;
+            for (int rayId = 0; rayId < tracesCnt; ++rayId)
+            {
+              bool stop = strategy.executeForMesh(collRes, tm, rayId, traces[rayId].pos, traces[rayId].dir, traces[rayId].pos.outT,
+                traces[rayId].outNorm, ri_desc, haveCollision, layer_idx, idx, p, int(intptr_t(data) - intptr_t(data_s)),
+                traces[rayId].outMatId, cell_idx);
+              if (stop)
+                return haveCollision;
+            }
+          }
+        }
+        else if (bool paletteRotation = (riPaletteRotationData[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0)
+        {
+          const vec4f posBoundingRad = bounding_rad_from_origin(collRes);
+          bool checkBBoxAll = riProp.canopyOpacity > 0.f && strategy.isCheckBBoxAll();
+          rendinst::gen::RotationPaletteManager::Palette palette =
+            rendinst::gen::get_rotation_palette_manager()->getPalette({layer_idx, p});
+
+          const int16_t *data_s = (int16_t *)(crt.sysMemData.get() + scs.ofs);
+          int stride_w =
+            RIGEN_POS_STRIDE_B((rgl.rtData->riZeroInstSeeds.data()[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0,
+              rgl.perInstDataDwords) /
+            2;
+          for (const int16_t *__restrict data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
+          {
+            vec3f v_pos, v_scale;
+            vec4i paletteId;
+            if (!rendinst::gen::unpack_tm_pos(v_pos, v_scale, data, v_cell_add, v_cell_mul, paletteRotation, &paletteId))
+              continue;
+
+            if (!checkBBoxAll)
+            {
+              // unprecise, but fast and it filter most of instances
+              vec4f posBoundingRadSq = v_sqr_x(v_mul_x(posBoundingRad, v_hmax3(v_scale)));
+              if (tracesCnt == 1)
+              {
+                vec3f rayStart = v_ldu(&traces[0].pos.x);
+                vec3f rayDir = v_ldu(&traces[0].dir.x);
+                vec3f rayLen = v_splats(traces[0].pos.outT);
+                if (DAGOR_LIKELY(!v_test_ray_sphere_intersection(rayStart, rayDir, rayLen, v_pos, posBoundingRadSq)))
+                  continue;
+              }
+              else if (!v_bbox3_test_sph_intersect(ray_box, v_pos, posBoundingRadSq)) // usually trace down, so we can use ray_box here
+                continue;
+            }
+
+            quat4f v_rot = rendinst::gen::RotationPaletteManager::get_quat(palette, v_extract_xi(paletteId));
+            mat44f tm;
+            v_mat44_compose(tm, v_pos, v_rot, v_scale);
+
+            bbox3f riBBox;
+            v_bbox3_init(riBBox, tm, collRes->vFullBBox);
+            BBox3 riWorldCollisionBox, treeWithCanopyWorldCollisionBox;
+            v_stu_bbox3(riWorldCollisionBox, riBBox);
+            if (checkBBoxAll)
+            {
+              bbox3f allBBox;
+              v_bbox3_init(allBBox, tm, v_ldu_bbox3(rgl.rtData->riRes[p]->bbox));
+              v_stu_bbox3(treeWithCanopyWorldCollisionBox, allBBox);
+
+              if (traces.size() == 1)
+              {
+                vec3f rayStart = v_ldu(&traces[0].pos.x);
+                vec3f rayDir = v_ldu(&traces[0].dir.x);
+                vec3f rayLen = v_splats(traces[0].pos.outT);
+                if (DAGOR_LIKELY(!v_test_ray_box_intersection(rayStart, rayDir, rayLen, allBBox)))
+                  continue;
+              }
+              else if (DAGOR_LIKELY(!v_bbox3_test_box_intersect(allBBox, ray_box)))
+                continue;
+            }
+
+            for (int rayId = 0; rayId < tracesCnt; ++rayId)
+            {
+              bool stop = strategy.executeForPos(collRes, tm, riWorldCollisionBox, rayId, traces[rayId].pos, traces[rayId].dir,
+                traces[rayId].pos.outT, traces[rayId].outNorm, ri_desc, haveCollision, layer_idx, idx, p,
+                int(intptr_t(data) - intptr_t(data_s)), traces[rayId].outMatId, cell_idx, treeWithCanopyWorldCollisionBox);
+              if (stop)
+                return haveCollision;
+            }
+          }
+        }
+        else
+        {
+          const vec4f posBoundingRad = bounding_rad_from_origin(collRes);
+          // isCheckBBoxAll() only turns false once the strategy is satisfied, and that stops the
+          // traversal, so it holds for the whole slice (as the palette branch above assumes too)
+          const bool checkBBoxAll = riProp.canopyOpacity > 0.f && strategy.isCheckBBoxAll();
+          vec3f v_tree_min = collRes->vFullBBox.bmin;
+          vec3f v_tree_max = collRes->vFullBBox.bmax;
+
+          const int16_t *data_s = (int16_t *)(crt.sysMemData.get() + scs.ofs);
+          int stride_w =
+            RIGEN_POS_STRIDE_B((rgl.rtData->riZeroInstSeeds.data()[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0,
+              rgl.perInstDataDwords) /
+            2;
+          for (const int16_t *data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
+          {
+            vec3f v_pos, v_scale;
+            if (!rendinst::gen::unpack_tm_pos(v_pos, v_scale, data, v_cell_add, v_cell_mul, false /*paletteRotation*/))
+              continue;
+
+            bbox3f treeBBox;
+            treeBBox.bmin = v_add(v_pos, v_mul(v_scale, v_tree_min));
+            treeBBox.bmax = v_add(v_pos, v_mul(v_scale, v_tree_max));
+
+            bool isIntersec = v_bbox3_test_box_intersect(treeBBox, ray_box);
+
+            BBox3 worldBoxCollision;
+            BBox3 worldBoxAll;
+            if (isIntersec || checkBBoxAll)
+            {
+              v_stu_bbox3(worldBoxCollision, treeBBox);
+              if (checkBBoxAll)
+              {
+                bbox3f box = v_ldu_bbox3(rgl.rtData->riRes[p]->bbox);
+                treeBBox.bmin = v_add(v_pos, v_mul(v_scale, box.bmin));
+                treeBBox.bmax = v_add(v_pos, v_mul(v_scale, box.bmax));
+                isIntersec = isIntersec || v_bbox3_test_box_intersect(treeBBox, ray_box);
+                if (!isIntersec)
+                  continue;
+                v_stu_bbox3(worldBoxAll, treeBBox);
+              }
+            }
+            else
+              continue;
+
+            if (!checkBBoxAll)
+            {
+              // unprecise, but fast and it filter most of instances
+              vec4f posBoundingRadSq = v_sqr_x(v_mul_x(posBoundingRad, v_hmax3(v_scale)));
+              if (tracesCnt == 1)
+              {
+                vec3f rayStart = v_ldu(&traces[0].pos.x);
+                vec3f rayDir = v_ldu(&traces[0].dir.x);
+                vec3f rayLen = v_splats(traces[0].pos.outT);
+                if (DAGOR_LIKELY(!v_test_ray_sphere_intersection(rayStart, rayDir, rayLen, v_pos, posBoundingRadSq)))
+                  continue;
+              }
+              else if (!v_bbox3_test_sph_intersect(ray_box, v_pos, posBoundingRadSq)) // usually trace down, so we can use ray_box here
+                continue;
+            }
+
+            mat44f tm;
+            v_mat44_compose(tm, v_pos, V_C_UNIT_0001, v_scale);
+            for (int rayId = 0; rayId < tracesCnt; ++rayId)
+            {
+              bool stop = strategy.executeForPos(collRes, tm, worldBoxCollision, rayId, traces[rayId].pos, traces[rayId].dir,
+                traces[rayId].pos.outT, traces[rayId].outNorm, ri_desc, haveCollision, layer_idx, idx, p,
+                int(intptr_t(data) - intptr_t(data_s)), traces[rayId].outMatId, cell_idx, worldBoxAll);
+              if (stop)
+                return haveCollision;
+            }
+          }
+        }
+      }
+    }
+    return haveCollision;
   }
-  return haveCollision;
-}
+};
+} // namespace
 
 extern void getRIGenExtra44NoLock(riex_handle_t id, mat44f &out_tm);
 
 template <typename Strategy, bool CHK_BOX>
 bool rayTestRiExtraInstanceBase(dag::Span<Trace> traces, bbox3f_cref ray_box, bbox3f_cref coll_res_bbox,
-  rendinst::riex_handle_t handle, mat44f_cref tm, CollisionResource *res, bool &have_collision, Strategy &strategy,
+  rendinst::riex_handle_t handle, mat44f_cref tm, const vec4f &bsph, CollisionResource *res, bool &have_collision, Strategy &strategy,
   dag::Span<rendinst::RendInstDesc> out_ri_desc)
 {
   if (CHK_BOX)
@@ -973,12 +1159,7 @@ bool rayTestRiExtraInstanceBase(dag::Span<Trace> traces, bbox3f_cref ray_box, bb
   uint32_t pool = rendinst::handle_to_ri_type(handle);
   uint32_t riInstance = rendinst::handle_to_ri_inst(handle);
   int layer = pool < rendinst::riex_max_type() ? rendinst::riExtra[pool].riPoolRefLayer : -1;
-  vec4f bsph = v_zero(), bsphRadSq = v_zero();
-  if (traces.size() > 1)
-  {
-    bsph = rendinst::riExtra.data()[pool].riXYZR.data()[riInstance];
-    bsphRadSq = v_splat_w(v_mul(bsph, bsph));
-  }
+  vec4f bsphRadSq = v_splat_w(v_mul(bsph, bsph));
   for (int rayId = 0; rayId < traces.size(); ++rayId)
   {
     if (traces.size() > 1 && !v_test_ray_sphere_intersection(v_ldu(&traces[rayId].pos.x), v_ldu(&traces[rayId].dir.x),
@@ -1002,12 +1183,20 @@ bool rayTestRiExtraInstance(dag::Span<Trace> traces, bbox3f_cref ray_box, bbox3f
   CollisionResource *res, bool &have_collision, Strategy &strategy, dag::Span<rendinst::RendInstDesc> out_ri_desc)
 {
   mat44f tm;
+  vec4f bsph;
   if (READ_LOCK)
-    rendinst::getRIGenExtra44(handle, tm);
-  else
+  {
+    ScopedRIExtraReadLock rd;
     rendinst::getRIGenExtra44NoLock(handle, tm);
+    bsph = rendinst::getRIGenExtraBSphere(handle);
+  }
+  else
+  {
+    rendinst::getRIGenExtra44NoLock(handle, tm);
+    bsph = rendinst::getRIGenExtraBSphere(handle);
+  }
 
-  return rayTestRiExtraInstanceBase<Strategy, CHK_BOX>(traces, ray_box, coll_res_bbox, handle, tm, res, have_collision, strategy,
+  return rayTestRiExtraInstanceBase<Strategy, CHK_BOX>(traces, ray_box, coll_res_bbox, handle, tm, bsph, res, have_collision, strategy,
     out_ri_desc);
 }
 
@@ -1049,6 +1238,7 @@ static bool rayTraverseRiExtra(bbox3f_cref ray_box, dag::Span<Trace> traces, ren
 
   riex_collidable_t ri_h;
   dag::Vector<mat44f, framemem_allocator> ri_tm;
+  dag::Vector<vec4f, framemem_allocator> ri_bsph;
 
   // RI can be destroyed after gatherRIGenExtraCollidable and before actual ray trace, causing OOB
   // so we save matrices to guarantee valid data (this also save as a read lock in loop later)
@@ -1063,46 +1253,87 @@ static bool rayTraverseRiExtra(bbox3f_cref ray_box, dag::Span<Trace> traces, ren
   }
 
   ri_tm.resize_noinit(ri_h.size());
+  ri_bsph.resize_noinit(ri_h.size());
   for (int i = 0; i < ri_h.size(); ++i)
+  {
     getRIGenExtra44NoLock(ri_h[i], ri_tm[i]);
+    ri_bsph[i] = getRIGenExtraBSphere(ri_h[i]);
+  }
   rendinst::ccExtra.unlockRead();
 
   if (ri_h.size())
   {
+    // visit near to far: tmin is a lower bound of the instance hit distance (bsphere entry
+    // along the ray), so the sweep can stop at the first instance the current best hit
+    // already beats; a strategy that keeps outT full (list, occlusion) still visits all
+    struct OrderedRi
+    {
+      float tmin;
+      uint32_t idx;
+    };
+    dag::RelocatableFixedVector<OrderedRi, 64, true, framemem_allocator> order;
+    order.resize(ri_h.size());
+    if (Strategy::shrinksOutT && traces.size() == 1)
+    {
+      vec3f rayFrom = v_ldu(&traces[0].pos.x);
+      vec3f rayDir = v_ldu(&traces[0].dir.x);
+      for (int i = 0; i < ri_h.size(); ++i)
+      {
+        order[i].tmin = v_extract_x(v_dot3_x(v_sub(ri_bsph[i], rayFrom), rayDir)) - v_extract_w(ri_bsph[i]);
+        order[i].idx = i;
+      }
+      stlsort::sort(order.begin(), order.end(), [](const OrderedRi &a, const OrderedRi &b) { return a.tmin < b.tmin; });
+    }
+    else // multi ray or a strategy that keeps out_t full: -FLT_MAX keeps the break below inert
+      for (int i = 0; i < ri_h.size(); ++i)
+        order[i] = {-FLT_MAX, uint32_t(i)};
+
     int prevRiType = -1;
+    bool ignoreRiType = false;
     CollisionResource *collRes = nullptr;
     bbox3f vFullBBox;
     dag::RelocatableFixedVector<rendinst::RendInstDesc, 4, true, framemem_allocator> descriptions;
     descriptions.push_back_uninitialized(traces.size());
-    for (int i = 0; i < ri_h.size(); i++)
+    for (const OrderedRi &ord : order)
     {
+      if (ord.tmin >= traces[0].pos.outT)
+        break;
+      const int i = ord.idx;
       if (DAGOR_UNLIKELY(ri_h[i] == skip_riex_handle))
         continue;
+
+      if constexpr (Strategy::hasRiExtraIgnoreFunction)
+        if (strategy.riExtraIgnoreFunction && strategy.riExtraIgnoreFunction(ri_h[i])) [[unlikely]]
+          continue;
+
       uint32_t riType = rendinst::handle_to_ri_type(ri_h[i]);
+      // nothing resolved here depends on the instance; neighbors along the ray often share
+      // a pool, so cache the last one
       if (riType != prevRiType)
       {
         prevRiType = riType;
         collRes = rendinst::riExtra[riType].collRes;
         vFullBBox = collRes->vFullBBox;
+        ignoreRiType = false;
+        const int poolRef = rendinst::riExtra[riType].riPoolRef;
+        if (RendInstGenData *rgl = (poolRef >= 0) ? rendinst::getRgLayer(rendinst::riExtra[riType].riPoolRefLayer) : nullptr)
+        {
+          const rendinst::props::RendinstProperties &riProp = rgl->rtData->riProperties[poolRef];
+          ignoreRiType = strategy.shouldIgnoreRendinst(/*isPos*/ false, riProp.immortal, riProp.damageable, riProp.matId);
+        }
       }
-
-      int poolRef = rendinst::riExtra[riType].riPoolRef;
-      if (RendInstGenData *rgl = (poolRef >= 0) ? rendinst::getRgLayer(rendinst::riExtra[riType].riPoolRefLayer) : nullptr)
-      {
-        const RendInstGenData::RendinstProperties &riProp = rgl->rtData->riProperties[poolRef];
-        if (strategy.shouldIgnoreRendinst(/*isPos*/ false, riProp.immortal, riProp.damageable, riProp.matId))
-          continue;
-      }
+      if (ignoreRiType)
+        continue;
 
       for (auto &desc : descriptions)
         desc.reset();
-      bool shouldReturn = rayTestRiExtraInstanceBase<Strategy, false>(traces, ray_box, vFullBBox, ri_h[i], ri_tm[i], collRes,
-        haveCollision, strategy, make_span(descriptions));
+      bool shouldReturn = rayTestRiExtraInstanceBase<Strategy, false>(traces, ray_box, vFullBBox, ri_h[i], ri_tm[i], ri_bsph[i],
+        collRes, haveCollision, strategy, make_span(descriptions));
       if (ri_desc)
         for (int j = 0; j < descriptions.size(); ++j)
           if (descriptions[j].pool >= 0)
           {
-            *ri_desc = descriptions[0]; // just first one, should be good enough
+            *ri_desc = descriptions[j]; // just first valid one, should be good enough
             break;
           }
 
@@ -1126,7 +1357,10 @@ static bool rayTraverseRendinst(bbox3f_cref rayBox, dag::Span<Trace> traces, boo
   rendinst::RendInstDesc *ri_desc, Strategy &strategy, bool &haveCollision) // pos bbox here!
 {
   RendInstGenData *rgl = rendinst::rgLayer[layer_idx];
-  vec4f worldBboxXZ = v_perm_xzac(rayBox.bmin, rayBox.bmax);
+  bbox3f rayBoxExt = rayBox;
+  ScopedLockRead lock(rgl->rtData->riRwCs);
+  v_bbox3_extend(rayBoxExt, v_splats(rgl->rtData->maxCellMargin));
+  vec4f worldBboxXZ = v_perm_xzac(rayBoxExt.bmin, rayBoxExt.bmax);
   vec4f regionV = v_sub(worldBboxXZ, rgl->world0Vxz);
   regionV = v_max(v_mul(regionV, rgl->invGridCellSzV), v_zero());
   regionV = v_min(regionV, rgl->lastCellXZXZ);
@@ -1134,7 +1368,6 @@ static bool rayTraverseRendinst(bbox3f_cref rayBox, dag::Span<Trace> traces, boo
   DECL_ALIGN16(int, regions[4]);
   v_sti(regions, regionI);
 
-  ScopedLockRead lock(rgl->rtData->riRwCs);
   rgl->rtData->loadedCellsBBox.clip(regions[0], regions[1], regions[2], regions[3]);
   dag::ConstSpan<int> ld = rgl->rtData->loaded.getList();
   if ((regions[2] - regions[0] + 1) * (regions[3] - regions[1] + 1) < ld.size())
@@ -1144,7 +1377,7 @@ static bool rayTraverseRendinst(bbox3f_cref rayBox, dag::Span<Trace> traces, boo
       for (int x = regions[0]; x <= regions[2]; x++, cellI++)
       {
         RendInstGenData::Cell &cell = rgl->cells[cellI];
-        if (traverseRayCell(cell, rayBox, traces, trace_meshes, layer_idx, ri_desc, strategy, cellI))
+        if (TraverseRayCell<Strategy>::traverse(*rgl, cell, rayBox, traces, trace_meshes, layer_idx, ri_desc, strategy, cellI))
         {
           if (ri_desc)
             ri_desc->cellIdx = cellI;
@@ -1159,7 +1392,7 @@ static bool rayTraverseRendinst(bbox3f_cref rayBox, dag::Span<Trace> traces, boo
     for (auto ldi : ld)
     {
       RendInstGenData::Cell &cell = rgl->cells[ldi];
-      if (traverseRayCell(cell, rayBox, traces, trace_meshes, layer_idx, ri_desc, strategy, ldi))
+      if (TraverseRayCell<Strategy>::traverse(*rgl, cell, rayBox, traces, trace_meshes, layer_idx, ri_desc, strategy, ldi))
       {
         if (ri_desc)
           ri_desc->cellIdx = ldi;
@@ -1198,7 +1431,7 @@ static bool rayTraverse(dag::Span<Trace> traces, bool trace_meshes, rendinst::Re
 bool traceTransparencyRayRIGenNormalizedWithDist(const Point3 &pos, const Point3 &dir, float &t, float transparency_threshold,
   PhysMat::MatID ray_mat, rendinst::RendInstDesc *ri_desc, int *out_mat_id, float *out_transparency, bool check_canopy)
 {
-  RayTransparencyStrat rayTranspStrategy(transparency_threshold, check_canopy, ray_mat);
+  RayTransparencyStrat rayTranspStrategy(1 /*count*/, transparency_threshold, check_canopy, /* check_trunk */ true, ray_mat);
   Trace traceData(pos, dir, t, nullptr);
 
   bbox3f rayBox;
@@ -1225,7 +1458,7 @@ bool traceTransparencyRayRIGenNormalizedAllLayers(const Point3 &pos, const Point
   PhysMat::MatID ray_mat, rendinst::RendInstDesc *ri_desc, int *out_mat_id, float *out_transparency, bool check_canopy,
   float min_height_second_layer)
 {
-  RayTransparencyStrat rayTranspStrategy(transparency_threshold, check_canopy, ray_mat);
+  RayTransparencyStrat rayTranspStrategy(1 /*count*/, transparency_threshold, check_canopy, /* check_trunk */ true, ray_mat);
   rayTranspStrategy.secondLayerMinCapsuleHeightSq = sqr(min_height_second_layer);
   Trace traceData(pos, dir, mint, nullptr);
 
@@ -1290,7 +1523,7 @@ static bool rayTestIndividualNoLock(dag::Span<Trace> traces, const rendinst::Ren
 
   if (ri_desc.isRiExtra())
   {
-    if (ri_desc.pool >= rendinst::riExtra.size())
+    if (!rendinst::riExtra.isValid(ri_desc.pool))
       return false;
     rendinst::RiExtraPool *pool = rendinst::riExtra.data() + ri_desc.pool;
     if (!pool->isInGrid(ri_desc.idx))
@@ -1301,7 +1534,7 @@ static bool rayTestIndividualNoLock(dag::Span<Trace> traces, const rendinst::Ren
 
     if (RendInstGenData *rgl = (pool->riPoolRef >= 0) ? rendinst::getRgLayer(pool->riPoolRefLayer) : nullptr)
     {
-      const RendInstGenData::RendinstProperties &riProp = rgl->rtData->riProperties[pool->riPoolRef];
+      const rendinst::props::RendinstProperties &riProp = rgl->rtData->riProperties[pool->riPoolRef];
       if (strategy.shouldIgnoreRendinst(/*isPos*/ false, riProp.immortal, riProp.damageable, riProp.matId))
         return false;
     }
@@ -1315,6 +1548,10 @@ static bool rayTestIndividualNoLock(dag::Span<Trace> traces, const rendinst::Ren
     if (DAGOR_UNLIKELY(rh == skip_riex_handle))
       return false;
 
+    if constexpr (Strategy::hasRiExtraIgnoreFunction)
+      if (strategy.riExtraIgnoreFunction && strategy.riExtraIgnoreFunction(rh)) [[unlikely]]
+        return false;
+
     rayTestRiExtraInstance<Strategy, /*CHK_BOX*/ true, /*READ_LOCK*/ false>(traces, rayBox, collRes->vFullBBox, rh, collRes,
       haveCollision, strategy, out_ri_desc);
     return haveCollision;
@@ -1327,7 +1564,8 @@ static bool rayTestIndividualNoLock(dag::Span<Trace> traces, const rendinst::Ren
 
   RendInstGenData *rgl = RendInstGenData::getGenDataByLayer(ri_desc);
   mat44f tm;
-  if (!riutil::get_rendinst_matrix(ri_desc, rgl, data, cell, tm) || !rgl)
+  uint32_t paletteId = 0;
+  if (!riutil::get_rendinst_matrix(ri_desc, rgl, data, cell, tm, paletteId) || !rgl)
     return false;
 
   CollisionResource *collRes = rgl->rtData->riCollRes[ri_desc.pool].collRes;
@@ -1346,6 +1584,10 @@ static bool rayTestIndividualNoLock(dag::Span<Trace> traces, const rendinst::Ren
       traces[rayId].outNorm, safe_at(out_ri_desc, rayId), localHaveCollision, ri_desc.layer, ri_desc.idx, ri_desc.pool, ri_desc.offs,
       traces[rayId].outMatId, 0);
     haveCollision |= localHaveCollision;
+    // Authoritative per-ray desc for the cached path. executeForMesh above is passed cell_idx=0
+    // (this desc's real cell is not decomposed into the call), so a strategy that captures the
+    // desc from its args (TraceRayMultiDescStrat) gets an incomplete cellIdx; this supplies the
+    // full desc. Required - do not drop as redundant.
     if (localHaveCollision && rayId < out_ri_desc.size())
       out_ri_desc[rayId] = ri_desc;
     if (shouldExit)
@@ -1355,10 +1597,11 @@ static bool rayTestIndividualNoLock(dag::Span<Trace> traces, const rendinst::Ren
   return haveCollision;
 }
 
-bool traceRayRIGenNormalized(dag::Span<Trace> traces, TraceFlags trace_flags, int ray_mat_id, rendinst::RendInstDesc *out_ri_descs,
-  const TraceMeshFaces *ri_cache, rendinst::riex_handle_t skip_riex_handle)
+template <typename Strategy>
+bool traceRayRIGenNormalizedInternal(Strategy &strategy, dag::Span<Trace> traces, TraceFlags trace_flags,
+  rendinst::RendInstDesc *out_ri_descs, const TraceMeshFaces *ri_cache, rendinst::riex_handle_t skip_riex_handle,
+  dag::Span<rendinst::RendInstDesc> out_ri_desc_span = {})
 {
-  TraceRayStrat traceRayStrategy(ray_mat_id, trace_flags);
   bool ret = false;
   if (ri_cache)
   {
@@ -1371,22 +1614,72 @@ bool traceRayRIGenNormalized(dag::Span<Trace> traces, TraceFlags trace_flags, in
       ri_cache->rendinstCache.foreachValid(rendinst::GatherRiTypeFlag::RiGenTmAndExtra,
         [&](const rendinst::RendInstDesc &ri_desc, bool) {
           if (rendinst::isRgLayerPrimary(ri_desc.layer))
-            ret |= rayTestIndividualNoLock(traces, ri_desc, {}, traceRayStrategy, rayBox, skip_riex_handle);
+            ret |= rayTestIndividualNoLock(traces, ri_desc, out_ri_desc_span, strategy, rayBox, skip_riex_handle);
         });
 
       return ret;
     }
     trace_utils::draw_trace_handle_debug_cast_result(ri_cache, traces, false, true);
   }
-  return rayTraverse(traces, bool(trace_flags & TraceFlag::Meshes), out_ri_descs, traceRayStrategy, skip_riex_handle);
+  return rayTraverse(traces, bool(trace_flags & TraceFlag::Meshes), out_ri_descs, strategy, skip_riex_handle);
 }
 
+bool traceRayRIGenNormalized(dag::Span<Trace> traces, TraceFlags trace_flags, int ray_mat_id, rendinst::RendInstDesc *out_ri_descs,
+  const TraceMeshFaces *ri_cache, rendinst::riex_handle_t skip_riex_handle)
+{
+  TraceRayStrat traceRayStrategy(ray_mat_id, trace_flags);
+  return traceRayRIGenNormalizedInternal(traceRayStrategy, traces, trace_flags, out_ri_descs, ri_cache, skip_riex_handle);
+}
+
+bool traceRayRIGenNormalizedMultiRay(dag::Span<Trace> traces, TraceFlags trace_flags, dag::Span<rendinst::RendInstDesc> ri_descs,
+  int ray_mat_id, const TraceMeshFaces *ri_cache, rendinst::riex_handle_t skip_riex_handle)
+{
+  G_ASSERT(traces.size() == ri_descs.size());
+  for (rendinst::RendInstDesc &d : ri_descs)
+    d.invalidate();
+  TraceRayMultiDescStrat strategy(ray_mat_id, trace_flags, ri_descs);
+  // Pass ri_descs both as the strategy's capture span (non-cached paths) and as the cached
+  // path's per-ray output; the cached rayTestIndividualNoLock write is authoritative there.
+  return traceRayRIGenNormalizedInternal(strategy, traces, trace_flags, /*single out*/ nullptr, ri_cache, skip_riex_handle, ri_descs);
+}
+
+bool rayhitRIGenNormalized(dag::Span<Trace> traces, TraceFlags trace_flags, int ray_mat_id, rendinst::RendInstDesc *out_ri_desc,
+  const TraceMeshFaces *ri_cache, rendinst::riex_handle_t skip_riex_handle)
+{
+  RayHitStrat strategy(ray_mat_id, trace_flags);
+  if (ri_cache)
+  {
+    AutoLockReadPrimaryAndExtra lockRead;
+    if (check_cached_ri_data(ri_cache))
+    {
+      bbox3f rayBox;
+      trace_utils::prepare_traces_box(traces, rayBox);
+      rendinst::RendInstDesc descTmp;
+      dag::Span<rendinst::RendInstDesc> outSpan(out_ri_desc ? out_ri_desc : &descTmp, 1);
+      return ri_cache->rendinstCache.foreachValidUntil(rendinst::GatherRiTypeFlag::RiGenTmAndExtra,
+        [&](const rendinst::RendInstDesc &ri_desc, bool) {
+          return rendinst::isRgLayerPrimary(ri_desc.layer) &&
+                 rayTestIndividualNoLock(traces, ri_desc, outSpan, strategy, rayBox, skip_riex_handle);
+        });
+    }
+    trace_utils::draw_trace_handle_debug_cast_result(ri_cache, traces, false, true);
+  }
+  return rayTraverse(traces, bool(trace_flags & TraceFlag::Meshes), out_ri_desc, strategy, skip_riex_handle);
+}
+
+bool traceRayRIGenNormalizedWithIgnoreFunc(dag::Span<Trace> traces, TraceFlags trace_flags, int ray_mat_id,
+  rendinst::RendInstDesc *out_ri_descs, const TraceMeshFaces *ri_cache, TraceRayIgnoreRiExtraCbType ignore_func)
+{
+  TraceRayStratWithRiExtraIgnoreFunction traceRayStrategy(ray_mat_id, trace_flags);
+  traceRayStrategy.riExtraIgnoreFunction = ignore_func;
+  return traceRayRIGenNormalizedInternal(traceRayStrategy, traces, trace_flags, out_ri_descs, ri_cache, RIEX_HANDLE_NULL);
+}
 
 DECL_ALIGN16(static float, v_SUBCELL_DIV_MAX[4]) = {
   SUBCELL_DIV - 0.01f, SUBCELL_DIV - 0.01f, SUBCELL_DIV - 0.01f, SUBCELL_DIV - 0.01f};
 
 static bool traceDownMultiRayCell(int layer_idx, int cell_idx, dag::Span<Trace> traces, dag::Span<rendinst::RendInstDesc> ri_desc,
-  bbox3f_cref ray_box, int ray_mat_id, uint8_t behaviorFlags, [[maybe_unused]] Bitarray *filter_pools)
+  bbox3f_cref ray_box, int ray_mat_id, uint8_t behaviorFlags, TraceDownMutiRayIgnoreCbType ignore_func)
 {
   const RendInstGenData *rgl = rendinst::rgLayer[layer_idx];
   const RendInstGenData::Cell &cell = rgl->cells[cell_idx];
@@ -1453,10 +1746,9 @@ static bool traceDownMultiRayCell(int layer_idx, int cell_idx, dag::Span<Trace> 
         if (!collRes)
           continue;
 
-#if _TARGET_PC_TOOLS_BUILD
-        if (filter_pools && filter_pools->get(p))
-          continue;
-#endif
+        if (ignore_func) [[unlikely]]
+          if (ignore_func(RendInstDesc{cell_idx, idx, p, ~0u, layer_idx})) // Warn: called once per pool
+            continue;
 
         const int16_t *data_s = (int16_t *)(crt.sysMemData.get() + scs.ofs);
         int stride_w =
@@ -1478,12 +1770,7 @@ static bool traceDownMultiRayCell(int layer_idx, int cell_idx, dag::Span<Trace> 
           {
             if (collisionTraces[rayId].isHit)
             {
-              ri_desc[rayId].cellIdx = cell_idx;
-              ri_desc[rayId].idx = idx;
-              ri_desc[rayId].pool = p;
-              ri_desc[rayId].offs = int(intptr_t(data) - intptr_t(data_s));
-              ri_desc[rayId].layer = layer_idx;
-
+              ri_desc[rayId] = RendInstDesc{cell_idx, idx, p, uint32_t(intptr_t(data) - intptr_t(data_s)), layer_idx};
               traces[rayId].pos.outT = collisionTraces[rayId].t;
               traces[rayId].outNorm = collisionTraces[rayId].norm;
               if (collisionTraces[rayId].outMatId == PHYSMAT_INVALID || collisionTraces[rayId].outMatId == PHYSMAT_DEFAULT)
@@ -1500,12 +1787,8 @@ static bool traceDownMultiRayCell(int layer_idx, int cell_idx, dag::Span<Trace> 
 }
 
 bool traceDownMultiRayNoCache(dag::Span<Trace> traces, bbox3f_cref ray_box, dag::Span<rendinst::RendInstDesc> ri_descs, int ray_mat_id,
-  TraceFlags trace_flags, TraceDownMutiRayIgnoreCbType ignore_func, [[maybe_unused]] Bitarray *filter_pools)
+  TraceFlags trace_flags, TraceDownMutiRayIgnoreCbType ignore_func)
 {
-#if _TARGET_PC_TOOLS_BUILD
-#else
-  G_ASSERTF(!filter_pools, "Pools filtering is not not supported in game runtime"); // Perf optimization
-#endif
   G_ASSERT(traces.size() == ri_descs.size());
   G_ASSERT(!(trace_flags & (TraceFlag::Meshes | TraceFlag::Trees)));
 
@@ -1542,11 +1825,6 @@ bool traceDownMultiRayNoCache(dag::Span<Trace> traces, bbox3f_cref ray_box, dag:
     const CollisionResource *collRes = rendinst::riExtra[resIdx].collRes;
     if (!collRes)
       continue;
-
-#if _TARGET_PC_TOOLS_BUILD
-    if (filter_pools && filter_pools->get(rendinst::riExtra[resIdx].riPoolRef))
-      continue;
-#endif
 
     if (DAGOR_UNLIKELY(ignore_func) && ignore_func(RendInstDesc(ri_h[i])))
       continue;
@@ -1591,7 +1869,7 @@ bool traceDownMultiRayNoCache(dag::Span<Trace> traces, bbox3f_cref ray_box, dag:
     {
       for (int x = regions[0]; x <= regions[2]; x++, cellI++)
       {
-        if (traceDownMultiRayCell(_layer, cellI, traces, ri_descs, ray_box, ray_mat_id, behaviorFlags, filter_pools))
+        if (traceDownMultiRayCell(_layer, cellI, traces, ri_descs, ray_box, ray_mat_id, behaviorFlags, ignore_func))
           haveCollision = true;
       }
     }
@@ -1667,7 +1945,8 @@ bool rayhitRendInstsNormalized(const Point3 &from, const Point3 &dir, float t, f
 }
 
 bool traceRayRendInstsNormalized(const Point3 &from, const Point3 &dir, float &tout, Point3 &norm, bool /*extend_bbox*/,
-  bool trace_meshes, rendinst::RendInstDesc *ri_desc, bool trace_trees, int ray_mat_id, int *out_mat_id)
+  bool trace_meshes, rendinst::RendInstDesc *ri_desc, bool trace_trees, int ray_mat_id, int *out_mat_id,
+  TraceRayIgnoreRiExtraCbType ignore_func)
 {
   TraceFlags traceFlags = TraceFlag::Destructible;
   if (trace_meshes)
@@ -1676,8 +1955,18 @@ bool traceRayRendInstsNormalized(const Point3 &from, const Point3 &dir, float &t
     traceFlags |= TraceFlag::Trees;
   Trace traceData(from, dir, tout, nullptr);
   traceData.outNorm = norm;
-  if (!traceRayRIGenNormalized(dag::Span<Trace>(&traceData, 1), traceFlags, ray_mat_id, ri_desc))
-    return false;
+
+  if (ignore_func)
+  {
+    if (!traceRayRIGenNormalizedWithIgnoreFunc(dag::Span<Trace>(&traceData, 1), traceFlags, ray_mat_id, ri_desc, nullptr, ignore_func))
+      return false;
+  }
+  else
+  {
+    if (!traceRayRIGenNormalized(dag::Span<Trace>(&traceData, 1), traceFlags, ray_mat_id, ri_desc))
+      return false;
+  }
+
   tout = traceData.pos.outT;
   norm = traceData.outNorm;
   if (out_mat_id)
@@ -1703,31 +1992,24 @@ template <typename ListT>
 bool traceRayRendInstsListAllNormalizedImpl(dag::Span<Trace> traces, ListT &ri_data, const TraceRendInstParams &params)
 {
   TraceRayAllUnsortedListStrat<ListT, RayTransparencyStrat> traceRayStrategy(params.tracePhysMatId, ri_data);
-  RayTransparencyStrat transpStrategy(params.transparencyThreshold, params.checkCanopy, params.tracePhysMatId);
+  RayTransparencyStrat transpStrategy(traces.size(), params.transparencyThreshold, params.checkCanopy, /* check_trunk */ false,
+    params.tracePhysMatId);
   if (params.traceTransparencyPrimaryLayers || params.traceTransparencyAllLayers)
-  {
-    transpStrategy.perTraceData.resize(traces.size());
     traceRayStrategy.setTransparencyStrat(&transpStrategy);
-  }
   traceRayStrategy.extendRay = params.extendRay;
 
-  bool ret = false;
   bool haveCollision = false;
   bbox3f rayBox;
   init_raybox_from_traces(rayBox, traces);
-  if (rayTraverseRiExtra(rayBox, traces, nullptr, traceRayStrategy, haveCollision, rendinst::RIEX_HANDLE_NULL))
-    ret = true;
+  // a rayTraverse* result only means "stop the traversal", which this strategy never requests
+  // (its executeForCell always returns false); hits are reported through haveCollision
+  rayTraverseRiExtra(rayBox, traces, nullptr, traceRayStrategy, haveCollision, rendinst::RIEX_HANDLE_NULL);
   const int layers = params.traceTransparencyAllLayers ? rendinst::rgLayer.size() : rendinst::rgPrimaryLayers;
   for (int _layer = 0; _layer < layers; _layer++)
-    if (RendInstGenData *rgl = rendinst::rgLayer[_layer])
-    {
-      if (rayTraverseRendinst(rayBox, traces, params.traceMeshes, _layer, nullptr, traceRayStrategy, haveCollision))
-        ret = true;
-    }
+    if (rendinst::rgLayer[_layer])
+      rayTraverseRendinst(rayBox, traces, params.traceMeshes, _layer, nullptr, traceRayStrategy, haveCollision);
   stlsort::sort_branchless(ri_data.begin(), ri_data.end());
-  if (!ret || traceRayStrategy.list.empty())
-    return false;
-  return true;
+  return haveCollision && !ri_data.empty();
 }
 
 bool traceRayRendInstsRayBatchAllIntersections(dag::Span<Trace> traces, RendInstsIntersectionsListExt &ri_data,
@@ -1763,7 +2045,10 @@ void computeRiIntersectedSolids(RendInstsIntersectionsListExt &intersected, cons
     return;
   const int intersectionCount = int(intersected.size());
 
-  if (intersectionCount > 1024 || intersectionCount < 0)
+  // every intersection can introduce one new id, and the ids pack into the 10 bit fields of
+  // LocalIntersectionId below
+  const int maxIntersections = 1 << 10;
+  if (intersectionCount > maxIntersections || intersectionCount < 0)
   {
     eastl::string dbgNames;
     dbgNames.reserve(300);
@@ -1785,11 +2070,11 @@ void computeRiIntersectedSolids(RendInstsIntersectionsListExt &intersected, cons
   {
     struct
     {
-      uint8_t collNodeId;
-      uint8_t matId;
-      uint8_t riId;
-      bool removed : 1;
-      bool direction : 1;
+      uint32_t collNodeId : 10;
+      uint32_t matId : 10;
+      uint32_t riId : 10;
+      uint32_t removed : 1;
+      uint32_t direction : 1;
     };
     uint32_t data;
     int outIdx;
@@ -1798,9 +2083,9 @@ void computeRiIntersectedSolids(RendInstsIntersectionsListExt &intersected, cons
   };
 
   dag::RelocatableFixedVector<LocalIntersectionId, 128u, true, framemem_allocator> intersectionData;
-  LocalIntersectionIdRemap<unsigned, uint8_t, 16> localCollNodeRemap;
-  LocalIntersectionIdRemap<int, uint8_t, 16> localMatIdRemap;
-  LocalIntersectionIdRemap<RendInstDesc, uint8_t, 4> localRiRemap;
+  LocalIntersectionIdRemap<unsigned, uint16_t, 16> localCollNodeRemap;
+  LocalIntersectionIdRemap<int, uint16_t, 16> localMatIdRemap;
+  LocalIntersectionIdRemap<RendInstDesc, uint16_t, 4> localRiRemap;
 
   // [0, size) - coll node index and flags
   // [size, size * 2) - out intersection index
@@ -1919,47 +2204,39 @@ void computeRiIntersectedSolids(RendInstsIntersectionsListExt &intersected, cons
 static void fill_collision_info(RendInstGenData *rgl, const rendinst::RendInstDesc &ri_desc, const TMatrix &tm, const BBox3 &bbox,
   rendinst::CollisionInfo &out_coll_info)
 {
-  bool isRiExtra = ri_desc.isRiExtra();
-  out_coll_info.riPoolRef = isRiExtra ? rendinst::riExtra[ri_desc.pool].riPoolRef : ri_desc.pool;
-  if (isRiExtra && out_coll_info.riPoolRef >= 0)
-    rgl = rendinst::getRgLayer(rendinst::riExtra[ri_desc.pool].riPoolRefLayer);
-  // debug("fill_collision_info(%d, %d, %d, %d) -> %d, %d",
-  //   ri_desc.cellIdx, ri_desc.idx, ri_desc.pool, ri_desc.offs, ri_desc.isRiExtra(), pool);
+  // null exactly for non riExtra descs; guard each use with the pointer itself so the
+  // check is visible to static analysis. getHp/isInvincible are not const
+  rendinst::RiExtraPool *riExPool = ri_desc.isRiExtra() ? &rendinst::riExtra[ri_desc.pool] : nullptr;
+  const int poolRef = riExPool ? riExPool->riPoolRef : ri_desc.pool;
+  out_coll_info.riPoolRef = poolRef;
+  if (riExPool && poolRef >= 0)
+    rgl = rendinst::getRgLayer(riExPool->riPoolRefLayer);
 
-  out_coll_info.handle = ri_desc.isRiExtra() ? rendinst::riExtra[ri_desc.pool].collHandle
-                                             : (rgl ? rgl->rtData->riCollRes[out_coll_info.riPoolRef].handle : nullptr); //-V781
-  out_coll_info.collRes = ri_desc.isRiExtra() ? rendinst::riExtra[ri_desc.pool].collRes
-                                              : (rgl ? rgl->rtData->riCollRes[out_coll_info.riPoolRef].collRes : nullptr);
+  // the layer keeps the pool wide properties; without them every field falls back to its
+  // own neutral value, which is not always the default constructed one
+  const rendinst::props::RendinstProperties *riProp = (rgl && poolRef >= 0) ? &rgl->rtData->riProperties[poolRef] : nullptr;
+  const rendinst::props::DestrProps *riDestr = (rgl && poolRef >= 0) ? &rgl->rtData->riDestr[poolRef] : nullptr;
+
+  out_coll_info.handle = riExPool ? riExPool->collHandle : (rgl ? rgl->rtData->riCollRes[poolRef].handle : nullptr); //-V781
+  out_coll_info.collRes = riExPool ? riExPool->collRes : (rgl ? rgl->rtData->riCollRes[poolRef].collRes : nullptr);
   out_coll_info.tm = tm;
   out_coll_info.localBBox = bbox;
-  out_coll_info.isImmortal = (rgl && out_coll_info.riPoolRef >= 0)
-                               ? rgl->rtData->riProperties[out_coll_info.riPoolRef].immortal //-V781
-                               : (isRiExtra && rendinst::riExtra[ri_desc.pool].immortal);
-  out_coll_info.stopsBullets =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riProperties[out_coll_info.riPoolRef].stopsBullets : true;
-  out_coll_info.isDestr =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].destructable : !isRiExtra;
-  out_coll_info.destrImpulse =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].destructionImpulse : 0;
-  out_coll_info.hp = isRiExtra ? rendinst::riExtra[ri_desc.pool].getHp(ri_desc.idx) : 0.f;
-  out_coll_info.initialHp = isRiExtra ? rendinst::riExtra[ri_desc.pool].initialHP : 0.f;
-  out_coll_info.bushBehaviour =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riProperties[out_coll_info.riPoolRef].bushBehaviour : false;
-  out_coll_info.treeBehaviour =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riProperties[out_coll_info.riPoolRef].treeBehaviour : false;
-  out_coll_info.isParent = (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].isParent : false;
-  out_coll_info.tag = (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].tag : SimpleString();
-  out_coll_info.destroyedByTag =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].destroyedByTag : SimpleString();
-  out_coll_info.destructibleByParent =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].destructibleByParent : false;
-  out_coll_info.destroyNeighbourDepth =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].destroyNeighbourDepth : 1;
-  out_coll_info.destrFxId = (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].destrFxId : -1;
-  out_coll_info.destrFxTemplate =
-    (rgl && out_coll_info.riPoolRef >= 0) ? rgl->rtData->riDestr[out_coll_info.riPoolRef].destrFxTemplate : SimpleString();
+  out_coll_info.isImmortal = riProp ? riProp->immortal : (riExPool && riExPool->immortal); //-V781
+  out_coll_info.isImmortal |= riExPool ? riExPool->isInvincible(ri_desc.idx) : false;
+  out_coll_info.stopsBullets = riProp ? riProp->stopsBullets : true;
+  out_coll_info.isDestr = riDestr ? riDestr->destructable : !riExPool;
+  out_coll_info.destrImpulse = riDestr ? riDestr->destructionImpulse : 0;
+  out_coll_info.hp = riExPool ? riExPool->getHp(ri_desc.idx) : 0.f;
+  out_coll_info.initialHp = riExPool ? riExPool->initialHP : 0.f;
+  out_coll_info.bushBehaviour = riProp ? riProp->bushBehaviour : false;
+  out_coll_info.treeBehaviour = riProp ? riProp->treeBehaviour : false;
+  out_coll_info.isParent = riDestr ? riDestr->isParent : false;
+  out_coll_info.destructibleByParent = riDestr ? riDestr->destructibleByParent : false;
+  out_coll_info.destroyNeighbourDepth = riDestr ? riDestr->destroyNeighbourDepth : 1;
+  out_coll_info.destrFxId = riDestr ? riDestr->destrFxId : -1;
+  out_coll_info.matId = riProp ? riProp->matId : PHYSMAT_INVALID;
 
-  if (isRiExtra && out_coll_info.hp <= 0.f && !out_coll_info.isDestr)
+  if (riExPool && out_coll_info.hp <= 0.f && !out_coll_info.isDestr)
     out_coll_info.isImmortal = true;
 }
 
@@ -1978,8 +2255,8 @@ CollisionInfo getRiGenDestrInfo(const RendInstDesc &desc)
 {
   CollisionInfo ret(desc);
   G_ASSERT(desc.isValid());
-  fill_collision_info(RendInstGenData::getGenDataByLayer(desc), desc, rendinst::getRIGenMatrixNoLock(desc),
-    rendinst::getRIGenBBox(desc), ret);
+  fill_collision_info(RendInstGenData::getGenDataByLayer(desc), desc, rendinst::getRIGenMatrix(desc), rendinst::getRIGenBBox(desc),
+    ret);
   return ret;
 }
 
@@ -1988,6 +2265,9 @@ struct CallbackAddStrat : public MaterialRayStrat
   rendinst::RendInstCollisionCB &callback;
   dag::RelocatableFixedVector<eastl::pair<bool, rendinst::CollisionInfo>, 12, true, framemem_allocator> collInfoQueue;
   bool useQueue;
+#if DAGOR_DBGLEVEL > 0
+  const rendinst::CollisionInfo *processingElem = nullptr; // for debugger
+#endif
 
   // set use_queue to true if you want unlock ri mutexes before callback processing
   CallbackAddStrat(rendinst::RendInstCollisionCB &cb, bool use_queue, PhysMat::MatID ray_mat = PHYSMAT_INVALID) :
@@ -2036,6 +2316,11 @@ struct CallbackAddStrat : public MaterialRayStrat
   {
     for (auto &q : collInfoQueue)
     {
+      if (!rendinst::isRiGenInWorld(q.second.desc))
+        continue;
+#if DAGOR_DBGLEVEL > 0
+      processingElem = &q.second;
+#endif
       if (q.first)
         callback.addCollisionCheck(q.second);
       else
@@ -2070,17 +2355,17 @@ struct CacheAddStrat : public MaterialRayStrat
   CheckBoxRIResultFlags executeForTm(RendInstGenData * /*rgl*/, const rendinst::RendInstDesc &ri_desc, mat44f_cref v_tm,
     const BBox3 &bbox, const CollisionResource *)
   {
-    return addToCacheInBox(ri_desc, v_tm, bbox, riCache->rendinstCache, false, CheckBoxRIResultFlag::All);
+    return addToCache(ri_desc, v_tm, bbox, riCache->rendinstCache, false, CheckBoxRIResultFlag::All);
   }
 
   CheckBoxRIResultFlags executeForPos(RendInstGenData * /*rgl*/, const rendinst::RendInstDesc &ri_desc, mat44f_cref v_tm,
     const BBox3 &bbox, const CollisionResource *)
   {
-    return addToCacheInBox(ri_desc, v_tm, bbox, riCache->rendinstCache, true, CheckBoxRIResultFlag::All);
+    return addToCache(ri_desc, v_tm, bbox, riCache->rendinstCache, true, CheckBoxRIResultFlag::All);
   }
 
 private:
-  CheckBoxRIResultFlags addToCacheInBox(const rendinst::RendInstDesc &ri_desc, mat44f_cref v_tm, const BBox3 &bbox,
+  CheckBoxRIResultFlags addToCache(const rendinst::RendInstDesc &ri_desc, mat44f_cref, const BBox3 &,
     TraceMeshFaces::RendinstCache &cache, bool is_pos, CheckBoxRIResultFlags overflow_result)
   {
     if (cache.isFull())
@@ -2088,13 +2373,6 @@ private:
       valid = false; // we don't have enough place for another one, we cannot use cache
       return overflow_result;
     }
-    mat44f invTm;
-    v_mat44_inverse43(invTm, v_tm);
-    bbox3f v_bbox = v_ldu_bbox3(bbox);
-    bbox3f invBox;
-    v_bbox3_init(invBox, invTm, v_ldu_bbox3(riCache->box));
-    if (!v_bbox3_test_box_intersect(v_bbox, invBox))
-      return {};
 
     cache.add(ri_desc, is_pos);
     return {};
@@ -2105,8 +2383,12 @@ template <typename T>
 class VerifyReadLock
 {
 public:
-  VerifyReadLock(T &_lock) : lock(_lock) {}
-  ~VerifyReadLock() { G_ASSERT(!locked); }
+  VerifyReadLock(T &_lock) : lock(_lock) { lockRead(); }
+  ~VerifyReadLock()
+  {
+    if (isLocked())
+      unlockRead();
+  }
   void lockRead() DAG_TS_ACQUIRE_SHARED(lock)
   {
     G_ASSERT(!locked);
@@ -2148,7 +2430,7 @@ public:
       mat44f itmB;
       v_mat44_inverse43(itmB, tm_b);
       vec3f lcA = v_mat44_mul_vec3p(itmB, centerA);
-      vec4f maxScale = v_mat44_max_scale43_x(tm_b);
+      vec4f maxScale = v_splat_x(v_mat44_max_scale43_x(tm_b));
       bbox3f extB = local_box_b;
       v_bbox3_extend(extB, v_mul(v_splats(boundingA.r), maxScale));
       return v_bbox3_test_pt_inside(extB, lcA);
@@ -2170,13 +2452,7 @@ public:
         return v_bbox3_test_box_intersect(aInB, local_box_b);
       }
 
-      if (v_bbox3_test_trasformed_box_intersect(worldBoxA, local_box_b, tm_b))
-        return true;
-
-      mat44f itmB;
-      v_mat44_inverse43(itmB, tm_b);
-      if (v_bbox3_test_trasformed_box_intersect(local_box_b, worldBoxA, itmB))
-        return true;
+      return v_bbox3_test_trasformed_box_likely_intersect(worldBoxA, local_box_b, tm_b);
     }
 
     if constexpr (eastl::is_same_v<bounding_type_t, OrientedObjectBox>)
@@ -2212,15 +2488,9 @@ public:
 
       mat44f tmBtoA;
       v_mat44_mul43(tmBtoA, itmA, tm_b);
-      if (v_bbox3_test_trasformed_box_intersect(boundingA.bbox, local_box_b, tmBtoA))
-        return true;
-
-      mat44f tmAtoB, itmB;
-      v_mat44_inverse43(itmB, tm_b);
-      v_mat44_mul43(tmAtoB, itmB, boundingA.tm);
-      if (v_bbox3_test_trasformed_box_intersect(local_box_b, boundingA.bbox, tmAtoB))
-        return true;
+      return v_bbox3_test_trasformed_box_likely_intersect(boundingA.bbox, local_box_b, tmBtoA);
     }
+
     if constexpr (eastl::is_same_v<bounding_type_t, Capsule>)
     {
       if (!v_bbox3_test_box_intersect(boundingA.getBoundingBox(), worldBoxB))
@@ -2232,11 +2502,31 @@ public:
     return false;
   }
 
+  __forceinline bool testSphereIntersectionEst(vec3f bsph_pos, vec4f bsph_rad)
+  {
+    if constexpr (eastl::is_same_v<bounding_type_t, BSphere3>)
+    {
+      vec4f sphA = v_ldu_bsphere3(boundingA);
+      vec4f sphB = v_perm_xyzd(bsph_pos, v_splat_x(bsph_rad));
+      return v_test_bsph_bsph_intersection(sphA, sphB);
+    }
+
+    if constexpr (eastl::is_same_v<bounding_type_t, BBox3> || eastl::is_same_v<bounding_type_t, OrientedObjectBox>)
+      return v_bbox3_test_sph_intersect(worldBoxA, bsph_pos, v_sqr_x(bsph_rad));
+
+    if constexpr (eastl::is_same_v<bounding_type_t, Capsule>)
+    {
+      vec4f sphB = v_perm_xyzd(bsph_pos, v_splat_x(bsph_rad));
+      return boundingA.cliptest(sphB);
+    }
+    return false;
+  }
+
 private:
   static bool isSmallBox(bbox3f bbox)
   {
     const float smallObjWidth = 1.6f;
-    return (v_signmask(v_cmp_lt(v_bbox3_size(bbox), v_splats(smallObjWidth))) & 0b101) == 0b101;
+    return v_check_xz_all_true(v_cmp_lt(v_bbox3_size(bbox), v_splats(smallObjWidth)));
   }
 
   const bounding_type_t &boundingA;
@@ -2270,7 +2560,6 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
   if (ri_types & GatherRiTypeFlag::RiExtraOnly && rendinst::isRgLayerPrimary(layer))
   {
     VerifyReadLock lock(rendinst::ccExtra);
-    lock.lockRead();
     if constexpr (eastl::is_same_v<bounding_type_t, BSphere3>)
       gatherRIGenExtraCollidable(riexHandles, obj_bounding, false /*read_lock*/);
     if constexpr (eastl::is_same_v<bounding_type_t, BBox3> || eastl::is_same_v<bounding_type_t, OrientedObjectBox>)
@@ -2294,7 +2583,7 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
         int poolRef = pool.riPoolRef;
         if (RendInstGenData *rgl = (poolRef >= 0) ? rendinst::getRgLayer(pool.riPoolRefLayer) : nullptr)
         {
-          const RendInstGenData::RendinstProperties &riProp = rgl->rtData->riProperties[poolRef];
+          const rendinst::props::RendinstProperties &riProp = rgl->rtData->riProperties[poolRef];
           ignoreRi = should_ignore(/*isPos*/ false, riProp.immortal, riProp.damageable, riProp.matId);
         }
         else
@@ -2302,6 +2591,21 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
       }
       if (ignoreRi)
         continue;
+
+      if constexpr (eastl::is_same_v<bounding_type_t, OrientedObjectBox>)
+      {
+        vec4f wbsph = pool.riXYZR[riIdx];
+        if (!v_bbox3_test_sph_intersect(v_ldu_bbox3(obj_world_aabb), wbsph, v_sqr_x(v_splat_w(wbsph))))
+          continue;
+      }
+      if constexpr (eastl::is_same_v<bounding_type_t, Capsule>)
+      {
+        vec4f wbsph = pool.riXYZR[riIdx];
+        vec4f a = v_ldu(&obj_bounding.a.x);
+        vec4f extRadSq = v_sqr(v_add(wbsph, a));
+        if (!v_test_segment_sphere_intersection(a, v_ldu(&obj_bounding.b.x), wbsph, v_splat_w(extRadSq)))
+          continue;
+      }
 
       mat44f riTm;
       v_mat43_transpose_to_mat44(riTm, pool.riTm[riIdx]);
@@ -2319,8 +2623,6 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
       if (stop)
         break;
     }
-    if (lock.isLocked())
-      lock.unlockRead();
   }
 
   G_ASSERTF(testedNum <= max_number_of_rendinst_collision_callbacks, "Tested (%d) more then allowed limit of %d @ pos=%@ wabb=(%@,%@)",
@@ -2357,8 +2659,7 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
     }
 #endif
 
-    VerifyReadLock lock(rgl->rtData->riRwCs);
-    lock.lockRead();
+    ScopedLockRead lock(rgl->rtData->riRwCs);
 
     const eastl::BitvectorWordType *riPosInstData = rgl->rtData->riPosInst.data();
     const eastl::BitvectorWordType *riPaletteRotationData = rgl->rtData->riPaletteRotation.data();
@@ -2375,8 +2676,20 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
             continue;
           const RendInstGenData::CellRtData &crt = *crt_ptr;
 
-          if (!v_bbox3_test_box_intersect(crt.bbox[0], v_ldu_bbox3(obj_world_aabb)))
-            continue;
+          if constexpr (eastl::is_same_v<bounding_type_t, BSphere3>)
+            if (!v_bbox3_test_sph_intersect(crt.bbox[0], v_ldu(&obj_bounding.c.x), v_set_x(obj_bounding.r2)))
+              continue;
+          if constexpr (eastl::is_same_v<bounding_type_t, BBox3> || eastl::is_same_v<bounding_type_t, OrientedObjectBox>)
+            if (!v_bbox3_test_box_intersect(crt.bbox[0], v_ldu_bbox3(obj_world_aabb)))
+              continue;
+          if constexpr (eastl::is_same_v<bounding_type_t, Capsule>)
+          {
+            bbox3f extB = crt.bbox[0];
+            v_bbox3_extend(extB, v_splats(obj_bounding.r));
+            if (!v_test_segment_box_intersection(v_ldu(&obj_bounding.a.x), v_ldu(&obj_bounding.b.x), extB))
+              continue;
+          }
+
           vec3f v_cell_add = crt.cellOrigin;
           vec3f v_cell_mul = v_mul(rendinst::gen::VC_1div32767, v_make_vec4f(cellSz, crt.cellHeight, cellSz, 0));
 
@@ -2412,43 +2725,77 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
               riPosInstBit = eastl::BitvectorWordType(1) << (p % (sizeof(riPosInstBit) * CHAR_BIT));
             }
 
+            // the per pool constants below are resolved at the first slice that holds data, so a
+            // pool with nothing in the subcell range pays for none of them
+            bool poolResolved = false, isPosInst = false, paletteRotation = false, checkCanopy = false;
+            CollisionResource *collRes = nullptr;
+            vec4f posBoundingRad = v_zero();
+            bbox3f vFullBBox = {}, vCanopyBBox = {};
+            BBox3 localBBox;
+            int strideW = 0;
+            rendinst::gen::RotationPaletteManager::Palette palette;
+
             subCell[1] = initialSubCell1;
             for (int stride_subCell = SUBCELL_DIV - (subCell[2] - subCell[0] + 1), idx = subCell[1] * SUBCELL_DIV + subCell[0];
                  subCell[1] <= subCell[3]; subCell[1]++, idx += stride_subCell)
             {
               for (int x2 = subCell[0]; x2 <= subCell[2]; x2++, idx++)
               {
-                if (!v_bbox3_test_box_intersect(crt.bbox[idx + 1], v_ldu_bbox3(obj_world_aabb)))
-                  continue;
+                if constexpr (eastl::is_same_v<bounding_type_t, BSphere3>)
+                  if (!v_bbox3_test_sph_intersect(crt.bbox[idx + 1], v_ldu(&obj_bounding.c.x), v_set_x(obj_bounding.r2)))
+                    continue;
+                if constexpr (eastl::is_same_v<bounding_type_t, BBox3> || eastl::is_same_v<bounding_type_t, OrientedObjectBox>)
+                  if (!v_bbox3_test_box_intersect(crt.bbox[idx + 1], v_ldu_bbox3(obj_world_aabb)))
+                    continue;
+                if constexpr (eastl::is_same_v<bounding_type_t, Capsule>)
+                {
+                  bbox3f extB = crt.bbox[idx + 1];
+                  v_bbox3_extend(extB, v_splats(obj_bounding.r));
+                  if (!v_test_segment_box_intersection(v_ldu(&obj_bounding.a.x), v_ldu(&obj_bounding.b.x), extB))
+                    continue;
+                }
 
                 const RendInstGenData::CellRtData::SubCellSlice &scs = crt.getCellSlice(p, idx);
                 if (DAGOR_LIKELY(!scs.sz))
                   continue;
-                const RendInstGenData::RendinstProperties &riProp = rgl->rtData->riProperties[p];
-                bool isPosInst = (riPosInstData[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0;
-                if (should_ignore(isPosInst, riProp.immortal, riProp.damageable, riProp.matId) || !scs.sz)
-                  continue;
-                CollisionResource *collRes = rgl->rtData->riCollRes[p].collRes;
-                bool paletteRotation = (riPaletteRotationData[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0;
-                const bbox3f vFullBBox = collRes ? collRes->vFullBBox : rgl->rtData->riCollResBb[p];
+                if (!poolResolved)
+                {
+                  poolResolved = true;
+                  const rendinst::props::RendinstProperties &riProp = rgl->rtData->riProperties[p];
+                  isPosInst = (riPosInstData[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0;
+                  if (should_ignore(isPosInst, riProp.immortal, riProp.damageable, riProp.matId))
+                    goto nextPool;
+                  collRes = rgl->rtData->riCollRes[p].collRes;
+                  paletteRotation = (riPaletteRotationData[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0;
+                  posBoundingRad = collRes ? bounding_rad_from_origin(collRes) : v_zero();
+                  vFullBBox = collRes ? collRes->vFullBBox : rgl->rtData->riCollResBb[p];
+                  v_stu_bbox3(localBBox, vFullBBox);
+                  checkCanopy = (ri_types & GatherRiTypeFlag::RiGenCanopy) && riProp.canopyOpacity > 0.f;
+                  if (checkCanopy)
+                  {
+                    BBox3 canopyBox;
+                    getRIGenCanopyBBox(riProp, rgl->rtData->riRes[p]->bbox, canopyBox);
+                    vCanopyBBox = v_ldu_bbox3(canopyBox);
+                  }
+                  strideW = RIGEN_STRIDE_B(isPosInst,
+                              (rgl->rtData->riZeroInstSeeds.data()[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0,
+                              rgl->perInstDataDwords) /
+                            2;
+                  if (isPosInst && paletteRotation)
+                    palette = rendinst::gen::get_rotation_palette_manager()->getPalette({layer, p});
+                }
 
                 if (!isPosInst)
                 {
                   const int16_t *data_s = (const int16_t *)(crt.sysMemData.get() + scs.ofs);
-                  int stride_w =
-                    RIGEN_TM_STRIDE_B((rgl->rtData->riZeroInstSeeds.data()[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0,
-                      rgl->perInstDataDwords) /
-                    2;
-                  for (const int16_t *data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
+                  for (const int16_t *data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += strideW)
                   {
                     mat44f riTm;
                     if (!rendinst::gen::unpack_tm_full(riTm, data, v_cell_add, v_cell_mul))
                       continue;
-                    if (!objectBounding.testIntersection(riTm, vFullBBox))
+                    if (!objectBounding.testIntersection(riTm, vFullBBox) &&
+                        (!checkCanopy || !objectBounding.testIntersection(riTm, vCanopyBBox)))
                       continue;
-
-                    BBox3 localBBox;
-                    v_stu_bbox3(localBBox, vFullBBox);
 
                     rendinst::RendInstDesc riDesc(cellI, idx, p, int(intptr_t(data) - intptr_t(data_s)), layer);
                     stop |= callback(rgl, riDesc, riTm, localBBox, collRes, false);
@@ -2462,32 +2809,26 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
                 }
                 else
                 {
-                  BBox3 localBBox;
-                  v_stu_bbox3(localBBox, vFullBBox);
-
                   const int16_t *data_s = (int16_t *)(crt.sysMemData.get() + scs.ofs);
-                  int stride_w = RIGEN_POS_STRIDE_B(
-                                   (rgl->rtData->riZeroInstSeeds.data()[p / (sizeof(riPosInstBit) * CHAR_BIT)] & riPosInstBit) != 0,
-                                   rgl->perInstDataDwords) /
-                                 2;
                   if (paletteRotation)
                   {
-                    rendinst::gen::RotationPaletteManager::Palette palette =
-                      rendinst::gen::get_rotation_palette_manager()->getPalette({layer, p});
-
-                    for (const int16_t *data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
+                    for (const int16_t *data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += strideW)
                     {
                       vec3f v_pos, v_scale;
                       vec4i paletteId;
                       if (!rendinst::gen::unpack_tm_pos(v_pos, v_scale, data, v_cell_add, v_cell_mul, paletteRotation, &paletteId))
                         continue;
+                      if (collRes)
+                      {
+                        if (!objectBounding.testSphereIntersectionEst(v_pos, v_mul_x(posBoundingRad, v_hmax3(v_scale))))
+                          continue;
+                      }
+
                       quat4f v_rot = rendinst::gen::RotationPaletteManager::get_quat(palette, v_extract_xi(paletteId));
                       mat44f tm;
                       v_mat44_compose(tm, v_pos, v_rot, v_scale);
-                      bbox3f treeBBox;
-                      v_bbox3_init(treeBBox, tm, vFullBBox);
-
-                      if (!v_bbox3_test_box_intersect(treeBBox, v_ldu_bbox3(obj_world_aabb)))
+                      if (!objectBounding.testIntersection(tm, vFullBBox) &&
+                          (!checkCanopy || !objectBounding.testIntersection(tm, vCanopyBBox)))
                         continue;
 
                       rendinst::RendInstDesc riDesc(cellI, idx, p, int(intptr_t(data) - intptr_t(data_s)), layer);
@@ -2505,7 +2846,7 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
                     vec3f v_tree_min = vFullBBox.bmin;
                     vec3f v_tree_max = vFullBBox.bmax;
 
-                    for (const int16_t *data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += stride_w)
+                    for (const int16_t *data = data_s, *data_e = data + scs.sz / 2; data < data_e; data += strideW)
                     {
                       vec3f v_pos, v_scale;
                       if (!rendinst::gen::unpack_tm_pos(v_pos, v_scale, data, v_cell_add, v_cell_mul, paletteRotation))
@@ -2514,8 +2855,20 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
                       treeBBox.bmin = v_add(v_pos, v_mul(v_scale, v_tree_min));
                       treeBBox.bmax = v_add(v_pos, v_mul(v_scale, v_tree_max));
 
-                      if (!v_bbox3_test_box_intersect(treeBBox, v_ldu_bbox3(obj_world_aabb)))
-                        continue;
+                      if (!v_bbox3_test_box_intersect(treeBBox, v_ldu_bbox3(obj_world_aabb))) // simple check without tm for pos
+                                                                                              // instance
+                      {
+                        if (!checkCanopy)
+                          continue;
+                        else
+                        {
+                          bbox3f worldCanopyBBox;
+                          worldCanopyBBox.bmin = v_add(v_pos, v_mul(v_scale, vCanopyBBox.bmin));
+                          worldCanopyBBox.bmax = v_add(v_pos, v_mul(v_scale, vCanopyBBox.bmax));
+                          if (!v_bbox3_test_box_intersect(worldCanopyBBox, v_ldu_bbox3(obj_world_aabb)))
+                            continue;
+                        }
+                      }
 
                       rendinst::RendInstDesc riDesc(cellI, idx, p, int(intptr_t(data) - intptr_t(data_s)), layer);
                       mat44f tm;
@@ -2532,12 +2885,12 @@ static bool forEachRendinstInBounding(int layer, const bounding_type_t &obj_boun
                 }
               }
             }
+          nextPool:;
           }
         }
       }
     }
-  done:
-    lock.unlockRead();
+  done:;
   }
 
   G_ASSERTF(testedNum <= max_number_of_rendinst_collision_callbacks, "Tested (%d) more then allowed limit of %d @ pos=%@ wabb=(%@,%@)",
@@ -2572,9 +2925,9 @@ static CheckBoxRIResultFlags testObjToRendInstIntersectionNoCache(int layer, con
     if (!collres && strategy.isCollisionRequired())
       return false;
     if (is_pos)
-      strategy.executeForPos(rgl, ri_desc, ri_tm, local_bbox, collres);
+      result = strategy.executeForPos(rgl, ri_desc, ri_tm, local_bbox, collres);
     else
-      strategy.executeForTm(rgl, ri_desc, ri_tm, local_bbox, collres);
+      result = strategy.executeForTm(rgl, ri_desc, ri_tm, local_bbox, collres);
     if (result & CheckBoxRIResultFlag::HasTraceableRi)
       return true;
     return false;
@@ -2596,7 +2949,7 @@ struct GatherCollidableInSphereStrat
   {}
   bool shouldIgnoreRendinst(bool /*is_pos*/, bool /* is_immortal */, bool is_damageable, PhysMat::MatID /*mat_id*/) const
   {
-    return is_damageable || !onlyDamageable;
+    return !is_damageable && onlyDamageable;
   }
   inline bool isCollisionRequired() const { return true; }
 
@@ -2689,7 +3042,7 @@ void clipCapsuleRI(const ::Capsule &c, Point3 &lpt, Point3 &wpt, real &md, const
 
     BBox3 wbb = c.getBoundingBoxScalar();
     FOR_EACH_RG_LAYER_DO (rgl)
-      testObjToRendInstIntersectionNoCache(_layer, wbb, wbb, GatherRiTypeFlag::RiGenAndExtra, strat, false);
+      testObjToRendInstIntersectionNoCache(_layer, c, wbb, GatherRiTypeFlag::RiGenAndExtra, strat, false);
   }
 }
 
@@ -2779,6 +3132,8 @@ static bool testObjToRendInstIntersectionCache(const bounding_type_t &bounding, 
   {
     for (const rendinst::CollisionInfo &collInfo : collInfoQueue)
     {
+      if (!rendinst::isRiGenInWorld(collInfo.desc))
+        continue;
       RendInstGenData *rgl = rendinst::rgLayer[collInfo.desc.layer];
       bool isPosRi = !collInfo.desc.isRiExtra() && rgl->rtData->riPosInst[collInfo.desc.pool];
       if (!isPosRi)
@@ -2848,14 +3203,17 @@ void testObjToRendInstIntersection(const Capsule &obj_capsule, RendInstCollision
   testObjToRendInstIntersectionInternal(obj_capsule, callback, ri_types, ri_cache, ray_mat, unlock_before_cb);
 }
 
-CheckBoxRIResultFlags checkBoxToRIGenIntersection(const BBox3 &box)
+template <typename bounding_type_t>
+static CheckBoxRIResultFlags check_to_rigen_intersection(const bounding_type_t &bounding, const BBox3 &world_aabb)
 {
   CheckIntersectionStrat strat;
   CheckBoxRIResultFlags testRes = {};
   FOR_EACH_RG_LAYER_DO (rgl)
   {
-    CheckBoxRIResultFlags res =
-      testObjToRendInstIntersectionNoCache(_layer, box, box, GatherRiTypeFlag::RiGenAndExtra, strat, false /*unlock_before_cb*/);
+    CheckBoxRIResultFlags res = testObjToRendInstIntersectionNoCache(_layer, bounding, world_aabb, GatherRiTypeFlag::RiGenAndExtra,
+      strat, false /*unlock_before_cb*/);
+    // a traceable hit in a primary layer is the final answer; a secondary layer can only
+    // contribute collidable content
     if (rendinst::isRgLayerPrimary(_layer))
     {
       if (res & CheckBoxRIResultFlag::HasTraceableRi)
@@ -2866,6 +3224,16 @@ CheckBoxRIResultFlags checkBoxToRIGenIntersection(const BBox3 &box)
     testRes |= res;
   }
   return testRes;
+}
+
+CheckBoxRIResultFlags checkSphereToRIGenIntersection(const BSphere3 &sphere)
+{
+  return check_to_rigen_intersection(sphere, BBox3(sphere));
+}
+
+CheckBoxRIResultFlags checkCapsuleToRIGenIntersection(const Capsule &capsule)
+{
+  return check_to_rigen_intersection(capsule, capsule.getBoundingBoxScalar());
 }
 
 struct ForeachRIGenStrat : public MaterialRayStrat
@@ -2902,6 +3270,115 @@ void foreachRIGenInBox(const BBox3 &box, GatherRiTypeFlags ri_types, ForeachCB &
     testObjToRendInstIntersectionNoCache(_layer, box, box, ri_types, strat, false /*unlock_before_cb*/);
 }
 
+void foreachRIGenPosInstanceInBox(const BBox3 &box, const Point3 &margin, bool (*pool_filter)(int layer_ix, int pool_ix, void *user),
+  void *user, GetPosInstCallbackType &&cb)
+{
+  const bbox3f vBox0 = v_ldu_bbox3(box);
+  const vec4f vMargin = v_ldu_p3_safe(&margin.x);
+  bbox3f vBox = vBox0; // the coarse prune box: unit scale margin, the per instance root test scales it
+  v_bbox3_extend(vBox, vMargin);
+  FOR_EACH_RG_LAYER_DO (rgl)
+  {
+    if (!rgl->rtData)
+      continue;
+    const float cellSz = rgl->grid2world * rgl->cellSz;
+    ScopedLockRead lock(rgl->rtData->riRwCs);
+    // only the clamped cell rectangle of the query, not the whole layer grid; a query
+    // with no loaded cell must not pay the pool scan either
+    bbox3f cellBox = vBox;
+    v_bbox3_extend(cellBox, v_splats(rgl->rtData->maxCellMargin));
+    vec4f regionV = v_sub(v_perm_xzac(cellBox.bmin, cellBox.bmax), rgl->world0Vxz);
+    regionV = v_min(v_max(v_mul(regionV, rgl->invGridCellSzV), v_zero()), rgl->lastCellXZXZ);
+    DECL_ALIGN16(int, regions[4]);
+    v_sti(regions, v_cvt_floori(regionV));
+    rgl->rtData->loadedCellsBBox.clip(regions[0], regions[1], regions[2], regions[3]);
+    if (regions[0] > regions[2] || regions[1] > regions[3])
+      continue;
+    // the accepted pool set and its per pool constants do not depend on the cell:
+    // resolve them once per layer, every cell then visits only this list
+    struct PosPool
+    {
+      rendinst::gen::RotationPaletteManager::Palette palette;
+      uint16_t p, strideW;
+      bool paletteRotation;
+    };
+    dag::RelocatableFixedVector<PosPool, 64, true, framemem_allocator> pools;
+    for (int p = 0, pcnt = rgl->rtData->riRes.size(); p < pcnt; ++p)
+    {
+      if (!rgl->rtData->riPosInst[p])
+        continue;
+      if (pool_filter && !pool_filter(_layer, p, user)) // rejected pools skip the whole unpack sweep
+        continue;
+      PosPool &it = pools.push_back();
+      it.p = uint16_t(p);
+      it.strideW = uint16_t(RIGEN_POS_STRIDE_B(rgl->rtData->riZeroInstSeeds[p], rgl->perInstDataDwords) / 2);
+      it.paletteRotation = rgl->rtData->riPaletteRotation[p];
+      if (it.paletteRotation)
+        it.palette = rendinst::gen::get_rotation_palette_manager()->getPalette({_layer, p});
+    }
+    if (pools.empty())
+      continue;
+    const int cellXStride = rgl->cellNumW - (regions[2] - regions[0] + 1);
+    for (int z = regions[1], cellI = regions[1] * rgl->cellNumW + regions[0]; z <= regions[3]; z++, cellI += cellXStride)
+      for (int x = regions[0]; x <= regions[2]; x++, cellI++)
+      {
+        const RendInstGenData::CellRtData *crtp = rgl->cells[cellI].isReady();
+        if (!crtp || !crtp->sysMemData)
+          continue;
+        const RendInstGenData::CellRtData &crt = *crtp;
+        if (!v_bbox3_test_box_intersect(crt.bbox[0], vBox))
+          continue;
+        const vec3f v_cell_add = crt.cellOrigin;
+        const vec3f v_cell_mul = v_mul(rendinst::gen::VC_1div32767, v_make_vec4f(cellSz, crt.cellHeight, cellSz, 0));
+        // prune per subcell too: a partially covered cell sweeps only the intersecting slices
+        uint8_t scIdx[SUBCELL_DIV * SUBCELL_DIV];
+        int scCount = 0;
+        for (int i = 0; i < SUBCELL_DIV * SUBCELL_DIV; ++i)
+          if (v_bbox3_test_box_intersect(crt.bbox[i + 1], vBox))
+            scIdx[scCount++] = uint8_t(i);
+        if (!scCount)
+          continue;
+        for (const PosPool &pi : pools)
+        {
+          if (crt.pools[pi.p].total <= 0)
+            continue;
+          const RendInstGenData::CellRtData::SubCellSlice *poolScs =
+            crt.scs.data() + crt.remapPoolIndex(pi.p) * (SUBCELL_DIV * SUBCELL_DIV);
+          for (int s = 0; s < scCount; ++s)
+          {
+            const RendInstGenData::CellRtData::SubCellSlice &scs = poolScs[scIdx[s]];
+            if (!scs.sz)
+              continue;
+            const int16_t *dataS = (const int16_t *)(crt.sysMemData.get() + scs.ofs);
+            for (const int16_t *data = dataS, *dataE = dataS + scs.sz / 2; data < dataE; data += pi.strideW)
+            {
+              vec3f v_pos, v_scale;
+              vec4i paletteId;
+              if (!rendinst::gen::unpack_tm_pos(v_pos, v_scale, data, v_cell_add, v_cell_mul, pi.paletteRotation, &paletteId))
+                continue;
+              bbox3f instBox = vBox0; // the margin is the unit scale reach: scale it per instance
+              v_bbox3_extend(instBox, v_mul(vMargin, v_hmax3(v_scale)));
+              if (!v_bbox3_test_pt_inside(instBox, v_pos))
+                continue;
+              const quat4f v_rot = pi.paletteRotation
+                                     ? rendinst::gen::RotationPaletteManager::get_quat(pi.palette, v_extract_xi(paletteId))
+                                     : V_C_UNIT_0001;
+              // slice relative offs + the subcell idx: the canonical rigen desc addressing
+              cb(rendinst::RendInstDesc(cellI, scIdx[s], pi.p, int(intptr_t(data) - intptr_t(dataS)), _layer), v_pos, v_rot, v_scale);
+            }
+          }
+        }
+      }
+  }
+}
+
+void foreachRIGenInSphere(const BSphere3 &sphere, GatherRiTypeFlags ri_types, ForeachCB &cb)
+{
+  ForeachRIGenStrat strat(cb);
+  FOR_EACH_RG_LAYER_DO (rgl)
+    testObjToRendInstIntersectionNoCache(_layer, sphere, BBox3(sphere), ri_types, strat, false /*unlock_before_cb*/);
+}
+
 void getRIGenTMsInBox(const BBox3 &box, dag::ConstSpan<int16_t> pool_ids, GetTmsCallbackType &&tm_callback)
 {
   TIME_PROFILE_DEV(getRIGenTMsInBox);
@@ -2935,8 +3412,6 @@ bool initializeCachedRiData(TraceMeshFaces *ri_cache)
   int ver = riutil::world_version_get();
 
   CacheAddStrat strat(ri_cache);
-  mat44f identTm;
-  v_mat44_ident(identTm);
   FOR_EACH_PRIMARY_RG_LAYER_DO (rgl)
     testObjToRendInstIntersectionNoCache(_layer, ri_cache->box, ri_cache->box, GatherRiTypeFlag::RiGenAndExtra, strat,
       false /*unlock_before_cb*/);
@@ -2945,7 +3420,39 @@ bool initializeCachedRiData(TraceMeshFaces *ri_cache)
     // only update cache's version if it fully succeeded, partial caches
     // don't count, we can't use them!
     ri_cache->rendinstCache.version = ver;
-    ri_cache->rendinstCache.sort();
+  }
+  else
+  {
+    // clean it up just in case, we should never use these anyway.
+    ri_cache->rendinstCache.clear();
+  }
+  return strat.valid;
+}
+
+bool initializeCachedRiData(TraceMeshFaces *ri_cache, const Capsule &capsule, bool ri_extra_only /* = false*/)
+{
+  if (!rendinst::rgPrimaryLayers || !rendinst::rgLayer[0])
+    return false;
+
+  TIME_PROFILE(initializeCachedRiData);
+  ri_cache->rendinstCache.clear();
+  ri_cache->box = capsule.getBoundingBoxScalar();
+
+  // World version is updated separately (riRwCs is NOT held), so
+  // we can't be 100% sure that RIs we collect here are of 'ver', but
+  // they're AT LEAST of 'ver'. This means if the world gets invalidated
+  // we'll know that in 'world_version_check' later and act properly.
+  int ver = riutil::world_version_get();
+
+  CacheAddStrat strat(ri_cache);
+  FOR_EACH_PRIMARY_RG_LAYER_DO (rgl)
+    testObjToRendInstIntersectionNoCache(_layer, capsule, ri_cache->box,
+      ri_extra_only ? GatherRiTypeFlag::RiExtraOnly : GatherRiTypeFlag::RiGenAndExtra, strat, false /*unlock_before_cb*/);
+  if (strat.valid)
+  {
+    // only update cache's version if it fully succeeded, partial caches
+    // don't count, we can't use them!
+    ri_cache->rendinstCache.version = ver;
   }
   else
   {

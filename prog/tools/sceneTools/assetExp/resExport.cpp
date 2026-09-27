@@ -69,6 +69,11 @@ public:
     RealResData(IDagorAssetExporter *p, DagorAsset *a, int rid, int nid) :
       exp(p), asset(a), realResNameId(rid), nameId(nid), headerOffset(0), dataOffset(0)
     {}
+
+    static int cmpByName(const RealResData *a, const RealResData *b)
+    {
+      return dd_stricmp(ResData::cmpMgr->getAssetName(a->realResNameId), ResData::cmpMgr->getAssetName(b->realResNameId));
+    }
   };
 
 
@@ -249,6 +254,62 @@ public:
     ResData::cmpMgr = NULL;
   }
 
+  void reorderRealResData()
+  {
+    // Sort realResData alphabetically by name
+    ResData::cmpMgr = &mgr;
+    sort(realResData, &RealResData::cmpByName);
+    ResData::cmpMgr = NULL;
+
+    // Build nameId-to-realResData-index map
+    Tab<int> posMap(tmpmem);
+    for (int i = 0; i < realResData.size(); ++i)
+    {
+      int nid = realResData[i].realResNameId;
+      if (nid >= posMap.size())
+      {
+        int base = posMap.size();
+        posMap.resize(nid + 1);
+        for (int j = base; j < posMap.size(); j++)
+          posMap[j] = -1;
+      }
+      posMap[nid] = i;
+    }
+
+    // Pull dependencies before their consumers while preserving alphabetical order.
+    // For each resource with refs, ensure all deps appear earlier in the array.
+    // If a dep is found after the consumer, move it right before the consumer.
+    for (int i = 0; i < resData.size(); ++i)
+    {
+      ResData &rd = resData[i];
+      int nid = rd.nameId;
+      if (nid < 0 || nid >= posMap.size() || posMap[nid] < 0)
+        continue;
+      int consumerPos = posMap[nid];
+
+      for (int r = 0; r < rd.refNameIds.size(); ++r)
+      {
+        int depNid = rd.refNameIds[r];
+        if (depNid < 0 || depNid >= posMap.size() || posMap[depNid] < 0)
+          continue;
+        int depPos = posMap[depNid];
+        if (depPos <= consumerPos)
+          continue; // dep is already before consumer, good
+
+        // Move dep from depPos to consumerPos (shifting everything in between)
+        RealResData tmp = eastl::move(realResData[depPos]);
+        for (int k = depPos; k > consumerPos; --k)
+        {
+          realResData[k] = eastl::move(realResData[k - 1]);
+          posMap[realResData[k].realResNameId] = k;
+        }
+        realResData[consumerPos] = eastl::move(tmp);
+        posMap[depNid] = consumerPos;
+        posMap[nid] = ++consumerPos; // consumer shifted right by one
+      }
+    }
+  }
+
   bool saveFileInternal(mkbindump::BinDumpSaveCB &cwr, AssetExportCache &c4, file_ptr_t fp, ILogWriter &log,
     IGenericProgressIndicator &pbar, const char *pack_fname, const DataBlock &blk_export_props)
   {
@@ -264,6 +325,8 @@ public:
     int build_errors = 0;
 
     reorderResData(log);
+    if (dabuild_grp_write_ver >= 3)
+      reorderRealResData();
 
     for (int i = 0; i < realResData.size(); ++i)
     {
@@ -389,6 +452,14 @@ public:
 
       cwr.align16();
       int dataOfs = cwr.tell();
+      if (dataOfs >= (2000u << 20))
+      {
+        cwr.reset(0);
+        log.addMessage(ILogWriter::ERROR, "Can't write res pack: %s, content is too big (data size >= %llu Mb)", pack_fname,
+          dataOfs >> 20);
+        build_errors++;
+        break;
+      }
 
       int data_ofs, data_len = 0;
 
@@ -612,6 +683,9 @@ bool buildGameResPack(mkbindump::BinDumpSaveCB &cwr, dag::ConstSpan<DagorAsset *
     }
     if (prev_pack_fp && !changed && c4.checkAllTouched())
     {
+      // Prune stale entries here too - otherwise a pack that stays up-to-date across many build-server runs
+      // never gets its cache cleaned, since this is the only path most runs ever take.
+      c4.removeUntouched();
       log.addMessage(log.NOTE, "skip up-to-date %s", pack_fname);
       up_to_date = true;
       df_close(prev_pack_fp);
@@ -672,6 +746,34 @@ bool buildGameResPack(mkbindump::BinDumpSaveCB &cwr, dag::ConstSpan<DagorAsset *
   log.addMessage(log.NOTE, "built %s: %d Kb, %d resources\n", pack_fname, cwr.getSize() >> 10, assets.size());
   stat_grp_built++;
   return true;
+}
+
+// Separate from checkGameResPackUpToDate() below: checks the whole pack still matches the cache from the
+// last real build, never calls gatherSrcDataFiles(), and never pinpoints which asset is stale - a UI-only
+// indicator, not suitable for a real build decision.
+bool quickCheckGameResPackReady(dag::ConstSpan<DagorAsset *> assets, AssetExportCache &c4, const char *pack_fname)
+{
+  GrpExporter exp(assets[0]->getMgr());
+  for (int i = 0; i < assets.size(); ++i)
+  {
+    DagorAsset &a = *assets[i];
+    String asset_name_typified(a.getNameTypified());
+    int dataOfs = 0, dataLen = 0;
+    IDagorAssetExporter *e = exp.mgr.getAssetExporter(a.getType());
+    if (!e)
+      return false;
+
+    if (c4.checkAssetExpVerChanged(a.getType(), e->getGameResClassId(), e->getGameResVersion()))
+      return false;
+    if (!c4.getAssetDataPos(asset_name_typified, dataOfs, dataLen))
+      return false;
+    if (c4.checkDataBlockChanged(asset_name_typified, a.props, -1))
+      return false;
+  }
+  // resetExtraAssets() also catches an asset removed since the last build (mutates adPos, same as precise check).
+  if (c4.resetExtraAssets(assets))
+    return false;
+  return c4.allTrackedFilesUpToDate(pack_fname);
 }
 
 bool checkGameResPackUpToDate(dag::ConstSpan<DagorAsset *> assets, AssetExportCache &c4, const char *pack_fname, int ch_bit)

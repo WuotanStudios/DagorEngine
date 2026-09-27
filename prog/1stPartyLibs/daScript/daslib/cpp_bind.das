@@ -1,20 +1,22 @@
 options gen2
 options indenting = 4
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module cpp_bind public
 
-require fio
-require rtti
-require ast
+//! C++ adapter code generator.
+//!
+//! Given a daslang class type, generates C++ header code for a class adapter
+//! that forwards virtual method calls from C++ into the daslang context.
+//! Used together with ``log_cpp_class_adapter``.
+
+require daslib/fio
+require daslib/ast
 require daslib/ast_boost
-require daslib/strings_boost
 
 def private log_cpp_class_method(cpp_file : file; name : string; fntype : TypeDeclPtr) {
-    var inscope cft <- clone_type(fntype.firstType)
-    cft.flags |= TypeDeclFlags.smartPtrNative
+    var cft = clone_type(fntype.firstType)
+    cft.flags.smartPtrNative = true
     let rettd = describe_cpp(cft)
     fwrite(cpp_file, "{rettd} {name} ( Context * __context__, Func __funcCall__")
     for (argN, argT, argI in fntype.argNames, fntype.argTypes, count()) {
@@ -33,10 +35,11 @@ def private log_cpp_class_method(cpp_file : file; name : string; fntype : TypeDe
     fwrite(cpp_file, " )")
 }
 
+[unused_argument(name)]
 def private log_cpp_class_method_call(cpp_file : file; name : string; fntype : TypeDeclPtr) {
     let rettd = describe_cpp(fntype.firstType)
     fwrite(cpp_file, "das_invoke_function<{rettd}>::invoke\n      <")
-    for (argN, argT, argI in fntype.argNames, fntype.argTypes, count()) {
+    for (_argN, argT, argI in fntype.argNames, fntype.argTypes, count()) {
         if (argI != 0) {
             fwrite(cpp_file, ",")
         }
@@ -63,19 +66,14 @@ def private log_cpp_class_method_call(cpp_file : file; name : string; fntype : T
     }
 }
 
-def log_cpp_class_adapter(cpp_file : file; name : string; cinfo : TypeDeclPtr) {
+def log_cpp_class_adapter(cpp_file : file; name : string; var cinfo : TypeDeclPtr) {
     //! Generates C++ class adapter for the Daslang class.
-    //! Intended use::
-    //!
-    //!     log_cpp_class_adapter(cppFileNameDotInc, "daslangClassName", typeinfo(ast_typedecl type<daslangClassName>))
     assert(cinfo.isClass, "can only make adapter out of a class")
     var methods : array<tuple<name : string; index : int>>
-    var inscope types : array<TypeDeclPtr>
+    var types : array<TypeDeclPtr>
     for (fld, idx in cinfo.structType.fields, count()) {
-        if (!fld._type.isFunction || fld.name == "__finalize" || fld.init != null) {
-            continue
-        }
-        push(methods, ("{fld.name}", idx))
+        if (!fld._type.isFunction || fld.name == "__finalize" || fld.init != null) continue
+        push(methods, (name = "{fld.name}", index = idx))
         push_clone(types, fld._type)
     }
     let nmet = length(methods)
@@ -90,7 +88,7 @@ def log_cpp_class_adapter(cpp_file : file; name : string; cinfo : TypeDeclPtr) {
     fwrite(cpp_file, "  int _das_class_method_offset[{nmet}];\n")
     fwrite(cpp_file, "public:\n")
     fwrite(cpp_file, "  {name} ( const StructInfo * info ) \{\n")
-    for (mn, mni in methods, count()) {
+    for (mn, _mni in methods, count()) {
         fwrite(cpp_file, "      _das_class_method_offset[__fn_{mn.name}] = info->fields[{mn.index}]->offset;\n")
     }
     fwrite(cpp_file, "  \}\n")
@@ -112,5 +110,4 @@ def log_cpp_class_adapter(cpp_file : file; name : string; cinfo : TypeDeclPtr) {
         fwrite(cpp_file, "  \}\n")
     }
     fwrite(cpp_file, "};\n\n")
-    delete types
 }

@@ -3,7 +3,9 @@
 #include <math/dag_Point2.h>
 #include <math/dag_Point3.h>
 #include <daECS/core/coreEvents.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <3d/dag_resPtr.h>
 #include <shaders/dag_DynamicShaderHelper.h>
 #include "render/renderEvent.h"
@@ -13,6 +15,7 @@
 
 #define INSIDE_RENDERER 1
 #include "render/world/private_worldRenderer.h"
+#include <render/world/frameGraphHelpers.h>
 #include <drv/3d/dag_draw.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
 
@@ -39,16 +42,16 @@ GLOBAL_VARS_LIST
 static constexpr int geom_slices = 36;
 
 template <typename Callable>
-static void set_shader_params_ecs_query(Callable c);
+static void set_shader_params_ecs_query(ecs::EntityManager &manager, Callable c);
 
 template <typename Callable>
-static void is_active_ecs_query(Callable c);
+static void is_active_ecs_query(ecs::EntityManager &manager, Callable c);
 
 template <typename Callable>
-inline void distant_haze_node_init_ecs_query(ecs::EntityId eid, Callable c);
+inline void distant_haze_node_init_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable c);
 
 template <typename Callable>
-static void get_heat_haze_lod_ecs_query(Callable c);
+static void get_heat_haze_lod_ecs_query(ecs::EntityManager &manager, Callable c);
 
 struct DistantHazeManager
 {
@@ -75,7 +78,7 @@ private:
 
 public:
   void render(
-    float min_terrain_height, float max_terrain_height, const Point3 &camera_position, TEXTUREID depth_tex_id, int depth_tex_lod) const
+    float min_terrain_height, float max_terrain_height, const Point3 &camera_position, Texture *depth_tex, int depth_tex_lod) const
   {
 
     if (!haze_shader.shader)
@@ -83,39 +86,41 @@ public:
 
     d3d::settm(TM_WORLD, TMatrix::IDENT);
 
-    set_shader_params_ecs_query([min_terrain_height, max_terrain_height, camera_position](bool distant_haze__is_center_fixed,
-                                  Point2 distant_haze__center, float distant_haze__radius, float distant_haze__fade_in_bottom,
-                                  float distant_haze__fade_out_top, float distant_haze__total_height, float distant_haze__size,
-                                  float distant_haze__strength, float distant_haze__blur, Point3 distant_haze__speed) {
-      float hazeMul = get_daskies() ? get_daskies()->getHazeStrength() : 1;
+    set_shader_params_ecs_query(*g_entity_mgr,
+      [min_terrain_height, max_terrain_height, camera_position](bool distant_haze__is_center_fixed, Point2 distant_haze__center,
+        float distant_haze__radius, float distant_haze__fade_in_bottom, float distant_haze__fade_out_top,
+        float distant_haze__total_height, float distant_haze__size, float distant_haze__strength, float distant_haze__blur,
+        Point3 distant_haze__speed) {
+        float hazeMul = get_daskies() ? get_daskies()->getHazeStrength() : 1;
 
-      ShaderGlobal::set_int(distant_haze_geometry_slicesVarId, geom_slices);
-      ShaderGlobal::set_real(distant_haze_minhVarId, min_terrain_height);
-      ShaderGlobal::set_real(distant_haze_maxhVarId, max_terrain_height);
-      ShaderGlobal::set_real(distant_haze_radiusVarId, distant_haze__radius);
-      ShaderGlobal::set_real(distant_haze_fade_inVarId, distant_haze__fade_in_bottom);
-      ShaderGlobal::set_real(distant_haze_fade_outVarId, distant_haze__fade_out_top);
-      ShaderGlobal::set_real(distant_haze_heightVarId, distant_haze__total_height);
-      ShaderGlobal::set_real(distant_haze_densityVarId, distant_haze__size);
-      ShaderGlobal::set_real(distant_haze_strengthVarId, distant_haze__strength * hazeMul);
-      ShaderGlobal::set_real(distant_haze_blurVarId, distant_haze__blur * hazeMul);
-      ShaderGlobal::set_color4(distant_haze_speedVarId, distant_haze__speed);
-      ShaderGlobal::set_color4(distant_haze_centerVarId,
-        distant_haze__is_center_fixed ? distant_haze__center : Point2(camera_position.x, camera_position.z));
-    });
+        ShaderGlobal::set_int(distant_haze_geometry_slicesVarId, geom_slices);
+        ShaderGlobal::set_float(distant_haze_minhVarId, min_terrain_height);
+        ShaderGlobal::set_float(distant_haze_maxhVarId, max_terrain_height);
+        ShaderGlobal::set_float(distant_haze_radiusVarId, distant_haze__radius);
+        ShaderGlobal::set_float(distant_haze_fade_inVarId, distant_haze__fade_in_bottom);
+        ShaderGlobal::set_float(distant_haze_fade_outVarId, distant_haze__fade_out_top);
+        ShaderGlobal::set_float(distant_haze_heightVarId, distant_haze__total_height);
+        ShaderGlobal::set_float(distant_haze_densityVarId, distant_haze__size);
+        ShaderGlobal::set_float(distant_haze_strengthVarId, distant_haze__strength * hazeMul);
+        ShaderGlobal::set_float(distant_haze_blurVarId, distant_haze__blur * hazeMul);
+        ShaderGlobal::set_float4(distant_haze_speedVarId, distant_haze__speed);
+        ShaderGlobal::set_float4(distant_haze_centerVarId,
+          distant_haze__is_center_fixed ? distant_haze__center : Point2(camera_position.x, camera_position.z));
+      });
 
-    ShaderGlobal::set_texture(haze_scene_depth_texVarId, depth_tex_id);
-    ShaderGlobal::set_real(haze_scene_depth_tex_lodVarId, depth_tex_lod);
+    ShaderGlobal::set_texture(haze_scene_depth_texVarId, depth_tex);
+    ShaderGlobal::set_float(haze_scene_depth_tex_lodVarId, depth_tex_lod);
 
     haze_shader.shader->setStates();
     d3d_err(d3d::draw(PRIM_TRISTRIP, 0, geom_slices * 2));
+    ShaderGlobal::set_texture(haze_scene_depth_texVarId, nullptr);
   }
 
   bool is_active() const
   {
     bool active = false;
 
-    is_active_ecs_query(
+    is_active_ecs_query(*g_entity_mgr,
       [&active](ECS_REQUIRE(bool distant_haze__is_center_fixed, Point2 distant_haze__center, float distant_haze__radius,
         float distant_haze__fade_in_bottom, float distant_haze__fade_out_top, float distant_haze__total_height,
         float distant_haze__size, float distant_haze__strength, float distant_haze__blur,
@@ -132,7 +137,7 @@ ECS_REGISTER_BOXED_TYPE(DistantHazeManager, nullptr);
 ECS_AUTO_REGISTER_COMPONENT(DistantHazeManager, "distant_haze__manager", nullptr, 0);
 
 ECS_TAG(render)
-ECS_ON_EVENT(OnLevelLoaded)
+ECS_ON_EVENT(EventRenderSceneLoaded)
 static void init_distant_haze_manager_es_event_handler(const ecs::Event &, DistantHazeManager &distant_haze__manager)
 {
   distant_haze__manager.init_for_level();
@@ -151,7 +156,7 @@ dafg::NodeHandle createDistantHazeNode(DistantHazeManager &distant_haze__manager
     type == DistantHazeNodeType::Normal ? "heat_haze_render_distant_haze_node" : "heat_haze_render_distant_haze_node_color";
 
   return dafg::register_node(nodeName, DAFG_PP_NODE_SRC, [&distant_haze__manager, depthlod](dafg::Registry registry) {
-    registry.orderMeAfter("heat_haze_render_particles_node");
+    read_all_camera_view_tokens(registry.currNameSpace(), "after_heat_haze_render_particles_nodes");
 
     auto cameraHndl = registry.readBlob<CameraParams>("current_camera").handle();
     auto hazeRenderedHndl = registry.modifyBlob<bool>("haze_rendered").handle();
@@ -190,7 +195,7 @@ dafg::NodeHandle createDistantHazeNode(DistantHazeManager &distant_haze__manager
       const auto depthTex = depthlod == 0 ? depthForTransparencyHndl.view() : farDownsampledDepthHndl.view();
 
       // TODO: Don't store this logic in manager
-      distant_haze__manager.render(minH, maxH, cameraPosition, depthTex.getTexId(), eastl::max(depthlod - 1, 0));
+      distant_haze__manager.render(minH, maxH, cameraPosition, depthTex.getTex2D(), eastl::max(depthlod - 1, 0));
     };
   });
 }
@@ -199,12 +204,12 @@ ECS_TAG(render)
 ECS_ON_EVENT(OnRenderSettingsReady)
 ECS_TRACK(render_settings__haze)
 ECS_REQUIRE(bool render_settings__haze)
-static void distant_haze_settings_tracking_es(const ecs::Event &, bool render_settings__haze)
+static void distant_haze_settings_tracking_es(const ecs::Event &, ecs::EntityManager &manager, bool render_settings__haze)
 {
   int depthlod = -1;
-  get_heat_haze_lod_ecs_query([&depthlod](int heat_haze__lod) { depthlod = heat_haze__lod; });
+  get_heat_haze_lod_ecs_query(manager, [&depthlod](int heat_haze__lod) { depthlod = heat_haze__lod; });
 
-  distant_haze_node_init_ecs_query(g_entity_mgr->getSingletonEntity(ECS_HASH("distant_haze_manager")),
+  distant_haze_node_init_ecs_query(manager, manager.getSingletonEntity(ECS_HASH("distant_haze_manager")),
     [&](DistantHazeManager &distant_haze__manager, dafg::NodeHandle &distant_haze__node, dafg::NodeHandle &distant_haze__color_node) {
       distant_haze__node = {};
       distant_haze__color_node = {};

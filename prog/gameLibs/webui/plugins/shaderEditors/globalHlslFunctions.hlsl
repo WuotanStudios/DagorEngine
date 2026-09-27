@@ -17,28 +17,25 @@
 #define IS_ENVI_COVER 0
 #endif
 
-#ifndef shadow2DArray
-  #define shadow2DArray(a, uv) a.SampleCmpLevelZero(a##_cmpSampler, (uv).xyz, (uv).w)
+#ifndef NBS_PS_DEFINED
+  #define PPCAT_(a_, b_) a_ ## b_
+  #define PPCAT(a_, b_) PPCAT_(a_, b_)
+  #define tex2Dlod(a, uv) a.SampleLevel(PPCAT(a, _samplerstate), (uv).xy, (uv).w)
+  #define tex3Dlod(a, uv) a.SampleLevel(PPCAT(a, _samplerstate), (uv).xyz, (uv).w)
+  #define shadow2DArray(a, uv) a.SampleCmpLevelZero(PPCAT(a, _cmpSampler), (uv).xyz, (uv).w)
+  #define textureLodOffset(a, tc, lod, ofs) a.SampleLevel(PPCAT(a, _samplerstate), tc, lod, ofs)
+  #define textureGather(a, tc) a.Gather(PPCAT(a, _samplerstate), tc)
 #endif
 
-#ifndef tex3Dlod
-  #define tex3Dlod(a, uv) a.SampleLevel(a##_samplerstate, (uv).xyz, (uv).w)
-#endif
+#define texture2DAt(a, tc) a[tc]
+#define texture3DAt(a, tc) a[tc]
 
-#ifndef textureLodOffset
-  #define textureLodOffset(a, tc, lod, ofs) a.SampleLevel(a##_samplerstate, tc, lod, ofs)
-#endif
-
-#ifndef textureGather
-  #define textureGather(a, tc) a.Gather(a##_samplerstate, tc)
-#endif
-
-#define tex_hmap_low_samplerstate  land_heightmap_tex_samplerstate
+#define hmapMain_samplerstate  tex_hmap_low_samplerstate
 
 #define downsampled_checkerboard_depth_tex_samplerstate  downsampled_far_depth_tex_samplerstate
 #define prev_downsampled_far_depth_tex_samplerstate     downsampled_far_depth_tex_samplerstate
 #define downsampled_close_depth_tex_samplerstate        downsampled_far_depth_tex_samplerstate
-#define distant_heightmap_tex_samplerstate              land_heightmap_tex_samplerstate
+#define distant_heightmap_tex_samplerstate              tex_hmap_low_samplerstate
 
 
 #define HAS_STATIC_SHADOW 1
@@ -86,6 +83,10 @@
   uint2 or(uint2 a, uint2 b) { return a || b; }
   uint3 or(uint3 a, uint3 b) { return a || b; }
   uint4 or(uint4 a, uint4 b) { return a || b; }
+
+  bool2 select(bool2 a, bool2 b, bool2 c) { return a ? b : c; }
+  bool3 select(bool3 a, bool3 b, bool3 c) { return a ? b : c; }
+  bool4 select(bool4 a, bool4 b, bool4 c) { return a ? b : c; }
 
   #ifndef NBS_PS_DEFINED
     bool2 and(bool2 a, bool2 b) { return a && b; }
@@ -465,9 +466,6 @@ float4 pow2(float4 x)
   return x * x;
 }
 
-#define tex2Dlod(a, uv) a.SampleLevel(a##_samplerstate, (uv).xy, (uv).w)
-#define tex3Dlod(a, uv) a.SampleLevel(a##_samplerstate, (uv).xyz, (uv).w)
-
 float get_smooth_noise3d(float3 v)
 {
   float3 i = floor(v);
@@ -539,10 +537,10 @@ float3 getWorldNormal(float3 worldPos)
 {
   float2 uvLow  = worldPos.xz * world_to_hmap_low.xy + world_to_hmap_low.zw;
   float3 offset = float3(tex_hmap_inv_sizes.x, 0, tex_hmap_inv_sizes.y);
-  float W = tex2Dlod(land_heightmap_tex, float4(uvLow - offset.xy,0,0)).x;
-  float E = tex2Dlod(land_heightmap_tex, float4(uvLow + offset.xy,0,0)).x;
-  float N = tex2Dlod(land_heightmap_tex, float4(uvLow - offset.yz,0,0)).x;
-  float S = tex2Dlod(land_heightmap_tex, float4(uvLow + offset.yz,0,0)).x;
+  float W = tex2Dlod(hmapMain, float4(uvLow - offset.xy,0,0)).x;
+  float E = tex2Dlod(hmapMain, float4(uvLow + offset.xy,0,0)).x;
+  float N = tex2Dlod(hmapMain, float4(uvLow - offset.yz,0,0)).x;
+  float S = tex2Dlod(hmapMain, float4(uvLow + offset.yz,0,0)).x;
   return normalize(half3(W-E, tex_hmap_inv_sizes.x/world_to_hmap_low.x/heightmap_scale.x, N-S));
 }
 
@@ -556,7 +554,7 @@ float linearize_z(float rawDepth, float2 decode_depth)
   return rcp(decode_depth.x + decode_depth.y * rawDepth);
 }
 
-float sample_spheres_density(StructuredBuffer<float4> spheres, int spheres_count, float3 world_pos)
+float sample_spheres_density(StructuredBuffer<NBSSphere> spheres, int spheres_count, float3 world_pos)
 {
   if (IS_DISTANT_FOG && !IS_ENVI_COVER)
     return 0;
@@ -564,13 +562,11 @@ float sample_spheres_density(StructuredBuffer<float4> spheres, int spheres_count
   float density = 0;
   for (int i = 0; i < spheres_count; ++i)
   {
-    float4 sphere = spheres[2 * i];
-    float2 densityParams = spheres[2 * i + 1].xy;
-    float dist = distance(sphere.xyz, world_pos);
-    float radiusInv = sphere.w;
-    float weight = dist * radiusInv;
+    NBSSphere sphere = spheres[i];
+    float dist = distance(sphere.pos, world_pos);
+    float weight = dist * sphere.invRadius;
     FLATTEN if (weight <= 1)
-      density += lerp(densityParams.x, densityParams.y, weight);
+      density += lerp(sphere.centerDensity, sphere.edgeDensity, weight);
   }
   return density;
 }
@@ -613,3 +609,4 @@ uint4 texelFetch(Texture3D<uint4> a, int3 tc, int lod) { return a.Load(int4(tc, 
 uint3 texelFetch(Texture3D<uint3> a, int3 tc, int lod) { return a.Load(int4(tc, lod)); }
 uint2 texelFetch(Texture3D<uint2> a, int3 tc, int lod) { return a.Load(int4(tc, lod)); }
 uint  texelFetch(Texture3D<uint>  a, int3 tc, int lod) { return a.Load(int4(tc, lod)); }
+

@@ -12,10 +12,9 @@
 
 #define HAS_SHADER_GRAPH_COMPILE_SUPPORT (DAGOR_DBGLEVEL > 0 && _TARGET_PC_WIN)
 
-typedef bool (*ShaderCompilerCallback)(uint32_t variant_id, const String &name, const String &code, const DataBlock &shader_blk,
-  String &out_errors);
+typedef bool (*ShaderCompilerCallback)(const String &name, const DataBlock &shader_blk, String &out_errors);
 
-typedef String (*ShaderGetSrcCallback)(uint32_t variant_id);
+typedef String (*ShaderGetSrcCallback)(uint32_t variant_id, NodeBasedShaderQuality nbs_quality);
 
 class ShaderGraphRecompiler
 {
@@ -23,22 +22,24 @@ public:
   void recompile();
   void update(float /* dt */);
 
-  void getIncludeFileNames(Tab<String> &includeGraphNames);
-
   static void activate(NodeBasedShaderType shader);
 
   static void initialize(NodeBasedShaderType shader, ShaderCompilerCallback compiler_callback, const char *root_graph_filename,
-    const char *subgraphs_dir = nullptr, String user_script = String(""), const char *optional_graphs_dir = nullptr);
+    const char *subgraphs_dir = nullptr, String user_script = String(""), const char *permutations_blk_filename = nullptr);
 
   static ShaderGraphRecompiler *getInstance();
 
-  static String substitute(NodeBasedShaderType shader, uint32_t variant_id, const DataBlock &shader_blk);
-  static String substitutePs4(NodeBasedShaderType shader, uint32_t variant_id, const DataBlock &shader_blk);
-  static String substitutePs5(NodeBasedShaderType shader, uint32_t variant_id, const DataBlock &shader_blk)
+  static String substitute(NodeBasedShaderType shader, uint32_t variant_id, NodeBasedShaderQuality nbs_quality,
+    const DataBlock &shader_blk);
+  static String substitutePs4(NodeBasedShaderType shader, uint32_t variant_id, NodeBasedShaderQuality nbs_quality,
+    const DataBlock &shader_blk);
+  static String substitutePs5(NodeBasedShaderType shader, uint32_t variant_id, NodeBasedShaderQuality nbs_quality,
+    const DataBlock &shader_blk)
   {
-    return substitutePs4(shader, variant_id, shader_blk);
+    return substitutePs4(shader, variant_id, nbs_quality, shader_blk);
   }
   static String substitute(const DataBlock &shader_blk, String shader_template);
+  static String substituteDshl(NodeBasedShaderType shader, const DataBlock &shader_blk);
   static String enumerateLines(const char *s);
 
   static void onShaderGraphEditor(webui::RequestInfo *params);
@@ -51,13 +52,11 @@ protected:
   ShaderGraphRecompiler(const char *editor_name, ShaderGetSrcCallback shader_get_src_callback);
 
   void init(NodeBasedShaderType shader, const char *subgraphs_dir, const char *user_script, const char *root_graph_filename,
-    const char *optional_graphs_dir, ShaderCompilerCallback compiler_callback);
+    const char *permutations_blk_filename, ShaderCompilerCallback compiler_callback);
+
+  bool gatherPermutationGraphs(Tab<String> &out_graph_filenames, String &out_permutation_table_json);
 
   static ShaderGraphRecompiler *activeInstance;
-
-  static ShaderGraphRecompiler *fogInstance;
-
-  static ShaderGraphRecompiler *enviCoverInstance;
 
 private:
   webui::GraphEditor *shader_editor = nullptr;
@@ -66,6 +65,8 @@ private:
 
   NodeBasedShaderType shaderType = static_cast<NodeBasedShaderType>(0);
   String currentShaderName;
+  String rootShaderName;
+  int editedPermutationIdx = -1;
   String shaderBlkText;
   String currentGraphFileName;
   String lastCompileError;
@@ -73,6 +74,7 @@ private:
   String translateDir; // for translated to .blk
   String rootGraphFileName;
   String optionalGraphsDir;
+  String permutationsBlkFileName;
 
   String editorName;
 
@@ -85,11 +87,14 @@ private:
 };
 
 String find_shader_editors_path();
+String add_nbs_quality_definition(NodeBasedShaderQuality nbs_quality);
 String collect_template_files(const String &template_dir, const Tab<String> &template_names);
 
 
 extern webui::HttpPlugin get_fog_shader_graph_editor_http_plugin();
 extern webui::HttpPlugin get_envi_cover_shader_graph_editor_http_plugin();
+extern webui::HttpPlugin get_clouds_shader_graph_editor_http_plugin();
 
 #define FOG_SHADER_EDITOR_PLUGIN_NAME        "fog_shader_editor"
 #define ENVI_COVER_SHADER_EDITOR_PLUGIN_NAME "envi_cover_shader_editor"
+#define CLOUDS_SHADER_EDITOR_PLUGIN_NAME     "clouds_shader_editor"

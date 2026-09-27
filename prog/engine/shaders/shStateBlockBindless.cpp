@@ -16,8 +16,8 @@
 #include <osApiWrappers/dag_miscApi.h>
 
 #include "shStateBlock.h"
-#include "concurrentRangePool.h"
-#include "concurrentElementPool.h"
+#include <generic/dag_concurrentRangePool.h>
+#include <generic/dag_concurrentElementPool.h>
 
 using namespace shaders;
 
@@ -60,18 +60,18 @@ enum class PackedBufferId : uint8_t
   Invalid = 0
 };
 
-using ConstantsContainer = ConcurrentRangePool<Point4, get_const_log2(MAX_CONST_BUFFER_SIZE), 8, true>;
+using ConstantsContainer = dag::ConcurrentRangePool<Point4, get_const_log2(MAX_CONST_BUFFER_SIZE), 8, true>;
 
 // NOTE 9+6 <= GLOBAL_STATE_BITS because IDs from these need to fit there
-using StatesContainer = ConcurrentElementPool<GlobalStateId, BindlessState, 9, 6>;
-using BuffersContainer = ConcurrentElementPool<GlobalStateId, Sbuffer *, 9, 6>;
+using StatesContainer = dag::ConcurrentElementPool<GlobalStateId, BindlessState, 9, 6>;
+using BuffersContainer = dag::ConcurrentElementPool<GlobalStateId, Sbuffer *, 9, 6>;
 
 static ConstantsContainer dataConsts;
 static StatesContainer all;          // first one is default
 static BuffersContainer allConstBuf; // parallel to all
-using BindlessConstParamsStorage = ConcurrentRangePool<BindlessConstParams, get_const_log2(MAX_CONST_BUFFER_SIZE)>;
+using BindlessConstParamsStorage = dag::ConcurrentRangePool<BindlessConstParams, get_const_log2(MAX_CONST_BUFFER_SIZE)>;
 static BindlessConstParamsStorage bindlessConstParams;
-static ConcurrentElementPool<BindlessTexId, BindlessTexRecord, 10> uniqBindlessTex;
+static dag::ConcurrentElementPool<BindlessTexId, BindlessTexRecord, 10> uniqBindlessTex;
 static dag::Vector<eastl::tuple<D3DResourceType, uint32_t, uint32_t>> allocatedBindlessRanges;
 static OSSpinlock mutex;
 
@@ -82,11 +82,11 @@ static_assert(DEFAULT_BINDLESS_CONST_STATE_ID == static_cast<ConstStateIdx>(decl
 static eastl::deque<PackedStcodeId, EASTLAllocatorType, 2048> stcodeIdToPacked;
 
 // NOTE: 2+4 <= BUFFER_BITS because IDs from this need to fit there
-using PackedBuffersContainer = ConcurrentElementPool<PackedBufferId, Sbuffer *, 2, 4>;
+using PackedBuffersContainer = dag::ConcurrentElementPool<PackedBufferId, Sbuffer *, 2, 4>;
 
 // NOTE: 5+5 <= PACKED_STCODE_BITS because IDs from these need to fit there
 template <typename T>
-using PackedCont = ConcurrentElementPool<PackedStcodeId, T, 5, 5>;
+using PackedCont = dag::ConcurrentElementPool<PackedStcodeId, T, 5, 5>;
 
 static PackedCont<StatesContainer> packedAll;
 static PackedCont<ConstantsContainer> packedDataConsts;
@@ -166,7 +166,7 @@ static uint32_t register_bindless_sampler(TEXTUREID tid, bool after_reset = fals
   if (sampler == d3d::INVALID_SAMPLER_HANDLE)
   {
     G_ASSERT(tid == BAD_TEXTUREID);
-    return uint32_t(-1);
+    return DEFAULT_SAMPLER_ID; // workaround for the -1 sampler access crash
   }
 
   return d3d::register_bindless_sampler(sampler);
@@ -179,8 +179,9 @@ static Sbuffer *create_static_cb(uint32_t register_count, const char *name)
 
 
 
+
 #else
-  return d3d::buffers::create_persistent_cb(register_count, name);
+  return d3d::buffers::create_persistent_cb(register_count, name, RESTAG_ENGINE);
 #endif
 }
 
@@ -428,7 +429,7 @@ struct BindlessState
 
         auto p4btcmp = [](const Point4 &a, const Point4 &b) {
           // bitwise compare to be able collapse bitwise-identical NaNs
-          return v_signmask(v_cmp_eqi(v_ld(&a.x), v_ld(&b.x))) == 15;
+          return v_check_xyzw_all_true(v_cmp_eqi(v_ld(&a.x), v_ld(&b.x)));
         };
         uint32_t beginConst = 0;
         // if there are exist bindless resources we compare all dataConstToAdd ranges EXCEPT bindless ones,
@@ -505,8 +506,9 @@ struct BindlessState
         {
           G_ASSERT(type == added_textures_sorted[i].second);
           const auto texId = addedBindlessTexIds.emplace_back(uniqBindlessTex.allocate());
+          // lastFrame=~0u to avoid collision with frame 0, which would skip the first descriptor heap write.
           uniqBindlessTex[texId] =
-            BindlessTexRecord{added_textures_sorted[i].first, brange++, 0, INVALID_TEX_STREAMING_GENERATION, 0, type};
+            BindlessTexRecord{added_textures_sorted[i].first, brange++, ~0u, INVALID_TEX_STREAMING_GENERATION, 0, type};
         }
         return offset + count;
       };

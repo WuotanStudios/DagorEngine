@@ -8,12 +8,13 @@
 #include <memory/dag_mem.h>
 #include <generic/dag_span.h>
 #include <dag/dag_relocatable.h>
+#include <util/dag_compilerDefs.h>
 
 #include <supp/dag_define_KRNLIMP.h>
 extern "C" KRNLIMP void dd_simplify_fname_c(char *fn);
 #include <supp/dag_undef_KRNLIMP.h>
 
-class SimpleString
+class DAGOR_WARN_IF_UNUSED SimpleString
 {
 public:
   typedef char value_type;
@@ -73,6 +74,7 @@ public:
   // cast operators
   operator char *() { return str(); }
   operator const char *() const { return str(); }
+  explicit operator bool() = delete; // Did you mean `!empty()`?
 
   // space allocation (to be used as buffer)
   void allocBuffer(int sz)

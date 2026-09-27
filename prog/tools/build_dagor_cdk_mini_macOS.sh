@@ -1,3 +1,7 @@
+if [ "$1" = "x86_64" ] || [ "$1" = "arm64" ]; then
+  export PlatformArch=$1
+fi
+
 # dabuild
 jam -s Root=../.. -f libTools/daKernel/jamfile
 jam -s Root=../.. -f sceneTools/assetExp/jamfile
@@ -14,6 +18,8 @@ jam -s Root=../.. -s Tegra_exp=yes -f sceneTools/assetExp/ddsxConv/jamfile
 # shader compilers
 jam -s Root=../.. -f ShaderCompiler2/jamfile
 jam -s Root=../.. -f ShaderCompiler2/jamfile-stub
+jam -s Root=../.. -f ShaderCompiler2/nodeBased/jamfile
+jam -s Root=../.. -f ../3rdPartyLibs/scripts/duktape/jamfile
 
 # common minimal gui shaders for tools
 pushd sceneTools/guiShaders_commonData

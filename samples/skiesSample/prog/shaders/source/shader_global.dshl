@@ -50,6 +50,9 @@ interval in_editor_assume: no <1, yes;
 int use_postfx = 1;
 interval use_postfx : off<1, on;
 
+int shaderlod = 1;
+interval shaderlod:low<1, high;
+
 macro NO_ATEST()
   hlsl(ps) {
     #define clip_alpha(a)
@@ -202,8 +205,12 @@ macro INIT_HDR(code)
 endmacro
 
 macro USE_HDR(code)
-  hlsl(code) {half3 pack_hdr(half3 a) {return a;}}
-  hlsl(code) {half3 unpack_hdr(half3 a) {return a;}}
+  hlsl(code) {
+    half3 pack_hdr(half3 a) {return a;}
+    half3 unpack_hdr(half3 a) {return a;}
+    half get_exposure_mul() {return 1;}
+    half get_exposure_inv() {return 1;}
+  }
 endmacro
 
 hlsl(ps) {
@@ -241,9 +248,6 @@ half linearSmoothnessToLinearRoughness(half linearSmoothness) {return 1-linearSm
 int compatibility_mode = 0;
 interval compatibility_mode:compatibility_mode_off<1, compatibility_mode_on;
 
-int mobile_render = 0;
-interval mobile_render: off < 1, forward < 2, deferred;
-
 macro USE_MSAA()
   hlsl(ps) {
     #define NUM_MSAA_SAMPLES 0
@@ -272,8 +276,6 @@ hlsl(ps) {
 endmacro
 
 macro INIT_HDR_STCODE()
-endmacro
-macro INIT_SUN_STCODE()
 endmacro
 macro USE_SUN()
 endmacro

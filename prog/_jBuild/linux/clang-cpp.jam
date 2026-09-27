@@ -28,6 +28,9 @@ rule ProcessCompileTarget
   }
   if $(CheckOnly) != yes && $(Config) != dbg { _CONFIG_OPT += -g ; }
 
+  if $(UseWholeOpt) = yes { _CONFIG_OPT += -flto=thin ; }
+  else if $(UseWholeOpt) != no { _CONFIG_OPT += -flto=$(UseWholeOpt) ; } # e.g. full
+
   if $(FortifySource) = yes { _CONFIG_OPT += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 ; }
 
   if $(PlatformArch) = e2k { # no StackProtection support available
@@ -46,7 +49,7 @@ rule ProcessCompileTarget
 
   if $(StrictCompile) = yes {
     if ! [ MATCH /(3rdPartyLibs)/ : $(Location) ] && ! [ MATCH /(devtools)/ : $(Location) ] { # Note: this doesn't work on 3rdp headers
-      _CPP_OPT += -Wunused-parameter ;
+      _CPP_OPT += -Wunused-parameter -Wunused-lambda-capture -Wrange-loop-construct -Werror=unused-lambda-capture -Werror=range-loop-construct ;
     }
   }
 
@@ -56,7 +59,7 @@ rule ProcessCompileTarget
 }
 
 
-rule DepRule
+if ! DepRuleDotDot in $(JAM_BUILTINS) { rule DepRuleDotDot
 {
   local changed_dep = ;
 
@@ -66,7 +69,6 @@ rule DepRule
     local rel_path = ;
     switch $(dep)
     {
-      case /Develop/SDK* : dep = ; # skip target part
       case *: : dep = ; # skip target part
       case /* : changed_dep += $(dep) ;   # absolute path with drive
       case *  : rel_path = [ MATCH "[\.\\\/]*([^ \
@@ -77,13 +79,13 @@ rule DepRule
 
   Includes $(<) : $(changed_dep) ;
   null_action $(changed_dep) ;
-}
+} }
 
 
 rule CheckHeaders
 {
   Depends $(<) : $(>) ;
-  NoCare $(>) ; # tolerant to .d absence
+  if $(StrictHeaderDeps) != yes || ! [ GLOB $(<:D) : $(<:D=) ] { NoCare $(>) ; } # tolerant to .d absence (also on fresh builds when .obj missing too)
   NOUPDATE $(>) ; # tolerant to .d timestamp
 
   # scan line for header, skipping any ../ at the beginning [will be prefixed with $(Root)]
@@ -91,7 +93,7 @@ rule CheckHeaders
                       ]*([^ \\\
                       ]+)[ \\\
                       ]" ;
-  HDRRULE  on $(>) = DepRule ;
+  HDRRULE  on $(>) = DepRuleDotDot ;
   HDRFS    on $(>) = yes ;
 }
 

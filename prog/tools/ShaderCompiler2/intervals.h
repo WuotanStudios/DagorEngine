@@ -53,7 +53,7 @@ public:
   /************************************************************************/
   /* boolean expressions for this class
   /************************************************************************/
-  enum BooleanExpr
+  enum BooleanExpr : uint8_t
   {
     EXPR_NOTINIT,
     EXPR_EQ,         // ==
@@ -62,6 +62,8 @@ public:
     EXPR_SMALLER,    // <
     EXPR_SMALLER_EQ, // <=
     EXPR_NOT_EQ,     // !=
+
+    EXPR_COUNT
   };
 
   Interval(int name_id, ShaderVariant::VarType interval_type, eastl::string file_name = "") :
@@ -113,6 +115,8 @@ public:
   // check boolean expression
   bool checkExpression(ShaderVariant::ValueType left_op_normalized, const Interval::BooleanExpr expr, const char *right_op,
     String &error_msg, shc::TargetContext &ctx) const;
+  bool checkExpression(ShaderVariant::ValueType left_op_normalized, const Interval::BooleanExpr expr, int right_op_name_id,
+    String &error_msg, shc::TargetContext &ctx) const;
 
   // return true, if intervals are identical
   inline bool operator==(const Interval &other) const
@@ -131,11 +135,15 @@ public:
   inline ShaderVariant::VarType getVarType() const { return intervalType; }
   const eastl::string &getFileName() const { return fileName; }
 
+  bool isAlwaysReferenced() const { return isAlwaysReferencedFlag; }
+  void makeAlwaysReferenced() { isAlwaysReferencedFlag = true; }
+
 private:
   NameId<IntervalValue::Adapter> nameId;
   ShaderVariant::VarType intervalType;
   SerializableTab<IntervalValue> valueList;
   bindump::string fileName;
+  bool isAlwaysReferencedFlag = false;
 };
 
 class IntervalList
@@ -164,7 +172,8 @@ public:
 private:
   SerializableTab<bindump::Ptr<Interval>> intervals;
 
-  const Interval *getIntervalByNameId(int name_id) const;
+  Interval *getIntervalByNameId(int name_id);
+  const Interval *getIntervalByNameId(int name_id) const { return const_cast<IntervalList *>(this)->getIntervalByNameId(name_id); }
 };
 
 const char *get_interval_value_name(const IntervalValue &value, const shc::TargetContext &ctx);

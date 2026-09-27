@@ -14,11 +14,12 @@
 #include <debug/dag_assert.h>
 #include <util/dag_hashedKeyMap.h>
 #include <util/dag_nameHashers.h>
+#include <util/dag_compilerDefs.h>
 
 using oa_hash_t = uint32_t;
 
 template <bool ignore_case, typename Hasher = DefaultOAHasher<ignore_case>>
-struct OAHashNameMap
+struct DAGOR_WARN_IF_UNUSED OAHashNameMap
 {
   using hash_t = oa_hash_t;
   HashedKeyMap<hash_t, uint32_t> hashToStringId;
@@ -203,7 +204,7 @@ typedef FastNameMap FastNameMapEx;
 #ifdef _TARGET_STATIC_LIB
 extern template struct OAHashNameMap<false>;
 extern template struct OAHashNameMap<true>;
-extern template struct OAHashNameMap<false, FNV1OAHasher<false>>;
+extern template struct OAHashNameMap<false, FNV1AOAHasher<false>>;
 #else
 #include "dag_oaHashNameMapImpl.inl"
 #endif

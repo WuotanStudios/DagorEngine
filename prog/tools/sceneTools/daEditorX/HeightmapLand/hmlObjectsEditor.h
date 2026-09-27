@@ -28,8 +28,6 @@ class SplineObject;
 class SplinePointObject;
 class CrossRoadData;
 class LandscapeEntityObject;
-class SnowSourceObject;
-struct NearSnowSource;
 
 
 class HmapLandObjectEditor : public ObjectEditor, public IAssetBaseViewClient, public IAssetUpdateNotify, public IDagorEdCustomCollider
@@ -40,7 +38,6 @@ public:
 
   // ObjectEditor interface implementation
   void fillToolBar(PropPanel::ContainerPropertyControl *toolbar) override;
-  void addButton(PropPanel::ContainerPropertyControl *tb, int id, const char *bmp_name, const char *hint, bool check = false) override;
   void updateToolbarButtons() override;
   bool pickObjects(IGenViewportWnd *wnd, int x, int y, Tab<RenderableEditableObject *> &objs) override;
 
@@ -48,6 +45,7 @@ public:
   bool handleMouseLBPress(IGenViewportWnd *wnd, int x, int y, bool inside, int buttons, int key_modif) override;
   bool handleMouseLBRelease(IGenViewportWnd *wnd, int x, int y, bool inside, int buttons, int key_modif) override;
   bool handleMouseRBPress(IGenViewportWnd *wnd, int x, int y, bool inside, int buttons, int key_modif) override;
+  bool handleMouseWheel(IGenViewportWnd *wnd, int wheel_d, int x, int y, int key_modif) override;
   void gizmoStarted() override;
   void gizmoEnded(bool apply) override;
 
@@ -58,8 +56,15 @@ public:
   void update(real dt) override;
 
   void setEditMode(int cm) override;
+  // a first pick in split-poly mode belongs to that mode: any mode change abandons it
+  void stopPolySplitting();
+  // and so does losing the picked point itself, since Del acts on the selection made before the mode was entered
+  void stopPolySplittingIfPickGone();
+  // hover marker and rubber line, recomputed on the next mouse move: drop them when what they point at is gone
+  void dropHoverState();
   bool canSelectObj(RenderableEditableObject *o) override;
   void createObjectBySample(RenderableEditableObject *sample) override;
+  void registerEditorCommands(IEditorCommandSystem &command_system) override;
   void registerViewportAccelerators(IWndManager &wndManager) override;
 
   // IMenuEventHandler
@@ -83,7 +88,6 @@ public:
 
   // IDagorEdCustomCollider
   bool traceRay(const Point3 &p, const Point3 &dir, real &maxt, Point3 *norm) override;
-  bool shadowRayHitTest(const Point3 &p, const Point3 &dir, real maxt) override;
   const char *getColliderName() const override { return "RoadGeom"; }
   bool isColliderVisible() const override;
   void getObjNames(Tab<String> &names, Tab<String> &sel_names, const Tab<int> &types) override;
@@ -101,8 +105,16 @@ public:
   void save(DataBlock &blk);
   void load(const DataBlock &blk);
 
-  void save(DataBlock &splBlk, DataBlock &polBlk, DataBlock &entBlk, DataBlock &ltBlk, int layer);
-  void load(const DataBlock &splBlk, const DataBlock &polBlk, const DataBlock &entBlk, const DataBlock &ltBlk, int layer);
+  void save(DataBlock &splBlk, DataBlock &polBlk, DataBlock &entBlk, int layer);
+  void load(const DataBlock &splBlk, const DataBlock &polBlk, const DataBlock &entBlk, int layer);
+
+  void saveObjectLocalStates(DataBlock &local_data);
+  void loadObjectLocalStates(const DataBlock &local_data);
+
+  // A per-object hide is a viewport state, so an export or a build must not see it.
+  // Use the two methods in a pair.
+  void showHiddenObjectsForBuild();
+  void restoreHiddenObjectsAfterBuild();
 
   void gatherStaticGeometry(StaticGeometryContainer &cont, int flags, bool collision, int stage);
   void gatherLoftLandPts(Tab<Point3> &loft_pt_cloud, Tab<Point3> &water_border_polys, Tab<Point2> &hmap_sweep_polys);
@@ -112,6 +124,8 @@ public:
 
   float screenDistBetweenPoints(IGenViewportWnd *wnd, SplinePointObject *p1, SplinePointObject *p2);
   float screenDistBetweenCursorAndPoint(IGenViewportWnd *wnd, int x, int y, SplinePointObject *p);
+  // the split-poly candidate under the cursor, or null: the hover and the click have to agree on every rule
+  SplinePointObject *splitPolyCandidate(SplineObject &poly, IGenViewportWnd *wnd, int x, int y);
 
   void removeSpline(SplineObject *s);
 
@@ -119,6 +133,7 @@ public:
   void clone(bool clone_seed);
 
   bool isCloneMode() { return cloneMode; }
+  bool isInGizmo() const { return inGizmo; }
   bool isEditingSpline(SplineObject *spline) { return spline == curSpline; }
 
   void exportAsComposit();
@@ -164,9 +179,6 @@ public:
   inline SplineObject *getSpline(int idx) { return splines[idx]; }
   inline const SplineObject *getSpline(int idx) const { return splines[idx]; }
 
-  void calcSnow(StaticGeometryContainer &container);
-  void updateSnowSources();
-
   GeomObject &getClearedWaterGeom();
   void removeWaterGeom();
 
@@ -197,13 +209,18 @@ public:
 
   void updateImgui() override;
 
+  static bool doesObjectSupportHiding(RenderableEditableObject &object);
+  static bool doesObjectSupportLocking(RenderableEditableObject &object);
+
+  static bool isObjectLocked(const LandscapeEntityObject &object);
+  static bool isObjectLocked(const SplineObject &object);
+
 public:
   class LoftAndGeomCollider : public IDagorEdCustomCollider
   {
   public:
     LoftAndGeomCollider(bool _loft, HmapLandObjectEditor &oe) : loft(_loft), objEd(oe), loftLayerOrder(-1) {}
     bool traceRay(const Point3 &p, const Point3 &dir, real &maxt, Point3 *norm) override;
-    bool shadowRayHitTest(const Point3 &p, const Point3 &dir, real maxt) override;
     const char *getColliderName() const override { return loft ? "LoftGeom" : "PolyGeom"; }
     bool isColliderVisible() const override;
 
@@ -239,9 +256,11 @@ protected:
   void onObjectFlagsChange(RenderableEditableObject *obj, int changed_flags) override;
   void updateSelection() override;
   void fillSelectionMenu(IGenViewportWnd *wnd, PropPanel::IMenu *menu) override;
+  void setCreateBySampleMode(RenderableEditableObject *sample_ = NULL) override;
 
   bool findTargetPos(IGenViewportWnd *wnd, int x, int y, Point3 &out, bool place_on_ri_collision = false);
   void selectNewObjEntity(const char *name);
+  void setNewObjInteractiveMove(bool on);
   SplineObject *findSplineAndDirection(IGenViewportWnd *wnd, SplinePointObject *p, bool &dirs_equal, SplineObject *excl = NULL);
 
   static void fillPossiblePixelPerfectSelectionHits(IPixelPerfectSelectionService &selection_service,
@@ -254,6 +273,9 @@ protected:
   // Returns true if it was in progress and got canceled.
   bool stopSplineCreation();
 
+  void createRegularShape(const Point3 &center, float radius, bool as_poly);
+  void updateShapeToast(int x, int y);
+
   bool isOutlinerWindowOpen() const { return outlinerWindowOpen; }
   void showOutlinerWindow(bool show);
 
@@ -265,14 +287,17 @@ protected:
 
   int selectMode;
   int currentMode;
+  int hideSplinesAndPolygonsMode = -1;
 
   Tab<SplineObject *> splines;
+  Tab<SplineObject *> renderRoadsSplinesCache;
   GeomObject *waterGeom;
 
   bool cloneMode;
   Point3 cloneDelta;
   String cloneName;
   PtrTab<RenderableEditableObject> cloneObjs;
+  PtrTab<RenderableEditableObject> gizmoTransformObjs; // entered gizmo mode, see setSelectionGizmoTranformMode()
 
   bool inGizmo;
   DynRenderBuffer *ptDynBuf;
@@ -282,17 +307,24 @@ protected:
   SplineObject *curSpline;
   String curSplineAsset;
 
+  bool shapeCenterPlaced = false;
+  bool shapeReadyToConfirm = false;
+  Point3 shapeCenter;
+  float shapeRadius = 0.f;
+  float shapeRotation = 0.f;
+  int shapeSegments = 4;
+  int lastMouseX = 0, lastMouseY = 0;
+
   Ptr<LandscapeEntityObject> newObj;
 
   IObjectCreator *objCreator;
   bool areLandHoleBoxesVisible;
-  bool hideSplines;
+  bool hideNotes;
   bool usePixelPerfectSelection;
   bool selectOnlyIfEntireObjectInRect;
   bool showPhysMat, showPhysMatColors;
 
   dag::Vector<IPixelPerfectSelectionService::Hit> pixelPerfectSelectionHitsCache;
-  Tab<NearSnowSource> nearSources;
 
   shaders::OverrideStateId zFuncLessStateId;
 

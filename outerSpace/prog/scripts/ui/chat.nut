@@ -1,8 +1,7 @@
 from "%darg/ui_imports.nut" import *
 import "%dngscripts/ecs.nut" as ecs
-
-let { EventSqChatMessage, mkCmdChatMessage } = require("%scripts/globs/sqevents.nut")
-let { userName } = require("%scripts/ui/login.nut")
+from "%scripts/globs/sqevents.nut" import EventSqChatMessage, mkCmdChatMessage
+from "%scripts/ui/login.nut" import userName
 
 let chatLines = persist("chatLines", @() [])
 let linesGen = mkWatched(persist, "linesGen", 0)
@@ -86,15 +85,15 @@ function chatLog() {
   }
 }
 
-let inputBoxHeight = fsh(3)
-let inputBoxDummy = freeze({size=[flex(), inputBoxHeight]})
+const inputBoxHeight = fsh(3)
+const inputBoxDummy = {size=const [flex(), inputBoxHeight]}
 
 function inputBox() {
   return {
     rendObj = ROBJ_SOLID
     vplace = ALIGN_BOTTOM
     color = Color(0,0,0,200)
-    size = [flex(), inputBoxHeight]
+    size = const [flex(), inputBoxHeight]
 
     children = @() {
       rendObj = ROBJ_TEXT
@@ -127,7 +126,7 @@ function chatUi() {
   return {
     key = "chat"
     flow = FLOW_VERTICAL
-    size = static [sw(20), fsh(20)]
+    size = const [sw(20), fsh(20)]
 //    rendObj = ROBJ_DEBUG
     vplace = ALIGN_BOTTOM
     watch = showChatInput
@@ -152,12 +151,12 @@ function updateChat() {
   linesGen.modify(@(v) v+1)
 }
 
+gui_scene.setInterval(ChatUpdatePeriod, updateChat)
+
 function mkChatUi() {
   outMessage.set("")
   chatLines.clear()
   showChatInput.set(false)
-  gui_scene.clearTimer(updateChat)
-  gui_scene.setInterval(ChatUpdatePeriod, updateChat)
 
   return {chatUi, showChatInput}
 }

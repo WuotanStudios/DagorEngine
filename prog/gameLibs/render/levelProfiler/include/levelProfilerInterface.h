@@ -12,18 +12,42 @@ namespace levelprofiler
 {
 
 class ICopyProvider;
+class LevelProfilerUI;
 
-enum TableColumn
+enum class TextureColumn : int
 {
-  COLUMN_NONE = -1, // Invalid column indicator
-  COL_NAME,         // Texture/resource name
-  COL_FORMAT,       // Texture format
-  COL_WIDTH,        // Texture width
-  COL_HEIGHT,       // Texture height
-  COL_MIPS,         // Mipmap count
-  COL_MEM_SIZE,     // Memory size
-  COL_TEX_USAGE     // Texture Usage information
+  NONE = -1,
+  NAME = 0,
+  FORMAT,
+  WIDTH,
+  HEIGHT,
+  MIPS,
+  MEM_SIZE,
+  USAGE,
+  BASE_COUNT // Number of static columns - must always be last
 };
+
+enum class RiColumn : int
+{
+  NONE = -1,
+  NAME = 0,
+  COUNT_ON_MAP,
+  BSPHERE_RAD,
+  BBOX_RAD,
+  PHYS_TRIS,
+  TRACE_TRIS,
+  BASE_COUNT // Number of static columns - must always be last
+};
+
+using ColumnIndex = int;
+inline constexpr ColumnIndex operator*(TextureColumn c) { return static_cast<ColumnIndex>(c); }
+inline constexpr ColumnIndex operator*(RiColumn c) { return static_cast<ColumnIndex>(c); }
+inline constexpr bool isValidColumn(ColumnIndex c) { return c >= 0; }
+
+static_assert(static_cast<int>(TextureColumn::BASE_COUNT) == static_cast<int>(TextureColumn::USAGE) + 1,
+  "TextureColumn::BASE_COUNT must follow last data column");
+static_assert(static_cast<int>(RiColumn::BASE_COUNT) == static_cast<int>(RiColumn::TRACE_TRIS) + 1,
+  "RiColumn::BASE_COUNT must follow last data column");
 
 using ProfilerString = eastl::string;
 using TextureID = unsigned int;
@@ -39,12 +63,25 @@ struct TextureUsage
   TextureUsage(int t, int u) : total(t), unique(u), shared(t - u) {}
 };
 
+// A texture used by one asset is unique, not shared, so the shared-usage range starts at two.
+static constexpr int SHARED_TEXTURE_USAGE_MIN = 2;
+
 class IDataCollector
 {
 public:
   virtual ~IDataCollector() = default;
   virtual void collect() = 0;
   virtual void clear() = 0;
+
+  // A collector whose walk outlives collect() overrides these; the defaults describe a synchronous
+  // one, already done when collect() returns. Driving, pausing and progress go through here, so
+  // those paths never name a specific collector.
+  virtual void continueCollect() {}
+  virtual bool isCollecting() const { return false; }
+  virtual bool isPaused() const { return false; }
+  virtual void pauseCollection() {}
+  virtual void resumeCollection() {}
+  virtual float getCollectProgress() const { return 1.0f; }
 };
 
 class IFilter
@@ -59,9 +96,17 @@ class IProfilerModule
 {
 public:
   virtual ~IProfilerModule() = default;
+  // init() only wires the module up. It runs at renderer creation, before any level is loaded,
+  // so collecting here would just snapshot an empty world; the Collect Data button collects.
   virtual void init() = 0;
   virtual void shutdown() = 0;
   virtual void drawUI() = 0;
+
+  // Called on the tab modules when the data they display changed: once when collect replaces it,
+  // again when an incremental walk finishes filling it in, so it has to be idempotent. A data
+  // module does its own post-collect work inside collect() and is not dispatched here. Unlike
+  // init() it must keep what the user set up (filters, selection) that still resolves.
+  virtual void onDataCollected() {}
 
   virtual ICopyProvider *getCopyProvider() { return nullptr; }
 };

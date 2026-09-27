@@ -1227,6 +1227,14 @@ FBXConverter::ConvertMeshMultiMaterial(const MeshGeometry &mesh, const Model &mo
     const MatIndexArray &mindices = mesh.GetMaterialIndices();
     ai_assert(mindices.size());
 
+    const eastl::vector<unsigned int> &faces = mesh.GetFaceIndexCounts();
+    if (mindices.size() != faces.size()) {
+        FBXImporter::LogError("material index count (", mindices.size(),
+            ") does not match face count (", faces.size(),
+            "), ignoring mesh");
+        return eastl::vector<unsigned int>();
+    }
+
     eastl::set<MatIndexArray::value_type> had;
     eastl::vector<unsigned int> indices;
 
@@ -1263,11 +1271,25 @@ unsigned int FBXConverter::ConvertMeshMultiMaterial(const MeshGeometry &mesh, co
             continue;
         }
         ++count_faces;
+
+        if (*itf > AI_MAX_FACE_INDICES) {
+            FBXImporter::LogError("ConvertMeshMultiMaterial: face index count ",
+                    *itf, " exceeds limit ", AI_MAX_FACE_INDICES,
+                    ". Rejecting malformed mesh.");
+            return static_cast<unsigned int>(mMeshes.size() - 1);
+        }
         count_vertices += *itf;
     }
 
     ai_assert(count_faces);
     ai_assert(count_vertices);
+
+    if (count_vertices > vertices.size()) {
+        FBXImporter::LogError("ConvertMeshMultiMaterial: face index counts sum to ",
+                count_vertices, " but mesh only has ", vertices.size(),
+                " vertices. Rejecting malformed mesh.");
+        return static_cast<unsigned int>(mMeshes.size() - 1);
+    }
 
     // mapping from output indices to DOM indexing, needed to resolve weights or blendshapes
     eastl::vector<unsigned int> reverseMapping;
@@ -3372,21 +3394,6 @@ FBXConverter::KeyFrameListList FBXConverter::GetRotationKeyframeList(const eastl
                 int64_t tc = curve->GetKeys().at(1);
                 float vc = curve->GetValues().at(1);
                 for (size_t n = 1; n < count; n++) {
-                    while (abs(vc - vp) >= 180.0f) {
-                        double step = floor(double(tc - tp) / abs(vc - vp) * 179.0f);
-                        int64_t tnew = tp + int64_t(step);
-                        float vnew = vp + (vc - vp) * float(step / (tc - tp));
-                        if (tnew >= adj_start && tnew <= adj_stop) {
-                            Keys->push_back(tnew);
-                            Values->push_back(vnew);
-                        }
-                        else {
-                            // Something broke
-                            break;
-                        }
-                        tp = tnew;
-                        vp = vnew;
-                    }
                     if (tc >= adj_start && tc <= adj_stop) {
                         Keys->push_back(tc);
                         Values->push_back(vc);

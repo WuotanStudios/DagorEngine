@@ -5,83 +5,98 @@
 #include "esram_components.h"
 #include <constants.h>
 #include <container_mutex_wrapper.h>
+#include <debug/names.h>
 #include <d3d12_error_handling.h>
 #include <driver.h>
 #include <host_device_shared_memory_region.h>
 #include <resource_memory.h>
 
-#include <EASTL/vector.h>
 #include <supp/dag_comPtr.h>
-
 
 namespace drv3d_dx12::resource_manager
 {
-class RingMemoryBase : public ESRamPageMappingProvider
+class FramePushRingMemoryProvider : public ESRamPageMappingProvider
 {
   using BaseType = ESRamPageMappingProvider;
 
 protected:
+  using HostDeviceSharedMemoryRegionAllocationResult = dag::Expected<HostDeviceSharedMemoryRegion, MemoryAllocationError>;
+
   struct CompletedFrameExecutionInfo : BaseType::CompletedFrameExecutionInfo
   {
     uint32_t historyIndex;
   };
 
-  template <typename T>
-  struct RingMemoryState : T
+  struct PushRingMemoryState
   {
-    using HeapType = typename T::HeapType;
-    struct RingSegment : BasicBuffer
+    using HeapType = FramePushRingMemoryProvider;
+
+    static constexpr uint32_t min_ring_size = 2 * 1024 * 1024;
+    static constexpr uint32_t default_ring_size = 16 * 1024 * 1024;
+    static constexpr uint32_t default_large_push_threshold = 2 * 1024 * 1024;
+
+    struct RingSegment
     {
+      ComPtr<ID3D12Resource> buffer;
+      ResourceMemoryLocationWithGPUAndCPUAddress baseLocation;
+      uint64_t bufferSize = 0;
       // Offset where we allocate next chunk from
       uint32_t allocationOffset = 0;
-      // Total allocated, bufferMemory.size - allocationSize yields free memory
+      // Total allocated, bufferSize - allocationSize yields free memory
       uint32_t allocationSize = 0;
       // Allocation size since last snapshot
       uint32_t currentAllocation = 0;
-      // Copy of currentAllocation before it was set to 0, used for telemetry
-      uint32_t lastAllocation = 0;
-      // number of times we have seen it unused
-      uint32_t timeSinceUnused = 0;
       // coincides with latched frame index
       uint32_t allocationHistory[FRAME_FRAME_BACKLOG_LENGTH] = {};
 
-      HostDeviceSharedMemoryRegion allocate(uint32_t size, uint32_t alignment)
+      ID3D12Resource *getResourcePtr() const { return buffer.Get(); }
+      D3D12_GPU_VIRTUAL_ADDRESS getGPUPointer() const { return baseLocation.gpuAddress; }
+      uint8_t *getCPUPointer() const { return baseLocation.cpuAddress; }
+      uint64_t getBufferMemorySize() const { return bufferSize; }
+
+      /// Empty when the ring has no room left, which is an ordinary outcome; the caller falls back
+      /// to the temporary upload memory.
+      eastl::optional<HostDeviceSharedMemoryRegion> allocate(uint32_t size, uint32_t alignment)
       {
         HostDeviceSharedMemoryRegion result;
 
         auto allocationBegin = align_value(allocationOffset, alignment);
         auto allocationEnd = allocationBegin + size;
 
-        auto freeMemory = bufferMemory.size - allocationSize;
+        auto freeMemory = bufferSize - allocationSize;
         auto freeBegin = allocationOffset;
         auto freeEnd = freeBegin + freeMemory;
 
         // wants to allocate more than we have free
         if (allocationEnd > freeEnd)
         {
-          return result;
+          return {};
         }
 
-        uint32_t newAllocationSize = allocationEnd - allocationOffset;
-        if (allocationEnd > bufferMemory.size)
+        uint32_t newAllocationSize;
+        if (allocationEnd > bufferSize)
         {
-          const uint32_t extra = bufferMemory.size - freeBegin;
+          const uint32_t extra = bufferSize - freeBegin;
           // we have to wrap
           allocationBegin = 0;
           allocationEnd = size;
-          freeEnd -= bufferMemory.size;
+          freeEnd -= bufferSize;
 
           // check free space again after wrap
           if (allocationEnd > freeEnd)
           {
-            return result;
+            return {};
           }
 
           newAllocationSize = extra + size;
         }
+        else
+        {
+          newAllocationSize = allocationEnd - allocationOffset;
+        }
 
         result.buffer = buffer.Get();
-        result.memoryLocation = static_cast<ResourceMemoryLocationWithGPUAndCPUAddress>(bufferMemory) + allocationBegin;
+        result.memoryLocation = baseLocation + allocationBegin;
         result.range = ValueRange<uint64_t>{allocationBegin, allocationEnd};
 
         allocationOffset = allocationEnd;
@@ -94,9 +109,7 @@ protected:
 
       void finishRecording(uint32_t history_index)
       {
-        timeSinceUnused = allocationSize > 0 ? 0 : (timeSinceUnused + 1);
         allocationHistory[history_index] = currentAllocation;
-        lastAllocation = currentAllocation;
         currentAllocation = 0;
       }
 
@@ -106,246 +119,152 @@ protected:
         allocationHistory[history_index] = 0;
       }
 
-      bool canBeRemoved() const { return 0 == allocationSize; }
+      void reset()
+      {
+        buffer.Reset();
+        baseLocation = {};
+        bufferSize = 0;
+      }
     };
 
-    // we always have at least one segment with min_ring_size
-    // should we ever run out of segment space we allocate a
-    // new segment. As soon as we no longer need it, we drop
-    // the segment.
-    dag::Vector<RingSegment> ringSegments;
-    dag::Vector<RingSegment> deletedRingSegments;
+    // Single ring buffer, allocated during setup.
+    // When the ring can not provide memory, the caller falls back to temporary upload memory.
+    RingSegment segment;
 
     void finishRecording(uint32_t history_index)
     {
       G_ASSERT(history_index < FRAME_FRAME_BACKLOG_LENGTH);
-      for (auto &segment : ringSegments)
-      {
-        segment.finishRecording(history_index);
-      }
+      segment.finishRecording(history_index);
     }
 
-    void finishExecution(HeapType *heap, uint32_t history_index)
+    void finishExecution(uint32_t history_index)
     {
       G_ASSERT(history_index < FRAME_FRAME_BACKLOG_LENGTH);
-
-      for (auto &segment : ringSegments)
-      {
-        segment.finishExecution(history_index);
-      }
-
-      for (auto &segment : deletedRingSegments)
-      {
-        segment.finishExecution(history_index);
-      }
-
-      {
-        // Split into two ranges, first are segments that are still needed and the second range are
-        // ranges that can be dropped.
-        auto pivot = eastl::partition(begin(deletedRingSegments), end(deletedRingSegments),
-          [](auto &segment) { return !segment.canBeRemoved(); });
-        for (auto at = pivot, ed = end(deletedRingSegments); at != ed; ++at)
-        {
-          T::onSegmentRemove(heap, at->getBufferMemorySize());
-          at->reset(heap);
-        }
-        deletedRingSegments.erase(pivot, end(deletedRingSegments));
-      }
-
-      while ((ringSegments.size() >= T::min_active_segments) && T::shouldTrim(heap))
-      {
-        // remove no longer needed segments one by one
-        auto toBeRemoved = eastl::find_if(begin(ringSegments) + T::min_active_segments, end(ringSegments),
-          [=](auto &segment) { return segment.canBeRemoved(); });
-        if (end(ringSegments) != toBeRemoved)
-        {
-          T::onSegmentRemove(heap, toBeRemoved->getBufferMemorySize());
-          toBeRemoved->reset(heap);
-          ringSegments.erase(toBeRemoved);
-        }
-        else
-        {
-          break;
-        }
-      }
+      segment.finishExecution(history_index);
     }
 
-    bool addSegment(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, uint32_t size, AllocationFlags allocation_flags)
+    void create(HeapType *heap, ID3D12Device *device, uint32_t size)
     {
-      D3D12_RESOURCE_DESC desc;
-      desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-      desc.Width = align_value(size, T::min_ring_size);
-      desc.Height = 1;
-      desc.DepthOrArraySize = 1;
-      desc.MipLevels = 1;
-      desc.Format = DXGI_FORMAT_UNKNOWN;
-      desc.SampleDesc.Count = 1;
-      desc.SampleDesc.Quality = 0;
-      desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-      desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-      D3D12_RESOURCE_ALLOCATION_INFO allocInfo;
-      allocInfo.SizeInBytes = desc.Width;
-      allocInfo.Alignment = desc.Alignment;
-
-      auto initialState = HeapType::propertiesToInitialState(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_NONE,
-        DeviceMemoryClass::PUSH_RING_BUFFER);
-
+      segment = {};
+#if _TARGET_PC_WIN
       auto memoryProperties = heap->getPushHeapProperties();
+      const auto &fs = heap->getFeatureSet();
 
-      auto allocation = heap->allocate(adapter, device, memoryProperties, allocInfo, allocation_flags);
-      if (!allocation)
+      const D3D12_HEAP_PROPERTIES heapProperties = {
+        .Type = memoryProperties.getHeapType(),
+        .CPUPageProperty = memoryProperties.getCpuPageProperty(fs),
+        .MemoryPoolPreference = memoryProperties.getMemoryPool(fs),
+        .CreationNodeMask = 0,
+        .VisibleNodeMask = 0,
+      };
+
+      const auto initialState = HeapType::propertiesToInitialState(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_NONE,
+        DeviceMemoryClass::PUSH_RING_BUFFER);
+#else
+      const D3D12_HEAP_PROPERTIES heapProperties = {
+        .Type = D3D12_HEAP_TYPE_UPLOAD,
+        .CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        .MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN,
+        .CreationNodeMask = 0,
+        .VisibleNodeMask = 0,
+      };
+
+      const auto initialState = D3D12_RESOURCE_STATE_GENERIC_READ;
+#endif
+
+      const D3D12_RESOURCE_DESC desc = {
+        .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+        .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+        .Width = align_value(size, min_ring_size),
+        .Height = 1,
+        .DepthOrArraySize = 1,
+        .MipLevels = 1,
+        .Format = DXGI_FORMAT_UNKNOWN,
+        .SampleDesc = {.Count = 1, .Quality = 0},
+        .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        .Flags = D3D12_RESOURCE_FLAG_NONE,
+      };
+
+      ByteUnits ringSizeUnits{desc.Width};
+      logdbg("DX12: Allocating push ring buffer of %.2f %s", ringSizeUnits.units(), ringSizeUnits.name());
+      if (!DX12_CHECK_OK(device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &desc, initialState, nullptr,
+            COM_ARGS(&segment.buffer))))
       {
-        return false;
+        DAG_FATAL("DX12: Failed to create push ring buffer of %u bytes", size);
       }
+      debug::name_resource(segment.buffer.Get(), debug::make_pool_object_name("PushRing"));
 
-      RingSegment newSegment;
-      auto errorCode = newSegment.create(device, desc, allocation, initialState, true);
-      if (DX12_CHECK_FAIL(errorCode))
-      {
-        heap->free(allocation, allocation_flags.test(AllocationFlag::DEFRAGMENTATION_OPERATION));
-        return false;
-      }
-      auto &ringSegment = ringSegments.emplace_back(eastl::move(newSegment));
+      segment.bufferSize = desc.Width;
+      segment.baseLocation.gpuAddress = segment.buffer->GetGPUVirtualAddress();
 
-      T::onSegmentAdd(heap, ringSegment.getBufferMemory(), ringSegment.getResourcePtr());
+      D3D12_RANGE emptyRange{};
+      uint8_t *mappedPtr = nullptr;
+      segment.buffer->Map(0, &emptyRange, reinterpret_cast<void **>(&mappedPtr));
+      segment.baseLocation.cpuAddress = mappedPtr;
 
-      return true;
+      heap->recordConstantRingAllocated(desc.Width);
     }
 
-    // rotates segments by one to the left, eg new back becomes previous front
-    void rotateSegments()
+    eastl::optional<HostDeviceSharedMemoryRegion> allocate(uint32_t size, uint32_t alignment, uint32_t frame_index)
     {
-      if (2 > ringSegments.size())
+      // Per-frame allocation limit to prevent one frame from consuming the entire ring,
+      // which would cause oscillation between ring and temp upload fallback.
+      // Per-frame usage after this allocation.
+      uint32_t frameUsage = segment.currentAllocation + size;
+      // Hard cap: no single frame may use more than half the buffer.
+      if (frameUsage > segment.bufferSize / 2)
       {
-        return;
+        return {};
       }
-      if (2 == ringSegments.size())
+      // Look-ahead: assume the next frame needs roughly the same total as this frame.
+      // The next oldest frame completion frees at least minFreed bytes.
+      const uint32_t minFreed = segment.allocationHistory[(frame_index + 1) % FRAME_FRAME_BACKLOG_LENGTH];
+      const uint32_t available = static_cast<uint32_t>(segment.bufferSize) - segment.allocationSize + minFreed;
+      if (frameUsage + frameUsage > available)
       {
-        eastl::swap(ringSegments.front(), ringSegments.back());
+        return {};
       }
-      else
-      {
-        eastl::rotate(begin(ringSegments), begin(ringSegments) + 1, end(ringSegments));
-      }
+      return segment.allocate(size, alignment);
     }
 
-    HostDeviceSharedMemoryRegion allocate(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, uint32_t size,
-      uint32_t alignment)
-    {
-      HostDeviceSharedMemoryRegion result;
-      for (auto &segment : ringSegments)
-      {
-        result = segment.allocate(size, alignment);
-        if (result)
-        {
-          return result;
-        }
-      }
-
-      // no segment can supply the memory, need to allocate a new segment
-      if (!addSegment(heap, adapter, device, size, {}))
-      {
-        return result;
-      }
-
-      auto &newSegment = ringSegments.back();
-      result = newSegment.allocate(size, alignment);
-      G_ASSERT(static_cast<bool>(result));
-      return result;
-    }
-
-    size_t currentMemorySize() const
-    {
-      return eastl::accumulate(begin(ringSegments), end(ringSegments), 0,
-        [](size_t value, auto &segment) //
-        { return value + segment.getBufferMemorySize(); });
-    }
-
-    bool onMoveSegment(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, ID3D12Resource *buffer,
-      AllocationFlags allocation_flags)
-    {
-      auto ref =
-        eastl::find_if(begin(ringSegments), end(ringSegments), [buffer](auto &segment) { return buffer == segment.getResourcePtr(); });
-      // Only realistic chance is that the segment is already on deletion list
-      if (ref == end(ringSegments))
-        return true;
-      auto temp = eastl::move(*ref);
-      ringSegments.erase(ref);
-      // If it fails there is no space for a new segment in any heap we can use
-      if (!addSegment(heap, adapter, device, temp.getBufferMemorySize(), allocation_flags))
-      {
-        // add the segment we want to remove back to the pool of available segments
-        ringSegments.push_back(eastl::move(temp));
-        return false;
-      }
-      deletedRingSegments.push_back(eastl::move(temp));
-      return true;
-    }
+    size_t currentMemorySize() const { return segment.getBufferMemorySize(); }
 
     void shutdown(HeapType *heap)
     {
-      for (auto &segment : ringSegments)
-      {
-        segment.reset(heap);
-      }
-      ringSegments.clear();
+      heap->recordConstantRingFreed(segment.getBufferMemorySize());
+      segment.reset();
     }
   };
-};
 
-class FramePushRingMemoryProvider : public RingMemoryBase
-{
-  using BaseType = RingMemoryBase;
+  using PushRingMemoryStateWrapper = ContainerMutexWrapper<PushRingMemoryState, OSSpinlock>;
+  PushRingMemoryStateWrapper pushRing;
+  uint32_t largePushThreshold = PushRingMemoryState::default_large_push_threshold;
 
-protected:
-  struct FramePushRingMemoryImplementation
+  struct SetupInfo : BaseType::SetupInfo
   {
-    // using a ring of 16 MiBytes avoids basically any resizes
-    constexpr static uint32_t min_ring_size = 16 * 1024 * 1024;
-    // always keep one segment around
-    constexpr static uint32_t min_active_segments = 1;
-
-    using HeapType = FramePushRingMemoryProvider;
-
-    static void onSegmentAdd(HeapType *heap, ResourceMemory memory, ID3D12Resource *buffer)
-    {
-      heap->updateMemoryRangeUse(memory, PushRingBufferReference{buffer});
-      heap->recordConstantRingAllocated(memory.size());
-    }
-    static void onSegmentRemove(HeapType *heap, size_t size) { heap->recordConstantRingFreed(size); }
-    static bool shouldTrim(HeapType *heap) { return heap->shouldTrimFramePushRingBuffer(); }
+    uint32_t pushRingSize = PushRingMemoryState::default_ring_size;
+    uint32_t largePushThreshold = PushRingMemoryState::default_large_push_threshold;
   };
-
-  ContainerMutexWrapper<RingMemoryState<FramePushRingMemoryImplementation>, OSSpinlock> pushRing;
-
-  bool onMovePushRingBuffer(DXGIAdapter *adapter, ID3D12Device *device, ID3D12Resource *buffer, AllocationFlags allocation_flags)
-  {
-    return pushRing.access()->onMoveSegment(this, adapter, device, buffer, allocation_flags);
-  }
-
 
   void setup(const SetupInfo &info)
   {
     BaseType::setup(info);
-    // The very first allocation is the first const ring buffer. This makes handling in case of memory shortage
-    // simpler, as the very first segment, which we always *need*, is in the very first heap and so has to never
-    // be moved. We only truncate additional ring buffers when possible.
-    pushRing.access()->addSegment(this, info.getAdapter(), info.device, FramePushRingMemoryImplementation::min_ring_size, {});
+    uint32_t ringSize = max(info.pushRingSize, PushRingMemoryState::min_ring_size);
+    largePushThreshold = min(info.largePushThreshold, ringSize / 3);
+    pushRing.access()->create(this, info.device, ringSize);
+    ByteUnits thresholdUnits{largePushThreshold};
+    logdbg("DX12: Push ring large push threshold set to %.2f %s", thresholdUnits.units(), thresholdUnits.name());
   }
 
   void preRecovery()
   {
     pushRing.access()->shutdown(this);
-
     BaseType::preRecovery();
   }
 
   void shutdown()
   {
     pushRing.access()->shutdown(this);
-
     BaseType::shutdown();
   }
 
@@ -355,7 +274,10 @@ protected:
   };
 
 public:
-  HostDeviceSharedMemoryRegion allocatePushMemory(DXGIAdapter *adapter, Device &device, uint32_t size, uint32_t alignment);
+  /// Empty when the request is too large for the ring or the ring is full for this frame. Both are
+  /// ordinary outcomes, the derived provider then serves the request from temporary upload memory.
+  eastl::optional<HostDeviceSharedMemoryRegion> allocatePushMemory(DXGIAdapter *adapter, Device &device, uint32_t size,
+    uint32_t alignment, uint32_t frame_index);
 
   ResourceHeapProperties getPushHeapProperties()
   {
@@ -371,7 +293,7 @@ public:
   void completeFrameExecution(const CompletedFrameExecutionInfo &info, PendingForCompletedFrameData &data)
   {
     BaseType::completeFrameExecution(info, data);
-    pushRing.access()->finishExecution(this, info.historyIndex);
+    pushRing.access()->finishExecution(info.historyIndex);
   }
 
   size_t getFramePushRingMemorySize() { return pushRing.access()->currentMemorySize(); }
@@ -383,348 +305,307 @@ public:
   }
 };
 
-class UploadRingMemoryProvider : public FramePushRingMemoryProvider
+class TemporaryUploadMemoryProvider : public FramePushRingMemoryProvider
 {
   using BaseType = FramePushRingMemoryProvider;
 
 protected:
-  struct UploadRingMemoryImplementation
+  struct PendingForCompletedFrameData : BaseType::PendingForCompletedFrameData
   {
-    // using a ring of 16 MiBytes avoids basically any resizes
-    constexpr static uint32_t min_ring_size = 16 * 1024 * 1024;
-    // always keep one segment around
-    constexpr static uint32_t min_active_segments = 0;
-
-    using HeapType = UploadRingMemoryProvider;
-
-    static void onSegmentAdd(HeapType *heap, ResourceMemory memory, ID3D12Resource *buffer)
+    struct FreeRange
     {
-      heap->updateMemoryRangeUse(memory, UploadRingBufferReference{buffer});
-      heap->recordUploadRingAllocated(memory.size());
-    }
-    static void onSegmentRemove(HeapType *heap, size_t size) { heap->recordUploadRingFreed(size); }
-    static bool shouldTrim(HeapType *heap) { return heap->shouldTrimUploadRingBuffer(); }
+      ID3D12Resource *buffer;
+      ValueRange<uint64_t> range;
+    };
+    dag::Vector<FreeRange> uploadBufferFrees;
+    uint32_t uploadBufferUsage = 0;
+    uint32_t tempUsage = 0;
   };
-  ContainerMutexWrapper<RingMemoryState<UploadRingMemoryImplementation>, OSSpinlock> uploadRing;
 
-  bool onMoveUploadRingBuffer(DXGIAdapter *adapter, ID3D12Device *device, ID3D12Resource *buffer, AllocationFlags allocation_flags)
+  struct TemporaryUploadMemoryInfo
   {
-    return uploadRing.access()->onMoveSegment(this, adapter, device, buffer, allocation_flags);
-  }
+    using HeapType = TemporaryUploadMemoryProvider;
+    static constexpr size_t buffer_block_size = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT * 256;
+    // A new buffer keeps at least this much free, so it stays a usable pool member instead of
+    // holding one region and a remainder nobody can use.
+    static constexpr size_t buffer_min_free_space = 1024 * 1024;
+    static_assert(buffer_min_free_space <= buffer_block_size / 2,
+      "A minimum free space near the block size makes every new buffer take an extra block, whatever the request is");
+    static constexpr uint32_t drop_timeout = FRAME_FRAME_BACKLOG_LENGTH * 50;
+    static constexpr DeviceMemoryClass memory_class = DeviceMemoryClass::TEMPORARY_UPLOAD_BUFFER;
+    static constexpr char debug_name[] = "TempUpload";
 
-  void preRecovery()
-  {
-    uploadRing.access()->shutdown(this);
-
-    BaseType::preRecovery();
-  }
-
-  void shutdown()
-  {
-    uploadRing.access()->shutdown(this);
-
-    BaseType::shutdown();
-  }
-
-public:
-  HostDeviceSharedMemoryRegion allocateUploadRingMemory(DXGIAdapter *adapter, Device &device, uint32_t size, uint32_t alignment);
-
-  void completeFrameRecording(const CompletedFrameRecordingInfo &info)
-  {
-    BaseType::completeFrameRecording(info);
-    uploadRing.access()->finishRecording(info.historyIndex);
-  }
-
-  void completeFrameExecution(const CompletedFrameExecutionInfo &info, PendingForCompletedFrameData &data)
-  {
-    BaseType::completeFrameExecution(info, data);
-    uploadRing.access()->finishExecution(this, info.historyIndex);
-  }
-
-  size_t getUploadRingMemorySize() { return uploadRing.access()->currentMemorySize(); }
-};
-
-class TemporaryMemoryBase : public UploadRingMemoryProvider
-{
-  using BaseType = UploadRingMemoryProvider;
-
-protected:
-  template <typename T>
-  struct TemporaryMemoryState : T
-  {
-    using HeapType = typename T::HeapType;
-    static constexpr DeviceMemoryClass memory_class = T::memory_class;
+    void onSegmentAdd(HeapType *heap, ID3D12Resource *buffer, ResourceMemory mem)
+    {
+      heap->updateMemoryRangeUse(mem, TempUploadBufferReference{buffer});
+      heap->recordTempBufferAllocated(mem.size());
+      poolSize += mem.size();
+    }
+    void onSegmentAddNoLock(HeapType *heap, ID3D12Resource *buffer, ResourceMemory mem)
+    {
+      heap->updateMemoryRangeUseNoLock(mem, TempUploadBufferReference{buffer});
+      heap->recordTempBufferAllocated(mem.size());
+      poolSize += mem.size();
+    }
+    void onSegmentRemove(HeapType *heap, size_t size)
+    {
+      heap->recordTempBufferFreed(size);
+      poolSize -= size;
+    }
 
     struct Buffer : BasicBuffer
     {
-      uint32_t fillSize = 0;
-      uint32_t allocations = 0;
-    };
-    Buffer currentBuffer;
-    Buffer standbyBuffer;
-    size_t nextBufferSize = T::min_buffer_size;
-    size_t currentBufferUse = 0;
-    size_t nextBufferSizeShrinkThreshold = T::min_buffer_size;
-    uint32_t timesSinceUse = 0;
+      // Sorted and coalesced free ranges. Empty means the buffer has no room left.
+      dag::Vector<ValueRange<uint64_t>> freeRanges;
+      uint32_t allocationSize = 0; // total bytes of live (not yet freed) allocations
+      uint32_t timesSinceUse = 0;  // frames in a row with no live allocation
 
-    dag::Vector<Buffer> buffers;
-    dag::Vector<Buffer> deletedBuffers;
+      bool hasAllocations() const { return allocationSize > 0; }
 
-    eastl::pair<HostDeviceSharedMemoryRegion, HRESULT> allocate(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device,
-      size_t size, size_t alignment)
-    {
-      HostDeviceSharedMemoryRegion result;
-      size_t offset = (currentBuffer.fillSize + alignment - 1) & ~(alignment - 1);
-      if (!currentBuffer || (offset + size > currentBuffer.getBufferMemorySize()))
+      /// One free range that covers the buffer. Only valid after create(), which sets the size.
+      void resetAllocations()
       {
-        if (currentBuffer)
+        freeRanges.clear();
+        freeRanges.push_back(make_value_range<uint64_t>(0, getBufferMemorySize()));
+        allocationSize = 0;
+        timesSinceUse = 0;
+      }
+
+      /// Empty when no free range of this buffer fits, the caller then looks at the next buffer or
+      /// creates a new one.
+      eastl::optional<HostDeviceSharedMemoryRegion> allocate(size_t size, size_t alignment)
+      {
+        auto at = free_list_find_smallest_fit_aligned(freeRanges, static_cast<uint64_t>(size), static_cast<uint64_t>(alignment));
+        if (at == end(freeRanges))
         {
-          if (currentBuffer.allocations)
+          return {};
+        }
+        auto range = make_value_range<uint64_t>(align_value<uint64_t>(at->front(), alignment), size);
+        // The alignment padding before 'range' and the remainder after it stay free ranges, so a
+        // caller never has to hand padding back and free() needs only the range it holds.
+        auto p2 = at->cutOut(range);
+        if (at->empty())
+        {
+          if (p2.empty())
           {
-            buffers.push_back(eastl::move(currentBuffer));
-            currentBuffer.setBufferMemory({});
+            freeRanges.erase(at);
           }
           else
           {
-            T::onSegmentRemove(heap, currentBuffer.getBufferMemorySize());
-            currentBuffer.reset(heap);
+            *at = p2;
           }
         }
-
-        if (standbyBuffer && standbyBuffer.getBufferMemorySize() >= size)
+        else if (!p2.empty())
         {
-          currentBuffer = eastl::move(standbyBuffer);
-          standbyBuffer.setBufferMemory({});
+          // move p2 after at, as on 'cutOut' this will always store the first of the two ranges
+          freeRanges.insert(at + 1, p2);
         }
-        else
+        allocationSize += size;
+
+        HostDeviceSharedMemoryRegion result;
+        result.buffer = getResourcePtr();
+        result.memoryLocation = static_cast<ResourceMemoryLocationWithGPUAndCPUAddress>(getBufferMemory()) + range.front();
+        result.range = range;
+        return result;
+      }
+
+      void freeRange(ValueRange<uint64_t> range)
+      {
+        G_ASSERT(allocationSize >= range.size());
+        allocationSize -= range.size();
+        free_list_insert_and_coalesce(freeRanges, range);
+      }
+    };
+
+    dag::Vector<Buffer> buffers;        // every one of these can serve a request
+    dag::Vector<Buffer> deletedBuffers; // drain only, comes from defragmentation
+
+    size_t poolSize = 0;
+    // TODO make configurable
+    size_t poolSizeLimit = 512 * 1024 * 1024;
+    bool reportedOverBudget = false;
+
+    HostDeviceSharedMemoryRegionAllocationResult allocate(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, size_t size,
+      size_t alignment, bool fail_over_budget)
+    {
+      for (auto &buffer : buffers)
+      {
+        if (auto existingSpace = buffer.allocate(size, alignment))
         {
-          if (standbyBuffer)
-          {
-            T::onSegmentRemove(heap, standbyBuffer.getBufferMemorySize());
-            standbyBuffer.reset(heap);
-          }
-          currentBuffer.setBufferMemory({});
-
-          D3D12_RESOURCE_DESC desc;
-          desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-          desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-          desc.Width = max(nextBufferSize, align_value<size_t>(size, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT));
-          desc.Height = 1;
-          desc.DepthOrArraySize = 1;
-          desc.MipLevels = 1;
-          desc.Format = DXGI_FORMAT_UNKNOWN;
-          desc.SampleDesc.Count = 1;
-          desc.SampleDesc.Quality = 0;
-          desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-          desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-          D3D12_RESOURCE_ALLOCATION_INFO allocInfo;
-          allocInfo.SizeInBytes = desc.Width;
-          allocInfo.Alignment = desc.Alignment;
-
-          auto initialState = heap->propertiesToInitialState(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_NONE, memory_class);
-
-          auto memoryProperties = heap->getProperties(D3D12_RESOURCE_FLAG_NONE, memory_class, allocInfo.Alignment);
-
-          HRESULT errorCode = S_OK;
-          auto allocation = heap->allocate(adapter, device, memoryProperties, allocInfo, {}, &errorCode);
-
-          if (!allocation)
-          {
-            return {result, errorCode};
-          }
-
-          errorCode = currentBuffer.create(device, desc, allocation, initialState, true);
-          if (DX12_CHECK_FAIL(errorCode))
-          {
-            heap->free(allocation, false);
-            return {result, errorCode};
-          }
-
-          T::onSegmentAdd(heap, currentBuffer.getResourcePtr(), currentBuffer.getBufferMemory());
+          return *existingSpace;
         }
-        currentBuffer.fillSize = 0;
-        currentBuffer.allocations = 0;
-        offset = 0;
       }
-      result.buffer = currentBuffer.getResourcePtr();
-      result.memoryLocation = static_cast<ResourceMemoryLocationWithGPUAndCPUAddress>(currentBuffer.getBufferMemory()) + offset;
-      auto oldFill = currentBuffer.fillSize;
-      currentBuffer.fillSize = offset + size;
-      currentBuffer.allocations++;
-      currentBufferUse += currentBuffer.fillSize - oldFill;
-      G_ASSERT(result.cpuPointer());
-      G_ASSERT(result.buffer);
-      result.range = make_value_range<uint64_t>(offset, size);
-      return {result, S_OK};
+
+      D3D12_RESOURCE_DESC desc;
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      // The minimum free space keeps a request that is an exact multiple of the block size from
+      // producing a buffer that this one allocation fills completely.
+      desc.Width = align_value<size_t>(size + buffer_min_free_space, buffer_block_size);
+      desc.Height = 1;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1;
+      desc.Format = DXGI_FORMAT_UNKNOWN;
+      desc.SampleDesc.Count = 1;
+      desc.SampleDesc.Quality = 0;
+      desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+      if (fail_over_budget && poolSize + desc.Width > poolSizeLimit)
+      {
+        ByteUnits currentSize{poolSize};
+        ByteUnits sizeLimit{poolSizeLimit};
+        ByteUnits reqSize{desc.Width};
+        logdbg("DX12: Out of temp upload pool, pool %.2f %s of %.2f %s, while trying to grow it by %.2f %s", currentSize.units(),
+          currentSize.name(), sizeLimit.units(), sizeLimit.name(), reqSize.units(), reqSize.name());
+        return unexpected_memory_allocation_error(E_ABORT);
+      }
+
+      D3D12_RESOURCE_ALLOCATION_INFO allocInfo;
+      allocInfo.SizeInBytes = desc.Width;
+      allocInfo.Alignment = desc.Alignment;
+
+      auto initialState = heap->propertiesToInitialState(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_NONE, memory_class);
+
+      auto memoryProperties = heap->getProperties(D3D12_RESOURCE_FLAG_NONE, memory_class, allocInfo.Alignment);
+
+      auto allocationResult = heap->allocate(adapter, device, memoryProperties, allocInfo, {});
+      if (!allocationResult.has_value())
+      {
+        return dag::Unexpected{allocationResult.error()};
+      }
+
+      auto &allocation = allocationResult.value();
+
+      Buffer newBuffer;
+      HRESULT errorCode = newBuffer.create(device, desc, allocation, initialState, true, debug::make_pool_object_name(debug_name));
+      if (DX12_CHECK_FAIL(errorCode))
+      {
+        heap->free(allocation);
+        // TODO: This is not 100% correct, as the allocation for the pool went through but for some
+        // reason the object creation failed, probably should implement something for this properly.
+        // For other objects, like textures we are not reporting any oom error when the object
+        // create did fail.
+        return dag::Unexpected{heap->makeMemoryAllocationError(errorCode, desc.Width, memoryProperties)};
+      }
+
+      onSegmentAdd(heap, newBuffer.getResourcePtr(), newBuffer.getBufferMemory());
+      newBuffer.resetAllocations();
+      buffers.push_back(eastl::move(newBuffer));
+
+      // The buffer is at least size + buffer_min_free_space wide and its one free range starts
+      // at offset 0, which satisfies any alignment, so this request always fits.
+      return *buffers.back().allocate(size, alignment);
     }
 
-    void trim(HeapType *heap)
+    // A timeout of 0 releases every empty buffer, which is what trim wants.
+    void dropEmptyBuffers(HeapType *heap, bool is_heaps_lock_required, uint32_t timeout)
     {
-      if (standbyBuffer)
+      for (auto at = begin(buffers); at != end(buffers);)
       {
-        T::onSegmentRemove(heap, standbyBuffer.getBufferMemorySize());
+        if (at->hasAllocations())
+        {
+          at->timesSinceUse = 0;
+          ++at;
+          continue;
+        }
+        if (++at->timesSinceUse < timeout)
+        {
+          ++at;
+          continue;
+        }
+        onSegmentRemove(heap, at->getBufferMemorySize());
+        at->reset(heap, is_heaps_lock_required);
+        at = buffers.erase(at);
       }
-      standbyBuffer.reset(heap);
     }
 
-    bool shouldSwapStandbyBuffer(Buffer &other)
-    {
-      if (!standbyBuffer)
-      {
-        return true;
-      }
-      if (other.getBufferMemorySize() < nextBufferSize)
-      {
-        return false;
-      }
-      if (other.getBufferMemorySize() > nextBufferSize * 2)
-      {
-        return false;
-      }
-      return standbyBuffer.getBufferMemorySize() < other.getBufferMemorySize();
-    }
+    void trim(HeapType *heap) { dropEmptyBuffers(heap, true, 0); }
 
-    template <typename Handler>
-    static bool free(HeapType *heap, dag::Vector<Buffer> &buffer_set, ID3D12Resource *ref, Handler temp_swap_handler)
+    void trimNoLock(HeapType *heap) { dropEmptyBuffers(heap, false, 0); }
+
+    void free(HeapType *heap, ID3D12Resource *ref, ValueRange<uint64_t> range)
     {
-      auto iter = eastl::find_if(begin(buffer_set), end(buffer_set),
+      auto at = eastl::find_if(begin(buffers), end(buffers),
         [ref](const auto &buf) //
         { return ref == buf.getResourcePtr(); });
-      if (iter == end(buffer_set))
+      if (at != end(buffers))
       {
-        return false;
-      }
-      if (0 == --iter->allocations)
-      {
-        if (!temp_swap_handler(*iter))
-        {
-          T::onSegmentRemove(heap, iter->getBufferMemorySize());
-          iter->reset(heap);
-        }
-        *iter = eastl::move(buffer_set.back());
-        buffer_set.pop_back();
-      }
-      return true;
-    }
-
-    void free(HeapType *heap, ID3D12Resource *ref)
-    {
-      if (ref == currentBuffer.getResourcePtr())
-      {
-        if (!--currentBuffer.allocations)
-        {
-          currentBuffer.fillSize = 0;
-        }
+        // An empty buffer stays in the pool and serves the next request. Only the drop timeout
+        // releases it.
+        at->freeRange(range);
         return;
       }
 
-      if (free(heap, buffers, ref, [this, heap](auto &buffer) {
-            if (!shouldSwapStandbyBuffer(buffer))
-            {
-              return false;
-            }
-            if (standbyBuffer)
-            {
-              T::onSegmentRemove(heap, standbyBuffer.getBufferMemorySize());
-            }
-            standbyBuffer.reset(heap);
-            standbyBuffer = eastl::move(buffer);
-            standbyBuffer.fillSize = 0;
-            return true;
-          }))
+      at = eastl::find_if(begin(deletedBuffers), end(deletedBuffers),
+        [ref](const auto &buf) //
+        { return ref == buf.getResourcePtr(); });
+      if (at != end(deletedBuffers))
       {
-        return;
-      }
-
-      if (free(heap, deletedBuffers, ref, [](auto &) { return false; }))
-      {
+        at->freeRange(range);
+        if (!at->hasAllocations())
+        {
+          onSegmentRemove(heap, at->getBufferMemorySize());
+          at->reset(heap, true);
+          deletedBuffers.erase(at);
+        }
         return;
       }
 
       G_ASSERTF(false, "DX12: Tried to free temp ref %p, but no matching buffer was found", ref);
     }
 
-    void free(HeapType *heap, const dag::Vector<ID3D12Resource *> &list)
+    void free(HeapType *heap, const dag::Vector<PendingForCompletedFrameData::FreeRange> &list)
     {
-      for (auto ref : list)
+      for (auto &entry : list)
       {
-        free(heap, ref);
+        free(heap, entry.buffer, entry.range);
       }
     }
 
     void completeFrameRecording(HeapType *heap)
     {
-      // keep size aligned to min alignment
-      nextBufferSize = max(align_value<size_t>(currentBufferUse, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT),
-        max(T::min_buffer_size, nextBufferSize));
-
-      if (nextBufferSize > nextBufferSizeShrinkThreshold && currentBufferUse < nextBufferSize / 2)
+      if (reportedOverBudget)
       {
-        nextBufferSize /= 2;
+        ByteUnits currentSize{currentMemorySize()};
+        ByteUnits sizeLimit{poolSizeLimit};
+        logdbg("DX12: On frame end temp upload pool over budget report, %.4f %s of %.4f %s.", currentSize.units(), currentSize.name(),
+          sizeLimit.units(), sizeLimit.name());
+        reportedOverBudget = false;
       }
 
-      currentBufferUse = 0;
-      if (!currentBuffer.allocations)
-      {
-        if (++timesSinceUse > T::drop_timeout)
-        {
-          if (standbyBuffer)
-          {
-            T::onSegmentRemove(heap, standbyBuffer.getBufferMemorySize());
-            standbyBuffer.reset(heap);
-          }
-          else if (currentBuffer)
-          {
-            T::onSegmentRemove(heap, currentBuffer.getBufferMemorySize());
-            currentBuffer.reset(heap);
-          }
-          timesSinceUse = 0;
-        }
-      }
+      dropEmptyBuffers(heap, true, drop_timeout);
     }
 
-    size_t currentMemorySize() const
-    {
-      return eastl::accumulate(begin(buffers), end(buffers), currentBuffer.getBufferMemorySize() + standbyBuffer.getBufferMemorySize(),
-        [](size_t value, auto &buffer) { return value + buffer.getBufferMemorySize(); });
-    }
+    size_t currentMemorySize() const { return poolSize; }
 
     void shutdown(HeapType *heap)
     {
+      reportedOverBudget = false;
+
       for (auto &buf : buffers)
       {
-        buf.reset(heap);
+        buf.reset(heap, true);
       }
       buffers.clear();
       for (auto &buf : deletedBuffers)
       {
-        logdbg("DX12: TemporaryMemoryState::shutdown: A deleted buffer was still alive during "
-               "shutdown, %p with %u refs",
-          buf.getResourcePtr(), buf.allocations);
-        buf.reset(heap);
+        logdbg("DX12: TemporaryUploadMemoryInfo::shutdown: A deleted buffer was still alive during "
+               "shutdown, %p with %u bytes still allocated",
+          buf.getResourcePtr(), buf.allocationSize);
+        buf.reset(heap, true);
       }
       deletedBuffers.clear();
-      standbyBuffer.reset(heap);
-      currentBuffer.reset(heap);
-      currentBuffer.fillSize = 0;
-      currentBuffer.allocations = 0;
 
-      currentBufferUse = 0;
+      poolSize = 0;
     }
 
-    bool tryMoveStandbyBuffer(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, ID3D12Resource *buffer,
-      AllocationFlags allocation_flags)
+    eastl::pair<D3D12_RESOURCE_DESC, D3D12_RESOURCE_ALLOCATION_INFO> calculate_temp_buffer_desc_alloc_info(uint64_t size)
     {
-      if (standbyBuffer.getResourcePtr() != buffer)
-      {
-        return false;
-      }
-
       D3D12_RESOURCE_DESC desc;
       desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
       desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-      desc.Width = standbyBuffer.getBufferMemorySize();
+      desc.Width = size;
       desc.Height = 1;
       desc.DepthOrArraySize = 1;
       desc.MipLevels = 1;
@@ -738,93 +619,110 @@ protected:
       allocInfo.SizeInBytes = desc.Width;
       allocInfo.Alignment = desc.Alignment;
 
-      auto initialState = heap->propertiesToInitialState(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_NONE, memory_class);
-
-      auto memoryProperties = heap->getProperties(D3D12_RESOURCE_FLAG_NONE, memory_class, allocInfo.Alignment);
-      auto allocation = heap->allocate(adapter, device, memoryProperties, allocInfo, allocation_flags);
-
-      if (!allocation)
-      {
-        return false;
-      }
-
-      Buffer newStandbyBuffer;
-      const auto errorCode = newStandbyBuffer.create(device, desc, allocation, initialState, true);
-      if (DX12_CHECK_FAIL(errorCode))
-      {
-        heap->free(allocation, allocation_flags.test(AllocationFlag::DEFRAGMENTATION_OPERATION));
-        return false;
-      }
-
-      T::onSegmentRemove(heap, standbyBuffer.getBufferMemorySize());
-      standbyBuffer.reset(heap);
-
-      standbyBuffer = newStandbyBuffer;
-      T::onSegmentAdd(heap, standbyBuffer.getResourcePtr(), standbyBuffer.getBufferMemory());
-      return true;
+      return {desc, allocInfo};
     }
 
     bool tryMoveBuffer(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, Buffer &buffer, AllocationFlags allocation_flags)
     {
-      D3D12_RESOURCE_DESC desc;
-      desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-      desc.Width = buffer.getBufferMemorySize();
-      desc.Height = 1;
-      desc.DepthOrArraySize = 1;
-      desc.MipLevels = 1;
-      desc.Format = DXGI_FORMAT_UNKNOWN;
-      desc.SampleDesc.Count = 1;
-      desc.SampleDesc.Quality = 0;
-      desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-      desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-      D3D12_RESOURCE_ALLOCATION_INFO allocInfo;
-      allocInfo.SizeInBytes = desc.Width;
-      allocInfo.Alignment = desc.Alignment;
+      auto [desc, allocInfo] = calculate_temp_buffer_desc_alloc_info(buffer.getBufferMemorySize());
 
       auto initialState = heap->propertiesToInitialState(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_NONE, memory_class);
 
       auto memoryProperties = heap->getProperties(D3D12_RESOURCE_FLAG_NONE, memory_class, allocInfo.Alignment);
 
-      auto allocation = heap->allocate(adapter, device, memoryProperties, allocInfo, allocation_flags);
+      return heap->allocate(adapter, device, memoryProperties, allocInfo, allocation_flags)
+        .transform([&, this](const ResourceMemory &allocation) {
+          Buffer newBuffer;
+          const auto errorCode =
+            newBuffer.create(device, desc, allocation, initialState, true, debug::make_pool_object_name(debug_name));
+          if (DX12_CHECK_FAIL(errorCode))
+          {
+            heap->free(allocation);
+            return false;
+          }
 
-      if (!allocation)
+          if (buffer.hasAllocations())
+          {
+            deletedBuffers.push_back(eastl::move(buffer));
+          }
+          else
+          {
+            onSegmentRemove(heap, buffer.getBufferMemorySize());
+            buffer.reset(heap, true);
+          }
+
+          buffer = eastl::move(newBuffer);
+          // The replacement stays in 'buffers', so allocations reach it. Without a free list it would
+          // sit there taking no request and receiving no free, and only shutdown would release it.
+          buffer.resetAllocations();
+
+          onSegmentAdd(heap, buffer.getResourcePtr(), buffer.getBufferMemory());
+          return true;
+        })
+        .value_or(false);
+    }
+
+    // A buffer whose memory is already gone must leave the set that serves requests, or a later
+    // request that fits one of its stale free ranges gets a region built on the cleared memory
+    // info. One that still holds live allocations has to stay reachable for its pending frees,
+    // so it drains through deletedBuffers.
+    void dropBufferWithLostMemory(decltype(buffers)::iterator at)
+    {
+      if (at->hasAllocations())
       {
+        deletedBuffers.push_back(eastl::move(*at));
+      }
+      buffers.erase(at);
+    }
+
+    // Takes an iterator, not a reference: this gives the memory back before the replacement
+    // exists, so a failure has to remove the buffer from 'buffers'.
+    bool tryMoveBufferToLocation(HeapType *heap, ID3D12Device *device, decltype(buffers)::iterator at, HeapID heap_id,
+      uint32_t free_range_index)
+    {
+      const auto memory = at->getBufferMemory();
+      heap->freeNoLock(memory, false);
+      onSegmentRemove(heap, memory.size);
+      at->setBufferMemory({});
+
+      auto [desc, allocInfo] = calculate_temp_buffer_desc_alloc_info(memory.size);
+      auto allocationResult = heap->allocateMemoryInPlace(heap_id, free_range_index, allocInfo);
+      if (!allocationResult.has_value())
+      {
+        dropBufferWithLostMemory(at);
         return false;
       }
+      auto &allocation = allocationResult.value();
 
+      auto initialState = heap->propertiesToInitialState(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_NONE, memory_class);
       Buffer newBuffer;
-      const auto errorCode = newBuffer.create(device, desc, allocation, initialState, true);
+      const auto errorCode = newBuffer.create(device, desc, allocation, initialState, true, debug::make_pool_object_name(debug_name));
       if (DX12_CHECK_FAIL(errorCode))
       {
-        heap->free(allocation, allocation_flags.test(AllocationFlag::DEFRAGMENTATION_OPERATION));
+        heap->freeNoLock(allocation, false);
+        dropBufferWithLostMemory(at);
         return false;
       }
 
-      if (buffer.allocations > 0)
+      if (at->hasAllocations())
       {
-        deletedBuffers.push_back(eastl::move(buffer));
+        deletedBuffers.push_back(eastl::move(*at));
       }
       else
       {
-        T::onSegmentRemove(heap, buffer.getBufferMemorySize());
-        buffer.reset(heap);
+        at->reset(heap, false);
       }
 
-      buffer = eastl::move(newBuffer);
+      *at = eastl::move(newBuffer);
+      at->resetAllocations();
 
-      T::onSegmentAdd(heap, buffer.getResourcePtr(), buffer.getBufferMemory());
+      onSegmentAddNoLock(heap, at->getResourcePtr(), at->getBufferMemory());
       return true;
     }
 
     bool tryMoveBuffer(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, ID3D12Resource *buffer,
       AllocationFlags allocation_flags)
     {
-      if (currentBuffer.getResourcePtr() == buffer)
-      {
-        return tryMoveBuffer(heap, adapter, device, currentBuffer, allocation_flags);
-      }
       auto ref = eastl::find_if(begin(buffers), end(buffers),
         [buffer](auto &buf) //
         { return buffer == buf.getResourcePtr(); });
@@ -835,86 +733,98 @@ protected:
       return tryMoveBuffer(heap, adapter, device, *ref, allocation_flags);
     }
 
+    bool tryMoveBufferToLocation(HeapType *heap, ID3D12Device *device, ID3D12Resource *buffer, HeapID heap_id,
+      uint32_t free_range_index)
+    {
+      auto ref = eastl::find_if(begin(buffers), end(buffers),
+        [buffer](auto &buf) //
+        { return buffer == buf.getResourcePtr(); });
+      if (ref == end(buffers))
+      {
+        return false;
+      }
+      return tryMoveBufferToLocation(heap, device, ref, heap_id, free_range_index);
+    }
+
     // This checks if any buffer has still some allocations outstanding to be freed
     bool isAllFree() const
     {
       // This intentionally has no short cuts to report all buffers that are still used
       bool anySeen = false;
-      if (currentBuffer.allocations > 0)
-      {
-        logdbg("DX12: Buffer %p has still %u allocations...", currentBuffer.getResourcePtr(), currentBuffer.allocations);
-        anySeen = true;
-      }
-      // Scan all pending buffers and see if any of them has still some allocations pending.
       for (auto &buffer : buffers)
       {
-        if (buffer.allocations > 0)
+        if (buffer.hasAllocations())
         {
-          logdbg("DX12: Buffer %p has still %u allocations...", buffer.getResourcePtr(), buffer.allocations);
+          logdbg("DX12: Buffer %p has still %u bytes allocated...", buffer.getResourcePtr(), buffer.allocationSize);
+          anySeen = true;
+        }
+      }
+      // A buffer that defragmentation replaced only drains, so it can hold live regions too.
+      for (auto &buffer : deletedBuffers)
+      {
+        if (buffer.hasAllocations())
+        {
+          logdbg("DX12: Deleted buffer %p has still %u bytes allocated...", buffer.getResourcePtr(), buffer.allocationSize);
           anySeen = true;
         }
       }
       return !anySeen;
     }
   };
-};
 
-class TemporaryUploadMemoryProvider : public TemporaryMemoryBase
-{
-  using BaseType = TemporaryMemoryBase;
+  using TempMemoryStateWrapper = ContainerMutexWrapper<TemporaryUploadMemoryInfo, OSSpinlock>;
+  TempMemoryStateWrapper tempBuffer;
 
-protected:
-  struct PendingForCompletedFrameData : BaseType::PendingForCompletedFrameData
+  // Push fallback memory has frame lifetime, frees are handed to a frame slot only at completeFrameRecording
+  using PushFallbackFreesWrapper = ContainerMutexWrapper<dag::Vector<PendingForCompletedFrameData::FreeRange>, OSSpinlock>;
+  PushFallbackFreesWrapper pushFallbackFrees;
+
+  static void record_temporary_free(PendingForCompletedFrameData &data, const PendingForCompletedFrameData::FreeRange &entry,
+    uint32_t &usage)
   {
-    dag::Vector<ID3D12Resource *> uploadBufferRefs;
-    uint32_t uploadBufferUsage = 0;
-    uint32_t tempUsage = 0;
-  };
+    data.uploadBufferFrees.push_back(entry);
+    usage += static_cast<uint32_t>(entry.range.size());
+  }
 
-  struct TemporaryUploadMemoryImeplementation
+  void recordPushFallbackFree(ID3D12Resource *buffer, ValueRange<uint64_t> range)
   {
-    // never have less than one mibyte
-    static constexpr size_t min_buffer_size = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT * 16;
-    static constexpr uint32_t drop_timeout = FRAME_FRAME_BACKLOG_LENGTH * 256;
-    static constexpr DeviceMemoryClass memory_class = DeviceMemoryClass::TEMPORARY_UPLOAD_BUFFER;
+    pushFallbackFrees.access()->push_back({buffer, range});
+  }
 
-    using HeapType = TemporaryUploadMemoryProvider;
-
-    static void onSegmentAdd(HeapType *heap, ID3D12Resource *buffer, ResourceMemory mem)
+  void flushPushFallbackFreesToRecordingFrame()
+  {
+    dag::Vector<PendingForCompletedFrameData::FreeRange> frees;
     {
-      heap->updateMemoryRangeUse(mem, TempUploadBufferReference{buffer});
-      heap->recordTempBufferAllocated(mem.size());
+      auto access = pushFallbackFrees.access();
+      if (access->empty())
+      {
+        return;
+      }
+      frees.swap(*access);
     }
+    accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>([&frees](auto &data) {
+      for (auto &entry : frees)
+      {
+        record_temporary_free(data, entry, data.tempUsage);
+      }
+    });
+  }
 
-    static void onSegmentRemove(HeapType *heap, size_t size) { heap->recordTempBufferFreed(size); }
-  };
-
-  struct TemporaryUploadMemoryInfo : TemporaryMemoryState<TemporaryUploadMemoryImeplementation>
+  void freeTemporaryRanges(dag::Vector<PendingForCompletedFrameData::FreeRange> &list)
   {
-    using BaseType = TemporaryMemoryState<TemporaryUploadMemoryImeplementation>;
+    eastl::sort(begin(list), end(list), [](const auto &a, const auto &b) { return a.buffer < b.buffer; });
+    tempBuffer.access()->free(this, list);
+    list.clear();
+  }
 
-    uint32_t uploadBufferUsage = 0;
-    // TODO make configurable
-    uint32_t uploadBufferUsageLimit = 256 * 1024 * 1024;
-    uint32_t tempUsage = 0;
-    // TODO make configurable
-    uint32_t tempUsageLimit = 256 << 20;
-
-    void shutdown(TemporaryUploadMemoryProvider *heap)
+  void freePushFallbackFreesNow()
+  {
+    auto access = pushFallbackFrees.access();
+    if (access->empty())
     {
-      uploadBufferUsage = 0;
-      tempUsage = 0;
-
-      BaseType::shutdown(heap);
+      return;
     }
-  };
-
-  ContainerMutexWrapper<TemporaryUploadMemoryInfo, OSSpinlock> tempBuffer;
-
-  bool tryMoveTemporaryUploadStandbyBuffer(DXGIAdapter *adapter, ID3D12Device *device, ID3D12Resource *buffer,
-    AllocationFlags allocation_flags)
-  {
-    return tempBuffer.access()->tryMoveStandbyBuffer(this, adapter, device, buffer, allocation_flags);
+    freeTemporaryRanges(*access);
   }
 
   bool tryMoveTemporaryUploadBuffer(DXGIAdapter *adapter, ID3D12Device *device, ID3D12Resource *buffer,
@@ -925,15 +835,7 @@ protected:
 
   void completeFrameExecution(const CompletedFrameExecutionInfo &info, PendingForCompletedFrameData &data)
   {
-    // sort to make free a bit faster by doing one buffer at a time
-    eastl::sort(begin(data.uploadBufferRefs), end(data.uploadBufferRefs));
-    {
-      auto tempBufferAccess = tempBuffer.access();
-      tempBufferAccess->free(this, data.uploadBufferRefs);
-      tempBufferAccess->uploadBufferUsage -= data.uploadBufferUsage;
-      tempBufferAccess->tempUsage -= data.tempUsage;
-    }
-    data.uploadBufferRefs.clear();
+    freeTemporaryRanges(data.uploadBufferFrees);
     data.uploadBufferUsage = 0;
     data.tempUsage = 0;
 
@@ -942,6 +844,7 @@ protected:
 
   void preRecovery()
   {
+    freePushFallbackFreesNow();
     tempBuffer.access()->shutdown(this);
 
     BaseType::preRecovery();
@@ -949,6 +852,7 @@ protected:
 
   void shutdown()
   {
+    freePushFallbackFreesNow();
     tempBuffer.access()->shutdown(this);
 
     BaseType::shutdown();
@@ -958,81 +862,74 @@ protected:
   bool allTemporaryUsesCompleted(T visitable)
   {
     bool baseCompleted = BaseType::allTemporaryUsesCompleted(visitable);
-    bool hasComplted = true;
-    {
-      hasComplted = tempBuffer.access()->isAllFree();
-    }
+    freePushFallbackFreesNow();
+    bool hasComplted = tempBuffer.access()->isAllFree();
     if (!hasComplted)
     {
-      auto tempBufferAccess = tempBuffer.access();
-      visitable([this, &tempBufferAccess](PendingForCompletedFrameData &data) {
-        if (data.uploadBufferRefs.empty())
+      visitable([this](PendingForCompletedFrameData &data) {
+        if (data.uploadBufferFrees.empty())
         {
           return;
         }
-        eastl::sort(begin(data.uploadBufferRefs), end(data.uploadBufferRefs));
-        {
-          tempBufferAccess->free(this, data.uploadBufferRefs);
-          tempBufferAccess->uploadBufferUsage -= data.uploadBufferUsage;
-          tempBufferAccess->tempUsage -= data.tempUsage;
-        }
-        data.uploadBufferRefs.clear();
+        freeTemporaryRanges(data.uploadBufferFrees);
         data.uploadBufferUsage = 0;
         data.tempUsage = 0;
       });
-      hasComplted = tempBufferAccess->isAllFree();
+      hasComplted = tempBuffer.access()->isAllFree();
     }
     return baseCompleted && hasComplted;
   }
 
 public:
-  HostDeviceSharedMemoryRegion tryAllocateTempUpload(DXGIAdapter *adapter, ID3D12Device *device, size_t size, size_t alignment,
-    bool &should_flush, HRESULT errorCode)
+  HostDeviceSharedMemoryRegionAllocationResult tryAllocateTempUpload(DXGIAdapter *adapter, ID3D12Device *device, size_t size,
+    size_t alignment, bool &should_flush)
   {
-    HostDeviceSharedMemoryRegion result;
     auto tempBufferAccess = tempBuffer.access();
-    eastl::tie(result, errorCode) = tempBufferAccess->allocate(this, adapter, device, size, alignment);
-    if (!result)
-    {
-      ByteUnits reqSize{size};
-      logdbg("TemporaryUploadMemoryProvider::allocateTempUpload: Allocation failed, let's trim "
-             "heaps and try again. Size: %.2f %s, Error code: 0x%08X",
-        reqSize.units(), reqSize.name(), GetLastError());
-      tempBufferAccess->trim(this);
-      eastl::tie(result, errorCode) = tempBufferAccess->allocate(this, adapter, device, size, alignment);
-    }
-    tempBufferAccess->tempUsage += result.range.size();
-    should_flush = tempBufferAccess->tempUsage > tempBufferAccess->tempUsageLimit;
+    return tempBufferAccess->allocate(this, adapter, device, size, alignment, false)
+      .or_else([&, this](auto) {
+        ByteUnits reqSize{size};
+        logdbg("TemporaryUploadMemoryProvider::allocateTempUpload: Allocation failed, let's trim "
+               "heaps and try again. Size: %.2f %s, Error code: 0x%08X",
+          reqSize.units(), reqSize.name(), GetLastError());
+        tempBufferAccess->trim(this);
+        return tempBufferAccess->allocate(this, adapter, device, size, alignment, false);
+      })
+      .and_then([&](auto &&value) -> HostDeviceSharedMemoryRegionAllocationResult {
+        const size_t poolSize = tempBufferAccess->currentMemorySize();
+        should_flush = poolSize > tempBufferAccess->poolSizeLimit;
 
-    if (should_flush)
-    {
-      ByteUnits currentUsage{tempBufferAccess->tempUsage};
-      ByteUnits usageLimit{tempBufferAccess->tempUsageLimit};
-      ByteUnits reqSize{size};
-      logdbg("DX12: Out of temp upload pool budget, usage %.2f %s of %.2f %s, while allocating %.2f %s, flushing.",
-        currentUsage.units(), currentUsage.name(), usageLimit.units(), usageLimit.name(), reqSize.units(), reqSize.name());
-    }
-    return result;
+        if (should_flush && !tempBufferAccess->reportedOverBudget)
+        {
+          ByteUnits currentSize{poolSize};
+          ByteUnits sizeLimit{tempBufferAccess->poolSizeLimit};
+          ByteUnits reqSize{size};
+          logdbg("DX12: Out of temp upload pool budget, pool %.2f %s of %.2f %s, while allocating %.2f %s, requesting flush.",
+            currentSize.units(), currentSize.name(), sizeLimit.units(), sizeLimit.name(), reqSize.units(), reqSize.name());
+          tempBufferAccess->reportedOverBudget = true;
+        }
+        return eastl::move(value);
+      });
   }
 
-  HostDeviceSharedMemoryRegion allocateTempUpload(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment,
+  // Large push allocations (> 2 MiB) are redirected to temporary upload memory to avoid bloating the push ring.
+  // The temporary memory is automatically recorded for frame-completion cleanup.
+  HostDeviceSharedMemoryRegionAllocationResult allocatePushMemory(DXGIAdapter *adapter, Device &device, uint32_t size,
+    uint32_t alignment, uint32_t frame_index);
+
+  HostDeviceSharedMemoryRegionAllocationResult allocateTempUpload(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment,
     bool &should_flush);
 
-  HostDeviceSharedMemoryRegion allocateTempUploadForUploadBuffer(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment);
+  HostDeviceSharedMemoryRegionAllocationResult allocateTempUploadForUploadBuffer(DXGIAdapter *adapter, Device &device, size_t size,
+    size_t alignment);
 
-  HostDeviceSharedMemoryRegion tryAllocateTempUploadForUploadBuffer(DXGIAdapter *adapter, ID3D12Device *device, size_t size,
-    size_t alignment, HRESULT errorCode);
+  HostDeviceSharedMemoryRegionAllocationResult tryAllocateTempUploadForUploadBuffer(DXGIAdapter *adapter, ID3D12Device *device,
+    size_t size, size_t alignment);
 
   void completeFrameRecording(const CompletedFrameRecordingInfo &info)
   {
+    flushPushFallbackFreesToRecordingFrame();
     tempBuffer.access()->completeFrameRecording(this);
     BaseType::completeFrameRecording(info);
-  }
-
-  void setTempBufferShrinkThresholdSize(size_t size)
-  {
-    auto tempBufferAccess = tempBuffer.access();
-    tempBufferAccess->nextBufferSizeShrinkThreshold = max(size, tempBufferAccess->min_buffer_size);
   }
 
   size_t getTemporaryUploadMemorySize() { return tempBuffer.access()->currentMemorySize(); }
@@ -1041,10 +938,8 @@ public:
   {
     if (HostDeviceSharedMemoryRegion::Source::TEMPORARY == mem.source)
     {
-      accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>([buffer = mem.buffer, size = mem.range.size()](auto &data) {
-        data.uploadBufferRefs.push_back(buffer);
-        data.tempUsage += size;
-      });
+      accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>(
+        [buffer = mem.buffer, range = mem.range](auto &data) { record_temporary_free(data, {buffer, range}, data.tempUsage); });
     }
     else
     {
@@ -1055,10 +950,8 @@ public:
   void freeHostDeviceSharedMemoryRegionForUploadBufferOnFrameCompletion(HostDeviceSharedMemoryRegion mem)
   {
     G_ASSERT(HostDeviceSharedMemoryRegion::Source::TEMPORARY == mem.source);
-    accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>([buffer = mem.buffer, size = mem.range.size()](auto &data) {
-      data.uploadBufferRefs.push_back(buffer);
-      data.uploadBufferUsage += size;
-    });
+    accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>(
+      [buffer = mem.buffer, range = mem.range](auto &data) { record_temporary_free(data, {buffer, range}, data.uploadBufferUsage); });
   }
 };
 
@@ -1079,7 +972,9 @@ protected:
     {
       dag::Vector<ValueRange<uint64_t>> freeRanges;
 
-      HostDeviceSharedMemoryRegion allocate(size_t size, size_t alignment)
+      /// Empty when no free range of this buffer fits, the caller then looks at the next buffer or
+      /// creates a new one.
+      eastl::optional<HostDeviceSharedMemoryRegion> allocate(size_t size, size_t alignment)
       {
         HostDeviceSharedMemoryRegion result;
         auto at = free_list_find_smallest_fit_aligned(freeRanges, size, alignment);
@@ -1108,8 +1003,9 @@ protected:
           result.memoryLocation = static_cast<ResourceMemoryLocationWithGPUAndCPUAddress>(bufferMemory) + range.front();
           result.range = range;
           result.source = source_type;
+          return result;
         }
-        return result;
+        return {};
       }
       bool free(ValueRange<uint64_t> range)
       {
@@ -1131,22 +1027,22 @@ protected:
         if (heapRef->free(range))
         {
           T::onSegmentRemove(heap, heapRef->getBufferMemorySize());
-          heapRef->reset(heap);
+          heapRef->reset(heap, true);
 
           buffers.erase(heapRef);
         }
       }
     }
 
-    HostDeviceSharedMemoryRegion allocate(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, size_t size, size_t alignment)
+    HostDeviceSharedMemoryRegionAllocationResult allocate(HeapType *heap, DXGIAdapter *adapter, ID3D12Device *device, size_t size,
+      size_t alignment)
     {
-      HostDeviceSharedMemoryRegion result;
       for (auto &buffer : buffers)
       {
-        auto result = buffer.allocate(size, alignment);
-        if (result)
+        auto existingSpace = buffer.allocate(size, alignment);
+        if (existingSpace)
         {
-          return result;
+          return *existingSpace;
         }
       }
 
@@ -1173,34 +1069,40 @@ protected:
 
       auto memoryProperties = heap->getProperties(D3D12_RESOURCE_FLAG_NONE, memory_class, allocInfo.Alignment);
 
-      auto allocation = heap->allocate(adapter, device, memoryProperties, allocInfo, {});
+      auto allocationResult = heap->allocate(adapter, device, memoryProperties, allocInfo, {});
 
-      if (!allocation)
+      if (!allocationResult.has_value())
       {
-        return result;
+        return dag::Unexpected{allocationResult.error()};
       }
 
-      auto errorCode = newHeap.create(device, desc, allocation, initialState, true);
+      auto &allocation = allocationResult.value();
+
+      auto errorCode = newHeap.create(device, desc, allocation, initialState, true, debug::make_pool_object_name(T::debug_name));
       if (DX12_CHECK_FAIL(errorCode))
       {
-        heap->free(allocation, false);
-        return result;
+        heap->free(allocation);
+        return dag::Unexpected{heap->makeMemoryAllocationError(errorCode, desc.Width, memoryProperties)};
       }
 
       T::onSegmentAdd(heap, newHeap.getBufferMemory(), newHeap.getResourcePtr());
 
       newHeap.freeRanges.push_back(make_value_range(0ull, desc.Width));
-      result = newHeap.allocate(size, alignment);
-      G_ASSERT(static_cast<bool>(result));
+      auto result = newHeap.allocate(size, alignment);
+      G_ASSERT(result.has_value());
       buffers.push_back(eastl::move(newHeap));
-      return result;
+      if (!result)
+      {
+        return unexpected_memory_allocation_error(E_FAIL);
+      }
+      return *result;
     }
 
     void shutdown(HeapType *heap)
     {
       for (auto &buffer : buffers)
       {
-        buffer.reset(heap);
+        buffer.reset(heap, true);
       }
       buffers.clear();
     }
@@ -1230,11 +1132,17 @@ protected:
     static constexpr HostDeviceSharedMemoryRegion::Source source_type = HostDeviceSharedMemoryRegion::Source::PERSISTENT_UPLOAD;
     static constexpr size_t buffer_alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT * 256;
     static constexpr DeviceMemoryClass memory_class = DeviceMemoryClass::HOST_RESIDENT_HOST_WRITE_ONLY_BUFFER;
+    static constexpr char debug_name[] = "PersistentUpload";
 
     static void onSegmentRemove(HeapType *heap, size_t size) { heap->recordPersistentUploadBufferFreed(size); }
     static void onSegmentAdd(HeapType *heap, ResourceMemory memory, ID3D12Resource *buffer)
     {
       heap->updateMemoryRangeUse(memory, PersistentUploadBufferReference{buffer});
+      heap->recordPersistentUploadBufferAllocated(memory.size());
+    }
+    static void onSegmentAddNoLock(HeapType *heap, ResourceMemory memory, ID3D12Resource *buffer)
+    {
+      heap->updateMemoryRangeUseNoLock(memory, PersistentUploadBufferReference{buffer});
       heap->recordPersistentUploadBufferAllocated(memory.size());
     }
   };
@@ -1271,7 +1179,8 @@ protected:
   }
 
 public:
-  HostDeviceSharedMemoryRegion allocatePersistentUploadMemory(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment);
+  HostDeviceSharedMemoryRegionAllocationResult allocatePersistentUploadMemory(DXGIAdapter *adapter, Device &device, size_t size,
+    size_t alignment);
 
   size_t getPersistentUploadMemorySize() { return uploadMemory.access()->currentMemorySize(); }
 
@@ -1304,11 +1213,17 @@ protected:
     static constexpr HostDeviceSharedMemoryRegion::Source source_type = HostDeviceSharedMemoryRegion::Source::PERSISTENT_READ_BACK;
     static constexpr size_t buffer_alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT * 16;
     static constexpr DeviceMemoryClass memory_class = DeviceMemoryClass::READ_BACK_BUFFER;
+    static constexpr char debug_name[] = "PersistentReadBack";
 
     static void onSegmentRemove(HeapType *heap, size_t size) { heap->recordPersistentReadBackBufferFreed(size); }
     static void onSegmentAdd(HeapType *heap, ResourceMemory memory, ID3D12Resource *buffer)
     {
       heap->updateMemoryRangeUse(memory, PersistentReadBackBufferReference{buffer});
+      heap->recordPersistentReadBackBufferAllocated(memory.size());
+    }
+    static void onSegmentAddNoLock(HeapType *heap, ResourceMemory memory, ID3D12Resource *buffer)
+    {
+      heap->updateMemoryRangeUseNoLock(memory, PersistentReadBackBufferReference{buffer});
       heap->recordPersistentReadBackBufferAllocated(memory.size());
     }
   };
@@ -1346,7 +1261,8 @@ protected:
   }
 
 public:
-  HostDeviceSharedMemoryRegion allocatePersistentReadBack(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment);
+  HostDeviceSharedMemoryRegionAllocationResult allocatePersistentReadBack(DXGIAdapter *adapter, Device &device, size_t size,
+    size_t alignment);
 
   size_t getPersistentReadBackMemorySize() { return readBackMemory.access()->currentMemorySize(); }
 
@@ -1379,11 +1295,17 @@ protected:
     static constexpr HostDeviceSharedMemoryRegion::Source source_type = HostDeviceSharedMemoryRegion::Source::PERSISTENT_BIDIRECTIONAL;
     static constexpr size_t buffer_alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT * 128;
     static constexpr DeviceMemoryClass memory_class = DeviceMemoryClass::BIDIRECTIONAL_BUFFER;
+    static constexpr char debug_name[] = "PersistentBidirectional";
 
     static void onSegmentRemove(HeapType *heap, size_t size) { heap->recordPersistentBidirectionalBufferFreed(size); }
     static void onSegmentAdd(HeapType *heap, ResourceMemory memory, ID3D12Resource *buffer)
     {
       heap->updateMemoryRangeUse(memory, PersistentBidirectionalBufferReference{buffer});
+      heap->recordPersistentBidirectionalBufferAllocated(memory.size());
+    }
+    static void onSegmentAddNoLock(HeapType *heap, ResourceMemory memory, ID3D12Resource *buffer)
+    {
+      heap->updateMemoryRangeUseNoLock(memory, PersistentBidirectionalBufferReference{buffer});
       heap->recordPersistentBidirectionalBufferAllocated(memory.size());
     }
   };
@@ -1421,7 +1343,8 @@ protected:
   }
 
 public:
-  HostDeviceSharedMemoryRegion allocatePersistentBidirectional(DXGIAdapter *adapter, Device &device, size_t size, size_t alignment);
+  HostDeviceSharedMemoryRegionAllocationResult allocatePersistentBidirectional(DXGIAdapter *adapter, Device &device, size_t size,
+    size_t alignment);
 
   size_t getPersistentBidirectionalMemorySize() { return bidirectionalMemory.access()->currentMemorySize(); }
 

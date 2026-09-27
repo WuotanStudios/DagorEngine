@@ -40,9 +40,7 @@ static unsigned real2int10(real a)
   if (ret >= 0)
     return ((unsigned)ret) & ((1 << 9) - 1);
   else
-  {
-    return ((unsigned)ret & ((1 << 9) - 1)) | (1 << 10);
-  }
+    return ((unsigned)ret & ((1 << 9) - 1)) | (1 << 9);
 }
 
 static unsigned real2uint(real a) { return real2int(a < 0 ? 0 : a); }
@@ -63,6 +61,9 @@ bool can_combine_elems(const ShaderMeshData::RElem &left, const ShaderMeshData::
     return false;
 
   if (left.flags != right.flags)
+    return false;
+
+  if (!left.vertexData->allowVertexMerge || !right.vertexData->allowVertexMerge)
     return false;
 
   if (!left.vertexData->checkChannels(right.vertexData->vDesc.data(), right.vertexData->vDesc.size()))
@@ -204,6 +205,18 @@ void GlobalVertexDataSrc::attachData(const GlobalVertexDataSrc &other_data)
   partCount += other_data.partCount;
 }
 
+dag::Span<uint8_t> GlobalVertexDataSrc::attachRawData(int size_bytes)
+{
+  int start = numv * stride;
+  G_ASSERT(data_size(vData) == start);
+  int num = (size_bytes + stride - 1) / stride;
+  vData.resize(vData.size() + num * stride);
+  numv += num;
+  baseVertSegCount++;
+  allowVertexMerge = false;
+  return make_span(&vData[start], num * stride);
+}
+
 void GlobalVertexDataSrc::attachDataPart(const GlobalVertexDataSrc &other_data, int _sv, int _numv, int _si, int _numf, int num_parts)
 {
   // add vertices
@@ -262,6 +275,32 @@ void GlobalVertexDataSrc::attachDataPart(const GlobalVertexDataSrc &other_data, 
 //
 
 
+int VoxelSurfaceSrc::zstdCompressionLevel = 18;
+
+VoxelSurfaceSrc::VoxelSurfaceSrc() : rgbaBlocks(tmpmem), normBlocks(tmpmem) {}
+VoxelSurfaceSrc::~VoxelSurfaceSrc() {}
+
+int VoxelSurfaceSrc::save(mkbindump::BinDumpSaveCB &cwr)
+{
+  int start = cwr.tell();
+  cwr.writeInt32e(rgbaBlocks.size());
+  cwr.writeInt32e(normBlocks.size());
+
+  Tab<uint8_t> buffer(tmpmem);
+
+  buffer.resize(zstd_compress_bound(data_size(rgbaBlocks)));
+  int size = zstd_compress(buffer.data(), buffer.size(), rgbaBlocks.data(), data_size(rgbaBlocks), zstdCompressionLevel);
+  cwr.writeInt32e(size);
+  cwr.writeRaw(buffer.data(), size);
+
+  buffer.resize(zstd_compress_bound(data_size(normBlocks)));
+  size = zstd_compress(buffer.data(), buffer.size(), normBlocks.data(), data_size(normBlocks), zstdCompressionLevel);
+  cwr.writeRaw(buffer.data(), size);
+
+  return cwr.tell() - start;
+}
+
+
 /*********************************
  *
  * class ShaderMeshData
@@ -306,10 +345,17 @@ ShaderMeshData::ShaderMeshData() { memset(stageEndElemIdx, 0, sizeof(stageEndEle
 ShaderMeshData::~ShaderMeshData() {}
 
 
+// build-site context for the UV range error report
+static int g_uv_err_lod = -1;
+static const char *g_uv_err_node = nullptr;
+
 // build meshdata
 bool ShaderMeshData::build(class Mesh &m, ShaderMaterial **mats, int nummats, IColorConvert &color_convert, bool allow_32_bit,
-  int node_id)
+  int node_id, int uv_err_lod, const char *uv_err_node)
 {
+  g_uv_err_lod = uv_err_lod;
+  g_uv_err_node = uv_err_node;
+
   // Calculate dU, dV (tangent, binormal).
 
   int chIdDu = m.find_extra_channel(SCUSAGE_EXTRA, 50);
@@ -498,6 +544,10 @@ static const char *type_name(int i)
 #undef SWITCH_NAME
 
 static int pos_chan_cvt_err = 0, chan_cvt_err = 0;
+static int uv_range_err_count = 0;
+static float uv_range_max_abs = 0.f;
+static bool g_uv_validate = false;
+static Tab<ShaderMeshData::UvRangeError> uv_range_errors;
 
 static __forceinline int convert_vertex(uint8_t *p, Color4 val, uint32_t mod, uint32_t type, const Color4 &mul, const Color4 &ofs,
   int node_idUse)
@@ -714,6 +764,19 @@ struct ChannelVertices
   uint32_t uniqueVertsCount() const { return uint32_t(encodedData.size() / encodedSize); }
 };
 
+// aggregate the offending vert into the (lod, node, tc channel) entry of the report
+static void add_uv_range_error(const char *node, int lod, int channel, float max_abs)
+{
+  for (ShaderMeshData::UvRangeError &e : uv_range_errors)
+    if (e.lod == lod && e.channel == channel && e.node == (node ? node : ""))
+    {
+      e.count++;
+      e.maxAbs = eastl::max(e.maxAbs, max_abs);
+      return;
+    }
+  uv_range_errors.push_back(ShaderMeshData::UvRangeError{eastl::string(node ? node : ""), lod, channel, 1, max_abs});
+}
+
 static void process_channel_data(Mesh &m, ShaderMeshData::RElem &re, const ShaderChannelId *desc, int channel, int node_id,
   int sc_type, int &count, int &type, const uint8_t *&vert_data, size_t &vert_stride, const uint8_t *&face_data, size_t &face_stride,
   int &node_id_use, bool &color_convert, bool need_face = true)
@@ -768,6 +831,27 @@ static void process_channel_data(Mesh &m, ShaderMeshData::RElem &re, const Shade
     case SCUSAGE_TC:
       if (desc[channel].ui < 0 || desc[channel].ui >= NUMMESHTCH)
         DAG_FATAL("%s: chan[%d]: unknown tc channel %d", re.mat->getShaderClassName(), channel, desc[channel].ui);
+      // Enormous or non-finite UVs break rendering
+      if (g_uv_validate)
+      {
+        for (Point2 &uv : m.tvert[desc[channel].ui])
+        {
+          const bool brokenX = !(fabsf(uv.x) <= 1e4f); // inverted to check for NaNs
+          const bool brokenY = !(fabsf(uv.y) <= 1e4f);
+          if (DAGOR_UNLIKELY(brokenX || brokenY))
+          {
+            float finiteX = check_finite(uv.x) ? uv.x : eastl::numeric_limits<float>::max();
+            float finiteY = check_finite(uv.y) ? uv.y : eastl::numeric_limits<float>::max();
+            add_uv_range_error(g_uv_err_node, g_uv_err_lod, desc[channel].ui, eastl::max(fabsf(finiteX), fabsf(finiteY)));
+            if (brokenX)
+              uv.x = eastl::clamp(finiteX, 0.f, 1.f);
+            if (brokenY)
+              uv.y = eastl::clamp(finiteY, 0.f, 1.f);
+            uv_range_err_count++;
+            uv_range_max_abs = eastl::max(uv_range_max_abs, eastl::max(fabsf(finiteX), fabsf(finiteY)));
+          }
+        }
+      }
       count = m.getTVert(desc[channel].ui).size();
       type = MeshData::CHT_FLOAT2;
       vert_data = (const uint8_t *)m.getTVert(desc[channel].ui).data();
@@ -804,6 +888,15 @@ static float encode_vertex(const uint8_t *from, uint8_t to[16], int vert_type, i
       val[1] = p.g / 255.0f;
       val[2] = p.b / 255.0f;
       val[3] = p.a / 255.0f;
+    }
+    break;
+    case MeshData::CHT_SHORT4:
+    {
+      const BoneIndices &b = *(BoneIndices *)from;
+      val[0] = b.x;
+      val[1] = b.y;
+      val[2] = b.z;
+      val[3] = b.w;
     }
     break;
     default: G_ASSERT(0);
@@ -1204,7 +1297,8 @@ static float calculateTextureScale(Mesh &m, int startf, int numf, const ShaderCh
   {
     if (!indicesTc[tc_channel].size() || !tc[tc_channel].size())
       continue;
-    for (int face = startf; face < numf; face++)
+    const int endf = startf + numf;
+    for (int face = startf; face < endf; face++)
     {
       const Face &fp = indicesPos[face];
       const TFace &ft = indicesTc[tc_channel][face];
@@ -1250,6 +1344,17 @@ static float calculateTextureScale(Mesh &m, int startf, int numf, const ShaderCh
 void ShaderMeshData::reset_channel_cvt_errors() { pos_chan_cvt_err = chan_cvt_err = 0; }
 int ShaderMeshData::get_channel_cvt_errors() { return chan_cvt_err; }
 int ShaderMeshData::get_channel_cvt_critical_errors() { return pos_chan_cvt_err; }
+
+void ShaderMeshData::reset_uv_range_errors()
+{
+  uv_range_err_count = 0;
+  uv_range_max_abs = 0.f;
+  uv_range_errors.clear();
+}
+int ShaderMeshData::get_uv_range_error_count() { return uv_range_err_count; }
+float ShaderMeshData::get_uv_range_max_abs() { return uv_range_max_abs; }
+const Tab<ShaderMeshData::UvRangeError> &ShaderMeshData::get_uv_range_errors() { return uv_range_errors; }
+bool ShaderMeshData::exchange_uv_validation(bool on) { return eastl::exchange(g_uv_validate, on); }
 
 // save
 void ShaderMeshData::RElem::save(mkbindump::BinDumpSaveCB &cwr, ShaderMeshDataSaveCB &mdcb)

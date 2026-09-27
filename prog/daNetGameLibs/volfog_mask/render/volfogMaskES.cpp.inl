@@ -26,7 +26,7 @@ VARS
 
 
   inline bool
-  update_volfog_mask_texture(SharedTexHolder &tex_holder, int tex_size, Point4 bounds, const ecs::FloatList &data)
+  update_volfog_mask_texture(SharedTexWithShaderVar &tex_holder, int tex_size, Point4 bounds, const ecs::FloatList &data)
 {
   if (!data.size())
     return false;
@@ -49,14 +49,13 @@ VARS
     smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
     smpInfo.filter_mode = d3d::FilterMode::Linear;
     ShaderGlobal::set_sampler(get_shader_variable_id("volfog_mask_tex_samplerstate", true), d3d::request_sampler(smpInfo));
-    NodeBasedShaderManager::clearAllCachedResources();
   }
 
   Point2 min_bound = Point2(bounds.x, bounds.y);
   Point2 max_bound = Point2(bounds.z, bounds.w);
   float invX = safeinv(max_bound.x - min_bound.x);
   float invY = safeinv(max_bound.y - min_bound.y);
-  ShaderGlobal::set_color4(world_to_volfog_maskVarId, Color4(invX, invY, -invX * min_bound.x, -invY * min_bound.y));
+  ShaderGlobal::set_float4(world_to_volfog_maskVarId, Color4(invX, invY, -invX * min_bound.x, -invY * min_bound.y));
 
   int pos = 0;
   if (tex_holder.getTex2D())
@@ -74,7 +73,7 @@ VARS
 
 ECS_ON_EVENT(on_appear)
 inline void volfog_mask_appear_es_event_handler(const ecs::Event &,
-  SharedTexHolder &volfog_mask__tex_holder,
+  SharedTexWithShaderVar &volfog_mask__tex_holder,
   int volfog_mask__size,
   bool &volfog_mask__do_update,
   Point4 volfog_mask__bounds,             // minx, minz, maxx, maxz
@@ -95,7 +94,7 @@ inline void volfog_mask_appear_es_event_handler(const ecs::Event &,
 ECS_TAG(render)
 ECS_REQUIRE(eastl::true_type volfog_mask__do_update)
 inline void volfog_mask_render_es(const UpdateStageInfoBeforeRender &stg,
-  SharedTexHolder &volfog_mask__tex_holder,
+  SharedTexWithShaderVar &volfog_mask__tex_holder,
   int volfog_mask__size,
   bool &volfog_mask__do_update,
   Point4 volfog_mask__bounds,             // minx, minz, maxx, maxz

@@ -1,4 +1,6 @@
 
+#define MIN_POSSIBLE_WARP_SIZE 32 // Apple GPUs
+
 #define RWBuffer         RWStructuredBuffer
 
 #define NOP
@@ -37,7 +39,6 @@ struct TextureCubeArraySampler
 //#define WaveReadLaneAt    ReadLane
 #define WaveReadFirstLane WaveReadLaneFirst
 //#define WaveGetLaneIndex
-#define WaveIsHelperLane  WaveIsFirstLane
 #define WaveAllBitOr      WaveActiveBitOr
 #define WaveAllBitAnd     WaveActiveBitAnd
 #define WaveAllSum_F32    WaveActiveSum
@@ -47,3 +48,5 @@ struct TextureCubeArraySampler
 #define WaveAllMin_F32    WaveActiveMin
 #define WaveAllMin_I32    WaveActiveMin
 #define WaveAllMin_U32    WaveActiveMin
+
+#define ACCESS_FORMAT(fmt)

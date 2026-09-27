@@ -5,7 +5,6 @@
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_interop.h"
 #include "daScript/ast/ast_handle.h"
-#include "daScript/ast/ast_typefactory_bind.h"
 #include "daScript/simulate/bind_enum.h"
 #include "dasQUIRREL.h"
 #include "need_dasQUIRREL.h"
@@ -29,7 +28,7 @@ void Module_dasQUIRREL::initFunctions_6() {
 		->args({"v","idx"});
 // from D:\Work\daScript\Modules\dasQuirrel\libquirrel\include\squirrel.h:336:23
 	addExtern< SQRESULT (*)(SQVM *,SQInteger,SQBool) , sq_clear >(*this,lib,"sq_clear",SideEffects::worstDefault,"sq_clear")
-		->args({"v","idx","freemem"})->arg_init(2, make_smart<ExprConstUInt>(1u));
+		->args({"v","idx","freemem"})->arg_init(2, new ExprConstUInt(1u));
 // from D:\Work\daScript\Modules\dasQuirrel\libquirrel\include\squirrel.h:337:23
 	addExtern< SQRESULT (*)(SQVM *,SQInteger) , sq_freeze >(*this,lib,"sq_freeze",SideEffects::worstDefault,"sq_freeze")
 		->args({"v","idx"});
@@ -67,7 +66,7 @@ void Module_dasQUIRREL::initFunctions_6() {
 	addExtern< SQRESULT (*)(SQVM *,SQInteger,tagSQObject *) , sq_getstackobj >(*this,lib,"sq_getstackobj",SideEffects::worstDefault,"sq_getstackobj")
 		->args({"v","idx","po"});
 // from D:\Work\daScript\Modules\dasQuirrel\libquirrel\include\squirrel.h:353:19
-	addExtern< void (*)(SQVM *,tagSQObject) , sq_pushobject >(*this,lib,"sq_pushobject",SideEffects::worstDefault,"sq_pushobject")
+	addExtern< void (*)(SQVM *,const tagSQObject &) , sq_pushobject >(*this,lib,"sq_pushobject",SideEffects::worstDefault,"sq_pushobject")
 		->args({"v","obj"});
 // from D:\Work\daScript\Modules\dasQuirrel\libquirrel\include\squirrel.h:354:19
 	addExtern< void (*)(SQVM *,tagSQObject *) , sq_addref >(*this,lib,"sq_addref",SideEffects::worstDefault,"sq_addref")

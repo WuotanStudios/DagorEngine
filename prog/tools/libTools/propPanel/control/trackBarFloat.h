@@ -1,11 +1,12 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <EASTL/optional.h>
 #include <propPanel/control/propertyControlBase.h>
 #include <propPanel/constants.h>
 #include <propPanel/imguiHelper.h>
 #include <propPanel/immediateFocusLossHandler.h>
-#include "spinEditStandalone.h"
+#include <propPanel/control/spinEditStandalone.h>
 #include "../scopedImguiBeginDisabled.h"
 
 namespace PropPanel
@@ -35,18 +36,7 @@ public:
 
   float getFloatValue() const override { return spinEdit.getValue(); }
 
-  void setFloatValue(float value) override
-  {
-    const float step = spinEdit.getStepValue();
-    const float min = spinEdit.getMinValue();
-    const float max = spinEdit.getMaxValue();
-
-    value = clamp(value, min, max);
-    if (step != 0.0f)
-      value = min + (floorf(0.5f + ((value - min) / step)) * step);
-
-    spinEdit.setValue(value);
-  }
+  void setFloatValue(float value) override { spinEdit.setValue(value); }
 
   void setMinMaxStepValue(float min, float max, float step) override { spinEdit.setMinMaxStepValue(min, max, step); }
 
@@ -61,11 +51,31 @@ public:
 
   void setEnabled(bool enabled) override { controlEnabled = enabled; }
 
+  bool isDefaultValueSet() const override { return defaultValue ? *defaultValue == getFloatValue() : true; }
+
+  void applyDefaultValue() override
+  {
+    if (isDefaultValueSet())
+    {
+      return;
+    }
+
+    if (defaultValue)
+    {
+      spinEdit.setValue(*defaultValue);
+      onWcChange(nullptr);
+    }
+  }
+
+  void setDefaultValue(Variant var) override { defaultValue = var.convert<float>(); }
+
+  const char *getImguiTypeName() const override { return "TrackFloat"; }
+
   void updateImgui() override
   {
     ScopedImguiBeginDisabled scopedDisabled(!controlEnabled);
 
-    ImguiHelper::separateLineLabel(controlCaption);
+    separateLineLabelWithTooltip(controlCaption.begin(), controlCaption.end());
 
     const float remainingWidthAfterTheLabel = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemInnerSpacing.x;
     const float spinEditWidth = ImguiHelper::getDefaultRightSideEditWidth();
@@ -74,18 +84,34 @@ public:
     {
       ImGui::SetNextItemWidth(sliderWidth);
 
-      float value = spinEdit.getValue();
-      const bool changed = controlPower == TRACKBAR_DEFAULT_POWER ? sliderFloat(value) : sliderFloatPower(value);
+      const char *label = "##s";
+      ImguiHelper::deactivateItemIfActiveAndDisabled(label);
 
+      float value = spinEdit.getValue();
+      const bool changed = controlPower == TRACKBAR_DEFAULT_POWER ? sliderFloat(label, value) : sliderFloatPower(label, value);
+      const bool sliderDeactivatedAfterEdit = ImGui::IsItemDeactivatedAfterEdit();
+
+      setImguiTestItemInfo();
       setPreviousImguiControlTooltip();
 
       if (changed)
       {
+        const float step = spinEdit.getStepValue();
+        const float min = spinEdit.getMinValue();
+        const float max = spinEdit.getMaxValue();
+
+        value = clamp(value, min, max);
+        if (step != 0.0f)
+          value = min + (floorf(0.5f + ((value - min) / step)) * step);
+
         // This is here to add stepping. (ImGui currently does not support that. See: https://github.com/ocornut/imgui/issues/1183.)
         setFloatValue(value);
 
         onWcChange(nullptr);
       }
+
+      if (sliderDeactivatedAfterEdit)
+        onWcChangeFinished(nullptr);
 
       ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
       ImGui::SetNextItemWidth(spinEditWidth);
@@ -96,7 +122,7 @@ public:
     }
 
     setFocusToNextImGuiControlIfRequested();
-    spinEdit.updateImgui(*this, &controlTooltip, this);
+    spinEdit.updateImgui(*this, &controlTooltip, this, this, "value");
 
     if (spinEdit.isTextInputFocused())
       set_focused_immediate_focus_loss_handler(this);
@@ -105,18 +131,18 @@ public:
   }
 
 private:
-  void onImmediateFocusLoss() override { spinEdit.sendWcChangeIfVarChanged(*this); }
+  void onImmediateFocusLoss() override { spinEdit.sendWcChangeAndFinishIfVarChanged(*this); }
 
-  bool sliderFloat(float &value)
+  bool sliderFloat(const char *label, float &value)
   {
     pushTrackBarColorOverrides();
     const bool changed =
-      ImGui::SliderFloat("##s", &value, spinEdit.getMinValue(), spinEdit.getMaxValue(), "", ImGuiSliderFlags_NoInput);
+      ImGui::SliderFloat(label, &value, spinEdit.getMinValue(), spinEdit.getMaxValue(), "", ImGuiSliderFlags_NoInput);
     popTrackBarColorOverrides();
     return changed;
   }
 
-  bool sliderFloatPower(float &value)
+  bool sliderFloatPower(const char *label, float &value)
   {
     // As the power parameter no longer can be given to ImGui's SliderFloat, we map our value between 0 and 1 respecting
     // the power parameter, let the slider work normally within the 0..1 range, and then convert the value back.
@@ -126,7 +152,7 @@ private:
     float ratio = min == max ? 0.0f : pow((spinEdit.getValue() - min) / (max - min), 1.0f / controlPower);
 
     pushTrackBarColorOverrides();
-    const bool changed = ImGui::SliderFloat("##s", &ratio, 0.0f, 1.0f, "", ImGuiSliderFlags_NoInput);
+    const bool changed = ImGui::SliderFloat(label, &ratio, 0.0f, 1.0f, "", ImGuiSliderFlags_NoInput);
     popTrackBarColorOverrides();
     if (!changed)
       return false;
@@ -140,6 +166,7 @@ private:
   bool controlEnabled = true;
   const float controlPower;
   SpinEditControlStandalone spinEdit;
+  eastl::optional<float> defaultValue;
 };
 
 } // namespace PropPanel

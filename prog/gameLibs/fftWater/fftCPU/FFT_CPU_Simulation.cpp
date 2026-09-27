@@ -5,6 +5,7 @@
 #include <math/random/dag_random.h>
 #include <debug/dag_debug.h>
 #include "FFT_CPU_Simulation.h"
+#include <fftWater/chopWaterGen.h>
 #include <vecmath/dag_vecMath.h>
 #include <math/dag_hlsl_floatx.h>
 #include "../shaders/fft_spectrum.hlsli"
@@ -309,58 +310,36 @@ void FFTc(unsigned int nn, unsigned int m, float *x)
   }
 }
 
-//   Perform a 2D FFT inplace given a complex 2D array
-//   The size of the array (nx,nx)
-//   FFT2D (non-SSE code) is left here in case we need compatibility with non-SSE CPUs
-void FFT2D(complex *c, int nx)
+static void fft1_and_transpose_2d(complex *c, int nx)
 {
-  int i, j;
-  float tre, tim;
-
   int m = get_log2w(nx);
-  int nn = nx;
 
-  for (j = 0; j < nx; j++)
-  {
-    FFTc(nn, m, (float *)&c[j << m]);
-  }
+  for (int j = 0; j < nx; j++)
+    FFTc(nx, m, (float *)&c[j << m]);
 
-  // 2D matrix transpose
-  for (i = 0; i < nx - 1; i++)
+  for (int i = 0; i < nx - 1; i++)
   {
-    for (j = i + 1; j < nx; j++)
+    for (int j = i + 1; j < nx; j++)
     {
       int ji = ((j << m) + i);
       int ij = ((i << m) + j);
-      tre = c[ji][0];
-      tim = c[ji][1];
+      float tre = c[ji][0];
+      float tim = c[ji][1];
       c[ji][0] = c[ij][0];
       c[ji][1] = c[ij][1];
       c[ij][0] = tre;
       c[ij][1] = tim;
     }
   }
-  // doing 1D FFT for rows
-  for (j = 0; j < nx; j++)
-  {
-    FFTc(nn, m, (float *)&c[j << m]);
-  }
+}
 
-  // 2D matrix transpose
-  for (i = 0; i < nx - 1; i++)
-  {
-    for (j = i + 1; j < nx; j++)
-    {
-      int ji = ((j << m) + i);
-      int ij = ((i << m) + j);
-      tre = c[ji][0];
-      tim = c[ji][1];
-      c[ji][0] = c[ij][0];
-      c[ji][1] = c[ij][1];
-      c[ji][0] = tre;
-      c[ji][1] = tim;
-    }
-  }
+//   Perform a 2D FFT inplace given a complex 2D array
+//   The size of the array (nx,nx)
+//   FFT2D (non-SSE code) is left here in case we need compatibility with non-SSE CPUs
+void FFT2D(complex *c, int nx)
+{
+  fft1_and_transpose_2d(c, nx);
+  fft1_and_transpose_2d(c, nx);
 }
 
 //   Performs a 1D FFT inplace given x- interleaved real/imaginary array of data,
@@ -439,6 +418,8 @@ void FFTcSSE(unsigned int nn, unsigned int m, vec4f *x)
 //   The size of the array (nx,nx)
 void FFT2DSSE(complex *c, int nx)
 {
+  // iv_data is sized for the max FFT resolution; a resolution bump must grow it too
+  G_STATIC_ASSERT((1 << MAX_FFT_RESOLUTION_GAUSS) <= 512);
   vec4f iv_data[512 * 2];
   vec4f shuffledata0;
   vec4f shuffledata1;
@@ -468,8 +449,8 @@ void FFT2DSSE(complex *c, int nx)
       shuffledata0 = v_merge_hw(v_ldu_half(f0), v_ldu_half(f1)); // f0.x,f1.x, f0.y,f1.y
       shuffledata1 = v_merge_hw(v_ldu_half(f2), v_ldu_half(f3)); // f2.x,f3.x, f2.y,f3.y
 
-      iv_data[i * 2] = v_perm_xyXY(shuffledata0, shuffledata1);     // xxxx
-      iv_data[i * 2 + 1] = v_perm_zwZW(shuffledata0, shuffledata1); // yyyy
+      iv_data[i * 2] = v_perm_xyab(shuffledata0, shuffledata1);     // xxxx
+      iv_data[i * 2 + 1] = v_perm_zwcd(shuffledata0, shuffledata1); // yyyy
       // iv_data[i*2] = v_make_vec4f(*f0,*f1,*f2,*f3);
       // iv_data[i*2+1] = v_make_vec4f(*(f0+1),*(f1+1),*(f2+1),*(f3+1));
       f0 += 2;
@@ -502,12 +483,7 @@ void FFT2DSSE(complex *c, int nx)
   {
 
     for (int ij = j, i = 0; i < nx; i++, ij += nx)
-    {
-      shuffledata0 = v_ld((float *)&(c[ij][0]));
-      shuffledata1 = v_ld((float *)&(c[ij + 2][0]));
-      iv_data[i * 2] = v_perm_xzXZ(shuffledata0, shuffledata1);
-      iv_data[i * 2 + 1] = v_perm_ywYW(shuffledata0, shuffledata1);
-    }
+      v_ld_soa2((float *)&(c[ij][0]), iv_data[i * 2], iv_data[i * 2 + 1]); // 4 complex to re/im SoA
     FFTcSSE(nn, m, iv_data);
     f0 = (float *)&(c[j][0]);
     f1 = (float *)&(c[j + nx + 0][0]);
@@ -593,12 +569,12 @@ void NVWaveWorks_FFT_CPU_Simulation::UpdateHt(int row)
     vec4f s23 = v_add(*(vec4f *)&_k[i + 2], mk);
     vec4f d23 = v_sub(*(vec4f *)&_k[i + 2], mk);
 
-    vec4f sx = v_perm_xzXZ(s01, s23);
-    vec4f sy = v_perm_ywYW(s01, s23);
+    vec4f sx = v_perm_xzac(s01, s23);
+    vec4f sy = v_perm_ywbd(s01, s23);
     vec4f hx = v_sub(v_mul(sx, cn), v_mul(sy, sn));
 
-    vec4f dx = v_perm_xzXZ(d01, d23); //_mm_shuffle_ps( d01, d23, _MM_SHUFFLE(2,0,2,0) );
-    vec4f dy = v_perm_ywYW(d01, d23); //_mm_shuffle_ps( d01, d23, _MM_SHUFFLE(3,1,3,1) );
+    vec4f dx = v_perm_xzac(d01, d23); //_mm_shuffle_ps( d01, d23, _MM_SHUFFLE(2,0,2,0) );
+    vec4f dy = v_perm_ywbd(d01, d23); //_mm_shuffle_ps( d01, d23, _MM_SHUFFLE(3,1,3,1) );
     vec4f hy = v_add(v_mul(dx, sn), v_mul(dy, cn));
 
     // height
@@ -1167,4 +1143,16 @@ void calc_wave_height(const NVWaveWorks_FFT_CPU_Simulation::Params *fft, int num
   }
   // Use the max wave height there because a significant is not precise enough anymore but the max height quite close to the truth
   out_significant_wave_height = out_max_wave_height;
+}
+
+void calc_wave_height_chop(const ChopWaterGenerator &chopGen, int num_cascades, float &out_significant_wave_height,
+  float &out_max_wave_height, float *out_max_wave_size)
+{
+  out_significant_wave_height = chopGen.getSignificantWaveHeight() * 0.5f; // *0.5 since Chop stores total waveH [-Max, +Max]
+  out_max_wave_height = chopGen.getMaxWaveHeight() * 0.5f;
+  if (out_max_wave_size)
+  {
+    for (int i = 0; i < num_cascades; ++i)
+      out_max_wave_size[i] = chopGen.getMaxWaveHeightCascade(i) * 0.5f;
+  }
 }

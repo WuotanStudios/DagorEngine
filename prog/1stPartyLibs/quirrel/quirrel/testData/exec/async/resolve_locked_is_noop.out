@@ -1,0 +1,7 @@
+=== after_terminal ===
+first resolve, p=fulfilled
+after extra calls p=fulfilled
+awaited value: 1
+r after fault=faulted
+r reason: first
+script done

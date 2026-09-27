@@ -19,7 +19,8 @@
 #include "util/dag_delayedAction.h"
 #include "util/dag_base64.h"
 #include <ecs/scripts/sqEntity.h>
-#include <quirrel/sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
+#include <quirrel/frp/dag_frp.h>
 #include <quirrel/sqEventBus/sqEventBus.h>
 #include <json/json.h>
 #include <rendInst/rendInstExtra.h>
@@ -97,8 +98,21 @@ static bool trace_ray_static_ex(const Point3 &p0, const Point3 &dir, float &dist
   if (!o)
     return trace_ray_static_common(p0, dir, dist, out_norm, nullptr);
 
+  eastl::vector<rendinst::riex_handle_t> exclude_handles;
+
   const rendinst::riex_handle_t riex_handle = extract_ri_extra_from_eid(o->getEid());
-  if (riex_handle == rendinst::RIEX_HANDLE_NULL)
+  if (riex_handle != rendinst::RIEX_HANDLE_NULL)
+    exclude_handles.push_back(riex_handle);
+
+  if (const ecs::EidList *subEids = g_entity_mgr->getNullable<ecs::EidList>(o->getEid(), ECS_HASH("subentityEids")))
+    for (ecs::EntityId childEid : *subEids)
+    {
+      const rendinst::riex_handle_t childHandle = extract_ri_extra_from_eid(childEid);
+      if (childHandle != rendinst::RIEX_HANDLE_NULL)
+        exclude_handles.push_back(childHandle);
+    }
+
+  if (exclude_handles.empty())
     return trace_ray_static_common(p0, dir, dist, out_norm, nullptr);
 
   Point3 p = p0;
@@ -121,8 +135,9 @@ static bool trace_ray_static_ex(const Point3 &p0, const Point3 &dir, float &dist
   rendinst::RendInstDesc ri_desc;
   while (trace_ray_static_common(p, dir, dist, out_norm, &ri_desc))
   {
-    if (skipsLeft <= 0 || !ri_desc.isRiExtra() || riex_handle != ri_desc.getRiExtraHandle() ||
-        trace_ray_static_common(p, dir, dist, out_norm, nullptr, dacoll::ETF_RI))
+    const bool isExcluded = ri_desc.isRiExtra() && eastl::find(exclude_handles.begin(), exclude_handles.end(),
+                                                     ri_desc.getRiExtraHandle()) != exclude_handles.end();
+    if (skipsLeft <= 0 || !isExcluded || trace_ray_static_common(p, dir, dist, out_norm, nullptr, dacoll::ETF_RI))
     {
       dist += dist_sum;
       return true;
@@ -262,9 +277,7 @@ static void perform_point_action_static(bool trace, const Point3 &p0, const Poin
       box.bmin = v_ldu(&pt1.x);
       box.bmax = v_ldu(&pt2.x);
 
-      uint32_t poolsCount = rendinst::getRiGenExtraResCount();
-      for (uint32_t pool_idx = 0; pool_idx < poolsCount; ++pool_idx)
-      {
+      rendinst::iterateRiGenExtraResId([&](int pool_idx) {
         Tab<rendinst::riex_handle_t> handles(framemem_ptr());
         rendinst::getRiGenExtraInstances(handles, pool_idx, box);
         const int handlesCount = handles.size();
@@ -299,7 +312,7 @@ static void perform_point_action_static(bool trace, const Point3 &p0, const Poin
             }
           }
         }
-      }
+      });
     }
   }
 
@@ -337,8 +350,6 @@ static bool on_daed4_activate(bool activate)
   if (activate)
     init_entity_object_editor();
 
-  sqeventbus::send_event("entity_editor.onEditorActivated", Json::Value(activate));
-
   if (activate || wasFreeCameraActive)
   {
     if (activate)
@@ -359,9 +370,11 @@ static bool on_daed4_activate(bool activate)
   {
     if (objEd->getEditMode() == CM_OBJED_MODE_CREATE_ENTITY || objEd->getEditMode() == CM_OBJED_MODE_POINT_ACTION)
       objEd->setEditMode(CM_OBJED_MODE_SELECT);
+    objEd->dropPendingSaveMainSceneCopy();
   }
 
   daed4_state = activate ? EditorState::ACTIVE : EditorState::DISABLED;
+  ::update_active_state_on_toolbar(activate);
   return true;
 }
 
@@ -375,6 +388,12 @@ static void on_daed4_changed() { sqeventbus::send_event("entity_editor.onEditorC
 
 void init_da_editor4()
 {
+  if (daEd4Embedded)
+  {
+    debug("daEd4 already initialized %p", daEd4Embedded.get());
+    return;
+  }
+
   daEd4Embedded.reset(create_da_editor4(NULL));
   daEd4 = daEd4Embedded ? daEd4Embedded.get() : &daEd4Stub;
   daEd4->setActivationHandler(on_daed4_activate);
@@ -392,6 +411,7 @@ void term_da_editor4()
 {
   daEd4->setObjectEditor(NULL);
   objEd.reset();
+  invalidate_scene_tree();
   daEd4Embedded.reset();
   daEd4 = &daEd4Stub;
   daEd4Vrom.reset();
@@ -527,12 +547,10 @@ static SQInteger gather_ri_by_sphere(HSQUIRRELVM vm)
   box.bmin = v_ldu(&pt1.x);
   box.bmax = v_ldu(&pt2.x);
 
-  uint32_t poolsCount = rendinst::getRiGenExtraResCount();
   const float testRadiusSq = r * r;
   int fillCount = 0;
 
-  for (uint32_t pool_idx = 0; pool_idx < poolsCount; ++pool_idx)
-  {
+  rendinst::iterateRiGenExtraResId([&](int pool_idx) {
     Tab<rendinst::riex_handle_t> handles(framemem_ptr());
     rendinst::getRiGenExtraInstances(handles, pool_idx, box);
     const int handlesCount = handles.size();
@@ -548,13 +566,12 @@ static SQInteger gather_ri_by_sphere(HSQUIRRELVM vm)
         ++fillCount;
       }
     }
-  }
+  });
 
   Sqrat::Array res(vm, fillCount);
 
   int filledCount = 0;
-  for (uint32_t pool_idx = 0; pool_idx < poolsCount; ++pool_idx)
-  {
+  rendinst::iterateRiGenExtraResId([&](int pool_idx) {
     Tab<rendinst::riex_handle_t> handles(framemem_ptr());
     rendinst::getRiGenExtraInstances(handles, pool_idx, box);
     const int handlesCount = handles.size();
@@ -581,7 +598,7 @@ static SQInteger gather_ri_by_sphere(HSQUIRRELVM vm)
         ++filledCount;
       }
     }
-  }
+  });
 
   Sqrat::Var<Sqrat::Array>::push(vm, res);
   return 1;
@@ -654,11 +671,31 @@ static TMatrix make_cam_spawn_tm()
 
 /// @module entity_editor
 
+// Built on pull only, so a burst of edits costs one table. Owned with the bound VM.
+struct SceneTreeNode final : public sqfrp::INativeComputedSource
+{
+  eastl::unique_ptr<sqfrp::ComputedHandle> handle; // null while no VM is bound
+
+  sqfrp::NativePullResult pull(HSQUIRRELVM vm) override
+  {
+    Sqrat::Table tree = EntityObjEditor::getSceneTree(vm, objEd.get());
+    sq_pushobject(vm, tree.GetObject());
+    return sqfrp::NativePullResult::Changed; // a fresh table never compares equal
+  }
+};
+static SceneTreeNode scene_tree_node;
+
+void invalidate_scene_tree()
+{
+  if (scene_tree_node.handle)
+    scene_tree_node.handle->graph->invalidateNativeComputed(scene_tree_node.handle->id);
+}
+
 void register_editor_script(SqModules *module_mgr)
 {
   HSQUIRRELVM vm = module_mgr->getVM();
 
-  ::register_da_editor4_script(module_mgr);
+  ::register_da_editor4_script(module_mgr, daed4_state != EditorState::DISABLED); // RELOADING keeps the UI open
   EntityObjEditor::register_script_class(vm);
 
   Sqrat::Table exports(vm);
@@ -699,7 +736,21 @@ void register_editor_script(SqModules *module_mgr)
 
     .Func("make_cam_spawn_tm", make_cam_spawn_tm)
     /**/;
+
+  sqfrp::ObservablesGraph *graph = sqfrp::ObservablesGraph::get_from_vm(vm);
+  G_ASSERTF_RETURN(graph, , "entity_editor: the VM has no FRP graph");
+  G_ASSERTF_RETURN(!scene_tree_node.handle, , "entity_editor: already bound to a VM; the editor UI runs in one VM at a time");
+  scene_tree_node.handle.reset(new sqfrp::ComputedHandle(graph->createNativeComputed(&scene_tree_node), graph));
+  exports.SetInstance("sceneTree", scene_tree_node.handle.get());
+
   module_mgr->addNativeModule("entity_editor", exports);
+}
+
+void unregister_editor_script(HSQUIRRELVM vm)
+{
+  ::unregister_da_editor4_script(vm);
+  if (scene_tree_node.handle && scene_tree_node.handle->graph->vm == vm)
+    scene_tree_node.handle.reset();
 }
 
 

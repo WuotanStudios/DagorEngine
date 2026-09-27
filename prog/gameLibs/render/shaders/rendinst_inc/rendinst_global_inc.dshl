@@ -17,12 +17,21 @@ buffer ri_gen_multidraw_perDrawArgsBuffer;
 
 int rendinst_perinst_buff_no = 6 always_referenced;  // perinst
 int rendinst_instance_buff_no = 5 always_referenced; // instance_cb
-int per_instance_data_no = 14 always_referenced;
+int per_instance_data_no = 16 always_referenced;
+int ri_additional_instance_offsets_data_no = 17 always_referenced;
 
 float4 impostor_shadow_x = (0,0,0,0);
 float4 impostor_shadow_y = (0,0,0,0);
 float4 impostor_shadow_z = (0,0,0,0);
 texture impostor_shadow;
+sampler impostor_shadow_samplerstate
+{
+  comparison_func = less;
+  mipmap_mode = point;
+  address_u = clamp;
+  address_v = clamp;
+  address_w = clamp;
+};
 
 float tree_wind_branch_amp = 0.5;
 float tree_wind_detail_amp = 0.5;
@@ -31,9 +40,8 @@ float tree_wind_speed = 0.1;
 float tess_quality = 75;
 
 float lods_shift_dist_mul = 1.0;
-
-float4 camera_base_offset = (0, 0, 0, 0);
-float4 prev_camera_base_offset = (0, 0, 0, 0);
+float ri_dist_mul_rcp = 1.0;
+float ri_fade_y_scale = 1.0;
 
 ////// macro
 
@@ -45,29 +53,34 @@ macro INIT_RENDINST_IMPOSTOR_SHADOW()
   }
 endmacro
 
+
+macro USE_TRANSITION_CROSS_DISSOLVE_PARAMS()
+  static float cross_dissolve_mul = 0;
+  static float cross_dissolve_add = 0;
+endmacro
+
+macro USE_TRANSITION_CROSS_DISSOLVE_FUNCTIONS()
+  (vs) { cross_dissolve_mul_add@f2 = (cross_dissolve_mul, cross_dissolve_add, 0, 0); }
+  hlsl(vs)
+  {
+    float get_transition_lod_cross_dissolve_opacity(float distance, float dist_shift)
+    {
+      float2 mul_add = get_cross_dissolve_mul_add();
+      return saturate(distance * dist_shift * mul_add.x + mul_add.y);
+    }
+  }
+endmacro
+
 macro USE_TRANSITION_CROSS_DISSOLVE()
   static int use_cross_dissolve = 0;
   interval use_cross_dissolve : off < 1, on;
 
   if (use_cross_dissolve == on)
   {
-    static float cross_dissolve_mul = 0;
-    static float cross_dissolve_add = 0;
-    (vs) { cross_dissolve_mul_add@f2 = (cross_dissolve_mul, cross_dissolve_add, 0, 0); }
-
-    hlsl(vs)
-    {
-      float get_transition_lod_cross_dissolve_opacity(float distance, float dist_shift)
-      {
-        float2 mul_add = get_cross_dissolve_mul_add();
-        return saturate(distance * dist_shift * mul_add.x + mul_add.y);
-      }
-      #define CROSS_DISSOLVE_VS
-    }
-    hlsl(ps)
-    {
-      #define CROSS_DISSOLVE_PS
-    }
+    USE_TRANSITION_CROSS_DISSOLVE_PARAMS()
+    USE_TRANSITION_CROSS_DISSOLVE_FUNCTIONS()
+    hlsl(vs) { #define CROSS_DISSOLVE_VS }
+    hlsl(ps) { #define CROSS_DISSOLVE_PS }
   }
 endmacro
 

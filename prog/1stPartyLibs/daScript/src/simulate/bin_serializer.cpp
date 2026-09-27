@@ -110,9 +110,12 @@ namespace das {
         virtual void beforeArray ( Array * pa, TypeInfo * ti ) override {
             verify_hash(ti->hash);
             if ( reading ) {
-                uint32_t newSize = 0;
+                uint64_t newSize = 0;
                 load(newSize);
                 array_clear(*context, *pa, /*at*/nullptr);
+                // exact reserve first: the final size is known, so the resize never grows -
+                // no pow2 slack on big payloads, and no max_unreserved_size panic
+                array_reserve(*context, *pa, newSize, getTypeBaseSize(ti), /*at*/nullptr);
                 array_resize(*context, *pa, newSize, getTypeBaseSize(ti), true, /*at*/nullptr);
             } else {
                 save(pa->size);
@@ -177,6 +180,15 @@ namespace das {
             serialize(data);
         }
         virtual void Bitfield ( uint32_t & data, TypeInfo * ) override {
+            serialize(data);
+        }
+        virtual void Bitfield8 ( uint8_t & data, TypeInfo * ) override {
+            serialize(data);
+        }
+        virtual void Bitfield16 ( uint16_t & data, TypeInfo * ) override {
+            serialize(data);
+        }
+        virtual void Bitfield64 ( uint64_t & data, TypeInfo * ) override {
             serialize(data);
         }
         virtual void Int2 ( int2 & data ) override {
@@ -268,7 +280,6 @@ namespace das {
                 DAS_ASSERTF(info,"type info not found. how did we get type, which is not in the typeinfo hash?");
                 uint32_t size = getTypeSize(info) + 16;
                 char * ptr = context->allocate(size);
-                if ( !ptr ) context->throw_out_of_memory(false, size);
                 context->heap->mark_comment(ptr, "lambda (via bin serializer)");
                 memset ( ptr, 0, size );
                 *((TypeInfo **)ptr) = info;
@@ -290,18 +301,14 @@ namespace das {
         writer.walk(args[0], info);
         writer.close();
         Array arr;
-        arr.data = writer.bytesAt;
-        arr.size = writer.bytesWritten;
-        arr.capacity = writer.bytesWritten;
-        arr.lock = 1;
-        arr.flags = 0;
+        array_mark_locked(arr, writer.bytesAt, writer.bytesWritten);
         vec4f arg = cast<char *>::from((char *)&arr);
         context.invoke(*block, &arg, nullptr, &call->debugInfo);
         return v_zero();
     }
 
     // load ( obj, bytesAt )
-    void _builtin_binary_load ( Context & context, LineInfo * at, TypeInfo* info, const char *data, uint32_t len, char *to) {
+    void _builtin_binary_load ( Context & context, LineInfo * at, TypeInfo* info, const char *data, uint64_t len, char *to) {
         if ( !(info->flags&(TypeInfo::flag_refType | TypeInfo::flag_ref)) )
             return;
         BinDataSerialize reader(context, at, const_cast<char*>(data), len);

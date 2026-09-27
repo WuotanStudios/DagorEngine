@@ -4,6 +4,8 @@ include "shaders_pc11.blk"
 {
   file:t = "depth_hierarchy.dshl"
   file:t = "motion_vrs.dshl"
+  file:t = "shading_vrs.dshl"
+  file:t = "medium_preset_compilation_var_ref.dshl"
 }
 
 "@override:outDumpName":t="../../game/compiledShaders/gameDX12"
@@ -11,14 +13,17 @@ include "shaders_pc11.blk"
   "@override:fsh":t="5.0"
   "@override:assume_vars" {
     gi_voxelize_use_multidraw:i=1
+    "@delete:supports_barycentrics":i = 0
     use_ssss:i=0
     ssss_quality:i=1
     depth_bounds_support:i=1
-    antialiasing_type:i=2
+    antialiasing_type:i=1
     hdr_ps_output_mode:i=0
     combined_shadows:i=1
     static_shadows_cascades:i=2
     current_ambient:i=1
     gi_quality:i=1
+    parallax_shadow_enabled:i=0
+    parallax_ao_enabled:i=0
   }
 }

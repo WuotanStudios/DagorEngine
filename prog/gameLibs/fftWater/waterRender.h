@@ -11,6 +11,7 @@
 #include <heightmap/heightmapCulling.h>
 #include <generic/dag_smallTab.h>
 #include "waterCommon.h"
+#include "waterRenderCommon.h"
 #include <3d/dag_resPtr.h>
 #include <shaders/dag_overrideStateId.h>
 #include <fftWater/fftWater.h>
@@ -56,9 +57,10 @@ public:
   void getCascadePeriod(int cascade_no, float &out_period, float &out_window_in, float &out_window_out);
 #endif
 
-  WaterNVRender(const NVWaveWorks_FFT_CPU_Simulation::Params &p, const fft_water::SimulationParams &simulation, int quality,
+  WaterNVRender(const NVWaveWorks_FFT_CPU_Simulation::Params &p, const fft_water::SimulationParams &simulation, int render_quality,
     int geom_quality, bool depth_renderer, bool ssr_renderer, bool one_to_four_cascades, int num_cascades, float cascade_window_length,
-    float cascade_facet_size, const fft_water::WaterHeightmap *water_heightmap, bool water_heightmap_draw_patches);
+    float cascade_facet_size, const fft_water::WaterHeightmap *water_heightmap, const HeightmapHeightCulling *heightmap_culling,
+    bool water_heightmap_draw_patches);
   ~WaterNVRender();
 
   void reset();
@@ -68,26 +70,22 @@ public:
   void enableTurbulenceFoam(bool value) { turbulenceFoamEnabled = value && renderQuality >= fft_water::RENDER_GOOD; }
   void reinit(const Point2 &wind_dir, float wind_speed, float period);
 
-  void setLevel(float water_level);
-  float getMinLevel() const { return minWaterLevel; }
-  float getMaxLevel() const { return maxWaterLevel; }
+  float getMinHeight() const { return minWaterHeight; }
+  float getMaxHeight() const { return maxWaterHeight; }
   void setMinMaxLevel(float min_water_level, float max_water_level);
   const Point2 &getWaveDisplacementDistance() const { return waveDisplacementDist; }
   void setWaveDisplacementDistance(const Point2 &value);
   void calcWaveHeight(float &out_max_wave_height, float &out_significant_wave_height);
-  void initRefraction(int w, int h);
-  void closeRefraction();
 
   void simulateAllAt(double time); // SYNC!
   void updateTexturesAll();        // SYNC!
   void calculateGradients();
   void calculateCascadesRoughness();
 
-  void prepareRefraction(Texture *scene_target_tex);
-
   void render(const Point3 &origin, TEXTUREID distanceTex, int geom_lod_quality, int survey_id, const Frustum &frustum,
-    const Driver3dPerspective &persp, IWaterDecalsRenderHelper *decals_renderer = NULL,
-    fft_water::RenderMode render_mode = fft_water::RenderMode::WATER_SHADER);
+    Occlusion *occlusion, const Driver3dPerspective &persp, const WaterRenderCommon &waterRenderCommon,
+    IWaterDecalsRenderHelper *decals_renderer = NULL, fft_water::RenderMode render_mode = fft_water::RenderMode::WATER_SHADER,
+    eastl::function<bool(const Point3_vec4 &pos, const Point3_vec4 &posRB)> cullCb = {});
 
   void performGPUFFT();
   void closeGPU();
@@ -105,8 +103,8 @@ public:
   bool isDepthRendererEnabled() const { return depthRendererEnabled; }
   bool isSSRRendererEnabled() const { return ssrRendererEnabled; }
   void setRenderQuad(const BBox2 &b);
-  void setWakeHtTex(TEXTUREID wake_ht_tex);
   void setLod0AreaSize(float size) { lod0AreaRadius = size; }
+  void setLastLodExtension(float extension) { lastLodExtension = extension; }
   float getLod0AreaSize() { return lod0AreaRadius; }
   void setGridLod0AdditionalTesselation(float additional_tesselation) { lod0TesselationAdditional = additional_tesselation; }
 
@@ -134,23 +132,15 @@ public:
     gridOffset = cameraPatchOffset;
   }
 
-  float getShoreWaveThreshold() const { return shoreWaveThreshold; }
-  void setShoreWaveThreshold(float value);
-
-  bool isShoreEnabled() const;
-  void shoreEnable(bool enable);
+  float getMaxWaveHeight() { return maxWaveHeight; }
+  float getSignificantWaveHeight() { return significantWaveHeight; }
 
 protected:
-  struct SavedStates
-  {
-    TEXTUREID shoreDistanceFieldTexId = BAD_TEXTUREID;
-  };
   void setCascades(const NVWaveWorks_FFT_CPU_Simulation::Params &p);
-  SavedStates setStates(TEXTUREID distanceTex, int vs_samplers);
-  void resetStates(const SavedStates &states, int vs_samplers);
+  WaterRenderCommon::SavedStates setStates(const WaterRenderCommon &water_render_common, TEXTUREID distanceTex, int vs_samplers);
+  void resetStates(const WaterRenderCommon &water_render_common, const WaterRenderCommon::SavedStates &states, int vs_samplers);
   int getAutoDisplacementSamplers(float threshold);
   void applyWaterCell();
-  void applyShoreEnabled();
 
   bool autoVsamplersAdjust;
   bool turbulenceFoamEnabled;
@@ -162,6 +152,7 @@ protected:
   double lastFoamTime;
   HeightmapRenderer meshRenderer[fft_water::RenderMode::MAX];
   const fft_water::WaterHeightmap *waterHeightmap = nullptr;
+  const HeightmapHeightCulling *heightmapCulling = nullptr;
   int waterHeightmapPatchesGridRes = 0;
   int waterHeightmapPatchesCount = 0;
   int waterHeightmapPatchesGridScale = 1;
@@ -178,20 +169,18 @@ protected:
 
   bool clearNeeded;
   UniqueTex foamGradient;
-
-  UniqueTex refraction;
   GPGPUData *gpGpu;
   CSGPUData *csGpu;
 
-  UniqueTexHolder heightmapGridTex;
-  UniqueTexHolder heightmapPagesTex;
+  UniqueTexWithShaderVar heightmapGridTex;
+  UniqueTexWithShaderVar heightmapPagesTex;
 
-  UniqueBufHolder heightmapBuf;
+  UniqueBufWithShaderVar heightmapBuf;
   eastl::unique_ptr<ShaderMaterial> heightmapShmat[fft_water::RenderMode::MAX];
   ShaderElement *heightmapShElem[fft_water::RenderMode::MAX] = {nullptr, nullptr, nullptr};
 
-  float waterLevel;
   float minWaterLevel, maxWaterLevel;
+  float minWaterHeight, maxWaterHeight;
   float maxWaveHeight, significantWaveHeight;
   float maxWaveSize[MAX_NUM_CASCADES];
   Point2 waveDisplacementDist;
@@ -209,8 +198,6 @@ protected:
   eastl::unique_ptr<ComputeShaderElement> gradientMipCs;
   bool computeGradientsEnabled;
   bool oneToFourCascades = false;
-
-  TEXTUREID wakeHtTex;
 
   float cameraPatchAlign = 1.0f;
   Point2 cameraPatchOffset = ZERO<Point2>();
@@ -230,13 +217,5 @@ protected:
   float cascadesRoughnessMipBias;
   float cascadesRoughnessDistBias;
 
-  Point2 detailsWeightDist;
-  Point4 detailsWeightMin;
-  Point4 detailsWeightMax;
-  Point2 shoreDamp;
-  Point2 shoreWavesDist;
-  bool shoreEnabled;
-  float shoreWaveThreshold = 0.62f;
   shaders::UniqueOverrideStateId overrideAlpha, overrideRGB;
-  shaders::UniqueOverrideStateId zClampStateId, zClampFlipStateId;
 };

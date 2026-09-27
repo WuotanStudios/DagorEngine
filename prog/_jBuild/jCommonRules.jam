@@ -66,6 +66,10 @@ actions quietly generate_es
 }
 
 # concatenates (prefix : suffix) and simplifies path
+# newer jam.exe provides this rule as a C builtin (see $(JAM_BUILTINS));
+# keep the interpreted fallback for older jam.exe
+if ! SimplifyComposedPath in $(JAM_BUILTINS) {
+# concatenates (prefix : suffix) and simplifies path
 rule SimplifyComposedPath
 {
   local prefix = $(1) ;
@@ -78,6 +82,7 @@ rule SimplifyComposedPath
   }
   return $(prefix)/$(suffix) ;
 }
+}
 
 # concatenates (prefix : suffix) if suffix starts with ".." and simplifies path
 # This function is designed to create absolute path.
@@ -86,12 +91,16 @@ rule SimplifyComposedPath
 # a) system libs like "ws2_32.lib", "advapi32.lib", ...
 # b) absolute paths to external libs like: "/home/bs/devtools/oodle.2.7/lib/liboo2corelinux64.a"
 # The function is useful for MSVC because it allows to get shorter paths than <CWD>/<RELATIVE_PATH>
+# newer jam.exe provides this rule as a C builtin (see $(JAM_BUILTINS));
+# keep the interpreted fallback for older jam.exe
+if ! MakePathAbsolute in $(JAM_BUILTINS) {
 rule MakePathAbsolute prefix : suffix
 {
   switch $(suffix) {
     case ..* : return [ SimplifyComposedPath $(prefix) : $(suffix) ] ;
   }
   return $(suffix) ;
+}
 }
 
 # concatenates (prefix : suffixList) if suffix starts with ".." and simplifies path
@@ -102,6 +111,9 @@ rule MakePathAbsolute prefix : suffix
 # a) system libs like "ws2_32.lib", "advapi32.lib", ...
 # b) absolute paths to external libs like: "/home/bs/devtools/oodle.2.7/lib/liboo2corelinux64.a"
 # The function is useful for MSVC because it allows to get shorter paths than <CWD>/<RELATIVE_PATH>
+# newer jam.exe provides this rule as a C builtin (see $(JAM_BUILTINS));
+# keep the interpreted fallback for older jam.exe
+if ! MakePathListAbsolute in $(JAM_BUILTINS) {
 rule MakePathListAbsolute prefix : suffixList
 {
   local result = ;
@@ -112,6 +124,7 @@ rule MakePathListAbsolute prefix : suffixList
   }
   return $(result) ;
 }
+}
 
 # converts source file to C string constant using python script
 # dst : [target] 
@@ -121,7 +134,7 @@ rule GenESSourceFile
   local src = $(Location)/$(1) ;
   local dst = $(Location)/$(dst_nm) ;
   local tgt = $(Target) ;
-  if $(UseQuirrel) && $(TargetType) = lib { tgt = $(tgt:S=~$(UseQuirrel).lib) ; }
+
 
   LOCATE on $(src) = $(Root) ;
   LOCATE on $(dst) = $(Root) ;
@@ -229,7 +242,7 @@ rule BuildValidJamString
 rule StrToCIdent
 {
   local ident = $(1) ;
-  local spec_sym = "\\~\\#\\@\\$\\:\\.\\-" ;
+  local spec_sym = "\\~\\#\\@\\$\\:\\./\\-" ;
   local match_str = ([^$(spec_sym)]*)([$(spec_sym)])(.*) ;
   local split = [ MATCH $(match_str) : $(ident) ] ;
   while $(split) {
@@ -241,11 +254,13 @@ rule StrToCIdent
 
 rule AutoscanBuildLists # folder_list : wildcard : dest_var : excl_regexp
 {
+  local excl_regexp = $(4) ;
+  if ! $(excl_regexp) && $(2) = *.cpp { excl_regexp = \\.cpp\\.gen\\.es\\.cpp$ ; }
   for sd in $(1) {
     local s = [ GLOB $(Root)/$(Location)/$(sd) : $(2) ] ;
     s = $(s:D=$(sd)) ;
-    if $(4) {
-      for f in $(s) { if ! [ MATCH "($(4))" : $(f) ] { $(3) += $(f) ; } }
+    if $(excl_regexp) {
+      for f in $(s) { if ! [ MATCH "($(excl_regexp))" : $(f) ] { $(3) += $(f) ; } }
     } else {
       $(3) += $(s) ;
     }
@@ -257,9 +272,9 @@ if $(OS) = NT {
   {
     echo * copy file to:   $(file)
     set_filter nul /1 file\(s\) copied/
-    call_filtered $(ComSpec) /C copy /Y /B /V #\( "$(2)" "$(1)" )\#
+    call_filtered $(ComSpec) /C copy /Y /B /V #\( "$(srcAbs:E=$(2))" "$(dstAbs:E=$(1))" )\# >nul
     clr_filters
-    if not exist $(1) set errorlevel=13
+    if not exist $(dstAbs:E=$(1)) set errorlevel=13
   }
 } else {
   actions together quietly raw_copy_file
@@ -267,6 +282,30 @@ if $(OS) = NT {
     echo * copy file to:   $(file)
     call cp $(2) $(1)
     $(post_copy_cmd)
+    if not exist $(1) set errorlevel=13
+  }
+}
+
+if $(OS) = NT {
+  rule ProcessBundleSymlink
+  {
+    local dest = $(1[1]) ;
+    local rel_src = $(1[2]) ;
+
+    MakeDirectory all : $(OutDir)/$(dest:D) ;
+    Depends $(OutDir)/$(dest) : $(OutDir)/$(dest:D)/$(rel_src) ;
+    NOCARE $(OutDir)/$(dest:D)/$(rel_src) ;
+    Depends all : $(OutDir)/$(dest) ;
+    src on $(OutDir)/$(dest) = $(rel_src) ;
+    raw_sym_link $(OutDir)/$(dest) : $(OutDir)/$(dest:D)/$(rel_src) ;
+
+    if $(1[3]) { ProcessBundleSymlink $(1[3-]) ; }
+  }
+
+  actions together quietly raw_sym_link
+  {
+    echo * make rel symlink:  $(1) <-- $(1)/$(src)
+    call $(ComSpec) /c mklink /J #\( $(1) "$(1)/$(src)" )\# >nul
     if not exist $(1) set errorlevel=13
   }
 }

@@ -61,6 +61,7 @@ void initRIGen(bool need_render, int cell_pool_sz, float poi_radius, ri_register
   ri_unregister_collision_cb unreg_coll_cb = nullptr, int job_manager_id = -1, float sec_layer_poi_radius = 256.0f,
   bool simplified_render = false, bool should_init_gpu_objects = true);
 void termRIGen();
+void termRIGenJobs();
 
 void setPoiRadius(float poi_radius);
 
@@ -87,11 +88,19 @@ using FxTypeByNameCallback = int (*)(const char *);
 void initRiGenDebris(const DataBlock &ri_blk, FxTypeByNameCallback get_fx_type_by_name, bool init_sec_ri_extra_here = true);
 void initRiGenDebrisSecondary(const DataBlock &ri_blk, FxTypeByNameCallback get_fx_type_by_name);
 void updateRiDestrFxIds(FxTypeByNameCallback get_fx_type_by_name);
-void initRiSoundOccluders(const dag::ConstSpan<eastl::pair<const char *, const char *>> &ri_name_to_occluder_type,
-  const dag::ConstSpan<eastl::pair<const char *, float>> &occluders);
 float debugGetSoundOcclusion(const char *ri_name, float def_value);
 
 void precomputeRIGenCellsAndPregenerateRIExtra();
+// Called on the loading thread after each precomputed cell, and once with
+// cells_done = 0 before the first: a host can estimate the pregen end from
+// cell throughput (e.g. to start a loading-screen exit in time).
+// Set the callback on the loading thread, before the precompute starts:
+// the pointer is sampled once at phase entry, unguarded.
+using RiGenPrecomputeProgressCb = void (*)(int cells_done, int cells_total);
+void set_ri_gen_precompute_progress_cb(RiGenPrecomputeProgressCb cb);
+// Builds the riExtra grid leaf trees. The streaming path calls this itself once its last cell job
+// lands; a host that pregenerates every cell instead replaces that path and has to call it.
+void optimizeRIGenExtra();
 
 const DataBlock *getRIGenExtraConfig();
 const DataBlock *registerRIGenExtraConfig(const DataBlock *persist_props);
@@ -100,16 +109,18 @@ void addRIGenExtraSubst(const char *ri_res_name);
 void walkRIGenResourceNames(res_walk_cb cb);
 bool hasRiLayer(int res_idx, LayerFlag layer);
 
+int getRIGenLoadedInstancesCount();
+
 CollisionResource *getRIGenCollInfo(const rendinst::RendInstDesc &desc);
 
+float getMaxRiGenLoadingDistance();
+float getMaxRiGenCellSize();
 void registerRIGenSweepAreas(dag::ConstSpan<TMatrix> box_itm_list);
 int scheduleRIGenPrepare(dag::ConstSpan<Point3> poi);
 bool isRIGenPrepareFinished();
 
-using ri_added_from_rigendata_cb = void (*)(riex_handle_t handle);
-void registerRiExtraAddedFromGenDataCb(ri_added_from_rigendata_cb cb);
-bool unregisterRiExtraAddedFromGenDataCb(ri_added_from_rigendata_cb cb);
-void onRiExtraAddedFromGenData(riex_handle_t id);
+using ri_added_from_rigendata_cb_t = void (*)(riex_handle_t handle);                        // Warn: called in thread
+ri_added_from_rigendata_cb_t setRiExtraAddedFromGenDataCb(ri_added_from_rigendata_cb_t cb); // Returns prev cb
 
 using ri_gen_cell_loaded_cb = void (*)(int layer_idx, int cell_idx, int x, int z, bool loaded, bool last_job);
 void registerRiGenCellLoadedCb(ri_gen_cell_loaded_cb cb);
@@ -131,6 +142,7 @@ extern void updateRIGenImpostors(float shadowDistance, const Point3 &sunDir0, co
 extern void resetRiGenImpostors();
 extern void getLodCounter(int lod, const RiGenVisibility *visibility, int &subCellNo, int &cellNo);
 extern void set_per_instance_visibility_for_any_tree(bool on); // should be on only in tank
+extern void setTreeLod0Offset(bool on);
 
 extern float getMaxFarplaneRIGen(bool sec_layer = false);
 extern float getMaxAverageFarplaneRIGen(bool sec_layer = false);
@@ -203,5 +215,8 @@ void iterate_apex_destructible_rendinst_data(RiApexIterationCallback callback);
 
 bool should_init_ri_damage_model();
 void dm_iter_all_ri_layers(eastl::fixed_function<20, void(int, const dag::ConstSpan<const char *> &)> cb);
+
+using ImpostorTextureCallback = void (*)(const RenderableInstanceLodsResource *);
+void set_impostor_iexture_callback(ImpostorTextureCallback callback);
 
 }; // namespace rendinst

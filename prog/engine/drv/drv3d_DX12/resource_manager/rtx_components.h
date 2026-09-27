@@ -9,6 +9,7 @@
 #include "buffer_components.h"
 #include "raytrace_acceleration_structure.h"
 #include <container_mutex_wrapper.h>
+#include <drv_assert_defs.h>
 #include <driver.h>
 
 #include <dag/dag_vector.h>
@@ -141,13 +142,29 @@ protected:
   }
 
 public:
+  using AccelerationStructurePoolResult = dag::Expected<::raytrace::AccelerationStructurePool, MemoryAllocationError>;
+  using AccelerationStructureResult = dag::Expected<RaytraceAccelerationStructure *, MemoryAllocationError>;
+
   // assumes input was validated
-  ::raytrace::AccelerationStructurePool createAccelerationStructurePool(Device &device,
+  AccelerationStructurePoolResult createAccelerationStructurePool(Device &device,
     const ::raytrace::AccelerationStructurePoolCreateInfo &info);
-  RaytraceAccelerationStructure *createAccelerationStructure(Device &device, ::raytrace::AccelerationStructurePool pool,
+  // Only the top level structure needs a descriptor and can fail, the other two placements can not.
+  AccelerationStructureResult createAccelerationStructure(Device &device, ::raytrace::AccelerationStructurePool pool,
     const ::raytrace::TopAccelerationStructurePlacementInfo &info);
   RaytraceAccelerationStructure *createAccelerationStructure(::raytrace::AccelerationStructurePool pool,
     const ::raytrace::BottomAccelerationStructurePlacementInfo &info);
+  RaytraceAccelerationStructure *createAccelerationStructure(::raytrace::AccelerationStructurePool pool,
+    const ::raytrace::OpacityMicroMapTriangleArrayPlacementInfo &info);
+
+  template <typename T>
+  void visitRaytraceAccelerationStructurePools(T clb)
+  {
+    clb.beginVisit();
+    iterateRayTraceAccelerationStructurePools(
+      [&clb](RayTraceAccelerationStructurePool &pool) { clb.visitAccelerationStructurePool(pool); });
+    clb.endVisit();
+  }
+
   void destroyAccelerationStructurePoolOnFrameCompletion(::raytrace::AccelerationStructurePool pool)
   {
     accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>([=](auto &data) {
@@ -170,9 +187,19 @@ public:
     {
       rts = reinterpret_cast<RaytraceAccelerationStructure *>(structure.bottom);
     }
+    else if (structure.omm)
+    {
+      rts = reinterpret_cast<RaytraceAccelerationStructure *>(structure.omm);
+    }
 
     if (rts)
     {
+      if (DAGOR_UNLIKELY(!rts->isAlive))
+      {
+        D3D_ERROR("DX12: Double delete of acceleration structure (pool path, size=%u, type=%u)", rts->size,
+          static_cast<uint32_t>(rts->type));
+        return;
+      }
       asPool->subStructures.free(rts);
     }
   }
@@ -183,13 +210,20 @@ static constexpr uint32_t RAYTRACE_AS_ALIGNMENT = D3D12_RAYTRACING_ACCELERATION_
 static_assert(0 == (RAYTRACE_AS_ALIGNMENT & (RAYTRACE_AS_ALIGNMENT - 1)), "AS_ALIGNMENT must be power of 2");
 static constexpr uint32_t RAYTRACE_HEAP_SIZE = 1024 * 1024 / 2;
 static_assert(RAYTRACE_HEAP_SIZE % RAYTRACE_HEAP_ALIGNMENT == 0);
+static constexpr uint32_t RAYTRACE_HEAP_MAX_SIZE = 4 * 1024 * 1024;
+static_assert(RAYTRACE_HEAP_MAX_SIZE % RAYTRACE_HEAP_ALIGNMENT == 0);
+static constexpr uint16_t RAYTRACE_EMPTY_HEAP_KEEP_FRAMES = 60;
 
 struct RaytraceAccelerationStructureHeap
 {
   RayTraceAccelerationStructurePool *pool = nullptr;
-  static constexpr uint32_t SLOTS = RAYTRACE_HEAP_SIZE / RAYTRACE_AS_ALIGNMENT;
+  // Slot count is per heap, not per bucket: heaps of one bucket grow geometrically. The tracker
+  // takes the biggest heap, so the max size alone states how far a bucket may grow.
+  static constexpr uint32_t SLOTS = RAYTRACE_HEAP_MAX_SIZE / RAYTRACE_AS_ALIGNMENT;
   Bitset<SLOTS> freeSlots;
+  uint16_t slotCount = 0;
   uint16_t takenSlotCount = 0;
+  uint16_t keepFramesLeft = 0;
 
   RaytraceAccelerationStructureHeap() { freeSlots.set(); }
 };
@@ -203,26 +237,34 @@ protected:
 
 private:
   ska::flat_hash_map<size_t, dag::Vector<RaytraceAccelerationStructureHeap>> heapBuckets DAG_TS_GUARDED_BY(rtasSpinlock);
+  uint16_t emptyHeapKeepFrames = RAYTRACE_EMPTY_HEAP_KEEP_FRAMES;
 
 protected:
   uint64_t memoryUsed DAG_TS_GUARDED_BY(rtasSpinlock) = 0;
 
 private:
-  RaytraceAccelerationStructureHeap allocAccelStructHeap(Device &device, uint32_t size) DAG_TS_REQUIRES(rtasSpinlock);
+  dag::Expected<RaytraceAccelerationStructureHeap, MemoryAllocationError> allocAccelStructHeap(Device &device, uint32_t aligned_size,
+    uint16_t slot_count) DAG_TS_REQUIRES(rtasSpinlock);
   void freeAccelStructHeap(RaytraceAccelerationStructureHeap &&heap) DAG_TS_REQUIRES(rtasSpinlock);
 
-  RaytraceAccelerationStructure *allocAccelStruct(Device &device, uint32_t size);
+  AccelerationStructureResult allocAccelStruct(Device &device, uint32_t size, ResourceTagType tag,
+    RaytraceAccelerationStructure::Type type);
   void freeAccelStruct(RaytraceAccelerationStructure *accelStruct);
+  void retireEmptyAccelStructHeaps();
 
 protected:
   struct PendingForCompletedFrameData : BaseType::PendingForCompletedFrameData
   {
+    dag::Vector<RaytraceAccelerationStructure *> deletedOpacityMicroMapTriangleArrays;
     dag::Vector<RaytraceAccelerationStructure *> deletedBottomAccelerationStructure;
     dag::Vector<RaytraceAccelerationStructure *> deletedTopAccelerationStructure;
   };
 
+  void setup(const SetupInfo &info);
+
   void completeFrameExecution(const CompletedFrameExecutionInfo &info, PendingForCompletedFrameData &data)
   {
+    retireEmptyAccelStructHeaps();
     {
       for (auto as : data.deletedTopAccelerationStructure)
       {
@@ -236,9 +278,16 @@ protected:
         recordRaytraceBottomStructureFreed(as->requestedSize);
         freeAccelStruct(as);
       }
+      for (auto omm : data.deletedOpacityMicroMapTriangleArrays)
+      {
+        G_ASSERT(omm->descriptor == D3D12_CPU_DESCRIPTOR_HANDLE{});
+        recordRaytraceOpacityMicroMapTriangleArrayFreed(omm->requestedSize);
+        freeAccelStruct(omm);
+      }
     }
     data.deletedTopAccelerationStructure.clear();
     data.deletedBottomAccelerationStructure.clear();
+    data.deletedOpacityMicroMapTriangleArrays.clear();
 
     BaseType::completeFrameExecution(info, data);
   }
@@ -266,8 +315,9 @@ public:
     return memoryUsed;
   }
 
-  RaytraceAccelerationStructure *newRaytraceTopAccelerationStructure(Device &device, uint64_t size);
-  RaytraceAccelerationStructure *newRaytraceBottomAccelerationStructure(Device &device, uint64_t size);
+  AccelerationStructureResult newRaytraceTopAccelerationStructure(Device &device, uint64_t size, ResourceTagType tag);
+  AccelerationStructureResult newRaytraceBottomAccelerationStructure(Device &device, uint64_t size, ResourceTagType tag);
+  AccelerationStructureResult createOpacityMicroMapTriangleArray(Device &device, uint64_t size, ResourceTagType tag);
 
   void deleteRaytraceTopAccelerationStructureOnFrameCompletion(RaytraceAccelerationStructure *ras)
   {
@@ -278,6 +328,11 @@ public:
   {
     accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>(
       [=](auto &data) { data.deletedBottomAccelerationStructure.push_back(ras); });
+  }
+  void deleteRaytraceOpacityMicroMapTriangleArrayOnFrameCompletion(RaytraceAccelerationStructure *ras)
+  {
+    accessRecodingPendingFrameCompletion<PendingForCompletedFrameData>(
+      [=](auto &data) { data.deletedOpacityMicroMapTriangleArrays.push_back(ras); });
   }
 };
 } // namespace drv3d_dx12::resource_manager

@@ -6,6 +6,10 @@ Location = prog/1stPartyLibs/daScript ;
 
 include $(Root)/prog/_jBuild/defaults.jam ;
 
+if $(DasAotLLVM) = yes {
+  CPPopt += -DDAS_LLVM_AOT ;
+}
+
 #WPO in win32 msvc2015 produces buggy code
 if $(Platform)-$(PlatformArch) = windows-x86 && $(UseWholeOpt) = yes && ! $(PlatformSpec) in clang vc15 vc16 vc17 {
   CPPopt += /GL- ;
@@ -20,6 +24,7 @@ TargetType  = lib ;
 Target      = 1stPartyLibs/daScript.lib ;
 AddIncludes =
   $(Root)/prog/1stPartyLibs/daScript/include
+  $(Root)/prog/1stPartyLibs/daScript/include/das_hash_map
   $(Root)/prog/1stPartyLibs/daScript/include/modules/uriparser
   $(Root)/prog/3rdPartyLibs/uriparser/include
   $(Root)/prog/3rdPartyLibs/fmt/include
@@ -45,6 +50,11 @@ if $(daScript_sanitizer) = 1 {
   CPPopt += -DDAS_SANITIZER=$(daScript_sanitizer) ;
 }
 
+if $(daScript_debugger) = 1 {
+  Target = $(Target:S=~deb$(daScript_debugger).lib) ;
+  CPPopt += -DDAS_DEBUGGER=$(daScript_debugger) ;
+}
+
 if $(daScript_keepalive) = 1 {
   Target = $(Target:S=~ka$(daScript_keepalive).lib) ;
   CPPopt += -DDAS_ENABLE_KEEPALIVE=$(daScript_keepalive) ;
@@ -56,6 +66,10 @@ if $(Platform) = macOS {
   CPPopt += -Wno-deprecated-declarations ;
 }
 
+if $(Config) in rel irel {
+  CPPopt += -DDAS_NO_ASSERTIONS=1 ;
+}
+
 # Fix for fmt library Unicode compilation errors
 CPPopt += -DFMT_UNICODE=0 ;
 
@@ -64,24 +78,28 @@ if $(daScript_ConsoleExe) = yes {
   CPPopt += -DDAS_DEFAULT_STDOUT ;
 }
 
-BuiltinFolder = src/builtin ;
-StringifySourceFile $(BuiltinFolder)/rtti.das : $(BuiltinFolder)/rtti.das.inc : $(BuiltinFolder)/module_builtin_rtti.cpp : "--full-string" ;
-StringifySourceFile $(BuiltinFolder)/fio.das : $(BuiltinFolder)/fio.das.inc : $(BuiltinFolder)/module_builtin_fio.cpp : "--full-string" ;
-StringifySourceFile $(BuiltinFolder)/builtin.das : $(BuiltinFolder)/builtin.das.inc : $(BuiltinFolder)/module_builtin_das.cpp : "--full-string" ;
-StringifySourceFile $(BuiltinFolder)/ast.das : $(BuiltinFolder)/ast.das.inc : $(BuiltinFolder)/module_builtin_ast.cpp : "--full-string" ;
-StringifySourceFile $(BuiltinFolder)/network.das : $(BuiltinFolder)/network.das.inc : $(BuiltinFolder)/module_builtin_network.cpp : "--full-string" ;
-StringifySourceFile $(BuiltinFolder)/debugger.das : $(BuiltinFolder)/debugger.das.inc : $(BuiltinFolder)/module_builtin_debugger.cpp : "--full-string" ;
-
-local AllSrcFolder_CPP = 
+local AllSrcFolder_CPP =
   src/ast
   src/builtin
+  src/runtime
   src/simulate
   src/misc
   src/parser
   src/modules/uriparser
+  src/hal
 ;
 
-AutoscanBuildLists $(AllSrcFolder_CPP) : *.cpp       : Sources ;
+# project_specific_file_info.cpp provides default get_file_access / get_context /
+# get_clone_context as link-time-resolved fallbacks. In dagor every executable
+# supplies its own (games via das_es.cpp + defaultFileAccess.cpp, tools via
+# dagorAdapter/da.cpp), so compiling this file into the lib produces duplicate
+# strong symbols (multiple definition of get_context/get_clone_context) at game
+# link time. Exclude it from the lib build.
+# src/hal/performance_time.cpp defines ref_time_ticks / get_time_usec / get_time_nsec /
+# ref_time_delta_to_usec, which dagor's engine kernel already provides (e.g.
+# engine/kernel/linux/linuxCpuFreq.cpp). Compiling it into the lib produces duplicate
+# strong symbols at link time, so exclude it too - dagor's kernel supplies these on every platform.
+AutoscanBuildLists $(AllSrcFolder_CPP) : *.cpp       : Sources : (project_specific_file_info\\.cpp|performance_time\\.cpp|\\.cpp\\.gen\\.es\\.cpp)$ ;
 
 local ExcOpt ;
 if $(Platform) in windows xboxOne scarlett {

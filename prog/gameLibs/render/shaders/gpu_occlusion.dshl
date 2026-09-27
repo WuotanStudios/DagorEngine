@@ -8,10 +8,6 @@ int downsampled_depth_mip_count;
 macro USE_REPROJECTED_HZB_OCCLUSION(code)
   bool use_reprojected_hzb = true;
   hlsl (code) {
-    #include <occlusion_type.hlsli>
-    #if OCCLUSION_BUFFER != OCCLUSION_INVWBUFFER
-      #error "shader uses reprojected hzb occlusion culling but current occlusion buffer packing is not supported"
-    #endif
     #define USE_REPROJECTED_HZB 1
   }
 endmacro
@@ -28,6 +24,7 @@ macro BASE_GPU_OCCLUSION(code)
       downsampled_depth_mip_count@f1 = (downsampled_depth_mip_count);
     }
   }
+
   hlsl(code)
   {
     #ifndef optional_hyperbolize_downsampled_depth

@@ -1,4 +1,5 @@
 from "%darg/ui_imports.nut" import *
+from "types" import Table
 let comboStyle = require("combobox.style.nut")
 
 let ComboPopupLayer = getconsttable()?.Layers.ComboPopup ?? 1
@@ -67,8 +68,8 @@ function setValueByOptions(opts, wdata, wupdate){
 function popupWrapper(popupContent, dropDirDown) {
   let align = dropDirDown ? ALIGN_TOP : ALIGN_BOTTOM
   let children = [
-    {size = static [flex(), ph(100)]}
-    {size = static [flex(), hdpx(2)]}
+    {size = const [flex(), ph(100)]}
+    {size = const [flex(), hdpx(2)]}
     popupContent
   ]
 
@@ -113,7 +114,7 @@ function combobox(watches, options, combo_style=comboStyle) {
   local changeVarOnListUpdate = true
   let xmbNode = combo_style?.xmbNode ?? XmbNode()
 
-  if (type(watches) == "table") {
+  if (watches instanceof Table) {
     wdata = watches.value
     wdisable = watches?.disable ?? {value=false}
     wupdate =  @(v) wdata.set(v)

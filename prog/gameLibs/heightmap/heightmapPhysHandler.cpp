@@ -16,6 +16,7 @@
 #include <memory/dag_physMem.h>
 #include <osApiWrappers/dag_sharedMem.h>
 #include <supp/dag_alloca.h>
+#include <stdio.h>
 
 #define PHYS_MEM_THRESHOLD_SIZE (32 << 20) // 4K^2*sizeof(uint16_t)
 
@@ -83,9 +84,10 @@ void HeightmapPhysHandler::initRaw(const uint16_t *raw, float cell, uint16_t w, 
     raw, hmapWidth.x, hmapWidth.y, blockShift, hrbSubSz);
 
   finalizeLoad();
+  measureMaxGradient();
 }
 
-bool HeightmapPhysHandler::loadDump(IGenLoad &loadCb, GlobalSharedMemStorage *sharedMem, int skip_mips)
+bool HeightmapPhysHandler::loadDump(IGenLoad &loadCb, int skip_mips)
 {
   hmapCellSize = loadCb.readReal() * (1 << skip_mips);
   hMin = loadCb.readReal();
@@ -96,7 +98,10 @@ bool HeightmapPhysHandler::loadDump(IGenLoad &loadCb, GlobalSharedMemStorage *sh
   int width_version = loadCb.readInt();
   int version = width_version >> HMAP_WIDTH_BITS;
   hmapWidth.x = (width_version & HMAP_WIDTH_MASK) >> skip_mips;
-  hmapWidth.y = (loadCb.readInt() >> skip_mips);
+  const uint32_t heightMirrored = loadCb.readInt();
+  mirror = heightMirrored >> 31; // "mirror" initial state is used to decide whether the land tracer is needed.
+  const uint32_t height = heightMirrored & 0x7FFFFFFF;
+  hmapWidth.y = (height >> skip_mips);
   excludeBounding[0].x = loadCb.readInt();
   excludeBounding[0].y = loadCb.readInt();
   excludeBounding[1].x = loadCb.readInt();
@@ -106,32 +111,33 @@ bool HeightmapPhysHandler::loadDump(IGenLoad &loadCb, GlobalSharedMemStorage *sh
   uint8_t hrbSubSz = (chunkSz & 0xF00) ? (1 << ((chunkSz >> 8) & 0xF)) : 0;
   const size_t allocatedDataSize = CompressedHeightmap::calc_data_size_needed(hmapWidth.x, hmapWidth.y, blockShift, hrbSubSz);
 
-  GlobalSharedMemStorage *sm = sharedMem;
-  bool own_data = false;
+  GlobalSharedMemStorage *sm = HeightmapPhysHandler::sharedMem;
+  char sm_ptr_name[256];
+  SNPRINTF(sm_ptr_name, sizeof(sm_ptr_name), "%s:%X", loadCb.getTargetName(), loadCb.tell());
+
   int t0_msec = 0;
-  if (sm && (hmap_data = sm->findPtr(loadCb.getTargetName(), _MAKE4C('HMAP'))) != NULL)
+  bool smNew = false;
+  if (sm && (hmap_data = sm->findOrAlloc(sm_ptr_name, HeightmapPhysHandler::SM_DATA_TAG, allocatedDataSize, smNew)) != NULL && !smNew)
   {
     int dump_sz = (int)sm->getPtrSize(hmap_data);
     G_ASSERT(allocatedDataSize <= dump_sz);
-    logmessage(_MAKE4C('SHMM'), "reusing HMAP dump from shared mem: : %p, %dK, '%s'", hmap_data, dump_sz >> 10,
-      loadCb.getTargetName());
+    logmessage(_MAKE4C('SHMM'), "reusing HMAP dump from shared mem: %p, %dK, '%s'", hmap_data, dump_sz >> 10, sm_ptr_name);
     compressed = CompressedHeightmap::init((uint8_t *)hmap_data, allocatedDataSize, hmapWidth.x, hmapWidth.y, blockShift, hrbSubSz);
   }
   else
   {
     if (sm)
     {
-      hmap_data = sm->allocPtr(loadCb.getTargetName(), _MAKE4C('HMAP'), allocatedDataSize);
       if (hmap_data)
         logmessage(_MAKE4C('SHMM'), "allocated HMAP dump in shared mem: %p, %dK, '%s' (mem %lluK/%lluK, rec=%d)", hmap_data,
-          allocatedDataSize >> 10, loadCb.getTargetName(), ((uint64_t)sm->getMemUsed()) >> 10, ((uint64_t)sm->getMemSize()) >> 10,
+          allocatedDataSize >> 10, sm_ptr_name, ((uint64_t)sm->getMemUsed()) >> 10, ((uint64_t)sm->getMemSize()) >> 10,
           sm->getRecUsed());
       else
         logmessage(_MAKE4C('SHMM'),
           "failed to allocate HMAP dump in shared mem: %p, %dK, '%s' (mem %lluK/%lluK, rec=%d); "
           "falling back to conventional allocator",
-          hmap_data, allocatedDataSize >> 10, loadCb.getTargetName(), ((uint64_t)sm->getMemUsed()) >> 10,
-          ((uint64_t)sm->getMemSize()) >> 10, sm->getRecUsed());
+          hmap_data, allocatedDataSize >> 10, sm_ptr_name, ((uint64_t)sm->getMemUsed()) >> 10, ((uint64_t)sm->getMemSize()) >> 10,
+          sm->getRecUsed());
     }
     if (!hmap_data)
     {
@@ -141,7 +147,6 @@ bool HeightmapPhysHandler::loadDump(IGenLoad &loadCb, GlobalSharedMemStorage *sh
         logerr("%s failed to allocate %dK", __FUNCTION__, allocatedDataSize >> 10);
         return false;
       }
-      own_data = true;
     }
 
     t0_msec = get_time_msec();
@@ -233,17 +238,22 @@ bool HeightmapPhysHandler::loadDump(IGenLoad &loadCb, GlobalSharedMemStorage *sh
 #endif
       loadCb.endBlock();
     }
+    if (sm && sm->doesPtrBelong(hmap_data))
+    {
+      if (dumpSharingReadOnly)
+        mark_global_shared_mem_readonly(hmap_data, allocatedDataSize, true);
+      sm->markPtrDataReady(hmap_data);
+    }
   }
-  if (!own_data)
-    hmap_data = NULL;
 
   finalizeLoad();
+  measureMaxGradient();
   unsigned grid_res = compressed.getBestHtRangeBlocksResolution(), grid_step = compressed.getW() / grid_res;
   debug("heightmap of size %dx%d at %@, minH=%g(real=%g) maxH=%g(real=%g)  memSz=%dK (%s), hier-grid %dx%d,L%d (blocks of %dx%d)"
         " [fmt=%d:%dK skip=%d] decoded for %d ms",
     hmapWidth.x, hmapWidth.y, worldPosOfs, hMin, worldBox[0].y, hMin + hScale, worldBox[1].y, compressed.dataSizeCurrent() >> 10,
-    hmap_data ? "owned" : "shared", grid_res, grid_res, compressed.htRangeBlocksLevels, grid_step, grid_step, version, chunkSz >> 10,
-    skip_mips, t0_msec ? get_time_msec() - t0_msec : 0);
+    isDataOwned() ? "owned" : "shared", grid_res, grid_res, compressed.htRangeBlocksLevels, grid_step, grid_step, version,
+    chunkSz >> 10, skip_mips, t0_msec ? get_time_msec() - t0_msec : 0);
   return true;
 }
 
@@ -281,15 +291,17 @@ bool HeightmapPhysHandler::repackCompressedData(uint8_t use_hrb_subsz)
   hmap_data = alloc_hmap_data(allocatedDataSize);
 
   compressed = CompressedHeightmap::compress((uint8_t *)hmap_data, allocatedDataSize, hmap16.data(), w, h, block_shift, use_hrb_subsz);
+  measureMaxGradient(); // close() dropped the bound, the heights did not change
   return true;
 }
 
 bool HeightmapPhysHandler::checkOrAllocateOwnData()
 {
-  if (hmap_data)
+  if (isDataOwned())
     return true;
 
   const size_t allocatedDataSize = compressed.dataSizeCurrent();
+  void *shared_hmap_ptr = hmap_data;
   hmap_data = alloc_hmap_data(allocatedDataSize);
   if (!hmap_data)
   {
@@ -298,21 +310,38 @@ bool HeightmapPhysHandler::checkOrAllocateOwnData()
   }
 
   memcpy(hmap_data, compressed.fullData, allocatedDataSize);
-  logmessage(_MAKE4C('SHMM'), "check and allocate new HMAP dump by copying: : %p, %dK %p", hmap_data, allocatedDataSize >> 10,
+  logmessage(_MAKE4C('SHMM'), "check and allocate new HMAP dump by copying: %p, %dK %p", hmap_data, allocatedDataSize >> 10,
     compressed.fullData);
   compressed = CompressedHeightmap::init((uint8_t *)hmap_data, allocatedDataSize, hmapWidth.x, hmapWidth.y,
     compressed.block_width_shift, compressed.htRangeBlocksLevels ? hmapWidth.x >> compressed.htRangeBlocksLevels : 0);
+  if (shared_hmap_ptr && sharedMem && sharedMem->doesPtrBelong(shared_hmap_ptr))
+    sharedMem->releasePtr(HeightmapPhysHandler::SM_DATA_TAG, shared_hmap_ptr);
   return true;
 }
 
 void HeightmapPhysHandler::close()
 {
+  if (hmap_data && sharedMem && sharedMem->doesPtrBelong(hmap_data))
+  {
+    sharedMem->releasePtr(HeightmapPhysHandler::SM_DATA_TAG, hmap_data);
+    hmap_data = nullptr;
+  }
   if (hmap_data)
   {
     const size_t allocatedDataSize = compressed.dataSizeCurrent();
     free_hmap_data(hmap_data, allocatedDataSize);
     hmap_data = NULL;
   }
+  // closed is a no-data state: a measure over it must see none
+  compressed = {};
+  maxGradient = 1e9f;
+  maxGradientDirty.setEmpty();
+}
+
+void HeightmapPhysHandler::measureMaxGradient()
+{
+  maxGradient = compressed && hmapCellSize > 0 ? calc_hmap_max_neighbor_delta(compressed) * hScaleRaw / hmapCellSize : 1e9f;
+  maxGradientDirty.setEmpty();
 }
 
 Point3 HeightmapPhysHandler::getClippedOrigin(const Point3 &origin_pos) const
@@ -364,13 +393,13 @@ bool HeightmapPhysHandler::traceray(const Point3 &p, const Point3 &dir, real &t,
   rayBox += end;
   if (!(worldBox & rayBox))
     return false;
-  if (!v_test_segment_box_intersection(v_ldu(&p.x), v_ld(&end.x), vecbox))
+  if (!v_test_segment_box_intersection(v_ldu_p3_safe(&p.x), v_ld(&end.x), vecbox))
     return false;
   return trace_ray_midpoint_heightmap(*this, p, dir, t, normal, cull);
 }
 bool HeightmapPhysHandler::rayhitNormalized(const Point3 &p, const Point3 &normDir, real t) const
 {
-  vec3f pt = v_ldu(&p.x), end = v_madd(v_ldu(&normDir.x), v_splats(t), pt);
+  vec3f pt = v_ldu_p3_safe(&p.x), end = v_madd(v_ldu_p3_safe(&normDir.x), v_splats(t), pt);
   bbox3f rayBox;
   rayBox.bmin = v_min(end, pt);
   rayBox.bmax = v_max(end, pt);
@@ -388,7 +417,7 @@ bool HeightmapPhysHandler::rayUnderHeightmapNormalized(const Point3 &p, const Po
   rayBox += end;
   if (!(worldBox & rayBox))
     return false;
-  if (!v_test_segment_box_intersection(v_ldu(&p.x), v_ld(&end.x), vecbox))
+  if (!v_test_segment_box_intersection(v_ldu_p3_safe(&p.x), v_ld(&end.x), vecbox))
     return false;
   return ray_under_heightmap(*this, p, normDir, t);
 }
@@ -528,3 +557,8 @@ void HeightmapPhysHandler::updateBlockMinMax(uint32_t blockId, uint16_t ht, floa
   }
   block = CompressedHeightmap::BlockInfo{uint16_t(nextMin), uint16_t(nextDelta)};
 }
+
+bool HeightmapPhysHandler::isDataOwned() const { return hmap_data && (!sharedMem || !sharedMem->doesPtrBelong(hmap_data)); }
+
+bool HeightmapPhysHandler::dumpSharingReadOnly = true;
+GlobalSharedMemStorage *HeightmapPhysHandler::sharedMem = nullptr;

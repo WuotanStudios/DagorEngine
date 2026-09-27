@@ -25,11 +25,14 @@ enum ProfilerMetricId
   M_BHV_BEFORE_RENDER,
   M_ETREE_BEFORE_RENDER,
   M_RECALC_LAYOUT,
+  M_FRP_UPDATE,
+  M_REBUILD,
+  M_ETREE_REBUILD,
   M_DBG,
   NUM_PROFILER_METRICS
 };
 
-extern const char *profiler_metric_names[NUM_PROFILER_METRICS];
+extern const char *const *profiler_metric_names;
 
 
 struct Metric

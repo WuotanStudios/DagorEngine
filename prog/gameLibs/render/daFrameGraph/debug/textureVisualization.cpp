@@ -86,7 +86,7 @@ void overlay_checkbox(const char *label)
 
 static UniqueTex create_empty_debug_tex(int fmt, int w, int h, int miplevels, const char *name)
 {
-  return dag::create_tex(nullptr, w, h, fmt, miplevels, name);
+  return dag::create_tex(nullptr, w, h, fmt, miplevels, name, RESTAG_DEBUG);
 }
 
 static const char *get_selected_resource_name(dafg::ResNameId nameId, const dafg::InternalRegistry &registry)
@@ -226,7 +226,7 @@ auto reconstruct_namespace_request(dafg::Registry reg, const char *full_path)
 
 // Normally it's not allowed to modify framegraph structure when it's being executed.
 // Modifies are deferred in fact, it's needed to prevent user mistakes.
-// However, texture visulization may be rendered in the node and it should be able to create debug nodes on the fly.
+// However, texture visualization may be rendered in the node and it should be able to create debug nodes on the fly.
 // So need to workaround graph change lock.
 class DebugNodeRegisterScope
 {
@@ -252,36 +252,39 @@ private:
 };
 
 template <bool debug_focus = true>
-static dafg::NodeHandle makeDebugTextureCopyNode(const Selection &selection, dafg::InternalRegistry &internalRegistry,
+static dafg::NodeHandle make_debug_texture_copy_node(const Selection &selection, dafg::InternalRegistry &internal_registry,
   UniqueTex &texture, const char *texture_name)
 {
-  String nodeName({}, "debug_%s_copy_node", texture_name);
+  String nodeName({}, ".debug_%s%s_copy_node", texture_name, selection.history ? "_history" : "");
   nodeName.replaceAll("/", "_");
-  String textureName({}, "debug_%s_copy", texture_name);
+  String textureName({}, ".debug_%s%s_copy", texture_name, selection.history ? "_history" : "");
   textureName.replaceAll("/", "_");
   return dafg::register_node(nodeName, DAFG_PP_NODE_SRC,
-    [selection, &internalRegistry, nodeName, &texture, textureName](dafg::Registry registry) {
+    [selection, &internal_registry, nodeName, &texture, textureName](dafg::Registry registry) {
       registry.executionHas(dafg::SideEffects::External);
 
-      const auto ourId = internalRegistry.knownNames.getNameId<dafg::NodeNameId>(internalRegistry.knownNames.root(), nodeName);
+      const auto ourId = internal_registry.knownNames.getNameId<dafg::NodeNameId>(internal_registry.knownNames.root(), nodeName);
 
-      const auto fullSelectedResName = internalRegistry.knownNames.getName(selection.what);
+      const auto fullSelectedResName = internal_registry.knownNames.getName(selection.what);
       const auto resNs = reconstruct_namespace_request(registry, fullSelectedResName);
-      const auto shortSelectedResName = internalRegistry.knownNames.getShortName(selection.what);
+      const auto shortSelectedResName = internal_registry.knownNames.getShortName(selection.what);
 
       dafg::VirtualResourceHandle<const BaseTexture, true, false> hndl =
-        resNs.read(shortSelectedResName).texture().atStage(dafg::Stage::TRANSFER).useAs(dafg::Usage::COPY).handle();
+        selection.history
+          ? resNs.readTextureHistory(shortSelectedResName).atStage(dafg::Stage::TRANSFER).useAs(dafg::Usage::COPY).handle()
+          : resNs.read(shortSelectedResName).texture().atStage(dafg::Stage::TRANSFER).useAs(dafg::Usage::COPY).handle();
 
 
-      if (auto prec = eastl::get_if<PreciseTimePoint>(&selection.when))
+      // Order and trick with readResources are not required for history copy
+      if (auto prec = eastl::get_if<PreciseTimePoint>(&selection.when); prec && !selection.history)
       {
         // Must be done this way in order to work with namespaces, user-facing
         // API does not permit explicit ordering with nodes in different namespaces.
-        internalRegistry.nodes[ourId].precedingNodeIds.insert(prec->precedingNode);
-        internalRegistry.nodes[ourId].followingNodeIds.insert(prec->followingNode);
+        internal_registry.nodes[ourId].precedingNodeIds.insert(prec->precedingNode);
+        internal_registry.nodes[ourId].followingNodeIds.insert(prec->followingNode);
         // Since we  want to read resources from anywhere within a framegraph when doing precise selection,
         // we need to clear readResources of this node in order to prevent possible cycles.
-        internalRegistry.nodes[ourId].readResources.clear();
+        internal_registry.nodes[ourId].readResources.clear();
       }
 
       return [hndl, fullSelectedResName, &texture, textureName]() {
@@ -324,9 +327,13 @@ static bool operator==(const PreciseTimePoint &lhs, const PreciseTimePoint &rhs)
   return lhs.precedingNode == rhs.precedingNode && lhs.followingNode == rhs.followingNode;
 }
 
-static bool operator==(const Selection &lhs, const Selection &rhs) { return lhs.when == rhs.when && lhs.what == rhs.what; }
+static bool operator==(const Selection &lhs, const Selection &rhs)
+{
+  return lhs.when == rhs.when && lhs.what == rhs.what && lhs.history == rhs.history;
+}
 
-void update_fg_debug_tex(const eastl::optional<Selection> &selection, dafg::InternalRegistry &registry)
+void update_fg_debug_tex(const eastl::optional<Selection> &selection, dafg::InternalRegistry &registry,
+  const dafg::DependencyData &dep_data)
 {
   const bool changed = selection != savedSelection;
   if (changed)
@@ -335,7 +342,9 @@ void update_fg_debug_tex(const eastl::optional<Selection> &selection, dafg::Inte
     runShowTex = true;
     if (selection)
     {
-      if (registry.resources[selection->what].type != dafg::ResourceType::Texture)
+      const auto &createdResData = registry.resources[dep_data.renamingRepresentatives[selection->what]].createdResData;
+
+      if (createdResData->type != dafg::ResourceType::Texture)
       {
         selectedResourceIsATexture = false;
         return;
@@ -344,7 +353,7 @@ void update_fg_debug_tex(const eastl::optional<Selection> &selection, dafg::Inte
       savedSelection = selection;
       close_visualization_texture();
       debugTextureCopyNode =
-        makeDebugTextureCopyNode(*selection, registry, copiedTexture, get_selected_resource_name(selection->what, registry));
+        make_debug_texture_copy_node(*selection, registry, copiedTexture, get_selected_resource_name(selection->what, registry));
     }
     else
     {
@@ -397,7 +406,7 @@ public:
   {
     close();
     DebugNodeRegisterScope debugRegistration;
-    readerNode = makeDebugTextureCopyNode<false>(selection, *registry, texture, name);
+    readerNode = make_debug_texture_copy_node<false>(selection, *registry, texture, name);
   }
 
   void close() override
@@ -461,19 +470,21 @@ void update_external_texture_visualization(dafg::InternalRegistry &registry, con
 
   for (const auto [resId, lifetime] : dep_data.resourceLifetimes.enumerate())
   {
-    if (registry.resources[resId].type != dafg::ResourceType::Texture)
+    const auto &createdResData = registry.resources[dep_data.renamingRepresentatives[resId]].createdResData;
+
+    if (!createdResData.has_value() || createdResData->type != dafg::ResourceType::Texture)
       continue;
 
     if (lifetime.consumedBy == dafg::NodeNameId::Invalid && lifetime.readers.empty())
       continue;
 
     TextureInfo info{};
-    if (auto resInfo = eastl::get_if<dafg::Texture2dCreateInfo>(&registry.resources[resId].creationInfo))
+    if (auto resInfo = eastl::get_if<dafg::Texture2dCreateInfo>(&createdResData->creationInfo))
     {
       info.type = D3DResourceType::TEX;
       info.cflg = resInfo->creationFlags;
     }
-    else if (auto resInfo = eastl::get_if<dafg::Texture3dCreateInfo>(&registry.resources[resId].creationInfo))
+    else if (auto resInfo = eastl::get_if<dafg::Texture3dCreateInfo>(&createdResData->creationInfo))
     {
       info.type = D3DResourceType::VOLTEX;
       info.cflg = resInfo->creationFlags;

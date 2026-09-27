@@ -3,6 +3,7 @@
 
 #include <EditorCore/ec_rendEdObject.h>
 #include <de3_composit.h>
+#include <rendInst/rendInstConsts.h>
 #include <util/dag_simpleString.h>
 #include "hmlLayers.h"
 
@@ -49,8 +50,6 @@ public:
   void onRemove(ObjectEditor *) override;
   void onAdd(ObjectEditor *objEditor) override;
 
-  bool setPos(const Point3 &p) override;
-
   void putMoveUndo() override;
 
   void onObjectNameChange(RenderableEditableObject *obj, const char *old_name, const char *new_name) override { objectPropsChanged(); }
@@ -73,6 +72,12 @@ public:
   int getEditLayerIdx() const { return editLayerIdx; }
   int lpIndex() const { return EditLayerProps::ENT; };
 
+  int getRenderLayerIdx() const;
+
+  // Moves the internal entity to the appropriate layer.
+  // Call it after creating the entity, and after anything that changes isHidden().
+  void applyLayerIdxToEntity(bool use_render_layer = true);
+
   struct Props
   {
     enum
@@ -90,6 +95,8 @@ public:
     SimpleString entityName;
     int placeType = PT_coll;
     bool overridePlaceTypeForComposit = false;
+    bool overrideAutoInstSeed = false;
+    bool autoInstSeed = true;
 
     String notes;
   };
@@ -106,12 +113,8 @@ public:
   IObjEntity *getEntity() { return entity; }
 
   bool usesRendinstPlacement() const override { return props.placeType == props.PT_riColl; }
-  void setCollisionIgnored() override
-  {
-    oldPerInstSeed = perInstSeed;
-    setPerInstSeed(0xBAD);
-  }
-  void resetCollisionIgnored() override { setPerInstSeed(oldPerInstSeed); }
+  void setCollisionIgnored() override;
+  void resetCollisionIgnored() override;
 
   struct FxProps
   {
@@ -142,6 +145,9 @@ public:
     const char *initially_selected_asset_name);
 
   void setGizmoTranformMode(bool enable);
+  void setInteractiveMove(bool on);
+  void setHiddenFromPlacementTrace(bool hide);
+  void generatePinnedPerInstSeed();
 
 protected:
   struct CollidersData
@@ -185,6 +191,9 @@ protected:
   bool isCollidable;
   int editLayerIdx = 0;
   bool gizmoEnabled = false;
+  bool interactiveMove = false; // the object follows the mouse, see setInteractiveMove()
+  bool riExtraCollisionIgnored = false;
+  int subtypeBeforeTraceHide = -1; // real subtype while ST_NOT_COLLIDABLE is held, -1 when not held
 
   static CollidersData colliders;
 
@@ -201,7 +210,10 @@ protected:
   void setPosOnCollision(Point3 pos, bool setup_ri_collision = true);
   void rePlaceAllEntities();
   void fillMaterialProps(PropPanel::ContainerPropertyControl &panel);
+  void setIgnoreRiExtraCollisionInEntity();
 
+  // No merge key: UndoPropsChange rebuilds the entity from these colliders, so folding a restore away
+  // would change what it reads.
   class UndoStaticPropsChange : public UndoRedoObject
   {
     LandscapeEntityObject::CollidersData oldData, redoData;
@@ -231,7 +243,7 @@ protected:
     LandscapeEntityObject::Props oldProps, redoProps;
 
   protected:
-    LandscapeEntityObject *getObj() { return obj; }
+    LandscapeEntityObject *getObj() const { return obj; }
 
   public:
     UndoPropsChange(LandscapeEntityObject *o) : obj(o) { oldProps = redoProps = obj->props; }
@@ -246,7 +258,43 @@ protected:
     void redo() override { obj->setProps(redoProps); }
 
     size_t size() override { return sizeof(*this); }
+    // setProps rebuilds the entity from perInstSeed and the static colliders, so UndoPerInstSeedChange
+    // and UndoStaticPropsChange have to restore before this one.
+    UNDO_MERGE_SNAPSHOT_BY_TARGET(0x065BBE83u, obj.get()) // LandscapeEntityObject_UndoPropsChange
     void accepted() override {}
     void get_description(String &s) override { s = "UndoEntityPropsChange"; }
+  };
+
+  // perInstSeed lives outside Props, so UndoPropsChange does not cover it. An edit that generates a pinned
+  // seed has to put this too, or its undo would restore the props and leave the object pinned - and
+  // propsChanged() would hand the pin straight back to the rebuilt entity.
+  // No merge key either, same reason as UndoStaticPropsChange.
+  class UndoPerInstSeedChange : public UndoRedoObject
+  {
+    Ptr<LandscapeEntityObject> obj;
+    int oldSeed, redoSeed;
+
+  public:
+    UndoPerInstSeedChange(LandscapeEntityObject *o) : obj(o), oldSeed(o->perInstSeed), redoSeed(o->perInstSeed) {}
+
+    // setPerInstanceSeed() re-places a composit's whole subtree and has no guard of its own, so an
+    // unchanged seed must not reach it: the record is put for a whole selection, most of which never moved.
+    void restore(bool save_redo) override
+    {
+      if (save_redo)
+        redoSeed = obj->perInstSeed;
+      if (obj->perInstSeed != oldSeed)
+        obj->setPerInstSeed(oldSeed); // 0 puts the object back on the position hash
+    }
+
+    void redo() override
+    {
+      if (obj->perInstSeed != redoSeed)
+        obj->setPerInstSeed(redoSeed);
+    }
+
+    size_t size() override { return sizeof(*this); }
+    void accepted() override {}
+    void get_description(String &s) override { s = "UndoEntityPerInstSeedChange"; }
   };
 };

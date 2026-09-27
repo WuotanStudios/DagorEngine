@@ -32,6 +32,20 @@
 #include "device_context.h"
 #include "timeline_latency.h"
 #include "command.h"
+#include "os.h"
+#include <drv_utils.h>
+#include "global_const_buffer.h"
+#include "backend/cmd/debug.h"
+#include "backend/cmd/misc.h"
+#include "backend/cmd/vendor_exts.h"
+#include "backend/cmd/query.h"
+#include "backend/cmd/state.h"
+#include "backend/cmd/sync.h"
+#include "amd_anti_lag.h"
+#include "backend.h"
+#include "pipeline/compiler.h"
+#include "amdFsr.h"
+#include "xess.h"
 
 #if DAGOR_DBGLEVEL > 0
 #include "3d/dag_resourceDump.h"
@@ -62,8 +76,21 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
     }
       return 1;
     case Drv3dCommand::DEBUG_MESSAGE:
-      Globals::ctx.writeDebugMessage(static_cast<const char *>(par1), reinterpret_cast<intptr_t>(par2),
-        reinterpret_cast<intptr_t>(par3));
+    {
+      const char *msg = static_cast<const char *>(par1);
+      intptr_t msgLength = reinterpret_cast<intptr_t>(par2);
+      intptr_t severity = reinterpret_cast<intptr_t>(par3);
+      if (msgLength <= 0)
+        msgLength = strlen(msg);
+
+      CmdWriteDebugMessage cmd;
+      cmd.severity = severity;
+      OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+      cmd.messageIndex = StringIndexRef{Frontend::replay->charStore.size()};
+      Frontend::replay->charStore.insert(Frontend::replay->charStore.end(), msg, msg + msgLength);
+      Frontend::replay->charStore.push_back(0);
+      Globals::ctx.dispatchCmdNoLock(cmd);
+    }
       return 1;
     case Drv3dCommand::GET_TIMINGS:
       *reinterpret_cast<Drv3dTimings *>(par1) = Frontend::timings.get(reinterpret_cast<uintptr_t>(par2));
@@ -77,11 +104,17 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
         return 1;
       }
       break;
-    case Drv3dCommand::AFTERMATH_MARKER: Globals::ctx.placeAftermathMarker((const char *)par1); break;
-    case Drv3dCommand::SET_VS_DEBUG_INFO:
-    case Drv3dCommand::SET_PS_DEBUG_INFO:
-      Globals::shaderProgramDatabase.setShaderDebugName(ShaderID(*(int *)par1), (const char *)par2);
-      break;
+    case Drv3dCommand::AFTERMATH_MARKER:
+      if (Globals::cfg.debugLevel)
+      {
+        const char *name = (const char *)par1;
+        CmdPlaceAftermathMarker cmd;
+        OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+        cmd.stringIndex = StringIndexRef{Frontend::replay->charStore.size()};
+        Frontend::replay->charStore.insert(Frontend::replay->charStore.end(), name, name + strlen(name) + 1);
+        Globals::ctx.dispatchCmdNoLock(cmd);
+      }
+      return 1;
     case Drv3dCommand::D3D_FLUSH:
     case Drv3dCommand::GPU_BARRIER_WAIT_ALL_COMMANDS: // TODO: Implement GPU_BARRIER_WAIT_ALL_COMMANDS separately
       // driver can merge multiple queue submits
@@ -98,6 +131,16 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
           debug("vulkan: flush %u:%s taken %u us", (uintptr_t)par2, (const char *)par1, flushTime);
       }
       break;
+    case Drv3dCommand::D3D_FLUSH_COMMAND_BUFFER:
+    {
+      TIME_PROFILE(vulkan_wait_for_backend_drain);
+      Globals::lock.acquire();
+      Globals::ctx.flushDraws(); // submits current replay to backend
+      while (!Globals::timelines.get<TimelineManager::CpuReplay>().waitAdvance(0, MAX_REPLAY_WAIT_TRIES))
+        ;
+      Globals::lock.release();
+    }
+    break;
     case Drv3dCommand::COMPILE_PIPELINE:
     {
       G_ASSERTF(Globals::lock.isAcquired(), "pipeline compilation requires gpu lock");
@@ -108,10 +151,14 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
         case STAGE_PS:
         {
           const VkPrimitiveTopology topology = translate_primitive_topology_to_vulkan((uintptr_t)par2);
-          Globals::ctx.compileGraphicsPipeline(topology);
+          Frontend::GCB.flushGraphics(Globals::ctx);
+          Globals::ctx.dispatchPipeline<CmdCompileGraphicsPipeline>({topology}, "compileGraphicsPipeline");
           break;
         }
-        case STAGE_CS: Globals::ctx.compileComputePipeline(); break;
+        case STAGE_CS:
+          Frontend::GCB.flushCompute(Globals::ctx);
+          Globals::ctx.dispatchPipeline<CmdCompileComputePipeline>({}, "compileComputePipeline");
+          break;
         default:
         {
           G_ASSERTF(false, "Unsupported pipeline type(%u) for compilation", (unsigned)pipelineType);
@@ -129,8 +176,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
       if (par1 == nullptr)
         mask = par2 == nullptr ? PipelineManager::ASYNC_MASK_ALL : PipelineManager::ASYNC_MASK_RENDER;
 
-      CmdPipelineCompilationTimeBudget cmd{mask};
-      Globals::ctx.dispatchCommand(cmd);
+      Globals::ctx.dispatchCmd<CmdPipelineCompilationTimeBudget>({mask});
       asyncCompileStack.push_back(mask);
       return 1;
     }
@@ -141,8 +187,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
       asyncCompileStack.pop_back();
       PipelineManager::AsyncMask mask = asyncCompileStack.size() ? asyncCompileStack.back() : PipelineManager::ASYNC_MASK_NONE;
 
-      CmdPipelineCompilationTimeBudget cmd{mask};
-      Globals::ctx.dispatchCommand(cmd);
+      Globals::ctx.dispatchCmd<CmdPipelineCompilationTimeBudget>({mask});
       return 1;
     }
     case Drv3dCommand::GET_PIPELINE_COMPILATION_QUEUE_LENGTH:
@@ -151,6 +196,11 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
         uint32_t *frameLatency = static_cast<uint32_t *>(par1);
         *frameLatency = TimelineLatency::replayToGPUCompletion;
       }
+      if (par2)
+      {
+        size_t *absCompiledPipes = static_cast<size_t *>(par2);
+        *absCompiledPipes = Backend::pipelineCompiler.getCompiledPipes() + 1; // offset to show that feature is implemented to caller
+      }
       return Globals::ctx.getPiplineCompilationQueueLength();
       break;
     case Drv3dCommand::ACQUIRE_OWNERSHIP: Globals::lock.acquire(); break;
@@ -158,10 +208,13 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
 
     // TriggerMultiFrameCapture causes crashes on some android devices but 1 frame capture works correctly
     // so free command slot it used for that
-    case Drv3dCommand::PIX_GPU_CAPTURE_NEXT_FRAMES: Globals::Dbg::rdoc.triggerCapture(reinterpret_cast<uintptr_t>(par3)); break;
+    case Drv3dCommand::PIX_GPU_CAPTURE_NEXT_FRAMES:
+      Globals::Dbg::rdoc.setCapturePathTemplate(reinterpret_cast<const wchar_t *>(par2));
+      Globals::Dbg::rdoc.triggerCapture(reinterpret_cast<uintptr_t>(par3));
+      break;
 
     // Must be used in conjuction with Drv3dCommand::PIX_GPU_END_CAPTURE
-    case Drv3dCommand::PIX_GPU_BEGIN_CAPTURE: Globals::Dbg::rdoc.beginCapture(); break;
+    case Drv3dCommand::PIX_GPU_BEGIN_CAPTURE: Globals::Dbg::rdoc.beginCapture(reinterpret_cast<const wchar_t *>(par2)); break;
 
     // Must be used in conjuction with Drv3dCommand::PIX_GPU_BEGIN_CAPTURE
     case Drv3dCommand::PIX_GPU_END_CAPTURE: Globals::Dbg::rdoc.endCapture(); break;
@@ -176,7 +229,29 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
     {
       G_ASSERTF(par1, "vulkan: par1 for Drv3dCommand::TIMESTAMPISSUE must be not null");
       QueryId &qId = *(reinterpret_cast<QueryId *>(par1));
-      qId = Globals::cfg.has.gpuTimestamps ? Globals::ctx.insertTimestamp() : 0;
+      qId = 0;
+      if (Globals::cfg.has.gpuTimestamps)
+      {
+        size_t replayId;
+        QueryIndex qIdx;
+        if (Frontend::State::pod.reorderTimestamps)
+        {
+          replayId = Frontend::replay->id;
+          qIdx = Globals::timestamps.allocate();
+          G_ASSERTF(Frontend::replay->reorderedTimestampQueriesCount == qIdx,
+            "vulkan: only tight addition of reordered timestamps for now. %u vs %u", Frontend::replay->reorderedTimestampQueriesCount,
+            qIdx);
+          Frontend::replay->reorderedTimestampQueriesCount = qIdx + 1;
+        }
+        else
+        {
+          OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+          replayId = Frontend::replay->id;
+          qIdx = Globals::timestamps.allocate();
+          Globals::ctx.dispatchCmdNoLock<CmdInsertTimesampQuery>({});
+        }
+        qId = Globals::timestamps.encodeId(qIdx, replayId);
+      }
       return 1;
     }
     break;
@@ -185,7 +260,12 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
       if (!par1)
         return 0;
 
-      uint64_t gpuTimeStamp = Globals::ctx.getTimestampResult(reinterpret_cast<QueryId>(par1));
+      uint64_t gpuTimeStamp = 0;
+      {
+        QueryId queryId = reinterpret_cast<QueryId>(par1);
+        OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+        gpuTimeStamp = Globals::timestamps.getResult(queryId, 0, 1);
+      }
       if (!gpuTimeStamp)
         return 0;
 
@@ -288,47 +368,125 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
     }
     case Drv3dCommand::GET_VIDEO_MEMORY_BUDGET:
     {
-      uint32_t totalMemory = Globals::VK::phy.getAvailableVideoMemoryKb();
+      // need to call this first to update budget
+      uint32_t availableMemory = Globals::Mem::pool.getCurrentAvailableDeviceKb();
+      uint32_t memoryBudget = Globals::VK::phy.calculateAvailableDeviceLocalMemoryBudgetKb();
       if (par1)
-        *reinterpret_cast<uint32_t *>(par1) = totalMemory;
+        *reinterpret_cast<uint32_t *>(par1) = memoryBudget;
       if (par2 || par3)
       {
-        uint32_t availableMemory = Globals::Mem::pool.getCurrentAvailableDeviceKb();
-        availableMemory = min<uint32_t>(totalMemory, availableMemory);
-        if (availableMemory == 0)
+        availableMemory = min<uint32_t>(memoryBudget, availableMemory);
+        if (availableMemory == 0 && !Globals::VK::phy.memoryBudgetInfoAvailable)
           return 0;
         if (par2)
           *reinterpret_cast<uint32_t *>(par2) = availableMemory;
         if (par3)
-          *reinterpret_cast<uint32_t *>(par3) = totalMemory - availableMemory; // it is always positive
+          *reinterpret_cast<uint32_t *>(par3) = memoryBudget - availableMemory; // it is always positive
       }
-      return totalMemory;
+      return Globals::VK::phy.getAvailableVideoMemoryKb();
     }
+    case Drv3dCommand::GET_PRESENTED_FRAME_COUNT: return Backend::interop.lastPresentedFrameCount.load(std::memory_order_relaxed);
 
 #if USE_STREAMLINE_FOR_DLSS
     case Drv3dCommand::GET_STREAMLINE:
     {
-      *static_cast<void **>(par1) =
-        drv3d_vulkan::Globals::VK::loader.streamlineAdapter ? &drv3d_vulkan::Globals::VK::loader.streamlineAdapter.value() : nullptr;
-      return 1;
+      auto &sl = *static_cast<nv::Streamline **>(par1);
+      if (drv3d_vulkan::Globals::VK::loader.streamlineAdapter)
+      {
+        sl = &drv3d_vulkan::Globals::VK::loader.streamlineAdapter.value();
+        return 1;
+      }
+      return 0;
     }
     break;
     case Drv3dCommand::EXECUTE_DLSS:
     {
-      Globals::ctx.executeStreamlineDlss(*(nv::DlssParams<> *)par1, par2 ? *(int *)par2 : 0);
+      nv::DlssParams<BaseTexture> &dlssParamsDrv = *(nv::DlssParams<BaseTexture> *)par1;
+      int viewIndex = par2 ? *(int *)par2 : 0;
+
+      nv::DlssParams<Image> dlssParams =
+        nv::convertDlssParams(dlssParamsDrv, [](BaseTexture *t) { return t ? cast_to_texture_base(t)->image : nullptr; });
+
+      Globals::ctx.dispatchCmd<CmdExecuteStreamlineDLSS>({dlssParams, viewIndex});
+      return 1;
+    }
+    break;
+    case Drv3dCommand::EXECUTE_DLSS_G:
+    {
+      nv::DlssGParams<BaseTexture> &dlssGParamsDrv = *(nv::DlssGParams<BaseTexture> *)par1;
+      int viewIndex = par2 ? *(int *)par2 : 0;
+
+      nv::DlssGParams<Image> dlssGParams =
+        nv::convertDlssGParams(dlssGParamsDrv, [](BaseTexture *t) { return t ? cast_to_texture_base(t)->image : nullptr; });
+
+      Globals::ctx.dispatchCmd<CmdExecuteStreamlineDLSSG>({dlssGParams, viewIndex});
+      return 1;
+    }
+    break;
+    case Drv3dCommand::SET_DLSS_G_ENABLED:
+    {
+      int framesToGenerate = par1 ? *(int *)par1 : 0;
+      int viewIndex = par2 ? *(int *)par2 : 0;
+      Globals::ctx.dispatchCmd<CmdSetDlssGEnabled>({framesToGenerate, viewIndex});
+      return 1;
+    }
+    break;
+    case Drv3dCommand::SET_DLSS_OPTIONS:
+    {
+      nv::DlssOptions &options = *(nv::DlssOptions *)par1;
+      int viewIndex = par2 ? *(int *)par2 : 0;
+      Globals::ctx.dispatchCmd<CmdSetDlssOptions>({options, viewIndex});
+      return 1;
+    }
+    break;
+    case Drv3dCommand::EXECUTE_DLSS_NR:
+    {
+      nv::DlssNRParams<BaseTexture> &dlssNRParamsDrv = *(nv::DlssNRParams<BaseTexture> *)par1;
+      int viewIndex = par2 ? *(int *)par2 : 0;
+
+      nv::DlssNRParams<Image> dlssNRParams =
+        nv::convertDlssNRParams(dlssNRParamsDrv, [](BaseTexture *t) { return t ? cast_to_texture_base(t)->image : nullptr; });
+
+      Globals::ctx.dispatchCmd<CmdExecuteStreamlineDLSSNR>({dlssNRParams, viewIndex});
+      return 1;
+    }
+    break;
+    case Drv3dCommand::SET_DLSS_NR_OPTIONS:
+    {
+      nv::DlssNROptions &options = *(nv::DlssNROptions *)par1;
+      int viewIndex = par2 ? *(int *)par2 : 0;
+      Globals::ctx.dispatchCmd<CmdSetDlssNROptions>({options, viewIndex});
       return 1;
     }
     break;
 #else
     case Drv3dCommand::GET_DLSS:
     {
+      if (drv3d_vulkan::Globals::dlss.getState() != nv::DLSS::State::SUPPORTED)
+        return 0;
       *(nv::DLSS **)par1 = &drv3d_vulkan::Globals::dlss;
       return 1;
     }
     break;
     case Drv3dCommand::EXECUTE_DLSS_NO_STREAMLINE:
     {
-      Globals::ctx.executeDLSS(*(nv::DlssParams<BaseTexture> *)par1);
+      const nv::DlssParams<BaseTexture> &params = *(nv::DlssParams<BaseTexture> *)par1;
+      auto cast_to_image = [](BaseTexture *src) {
+        if (src)
+          return cast_to_texture_base(src)->image;
+        return (Image *)nullptr;
+      };
+
+      Globals::ctx.dispatchCmd<CmdExecuteDLSS>({convertDlssParams(params, cast_to_image)});
+      return 1;
+    }
+    break;
+    case Drv3dCommand::SET_DLSS_OPTIONS:
+    {
+      const nv::DlssOptions &options = *(nv::DlssOptions *)par1;
+      // Native NGX: (re)create the feature on the backend, where the NGX work runs.
+      Globals::ctx.dispatchCmd<CmdInitializeDLSS>({int(options.mode), options.outputResolution.x, options.outputResolution.y,
+        options.useRayReconstruction, options.useLegacyModel});
       return 1;
     }
     break;
@@ -341,6 +499,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
 #if _TARGET_PC_WIN
         case GpuVendor::NVIDIA: *(GpuLatency **)par2 = create_gpu_latency_nvidia(); break;
 #endif
+        case GpuVendor::AMD: *(GpuLatency **)par2 = create_gpu_latency_amd_anti_lag(); break;
         default: *(GpuLatency **)par2 = nullptr; return 0;
       }
 
@@ -355,7 +514,99 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
     case Drv3dCommand::GET_QUEUE_INDEX:
       *(uint32_t *)par1 = drv3d_vulkan::Globals::VK::queue[DeviceQueueType::GRAPHICS].getIndex();
       return 1;
-    case Drv3dCommand::EXECUTE_FSR: Globals::ctx.executeFSR((amd::FSR *)par1, *(const amd::FSR::UpscalingArgs *)par2); return 1;
+    case Drv3dCommand::INIT_FSR_UPSCALING:
+    {
+      amd::FSRVulkan &fsr = amd::FSRVulkan::getInstance();
+      fsr.teardownUpscaling();
+      return int(fsr.initUpscaling(*reinterpret_cast<const amd::FSR::ContextArgs *>(par1)));
+    }
+    case Drv3dCommand::TEARDOWN_FSR_UPSCALING:
+    {
+      if (amd::FSRVulkan *fsr = amd::FSRVulkan::getExistingInstance())
+        fsr->teardownUpscaling();
+      return 1;
+    }
+    case Drv3dCommand::GET_FSR_LOADED:
+    {
+      return int(amd::FSRVulkan::getInstance().isLoaded());
+    }
+    case Drv3dCommand::GET_FSR_UPSCALING_SUPPORTED:
+    {
+      return int(amd::FSRVulkan::getInstance().isUpscalingSupported());
+    }
+    case Drv3dCommand::GET_FSR_RESOLUTION:
+    {
+      IPoint2 &renderResolution = *reinterpret_cast<IPoint2 *>(par3);
+      renderResolution = amd::FSRVulkan::getInstance().getRenderingResolution(
+        static_cast<amd::FSR::UpscalingMode>(*reinterpret_cast<int *>(par2)), *reinterpret_cast<IPoint2 *>(par1));
+      return 1;
+    }
+    case Drv3dCommand::GET_FSR_VERSION:
+    {
+      char *data = reinterpret_cast<char *>(par1);
+      size_t size = reinterpret_cast<size_t>(par2);
+      String version = amd::FSRVulkan::getInstance().getVersionString();
+      if (size > 0)
+      {
+        strncpy(data, version.c_str(), size);
+        data[size - 1] = '\0';
+      }
+      return 1;
+    }
+    case Drv3dCommand::GET_FSR_SUPPORTED_GEN_FRAMES:
+    {
+      auto &frames = *reinterpret_cast<int *>(par1);
+      frames = 0;
+      return 1;
+    }
+    case Drv3dCommand::GET_FSR_FG_ENABLED:
+    {
+      auto &enabled = *reinterpret_cast<bool *>(par1);
+      enabled = false;
+      return 1;
+    }
+    case Drv3dCommand::GET_FSR_FG_SUPPORTED:
+    {
+      return 0; //-V1037
+    }
+    case Drv3dCommand::GET_FSR_FG_SUPPRESSED:
+    {
+      auto &suppressed = *reinterpret_cast<bool *>(par1);
+      suppressed = false;
+      return 1;
+    }
+    case Drv3dCommand::FSR_ENABLE_FG:
+    case Drv3dCommand::FSR_SUPPRESS_FG:
+    {
+      return 1;
+    }
+    case Drv3dCommand::EXECUTE_FSR:
+    {
+      const amd::FSR::UpscalingArgs &params = *reinterpret_cast<const amd::FSR::UpscalingArgs *>(par1);
+      auto cast_to_image = [](BaseTexture *src) {
+        if (src)
+          return cast_to_texture_base(src)->image;
+        return (Image *)nullptr;
+      };
+
+      CmdExecuteFSR cmd{params};
+      cmd.params.colorTexture = cast_to_image(params.colorTexture);
+      cmd.params.depthTexture = cast_to_image(params.depthTexture);
+      cmd.params.motionVectors = cast_to_image(params.motionVectors);
+      cmd.params.exposureTexture = cast_to_image(params.exposureTexture);
+      cmd.params.outputTexture = cast_to_image(params.outputTexture);
+      cmd.params.reactiveTexture = cast_to_image(params.reactiveTexture);
+      cmd.params.transparencyAndCompositionTexture = cast_to_image(params.transparencyAndCompositionTexture);
+      Globals::ctx.dispatchCmd(cmd);
+
+      return 1;
+    }
+    case Drv3dCommand::EXECUTE_FSR_FG:
+    {
+      G_UNUSED(par1);
+      G_UNUSED(par2);
+      return 1;
+    }
     case Drv3dCommand::MAKE_TEXTURE:
     {
       const Drv3dMakeTextureParams *makeParams = (const Drv3dMakeTextureParams *)par1;
@@ -366,6 +617,22 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
     case Drv3dCommand::REGISTER_ONE_TIME_FRAME_EXECUTION_EVENT_CALLBACKS:
       drv3d_vulkan::Globals::ctx.registerFrameEventsCallback(static_cast<FrameEvents *>(par1), par2);
       return 1;
+
+    case Drv3dCommand::IS_HDR_ENABLED:
+    {
+      return (int)Frontend::swapchain.getMode().isHdr();
+    }
+    case Drv3dCommand::INT10_HDR_BUFFER: return (int)Frontend::swapchain.getMode().isHdr();
+    case Drv3dCommand::HDR_OUTPUT_MODE:
+    {
+      if (Frontend::swapchain.getMode().isHdr())
+        return (int)HdrOutputMode::HDR10_ONLY;
+      return (int)HdrOutputMode::SDR_ONLY;
+    }
+    case Drv3dCommand::IS_HDR_AVAILABLE:
+    {
+      return (int)Frontend::swapchain.getMode().canDoHdr();
+    }
 
     case Drv3dCommand::PROCESS_APP_INACTIVE_UPDATE:
     {
@@ -397,15 +664,14 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
     }
     case Drv3dCommand::GET_WORKER_CPU_CORE:
     {
-      drv3d_vulkan::Globals::ctx.getWorkerCpuCore((int *)par1, (int *)par2);
+      Globals::ctx.dispatchCmd<CmdGetWorkerCpuCore>({(int *)par1, (int *)par2});
       return 1;
     }
     case Drv3dCommand::ASYNC_PIPELINE_COMPILATION_FEEDBACK_BEGIN:
     {
       G_ASSERTF(Globals::lock.isAcquired(), "vulkan: pipeline compile feedback begin must be under GPU lock");
       uint32_t *feedbackData = (uint32_t *)par1;
-      CmdAsyncPipeFeedbackBegin cmd{feedbackData};
-      Globals::ctx.dispatchCommand(cmd);
+      Globals::ctx.dispatchCmd<CmdAsyncPipeFeedbackBegin>({feedbackData});
 
       const uint32_t feedbackDataContent = interlocked_relaxed_load(*feedbackData);
       // 16b+16b processed & current skip counts
@@ -422,8 +688,7 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
     case Drv3dCommand::ASYNC_PIPELINE_COMPILATION_FEEDBACK_END:
     {
       G_ASSERTF(Globals::lock.isAcquired(), "vulkan: pipeline compile feedback end must be under GPU lock");
-      CmdAsyncPipeFeedbackEnd cmd{};
-      Globals::ctx.dispatchCommand(cmd);
+      Globals::ctx.dispatchCmd<CmdAsyncPipeFeedbackEnd>({});
       return 1;
     }
     case Drv3dCommand::GET_MONITORS:
@@ -432,37 +697,79 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
       clear_and_shrink(monitorList);
 
 #if VK_KHR_display
-      if (Globals::VK::phy.displays.empty())
-        return 0;
-
-      monitorList.reserve(Globals::VK::phy.displays.size());
-      for (VkDisplayPropertiesKHR &iter : Globals::VK::phy.displays)
+      if (!Globals::VK::phy.displays.empty())
       {
-        monitorList.push_back(
-          String(64, "%s", iter.displayName ? iter.displayName : String(16, "DISPLAY%u", &iter - Globals::VK::phy.displays.begin())));
+        monitorList.reserve(Globals::VK::phy.displays.size());
+        for (VkDisplayPropertiesKHR &iter : Globals::VK::phy.displays)
+        {
+          monitorList.push_back(String(64, "%s",
+            iter.displayName ? iter.displayName : String(16, "DISPLAY%u", &iter - Globals::VK::phy.displays.begin())));
+        }
+        return monitorList.size() > 0;
       }
-      return monitorList.size() > 0;
 #endif
+#if _TARGET_PC_LINUX
+      return drv3d_vulkan::get_monitors_list(monitorList) ? 1 : 0;
+#else
       return 0;
+#endif
+    }
+    case Drv3dCommand::GET_MONITOR_INFO:
+    {
+#if _TARGET_PC_LINUX
+      const char *monitorName = resolve_monitor_name(*reinterpret_cast<const char **>(par1));
+      String *friendlyName = reinterpret_cast<String *>(par2);
+      int *monitorIndex = reinterpret_cast<int *>(par3);
+      return drv3d_vulkan::get_monitor_info(monitorName, friendlyName, monitorIndex) ? 1 : 0;
+#else
+      return 0;
+#endif
+    }
+    case Drv3dCommand::GET_RESOLUTIONS_FROM_MONITOR:
+    {
+#if _TARGET_PC_LINUX
+      const char *monitorName = resolve_monitor_name(*reinterpret_cast<const char **>(par1));
+      Tab<String> &resolutions = *reinterpret_cast<Tab<String> *>(par2);
+      clear_and_shrink(resolutions);
+      return drv3d_vulkan::get_resolutions_from_monitor(monitorName, resolutions) ? 1 : 0;
+#else
+      return 0;
+#endif
     }
     case Drv3dCommand::GET_VSYNC_REFRESH_RATE:
     {
-      return Globals::window.refreshRate;
+      *(double *)par1 = Globals::window.refreshRate;
+      return 1;
+    }
+    case Drv3dCommand::GET_SWAPCHAIN_PRE_ROTATION:
+    {
+      return Frontend::swapchain.getAppPreRotationAngle();
     }
     case Drv3dCommand::DELAY_SYNC:
 #if VULKAN_ENABLE_DEBUG_FLUSHING_SUPPORT
       if (Globals::cfg.bits.flushAfterEachDrawAndDispatch)
         return 0;
 #endif
-      Globals::ctx.dispatchCommand<CmdDelaySyncCompletion>({true});
+      Globals::ctx.dispatchCmd<CmdDelaySyncCompletion>({true});
       return 1;
     case Drv3dCommand::CONTINUE_SYNC:
 #if VULKAN_ENABLE_DEBUG_FLUSHING_SUPPORT
       if (Globals::cfg.bits.flushAfterEachDrawAndDispatch)
         return 0;
 #endif
-      Globals::ctx.dispatchCommand<CmdDelaySyncCompletion>({false});
+      Globals::ctx.dispatchCmd<CmdDelaySyncCompletion>({false});
       return 1;
+    case Drv3dCommand::COMPLETE_SYNC:
+#if _TARGET_ANDROID
+      // android GPU drivers ignore action-less sync, so fake sync points are not allowed
+      return 0;
+#else
+      // do not bother without bindless, there is no user barriers in this case
+      if (!Globals::desc.caps.hasBindless)
+        return 0;
+      Globals::ctx.dispatchCmd<CmdCompleteSync>({});
+      return 1;
+#endif
     case Drv3dCommand::GET_RESOURCE_STATISTICS:
     {
 #if DAGOR_DBGLEVEL > 0
@@ -562,20 +869,36 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
       {
         G_ASSERTF(par1, "vulkan: par1 for Drv3dCommand::GETVISIBILITYBEGIN must be not null");
         QueryId &qId = *(reinterpret_cast<QueryId *>(par1));
-        qId = Globals::ctx.startOcclusionQuery();
+
+        OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+        QueryIndex qIdx = Globals::occlusionQueries.allocate();
+        Globals::occlusionQueries.activateScope();
+        Globals::ctx.dispatchCmdNoLock<CmdStartOcclusionQuery>({qIdx});
+        qId = Globals::occlusionQueries.encodeId(qIdx, Frontend::replay->id);
         return 1;
       }
       break;
     case Drv3dCommand::GETVISIBILITYEND:
       if (Globals::desc.caps.hasOcclusionQuery && par1)
       {
-        Globals::ctx.endOcclusionQuery(reinterpret_cast<QueryId>(par1));
+        QueryId queryId = reinterpret_cast<QueryId>(par1);
+        OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+        if (Globals::occlusionQueries.verifyQueryBelongsToWorkItem(queryId, Frontend::replay->id))
+        {
+          Globals::occlusionQueries.deactivateScope();
+          Globals::ctx.dispatchCmdNoLock<CmdEndOcclusionQuery>({Globals::occlusionQueries.decodeQueryIndex(queryId)});
+        }
         return 1;
       }
       break;
     case Drv3dCommand::GETVISIBILITYCOUNT:
       if (Globals::desc.caps.hasOcclusionQuery && par1)
-        return Globals::ctx.getOcclusionQueryResult(reinterpret_cast<QueryId>(par1));
+      {
+        QueryId queryId = reinterpret_cast<QueryId>(par1);
+        OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+        uint64_t qres = Globals::occlusionQueries.getResult(queryId, ~0ULL, 0);
+        return qres == ~0ULL ? -1 : (qres > 0);
+      }
       break;
     case Drv3dCommand::GET_RAYTRACE_ACCELERATION_STRUCTURES_MEMORY_USAGE:
       if (par1)
@@ -595,6 +918,125 @@ int d3d::driver_command(Drv3dCommand command, void *par1, void *par2, [[maybe_un
         return 0;
       }
       break;
+    case Drv3dCommand::REGISTER_DEVICE_RESET_EVENT_HANDLER:
+    {
+      DeviceResetEventHandler *handler = static_cast<DeviceResetEventHandler *>(par1);
+      auto it = eastl::find(eastl::begin(Globals::ctx.getDeviceResetEventHandlers()),
+        eastl::end(Globals::ctx.getDeviceResetEventHandlers()), handler);
+      if (it == eastl::end(Globals::ctx.getDeviceResetEventHandlers()))
+        Globals::ctx.getDeviceResetEventHandlers().emplace_back(handler);
+      else
+        G_ASSERTF(false, "Device reset event handler is already registered.");
+      return 1;
+    }
+
+    case Drv3dCommand::UNREGISTER_DEVICE_RESET_EVENT_HANDLER:
+    {
+      DeviceResetEventHandler *handler = static_cast<DeviceResetEventHandler *>(par1);
+      auto it = eastl::find(eastl::begin(Globals::ctx.getDeviceResetEventHandlers()),
+        eastl::end(Globals::ctx.getDeviceResetEventHandlers()), handler);
+      if (it != eastl::end(Globals::ctx.getDeviceResetEventHandlers()))
+        Globals::ctx.getDeviceResetEventHandlers().erase(it);
+      else
+        G_ASSERTF(false, "Could not find device reset event handler to unregister.");
+      return 1;
+    }
+
+    case Drv3dCommand::UNLOAD_SHADER_MEMORY:
+    {
+      Globals::ctx.dispatchCmd<CmdRestartPipelineCompiler>({});
+      return 1;
+    }
+
+    case Drv3dCommand::GET_XESS_STATE:
+    {
+      return (int)Globals::xess.getState();
+    }
+
+    case Drv3dCommand::IS_XESS_QUALITY_AVAILABLE_AT_RESOLUTION:
+    {
+      IPoint2 targetResolution = *(IPoint2 *)par1;
+      if (targetResolution.x <= 0 || targetResolution.y <= 0)
+        return 0;
+      int xessQuality = *(int *)par2;
+      return Globals::xess.isQualityAvailableAtResolution(targetResolution.x, targetResolution.y, xessQuality);
+    }
+
+    case Drv3dCommand::GET_XESS_SUPPORTED_GEN_FRAMES:
+    {
+      auto &frames = *(int *)par1;
+      frames = Globals::xess.isFrameGenerationSupported() ? 1 : 0;
+      return 1;
+    }
+
+    case Drv3dCommand::GET_XESS_FG_ENABLED:
+    {
+      auto &enabled = *(bool *)par1;
+      enabled = Globals::xess.isFrameGenerationEnabled();
+      return 1;
+    }
+
+    case Drv3dCommand::XESS_ENABLE_FG:
+    {
+      auto enable = *(bool *)par1;
+      Globals::xess.enableFrameGeneration(enable);
+      return 1;
+    }
+
+    case Drv3dCommand::XESS_SUPPRESS_FG:
+    {
+      auto suppress = *(bool *)par1;
+      Globals::xess.suppressFrameGeneration(suppress);
+      return 1;
+    }
+
+    case Drv3dCommand::XESS_SCHEDULE_GEN_FRAME:
+    {
+      return 0; //-V1037
+    }
+
+    case Drv3dCommand::GET_XESS_RESOLUTION:
+    {
+      IPoint2 &optRes = *(IPoint2 *)par1;
+      IPoint2 &minRes = *(IPoint2 *)par2;
+      IPoint2 &maxRes = *(IPoint2 *)par3;
+      Globals::xess.getRenderResolution(optRes.x, optRes.y, minRes.x, minRes.y, maxRes.x, maxRes.y);
+      return 1;
+    }
+
+    case Drv3dCommand::GET_XESS_VERSION:
+    {
+      auto maybeVersionString = Globals::xess.getVersion();
+      if (!maybeVersionString)
+        D3D_ERROR("vulkan: Failed to get XESS version string. Error: %s", Xess::errorKindToString(maybeVersionString.error()));
+
+      auto versionString = maybeVersionString.value_or("N/A");
+
+      char *data = reinterpret_cast<char *>(par1);
+      size_t size = reinterpret_cast<size_t>(par2);
+      strncpy(data, versionString.c_str(), size);
+      return 1;
+    }
+
+    case Drv3dCommand::SET_XESS_VELOCITY_SCALE:
+    {
+      Globals::xess.setVelocityScale(*(float *)par1, *(float *)par2);
+      return 1;
+    }
+
+    case Drv3dCommand::EXECUTE_XESS:
+    {
+      VERIFY_GLOBAL_LOCK_ACQUIRED();
+      G_ASSERT(par1);
+      XessParams *pars = (XessParams *)par1;
+
+      auto toImage = [](BaseTexture *t) { return t ? cast_to_texture_base(t)->image : nullptr; };
+      Globals::ctx.dispatchCmd<CmdExecuteXESS>({toImage(pars->inColor), toImage(pars->inDepth), toImage(pars->inMotionVectors),
+        pars->inJitterOffsetX, pars->inJitterOffsetY, static_cast<uint32_t>(pars->inInputWidth),
+        static_cast<uint32_t>(pars->inInputHeight), static_cast<uint32_t>(pars->inColorDepthOffsetX),
+        static_cast<uint32_t>(pars->inColorDepthOffsetY), pars->inReset, toImage(pars->outColor)});
+      return 1;
+    }
     default: break;
   };
 

@@ -2,7 +2,13 @@
 
 #include <generic/dag_enumerate.h>
 #include <daECS/core/coreEvents.h>
-#include <ecs/core/entitySystem.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/ecsQuery.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/entityComponent.h>
 #include <ecs/rendInst/riExtra.h>
 #include <gameRes/dag_gameResources.h>
 #include <gameRes/dag_stdGameResId.h>
@@ -11,6 +17,7 @@
 #include <riGen/riGenExtra.h>
 #include "../globalManager.h"
 #include "riex.h"
+#include <triangleSizeDebug/triangleSizeDebug.h>
 
 namespace material_var
 {
@@ -23,18 +30,19 @@ namespace dagdp
 {
 
 template <typename Callable>
-static inline void riex_object_group_ecs_query(Callable);
+static inline void riex_object_group_ecs_query(ecs::EntityManager &manager, Callable);
 
 ECS_NO_ORDER
-static inline void riex_object_group_process_es(const dagdp::EventObjectGroupProcess &evt, dagdp::RiexManager &dagdp__riex_manager)
+static inline void riex_object_group_process_es(
+  const dagdp::EventObjectGroupProcess &evt, ecs::EntityManager &manager, dagdp::RiexManager &dagdp__riex_manager)
 {
   auto &rulesBuilder = *evt.get<0>();
   auto &builder = dagdp__riex_manager.currentBuilder;
 
   builder = {}; // Reset the state.
 
-  riex_object_group_ecs_query([&](ECS_REQUIRE(ecs::Tag dagdp_object_group_riex) ecs::EntityId eid, const ecs::Object &dagdp__assets,
-                                const ecs::Object &dagdp__params) {
+  riex_object_group_ecs_query(manager, [&](ECS_REQUIRE(ecs::Tag dagdp_object_group_riex) ecs::EntityId eid,
+                                         const ecs::Object &dagdp__assets, const ecs::Object &dagdp__params) {
     auto iter = rulesBuilder.objectGroups.find(eid);
     if (iter == rulesBuilder.objectGroups.end())
       return;
@@ -68,11 +76,10 @@ static inline void riex_object_group_process_es(const dagdp::EventObjectGroupPro
       {
         // Expected to be preloaded by RiexPreload -> GameresPreLoaded flag is applicable
         const auto riAddFlag = rendinst::AddRIFlag::UseShadow | rendinst::AddRIFlag::GameresPreLoaded;
-        const int riExId = get_or_add_ri_extra_res_id(assetName.c_str(), riAddFlag);
-        const GameResHandle handle = GAMERES_HANDLE_FROM_STRING(assetName.c_str());
-        eastl::shared_ptr<GameResource> gameRes(get_one_game_resource_ex(handle, RendInstGameResClassId), GameResDeleter());
+        const rendinst::ClientRiexPoolId riExId = rendinst::ClientRiexPoolId::add(assetName.c_str(), riAddFlag);
+        eastl::shared_ptr<GameResource> gameRes(get_game_resource_ex(assetName.c_str(), RendInstGameResClassId), GameResDeleter());
 
-        if (!gameRes.get() || riExId < 0)
+        if (!gameRes.get() || !riExId.valid())
         {
           logerr("daGdp: object group with EID %u has invalid RendInstExtra asset with name %s.", static_cast<unsigned int>(eid),
             assetName.c_str());
@@ -113,9 +120,10 @@ static inline void riex_object_group_process_es(const dagdp::EventObjectGroupPro
             }
           }
 
-          // TODO: Distortions
           // TODO: Transparency
-          if (shaderMesh->getElems(ShaderMesh::STG_opaque, ShaderMesh::STG_decal).size() != shaderMesh->getAllElems().size())
+          if (shaderMesh->getElems(ShaderMesh::STG_opaque, ShaderMesh::STG_decal).size() +
+                shaderMesh->getElems(ShaderMesh::STG_distortion, ShaderMesh::STG_distortion).size() !=
+              shaderMesh->getAllElems().size())
           {
             stagesOk = false;
             break;
@@ -149,11 +157,11 @@ static inline void riex_object_group_process_es(const dagdp::EventObjectGroupPro
         // PoolOffset is calculated by: poolIdx * (sizeof(rendinst::render::RiShaderConstBuffers) / sizeof(vec4f)) + 1;
         // Where RiShaderConstBuffers is a struct with all extra data for a single RI (type).
         // PER_DRAW_VECS_COUNT should be equal to (sizeof(rendinst::render::RiShaderConstBuffers) / sizeof(vec4f)).
-        resource->riPoolOffset = riExId * rendinst::render::PER_DRAW_VECS_COUNT + 1;
+        resource->riPoolOffset = riExId.id() * rendinst::render::PER_DRAW_VECS_COUNT + 1;
         for (int lodIndex = 0; lodIndex < numMeshLods; lodIndex++)
           resource->lods_rId.push_back(rulesBuilder.nextRenderableId++);
 
-        update_per_draw_gathered_data(riExId);
+        update_per_draw_gathered_data(riExId.id());
       }
 
       G_ASSERT(resource);
@@ -168,7 +176,7 @@ static inline void riex_object_group_process_es(const dagdp::EventObjectGroupPro
         RiexRenderableInfo rInfo;
         rInfo.lodsRes = lodsRes;
         rInfo.lodIndex = lodIndex;
-        rInfo.isTree = rendinst::riExtra[resource->riExId].isTree;
+        rInfo.isTree = rendinst::riExtra[resource->riExId.id()].isTree;
 
         const RenderableId rId = resource->lods_rId[lodIndex];
         builder.renderablesInfo.emplace(rId, rInfo);
@@ -223,7 +231,25 @@ static inline void riex_view_finalize_es(const dagdp::EventViewFinalize &evt, da
   const auto &viewInfo = evt.get<0>();
   const auto &viewBuilder = evt.get<1>();
   auto nodes = evt.get<2>();
-  riex_finalize_view(viewInfo, viewBuilder, dagdp__riex_manager, nodes);
+  const bool isTriangleSizeEnabled = evt.get<4>();
+  riex_finalize_view(viewInfo, viewBuilder, dagdp__riex_manager, nodes, isTriangleSizeEnabled);
+}
+
+ECS_TAG(render, dev)
+static inline void riex_triangle_size_debug_enable_es(const CreateTriangleDebugNodes &evt, dagdp::GlobalManager &dagdp__global_manager)
+{
+  if (!evt.systems.isDaGDP)
+    return;
+
+  dagdp__global_manager.destroyViews();
+  dagdp__global_manager.setTriangleDebugView(true);
+}
+
+ECS_TAG(render, dev)
+static inline void riex_triangle_size_debug_disable_es(const DestroyTriangleDebugNodes &, dagdp::GlobalManager &dagdp__global_manager)
+{
+  dagdp__global_manager.destroyViews();
+  dagdp__global_manager.setTriangleDebugView(false);
 }
 
 ECS_NO_ORDER
@@ -238,7 +264,7 @@ ECS_NO_ORDER static inline void riex_invalidate_views_es(const dagdp::EventInval
 }
 
 template <typename Callable>
-static inline void manager_ecs_query(Callable);
+static inline void manager_ecs_query(ecs::EntityManager &manager, Callable);
 
 ECS_TAG(render)
 ECS_ON_EVENT(on_appear)
@@ -246,9 +272,9 @@ ECS_ON_EVENT(on_disappear)
 ECS_TRACK(dagdp__name, dagdp__assets, dagdp__params)
 ECS_REQUIRE(
   ecs::Tag dagdp_object_group_riex, const ecs::string &dagdp__name, const ecs::Object &dagdp__assets, const ecs::Object &dagdp__params)
-static void dagdp_object_group_riex_changed_es(const ecs::Event &)
+static void dagdp_object_group_riex_changed_es(const ecs::Event &, ecs::EntityManager &manager)
 {
-  manager_ecs_query([](dagdp::GlobalManager &dagdp__global_manager) { dagdp__global_manager.invalidateRules(); });
+  manager_ecs_query(manager, [](dagdp::GlobalManager &dagdp__global_manager) { dagdp__global_manager.invalidateRules(); });
 }
 
 struct RiexPreload

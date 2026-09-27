@@ -5,6 +5,10 @@
   #define COMPARE_TOLERANCE_SCALE(a) 1
 #endif
 
+#ifndef CONTACT_SHADOWS_SELF_OCCLUSION_BIAS_SCALE
+  #define CONTACT_SHADOWS_SELF_OCCLUSION_BIAS_SCALE 0
+#endif
+
 //returns hit (t) if hitT < 1, >= 1 on miss
 //screenHtAspectAndMinLen.x is target height/width, and screenHtAspectAndMinLen.y is distance in CS space (i.e. 2.0 is full width)
 // this prevents super small rays (in pixels) in case of fixed rayLength, this should be only used for infinite ray (sun)
@@ -15,7 +19,8 @@ float contactShadowRayCastWithScaleHitT(
   float4x4 projTm,
   float linearDepth,
   float4x4 viewProjTmNoOfs,
-  out float2 hitUV, float4 viewScaleOfs, float2 screenHtAspectAndMinLen = float2(1080. / 1920., 0.0))
+  out float2 hitUV, float4 viewScaleOfs,
+  float2 screenHtAspectAndMinLen = float2(1080. / 1920., 0.0))
 {
   float4 rayStartClip = mul( float4( cameraToPoint, 1 ), viewProjTmNoOfs );
   float4 rayDirClip = mul( float4( rayDirection * rayLength, 0 ), viewProjTmNoOfs );
@@ -49,39 +54,44 @@ float contactShadowRayCastWithScaleHitT(
   const float stepLen = float(1.0h / float(numSteps));
 
   const float compareTolerance = abs( rayDepthScreenZ - rayStartScreen.z ) * stepLen * COMPARE_TOLERANCE_SCALE(linearDepth);
+  const float selfOcclusionBias = compareTolerance * CONTACT_SHADOWS_SELF_OCCLUSION_BIAS_SCALE;
 
-  float sampleT = stepOffset * stepLen + stepLen;
+  const float firstSampleT = stepOffset * stepLen + stepLen;
+  const float3 tapStepUVz = rayStepUVz * stepLen;
+  float3 sampleUVz = rayStartUVz + rayStepUVz * firstSampleT;
+  // Number of steps should be <= 32.
+  uint hitMask = 0;
 
-  float hitT = 1.h;
-
+  [loop]
   for( int i = 0; i < numSteps; i++ )
   {
-    float3 sampleUVz = rayStartUVz + rayStepUVz * sampleT;
     #if FSR_DISTORTION
       float sampleDepth = float(tex2Dlod(depth_gbuf, float4(linearToDistortedTc(sampleUVz.xy), 0, 0)).r);
     #else
       float sampleDepth = float(tex2Dlod(depth_gbuf, float4(sampleUVz.xy, 0, 0)).r);
     #endif
     float depthDiff = sampleUVz.z - sampleDepth;
-    bool hasHit = abs( depthDiff + compareTolerance ) < compareTolerance;
+    // samples past the far plane (reversed-z) are below any depth buffer value and would false-hit
+    bool hasHit = depthDiff < -selfOcclusionBias && depthDiff > -(selfOcclusionBias + 2.h * compareTolerance) && sampleUVz.z > 0;
 
 
     #if EARLY_EXIT_CONTACT_SHADOWS
     if (hasHit)
     {
       hitUV = sampleUVz.xy;
-      return any(or(hitUV < 0, hitUV > 1)) ? 1.h : sampleT;
+      return any(or(hitUV < 0, hitUV > 1)) ? 1.h : firstSampleT + i * stepLen;
     }
     #else
-      hitT = hasHit ? min(hitT, sampleT) : hitT;
+      hitMask |= hasHit ? (1u << i) : 0;
     #endif
 
-    sampleT += stepLen;
+    sampleUVz += tapStepUVz;
   }
 
   #if EARLY_EXIT_CONTACT_SHADOWS
   return 1.h;
   #else
+  float hitT = hitMask != 0 ? min(1.h, firstSampleT + firstbitlow(hitMask) * stepLen) : 1.h;
   hitUV = rayStartUVz.xy + rayStepUVz.xy * hitT;
   return float(any(or(hitUV < 0, hitUV>1)) ? 1.h : hitT);
   #endif
@@ -100,7 +110,8 @@ float contactShadowFilteredRayCastWithScaleHitT(
   float4x4 projTm,
   float linearDepth,
   float4x4 viewProjTmNoOfs,
-  out float2 hitUV, float4 viewScaleOfs, float2 screenHtAspectAndMinLen = float2(1080./1920., 0.0))
+  out float2 hitUV, float4 viewScaleOfs,
+  float2 screenHtAspectAndMinLen = float2(1080./1920., 0.0))
 {
   float4 rayStartClip = mul( float4( cameraToPoint, 1 ), viewProjTmNoOfs );
   float4 rayDirClip = mul( float4( rayDirection * rayLength, 0 ), viewProjTmNoOfs );
@@ -134,6 +145,7 @@ float contactShadowFilteredRayCastWithScaleHitT(
   const float stepLen = float(1.0h / float(numSteps));
 
   float compareTolerance = float(abs( rayDepthScreenZ - rayStartScreen.z ) * (2.h*stepLen) * COMPARE_TOLERANCE_SCALE(linearDepth));
+  float selfOcclusionBias = compareTolerance * CONTACT_SHADOWS_SELF_OCCLUSION_BIAS_SCALE;
 
   float sampleT = stepOffset * stepLen + stepLen;
 
@@ -152,7 +164,10 @@ float contactShadowFilteredRayCastWithScaleHitT(
     #endif
     const float unfiltered_raw_depth = float(depth_gbuf.SampleLevel(depth_gbuf_samplerstate, uv, 0).x);
     float linear_raw_depth = float(depth_gbuf.SampleLevel(depth_gbuf_linear_samplerstate, uv, 0).x);
-    bool hasHit = min(unfiltered_raw_depth, linear_raw_depth) > sampleUVz.z && max(unfiltered_raw_depth, linear_raw_depth) < sampleUVz.z + compareTolerance;
+    float hitMinDepth = sampleUVz.z + selfOcclusionBias;
+    // samples past the far plane (reversed-z) are below any depth buffer value and would false-hit
+    bool hasHit = min(unfiltered_raw_depth, linear_raw_depth) > hitMinDepth &&
+      max(unfiltered_raw_depth, linear_raw_depth) < hitMinDepth + compareTolerance && sampleUVz.z > 0;
     #if EARLY_EXIT_CONTACT_SHADOWS
     if (hasHit)
     {
@@ -165,6 +180,7 @@ float contactShadowFilteredRayCastWithScaleHitT(
     sampleT += stepLen;
   }
   compareTolerance *= 0.5;
+  selfOcclusionBias = compareTolerance * CONTACT_SHADOWS_SELF_OCCLUSION_BIAS_SCALE;
   #endif
 
   for (; i < numSteps; i++ )
@@ -185,11 +201,13 @@ float contactShadowFilteredRayCastWithScaleHitT(
     {
       float linear_raw_depth = depth_gbuf.SampleLevel(depth_gbuf_linear_samplerstate, uv, 0).x;
       minDepth = min(minDepth, linear_raw_depth);
-      maxDepth = min(maxDepth, linear_raw_depth);
+      maxDepth = max(maxDepth, linear_raw_depth);
     }
-    bool hasHit = minDepth > sampleUVz.z && maxDepth < sampleUVz.z + compareTolerance;
+    float hitMinDepth = sampleUVz.z + selfOcclusionBias;
+    bool hasHit = minDepth > hitMinDepth && maxDepth < hitMinDepth + compareTolerance;
     #else
-    bool hasHit = abs( depthDiff + compareTolerance ) < compareTolerance;
+    // samples past the far plane (reversed-z) are below any depth buffer value and would false-hit
+    bool hasHit = depthDiff < -selfOcclusionBias && depthDiff > -(selfOcclusionBias + 2.h * compareTolerance) && sampleUVz.z > 0;
     #endif
 
     #if EARLY_EXIT_CONTACT_SHADOWS

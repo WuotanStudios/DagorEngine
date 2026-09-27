@@ -70,7 +70,8 @@ namespace ClosestPoint
 			// Denominator must be positive:
 			// |v0|^2 * |v1|^2 - (v0 . v1)^2 = |v0|^2 * |v1|^2 * (1 - cos(angle)^2) >= 0
 			float denominator = d00 * d11 - d01 * d01;
-			if (denominator < 1.0e-12f)
+			// (1 - cos(angle)^2) == 1.0e-6 or angle ~ 0.06 degrees which means the triangle is degenerate and we fall back to calculating the closest point on the longest edge
+			if (denominator <= 1.0e-6f * d00 * d11)
 			{
 				// Degenerate triangle, return coordinates along longest edge
 				if (d00 > d11)
@@ -100,7 +101,7 @@ namespace ClosestPoint
 			float d12 = v1.Dot(v2);
 
 			float denominator = d11 * d22 - d12 * d12;
-			if (denominator < 1.0e-12f)
+			if (denominator <= 1.0e-6f * d11 * d22)
 			{
 				// Degenerate triangle, return coordinates along longest edge
 				if (d11 > d22)
@@ -166,12 +167,12 @@ namespace ClosestPoint
 		// See: https://box2d.org/posts/2014/01/troublesome-triangle/
 		// The difference in normals is most pronounced when one edge is much smaller than the others (in which case the other 2 must have roughly the same length).
 		// Therefore we can suffice by just picking the shortest from 2 edges and use that with the 3rd edge to calculate the normal.
-		// We first check which of the edges is shorter and if bc is shorter than ac then we swap a with c to a is always on the shortest edge
+		// In this case we ensure that ab is shorter than bc by swapping a and c if it is not.
 		UVec4 swap_ac;
 		{
-			Vec3 ac = inC - inA;
+			Vec3 ba = inA - inB;
 			Vec3 bc = inC - inB;
-			swap_ac = Vec4::sLess(bc.DotV4(bc), ac.DotV4(ac));
+			swap_ac = Vec4::sLess(bc.DotV4(bc), ba.DotV4(ba));
 		}
 		Vec3 a = Vec3::sSelect(inA, inC, swap_ac);
 		Vec3 c = Vec3::sSelect(inC, inA, swap_ac);

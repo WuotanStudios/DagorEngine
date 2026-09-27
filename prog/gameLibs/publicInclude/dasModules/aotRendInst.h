@@ -14,6 +14,7 @@
 #include <rendInst/rendInstExtra.h>
 #include <rendInst/rendInstExtraAccess.h>
 #include <rendInst/rendInstCollision.h>
+#include <rendInst/riexSync.h>
 #include <rendInst/debugCollisionVisualization.h>
 #include <rendInst/gpuObjects.h>
 #include <rendInst/constants.h>
@@ -78,10 +79,7 @@ inline void gather_ri_gen_extra_collidable(const BBox3 &viewBB,
   rendinst::gatherRIGenExtraCollidable(handles, viewBB, true /*read_lock*/);
 
   das::Array arr;
-  arr.data = (char *)handles.data();
-  arr.size = uint32_t(handles.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, handles.data(), handles.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -95,10 +93,7 @@ inline void gather_ri_gen_extra_collidable_in_transformed_box(const TMatrix &tra
   rendinst::gatherRIGenExtraCollidable(handles, transform, viewBB, true /*read_lock*/);
 
   das::Array arr;
-  arr.data = (char *)handles.data();
-  arr.size = uint32_t(handles.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, handles.data(), handles.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -112,10 +107,7 @@ inline void gather_ri_gen_extra_collidable_max(const BSphere3 &sphere, float max
   rendinst::gatherRIGenExtraCollidableMax(handles, sphere, max_size);
 
   das::Array arr;
-  arr.data = (char *)handles.data();
-  arr.size = uint32_t(handles.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, handles.data(), handles.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -129,10 +121,7 @@ inline void get_ri_gen_extra_instances(int res_idx,
   rendinst::getRiGenExtraInstances(handles, res_idx);
 
   das::Array arr;
-  arr.data = (char *)handles.data();
-  arr.size = uint32_t(handles.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, handles.data(), handles.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -146,10 +135,7 @@ inline void get_ri_gen_extra_instances_by_box(int res_idx, const bbox3f &box,
   rendinst::getRiGenExtraInstances(handles, res_idx, box);
 
   das::Array arr;
-  arr.data = (char *)handles.data();
-  arr.size = uint32_t(handles.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, handles.data(), handles.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -163,10 +149,7 @@ inline void get_ri_gen_extra_instances_by_sphere(int res_idx, const BSphere3 &sp
   rendinst::getRiGenExtraInstances(handles, res_idx, sphere);
 
   das::Array arr;
-  arr.data = (char *)handles.data();
-  arr.size = uint32_t(handles.size());
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, handles.data(), handles.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);
@@ -190,6 +173,25 @@ inline void damage_ri_in_sphere(const Point3 &pos, float rad, const Point2 &dmg_
   ::rendinstdestr::damage_ri_in_sphere(pos, rad, dmg_near_far, 0.f, at_time, create_destr, riex_destr_cb_func, should_damage_func);
 }
 
+inline void damage_ri_in_sphere_with_dest_setting(const Point3 &pos, float rad, const Point2 &dmg_near_far, float at_time,
+  bool create_destr, const das::TBlock<void, const rendinst::riex_handle_t> &riex_destr_cb,
+  const das::TBlock<bool, const rendinst::riex_handle_t> &should_damage, das::Context *context, das::LineInfoArg *at)
+{
+  auto riex_destr_cb_func = [&](rendinst::riex_handle_t riex_handle) {
+    vec4f arg = das::cast<rendinst::riex_handle_t>::from(riex_handle);
+    context->invoke(riex_destr_cb, &arg, nullptr, at);
+  };
+
+  auto should_damage_func = [&](rendinst::riex_handle_t riex_handle) {
+    vec4f arg = das::cast<rendinst::riex_handle_t>::from(riex_handle);
+    vec4f res = context->invoke(should_damage, &arg, nullptr, at);
+    return das::cast<bool>::to(res);
+  };
+
+  ::rendinstdestr::damage_ri_in_sphere(pos, rad, dmg_near_far, ::rendinstdestr::get_destr_settings().destrImpulseHitPointsMult,
+    at_time, create_destr, riex_destr_cb_func, should_damage_func);
+}
+
 inline void doRIGenDamage(const BSphere3 &sphere, unsigned frame_no, const Point3 &axis)
 {
   rendinst::doRIGenDamage(sphere, frame_no, axis);
@@ -204,6 +206,41 @@ inline void doRendinstDamage(const BSphere3 &sphere, uint32_t frame_no, float at
 inline void getRiGenDestrInfo(const rendinst::RendInstDesc &desc, rendinst::CollisionInfo &res)
 {
   res = rendinst::getRiGenDestrInfo(desc);
+}
+
+inline rendinst::RendInstDesc ri_desc_to_net_restorable(const rendinst::RendInstDesc &desc, bool is_client)
+{
+  if (!desc.isValid())
+    return {};
+  rendinst::RendInstDesc res;
+  {
+    rendinst::AutoLockReadPrimaryAndExtra lock;
+    if (desc.isRiExtra() && !rendinst::isRiGenExtraValid(desc.getRiExtraHandle()))
+      return {};
+    res = rendinst::get_restorable_desc(desc);
+  }
+  if (res.isValid() && is_client)
+    res.pool = riexsync::get_server_ri_pool_id(res.pool, -1);
+  return res;
+}
+
+inline rendinst::RendInstDesc ri_desc_from_net_restorable(const rendinst::RendInstDesc &desc, bool is_client)
+{
+  rendinst::RendInstDesc res = desc;
+  if (is_client)
+    res.pool = riexsync::get_client_ri_pool_id(res.pool, -1);
+  if (!res.isValid())
+    return {};
+  if (res.isRiExtra())
+  {
+    rendinst::AutoLockReadPrimaryAndExtra lock;
+    res.idx = rendinst::find_restorable_data_index(res);
+    if (res.idx < 0)
+      return {};
+  }
+  else if (!rendinst::resolve_rigen_desc_subcell(res))
+    return {};
+  return res;
 }
 
 inline int rendinst_cloneRIGenExtraResIdx(const char *source_res_name, const char *new_res_name)
@@ -249,6 +286,44 @@ inline void rendinst_foreachInBox(const BBox3 &box, int type_flags,
     at);
 }
 
+inline void rendinst_foreachInSphere(const BSphere3 &sphere, int type_flags,
+  const das::TBlock<void, const rendinst::RendInstDesc, const TMatrix, bool> &block, das::Context *context, das::LineInfoArg *at)
+{
+  vec4f args[3];
+  context->invokeEx(
+    block, args, nullptr,
+    [&](das::SimNode *code) {
+      struct ForeachCB final : public rendinst::ForeachCB
+      {
+        vec4f *args = nullptr;
+        das::Context *context = nullptr;
+        das::SimNode *code = nullptr;
+
+        void executeForTm(RendInstGenData *, const rendinst::RendInstDesc &ri_desc, const TMatrix &tm) override
+        {
+          args[0] = das::cast<const rendinst::RendInstDesc &>::from(ri_desc);
+          args[1] = das::cast<const TMatrix &>::from(tm);
+          args[2] = das::cast<bool>::from(true);
+          code->eval(*context);
+        }
+
+        void executeForPos(RendInstGenData *, const rendinst::RendInstDesc &ri_desc, const TMatrix &pos) override
+        {
+          args[0] = das::cast<const rendinst::RendInstDesc &>::from(ri_desc);
+          args[1] = das::cast<const TMatrix &>::from(pos);
+          args[2] = das::cast<bool>::from(false);
+          code->eval(*context);
+        }
+      } cb;
+      cb.args = args;
+      cb.context = context;
+      cb.code = code;
+
+      rendinst::foreachRIGenInSphere(sphere, static_cast<rendinst::GatherRiTypeFlag>(type_flags), cb);
+    },
+    at);
+}
+
 inline void rendinst_foreachTreeInBox(const BBox3 &bbox, const das::TBlock<void, const rendinst::CollisionInfo> &block,
   das::Context *context, das::LineInfoArg *at)
 {
@@ -277,6 +352,17 @@ inline void rendinst_foreachTreeInBox(const BBox3 &bbox, const das::TBlock<void,
       rendinst::testObjToRendInstIntersection(bbox, cb, rendinst::GatherRiTypeFlag::RiGenOnly);
     },
     at);
+}
+
+inline void rendinst_doRIGenDamageFiltered(const BSphere3 &sphere, unsigned frame_no, const Point3 &axis,
+  const das::TBlock<bool, int, int> &pool_skip_block, das::Context *context, das::LineInfoArg *at)
+{
+  auto skip = [&](int layer, int pool) -> bool {
+    vec4f args[] = {das::cast<int>::from(layer), das::cast<int>::from(pool)};
+    vec4f res = context->invoke(pool_skip_block, args, nullptr, at);
+    return das::cast<bool>::to(res);
+  };
+  rendinst::doRIGenDamage(sphere, frame_no, axis, /*create_debris*/ true, skip);
 }
 
 inline void get_ri_color_infos(const das::TBlock<void, E3DCOLOR, E3DCOLOR, const das::TTemporary<const char *>> &block,

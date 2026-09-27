@@ -5,6 +5,7 @@
 #include <generic/dag_sort.h>
 #include <fx/dag_baseFxClasses.h>
 #include <gameRes/dag_gameResources.h>
+#include <math/dag_bezier.h>
 #include <math/dag_frustum.h>
 #include <math/random/dag_random.h>
 #include <ADT/threadpoolLocalVector.h>
@@ -13,7 +14,10 @@
 #include <memory/dag_framemem.h>
 #include <startup/dag_globalSettings.h>
 #include <effectManager/effectManagerDetails.h>
+#include <generic/dag_initOnDemand.h>
 #include <generic/dag_relocatableFixedVector.h>
+#include <landMesh/biomeQuery.h>
+#include <ska_hash_map/flat_hash_map2.hpp>
 
 #if DAGOR_DBGLEVEL > 0
 #include <debug/dag_log.h>
@@ -54,6 +58,42 @@ static ActiveShadowVec activeShadowVec;
 static int maxActiveShadows = 0;
 static float invMagnification = 1.0f;
 static float invMagnificationSq = 1.0f;
+
+struct FxGlobalConfig
+{
+  ska::flat_hash_map<eastl::string, Color4, ska::power_of_two_std_hash<eastl::string>> biomeColorReplacements;
+};
+static InitOnDemand<FxGlobalConfig> fx_global_config;
+
+void EffectManager::loadGlobalConfig(const DataBlock &fx_blk)
+{
+  fx_global_config.demandDestroy();
+  fx_global_config.demandInit();
+  auto &replacements = fx_global_config->biomeColorReplacements;
+  replacements.clear();
+  const DataBlock *replacementsBlk = fx_blk.getBlockByNameEx("biomeColorReplacement");
+  for (int b = 0; b < replacementsBlk->blockCount(); b++)
+  {
+    const DataBlock *replaceBlk = replacementsBlk->getBlock(b);
+    const Color4 color = Color4::xyzw(replaceBlk->getPoint4("color", Point4(1, 1, 1, 1)));
+    const int biomeNid = replaceBlk->getNameId("biome");
+    for (int i = 0; i < replaceBlk->paramCount(); i++)
+      if (replaceBlk->getParamNameId(i) == biomeNid && replaceBlk->getParamType(i) == DataBlock::TYPE_STRING)
+        replacements.emplace(eastl::string(replaceBlk->getStr(i)), color);
+  }
+}
+
+static Color4 get_biome_color_mult(const BiomeQueryResult &result)
+{
+  if (fx_global_config)
+    if (const char *groupName = biome_query::get_biome_group_name(result.mostFrequentBiomeGroupIndex))
+    {
+      auto it = fx_global_config->biomeColorReplacements.find_as(groupName);
+      if (it != fx_global_config->biomeColorReplacements.end())
+        return it->second;
+    }
+  return Color4::xyzw(result.averageBiomeColor);
+}
 
 void EffectManager::onSettingsChanged(bool shadows_enabled, int max_active_shadows)
 {
@@ -226,6 +266,8 @@ void AcesEffect::setFakeBrightnessBackgroundPos(const Point3 &backgroundPos)
   mgr->setFakeBrightnessBackgroundPosBuff(fxId, backgroundPos);
 }
 void AcesEffect::setLightRadiusMultiplier(float multiplier) { mgr->setFxLightRadiusMultiplierBuff(fxId, multiplier); }
+void AcesEffect::setLightFlags(uint32_t flags) { mgr->setFxLightFlagsBuff(fxId, flags); }
+void AcesEffect::setLightSourceRadius(float radius) { mgr->setFxLightSourceRadiusBuff(fxId, radius); }
 void AcesEffect::setFxScale(float scale) { mgr->setFxLightIntensityBuff(fxId, scale); }
 void AcesEffect::setRestrictionBox(const TMatrix &box) { mgr->setFxLightBoxBuff(fxId, box); }
 void AcesEffect::setWindScale(float scale) { mgr->setFxWindScaleBuff(fxId, scale); }
@@ -237,6 +279,7 @@ bool AcesEffect::isAlive() const { return cachedFlags & IS_LOCKED; }
 void AcesEffect::unsetEmitter() { mgr->unsetFxEmitterBuff(fxId); }
 void AcesEffect::stop() { mgr->stopFxBuff(fxId); }
 void AcesEffect::pauseSound(bool pause) { mgr->pauseFxSoundBuff(fxId, pause); }
+void AcesEffect::warmup(float time, float step_dt) { mgr->setFxWarmupBuff(fxId, time, step_dt); }
 bool AcesEffect::hasSound() const { return (*mgr->params.sfxPath) && (*mgr->params.sfxEvent); }
 void AcesEffect::enableActiveQuery()
 {
@@ -269,16 +312,20 @@ enum BuffCmdType
   FX_CMD_COLOR_MULT,
   FX_CMD_STOP,
   FX_CMD_LIGHT_RADIUS,
+  FX_CMD_LIGHT_FLAGS,
+  FX_CMD_LIGHT_SOURCE_RADIUS,
   FX_CMD_LIGHT_INTENSITY,
   FX_CMD_LIGHT_BOX,
   FX_CMD_WIND_SCALE,
   FX_CMD_GRAVITY_TM,
+  FX_CMD_SPLINE_GEN,
   FX_CMD_UNLOCK,
   FX_CMD_PAUSE_SOUND,
   FX_CMD_TM,
   FX_CMD_UNSET_EMITTER,
   FX_CMD_ENABLE_ACTIVE_QUERY,
-  FX_CMD_FAKE_BRIGHTNESS_BACKGROUND_POS
+  FX_CMD_FAKE_BRIGHTNESS_BACKGROUND_POS,
+  FX_CMD_WARMUP
 };
 struct BuffCommand
 {
@@ -293,6 +340,7 @@ struct BuffCommand
   union
   {
     TMatrix tm;
+    TMatrix4 tm4;
     Matrix3 m3;
     Point2 p2;
     Point3 p3;
@@ -396,6 +444,31 @@ static void register_base_fx_res(BaseEffectObject *base_fx)
   base_fx->setParam(_MAKE4C('PFXR'), &forceRecreate); // register dafx system
 }
 
+
+static void validate_fx_tm(const EffectManager *fx_mgr, const TMatrix &tm, const char *res_name)
+{
+#if DAGOR_DBGLEVEL > 0
+  constexpr int errMax = 3;
+  static thread_local int errCount = 0;
+  const float posLenSq = tm.col[3].lengthSq();
+  if (check_nan(tm.col[0].lengthSq()) || check_nan(tm.col[1].lengthSq()) || check_nan(tm.col[2].lengthSq()) || check_nan(posLenSq))
+  {
+    if (errCount++ < errMax)
+      logerr("fxMgr: NaN tm for fx:'%s'/'%s' (%d)", fx_mgr->getName(), res_name, errCount);
+  }
+  if (posLenSq < 0.0001f)
+  {
+    if (errCount++ < errMax)
+      logerr("fxMgr: Zero pos for fx:'%s'/'%s' (%d)", fx_mgr->getName(), res_name, errCount);
+  }
+#else
+  G_UNUSED(fx_mgr);
+  G_UNUSED(tm);
+  G_UNUSED(res_name);
+#endif
+}
+
+
 void EffectManager::validateDeleted(const BaseEffect &fx)
 {
 #if DAGOR_DBGLEVEL > 0
@@ -425,23 +498,22 @@ void EffectManager::destroyEffect(AcesEffect::FxId fx_id, BaseEffect &fx)
 #endif
   destroyFxSoundExt(fx.soundId, true, true);
   destroyLight(fx);
+  if (fx.pendingId >= 0)
+  {
+    if (pendingList[fx.pendingId].biomeQueryId != -1)
+      biome_query::cancel_query(pendingList[fx.pendingId].biomeQueryId);
+    BaseEffect *swapFx = remove_and_fix_subfx(fx.pendingId, pendingList, fxList);
+    if (swapFx)
+      swapFx->pendingId = fx.pendingId;
+    fx.pendingId = -1;
+  }
   del_it(fx.obj);
   fxList.destroyReference(fx_id);
 }
 
 void EffectManager::setFxTm(BaseEffect &fx, const TMatrix &tm, bool is_emitter_tm)
 {
-#if DAGOR_DBGLEVEL > 0
-  if (check_nan(tm.getcol(0).lengthSq()) || check_nan(tm.getcol(1).lengthSq()) || check_nan(tm.getcol(2).lengthSq()) ||
-      check_nan(tm.getcol(3).lengthSq()))
-    logerr("fx : NaN in fx tm (%s/%s)", params.name, params.resName);
-
-  if (tm.getcol(3).lengthSq() < 0.0001f)
-  {
-    logerr("%s : zero pos for fx: %s/%s", __FUNCTION__, params.name, params.resName);
-    debug_dump_stack();
-  }
-#endif
+  validate_fx_tm(this, tm, params.resName.c_str());
   validateDeleted(fx);
 
   fx.tm = tm;
@@ -527,6 +599,26 @@ void EffectManager::setFxSpawnRate(BaseEffect &fx, float value)
     pendingList[fx.pendingId].spawnRate = value;
 }
 
+void EffectManager::setFxWarmup(BaseEffect &fx, float time, float step_dt)
+{
+  validateDeleted(fx);
+  if (time == 0.f)
+    return;
+  if (fx.pendingId < 0)
+  {
+    BaseFxWarmupParams warmupParams = {time, step_dt, /*perInstanceMode*/ true};
+    fx.obj->setParam(_MAKE4C('PFXG'), &warmupParams);
+    return;
+  }
+  PendingData &pe = pendingList[fx.pendingId];
+  if (time < 0.f || pe.warmupTime < 0.f)
+    pe.warmupTime = min(pe.warmupTime, time); // auto wins: replaces accumulated positive time, survives later positives
+  else
+    pe.warmupTime += time;
+  if (step_dt > 0.f) // 0 = no opinion: an earlier requested step_dt survives
+    pe.warmupStepDt = step_dt;
+}
+
 void EffectManager::setFxLightRadiusMultiplier(BaseEffect &fx, float multiplier)
 {
   if (fx.pendingId < 0)
@@ -540,6 +632,28 @@ void EffectManager::setFxLightRadiusMultiplier(BaseEffect &fx, float multiplier)
   }
   else
     pendingList[fx.pendingId].lightRadiusMultiplier = multiplier;
+}
+
+void EffectManager::setFxLightFlags(BaseEffect &fx, uint32_t flags)
+{
+  if (fx.pendingId < 0)
+  {
+    if (params.lightEnabled)
+      lightList[fx.lightId].lightFlags = flags;
+  }
+  else
+    pendingList[fx.pendingId].lightFlags = flags;
+}
+
+void EffectManager::setFxLightSourceRadius(BaseEffect &fx, float radius)
+{
+  if (fx.pendingId < 0)
+  {
+    if (params.lightEnabled)
+      lightList[fx.lightId].lightSourceRadius = radius;
+  }
+  else
+    pendingList[fx.pendingId].lightSourceRadius = radius;
 }
 
 void EffectManager::setFxLightIntensity(BaseEffect &fx, float intensity)
@@ -610,7 +724,8 @@ void EffectManager::unsetFxEmitter(BaseEffect &fx)
 
 int EffectManager::getAliveFxCount() const { return fxList.totalSize() - fxList.freeIndicesSize(); }
 
-EffectManager::EffectManager(const char *_name, const DataBlock *_blk, const char *effect_name, acesfx::PrefetchType prefetch_type)
+EffectManager::EffectManager(const char *_name, const DataBlock *_blk, const char *effect_name, acesfx::PrefetchType prefetch_type,
+  const acesfx::FXSoundInitParams *sound_init)
 {
   G_ASSERT(_name && *_name);
   G_ASSERT(!_blk || _blk->isValid());
@@ -633,13 +748,16 @@ EffectManager::EffectManager(const char *_name, const DataBlock *_blk, const cha
 
   params.distanceOffset = blk.getReal("sortDistanceOffset", 0.f);
   params.lifeTime = blk.getReal("lifeTime", 0.f);
-  params.soundEnableDistanceSq = blk.getReal("soundEnableDistance", -1.f);
-  if (params.soundEnableDistanceSq > 0)
-    params.soundEnableDistanceSq *= params.soundEnableDistanceSq;
+  if (!sound_init)
+  {
+    params.soundEnableDistanceSq = blk.getReal("soundEnableDistance", -1.f);
+    if (params.soundEnableDistanceSq > 0)
+      params.soundEnableDistanceSq *= params.soundEnableDistanceSq;
+  }
   params.maxNumInstances = -1;
   params.spawnRangeLimit = 0;
 
-  loadSoundParamsExt();
+  loadSoundParamsExt(sound_init);
 
   effectBase = nullptr;
 
@@ -668,7 +786,7 @@ void EffectManagerAsyncLoad::doJob()
 
 void EffectManager::initAsync()
 {
-  effectBase = (BaseEffectObject *)get_one_game_resource_ex(GAMERES_HANDLE_FROM_STRING(params.resName.c_str()), EffectGameResClassId);
+  effectBase = (BaseEffectObject *)get_one_game_resource_ex(params.resName.c_str(), EffectGameResClassId);
   if (!effectBase)
   {
     logerr("Effect resource '%s' referenced in '%s' not found", params.resName.c_str(), params.name.c_str());
@@ -701,7 +819,7 @@ void EffectManager::initAsync()
   initLightEnabledExt();
 }
 
-void EffectManager::createFxRes(AcesEffect::FxId fx_id, const Point3 &pos)
+void EffectManager::createFxRes(AcesEffect::FxId fx_id, bool is_player, const Point3 &pos)
 {
   BaseEffectObject *obj = (BaseEffectObject *)effectBase->clone();
   G_ASSERT_RETURN(obj, );
@@ -721,7 +839,8 @@ void EffectManager::createFxRes(AcesEffect::FxId fx_id, const Point3 &pos)
     setFxLight(*fx);
   }
 
-  BaseEffectEnabled dafxe = {true, length(viewPos - pos) * invMagnification};
+  float distanceToCam = is_player ? 0 : length(viewPos - pos) * invMagnification;
+  BaseEffectEnabled dafxe = {true, distanceToCam};
   fx->obj->setParam(_MAKE4C('PFXE'), &dafxe);
   fx->obj->getParam(_MAKE4C('FXID'), &fx->iid);
 
@@ -738,12 +857,16 @@ void EffectManager::createFxRes(AcesEffect::FxId fx_id, const Point3 &pos)
 
     setFxSpawnRate(*fx, markAsDeleted ? 0.f : pe.spawnRate);
     setFxLightRadiusMultiplier(*fx, pe.lightRadiusMultiplier);
+    setFxLightFlags(*fx, pe.lightFlags);
+    setFxLightSourceRadius(*fx, pe.lightSourceRadius);
     setFxLightIntensity(*fx, pe.lightIntensity);
     setFxLightBox(*fx, pe.lightBox);
     if (pe.windScale >= 0)
       setFxWindScale(*fx, pe.windScale);
     setFxGravityTm(*fx, pe.gravityTm);
     setFxColorMult(*fx, pe.colorMult);
+    setFxFakeBrightnessBackgroundPos(*fx, pe.fakeBrightnessBackgroundPos);
+    setFxSplineGenControlPoints(*fx, pe.splineGenData);
 
     setFxTm(*fx, fx->tm, pe.isEmitterTm);
     setFxVisibility(*fx, fx->visibility, true);
@@ -751,8 +874,20 @@ void EffectManager::createFxRes(AcesEffect::FxId fx_id, const Point3 &pos)
     if (pe.unsetEmitter)
       unsetFxEmitter(*fx);
 
-    if (warmupDt > 0)
-      fx->obj->setParam(_MAKE4C('PFXG'), &warmupDt);
+    if (pe.warmupTime != 0.f)
+    {
+      // requested warmup (AcesEffect::warmup) - per-instance stepping. Auto (< 0) keeps the
+      // sentinel: the steady-state pre-simulation supersedes load-time catch-up
+      BaseFxWarmupParams warmupParams = {pe.warmupTime < 0.f ? pe.warmupTime : warmupDt + pe.warmupTime, pe.warmupStepDt,
+        /*perInstanceMode*/ true};
+      fx->obj->setParam(_MAKE4C('PFXG'), &warmupParams);
+    }
+    else if (warmupDt > 0.f)
+    {
+      // load-time catch-up only (no caller request) - shared-budget stepping
+      BaseFxWarmupParams warmupParams = {warmupDt, /*stepDt*/ 0.f, /*perInstanceMode*/ false};
+      fx->obj->setParam(_MAKE4C('PFXG'), &warmupParams);
+    }
 
     BaseEffect *swapFx = remove_and_fix_subfx(pendId, pendingList, fxList);
     if (swapFx)
@@ -788,7 +923,8 @@ void EffectManager::reset()
   }
 }
 
-AcesEffect *EffectManager::startEffect(const Point3 &pos, bool lock, bool is_player, FxErrorType *perr, bool with_sound)
+AcesEffect *EffectManager::startEffect(const Point3 &pos, bool lock, bool is_player, FxErrorType *perr, bool with_sound,
+  bool with_biome_query)
 {
   int asyncState = interlocked_acquire_load(atomicInitialized);
   if (asyncState == LOAD_FAILED)
@@ -806,14 +942,14 @@ AcesEffect *EffectManager::startEffect(const Point3 &pos, bool lock, bool is_pla
     return nullptr;
   }
 
-  int currentCount = fxList.totalSize() - fxList.freeIndicesSize();
+  int currentCount = fxList.totalSize() - fxList.freeIndicesSize() - pendingList.size();
   if (asyncState == READY && currentCount > params.maxNumInstances)
   {
     // find 1 non-visibile, non-locked fx
     for (int i = 0; i < fxList.totalSize(); ++i)
     {
       BaseEffect *fx = fxList.getByIdx(i);
-      if (!fx || (fx->flags & AcesEffect::IS_LOCKED))
+      if (!fx || !fx->obj || (fx->flags & AcesEffect::IS_LOCKED))
         continue;
 
       bool visible = false;
@@ -834,9 +970,12 @@ AcesEffect *EffectManager::startEffect(const Point3 &pos, bool lock, bool is_pla
     }
   }
 
-  AcesEffect *extFx = new AcesEffect();
   AcesEffect::FxId fxId = fxList.emplaceOne();
   BaseEffect *fx = fxList.get(fxId);
+  if (!fx)
+    return nullptr;
+
+  AcesEffect *extFx = new AcesEffect();
   extFx->fxId = fxId;
   extFx->mgr = this;
   G_ASSERT(fx->flags == 0);
@@ -851,14 +990,16 @@ AcesEffect *EffectManager::startEffect(const Point3 &pos, bool lock, bool is_pla
 
   startEffectSoundExt(fxId, *fx, with_sound, pos);
 
-  if (asyncState == READY)
+  if (asyncState == READY && !with_biome_query)
   {
-    createFxRes(fxId, pos);
+    createFxRes(fxId, is_player, pos);
   }
   else
   {
     fx->pendingId = pendingList.size();
-    pendingList.emplace_back(fxId);
+    PendingData &pe = pendingList.emplace_back(fxId);
+    if (with_biome_query)
+      pe.biomeQueryId = biome_query::query(pos, 0.25f);
   }
 
   return extFx;
@@ -902,42 +1043,61 @@ void EffectManager::updateLoading()
 
   OSSpinlockScopedLock lock(&mgrSLock);
 
-  int asyncState = interlocked_acquire_load(atomicInitialized);
+  const int asyncState = interlocked_acquire_load(atomicInitialized);
+  const bool isJustLoaded = asyncState == LOADED;
   if (asyncState != LOADED)
-  {
     updateStarted &= (asyncState & READY) ? true : false;
+  if (asyncState < LOADED)
     return;
-  }
 
-  register_base_fx_res(effectBase);
+  if (isJustLoaded)
+    register_base_fx_res(effectBase);
 
-  for (int i = 0; i < fxList.totalSize(); ++i)
+  for (int i = 0; i < pendingList.size(); i++)
   {
-    BaseEffect *fx = fxList.getByIdx(i);
-    if (fx)
+    PendingData &pe = pendingList[i];
+    BaseEffect *fx = fxList.get(pe.fxId);
+    G_ASSERT_CONTINUE(fx)
+    G_ASSERT_CONTINUE(fx->pendingId == i)
+
+    if (fx->flags & AcesEffect::IS_MARK_AS_DELETED)
     {
-      const Point3 &pos = fx->tm.getcol(3);
-      if (fx->flags & AcesEffect::IS_LOCKED || !hasEnoughEffectsAtPoint(fx->flags & AcesEffect::IS_PLAYER, pos))
-      {
-        createFxRes(fxList.getRefByIdx(i), pos);
-      }
-      else // we only can query hasEnoughEffectsAtPoint after async job is done. so it we overshoot - destroy fx that are over the
-           // limit
-      {
-        G_ASSERT(fx->pendingId >= 0);
-        BaseEffect *swapFx = remove_and_fix_subfx(fx->pendingId, pendingList, fxList);
-        if (swapFx)
-          swapFx->pendingId = fx->pendingId;
-        del_it(fx->extFx);
-      }
+      del_it(fx->extFx);
+      i--;
+      continue;
+    }
+
+    if (pe.biomeQueryId != -1)
+    {
+      BiomeQueryResult result;
+      const auto status = biome_query::get_query_result(pe.biomeQueryId, result);
+      if (status == GpuReadbackResultState::IN_PROGRESS)
+        continue;
+      pe.biomeQueryId = -1;
+      if (status == GpuReadbackResultState::SUCCEEDED)
+        pe.colorMult = get_biome_color_mult(result);
+    }
+
+    const Point3 &pos = fx->tm.getcol(3);
+    if (fx->flags & AcesEffect::IS_LOCKED || !hasEnoughEffectsAtPoint(fx->flags & AcesEffect::IS_PLAYER, pos))
+    {
+      createFxRes(pe.fxId, fx->flags & AcesEffect::IS_PLAYER, pos);
+      if (fx->pendingId < 0) // -V547 in case assert return occurred for some reason, it will not be deleted
+        i--;
+    }
+    else // we only can query hasEnoughEffectsAtPoint after async job is done. so it we overshoot - destroy fx that are over the
+         // limit
+    {
+      del_it(fx->extFx); // this will delete effect from pendingList by swapping it with last in list
+      i--;
     }
   }
 
-  G_ASSERT(pendingList.empty());
-  pendingList.shrink_to_fit();
-
-  warmupDt = 0;
-  interlocked_release_store(atomicInitialized, READY);
+  if (isJustLoaded)
+  {
+    warmupDt = 0;
+    interlocked_release_store(atomicInitialized, READY);
+  }
 }
 
 void EffectManager::updateLights(float dt, FxLightParams *out_big_light)
@@ -988,7 +1148,7 @@ void EffectManager::updateActiveAndFree(int active_query_sparse_step)
   for (int i = 0; i < fxList.totalSize(); ++i)
   {
     BaseEffect *fx = fxList.getByIdx(i);
-    if (!fx)
+    if (!fx || fx->pendingId >= 0) // pending fx has no obj/iid yet — would be reported inactive and killed
       continue;
 
     int flags = fx->flags;
@@ -1062,7 +1222,7 @@ void EffectManager::shutdown()
 
   if (effectBase)
   {
-    release_game_resource((GameResource *)effectBase);
+    release_game_resource_ex(effectBase, EffectGameResClassId);
     effectBase = nullptr;
   }
 }
@@ -1078,32 +1238,45 @@ void EffectManager::getFxMatrices(dag::Vector<TMatrix, framemem_allocator> &matr
 }
 
 void EffectManager::getDebugInfo(dag::Vector<Point3, framemem_allocator> &positions, dag::Vector<int, framemem_allocator> &elems,
-  dag::Vector<eastl::string_view, framemem_allocator> &names)
-{
-  for (int i = 0; i < fxList.totalSize(); ++i)
-  {
-    BaseEffect *fx = fxList.getByIdx(i);
-    if (fx)
-    {
-      int count = 0;
-      if (fx->obj)
-        fx->obj->getParam(_MAKE4C('FXIC'), &count);
-
-      elems.push_back(count);
-      positions.push_back(fx->tm.getcol(3));
-      names.push_back(params.name);
-    }
-  }
-}
-
-void EffectManager::getResDebugInfo(dag::Vector<Point3, framemem_allocator> &positions,
-  dag::Vector<eastl::string, framemem_allocator> &out_names, dag::Vector<int, framemem_allocator> &out_elems)
+  dag::Vector<eastl::string_view, framemem_allocator> &names, bool only_visible)
 {
   for (int i = 0; i < fxList.totalSize(); ++i)
   {
     BaseEffect *fx = fxList.getByIdx(i);
     if (!fx || !fx->obj)
       continue;
+
+    if (only_visible)
+    {
+      bool visible = true;
+      if (fx->obj->getParam(_MAKE4C('PFXC'), &visible) && !visible)
+        continue;
+    }
+
+    int count = 0;
+    fx->obj->getParam(_MAKE4C('FXIC'), &count);
+
+    elems.push_back(count);
+    positions.push_back(fx->tm.getcol(3));
+    names.push_back(params.name);
+  }
+}
+
+void EffectManager::getResDebugInfo(dag::Vector<Point3, framemem_allocator> &positions,
+  dag::Vector<eastl::string, framemem_allocator> &out_names, dag::Vector<int, framemem_allocator> &out_elems, bool only_visible)
+{
+  for (int i = 0; i < fxList.totalSize(); ++i)
+  {
+    BaseEffect *fx = fxList.getByIdx(i);
+    if (!fx || !fx->obj)
+      continue;
+
+    if (only_visible)
+    {
+      bool visible = true;
+      if (fx->obj->getParam(_MAKE4C('PFXC'), &visible) && !visible)
+        continue;
+    }
 
     dafx::InstanceId iid;
     fx->obj->getParam(_MAKE4C('FXID'), &iid);
@@ -1245,8 +1418,37 @@ bool EffectManager::hasLockedEffects()
   return false;
 }
 
+void EffectManager::teleportAllRandomRad(float r)
+{
+  OSSpinlockScopedLock lock(&mgrSLock);
+  for (int i = 0; i < fxList.totalSize(); ++i)
+  {
+    BaseEffect *fx = fxList.getByIdx(i);
+    if (!fx || (fx->flags & AcesEffect::IS_MARK_AS_DELETED))
+      continue;
+
+    float dist = gfrnd() * r;
+    float yaw = gfrnd() * TWOPI;
+    float pitch = gfrnd() * PI - PI * 0.5f;
+    float cp = cosf(pitch);
+    Point3 offset(cp * cosf(yaw) * dist, cp * sinf(yaw) * dist, sinf(pitch) * dist);
+
+    TMatrix tm = fx->tm;
+    tm.setcol(3, tm.getcol(3) + offset);
+    setFxTm(*fx, tm, false);
+  }
+}
+
 void EffectManager::setFxTmBuff(AcesEffect::FxId fx_id, const TMatrix &tm, bool is_emitter_tm)
 {
+#if DAGOR_DBGLEVEL > 0
+  validate_fx_tm(this, tm, params.resName.c_str());
+  {
+    OSSpinlockScopedLock callSiteLock(&mgrSLock);
+    if (BaseEffect *callSiteFx = fxList.get(fx_id))
+      validateDeleted(*callSiteFx);
+  }
+#endif
   if (push_fx_cmd(this, fx_id, is_emitter_tm ? FX_CMD_EMM_TM : FX_CMD_TM, [&](BuffCommand &cmd) { cmd.tm = tm; }))
     return;
   mgrSLock.lock();
@@ -1327,6 +1529,18 @@ void EffectManager::setFxSpawnRateBuff(AcesEffect::FxId fx_id, float value)
   mgrSLock.unlock();
 }
 
+void EffectManager::setFxWarmupBuff(AcesEffect::FxId fx_id, float time, float step_dt)
+{
+  if (time == 0.f)
+    return;
+  if (push_fx_cmd(this, fx_id, FX_CMD_WARMUP, [&](BuffCommand &cmd) { cmd.p2 = Point2(time, step_dt); }))
+    return;
+  mgrSLock.lock();
+  if (EffectManager::BaseEffect *e = fxList.get(fx_id))
+    setFxWarmup(*e, time, step_dt);
+  mgrSLock.unlock();
+}
+
 void EffectManager::setFxLightRadiusMultiplierBuff(AcesEffect::FxId fx_id, float multiplier)
 {
   if (push_fx_cmd(this, fx_id, FX_CMD_LIGHT_RADIUS, [&](BuffCommand &cmd) { cmd.f = multiplier; }))
@@ -1334,6 +1548,26 @@ void EffectManager::setFxLightRadiusMultiplierBuff(AcesEffect::FxId fx_id, float
   mgrSLock.lock();
   if (EffectManager::BaseEffect *e = fxList.get(fx_id))
     setFxLightRadiusMultiplier(*e, multiplier);
+  mgrSLock.unlock();
+}
+
+void EffectManager::setFxLightFlagsBuff(AcesEffect::FxId fx_id, uint32_t flags)
+{
+  if (push_fx_cmd(this, fx_id, FX_CMD_LIGHT_FLAGS, [&](BuffCommand &cmd) { cmd.u = flags; }))
+    return;
+  mgrSLock.lock();
+  if (EffectManager::BaseEffect *e = fxList.get(fx_id))
+    setFxLightFlags(*e, flags);
+  mgrSLock.unlock();
+}
+
+void EffectManager::setFxLightSourceRadiusBuff(AcesEffect::FxId fx_id, float radius)
+{
+  if (push_fx_cmd(this, fx_id, FX_CMD_LIGHT_SOURCE_RADIUS, [&](BuffCommand &cmd) { cmd.f = radius; }))
+    return;
+  mgrSLock.lock();
+  if (EffectManager::BaseEffect *e = fxList.get(fx_id))
+    setFxLightSourceRadius(*e, radius);
   mgrSLock.unlock();
 }
 
@@ -1365,6 +1599,39 @@ void EffectManager::setFxWindScaleBuff(AcesEffect::FxId fx_id, float scale)
   if (EffectManager::BaseEffect *e = fxList.get(fx_id))
     setFxWindScale(*e, scale);
   mgrSLock.unlock();
+}
+
+void EffectManager::setFxSplineGenControlPoints(BaseEffect &fx, const TMatrix4 &splineGenData)
+{
+  if (fx.pendingId < 0)
+    fx.obj->setParam(_MAKE4C('SPLN'), (void *)&splineGenData);
+  else
+    pendingList[fx.pendingId].splineGenData = splineGenData;
+}
+
+void EffectManager::setFxSplineControlPointsBuff(AcesEffect::FxId fx_id, const Point4 &p0, const Point4 &p1, const Point4 &p2,
+  const Point4 &p3)
+{
+  TMatrix4 splData = TMatrix4::ZERO;
+  BezierSplineInt<Point4> spline;
+  Point4 splinePoints[4] = {p0, p1, p2, p3};
+  spline.calculate(splinePoints);
+  splData.setrow(0, spline.sk[0]);
+  splData.setrow(1, spline.sk[1]);
+  splData.setrow(2, spline.sk[2]);
+  splData.setrow(3, spline.sk[3]);
+
+  if (push_fx_cmd(this, fx_id, FX_CMD_SPLINE_GEN, [&](BuffCommand &cmd) { cmd.tm4 = splData; }))
+    return;
+  mgrSLock.lock();
+  if (EffectManager::BaseEffect *e = fxList.get(fx_id))
+    setFxSplineGenControlPoints(*e, splData);
+  mgrSLock.unlock();
+}
+
+void AcesEffect::setSplineControlPoints(const Point4 &p0, const Point4 &p1, const Point4 &p2, const Point4 &p3)
+{
+  mgr->setFxSplineControlPointsBuff(fxId, p0, p1, p2, p3);
 }
 
 void EffectManager::setFxGravityTm(BaseEffect &fx, const Matrix3 &tm)
@@ -1456,19 +1723,25 @@ void EffectManager::updateCmdBuff()
       case FX_CMD_EMM_TM: cmd.mgr->setFxTm(*e, cmd.tm, true); break;
       case FX_CMD_HIDE: cmd.mgr->setFxVisibility(*e, cmd.u, cmd.b); break;
       case FX_CMD_UNLOCK:
+      {
+        OSSpinlockScopedLock lock(&cmd.mgr->mgrSLock);
         e->flags &= ~AcesEffect::IS_LOCKED;
         updateCachedFlags(*e);
-        break;
+      }
+      break;
       case FX_CMD_FAKE_BRIGHTNESS_BACKGROUND_POS: cmd.mgr->setFxFakeBrightnessBackgroundPos(*e, cmd.p3); break;
       case FX_CMD_VELOCITY: cmd.mgr->setFxVelocity(*e, cmd.p3); break;
       case FX_CMD_VELOCITY_SCALE_MIN_MAX: cmd.mgr->setFxVelocityScaleMinMax(*e, cmd.p2); break;
       case FX_CMD_SPAWN_RATE: cmd.mgr->setFxSpawnRate(*e, cmd.f); break;
       case FX_CMD_LIGHT_RADIUS: cmd.mgr->setFxLightRadiusMultiplier(*e, cmd.f); break;
+      case FX_CMD_LIGHT_FLAGS: cmd.mgr->setFxLightFlags(*e, cmd.u); break;
+      case FX_CMD_LIGHT_SOURCE_RADIUS: cmd.mgr->setFxLightSourceRadius(*e, cmd.f); break;
       case FX_CMD_LIGHT_INTENSITY: cmd.mgr->setFxLightIntensity(*e, cmd.f); break;
       case FX_CMD_LIGHT_BOX: cmd.mgr->setFxLightBox(*e, cmd.tm); break;
       case FX_CMD_WIND_SCALE: cmd.mgr->setFxWindScale(*e, cmd.f); break;
       case FX_CMD_GRAVITY_TM: cmd.mgr->setFxGravityTm(*e, cmd.m3); break;
       case FX_CMD_COLOR_MULT: cmd.mgr->setFxColorMult(*e, cmd.c4); break;
+      case FX_CMD_SPLINE_GEN: cmd.mgr->setFxSplineGenControlPoints(*e, cmd.tm4); break;
       case FX_CMD_STOP:
       {
         OSSpinlockScopedLock lock(&cmd.mgr->mgrSLock);
@@ -1483,9 +1756,13 @@ void EffectManager::updateCmdBuff()
       break;
       case FX_CMD_PAUSE_SOUND: cmd.mgr->pauseFxSoundExt(*e, cmd.b); break;
       case FX_CMD_ENABLE_ACTIVE_QUERY:
+      {
+        OSSpinlockScopedLock lock(&cmd.mgr->mgrSLock);
         e->flags |= AcesEffect::ACTIVE_QUERY_ENABLED;
         updateCachedFlags(*e);
-        break;
+      }
+      break;
+      case FX_CMD_WARMUP: cmd.mgr->setFxWarmup(*e, cmd.p2.x, cmd.p2.y); break;
       default: G_FAST_ASSERT(0); break;
     }
 #if DAGOR_DBGLEVEL > 0 && _TARGET_PC

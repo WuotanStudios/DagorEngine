@@ -68,6 +68,10 @@ Backend *FileBackend::create(const FileBackendConfig &config)
   bck->maxSize = config.maxSize;
   bck->manualEviction = config.manualEviction;
   bck->aioJobId = config.aioJobId;
+
+  if (config.csMgr)
+    bck->csMgr = config.csMgr;
+
   if (bck->maxSize != 0) // not inifity storage, do populate for eviction
     bck->doPopulate();
 
@@ -82,7 +86,7 @@ struct FindFilesAsyncJob : public cpujobs::IJob
   carray<Tab<alefind_t>, 2> foundFiles;
 
   FindFilesAsyncJob(FileBackend *fback) : back(fback) {}
-  const char *getJobName(bool &) const override { return "FindFilesAsyncJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("FindFilesAsyncJob"); }
   virtual void doJob()
   {
     char tmpPath[DAGOR_MAX_PATH];
@@ -130,6 +134,7 @@ void FileBackend::onFoundFiles(dag::ConstSpan<Tab<alefind_t>> fnd_results)
     {
       G_ASSERT(strlen(fnd->fmask) > mountPathLen + 1);
       strncpy(tmpPath, fnd->fmask, sizeof(tmpPath));
+      tmpPath[sizeof(tmpPath) - 1] = '\0';
       tmpPath[strlen(tmpPath) - 1] = '\0'; // trim '*'
       strncat(tmpPath, fnd->name, sizeof(tmpPath) - strlen(tmpPath) - 1);
       const char *fname = tmpPath + mountPathLen + 1; // skip mount path & '/'

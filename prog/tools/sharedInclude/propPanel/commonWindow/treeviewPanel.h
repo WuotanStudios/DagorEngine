@@ -4,7 +4,7 @@
 //
 #pragma once
 
-#include <propPanel/control/filteredTreeTypes.h>
+#include <propPanel/c_common.h>
 #include <propPanel/c_control_event_handler.h>
 #include <propPanel/c_window_event_handler.h>
 #include <libTools/util/hdpiUtil.h>
@@ -16,14 +16,19 @@
 namespace PropPanel
 {
 
-class FilteredTreeControlStandalone;
+class TreeControlStandalone;
 class IListBoxInterface;
 class ITreeInterface;
+class ITreeRenderEx;
+class ITreeDragHandler;
+class ITreeDropHandler;
+class ITreeFilter;
+class TreeNode;
+
 class IMenu;
 class ListBoxControlStandalone;
 class ContainerPropertyControl;
 class TreeBaseWindow;
-
 enum class IconId : int;
 
 class ITreeViewEventHandler
@@ -42,7 +47,7 @@ class TreeBaseWindow : public WindowControlEventHandler
 {
 public:
   TreeBaseWindow(ITreeViewEventHandler *event_handler, void *phandle, int x, int y, hdpi::Px w, hdpi::Px h, const char *caption,
-    bool icons_show, bool state_icons_show = false);
+    bool icons_show, bool state_icons_show = false, bool multi_select = false);
 
   ~TreeBaseWindow() override;
 
@@ -52,9 +57,9 @@ public:
   TLeafHandle addItemAsFirst(const char *name, const char *icon_name, TLeafHandle parent = NULL, void *user_data = nullptr);
   void removeItem(TLeafHandle item);
 
-  virtual void addChildName(const char *name, TLeafHandle parent);
   int getChildrenCount(TLeafHandle parent) const;
   TLeafHandle getChild(TLeafHandle parent, int i) const;
+  TLeafHandle getParent(TLeafHandle item) const;
 
   TLeafHandle getNextNode(TLeafHandle item, bool forward) const;
 
@@ -65,21 +70,27 @@ public:
 
   String getItemName(TLeafHandle item) const;
   void *getItemData(TLeafHandle item) const;
-  Tab<String> getChildNames(TLeafHandle item) const;
-  TTreeNode *getItemNode(TLeafHandle item);
-  const TTreeNode *getItemNode(TLeafHandle item) const;
+  TreeNode *getItemNode(TLeafHandle item);
+  const TreeNode *getItemNode(TLeafHandle item) const;
 
   bool isOpen(TLeafHandle item) const;
   bool isSelected(TLeafHandle item) const;
 
+  bool isContextMenuOpen() const;
+
   TLeafHandle getSelectedItem() const;
-  void setSelectedItem(TLeafHandle item);
+  void getSelectedItems(dag::Vector<TLeafHandle> &items, bool search_in_collapsed = false, bool include_filtered_out = false) const;
+
+  void setSelectedItem(TLeafHandle item, bool keep_selected = false);
+  void setSelectedItems(dag::ConstSpan<TLeafHandle> items);
+
+  bool deselectItem(TLeafHandle item);
   TLeafHandle getRoot() const;
 
   // Get the unfiltered internal root node.
   // Unlike getRoot() this returns with the internal root node which is never visible, and not with the first child of
   // the root node.
-  const TTreeNode &getUnfilteredRootNode() const;
+  const TreeNode &getRootNode() const;
 
   void clear();
   TLeafHandle search(const char *text, TLeafHandle first, bool forward, bool use_wildcard_search = false);
@@ -90,22 +101,21 @@ public:
   void expandTillRoot(TLeafHandle leaf, bool open = true);
   void ensureVisible(TLeafHandle item);
 
-  // Gets the expansion state from the filtered tree, and apply it to the unfiltered tree.
-  // This is only needed to be callled if TTreeNode::isExpand is used directly. (For example by using
-  // getUnfilteredRootNode() and walking its children.)
-  void updateUnfilteredExpansionStateFromFilteredTree();
+  void setTreeRenderEx(ITreeRenderEx *interface);
+
+  void setDragHandler(ITreeDragHandler *drag_handler);
+  void setDropHandler(ITreeDropHandler *drop_handler);
 
   void setFocus();
   void setMessage(const char *in_message);
 
-  virtual bool handleNodeFilter([[maybe_unused]] const TTreeNode &node) { return true; }
+  virtual bool handleNodeFilter([[maybe_unused]] const TreeNode &node) { return true; }
+  virtual bool hasAnyFilter() const { return false; }
 
   // If control_height is 0 then it will use the entire available height.
   virtual void updateImgui(float control_height = 0.0f);
 
 protected:
-  typedef bool (*TTreeNodeFilterFunc)(void *param, TTreeNode &node);
-
   TLeafHandle addItemInternal(const char *name, IconId icon, TLeafHandle parent, void *user_data, bool as_first);
   void startFilter();
 
@@ -116,7 +126,8 @@ protected:
 
   ITreeViewEventHandler *mEventHandler;
   WindowBase *treeWindowBase; // Just for identification.
-  FilteredTreeControlStandalone *mTree;
+  TreeControlStandalone *mTree;
+  eastl::unique_ptr<ITreeFilter> treeFilter;
 };
 
 
@@ -161,7 +172,8 @@ protected:
   void onClick(int pid, ContainerPropertyControl *panel) override;
   long onKeyDown(int pcb_id, ContainerPropertyControl *panel, unsigned v_key) override;
 
-  bool handleNodeFilter(const TTreeNode &node) override;
+  virtual bool handleNodeFilter([[maybe_unused]] const TreeNode &node) override { return false; }
+  virtual bool hasAnyFilter() const override { return false; }
 
   void searchNext(const char *text, bool forward);
   void setCaptionFilterButton();

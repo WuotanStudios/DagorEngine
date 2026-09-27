@@ -20,7 +20,6 @@ Sources =
   perlin.cpp
   ffd44.cpp
   triangleTriangleIntersection.cpp
-  triangleBoxIntersection.cpp
   sHmath.cpp
   geomTree.cpp
   geomTreeMap.cpp
@@ -33,6 +32,7 @@ Sources =
   wooray2d.cpp
   wooray3d.cpp
   checkNanTest.cpp
+  sdf_edt.cpp
 ;
 
 UseProgLibs =

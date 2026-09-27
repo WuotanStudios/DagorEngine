@@ -15,8 +15,12 @@
 #include <drv/3d/dag_renderTarget.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
 #include <shaders/dag_overrideStates.h>
+#include <util/dag_threadPool.h>
+#include <osApiWrappers/dag_cpuJobs.h>
 
 static int globalFrameBlockId = -1;
+
+CONSOLE_BOOL_VAL("grassify", disable_async_visibility_filtering, false);
 
 #define GLOBAL_VARS_LIST                             \
   VAR(world_to_grass_slice)                          \
@@ -41,11 +45,9 @@ struct GrassMaskSliceHelper
     state.set(shaders::OverrideState::FLIP_CULL);
     flipCullStateId = shaders::overrides::create(state);
 
-    maskTex = dag::create_tex(nullptr, maskSize.x, maskSize.y, TEXCF_RTARGET, 1, "grass_mask_islands_tex");
-    ShaderGlobal::set_sampler(get_shader_variable_id("grass_mask_islands_tex_samplerstate", true), d3d::request_sampler({}));
-    colorTex =
-      dag::create_tex(nullptr, maskSize.x, maskSize.y, TEXCF_SRGBREAD | TEXCF_SRGBWRITE | TEXCF_RTARGET, 1, "grass_color_islands_tex");
-    ShaderGlobal::set_sampler(get_shader_variable_id("grass_color_islands_tex_samplerstate", true), d3d::request_sampler({}));
+    maskTex = dag::create_tex(nullptr, maskSize.x, maskSize.y, TEXCF_RTARGET, 1, "grass_mask_islands_tex", RESTAG_GRASS);
+    colorTex = dag::create_tex(nullptr, maskSize.x, maskSize.y, TEXCF_SRGBREAD | TEXCF_SRGBWRITE | TEXCF_RTARGET, 1,
+      "grass_color_islands_tex", RESTAG_GRASS);
   };
 
   void renderMask(IRandomGrassRenderHelper &grassRenderHelper);
@@ -53,9 +55,45 @@ struct GrassMaskSliceHelper
   float texelSize;
   IPoint2 maskSize;
   IPoint2 offset;
-  UniqueTexHolder maskTex, colorTex;
+  UniqueTexWithShaderVar maskTex, colorTex;
   shaders::UniqueOverrideStateId flipCullStateId;
   PostFxRenderer copy_grass_decals;
+};
+
+struct FilterVisibilityJob : public cpujobs::IJob
+{
+  void start(RiGenVisibility *global_vis, RiGenVisibility *frame_vis, const Frustum &cull_frustum)
+  {
+    wait();
+    globalVis = global_vis;
+    frameVis = frame_vis;
+    frustum = cull_frustum;
+    started = true;
+    threadpool::add(this, threadpool::PRIO_NORMAL, true);
+  }
+
+  void wait()
+  {
+    if (!started)
+      return;
+    threadpool::wait(this);
+    started = false;
+  }
+
+  bool isStarted() const { return started; }
+
+  void doJob() override
+  {
+    rendinst::filterVisibility(*globalVis, *frameVis, [this](vec4f min, vec4f max) { return frustum.testBox(min, max); });
+  }
+  void releaseJob() override {}
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("grassify_filter_visibility"); }
+
+private:
+  RiGenVisibility *globalVis = nullptr;
+  RiGenVisibility *frameVis = nullptr;
+  Frustum frustum;
+  bool started = false;
 };
 
 struct GrassGenerateHelper
@@ -79,6 +117,7 @@ struct GrassGenerateHelper
 
   ~GrassGenerateHelper()
   {
+    filterJob.wait();
     rendinst::destroyRIGenVisibility(globalVis);
     rendinst::destroyRIGenVisibility(frameVis);
   }
@@ -87,7 +126,10 @@ struct GrassGenerateHelper
     float grassMaskTexelSize, const TMatrix &view_itm, Driver3dPerspective perspective, const GPUGrassBase &gpuGrassBase);
   void render(const Point3 &position, const TMatrix &view_itm, const GPUGrassBase &gpuGrassBase);
 
+  void startFilterJob(const TMatrix &itm, Driver3dPerspective perspective);
+
 private:
+  Frustum buildFrustum(const TMatrix &itm, Driver3dPerspective perspective) const;
   TMatrix getViewMatrix() const;
   TMatrix4 getProjectionMatrix(const Point3 &position, float distance) const;
 
@@ -96,6 +138,7 @@ private:
   RiGenVisibility *globalVis = nullptr;
   RiGenVisibility *frameVis = nullptr;
   int rendinstGrassifySceneBlockId = ShaderGlobal::getBlockId("rendinst_grassify_scene");
+  FilterVisibilityJob filterJob;
 };
 
 void GrassMaskSliceHelper::renderMask(IRandomGrassRenderHelper &grassRenderHelper)
@@ -130,6 +173,21 @@ TMatrix4 GrassGenerateHelper::getProjectionMatrix(const Point3 &position, float 
   return matrix_ortho_off_center_lh(bbox3[0].x, bbox3[1].x, bbox3[1].z, bbox3[0].z, bbox3[0].y, bbox3[1].y);
 }
 
+Frustum GrassGenerateHelper::buildFrustum(const TMatrix &itm, Driver3dPerspective perspective) const
+{
+  perspective.zf = maxDistance; // Fix far to cull based on distance
+  TMatrix4 projTm;
+  d3d::calcproj(perspective, projTm);
+  return Frustum(TMatrix4(inverse(itm)) * projTm);
+}
+
+void GrassGenerateHelper::startFilterJob(const TMatrix &itm, Driver3dPerspective perspective)
+{
+  if (!globalVis || disable_async_visibility_filtering)
+    return;
+  filterJob.start(globalVis, frameVis, buildFrustum(itm, perspective));
+}
+
 void GrassGenerateHelper::generate(const GrassView view, const Point3 &position, const IPoint2 &grassMaskOffset,
   const IPoint2 &grassMaskSize, float grassMaskTexelSize, const TMatrix &itm, Driver3dPerspective perspective,
   const GPUGrassBase &gpuGrassBase)
@@ -144,12 +202,13 @@ void GrassGenerateHelper::generate(const GrassView view, const Point3 &position,
   Point3 alignedCenterPos = Point3(position2D.x, position.y, position2D.y);
   Point2 grassMaskDistance = Point2(grassMaskSize) * grassMaskTexelSize;
 
-  TMatrix4 projTm;
-  // Fix far to cull based on distance.
-  perspective.zf = maxDistance;
-  d3d::calcproj(perspective, projTm);
-  Frustum frustum(TMatrix4(inverse(itm)) * projTm);
-  rendinst::filterVisibility(*globalVis, *frameVis, [&frustum](vec4f min, vec4f max) { return frustum.testBox(min, max); });
+  if (filterJob.isStarted())
+    filterJob.wait();
+  else
+  {
+    Frustum frustum = buildFrustum(itm, perspective);
+    rendinst::filterVisibility(*globalVis, *frameVis, [&frustum](vec4f min, vec4f max) { return frustum.testBox(min, max); });
+  }
 
   {
     SCOPE_VIEW_PROJ_MATRIX;
@@ -167,7 +226,7 @@ void GrassGenerateHelper::generate(const GrassView view, const Point3 &position,
       const float distanceMultiplier = 2;
       currentGrassDistance *= distanceMultiplier;
       const int quadSize = currentGrassDistance / currentGridSize;
-      ShaderGlobal::set_color4(grass_average_ht__ht_extent__avg_hor__hor_extentVarId,
+      ShaderGlobal::set_float4(grass_average_ht__ht_extent__avg_hor__hor_extentVarId,
         0.5 * maxGrassHeightSize,               // average grass Ht
         0.5 * maxGrassHeightSize,               // grass Ht extents
         currentGridSize * 0.5,                  // average grid extents
@@ -178,7 +237,7 @@ void GrassGenerateHelper::generate(const GrassView view, const Point3 &position,
       d3d::settm(TM_PROJ, &proj);
       d3d::setview(0, 0, min(quadSize * 2, grassMaskSize.x), min(quadSize * 2, grassMaskSize.y), 0, 1);
 
-      ShaderGlobal::set_color4(grass_grid_paramsVarId, alignedCenterPos.x, alignedCenterPos.y, currentGridSize, quadSize);
+      ShaderGlobal::set_float4(grass_grid_paramsVarId, alignedCenterPos.x, alignedCenterPos.y, currentGridSize, quadSize);
 
       FRAME_LAYER_GUARD(globalFrameBlockId);
       SCENE_LAYER_GUARD(rendinstGrassifySceneBlockId);
@@ -187,7 +246,7 @@ void GrassGenerateHelper::generate(const GrassView view, const Point3 &position,
         rendinst::LayerFlag::Opaque, rendinst::OptimizeDepthPass::No, 3);
     };
 
-    ShaderGlobal::set_color4(world_to_grass_sliceVarId, 1.0f / grassMaskDistance.x, 1.0f / grassMaskDistance.y,
+    ShaderGlobal::set_float4(world_to_grass_sliceVarId, 1.0f / grassMaskDistance.x, 1.0f / grassMaskDistance.y,
       -grassMaskOffset.x / grassMaskDistance.x, -grassMaskOffset.y / grassMaskDistance.y);
 
     // todo: generate lods in one pass
@@ -216,6 +275,11 @@ Grassify::Grassify(const DataBlock &grassifyBlock, float grassDistance)
 
 void Grassify::initGrassifyRendinst() { grassGenHelper->initGrassifyRendinst(); }
 
+void Grassify::startFilterJob(const TMatrix &view_tm, const Driver3dPerspective &perspective)
+{
+  grassGenHelper->startFilterJob(view_tm, perspective);
+}
+
 void Grassify::generate(GrassView view, const Point3 &pos, const TMatrix &view_itm, const Driver3dPerspective &perspective,
   Texture *grass_mask, IRandomGrassRenderHelper &grassRenderHelper, const GPUGrassBase &gpuGrassBase)
 {
@@ -224,7 +288,7 @@ void Grassify::generate(GrassView view, const Point3 &pos, const TMatrix &view_i
 
   // There is no any render to this target, but we need any target to set as a render target,
   // and we need to keep the same texel size between regular grass and grassify, so we use same targets.
-  d3d::set_render_target(grass_mask, 0);
+  d3d::set_render_target({}, DepthAccess::RW, {{grass_mask, 0, 0}});
 
   grassMaskHelper->maskTex.setVar();
   grassMaskHelper->colorTex.setVar();
@@ -233,17 +297,17 @@ void Grassify::generate(GrassView view, const Point3 &pos, const TMatrix &view_i
     perspective, gpuGrassBase);
 }
 
+void Grassify::driverReset() { grassMaskHelper.reset(); }
+
 void Grassify::generateGrassMask(IRandomGrassRenderHelper &grassRenderHelper)
 {
-  Color4 rendinst_landscape_area_left_top_right_bottom = ShaderGlobal::get_color4(rendinst_landscape_area_left_top_right_bottomVarId);
+  Color4 rendinstLandscapeAreaLeftTopRightBottom = ShaderGlobal::get_float4(rendinst_landscape_area_left_top_right_bottomVarId);
 
-  IPoint2 grassifyMaskDistance =
-    IPoint2(rendinst_landscape_area_left_top_right_bottom.b - rendinst_landscape_area_left_top_right_bottom.r,
-      rendinst_landscape_area_left_top_right_bottom.a - rendinst_landscape_area_left_top_right_bottom.g);
+  IPoint2 grassifyMaskDistance = IPoint2(rendinstLandscapeAreaLeftTopRightBottom.b - rendinstLandscapeAreaLeftTopRightBottom.r,
+    rendinstLandscapeAreaLeftTopRightBottom.a - rendinstLandscapeAreaLeftTopRightBottom.g);
 
-  IPoint2 grassifyMaskOffset =
-    IPoint2(min(rendinst_landscape_area_left_top_right_bottom.b, rendinst_landscape_area_left_top_right_bottom.r),
-      min(rendinst_landscape_area_left_top_right_bottom.a, rendinst_landscape_area_left_top_right_bottom.g));
+  IPoint2 grassifyMaskOffset = IPoint2(min(rendinstLandscapeAreaLeftTopRightBottom.b, rendinstLandscapeAreaLeftTopRightBottom.r),
+    min(rendinstLandscapeAreaLeftTopRightBottom.a, rendinstLandscapeAreaLeftTopRightBottom.g));
 
   grassifyMaskDistance = abs(grassifyMaskDistance);
   float texelSize = min(grassifyMaskDistance.x / (float)grassifyMaskSize.x, grassifyMaskDistance.x / (float)grassifyMaskSize.y);

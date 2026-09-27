@@ -50,7 +50,7 @@ BhvProjection::BhvProjection() : Behavior(darg::Behavior::STAGE_BEFORE_RENDER, 0
 
 
 template <typename Callable>
-static void visibility_ecs_query(ecs::EntityId eid, Callable c);
+static void visibility_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable c);
 
 
 int BhvProjection::update(UpdateStage /*stage*/, darg::Element *elem, float /*dt*/)
@@ -142,10 +142,11 @@ int BhvProjection::update(UpdateStage /*stage*/, darg::Element *elem, float /*dt
 
     bool itemVisible = false;
     bool animcharVisible = false;
-    visibility_ecs_query(eid, [&](const bool *item__visibleCached, const bool *item__visible, bool animchar__visible = true) {
-      itemVisible = item__visibleCached ? *item__visibleCached : item__visible ? *item__visible : true;
-      animcharVisible = animchar__visible;
-    });
+    visibility_ecs_query(*g_entity_mgr, eid,
+      [&](const bool *item__visibleCached, const bool *item__visible, bool animchar__visible = true) {
+        itemVisible = item__visibleCached ? *item__visibleCached : item__visible ? *item__visible : true;
+        animcharVisible = animchar__visible;
+      });
 
     if (eid == ecs::INVALID_ENTITY_ID || alwaysVisible || itemVisible)
     {
@@ -154,7 +155,9 @@ int BhvProjection::update(UpdateStage /*stage*/, darg::Element *elem, float /*dt
 
       bool inElem = false;
       float minDistance = data.RawGetSlotValue(strings->minDistance, 0.1f);
-      if (distanceToObject > minDistance && sp.z > 0)
+      // clip at the near plane, not at z==0: nearer points are not visible in 3D
+      // and the division can produce unreasonable values
+      if (distanceToObject > minDistance && sp.z > persp.zn)
       {
         if (vrgui::is_inited())
         {
@@ -308,8 +311,13 @@ int BhvProjection::update(UpdateStage /*stage*/, darg::Element *elem, float /*dt
       }
     }
 
-    child->transform->translate = vp;
-    child->transform->scale = Point2(distScale, distScale);
+    // a hidden child is not rendered, so do not store its off-screen projection: the stale value
+    // may survive into the next rebuild, where daRg checks the transform range and reports it
+    if (!child->isHidden())
+    {
+      child->transform->translate = vp;
+      child->transform->scale = Point2(distScale, distScale);
+    }
 
     if (child->isHidden() != wasHidden)
       resultFlags |= R_REBUILD_RENDER_AND_INPUT_LISTS;

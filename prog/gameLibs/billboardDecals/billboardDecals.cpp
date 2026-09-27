@@ -46,7 +46,7 @@ BillboardDecals::BillboardDecals() :
   billboard_decals_depth_maskVarId = get_shader_variable_id("billboard_decals_depth_mask");
 }
 
-void BillboardDecals::init_textures(SharedTexHolder &&diffuse, SharedTexHolder &&normal)
+void BillboardDecals::init_textures(SharedTexWithShaderVar &&diffuse, SharedTexWithShaderVar &&normal)
 {
 
   diffuseTex = eastl::move(diffuse);
@@ -54,13 +54,6 @@ void BillboardDecals::init_textures(SharedTexHolder &&diffuse, SharedTexHolder &
 
   bumpTex = eastl::move(normal);
   bumpTex.setVar();
-  {
-    d3d::SamplerInfo smpInfo;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
-    d3d::SamplerHandle sampler = d3d::request_sampler(smpInfo);
-    ShaderGlobal::set_sampler(get_shader_variable_id("billboard_decals_diff_tex_samplerstate", true), sampler);
-    ShaderGlobal::set_sampler(get_shader_variable_id("billboard_decals_bump_tex_samplerstate", true), sampler);
-  }
   // Textures.
 
   TextureInfo tinfo;
@@ -77,9 +70,9 @@ bool BillboardDecals::init_textures(dag::ConstSpan<const char *> diffuse, dag::C
 {
   if (!diffuse.size())
     return false;
-  SharedTexHolder diffuseTexArray =
+  SharedTexWithShaderVar diffuseTexArray =
     dag::add_managed_array_texture(String(128, "%s_diff*", texture_name), diffuse, "billboard_decals_diff_tex");
-  SharedTexHolder bumpTexArray;
+  SharedTexWithShaderVar bumpTexArray;
   if (!normal.empty())
   {
     bumpTexArray = dag::add_managed_array_texture(String(128, "%s_normal*", texture_name), normal, "billboard_decals_bump_tex");
@@ -108,9 +101,14 @@ bool BillboardDecals::init(float hard_dist, float soft_dist, unsigned max_holes,
   clearSphereShader = new_compute_shader(clear_sphere_shader_name);
   if (!clearSphereShader)
     return false;
-  holesInstances =
-    dag::buffers::create_ua_sr_structured(sizeof(BillboardDecalInstance), maxHoles, holes_buffer_name, dag::buffers::Init::Zero);
+  holesInstances = dag::buffers::create_ua_sr_structured(sizeof(BillboardDecalInstance), maxHoles, holes_buffer_name,
+    dag::buffers::Init::Zero, RESTAG_DECALS);
   if (!holesInstances)
+    return false;
+
+  holesToUpdateBuf =
+    d3d::buffers::create_one_frame_cb((sizeof(BillboardToUpdate) * MAX_DECALS_TO_UPDATE) >> 4, "holesToUpdateCB", RESTAG_DECALS);
+  if (!holesToUpdateBuf)
     return false;
 
   // VB and IB.
@@ -140,6 +138,7 @@ void BillboardDecals::close()
   numFreeDecals = 0;
   freeDecalIds.clear();
   recentlyFreedIds.clear();
+  del_d3dres(holesToUpdateBuf);
 }
 
 BillboardDecals::~BillboardDecals() { close(); }
@@ -159,10 +158,12 @@ void BillboardDecals::prepareRender(const Frustum & /*frustum*/, const Point3 & 
   if (holesToUpdate.size())
   {
     // todo: on DX9/Dx10 replace that with shader that writes to texture (rendering points to texture).
+    holesToUpdateBuf->updateData(0, holesToUpdate.size() * sizeof(BillboardToUpdate), holesToUpdate.data(),
+      VBLOCK_WRITEONLY | VBLOCK_DISCARD);
 
     IPoint4 params(nextHoleNo, holesToUpdate.size(), maxHoles, 0);
     d3d::set_cs_const(billboard_decals_nextHole__holesToUpdate__maxHoles_const_no.get_int(), (float *)&params.x, 1);
-    d3d::set_cs_const(1, (float *)&holesToUpdate[0], holesToUpdate.size() * ((elem_size(holesToUpdate) + 15) / 16));
+    d3d::set_const_buffer(STAGE_CS, 1, holesToUpdateBuf);
     d3d::set_rwbuffer(STAGE_CS, billboard_decals_generator_holes_uav_no.get_int(), holesInstances.getBuf());
     holesGenerator->dispatch(1, (holesToUpdate.size() + DECALS_WARP_X * DECALS_WARP_X - 1) / (DECALS_WARP_X * DECALS_WARP_X), 1);
     d3d::set_rwbuffer(STAGE_CS, billboard_decals_generator_holes_uav_no.get_int(), 0);
@@ -205,7 +206,7 @@ void BillboardDecals::clearInSphere(const Point3 &pos, float sphere_radius)
 void BillboardDecals::render()
 {
   index_buffer::use_quads_16bit();
-  ShaderGlobal::set_color4(billboard_decals_depth_maskVarId, 1.f + hardDistance / softnessDistance, -1.f / softnessDistance, w, h);
+  ShaderGlobal::set_float4(billboard_decals_depth_maskVarId, 1.f + hardDistance / softnessDistance, -1.f / softnessDistance, w, h);
 
   // todo: on Dx9 we need vertex buffer. It can be as simple as vertexId in each vertex (4 bytes per vertices)
   d3d::setvsrc(0, 0, 0);

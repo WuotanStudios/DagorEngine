@@ -36,27 +36,22 @@ public:
 
   void setCurrentView(int view) override;
 
-  void renderSSAO(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *depth_tex_to_use, const ManagedTex *ssao_tex,
-    const ManagedTex *prev_ssao_tex, const DPoint3 *world_pos, SubFrameSample sub_sample, bool clear_rt);
+  void renderSSAO(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *depth_tex_to_use, BaseTexture *ssao_tex,
+    BaseTexture *prev_ssao_tex, const DPoint3 *world_pos, SubFrameSample sub_sample, bool clear_rt);
 
-  void applySSAOBlur(const ManagedTex *ssao_tex, const ManagedTex *tmp_tex);
+  void applySSAOBlur(BaseTexture *ssao_tex, BaseTexture *tmp_tex);
 
 private:
-  void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssaoDepthTexUse, const ManagedTex *ssaoTex,
-    const ManagedTex *prevSsaoTex, const ManagedTex *tmpTex, const DPoint3 *world_pos,
+  void render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssaoDepthTexUse, BaseTexture *ssaoTex,
+    BaseTexture *prevSsaoTex, BaseTexture *tmpTex, const DPoint3 *world_pos,
     SubFrameSample sub_sample = SubFrameSample::Single) override;
-
-  void initRandomPattern();
-  void renderRandomPattern();
 
   void updateViewSpecific(const TMatrix &view_tm, const TMatrix4 &proj_tm, const DPoint3 *world_pos);
   void updateFrameNo();
-  void renderSSAO(BaseTexture *depth_to_use, const ManagedTex &ssaoTex, const ManagedTex &prevSsaoTex, bool clear_rt);
-  void applyBlur(const ManagedTex &ssaoTex, const ManagedTex &tmpTex);
+  void renderSSAO(BaseTexture *depth_to_use, BaseTexture *ssaoTex, BaseTexture *prevSsaoTex, bool clear_rt);
+  void applyBlur(BaseTexture *ssaoTex, BaseTexture *tmpTex);
 
-  void generatePoissionPoints(int num_samples, int num_frames);
-
-  void clearRandomPattern() { randomPatternTex.close(); };
+  void generatePoissonPoints(int num_samples, int num_frames);
 
   static constexpr const char *ssao_sh_name = "ssao";
   static constexpr const char *blur_sh_name = "ssao_blur";
@@ -75,8 +70,7 @@ private:
 
   RTargetPool::Ptr ssaoRTPool;
   ViewDependentResource<ViewSpecific, 2> viewSpecific;
-  UniqueTexHolder randomPatternTex;
-  UniqueBufHolder poissonPoints;
+  UniqueBufWithShaderVar poissonPoints;
 
   eastl::unique_ptr<PostFxRenderer> ssaoBlurRenderer{nullptr};
   bool useOwnTextures;

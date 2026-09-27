@@ -18,8 +18,9 @@ public:
   void init();
   void shutdown();
 
+  void setCapturePathTemplate(const wchar_t *name);
   void triggerCapture(uint32_t count);
-  void beginCapture();
+  void beginCapture(const wchar_t *name);
   void endCapture();
 
 private:

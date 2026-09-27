@@ -106,11 +106,13 @@ struct LastIs<V, IndexList<A>>
 
 template <uint32_t id, DXGI_FORMAT base, DXGI_FORMAT linear, DXGI_FORMAT srgb,
   uint32_t channel_mask = FormatTrait<linear>::channel_mask, uint32_t block_size = FormatTrait<linear>::bits,
-  uint32_t block_x = FormatTrait<linear>::block_width, uint32_t block_y = FormatTrait<linear>::block_height>
+  uint32_t block_x = FormatTrait<linear>::block_width, uint32_t block_y = FormatTrait<linear>::block_height,
+  uint32_t bits_plane_0 = FormatTrait<linear>::bits_per_plane[0], uint32_t bits_plane_1 = FormatTrait<linear>::bits_per_plane[1],
+  uint32_t bits_plane_2 = FormatTrait<linear>::bits_per_plane[2]>
 struct FormatInfo
 {
   static const uint32_t ID = id;
-  static const uint32_t Index = id >> FormatStore::CREATE_FLAGS_FORMAT_SHIFT;
+  static const uint32_t Index = id >> FormatStore::create_flags_format_shift;
   static const DXGI_FORMAT BaseFormat = base;
   static const DXGI_FORMAT LinearFormat = linear;
   static const DXGI_FORMAT SrgbFormat = srgb;
@@ -119,6 +121,7 @@ struct FormatInfo
   static const uint32_t BlockX = block_x;
   static const uint32_t BlockY = block_y;
   static const uint32_t ChannelMask = channel_mask;
+  static constexpr uint32_t BitsPerPlane[3] = {bits_plane_0, bits_plane_1, bits_plane_2};
 };
 
 template <DXGI_FORMAT base, DXGI_FORMAT linear, DXGI_FORMAT srgb, uint8_t plane_count, uint32_t block_size = FormatTrait<linear>::bits,
@@ -127,7 +130,7 @@ struct ExtraFormatInfo
 {
   template <uint32_t next_index>
   using FormatType =
-    FormatInfo<next_index << FormatStore::CREATE_FLAGS_FORMAT_SHIFT, base, linear, srgb, plane_count, block_size, block_x, block_y>;
+    FormatInfo<next_index << FormatStore::create_flags_format_shift, base, linear, srgb, plane_count, block_size, block_x, block_y>;
 };
 
 enum class ColorSpace : uint8_t
@@ -180,6 +183,7 @@ public:
   static CONST_TABLE DXGI_FORMAT srgbFormatArray[sizeof...(Formats)];
   static CONST_TABLE BlockInfo blockList[sizeof...(Formats)];
   static CONST_TABLE uint32_t channelMask[sizeof...(Formats)];
+  static CONST_TABLE uint32_t bytesPerPlane[sizeof...(Formats)][3];
 
   static uint8_t planeCount[sizeof...(Formats)];
   static FormatSupport linearFormatSupportArray[sizeof...(Formats)];
@@ -248,7 +252,7 @@ public:
     {
       logdbg("DX12: Device vendor is AMD, assuming emulated D24S8, patching D24S8 to D32S8X24...");
       remapTo<DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT>(
-        TEXFMT_DEPTH24 >> FormatStore::CREATE_FLAGS_FORMAT_SHIFT);
+        TEXFMT_DEPTH24 >> FormatStore::create_flags_format_shift);
     }
 #else
     G_UNUSED(vendor);
@@ -312,6 +316,13 @@ public:
   {
     checkTableIndex(index);
     return blockList[index];
+  }
+
+  static uint32_t getBytesPerPlane(uint32_t index, uint32_t plane)
+  {
+    checkTableIndex(index);
+    G_ASSERT(plane < 3);
+    return bytesPerPlane[index][plane];
   }
 
   static uint8_t getPlaneCount(uint32_t index)
@@ -382,6 +393,14 @@ CONST_TABLE typename FormatInfoTable<Formats...>::BlockInfo FormatInfoTable<Form
 template <typename... Formats>
 CONST_TABLE uint32_t FormatInfoTable<Formats...>::channelMask[sizeof...(Formats)] = //
   {Formats::ChannelMask...};
+
+template <typename... Formats>
+CONST_TABLE uint32_t FormatInfoTable<Formats...>::bytesPerPlane[sizeof...(Formats)][3] = { //
+  {
+    Formats::BitsPerPlane[0] / 8,
+    Formats::BitsPerPlane[1] / 8,
+    Formats::BitsPerPlane[2] / 8,
+  }...};
 
 template <typename... Formats>
 uint8_t FormatInfoTable<Formats...>::planeCount[sizeof...(Formats)];
@@ -548,7 +567,7 @@ struct SortedFormatInfoTable<FormatInfoTable<A, N...>>
 
 // use DummyFormatInfo<index to fill with dummy> to add a dummy for unused slot to make the format table a contiguous list
 template <uint32_t F>
-using DummyFormatInfo = FormatInfo<F, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, 1, 0, 1, 1>;
+using DummyFormatInfo = FormatInfo<F, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, 1, 0, 1, 1, 0, 0, 0>;
 
 // clang-format off
 // this table can be in any order, SortedFormatInfoTable will sort them by TEXFMT_
@@ -569,7 +588,7 @@ FormatInfo<TEXFMT_DXT1,           DXGI_FORMAT_BC1_TYPELESS,           DXGI_FORMA
 FormatInfo<TEXFMT_DXT3,           DXGI_FORMAT_BC2_TYPELESS,           DXGI_FORMAT_BC2_UNORM,            DXGI_FORMAT_BC2_UNORM_SRGB>,
 FormatInfo<TEXFMT_DXT5,           DXGI_FORMAT_BC3_TYPELESS,           DXGI_FORMAT_BC3_UNORM,            DXGI_FORMAT_BC3_UNORM_SRGB>,
 FormatInfo<TEXFMT_R32G32UI,       DXGI_FORMAT_R32G32_TYPELESS,        DXGI_FORMAT_R32G32_UINT,          DXGI_FORMAT_R32G32_UINT>,
-DummyFormatInfo<0x0F000000U>,
+FormatInfo<TEXFMT_BC5S,           DXGI_FORMAT_BC5_TYPELESS,           DXGI_FORMAT_BC5_SNORM,            DXGI_FORMAT_BC5_SNORM>,
 FormatInfo<TEXFMT_L16,            DXGI_FORMAT_R16_TYPELESS,           DXGI_FORMAT_R16_UNORM,            DXGI_FORMAT_R16_UNORM>,
 FormatInfo<TEXFMT_A8,             DXGI_FORMAT_A8_UNORM,               DXGI_FORMAT_A8_UNORM,             DXGI_FORMAT_A8_UNORM>,
 FormatInfo<TEXFMT_R8,             DXGI_FORMAT_R8_TYPELESS,            DXGI_FORMAT_R8_UNORM,             DXGI_FORMAT_R8_UNORM>,
@@ -632,7 +651,7 @@ FormatStore FormatStore::fromDXGIFormat(DXGI_FORMAT fmt)
   FormatStore result;
 
   FormatInfoTableSet::IndexInfo ii = FormatInfoTableSet::getIndex(fmt);
-  result.isSrgb = ii.colorSpace == ColorSpace::SRGB;
+  result.srgbRead = result.srgbWrite = ii.colorSpace == ColorSpace::SRGB;
   result.linearFormat = ii.index;
   return result;
 }
@@ -659,17 +678,17 @@ FormatStore FormatStore::fromDXGIDepthFormat(DXGI_FORMAT fmt)
   return result;
 }
 
-DXGI_FORMAT FormatStore::asDxGiTextureCreateFormat() const
+DXGI_FORMAT FormatStore::asDxGiResourceCreateFormat() const
 {
   // R32F can be used both as float and uint, so it should be created typeless.
-  if (linearFormat == (TEXFMT_R32F >> CREATE_FLAGS_FORMAT_SHIFT))
+  if (linearFormat == (TEXFMT_R32F >> create_flags_format_shift))
     return asDxGiBaseFormat();
   // For block compressed, we use the requested specific format
   if (isBlockCompressed())
-    return asDxGiFormat();
+    return asDxGiFormat<true>();
   // For depth (and stencil) or when srgb is requested and the format has a
   // srgb variation, we use the base format to allow views of different formats.
-  if ((isSrgbCapableFormatType() && isSrgb) || isDepth())
+  if ((isSrgbCapableFormatType() && srgbRead) || isDepth())
     return asDxGiBaseFormat();
   // For any other format we use linear.
   return asLinearDxGiFormat();
@@ -681,10 +700,14 @@ DXGI_FORMAT FormatStore::asDxGiBaseFormat() const
   return FormatInfoTableSet::getFormat(linearFormat, ColorSpace::UNDEFINED);
 }
 
+template <bool use_for_read>
 DXGI_FORMAT FormatStore::asDxGiFormat() const
 {
-  return FormatInfoTableSet::getFormat(linearFormat, isSrgb ? ColorSpace::SRGB : ColorSpace::LINEAR);
+  return FormatInfoTableSet::getFormat(linearFormat, (use_for_read ? srgbRead : srgbWrite) ? ColorSpace::SRGB : ColorSpace::LINEAR);
 }
+
+template DXGI_FORMAT FormatStore::asDxGiFormat<true>() const;
+template DXGI_FORMAT FormatStore::asDxGiFormat<false>() const;
 
 DXGI_FORMAT FormatStore::asLinearDxGiFormat() const { return FormatInfoTableSet::getFormat(linearFormat, ColorSpace::LINEAR); }
 
@@ -697,52 +720,53 @@ bool FormatStore::isHDRFormat() const
   switch (linearFormat)
   {
     // HDR
-    case TEXFMT_A2R10G10B10 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A2B10G10R10 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A32B32G32R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16S >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A32B32G32R32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R11G11B10F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R9G9B9E5 >> CREATE_FLAGS_FORMAT_SHIFT: return true;
+    case TEXFMT_A2R10G10B10 >> create_flags_format_shift:
+    case TEXFMT_A2B10G10R10 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16F >> create_flags_format_shift:
+    case TEXFMT_A32B32G32R32F >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16S >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16UI >> create_flags_format_shift:
+    case TEXFMT_A32B32G32R32UI >> create_flags_format_shift:
+    case TEXFMT_R11G11B10F >> create_flags_format_shift:
+    case TEXFMT_R9G9B9E5 >> create_flags_format_shift: return true;
     default:
     // has no full RGB channel set
-    case TEXFMT_G16R16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G16R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G32R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32G32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_L16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32SI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R16UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8S >> CREATE_FLAGS_FORMAT_SHIFT:
+    case TEXFMT_G16R16 >> create_flags_format_shift:
+    case TEXFMT_G16R16F >> create_flags_format_shift:
+    case TEXFMT_G32R32F >> create_flags_format_shift:
+    case TEXFMT_R16F >> create_flags_format_shift:
+    case TEXFMT_R32F >> create_flags_format_shift:
+    case TEXFMT_R32G32UI >> create_flags_format_shift:
+    case TEXFMT_L16 >> create_flags_format_shift:
+    case TEXFMT_A8 >> create_flags_format_shift:
+    case TEXFMT_R8 >> create_flags_format_shift:
+    case TEXFMT_R32UI >> create_flags_format_shift:
+    case TEXFMT_R32SI >> create_flags_format_shift:
+    case TEXFMT_R8G8 >> create_flags_format_shift:
+    case TEXFMT_R8UI >> create_flags_format_shift:
+    case TEXFMT_R16UI >> create_flags_format_shift:
+    case TEXFMT_R8G8S >> create_flags_format_shift:
     // is compressed
-    case TEXFMT_DXT1 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT3 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_ATI1N >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_ATI2N >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_BC6H >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_BC7 >> CREATE_FLAGS_FORMAT_SHIFT:
+    case TEXFMT_DXT1 >> create_flags_format_shift:
+    case TEXFMT_DXT3 >> create_flags_format_shift:
+    case TEXFMT_DXT5 >> create_flags_format_shift:
+    case TEXFMT_ATI1N >> create_flags_format_shift:
+    case TEXFMT_ATI2N >> create_flags_format_shift:
+    case TEXFMT_BC5S >> create_flags_format_shift:
+    case TEXFMT_BC6H >> create_flags_format_shift:
+    case TEXFMT_BC7 >> create_flags_format_shift:
     // SDR
-    case TEXFMT_DEFAULT >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R5G6B5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A1R5G5B5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A4R4G4B4 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8B8A8 >> CREATE_FLAGS_FORMAT_SHIFT:
+    case TEXFMT_DEFAULT >> create_flags_format_shift:
+    case TEXFMT_R5G6B5 >> create_flags_format_shift:
+    case TEXFMT_A1R5G5B5 >> create_flags_format_shift:
+    case TEXFMT_A4R4G4B4 >> create_flags_format_shift:
+    case TEXFMT_R8G8B8A8 >> create_flags_format_shift:
     // depth / stencil
-    case TEXFMT_DEPTH24 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH32 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH32_S8 >> CREATE_FLAGS_FORMAT_SHIFT: return false;
+    case TEXFMT_DEPTH24 >> create_flags_format_shift:
+    case TEXFMT_DEPTH16 >> create_flags_format_shift:
+    case TEXFMT_DEPTH32 >> create_flags_format_shift:
+    case TEXFMT_DEPTH32_S8 >> create_flags_format_shift: return false;
   }
 }
 
@@ -751,47 +775,48 @@ bool FormatStore::isColor() const
   switch (linearFormat)
   {
     default: return false;
-    case TEXFMT_DEFAULT >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A2R10G10B10 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A2B10G10R10 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A32B32G32R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G16R16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G16R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G32R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT1 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT3 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32G32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_L16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A1R5G5B5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A4R4G4B4 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R5G6B5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16S >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A32B32G32R32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_ATI1N >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_ATI2N >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8B8A8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32SI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R11G11B10F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R9G9B9E5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8S >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_BC6H >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_BC7 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R16UI >> CREATE_FLAGS_FORMAT_SHIFT: return true;
-    case TEXFMT_DEPTH24 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH32 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH32_S8 >> CREATE_FLAGS_FORMAT_SHIFT: return false;
+    case TEXFMT_DEFAULT >> create_flags_format_shift:
+    case TEXFMT_A2R10G10B10 >> create_flags_format_shift:
+    case TEXFMT_A2B10G10R10 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16F >> create_flags_format_shift:
+    case TEXFMT_A32B32G32R32F >> create_flags_format_shift:
+    case TEXFMT_G16R16 >> create_flags_format_shift:
+    case TEXFMT_G16R16F >> create_flags_format_shift:
+    case TEXFMT_G32R32F >> create_flags_format_shift:
+    case TEXFMT_R16F >> create_flags_format_shift:
+    case TEXFMT_R32F >> create_flags_format_shift:
+    case TEXFMT_DXT1 >> create_flags_format_shift:
+    case TEXFMT_DXT3 >> create_flags_format_shift:
+    case TEXFMT_DXT5 >> create_flags_format_shift:
+    case TEXFMT_R32G32UI >> create_flags_format_shift:
+    case TEXFMT_L16 >> create_flags_format_shift:
+    case TEXFMT_A8 >> create_flags_format_shift:
+    case TEXFMT_R8 >> create_flags_format_shift:
+    case TEXFMT_A1R5G5B5 >> create_flags_format_shift:
+    case TEXFMT_A4R4G4B4 >> create_flags_format_shift:
+    case TEXFMT_R5G6B5 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16S >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16UI >> create_flags_format_shift:
+    case TEXFMT_A32B32G32R32UI >> create_flags_format_shift:
+    case TEXFMT_ATI1N >> create_flags_format_shift:
+    case TEXFMT_ATI2N >> create_flags_format_shift:
+    case TEXFMT_R8G8B8A8 >> create_flags_format_shift:
+    case TEXFMT_R32UI >> create_flags_format_shift:
+    case TEXFMT_R32SI >> create_flags_format_shift:
+    case TEXFMT_R11G11B10F >> create_flags_format_shift:
+    case TEXFMT_R9G9B9E5 >> create_flags_format_shift:
+    case TEXFMT_R8G8 >> create_flags_format_shift:
+    case TEXFMT_R8G8S >> create_flags_format_shift:
+    case TEXFMT_BC6H >> create_flags_format_shift:
+    case TEXFMT_BC7 >> create_flags_format_shift:
+    case TEXFMT_R8UI >> create_flags_format_shift:
+    case TEXFMT_R16UI >> create_flags_format_shift:
+    case TEXFMT_BC5S >> create_flags_format_shift: return true;
+    case TEXFMT_DEPTH24 >> create_flags_format_shift:
+    case TEXFMT_DEPTH16 >> create_flags_format_shift:
+    case TEXFMT_DEPTH32 >> create_flags_format_shift:
+    case TEXFMT_DEPTH32_S8 >> create_flags_format_shift: return false;
   }
 }
 
@@ -800,47 +825,48 @@ bool FormatStore::isDepth() const
   switch (linearFormat)
   {
     default: return false;
-    case TEXFMT_DEFAULT >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A2R10G10B10 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A2B10G10R10 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A32B32G32R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G16R16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G16R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G32R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT1 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT3 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32G32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_L16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A1R5G5B5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A4R4G4B4 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R5G6B5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16S >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A32B32G32R32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_ATI1N >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_ATI2N >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8B8A8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32SI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R11G11B10F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R9G9B9E5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8S >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_BC6H >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_BC7 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R16UI >> CREATE_FLAGS_FORMAT_SHIFT: return false;
-    case TEXFMT_DEPTH24 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH32 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DEPTH32_S8 >> CREATE_FLAGS_FORMAT_SHIFT: return true;
+    case TEXFMT_DEFAULT >> create_flags_format_shift:
+    case TEXFMT_A2R10G10B10 >> create_flags_format_shift:
+    case TEXFMT_A2B10G10R10 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16F >> create_flags_format_shift:
+    case TEXFMT_A32B32G32R32F >> create_flags_format_shift:
+    case TEXFMT_G16R16 >> create_flags_format_shift:
+    case TEXFMT_G16R16F >> create_flags_format_shift:
+    case TEXFMT_G32R32F >> create_flags_format_shift:
+    case TEXFMT_R16F >> create_flags_format_shift:
+    case TEXFMT_R32F >> create_flags_format_shift:
+    case TEXFMT_DXT1 >> create_flags_format_shift:
+    case TEXFMT_DXT3 >> create_flags_format_shift:
+    case TEXFMT_DXT5 >> create_flags_format_shift:
+    case TEXFMT_R32G32UI >> create_flags_format_shift:
+    case TEXFMT_L16 >> create_flags_format_shift:
+    case TEXFMT_A8 >> create_flags_format_shift:
+    case TEXFMT_R8 >> create_flags_format_shift:
+    case TEXFMT_A1R5G5B5 >> create_flags_format_shift:
+    case TEXFMT_A4R4G4B4 >> create_flags_format_shift:
+    case TEXFMT_R5G6B5 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16S >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16UI >> create_flags_format_shift:
+    case TEXFMT_A32B32G32R32UI >> create_flags_format_shift:
+    case TEXFMT_ATI1N >> create_flags_format_shift:
+    case TEXFMT_ATI2N >> create_flags_format_shift:
+    case TEXFMT_R8G8B8A8 >> create_flags_format_shift:
+    case TEXFMT_R32UI >> create_flags_format_shift:
+    case TEXFMT_R32SI >> create_flags_format_shift:
+    case TEXFMT_R11G11B10F >> create_flags_format_shift:
+    case TEXFMT_R9G9B9E5 >> create_flags_format_shift:
+    case TEXFMT_R8G8 >> create_flags_format_shift:
+    case TEXFMT_R8G8S >> create_flags_format_shift:
+    case TEXFMT_BC6H >> create_flags_format_shift:
+    case TEXFMT_BC7 >> create_flags_format_shift:
+    case TEXFMT_R8UI >> create_flags_format_shift:
+    case TEXFMT_R16UI >> create_flags_format_shift:
+    case TEXFMT_BC5S >> create_flags_format_shift: return false;
+    case TEXFMT_DEPTH24 >> create_flags_format_shift:
+    case TEXFMT_DEPTH16 >> create_flags_format_shift:
+    case TEXFMT_DEPTH32 >> create_flags_format_shift:
+    case TEXFMT_DEPTH32_S8 >> create_flags_format_shift: return true;
   }
 }
 
@@ -850,47 +876,48 @@ bool FormatStore::isStencil() const
   switch (linearFormat)
   {
     default: return false;
-    case TEXFMT_DEFAULT >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A2R10G10B10 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A2B10G10R10 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A32B32G32R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G16R16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G16R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_G32R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R16F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT1 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT3 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_DXT5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32G32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_L16 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A1R5G5B5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A4R4G4B4 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R5G6B5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16S >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A16B16G16R16UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_A32B32G32R32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_ATI1N >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_ATI2N >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8B8A8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R32SI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R11G11B10F >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R9G9B9E5 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8G8S >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_BC6H >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_BC7 >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R8UI >> CREATE_FLAGS_FORMAT_SHIFT:
-    case TEXFMT_R16UI >> CREATE_FLAGS_FORMAT_SHIFT: return false;
-    case TEXFMT_DEPTH24 >> CREATE_FLAGS_FORMAT_SHIFT: return true;
-    case TEXFMT_DEPTH16 >> CREATE_FLAGS_FORMAT_SHIFT: return false;
-    case TEXFMT_DEPTH32 >> CREATE_FLAGS_FORMAT_SHIFT: return false;
-    case TEXFMT_DEPTH32_S8 >> CREATE_FLAGS_FORMAT_SHIFT: return true;
+    case TEXFMT_DEFAULT >> create_flags_format_shift:
+    case TEXFMT_A2R10G10B10 >> create_flags_format_shift:
+    case TEXFMT_A2B10G10R10 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16F >> create_flags_format_shift:
+    case TEXFMT_A32B32G32R32F >> create_flags_format_shift:
+    case TEXFMT_G16R16 >> create_flags_format_shift:
+    case TEXFMT_G16R16F >> create_flags_format_shift:
+    case TEXFMT_G32R32F >> create_flags_format_shift:
+    case TEXFMT_R16F >> create_flags_format_shift:
+    case TEXFMT_R32F >> create_flags_format_shift:
+    case TEXFMT_DXT1 >> create_flags_format_shift:
+    case TEXFMT_DXT3 >> create_flags_format_shift:
+    case TEXFMT_DXT5 >> create_flags_format_shift:
+    case TEXFMT_R32G32UI >> create_flags_format_shift:
+    case TEXFMT_L16 >> create_flags_format_shift:
+    case TEXFMT_A8 >> create_flags_format_shift:
+    case TEXFMT_R8 >> create_flags_format_shift:
+    case TEXFMT_A1R5G5B5 >> create_flags_format_shift:
+    case TEXFMT_A4R4G4B4 >> create_flags_format_shift:
+    case TEXFMT_R5G6B5 >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16S >> create_flags_format_shift:
+    case TEXFMT_A16B16G16R16UI >> create_flags_format_shift:
+    case TEXFMT_A32B32G32R32UI >> create_flags_format_shift:
+    case TEXFMT_ATI1N >> create_flags_format_shift:
+    case TEXFMT_ATI2N >> create_flags_format_shift:
+    case TEXFMT_R8G8B8A8 >> create_flags_format_shift:
+    case TEXFMT_R32UI >> create_flags_format_shift:
+    case TEXFMT_R32SI >> create_flags_format_shift:
+    case TEXFMT_R11G11B10F >> create_flags_format_shift:
+    case TEXFMT_R9G9B9E5 >> create_flags_format_shift:
+    case TEXFMT_R8G8 >> create_flags_format_shift:
+    case TEXFMT_R8G8S >> create_flags_format_shift:
+    case TEXFMT_BC6H >> create_flags_format_shift:
+    case TEXFMT_BC7 >> create_flags_format_shift:
+    case TEXFMT_R8UI >> create_flags_format_shift:
+    case TEXFMT_R16UI >> create_flags_format_shift:
+    case TEXFMT_BC5S >> create_flags_format_shift: return false;
+    case TEXFMT_DEPTH24 >> create_flags_format_shift: return true;
+    case TEXFMT_DEPTH16 >> create_flags_format_shift: return false;
+    case TEXFMT_DEPTH32 >> create_flags_format_shift: return false;
+    case TEXFMT_DEPTH32_S8 >> create_flags_format_shift: return true;
   }
 }
 
@@ -912,7 +939,27 @@ uint32_t FormatStore::getBytesPerPixelBlock(uint32_t *block_x, uint32_t *block_y
   return bi.size;
 }
 
-const char *FormatStore::getNameString() const { return dxgi_format_name(asDxGiFormat()); }
+uint32_t FormatStore::getBytesPerPixelBlockPerPlane(uint32_t *block_x, uint32_t *block_y, uint32_t plane_index) const
+{
+  const auto bi = FormatInfoTableSet::getBlockInfo(linearFormat);
+
+  if (block_x)
+    *block_x = bi.x;
+  if (block_y)
+    *block_y = bi.y;
+
+  const auto bytesPerPlane = FormatInfoTableSet::getBytesPerPlane(linearFormat, plane_index);
+  return bytesPerPlane;
+}
+
+template <bool use_for_read>
+const char *FormatStore::getNameString() const
+{
+  return dxgi_format_name(asDxGiFormat<use_for_read>());
+}
+
+template const char *FormatStore::getNameString<true>() const;
+template const char *FormatStore::getNameString<false>() const;
 
 bool FormatStore::canBeStored(DXGI_FORMAT fmt) { return FormatInfoTableSet::isInList(fmt); }
 
@@ -924,12 +971,14 @@ uint32_t FormatStore::getChannelMask() const { return FormatInfoTableSet::getCha
 
 bool FormatStore::isSupported(D3D12_FORMAT_SUPPORT1 flags) const
 {
-  return (FormatInfoTableSet::getFormatSupport(linearFormat, isSrgb).support1 & flags) == flags;
+  return (FormatInfoTableSet::getFormatSupport(linearFormat, srgbRead).support1 & flags) == flags &&
+         (FormatInfoTableSet::getFormatSupport(linearFormat, srgbWrite).support1 & flags) == flags;
 }
 
 bool FormatStore::isSupported(D3D12_FORMAT_SUPPORT2 flags) const
 {
-  return (FormatInfoTableSet::getFormatSupport(linearFormat, isSrgb).support2 & flags) == flags;
+  return (FormatInfoTableSet::getFormatSupport(linearFormat, srgbRead).support2 & flags) == flags &&
+         (FormatInfoTableSet::getFormatSupport(linearFormat, srgbWrite).support2 & flags) == flags;
 }
 
 bool FormatStore::isSupportedTexture2D() const { return isSupported(D3D12_FORMAT_SUPPORT1_TEXTURE2D); }
@@ -962,13 +1011,13 @@ bool FormatStore::isSampleCountSupported(int32_t sampleCount) const
 {
   G_ASSERTF(is_pow2(sampleCount), "Sample count should be power-of-two value. %u is provided", sampleCount);
 
-  uint32_t sampleCountSupportMask = FormatInfoTableSet::getFormatSupport(linearFormat, isSrgb).sampleCountSupportMask;
+  uint32_t sampleCountSupportMask = FormatInfoTableSet::getFormatSupport(linearFormat, srgbWrite).sampleCountSupportMask;
   return (sampleCountSupportMask & (uint32_t)sampleCount) != 0;
 }
 
 int32_t FormatStore::getMaxSampleCount() const
 {
-  return (int32_t)FormatInfoTableSet::getFormatSupport(linearFormat, isSrgb).maxSampleCount;
+  return (int32_t)FormatInfoTableSet::getFormatSupport(linearFormat, srgbWrite).maxSampleCount;
 }
 
 bool FormatStore::isCopyConvertible(FormatStore other) const

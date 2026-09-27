@@ -88,81 +88,6 @@ def loadconfig(path):
         config["path_to_this_config"] = os.path.dirname(path)
         return config
 
-
-def gather_files_in_predefinition_paths(config, config_path):
-    if config is None:
-        return []
-    out = []
-    predefinition_paths = config.get("predefinition_paths", [])
-    if len(predefinition_paths) == 0:
-        return []
-    for pp in predefinition_paths:
-        combined_path = os.path.normpath(os.path.join(config_path, pp))
-        if combined_path.endswith(".nut"):
-            out.append(combined_path)
-        else:
-            for root, dirs, files in os.walk(combined_path):
-                out.extend([os.path.join(root, f) for f in files if f.endswith(".nut")])
-    return out
-
-def make_fast_definition(config, config_path):
-    const_re = re.compile(r"global\sconst\s+[\w|\d_]+\s*\=\s*.*\n")
-    vars_re = re.compile(r"(\:\:[\w|\d_]+\s?\<\-)(\s*.+\n)")
-    enums_re = re.compile(r"(global\s*enum\s*[\w|\d_]+([\s\n]?|[/\w\s\.\,]+)\{[\@\w\s\,\d\=\n/\"\#\.\(\)\~\+\-]*\})")
-    res = []
-    files_list = gather_files_in_predefinition_paths(config, config_path)
-    if len(files_list) == 0:
-        return None
-    for file in files_list:
-        with open(file, "rt", encoding = "utf-8") as f:
-            r = f.read()
-            res.extend(const_re.findall(r))
-            for i in enums_re.findall(r):
-                res.append(i[0])
-            for i in vars_re.findall(r):
-                if "function" in i[1]:
-                    res.append(i[0]+" @(...) null")
-                elif "{" in i[1]:
-                    res.append(i[0]+" {}")
-                elif "[" in i[1]:
-                    res.append(i[0]+" []")
-                elif "class" in i[1]:
-                    res.append(i[0]+" class{}")
-                else:
-                  res.append(i[0]+" null")
-    res_file = tempfile.NamedTemporaryFile(mode = "wt", delete = False)
-    res_file.write("// warning disable: -file:egyptian-braces\n")
-    res_file.write("\n".join(res))
-    res_file.close()
-    list_file = tempfile.NamedTemporaryFile(mode = "wt", delete = False)
-    list_file.write(res_file.name)
-    list_file.close()
-    return list_file.name
-
-def make_temp_predefinition_paths(config, config_path):
-    if config is None:
-        return None
-
-    predefinition_paths = config.get("predefinition_paths", [])
-    if len(predefinition_paths) == 0:
-        return None
-
-    list_file = tempfile.NamedTemporaryFile(mode = "wt", delete = False)
-    print("Config Path: {0}\n".format(config_path))
-    out = []
-    for pp in predefinition_paths:
-        combined_path = os.path.normpath(os.path.join(config_path, pp))
-        print("Collecting predefinition files at {0}".format(combined_path))
-        if combined_path.endswith(".nut"):
-            out.append(combined_path)
-        else:
-            for root, dirs, files in os.walk(combined_path):
-                out.extend([os.path.join(root,f) for f in files if f.endswith(".nut")])
-    list_file.write("\n".join(out))
-    list_file.close()
-    return list_file.name
-
-
 def checkpath_by_config(config, config_path, p, root, isFile):
     if config is None and isFile:
         return False
@@ -302,6 +227,14 @@ def check_files_with_configs(files, cmdchecks = [], **kwargs):
         sys.exit(1)
 
 
+UNCHECKED_PREFIXES = (
+    "prog/1stPartyLibs/quirrel/quirrel/testData",
+    "prog/1stPartyLibs/quirrel/quirrel/doc/examples",
+    "prog/commonFx/",
+    "skyquake/prog/scripts",
+)
+
+
 def getNameWarningMap():
     findre = re.compile(r"w(\d+)\s*\((.*)\)")
     out = shell("{0} --warnings-list".format(csq_path)).decode('utf-8')
@@ -353,8 +286,7 @@ if __name__ == "__main__":
         use_configs = True
         gerrit_files = gerrit.list_files(args.changeid, args.revisionid, branch=args.branch, project=args.project)
         gerrit_files = [f[0] for f in gerrit_files.items() if f[1].get("status")!="D" and f[0].lower().endswith(".nut")]
-        gerrit_files = [f for f in gerrit_files if not f.startswith("prog/1stPartyLibs/quirrel/quirrel/testData") and not f.startswith("prog/commonFx/")]
-        gerrit_files = [f for f in gerrit_files if not f.startswith("skyquake/prog/scripts")]
+        gerrit_files = [f for f in gerrit_files if not f.startswith(UNCHECKED_PREFIXES)]
         files = gather_files(gerrit_files, args.exclude, use_configs)
     elif len(args.paths)>0:
         files = gather_files(args.paths, args.exclude, use_configs)

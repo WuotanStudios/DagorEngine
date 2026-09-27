@@ -13,6 +13,7 @@
 
 class IGenSave;
 class IGenLoad;
+class String;
 
 namespace AnimV20
 {
@@ -20,7 +21,7 @@ class AnimationGraph;
 //
 // Simple animation state holder implementation
 //
-class AnimCommonStateHolder
+class AnimGraphStateHolder
 {
 public:
   enum
@@ -69,11 +70,16 @@ public:
   };
 
 public:
-  AnimCommonStateHolder(AnimationGraph &graph);
-  AnimCommonStateHolder(const AnimCommonStateHolder &st);
-  ~AnimCommonStateHolder() { term(); }
+  AnimGraphStateHolder(AnimationGraph &graph);
+  AnimGraphStateHolder(const AnimGraphStateHolder &st);
+  ~AnimGraphStateHolder() { term(); }
 
   void reset();
+
+  // Allocate val array for all params, fill with default values from initState
+  void init();
+  // Clear allocated val array, clear dynamically allocated memory stored in the state
+  void term();
 
   bool getParamIdValid(int id) const { return id >= 0 && id < val.size(); }
 
@@ -89,6 +95,8 @@ public:
   int getParamInt(int id) const;
   void setParamInt(int id, int val);
 
+  unsigned getParamType(int idx) const { return paramTypes[idx]; }
+
   void *getInlinePtr(int id)
   {
     G_ASSERTF(id >= 0 && id < val.size(), "Id = '%d' out of range [0; %d]", id, val.size());
@@ -96,11 +104,11 @@ public:
       paramTypes[id]);
     return &val[id].scalarInt;
   }
-  const void *getInlinePtr(int id) const { return const_cast<AnimCommonStateHolder *>(this)->getInlinePtr(id); }
+  const void *getInlinePtr(int id) const { return const_cast<AnimGraphStateHolder *>(this)->getInlinePtr(id); }
   unsigned getInlinePtrMaxSz(int id) const { return getInlinePtrWords(paramTypes, id) * elem_size(val); }
 
   float *getParamScalarPtr(int id);
-  const float *getParamScalarPtr(int id) const { return const_cast<AnimCommonStateHolder *>(this)->getParamScalarPtr(id); }
+  const float *getParamScalarPtr(int id) const { return const_cast<AnimGraphStateHolder *>(this)->getParamScalarPtr(id); }
   float getParamEffTimeScale(int id) const;
 
   const EffectorVar &getParamEffector(int id) const { return *(const EffectorVar *)getInlinePtr(id); }
@@ -113,6 +121,9 @@ public:
   // store/restore routines
   void saveState(IGenSave &cb) const;
   void loadState(IGenLoad &cb);
+
+  // dump all params as text: "paramName: HEXHEXHEX = value (type)\n"
+  void dumpStateText(String &out) const;
 
   AnimationGraph &getGraph() { return graph; }
 
@@ -148,24 +159,21 @@ private:
   const Tab<int16_t> &valFifo3Ind;
   const Tab<uint8_t> &paramTypes;
 
-  void init();
-  void term();
-
   friend class AnimationGraph;
 };
 
 
-inline float AnimCommonStateHolder::getParam(int id) const
+inline float AnimGraphStateHolder::getParam(int id) const
 {
-  G_ASSERTF((unsigned)id < val.size(), "Id: '%d' out of range [0; %d]", id, val.size());
+  G_ASSERTF((unsigned)id < val.size(), "Trying to get parameter id=%d but id is out of range 0..%d", id, val.size());
   G_ASSERTF(paramTypes[id] == PT_ScalarParam || paramTypes[id] == PT_TimeParam, "Unexpected (%d) non float type on param <%s>(%d)",
     paramTypes[id], paramNames.getName(id), id);
   return val[id].scalar;
 }
 
-inline void AnimCommonStateHolder::setParam(int id, float value)
+inline void AnimGraphStateHolder::setParam(int id, float value)
 {
-  G_ASSERTF(id < val.size(), "Id: '%d' out of range [0; %d]", id, val.size(), value);
+  G_ASSERTF(id < val.size(), "Trying to set int parameter id=%d but id is out of range 0..%d", id, val.size(), value);
   G_ASSERTF(check_finite(value), "Setting an infinite value: '%g'", value);
   G_ASSERTF(paramTypes[id] == PT_ScalarParam || paramTypes[id] == PT_TimeParam, "Unexpected (%d) non float type on param <%s>(%d)",
     paramTypes[id], paramNames.getName(id), id);

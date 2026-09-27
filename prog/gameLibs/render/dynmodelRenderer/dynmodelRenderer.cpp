@@ -9,6 +9,7 @@
 #include <drv/3d/dag_matricesAndPerspective.h>
 #include <drv/3d/dag_shaderConstants.h>
 #include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <EASTL/array.h>
 #include <EASTL/set.h>
 #include <EASTL/string.h>
@@ -16,6 +17,7 @@
 #include <EASTL/vector_set.h>
 #include <EASTL/fixed_vector.h>
 #include <generic/dag_tab.h>
+#include <generic/dag_concurrentElementPool.h>
 #include <image/dag_texPixel.h>
 #include <math/dag_geomTree.h>
 #include <osApiWrappers/dag_miscApi.h>
@@ -25,11 +27,21 @@
 #include <shaders/dag_shaderBlock.h>
 #include <shaders/dag_overrideStates.h>
 #include <startup/dag_globalSettings.h>
+#include <util/dag_console.h>
 #include <util/dag_convar.h>
+#include <util/dag_concurrencyCheck.h>
 #include <memory/dag_framemem.h>
 #include <generic/dag_smallTab.h>
 #include <ioSys/dag_dataBlock.h>
 #include <gameRes/dag_resourceNameResolve.h>
+#include <shaders/dag_shaderVarsUtils.h>
+#include <shaders/dag_shStateBlockBindless.h>
+#include <shaders/dag_shSkinMesh.h>
+#include <ska_hash_map/flat_hash_map2.hpp>
+#include <3d/dag_multidrawContext.h>
+#include <render/dynmodelRenderer/dynModelsPackedMultidrawParams.hlsli>
+#include <render/animchar_additional_data_types.hlsli>
+#include <render/debugMesh.h>
 
 namespace dynrend
 {
@@ -45,6 +57,7 @@ struct InstanceData
   int nodeOffsetRenderData;
   int instanceLod;
   bool relativeToCamera;
+  int indexToCustomCameraOffset;
 
   InstanceData() {} //-V730
 };
@@ -73,6 +86,12 @@ struct DipChunk
   int numBones;
 
   int texLevel;
+  int lodNo; // for debug_mesh lod coloring
+
+  // Packed/multidraw material support
+  bool packedMaterial;
+  shaders::CombinedDynVariantState variantState;
+  uint16_t bindposeBufferOffset;
 
   DipChunk() {} //-V730
 
@@ -83,7 +102,8 @@ struct DipChunk
     if (numBones == 0 && next.numBones == 0 && instanceNo == next.instanceNo && shader == next.shader &&
         vertexData == next.vertexData && nodeOffsetRenderData == next.nodeOffsetRenderData &&
         instanceOffsetRenderData == next.instanceOffsetRenderData && nodeChunkSizeInVecs == next.nodeChunkSizeInVecs &&
-        baseVertex == next.baseVertex && numPasses == next.numPasses && forcedOrder == next.forcedOrder)
+        baseVertex == next.baseVertex && numPasses == next.numPasses && forcedOrder == next.forcedOrder &&
+        packedMaterial == next.packedMaterial)
     {
       if (si == next.si + 3 * next.numf)
       {
@@ -145,6 +165,7 @@ struct InstanceChunk
 
 struct NodeChunk
 {
+  static constexpr bool HAS_PREV = true;
   mat44f nodeGlobTm;
   mat44f prevNodeGlobTm;
   float nodeOpacity;
@@ -152,6 +173,16 @@ struct NodeChunk
                               // compatibility
   NodeExtraData extraData;
   // Optionally either a single InitialNodeTMs or several BoneTMs follow this struct in buffer
+};
+
+// Contexts with set_prev_matrices(false) use these instead, see DYNREND_HAS_PREV_MATRICES in skinning_inc.dshl
+struct NodeChunkNoPrev
+{
+  static constexpr bool HAS_PREV = false;
+  mat44f nodeGlobTm;
+  float nodeOpacity;
+  float toInstanceDataOffset;
+  NodeExtraData extraData;
 };
 
 struct InitialNodeTMs
@@ -162,6 +193,7 @@ struct InitialNodeTMs
 };
 struct BoneTMs
 {
+  static constexpr bool HAS_PREV = true;
   vec4f boneTm0;
   vec4f boneTm1;
   vec4f boneTm2;
@@ -169,14 +201,54 @@ struct BoneTMs
   vec4f bonePrevTm1;
   vec4f bonePrevTm2;
 };
+struct BoneTMsNoPrev
+{
+  static constexpr bool HAS_PREV = false;
+  vec4f boneTm0;
+  vec4f boneTm1;
+  vec4f boneTm2;
+};
 
 static_assert(sizeof(NodeExtraData) == 2 * sizeof(float), "NodeExtraData must be exactly the size of 2 floats.");
+
+struct NodeCollapserData
+{
+  Point4 data[ADDITIONAL_BONE_MTX_OFFSET];
+};
+
+static void fill_node_collapser_data(const DynamicRenderableSceneInstance *scene, NodeCollapserData &out)
+{
+  const auto &ncBits = scene->getNodeCollapserBits().data;
+  out.data[0] = Point4(bitwise_cast<float>(ncBits[0]), bitwise_cast<float>(ncBits[1]), bitwise_cast<float>(ncBits[2]),
+    bitwise_cast<float>(ncBits[3]));
+  out.data[1] = Point4(bitwise_cast<float>(ncBits[4]), bitwise_cast<float>(ncBits[5]), bitwise_cast<float>(ncBits[6]),
+    bitwise_cast<float>(ncBits[7]));
+}
 
 constexpr int BIG_NODE_CHUNK_VECS = (sizeof(NodeChunk) + sizeof(InitialNodeTMs)) / sizeof(vec4f);
 constexpr int SMALL_NODE_CHUNK_VECS = sizeof(NodeChunk) / sizeof(vec4f);
 
+constexpr int BIG_NODE_CHUNK_NO_PREV_VECS = (sizeof(NodeChunkNoPrev) + sizeof(InitialNodeTMs)) / sizeof(vec4f);
+constexpr int SMALL_NODE_CHUNK_NO_PREV_VECS = sizeof(NodeChunkNoPrev) / sizeof(vec4f);
+
+static int node_chunk_vecs(bool has_prev_matrices, bool initial_nodes)
+{
+  if (has_prev_matrices)
+    return initial_nodes ? BIG_NODE_CHUNK_VECS : SMALL_NODE_CHUNK_VECS;
+  return initial_nodes ? BIG_NODE_CHUNK_NO_PREV_VECS : SMALL_NODE_CHUNK_NO_PREV_VECS;
+}
+
+// Shaders must agree, see dynmodel_node_collapser_data and DYNREND_HAS_PREV_MATRICES in skinning_inc.dshl
+static int skin_bones_start_vecs(bool has_prev_matrices, bool animchar_layout)
+{
+  return node_chunk_vecs(has_prev_matrices, false) + (animchar_layout ? ADDITIONAL_BONE_MTX_OFFSET : 0);
+}
+
 static ShaderElement *replacement_shader = nullptr;
+static MultidrawContext<uint32_t> multidrawContext = {"dynrend_multidraw"};
 static Tab<const char *> filtered_material_names;
+
+static bool platform_has_bindless() { return d3d::get_driver_desc().caps.hasBindless; }
 
 #if _TARGET_C1 | _TARGET_C2
 
@@ -202,49 +274,101 @@ struct ContextGpuData
 {
   TMatrix4 projToWorldTm;
   TMatrix4 projToViewTm;
+  TMatrix4 relativeWorldToProjTm;
 };
-
-PerInstanceRenderData::PerInstanceRenderData(const AddedPerInstanceRenderData &o)
-{
-  static_cast<BasePerInstanceRenderData &>(*this) = static_cast<const BasePerInstanceRenderData &>(o);
-  params.assign(o.params.begin(), o.params.end());
-}
 
 AddedPerInstanceRenderData::AddedPerInstanceRenderData(const PerInstanceRenderData &o, dag::Vector<Point4> &extraParams) :
   BasePerInstanceRenderData(o)
 {
-  if (o.params.size() <= inplaceParams.capacity())
+  // Non-empty params are always terminated with an additional data block
+  // so shader backward metadata reads cannot misparse generic params
+  if (o.params.empty() && o.additionalData.empty())
+    return;
+  dag::ConstSpan<Point4> tail = make_span_const(o.additionalData.data(), o.additionalData.size());
+  if (tail.empty())
+    tail = animchar_additional_data::get_null_data();
+  const uint32_t genericCount = eastl::max<uint32_t>(o.params.size(), NUM_GENERIC_PER_INSTANCE_PARAMS);
+  const uint32_t totalCount = genericCount + tail.size();
+  const auto fill = [&](auto &dst) {
+    dst.insert(dst.end(), o.params.begin(), o.params.end());
+    dst.insert(dst.end(), genericCount - o.params.size(), Point4::ZERO);
+    dst.insert(dst.end(), tail.begin(), tail.end());
+  };
+  if (totalCount <= inplaceParams.capacity())
   {
-    inplaceParams.assign(o.params.begin(), o.params.end());
+    fill(inplaceParams);
     params.set(inplaceParams.data(), inplaceParams.size());
   }
   else
   {
-    params.set(extraParams.end(), o.params.size()); // Note: re-alloc/rebase handled by calling code
-    extraParams.insert(extraParams.end(), o.params.begin(), o.params.end());
+    params.set(extraParams.end(), totalCount); // Note: re-alloc/rebase handled by calling code
+    fill(extraParams);
   }
 }
+
+AddedPerInstanceRenderData::AddedPerInstanceRenderData(const BasePerInstanceRenderData &base, dag::ConstSpan<Point4> merged_params,
+  dag::Vector<Point4> &extraParams) :
+  BasePerInstanceRenderData(base)
+{
+  if (merged_params.size() <= inplaceParams.capacity())
+  {
+    inplaceParams.assign(merged_params.begin(), merged_params.end());
+    params.set(inplaceParams.data(), inplaceParams.size());
+  }
+  else
+  {
+    params.set(extraParams.end(), merged_params.size()); // Note: re-alloc/rebase handled by calling code
+    extraParams.insert(extraParams.end(), merged_params.begin(), merged_params.end());
+  }
+}
+
+using ContextPool = dag::ConcurrentElementPool<ContextId, ContextData, 5>;
+static_assert(ContextPool::FIRST_ID == ContextId::MAIN, "ContextId::MAIN must be the pool's first id");
 
 struct ContextData
 {
   eastl::string name;
+  ContextId index = ContextId::Invalid;
 
   Tab<InstanceData> instances;
   Tab<bool> allNodesVisibility; // Faster than eastl::bitvector
   eastl::vector<AddedPerInstanceRenderData> perInstanceRenderData;
   dag::Vector<Point4> extraParams;
   Tab<TMatrix4> customProjTms;
+  dag::RelocatableFixedVector<Point3, 8, true> customCameraOffsets;
   float minElemRadius = 0.f;
   bool renderSkinned = true;
+  bool instanceDataOnly = false;
+  bool nodeCollapserEnabled = false;
+  bool prevMatrices = true;        // not reset by clear(), it belongs to the pass that renders the context
+  bool animcharSkinLayout = false; // layout of the last skinned fill, not reset by clear(), readers ask after render
+#if DAGOR_DBGLEVEL > 0
+  bool prevMatricesAtFill = true;
+  uint8_t skinLayoutsFilled = 0; // to catch contexts that use both dynmodel and animchar
+#endif
   bool ringBufferVarSet = false;
   int statNodes = 0;
   int statBones = 0;
   int statPreMerged = 0;
   int statPostMerged = 0;
+
+  // Owned by the caller, valid until clear(). Null means live globals, main thread only
+  const GlobalVariableStates *globVarsState = nullptr;
+  // A class is packed unconditionally so per element answer is valid for any global state
+  ska::flat_hash_map<const ShaderElement *, bool> elemHasPackedMaterial;
+
   ContextGpuData gpuData;
 
   eastl::array<Tab<DipChunk>, ShaderMesh::Stage::STG_COUNT> dipChunksByStage;
   eastl::array<Tab<int>, ShaderMesh::Stage::STG_COUNT> dipChunksOrderByStage;
+
+  // Packed/multidraw support
+  eastl::array<Tab<int>, ShaderMesh::Stage::STG_COUNT> packedChunkOrderByStage;
+  eastl::array<dag::Vector<PackedDrawCallsRange>, ShaderMesh::Stage::STG_COUNT> drawcallRangesByStage;
+  ska::flat_hash_map<shaders::ConstStateIdx, uint8_t> bindlessStatesToUpdateTexLevels;
+
+  bool renderSorted = false;
+  bool renderFinalized = false;
 
   RenderDataBuffer renderDataBuffer;
   RingDynamicSB *ringBuffer = NULL;
@@ -252,10 +376,21 @@ struct ContextData
   uint32_t prevDiscardOnFrame = 0;
   int ringBufferPos = 0;
 
-  ContextData(const char *name_, int idx, int ringBufferSize = 0) : name(name_)
+  // Context specific view/proj matrices, used by add_animchar().
+  struct CachedTm
+  {
+    TMatrix4 viewTm = TMatrix4::IDENT;
+    TMatrix4 projTm = TMatrix4::IDENT;
+    TMatrix4 prevViewTm = TMatrix4::IDENT;
+    TMatrix4 prevProjTm = TMatrix4::IDENT;
+  };
+  eastl::optional<CachedTm> cachedTm;
+
+  ContextData() = default;
+  ContextData(const char *name_, ContextId idx, int ringBufferSize = 0) : name(name_), index(idx)
   {
     perInstanceRenderData.emplace_back();
-    recreateRingBuffer(ringBufferSize ? ringBufferSize : initialRingBufferSize, idx);
+    recreateRingBuffer(ringBufferSize ? ringBufferSize : initialRingBufferSize);
   }
 
   int storePerInstanceRenderData(const dynrend::PerInstanceRenderData &rdata)
@@ -264,16 +399,35 @@ struct ContextData
     const Point4 *oldParamsBase = extraParams.data();
     const auto *oldBase = perInstanceRenderData.data();
     perInstanceRenderData.emplace_back(rdata, extraParams);
-    // Account for possible `perInstanceRenderData/extraParams` reallocations which might invalidate pointers
-    if (DAGOR_UNLIKELY(oldBase != perInstanceRenderData.data()))
+    fixupStoredParamSpans(oldBase, oldParamsBase);
+    return idx;
+  }
+
+  int cloneStoredPerInstanceRenderData(int src_index)
+  {
+    dag::RelocatableFixedVector<Point4, NUM_GENERIC_PER_INSTANCE_PARAMS + 2, true, framemem_allocator> paramsCopy;
+    paramsCopy.assign(perInstanceRenderData[src_index].params.begin(), perInstanceRenderData[src_index].params.end());
+    dynrend::BasePerInstanceRenderData baseCopy = perInstanceRenderData[src_index];
+    int idx = perInstanceRenderData.size();
+    const Point4 *oldParamsBase = extraParams.data();
+    const auto *oldBase = perInstanceRenderData.data();
+    perInstanceRenderData.emplace_back(baseCopy, make_span_const(paramsCopy.data(), paramsCopy.size()), extraParams);
+    fixupStoredParamSpans(oldBase, oldParamsBase);
+    return idx;
+  }
+
+  // Account for possible `perInstanceRenderData/extraParams` reallocations which might invalidate pointers
+  void fixupStoredParamSpans(const dynrend::AddedPerInstanceRenderData *old_base, const Point4 *old_params_base)
+  {
+    if (DAGOR_UNLIKELY(old_base != perInstanceRenderData.data()))
       for (auto &r : perInstanceRenderData)
         if (r.params.size() <= r.inplaceParams.capacity())
           r.params.set(r.inplaceParams.data(), r.params.size());
-    if (DAGOR_UNLIKELY(rdata.params.size() > NUM_GENERIC_PER_INSTANCE_PARAMS && extraParams.data() != oldParamsBase))
+    if (DAGOR_UNLIKELY(perInstanceRenderData.back().params.size() > perInstanceRenderData.back().inplaceParams.capacity() &&
+                       extraParams.data() != old_params_base))
       for (const Point4 *newBase = extraParams.data(); auto &r : perInstanceRenderData)
         if (r.params.size() > r.inplaceParams.capacity())
-          r.params.set(newBase + (r.params.data() - oldParamsBase), r.params.size());
-    return idx;
+          r.params.set(newBase + (r.params.data() - old_params_base), r.params.size());
   }
 
   void clear()
@@ -283,17 +437,33 @@ struct ContextData
     instances.resize(0);
     allNodesVisibility.resize(0);
     customProjTms.resize(0);
+    customCameraOffsets.clear();
+    renderDataBuffer.clear();
     for (auto &stage : dipChunksByStage)
       stage.resize(0);
     for (auto &stage : dipChunksOrderByStage)
       stage.resize(0);
+    for (auto &stage : packedChunkOrderByStage)
+      stage.resize(0);
+    for (auto &stage : drawcallRangesByStage)
+      stage.clear();
+    bindlessStatesToUpdateTexLevels.clear();
 
     minElemRadius = 0.f;
     renderSkinned = true;
+    renderSorted = false;
+    renderFinalized = false;
     statNodes = statBones = statPreMerged = statPostMerged = 0;
+    globVarsState = nullptr;
+    elemHasPackedMaterial.clear();
+#if DAGOR_DBGLEVEL > 0
+    skinLayoutsFilled = 0;
+#endif
+    instanceDataOnly = false;
+    cachedTm.reset();
   }
 
-  void recreateRingBuffer(int new_size_in_vecs, int index)
+  void recreateRingBuffer(int new_size_in_vecs)
   {
     if (ringBuffer)
     {
@@ -309,7 +479,7 @@ struct ContextData
     if (ringBufferSizeInVecs)
     {
       ringBuffer = new RingDynamicSB();
-      String bufName(0, "instance_data_buffer%d_%s", index, name.c_str());
+      String bufName(0, "instance_data_buffer%d_%s", ContextPool::to_index(index), name.c_str());
       ringBuffer->init(ringBufferSizeInVecs, sizeof(vec4f), sizeof(vec4f), SBCF_BIND_SHADER_RES, TEXFMT_A32B32G32R32F, bufName.str());
     }
   }
@@ -321,50 +491,101 @@ Intervals *DipChunk::getIntervals(ContextData &ctx) const
   return perInstanceRenderData.intervals.empty() ? NULL : &perInstanceRenderData.intervals;
 }
 
-
-static eastl::vector<ContextData> contexts;
+static ContextPool contexts;
 static Tab<const char *> shadersRenderOrder;
-static TMatrix4_vec4 prevViewTm = TMatrix4_vec4::IDENT;
-static TMatrix4_vec4 prevProjTm = TMatrix4_vec4::IDENT;
+static TMatrix4_vec4 globalPrevViewTm = TMatrix4_vec4::IDENT;
+static TMatrix4_vec4 globalPrevProjTm = TMatrix4_vec4::IDENT;
 static Point3 localOffsetHint;
 static bool separateAtestPass = false;
-UniqueBufHolder contextGpuDataBuffer;
+UniqueBufWithShaderVar contextGpuDataBuffer;
 Statistics statistics = {0};
 
-CONSOLE_BOOL_VAL("debug", dynrendLog, false);
+static ShaderVariableInfo skinningProjToWorldTm("skinning_proj_to_world_tm", true);
+static ShaderVariableInfo skinningProjToViewTm("skinning_proj_to_view_tm", true);
 
+CONSOLE_BOOL_VAL("debug", dynrendLog, false);
+CONSOLE_BOOL_VAL("debug", dynrendCoalescePacked, true);
+
+static void update_context_gpu_data(const ContextGpuData &data)
+{
+  contextGpuDataBuffer->updateDataWithLock(0, sizeof(ContextGpuData), &data, VBLOCK_WRITEONLY | VBLOCK_DISCARD);
+  if (skinningProjToWorldTm && skinningProjToViewTm)
+  {
+    skinningProjToWorldTm.set_float4x4(data.projToWorldTm.transpose());
+    skinningProjToViewTm.set_float4x4(data.projToViewTm.transpose());
+  }
+}
+
+bool is_valid_context(ContextId context_id) { return context_id >= ContextId::MAIN; }
+
+static bool is_allocated_context(ContextId context_id)
+{
+  return context_id >= ContextId::MAIN
+#ifndef DAGOR_THREAD_SANITIZER
+         // NOTE: totalElements() can be increased from another thread - reading is not thread-safe
+         // But this check happen for assert only, so it shouldn't fire in release anyway
+         && ContextPool::to_index(context_id) < contexts.totalElements()
+#endif
+    ;
+}
+
+bool is_user_context(ContextId context_id) { return context_id >= ContextId::FIRST_USER_CONTEXT; }
+
+static ContextId create_context_impl(const char *name)
+{
+#ifndef DAGOR_THREAD_SANITIZER
+  G_ASSERT(contexts.totalElements() >= ContextPool::to_index(ContextId::FIRST_USER_CONTEXT));
+#endif
+  for (auto &c : contexts)
+  {
+    if (!c.ringBuffer)
+    {
+      c = ContextData{name, c.index};
+      return c.index;
+    }
+  }
+  ContextId id = contexts.allocate();
+  contexts[id] = ContextData{name, id};
+  return id;
+}
 
 ContextId create_context(const char *name)
 {
-  G_ASSERT(contexts.size() >= (int)ContextId::FIRST_USER_CONTEXT);
-  int id = contexts.size();
-  contexts.emplace_back(name, id);
-  return (ContextId)id;
+  CONCURRENCY_CHECKER(dynrend);
+  return create_context_impl(name);
 }
 
 
 ContextId get_or_create_context(const char *name)
 {
+  CONCURRENCY_CHECKER(dynrend);
   for (auto &c : contexts)
     if (c.name == name)
     {
-      int idx = &c - contexts.data();
       if (!c.ringBuffer)
-        c.recreateRingBuffer(initialRingBufferSize, idx);
-      c.clear();
-      return (ContextId)idx;
+        c = ContextData{name, c.index};
+      else
+        c.clear();
+      return c.index;
     }
-  return create_context(name);
+  return create_context_impl(name);
 }
 
+ContextId find_context(const char *name)
+{
+  for (auto &c : dynrend::contexts)
+    if (c.ringBuffer && c.name == name)
+      return c.index;
+  return ContextId::Invalid;
+}
 
 void delete_context(ContextId context_id)
 {
-  G_ASSERT(context_id >= ContextId::FIRST_USER_CONTEXT && (int)context_id < contexts.size());
-  ContextData &ctx = contexts[(int)context_id];
-  ctx.recreateRingBuffer(0, &ctx - contexts.begin());
-  while (!contexts.back().ringBuffer)
-    contexts.pop_back();
+  CONCURRENCY_CHECKER(dynrend);
+  G_ASSERT_RETURN(is_user_context(context_id), );
+  ContextData &ctx = contexts[context_id];
+  ctx.recreateRingBuffer(0);
+  ctx.clear();
 }
 
 
@@ -377,10 +598,16 @@ void init()
   initialRingBufferSize = graphicsBlk->getInt("dynrendInitialRingBufferSize", DEFAULT_INITIAL_RING_BUFFER_SIZE);
   initialMainRingBufferSize = graphicsBlk->getInt("dynrendInitialMainRingBufferSize", DEFAULT_INITIAL_MAIN_RING_BUFFER_SIZE);
 
-  contexts.emplace_back("MAIN", (int)ContextId::MAIN, initialMainRingBufferSize);
-  contexts.emplace_back("IMMEDIATE", (int)ContextId::IMMEDIATE);
+  ContextId id = contexts.allocate();
+  G_ASSERT(id == ContextId::MAIN && ContextPool::from_index(0) == ContextId::MAIN);
+  contexts[id] = ContextData{"MAIN", id, initialMainRingBufferSize};
 
-  contextGpuDataBuffer = dag::buffers::create_one_frame_cb(dag::buffers::cb_struct_reg_count<ContextGpuData>(), "context_gpu_data");
+  id = contexts.allocate();
+  G_ASSERT(id == ContextId::IMMEDIATE && ContextPool::from_index(1) == ContextId::IMMEDIATE);
+  contexts[id] = ContextData{"IMMEDIATE", id};
+
+  contextGpuDataBuffer =
+    dag::buffers::create_one_frame_cb(dag::buffers::cb_struct_reg_count<ContextGpuData>(), "context_gpu_data", RESTAG_DYNMODEL);
   d3d_err(contextGpuDataBuffer.getBuf());
 
   instanceDataBufferVarId = ::get_shader_variable_id("instance_data_buffer", true);
@@ -392,15 +619,16 @@ void init()
 void close()
 {
   for (ContextData &ctx : contexts)
-    ctx.recreateRingBuffer(0, &ctx - contexts.begin());
+    ctx.recreateRingBuffer(0);
 
   contexts.clear();
 
   contextGpuDataBuffer.close();
+  multidrawContext.close();
 }
 
 
-bool is_initialized() { return !contexts.empty(); }
+bool is_initialized() { return contexts.totalElements(); }
 
 
 void set_shaders_forced_render_order(const eastl::vector<eastl::string> &shader_names)
@@ -420,9 +648,70 @@ void set_shaders_forced_render_order(const eastl::vector<eastl::string> &shader_
 
 void set_reduced_render(ContextId context_id, float min_elem_radius, bool render_skinned)
 {
-  ContextData &ctx = contexts[(int)context_id];
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
   ctx.minElemRadius = min_elem_radius;
   ctx.renderSkinned = render_skinned;
+}
+
+void set_instance_data_only(ContextId context_id, bool enable)
+{
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
+  ctx.instanceDataOnly = enable;
+}
+
+#if DAGOR_DBGLEVEL > 0
+static bool pass_expects_prev_matrices = true;
+void set_pass_expects_prev_matrices(bool enable) { pass_expects_prev_matrices = enable; }
+#else
+void set_pass_expects_prev_matrices(bool) {}
+#endif
+
+void set_prev_matrices(ContextId context_id, bool enable)
+{
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
+  ctx.prevMatrices = enable;
+}
+
+int get_skin_bones_start_in_vecs(ContextId context_id)
+{
+  if (!is_allocated_context(context_id))
+    return skin_bones_start_vecs(true, false);
+  const ContextData &ctx = contexts[context_id];
+  return skin_bones_start_vecs(ctx.prevMatrices, ctx.animcharSkinLayout);
+}
+
+int get_skin_bone_rows(ContextId context_id)
+{
+  const bool hasPrev = !is_allocated_context(context_id) || contexts[context_id].prevMatrices;
+  return hasPrev ? sizeof(BoneTMs) / sizeof(vec4f) : sizeof(BoneTMsNoPrev) / sizeof(vec4f);
+}
+
+// Animchar and dynmodel use different layouts. Record the one used in this context.
+static void mark_skin_layout(ContextData &ctx, bool animchar_layout)
+{
+  ctx.animcharSkinLayout = animchar_layout;
+#if DAGOR_DBGLEVEL > 0
+  ctx.skinLayoutsFilled |= animchar_layout ? 2 : 1;
+  G_ASSERTF(ctx.skinLayoutsFilled != 3, "dynrend context %s holds both skin layouts, get_skin_bones_start_in_vecs answers for one",
+    ctx.name.c_str());
+#endif
+}
+
+void set_node_collapser_enabled(ContextId context_id, bool enable)
+{
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
+  ctx.nodeCollapserEnabled = enable;
+}
+
+void set_context_global_vars_state(ContextId context_id, const GlobalVariableStates *gvars_state)
+{
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
+  ctx.globVarsState = (gvars_state && !gvars_state->empty()) ? gvars_state : nullptr;
 }
 
 static bool check_shader_names = false;
@@ -430,10 +719,10 @@ void set_check_shader_names(bool check) { check_shader_names = check; }
 
 void add(ContextId context_id, const DynamicRenderableSceneInstance *instance, const InitialNodes *optional_initial_nodes,
   const dynrend::PerInstanceRenderData *optional_render_data, dag::Span<int> *node_list, const TMatrix4 *customProj,
-  bool relative_to_camera)
+  bool relative_to_camera, const Point3 *custom_camera_offset)
 {
   G_ASSERT(instance);
-  G_ASSERTF_RETURN((int)context_id >= 0 && (int)context_id < contexts.size(), , "Uninitialized dynrend context was used");
+  G_ASSERTF_RETURN(is_allocated_context(context_id), , "Uninitialized dynrend context was used");
   G_ASSERT(context_id != ContextId::IMMEDIATE || is_main_thread());
 
   if (optional_initial_nodes && optional_initial_nodes->nodesModelTm.size() == 0) // Uninitialized.
@@ -448,13 +737,13 @@ void add(ContextId context_id, const DynamicRenderableSceneInstance *instance, c
     return;
   }
 
-  const DynamicRenderableSceneResource *sceneRes = instance->getCurSceneResource(); // int lodNo = instance->getCurrentLodNo();
+  const DynamicRenderableSceneResource *sceneRes = instance->getCurSceneResource();
   if (!sceneRes)
     return; // LODed out.
 
   TIME_PROFILE(dynrend_add);
 
-  ContextData &ctx = contexts[(int)context_id];
+  ContextData &ctx = contexts[context_id];
 
 #if DAGOR_DBGLEVEL > 0
   if (check_shader_names)
@@ -528,6 +817,18 @@ void add(ContextId context_id, const DynamicRenderableSceneInstance *instance, c
   instanceData.indexToCustomProjtm = -1;
   instanceData.instanceLod = instance->getCurrentLodNo();
   instanceData.relativeToCamera = relative_to_camera;
+  instanceData.indexToCustomCameraOffset = -1;
+  if (custom_camera_offset)
+  {
+    if (const auto found = eastl::find(ctx.customCameraOffsets.begin(), ctx.customCameraOffsets.end(), *custom_camera_offset);
+        found != ctx.customCameraOffsets.end())
+      instanceData.indexToCustomCameraOffset = eastl::distance(ctx.customCameraOffsets.begin(), found);
+    else
+    {
+      instanceData.indexToCustomCameraOffset = ctx.customCameraOffsets.size();
+      ctx.customCameraOffsets.push_back(*custom_camera_offset);
+    }
+  }
   if (customProj)
   {
     instanceData.indexToCustomProjtm = ctx.customProjTms.size();
@@ -574,6 +875,36 @@ static TMatrix4 calcLocalViewProj(const Point3 &model_origin, const TMatrix4 &sr
 }
 
 
+uint32_t render_flags_for_stage(ShaderMesh::Stage shader_mesh_stage)
+{
+  switch (shader_mesh_stage)
+  {
+    case ShaderMesh::Stage::STG_opaque:
+    case ShaderMesh::Stage::STG_atest: return RENDER_OPAQUE;
+    case ShaderMesh::Stage::STG_decal: return RENDER_DECAL;
+    case ShaderMesh::Stage::STG_trans: return RENDER_TRANS;
+    case ShaderMesh::Stage::STG_distortion: return RENDER_DISTORTION;
+    default: return RENDER_OPAQUE | RENDER_DECAL | RENDER_TRANS | RENDER_DISTORTION;
+  }
+}
+
+static bool element_has_packed_material(ContextData &ctx, ShaderElement *shader, const GlobalVariableStates *gvars_state)
+{
+  auto [it, inserted] = ctx.elemHasPackedMaterial.emplace(shader, false);
+  if (inserted)
+  {
+    shaders::CombinedDynVariantState vs = get_dynamic_variant_states(gvars_state, shader->native());
+    it->second = is_valid(vs) && is_packed_material(vs.const_state);
+  }
+  return it->second;
+}
+
+static bool should_log_packed_classic_drop(const char *shader_class)
+{
+  static eastl::vector_set<eastl::string> logged; // main thread only (classic dip loop)
+  return logged.emplace(shader_class).second;
+}
+
 static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data, const TMatrix4 &view, const TMatrix4 &proj,
   const TMatrix4 &prev_view, const TMatrix4 &prev_proj, const Point3 &offset, TexStreamingContext texCtx, int &node_offset_render_data,
   int &instance_offset_render_data)
@@ -588,6 +919,10 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
   const DynamicRenderableSceneResource *sceneRes = instance_data.sceneRes;
   auto *perInstanceRenderData = &ctx.perInstanceRenderData[instance_data.indexToPerInstanceRenderData];
 
+  eastl::fixed_vector<int, 8, false> instanceIntervalVarIds; // Intervals is StaticTab<Interval, 8>
+  for (const Interval &interval : perInstanceRenderData->intervals)
+    instanceIntervalVarIds.push_back(interval.varId);
+
 
   // Duplicate PerInstanceRenderData for per-node intervals.
 
@@ -599,8 +934,7 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
   int indexToAlternativePerInstanceRenderData = instance_data.indexToPerInstanceRenderData;
   if (!nodesWithAlternativeSetOfIntervals.empty())
   {
-    dynrend::PerInstanceRenderData perInstanceRenderDataCopy(*perInstanceRenderData); // Explicit copy to avoid dealing with reallocs
-    indexToAlternativePerInstanceRenderData = ctx.storePerInstanceRenderData(perInstanceRenderDataCopy);
+    indexToAlternativePerInstanceRenderData = ctx.cloneStoredPerInstanceRenderData(instance_data.indexToPerInstanceRenderData);
     perInstanceRenderData = &ctx.perInstanceRenderData[instance_data.indexToPerInstanceRenderData]; // Restore pointer to _main_
                                                                                                     // perInstanceRenderData.
 
@@ -625,9 +959,16 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
   TMatrix4_vec4 viewProjMatrixRelToOrigin;
   if (instance_data.relativeToCamera)
   {
-    TMatrix4 cameraRotation = view;
-    cameraRotation.setrow(3, 0, 0, 0, 1);
-    viewProjMatrixRelToOrigin = cameraRotation * proj;
+    TMatrix4 relativeViewTm = view;
+    if (instance_data.indexToCustomCameraOffset >= 0)
+    {
+      TMatrix4 viewItm = inverse44(view);
+      viewItm.setrow(3, viewItm.getrow(3) + Point4::xyz0(ctx.customCameraOffsets[instance_data.indexToCustomCameraOffset]));
+      relativeViewTm = inverse44(viewItm);
+    }
+    else
+      relativeViewTm.setrow(3, 0, 0, 0, 1);
+    viewProjMatrixRelToOrigin = relativeViewTm * proj;
   }
   else if (instance_data.indexToCustomProjtm >= 0)
     viewProjMatrixRelToOrigin = calcLocalViewProj(modelOrigin, view, ctx.customProjTms[instance_data.indexToCustomProjtm], offset);
@@ -639,9 +980,9 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
   TMatrix4_vec4 prevViewProjMatrixRelToOrigin;
   if (instance_data.relativeToCamera)
   {
-    TMatrix4 cameraRotationPrev = prev_view;
-    cameraRotationPrev.setrow(3, 0, 0, 0, 1);
-    prevViewProjMatrixRelToOrigin = cameraRotationPrev * prev_proj;
+    TMatrix4 relativeViewTmPrev = prev_view;
+    relativeViewTmPrev.setrow(3, 0, 0, 0, 1);
+    prevViewProjMatrixRelToOrigin = relativeViewTmPrev * prev_proj;
   }
   else
     prevViewProjMatrixRelToOrigin = calcLocalViewProj(prevModelOrigin, prev_view, prev_proj, offset);
@@ -676,9 +1017,16 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
 
   // elems to DipChunks.
 
-  auto initNodeChunk = [&](NodeChunk &node_chunk, int node_id, int base_offset) {
+  auto initNodeChunk = [&](auto &node_chunk, int node_id, int base_offset) {
     node_chunk.toInstanceDataOffset = globalInstanceOffset - base_offset + 0.5f;
     node_chunk.nodeOpacity = opacityArray[node_id];
+  };
+
+  auto pushNodeChunk = [&](auto &&fill) {
+    if (ctx.prevMatrices)
+      fill(ctx.renderDataBuffer.push_back<NodeChunk>());
+    else
+      fill(ctx.renderDataBuffer.push_back<NodeChunkNoPrev>());
   };
 
   auto initDipChunk = [&](DipChunk &dip_chunk, int node_id, const ShaderMesh::RElem &elem, ShaderMesh::Stage stg) {
@@ -700,13 +1048,52 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
     else
       dip_chunk.overrideStateId = shaders::OverrideStateId();
     dip_chunk.mergeOverrideState = perInstanceRenderData->flags & MERGE_OVERRIDE_STATE;
-    dip_chunk.constDataBuf = perInstanceRenderData->constDataBuf;
+    dip_chunk.constDataBuf = perInstanceRenderData->constDataId;
 
     dip_chunk.texLevel = desiredTexLevel;
+    dip_chunk.lodNo = max(instance_data.instanceLod, 0);
     dip_chunk.instanceOffsetRenderData = instance_offset_render_data;
+
+    dip_chunk.packedMaterial = false;
+
+    dip_chunk.variantState = {};
+    dip_chunk.bindposeBufferOffset = 0;
 
     elem.mat->getIntVariable(dynamic_num_passesVarId, dip_chunk.numPasses);
     elem.mat->getIntVariable(draw_orderVarId, dip_chunk.forcedOrder);
+  };
+
+  // A multidraw coalesced range cannot set per-instance const data or override states, and replacement/filter
+  // scopes must draw the replacement class. Such instances stay classic and
+  // their classes are not packed
+  const GlobalVariableStates *packGvarsState = ctx.globVarsState;
+  const bool instancePackable = platform_has_bindless() && perInstanceRenderData->constDataId == BAD_D3DRESID &&
+                                !perInstanceRenderData->constDataBuf && !bool(perInstanceRenderData->overrideStateId) &&
+                                !(perInstanceRenderData->flags & MERGE_OVERRIDE_STATE) && !replacement_shader &&
+                                !filtered_material_names.size() && (packGvarsState || is_main_thread());
+
+  enum class ChunkFate
+  {
+    Classic,
+    Packed,
+    Dropped
+  };
+  auto resolveDipChunk = [&](DipChunk &dip_chunk) -> ChunkFate {
+    if (!instancePackable || dip_chunk.numPasses > 0) // the packed block draws every chunk with instanceCount = 1
+      return ChunkFate::Classic;
+    if (!element_has_packed_material(ctx, dip_chunk.shader, packGvarsState))
+      return ChunkFate::Classic;
+    // A range cannot set per-instance intervals: a packed class whose variant selection reads one of them stays classic
+    for (int varId : instanceIntervalVarIds)
+      if (dynamic_variant_depends_on_global_var(dip_chunk.shader->native(), varId))
+        return ChunkFate::Classic;
+    shaders::CombinedDynVariantState vs = get_dynamic_variant_states(packGvarsState, dip_chunk.shader->native());
+    if (!is_valid(vs))
+      return ChunkFate::Dropped;
+    dip_chunk.packedMaterial = true;
+    dip_chunk.variantState = vs;
+    dip_chunk.intervals = nullptr;
+    return ChunkFate::Packed;
   };
 
   eastl::fixed_vector<eastl::fixed_vector<ShaderMesh::Stage, 2, false>, 5, false> shaderMeshStagesList;
@@ -727,8 +1114,33 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
   if (perInstanceRenderData->flags & RENDER_DISTORTION)
     shaderMeshStagesList.push_back({ShaderMesh::Stage::STG_distortion});
 
-  const int nodeChunkVecs = instance_data.initialNodes ? BIG_NODE_CHUNK_VECS : SMALL_NODE_CHUNK_VECS;
+  const int nodeChunkVecs = node_chunk_vecs(ctx.prevMatrices, instance_data.initialNodes != nullptr);
   node_offset_render_data = ctx.renderDataBuffer.vec_size();
+
+  // Marked bones are indexing to skins[0], which wouldn't work for higher skins (WT has them)
+  // So we look up the node index for them once before the loop.
+  // All nodes of an instance are collapsed to the same point defined by target node
+  // so the collapsed node mx can be calculated here too.
+  const DynamicRenderableSceneInstance::NodeCollapserBits &ncBits = instance->getNodeCollapserBits();
+  const bool applyNodeCollapser = ctx.nodeCollapserEnabled && !ncBits.isEmpty();
+  dag::RelocatableFixedVector<int, 16, true> collapsedNodes;
+  mat44f collapsedNodeWtm, prevCollapsedNodeWtm;
+  if (applyNodeCollapser)
+  {
+    const int targetNode = instance->getNodeCollapserTarget();
+    TMatrix collapsedTm = TMatrix::ZERO, prevCollapsedTm = TMatrix::ZERO;
+    if (targetNode >= 0)
+    {
+      collapsedTm.setcol(3, instance->getNodeWtmRelToOrigin(targetNode).getcol(3));
+      prevCollapsedTm.setcol(3, instance->getNodePrevWtmRelToOrigin(targetNode).getcol(3));
+    }
+    v_mat44_make_from_43cu(collapsedNodeWtm, collapsedTm[0]);
+    v_mat44_make_from_43cu(prevCollapsedNodeWtm, prevCollapsedTm[0]);
+
+    for (uint32_t boneId = 0, boneCount = ncBits.data.size() * 32; boneId < boneCount; boneId++)
+      if (ncBits.isBoneMarked(boneId))
+        collapsedNodes.push_back(instance->getNodeForBone(boneId));
+  }
 
   sceneRes->getMeshes(
     [&](const ShaderMesh *mesh, int node_id, float radius, int rigid_no) {
@@ -748,18 +1160,17 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
       v_mat44_mul(prevNodeGlobTm, prevViewProjTmRelToOrigin, prevNodeTmRelToOrigin);
 
       const int nodeOffsetRenderData = ctx.renderDataBuffer.vec_size();
-      {
-        NodeChunk &nodeChunk = ctx.renderDataBuffer.push_back<NodeChunk>();
-
+      pushNodeChunk([&]<typename Chunk>(Chunk &nodeChunk) {
         initNodeChunk(nodeChunk, node_id, nodeOffsetRenderData);
         nodeChunk.nodeGlobTm = nodeGlobTm;
-        nodeChunk.prevNodeGlobTm = prevNodeGlobTm;
+        if constexpr (Chunk::HAS_PREV)
+          nodeChunk.prevNodeGlobTm = prevNodeGlobTm;
 
         if (instance_data.initialNodes && !instance_data.initialNodes->extraData.empty())
           nodeChunk.extraData = instance_data.initialNodes->extraData[node_id];
         else
           nodeChunk.extraData.flt[0] = nodeChunk.extraData.flt[1] = 0.f;
-      }
+      });
 
       if (instance_data.initialNodes && !instance_data.initialNodes->nodesModelTm.empty())
       {
@@ -770,6 +1181,9 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
         nodeTms.initialNodeTm1 = initialNodeTm.col1;
         nodeTms.initialNodeTm2 = initialNodeTm.col2;
       }
+
+      if (ctx.instanceDataOnly)
+        return;
 
       for (auto &&shaderMeshStages : shaderMeshStagesList)
       {
@@ -789,7 +1203,15 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
           DipChunk &dipChunk = dipChunks.push_back();
           initDipChunk(dipChunk, node_id, elems[elemNo], shaderMeshStages.front());
           dipChunk.numBones = 0;
+          const ChunkFate fate = resolveDipChunk(dipChunk);
+          if (fate == ChunkFate::Dropped)
+          {
+            dipChunks.pop_back();
+            continue;
+          }
           dipChunk.nodeOffsetRenderData = nodeOffsetRenderData - (rigid_no % 256) * nodeChunkVecs;
+          if (fate == ChunkFate::Packed)
+            dipChunk.nodeOffsetRenderData = nodeOffsetRenderData; // exact NodeChunk address, the shader ignores the rigid index
           dipChunk.nodeChunkSizeInVecs = nodeChunkVecs;
           if (dipChunks.size() >= 2 && dipChunks[dipChunks.size() - 2].tryMerge(dipChunk))
           {
@@ -824,40 +1246,61 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
       }
 
       const int nodeOffsetRenderData = ctx.renderDataBuffer.vec_size();
-      {
-        NodeChunk &nodeChunk = ctx.renderDataBuffer.push_back<NodeChunk>();
-
+      pushNodeChunk([&]<typename Chunk>(Chunk &nodeChunk) {
         initNodeChunk(nodeChunk, node_id, nodeOffsetRenderData);
         nodeChunk.nodeGlobTm = viewProjTmRelToOrigin;
-        nodeChunk.prevNodeGlobTm = prevViewProjTmRelToOrigin;
+        if constexpr (Chunk::HAS_PREV)
+          nodeChunk.prevNodeGlobTm = prevViewProjTmRelToOrigin;
+
         if (instance_data.initialNodes && !instance_data.initialNodes->extraData.empty())
           nodeChunk.extraData = instance_data.initialNodes->extraData[node_id];
         else
           nodeChunk.extraData.flt[0] = nodeChunk.extraData.flt[1] = 0.f;
-      }
+      });
 
       ctx.statBones += mesh->bonesCount();
 
-      BoneTMs *bones = ctx.renderDataBuffer.push_back<BoneTMs>(mesh->bonesCount());
-      for (int boneNo = 0; boneNo < mesh->bonesCount(); boneNo++)
-      {
-        mat44f origTm, nodeWtmRelToOrigin, transp;
-        v_mat44_make_from_43cu(origTm, mesh->getBoneOrgTm(boneNo)[0]);
-        v_mat44_make_from_43cu(nodeWtmRelToOrigin, instance->getNodeWtmRelToOrigin(mesh->getNodeForBone(boneNo))[0]);
-        v_mat44_mul(transp, nodeWtmRelToOrigin, origTm);
-        v_mat44_transpose(transp, transp);
-        bones[boneNo].boneTm0 = transp.col0;
-        bones[boneNo].boneTm1 = transp.col1;
-        bones[boneNo].boneTm2 = transp.col2;
+      auto fillBoneTms = [&]<typename Bones>(Bones *bones) {
+        for (int boneNo = 0; boneNo < mesh->bonesCount(); boneNo++)
+        {
+          mat44f origTm, nodeWtmRelToOrigin, transp;
+          v_mat44_make_from_43cu(origTm, mesh->getBoneOrgTm(boneNo)[0]);
+          const int boneNodeId = mesh->getNodeForBone(boneNo);
+          const bool collapsed = eastl::find(collapsedNodes.begin(), collapsedNodes.end(), boneNodeId) != collapsedNodes.end();
+          if (collapsed)
+            nodeWtmRelToOrigin = collapsedNodeWtm;
+          else
+            v_mat44_make_from_43cu(nodeWtmRelToOrigin, instance->getNodeWtmRelToOrigin(boneNodeId)[0]);
+          v_mat44_mul(transp, nodeWtmRelToOrigin, origTm);
+          v_mat44_transpose(transp, transp);
+          bones[boneNo].boneTm0 = transp.col0;
+          bones[boneNo].boneTm1 = transp.col1;
+          bones[boneNo].boneTm2 = transp.col2;
 
-        mat44f prevNodeWtmRelToOrigin;
-        v_mat44_make_from_43cu(prevNodeWtmRelToOrigin, instance->getNodePrevWtmRelToOrigin(mesh->getNodeForBone(boneNo))[0]);
-        v_mat44_mul(transp, prevNodeWtmRelToOrigin, origTm);
-        v_mat44_transpose(transp, transp);
-        bones[boneNo].bonePrevTm0 = transp.col0;
-        bones[boneNo].bonePrevTm1 = transp.col1;
-        bones[boneNo].bonePrevTm2 = transp.col2;
-      }
+          if constexpr (Bones::HAS_PREV)
+          {
+            mat44f prevNodeWtmRelToOrigin;
+            if (collapsed)
+              prevNodeWtmRelToOrigin = prevCollapsedNodeWtm;
+            else
+              v_mat44_make_from_43cu(prevNodeWtmRelToOrigin, instance->getNodePrevWtmRelToOrigin(boneNodeId)[0]);
+            v_mat44_mul(transp, prevNodeWtmRelToOrigin, origTm);
+            v_mat44_transpose(transp, transp);
+            bones[boneNo].bonePrevTm0 = transp.col0;
+            bones[boneNo].bonePrevTm1 = transp.col1;
+            bones[boneNo].bonePrevTm2 = transp.col2;
+          }
+        }
+      };
+
+      mark_skin_layout(ctx, false);
+      if (ctx.prevMatrices)
+        fillBoneTms(ctx.renderDataBuffer.push_back<BoneTMs>(mesh->bonesCount()));
+      else
+        fillBoneTms(ctx.renderDataBuffer.push_back<BoneTMsNoPrev>(mesh->bonesCount()));
+
+      if (ctx.instanceDataOnly)
+        return;
 
       for (auto &&shaderMeshStages : shaderMeshStagesList)
       {
@@ -876,8 +1319,13 @@ static void instanceToChunks(ContextData &ctx, const InstanceData &instance_data
           DipChunk &dipChunk = ctx.dipChunksByStage[shaderMeshStages.front()].push_back();
           initDipChunk(dipChunk, node_id, elems[elemNo], shaderMeshStages.front());
           dipChunk.numBones = mesh->bonesCount();
+          if (resolveDipChunk(dipChunk) == ChunkFate::Dropped)
+          {
+            ctx.dipChunksByStage[shaderMeshStages.front()].pop_back();
+            continue;
+          }
           dipChunk.nodeOffsetRenderData = nodeOffsetRenderData;
-          dipChunk.nodeChunkSizeInVecs = SMALL_NODE_CHUNK_VECS; // Skinned meshes never use initial tms.
+          dipChunk.nodeChunkSizeInVecs = node_chunk_vecs(ctx.prevMatrices, false); // Skinned meshes never use initial tms.
         }
       }
       ctx.statNodes++;
@@ -930,16 +1378,18 @@ public:
 
 void prepare_render_begin(ContextId context_id, const TMatrix4 &view, const TMatrix4 &proj)
 {
-  G_ASSERTF_RETURN((int)context_id >= 0 && (int)context_id < contexts.size(), , "Uninitialized dynrend context was used");
+  G_ASSERTF_RETURN(is_allocated_context(context_id), , "Uninitialized dynrend context was used");
   G_ASSERT(context_id != ContextId::IMMEDIATE || is_main_thread());
 
-  ContextData &ctx = contexts[(int)context_id];
+  ContextData &ctx = contexts[context_id];
 
   {
     TMatrix4 relativeViewTm = view;
     relativeViewTm.setrow(3, 0, 0, 0, 1.f);
 
     TMatrix4 worldToProjTm = relativeViewTm * proj;
+    ctx.gpuData.relativeWorldToProjTm = worldToProjTm;
+
     float det;
     inverse44(worldToProjTm, ctx.gpuData.projToWorldTm, det);
     inverse44(proj, ctx.gpuData.projToViewTm, det);
@@ -949,10 +1399,11 @@ void prepare_render_begin(ContextId context_id, const TMatrix4 &view, const TMat
 void prepare_render_instances(ContextId context_id, const TMatrix4 &view, const TMatrix4 &proj, int &instanceToChunkOffset,
   const Point3 &offset_to_origin, TexStreamingContext texCtx, dynrend::InstanceContextData *instanceContextData)
 {
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
   TIME_PROFILE(dynrend_prepare_render_instances);
 
   // Instances to chunks.
-  ContextData &ctx = contexts[(int)context_id];
+  ContextData &ctx = contexts[context_id];
 
   if (instanceToChunkOffset <= 0)
   {
@@ -960,7 +1411,7 @@ void prepare_render_instances(ContextId context_id, const TMatrix4 &view, const 
 
     if (instanceContextData)
     {
-      instanceContextData->contextId = ContextId(-1);
+      instanceContextData->contextId = ContextId::Invalid;
       instanceContextData->nodeOffsetRenderData = -1;
     }
     instanceToChunkOffset = 0;
@@ -973,7 +1424,7 @@ void prepare_render_instances(ContextId context_id, const TMatrix4 &view, const 
   for (auto it = ctx.instances.begin() + instanceToChunkOffset; it < ctx.instances.end(); ++it)
   {
     InstanceData &instanceData = *it;
-    instanceToChunks(ctx, instanceData, view, proj, prevViewTm, prevProjTm, offset_to_origin, texCtx, nodeOffsetRenderData,
+    instanceToChunks(ctx, instanceData, view, proj, globalPrevViewTm, globalPrevProjTm, offset_to_origin, texCtx, nodeOffsetRenderData,
       instanceOffsetRenderData);
     instanceData.nodeOffsetRenderData = nodeOffsetRenderData;
     instanceData.instanceOffsetRenderData = instanceOffsetRenderData;
@@ -987,78 +1438,29 @@ void prepare_render_instances(ContextId context_id, const TMatrix4 &view, const 
   }
 } // prepare_render_instances
 
-void prepare_render_finalize(ContextId context_id)
+void prepare_render_sort(ContextId context_id)
 {
-  ContextData &ctx = contexts[(int)context_id];
-  if (ctx.renderDataBuffer.empty())
-  {
-    ctx.clear();
-    return;
-  }
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
+
   FRAMEMEM_REGION;
-
-
-  // Copy render data to ring buffer.
-
-  const int sizeOfAllChunks = ctx.renderDataBuffer.vec_size();
-  if (sizeOfAllChunks > ctx.ringBufferSizeInVecs)
-  {
-    ctx.recreateRingBuffer(3 * sizeOfAllChunks, &ctx - contexts.begin());
-    debug("dynrend: '%s' ring buffer size = %dK", ctx.name.c_str(), (ctx.ringBufferSizeInVecs * sizeof(vec4f)) >> 10);
-  }
-
-  if (ctx.ringBuffer->bufLeft() < sizeOfAllChunks)
-  {
-    if (ctx.prevDiscardOnFrame == ::dagor_frame_no())
-    {
-      ctx.recreateRingBuffer(3 * ctx.ringBufferSizeInVecs, &ctx - contexts.begin());
-      debug("dynrend: '%s' ring buffer size = %dK", ctx.name.c_str(), (ctx.ringBufferSizeInVecs * sizeof(vec4f)) >> 10);
-    }
-    ctx.prevDiscardOnFrame = dagor_frame_no();
-
-    ctx.ringBuffer->resetPos();
-    ctx.ringBuffer->resetCounters();
-  }
-
-  void *ringBufferData;
-  {
-    TIME_PROFILE(lock);
-    ringBufferData = ctx.ringBuffer->lockData(sizeOfAllChunks);
-    if (!ringBufferData)
-    {
-      ctx.clear();
-      return;
-    }
-  }
-
-  ctx.ringBufferPos = ctx.ringBuffer->getPos();
-
-  {
-    TIME_PROFILE(memcpy);
-    memcpy(ringBufferData, ctx.renderDataBuffer.data(), ctx.renderDataBuffer.size());
-  }
-
-  {
-    TIME_PROFILE(unlock);
-    ctx.ringBuffer->unlockData(sizeOfAllChunks);
-  }
-
-
-  // Sort.
-
   eastl::array<SmallTab<int, framemem_allocator>, ShaderMesh::Stage::STG_COUNT> dipChunksOrderByStage;
 
   {
     TIME_PROFILE(sort);
     for (int stageNo = 0; stageNo < ShaderMesh::Stage::STG_COUNT; stageNo++)
     {
-      for (DipChunk &chunk : ctx.dipChunksByStage[stageNo]) // In separate pass because instanceToChunks can resize
-                                                            // perInstanceRenderData.
-        chunk.intervals = chunk.getIntervals(ctx);          // intervals field is used only for sorting
-
-      dipChunksOrderByStage[stageNo].resize(ctx.dipChunksByStage[stageNo].size());
-      for (int order = 0, e = dipChunksOrderByStage[stageNo].size(); order < e; order++)
-        dipChunksOrderByStage[stageNo][order] = order;
+      // In separate pass because instanceToChunks can resize perInstanceRenderData.
+      // intervals field is used only for sorting non-packed chunks.
+      for (int i = 0, e = ctx.dipChunksByStage[stageNo].size(); i < e; i++)
+      {
+        DipChunk &chunk = ctx.dipChunksByStage[stageNo][i];
+        if (!chunk.packedMaterial)
+        {
+          chunk.intervals = chunk.getIntervals(ctx);
+          dipChunksOrderByStage[stageNo].push_back(i);
+        }
+      }
 
       stlsort::sort(dipChunksOrderByStage[stageNo].begin(), dipChunksOrderByStage[stageNo].end(),
         CompareDipChunks(ctx.dipChunksByStage[stageNo].begin()));
@@ -1075,7 +1477,7 @@ void prepare_render_finalize(ContextId context_id)
       auto &dipChunks = ctx.dipChunksByStage[stageNo];
       auto &order = dipChunksOrderByStage[stageNo];
       auto &newOrder = ctx.dipChunksOrderByStage[stageNo];
-      for (int curChunkNo = 0, e = dipChunks.size(); curChunkNo < e; curChunkNo++)
+      for (int curChunkNo = 0, e = order.size(); curChunkNo < e; curChunkNo++)
       {
         newOrder.push_back(order[curChunkNo]);
         int mergeChunkNo = curChunkNo + 1;
@@ -1093,22 +1495,175 @@ void prepare_render_finalize(ContextId context_id)
   }
 
 
+  // Separate packed (multidraw) chunks and coalesce drawcalls
+  {
+    TIME_PROFILE(coalesce_packed);
+    for (int stageNo = 0; stageNo < ShaderMesh::Stage::STG_COUNT; stageNo++)
+    {
+      auto &dipChunks = ctx.dipChunksByStage[stageNo];
+      auto &packedOrder = ctx.packedChunkOrderByStage[stageNo];
+      auto &drawcallRanges = ctx.drawcallRangesByStage[stageNo];
+
+      // Collect packed chunks (non-packed were already handled in the sort step above)
+      for (int i = 0, e = dipChunks.size(); i < e; i++)
+        if (dipChunks[i].packedMaterial)
+          packedOrder.push_back(i);
+
+      if (packedOrder.empty())
+        continue;
+
+      // Sort packed chunks for coalescing: by material_id, priority, rstate, vData, prog, node chunk size
+      stlsort::sort(packedOrder.begin(), packedOrder.end(), [&dipChunks](int a, int b) {
+        const DipChunk &ca = dipChunks[a];
+        const DipChunk &cb = dipChunks[b];
+        if (get_material_id(ca.variantState.const_state) != get_material_id(cb.variantState.const_state))
+          return get_material_id(ca.variantState.const_state) < get_material_id(cb.variantState.const_state);
+        if (ca.forcedOrder != cb.forcedOrder)
+          return ca.forcedOrder < cb.forcedOrder;
+        if (ca.variantState.render_state != cb.variantState.render_state)
+          return ca.variantState.render_state < cb.variantState.render_state;
+        if (ca.vertexData != cb.vertexData)
+          return (uintptr_t)ca.vertexData < (uintptr_t)cb.vertexData;
+        if (ca.variantState.program != cb.variantState.program)
+          return ca.variantState.program < cb.variantState.program;
+        if (ca.nodeChunkSizeInVecs != cb.nodeChunkSizeInVecs)
+          return ca.nodeChunkSizeInVecs < cb.nodeChunkSizeInVecs;
+        return false;
+      });
+
+      // Coalesce consecutive compatible packed chunks into drawcall ranges
+      auto mergeComparator = [&dipChunks](int a, int b) -> bool {
+        const DipChunk &ca = dipChunks[a];
+        const DipChunk &cb = dipChunks[b];
+        return ca.vertexData == cb.vertexData && ca.forcedOrder == cb.forcedOrder &&
+               ca.variantState.render_state == cb.variantState.render_state &&
+               get_material_id(ca.variantState.const_state) == get_material_id(cb.variantState.const_state) &&
+               ca.variantState.program == cb.variantState.program && ca.nodeChunkSizeInVecs == cb.nodeChunkSizeInVecs;
+      };
+
+      drawcallRanges.push_back(PackedDrawCallsRange{0, 1});
+      ctx.bindlessStatesToUpdateTexLevels.emplace(dipChunks[packedOrder[0]].variantState.const_state,
+        dipChunks[packedOrder[0]].texLevel);
+
+      for (uint32_t i = 1, ie = packedOrder.size(); i < ie; ++i)
+      {
+        if (dynrendCoalescePacked.get() && mergeComparator(packedOrder[i], packedOrder[i - 1]))
+          drawcallRanges.back().count++;
+        else
+          drawcallRanges.push_back(PackedDrawCallsRange{drawcallRanges.back().count + drawcallRanges.back().start, 1});
+
+        auto iter = ctx.bindlessStatesToUpdateTexLevels.find(dipChunks[packedOrder[i]].variantState.const_state);
+        if (iter == ctx.bindlessStatesToUpdateTexLevels.end())
+          ctx.bindlessStatesToUpdateTexLevels.emplace(dipChunks[packedOrder[i]].variantState.const_state,
+            dipChunks[packedOrder[i]].texLevel);
+        else
+          iter->second = max(iter->second, (uint8_t)dipChunks[packedOrder[i]].texLevel);
+      }
+    }
+  }
+
+  ctx.renderSorted = true;
+}
+
+bool prepare_render_finalize(ContextId context_id)
+{
+  G_ASSERT_RETURN(is_allocated_context(context_id), false);
+  ContextData &ctx = contexts[context_id];
+  if (ctx.renderDataBuffer.empty())
+  {
+    ctx.clear();
+    return true;
+  }
+  FRAMEMEM_REGION;
+
+  if (ctx.renderFinalized)
+  {
+    if (!ctx.renderSorted)
+      prepare_render_sort(context_id);
+    return true;
+  }
+
+  // Copy render data to ring buffer.
+
+  const int sizeOfAllChunks = ctx.renderDataBuffer.vec_size();
+  if (sizeOfAllChunks > ctx.ringBufferSizeInVecs)
+  {
+    ctx.recreateRingBuffer(3 * sizeOfAllChunks);
+    debug("dynrend: '%s' ring buffer size = %dK", ctx.name.c_str(), (ctx.ringBufferSizeInVecs * sizeof(vec4f)) >> 10);
+  }
+
+  if (ctx.ringBuffer->bufLeft() < sizeOfAllChunks)
+  {
+    if (ctx.prevDiscardOnFrame == ::dagor_frame_no())
+    {
+      ctx.recreateRingBuffer(3 * ctx.ringBufferSizeInVecs);
+      debug("dynrend: '%s' ring buffer size = %dK", ctx.name.c_str(), (ctx.ringBufferSizeInVecs * sizeof(vec4f)) >> 10);
+    }
+    ctx.prevDiscardOnFrame = dagor_frame_no();
+
+    ctx.ringBuffer->resetPos();
+    ctx.ringBuffer->resetCounters();
+  }
+
+  void *ringBufferData;
+  {
+    TIME_PROFILE(lock);
+    ringBufferData = ctx.ringBuffer->lockData(sizeOfAllChunks);
+    if (!ringBufferData)
+    {
+      ctx.clear();
+      return false;
+    }
+  }
+
+  ctx.ringBufferPos = ctx.ringBuffer->getPos();
+
+  {
+    TIME_PROFILE(memcpy);
+    memcpy(ringBufferData, ctx.renderDataBuffer.data(), ctx.renderDataBuffer.size());
+  }
+
+  {
+    TIME_PROFILE(unlock);
+    ctx.ringBuffer->unlockData(sizeOfAllChunks);
+  }
+
+#if DAGOR_DBGLEVEL > 0
+  ctx.prevMatricesAtFill = ctx.prevMatrices;
+#endif
+
+  prepare_render_sort(context_id);
+
   if (dynrendLog.get() && ::dagor_frame_no() % 100 == 0)
     debug("%d prepare %s: instances=%d, nodes=%d, bones=%d, chunks[0]=%d, chunks[4]=%d, preMerged=%d, postMerged=%d",
       ::dagor_frame_no(), ctx.name.c_str(), ctx.instances.size(), ctx.statNodes, ctx.statBones,
       ctx.dipChunksOrderByStage[ShaderMesh::Stage::STG_opaque].size(), ctx.dipChunksOrderByStage[ShaderMesh::Stage::STG_trans].size(),
       ctx.statPreMerged, ctx.statPostMerged);
+
+  ctx.renderFinalized = true;
+  return true;
 }
 
 void prepare_render(ContextId context_id, const TMatrix4 &view, const TMatrix4 &proj, const Point3 &offset_to_origin,
   TexStreamingContext texCtx, dynrend::InstanceContextData *instanceContextData)
 {
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
   TIME_PROFILE(dynrend_prepare_render);
 
   prepare_render_begin(context_id, view, proj);
   int offset = -1;
   prepare_render_instances(context_id, view, proj, offset, offset_to_origin, texCtx, instanceContextData);
   prepare_render_finalize(context_id);
+}
+
+void collect_used_resources(ContextId context_id, eastl::vector_set<const DynamicRenderableSceneLodsResource *> &resources)
+{
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
+
+  for (auto &instance : ctx.instances)
+    if (auto res = instance.instance->getConstLodsResource())
+      resources.insert(res->getFirstOriginal());
 }
 
 static void change_intervals(Intervals *from, Intervals *to)
@@ -1151,28 +1706,33 @@ static void set_override(shaders::OverrideStateId id, shaders::OverrideStateId &
 
 void update_reprojection_data(ContextId contextId)
 {
-  ContextData &ctx = contexts[(int)contextId];
+  G_ASSERT_RETURN(is_allocated_context(contextId), );
+  ContextData &ctx = contexts[contextId];
   if (!ctx.renderSkinned)
     return;
-  contextGpuDataBuffer->updateDataWithLock(0, sizeof(ContextGpuData), &ctx.gpuData, VBLOCK_WRITEONLY | VBLOCK_DISCARD);
+  update_context_gpu_data(ctx.gpuData);
 }
 
 bool set_instance_data_buffer(unsigned stage, ContextId contextId, int node_offset_render_data, int instance_offset_render_data)
 {
   G_ASSERT(is_main_thread());
 
-  if ((int)contextId < 0)
+  if (!is_valid_context(contextId))
     return false;
 
-  ContextData &ctx = contexts[(int)contextId];
+  ContextData &ctx = contexts[contextId];
   if (!ctx.renderSkinned)
     return false;
 
   ShaderGlobal::set_buffer(instanceDataBufferVarId, ctx.ringBuffer->getBufId());
   ctx.ringBufferVarSet = true;
 
+  // the cs skinning shaders implement the full layout only, see DYNREND_HAS_PREV_MATRICES in skinning_inc.dshl
+  G_ASSERTF(stage != STAGE_CS || ctx.prevMatrices,
+    "dynrend context %s has no prev matrices, the cs skinning shaders read the full layout", ctx.name.c_str());
+
   const uint32_t offsetToNodeChunk = ctx.ringBufferPos + node_offset_render_data;
-  const uint32_t offsetAndSize = (offsetToNodeChunk << 8) | (SMALL_NODE_CHUNK_VECS);
+  const uint32_t offsetAndSize = (offsetToNodeChunk << 8) | node_chunk_vecs(ctx.prevMatrices, false);
 
   const uint32_t offsetToInstanceChunk = ctx.ringBufferPos + instance_offset_render_data;
 
@@ -1182,41 +1742,70 @@ bool set_instance_data_buffer(unsigned stage, ContextId contextId, int node_offs
   return true;
 }
 
+bool get_instance_data_offsets(ContextId contextId, int node_offset_render_data, int instance_offset_render_data,
+  uint32_t out_dwords[2], D3DRESID &out_buffer_id)
+{
+
+  if (!is_valid_context(contextId))
+    return false;
+
+  const ContextData &ctx = contexts[contextId];
+  if (!ctx.renderSkinned || !ctx.ringBuffer)
+    return false;
+
+  const uint32_t offsetToNodeChunk = ctx.ringBufferPos + node_offset_render_data;
+  out_dwords[0] = (offsetToNodeChunk << 8) | (SMALL_NODE_CHUNK_VECS);
+  out_dwords[1] = ctx.ringBufferPos + instance_offset_render_data;
+  out_buffer_id = ctx.ringBuffer->getBufId();
+
+  return true;
+}
+
 const Point4 *get_per_instance_render_data(ContextId contextId, int indexToPerInstanceRenderData)
 {
   G_ASSERT(is_main_thread());
 
-  if ((int)contextId < 0)
+  if (!is_valid_context(contextId))
     return nullptr;
 
-  ContextData &ctx = contexts[(int)contextId];
+  ContextData &ctx = contexts[contextId];
 
   return ctx.perInstanceRenderData[indexToPerInstanceRenderData].params.data();
 }
 
-void render(ContextId context_id, ShaderMesh::Stage shader_mesh_stage)
-{
-  G_ASSERT(is_main_thread());
-  G_ASSERTF_RETURN((int)context_id >= 0 && (int)context_id < contexts.size(), , "Uninitialized dynrend context was used");
+void after_device_reset() { update_context_gpu_data({}); }
 
-  ContextData &ctx = contexts[(int)context_id];
+// The one-frame cb is valid only for the frame it was written in, but its
+// binding outlives render calls; discard it every frame so a stale binding
+// never exposes recycled framemem to the GPU.
+void begin_frame() { update_context_gpu_data({}); }
+
+static void render_context_begin(ContextData &ctx)
+{
+  ShaderGlobal::set_buffer(instanceDataBufferVarId, ctx.ringBuffer->getBufId());
+  ctx.ringBufferVarSet = true;
+  update_context_gpu_data(ctx.gpuData);
+  int sceneBlock = ShaderGlobal::getBlock(ShaderGlobal::LAYER_SCENE);
+  ShaderGlobal::setBlock(sceneBlock, ShaderGlobal::LAYER_SCENE); // Update buffer var.
+}
+
+static void render_context_end(ContextData &ctx)
+{
+  ShaderGlobal::set_buffer(instanceDataBufferVarId, BAD_D3DRESID); // avoid race if prepare happens in multiple threads
+  ShaderGlobal::set_buffer(instance_const_data_bufferVarId, BAD_D3DRESID);
+  d3d::set_immediate_const(STAGE_VS, NULL, 0);
+  d3d::set_immediate_const(STAGE_PS, NULL, 0);
+  ctx.ringBufferVarSet = false;
+}
+
+static void render_stage(ContextData &ctx, ShaderMesh::Stage shader_mesh_stage)
+{
   const auto &dipChunks = ctx.dipChunksByStage[shader_mesh_stage];
 
   if (dipChunks.empty())
     return;
 
   TIME_PROFILE(dynrend_render);
-
-
-  // Begin render.
-
-  ShaderGlobal::set_buffer(instanceDataBufferVarId, ctx.ringBuffer->getBufId());
-  ctx.ringBufferVarSet = true;
-
-  contextGpuDataBuffer->updateDataWithLock(0, sizeof(ContextGpuData), &ctx.gpuData, VBLOCK_WRITEONLY | VBLOCK_DISCARD);
-
-  int sceneBlock = ShaderGlobal::getBlock(ShaderGlobal::LAYER_SCENE);
-  ShaderGlobal::setBlock(sceneBlock, ShaderGlobal::LAYER_SCENE); // Update buffer var.
 
 
   // Render sequence of DIP chunks through immediate constants
@@ -1229,6 +1818,8 @@ void render(ContextId context_id, ShaderMesh::Stage shader_mesh_stage)
   int statIntervals = 0;
   int statConstData = 0;
   int statOverrides = 0;
+
+  const bool debugMeshColoring = debug_mesh::is_enabled();
 
   {
     TIME_PROFILE(render);
@@ -1279,8 +1870,20 @@ void render(ContextId context_id, ShaderMesh::Stage shader_mesh_stage)
         statOverrides++;
       }
 
+      // A packed class has no classic variant: a plain dip would draw it with an unwritten draw id.
       bool shaderChanged = dipChunk.shader != currentShader;
-      bool texLevelIncreased = dipChunk.shader->setReqTexLevel(dipChunk.texLevel);
+      if (shaderChanged && platform_has_bindless() && DAGOR_UNLIKELY(element_has_packed_material(ctx, dipChunk.shader, nullptr)))
+      {
+        if (should_log_packed_classic_drop(dipChunk.shaderName))
+          logerr("dynrend: dropped a classic dip of packed material shader '%s' (ctx %s): the instance could not be "
+                 "packed (const data, override state, replacement or filter scope, no snapshot on a worker, "
+                 "interval-dependent class) and a packed class has no classic variant",
+            dipChunk.shaderName, ctx.name.c_str());
+        statInvalid++;
+        continue;
+      }
+
+      bool texLevelIncreased = dipChunk.shader->setReqTexLevel(dipChunk.texLevel); //-V522
       if (shaderChanged || texLevelIncreased)
       {
         if (shaderChanged && currentShader)
@@ -1317,9 +1920,13 @@ void render(ContextId context_id, ShaderMesh::Stage shader_mesh_stage)
       {
         const uint32_t params[] = {offsetAndSize, offsetToInstanceChunk};
         d3d::set_immediate_const(STAGE_VS, params, 2);
+        d3d::set_immediate_const(STAGE_PS, params, 2);
         currentOffsetAndSize = offsetAndSize;
         currentInstanceOffset = offsetToInstanceChunk;
       }
+
+      if (debugMeshColoring)
+        debug_mesh::set_debug_value(dipChunk.lodNo);
 
       // Do instansing if > 0 to gen inst id
       if (dipChunk.numPasses > 0)
@@ -1340,26 +1947,119 @@ void render(ContextId context_id, ShaderMesh::Stage shader_mesh_stage)
 
     if (currentShader)
       currentShader->setReqTexLevel();
+
+    if (debugMeshColoring)
+      debug_mesh::reset_debug_value();
+  }
+
+  // Multidraw rendering for packed materials
+  {
+    const auto &packedOrder = ctx.packedChunkOrderByStage[shader_mesh_stage];
+    const auto &drawcallRanges = ctx.drawcallRangesByStage[shader_mesh_stage];
+
+    if (!packedOrder.empty() && !drawcallRanges.empty())
+    {
+      TIME_D3D_PROFILE(dynrend_render_indirect);
+
+      // Update bindless tex levels
+      if (!ctx.bindlessStatesToUpdateTexLevels.empty())
+      {
+        for (auto stateIdTexLevel : ctx.bindlessStatesToUpdateTexLevels)
+          update_bindless_state(stateIdTexLevel.first, stateIdTexLevel.second);
+      }
+
+      const auto multiDrawRenderer = multidrawContext.fillBuffers(packedOrder.size(),
+        [&](uint32_t drawcallId, uint32_t &indexCountPerInstance, uint32_t &instanceCount, uint32_t &startIndexLocation,
+          int32_t &baseVertexLocation, uint32_t &perDrawData) {
+          const DipChunk &chunk = dipChunks[packedOrder[drawcallId]];
+          indexCountPerInstance = chunk.numf * 3;
+          instanceCount = 1;
+          startIndexLocation = chunk.si;
+          baseVertexLocation = chunk.baseVertex;
+          const uint32_t instanceOffset = ctx.ringBufferPos + chunk.nodeOffsetRenderData;
+          if (DAGOR_UNLIKELY(instanceOffset >= MAX_MATRIX_OFFSET))
+          {
+            LOGERR_ONCE("Too big offset in instance matrix buffer %d.", instanceOffset);
+            instanceCount = 0;
+          }
+          const uint32_t materialOffset = get_material_offset(chunk.variantState.const_state);
+          if (DAGOR_UNLIKELY(materialOffset >= MAX_MATERIAL_OFFSET))
+          {
+            LOGERR_ONCE("Too big material offset %d.", materialOffset);
+            instanceCount = 0;
+          }
+          perDrawData = (instanceOffset << MATERIAL_OFFSET_BITS) | materialOffset;
+        });
+
+      GlobalVertexData *vdata = NULL;
+
+      const int smallChunkVecs = node_chunk_vecs(ctx.prevMatrices, false);
+      uint32_t currentImmediateConst = ~0u;
+      for (const auto &dcParams : drawcallRanges)
+      {
+        const DipChunk &chunk = dipChunks[packedOrder[dcParams.start]];
+
+        // WT packed shaders read InitialNodeTMs only when this low byte exceeds the base chunk size
+        // DNG packed shaders add the raw dword to the node base. Both served by this loop, so need 0 for small chunks
+        const uint32_t immediateConst = chunk.nodeChunkSizeInVecs == smallChunkVecs ? 0u : (uint32_t)chunk.nodeChunkSizeInVecs;
+        if (immediateConst != currentImmediateConst)
+        {
+          d3d::set_immediate_const(STAGE_VS, &immediateConst, 1);
+          d3d::set_immediate_const(STAGE_PS, &immediateConst, 1);
+          currentImmediateConst = immediateConst;
+        }
+
+        if (debugMeshColoring)
+          debug_mesh::set_debug_value(chunk.lodNo);
+        set_states_for_variant(chunk.shader->native(), chunk.variantState);
+
+        if (!chunk.vertexData->isEmpty())
+        {
+          if (vdata != chunk.vertexData)
+            (vdata = chunk.vertexData)->setToDriver();
+          multiDrawRenderer.render(PRIM_TRILIST, dcParams.start, dcParams.count);
+        }
+        if (debugMeshColoring)
+          debug_mesh::reset_debug_value();
+        statDip++;
+      }
+    }
   }
 
   if (dynrendLog.get() && ::dagor_frame_no() % 100 == 0)
     debug("%d     render[%d] %s: chunks=%d, Shader=%d, VertexData=%d, Invalid=%d, intervals=%d, constData=%d, overrides=%d, tris=%d",
       ::dagor_frame_no(), shader_mesh_stage, ctx.name.c_str(), ctx.dipChunksOrderByStage[shader_mesh_stage].size(), statShader,
       statVertexData, statInvalid, statIntervals, statConstData, statOverrides, statTriangles);
+}
 
-  // End render.
-  ShaderGlobal::set_buffer(instanceDataBufferVarId, BAD_D3DRESID); // avoid race if prepare happens in multiple threads
-  ShaderGlobal::set_buffer(instance_const_data_bufferVarId, BAD_D3DRESID);
-  d3d::set_immediate_const(STAGE_VS, NULL, 0);
-  ctx.ringBufferVarSet = false;
+
+void render(ContextId context_id, ShaderMesh::Stage shader_mesh_stage)
+{
+  G_ASSERT(is_main_thread());
+  G_ASSERTF_RETURN(is_allocated_context(context_id), , "Uninitialized dynrend context was used");
+
+  ContextData &ctx = contexts[context_id];
+  if (ctx.dipChunksByStage[shader_mesh_stage].empty())
+    return;
+
+#if DAGOR_DBGLEVEL > 0
+  G_ASSERTF(ctx.prevMatricesAtFill == pass_expects_prev_matrices,
+    "dynrend context %s was filled with%s previous matrices, but the "
+    "current pass expects them%s",
+    ctx.name.c_str(), ctx.prevMatricesAtFill ? "" : "out", pass_expects_prev_matrices ? "" : " missing");
+#endif
+
+  render_context_begin(ctx);
+  render_stage(ctx, shader_mesh_stage);
+  render_context_end(ctx);
 }
 
 
 void clear(ContextId context_id)
 {
-  G_ASSERTF_RETURN((int)context_id >= 0 && (int)context_id < contexts.size(), , "Uninitialized dynrend context was used");
+  G_ASSERTF_RETURN(is_allocated_context(context_id), , "Uninitialized dynrend context was used");
 
-  ContextData &ctx = contexts[(int)context_id];
+  ContextData &ctx = contexts[context_id];
   if (dynrendLog.get() && ::dagor_frame_no() % 100 == 0 && !ctx.instances.empty())
     debug("%d     clear %s", ::dagor_frame_no(), ctx.name.c_str());
   ctx.clear();
@@ -1372,22 +2072,42 @@ void clear_all_contexts()
     ctx.clear();
 }
 
+void reset_ring_buffers()
+{
+  for (ContextData &ctx : contexts)
+    if (ctx.ringBuffer)
+    {
+      ctx.ringBuffer->resetPos();
+      ctx.ringBuffer->resetCounters();
+    }
+}
+
 
 void set_prev_view_proj(const TMatrix4_vec4 &prev_view, const TMatrix4_vec4 &prev_proj)
 {
-  prevViewTm = prev_view;
-  prevProjTm = prev_proj;
+  globalPrevViewTm = prev_view;
+  globalPrevProjTm = prev_proj;
 }
 
 
 void get_prev_view_proj(TMatrix4_vec4 &prev_view, TMatrix4_vec4 &prev_proj)
 {
-  prev_view = prevViewTm;
-  prev_proj = prevProjTm;
+  prev_view = globalPrevViewTm;
+  prev_proj = globalPrevProjTm;
 }
 
 
 void set_local_offset_hint(const Point3 &hint) { localOffsetHint = hint; }
+
+
+void set_context_view_proj(ContextId context_id, const TMatrix4 &view, const TMatrix4 &proj, const TMatrix4 &prev_view,
+  const TMatrix4 &prev_proj)
+{
+  G_ASSERTF_RETURN(is_allocated_context(context_id), , "Uninitialized dynrend context was used");
+  ContextData &ctx = contexts[context_id];
+
+  ctx.cachedTm.emplace(ContextData::CachedTm{view, proj, prev_view, prev_proj});
+}
 
 
 void enable_separate_atest_pass(bool enable) { separateAtestPass = enable; }
@@ -1403,10 +2123,38 @@ void verify_is_empty(ContextId context_id)
   static bool verifyDynrendContexts = ::dgs_get_settings()->getBlockByNameEx("debug")->getBool("verifyDynrendContexts", false);
   if (verifyDynrendContexts)
   {
-    ContextData &ctx = contexts[(int)context_id];
+    G_ASSERT_RETURN(is_allocated_context(context_id), );
+    ContextData &ctx = contexts[context_id];
     G_ASSERTF(ctx.instances.empty(), "dynrend: context '%s' is already in use", ctx.name.c_str());
     G_UNUSED(ctx);
   }
+}
+
+bool has_elems_in_stage(const DynamicRenderableSceneLodsResource *lods_res, ShaderMesh::Stage stage)
+{
+  if (!lods_res)
+    return false;
+  for (int lodNo = 0; lodNo < lods_res->lods.size(); lodNo++)
+  {
+    const DynamicRenderableSceneResource *scene = lods_res->lods[lodNo].scene;
+    if (!scene)
+      continue;
+    for (const auto &rigid : scene->getRigidsConst())
+      if (!rigid.mesh->getMesh()->getElems(stage).empty())
+        return true;
+    for (const auto &skin : scene->getSkins())
+      if (!skin->getMesh()->getShaderMesh().getElems(stage).empty())
+        return true;
+  }
+  return false;
+}
+
+void render_immediate(ShaderMesh::Stage shader_mesh_stage, const TMatrix4 &vtm, const TMatrix4 &ptm, TexStreamingContext texCtx)
+{
+  G_ASSERT(is_main_thread());
+  prepare_render(ContextId::IMMEDIATE, vtm, ptm, localOffsetHint, texCtx);
+  render(ContextId::IMMEDIATE, shader_mesh_stage);
+  clear(ContextId::IMMEDIATE);
 }
 
 void render_one_instance(const DynamicRenderableSceneInstance *instance, ShaderMesh::Stage shader_mesh_stage,
@@ -1428,9 +2176,7 @@ void render_one_instance(const DynamicRenderableSceneInstance *instance, ShaderM
   verify_is_empty(ContextId::IMMEDIATE);
 
   add(ContextId::IMMEDIATE, instance, optional_initial_nodes, optional_render_data, nullptr, nullptr, relative_to_camera);
-  prepare_render(ContextId::IMMEDIATE, vtm, ptm, localOffsetHint, texCtx);
-  render(ContextId::IMMEDIATE, shader_mesh_stage);
-  clear(ContextId::IMMEDIATE);
+  render_immediate(shader_mesh_stage, vtm, ptm, texCtx);
 }
 
 
@@ -1497,15 +2243,17 @@ void reset_statistics() { memset(&statistics, 0, sizeof(statistics)); }
 
 void iterate_instances(dynrend::ContextId context_id, InstanceIterator iter, void *user_data)
 {
-  ContextData &ctx = contexts[(int)context_id];
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
   for (auto &instanceData : ctx.instances)
   {
     auto &instance = *instanceData.instance;
     auto &sceneRes = *instanceData.sceneRes;
-    const int nodeChunkVecs = (instanceData.initialNodes ? BIG_NODE_CHUNK_VECS : SMALL_NODE_CHUNK_VECS);
-    iter(context_id, sceneRes, instance, ctx.perInstanceRenderData[instanceData.indexToPerInstanceRenderData], ctx.allNodesVisibility,
+    const int nodeChunkVecs = node_chunk_vecs(ctx.prevMatrices, instanceData.initialNodes != nullptr);
+    iter(context_id, sceneRes, instance, instanceData.relativeToCamera,
+      ctx.perInstanceRenderData[instanceData.indexToPerInstanceRenderData], ctx.allNodesVisibility,
       instanceData.indexToAllNodesVisibility, ctx.minElemRadius, instanceData.nodeOffsetRenderData,
-      instanceData.instanceOffsetRenderData, nodeChunkVecs, user_data);
+      instanceData.instanceOffsetRenderData, instanceData.initialNodes, nodeChunkVecs, user_data);
   }
 }
 
@@ -1533,5 +2281,520 @@ InitialNodes::InitialNodes(const DynamicRenderableSceneInstance *instance, const
     v_mat44_make_from_43cu(nodesModelTm[nodeId], root_tm.m[0]);
 }
 
+static ShaderVariableInfo animchar_draw_order_var_info("draw_order");
+
+static void animchar_to_chunks(ContextData &ctx, uint32_t start_stage, uint32_t end_stage, const DynamicRenderableSceneInstance *scene,
+  const DynamicRenderableSceneResource *lodResource, const animchar_additional_data::AnimcharAdditionalDataView &additional_data,
+  NeedPreviousMatrices need_previous_matrices, DynamicShaderOverrides shader_overrides, const PathFilterView &path_filter,
+  uint8_t render_mask, RenderPriority priority, const GlobalVariableStates *gvars_state, TexStreamingContext texCtx,
+  const mat44f &viewProjTmRelToOrigin, const mat44f &prevViewProjTmRelToOrigin,
+  eastl::vector<int, framemem_allocator> *output_offsets = nullptr)
+{
+  G_ASSERT(scene->getLodsResource()->getInstanceRefCount() > 0);
+  int lodNo = max(scene->getCurrentLodNo(), 0);
+  float distSq = scene->getDistSq();
+  int reqLevel = texCtx.getTexLevel(scene->getLodsResource()->getTexScale(lodNo), distSq);
+
+  const auto rigidCount = lodResource->getRigidsConst().size();
+  if (output_offsets)
+    output_offsets->assign(rigidCount + lodResource->getSkinNodes().size(), -1);
+
+  const bool addPreviousMatrices = need_previous_matrices == NeedPreviousMatrices::Yes;
+
+  Point3 posMul, posOfs;
+  if (scene->getLodsResource()->isBoundPackUsed())
+  {
+    posMul = *((Point3 *)scene->getLodsResource()->bpC255);
+    posOfs = *((Point3 *)scene->getLodsResource()->bpC254);
+  }
+  else
+  {
+    posMul = Point3(1.f, 1.f, 1.f);
+    posOfs = Point3(0.f, 0.f, 0.f);
+  }
+
+  // InstanceChunk: write posMul, posOfs, and per-instance params (additional data)
+  const int globalInstanceOffset = ctx.renderDataBuffer.vec_size();
+
+  {
+    InstanceChunk &instanceChunk = ctx.renderDataBuffer.push_back<InstanceChunk>();
+    instanceChunk.posMul.set_xyz0(posMul);
+    instanceChunk.posOfs__paramsCount.set_xyz0(posOfs);
+    // additional_data is the per-instance params for animchars
+    instanceChunk.posOfs__paramsCount.w = additional_data.size() + 0.5f;
+  }
+
+  // Per-instance params: copy additional data (metadata at end of span)
+  if (!additional_data.is_null() && additional_data.size() > 0)
+  {
+    vec4f *params = ctx.renderDataBuffer.push_back<vec4f>(additional_data.size());
+    memcpy(params, additional_data.data(), additional_data.size() * sizeof(vec4f));
+  }
+
+  const int nodeChunkVecs = node_chunk_vecs(ctx.prevMatrices, false); // animchars never use initial tms
+
+  auto pushNodeChunk = [&](auto &&fill) {
+    if (ctx.prevMatrices)
+      fill(ctx.renderDataBuffer.push_back<NodeChunk>());
+    else
+      fill(ctx.renderDataBuffer.push_back<NodeChunkNoPrev>());
+  };
+
+  auto initAnimcharDipChunk = [&](DipChunk &dip, const ShaderMesh::RElem &elem, ShaderElement *shader_override,
+                                const shaders::CombinedDynVariantState &vs) {
+    dip.indexToPerInstanceRenderData = 0; // default, no intervals for animchars
+    dip.instanceNo = -1;                  // sentinel: not from add() path
+    dip.si = elem.si;
+    dip.numf = elem.numf;
+    dip.baseVertex = elem.baseVertex;
+    dip.shader = shader_override ? shader_override : elem.e.get();
+    dip.numPasses = 0;
+    dip.shaderName = dip.shader->getShaderClassName();
+    dip.vertexData = elem.vertexData;
+    dip.overrideStateId = shaders::OverrideStateId();
+    dip.mergeOverrideState = false;
+    dip.constDataBuf = BAD_D3DRESID;
+    dip.texLevel = reqLevel;
+    dip.lodNo = lodNo;
+    dip.instanceOffsetRenderData = globalInstanceOffset;
+    dip.intervals = nullptr;
+    dip.forcedOrder = (int)priority << 2;
+
+    elem.mat->getIntVariable(dynamic_num_passesVarId, dip.numPasses);
+    elem.mat->getIntVariable(draw_orderVarId, dip.forcedOrder);
+
+    // Per-element draw_order override
+    int drawOrder = 0;
+    if (elem.mat->getIntVariable(animchar_draw_order_var_info.get_var_id(), drawOrder))
+    {
+      if (drawOrder < 0)
+        dip.forcedOrder |= (int)RenderPriority::HIGH;
+      else if (drawOrder > 0)
+        dip.forcedOrder |= (int)RenderPriority::LOW;
+      else
+        dip.forcedOrder |= (int)RenderPriority::DEFAULT;
+    }
+
+    dip.packedMaterial = is_packed_material(vs.const_state);
+    dip.variantState = vs;
+  };
+
+  // Rigids
+  {
+    dag::ConstSpan<DynamicRenderableSceneResource::RigidObject> rigidsConst = lodResource->getRigidsConst();
+    for (int currentRigidNo = 0; currentRigidNo < (int)rigidsConst.size(); currentRigidNo++)
+    {
+      const auto &o = rigidsConst[currentRigidNo];
+      bool visible = false;
+      if (path_filter.empty())
+        visible = !scene->isNodeHidden(o.nodeId);
+      else
+        visible = (o.nodeId >= path_filter.size() || (path_filter[o.nodeId] & render_mask) == render_mask);
+
+      if (visible)
+      {
+        mat44f nodeTmRelToOrigin, nodeGlobTm;
+        v_mat44_make_from_43cu(nodeTmRelToOrigin, scene->getNodeWtmRelToOrigin(o.nodeId)[0]);
+        v_mat44_mul(nodeGlobTm, viewProjTmRelToOrigin, nodeTmRelToOrigin);
+
+        mat44f prevNodeTmRelToOrigin, prevNodeGlobTm;
+        v_mat44_make_from_43cu(prevNodeTmRelToOrigin, scene->getNodePrevWtmRelToOrigin(o.nodeId)[0]);
+        v_mat44_mul(prevNodeGlobTm, prevViewProjTmRelToOrigin, prevNodeTmRelToOrigin);
+
+        const int nodeOffsetRenderData = ctx.renderDataBuffer.vec_size();
+        if (output_offsets)
+          (*output_offsets)[currentRigidNo] = nodeOffsetRenderData;
+        pushNodeChunk([&]<typename Chunk>(Chunk &nodeChunk) {
+          nodeChunk.nodeGlobTm = nodeGlobTm;
+          if constexpr (Chunk::HAS_PREV)
+            nodeChunk.prevNodeGlobTm = prevNodeGlobTm;
+          nodeChunk.toInstanceDataOffset = globalInstanceOffset - nodeOffsetRenderData + 0.5f;
+          nodeChunk.nodeOpacity = scene->opacity_ptr()[o.nodeId];
+          nodeChunk.extraData.flt[0] = nodeChunk.extraData.flt[1] = 0.f;
+        });
+
+        if (ctx.instanceDataOnly)
+          continue;
+
+        for (uint8_t stage = start_stage; stage <= end_stage; ++stage)
+        {
+          for (const auto &elem : o.mesh->getMesh()->getElems(stage))
+          {
+            if (!elem.e)
+              continue;
+
+            shaders::CombinedDynVariantState vs;
+            {
+              ShaderElement *s = shader_overrides.rigidsShader ? shader_overrides.rigidsShader : static_cast<ShaderElement *>(elem.e);
+              vs = get_dynamic_variant_states(gvars_state, s->native());
+              if (!is_valid(vs))
+                continue;
+            }
+
+            auto &dipChunks = ctx.dipChunksByStage[stage];
+            DipChunk &dipChunk = dipChunks.push_back();
+            initAnimcharDipChunk(dipChunk, elem, shader_overrides.rigidsShader, vs);
+            dipChunk.numBones = 0;
+            // Multidraw: each draw call encodes the exact NodeChunk address (rigid_index ignored by shader).
+            // Non-multidraw: all rigids in a group share a base address; shader offsets by rigid_index from vertex.
+            dipChunk.nodeOffsetRenderData =
+              dipChunk.packedMaterial ? nodeOffsetRenderData : nodeOffsetRenderData - (currentRigidNo % 256) * nodeChunkVecs;
+            dipChunk.nodeChunkSizeInVecs = nodeChunkVecs;
+            dipChunk.bindposeBufferOffset = 0;
+
+            if (dipChunks.size() >= 2 && dipChunks[dipChunks.size() - 2].tryMerge(dipChunk))
+            {
+              ctx.statPreMerged++;
+              dipChunks.pop_back();
+            }
+          }
+        }
+
+        ctx.statNodes++;
+      }
+    }
+  }
+
+  // Skins
+  if (lodResource->getSkinsCount())
+  {
+    auto skins = lodResource->getSkins();
+    G_ASSERTF_RETURN(skins[0], , "Skin mesh not loaded");
+    const ShaderSkinnedMesh &skinMesh = *skins[0]->getMesh();
+
+    const int nodeOffsetRenderData = ctx.renderDataBuffer.vec_size();
+    // For skins: store viewProj in nodeGlobTm (bones are relative-to-origin, shader multiplies)
+    pushNodeChunk([&]<typename Chunk>(Chunk &nodeChunk) {
+      nodeChunk.nodeGlobTm = viewProjTmRelToOrigin;
+      if constexpr (Chunk::HAS_PREV)
+        nodeChunk.prevNodeGlobTm = prevViewProjTmRelToOrigin;
+      nodeChunk.toInstanceDataOffset = globalInstanceOffset - nodeOffsetRenderData + 0.5f;
+      nodeChunk.nodeOpacity = 1.0f;
+      nodeChunk.extraData.flt[0] = nodeChunk.extraData.flt[1] = 0.f;
+    });
+
+    // RENDER_SHADOW = 4 from UpdateStageInfoRender::RenderPass
+    mark_skin_layout(ctx, true);
+    NodeCollapserData *ncData = ctx.renderDataBuffer.push_back<NodeCollapserData>(1);
+    if (render_mask & 4)
+      memset(ncData, 0, sizeof(NodeCollapserData));
+    else
+      fill_node_collapser_data(scene, *ncData);
+
+    // BoneTMs
+    ctx.statBones += skinMesh.bonesCount();
+    auto fillBoneTms = [&]<typename Bones>(Bones *bones) {
+      for (int boneNo = 0; boneNo < skinMesh.bonesCount(); boneNo++)
+      {
+        mat44f origTm, nodeWtmRelToOrigin, transp;
+        v_mat44_make_from_43cu(origTm, skinMesh.getBoneOrgTm(boneNo)[0]);
+        v_mat44_make_from_43cu(nodeWtmRelToOrigin, scene->getNodeWtmRelToOrigin(skinMesh.getNodeForBone(boneNo))[0]);
+        v_mat44_mul(transp, nodeWtmRelToOrigin, origTm);
+        v_mat44_transpose(transp, transp);
+        bones[boneNo].boneTm0 = transp.col0;
+        bones[boneNo].boneTm1 = transp.col1;
+        bones[boneNo].boneTm2 = transp.col2;
+
+        if constexpr (Bones::HAS_PREV)
+        {
+          if (addPreviousMatrices)
+          {
+            mat44f prevNodeWtmRelToOrigin;
+            v_mat44_make_from_43cu(prevNodeWtmRelToOrigin, scene->getNodePrevWtmRelToOrigin(skinMesh.getNodeForBone(boneNo))[0]);
+            v_mat44_mul(transp, prevNodeWtmRelToOrigin, origTm);
+            v_mat44_transpose(transp, transp);
+            bones[boneNo].bonePrevTm0 = transp.col0;
+            bones[boneNo].bonePrevTm1 = transp.col1;
+            bones[boneNo].bonePrevTm2 = transp.col2;
+          }
+          else
+          {
+            bones[boneNo].bonePrevTm0 = bones[boneNo].boneTm0;
+            bones[boneNo].bonePrevTm1 = bones[boneNo].boneTm1;
+            bones[boneNo].bonePrevTm2 = bones[boneNo].boneTm2;
+          }
+        }
+      }
+    };
+
+    if (ctx.prevMatrices)
+      fillBoneTms(ctx.renderDataBuffer.push_back<BoneTMs>(skinMesh.bonesCount()));
+    else
+      fillBoneTms(ctx.renderDataBuffer.push_back<BoneTMsNoPrev>(skinMesh.bonesCount()));
+
+    auto skinNodes = lodResource->getSkinNodes();
+    for (int i = 0, e = skinNodes.size(); i < e; i++)
+    {
+      bool visible = false;
+      if (path_filter.empty())
+        visible = !scene->isNodeHidden(skinNodes[i]);
+      else
+        visible = (skinNodes[i] >= path_filter.size() || ((path_filter[skinNodes[i]]) & render_mask) == render_mask);
+
+      if (!visible)
+        continue;
+
+      if (output_offsets)
+        (*output_offsets)[rigidCount + i] = nodeOffsetRenderData;
+
+      if (ctx.instanceDataOnly)
+        continue;
+
+      for (uint8_t stage = start_stage; stage <= end_stage; ++stage)
+      {
+        for (const auto &elem : skins[i]->getMesh()->getShaderMesh().getElems(stage))
+        {
+          if (!elem.e)
+            continue;
+
+          shaders::CombinedDynVariantState vs;
+          {
+            ShaderElement *s = shader_overrides.skinsShader ? shader_overrides.skinsShader : static_cast<ShaderElement *>(elem.e);
+            vs = get_dynamic_variant_states(gvars_state, s->native());
+            if (!is_valid(vs))
+              continue;
+          }
+
+          DipChunk &dipChunk = ctx.dipChunksByStage[stage].push_back();
+          initAnimcharDipChunk(dipChunk, elem, shader_overrides.skinsShader, vs);
+          dipChunk.numBones = skinMesh.bonesCount();
+          dipChunk.nodeOffsetRenderData = nodeOffsetRenderData;
+          dipChunk.nodeChunkSizeInVecs = nodeChunkVecs;
+          dipChunk.bindposeBufferOffset = lodResource->getBindposeBufferIndex(i);
+        }
+      }
+    }
+    ctx.statNodes++;
+  }
+}
+
+
+void add_animchar(ContextId context_id, uint32_t start_stage, uint32_t end_stage, const DynamicRenderableSceneInstance *scene,
+  const DynamicRenderableSceneResource *lodResource, const animchar_additional_data::AnimcharAdditionalDataView additional_data,
+  NeedPreviousMatrices need_previous_matrices, DynamicShaderOverrides shader_overrides, const PathFilterView path_filter,
+  uint8_t render_mask, RenderPriority priority, const GlobalVariableStates *gvars_state, TexStreamingContext texCtx,
+  eastl::vector<int, framemem_allocator> *output_offsets)
+{
+  G_ASSERTF_RETURN(is_allocated_context(context_id), , "Uninitialized dynrend context was used");
+
+  ContextData &ctx = contexts[context_id];
+
+  TMatrix4 viewTm, projTm, prevViewTm, prevProjTm;
+  if (ctx.cachedTm.has_value())
+  {
+    viewTm = ctx.cachedTm->viewTm;
+    projTm = ctx.cachedTm->projTm;
+    prevViewTm = ctx.cachedTm->prevViewTm;
+    prevProjTm = ctx.cachedTm->prevProjTm;
+  }
+  else
+  {
+    d3d::gettm(TM_VIEW, &viewTm);
+    d3d::gettm(TM_PROJ, &projTm);
+    prevViewTm = globalPrevViewTm;
+    prevProjTm = globalPrevProjTm;
+  }
+
+  const Point3 &modelOrigin = scene->getOrigin();
+  TMatrix4 viewProjMatrix = calcLocalViewProj(modelOrigin, viewTm, projTm, localOffsetHint);
+  mat44f viewProjTmRelToOrigin = (mat44f &)viewProjMatrix;
+
+  const Point3 &prevModelOrigin = scene->getOriginPrev();
+  TMatrix4 prevViewProjMatrix = calcLocalViewProj(prevModelOrigin, prevViewTm, prevProjTm, localOffsetHint);
+  mat44f prevViewProjTmRelToOrigin = (mat44f &)prevViewProjMatrix;
+
+  animchar_to_chunks(ctx, start_stage, end_stage, scene, lodResource, additional_data, need_previous_matrices, shader_overrides,
+    path_filter, render_mask, priority, gvars_state, texCtx, viewProjTmRelToOrigin, prevViewProjTmRelToOrigin, output_offsets);
+}
+
+
+void add_animchar(ContextId context_id, uint32_t start_stage, uint32_t end_stage, const DynamicRenderableSceneInstance *scene,
+  const animchar_additional_data::AnimcharAdditionalDataView additional_data, NeedPreviousMatrices need_previous_matrices,
+  DynamicShaderOverrides shader_overrides, const PathFilterView path_filter, uint8_t render_mask, RenderPriority priority,
+  const GlobalVariableStates *gvars_state, TexStreamingContext texCtx, eastl::vector<int, framemem_allocator> *output_offsets)
+{
+  const DynamicRenderableSceneResource *lodResource = scene->getCurSceneResource();
+  if (lodResource)
+    add_animchar(context_id, start_stage, end_stage, scene, lodResource, additional_data, need_previous_matrices, shader_overrides,
+      path_filter, render_mask, priority, gvars_state, texCtx, output_offsets);
+}
+
+void merge_context(ContextId dst_id, ContextId src_id)
+{
+  G_ASSERTF_RETURN(is_allocated_context(dst_id), , "Invalid dst context in merge_context");
+  G_ASSERTF_RETURN(is_allocated_context(src_id), , "Invalid src context in merge_context");
+
+  ContextData &dst = contexts[dst_id];
+  ContextData &src = contexts[src_id];
+
+  if (src.renderDataBuffer.empty())
+  {
+    src.clear();
+    return;
+  }
+
+  // Offset delta: all DipChunk offsets in src are relative to src's renderDataBuffer.
+  // After appending src data to dst, they must be shifted by dst's current size.
+  const int offsetDelta = dst.renderDataBuffer.vec_size();
+
+  // Append src render data to dst
+  const size_t srcBytes = src.renderDataBuffer.size();
+  if (srcBytes > 0)
+  {
+    char *dstBuf = dst.renderDataBuffer.push_back<char>(srcBytes);
+    memcpy(dstBuf, src.renderDataBuffer.data(), srcBytes);
+  }
+
+  // Move DipChunks with adjusted offsets
+  for (int stageNo = 0; stageNo < ShaderMesh::Stage::STG_COUNT; stageNo++)
+  {
+    auto &srcChunks = src.dipChunksByStage[stageNo];
+    auto &dstChunks = dst.dipChunksByStage[stageNo];
+    for (auto &chunk : srcChunks)
+    {
+      chunk.nodeOffsetRenderData += offsetDelta;
+      chunk.instanceOffsetRenderData += offsetDelta;
+      dstChunks.push_back(chunk);
+    }
+  }
+
+  // Merge bindless tex level state
+  for (auto &[cstate, level] : src.bindlessStatesToUpdateTexLevels)
+  {
+    auto iter = dst.bindlessStatesToUpdateTexLevels.find(cstate);
+    if (iter == dst.bindlessStatesToUpdateTexLevels.end())
+      dst.bindlessStatesToUpdateTexLevels.emplace(cstate, level);
+    else
+      iter->second = max(iter->second, level);
+  }
+
+  // Accumulate stats
+  dst.statNodes += src.statNodes;
+  dst.statBones += src.statBones;
+  dst.statPreMerged += src.statPreMerged;
+
+  src.clear();
+}
+
+
+bool context_has_data(ContextId context_id)
+{
+  if (!is_valid_context(context_id))
+    return false;
+  G_ASSERT_RETURN(is_allocated_context(context_id), false);
+  const ContextData &ctx = contexts[context_id];
+  if (ctx.instanceDataOnly && ctx.renderDataBuffer.vec_size() > 0)
+    return true;
+  for (const auto &stage : ctx.dipChunksByStage)
+    if (!stage.empty())
+      return true;
+  return false;
+}
+
+
+D3DRESID get_context_buffer_id(ContextId context_id)
+{
+  G_ASSERTF_RETURN(is_allocated_context(context_id), BAD_D3DRESID, "Uninitialized dynrend context was used");
+  const ContextData &ctx = contexts[context_id];
+  return ctx.ringBuffer ? ctx.ringBuffer->getBufId() : BAD_D3DRESID;
+}
+
+
+int get_context_buffer_pos(ContextId context_id)
+{
+  G_ASSERTF_RETURN(is_allocated_context(context_id), 0, "Uninitialized dynrend context was used");
+  return contexts[context_id].ringBufferPos;
+}
+
+
+void iterate_dips(dynrend::ContextId context_id, DipsIterator iter)
+{
+  G_ASSERT_RETURN(is_allocated_context(context_id), );
+  ContextData &ctx = contexts[context_id];
+  for (int stageNo = 0; stageNo < ShaderMesh::Stage::STG_COUNT; stageNo++)
+  {
+    auto &dipChunks = ctx.dipChunksByStage[stageNo];
+    for (const DipChunk &chunk : dipChunks)
+    {
+      if (chunk.numf == 0)
+        continue;
+
+      const uint32_t offsetToNodeChunk = ctx.ringBufferPos + chunk.nodeOffsetRenderData;
+      const uint32_t offsetAndSize = (offsetToNodeChunk << 8) | chunk.nodeChunkSizeInVecs;
+      const uint32_t offsetToInstanceChunk = ctx.ringBufferPos + chunk.instanceOffsetRenderData;
+      iter(chunk.variantState, chunk.vertexData, chunk.shader, chunk.baseVertex, offsetAndSize, offsetToInstanceChunk);
+    }
+  }
+}
+
+
+bool prepare_render_current(ContextId context_id)
+{
+  if (!context_has_data(context_id))
+  {
+    // add_animchar() writes the InstanceChunk into renderDataBuffer before knowing
+    // whether any draw call survives filtering. If all elements are culled, dipChunksByStage
+    // stays empty but renderDataBuffer holds orphaned bytes. Clear them now so the next
+    // batch does not inherit a stale non-zero vec_size() that corrupts chunk offsets.
+    if (is_valid_context(context_id))
+    {
+      G_ASSERT_RETURN(is_allocated_context(context_id), false);
+
+      contexts[context_id].renderDataBuffer.clear();
+    }
+    return false;
+  }
+  // Always read d3d state here -- this runs on the main thread where the frame
+  // graph has already bound the correct camera via bindAsView/bindAsProj.
+  TMatrix4 viewTm, projTm;
+  d3d::gettm(TM_VIEW, &viewTm);
+  d3d::gettm(TM_PROJ, &projTm);
+  // add_animchar() populates both dipChunksByStage and renderDataBuffer directly.
+  // Only gpu-side setup (projToWorldTm etc.) and finalization remain.
+  // Must NOT call prepare_render / prepare_render_instances as that would
+  // clear renderDataBuffer and destroy the add_animchar data.
+  prepare_render_begin(context_id, viewTm, projTm);
+  return prepare_render_finalize(context_id);
+}
+
+
+void render_all_stages(ContextId context_id)
+{
+  G_ASSERT(is_main_thread());
+  G_ASSERTF_RETURN(is_allocated_context(context_id), , "Uninitialized dynrend context was used");
+
+  ContextData &ctx = contexts[context_id];
+  bool hasAnyStage = false;
+  for (int stg = 0; stg < ShaderMesh::STG_COUNT; stg++)
+    if (!ctx.dipChunksByStage[stg].empty())
+    {
+      hasAnyStage = true;
+      break;
+    }
+  if (!hasAnyStage)
+    return;
+
+  render_context_begin(ctx);
+  for (int stg = 0; stg < ShaderMesh::STG_COUNT; stg++)
+    render_stage(ctx, (ShaderMesh::Stage)stg);
+  render_context_end(ctx);
+}
+
 //============================================================================
 } // namespace dynrend
+
+static bool dynrend_console_handler(const char *argv[], int argc)
+{
+  int found = 0;
+  CONSOLE_CHECK_NAME("render", "check_dynrend_shaders", 1, 2)
+  {
+    static bool check = false;
+    if (argc > 1)
+      check = console::to_bool(argv[1]);
+    else
+      check = !check;
+    dynrend::set_check_shader_names(check);
+  }
+  return found;
+}
+REGISTER_CONSOLE_HANDLER(dynrend_console_handler);

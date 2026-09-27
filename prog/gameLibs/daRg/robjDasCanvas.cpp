@@ -16,11 +16,14 @@
 
 #include <math/dag_mathUtils.h>
 #include <dasModules/dasSystem.h>
+#include <dasModules/dasScriptsLoader.h>
 #include <gui/dag_stdGuiRender.h>
 
 
 using namespace StdGuiRender;
 using namespace das;
+
+static int verboseExceptions = 4;
 
 namespace darg
 {
@@ -81,15 +84,28 @@ bool RobjDasCanvasParams::load(const Element *elem)
   Sqrat::Object setupFuncName = scriptDesc.GetSlot(elem->csk->setupFunc);
 
   Sqrat::Object scriptObj = scriptDesc.GetSlot(elem->csk->script);
-  if (scriptObj.GetType() != OT_INSTANCE || !Sqrat::ClassType<DasScript>::IsClassInstance(scriptObj.GetObject(), false))
+  if (scriptObj.GetType() != OT_INSTANCE || !Sqrat::ClassType<DasScript>::IsClassInstance(scriptObj.GetObject()))
   {
     darg_assert_trace_var("DAS canvas requires valid 'script' object", scriptDesc, elem->csk->rendObj);
   }
   else
   {
+    DasScript *script = scriptObj.Cast<DasScript *>();
+
+    // Async loading: load() runs on the main thread (element setup/rebuild) and the setup
+    // function is evaluated below - that must stay on the main thread, never the render thread.
+    // If the script is still compiling on the worker, drain it here (synchronous fallback) so
+    // draw/setup resolution and the setup eval all happen on the main thread.
+    if (script->isLoading())
+      scene->dasScriptsData->waitScriptResolved(script);
+    if (!script->isReady() || !script->ctx)
+    {
+      darg_assert_trace_var("DAS canvas script failed to load", scriptDesc, elem->csk->rendObj);
+      return true;
+    }
+
     das::daScriptEnvironmentGuard envGuard(scene->dasScriptsData->dasEnv, scene->dasScriptsData->dasEnv);
 
-    DasScript *script = scriptObj.Cast<DasScript *>();
     das::Context *ctx = script->ctx.get();
 
     bool isUnique = false;
@@ -106,6 +122,8 @@ bool RobjDasCanvasParams::load(const Element *elem)
           darg_assert_trace_var("'setup' function: invalid signature, expected arguments:"
                                 "(props: Properties&; var storage: <user's struct> &)",
             scriptDesc, elem->csk->rendObj);
+        else if (setupFunc->cmres)
+          darg_assert_trace_var("'setup' function must not return a struct by value", scriptDesc, elem->csk->rendObj);
         else
         {
           das::TypeInfo *argType = info->fields[1];
@@ -116,16 +134,21 @@ bool RobjDasCanvasParams::load(const Element *elem)
             dataArgType = argType;
             data.resize(argType->size);
             vec4f args[2] = {das::cast<const Properties &>::from(elem->props), das::cast<void *>::from(data.data())};
+            darg_das_check_eval_thread(ctx);
             ctx->tryRestartAndLock();
             bind_dascript::RAIIStackwalkOnLogerr stackwalkOnLogerr(ctx);
 
+            bind_dascript::RAIIAlwaysStackWalkOnException alwaysStackWalkOnException(ctx, verboseExceptions > 0);
             ctx->evalWithCatch(setupFunc, args, nullptr);
 
             if (const char *error = ctx->getException())
-              logerr("%s: %s", ctx->exceptionAt.describe().c_str(), error);
+            {
+              if (verboseExceptions > 0)
+                verboseExceptions--;
+              logerr("(%s fn: %s) %s: %s", ctx->name.c_str(), setupFunc->name, ctx->exceptionAt.describe().c_str(), error);
+            }
 
             ctx->unlock();
-            ctx->restartHeaps();
           }
         }
       }
@@ -142,6 +165,8 @@ bool RobjDasCanvasParams::load(const Element *elem)
         "Invalid signature of 'draw' function, expected aguments: "
         "(var ctx: GuiContext&; rdata: ElemRenderData& const; rstate: RenderState& const; [data: <user's struct> &])",
         scriptDesc, elem->csk->rendObj);
+    else if (draw->cmres)
+      darg_assert_trace_var("'draw' function must not return a struct by value", scriptDesc, elem->csk->rendObj);
     else
     {
       this->dasScriptObj = scriptObj;
@@ -175,21 +200,28 @@ void RobjDasCanvas::render(GuiContext &ctx, const Element *elem, const ElemRende
   vec4f args[4] = {das::cast<GuiContext &>::from(ctx), das::cast<const ElemRenderData &>::from(*rdata),
     das::cast<const RenderState &>::from(render_state), das::cast<void *>::from(params->data.data())};
 
+  darg_das_check_eval_thread(params->dasCtx);
   params->dasCtx->tryRestartAndLock();
   bind_dascript::RAIIStackwalkOnLogerr stackwalkOnLogerr(params->dasCtx);
 
   GuiScene *scene = GuiScene::get_from_elem(elem);
 
   {
+    bind_dascript::RAIIAlwaysStackWalkOnException alwaysStackWalkOnException(params->dasCtx, verboseExceptions > 0);
     das::daScriptEnvironmentGuard envGuard(scene->dasScriptsData->dasEnv, scene->dasScriptsData->dasEnv);
     params->dasCtx->evalWithCatch(params->drawFunc, args, nullptr);
   }
 
   if (const char *ex = params->dasCtx->getException())
-    logerr("%s: %s", params->dasCtx->exceptionAt.describe().c_str(), ex);
+  {
+    if (verboseExceptions > 0)
+      verboseExceptions--;
+    logerr("(%s fn: %s) %s: %s%s", params->dasCtx->name.c_str(), params->drawFunc->name,
+      params->dasCtx->exceptionAt.describe().c_str(), ex,
+      darg_das_compile_in_flight() ? " [NOTE: a worker das compile was in flight - eval/compile overlap, see daRg async-load]" : "");
+  }
 
   params->dasCtx->unlock();
-  params->dasCtx->restartHeaps();
   ctx.setViewTm(xf.vtm);
   ctx.reset_draw_str_attr();
   ctx.reset_draw_str_texture();

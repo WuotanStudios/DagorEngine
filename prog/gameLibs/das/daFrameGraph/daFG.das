@@ -6,7 +6,7 @@ require daFgCore public
 require DagorDriver3D public
 require DagorShaders public
 
-require ast
+require daslib/ast
 require daslib/ast_boost
 require daslib/macro_boost
 require daslib/templates_boost
@@ -108,14 +108,14 @@ def root() : NameSpace
   return NameSpace(nameSpaceId = getRegistry().knownNames |> root)
 
 
-def operator /(var self : NameSpace; child_name : string) : NameSpace
+def operator /(self : NameSpace; child_name : string) : NameSpace
   if is_in_aot() || is_in_completion()
     return <- NameSpace()
 
   return NameSpace(nameSpaceId = getRegistry().knownNames |> addNameId`NameSpaceNameId(self.nameSpaceId, child_name))
 
 
-def fillSlot(var self : NameSpace; slot : NamedSlot; res_name_space : NameSpace; res_name : string)
+def fillSlot(self : NameSpace; slot : NamedSlot; res_name_space : NameSpace; res_name : string)
   fill_slot(self.nameSpaceId, slot.name, res_name_space.nameSpaceId, res_name)
 
 
@@ -127,7 +127,7 @@ def private get(var nodes : idIndexedMapping`NodeNameId`NodeData&; node_id : Nod
   return <- cb |> invoke(nodes |> get(node_id))
 
 
-def registerNode(var self : NameSpace; name : string; var declaration_callback : lambda<(var reg : Registry) : lambda<void>>) : NodeHandle
+def registerNode(self : NameSpace; name : string; var declaration_callback : lambda<(var reg : Registry) : lambda<void>>) : NodeHandle
   if is_in_aot() || is_in_completion()
     return <- NodeHandle()
 
@@ -203,11 +203,11 @@ def executionHas(var self : Registry; side_effect : SideEffect) : Registry
   return self
 
 
-def create(var self : Registry; name : string; history : History) : VirtualResourceCreationSemiRequest
+def create(var self : Registry; name : string) : VirtualResourceCreationSemiRequest
   let nodeNsId = self.registry.knownNames |> getParent(self.nodeId)
   let nameId = self.registry.knownNames |> addNameId`ResNameId(nodeNsId, name)
   self.registry.resources |> get(nameId) <| $(var res : ResourceData&)
-    res.history = history
+    res.createdResData |> emplace_some
 
   self.registry.nodes[self.nodeId].createdResources |> insert(nameId)
   using() <| $(var req : ResourceRequest#)
@@ -287,7 +287,7 @@ def modify(var self : NameSpaceRequest; slot : NamedSlot) : VirtualResourceSemiR
   return <- VirtualResourceSemiRequest(registry = self.registry, nodeId = self.nodeId, resUid = ResUid(nameId = nameId, history = false))
 
 
-def rename(var self : NameSpaceRequest; from : string; to : string; history : History) : VirtualResourceSemiRequest
+def rename(var self : NameSpaceRequest; from : string; to : string) : VirtualResourceSemiRequest
   let fromResId = self.registry.knownNames |> addNameId`ResNameId(self.nameSpaceId, from)
   let nodeNsId = self.registry.knownNames |> getParent(self.nodeId)
   let toResId = self.registry.knownNames |> addNameId`ResNameId(nodeNsId, to)
@@ -296,8 +296,6 @@ def rename(var self : NameSpaceRequest; from : string; to : string; history : Hi
   using() <| $(var req : ResourceRequest#)
     req.usage = ResourceUsage(access = Access.READ_WRITE)
     self.registry.nodes[self.nodeId].resourceRequests[fromResId] := req
-  self.registry.resources |> get(toResId) <| $(var res : ResourceData&)
-    res.history = history
 
   return <- VirtualResourceSemiRequest(registry = self.registry, nodeId = self.nodeId, resUid = ResUid(nameId = fromResId, history = false))
 
@@ -316,7 +314,8 @@ def texture(var self : VirtualResourceCreationSemiRequest; info : Texture2dCreat
         desc.height = info.resolution as res.y
       res |> setDescription(desc)
 
-    res.resType = ResourceType.Texture
+    assume createdResData = res.createdResData as some
+    createdResData.resType = ResourceType.Texture
 
   return <- VirtualTextureRequest(registry = self.registry, nodeId = self.nodeId, resUid = self.resUid)
 
@@ -335,7 +334,8 @@ def buffer(var self : VirtualResourceCreationSemiRequest; info : BufferCreateInf
       desc.activation = ResourceActivationAction.DISCARD_AS_UAV
       res |> setDescription(desc)
 
-    res.resType = ResourceType.Buffer
+    assume createdResData = res.createdResData as some
+    createdResData.resType = ResourceType.Buffer
 
   return <- VirtualBufferRequest(registry = self.registry, nodeId = self.nodeId, resUid = self.resUid)
 
@@ -349,7 +349,7 @@ def isDasNative(var t : TypeDeclPtr) : bool
   if t.isHandle
     return false
 
-  if length(t.dim) > 0
+  if t.baseType == Type.tFixedArray
     return true
 
   // These are interop types by default, see blobBindings.cpp
@@ -379,35 +379,35 @@ def private tryAddBlobSpecializations(var blobType : TypeDeclPtr; hasDefValue : 
   let blobTypeHash = hash(mangledBlobTypeName)
 
   // We add 2 new types per blob type: blob request and blob handle
-  var inscope vrr_type <- typeinfo ast_typedecl(type<VirtualResourceRequest>)
+  var vrr_type = typeinfo ast_typedecl(type<VirtualResourceRequest>)
   var vrrBase = vrr_type.structType
-  var inscope blobRequestStruct <- clone_structure(vrrBase)
+  var blobRequestStruct = clone_structure(vrrBase)
   blobRequestStruct.name := "VirtualBlobRequest`{blobTypeHash}"
-  blobRequestStruct.parent := vrrBase
+  blobRequestStruct.parent = vrrBase
   blobRequestStruct.flags |= StructureFlags.generated
 
-  var inscope vrhb_type <- typeinfo ast_typedecl(type<VirtualResourceHandleBase>)
+  var vrhb_type = typeinfo ast_typedecl(type<VirtualResourceHandleBase>)
   var vrhBase = vrhb_type.structType
-  var inscope blobHandleStruct <- clone_structure(vrhBase)
+  var blobHandleStruct = clone_structure(vrhBase)
   blobHandleStruct.name := "VirtualBlobHandle`{blobTypeHash}"
-  blobHandleStruct.parent := vrhBase
+  blobHandleStruct.parent = vrhBase
   blobHandleStruct.flags |= StructureFlags.generated
 
-  var inscope blobHandleFn <- qmacro_function("handle") <| \
+  var blobHandleFn = qmacro_function("handle") <| \
     $(self : $t(blobRequestStruct)) : $t(blobHandleStruct) {
       return <- struct<$t(blobHandleStruct)>(provider = self.registry |> getProvider(), resUid = self.resUid);
     }
   compiling_module() |> add_function(blobHandleFn)
 
   if !blobType.isRef
-    var inscope blobGetFn <- qmacro_function("get") <| \
+    var blobGetFn = qmacro_function("get") <| \
       $(self : $t(blobHandleStruct); cb : block<(var value : $t(blobType)&) : void>) : void {
         let blobView = self.provider |> getBlobView(self.resUid.nameId, self.resUid.history);
         invoke(cb) <| deref(unsafe(reinterpret<$t(blobType)?> blobView |> getData($v(mangledBlobTypeName))));
       }
     compiling_module() |> add_function(blobGetFn)
   else
-    var inscope blobGetFn <- qmacro_function("get") <| \
+    var blobGetFn = qmacro_function("get") <| \
       $(self : $t(blobHandleStruct); cb : block<(var value : $t(blobType)) : void>) : void {
         let blobView = self.provider |> getBlobView(self.resUid.nameId, self.resUid.history);
         invoke(cb) <| deref(unsafe(reinterpret<$t(blobType)?> blobView |> getData($v(mangledBlobTypeName))));
@@ -415,38 +415,38 @@ def private tryAddBlobSpecializations(var blobType : TypeDeclPtr; hasDefValue : 
     compiling_module() |> add_function(blobGetFn)
 
   if useDasCtorDtor(blobType)
-    var inscope exprReinterpret <- qmacro(unsafe(reinterpret<$t(blobType)?> self))
+    var exprReinterpret = qmacro(unsafe(reinterpret<$t(blobType)?> self))
     // NOTE: some project use the "please error out if some optimizations
     // were not possible due to aliasing restrictions" mode, so we need to
     // explicitly say that no aliasing is happening here, hence the `assumeNoAlias`
-    var inscope exprDeref <- new ExprPtr2Ref(subexpr <- exprReinterpret, assumeNoAlias = true)
-    var inscope blobCtorFn <- qmacro_function("ctor`{blobTypeHash}") <| \
+    var exprDeref = new ExprPtr2Ref(subexpr <- exprReinterpret, assumeNoAlias = true)
+    var blobCtorFn = qmacro_function("ctor`{blobTypeHash}") <| \
       $(var self : void?) : void {
         $e(exprDeref) <- struct<$t(blobType)>();
       }
     compiling_module() |> add_function(blobCtorFn)
 
-    var inscope blobDtorFn <- qmacro_function("dtor`{blobTypeHash}") <| \
+    var blobDtorFn = qmacro_function("dtor`{blobTypeHash}") <| \
       $(var self : void?) : void {
         delete deref(unsafe(reinterpret<$t(blobType)?> self));
       }
     compiling_module() |> add_function(blobDtorFn)
 
-    var inscope exprCastFrom <- qmacro(unsafe(reinterpret<$t(blobType) const?> from))
-    var inscope exprFrom <- new ExprPtr2Ref(subexpr <- exprCastFrom, assumeNoAlias = true)
-    var inscope blobCopyFn <- qmacro_function("copy`{blobTypeHash}") <| \
+    var exprCastFrom = qmacro(unsafe(reinterpret<$t(blobType) const?> from))
+    var exprFrom = new ExprPtr2Ref(subexpr <- exprCastFrom, assumeNoAlias = true)
+    var blobCopyFn = qmacro_function("copy`{blobTypeHash}") <| \
       $(var self : void?; from : void const?) : void {
         $e(clone_expression(exprDeref)) = $e(exprFrom);
       }
     compiling_module() |> add_function(blobCopyFn)
 
   if hasDefValue
-    var inscope exprReinterpret <- qmacro(unsafe(reinterpret<$t(blobType)?> self))
+    var exprReinterpret = qmacro(unsafe(reinterpret<$t(blobType)?> self))
     // NOTE: some project use the "please error out if some optimizations
     // were not possible due to aliasing restrictions" mode, so we need to
     // explicitly say that no aliasing is happening here, hence the `assumeNoAlias`
-    var inscope exprDeref <- new ExprPtr2Ref(subexpr <- exprReinterpret, assumeNoAlias = true)
-    var inscope blobDefCtorFn <- qmacro_function("ctor_def`{blobTypeHash}") <| \
+    var exprDeref = new ExprPtr2Ref(subexpr <- exprReinterpret, assumeNoAlias = true)
+    var blobDefCtorFn = qmacro_function("ctor_def`{blobTypeHash}") <| \
       $(var self : void?; def_value : $t(blobType)) : void {
         $e(exprDeref) <- def_value;
       }
@@ -460,15 +460,15 @@ def private tryAddBlobSpecializations(var blobType : TypeDeclPtr; hasDefValue : 
 // the following functions like handle, get, etc.
 [call_macro(name="blob")]
 class BlobMacro : AstCallMacro
-  [unused_argument(mod)] def override visit(prog : ProgramPtr; mod : Module ?; var expr : smart_ptr<ExprCallMacro>) : ExpressionPtr
+  [unused_argument(mod)] def override visit(prog : ProgramPtr; mod : Module ?; expr : ExprCallMacro ?) : ExpressionPtr
     macro_verify(expr.arguments |> length == 2, prog, expr.at,
       "Function-like macro `blob` accepts two arguments: request and \
        blob type, e.g. registry |> read(\"sea_level\") |> blob(type<float>)")
 
     assume request = expr.arguments[0]
-    var inscope creationReqTd <- typeinfo ast_typedecl(type<VirtualResourceCreationSemiRequest>)
+    var creationReqTd = typeinfo ast_typedecl(type<VirtualResourceCreationSemiRequest>)
     let isCreationReq = is_same_type(request._type, creationReqTd, RefMatters.no, ConstMatters.no, TemporaryMatters.no)
-    var inscope regularReqTd <- typeinfo ast_typedecl(type<VirtualResourceSemiRequest>)
+    var regularReqTd = typeinfo ast_typedecl(type<VirtualResourceSemiRequest>)
     let isRegularReq = is_same_type(request._type, regularReqTd, RefMatters.no, ConstMatters.no, TemporaryMatters.no)
 
     macro_verify(isCreationReq || isRegularReq, prog, expr.at,
@@ -476,7 +476,7 @@ class BlobMacro : AstCallMacro
                   e.g. registry |> read(\"sea_level\") or registry |> create(\"sea_level\", History No)")
 
     let hasValue = !(expr.arguments[1] is ExprTypeDecl)
-    var inscope blobType := expr.arguments[1]._type
+    var blobType = clone_type(expr.arguments[1]._type)
     if hasValue
       blobType.flags &= ~TypeDeclFlags.constant
       blobType.flags &= ~TypeDeclFlags.ref
@@ -522,7 +522,8 @@ class BlobMacro : AstCallMacro
                 res |> overrideCtor(getTypeInfo(type<$t(blobType)>), ctor);
               }
 
-              res.resType = ResourceType.Blob;
+              assume createdResData = res.createdResData as some
+              createdResData.resType = ResourceType.Blob;
             } |> invoke(self.registry.resources |> get(self.resUid.nameId));
             self |> modifyRequest() <| $(var request : ResourceRequest&) {
               request |> markWithTag($v(mangledBlobTypeName));
@@ -557,6 +558,7 @@ def optional(var self : auto(TT)) : TT
 def useAs(var self : auto(TT); usageType : Usage) : TT
   let setUsage = $ <| (var request : ResourceRequest &)
     request.usage.usageType = usageType
+    request.usageDeclared = true
   self |> modifyRequest(setUsage)
   return self
 
@@ -599,11 +601,11 @@ def handle(self : VirtualBufferRequest) : VirtualBufferHandle
   return <- VirtualBufferHandle(provider = self.registry |> getProvider(), resUid = self.resUid)
 
 
-def view(self : VirtualTextureHandle) : ManagedTexView
+def view(self : VirtualTextureHandle) : TextureView
   return self.provider |> getTexView(self.resUid.nameId, self.resUid.history)
 
 
-def view(self : VirtualBufferHandle) : ManagedBufView
+def view(self : VirtualBufferHandle) : BufferView
   return self.provider |> getBufView(self.resUid.nameId, self.resUid.history)
 
 
@@ -625,7 +627,7 @@ def requestState(var self : Registry) : StateRequest
   return StateRequest(registry = self.registry, nodeId = self.nodeId)
 
 
-def private setBlock(var self : StateRequest; name : string; layer : string; var value : int&) : StateRequest
+def private setBlock(var self : StateRequest; name : string; layer : string; var value : int&) : StateRequest    // nolint:LINT014 - self is returned, so it must stay 'var'
   if value != -1
     let selfName = self.registry.knownNames |> getName(self.nodeId)
     error("Block requested to be set to layer {layer} twice within {selfName} frame graph node! Ignoring one of the requests!")

@@ -1,4 +1,10 @@
-macro TILE_CONSTANT_FILLER()
+include "shader_global.dshl"
+
+shader tileConstantFiller
+{
+  supports global_frame;
+  supports none;
+
   cull_mode  = none;
   z_test = false;        // D3DRS_ZFUNC = D3DCMP_ALWAYS
   z_write = false;
@@ -18,15 +24,13 @@ macro TILE_CONSTANT_FILLER()
   }
 
   (vs) {
-    clipmap_tex_mips@f1 = (clipmap_tex_mips);
+    texture_size_inv@f2 = (1.0 / get_viewport().zw);
   }
   hlsl(vs) {
     VsOutput fill_constant_vs(int2 pos_wh : POSITION, float4 color:TEXCOORD0)
     {
       VsOutput output;
-      float2 texture_size = float2(TILE_WIDTH*clipmap_tex_mips*MAX_VTEX_CNT, TILE_WIDTH);
-      float2 pos_pixels = pos_wh.xy;
-      float2 pos_screen = (pos_pixels)/(texture_size);
+      float2 pos_screen = pos_wh.xy * texture_size_inv;
       output.pos = float4(pos_screen * YTWO + YMINONE, 1, 1);
       output.color = float4(BGRA_SWIZZLE(color).rgb, 1);
       return output;
@@ -40,4 +44,4 @@ macro TILE_CONSTANT_FILLER()
   }
   compile("target_ps", "fill_constant_ps");
   compile("target_vs", "fill_constant_vs");
-endmacro
+}

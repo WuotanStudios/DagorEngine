@@ -19,13 +19,13 @@ struct typeName<dag::FixedVectorMap<K, V, inplace_count>>
 };
 
 template <class K, class V, size_t inplace_count>
-V &fixed_vector_map_at(dag::FixedVectorMap<K, V, inplace_count> &map, const K &key)
+V &fixed_vector_map_at(dag::FixedVectorMap<K, V, inplace_count> &map, const K key)
 {
   return map[key];
 }
 
 template <class K, class V, size_t inplace_count>
-bool fixed_vector_map_contains(const dag::FixedVectorMap<K, V, inplace_count> &map, const K &key)
+bool fixed_vector_map_contains(const dag::FixedVectorMap<K, V, inplace_count> &map, const K key)
 {
   return map.contains(key);
 }
@@ -42,7 +42,7 @@ struct typeFactory<dag::FixedVectorMap<K, V, inplace_count>>
     {
       auto keyDeclT = makeType<K>(library);
       auto valDeclT = makeType<V>(library);
-      auto ann = make_smart<ManagedVectorAnnotation<VT>>(declN, const_cast<ModuleLibrary &>(library));
+      auto ann = new ManagedVectorAnnotation<VT>(declN, const_cast<ModuleLibrary &>(library));
       ann->cppName =
         "dag::FixedVectorMap<" + describeCppType(keyDeclT) + ", " + describeCppType(valDeclT) + ", " + to_string(inplace_count) + ">";
       auto mod = library.front();

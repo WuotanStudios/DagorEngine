@@ -6,7 +6,7 @@
 #include <ecs/anim/animchar_visbits.h>
 #include <ecs/render/updateStageRender.h>
 
-#include <render/world/dynModelRenderer.h>
+#include <render/dynmodelRenderer.h>
 
 
 void AnimcharRenderMainJob::start(AnimcharRenderMainJobCtx *ctx,
@@ -22,7 +22,8 @@ void AnimcharRenderMainJob::start(AnimcharRenderMainJobCtx *ctx,
   hints = hints_;
   occlusion = occlusion_;
   frustum = fg_cam_blob_frustum;
-  dstate = dynmodel_renderer::create_state(state_name);
+  dynCtx = dynrend::get_or_create_context(state_name);
+  dynrend::set_context_view_proj(dynCtx, ctx->viewTm, ctx->projTm, ctx->prevViewTm, ctx->prevProjTm);
   texCtx = tex_ctx;
 
   threadpool::add(this, threadpool::PRIO_HIGH, ctx->lastJobTPQPos, threadpool::AddFlags::None);
@@ -33,18 +34,19 @@ void AnimcharRenderMainJob::doJob()
   if (eastl::to_underlying(flt) == 0) // First one wake others up
     threadpool::wake_up_all();
 
-  G_FAST_ASSERT(dstate && frustum);
+  G_FAST_ASSERT(dynrend::is_valid_context(dynCtx) && frustum);
   const animchar_visbits_t add_vis_bits = VISFLG_MAIN_VISIBLE | VISFLG_MAIN_CAMERA_RENDERED;
-  const animchar_visbits_t check_bits = VISFLG_MAIN_AND_SHADOW_VISIBLE | VISFLG_MAIN_VISIBLE;
+  const animchar_visbits_t require_any_vis_bits = VISFLG_MAIN_AND_SHADOW_VISIBLE | VISFLG_MAIN_VISIBLE;
+  const animchar_visbits_t reject_if_any_vis_bits = VISFLG_COCKPIT_VISIBLE;
+
   const uint8_t filterMask = UpdateStageInfoRender::RENDER_MAIN;
-  g_entity_mgr->broadcastEventImmediate(
-    AnimcharRenderAsyncEvent(*dstate, &mainCtx->globalVarsState, occlusion, *frustum, add_vis_bits, check_bits, filterMask,
-      /*needPreviousMatrices*/ (hints & UpdateStageInfoRender::RENDER_MOTION_VECS) != 0, flt, texCtx));
-  // To consider: pre-sort partially here to make final sort faster?
+  g_entity_mgr->broadcastEventImmediate(AnimcharRenderAsyncEvent(dynCtx, &mainCtx->globalVarsState, occlusion, *frustum, add_vis_bits,
+    require_any_vis_bits, reject_if_any_vis_bits, filterMask,
+    /*needPreviousMatrices*/ (hints & UpdateStageInfoRender::RENDER_MOTION_VECS) != 0, flt, texCtx));
   if (interlocked_decrement(mainCtx->jobsLeft) == 0) // Last one finalizes to 0th
   {
     for (int n = 1; n < AnimcharRenderAsyncFilter::ARF_IDX_COUNT; n++)
-      mainCtx->jobs[0].dstate->addStateFrom(eastl::move(*mainCtx->jobs[n].dstate));
-    mainCtx->jobs[0].dstate->prepareForRender();
+      dynrend::merge_context(mainCtx->jobs[0].dynCtx, mainCtx->jobs[n].dynCtx);
+    dynrend::prepare_render_finalize(mainCtx->jobs[0].dynCtx);
   }
 }

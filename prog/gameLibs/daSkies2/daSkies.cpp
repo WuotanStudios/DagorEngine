@@ -13,7 +13,7 @@
 #include <drv/3d/dag_texture.h>
 #include <drv/3d/dag_tex3d.h>
 #include <drv/3d/dag_driver.h>
-#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_commands.h>
 #include <util/dag_simpleString.h>
 #include <math/dag_Point3.h>
@@ -28,7 +28,6 @@
 #include <shaders/dag_shaderBlock.h>
 #include <render/noiseTex.h>
 #include "daStars.h"
-#include <render/fx/auroraBorealis.h>
 #include "star_rendering_consts.hlsli"
 
 #include <gameRes/dag_gameResSystem.h>
@@ -36,6 +35,11 @@
 #include <math/dag_mathUtils.h>
 #include <math/dag_frustum.h>
 #include <3d/dag_textureIDHolder.h>
+#include <util/dag_convar.h>
+
+#if DAGOR_DBGLEVEL > 0
+#include <imgui/imgui.h>
+#endif
 
 #define USE_CONSOLE_BOOL_VAL         CONSOLE_BOOL_VAL
 #define USE_CONSOLE_INT_VAL          CONSOLE_INT_VAL
@@ -44,38 +48,47 @@
 
 #include "skiesData.h"
 #include "clouds2.h"
+#include "cloudsShaderVars.h"
 static uint32_t noAlphaHdrFmt = TEXFMT_R11G11B10F;
 static uint32_t noAlphaSkyHdrFmt = TEXFMT_R11G11B10F;
 
-#define GLOBAL_VARS_LIST                    \
-  VAR(render_sun, false)                    \
-  VAR(skies_have_two_suns, true)            \
-  VAR(skies_moon_info, true)                \
-  VAR(skies_moon_dir, true)                 \
-  VAR(skies_moon_color, true)               \
-  VAR(real_skies_sun_light_dir, false)      \
-  VAR(real_skies_sun_color, false)          \
-  VAR(light_shadow_dir, true)               \
-  VAR(skies_primary_sun_light_dir, false)   \
-  VAR(skies_secondary_sun_light_dir, false) \
-  VAR(skies_primary_sun_color, false)       \
-  VAR(skies_secondary_sun_color, false)     \
-  VAR(skies_world_view_pos, false)          \
-  VAR(strata_clouds_altitude, false)        \
-  VAR(strata_clouds_effect, false)          \
-  VAR(strata_tc_scale, false)               \
-  VAR(strata_pos_x, false)                  \
-  VAR(strata_pos_z, false)                  \
-  VAR(skies_use_2d_shadows, true)           \
-  VAR(lowres_sky, true)                     \
-  VAR(sky_sphere_scale, true)               \
-  VAR(sky_sphere_sphere_pos, true)          \
+#define GLOBAL_VARS_LIST                      \
+  VAR(solid_color, false)                     \
+  VAR(render_sun, false)                      \
+  VAR(skies_have_two_suns, true)              \
+  VAR(skies_moon_info, true)                  \
+  VAR(skies_moon_dir, true)                   \
+  VAR(skies_moon_color, true)                 \
+  VAR(real_skies_sun_light_dir, false)        \
+  VAR(real_skies_sun_color, false)            \
+  VAR(light_shadow_dir, true)                 \
+  VAR(skies_primary_sun_light_dir, false)     \
+  VAR(skies_secondary_sun_light_dir, false)   \
+  VAR(skies_primary_sun_color, false)         \
+  VAR(skies_secondary_sun_color, false)       \
+  VAR(skies_world_view_pos, false)            \
+  VAR(strata_clouds_altitude, false)          \
+  VAR(strata_clouds_effect, false)            \
+  VAR(strata_tc_scale, false)                 \
+  VAR(strata_pos_x, false)                    \
+  VAR(strata_pos_z, false)                    \
+  VAR(lowres_sky, true)                       \
+  VAR(sky_sphere_scale, true)                 \
+  VAR(sky_sphere_sphere_pos, true)            \
+  VAR(sky_polarization_filter_strength, true) \
+  VAR(clouds_erosion_flow_warp, true)         \
+  VAR(clouds_erosion_flow_height_bias, true)  \
+  VAR(clouds_erosion_flow_edge_bias, true)    \
+  VAR(clouds_erosion_flow_curl_size, true)    \
+  VAR(clouds_erosion_shear, true)             \
   VAR(skies_has_clouds, false)
 // VAR(infinite_skies)
 
 #define VAR(a, opt) static ShaderVariableInfo a##VarId;
 GLOBAL_VARS_LIST
 #undef VAR
+
+CONSOLE_BOOL_VAL("clouds", disable_cloud_render, false);
 
 static bool clouds_frustum_check(const Point3 &pos, const TMatrix &view_tm, const TMatrix4 &proj_tm, float earthRadius,
   float bottom_border, float top_border)
@@ -124,21 +137,51 @@ void DaSkies::updateCloudsOrigin()
                                                                                                                          // fixme
     // clouds->setWindAltGradient(-windDirX, -windDirZ.0);
   }
-  ShaderGlobal::set_real(strata_pos_xVarId, -cloudsOrigin.strataX);
-  ShaderGlobal::set_real(strata_pos_zVarId, -cloudsOrigin.strataZ);
+  ShaderGlobal::set_float(strata_pos_xVarId, -cloudsOrigin.strataX);
+  ShaderGlobal::set_float(strata_pos_zVarId, -cloudsOrigin.strataZ);
 }
 
 void DaSkies::setSkyParams(const SkyAtmosphereParams &params)
 {
   if (skyParams != params)
   {
-    if (clouds && skyParams.planet_scale != params.planet_scale)
-      clouds->invalidateAll();
+    ShaderGlobal::set_float(sky_polarization_filter_strengthVarId, clamp(params.polarization_strength, 0.f, 0.5f));
+    // the polarizer is a render-time shader var, not a scattering input: strength alone
+    // re-bakes the panorama only (the LUT sky path reads the var live), LUTs stay valid
+    SkyAtmosphereParams scatteringInputs = params;
+    scatteringInputs.polarization_strength = skyParams.polarization_strength;
+    if (skyParams == scatteringInputs)
+    {
+      skyParams = params;
+      invalidatePanorama();
+      return;
+    }
+    if (clouds)
+    {
+      if (skyParams.planet_scale != params.planet_scale)
+        clouds->invalidateAll();
+      else
+        clouds->invalidateLight();
+    }
     skyParams = params;
     skies.setParams(skyParams);
+    invalidateRequests();
     moon_check_ht = 15000 * skyParams.planet_scale * skyParams.atmosphere_scale;
     nextScatteringGeneration++;
   }
+}
+
+void DaSkies::setCloudsTurbulence(const CloudsTurbulence &v)
+{
+  if (cloudsTurbulence == v)
+    return;
+  cloudsTurbulence = v;
+  // plain sample-time shader vars: no invalidation needed, panorama and screen pick them up next trace
+  ShaderGlobal::set_float(clouds_erosion_flow_warpVarId, v.warp);
+  ShaderGlobal::set_float(clouds_erosion_flow_height_biasVarId, v.height_bias);
+  ShaderGlobal::set_float(clouds_erosion_flow_edge_biasVarId, v.edge_bias);
+  ShaderGlobal::set_float(clouds_erosion_flow_curl_sizeVarId, v.curl_size);
+  ShaderGlobal::set_float(clouds_erosion_shearVarId, v.shear);
 }
 
 float DaSkies::getHazeStrength() const
@@ -184,7 +227,34 @@ bool DaSkies::isPrepareRequired() const { return clouds && clouds->isPrepareRequ
 
 bool DaSkies::isCloudsReady() const { return clouds && clouds->isReady(); }
 
-void DaSkies::prepare(const Point3 &dir_to_sun, bool force_update, float dt)
+bool DaSkies::isLightingConverged() const
+{
+  if (cpuOnly)
+    return true;
+  if (!isScatteringReady())
+    return false;
+  if (clouds && !clouds->isLightingConverged())
+    return false;
+  return !panoramaEnabled() || isPanoramaValid();
+}
+
+void DaSkies::logLightingConvergence()
+{
+  static const bool enabled = ::dgs_get_settings()->getBlockByNameEx("debug")->getBool("logRenderConvergence", false);
+  if (!enabled)
+    return;
+  const bool converged = isLightingConverged();
+  if (converged && !loggedLightingConverged)
+    debug("[convergence] skiesLighting");
+  loggedLightingConverged = converged;
+}
+
+bool DaSkies::isScatteringReady() const
+{
+  return (computedScatteringGeneration == nextScatteringGeneration) && !skies.isGPUReadbackPending();
+}
+
+void DaSkies::prepare(const Point3 &dir_to_sun, float dt)
 {
   prepareFrame++;
   real_skies_sun_light_dir = normalize(dpoint3(dir_to_sun));
@@ -195,14 +265,55 @@ void DaSkies::prepare(const Point3 &dir_to_sun, bool force_update, float dt)
     clouds->setWeatherGen(cloudsWeatherGen);
     clouds->setCloudsForm(cloudsForm);
     clouds->setCloudsRendering(cloudsRendering);
-    clouds->update(dt);
+    clouds->setTraceCheckerboard(cloudsCheckerboardTrace);
+    clouds->update(dt, windDir);
     if (skies.setStatisticalCloudsInfo(cloudsRendering.ms_contribution, cloudsRendering.ms_attenuation, clouds->minimalStartAlt(),
           clouds->maximumTopAlt(), clouds->getCloudsShadowCoverage(), clouds_sigma_from_extinction(cloudsForm.extinction)))
       nextScatteringGeneration++;
   }
 
+  // cloud droplet aerosol (mie3): asymmetric haze lobe under each layer deck plus a
+  // ground slab while raining, derived per cloud; a change re-bakes
+  // the small transmittance/MS/irradiance LUTs via the scattering generation.
+  // parameter-only: kept outside the renderer guard so CPU-only (dedicated server)
+  // instances derive the same atmosphere as rendering clients
+  {
+    const float rainAmt = clamp(cloudsWeatherGen.cumulonimbusCoverage, 0.f, 1.f);
+    const float epicAmt = clamp(cloudsWeatherGen.epicness, 0.f, 1.f);
+    // clouds altitudes are world-frame; the atmosphere medium lives at
+    // altitude = world_y - min_ground_offset
+    const float groundOffsetKm = skyParams.min_ground_offset * 0.001f;
+    Point4 aerosol[2];
+    for (int i = 0; i < 2; ++i)
+    {
+      const auto &l = cloudsForm.layers[i];
+      const float cov = clamp(cloudsWeatherGen.layers[i].coverage, 0.f, 1.f);
+      const float aerosolness = i == 0 ? cloudsRendering.layer0_aerosolness : cloudsRendering.layer1_aerosolness;
+      // cumulonimbus and epic clouds generate the layer-0 weather channel independently
+      // of its coverage (gen_weather), so they must feed its deck lobe too; density 0.5
+      // is the epicness target in the weather gen
+      const float covDens = i == 0 ? max(cov * l.density, max(rainAmt, 0.5f * epicAmt)) : cov * l.density;
+      const float amp = cloudsRendering.cloudAerosolDropletsMieStrength * aerosolness * covDens * (1.f + 2.f * rainAmt);
+      // 0.15 km floors: the LUT integrators place dedicated in-band steps and resolve
+      // any width, but froxel/sky-view marches still sample the lobes uniformly
+      const float reachBelow = max(cloudsRendering.aerosol_reach_below_km, 0.15f);
+      // the visible deck forms about a third up the envelope: bottom rounding and
+      // erosion carve the layer bottom, so anchoring at startAt hangs haze in clear air
+      const float deckAlt = max(l.startAt + 0.33f * l.thickness - groundOffsetKm, 0.f);
+      // rain widens the haze to the ground; never narrower than the dry reach (low decks)
+      const float invBelow = lerp(1.f / reachBelow, 1.f / max(max(deckAlt, 0.1f), reachBelow), rainAmt);
+      // thin overshoot above the deck, always thinner than the sub-cloud reach
+      const float invAbove = 1.f / max(min(0.2f + 0.1f * l.thickness, 0.5f * reachBelow), 0.15f);
+      // canonical form when the lobe is off: a moving deck must not re-bake the LUTs
+      aerosol[i] = amp > 0.f ? Point4(amp, deckAlt, invBelow, invAbove) : Point4(0, 0, 1, 1);
+    }
+    const float rainSlab = cloudsRendering.cloudAerosolDropletsMieStrength * cloudsRendering.cumulonimbus_aerosolness * rainAmt;
+    if (skies.setCloudAerosolInfo(aerosol[0], aerosol[1], Point2(rainSlab, 1.f)))
+      nextScatteringGeneration++;
+  }
+
   shrinkRequests();
-  prepareSkies(force_update);
+  prepareSkies();
   if (skies.updateColors())
     invalidateRequests();
 
@@ -231,41 +342,41 @@ void DaSkies::prepare(const Point3 &dir_to_sun, bool force_update, float dt)
     eastl::swap(primarySunColor, secondarySunColor);
     eastl::swap(primarySunEffect, secondarySunEffect);
   }
-  ShaderGlobal::set_color4(skies_primary_sun_light_dirVarId, primarySunDir.x, primarySunDir.z, primarySunDir.y, 0);
-  ShaderGlobal::set_color4(skies_secondary_sun_light_dirVarId, secondarySunDir.x, secondarySunDir.z, secondarySunDir.y, 0);
-  ShaderGlobal::set_color4(skies_primary_sun_colorVarId, color4(primarySunColor, primarySunEffect));
-  ShaderGlobal::set_color4(skies_secondary_sun_colorVarId, color4(secondarySunColor, secondarySunEffect));
+  ShaderGlobal::set_float4(skies_primary_sun_light_dirVarId, primarySunDir.x, primarySunDir.z, primarySunDir.y, 0);
+  ShaderGlobal::set_float4(skies_secondary_sun_light_dirVarId, secondarySunDir.x, secondarySunDir.z, secondarySunDir.y, 0);
+  ShaderGlobal::set_float4(skies_primary_sun_colorVarId, color4(primarySunColor, primarySunEffect));
+  ShaderGlobal::set_float4(skies_secondary_sun_colorVarId, color4(secondarySunColor, secondarySunEffect));
 
   ShaderGlobal::set_int(skies_have_two_sunsVarId, brightness(secondarySunColor) > 0);
 
-  ShaderGlobal::set_color4(real_skies_sun_light_dirVarId, real_skies_sun_light_dir.x, real_skies_sun_light_dir.z,
+  ShaderGlobal::set_float4(real_skies_sun_light_dirVarId, real_skies_sun_light_dir.x, real_skies_sun_light_dir.z,
     real_skies_sun_light_dir.y, 0);
-  ShaderGlobal::set_color4(skies_moon_dirVarId, moonDir.x, moonDir.z, moonDir.y, 0);
-  ShaderGlobal::set_color4(real_skies_sun_colorVarId, color4(skies.getBaseSunColor(), 0));
+  ShaderGlobal::set_float4(skies_moon_dirVarId, moonDir.x, moonDir.z, moonDir.y, 0);
+  ShaderGlobal::set_float4(real_skies_sun_colorVarId, color4(skies.getBaseSunColor(), 0));
 
-  ShaderGlobal::set_color4(skies_moon_infoVarId, moonEffect, moonAgeEffect, (moonAgeEffect * 2.0f / 3.0f + 1.0f / 3.0f), 0);
+  ShaderGlobal::set_float4(skies_moon_infoVarId, moonEffect, moonAgeEffect, (moonAgeEffect * 2.0f / 3.0f + 1.0f / 3.0f), 0);
 
   if (clouds)
   {
-    if (uint32_t(clouds->prepareLighting(getPrimarySunDir(), getSecondarySunDir())) & CLOUDS_INVALIDATED)
+    if (uint32_t(clouds->prepareLighting(getPrimarySunDir(), getSecondarySunDir(), isScatteringReady(), cloudsCameraXZ)) &
+        CLOUDS_INVALIDATED)
     {
       cloudsGeneration++;
       invalidatePanorama(true);
     }
-    ShaderGlobal::set_color4(light_shadow_dirVarId, P3D(getPrimarySunDir()), 0); // we set it always, even if prepareLighting hasn't
+
+    ShaderGlobal::set_float4(light_shadow_dirVarId, P3D(getPrimarySunDir()), 0); // we set it always, even if prepareLighting hasn't
                                                                                  // done anything
   }
   ShaderGlobal::set_int(skies_has_cloudsVarId, !!clouds); // todo: only if there are enough clouds in the skies. todo: // gpu readback
                                                           // of filled layers
+  logLightingConvergence();
 }
 
-void DaSkies::projectUses2DShadows(bool on)
+void DaSkies::resetCloudsShadows()
 {
-  if (cpuOnly)
-    return;
-  ShaderGlobal::set_int(skies_use_2d_shadowsVarId, 1);
   if (clouds)
-    clouds->setUseShadows2D(on);
+    clouds->resetCloudsShadows();
 }
 
 void DaSkies::setStrataClouds(const StrataClouds &a)
@@ -278,26 +389,41 @@ void DaSkies::setStrataClouds(const StrataClouds &a)
 
 void DaSkies::setStrataCloudsTexture(const char *tex_name)
 {
-  if (!tex_name)
+  if (cpuOnly)
     return;
+  static String lastTexName;
+  if (!lastTexName.empty() && tex_name && strcmp(lastTexName.c_str(), tex_name) == 0)
+    return;
+
+  if (!tex_name)
+  {
+    strataClouds.close();
+    return;
+  }
 
   strataClouds.close();
   strataClouds = dag::get_tex_gameres(tex_name, "strata_clouds");
   prefetch_managed_texture(strataClouds.getTexId());
   strataClouds.setVar();
-  ShaderGlobal::set_sampler(::get_shader_variable_id("strata_clouds_samplerstate"), d3d::request_sampler({}));
+  lastTexName = tex_name;
 }
 
-void DaSkies::renderStrataClouds(const Point3 &origin, const TMatrix &view_tm, const TMatrix4 &proj_tm, bool panorama)
+void DaSkies::setStrataCloudsVars() const
+{
+  if (!strataClouds)
+    return;
+  ShaderGlobal::set_float(strata_clouds_effectVarId, strataCloudsParams.amount);
+  ShaderGlobal::set_float(strata_clouds_altitudeVarId, strataCloudsParams.altitude);
+  strataClouds.setVar();
+}
+
+void DaSkies::renderStrataClouds(const Point3 &origin, const TMatrix &view_tm, const TMatrix4 &proj_tm)
 {
   if (!strataClouds || !shouldRenderStrata)
     return;
-  ShaderGlobal::set_real(strata_clouds_effectVarId, strataCloudsParams.amount);
+
+  setStrataCloudsVars();
   if (strataCloudsParams.amount < 0.0001f || origin.y >= strataCloudsParams.altitude * 1000)
-    return;
-  ShaderGlobal::set_real(strata_clouds_altitudeVarId, strataCloudsParams.altitude);
-  strataClouds.setVar();
-  if (panorama)
     return;
 
   TIME_D3D_PROFILE(strata_clouds);
@@ -308,7 +434,7 @@ void DaSkies::renderStrataClouds(const Point3 &origin, const TMatrix &view_tm, c
 
 void DaSkies::destroy_skies_data(SkiesData *&data) { del_it(data); }
 
-IPoint2 DaSkies::getCloudsResolution(SkiesData *data)
+IPoint2 DaSkies::getCloudsResolution(const SkiesData *data)
 {
   if (clouds)
     return clouds->getResolution(data->clouds);
@@ -322,8 +448,27 @@ void DaSkies::skiesDataScatteringVolumeBarriers(SkiesData *data)
   d3d::resource_barrier({data->baseSkies->scatteringVolume[1].getVolTex(), RB_RO_SRV | RB_STAGE_PIXEL | RB_STAGE_COMPUTE, 0, 0});
 }
 
+#if DAGOR_DBGLEVEL > 0
+void DaSkies::overrideSkiesDataCloudsUseCompute(SkiesData *data, bool use_compute)
+{
+  if (!data)
+    return;
+  data->clouds.useCompute = use_compute;
+  data->clouds.taaUseCompute = use_compute;
+}
+#endif
+
+bool DaSkies::canCheckerboardTrace()
+{
+  // shares the renderer's checkerCompiled gate, or the caller would size the
+  // clouds target for a trace mode that never engages; SM < 5 is the only
+  // release path that drops the compute trace the checkerboard needs
+  return d3d::get_driver_desc().shaderModel >= 5.0_sm && clouds_checkerboard_compiled();
+}
+
 void DaSkies::changeSkiesData(int sky_detail_level, int clouds_detail_level, bool fly_through_clouds, int targetW, int targetH,
-  SkiesData *data, CloudsResolution clouds_resolution, bool use_blurred_clouds)
+  SkiesData *data, CloudsResolution clouds_resolution, bool use_blurred_clouds, bool ignore_panorama_state,
+  const IPoint2 &render_resolution)
 {
   if (cpuOnly)
     return;
@@ -331,7 +476,7 @@ void DaSkies::changeSkiesData(int sky_detail_level, int clouds_detail_level, boo
   if (!data)
     return;
   data->autoDetect = false;
-  if (panoramaEnabled())
+  if (!ignore_panorama_state && panoramaEnabled())
   {
     data->lowresSkies.close();
     data->clouds.close();
@@ -345,6 +490,12 @@ void DaSkies::changeSkiesData(int sky_detail_level, int clouds_detail_level, boo
 
   sky_detail_level = clamp(sky_detail_level, 0, 3);
   clouds_detail_level = clamp((int)clouds_detail_level, 0, 4);
+  const int divider = get_clouds_res_divider(clouds_detail_level);
+  G_ASSERT(divider > 0);
+
+  const bool wantsDynamicRes = render_resolution.x > 0 && render_resolution.y > 0 && divider > 0;
+  data->clouds.setUsedResolution(wantsDynamicRes ? render_resolution / divider : IPoint2::ZERO);
+
   if (data->tw == targetW && data->th == targetH && data->flyThrough == fly_through_clouds &&
       data->skyDetailLevel == sky_detail_level && data->cloudsDetailLevel == clouds_detail_level)
     return;
@@ -366,7 +517,7 @@ void DaSkies::changeSkiesData(int sky_detail_level, int clouds_detail_level, boo
   {
     int skyW = (targetW >> data->skyDetailLevel), skyH = (targetH >> data->skyDetailLevel);
     eastl::string name(eastl::string::CtorSprintf{}, "%s_lowres_sky", data->base_name.c_str());
-    data->lowresSkies = dag::create_tex(NULL, skyW, skyH, TEXCF_RTARGET | noAlphaSkyHdrFmt, 1, name.c_str());
+    data->lowresSkies = dag::create_tex(NULL, skyW, skyH, TEXCF_RTARGET | noAlphaSkyHdrFmt, 1, name.c_str(), RESTAG_DASKIES2);
     {
       d3d::SamplerInfo smpInfo;
       smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
@@ -375,11 +526,8 @@ void DaSkies::changeSkiesData(int sky_detail_level, int clouds_detail_level, boo
   }
 
   data->cloudsDetailLevel = clouds_detail_level;
-  // clouds_detail_level: 3, 4 -- mobile low quality
-  const int divider = clouds_detail_level >= 3 ? clouds_detail_level : (1 << clouds_detail_level);
-  // have to keep legacy behav because of config files
   if (clouds_detail_level > 0 || clouds_resolution == CloudsResolution::ForceFullresClouds)
-    data->clouds.init(targetW / divider, targetH / divider, data->base_name, fly_through_clouds, clouds_resolution,
+    data->clouds.init(IPoint2(targetW / divider, targetH / divider), data->base_name, fly_through_clouds, clouds_resolution,
       use_blurred_clouds);
   else
     data->clouds.close();
@@ -403,54 +551,23 @@ SkiesData *DaSkies::createSkiesData(const char *base_name, const PreparedSkiesPa
 
   SkiesData *data = new SkiesData(base_name, params);
   data->shouldRenderStars &= render_stars;
+  data->strataInLowres = params.strataInLowres;
   return data;
 }
 
-// cloudsDepth is supposed to be /2 of targetDepth
-// fixme: verify that!
-void DaSkies::prepareRenderClouds(bool infinite, const Point3 &origin, const TextureIDPair &cloudsDepth,
-  const TextureIDPair &prevCloudsDepth, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm, bool check_cloud_visibility,
-  const bool acquare_new_resource, const bool set_camera_vars)
+void DaSkies::prepareSkies()
 {
-  if (cpuOnly)
-    return;
-  if (!clouds)
-    return;
-  data->cloudsVisible =
-    (!check_cloud_visibility || clouds->hasVisibleClouds()) &&
-    clouds_frustum_check(origin, view_tm, proj_tm, skies.getEarthRadius(), clouds->effectiveStartAlt(), clouds->effectiveTopAlt());
-  if (data->cloudsVisible)
-    clouds->renderClouds(data->clouds, infinite ? TextureIDPair() : cloudsDepth, infinite ? TextureIDPair() : prevCloudsDepth, view_tm,
-      proj_tm, acquare_new_resource, set_camera_vars);
-}
-
-void DaSkies::renderCloudsToTarget(bool infinite, const Point3 &origin, const TextureIDPair &downsampledDepth, TEXTUREID targetDepth,
-  const Point4 &targetDepthTransform, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm)
-{
-  if (cpuOnly)
-    return;
-  if (!clouds)
-    return;
-
-  if (data->cloudsVisible)
-  {
-    ShaderGlobal::set_color4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
-    clouds->renderCloudsScreen(data->clouds, infinite ? TextureIDPair() : downsampledDepth, infinite ? BAD_TEXTUREID : targetDepth,
-      targetDepthTransform, view_tm, proj_tm);
-  }
-}
-
-void DaSkies::prepareSkies(bool invalidate_cpu)
-{
-  if (cpuOnly)
-    return;
-
   if (computedScatteringGeneration != nextScatteringGeneration)
   {
-    if (clouds)
-      clouds->setCloudsShadowCoverage();
-    skies.setParams(skyParams);
-    skies.precompute(invalidate_cpu); // todo: invalidate_cpu should be always true if we have invalidated skies
+    // cpuOnly skips only the GPU LUT rebuild; the request caches memoize CPU
+    // lookups and must still drop stale entries when scattering inputs change
+    if (!cpuOnly)
+    {
+      if (clouds)
+        clouds->setCloudsShadowCoverage();
+      skies.setParams(skyParams);
+      skies.precompute();
+    }
     computedScatteringGeneration = nextScatteringGeneration;
     invalidateRequests();
   }
@@ -463,11 +580,7 @@ void DaSkies::initCloudsRender(bool useHole)
   if (!clouds)
     clouds = new Clouds2;
   clouds->init(useHole);
-  strataClouds.close();
-  strataClouds = dag::get_tex_gameres("strata_clouds_simple", "strata_clouds");
-  prefetch_managed_texture(strataClouds.getTexId());
-  strataClouds.setVar();
-  ShaderGlobal::set_sampler(::get_shader_variable_id("strata_clouds_samplerstate"), d3d::request_sampler({}));
+  setStrataCloudsTexture("strata_clouds_simple");
 
   //==ddsx::tex_pack2_perform_delayed_data_loading();
 
@@ -486,11 +599,12 @@ void DaSkies::setNearCloudsRenderingEnabled(bool enabled)
   }
 }
 
-void DaSkies::renderCloudVolume(VolTexture *cloudVolume, float max_dist, const TMatrix &view_tm, const TMatrix4 &proj_tm)
+void DaSkies::renderCloudVolume(VolTexture *cloudVolume, TEXTUREID prevCloudVolume, float max_dist, const TMatrix &view_tm,
+  const TMatrix4 &proj_tm, const TMatrix4 &prev_glob_tm)
 {
-  if (cpuOnly || !clouds || !cloudVolume)
+  if (cpuOnly || !clouds || !cloudVolume || solidColorMode)
     return;
-  clouds->renderCloudVolume(cloudVolume, max_dist, view_tm, proj_tm);
+  clouds->renderCloudVolume(cloudVolume, prevCloudVolume, max_dist, view_tm, proj_tm, prev_glob_tm);
 }
 
 DaSkies::DaSkies(bool cpu_only) : cpuOnly(cpu_only), panoramaData(NULL), panoramaValid(PANORAMA_INVALID), shouldRenderStrata(true)
@@ -556,6 +670,7 @@ void DaSkies::initSky(int, uint32_t skyfmt, bool useHole)
   skyStars->init("stars", "moon");
   initCloudsTracer();
   initRainQuery();
+  applySolidColor.init("applySolidColor", true);
 }
 
 
@@ -622,79 +737,100 @@ bool DaSkies::isCloudsVisible(SkiesData *data) { return data->cloudsVisible; }
 
 void DaSkies::cloudsLayersHeightsBarrier() { clouds->layersHeightsBarrier(); }
 
-void DaSkies::prepareSkyAndClouds(bool infinite, const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon,
-  const ManagedTex &cloudsDepth, const ManagedTex &prevCloudsDepth, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm,
-  UpdateSky update_sky, bool fixed_offset, float altitude_tolerance, AuroraBorealis *aurora, const bool acquare_new_resource,
-  const bool set_camera_vars)
+void DaSkies::prepareSkyAndInfiniteClouds(const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon, SkiesData *data,
+  const TMatrix &view_tm, const TMatrix4 &proj_tm, UpdateSky update_sky, bool fixed_offset, float altitude_tolerance,
+  const CloudsRenderFlags flags)
 {
-  prepareSkyAndClouds(infinite, origin, dir, render_sun_moon, TextureIDPair(cloudsDepth.getTex2D(), cloudsDepth.getTexId()),
-    TextureIDPair(prevCloudsDepth.getTex2D(), prevCloudsDepth.getTexId()), data, view_tm, proj_tm, update_sky, fixed_offset,
-    altitude_tolerance, aurora, acquare_new_resource, set_camera_vars);
+  prepareSkyAndClouds(true, origin, dir, render_sun_moon, nullptr, nullptr, data, view_tm, proj_tm, update_sky, fixed_offset,
+    altitude_tolerance, flags);
 }
 
-void DaSkies::prepareSkyAndClouds(bool infinite, const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon,
-  const TextureIDPair &cloudsDepth, const TextureIDPair &prevCloudsDepth, SkiesData *data, const TMatrix &view_tm,
-  const TMatrix4 &proj_tm, UpdateSky update_sky, bool fixed_offset, float altitude_tolerance, AuroraBorealis *aurora,
-  const bool acquare_new_resource, const bool set_camera_vars)
+void DaSkies::prepareSky(const DPoint3 &origin, uint32_t render_sun_moon, SkiesData *data, const TMatrix &view_tm,
+  const TMatrix4 &proj_tm, UpdateSky update_sky, float altitude_tolerance, const CloudsRenderFlags flags)
 {
-  if (!data || cpuOnly)
+  if (!data || cpuOnly || solidColorMode)
     return;
 
-  /*frustum_check(
-    origin,
-    getCloudsTopBorder(),
-    getCloudsBottomBorder(),
-    strataCloudsParams.altitude,
-    data->shouldRenderClouds,
-    shouldRenderStrata );*/
-  // if (data->autoDetect && data->level )
-  // void DaSkies::changeSkiesData(int sky_level, uint32_t level, bool fly_through_clouds, int targetW, int targetH, SkiesData *data)
-
   TIME_D3D_PROFILE(prepareSky)
-  ShaderGlobal::set_color4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
+  ShaderGlobal::set_float4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
   useFog(origin, data, view_tm, proj_tm, update_sky, altitude_tolerance);
 
-  if (set_camera_vars)
+  if (check_clouds_render_flag(flags, CloudsRenderFlags::SetCameraVars))
     set_viewvecs_to_shader(view_tm, proj_tm);
 
   if (panoramaEnabled())
   {
-    if ((update_sky != UpdateSky::Off || panoramaValid == PANORAMA_INVALID) && updatePanorama(origin, view_tm, proj_tm))
+    if ((update_sky != UpdateSky::Off || panoramaValid == PANORAMA_INVALID) && updatePanorama(origin))
       useFog(origin, data, view_tm, proj_tm, UpdateSky::Off);
     clouds->setCloudsOffsetVars(data->clouds);
     return;
   }
-  if (update_sky != UpdateSky::Off)
-  {
-    data->renderSunMoon = render_sun_moon;
-    if (data->lowresSkies)
-    {
-      SCOPE_RENDER_TARGET;
-      ShaderGlobal::set_real(render_sunVarId, (data->renderSunMoon & 1) ? 1 : 0);
 
-      // #if 0
-      {
-        TIME_D3D_PROFILE(render_sky);
-        d3d::set_render_target(data->lowresSkies.getTex2D(), 0);
-        d3d::clearview(CLEAR_DISCARD_TARGET, 0, 0, 0);
-        skies.renderSky();
+  if (update_sky == UpdateSky::Off)
+    return;
 
-        if (aurora)
-        {
-          aurora->beforeRender();
-          aurora->render();
-        }
-      }
+  data->renderSunMoon = render_sun_moon;
+  if (!data->lowresSkies)
+    return;
 
-      renderStrataClouds(origin, view_tm, proj_tm, false);
+  SCOPE_RENDER_TARGET;
+  ShaderGlobal::set_float(render_sunVarId, (data->renderSunMoon & 1) ? 1 : 0);
 
-      d3d::resource_barrier({data->lowresSkies.getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
-    }
-    if (!fixed_offset)
-      data->clouds.update(dir, origin);
-    prepareRenderClouds(infinite, origin, cloudsDepth, prevCloudsDepth, data, view_tm, proj_tm,
-      update_sky == UpdateSky::OnWithoutCloudsVisibilityCheck, acquare_new_resource, set_camera_vars);
-  }
+  TIME_D3D_PROFILE(render_sky);
+  d3d::set_render_target({}, DepthAccess::RW, {{data->lowresSkies.getTex2D(), 0, 0}});
+  d3d::clearview(DISCARD_TARGET, 0, 0, 0);
+  skies.renderSky();
+
+  if (data->strataInLowres)
+    renderStrataClouds(origin, view_tm, proj_tm);
+
+  d3d::resource_barrier({data->lowresSkies.getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
+}
+
+void DaSkies::prepareClouds(bool can_be_inside_clouds, const DPoint3 &origin, const DPoint3 &dir, BaseTexture *clouds_depth,
+  BaseTexture *prev_clouds_depth, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm, UpdateSky update_sky,
+  bool fixed_offset, const CloudsRenderFlags flags)
+{
+  if (!data || cpuOnly || solidColorMode)
+    return;
+
+  if (panoramaEnabled())
+    return;
+
+  if (check_clouds_render_flag(flags, CloudsRenderFlags::SetCameraVars))
+    set_viewvecs_to_shader(view_tm, proj_tm);
+
+  if (!fixed_offset)
+    data->clouds.update(dir, origin);
+
+  if (!clouds)
+    return;
+
+  // the BSM window must follow the camera even when no cloud is on screen, and a
+  // teleport is learned here first - prepare() already ran on the previous origin,
+  // so catch the window up before this frame's receivers sample the map
+  cloudsCameraXZ = Point2(origin.x, origin.z);
+  clouds->ensureBSMWindow(cloudsCameraXZ, getPrimarySunDir());
+
+  const CheckCloudVisibility check_cloud_visibility =
+    (update_sky == UpdateSky::OnWithoutCloudsVisibilityCheck) ? CheckCloudVisibility::No : CheckCloudVisibility::Yes;
+
+  data->cloudsVisible =
+    !disable_cloud_render && clouds->isReady() && (check_cloud_visibility == CheckCloudVisibility::No || clouds->hasVisibleClouds()) &&
+    clouds_frustum_check(origin, view_tm, proj_tm, skies.getEarthRadius(), clouds->effectiveStartAlt(), clouds->effectiveTopAlt());
+
+  if (data->cloudsVisible)
+    clouds->renderCloudsPrepare(data->clouds, can_be_inside_clouds ? nullptr : clouds_depth,
+      can_be_inside_clouds ? nullptr : prev_clouds_depth, view_tm, proj_tm, flags);
+}
+
+void DaSkies::prepareSkyAndClouds(bool can_be_inside_clouds, const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon,
+  BaseTexture *clouds_depth, BaseTexture *prev_clouds_depth, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm,
+  UpdateSky update_sky, bool fixed_offset, float altitude_tolerance, const CloudsRenderFlags flags)
+{
+  prepareSky(origin, render_sun_moon, data, view_tm, proj_tm, update_sky, altitude_tolerance, flags);
+  prepareClouds(can_be_inside_clouds, origin, dir, clouds_depth, prev_clouds_depth, data, view_tm, proj_tm, update_sky, fixed_offset,
+    flags);
 }
 
 // if panorama is enabled we use just it for all types of render
@@ -705,7 +841,14 @@ void DaSkies::prepareSkyAndClouds(bool infinite, const DPoint3 &origin, const DP
 //  if ever needed to be restored, add && panoramaData == data to expression
 
 void DaSkies::renderSky(SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm, const Driver3dPerspective &persp,
-  RenderPrepared render_prepared, const SphereRenderer *sphere_renderer, AuroraBorealis *aurora)
+  RenderPrepared render_prepared, const SphereRenderer *sphere_renderer)
+{
+  renderSkyWithoutOverlay(data, view_tm, proj_tm, persp, render_prepared, sphere_renderer);
+  renderSkyOverlay(data, view_tm, proj_tm, persp, render_prepared);
+}
+
+void DaSkies::renderSkyWithoutOverlay(SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm,
+  const Driver3dPerspective &persp, RenderPrepared render_prepared, const SphereRenderer *sphere_renderer)
 {
   if (cpuOnly)
     return;
@@ -715,13 +858,17 @@ void DaSkies::renderSky(SkiesData *data, const TMatrix &view_tm, const TMatrix4 
     return;
 
   const Point3 &origin = data->preparedOrigin;
-  ShaderGlobal::set_color4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
+  ShaderGlobal::set_float4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
   useFog(origin, data, view_tm, proj_tm, UpdateSky::Off);
   set_viewvecs_to_shader(view_tm, proj_tm);
 
-  bool strataCloudsOverMoon = false;
-  ShaderGlobal::set_real(render_sunVarId, (data->renderSunMoon & 1) ? 1 : 0);
-  if (panoramaEnabled())
+  ShaderGlobal::set_float(render_sunVarId, (data->renderSunMoon & 1) ? 1 : 0);
+  if (solidColorMode)
+  {
+    ShaderGlobal::set_float4(solid_colorVarId, solidColor);
+    applySolidColor.render();
+  }
+  else if (panoramaEnabled())
   {
     G_ASSERT(panoramaValid != PANORAMA_INVALID);
     renderPanorama(origin, view_tm, proj_tm, persp);
@@ -735,17 +882,27 @@ void DaSkies::renderSky(SkiesData *data, const TMatrix &view_tm, const TMatrix4 
       sphere_renderer->render(skiesSphereApplyShader, view_tm);
     }
     else
-    {
       skiesApply.render();
-    }
   }
   else
-  {
-    skies.renderSky(); //??
-    strataCloudsOverMoon = true;
-  }
+    skies.renderSky();
+}
 
+void DaSkies::renderSkyOverlay(SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm, const Driver3dPerspective &persp,
+  RenderPrepared render_prepared)
+{
+  if (cpuOnly || solidColorMode)
+    return;
+  TIME_D3D_PROFILE(renderSkyOverlay)
+  G_ASSERT_RETURN(data, );
+
+  const Point3 &origin = data->preparedOrigin;
+  ShaderGlobal::set_float4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
   useFog(origin, data, view_tm, proj_tm, UpdateSky::Off);
+  set_viewvecs_to_shader(view_tm, proj_tm);
+  bool strataCloudsOverMoon =
+    !panoramaEnabled() && !(data->lowresSkies && data->strataInLowres && render_prepared != RenderPrepared::Off);
+
   if (canRenderStars())
   {
     const float sunHighBrightness = brightness(getCpuSunSky(Point3(0, moon_check_ht, 0), real_skies_sun_light_dir));
@@ -764,15 +921,10 @@ void DaSkies::renderSky(SkiesData *data, const TMatrix &view_tm, const TMatrix4 
     }
     if (data->renderSunMoon & 2)
       skyStars->renderMoon(origin, moonDir, moonAge, sunHighBrightness);
-    if (aurora)
-    {
-      aurora->beforeRender();
-      aurora->render();
-    }
   }
 
   if (strataCloudsOverMoon)
-    renderStrataClouds(origin, view_tm, proj_tm, false);
+    renderStrataClouds(origin, view_tm, proj_tm);
 }
 
 void DaSkies::renderStars(const Driver3dPerspective &persp, const Point3 &origin, float stars_intensity_mul)
@@ -782,17 +934,10 @@ void DaSkies::renderStars(const Driver3dPerspective &persp, const Point3 &origin
     skyStars->renderStars(persp, 0, starsLatitude, starsLongtitude, starsJulianDay, initialAzimuthAngle, stars_intensity_mul);
 }
 
-void DaSkies::renderClouds(bool infinite, const ManagedTex &cloudsDepth, TEXTUREID targetDepth, SkiesData *data,
-  const TMatrix &view_tm, const TMatrix4 &proj_tm, const Point4 &targetDepthTransform)
+void DaSkies::renderCloudsToTarget(bool can_be_inside_clouds, BaseTexture *downsampledDepth, BaseTexture *targetDepth, SkiesData *data,
+  const TMatrix &view_tm, const TMatrix4 &proj_tm, const Point4 &targetDepthTransform, const CloudsRenderFlags flags)
 {
-  renderClouds(infinite, TextureIDPair{cloudsDepth.getTex2D(), cloudsDepth.getTexId()}, targetDepth, data, view_tm, proj_tm,
-    targetDepthTransform);
-}
-
-void DaSkies::renderClouds(bool infinite, const TextureIDPair &downsampledDepth, TEXTUREID targetDepth, SkiesData *data,
-  const TMatrix &view_tm, const TMatrix4 &proj_tm, const Point4 &targetDepthTransform)
-{
-  if (cpuOnly || panoramaEnabled() || !data || !clouds)
+  if (cpuOnly || panoramaEnabled() || !data || !clouds || solidColorMode)
     return;
   if (!data->cloudsVisible)
     return;
@@ -800,51 +945,65 @@ void DaSkies::renderClouds(bool infinite, const TextureIDPair &downsampledDepth,
   set_viewvecs_to_shader(view_tm, proj_tm);
 
   const Point3 origin = data->preparedOrigin;
-  ShaderGlobal::set_color4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
+  ShaderGlobal::set_float4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
   useFog(origin, data, view_tm, proj_tm, UpdateSky::Off);
-  renderCloudsToTarget(infinite, origin, downsampledDepth, targetDepth, targetDepthTransform, data, view_tm, proj_tm);
+  if (data->cloudsVisible)
+  {
+    ShaderGlobal::set_float4(skies_world_view_posVarId, origin.x, origin.y, origin.z, 0);
+    clouds->renderCloudsApply(data->clouds, can_be_inside_clouds ? nullptr : downsampledDepth,
+      can_be_inside_clouds ? nullptr : targetDepth, targetDepthTransform, view_tm, proj_tm, flags);
+  }
 }
 
-void DaSkies::renderEnvi(bool infinite, const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon,
-  const ManagedTex &cloudsDepth, const ManagedTex &prevCloudsDepth, TEXTUREID targetDepth, SkiesData *data, const TMatrix &view_tm,
+void DaSkies::renderEnvi(bool can_be_inside_clouds, const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon,
+  const ManagedTex &cloudsDepth, const ManagedTex &prevCloudsDepth, BaseTexture *targetDepth, SkiesData *data, const TMatrix &view_tm,
   const TMatrix4 &proj_tm, const Driver3dPerspective &persp, UpdateSky update_sky, bool fixed_offset, float altitude_tolerance,
-  AuroraBorealis *aurora)
+  const CloudsRenderFlags flags)
 {
   if (cpuOnly)
     return;
   G_ASSERT(data);
   TIME_D3D_PROFILE(envi)
-  prepareSkyAndClouds(infinite, origin, dir, render_sun_moon, TextureIDPair(cloudsDepth.getTex2D(), cloudsDepth.getTexId()),
-    TextureIDPair(prevCloudsDepth.getTex2D(), prevCloudsDepth.getTexId()), data, view_tm, proj_tm, update_sky, fixed_offset,
-    altitude_tolerance, aurora);
+  prepareSkyAndClouds(can_be_inside_clouds, origin, dir, render_sun_moon, cloudsDepth.getTex2D(), prevCloudsDepth.getTex2D(), data,
+    view_tm, proj_tm, update_sky, fixed_offset, altitude_tolerance, flags);
 
-  renderSky(data, view_tm, proj_tm, persp, RenderPrepared::LowresOnFarPlane, nullptr, aurora);
-  renderClouds(infinite, TextureIDPair(cloudsDepth.getTex2D(), cloudsDepth.getTexId()), targetDepth, data, view_tm, proj_tm);
+  bool prevSolidColorMode = solidColorMode;
+  solidColorMode = false;
+  renderSky(data, view_tm, proj_tm, persp, RenderPrepared::LowresOnFarPlane, nullptr);
+  renderCloudsToTarget(can_be_inside_clouds, cloudsDepth.getTex2D(), targetDepth, data, view_tm, proj_tm, Point4(1, 1, 0, 0), flags);
+  solidColorMode = prevSolidColorMode;
 }
 
 void DaSkies::reset()
 {
   invalidate();
+
+  // reset any pending readback
+  cloudsTraceResultRingBuffer.reset();
+  cloudsTracesInFlight.clear();
+  rainQueryResultRingBuffer.reset();
+
   if (clouds)
     clouds->reset();
   if (skyStars)
     skyStars->afterReset();
   ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
-  prepare(getSunDir(), false, 0.f);
+  prepare(getSunDir(), 0.f);
 }
 
 void DaSkies::invalidate()
 {
   nextScatteringGeneration++;
-  clouds->invalidateAll();
+  if (clouds)
+    clouds->invalidateAll();
   invalidatePanorama(true);
 }
 
 /*void DaSkies::setSkiesRenderData(const Point3 &world_view_pos, const Point3 &sun_light_dir, const Color3 &sun_light_color)
 {
-  ShaderGlobal::set_color4(skies_world_view_posVarId, Color4::xyz1(world_view_pos));
-  ShaderGlobal::set_color4(skies_sun_light_dirVarId, Color4::xyz0(sun_light_dir));
-  ShaderGlobal::set_color4(skies_sun_colorVarId, color4(sun_light_color, 1.0f));
+  ShaderGlobal::set_float4(skies_world_view_posVarId, Color4::xyz1(world_view_pos));
+  ShaderGlobal::set_float4(skies_sun_light_dirVarId, Color4::xyz0(sun_light_dir));
+  ShaderGlobal::set_float4(skies_sun_colorVarId, color4(sun_light_color, 1.0f));
 }*/
 
 void DaSkies::renderCelestialObject(TEXTUREID tid, const Point3 &dir, float phase, float intensity, float size)
@@ -890,10 +1049,14 @@ Color3 DaSkies::getIrradiance(float ht, float mu) const
     return it->second;
   return (irradianceRequests[rq] = skies.getCpuIrradiance(ht, mu));
 }
-void DaSkies::setWindDirection(const Point2 &windDir)
+
+void DaSkies::setSolidColorMode(bool enabled, const E3DCOLOR &val)
 {
-  if (clouds)
-    clouds->setErosionNoiseWindDir(windDir);
+  if (solidColorMode == enabled)
+    return;
+  solidColorMode = enabled;
+  solidColor = val;
+  invalidate();
 }
 
 float DaSkies::getCloudsStartAlt() { return clouds ? clouds->effectiveStartAlt() * 1000.f : -1.f; }
@@ -934,6 +1097,29 @@ void DaSkies::setExternalWeatherTexture(TEXTUREID tid)
 {
   if (clouds)
     clouds->setExternalWeatherTexture(tid);
+}
+
+void DaSkies::initCloudsNBS(const char *root_graph)
+{
+  if (clouds)
+    clouds->initNBS(String(root_graph));
+}
+
+bool DaSkies::updateCloudsNBSShaders(const char *shader_name, const DataBlock &shader_blk, String &out_errors)
+{
+  return clouds ? clouds->updateNBSShaders(String(shader_name), shader_blk, out_errors) : false;
+}
+
+void DaSkies::enableCloudsNBSOptionalGraph(const char *graph_name, bool enable)
+{
+  if (clouds)
+    clouds->enableNBSOptionalGraph(String(graph_name), enable);
+}
+
+void DaSkies::closeCloudsNBS()
+{
+  if (clouds)
+    clouds->closeNBS();
 }
 
 // todo: implement on client
@@ -1011,20 +1197,17 @@ void DaSkies::dispatchCloudsTraces()
       if (traceCloudsCs)
       {
         int numThreadGroups = (dispatchSize - 1) / numCloudsTracesPerGroup + 1;
-        if (numThreadGroups > 1)
-          d3d::set_cs_constbuffer_size(8 + numThreadGroups * numCloudsTracesPerGroup * 2);
-        d3d::set_cs_const(8, &dispatchData[0], dispatchSize * 2);
+        // register must match rays[] in trace_clouds_cs
+        d3d::set_cs_const(12, &dispatchData[0], dispatchSize * 2);
         STATE_GUARD_NULLPTR(d3d::set_rwbuffer(STAGE_CS, 0, VALUE), (Sbuffer *)resultBuffer);
         traceCloudsCs->dispatch(numThreadGroups, 1, 1);
-        if (numThreadGroups > 1)
-          d3d::set_cs_constbuffer_size(0);
       }
       else
       {
         SCOPE_RENDER_TARGET;
         SCOPE_RESET_SHADER_BLOCKS;
         ScopeResetShaderBlocks savedBlocks;
-        d3d::set_render_target((Texture *)resultBuffer, 0);
+        d3d::set_render_target({}, DepthAccess::RW, {{(BaseTexture *)resultBuffer, 0, 0}});
         d3d::set_ps_const(15, &dispatchData[0], dispatchSize * 2);
         traceCloudsPs.render();
       }
@@ -1166,4 +1349,85 @@ void DaSkies::getCloudsTextureResourceDependencies(Tab<TEXTUREID> &dependencies)
   {
     clouds->getTextureResourceDependencies(dependencies);
   }
+}
+
+void DaSkies::debugUI()
+{
+#if DAGOR_DBGLEVEL > 0
+  ImGui::Text("Sky");
+  SkyAtmosphereParams sky = skyParams;
+  if (ImGui::SliderFloat("polarization_strength", &sky.polarization_strength, 0.0, 0.5))
+    setSkyParams(sky); // strength-only change takes the render-time fast path, no LUT re-bake
+
+  ImGui::Text("Clouds rendering");
+  ImGui::SliderFloat("forward_eccentricity", &cloudsRendering.forward_eccentricity, 0.1, 0.9999);
+  ImGui::SliderFloat("back_eccentricity", &cloudsRendering.back_eccentricity, 0.01, 0.9999);
+  ImGui::SliderFloat("forward_eccentricity_weight", &cloudsRendering.forward_eccentricity_weight, 0.0, 1.0);
+  ImGui::SliderFloat("erosion_noise_size", &cloudsRendering.erosion_noise_size, 1.0, 73);
+  ImGui::SliderFloat("erosionWindSpeed", &cloudsRendering.erosionWindSpeed, -100, 100);
+  ImGui::SliderFloat("ambient_desaturation", &cloudsRendering.ambient_desaturation, 0, 1);
+  ImGui::SliderFloat("ms_contribution", &cloudsRendering.ms_contribution, 0, 1);
+  ImGui::SliderFloat("ms_attenuation", &cloudsRendering.ms_attenuation, 0.02, 1.0);
+  ImGui::SliderFloat("ms_ecc_attenuation", &cloudsRendering.ms_ecc_attenuation, 0.02, 0.99);
+  ImGui::SliderFloat("droplet_diameter_um", &cloudsRendering.droplet_diameter_um, 5, 50);
+  ImGui::SliderFloat("edge_albedo", &cloudsRendering.edge_albedo, 0.5, 1.0);
+  ImGui::SliderFloat("edge_albedo_sharpness", &cloudsRendering.edge_albedo_sharpness, 0.5, 16);
+  ImGui::SliderFloat("taa_exposure_scale", &cloudsRendering.taa_exposure_scale, 0, 1.5);
+  ImGui::SliderFloat("layer0_aerosolness", &cloudsRendering.layer0_aerosolness, 0, 1.0);
+  ImGui::SliderFloat("layer1_aerosolness", &cloudsRendering.layer1_aerosolness, 0, 1.0);
+  ImGui::SliderFloat("cumulonimbus_aerosolness", &cloudsRendering.cumulonimbus_aerosolness, 0, 1.0);
+  ImGui::SliderFloat("cloudAerosolDropletsMieStrength", &cloudsRendering.cloudAerosolDropletsMieStrength, 0, 4.0);
+  ImGui::SliderFloat("aerosol_reach_below_km", &cloudsRendering.aerosol_reach_below_km, 0.05, 3.0);
+  ImGui::SliderInt("bsm_log2_amortize_frames", &cloudsRendering.bsm_log2_amortize_frames, 0, 6);
+  ImGui::SliderFloat("bsm_scattering_physicality", &cloudsRendering.bsm_scattering_physicality, 0, 1.0);
+  ImGui::SliderFloat("erosion_strength", &cloudsRendering.erosion_strength, 0, 0.6);
+  ImGui::SliderFloat("erosion_height_bias", &cloudsRendering.erosion_height_bias, 0, 1.0);
+  ImGui::SliderFloat("erosion_edge_mul", &cloudsRendering.erosion_edge_mul, 0, 8.0);
+  ImGui::SliderFloat("erosion_edge_add", &cloudsRendering.erosion_edge_add, 0, 1.0);
+
+  ImGui::Text("Clouds generation");
+  ImGui::SliderFloat("cumulonimbusCoverage", &cloudsWeatherGen.cumulonimbusCoverage, 0.0, 1.0);
+  ImGui::SliderFloat("cumulonimbusSeed", &cloudsWeatherGen.cumulonimbusSeed, 0.0, 100.0);
+  ImGui::SliderFloat("epicness", &cloudsWeatherGen.epicness, 0.0, 1.0);
+  ImGui::SliderFloat("layers[0].coverage", &cloudsWeatherGen.layers[0].coverage, 0.0, 1.0);
+  ImGui::SliderFloat("layers[0].freq", &cloudsWeatherGen.layers[0].freq, 1, 8);
+  ImGui::SliderFloat("layers[0].seed", &cloudsWeatherGen.layers[0].seed, 0, 100);
+  ImGui::SliderFloat("layers[1].coverage", &cloudsWeatherGen.layers[1].coverage, 0.0, 1.0);
+  ImGui::SliderFloat("layers[1].freq", &cloudsWeatherGen.layers[1].freq, 1, 8);
+  ImGui::SliderFloat("layers[1].seed", &cloudsWeatherGen.layers[1].seed, 0, 100);
+
+  ImGui::Text("Clouds formation");
+  ImGui::SliderInt("shapeNoiseScale", &cloudsForm.shapeNoiseScale, 2, 16);
+  ImGui::SliderInt("cumulonimbusShapeScale", &cloudsForm.cumulonimbusShapeScale, 2, 16);
+  ImGui::SliderInt("turbulenceFreq", &cloudsForm.turbulenceFreq, 1, 6);
+  ImGui::SliderFloat("turbulenceStrength", &cloudsForm.turbulenceStrength, 0., 2.0);
+  ImGui::SliderFloat("extinction", &cloudsForm.extinction, 0.5, 6.0);
+  ImGui::SliderFloat("layers[0].density", &cloudsForm.layers[0].density, 0.5, 2.0);
+  ImGui::SliderFloat("layers[0].startAt", &cloudsForm.layers[0].startAt, 0.02, 8.0);
+  ImGui::SliderFloat("layers[0].thickness", &cloudsForm.layers[0].thickness, 1.0, 10.0);
+  ImGui::SliderFloat("layers[0].clouds_type", &cloudsForm.layers[0].clouds_type, 0, 1.0);
+  ImGui::SliderFloat("layers[0].clouds_type_variance", &cloudsForm.layers[0].clouds_type_variance, 0, 1.0);
+  ImGui::SliderFloat("layers[1].density", &cloudsForm.layers[1].density, 0.5, 2.0);
+  ImGui::SliderFloat("layers[1].startAt", &cloudsForm.layers[1].startAt, 0.02, 10.0);
+  ImGui::SliderFloat("layers[1].thickness", &cloudsForm.layers[1].thickness, 1.0, 10.0);
+  ImGui::SliderFloat("layers[1].clouds_type", &cloudsForm.layers[1].clouds_type, 0, 1.0);
+  ImGui::SliderFloat("layers[1].clouds_type_variance", &cloudsForm.layers[1].clouds_type_variance, 0, 1.0);
+
+  ImGui::Text("Clouds shape");
+  bool changed = false;
+  changed = ImGui::SliderFloat("perlin_worley_dilation", &cloudsForm.perlin_worley_dilation, 0.0, 1.0);
+  changed |= ImGui::SliderFloat("worley_erosion", &cloudsForm.worley_erosion, 0.0, 2.0);
+  changed |= ImGui::SliderFloat("shape_gamma", &cloudsForm.shape_gamma, 0.0, 2.0);
+  if (changed)
+    clouds->reset();
+
+  ImGui::Text("Clouds turbulence");
+  CloudsTurbulence turbulence = cloudsTurbulence;
+  ImGui::SliderFloat("warp", &turbulence.warp, 0.0, 0.5);
+  ImGui::SliderFloat("height_bias", &turbulence.height_bias, 0.0, 1.0);
+  ImGui::SliderFloat("edge_bias", &turbulence.edge_bias, 0.0, 1.0);
+  ImGui::SliderFloat("curl_size", &turbulence.curl_size, 1.0, 8.0);
+  ImGui::SliderFloat("shear", &turbulence.shear, 0.0, 1.0);
+  setCloudsTurbulence(turbulence); // pushes the shader vars; early-outs when unchanged
+#endif
 }

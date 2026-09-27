@@ -10,7 +10,6 @@ class IBaseLoad;
 class IBaseSave;
 class ShaderMesh;
 class ShaderMaterial;
-class LandRayTracer;
 class EditorLandRayTracer;
 class MaterialData;
 class StaticGeometryTexture;
@@ -98,18 +97,18 @@ public:
   BBox3 getBBox(int x, int y, float *sphere_radius = NULL);
 
   dag::Span<landmesh::Cell> getCells() { return make_span(cells); }
-  EditorLandRayTracer *getEditorLandRayTracer() const { return editorLandTracer; }
-  LandRayTracer *getGameLandRayTracer() const { return gameLandTracer; }
+  EditorLandRayTracer *getEditorLandRayTracer(bool full) const { return editorLandTracer[full ? 1 : 0]; }
+  EditorLandRayTracer *getGameLandRayTracer() const { return gameLandTracer; }
 
-  void setEditorLandRayTracer(EditorLandRayTracer *lrt);
-  void setGameLandRayTracer(LandRayTracer *lrt);
+  void setEditorLandRayTracer(EditorLandRayTracer *lrt, bool full);
+  void setGameLandRayTracer(EditorLandRayTracer *lrt);
   MaterialData getMaterialData(uint32_t matNo) const;
 
   // traceRay
-  bool traceRay(const Point3 &p, const Point3 &dir, real &t, Point3 *normal) const;
+  bool traceRay(bool lmesh_only, const Point3 &p, const Point3 &dir, real &t, Point3 *normal) const;
 
   //! Get maximum height at point (and normal, if needed)
-  bool getHeight(const Point2 &p, real &ht, Point3 *normal) const;
+  bool getHeight(bool lmesh_only, const Point2 &p, real &ht, Point3 *normal) const;
 
   int addMaterial(StaticGeometryMaterial *material, bool *clipmap_only, bool *has_vertex_opacity, int node_layer = -1,
     bool *is_height_patch = NULL);
@@ -134,8 +133,8 @@ protected:
   IPoint2 size, origin;
   float cellSize;
   Point3 offset;
-  EditorLandRayTracer *editorLandTracer;
-  LandRayTracer *gameLandTracer;
+  EditorLandRayTracer *editorLandTracer[2] = {nullptr, nullptr};
+  EditorLandRayTracer *gameLandTracer = nullptr;
   PtrTab<StaticGeometryMaterial> materials;
   PtrTab<StaticGeometryTexture> textures;
 

@@ -1,0 +1,3 @@
+return {
+  EventAfterDeviceReset = class { name = "EventAfterDeviceReset" }
+}

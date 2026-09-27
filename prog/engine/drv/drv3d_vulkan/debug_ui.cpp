@@ -20,6 +20,8 @@
 #include "predicted_latency_waiter.h"
 #include "pipeline_barrier.h"
 #include "swapchain.h"
+#include "vk_to_string.h"
+#include "backend/cmd/debug.h"
 
 using namespace drv3d_vulkan;
 
@@ -118,7 +120,7 @@ void drawFrameHashesHistory()
     uint64_t currentHashes[GPU_TIMELINE_HISTORY_SIZE];
 
     Globals::timelines.get<TimelineManager::GpuExecute>().enumerate([&](size_t index, const FrameInfo &ctx) //
-      { currentHashes[index] = ctx.execTracker.getPrevJobHash(); });
+      { currentHashes[index] = ctx.execTracker().getPrevJobHash(); });
 
     for (uint64_t &itr : currentHashes)
       for (FrameHashHistoryEntry &cmp : frameHashesHistory)
@@ -347,7 +349,7 @@ void drv3d_vulkan::debug_ui_pipelines()
 #else
 
   if (ImGui::Button("Update"))
-    Globals::ctx.updateDebugUIPipelinesData();
+    Globals::ctx.dispatchCmd<CmdUpdateDebugUIPipelinesData>({});
 
   ImGui::SameLine();
   ImGui::SetNextItemWidth(250);
@@ -457,8 +459,10 @@ void drv3d_vulkan::debug_ui_pipelines()
       // See https://github.com/ocornut/imgui/issues/211#issuecomment-902751145
       if (ImGui::Checkbox(String(0, "##program%d", info.program.get()).c_str(), &info.enabled))
       {
-        Globals::ctx.setPipelineUsability(info.program, info.enabled);
-        Globals::ctx.updateDebugUIPipelinesData();
+        Globals::ctx.dispatchCmd<CmdUpdateDebugUIPipelinesData>({});
+#if VULKAN_ENABLE_DEBUG_FLUSHING_SUPPORT
+        Globals::ctx.dispatchCmd<CmdSetPipelineUsability>({info.program, info.enabled});
+#endif
       }
     }
 
@@ -502,6 +506,9 @@ void drv3d_vulkan::debug_ui_misc()
   if (ImGui::Button("Generate fault report"))
     Globals::ctx.generateFaultReportAtFrameEnd();
 
+  if (ImGui::Button("Simulate device lost"))
+    Backend::interop.deviceLost = true;
+
   ImGui::TextUnformatted(Globals::ctx.isWorkerRunning() ? "Execution: threaded" : "Execution: deferred");
 
   if (ImGui::Button("Switch execution mode"))
@@ -522,6 +529,34 @@ void drv3d_vulkan::debug_ui_misc()
 
 void drv3d_vulkan::debug_ui_swapchain()
 {
+  {
+    SwapchainMode mode = Frontend::swapchain.getMode();
+    ImGui::Text("surface: %016llX", (unsigned long long)generalize(mode.surfaceAndWindow.first));
+    ImGui::Text("window: %p", mode.surfaceAndWindow.second);
+    ImGui::Text("presentMode: %s", formatPresentMode(mode.presentMode));
+    ImGui::Text("display extent: %u x %u", mode.displayExtent.width, mode.displayExtent.height);
+    ImGui::Text("backbuffer extent: %u x %u", mode.backbufferExtent.width, mode.backbufferExtent.height);
+    ImGui::Text("format: %s", mode.format.getNameString());
+    ImGui::Text("extraBusyImages: %u", (unsigned)mode.extraBusyImages);
+    ImGui::Text("enableSrgb: %d", (int)mode.enableSrgb);
+    ImGui::Text("fullscreen: %d", (int)mode.fullscreen);
+    ImGui::Text("mutableFormat: %d", (int)mode.mutableFormat);
+    ImGui::Text("mismatchedExtents: %d", (int)mode.mismatchedExtents);
+    ImGui::Text("usesHdr: %d", (int)mode.usesHdr);
+    ImGui::Text("canUseHdr: %d", (int)mode.canUseHdr);
+    ImGui::Text("modifySource: %s", mode.modifySource ? mode.modifySource : "<null>");
+  }
+
+  bool beOnlyAcq = Frontend::swapchain.isBackendOnlyAcquire();
+  ImGui::Text("Backend only acquire: %s", beOnlyAcq ? "yes" : "no");
+  if (beOnlyAcq)
+    ImGui::Text("Presented ring size: <unavailable in backend only acquire mode>");
+  else
+    ImGui::Text("Presented ring size: %u", Frontend::swapchain.getPresentedRingSize());
+
+  if (ImGui::Button("Toggle backend only acquire"))
+    Frontend::swapchain.toggleBackendOnlyAcquire();
+
   if (ImGui::Button("Recreate"))
   {
     SwapchainMode newMode = Frontend::swapchain.getMode();
@@ -535,7 +570,8 @@ void drv3d_vulkan::debug_ui_swapchain()
     newMode.modifySource = "debug_ui_recreate_surface";
     newMode.setHeadless();
     Frontend::swapchain.setMode(newMode);
-    newMode.surface = init_window_surface(Globals::VK::inst);
+    newMode.surfaceAndWindow = {
+      init_window_surface(Globals::VK::inst, Globals::window.getMainWindow()), Globals::window.getMainWindow()};
     Frontend::swapchain.setMode(newMode);
   }
 
@@ -550,6 +586,20 @@ void drv3d_vulkan::debug_ui_swapchain()
   {
     SwapchainMode newMode = Frontend::swapchain.getMode();
     newMode.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    Frontend::swapchain.setMode(newMode);
+  }
+
+  if (ImGui::Button("Mode FIFO relaxed"))
+  {
+    SwapchainMode newMode = Frontend::swapchain.getMode();
+    newMode.presentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    Frontend::swapchain.setMode(newMode);
+  }
+
+  if (ImGui::Button("Mode MAILBOX"))
+  {
+    SwapchainMode newMode = Frontend::swapchain.getMode();
+    newMode.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
     Frontend::swapchain.setMode(newMode);
   }
 

@@ -37,14 +37,22 @@ uint32_t getPipelineSignificantAppVersion()
   return appVer;
 }
 
-void PipelineCacheFile::load(const char *path)
+static bool isPipelineCacheFileAllowed()
 {
   const DataBlock *cfgBlk = Globals::cfg.getPerDriverPropertyBlock("pipelineCompiler");
-  const bool allowPipelineCache = ::dgs_get_settings()->getBlockByNameEx("vulkan")->getBool("allowPipelineCache", true) &&
-                                  cfgBlk->getBool("allowPipelineCache", true);
+  return ::dgs_get_settings()->getBlockByNameEx("vulkan")->getBool("allowPipelineCache", true) &&
+         cfgBlk->getBool("allowPipelineCache", true);
+}
 
-  if (!allowPipelineCache)
+void PipelineCacheFile::load(const char *path)
+{
+  TIME_PROFILE(vulkan_load_pipeline_cache);
+
+  if (!isPipelineCacheFileAllowed())
+  {
+    debug("vulkan: pipeline cache file disabled, load skipped");
     return;
+  }
 
   const char *filePath = path ? path : getDataPath();
   if (!filePath || !*filePath)
@@ -264,6 +272,12 @@ public:
 
 void PipelineCacheFile::store()
 {
+  if (!isPipelineCacheFileAllowed())
+  {
+    debug("vulkan: pipeline cache file disabled, store skipped");
+    return;
+  }
+
   const char *path = getDataPath();
   if (!path || !*path)
     return;
@@ -365,7 +379,14 @@ void PipelineCacheFile::storeCacheFor(const UUID &id, dag::ConstSpan<uint8_t> da
     }
   }
 
-  LocalCacheEntry &entry = localCache.push_back();
+  bool overwriteOld = localCache.size() >= MAX_UIDS;
+  if (overwriteOld)
+  {
+    for (uint32_t i = 0; i < localCache.size() - 1; ++i)
+      localCache[i] = localCache[i + 1];
+  }
+
+  LocalCacheEntry &entry = overwriteOld ? localCache.back() : localCache.push_back();
   entry.id = id;
   entry.data = data;
 }

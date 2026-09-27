@@ -7,6 +7,7 @@
 #include <drv/3d/dag_vertexIndexBuffer.h>
 #include <drv/3d/dag_shaderConstants.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <perfMon/dag_statDrv.h>
 #include <gameRes/dag_collisionResource.h>
 #include <rendInst/riexHandle.h>
@@ -18,6 +19,7 @@
 #include <util/dag_convar.h>
 #include <generic/dag_smallTab.h>
 #include <dag/dag_vectorSet.h>
+#include <EASTL/bitvector.h>
 
 // todo: use clusters may be?
 // todo: classification
@@ -33,15 +35,18 @@ static inline bool is_transparent(uint32_t phys_mat_id)
   return uint32_t(phys_mat_id) < PhysMat::physMatCount() && PhysMat::getMaterial(phys_mat_id).lightTransparent;
 }
 
-CONSOLE_BOOL_VAL("render", gi_voxelize_cs, false);
+// Which faces reach the voxel scene: glass and the like must not occlude light, so their geometry is dropped.
+// Asked per FACE, since one collision node can carry several materials.
+static inline bool is_voxelized_material(int phys_mat_id) { return !is_transparent(phys_mat_id); }
+
 CONSOLE_BOOL_VAL("render", gi_voxelize_md, true);
 
 #define GLOBAL_VARS_LIST           \
   VAR(gi_voxelize_with_instancing) \
   VAR(gi_voxelize_use_multidraw)   \
-  VAR(gi_voxelize_with_colors)     \
   VAR(gi_voxelization_vbuffer)     \
-  VAR(gi_voxelization_ibuffer)
+  VAR(gi_voxelization_ibuffer)     \
+  VAR(supports_barycentrics)
 
 #define VAR(a) static ShaderVariableInfo a##VarId(#a, true);
 GLOBAL_VARS_LIST
@@ -56,13 +61,17 @@ uint32_t LRURendinstCollision::getMaxBatchSize() const { return MAX_VOXELIZATION
 static constexpr uint32_t compute_vb_flags = (can_voxelize_in_compute ? SBCF_BIND_SHADER_RES | SBCF_MISC_ALLOW_RAW : 0);
 static int ssgi_scene_common_color_reg_no_const = 6, ssgi_scene_common_alpha_reg_no_const = 5;
 
-bool LRURendinstCollision::useSRVBuffers = false;
+static uint32_t get_additional_buffer_flags()
+{
+  return d3d::get_driver_desc().caps.hasRayQuery ? SBCF_BIND_SHADER_RES | SBCF_MISC_ALLOW_RAW : 0;
+}
 
 LRURendinstCollision::LRURendinstCollision() :
-  vbAllocator(SbufferHeapManager("vb_collision_", 4,
-    compute_vb_flags | SBCF_BIND_VERTEX | (useSRVBuffers ? SBCF_BIND_SHADER_RES | SBCF_MISC_ALLOW_RAW : 0))),
-  ibAllocator(SbufferHeapManager("ib_collision_", 4,
-    compute_vb_flags | SBCF_BIND_INDEX | (useSRVBuffers ? SBCF_BIND_SHADER_RES | SBCF_MISC_ALLOW_RAW : 0)))
+  vbAllocator(SbufferHeapManager("vb_collision_", 4, compute_vb_flags | SBCF_BIND_VERTEX | get_additional_buffer_flags()),
+    RESTAG_COLLISION),
+  ibAllocator(
+    SbufferHeapManager("ib_collision_", 4, compute_vb_flags | SBCF_BIND_INDEX | SBCF_INDEX32 | get_additional_buffer_flags()),
+    RESTAG_COLLISION)
 {
   create_cubic_indices(make_span((uint8_t *)boxIndices.data(), COLLISION_BOX_INDICES_NUM * sizeof(uint16_t)), 1, false);
   ShaderGlobal::get_int_by_name("ssgi_scene_common_color_reg_no", ssgi_scene_common_color_reg_no_const);
@@ -70,78 +79,89 @@ LRURendinstCollision::LRURendinstCollision() :
   supportNoOverwrite = d3d::get_driver_desc().caps.hasNoOverwriteOnShaderResourceBuffers;
   instanceTms = dag::create_sbuffer(sizeof(Point4), getMaxBatchSize() * 3,
     (supportNoOverwrite ? (SBCF_DYNAMIC | SBCF_CPU_ACCESS_WRITE) : 0) | SBCF_BIND_SHADER_RES | SBCF_MISC_STRUCTURED, 0,
-    "collision_voxelization_tm");
+    "collision_voxelization_tm", RESTAG_COLLISION);
   // if we don't support nooverwrite do not use SBCF_DYNAMIC | SBCF_CPU_ACCESS_WRITE
-  voxelizeCollisionMat.reset(new_shader_material_by_name_optional("voxelize_collision"));
-  if (voxelizeCollisionMat)
-  {
-    voxelizeCollisionMat->addRef();
-    voxelizeCollisionElem = voxelizeCollisionMat->make_elem();
-  }
-  voxelize_collision_cs.reset();
-  auto csMat = new_shader_material_by_name_optional("voxelize_collision_cs");
-  if (csMat)
-    voxelize_collision_cs.reset(new ComputeShaderElement(&csMat->native()));
   const bool multiDrawIndirectSupported = d3d::get_driver_desc().caps.hasWellSupportedIndirect;
   if (multiDrawIndirectSupported)
   {
     serialBuf.init(MAX_VOXELIZATION_INSTANCES * 3); // 3 is for 3-axis projection
-    VSDTYPE vsdInstancing[] = {VSD_STREAM_PER_VERTEX_DATA(0), VSD_REG(VSDR_POS, VSDT_HALF4), VSD_STREAM_PER_INSTANCE_DATA(1),
-      VSD_REG(VSDR_TEXC0, VSDT_INT1), VSD_END};
-    if (voxelizeCollisionElem)
-      voxelizeCollisionElem->replaceVdecl(d3d::create_vdecl(vsdInstancing));
-
     multiDrawBuf = dag::create_sbuffer(INDIRECT_BUFFER_ELEMENT_SIZE,
       getMaxBatchSize() * DRAW_INDEXED_INDIRECT_NUM_ARGS / INDIRECT_BUFFER_ELEMENT_SIZE, SBCF_INDIRECT, 0,
-      "collision_voxelization_indirect");
+      "collision_voxelization_indirect", RESTAG_COLLISION);
     debug("%s support multi draw indirect", __FUNCTION__);
   }
 }
 
-LRURendinstCollision::~LRURendinstCollision()
+// The material-independent half of voxelization_node_size -- node kind, geometry presence and the vert byte size (the header states
+// what "material-independent" excludes for a BOX).
+// Split out because the fill pass runs per node per LRU miss and must not walk faces there.
+bool LRURendinstCollision::voxelization_node_verts(const CollisionResource *coll_res, int ni, const CollisionNode *node,
+  uint32_t &vb_size)
 {
-  if (multiDrawBuf && voxelizeCollisionElem)
-    d3d::delete_vdecl(voxelizeCollisionElem->getEffectiveVDecl());
+  if (!node || !node->checkBehaviorFlags(CollisionNode::TRACEABLE))
+    return false;
+  if (node->type == COLLISION_NODE_TYPE_BOX)
+  {
+    if (!is_voxelized_material(coll_res->getNodePhysMatId(node->nodeIndex, 0)))
+      return false;
+    vb_size = COLLISION_BOX_VERTICES_NUM * sizeof(CollisionVertex);
+    return true;
+  }
+  if (coll_res->getNodeFaceCount(ni) > 0 && (node->type == COLLISION_NODE_TYPE_MESH || node->type == COLLISION_NODE_TYPE_CONVEX))
+  {
+    // Every vert is kept, even one no surviving face references: indices are 32-bit and rebased per node, so an unindexed vert only
+    // sits unused in the buffer.
+    vb_size = coll_res->getNodeVertCount(ni) * sizeof(CollisionVertex);
+    return true;
+  }
+  return false;
+}
+
+// getRiData (size) and updateLRU (fill) must agree byte-for-byte or updateData's G_ASSERTF fires; one shared classify keeps the passes
+// in sync. 32-bit indices, so a chunk of any size voxelizes.
+bool LRURendinstCollision::voxelization_node_size(const CollisionResource *coll_res, int ni, const CollisionNode *node,
+  uint32_t &ib_size, uint32_t &vb_size)
+{
+  if (!voxelization_node_verts(coll_res, ni, node, vb_size))
+    return false;
+  if (node->type == COLLISION_NODE_TYPE_BOX)
+  {
+    ib_size = COLLISION_BOX_INDICES_NUM * sizeof(uint32_t);
+    return true;
+  }
+  ib_size = coll_res->countNodeFacesByMaterial(ni, is_voxelized_material) * 3 * sizeof(uint32_t);
+  // No face survived the filter: the node contributes nothing at all, and saying otherwise would size a zero-index entry the fill pass
+  // then refuses to emit.
+  return ib_size != 0;
 }
 
 LRURendinstCollision::RiDataInfo LRURendinstCollision::getRiData(uint32_t type)
 {
-  uint32_t oldSize = riInfo.size();
-  if (type >= oldSize)
+  if (type >= riInfo.size())
   {
     G_ASSERTF(type < (1 << 21), "%d", type);
     riInfo.resize(type + 1);
-    for (uint32_t i = oldSize, ei = riInfo.size(); i < ei; ++i)
+    riInfoSettled.resize(type + 1, false);
+  }
+  RiDataInfo &info = riInfo[type];
+  if (!riInfoSettled[type])
+  {
+    if (const CollisionResource *collRes = lru_collision_get_collres(type))
     {
-      const CollisionResource *collRes = lru_collision_get_collres(i);
-      if (!collRes)
-        continue;
       for (int ni = 0, ne = collRes->getAllNodes().size(); ni < ne; ++ni)
       {
-        const CollisionNode *node = collRes->getNode(ni);
-        if (!node)
-          continue;
-
-        if (!node->checkBehaviorFlags(CollisionNode::TRACEABLE))
-          continue;
-
-        if (is_transparent(node->physMatId))
-          continue;
-        if (node->type == COLLISION_NODE_TYPE_BOX)
+        uint32_t nodeIbSize, nodeVbSize;
+        if (voxelization_node_size(collRes, ni, collRes->getNode(ni), nodeIbSize, nodeVbSize))
         {
-          riInfo[i].ibSize += COLLISION_BOX_INDICES_NUM * sizeof(uint16_t);
-          riInfo[i].vbSize += COLLISION_BOX_VERTICES_NUM * sizeof(CollisionVertex);
-        }
-        else if (node->indices.size() > 0 && (node->type == COLLISION_NODE_TYPE_MESH || node->type == COLLISION_NODE_TYPE_CONVEX))
-        {
-          riInfo[i].ibSize += data_size(node->indices);
-          riInfo[i].vbSize += node->vertices.size() * sizeof(CollisionVertex);
+          info.ibSize += nodeIbSize;
+          info.vbSize += nodeVbSize;
         }
       }
-      riInfo[i].ibSize = (riInfo[i].ibSize + 3) & ~3; // align size to 4
+      info.ibSize = (info.ibSize + 3) & ~3; // align size to 4
+      riInfoSettled[type] = true;
     }
   }
-  return riInfo[type];
+  return info;
 }
 
 uint32_t LRURendinstCollision::getVbCapacity() const
@@ -288,6 +308,8 @@ bool LRURendinstCollision::updateLRU(dag::ConstSpan<rendinst::riex_handle_t> ri)
   for (auto h : ri)
   {
     const uint32_t type = lru_collision_get_type(h);
+    // RIEX_HANDLE_NULL maps to ~0u here; without this skip resize(type + 1) wraps to resize(0)
+    // (wiping the map) and processed.set(type) grows the bitvector by ~512 MB.
     if (type == ~0u)
       continue;
     if (processed.test(type, false))
@@ -332,30 +354,27 @@ bool LRURendinstCollision::updateLRU(dag::ConstSpan<rendinst::riex_handle_t> ri)
     G_ASSERTF(ib.size == riInfo[type].ibSize && vb.size == riInfo[type].vbSize, "requested %d,%d == %d,%d", riInfo[type].vbSize,
       riInfo[type].ibSize, vb.size, ib.size);
 
-    G_ASSERT(vb.offset % sizeof(CollisionVertex) == 0 && ib.offset % sizeof(uint16_t) == 0);
-    G_ASSERT((ib.size & 3) == 0 && (ib.offset & 3) == 0); // it is 16 bit index, but we copy aligned to 4
+    G_ASSERT(vb.offset % sizeof(CollisionVertex) == 0 && ib.offset % sizeof(uint32_t) == 0);
+    G_ASSERT((ib.size & 3) == 0 && (ib.offset & 3) == 0); // 32 bit index buffer (SBCF_INDEX32)
 
     const CollisionResource *collRes = lru_collision_get_collres(type);
     G_ASSERT_CONTINUE(collRes && collRes->getAllNodes().size());
     uint8_t *vertices = verticesRes.data(), *indices = indicesRes.data();
 
     int firstVertex = 0;
-    int nodeIbSize = 0;
-    int nodeVbSize = 0;
     for (int ni = 0, ne = collRes->getAllNodes().size(); ni < ne; ++ni)
     {
       const CollisionNode *node = collRes->getNode(ni);
-      if (!node || !node->checkBehaviorFlags(CollisionNode::TRACEABLE))
-        continue;
-      if (is_transparent(node->physMatId))
+      uint32_t nodeIbSize, nodeVbSize;
+      if (!voxelization_node_verts(collRes, ni, node, nodeVbSize))
         continue;
       if (node->type == COLLISION_NODE_TYPE_BOX)
       {
-        nodeIbSize = COLLISION_BOX_INDICES_NUM * sizeof(uint16_t);
-        nodeVbSize = COLLISION_BOX_VERTICES_NUM * sizeof(CollisionVertex);
+        nodeIbSize = COLLISION_BOX_INDICES_NUM * sizeof(uint32_t);
         Point3_vec4 boxVertices[COLLISION_BOX_VERTICES_NUM];
+        BBox3 nodeBBox = collRes->getNodeBBox(node->nodeIndex);
         for (int vertNo = 0; vertNo < COLLISION_BOX_VERTICES_NUM; ++vertNo)
-          boxVertices[vertNo] = node->modelBBox.point(vertNo ^ 1); // xor 1 to invert culling
+          boxVertices[vertNo] = nodeBBox.point(vertNo ^ 1); // xor 1 to invert culling
 
         const vec4f *__restrict verts = (const vec4f *)boxVertices;
         CollisionVertex *__restrict vertsDest = (CollisionVertex *)vertices;
@@ -363,47 +382,53 @@ bool LRURendinstCollision::updateLRU(dag::ConstSpan<rendinst::riex_handle_t> ri)
           v_float_to_half(&vertsDest->x, *verts);
         G_FAST_ASSERT((uint8_t *)vertsDest <= verticesRes.end());
 
-        if (!firstVertex)
-          memcpy(indices, boxIndices.data(), nodeIbSize);
-        else
-        {
-          uint16_t *ind = (uint16_t *)indices;
-          for (int ii = 0; ii < COLLISION_BOX_INDICES_NUM; ++ii, ++ind)
-            *ind = boxIndices[ii] + firstVertex;
-        }
+        uint32_t *ind = (uint32_t *)indices;
+        for (int ii = 0; ii < COLLISION_BOX_INDICES_NUM; ++ii, ++ind)
+          *ind = boxIndices[ii] + firstVertex;
       }
-      else if (node->indices.size() > 0 && (node->type == COLLISION_NODE_TYPE_MESH || node->type == COLLISION_NODE_TYPE_CONVEX))
+      else
       {
-        nodeIbSize = data_size(node->indices);
-        nodeVbSize = node->vertices.size() * sizeof(CollisionVertex);
-        G_ASSERT_CONTINUE(elem_size(node->vertices) == sizeof(vec4f));
-        CollisionVertex *__restrict vertsDest = (CollisionVertex *)vertices;
-        const vec4f *__restrict verts = (const vec4f *)node->vertices.data();
-        if ((node->flags & (node->IDENT | node->TRANSLATE)) == node->IDENT)
+        // What the size pass reserved IS the layout, so advance by that and keep the fill inside it.
+        // The cached face count and the BLAS walk can only disagree in a release build (a dev build
+        // logerrs and cures it at load), and a shorter walk would otherwise shift the index block of
+        // every later node and leave the vert cursor behind. countNodeFacesByMaterial reads the cached
+        // count for a single-material node, so the per-LRU-miss path pays no face walk there; a fused (set-holding) node walks its
+        // leaves per face, here and in the fill below.
+        const uint32_t sizedFaces = collRes->countNodeFacesByMaterial(ni, is_voxelized_material);
+        if (sizedFaces == 0)
+          continue; // the filter emptied this node, so the size pass gave it neither ib nor vb bytes
+        nodeIbSize = sizedFaces * 3 * sizeof(uint32_t);
+        uint32_t *ind = (uint32_t *)indices;
+        const uint32_t *indEnd = (const uint32_t *)(indices + nodeIbSize);
+        uint32_t walkedFaces = 0;
+        collRes->iterateNodeFacesByMaterial(ni, is_voxelized_material, [&](int, uint32_t i0, uint32_t i1, uint32_t i2) {
+          if (++walkedFaces > sizedFaces)
+            return;
+          *ind++ = i0 + firstVertex;
+          *ind++ = i1 + firstVertex;
+          *ind++ = i2 + firstVertex;
+        });
+        if (walkedFaces != sizedFaces)
         {
-          for (const vec4f *__restrict ve = verts + node->vertices.size(); verts != ve; ++verts, ++vertsDest)
-            v_float_to_half(&vertsDest->x, *verts);
+          LOGERR_ONCE("lru voxelization: collres %u node <%s>#%d walked %u faces, sized for %u", type, collRes->getNodeNameStr(*node),
+            ni, walkedFaces, sizedFaces);
+          while (ind < indEnd) // degenerate tris, so a short walk leaves no uninitialized index behind
+            *ind++ = firstVertex;
+        }
+
+        CollisionVertex *__restrict vertsDest = (CollisionVertex *)vertices;
+        if (collRes->isIdentNode(ni))
+        {
+          collRes->iterateNodeVerts(ni, [&](int, vec4f v) { v_float_to_half(&(vertsDest++)->x, v); });
         }
         else
         {
           mat44f nodeTm;
-          v_mat44_make_from_43cu_unsafe(nodeTm, node->tm[0]);
-          for (const vec4f *__restrict ve = verts + node->vertices.size(); verts != ve; ++verts, ++vertsDest)
-            v_float_to_half(&vertsDest->x, v_mat44_mul_vec3p(nodeTm, *verts));
+          v_mat44_make_from_43cu_unsafe(nodeTm, collRes->getNodeTm(node->nodeIndex)[0]);
+          collRes->iterateNodeVerts(ni, [&](int, vec4f v) { v_float_to_half(&(vertsDest++)->x, v_mat44_mul_vec3p(nodeTm, v)); });
         }
         G_FAST_ASSERT((uint8_t *)vertsDest <= verticesRes.end());
-
-        if (!firstVertex)
-          memcpy(indices, node->indices.data(), nodeIbSize);
-        else
-        {
-          uint16_t *ind = (uint16_t *)indices;
-          for (int ii = 0; ii < node->indices.size(); ++ii, ++ind)
-            *ind = node->indices[ii] + firstVertex;
-        }
       }
-      else
-        continue;
 
       G_ASSERT(nodeIbSize > 0 && nodeVbSize > 0);
 
@@ -567,6 +592,14 @@ void LRURendinstCollision::drawInstances(dag::ConstSpan<rendinst::riex_handle_t>
 void LRURendinstCollision::drawInstances(uint32_t start_instance, const uint32_t *types_counts, uint32_t batches, VolTexture *color,
   VolTexture *alpha, uint32_t instMul, bool primitives)
 {
+#if DAGOR_DBGLEVEL > 0
+  // (primitives, supports_barycentrics == on) is dont_render in collision rasterize
+  // shaders; a wrong blk assume or a caller ignoring caps.hasBarycentrics
+  // would silently draw nothing here
+  if (primitives && ShaderGlobal::get_interval_current_value(supports_barycentricsVarId.get_var_id()) != 0)
+    LOGERR_ONCE("LRU collision: primitives rasterize while supports_barycentrics == on (%s)",
+      ShaderGlobal::is_var_assumed(supports_barycentricsVarId) ? "assumed in shader blk" : "set at runtime");
+#endif
   uint32_t offset = start_instance * instMul;
   if (multiDrawBuf.getBuf() && gi_voxelize_md.get() && !primitives)
   {
@@ -586,9 +619,9 @@ void LRURendinstCollision::drawInstances(uint32_t start_instance, const uint32_t
       auto vbInfo = vbAllocator.get(lruEntry.vb), ibInfo = ibAllocator.get(lruEntry.ib);
       G_ASSERT(vbInfo.size && ibInfo.size);
 
-      dataPtr->indexCountPerInstance = (ibInfo.size / (3 * sizeof(uint16_t))) * 3;
+      dataPtr->indexCountPerInstance = (ibInfo.size / (3 * sizeof(uint32_t))) * 3;
       dataPtr->instanceCount = instCount;
-      dataPtr->startIndexLocation = ibInfo.offset / sizeof(uint16_t);
+      dataPtr->startIndexLocation = ibInfo.offset / sizeof(uint32_t);
       dataPtr->baseVertexLocation = vbInfo.offset / sizeof(CollisionVertex);
       dataPtr->startInstanceLocation = instances;
       instances += instCount;
@@ -616,14 +649,14 @@ void LRURendinstCollision::drawInstances(uint32_t start_instance, const uint32_t
     G_ASSERT(vbInfo.size && ibInfo.size);
     if (primitives)
     {
-      uint32_t offsets[3] = {offset, uint32_t(ibInfo.offset / sizeof(uint16_t)), uint32_t(vbInfo.offset / sizeof(CollisionVertex))};
+      uint32_t offsets[3] = {offset, uint32_t(ibInfo.offset / sizeof(uint32_t)), uint32_t(vbInfo.offset / sizeof(CollisionVertex))};
       d3d::set_immediate_const(STAGE_VS, offsets, 3);
-      d3d::draw_instanced(PRIM_TRILIST, 0, ibInfo.size / (3 * sizeof(uint16_t)), instCount, 0);
+      d3d::draw_instanced(PRIM_TRILIST, 0, ibInfo.size / (3 * sizeof(uint32_t)), instCount, 0);
     }
     else
     {
       d3d::set_immediate_const(STAGE_VS, &offset, 1);
-      d3d::drawind_instanced(PRIM_TRILIST, ibInfo.offset / sizeof(uint16_t), ibInfo.size / (3 * sizeof(uint16_t)),
+      d3d::drawind_instanced(PRIM_TRILIST, ibInfo.offset / sizeof(uint32_t), ibInfo.size / (3 * sizeof(uint32_t)),
         vbInfo.offset / sizeof(CollisionVertex), instCount);
     }
     offset += instCount;
@@ -636,7 +669,7 @@ void LRURendinstCollision::drawInstances(uint32_t start_instance, const uint32_t
 }
 
 void LRURendinstCollision::dispatchInstances(const uint32_t start_instance, const uint32_t *types_counts, uint32_t batches,
-  VolTexture *color, VolTexture *alpha, uint32_t threads)
+  VolTexture *color, VolTexture *alpha, uint32_t threads_in_group)
 {
   // uint32_t triCount = 0;
   uint32_t offset = start_instance;
@@ -649,17 +682,39 @@ void LRURendinstCollision::dispatchInstances(const uint32_t start_instance, cons
     const LRUEntry &lruEntry = riToLRUmap[type];
     auto vbInfo = vbAllocator.get(lruEntry.vb), ibInfo = ibAllocator.get(lruEntry.ib);
     G_ASSERT(vbInfo.size && ibInfo.size);
-    const uint32_t tris = (ibInfo.size / (3 * sizeof(uint16_t)));
-    const uint32_t renderInfo[4] = {uint32_t(ibInfo.offset / sizeof(uint16_t)), uint32_t(vbInfo.offset / sizeof(CollisionVertex)),
-      uint32_t(tris | (count << 20)), offset};
-    d3d::set_immediate_const(STAGE_CS, renderInfo, 4);
-    // draw n triangles. We need clusters or multidispatch indirect, too much calls otherwise!
-    d3d::dispatch((count * tris + threads - 1) / threads, 1, 1);
+    const uint32_t tris = (ibInfo.size / (3 * sizeof(uint32_t)));
+    // renderInfo[2] below packs tris into the low 20 bits (instance count in the high 12). The 32-bit index
+    // path no longer caps a resource at 65536 verts, but more tris in one collision resource is not real
+    // content -- skip + log rather than silently corrupt the packed dispatch counts.
+    if (tris > MAX_VOXELIZATION_TRIS)
+    {
+      LOGERR_ONCE("LRU collision: resource type %u has %u tris (> %u); skipping compute voxelization", type, tris,
+        MAX_VOXELIZATION_TRIS);
+      continue;
+    }
+    // 64K is the smallest guaranteed dispatch size on all platforms
+    // TODO: use some kind of d3d-provided constant instead?
+    constexpr uint32_t SUB_BATCH_SIZE = 65535U;
+    G_ASSERT(tris <= SUB_BATCH_SIZE * threads_in_group); // otherwise we can't dispatch even single sub-batch
+    const uint32_t instancesPerSubBatch = SUB_BATCH_SIZE * threads_in_group / tris;
+    for (uint32_t instanceOffset = 0; instanceOffset < count; instanceOffset += instancesPerSubBatch)
+    {
+      const uint32_t actualInstances = min(count - instanceOffset, SUB_BATCH_SIZE * threads_in_group / tris);
+      const uint32_t renderInfo[4] = {
+        uint32_t(ibInfo.offset / sizeof(uint32_t)),
+        uint32_t(vbInfo.offset / sizeof(CollisionVertex)),
+        uint32_t(tris | (actualInstances << 20)),
+        offset + instanceOffset,
+      };
+      d3d::set_immediate_const(STAGE_CS, renderInfo, 4);
+      // draw n triangles. We need clusters or multidispatch indirect, too much calls otherwise!
+      d3d::dispatch((actualInstances * tris + threads_in_group - 1) / threads_in_group, 1, 1);
+      if (color)
+        d3d::resource_barrier({color, RB_NONE, 0, 0});
+      if (alpha)
+        d3d::resource_barrier({alpha, RB_NONE, 0, 0});
+    }
     // triCount+=count*tris;
-    if (color)
-      d3d::resource_barrier({color, RB_NONE, 0, 0});
-    if (alpha)
-      d3d::resource_barrier({alpha, RB_NONE, 0, 0});
   }
   d3d::set_immediate_const(STAGE_CS, nullptr, 0);
   // debug("triCount = %d instances = %d", triCount, offset);
@@ -670,6 +725,8 @@ void LRURendinstCollision::dispatchInstances(const uint32_t start_instance, cons
 void LRURendinstCollision::dispatchInstances(dag::ConstSpan<rendinst::riex_handle_t> handles, VolTexture *color, VolTexture *alpha,
   ComputeShaderElement &cs) // expect sorted
 {
+  if (!ibAllocator.getHeap().getBuf() || !vbAllocator.getHeap().getBuf())
+    return;
   G_ASSERT(ibAllocator.getHeap().getBuf()->getFlags() & SBCF_BIND_SHADER_RES);
   TIME_D3D_PROFILE(LRU_dispatch_instances);
   if (alpha)
@@ -697,28 +754,11 @@ void LRURendinstCollision::draw(dag::ConstSpan<rendinst::riex_handle_t> handles,
     drawInstances(handles, color, alpha, inst_mul, elem, prims);
 }
 
-void LRURendinstCollision::voxelize(dag::ConstSpan<rendinst::riex_handle_t> handles, VolTexture *color, VolTexture *alpha)
-{
-  if (handles.empty())
-    return;
-  ShaderGlobal::set_int(gi_voxelize_with_colorsVarId, color ? 1 : 0);
-  if (voxelize_collision_cs && gi_voxelize_cs.get() &&
-      (ibAllocator.getHeap().getBuf() && ibAllocator.getHeap().getBuf()->getFlags() & SBCF_BIND_SHADER_RES)) // otherwise we can't
-                                                                                                             // dispatch
-  {
-    dispatchInstances(handles, color, alpha, *voxelize_collision_cs);
-  }
-  else
-  {
-    if (voxelizeCollisionElem)
-      drawInstances(handles, color, alpha, 3, *voxelizeCollisionElem, false);
-  }
-}
-
 void LRURendinstCollision::clearRiInfo()
 {
   reset();
   riInfo = {};
+  riInfoSettled = {};
 }
 
 eastl::optional<LRURendinstCollision::MeshData> LRURendinstCollision::getModelData(int modelId) const
@@ -734,11 +774,24 @@ eastl::optional<LRURendinstCollision::MeshData> LRURendinstCollision::getModelDa
   ret.vertices = vbAllocator.getHeap().getBuf();
   ret.indices = ibAllocator.getHeap().getBuf();
   ret.baseVertex = vbInfo.offset / sizeof(CollisionVertex);
-  ret.startIndex = ibInfo.offset / sizeof(uint16_t);
+  ret.startIndex = ibInfo.offset / sizeof(uint32_t);
   ret.vertexCount = vbInfo.size / sizeof(CollisionVertex);
-  ret.indexCount = ((ibInfo.size / sizeof(uint16_t)) / 3) * 3;
+  ret.indexCount = ((ibInfo.size / sizeof(uint32_t)) / 3) * 3;
   ret.vertexStride = sizeof(CollisionVertex);
+  ret.indexStride = sizeof(uint32_t);
   ret.positionOffset = 0;
   ret.positionFormat = VSDT_HALF4;
   return ret;
+}
+
+eastl::shared_ptr<LRURendinstCollision> LRURendinstCollision::acquire()
+{
+  static eastl::weak_ptr<LRURendinstCollision> instance;
+  auto shared = instance.lock();
+  if (!shared)
+  {
+    shared = eastl::make_shared<LRURendinstCollision>();
+    instance = shared;
+  }
+  return shared;
 }

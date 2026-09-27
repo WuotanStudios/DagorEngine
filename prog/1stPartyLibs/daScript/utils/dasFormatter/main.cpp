@@ -1,52 +1,40 @@
 #include "daScript/ast/ast.h"
+#include "daScript/ast/dyn_modules.h"
 #include "daScript/daScriptModule.h"
 #include "daScript/ast/ast_serializer.h"
 #include "daScript/misc/platform.h"
+#include "daScript/misc/sysos.h"
 #include "fmt.h"
+
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+#include "modules/external_declare.inc"
+#endif
 
 using namespace das;
 
+das::FileAccessPtr get_file_access( char * pak );
 
 void InitModules() {
     // register modules
-    if (!Module::require("$")) {
-        NEED_MODULE(Module_BuiltIn);
-    }
-    if (!Module::require("math")) {
-        NEED_MODULE(Module_Math);
-    }
-    if (!Module::require("raster")) {
-        NEED_MODULE(Module_Raster);
-    }
-    if (!Module::require("strings")) {
-        NEED_MODULE(Module_Strings);
-    }
-    if (!Module::require("rtti")) {
-        NEED_MODULE(Module_Rtti);
-    }
-    if (!Module::require("ast")) {
-        NEED_MODULE(Module_Ast);
-    }
-    if (!Module::require("jit")) {
-        NEED_MODULE(Module_Jit);
-    }
-    if (!Module::require("debugapi")) {
-        NEED_MODULE(Module_Debugger);
-    }
-    NEED_MODULE(Module_Network);
-    NEED_MODULE(Module_UriParser);
-    NEED_MODULE(Module_JobQue);
-    NEED_MODULE(Module_FIO);
-    NEED_MODULE(Module_DASBIND);
-#include "modules/external_need.inc"
+    register_builtin_modules();
+#if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+#include "modules/external_pull.inc"
+#endif
+#ifdef DAS_ENABLE_DYN_INCLUDES
+    daScriptEnvironment::ensure();
+    auto access = get_file_access(nullptr);
+    TextPrinter tout;
+    vector<string> load_modules;
+    require_dynamic_modules(access, getDasRoot(), "", load_modules, tout);
+#endif
     Module::Initialize();
     // compile and run
 
 }
 
 string help() {
-    return "Tool to convert dascript v1 syntax to v2\n"
-           "das-fmt {-i} filename1 {filename2} ...:\n"
+    return "Tool to convert daslang v1 syntax to v2\n"
+           "gen1_to_gen2 {-i} filename1 {filename2} ...:\n"
            "   -i inplace conversion, write to the same file. Multiple filenames only allowed in inplace mode\n"
            "   --tests Run tests, no filenames required\n"
            "   --semicolon Keep semicolon after convertion\n"
@@ -326,9 +314,12 @@ int main(int argc, char** argv) {
         tp << "no files" << "\n";
     }
     InitModules();
+    int rc;
     if (is_tests) {
-        return test();
+        rc = test();
     } else {
-        return das::format::run(opts, files);
+        rc = das::format::run(opts, files);
     }
+    Module::Shutdown();
+    return rc;
 }

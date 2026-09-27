@@ -36,6 +36,7 @@ public:
   public:
     TabInt() : Tab<int>(midmem_ptr()) {}
     TabInt(const TabInt &from) : Tab<int>(from) {}
+    TabInt &operator=(const TabInt &from) = default;
   };
 
   DeWorkspace();
@@ -56,7 +57,6 @@ public:
   void clear();
 
   const DataBlock &getShGlobVarsScheme() const { return shGlobVarsScheme; }
-  const DataBlock *findWspBlk(const char *app_blk_path);
 
   void getHmapSettings(bool &hmap_tiletex, bool &hmap_colortex, bool &hmap_lightmaptex, bool &hmap_usemeshsurface,
     bool &hmap_usenormalmap) const

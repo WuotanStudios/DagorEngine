@@ -2,10 +2,17 @@
 
 #include "variantSemantic.h"
 #include "shaderSemantic.h"
+#include "assemblyShader.h"
 #include "hwSemantic.h"
 #include "shExprParser.h"
 #include <shaders/shUtils.h>
+#include <shaders/shOpcode.h>
+#include <shaders/shOpcodeFormat.h>
+#include <generic/dag_span.h>
 #include "defer.h"
+#include "semUtils.h"
+#include "varMap.h"
+#include "boolExpr.h"
 
 namespace semantic
 {
@@ -42,208 +49,157 @@ VarLookupRes lookup_state_var(const char *name, shc::VariantContext &ctx, bool a
 
 ShVarBool VariantBoolExprEvalCB::eval_expr(bool_expr &e)
 {
-  String evalExprErrStr{};
-  String *savedStr = eastl::exchange(curEvalExprErrStr, &evalExprErrStr);
-
-  ShVarBool result = ShaderParser::eval_shader_bool<true>(e, *this);
-  curEvalExprErrStr = savedStr;
-
-  if (!evalExprErrStr.empty() && (!result.isConst || result.value))
+  if (ctx.shCtx().blockLevel() == ShaderBlockLevel::SHADER)
   {
-    if (curEvalExprErrStr)
-      curEvalExprErrStr->append(evalExprErrStr.c_str());
-    else
-    {
-      String cond;
-      ShaderParser::build_bool_expr_string(e, cond);
-      report_error(ctx.tgtCtx().sourceParseState().parser, &e, "expr \"%s\" is not const.false and gives errors:\n%s", cond,
-        evalExprErrStr.c_str());
-    }
+    G_ASSERT(e.compiled);
+  }
+  else
+  {
+    compile_bool_expr_cached(e, ctx.tgtCtx());
   }
 
-  return result;
+  const auto &variant = ctx.variant();
+  Parser &parser = ctx.tgtCtx().sourceParseState().parser;
+  const auto bytecode = bytecode_from_expr(e);
+
+  auto res = evaluate_compiled_bool_expr(
+    bytecode,
+    [&, this](int interval_nid, int value_nid, Interval::BooleanExpr cmpop) {
+      const IntervalList *intervalList = &variant.intervals;
+
+      // search interval by name
+      int intervalIndex = variant.intervals.getIntervalIndex(interval_nid);
+      if (intervalIndex == INTERVAL_NOT_INIT)
+      {
+        intervalIndex = ctx.tgtCtx().globVars().getIntervalList().getIntervalIndex(interval_nid);
+        if (DAGOR_UNLIKELY(intervalIndex == INTERVAL_NOT_INIT))
+        {
+          report_error(parser, &e, "interval %s not found!", ctx.tgtCtx().intervalNameMap().getName(interval_nid));
+          return BoolExprEvalCbResult{.erred = true};
+        }
+
+        intervalList = &ctx.tgtCtx().globVars().getIntervalList();
+      }
+
+      const Interval *interv = intervalList->getInterval(intervalIndex);
+      G_ASSERT(interv);
+
+      ShaderVariant::ValueType varValue = variant.getValue(interv->getVarType(), intervalIndex);
+      if (varValue == -1)
+      {
+        // I do not like the map->map jump through a string here.
+        // @TODO Probably having one map would've been better, it's an acceleration structure anyway, not a namespace.
+        bool isGlobal = true;
+        if (const int varNameId = ctx.tgtCtx().varNameMap().getVarId(ctx.tgtCtx().intervalNameMap().getName(interval_nid));
+            varNameId >= 0)
+        {
+          isGlobal = ctx.parsedSemCode().find_var(varNameId) < 0;
+        }
+
+        if (auto valueMaybe = ctx.shCtx().assumes().getAssumedVal(interval_nid, isGlobal))
+          varValue = interv->normalizeValue(*valueMaybe);
+      }
+      const Interval *interval = intervalList->getInterval(intervalIndex);
+
+      // This is no longer validated due to pruned branches in gatherVar. Before we used a slow error accumulation and discard
+      // technique which was also bad because it hid some valid errors.
+      // Here, we have to presume that var == some_bs_value evaluates to false.
+      //
+      // @TODO we should restore this validation in gatherVar pass.
+      if (DAGOR_UNLIKELY(!ShaderVariant::ValueRange(0, interval->getValueCount() - 1).isInRange(varValue)))
+        return BoolExprEvalCbResult{.res = false};
+
+      String error_msg;
+      bool bool_result = interval->checkExpression(varValue, cmpop, value_nid, error_msg, ctx.tgtCtx());
+      if (DAGOR_UNLIKELY(!error_msg.empty()))
+      {
+        report_error(parser, &e, error_msg.str());
+        return BoolExprEvalCbResult{.erred = true};
+      }
+
+      return BoolExprEvalCbResult{.res = bool_result};
+    },
+    [&, this](int texture_nid, Interval::BooleanExpr cmpop) {
+      const IntervalList *intervalList = &variant.intervals;
+
+      // search interval by name
+      int intervalIndex = variant.intervals.getIntervalIndex(texture_nid);
+      if (intervalIndex == INTERVAL_NOT_INIT)
+      {
+        intervalIndex = ctx.tgtCtx().globVars().getIntervalList().getIntervalIndex(texture_nid);
+        if (DAGOR_UNLIKELY(intervalIndex == INTERVAL_NOT_INIT))
+        {
+          report_error(parser, &e, "tex interval %s not found!", ctx.tgtCtx().intervalNameMap().getName(texture_nid));
+          return BoolExprEvalCbResult{.erred = true};
+        }
+        intervalList = &ctx.tgtCtx().globVars().getIntervalList();
+      }
+
+      const Interval *interv = intervalList->getInterval(intervalIndex);
+      G_ASSERT(interv);
+
+      ShaderVariant::ValueType varValue = variant.getValue(interv->getVarType(), intervalIndex);
+      if (varValue == -1)
+      {
+        bool isGlobal = true;
+        if (const int varNameId = ctx.tgtCtx().varNameMap().getVarId(ctx.tgtCtx().intervalNameMap().getName(texture_nid));
+            varNameId >= 0)
+        {
+          isGlobal = ctx.parsedSemCode().find_var(varNameId) < 0;
+        }
+
+        if (auto valueMaybe = ctx.shCtx().assumes().getAssumedVal(texture_nid, isGlobal))
+          varValue = interv->normalizeValue(*valueMaybe);
+      }
+
+      switch (cmpop)
+      {
+        case Interval::EXPR_EQ: return BoolExprEvalCbResult{.res = varValue != 1};
+        case Interval::EXPR_NOT_EQ: return BoolExprEvalCbResult{.res = varValue == 1};
+        default: G_ASSERT_RETURN(0, BoolExprEvalCbResult{.erred = true});
+      }
+    },
+    [&, this](int boolvar_nid) {
+      auto found = semantic::get_bool_maybe_by_name_id(boolvar_nid, ctx);
+      if (DAGOR_UNLIKELY(!found.expr))
+      {
+        report_error(parser, &e, "Bool var %s not found", ctx.tgtCtx().boolVarNameMap().getName(boolvar_nid));
+        return BoolExprFetchCbResult{.erred = true};
+      }
+      return BoolExprFetchCbResult{.program = bytecode_from_expr(*found.expr)};
+    },
+    [&, this](int maybeboolvar_nid) {
+      auto found = semantic::get_bool_maybe_by_name_id(maybeboolvar_nid, ctx);
+      if (!found.expr)
+        return BoolExprFetchCbResult{.program = BoolExprEvalProgram{{}, {false}}};
+      return BoolExprFetchCbResult{.program = bytecode_from_expr(*found.expr)};
+    },
+    [&, this] { return BoolExprEvalCbResult{.res = bool(variant.getValue(ShaderVariant::VARTYPE_MODE, ShaderVariant::TWO_SIDED))}; },
+    [&, this] {
+      return BoolExprEvalCbResult{.res = bool(variant.getValue(ShaderVariant::VARTYPE_MODE, ShaderVariant::REAL_TWO_SIDED))};
+    },
+    [&, this](int shader_nid, Interval::BooleanExpr cmpop) {
+      switch (cmpop)
+      {
+        case Interval::EXPR_EQ: return BoolExprEvalCbResult{.res = shader_nid == ctx.shCtx().nameId()};
+        case Interval::EXPR_NOT_EQ: return BoolExprEvalCbResult{.res = shader_nid != ctx.shCtx().nameId()};
+        default: G_ASSERT_RETURN(0, BoolExprEvalCbResult{.erred = true});
+      }
+    });
+
+  if (!res.has_value())
+  {
+    sh_debug(SHLOG_ERROR, "Bool evaluation ended with errors");
+    return ShVarBool(false, false);
+  }
+
+  return ShVarBool(res.value(), true);
 }
 
 ShVarBool VariantBoolExprEvalCB::eval_bool_value(bool_value &val)
 {
-  const auto &variant = ctx.variant();
-  auto &parser = ctx.tgtCtx().sourceParseState().parser;
-
-  if (val.two_sided)
-  {
-    return ShVarBool(variant.getValue(ShaderVariant::VARTYPE_MODE, ShaderVariant::TWO_SIDED), true);
-  }
-  else if (val.real_two_sided)
-  {
-    return ShVarBool(variant.getValue(ShaderVariant::VARTYPE_MODE, ShaderVariant::REAL_TWO_SIDED), true);
-  }
-  else if (val.shader)
-  {
-    return ShVarBool(semantic::compare_shader(val, ctx.shCtx()), true);
-  }
-  else if (val.hw)
-  {
-    return ShVarBool(semantic::compare_hw_token(val, ctx.tgtCtx().compCtx()), true);
-  }
-  else if (val.interval_ident)
-  {
-    auto [varIndex, varType, isGlobal] = lookup_state_var(*val.interval_ident, ctx, true);
-    bool has_corresponded_var = varIndex >= 0;
-
-    G_ASSERT(val.cmpop);
-    G_ASSERT(val.interval_value);
-
-    Interval::BooleanExpr expr = Interval::EXPR_NOTINIT;
-    switch (val.cmpop->op->num)
-    {
-      case SHADER_TOKENS::SHTOK_eq: expr = Interval::EXPR_EQ; break;
-      case SHADER_TOKENS::SHTOK_assign: expr = Interval::EXPR_EQ; break;
-      case SHADER_TOKENS::SHTOK_greater: expr = Interval::EXPR_GREATER; break;
-      case SHADER_TOKENS::SHTOK_greatereq: expr = Interval::EXPR_GREATER_EQ; break;
-      case SHADER_TOKENS::SHTOK_smaller: expr = Interval::EXPR_SMALLER; break;
-      case SHADER_TOKENS::SHTOK_smallereq: expr = Interval::EXPR_SMALLER_EQ; break;
-      case SHADER_TOKENS::SHTOK_noteq: expr = Interval::EXPR_NOT_EQ; break;
-      default: G_ASSERT(0);
-    }
-
-    if (expr == Interval::EXPR_NOTINIT)
-      return ShVarBool(false, false);
-
-    const IntervalList *intervalList = &variant.intervals;
-
-    // search interval by name
-    int e_interval_ident_id = ctx.tgtCtx().intervalNameMap().getNameId(val.interval_ident->text);
-    int intervalIndex = variant.intervals.getIntervalIndex(e_interval_ident_id);
-    if (intervalIndex == INTERVAL_NOT_INIT)
-    {
-      intervalIndex = ctx.tgtCtx().globVars().getIntervalList().getIntervalIndex(e_interval_ident_id);
-
-      if (intervalIndex == INTERVAL_NOT_INIT)
-      {
-        report_error(parser, val.interval_ident, "[ERROR] interval %s not found!", val.interval_ident->text);
-        return ShVarBool(false, false);
-      }
-
-      intervalList = &ctx.tgtCtx().globVars().getIntervalList();
-
-      if (!has_corresponded_var)
-        isGlobal = true;
-    }
-
-    const Interval *interv = intervalList->getInterval(intervalIndex);
-    G_ASSERT(interv);
-
-    ShaderVariant::ValueType varValue = variant.getValue(interv->getVarType(), intervalIndex);
-    if (varValue == -1)
-    {
-      if (auto valueMaybe = ctx.shCtx().assumes().getAssumedVal(val.interval_ident->text, isGlobal))
-        varValue = interv->normalizeValue(*valueMaybe);
-    }
-    const Interval *interval = intervalList->getInterval(intervalIndex);
-    if (!ShaderVariant::ValueRange(0, interval->getValueCount() - 1).isInRange(varValue))
-    {
-      report_bool_eval_error(
-        String{0, "  illegal normalized value (%d) for this interval (%s)\n", varValue, get_interval_name(*interval, ctx.tgtCtx())});
-      return ShVarBool(false, false);
-    }
-
-    String error_msg;
-    bool bool_result = interval->checkExpression(varValue, expr, val.interval_value->text, error_msg, ctx.tgtCtx());
-    if (!error_msg.empty())
-      report_error(parser, val.interval_ident, error_msg);
-
-    return ShVarBool(bool_result, true);
-  }
-  else if (val.texture_name)
-  {
-    auto [varIndex, varType, isGlobal] = lookup_state_var(*val.texture_name, ctx);
-    if (varIndex < 0)
-    {
-      report_bool_eval_error(String{0, "  variable <%s> not defined!\n", val.texture_name});
-      return ShVarBool(false, false);
-    }
-
-    const IntervalList *intervalList = &variant.intervals;
-
-    // search interval by name
-    int e_texture_ident_id = ctx.tgtCtx().intervalNameMap().getNameId(val.texture_name->text);
-    int intervalIndex = variant.intervals.getIntervalIndex(e_texture_ident_id);
-    if (intervalIndex == INTERVAL_NOT_INIT)
-    {
-      intervalIndex = ctx.tgtCtx().globVars().getIntervalList().getIntervalIndex(e_texture_ident_id);
-
-      if (intervalIndex == INTERVAL_NOT_INIT)
-      {
-        report_bool_eval_error(String{0, "  interval %s not found!\n", val.texture_name->text});
-        return ShVarBool(false, false);
-      }
-
-      intervalList = &ctx.tgtCtx().globVars().getIntervalList();
-    }
-
-    const Interval *interv = intervalList->getInterval(intervalIndex);
-    G_ASSERT(interv);
-
-    ShaderVariant::ValueType varValue = variant.getValue(interv->getVarType(), intervalIndex);
-    if (varValue == -1)
-    {
-      if (auto valueMaybe = ctx.shCtx().assumes().getAssumedVal(val.texture_name->text, isGlobal))
-        varValue = interv->normalizeValue(*valueMaybe);
-    }
-
-    bool result = false;
-    G_ASSERT(val.cmpop);
-    switch (val.cmpop->op->num)
-    {
-      case SHADER_TOKENS::SHTOK_eq:
-      case SHADER_TOKENS::SHTOK_assign:
-      {
-        result = varValue != 1;
-        break;
-      }
-      case SHADER_TOKENS::SHTOK_noteq:
-      {
-        result = varValue == 1;
-        break;
-      }
-      case SHADER_TOKENS::SHTOK_greater:
-      case SHADER_TOKENS::SHTOK_greatereq:
-      case SHADER_TOKENS::SHTOK_smaller:
-      case SHADER_TOKENS::SHTOK_smallereq:
-        report_error(parser, val.cmpop->op, "[ERROR] operators '>', '>=', '<' and '<=' are not supported here!");
-        break;
-      default: G_ASSERT(0);
-    }
-
-    return ShVarBool(result, true);
-  }
-  else if (val.bool_var)
-  {
-    auto res = semantic::get_bool_expr(*val.bool_var, parser, ctx, ctx.tgtCtx());
-    if (res)
-      return eval_expr(*res.expr);
-  }
-  else if (val.maybe)
-  {
-    auto res = semantic::get_bool_maybe(*val.maybe_bool_var, ctx, ctx.tgtCtx());
-    if (res)
-      return eval_expr(*res.expr);
-    else
-      return ShVarBool(false, true);
-  }
-  else if (val.true_value)
-  {
-    return ShVarBool(true, true);
-  }
-  else if (val.false_value)
-  {
-    return ShVarBool(false, true);
-  }
-  else
-  {
-    G_ASSERT(0);
-  }
-  return ShVarBool(false, false);
+  G_ASSERTF_RETURN(0, ShVarBool(false, false),
+    "ICE: use bytecode for bool expr evaluation in variants! This method only exists due to interface");
 }
 
 int VariantBoolExprEvalCB::eval_interval_value(const char *ival_name)
@@ -279,7 +235,7 @@ int VariantBoolExprEvalCB::eval_interval_value(const char *ival_name)
   ShaderVariant::ValueType varValue = ctx.variant().getValue(interv->getVarType(), intervalIndex);
   if (varValue == -1)
   {
-    if (auto valueMaybe = ctx.shCtx().assumes().getAssumedVal(ival_name, isGlobal))
+    if (auto valueMaybe = ctx.shCtx().assumes().getAssumedVal(e_interval_ident_id, isGlobal))
       varValue = interv->normalizeValue(*valueMaybe);
   }
   return varValue;
@@ -299,6 +255,95 @@ eastl::optional<ShaderStage> parse_state_block_stage(const char *stage_str)
   }
 
   return eastl::nullopt;
+}
+
+// Synthesizes (or returns the existing) anonymous static texture shader var bound to material
+// texture slot `slot`. Equivalent in effect to the user writing:
+//   texture __dgrmat_tex_<slot> = material.texture[<slot>];
+// so that `@staticTex = material.texture.<diffuse|N>` can be desugared into a MaterialVar
+// initializer referencing this synthesized shader var.
+static int get_or_synth_static_mat_tex_var_id(int slot, shc::VariantContext &ctx, const eastl::vector<static_attrib_decl *> &attribs,
+  Symbol *loc)
+{
+  ShaderSemCode &code = ctx.parsedSemCode();
+
+  char nameBuf[32];
+  SNPRINTF(nameBuf, sizeof(nameBuf), "__dgrmat_tex_%d", slot);
+  const int varNameId = ctx.tgtCtx().varNameMap().addVarId(nameBuf);
+
+  int vi = code.find_var(varNameId);
+  if (vi >= 0)
+    return vi;
+
+  vi = ShaderParser::appendVarToContext(ctx, nameBuf, SHVT_TEXTURE, varNameId, loc, false, false, false, slot);
+
+  uint32_t flags = 0;
+  uint32_t stubCol = 0;
+
+  ShaderParser::parseAttribs(ctx, attribs, code.vars[vi], flags, stubCol);
+
+  const bool hasStubColor = flags & ShaderClass::VF_HAS_STUB_COLOR;
+
+  auto &sclass = ctx.shCtx().compiledShader();
+  auto &parser = ctx.tgtCtx().sourceParseState().parser;
+
+  int sv = sclass.find_static_var(varNameId);
+  if (sv < 0 && hasStubColor)
+  {
+    sv = append_items(sclass.stvar, 1);
+    sclass.stvar[sv].type = SHVT_TEXTURE;
+    sclass.stvar[sv].nameId = varNameId;
+    sclass.stvar[sv].additionalFlags = flags;
+    sclass.stvar[sv].stubColor = stubCol;
+    if (sclass.stvarsAreDynamic.size() <= sv)
+      sclass.stvarsAreDynamic.resize(sv + 1);
+
+    sclass.stvarsAreDynamic[sv] = code.vars[vi].dynamic;
+    sclass.stvar[sv].defval.texId = unsigned(BAD_TEXTUREID);
+  }
+  else if (sv >= 0)
+  {
+    if (sclass.stvar[sv].type != SHVT_TEXTURE)
+    {
+      report_error(parser, loc, "static var '%s' defined with different type", nameBuf);
+      return -1;
+    }
+    if (sclass.stvar[sv].additionalFlags != flags)
+    {
+      report_error(parser, loc, "static var '%s' defined with different attributes", nameBuf);
+      return -1;
+    }
+    if ((flags & ShaderClass::VF_HAS_STUB_COLOR) && (sclass.stvar[sv].stubColor != stubCol))
+    {
+      report_error(parser, loc, "static var '%s' defined with different stub colors", nameBuf);
+      return -1;
+    }
+  }
+
+  if (hasStubColor)
+  {
+    int i = append_items(code.stvarmap, 1);
+    code.stvarmap[i].v = vi;
+    code.stvarmap[i].sv = sv;
+
+    int opcode = shaderopcode::makeOp2(SHCOD_TEXTURE_STUBCOL, 0, sv);
+    for (int i = 0; i < sclass.shInitCode.size(); i += 2)
+      if (sclass.shInitCode[i + 1] == opcode)
+      {
+        if (sclass.shInitCode[i] != stubCol)
+          report_error(parser, loc, "ambiguous stub color for static texture <%s> used in branching", nameBuf);
+        return -1;
+      }
+    sclass.shInitCode.push_back(stubCol);
+    sclass.shInitCode.push_back(opcode);
+  }
+  else
+  {
+    code.initcode.push_back(vi);
+    code.initcode.push_back(shaderopcode::makeOp2(SHCOD_TEXTURE, slot, 0));
+  }
+
+  return vi;
 }
 
 eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_block_stat &state_block, ShaderStage stage,
@@ -322,6 +367,21 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
     def.hlsl = state_block.var->hlsl_var_text;
     if (state_block.var->val->expr)
       def.shaderVarTerm = state_block.var->val->expr->lhs->lhs->var_name;
+    else if (state_block.var->val->tex)
+    {
+      const auto &tex = *state_block.var->val->tex;
+      const int slot = tex.tex_num ? semutils::int_number(tex.tex_num->text) : 0;
+      char nameBuf[32];
+      SNPRINTF(nameBuf, sizeof(nameBuf), "__dgrmat_tex_%d", slot);
+      char *nameStor = TMPMEM_ALLOC_N(char, strlen(nameBuf) + 1);
+      memcpy(nameStor, nameBuf, strlen(nameBuf) + 1);
+      SHTOK_ident *synthIdent = TMPMEM_ALLOC(SHTOK_ident);
+      synthIdent->text = nameStor;
+      synthIdent->file_start = state_block.var->val->mat->file_start;
+      synthIdent->line_start = state_block.var->val->mat->line_start;
+      synthIdent->col_start = state_block.var->val->mat->col_start;
+      def.shaderVarTerm = synthIdent;
+    }
     def.builtinVarTerm = state_block.var->val->builtin_var;
   }
   else if (state_block.arr)
@@ -336,6 +396,7 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
     def.nameSpaceTerm = state_block.reg->var->nameSpace;
     def.hlsl = state_block.reg->hlsl_var_text;
     def.shaderVarTerm = state_block.reg->shader_var;
+    def.literalReg = state_block.reg->literal_id;
   }
   else if (state_block.reg_arr)
   {
@@ -344,6 +405,8 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
     def.hlsl = state_block.reg_arr->hlsl_var_text;
     def.shaderVarTerm = state_block.reg_arr->shader_var;
     def.sizeVarTerm = state_block.reg_arr->size_shader_var;
+    def.literalReg = state_block.reg_arr->literal_id;
+    def.literalSize = state_block.reg_arr->literal_size;
   }
   else
     G_ASSERTF(0, "Invalid/unsupported state_block_stat type");
@@ -381,22 +444,6 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
     report_warning(parser, *def.varTerm, "named const <%s%s> hides one in supported non-compatible blocks", def.baseName,
       def.nameSpaceTerm->text);
 
-  if (ctx.namedConstTable().globConstBlk)
-  {
-    bool conflict_blk = false;
-    if (def.stage == STAGE_VS)
-    {
-      conflict_blk = ctx.namedConstTable().globConstBlk->getVsNameId(def.baseName) != -1;
-    }
-    else
-    {
-      conflict_blk = ctx.namedConstTable().globConstBlk->getPsNameId(def.baseName) != -1;
-    }
-    if (conflict_blk)
-      report_error(parser, def.varTerm, "named const <%s%s> conflicts with global const block <%s>", def.baseName,
-        def.nameSpaceTerm->text, ctx.namedConstTable().globConstBlk->name.c_str());
-  }
-
   if (def.type == VariableType::Unknown)
   {
     report_error(parser, def.nameSpaceTerm, "named const <%s> has unknown type <%s> block", def.baseName, def.nameSpaceTerm->text);
@@ -404,28 +451,35 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
   }
 
   // validate hlsl existence
-  if ((def.type == VariableType::buf || def.type == VariableType::cbuf || def.type == VariableType::tex ||
-        def.type == VariableType::smp) &&
-      !def.hlsl)
+  if ((def.type == VariableType::buf || def.type == VariableType::cbuf || def.type == VariableType::tex) && !def.hlsl)
   {
     report_error(parser, def.nameSpaceTerm, "named const <%s> has type of <%s> and so requires hlsl", def.baseName,
       def.nameSpaceTerm->text);
   }
 
-  if (def.type != VariableType::f44 && state_block.arr && !state_block.arr->par)
-    report_error(parser, def.varTerm, "Array initializer for single named constants is only allowed for @f44 type");
+  if (vt_is_explicit_bindless(def.type) && def.hlsl)
+    report_error(parser, def.nameSpaceTerm,
+      "named const <%s> of type <%s> generates its own declaration and must not have an hlsl block", def.baseName,
+      def.nameSpaceTerm->text);
 
-  // @TODO: enable and test for other types if need be
-  if (def.type != VariableType::f4 && def.type != VariableType::i4 && def.type != VariableType::u4 && def.type != VariableType::f44 &&
-      def.type != VariableType::uav && ((state_block.arr && state_block.arr->par) || state_block.reg_arr))
+  if (def.type != VariableType::f44 && def.type != VariableType::f43 && state_block.arr && !state_block.arr->par)
+    report_error(parser, def.varTerm, "Array initializer for single named constants is only allowed for @f44 or @f43 type");
+
+#define TYPE(type) VariableType::type,
+  if (!item_is_in(def.type, {ARRAY_ELIGIBLE_PRESHADER_VARIABLE_TYPE_LIST}) &&
+      ((state_block.arr && state_block.arr->par) || state_block.reg_arr))
   {
-    report_error(parser, def.varTerm, "variable <%s> is of type <%s> and not @f4, @f44, @i4, @u4, @uav and so can't be array",
-      def.baseName, def.nameSpaceTerm->text);
+#undef TYPE
+#define TYPE(type) "@" #type ", "
+    report_error(parser, def.varTerm,
+      "variable <%s> is of type <%s> and not " ARRAY_ELIGIBLE_PRESHADER_VARIABLE_TYPE_LIST "and so can't be array", def.baseName,
+      def.nameSpaceTerm->text);
+#undef TYPE
   }
 
-  def.isBindless = vt_is_static_texture(def.type) && shc::config().enableBindless;
-  if (def.isBindless)
+  if (vt_is_static_texture(def.type) && shc::config().enableBindless)
   {
+    def.bindlessMode = BindlessMode::StaticImplicit;
     if (stage == STAGE_CS)
     {
       report_error(parser, def.varTerm, "variable <%s> of type <%s> is not permitted in a compute shader", def.baseName,
@@ -443,6 +497,7 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
     case VariableType::f3:
     case VariableType::f4:
     case VariableType::f44:
+    case VariableType::f43:
       def.shvarType = SHVT_COLOR4;
       def.regSpace = HLSL_RSPACE_C;
       break;
@@ -457,6 +512,21 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
       def.shvarType = SHVT_INT4;
       def.regSpace = HLSL_RSPACE_C;
       break;
+    case VariableType::bindlessTex2D:
+    case VariableType::bindlessTex3D:
+    case VariableType::bindlessTexCube:
+    case VariableType::bindlessTexArray:
+    case VariableType::bindlessTexCubeArray:
+    case VariableType::bindlessSampler:
+    case VariableType::bindlessByteBuffer:
+      if (!shc::config().enableBindless)
+        report_error(parser, def.varTerm, "variable <%s> of type <%s> requires bindless support, which is not enabled for this target",
+          def.baseName, def.nameSpaceTerm->text);
+      def.shvarType = SHVT_INT4;
+      def.regSpace = HLSL_RSPACE_C;
+      def.bindlessMode = BindlessMode::ExplicitApi;
+      def.mangledName = String{0, "%s_bindless_id", def.baseName};
+      break;
     case VariableType::tex:
     case VariableType::tex2d:
     case VariableType::tex3d:
@@ -467,40 +537,43 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
       def.regSpace = HLSL_RSPACE_T;
       break;
 
-    case VariableType::smp:
     case VariableType::smp2d:
     case VariableType::smp3d:
     case VariableType::smpArray:
-    case VariableType::smpCube:
-    case VariableType::smpCubeArray:
-    case VariableType::shd:
-    case VariableType::shdArray:
       def.shvarType = SHVT_TEXTURE;
       def.regSpace = HLSL_RSPACE_T;
       needPairSampler = true;
-      def.pairSamplerIsShadow = def.type == VariableType::shd || def.type == VariableType::shdArray;
       break;
-    case VariableType::staticSampler:
-    case VariableType::staticCube:
-    case VariableType::staticCubeArray:
+    case VariableType::staticTex:
+    case VariableType::staticSmp:
+    case VariableType::staticTexCube:
+    case VariableType::staticSmpCube:
+    case VariableType::staticTexCubeArray:
+    case VariableType::staticSmpCubeArray:
     case VariableType::staticTexArray:
+    case VariableType::staticSmpArray:
     case VariableType::staticTex3D:
+    case VariableType::staticSmp3D:
       def.shvarType = SHVT_TEXTURE;
-      def.regSpace = def.isBindless ? HLSL_RSPACE_C : HLSL_RSPACE_T;
-      needPairSampler = !def.isBindless;
+      def.regSpace = def.isStaticBindless() ? HLSL_RSPACE_C : HLSL_RSPACE_T;
+      needPairSampler = !def.isStaticBindless() && semantic::vt_is_static_sampled_texture(def.type);
       switch (def.type)
       {
-        case VariableType::staticSampler: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_2D; break;
-        case VariableType::staticTex3D: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_3D; break;
-        case VariableType::staticCube: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_CUBE; break;
-        case VariableType::staticTexArray: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_2D_ARRAY; break;
-        case VariableType::staticCubeArray: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_CUBE_ARRAY; break;
+        case VariableType::staticTex:
+        case VariableType::staticSmp: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_2D; break;
+        case VariableType::staticTex3D:
+        case VariableType::staticSmp3D: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_3D; break;
+        case VariableType::staticTexCube:
+        case VariableType::staticSmpCube: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_CUBE; break;
+        case VariableType::staticTexArray:
+        case VariableType::staticSmpArray: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_2D_ARRAY; break;
+        case VariableType::staticTexCubeArray:
+        case VariableType::staticSmpCubeArray: def.shvarTexType = ShaderVarTextureType::SHVT_TEX_CUBE_ARRAY; break;
         default: break;
       }
       break;
     case VariableType::sampler:
-      if (def.stage != STAGE_PS && def.stage != STAGE_CS)
-        report_error(parser, def.varTerm, "@sampler is supported only in ps/cs stage");
+    case VariableType::cmpSampler:
       def.shvarType = SHVT_SAMPLER;
       def.regSpace = HLSL_RSPACE_S;
       break;
@@ -526,10 +599,9 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
   }
 
   // @HACK produces a fake sampler declaration if a pair sampler var needs to be implicitly emitted
-  // (this takes place for @smp... vars). This feature should be inevitably removed in favor of explicit
+  // (this takes place for @smp2d... vars). This feature should be inevitably removed in favor of explicit
   // @tex... + @sampler combinations
   auto addPairSampler = [&] {
-    def.pairSamplerBindSuffix = def.pairSamplerIsShadow ? "_cmpSampler" : "_samplerstate";
     def.pairSamplerName = String{0, "%s_samplerstate", def.shaderVarTerm->text};
     def.pairSamplerTmpDecl = TMPMEM_ALLOC(sampler_decl);
     def.pairSamplerTmpDecl->name = TMPMEM_ALLOC(SHTOK_ident);
@@ -542,26 +614,40 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
   {
     def.isDynamic = true;
 
-    auto getConstIntFromShadervar = [&](Terminal *t) -> int {
-      auto [vi, reg_type, is_global] = lookup_state_var(*t, ctx);
-      G_ASSERT(vi >= 0);
-      if (reg_type != SHVT_INT)
+    auto getConstIntFromShadervarOrLit = [&](Terminal *t, SHTOK_intnum *i) -> int {
+      if (t)
       {
-        report_error(parser, t, "Hardcoded register %s must be of type `int`, but found %s", t->text,
-          ShUtils::shader_var_type_name(reg_type));
-      }
-      if (is_global)
-      {
-        ctx.tgtCtx().globVars().getVar(vi).isImplicitlyReferenced = true;
-        return ctx.tgtCtx().globVars().getVar(vi).value.i;
+        G_ASSERT(!i);
+        auto [vi, reg_type, is_global] = lookup_state_var(*t, ctx);
+        G_ASSERT(vi >= 0);
+        if (reg_type != SHVT_INT)
+        {
+          report_error(parser, t, "Hardcoded register %s must be of type `int`, but found %s", t->text,
+            ShUtils::shader_var_type_name(reg_type));
+        }
+        if (is_global)
+        {
+          ctx.tgtCtx().globVars().getVar(vi).isImplicitlyReferenced = true;
+          return ctx.tgtCtx().globVars().getVar(vi).value.i;
+        }
+        else
+        {
+          report_error(parser, t, "Only global variables for hardcoded registers are supported");
+          return -1;
+        }
       }
       else
-        report_error(parser, t, "Only global variables for hardcoded registers are supported");
-      return -1;
+      {
+        G_ASSERT(i);
+        int res = -1;
+        if (!semutils::try_int_number(i->text, res))
+          report_error(parser, i, "Invalid int literal '%s' for explicit register/size", i->text);
+        return res;
+      }
     };
 
-    def.hardcodedRegister = getConstIntFromShadervar(def.shaderVarTerm);
-    def.registerSize = state_block.reg ? 1 : getConstIntFromShadervar(def.sizeVarTerm);
+    def.hardcodedRegister = getConstIntFromShadervarOrLit(def.shaderVarTerm, def.literalReg);
+    def.registerSize = state_block.reg ? 1 : getConstIntFromShadervarOrLit(def.sizeVarTerm, def.literalSize);
     def.arrayElemCount = def.registerSize;
     if (state_block.reg_arr && state_block.reg_arr->hlsl_var_text)
     {
@@ -570,15 +656,6 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
         // @TODO: enable once implemented
         report_error(parser, state_block.reg_arr->var,
           "Hardcoded register arrays with custom hlsl for type @f4 (arrays of structs) are not implemented yet");
-        return eastl::nullopt;
-      }
-      else if (def.type != VariableType::uav)
-      {
-        // @TODO: enable and test for other types if need be
-        report_error(parser, state_block.reg_arr->var,
-          "Hardcoded register arrays with custom hlsl not supported for type %s. For arrays of structs, use @f4 (not implemented "
-          "yet)",
-          state_block.reg_arr->var->nameSpace->text);
         return eastl::nullopt;
       }
     }
@@ -613,6 +690,8 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
 
   if (def.type == VariableType::f44 && !isMatrixFromVectors)
     def.shvarType = SHVT_FLOAT4X4;
+  if (def.type == VariableType::f43)
+    def.shvarType = SHVT_FLOAT4x3;
 
   if (state_block.arr && !state_block.arr->par && !isMatrixFromVectors && synInitializerElemCount > 1)
   {
@@ -656,8 +735,10 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
     return true;
   };
 
-  const int elementRegisterSize = (def.type == VariableType::f44 && !isMatrixFromVectors) ? 4 : 1;
-  const bool allowsArithmeticExpressions = (vt_is_numeric(def.type) && def.type != VariableType::f44) || isMatrixFromVectors;
+  const int elementRegisterSize =
+    (def.type == VariableType::f44 && !isMatrixFromVectors) ? 4 : (def.type == VariableType::f43 ? 3 : 1);
+  const bool allowsArithmeticExpressions =
+    (vt_is_numeric(def.type) && def.type != VariableType::f44 && def.type != VariableType::f43) || isMatrixFromVectors;
 
   // All arithmetic consts are forced to be dynamic for blocks -- all stcode is run as if it were dynamic anyways, and until we can
   // bake pure constexpr expressions directly into hlsl (@TODO), we need to force them to be considered dynamic
@@ -679,6 +760,25 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
         def.exprWithDynamicAndMaterialTerms = &val;
       }
     });
+
+    if (val.tex)
+    {
+      if (!vt_is_static_texture(def.type))
+      {
+        report_error(parser, val.mat, "material.texture.* can only initialize a static texture named const (got %s)",
+          def.nameSpaceTerm->text);
+        return eastl::nullopt;
+      }
+      const int slot = val.tex->tex_num ? semutils::int_number(val.tex->tex_num->text) : 0;
+
+      if (!registerInitShvarType(SHVT_TEXTURE))
+        return eastl::nullopt;
+
+      const int vi = get_or_synth_static_mat_tex_var_id(slot, ctx, val.attrib, val.mat);
+      const char *vname = ctx.tgtCtx().varNameMap().getName(ctx.parsedSemCode().vars[vi].nameId);
+      hadStaticElements = true;
+      return Elem{Elem::MaterialVar{vi, ShaderVarType(SHVT_TEXTURE), vname}, val.mat};
+    }
 
     if (val.builtin_var)
     {
@@ -728,7 +828,8 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
     {
       if (!val.expr->lhs->lhs->var_name)
       {
-        report_error(parser, &val, "Arithmetic expressions are not supported for matrix. Check: %s@f44", def.baseName);
+        report_error(parser, &val, "Arithmetic expressions are not supported for matrix. Check: %s%s", def.baseName,
+          def.nameSpaceTerm->text);
         return eastl::nullopt;
       }
       auto [vi, vt, isGlobal] = semantic::lookup_state_var(*val.expr->lhs->lhs->var_name, ctx);
@@ -789,6 +890,8 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
       arithmetic_operand *op = TMPMEM_ALLOC(arithmetic_operand);
       SHTOK_ident *varNameIdent = TMPMEM_ALLOC(SHTOK_ident);
       value->builtin_var = nullptr;
+      value->mat = nullptr;
+      value->tex = nullptr;
       value->expr = e;
       value->expr->lhs = emd;
       value->expr->lhs->lhs = op;
@@ -822,7 +925,8 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
     return eastl::nullopt;
 
   def.registerSize = def.initializer.size() * elementRegisterSize;
-  def.arrayElemCount = def.type == VariableType::f44 ? def.registerSize / 4 : def.registerSize;
+  def.arrayElemCount =
+    (def.type == VariableType::f44) ? def.registerSize / 4 : (def.type == VariableType::f43 ? def.registerSize / 3 : def.registerSize);
 
   // Validate semantic constraints on dynamicity and use of global/material vars combinations
 
@@ -856,7 +960,7 @@ eastl::optional<NamedConstDefInfo> parse_named_const_definition(const state_bloc
 #undef TMPMEM_ALLOC
 }
 
-eastl::optional<LocalVarDefInfo> parse_local_var_decl(local_var_decl &decl, shc::VariantContext &ctx,
+eastl::optional<LocalVarDefInfo> parse_local_var_decl(const local_var_decl &decl, shc::VariantContext &ctx,
   bool ignore_color_dimension_mismatch, bool allow_override)
 {
   using namespace ShaderParser;

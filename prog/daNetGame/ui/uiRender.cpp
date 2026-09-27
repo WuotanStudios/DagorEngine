@@ -16,11 +16,14 @@
 #include <osApiWrappers/dag_miscApi.h>
 #include <perfMon/dag_statDrv.h>
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <ecs/scripts/scripts.h>
 
 #include <daRg/dag_guiScene.h>
 #include <daRg/dag_panelRenderer.h>
+#include <quirrel/sqEventBus/sqEventBus.h>
 
 
 namespace uirender
@@ -45,11 +48,10 @@ all_darg_scenes_t get_all_scenes()
 bool has_scenes() { return overlay_ui::gui_scene() || user_ui::gui_scene.get(); }
 
 
-static class UIRenderJob final : public cpujobs::IJob
+static struct UIRenderJob final : public cpujobs::IJob
 {
   WinCritSec critSec;
 
-public:
   enum RunState : uint8_t
   {
     INITIAL = 0x00,
@@ -59,18 +61,19 @@ public:
   };
   uint8_t runState = INITIAL;
 
-  const char *getJobName(bool &) const override { return "darg_scene_build_render"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("darg_scene_build_render"); }
 
   void doJob() override
   {
     WinAutoLock lock(critSec);
-    // Note: daRg is "owning" `StdGuiRender` until this job's completion so no much sense to do this reset in main thread
+
+    // Note: daRg "owns" `StdGuiRender` until this job's completion so no much sense to do this reset in main thread
     StdGuiRender::reset_per_frame_dynamic_buffer_pos();
+
     for (darg::IGuiScene *scn : get_all_scenes())
     {
       FRAMEMEM_REGION;
       HSQUIRRELVM vm = scn->getScriptVM();
-      VMScopedCriticalSection vmLock(vm, &critSec);
       sq_limitthreadaccess(vm, ::get_current_thread_id());
       scn->renderThreadBeforeRender();
       scn->buildRender();
@@ -107,27 +110,23 @@ void wait_ui_render_job_done()
     for (darg::IGuiScene *scn : get_all_scenes())
     {
       sq_limitthreadaccess(scn->getScriptVM(), ::get_main_thread_id());
+      sqvm_unregister_critical_section(scn->getScriptVM());
     }
   }
 }
 
-static class UIBeforeRenderJob final : public cpujobs::IJob
+static struct UIBeforeRenderJob final : public cpujobs::IJob
 {
-  WinCritSec critSec;
-
-public:
   float dt;
-  const char *getJobName(bool &) const override { return "gui_before_render_update"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("gui_before_render_update"); }
   void doJob() override
   {
-    WinAutoLock lock(critSec);
+    WinAutoLock lock(ui_render_job.critSec);
 
     for (darg::IGuiScene *scn : get_all_scenes())
     {
       FRAMEMEM_REGION;
-      HSQUIRRELVM vm = scn->getScriptVM();
-      VMScopedCriticalSection vmLock(vm, &critSec);
-      sq_limitthreadaccess(vm, ::get_current_thread_id());
+      sq_limitthreadaccess(scn->getScriptVM(), ::get_current_thread_id());
       scn->update(dt);
     }
 
@@ -143,6 +142,7 @@ void wait_ui_before_render_job_done()
     TIME_PROFILE(wait_ui_before_render_job_done);
     threadpool::wait(&ui_before_render_job);
   }
+  sqeventbus::set_mtsafe_mode(false);
 }
 
 
@@ -154,17 +154,36 @@ void start_ui_render_job(bool wake)
     ui_render_job.start(wake);
 }
 
+void prepare_to_start_ui_before_render_job()
+{
+  if (beforeRenderMultithreaded)
+  {
+    sqeventbus::set_mtsafe_mode(true);
+    interlocked_release_store(ui_before_render_job.done, 0); // To be able wait it
+  }
+  for (darg::IGuiScene *scn : get_all_scenes())
+    sqvm_register_critical_section(scn->getScriptVM(), ui_render_job.critSec);
+}
 
 void start_ui_before_render_job()
 {
   if (beforeRenderMultithreaded)
-    threadpool::add(&ui_before_render_job, threadpool::PRIO_LOW, true);
+  {
+    if (is_main_thread())
+      sqeventbus::set_mtsafe_mode(true);
+    using namespace threadpool;
+    uint32_t _1;
+    add(&ui_before_render_job, PRIO_LOW, _1, AddFlags::WakeOnAdd | AddFlags::IgnoreNotDone);
+  }
 }
 
 void skip_ui_render_job()
 {
   if (beforeRenderMultithreaded)
     G_VERIFY(interlocked_exchange(ui_render_job.done, 1) == 0); // Since we resetted it on `ui_before_render_job` start
+  if (multithreaded)
+    for (darg::IGuiScene *scn : get_all_scenes())
+      sqvm_unregister_critical_section(scn->getScriptVM());
 }
 
 void update_all_gui_scenes_mainthread(float dt)

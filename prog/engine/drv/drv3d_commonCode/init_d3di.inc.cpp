@@ -1,5 +1,6 @@
 #include <drv/3d/dag_interface_table.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_texture.h>
 #include <drv/3d/dag_bindless.h>
@@ -23,6 +24,7 @@
 #include <drv/3d/dag_resUpdateBuffer.h>
 #include <drv/3d/dag_shaderLibrary.h>
 #include <drv/3d/dag_capture.h>
+#include <drv/3d/dag_resourceTag.h>
 
 #if _TARGET_PC
 #include <drv/3d/dag_platform_pc.h>
@@ -32,15 +34,16 @@
 
 static void na_func() { DAG_FATAL("D3DI function not implemented"); }
 
-#define FILL_ENTRY(X)     d3dit.X = d3d::X
-#define FILL_ENTRY2(X, Y) d3dit.X = d3d::Y
+#define FILL_ENTRY(X)     d3dit.X = d3d _ADD_MULTI_NAMESPACE::X
+#define FILL_ENTRY2(X, Y) d3dit.X = d3d _ADD_MULTI_NAMESPACE::Y
 #if _TARGET_PC_WIN | _TARGET_PC_MACOSX
-#define FILL_ENTRY_PC(X) d3dit.X = d3d::pcwin::X
+#define FILL_ENTRY_PC(X) d3dit.X = d3d::pcwin _ADD_MULTI_NAMESPACE::X
 #else
 #define FILL_ENTRY_PC(X)
 #endif
-#define FILL_NAMESPACE_ENTRY(nspace, name)                        d3dit.nspace.name = d3d::nspace::name
-#define FILL_NAMESPACE_ENTRY2(nspace, internal_name, public_name) d3dit.nspace.internal_name = d3d::nspace::public_name
+#define FILL_NAMESPACE_ENTRY(nspace, name) d3dit.nspace.name = d3d::nspace _ADD_MULTI_NAMESPACE::name
+#define FILL_NAMESPACE_ENTRY2(nspace, internal_name, public_name) \
+  d3dit.nspace.internal_name = d3d::nspace _ADD_MULTI_NAMESPACE::public_name
 
 bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
 {
@@ -51,7 +54,6 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
 
   // fill table with proper function pointers
   FILL_ENTRY(get_driver_name);
-  FILL_ENTRY(get_device_driver_version);
   FILL_ENTRY(get_device_name);
   FILL_ENTRY(get_last_error);
   FILL_ENTRY(get_last_error_code);
@@ -89,31 +91,28 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY2(stretch_rect_0, stretch_rect);
   FILL_ENTRY(copy_from_current_render_target);
 
+  FILL_ENTRY(down_size_tex);
+  FILL_ENTRY(up_size_tex);
+
   FILL_ENTRY(get_texture_statistics);
 
   FILL_ENTRY(settex);
   FILL_ENTRY(settex_vs);
 
   FILL_ENTRY2(create_program_0, create_program);
-  FILL_ENTRY2(create_program_1, create_program);
   FILL_ENTRY2(create_program_cs, create_program_cs);
 
   FILL_ENTRY(set_program);
   FILL_ENTRY(delete_program);
 
   FILL_ENTRY(create_vertex_shader);
-  FILL_ENTRY(create_vertex_shader_dagor);
   FILL_ENTRY(delete_vertex_shader);
 
   FILL_ENTRY(set_vertex_shader);
   FILL_ENTRY(set_const);
   FILL_ENTRY(set_immediate_const);
 
-  FILL_ENTRY(set_vs_constbuffer_size);
-  FILL_ENTRY(set_cs_constbuffer_size);
-
   FILL_ENTRY(create_pixel_shader);
-  FILL_ENTRY(create_pixel_shader_dagor);
   FILL_ENTRY(delete_pixel_shader);
 
   FILL_ENTRY(set_pixel_shader);
@@ -123,10 +122,12 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY(register_bindless_sampler);
 
   FILL_ENTRY(allocate_bindless_resource_range);
-  FILL_ENTRY(resize_bindless_resource_range);
   FILL_ENTRY(free_bindless_resource_range);
+  FILL_ENTRY(update_bindless_resource_range);
   FILL_ENTRY(update_bindless_resource);
   FILL_ENTRY(update_bindless_resources_to_null);
+  FILL_ENTRY(add_bindless_resource);
+  FILL_ENTRY(add_bindless_resources);
 
   FILL_ENTRY(set_tex);
   FILL_ENTRY(set_rwtex);
@@ -137,6 +138,9 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY(clear_rt);
 
   FILL_ENTRY(discard_tex);
+
+  FILL_ENTRY(update_sub_region);
+  FILL_ENTRY(update_sub_region_no_order);
 
   FILL_ENTRY(set_buffer);
   FILL_ENTRY(set_rwbuffer);
@@ -149,9 +153,8 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY2(set_depth_0, set_depth);
   FILL_ENTRY2(set_depth_1, set_depth);
   FILL_ENTRY2(set_render_target_0, set_render_target);
-  FILL_ENTRY2(set_render_target_1, set_render_target);
-  FILL_ENTRY2(set_render_target_2, set_render_target);
   FILL_ENTRY2(set_render_target_3, set_render_target);
+  FILL_ENTRY2(set_render_target_4, set_render_target);
   FILL_ENTRY(get_render_target);
   FILL_ENTRY(get_target_size);
   FILL_ENTRY(get_render_target_size);
@@ -191,7 +194,6 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY(clearview);
 
   FILL_ENTRY(update_screen);
-  FILL_ENTRY(wait_for_async_present);
   FILL_ENTRY(begin_frame);
   FILL_ENTRY(mark_simulation_start);
   FILL_ENTRY(mark_simulation_end);
@@ -206,8 +208,6 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
 
   FILL_ENTRY(draw_base);
   FILL_ENTRY(drawind_base);
-  FILL_ENTRY(draw_up);
-  FILL_ENTRY(drawind_up);
   FILL_ENTRY(draw_indirect);
   FILL_ENTRY(draw_indexed_indirect);
   FILL_ENTRY(multi_draw_indirect);
@@ -216,6 +216,7 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY(dispatch_indirect);
   FILL_ENTRY(dispatch_mesh);
   FILL_ENTRY(dispatch_mesh_indirect);
+  FILL_ENTRY(dispatch_mesh_indirect_count);
 
   FILL_ENTRY(insert_fence);
   FILL_ENTRY(insert_wait_on_fence);
@@ -255,8 +256,6 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY(begin_conditional_render);
   FILL_ENTRY(end_conditional_render);
 
-  FILL_ENTRY(get_program_vdecl);
-
   FILL_ENTRY(get_vrr_supported);
   FILL_ENTRY(get_vsync_enabled);
   FILL_ENTRY(enable_vsync);
@@ -271,6 +270,8 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY(endEvent);
   FILL_ENTRY(get_backbuffer_tex);
   FILL_ENTRY(get_secondary_backbuffer_tex);
+
+  FILL_ENTRY(get_dedicated_gpu_memory_system_internal_overhead_kb);
 
 #if D3D_HAS_RAY_TRACING
   // raytrace interface ->
@@ -308,6 +309,9 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
 #endif
 
   FILL_ENTRY(resource_barrier);
+  FILL_ENTRY(enhanced_texture_barrier);
+  FILL_ENTRY(enhanced_buffer_barrier);
+  FILL_ENTRY(enhanced_barrier_batch);
 
   FILL_ENTRY(create_render_pass);
   FILL_ENTRY(delete_render_pass);
@@ -345,6 +349,8 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
   FILL_ENTRY(start_capture);
   FILL_ENTRY(stop_capture);
 
+  FILL_ENTRY(visit_tagged_resources);
+
   FILL_ENTRY_PC(set_present_wnd);
 
   FILL_ENTRY_PC(can_render_to_window);
@@ -359,7 +365,6 @@ bool d3d::fill_interface_table(D3dInterfaceTable &d3dit)
 
   d3dit.driverCode = DRV3D_CODE;
   d3dit.driverName = d3d::get_driver_name();
-  d3dit.driverVer = d3d::get_device_driver_version();
   d3dit.deviceName = d3d::get_device_name();
   memset(&d3dit.drvDesc, 0, sizeof(d3dit.drvDesc));
 

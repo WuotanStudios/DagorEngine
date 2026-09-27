@@ -53,7 +53,7 @@ TexPtr create_preintegrated_fresnel_GGX(const char *name, uint32_t preintegrate_
       prefmt = TEXFMT_DEFAULT;
   }
 
-  TexPtr preIntegratedGF = dag::create_tex(nullptr, 128, 32, prefmt | TEXCF_RTARGET, 1, name);
+  TexPtr preIntegratedGF = dag::create_tex(nullptr, 128, 32, prefmt | TEXCF_RTARGET, 1, name, RESTAG_POSTFX);
   eastl::string samplerName(eastl::string::CtorSprintf{}, "%s_samplerstate", name);
   d3d::SamplerInfo smpInfo;
   smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
@@ -66,7 +66,7 @@ void render_preintegrated_fresnel_GGX(Texture *preIntegratedGF, PostFxRenderer *
   d3d::GpuAutoLock gpuLock;
   SCOPE_RENDER_TARGET;
 
-  d3d::set_render_target(preIntegratedGF, 0);
+  d3d::set_render_target({}, DepthAccess::RW, {{preIntegratedGF, 0, 0}});
   ShaderGlobal::set_int(preintegrated_envi_frameVarId, frames <= 1 ? -1 : int(frame));
   // d3d::clearview( CLEAR_TARGET, 0xffffffff, 0.f, 0 );
 

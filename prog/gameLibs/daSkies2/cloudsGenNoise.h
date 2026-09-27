@@ -24,14 +24,14 @@ public:
   bool render();
   void setVars();
 
-  SharedTexHolder resCloud1, resCloud2;
+  SharedTexWithShaderVar resCloud1, resCloud2;
 
 private:
   /* Return true if curl was rendered */
   bool renderCurl();
   void generateMips3d(const ManagedTex &tex);
 
-  bool loadVolmap(const char *resname, int resolution, SharedTexHolder &tex);
+  bool loadVolmap(const char *resname, int resolution, SharedTexWithShaderVar &tex);
   static int get_blocked_mips(const ManagedTex &tex);
 
   void closeCompressor();
@@ -54,12 +54,13 @@ private:
   bool curlRendered = false;
   bool compressSupported = false;
 
-  eastl::unique_ptr<ComputeShaderElement> genCurl2d, genCurl3d;
+  eastl::unique_ptr<ComputeShaderElement> genCurl2d, genCurl2dCompressed, genCurl3dCompressed;
   PostFxRenderer genCurl2dPs;
-  VoltexRenderer genCloudShape, genCloudDetail, genMips3d;
+  VoltexRenderer genCloudShape, genCloudDetail, genMips3d, genCurl3d;
 
-  UniqueTexHolder cloud1, cloud2;
-  UniqueTexHolder cloudsCurl2d;
+  UniqueTexWithShaderVar cloud1, cloud2;
+  UniqueTexWithShaderVar cloudsCurl2d;
+  UniqueTexWithShaderVar cloudsCurl3d;
   VoltexRenderer compress3D;
 
   UniqueTex cloud1Compressed, cloud2Compressed;

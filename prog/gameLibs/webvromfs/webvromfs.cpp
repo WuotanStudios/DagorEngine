@@ -21,9 +21,12 @@
 
 Tab<SimpleString> WebVromfsDataCache::bannedUrlPrefix;
 int WebVromfsDataCache::banUnresponsiveUrlForTimeoutInSec = 9;
+bool WebVromfsDataCache::silentMode = false;
 
 bool WebVromfsDataCache::init(const DataBlock &params, const char *cache_dir)
 {
+  // let a main-thread unmount drive download completions while it drains off-main resolves
+  set_vromfs_backed_resolve_pump(&cpujobs::release_done_jobs);
   DataBlock wcParams;
   wcParams = params;
 
@@ -39,9 +42,12 @@ bool WebVromfsDataCache::init(const DataBlock &params, const char *cache_dir)
   simplify_fname(webcachePrefix);
 
   banUnresponsiveUrlForTimeoutInSec = params.getInt("banUnresponsiveUrlForTimeoutInSec", 10);
+  silentMode = params.getBool("silentMode", false);
   wcParams.setBool("noIndex", true);
   wcParams.setInt64("maxSize", params.getInt64("maxSize", 32 << 20));
   wcParams.setInt("timeoutSec", params.getInt("timeoutSec", 12));
+  if (params.paramExists("connectTimeoutSec"))
+    wcParams.setInt("connectTimeoutSec", params.getInt("connectTimeoutSec", 10));
   wcParams.setInt("traceLevel", params.getInt("traceLevel", 0));
   wcParams.setBool("smartMultiThreading", true);
   wcParams.setStr("jobMgrName", "vromfsWebCache");
@@ -222,7 +228,10 @@ bool WebVromfsDataCache::vromfs_get_file_data(const char *rel_fn, const char * /
   }
 
   wb->measureWaitTime(get_time_usec(reft), rel_fn, (void *)sync_wait_entry);
-  logerr("web-vromfs: [network] get(%s): err=%d", rel_fn, err);
+  if (silentMode)
+    logwarn("web-vromfs: [network] get(%s): err=%d", rel_fn, err);
+  else
+    logerr("web-vromfs: [network] get(%s): err=%d", rel_fn, err);
   if (const char *ext = dd_get_fname_ext(src_fn))
   {
     int idx = wb->substFileExt.getNameId(ext);
@@ -263,9 +272,11 @@ void WebVromfsDataCache::measureWaitTime(int usec, const char *rel_fn, void *syn
 
 static void remove_entry(datacache::Entry *ent)
 {
+  // NOTE: caller owns the entry's user reference; do NOT call ent->free() here.
+  // With delOnFree set by del(), free() in FileEntry can drop refCount to 0 and `delete this`,
+  // which then becomes a UAF when the caller's EntryHolder/explicit free() runs.
   ent->closeStream();
   ent->del();
-  ent->free();
 }
 static bool check_file_hash_and_erase_if_broken(const char *key, datacache::Entry *ent)
 {
@@ -320,6 +331,8 @@ void WebVromfsDataCache::onFileLoadedSync(const char *key, datacache::ErrorCode 
   else
   {
     *(datacache::Entry **)arg = ENT_PTR_STATUS_FAILED;
+    if (ent) // remove_entry no longer frees; release the user reference here
+      ent->free();
     logwarn("web-vromfs: [network] failed to download %s, err=%d", key, err);
   }
 }

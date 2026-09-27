@@ -4,6 +4,7 @@
 #include <render/randomGrass.h>
 #include <render/randomGrassInstance.hlsli>
 #include <shaders/dag_shaderMesh.h>
+#include <3d/dag_texMgr.h>
 #include <generic/dag_enumerate.h>
 #include <3d/dag_lockSbuffer.h>
 #include <3d/dag_eventQueryHolder.h>
@@ -12,15 +13,15 @@
 #include <math/dag_half.h>
 
 #include "bvh_context.h"
+#include "bvh_omm.h"
 #include "bvh_tools.h"
 #include "bvh_generic_connection.h"
+#include <render/omm.h>
 #include <drv/3d/dag_bindless.h>
 #include <drv/3d/dag_lock.h>
 
 namespace bvh
 {
-
-Sbuffer *alloc_scratch_buffer(uint32_t size, uint32_t &offset);
 
 namespace grass
 {
@@ -32,22 +33,29 @@ struct BVHVertex
   Point2 texcoord;
 };
 
-static UniqueBLAS create_grass_blas(Sbuffer *vb, Sbuffer *ib, int vcount, int icount)
+static UniqueBLAS create_grass_blas(ContextId context_id, const BVHGeometryBufferWithOffset &geometry, int vcount, int icount,
+  const RaytraceGeometryDescription::OpacityMicroMapLinkage *omm_linkage = nullptr)
 {
   RaytraceGeometryDescription desc;
   memset(&desc, 0, sizeof(desc));
   desc.type = RaytraceGeometryDescription::Type::TRIANGLES;
-  desc.data.triangles.vertexBuffer = vb;
-  desc.data.triangles.indexBuffer = ib;
+  desc.data.triangles.vertexBuffer = geometry.getVertexBuffer(context_id);
+  desc.data.triangles.indexBuffer = geometry.getIndexBuffer(context_id);
   desc.data.triangles.vertexCount = vcount;
   desc.data.triangles.vertexStride = sizeof(BVHVertex);
   desc.data.triangles.vertexFormat = VSDT_FLOAT3;
+  desc.data.triangles.vertexOffsetExtraBytes = geometry.vbOffset;
   desc.data.triangles.indexCount = icount;
-  desc.data.triangles.indexOffset = 0;
+  desc.data.triangles.indexOffset = geometry.ibOffset / 2;
   desc.data.triangles.flags = RaytraceGeometryDescription::Flags::NONE;
+  if (omm_linkage)
+  {
+    desc.ommLinkage = *omm_linkage;
+    desc.extraDataAvailableMask.hasOpacityMicroMapLinkage = true;
+  }
 
   raytrace::BottomAccelerationStructureBuildInfo buildInfo{};
-  buildInfo.flags = RaytraceBuildFlags::FAST_TRACE;
+  buildInfo.flags = RaytraceBuildFlags::FAST_TRACE | RaytraceBuildFlags::LOW_MEMORY;
 
   UniqueBLAS blas = UniqueBLAS::create(&desc, 1, buildInfo.flags);
   HANDLE_LOST_DEVICE_STATE(blas, blas);
@@ -64,28 +72,55 @@ static UniqueBLAS create_grass_blas(Sbuffer *vb, Sbuffer *ib, int vcount, int ic
   return blas;
 }
 
+// The write of the address is what puts a LOD into the BVH.
+static void publish_grass_blas_address(RandomGrassBvhMapping &mapping, const UniqueBLAS &blas)
+{
+  const auto handle = blas.getGPUAddress();
+  mapping.blas.x = handle & GPU_ADDRESS_LOW_MASK;
+  mapping.blas.y = handle >> GPU_ADDRESS_HIGH_SHIFT;
+}
+
 struct LOD
 {
   TEXTUREID diffuseTexId;
   TEXTUREID alphaTexId;
-  UniqueBuf vertices;
-  UniqueBuf indices;
+  BVHGeometryBufferWithOffset geometry;
   UniqueBVHBufferWithOffset ahsVertices;
   UniqueBLAS blas;
   MeshMetaAllocator::AllocId metaAllocId = MeshMetaAllocator::INVALID_ALLOC_ID;
 
+  // Kept so process_omm() can build the geometry some frames after reload_grass().
+  uint32_t vertexCount = 0;
+  uint32_t indexCount = 0;
+  int metaMappingIndex = -1;
+  OmmState ommState = OmmState::None;
+  uint32_t ommWaitAttempts = 0;
+  render::omm::BakeHandle ommBakeHandle;
+  render::omm::BakeResult ommBakeResult;
+  render::omm::BakeStats ommBakeStats;
+  render::omm::DebugBakeSource ommDebugBakeSource;
+  UniqueOMM omm;
+
   void teardown(ContextId context_id)
   {
-    context_id->releaseTexure(diffuseTexId);
-    context_id->releaseTexure(alphaTexId);
-    context_id->releaseBuffer(vertices.getBuf());
-    context_id->releaseBuffer(indices.getBuf());
+    if (context_id->ommEnabled)
+    {
+      if (ommState == OmmState::Baking)
+        render::omm::discard_bake(context_id->ommContext, ommBakeHandle);
+      render::omm::clear_result(ommBakeResult);
+    }
+    omm.reset();
+    ommBakeHandle = {};
+    ommState = OmmState::None;
+
+    context_id->releaseTexture(diffuseTexId);
+    context_id->releaseTexture(alphaTexId);
+    context_id->releaseBuffer(geometry.processedVertexBuffer.get());
     context_id->releaseBuffer(ahsVertices.get());
     context_id->freeMetaRegion(metaAllocId);
     diffuseTexId = BAD_TEXTUREID;
     alphaTexId = BAD_TEXTUREID;
-    vertices.close();
-    indices.close();
+    geometry.close(context_id);
     blas.reset();
   }
 };
@@ -93,6 +128,7 @@ struct LOD
 struct Layer
 {
   eastl::vector<LOD> lods;
+  String assetName;
 };
 
 static eastl::vector<Layer> layers;
@@ -123,21 +159,13 @@ void teardown()
 
 void init(ContextId context_id)
 {
-  if (context_id->has(Features::Grass))
+  if (context_id->hasAny(Features::Grass))
     bvhConnection.contexts.insert(context_id);
-}
-
-void teardown(ContextId context_id)
-{
-  if (context_id->has(Features::Grass))
-    bvhConnection.contexts.insert(context_id);
-
-  bvhConnection.contexts.erase(context_id);
 }
 
 void on_unload_scene(ContextId context_id)
 {
-  if (!context_id->has(Features::Grass))
+  if (!context_id->hasAny(Features::Grass))
     return;
 
   for (auto &layer : layers)
@@ -149,9 +177,15 @@ void on_unload_scene(ContextId context_id)
   bvhConnection.metainfoMappingsCpu.clear();
 }
 
+void teardown(ContextId context_id)
+{
+  bvh::grass::on_unload_scene(context_id);
+  bvhConnection.contexts.erase(context_id);
+}
+
 void reload_grass(ContextId context_id, RandomGrass *grass)
 {
-  if (!grass || !context_id->has(Features::Grass))
+  if (!grass || !context_id->hasAny(Features::Grass))
     return;
 
   bvh::grass::on_unload_scene(context_id);
@@ -164,8 +198,8 @@ void reload_grass(ContextId context_id, RandomGrass *grass)
 
   d3d::GpuAutoLock gpuLock;
 
-  bvhConnection.metainfoMappings =
-    dag::buffers::create_persistent_sr_structured(sizeof(RandomGrassBvhMapping), metaCount, "bvh_grass_mapping");
+  bvhConnection.metainfoMappings = dag::buffers::create_persistent_sr_structured(sizeof(RandomGrassBvhMapping), metaCount,
+    "bvh_grass_mapping", d3d::buffers::Init::No, RESTAG_BVH);
 
   HANDLE_LOST_DEVICE_STATE(bvhConnection.metainfoMappings, );
 
@@ -180,6 +214,7 @@ void reload_grass(ContextId context_id, RandomGrass *grass)
     layer_id_map[layerIx] = bvh_id_gen.fetch_add(1);
 
     auto &bvhLayer = layers.emplace_back();
+    bvhLayer.assetName = layer.info.resName;
     for (auto [lodIx, lod] : enumerate(layer.lods))
     {
       auto &bvhLod = bvhLayer.lods.emplace_back();
@@ -194,8 +229,6 @@ void reload_grass(ContextId context_id, RandomGrass *grass)
       G_ASSERT(parser.normalFormat == VSDT_FLOAT3);
       G_ASSERT(parser.texcoordFormat == VSDT_FLOAT2);
 
-      static int counter = 0;
-
       struct MeshVertex
       {
         Point3 position;
@@ -207,18 +240,22 @@ void reload_grass(ContextId context_id, RandomGrass *grass)
       auto indexDwords = divide_up(sizeof(Index) * elem.numf * 3, 4);
       auto vertexDwords = divide_up(sizeof(BVHVertex) * elem.numv, 4);
 
-      bvhLod.indices = dag::buffers::create_persistent_sr_byte_address(indexDwords, String(64, "bvh_grass_indices_%d", counter++));
-      bvhLod.vertices = dag::buffers::create_persistent_sr_byte_address(vertexDwords, String(64, "bvh_grass_vertices_%d", counter++));
+      auto alloc = context_id->allocateSourceGeometry(indexDwords + vertexDwords);
 
-      HANDLE_LOST_DEVICE_STATE(bvhLod.indices, );
-      HANDLE_LOST_DEVICE_STATE(bvhLod.vertices, );
+      bvhLod.geometry.heapIndex = alloc.heapIx;
+      bvhLod.geometry.bindlessIndex = alloc.bindlessId;
+      bvhLod.geometry.bufferRegion = alloc.region;
+      bvhLod.geometry.ibOffset = context_id->getSourceBufferOffset(alloc.heapIx, alloc.region);
+      bvhLod.geometry.vbOffset = bvhLod.geometry.ibOffset + indexDwords * 4;
+
+      HANDLE_LOST_DEVICE_STATE(bvhLod.geometry, );
 
       {
-        auto ibData = lock_sbuffer<Index>(bvhLod.indices.getBuf(), 0, 0, VBLOCK_WRITEONLY);
-        auto vbData = lock_sbuffer<BVHVertex>(bvhLod.vertices.getBuf(), 0, 0, VBLOCK_WRITEONLY);
-
-        if (ibData && vbData)
+        if (auto gData = lock_sbuffer<uint8_t>(bvhLod.geometry.getIndexBuffer(context_id), bvhLod.geometry.ibOffset,
+              (indexDwords + vertexDwords) * 4, VBLOCK_WRITEONLY))
         {
+          auto ii = [&](int i) -> Index & { return *(Index *)&gData[sizeof(Index) * i]; };
+          auto vi = [&](int i) -> BVHVertex & { return *(BVHVertex *)&gData[indexDwords * 4 + sizeof(BVHVertex) * i]; };
           auto packNormal = [](const Point3 &n) {
             return (uint32_t(n.x * 127.0f + 128.0f) << 16) | (uint32_t(n.y * 127.0f + 128.0f) << 8) |
                    (uint32_t(n.z * 127.0f + 128.0f));
@@ -226,37 +263,42 @@ void reload_grass(ContextId context_id, RandomGrass *grass)
 
           if (auto *elemIb = elem.vertexData->getIBMem<Index>(elem.si, elem.numf))
             for (unsigned int indexNo = 0; indexNo < elem.numf * 3; indexNo++)
-              ibData[indexNo] = elemIb[indexNo] - elem.sv;
+              ii(indexNo) = elemIb[indexNo] - elem.sv;
 
           if (auto *elemVb = elem.vertexData->getVBMem<MeshVertex>(elem.baseVertex, elem.sv, elem.numv))
             for (unsigned int vertexNo = 0; vertexNo < elem.numv; vertexNo++)
             {
-              vbData[vertexNo].position = elemVb[vertexNo].position;
-              vbData[vertexNo].texcoord = elemVb[vertexNo].texcoord;
-              vbData[vertexNo].normal = packNormal(elemVb[vertexNo].normal);
+              vi(vertexNo).position = elemVb[vertexNo].position;
+              vi(vertexNo).texcoord = elemVb[vertexNo].texcoord;
+              vi(vertexNo).normal = packNormal(elemVb[vertexNo].normal);
             }
         }
       }
 
       bvhLod.diffuseTexId = lod.diffuseTexId;
       bvhLod.alphaTexId = lod.alphaTexId;
-      bvhLod.blas = create_grass_blas(bvhLod.vertices.getBuf(), bvhLod.indices.getBuf(), elem.numv, elem.numf * 3);
-      HANDLE_LOST_DEVICE_STATE(bvhLod.blas, );
+      bvhLod.vertexCount = elem.numv;
+      bvhLod.indexCount = elem.numf * 3;
+      // Grass is alpha-tested, thus with OMM the BLAS must wait for process_omm(). Without OMM the
+      // any-hit shader does the cutout, and the BLAS can be built now.
+      bvhLod.ommState = context_id->ommEnabled ? OmmState::None : OmmState::Failed;
+      if (!context_id->ommEnabled)
+      {
+        bvhLod.blas = create_grass_blas(context_id, bvhLod.geometry, elem.numv, elem.numf * 3);
+        HANDLE_LOST_DEVICE_STATE(bvhLod.blas, );
+      }
 
-      bvhLod.metaAllocId = context_id->allocateMetaRegion(1);
-      auto &meta = context_id->meshMetaAllocator.get(bvhLod.metaAllocId)[0];
+      TIME_PROFILE(meta_lock_grass);
+      bvhLod.metaAllocId = context_id->allocateMetaRegion(1, "grass");
+      LockedMetaAccess lockedMeta(*context_id, bvhLod.metaAllocId);
+      auto &meta = lockedMeta[0];
 
       meta.markInitialized();
 
-      uint32_t bindlessIndicesIndex, bindlessVerticesIndex;
-
       meta.holdAlphaTex(context_id, lod.alphaTexId);
       meta.holdAlbedoTex(context_id, lod.diffuseTexId);
-      context_id->holdBuffer(bvhLod.indices.getBuf(), bindlessIndicesIndex);
-      context_id->holdBuffer(bvhLod.vertices.getBuf(), bindlessVerticesIndex);
 
-      d3d::resource_barrier(ResourceBarrierDesc(bvhLod.indices.getBuf(), bindlessSRVBarrier));
-      d3d::resource_barrier(ResourceBarrierDesc(bvhLod.vertices.getBuf(), bindlessSRVBarrier));
+      d3d::resource_barrier(ResourceBarrierDesc(bvhLod.geometry.getIndexBuffer(context_id), bindlessSRVBarrier));
 
       meta.materialType = MeshMeta::bvhMaterialRendinst | MeshMeta::bvhMaterialGrass;
       meta.setIndexBitAndTexcoordFormat(2, VSDT_FLOAT2);
@@ -264,10 +306,11 @@ void reload_grass(ContextId context_id, RandomGrass *grass)
       meta.normalOffset = offsetof(BVHVertex, normal);
       meta.colorOffset = 0xFFU;
       meta.vertexStride = sizeof(BVHVertex);
-      meta.setIndexBufferIndex(bindlessIndicesIndex);
-      meta.setVertexBufferIndex(bindlessVerticesIndex);
+      meta.setIndexBufferIndex(bvhLod.geometry.bindlessIndex);
+      meta.setVertexBufferIndex(bvhLod.geometry.bindlessIndex);
       meta.startIndex = 0;
       meta.startVertex = 0;
+      meta.vertexOffset = bvhLod.geometry.vbOffset;
 
       auto pack = [](void *d, const ColorRange &r) {
         uint32_t p[4];
@@ -291,33 +334,35 @@ void reload_grass(ContextId context_id, RandomGrass *grass)
       pack(&meta.materialData2, layer.info.colors[CHANNEL_GREEN]);
       pack(&meta.layerData, layer.info.colors[CHANNEL_BLUE]);
 
-      auto metaIx = grass->getGrassLayerCount() * lodIx + layerIx;
-      auto blasHandle = d3d::get_raytrace_acceleration_structure_gpu_handle(bvhLod.blas.get()).handle;
-      auto &mapping = bvhConnection.metainfoMappingsCpu[metaIx];
+      meta.materialType |= MeshMeta::bvhMaterialAlphaInRed;
 
-      mapping.blas.x = blasHandle & 0xFFFFFFFFLLU;
-      mapping.blas.y = blasHandle >> 32;
+      auto metaIx = grass->getGrassLayerCount() * lodIx + layerIx;
+      bvhLod.metaMappingIndex = metaIx;
+      auto &mapping = bvhConnection.metainfoMappingsCpu[metaIx];
       mapping.metaIndex = MeshMetaAllocator::decode(bvhLod.metaAllocId);
+
+      // Only the path without OMM has a BLAS at this time; otherwise process_omm() writes it later.
+      if (bvhLod.blas)
+        publish_grass_blas_address(mapping, bvhLod.blas);
 
       // Need to fit in 15 bits so there is enough space for the alpha value
       G_ASSERT(MeshMetaAllocator::decode(bvhLod.metaAllocId) < (1 << 15));
 
-      ProcessorInstances::getAHSProcessor().process(bvhLod.indices.getBuf(), bvhLod.vertices.getBuf(), bvhLod.ahsVertices, 2,
-        elem.numf * 3, offsetof(BVHVertex, texcoord), VSDT_FLOAT2, sizeof(BVHVertex), -1);
-
-      uint32_t bindlessIndex;
-      context_id->holdBuffer(bvhLod.ahsVertices.get(), bindlessIndex);
-
       uint32_t indexCount = elem.numf * 3;
-
       meta.indexCount = indexCount;
-      meta.setAhsVertexBufferIndex(bindlessIndex);
-      if (bindlessIndex > BVH_BINDLESS_BUFFER_MAX)
-        logerr("BVH Grass vertex buffer bindless index out of range: %u", bindlessIndex);
       if (indexCount > 0xFFFFU)
         logerr("BVH Grass vertex buffer index count out of range: %u", indexCount);
 
-      meta.materialType |= MeshMeta::bvhMaterialAlphaInRed;
+      if (!context_id->ommEnabled)
+      {
+        uint32_t bindlessIndex;
+        ProcessorInstances::getAHSProcessor().process(context_id, bvhLod.geometry, bvhLod.ahsVertices, bindlessIndex, 2, elem.numf * 3,
+          offsetof(BVHVertex, texcoord), VSDT_FLOAT2, sizeof(BVHVertex), -1);
+
+        meta.setAhsVertexBufferIndex(bindlessIndex);
+        if (bindlessIndex > BVH_BINDLESS_BUFFER_MAX)
+          logerr("BVH Grass vertex buffer bindless index out of range: %u", bindlessIndex);
+      }
     }
   }
 
@@ -325,9 +370,150 @@ void reload_grass(ContextId context_id, RandomGrass *grass)
     bvhConnection.metainfoMappingsCpu.data(), 0);
 }
 
+// The mesh pipeline's bake helpers in bvh_omm carry mesh-only concerns (texcoord-format lookup,
+// per-object subdivision budgeting). Grass geometry is always float2 UVs with alpha in the red channel,
+// so its bake is a fixed, trivial variant kept local here rather than generalizing the mesh helpers.
+static bool begin_lod_omm_bake(ContextId context_id, LOD &lod)
+{
+  BaseTexture *texture = acquire_managed_tex(lod.alphaTexId);
+  if (!texture)
+    return false;
+
+  render::omm::BakeInput input{
+    .alphaTexture = texture,
+    .texCoordBuffer = lod.geometry.getVertexBuffer(context_id),
+    .indexBuffer = lod.geometry.getIndexBuffer(context_id),
+    .alphaTextureChannel = 0, // grass stores alpha in red (bvhMaterialAlphaInRed)
+    .texCoordFormat = render::omm::TexCoordFormat::Float2,
+    .texCoordOffsetInBytes = static_cast<uint32_t>(lod.geometry.vbOffset + offsetof(BVHVertex, texcoord)),
+    .texCoordStrideInBytes = sizeof(BVHVertex),
+    .indexFormat = render::omm::IndexFormat::UINT16,
+    .indexCount = lod.indexCount,
+    .indexStrideInBytes = sizeof(uint16_t),
+    .indexBufferOffsetInBytes = lod.geometry.ibOffset,
+    .globalFormat = render::omm::Format::OC1_2_State,
+  };
+  // Opacity counts, for the same reason as the mesh path (see start_omm_bake).
+  input.bakeFlags |= render::omm::ENABLE_POST_DISPATCH_INFO_STATS;
+
+  lod.ommDebugBakeSource = render::omm::make_debug_bake_source(input, lod.alphaTexId);
+
+  const bool dispatched = render::omm::begin_bake(context_id->ommContext, input, lod.ommBakeHandle);
+  release_managed_tex(lod.alphaTexId);
+  return dispatched;
+}
+
+// The mapping of the LOD keeps its initial zero BLAS address, thus the LOD stays out of the BVH.
+static void fail_grass_lod(const Layer &layer, size_t lod_ix, LOD &lod, const char *reason)
+{
+  logerr("BVH grass: dropping '%s' lod %u (diffuse '%s') from the BVH -- %s", layer.assetName.c_str(), unsigned(lod_ix),
+    get_managed_texture_name(lod.diffuseTexId), reason);
+  lod.ommState = OmmState::Failed;
+
+  const String label(0, "%s grass '%s' lod %u", get_managed_texture_name(lod.diffuseTexId), layer.assetName.c_str(), unsigned(lod_ix));
+  publish_failed_grass_omm_debug_result(lod.ommBakeResult, lod.ommDebugBakeSource, label.c_str(), reason);
+}
+
+// Advances each LOD's async OMM bake and, once ready, rebuilds its BLAS with the OMM linked. Called per
+// frame from process_meshes (a valid GPU-dispatch context). Grass LODs are static and persistent, so
+// there is no discard/leak bookkeeping like the mesh pipeline needs -- a LOD only leaves the state
+// machine by reaching Built or Failed, and teardown discards any bake still in flight.
+void process_omm(ContextId context_id)
+{
+  if (!context_id->ommEnabled || !context_id->hasAny(Features::Grass) || layers.empty())
+    return;
+
+  TIME_PROFILE(grass__process_omm);
+
+  FRAMEMEM_REGION;
+  bool mappingsDirty = false;
+
+  for (auto &layer : layers)
+    for (auto [lodIx, lod] : enumerate(layer.lods))
+    {
+      if (lod.ommState == OmmState::Built || lod.ommState == OmmState::Failed)
+        continue;
+      if (lod.alphaTexId == BAD_TEXTUREID)
+      {
+        fail_grass_lod(layer, lodIx, lod, grass_omm_failure_text(OmmFailure::NoAlphaSource));
+        continue;
+      }
+
+      String waitReason;
+      if (const OmmTextureWait wait = wait_for_grass_omm_texture(lod.alphaTexId, lod.ommWaitAttempts, waitReason);
+          wait != OmmTextureWait::Ready)
+      {
+        if (wait == OmmTextureWait::GaveUp)
+          fail_grass_lod(layer, lodIx, lod, waitReason.c_str());
+        continue;
+      }
+
+      if (lod.ommState == OmmState::None)
+      {
+        if (!render::omm::has_free_bake_slot(context_id->ommContext))
+          continue;
+
+        if (!begin_lod_omm_bake(context_id, lod))
+        {
+          fail_grass_lod(layer, lodIx, lod, grass_omm_failure_text(OmmFailure::BakeStartFailed));
+          continue;
+        }
+        lod.ommState = OmmState::Baking;
+        continue;
+      }
+
+      if (lod.ommState == OmmState::Baking)
+      {
+        const render::omm::ConsumeBakeResult r =
+          render::omm::consume_bake(context_id->ommContext, lod.ommBakeHandle, lod.ommBakeResult, &lod.ommBakeStats);
+        if (r == render::omm::ConsumeBakeResult::NotReady)
+          continue;
+        if (r == render::omm::ConsumeBakeResult::Failed)
+        {
+          lod.ommBakeHandle = {};
+          fail_grass_lod(layer, lodIx, lod, grass_omm_failure_text(OmmFailure::ReadbackInvalid));
+          continue;
+        }
+        lod.ommState = OmmState::Ready;
+      }
+
+      if (lod.ommState == OmmState::Ready)
+      {
+        OmmBuildInfos ommBuilds;
+        OmmBuildResults ommResults;
+        const OmmFailure failure = build_grass_omm_array(lod.ommBakeResult, lod.ommBakeStats, lod.omm, ommBuilds, ommResults);
+        if (is_in_lost_device_state)
+          return;
+        if (failure != OmmFailure::None)
+        {
+          // fail_grass_lod hands the buffers to the viewer, thus it must come before the release.
+          fail_grass_lod(layer, lodIx, lod, grass_omm_failure_text(failure));
+          release_omm_result(context_id->ommContext, lod.ommBakeResult);
+          continue;
+        }
+        // Build the OMM array now (its post-build flush orders it before the BLAS), then rebuild this
+        // LOD's BLAS with the OMM linked.
+        build_pending_omm_arrays(context_id->ommContext, ommBuilds, ommResults);
+        const auto linkage = render::omm::make_geometry_linkage(lod.ommBakeResult, lod.omm.get());
+        lod.blas = create_grass_blas(context_id, lod.geometry, lod.vertexCount, lod.indexCount, &linkage);
+        lod.ommState = OmmState::Built;
+
+        if (lod.metaMappingIndex >= 0 && lod.metaMappingIndex < int(bvhConnection.metainfoMappingsCpu.size()) && lod.blas)
+        {
+          publish_grass_blas_address(bvhConnection.metainfoMappingsCpu[lod.metaMappingIndex], lod.blas);
+          mappingsDirty = true;
+        }
+      }
+    }
+
+  if (mappingsDirty && bvhConnection.metainfoMappings)
+    bvhConnection.metainfoMappings->updateData(0, bvhConnection.metainfoMappingsCpu.size() * sizeof(RandomGrassBvhMapping),
+      bvhConnection.metainfoMappingsCpu.data(), 0);
+}
+
 void get_instances(ContextId context_id, Sbuffer *&instances, Sbuffer *&instance_count)
 {
-  if (context_id->has(Features::Grass))
+  if (context_id->hasAny(Features::Grass))
   {
     instances = bvhConnection.instances.getBuf();
     instance_count = bvhConnection.counter.getBuf();
@@ -339,27 +525,24 @@ void get_instances(ContextId context_id, Sbuffer *&instances, Sbuffer *&instance
   }
 }
 
-UniqueBLAS *get_blas(int layer_ix, int lod_ix)
+// A LOD that has no BLAS yet is not in the BVH, thus it has no address to compare with.
+void collect_blas_addresses(dag::Vector<uint64_t> &addresses)
 {
-  if (layer_ix < 0 || layer_ix >= layers.size())
-    return nullptr;
-
-  auto &layer = layers[layer_ix];
-  if (lod_ix < 0 || lod_ix >= layer.lods.size())
-    return nullptr;
-
-  return &layer.lods[lod_ix].blas;
+  for (auto &layer : layers)
+    for (auto &lod : layer.lods)
+      if (lod.blas)
+        addresses.push_back(lod.blas.getGPUAddress());
 }
 
-void get_memory_statistics(int64_t &vb, int64_t &ib, int64_t &blas, int64_t &meta, int64_t &queries)
+void get_memory_statistics(ContextId context_id, int64_t &vb, int64_t &ib, int64_t &blas, int64_t &meta, int64_t &queries)
 {
   vb = ib = blas = meta = queries = 0;
   for (auto &layer : layers)
     for (auto &lod : layer.lods)
     {
-      vb += lod.vertices->getElementSize() * lod.vertices->getNumElements();
-      ib += lod.indices->getElementSize() * lod.indices->getNumElements();
-      blas += d3d::get_raytrace_acceleration_structure_size(lod.blas.get());
+      vb += context_id->getSourceBufferSize(lod.geometry.heapIndex, lod.geometry.bufferRegion);
+      if (lod.blas) // no BLAS until process_omm() links the OMM
+        blas += d3d::get_raytrace_acceleration_structure_size(lod.blas.get());
     }
   if (bvhConnection.instances)
     queries = bvhConnection.instances->getElementSize() * bvhConnection.instances->getNumElements();

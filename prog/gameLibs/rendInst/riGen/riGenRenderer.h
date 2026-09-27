@@ -27,7 +27,9 @@ public:
   void render(const RendInstGenData::RtData &rtData, const RiGenVisibility &visibility);
   void sortObjects();
   static void updatePerDrawData(RendInstGenData::RtData &rt_data, int per_inst_data_dwords);
+  static void updatePerDrawDataAtIdx(RendInstGenData::RtData &rt_data, int per_inst_data_dwords, int ri_idx);
   static void updatePackedData(int layer);
+  static void afterDeviceReset();
 
 private:
   struct PackedRenderRange
@@ -49,9 +51,10 @@ private:
       return;
 
     const auto isMergeable = [](const RiGenRenderRecord &r1, const RiGenRenderRecord &r2) {
-      bool result = DAGOR_LIKELY(r1.vstride == r2.vstride && r1.vbIdx == r2.vbIdx) && r1.stage == r2.stage && r1.rstate == r2.rstate &&
-                    r1.prog == r2.prog && get_material_id(r1.cstate) == get_material_id(r2.cstate) && r1.visibility == r2.visibility &&
-                    r1.instanceLod == r2.instanceLod;
+      bool result = DAGOR_LIKELY(r1.vstride == r2.vstride && r1.vbIdx == r2.vbIdx) && r1.stage == r2.stage &&
+                    r1.dvState.render_state == r2.dvState.render_state && r1.dvState.program == r2.dvState.program &&
+                    get_material_id(r1.dvState.const_state) == get_material_id(r2.dvState.const_state) &&
+                    r1.visibility == r2.visibility && r1.instanceLod == r2.instanceLod;
 
       if constexpr (separate_mesh_debug_values)
         result &= r1.meshDebugValue == r2.meshDebugValue;
@@ -60,7 +63,7 @@ private:
     };
     packedRenderRanges.clear();
     packedRenderRanges.emplace_back(PackedRenderRange{0, 1});
-    bindlessStatesToUpdateTexLevels.emplace(packedRenderRecords.front().cstate, 15);
+    bindlessStatesToUpdateTexLevels.emplace(packedRenderRecords.front().dvState.const_state, TexStreamingContext::MAX_TEX_LEVEL);
     const auto &firstRecord = packedRenderRecords[0];
     bool prevRecordExceededInstanceLimit =
       firstRecord.visibility == firstRecord.PER_INSTANCE && firstRecord.offset + firstRecord.count >= rendinst::render::MAX_INSTANCES;
@@ -75,9 +78,9 @@ private:
         lastRange.count++;
       else
         packedRenderRanges.emplace_back(PackedRenderRange{static_cast<uint16_t>(lastRange.count + lastRange.start), 1});
-      const auto iter = bindlessStatesToUpdateTexLevels.find(curRecord.cstate);
+      const auto iter = bindlessStatesToUpdateTexLevels.find(curRecord.dvState.const_state);
       if (iter == bindlessStatesToUpdateTexLevels.end())
-        bindlessStatesToUpdateTexLevels.emplace(curRecord.cstate, 15);
+        bindlessStatesToUpdateTexLevels.emplace(curRecord.dvState.const_state, TexStreamingContext::MAX_TEX_LEVEL);
       prevRecordExceededInstanceLimit = isInstanceLimitExceeeded;
     }
   }

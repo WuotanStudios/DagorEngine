@@ -1,10 +1,14 @@
 options gen2
 options indenting = 4
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module refactor shared private
+
+//! Automated refactoring tools.
+//!
+//! Provides ``extract_method`` and ``rename`` tag-function macros that
+//! restructure code at compile time. Used by editor tooling and IDE
+//! integration.
 
 require daslib/ast_boost
 require daslib/templates_boost
@@ -15,13 +19,15 @@ require strings
 
 let LOG_REFACTOR = 100500
 
-[tag_function(extract_method_tag), sideeffects]
+[tag_function(extract_method_tag), sideeffects, unused_argument(method_name)]
 def public extract_method(method_name : string; blk : block) {
+    //! Marks a block of code for method extraction refactoring.
     invoke(blk)
 }
 
 [tag_function(extract_method_tag), sideeffects]
 def public extract_expression(method_name : string; expr) {
+    //! Marks an expression for expression extraction refactoring.
     return expr
 }
 
@@ -30,6 +36,7 @@ def log_range(at : LineInfo) {
 }
 
 struct ExtractMethodDesc {
+    //! Descriptor for extract-method refactoring.
     call_name : string
     function_declaration : string
     call_expression : string
@@ -46,19 +53,20 @@ def JV(li : LineInfo) {
 
 [tag_function_macro(tag="extract_method_tag")]
 class ExtractMethodMacro : AstFunctionAnnotation {
+    //! Function annotation implementing extract-method refactoring.
     method_tag = "!!!extract_method"
-    def override verifyCall(var call : smart_ptr<ExprCallFunc>; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
+    def override verifyCall(var call : ExprCallFunc?; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
         if (!(call.arguments[0] is ExprConstString)) {
             print("extract_method: first argument must be a string literal")
             return false
         }
         var captured <- capture_block(call.arguments[1])
         sort(captured) <| $(a, b) => string(a.variable.name) < string(b.variable.name)
-        var call_name = string((call.arguments[0] as ExprConstString).value)
-        let function_declaration = build_string <| $(writer) {
+        let call_name = string((call.arguments[0] as ExprConstString).value)
+        let function_declaration = build_string() $(writer) {
             writer |> write("def ")
             writer |> write(call_name)
-            if (length(captured) != 0) {
+            if (!empty(captured)) {
                 writer |> write(" ( ")
                 var first = true
                 for (v in captured) {
@@ -67,13 +75,15 @@ class ExtractMethodMacro : AstFunctionAnnotation {
                     } else {
                         writer |> write("; ")
                     }
-                    if (!v.variable._type.flags.constant && v.variable.access_flags.access_ref) {
+                    // access_info_pass_mutable: a callee inside the extracted block demands a mutable ref even if it never writes — a const param would not compile
+                    let needs_mutable = v.variable.access_flags.access_ref || v.variable.access_info.access_info_pass_mutable
+                    if (!v.variable._type.flags.constant && needs_mutable) {
                         writer |> write("var ")
                     }
                     writer |> write(v.variable.name)
                     writer |> write(":")
                     writer |> write(describe(v.variable._type))
-                    if (v.variable._type.isWorkhorseType && v.variable.access_flags.access_ref) {
+                    if (v.variable._type.isWorkhorseType && needs_mutable) {
                         writer |> write("&")
                     }
                 }
@@ -81,10 +91,10 @@ class ExtractMethodMacro : AstFunctionAnnotation {
             }
         }
 
-        let call_expression = build_string <| $(writer) {
+        let call_expression = build_string() $(writer) {
             writer |> write(call_name)
             writer |> write("(")
-            if (length(captured) != 0) {
+            if (!empty(captured)) {
                 var first = true
                 for (v in captured) {
                     if (first) {
@@ -115,6 +125,7 @@ class ExtractMethodMacro : AstFunctionAnnotation {
 }
 
 struct ExtractVariableDesc {
+    //! Descriptor for extract-variable refactoring.
     variable_name : string
     variable_type : string
     variable_keyword : string
@@ -125,11 +136,13 @@ struct ExtractVariableDesc {
 
 [tag_function(extract_variable_tag), sideeffects]
 def public extract_variable_nonref(method_name : string; expr) {
+    //! Marks an expression for variable extraction by value.
     return expr
 }
 
 [tag_function(extract_variable_tag), sideeffects]
 def public extract_variable_ref(method_name : string; var expr : auto(TT)& ==const) : TT& {
+    //! Marks an expression for variable extraction by reference.
     unsafe {
         return expr
     }
@@ -137,46 +150,48 @@ def public extract_variable_ref(method_name : string; var expr : auto(TT)& ==con
 
 [call_macro(name="extract_variable")]
 class ExtractVariableMacro : AstCallMacro {
-    def override visit(prog : ProgramPtr; mod : Module?; var expr : smart_ptr<ExprCallMacro>) : ExpressionPtr {
+    //! Call macro implementing extract-variable refactoring.
+    def override visit(prog : ProgramPtr; mod : Module?; var expr : ExprCallMacro?) : ExpressionPtr {
         if (!(expr.arguments[0] is ExprConstString)) {
             macro_error(prog, expr.at, "extract_variable: first argument must be a string literal")
-            return <- default<ExpressionPtr>
+            return null
         }
         assume varType = expr.arguments[1]._type
         if (varType == null || varType.isAutoOrAlias) {
             macro_error(prog, expr.at, "extract_variable: unresolve expression type")
-            return <- default<ExpressionPtr>
+            return null
         }
-        var inscope ccall <- new ExprCall(at = expr.at)
+        var ccall = new ExprCall(at = expr.at)
         ccall.name := (varType.isRef && !varType.isConst) ? "extract_variable_ref" : "extract_variable_nonref"
         ccall.arguments |> emplace_new <| clone_expression(expr.arguments[0])
         ccall.arguments |> emplace_new <| clone_expression(expr.arguments[1])
-        return <- ccall
+        return ccall
     }
 }
 
 [tag_function_macro(tag="extract_variable_tag")]
 class ExtractVariableFunction : AstFunctionAnnotation {
+    //! Function annotation for extract-variable target functions.
     method_tag = "!!!extract_variable"
-    def override transform(var call : smart_ptr<ExprCallFunc>; var errors : das_string) : ExpressionPtr {
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
         assume cffg = call.func.fromGeneric
         assume varType = call.arguments[1]._type
         if (call.func != null && cffg != null && cffg.name == "extract_variable") {
             if (varType.isConst || !varType.isRef) {
-                var inscope ccall <- clone_expression(call)
+                var ccall = clone_expression(call)
                 (ccall as ExprCall).name := "extract_variable_nonref"
-                return <- ccall
+                return ccall
             }
         }
-        return <- default<ExpressionPtr>
+        return null
     }
-    def override verifyCall(var call : smart_ptr<ExprCallFunc>; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
+    def override verifyCall(var call : ExprCallFunc?; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
         if (!(call.arguments[0] is ExprConstString)) {
             print("extract_variable: first argument must be a string literal")
             return false
         }
         assume varType = call.arguments[1]._type
-        var variable_name = string((call.arguments[0] as ExprConstString).value)
+        let variable_name = string((call.arguments[0] as ExprConstString).value)
         assume atCall = call.atEnclosure
         assume atBlock = call.arguments[1].at
         var jv <- JV(ExtractVariableDesc(

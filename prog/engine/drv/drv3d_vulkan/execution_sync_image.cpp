@@ -213,6 +213,22 @@ void ImageSyncOp::onConflictWithDst(ImageSyncOp &dst)
   dst.conflictingLAddr.merge(laddr);
 
   bool differentLayouts = dst.layout != layout;
+
+  // when dst area is larger than src AND overlapping ones have same layout
+  // non overlapping subresources layouts need to be properly processed
+  // with special logic, because otherwise layout transition will be filtered out
+  if (!differentLayouts && !dst.changesLayout && (area.arrayRange < dst.area.arrayRange || area.mipRange < dst.area.mipRange))
+  {
+    auto hasMismatchingLayouts = [&]() {
+      for (uint32_t mip = dst.area.mipIndex; mip < dst.area.mipIndex + dst.area.mipRange; ++mip)
+        for (uint32_t array = dst.area.arrayIndex; array < dst.area.arrayIndex + dst.area.arrayRange; ++array)
+          if (obj->layout.get(mip, array) != dst.layout)
+            return true;
+      return false;
+    };
+    differentLayouts |= hasMismatchingLayouts();
+  }
+
   changesLayout |= differentLayouts;
   dst.changesLayout |= differentLayouts;
 
@@ -225,6 +241,12 @@ void ImageSyncOp::onConflictWithDst(ImageSyncOp &dst)
   // clang-format on
   handledBySubpassDependency = handledBySubpassDep;
   dst.handledBySubpassDependency = handledBySubpassDep;
+
+  // a suppressed intra-NRP dependency is covered by the subpass dependency only inside the pass;
+  // the src write still needs an explicit barrier before the next external access, so fold it into
+  // the surviving dst op, which otherwise keeps only its read and loses the write for future sync.
+  if (handledBySubpassDep && laddr.isWrite())
+    dst.laddr.merge(laddr);
 }
 
 template <>
@@ -300,7 +322,7 @@ void ExecutionSyncTracker::ImageOpsArray::removeRoSeal(Image *obj)
 {
   // we don't know actual caller here
   arr[lastProcessed] =
-    ImageSyncOp(SyncOpUid::next(), {}, obj->getRoSealReads(), obj, {0, obj->getMipLevels(), 0, obj->getArrayLayers()});
+    ImageSyncOp(SyncOpUid::next(obj), {}, obj->getRoSealReads(), obj, {0, obj->getMipLevels(), 0, obj->getArrayLayers()});
   arr[lastProcessed].specificInit(false /*nrpAttachment*/, obj->layout.roSealTargetLayout, ExecutionSyncTracker::SUBPASS_NON_NATIVE, 0,
     false /*discard*/);
 }

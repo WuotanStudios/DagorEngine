@@ -5,6 +5,7 @@ include "wind/wind_simulation_inc.dshl"
 include "dynamic_render_deform_hmap_inc.dshl"
 include "cloth_optional.dshl"
 include "overlay_color_map_inc.dshl"
+include "dynamic_destr_disappear_inc.dshl"
 
 texture dynamic_decals_atlas;
 texture perlin_noise3d;
@@ -20,6 +21,41 @@ int disable_dynmat_params = 0;
 interval disable_dynmat_params: no < 1, yes;
 
 int layered_material_detail_quality = 0;
+
+macro INIT_DYNAMIC_THERMAL_SIGNATURE()
+  static float thermal_vision_temperature = 0.0;
+endmacro
+
+macro USE_DYNAMIC_THERMAL_SIGNATURE()
+  (ps) { thermal_vision_temperature@f1 = thermal_vision_temperature; }
+  hlsl(ps) {
+    void init_thermal_signature(inout UnpackedGbuffer result, half3 diffuse_color)
+    {
+      if (special_vision <= 0)
+        return;
+      float material_temperature = get_thermal_vision_temperature();
+      bool blendWithTerrain = material_temperature < 0;
+      if (material_temperature > 0)
+      {
+        init_emission(result, material_temperature);
+        init_material(result, SHADING_SELFILLUM);
+      }
+      else if (blendWithTerrain )
+      {
+        init_isLandscape(result, 1);
+      }
+      else
+      {
+        result.albedo += THERMAL_TWEAK_ALBEDO_OFFSET;
+        result.smoothness += THERMAL_TWEAK_SMOOTHNESS_OFFSET;
+        result.metalness += THERMAL_TWEAK_METALNESS_OFFSET;
+        #ifdef THERMAL_TWEAK_SKINNED_ALBEDO_MUL
+          init_albedo(result, THERMAL_TWEAK_SKINNED_ALBEDO_MUL * diffuse_color);
+        #endif
+      }
+    }
+  }
+endmacro
 
 macro XRAY_DEPTH_PS()
   hlsl(ps) {
@@ -44,6 +80,9 @@ macro SPECIAL_RENDER_ALPHATEST_USE()
         #endif
         half4 diffuseColor = tex2DBindless(get_diffuse_tex(), input.diffuseTexcoord);
         clip_alpha(diffuseColor.a);
+        #if DYNAMIC_DESTR_DISAPPEAR_ENABLED
+          apply_destr_disappear(input.destr_params);
+        #endif
       }
     }
     compile("target_ps", "render_depth_ps");
@@ -54,11 +93,18 @@ macro SPECIAL_RENDER_ALPHATEST_USE()
   }
 endmacro
 
-macro SPECIAL_RENDER_NOALPHATEST()
+macro SPECIAL_RENDER_NOALPHATEST(use_ri_disintegration)
 
   if (dyn_model_render_pass == render_to_depth)
   {
-    compile("ps_null", "null_ps");
+    if (use_ri_disintegration)
+    {
+       compile("target_ps", "render_depth_disintegration_ps");
+    }
+    else
+    {
+      compile("ps_null", "null_ps");
+    }
   }
   else if (dyn_model_render_pass == render_to_deform_hmap)
   {
@@ -68,18 +114,18 @@ endmacro
 
 
 
-macro SPECIAL_RENDER_ALPHATEST_CHOOSE()
+macro SPECIAL_RENDER_ALPHATEST_CHOOSE(use_ri_disintegration)
   if (atest == atestOn)
   {
     SPECIAL_RENDER_ALPHATEST_USE()
   } else
   {
-    SPECIAL_RENDER_NOALPHATEST()
+    SPECIAL_RENDER_NOALPHATEST(use_ri_disintegration)
   }
 endmacro
 
 macro INIT_TANK_COCKPIT_LIGHTING()
-  if (compatibility_mode == compatibility_mode_on && mobile_render == off)
+  if (compatibility_mode == compatibility_mode_on)
   {
     (ps) {
       tank_cockpit__bsphere@f4 = tank_cockpit__bsphere;
@@ -92,8 +138,7 @@ float4 prev_to_cur_origin_move;
 
 block(scene) dynamic_scene
 {
-  DYNAMIC_SIMPLE_VS_SHARED_DECL()
-  DYNAMIC_SIMPLE_SHARED_DECL(ps)
+  DYNMODEL_SHARED_DECL()
   INIT_BURNED_DIFFUSE_FUNCTION_BLOCK()
   INIT_PROJECTIVE_WOUNDS_BLOCK()
   INIT_AMBIENT_WIND(vs)
@@ -110,6 +155,7 @@ block(scene) dynamic_scene
     jitteredCamPosToUnjitteredHistoryClip@f44 = jitteredCamPosToUnjitteredHistoryClip;
     prev_to_cur_origin_move@f3 = prev_to_cur_origin_move;
     paint_details_tex@smp2d = paint_details_tex;
+    params_validation_debug_color@f4 = params_validation_debug_color;
   }
 
   (ps) {
@@ -121,20 +167,18 @@ block(scene) dynamic_scene
     special_vision@i1 = special_vision;
     disable_dynmat_params@i1 = disable_dynmat_params;
     layered_material_detail_quality@i1 = layered_material_detail_quality;
+    params_validation_debug_color@f4 = params_validation_debug_color;
+    real_skies_sun_light_dir@f4 = real_skies_sun_light_dir;
   }
   INIT_USE_CHARACTER_MICRODETAIL()
   INIT_DYNAMICS_WETNESS()
 
-  if (mobile_render != off)
-  {
-    INIT_STATIC_SHADOW_PS()
-  }
   INIT_TANK_COCKPIT_LIGHTING()
 }
 
 block(scene) dynamic_depth_scene
 {
-  DYNAMIC_SIMPLE_VS_SHARED_DECL()
+  DYNMODEL_SHARED_DECL()
   INIT_PROJECTIVE_WOUNDS_BLOCK()
   INIT_AMBIENT_WIND(vs)
   INIT_AMBIENT_WIND_BASE(ps)
@@ -146,8 +190,8 @@ block(scene) dynamic_depth_scene
   }
 }
 
-macro DYNAMIC_BLOCK()
-if (dyn_model_render_pass == render_pass_normal)
+macro DYNAMIC_BLOCK_BASE()
+if (dyn_model_render_pass == render_pass_normal  || is_triangle_size_debug)
 {
   supports dynamic_scene;
 
@@ -162,29 +206,17 @@ else if (dyn_model_render_pass == render_to_depth || dyn_model_render_pass == re
 }
 endmacro
 
+macro DYNAMIC_BLOCK()
+  if ((allow_triangle_size_debug == no && is_triangle_size_debug) || (!hardware.dx12 && is_triangle_size_debug))
+  {
+    dont_render;
+  }
+  DYNMODEL_SHARED_DECL_IMMEDIATE()
+  DYNAMIC_BLOCK_BASE()
+endmacro
+
 macro DYNAMIC_BLOCK_XRAY()
-  if (shader == hatching_simple || shader == hatching_sphere)
-  {
-    supports global_frame;
-
-    (vs) {
-      world_local_x@f3 = world_local_x;
-      world_local_y@f3 = world_local_y;
-      world_local_z@f3 = world_local_z;
-      world_local_pos@f3 = world_local_pos;
-    }
-    (ps) {
-      is_hero_cockpit@i1 = (is_hero_cockpit); // just in case we want to use xray + cockpit
-    }
-    hlsl(ps) {
-      #define GBUFFER_IS_HERO_COCKPIT is_hero_cockpit
-    }
-  }
-  else
-  {
-    DYNAMIC_BLOCK()
-  }
-
+  DYNAMIC_BLOCK()
   INIT_XRAY_RENDER()
 
   channel float3 pos = pos;
@@ -202,7 +234,11 @@ macro DYNAMIC_SIMPLE_HELPER_PS()
         INIT_MULTIDRAW(input);
         SET_DRAW_CALL_ID(GET_DRAW_ID(input) & MATERIAL_OFFSET_MASK);
       #endif
-      discard_torn_wound(input.fragPos, input.fragNormal, input.tornWoundParams);
+      BRANCH
+      if (input.tornWoundParams.x < 0)
+        cut_wound_hole(input.tornWoundParams);
+      else if (discard_torn_wound(input.fragPos, input.fragNormal, input.tornWoundParams) < 0)
+        discard;
     }
   }
 endmacro
@@ -217,6 +253,9 @@ DYNAMIC_SIMPLE_HELPER_PS()
       half4 diffuseColor = tex2DBindless(get_diffuse_tex(), input.diffuseTexcoord.xy);
       clip_alpha(diffuseColor.a);
       ##endif
+      #if DYNAMIC_DESTR_DISAPPEAR_ENABLED
+        apply_destr_disappear(input.destr_params);
+      #endif
     }
   }
   compile("target_ps", "dynamic_simple_ps");

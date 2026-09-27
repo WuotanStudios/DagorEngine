@@ -1,5 +1,6 @@
 #pragma once
 
+#include "daScript/simulate/runtime_iterator.h"
 #include "daScript/simulate/simulate.h"
 
 namespace das
@@ -39,7 +40,6 @@ namespace das
             vec4f ll = subexpr->eval(context);
             TRange r = cast<TRange>::to(ll);
             char * iter = context.allocateIterator(sizeof(RangeIterator<TRange>),"range iterator", &debugInfo);
-            if ( !iter ) context.throw_out_of_memory(false, sizeof(RangeIterator<TRange>) + 16, &debugInfo);
             new (iter) RangeIterator<TRange>(r, &debugInfo);
             return cast<char *>::from(iter);
         }
@@ -172,18 +172,33 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode ** __restrict tail = this->list + this->total;
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            SimNode ** __restrict body = this->list;
-        loopbegin:;
-            for (; body!=tail; ++body) {
-                (*body)->eval(context);
-                DAS_PROCESS_LOOP_FLAGS(break);
+        if ( this->totalFinal == 0 ) {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode ** __restrict body = this->list;
+            loopbegin:;
+                for (; body!=tail; ++body) {
+                    (*body)->eval(context);
+                    DAS_PROCESS_LOOP_FLAGS(break);
+                }
             }
-        } }
+        } else {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode ** __restrict body = this->list;
+            loopbegin_fin:;
+                for (; body!=tail; ++body) {
+                    (*body)->eval(context);
+                    DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                }
+            loopend_fin:;
+                this->evalFinal(context);
+                if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~EvalFlags::stopForBreak;
         return v_zero();
     }
@@ -197,15 +212,25 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode ** __restrict tail = this->list + this->total;
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
-                (*body)->eval(context);
+        if ( this->totalFinal == 0 ) {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
+                    (*body)->eval(context);
+                }
             }
-        } }
+        } else {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
+                    (*body)->eval(context);
+                }
+                this->evalFinal(context);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }
@@ -219,14 +244,23 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode * __restrict pbody = this->list[0];
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            pbody->eval(context);
-            DAS_PROCESS_LOOP1_FLAGS(continue);
-        } }
+        if ( this->totalFinal == 0 ) {
+            SimNode * __restrict pbody = this->list[0];
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                pbody->eval(context);
+                DAS_PROCESS_LOOP1_FLAGS(continue);
+            }
+        } else {
+            SimNode * __restrict pbody = this->list[0];
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                pbody->eval(context);
+                this->evalFinal(context);
+                DAS_PROCESS_LOOP1_FLAGS(continue);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }
@@ -240,13 +274,21 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode * __restrict pbody = this->list[0];
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            pbody->eval(context);
-        } }
+        if ( this->totalFinal == 0 ) {
+            SimNode * __restrict pbody = this->list[0];
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                pbody->eval(context);
+            }
+        } else {
+            SimNode * __restrict pbody = this->list[0];
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                pbody->eval(context);
+                this->evalFinal(context);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }
@@ -266,19 +308,35 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode ** __restrict tail = this->list + this->total;
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            SimNode ** __restrict body = this->list;
-        loopbegin:;
-            DAS_KEEPALIVE_LOOP(&context);
-            for (; body!=tail; ++body) {
-                (*body)->eval(context);
-                DAS_PROCESS_LOOP_FLAGS(break);
+        if ( this->totalFinal == 0 ) {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode ** __restrict body = this->list;
+            loopbegin:;
+                DAS_KEEPALIVE_LOOP(&context);
+                for (; body!=tail; ++body) {
+                    (*body)->eval(context);
+                    DAS_PROCESS_LOOP_FLAGS(break);
+                }
             }
-        } }
+        } else {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode ** __restrict body = this->list;
+            loopbegin_fin:;
+                DAS_KEEPALIVE_LOOP(&context);
+                for (; body!=tail; ++body) {
+                    (*body)->eval(context);
+                    DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                }
+            loopend_fin:;
+                this->evalFinal(context);
+                if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~EvalFlags::stopForBreak;
         return v_zero();
     }
@@ -292,16 +350,27 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode ** __restrict tail = this->list + this->total;
-        for (baseType i = r.from; i != r_to; ++i) {
-            DAS_KEEPALIVE_LOOP(&context);
-            *pi = i;
-            for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
-                (*body)->eval(context);
+        if ( this->totalFinal == 0 ) {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                DAS_KEEPALIVE_LOOP(&context);
+                *pi = i;
+                for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
+                    (*body)->eval(context);
+                }
             }
-        } }
+        } else {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                DAS_KEEPALIVE_LOOP(&context);
+                *pi = i;
+                for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
+                    (*body)->eval(context);
+                }
+                this->evalFinal(context);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }
@@ -315,14 +384,23 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode * __restrict pbody = this->list[0];
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            pbody->eval(context);
-            DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
-        } }
+        if ( this->totalFinal == 0 ) {
+            SimNode * __restrict pbody = this->list[0];
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                pbody->eval(context);
+                DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+            }
+        } else {
+            SimNode * __restrict pbody = this->list[0];
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                pbody->eval(context);
+                this->evalFinal(context);
+                DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }
@@ -336,14 +414,23 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode * __restrict pbody = this->list[0];
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            pbody->eval(context);
-            DAS_KEEPALIVE_LOOP(&context);
-        } }
+        if ( this->totalFinal == 0 ) {
+            SimNode * __restrict pbody = this->list[0];
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                pbody->eval(context);
+                DAS_KEEPALIVE_LOOP(&context);
+            }
+        } else {
+            SimNode * __restrict pbody = this->list[0];
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                pbody->eval(context);
+                this->evalFinal(context);
+                DAS_KEEPALIVE_LOOP(&context);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }
@@ -365,19 +452,35 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode ** __restrict tail = this->list + this->total;
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            SimNode ** __restrict body = this->list;
-        loopbegin:;
-            for (; body!=tail; ++body) {
-                DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
-                (*body)->eval(context);
-                DAS_PROCESS_LOOP_FLAGS(break);
+        if ( this->totalFinal == 0 ) {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode ** __restrict body = this->list;
+            loopbegin:;
+                for (; body!=tail; ++body) {
+                    DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                    (*body)->eval(context);
+                    DAS_PROCESS_LOOP_FLAGS(break);
+                }
             }
-        } }
+        } else {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode ** __restrict body = this->list;
+            loopbegin_fin:;
+                for (; body!=tail; ++body) {
+                    DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                    (*body)->eval(context);
+                    DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                }
+            loopend_fin:;
+                this->evalFinal(context);
+                if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~EvalFlags::stopForBreak;
         return v_zero();
     }
@@ -391,16 +494,27 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        { SimNode ** __restrict tail = this->list + this->total;
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
-                DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
-                (*body)->eval(context);
+        if ( this->totalFinal == 0 ) {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
+                    DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                    (*body)->eval(context);
+                }
             }
-        } }
+        } else {
+            SimNode ** __restrict tail = this->list + this->total;
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                for (SimNode ** __restrict body = this->list; body!=tail; ++body) {
+                    DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                    (*body)->eval(context);
+                }
+                this->evalFinal(context);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }
@@ -414,16 +528,25 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        {
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            SimNode * pbody = this->list[0];   // note: instruments
-            DAS_SINGLE_STEP(context,pbody->debugInfo,true);
-            pbody->eval(context);
-            DAS_PROCESS_LOOP1_FLAGS(continue);
-        } }
+        if ( this->totalFinal == 0 ) {
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode * pbody = this->list[0];   // note: instruments
+                DAS_SINGLE_STEP(context,pbody->debugInfo,true);
+                pbody->eval(context);
+                DAS_PROCESS_LOOP1_FLAGS(continue);
+            }
+        } else {
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode * pbody = this->list[0];   // note: instruments
+                DAS_SINGLE_STEP(context,pbody->debugInfo,true);
+                pbody->eval(context);
+                this->evalFinal(context);
+                DAS_PROCESS_LOOP1_FLAGS(continue);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }
@@ -437,15 +560,23 @@ namespace das
         baseType * pi = (baseType *)(context.stack.sp() + this->stackTop[0]);
         baseType r_to = r.to;
         if ( r.from >= r_to ) goto loopend;
-        {
-        for (baseType i = r.from; i != r_to; ++i) {
-            *pi = i;
-            SimNode * pbody = this->list[0];   // note: instruments
-            DAS_SINGLE_STEP(context,pbody->debugInfo,true);
-            pbody->eval(context);
-        } }
+        if ( this->totalFinal == 0 ) {
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode * pbody = this->list[0];   // note: instruments
+                DAS_SINGLE_STEP(context,pbody->debugInfo,true);
+                pbody->eval(context);
+            }
+        } else {
+            for (baseType i = r.from; i != r_to; ++i) {
+                *pi = i;
+                SimNode * pbody = this->list[0];   // note: instruments
+                DAS_SINGLE_STEP(context,pbody->debugInfo,true);
+                pbody->eval(context);
+                this->evalFinal(context);
+            }
+        }
     loopend:;
-        this->evalFinal(context);
         context.stopFlags &= ~(EvalFlags::stopForBreak | EvalFlags::stopForContinue);
         return v_zero();
     }

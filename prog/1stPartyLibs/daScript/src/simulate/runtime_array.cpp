@@ -9,30 +9,96 @@ namespace das
         arr.size = 0;
     }
 
+    void array_mark_locked ( Array & arr, void * data, uint64_t capacity ) {
+        arr.data = (char *)data;
+        arr.size = arr.capacity = capacity;
+        arr.lock = 1;
+        arr.magic = DAS_ARRAY_MAGIC;
+        arr.borrowed = true;
+    }
+
+    void array_mark_locked ( Array & arr, void * data, uint64_t size, uint64_t capacity ) {
+        arr.data = (char *)data;
+        arr.size = size;
+        arr.capacity = capacity;
+        arr.lock = 1;
+        arr.magic = DAS_ARRAY_MAGIC;
+        arr.borrowed = true;
+    }
+
+    // the inverse of array_mark_locked for views that outlive a temp scope: reset the view
+    // WITHOUT freeing the storage (it belongs to a file mapping / another allocator). false =
+    // not a mark_locked view (untouched) — callers turn that into a runtime error. The
+    // borrowed bit is the discriminator: an OWNED array that merely holds a lock has the same
+    // lock/magic signature, and "forgetting" it would leak its storage.
+    bool array_forget_locked ( Array & arr ) {
+        if ( arr.lock != 1 || arr.magic != DAS_ARRAY_MAGIC || !arr.borrowed ) return false;
+        arr.data = nullptr;
+        arr.size = 0;
+        arr.capacity = 0;
+        arr.lock = 0;
+        arr.magic = 0;
+        arr.flags = 0;  // the whole word (incl. borrowed) — back to the fresh-empty-array state
+        return true;
+    }
+
     void array_lock ( Context & context, Array & arr, LineInfo * at ) {
         if ( arr.shared || arr.hopeless ) return;
-        arr.lock ++;
-        if ( arr.lock==0 ) context.throw_error_at(at, "array lock overflow");
+        if ( arr.lock==0 ) {
+            if ( arr.magic != 0 ) {
+                context.throw_error_at(at, "array magic mismatch on first lock, was it moved or overwritten?");
+            }
+            arr.lock = 1;
+            arr.magic = DAS_ARRAY_MAGIC;
+        } else {
+            if ( arr.magic != DAS_ARRAY_MAGIC ) {
+                context.throw_error_at(at, "array magic mismatch on lock, was it moved or overwritten?");
+            }
+            arr.lock ++;
+            if ( arr.lock==0 ) {
+                context.throw_error_at(at, "array lock overflow, was it moved or overwritten?");
+            }
+        }
     }
 
     void array_unlock ( Context & context, Array & arr, LineInfo * at ) {
         if ( arr.shared || arr.hopeless ) return;
-        if ( arr.lock==0 ) context.throw_error_at(at, "array lock underflow");
+        if ( arr.magic != DAS_ARRAY_MAGIC ) {
+            context.throw_error_at(at, "array magic mismatch on unlock, was it moved or overwritten?");
+        }
+        if ( arr.lock==0 ) {
+            context.throw_error_at(at, "array lock underflow, was it moved or overwritten?");
+        }
         arr.lock --;
+        if ( arr.lock==0 ) {
+            arr.magic = 0;
+        }
     }
 
-    void array_reserve(Context & context, Array & arr, uint32_t newCapacity, uint32_t stride, LineInfo * at) {
+    static void array_reserve_impl(Context & context, Array & arr, uint64_t newCapacity, uint32_t stride, bool eager, LineInfo * at) {
         if ( arr.isLocked() ) context.throw_error_at(at, "can't change capacity of a locked array");
         if ( arr.capacity >= newCapacity ) return;
-        char * newData = nullptr;
-        if ( context.verySafeContext ) {
-            newData = (char *)context.allocate(newCapacity*stride, at);
-            memcpy(newData, arr.data, arr.size*stride);
-        } else {
-            newData = (char *)context.reallocate(arr.data, arr.capacity*stride, newCapacity*stride, at);
+        // Explicit mul_overflow guard: stride is uint32, newCapacity is uint64.
+        // The product can overflow uint64 when newCapacity > UINT64_MAX / stride
+        // (with stride > 0). Panic before passing a wrap-around byte count to
+        // the heap allocator (where it would silently allocate a small block
+        // and the next memcpy would overrun random memory).
+        if ( stride && newCapacity > UINT64_MAX / uint64_t(stride) ) {
+            context.throw_error_at(at, "array_reserve: capacity*stride overflows uint64 [capacity=%llu] [stride=%u]", (unsigned long long)newCapacity, stride);
         }
-        if ( !newData ) context.throw_out_of_memory(false, newCapacity*stride, at);
-        context.heap->mark_comment(newData, "array");
+        uint64_t memSize64 = newCapacity * uint64_t(stride);
+        const char * prev_comment = arr.data ? context.heap->get_comment(arr.data) : nullptr;
+        char * newData = nullptr;
+        // deferred arm: abandon the old buffer to GC so stale interior aliases stay readable
+        if ( context.verySafeContext && !arr.scratch && !eager ) {
+            newData = (char *)context.allocate(memSize64, at);
+            if ( newData && arr.data ) {
+                memcpy(newData, arr.data, arr.size*stride);
+            }
+        } else {
+            newData = (char *)context.reallocate(arr.data, arr.capacity*stride, memSize64, at);
+        }
+        context.heap->mark_comment(newData, prev_comment ? prev_comment : "array");
         if ( newData != arr.data ) {
             // memcpy(newData, arr.data, arr.capacity);
             arr.data = newData;
@@ -40,14 +106,42 @@ namespace das
         arr.capacity = newCapacity;
     }
 
-    void array_resize ( Context & context, Array & arr, uint32_t newSize, uint32_t stride, bool zero, LineInfo * at ) {
+    void array_reserve(Context & context, Array & arr, uint64_t newCapacity, uint32_t stride, LineInfo * at) {
+        array_reserve_impl(context, arr, newCapacity, stride, false, at);
+    }
+
+    void array_reserve_scratch(Context & context, Array & arr, uint64_t newCapacity, uint32_t stride, LineInfo * at) {
+        array_reserve_impl(context, arr, newCapacity, stride, true, at);
+    }
+
+    void array_resize ( Context & context, Array & arr, uint64_t newSize, uint32_t stride, bool zero, LineInfo * at ) {
         if ( arr.isLocked() ) context.throw_error_at(at, "can't resize locked array");
+        // The daslang surface contract is `long_length(arr) : int64`, so a size that doesn't
+        // fit in int64_t would wrap negative on the way out. Enforce the cap up front so the
+        // int64 API stays well-defined.
+        if ( newSize > uint64_t(INT64_MAX) ) {
+            context.throw_error_at(at, "array_resize: newSize exceeds INT64_MAX [newSize=%llu]", (unsigned long long)newSize);
+        }
         if ( newSize > arr.capacity ) {
-            uint32_t newCapacity = 1 << (32 - das_clz (das::max(newSize,2u) - 1));
-            newCapacity = das::max(newCapacity, 16u);
+            // Without this, the pow2 round-up below silently doubles a huge one-shot allocation;
+            // an exact reserve (never rounded) is the deliberate spelling. Divide: newSize*stride
+            // can overflow uint64 (same trick as the array_reserve guard).
+            if ( stride && newSize > context.maxUnreservedSize / uint64_t(stride) ) {
+                context.throw_error_at(at, "array resize to %llu elements of %u bytes each grows past max_unreserved_size (%llu bytes); reserve the final size first, ensure_capacity for open-ended appends, or raise the max_unreserved_size option",
+                    (unsigned long long)newSize, stride, (unsigned long long)context.maxUnreservedSize);
+            }
+            // Round the capacity up to the next power of two, leaving slack so append-style
+            // repeated resize stays amortized O(1) (push grows geometrically via array_grow).
+            uint64_t newCapacity = uint64_t(1) << (64 - das_clz64(das::max(newSize, uint64_t(2)) - 1));
+            newCapacity = das::max(newCapacity, uint64_t(16));
+            // The pow2 round-up overflows past INT64_MAX when newSize > 2^62; clamp so the
+            // resulting capacity stays representable in the int64 long_capacity() surface.
+            if ( newCapacity > uint64_t(INT64_MAX) ) newCapacity = uint64_t(INT64_MAX);
             array_reserve(context, arr, newCapacity, stride, at);
         }
-        if ( zero && newSize>arr.size ) {
+        // stride 0 (zero-size elements) allocates nothing, so arr.data stays null - and
+        // memset's first argument is declared nonnull even for a zero byte count (UBSan)
+        if ( zero && newSize>arr.size && stride ) {
             memset ( arr.data + arr.size*stride, 0, size_t(newSize-arr.size)*size_t(stride) );
         }
         arr.size = newSize;
@@ -85,7 +179,6 @@ namespace das
         vec4f ll = source->eval(context);
         Array * arr = cast<Array *>::to(ll);
         char * iter = context.allocateIterator(sizeof(GoodArrayIterator),"array<> iterator", &debugInfo);
-        if ( !iter ) context.throw_out_of_memory(false, sizeof(GoodArrayIterator)+16, &debugInfo);
         new (iter) GoodArrayIterator(arr, stride, &debugInfo);
         return cast<char *>::from(iter);
     }
@@ -119,7 +212,6 @@ namespace das
         vec4f ll = source->eval(context);
         char * data = cast<char *>::to(ll);
         char * iter = context.allocateIterator(sizeof(FixedArrayIterator),"fixed array iterator", &debugInfo);
-        if ( !iter ) context.throw_out_of_memory(false, sizeof(FixedArrayIterator)+16, &debugInfo);
         new (iter) FixedArrayIterator(data, size, stride, &debugInfo);
         return cast<char *>::from(iter);
     }
@@ -133,7 +225,7 @@ namespace das
         for ( uint32_t i=0, is=total; i!=is; ++i, pArray-- ) {
             if ( pArray->data ) {
                 if ( !pArray->isLocked() ) {
-                    uint32_t oldSize = pArray->capacity*stride;
+                    uint64_t oldSize = pArray->capacity * uint64_t(stride);
                     context.free(pArray->data, oldSize, &debugInfo);
                 } else {
                     context.throw_error_at(debugInfo, "deleting locked array%s", errorMessage);

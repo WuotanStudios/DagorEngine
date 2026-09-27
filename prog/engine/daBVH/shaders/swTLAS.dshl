@@ -1,0 +1,890 @@
+include "swBLAS.dshl"
+
+macro USE_SW_BVH_TLAS(code)
+hlsl(code) {
+  #define SW_RT_INFINITY asfloat(0x7F800000)
+  #define SW_RT_BELOW_INFINITY asfloat(0x7F7FFFFF)
+
+  #ifndef DECODE_TLAS_NODE_DEFINED
+  void decode_tlas_node(ByteAddressBuffer tlas_data, uint offset, out float3 elem1, out float3 elem2, out uint skip, out bool leaf)
+  {
+    uint4 e12 = loadBuffer4(tlas_data, offset);
+    elem1 = f16tof32(e12.xyz);
+    elem2 = f16tof32(e12.xyz>>16);
+    skip = e12.w;
+    leaf = skip>>31;
+  }
+  #endif
+
+  float3 transform(float3x3 m, float3 pt)
+  {
+    return mul(pt, m).xyz;
+    //return float3(m[0].w, m[1].w, m[2].w) + m[0].xyz*pt.x + m[1].xyz*pt.y + m[2].xyz*pt.z;
+  }
+  float3 transform(float3x3 m, float4 pt) {return transform(m, pt.xyz);}
+
+  //#define BVH_TLAS_BOXES 0
+  //#define BVH_TLAS_BOXES_SHADOW 0
+  #define BVH_TLAS_BOXES_SHADOW_THRESHOLD 1 // if ray originated from more than 10*10 distance from instance, it will be treated as box
+  #define SHADOW_OFFSET_ORIGIN_PART 0.004
+  // Mirrored instances (det<0) encode the reflection in the sign bit of scale.x; the CPU decoder
+  // (decodeLeafTransform) honors it. The GPU decode ignores it by default, because SWRT shadows
+  // currently run only on collapsed/optimized (non-reflected) models. Turn this on for the correct
+  // decode (clear scale.x sign, negate col2) once reflected instances are fed to the TLAS.
+  #ifndef BVH_TLAS_DECODE_REFLECTION
+  #define BVH_TLAS_DECODE_REFLECTION 0
+  #endif
+
+  struct DecodedTLASLeaf
+  {
+    float3 origin, scale;
+    float3x3 invTm;
+    uint maxScale__distToTreatAsBox;
+    uint leafDataOffset; // for deferred blasStart/blasSize reads
+    #ifdef TLAS_ADDITIONAL_LEAF_DATA_DEFINED
+    TLASAdditionalLeafData additional;
+    #endif
+  };
+  float get_leaf_max_scale(DecodedTLASLeaf l) {return f16tof32(l.maxScale__distToTreatAsBox);}
+  float get_leaf_box_dist(DecodedTLASLeaf l) {return (l.maxScale__distToTreatAsBox>>16);}
+  bool is_leaf_box(DecodedTLASLeaf l) {return (l.maxScale__distToTreatAsBox>>16) == 0;}
+
+  DecodedTLASLeaf decode_tlas_leaf(ByteAddressBuffer tlas_data, uint offset)
+  {
+    offset &= 0x7fffffff;
+    DecodedTLASLeaf ret;
+    ret.leafDataOffset = offset;
+    ret.origin = asfloat(loadBuffer3(tlas_data, offset));
+    ret.scale = asfloat(loadBuffer3(tlas_data, offset + 3*4));
+    ret.invTm[0] = asfloat(loadBuffer3(tlas_data, offset + 6*4));
+    ret.invTm[1] = asfloat(loadBuffer3(tlas_data, offset + 9*4));
+    #if BVH_TLAS_DECODE_REFLECTION
+    // Sign-cleared scale also keeps invScale (and the [-invScale,invScale] box) correct in distTLASleaf.
+    uint reflected = asuint(ret.scale.x) >> 31;
+    ret.scale.x = abs(ret.scale.x);
+    ret.invTm[2] = reflected ? -cross(ret.invTm[0], ret.invTm[1]) : cross(ret.invTm[0], ret.invTm[1]);
+    #else
+    ret.invTm[2] = cross(ret.invTm[0], ret.invTm[1]);
+    #endif
+    ret.maxScale__distToTreatAsBox = loadBuffer(tlas_data, offset + 12*4);
+    // blasStart (offset+13*4) and blasSize (offset+14*4) are read on demand via load_leaf_blas_start/size
+    #ifdef TLAS_ADDITIONAL_LEAF_DATA_DEFINED
+    // boxes don't use blasStart/blasSize, so additional data can start 8 bytes earlier
+    decode_tlas_leaf_additional(tlas_data, offset + (is_leaf_box(ret) ? 13*4 : 15*4), ret.additional);
+    #endif
+    return ret;
+  }
+  uint2 load_leaf_blas_start_size(ByteAddressBuffer tlas_data, DecodedTLASLeaf l) {return loadBuffer2(tlas_data, l.leafDataOffset + 13*4);}
+
+  float3 world_to_blas_encoded(float3 worldPos, float3 origin, float3 scale, float3x3 invTm)
+  {
+    float3 centered = worldPos - origin;
+    float3 rotated = mul(centered, invTm);
+    return rotated * scale;
+  }
+
+  float blas_encoded_y_to_world(float blasY, float3 origin, float3 scale)
+  {
+    return blasY / scale.y + origin.y;
+  }
+
+  bool rayTLASLeaf(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, uint offset, float3 rayOrigin, float3 rayDir, inout float t, inout float2 bCoord, inout float3 triNorm, inout int complex)
+  {
+    DecodedTLASLeaf leaf = decode_tlas_leaf(tlas_data, offset);
+    rayOrigin -= leaf.origin;
+    float3 rayOriginTr = transform(leaf.invTm, rayOrigin)*leaf.scale, rayDirTr = transform(leaf.invTm, rayDir).xyz*leaf.scale;
+    float3 rayDirTrInv = select(abs(rayDirTr) < 1e-32f, select(rayDirTr < 0, -1e32f, 1e32f), rcp(rayDirTr));
+
+    float3 localTriNorm;
+    float localT = t;
+    bool hit = RayIntersectsBoxTNormal(rayOriginTr, rayDirTrInv, -1, 1, localT, localTriNorm);
+    BRANCH
+    if (!hit)
+      return false;
+    #if !BVH_TLAS_BOXES
+      #if defined(OPTIMIZE_SMALL_BOXES_SQ_MUL)
+      //fixme: use local space size!
+        BRANCH
+        if (!is_leaf_box(leaf) && length_sq(rayOrigin) < OPTIMIZE_SMALL_BOXES_SQ_MUL*get_leaf_max_scale(leaf))
+      #else
+        BRANCH
+        if (!is_leaf_box(leaf))
+      #endif
+    #else
+      if (0)
+    #endif
+    {
+      uint2 blasStartSize = load_leaf_blas_start_size(tlas_data, leaf);
+      hit = rayBLAS(blas_data, rayOriginTr, rayDirTr, rayDirTrInv, blasStartSize.x, blasStartSize.y, t, localTriNorm, bCoord, complex);
+      BRANCH
+      if (!hit)
+        return false;
+    } else
+      t = localT;
+    float3x3 tm = transpose(leaf.invTm);
+    triNorm = transform(tm, localTriNorm*leaf.scale).xyz;
+    return true;
+  }
+
+  bool rayTLAS(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, float3 rayOrigin, float3 rayDir, float3 rayDirInv, float rayMaxT, out float t, inout float3 triNorm, inout float2 bCoord, out int complex)
+  {
+    t = min(rayMaxT, SW_RT_BELOW_INFINITY);
+    uint blasComplex = 0, tlasComplex = 0;
+    triNorm = float3(0,0,0);
+
+    bool found_hit = false;
+
+    {
+      int dataOffset = 0;
+      float3 rayOriginScaled = -rayOrigin*rayDirInv;
+      LOOP
+      for (;;)
+      {
+        bool leafNode;
+        float3 bmin, bmax;
+
+        uint offsetToNextNode;
+        decode_tlas_node(tlas_data, dataOffset, bmin, bmax, offsetToNextNode, leafNode);
+        if (!offsetToNextNode)
+          break;
+
+        //bool collision = RayIntersectsBox(rayOrigin, rayDirInv, bmin, bmax, t);
+        bool collision = RayIntersectsBoxT0T1(bmin.xyz*rayDirInv + rayOriginScaled, bmax.xyz*rayDirInv + rayOriginScaled, t);
+        ++tlasComplex;
+        if (!leafNode)
+        {
+          //if there is collision, go to the next node (left) or else skip over the whole branch
+          dataOffset += collision ? TLAS_NODE_ELEM_SIZE : offsetToNextNode;
+        }
+        else
+        {
+          BRANCH
+          if (collision)
+          {
+            found_hit = found_hit | rayTLASLeaf(tlas_data, blas_data, offsetToNextNode, rayOrigin, rayDir, t, bCoord, triNorm, blasComplex);
+          }
+          dataOffset += TLAS_NODE_ELEM_SIZE;
+        }
+      }
+    }
+    triNorm = normalize(triNorm);
+    complex = (blasComplex&0xfffff)|tlasComplex<<16;
+    return found_hit;
+  }
+
+  // Nearest-first ("ordered") closest-hit TLAS traversal: the CPU rayBLAS_OrderedFree
+  // scheme one level up. Children of a node are gathered in chunks of 4, slab-tested,
+  // sorted near-to-far by box entry distance and visited nearest-first, so an early hit
+  // shrinks t sooner and prunes far subtrees; a stacked entry already at or beyond the
+  // shrunken t is dropped at pop. Culling is always against the current t, so it finds
+  // the same closest hit as rayTLAS - order affects only speed. Shadow/any-hit rays gain
+  // nothing from ordering (see rayShadowTLAS) - this is for closest-hit queries only.
+  //
+  // Stack entries are (entry distance | node offset) keys. Default: uint2 pairs -
+  // full 32-bit offsets (a TLAS of any size) and exact distances (asuint is
+  // order-preserving for the non-negative tEnter). SWRT_TLAS_ORDERED_PACKED_KEYS 1
+  // packs both into ONE uint to halve the stack's register footprint:
+  // f32tof16(dist) with the sign bit dropped and 2 mantissa bits cut (13 bits;
+  // f32tof16 truncates and so does the cut, so the decoded distance only rounds
+  // DOWN - ordering gets marginally coarser, the pop cull stays conservative) and
+  // ofs>>4 in the low 19 bits (nodes are 16-byte aligned). The packed form caps
+  // the TLAS at 8 MB - the producer must guarantee it (offset truncation is
+  // silent corruption, not degradation).
+  #ifndef SWRT_TLAS_ORDERED_PACKED_KEYS
+  #define SWRT_TLAS_ORDERED_PACKED_KEYS 0
+  #endif
+  #if SWRT_TLAS_ORDERED_PACKED_KEYS
+    #define SWRT_TLAS_KEY_T uint
+    #define SWRT_TLAS_KEY_MAKE(d, o) (((f32tof16(d) >> 2) << 19) | ((o) >> 4))
+    #define SWRT_TLAS_KEY_DIST(k) f16tof32(((k) >> 19) << 2)
+    #define SWRT_TLAS_KEY_OFS(k) (((k) & 0x7FFFFu) << 4)
+    #define SWRT_TLAS_KEY_MISS (~0u)
+  #else
+    #define SWRT_TLAS_KEY_T uint2
+    #define SWRT_TLAS_KEY_MAKE(d, o) uint2(asuint(d), o)
+    #define SWRT_TLAS_KEY_DIST(k) asfloat((k).x)
+    #define SWRT_TLAS_KEY_OFS(k) ((k).y)
+    #define SWRT_TLAS_KEY_MISS uint2(~0u, ~0u)
+  #endif
+  #define SWRT_TLAS_ORDERED_STACK (3*BVH_MAX_TLAS_DEPTH) // 3 deferred siblings per level of the build-asserted worst case
+
+  void swrt_tlas_cax(inout SWRT_TLAS_KEY_T a, inout SWRT_TLAS_KEY_T b)
+  {
+  #if SWRT_TLAS_ORDERED_PACKED_KEYS
+    uint mn = min(a, b);
+    b = max(a, b);
+    a = mn;
+  #else
+    bool sw = b.x < a.x;
+    uint2 mn = sw ? b : a, mx = sw ? a : b;
+    a = mn;
+    b = mx;
+  #endif
+  }
+
+  bool rayTLASOrdered(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, float3 rayOrigin, float3 rayDir, float3 rayDirInv, float rayMaxT, out float t, inout float3 triNorm, inout float2 bCoord, out int complex)
+  {
+    t = min(rayMaxT, SW_RT_BELOW_INFINITY);
+    uint blasComplex = 0, tlasComplex = 0;
+    triNorm = float3(0,0,0);
+    bool found_hit = false;
+    float3 rayOriginScaled = -rayOrigin*rayDirInv;
+
+    SWRT_TLAS_KEY_T stack[SWRT_TLAS_ORDERED_STACK];
+    int sp = 0;
+    // current gather span [cs, ce); the root level is terminated by the stop sentinel
+    uint cs = 0, ce = 0xFFFFFFFFu;
+
+    LOOP
+    for (;;)
+    {
+      // gather: slab-test the children in [cs, ce), sort each chunk of 4 near-to-far
+      // (misses become ~0u and sink), push far-first so the nearest pops first
+      LOOP
+      while (cs < ce)
+      {
+        // Never taken in practice (TLAS depth is asserted at build), but this branch is
+        // LOAD-BEARING for codegen, do not remove or replace with a min() clamp: it is
+        // the range proof that lets the compiler keep the indexed stack in registers,
+        // and its early exit fences loop scheduling. Measured on Scarlett: removing it
+        // is 2x slower (VGPRs 180, occupancy 6 -> 2), min() clamp is 20% slower.
+        if (sp > SWRT_TLAS_ORDERED_STACK - 4)
+          break;
+        SWRT_TLAS_KEY_T k0 = SWRT_TLAS_KEY_MISS, k1 = SWRT_TLAS_KEY_MISS, k2 = SWRT_TLAS_KEY_MISS, k3 = SWRT_TLAS_KEY_MISS;
+        uint m = 0, nh = 0;
+        LOOP
+        while (cs < ce && m < 4)
+        {
+          bool leafNode;
+          float3 bmin, bmax;
+          uint cskip;
+          decode_tlas_node(tlas_data, cs, bmin, bmax, cskip, leafNode);
+          if (!cskip)
+          {
+            ce = cs; // stop sentinel (root level only)
+            break;
+          }
+          ++tlasComplex;
+          float3 t0 = bmin*rayDirInv + rayOriginScaled, t1 = bmax*rayDirInv + rayOriginScaled;
+          float3 tmin3 = min(t0, t1), tmax3 = max(t0, t1);
+          float tEnter = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.f));
+          float tExit = min(min(tmax3.x, tmax3.y), min(tmax3.z, t));
+          SWRT_TLAS_KEY_T key = tEnter <= tExit ? SWRT_TLAS_KEY_MAKE(tEnter, cs) : SWRT_TLAS_KEY_MISS;
+          nh += tEnter <= tExit ? 1u : 0u;
+          if (m == 0) k0 = key; else if (m == 1) k1 = key; else if (m == 2) k2 = key; else k3 = key;
+          ++m;
+          cs += leafNode ? TLAS_NODE_ELEM_SIZE : cskip;
+        }
+        // optimal 4-element network: 5 compare-exchanges, ascending
+        swrt_tlas_cax(k0, k2); swrt_tlas_cax(k1, k3); swrt_tlas_cax(k0, k1); swrt_tlas_cax(k2, k3); swrt_tlas_cax(k1, k2);
+        if (nh > 3) stack[sp++] = k3;
+        if (nh > 2) stack[sp++] = k2;
+        if (nh > 1) stack[sp++] = k1;
+        if (nh > 0) stack[sp++] = k0;
+      }
+      if (sp == 0)
+        break;
+      SWRT_TLAS_KEY_T key = stack[--sp];
+      cs = 0; ce = 0; // default: nothing to gather, pop again
+      if (SWRT_TLAS_KEY_DIST(key) >= t)
+        continue; // deferred cull: a closer hit landed after this entry was pushed
+      uint o = SWRT_TLAS_KEY_OFS(key);
+      uint skip = loadBuffer(tlas_data, o + 12);
+      BRANCH
+      if (skip >> 31)
+        found_hit = found_hit | rayTLASLeaf(tlas_data, blas_data, skip, rayOrigin, rayDir, t, bCoord, triNorm, blasComplex);
+      else
+      {
+        cs = o + TLAS_NODE_ELEM_SIZE;
+        ce = o + skip;
+      }
+    }
+    triNorm = normalize(triNorm);
+    complex = (blasComplex&0xfffff)|tlasComplex<<16;
+    return found_hit;
+  }
+
+  bool rayShadowTLASLeaf(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, uint offset, float3 rayOrigin, float3 rayDir)
+  {
+    DecodedTLASLeaf leaf = decode_tlas_leaf(tlas_data, offset);
+    rayOrigin -= leaf.origin;
+
+    float3 rayOriginTr = transform(leaf.invTm, rayOrigin + rayDir*SHADOW_OFFSET_ORIGIN_PART*get_leaf_max_scale(leaf))*leaf.scale;
+    float3 rayDirTr = transform(leaf.invTm, rayDir).xyz*leaf.scale;
+    float3 rayDirTrInv = select(abs(rayDirTr) < 1e-32f, select(rayDirTr < 0, -1e32f, 1e32f), rcp(rayDirTr));
+
+    #if BVH_TLAS_BOXES_SHADOW
+      return RayIntersectsBoxInf(rayOriginTr, rayDirTrInv, -1, 1);
+    #else
+    if (!RayIntersectsBoxInf(rayOriginTr, rayDirTrInv, -1, 1))
+      return false;
+
+    BRANCH
+    #if BVH_TLAS_BOXES_SHADOW_THRESHOLD
+    // get_leaf_box_dist is in BLAS-encoded half-extent units (anisotropic, per-axis), the same
+    // space as rayOriginTr -- NOT metres, even though the source convar is authored in metres.
+    if (is_leaf_box(leaf) || length_sq(rayOriginTr) > pow2(get_leaf_box_dist(leaf)))
+    #else
+    if (is_leaf_box(leaf))
+    #endif
+      return true;
+    uint2 blasStartSize = load_leaf_blas_start_size(tlas_data, leaf);
+    return rayShadowBLAS(blas_data, rayOriginTr, rayDirTr, rayDirTrInv, blasStartSize.x, blasStartSize.y);
+    #endif
+  }
+
+  // Range-limited any-hit shadow walk. Boxes honour rayMaxT, triangles do not:
+  // a triangle inside a leaf whose box survived the limit is accepted even if
+  // its own hit distance is a little past it. That keeps the BLAS inner loop
+  // byte-identical to the unlimited walk while still pruning every node and
+  // instance outside the segment, so the over-estimate is bounded by the
+  // extent of the surviving leaf box. A shadow query only needs a boolean,
+  // hence Est - use rayTLAS when the hit distance itself matters.
+  //
+  // The point is to avoid paying for a closest-hit walk (rayTLAS/Ordered) just
+  // to get a range cap: any-hit exits on the first blocker, needs no ordered
+  // descent, and computes no normal/barycentrics.
+  bool rayShadowTLASLeafEst(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, uint offset, float3 rayOrigin, float3 rayDir,
+    float rayMaxT)
+  {
+    DecodedTLASLeaf leaf = decode_tlas_leaf(tlas_data, offset);
+    rayOrigin -= leaf.origin;
+
+    float3 rayOriginTr = transform(leaf.invTm, rayOrigin + rayDir*SHADOW_OFFSET_ORIGIN_PART*get_leaf_max_scale(leaf))*leaf.scale;
+    float3 rayDirTr = transform(leaf.invTm, rayDir).xyz*leaf.scale;
+    float3 rayDirTrInv = select(abs(rayDirTr) < 1e-32f, select(rayDirTr < 0, -1e32f, 1e32f), rcp(rayDirTr));
+    // origin and direction take the same transform and scale, so the ray
+    // parameter survives into leaf space and rayMaxT needs no rescaling
+    #if BVH_TLAS_BOXES_SHADOW
+      return RayIntersectsBox(rayOriginTr, rayDirTrInv, -1, 1, rayMaxT);
+    #else
+    if (!RayIntersectsBox(rayOriginTr, rayDirTrInv, -1, 1, rayMaxT))
+      return false;
+
+    BRANCH
+    #if BVH_TLAS_BOXES_SHADOW_THRESHOLD
+    if (is_leaf_box(leaf) || length_sq(rayOriginTr) > pow2(get_leaf_box_dist(leaf)))
+    #else
+    if (is_leaf_box(leaf))
+    #endif
+      return true;
+    uint2 blasStartSize = load_leaf_blas_start_size(tlas_data, leaf);
+    return rayShadowBLAS(blas_data, rayOriginTr, rayDirTr, rayDirTrInv, blasStartSize.x, blasStartSize.y);
+    #endif
+  }
+
+  bool rayShadowTLASEst(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, float3 rayOrigin, float3 rayDir, float3 rayDirInv,
+    float rayMaxT, uint at = 0
+    , uint endAt = 0
+    )
+  {
+    uint dataOffset = at;
+    float3 rayOriginScaled = -rayOrigin*rayDirInv;
+
+    LOOP
+    for(;;)
+    {
+      bool leafNode;
+      float3 bmin, bmax;
+      int offsetToNextNode;
+      decode_tlas_node(tlas_data, dataOffset, bmin, bmax, offsetToNextNode, leafNode);
+      #if !LIMIT_AT_END
+      if (!offsetToNextNode)
+        break;
+      #else
+      if (dataOffset > endAt || !offsetToNextNode)
+        break;
+      #endif
+
+      bool collision = RayIntersectsBoxT0T1(bmin.xyz*rayDirInv + rayOriginScaled, bmax.xyz*rayDirInv + rayOriginScaled, rayMaxT);
+      if (!leafNode)
+      {
+        if (!collision)
+          dataOffset += offsetToNextNode;
+        else
+          dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+      else
+      {
+        BRANCH
+        if (collision)
+        {
+          if (rayShadowTLASLeafEst(tlas_data, blas_data, offsetToNextNode, rayOrigin, rayDir, rayMaxT))
+            return true;
+        }
+        dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+    }
+    return false;
+  }
+
+  bool rayShadowTLAS(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data,float3 rayOrigin, float3 rayDir, float3 rayDirInv, uint at = 0
+    , uint endAt = 0
+    )
+  {
+    // for hit or miss (shadow) there is no point in ordered traversal - we don't care if we hit closest tri or not
+    uint dataOffset = at;
+    float3 rayOriginScaled = -rayOrigin*rayDirInv;
+
+    LOOP
+    for(;;)
+    {
+      bool leafNode;
+      float3 bmin, bmax;
+      int offsetToNextNode;
+      decode_tlas_node(tlas_data, dataOffset, bmin, bmax, offsetToNextNode, leafNode);
+      #if !LIMIT_AT_END
+      if (!offsetToNextNode)
+        break;
+      #else
+      if (dataOffset > endAt || !offsetToNextNode)
+        break;
+      #endif
+
+      bool collision = RayIntersectsBoxT0TInf(bmin.xyz*rayDirInv + rayOriginScaled, bmax.xyz*rayDirInv + rayOriginScaled);
+      if (!leafNode)
+      {
+        //if there is collision, go to the next node (left) or else skip over the whole branch
+        if (!collision)
+          dataOffset += offsetToNextNode;
+        else
+          dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+      else
+      {
+        BRANCH
+        if (collision)
+        {
+          if (rayShadowTLASLeaf(tlas_data, blas_data, offsetToNextNode, rayOrigin, rayDir))
+            return true;
+        }
+        dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+    }
+    return false;
+  }
+  #ifdef SWRT_USE_CONSTANT_PLANES
+  bool testBoxExtentB(float3 bmin, float3 bmax, float4x4 frustum, float4 plane4)
+  {
+    float3 center = (bmax + bmin)*0.5, extent = bmax-center;
+    float4 res03;
+    res03 = (center.xxxx + (extent.x * sign(SWRT_USE_CONSTANT_PLANES[0]))) * SWRT_USE_CONSTANT_PLANES[0] + frustum[3];
+    res03 = (center.yyyy + (extent.y * sign(SWRT_USE_CONSTANT_PLANES[1]))) * SWRT_USE_CONSTANT_PLANES[1] + res03;
+    res03 = (center.zzzz + (extent.z * sign(SWRT_USE_CONSTANT_PLANES[2]))) * SWRT_USE_CONSTANT_PLANES[2] + res03;
+    return all(bool4(res03 >= 0)) & (dot(((extent * sign(SWRT_USE_CONSTANT_PLANES[3].xyz)) + center.xyz), SWRT_USE_CONSTANT_PLANES[3].xyz) + plane4.w >= 0 );
+  }
+  #else
+  bool testBoxExtentB(float3 bmin, float3 bmax, float4x4 frustum, float4 plane4)
+  {
+    float3 center = (bmax + bmin)*0.5, extent = bmax-center;
+    float4 res03;
+    res03 = (center.xxxx + (extent.x * sign(frustum[0]))) * frustum[0] + frustum[3];
+    res03 = (center.yyyy + (extent.y * sign(frustum[1]))) * frustum[1] + res03;
+    res03 = (center.zzzz + (extent.z * sign(frustum[2]))) * frustum[2] + res03;
+    return all(bool4(res03 >= 0)) & (dot(((extent * sign(plane4.xyz)) + center.xyz), plane4.xyz) + plane4.w >= 0 );
+  }
+  #endif
+
+  bool isSomethingInFrustum(ByteAddressBuffer tlas_data, float4x4 frustum, float4 plane4, inout uint first_leaf)
+  {
+    // for hit or miss (shadow) there is no point in ordered traversal - we don't care if we hit closest tri or not
+    int dataOffset = 0;
+    LOOP
+    for(;;)
+    {
+      bool leafNode;
+      float3 bmin, bmax;
+      int offsetToNextNode;
+      decode_tlas_node(tlas_data, dataOffset, bmin, bmax, offsetToNextNode, leafNode);
+      if (!offsetToNextNode)
+        break;
+
+      bool collision = testBoxExtentB(bmin, bmax, frustum, plane4);
+      if (!leafNode)
+      {
+
+        //if there is collision, go to the next node (left) or else skip over the whole branch
+        if (!collision)
+          dataOffset += offsetToNextNode;
+        else
+          dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+      else
+      {
+        BRANCH
+        if (collision)
+        {
+          first_leaf = dataOffset;
+          return true;
+          //if (isTlasInFrustum(dataOffset, frustum))
+          //  return true;
+        }
+        dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+    }
+    return false;
+  }
+
+  // Find the DFS-last leaf colliding with frustum via right-first stack-based DFS.
+  // Handles N-ary trees (max_children_count > 2): iterates all direct children per node.
+  // first_leaf_ofs: offset of the already-known first visible leaf — subtrees entirely before it are skipped.
+  uint findLastLeafInFrustum(ByteAddressBuffer tlas_data, float4x4 frustum, float4 plane4, uint first_leaf_ofs, uint root_ofs = 0)
+  {
+    #define STACK_SIZE 16
+    uint stack[STACK_SIZE];
+    int stackSize = 1;
+    stack[0] = root_ofs;
+
+    LOOP
+    while (stackSize > 0)
+    {
+      uint current = stack[--stackSize];
+      bool currentIsLeaf = current >> 31;
+      current &= 0x7FFFFFFF;
+
+      if (currentIsLeaf)
+        return current;
+
+      // Re-read node to get skip (subtree size)
+      float3 bmin, bmax;
+      uint skip;
+      bool isLeaf;
+      decode_tlas_node(tlas_data, current, bmin, bmax, skip, isLeaf);
+
+      if (isLeaf) // root was pushed without leaf flag
+        return current;
+
+      // Iterate all direct children left-to-right; rightmost ends up on top (popped first)
+      uint childOfs = current + TLAS_NODE_ELEM_SIZE;
+      uint endOfs = current + skip;
+      while (childOfs < endOfs)
+      {
+        float3 childBmin, childBmax;
+        uint childSkip;
+        bool childIsLeaf;
+        decode_tlas_node(tlas_data, childOfs, childBmin, childBmax, childSkip, childIsLeaf);
+
+        uint childEnd = childOfs + (childIsLeaf ? TLAS_NODE_ELEM_SIZE : childSkip);
+        // Subtree entirely before the first visible leaf — cannot contain the last leaf
+        if (childEnd > first_leaf_ofs && childSkip && testBoxExtentB(childBmin, childBmax, frustum, plane4))
+        {
+          // Overflow drops the DFS-last (rightmost) children -- exactly the ones we look for --
+          // yielding an endAt that is too small and per-tile light leaks. Bail conservatively:
+          // ~0u tells the caller to drop the end limit for this tile (correct, just slower).
+          if (stackSize >= STACK_SIZE)
+            return ~0u;
+          stack[stackSize++] = childOfs | (childIsLeaf ? 0x80000000u : 0u);
+        }
+
+        childOfs = childEnd;
+      }
+    }
+    #undef STACK_SIZE
+
+    return ~0u;
+  }
+
+  // Offset at which box-overlap traversal must begin. Leading nodes that are disjoint from the
+  // query box cannot hold relevant leaves (their subtree is skipped); nodes fully containing it
+  // are guaranteed to be entered, so the walk can start inside them. Returns ~0u when nothing in
+  // the TLAS overlaps the box. Same narrowing idea as isSomethingInFrustum for shadow tiles.
+  uint firstTLASOffsetForBox(ByteAddressBuffer tlas_data, float3 query_bmin, float3 query_bmax, uint at)
+  {
+    uint dataOffset = at;
+    LOOP
+    for (;;)
+    {
+      bool leafNode;
+      float3 bmin, bmax;
+      uint skip;
+      decode_tlas_node(tlas_data, dataOffset, bmin, bmax, skip, leafNode);
+      if (!skip)
+        return ~0u;
+      bool overlaps = all(bmin <= query_bmax) && all(bmax >= query_bmin);
+      if (leafNode)
+      {
+        if (overlaps)
+          return dataOffset;
+        dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+      else if (!overlaps)
+        dataOffset += skip;
+      else if (all(bmin <= query_bmin) && all(bmax >= query_bmax))
+        dataOffset += TLAS_NODE_ELEM_SIZE;
+      else
+        return dataOffset;
+    }
+  }
+
+  // DFS-last leaf node overlapping the box, via right-first stack DFS (same shape as
+  // findLastLeafInFrustum). Result is a walk end limit: no relevant leaf lies past it.
+  // ~0u = drop the limit (nothing found, or stack overflow - conservative, just slower).
+  uint lastTLASLeafForBox(ByteAddressBuffer tlas_data, float3 query_bmin, float3 query_bmax, uint first_ofs, uint root_ofs = 0)
+  {
+    #define BOX_STACK_SIZE 16
+    uint stack[BOX_STACK_SIZE];
+    int stackSize = 1;
+    stack[0] = root_ofs;
+
+    LOOP
+    while (stackSize > 0)
+    {
+      uint current = stack[--stackSize];
+      bool currentIsLeaf = current >> 31;
+      current &= 0x7FFFFFFF;
+      if (currentIsLeaf)
+        return current;
+
+      float3 bmin, bmax;
+      uint skip;
+      bool isLeaf;
+      decode_tlas_node(tlas_data, current, bmin, bmax, skip, isLeaf);
+      if (isLeaf) // root pushed without the leaf flag
+        return current;
+
+      uint childOfs = current + TLAS_NODE_ELEM_SIZE;
+      uint endOfs = current + skip;
+      while (childOfs < endOfs)
+      {
+        float3 childBmin, childBmax;
+        uint childSkip;
+        bool childIsLeaf;
+        decode_tlas_node(tlas_data, childOfs, childBmin, childBmax, childSkip, childIsLeaf);
+
+        uint childEnd = childOfs + (childIsLeaf ? TLAS_NODE_ELEM_SIZE : childSkip);
+        // subtree entirely before the known first hit cannot contain the last one
+        if (childEnd > first_ofs && childSkip && all(childBmin <= query_bmax) && all(childBmax >= query_bmin))
+        {
+          if (stackSize >= BOX_STACK_SIZE)
+            return ~0u;
+          stack[stackSize++] = childOfs | (childIsLeaf ? 0x80000000u : 0u);
+        }
+        childOfs = childEnd;
+      }
+    }
+    #undef BOX_STACK_SIZE
+    return ~0u;
+  }
+
+  #define NEG_DIST_SCALE 1.05
+  #define POS_DIST_SCALE 1.0//0.95
+
+  // Distance-query view of a TLAS leaf: decoded once, reusable across many query points
+  // (e.g. cached in groupshared for a whole thread group). blasStartSize.y == 0 marks a pure
+  // box leaf (a mesh BLAS can never have zero size). invTm kept as three rows, not float3x3:
+  // matrices inside groupshared struct arrays are unreliable across compilers.
+  struct DistDecodedLeaf
+  {
+    float3 origin;
+    float3 invScale;
+    float3 invTm0, invTm1, invTm2;
+    uint2 blasStartSize;
+  };
+
+  DistDecodedLeaf decode_dist_tlas_leaf(ByteAddressBuffer tlas_data, uint offset)
+  {
+    DecodedTLASLeaf leaf = decode_tlas_leaf(tlas_data, offset);
+    DistDecodedLeaf r;
+    r.origin = leaf.origin;
+    r.invScale = 1/leaf.scale;
+    r.invTm0 = leaf.invTm[0];
+    r.invTm1 = leaf.invTm[1];
+    r.invTm2 = leaf.invTm[2];
+    r.blasStartSize = is_leaf_box(leaf) ? uint2(0, 0) : load_leaf_blas_start_size(tlas_data, leaf);
+    return r;
+  }
+
+  // Narrow a mesh leaf's blasStartSize to the BLAS node sub-range overlapping a world-space
+  // box (e.g. a thread group's tile): per-query walks then traverse a subtree instead of the
+  // whole model tree. blasStartSize.y becomes ~0u when nothing overlaps (queries skip the leaf).
+  void narrowDistLeafToBox(inout DistDecodedLeaf leaf, ByteAddressBuffer blas_data, float3 world_bmin, float3 world_bmax)
+  {
+    if (leaf.blasStartSize.y == 0 || leaf.blasStartSize.y == ~0u) // pure box / already culled
+      return;
+    // world box -> conservative instance-local (unscaled) AABB: rotate the center, abs-rotate
+    // the extent; must mirror transform()'s v.x*row0 + v.y*row1 + v.z*row2 convention
+    float3 center = 0.5*(world_bmin + world_bmax) - leaf.origin;
+    float3 ext = 0.5*(world_bmax - world_bmin);
+    float3 lc = transform(float3x3(leaf.invTm0, leaf.invTm1, leaf.invTm2), center);
+    float3 le = abs(leaf.invTm0)*ext.x + abs(leaf.invTm1)*ext.y + abs(leaf.invTm2)*ext.z;
+    uint f = firstBLASOffsetForBox(blas_data, leaf.blasStartSize.x, leaf.blasStartSize.y, lc - le, lc + le, leaf.invScale);
+    if (f == ~0u)
+    {
+      leaf.blasStartSize.y = ~0u;
+      return;
+    }
+    uint lastLeaf = lastBLASLeafForBox(blas_data, leaf.blasStartSize.x, leaf.blasStartSize.y, lc - le, lc + le, leaf.invScale, f);
+    uint end = lastLeaf != ~0u ? lastLeaf + BVH_BLAS_LEAF_SIZE : leaf.blasStartSize.x + leaf.blasStartSize.y;
+    leaf.blasStartSize = uint2(f, end - f);
+  }
+
+  // world_nrm/world_surf receive the winner's UNNORMALIZED world-space geometric normal and
+  // the closest point on the winning surface when this leaf improves maxDist2 (triangle plane
+  // normal + closest point, or the nearest box face + point for pure box leaves).
+  bool distTLASleafDecodedN(DistDecodedLeaf leaf, ByteAddressBuffer blas_data, float3 worldPos, inout float maxDist2, inout float3 world_nrm, inout float3 world_surf)
+  {
+    if (leaf.blasStartSize.y == ~0u) // narrowed away: nothing of this instance near the query region
+      return false;
+    worldPos -= leaf.origin;
+
+    float3 localPos = transform(float3x3(leaf.invTm0, leaf.invTm1, leaf.invTm2), worldPos);
+    float distToLocalBox2 = sqDistancePointBox(-leaf.invScale, leaf.invScale, localPos);
+    BRANCH
+    if (distToLocalBox2 >= abs(maxDist2)) // exact distance
+      return false;
+
+    if (leaf.blasStartSize.y == 0)
+    {
+      // must compete with the running best: inside the box distToLocalBox2 is 0, so this branch
+      // is entered at any depth - an unconditional write would override closer geometry from
+      // other instances and escape the caller's search radius with deep negatives
+      float d = distancePointBoxSigned(-leaf.invScale, leaf.invScale, localPos);
+      if (d*d >= abs(maxDist2))
+        return false;
+      maxDist2 = ((d < 0) ? -NEG_DIST_SCALE : POS_DIST_SCALE)*d*d;
+      float3 nLocal;
+      float3 surfLocal = clamp(localPos, -leaf.invScale, leaf.invScale);
+      if (d > 0)
+        nLocal = localPos - surfLocal;
+      else
+      {
+        // inside (or on surface): outward normal of the least-penetrated face, surface point
+        // projected onto that face
+        float3 pen = leaf.invScale - abs(localPos);
+        nLocal = pen.x < pen.y && pen.x < pen.z ? float3(sign(localPos.x), 0, 0)
+                                                : (pen.y < pen.z ? float3(0, sign(localPos.y), 0) : float3(0, 0, sign(localPos.z)));
+        surfLocal += nLocal*dot(pen, abs(nLocal));
+      }
+      world_nrm = float3(dot(nLocal, leaf.invTm0), dot(nLocal, leaf.invTm1), dot(nLocal, leaf.invTm2));
+      world_surf = leaf.origin + float3(dot(surfLocal, leaf.invTm0), dot(surfLocal, leaf.invTm1), dot(surfLocal, leaf.invTm2));
+      return true;
+    }
+    // localPos stays UNSCALED (rotation is isometric, so it is world-metric); distBlas converts
+    // the encoded nodes/verts into that space via invScale, so its result competes with maxDist2
+    // directly - no conservative maxScale seeding and no world re-verify needed
+    float bestDist2 = maxDist2;
+    float3 nrm, surf;
+    BRANCH
+    if (distBlas(blas_data, leaf.blasStartSize.x, leaf.blasStartSize.y, localPos, leaf.invScale, bestDist2, nrm, surf))
+    {
+      maxDist2 = ((bestDist2 < 0) ? -NEG_DIST_SCALE : POS_DIST_SCALE)*abs(bestDist2);
+      world_nrm = float3(dot(nrm, leaf.invTm0), dot(nrm, leaf.invTm1), dot(nrm, leaf.invTm2));
+      world_surf = leaf.origin + float3(dot(surf, leaf.invTm0), dot(surf, leaf.invTm1), dot(surf, leaf.invTm2));
+      return true;
+    }
+    return false;
+  }
+
+  bool distTLASleafDecoded(DistDecodedLeaf leaf, ByteAddressBuffer blas_data, float3 worldPos, inout float maxDist2)
+  {
+    float3 nrm = 0, surf = 0;
+    return distTLASleafDecodedN(leaf, blas_data, worldPos, maxDist2, nrm, surf);
+  }
+
+  bool distTLASleaf(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, uint offset, float3 worldPos, inout float maxDist2)
+  {
+    return distTLASleafDecoded(decode_dist_tlas_leaf(tlas_data, offset), blas_data, worldPos, maxDist2);
+  }
+  bool distTLASleafChecked(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, uint offset, float3 worldPos, inout float maxDist2)
+  {
+    float3 bmin, bmax;
+    bool leafNode;
+    int treeSize = 0;
+    decode_tlas_node(tlas_data, offset, bmin, bmax, treeSize, leafNode);
+    float dist2 = sqDistancePointBox(bmin-0.5, bmax+0.5, worldPos);
+    BRANCH
+    if (dist2 >= abs(maxDist2))
+      return false;
+    return distTLASleaf(tlas_data, blas_data, offset, worldPos, maxDist2);
+  }
+
+  // Ranged walk (at/endAt confine it to a precomputed [first, last] node range, see
+  // firstTLASOffsetForBox / lastTLASLeafForBox; pass 0 / ~0u for a full walk) that also
+  // reports the winner's world-space normal and surface point (see distTLASleafDecodedN);
+  // for consumers that feed lighting from the closest surface.
+  bool distTLASN(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, float3 worldPos, float maxDist, inout float distance, uint at, uint endAt, inout float3 world_nrm, inout float3 world_surf)
+  {
+    float maxDist2 = maxDist*maxDist;
+    bool found_hit = false;
+
+    uint dataOffset = at;
+
+    LOOP
+    for (;;)
+    {
+      bool leafNode;
+      float3 bmin, bmax;
+      uint offsetToNextNode;
+      decode_tlas_node(tlas_data, dataOffset, bmin, bmax, offsetToNextNode, leafNode);
+      if (!offsetToNextNode || dataOffset > endAt)
+        break;
+
+      float dist2 = sqDistancePointBox(bmin, bmax, worldPos);
+      bool collision = dist2 < abs(maxDist2);
+      if (!leafNode)
+      {
+        //if there is collision, go to the next node (left) or else skip over the whole branch
+        if (!collision)
+          dataOffset += offsetToNextNode;
+        else
+          dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+      else
+      {
+        if (collision)
+          found_hit = found_hit | distTLASleafDecodedN(decode_dist_tlas_leaf(tlas_data, offsetToNextNode), blas_data, worldPos, maxDist2, world_nrm, world_surf);
+        dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+    }
+    distance = sqrt(abs(maxDist2));
+    distance = maxDist2 < 0 ? -distance/sqrt(NEG_DIST_SCALE) : distance/sqrt(POS_DIST_SCALE);
+    return found_hit;
+  }
+
+  // same walk without the normal/surface channels; the compiler strips the dead outputs
+  bool distTLAS(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, float3 worldPos, float maxDist, inout float distance, uint at, uint endAt)
+  {
+    float3 nrm = 0, surf = 0;
+    return distTLASN(tlas_data, blas_data, worldPos, maxDist, distance, at, endAt, nrm, surf);
+  }
+  bool distTLAS(ByteAddressBuffer tlas_data, ByteAddressBuffer blas_data, float3 worldPos, float maxDist, inout float distance)
+  {
+    return distTLAS(tlas_data, blas_data, worldPos, maxDist, distance, 0u, 0xFFFFFFFFu);
+  }
+
+  #ifdef HAS_TLAS_XZ_INF_CB
+  bool tlas_xz_inf_cb(ByteAddressBuffer tlas_data, DecodedTLASLeaf leaf, float3 worldPos, inout TlasXzCbData cbData);
+
+  void forEachTLASLeafXZCb(ByteAddressBuffer tlas_data, float3 tlasPos, float3 worldPos, inout TlasXzCbData cbData)
+  {
+    int dataOffset = 0;
+    LOOP
+    for (;;)
+    {
+      float3 bmin, bmax;
+      uint offsetToNextNode;
+      bool leafNode;
+      decode_tlas_node(tlas_data, dataOffset, bmin, bmax, offsetToNextNode, leafNode);
+      if (!offsetToNextNode)
+        break;
+      bool collision = all(tlasPos.xz >= bmin.xz & bmax.xz >= tlasPos.xz);
+      if (!leafNode)
+      {
+        dataOffset += collision ? TLAS_NODE_ELEM_SIZE : (int)offsetToNextNode;
+      }
+      else
+      {
+        BRANCH
+        if (collision)
+        {
+          DecodedTLASLeaf leaf = decode_tlas_leaf(tlas_data, offsetToNextNode);
+          if (tlas_xz_inf_cb(tlas_data, leaf, worldPos, cbData))
+            break;
+        }
+        dataOffset += TLAS_NODE_ELEM_SIZE;
+      }
+    }
+  }
+  #endif
+}
+endmacro

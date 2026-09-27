@@ -15,7 +15,10 @@ public:
     cstr, //
     eid,
     worldPos,
-    clampToBorder);
+    clampToBorder,
+    fov,
+    fadeOutZone,
+    relativeAngle);
 
   BhvPlaceOnCompassStrip();
   virtual int update(UpdateStage stage, darg::Element *elem, float dt) override final;

@@ -48,6 +48,7 @@ enum
 
   SYS_SKIP_SIMULATION_ON_THIS_FRAME = 1 << 20,
   SYS_ALLOW_SIMULATION_LODS = 1 << 21,
+  SYS_DISABLE_CULLING = 1 << 22,
 
   SYS_DUMMY_SYSTEM = 1 << 31,
 };
@@ -60,6 +61,7 @@ struct SystemTemplate
   eastl::string name;
   int gameResId;
   float spawnRangeLimit;
+  uint8_t statGroup;
 
   EmitterState emitterState;
   EmitterRandomizer emitterRandomizer;

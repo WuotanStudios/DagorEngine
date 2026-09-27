@@ -1,0 +1,50 @@
+include "shader_global.dshl"
+include "rendinst_opaque_inc.dshl"
+include "rendinst_rotation_palette.dshl"
+include "rendinst_simple_inc.dshl"
+include "paint_details_inc.dshl"
+include "gbuffer.dshl"
+include "voxel_inc.dshl"
+
+shader rendinst_voxel
+{
+  if (rendinst_render_pass == rendinst_render_pass_impostor_color  ||
+      rendinst_render_pass == rendinst_render_pass_impostor_shadow ||
+      rendinst_render_pass == rendinst_render_pass_impostor_voxel ||
+      rendinst_render_pass == rendinst_render_pass_grassify ||
+      rendinst_render_pass == rendinst_render_pass_to_heightmap ||
+      rendinst_render_pass == rendinst_render_pass_voxelize_albedo ||
+      rendinst_render_pass == rendinst_render_pass_triangle_debug)
+  {
+    dont_render;
+  }
+
+  // NO_DYNSTCODE()
+
+  cull_mode = cw;
+
+  channel float3 pos = pos;
+
+  USE_RIEXTRA_PER_INSTANCE_RENDER_DATA(vs)
+
+  ENABLE_MULTI_DRAW(false)
+  RENDINST_BLOCK()
+  RI_VOXELIZE_ALBEDO()
+  RENDINST_INSTANCING()
+  hlsl {
+    ##if (rendinst_render_is_normal_or_vox_albedo)
+      #define HLSL_FULL_VS_OUTPUT 1
+    ##endif
+  }
+
+  INIT_AND_USE_COMMON_RENDINST_MOTION_VECTORS()
+  INIT_AND_USE_GLOBTM(ps)
+
+  if (rendinst_render_pass != rendinst_render_pass_to_shadow && rendinst_render_pass != rendinst_render_pass_depth)
+  {
+    WRITE_GBUFFER()
+  }
+
+  USE_RENDINST_VOXEL_VS()
+  USE_VOXEL_PS(true)
+}

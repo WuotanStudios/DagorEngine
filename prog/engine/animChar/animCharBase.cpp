@@ -18,8 +18,8 @@
 #include <gameRes/dag_gameResSystem.h>
 #include <ioSys/dag_dataBlock.h>
 #include <ioSys/dag_roDataBlock.h>
-#include "animBranches.h"
-#include "animPdlMgr.h"
+#include <anim/dag_animPureInterface.h>
+#include <animChar/dag_animCharacter2.h>
 
 #include <debug/dag_log.h>
 #include <debug/dag_debug.h>
@@ -46,20 +46,18 @@ extern PerformanceTimer2 perf_tm;
 
 namespace AnimCharV20
 {
-bool (*trace_static_multiray)(dag::Span<AnimCharV20::LegsIkRay> traces, bool down, intptr_t ctx) = NULL;
+bool (*trace_static_multiray)(dag::Span<AnimCharV20::TraceRayInfo> traces, bool down, intptr_t ctx) = NULL;
 } // namespace AnimCharV20
 
 #define debug(...) logmessage(_MAKE4C('ANIM'), __VA_ARGS__)
 //
 // Animchar base component
 //
+GeomNodeTree AnimcharBaseComponent::emptyNodeTree;
+
 AnimcharBaseComponent::AnimcharBaseComponent() :
   animGraph(NULL),
   animMap(midmem),
-  animState(NULL),
-  stateDirector(NULL),
-  originalNodeTree(NULL),
-  stateDirectorEnabled(true),
   animValid(false),
   forceAnimUpdate(false),
   magic(MAGIC_VALUE),
@@ -68,11 +66,10 @@ AnimcharBaseComponent::AnimcharBaseComponent() :
   centerNodeBsphRad(0),
   centerNodeIdx(0),
   fastPhysSystem(NULL),
-  physSys(NULL),
   totalDeltaTime(0),
   postCtrl(NULL),
   motionMatchingController(nullptr),
-  animDbgCtx(NULL)
+  animcharDebugContext(NULL)
 {
   node0.pOfs = v_zero();
   node0.pScale_id = V_C_ONE;
@@ -84,30 +81,22 @@ AnimcharBaseComponent::AnimcharBaseComponent() :
 
 AnimcharBaseComponent::~AnimcharBaseComponent()
 {
-  if (animGraph && animState)
-    animGraph->resetBlendNodes(*animState);
-
   for (int i = 0; i < attachment.size(); i++)
     releaseAttachment(i);
   clear_and_shrink(attachment);
   clear_and_shrink(attachmentSlotId);
 
-  destroyDebugBlenderContext();
+  destroyDumpBlenderDataContext();
   del_it(fastPhysSystem);
   setOriginalNodeTreeRes(NULL);
-  postCtrl = NULL;
-  motionMatchingController = nullptr;
+  if (nodeTree != &emptyNodeTree)
+    nodeTree->destroy();
 
-  destroyGraph(stateDirector);
+  if (animcharDebugContext)
+    del_it(animcharDebugContext);
 
-  if (animState)
-  {
-    delete animState;
-    animState = NULL;
-  }
-  animGraph = NULL;
-  centerNodeBsphRad = 0;
-  centerNodeIdx = dag::Index16(0);
+  if (physObjData)
+    release_game_resource_ex(physObjData, PhysObjGameResClassId);
 }
 
 void AnimcharBaseComponent::setFastPhysSystem(FastPhysSystem *system)
@@ -118,15 +107,15 @@ void AnimcharBaseComponent::setFastPhysSystem(FastPhysSystem *system)
   totalDeltaTime = 0;
   fastPhysSystem = system;
 
-  nodeTree.invalidateWtm();
-  vec3f world_translate = nodeTree.translateToZero();
-  nodeTree.calcWtm();
-  nodeTree.translate(world_translate);
+  nodeTree->invalidateWtm();
+  vec3f world_translate = nodeTree->translateToZero();
+  nodeTree->calcWtm();
+  nodeTree->translate(world_translate);
 
   if (fastPhysSystem)
-    fastPhysSystem->init(nodeTree);
+    fastPhysSystem->init(*nodeTree);
 
-  nodeTree.invalidateWtm();
+  nodeTree->invalidateWtm();
   recalcWtm();
 }
 
@@ -142,17 +131,17 @@ bool AnimcharBaseComponent::resetFastPhysSystem()
     return true;
   if (!originalNodeTree)
     return false;
-  if (nodeTree.empty())
+  if (nodeTree->empty())
     return false;
 
   FastPhysSystem *fpsys = fastPhysSystem;
-  mat44f tm = nodeTree.getRootTm();
-  vec3f wofs = nodeTree.getWtmOfs();
+  mat44f tm = nodeTree->getRootTm();
+  vec3f wofs = nodeTree->getWtmOfs();
 
-  nodeTree = *originalNodeTree;
-  nodeTree.getRootTm() = tm;
-  nodeTree.setWtmOfs(wofs);
-  nodeTree.invalidateWtm();
+  nodeTree->replaceContentFrom(*originalNodeTree);
+  nodeTree->getRootTm() = tm;
+  nodeTree->setWtmOfs(wofs);
+  nodeTree->invalidateWtm();
 
   fastPhysSystem = NULL;
   invalidateAnim();
@@ -160,7 +149,7 @@ bool AnimcharBaseComponent::resetFastPhysSystem()
 
   totalDeltaTime = 0;
   fastPhysSystem = fpsys;
-  fastPhysSystem->reset(nodeTree.getWtmOfs());
+  fastPhysSystem->reset(nodeTree->getWtmOfs());
 
   return true;
 }
@@ -199,39 +188,41 @@ void AnimcharBaseComponent::setTm(const Point3 &pos, const Point3 &dir, const Po
 }
 void AnimcharBaseComponent::setPos(const Point3 &pos)
 {
-  nodeTree.changeRootPos(v_perm_xyzd(v_ldu(&pos.x), V_C_UNIT_0001));
-  nodeTree.invalidateWtm();
+  if (nodeTree->empty())
+    return;
+  nodeTree->changeRootPos(v_perm_xyzd(v_ldu(&pos.x), V_C_UNIT_0001));
+  nodeTree->invalidateWtm();
 }
 void AnimcharBaseComponent::setDir(float ax, float ay, float az)
 {
-  if (nodeTree.empty())
+  if (nodeTree->empty())
     return;
-  mat44f &root_tm = nodeTree.getRootTm();
+  mat44f &root_tm = nodeTree->getRootTm();
   Matrix3 m = rotxM3(ax) * rotyM3(ay) * rotzM3(az);
 
-  root_tm.col0 = v_and(v_ldu(m.m[0]), v_cast_vec4f(V_CI_MASK1110));
-  root_tm.col1 = v_and(v_ldu(m.m[1]), v_cast_vec4f(V_CI_MASK1110));
-  root_tm.col2 = v_and(v_ldu(m.m[2]), v_cast_vec4f(V_CI_MASK1110));
-  nodeTree.invalidateWtm();
+  mat33f m3;
+  v_mat33_make_from_33cu(m3, m.m[0]);
+  root_tm.set33(m3);
+  nodeTree->invalidateWtm();
 }
 
 void AnimcharBaseComponent::getTm(mat44f &tm) const
 {
-  if (nodeTree.empty())
+  if (nodeTree->empty())
     return;
-  auto &root_tm = nodeTree.getRootTm();
+  auto &root_tm = nodeTree->getRootTm();
   tm.col0 = root_tm.col0;
   tm.col1 = root_tm.col1;
   tm.col2 = root_tm.col2;
-  tm.col3 = v_add(root_tm.col3, nodeTree.getWtmOfs());
+  tm.col3 = v_add(root_tm.col3, nodeTree->getWtmOfs());
 }
 
 void AnimcharBaseComponent::getTm(TMatrix &tm) const
 {
-  if (nodeTree.empty())
+  if (nodeTree->empty())
     return;
-  mat44f root_tm = nodeTree.getRootTm();
-  root_tm.col3 = v_add(root_tm.col3, nodeTree.getWtmOfs());
+  mat44f root_tm = nodeTree->getRootTm();
+  root_tm.col3 = v_add(root_tm.col3, nodeTree->getWtmOfs());
   v_mat_43cu_from_mat44(tm.array, root_tm);
 }
 
@@ -240,11 +231,11 @@ Point3 AnimcharBaseComponent::getPos(bool recalc_anim_if_needed)
   if (recalc_anim_if_needed)
     calcAnimWtm(true);
 
-  if (!nodeTree.empty())
+  if (!nodeTree->empty())
   {
-    auto &root_tm = nodeTree.getRootTm();
+    auto &root_tm = nodeTree->getRootTm();
     Point3 ret;
-    v_stu_p3(&ret.x, v_add(root_tm.col3, nodeTree.getWtmOfs()));
+    v_stu_p3(&ret.x, v_add(root_tm.col3, nodeTree->getWtmOfs()));
     return ret;
   }
   return Point3(0, 0, 0);
@@ -274,7 +265,7 @@ void AnimcharBaseComponent::reset()
   totalDeltaTime = 0;
 
   if (fastPhysSystem)
-    fastPhysSystem->reset(nodeTree.getWtmOfs());
+    fastPhysSystem->reset(nodeTree->getWtmOfs());
 }
 
 void AnimcharBaseComponent::resetFastPhysWtmOfs(const vec3f wofs)
@@ -283,18 +274,20 @@ void AnimcharBaseComponent::resetFastPhysWtmOfs(const vec3f wofs)
     fastPhysSystem->reset(wofs);
 }
 
+PhysicsResource *AnimcharBaseComponent::getPhysicsResource() const { return physObjData ? physObjData->physRes.get() : nullptr; }
+
 void AnimcharBaseComponent::recalcWtm()
 {
-  if (!nodeTree.isWtmValid(false))
-    recalcWtm(nodeTree.translateToZero());
+  if (!nodeTree->isWtmValid(false))
+    recalcWtm(nodeTree->translateToZero());
   else
     postRecalcWtm();
 }
 
 void AnimcharBaseComponent::recalcWtm(vec3f world_translate)
 {
-  nodeTree.calcWtm();
-  nodeTree.translate(world_translate);
+  nodeTree->calcWtm();
+  nodeTree->translate(world_translate);
   postRecalcWtm();
 }
 
@@ -309,10 +302,10 @@ void AnimcharBaseComponent::postRecalcWtm()
   //== call external node post-processing
 
   if (postCtrl)
-    postCtrl->update(totalDeltaTime, nodeTree, this);
+    postCtrl->update(totalDeltaTime, *nodeTree, this);
 
-  if (fastPhysSystem && totalDeltaTime > 0)
-    fastPhysSystem->update(totalDeltaTime, nodeTree.getWtmOfs());
+  if (fastPhysSystem && fastPhysSystem->enabled && totalDeltaTime > 0)
+    fastPhysSystem->update(totalDeltaTime, nodeTree->getWtmOfs());
 
   if (recalcableAttachments || attachment.size() > sizeof(recalcableAttachments) * CHAR_BIT)
     recalcAttachments();
@@ -322,8 +315,8 @@ void AnimcharBaseComponent::postRecalcWtm()
 
 void AnimcharBaseComponent::updateFastPhys(const float dt)
 {
-  if (fastPhysSystem)
-    fastPhysSystem->update(dt, nodeTree.getWtmOfs());
+  if (fastPhysSystem && fastPhysSystem->enabled)
+    fastPhysSystem->update(dt, nodeTree->getWtmOfs());
 }
 
 void AnimcharBaseComponent::act(real dt, bool calc_anim)
@@ -341,28 +334,17 @@ void AnimcharBaseComponent::act(real dt, bool calc_anim)
 #endif
 
   AnimcharIrqHandler ih{&irq, this};
-  if (stateDirector)
-    stateDirector->setIrqHandler(&ih);
-
   animState->advance(dt);
-  if (stateDirector && stateDirectorEnabled)
-    stateDirector->advance();
   animValid = false;
 
   if (originLinVelStorage || originAngVelStorage)
   {
     AnimBlender::TlsContext &tls = animGraph->selectBlenderCtx(&irq, this);
     animGraph->blendOriginVel(tls, *animState, true);
-    if (originLinVelStorage && !nodeTree.empty())
+    if (originLinVelStorage && !nodeTree->empty())
     {
       vec3f v = tls.originLinVel;
-      if (stateDirector && stateDirectorEnabled)
-      {
-        Point3_vec4 add_vel;
-        stateDirector->getAddOriginVel(add_vel);
-        v = v_add(v, v_ld(&add_vel.x));
-      }
-      v_stu_p3(&originLinVelStorage->x, v_mat44_mul_vec3v(nodeTree.getRootTm(), v));
+      v_stu_p3(&originLinVelStorage->x, v_mat44_mul_vec3v(nodeTree->getRootTm(), v));
     }
     if (originAngVelStorage)
     {
@@ -374,8 +356,6 @@ void AnimcharBaseComponent::act(real dt, bool calc_anim)
     }
   }
   calcAnimWtm(forceAnimUpdate || calc_anim);
-  if (stateDirector)
-    stateDirector->setIrqHandler(nullptr);
 #if MEASURE_PERF
   perf_tm.pause();
   perf_cnt++;
@@ -400,33 +380,6 @@ void AnimcharBaseComponent::act(real dt, bool calc_anim)
 #endif
 }
 
-bool AnimcharBaseComponent::loadAnimGraphCpp(const char *res_name)
-{
-  if (!animState)
-    setupAnim();
-
-  stateDirector = makeGraphFromRes(res_name);
-  if (!stateDirector)
-  {
-    DAG_FATAL("can't create state director from graph <%s>", res_name);
-    RETURN_X_AFTER_FATAL(false);
-  }
-
-  if (!stateDirector->init(animGraph, animState))
-  {
-    destroyGraph(stateDirector);
-    DAG_FATAL("can't init state director from graph <%s>", res_name);
-    RETURN_X_AFTER_FATAL(false);
-  }
-
-  if (animState)
-  {
-    animState->reset();
-    animGraph->resetBlendNodes(*animState);
-  }
-  resetAnim();
-  return true;
-}
 
 void AnimcharBaseComponent::resetAnim()
 {
@@ -434,50 +387,31 @@ void AnimcharBaseComponent::resetAnim()
   if (animState)
   {
     animState->reset();
-    animGraph->resetBlendNodes(*animState);
-    animGraph->postBlendInit(*animState, nodeTree);
-    if (stateDirector)
-      stateDirector->reset(true);
+    animGraph->resetBlendNodesState(*animState);
+    animGraph->postBlendInit(*animState, *nodeTree);
     // DEBUG_CTX("animState.size=%d", animState->getSize());
   }
-  if (originalNodeTree && nodeTree.nodeCount() > 1)
+  if (originalNodeTree && nodeTree->nodeCount() > 1)
   {
-    memcpy(&nodeTree.getRootTm() + 1, &originalNodeTree->getRootTm() + 1, sizeof(mat44f) * (nodeTree.nodeCount() - 1));
-    memcpy(&nodeTree.getRootWtmRel() + 1, &originalNodeTree->getRootWtmRel() + 1, sizeof(mat44f) * (nodeTree.nodeCount() - 1));
+    memcpy(&nodeTree->getRootTm() + 1, &originalNodeTree->getRootTm() + 1, sizeof(mat44f) * (nodeTree->nodeCount() - 1));
+    memcpy(&nodeTree->getRootWtmRel() + 1, &originalNodeTree->getRootWtmRel() + 1, sizeof(mat44f) * (nodeTree->nodeCount() - 1));
   }
 }
 
-bool AnimcharBaseComponent::load(const AnimCharCreationProps &props, int skeletonId, int acId, int physId)
+bool AnimcharBaseComponent::load(const AnimCharCreationProps &props, const GeomNodeTree *skeleton, const AnimGraphResData *agRes,
+  const DynamicPhysObjectData *physRes)
 {
-  GeomNodeTree *skeleton = (GeomNodeTree *)::get_game_resource(skeletonId);
   if (!skeleton)
     return false;
-  AnimCharData *ac = (acId >= 0) ? (AnimCharData *)::get_game_resource(acId) : NULL;
-  if (acId >= 0 && !ac)
+  loadData(props, skeleton, agRes ? agRes->graph.get() : nullptr);
+
+  if (auto poData = (DynamicPhysObjectData *)physRes; poData && poData->physRes)
   {
-    ::release_game_resource(skeletonId);
-    return false;
+    physObjData = poData;
+    game_resource_add_ref_ex(physObjData, PhysObjGameResClassId);
   }
 
-  AnimationGraph *ag = ac ? ac->graph.get() : nullptr;
-  loadData(props, skeleton, ag);
-
-  if (ac && ac->agResName && ac->agResName[0])
-    loadAnimGraphCpp(ac->agResName);
-
-  if (physId >= 0)
-  {
-    DynamicPhysObjectData *poData = (DynamicPhysObjectData *)::get_game_resource(physId);
-    setPhysicsResource(poData ? poData->physRes : NULL);
-    ::release_game_resource(physId);
-  }
-
-  ::release_game_resource(skeletonId);
-  if (acId >= 0)
-    ::release_game_resource(acId);
-
-  centerNodeIdx =
-    (!props.centerNode || strcmp(props.centerNode, "@root") == 0) ? dag::Index16(0) : nodeTree.findNodeIndex(props.centerNode);
+  centerNodeIdx = props.centerNode.empty() ? dag::Index16(0) : nodeTree->findNodeIndex(props.centerNode.c_str());
   if (!centerNodeIdx)
   {
     logwarn("center node \"%s\" not found, Root is used instead (animchar: %s)", props.centerNode, creationInfo.resName);
@@ -487,11 +421,11 @@ bool AnimcharBaseComponent::load(const AnimCharCreationProps &props, int skeleto
   return true;
 }
 
-void AnimcharBaseComponent::loadData(const AnimCharCreationProps &props, GeomNodeTree *skeleton, AnimationGraph *ag)
+void AnimcharBaseComponent::loadData(const AnimCharCreationProps &props, const GeomNodeTree *skeleton, AnimationGraph *ag)
 {
   setOriginalNodeTreeRes(skeleton);
   if (skeleton)
-    nodeTree = *skeleton;
+    setNodeTreeFrom(*skeleton);
 
   if (props.useCharDep && ag)
   {
@@ -508,8 +442,8 @@ void AnimcharBaseComponent::loadData(const AnimCharCreationProps &props, GeomNod
     p = (float *)&node0.sScale;
     p[0] = p[1] = p[2] = p[3] = props.sScale;
 
-    node0.setChanNodeId(ag->getNodeId(props.rootNode));
-    charDepNodeId = nodeTree.findNodeIndex(props.rootNode);
+    node0.setChanNodeId(ag->getNodeId(props.rootNode.c_str()));
+    charDepNodeId = nodeTree->findNodeIndex(props.rootNode.c_str());
     charDepBasePYofs = props.pyOfs;
   }
 
@@ -561,19 +495,16 @@ void AnimcharBaseComponent::loadData(const AnimCharCreationProps &props, GeomNod
         int idx = find_value_idx(attachmentSlotId, slot_id);
         G_ASSERTF(idx >= 0, "slot_id=%d blk #%d", slot_id, i + 1);
         const char *node_nm = b->getBlock(i)->getStr("node", NULL);
-        attachment[idx].nodeIdx = node_nm ? nodeTree.findNodeIndex(node_nm) : (nodeTree.empty() ? dag::Index16() : dag::Index16(0));
+        attachment[idx].nodeIdx = node_nm ? nodeTree->findNodeIndex(node_nm) : (nodeTree->empty() ? dag::Index16() : dag::Index16(0));
         if (node_nm && !attachment[idx].nodeIdx)
         {
-          attachment[idx].nodeIdx = nodeTree.empty() ? dag::Index16() : dag::Index16(0);
+          attachment[idx].nodeIdx = nodeTree->empty() ? dag::Index16() : dag::Index16(0);
 
           char buf[4 << 10];
           logerr("slot <%s> refers to bad node <%s>%s", slot_nm, node_nm, dgs_get_fatal_context(buf, sizeof(buf)));
         }
         TMatrix tm = b->getBlock(i)->getTm("tm", TMatrix::IDENT);
-        attachment[idx].tm.col0 = v_and(v_ldu(tm.m[0]), v_cast_vec4f(V_CI_MASK1110));
-        attachment[idx].tm.col1 = v_and(v_ldu(tm.m[1]), v_cast_vec4f(V_CI_MASK1110));
-        attachment[idx].tm.col2 = v_and(v_ldu(tm.m[2]), v_cast_vec4f(V_CI_MASK1110));
-        attachment[idx].tm.col3 = v_perm_xyzd(v_ldu(tm.m[3]), V_C_UNIT_0001);
+        v_mat44_make_from_43cu(attachment[idx].tm, tm.m[0]);
       }
   }
 }
@@ -582,12 +513,18 @@ void AnimcharBaseComponent::cloneTo(AnimcharBaseComponent *as, bool reset_anim) 
 {
   TIME_PROFILE_DEV(animchar_clone);
 
+  // Reset animState pointer before animGraph. animState references graph so if the char we are cloning in to was
+  // the last char using this graph, we need to reset it's state before reseting the graph.
+  as->animState.reset(NULL);
+
   as->animGraph = animGraph;
-  as->nodeTree = nodeTree;
+  as->setNodeTreeFrom(*nodeTree);
   as->node0 = node0;
   as->charDepNodeId = charDepNodeId;
   as->charDepBasePYofs = charDepBasePYofs;
-  as->physSys = physSys;
+  as->physObjData = physObjData;
+  if (physObjData)
+    game_resource_add_ref_ex(physObjData, PhysObjGameResClassId);
 
   if (originalNodeTree)
     as->setOriginalNodeTreeRes(originalNodeTree);
@@ -596,12 +533,7 @@ void AnimcharBaseComponent::cloneTo(AnimcharBaseComponent *as, bool reset_anim) 
   {
     as->animMap = animMap;
     as->animMapPRS = animMapPRS;
-    as->animState = new AnimCommonStateHolder(*animState);
-
-    as->stateDirector = cloneGraph(stateDirector, as->animState);
-    as->stateDirectorEnabled = stateDirectorEnabled;
-    if (as->stateDirector)
-      as->stateDirector->reset(true);
+    as->animState.reset(new AnimGraphStateHolder(*animState));
   }
   as->creationInfo = creationInfo;
   as->centerNodeBsphRad = centerNodeBsphRad;
@@ -623,16 +555,16 @@ void AnimcharBaseComponent::cloneTo(AnimcharBaseComponent *as, bool reset_anim) 
     as->resetAnim();
 }
 
-int AnimcharBaseComponent::setAttachedChar(int slot_id, attachment_uid_t uid, AnimcharBaseComponent *attChar, bool recalcable)
+int AnimcharBaseComponent::setAttachedChar(int slot_id, attachment_uid_t uid, AnimcharBaseComponent &attChar, bool recalcable)
 {
   int idx = slot_id >= 0 ? find_value_idx(attachmentSlotId, slot_id) : -1;
   if (idx < 0)
     return idx;
   releaseAttachment(idx);
-  attachment[idx].animChar = attChar;
+  attachment[idx].animChar = &attChar;
   attachment[idx].uid = uid;
   attachment[idx].recalcable = recalcable;
-  if (attChar && recalcable && idx < sizeof(recalcableAttachments) * CHAR_BIT)
+  if (recalcable && idx < sizeof(recalcableAttachments) * CHAR_BIT)
     recalcableAttachments |= decltype(recalcableAttachments)(1) << idx;
   return idx;
 }
@@ -668,7 +600,7 @@ const mat44f *AnimcharBaseComponent::getSlotNodeWtm(int slot_id) const
   int idx = slot_id >= 0 ? find_value_idx(attachmentSlotId, slot_id) : -1;
   if (idx < 0)
     return NULL;
-  return &nodeTree.getNodeWtmRel(attachment[idx].nodeIdx);
+  return &nodeTree->getNodeWtmRel(attachment[idx].nodeIdx);
 }
 
 bool AnimcharBaseComponent::initAttachmentTmAndNodeWtm(int slot_id, mat44f &attach_tm) const
@@ -676,7 +608,7 @@ bool AnimcharBaseComponent::initAttachmentTmAndNodeWtm(int slot_id, mat44f &atta
   int idx = slot_id >= 0 ? find_value_idx(attachmentSlotId, slot_id) : -1;
   if (idx < 0)
     return false;
-  v_mat44_mul(attach_tm, nodeTree.getNodeWtmRel(attachment[idx].nodeIdx), attachment[idx].tm);
+  v_mat44_mul(attach_tm, nodeTree->getNodeWtmRel(attachment[idx].nodeIdx), attachment[idx].tm);
   return true;
 }
 
@@ -703,20 +635,20 @@ void AnimcharBaseComponent::setupAnim()
   if (!animGraph)
     return;
 
-  animMap.reserve(nodeTree.nodeCount());
+  animMap.reserve(nodeTree->nodeCount());
   if (originalNodeTree)
-    animMapPRS.reserve(nodeTree.nodeCount() * 3);
+    animMapPRS.reserve(nodeTree->nodeCount() * 3);
   if (node0.chanNodeId() != -2)
   {
     G_ASSERTF(originalNodeTree || node0.chanNodeId() == -2, "originalNodeTree=%p node0.chanNodeId=%d", originalNodeTree,
       node0.chanNodeId());
   }
 
-  for (dag::Index16 i(0), ie(nodeTree.nodeCount()); i != ie; ++i)
+  for (dag::Index16 i(0), ie(nodeTree->nodeCount()); i != ie; ++i)
   {
     AnimMap am;
     am.geomId = i;
-    am.animId = animGraph->getNodeId(nodeTree.getNodeName(i));
+    am.animId = animGraph->getNodeId(nodeTree->getNodeName(i));
     if (am.animId != -1)
     {
       if (am.animId == node0.chanNodeId())
@@ -734,47 +666,52 @@ void AnimcharBaseComponent::setupAnim()
   animMap.shrink_to_fit();
   animMapPRS.shrink_to_fit();
 
-  animState = new AnimCommonStateHolder(*animGraph);
+  animState.reset(new AnimGraphStateHolder(*animGraph));
   // DEBUG_CTX("setup animGraph: %d/%d nodes", animMap.size(), nmb.totalNodes);
 }
 
-void AnimcharBaseComponent::createDebugBlenderContext(bool dump_all_nodes)
+void AnimcharBaseComponent::createDumpBlenderDataContext(bool dump_all_nodes)
 {
-  destroyDebugBlenderContext();
-  animDbgCtx = animGraph ? animGraph->createDebugBlenderContext(&nodeTree, dump_all_nodes) : NULL;
+  AnimcharDebugContext *debugContext = createOrReturnExistingDebugContext();
+  destroyDumpBlenderDataContext();
+  debugContext->dumpBlenderDataContext = animGraph ? animGraph->createDumpBlenderDataContext(nodeTree, dump_all_nodes) : NULL;
 }
-void AnimcharBaseComponent::destroyDebugBlenderContext()
+void AnimcharBaseComponent::destroyDumpBlenderDataContext()
 {
-  if (animDbgCtx)
-    animGraph->destroyDebugBlenderContext(animDbgCtx);
-  animDbgCtx = NULL;
+  if (!animcharDebugContext)
+    return;
+  if (animcharDebugContext->dumpBlenderDataContext)
+    animGraph->destroyDumpBlenderDataContext(animcharDebugContext->dumpBlenderDataContext);
+  animcharDebugContext->dumpBlenderDataContext = NULL;
 }
 const DataBlock *AnimcharBaseComponent::getDebugBlenderState(bool dump_tm)
 {
-  if (animGraph && !animDbgCtx)
-    createDebugBlenderContext(false);
-  return animGraph ? animGraph->getDebugBlenderState(animDbgCtx, *animState, dump_tm) : NULL;
+  AnimcharDebugContext *debugContext = createOrReturnExistingDebugContext();
+  if (animGraph && !debugContext->dumpBlenderDataContext)
+    createDumpBlenderDataContext(false);
+  return animGraph ? animGraph->getDebugBlenderState(debugContext->dumpBlenderDataContext, *animState, dump_tm) : NULL;
 }
 const DataBlock *AnimcharBaseComponent::getDebugNodemasks()
 {
-  if (animGraph && !animDbgCtx)
-    createDebugBlenderContext(false);
-  return animGraph ? animGraph->getDebugNodemasks(animDbgCtx) : NULL;
+  AnimcharDebugContext *debugContext = createOrReturnExistingDebugContext();
+  if (animGraph && !debugContext->dumpBlenderDataContext)
+    createDumpBlenderDataContext(false);
+  return animGraph ? animGraph->getDebugNodemasks(debugContext->dumpBlenderDataContext) : NULL;
 }
 
 void AnimcharBaseComponent::calcAnimWtm(bool may_calc_anim)
 {
-  nodeTree.verifyOnlyTmFast();
+  nodeTree->verifyOnlyTmFast();
   if (animGraph && !animValid && may_calc_anim)
   {
     AnimBlender::TlsContext *tls = NULL;
-    nodeTree.invalidateWtm();
-    vec3f world_translate = nodeTree.translateToZero();
     bool haveBlend = false;
     if (!postCtrl || !postCtrl->overridesBlender())
     {
       haveBlend |= animGraph->blend(*(tls = &animGraph->selectBlenderCtx(&irq, this)), *animState, getCharDepModif());
     }
+    nodeTree->invalidateWtm();
+    vec3f world_translate = nodeTree->translateToZero();
     if (haveBlend && tls)
     {
 #if MEASURE_PERF
@@ -782,7 +719,7 @@ void AnimcharBaseComponent::calcAnimWtm(bool may_calc_anim)
       perf_tm2.go();
 #endif
 
-      mat44f *gn_tm_base = &nodeTree.getRootTm();
+      mat44f *gn_tm_base = &nodeTree->getRootTm();
       if (node0.chanNodeId() != -2)
       {
         const vec3f *p, *s;
@@ -820,8 +757,8 @@ void AnimcharBaseComponent::calcAnimWtm(bool may_calc_anim)
 #endif
     }
 
-    nodeTree.verifyOnlyTmFast();
-    nodeTree.calcWtm();
+    nodeTree->verifyOnlyTmFast();
+    nodeTree->calcWtm();
 
 #if MEASURE_PERF
     perfanimgblend::perf_tm.go();
@@ -832,17 +769,17 @@ void AnimcharBaseComponent::calcAnimWtm(bool may_calc_anim)
     {
       AnimPostBlendCtrl::Context ctx(*originalNodeTree, this, (float *)alloca(animGraph->getPbcWtParamCount() * sizeof(float)),
         animGraph->getPbcWtParamCount(), node0.chanNodeId() < -1 ? NULL : &node0.sScale, &irq, this, world_translate);
-      animGraph->postBlendProcess(*tls, *animState, nodeTree, ctx);
+      animGraph->postBlendProcess(*tls, *animState, *nodeTree, ctx);
     }
 
     if (postCtrl)
-      postCtrl->onPostAnimBlend(nodeTree, world_translate);
+      postCtrl->onPostAnimBlend(*nodeTree, world_translate);
 #if MEASURE_PERF
     perf_tm3.pause();
     perfanimgblend::perf_tm.pause();
 #endif
 
-    nodeTree.verifyOnlyTmFast();
+    nodeTree->verifyOnlyTmFast();
     recalcWtm(world_translate);
 
     animValid = true;
@@ -856,25 +793,32 @@ void AnimcharBaseComponent::recalcAttachments()
 {
   for (int i = 0, e = attachment.size(); i < e; i++)
   {
-    G_ASSERTF(nodeTree.isIndexValid(attachment[i].nodeIdx), "nodeIdx=%d nodeTree=%p (%d nodes)", (int)attachment[i].nodeIdx, &nodeTree,
-      nodeTree.nodeCount());
+    G_ASSERTF(nodeTree->isIndexValid(attachment[i].nodeIdx), "nodeIdx=%d nodeTree=%p (%d nodes)", (int)attachment[i].nodeIdx, nodeTree,
+      nodeTree->nodeCount());
     if (attachment[i].animChar && attachment[i].recalcable)
     {
       mat44f tm;
       //== we could use bitflag for identity tm to skip mat44f multiplication (but for now ALL tms are not identical)
-      v_mat44_mul(tm, nodeTree.getNodeWtmRel(attachment[i].nodeIdx), attachment[i].tm);
+      v_mat44_mul(tm, nodeTree->getNodeWtmRel(attachment[i].nodeIdx), attachment[i].tm);
       attachment[i].animChar->setTm(tm);
       attachment[i].animChar->doRecalcAnimAndWtm();
     }
   }
 }
 
-void AnimcharBaseComponent::setOriginalNodeTreeRes(GeomNodeTree *n)
+void AnimcharBaseComponent::setNodeTreeFrom(const GeomNodeTree &from)
+{
+  if (nodeTree != &emptyNodeTree)
+    nodeTree->destroy();
+  nodeTree = GeomNodeTree::make(from);
+}
+
+void AnimcharBaseComponent::setOriginalNodeTreeRes(const GeomNodeTree *n)
 {
   if (n)
-    ::game_resource_add_ref((GameResource *)n);
+    ::game_resource_add_ref_ex(n, GeomNodeTreeGameResClassId);
   if (originalNodeTree)
-    ::release_game_resource((GameResource *)originalNodeTree);
+    ::release_game_resource_ex(originalNodeTree, GeomNodeTreeGameResClassId);
   originalNodeTree = n;
 }
 
@@ -886,15 +830,14 @@ intptr_t AnimcharBaseComponent::irq(int type, intptr_t p1, intptr_t p2, intptr_t
   // get_time_msec()/1000.0);
   if (type >= GIRQT_FIRST_SERVICE_IRQ)
   {
-    // route service irqs to states director
-    if (ac->stateDirector && ac->stateDirectorEnabled)
-      ac->stateDirector->atIrq(type, (IAnimBlendNode *)p1);
+    if (ac->animGraph && ac->animState)
+      ac->animGraph->atIrq(type, (IAnimBlendNode *)p1, *ac->animState);
   }
   else if (type == GIRQT_TraceFootStepMultiRay)
   {
     if (!AnimCharV20::trace_static_multiray)
       return GIRQR_NoResponse;
-    AnimCharV20::LegsIkRay *rays = (AnimCharV20::LegsIkRay *)(void *)p1;
+    AnimCharV20::TraceRayInfo *rays = (AnimCharV20::TraceRayInfo *)(void *)p1;
     int count = p2;
     bool isTraceDown = p3;
     if (AnimCharV20::trace_static_multiray(make_span(rays, count), isTraceDown, ac->traceContext))
@@ -903,7 +846,7 @@ intptr_t AnimcharBaseComponent::irq(int type, intptr_t p1, intptr_t p2, intptr_t
   else if (type == GIRQT_GetMotionMatchingPose)
   {
     AnimV20::AnimBlender::TlsContext *tls = (AnimV20::AnimBlender::TlsContext *)(void *)p1;
-    if (ac->motionMatchingController && ac->motionMatchingController->getPose(*tls, ac->animMap))
+    if (ac->motionMatchingController && ac->motionMatchingController->getPose(*tls, ac->animMap, *ac->nodeTree))
       return GIRQR_MotionMatchingPoseApplied;
     else
       return GIRQR_NoResponse;

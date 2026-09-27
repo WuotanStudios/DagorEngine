@@ -100,13 +100,13 @@ namespace das {
         }
     }
 
-    void DataWalker::walk_array ( char * pa, uint32_t stride, uint32_t count, TypeInfo * ti ) {
+    void DataWalker::walk_array ( char * pa, uint32_t stride, uint64_t count, TypeInfo * ti ) {
         if ( !canVisitArrayData(ti,count) ) return;
         char * pe = pa;
         beforeArrayData(pa, stride, count, ti);
         if ( cancel() ) return;
-        for ( uint32_t i=0; i!=count; ++i ) {
-            bool last = i==count-1;
+        for ( uint64_t i=0, ic=count; i!=ic; ++i ) {
+            bool last = i==ic-1;
             beforeArrayElement(pa, ti, pe, i, last);
             if ( cancel() ) return;
             walk(pe, ti);
@@ -119,8 +119,6 @@ namespace das {
     }
 
     void DataWalker::walk_dim ( char * pa, TypeInfo * ti ) {
-        beforeDim(pa, ti);
-        if ( cancel() ) return;
         TypeInfo copyInfo = *ti;
         DAS_ASSERT(copyInfo.dimSize);
         copyInfo.size = ti->dim[0] ? copyInfo.size / ti->dim[0] : copyInfo.size;
@@ -137,17 +135,15 @@ namespace das {
         uint32_t stride = copyInfo.size;
         uint32_t count = ti->dim[0];
         walk_array(pa, stride, count, &copyInfo);
-        if ( cancel() ) return;
-        afterDim(pa, ti);
     }
 
     void DataWalker::walk_table ( Table * tab, TypeInfo * info ) {
         if ( !canVisitTableData(info) ) return;
         int keySize = info->firstType->size;
         int valueSize = info->secondType->size;
-        uint32_t count = 0;
-        for ( uint32_t i=0, is=tab->capacity; i!=is; ++i ) {
-            if ( tab->hashes[i] > HASH_KILLED64 ) {
+        uint64_t count = 0;
+        for ( uint64_t i=0, is=tab->capacity; i!=is; ++i ) {
+            if ( tableLiveSlot(*tab, i) ) {
                 bool last = (count == (tab->size-1));
                 // key
                 char * key = tab->keys + i*keySize;
@@ -184,7 +180,13 @@ namespace das {
             if ( cancel() ) return;
             afterRef(pa,info);
         } else if ( info->dimSize ) {
-            walk_dim(pa, info);
+            if ( canVisitDim(pa,info) ) {
+                beforeDim(pa, info);
+                if ( cancel() ) return;
+                walk_dim(pa, info);
+                if ( cancel() ) return;
+                afterDim(pa, info);
+            }
         } else if ( info->type==Type::tArray ) {
             auto arr = (Array *) pa;
             if ( canVisitArray(arr,info) ) {
@@ -219,6 +221,9 @@ namespace das {
                 case Type::tInt4:       Int4(*((int4 *)pa)); break;
                 case Type::tUInt:       UInt(*((uint32_t *)pa)); break;
                 case Type::tBitfield:   Bitfield(*((uint32_t *)pa),info); break;
+                case Type::tBitfield8:  Bitfield8(*((uint8_t *)pa),info); break;
+                case Type::tBitfield16: Bitfield16(*((uint16_t *)pa),info); break;
+                case Type::tBitfield64: Bitfield64(*((uint64_t *)pa),info); break;
                 case Type::tUInt2:      UInt2(*((uint2 *)pa)); break;
                 case Type::tUInt3:      UInt3(*((uint3 *)pa)); break;
                 case Type::tUInt4:      UInt4(*((uint4 *)pa)); break;
@@ -231,6 +236,29 @@ namespace das {
                 case Type::tURange:     URange(*((urange *)pa)); break;
                 case Type::tRange64:    Range64(*((range64 *)pa)); break;
                 case Type::tURange64:   URange64(*((urange64 *)pa)); break;
+                case Type::tFloat16:    Float16(*((float16_t *)pa)); break;
+                case Type::tHalf2:      Half2(*((half2 *)pa)); break;
+                case Type::tHalf3:      Half3(*((half3 *)pa)); break;
+                case Type::tHalf4:      Half4(*((half4 *)pa)); break;
+                case Type::tHalf8:      Half8(*((half8 *)pa)); break;
+                case Type::tShort2:     Short2(*((short2 *)pa)); break;
+                case Type::tShort3:     Short3(*((short3 *)pa)); break;
+                case Type::tShort4:     Short4(*((short4 *)pa)); break;
+                case Type::tShort8:     Short8(*((short8 *)pa)); break;
+                case Type::tUShort2:    UShort2(*((ushort2 *)pa)); break;
+                case Type::tUShort3:    UShort3(*((ushort3 *)pa)); break;
+                case Type::tUShort4:    UShort4(*((ushort4 *)pa)); break;
+                case Type::tUShort8:    UShort8(*((ushort8 *)pa)); break;
+                case Type::tByte2:      Byte2(*((byte2 *)pa)); break;
+                case Type::tByte3:      Byte3(*((byte3 *)pa)); break;
+                case Type::tByte4:      Byte4(*((byte4 *)pa)); break;
+                case Type::tByte8:      Byte8(*((byte8 *)pa)); break;
+                case Type::tByte16:     Byte16(*((byte16 *)pa)); break;
+                case Type::tUByte2:     UByte2(*((ubyte2 *)pa)); break;
+                case Type::tUByte3:     UByte3(*((ubyte3 *)pa)); break;
+                case Type::tUByte4:     UByte4(*((ubyte4 *)pa)); break;
+                case Type::tUByte8:     UByte8(*((ubyte8 *)pa)); break;
+                case Type::tUByte16:    UByte16(*((ubyte16 *)pa)); break;
                 case Type::tEnumeration:    WalkEnumeration(*((int32_t *)pa), info->enumType); break;
                 case Type::tEnumeration8:   WalkEnumeration8(*((int8_t *)pa),  info->enumType); break;
                 case Type::tEnumeration16:  WalkEnumeration16(*((int16_t *)pa), info->enumType); break;

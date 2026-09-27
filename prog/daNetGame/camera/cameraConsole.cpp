@@ -7,13 +7,18 @@
 #include <3d/dag_render.h>
 #include <osApiWrappers/dag_direct.h>
 #include <osApiWrappers/dag_clipboard.h>
-#include <ecs/core/entityManager.h>
+#include <camTrack/camTrack.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include "camera/camTrack.h"
 #include "camera/sceneCam.h"
 #include "game/player.h"
+#include <util/dag_delayedAction.h>
 
 using namespace console;
 
-static bool camera_console_handler(const char *argv[], int argc) // move to other file!
+static bool camera_console_handler(const char *argv[], int argc)
 {
   if (argc < 1)
     return false;
@@ -72,10 +77,16 @@ static bool camera_console_handler(const char *argv[], int argc) // move to othe
     }
     lastPos = pos;
     if (argc == 2)
-      itm.setcol(3, pos.x, atof(argv[1]), pos.z);
-    if (argc == 3)
+    {
+      const char *s = (*argv[1] == '(') ? argv[1] + 1 : argv[1];                        // tolerate "%@"-style "(x,y,z)" paste
+      if (const char *cb = strchr(s, ','), *ce = strrchr(s, ','); cb && ce && cb != ce) // E.g "123,456,678"
+        itm.setcol(3, atof(s), atof(cb + 1), atof(ce + 1));
+      else
+        itm.setcol(3, pos.x, atof(argv[1]), pos.z);
+    }
+    else if (argc == 3)
       itm.setcol(3, atof(argv[1]), pos.y, atof(argv[2]));
-    if (argc == 4)
+    else if (argc == 4)
       itm.setcol(3, atof(argv[1]), atof(argv[2]), atof(argv[3]));
 
     if (argc > 1)
@@ -83,13 +94,23 @@ static bool camera_console_handler(const char *argv[], int argc) // move to othe
   }
   CONSOLE_CHECK_NAME("camera", "free", 1, 2)
   {
-    if (argc == 1)
-      toggle_free_camera();
-    else if (to_bool(argv[1]))
-      enable_free_camera();
-    else
-      disable_free_camera();
+    const bool toggleFreeCamera = argc == 1;
+    const bool enableFreeCamera = toggleFreeCamera ? false : to_bool(argv[1]);
+    auto cameraFreeCmd = [=] {
+      if (toggleFreeCamera)
+        toggle_free_camera();
+      else if (enableFreeCamera)
+        enable_free_camera();
+      else
+        disable_free_camera();
+    };
+    // Additional game job may own the entity manager when the camera.free is executed.
+    // Defer this call so that it is executed on main thread after the additional game job has finished.
+    delayed_call(cameraFreeCmd);
   }
+  CONSOLE_CHECK_NAME("camera", "record_track", 2, 2) { camtrack::record(argv[1]); }
+  CONSOLE_CHECK_NAME("camera", "stop_record", 1, 1) { camtrack::stop_record(); }
+  CONSOLE_CHECK_NAME("camera", "play_record", 2, 2) { camtrack::play(argv[1]); }
   return found;
 }
 

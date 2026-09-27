@@ -84,55 +84,52 @@ namespace das {
         }
     };
 
-    #include "network.das.inc"
-
     bool makeServer ( const void * pClass, const StructInfo * info, Context * context ) {
-        auto server = make_smart<ServerAdapter>((char *)pClass,info,context);
-        if ( !server->isValid() ) return false;
-        server.orphan();
+        auto server = new ServerAdapter((char *)pClass,info,context);
+        if ( !server->isValid() ) { delete server; return false; }
         return true;
     }
 
-    bool server_init ( smart_ptr_raw<Server> server, int port, Context * context, LineInfoArg * at ) {
+    bool server_init ( Server * server, int port, Context * context, LineInfoArg * at ) {
         if ( !server ) context->throw_error_at(at, "null server");
         return server->init(port);
     }
 
-    bool server_is_open ( smart_ptr_raw<Server> server, Context * context, LineInfoArg * at ) {
+    bool server_is_open ( Server * server, Context * context, LineInfoArg * at ) {
         if ( !server ) context->throw_error_at(at, "null server");
         return server->is_open();
     }
 
-    bool server_is_connected ( smart_ptr_raw<Server> server, Context * context, LineInfoArg * at ) {
+    bool server_is_connected ( Server * server, Context * context, LineInfoArg * at ) {
         if ( !server ) context->throw_error_at(at, "null server");
         return server->is_connected();
     }
 
-    bool server_send ( smart_ptr_raw<Server> server, uint8_t * data, int32_t size, Context * context, LineInfoArg * at ) {
+    bool server_send ( Server * server, uint8_t * data, int32_t size, Context * context, LineInfoArg * at ) {
         if ( !server ) context->throw_error_at(at, "null server");
         return server->send_msg((char *)data, size);
     }
 
-    void server_tick ( smart_ptr_raw<Server> server, Context * context, LineInfoArg * at ) {
+    void server_tick ( Server * server, Context * context, LineInfoArg * at ) {
         if ( !server ) context->throw_error_at(at, "null server");
         server->tick();
     }
 
-    void server_restore ( smart_ptr_raw<Server> server, const void * pClass, const StructInfo * info, Context * context, LineInfoArg * at ) {
+    void server_restore ( Server * server, const void * pClass, const StructInfo * info, Context * context, LineInfoArg * at ) {
         if ( !server ) context->throw_error_at(at, "null server");
-        auto adapter = (ServerAdapter *) server.get();
+        auto adapter = (ServerAdapter *) server;
         adapter->update((char *)pClass,info,context);
     }
 
     class Module_Network : public Module {
     public:
-        Module_Network() : Module("network") {
+        Module_Network() : Module("network_core") {
             DAS_PROFILE_SECTION("Module_Network");
             ModuleLibrary lib(this);
             lib.addBuiltInModule();
-            addBuiltinDependency(lib, Module::require("rtti"));
+            addBuiltinDependency(lib, Module::require("rtti_core"));
             // sever
-            addAnnotation(make_smart<ServerAnnotation>(lib));
+            addAnnotation(new ServerAnnotation(lib));
             addExtern<DAS_BIND_FUN(makeServer)>(*this, lib,  "make_server",
                 SideEffects::modifyArgumentAndExternal, "makeServer")
                     ->args({"class","info","context"});
@@ -154,8 +151,6 @@ namespace das {
             addExtern<DAS_BIND_FUN(server_restore)>(*this, lib,  "server_restore",
                 SideEffects::modifyArgumentAndExternal, "server_restore")
                     ->args({"server","class","info","context","at"});
-            // add builtin module
-            compileBuiltinModule("network.das",network_das,sizeof(network_das));
         }
         virtual ModuleAotType aotRequire ( TextWriter & tw ) const override {
             tw << "#include \"daScript/simulate/aot_builtin_network.h\"\n";

@@ -16,7 +16,8 @@
 #include <ioSys/dag_dataBlock.h>
 #include <startup/dag_globalSettings.h>
 #include "depthAOAbove.h"
-#include <render/world/cameraInCamera.h>
+#include <render/cameraInCamera/cameraInCamera.h>
+#include <render/world/portalRenderer.h>
 #include <shaders/dag_shaderBlock.h>
 
 
@@ -33,7 +34,15 @@ CONSOLE_BOOL_VAL("render", sw_hmap_occlusion, true);
 CONSOLE_BOOL_VAL("render", sw_animchars_occlusion, true);
 CONSOLE_BOOL_VAL("render", occlusion_async_readback_gpu, true);
 
+namespace var
+{
+static ShaderVariableInfo hmap_object_tess_active("hmap_object_tess_active", true);
+} // namespace var
+
 extern void wait_static_shadows_cull_jobs();
+extern void wait_scene_shadow_ri_cull_jobs();
+extern void close_scene_shadow_ri_visibility();
+extern void shrink_scene_shadow_ri_visibility();
 
 void WorldRenderer::prepareLightProbeRIVisibilityAsync(const mat44f &globtm, const Point3 &view_pos)
 {
@@ -46,8 +55,11 @@ void WorldRenderer::waitAllJobs()
   mainCameraVisibilityMgr.waitAllJobs();
   camcamVisibilityMgr.waitAllJobs();
   wait_static_shadows_cull_jobs();
+  wait_scene_shadow_ri_cull_jobs();
   if (depthAOAboveCtx)
     depthAOAboveCtx->waitCullJobs();
+  if (PortalRenderer *portalRenderer = portal_renderer_mgr::query_portal_renderer())
+    portalRenderer->waitVisibilityJob();
 }
 
 void WorldRenderer::toggleProbeReflectionQuality()
@@ -62,7 +74,7 @@ void WorldRenderer::toggleProbeReflectionQuality()
 void WorldRenderer::initRendinstVisibility()
 {
   closeRendinstVisibility();
-  const DataBlock *grCfg = ::dgs_get_settings()->getBlockByName("graphics");
+  const DataBlock *grCfg = ::dgs_get_settings()->getBlockByNameEx("graphics");
   sw_occlusion.set(grCfg->getBool("sw_occlusion", sw_occlusion.get()));
   sw_hmap_occlusion.set(grCfg->getBool("sw_hmap_occlusion", sw_hmap_occlusion.get()));
   rendinst_cube_visibility = rendinst::createRIGenVisibility(midmem);
@@ -87,6 +99,22 @@ void WorldRenderer::closeRendinstVisibility()
     rendinst::destroyRIGenVisibility(eastl::exchange(rsv, nullptr));
   rendinst::destroyRIGenVisibility(eastl::exchange(rendinstHmapPatchesVisibility, nullptr));
   rendinst::destroyRIGenVisibility(eastl::exchange(rendinst_dynamic_shadow_visibility, nullptr));
+  close_scene_shadow_ri_visibility();
+}
+
+// visibility objects persist across levels; drop their mission-sized cull buffers
+// so they do not stay parked in menu (they regrow on next prepare)
+void WorldRenderer::shrinkRendinstVisibilities()
+{
+  waitAllJobs();
+  rendinst::shrinkRIGenVisibility(mainCameraVisibilityMgr.getRiMainVisibility());
+  rendinst::shrinkRIGenVisibility(camcamVisibilityMgr.getRiMainVisibility());
+  rendinst::shrinkRIGenVisibility(rendinst_cube_visibility);
+  for (auto rsv : rendinst_shadows_visibility)
+    rendinst::shrinkRIGenVisibility(rsv);
+  rendinst::shrinkRIGenVisibility(rendinstHmapPatchesVisibility);
+  rendinst::shrinkRIGenVisibility(rendinst_dynamic_shadow_visibility);
+  shrink_scene_shadow_ri_visibility();
 }
 
 void WorldRenderer::startVisibility()
@@ -99,6 +127,7 @@ void WorldRenderer::startVisibility()
   IPoint2 renderingResolution(0, 0);
   getRenderingResolution(renderingResolution.x, renderingResolution.y);
 
+  STATE_GUARD_0(ShaderGlobal::set_int(var::hmap_object_tess_active, VALUE), 1);
   const bool asyncRiJobEnabled = async_riex_opaque.get() && !rendinst::gpuobjects::has_pending();
   mainCameraVisibilityMgr.prepareToStartAsyncRIGenExtraOpaqueRender(globalFrameBlockId, currentTexCtx, asyncRiJobEnabled);
   mainCameraVisibilityMgr.startVisibility(currentFrameCamera, transparentPartitionSphere, renderingResolution, shadowCtx);
@@ -112,19 +141,24 @@ void WorldRenderer::startVisibility()
 
 void WorldRenderer::startOcclusionAndSwRaster()
 {
-  mainCameraVisibilityMgr.startOcclusionAndSwRaster(*riOcclusionData, currentFrameCamera, lmeshMgr);
+  mat44f_cref cockpitProjTm = reinterpret_cast<mat44f_cref>(cockpitCameraParams.noJitterProjTm);
+  mainCameraVisibilityMgr.startOcclusionAndSwRaster(*riOcclusionData, currentFrameCamera, lmeshMgr, cockpitProjTm);
 
   if (camera_in_camera::is_lens_render_active())
-    camcamVisibilityMgr.startOcclusionAndSwRaster(*riOcclusionData, *camcamParams, lmeshMgr);
+  {
+    if (camera_in_camera::get_frame_number() < 1)
+      camcamVisibilityMgr.getOcclusion()->reset();
+    camcamVisibilityMgr.startOcclusionAndSwRaster(*riOcclusionData, *camcamParams, lmeshMgr, cockpitProjTm);
+  }
 }
 
 void WorldRenderer::startGroundVisibility()
 {
-  mainCameraVisibilityMgr.startGroundVisibility(lmeshMgr, lmeshRenderer, cameraHeight, waterLevel, displacementSubDiv,
-    currentFrameCamera);
+  const float deformR = deformHmap ? 1.414213562373095f * deformHmap->getRadius() : 0;
+  mainCameraVisibilityMgr.startGroundVisibility(lmeshMgr, displacementSubDiv, deformR, currentFrameCamera);
 
   if (camera_in_camera::is_lens_render_active())
-    camcamVisibilityMgr.startGroundVisibility(lmeshMgr, lmeshRenderer, cameraHeight, waterLevel, displacementSubDiv, *camcamParams);
+    camcamVisibilityMgr.startGroundVisibility(lmeshMgr, displacementSubDiv, deformR, *camcamParams);
 }
 
 void WorldRenderer::startGroundReflectionVisibility()
@@ -135,19 +169,19 @@ void WorldRenderer::startGroundReflectionVisibility()
   // Non-oblique culling frustum is safe from nearly parallel planes.
   Frustum frustum(TMatrix4(waterPlanarReflectionViewTm) * currentFrameCamera.noJitterProjTm);
   Point3 viewPos = waterPlanarReflectionViewItm.getcol(3);
-  mainCameraVisibilityMgr.startGroundReflectionVisibility(lmeshMgr, lmeshRenderer, frustum, viewPos, currentFrameCamera.noJitterProjTm,
-    cameraHeight, waterLevel);
+  mainCameraVisibilityMgr.startGroundReflectionVisibility(lmeshMgr, frustum, viewPos, currentFrameCamera.noJitterProjTm);
 
   if (camera_in_camera::is_lens_render_active())
   {
     Frustum frustum(TMatrix4(waterPlanarReflectionViewTm) * camcamParams->noJitterProjTm);
-    camcamVisibilityMgr.startGroundReflectionVisibility(lmeshMgr, lmeshRenderer, frustum, viewPos, camcamParams->noJitterProjTm,
-      cameraHeight, waterLevel);
+    camcamVisibilityMgr.startGroundReflectionVisibility(lmeshMgr, frustum, viewPos, camcamParams->noJitterProjTm);
   }
 }
 
 void WorldRenderer::startLightsCullingJob()
 {
+  sceneShadowRenderData.clear();
+  sceneShadowRiGpuObjectsPending = rendinst::gpuobjects::has_pending();
   // there is no dynamic lights in compatibility/forward, so no need to visibility test them
   if (hasFeature(FeatureRenderFlags::CLUSTERED_LIGHTS))
   {

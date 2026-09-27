@@ -41,6 +41,14 @@ if $(PlatformSpec) in gcc clang {
   Copt += -Wno-unused-parameter ;
 }
 
+if $(PlatformSpec) in gcc {
+  Copt += -Wno-discarded-qualifiers ;
+}
+
+if $(PlatformSpec) in clang {
+  Copt += -Wno-incompatible-pointer-types-discards-qualifiers ;
+}
+
 Copt += -DMINIUPNPC_SET_SOCKET_TIMEOUT -DMINIUPNPC_GET_SRC_ADDR ;
 
 include $(Root)/prog/_jBuild/build.jam ;

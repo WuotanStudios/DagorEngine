@@ -1,6 +1,7 @@
 "@override:source" {
   file:t = "../../../prog/gameLibs/bvh/shaders/bvh_debug.dshl"
   file:t = "../../../prog/gameLibs/bvh/shaders/bvh_hwinstance_copy.dshl"
+  file:t = "../../../prog/gameLibs/bvh/shaders/bvh_lru_collision_normals.dshl"
   file:t = "../../../prog/gameLibs/bvh/shaders/bvh_process_dynrend_indices.dshl"
   file:t = "../../../prog/gameLibs/bvh/shaders/bvh_process_ahs_vertices.dshl"
   file:t = "../../../prog/gameLibs/bvh/shaders/bvh_process_skinned_vertices.dshl"
@@ -11,4 +12,8 @@
   file:t = "../../../prog/gameLibs/bvh/shaders/bvh_process_impostor_vertices.dshl"
   file:t = "../../../prog/gameLibs/bvh/shaders/bvh_process_leaves_vertices.dshl"
   file:t = "../../../prog/gameLibs/bvh/shaders/bvh_process_bake_texture_to_vertices.dshl"
+  file:t = "../../../prog/gameLibs/bvh/shaders/bvh_smoke_tracers.dshl"
+  file:t = "../../../prog/gameLibs/bvh/shaders/bvh_voxel_activity.dshl"
 }
+
+incDir:t="../../../prog/3rdPartyLibs/nvapi"

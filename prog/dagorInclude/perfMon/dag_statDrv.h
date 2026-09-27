@@ -6,14 +6,7 @@
 
 #include <util/dag_preprocessor.h>
 #include <perfMon/dag_drawStat.h>
-
-#ifndef TIME_PROFILER_ENABLED
-#if _TARGET_PC || (DAGOR_DBGLEVEL != 0)
-#define TIME_PROFILER_ENABLED 1
-#else
-#define TIME_PROFILER_ENABLED 0
-#endif
-#endif
+#include <perfMon/dag_timeProfilerEnabled.h>
 
 #if TIME_PROFILER_ENABLED
 #define DA_PROFILER_ENABLED 1
@@ -89,6 +82,7 @@ struct TimeIntervalInfo
 #define TIME_PROFILE_UNIQUE_EVENT_DEV             DA_PROFILE_UNIQUE_EVENT
 #define TIME_PROFILE_UNIQUE_EVENT_NAMED_DEV(Name) DA_PROFILE_UNIQUE_EVENT_NAMED(Name)
 #define TIME_PROFILE_UNIQUE_EVENT_DESC_DEV(Desc)  DA_PROFILE_UNIQUE_EVENT_DESC(Desc)
+#define TIME_PROFILE_TAG_DEV                      DA_PROFILE_TAG
 #else
 #define TIME_PROFILE_WAIT_DEV(LabelName)
 #define TIME_PROFILE_DEV(LabelName)
@@ -98,6 +92,7 @@ struct TimeIntervalInfo
 #define TIME_PROFILE_UNIQUE_EVENT_DEV(...)
 #define TIME_PROFILE_UNIQUE_EVENT_NAMED_DEV(Name)
 #define TIME_PROFILE_UNIQUE_EVENT_DESC_DEV(Desc)
+#define TIME_PROFILE_TAG_DEV(...)
 #endif
 
 #if TDR_PROFILE

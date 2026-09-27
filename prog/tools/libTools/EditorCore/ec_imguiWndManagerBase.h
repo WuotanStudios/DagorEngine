@@ -1,6 +1,9 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include "ec_editorCommand.h"
+
+#include <EditorCore/ec_rect.h>
 #include <EditorCore/ec_wndPublic.h>
 #include <dag/dag_vector.h>
 
@@ -10,10 +13,26 @@
 class ImguiWndManagerBase : public IWndManager
 {
 public:
-  int run(int width, int height, const char *caption, const char *icon, WindowSizeInit size) override { return 0; }
+  class WindowPositionAndSize
+  {
+  public:
+    WindowPositionAndSize() { reset(); }
 
-  bool loadLayout(const char *filename) override { return false; }
-  void saveLayout(const char *filename) override {}
+    void reset()
+    {
+      rectangle = EcRect{};
+      maximized = true;
+    }
+
+    bool isValid() const { return rectangle.width() >= MINIMUM_SIZE && rectangle.height() >= MINIMUM_SIZE; }
+
+    static constexpr int MINIMUM_SIZE = 32;
+
+    EcRect rectangle;
+    bool maximized;
+  };
+
+  int run(int width, int height, const char *caption, const char *icon, WindowSizeInit size) override { return 0; }
 
   void registerWindowHandler(IWndManagerWindowHandler *handler) override
   {
@@ -82,55 +101,50 @@ public:
 
   void setMenuArea(void *handle, hdpi::Px width, hdpi::Px height) override {}
 
-  void addAccelerator(unsigned cmd_id, ImGuiKeyChord key_chord) override
+  void addAccelerator(unsigned cmd_id, ImGuiKeyChord key_chord) override { addAcceleratorInternal(cmd_id, key_chord); }
+
+  void addAccelerator(unsigned cmd_id, const char *editor_command_id) override { addAcceleratorInternal(cmd_id, editor_command_id); }
+
+  void addViewportAccelerator(unsigned cmd_id, ImGuiKeyChord key_chord, bool allow_repeat) override
   {
-    Accelerator accelerator(cmd_id, key_chord);
-    accelerators.push_back(eastl::move(accelerator));
+    addAcceleratorInternal(cmd_id, key_chord, allow_repeat, /*viewport_accelerator = */ true);
   }
 
-  void addAcceleratorUp(unsigned cmd_id, ImGuiKeyChord key_chord) override
+  void addViewportAccelerator(unsigned cmd_id, const char *editor_command_id, bool allow_repeat) override
   {
-    G_ASSERT((key_chord & ImGuiMod_Ctrl) == 0);
-    G_ASSERT((key_chord & ImGuiMod_Alt) == 0);
-    G_ASSERT((key_chord & ImGuiMod_Shift) == 0);
-
-    Accelerator accelerator(cmd_id, key_chord);
-    acceleratorUps.push_back(eastl::move(accelerator));
+    addAcceleratorInternal(cmd_id, editor_command_id, allow_repeat, /*viewport_accelerator = */ true);
   }
 
-  void addViewportAccelerator(unsigned cmd_id, ImGuiKeyChord key_chord, bool allow_repeat = false) override
-  {
-    Accelerator accelerator(cmd_id, key_chord, allow_repeat);
-    viewportAccelerators.push_back(eastl::move(accelerator));
-  }
+  void clearAccelerators() override { accelerators.clear(); }
 
-  void clearAccelerators() override
+  unsigned processImguiAccelerator(ImGuiID active_viewport_canvas_id, bool &viewport_accelerator) override
   {
-    accelerators.clear();
-    acceleratorUps.clear();
-    viewportAccelerators.clear();
-  }
+    // Constraints:
+    // - ImGui reports a RouteGlobal shortcut as pressed even while an item is active
+    // - the viewport canvas is the active item for as long as fly mode lasts
+    // - ImGui reserves the chords that could be a character only for a focused text input
+    // - an accelerator such as the console toggle has to work from a text input.
+    const ImGuiID activeId = ImGui::GetActiveID();
+    const bool skipGlobalAccelerators = activeId != 0 && activeId != active_viewport_canvas_id && !ImGui::GetIO().WantTextInput;
 
-  unsigned processImguiAccelerator() override
-  {
     for (const Accelerator &accelerator : accelerators)
+    {
+      if (accelerator.viewportAccelerator)
+      {
+        if (active_viewport_canvas_id == 0)
+          continue;
+      }
+      else if (skipGlobalAccelerators)
+      {
+        continue;
+      }
+
       if (ImGui::Shortcut(accelerator.keyChord, accelerator.inputFlags | ImGuiInputFlags_RouteGlobal))
+      {
+        viewport_accelerator = accelerator.viewportAccelerator;
         return accelerator.cmdId;
-
-    // NOTE: ImGui porting: this should be ImGuiKeyOwner_NoOwner instead of ImGuiKeyOwner_Any but then CM_TAB_RELEASE
-    // (currently the only one command that uses accelerator up) would not work.
-    for (const Accelerator &accelerator : acceleratorUps)
-      if (ImGui::IsKeyReleased((ImGuiKey)accelerator.keyChord, ImGuiKeyOwner_Any))
-        return accelerator.cmdId;
-
-    return 0;
-  }
-
-  unsigned processImguiViewportAccelerator(ImGuiID viewport_id) override
-  {
-    for (const Accelerator &accelerator : viewportAccelerators)
-      if (ImGui::Shortcut(accelerator.keyChord, accelerator.inputFlags, viewport_id))
-        return accelerator.cmdId;
+      }
+    }
 
     return 0;
   }
@@ -138,7 +152,8 @@ public:
 private:
   struct Accelerator
   {
-    Accelerator(unsigned cmd_id, ImGuiKeyChord key_chord, bool allow_repeat = false) : cmdId(cmd_id), keyChord(key_chord)
+    Accelerator(unsigned cmd_id, ImGuiKeyChord key_chord, bool allow_repeat = false, bool viewport_accelerator = false) :
+      cmdId(cmd_id), keyChord(key_chord), viewportAccelerator(viewport_accelerator)
     {
       G_ASSERT(cmd_id != 0);
 
@@ -150,11 +165,29 @@ private:
     unsigned cmdId;
     ImGuiKeyChord keyChord;
     ImGuiInputFlags inputFlags;
+    bool viewportAccelerator;
   };
+
+  void addAcceleratorInternal(unsigned cmd_id, ImGuiKeyChord key_chord, bool allow_repeat = false, bool viewport_accelerator = false)
+  {
+    Accelerator accelerator(cmd_id, key_chord, allow_repeat, viewport_accelerator);
+    accelerators.push_back(eastl::move(accelerator));
+  }
+
+  void addAcceleratorInternal(unsigned cmd_id, const char *editor_command_id, bool allow_repeat = false,
+    bool viewport_accelerator = false)
+  {
+    const EditorCommand *command = ec_editor_commands.getCommand(editor_command_id);
+    if (!command)
+      return;
+
+    for (int i = 0; i < command->getHotkeyCount(); ++i)
+      addAcceleratorInternal(cmd_id, command->getKeyChord(i), allow_repeat, viewport_accelerator);
+
+    ec_editor_commands.setCommandCmdId(editor_command_id, cmd_id);
+  }
 
   dag::Vector<void *> windows;
   dag::Vector<IWndManagerWindowHandler *> handlers;
   dag::Vector<Accelerator> accelerators;
-  dag::Vector<Accelerator> acceleratorUps;
-  dag::Vector<Accelerator> viewportAccelerators;
 };

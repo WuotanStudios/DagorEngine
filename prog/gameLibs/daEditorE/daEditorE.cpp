@@ -26,10 +26,13 @@
 #include <debug/dag_debug3d.h>
 #include <util/dag_console.h>
 #include <perfMon/dag_statDrv.h>
+#include <quirrel/sqEventBus/sqEventBus.h>
+#include <jsoncpp/include/json/value.h>
 
 extern void register_da_editor4_objed_ptr(ObjectEditor **oe_ptr);
 extern void update_gizmo_basis_type_on_toolbar();
 extern void update_gizmo_center_type_on_toolbar();
+extern void update_free_camera_state_on_toolbar();
 
 namespace
 {
@@ -37,6 +40,7 @@ namespace
 static IGenGuiCursor *gui_cursor = nullptr;
 
 static bool de4_active = false, de4_freecam_active = false;
+static bool de4_saved_touch_screen = false, de4_saved_emu_touch_screen_with_mouse = false;
 dainput::action_set_handle_t de4_cameraActionSet;
 dainput::action_set_handle_t de4_globalsActionSet;
 static void reset_gui_cursor()
@@ -146,6 +150,7 @@ struct De4ActivationHandler : public ecs::IGenHidEventHandler
     if (de4_active && de4_freecam_active && (btn_idx == HumanInput::DKEY_SPACE || btn_idx == HumanInput::DKEY_ESCAPE))
     {
       de4_freecam_active = false;
+      update_free_camera_state_on_toolbar();
       dainput::activate_action_set(de4_cameraActionSet, false);
       global_cls_drv_pnt->getDevice(0)->setRelativeMovementMode(false);
       activeChanged();
@@ -162,6 +167,11 @@ struct De4ActivationHandler : public ecs::IGenHidEventHandler
     de4_active = !de4_active;
     if (de4_active)
     {
+      de4_saved_touch_screen = HumanInput::stg_pnt.touchScreen;
+      de4_saved_emu_touch_screen_with_mouse = HumanInput::stg_pnt.emuTouchScreenWithMouse;
+      HumanInput::stg_pnt.touchScreen = false;
+      HumanInput::stg_pnt.emuTouchScreenWithMouse = false;
+
       de4_cameraActionSet = dainput::get_action_set_handle("Camera");
       de4_globalsActionSet = dainput::get_action_set_handle("Globals"); // screenshot/voicechat/etc.
       savedActionSets.reserve(dainput::get_action_set_stack_depth());
@@ -177,6 +187,11 @@ struct De4ActivationHandler : public ecs::IGenHidEventHandler
     }
     else
     {
+      if (!HumanInput::stg_pnt.touchScreen)
+        HumanInput::stg_pnt.touchScreen = de4_saved_touch_screen;
+      if (!HumanInput::stg_pnt.emuTouchScreenWithMouse)
+        HumanInput::stg_pnt.emuTouchScreenWithMouse = de4_saved_emu_touch_screen_with_mouse;
+
       dainput::reset_action_set_stack();
       dainput::activate_action_set(de4_globalsActionSet, true);
       for (int i = savedActionSets.size() - 1; i >= 0; i--)
@@ -185,6 +200,7 @@ struct De4ActivationHandler : public ecs::IGenHidEventHandler
     }
 
     global_cls_drv_pnt->getDevice(0)->setRelativeMovementMode(!de4_active);
+    update_free_camera_state_on_toolbar();
     activeChanged();
     return true;
   }
@@ -347,6 +363,7 @@ struct De4InpHandler : public ecs::IGenHidEventHandler
     if (de4_active && !de4_freecam_active && btn_idx == HumanInput::DKEY_SPACE)
     {
       de4_freecam_active = true;
+      update_free_camera_state_on_toolbar();
       dainput::activate_action_set(de4_cameraActionSet, true);
       global_cls_drv_pnt->getDevice(0)->setRelativeMovementMode(true);
 
@@ -419,7 +436,7 @@ void De4ActivationHandler::activeChanged()
     DAEDITOR4.endRectangularSelection(NULL, NULL);
 }
 
-struct IDaEditor4EngineImpl : public IDaEditor4Engine, public ILogWriter, public IDaEditor4EmbeddedComponent
+struct IDaEditor4EngineImpl : public IDaEditor4Engine, public ILogWriter, public IDaEditor4EmbeddedComponent, IUndoRedoWndClient
 {
   struct Grid
   {
@@ -435,7 +452,7 @@ struct IDaEditor4EngineImpl : public IDaEditor4Engine, public ILogWriter, public
   void (*performPointActionCb)(bool trace, const Point3 &p0, const Point3 &dir, const Point3 &traced_pos, const char *op, int mod);
 
 public:
-  IDaEditor4EngineImpl() : IDaEditor4Engine(*create_undo_system("de4", 2 << 20, NULL))
+  IDaEditor4EngineImpl() : IDaEditor4Engine(*create_undo_system("de4", 2 << 20, this))
   {
     memset(&rectSelect, 0, sizeof(rectSelect));
     curEH = NULL;
@@ -790,12 +807,12 @@ public:
       return;
     objEd->beforeRender();
   }
-  virtual void render3d(const Frustum &frustum, const Point3 &camera_pos)
+  virtual void render3d(const Frustum &frustum, const Point3 &camera_pos, bool render_on_top)
   {
     if (!de4_active || !objEd)
       return;
     TIME_D3D_PROFILE(daEditorE)
-    ::begin_draw_cached_debug_lines();
+    ::begin_draw_cached_debug_lines(!render_on_top, !render_on_top);
     objEd->render(frustum, camera_pos);
     ::end_draw_cached_debug_lines();
   }
@@ -825,6 +842,17 @@ public:
     if (!de4_freecam_active && ::gui_cursor && !de4_inp_handler.shouldHideCursor() &&
         global_cls_drv_pnt->getDevice(0)->isPointerOverWindow() && ::gui_cursor->getVisible())
       ::gui_cursor->render(Point2(rs.x, rs.y));
+  }
+  void updateUndoRedoMenu() override {}
+  void onUndoRedo(const char *nm, bool wasUndo)
+  {
+    if (!suppressUndoRedoEvents)
+    {
+      Json::Value val;
+      val["name"] = Json::Value(nm);
+      val["wasUndo"] = wasUndo;
+      sqeventbus::send_event("undoNotification", eastl::move(val));
+    }
   }
 };
 IDaEditor4Engine *IDaEditor4Engine::__daeditor4_global_instance = NULL;

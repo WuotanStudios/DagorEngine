@@ -3,6 +3,7 @@
 #include <render/sphHarmCalc.h>
 #include <drv/3d/dag_texture.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_query.h>
 #include <drv/3d/dag_commands.h>
@@ -15,7 +16,6 @@
 #include <osApiWrappers/dag_miscApi.h>
 #include <vecmath/dag_vecMath.h>
 #include <perfMon/dag_statDrv.h>
-#include <3d/dag_gpuConfig.h>
 #include <util/dag_hash.h>
 
 #include <math/dag_hlsl_floatx.h>
@@ -199,11 +199,11 @@ void SphHarmCalc::processFaceData(uint8_t *buf, int face, int width, int stride,
       if (!isLinearTarget)
         col = Color4(powf(max(0.f, col.r), gamma), powf(max(0.f, col.g), gamma), powf(max(0.f, col.b), gamma), 1);
 
-      // Harmonics are an approximation, be tolerant.
-      if (col.r < -0.1f || col.g < -0.1f || col.b < -0.1f || col.r > 100.f || col.g > 100.f || col.b > 100.f || !check_finite(col.r) ||
-          !check_finite(col.g) || !check_finite(col.b))
+      // Discard only inf/negative values, bright HDR values are accepted by the shader too
+      if (!check_finite(col.r) || !check_finite(col.g) || !check_finite(col.b) || col.r < -0.1f || col.g < -0.1f || col.b < -0.1f)
       {
-        LOGERR_ONCE("Invalid SPH sample col=%@", col);
+        LOGERR_ONCE("Invalid SPH sample col=%@ (face=%d texel=%d,%d of %dx%d dir=%@ fmt=0x%X gamma=%g)", col, face, x, y, width, width,
+          normalize(ivtm % Point3(x1 + step_2, -yc, 1)), fmt, gamma);
         col = Color4(0.1f, 0.2f, 0.4f); // Neutral day color.
       }
       col.clamp0();
@@ -344,21 +344,22 @@ bool SphHarmCalc::processFaceDataGpu(Texture *texture, const int face, int width
   if (groupsToRun != previousRunSize)
   {
     harmonicsPreSum.reset();
-    harmonicsPreSum.reset(d3d::buffers::create_ua_sr_structured(sizeof(HarmCoefs), groupsToRun, "harmonicsValues"));
+    harmonicsPreSum.reset(
+      d3d::buffers::create_ua_sr_structured(sizeof(HarmCoefs), groupsToRun, "harmonicsValues", d3d::buffers::Init::No, RESTAG_POSTFX));
     previousRunSize = groupsToRun;
 
     if (!harmonicsSum)
-      harmonicsSum.reset(d3d::buffers::create_ua_structured_readback(sizeof(HarmCoefs), 1, "harmonicsValuesFinal"));
+      harmonicsSum.reset(d3d::buffers::create_ua_structured_readback(sizeof(HarmCoefs), 1, "harmonicsValuesFinal",
+        d3d::buffers::Init::No, RESTAG_POSTFX));
   }
   d3d::set_rwbuffer(STAGE_CS, 0, harmonicsPreSum.get());
 
   d3d::set_tex(STAGE_CS, 1, texture);
-  d3d::set_sampler(STAGE_CS, 1, d3d::request_sampler({}));
 
   ShaderGlobal::set_int_fast(cube_face_widthVarId, sampling_resolution);
   ShaderGlobal::set_int_fast(face_numberVarId, face);
   ShaderGlobal::set_int_fast(mip_numberVarId, desiredMip);
-  ShaderGlobal::set_real_fast(gammaVarId, gamma);
+  ShaderGlobal::set_float(gammaVarId, gamma);
 
   ShaderGlobal::set_variant(envi_type == EnviromentTextureType::CubeMap ? ShaderGlobal::variant<"sp_harm_type"_h, "from_sky_box"_h>
                                                                         : ShaderGlobal::variant<"sp_harm_type"_h, "from_panorama"_h>);
@@ -517,13 +518,13 @@ void SphHarmCalc::reset()
   mem_set_0(valuesOpt);
   valid = true;
 
-  auto driverDesc = d3d::get_driver_desc();
+  auto &drvDesc = d3d::get_driver_desc();
   bool init_compute = d3d::get_driver_code()
-                        .map(d3d::iOS, false)                   // compute version hangs mobile gpu
-                        .map(d3d::macOSX && d3d::vulkan, false) // Mac+Vulkan has problems with compute version
-                        .map(d3d::macOSX, d3d_get_gpu_cfg().primaryVendor != GpuVendor::INTEL) // on some intel drivers it fails to
-                                                                                               // create pipeline state on mac
-                        .map(d3d::any, driverDesc.shaderModel >= 5.0_sm && !driverDesc.issues.hasComputeTimeLimited);
+                        .map(d3d::iOS, false)                                      // compute version hangs mobile gpu
+                        .map(d3d::macOSX && d3d::vulkan, false)                    // Mac+Vulkan has problems with compute version
+                        .map(d3d::macOSX, drvDesc.info.vendor != GpuVendor::INTEL) // on some intel drivers it fails to create pipeline
+                                                                                   // state on mac
+                        .map(d3d::any, drvDesc.shaderModel >= 5.0_sm && !drvDesc.issues.hasComputeTimeLimited);
 
   if (init_compute)
   {

@@ -16,7 +16,9 @@ namespace das
         virtual bool canVisitStructureFieldInit ( Structure * ) override { return false; }
         virtual bool canVisitArgumentInit ( Function * , const VariablePtr &, Expression * ) override { return false; }
         virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
-
+        virtual bool canVisitFunction ( Function * fun ) override {
+            return !fun->stub; //  && !fun->isTemplate;     // not a thing with templates
+        }
         virtual bool canVisitStructure ( Structure * st ) override {
             return !st->isTemplate;     // not a thing with templates
         }
@@ -25,11 +27,11 @@ namespace das
             Visitor::preVisit(var);
             for ( const auto & pA : var->annotations ) {
                 if (pA->annotation->rtti_isStructureAnnotation()) {
-                    auto sa = static_pointer_cast<StructureAnnotation>(pA->annotation);
+                    auto sa = static_cast<StructureAnnotation*>(pA->annotation);
                     string err = "";
                     if (!sa->look(var, *program->thisModuleGroup, pA->arguments, err)) {
                         program->error("can't finalize structure annotation [" + sa->name + "]",err,"",
-                            var->at, CompilationError::invalid_annotation);
+                            var->at, CompilationError::cant_finalize_structure_annotation);
                     }
                 }
             }
@@ -37,11 +39,11 @@ namespace das
         virtual void preVisit ( Function * fn ) override {
             Visitor::preVisit(fn);
             for ( const auto & an : fn->annotations ) {
-                auto fna = static_pointer_cast<FunctionAnnotation>(an->annotation);
+                auto fna = static_cast<FunctionAnnotation*>(an->annotation);
                 string err = "";
                 if ( !fna->finalize(fn, *program->thisModuleGroup, an->arguments, program->options, err) ) {
                     program->error("can't finalize annotation [" + fna->name + "]",err,"",
-                        fn->at, CompilationError::invalid_annotation);
+                        fn->at, CompilationError::cant_finalize_function_annotation);
                 }
             }
         }
@@ -49,11 +51,11 @@ namespace das
             Visitor::preVisit(block);
             if ( block->annotations.size() ) {
                 for ( const auto & an : block->annotations ) {
-                    auto fna = static_pointer_cast<FunctionAnnotation>(an->annotation);
+                    auto fna = static_cast<FunctionAnnotation*>(an->annotation);
                     string err = "";
                     if ( !fna->finalize(block, *program->thisModuleGroup, an->arguments, program->options, err) ) {
                         program->error("can't finalize annotation [" + fna->name + "]",err,"",
-                            block->at, CompilationError::invalid_annotation);
+                            block->at, CompilationError::cant_finalize_block_annotation);
                     }
                 }
                 if ( block->annotationDataSid || block->annotationData ) {
@@ -61,22 +63,22 @@ namespace das
                         program->thisModule->annotationData[block->annotationDataSid] = block->annotationData;
                     } else {
                         program->error("internal error. both annotationData and Sid must be provided","","",
-                                       block->at, CompilationError::invalid_annotation);
+                                       block->at, CompilationError::internal_annotation);
                     }
                 }
             }
         }
 
-        void skipMakeBlock ( const ExpressionPtr & expr ) {
+        void skipMakeBlock ( ExpressionPtr expr ) {
             if ( expr->rtti_isMakeBlock() ) {
-                auto mkb = static_pointer_cast<ExprMakeBlock>(expr);
-                auto blk = static_pointer_cast<ExprBlock>(mkb->block);
+                auto mkb = static_cast<ExprMakeBlock*>(expr);
+                auto blk = static_cast<ExprBlock*>(mkb->block);
                 blk->aotSkipMakeBlock = true;
             }
         }
         virtual void preVisit ( ExprCall * call ) override {
             Visitor::preVisit(call);
-            if ( call->func->aotTemplate ) {
+            if ( call->func && call->func->aotTemplate ) {
                 for ( auto & arg : call->arguments ) {
                     skipMakeBlock(arg);
                 }
@@ -106,12 +108,13 @@ namespace das
     bool Program::patchAnnotations() {
         bool astChanged = false;
         thisModule->functions.foreach([&](auto fn){
+            if ( fn->isTemplate ) return false;
             for ( auto & ann : fn->annotations ) {
                 if ( ann->annotation->rtti_isFunctionAnnotation() ) {
-                    auto fann = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                    auto fann = static_cast<FunctionAnnotation*>(ann->annotation);
                     string err;
                     if ( !fann->patch(fn, *thisModuleGroup, ann->arguments, options, err, astChanged) ) {
-                        error("function annotation patch failed\n", err, "", fn->at, CompilationError::annotation_failed );
+                        error("function annotation patch failed\n", err, "", fn->at, CompilationError::runtime_function_annotation );
                     }
                     if ( astChanged ) return true;
                 }
@@ -122,16 +125,22 @@ namespace das
         thisModule->structures.find_first([&](auto st){
             for ( auto & ann : st->annotations ) {
                 if ( ann->annotation->rtti_isStructureAnnotation() ) {
-                    auto sann = static_pointer_cast<StructureAnnotation>(ann->annotation);
+                    auto sann = static_cast<StructureAnnotation*>(ann->annotation);
                     string err;
                     if ( !sann->patch(st, *thisModuleGroup, ann->arguments, err, astChanged) ) {
-                        error("structure annotation patch failed\n", err, "", st->at, CompilationError::annotation_failed );
+                        error("structure annotation patch failed\n", err, "", st->at, CompilationError::runtime_structure_annotation );
                     }
                     if ( astChanged ) return true;
                 }
             }
             return false;
         });
+        if ( astChanged ) goto done;
+        // [inline] splicing shares the patch slot: it runs once the annotation patches
+        // are quiet, and its splices restart infer the same way (ast_inline.cpp)
+        if ( !failed() ) {
+            astChanged |= patchInline();
+        }
     done:;
         return astChanged;
     }
@@ -167,12 +176,13 @@ namespace das
 
     void Program::fixupAnnotations() {
         thisModule->functions.foreach([&](auto fn){
+            if ( fn->isTemplate ) return;
             for ( auto & ann : fn->annotations ) {
                 if ( ann->annotation->rtti_isFunctionAnnotation() ) {
-                    auto fann = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                    auto fann = static_cast<FunctionAnnotation*>(ann->annotation);
                     string err;
                     if ( !fann->fixup(fn, *thisModuleGroup, ann->arguments, options, err) ) {
-                        error("function annotation patch failed\n", err, "", fn->at, CompilationError::annotation_failed );
+                        error("function annotation patch failed\n", err, "", fn->at, CompilationError::runtime_function_annotation );
                     }
                 }
             }

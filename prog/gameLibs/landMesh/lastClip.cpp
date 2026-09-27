@@ -5,6 +5,7 @@
 #include <drv/3d/dag_renderTarget.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_lock.h>
 #include <3d/dag_render.h>
@@ -18,6 +19,7 @@
 #include <landMesh/lmeshManager.h>
 #include <landMesh/lmeshRenderer.h>
 #include <landMesh/lastClip.h>
+#include <heightmap/heightmapHandler.h>
 #include <shaders/dag_shaders.h>
 #include <shaders/dag_shaderBlock.h>
 #include <perfMon/dag_cpuFreq.h>
@@ -28,6 +30,7 @@
 #include <render/toroidal_update.h>
 #include <math/dag_adjpow2.h>
 #include <render/bcCompressor.h>
+#include <EASTL/unique_ptr.h>
 
 void render_last_clip_in_box(const BBox3 &land_box_part, const Point2 &half_texel, const Point3 &view_pos, LandMeshData &data)
 {
@@ -40,7 +43,9 @@ void render_last_clip_in_box(const BBox3 &land_box_part, const Point2 &half_texe
   pos.y = landBBox[1].y + 10;
   LandMeshRenderer &renderer = *data.lmeshRenderer;
   LandMeshManager &provider = *data.lmeshMgr;
-  renderer.prepare(provider, pos, 0.f);
+  // origins sit inside hmap coverage, so the hmap-vs-cells gate holds for any real multiplier;
+  // the whole-map bake deliberately ignores the per-level camera-distance tuning (default mul)
+  renderer.prepare(provider, HmapOrigin(pos));
   TMatrix vtm = TMatrix::IDENT;
   vtm.setcol(0, 1, 0, 0);
   vtm.setcol(1, 0, 0, 1);
@@ -57,7 +62,8 @@ void render_last_clip_in_box(const BBox3 &land_box_part, const Point2 &half_texe
   // if (::app->renderer->isCompatibilityMode())
   //   renderer.setRenderClipmapWithPosition(true);//since we don't render with depth anyway
   TMatrix4_vec4 globTm = TMatrix4_vec4(vtm) * proj;
-  renderer.render(reinterpret_cast<mat44f_cref>(globTm), proj, Frustum{globTm}, provider, renderer.RENDER_CLIPMAP, view_pos);
+  renderer.render(reinterpret_cast<mat44f_cref>(globTm), proj, Frustum{globTm}, provider, renderer.RENDER_CLIPMAP, view_pos,
+    HmapOrigin(pos));
   // if (::app->renderer->isCompatibilityMode())
   //   renderer.setRenderClipmapWithPosition(false);
   renderer.setRenderInBBox(BBox3());
@@ -86,7 +92,7 @@ void render_last_clip_in_box_tor(const BBox3 &land_box_part, const Point2 &half_
   pos.y = landBBox[1].y + 10;
   LandMeshRenderer &renderer = *data.lmeshRenderer;
   LandMeshManager &provider = *data.lmeshMgr;
-  renderer.prepare(provider, pos, 0.f);
+  renderer.prepare(provider, HmapOrigin(pos));
 
   ToroidalGatherCallback::RegionTab regions;
   float texelSize = data.texelSize;
@@ -117,16 +123,17 @@ void render_last_clip_in_box_tor(const BBox3 &land_box_part, const Point2 &half_
     d3d::settm(TM_PROJ, &proj);
     d3d::setview(reg.lt.x, reg.lt.y, reg.wd.x, reg.wd.y, 0, 1);
 
-    TMatrix4 viewProj = TMatrix4(view) * proj;
+    TMatrix4_vec4 viewProj = TMatrix4_vec4(view) * proj;
 
     Point3 posT = box3.center();
     posT.y = landBBox[1].y + 10;
-    renderer.prepare(provider, posT, 0.f);
+    renderer.prepare(provider, HmapOrigin(posT));
     ShaderGlobal::setBlock(data.global_frame_id, ShaderGlobal::LAYER_FRAME);
     renderer.setLMeshRenderingMode(LMeshRenderingMode::RENDERING_CLIPMAP);
 
     renderer.setRenderInBBox(box3);
-    renderer.render(provider, renderer.RENDER_CLIPMAP, view_pos);
+    renderer.render(reinterpret_cast<mat44f_cref>(viewProj), proj, Frustum{viewProj}, provider, renderer.RENDER_CLIPMAP, view_pos,
+      HmapOrigin(posT));
 
     renderer.setRenderInBBox(BBox3());
 
@@ -168,12 +175,6 @@ static void fixedClipPartialRenderCb(int lineNo, int linesCount, int picHeight, 
 
 #define SAVE_RT 0
 
-void apply_last_clip_anisotropy(d3d::SamplerInfo &last_clip_sampler)
-{
-  last_clip_sampler.anisotropic_max = ::dgs_tex_anisotropy;
-  ShaderGlobal::set_sampler(get_shader_variable_id("last_clip_tex_samplerstate", true), d3d::request_sampler(last_clip_sampler));
-}
-
 void configure_last_clip_sampler(d3d::SamplerInfo &last_clip_sampler)
 {
   last_clip_sampler.mip_map_mode = d3d::MipMapMode::Linear;
@@ -191,21 +192,24 @@ void configure_world_to_last_clip(const LandMeshManager *lmeshMgr)
   Color4 world_to_last_clip(1.f / landBox.width().x, 1.f / landBox.width().z, -landBox[0].x / landBox.width().x,
     -landBox[0].z / landBox.width().z);
   static int world_to_last_clipVardId = get_shader_variable_id("world_to_last_clip", true);
-  ShaderGlobal::set_color4(world_to_last_clipVardId, world_to_last_clip);
+  ShaderGlobal::set_float4(world_to_last_clipVardId, world_to_last_clip);
 }
 
 void preload_textures_for_last_clip()
 {
-  prefetch_managed_textures_by_textag(TEXTAG_LAND);
-  if (DAGOR_UNLIKELY(!is_managed_textures_streaming_load_on_demand()))
-  {
-    ddsx::tex_pack2_perform_delayed_data_loading();
-    return;
-  }
-  // this wait prevents (possible) subsequent wait inside prepare_fixed_clip() in main thread
   Tab<TEXTUREID> land_tex;
   textag_get_list(TEXTAG_LAND, land_tex);
-  prefetch_and_wait_managed_textures_loaded(land_tex);
+
+  if (DAGOR_UNLIKELY(!is_managed_textures_streaming_load_on_demand()))
+  {
+    prefetch_and_check_managed_textures_loaded(land_tex);
+    ddsx::tex_pack2_perform_delayed_data_loading();
+  }
+  else
+  {
+    // this wait prevents (possible) subsequent wait inside prepare_fixed_clip() in main thread
+    prefetch_and_wait_managed_textures_loaded(land_tex);
+  }
 }
 
 enum class LastClipComp
@@ -216,11 +220,11 @@ enum class LastClipComp
 };
 
 template <typename T>
-void render_and_compress(const T &render_func, UniqueTexHolder &last_clip, const LandMeshData &data, int numMips,
+void render_and_compress(const T &render_func, UniqueTexWithShaderVar &last_clip, const LandMeshData &data, int numMips,
   LastClipComp comp_type)
 {
   UniqueTex temp = dag::create_tex(NULL, data.texture_size, data.texture_size, TEXFMT_A8R8G8B8 | TEXCF_RTARGET | TEXCF_SRGBWRITE, 1,
-    "temp_last_clip_tex");
+    "temp_last_clip_tex", RESTAG_LAND);
 
   render_func(temp);
   {
@@ -231,12 +235,10 @@ void render_and_compress(const T &render_func, UniqueTexHolder &last_clip, const
     if (!temp_comp->isValid()) // In case of device loss.
       return;
 
-    d3d::SamplerHandle sampler = d3d::request_sampler({});
-
     int j = data.texture_size;
     for (int i = 0; i < numMips; i++)
     {
-      temp_comp->updateFromMip(temp.getTexId(), sampler, 0, i);
+      temp_comp->updateFromMip(temp.getTexId(), 0, i);
       temp_comp->copyToMip(last_clip.getTex2D(), i, 0, 0, i, 0, 0, j, j);
       j /= 2;
     }
@@ -244,8 +246,8 @@ void render_and_compress(const T &render_func, UniqueTexHolder &last_clip, const
   temp.close();
 }
 
-void prepare_fixed_clip(UniqueTexHolder &last_clip, d3d::SamplerInfo &last_clip_sampler, LandMeshData &data, bool update_game_screen,
-  const Point3 &view_pos)
+void prepare_fixed_clip(UniqueTexWithShaderVar &last_clip, d3d::SamplerInfo &last_clip_sampler, LandMeshData &data,
+  bool update_game_screen, const Point3 &view_pos)
 {
   last_clip.close();
   if (!data.lmeshMgr || !data.lmeshRenderer)
@@ -290,7 +292,8 @@ void prepare_fixed_clip(UniqueTexHolder &last_clip, d3d::SamplerInfo &last_clip_
     }
   }();
 
-  last_clip = dag::create_tex(NULL, data.texture_size, data.texture_size, TEXCF_SRGBREAD | flags, numMips, "last_clip_tex");
+  last_clip =
+    dag::create_tex(NULL, data.texture_size, data.texture_size, TEXCF_SRGBREAD | flags, numMips, "last_clip_tex", RESTAG_LAND);
   d3d_err(last_clip.getTex2D());
 
   int render_normalmapVarId = get_shader_variable_id("render_with_normalmap", true);
@@ -309,7 +312,7 @@ void prepare_fixed_clip(UniqueTexHolder &last_clip, d3d::SamplerInfo &last_clip_
     d3d::setwire(0);
     {
       SCOPE_RENDER_TARGET;
-      d3d::set_render_target(tex.getTex2D(), 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{tex.getTex2D(), 0, 0}});
       d3d::clearview(CLEAR_TARGET, 0x00000000, 1.0f, 0);
       for (int y = 0; y < data.texture_size; y += partHeight)
       {
@@ -323,6 +326,10 @@ void prepare_fixed_clip(UniqueTexHolder &last_clip, d3d::SamplerInfo &last_clip_
 
   // debug("total last clip time = %dus",get_time_usec(reft));
   d3d::driver_command(Drv3dCommand::ACQUIRE_OWNERSHIP);
+
+  // flush pending hmap texture uploads/edits so the bake below includes them; prepare() no longer does this bookkeeping
+  if (HeightmapHandler *hmap = data.lmeshMgr->getHmapHandler())
+    hmap->makeBookKeeping();
 
   if (compression != LastClipComp::NONE)
   {
@@ -350,6 +357,5 @@ void prepare_fixed_clip(UniqueTexHolder &last_clip, d3d::SamplerInfo &last_clip_
 #endif
 
   configure_last_clip_sampler(last_clip_sampler);
-  apply_last_clip_anisotropy(last_clip_sampler);
   configure_world_to_last_clip(data.lmeshMgr);
 }

@@ -1,5 +1,6 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
+#include <memory/dag_framemem.h>
 #include <ioSys/dag_fileIo.h>
 #include <ioSys/dag_zlibIo.h>
 #include <osApiWrappers/dag_files.h>
@@ -10,6 +11,8 @@
 #include "driver_config.h"
 #include "timelines.h"
 #include "vulkan_allocation_callbacks.h"
+// after the driver headers: it pulls vulkan.h, which must see vulkan_api.h platform defines first
+#include <drv/shadersMetaData/spirv/unpack.h>
 
 using namespace drv3d_vulkan;
 
@@ -86,23 +89,55 @@ void PipelineManager::unloadAll()
   seenGraphicsPipes.clear();
 }
 
+void PipelineManager::onDeviceReset()
+{
+  seenGraphicsPipes.clear();
+
+  graphics.enumerate([](auto &pipeline, auto) { pipeline.shutdown(); });
+  graphics.enumerateLayouts([](auto &layout) { layout.onDeviceReset(); });
+  compute.enumerate([](auto &pipeline, auto) { pipeline.onDeviceReset(); });
+  compute.enumerateLayouts([](auto &layout) { layout.onDeviceReset(); });
+}
+
+void PipelineManager::afterDeviceReset()
+{
+  graphics.enumerateLayouts([](auto &layout) { layout.afterDeviceReset(); });
+  compute.enumerateLayouts([](auto &layout) { layout.afterDeviceReset(); });
+  compute.enumerate([](auto &pipeline, auto) { pipeline.afterDeviceReset(false); });
+}
+
 void PipelineManager::prepareRemoval(ProgramID program)
 {
   CleanupQueue &cleanups = Backend::gpuJob.get().cleanups;
-  auto index = program_to_index(program);
   switch (get_program_type(program))
   {
-    case program_type_graphics: cleanups.enqueue(*graphics.takeOut(index)); break;
-    case program_type_compute: cleanups.enqueue(*compute.takeOut(index)); break;
+    case program_type_graphics: cleanups.enqueue(*graphics.takeOut(GraphicsProgram::getIndexFromID(program))); break;
+    case program_type_compute: cleanups.enqueue(*compute.takeOut(ComputeProgram::getIndexFromID(program))); break;
     default: G_ASSERTF(false, "Broken program type"); return;
   }
 }
 
-VulkanShaderModuleHandle PipelineManager::makeVkModule(const ShaderModuleBlob *module)
+VulkanShaderModuleHandle PipelineManager::makeVkModule(const ShaderModuleBlob *module, spirv::HashValue &hv)
 {
+  Tab<uint8_t> tmpstorage(framemem_ptr());
+  module->source.uncompress(tmpstorage);
+
+  Tab<uint8_t> tmpstorageSmolv(framemem_ptr());
+  if (module->sizeSmolv)
+  {
+    G_ASSERT(module->offset + module->sizeSmolv <= tmpstorage.size());
+    G_VERIFY(spirv::decode_smolv(make_span_const(tmpstorage.data() + module->offset, tmpstorage.size() - module->offset),
+      module->sizeSmolv, tmpstorageSmolv));
+  }
+  const auto &src = module->sizeSmolv ? tmpstorageSmolv : tmpstorage;
+  const uint32_t size = module->sizeSmolv == 0 && module->size ? module->size : src.size();
+  const uint32_t offset = module->sizeSmolv ? 0 : module->offset;
+  G_ASSERT(offset + size <= src.size());
+  hv = spirv::HashValue::calculate(src.data() + offset, size);
+
   VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0};
-  smci.codeSize = module->getBlobSize();
-  smci.pCode = module->blob.data();
+  smci.codeSize = size;
+  smci.pCode = (const uint32_t *)(src.data() + offset);
 
   VulkanShaderModuleHandle shader = VulkanShaderModuleHandle();
   VULKAN_EXIT_ON_FAIL(Globals::VK::dev.vkCreateShaderModule(Globals::VK::dev.get(), &smci, VKALLOC(shader_module), ptr(shader)));

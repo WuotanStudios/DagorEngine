@@ -1,10 +1,12 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <heightmap/heightmapHandler.h>
+#include <heightmap/heightmapMetricsCalc.h>
 #include <heightMapLand/dag_hmlGetHeight.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
 #include <drv/3d/dag_texture.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <math/dag_bounds2.h>
 #include <math/dag_mathUtils.h>
 #include <shaders/dag_shaders.h>
@@ -19,21 +21,36 @@
 #include <drv/3d/dag_info.h>
 
 #include <perfMon/dag_statDrv.h>
+#include <heightmap/simpleHeightmapRenderer.h>
+#include "lodGridVertexDataPool.h"
 
+namespace convar
+{
 // for NV 551 workaround
-#include <3d/dag_gpuConfig.h>
 CONSOLE_BOOL_VAL("hmap", nvidia_551_workaround, true);
+CONSOLE_INT_VAL("hmap", metrics_maxCalcLevel, 14, 2, 128);
+CONSOLE_INT_VAL("hmap", metrics_minCalcLevel, 2, 0, 8);
+CONSOLE_INT_VAL("hmap", metrics_dim, 3, 3, 5);
+} // namespace convar
+
+static inline int resolve_metrics_level(int level_value, const ConVarI &cvar)
+{
+  return level_value >= 0 ? clamp(level_value, cvar.getMin(), cvar.getMax()) : cvar.get();
+}
 
 // Used for dynamic terraforms
 #define ENABLE_RENDER_HMAP_MODIFICATION    1
 #define ENABLE_RENDER_HMAP_SUB_TESSELATION 1
 
 #define GLOBAL_VARS_LIST         \
+  VAR(heightmap_region)          \
   VAR(tex_hmap_low_samplerstate) \
+  VAR(hmapMain)                  \
   VAR(tex_hmap_low)              \
   VAR(world_to_hmap_low)         \
   VAR(heightmap_scale)           \
-  VAR(tex_hmap_inv_sizes)
+  VAR(tex_hmap_inv_sizes)        \
+  VAR(hmap_max_gradient)
 
 #define VAR(a) static ShaderVariableInfo a##VarId(#a, true);
 GLOBAL_VARS_LIST
@@ -54,61 +71,82 @@ static uint32_t select_hmap_tex_fmt()
 
 static int get_mip_levels(const IPoint2 &hmapWidth) { return min(get_log2i(hmapWidth.x), get_log2i(hmapWidth.y)) + 1; }
 
-void HeightmapHandler::setVars()
+void HeightmapHandler::setVars() const
 {
   if (!renderData)
     return;
-  ShaderGlobal::set_color4(world_to_hmap_lowVarId,
+  Color4 c = mirror ? Color4(-(128 << 20), -(128 << 20), 128 << 20, 128 << 20)
+                    : Color4(worldBox2[0].x, worldBox2[0].y, worldBox2[1].x, worldBox2[1].y);
+  ShaderGlobal::set_float4(heightmap_regionVarId, c);
+  ShaderGlobal::set_float4(world_to_hmap_lowVarId,
     Color4(1.0f / worldSize.x, 1.0f / worldSize.y, -worldPosOfs.x / worldSize.x, -worldPosOfs.y / worldSize.y));
 
-  ShaderGlobal::set_color4(tex_hmap_inv_sizesVarId,
+  ShaderGlobal::set_float4(tex_hmap_inv_sizesVarId,
     Color4(1.0f / hmapWidth.x, 1.0f / hmapWidth.y, 1.0f / hmapWidth.x, 1.0f / hmapWidth.y));
 
-  ShaderGlobal::set_color4(heightmap_scaleVarId, Color4(hScale, hMin, hScale, hMin));
+  ShaderGlobal::set_float4(heightmap_scaleVarId, Color4(hScale, hMin, hScale, hMin));
+  ShaderGlobal::set_texture(hmapMainVarId, renderData->heightmap);
   ShaderGlobal::set_texture(tex_hmap_lowVarId, renderData->heightmap);
   ShaderGlobal::set_sampler(tex_hmap_low_samplerstateVarId, renderData->heightmapSampler);
+  ShaderGlobal::set_float(hmap_max_gradientVarId, maxGradient);
 }
 
-void HeightmapHandler::initRender(bool clamp)
+void HeightmapHandler::initRender(bool clamp, float water_level, float shore_error_meters, int metrics_min_calc_level,
+  int metrics_max_calc_level)
 {
   renderData.reset(new HeightmapRenderData);
 
+  setMirroring(!clamp);
+
   const int levelCount = get_mip_levels(hmapWidth) - 1; // Last mip is 2x2.
   renderData->texFMT = select_hmap_tex_fmt();
-  renderData->heightmap =
-    UniqueTex(dag::create_tex(NULL, hmapWidth.x, hmapWidth.y, renderData->texFMT | TEXCF_UPDATE_DESTINATION, levelCount, "hmapMain"),
-      "land_heightmap_tex");
-  {
-    d3d::SamplerInfo smpInfo;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w =
-      clamp ? d3d::AddressMode::Clamp : d3d::AddressMode::Mirror;
-    renderData->heightmapSampler = d3d::request_sampler(smpInfo);
-  }
+  renderData->heightmap = dag::create_tex(NULL, hmapWidth.x, hmapWidth.y, renderData->texFMT | TEXCF_UPDATE_DESTINATION, levelCount,
+    "hmapMain", RESTAG_LAND);
   d3d_err(renderData->heightmap.getTex2D());
 
   fillHmapTexturesNeeded = true;
 
   hmapUploadTex = dag::create_tex(NULL, enabledMipsUpdating ? 3 * HMAP_BSIZE / 2 : HMAP_BSIZE, HMAP_BSIZE,
-    renderData->texFMT | TEXCF_WRITEONLY, 1, "hmap_upload_tex_region");
+    renderData->texFMT | TEXCF_WRITEONLY, 1, "hmap_upload_tex_region", RESTAG_LAND);
   lastRegionUpdated_NVworkaround = -1;
-  renderer.setRenderClip(&worldBox2);
   setVars();
 
-  debug("hmap: initialized");
+  initMetrics(water_level, shore_error_meters, metrics_min_calc_level, metrics_max_calc_level);
 }
 
-bool HeightmapHandler::loadDump(IGenLoad &loadCb, bool load_render_data, GlobalSharedMemStorage *sharedMem)
+void HeightmapHandler::initMetrics(float water_level, float shore_error_meters, int metrics_min_calc_level, int metrics_max_calc_level)
+{
+  del_it(metrics);
+  del_it(metricsRenderer);
+  shoreErrorMeters = shore_error_meters;
+  metricsMinCalcLevel = metrics_min_calc_level;
+  metricsMaxCalcLevel = metrics_max_calc_level;
+  if (metricsMinCalcLevel >= 0 && metricsMaxCalcLevel >= 0 && metricsMinCalcLevel > metricsMaxCalcLevel)
+  {
+    logerr("hmap: level asks for metrics calc levels %d..%d, min is above max; using %d for both", metricsMinCalcLevel,
+      metricsMaxCalcLevel, metricsMaxCalcLevel);
+    metricsMinCalcLevel = metricsMaxCalcLevel;
+  }
+  metrics = new MetricsErrors();
+  const int dimBits = convar::metrics_dim;
+  metrics->calc_lod_errors(*this, resolve_metrics_level(metricsMinCalcLevel, convar::metrics_minCalcLevel),
+    resolve_metrics_level(metricsMaxCalcLevel, convar::metrics_maxCalcLevel), 1 << dimBits, water_level, shoreErrorMeters);
+
+  metricsRenderer = new SimpleHeightmapRenderer;
+  metricsRenderer->init("heightmap", true, dimBits);
+  debug("hmap: initialized with metrics and %f water level, shore error=%f", water_level, shoreErrorMeters);
+}
+
+bool HeightmapHandler::loadDump(IGenLoad &loadCb, bool load_render_data, float water_level, float shore_error_meters,
+  int metrics_min_calc_level, int metrics_max_calc_level)
 {
   const int skip_mips = clamp(::dgs_get_settings()->getBlockByNameEx("debug")->getInt("skip_hmap_levels", 0), 0, 3);
 
-  if (!HeightmapPhysHandler::loadDump(loadCb, sharedMem, skip_mips))
+  if (!HeightmapPhysHandler::loadDump(loadCb, skip_mips))
     return false;
 
-  hmapTData.init(1 << max(hmapDimBits - 2, 2),
-    ::dgs_get_settings()->getBlockByNameEx("graphics")->getReal("hmapTessCellSize", hmapCellSize));
-
   if (load_render_data)
-    initRender();
+    initRender(!mirror, water_level, shore_error_meters, metrics_min_calc_level, metrics_max_calc_level);
   return true;
 }
 
@@ -172,7 +210,7 @@ void HeightmapHandler::fillHmapTextures()
   {
     String uploadTempName(128, "hmap_upload_tex_quad_%d", i);
     UniqueTex uploadTemp =
-      dag::create_tex(NULL, 3 * quadWidth.x / 2, quadWidth.y, renderData->texFMT | TEXCF_WRITEONLY, 1, uploadTempName);
+      dag::create_tex(NULL, 3 * quadWidth.x / 2, quadWidth.y, renderData->texFMT | TEXCF_WRITEONLY, 1, uploadTempName, RESTAG_LAND);
     if (!uploadTemp)
     {
       logerr("failed to create uploadTemp during fillHmapTextures, skipping");
@@ -185,7 +223,7 @@ void HeightmapHandler::fillHmapTextures()
     if (i / 2 != 0)
       quadPivot.y += quadWidth.y;
 
-    if (auto lock = lock_texture(uploadTemp.getTex2D(), 0, TEXLOCK_WRITE))
+    if (auto lock = lock_texture<ImageRawBytes>(uploadTemp.getTex2D(), 0, TEXLOCK_WRITE))
       fillHmapRegionDetailed(quadPivot, quadWidth, true, uploadTemp.getTex2D(), eastl::move(lock), tempMem);
     else
       logerr("hmap: Could not lock %s during fillHmapTextures! Part of hmap will be missing!", uploadTempName);
@@ -202,7 +240,7 @@ bool HeightmapHandler::fillHmapRegion(int region_index, bool NVworkaround_applyO
   const IPoint2 regionWidth = IPoint2(HMAP_BSIZE, HMAP_BSIZE);
 
   // Keep in mind that above log2(HMAP_BSIZE) + 1 = log2(32) + 1 = 6th mip level heights won't update.
-  auto tryLock = lock_texture(hmapUploadTex.getTex2D(), 0, TEXLOCK_WRITE | TEXLOCK_DISCARD);
+  auto tryLock = lock_texture<ImageRawBytes>(hmapUploadTex.getTex2D(), 0, TEXLOCK_WRITE | TEXLOCK_DISCARD);
   if (tryLock)
   {
     alignas(16) carray<uint16_t, 3 * HMAP_BSIZE * HMAP_BSIZE / 2> tempMem;
@@ -218,7 +256,7 @@ bool HeightmapHandler::fillHmapRegion(int region_index, bool NVworkaround_applyO
 }
 
 void HeightmapHandler::fillHmapRegionDetailed(IPoint2 region_pivot, IPoint2 region_width, bool update_mips, BaseTexture *upload_tex,
-  LockedImage2D upload_texlock, const eastl::span<uint16_t> temp_mem, bool NVworkaround_applyOnNextFrame)
+  LockedImageRawBytes upload_texlock, const eastl::span<uint16_t> temp_mem, bool NVworkaround_applyOnNextFrame)
 {
   const int levelCount = min<int>(update_mips ? get_mip_levels(region_width) : 1, renderData->heightmap.getTex2D()->level_count());
   const int elementsStride = levelCount > 1 ? 3 * region_width.x / 2 : region_width.x;
@@ -279,48 +317,81 @@ void HeightmapHandler::fillHmapRegionDetailed(IPoint2 region_pivot, IPoint2 regi
     auto [w, h] = region_width >> l;
     IPoint2 regionMipPivot = region_pivot >> l;
     IPoint2 regionFlatMipPivot = getFlatMipPivot(l, region_width);
-    renderData->heightmap->updateSubRegion(upload_tex, 0, regionFlatMipPivot.x, regionFlatMipPivot.y, 0, w, h, 1, l, regionMipPivot.x,
-      regionMipPivot.y, 0);
+    d3d::update_sub_region(upload_tex, 0, regionFlatMipPivot.x, regionFlatMipPivot.y, 0, w, h, 1, renderData->heightmap.getBaseTex(),
+      l, regionMipPivot.x, regionMipPivot.y, 0);
   }
 
   terrainStateVersion++;
 }
 
+void HeightmapHandler::updateMaxGradientDirty()
+{
+  if (maxGradientDirty.isEmpty())
+    return;
+  IBBox2 box = maxGradientDirty;
+  maxGradientDirty.setEmpty();
+  if (!compressed || hmapCellSize <= 0)
+    return;
+  // the pairs the edits moved, over both values a cell can render: the live
+  // overlay now, the compressed value once the overlay clears; a pair delta
+  // between them bounds either. Grown left/up by one so the pairs into the
+  // box are seen; right/down pairs read past the box
+  box[0].x = max(box[0].x - 1, 0);
+  box[0].y = max(box[0].y - 1, 0);
+  box[1].x = min(box[1].x, hmapWidth.x - 1);
+  box[1].y = min(box[1].y, hmapWidth.y - 1);
+  auto range = [&](int x, int y) {
+    const int c = compressed.decodePixelUnsafe(x, y);
+    auto it = visualHeights.find(x + y * hmapWidth.x);
+    return it != visualHeights.end() ? IPoint2(min(int(it->second), c), max(int(it->second), c)) : IPoint2(c, c);
+  };
+  auto delta = [](const IPoint2 &a, const IPoint2 &b) { return max(a.y - b.x, b.y - a.x); };
+  int mx = 0;
+  for (int y = box[0].y; y <= box[1].y; ++y)
+    for (int x = box[0].x; x <= box[1].x; ++x)
+    {
+      const IPoint2 r = range(x, y);
+      if (x + 1 < hmapWidth.x)
+        mx = max(mx, delta(r, range(x + 1, y)));
+      if (y + 1 < hmapWidth.y)
+        mx = max(mx, delta(r, range(x, y + 1)));
+    }
+  maxGradient = max(maxGradient, mx * hScaleRaw / hmapCellSize);
+}
+
 void HeightmapHandler::close()
 {
+  del_it(metrics);
+  del_it(metricsRenderer);
   hmapUploadTex.close();
+  ShaderGlobal::set_texture(hmapMainVarId, BAD_TEXTUREID);
   ShaderGlobal::set_texture(tex_hmap_lowVarId, BAD_TEXTUREID);
-  ShaderGlobal::set_color4(world_to_hmap_lowVarId, Color4(10e+3, 10e+3, 10e+10, 10e+10)); // 1mm^2 at (-10000Km, -10000Km)
+  ShaderGlobal::set_float4(world_to_hmap_lowVarId, Color4(10e+3, 10e+3, 10e+10, 10e+10)); // 1mm^2 at (-10000Km, -10000Km)
   renderData.reset();
   renderer.close();
   heightmapHeightCulling.reset();
   HeightmapPhysHandler::close();
+  // the base close reset the bound: publish the no cull default with it
+  ShaderGlobal::set_float(hmap_max_gradientVarId, maxGradient);
 }
 
 void HeightmapHandler::afterDeviceReset()
 {
   renderer.close();
-  renderer.init("heightmap", "", "hmap_tess_factor", false, hmapDimBits);
+  renderer.init("heightmap", false, hmapDimBits);
 }
 
 bool HeightmapHandler::init(int dim_bits)
 {
   hmapDimBits =
     dim_bits <= 1 ? ::dgs_get_settings()->getBlockByNameEx("graphics")->getInt("heightmapDimBits", default_patch_bits) : dim_bits;
+  // out-of-range dim bits are clamped, not an init failure (as HeightmapRenderer did)
+  hmapDimBits = clamp<int>(hmapDimBits, VDATA_OFS, VDATA_OFS + MAX_VDATA - 1);
 
-  if (!renderer.init("heightmap", "", "hmap_tess_factor", false, hmapDimBits))
+  if (!renderer.init("heightmap", false, hmapDimBits))
     return false;
 
   return true;
-}
-
-int HeightmapHandler::calcLod(int min_lod, const Point3 &origin_pos, float camera_height) const
-{
-  int maxLod = lodCount - 1;
-  int lod = (length(Point2::xz(getClippedOrigin(origin_pos)) - Point2::xz(origin_pos)) / renderer.getDim()) * 0.5f;
-  lod += max(0.f, camera_height) * 0.003f;
-  lod = clamp(lod, min(min_lod, maxLod), maxLod);
-  return lod;
 }
 
 void HeightmapHandler::setMaxUpwardDisplacement(float v)
@@ -341,6 +412,8 @@ void HeightmapHandler::setMaxDownwardDisplacement(float v)
 
 void HeightmapHandler::invalidateCulling(const IBBox2 &ib)
 {
+  if (metrics)
+    metrics->updateHeightBounds(*this, ib, false);
   if (!heightmapHeightCulling)
   {
     heightmapHeightCulling.reset(new HeightmapHeightCulling);
@@ -360,29 +433,50 @@ void HeightmapHandler::makeBookKeeping()
     heightChangesIndex.clear();
     fillHmapTexturesNeeded = false;
   }
-  if (pushHmapModificationOnPrepare)
-    prepareHmapModificaton();
+  prepareHmapModificaton();
+  // the same bookkeeping point that applies the edits to the texture: the
+  // bound is folded before any frame renders the steeper terrain
+  updateMaxGradientDirty();
+#if DAGOR_DBGLEVEL > 0
+  // dev-only: react to runtime changes of the tessellation console vars (metrics_dim / metrics_maxCalcLevel).
+  // metrics/metricsRenderer are created by initRender; skip until then. This is once-per-frame bookkeeping.
+  if (metricsRenderer)
+  {
+    const int dimBits = convar::metrics_dim;
+    if (metricsRenderer->getDimBits() != dimBits)
+    {
+      del_it(metricsRenderer);
+      metricsRenderer = new SimpleHeightmapRenderer();
+      metricsRenderer->init("heightmap", true, dimBits);
+    }
+    metrics->calc_lod_errors(*this, resolve_metrics_level(metricsMinCalcLevel, convar::metrics_minCalcLevel),
+      resolve_metrics_level(metricsMaxCalcLevel, convar::metrics_maxCalcLevel), 1 << dimBits, metrics->water_level, shoreErrorMeters);
+  }
+#endif
 }
 
-bool HeightmapHandler::prepare(const Point3 &world_pos, float camera_height, float water_level)
+// Pure distance check, no side effects: true when world_pos is close enough to render the
+// tessellated heightmap. Split out so predicate-only callers (e.g. CSM invalidation) can ask
+// without binding shader state.
+bool HeightmapHandler::shouldRenderTessellatedHmap(const Point3 &world_pos, float hmap_distance_mul) const
 {
-  makeBookKeeping();
-  preparedOriginPos = world_pos;
-  preparedCameraHeight = camera_height;
-  preparedWaterLevel = water_level;
-  setVars();
-  float distanceToSwitch = hmapDistanceMul * max(worldSize.x, worldSize.y);
-  if (lengthSq(getClippedOrigin(world_pos) - world_pos) > distanceToSwitch * distanceToSwitch)
-    return false;
+  const float distanceToSwitch = hmap_distance_mul * max(worldSize.x, worldSize.y);
+  return lengthSq(getClippedOrigin(world_pos) - world_pos) <= distanceToSwitch * distanceToSwitch;
+}
 
-  return true;
+// Binds the heightmap shader vars and returns shouldRenderTessellatedHmap(); call before
+// rendering terrain. The once-per-frame bookkeeping (makeBookKeeping) must be called separately.
+bool HeightmapHandler::prepare(const Point3 &world_pos, float hmap_distance_mul) const
+{
+  setVars();
+  return shouldRenderTessellatedHmap(world_pos, hmap_distance_mul);
 }
 
 void HeightmapHandler::prepareHmapModificaton()
 {
   G_ASSERTF_RETURN(!fillHmapTexturesNeeded, , "prepareHmapModificaton: Full fillHmapTextures is needed");
 #if ENABLE_RENDER_HMAP_MODIFICATION
-  const bool applyOnNextFrame = nvidia_551_workaround && d3d_get_gpu_cfg().multipleCopySubresourceWorkaround;
+  const bool applyOnNextFrame = convar::nvidia_551_workaround && d3d::get_driver_desc().issues.hasMultipleCopySubresourceBug;
   if (applyOnNextFrame && lastRegionUpdated_NVworkaround != -1)
   {
     fillHmapRegion(lastRegionUpdated_NVworkaround, false);
@@ -399,90 +493,65 @@ void HeightmapHandler::prepareHmapModificaton()
 #endif
 }
 
-void HeightmapHandler::render(int min_tank_lod)
+void cull_lod_grid3(const MetricsErrors &errors, LodGridCullData &cull_data, const Frustum &frustum, const Occlusion *use_occlusion,
+  const HeightmapHandler &h, vec3f vp, const vec4f *bbox2, const HeightmapMetricsQuality &q)
 {
-  mat44f globtm;
-  d3d::getglobtm(globtm);
-  LodGridCullData defaultCullData(framemem_ptr());
-  TMatrix4 proj;
-  d3d::gettm(TM_PROJ, &proj);
-  frustumCulling(defaultCullData, HeightmapFrustumCullingInfo{preparedOriginPos, preparedCameraHeight, preparedWaterLevel,
-                                    Frustum(globtm), nullptr, min_tank_lod, 0, 1, proj});
-  renderCulled(defaultCullData);
+  cull_lod_grid3(errors, cull_data, frustum, use_occlusion, h.worldBox[0].y, h.worldBox[1].y, h.worldBox2,
+    h.getMaxUpwardDisplacement(), h.getMaxDownwardDisplacement(), h.isMirror(), vp, bbox2, q);
 }
+
+void frustumCulling(const MetricsErrors &errors, LodGridCullData &cull_data, const Point3 &world_pos, const Frustum &frustum,
+  const Occlusion *occlusion, const HeightmapHandler &handler, const vec4f *bbox2, const HeightmapMetricsQuality &q)
+{
+  TIME_PROFILE(htmap_frustum_cull2);
+  cull_lod_grid3(errors, cull_data, frustum, occlusion, handler, v_ldu(&world_pos.x), bbox2, q);
+}
+
 
 // float hm_scale = 1.0f;
 
-void HeightmapHandler::frustumCulling(LodGridCullData &cull_data, const HeightmapFrustumCullingInfo &fi)
+void HeightmapHandler::frustumCulling(LodGridCullData &cull_data, const HeightmapFrustumCullingInfo &fi) const
 {
-  if (fi.proj == TMatrix4::IDENT)
-  {
-    debug_dump_stack();
-  }
-  if (!fi.frustum.testBoxB(vecbox.bmin, vecbox.bmax))
-  {
-    cull_data.eraseAll();
-    return;
-  }
-
-  const auto hmtd = (ENABLE_RENDER_HMAP_SUB_TESSELATION && hmapTData.hasTesselation()) ? &hmapTData : nullptr;
-#if DAGOR_DBGLEVEL > 0 && TIME_PROFILER_ENABLED
-  auto doFrustumCull = [&]() {
-#else
-  TIME_PROFILE(htmap_frustum_cull);
-#endif
-    int lastLodRepeat = max(1,
-      (int)(1 + safediv(max(worldSize.x, worldSize.y), renderer.getDim() * hmapCellSize * fi.lod0scale * (1 << (lodCount - 1)))));
-
-    cull_data.lodGrid.init(lodCount, lodDistance, fi.lod0subdiv, lodDistance * lastLodRepeat); // changing 1,lod0subdiv, 1 to
-                                                                                               // 3,lod0subdiv,3 will get much longer
-                                                                                               // distance of high quality tesselation
-                                                                                               // (helpful  in zoom)
-    int lod = calcLod(fi.min_tank_lod, fi.world_pos, fi.camera_height);
-    if (lod > 0)
-      cull_data.lodGrid.lod0SubDiv = 0;
-
-    // unfortunately, although if we use (1<<(lodGrid.lodsCount-1)) snapping all verices stays, but triangulation pops (because we use
-    // diamond subdivision) can be fix, if we will swap subdivision as well.
-    float scale = hmapCellSize * (1 << lod) * fi.lod0scale;
-    float align = renderer.getDim() * scale;
-
-    // float align = (1<<(lodGrid.lodsCount-1))*hmapCellSize;
-    float lod0AreaSize = 0.f;
-    Point3 clippedOrigin = getClippedOrigin(fi.world_pos);
-    cull_lod_grid(cull_data.lodGrid, cull_data.lodGrid.lodsCount - fi.min_tank_lod, clippedOrigin.x, clippedOrigin.z, scale, scale,
-      align, align, worldBox[0].y, worldBox[1].y, &fi.frustum, &worldBox2, cull_data, fi.occlusion, lod0AreaSize,
-      renderer.get_hmap_tess_factorVarId(), renderer.getDim(), true, heightmapHeightCulling.get(), hmtd, nullptr, fi.water_level,
-      &fi.world_pos);
-#if DAGOR_DBGLEVEL > 0 && TIME_PROFILER_ENABLED
-  };
-  if (!hmtd)
-  {
-    TIME_PROFILE(htmap_frustum_cull);
-    doFrustumCull();
-  }
-  else
-  {
-    TIME_PROFILE(htmap_tesselated_frustum_cull);
-    doFrustumCull();
-  }
-#endif
+  // if (fi.proj == TMatrix4::IDENT)
+  // debug_dump_stack();
+  // metrics are always built for the rendering heightmap (see initRender / prepare), so the
+  // non-metrics distance-based cull is dead. Assert the invariant; on release degrade to empty cull.
+  cull_data.eraseAll();
+  G_ASSERT_RETURN(metrics, );
+  ::frustumCulling(*metrics, cull_data, fi.world_pos, fi.frustum, fi.occlusion, *this, fi.world_bbox_xzs, fi.metrics);
 }
 
-void HeightmapHandler::renderCulled(const LodGridCullData &cullData)
+void HeightmapHandler::renderCulled(const LodGridCullData &cullData) const
 {
   if (!cullData.hasPatches())
     return;
-  renderer.render(cullData.lodGrid, cullData);
+  // metrics/metricsRenderer are always built for the rendering heightmap (see initRender / prepare);
+  // the plain renderer.render() fallback is dead. Assert the invariant; on release degrade to no-op.
+  G_ASSERT_RETURN(metrics && metricsRenderer, );
+  G_ASSERT(metrics->dim == metricsRenderer->getDim());
+  metricsRenderer->render(cullData, metricsRenderer->getShElem(), metricsRenderer->getDimBits());
 }
 
-void HeightmapHandler::renderOnePatch()
+void HeightmapHandler::renderOnePatch(const Frustum &frustum)
 {
-  mat44f globtm;
-  d3d::getglobtm(globtm);
-  if (!Frustum(globtm).testBoxB(vecbox.bmin, vecbox.bmax))
+  if (!frustum.testBoxB(vecbox.bmin, vecbox.bmax))
     return;
-  renderer.renderOnePatch(Point2::xz(worldBox[0]), Point2::xz(worldBox[1]));
+  const Point2 leftTop = Point2::xz(worldBox[0]), rightBottom = Point2::xz(worldBox[1]);
+  G_ASSERT(fabsf((rightBottom.y - leftTop.y) - (rightBottom.x - leftTop.x)) < 0.00001f); // the single cell covers a square only
+  renderer.renderOnePatch(leftTop, rightBottom.x - leftTop.x);
+}
+
+void HeightmapHandler::setMirroring(bool _mirror)
+{
+  mirror = _mirror;
+
+  if (renderData)
+  {
+    d3d::SamplerInfo smpInfo;
+    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w =
+      mirror ? d3d::AddressMode::Mirror : d3d::AddressMode::Clamp;
+    renderData->heightmapSampler = d3d::request_sampler(smpInfo);
+  }
 }
 
 void HeightmapHandler::setSampler(d3d::SamplerHandle &&s)

@@ -6,6 +6,7 @@
 #include "main/gameLoad.h"
 #include "net/net.h"
 #include "game/gameLauncher.h"
+#include "input/inputControls.h"
 
 #include <gui/dag_visConsole.h>
 #include <gui/dag_visualLog.h>
@@ -27,13 +28,14 @@ using namespace console;
 PULL_CONSOLE_PROC(def_app_console_handler)
 PULL_CONSOLE_PROC(profiler_console_handler)
 PULL_CONSOLE_PROC(ecs_console_handler)
-PULL_CONSOLE_PROC(game_console_handler)
+PULL_CONSOLE_PROC(editmode_console_handler)
 PULL_CONSOLE_PROC(phys_console_handler)
 PULL_CONSOLE_PROC(sq_console_handler)
 PULL_CONSOLE_PROC(das_console_handler)
 PULL_CONSOLE_PROC(replay_console_handler)
 #if DAGOR_DBGLEVEL > 0
 PULL_CONSOLE_PROC(ri_collision_console_handler)
+PULL_CONSOLE_PROC(ri_scene_console_handler)
 #endif
 
 // use it only for app like console processors. move everything else elsewhere
@@ -56,6 +58,10 @@ static bool app_console_handler(const char *argv[], int argc)
   {
     visuallog::setMaxItems(to_int(argv[1]));
   }
+  CONSOLE_CHECK_NAME_EX("log", "disable", 1, 2, "disable or enable visuallog fully", "<is_disabled>")
+  {
+    visuallog::setDrawDisabled(to_bool(argv[1]));
+  }
   CONSOLE_CHECK_NAME("app", "fps_limit", 2, 2) { set_fps_limit(to_int(argv[1])); }
   CONSOLE_CHECK_NAME("app", "switch_scene", 1, 2) { sceneload::switch_scene(argc > 1 ? argv[1] : "", {}); }
   CONSOLE_CHECK_NAME("app", "switch_scene_and_update", 1, 2) { sceneload::switch_scene_and_update(argc > 1 ? argv[1] : ""); }
@@ -71,6 +77,11 @@ static bool app_console_handler(const char *argv[], int argc)
     if (argc > 4)
       params.flags = console::to_int(argv[4]);
     d3d_err(d3d::driver_command(Drv3dCommand::PIX_GPU_CAPTURE_AFTER_LONG_FRAMES, reinterpret_cast<void *>(&params)));
+  }
+  CONSOLE_CHECK_NAME("app", "reinit_input", 1, 1)
+  {
+    controls::destroy();
+    controls::init_control();
   }
   return found;
 }

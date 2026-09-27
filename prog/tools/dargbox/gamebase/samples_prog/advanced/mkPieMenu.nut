@@ -1,5 +1,6 @@
 from "%darg/ui_imports.nut" import *
 from "math" import PI, sin, cos
+from "types" import String
 
 
 function place_by_circle(params) {
@@ -97,7 +98,7 @@ function mkPieMenu(params=defParams){
   let internalIdx = Watched(null)
   let curIdx = params?.curIdx ?? Watched(null)
   let curAngle = Watched(null)
-  internalIdx.subscribe(function(v) { if (v != null) curIdx(v)})
+  internalIdx.subscribe_with_nasty_disregard_of_frp_update(function(v) { if (v != null) curIdx.set(v)})
   let children = place_by_circle({
     radius=radius, objects=objs.map(@(v, i) v?.ctor?(curIdx, i) ?? mDefCtor(v?.text)(curIdx, i) ), offset=3.0/4
   })
@@ -177,7 +178,7 @@ function mkPieMenuActivator(params = defParams){
   let showPieMenu = params?.showPieMenu ?? Watched(hotkeys==null)
   let pieMenu = mkPieMenu(params)
   let eventHandlers = params?.eventHandlers
-  if (type(hotkeys)=="string")
+  if (hotkeys instanceof String)
     hotkeys = [[hotkeys, @() showPieMenu(!showPieMenu.get())]]
 
   return function() {

@@ -13,19 +13,22 @@ function new_rnd_seed() {//setting new rnd
 }
 
 const DEFAULT_MAX_INT_RAND = 32767
-const maxrndfloat = 16777215.0 // float can only hold 23-bits integers without data loss
+const maxrndfloat = 16777216.0 // float can only hold 23-bits integers without data loss
 const maxrndfloatmask = 16777215 // (1<24)-1
 const maxnoiseint = 0xffffffff // 32 bits
 
-function randint_uniform(lo, hi, rand) { // returns random int in range [lo,hi], closed interval
+function randint_uniform(lo: number, hi: number, rand: function): number { // returns random int in range [lo,hi], closed interval
   let n = hi - lo + 1
   assert(n != 0)
   let maxx = maxnoiseint - (maxnoiseint % n)
   local x
+  local cnt = 8
   do {
     x = rand()
-  } while (x >= maxx)
-  return lo + (x % n)
+    if (x < maxx)
+      return lo + (x % n)
+  } while (--cnt)
+  return lo + rand() % n
 }
 
 class Rand{
@@ -42,47 +45,21 @@ class Rand{
     this._count = 0
   }
 
-  function rfloat(start=0.0, end=1.0){ // return float in range [start,end)
+  function rfloat(start: number = 0.0, end: number = 1.0): float { // return float in range [start,end)
     this._count += 1
     let start_ = math.min(end,start)
     let end_ = math.max(end,start)
-    let runit = (random.uint_noise1D(this._seed, this._count) & maxrndfloatmask) / maxrndfloat // [0,1]
+    let runit = (random.uint_noise1D(this._count, this._seed) & maxrndfloatmask) / maxrndfloat // [0,1)
     return runit * (end_-start_) + start_
-  }
-
-  static function _rfloat(start=0.0, end=1.0, seed=null, count=null){ // return float in range [start,end)
-    if (type(seed)=="table") {
-      let params = seed
-      start=params?.start ?? start
-      end=params?.end ?? end
-      seed = params?.seed ?? new_rnd_seed()
-      count = params?.count ?? count
-    }
-    let start_ = math.min(end,start)
-    let end_ = math.max(end,start)
-    let runit = (random.uint_noise1D(seed, count ?? seed) & maxrndfloatmask) / maxrndfloat // [0,1]
-    return runit * (end_-start_) + start_
-  }
-
-  static function _rint(start=0, end=DEFAULT_MAX_INT_RAND, seed=null, count=null){ // return int in range [start, end], i.e. inclusive
-    if (type(seed)=="table") {
-      let params = seed
-      start=params?.start ?? start
-      end=params?.end ?? end
-      seed = params?.seed ?? new_rnd_seed()
-      count = params?.count ?? count
-    }
-    return randint_uniform(math.min(end,start), math.max(end,start), @() random.uint_noise1D(seed, count ?? seed))
   }
 
   function rint(start=0, end = null) { // return int in range [start, end], i.e. inclusive
-    this._count += 1
     if (end==null && start==0)
-      return random.uint_noise1D(this._seed, this._count)
+      return random.uint_noise1D(++this._count, this._seed)
     else {
       end = end?.tointeger() ?? DEFAULT_MAX_INT_RAND
       start = start.tointeger()
-      return randint_uniform(math.min(end,start), math.max(end,start), @() random.uint_noise1D(this._seed, this._count))
+      return randint_uniform(math.min(end,start), math.max(end,start), @() random.uint_noise1D(++this._count, this._seed))
     }
   }
 
@@ -90,7 +67,7 @@ class Rand{
   static gauss_rnd = random.gauss_rnd
   static uint_noise1D = random.uint_noise1D
   static set_rnd_seed = random.set_rnd_seed //for rnd and gauss_rnd
-  static get_rnd_seed = random.set_rnd_seed //for rnd and gauss_rnd
+  static get_rnd_seed = random.get_rnd_seed //for rnd and gauss_rnd
 
   static function chooseRandom(arr, seed = null) { //free standing
     if (arr.len()==0)
@@ -102,7 +79,7 @@ class Rand{
   static function shuffle(arr, seed=null) {
     let res = clone arr
     let size = res.len()
-    let randfunc = @(count) random.uint_noise1D(seed == null ? new_rnd_seed() : seed, count)
+    let randfunc = @(count) random.uint_noise1D(count, seed == null ? new_rnd_seed() : seed)
     for (local i = size - 1; i > 0; i--) {
       res.swap(randfunc(i) % (i + 1), i)
     }

@@ -1,9 +1,13 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <string.h>
 #include <EASTL/bitset.h>
 #include "driver.h"
 #include "device_memory.h"
+#include "buffer_ref.h"
+#include "frontend.h"
+#include "pipeline_state.h"
 
 namespace drv3d_vulkan
 {
@@ -38,8 +42,15 @@ struct GlobalConstBuffer
 
   DirtyState::Type dirtyState = ~DirtyState::Type(0);
 
-  // current sizes of the register space sections (eg what needs uploading)
-  uint32_t registerSpaceSizes[STAGE_MAX] = {MIN_COMPUTE_CONST_REGISTERS, FRAGMENT_SHADER_REGISTERS, VERTEX_SHADER_MIN_REGISTERS};
+  // runtime limits derived from device maxUniformBufferRange (initialized via initDeviceLimits)
+  uint32_t maxVertexRegisters = VERTEX_SHADER_MAX_REGISTERS;
+  uint32_t maxComputeRegisters = MAX_COMPUTE_CONST_REGISTERS;
+
+  static constexpr uint32_t DEFAULT_REG_COUNT[STAGE_MAX] = {
+    MIN_COMPUTE_CONST_REGISTERS, FRAGMENT_SHADER_REGISTERS, VERTEX_SHADER_MIN_REGISTERS};
+  uint32_t programImplicitCbufRegCount[STAGE_MAX] = {
+    UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT, UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT, UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT};
+  uint32_t uploadedRegCount[STAGE_MAX] = {};
   // one big chunk to provide memory for register backing
   uint32_t totalRegisterSpace[(MAX_COMPUTE_CONST_REGISTERS + VERTEX_SHADER_MAX_REGISTERS + FRAGMENT_SHADER_REGISTERS) *
                               SHADER_REGISTER_ELEMENTS] = {};
@@ -58,50 +69,72 @@ struct GlobalConstBuffer
   bool registerMemoryUpdate(uint32_t stage, uint32_t offset, dag::ConstSpan<uint32_t> blob)
   {
     auto data = getRegisterSectionStart(stage) + offset;
-    // search for first difference
-    auto range = eastl::mismatch(blob.begin(), blob.end(), data);
-    bool modified = range.first != blob.end();
-    // copy over until we reach the end
-    while (range.first != blob.end())
-    {
-      *range.second++ = *range.first++;
-    }
-    return modified;
+    const uint32_t *src = blob.data();
+    const size_t n = blob.size();
+    // blob can be alias to float instead of uint32_t, so must be processed with byte-wise operations
+    size_t first = 0;
+    while (first < n && memcmp(&data[first], &src[first], sizeof(uint32_t)) == 0)
+      ++first;
+    if (first == n)
+      return false;
+    memcpy(&data[first], &src[first], (n - first) * sizeof(uint32_t));
+    return true;
   }
 
-  uint32_t setComputeConstRegisterCount(uint32_t cnt)
+  void initDeviceLimits(uint32_t max_uniform_buffer_range)
   {
-    if (cnt)
-      cnt = clamp<uint32_t>(nextPowerOfTwo(cnt), MIN_COMPUTE_CONST_REGISTERS, MAX_COMPUTE_CONST_REGISTERS);
-    else
-      cnt = MIN_COMPUTE_CONST_REGISTERS; // TODO update things to allow 0 (eg shader can tell how many it needs)
-    markDirty(DirtyState::COMPUTE_CONST_REGISTERS, registerSpaceSizes[STAGE_CS] < cnt);
-    registerSpaceSizes[STAGE_CS] = cnt;
-    return cnt;
+    uint32_t maxRegsFromDevice = max_uniform_buffer_range / SHADER_REGISTER_SIZE;
+    maxVertexRegisters = min(VERTEX_SHADER_MAX_REGISTERS, maxRegsFromDevice);
+    maxComputeRegisters = min(MAX_COMPUTE_CONST_REGISTERS, maxRegsFromDevice);
   }
-  uint32_t setVertexConstRegisterCount(uint32_t cnt)
+
+  uint32_t getMaxRegCount(uint32_t stage) const
   {
-    if (cnt)
-      cnt = clamp<uint32_t>(nextPowerOfTwo(cnt), VERTEX_SHADER_MIN_REGISTERS, VERTEX_SHADER_MAX_REGISTERS);
-    else
-      cnt = VERTEX_SHADER_MIN_REGISTERS; // TODO update things to allow 0 (eg shader can tell how many it needs)
-    markDirty(DirtyState::VERTEX_CONST_REGISTERS, registerSpaceSizes[STAGE_VS] < cnt);
-    registerSpaceSizes[STAGE_VS] = cnt;
-    return cnt;
+    return STAGE_CS == stage ? maxComputeRegisters : STAGE_PS == stage ? FRAGMENT_SHADER_REGISTERS : maxVertexRegisters;
   }
+
   void setConstRegisters(int stage, uint32_t offset, dag::ConstSpan<uint32_t> blob)
   {
     auto ds = static_cast<DirtyState::Bits>(DirtyState::COMPUTE_CONST_REGISTERS + stage);
     G_ASSERT(ds < DirtyState::INVALID);
+    G_ASSERTF(offset + blob.size() <= getMaxRegCount(stage) * SHADER_REGISTER_ELEMENTS,
+      "vulkan: OOB writing to GCB stage %u offset %u size %u limit %u", stage, offset, blob.size(),
+      getMaxRegCount(stage) * SHADER_REGISTER_ELEMENTS);
     markDirty(ds, registerMemoryUpdate(stage, offset, blob));
   }
 
-  template <typename ContextClass>
-  void setGlobalCbToStage(ContextClass &ctx, uint32_t stage)
+  void setRegCount(uint32_t stage, uint32_t count)
   {
-    ctx.setConstRegisterBuffer(
-      ctx.uploadToDeviceFrameMem(registerSpaceSizes[stage] * SHADER_REGISTER_SIZE, getRegisterSectionStart(stage)),
-      (ShaderStage)stage);
+    programImplicitCbufRegCount[stage] = count;
+    markDirtyIfUploadGrows(stage);
+  }
+
+  void markDirtyIfUploadGrows(uint32_t stage)
+  {
+    auto ds = static_cast<DirtyState::Bits>(DirtyState::COMPUTE_CONST_REGISTERS + stage);
+    markDirty(ds, getUploadRegCount(stage) > uploadedRegCount[stage]);
+  }
+
+  uint32_t getUploadRegCount(uint32_t stage) const
+  {
+    const uint32_t count = programImplicitCbufRegCount[stage];
+    if (count == UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT)
+      return DEFAULT_REG_COUNT[stage];
+    return min(count, getMaxRegCount(stage));
+  }
+
+  template <typename ContextClass>
+  void setGlobalCbToStage(ContextClass &ctx, uint32_t raw_stage)
+  {
+    const uint32_t regCount = getUploadRegCount(raw_stage);
+    uploadedRegCount[raw_stage] = regCount;
+    if (regCount == 0)
+      return;
+    BufferRef ref = ctx.uploadToDeviceFrameMem(regCount * SHADER_REGISTER_SIZE, getRegisterSectionStart(raw_stage));
+    ShaderStage stage = (ShaderStage)raw_stage;
+    auto &resBinds = Frontend::State::pipe.getStageResourceBinds(stage);
+    if (resBinds.set<StateFieldGlobalConstBuffer, BufferRef>(ref))
+      Frontend::State::pipe.markResourceBindDirty(stage);
   }
 
   template <typename ContextClass>

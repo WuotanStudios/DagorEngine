@@ -13,8 +13,6 @@ hlsl {
 
 shader dagdp_dynamic_recount
 {
-  ENABLE_ASSERT(cs)
-
   (cs) {
     dyn_allocs@uav = dagdp__dyn_allocs hlsl {
       #include "dagdp_common.hlsli"
@@ -82,6 +80,8 @@ shader dagdp_dynamic_recount
         count = 0;
       else
         count += (dyn_region.y - totalPlaced) / dyn_counters_num; // Distribute extra capacity across all counters equally.
+
+      GroupMemoryBarrierWithGroupSync();
 
       inclusive_prefix_sum_gs(tId, count);
       const bool isAlreadyPlaced = structuredBufferAt(dyn_counters, DYN_COUNTERS_INDEX_OVERFLOW_FLAG) == 0u;

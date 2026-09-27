@@ -17,6 +17,10 @@
 #include "global_lock.h"
 #include "frontend_pod_state.h"
 #include "timelines.h"
+#include "backend/cmd/renderpass.h"
+#include "backend/cmd/resources.h"
+#include "validation.h"
+#include <renderPassValidation.h>
 
 using namespace drv3d_vulkan;
 
@@ -48,6 +52,9 @@ struct LocalAccessorWithoutState
 
 d3d::RenderPass *d3d::create_render_pass(const RenderPassDesc &rp_desc)
 {
+  if (!validate_render_pass_desc(rp_desc))
+    return nullptr;
+
   LocalAccessorWithoutState la;
   WinAutoLock lk(Globals::Mem::mutex);
 
@@ -60,17 +67,20 @@ void d3d::delete_render_pass(d3d::RenderPass *rp)
 {
   // can happen from external thread by overall deletion rules, so must be processed in backend
   LocalAccessorWithoutState la;
-  la.ctx.destroyRenderPassResource((RenderPassResource *)rp);
+  D3D_CONTRACT_ASSERT(rp != nullptr);
+  la.ctx.dispatchCmd<CmdDestroyRenderPassResource>({(RenderPassResource *)rp});
 }
 
-void d3d::begin_render_pass(d3d::RenderPass *drv_rp, const RenderPassArea area, const RenderPassTarget *targets)
+void d3d::begin_render_pass(d3d::RenderPass *drv_rp, const RenderPassArea area, dag::ConstSpan<RenderPassTarget> targets)
 {
   D3D_CONTRACT_ASSERTF(drv_rp, "vulkan: can't start null render pass");
   using Bind = StateFieldRenderPassTarget;
   LocalAccessor la;
 
   RenderPassResource *rp = (RenderPassResource *)drv_rp;
-  for (uint32_t i = 0; i < rp->getTargetsCount(); ++i)
+  D3D_CONTRACT_ASSERTF(rp->getTargetsCount() == targets.size(), "vulkan: missing/excessive targets for rp %s, expected %u got %u",
+    rp->getDebugName(), rp->getTargetsCount(), targets.size());
+  for (uint32_t i = 0; i < targets.size(); ++i)
   {
     D3D_CONTRACT_ASSERTF(targets[i].resource.tex, "vulkan: trying to start render pass %s with missing target %u", rp->getDebugName(),
       i);
@@ -90,7 +100,7 @@ void d3d::begin_render_pass(d3d::RenderPass *drv_rp, const RenderPassArea area, 
     Frontend::replay->nativeRPDrawCounter.push_back(Frontend::State::pod.drawsCount);
   }
 
-  la.ctx.nativeRenderPassChanged();
+  la.ctx.dispatchCmdWithStateSet<CmdNativeRenderPassChanged>({});
 }
 
 void d3d::next_subpass()
@@ -101,7 +111,7 @@ void d3d::next_subpass()
   const RenderPassArea &area =
     la.pipeState.getRO<StateFieldRenderPassArea, RenderPassArea, FrontGraphicsState, FrontRenderPassState>();
   la.pipeState.set<StateFieldGraphicsViewport, RenderPassArea, FrontGraphicsState>(area);
-  la.ctx.nativeRenderPassChanged();
+  la.ctx.dispatchCmdWithStateSet<CmdNativeRenderPassChanged>({});
 }
 
 void d3d::end_render_pass()
@@ -123,6 +133,5 @@ void d3d::end_render_pass()
     OSSpinlockScopedLock lockedFront(Globals::ctx.getFrontLock());
     Frontend::replay->nativeRPDrawCounter.back() = Frontend::State::pod.drawsCount - Frontend::replay->nativeRPDrawCounter.back();
   }
-  la.ctx.nativeRenderPassChanged();
-  la.ctx.executeDebugFlush("NativeRenderPassEnd");
+  la.ctx.dispatchPipeline<CmdNativeRenderPassChanged>({}, "NativeRenderPassEnd");
 }

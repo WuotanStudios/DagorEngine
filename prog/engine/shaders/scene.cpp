@@ -7,14 +7,11 @@
 
 #include <3d/dag_texMgr.h>
 #include <3d/dag_materialData.h>
-#include <obsolete/dag_cfg.h>
 #include <workCycle/dag_gameSettings.h>
 
 #include <ioSys/dag_fileIo.h>
 #include <osApiWrappers/dag_files.h>
-#include <util/dag_loadingProgress.h>
 #include <perfMon/dag_cpuFreq.h>
-#include <perfMon/dag_objVisDebug.h>
 #include <generic/dag_sort.h>
 #include <supp/dag_prefetch.h>
 #include <math/dag_mathUtils.h>
@@ -97,10 +94,11 @@ static int sort_mesh_elems(ShaderMesh::RElem *const *_a, ShaderMesh::RElem *cons
 {
   const ShaderMesh::RElem &a = *_a[0];
   const ShaderMesh::RElem &b = *_b[0];
-  int diff = a.vertexData - b.vertexData;
-  if (!diff)
-    diff = a.vdOrderIndex - b.vdOrderIndex;
-  return diff;
+  if (a.vertexData != b.vertexData)
+    return a.vertexData < b.vertexData ? -1 : 1;
+  if (a.vdOrderIndex != b.vdOrderIndex)
+    return a.vdOrderIndex < b.vdOrderIndex ? -1 : 1;
+  return 0;
 }
 
 void RenderScene::buildOptSceneData()
@@ -278,11 +276,10 @@ void RenderScene::buildOptSceneData()
   }
   G_ASSERT(elemnum == optScn.elemIdxStor.size());
 
-  optScn.buildVisTree.build(objs.data(), objs.size(), false);
+  optScn.buildVisTree.build(make_span(objs));
 
   optScn.visTree.nodes = make_span(optScn.buildVisTree.nodes);
   optScn.visTree.leavesCount = optScn.buildVisTree.leavesCount;
-  optScn.buildVisTree.clearLastPlaneWord();
 
   optScn.prepareDone = false;
   optScn.inited = true;
@@ -334,10 +331,10 @@ void RenderScene::sort_objects(const Point3 &sort_point)
     // int trans1 = 0;
     real d1 = (sort_point - obj1.bsph.c).lengthSq();
     real d2 = (sort_point - obj2.bsph.c).lengthSq();
-    if (d1 < d2)
-      return trans1 ? false : true;
-    else
-      return trans1 ? true : false;
+    if (d1 != d2)
+      return trans1 ? d1 > d2 : d1 < d2;
+
+    return false;
   });
 }
 
@@ -398,10 +395,7 @@ void RenderScene::render(const VisibilityFinder &vf, int render_id, unsigned ren
           {
             //== code to be used while get_shader_lightmap() has side effects
 
-            auto e = optScn.mats[i].e;
-            if (!e)
-              continue;
-            if (!e->native().setStates())
+            if (!optScn.mats[i].e || !optScn.mats[i].e->native().setStates())
               break;
             first = false;
           }
@@ -462,6 +456,8 @@ void RenderScene::foreachElem(ElemCallback &callback) const
 
   for (int i = optScn.getMatStartIdx(ShaderMesh::STG_opaque); i < optScn.getMatEndIdx(ShaderMesh::STG_atest); i++)
   {
+    if (!optScn.mats[i].e) // make_elem() may fail for a material, same as in render paths
+      continue;
     ScriptedShaderElement &material = optScn.mats[i].e->native();
     for (int ei = optScn.mats[i].se; ei < optScn.mats[i].ee; ++ei)
     {
@@ -518,7 +514,7 @@ void RenderScene::foreachElem(ElemCallback &callback) const
   }
 }
 
-void RenderScene::render_trans()
+void RenderScene::render_trans(bool draw_all)
 {
   G_ASSERTF_RETURN(optScn.inited || !obj.size(), , "optScn.inited=%d while calling %p.render_trans() obj.size()=%d", optScn.inited,
     this, obj.size());
@@ -540,26 +536,35 @@ void RenderScene::render_trans()
       int ei = optScn.mats[i].se, ei_end = optScn.mats[i].ee;
       bool first = true;
 
-      unsigned bit = 0x80000000 >> (ei & 0x1F);
-      unsigned *wpos = &optScn.visData.usedElems[(ei >> 5) + lod * optScn.usedElemsStride];
-      if (!*wpos)
+      unsigned bit, *wpos;
+      if (draw_all)
       {
-        ei += 32 - (ei & 0x1F);
-        bit = 0x80000000;
-        wpos++;
+        bit = 0;
+        wpos = NULL;
       }
-      if (bit == 0x80000000 && ei < ei_end)
-        while (!*wpos)
+      else
+      {
+        bit = 0x80000000 >> (ei & 0x1F);
+        wpos = &optScn.visData.usedElems[(ei >> 5) + lod * optScn.usedElemsStride];
+        if (!*wpos)
         {
+          ei += 32 - (ei & 0x1F);
+          bit = 0x80000000;
           wpos++;
-          ei += 32;
-          if (ei >= ei_end)
-            break;
         }
+        if (bit == 0x80000000 && ei < ei_end)
+          while (!*wpos)
+          {
+            wpos++;
+            ei += 32;
+            if (ei >= ei_end)
+              break;
+          }
+      }
 
       for (; ei < ei_end; ei++)
       {
-        if (*wpos & bit)
+        if (!wpos || (*wpos & bit))
         {
           const OptimizedScene::Elem *__restrict e = &optScn.elems[ei];
           if (first)
@@ -590,20 +595,24 @@ void RenderScene::render_trans()
           }
         }
 
-        bit >>= 1;
-        if (!bit)
+        if (wpos)
         {
-          if (ei + 1 == ei_end) // It is the last element, it will be an error to look for the next bit.
-            break;
-
-          wpos++;
-          bit = 0x80000000;
-          while (!*wpos)
+          bit >>= 1;
+          if (!bit)
           {
-            wpos++;
-            ei += 32;
-            if (ei >= ei_end)
+            if (ei + 1 == ei_end) // It is the last element, it will be an error to look for the next bit.
               break;
+
+            wpos++;
+            bit = 0x80000000;
+            unsigned *wposEnd = optScn.visData.usedElems.data() + ((ei_end - 1) >> 5) + 1 + lod * optScn.usedElemsStride;
+            while (wpos < wposEnd && !*wpos)
+            {
+              wpos++;
+              ei += 32;
+              if (ei >= ei_end)
+                break;
+            }
           }
         }
       }
@@ -611,6 +620,11 @@ void RenderScene::render_trans()
         d3d::drawind(PRIM_TRILIST, si, numf, 0);
     }
   }
+}
+
+bool RenderScene::isMaterialInited(int stage) const
+{
+  return optScn.inited && optScn.visData.lastElemNum[0] && (optScn.getMatStartIdx(stage) < optScn.getMatEndIdx(stage));
 }
 
 void RenderScene::loadTextures(IGenLoad &cb, Tab<TEXTUREID> &tex)
@@ -634,8 +648,6 @@ void RenderScene::loadTextures(IGenLoad &cb, Tab<TEXTUREID> &tex)
     tex[i] = get_managed_texture_id(name.data());
     if (tex[i] == BAD_TEXTUREID)
       tex[i] = add_managed_texture(name.data());
-    if ((n & 0x3F) == 0)
-      loading_progress_point();
 
     acquire_managed_tex(tex[i]);
   }
@@ -649,14 +661,6 @@ void RenderScene::load(const char *lmdir, bool use_vis)
   ShaderMaterial::setLoadingString(fn);
 
   int startUpTime = get_time_msec();
-// int startUpTime0=startUpTime;
-#define STARTUP_POINT(name)                                                                        \
-  {                                                                                                \
-    /*int t=get_time_msec();*/                                                                     \
-    /*debug("*** %7dms: load scene %s (line %d)", t-startUpTime, (const char*)(name), __LINE__);*/ \
-    /*startUpTime=t;*/                                                                             \
-    loading_progress_point();                                                                      \
-  }
 
   debug("loading scene %s", (char *)fn);
 
@@ -664,9 +668,6 @@ void RenderScene::load(const char *lmdir, bool use_vis)
   if (!crd.fileHandle)
     DAG_FATAL("can't open scene file '%s'", fn.str());
 
-  STARTUP_POINT("open");
-
-  loading_progress_point();
   if (crd.readInt() != _MAKE4C('scnf'))
   {
     DAG_FATAL("non-scene file"); // DAGOR_THROW(IGenLoad::LoadException("non-scene file", crd.tell()));

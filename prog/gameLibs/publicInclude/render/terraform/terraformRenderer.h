@@ -48,6 +48,7 @@ public:
 
   void initHeightMask();
   void closeHeightMask();
+  void updateSamplers();
 
   void update();
   void render(RenderMode render_mode, const BBox2 &region_box);
@@ -75,7 +76,7 @@ private:
   Desc desc;
   Point2 heightMaskWorldSize = Point2(1, 1);
   DynamicShaderHelper patchShader;
-  UniqueTexHolder hmapSavedTex;
+  UniqueTexWithShaderVar hmapSavedTex;
   ska::flat_hash_map<uint32_t, Patch *> patches;
   ska::flat_hash_map<uint32_t, Prim *> prims;
   uint32_t curTimestep = 0;
@@ -84,7 +85,6 @@ private:
   int terraform_min_max_levelVarId = -1;
   int terraform_render_modeVarId = -1;
   int terraform_tex_data_sizeVarId = -1;
-  int terraform_enabledVarId = -1;
   int tform_height_mask_scale_offsetVarId = -1;
 
   int tform_diffuse_texVarId = -1;
@@ -92,5 +92,5 @@ private:
   int tform_detail_rtexVarId = -1;
   int tform_normals_texVarId = -1;
 
-  UniqueTexHolder heightMaskTex;
+  UniqueTexWithShaderVar heightMaskTex;
 };

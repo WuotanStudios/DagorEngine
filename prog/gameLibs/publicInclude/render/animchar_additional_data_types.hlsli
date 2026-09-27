@@ -10,12 +10,25 @@
 #define AAD_VEHICLE_CAMO      2
 #define AAD_DECALS_TYPE       3
 #define AAD_MATERIAL_PARAMS   4
+#define AAD_EYE_DIR           5
+// Vehicle envi cover. Aliases slot 5: the eye writer runs only on soldier
+// animchars with eye components, the cover writers only in the WT vehicle
+// render paths (IGroundModel, physical tracks), so they can't intersect
+#define AAD_ENVI_COVER        5
+// Per-character head customization slot (package_soldier). Aliases slot 4:
+// all 8 ids are taken, and head animchars never use the dynmat system - the
+// packer ES enforces that with ECS_REQUIRE_NOT on dynamic_material_channels_arr.
+// Layout offsets live in package_soldier/shaders/head_customization.hlsli.
+#define AAD_HEAD_CUSTOMIZATION 4
 
 // raw data, passed directly to rendering, can overlap with each other (unless there is a design error in shaders)
 #define AAD_RAW_XRAY_INDEX          6
 #define AAD_RAW_ANIM_TO_TEX_PARAMS  6
 #define AAD_RAW_PLACING_COLOR       6
 #define AAD_RAW_INITIAL_TM__HASHVAL 6
+
+// This is used together with AAD_RAW_INITIAL_TM__HASHVAL
+#define AAD_RAW_DESTR_PARAMS        7
 
 // todo: should be splitted into separate parameters. Now there are: burning, projective blood decals, torn wounds
 #define AAD_HUMAN_COMBINED_PARAMS 7

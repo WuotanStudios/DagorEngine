@@ -10,6 +10,18 @@
 
 namespace das {
 
+    // print flags are sticky node bits; without a wipe the output of a subtree print depends on
+    // what larger trees the node was printed inside before (describe() must be pure — CSE keys on it).
+    // opts into quote AND assume interiors — everything the Printer below descends into.
+    class ClearPrinterFlags : public Visitor {
+        virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return true; }
+        virtual bool canVisitWithAliasSubexpression ( ExprAssume * ) override { return true; }
+        virtual void preVisitExpression ( Expression * expr ) override {
+            Visitor::preVisitExpression(expr);
+            expr->printFlags = 0;
+        }
+    };
+
     class SetPrinterFlags : public Visitor {
     // ExprBlock
         virtual void preVisitBlockExpression ( ExprBlock * block, Expression * expr ) override {
@@ -85,18 +97,21 @@ namespace das {
                 printRef = program->options.getBoolOption("print_ref");
                 printVarAccess = program->options.getBoolOption("print_var_access");
                 printAliases= program->options.getBoolOption("log_aliasing");
-                printFuncUse= program->options.getBoolOption("print_func_use");
+                printUse = program->options.getBoolOption("print_use");
                 gen2 = program->policies.version_2_syntax;
-                printCStyle = program->options.getBoolOption("print_c_style") || gen2;
+                printCStyle = program->options.getBoolOption("print_c_style");
             }
+            // gen2 always implies C-style braces; keep these consistent even when
+            // there is no program (describe_function / describe_expression path).
+            printCStyle = printCStyle || gen2;
         }
         string str() const { return ss.str(); };
         bool printRef = false;
         bool printVarAccess = false;
         bool printCStyle = false;
         bool printAliases = false;
-        bool printFuncUse = false;
-        bool gen2 = false;
+        bool printUse = false;
+        bool gen2 = true;
     protected:
         void newLine () {
             auto nlPos = ss.tellp();
@@ -210,6 +225,13 @@ namespace das {
                 ss << "] ";
             }
         }
+        virtual void preVisitStructureAlias ( Structure * var, const string & name, TypeDecl * at ) override {
+            Visitor::preVisitStructureAlias(var, name, at);
+            ss << "\ttypedef " << name << " = " << at->describe();
+            if ( gen2 ) ss << ";";
+            ss << "\n";
+        }
+
         virtual void preVisitStructureField ( Structure * that, Structure::FieldDeclaration & decl, bool last ) override {
             Visitor::preVisitStructureField(that, decl, last);
             ss << "\t";
@@ -244,7 +266,7 @@ namespace das {
     // global
         virtual void preVisitGlobalLet ( const VariablePtr & var ) override {
             Visitor::preVisitGlobalLet(var);
-            if ( printFuncUse ) {
+            if ( printUse ) {
                 if ( var->useFunctions.size() ) {
                     ss << "// use functions";
                     for ( auto & ufn : var->useFunctions ) {
@@ -265,9 +287,11 @@ namespace das {
                 << (var->private_variable ? " private" : "")
                 << "\n\t";
             outputVariableAnnotation(var->annotation);
-            if ( var->isAccessUnused() ) ss << " /*unused*/ ";
-            if ( printVarAccess && !var->access_ref ) ss << "$";
-            if ( printVarAccess && !var->access_pass ) ss << "%";
+            if ( printUse && var->isAccessUnused() ) ss << " /*unused*/ ";
+            if ( printVarAccess && var->access_ref ) ss << "/*ref*/";
+            if ( printVarAccess && var->access_pass ) ss << "/*pass*/";
+            if ( printVarAccess && var->access_get ) ss << "/*get*/";
+            if ( printVarAccess && var->access_info_pass_mutable ) ss << "/*pass_mut*/";
             ss << var->name << " : " << var->type->describe();
         }
         virtual VariablePtr visitGlobalLet ( const VariablePtr & var ) override {
@@ -283,6 +307,9 @@ namespace das {
     // function
         virtual void preVisit ( Function * fn) override {
             Visitor::preVisit(fn);
+            if ( fn->isFullyInferred ) {
+                ss << "/*FULLY INFERRED*/\n";
+            }
             if ( fn->unsafeFunction ) {
                 ss << "/*unsafe*/ ";
             }
@@ -304,24 +331,33 @@ namespace das {
             if ( fn->moreFlags ) {
                 ss << "// ";
                 if ( fn->macroFunction ) { ss << "[macro_function]"; }
-                if ( fn->needStringCast ) { ss << "[need_string_cast]"; }
                 if ( fn->aotHashDeppendsOnArguments ) { ss << "[aot_hash_deppends_on_arguments]"; }
                 if ( fn->requestJit ) { ss << "[jit]"; }
                 if ( fn->requestNoJit ) { ss << "[no_jit]"; }
                 if ( fn->nodiscard ) { ss << "[nodiscard]"; }
                 ss << "\n";
             }
+            if ( fn->tempStringResult ) { ss << "// [temp_string_result]\n"; }
             if ( fn->fastCall ) { ss << "[fastcall]\n"; }
-            if ( fn->addr ) { ss << "[addr]\n"; }
+            // if ( fn->addr ) { ss << "[addr]\n"; }
             if ( fn->exports ) { ss << "[export]\n"; }
             if ( fn->init ) { ss << "[init" << (fn->lateInit ? "(late)" : "") << "]\n"; }
             if ( fn->macroInit ) { ss << "[macro_init]\n"; }
             if ( fn->macroFunction ) { ss << "[macro_function]\n"; }
-            if ( fn->shutdown ) { ss << "[finalize]\n"; }
+            if ( fn->shutdown ) { ss << "[finalize" << (fn->lateShutdown ? "(late)" : "") << "]\n"; }
             if ( fn->unsafeDeref ) { ss << "[unsafe_deref]\n"; }
             if ( fn->unsafeOperation ) { ss << "[unsafe_operation]\n"; }
-            if ( fn->isClassMethod ) { ss << "[class_method(" << fn->classParent->getMangledName() << ")]\n"; }
+            if ( fn->isClassMethod ) {
+                ss << "[";
+                ss << (fn->isStaticClassMethod ? "static_class_method" : "class_method");
+                if ( fn->isConstClassMethod ) {
+                    ss << " const";
+                }
+                ss << "(" << fn->classParent->getMangledName() << ")]\n";
+            }
             if ( fn->generator ) { ss << "[GENERATOR]\n"; }
+            if ( fn->lambda ) { ss << "[LAMBDA]\n"; }
+            if ( fn->hasTryRecover ) { ss << "[has_try_recover]\n"; }
             logAnnotations(fn->annotations);
             if ( printAliases ) {
                 if ( fn->resultAliases.size() ) {
@@ -341,7 +377,7 @@ namespace das {
                     }
                 }
             }
-            if ( printFuncUse ) {
+            if ( printUse ) {
                 if ( fn->useFunctions.size() ) {
                     ss << "// use functions";
                     for ( auto & ufn : fn->useFunctions ) {
@@ -358,7 +394,7 @@ namespace das {
                 }
             }
             if ( fn->fromGeneric ) {
-                ss << "// from generic " << fn->fromGeneric->describe() << "\n";
+                ss << "// from generic " << fn->fromGeneric->module->name << "::" << fn->fromGeneric->describe() << "\n";
             }
             if ( fn->isTemplate ) {
                 ss << "template ";
@@ -369,8 +405,8 @@ namespace das {
         virtual void preVisitFunctionBody ( Function * fn,Expression * expr ) override {
             Visitor::preVisitFunctionBody(fn,expr);
             if ( fn->arguments.size() ) ss << ")";
-            if ( fn->result && !fn->result->isVoid() ) ss << " : " << fn->result->describe();
-            ss << "\n";
+            if ( fn->result ) ss << " : " << fn->result->describe();
+            if ( !gen2 ) ss << "\n";
         }
         virtual void preVisitArgument ( Function * fn, const VariablePtr & arg, bool last ) override {
             Visitor::preVisitArgument(fn,arg,last);
@@ -380,10 +416,12 @@ namespace das {
                 ss << "] ";
             }
             if ( !arg->type->isConst() ) ss << "var ";
-            if ( arg->isAccessUnused() ) ss << " /*unused*/ ";
-            if ( arg->no_capture ) ss << " /*no_capture*/ ";
-            if ( printVarAccess && !arg->access_ref ) ss << "$";
-            if ( printVarAccess && !arg->access_pass ) ss << "%";
+            if ( printUse && arg->isAccessUnused() ) ss << " /*unused*/ ";
+            if ( printUse && arg->no_capture ) ss << " /*no_capture*/ ";
+            if ( printVarAccess && arg->access_ref ) ss << "/*ref*/";
+            if ( printVarAccess && arg->access_pass ) ss << "/*pass*/";
+            if ( printVarAccess && arg->access_get ) ss << "/*get*/";
+            if ( printVarAccess && arg->access_info_pass_mutable ) ss << "/*pass_mut*/";
             ss << arg->name;
             if ( !arg->aka.empty() ) ss << " aka " << arg->aka;
             ss << ":" << arg->type->describe();
@@ -445,6 +483,11 @@ namespace das {
             if ( that->rtti_isFor() ) return false;
             if ( that->rtti_isWhile() ) return false;
             if ( that->rtti_isWith() ) return false;
+            if ( gen2 ) {
+                if ( that->rtti_isBlock() ) return false;
+                if ( that->rtti_isUnsafe() ) return false;
+                if ( strcmp(that->__rtti,"ExprTryCatch")==0 ) return false;
+            }
             return true;
         }
         virtual ExpressionPtr visitBlockExpression ( ExprBlock * block, Expression * that ) override {
@@ -479,10 +522,24 @@ namespace das {
                     if ( block->returnType ) {
                         ss << ":" << block->returnType->describe();
                     }
-                    ss << "\n";
+                    if ( !gen2 ) ss << "\n";
                 }
             }
-            if ( printCStyle || block->isClosure ) ss << string(tab,'\t') << "{\n";
+            if ( printCStyle || block->isClosure ) {
+                if ( block->isClosure ) {
+                    if ( gen2 ) {
+                        ss << " {\n";
+                    } else {
+                        ss << string(tab,'\t') << "{\n";
+                    }
+                } else if ( block->topLevel ) {
+                    ss << "{\n";
+                } else if ( gen2 ) {
+                    ss << " {\n";
+                } else {
+                    ss << string(tab,'\t') << "{\n";
+                }
+            }
             tab ++;
         }
         virtual ExpressionPtr visit ( ExprBlock * block ) override {
@@ -561,14 +618,18 @@ namespace das {
         }
         virtual void preVisitLet ( ExprLet * let, const VariablePtr & var, bool last ) override {
             Visitor::preVisitLet(let, var, last);
-            if ( var->isAccessUnused() ) ss << " /*unused*/ ";
-            if ( printVarAccess && !var->access_ref ) ss << "$";
-            if ( printVarAccess && !var->access_pass ) ss << "%";
+            if ( printUse && var->isAccessUnused() ) ss << " /*unused*/ ";
+            if ( printVarAccess && var->access_ref ) ss << "/*ref*/";
+            if ( printVarAccess && var->access_pass ) ss << "/*pass*/";
+            if ( printVarAccess && var->access_get ) ss << "/*get*/";
+            if ( printVarAccess && var->access_info_pass_mutable ) ss << "/*pass_mut*/";
             ss << var->name;
             if ( !var->aka.empty() ) ss << " aka " << var->aka;
             if ( printAliases && var->aliasCMRES ) ss << "/*cmres*/";
             if ( var->early_out ) ss << "/*early_out*/";
             if ( var->used_in_finally ) ss << "/*used_in_finally*/";
+            if ( var->consumed ) ss << "/*consumed*/";
+            if ( var->single_return_via_move ) ss << "/*single_return_via_move*/";
             ss << ":" << var->type->describe();
         }
         virtual VariablePtr visitLet ( ExprLet * let, const VariablePtr & var, bool last ) override {
@@ -590,25 +651,35 @@ namespace das {
         virtual void preVisitIfBlock ( ExprIfThenElse * ifte, Expression * block ) override {
             Visitor::preVisitIfBlock(ifte,block);
             if ( gen2 ) ss <<  " )";
-            ss << "\n";
+            if ( !gen2 ) ss << "\n";
         }
         virtual void preVisitElseBlock ( ExprIfThenElse * ifte, Expression * block ) override {
             Visitor::preVisitElseBlock(ifte, block);
-            ss << "\n" << string(tab,'\t');
+            if ( gen2 ) {
+                ss << " ";
+            } else {
+                ss << "\n" << string(tab,'\t');
+            }
             if (block && block->rtti_isIfThenElse()) {
                 ss << (ifte->isStatic ? "static_el" : "el");
             } else {
-                ss << (ifte->isStatic ? "static_else\n" : "else\n");
+                ss << (ifte->isStatic ? "static_else" : "else");
+                if ( !gen2 ) ss << "\n";
             }
         }
     // try-catch
         virtual void preVisit ( ExprTryCatch * tc ) override {
             Visitor::preVisit(tc);
-            ss << "try\n";
+            ss << "try";
+            if ( !gen2 ) ss << "\n";
         }
         virtual void preVisitCatch ( ExprTryCatch * tc, Expression * block ) override {
             Visitor::preVisitCatch(tc, block);
-            ss << string(tab,'\t') << "recover\n";
+            if ( gen2 ) {
+                ss << " recover";
+            } else {
+                ss << string(tab,'\t') << "recover\n";
+            }
         }
     // for
         virtual void preVisit ( ExprFor * ffor ) override {
@@ -625,7 +696,7 @@ namespace das {
         virtual void preVisitForBody ( ExprFor * ffor, Expression * body ) override {
             Visitor::preVisitForBody(ffor, body);
             if ( gen2 ) ss << " )";
-            ss << "\n";
+            if ( !gen2 ) ss << "\n";
         }
         virtual ExpressionPtr visitForSource ( ExprFor * ffor, Expression * that , bool last ) override {
             if ( !last ) ss << ",";
@@ -635,12 +706,15 @@ namespace das {
         virtual void preVisit ( ExprWith * wh ) override {
             Visitor::preVisit(wh);
             ss << "with ";
-            if ( gen2 ) ss << "( ";
+            // module flavor is gen2-only surface, but generated nodes can land in a
+            // gen1 program (the inliner's scope wraps) - always parenthesize it
+            if ( gen2 || wh->isModuleWith() ) ss << "( ";
+            if ( wh->isModuleWith() ) ss << "module " << wh->moduleName;
         }
         virtual void preVisitWithBody ( ExprWith * wh, Expression * body ) override {
             Visitor::preVisitWithBody(wh,body);
-            if ( gen2 ) ss << " )";
-            ss << "\n";
+            if ( gen2 || wh->isModuleWith() ) ss << " )";
+            if ( !gen2 && !wh->isModuleWith() ) ss << "\n";
         }
     // with alias
         virtual bool canVisitWithAliasSubexpression ( ExprAssume * ) override {
@@ -648,7 +722,10 @@ namespace das {
         }
         virtual void preVisit ( ExprAssume * wh ) override {
             Visitor::preVisit(wh);
-            ss << "assume " << wh->alias << " = ";
+            ss << "assume ";
+            if ( wh->assumeType ) ss << "type ";
+            ss << wh->alias << " = ";
+            if ( wh->assumeType ) ss << wh->assumeType->describe();
         }
     // tag
         virtual void preVisit ( ExprTag * expr ) override {
@@ -680,12 +757,13 @@ namespace das {
         virtual void preVisitWhileBody ( ExprWhile * wh, Expression * body ) override {
             Visitor::preVisitWhileBody(wh,body);
             if ( gen2 ) ss << " )";
-            ss << "\n";
+            if ( !gen2 ) ss << "\n";
         }
     // while
         virtual void preVisit ( ExprUnsafe * wh ) override {
             Visitor::preVisit(wh);
-            ss << "unsafe\n";
+            ss << "unsafe";
+            if ( !gen2 ) ss << "\n";
         }
     // call
         virtual void preVisit ( ExprCall * call ) override {
@@ -708,7 +786,7 @@ namespace das {
             ss << call->name << "(";
         }
         virtual void preVisitNamedCallArg ( ExprNamedCall * call, MakeFieldDecl * arg, bool last ) override {
-            if (call->arguments[0] == arg) {
+            if ((*call->arguments)[0] == arg) {
                 if (call->nonNamedArguments.size() > 0) ss << ",";
                 ss << "[";
             }
@@ -778,7 +856,7 @@ namespace das {
             if ( c->enumType->module && !c->enumType->module->name.empty() ) {
                 ss << c->enumType->module->name << "::";
             }
-            ss << c->enumType->name << " " << c->text;
+            ss << c->enumType->name << "." << c->text;
             return Visitor::visit(c);
         }
         virtual ExpressionPtr visit ( ExprConstInt * c ) override {
@@ -819,9 +897,16 @@ namespace das {
                 name = c->bitfieldType->findBitfieldName(c->getValue());
             }
             if ( !name.empty() ) {
-                ss << c->bitfieldType->alias << " " << name;
+                ss << c->bitfieldType->alias << "." << name;
             } else {
-                ss << "bitfield(0x" << HEX << c->getValue() << DEC << ")";
+                ss << "bitfield";
+                switch ( c->bitfieldType ? c->bitfieldType->baseType : Type::tBitfield  ) {
+                    case Type::tBitfield8: ss << "8"; break;
+                    case Type::tBitfield16: ss << "16"; break;
+                    case Type::tBitfield64: ss << "64"; break;
+                    default: break;
+                }
+                ss << "(0x" << HEX << c->getValue() << DEC << ")";
             }
             return Visitor::visit(c);
         }
@@ -835,6 +920,10 @@ namespace das {
         }
         virtual ExpressionPtr visit ( ExprConstFloat * c ) override {
             ss << c->getValue() << "f";
+            return Visitor::visit(c);
+        }
+        virtual ExpressionPtr visit ( ExprConstFloat16 * c ) override {
+            ss << c->getValue().toFloat() << "h";
             return Visitor::visit(c);
         }
         virtual ExpressionPtr visit ( ExprConstString * c ) override {
@@ -1384,6 +1473,8 @@ namespace das {
         ast_print::Standalone ctx;
         ctx.setFlags(this);
 #else
+        ClearPrinterFlags cflags;
+        visit(cflags);
         SetPrinterFlags pflags;
         visit(pflags);
 #endif
@@ -1391,6 +1482,8 @@ namespace das {
 
     template <typename TT>
     __forceinline StringWriter&  print ( StringWriter& stream, const TT & value ) {
+        ClearPrinterFlags cflags;
+        const_cast<TT&>(value).visit(cflags);
         SetPrinterFlags flags;
         const_cast<TT&>(value).visit(flags);
         Printer log(nullptr);
@@ -1410,6 +1503,8 @@ namespace das {
         }, "*");
         if (any) stream << "\n";
         bool logGenerics = program.options.getBoolOption("log_generics");
+        ClearPrinterFlags cflags;
+        const_cast<Program&>(program).visit(cflags, logGenerics);
         SetPrinterFlags flags;
         const_cast<Program&>(program).visit(flags, logGenerics);
         Printer log(&program);

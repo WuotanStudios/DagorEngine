@@ -6,6 +6,7 @@ require soundEvent
 require soundHash
 require soundSystem
 require sound_utils_net.modules.sound_utils_net_events
+require sound_utils_net.modules.sound_desc_common
 require sound_utils.modules.sound_utils_events
 
 let MAX_NET_DELAY = 5.
@@ -32,7 +33,7 @@ def play_impl(hash : uint; var pos : float3; param : float; descs : Object; is_w
   let objRef = get_net_sound_desc(hash, descs)
   if objRef != null
     assume obj = *objRef
-    let nameRef = is_watched ? (has(obj, "hero") ? obj["hero"] : obj["path"]) : (has(obj, "enemy") ? obj["enemy"] : obj["path"])
+    let nameRef = is_watched ? (has(obj, WATCHED_SOUND_KEY) ? obj[WATCHED_SOUND_KEY] : obj["path"]) : (has(obj, OTHER_SOUND_KEY) ? obj[OTHER_SOUND_KEY] : obj["path"])
     if nameRef != null
       let name = (*nameRef) ?? ""
       let isFar = obj.isFar ?? false
@@ -53,30 +54,30 @@ def play_impl(hash : uint; var pos : float3; param : float; descs : Object; is_w
 // -------------------------------------------------------------
 
 [es(tag=sound)]
-def play_net_sound_pos_impl_cmd(cmd : CmdPlayNetSoundPos; eid : EntityId; @shared_comp net_sound__descs : Object; var sound_event_group : SoundEventGroup?)
+def play_net_sound_pos_impl_cmd(cmd : CmdPlayNetSoundPos; @shared_comp net_sound__descs : Object; var sound_event_group : SoundEventGroup?; is_watched_sound = false)
   if get_sync_time() < cmd.time + MAX_NET_DELAY
-    play_impl(cmd.hash, cmd.pos, cmd.param, net_sound__descs, has(eid, "hero"), sound_event_group)
+    play_impl(cmd.hash, cmd.pos, cmd.param, net_sound__descs, is_watched_sound, sound_event_group)
 
 [es(tag=sound)]
-def play_net_sound_impl_cmd(cmd : CmdPlayNetSound; eid : EntityId; @shared_comp net_sound__descs : Object; var sound_event_group : SoundEventGroup?; transform : float3x4)
+def play_net_sound_impl_cmd(cmd : CmdPlayNetSound; @shared_comp net_sound__descs : Object; var sound_event_group : SoundEventGroup?; transform : float3x4; is_watched_sound = false)
   if get_sync_time() < cmd.time + MAX_NET_DELAY
-    play_impl(cmd.hash, transform[3], cmd.param, net_sound__descs, has(eid, "hero"), sound_event_group)
+    play_impl(cmd.hash, transform[3], cmd.param, net_sound__descs, is_watched_sound, sound_event_group)
 
 [es(tag=sound)]
-def play_net_sound_impl_client(cmd : CmdPlaySound; eid : EntityId; @shared_comp net_sound__descs : Object; var sound_event_group : SoundEventGroup?)
-  play_impl(cmd.hash, cmd.pos, cmd.param, net_sound__descs, has(eid, "hero"), sound_event_group)
+def play_net_sound_impl_client(cmd : CmdPlaySound; @shared_comp net_sound__descs : Object; var sound_event_group : SoundEventGroup?; is_watched_sound = false)
+  play_impl(cmd.hash, cmd.pos, cmd.param, net_sound__descs, is_watched_sound, sound_event_group)
 
 [es(tag=sound)]
-def play_net_sound_impl_client_simple(cmd : CmdPlaySoundSimple; eid : EntityId; @shared_comp net_sound__descs : Object; var sound_event_group : SoundEventGroup?; transform : float3x4)
-  play_impl(cmd.hash, transform[3], 0., net_sound__descs, has(eid, "hero"), sound_event_group)
+def play_net_sound_impl_client_simple(cmd : CmdPlaySoundSimple; @shared_comp net_sound__descs : Object; var sound_event_group : SoundEventGroup?; transform : float3x4; is_watched_sound = false)
+  play_impl(cmd.hash, transform[3], 0., net_sound__descs, is_watched_sound, sound_event_group)
 
 
 // -------------------------------------------------------------
 
 [es(tag=sound)]
-def play_scene_net_sound_impl(cmd : CmdPlaySceneNetSound; eid : EntityId; var sound_event_group : SoundEventGroup?; transform : float3x4)
+def play_scene_net_sound_impl(cmd : CmdPlaySceneNetSound; var sound_event_group : SoundEventGroup?; transform : float3x4; is_watched_sound = false)
   find_query() <| $ [es(REQUIRE=sceneNetSounds)] (@shared_comp net_sound__descs : Object)
     if has_net_sound_desc(cmd.hash, net_sound__descs)
-      play_impl(cmd.hash, transform[3], 0., net_sound__descs, has(eid, "hero"), sound_event_group)
+      play_impl(cmd.hash, transform[3], 0., net_sound__descs, is_watched_sound, sound_event_group)
       return true
     return false

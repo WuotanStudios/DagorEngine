@@ -1,11 +1,13 @@
 options gen2
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options indenting = 4
 
 module base64 shared private
 
-// very much inspired by LIBHV implementation
+//! Base64 encoding and decoding.
+//!
+//! Provides ``base64_encode`` and ``base64_decode`` for converting between
+//! binary data (strings or ``array<uint8>``) and Base64 text representation.
+//! Inspired by the libhv implementation.
 
 require daslib/strings
 
@@ -49,26 +51,29 @@ let base64de <- fixed_array<int>(
 );
 
 def public BASE64_DECODE_OUT_SIZE(s : int) {
+    //! Returns the maximum decoded output size for a Base64 string of length `s`.
     return s / 4 * 3
 }
 
 def public BASE64_ENCODE_OUT_SIZE(s : int) {
+    //! Returns the encoded output size for binary data of length `s`.
     return (s + 2) / 3 * 4
 }
 
 def public base64_decode(_in : string) : tuple<text : string; size : int> {
-    //! decode base64 string
+    //! Decodes a Base64-encoded string. Returns a tuple of the decoded text and its byte length.
     var inscope out : array<uint8>
     var outlen = 0
-    peek_data(_in) <| $(inp) {
+    peek_data(_in) $(inp) {
         outlen = base64_decode(inp, out)
     }
-    return (string(out), outlen)
+    return (text = string(out), size = outlen)
 }
 
 def public base64_decode(_in : string; var out : array<uint8>) : int {
+    //! Decodes a Base64-encoded string into the provided byte array. Returns the decoded byte count, or -1 on error.
     var outlen = 0
-    peek_data(_in) <| $(inp) {
+    peek_data(_in) $(inp) {
         outlen = base64_decode(inp, out)
     }
     return outlen
@@ -81,18 +86,12 @@ def base64_decode(inp : array<uint8> | #; var out : array<uint8>) : int {
     out |> resize(BASE64_DECODE_OUT_SIZE(inlen))
     for (i in range(inp |> length)) {
         var c = 0
-        var s = i % 4
-        var ii = int(inp[i])
-        if (ii == BASE64_PAD) {
-            break
-        }
-        if (ii < BASE64DE_FIRST || ii > BASE64DE_LAST) {
-            return -1
-        }
+        let s = i % 4
+        let ii = int(inp[i])
+        if (ii == BASE64_PAD) break
+        if (ii < BASE64DE_FIRST || ii > BASE64DE_LAST) return -1
         c = base64de[ii - BASE64DE_FIRST]
-        if (c == -1) {
-            return -1
-        }
+        if (c == -1) return -1
         if (s == 0) {
             out[j] = uint8((uint(c) << 2u) & 0xFF)
             continue
@@ -120,22 +119,24 @@ def base64_decode(inp : array<uint8> | #; var out : array<uint8>) : int {
     return j
 }
 
+[temp_string_result]
 def public base64_encode(_inp : string) {
-    //! Encodes a string to base64
+    //! Encodes a string to its Base64 text representation.
     var res : string
-    peek_data(_inp) <| $(inp) {
+    peek_data(_inp) $(inp) {
         res = base64_encode(inp)
     }
     return res
 }
 
 def public base64_encode(inp : array<uint8> | #) {
-    var inlen = inp |> length
+    //! Encodes a byte array to its Base64 text representation.
+    let inlen = inp |> length
     var j = 0
     var out : array<uint8>
     out |> resize(BASE64_ENCODE_OUT_SIZE(inlen))
     for (i in range(inlen)) {
-        var s = i % 3
+        let s = i % 3
         if (s == 0) {
             out[j++] = uint8(base64en[(uint(inp[i]) >> 2u) & 0x3F])
             continue
@@ -148,7 +149,7 @@ def public base64_encode(inp : array<uint8> | #) {
         }
     }
     // move back
-    var i = inlen - 1
+    let i = inlen - 1
     // check the last and add padding
     if ((i % 3) == 0) {
         out[j++] = uint8(base64en[(uint(inp[i]) & 0x3) << 4u])

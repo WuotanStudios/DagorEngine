@@ -9,6 +9,9 @@ DAS_BASE_BIND_ENUM_98(::FontFxType, FontFxType, FFT_NONE, FFT_SHADOW, FFT_GLOW, 
 
 DAS_BASE_BIND_ENUM_98(::BlendMode, BlendMode, NO_BLEND, PREMULTIPLIED, NONPREMULTIPLIED, ADDITIVE);
 
+DAS_BASE_BIND_ENUM_98(::TexFormat, TexFormat, SRGB_IN_UNORM, UNORM, SRGB_DECAL);
+
+
 MAKE_TYPE_FACTORY(GuiVertexTransform, GuiVertexTransform);
 MAKE_TYPE_FACTORY(StdGuiFontContext, StdGuiFontContext);
 
@@ -104,12 +107,13 @@ struct DagorStdGuiRender final : public das::Module
     addBuiltinDependency(lib, require("DagorShaders"));
     addBuiltinDependency(lib, require("DagorDriver3D"));
 
-    addEnumeration(das::make_smart<EnumerationFontFxType>());
-    addEnumeration(das::make_smart<EnumerationBlendMode>());
-    addAnnotation(das::make_smart<GuiContextAnnotation>(lib));
-    addAnnotation(das::make_smart<StdGuiFontContextAnnotation>(lib));
-    addAnnotation(das::make_smart<GuiVertexTransformAnnotation>(lib));
-    addAnnotation(das::make_smart<StdGuiShaderAnnotation>(lib));
+    addEnumeration(new EnumerationFontFxType());
+    addEnumeration(new EnumerationBlendMode());
+    addEnumeration(new EnumerationTexFormat());
+    addAnnotation(new GuiContextAnnotation(lib));
+    addAnnotation(new StdGuiFontContextAnnotation(lib));
+    addAnnotation(new GuiVertexTransformAnnotation(lib));
+    addAnnotation(new StdGuiShaderAnnotation(lib));
 
     das::addExtern<DAS_BIND_FUN(bind_dascript::StdGuiShader_ctor)>(*this, lib, "StdGuiShader_ctor", das::SideEffects::accessExternal,
       "::bind_dascript::StdGuiShader_ctor");
@@ -194,9 +198,9 @@ struct DagorStdGuiRender final : public das::Module
     BIND_MEMBER_SIGNATURE(::StdGuiRender::GuiContext, render_rect_t, "render_rect_t", das::SideEffects::modifyArgument,
       void(::StdGuiRender::GuiContext::*)(Point2, Point2, Point2, Point2));
     BIND_MEMBER_SIGNATURE(::StdGuiRender::GuiContext, set_textures, "set_textures", das::SideEffects::modifyArgument,
-      void(::StdGuiRender::GuiContext::*)(TEXTUREID, d3d::SamplerHandle, TEXTUREID, d3d::SamplerHandle, bool, bool));
+      void(::StdGuiRender::GuiContext::*)(TEXTUREID, d3d::SamplerHandle, TEXTUREID, d3d::SamplerHandle, bool, TexFormat));
     BIND_MEMBER_SIGNATURE(::StdGuiRender::GuiContext, set_texture, "set_texture", das::SideEffects::modifyArgument,
-      void(::StdGuiRender::GuiContext::*)(TEXTUREID, d3d::SamplerHandle, bool, bool));
+      void(::StdGuiRender::GuiContext::*)(TEXTUREID, d3d::SamplerHandle, bool, TexFormat));
     BIND_MEMBER_SIGNATURE(::StdGuiRender::GuiContext, reset_textures, "reset_textures", das::SideEffects::modifyArgument,
       void(::StdGuiRender::GuiContext::*)());
 

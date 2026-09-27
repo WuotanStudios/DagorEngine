@@ -12,6 +12,8 @@
 #include <generic/dag_enumerate.h>
 #include <generic/dag_zip.h>
 #include <atomic>
+#include <math/dag_frustum.h>
+#include <util/dag_strUtil.h>
 
 #include "bvh_context.h"
 #include "bvh_ri_common.h"
@@ -21,9 +23,21 @@
 namespace bvh
 {
 
+enum class PerInstanceDataUse
+{
+  ALLOWED,
+  FORCE_OFF
+};
+
+void before_object_action(ContextId context_id, uint64_t object_id);
+
 extern elem_rules_fn elem_rules;
 
+extern bool bvh_use_hair;
+
 extern dag::AtomicInteger<uint32_t> bvh_id_gen;
+
+static constexpr auto max_light_dist_for_bvh_shadow = 20.0f;
 
 inline uint64_t make_relem_mesh_id(uint32_t res_id, uint32_t lod_id, uint32_t elem_id)
 {
@@ -40,7 +54,8 @@ inline void decompose_relem_mesh_id(uint64_t object_id, uint32_t &res_id, uint32
 inline uint32_t make_dyn_elem_id(uint32_t mesh_no, uint32_t elem_id) { return mesh_no << 14 | elem_id; }
 
 inline eastl::optional<MeshInfo> process_relem(ContextId context_id, const ShaderMesh::RElem &elem,
-  const BufferProcessor *vertex_processor, const Point4 &pos_mul, const Point4 &pos_add, const BSphere3 &bounding, bool is_ri,
+  eastl::optional<const BufferProcessor *> vertex_processor, const Point4 &pos_mul, const Point4 &pos_add, const BSphere3 &bounding,
+  bool is_ri, PerInstanceDataUse per_instance_data_use,
   const RenderableInstanceLodsResource::ImpostorParams *impostor_params = nullptr,
   const RenderableInstanceLodsResource::ImpostorTextures *impostor_textures = nullptr)
 {
@@ -51,6 +66,9 @@ inline eastl::optional<MeshInfo> process_relem(ContextId context_id, const Shade
   static int use_cross_dissolveVarId = get_shader_variable_id("use_cross_dissolve", true);
   if (int use_cross_dissolve = 0; strcmp(elem.mat->getShaderClassName(), "rendinst_baked_impostor") == 0 &&
                                   elem.mat->getIntVariable(use_cross_dissolveVarId, use_cross_dissolve) && use_cross_dissolve)
+    return eastl::nullopt;
+
+  if (strcmp(elem.mat->getShaderClassName(), "rendinst_heightmap_patch") == 0)
     return eastl::nullopt;
 
   bool hasIndices;
@@ -67,52 +85,56 @@ inline eastl::optional<MeshInfo> process_relem(ContextId context_id, const Shade
   G_ASSERT(parser.normalFormat == -1 || parser.normalFormat == VSDT_E3DCOLOR);
   G_ASSERT(parser.colorFormat == -1 || parser.colorFormat == VSDT_E3DCOLOR);
 
+  auto shdlen = strlen(elem.mat->getShaderClassName());
+
+  if (!bvh_use_hair && strncmp(elem.mat->getShaderClassName(), "dynamic_hair", 12) == 0)
+    return eastl::nullopt;
+
+  // rendinst_*_decal
+  if (strncmp(elem.mat->getShaderClassName(), "rendinst_", 9) == 0 &&
+      str_ends_with_c(elem.mat->getShaderClassName(), "_decal", shdlen, 6))
+    return eastl::nullopt;
+
   bool isHeliRotor = strncmp(elem.mat->getShaderClassName(), "helicopter_rotor", 16) == 0;
   bool isTree = strncmp(elem.mat->getShaderClassName(), "rendinst_tree", 13) == 0;
-  bool isTreePerlinLayered = strncmp(elem.mat->getShaderClassName(), "rendinst_tree_perlin_layered", 28) == 0;
   bool isLeaves = strncmp(elem.mat->getShaderClassName(), "rendinst_facing_leaves", 22) == 0;
   bool isFlag = strncmp(elem.mat->getShaderClassName(), "rendinst_flag", 13) == 0;
   bool isDeformed = strcmp(elem.mat->getShaderClassName(), "dynamic_deformed") == 0;
 
-  if (isHeliRotor)
+  if (!vertex_processor.has_value())
   {
-    G_ASSERT(!vertex_processor);
-    vertex_processor = &ProcessorInstances::getHeliRotorVertexProcessor();
-  }
-  else if (isFlag)
-  {
-    G_ASSERT(!vertex_processor);
-    vertex_processor = &ProcessorInstances::getFlagVertexProcessor();
-  }
-  else if (isDeformed)
-  {
-    G_ASSERT(!vertex_processor);
-    vertex_processor = &ProcessorInstances::getDeformedVertexProcessor();
-  }
-  else if (impostor_textures && impostor_params)
-  {
-    G_ASSERT(!vertex_processor);
-    vertex_processor = &ProcessorInstances::getImpostorVertexProcessor();
-  }
-  else if (isLeaves && context_id->has(Features::RIFull))
-  {
-    G_ASSERT(!vertex_processor);
-    vertex_processor = &ProcessorInstances::getLeavesVertexProcessor();
-  }
-  else if (isTree && context_id->has(Features::RIFull))
-  {
-    G_ASSERT(!vertex_processor);
-    vertex_processor = &ProcessorInstances::getTreeVertexProcessor();
-  }
-  else if (is_ri && context_id->has(Features::RIBaked))
-  {
-    G_ASSERT(!vertex_processor);
-    vertex_processor = &ProcessorInstances::getBakeTextureToVerticesProcessor();
-  }
-  else if (!is_ri && !vertex_processor && context_id->has(Features::DynrendRigidBaked))
-  {
-    G_ASSERT(!vertex_processor);
-    vertex_processor = &ProcessorInstances::getBakeTextureToVerticesProcessor();
+    if (isHeliRotor)
+    {
+      vertex_processor = &ProcessorInstances::getHeliRotorVertexProcessor();
+    }
+    else if (isFlag)
+    {
+      vertex_processor = &ProcessorInstances::getFlagVertexProcessor();
+    }
+    else if (isDeformed)
+    {
+      vertex_processor = &ProcessorInstances::getDeformedVertexProcessor();
+    }
+    else if (impostor_textures && impostor_params)
+    {
+      vertex_processor = &ProcessorInstances::getImpostorVertexProcessor();
+    }
+    else if (isLeaves && context_id->hasAny(Features::RIFull))
+    {
+      vertex_processor = &ProcessorInstances::getLeavesVertexProcessor();
+    }
+    else if (isTree && context_id->hasAny(Features::RIFull))
+    {
+      vertex_processor = &ProcessorInstances::getTreeVertexProcessor();
+    }
+    else if (is_ri && context_id->hasAny(Features::RIBaked))
+    {
+      vertex_processor = &ProcessorInstances::getBakeTextureToVerticesProcessor();
+    }
+    else if (!is_ri && context_id->hasAny(Features::DynrendRigidBaked))
+    {
+      vertex_processor = &ProcessorInstances::getBakeTextureToVerticesProcessor();
+    }
   }
 
   auto ib = hasIndices ? elem.vertexData->getIB() : nullptr;
@@ -136,12 +158,16 @@ inline eastl::optional<MeshInfo> process_relem(ContextId context_id, const Shade
   meshInfo.texcoordFormat = parser.texcoordFormat;
   meshInfo.texcoordOffset = parser.texcoordFormat != -1 ? parser.texcoordOffset : MeshInfo::invalidOffset;
   meshInfo.secTexcoordOffset = parser.secTexcoordFormat != -1 ? parser.secTexcoordOffset : MeshInfo::invalidOffset;
-  meshInfo.vertexProcessor = vertex_processor;
+  meshInfo.vertexProcessor = vertex_processor.value_or(nullptr);
   meshInfo.posMul = pos_mul;
   meshInfo.posAdd = pos_add;
   meshInfo.boundingSphere = bounding;
-  meshInfo.hasInstanceColor = (isTree && !isTreePerlinLayered) || impostor_params;
+  meshInfo.hasInstanceColor = (isTree || impostor_params) && per_instance_data_use == PerInstanceDataUse::ALLOWED;
   meshInfo.isHeliRotor = isHeliRotor;
+  meshInfo.ppPositionTextureId = elem.mat->get_texture(7);
+  meshInfo.ppDirectionTextureId = elem.mat->get_texture(8);
+  static int clothNoiseCombinedTexVarId = get_shader_variable_id("clothNoiseCombinedTex", true);
+  elem.mat->getTextureVariable(clothNoiseCombinedTexVarId, meshInfo.clothNoiseCombinedTexTextureId);
 
   if (elem_rules)
     elem_rules(elem, meshInfo, parser, impostor_params, impostor_textures);
@@ -149,8 +175,9 @@ inline eastl::optional<MeshInfo> process_relem(ContextId context_id, const Shade
   return meshInfo;
 }
 
-inline void process_relems(ContextId context_id, const dag::Span<ShaderMesh::RElem> &elems, uint32_t bvh_id, uint32_t lod_ix,
-  const BufferProcessor *vertex_processor, const Point4 &pos_mul, const Point4 &pos_add, const BSphere3 &bounding, bool is_ri,
+inline void process_relems(ContextId context_id, const char *tag, const dag::Span<ShaderMesh::RElem> &elems, uint32_t bvh_id,
+  uint32_t lod_ix, eastl::optional<const BufferProcessor *> vertex_processor, const Point4 &pos_mul, const Point4 &pos_add,
+  const BSphere3 &bounding, bool is_ri, PerInstanceDataUse per_instance_data_use, const RenderableInstanceLodsResource *resource,
   const RenderableInstanceLodsResource::ImpostorParams *impostor_params = nullptr,
   const RenderableInstanceLodsResource::ImpostorTextures *impostor_textures = nullptr)
 {
@@ -161,8 +188,8 @@ inline void process_relems(ContextId context_id, const dag::Span<ShaderMesh::REl
   bool isAnimated = false;
 
   for (auto [i, elem] : enumerate(elems))
-    if (auto meshInfo =
-          process_relem(context_id, elem, vertex_processor, pos_mul, pos_add, bounding, is_ri, impostor_params, impostor_textures))
+    if (auto meshInfo = process_relem(context_id, elem, vertex_processor, pos_mul, pos_add, bounding, is_ri, per_instance_data_use,
+          impostor_params, impostor_textures))
     {
       isAnimated = isAnimated || (meshInfo->vertexProcessor && !meshInfo->vertexProcessor->isOneTimeOnly());
       meshes.push_back(eastl::move(meshInfo.value()));
@@ -172,19 +199,64 @@ inline void process_relems(ContextId context_id, const dag::Span<ShaderMesh::REl
   if (meshes.empty())
     return;
 
+  // filter out trees and flags because we don't want to account them yet
+  BvhType type = !resource->hasTreeOrFlag() ? BvhType::RI : BvhType::None;
+  const AssetNameRef assetName = make_asset_name_ref(resource);
   if (isAnimated)
   {
     for (auto [i, info] : zip(indices, meshes))
     {
+      bool isMeshAnimated = info.vertexProcessor && !info.vertexProcessor->isOneTimeOnly();
       const auto meshId = make_relem_mesh_id(bvh_id, lod_ix, i);
-      add_object(context_id, meshId, {{info}, isAnimated});
+      add_object(context_id, meshId, {{info}, type, isMeshAnimated, tag, assetName});
     }
   }
   else
   {
     const auto meshId = make_relem_mesh_id(bvh_id, lod_ix, 0);
-    add_object(context_id, meshId, {{meshes.begin(), meshes.end()}, isAnimated});
+    add_object(context_id, meshId, {{meshes.begin(), meshes.end()}, type, isAnimated, tag, assetName});
   }
+}
+
+inline bool instance_needs_animation_narrow_phase(const vec4f &world_bounds, const Frustum &frustum, const vec4f &light_direction)
+{
+  static const auto vMaxLightDistForBvhShadow = v_splats(max_light_dist_for_bvh_shadow);
+
+  const vec4f radius = v_splat_w(world_bounds);
+  const vec4f sweep = v_mul(light_direction, vMaxLightDistForBvhShadow);
+  return frustum.testSweptSphere(world_bounds, radius, sweep);
+}
+
+inline bool instance_needs_animation_broad_phase(const vec4f &world_bounds, const Frustum &frustum, const vec4f &light_direction)
+{
+  static const auto vMaxLightDistForBvhShadow = v_splats(max_light_dist_for_bvh_shadow);
+
+  bbox3f worldBoundsBox;
+  vec3f light_direction_scaled = v_mul(light_direction, vMaxLightDistForBvhShadow);
+  vec3f far_point = v_add(world_bounds, light_direction_scaled);
+  worldBoundsBox.bmin = v_min(world_bounds, far_point);
+  worldBoundsBox.bmax = v_max(world_bounds, far_point);
+  worldBoundsBox.bmin = v_sub(worldBoundsBox.bmin, v_splat_w(world_bounds));
+  worldBoundsBox.bmax = v_add(worldBoundsBox.bmax, v_splat_w(world_bounds));
+  auto isVisible = !!frustum.testBoxB(worldBoundsBox.bmin, worldBoundsBox.bmax);
+  return isVisible;
+}
+
+inline bool instance_needs_animation_broad_phase_with_distance_rate(const vec4f &world_bounds, const Frustum &frustum,
+  const vec4f &view_pos, const vec4f &light_direction)
+{
+  bool isVisible = instance_needs_animation_broad_phase(world_bounds, frustum, light_direction);
+
+  if (isVisible)
+  {
+    auto distance = v_length3(v_sub(view_pos, world_bounds));
+    auto rate = v_extract_x(v_mul(v_div(distance, v_splat_w(world_bounds)), V_C_HALF));
+
+    static constexpr float animation_distance_rate = 20;
+    if (rate < animation_distance_rate)
+      return true;
+  }
+  return false;
 }
 
 } // namespace bvh

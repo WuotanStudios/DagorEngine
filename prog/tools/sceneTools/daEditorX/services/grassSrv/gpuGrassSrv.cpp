@@ -2,12 +2,15 @@
 
 #include "gpuGrassSrv.h"
 #include <de3_interface.h>
+#include <de3_dynRenderService.h>
 #include <ioSys/dag_dataBlock.h>
 #include <3d/dag_render.h>
 #include <render/dag_cur_view.h>
 #include <oldEditor/de_interface.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
 #include <vecmath/dag_vecMathDecl.h>
+#include <oldEditor/de_workspace.h>
+#include <util/dag_convar.h>
 
 
 bool RandomGPUGrassRenderHelper::isValid() const { return hmap != nullptr; }
@@ -50,32 +53,63 @@ void GPUGrassService::closeGrass() { grass.reset(); }
 
 void GPUGrassService::createGrass(DataBlock &grass_settings)
 {
-  closeGrass();
-  grass = eastl::make_unique<GPUGrass>();
-  grass->init(grass_settings);
+  if (!DAGORED2->getWorkspace().isUsingDngBasedSceneRender())
+  {
+    closeGrass();
+    grass = eastl::make_unique<GPUGrass>();
+    grass->init(grass_settings);
+  }
+
+  static int unitBBInfoForGrassVarId = get_shader_variable_id("unitBBInfoForGrass", true);
+  ShaderGlobal::set_float4(unitBBInfoForGrassVarId, Color4(-100000.0f, -100000.0f, -100000.0f, 1.0f)); // turn off unit bbox grass
+                                                                                                       // bending
+
   enumerateGrassTypes(grass_settings);
   enumerateGrassDecals(grass_settings);
+
+  if (grassBlock)
+    delete grassBlock;
+  grassBlock = new DataBlock(grass_settings);
+
+  if (auto render = EDITORCORE->queryEditorInterface<IDynRenderService>())
+    render->onGrassCreated(grassBlock);
 }
 
 DataBlock *GPUGrassService::createDefaultGrass()
 {
   enabled = false;
-  DataBlock *result = new DataBlock();
-  result->addReal("grass_grid_size", 0.125);
-  result->addReal("grass_distance", 150);
-  result->addInt("grassMaskResolution", 1024);
-  result->addReal("hor_size_mul", 1.0);
-  DataBlock *types = result->addBlock("grass_types");
+  if (grassBlock)
+    delete grassBlock;
+  grassBlock = new DataBlock();
+  grassBlock->addReal("grass_grid_size", 0.125);
+  grassBlock->addReal("grass_distance", 150);
+  grassBlock->addInt("grassMaskResolution", 1024);
+  grassBlock->addReal("hor_size_mul", 1.0);
+  DataBlock *types = grassBlock->addBlock("grass_types");
   DataBlock *nograss = types->addBlock("nograss");
   nograss->addReal("density_from_weight_mul", 0.0);
   nograss->addReal("density_from_weight_add", 0.0);
-  result->addBlock("decals");
-  enumerateGrassTypes(*result);
-  enumerateGrassDecals(*result);
-  return result;
+  grassBlock->addBlock("decals");
+  enumerateGrassTypes(*grassBlock);
+  enumerateGrassDecals(*grassBlock);
+  if (auto render = EDITORCORE->queryEditorInterface<IDynRenderService>())
+    render->onGrassCreated(grassBlock);
+  return new DataBlock(*grassBlock); // caller assume ownership of the pointer
 }
 
-void GPUGrassService::enableGrass(bool flag) { enabled = flag; }
+DataBlock *GPUGrassService::getSettings() { return grassBlock; }
+
+void GPUGrassService::enableGrass(bool flag)
+{
+  if (DAGORED2->getWorkspace().isUsingDngBasedSceneRender())
+  {
+    extern ConVarT<bool, false> grassRender;
+    extern ConVarT<bool, false> grassPrepass;
+    grassRender.set(flag);
+    grassPrepass.set(flag);
+  }
+  enabled = flag;
+}
 
 void GPUGrassService::beforeRender(Stage stage)
 {
@@ -86,7 +120,11 @@ void GPUGrassService::beforeRender(Stage stage)
   mat44f globtm;
   d3d::getglobtm(globtm);
   Frustum frustum(globtm);
-  grass->generate(frustum, itm.getcol(3), itm.getcol(2), grassHelper);
+  const auto &currentPos = itm.getcol(3);
+  if (smallGrass)
+    grass->generatePerView(GrassView::Main, frustum, currentPos, currentPos, itm.getcol(2), grassHelper);
+  else
+    grass->generate(frustum, currentPos, currentPos, itm.getcol(2), grassHelper);
 }
 
 void GPUGrassService::renderGeometry(Stage stage)
@@ -100,6 +138,34 @@ void GPUGrassService::renderGeometry(Stage stage)
 BBox3 *GPUGrassService::getGrassBbox() { return &grassHelper.box; }
 
 bool GPUGrassService::isGrassEnabled() const { return enabled; }
+
+bool GPUGrassService::isGrassValid() const
+{
+  if (grassTypes.empty() || (grassTypes.size() == 1 && grassTypes[0].name == "nograss"))
+    return false;
+  for (const GPUGrassDecal &decal : grassDecals)
+  {
+    if (decal.channels.empty())
+      continue;
+    for (const auto &channel : decal.channels)
+    {
+      if (channel.second < 1.0)
+        continue;
+      const GPUGrassType *type = nullptr;
+      for (const auto &t : grassTypes)
+        if (t.name == channel.first.c_str())
+        {
+          type = &t;
+          break;
+        }
+      if (!type)
+        continue;
+      if (!type->diffuse.empty() && !type->normal.empty())
+        return true;
+    }
+  }
+  return false;
+}
 
 void GPUGrassService::enumerateGrassTypes(DataBlock &grassBlk)
 {
@@ -247,6 +313,10 @@ void GPUGrassService::invalidate()
   if (grass)
     grass->invalidate();
 }
+
+void GPUGrassService::setIsSmallGrass(bool flag) { smallGrass = flag; }
+
+bool GPUGrassService::isSmallGrass() const { return smallGrass; }
 
 static GPUGrassService srv;
 

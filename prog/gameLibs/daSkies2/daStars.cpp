@@ -39,7 +39,7 @@ bool DaStars::setMoonResourceName(const char *res_name)
   if (!moonTex2)
     return false;
   resetMoonResourceName();
-  moonTex = SharedTexHolder(eastl::move(moonTex2), "stars_moon_tex");
+  moonTex = SharedTexWithShaderVar(eastl::move(moonTex2), "stars_moon_tex");
   ShaderGlobal::set_sampler(get_shader_variable_id("stars_moon_tex_samplerstate", true),
     get_texture_separate_sampler(moonTex.getTexId()));
   return true;
@@ -54,7 +54,6 @@ void DaStars::init(const char *stars, const char *moon)
   stars_lattitudeVarId = get_shader_variable_id("stars_lattitude");
   stars_lstVarId = get_shader_variable_id("stars_lst");
   starsTex = dag::get_tex_gameres(stars, "stars_tex");
-  ShaderGlobal::set_sampler(get_shader_variable_id("stars_tex_samplerstate", true), d3d::request_sampler({}));
   G_ASSERTF(starsTex, "Texture '%s' for stars not found.", stars);
 
   moonSize = 0.02f;
@@ -83,11 +82,11 @@ void DaStars::init(const char *stars, const char *moon)
     starsRendElem.numVert = star_catalog::g_star_count * 4;
     starsRendElem.startIndex = 0;
     starsRendElem.numPrim = star_catalog::g_star_count * 2;
-    starsVb = dag::create_vb(starsRendElem.numVert * starsRendElem.stride, 0, "starsVb");
+    starsVb = dag::create_vb(starsRendElem.numVert * starsRendElem.stride, 0, "starsVb", RESTAG_DASKIES2);
     G_ASSERT(starsVb);
 
-    starsIb = dag::create_ib(starsRendElem.numPrim * 3 * sizeof(uint16_t), 0,
-      "starsIb"); // To be filled on scene change.
+    starsIb = dag::create_ib(starsRendElem.numPrim * 3 * sizeof(uint16_t), 0, "starsIb", RESTAG_DASKIES2); // To be filled on scene
+                                                                                                           // change.
     G_ASSERT(starsIb);
 
     generateStars();
@@ -202,13 +201,13 @@ void DaStars::renderStars(const Driver3dPerspective &persp, float sun_brightness
 
   TIME_D3D_PROFILE(render_stars);
   float stars_lst = calc_lst_hours(julian_day, longtitude);
-  ShaderGlobal::set_real(stars_lattitudeVarId, latitude);
-  ShaderGlobal::set_real(stars_lstVarId, stars_lst);
+  ShaderGlobal::set_float(stars_lattitudeVarId, latitude);
+  ShaderGlobal::set_float(stars_lstVarId, stars_lst);
 
   float starIntensity = (1 - sun_brightness) * stars_intensity_mul;
-  ShaderGlobal::set_real_fast(starIntensityGlobVarId, starIntensity);
+  ShaderGlobal::set_float(starIntensityGlobVarId, starIntensity);
 
-  ShaderGlobal::set_real(starsScaleVarId, 0.001f / (persp.wk > 0 ? persp.wk : 1.3f));
+  ShaderGlobal::set_float(starsScaleVarId, 0.001f / (persp.wk > 0 ? persp.wk : 1.3f));
 
   d3d::setvsrc(0, starsVb.getBuf(), starsRendElem.stride);
   d3d::setind(starsIb.getBuf());
@@ -245,7 +244,7 @@ float DaStars::getMoonIntenisty(const Point3 &origin, const Point3 &moonDir, flo
 void DaStars::setMoonSize(float size)
 {
   moonSize = size;
-  ShaderGlobal::set_real(stars_moon_sizeVarId, moonSize);
+  ShaderGlobal::set_float(stars_moon_sizeVarId, moonSize);
 }
 
 bool DaStars::setMoonVars(const Point3 &origin, const Point3 &moonDir, float moonAgeDay, float sun_brightness)
@@ -258,9 +257,9 @@ bool DaStars::setMoonVars(const Point3 &origin, const Point3 &moonDir, float moo
     return false;
   }
   moonTex.setVar();
-  ShaderGlobal::set_real_fast(stars_moon_intensityVarId, moonIntensity * 0.5);
-  ShaderGlobal::set_color4(stars_moon_dirVarId, moonDir.x, moonDir.y, moonDir.z, moonAgeNorm);
-  ShaderGlobal::set_real(stars_moon_sizeVarId, moonSize);
+  ShaderGlobal::set_float(stars_moon_intensityVarId, moonIntensity * 0.5);
+  ShaderGlobal::set_float4(stars_moon_dirVarId, moonDir.x, moonDir.y, moonDir.z, moonAgeNorm);
+  ShaderGlobal::set_float(stars_moon_sizeVarId, moonSize);
   return true;
 }
 
@@ -280,9 +279,9 @@ void DaStars::renderCelestialObject(TEXTUREID tid, const Point3 &dir, float phas
 {
   TIME_D3D_PROFILE(render_celestial);
   ShaderGlobal::set_texture(moonTex.getVarId(), tid);
-  ShaderGlobal::set_real_fast(stars_moon_intensityVarId, intensity);
-  ShaderGlobal::set_color4(stars_moon_dirVarId, dir.x, dir.y, dir.z, phase);
-  ShaderGlobal::set_real(stars_moon_sizeVarId, size);
+  ShaderGlobal::set_float(stars_moon_intensityVarId, intensity);
+  ShaderGlobal::set_float4(stars_moon_dirVarId, dir.x, dir.y, dir.z, phase);
+  ShaderGlobal::set_float(stars_moon_sizeVarId, size);
   moonElem->setStates(0, true);
   d3d::setvsrc(0, starsVb.getBuf(), starsRendElem.stride);
   d3d::setind(starsIb.getBuf());

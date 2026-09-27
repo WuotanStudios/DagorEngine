@@ -16,8 +16,6 @@
 #define TBL_CLASS_TYPE_MEMBER_MASK ((1u<<TBL_CLASS_TYPE_MEMBER_BITS)-1)
 #define TBL_CLASS_CLASS_MASK ( (~(uint64_t(0))) ^ TBL_CLASS_TYPE_MEMBER_MASK )
 
-#define SQ_FREE_KEY_TYPE SQObjectType(0)
-
 inline SQUnsignedInteger32 sq_float_hash32(float v)
 {
     SQUnsignedInteger32 i;
@@ -25,12 +23,22 @@ inline SQUnsignedInteger32 sq_float_hash32(float v)
     return i ^ (i >> 23);
 }
 
+inline SQUnsignedInteger32 sq_integer_hash32(SQInteger v)
+{
+    SQUnsignedInteger32 i = (SQUnsignedInteger32)(v ^ (v >> 31));
+    i ^= i >> 16;
+    i *= 0x45d9f3bu;
+    i ^= i >> 16;
+    return i;
+}
+
 inline SQHash HashObj(const SQObject &key)
 {
     switch(sq_type(key)) {
         case OT_STRING:     return _string(key)->_hash;
         case OT_FLOAT:      return (SQHash)(sq_float_hash32(_float(key)));
-        case OT_BOOL: case OT_INTEGER:  return (SQHash)((SQInteger)_integer(key));
+        case OT_BOOL:       return (SQHash)((SQInteger)_integer(key));
+        case OT_INTEGER:    return (SQHash)(sq_integer_hash32(_integer(key)));
         default:            return hashptr(key._unVal.pRefCounted);
     }
 }
@@ -43,7 +51,7 @@ private:
     friend struct SQStreamSerializer;
     struct _HashNode
     {
-        _HashNode() { key._type = SQ_FREE_KEY_TYPE; next = NULL; }
+        _HashNode() { key._type = OT_FREE_TABLE_SLOT; next = NULL; }
         SQObjectPtr val;
         SQObjectPtr key;
         _HashNode *next;
@@ -56,6 +64,7 @@ private:
     SQAllocContext _alloc_ctx;
     uint64_t _classTypeId;
     ///////////////////////
+    SQTable *CopyNodes();
     void AllocNodes(SQInteger nSize);
     void Rehash(bool force);
     SQTable(SQSharedState *ss, SQInteger nInitialSize);
@@ -70,6 +79,7 @@ public:
     }
     void Finalize();
     SQTable *Clone();
+    SQTable *CopyNodesResolvingWeakRefs();
     ~SQTable()
     {
         uint32_t cnt = _numofnodes_minus_one + 1;
@@ -105,7 +115,7 @@ public:
         return NULL;
     }
     //for compiler use
-    inline bool GetStr(const SQChar* key,SQInteger keylen,SQObjectPtr &val) const
+    inline bool GetStr(const char* key,SQInteger keylen,SQObjectPtr &val) const
     {
         SQHash hash = _hashstr(key,keylen);
         _HashNode *n = &_nodes[hash & _numofnodes_minus_one];

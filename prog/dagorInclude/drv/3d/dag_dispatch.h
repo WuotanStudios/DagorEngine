@@ -6,10 +6,11 @@
 
 #include <util/dag_inttypes.h>
 #include <drv/3d/dag_consts.h>
+#include <drv/3d/dag_multi_interface.h>
 
 class Sbuffer;
 
-namespace d3d
+namespace d3d _MULTI_INTERFACE
 {
 /**
  * @brief Dispatches a compute shader with the specified thread group dimensions.
@@ -30,13 +31,22 @@ bool dispatch(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_
  * @param args The argument buffer containing the dispatch parameters. The buffer must be created with the
  * d3d::buffers::create_indirect or d3d::buffers::create_ua_indirect methods and Indirect::Dispatch argument.
  * The buffer should contain the following data: uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z.
+ * When the used compute program is a ray gen shader, then the argument type for buffer creation must be
+ * Indirect::DispatchComputeAsRayGen. The data layout for each argument is defined by the raytrace::RayDispatchIndirectArguments
+ * type.
+ *
+ * Preconditions (contract assert on all backends):
+ *   - args != nullptr
+ *   - args->getFlags() & SBCF_BIND_UNORDERED
+ *   - args->getFlags() & SBCF_MISC_DRAWINDIRECT
+ *
  * @param byte_offset The byte offset within the argument buffer (default: 0).
  * @param gpu_pipeline The GPU pipeline to use for dispatching (default: GpuPipeline::GRAPHICS).
  * @warning gpu_pipeline argument doesn't work currently.
  * @return True if the dispatch was successful, false otherwise.
  */
 bool dispatch_indirect(Sbuffer *args, uint32_t byte_offset = 0, GpuPipeline gpu_pipeline = GpuPipeline::GRAPHICS);
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 #if _TARGET_D3D_MULTI
 #include <drv/3d/dag_interface_table.h>

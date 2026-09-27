@@ -5,6 +5,7 @@
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_resetDevice.h>
+#include <3d/dag_preRotation.h>
 #include <workCycle/dag_gameScene.h>
 #include <workCycle/dag_gameSceneRenderer.h>
 #include <image/dag_tga.h>
@@ -87,7 +88,40 @@ bool ScreenShotSystem::makeScreenShot(ScreenShot &info, IHDRDecoder *decoder)
     info.picture = (void *)decoder->LockResult(info.stride, info.w, info.h);
   }
   else
+  {
     info.picture = (void *)lockScreen(info.w, info.h, info.stride, format, info.fastLocked);
+    int angle = prerotation::frame_angle();
+    if ((angle == 90 || angle == 270) && format == d3d::CAPFMT_X8R8G8B8 && info.picture)
+    {
+      void *picture = memalloc(info.w * info.h * 4, tmpmem_ptr());
+      if (!picture)
+      {
+        message(String(128, "Not enough memory: %d needed", info.w * info.h * 4));
+        return false;
+      }
+      info.allocated = true;
+      eastl::swap(info.w, info.h);
+      for (int y = 0; y < info.h; y++)
+      {
+        for (int x = 0; x < info.w; x++)
+        {
+          char *dst = (char *)picture + (y * info.w + x) * 4;
+          char *src;
+          if (angle == 90)
+            src = (char *)info.picture + (x * info.stride + (info.h - y - 1) * 4);
+          else
+            src = (char *)info.picture + ((info.w - x - 1) * info.stride + y * 4);
+          dst[0] = src[0];
+          dst[1] = src[1];
+          dst[2] = src[2];
+          dst[3] = src[3];
+        }
+      }
+      info.stride = info.w * 4;
+      info.picture = picture;
+      unlockScreen(info.fastLocked);
+    }
+  }
   if (!info.picture)
   {
     message(String(128, "Can't make ScreenShot: %s", d3d::get_last_error()));
@@ -190,7 +224,7 @@ bool ScreenShotSystem::makeTexScreenShot(ScreenShot &info, Texture *tex)
   tex->getinfo(ti, 0);
   if (!(ti.cflg & (TEXCF_RTARGET | TEXCF_SYSMEM | TEXCF_UNORDERED | TEXCF_READABLE)))
     logwarn("can't make screenshot of unlockable texture");
-  else if ((ti.cflg & TEXFMT_MASK))
+  else if ((ti.cflg & TEXFMT_MASK) != TEXFMT_DEFAULT && (ti.cflg & TEXFMT_MASK) != TEXFMT_A8B8G8R8)
   {
     logwarn("can't make screenshot of format 0x%x", ti.cflg & TEXFMT_MASK);
   }
@@ -215,6 +249,20 @@ bool ScreenShotSystem::makeTexScreenShot(ScreenShot &info, Texture *tex)
     for (int y = info.h; y > 0; y--, ptr = (char *)ptr + stride, op += info.stride)
       memcpy(op, ptr, info.stride);
     tex->unlockimg();
+
+    if ((ti.cflg & TEXFMT_MASK) == TEXFMT_A8B8G8R8)
+    {
+      char *op = (char *)info.picture;
+      for (int y = info.h; y > 0; y--, op += info.stride)
+      {
+        for (unsigned int pos = 0; pos < info.stride; pos += 4)
+        {
+          char tmp = op[pos];
+          op[pos] = op[pos + 2];
+          op[pos + 2] = tmp;
+        }
+      }
+    }
     return true;
   }
   return false;
@@ -393,7 +441,7 @@ const char *ScreenShotSystem::lastMessage() { return last_error; }
 
 void ScreenShotSystem::setWriteImageCB(write_image_cb cb, const char *ext)
 {
-  if (!cb || !file_ext)
+  if (!cb || file_ext.empty())
   {
     writeImageCb = save_tga32_shot;
     file_ext = "tga";

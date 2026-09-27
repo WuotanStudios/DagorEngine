@@ -15,9 +15,10 @@
 #include "image_resource.h"
 #include "async_completion_state.h"
 #include "globals.h"
-#include "translate_d3d_to_vk.h"
+#include <drv/shadersMetaData/spirv/translate_d3d_to_vk.h>
 #include "basetexture.h"
 #include "vk_format_utils.h"
+#include <validation/texture.h>
 
 namespace drv3d_vulkan
 {
@@ -40,7 +41,7 @@ struct BaseTexParams
   bool isCubeMap() const { return (type == D3DResourceType::CUBETEX) || (type == D3DResourceType::CUBEARRTEX); }
   bool isVolume() const { return type == D3DResourceType::VOLTEX; }
   bool is2DTex() const { return type == D3DResourceType::TEX; }
-  bool isGPUWritable() const { return flg & (TEXCF_RTARGET | TEXCF_UNORDERED); }
+  bool isGPUWritable() const { return flg & (TEXCF_RTARGET | TEXCF_UNORDERED | TEXCF_UPDATE_DESTINATION); }
   bool isStagingPermanent() const { return flg & (TEXCF_READABLE | TEXCF_SYSMEM | TEXCF_DYNAMIC); }
   bool isStagingDiscardable() const { return flg & TEXCF_DYNAMIC; }
 
@@ -155,7 +156,7 @@ struct BaseTex final : public D3dResourceNameImpl<BaseTexture>
   void setInitialImageViewState()
   {
     // this fields not gonna change over texture lifetime
-    imageViewCache.setFormat(pars.allowSrgbRead() ? getFormat() : getFormat().getLinearVariant());
+    imageViewCache.setFormat(pars.allowSrgbRead() ? getFormat().getSRGBVariant() : getFormat().getLinearVariant());
     imageViewCache.isArray = pars.isArray();
     imageViewCache.isCubemap = pars.isCubeMap();
     imageViewCache.setArrayBase(0);
@@ -204,21 +205,9 @@ struct BaseTex final : public D3dResourceNameImpl<BaseTexture>
 #endif
 
   /// bindless streaming tracking
-
-  // stub textures don't have unique image, so we can't swap them in bindless slots without additional data
-  dag::Vector<uint32_t> bindlessStubSwapQueue;
-
-  void enqueueBindlessStubSwap(uint32_t slot)
-  {
-    for (uint32_t i : bindlessStubSwapQueue)
-    {
-      if (i == slot)
-        return;
-    }
-    bindlessStubSwapQueue.push_back(slot);
-  }
-
   void updateBindlessViewsForStreamedTextures();
+  BaseTex *getForBindless();
+
   void onDeviceReset();
   void afterDeviceReset();
 
@@ -261,6 +250,11 @@ struct BaseTex final : public D3dResourceNameImpl<BaseTexture>
   D3DResourceType getType() const override { return pars.type; }
   bool isCubeArray() const override { return getType() == D3DResourceType::CUBEARRTEX; }
   int level_count() const override { return pars.levels; }
+
+  uint32_t getFixedSize() const
+  {
+    return fmt.calculateImageSize(pars.w, pars.h, pars.getDepthSlices(), pars.levels) * pars.getArrayCount();
+  }
 
   uint32_t getSize() const override
   {
@@ -314,10 +308,6 @@ struct BaseTex final : public D3dResourceNameImpl<BaseTexture>
 
   int generateMips() override;
   int update(BaseTexture *src) override;
-  int updateSubRegion(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
-    int dest_subres_idx, int dest_x, int dest_y, int dest_z) override;
-  int updateSubRegionNoOrder(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
-    int dest_subres_idx, int dest_x, int dest_y, int dest_z) override;
 
   int lockimg(void **p, int &stride_bytes, int level = 0, unsigned flags = TEXLOCK_DEFAULT) override
   {
@@ -356,16 +346,18 @@ struct BaseTex final : public D3dResourceNameImpl<BaseTexture>
     pars.updateLevelsIfNeeded();
     D3D_CONTRACT_ASSERT(pars.levels > 0);
 
+    setTexName(stat_name);
+    check_texture_srgb_format(pars.flg, getTexName());
     fmt = FormatStore::fromCreateFlags(pars.flg);
     maxMipLevel = 0;
     minMipLevel = pars.levels - 1;
-    setTexName(stat_name);
 
     setInitialImageViewState();
   }
 
-  ~BaseTex() { finishReadback(); }
+  ~BaseTex() { tryFinishReadbackWithoutResultWait(); }
 
+  void useExternalResource(Image *resource);
   static Texture *wrapVKImage(VkImage tex_res, ResourceBarrier current_state, int width, int height, int layers, int mips,
     const char *name, int flg);
 
@@ -390,6 +382,8 @@ private:
   /// readback helpers
   AsyncCompletionState readback;
   void finishReadback();
+  // when readback result will not be used - try to take this in account and do faster finishing
+  void tryFinishReadbackWithoutResultWait();
   void startReadback(int mip, int slice, int staging_offset);
 
   /// staging buffer
@@ -406,6 +400,9 @@ private:
   }
   void useStaging(int32_t w, int32_t h, int32_t d, int32_t levels, uint16_t arrays, bool temporary = false);
   void destroyStaging();
+
+  void copyImage(Image *dst, const VkImageCopy *regions, uint32_t region_count, uint32_t src_mip, uint32_t dst_mip, uint32_t mip_count,
+    bool unordered = false);
 };
 
 static inline BaseTex *getbasetex(/*const*/ BaseTexture *t) { return t ? (BaseTex *)t : nullptr; }

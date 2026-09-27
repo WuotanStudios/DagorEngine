@@ -9,9 +9,12 @@
 #include <osApiWrappers/dag_localConv.h>
 #include <drv/3d/dag_renderTarget.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
-#include <3d/dag_gpuConfig.h>
 
+#if _TARGET_PC || _TARGET_IOS || _TARGET_ANDROID
+#include <folders/folders.h>
+#endif
 
 #if USE_CPU_FEATURES
 #include <cpu_features/include/cpu_features_macros.h>
@@ -93,6 +96,7 @@ extern const char *macosx_get_location();
 #include <unistd.h>
 #include <osApiWrappers/dag_files.h>
 #include <android/android_platform.h>
+#include <android/android_network.h>
 #include <android/and_java_helpers.h>
 #endif
 
@@ -134,19 +138,18 @@ void dump_sysinfo()
   int freeVirtualMemMb = 0;
   get_virtual_memory_free(freeVirtualMemMb);
 
-  const GpuUserConfig &gpuCfg = d3d_get_gpu_cfg();
-  DagorDateTime gpuDriverDate = d3d::get_gpu_driver_date(gpuCfg.primaryVendor);
+  auto &info = d3d::get_driver_desc().info;
+  const DagorDateTime &gpuDriverDate = info.driverDate;
 
-  debug("SYSINFO: \"%s\",\"%s\",\"%s\",\"%d/%02d/%02d %d.%d.%d.%d\",\"%s\",\"%s\",%d,%lld", get_platform_string_id(), os.str(),
-    d3d::get_device_name(), gpuDriverDate.year, gpuDriverDate.month, gpuDriverDate.day, gpuCfg.driverVersion[0],
-    gpuCfg.driverVersion[1], gpuCfg.driverVersion[2], gpuCfg.driverVersion[3], d3d::get_driver_name(), cpu.str(), cpuCores,
-    freeVirtualMemMb);
+  debug("SYSINFO: \"%s\",\"%s\",\"%s\",\"%d/%02d/%02d %s\",\"%s\",\"%s\",%d,%lld", get_platform_string_id(), os.str(),
+    d3d::get_device_name(), gpuDriverDate.year, gpuDriverDate.month, gpuDriverDate.day, info.driverVersion.toString().c_str(),
+    d3d::get_driver_name(), cpu.str(), cpuCores, freeVirtualMemMb);
   debug("SYSINFO_PLATFORM: %s", get_platform_string_id());
   debug("SYSINFO_OS: %s", os.str());
   debug("SYSINFO_GPU_NAME: \"%s\"", d3d::get_device_name());
-  debug("SYSINFO_GPU_VENDOR: %s", d3d_get_vendor_name(gpuCfg.primaryVendor));
-  debug("SYSINFO_GPU_DRIVER: %d/%02d/%02d %d.%d.%d.%d", gpuDriverDate.year, gpuDriverDate.month, gpuDriverDate.day,
-    gpuCfg.driverVersion[0], gpuCfg.driverVersion[1], gpuCfg.driverVersion[2], gpuCfg.driverVersion[3]);
+  debug("SYSINFO_GPU_VENDOR: %s", d3d_get_vendor_name(info.vendor));
+  debug("SYSINFO_GPU_DRIVER: %d/%02d/%02d %s", gpuDriverDate.year, gpuDriverDate.month, gpuDriverDate.day,
+    info.driverVersion.toString().c_str());
   debug("SYSINFO_GPU_API: \"%s\"", d3d::get_driver_name());
   debug("SYSINFO_CPU_INFO: \"%s\", freq=%s", cpu.str(), cpuFreq, cpuCores);
   debug("SYSINFO_CPU_VENDOR: \"%s\"", cpuVendor);
@@ -176,6 +179,46 @@ void dump_sysinfo()
   String soc;
   if (systeminfo::get_soc_info(soc))
     debug("SYSINFO_SOC: \"%s\"", soc);
+  int memPageSize = systeminfo::get_mem_page_size();
+  if (memPageSize > 0)
+    debug("SYSINFO_PAGESIZE: %d", memPageSize);
+
+#if _TARGET_PC || _TARGET_IOS || _TARGET_ANDROID
+  String diskPath = folders::get_exe_dir();
+  if (diskPath.empty())
+  {
+#if _TARGET_ANDROID
+    diskPath = folders::get_gamedata_dir();
+#else
+    diskPath = folders::get_game_dir();
+#endif
+  }
+#else
+  String diskPath; // consoles report their own storage and ignore the path
+#endif
+
+  // both lines always print (type on PC only), so a missing line means an old client and not a failed query
+#if _TARGET_PC
+  DiskType diskType = DiskType::Unknown;
+  systeminfo::get_disk_type(diskPath.c_str(), diskType);
+  debug("SYSINFO_DISK_TYPE: \"%s\"", systeminfo::to_string(diskType));
+#endif
+
+  uint64_t diskFreeBytes = 0, diskTotalBytes = 0;
+  if (!systeminfo::get_disk_space(diskPath.c_str(), diskFreeBytes, diskTotalBytes))
+    debug("SYSINFO_DISK_FREE: unknown");
+  else
+  {
+    int freeGb = int(diskFreeBytes / (1024ull * 1024ull * 1024ull));
+    if (diskTotalBytes)
+    {
+      int totalGb = int(diskTotalBytes / (1024ull * 1024ull * 1024ull));
+      int freePercent = int(diskFreeBytes * 100ull / diskTotalBytes);
+      debug("SYSINFO_DISK_FREE: %dGB free of %dGB (%d%%)", freeGb, totalGb, freePercent);
+    }
+    else
+      debug("SYSINFO_DISK_FREE: %dGB free", freeGb);
+  }
 }
 
 void dump_dll_names()
@@ -288,20 +331,24 @@ String get_model_by_cpu(const char *cpu)
   return returnDefault("Unknown iOS device");
 }
 
+#else
+String get_model_by_cpu(const char *cpu) { return String(cpu); }
+#endif
+
 int get_network_connection_type()
 {
   // -1 -- Unknown
   // 0 -- Not connected
   // 1 -- Cellular
   // 2 -- Wi-Fi
+#if _TARGET_IOS
   return ios_get_network_connection_type();
-}
-
+#elif _TARGET_ANDROID
+  return android::platform::get_connection_type();
 #else
-String get_model_by_cpu(const char *cpu) { return String(cpu); }
-int get_network_connection_type() { return -1; }
-
+  return -1;
 #endif
+}
 
 
 const char *to_string(ThermalStatus status)
@@ -316,6 +363,18 @@ const char *to_string(ThermalStatus status)
     case ThermalStatus::Critical: return "Critical";
     case ThermalStatus::Emergency: return "Emergency";
     case ThermalStatus::Shutdown: return "Shutdown";
+    default: return "Unknown";
+  }
+}
+
+const char *to_string(DiskType disk_type)
+{
+  switch (disk_type)
+  {
+    case DiskType::Hdd: return "HDD";
+    case DiskType::Ssd: return "SSD";
+    case DiskType::Remote: return "Remote";
+    case DiskType::RamDisk: return "RamDisk";
     default: return "Unknown";
   }
 }

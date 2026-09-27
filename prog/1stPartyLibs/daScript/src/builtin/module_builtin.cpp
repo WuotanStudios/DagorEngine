@@ -68,18 +68,21 @@ namespace das
     IMPLEMENT_OP2_POLICY(BoolXor, Bool, bool);
 
 #define ADD_NUMERIC_CASTS(TYPE,CTYPE)                                                                               \
-    addFunction ( make_smart<BuiltInFn<SimNode_Zero,CTYPE>>(#TYPE,lib,#CTYPE,false) );                             \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,float>,CTYPE,float>>(#TYPE,lib,#CTYPE,false) );          \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,double>,CTYPE,double>>(#TYPE,lib,#CTYPE,false) );        \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,int32_t>,CTYPE,int32_t>>(#TYPE,lib,#CTYPE,false) );      \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,uint32_t>,CTYPE,uint32_t>>(#TYPE,lib,#CTYPE,false) );    \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,Bitfield>,CTYPE,Bitfield>>(#TYPE,lib,#CTYPE,false) );    \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,int8_t>,CTYPE,int8_t>>(#TYPE,lib,#CTYPE,false) );        \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,uint8_t>,CTYPE,uint8_t>>(#TYPE,lib,#CTYPE,false) );      \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,int16_t>,CTYPE,int16_t>>(#TYPE,lib,#CTYPE,false) );      \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,uint16_t>,CTYPE,uint16_t>>(#TYPE,lib,#CTYPE,false) );    \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,int64_t>,CTYPE,int64_t>>(#TYPE,lib,#CTYPE,false) );      \
-    addFunction ( make_smart<BuiltInFn<SimNode_Cast<CTYPE,uint64_t>,CTYPE,uint64_t>>(#TYPE,lib,#CTYPE,false) );
+    addFunction ( (new BuiltInFn<SimNode_Zero,CTYPE>(#TYPE,lib,#CTYPE,false)) );                             \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,float>,CTYPE,float>(#TYPE,lib,#CTYPE,false)) );          \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,double>,CTYPE,double>(#TYPE,lib,#CTYPE,false)) );        \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,int32_t>,CTYPE,int32_t>(#TYPE,lib,#CTYPE,false)) );      \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,uint32_t>,CTYPE,uint32_t>(#TYPE,lib,#CTYPE,false)) );    \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,Bitfield>,CTYPE,Bitfield>(#TYPE,lib,#CTYPE,false)) );    \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,Bitfield8>,CTYPE,Bitfield8>(#TYPE,lib,#CTYPE,false)) );    \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,Bitfield16>,CTYPE,Bitfield16>(#TYPE,lib,#CTYPE,false)) );    \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,Bitfield64>,CTYPE,Bitfield64>(#TYPE,lib,#CTYPE,false)) );    \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,int8_t>,CTYPE,int8_t>(#TYPE,lib,#CTYPE,false)) );        \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,uint8_t>,CTYPE,uint8_t>(#TYPE,lib,#CTYPE,false)) );      \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,int16_t>,CTYPE,int16_t>(#TYPE,lib,#CTYPE,false)) );      \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,uint16_t>,CTYPE,uint16_t>(#TYPE,lib,#CTYPE,false)) );    \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,int64_t>,CTYPE,int64_t>(#TYPE,lib,#CTYPE,false)) );      \
+    addFunction ( (new BuiltInFn<SimNode_Cast<CTYPE,uint64_t>,CTYPE,uint64_t>(#TYPE,lib,#CTYPE,false)) );
 
 
 #define ADD_NUMERIC_LIMITS(TYPENAME,CTYPE)  \
@@ -95,8 +98,6 @@ namespace das
 
 #define ADD_NUMERIC_LIMITS_EX_UNSIGNED(TYPENAME,CONSTNAME,CTYPE)  \
     addConstant<CTYPE>(*this, #TYPENAME "_MAX", (CTYPE)CONSTNAME##_MAX);
-
-    void verifyOptions();
 
     Module_BuiltIn::Module_BuiltIn() : Module("$") {
         DAS_PROFILE_SECTION("Module_Builtin");
@@ -119,6 +120,10 @@ namespace das
         // storage
         ADD_NUMERIC_CASTS(int8, int8_t);
         ADD_NUMERIC_CASTS(int16, int16_t);
+        // scalar float16 <-> float converts — the floor for literals, printers, and JIT
+        // const lowering; the full numeric cast matrix lands with the fp16 operator wave
+        addFunction ( (new BuiltInFn<SimNode_Cast<float16_t,float>,float16_t,float>("float16",lib,"float16_t",false)) );
+        addFunction ( (new BuiltInFn<SimNode_Cast<float,float16_t>,float,float16_t>("float",lib,"float",false)) );
         ADD_NUMERIC_CASTS(uint8, uint8_t);
         ADD_NUMERIC_CASTS(uint16, uint16_t);
         // int32
@@ -141,6 +146,67 @@ namespace das
         ADD_NUMERIC_CASTS(bitfield, Bitfield);
         addFunctionBasic<Bitfield,uint32_t>(*this,lib);
         addFunctionBitLogic<Bitfield,uint32_t>(*this,lib);
+        ADD_NUMERIC_CASTS(bitfield8, Bitfield8);
+        ADD_NUMERIC_CASTS(bitfield16, Bitfield16);
+        ADD_NUMERIC_CASTS(bitfield64, Bitfield64);
+        addFunctionBasic<Bitfield64,uint64_t>(*this,lib);
+        addFunctionBitLogic<Bitfield64,uint64_t>(*this,lib);
+        // bitfield 8 operations
+        addExtern<DAS_BIND_FUN(__bitfield8_eq)>(*this, lib, "==",
+            SideEffects::none, "__bitfield8_eq")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield8_neq)>(*this, lib, "!=",
+            SideEffects::none, "__bitfield8_neq")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield8_not)>(*this, lib, "~",
+            SideEffects::none, "__bitfield8_not")
+                ->args({"value"});
+        addExtern<DAS_BIND_FUN(__bitfield8_and)>(*this, lib, "&",
+            SideEffects::none, "__bitfield8_and")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield8_or)>(*this, lib, "|",
+            SideEffects::none, "__bitfield8_or")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield8_xor)>(*this, lib, "^",
+            SideEffects::none, "__bitfield8_xor")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield8_setand)>(*this, lib, "&=",
+            SideEffects::modifyArgument, "__bitfield8_setand")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield8_setor)>(*this, lib, "|=",
+            SideEffects::modifyArgument, "__bitfield8_setor")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield8_setxor)>(*this, lib, "^=",
+            SideEffects::modifyArgument, "__bitfield8_setxor")
+                ->args({"left","right"});
+        // bitfield 16 operations
+        addExtern<DAS_BIND_FUN(__bitfield16_eq)>(*this, lib, "==",
+            SideEffects::none, "__bitfield16_eq")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield16_neq)>(*this, lib, "!=",
+            SideEffects::none, "__bitfield16_neq")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield16_not)>(*this, lib, "~",
+            SideEffects::none, "__bitfield16_not")
+                ->args({"value"});
+        addExtern<DAS_BIND_FUN(__bitfield16_and)>(*this, lib, "&",
+            SideEffects::none, "__bitfield16_and")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield16_or)>(*this, lib, "|",
+            SideEffects::none, "__bitfield16_or")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield16_xor)>(*this, lib, "^",
+            SideEffects::none, "__bitfield16_xor")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield16_setand)>(*this, lib, "&=",
+            SideEffects::modifyArgument, "__bitfield16_setand")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield16_setor)>(*this, lib, "|=",
+            SideEffects::modifyArgument, "__bitfield16_setor")
+                ->args({"left","right"});
+        addExtern<DAS_BIND_FUN(__bitfield16_setxor)>(*this, lib, "^=",
+            SideEffects::modifyArgument, "__bitfield16_setxor")
+                ->args({"left","right"});
         // int64
         addFunctionBasic<int64_t>(*this,lib);
         addFunctionNumericWithMod<int64_t>(*this,lib);
@@ -176,8 +242,40 @@ namespace das
         addEquNeqVal<uint8_t>(*this,lib);
         addEquNeqVal<int16_t>(*this,lib);
         addEquNeqVal<uint16_t>(*this,lib);
+        // 16/8-bit lattice: equality is elementwise all-lanes via the C++ operators
+        // (fp16 lanes promote-compare, so -0 == +0 and NaN != NaN hold per lane)
+        addEquNeqVal<float16_t>(*this,lib);
+        addEquNeqVal<half2>(*this,lib);
+        addEquNeqVal<half3>(*this,lib);
+        addEquNeqVal<half4>(*this,lib);
+        addEquNeqVal<half8>(*this,lib);
+        addEquNeqVal<short2>(*this,lib);
+        addEquNeqVal<short3>(*this,lib);
+        addEquNeqVal<short4>(*this,lib);
+        addEquNeqVal<short8>(*this,lib);
+        addEquNeqVal<ushort2>(*this,lib);
+        addEquNeqVal<ushort3>(*this,lib);
+        addEquNeqVal<ushort4>(*this,lib);
+        addEquNeqVal<ushort8>(*this,lib);
+        addEquNeqVal<byte2>(*this,lib);
+        addEquNeqVal<byte3>(*this,lib);
+        addEquNeqVal<byte4>(*this,lib);
+        addEquNeqVal<byte8>(*this,lib);
+        addEquNeqVal<byte16>(*this,lib);
+        addEquNeqVal<ubyte2>(*this,lib);
+        addEquNeqVal<ubyte3>(*this,lib);
+        addEquNeqVal<ubyte4>(*this,lib);
+        addEquNeqVal<ubyte8>(*this,lib);
+        addEquNeqVal<ubyte16>(*this,lib);
         // misc types
         addMiscTypes(lib);
+        // `half` spells float16 without reserving the identifier (audit: `half` is a common
+        // local name — 107 uses in-tree; an alias coexists with same-named locals)
+        {
+            auto halfT = new TypeDecl(Type::tFloat16);
+            halfT->alias = "half";
+            addAlias(halfT);
+        }
         // VECTOR & MATRIX TYPES
         addVectorTypes(lib);
         addVectorCtor(lib);
@@ -188,10 +286,6 @@ namespace das
         addRuntimeSort(lib);
         // TIME
         addTime(lib);
-        // NOW, for the builtin module
-        appendCompiledFunctions();
-        // lets verify options (it is here because its the builtin module)
-        verifyOptions();
         // lets verify all names
         uint32_t verifyFlags = uint32_t(VerifyBuiltinFlags::verifyAll);
         verifyFlags &= ~VerifyBuiltinFlags::verifyGlobals;      // we skip globals due to INT_MAX etc

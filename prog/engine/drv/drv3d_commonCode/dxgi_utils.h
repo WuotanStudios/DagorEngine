@@ -3,16 +3,19 @@
 
 #if _TARGET_PC_WIN
 
+#include <osApiWrappers/dag_versionQuery.h>
 #include <supp/dag_comPtr.h>
+#include <util/dag_string.h>
 
-#include <EASTL/utility.h>
 #include <EASTL/optional.h>
+#include <EASTL/utility.h>
 
-class String;
-struct IDXGIOutput;
-struct IDXGIFactory1;
+#include <dxgi1_6.h>
+#include <Windows.h>
 
-String get_monitor_name_from_output(IDXGIOutput *pOutput);
+
+String get_name(IDXGIOutput *pOutput);
+String get_name(const DXGI_OUTPUT_DESC &desc);
 
 /* Returns with the monitor's ptr if it exists with the given name,
  otherwise returns with nullptr.
@@ -26,8 +29,29 @@ ComPtr<IDXGIOutput> get_output_monitor_by_name_or_default(IDXGIFactory1 *factory
 /* Returns with the primary monitor's pointer if it's available. */
 ComPtr<IDXGIOutput> get_default_monitor(IDXGIFactory1 *factory);
 
+DISPLAYCONFIG_RATIONAL get_refresh_rate(IDXGIOutput *output);
+DISPLAYCONFIG_RATIONAL get_refresh_rate(const DXGI_OUTPUT_DESC &desc);
+
 bool resolutions_have_same_ratio(eastl::pair<uint32_t, uint32_t> l_res, eastl::pair<uint32_t, uint32_t> r_res);
 
 eastl::optional<eastl::pair<uint32_t, uint32_t>> get_recommended_resolution(IDXGIOutput *dxgi_output);
 
+DriverVersion get_driver_version_from_adapter(IDXGIAdapter *adapter);
+
+// Adapter that the DX12 support probe looked at, for user facing messages. Filled for every status the probe
+// returns after it found a hardware adapter (OUTDATED_DRIVER, BLACKLISTED_DRIVER, INSUFFICIENT_DEVICE,
+// FULL_SUPPORT); left at the defaults for OUTDATED_OS and NO_DEVICE_FOUND.
+struct ProbedAdapterInfo
+{
+  String name;
+  uint32_t vendorId = 0;
+  uint32_t deviceId = 0;
+  DriverVersion driverVersion{};
+  // for a blacklisted driver: a newer driver without the defect exists, so the user can update instead of rolling back
+  bool fixedDriverAvailable = true;
+};
+
+DXGI_GPU_PREFERENCE get_gpu_preference_from_registry();
+
+bool is_software_device(const DXGI_ADAPTER_DESC1 &desc);
 #endif

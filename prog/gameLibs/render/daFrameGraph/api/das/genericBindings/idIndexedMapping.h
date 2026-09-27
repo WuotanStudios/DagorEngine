@@ -40,7 +40,7 @@ struct typeFactory<IdIndexedMapping<K, V>>
     {
       auto keyDeclT = makeType<K>(library);
       auto valDeclT = makeType<V>(library);
-      auto ann = make_smart<ManagedVectorAnnotation<VT>>(declN, const_cast<ModuleLibrary &>(library));
+      auto ann = new ManagedVectorAnnotation<VT>(declN, const_cast<ModuleLibrary &>(library));
       ann->cppName = "IdIndexedMapping<" + describeCppType(keyDeclT) + ", " + describeCppType(valDeclT) + ">";
       auto mod = library.front();
       mod->addAnnotation(ann);
@@ -48,7 +48,7 @@ struct typeFactory<IdIndexedMapping<K, V>>
       addExtern<DAS_BIND_FUN((id_indexed_mapping_get<K, V>)), SimNode_ExtFuncCallRef>(*mod, library, //
         "[]", SideEffects::modifyArgument, "id_indexed_mapping_get")
         ->generated = true;
-      addExtern<DAS_BIND_FUN((id_indexed_mapping_get<K, V>))>(*mod, library, //
+      addExtern<DAS_BIND_FUN((id_indexed_mapping_get<K, V>)), SimNode_ExtFuncCallRef>(*mod, library, //
         "get", SideEffects::modifyArgument, "id_indexed_mapping_get")
         ->generated = true;
     }

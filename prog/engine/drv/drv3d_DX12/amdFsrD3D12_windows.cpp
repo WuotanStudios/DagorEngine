@@ -1,66 +1,124 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <amdFsr.h>
+#include "amdFsr.h"
 #include <amdFsr3Helpers.h>
 
+#include "device.h"
 #include "driver_win.h"
+#include "pipeline_cache.h"
+#include "swapchain.h"
 
 #include <drv/3d/dag_commands.h>
-#include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_resetDevice.h>
-#include <ioSys/dag_dataBlock.h>
+#include <osApiWrappers/dag_atomic.h>
 #include <osApiWrappers/dag_dynLib.h>
-#include <memory/dag_framemem.h>
+#include <osApiWrappers/dag_versionQuery.h>
 #include <drv_log_defs.h>
 #include <3d/gpuLatency.h>
 #include <supp/dag_comPtr.h>
 #include <util/dag_finally.h>
 
-#include <dx12/ffx_api_dx12.hpp>
-#include <dx12/ffx_api_framegeneration_dx12.hpp>
-#include <ffx_framegeneration.hpp>
-#include <ffx_upscale.hpp>
+#include <dx12/ffx_api_dx12.h>
+#include <dx12/ffx_api_framegeneration_dx12.h>
+#include <ffx_framegeneration.h>
+#include <ffx_upscale.h>
 
-void get_fg_initializers(DXGIFactory *&factory, DXGISwapChain *&swapchain, ID3D12CommandQueue *&graphicsQueue);
-void shutdown_internal_swapchain();
-bool adopt_external_swapchain(DXGISwapChain *swapchain);
-void create_default_swapchain();
+#include <EASTL/fixed_vector.h>
 
+ComPtr<DXGISwapChain> get_fg_swapchain();
 
 namespace amd
 {
-
-static inline FfxApiResource ffx_get_resource(void *texture, uint32_t state)
+namespace
 {
-  FfxApiResource apiRes = {};
-  if (!texture)
-    return apiRes;
+FfxApiResource ffx_get_resource(void *texture, uint32_t state)
+{
+  if (texture)
+    return ffxApiGetResourceDX12((ID3D12Resource *)texture, state);
 
-  apiRes = ffxApiGetResourceDX12((ID3D12Resource *)texture, state);
-  return apiRes;
+  return {};
 }
 
-inline FfxApiSurfaceFormat convert(DXGI_FORMAT format)
+uint32_t convert(DXGI_FORMAT format)
 {
   switch (format)
   {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return FFX_API_SURFACE_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_UINT: return FFX_API_SURFACE_FORMAT_R32G32B32A32_UINT;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R32G32_FLOAT: return FFX_API_SURFACE_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT: return FFX_API_SURFACE_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    case DXGI_FORMAT_R32_UINT: return FFX_API_SURFACE_FORMAT_R32_UINT;
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+    case DXGI_FORMAT_R8_UINT: return FFX_API_SURFACE_FORMAT_R8_UINT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R11G11B10_FLOAT: return FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return FFX_API_SURFACE_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB;
+    case DXGI_FORMAT_R8G8B8A8_SNORM: return FFX_API_SURFACE_FORMAT_R8G8B8A8_SNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return FFX_API_SURFACE_FORMAT_B8G8R8A8_TYPELESS;
     case DXGI_FORMAT_B8G8R8A8_UNORM: return FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB;
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT: return FFX_API_SURFACE_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R16G16_UINT: return FFX_API_SURFACE_FORMAT_R16G16_UINT;
+    case DXGI_FORMAT_R8G8_TYPELESS:
+    case DXGI_FORMAT_R8G8_UINT: return FFX_API_SURFACE_FORMAT_R8G8_UINT;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_FLOAT: return FFX_API_SURFACE_FORMAT_R16_FLOAT;
+    case DXGI_FORMAT_R16_UINT: return FFX_API_SURFACE_FORMAT_R16_UINT;
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_UNORM: return FFX_API_SURFACE_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R16_SNORM: return FFX_API_SURFACE_FORMAT_R16_SNORM;
+    case DXGI_FORMAT_R8_TYPELESS:
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_A8_UNORM: return FFX_API_SURFACE_FORMAT_R8_UNORM;
     default: G_ASSERT(false); return FFX_API_SURFACE_FORMAT_UNKNOWN;
   }
 }
 
-class FSRD3D12Win;
+bool verify_dll_version(const char *dll, LibraryVersion version)
+{
+  if (auto queriedVersion = get_library_version(dll))
+  {
+    return version == queriedVersion;
+  }
 
-FSRD3D12Win *fSRD3D12Win = nullptr; // With this only one FSR instance is allowed. When this will became a problem, please fix it
+  return true;
+};
+
+} // namespace
+
+FSRD3D12 *g_fsrD3D12 = nullptr; // With this only one FSR instance is allowed. When this will became a problem, please fix it
 
 // On windows, we use FSR3.1
-class FSRD3D12Win final : public FSR
+class FSRD3D12::Impl
 {
 public:
-  FSRD3D12Win()
+  using ContextArgs = FSR::ContextArgs;
+  using UpscalingMode = FSR::UpscalingMode;
+  using UpscalingPlatformArgs = FSR::UpscalingPlatformArgs;
+  using FrameGenPlatformArgs = FSR::FrameGenPlatformArgs;
+
+  Impl()
   {
-    logdbg("[AMDFSR] Creating upscaling FSRD3D12Win...");
+    logdbg("[AMDFSR] Creating upscaling FSRD3D12...");
 
     fsrModule.reset(os_dll_load("amd_fidelityfx_loader_dx12.dll"));
 
@@ -75,60 +133,22 @@ public:
 
     if (isLoaded())
     {
-      uint64_t versionCount = 0;
-      ffx::QueryDescGetVersions versionsDesc{};
-      versionsDesc.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-      versionsDesc.device = d3d::get_device();
-      versionsDesc.outputCount = &versionCount;
-      if (query(nullptr, &versionsDesc.header) == FFX_API_RETURN_OK)
-      {
-        dag::Vector<uint64_t, framemem_allocator> versionIds;
-        dag::Vector<const char *, framemem_allocator> versionNames;
-        versionIds.resize(versionCount);
-        versionNames.resize(versionCount);
-        versionsDesc.versionIds = versionIds.data();
-        versionsDesc.versionNames = versionNames.data();
-
-        if (versionCount > 0 && query(nullptr, &versionsDesc.header) == FFX_API_RETURN_OK)
-        {
-          for (int verIx = 0; verIx < versionCount; ++verIx)
-            logdbg("[AMDFSR] provider %llu - %s", versionIds[verIx], versionNames[verIx]);
-
-          // The first returned provider is FSR3 upscaling
-          upscalingVersionString = versionNames.front();
-        }
-      }
-
-      logdbg("[AMDFSR] FSRD3D12Win created. Upscaling use %s.", getVersionString().data());
+      logdbg("[AMDFSR] FSRD3D12 created.");
     }
     else
     {
-      logdbg("[AMDFSR] Failed to create FSRD3D12Win.");
+      logdbg("[AMDFSR] Failed to create FSRD3D12.");
     }
-
-    G_ASSERT(!fSRD3D12Win);
-    fSRD3D12Win = this;
   }
 
-  ~FSRD3D12Win()
+  ~Impl()
   {
     d3d::driver_command(Drv3dCommand::ACQUIRE_OWNERSHIP);
     FINALLY([] { d3d::driver_command(Drv3dCommand::RELEASE_OWNERSHIP); });
-    if (framegenContext)
-    {
-      [[maybe_unused]] auto retCode = destroyContext(&framegenContext, nullptr);
-      G_ASSERT(retCode == FFX_API_RETURN_OK);
-      framegenContext = nullptr;
-    }
-    if (swapchainContext)
-    {
-      [[maybe_unused]] auto retCode = destroyContext(&swapchainContext, nullptr);
-      G_ASSERT(retCode == FFX_API_RETURN_OK);
-      swapchainContext = nullptr;
-      shutdown_internal_swapchain();
-    }
 
-    fSRD3D12Win = nullptr;
+    G_VERIFY(destroyContextIfNeeded(upscalingContext));
+    G_VERIFY(destroyContextIfNeeded(framegenContext));
+    G_VERIFY(destroyContextIfNeeded(swapchainContext));
   }
 
   bool initUpscaling(const ContextArgs &args)
@@ -141,11 +161,23 @@ public:
       return false;
     }
 
-    ffx::CreateBackendDX12Desc backendDesc{};
-    backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
-    backendDesc.device = static_cast<ID3D12Device *>(d3d::get_device());
+    ffxCreateBackendDX12Desc backendDesc{
+      .header{
+        .type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12,
+      },
+      .device = static_cast<ID3D12Device *>(d3d::get_device()),
+    };
 
-    ffx::CreateContextDescUpscale desc = convert(args, backendDesc.header);
+    ffxCreateContextDescUpscaleVersion versionDesc{
+      .header{
+        .type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION,
+      },
+      .version = FFX_UPSCALER_VERSION,
+    };
+
+    ffxCreateContextDescUpscale desc = convert(args, backendDesc.header);
+    versionDesc.header.pNext = desc.header.pNext;
+    desc.header.pNext = &versionDesc.header;
 
     auto status = createContext(&upscalingContext, &desc.header, nullptr);
     if (status != FFX_API_RETURN_OK)
@@ -161,15 +193,14 @@ public:
     return true;
   }
 
-  void teardownUpscaling() override
+  void teardownUpscaling()
   {
     enableFrameGeneration(false);
 
     if (!upscalingContext)
       return;
 
-    destroyContext(&upscalingContext, nullptr);
-    upscalingContext = nullptr;
+    G_VERIFY(destroyContextIfNeeded(upscalingContext));
     contextArgs.mode = UpscalingMode::Off;
   }
 
@@ -178,272 +209,350 @@ public:
     return get_next_jitter(render_width, output_width, jitterIndex, upscalingContext, query);
   }
 
-  bool doApplyUpscaling(const UpscalingPlatformArgs &args, void *command_list) const override
+  bool doApplyUpscaling(const UpscalingPlatformArgs &args, void *command_list) const
   {
     return apply_upscaling(args, command_list, upscalingContext, dispatch, ffx_get_resource);
   }
 
-  IPoint2 getRenderingResolution(UpscalingMode mode, const IPoint2 &target_resolution) const override
+  IPoint2 getRenderingResolution(UpscalingMode mode, const IPoint2 &target_resolution) const
   {
     return get_rendering_resolution(mode, target_resolution, upscalingContext, query);
   }
 
-  UpscalingMode getUpscalingMode() const override { return contextArgs.mode; }
+  UpscalingMode getUpscalingMode() const { return contextArgs.mode; }
 
-  bool isLoaded() const override { return createContext && destroyContext && configure && query && dispatch; }
+  bool isLoaded() const { return createContext && destroyContext && configure && query && dispatch; }
 
-  bool isUpscalingSupported() const override { return isLoaded() && d3d::get_driver_desc().shaderModel >= 6.2_sm; }
+  bool isUpscalingSupported() const { return isLoaded() && d3d::get_driver_desc().shaderModel >= 6.2_sm; }
 
-  bool isFrameGenerationSupported() const override { return isLoaded() && d3d::get_driver_desc().shaderModel >= 6.2_sm; }
-
-  String getVersionString() const override { return upscalingVersionString; }
-
-  void enableFrameGeneration(bool enable) override
+  bool isFrameGenerationSupported() const
   {
-    if (enable)
+    if (!isLoaded())
+      return false;
+
+    if (d3d::get_driver_desc().shaderModel >= 6.2_sm)
+      return true;
+
+    auto *device = static_cast<ID3D12Device *>(d3d::get_device());
+    const auto sm = drv3d_dx12::shader_model_from_dx(drv3d_dx12::get_shader_model(device).HighestShaderModel);
+
+    return sm >= 6.2_sm;
+  }
+
+  String getVersionString() const
+  {
+    initVersionString();
+    return upscalingVersionString;
+  }
+
+  bool createFrameGenerationSwapchain(DXGIFactory *factory, ID3D12CommandQueue *queue,
+    const drv3d_dx12::SwapchainCreateInfo &create_info, const DXGI_SWAP_CHAIN_DESC1 &swapchain_desc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &fullscreen_desc, DXGISwapChain **swapchain)
+  {
+    G_ASSERT_RETURN(swapchain, false);
+
+    if (!isFrameGenerationSupported())
+      return false;
+
+    if (!destroyContextIfNeeded(framegenContext) || !destroyContextIfNeeded(swapchainContext))
+      return false;
+
+    DXGI_SWAP_CHAIN_DESC1 mutableSwapchainDesc = swapchain_desc;
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC mutableFullscreenDesc = fullscreen_desc;
+
+    ffxCreateContextDescFrameGenerationSwapChainVersionDX12 versionDesc{
+      .header{
+        .type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_DX12,
+      },
+      .version = FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION,
+    };
+
+    ComPtr<IDXGISwapChain4> newDxgiSwapchain;
+    ffxCreateContextDescFrameGenerationSwapChainForHwndDX12 createSwapChainDesc{
+      .header{
+        .type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12,
+        .pNext = &versionDesc.header,
+      },
+      .swapchain = newDxgiSwapchain.GetAddressOf(),
+      .hwnd = create_info.window,
+      .desc = &mutableSwapchainDesc,
+      .fullscreenDesc = &mutableFullscreenDesc,
+      .dxgiFactory = factory,
+      .gameQueue = queue,
+    };
+
+    [[maybe_unused]] auto retCode = createContext(&swapchainContext, &createSwapChainDesc.header, nullptr);
+    G_ASSERT_RETURN(retCode == FFX_API_RETURN_OK, false);
+
+    ffxCreateBackendDX12Desc backendDesc{
+      .header{
+        .type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12,
+      },
+      .device = static_cast<ID3D12Device *>(d3d::get_device()),
+    };
+
+    ffxCreateContextDescFrameGeneration createFg{
+      .header{
+        .type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION,
+        .pNext = &backendDesc.header,
+      },
+      .flags =
+        (contextArgs.invertedDepth ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED : 0u) |
+        ((contextArgs.enableHdr || create_info.enableHdr || create_info.forceHdr) ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE
+                                                                                  : 0u),
+      .displaySize{
+        .width = swapchain_desc.Width,
+        .height = swapchain_desc.Height,
+      },
+      .maxRenderSize{
+        .width = swapchain_desc.Width,
+        .height = swapchain_desc.Height,
+      },
+      .backBufferFormat = convert(swapchain_desc.Format),
+    };
+
+    retCode = createContext(&framegenContext, &createFg.header, nullptr);
+    if (retCode != FFX_API_RETURN_OK)
     {
-      if (framegenContext)
-        return;
-
-      d3d::driver_command(Drv3dCommand::ACQUIRE_OWNERSHIP);
-      FINALLY([] { d3d::driver_command(Drv3dCommand::RELEASE_OWNERSHIP); });
-
-      ComPtr<DXGIFactory> dxgiFactory;
-      ComPtr<DXGISwapChain> dxgiSwapchain;
-      ComPtr<ID3D12CommandQueue> d3dGraphicsQueue;
-      get_fg_initializers(*dxgiFactory.GetAddressOf(), *dxgiSwapchain.GetAddressOf(), *d3dGraphicsQueue.GetAddressOf());
-
-      G_ASSERT_RETURN(dxgiSwapchain, );
-
-      DXGI_SWAP_CHAIN_DESC swapchainDesc = {};
-      dxgiSwapchain->GetDesc(&swapchainDesc);
-      HWND hwnd;
-      dxgiSwapchain->GetHwnd(&hwnd);
-      DXGI_SWAP_CHAIN_DESC1 desc1;
-      dxgiSwapchain->GetDesc1(&desc1);
-      DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreenDesc;
-      dxgiSwapchain->GetFullscreenDesc(&fullscreenDesc);
-      dxgiSwapchain.Reset();
-
-      // Remove the old swapchain first, because only one swapchain can exist for the window with flip model
-      shutdown_internal_swapchain();
-
-      ComPtr<IDXGISwapChain4> newDxgiSwapchain;
-      // Make the framegen swapchain and replace the driver one with it
-      ffx::CreateContextDescFrameGenerationSwapChainForHwndDX12 createSwapChainDesc{};
-      createSwapChainDesc.swapchain = newDxgiSwapchain.GetAddressOf();
-      createSwapChainDesc.hwnd = hwnd;
-      createSwapChainDesc.desc = &desc1;
-      createSwapChainDesc.fullscreenDesc = &fullscreenDesc;
-      createSwapChainDesc.dxgiFactory = dxgiFactory.Get();
-      createSwapChainDesc.gameQueue = d3dGraphicsQueue.Get();
-
-      [[maybe_unused]] auto retCode = createContext(&swapchainContext, &createSwapChainDesc.header, nullptr);
-      G_ASSERT(retCode == FFX_API_RETURN_OK);
-
-      if (!adopt_external_swapchain(newDxgiSwapchain.Get()))
-      {
-        create_default_swapchain();
-        return;
-      }
-
-      // Make the framegen context
-      ffx::CreateContextDescFrameGeneration createFg{};
-      if (contextArgs.invertedDepth)
-        createFg.flags |= FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED;
-      if (contextArgs.enableHdr)
-        createFg.flags |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE;
-      createFg.displaySize.width = contextArgs.outputWidth;
-      createFg.displaySize.height = contextArgs.outputHeight;
-      createFg.maxRenderSize.width = contextArgs.outputWidth;
-      createFg.maxRenderSize.height = contextArgs.outputHeight;
-      createFg.backBufferFormat = convert(swapchainDesc.BufferDesc.Format);
-
-      ffx::CreateBackendDX12Desc backendDesc{};
-      backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
-      backendDesc.device = static_cast<ID3D12Device *>(d3d::get_device());
-
-      createFg.header.pNext = &backendDesc.header;
-
-      retCode = createContext(&framegenContext, &createFg.header, nullptr);
-      G_ASSERT(retCode == FFX_API_RETURN_OK);
+      G_ASSERT_RETURN(destroyContextIfNeeded(swapchainContext), false);
+      return false;
     }
-    else
+
+    *swapchain = newDxgiSwapchain.Detach();
+    return true;
+  }
+
+  void releaseFrameGenerationSwapchainContext()
+  {
+    enableFrameGeneration(false);
+
+    G_VERIFY(destroyContextIfNeeded(framegenContext));
+    G_VERIFY(destroyContextIfNeeded(swapchainContext));
+  }
+
+  void enableFrameGeneration(bool enable)
+  {
+    if (!framegenContext || !swapchainContext)
+      return;
+
+    if (enable == isFrameGenEnabled)
+      return;
+
+    d3d::driver_command(Drv3dCommand::ACQUIRE_OWNERSHIP);
+    FINALLY([] { d3d::driver_command(Drv3dCommand::RELEASE_OWNERSHIP); });
+
+    d3d::driver_command(Drv3dCommand::D3D_FLUSH);
+    isFrameGenEnabled = enable;
+
+    if (!enable)
     {
-      d3d::driver_command(Drv3dCommand::ACQUIRE_OWNERSHIP);
-      FINALLY([] { d3d::driver_command(Drv3dCommand::RELEASE_OWNERSHIP); });
-
-      if (framegenContext)
-      {
-        [[maybe_unused]] auto retCode = destroyContext(&framegenContext, nullptr);
-        G_ASSERT(retCode == FFX_API_RETURN_OK);
-        framegenContext = nullptr;
-      }
-      if (swapchainContext)
-      {
-        [[maybe_unused]] auto retCode = destroyContext(&swapchainContext, nullptr);
-        G_ASSERT(retCode == FFX_API_RETURN_OK);
-        swapchainContext = nullptr;
-
-        // Reset the swapchain from the backend!
-        shutdown_internal_swapchain();
-        create_default_swapchain();
-      }
+      ComPtr<DXGISwapChain> dxgiSwapchain = get_fg_swapchain();
+      ffxConfigureDescFrameGeneration disableConfig{
+        .header{
+          .type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION,
+        },
+        .swapChain = dxgiSwapchain.Get(),
+        .frameGenerationEnabled = false,
+      };
+      [[maybe_unused]] auto retCode = configure(&framegenContext, &disableConfig.header);
+      G_ASSERT(retCode == FFX_API_RETURN_OK);
     }
   }
 
-  void suppressFrameGeneration(bool suppress) override { isFrameGenSuppressed = suppress; }
+  void suppressFrameGeneration(bool suppress) { interlocked_relaxed_store(isFrameGenSuppressed, suppress); }
 
-  void doScheduleGeneratedFrames(const FrameGenPlatformArgs &args, void *command_list) override
+  void doScheduleGeneratedFrames(const FrameGenPlatformArgs &args, void *command_list)
   {
-    G_ASSERT_RETURN(framegenContext, );
+    G_ASSERT_RETURN(framegenContext && swapchainContext, );
 
-    ComPtr<DXGIFactory> dxgiFactory;
-    ComPtr<DXGISwapChain> dxgiSwapchain;
-    ComPtr<ID3D12CommandQueue> d3dGraphicsQueue;
-    get_fg_initializers(*dxgiFactory.GetAddressOf(), *dxgiSwapchain.GetAddressOf(), *d3dGraphicsQueue.GetAddressOf());
+    const bool suppressed = interlocked_relaxed_load(isFrameGenSuppressed);
+
+    ComPtr<DXGISwapChain> dxgiSwapchain = get_fg_swapchain();
 
     if (auto latency = GpuLatency::getInstance(); latency && latency->getVendor() == GpuVendor::AMD)
     {
       // Anti Lag 2 data injection
 
       // {5083ae5b-8070-4fca-8ee5-3582dd367d13}
-      static const GUID IID_IFfxAntiLag2Data = {0x5083ae5b, 0x8070, 0x4fca, {0x8e, 0xe5, 0x35, 0x82, 0xdd, 0x36, 0x7d, 0x13}};
+      static const GUID IID_IFfxAntiLag2Data{0x5083ae5b, 0x8070, 0x4fca, {0x8e, 0xe5, 0x35, 0x82, 0xdd, 0x36, 0x7d, 0x13}};
 
       struct AntiLag2Data
       {
         void *context;
         bool enabled;
-      } data;
-
-      data.context = latency->getHandle();
-      data.enabled = latency->isEnabled();
+      } data{
+        .context = latency->getHandle(),
+        .enabled = latency->isEnabled(),
+      };
       dxgiSwapchain->SetPrivateData(IID_IFfxAntiLag2Data, sizeof(data), &data);
     }
 
-    frameGenerationConfig.swapChain = dxgiSwapchain.Get();
-    frameGenerationConfig.presentCallback = nullptr;
-    frameGenerationConfig.presentCallbackUserContext = nullptr;
-    frameGenerationConfig.frameGenerationCallback = nullptr;
-    frameGenerationConfig.frameGenerationCallbackUserContext = nullptr;
-    frameGenerationConfig.frameGenerationEnabled = !isFrameGenSuppressed;
-    frameGenerationConfig.allowAsyncWorkloads = true;
-    frameGenerationConfig.HUDLessColor = FfxApiResource({});
-    frameGenerationConfig.flags = 0; // FfxApiDispatchFrameGenerationFlags
-    frameGenerationConfig.onlyPresentGenerated = false;
-    frameGenerationConfig.generationRect.left = 0;
-    frameGenerationConfig.generationRect.top = 0;
-    frameGenerationConfig.generationRect.width = args.outputResolution.x;
-    frameGenerationConfig.generationRect.height = args.outputResolution.y;
-    frameGenerationConfig.frameID = args.frameIndex;
-
-    auto retCode = configure(&framegenContext, &frameGenerationConfig.header);
+    frameGenerationConfig = {
+      .header{
+        .type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION,
+      },
+      .swapChain = dxgiSwapchain.Get(),
+      .frameGenerationEnabled = isFrameGenEnabled && !suppressed,
+      .allowAsyncWorkloads = true,
+      .flags = 0, // FfxApiDispatchFrameGenerationFlags
+      .generationRect{
+        .width = args.outputResolution.x,
+        .height = args.outputResolution.y,
+      },
+      .frameID = args.frameIndex,
+    };
+    [[maybe_unused]] auto retCode = configure(&framegenContext, &frameGenerationConfig.header);
     G_ASSERT(retCode == FFX_API_RETURN_OK);
 
-    ffx::DispatchDescFrameGenerationPrepare dispatchFgPrep{};
-    dispatchFgPrep.frameID = args.frameIndex;
-    dispatchFgPrep.flags = args.debugView ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES : 0;
-    dispatchFgPrep.commandList = command_list;
-    dispatchFgPrep.renderSize.width = args.inputResolution.x;
-    dispatchFgPrep.renderSize.height = args.inputResolution.y;
-    dispatchFgPrep.jitterOffset.x = args.jitter.x;
-    dispatchFgPrep.jitterOffset.y = args.jitter.y;
-    dispatchFgPrep.motionVectorScale.x = args.motionVectorScale.x;
-    dispatchFgPrep.motionVectorScale.y = args.motionVectorScale.y;
-    dispatchFgPrep.frameTimeDelta = args.timeElapsed * 1000.0f; // FSR expects milliseconds
-    dispatchFgPrep.unused_reset = args.reset;
-    dispatchFgPrep.cameraNear = args.nearPlane;
-    dispatchFgPrep.cameraFar = args.farPlane;
-    dispatchFgPrep.cameraFovAngleVertical = args.fovY;
-    dispatchFgPrep.viewSpaceToMetersFactor = 1;
-    dispatchFgPrep.depth = ffx_get_resource(args.depthTexture, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-    dispatchFgPrep.motionVectors = ffx_get_resource(args.motionVectors, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-
+    ffxDispatchDescFrameGenerationPrepare dispatchFgPrep{
+      .header{
+        .type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE,
+      },
+      .frameID = args.frameIndex,
+      .flags = args.debugView ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES : 0u,
+      .commandList = command_list,
+      .renderSize{
+        .width = uint32_t(args.inputResolution.x),
+        .height = uint32_t(args.inputResolution.y),
+      },
+      .jitterOffset{
+        .x = args.jitter.x,
+        .y = args.jitter.y,
+      },
+      .motionVectorScale{
+        .x = args.motionVectorScale.x,
+        .y = args.motionVectorScale.y,
+      },
+      .frameTimeDelta = args.timeElapsed * 1000.0f, // FSR expects milliseconds
+      .unused_reset = args.reset,
+      .cameraNear = args.nearPlane,
+      .cameraFar = args.farPlane,
+      .cameraFovAngleVertical = args.fovY,
+      .viewSpaceToMetersFactor = 1,
+      .depth = ffx_get_resource(args.depthTexture, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ),
+      .motionVectors = ffx_get_resource(args.motionVectors, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ),
+    };
     retCode = dispatch(&framegenContext, &dispatchFgPrep.header);
     G_ASSERT(retCode == FFX_API_RETURN_OK);
 
-    ffx::ConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiConfig{};
-    uiConfig.uiResource = ffx_get_resource(args.uiTexture, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-    uiConfig.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
+    ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiConfig{
+      .header{
+        .type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12,
+      },
+      .uiResource = ffx_get_resource(args.uiTexture, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ),
+      .flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING |
+               FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA,
+    };
     retCode = configure(&swapchainContext, &uiConfig.header);
     G_ASSERT(retCode == FFX_API_RETURN_OK);
 
-    if (!isFrameGenSuppressed)
+    if (!suppressed)
     {
-      ffx::DispatchDescFrameGeneration dispatchFg{};
-      dispatchFg.presentColor = ffx_get_resource(args.colorTexture, FFX_API_RESOURCE_STATE_COMMON);
-      dispatchFg.numGeneratedFrames = 1;
-      dispatchFg.generationRect.left = 0;
-      dispatchFg.generationRect.top = 0;
-      dispatchFg.generationRect.width = args.outputResolution.x;
-      dispatchFg.generationRect.height = args.outputResolution.y;
-      dispatchFg.frameID = args.frameIndex;
-      dispatchFg.reset = args.reset;
-      dispatchFg.minMaxLuminance[0] = 0;
-      dispatchFg.minMaxLuminance[1] = 0;
-      dispatchFg.backbufferTransferFunction = 0;
-      for (auto &t : dispatchFg.outputs)
-        t = FfxApiResource({});
+      ffxDispatchDescFrameGeneration dispatchFg{
+        .header{
+          .type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION,
+        },
+        .presentColor = ffx_get_resource(args.colorTexture, FFX_API_RESOURCE_STATE_COMMON),
+        .numGeneratedFrames = 1,
+        .reset = args.reset,
+        .generationRect{
+          .width = args.outputResolution.x,
+          .height = args.outputResolution.y,
+        },
+        .frameID = args.frameIndex,
+      };
 
-      ffx::QueryDescFrameGenerationSwapChainInterpolationCommandListDX12 queryCmdList{};
-      queryCmdList.pOutCommandList = &dispatchFg.commandList;
+      ffxQueryDescFrameGenerationSwapChainInterpolationCommandListDX12 queryCmdList{
+        .header{
+          .type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_INTERPOLATIONCOMMANDLIST_DX12,
+        },
+        .pOutCommandList = &dispatchFg.commandList,
+      };
       retCode = query(&swapchainContext, &queryCmdList.header);
       G_ASSERT(retCode == FFX_API_RETURN_OK);
 
-      ffx::QueryDescFrameGenerationSwapChainInterpolationTextureDX12 queryFiTexture{};
-      queryFiTexture.pOutTexture = &dispatchFg.outputs[0];
+      ffxQueryDescFrameGenerationSwapChainInterpolationTextureDX12 queryFiTexture{
+        .header{
+          .type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_INTERPOLATIONTEXTURE_DX12,
+        },
+        .pOutTexture = &dispatchFg.outputs[0],
+      };
       retCode = query(&swapchainContext, &queryFiTexture.header);
       G_ASSERT(retCode == FFX_API_RETURN_OK);
 
       retCode = dispatch(&framegenContext, &dispatchFg.header);
       G_ASSERT(retCode == FFX_API_RETURN_OK);
-
-      G_UNUSED(retCode);
     }
   }
 
-  int getPresentedFrameCount() override { return (framegenContext && !isFrameGenSuppressed) ? 2 : 1; }
+  int getPresentedFrameCount()
+  {
+    return (framegenContext && isFrameGenEnabled && !interlocked_relaxed_load(isFrameGenSuppressed)) ? 2 : 1;
+  }
 
-  bool isFrameGenerationActive() const override { return !!framegenContext; }
+  bool isFrameGenerationActive() const { return isFrameGenEnabled; }
 
-  bool isFrameGenerationSuppressed() const override { return isFrameGenSuppressed; }
+  bool isFrameGenerationSuppressed() const { return interlocked_relaxed_load(isFrameGenSuppressed); }
 
   void preRecover()
   {
-    auto tmpContextArgs = contextArgs;
+    d3d::driver_command(Drv3dCommand::D3D_FLUSH);
 
-    if (framegenContext)
-    {
-      [[maybe_unused]] auto retCode = destroyContext(&framegenContext, nullptr);
-      G_ASSERT(retCode == FFX_API_RETURN_OK);
-      framegenContext = nullptr;
-    }
-
-    if (swapchainContext)
-    {
-      [[maybe_unused]] auto retCode = destroyContext(&swapchainContext, nullptr);
-      G_ASSERT(retCode == FFX_API_RETURN_OK);
-      swapchainContext = nullptr;
-    }
-
-    if (upscalingContext)
-    {
-      destroyContext(&upscalingContext, nullptr);
-      upscalingContext = nullptr;
-      contextArgs.mode = UpscalingMode::Off;
-    }
-
-    contextArgs = tmpContextArgs;
+    G_VERIFY(destroyContextIfNeeded(framegenContext));
+    G_VERIFY(destroyContextIfNeeded(swapchainContext));
+    G_VERIFY(destroyContextIfNeeded(upscalingContext));
   }
 
   void recover()
   {
     // The regular tear down resets the mode to off, but the preRecover keeps the mode
     // and the mode isn't off here have to restore the fsr context and reinitialize the object
-    if (amd::fSRD3D12Win->getUpscalingMode() != amd::FSR::UpscalingMode::Off)
+    if (getUpscalingMode() != amd::FSR::UpscalingMode::Off)
       initUpscaling(contextArgs);
-    if (contextArgs.enableFrameGeneration)
-      enableFrameGeneration(true);
+  }
+
+  uint64_t getMemorySize()
+  {
+    FfxApiEffectMemoryUsage usageInfo{};
+    if (upscalingContext)
+    {
+      ffxQueryDescUpscaleGetGPUMemoryUsage usageQuery{
+        .header =
+          {
+            .type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE,
+          },
+        .gpuMemoryUsageUpscaler = &usageInfo,
+      };
+      query(&upscalingContext, &usageQuery.header);
+    }
+    uint64_t totalSize = usageInfo.totalUsageInBytes;
+
+    if (framegenContext)
+    {
+      usageInfo = {};
+      ffxQueryDescFrameGenerationGetGPUMemoryUsage usageQuery{
+        .header =
+          {
+            .type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE,
+          },
+        .gpuMemoryUsageFrameGeneration = &usageInfo,
+      };
+      query(&framegenContext, &usageQuery.header);
+    }
+    totalSize += usageInfo.totalUsageInBytes;
+
+    if (swapchainContext)
+    {
+      usageInfo = {};
+      ffxQueryFrameGenerationSwapChainGetGPUMemoryUsageDX12 usageQuery{
+        .header = {.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_GPU_MEMORY_USAGE_DX12},
+        .gpuMemoryUsageFrameGenerationSwapchain = &usageInfo,
+      };
+      query(&swapchainContext, &usageQuery.header);
+    }
+    totalSize += usageInfo.totalUsageInBytes;
+
+    return totalSize;
   }
 
 private:
@@ -459,31 +568,146 @@ private:
   ffxContext framegenContext = nullptr;
   ffxContext swapchainContext = nullptr;
 
-  ffx::ConfigureDescFrameGeneration frameGenerationConfig;
+  ffxConfigureDescFrameGeneration frameGenerationConfig = {};
 
   ContextArgs contextArgs = {};
 
-  uint32_t jitterIndex = 0;
+  int32_t jitterIndex = 0;
 
+  bool isFrameGenEnabled = false;
   bool isFrameGenSuppressed = false;
 
-  String upscalingVersionString = String(8, "");
+  mutable String upscalingVersionString = String(8, "");
+
+  bool destroyContextIfNeeded(ffxContext &context)
+  {
+    if (!context)
+      return true;
+
+    [[maybe_unused]] auto retCode = destroyContext(&context, nullptr);
+    G_ASSERT_RETURN(retCode == FFX_API_RETURN_OK, false);
+    context = nullptr;
+    return true;
+  }
+
+  void initVersionString() const
+  {
+    if (!upscalingVersionString.empty() || !query)
+      return;
+
+    auto device = d3d::get_device();
+    if (!device)
+      return;
+
+    uint64_t versionCount = 0;
+    ffxQueryDescGetVersions versionsDesc{
+      .header{
+        .type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS,
+      },
+      .createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,
+      .device = device,
+      .outputCount = &versionCount,
+    };
+    if (query(nullptr, &versionsDesc.header) != FFX_API_RETURN_OK || versionCount == 0)
+      return;
+
+    const int MAX_VERSION_COUNT = 32;
+    eastl::fixed_vector<uint64_t, MAX_VERSION_COUNT> versionIds;
+    eastl::fixed_vector<const char *, MAX_VERSION_COUNT> versionNames;
+    versionIds.resize(versionCount);
+    versionNames.resize(versionCount);
+    versionsDesc.versionIds = versionIds.data();
+    versionsDesc.versionNames = versionNames.data();
+
+    if (query(nullptr, &versionsDesc.header) != FFX_API_RETURN_OK)
+      return;
+
+    for (int verIx = 0; verIx < versionCount; ++verIx)
+      logdbg("[AMDFSR] provider %llu - %s", versionIds[verIx], versionNames[verIx]);
+
+    upscalingVersionString = versionNames.front();
+  }
 };
 
-FSR *createD3D12Win() { return new FSRD3D12Win; }
+FSRD3D12::FSRD3D12() : pImpl(eastl::make_unique<Impl>())
+{
+  G_ASSERT(!g_fsrD3D12);
+  g_fsrD3D12 = this;
+}
+
+FSRD3D12::~FSRD3D12() { g_fsrD3D12 = nullptr; }
+
+bool FSRD3D12::initUpscaling(const FSR::ContextArgs &args) { return pImpl->initUpscaling(args); }
+
+void FSRD3D12::teardownUpscaling() { pImpl->teardownUpscaling(); }
+
+Point2 FSRD3D12::getNextJitter(uint32_t render_width, uint32_t output_width)
+{
+  return pImpl->getNextJitter(render_width, output_width);
+}
+
+bool FSRD3D12::doApplyUpscaling(const FSR::UpscalingPlatformArgs &args, void *command_list) const
+{
+  return pImpl->doApplyUpscaling(args, command_list);
+}
+
+IPoint2 FSRD3D12::getRenderingResolution(FSR::UpscalingMode mode, const IPoint2 &target_resolution) const
+{
+  return pImpl->getRenderingResolution(mode, target_resolution);
+}
+
+FSR::UpscalingMode FSRD3D12::getUpscalingMode() const { return pImpl->getUpscalingMode(); }
+
+bool FSRD3D12::isLoaded() const { return pImpl->isLoaded(); }
+
+bool FSRD3D12::isUpscalingSupported() const { return pImpl->isUpscalingSupported(); }
+
+bool FSRD3D12::isFrameGenerationSupported() const { return pImpl->isFrameGenerationSupported(); }
+
+String FSRD3D12::getVersionString() const { return pImpl->getVersionString(); }
+
+void FSRD3D12::enableFrameGeneration(bool enable) { pImpl->enableFrameGeneration(enable); }
+
+void FSRD3D12::suppressFrameGeneration(bool suppress) { pImpl->suppressFrameGeneration(suppress); }
+
+void FSRD3D12::doScheduleGeneratedFrames(const FSR::FrameGenPlatformArgs &args, void *command_list)
+{
+  pImpl->doScheduleGeneratedFrames(args, command_list);
+}
+
+int FSRD3D12::getPresentedFrameCount() { return pImpl->getPresentedFrameCount(); }
+
+bool FSRD3D12::isFrameGenerationActive() const { return pImpl->isFrameGenerationActive(); }
+
+bool FSRD3D12::isFrameGenerationSuppressed() const { return pImpl->isFrameGenerationSuppressed(); }
+
+void FSRD3D12::preRecover() { pImpl->preRecover(); }
+
+void FSRD3D12::recover() { pImpl->recover(); }
+
+bool FSRD3D12::createFrameGenerationSwapchain(DXGIFactory *factory, ID3D12CommandQueue *queue,
+  const drv3d_dx12::SwapchainCreateInfo &create_info, const DXGI_SWAP_CHAIN_DESC1 &swapchain_desc,
+  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &fullscreen_desc, DXGISwapChain **swapchain)
+{
+  return pImpl->createFrameGenerationSwapchain(factory, queue, create_info, swapchain_desc, fullscreen_desc, swapchain);
+}
+
+void FSRD3D12::releaseFrameGenerationSwapchainContext() { pImpl->releaseFrameGenerationSwapchainContext(); }
+
+uint64_t FSRD3D12::getMemorySize() { return pImpl->getMemorySize(); }
 
 } // namespace amd
 
 static void fsr3_before_reset(bool full_reset)
 {
-  if (full_reset && amd::fSRD3D12Win)
-    amd::fSRD3D12Win->preRecover();
+  if (full_reset && amd::g_fsrD3D12)
+    amd::g_fsrD3D12->preRecover();
 }
 
 static void fsr3_after_reset(bool full_reset)
 {
-  if (full_reset && amd::fSRD3D12Win)
-    amd::fSRD3D12Win->recover();
+  if (full_reset && amd::g_fsrD3D12)
+    amd::g_fsrD3D12->recover();
 }
 
 REGISTER_D3D_BEFORE_RESET_FUNC(fsr3_before_reset);

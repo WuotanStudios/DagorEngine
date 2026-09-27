@@ -29,10 +29,21 @@ extern const eastl::array<eastl::string_view, (size_t)DebugGbufferMode::Count> g
 extern DebugGbufferMode show_gbuffer;
 bool shouldRenderGbufferDebug();
 
-void setDebugGbufferMode(eastl::string_view mode);
+enum class DebugGbufferComposition
+{
+  Single = 0,
+  Grid,     // 4x4 mosaic of 16 debug modes covering the whole screen
+  Overview, // 12-mode border ring, gameplay frame visible in the center
+};
+
+extern DebugGbufferComposition show_gbuffer_composition;
+extern const eastl::array<eastl::string_view, 2> gbuffer_debug_composition_options;
+
+void setDebugGbufferMode(eastl::string_view mode, bool with_compositions = false);
 void setDebugGbufferWithVectorsMode(eastl::string_view mode, int vectorsCount, float vectorsScale);
 eastl::string getDebugGbufferUsage();
 eastl::string getDebugGbufferWithVectorsUsage();
+eastl::string getDebugGbufferModeName(DebugGbufferMode mode);
 
 class DeferredRT;
 
@@ -41,8 +52,13 @@ extern const int USE_DEBUG_GBUFFER_MODE;
 constexpr auto DEBUG_RENDER_GBUFFER_SHADER_NAME = "debug_final_gbuffer";
 constexpr auto DEBUG_RENDER_GBUFFER_WITH_VECTORS_SHADER_NAME = "debug_final_gbuffer_vec";
 
-void debug_render_gbuffer(const class PostFxRenderer &debugRenderer, DeferredRT &gbuffer, int mode = USE_DEBUG_GBUFFER_MODE);
+void debug_render_gbuffer(const class PostFxRenderer &debugRenderer, DeferredRT &gbuffer, Texture *depth = nullptr,
+  int mode = USE_DEBUG_GBUFFER_MODE);
 void debug_render_gbuffer(const class PostFxRenderer &debugRenderer, Texture *depth, int mode = USE_DEBUG_GBUFFER_MODE);
+void debug_render_gbuffer(const class PostFxRenderer &debugRenderer, Texture *dbg_tex, Texture *depth,
+  int32_t mode = USE_DEBUG_GBUFFER_MODE);
+
+void debug_render_gbuffer_tiles(const PostFxRenderer &debugRenderer, DebugGbufferComposition composition, bool with_labels = false);
 
 void debug_render_gbuffer_with_vectors(const class DynamicShaderHelper &debugVecShader, DeferredRT &gbuffer,
   int mode = USE_DEBUG_GBUFFER_MODE, int vec_count = -1, float vec_scale = 0.f);

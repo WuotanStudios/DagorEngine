@@ -1,6 +1,8 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <daECS/core/coreEvents.h>
 #include <ecs/anim/anim.h>
 #include <anim/dag_animStateHolder.h>
@@ -10,10 +12,13 @@
 
 ECS_REGISTER_TYPE(EffectorData, nullptr);
 
+ECS_UNICAST_EVENT_TYPE(CmdApplyAnimcharEffectorsImmediate);
+ECS_REGISTER_EVENT(CmdApplyAnimcharEffectorsImmediate);
+
 static void reset_ik_effector(AnimV20::AnimcharBaseComponent &animchar, int eff_id)
 {
   if (eff_id >= 0)
-    animchar.getAnimState()->paramEffector(eff_id).type = AnimV20::AnimCommonStateHolder::EffectorVar::T_useGeomNode;
+    animchar.getAnimState()->paramEffector(eff_id).type = AnimV20::AnimGraphStateHolder::EffectorVar::T_useGeomNode;
 }
 
 static void reset_ik_attnode(AnimV20::AnimcharBaseComponent &animchar, int wtm_id)
@@ -23,7 +28,7 @@ static void reset_ik_attnode(AnimV20::AnimcharBaseComponent &animchar, int wtm_i
 }
 
 ECS_ON_EVENT(on_appear, InvalidateEffectorData)
-static void animchar_effectors_init_es_event_handler(const ecs::Event &, ecs::EntityId eid,
+static void animchar_effectors_init_es_event_handler(const ecs::Event &, ecs::EntityManager &manager, ecs::EntityId eid,
   const AnimV20::AnimcharBaseComponent &animchar, const ecs::Array &animchar_effectors__effectorsList,
   ecs::Object &animchar_effectors__effectorsState)
 {
@@ -36,31 +41,25 @@ static void animchar_effectors_init_es_event_handler(const ecs::Event &, ecs::En
     const ecs::Object &obj = it.get<ecs::Object>();
 
     const ecs::string &effName = obj[ECS_HASH("effectorName")].get<ecs::string>();
-    int effId = animGraph->getParamId(effName.c_str(), AnimV20::IAnimStateHolder::PT_Effector);
+    int effId = animGraph->getParamId(effName.c_str(), AnimV20::AnimGraphStateHolder::PT_Effector);
     if (DAGOR_UNLIKELY(effId < 0))
     {
       logerr("Effector name '%s' not found in animgraph of animchar '%s' entity '%s'", effName.c_str(),
-        animchar.getCreateInfo()->resName.c_str(), g_entity_mgr->getEntityTemplateName(eid));
+        animchar.getCreateInfo()->resName.c_str(), manager.getEntityTemplateName(eid));
       continue;
     }
 
     const ecs::string &effWtmName = obj[ECS_HASH("effectorWtmName")].get<ecs::string>();
-    int effWtmId = animGraph->getParamId(effWtmName.c_str(), AnimV20::IAnimStateHolder::PT_InlinePtr);
+    int effWtmId = animGraph->getParamId(effWtmName.c_str(), AnimV20::AnimGraphStateHolder::PT_InlinePtr);
 
     animchar_effectors__effectorsState.addMember(ECS_HASH_SLOW(effName.c_str()), EffectorData(effId, effWtmId));
   }
 }
 
-ECS_TAG(render)
-ECS_AFTER(before_animchar_update_sync)
-ECS_BEFORE(animchar__updater_es) // must be before animchar update (but actually it should be 'just before')
-ECS_REQUIRE(eastl::true_type animchar__updatable)
-ECS_REQUIRE(eastl::true_type animchar__visible = true)
-ECS_REQUIRE_NOT(ecs::Tag animchar__actOnDemand)
-static void animchar_effectors_update_es(const UpdateAnimcharEvent &, AnimV20::AnimcharBaseComponent &animchar,
-  const TMatrix &transform, const ecs::Object &animchar_effectors__effectorsState)
+static void apply_animchar_effectors_state(AnimV20::AnimcharBaseComponent &animchar, const TMatrix &transform,
+  const ecs::Object &animchar_effectors__effectorsState)
 {
-  AnimV20::IAnimStateHolder *animState = animchar.getAnimState();
+  AnimV20::AnimGraphStateHolder *animState = animchar.getAnimState();
   for (auto &it : animchar_effectors__effectorsState)
   {
     const EffectorData &eff = it.second.get<EffectorData>();
@@ -82,4 +81,27 @@ static void animchar_effectors_update_es(const UpdateAnimcharEvent &, AnimV20::A
       reset_ik_attnode(animchar, eff.effWtmId);
     }
   }
+}
+
+ECS_TAG(render)
+ECS_AFTER(before_animchar_update_sync)
+ECS_BEFORE(animchar__updater_es) // must be before animchar update (but actually it should be 'just before')
+ECS_REQUIRE(eastl::true_type animchar__updatable)
+ECS_REQUIRE(eastl::true_type animchar__visible = true)
+ECS_REQUIRE_NOT(ecs::Tag animchar__actOnDemand)
+static void animchar_effectors_update_es(const UpdateAnimcharEvent &, AnimV20::AnimcharBaseComponent &animchar,
+  const TMatrix &transform, const ecs::Object &animchar_effectors__effectorsState)
+{
+  apply_animchar_effectors_state(animchar, transform, animchar_effectors__effectorsState);
+}
+
+// Sync variant of animchar_effectors_update_es; see the event declaration.
+ECS_TAG(render)
+ECS_REQUIRE(eastl::true_type animchar__updatable)
+ECS_REQUIRE(eastl::true_type animchar__visible = true)
+ECS_REQUIRE_NOT(ecs::Tag animchar__actOnDemand)
+static void animchar_effectors_apply_immediate_es(const CmdApplyAnimcharEffectorsImmediate &, AnimV20::AnimcharBaseComponent &animchar,
+  const TMatrix &transform, const ecs::Object &animchar_effectors__effectorsState)
+{
+  apply_animchar_effectors_state(animchar, transform, animchar_effectors__effectorsState);
 }

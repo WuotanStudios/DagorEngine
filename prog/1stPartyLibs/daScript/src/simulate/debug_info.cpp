@@ -40,6 +40,9 @@ namespace das
         {   Type::tInt4,        "int4"  },
         {   Type::tUInt,        "uint"  },
         {   Type::tBitfield,    "bitfield"  },
+        {   Type::tBitfield8,   "bitfield8"  },
+        {   Type::tBitfield16,  "bitfield16"  },
+        {   Type::tBitfield64,  "bitfield64"  },
         {   Type::tUInt2,       "uint2" },
         {   Type::tUInt3,       "uint3" },
         {   Type::tUInt4,       "uint4" },
@@ -47,6 +50,29 @@ namespace das
         {   Type::tFloat2,      "float2"},
         {   Type::tFloat3,      "float3"},
         {   Type::tFloat4,      "float4"},
+        {   Type::tFloat16,     "float16"},
+        {   Type::tHalf2,       "half2" },
+        {   Type::tHalf3,       "half3" },
+        {   Type::tHalf4,       "half4" },
+        {   Type::tHalf8,       "half8" },
+        {   Type::tShort2,      "short2"},
+        {   Type::tShort3,      "short3"},
+        {   Type::tShort4,      "short4"},
+        {   Type::tShort8,      "short8"},
+        {   Type::tUShort2,     "ushort2"},
+        {   Type::tUShort3,     "ushort3"},
+        {   Type::tUShort4,     "ushort4"},
+        {   Type::tUShort8,     "ushort8"},
+        {   Type::tByte2,       "byte2" },
+        {   Type::tByte3,       "byte3" },
+        {   Type::tByte4,       "byte4" },
+        {   Type::tByte8,       "byte8" },
+        {   Type::tByte16,      "byte16"},
+        {   Type::tUByte2,      "ubyte2"},
+        {   Type::tUByte3,      "ubyte3"},
+        {   Type::tUByte4,      "ubyte4"},
+        {   Type::tUByte8,      "ubyte8"},
+        {   Type::tUByte16,     "ubyte16"},
         {   Type::tDouble,      "double" },
         {   Type::tRange,       "range" },
         {   Type::tURange,      "urange"},
@@ -57,6 +83,8 @@ namespace das
         {   Type::tLambda,      "lambda"},
         {   Type::tTuple,       "tuple"},
         {   Type::tVariant,     "variant"},
+        {   Type::tFixedArray,  "fixed array"},
+        {   Type::tDistinct,    "distinct"},
         {   Type::fakeContext,  "__context"},
         {   Type::fakeLineInfo,  "__lineInfo"},
     };
@@ -82,7 +110,7 @@ namespace das
     }
 
     void TypeInfo::resolveAnnotation() const {
-        if ( (*daScriptEnvironment::bound)->modules ) Module::resolveAnnotation(this);
+        if ( daScriptEnvironment::getBound()->modules ) Module::resolveAnnotation(this);
     }
 
 
@@ -119,6 +147,9 @@ namespace das
             case tInt4:         return sizeof(int4);
             case tUInt:         return sizeof(uint32_t);
             case tBitfield:     return sizeof(uint32_t);
+            case tBitfield8:    return sizeof(uint8_t);
+            case tBitfield16:   return sizeof(uint16_t);
+            case tBitfield64:   return sizeof(uint64_t);
             case tUInt2:        return sizeof(uint2);
             case tUInt3:        return sizeof(uint3);
             case tUInt4:        return sizeof(uint4);
@@ -126,6 +157,29 @@ namespace das
             case tFloat2:       return sizeof(float2);
             case tFloat3:       return sizeof(float3);
             case tFloat4:       return sizeof(float4);
+            case tFloat16:      return sizeof(float16_t);
+            case tHalf2:        return sizeof(half2);
+            case tHalf3:        return sizeof(half3);
+            case tHalf4:        return sizeof(half4);
+            case tHalf8:        return sizeof(half8);
+            case tShort2:       return sizeof(short2);
+            case tShort3:       return sizeof(short3);
+            case tShort4:       return sizeof(short4);
+            case tShort8:       return sizeof(short8);
+            case tUShort2:      return sizeof(ushort2);
+            case tUShort3:      return sizeof(ushort3);
+            case tUShort4:      return sizeof(ushort4);
+            case tUShort8:      return sizeof(ushort8);
+            case tByte2:        return sizeof(byte2);
+            case tByte3:        return sizeof(byte3);
+            case tByte4:        return sizeof(byte4);
+            case tByte8:        return sizeof(byte8);
+            case tByte16:       return sizeof(byte16);
+            case tUByte2:       return sizeof(ubyte2);
+            case tUByte3:       return sizeof(ubyte3);
+            case tUByte4:       return sizeof(ubyte4);
+            case tUByte8:       return sizeof(ubyte8);
+            case tUByte16:      return sizeof(ubyte16);
             case tDouble:       return sizeof(double);
             case tRange:        return sizeof(range);
             case tURange:       return sizeof(urange);
@@ -142,8 +196,11 @@ namespace das
             case tVariant:      return 0;
             case fakeContext:   return 0;
             case fakeLineInfo:  return 0;
+            case alias:         // sometimes its requestd by generic
+            case option:
+            case autoinfer:     return 0;
             default:
-                DAS_ASSERTF(0, "not implemented. likely new built-intype been added, and support has not been updated.");
+                DAS_VERIFYF(0, "not implemented. likely new built-in type been added (type=%d), and support has not been updated.", int(type));
                 return 0;
         }
     }
@@ -173,6 +230,9 @@ namespace das
             case tInt4:         return alignof(int4);
             case tUInt:         return alignof(uint32_t);
             case tBitfield:     return alignof(uint32_t);
+            case tBitfield8:    return alignof(uint8_t);
+            case tBitfield16:   return alignof(uint16_t);
+            case tBitfield64:   return alignof(uint64_t);
             case tUInt2:        return alignof(uint2);
             case tUInt3:        return alignof(uint3);
             case tUInt4:        return alignof(uint4);
@@ -180,6 +240,29 @@ namespace das
             case tFloat2:       return alignof(float2);
             case tFloat3:       return alignof(float3);
             case tFloat4:       return alignof(float4);
+            case tFloat16:      return alignof(float16_t);
+            case tHalf2:        return alignof(half2);
+            case tHalf3:        return alignof(half3);
+            case tHalf4:        return alignof(half4);
+            case tHalf8:        return alignof(half8);
+            case tShort2:       return alignof(short2);
+            case tShort3:       return alignof(short3);
+            case tShort4:       return alignof(short4);
+            case tShort8:       return alignof(short8);
+            case tUShort2:      return alignof(ushort2);
+            case tUShort3:      return alignof(ushort3);
+            case tUShort4:      return alignof(ushort4);
+            case tUShort8:      return alignof(ushort8);
+            case tByte2:        return alignof(byte2);
+            case tByte3:        return alignof(byte3);
+            case tByte4:        return alignof(byte4);
+            case tByte8:        return alignof(byte8);
+            case tByte16:       return alignof(byte16);
+            case tUByte2:       return alignof(ubyte2);
+            case tUByte3:       return alignof(ubyte3);
+            case tUByte4:       return alignof(ubyte4);
+            case tUByte8:       return alignof(ubyte8);
+            case tUByte16:      return alignof(ubyte16);
             case tDouble:       return alignof(double);
             case tRange:        return alignof(range);
             case tURange:       return alignof(urange);
@@ -196,8 +279,11 @@ namespace das
             case tVariant:      return 1;
             case fakeContext:   return 1;
             case fakeLineInfo:  return 1;
+            case alias:         // sometimes its requestd by generic
+            case option:
+            case autoinfer:     return 0;
             default:
-                DAS_ASSERTF(0, "not implemented. likely new built-intype been added, and support has not been updated.");
+                DAS_VERIFYF(0, "not implemented. likely new built-intype been added, and support has not been updated.");
                 return 1;
         }
     }
@@ -248,7 +334,7 @@ namespace das
         return -1;
     }
 
-    int getVariantAlign ( TypeInfo * info ) {
+    static int getVariantAlign ( TypeInfo * info ) {
         int al = getTypeBaseAlign(Type::tInt);
         for ( uint32_t i=0, is=info->argCount; i!=is; ++i ) {
             al = das::max ( al, getTypeAlign(info->argTypes[i]) );
@@ -256,7 +342,7 @@ namespace das
         return al;
     }
 
-    int getVariantSize ( TypeInfo * info ) {
+    static int getVariantSize ( TypeInfo * info ) {
         int maxSize = 0;
         int al = getVariantAlign(info) - 1;
         for ( uint32_t i=0, is=info->argCount; i!=is; ++i ) {
@@ -269,6 +355,7 @@ namespace das
     }
 
     int getVariantFieldOffset ( TypeInfo * info, int index ) {
+        (void)index;
         DAS_ASSERT(info->type==Type::tVariant);
         DAS_ASSERT(uint32_t(index)<info->argCount);
         int al = getVariantAlign(info) - 1;
@@ -539,8 +626,14 @@ namespace das
                 stream << debug_type(info->firstType);
             }
             stream << ">";
-        } else if ( info->type==Type::tBitfield ) {
+        } else if ( info->type==Type::tBitfield || info->type==Type::tBitfield8 || info->type==Type::tBitfield16 || info->type==Type::tBitfield64 ) {
             stream << "bitfield";
+            switch ( info->type ) {
+                case Type::tBitfield8:    stream << ":uint8"; break;
+                case Type::tBitfield16:   stream << ":uint16"; break;
+                case Type::tBitfield64:   stream << ":uint64"; break;
+                default: break;
+            }
             if ( info->argNames ) {
                 stream << "<";
                 for ( uint32_t ai=0, ais=info->argCount; ai!=ais; ++ai ) {
@@ -670,6 +763,32 @@ namespace das
                 case Type::tFloat2:         ss << "f2"; break;
                 case Type::tFloat3:         ss << "f3"; break;
                 case Type::tFloat4:         ss << "f4"; break;
+                // 16/8-bit lattice codes (must match TypeDecl::getMangledName): h=float16/half,
+                // w=short, x=ushort, c=byte, q=ubyte. Injective vs the rest of the grammar —
+                // no other code starts with these letters, and no code is a bare digit.
+                case Type::tFloat16:        ss << "h"; break;
+                case Type::tHalf2:          ss << "h2"; break;
+                case Type::tHalf3:          ss << "h3"; break;
+                case Type::tHalf4:          ss << "h4"; break;
+                case Type::tHalf8:          ss << "h8"; break;
+                case Type::tShort2:         ss << "w2"; break;
+                case Type::tShort3:         ss << "w3"; break;
+                case Type::tShort4:         ss << "w4"; break;
+                case Type::tShort8:         ss << "w8"; break;
+                case Type::tUShort2:        ss << "x2"; break;
+                case Type::tUShort3:        ss << "x3"; break;
+                case Type::tUShort4:        ss << "x4"; break;
+                case Type::tUShort8:        ss << "x8"; break;
+                case Type::tByte2:          ss << "c2"; break;
+                case Type::tByte3:          ss << "c3"; break;
+                case Type::tByte4:          ss << "c4"; break;
+                case Type::tByte8:          ss << "c8"; break;
+                case Type::tByte16:         ss << "c16"; break;
+                case Type::tUByte2:         ss << "q2"; break;
+                case Type::tUByte3:         ss << "q3"; break;
+                case Type::tUByte4:         ss << "q4"; break;
+                case Type::tUByte8:         ss << "q8"; break;
+                case Type::tUByte16:        ss << "q16"; break;
                 case Type::tRange:          ss << "r"; break;
                 case Type::tURange:         ss << "z"; break;
                 case Type::tRange64:        ss << "r64"; break;
@@ -749,11 +868,48 @@ namespace das
     }
 
     void TextFileInfo::freeSourceData() {
+        FileInfo::freeSourceData();
         if ( source ) {
             das_aligned_free16((void*)source);
             source = nullptr;
             sourceLength = 0;
         }
+    }
+
+    void FileInfo::buildLineIndex() {
+        if ( lineIndexBuilt ) return;
+        lineIndexBuilt = true;
+        const char * src = nullptr;
+        uint32_t len = 0;
+        getSourceAndLength(src, len);
+        if ( !src || len == 0 ) return;
+        lineOffsets.reserve(len / 40 + 8);
+        lineOffsets.push_back(0);
+        for ( uint32_t i = 0; i < len; ++i ) {
+            if ( src[i] == '\n' ) {
+                lineOffsets.push_back(i + 1);
+            }
+        }
+    }
+
+    bool FileInfo::getLine ( uint32_t line, const char * & begin, uint32_t & len ) {
+        begin = nullptr;
+        len = 0;
+        if ( line == 0 ) return false;
+        if ( !lineIndexBuilt ) buildLineIndex();
+        if ( line > lineOffsets.size() ) return false;
+        const char * src = nullptr;
+        uint32_t srcLen = 0;
+        getSourceAndLength(src, srcLen);
+        if ( !src || srcLen == 0 ) return false;
+        uint32_t lineStart = lineOffsets[line - 1];
+        uint32_t lineEnd = ( line < lineOffsets.size() ) ? ( lineOffsets[line] - 1 ) : srcLen;
+        if ( lineEnd > lineStart && src[lineEnd - 1] == '\r' ) {
+            lineEnd--;
+        }
+        begin = src + lineStart;
+        len = lineEnd - lineStart;
+        return true;
     }
 
     bool FileAccess::isSameFileName ( const string & a, const string & b ) const {
@@ -818,6 +974,20 @@ namespace das
         } else {
             return incFileName;
         }
+    }
+
+
+    static string getModuleName ( const string & nameWithDots ) {
+        auto idx = nameWithDots.find_last_of("./");
+        if ( idx==string::npos ) return nameWithDots;
+        return nameWithDots.substr(idx+1);
+    }
+
+    static string getModuleFileName ( const string & nameWithDots ) {
+        auto fname = nameWithDots;
+        // TODO: should we?
+        replace ( fname.begin(), fname.end(), '.', '/' );
+        return fname;
     }
 
     ModuleInfo FileAccess::getModuleInfo ( const string & req, const string & from ) const {

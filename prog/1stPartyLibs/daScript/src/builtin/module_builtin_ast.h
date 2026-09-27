@@ -1,5 +1,7 @@
 #pragma once
 
+#include <daScript/simulate/aot_builtin_ast.h>
+
 MAKE_EXTERNAL_TYPE_FACTORY(TypeDecl,das::TypeDecl)
 MAKE_EXTERNAL_TYPE_FACTORY(FieldDeclaration,das::Structure::FieldDeclaration)
 MAKE_EXTERNAL_TYPE_FACTORY(Structure,das::Structure)
@@ -101,6 +103,7 @@ MAKE_EXTERNAL_TYPE_FACTORY(ExprConstEnumeration,das::ExprConstEnumeration);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstBitfield,das::ExprConstBitfield);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt8,das::ExprConstInt8);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt16,das::ExprConstInt16);
+MAKE_EXTERNAL_TYPE_FACTORY(ExprConstFloat16,das::ExprConstFloat16);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt64,das::ExprConstInt64);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt,das::ExprConstInt);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt2,das::ExprConstInt2);
@@ -144,7 +147,7 @@ namespace das {
     class Module_Ast : public Module {
     public:
         template <typename TT>
-        smart_ptr<TT> addExpressionAnnotation ( const smart_ptr<TT> & ann );
+        TT * addExpressionAnnotation ( TT * ann );
         Module_Ast();
         void registerFlags(ModuleLibrary & lib);
         void registerAdapterAnnotations(ModuleLibrary & lib);
@@ -180,9 +183,11 @@ namespace das {
     TypeDeclPtr makeStructureFlags();
     TypeDeclPtr makeFunctionFlags();
     TypeDeclPtr makeMoreFunctionFlags();
+    TypeDeclPtr makeMoreFunctionFlags2();
     TypeDeclPtr makeFunctionSideEffectFlags();
     TypeDeclPtr makeVariableFlags();
     TypeDeclPtr makeVariableAccessFlags();
+    TypeDeclPtr makeVariableAccessInfoFlags();
     TypeDeclPtr makeExprCopyFlags();
     TypeDeclPtr makeExprMoveFlags();
     TypeDeclPtr makeExprIfFlags();
@@ -193,10 +198,10 @@ namespace das {
     void init_expr_looks_like_call ( BasicStructureAnnotation & ann );
 
     template <typename EXPR>
-    struct AstExprAnnotation : ManagedStructureAnnotation <EXPR> {
+    struct AstExprAnnotation : ManagedStructureAnnotation <EXPR, true, false> {
         const char * parentExpression = nullptr;
         AstExprAnnotation(const string & en, ModuleLibrary & ml)
-            : ManagedStructureAnnotation<EXPR> (en, ml) {
+            : ManagedStructureAnnotation<EXPR, true, false> (en, ml) {
         }
         __forceinline void init() {
             init_expr(*this);
@@ -296,6 +301,7 @@ namespace das {
             this->template addField<DAS_BIND_MANAGED_FIELD(recordType)>("recordType");
             this->template addField<DAS_BIND_MANAGED_FIELD(values)>("values");
             this->template addField<DAS_BIND_MANAGED_FIELD(gen2)>("gen2");
+            this->template addField<DAS_BIND_MANAGED_FIELD(makeArrayOnHeap)>("makeArrayOnHeap");
         }
     };
 
@@ -314,7 +320,7 @@ namespace das {
             this->template addField<DAS_BIND_MANAGED_FIELD(value)>("value");
             this->template addField<DAS_BIND_MANAGED_FIELD(name)>("name");
             this->template addField<DAS_BIND_MANAGED_FIELD(atField)>("atField");
-            this->template addField<DAS_BIND_MANAGED_FIELD(field)>("field");
+            this->template addProperty<decltype(&EXPR::field), &EXPR::field>("field");
             this->template addField<DAS_BIND_MANAGED_FIELD(fieldIndex)>("fieldIndex");
             this->template addField<DAS_BIND_MANAGED_FIELD(annotation)>("annotation");
             this->addFieldEx ( "derefFlags", "derefFlags", offsetof(ExprField, derefFlags), makeExprFieldDerefFlags() );
@@ -328,6 +334,8 @@ namespace das {
             :  AstExpressionAnnotation<EXPR> (na, ml) {
             using ManagedType = EXPR;
             this->template addField<DAS_BIND_MANAGED_FIELD(baseType)>("baseType");
+            this->template addField<DAS_BIND_MANAGED_FIELD(promotedFromInt)>("promotedFromInt");
+            this->template addField<DAS_BIND_MANAGED_FIELD(inexactFloatPromotion)>("inexactFloatPromotion");
         }
         template <typename TT>
         void init( ModuleLibrary & ml ) {
@@ -338,7 +346,7 @@ namespace das {
     };
 
     template <typename TT>
-    smart_ptr<TT> Module_Ast::addExpressionAnnotation ( const smart_ptr<TT> & ann ) {
+    TT * Module_Ast::addExpressionAnnotation ( TT * ann ) {
         addAnnotation(ann);
         return ann;
     }

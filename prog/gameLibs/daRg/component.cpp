@@ -8,6 +8,10 @@
 
 #include "scriptUtil.h"
 #include "dargDebugUtils.h"
+#include "guiScene.h"
+#include "profiler.h"
+#include "behaviors/bhvBoundProps.h"
+#include "statefulComp.h"
 
 
 namespace darg
@@ -18,6 +22,8 @@ static bool is_valid_single_child_type(const Sqrat::Object &desc)
 {
   SQObjectType tp = desc.GetType();
   if (tp == OT_TABLE || tp == OT_CLASS || tp == OT_CLOSURE)
+    return true;
+  if (tp == OT_INSTANCE && try_get_stateful_desc(desc))
     return true;
   return false;
 }
@@ -79,7 +85,7 @@ void Component::read_behaviors(const Sqrat::Table &desc, const StringKeys *csk, 
     {
       Sqrat::Object objBhv = bhvArr.RawGetSlot(i);
       Behavior *bhv = try_cast_instance<Behavior>(objBhv, bhvArr, i, "Reading behaviors array");
-      if (bhv)
+      if (bhv && eastl::find(behaviors.begin(), behaviors.end(), bhv) == behaviors.end())
         behaviors.push_back(bhv);
     }
   }
@@ -87,6 +93,11 @@ void Component::read_behaviors(const Sqrat::Table &desc, const StringKeys *csk, 
   {
     darg_assert_trace_var(String(0, "Unexpected 'behavior' field type %s (%X)", sq_objtypestr(bhvType), bhvType), desc, csk->behavior);
   }
+
+  // bindProps implies BoundProps, no explicit behavior entry needed
+  const bool hasBindProps = !desc.RawGetSlot(csk->bindProps).IsNull();
+  if (hasBindProps && eastl::find(behaviors.begin(), behaviors.end(), &bhv_bound_props) == behaviors.end())
+    behaviors.push_back(&bhv_bound_props);
 }
 
 
@@ -192,7 +203,7 @@ void Component::check_if_desc_may_be_component(const Sqrat::Table &desc, const S
     return;
 
   const Sqrat::Object *expected_keys[] = {&csk->children, &csk->behavior, &csk->flow, &csk->rendObj, &csk->size, &csk->transform,
-    &csk->watch, &csk->hotkeys, &csk->eventHandlers};
+    &csk->watch, &csk->hotkeys, &csk->eventHandlers, &csk->bindProps};
 
   bool mayBe = false;
   for (const Sqrat::Object *key : expected_keys)
@@ -242,23 +253,29 @@ bool Component::resolve_description(const Sqrat::Object &desc, Sqrat::Table &des
     {
       builder = desc;
       Sqrat::Function func(vm, Sqrat::Object(vm), desc.GetObject());
-      Sqrat::Object tbl;
-      bool ok;
+      Sqrat::optional<Sqrat::Object> tbl;
+      GuiScene *guiScene = GuiScene::get_from_sqvm(vm);
+      G_ASSERT(guiScene);
+      guiScene->getPerfStats().builderEvals++;
+
       {
+        BuilderEvalGuard builderGuard(vm);
         TIME_PROFILE_DEV(comp_gen_sq_call);
-        ok = func.Evaluate(tbl);
+        // cumulative metric: the outermost scope already counts nested evals (e.g. calc_comp_size)
+        AutoProfileScope profile(!builderGuard.prev ? guiScene->getProfiler() : nullptr, M_COMPONENT_SCRIPT);
+        tbl = func.Eval<Sqrat::Object>();
 #if DAGOR_DBGLEVEL > 0 && TIME_PROFILER_ENABLED
         String cfn(framemem_ptr());
         get_closure_full_name(desc, cfn);
         DA_PROFILE_TAG(comp_gen_sq_call, cfn.c_str());
 #endif
       }
-      if (ok)
+      if (tbl)
       {
-        SQObjectType resType = tbl.GetType();
+        SQObjectType resType = tbl.value().GetType();
         if (resType == OT_CLASS || resType == OT_TABLE)
         {
-          desc_tbl = tbl;
+          desc_tbl = tbl.value();
           return true;
         }
         else if (resType == OT_NULL)
@@ -270,8 +287,15 @@ bool Component::resolve_description(const Sqrat::Object &desc, Sqrat::Table &des
         {
           String closureName;
           get_closure_full_name(desc, closureName);
-          String errMsg(32, "Invalid component description type %s (%X) returned from function %s", sq_objtypestr(resType), resType,
-            closureName.c_str());
+          String errMsg;
+          if (try_get_stateful_desc(tbl.value()))
+            errMsg.printf(32,
+              "Builder %s returned a stateful descriptor; it is only legal in a children slot, wrap it: "
+              "{children = <descriptor>}",
+              closureName.c_str());
+          else
+            errMsg.printf(32, "Invalid component description type %s (%X) returned from function %s", sq_objtypestr(resType), resType,
+              closureName.c_str());
 
           darg_immediate_error(vm, errMsg);
           return false;
@@ -286,7 +310,11 @@ bool Component::resolve_description(const Sqrat::Object &desc, Sqrat::Table &des
     case OT_NULL: desc_tbl = Sqrat::Table(vm); return false;
     default:
       desc_tbl = Sqrat::Table(vm);
-      String errMsg(0, "Invalid component description type = %s (%X)", sq_objtypestr(descType), descType);
+      String errMsg;
+      if (try_get_stateful_desc(desc))
+        errMsg.printf(0, "A stateful descriptor is only legal in a children slot, wrap it: {children = <descriptor>}");
+      else
+        errMsg.printf(0, "Invalid component description type = %s (%X)", sq_objtypestr(descType), descType);
       darg_immediate_error(vm, errMsg);
       return false;
   }

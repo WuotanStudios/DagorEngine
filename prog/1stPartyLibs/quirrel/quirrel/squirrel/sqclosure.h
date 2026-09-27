@@ -48,8 +48,6 @@ public:
     }
     ~SQClosure();
 
-    bool Save(SQVM *v,SQUserPointer up,SQWRITEFUNC write);
-    static bool Load(SQVM *v,SQUserPointer up,SQREADFUNC read,SQObjectPtr &ret);
 #ifndef NO_GARBAGE_COLLECTOR
     void Mark(SQCollectable **chain);
     void Finalize(){
@@ -104,12 +102,13 @@ public:
 struct SQGenerator : public CHAINABLE_OBJ
 {
     enum SQGeneratorState{eRunning,eSuspended,eDead};
+    enum ResumeMode{ResumeNormal,ResumeThrow};
 private:
     SQGenerator(SQSharedState *ss,SQClosure *closure) :
       _stack(ss->_alloc_ctx),
       _etraps(ss->_alloc_ctx)
     {
-      _closure=closure;_state=eRunning;_ci._generator=NULL;INIT_CHAIN();ADD_TO_CHAIN(&_ss(this)->_gc_chain,this);
+      _closure=closure;_state=eRunning;_ci._generator=NULL;_yield_arg1=MAX_FUNC_STACKSIZE;INIT_CHAIN();ADD_TO_CHAIN(&_ss(this)->_gc_chain,this);
     }
 public:
     static SQGenerator *Create(SQSharedState *ss,SQClosure *closure){
@@ -129,8 +128,13 @@ public:
         sq_delete(_sharedstate->_alloc_ctx, this,SQGenerator);
     }
 
-    bool Yield(SQVM *v,SQInteger target);
+    bool Yield(SQVM *v,SQInteger arg1,SQInteger target);
+    // Low-level resume; prefer RunStep, which owns the send/throw delivery.
     bool Resume(SQVM *v,SQObjectPtr &dest);
+    // Drive one resume step: deliver payload per mode, run the generator, write
+    // the yielded value into out. Returns false on an unhandled fault, leaving
+    // the thrown value in v->_lasterror.
+    bool RunStep(SQVM *v,SQObjectPtr &out,ResumeMode mode,const SQObjectPtr &payload);
 #ifndef NO_GARBAGE_COLLECTOR
     void Mark(SQCollectable **chain);
     void Finalize(){_stack.resize(0);_closure.Null();}
@@ -141,6 +145,7 @@ public:
     SQVM::CallInfo _ci;
     ExceptionsTraps _etraps;
     SQGeneratorState _state;
+    SQInteger _yield_arg1;
 };
 
 #define _CALC_NATVIVECLOSURE_SIZE(noutervalues) (sizeof(SQNativeClosure) + ((noutervalues)*sizeof(SQObjectPtr)))
@@ -149,7 +154,7 @@ struct SQNativeClosure : public CHAINABLE_OBJ
 {
 private:
     SQNativeClosure(SQSharedState *ss,SQFUNCTION func) :
-      _typecheck(ss->_alloc_ctx), _purefunction(false)
+      _docstring_id(0), _purefunction(false), _nodiscard(false), _isfastcall(false), _typecheck(ss->_alloc_ctx)
     {
       _function=func;INIT_CHAIN();ADD_TO_CHAIN(&_ss(this)->_gc_chain,this); _env = NULL;
     }
@@ -161,7 +166,10 @@ public:
         new (nc) SQNativeClosure(ss,func);
         nc->_outervalues = (SQObjectPtr *)(nc + 1);
         nc->_noutervalues = nouters;
+        nc->_result_type_mask = ~0u;
         nc->_purefunction = false;
+        nc->_nodiscard = false;
+        nc->_isfastcall = false;
         _CONSTRUCT_VECTOR(SQObjectPtr,nc->_noutervalues,nc->_outervalues);
         return nc;
     }
@@ -172,9 +180,13 @@ public:
         if(ret->_env) __ObjAddRef(ret->_env);
         ret->_name = _name;
         _COPY_VECTOR(ret->_outervalues,_outervalues,_noutervalues);
+        ret->_result_type_mask = _result_type_mask;
         ret->_typecheck.copy(_typecheck);
         ret->_nparamscheck = _nparamscheck;
         ret->_purefunction = _purefunction;
+        ret->_nodiscard = _nodiscard;
+        ret->_isfastcall = _isfastcall;
+        ret->_docstring_id = _docstring_id;
         return ret;
     }
     ~SQNativeClosure()
@@ -197,7 +209,15 @@ public:
 #endif
     SQInteger _nparamscheck;
     SQUnsignedInteger32 _noutervalues;
-    bool _purefunction;
+    SQUnsignedInteger32 _result_type_mask;
+    SQUnsignedInteger32 _docstring_id : 24;
+    SQUnsignedInteger32 _purefunction : 1;
+    SQUnsignedInteger32 _nodiscard : 1;
+    // Eligible for the _OP_FASTCALL mini-frame (see sqvm.cpp). Contract for a
+    // marked function: it must not call back into the VM (sq_call, metamethods)
+    // or read CallInfo/sq_stackinfos, must not return SQ_SUSPEND_FLAG or
+    // SQ_TAILCALL_FLAG, must push O(1) values, and must not use _env or outers.
+    SQUnsignedInteger32 _isfastcall : 1;
     SQIntVec _typecheck;
     SQObjectPtr *_outervalues;
     SQWeakRef *_env;

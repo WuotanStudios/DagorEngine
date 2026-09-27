@@ -38,7 +38,7 @@ MobileSSAORenderer::MobileSSAORenderer(int w, int h, int, uint32_t flags)
   for (int i = 0; i < ssaoTex.size(); ++i)
   {
     String name(128, "ssao_tex_%d_%d", viewCounter, i);
-    ssaoTex[i] = dag::create_tex(nullptr, aoWidth, aoHeight, format | TEXCF_RTARGET, 1, name.c_str());
+    ssaoTex[i] = dag::create_tex(nullptr, aoWidth, aoHeight, format | TEXCF_RTARGET, 1, name.c_str(), RESTAG_AO);
   }
 
   aoRenderer.reset(create_postfx_renderer(ssao_sh_name));
@@ -63,7 +63,7 @@ void MobileSSAORenderer::setFactor()
 
   const float factor = cvt(aoWidth, lowEndWidth, highEndWidth, scaledFactor, baseFactor);
 
-  ShaderGlobal::set_real(ssao_radius_factorVarId, factor);
+  ShaderGlobal::set_float(ssao_radius_factorVarId, factor);
 }
 
 MobileSSAORenderer::~MobileSSAORenderer()
@@ -75,8 +75,8 @@ MobileSSAORenderer::~MobileSSAORenderer()
 
 void MobileSSAORenderer::renderSSAO(BaseTexture * /*depth_to_use*/)
 {
-  d3d::set_render_target(ssaoTex[renderId].getTex2D(), 0);
-  d3d::clearview(CLEAR_DISCARD, 0xFFFFFFFF, 1.0, 0);
+  d3d::set_render_target({}, DepthAccess::RW, {{ssaoTex[renderId].getTex2D(), 0, 0}});
+  d3d::clearview(DISCARD_ALL, 0xFFFFFFFF, 1.0, 0);
   aoRenderer->render();
 }
 
@@ -88,8 +88,8 @@ void MobileSSAORenderer::applyBlur()
 
   ssaoBlurRenderer->getMat()->set_color4_param(ssao_texel_offsetVarId, texelOffset);
 
-  d3d::set_render_target(ssaoTex[blurId].getTex2D(), 0);
-  d3d::clearview(CLEAR_DISCARD, 0, 0, 0);
+  d3d::set_render_target({}, DepthAccess::RW, {{ssaoTex[blurId].getTex2D(), 0, 0}});
+  d3d::clearview(DISCARD_ALL, 0, 0, 0);
 
   ShaderGlobal::set_texture(ssao_texVarId, ssaoTex[renderId]);
   ssaoBlurRenderer->render();
@@ -135,8 +135,8 @@ void MobileSSAORenderer::setReprojection(const TMatrix &view_tm, const TMatrix4 
   reprojectionData.prevWorldPos = worldPos;
 }
 
-void MobileSSAORenderer::render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssaoDepthTexUse,
-  const ManagedTex *ssao_tex, const ManagedTex *prev_ssao_tex, const ManagedTex *tmp_tex, const DPoint3 *, SubFrameSample)
+void MobileSSAORenderer::render(const TMatrix &view_tm, const TMatrix4 &proj_tm, BaseTexture *ssaoDepthTexUse, BaseTexture *ssao_tex,
+  BaseTexture *prev_ssao_tex, BaseTexture *tmp_tex, const DPoint3 *, SubFrameSample)
 {
   TIME_D3D_PROFILE(SSAO_total)
   SCOPE_RENDER_TARGET;

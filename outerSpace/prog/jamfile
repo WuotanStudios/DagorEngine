@@ -6,14 +6,17 @@ GameMainVromFilePath = outer_space.vromfs.bin ;
 include $(Root)/prog/daNetGame/target_name_rules.jam ; # Note - $(Platform) is not defined before this line unless passed in command line
 
 TargetType ?= exe ;
+SupportsUsingHostedInternalServer = yes ;
 if $(Dedicated) != yes { TargetType = exe ; }
 Target     ?= [ CorrectTargetName ] ;
 TargetCodeName = $(Game) ; # this will hold target name unchanged even if non-default phys engine is used
 UseSystemOpenSSL = no ;
-PlatformArch_windows = x86_64 ;
 
 NOCARE $(Root)/$(Location)/def.jam ;
 include $(Root)/$(Location)/def.jam ;
+
+PlatformArch_windows ?= host_arch ;
+include $(Root)/prog/_jBuild/defPlatform.jam ;
 
 UseModulesAI = no ;
 UseModulesDM = no ;
@@ -22,11 +25,13 @@ NetPeerAuth = yes ;
 
 AotJamfile = $(Root)/prog/daNetGame-das-aot/jamfile ;
 AotCompilerBaseName = $(Root)/$(Location)/../tools/das-aot/outer_space-aot ;
+
 include $(Root)/prog/daNetGame/setup.jam ; # Note - $(Platform) is not defined before this line unless passed in command line
 DAS_AOT_COMPILER_OPT = -- --config outer_space_aot_config.blk -sConfig $(Config) ;
-if $(Platform) in windows { UseHostedInternalServer = yes ; }
 
-if $(Dedicated) != yes && $(Platform) in windows && $(PlatformArch) != arm64 {
+if ! $(Platform) in macOS android { UseHostedInternalServer = yes ; }
+
+if $(Dedicated) != yes && $(Platform) in windows {
   VRDeviceSupport ?= yes ;
 }
 
@@ -63,7 +68,9 @@ AllSrcFolder_CPP = ;
 
 # we set auth key explicitly otherwize linux server will reject any linux client (for win/mac auth key check is skipped)
 GameAuthKey_linux    = 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ;
-GameAuthKeyPlatformListPairs = linux linux ;
+GameAuthKey_ps5      = $(GameAuthKey_linux) ;
+GameAuthKey_scarlett = $(GameAuthKey_linux) ;
+GameAuthKeyPlatformListPairs = linux linux  xbox scarlett  ps ps5 ;
 #GamePublicKeyDER = ;
 
 include $(Root)/$(Location)/logCryptKey.jam ;
@@ -82,25 +89,27 @@ gamePulls = daECS/core/componentType.h game_pulls ;
 gamePulls +=
   framework_package_physobj_pull
   daNetGameLibs_native_dasevents_DAS_pull_AOT
+  daNetGameLibs_composite_entity_DAS_pull_AOT
 ;
 if $(Dedicated) = no {
   gamePulls +=
     daNetGameLibs_render_debug_DAS_pull_AOT
     daNetGameLibs_frame_graph_renderer_DAS_pull_AOT
   ;
-  Sources += gamePulls.jamvar ;
-} else {
-  Sources += gamePullsDed.jamvar ;
-  gamePullsDed = $(gamePulls) ;
-  gamePullsDed_action = $(gamePulls_action) ;
 }
+AddGamePullsToSources ;
 
-AddIncludes += $(Root)/prog/daNetGameLibs ;
+AddIncludes +=
+  $(Root)/prog/daNetGameLibs
+  $(Root)/prog/gameLibs
+;
+
 UseProgLibs +=
   daNetGame
   daNetGameLibs/package_physobj
   daNetGameLibs/dm/stub
   daNetGameLibs/native_dasevents
+  daNetGameLibs/composite_entity
 ;
 if $(Dedicated) = no {
   UseProgLibs +=
@@ -129,6 +138,7 @@ if $(Dedicated) != yes {
       Manifest = $(Root)/$(Location)/platform/$(Platform)/outer_space.exe.manifest ;
     }
     include $(Root)/prog/engine/drv/drv3d_DX12/copy_bundles.jam ;
+    include $(Root)/prog/engine/drv/drv3d_commonCode/copy_bundles.jam ;
     if $(FmodStudio) != src && $(HaveSound) != no {
       AddLibs += $(FmodStaticLibs) ;
       for dll in $(FmodStudioSharedLibs) { BundleCopy += @$(dll) $(dll:D=) ; }
@@ -140,6 +150,7 @@ if $(Dedicated) != yes {
       for dll in $(FmodStudioSharedLibs) { BundleCopy += @$(dll) $(dll:D=:S=) ; }
     }
   } else if $(Platform) = macOS {
+    if $(PlatformArch) = arm64 { ForceSignTarget_macOS = yes ; }
     BundleID   = com.gaijinent.$(BundleName) ;
     BundlePlist = @$(Root)/prog/_jBuild/macOS/generic.info.plist ../Info.plist ;
     BundleIcon = $(BundleName) ;
@@ -210,7 +221,6 @@ if $(Dedicated) != yes {
         platform/android.bundle/$(Game)/src/$(JavaActivitySrcName).java      src/com/gaijinent/$(BundleName)/$(JavaActivitySrcName).java
         @$(Root)/prog/gameLibs/android/platform/android.bundle/src/$(AndroidCommonPackage)/DagorCommonActivity.java      src/$(AndroidCommonPath)/DagorCommonActivity.java
         @$(Root)/prog/gameLibs/android/platform/android.bundle/src/$(AndroidCommonPackage)/DagorBaseActivity.java      src/$(AndroidCommonPath)/DagorBaseActivity.java
-        @$(Root)/prog/gameLibs/android/platform/android.bundle/src/$(AndroidCommonPackage)/DagorThermal.java      src/$(AndroidCommonPath)/DagorThermal.java
         @$(FmodStudioLowLibPath)/../fmod.jar       libs/fmod.jar
         @$(upd_so) libs/$(PlatformArch)/libupdater.so
         platform/android/config.blk assets/config.blk
@@ -227,6 +237,7 @@ if $(Dedicated) != yes {
 
     #AndroidCopyToDevice = default ;
   }
+  else if $(Platform) in ps5 scarlett { include setup_$(Platform).jam ; }
   else {
     Exit unsupported Platform\=$(Platform) for Target\=$(Target) ;
   }
@@ -250,19 +261,7 @@ AutoscanBuildLists $(AllSrcFolder_ES)  : *ES.cpp.inl : SourceES ;
 for s in $(SourceES) { GenESSourceFile $(s) ; }
 SourceES = ;
 
-if $(VRDeviceSupport) = yes {
-  if $(Platform) = android {
-    BundleCopy +=
-      @$(OpenXrSdkPath)/$(Platform)/$(PlatformArch)/Release/libopenxr_loader.so libs/$(PlatformArch)/libopenxr_loader.so
-    ;
-  }
-  else {
-    BundleCopy +=
-      @$(OpenXrSdkPath)/$(LegacyPlatformSuffix)/bin/openxr_loader.dll openxr_loader.dll
-      @$(OpenXrSdkPath)/$(LegacyPlatformSuffix)/bin/openxr_loader.pdb openxr_loader.pdb
-    ;
-  }
-}
+if $(VRDeviceSupport) = yes { include $(Root)/prog/engine/drv/vr_device/bundle.jam ; }
 
 if $(DumpBuildCmds) != yes {
 echo building Target\=$(Target) to $(_Output) "

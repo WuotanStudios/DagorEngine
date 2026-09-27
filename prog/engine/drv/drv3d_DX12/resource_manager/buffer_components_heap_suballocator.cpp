@@ -77,9 +77,9 @@ void HeapSuballocatorImpl<MaxSignatureCount>::update(Buckets &buckets, uint32_t 
 }
 
 
-void BufferHeap::HeapSuballocator::onHeapCreated(Heap &heap)
+void BufferHeap::HeapSuballocator::onHeapCreated(Heap &heap, bool can_suballocate)
 {
-  if (!heap.canSubAllocateFrom())
+  if (!can_suballocate)
     return;
 
   heap.setSuballocator(this);
@@ -93,7 +93,7 @@ void BufferHeap::HeapSuballocator::onHeapUpdated(const Heap &heap)
 
 void BufferHeap::HeapSuballocator::onHeapDestroyed(Heap &heap)
 {
-  if (!heap.canSubAllocateFrom())
+  if (!heap.hasSuballocator())
     return;
 
   heap.setSuballocator(nullptr);
@@ -102,38 +102,68 @@ void BufferHeap::HeapSuballocator::onHeapDestroyed(Heap &heap)
 
 void BufferHeap::HeapSuballocator::clear() { impl.clear(); }
 
-eastl::pair<BufferHeap::Heap *, ValueRange<uint64_t>> BufferHeap::HeapSuballocator::trySuballocate(dag::Vector<Heap> &buffer_heaps,
-  ResourceHeapProperties properties, uint64_t size, D3D12_RESOURCE_FLAGS flags, uint32_t offset_alignment)
+eastl::optional<eastl::pair<BufferHeap::Heap *, ValueRange<uint64_t>>> BufferHeap::HeapSuballocator::trySuballocate(
+  dag::Vector<Heap> &buffer_heaps, ResourceHeapProperties properties, uint64_t size, D3D12_RESOURCE_FLAGS flags,
+  uint32_t offset_alignment)
 {
   if (flags != D3D12_RESOURCE_FLAG_NONE)
-    return {nullptr, {}};
+    return {};
 
   const uint32_t signature = properties.raw;
 
   Heap *selectedHeap = nullptr;
   ValueRange<uint64_t> allocationRange;
-  impl.iterateSuitableHeaps(signature, size,
+  impl.iterateSuitableHeapsInSameSizeBucketOnly(signature, size,
     [&buffer_heaps, &selectedHeap, &allocationRange, size, offset_alignment, signature](uint32_t heap_index,
       uint64_t max_free_range_size) {
       G_UNUSED(max_free_range_size);
       G_UNUSED(signature);
       Heap &heap = buffer_heaps[heap_index];
 
-      G_ASSERT(heap.canSubAllocateFrom());
+      G_ASSERT(heap.hasSuballocator());
       G_ASSERT(heap.getMaxFreeRangeSize() == max_free_range_size);
       G_ASSERT(getSignature(heap) == signature);
 
-      auto range = heap.allocate(size, offset_alignment);
-      if (range.empty())
+      auto range = heap.allocateExact(size, offset_alignment);
+      if (!range)
         return false;
 
       selectedHeap = &heap;
-      allocationRange = range;
+      allocationRange = *range;
 
       return true;
     });
 
-  return {selectedHeap, allocationRange};
+  if (!selectedHeap)
+  {
+    impl.iterateSuitableHeapsInBufferOrder(signature, size,
+      [&buffer_heaps, &selectedHeap, &allocationRange, size, offset_alignment, signature](uint32_t heap_index,
+        uint64_t max_free_range_size) {
+        G_UNUSED(max_free_range_size);
+        G_UNUSED(signature);
+        Heap &heap = buffer_heaps[heap_index];
+
+        G_ASSERT(heap.hasSuballocator());
+        G_ASSERT(heap.getMaxFreeRangeSize() == max_free_range_size);
+        G_ASSERT(getSignature(heap) == signature);
+
+        auto range = heap.allocate(size, offset_alignment);
+        if (!range)
+          return false;
+
+        selectedHeap = &heap;
+        allocationRange = *range;
+
+        return true;
+      });
+  }
+
+  if (!selectedHeap)
+  {
+    return {};
+  }
+
+  return eastl::pair<Heap *, ValueRange<uint64_t>>{selectedHeap, allocationRange};
 }
 
 uint32_t BufferHeap::HeapSuballocator::getSignature(const Heap &heap) { return heap.getHeapID().group; }

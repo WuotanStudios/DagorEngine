@@ -61,6 +61,7 @@ protected:
   Buffer();
 
 public:
+  uint32_t bufSizeUnaligned = 0;
   uint32_t bufSize;
   uint32_t bufFlags;
   uint16_t structSize;
@@ -69,10 +70,8 @@ public:
   // and commit changes to cur_buffer at the end of frame
   id<MTLBuffer> dynamic_buffer = nil;
   int dynamic_offset = 0;
+  int dynamic_size = 0;
   uint64_t dynamic_frame = 0;
-
-  // slot mask where buffer is bound
-  uint64_t bound_slots = 0;
 
   int locked_offset;
   int locked_size;

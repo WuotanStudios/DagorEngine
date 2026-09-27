@@ -17,6 +17,9 @@
 namespace drv3d_vulkan
 {
 
+// the VS/FS push constant range split below is the spirv ABI value baked by the shader compiler
+static_assert(MAX_IMMEDIATE_CONST_WORDS == spirv::MAX_IMMEDIATE_CONST_WORDS);
+
 template <template <typename> class BaseShaderSet, typename ShaderConfig>
 class BasePipelineLayout
 {
@@ -35,9 +38,16 @@ public:
   VulkanPipelineLayoutHandle handle;
   VkShaderStageFlags shaderStages;
   size_t activeRegisters;
+  uint8_t bindlessSetsUsed;
+
+  ShaderSet<eastl::pair<bool, ShaderModuleHeader>> moduleHeaders;
+
+  void onDeviceReset() { shutdown(); }
+
+  void afterDeviceReset() { init(); }
 
 private:
-  void init(const CreationInfo &headers)
+  void init()
   {
     VulkanDescriptorSetLayoutHandle layoutSet[ShaderConfig::count + spirv::bindless::MAX_SETS];
     VkPushConstantRange pushConstantSet[ShaderConfig::count + spirv::bindless::MAX_SETS];
@@ -50,11 +60,19 @@ private:
     }
 
     activeRegisters = 0;
+    uint32_t activeStageCount = 0;
     for (size_t i = 0; i < ShaderConfig::count; ++i) // -V1008
-      if (headers.list[i])
+      if (moduleHeaders.list[i].first)
+      {
         activeRegisters = i + 1;
+        ++activeStageCount;
+      }
+    // dynamic uniform buffers are a per pipeline layout total shared across its stages; split it by
+    // this layout's actual stage count so common 1-2 stage layouts keep most b slots dynamic
+    const uint32_t dynamicBSlots = Globals::cfg.dynamicUniformBufferSlotsForLayout(activeStageCount);
 
     shaderStages = 0;
+    bindlessSetsUsed = 0;
     VkPipelineLayoutCreateInfo plci;
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.pNext = NULL;
@@ -66,23 +84,24 @@ private:
 
     for (size_t i = 0; i < activeRegisters; ++i)
     {
-      if (headers.list[i])
+      const ShaderModuleHeader &header = moduleHeaders.list[i].second;
+      if (moduleHeaders.list[i].first)
       {
-        registers.list[i].init(headers.list[i]->hash, headers.list[i]->header, ShaderConfig::stages[i]);
-        shaderStages |= headers.list[i]->stage;
-        if (headers.list[i]->header.pushConstantsCount)
+        bindlessSetsUsed = max(header.header.bindlessSetsUsed, bindlessSetsUsed);
+        registers.list[i].init(header.hash, header.header, ShaderConfig::stages[i], dynamicBSlots);
+        shaderStages |= header.stage;
+        if (header.header.pushConstantsCount)
         {
           // VS+PS can use different push constant ranges
           // yet other stages must share range from VS, and is always present in this case
           // so conunt offsets for VS+PS combo and expand VS range by stage flags for other stages
-          uint32_t pushConstantsSize = (uint32_t)(4 * headers.list[i]->header.pushConstantsCount);
+          uint32_t pushConstantsSize = (uint32_t)(4 * header.header.pushConstantsCount);
 
-          if (headers.list[i]->stage & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT))
+          if (header.stage & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT))
           {
             // for PS we use MAX_IMMEDIATE_CONST_WORDS elements hardcoded offset
-            uint32_t offset =
-              (headers.list[i]->stage & VK_SHADER_STAGE_FRAGMENT_BIT) ? MAX_IMMEDIATE_CONST_WORDS * sizeof(uint32_t) : 0;
-            pushConstantSet[plci.pushConstantRangeCount] = {headers.list[i]->stage, offset, pushConstantsSize};
+            uint32_t offset = (header.stage & VK_SHADER_STAGE_FRAGMENT_BIT) ? MAX_IMMEDIATE_CONST_WORDS * sizeof(uint32_t) : 0;
+            pushConstantSet[plci.pushConstantRangeCount] = {header.stage, offset, pushConstantsSize};
             ++plci.pushConstantRangeCount;
           }
           else
@@ -127,14 +146,22 @@ private:
 
     for (size_t i = 0; i < activeRegisters; ++i)
     {
-      if (headers.list[i])
+      if (moduleHeaders.list[i].first)
         registers.list[i].initUpdateTemplate(ShaderConfig::bind, handle,
           ShaderConfig::registerIndexes[i] + ShaderConfig::bindlessSetCount);
     }
   }
 
 public:
-  BasePipelineLayout(const CreationInfo &headers) { init(headers); }
+  BasePipelineLayout(const CreationInfo &headers)
+  {
+    for (size_t i = 0; i < ShaderConfig::count; ++i) // -V1008
+      if (headers.list[i])
+        moduleHeaders.list[i] = eastl::make_pair(true, *headers.list[i]);
+      else
+        moduleHeaders.list[i] = eastl::make_pair(false, ShaderModuleHeader{});
+    init();
+  }
 
   void shutdown()
   {
@@ -150,9 +177,20 @@ public:
       if (headers.list[i] && i >= activeRegisters)
         return false;
 
+    // match on the raw module identity: registers hold per-layout normalized headers, but the
+    // normalization is a deterministic function of this same module set, so raw identity is the key
     for (uint32_t i = 0; i < activeRegisters; ++i)
     {
-      if (!registers.list[i].matches(headers.list[i]))
+      const eastl::pair<bool, ShaderModuleHeader> &stored = moduleHeaders.list[i];
+      const ShaderModuleHeader *inc = headers.list[i];
+      if (!inc)
+      {
+        if (stored.first)
+          return false;
+        continue;
+      }
+      if (!stored.first || stored.second.hash != inc->hash ||
+          memcmp(&stored.second.header, &inc->header, sizeof(spirv::ShaderHeader)) != 0)
         return false;
     }
 
@@ -219,7 +257,7 @@ class BasePipeline : public CustomPipeline<PipelineLayoutType, PipelineProgramTy
 {
 public:
   BasePipeline(PipelineLayoutType *iLayout) :
-    CustomPipeline<PipelineLayoutType, PipelineProgramType>(iLayout), handle(), compiledHandle()
+    CustomPipeline<PipelineLayoutType, PipelineProgramType>(iLayout), handle(), compiledHandle(), ignore(false)
   {}
 
   void shutdown()
@@ -373,6 +411,10 @@ public:
 
     debug("====%016llX====", generalize(pipe_handle));
   }
+  bool isIgnored() { return ignore; }
+
+protected:
+  bool ignore;
 
 private:
   VulkanPipelineHandle handle;

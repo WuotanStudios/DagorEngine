@@ -1,8 +1,9 @@
 
+#define MIN_POSSIBLE_WARP_SIZE 64 // Xbox One (GCN, wave64)
+
 #define WAVE_INTRINSICS 1
 #define WaveReadLaneAt __XB_ReadLane
 #define WaveReadFirstLane(a) __XB_MakeUniform((a))
-#define WaveIsHelperLane  WaveIsFirstLane
 #define WaveGetLaneIndex __XB_GetLaneID
 #define WaveActiveAllTrue(val) WaveAllBitAnd(uint(val))
 #define WaveAllBitOr __XB_WaveOR
@@ -46,3 +47,5 @@ struct TextureCubeArraySampler
   TextureCubeArray tex;
   SamplerState smp;
 };
+
+#define ACCESS_FORMAT(fmt)

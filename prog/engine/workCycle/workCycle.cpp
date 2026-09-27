@@ -13,12 +13,13 @@
 #include <drv/hid/dag_hiGlobals.h>
 #include <drv/hid/dag_hiJoystick.h>
 #include <drv/hid/dag_hiPointing.h>
-#if _TARGET_C1 | _TARGET_C2
-
+#if _TARGET_C1 | _TARGET_C2 | _TARGET_XBOX
+#include <drv/hid/dag_hiKeyboard.h>
 #endif
 #include <startup/dag_inpDevClsDrv.h>
 #include <startup/dag_restart.h>
 #include <startup/dag_globalSettings.h>
+#include <ioSys/dag_dataBlock.h>
 #include <perfMon/dag_cpuFreq.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_lock.h>
@@ -37,7 +38,6 @@
 #include <perfMon/dag_statDrv.h>
 #include <perfMon/dag_cachesim.h>
 #include <shaders/dag_shaders.h>
-#include <util/dag_convar.h>
 #include "workCyclePriv.h"
 
 #include <EASTL/finally.h>
@@ -62,7 +62,67 @@ void workcycleperf::enable_debug(bool on) { perf_debug_req_on = on; }
 #if _TARGET_XBOX || _TARGET_PC_WIN || _TARGET_C1
 #include <perfMon/dag_pix.h>
 #include <util/dag_console.h>
-CONSOLE_INT_VAL("render", pix_capture_n_frames, 0, 0, 50);
+#include <util/dag_simpleString.h>
+#include <util/dag_string.h>
+#include <osApiWrappers/dag_unicode.h>
+
+static constexpr int MAX_PIX_CAPTURE_FRAMES = 50;
+static int pix_capture_frames_requested = 0;
+static SimpleString pix_capture_file_name;
+
+#if _TARGET_XBOX || _TARGET_PC_WIN
+#include <perfMon/dag_pixTimingCapture.h>
+#include <osApiWrappers/dag_direct.h>
+
+static constexpr int MAX_PIX_CPU_CAPTURE_SECONDS = 120;
+static constexpr int PIX_CPU_CAPTURE_TOOLING_MB = 1024;
+static constexpr int PIX_CPU_CAPTURE_SAMPLES_PER_SEC = 4000;
+#if _TARGET_PC_WIN
+static constexpr char PIX_CPU_CAPTURE_FILE_EXT[] = ".wpix";
+#else
+// on xbox PIX names the file itself and gives it .pevt, so an extension of ours would only double up
+static constexpr char PIX_CPU_CAPTURE_FILE_EXT[] = "";
+#endif
+static int pix_cpu_capture_seconds_requested = 0;
+static SimpleString pix_cpu_capture_file_name;
+#endif
+
+static bool is_uint_arg(const char *s) { return s[0] && !s[strspn(s, "0123456789")]; }
+
+static bool pix_capture_console_handler(const char *argv[], int argc)
+{
+  int found = 0;
+  CONSOLE_CHECK_NAME_EX("render", "pix_capture_n_frames", 1, 3, "make a PIX GPU capture of the next frames",
+    "[file_name] [frame_count]")
+  {
+    int frames = 1;
+    pix_capture_file_name.clear();
+    for (int i = 1; i < argc; i++)
+      if (is_uint_arg(argv[i]))
+        frames = console::to_int(argv[i]);
+      else
+        pix_capture_file_name = argv[i];
+
+    pix_capture_frames_requested = min(max(frames, 1), MAX_PIX_CAPTURE_FRAMES);
+  }
+#if _TARGET_XBOX || _TARGET_PC_WIN
+  CONSOLE_CHECK_NAME_EX("render", "pix_cpu_capture", 1, 3, "make a PIX timing (CPU) capture for N seconds", "[file_name] [seconds]")
+  {
+    int seconds = 10;
+    pix_cpu_capture_file_name.clear();
+    for (int i = 1; i < argc; i++)
+      if (is_uint_arg(argv[i]))
+        seconds = console::to_int(argv[i]);
+      else
+        pix_cpu_capture_file_name = argv[i];
+
+    pix_cpu_capture_seconds_requested = min(max(seconds, 1), MAX_PIX_CPU_CAPTURE_SECONDS);
+  }
+#endif
+  return found;
+}
+
+REGISTER_CONSOLE_HANDLER(pix_capture_console_handler);
 #endif
 #endif
 
@@ -85,6 +145,7 @@ static constexpr int MAX_TIME_STEP = 250000;
 
 static void act();
 static void draw(bool enable_stereo, int elapsed_usec, float gametime_elapsed, bool call_before_render = true, bool draw_gui = true);
+static void handle_programmatic_pix_cpu_capture();
 static bool present(bool updateScreenNeeded);
 
 static bool is_minimized_fullscreen() { return !::dgs_app_active && dgs_get_window_mode() == WindowMode::FULLSCREEN_EXCLUSIVE; }
@@ -100,16 +161,20 @@ bool dagor_work_cycle_is_need_to_draw()
 
 void dagor_work_cycle()
 {
-  struct CpuOnlyCycleScope
+  struct WorkCycleScope
   {
-    CpuOnlyCycleScope() { workcycleperf::mark_cpu_only_cycle_start(); }
-    ~CpuOnlyCycleScope() { end(); }
-    void end() { workcycleperf::mark_cpu_only_cycle_end(); }
-  } cpuOnlyCycleScope;
+    WorkCycleScope() { workcycleperf::mark_workcycle_start(); }
+    ~WorkCycleScope() { endCpuCycle(); }
+    void endCpuCycle() { workcycleperf::mark_cpu_only_cycle_end(); }
+  } workCycleScope;
 
   [[maybe_unused]] AutoDepthCounter acntr;
   TIME_PROFILER_TICK();
   ScopedCacheSim cachesim;
+
+  // this one counts seconds, not frames, so it must not sit on the drawing path: the cycle returns
+  // before draw while the window is minimized or occluded, and the capture would outlive its time
+  handle_programmatic_pix_cpu_capture();
 
   interlocked_increment(dagor_global_frame_id);
 
@@ -143,18 +208,18 @@ void dagor_work_cycle()
     interlocked_release_store(latest_frame_started, currentFrameId);
     // if the frame was not already started, we start it here
     TIME_PROFILE(low_latency);
-    d3d::begin_frame(currentFrameId, true);
+    static bool allowWait = dgs_get_settings()->getBlockByNameEx("video")->getBool("pufdGpuLatencyWait", true);
+    d3d::begin_frame(currentFrameId, allowWait);
     d3d::mark_simulation_start(currentFrameId);
   }
   auto deferredSimulationEnd = eastl::finally([]() { d3d::mark_simulation_end(dagor_get_global_frame_id()); });
 
-  ::dagor_idle_cycle();
+  bool willGoIdle = is_minimized_fullscreen() && ::dgs_dont_use_cpu_in_background;
+  ::dagor_idle_cycle(false, !willGoIdle);
 
-  if (DAGOR_UNLIKELY(is_minimized_fullscreen() && ::dgs_dont_use_cpu_in_background))
+  if (DAGOR_UNLIKELY(willGoIdle))
   {
     ResourceChecker::report();
-    if (tql::on_frame_finished)
-      tql::on_frame_finished();
     sleep_msec(200);
     ::dagor_reset_spent_work_time();
     return;
@@ -281,7 +346,11 @@ void dagor_work_cycle()
       interlocked_release_store(workcycle_internal::lastFrameTime, 1); // tell act to proceed working
       ResourceChecker::report();
       if (tql::on_frame_finished)
+      {
         tql::on_frame_finished();
+        // process pending resource updates because we won't present.
+        d3d::driver_command(Drv3dCommand::PROCESS_PENDING_RESOURCE_UPDATED);
+      }
       return;
     }
   }
@@ -306,12 +375,6 @@ void dagor_work_cycle()
   }
 #endif
 
-  // perform scene rendering
-  {
-    TIME_PROFILE(wait_for_async_present);
-    d3d::wait_for_async_present();
-  }
-
   if (DAGOR_UNLIKELY(check_and_handle_window_resize()))
     check_and_restore_3d_device();
 
@@ -327,15 +390,14 @@ void dagor_work_cycle()
   workcycleperf::log("== draw: endt=%6d us, dur=%6d us", fdt, fdt);
 
   // end before scope close, because we must not include present time that is usually waiting for GPU
-  cpuOnlyCycleScope.end();
+  workCycleScope.endCpuCycle();
 
+  d3d::mark_render_end(dagor_get_global_frame_id());
   if (game_scene && game_scene->canPresentAndReset())
   {
     updatescr_done = false;
     present(true);
   }
-
-  d3d::mark_render_end(dagor_get_global_frame_id());
 
   occluded_window = (da_profiler::get_active_mode() == 0) && d3d::is_window_occluded();
 
@@ -371,9 +433,9 @@ static void act()
     WinAutoLock lock(global_cls_drv_update_cs);
     if (::global_cls_drv_joy)
       ::global_cls_drv_joy->updateDevices();
-#if _TARGET_C1 | _TARGET_C2
-
-
+#if _TARGET_C1 | _TARGET_C2 | _TARGET_XBOX
+    if (::global_cls_drv_kbd)
+      ::global_cls_drv_kbd->updateDevices();
 #endif
     if (::global_cls_drv_pnt)
       ::global_cls_drv_pnt->updateDevices();
@@ -392,7 +454,7 @@ static void act()
 static void handle_programmatic_pix_capture()
 {
 #if DAGOR_DBGLEVEL > 0 && (_TARGET_XBOX || _TARGET_PC_WIN || _TARGET_C1)
-  if (pix_capture_n_frames.get() == 0)
+  if (pix_capture_frames_requested == 0)
     return;
 
   static int framesToCapture = 0;
@@ -405,7 +467,8 @@ static void handle_programmatic_pix_capture()
     if (framesToCapture == 0)
     {
       da_profiler::set_mode(modeBackup);
-      pix_capture_n_frames.set(0);
+      pix_capture_frames_requested = 0;
+      console::print_d("GPU capture finished");
     }
   }
   else if (framesToWaitBeforeCapture)
@@ -413,29 +476,29 @@ static void handle_programmatic_pix_capture()
     --framesToWaitBeforeCapture;
     if (framesToWaitBeforeCapture == 0)
     {
-      DagorDateTime time;
-      ::get_local_time(&time);
+      String name(pix_capture_file_name.c_str());
+      if (name.empty())
+      {
+        DagorDateTime time;
+        ::get_local_time(&time);
+        name.printf(64, "gpu_capture_%04d.%02d.%02d_%02d.%02d.%02d", time.year, time.month, time.day, time.hour, time.minute,
+          time.second);
+      }
+      else
+        dgctrl_screen_shot_name = name; // the screenshot the capture takes gets the same name as the capture
 
       static wchar_t capture_name[1024];
-
-#if _TARGET_C1
-
-#else
-#define WCHAR_BUF(x) x
-#endif
-
-      swprintf(WCHAR_BUF(capture_name), L"gpu_capture_%04d.%02d.%02d_%02d.%02d.%02d", time.year, time.month, time.day, time.hour,
-        time.minute, time.second);
+      utf8_to_wcs(name.c_str(), capture_name, countof(capture_name));
 
       PIX_GPU_CAPTURE_NEXT_FRAMES(0, capture_name, framesToCapture);
-      console::print_d("Capturing %d frames", framesToCapture);
+      console::print_d("Capturing %d frames to %s", framesToCapture, name.c_str());
       framesToCapture += 2; // Add a little buffer before turning off GPU mode
     }
   }
   else
   {
     framesToWaitBeforeCapture = 2;
-    framesToCapture = pix_capture_n_frames.get();
+    framesToCapture = pix_capture_frames_requested;
 
     modeBackup = da_profiler::get_current_mode();
     da_profiler::add_mode(da_profiler::EVENTS | da_profiler::UNIQUE_EVENTS | da_profiler::GPU | da_profiler::TAGS);
@@ -444,9 +507,65 @@ static void handle_programmatic_pix_capture()
 #endif
 }
 
+static void handle_programmatic_pix_cpu_capture()
+{
+#if DAGOR_DBGLEVEL > 0 && (_TARGET_XBOX || _TARGET_PC_WIN)
+  static int64_t captureStartedAt = 0;
+  static int captureSeconds = 0;
+
+  if (!captureStartedAt)
+  {
+    if (pix_cpu_capture_seconds_requested == 0)
+      return;
+
+    captureSeconds = pix_cpu_capture_seconds_requested;
+    pix_cpu_capture_seconds_requested = 0;
+
+    String name(pix_cpu_capture_file_name.c_str());
+    if (name.empty())
+    {
+      DagorDateTime time;
+      ::get_local_time(&time);
+#if _TARGET_PC_WIN
+      // every capture of the engine lands in GpuCaptures, and the collection tooling looks there
+      // only. On xbox the name is not a path of ours: PIX itself decides where the file goes.
+      dd_mkdir("GpuCaptures");
+      name.printf(64, "GpuCaptures/");
+#endif
+      name.aprintf(64, "cpu_capture_%04d.%02d.%02d_%02d.%02d.%02d%s", time.year, time.month, time.day, time.hour, time.minute,
+        time.second, PIX_CPU_CAPTURE_FILE_EXT);
+    }
+
+    if (const int err = pix_begin_timing_capture(name.c_str(), PIX_CPU_CAPTURE_TOOLING_MB, PIX_CPU_CAPTURE_SAMPLES_PER_SEC))
+    {
+      // 0x8abc01fb and 0x8abc01fc are the tooling memory ones, PIX documents the rest
+      if (err == PIX_TIMING_CAPTURE_UNSUPPORTED)
+        console::print_d("PIX: this build carries no PIX, nothing to capture with");
+      else
+        console::print_d("PIX: CPU capture refused, hr=0x%08X", err);
+      return;
+    }
+
+    captureStartedAt = ref_time_ticks();
+    console::print_d("Capturing %d sec of CPU to %s", captureSeconds, name.c_str());
+  }
+  else if (get_time_usec(captureStartedAt) >= int64_t(captureSeconds) * 1000000)
+  {
+    // the file is not there yet when the end is asked for, so the message waits with it: it is what
+    // tells whoever drives the run that the capture can be taken off the box
+    if (!pix_end_timing_capture())
+      return;
+
+    captureStartedAt = 0;
+    console::print_d("CPU capture finished");
+  }
+#endif
+}
+
 static void draw(bool enable_stereo, int elapsed_usec, float gametime_elapsed, bool call_before_render, bool draw_gui)
 {
   G_ASSERTF_RETURN(d3d::is_inited(), , "Drawing with uninitialized d3d");
+  TIME_D3D_PROFILE(draw);
 
   handle_programmatic_pix_capture();
 
@@ -523,7 +642,11 @@ static void draw(bool enable_stereo, int elapsed_usec, float gametime_elapsed, b
 
 static bool present(bool updateScreenNeeded)
 {
+  const unsigned resetCounter = get_d3d_reset_counter();
   if (!check_and_restore_3d_device())
+    return false;
+  // the frame we were about to present was rendered into resources the reset has replaced
+  if (resetCounter != get_d3d_reset_counter())
     return false;
 
   if (updatescr_done)
@@ -552,10 +675,8 @@ void workcycle_internal::default_on_swap_callback()
   unsigned frameTime = get_time_usec(lastSwapTime);
   lastSwapTime = ref_time_ticks();
 
-  nv::Streamline *streamline = nullptr;
-  d3d::driver_command(Drv3dCommand::GET_STREAMLINE, &streamline);
-  nv::DLSSFrameGeneration *dlss_g = streamline ? streamline->getDlssGFeature(0) : nullptr;
-  dagor_frame_no_add(dlss_g ? dlss_g->getActualFramesPresented() : 1);
+  dagor_frame_no_increment();
+  dagor_frames_presented_add(d3d::driver_command(Drv3dCommand::GET_PRESENTED_FRAME_COUNT));
   if (interlocked_relaxed_load(workcycle_internal::lastFrameTime) >= 0 || frameTime < 1000000000U)
   {
     if (dwc_hook_after_frame)

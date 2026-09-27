@@ -5,7 +5,6 @@ include "monteCarlo.dshl"
 include "roughToMip.dshl"
 include "normaldetail.dshl"
 include "viewVecVS.dshl"
-include "invGlobTm.dshl"
 include "static_shadow.dshl"
 include "contact_shadows.dshl"
 include "csm.dshl"
@@ -13,13 +12,13 @@ include "ssao_use.dshl"
 include "clusteredViewLights.dshl"
 include "depth_above.dshl"
 include "sq_clouds_shadow.dshl"
+include "resolve_thin_g_buffer_inc.dshl"
 
 float csm_distance = 1000;
 int thin_gbuf_resolve = 0;
 interval thin_gbuf_resolve: no_depth_bounds<1, shadows_no_scattering<2, all_shadows_scattering<3, static_shadows_no_scattering<4, static_shadows_scattering;
 int compatibility_fake_spot_lights = 0;
 interval compatibility_fake_spot_lights: no<1, yes;
-float darkest_wsao_influence = 0.01;
 
 macro COMMON_RESOLVE()
   INIT_HDR(ps)
@@ -34,8 +33,8 @@ macro INIT_LOAD_THIN_GBUFFER()
   INIT_LOAD_DEPTH_GBUFFER()
   USE_LOAD_DEPTH_GBUFFER()
   (ps) {
-    sunLight_gbuf@smp2d = albedo_gbuf;
-    ambientLight_gbuf@smp2d = normal_gbuf;//as per MRT_SHADERVAR_NAMES
+    sunLight_gbuf@tex2d = albedo_gbuf;
+    ambientLight_gbuf@tex2d = normal_gbuf;//as per MRT_SHADERVAR_NAMES
   }
 
   hlsl(ps) {
@@ -83,7 +82,6 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
   z_test = false;
   color_write = rgb;
 
-  ENABLE_ASSERT(ps)
   COMMON_RESOLVE()//should be BEFORE READ_GBUFFER!
   if (shader == thin_g_resolve)
   {
@@ -94,6 +92,10 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
   else if (shader == deferred_shadow_bare_minimum)
   {
     PACK_UNPACK_GBUFFER_BASE(ps)
+    INIT_GLOBAL_LINEAR_WRAP_SAMPLER(ps)
+    hlsl(ps) {
+      #define gbuffer_envi_probe_specular_samplerstate global_linear_wrap_sampler
+    }
     WRITE_GBUFFER_THIN()
     INIT_LOAD_DEPTH_GBUFFER()
     USE_LOAD_DEPTH_GBUFFER()
@@ -114,7 +116,7 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
       gbuffer_enviSPH0 @f4 = (enviSPH0*skylight_params.y);
       gbuffer_enviSPH1 @f4 = (enviSPH1*skylight_params.y);
       gbuffer_enviSPH2 @f4 = (enviSPH2*skylight_params.y);
-      gbuffer_envi_probe_specular@smpCube = envi_probe_specular;
+      gbuffer_envi_probe_specular@texCube = envi_probe_specular;
     }
   }
   INIT_STATIC_SHADOW()
@@ -123,10 +125,11 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
   SQ_INIT_CLOUDS_SHADOW(ps)
   SQ_CLOUDS_SHADOW(ps)
 
-  USE_CSM_SHADOW_DEF_NUM()
+  USE_CSM_SHADOW_DEF_NUM_DEFAULT()
   INIT_UPSCALE_SAMPLING()
   USE_UPSCALE_SAMPLING()
   USING_SSAO()
+  CALC_COMPATIBILITY_AO()
 
   hlsl(ps) {
     #define STATIC_SHADOW_REFERENCE_FXAA_IMPL 0
@@ -165,7 +168,6 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
   (ps) {
     screen_size@f4 = (1. / screen_pos_to_texcoord.x, 1. / screen_pos_to_texcoord.y, screen_pos_to_texcoord.x, screen_pos_to_texcoord.y);
     csm_distance@f1 = (csm_distance, 0, 0, 0);
-    darkest_wsao_influence@f1 = darkest_wsao_influence;
   }
 
   USE_VOLFOG_DITHERING_NOISE(ps)
@@ -221,17 +223,18 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
     half applySpotLight(int spot_index, float total, float4 worldPos)
     {
       RenderSpotLight sl = spot_lights_cb[spot_index];
-      float4 lightPosRadius = sl.lightPosRadius;
+      float4 lightPosRadius = decode_spot_light_pos_radius(sl);
       float4 lightColor = sl.lightColorAngleScale;
       float4 lightDirection = sl.lightDirectionAngleOffset;
-      float2 texId_scale = sl.texId_scale_illuminatingplane_shadow_contactshadow.xy;
+      float2 texId_scale = sl.texId_scale_illuminatingplane_packedDataBits.xy;
+      float lightRollAngle = decode_light_roll_angle(sl);
 
       half3 distanceVec = worldPos.xyz - lightPosRadius.xyz;
       half distance = length(distanceVec);
-      distanceVec /= distance;
+      distanceVec /= max(distance, 0.0001); // distanceVec feeds photometry below even when distance == 0
       half ret = 0.0f;
 
-      if (sl.lightPosRadius.w > distance)
+      if (lightPosRadius.w > distance)
       {
         if (distance == 0.0f)
           ret = 1.0f;
@@ -239,7 +242,7 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
           ret = dot(distanceVec, lightDirection.xyz);
       }
 
-      ret *= length(lightColor.xyz) * (1.0f - (distance / sl.lightPosRadius.w));
+      ret *= length(lightColor.xyz) * (1.0f - (distance / lightPosRadius.w));
 
       FLATTEN
       if (total > ret)
@@ -248,8 +251,8 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
         // in case of ret = 0, applyPhotometryIntensity can early exit
         ret = 0;
       }
-      ret = applyPhotometryIntensity(distanceVec, lightDirection.xyz, texId_scale.x,
-                                          texId_scale.y, ret);
+      ret = applySpotLightPhotometry(distanceVec, lightDirection.xyz, lightRollAngle, texId_scale.x,
+                                    texId_scale.y, ret);
 
       return max(total, ret);
     }
@@ -329,18 +332,16 @@ shader thin_g_resolve, deferred_shadow_bare_minimum
         //to remove this assume from common_assumes.blk.
         SSAO_TYPE ssao = getSSAOSimple(w, screenpos.xy);
       ##endif
-      //ssao.x *= get_depth_above_ao(worldPos.xyz) * lerp(0.1, 1, pow(ssao.WSAO_ATTR, 0.6));
-      //ssao.x *= get_depth_above_ao(worldPos.xyz) * lerp(0.04, 1, ssao.WSAO_ATTR);
-      ssao.x *= lerp(darkest_wsao_influence, 1, ssao.WSAO_ATTR);
       shadow *= ssao.CONTACT_SHADOWS_ATTR;
 
-      half3 result = gbuf.sunLight.xyz * shadow + gbuf.ambientLight.xyz * ssao.x;
+      half3 result = gbuf.sunLight.xyz * shadow + gbuf.ambientLight.xyz * calc_compatibility_ao(ssao);
 
       ##if shader == deferred_shadow_bare_minimum && dynamic_lights_count != lights_off
         float NdotV = dot(gbuffer.normal, view);
         float NoV = abs(NdotV) + 1e-5;
         half3 specularColor = gbuffer.specularColor * gbuffer.extracted_albedo_ao;
-        half3 dynamicLight = get_dynamic_lighting(gbuffer, worldPos.xyz, -viewVect, w,
+        // view must be normalized: it goes into the BRDF half-vector
+        half3 dynamicLight = get_dynamic_lighting(gbuffer, worldPos.xyz, view, w,
             screenpos.xy, NoV, specularColor, input.texcoord.xy, gbuffer.ao);
         result += dynamicLight * get_exposure_mul();
       ##endif

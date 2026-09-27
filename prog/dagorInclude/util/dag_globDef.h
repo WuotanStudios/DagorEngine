@@ -59,7 +59,7 @@ char (&_countof__helper_(T (&array)[N]))[N];
   __va_copy(TO, (FROM))
 #else
 #define __SHOULD_FREE_VALIST_COPY__ 0
-#define DAG_VACOPY(TO, FROM)        va_list &TO = (FROM)
+#define DAG_VACOPY(TO, FROM)        va_list &TO = (FROM) //-V1003 TO is a declarator, it cannot be parenthesized
 #endif
 
 #if __SHOULD_FREE_VALIST_COPY__
@@ -73,8 +73,11 @@ char (&_countof__helper_(T (&array)[N]))[N];
 #undef min
 #undef max
 
-#define G_UNUSED(x)    ((void)(x))
-#define G_UNREFERENCED G_UNUSED
+#define G_UNUSED(x)          ((void)(x))
+#define G_UNREFERENCED       G_UNUSED
+// Volatile-safe variant: (void)x on a volatile-qualified type is a "discarded volatile access"
+// (-Werror under gcc). Take the address instead -- no access, valid suppression.
+#define G_UNUSED_VOLATILE(x) ((void)&(x))
 
 template <typename T>
 inline constexpr T min(const T val1, const T val2)

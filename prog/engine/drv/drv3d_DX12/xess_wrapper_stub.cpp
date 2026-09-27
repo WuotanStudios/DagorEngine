@@ -23,13 +23,13 @@ bool XessWrapper::evaluateXess(void *, const void *) { return false; }
 
 XessState XessWrapper::getXessState() const { return XessState::DISABLED; }
 
-void XessWrapper::getXeSSRenderResolution(int &, int &) const {}
+void XessWrapper::getXeSSRenderResolution(int &, int &, int &, int &, int &, int &) const {}
 
 void XessWrapper::setVelocityScale(float, float) {}
 
 bool XessWrapper::isXessQualityAvailableAtResolution(uint32_t, uint32_t, int) const { return false; }
 
-void XessWrapper::startDump(const char *, int) {}
+void XessWrapper::startDump(const char *, uint32_t) {}
 
 dag::Expected<eastl::string, XessWrapper::ErrorKind> XessWrapper::getVersion() const { return dag::Unexpected(ErrorKind::Unknown); }
 
@@ -45,8 +45,28 @@ void XessWrapper::enableFrameGeneration(bool) {}
 
 void XessWrapper::suppressFrameGeneration(bool) {}
 
-void XessWrapper::doScheduleGeneratedFrames(const void *, void *) {}
+void XessWrapper::doScheduleGeneratedFrames(const XessFgParamsDx12 &, const XessFgParamsDx12ResourceStates &, ID3D12CommandList *) {}
 
 int XessWrapper::getPresentedFrameCount() { return 1; }
 
+uint64_t XessWrapper::getMemoryUsage() const { return 0; }
+
 GpuLatency *create_gpu_latency_intel() { return nullptr; }
+
+#if _TARGET_PC_WIN
+bool XessWrapper::createFrameGenerationSwapchain(DXGIFactory *, ID3D12CommandQueue *, const SwapchainCreateInfo &,
+  const DXGI_SWAP_CHAIN_DESC1 &, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &, DXGISwapChain **swapchain)
+{
+  if (swapchain)
+    *swapchain = nullptr;
+  return false;
+}
+
+bool drv3d_dx12::create_xessfg_swapchain(DXGIFactory *, ID3D12CommandQueue *, const SwapchainCreateInfo &,
+  const DXGI_SWAP_CHAIN_DESC1 &, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC &, DXGISwapChain **)
+{
+  return false;
+}
+
+void XessWrapper::releaseFrameGenerationSwapchainContext() {}
+#endif

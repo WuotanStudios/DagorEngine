@@ -126,6 +126,13 @@ namespace das {
         return typeName.empty() ? name : (name + "<" + typeName + ">");
     }
 
+    // TODO: at some point we should share fusion engine
+    inline DAS_THREAD_LOCAL(unique_ptr<FusionEngine>) g_fusionEngine;
+
+    unique_ptr<FusionEngine> &getFusionEngine() {
+        return *g_fusionEngine;
+    }
+
     void resetFusionEngine() {
         g_fusionEngine->reset();
     }
@@ -156,6 +163,7 @@ namespace das {
             createFusionEngine_at();
             createFusionEngine_at_array();
             createFusionEngine_tableindex();
+            createFusionEngine_tablewithhash();
             // call
             createFusionEngine_call1();
             createFusionEngine_call2();
@@ -209,9 +217,9 @@ namespace das {
         das_hash_map<SimNode *,SimNodeInfo> & info;
     };
 
-    void Program::fusion ( Context & context, TextWriter & logs ) {
+    void fusionContext ( Context & context, TextWriter & logs, bool enableFusion ) {
         // log all functions
-        if ( options.getBoolOption("fusion",true) ) {
+        if ( enableFusion ) {
             bool anyFusion = true;
             while ( anyFusion) {
                 anyFusion = false;
@@ -240,5 +248,15 @@ namespace das {
     void registerFusion ( const char * OpName, const char * CTypeName, FusionPoint * node ) {
         (**g_fusionEngine)[fuseName(OpName,CTypeName)].emplace_back(node);
     }
+
+}
+
+DAS_CC_API void register_fusion () {
+    das::g_fusionContextFn = &das::fusionContext;
+    das::g_resetFusionEngineFn = &das::resetFusionEngine;
+}
+
+extern "C" DAS_CC_API void jit_register_fusion () {
+    register_fusion();
 }
 

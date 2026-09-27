@@ -1,0 +1,329 @@
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/coreEvents.h>
+#include <ecs/render/updateStageRender.h>
+#include <startup/dag_globalSettings.h>
+#include <ioSys/dag_dataBlock.h>
+#include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_tex3d.h>
+#include <shaders/dag_shaders.h>
+#include <shaders/dag_shaderVariableInfo.h>
+#include <render/priorityManagedShadervar.h>
+#include <perfMon/dag_statDrv.h>
+#include <util/dag_console.h>
+#include "render/renderEvent.h"
+#include "game/gameEvents.h"
+
+#include "filmGrain.h"
+#include "renderSettings.h"
+
+FilmGrainMode get_film_grain_mode()
+{
+  static const bool film_grain_mode_var_exists = VariableMap::isVariablePresent(VariableMap::getVariableId("film_grain_mode"));
+  if (!film_grain_mode_var_exists)
+    return FilmGrainMode::DISABLED;
+
+  static const auto film_grain_modeVarId = ::get_shader_glob_var_id("film_grain_mode");
+  G_ASSERT_RETURN(ShaderGlobal::is_var_assumed(film_grain_modeVarId), FilmGrainMode::NOISE_BASED);
+  const int value = ShaderGlobal::get_interval_assumed_value(film_grain_modeVarId);
+  switch (value)
+  {
+    case 0: return FilmGrainMode::NOISE_BASED;
+    case 1: return FilmGrainMode::LUT_BASED;
+    default: G_ASSERT_RETURN(false, FilmGrainMode::NOISE_BASED);
+  }
+}
+
+static ShaderVariableInfo film_grain_lut_paramsVarId("film_grain_lut_params", true);
+static ShaderVariableInfo film_grain_gen_paramsVarId("film_grain_gen_params", true);
+static ShaderVariableInfo film_grain_gen_sizeVarId("film_grain_gen_size", true);
+
+// The generated LUT depends only on gen params and resolution, not on the scene,
+// so a finished LUT is stashed here when the per-scene holder entity is destroyed
+// and adopted by the next holder instead of being regenerated on scene switch.
+static struct FilmGrainLutCache
+{
+  UniqueTexWithShaderVar lut;
+  int wh = 0;
+  int d = 0;
+  Point4 genParams = Point4(0, 0, 0, 0);
+  bool shuttingDown = false;
+
+  void release()
+  {
+    lut.close();
+    wh = d = 0;
+  }
+} lut_cache;
+
+FilmGrainLutHolder::FilmGrainLutHolder() { setFilmGrainReady(false); }
+
+FilmGrainLutHolder::~FilmGrainLutHolder()
+{
+  setFilmGrainReady(false);
+  // stash a fully generated LUT for the next holder instance (scene switch)
+  if (lut && genSlice < 0 && !rebuildRequested && !lut_cache.shuttingDown)
+  {
+    lut_cache.lut = eastl::move(lut);
+    lut_cache.wh = lutWH;
+    lut_cache.d = lutD;
+    lut_cache.genParams = genParams;
+  }
+}
+
+void FilmGrainLutHolder::setFilmGrainReady(bool is_ready)
+{
+  if (get_film_grain_mode() != FilmGrainMode::LUT_BASED)
+    return;
+  if (is_ready)
+    PriorityShadervar::clear((int)film_grain_lut_paramsVarId, GEN_PRIORITY);
+  else
+    PriorityShadervar::set_float4((int)film_grain_lut_paramsVarId, GEN_PRIORITY, Point4(0, 0, 0, 0));
+}
+
+bool FilmGrainLutHolder::isLutNeeded() const
+{
+  return (enabledFromSettings || enabledFromExternalModifier) && lutWH > 0 && lutD > 0 &&
+         get_film_grain_mode() == FilmGrainMode::LUT_BASED;
+}
+
+void FilmGrainLutHolder::requestRebuild()
+{
+  setFilmGrainReady(false);
+  rebuildRequested = true;
+  // restart generation from scratch if already in progress
+  if (genSlice >= 0)
+    genSlice = -1;
+}
+
+void FilmGrainLutHolder::setParamsFromSettings(const Point4 &value)
+{
+  if (get_film_grain_mode() != FilmGrainMode::LUT_BASED)
+    return;
+  PriorityShadervar::set_float4((int)film_grain_lut_paramsVarId, SETTINGS_PRIORITY, value);
+  enabledFromSettings = true;
+  if (lut.getBaseTex() == nullptr && isLutNeeded())
+    requestRebuild();
+}
+
+void FilmGrainLutHolder::resetParamsFromSettings()
+{
+  if (get_film_grain_mode() != FilmGrainMode::LUT_BASED)
+    return;
+  PriorityShadervar::clear((int)film_grain_lut_paramsVarId, SETTINGS_PRIORITY);
+  enabledFromSettings = false;
+  if (!isLutNeeded())
+    resetLut();
+}
+
+void FilmGrainLutHolder::setExternalParams(const Point4 &value)
+{
+  if (get_film_grain_mode() != FilmGrainMode::LUT_BASED)
+    return;
+  PriorityShadervar::set_float4((int)film_grain_lut_paramsVarId, EXTERNAL_PRIORITY, value);
+  enabledFromExternalModifier = true;
+  if (lut.getBaseTex() == nullptr && isLutNeeded())
+    requestRebuild();
+}
+
+void FilmGrainLutHolder::resetExternalParams()
+{
+  if (get_film_grain_mode() != FilmGrainMode::LUT_BASED)
+    return;
+  PriorityShadervar::clear((int)film_grain_lut_paramsVarId, EXTERNAL_PRIORITY);
+  enabledFromExternalModifier = false;
+  if (!isLutNeeded())
+    resetLut();
+}
+
+void FilmGrainLutHolder::setGenParamsSettings(const Point4 &gen_params)
+{
+  const bool hasLut = lut.getBaseTex() != nullptr;
+  if (gen_params == genParams && hasLut == isLutNeeded())
+    return;
+  ShaderGlobal::set_float4(film_grain_gen_paramsVarId, gen_params);
+  genParams = gen_params;
+  if (isLutNeeded())
+    requestRebuild();
+}
+
+void FilmGrainLutHolder::setLutResolution(int wh, int d)
+{
+  const bool hasLut = lut.getBaseTex() != nullptr;
+  if (wh == lutWH && d == lutD && hasLut == isLutNeeded())
+    return;
+  lutWH = wh;
+  lutD = d;
+  if (isLutNeeded())
+    requestRebuild();
+}
+
+void FilmGrainLutHolder::resetLut()
+{
+  lut.close();
+  lut_cache.release(); // film grain is not needed anymore - no point in keeping the stash either
+  genCs.reset();
+  genSlice = -1;
+  rebuildRequested = false;
+}
+
+bool FilmGrainLutHolder::generate()
+{
+  if (!rebuildRequested)
+    return true;
+
+  TIME_D3D_PROFILE(generateFilmGrainLut);
+
+  // First call (or restart after requestRebuild during generation)
+  if (genSlice < 0)
+  {
+    lut.close();
+
+    // Adopt the LUT stashed by the previous holder instance (scene switch)
+    // if it was generated with the same parameters
+    if (lut_cache.lut && lut_cache.wh == lutWH && lut_cache.d == lutD && lut_cache.genParams == genParams)
+    {
+      lut = eastl::move(lut_cache.lut);
+      lut_cache.release();
+      lut.setVar();
+      rebuildRequested = false;
+      setFilmGrainReady(true);
+      return true;
+    }
+    else
+      lut_cache.release();
+
+    uint32_t fmt = TEXFMT_R11G11B10F;
+    if (!(d3d::get_texformat_usage(fmt) & d3d::USAGE_UNORDERED))
+      fmt = TEXFMT_DEFAULT;
+    lut = dag::create_voltex(lutWH, lutWH, lutD, fmt | TEXCF_UNORDERED, 1, "film_grain_lut");
+    lut.setVar();
+
+    genCs.reset(new_compute_shader("film_grain_generate_lut", true));
+    if (!genCs)
+    {
+      lut.close();
+      rebuildRequested = false;
+      return true;
+    }
+    genSlice = 0;
+  }
+
+  // Dispatch a batch of Z slices
+  int slices = min(lutD - genSlice, SLICES_PER_STEP);
+  ShaderGlobal::set_float4(film_grain_gen_sizeVarId, lutWH, lutWH, lutD, genSlice);
+  genCs->dispatchThreads(lutWH, lutWH, slices);
+  genSlice += slices;
+
+  if (genSlice >= lutD)
+  {
+    genCs.reset();
+    genSlice = -1;
+    rebuildRequested = false;
+    setFilmGrainReady(true);
+    return true;
+  }
+  return false;
+}
+
+void FilmGrainLutHolder::afterDeviceReset()
+{
+  if (lut)
+    requestRebuild();
+}
+
+ECS_DECLARE_RELOCATABLE_TYPE(FilmGrainLutHolder);
+ECS_REGISTER_RELOCATABLE_TYPE(FilmGrainLutHolder, nullptr);
+ECS_AUTO_REGISTER_COMPONENT(FilmGrainLutHolder, "film_grain_lut", nullptr, 0);
+
+ECS_TAG(render)
+ECS_ON_EVENT(EventAfterDeviceReset)
+static void film_grain_lut_after_device_reset_es_event_handler(const ecs::Event &, FilmGrainLutHolder &film_grain_lut)
+{
+  film_grain_lut.afterDeviceReset();
+}
+
+ECS_TAG(render)
+static void film_grain_lut_cache_after_device_reset_es(const EventAfterDeviceReset &)
+{
+  // a stashed LUT contains garbage after device reset
+  lut_cache.release();
+}
+
+ECS_TAG(render)
+static void film_grain_lut_cache_shutdown_es(const EventOnGameShutdown &)
+{
+  // the stash is a file-scope static: it must be released before d3d shutdown,
+  // and the holder's destructor must not re-populate it afterwards
+  lut_cache.shuttingDown = true;
+  lut_cache.release();
+}
+
+
+ECS_TAG(render)
+ECS_ON_EVENT(on_appear)
+ECS_TRACK(film_grain_lut__gen_params)
+static void film_grain_lut_params_change_es_event_handler(
+  const ecs::Event &, FilmGrainLutHolder &film_grain_lut, const Point4 &film_grain_lut__gen_params = Point4(0, 0, 0, 0))
+{
+  film_grain_lut.setGenParamsSettings(film_grain_lut__gen_params);
+}
+
+ECS_TAG(render)
+ECS_ON_EVENT(on_appear, OnRenderSettingsUpdated)
+static void film_grain_lut_settings_change_es_event_handler(const ecs::Event &evt, FilmGrainLutHolder &film_grain_lut)
+{
+  const bool bareMinimum = g_entity_mgr->getOr(get_render_settings(evt), ECS_HASH("render_settings__bare_minimum"), false);
+  const bool needsFilmGrain = dgs_get_settings()->getBlockByNameEx("graphics")->getBool("filmGrain", false) && !bareMinimum;
+  const IPoint2 filmGrainRes = dgs_get_settings()->getBlockByNameEx("graphics")->getIPoint2("filmGrainLutRes", IPoint2(256, 64));
+  film_grain_lut.setLutResolution(filmGrainRes.x, filmGrainRes.y);
+  if (needsFilmGrain)
+  {
+    Point4 value = dgs_get_settings()->getBlockByNameEx("cinematicEffects")->getPoint4("filmGrainLut", Point4(0.2, 0.1, 1, 0));
+    film_grain_lut.setParamsFromSettings(value);
+  }
+  else
+    film_grain_lut.resetParamsFromSettings();
+}
+
+ECS_TAG(render)
+static void film_grain_lut_generate_es(const UpdateStageInfoBeforeRender &, FilmGrainLutHolder &film_grain_lut)
+{
+  film_grain_lut.generate();
+}
+
+template <typename Callable>
+static void film_grain_lut_ecs_query(ecs::EntityManager &manager, Callable c);
+
+void FilmGrainLutHolder::enable_external_modifier(const Point4 &value)
+{
+  film_grain_lut_ecs_query(*g_entity_mgr, [value](FilmGrainLutHolder &film_grain_lut) { film_grain_lut.setExternalParams(value); });
+}
+
+void FilmGrainLutHolder::disable_external_modifier()
+{
+  film_grain_lut_ecs_query(*g_entity_mgr, [](FilmGrainLutHolder &film_grain_lut) { film_grain_lut.resetExternalParams(); });
+}
+
+static bool film_grain_console_handler(const char *argv[], int argc)
+{
+  if (argc < 1)
+    return false;
+
+  int found = 0;
+  CONSOLE_CHECK_NAME("render", "set_film_grain_lut_resolution", 3, 3)
+  {
+    const IPoint2 resFromSettings = dgs_get_settings()->getBlockByNameEx("graphics")->getIPoint2("filmGrainLutRes", IPoint2(256, 64));
+    int wh = console::to_int(argv[1]);
+    int d = console::to_int(argv[2]);
+    const IPoint2 requestedRes = wh > 0 && d > 0 ? IPoint2(wh, d) : resFromSettings;
+    film_grain_lut_ecs_query(*g_entity_mgr,
+      [requestedRes](FilmGrainLutHolder &film_grain_lut) { film_grain_lut.setLutResolution(requestedRes.x, requestedRes.y); });
+  }
+  return found;
+}
+
+REGISTER_CONSOLE_HANDLER(film_grain_console_handler);

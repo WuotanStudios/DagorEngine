@@ -1,5 +1,6 @@
 include "shader_global.dshl"
 include "gbuffer.dshl"
+include "gbuffer_with_mixing.dshl"
 include "frustum.dshl"
 include "postfx_inc.dshl"
 include "projectiveDecals/projective_decals_common.dshl"
@@ -12,6 +13,10 @@ interval blood_decals_debug_mode: off<1, boxes<2, depth_cmp;
 
 texture blood_decals_diff_tex;
 texture blood_decals_depth_atlas_tex;
+sampler blood_decals_depth_atlas_tex_samplerstate
+{
+  comparison_func = less;
+};
 texture perlin_noise3d;
 
 buffer blood_decals_traces_result;
@@ -22,7 +27,6 @@ float4 blood_decal_timings = (10, 1, 40, 0);
 
 shader blood_projective_decal_cull
 {
-  ENABLE_ASSERT(cs)
   INIT_AND_USE_FRUSTUM_CHECK_CS()
   (cs) {
     numDecals@u4 : register(projective_decals_original_count_const_no);
@@ -80,12 +84,13 @@ shader blood_projective_decal_decals
     current_time@f1 = (time_phase(0, 0));
   }
   (ps) {
-    blood_decals_diff_tex@smp2d = blood_decals_diff_tex;
+    blood_decals_diff_tex@tex2d = blood_decals_diff_tex;
     perlin_noise3d@smp3d = perlin_noise3d;
     blood_decal_begin_color@f4 = blood_begin_color;
     blood_decal_end_color@f4 = blood_end_color;
     blood_decal_timings@f4 = blood_decal_timings;
-    blood_decals_depth_atlas_tex@shd = blood_decals_depth_atlas_tex;
+    blood_decals_depth_atlas_tex@tex2d = blood_decals_depth_atlas_tex;
+    blood_decals_depth_atlas_tex_cmpSampler@cmpSampler = blood_decals_depth_atlas_tex_samplerstate;
   }
 
   hlsl {
@@ -119,7 +124,7 @@ shader blood_projective_decal_decals
     {
       VsOutput output;
 
-      float4 params = decode_float4(decals[decalId].params);
+      float4 params = unpackHalf2FromUint(decals[decalId].params);
 
       float3 decalPos = decals[decalId].pos_size.xyz;
       float decalSize = params.z;
@@ -172,20 +177,18 @@ shader blood_projective_decal_decals
   }
 
   INIT_STATIC_SHADOW_PS()
-  REDUCE_GBUFFER_MRT_MOBILE()
-  WRITE_GBUFFER()
+  WRITE_GBUFFER_WITH_MIXING(true, true, true)
   PROJECTIVE_DECALS_PS_COMMON()
-  ENABLE_ASSERT(ps)
+
+  INIT_GLOBAL_LINEAR_WRAP_SAMPLER(ps)
 
   hlsl(ps) {
+    #define blood_decals_diff_tex_samplerstate global_linear_wrap_sampler
     #include "projectiveDecals/blood_decals_const.hlsli"
 
     GBUFFER_OUTPUT projective_decals_ps(VsOutput input HW_USE_SCREEN_POS)
     {
       float4 screen = GET_SCREEN_POS(input.pos);
-    ##if mobile_render == deferred
-      clip_by_static_opaque_mask(screen.xy);
-    ##endif
 
       float3 worldPos = get_decal_world_pos(screen);
       float3 sceneNormal = normalize(cross(ddx(worldPos), ddy(worldPos)));
@@ -287,13 +290,16 @@ shader blood_projective_decal_decals
         result.smoothness = 0;
       ##endif
 
-      GBUFFER_OUTPUT gbuf = encode_gbuffer_alpha(result, alpha, world_view_pos-worldPos, GET_SCREEN_POS(input.pos));
 
       ##if blood_decals_debug_mode == off && compatibility_mode == compatibility_mode_off
-        gbuf.albedo_ao.w = alpha * lerp(blood_decal_begin_color.w, blood_decal_end_color.w, dryingTime) *
-          saturate(((flowValue - timeThreshold - 0.05) * 8) + 1 - dryingTime);
-        gbuf.normal_material.w = 0.9 * alpha * lerp(1, 0.1, dryingTime);
-        gbuf.smoothness_reflectance_metallTranslucency_shadow.w = alpha * lerp(1, 0.3, dryingTime);
+        half abledo_alpha = alpha * lerp(blood_decal_begin_color.w, blood_decal_end_color.w, dryingTime) *
+        saturate(((flowValue - timeThreshold - 0.05) * 8) + 1 - dryingTime);
+        half normal_alpha = 0.9 * alpha * lerp(1, 0.1, dryingTime);
+        half smoothness_alpha = alpha * lerp(1, 0.3, dryingTime);
+        half3 alpha3 = half3(abledo_alpha, normal_alpha, smoothness_alpha);
+        GBUFFER_OUTPUT gbuf = encode_gbuffer_alpha3(result, alpha3, world_view_pos-worldPos, GET_SCREEN_POS(input.pos));
+      ##else
+        GBUFFER_OUTPUT gbuf = encode_gbuffer_alpha(result, alpha, world_view_pos-worldPos, GET_SCREEN_POS(input.pos));
       ##endif
 
       return gbuf;

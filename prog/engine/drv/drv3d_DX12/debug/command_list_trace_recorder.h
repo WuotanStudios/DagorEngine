@@ -2,11 +2,13 @@
 #pragma once
 
 #include <driver.h>
-#include <supp/dag_comPtr.h>
-#include <winapi_helpers.h>
+#include "names.h"
 #include "trace_status.h"
 #include "trace_id.h"
 #include "trace_run_status.h"
+
+#include <supp/dag_comPtr.h>
+#include <winapi_helpers.h>
 
 
 namespace drv3d_dx12::debug
@@ -126,6 +128,14 @@ private:
       cmd->WriteBufferImmediate(2, params, modes);
       return static_cast<TraceID>(traceIndex);
     }
+    TraceID getProgress(RecorderID recorder)
+    {
+      if (!buffer)
+        return invalid_trace_value;
+
+      const auto subIndex = to_sub_index(recorder);
+      return static_cast<TraceID>(runLengths[subIndex]);
+    }
     // Cheap check to see if all traces where recorded as completed
     bool isCompleted(RecorderID recorder) const
     {
@@ -212,6 +222,13 @@ private:
       return;
     }
 
+    if constexpr (DX12_NAME_OBJECTS)
+    {
+      auto serial = debug::next_pool_object_serial();
+      name_resource(newPool.buffer.Get(), make_object_name("GpuTraceRecording", serial));
+      name_object(newPool.memoryHeap.Get(), make_object_name("GpuTraceRecordingHeap", serial));
+    }
+
     newPool.bufferMemory = newPool.buffer->GetGPUVirtualAddress();
     logdbg("DX12: New GPU trace recording pool buffer, memory at %p, heap %p, buffer %p at GPU address %016X", newPool.memory.get(),
       newPool.memoryHeap.Get(), newPool.buffer.Get(), newPool.bufferMemory);
@@ -237,6 +254,7 @@ public:
     return static_cast<RecorderID>(allocatedRecorders++);
   }
   TraceID recordTrace(RecorderID recorder, D3DGraphicsCommandList *cmd) { return getPool(recorder).recordTrace(recorder, cmd); }
+  TraceID getRecorderProgress(RecorderID recorder) { return getPool(recorder).getProgress(recorder); }
   bool isCompleted(RecorderID recorder) const { return getPool(recorder).isCompleted(recorder); }
   void beginRecording(RecorderID recorder) { return getPool(recorder).beginRecording(recorder); }
   TraceStatus readTraceStatus(RecorderID recorder, TraceID trace) const { return getPool(recorder).readTraceStatus(recorder, trace); }

@@ -5,20 +5,18 @@
 #pragma once
 
 #include <generic/dag_smallTab.h>
-#include <phys/dag_physSysInst.h>
+#include <generic/dag_functionRef.h>
+#include <phys/dag_physDecl.h>
 #include <phys/dag_physUserData.h>
+#include <generic/dag_tab.h>
 #include <util/dag_index16.h>
-
+#include <math/dag_geomTree.h>
 
 class TMatrix;
-class GeomNodeTree;
 class DynamicPhysObjectData;
-
-#ifndef NO_3D_GFX
+struct TwistCtrlParams;
 class DynamicRenderableSceneLodsResource;
 class DynamicRenderableSceneInstance;
-#endif
-
 
 #define DynamicPhysObject DynamicPhysObjectClass<PhysWorld>
 
@@ -26,9 +24,10 @@ template <class TPhysWorld = PhysWorld>
 class DynamicPhysObjectClass
 {
 public:
-  DynamicPhysObjectClass();
+  DynamicPhysObjectClass() = default;
+  DynamicPhysObjectClass(const DynamicPhysObjectClass &) = delete;
+  DynamicPhysObjectClass &operator=(const DynamicPhysObjectClass &) = delete;
   ~DynamicPhysObjectClass();
-
 
   static DynamicPhysObjectClass *create(const DynamicPhysObjectData *data, PhysWorld *world, const TMatrix &tm, uint16_t fgroup = 0,
     uint16_t fmask = 0);
@@ -37,44 +36,36 @@ public:
 
   void resetTm(const TMatrix &tm);
 
-#ifndef NO_3D_GFX
   int getModelCount() const { return modelEntries.size(); }
   DynamicRenderableSceneInstance *getModel(int index) const { return modelEntries[index]->model; }
   void replaceModel(int index, DynamicRenderableSceneLodsResource *res);
 
   void getBodyVisualTm(int body_index, TMatrix &tm);
-  void beforeRender(const Point3 &cam_pos);
-#endif // NO_3D_GFX
+  void beforeRender(const Point3 &cam_pos, dag::FunctionRef<TMatrix(int)> get_body_tm = {},
+    dag::FunctionRef<bool(int)> is_body_visible = {});
 
   PhysSystemInstance *getPhysSys() const { return physSys; }
 
-  GeomNodeTree *getNodeTree() const { return nodeTree; }
+  GeomNodeTree *getNodeTree() const { return nodeTree.get(); }
 
   const DynamicPhysObjectData *getData() const { return data; }
 
 protected:
-  const DynamicPhysObjectData *data;
+  const DynamicPhysObjectData *data = nullptr;
 
-#ifndef NO_3D_GFX
-  struct NodeAlignCtrl
-  {
-    dag::Index16 node0Id, node1Id, twistId[3];
-    int16_t twistCnt = 0;
-    float angDiff = 0;
-  };
   struct ModelEntry
   {
-    DynamicRenderableSceneInstance *model;
+    DynamicRenderableSceneInstance *model = nullptr;
 
     SmallTab<TMatrix *, MidmemAlloc> nodeHelpers;
     SmallTab<dag::Index16, MidmemAlloc> treeIndex;
-    Tab<NodeAlignCtrl> nodeAlignCtrl;
+    SmallTab<int, MidmemAlloc> nodeToBody;
+    Tab<TwistCtrlParams> twistCtrl;
   };
   SmallTab<ModelEntry *> modelEntries;
-#endif // NO_3D_GFX
 
-  PhysSystemInstance *physSys;
-  GeomNodeTree *nodeTree;
+  PhysSystemInstance *physSys = nullptr;
+  GeomNodeTreeUniquePtr nodeTree;
 
-  PhysObjectUserData ud = {_MAKE4C('DPOJ')};
+  PhysObjectUserData ud{_MAKE4C('DPOJ')};
 };

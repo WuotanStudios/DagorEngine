@@ -32,6 +32,21 @@ namespace ShaderParser
  *********************************/
 class GatherVarShaderEvalCB : public ShaderEvalCB, public ShaderBoolEvalCB
 {
+  struct ConditionsNestState
+  {
+    Tab<bool> stack = Tab<bool>(tmpmem);
+    int count = 0;
+    bool hasFlag = false;
+  };
+
+  ConditionsNestState dynState{}, staticState{};
+  SCFastNameMap staticVars, dynamicVars;
+
+  shc::ShaderContext &ctx;
+  Parser &parser; // Cached ref from ctx
+
+  bool compilingBoolExpr = false;
+
 public:
   explicit GatherVarShaderEvalCB(shc::ShaderContext &ctx);
 
@@ -39,7 +54,7 @@ public:
 
   void eval_static(static_var_decl &s) override;
   void eval_bool_decl(bool_decl &) override;
-  void decl_bool_alias(const char *name, bool_expr &expr) override;
+  void decl_bool_alias(const char *name, const char *base_name) override;
 
   void eval_channel_decl(channel_decl &s, int str_id = 0) override;
   void eval_state(state_stat &) override {}
@@ -67,22 +82,8 @@ public:
   void eval(immediate_const_block &) override;
 
 private:
-  shc::ShaderContext &ctx;
-
-  // Cached refs from ctx
-  shc::TypeTables &types;
-  Parser &parser;
-
-  // Internal pass state
-  Tab<bool> dynStack;
-  int dynCount;
-  bool hasDynFlag;
-
-  SCFastNameMap staticVars, dynamicVars;
-
-  ShVarBool addInterval(const char *intervalName, Terminal *terminal, bool_value *e);
-
-  ShVarBool addTextureInterval(const char *textureName, Terminal *terminal, bool_value &e);
+  ShVarBool addIntervalRef(const char *intervalName, Terminal *terminal, bool_value *e);
+  ShVarBool addTextureIntervalRef(const char *textureName, Terminal *terminal, bool_value &e);
 };
 } // namespace ShaderParser
 

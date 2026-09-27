@@ -54,7 +54,7 @@ GpuBenchmark::GpuBenchmark()
   index_buffer::init_quads_32bit(QUADS_COUNT);
 
   int vbSize = sizeof(Point4) * 2 * VERT_COUNT;
-  vb.set(d3d::create_vb(vbSize, SBCF_CPU_ACCESS_WRITE, "gpu_benchmark_vb"), "gpu_benchmark");
+  vb.set(d3d::create_vb(vbSize, SBCF_CPU_ACCESS_WRITE, "gpu_benchmark_vb", RESTAG_BENCHMARK), "gpu_benchmark");
   G_ASSERT(vb.getBuf());
 
   struct VertexData
@@ -130,8 +130,8 @@ GpuBenchmark::GpuBenchmark()
   G_UNUSED(channels);
 
   int level_count = get_log2i(RANDOM_BUFFER_RESOLUTION);
-  randomTex =
-    dag::create_tex(NULL, RANDOM_BUFFER_RESOLUTION, RANDOM_BUFFER_RESOLUTION, TEXFMT_A8R8G8B8, level_count, "gpu_benchmark_tex");
+  randomTex = dag::create_tex(NULL, RANDOM_BUFFER_RESOLUTION, RANDOM_BUFFER_RESOLUTION, TEXFMT_A8R8G8B8, level_count,
+    "gpu_benchmark_tex", RESTAG_BENCHMARK);
   randomTex.setVarId(::get_shader_glob_var_id("gpu_benchmark_tex"));
   for (int lev = 0; lev < level_count; ++lev)
   {
@@ -148,10 +148,6 @@ GpuBenchmark::GpuBenchmark()
           randomBufferData[x * 4 + c] = clamp(gauss_rnd() * 0.5f + 0.5f, 0.0f, 1.0f) * 255;
     randomTex->unlockimg();
   }
-  d3d::SamplerInfo smpInfo;
-  smpInfo.filter_mode = d3d::FilterMode::Linear;
-  smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Wrap;
-  ShaderGlobal::set_sampler(get_shader_variable_id("gpu_benchmark_tex_samplerstate"), d3d::request_sampler(smpInfo));
 
   gpu_benchmark_hmapVarId = get_shader_variable_id("gpu_benchmark_hmap");
 }
@@ -191,8 +187,6 @@ void GpuBenchmark::render(Texture *target_tex, Texture *depth_tex)
   SCOPE_VIEW_PROJ_MATRIX;
   SCOPE_RENDER_TARGET;
 
-  d3d::set_render_target(target_tex, 0);
-
   Texture *depthRT = depth_tex;
 
   if (!depthRT)
@@ -206,12 +200,12 @@ void GpuBenchmark::render(Texture *target_tex, Texture *depth_tex)
         flags |= TEXFMT_DEPTH24;
       else if (d3d::check_texformat(TEXFMT_DEPTH16))
         flags |= TEXFMT_DEPTH16;
-      benchmarkDepthTex = dag::create_tex(nullptr, tInfo.w, tInfo.h, flags, 1, "benchmark_depth");
+      benchmarkDepthTex = dag::create_tex(nullptr, tInfo.w, tInfo.h, flags, 1, "benchmark_depth", RESTAG_BENCHMARK);
     }
     depthRT = benchmarkDepthTex.getTex2D();
   }
 
-  d3d::set_depth(depthRT, DepthAccess::RW);
+  d3d::set_render_target({depthRT, 0, 0}, DepthAccess::RW, {{target_tex, 0, 0}});
   d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER, E3DCOLOR(159, 159, 255, 255), 0.0f, 0);
 
   d3d::settm(TM_WORLD, TMatrix::IDENT);

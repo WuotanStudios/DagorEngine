@@ -1,10 +1,10 @@
 "@override:compatibility_mode":i=1
 "@override:ssr_target":i=0
-"@delete:ssao_tex":i=0
 "@override:character_micro_details":i=0
 "@override:upscale_sampling_tex":i=0
 "@override:water_reflection_tex":i=0
-"@override:water_refraction_tex":i=0
+"@delete:water_refraction_tex":i=1
+water_refraction_tex:i=0
 "@override:sparkles_enable":i=0
 "@override:assume_fom_shadows":i=0
 "@override:assume_downsampled_shadows":i=0
@@ -12,6 +12,10 @@
 "@override:fx_apply_volfog_per_pixel":i=0
 "@override:micro_details_quality":i=0
 "@override:use_glass_dual_source_blending":i=0
+"@override:has_motion_vectors":i=0
+"@override:downsampled_motion_vectors_tex":i=0
+"@override:motion_gbuf":i=0
+"@override:motion_vector_type":i=0
 
 shore_waves_on:i=0
 shore_distance_field_tex:i=0
@@ -21,7 +25,11 @@ ssr_alternate_reflections:i=0
 static_shadows_cascades:i=2
 froxel_fog_use_experimental_offscreen_reprojection:i = 0
 froxel_fog_use_self_shadowing:i = 0
-lens_zoom_factor:r=1.0
 water_rt_enabled:i=0
 clouds_panorama_mip:i=1
+clouds_erosion_flow:i=0
 glass_rt_reflection:i=0
+allow_rt_glass_reflection:i=0
+antialiasing_type:i=2
+dof_focus_near_mode:i = 0;
+dof_focus_far_mode:i = 0;

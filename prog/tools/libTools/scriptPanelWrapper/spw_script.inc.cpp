@@ -1,14 +1,16 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-static const char *defScript = "\
-::getControl <- function getControl(full_name) \r\n\
+// compiled once per VM; the closure is published both as the ::getControl
+// root global (legacy panels) and through the script_panel native module
+static const char *getControlScript = "\
+return function getControl(full_name) \r\n\
 { \r\n\
-  local function nextWordEnd(text, word_begin_index) \r\n\
+  function nextWordEnd(text, word_begin_index) \r\n\
   { \r\n\
     return text.indexof(\"/\", word_begin_index); \r\n\
   } \r\n\
    \r\n\
-  local function getControlByName(object, name) \r\n\
+  function getControlByName(object, name) \r\n\
   { \r\n\
     if (object.rawin(\"controls\") && ((typeof object.controls) == \"array\")) \r\n\
       foreach(key, control in object.controls) \r\n\

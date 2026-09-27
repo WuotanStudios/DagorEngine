@@ -28,8 +28,8 @@ public:
   {
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("ecs"));
-    addAnnotation(das::make_smart<TiledSceneAnnotation>(lib));
-    addAnnotation(das::make_smart<GameObjectsAnnotation>(lib));
+    addAnnotation(new TiledSceneAnnotation(lib));
+    addAnnotation(new GameObjectsAnnotation(lib));
     das::addExtern<DAS_BIND_FUN(das_find_scene_game_objects)>(*this, lib, "find_scene_game_objects", das::SideEffects::accessExternal,
       "::bind_dascript::das_find_scene_game_objects");
     das::addExtern<DAS_BIND_FUN(das_for_scene_game_objects_in_box)>(*this, lib, "for_scene_game_objects",
@@ -44,6 +44,8 @@ public:
       "::bind_dascript::das_find_ladder");
     das::addExtern<DAS_BIND_FUN(das_enum_sounds_in_box)>(*this, lib, "enum_sounds_in_box", das::SideEffects::accessExternal,
       "::bind_dascript::das_enum_sounds_in_box");
+    das::addExtern<DAS_BIND_FUN(das_tiled_scene_get_node_flags)>(*this, lib, "get_node_flags", das::SideEffects::accessExternal,
+      "::bind_dascript::das_tiled_scene_get_node_flags");
 
     das::addExtern<DAS_BIND_FUN(tiled_scene_getNodesCount)>(*this, lib, "tiled_scene_getNodesCount", das::SideEffects::none,
       "::bind_dascript::tiled_scene_getNodesCount");

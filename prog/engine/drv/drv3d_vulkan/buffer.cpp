@@ -18,6 +18,7 @@
 #include "statStr.h"
 #include "device_context.h"
 #include "global_lock.h"
+#include "backend/cmd/resources.h"
 
 using namespace drv3d_vulkan;
 
@@ -104,11 +105,14 @@ void GenericBufferInterface::useExternalResource(Buffer *resource)
 void GenericBufferInterface::afterBufferResourceAllocated()
 {
   Globals::Dbg::naming.setBufName(ref.buffer, getName());
+  if (bufFlags & SBCF_NO_STATE_TRACKING)
+    ref.buffer->disableSyncTracking();
   if (FormatStore(0) != uavFormat)
     ref.buffer->addBufferView(uavFormat);
 
   if (bufFlags & SBCF_ZEROMEM)
   {
+    G_ASSERTF((bufFlags & SBCF_NO_STATE_TRACKING) == 0, "vulkan: can't track requested internal zero mem work");
     unsigned char *data = nullptr;
     if (lock(0, bufSize, (void **)&data, VBLOCK_WRITEONLY) && data)
     {
@@ -122,8 +126,11 @@ GenericBufferInterface::~GenericBufferInterface()
 {
   auto &ctx = Globals::ctx;
 
+  if (rld)
+    rld->destroySelf();
+
   if (stagingBuffer)
-    ctx.destroyBuffer(stagingBuffer);
+    ctx.dispatchCmd<CmdDestroyBuffer>({stagingBuffer});
 
   if (bufFlags & SBCF_FRAMEMEM)
   {
@@ -132,7 +139,7 @@ GenericBufferInterface::~GenericBufferInterface()
     return;
   }
 
-  ctx.destroyBuffer(ref.buffer);
+  ctx.dispatchCmd<CmdDestroyBuffer>({ref.buffer});
 }
 
 void GenericBufferInterface::onDeviceReset() { asyncCopyEvent.reset(); }
@@ -170,6 +177,8 @@ bool GenericBufferInterface::copyTo(Sbuffer *dst)
   auto &context = Globals::ctx;
   D3D_CONTRACT_ASSERTF(bufSize <= ref.buffer->getBlockSize(),
     "the actual backing buffer is smaller (%d bytes) than the Buffer (%d bytes)", ref.buffer->getBlockSize(), bufSize);
+  D3D_CONTRACT_ASSERTF_RETURN(dst->getSize() >= getSize(), false,
+    "vulkan: copyTo destination (%u bytes) is smaller than source (%u bytes)", dst->getSize(), getSize());
   // reorder buffer update if we running it from external thread
   if (Globals::lock.isAcquired())
     context.copyBufferDiscardReorderable(ref, dest->ref, 0, 0, bufSize);
@@ -180,6 +189,8 @@ bool GenericBufferInterface::copyTo(Sbuffer *dst)
 
 bool GenericBufferInterface::copyTo(Sbuffer *dst, uint32_t dst_offset, uint32_t src_offset, uint32_t size_bytes)
 {
+  if (size_bytes == 0)
+    return true;
   auto dest = (GenericBufferInterface *)dst;
   auto &context = Globals::ctx;
   // reorder buffer update if we running it from external thread
@@ -198,8 +209,8 @@ uint32_t GenericBufferInterface::acquireStagingBuffer()
   {
     // alloc temp with best possible memory type and smallest size only covering
     // locked area
-    stagingBuffer = Buffer::create(lockRange.size(), getTemporaryStagingBufferMemoryClass(), 1,
-      bufferLockedForRead() ? BufferMemoryFlags::NONE : BufferMemoryFlags::TEMP);
+    stagingBuffer = Buffer::create(stagingIsPersistent() ? bufSize : lockRange.size(), getTemporaryStagingBufferMemoryClass(), 1,
+      (bufferLockedForRead() || stagingIsPersistent()) ? BufferMemoryFlags::NONE : BufferMemoryFlags::TEMP);
     stagingBuffer->setStagingDebugName(ref.buffer);
   }
   return 0;
@@ -207,11 +218,9 @@ uint32_t GenericBufferInterface::acquireStagingBuffer()
 
 void GenericBufferInterface::disposeStagingBuffer()
 {
-  if (stagingBuffer)
+  if (stagingBuffer && !stagingIsPersistent())
   {
-    auto &ctx = Globals::ctx;
-
-    ctx.destroyBuffer(stagingBuffer);
+    Globals::ctx.dispatchCmd<CmdDestroyBuffer>({stagingBuffer});
     stagingBuffer = nullptr;
   }
 }
@@ -220,11 +229,10 @@ void GenericBufferInterface::processDiscardFlag()
 {
   if (bufferLockDiscardRequested())
   {
-    auto &ctx = Globals::ctx;
     // FIXME: clang on windows with dbg config, generates invalid code when .back() is used, used .stop instead
     uint32_t dynamic_size = (bufFlags & SBCF_FRAMEMEM) > 0 ? lockRange.stop : 0;
 
-    ref = ctx.discardBuffer(ref, getMemoryClass(), uavFormat, bufFlags, dynamic_size);
+    ref = ref.discard(getMemoryClass(), uavFormat, bufFlags, dynamic_size);
   }
 }
 

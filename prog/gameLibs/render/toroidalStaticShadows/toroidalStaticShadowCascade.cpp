@@ -13,6 +13,7 @@
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_tex3d.h>
+#include <drv/3d/dag_texture.h>
 #include <util/dag_string.h>
 #include <shaders/dag_shaders.h>
 #include <render/scopeRenderTarget.h>
@@ -21,6 +22,7 @@
 #include <render/viewTransformData.h>
 #include <math/dag_viewMatrix.h>
 #include <render/toroidalStaticShadows.h>
+#include <generic/dag_sort.h>
 
 static constexpr int TEXEL_ALIGN = 8; // align by 4 texels for performance (faster rasterization)
 
@@ -211,7 +213,13 @@ void ToroidalStaticShadowCascade::invalidate(bool force)
   {
     helper.curOrigin = IPoint2(-1000000, 100000);
     setShadervarsToInvalid();
+    isRenderingRegionFirstTime = true;
+    scrolledDepthMin = 0;
+    scrolledDepthMax = 1;
   }
+#if COLLECT_STATIC_SHADOWS_STATISTICS
+  staticShadowsStatistics.completelyValidFramesSinceLastUpdate = 0;
+#endif
 }
 
 void ToroidalStaticShadowCascade::setShadervarsToInvalid()
@@ -219,7 +227,7 @@ void ToroidalStaticShadowCascade::setShadervarsToInvalid()
   const Point4 matrixVals[] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {-1, -1, -1, 0}};
   for (int i = 0; i < 4; i++)
   {
-    ShaderGlobal::set_color4(static_shadow_matrixVarId[i], matrixVals[i]);
+    ShaderGlobal::set_float4(static_shadow_matrixVarId[i], matrixVals[i]);
   }
 }
 
@@ -244,6 +252,8 @@ Point3 ToroidalStaticShadowCascade::clipPointToWorld(const Point3 &pos) const
 
 bool ToroidalStaticShadowCascade::isValid(const BBox3 &box) const
 {
+  if (isRenderingRegionFirstTime)
+    return false;
   if (notRenderedRegions.empty())
     return true;
   IBBox2 bx = texel_ibbox2(toTexelSpaceClipped(box));
@@ -273,6 +283,8 @@ void ToroidalStaticShadowCascade::updateSunBelowHorizon(const ManagedTex &tex)
 
 bool ToroidalStaticShadowCascade::isCompletelyValid(const BBox3 &box) const
 {
+  if (inTransition)
+    return false;
   if (invalidRegions.empty())
     return true;
   IBBox2 bx = texel_ibbox2(toTexelSpaceClipped(box));
@@ -282,7 +294,10 @@ bool ToroidalStaticShadowCascade::isCompletelyValid(const BBox3 &box) const
 
 bool ToroidalStaticShadowCascade::isInside(const BBox3 &box) const
 {
-  const IBBox2 bx = texel_ibbox2(toTexelSpaceClipped(box));
+  const BBox3 boxClipped = toTexelSpaceClipped(box);
+  if (boxClipped.width().x < VERY_SMALL_NUMBER && boxClipped.width().y < VERY_SMALL_NUMBER && boxClipped.width().z < VERY_SMALL_NUMBER)
+    return false;
+  const IBBox2 bx = texel_ibbox2(boxClipped);
   return bx.isEmpty() ? false : bx & get_texture_box(helper);
 }
 
@@ -293,16 +308,16 @@ void ToroidalStaticShadowCascade::setShaderVars()
 
   const FrameData &fr = getReadFrameData();
 
-  ShaderGlobal::set_color4(static_shadow_cascade_scale_ofs_z_torVarId, 1, 0, -fr.torOfs.x + 0.5, fr.torOfs.y + 0.5);
-  ShaderGlobal::set_real(static_shadow_scrolled_depth_minVarId, scrolledDepthMin);
-  ShaderGlobal::set_real(static_shadow_scrolled_depth_maxVarId, scrolledDepthMax);
+  ShaderGlobal::set_float4(static_shadow_cascade_scale_ofs_z_torVarId, 1, 0, -fr.torOfs.x + 0.5, fr.torOfs.y + 0.5);
+  ShaderGlobal::set_float(static_shadow_scrolled_depth_minVarId, scrolledDepthMin);
+  ShaderGlobal::set_float(static_shadow_scrolled_depth_maxVarId, scrolledDepthMax);
 
   TMatrix wtm = getLightViewProj();
 
-  ShaderGlobal::set_color4(static_shadow_matrixVarId[0], P3D(wtm.getcol(0)), 1. / helper.texSize);
-  ShaderGlobal::set_color4(static_shadow_matrixVarId[1], P3D(wtm.getcol(1)), 0);
-  ShaderGlobal::set_color4(static_shadow_matrixVarId[2], P3D(wtm.getcol(2)), 0);
-  ShaderGlobal::set_color4(static_shadow_matrixVarId[3], P3D(wtm.getcol(3)), 0);
+  ShaderGlobal::set_float4(static_shadow_matrixVarId[0], P3D(wtm.getcol(0)), 1. / helper.texSize);
+  ShaderGlobal::set_float4(static_shadow_matrixVarId[1], P3D(wtm.getcol(1)), texelSize);
+  ShaderGlobal::set_float4(static_shadow_matrixVarId[2], P3D(wtm.getcol(2)), current.maxHtRange);
+  ShaderGlobal::set_float4(static_shadow_matrixVarId[3], P3D(wtm.getcol(3)), 0);
 }
 
 TMatrix ToroidalStaticShadowCascade::getLightViewProj() const
@@ -334,7 +349,7 @@ void ToroidalStaticShadowCascade::enableTransitionCascade(bool en)
   if (!transitionTex)
   {
     transitionTex = dag::create_tex(nullptr, helper.texSize, helper.texSize, TEXCF_RTARGET | TEXFMT_DEPTH16, 1,
-      String(26, "static_shadow_trans_tex_%d", cascade_id));
+      String(26, "static_shadow_trans_tex_%d", cascade_id), RESTAG_SHADOW);
   }
 }
 
@@ -604,6 +619,8 @@ ToroidalStaticShadowCascade::BeforeRenderReturned ToroidalStaticShadowCascade::u
 
   while (pixelsRendered < maxTexelsToUpdate)
   {
+    if (renderData.regionsToRender.size() >= renderData.MAX_REGIONS_TO_RENDER)
+      break;
     const int id = get_closest_region_and_split(helper, choosenRegions);
     if (id >= 0)
     {
@@ -661,6 +678,7 @@ void ToroidalStaticShadowCascade::render(IStaticShadowsCB &cb)
   {
 #if COLLECT_STATIC_SHADOWS_STATISTICS
     staticShadowsStatistics.completelyValidFrames++;
+    staticShadowsStatistics.completelyValidFramesSinceLastUpdate++;
 #endif
     return;
   }
@@ -668,12 +686,10 @@ void ToroidalStaticShadowCascade::render(IStaticShadowsCB &cb)
   TIME_D3D_PROFILE(staticShadowRender);
   SCOPE_RENDER_TARGET;
   SCOPE_VIEW_PROJ_MATRIX;
-  d3d_err(d3d::set_render_target(nullptr, 0));
-
   if (renderData.target->getType() == D3DResourceType::ARRTEX)
-    d3d::set_depth(renderData.target, cascade_id, DepthAccess::RW);
+    d3d::set_render_target({renderData.target, 0, static_cast<uint32_t>(cascade_id)}, DepthAccess::RW, {});
   else
-    d3d::set_depth(renderData.target, DepthAccess::RW);
+    d3d::set_render_target({renderData.target, 0, 0}, DepthAccess::RW, {});
 
   const float shadowClearValue = ToroidalStaticShadows::GetShadowClearValue(renderData.isSunBelowHorizon);
 
@@ -697,6 +713,7 @@ void ToroidalStaticShadowCascade::render(IStaticShadowsCB &cb)
     staticShadowsStatistics.invalidateRegionFrames++;
     staticShadowsStatistics.invalidateRegionCount += renderCount;
   }
+  staticShadowsStatistics.completelyValidFramesSinceLastUpdate = 0;
 #endif
 
   d3d::settm(TM_VIEW, renderData.viewTm);
@@ -731,8 +748,8 @@ void ToroidalStaticShadowCascade::render(IStaticShadowsCB &cb)
   {
     if (transitionCopyTarget->getType() == D3DResourceType::ARRTEX)
     {
-      transitionCopyTarget->updateSubRegion(transitionTex.getTex2D(), 0, 0, 0, 0, helper.texSize, helper.texSize, 1, cascade_id, 0, 0,
-        0);
+      d3d::update_sub_region(transitionTex.getTex2D(), 0, 0, 0, 0, helper.texSize, helper.texSize, 1, transitionCopyTarget, cascade_id,
+        0, 0, 0);
     }
     else
     {
@@ -743,9 +760,18 @@ void ToroidalStaticShadowCascade::render(IStaticShadowsCB &cb)
   }
 }
 
+// Skip tiny objects but with a slightly stricter threshold than depthAOAbove (&& not ||)
+static inline bool box_below_invalidate_threshold(const BBox3 &box, float texel_size)
+{
+  const float sizeThreshold = 2.f * texel_size;
+  return box.width().x <= sizeThreshold && box.width().z <= sizeThreshold;
+}
+
 void ToroidalStaticShadowCascade::invalidateBox(const BBox3 &box)
 {
   TIME_PROFILE_DEV(staticShadowCascade_invalidateBox);
+  if (box_below_invalidate_threshold(box, texelSize))
+    return;
   IBBox2 ibox = getClippedBoxRegion(box);
   if (ibox.isEmpty())
     return;
@@ -767,6 +793,8 @@ void ToroidalStaticShadowCascade::invalidateBoxes(const BBox3 *box, uint32_t cnt
   dag::Vector<IBBox2, framemem_allocator> clippedBoxes;
   for (auto be = box + cnt; box != be; ++box)
   {
+    if (box_below_invalidate_threshold(*box, texelSize))
+      continue;
     IBBox2 ibox = getClippedBoxRegion(*box);
     if (!ibox.isEmpty())
       clippedBoxes.push_back(ibox);

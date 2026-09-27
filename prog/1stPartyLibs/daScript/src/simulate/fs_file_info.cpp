@@ -3,6 +3,7 @@
 #include "daScript/simulate/fs_file_info.h"
 #include "daScript/misc/sysos.h"
 #include "daScript/ast/ast.h"
+#include "daScript/simulate/aot_builtin_fio.h"
 
 #define DASLIB_MODULE_NAME  "daslib"
 #define DASTEST_MODULE_NAME "dastest"
@@ -13,6 +14,7 @@
 
 #if !defined(DAS_NO_FILEIO)
 #include <sys/stat.h>
+#include <filesystem>
 #endif
 
 namespace das {
@@ -22,6 +24,10 @@ namespace das {
             struct stat st;
             int fd = fileno((FILE *)ff);
             fstat(fd, &st);
+            if ( !st.st_size ) {
+                fclose(ff);
+                return new TextFileInfo("", st.st_size, false);
+            }
             char *source = (char *) das_aligned_alloc16(st.st_size);
             auto info = new TextFileInfo(source, st.st_size, true);
             auto bytesRead = fread(source, 1, st.st_size, ff);
@@ -53,12 +59,17 @@ namespace das {
                 struct stat st;
                 int fd = fileno((FILE *)ff);
                 fstat(fd, &st);
-                char *source = (char *) das_aligned_alloc16(st.st_size);
-                hfile.reset(new TextFileInfo(source, st.st_size, true));
-                auto bytesRead = fread(source, 1, st.st_size, ff);
-                fclose(ff);
-                if ( size_t(bytesRead) != size_t(st.st_size) ) {
-                    hfile.release();
+                if ( st.st_size ) {
+                    char *source = (char *) das_aligned_alloc16(st.st_size);
+                    hfile.reset(new TextFileInfo(source, st.st_size, true));
+                    auto bytesRead = fread(source, 1, st.st_size, ff);
+                    fclose(ff);
+                    if ( size_t(bytesRead) != size_t(st.st_size) ) {
+                        hfile.release();
+                    }
+                } else {
+                    fclose(ff);
+                    hfile.reset(new TextFileInfo("", st.st_size, false));
                 }
             } else {
                 it_ok.first->second = nullptr;
@@ -80,8 +91,8 @@ namespace das {
         createFileSystems();
     }
 
-    FsFileAccess::FsFileAccess ( const string & pak, const FileAccessPtr & access )
-        : ModuleFileAccess (pak, access) {
+    FsFileAccess::FsFileAccess ( const string & pak, const smart_ptr<Program> & program )
+        : ModuleFileAccess (pak, program) {
         createFileSystems();
     }
 
@@ -109,6 +120,7 @@ namespace das {
     }
 
     das::FileInfo * FsFileAccess::getNewFileInfo(const das::string & fileName) {
+        if ( locked ) return nullptr;
         for ( auto & fs : fileSystems ) {
             if ( auto info = fs.first->tryOpenFile(fileName) ) {
                 return setFileInfo(fileName, FileInfoPtr(info));
@@ -124,14 +136,154 @@ namespace das {
         return true;
     }
 
+#if !defined(DAS_NO_FILEIO)
+    bool FsFileAccess::introduceFileFromDisk ( const string & name, const string & diskPath ) {
+        if ( FILE * ff = fopen(diskPath.c_str(), "rb") ) {
+            struct stat st;
+            int fd = fileno((FILE *)ff);
+            fstat(fd, &st);
+            if ( !st.st_size ) {
+                fclose(ff);
+                auto info = make_unique<TextFileInfo>("", uint32_t(st.st_size), false);
+                setFileInfo(name, das::move(info));
+                return true;
+            }
+            char * source = (char *) das_aligned_alloc16(st.st_size);
+            auto bytesRead = fread(source, 1, st.st_size, ff);
+            fclose(ff);
+            if ( size_t(bytesRead) == size_t(st.st_size) ) {
+                auto info = make_unique<TextFileInfo>(source, uint32_t(st.st_size), true);
+                setFileInfo(name, das::move(info));
+                return true;
+            } else {
+                das_aligned_free16(source);
+                return false;
+            }
+        }
+        return false;
+    }
+
+    void FsFileAccess::introduceDaslib () {
+        string daslibDir = getDasRoot() + "/" + DASLIB_MODULE_NAME + "/";
+#if defined(_MSC_VER)
+        _finddata_t c_file;
+        intptr_t hFile;
+        string findPath = daslibDir + "*.das";
+        if ((hFile = _findfirst(findPath.c_str(), &c_file)) != -1L) {
+            do {
+                if ( c_file.attrib & _A_SUBDIR ) continue;
+                string fullPath = daslibDir + c_file.name;
+                introduceFileFromDisk(fullPath, fullPath);
+            } while (_findnext(hFile, &c_file) == 0);
+            _findclose(hFile);
+        }
+#else
+        DIR * dir;
+        struct dirent * ent;
+        if ( (dir = opendir(daslibDir.c_str())) != NULL ) {
+            while ( (ent = readdir(dir)) != NULL ) {
+                string fname = ent->d_name;
+                if ( fname.length() > 4 && fname.substr(fname.length()-4) == ".das" ) {
+                    string fullPath = daslibDir + fname;
+                    introduceFileFromDisk(fullPath, fullPath);
+                }
+            }
+            closedir(dir);
+        }
+#endif
+    }
+
+    void FsFileAccess::introduceNativeModules () {
+        #define NATIVE_MODULE(category, subdir_name, dir_name, das_name) \
+            { \
+                string nativePath = getDasRoot() + "/modules/" + #dir_name + "/" + #subdir_name + "/" + #das_name + ".das"; \
+                introduceFileFromDisk(nativePath, nativePath); \
+            }
+        #include "modules/external_resolve.inc"
+        #undef NATIVE_MODULE
+    }
+
+    bool FsFileAccess::introduceNativeModule ( const string & req ) {
+        auto np = req.find_first_of("./");
+        if ( np == string::npos ) return false;
+        string top = req.substr(0, np);
+        auto last_np = req.find_last_of("./");
+        string mod_name = req.substr(last_np + 1);
+        string path = last_np == np ? "" : req.substr(np + 1, last_np - np - 1);
+        #define NATIVE_MODULE(category, subdir_name, dir_name, das_name) \
+            if ( top == #category && mod_name == #das_name && (path.empty() || path == #subdir_name) ) { \
+                string nativePath = getDasRoot() + "/modules/" + #dir_name + "/" + #subdir_name + "/" + #das_name + ".das"; \
+                return introduceFileFromDisk(nativePath, nativePath); \
+            }
+        #include "modules/external_resolve.inc"
+        #undef NATIVE_MODULE
+        return false;
+    }
+#else
+    bool FsFileAccess::introduceFileFromDisk ( const string &, const string & ) { return false; }
+    void FsFileAccess::introduceDaslib () {}
+    void FsFileAccess::introduceNativeModules () {}
+    bool FsFileAccess::introduceNativeModule ( const string & ) { return false; }
+#endif
+
+#if !defined(DAS_NO_FILEIO)
+    static bool endsWithExt ( const string & s, const char * suf ) {
+        size_t n = strlen(suf);
+        return s.size() >= n && memcmp(s.data() + s.size() - n, suf, n) == 0;
+    }
+#endif
+
     ModuleInfo FsFileAccess::getModuleInfo ( const string & req, const string & from ) const {
         if (!failed()) {
-            return ModuleFileAccess::getModuleInfo(req, from);
+            // A project's module_get() owns resolution, but an empty result means
+            // "I don't handle this require" -- fall through to the default mount-aware
+            // resolution below (daslib / native modules / dynamic modules / extraRoots)
+            // rather than reporting a missing prerequisite. This lets a project file
+            // override a single module and delegate everything else by returning ("","","").
+            ModuleInfo info = ModuleFileAccess::getModuleInfo(req, from);
+            if ( !info.fileName.empty() ) {
+                return info;
+            }
         }
+#if !defined(DAS_NO_FILEIO)
+        // file-path mode: trigger on .das or .das_project suffix + ./, ../, %/ prefix
+        if ( endsWithExt(req, ".das") || endsWithExt(req, ".das_project") ) {
+            bool relCur  = (req.size() >= 2 && req[0] == '.' && req[1] == '/');
+            bool relPar  = (req.size() >= 3 && req[0] == '.' && req[1] == '.' && req[2] == '/');
+            bool dasRoot = (req.size() >= 2 && req[0] == '%' && req[1] == '/');
+            if ( relCur || relPar || dasRoot ) {
+                namespace fs = std::filesystem;
+                fs::path base = dasRoot ? fs::path(getDasRoot().c_str()) : fs::path(from.c_str()).parent_path();
+                fs::path rel  = dasRoot ? fs::path(req.substr(2).c_str()) : fs::path(req.c_str());
+                // refuse absolute paths in the right-hand side: fs::path::operator/
+                // discards the LHS when RHS is absolute, which would let `%//etc/x.das`
+                // (or `%/C:/x.das` on Windows) escape getDasRoot() and the `from` dir.
+                if ( rel.is_absolute() || rel.has_root_name() || rel.has_root_directory() ) {
+                    return ModuleInfo();   // empty info -> reported as missing prerequisite
+                }
+                // for %/ the result must stay under getDasRoot(). After lexically_normal
+                // any `..` segments left in rel pop above the root (e.g. `%/../etc/x.das`),
+                // so reject. `./` and `../` are by design and may escape `from`'s dir.
+                if ( dasRoot ) {
+                    for ( const auto & seg : rel.lexically_normal() ) {
+                        if ( seg == ".." ) return ModuleInfo();
+                    }
+                }
+                fs::path full = (base / rel).lexically_normal();
+                ModuleInfo info;
+                info.fileName   = full.generic_string().c_str();
+                info.moduleName = full.stem().generic_string().c_str();
+                info.importName = info.moduleName;
+                return info;
+            }
+        }
+#endif
         auto np = req.find_first_of("./");
         if ( np != string::npos ) {
             string top = req.substr(0,np);
-            string mod_name = req.substr(np+1);
+            auto last_np = req.find_last_of("./");
+            string path = last_np == np ? "" : req.substr(np + 1,last_np - np - 1);
+            string mod_name = req.substr(last_np+1);
             ModuleInfo info;
             if ( top==DASLIB_MODULE_NAME ) {
                 info.moduleName = mod_name;
@@ -139,12 +291,27 @@ namespace das {
                 return info;
             }
             #define NATIVE_MODULE(category, subdir_name, dir_name, das_name) \
-                if ( top==#category && mod_name==#das_name ) { \
+                if ( top==#category && mod_name==#das_name && (path.empty() || path == #subdir_name) ) { \
                     info.moduleName = mod_name; \
                     info.fileName = getDasRoot() + "/modules/" + #dir_name + "/" + #subdir_name + "/" + #das_name + ".das"; \
                     return info; \
                 }
             #include "modules/external_resolve.inc"
+            // Try dynamic modules. From modules/<name>/.das_module.
+            auto resolve_mod = daScriptEnvironment::getBound()->g_dyn_modules_resolve;
+            if (resolve_mod) {
+                for (const auto &mod: *resolve_mod) {
+                    if (mod.name == top) {
+                        for (const auto &[from_path, to_path] : mod.paths) {
+                            if (from_path == req.substr(np + 1)) {
+                                info.moduleName = mod_name;
+                                info.fileName = to_path;
+                                return info;
+                            }
+                        }
+                    }
+                }
+            }
             #undef NATIVE_MODULE
             auto ert = extraRoots.find(top);
             if ( ert!=extraRoots.end() ) {

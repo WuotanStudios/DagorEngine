@@ -22,7 +22,7 @@ namespace threadpool
     cb(i, min(end-i, quant), thread_id);
 
   parallel_for(uint32_t begin, uint32_t end, uint32_t quant,
-               eastl::function<void(uint32_t tbegin, uint32_t tend, uint32_t thread_id)> cb,
+               dag::FunctionRef<void(uint32_t tbegin, uint32_t tend, uint32_t thread_id)> cb,
                uint32_t add_jobs_count = 0, JobPriority prio = PRIO_HIGH, bool wake = true);
 
   cb:
@@ -40,10 +40,18 @@ namespace threadpool
   wake: wakeup all threads. Better specify true, unless you know what are you doing
 */
 
-template <typename Cb>
-inline void parallel_for_inline(uint32_t begin, uint32_t end, uint32_t quant, Cb cb, uint32_t add_jobs_count = 0,
-  JobPriority prio = PRIO_HIGH, bool wake = true,
-  uint32_t dapDescId = 0) // wide load expects high priority
+namespace internal
+{
+
+enum class CallerRole
+{
+  ProcessUniformly,
+  ProcessFirstChunkOnCaller,
+};
+
+template <CallerRole role, typename Cb>
+inline void parallel_for_inline_impl(uint32_t begin, uint32_t end, uint32_t quant, Cb cb, uint32_t add_jobs_count, JobPriority prio,
+  bool wake, uint32_t dapDescId)
 {
   if (end == begin)
     return;
@@ -66,7 +74,7 @@ inline void parallel_for_inline(uint32_t begin, uint32_t end, uint32_t quant, Cb
     ParallelForJob(dag::AtomicInteger<uint32_t> &counter, Cb &cb_, uint32_t e, uint32_t q, uint32_t worker_id, uint32_t token) :
       current(counter), cb(cb_), end(e), quant(q), workerId(worker_id), dapToken(token)
     {}
-    virtual const char *getJobName(bool &) const override { return "ParallelForJob"; }
+    virtual const char *getJobName(bool &) const override { return DAPROFILER_STRING("ParallelForJob"); }
     virtual void doJob() override
     {
       // would be nice to put marker here...
@@ -83,14 +91,17 @@ inline void parallel_for_inline(uint32_t begin, uint32_t end, uint32_t quant, Cb
 #else
   static constexpr size_t stack_per_job = eastl::max((size_t)64 * 2, sizeof(ParallelForJob));
 #endif
-  dag::AtomicInteger<uint32_t> current = {begin};
+  const uint32_t counter_init = (role == CallerRole::ProcessFirstChunkOnCaller) ? (begin + quant) : begin;
+  dag::AtomicInteger<uint32_t> current = {counter_init};
   const auto wakeOnAdd = (add_jobs_count <= 2 && wake) ? threadpool::AddFlags::WakeOnAdd : threadpool::AddFlags::None;
   uint32_t queue_pos;
   ParallelForJob *lastJob;
   alignas(ParallelForJob) char staticJobsStorage[threadpool::MAX_WORKER_COUNT * stack_per_job];
+  // stride is stack_per_job (pads for false-sharing); alloca must match the stride, not
+  // sizeof(ParallelForJob), or slot 1+ overruns the allocation into the caller's stack.
   char *jobsStorage = DAGOR_LIKELY(add_jobs_count <= threadpool::MAX_WORKER_COUNT)
                         ? staticJobsStorage
-                        : (char *)alloca(add_jobs_count * sizeof(ParallelForJob)), // To consider: framemem?
+                        : (char *)alloca(add_jobs_count * stack_per_job), // To consider: framemem?
     *jobStorage = jobsStorage;
 
   static uint32_t def_desc = 0;
@@ -119,8 +130,16 @@ inline void parallel_for_inline(uint32_t begin, uint32_t end, uint32_t quant, Cb
 
   {
     DA_PROFILE_EVENT_DESC(dapDescId);
-    for (uint32_t at = current.fetch_add(quant); at < end; at = current.fetch_add(quant))
-      cb(at, at + eastl::min(quant, end - at), 0);
+    if constexpr (role == CallerRole::ProcessFirstChunkOnCaller)
+    {
+      // first chunk runs directly on caller thread
+      cb(begin, eastl::min(begin + quant, end), 0);
+    }
+    else
+    {
+      for (uint32_t at = current.fetch_add(quant); at < end; at = current.fetch_add(quant))
+        cb(at, at + eastl::min(quant, end - at), 0);
+    }
   }
   barrier_active_wait_for_job(lastJob, prio, queue_pos);
   // ok, all job _work_ is done here.
@@ -134,6 +153,25 @@ inline void parallel_for_inline(uint32_t begin, uint32_t end, uint32_t quant, Cb
     threadpool::wait(job);
     job->~ParallelForJob(); // does nothing
   }
+}
+} // namespace internal
+
+template <typename Cb>
+inline void parallel_for_inline(uint32_t begin, uint32_t end, uint32_t quant, Cb cb, uint32_t add_jobs_count = 0,
+  JobPriority prio = PRIO_HIGH, bool wake = true,
+  uint32_t dapDescId = 0) // wide load expects high priority
+{
+  internal::parallel_for_inline_impl<internal::CallerRole::ProcessUniformly>(begin, end, quant, eastl::move(cb), add_jobs_count, prio,
+    wake, dapDescId);
+}
+
+// first chunk takes [begin, begin + quant) and runs it on the caller thread, the rest works as in parallel_for_inline
+template <typename Cb>
+inline void parallel_for_inline_caller_first(uint32_t begin, uint32_t end, uint32_t quant, Cb cb, uint32_t add_jobs_count = 0,
+  JobPriority prio = PRIO_HIGH, bool wake = true, uint32_t dapDescId = 0)
+{
+  internal::parallel_for_inline_impl<internal::CallerRole::ProcessFirstChunkOnCaller>(begin, end, quant, eastl::move(cb),
+    add_jobs_count, prio, wake, dapDescId);
 }
 
 }; // namespace threadpool

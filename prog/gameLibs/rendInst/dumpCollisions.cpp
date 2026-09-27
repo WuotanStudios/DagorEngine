@@ -3,6 +3,7 @@
 #include "riGen/riGenExtra.h"
 
 #include <util/dag_console.h>
+#include <debug/dag_log.h>
 #include <ioSys/dag_fileIo.h>
 #include <gameRes/dag_collisionResource.h>
 #include <render/primitiveObjects.h>
@@ -19,20 +20,28 @@ static inline CollisionVertex to_coll_vert(vec4f v)
   return r;
 }
 static inline CollisionVertex to_coll_vert(Point3 v) { return v; }
+// File layout: [MAGIC][version][poolCountHint] then per-pool records. The magic has its MSB set so
+// it cannot be mistaken for the legacy leading pool-count hint (a small positive int); a stale
+// reader desyncs on it immediately instead of loading a new dump as a plausible-but-wrong scene.
+// Per pool the index count is written as a negative int when the pool has more than 65535 vertices
+// (uint32 indices follow) and as a positive int otherwise (16-bit indices follow). Magic/version
+// must match the reader in prog/gameLibs/publicInclude/rendInst/riCollisionDump.h (RI_COLLISION_DUMP_*).
 void dumpAllCollisions(IGenSave &cb)
 {
+  cb.writeInt((int)0xD0C0B1A5u); // RI_COLLISION_DUMP_MAGIC
+  cb.writeInt(1);                // RI_COLLISION_DUMP_VERSION
   static const int COLLISION_BOX_INDICES_NUM = 36;
   static const int COLLISION_BOX_VERTICES_NUM = 8;
   carray<uint16_t, COLLISION_BOX_INDICES_NUM> boxIndices;
   create_cubic_indices(make_span((uint8_t *)boxIndices.data(), COLLISION_BOX_INDICES_NUM * sizeof(uint16_t)), 1, false);
-  dag::Vector<uint16_t> indices;
+  dag::Vector<uint32_t> indices;
+  dag::Vector<uint16_t> indices16;
   dag::Vector<Point3> vertices;
   cb.writeInt(riExtra.size()); // hint!
-  for (auto &pool : riExtra)
-  {
+  iterateRIExtra([&](int, const RiExtraPool &pool) {
     CollisionResource *collRes = pool.collRes;
     if (!collRes || pool.isPosInst())
-      continue;
+      return;
     indices.clear();
     vertices.clear();
     for (int ni = 0, ne = collRes->getAllNodes().size(); ni < ne; ++ni)
@@ -47,38 +56,55 @@ void dumpAllCollisions(IGenSave &cb)
         indices.resize(indices.size() + COLLISION_BOX_INDICES_NUM);
         vertices.resize(vertices.size() + COLLISION_BOX_VERTICES_NUM);
 
+        BBox3 nodeBBox = collRes->getNodeBBox(ni);
         for (int vertNo = 0; vertNo < COLLISION_BOX_VERTICES_NUM; ++vertNo, vAt++)
-          vertices[vAt] = to_coll_vert(node->modelBBox.point(vertNo ^ 1)); // xor 1 to invert culling
+          vertices[vAt] = to_coll_vert(nodeBBox.point(vertNo ^ 1)); // xor 1 to invert culling
 
         for (int ii = 0; ii < COLLISION_BOX_INDICES_NUM; ++ii)
           indices[iAt + ii] = boxIndices[ii] + firstVertex;
       }
-      else if (node->indices.size() > 0 && (node->type == COLLISION_NODE_TYPE_MESH || node->type == COLLISION_NODE_TYPE_CONVEX))
+      else if (
+        collRes->getNodeFaceCount(ni) > 0 && (node->type == COLLISION_NODE_TYPE_MESH || node->type == COLLISION_NODE_TYPE_CONVEX))
       {
-        indices.resize(indices.size() + node->indices.size());
-        vertices.resize(vertices.size() + node->vertices.size());
-        G_ASSERT_CONTINUE(elem_size(node->vertices) == sizeof(vec4f));
-        const vec4f *__restrict verts = (const vec4f *)node->vertices.data();
+        int fc = collRes->getNodeFaceCount(ni);
+        int vc = collRes->getNodeVertCount(ni);
+        indices.resize(indices.size() + fc * 3);
+        vertices.resize(vertices.size() + vc);
         mat44f nodeTm;
-        v_mat44_make_from_43cu_unsafe(nodeTm, node->tm[0]);
-        for (const vec4f *__restrict ve = verts + node->vertices.size(); verts != ve; ++verts, ++vAt)
-          vertices[vAt] = to_coll_vert(v_mat44_mul_vec3p(nodeTm, *verts));
-        for (int ii = 0, ie = node->indices.size(); ii < ie; ++ii)
-          indices[iAt + ii] = node->indices[ii] + firstVertex;
+        v_mat44_make_from_43cu_unsafe(nodeTm, collRes->getNodeTm(node->nodeIndex)[0]);
+        collRes->iterateNodeVerts(ni, [&](int, vec4f v) { vertices[vAt++] = to_coll_vert(v_mat44_mul_vec3p(nodeTm, v)); });
+        collRes->iterateNodeFaces(ni, [&](int, uint32_t i0, uint32_t i1, uint32_t i2) {
+          indices[iAt++] = i0 + firstVertex;
+          indices[iAt++] = i1 + firstVertex;
+          indices[iAt++] = i2 + firstVertex;
+        });
       }
       else
         continue;
     }
     if (!indices.size())
-      continue;
-    cb.writeInt(indices.size());
-    cb.write(indices.begin(), indices.size() * sizeof(*indices.data()));
+      return;
+    if (vertices.size() > 65535)
+    {
+      // Wide form: negative count tells the reader that uint32 indices follow.
+      cb.writeInt(-(int)indices.size());
+      cb.write(indices.begin(), indices.size() * sizeof(*indices.data()));
+    }
+    else
+    {
+      // Legacy form: positive count, 16-bit indices that older readers still parse.
+      indices16.resize(indices.size());
+      for (size_t k = 0, ke = indices.size(); k < ke; ++k)
+        indices16[k] = (uint16_t)indices[k];
+      cb.writeInt(indices16.size());
+      cb.write(indices16.begin(), indices16.size() * sizeof(*indices16.data()));
+    }
     cb.writeInt(vertices.size());
     cb.write(vertices.begin(), vertices.size() * sizeof(*vertices.data()));
 
     cb.writeInt(pool.riTm.size());
     cb.write(pool.riTm.begin(), pool.riTm.size() * sizeof(mat43f));
-  }
+  });
 }
 } // namespace rendinst
 

@@ -9,13 +9,15 @@
 #include "de_ProjectSettings.h"
 #include "de_aboutdlg.h"
 #include "de_startdlg.h"
-#include "de_batch.h"
+#include "de_preferencesDialog.h"
 #include "de_screenshotMetaInfoLoader.h"
 #include "de_viewportWindow.h"
+#include "de_cameraPresets.h"
 #include "controlGallery.h"
 
 #include <de3_interface.h>
 #include <de3_lightService.h>
+#include <de3_hmapDebugShadingService.h>
 #include <de3_hmapService.h>
 #include <de3_huid.h>
 #include <de3_editorEvents.h>
@@ -35,19 +37,25 @@
 #include <propPanel/commonWindow/dialogManager.h>
 #include <propPanel/control/container.h>
 #include <propPanel/control/menu.h>
+#include <propPanel/control/toolbarContainer.h>
 #include <propPanel/c_util.h>
 #include <propPanel/colors.h>
 #include <propPanel/constants.h>
+#include <propPanel/imguiHelper.h>
 #include <propPanel/propPanel.h>
+#include <propPanel/toastManager.h>
 #include <winGuiWrapper/wgw_dialogs.h>
 #include <winGuiWrapper/wgw_input.h>
 
 #include <perfMon/dag_cpuFreq.h>
+#include <workCycle/dag_gameScene.h>
 #include <workCycle/dag_gameSettings.h>
 #include <workCycle/dag_startupModules.h>
 #include <workCycle/dag_workCycle.h>
+#include <perfMon/dag_daProfilerSettings.h>
 #include <gui/dag_baseCursor.h>
 #include <gui/dag_stdGuiRenderEx.h>
+#include <gui/dag_guiStartup.h>
 
 #include <EditorCore/ec_ViewportWindow.h>
 #include <EditorCore/ec_gizmofilter.h>
@@ -59,22 +67,28 @@
 #include <EditorCore/ec_ObjectEditor.h>
 #include <EditorCore/ec_IEditorCore.h>
 #include <EditorCore/ec_imguiInitialization.h>
+#include <EditorCore/ec_testSystem.h>
 #include <EditorCore/ec_input.h>
 #include <EditorCore/ec_startup.h>
 #include <EditorCore/ec_viewportSplitter.h>
 #include <EditorCore/ec_wndGlobal.h>
+#include <EditorCore/ec_keyboardShortcutsPanel.h>
+#include <EditorCore/ec_GizmoSettingsDialog.h>
 
 #include <libTools/staticGeom/geomObject.h>
 #include <libTools/renderViewports/cachedViewports.h>
 #include <libTools/util/makeBindump.h>
+#include <libTools/util/setupNamedMounts.h>
 #include <scene/dag_occlusionMap.h>
 #include <sceneBuilder/nsb_StdTonemapper.h>
 #include <sceneBuilder/nsb_LightmappedScene.h>
 
+#include <EASTL/string_view.h>
 #include <generic/dag_sort.h>
 #include <libTools/util/undo.h>
 #include <libTools/util/fileUtils.h>
 #include <regExp/regExp.h>
+#include <coolConsole/conBatch.h>
 
 #include <osApiWrappers/dag_direct.h>
 #include <osApiWrappers/dag_dynLib.h>
@@ -82,11 +96,12 @@
 #include <osApiWrappers/dag_symHlp.h>
 #include <osApiWrappers/dag_miscApi.h>
 
-#include <consoleWindow/dag_consoleWindow.h>
 #include <assets/texAssetBuilderTextureFactory.h>
 #include <assetsGui/av_globalState.h>
+#include <assetsGui/av_tagManagement.h>
 #include <ioSys/dag_dataBlock.h>
 #include <startup/dag_globalSettings.h>
+#include <startup/dag_restart.h>
 
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_lock.h>
@@ -98,11 +113,15 @@
 #include <render/daFrameGraph/debug.h>
 #include <render/dynmodelRenderer.h>
 
+#include <landMesh/clipMap.h>
+
 #include <de3_entityFilter.h>
 
 #include <eventLog/eventLog.h>
 #include <eventLog/errorLog.h>
 #include <util/dag_delayedAction.h>
+#include <util/dag_threadPool.h>
+#include <util/dag_string.h>
 
 #include <gui/dag_imgui.h>
 #include <imgui/imgui.h>
@@ -126,24 +145,24 @@ using PropPanel::ROOT_MENU_ITEM;
 #define LEVEL_FILE_EXTENSION_WO_DOT "level.blk"
 #define LEVEL_FILE_EXTENSION        "." LEVEL_FILE_EXTENSION_WO_DOT
 
-static constexpr unsigned DELAYED_CALLBACK_VIEWPORT_COMMAND_BIT = 1 << ((sizeof(unsigned) * 8) - 1);
-
 enum
 {
   CM_NAV_COMPASS = CM_PLUGIN_BASE - 10,
   CM_DISCARD_TEX_MODE,
+  CM_SHOW_COLLISION,
+  CM_CAMERA_PRESETS
 };
 
 extern void init3d_early();
-extern void init3d();
+extern void init3d(const char *window_layout_blk_path);
 
 namespace environment
 {
-void show_environment_settings(void *phandle);
 void save_settings(DataBlock &blk);
 void load_settings(DataBlock &blk);
 void save_ui_state(DataBlock &per_app_settings);
 void load_ui_state(const DataBlock &per_app_settings);
+IModelessWindowController *get_environment_settings_dialog_controller();
 }; // namespace environment
 
 static bool blockCloseMessage = false;
@@ -163,6 +182,8 @@ typedef void(__fastcall *ReleasePluginFunc)();
 
 extern void *get_generic_render_helper_service();
 extern void *get_generic_dyn_render_service();
+extern void *get_dng_based_render_service();
+extern void *get_dng_based_skies_service();
 extern void *get_tiff_bit_mask_image_mgr();
 extern void *get_generic_hmap_service();
 extern void *get_generic_asset_service();
@@ -179,6 +200,7 @@ extern void *get_generic_water_proj_fx_service();
 extern void *get_generic_cable_service();
 extern void *get_generic_spline_gen_service();
 extern void *get_generic_wind_service();
+extern void *get_hmap_debug_shading_service();
 extern void *get_pixel_perfect_selection_service();
 extern void *get_visibility_finder_service();
 
@@ -186,6 +208,7 @@ extern void release_generic_hmap_service();
 extern void release_generic_water_proj_fx_service();
 extern void release_generic_water_service();
 extern void release_generic_cable_service();
+extern void release_hmap_debug_shading_service();
 
 extern FastNameMap cmdline_include_dll_re, cmdline_exclude_dll_re;
 
@@ -198,7 +221,11 @@ IDagorInput *editorcore_extapi::dagInput = nullptr;
 IDagorTools *editorcore_extapi::dagTools = nullptr;
 IDagorScene *editorcore_extapi::dagScene = nullptr;
 
+DataBlock asset_browser_modal_settings;
+DataBlock asset_browser_modeless_settings;
+
 static eastl::unique_ptr<ControlGallery> control_gallery;
+static EditorCommandSystem editor_command_system;
 static bool discardTexMode = false;
 
 struct PluginMap
@@ -236,6 +263,9 @@ enum
   TABBAR_TYPE,
   PLUGTOOLS_TYPE,
   VIEWPORT_TYPE,
+  TAGMANAGER_TYPE,
+  SHORTCUTS_EDITOR_TYPE,
+  CAMERA_PRESETS_TYPE,
 };
 
 
@@ -281,7 +311,6 @@ void send_event_error(const char *s, const char *callstack)
 static void set_colliders_to_default_state()
 {
   restore_editor_colliders();
-  enable_all_custom_shadows();
 
   const int colliderCount = get_custom_colliders_count();
   for (int i = 0; i < colliderCount; ++i)
@@ -292,6 +321,30 @@ static void set_colliders_to_default_state()
   }
 }
 
+static String get_global_de_hotkey_settings_file_path()
+{
+  return make_full_path(sgg::get_exe_path_full(), "../.local/de3_hotkeys.blk");
+}
+
+static String get_heightmap_debug_shading_gradient_settings_file_path()
+{
+  return make_full_path(sgg::get_exe_path_full(), "../.local/color_presets_heightmap_debug_shading.blk");
+}
+
+// Finds the workspace that uses app_blk_path, registering a new one when none does.
+// Naming the path is consent to register it, so the new workspace stays listed even if this startup is then aborted.
+// Returns an empty name in case of an error, and puts the reason in error_message.
+static String resolve_workspace_for_app_blk_path(EditorWorkspace &wsp, const char *app_blk_path, String &error_message)
+{
+  const eastl::optional<String> foundWspName = wsp.getWspNameByAppBlkPathIfOnlyOneMatches(app_blk_path, error_message);
+  if (!foundWspName.has_value())
+    return String();
+
+  if (!foundWspName->empty())
+    return *foundWspName;
+
+  return wsp.addWspForAppBlkPath(app_blk_path, error_message);
+}
 
 //==============================================================================
 DagorEdAppWindow::DagorEdAppWindow(IWndManager *manager, const char *open_fname) :
@@ -319,6 +372,7 @@ DagorEdAppWindow::DagorEdAppWindow(IWndManager *manager, const char *open_fname)
   mTabWindow(NULL),
   mTabPanel(NULL),
   mPlugTools(NULL),
+  mTagManager(NULL),
   waterService(NULL),
   noWaterService(false)
 {
@@ -367,6 +421,14 @@ DagorEdAppWindow::DagorEdAppWindow(IWndManager *manager, const char *open_fname)
 //==============================================================================
 DagorEdAppWindow::~DagorEdAppWindow()
 {
+  const DataBlock &debugSettings = *dgs_get_settings()->getBlockByNameEx("debug");
+  const DataBlock *profiler = debugSettings.getBlockByName("profiler");
+  if (profiler && profiler->getBool("auto_dump", false))
+  {
+    da_profiler::request_dump();
+    da_profiler::tick_frame();
+  }
+
   texconvcache::build_on_demand_tex_factory_cease_loading(false);
   mManager->unregisterWindowHandler(this);
 
@@ -374,55 +436,87 @@ DagorEdAppWindow::~DagorEdAppWindow()
 
   // delete_visclipmesh();
 
-  DataBlock editorBlk;
+  const String editorBlkPathName = ::make_full_path(sgg::get_exe_path_full(), "../.local/de3_settings.blk");
 
-  DataBlock *toDagPlugBlk = editorBlk.addNewBlock("pluginsToDAG");
-  DataBlock *workspaceBlk = editorBlk.addNewBlock("workspace");
+  // Save all settings if a workspace has been selected and daEditorX has been "fully" started with a project.
+  if (sceneFname[0])
+  {
+    DataBlock editorBlk;
 
-  if (workspaceBlk && wsp)
-    workspaceBlk->setStr("currentName", wsp->getName());
+    DataBlock *toDagPlugBlk = editorBlk.addNewBlock("pluginsToDAG");
+    DataBlock *workspaceBlk = editorBlk.addNewBlock("workspace");
 
-  if (toDagPlugBlk)
-    for (int i = 0; i < toDagPlugNames.size(); ++i)
-      toDagPlugBlk->addStr("plug_name", toDagPlugNames[i]);
+    if (workspaceBlk && wsp)
+      workspaceBlk->setStr("currentName", wsp->getName());
 
-  DataBlock &globalPluginsRootSettings = *editorBlk.addNewBlock("plugins");
-  DataBlock perAppSettingsBlk;
-  DataBlock &perAppPluginsRootSettings = *perAppSettingsBlk.addNewBlock("plugins");
-  for (int i = 0; i < getPluginCount(); ++i)
-    if (IGenEditorPlugin *plugin = getPlugin(i))
+    if (toDagPlugBlk)
+      for (int i = 0; i < toDagPlugNames.size(); ++i)
+        toDagPlugBlk->addStr("plug_name", toDagPlugNames[i]);
+
+    DataBlock &globalPluginsRootSettings = *editorBlk.addNewBlock("plugins");
+    DataBlock perAppSettingsBlk;
+    DataBlock &perAppPluginsRootSettings = *perAppSettingsBlk.addNewBlock("plugins");
+    for (int i = 0; i < getPluginCount(); ++i)
+      if (IGenEditorPlugin *p = getPlugin(i))
+      {
+        DataBlock globalPluginSettings;
+        DataBlock perAppPluginSettings;
+        p->saveSettings(globalPluginSettings, perAppPluginSettings);
+        if (!globalPluginSettings.isEmpty())
+          globalPluginsRootSettings.addNewBlock(&globalPluginSettings, p->getInternalName());
+        if (!perAppPluginSettings.isEmpty())
+          perAppPluginsRootSettings.addNewBlock(&perAppPluginSettings, p->getInternalName());
+      }
+
+    editor_core_save_imgui_color_editor_options(editorBlk);
+    saveThemeSettings(editorBlk);
+    saveScreenshotSettings(editorBlk);
+
+    editorBlk.setBool("DeveloperToolsEnabled", developerToolsEnabled);
+    editorBlk.setInt("ToolbarScalePercent", getToolbarScalePercent());
+    GizmoSettings::save(editorBlk);
+
+    editorBlk.saveToTextFile(editorBlkPathName);
+
+    editor_core_save_dag_imgui_blk_settings(perAppSettingsBlk);
+    environment::save_ui_state(perAppSettingsBlk);
+
+    DataBlock *assetBrowserBlk = perAppSettingsBlk.addBlock("assetBrowser");
+    assetBrowserBlk->addNewBlock(&asset_browser_modal_settings, "assetSelectorDialogModal");
+    assetBrowserBlk->addNewBlock(&asset_browser_modeless_settings, "assetSelectorDialogModeless");
+
+    perAppSettingsBlk.saveToTextFile(getPerApplicationSettingsBlkPath());
+
+    const String hotkeySettingsPath = get_global_de_hotkey_settings_file_path();
+    DataBlock hotkeysBlk;
+    editor_command_system.saveChangedHotkeys(hotkeysBlk);
+    hotkeysBlk.saveToTextFile(hotkeySettingsPath);
+
+    DAEDITOR3.saveAssetsTags();
+
+    if (IHmapDebugShadingService *debugShadingService = DAGORED2->queryEditorInterface<IHmapDebugShadingService>())
+      debugShadingService->saveGradientsFile(get_heightmap_debug_shading_gradient_settings_file_path());
+
+    // switchToPlugin(-1);
+
+    const String windowLayoutBlkPath = getPerApplicationWindowLayoutBlkPath();
+    if (dockPositionsInitialized && !windowLayoutBlkPath.empty())
+      saveLayout(windowLayoutBlkPath);
+  }
+  else // If no project has been loaded then only update the last selected workspace in the settings.
+  {
+    // A startup that ended before any workspace loaded has no name to remember, and must keep the stored one.
+    DataBlock editorBlk;
+    if (wsp && *wsp->getName() && editorBlk.load(editorBlkPathName))
     {
-      DataBlock globalPluginSettings;
-      DataBlock perAppPluginSettings;
-      plugin->saveSettings(globalPluginSettings, perAppPluginSettings);
-      if (!globalPluginSettings.isEmpty())
-        globalPluginsRootSettings.addNewBlock(&globalPluginSettings, plugin->getInternalName());
-      if (!perAppPluginSettings.isEmpty())
-        perAppPluginsRootSettings.addNewBlock(&perAppPluginSettings, plugin->getInternalName());
+      editorBlk.addBlock("workspace")->setStr("currentName", wsp->getName());
+      editorBlk.saveToTextFile(editorBlkPathName);
     }
+  }
 
-  saveThemeSettings(editorBlk);
-  saveScreenshotSettings(editorBlk);
+  if (wsp)
+    wsp->save();
 
-  editorBlk.setBool("DeveloperToolsEnabled", developerToolsEnabled);
-  GizmoSettings::save(editorBlk);
-
-  String pathName = ::make_full_path(sgg::get_exe_path_full(), "../.local/de3_settings.blk");
-  editorBlk.saveToTextFile(pathName);
-
-  editor_core_save_dag_imgui_blk_settings(perAppSettingsBlk);
-  environment::save_ui_state(perAppSettingsBlk);
-
-  // There might be no path if exiting from the workspace selector without creating any workspaces.
-  const String perAppSettingsPath = getPerApplicationSettingsBlkPath();
-  if (!perAppSettingsPath.empty())
-    perAppSettingsBlk.saveToTextFile(perAppSettingsPath);
-
-  wsp->save();
-
-  // switchToPlugin(-1);
-
-  editor_core_save_imgui_settings(dockPositionsInitialized ? LATEST_DOCK_SETTINGS_VERSION : 0);
   PropPanel::remove_delayed_callback(*this);
   PropPanel::release();
 
@@ -432,14 +526,20 @@ DagorEdAppWindow::~DagorEdAppWindow()
   release_generic_hmap_service();
   release_generic_water_proj_fx_service();
   release_generic_water_service();
+  release_hmap_debug_shading_service();
   dynrend::close();
   console::shutdown();
   imgui_shutdown();
+
   StdGuiRender::close_fonts();
   StdGuiRender::close_render();
+  unregister_gui_base_rproc(); // Done by hand
 
   del_it(aboutDlg);
+  del_it(mCameraPresets);
   del_it(wsp);
+
+  threadpool::shutdown();
 }
 
 
@@ -451,17 +551,18 @@ void DagorEdAppWindow::init(const char *)
   ::dd_simplify_fname_c(imgPath.str());
   mManager->initCustomMouseCursors(imgPath);
 
-#if _TARGET_PC_LINUX // The Windows version uses its own message loop and the input is handled there.
+  init3d_early();
+
   dagor_init_keyboard_win();
   dagor_init_mouse_win();
   editor_core_initialize_input_handler();
-#endif
+  editor_core_initialize_test_runtime();
+  startup_game(RESTART_ALL);
 
-  init3d_early();
-  editor_core_initialize_imgui(nullptr); // The path is not set to avoid saving the startup screen's settings.
+  editor_core_initialize_imgui();
   editor_core_load_imgui_theme(getThemeFileName());
   GenericEditorAppWindow::init();
-  makeDefaultLayout();
+  makeDefaultLayout(/*for_initial_layout = */ true);
 
   IGenViewportWnd *curVP = ged.getViewport(0);
   if (curVP)
@@ -469,9 +570,141 @@ void DagorEdAppWindow::init(const char *)
     curVP->activate();
     ged.setCurrentViewportId(0);
   }
+}
 
-  // Accelerators
+
+String DagorEdAppWindow::getSwitchToPluginEditorCommandId(const IGenEditorPlugin &p)
+{
+  // getMenuCommandName() is more user friendly than getInternalName().
+  String id = String::mk_str_cat(EditorCommandIds::SWITCH_TO_PLUGIN, p.getMenuCommandName());
+  id.replaceAll(" ", "");
+  return id;
+}
+
+
+void DagorEdAppWindow::onEditorCommandKeyChordChanged()
+{
   addEditorAccelerators();
+
+  editor_command_system.updateMenuItemShortcuts(*getMainMenu());
+
+  for (int i = 0; i < ged.getViewportCount(); ++i)
+    if (ViewportWindow *viewport = ged.getViewport(i))
+      if (PropPanel::IMenu *menu = viewport->getPopupMenu())
+        editor_command_system.updateMenuItemShortcuts(*menu);
+
+  if (mToolPanel)
+    editor_command_system.updateToolbarButtons(*mToolPanel);
+  if (mPlugTools)
+    editor_command_system.updateToolbarButtons(*mPlugTools);
+}
+
+
+void DagorEdAppWindow::registerEditorCommands()
+{
+  registerCommonEditorCommands(editor_command_system);
+  ViewportWindow::registerEditorCommands(editor_command_system);
+
+  for (int i = 0; i < getPluginCount(); ++i)
+    if (IGenEditorPlugin *p = getPlugin(i))
+    {
+      p->registerEditorCommands(editor_command_system);
+
+      if (p->showInMenu())
+        editor_command_system.addCommand(getSwitchToPluginEditorCommandId(*p));
+    }
+
+  editor_command_system.addCommand(EditorCommandIds::DEBUG_FLUSH, ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_F,
+    ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_F);
+
+  editor_command_system.addCommand(EditorCommandIds::FILE_SAVE, ImGuiMod_Ctrl | ImGuiKey_S);
+  editor_command_system.addCommand(EditorCommandIds::FILE_SAVE_AS);
+  editor_command_system.addCommand(EditorCommandIds::FILE_OPEN);
+  editor_command_system.addCommand(EditorCommandIds::FILE_REOPEN);
+  editor_command_system.addCommand(EditorCommandIds::FILE_EXPORT_TO_GAME_PC);
+
+  editor_command_system.addCommand(EditorCommandIds::UNDO, ImGuiMod_Ctrl | ImGuiKey_Z);
+  editor_command_system.addCommand(EditorCommandIds::REDO, ImGuiMod_Ctrl | ImGuiKey_Y);
+  editor_command_system.addCommand(EditorCommandIds::SELECT_ALL, ImGuiMod_Ctrl | ImGuiKey_A);
+  editor_command_system.addCommand(EditorCommandIds::DESELECT_ALL, ImGuiMod_Ctrl | ImGuiKey_D);
+  editor_command_system.addCommand(EditorCommandIds::INVERT_SELECTION, ImGuiMod_Ctrl | ImGuiKey_I);
+
+  editor_command_system.addCommand(EditorCommandIds::VIEWPORT_LAYOUT_4);
+  editor_command_system.addCommand(EditorCommandIds::VIEWPORT_LAYOUT_1);
+  editor_command_system.addCommand(EditorCommandIds::LOAD_DEFAULT_LAYOUT);
+  editor_command_system.addCommand(EditorCommandIds::LOAD_LAYOUT);
+  editor_command_system.addCommand(EditorCommandIds::SAVE_LAYOUT);
+  editor_command_system.addCommand(EditorCommandIds::OPTIONS_TOTAL, ImGuiKey_F11);
+  editor_command_system.addCommand(EditorCommandIds::USE_OCCLUDERS);
+  editor_command_system.addCommand(EditorCommandIds::NAV_COMPASS);
+  editor_command_system.addCommand(EditorCommandIds::SHOW_COLLISION);
+  editor_command_system.addCommand(EditorCommandIds::CAMERA_PRESETS);
+  editor_command_system.addCommand(EditorCommandIds::DISCARD_TEX_MODE);
+  editor_command_system.addCommand(EditorCommandIds::TOGGLE_TAG_MANAGER);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_DEVELOPER_TOOLS_CONTROL_GALLERY);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_DEVELOPER_TOOLS_IMGUI_DEBUGGER, ImGuiMod_Ctrl | ImGuiKey_F12);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_DEVELOPER_TOOLS_TEST_RUNTIME, ImGuiMod_Alt | ImGuiKey_T);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_DEVELOPER_TOOLS_TOAST_MANAGER);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_DEVELOPER_TOOLS_TEXTURE_DEBUG);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_DEVELOPER_TOOLS_NODE_DEPS);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_DEVELOPER_TOOLS_CLIPMAP_DEBUG);
+  editor_command_system.addCommand(EditorCommandIds::CUR_PLUGIN_VIS_CHANGE, ImGuiKey_F12);
+
+  editor_command_system.addCommand(EditorCommandIds::BATCH_RUN);
+  editor_command_system.addCommand(EditorCommandIds::FILE_EXPORT_TO_DAG);
+  editor_command_system.addCommand(EditorCommandIds::FILE_EXPORT_COLLISION_TO_DAG);
+  editor_command_system.addCommand(EditorCommandIds::CREATE_ORTHOGONAL_SCREENSHOT);
+  editor_command_system.addCommand(EditorCommandIds::UPSCALE_HEIGHTMAP);
+
+  editor_command_system.addCommand(EditorCommandIds::OPTIONS_CAMERAS);
+  editor_command_system.addCommand(EditorCommandIds::OPTIONS_SCREENSHOT);
+  editor_command_system.addCommand(EditorCommandIds::OPTIONS_STAT_DISPLAY_SETTINGS);
+  editor_command_system.addCommand(EditorCommandIds::FILE_SETTINGS);
+  editor_command_system.addCommand(EditorCommandIds::OPTIONS_EDIT_PREFERENCES);
+  editor_command_system.addCommand(EditorCommandIds::OPTIONS_KEYBOARD_SHORTCUTS);
+
+  editor_command_system.addCommand(EditorCommandIds::VIEW_GRID_MOVE_SNAP, ImGuiKey_S);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_GRID_ANGLE_SNAP, ImGuiKey_A);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_GRID_SCALE_SNAP, ImGuiMod_Shift | ImGuiKey_5);
+  editor_command_system.addCommand(EditorCommandIds::VIEW_GRID_SETTINGS);
+
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_F5, ImGuiKey_F5);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_F6, ImGuiKey_F6);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_F7, ImGuiKey_F7);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_F8, ImGuiKey_F8);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF1, ImGuiMod_Shift | ImGuiKey_F1);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF2, ImGuiMod_Shift | ImGuiKey_F2);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF3, ImGuiMod_Shift | ImGuiKey_F3);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF4, ImGuiMod_Shift | ImGuiKey_F4);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF5, ImGuiMod_Shift | ImGuiKey_F5);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF6, ImGuiMod_Shift | ImGuiKey_F6);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF7, ImGuiMod_Shift | ImGuiKey_F7);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF8, ImGuiMod_Shift | ImGuiKey_F8);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF9, ImGuiMod_Shift | ImGuiKey_F9);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF10, ImGuiMod_Shift | ImGuiKey_F10);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF11, ImGuiMod_Shift | ImGuiKey_F11);
+  editor_command_system.addCommand(EditorCommandIds::SWITCH_PLUGIN_SF12, ImGuiMod_Shift | ImGuiKey_F12);
+
+  editor_command_system.addCommand(EditorCommandIds::NEXT_PLUGIN, ImGuiMod_Ctrl | ImGuiKey_Tab);
+  editor_command_system.addCommand(EditorCommandIds::PREV_PLUGIN, ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Tab);
+
+  editor_command_system.addCommand(EditorCommandIds::TAB_PRESS, ImGuiKey_Tab);
+
+  editor_command_system.addCommand(EditorCommandIds::CHANGE_VIEWPORT, ImGuiMod_Ctrl | ImGuiKey_W);
+  editor_command_system.addCommand(EditorCommandIds::STATS);
+  editor_command_system.addCommand(EditorCommandIds::CONSOLE, ImGuiMod_Ctrl | ImGuiKey_GraveAccent); // Ctrl+`
+  editor_command_system.addCommand(EditorCommandIds::THEME_TOGGLE);
+
+  // All commands have been registered, enable logging access to missing commands.
+  editor_command_system.enableMissingCommandLogging();
+
+  const String hotkeySettingsPath = get_global_de_hotkey_settings_file_path();
+  if (dd_file_exists(hotkeySettingsPath))
+  {
+    const DataBlock hotkeysBlk(hotkeySettingsPath);
+    editor_command_system.loadChangedHotkeys(hotkeysBlk);
+  }
 }
 
 
@@ -479,54 +712,112 @@ void DagorEdAppWindow::addEditorAccelerators()
 {
   mManager->clearAccelerators();
 
-  addCameraAccelerators();
+  { // camera controls that always work
+    mManager->addViewportAccelerator(CM_CAMERAS_FREE, EditorCommandIds::CAMERAS_FREE);
+    mManager->addViewportAccelerator(CM_CAMERAS_FPS, EditorCommandIds::CAMERAS_FPS);
+    mManager->addViewportAccelerator(CM_CAMERAS_TPS, EditorCommandIds::CAMERAS_TPS);
+    // mManager->addViewportAccelerator(CM_CAMERAS_CAR, ImGuiMod_Shift | ImGuiKey_Space);
+    mManager->addAccelerator(CM_ZOOM_AND_CENTER, EditorCommandIds::ZOOM_AND_CENTER_IN_FLY_MODE); // For fly mode.
 
-  mManager->addAccelerator(CM_FILE_SAVE, ImGuiMod_Ctrl | ImGuiKey_S);
+    mManager->addAccelerator(CM_DEBUG_FLUSH, EditorCommandIds::DEBUG_FLUSH);
+  }
 
-  mManager->addAccelerator(CM_UNDO, ImGuiMod_Ctrl | ImGuiKey_Z);
-  mManager->addAccelerator(CM_REDO, ImGuiMod_Ctrl | ImGuiKey_Y);
-  mManager->addAccelerator(CM_SELECT_ALL, ImGuiMod_Ctrl | ImGuiKey_A);
-  mManager->addAccelerator(CM_DESELECT_ALL, ImGuiMod_Ctrl | ImGuiKey_D);
+  if (CCameraElem::getCamera() == CCameraElem::MAX_CAMERA)
+  {
+    mManager->addAccelerator(CM_FILE_SAVE, EditorCommandIds::FILE_SAVE);
+    mManager->addAccelerator(CM_FILE_SAVE_AS, EditorCommandIds::FILE_SAVE_AS);
+    mManager->addAccelerator(CM_FILE_OPEN, EditorCommandIds::FILE_OPEN);
+    mManager->addAccelerator(CM_FILE_REOPEN, EditorCommandIds::FILE_REOPEN);
+    mManager->addAccelerator(CM_FILE_EXPORT_TO_GAME_PC, EditorCommandIds::FILE_EXPORT_TO_GAME_PC);
 
-  mManager->addAccelerator(CM_OPTIONS_TOTAL, ImGuiKey_F11);
-  mManager->addAccelerator(CM_CUR_PLUGIN_VIS_CHANGE, ImGuiKey_F12);
+    mManager->addAccelerator(CM_UNDO, EditorCommandIds::UNDO);
+    mManager->addAccelerator(CM_REDO, EditorCommandIds::REDO);
+    mManager->addAccelerator(CM_SELECT_ALL, EditorCommandIds::SELECT_ALL);
+    mManager->addAccelerator(CM_DESELECT_ALL, EditorCommandIds::DESELECT_ALL);
+    mManager->addAccelerator(CM_INVERT_SELECTION, EditorCommandIds::INVERT_SELECTION);
 
-  mManager->addAccelerator(CM_CREATE_SCREENSHOT, ImGuiMod_Ctrl | ImGuiKey_P);
-  mManager->addAccelerator(CM_CREATE_CUBE_SCREENSHOT, ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_P);
+    mManager->addAccelerator(CM_VIEWPORT_LAYOUT_4, EditorCommandIds::VIEWPORT_LAYOUT_4);
+    mManager->addAccelerator(CM_VIEWPORT_LAYOUT_1, EditorCommandIds::VIEWPORT_LAYOUT_1);
+    mManager->addAccelerator(CM_LOAD_DEFAULT_LAYOUT, EditorCommandIds::LOAD_DEFAULT_LAYOUT);
+    mManager->addAccelerator(CM_LOAD_LAYOUT, EditorCommandIds::LOAD_LAYOUT);
+    mManager->addAccelerator(CM_SAVE_LAYOUT, EditorCommandIds::SAVE_LAYOUT);
+    mManager->addAccelerator(CM_OPTIONS_TOTAL, EditorCommandIds::OPTIONS_TOTAL);
+    mManager->addAccelerator(CM_OPTIONS_GRID, EditorCommandIds::VIEW_GRID_SETTINGS);
+    mManager->addAccelerator(CM_USE_OCCLUDERS, EditorCommandIds::USE_OCCLUDERS);
+    mManager->addAccelerator(CM_NAV_COMPASS, EditorCommandIds::NAV_COMPASS);
+    mManager->addAccelerator(CM_SHOW_COLLISION, EditorCommandIds::SHOW_COLLISION);
+    mManager->addAccelerator(CM_NAV_COMPASS, EditorCommandIds::CAMERA_PRESETS);
+    mManager->addAccelerator(CM_DISCARD_TEX_MODE, EditorCommandIds::DISCARD_TEX_MODE);
+    mManager->addAccelerator(CM_WINDOW_TAGMANAGER, EditorCommandIds::TOGGLE_TAG_MANAGER);
+    mManager->addAccelerator(CM_VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES,
+      EditorCommandIds::VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES);
+    mManager->addAccelerator(CM_VIEW_DEVELOPER_TOOLS_CONTROL_GALLERY, EditorCommandIds::VIEW_DEVELOPER_TOOLS_CONTROL_GALLERY);
+    mManager->addAccelerator(CM_VIEW_DEVELOPER_TOOLS_IMGUI_DEBUGGER, EditorCommandIds::VIEW_DEVELOPER_TOOLS_IMGUI_DEBUGGER);
+    mManager->addAccelerator(CM_VIEW_DEVELOPER_TOOLS_TEST_RUNTIME, EditorCommandIds::VIEW_DEVELOPER_TOOLS_TEST_RUNTIME);
+    mManager->addAccelerator(CM_VIEW_DEVELOPER_TOOLS_TOAST_MANAGER, EditorCommandIds::VIEW_DEVELOPER_TOOLS_TOAST_MANAGER);
+    mManager->addAccelerator(CM_VIEW_DEVELOPER_TOOLS_TEXTURE_DEBUG, EditorCommandIds::VIEW_DEVELOPER_TOOLS_TEXTURE_DEBUG);
+    mManager->addAccelerator(CM_VIEW_DEVELOPER_TOOLS_NODE_DEPS, EditorCommandIds::VIEW_DEVELOPER_TOOLS_NODE_DEPS);
+    mManager->addAccelerator(CM_VIEW_DEVELOPER_TOOLS_CLIPMAP_DEBUG, EditorCommandIds::VIEW_DEVELOPER_TOOLS_CLIPMAP_DEBUG);
+    mManager->addAccelerator(CM_CUR_PLUGIN_VIS_CHANGE, EditorCommandIds::CUR_PLUGIN_VIS_CHANGE);
 
-  mManager->addAccelerator(CM_VIEW_GRID_MOVE_SNAP, ImGuiKey_S);
-  mManager->addAccelerator(CM_VIEW_GRID_ANGLE_SNAP, ImGuiKey_A);
-  mManager->addAccelerator(CM_VIEW_GRID_SCALE_SNAP, ImGuiMod_Shift | ImGuiKey_5);
+    mManager->addAccelerator(CM_BATCH_RUN, EditorCommandIds::BATCH_RUN);
+    mManager->addAccelerator(CM_FILE_EXPORT_TO_DAG, EditorCommandIds::FILE_EXPORT_TO_DAG);
+    mManager->addAccelerator(CM_FILE_EXPORT_COLLISION_TO_DAG, EditorCommandIds::FILE_EXPORT_COLLISION_TO_DAG);
+    mManager->addAccelerator(CM_CREATE_SCREENSHOT, EditorCommandIds::CREATE_SCREENSHOT);
+    mManager->addAccelerator(CM_CREATE_CUBE_SCREENSHOT, EditorCommandIds::CREATE_CUBE_SCREENSHOT);
+    mManager->addAccelerator(CM_CREATE_ORTHOGONAL_SCREENSHOT, EditorCommandIds::CREATE_ORTHOGONAL_SCREENSHOT);
+    mManager->addAccelerator(CM_UPSCALE_HEIGHTMAP, EditorCommandIds::UPSCALE_HEIGHTMAP);
 
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_F5, ImGuiKey_F5);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_F6, ImGuiKey_F6);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_F7, ImGuiKey_F7);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_F8, ImGuiKey_F8);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF1, ImGuiMod_Shift | ImGuiKey_F1);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF2, ImGuiMod_Shift | ImGuiKey_F2);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF3, ImGuiMod_Shift | ImGuiKey_F3);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF4, ImGuiMod_Shift | ImGuiKey_F4);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF5, ImGuiMod_Shift | ImGuiKey_F5);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF6, ImGuiMod_Shift | ImGuiKey_F6);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF7, ImGuiMod_Shift | ImGuiKey_F7);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF8, ImGuiMod_Shift | ImGuiKey_F8);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF9, ImGuiMod_Shift | ImGuiKey_F9);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF10, ImGuiMod_Shift | ImGuiKey_F10);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF11, ImGuiMod_Shift | ImGuiKey_F11);
-  mManager->addAccelerator(CM_SWITCH_PLUGIN_SF12, ImGuiMod_Shift | ImGuiKey_F12);
+    mManager->addAccelerator(CM_OPTIONS_CAMERAS, EditorCommandIds::OPTIONS_CAMERAS);
+    mManager->addAccelerator(CM_OPTIONS_SCREENSHOT, EditorCommandIds::OPTIONS_SCREENSHOT);
+    mManager->addAccelerator(CM_OPTIONS_STAT_DISPLAY_SETTINGS, EditorCommandIds::OPTIONS_STAT_DISPLAY_SETTINGS);
+    mManager->addAccelerator(CM_ENVIRONMENT_SETTINGS, EditorCommandIds::ENVIRONMENT_SETTINGS);
+    mManager->addAccelerator(CM_FILE_SETTINGS, EditorCommandIds::FILE_SETTINGS);
+    mManager->addAccelerator(CM_OPTIONS_EDIT_PREFERENCES, EditorCommandIds::OPTIONS_EDIT_PREFERENCES);
+    mManager->addAccelerator(CM_OPTIONS_KEYBOARD_SHORTCUTS, EditorCommandIds::OPTIONS_KEYBOARD_SHORTCUTS);
 
-  mManager->addAccelerator(CM_NEXT_PLUGIN, ImGuiMod_Ctrl | ImGuiKey_Tab);
-  mManager->addAccelerator(CM_PREV_PLUGIN, ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Tab);
+    mManager->addAccelerator(CM_VIEW_GRID_MOVE_SNAP, EditorCommandIds::VIEW_GRID_MOVE_SNAP);
+    mManager->addAccelerator(CM_VIEW_GRID_ANGLE_SNAP, EditorCommandIds::VIEW_GRID_ANGLE_SNAP);
+    mManager->addAccelerator(CM_VIEW_GRID_SCALE_SNAP, EditorCommandIds::VIEW_GRID_SCALE_SNAP);
 
-  mManager->addAccelerator(CM_TAB_PRESS, ImGuiKey_Tab);
-  mManager->addAcceleratorUp(CM_TAB_RELEASE, ImGuiKey_Tab);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_F5, EditorCommandIds::SWITCH_PLUGIN_F5);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_F6, EditorCommandIds::SWITCH_PLUGIN_F6);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_F7, EditorCommandIds::SWITCH_PLUGIN_F7);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_F8, EditorCommandIds::SWITCH_PLUGIN_F8);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF1, EditorCommandIds::SWITCH_PLUGIN_SF1);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF2, EditorCommandIds::SWITCH_PLUGIN_SF2);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF3, EditorCommandIds::SWITCH_PLUGIN_SF3);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF4, EditorCommandIds::SWITCH_PLUGIN_SF4);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF5, EditorCommandIds::SWITCH_PLUGIN_SF5);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF6, EditorCommandIds::SWITCH_PLUGIN_SF6);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF7, EditorCommandIds::SWITCH_PLUGIN_SF7);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF8, EditorCommandIds::SWITCH_PLUGIN_SF8);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF9, EditorCommandIds::SWITCH_PLUGIN_SF9);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF10, EditorCommandIds::SWITCH_PLUGIN_SF10);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF11, EditorCommandIds::SWITCH_PLUGIN_SF11);
+    mManager->addAccelerator(CM_SWITCH_PLUGIN_SF12, EditorCommandIds::SWITCH_PLUGIN_SF12);
 
-  mManager->addAccelerator(CM_CHANGE_VIEWPORT, ImGuiMod_Ctrl | ImGuiKey_W);
-  mManager->addAccelerator(CM_ZOOM_AND_CENTER, ImGuiKey_Z);                   // For normal mode.
-  mManager->addAccelerator(CM_CONSOLE, ImGuiMod_Ctrl | ImGuiKey_GraveAccent); // Ctrl+`
+    mManager->addAccelerator(CM_NEXT_PLUGIN, EditorCommandIds::NEXT_PLUGIN);
+    mManager->addAccelerator(CM_PREV_PLUGIN, EditorCommandIds::PREV_PLUGIN);
 
-  if (auto *p = curPlugin())
-    p->registerMenuAccelerators();
+    // This is a special accelerator where the key's release is also used. See HmapLandPlugin::updateImgui().
+    mManager->addViewportAccelerator(CM_TAB_PRESS, EditorCommandIds::TAB_PRESS);
+
+    mManager->addAccelerator(CM_CHANGE_VIEWPORT, EditorCommandIds::CHANGE_VIEWPORT);
+    mManager->addAccelerator(CM_ZOOM_AND_CENTER, EditorCommandIds::ZOOM_AND_CENTER); // For normal mode.
+    mManager->addAccelerator(CM_NAVIGATE, EditorCommandIds::NAVIGATE);
+    mManager->addAccelerator(CM_STATS, EditorCommandIds::STATS);
+    mManager->addAccelerator(CM_CHANGE_FOV, EditorCommandIds::CHANGE_FOV);
+    mManager->addAccelerator(CM_CONSOLE, EditorCommandIds::CONSOLE);
+    mManager->addAccelerator(CM_THEME_TOGGLE, EditorCommandIds::THEME_TOGGLE);
+
+    for (int i = 0; i < plugin.size(); ++i)
+      if (plugin[i].p->showInMenu())
+        mManager->addAccelerator(CM_PLUGINS_MENU_1ST + i, getSwitchToPluginEditorCommandId(*plugin[i].p));
+
+    if (auto *p = curPlugin())
+      p->registerMenuAccelerators();
+  }
 
   ViewportWindow *viewport = ged.getCurrentViewport();
   if (viewport)
@@ -534,32 +825,124 @@ void DagorEdAppWindow::addEditorAccelerators()
 }
 
 
-void DagorEdAppWindow::addCameraAccelerators()
+ModelessWindowControllerList DagorEdAppWindow::getModelessWindowControllers()
 {
-  mManager->clearAccelerators();
+  ModelessWindowControllerList controllers;
 
-  mManager->addAccelerator(CM_CAMERAS_FREE, ImGuiKey_Space);
-  mManager->addAccelerator(CM_CAMERAS_FPS, ImGuiMod_Ctrl | ImGuiKey_Space);
-  mManager->addAccelerator(CM_CAMERAS_TPS, ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Space);
-  // mManager->addAccelerator(CM_CAMERAS_CAR, ImGuiMod_Shift | ImGuiKey_Space);
+  GenericEditorAppWindow::getModelessWindowControllers(controllers, ScreenshotDlgMode::DA_EDITOR);
 
-  mManager->addAccelerator(CM_ZOOM_AND_CENTER, ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z); // For fly mode.
+  for (int i = 0; i < ged.getViewportCount(); ++i)
+    ged.getViewport(i)->getModelessWindowControllers(controllers);
 
-  mManager->addAccelerator(CM_DEBUG_FLUSH, ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_F);
-  mManager->addAccelerator(CM_DEBUG_FLUSH, ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_F);
+  controllers.addWindowController(*get_camera_object_config_modeless_dialog_handler());
+  controllers.addWindowController(*environment::get_environment_settings_dialog_controller());
+  controllers.addWindowController(*get_preferences_dialog_controller());
+  controllers.addWindowController(*get_gizmo_settings_dialog_controller());
+
+  return controllers;
 }
 
 
-void DagorEdAppWindow::makeDefaultLayout()
+void DagorEdAppWindow::makeDefaultLayout(bool for_initial_layout)
 {
   dockPositionsInitialized = false;
-  resetModelessWindows(ModelessWindowResetReason::ResettingLayout);
-  mManager->reset();
 
+  if (!for_initial_layout)
+  {
+    PropPanel::ImguiHelper::resetWindowLayout();
+    getModelessWindowControllers().setDefaultState();
+    editor_core_close_dag_imgui_windows();
+
+    consoleCommandsAndVariableWindowsVisible = imgui_window_is_visible("", "Console commands and variables");
+    getMainMenu()->setCheckById(CM_VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES, consoleCommandsAndVariableWindowsVisible);
+  }
+
+  mManager->reset();
   mManager->setWindowType(nullptr, VIEWPORT_TYPE);
   mManager->setWindowType(nullptr, PLUGTOOLS_TYPE);
   mManager->setWindowType(nullptr, TABBAR_TYPE);
   mManager->setWindowType(nullptr, TOOLBAR_TYPE);
+}
+
+
+void DagorEdAppWindow::saveLayout(const char *path)
+{
+  DataBlock blk;
+
+  DataBlock *mainWindowBlk = blk.addBlock("mainWindow");
+  getWndManager()->saveMainWindowPositionAndSize(*mainWindowBlk);
+
+  DataBlock *modelessWindowsBlk = blk.addBlock("modelessWindows");
+  getModelessWindowControllers().saveState(*modelessWindowsBlk);
+
+  editor_core_save_dag_imgui_windows(blk);
+
+  DataBlock *imguiBlk = blk.addBlock("imgui");
+  imguiBlk->setInt("dockSettingsVersion", LATEST_DOCK_SETTINGS_VERSION);
+
+  const char *imguiSettings = ImGui::SaveIniSettingsToMemory();
+  imguiBlk->setStr("imguiSettings", imguiSettings);
+
+  if (!blk.saveToTextFile(path))
+    logerr("Saving the window layout to \"%s\" has failed.", path);
+}
+
+
+bool DagorEdAppWindow::loadLayout(const DataBlock &blk)
+{
+  const DataBlock *imguiBlk = blk.getBlockByNameEx("imgui");
+  const int loadedDockSettingsVersion = imguiBlk->getInt("dockSettingsVersion", 0);
+  bool succeeded = false;
+  if (loadedDockSettingsVersion == LATEST_DOCK_SETTINGS_VERSION)
+  {
+    const char *imguiSettings = imguiBlk->getStr("imguiSettings", nullptr);
+    if (imguiSettings != nullptr && *imguiSettings != 0)
+    {
+      PropPanel::ImguiHelper::resetWindowLayout();
+      ImGui::LoadIniSettingsFromMemory(imguiSettings);
+      succeeded = true;
+    }
+  }
+  else
+  {
+    logwarn("The saved window layout contains old dock setting version, the layout will not be restored.");
+  }
+
+  getModelessWindowControllers().loadState(*blk.getBlockByNameEx("modelessWindows"));
+  editor_core_load_dag_imgui_windows(blk);
+
+  consoleCommandsAndVariableWindowsVisible = imgui_window_is_visible("", "Console commands and variables");
+  getMainMenu()->setCheckById(CM_VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES, consoleCommandsAndVariableWindowsVisible);
+
+  return succeeded;
+}
+
+
+void DagorEdAppWindow::loadLastUsedLayout()
+{
+  const String windowLayoutBlkPath = getPerApplicationWindowLayoutBlkPath();
+  DataBlock windowLayoutBlk;
+  if (!windowLayoutBlkPath.empty() && dd_file_exists(windowLayoutBlkPath) && windowLayoutBlk.load(windowLayoutBlkPath))
+  {
+    logdbg("Loading last used window layout from \"%s\".", windowLayoutBlkPath.c_str());
+    dockPositionsInitialized = loadLayout(windowLayoutBlk);
+  }
+  else // TODO: remove the entire else block after a while. This code just loads layout from its old location.
+  {
+    const String imguiIniPath(::make_full_path(sgg::get_exe_path_full(), "../.local/de3_imgui.ini"));
+    String imguiIniContents;
+    if (dag_read_file_to_mem_str(imguiIniPath, imguiIniContents) &&
+        strstr(imguiIniContents, String(0, "DockSettingsVersion=%d", LATEST_DOCK_SETTINGS_VERSION)))
+    {
+      logdbg("Loading layout from \"%s\".", imguiIniPath.c_str());
+      windowLayoutBlk.clearData();
+      windowLayoutBlk.addBlock("imgui")->setInt("dockSettingsVersion", LATEST_DOCK_SETTINGS_VERSION);
+      windowLayoutBlk.addBlock("imgui")->setStr("imguiSettings", imguiIniContents);
+      dockPositionsInitialized = loadLayout(windowLayoutBlk);
+    }
+  }
+
+  lastUsedLayoutLoaded = true;
 }
 
 
@@ -574,7 +957,7 @@ void *DagorEdAppWindow::onWmCreateWindow(int type)
 
       getMainMenu()->setEnabledById(CM_WINDOW_TOOLBAR, false);
 
-      mToolPanel = new PropPanel::ContainerPropertyControl(0, this, nullptr, 0, 0, hdpi::Px(0), hdpi::Px(0));
+      mToolPanel = new PropPanel::ToolbarContainerPropertyControl(0, this, nullptr, 0, 0, hdpi::Px(0), hdpi::Px(0));
 
       fillMainToolBar();
       updateThemeItems();
@@ -609,7 +992,7 @@ void *DagorEdAppWindow::onWmCreateWindow(int type)
 
       getMainMenu()->setEnabledById(CM_WINDOW_PLUGTOOLS, false);
 
-      mPlugTools = new PropPanel::ContainerPropertyControl(0, this, nullptr, 0, 0, hdpi::Px(0), hdpi::Px(0));
+      mPlugTools = new PropPanel::ToolbarContainerPropertyControl(0, this, nullptr, 0, 0, hdpi::Px(0), hdpi::Px(0));
 
       return mPlugTools;
     }
@@ -622,6 +1005,38 @@ void *DagorEdAppWindow::onWmCreateWindow(int type)
       DagorEdViewportWindow *v = new DagorEdViewportWindow();
       ged.addViewport(nullptr, appEH, mManager, v);
       return v;
+    }
+    break;
+
+    case TAGMANAGER_TYPE:
+    {
+      mTagManager = DAEDITOR3.getVisibleTagManagerWindow();
+
+      getMainMenu()->setCheckById(CM_WINDOW_TAGMANAGER, (mTagManager != nullptr));
+
+      return mTagManager;
+    }
+    break;
+
+    case SHORTCUTS_EDITOR_TYPE:
+    {
+      if (mShortcutsPanel)
+        return nullptr;
+
+      mShortcutsPanel = new KeyboardShortcutsPanel();
+      getMainMenu()->setCheckById(CM_OPTIONS_KEYBOARD_SHORTCUTS, true);
+      return mShortcutsPanel;
+    }
+    break;
+
+    case CAMERA_PRESETS_TYPE:
+    {
+      if (!mCameraPresets || mCameraPresets->isPanelVisible())
+        return nullptr;
+
+      mCameraPresets->showPanel();
+      getMainMenu()->setCheckById(CM_CAMERA_PRESETS, true);
+      return mCameraPresets->getPanel();
     }
     break;
   }
@@ -653,6 +1068,27 @@ bool DagorEdAppWindow::onWmDestroyWindow(void *window)
     return true;
   }
 
+  if (window == mTagManager)
+  {
+    mTagManager = nullptr;
+    getMainMenu()->setCheckById(CM_WINDOW_TAGMANAGER, false);
+    return true;
+  }
+
+  if (mCameraPresets && window == mCameraPresets->getPanel())
+  {
+    mCameraPresets->hidePanel();
+    getMainMenu()->setCheckById(CM_CAMERA_PRESETS, false);
+    return true;
+  }
+
+  if (mShortcutsPanel && window == mShortcutsPanel)
+  {
+    del_it(mShortcutsPanel);
+    getMainMenu()->setCheckById(CM_OPTIONS_KEYBOARD_SHORTCUTS, false);
+    return true;
+  }
+
   for (int i = 0; i < ged.getViewportCount(); ++i)
   {
     ViewportWindow *vport = ged.getViewport(i);
@@ -673,18 +1109,24 @@ void DagorEdAppWindow::fillMainToolBar()
 {
   ged.tbManager->init(GUI_MAIN_TOOLBAR_ID);
 
-  PropPanel::ContainerPropertyControl *tb2 = EDITORCORE->getCustomPanel(GUI_MAIN_TOOLBAR_ID)->createToolbarPanel(0, "");
+  PropPanel::ContainerPropertyControl *tb2 = EDITORCORE->getCustomPanel(GUI_MAIN_TOOLBAR_ID)->createToolbarPanel();
   tb2->createSeparator();
-  tb2->createCheckBox(CM_DISCARD_TEX_MODE, "Discard textures (show stub tex)");
+  editor_command_system.createToolbarToggleButton(*tb2, CM_DISCARD_TEX_MODE, EditorCommandIds::DISCARD_TEX_MODE,
+    "Discard textures (show stub tex)");
   tb2->setButtonPictures(CM_DISCARD_TEX_MODE, "discard_tex");
   tb2->setBool(CM_DISCARD_TEX_MODE, discardTexMode);
   tb2->createSeparator();
-  tb2->createCheckBox(CM_NAV_COMPASS, "Show compass");
+  editor_command_system.createToolbarToggleButton(*tb2, CM_NAV_COMPASS, EditorCommandIds::NAV_COMPASS, "Show compass");
   tb2->setButtonPictures(CM_NAV_COMPASS, "compass");
   tb2->setBool(CM_NAV_COMPASS, static_cast<DagorEdAppEventHandler *>(appEH)->showCompass);
+  editor_command_system.createToolbarButton(*tb2, CM_SHOW_COLLISION, EditorCommandIds::SHOW_COLLISION, "Show collision");
+  editor_command_system.createToolbarToggleButton(*tb2, CM_CAMERA_PRESETS, EditorCommandIds::CAMERA_PRESETS, "Show camera presets");
+  tb2->setButtonPictures(CM_CAMERA_PRESETS, "camera_list");
+
+  tb2->setButtonPictures(CM_SHOW_COLLISION, "collision_preview");
 
   tb2->setAlignRightFromChild(tb2->getChildCount());
-  tb2->createButton(CM_THEME_TOGGLE, "Toggle theme");
+  editor_command_system.createToolbarButton(*tb2, CM_THEME_TOGGLE, EditorCommandIds::THEME_TOGGLE, "Toggle theme");
 }
 
 
@@ -693,71 +1135,89 @@ void DagorEdAppWindow::fillMenu(PropPanel::IMenu *menu)
   menu->clearMenu(ROOT_MENU_ITEM);
 
   menu->addSubMenu(ROOT_MENU_ITEM, CM_FILE, "Project");
-  menu->addItem(CM_FILE, CM_FILE_SAVE, "Save project\tCtrl+S");
-  menu->addItem(CM_FILE, CM_FILE_SAVE_AS, "Save as...");
+  editor_command_system.addMenuItem(*menu, CM_FILE, CM_FILE_SAVE, EditorCommandIds::FILE_SAVE, "Save project");
+  editor_command_system.addMenuItem(*menu, CM_FILE, CM_FILE_SAVE_AS, EditorCommandIds::FILE_SAVE_AS, "Save as...");
   menu->addSeparator(CM_FILE);
 
   // currently creating projects is not supported
   //  menu->addItem(CM_FILE, CM_FILE_NEW, "Create new...");
-  menu->addItem(CM_FILE, CM_FILE_OPEN, "Open project...");
+  editor_command_system.addMenuItem(*menu, CM_FILE, CM_FILE_OPEN, EditorCommandIds::FILE_OPEN, "Open project...");
   menu->addSubMenu(CM_FILE, CM_FILE_RECENT_LAST, "Open recent");
-  menu->addItem(CM_FILE, CM_FILE_REOPEN, "Reopen current project");
+  editor_command_system.addMenuItem(*menu, CM_FILE, CM_FILE_REOPEN, EditorCommandIds::FILE_REOPEN, "Reopen current project");
   menu->addSeparator(CM_FILE);
 
-  menu->addItem(CM_FILE, CM_FILE_EXPORT_TO_GAME_PC, "Export to game (PC format)");
+  editor_command_system.addMenuItem(*menu, CM_FILE, CM_FILE_EXPORT_TO_GAME_PC, EditorCommandIds::FILE_EXPORT_TO_GAME_PC,
+    "Export to game (PC format)");
 
   // Edit
   menu->addSubMenu(ROOT_MENU_ITEM, CM_EDIT, "Edit");
-  menu->addItem(CM_EDIT, CM_UNDO, "Undo\tCtrl+Z");
-  menu->addItem(CM_EDIT, CM_REDO, "Redo\tCtrl+Y");
+  editor_command_system.addMenuItem(*menu, CM_EDIT, CM_UNDO, EditorCommandIds::UNDO, "Undo");
+  editor_command_system.addMenuItem(*menu, CM_EDIT, CM_REDO, EditorCommandIds::REDO, "Redo");
   updateUndoRedoMenu();
 
   menu->addSeparator(CM_EDIT);
 
-  menu->addItem(CM_EDIT, CM_SELECT_ALL, "Select all\tCtrl+A");
-  menu->addItem(CM_EDIT, CM_DESELECT_ALL, "Deselect all\tCtrl+D");
+  editor_command_system.addMenuItem(*menu, CM_EDIT, CM_SELECT_ALL, EditorCommandIds::SELECT_ALL, "Select all");
+  editor_command_system.addMenuItem(*menu, CM_EDIT, CM_DESELECT_ALL, EditorCommandIds::DESELECT_ALL, "Deselect all");
+  editor_command_system.addMenuItem(*menu, CM_EDIT, CM_INVERT_SELECTION, EditorCommandIds::INVERT_SELECTION, "Invert selection");
 
   // View
 
   menu->addSubMenu(ROOT_MENU_ITEM, CM_VIEW, "View");
 
-  menu->addItem(CM_VIEW, CM_VIEWPORT_LAYOUT_4, "4 quarters");
-  menu->addItem(CM_VIEW, CM_VIEWPORT_LAYOUT_1, "1 viewport");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_VIEWPORT_LAYOUT_4, EditorCommandIds::VIEWPORT_LAYOUT_4, "4 quarters");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_VIEWPORT_LAYOUT_1, EditorCommandIds::VIEWPORT_LAYOUT_1, "1 viewport");
 
   menu->addSeparator(CM_VIEW);
 
-  menu->addItem(CM_VIEW, CM_LOAD_DEFAULT_LAYOUT, "Load default layout");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_LOAD_DEFAULT_LAYOUT, EditorCommandIds::LOAD_DEFAULT_LAYOUT,
+    "Load default layout");
   menu->addSeparator(CM_VIEW);
-  menu->addItem(CM_VIEW, CM_LOAD_LAYOUT, "Load layout ...");
-  menu->addItem(CM_VIEW, CM_SAVE_LAYOUT, "Save layout ...");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_LOAD_LAYOUT, EditorCommandIds::LOAD_LAYOUT, "Load layout ...");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_SAVE_LAYOUT, EditorCommandIds::SAVE_LAYOUT, "Save layout ...");
   menu->addSeparator(CM_VIEW);
 
-  menu->addItem(CM_VIEW, CM_OPTIONS_TOTAL, "Plugins visibility...\tF11");
-  menu->addItem(CM_VIEW, CM_OPTIONS_GRID, "Edit grid options...");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_OPTIONS_TOTAL, EditorCommandIds::OPTIONS_TOTAL, "Plugins visibility...");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_OPTIONS_GRID, EditorCommandIds::VIEW_GRID_SETTINGS, "Edit grid options...");
 
   menu->addSeparator(CM_VIEW);
 
   menu->addItem(CM_VIEW, CM_ANIMATE_VIEWPORTS, "Animate viewports");
   // viewMenu.checkMenuItem(CM_ANIMATE_VIEWPORTS, deAppWnd->animateViewports);
 
-  menu->addItem(CM_VIEW, CM_USE_OCCLUDERS, "Use occluders");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_USE_OCCLUDERS, EditorCommandIds::USE_OCCLUDERS, "Use occluders");
   // viewMenu.checkMenuItem(CM_USE_OCCLUDERS, deAppWnd->shouldUseOccluders);
   // menu->setCheckById(CM_USE_OCCLUDERS, shouldUseOccluders);
-  menu->addItem(CM_VIEW, CM_NAV_COMPASS, "Show compass");
-  menu->addItem(CM_VIEW, CM_DISCARD_TEX_MODE, "Discard textures (show stub tex)");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_NAV_COMPASS, EditorCommandIds::NAV_COMPASS, "Show compass");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_SHOW_COLLISION, EditorCommandIds::SHOW_COLLISION, "Show collision");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_CAMERA_PRESETS, EditorCommandIds::CAMERA_PRESETS, "Show camera presets");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_DISCARD_TEX_MODE, EditorCommandIds::DISCARD_TEX_MODE,
+    "Discard textures (show stub tex)");
 
   menu->addSeparator(CM_VIEW);
   menu->addItem(CM_VIEW, CM_WINDOW_TOOLBAR, "Main toolbar");
   menu->addItem(CM_VIEW, CM_WINDOW_TABBAR, "Plugin tabs");
   menu->addItem(CM_VIEW, CM_WINDOW_PLUGTOOLS, "Plugin toolbar");
   menu->addItem(CM_VIEW, CM_WINDOW_VIEWPORT, "Viewport");
+  editor_command_system.addMenuItem(*menu, CM_VIEW, CM_WINDOW_TAGMANAGER, EditorCommandIds::TOGGLE_TAG_MANAGER, "Tags");
   menu->addSeparator(CM_VIEW);
   menu->addSubMenu(CM_VIEW, CM_VIEW_DEVELOPER_TOOLS, "Developer tools");
-  menu->addItem(CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES, "Console commands and variables");
-  menu->addItem(CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_CONTROL_GALLERY, "Control gallery");
-  menu->addItem(CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_IMGUI_DEBUGGER, "ImGui debugger");
-  menu->addItem(CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_TEXTURE_DEBUG, "Texture debug");
-  menu->addItem(CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_NODE_DEPS, "Node dependencies");
+  editor_command_system.addMenuItem(*menu, CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES,
+    EditorCommandIds::VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES, "Console commands and variables");
+  editor_command_system.addMenuItem(*menu, CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_CONTROL_GALLERY,
+    EditorCommandIds::VIEW_DEVELOPER_TOOLS_CONTROL_GALLERY, "Control gallery");
+  editor_command_system.addMenuItem(*menu, CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_IMGUI_DEBUGGER,
+    EditorCommandIds::VIEW_DEVELOPER_TOOLS_IMGUI_DEBUGGER, "ImGui debugger");
+  editor_command_system.addMenuItem(*menu, CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_TEST_RUNTIME,
+    EditorCommandIds::VIEW_DEVELOPER_TOOLS_TEST_RUNTIME, "Test runtime");
+  editor_command_system.addMenuItem(*menu, CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_TOAST_MANAGER,
+    EditorCommandIds::VIEW_DEVELOPER_TOOLS_TOAST_MANAGER, "Toast manager");
+  editor_command_system.addMenuItem(*menu, CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_TEXTURE_DEBUG,
+    EditorCommandIds::VIEW_DEVELOPER_TOOLS_TEXTURE_DEBUG, "Texture debug");
+  editor_command_system.addMenuItem(*menu, CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_NODE_DEPS,
+    EditorCommandIds::VIEW_DEVELOPER_TOOLS_NODE_DEPS, "Node dependencies");
+  editor_command_system.addMenuItem(*menu, CM_VIEW_DEVELOPER_TOOLS, CM_VIEW_DEVELOPER_TOOLS_CLIPMAP_DEBUG,
+    EditorCommandIds::VIEW_DEVELOPER_TOOLS_CLIPMAP_DEBUG, "Clipmap debug");
 
   menu->setEnabledById(CM_WINDOW_TOOLBAR, false);
   menu->setEnabledById(CM_WINDOW_TABBAR, false);
@@ -779,30 +1239,37 @@ void DagorEdAppWindow::fillMenu(PropPanel::IMenu *menu)
   // Tools
   menu->addSubMenu(ROOT_MENU_ITEM, CM_TOOLS, "Tools");
 
-  menu->addItem(CM_TOOLS, CM_BATCH_RUN, "Run batch file...");
+  editor_command_system.addMenuItem(*menu, CM_TOOLS, CM_BATCH_RUN, EditorCommandIds::BATCH_RUN, "Run batch file...");
 
   menu->addSeparator(CM_TOOLS);
-  menu->addItem(CM_TOOLS, CM_FILE_EXPORT_TO_DAG, "Export scene geometry to DAG...");
-  menu->addItem(CM_TOOLS, CM_FILE_EXPORT_COLLISION_TO_DAG, "Export scene collision geometry to DAG...");
+  editor_command_system.addMenuItem(*menu, CM_TOOLS, CM_FILE_EXPORT_TO_DAG, EditorCommandIds::FILE_EXPORT_TO_DAG,
+    "Export scene geometry to DAG...");
+  editor_command_system.addMenuItem(*menu, CM_TOOLS, CM_FILE_EXPORT_COLLISION_TO_DAG, EditorCommandIds::FILE_EXPORT_COLLISION_TO_DAG,
+    "Export scene collision geometry to DAG...");
   menu->addSeparator(CM_TOOLS);
 
-  menu->addItem(CM_TOOLS, CM_CREATE_SCREENSHOT, "Create screenshot\tCtrl+P");
-  menu->addItem(CM_TOOLS, CM_CREATE_CUBE_SCREENSHOT, "Create cube screenshot\tCtrl+Shift+P");
-  menu->addItem(CM_TOOLS, CM_CREATE_ORTHOGONAL_SCREENSHOT, "Create orthogonal screenshot");
-  menu->addItem(CM_TOOLS, CM_UPSCALE_HEIGHTMAP, "[SLOW] Upscale heightmap & rebake");
+  editor_command_system.addMenuItem(*menu, CM_TOOLS, CM_CREATE_SCREENSHOT, EditorCommandIds::CREATE_SCREENSHOT, "Create screenshot");
+  editor_command_system.addMenuItem(*menu, CM_TOOLS, CM_CREATE_CUBE_SCREENSHOT, EditorCommandIds::CREATE_CUBE_SCREENSHOT,
+    "Create cube screenshot");
+  editor_command_system.addMenuItem(*menu, CM_TOOLS, CM_CREATE_ORTHOGONAL_SCREENSHOT, EditorCommandIds::CREATE_ORTHOGONAL_SCREENSHOT,
+    "Create orthogonal screenshot");
+  editor_command_system.addMenuItem(*menu, CM_TOOLS, CM_UPSCALE_HEIGHTMAP, EditorCommandIds::UPSCALE_HEIGHTMAP,
+    "[SLOW] Upscale heightmap & rebake");
 
   // Settings
   menu->addSubMenu(ROOT_MENU_ITEM, CM_OPTIONS, "Settings");
 
-  menu->addItem(CM_OPTIONS, CM_OPTIONS_CAMERAS, "Cameras...");
-  menu->addItem(CM_OPTIONS, CM_OPTIONS_SCREENSHOT, "Screenshot...");
-  menu->addItem(CM_OPTIONS, CM_OPTIONS_STAT_DISPLAY_SETTINGS, "Stats settings...");
+  editor_command_system.addMenuItem(*menu, CM_OPTIONS, CM_OPTIONS_CAMERAS, EditorCommandIds::OPTIONS_CAMERAS, "Cameras...");
+  editor_command_system.addMenuItem(*menu, CM_OPTIONS, CM_OPTIONS_SCREENSHOT, EditorCommandIds::OPTIONS_SCREENSHOT, "Screenshot...");
+  editor_command_system.addMenuItem(*menu, CM_OPTIONS, CM_OPTIONS_STAT_DISPLAY_SETTINGS,
+    EditorCommandIds::OPTIONS_STAT_DISPLAY_SETTINGS, "Stats settings...");
 
   menu->addSeparator(CM_OPTIONS);
-  menu->addItem(CM_OPTIONS, CM_ENVIRONMENT_SETTINGS, "Environment settings...");
+  editor_command_system.addMenuItem(*menu, CM_OPTIONS, CM_ENVIRONMENT_SETTINGS, EditorCommandIds::ENVIRONMENT_SETTINGS,
+    "Environment settings...");
 
   menu->addSeparator(CM_OPTIONS);
-  menu->addItem(CM_OPTIONS, CM_FILE_SETTINGS, "Project settings...");
+  editor_command_system.addMenuItem(*menu, CM_OPTIONS, CM_FILE_SETTINGS, EditorCommandIds::FILE_SETTINGS, "Project settings...");
 
   menu->addSeparator(CM_OPTIONS);
   menu->addItem(CM_OPTIONS, CM_OPTIONS_ENABLE_DEVELOPER_TOOLS, "Enable developer tools");
@@ -812,6 +1279,10 @@ void DagorEdAppWindow::fillMenu(PropPanel::IMenu *menu)
   menu->addItem(CM_OPTIONS_PREFERENCES, CM_OPTIONS_PREFERENCES_ASSET_TREE, "Asset Tree");
   menu->setEnabledById(CM_OPTIONS_PREFERENCES_ASSET_TREE, false);
   menu->addItem(CM_OPTIONS_PREFERENCES, CM_OPTIONS_PREFERENCES_ASSET_TREE_COPY_SUBMENU, "Move \"Copy\" to submenu");
+  editor_command_system.addMenuItem(*menu, CM_OPTIONS, CM_OPTIONS_EDIT_PREFERENCES, EditorCommandIds::OPTIONS_EDIT_PREFERENCES,
+    "Toolbar preferences..."); // The name is temporary, this will be the general preferences window.
+  editor_command_system.addMenuItem(*menu, CM_OPTIONS, CM_OPTIONS_KEYBOARD_SHORTCUTS, EditorCommandIds::OPTIONS_KEYBOARD_SHORTCUTS,
+    "Keyboard Shortcuts...");
 
   // Help
   menu->addSubMenu(ROOT_MENU_ITEM, CM_HELP, "Help");
@@ -829,7 +1300,7 @@ void DagorEdAppWindow::fillMenu(PropPanel::IMenu *menu)
 }
 
 
-void DagorEdAppWindow::updateMenu(PropPanel::IMenu *menu) {}
+void DagorEdAppWindow::updateMenu(PropPanel::IMenu *) {}
 
 
 void DagorEdAppWindow::updateExportMenuItems()
@@ -882,12 +1353,10 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
   if (wsp)
   {
     const Tab<String> &recents = wsp->getRecents();
-    const int menuResentCnt = CM_FILE_RECENT_LAST - CM_FILE_RECENT_BASE;
-    const int minRecentRemainder = (recents.size() <= menuResentCnt) ? 0 : recents.size() - menuResentCnt;
 
     if (id >= CM_FILE_RECENT_BASE && id < CM_FILE_RECENT_LAST && id - CM_FILE_RECENT_BASE < recents.size())
     {
-      String fileName = ::make_full_path(DAGORED2->getSdkDir(), recents[id - CM_FILE_RECENT_BASE + minRecentRemainder]);
+      String fileName = ::make_full_path(DAGORED2->getSdkDir(), recents[id - CM_FILE_RECENT_BASE]);
 
       simplify_fname(fileName);
 
@@ -980,11 +1449,7 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
     {
       mManager->show(WSI_MAXIMIZED);
 
-      ImGuiContext *context = ImGui::GetCurrentContext();
-      for (ImGuiWindow *window : context->Windows)
-        ImGui::ClearWindowSettings(window->Name);
-
-      makeDefaultLayout();
+      makeDefaultLayout(/*for_initial_layout = */ false);
       getMainMenu()->click(CM_VIEWPORT_LAYOUT_1);
 
       const int oldPluginId = curPluginId;
@@ -997,7 +1462,13 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
     {
       String result = wingw::file_open_dlg(mManager->getMainWindow(), "Load layout from...", "Layout|*.blk", "blk");
       if (!result.empty())
-        mManager->loadLayout(result.str());
+      {
+        DataBlock blk;
+        if (blk.load(result))
+          loadLayout(blk);
+        else
+          logerr("Loading the window layout from \"%s\" has failed.", result.c_str());
+      }
     }
       return 1;
 
@@ -1005,7 +1476,7 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
     {
       String result = wingw::file_save_dlg(mManager->getMainWindow(), "Save layout as...", "Layout|*.blk", "blk");
       if (!result.empty())
-        mManager->saveLayout(result.str());
+        saveLayout(result.str());
     }
       return 1;
 
@@ -1077,6 +1548,13 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
       }
       return 0;
 
+    case CM_WINDOW_TAGMANAGER:
+    {
+      const bool show = (DAEDITOR3.getVisibleTagManagerWindow() == nullptr);
+      DAEDITOR3.showTagManagerWindow(show);
+    }
+      return 0;
+
     case CM_THEME_LIGHT:
     case CM_THEME_DARK:
     {
@@ -1109,6 +1587,9 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
     case CM_FILE_EXPORT_COLLISION_TO_DAG: exportLevelToDag(false); return 1;
 
     case CM_UNDO:
+      // Bring the user to the plugin that owns the op before applying it (no-op for same-plugin
+      // or owner-less ops), so the change is visible instead of mutating an off-screen plugin.
+      switchToUndoOpOwner(undoSystem->get_undo_owner());
       undoSystem->undo();
       updateUndoRedoMenu();
       IEditorCoreEngine::get()->updateViewports();
@@ -1116,6 +1597,7 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
       return 1;
 
     case CM_REDO:
+      switchToUndoOpOwner(undoSystem->get_redo_owner());
       undoSystem->redo();
       updateUndoRedoMenu();
       IEditorCoreEngine::get()->updateViewports();
@@ -1159,14 +1641,11 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
       return 1;
     }
 
-    case CM_ENVIRONMENT_SETTINGS:
-      environment::show_environment_settings(0);
-      // break;
-      return 1;
+    case CM_ENVIRONMENT_SETTINGS: getModelessWindowControllers().toggleShowById(WindowIds::MAIN_SETTINGS_ENVIRONMENT); return 1;
 
-    case CM_OPTIONS_CAMERAS: show_camera_objects_config_dialog(0); return 1;
+    case CM_OPTIONS_CAMERAS: getModelessWindowControllers().toggleShowById(WindowIds::MAIN_SETTINGS_CAMERA); return 1;
 
-    case CM_OPTIONS_SCREENSHOT: setScreenshotOptions(ScreenshotDlgMode::DA_EDITOR); return 1;
+    case CM_OPTIONS_SCREENSHOT: getModelessWindowControllers().toggleShowById(WindowIds::MAIN_SETTINGS_SCREENSHOT); return 1;
 
     case CM_OPTIONS_STAT_DISPLAY_SETTINGS:
     {
@@ -1197,6 +1676,12 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
       return 1;
     }
 
+    case CM_OPTIONS_EDIT_PREFERENCES:
+      getModelessWindowControllers().toggleShowById(WindowIds::MAIN_SETTINGS_EDIT_PREFERENCES);
+      return 1;
+
+    case CM_OPTIONS_KEYBOARD_SHORTCUTS: showShortcutsEditor(mShortcutsPanel == nullptr); return 1;
+
     case CM_FILE_OPEN_AND_LOCK: handleOpenProject(true); return 1;
 
     case CM_FILE_REOPEN:
@@ -1222,6 +1707,11 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
     case CM_DESELECT_ALL:
       if (curPlugin())
         curPlugin()->deselectAll();
+      return 1;
+
+    case CM_INVERT_SELECTION:
+      if (curPlugin())
+        curPlugin()->invertSelection();
       return 1;
 
     case CM_OPTIONS_GRID:
@@ -1250,6 +1740,13 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
       IEditorCoreEngine::get()->invalidateViewportCache();
       return 1;
     }
+    case CM_CAMERA_PRESETS:
+    {
+      showCameraPresets(!mCameraPresets || !mCameraPresets->isPanelVisible());
+      return 1;
+    }
+
+    case CM_SHOW_COLLISION: imgui_window_set_visible("", "Collision", !imgui_window_is_visible("", "Collision")); return 1;
 
     case CM_DISCARD_TEX_MODE:
       discardTexMode = !discardTexMode;
@@ -1257,9 +1754,9 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
       mToolPanel->setBool(id, discardTexMode);
       ec_set_busy(true);
       texconvcache::build_on_demand_tex_factory_limit_tql(discardTexMode ? TQL_thumb : TQL_uhq);
-      spawnEvent(HUID_InvalidateClipmap, (void *)true);
+      spawnEvent(HUID_InvalidateClipmap, (void *)(uintptr_t)INVALIDATE_CLIPMAP_FORCE_REDRAW);
       ec_set_busy(false);
-      break;
+      return 1;
 
     case CM_VIEW_DEVELOPER_TOOLS_CONSOLE_COMMANDS_AND_VARIABLES:
       consoleCommandsAndVariableWindowsVisible = !consoleCommandsAndVariableWindowsVisible;
@@ -1282,15 +1779,25 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
       getMainMenu()->setCheckById(id, imguiDebugWindowsVisible);
       return 1;
 
+    case CM_VIEW_DEVELOPER_TOOLS_TEST_RUNTIME:
+      testRuntimeWindowVisible = !editor_core_test_runtime_window_is_visible();
+      editor_core_test_runtime_set_window(testRuntimeWindowVisible);
+      getMainMenu()->setCheckById(id, testRuntimeWindowVisible);
+      return 1;
+
+    case CM_VIEW_DEVELOPER_TOOLS_TOAST_MANAGER: PropPanel::show_toast_debug_panel(); return 1;
+
     case CM_VIEW_DEVELOPER_TOOLS_TEXTURE_DEBUG: texdebug::select_texture("none"); return 1;
 
     case CM_VIEW_DEVELOPER_TOOLS_NODE_DEPS: dafg::show_dependencies_window(); return 1;
+
+    case CM_VIEW_DEVELOPER_TOOLS_CLIPMAP_DEBUG: show_clipmap_debug_window(); return 1;
 
     case CM_THEME_TOGGLE:
       themeName = (themeName != defaultThemeName) ? defaultThemeName : "dark";
       updateThemeItems();
       editor_core_load_imgui_theme(getThemeFileName());
-      break;
+      return 1;
 
     case CM_USE_OCCLUDERS:
       shouldUseOccluders = !shouldUseOccluders;
@@ -1300,7 +1807,7 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
 
     case CM_BATCH_RUN:
     {
-      DeBatch batch;
+      ConBatch batch;
       batch.openAndRunBatch();
       return 1;
     }
@@ -1339,13 +1846,17 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
     case CM_VIEW_GRID_ANGLE_SNAP:
     case CM_VIEW_GRID_SCALE_SNAP:
       if (IGenViewportWnd *vpw = getCurrentViewport())
-        if (vpw->isActive())
-          switch (id)
-          {
-            case CM_VIEW_GRID_MOVE_SNAP: ged.tbManager->setMoveSnap(); break;
-            case CM_VIEW_GRID_ANGLE_SNAP: ged.tbManager->setRotateSnap(); break;
-            case CM_VIEW_GRID_SCALE_SNAP: ged.tbManager->setScaleSnap(); break;
-          }
+      {
+        switch (id)
+        {
+          case CM_VIEW_GRID_MOVE_SNAP: grid.setMoveSnap(!grid.getMoveSnap()); break;
+          case CM_VIEW_GRID_ANGLE_SNAP: grid.setRotateSnap(!grid.getRotateSnap()); break;
+          case CM_VIEW_GRID_SCALE_SNAP: grid.setScaleSnap(!grid.getScaleSnap()); break;
+        }
+
+        onSnapSettingChanged();
+        return 1;
+      }
       break;
 
     case CM_CAMERAS_FREE:
@@ -1354,9 +1865,6 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
     case CM_CAMERAS_CAR:
     {
       IGenViewportWnd *vpw = getCurrentViewport();
-
-      if ((!vpw) || (!vpw->isActive()))
-        return 0;
 
       if (vpw)
       {
@@ -1368,10 +1876,7 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
         mToolPanel->setBool(CM_CAMERAS_TPS, CCameraElem::getCamera() == CCameraElem::TPS_CAMERA);
         mToolPanel->setBool(CM_CAMERAS_CAR, CCameraElem::getCamera() == CCameraElem::CAR_CAMERA);
 
-        if (CCameraElem::getCamera() == CCameraElem::MAX_CAMERA)
-          addEditorAccelerators();
-        else
-          addCameraAccelerators();
+        addEditorAccelerators();
 
         if (id == CM_CAMERAS_FREE)
         {
@@ -1381,6 +1886,8 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
             getEnabledColliders(backupPluginColliders);
         }
       }
+      else
+        return 0;
 
       if (id == CM_CAMERAS_FPS || id == CM_CAMERAS_TPS || id == CM_CAMERAS_CAR)
       {
@@ -1433,6 +1940,40 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
       else
         console->showConsole(true);
       return 1;
+
+    case CM_NAVIGATE:
+    {
+      const SimpleString zoomKey(editor_command_system.getCommandKeyChordsAsText(EditorCommandIds::ZOOM_AND_CENTER));
+      const SimpleString zoomKeyFly(editor_command_system.getCommandKeyChordsAsText(EditorCommandIds::ZOOM_AND_CENTER_IN_FLY_MODE));
+      const SimpleString freeCamera(editor_command_system.getCommandKeyChordsAsText(EditorCommandIds::CAMERAS_FREE));
+      const SimpleString fpsCamera(editor_command_system.getCommandKeyChordsAsText(EditorCommandIds::CAMERAS_FPS));
+
+      wingw::message_box(0, "Navigation info",
+        "Rotate:\t\t Alt + MiddleMouseButton\n"
+        "Pan:\t\t MiddleMouseButton\n"
+        "Zoom:\t\t MouseWhell\n"
+        "Zoom extents:\t %s\n"
+        "Zoom extents in fly mode: %s\n"
+        "Free camera:\t %s\n"
+        "FPS camera:\t %s\n"
+        "Accelerate:\t Ctrl",
+        zoomKey.c_str(), zoomKeyFly.c_str(), freeCamera.c_str(), fpsCamera.c_str());
+
+      return 1;
+    }
+
+    case CM_STATS: showStats(); return 1;
+
+    case CM_CHANGE_FOV: onChangeFov(); return 1;
+
+    case CM_OBJED_OBJPROP_PANEL:
+    case CM_OBJED_SELECT_BY_NAME:
+      if (IGenEditorPlugin *plug = curPlugin())
+      {
+        plug->handleViewportAcceleratorCommand(id);
+        return 1;
+      }
+      break;
   }
 
   // change plugin
@@ -1443,13 +1984,8 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
   // plugin's menu processing
 
   if (id >= CM_PLUGIN_BASE && id <= CM_PLUGIN__LAST && curPluginId != -1 && plugin[curPluginId].p)
-  {
-    if ((CCameraElem::getCamera() != CCameraElem::MAX_CAMERA) && (id == CM_TAB_PRESS || id == CM_TAB_RELEASE))
-      return 0;
-
     if (plugin[curPluginId].p->onPluginMenuClick(id))
       return 1;
-  }
 
   // plugin's settings processing
 
@@ -1466,7 +2002,7 @@ int DagorEdAppWindow::onMenuItemClick(unsigned id)
 }
 
 
-void DagorEdAppWindow::onClick(int pcb_id, PropPanel::ContainerPropertyControl *panel)
+void DagorEdAppWindow::onClick(int pcb_id, PropPanel::ContainerPropertyControl *)
 {
   switch (pcb_id)
   {
@@ -1476,33 +2012,7 @@ void DagorEdAppWindow::onClick(int pcb_id, PropPanel::ContainerPropertyControl *
     case CM_CAMERAS_CAR: ged.activateCurrentViewport(); break;
   }
 
-
-  if (onMenuItemClick(pcb_id))
-    return;
-
-  switch (pcb_id)
-  {
-    case CM_VIEW_GRID_MOVE_SNAP: ged.tbManager->setMoveSnap(); break;
-
-    case CM_VIEW_GRID_ANGLE_SNAP: ged.tbManager->setRotateSnap(); break;
-
-    case CM_VIEW_GRID_SCALE_SNAP: ged.tbManager->setScaleSnap(); break;
-
-    case CM_NAVIGATE:
-      wingw::message_box(0, "Navigation info",
-        "Rotate:\t\t Alt + MiddleMouseButton\n"
-        "Pan:\t\t MiddleMouseButton\n"
-        "Zoom:\t\t MouseWhell\n"
-        "Zoom extents:\t Z\n"
-        "Free camera:\t Space\n"
-        "FPS camera:\t Ctrl+Space\n"
-        "Accelerate:\t Ctrl");
-      break;
-
-    case CM_STATS: showStats(); break;
-
-    case CM_CHANGE_FOV: onChangeFov(); break;
-  }
+  onMenuItemClick(pcb_id);
 }
 
 
@@ -1546,15 +2056,15 @@ void DagorEdAppWindow::initDllPlugins(const char *plug_dir)
   String libPath;
 
 #if DAGOR_DBGLEVEL > 1
-  String mask = ::make_full_path(plug_dir, "*-dbg.dll");
+  String mask = ::make_full_path(plug_dir, "*-dbg" DAGOR_OS_DLL_SUFFIX);
 #elif DAGOR_DBGLEVEL > 0
-  String mask = ::make_full_path(plug_dir, "*-dev.dll");
+  String mask = ::make_full_path(plug_dir, "*-dev" DAGOR_OS_DLL_SUFFIX);
 #else
   String mask("");
 #endif
   String errorMess;
 
-  DataBlock appblk(String(260, "%s/application.blk", wsp->getAppDir()));
+  DataBlock appblk(wsp->getAppBlkPath());
   const DataBlock &sdk_blk = *appblk.getBlockByNameEx("SDK");
   Tab<RegExp *> reExcludeDll(tmpmem);
   Tab<RegExp *> reIncludeDll(tmpmem);
@@ -1621,67 +2131,64 @@ void DagorEdAppWindow::initDllPlugins(const char *plug_dir)
     console->addMessage(ILogWriter::REMARK, "Loading DLL \"%s\"...", ff.name);
 
     void *dllHandle = os_dll_load_deep_bind(libPath);
-
-    if (dllHandle)
+    if (!dllHandle)
     {
-      ::symhlp_load(libPath);
-      GetPluginVersionFunc getVersionFunc = (GetPluginVersionFunc)os_dll_get_symbol(dllHandle, "get_plugin_version");
+      console->addMessage(ILogWriter::NOTE, "DLL \"%s\" not loaded", ff.name);
+      continue;
+    }
 
-      if (getVersionFunc)
+    ::symhlp_load(libPath);
+    GetPluginVersionFunc getVersionFunc = (GetPluginVersionFunc)os_dll_get_symbol(dllHandle, "get_plugin_version");
+
+    if (getVersionFunc)
+    {
+      if ((*getVersionFunc)() != IGenEditorPlugin::CURRENT_VERSION)
       {
-        if ((*getVersionFunc)() != IGenEditorPlugin::CURRENT_VERSION)
-        {
-          ::symhlp_unload(libPath);
-          os_dll_close(dllHandle);
-          console->addMessage(ILogWriter::WARNING, "Plugin version mismatch. It can make Editor unstable.");
-          continue;
-        }
+        ::symhlp_unload(libPath);
+        os_dll_close(dllHandle);
+        console->addMessage(ILogWriter::WARNING, "Plugin version mismatch. It can make Editor unstable.");
+        continue;
+      }
 
-        RegisterPluginFunc regFunc = (RegisterPluginFunc)os_dll_get_symbol(dllHandle, "register_plugin");
+      RegisterPluginFunc regFunc = (RegisterPluginFunc)os_dll_get_symbol(dllHandle, "register_plugin");
 
-        if (regFunc)
+      if (regFunc)
+      {
+        DAGOR_TRY
         {
-          DAGOR_TRY
+          IGenEditorPlugin *plug = (*regFunc)(*IDagorEd2Engine::get(), libPath);
+
+          if (plug)
           {
-            IGenEditorPlugin *plug = (*regFunc)(*IDagorEd2Engine::get(), libPath);
-
-            if (plug)
-            {
-              if (registerDllPlugin(plug, dllHandle, libPath))
-                console->addMessage(ILogWriter::REMARK, "Plugin \"%s\" (%s) succesfully registered", ff.name,
-                  plug->getMenuCommandName());
-              else
-              {
-                ReleasePluginFunc releaseFunc = (ReleasePluginFunc)os_dll_get_symbol(dllHandle, "release_plugin");
-                if (releaseFunc)
-                  (*releaseFunc)();
-
-                errorMess = String(256, "Plugin from DLL \"%s\" not registered", ff.name);
-                errorType = ILogWriter::NOTE;
-              }
-            }
+            if (registerDllPlugin(plug, dllHandle, libPath))
+              console->addMessage(ILogWriter::REMARK, "Plugin \"%s\" (%s) succesfully registered", ff.name,
+                plug->getMenuCommandName());
             else
-              errorMess = String(256, "Couldn't register plugin from DLL \"%s\"", ff.name);
+            {
+              ReleasePluginFunc releaseFunc = (ReleasePluginFunc)os_dll_get_symbol(dllHandle, "release_plugin");
+              if (releaseFunc)
+                (*releaseFunc)();
+
+              errorMess = String(256, "Plugin from DLL \"%s\" not registered", ff.name);
+              errorType = ILogWriter::NOTE;
+            }
           }
-          DAGOR_CATCH(...) { errorMess = String(256, "Exception - couldn't register plugin from DLL \"%s\"", ff.name); }
+          else
+            errorMess = String(256, "Couldn't register plugin from DLL \"%s\"", ff.name);
         }
-        else
-          errorMess = String(256,
-            "Couldn't locate \"register_plugin()\" function in DLL "
-            "\"%s\"",
-            ff.name);
+        DAGOR_CATCH(...) { errorMess = String(256, "Exception - couldn't register plugin from DLL \"%s\"", ff.name); }
       }
       else
         errorMess = String(256,
-          "Couldn't locate \"get_plugin_version()\" function in DLL "
+          "Couldn't locate \"register_plugin()\" function in DLL "
           "\"%s\"",
           ff.name);
     }
     else
-    {
-      errorType = ILogWriter::NOTE;
-      errorMess = String(256, "DLL \"%s\" not loaded", ff.name);
-    }
+      errorMess = String(256,
+        "Couldn't locate \"get_plugin_version()\" function in DLL "
+        "\"%s\"",
+        ff.name);
 
     if (errorMess.length())
     {
@@ -1697,8 +2204,15 @@ void DagorEdAppWindow::initDllPlugins(const char *plug_dir)
 
 
 //==============================================================================
-void DagorEdAppWindow::startWithWorkspace(const char *wspName)
+void DagorEdAppWindow::startWithWorkspace(const char *wspName, const char *app_blk_path, const char *refused_arguments)
 {
+  // We report the refused command line arguments here, where the splash screen is no longer shown.
+  if (refused_arguments && *refused_arguments)
+  {
+    logerr("Command line error.%s", refused_arguments);
+    wingw::message_box(wingw::MBS_EXCL | wingw::MBS_OK, "Command line error", "Ignored command line arguments:%s", refused_arguments);
+  }
+
   String settingsPath = ::make_full_path(sgg::get_exe_path_full(), "../.local/de3_settings.blk");
   DataBlock settingsBlk(settingsPath);
 
@@ -1707,22 +2221,89 @@ void DagorEdAppWindow::startWithWorkspace(const char *wspName)
   developerToolsEnabled = settingsBlk.getBool("DeveloperToolsEnabled", developerToolsEnabled);
   GizmoSettings::load(settingsBlk);
 
-  if (!wspName)
+  String errorMessage;
+  String wspNameForBlkPath;
+
+  if (wspName && app_blk_path)
+  {
+    errorMessage.printf(0,
+      "Both a path to application.blk and a workspace name have been specified on the command line:\n"
+      "\"%s\"\nand \"-ws:%s\"\n\n"
+      "Specify only one of them.",
+      app_blk_path, wspName);
+  }
+  else if (app_blk_path)
+  {
+    if (getWorkspace()->initWorkspaceBlk(WSP_FILE_PATH))
+    {
+      wspNameForBlkPath = resolve_workspace_for_app_blk_path(*getWorkspace(), app_blk_path, errorMessage);
+      if (!wspNameForBlkPath.empty())
+        wspName = wspNameForBlkPath;
+    }
+    else
+    {
+      errorMessage.printf(0, "Cannot open the workspace file\n\"%s\"", WSP_FILE_PATH);
+    }
+  }
+
+  if (!errorMessage.empty())
+  {
+    wspName = nullptr;
+    app_blk_path = nullptr;
+
+    // Drop the level specified on the command line, so the shutdown does not mistake the run for a started editor and
+    // overwrite de3_settings.blk, losing the stored workspace and the plugin settings.
+    sceneFname[0] = 0;
+    shouldLoadFile = false;
+
+    logerr("%s", errorMessage);
+    wingw::message_box(wingw::MBS_EXCL | wingw::MBS_OK, "Workspace error", "%s", errorMessage);
+
+    // The workspace selector would block the unattended run.
+    if (dgs_execute_quiet)
+      quit_game(-2);
+  }
+
+  // An application.blk argument has resolved into wspName by now, or been refused and cleared it, so wspName covers both.
+  const bool wspGivenExplicitly = wspName != nullptr;
+  if (!wspGivenExplicitly)
     wspName = settingsBlk.getBlockByNameEx("workspace")->getStr("currentName", NULL);
 
   // Asset Viewer and daEditorX work differently, if daEditorX does not find the specified workspace then
   // EditorStartDialog's ctor calls EditorStartDialog::onAddWorkspace() which shows a dialog, so the startup scene is
   // always needed.
-  startup_editor_core_select_startup_scene();
+  G_ASSERT(dagor_get_current_game_scene());
 
   for (bool handled = false; !handled;)
   {
     StartupDlg dlg("DaEditorX start", *getWorkspace(), WSP_FILE_PATH, wspName, shouldLoadFile);
 
     int result = PropPanel::DIALOG_ID_OK;
-    int sel = ID_RECENT_FIRST;
-    if (!shouldLoadFile || dlg.getWorkspaceIndex(wspName) < 0 || !dd_file_exist(DAGORED2->getWorkspace().getAppPath()))
+    // Nothing else sets sel when the dialog below is skipped, so it must already hold the level from command line.
+    int sel = ID_OPEN_FROM_COMMAND_LINE;
+    if (!wspGivenExplicitly || !shouldLoadFile || dlg.getWorkspaceIndex(wspName) < 0 || !dlg.isSelectedWorkspaceValid())
     {
+      if (dgs_execute_quiet)
+      {
+        // Name every unmet condition and the input behind it, this log is all an unattended run leaves.
+        String reasons;
+        if (!wspGivenExplicitly)
+          reasons.aprintf(0, "\n- No usable workspace is given on the command line. Use \"-ws:<name>\" or a path to application.blk.");
+        else if (dlg.getWorkspaceIndex(wspName) < 0)
+          reasons.aprintf(0, "\n- There is no workspace named \"%s\" in \"%s\".", wspName, WSP_FILE_PATH);
+        else if (!dd_file_exist(DAGORED2->getWorkspace().getAppBlkPath()))
+          reasons.aprintf(0, "\n- The workspace \"%s\" uses \"%s\", which does not exist.", wspName,
+            DAGORED2->getWorkspace().getAppBlkPath());
+        else if (!dlg.isSelectedWorkspaceValid())
+          reasons.aprintf(0, "\n- The workspace \"%s\" did not load. Check \"%s\".", wspName,
+            DAGORED2->getWorkspace().getAppBlkPath());
+        if (!shouldLoadFile)
+          reasons.aprintf(0, "\n- No existing level is given. Use a path to a *.level.blk file.");
+
+        logerr("Cannot show the workspace selector in quiet mode.%s", reasons);
+        quit_game(-1);
+      }
+
       startupDlgShown = &dlg;
       result = dlg.showDialog();
       sel = dlg.getSelected();
@@ -1739,35 +2320,49 @@ void DagorEdAppWindow::startWithWorkspace(const char *wspName)
 
     dagor_idle_cycle();
 
-    handled = true;
-
     if (result == PropPanel::DIALOG_ID_CANCEL || sel == -1)
     {
       mManager->close();
       return;
     }
 
-    const char *wspName = wsp->getName();
-    if (!wspName || !*wspName)
+    if (sel == ID_OPEN_PROJECT)
+    {
+      const String path = wingw::file_open_dlg(mManager->getMainWindow(), "Open location to edit...",
+        "Level BLK|*" LEVEL_FILE_EXTENSION, LEVEL_FILE_EXTENSION_WO_DOT, wsp->getLevelsDir());
+      if (path.empty())
+        continue;
+
+      addToRecentList(path);
+      sel = ID_RECENT_FIRST;
+    }
+
+    handled = true;
+
+    const char *name = wsp->getName();
+    if (!name || !*name)
       continue;
 
     ec_set_busy(true);
     resetCore();
     DataBlock app_blk;
-    if (!app_blk.load(DAGORED2->getWorkspace().getAppPath()))
+    DAEDITOR3.conNote("using %%appDir=%s", dd_get_named_mount_path("appDir"));
+    if (!app_blk.load(DAGORED2->getWorkspace().getAppBlkPath()))
     {
-      DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppPath());
+      DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppBlkPath());
       handled = false;
       continue;
     }
+    setup_named_mount_points(*app_blk.getBlockByNameEx("mountPoints"), getSdkDir());
 
-    init3d();
+    init3d(getPerApplicationWindowLayoutBlkPath());
 
-    const String imguiIniPath(::make_full_path(sgg::get_exe_path_full(), "../.local/de3_imgui.ini"));
-    int loadedDockSettingsVersion = 0;
-    editor_core_initialize_imgui(imguiIniPath, &loadedDockSettingsVersion);
-    dockPositionsInitialized = loadedDockSettingsVersion == LATEST_DOCK_SETTINGS_VERSION;
+    da_profiler::set_profiling_settings(*dgs_get_settings()->getBlockByNameEx("debug"));
+    da_profiler::tick_frame(); // Apply settings instantly to allow profiling loading times.
 
+    TIME_PROFILE(DagorEdAppWindow::startWithWorkspace);
+
+    editor_core_initialize_imgui();
     editor_core_load_imgui_theme(getThemeFileName());
     setDocTitle();
 
@@ -1779,6 +2374,17 @@ void DagorEdAppWindow::startWithWorkspace(const char *wspName)
     editor_core_load_dag_imgui_blk_settings(perAppSettingsBlk);
     environment::load_ui_state(perAppSettingsBlk);
     initPlugins(settingsBlk, perAppSettingsBlk);
+
+    if (DataBlock *assetBrowserBlk = perAppSettingsBlk.getBlockByName("assetBrowser"))
+    {
+      if (DataBlock *assetSelectorDialogModalBlk = assetBrowserBlk->getBlockByName("assetSelectorDialogModal"))
+        asset_browser_modal_settings = *assetSelectorDialogModalBlk;
+      if (DataBlock *assetSelectorDialogModelessBlk = assetBrowserBlk->getBlockByName("assetSelectorDialogModeless"))
+        asset_browser_modeless_settings = *assetSelectorDialogModelessBlk;
+    }
+
+    editor_core_load_imgui_color_editor_options(settingsBlk);
+    setToolbarScalePercent(settingsBlk.getInt("ToolbarScalePercent", 100));
 
     const Tab<String> &recents = wsp->getRecents();
 
@@ -1797,10 +2403,6 @@ void DagorEdAppWindow::startWithWorkspace(const char *wspName)
     {
       case ID_CREATE_NEW: // new
         handled = handleNewProject(false);
-        break;
-
-      case ID_OPEN_PROJECT: // open
-        handled = handleOpenProject(false);
         break;
 
       case ID_OPEN_DRAG_AND_DROPPED_SCREENSHOT:
@@ -1828,9 +2430,13 @@ void DagorEdAppWindow::startWithWorkspace(const char *wspName)
 
       case ID_OPEN_FROM_COMMAND_LINE:
       default: // load recent
-        if (recents.size() || shouldLoadFile)
+      {
+        const int recentIndex = sel - ID_RECENT_FIRST;
+        const bool fromCommandLine = sel == ID_OPEN_FROM_COMMAND_LINE && shouldLoadFile;
+        const bool fromRecent = recentIndex >= 0 && recentIndex < recents.size();
+        if (fromCommandLine || fromRecent)
         {
-          String fileName = ::make_full_path(wsp->getSdkDir(), shouldLoadFile ? sceneFname : recents[sel - ID_RECENT_FIRST]);
+          String fileName = ::make_full_path(wsp->getSdkDir(), fromCommandLine ? sceneFname : recents[recentIndex]);
           ::strcpy(sceneFname, fileName);
 
           addToRecentList(sceneFname);
@@ -1847,13 +2453,16 @@ void DagorEdAppWindow::startWithWorkspace(const char *wspName)
             quit_game(-1);
           }
         }
-        break;
+      }
+      break;
     }
     if (!handled) //== we init d3d for workspace only once!
-      quit_game(-1);
+      quit_game(-2);
     ec_set_busy(false);
   }
   shouldLoadFile = false;
+
+  PropPanel::load_toast_message_icons();
 
   wsp->freeWorkspaceBlk();
   updateRecentMenu();
@@ -1865,20 +2474,54 @@ void DagorEdAppWindow::startWithWorkspace(const char *wspName)
   // the rendering is not enabled at that point then the application appears to be frozen.)
   queryEditorInterface<IDynRenderService>()->enableRender(!d3d::is_stub_driver());
   queryEditorInterface<IDynRenderService>()->selectAsGameScene();
-  spawnEvent(HUID_AfterProjectLoad, NULL);
+
+  preparePluginsListmenu();
 
   repaint();
   force_screen_redraw();
   dagor_idle_cycle();
   DEBUG_CP();
-  ec_set_busy(false);
+
+  // Show the console as the last rendered frame till the windows are not laid out.
+  queryEditorInterface<IDynRenderService>()->suppressScenePresent(true);
 
   DAGORED2->getConsole().hideConsole();
+
+  { // Wait till the window layout is ready.
+    // Temporarily lift the FPS limit to prevent dagor_work_cycle() from returning because of not enough elapsed time.
+    const bool oldLimitFps = dgs_limit_fps;
+    dgs_limit_fps = false;
+
+    // The first DagorEdAppWindow::renderUI() call loads the last used layout or sets the default one, then ImGui needs
+    // two frames to handle auto sizing.
+    for (int i = 0; i < 3; i++)
+    {
+      dagor_work_cycle();
+
+      // Supressing present() also suppresses tql::on_frame_finished(), but we want streaming texture loading to work.
+      dagor_idle_cycle();
+    }
+
+    dgs_limit_fps = oldLimitFps;
+  }
+
+  queryEditorInterface<IDynRenderService>()->suppressScenePresent(false);
+  ec_set_busy(false);
+
+  const DataBlock *profilerBlk = dgs_get_settings()->getBlockByNameEx("debug")->getBlockByName("profiler");
+  if (profilerBlk && profilerBlk->getBool("auto_dump_startup", false))
+    da_profiler::request_dump();
+
+  logdbg("daEditorX has loaded and ready for interaction");
+  flash_window(win32_get_main_wnd());
+
+  spawnEvent(HUID_AfterProjectLoad, NULL);
 }
 
 
 void *DagorEdAppWindow::queryEditorInterfacePtr(unsigned huid)
 {
+  const bool useDngBasedSceneRender = DAGORED2->getWorkspace().isUsingDngBasedSceneRender();
   if (huid == HUID_IDaEditor3Engine)
     return static_cast<IDaEditor3Engine *>(&IDaEditor3Engine::get());
 
@@ -1904,7 +2547,7 @@ void *DagorEdAppWindow::queryEditorInterfacePtr(unsigned huid)
     return get_generic_file_change_tracking_service();
 
   if (huid == HUID_ISkiesService)
-    return get_generic_skies_service();
+    return useDngBasedSceneRender ? get_dng_based_skies_service() : get_generic_skies_service();
 
   if (huid == HUID_IColorRangeService)
     return get_generic_color_range_service();
@@ -1922,7 +2565,7 @@ void *DagorEdAppWindow::queryEditorInterfacePtr(unsigned huid)
     return get_generic_water_service();
 
   if (huid == HUID_IDynRenderService)
-    return get_generic_dyn_render_service();
+    return useDngBasedSceneRender ? get_dng_based_render_service() : get_generic_dyn_render_service();
 
   if (huid == HUID_IRenderHelperService)
     return get_generic_render_helper_service();
@@ -1931,13 +2574,13 @@ void *DagorEdAppWindow::queryEditorInterfacePtr(unsigned huid)
     return get_generic_water_proj_fx_service();
 
   if (huid == HUID_ICableService)
-    return get_generic_cable_service();
+    return useDngBasedSceneRender ? nullptr : get_generic_cable_service();
 
   if (huid == HUID_ISplineGenService)
     return get_generic_spline_gen_service();
 
   if (huid == HUID_IWindService)
-    return get_generic_wind_service();
+    return useDngBasedSceneRender ? nullptr : get_generic_wind_service();
 
   if (huid == HUID_IPixelPerfectSelectionService)
     return get_pixel_perfect_selection_service();
@@ -1945,7 +2588,15 @@ void *DagorEdAppWindow::queryEditorInterfacePtr(unsigned huid)
   if (huid == HUID_IVisibilityFinderProvider)
     return get_visibility_finder_service();
 
+  if (huid == IEditorCommandSystem::HUID)
+    return &editor_command_system;
+
+  if (huid == IHmapDebugShadingService::HUID)
+    return ::get_hmap_debug_shading_service();
+
   RETURN_INTERFACE(huid, IMainWindowImguiRenderingService);
+  RETURN_INTERFACE(huid, IEditorCommandKeyChordChangeEventHandler);
+  RETURN_INTERFACE(huid, IGridSettingChangeEventHandler);
 
   return NULL;
 }
@@ -1980,7 +2631,7 @@ void DagorEdAppWindow::getInterfaces(int huid, Tab<void *> &interfaces)
 
 
 //==============================================================================
-void DagorEdAppWindow::addToRecentList(const char *fname, bool menu_update)
+void DagorEdAppWindow::addToRecentList(const char *fname, bool)
 {
   if (!fname || !*fname)
     return;
@@ -2083,11 +2734,11 @@ void DagorEdAppWindow::copyFiles(const FilePathName &from, const FilePathName &t
 //==============================================================================
 String DagorEdAppWindow::getApplicationName() const
 {
-  if (!wsp || !wsp->getAppPath() || wsp->getAppPath()[0] == '\0')
+  if (!wsp || !wsp->getAppBlkPath() || wsp->getAppBlkPath()[0] == '\0')
     return String();
 
   String fileName;
-  String absoluteAppPath = make_path_absolute(wsp->getAppPath());
+  String absoluteAppPath = make_path_absolute(wsp->getAppBlkPath());
   if (!absoluteAppPath.empty())
   {
     String dirPath;
@@ -2108,6 +2759,16 @@ String DagorEdAppWindow::getPerApplicationSettingsBlkPath() const
     return name;
   else
     return ::make_full_path(sgg::get_exe_path_full(), String(0, "../.local/de3_settings_%s.blk", name.c_str()));
+}
+
+//==============================================================================
+String DagorEdAppWindow::getPerApplicationWindowLayoutBlkPath() const
+{
+  const String name = getApplicationName();
+  if (name.empty())
+    return name;
+  else
+    return ::make_full_path(sgg::get_exe_path_full(), String(0, "../.local/de3_window_layout_%s.blk", name.c_str()));
 }
 
 //==============================================================================
@@ -2178,6 +2839,7 @@ void DagorEdAppWindow::pluginHelp(const char *url) const
 
   ::HtmlHelp(NULL, help.str(), HH_DISPLAY_TOPIC, 0);
 #else
+  G_UNUSED(url);
   LOGERR_CTX("TODO: tools Linux porting: DagorEdAppWindow::pluginHelp");
 #endif
 }
@@ -2187,10 +2849,11 @@ void DagorEdAppWindow::pluginHelp(const char *url) const
 void DagorEdAppWindow::getDocTitleText(String &text)
 {
   unsigned drv = d3d::get_driver_code().asFourCC();
+  const char *dng_label = DAGORED2->getWorkspace().isUsingDngBasedSceneRender() ? "dngBasedRender | " : "";
   if (sceneFname[0])
-    text.printf(300, "DaEditorX  [%c%c%c%c]  - %s", _DUMP4C(drv), sceneFname);
+    text.printf(300, "DaEditorX  [%s%c%c%c%c]  - %s", dng_label, _DUMP4C(drv), sceneFname);
   else
-    text.printf(300, "%s  [%c%c%c%c]", IDagorEd2Engine::getBuildVersion(), _DUMP4C(drv));
+    text.printf(300, "%s  [%s%c%c%c%c]", IDagorEd2Engine::getBuildVersion(), dng_label, _DUMP4C(drv));
 }
 
 
@@ -2209,7 +2872,14 @@ bool DagorEdAppWindow::canCloseScene(const char *title)
     return false;
 
   if (ret == wingw::MB_ID_YES)
+  {
     onMenuItemClick(CM_FILE_SAVE);
+
+    for (int i = 0; i < plugin.size(); ++i)
+      if (plugin[i].p)
+        if (IPluginBeforeClose *pbc = plugin[i].p->queryInterface<IPluginBeforeClose>())
+          pbc->beforeClose();
+  }
 
   if (sceneFname[0])
     autoSaveProject(sceneFname);
@@ -2220,7 +2890,7 @@ bool DagorEdAppWindow::canCloseScene(const char *title)
 }
 
 
-bool DagorEdAppWindow::handleNewProject(bool edit)
+bool DagorEdAppWindow::handleNewProject(bool)
 {
   ec_set_busy(false);
   if (!canCloseScene("Create new project"))
@@ -2260,7 +2930,6 @@ bool DagorEdAppWindow::handleNewProject(bool edit)
     return false;
   }
 
-  String projectDir(260, "%s/%s/", dlg.getLocation(), dlg.getName());
 
   DagorEdAppWindow::setDocTitle();
 
@@ -2268,7 +2937,7 @@ bool DagorEdAppWindow::handleNewProject(bool edit)
 }
 
 
-bool DagorEdAppWindow::handleOpenProject(bool edit)
+bool DagorEdAppWindow::handleOpenProject(bool)
 {
   if (!canCloseScene("Open project"))
     return false;
@@ -2333,6 +3002,9 @@ bool DagorEdAppWindow::createNewProject(const char *filename)
   String basePath, projectName;
   splitProjectFilename(filename, basePath, projectName);
 
+  IDynRenderService *dynRender = queryEditorInterface<IDynRenderService>();
+  const bool enableRendererAfter = !d3d::is_stub_driver();
+  dynRender->enableRender(false);
 
   for (int i = 0; i < plugin.size(); ++i)
     if (plugin[i].p)
@@ -2342,7 +3014,7 @@ bool DagorEdAppWindow::createNewProject(const char *filename)
     }
   undoSystem->clear();
 
-  DataBlock appblk(String(260, "%s/application.blk", wsp->getAppDir()));
+  DataBlock appblk(wsp->getAppBlkPath());
   ged.load(*appblk.getBlockByNameEx("defProjectLocal"));
 
   for (int i = 0; i < plugin.size(); ++i)
@@ -2354,6 +3026,9 @@ bool DagorEdAppWindow::createNewProject(const char *filename)
 
       plugin[i].p->onNewProject();
     }
+
+  if (dynRender->getRenderType() == IDynRenderService::RTYPE_DNG_BASED)
+    dynRender->updateEditorLandmesh();
 
   //== reset editor project settings
   lastUniqueId = 1;
@@ -2379,7 +3054,9 @@ bool DagorEdAppWindow::createNewProject(const char *filename)
     }
   }
 
-  return saveProject(filename);
+  const bool result = saveProject(filename);
+  dynRender->enableRender(enableRendererAfter);
+  return result;
 }
 
 
@@ -2458,12 +3135,18 @@ bool DagorEdAppWindow::gracefulFatalExit(const char *msg, const char *call_stack
 //==============================================================================
 bool DagorEdAppWindow::loadProject(const char *filename)
 {
+  TIME_PROFILE(DagorEdAppWindow::loadProject);
+
+  logdbg("Loading project \"%s\".", filename);
+
+  projectLoaded = false;
   bool real_3d = !d3d::is_stub_driver();
   if (!real_3d)
   {
     ::dgs_dont_use_cpu_in_background = false;
     dagor_enable_idle_priority(false);
   }
+  dagor_frame_no_increment();
   queryEditorInterface<IDynRenderService>()->enableRender(false);
   undoSystem->clear();
 
@@ -2476,7 +3159,10 @@ bool DagorEdAppWindow::loadProject(const char *filename)
   String lastplugin;
   splitProjectFilename(filename, basePath, projectName);
 
-  resetModelessWindows(ModelessWindowResetReason::LoadingProject);
+  del_it(mCameraPresets);
+  mCameraPresets = new CameraPresetsManager(basePath);
+  getMainMenu()->setCheckById(CM_CAMERA_PRESETS, false);
+
   set_colliders_to_default_state();
 
   int i;
@@ -2488,7 +3174,7 @@ bool DagorEdAppWindow::loadProject(const char *filename)
     }
   undoSystem->clear();
 
-  DataBlock blk, b1, b2;
+  DataBlock blk;
   DataBlock localBlk;
 
   {
@@ -2511,7 +3197,7 @@ bool DagorEdAppWindow::loadProject(const char *filename)
 
   if (localBlk.blockCount() + localBlk.paramCount() == 0)
   {
-    DataBlock appblk(String(260, "%s/application.blk", wsp->getAppDir()));
+    DataBlock appblk(wsp->getAppBlkPath());
     ged.load(*appblk.getBlockByNameEx("defProjectLocal"));
   }
   else
@@ -2673,8 +3359,7 @@ bool DagorEdAppWindow::loadProject(const char *filename)
       wingw::message_box(wingw::MBS_EXCL, "Plugin fatal error", "Plugin \"%s\" loading failed, plugin disabled.", menuName);
       debug("Plugin \"%s\" loading failed, plugin disabled.", menuName);
 
-      DataBlock::setRootIncludeResolver(wsp->getAppDir()); // reset DataBlock::setIncludeResolver() that may be installed in plugin to
-                                                           // be removed
+      DataBlock::setRootIncludeResolver("%appDir/"); // reset setIncludeResolver() that may be installed in plugin to be removed
       unregisterPlugin(plugin[i].p);
       --i;
 
@@ -2730,8 +3415,7 @@ bool DagorEdAppWindow::loadProject(const char *filename)
           wingw::message_box(wingw::MBS_EXCL, "Plugin fatal error", "Plugin \"%s\" loading failed, plugin disabled.", menuName);
         debug("Plugin \"%s\" loading failed, plugin disabled.", menuName);
 
-        DataBlock::setRootIncludeResolver(wsp->getAppDir()); // reset DataBlock::setIncludeResolver() that may be installed in plugin
-                                                             // to be removed
+        DataBlock::setRootIncludeResolver("%appDir/"); // reset setIncludeResolver() that may be installed in plugin to be removed
         unregisterPlugin(plugin[i].p);
         --i;
 
@@ -2743,9 +3427,11 @@ bool DagorEdAppWindow::loadProject(const char *filename)
   }
   environment::load_settings(localBlk);
 
-  String fname(260, "%sapplication.blk", wsp->getAppDir());
-  DataBlock appBlk(fname);
+  DataBlock appBlk(DAGORED2->getWorkspace().getAppBlkPath());
   queryEditorInterface<IDynRenderService>()->reloadCharacterMicroDetails(*appBlk.getBlockByNameEx("dynamicDeferred"), localBlk);
+
+  if (IHmapDebugShadingService *debugShadingService = DAGORED2->queryEditorInterface<IHmapDebugShadingService>())
+    debugShadingService->loadGradientsFile(get_heightmap_debug_shading_gradient_settings_file_path());
 
   con.setActionDesc("Preparing to show...");
 
@@ -2775,10 +3461,10 @@ bool DagorEdAppWindow::loadProject(const char *filename)
   con.startProgress();
   GeomObject::recompileAllGeomObjects(&con);
 
-  ICollision *collision = getInterfaceEx<ICollision>();
+  ICollision *collisionIface = getInterfaceEx<ICollision>();
 
-  if (collision)
-    collision->manageCustomColliders();
+  if (collisionIface)
+    collisionIface->manageCustomColliders();
 
   // notify all plugins about loading finish
   spawnEvent(HUID_BeforeMainLoop, nullptr);
@@ -2792,6 +3478,13 @@ bool DagorEdAppWindow::loadProject(const char *filename)
         console->addMessage(ILogWriter::ERROR, "Plugin \"%s\" failed during beforeMainLoop()", plugin[i].p->getMenuCommandName());
       }
     }
+
+  registerEditorCommands();
+
+  // Normally it would be enough to just call addAccelerators() here but because fillMenu() ran before
+  // registerEditorCommands() we have to update the menu and toolbar button shortcuts too. So we simply call
+  // onEditorCommandKeyChordChanged() to do all these.
+  onEditorCommandKeyChordChanged();
 
   switchToPlugin(plugId);
   ged.activateCurrentViewport();
@@ -2813,6 +3506,7 @@ bool DagorEdAppWindow::loadProject(const char *filename)
   prev_fatal_handler = dgs_fatal_handler;
   dgs_fatal_handler = DagorEdAppWindow::gracefulFatalExit;
 
+  projectLoaded = true;
   return true;
 }
 
@@ -2823,11 +3517,20 @@ void DagorEdAppWindow::loadProjectFromEditor(const char *path)
   CoolConsole &con = DAGORED2->getConsole();
   con.showConsole();
 
+  DataBlock modelessWindowStateBlk;
+  ModelessWindowControllerList modelessWindowList = getModelessWindowControllers();
+  modelessWindowList.saveState(modelessWindowStateBlk);
+  modelessWindowList.releaseAllWindows();
+
   strcpy(sceneFname, path);
   addToRecentList(sceneFname);
 
-  startup_editor_core_select_startup_scene(); // Show the full screen console as the loading screen.
+  const ImVec4 childBgVec4 = ImGui::GetStyleColorVec4(ImGuiCol_ChildBg);
+  const E3DCOLOR childBgColor = e3dcolor(Color4(childBgVec4.x, childBgVec4.y, childBgVec4.z, childBgVec4.w));
+  startup_editor_core_select_startup_scene(childBgColor); // Show the full screen console as the loading screen.
+
   loadProject(sceneFname);
+  getModelessWindowControllers().loadState(modelessWindowStateBlk);
   queryEditorInterface<IDynRenderService>()->enableRender(!d3d::is_stub_driver()); // loadProject disables rendering.
   queryEditorInterface<IDynRenderService>()->selectAsGameScene();
   setDocTitle();
@@ -2867,6 +3570,8 @@ bool DagorEdAppWindow::saveProject(const char *filename)
   splitProjectFilename(filename, basePath, projectName);
 
   bool ok = true;
+
+  DAEDITOR3.saveAssetsTags();
 
   CoolConsole &con = DAGORED2->getConsole();
   con.startProgress();
@@ -2964,12 +3669,12 @@ bool DagorEdAppWindow::saveProject(const char *filename)
       }
       for (int i = 0; i < getPluginCount(); ++i)
       {
-        IGenEditorPlugin *plugin = getPlugin(i);
-        IObjEntityFilter *filter = plugin->queryInterface<IObjEntityFilter>();
+        IGenEditorPlugin *p = getPlugin(i);
+        IObjEntityFilter *filter = p->queryInterface<IObjEntityFilter>();
 
         if (filter && filter->allowFiltering(IObjEntityFilter::STMASK_TYPE_COLLISION))
           if (!filter->isFilteringActive(IObjEntityFilter::STMASK_TYPE_COLLISION))
-            map.addNameId(plugin->getMenuCommandName());
+            map.addNameId(p->getMenuCommandName());
       }
 
       iterate_names(map, [&](int, const char *name) { disCollidersBlk->addStr("name", name); });
@@ -3022,8 +3727,6 @@ bool DagorEdAppWindow::saveProject(const char *filename)
         con.setActionDesc(String(1024, "Saving data: %s", plugin[i].p->getMenuCommandName()));
 
         dd_mkdir(String(256, "%s/%s", (const char *)basePath, name));
-
-        String path(256, "%s/%s/", (const char *)basePath, name);
 
         DataBlock blk;
 
@@ -3139,10 +3842,10 @@ ICollision *DagorEdAppWindow::getCollision()
 
     for (int i = 0; i < getPluginCount(); ++i)
     {
-      IGenEditorPlugin *plugin = getPlugin(i);
+      IGenEditorPlugin *p = getPlugin(i);
 
-      if (plugin)
-        tc = plugin->queryInterface<ICollision>();
+      if (p)
+        tc = p->queryInterface<ICollision>();
 
       if (tc)
       {
@@ -3174,11 +3877,80 @@ void DagorEdAppWindow::showSelectWindow(IObjectsList *obj_list, const char *obj_
 }
 
 //==============================================================================
+
+void DagorEdAppWindow::showTagManager(bool show)
+{
+  if (show)
+  {
+    mManager->setWindowType(nullptr, TAGMANAGER_TYPE);
+  }
+  else
+  {
+    mManager->removeWindow(mTagManager);
+  }
+}
+
+void DagorEdAppWindow::showShortcutsEditor(bool show)
+{
+  const bool isCurrentlyShown = mShortcutsPanel != nullptr;
+  if (show == isCurrentlyShown)
+    return;
+
+  if (mShortcutsPanel)
+  {
+    mManager->removeWindow(mShortcutsPanel);
+    mShortcutsPanel = nullptr;
+  }
+  else
+  {
+    mManager->setWindowType(nullptr, SHORTCUTS_EDITOR_TYPE);
+  }
+}
+
+void DagorEdAppWindow::showCameraPresets(bool show)
+{
+  if (!mCameraPresets)
+    return;
+
+  const bool isCurrentlyShown = mCameraPresets->isPanelVisible();
+  if (show == isCurrentlyShown)
+    return;
+
+  if (isCurrentlyShown)
+  {
+    mManager->removeWindow(mCameraPresets->getPanel());
+  }
+  else
+  {
+    mManager->setWindowType(nullptr, CAMERA_PRESETS_TYPE);
+  }
+}
+
+//==============================================================================
+
+bool DagorEdAppWindow::getPendingTextureLoadTotalCount(unsigned int &total_count)
+{
+  AsyncTextureLoadingState ld_state;
+  if (texconvcache::get_tex_factory_current_loading_state(ld_state))
+  {
+    total_count = ld_state.pendingLdTotal;
+    return true;
+  }
+  return false;
+}
+
+//==============================================================================
 void DagorEdAppWindow::zoomAndCenter()
 {
   IGenEditorPlugin *current = curPlugin();
   ViewportWindow *curVP = NULL;
   BBox3 bounds;
+
+  // A plugin with no 3D scene (GraphEditor) frames its own view instead of the viewports.
+  if (current && current->catchEvent(HUID_ZoomAndCenter, nullptr))
+  {
+    return;
+  }
 
   if (current && current->getSelectionBox(bounds))
   {
@@ -3217,11 +3989,11 @@ void DagorEdAppWindow::updateUndoRedoMenu()
   bool enable = true;
 
   if (undoName)
-    caption = String(128, "Undo \"%s\"\tCtrl+Z", undoName);
+    caption = String(128, "Undo \"%s\"", undoName);
   else
   {
     enable = false;
-    caption = "Undo\tCtrl+Z";
+    caption = "Undo";
   }
 
   getMainMenu()->setEnabledById(CM_UNDO, enable);
@@ -3232,12 +4004,12 @@ void DagorEdAppWindow::updateUndoRedoMenu()
   if (redoName)
   {
     enable = true;
-    caption = String(128, "Redo \"%s\"\tCtrl+Y", redoName);
+    caption = String(128, "Redo \"%s\"", redoName);
   }
   else
   {
     enable = false;
-    caption = "Redo\tCtrl+Y";
+    caption = "Redo";
   }
 
   getMainMenu()->setEnabledById(CM_REDO, enable);
@@ -3296,20 +4068,44 @@ void DagorEdAppWindow::showMessageAt()
   if (messageAt.empty())
     return;
   StdGuiRender::set_font(0);
-  Point2 ts = StdGuiRender::get_str_bbox(messageAt.c_str()).size();
   int ascent = StdGuiRender::get_font_ascent();
   int descent = StdGuiRender::get_font_descent();
   int fontHeight = ascent + descent;
-  int padding = 2;
-  int width = ts.x;
-  int height = padding + fontHeight + padding;
-  int left = msgX;
-  int top = msgY - height;
-  StdGuiRender::set_color(COLOR_BLACK);
-  StdGuiRender::render_box(left, top, left + width, top + height);
+  int padding = 4;
 
+  Tab<eastl::string_view> lines(tmpmem);
+  const char *p = messageAt.c_str();
+  while (true)
+  {
+    const char *nl = strchr(p, '\n');
+    int len = nl ? int(nl - p) : int(strlen(p));
+    while (len > 0 && p[len - 1] == '\r')
+      --len;
+
+    lines.emplace_back(p, len);
+    if (!nl)
+      break;
+    p = nl + 1;
+  }
+
+  int numLines = lines.size();
+  int maxWidth = 0;
+  for (int i = 0; i < numLines; ++i)
+    maxWidth = max(maxWidth, (int)StdGuiRender::get_str_bbox(lines[i].data(), lines[i].size()).size().x);
+
+  int width = maxWidth + padding * 2;
+  int totalHeight = padding + numLines * fontHeight + padding;
+  int left = msgX;
+  int top = msgY - totalHeight;
+
+  StdGuiRender::set_color(COLOR_BLACK);
+  StdGuiRender::render_box(left, top, left + width, top + totalHeight);
   StdGuiRender::set_color(COLOR_WHITE);
-  StdGuiRender::draw_strf_to(left + (width - ts.x) / 2, top + padding + ascent, messageAt.c_str());
+  for (int i = 0; i < numLines; ++i)
+  {
+    StdGuiRender::goto_xy(left + padding, top + padding + ascent + i * fontHeight);
+    StdGuiRender::draw_str(lines[i].data(), lines[i].size());
+  }
 };
 //==================================================================================================
 Point3 DagorEdAppWindow::snapToGrid(const Point3 &p) const { return grid.snapToGrid(p); }
@@ -3331,7 +4127,7 @@ String DagorEdAppWindow::getScreenshotNameMask(bool cube) const
 }
 
 //==================================================================================================
-void DagorEdAppWindow::setAnimateViewports(bool animate)
+void DagorEdAppWindow::setAnimateViewports(bool)
 {
   /*
   animateViewports = animate;
@@ -3340,6 +4136,19 @@ void DagorEdAppWindow::setAnimateViewports(bool animate)
 
   ::appWnd.checkMenuItem(CM_ANIMATE_VIEWPORTS, animateViewports);
   */
+}
+
+void DagorEdAppWindow::setToolbarScalePercent(int scale_percent)
+{
+  if (scale_percent < 50 || scale_percent > 400 || scale_percent == toolbarScalePercent)
+    return;
+
+  toolbarScalePercent = scale_percent;
+
+  if (mToolPanel)
+    mToolPanel->setToolbarScalePercent(toolbarScalePercent);
+  if (mPlugTools)
+    mPlugTools->setToolbarScalePercent(toolbarScalePercent);
 }
 
 void DagorEdAppWindow::onImguiDelayedCallback(void *user_data)
@@ -3353,7 +4162,7 @@ void DagorEdAppWindow::onImguiDelayedCallback(void *user_data)
   else
   {
     ViewportWindow *viewport = ged.getCurrentViewport();
-    if (!viewport || !viewport->isActive())
+    if (!viewport)
       return;
 
     const unsigned viewportCommandId = commandId & ~DELAYED_CALLBACK_VIEWPORT_COMMAND_BIT;
@@ -3371,28 +4180,28 @@ void DagorEdAppWindow::renderUIViewport(ViewportWindow &viewport, const Point2 &
   ImGui::PushID(&viewport);
 
   const ImGuiID viewportCanvasId = ImGui::GetCurrentWindow()->GetID("canvas");
-
-  if (viewport.isActive())
-  {
-    unsigned commandId = mManager->processImguiViewportAccelerator(viewportCanvasId);
-    if (commandId != 0)
-    {
-      G_ASSERT((commandId & DELAYED_CALLBACK_VIEWPORT_COMMAND_BIT) == 0);
-      commandId |= DELAYED_CALLBACK_VIEWPORT_COMMAND_BIT;
-      PropPanel::request_delayed_callback(*this, (void *)((uintptr_t)commandId));
-    }
-  }
-
   viewport.updateImgui(viewportCanvasId, size, item_spacing);
+
+  if (mCameraPresets)
+    mCameraPresets->captureViewportRect(ged.findViewportIndex(&viewport));
 
   ImGui::PopID();
 }
 
-void DagorEdAppWindow::renderUIViewports()
+bool DagorEdAppWindow::renderUIViewports()
 {
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-  ImGui::Begin("Viewport");
+  const bool submitContent = ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_NoScrollbar);
   ImGui::PopStyleVar();
+
+  const ImGuiWindow *window = ImGui::GetCurrentWindow();
+  const bool vpWindowVisible = submitContent && !window->Hidden && (!window->DockIsActive || window->DockTabIsVisible);
+
+  if (!submitContent)
+  {
+    ImGui::End();
+    return vpWindowVisible;
+  }
 
   const float itemSpacing = ImGui::GetStyle().ItemSpacing.y; // Use the same spacing in both directions.
   const Point2 regionAvailable = Point2(ImGui::GetContentRegionAvail()) - Point2(itemSpacing, itemSpacing);
@@ -3437,6 +4246,7 @@ void DagorEdAppWindow::renderUIViewports()
   }
 
   ImGui::End();
+  return vpWindowVisible;
 }
 
 void DagorEdAppWindow::renderUI()
@@ -3449,9 +4259,9 @@ void DagorEdAppWindow::renderUI()
   if (clientWidth == 0 || clientHeight == 0)
     return;
 
-  PropPanel::IMenu *mainMenu = getMainMenu();
-  if (mainMenu)
-    PropPanel::render_menu(*mainMenu);
+  PropPanel::IMenu *menu = getMainMenu();
+  if (menu)
+    PropPanel::render_menu(*menu);
 
   const ImGuiViewport *viewport = ImGui::GetMainViewport();
   ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -3470,7 +4280,7 @@ void DagorEdAppWindow::renderUI()
     PropPanel::pushToolBarColorOverrides();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, PropPanel::Constants::TOOLBAR_WINDOW_PADDING);
 
-    ImGui::BeginChild("Toolbar", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Border,
+    ImGui::BeginChild("Toolbar", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders,
       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking);
 
     ImGui::PopStyleVar();
@@ -3478,6 +4288,7 @@ void DagorEdAppWindow::renderUI()
 
     if (mToolPanel)
       mToolPanel->updateImgui();
+
     if (mTabWindow)
     {
       ImGui::PushStyleColor(ImGuiCol_Text, PropPanel::getOverriddenColor(PropPanel::ColorOverride::DIALOG_TITLE));
@@ -3486,12 +4297,29 @@ void DagorEdAppWindow::renderUI()
       if (mPlugTools)
         ImGui::NewLine();
     }
+
     if (mPlugTools)
       mPlugTools->updateImgui();
+
+    if (mShortcutsPanel)
+    {
+      ImGui::SetNextWindowSize(ImVec2(viewport->Size.x * 0.3f, viewport->Size.y * 0.7f), ImGuiCond_FirstUseEver);
+      ImGui::SetNextWindowPos(ImVec2(viewport->Size.x * 0.35f, viewport->Size.y * 0.15f), ImGuiCond_FirstUseEver);
+
+      bool open = true;
+      DAEDITOR3.imguiBegin("Keyboard Shortcuts", &open);
+      mShortcutsPanel->updateImgui();
+      DAEDITOR3.imguiEnd();
+
+      if (!open)
+        mManager->removeWindow(mShortcutsPanel);
+    }
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
     ImGui::EndChild();
     ImGui::PopStyleVar();
+
+    editor_command_system.updateImgui();
   }
 
   ImGui::BeginChild("DockHolder", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None,
@@ -3499,24 +4327,34 @@ void DagorEdAppWindow::renderUI()
 
   ImGuiID rootDockSpaceId = ImGui::GetID("RootDockSpace");
 
+  if (!dockPositionsInitialized && !lastUsedLayoutLoaded)
+    loadLastUsedLayout();
+
   // Create the initial dock layout.
   // If you want to the change the initial dock layout you will likely need to increase LATEST_DOCK_SETTINGS_VERSION.
   if (!dockPositionsInitialized)
   {
     dockPositionsInitialized = true;
 
-    const ImVec2 viewportSize = ImGui::GetMainViewport()->Size;
-
     ImGui::DockBuilderRemoveNode(rootDockSpaceId);
     ImGui::DockBuilderAddNode(rootDockSpaceId, ImGuiDockNodeFlags_CentralNode);
     ImGui::DockBuilderSetNodeSize(rootDockSpaceId, ImGui::GetMainViewport()->Size);
 
-    ImGuiID dockSpaceLeft, dockSpaceViewport;
+    ImGuiID dockSpaceLeft, dockSpaceLeftBottom, dockSpaceViewport;
     ImGuiID dockSpaceRight4 = ImGui::DockBuilderSplitNode(rootDockSpaceId, ImGuiDir_Right, 0.15f, nullptr, &dockSpaceLeft);
     ImGuiID dockSpaceRight3 = ImGui::DockBuilderSplitNode(dockSpaceLeft, ImGuiDir_Right, 0.25f, nullptr, &dockSpaceLeft);
     ImGuiID dockSpaceRight2 = ImGui::DockBuilderSplitNode(dockSpaceLeft, ImGuiDir_Right, 0.25f, nullptr, &dockSpaceLeft);
     ImGuiID dockSpaceRight1 = ImGui::DockBuilderSplitNode(dockSpaceLeft, ImGuiDir_Right, 0.33f, nullptr, &dockSpaceViewport);
+
+    ImGuiID dockSpaceGraph = ImGui::DockBuilderSplitNode(dockSpaceViewport, ImGuiDir_Right, 0.5f, nullptr, &dockSpaceViewport);
+
     dockSpaceLeft = ImGui::DockBuilderSplitNode(dockSpaceViewport, ImGuiDir_Left, 0.4f, nullptr, &dockSpaceViewport);
+    dockSpaceLeftBottom = ImGui::DockBuilderSplitNode(dockSpaceLeft, ImGuiDir_Down, 0.15f, nullptr, &dockSpaceLeft);
+
+    ImGuiID dockSpaceViewportBottomLeft =
+      ImGui::DockBuilderSplitNode(dockSpaceViewport, ImGuiDir_Down, 0.30f, nullptr, &dockSpaceViewport);
+    ImGuiID dockSpaceViewportBottomRight =
+      ImGui::DockBuilderSplitNode(dockSpaceViewportBottomLeft, ImGuiDir_Right, 0.5f, nullptr, &dockSpaceViewportBottomLeft);
 
     ImGuiDockNode *viewportNode = ImGui::DockBuilderGetNode(dockSpaceViewport);
     if (viewportNode)
@@ -3524,12 +4362,20 @@ void DagorEdAppWindow::renderUI()
 
     // TODO: ImGui porting: view: extensibility?
     ImGui::DockBuilderDockWindow("###AssetSelectorPanel", dockSpaceLeft);
+    ImGui::DockBuilderDockWindow("Tag Management", dockSpaceLeftBottom);
     ImGui::DockBuilderDockWindow("Viewport", dockSpaceViewport);
     ImGui::DockBuilderDockWindow("Outliner", dockSpaceRight1);
     ImGui::DockBuilderDockWindow("Properties", dockSpaceRight2);
     ImGui::DockBuilderDockWindow("Landscape properties", dockSpaceRight2);
     ImGui::DockBuilderDockWindow("Trigger / Mission Obj. Info", dockSpaceRight3);
     ImGui::DockBuilderDockWindow("Object Properties", dockSpaceRight4);
+    ImGui::DockBuilderDockWindow("Scene Outliner", dockSpaceRight4);
+
+    // GraphEditorPlg panels
+    ImGui::DockBuilderDockWindow("Graph", dockSpaceGraph);
+    ImGui::DockBuilderDockWindow("Histogram", dockSpaceViewportBottomLeft);
+    ImGui::DockBuilderDockWindow("Texture Preview", dockSpaceViewportBottomRight);
+    ImGui::DockBuilderDockWindow("Landscape preview", dockSpaceViewport);
 
     ImGui::DockBuilderFinish(rootDockSpaceId);
   }
@@ -3539,7 +4385,7 @@ void DagorEdAppWindow::renderUI()
   ImGui::DockSpace(rootDockSpaceId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
   PropPanel::popDialogTitleBarColorOverrides();
 
-  renderUIViewports();
+  bool vpWindowVisible = renderUIViewports();
 
   IGenEditorPlugin *currentPlugin = curPlugin();
   if (currentPlugin)
@@ -3560,6 +4406,17 @@ void DagorEdAppWindow::renderUI()
       console->hide();
   }
 
+  if (mTagManager)
+  {
+    bool open = true;
+    DAEDITOR3.imguiBegin("Tag Management", &open);
+    mTagManager->updateImgui();
+    DAEDITOR3.imguiEnd();
+
+    if (!open)
+      DAEDITOR3.showTagManagerWindow(false);
+  }
+
   if (control_gallery)
   {
     bool open = true;
@@ -3572,6 +4429,25 @@ void DagorEdAppWindow::renderUI()
   }
 
   PropPanel::render_dialogs();
+
+  PropPanel::render_toast_messages();
+
+  if (mCameraPresets && mCameraPresets->isPanelVisible())
+  {
+    ImGui::SetNextWindowSize(ImVec2(800.0f, 500.0f), ImGuiCond_FirstUseEver);
+
+    bool open = true;
+    DAEDITOR3.imguiBegin("Camera presets", &open);
+    mCameraPresets->getPanel()->updateImgui();
+    DAEDITOR3.imguiEnd();
+
+    if (!open)
+      showCameraPresets(false);
+  }
+
+  // Viewport overlays rendered last so they appear on top of the docked viewport windows.
+  if (mCameraPresets && vpWindowVisible)
+    mCameraPresets->renderAllViewportOverlays();
 
   ImGui::EndChild();
 
@@ -3589,16 +4465,22 @@ void DagorEdAppWindow::updateImgui()
   G_ASSERT(!renderingImgui);
   renderingImgui = true;
 
+  editor_core_test_runtime_begin_frame();
+
   PropPanel::after_new_frame();
 
   // The keyboard press checking itself cannot be in actObject because actObject could be called more often than
   // renderUI (that calls ImGui's NewFrame that updates ImGui's key states), and onMenuItemClick could fire more than
   // once.
 
-  const unsigned commandId = mManager->processImguiAccelerator();
+  const ViewportWindow *activeViewport = ged.getActiveViewport();
+  bool viewportAccelerator = false;
+  unsigned commandId = mManager->processImguiAccelerator(activeViewport ? activeViewport->getImguiCanvasId() : 0, viewportAccelerator);
   if (commandId != 0)
   {
     G_ASSERT((commandId & DELAYED_CALLBACK_VIEWPORT_COMMAND_BIT) == 0);
+    if (viewportAccelerator)
+      commandId |= DELAYED_CALLBACK_VIEWPORT_COMMAND_BIT;
     PropPanel::request_delayed_callback(*this, (void *)((uintptr_t)commandId));
   }
 
@@ -3614,15 +4496,8 @@ void DagorEdAppWindow::updateImgui()
     mToolPanel->setBool(CM_CONSOLE, consoleWindowVisible);
   }
 
-  const bool oldImguiDebugWindowsVisible = imguiDebugWindowsVisible;
-  if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F12))
-    imguiDebugWindowsVisible = !imguiDebugWindowsVisible;
-
   if (imguiDebugWindowsVisible)
     ImGui::ShowMetricsWindow(&imguiDebugWindowsVisible);
-
-  if (imguiDebugWindowsVisible != oldImguiDebugWindowsVisible)
-    getMainMenu()->setCheckById(CM_VIEW_DEVELOPER_TOOLS_IMGUI_DEBUGGER, imguiDebugWindowsVisible);
 
   editor_core_update_imgui_style_editor();
 
@@ -3630,14 +4505,11 @@ void DagorEdAppWindow::updateImgui()
 
   PropPanel::before_end_frame();
 
+  editor_core_test_runtime_end_frame();
+
   renderingImgui = false;
 }
 
-const char *daeditor3_get_appblk_fname()
-{
-  static String fn;
-  fn.printf(260, "%s/application.blk", DAGORED2->getWorkspace().getAppDir());
-  return fn;
-}
+const char *daeditor3_get_appblk_fname() { return DAGORED2->getWorkspace().getAppBlkPath(); }
 
-REGISTER_IMGUI_WINDOW("General", "Console commands and variables", console::imgui_window);
+DagorEdAppWindow &get_app() { return *((DagorEdAppWindow *)IDagorEd2Engine::get()); }

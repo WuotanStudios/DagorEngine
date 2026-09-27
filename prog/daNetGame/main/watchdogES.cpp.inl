@@ -4,6 +4,7 @@
 #include "main/watchdog.h"
 #include "main/level.h"
 #include "main/gameLoad.h"
+#include "main/version.h"
 #include "ui/overlay.h"
 #include "fatal.h"
 
@@ -11,11 +12,13 @@
 #include <ioSys/dag_dataBlock.h>
 #include <startup/dag_globalSettings.h>
 #include <math/random/dag_random.h>
-#include "render/animatedSplashScreen.h"
-#include <ecs/core/entityManager.h>
+#include <animated_splash_screen_api.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include "net/net.h" // net_stop
 
-#include <sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
 #include <sqrat.h>
 
 
@@ -25,7 +28,7 @@ namespace watchdog
 #if EA_ASAN_ENABLED || defined(__SANITIZE_ADDRESS__) // Note: num-1|denom-1 (nible) per mode
 static constexpr uint32_t THRESHOLDS_MULTIPLIERS = 0x202040;
 #else
-static constexpr uint32_t THRESHOLDS_MULTIPLIERS = 0x000021;
+static constexpr uint32_t THRESHOLDS_MULTIPLIERS = 0x000010;
 #endif
 
 #if (DAGOR_DBGLEVEL > 0 || _TARGET_PC) && !DAGOR_THREAD_SANITIZER
@@ -66,7 +69,7 @@ static void initialize_watchdog(int sleep, int trigger, int callstacks, bool fat
       // skew crash report generating bogus crash server signature
       fatal::force_immediate_dump(/*freeze*/ true);
 
-      statsd::counter("fatal", 1, {{"type", "Hang"}});
+      statsd::counter("fatal", 1, {{"type", "Hang"}, {"version", get_exe_version_str()}});
       net_stop();
       terminate_process(1);
     };

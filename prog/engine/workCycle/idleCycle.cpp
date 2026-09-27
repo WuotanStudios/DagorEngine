@@ -8,6 +8,7 @@
 #include <util/dag_delayedAction.h>
 #include <osApiWrappers/dag_wndProcComponent.h>
 #include <osApiWrappers/dag_miscApi.h>
+#include <osApiWrappers/dag_atomic.h>
 #include <debug/dag_debug.h>
 #include "workCyclePriv.h"
 #include <3d/dag_lowLatency.h>
@@ -18,17 +19,9 @@
 
 #endif
 
-#if _TARGET_PC_WIN
+#if _TARGET_PC_WIN | _TARGET_XBOX
 #include <workCycle/threadedWindow.h>
-#endif
 
-#if _TARGET_XBOX
-extern void update_xbox_keyboard();
-#elif _TARGET_PC_WIN
-static void update_xbox_keyboard() {}
-#endif
-
-#if _TARGET_PC_WIN
 static bool pump_messages(bool input_only)
 {
   TIME_PROFILE(pump_messages);
@@ -36,6 +29,7 @@ static bool pump_messages(bool input_only)
   if (windows::process_main_thread_messages(input_only, msg_processed))
     return msg_processed;
 
+#if _TARGET_PC_WIN
   static MSG msg;
   bool were_events = false;
 
@@ -53,16 +47,9 @@ static bool pump_messages(bool input_only)
   }
 
   return were_events;
-}
-#elif _TARGET_XBOX
-namespace gdk
-{
-extern bool process_main_thread_messages();
-}
-static bool pump_messages(bool)
-{
-  TIME_PROFILE(pump_messages);
-  return gdk::process_main_thread_messages();
+#else
+  return msg_processed;
+#endif
 }
 #endif
 
@@ -70,8 +57,6 @@ void dagor_process_sys_messages(bool input_only)
 {
 #if _TARGET_PC_WIN | _TARGET_XBOX
   bool were_events = pump_messages(input_only);
-
-  update_xbox_keyboard();
 
   if (were_events)
   {
@@ -81,6 +66,10 @@ void dagor_process_sys_messages(bool input_only)
   }
 
 #if _TARGET_C4
+
+
+
+
 
 
 
@@ -106,7 +95,7 @@ void dagor_process_sys_messages(bool input_only)
     quit_game(0, false);
   }
 #endif
-#elif _TARGET_PC_LINUX | _TARGET_XBOX
+#elif _TARGET_PC_LINUX
   if (input_only) //== implement properly [to be usable]
     return;
   workcycle_internal::idle_loop();
@@ -115,9 +104,12 @@ void dagor_process_sys_messages(bool input_only)
 #endif
 }
 
-void dagor_idle_cycle(bool input_only)
+void dagor_idle_cycle(bool input_only, bool is_work_cycle)
 {
   TIME_PROFILE(dagor_idle_cycle);
-  perform_regular_actions_for_idle_cycle();
+#if _TARGET_XBOX
+  gdk::process_pending_suspend();
+#endif
+  perform_regular_actions_for_idle_cycle(is_work_cycle);
   dagor_process_sys_messages(input_only);
 }

@@ -8,7 +8,7 @@ rule ProcessCompileTarget
   local pre_opt = ;
   local post_opt = ;
 
-  local O3 = -Xclang -O3 /Gy /Gw ;
+  local O3 = /clang:-O3 /Gy /Gw ;
   if $(PlatformArch) = x86 { O3 += /Oy- ; }
   if $(CheckOnly) = yes { O3 = /Od ; }
   switch $(Config) {
@@ -49,6 +49,7 @@ rule ProcessCompileTarget
 
   if $(KernelLinkage) = static { _CONFIG_OPT += -D_TARGET_STATIC_LIB ; }
   if $(UseWholeOpt) != no {
+    if $(UseWholeOptDevirt) = yes { _CONFIG_OPT += -fwhole-program-vtables ; }
     if $(UseWholeOpt) = yes {
       _CONFIG_OPT += -flto=thin ;
     } else {
@@ -64,7 +65,7 @@ rule ProcessCompileTarget
   $(Target)__CPP_OPT = -FImemory/dag_memBase.h $(post_opt) $(_CPP_OPT) -TP ;
 
   if $(StrictCompile) = yes {
-    if ! [ MATCH /(3rdPartyLibs)/ : $(Location) ] { $(Target)__CPP_OPT += -Wunused-parameter -Wunused-variable -Werror=unused-parameter -Werror=unused-variable /permissive- ; }
+    if ! [ MATCH /(3rdPartyLibs)/ : $(Location) ] { $(Target)__CPP_OPT += -Wunused-parameter -Wunused-variable -Wunused-lambda-capture -Wrange-loop-construct -Werror=unused-parameter -Werror=unused-variable -Werror=unused-lambda-capture -Werror=range-loop-construct /permissive- ; }
   }
 
   $(Target)__C_OPT   = $(post_opt) $(Copt) $(_CPP_OPT) ;
@@ -74,7 +75,10 @@ rule ProcessCompileTarget
 }
 
 
-rule DepRule
+# newer jam.exe provides this rule as the DepRuleDotDot C builtin (see
+# $(JAM_BUILTINS)); keep the interpreted fallback for older jam.exe
+if ! DepRuleDotDot in $(JAM_BUILTINS) {
+rule DepRuleDotDot
 {
   local changed_dep = ;
 
@@ -95,18 +99,19 @@ rule DepRule
   Includes $(<) : $(changed_dep) ;
   null_action $(changed_dep) ;
 }
+}
 
 
 rule CheckHeaders
 {
   Depends $(<) : $(>) ;
-  NoCare $(>) ; # tolerant to .d absence
+  if $(StrictHeaderDeps) != yes || ! [ GLOB $(<:D) : $(<:D=) ] { NoCare $(>) ; } # tolerant to .d absence (also on fresh builds when .obj missing too)
   NOUPDATE $(>) ; # tolerant to .d timestamp
 
   # scan line for header, skipping any ../ at the beginning [will be prefixed with $(Root)]
   HDRSCAN   on $(>) = "^[^ ]*: *([^\
 ]*).*$" ;
-  HDRRULE   on $(>) = DepRule ;
+  HDRRULE   on $(>) = DepRuleDotDot ;
 }
 
 

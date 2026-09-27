@@ -20,9 +20,9 @@ static ecs::CompileTimeQueryDesc setup_collimator_moa_render_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void setup_collimator_moa_render_ecs_query(Callable function)
+inline void setup_collimator_moa_render_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, setup_collimator_moa_render_ecs_query_desc.getHandle(),
+  perform_query(&manager, setup_collimator_moa_render_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -57,9 +57,9 @@ static constexpr ecs::ComponentDesc setup_collimator_moa_lens_ecs_query_comps[] 
   {ECS_HASH("gunmod__collimator_moa_dynamic_noise_sub_scale"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("gunmod__collimator_moa_dynamic_noise_scale"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("gunmod__collimator_moa_dynamic_noise_add"), ecs::ComponentTypeInfo<float>()},
-  {ECS_HASH("gunmod__collimator_moa_dynamic_noise_intensity_scale"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("gunmod__collimator_moa_dynamic_noise_speed"), ecs::ComponentTypeInfo<Point2>()},
-  {ECS_HASH("gunmod__collimator_moa_reticle_offset_y"), ecs::ComponentTypeInfo<float>()}
+  {ECS_HASH("gunmod__collimator_moa_reticle_offset_y"), ecs::ComponentTypeInfo<float>()},
+  {ECS_HASH("gunmod__collimator_lens_color"), ecs::ComponentTypeInfo<Point4>()}
 };
 static ecs::CompileTimeQueryDesc setup_collimator_moa_lens_ecs_query_desc
 (
@@ -69,9 +69,9 @@ static ecs::CompileTimeQueryDesc setup_collimator_moa_lens_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void setup_collimator_moa_lens_ecs_query(ecs::EntityId eid, Callable function)
+inline void setup_collimator_moa_lens_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, setup_collimator_moa_lens_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, setup_collimator_moa_lens_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -93,9 +93,9 @@ inline void setup_collimator_moa_lens_ecs_query(ecs::EntityId eid, Callable func
             , ECS_RO_COMP(setup_collimator_moa_lens_ecs_query_comps, "gunmod__collimator_moa_dynamic_noise_sub_scale", float)
             , ECS_RO_COMP(setup_collimator_moa_lens_ecs_query_comps, "gunmod__collimator_moa_dynamic_noise_scale", float)
             , ECS_RO_COMP(setup_collimator_moa_lens_ecs_query_comps, "gunmod__collimator_moa_dynamic_noise_add", float)
-            , ECS_RO_COMP(setup_collimator_moa_lens_ecs_query_comps, "gunmod__collimator_moa_dynamic_noise_intensity_scale", float)
             , ECS_RO_COMP(setup_collimator_moa_lens_ecs_query_comps, "gunmod__collimator_moa_dynamic_noise_speed", Point2)
             , ECS_RO_COMP(setup_collimator_moa_lens_ecs_query_comps, "gunmod__collimator_moa_reticle_offset_y", float)
+            , ECS_RO_COMP(setup_collimator_moa_lens_ecs_query_comps, "gunmod__collimator_lens_color", Point4)
             );
 
         }
@@ -107,7 +107,7 @@ static constexpr ecs::ComponentDesc render_collimator_moa_lens_ecs_query_comps[]
 //start of 3 ro components at [0]
   {ECS_HASH("collimator_moa_render__active_shapes_count"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("collimator_moa_render__shapes_buf_reg_count"), ecs::ComponentTypeInfo<int>()},
-  {ECS_HASH("collimator_moa_render__current_shapes_buf"), ecs::ComponentTypeInfo<UniqueBufHolder>()}
+  {ECS_HASH("collimator_moa_render__current_shapes_buf"), ecs::ComponentTypeInfo<UniqueBufWithShaderVar>()}
 };
 static ecs::CompileTimeQueryDesc render_collimator_moa_lens_ecs_query_desc
 (
@@ -117,9 +117,9 @@ static ecs::CompileTimeQueryDesc render_collimator_moa_lens_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void render_collimator_moa_lens_ecs_query(Callable function)
+inline void render_collimator_moa_lens_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, render_collimator_moa_lens_ecs_query_desc.getHandle(),
+  perform_query(&manager, render_collimator_moa_lens_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -127,7 +127,7 @@ inline void render_collimator_moa_lens_ecs_query(Callable function)
           function(
               ECS_RO_COMP(render_collimator_moa_lens_ecs_query_comps, "collimator_moa_render__active_shapes_count", int)
             , ECS_RO_COMP(render_collimator_moa_lens_ecs_query_comps, "collimator_moa_render__shapes_buf_reg_count", int)
-            , ECS_RO_COMP(render_collimator_moa_lens_ecs_query_comps, "collimator_moa_render__current_shapes_buf", UniqueBufHolder)
+            , ECS_RO_COMP(render_collimator_moa_lens_ecs_query_comps, "collimator_moa_render__current_shapes_buf", UniqueBufWithShaderVar)
             );
 
         }while (++comp != compE);

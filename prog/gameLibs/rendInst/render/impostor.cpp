@@ -1,14 +1,13 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include "render/impostor.h"
-
+#include <rendInst/impostor.h>
 #include <rendInst/impostorTextureMgr.h>
+#include <rendInst/packedMultidrawParams.hlsli>
 #include "riGen/riRotationPalette.h"
 #include "render/genRender.h"
-
 #include <render/bcCompressor.h>
 #include <3d/dag_lockSbuffer.h>
-#include <3d/dag_gpuConfig.h>
+#include <3d/dag_texStreamingContext.h>
 #include <math/dag_TMatrix4more.h>
 #include <3d/dag_render.h>
 #include <resourcePool/resourcePool.h>
@@ -21,6 +20,10 @@
 #include <drv/3d/dag_lock.h>
 #include <fx/dag_leavesWind.h>
 #include <shaders/dag_shaderBlock.h>
+#include <shaders/dag_shStateBlockBindless.h>
+#include <startup/dag_globalSettings.h>
+#include <debug/dag_debug.h>
+#include <EASTL/array.h>
 
 
 namespace rendinst::render
@@ -40,6 +43,7 @@ static int impostor_tex_count = rendinst::render::IMP_COUNT;
 static uint32_t impostor_texformats[rendinst::render::IMP_COUNT] = {TEXCF_SRGBREAD | TEXCF_SRGBWRITE, 0, 0};
 static E3DCOLOR impostor_clear_color[rendinst::render::IMP_COUNT] = {0x00000000, 0x00FFFFFF, 0xFFFFFFFF};
 RTargetPool::Ptr impostorColorTextureRTPool[rendinst::render::IMP_COUNT];
+ImpostorRenderer impostorRenderer = ImpostorRenderer{};
 PostFxRenderer *postfxBuildMip = nullptr;
 static shaders::UniqueOverrideStateId impostorShadowOverride;
 
@@ -50,6 +54,149 @@ static const auto compIPoint2 = [](const IPoint2 &a, const IPoint2 &b) { return 
 static eastl::vector_map<IPoint2, UniqueTex, decltype(compIPoint2)> impostorDepthTextures(compIPoint2);
 
 static constexpr uint32_t ROTATION_PALETTE_TM_VB_STRIDE = 3; // 3 float4
+
+void ImpostorRenderer::close() { multidrawContext.close(); }
+
+void ImpostorRenderer::sort_packed_drawcalls()
+{
+  TIME_PROFILE(sort_packed_drawcalls);
+  stlsort::sort(multidrawList.begin(), multidrawList.end(), [&](const Record &a, const Record &b) {
+    if (get_material_id(a.dvState.const_state) != get_material_id(b.dvState.const_state))
+      return get_material_id(a.dvState.const_state) < get_material_id(b.dvState.const_state);
+    if (a.dvState.render_state != b.dvState.render_state)
+      return a.dvState.render_state < b.dvState.render_state;
+    if (a.vData != b.vData)
+      return (uintptr_t)a.vData < (uintptr_t)b.vData;
+    if (a.dvState.program != b.dvState.program)
+      return a.dvState.program < b.dvState.program;
+
+    if (a.dvState.state_index != b.dvState.state_index)
+      return a.dvState.state_index < b.dvState.state_index;
+    return false;
+  });
+}
+
+void ImpostorRenderer::coalesce_packed_drawcalls()
+{
+
+  TIME_D3D_PROFILE(coalesce_packed_drawcalls);
+
+  const auto mergeComparator = [](const Record &a, const Record &b) -> bool {
+    return a.vData == b.vData && a.dvState.render_state == b.dvState.render_state &&
+           get_material_id(a.dvState.const_state) == get_material_id(b.dvState.const_state) && a.dvState.program == b.dvState.program;
+  };
+
+  drawcallRanges.push_back(PackedDrawCallsRange{0, 1});
+  bindlessStatesToUpdateTexLevels.emplace(multidrawList[0].dvState.const_state, TexStreamingContext::MAX_TEX_LEVEL);
+
+  for (uint32_t i = 1, ie = multidrawList.size(); i < ie; ++i)
+  {
+    const auto &currentRelem = multidrawList[i];
+    const bool mergeWithPrevious = mergeComparator(currentRelem, multidrawList[i - 1]);
+    if (mergeWithPrevious)
+      drawcallRanges.back().count++;
+    else
+      drawcallRanges.push_back(PackedDrawCallsRange{drawcallRanges.back().count + drawcallRanges.back().start, 1});
+    auto iter = bindlessStatesToUpdateTexLevels.find(currentRelem.dvState.const_state);
+    if (iter == bindlessStatesToUpdateTexLevels.end())
+      bindlessStatesToUpdateTexLevels.emplace(currentRelem.dvState.const_state, TexStreamingContext::MAX_TEX_LEVEL);
+  }
+}
+
+uint32_t ImpostorRenderer::render(dag::Span<const ShaderMesh::RElem> elems, uint32_t instance_count)
+{
+  TIME_PROFILE(render);
+  G_ASSERT_RETURN(instance_count > 0, 0); // zero would draw once non packed and nothing packed
+  uint32_t drawn = 0;
+
+  multidrawList.clear();
+  drawcallRanges.clear();
+  bindlessStatesToUpdateTexLevels.clear();
+
+  GlobalVertexData *vdata = nullptr;
+
+  for (unsigned int elemNo = 0; elemNo < elems.size(); elemNo++)
+  {
+    const ShaderMesh::RElem &elem = elems[elemNo];
+
+    if (!elem.e || elem.vertexData->isEmpty())
+      continue;
+
+    ShaderElement *s = static_cast<ShaderElement *>(elem.e);
+    shaders::CombinedDynVariantState dynVarState = get_dynamic_variant_states(s->native());
+    if (!is_valid(dynVarState))
+      continue;
+
+    if (is_packed_material(dynVarState.const_state))
+    {
+      multidrawList.push_back(Record{s, dynVarState, elem.vertexData, elem.si, elem.numf, elem.baseVertex});
+      continue;
+    }
+
+
+    if (elem.vertexData != vdata)
+    {
+      vdata = elem.vertexData;
+      vdata->setToDriver();
+    }
+
+    if (!elem.e->setStates(0, true))
+      continue;
+
+    const bool ok = instance_count > 1 ? d3d::drawind_instanced(PRIM_TRILIST, elem.si, elem.numf, elem.baseVertex, instance_count)
+                                       : elem.drawIndTriList();
+    d3d_err(ok);
+    if (ok) // a draw the driver rejected must not count as submitted
+      ++drawn;
+  }
+
+  if (!multidrawList.empty())
+  {
+    sort_packed_drawcalls();
+    coalesce_packed_drawcalls();
+
+    for (auto stateIdTexLevel : bindlessStatesToUpdateTexLevels)
+      update_bindless_state(stateIdTexLevel.first, stateIdTexLevel.second);
+
+    uint32_t packedDrawn = 0;
+    const auto multiDrawRenderer = multidrawContext.fillBuffers(multidrawList.size(),
+      [this, instance_count, &packedDrawn](uint32_t drawcallId, uint32_t &indexCountPerInstance, uint32_t &instanceCount,
+        uint32_t &startIndexLocation, int32_t &baseVertexLocation, uint32_t &perDrawData) {
+        const auto &currentRelem = multidrawList[drawcallId];
+        indexCountPerInstance = currentRelem.numf * 3;
+        instanceCount = instance_count;
+        startIndexLocation = currentRelem.si;
+        baseVertexLocation = currentRelem.bv;
+
+        const uint32_t materialOffset = get_material_offset(currentRelem.dvState.const_state);
+        if (DAGOR_UNLIKELY(materialOffset >= MAX_MATERIAL_OFFSET))
+        {
+          LOGERR_ONCE("Too big material offset %d.", materialOffset);
+          instanceCount = 0; // this drawcall submits nothing: it must not count as drawn
+        }
+        else
+          ++packedDrawn;
+        perDrawData = materialOffset;
+      });
+
+
+    if (multiDrawRenderer.valid()) // a failed fill submits nothing
+    {
+      drawn += packedDrawn;
+      for (const auto &dcParams : drawcallRanges)
+      {
+        auto &rli = multidrawList[dcParams.start];
+        set_states_for_variant(rli.curShader->native(), rli.dvState);
+
+        if (vdata != rli.vData)
+          (vdata = rli.vData)->setToDriver();
+
+        multiDrawRenderer.render(PRIM_TRILIST, dcParams.start, dcParams.count);
+      }
+    }
+  }
+  return drawn;
+}
 } // namespace rendinst::render
 
 static int impostorShadowXVarId = -1;
@@ -105,13 +252,6 @@ void initImpostorsGlobals()
   impostorShadowZVarId = ::get_shader_variable_id("impostor_shadow_z", true);
   impostorShadowVarId = ::get_shader_variable_id("impostor_shadow", true);
   worldViewPosVarId = ::get_shader_glob_var_id("world_view_pos");
-  {
-    d3d::SamplerInfo smpInfo;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
-    smpInfo.filter_mode = d3d::FilterMode::Compare;
-    smpInfo.mip_map_mode = d3d::MipMapMode::Point;
-    ShaderGlobal::set_sampler(get_shader_variable_id("impostor_shadow_samplerstate", true), d3d::request_sampler(smpInfo));
-  }
 
   const DataBlock *graphics = ::dgs_get_settings()->getBlockByNameEx("graphics");
   const bool compatibilityMode = ::dgs_get_settings()->getBlockByNameEx("video")->getBool("compatibilityMode", false);
@@ -177,6 +317,7 @@ void termImpostorsGlobals()
     rendinst::render::impostorColorTextureRTPool[i] = nullptr;
   }
   rendinst::render::impostorDepthTextures.clear();
+  rendinst::render::impostorRenderer.close();
 }
 
 static int get_impostor_max_tex_size(const DataBlock &graphics)
@@ -332,7 +473,7 @@ void RendInstGenData::RtData::initImpostors()
       pool.impostor.numColorTexMips = pool.impostor.renderMips;
       pool.impostor.tex[0].close();
 
-      pool.impostor.tex[0] = dag::create_tex(nullptr, rtSize, rtSizeY, texflagsColor, pool.impostor.renderMips, name);
+      pool.impostor.tex[0] = dag::create_tex(nullptr, rtSize, rtSizeY, texflagsColor, pool.impostor.renderMips, name, RESTAG_RENDINST);
       d3d_err(pool.impostor.tex[0].getBaseTex());
 
       // pure bilinear filtering of impostors gives ~1 msec gain on PS3
@@ -356,7 +497,8 @@ void RendInstGenData::RtData::initImpostors()
 
         pool.impostor.tex[i].close();
         const uint32_t fmt = rendinst::render::impostor_texformats[i];
-        pool.impostor.tex[i] = dag::create_tex(nullptr, rtSize, rtSizeY, texflags | fmt, pool.impostor.renderMips, name);
+        pool.impostor.tex[i] =
+          dag::create_tex(nullptr, rtSize, rtSizeY, texflags | fmt, pool.impostor.renderMips, name, RESTAG_RENDINST);
         d3d_err(pool.impostor.tex[i].getBaseTex());
         add_anisotropy_exception(pool.impostor.tex[i].getTexId());
       }
@@ -422,23 +564,19 @@ bool RendInstGenData::RtData::updateImpostorsPreshadow(int poolNo, const Point3 
   {
     // TODO use one global texture instead
     String name(100, "shadowImpostorTexture%d_%d", poolNo, layerIdx);
-    pool.shadowImpostorTexture =
-      d3d::create_tex(nullptr, IMPOSTOR_SHADOW_SIZE, IMPOSTOR_SHADOW_SIZE, TEXCF_RTARGET | TEXFMT_DEPTH16, 1, name.str());
-    //= d3d::create_tex(nullptr, IMPOSTOR_SHADOW_SIZE, IMPOSTOR_SHADOW_SIZE, TEXCF_RTARGET, 1, "shadowImpostorTexture");
+    pool.shadowImpostorTexture = d3d::create_tex(nullptr, IMPOSTOR_SHADOW_SIZE, IMPOSTOR_SHADOW_SIZE, TEXCF_RTARGET | TEXFMT_DEPTH16,
+      1, name.str(), RESTAG_RENDINST);
+    //= d3d::create_tex(nullptr, IMPOSTOR_SHADOW_SIZE, IMPOSTOR_SHADOW_SIZE, TEXCF_RTARGET, 1, "shadowImpostorTexture",
+    // RESTAG_RENDINST);
     d3d_err(pool.shadowImpostorTexture);
     pool.shadowImpostorTextureId = register_managed_tex(name.str(), pool.shadowImpostorTexture);
   }
   // d3d::set_render_target(0, (Texture*)rendinst::render::shadowImpostorTexture, 0, true);
   // d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER, 0, 1.f, 0);
-  d3d::set_render_target(0, (Texture *)nullptr, 0);
-  d3d::set_depth(pool.shadowImpostorTexture, DepthAccess::RW);
+  d3d::set_render_target({pool.shadowImpostorTexture, 0, 0}, DepthAccess::RW, {});
   d3d::clearview(CLEAR_ZBUFFER, 0, 1.f, 0);
   mat44f view;
   mat44f viewitm;
-
-#if _TARGET_C1 | _TARGET_C2
-
-#endif
 
   // vec4f eye = v_mul(sunDirV, v_splats(pool.sphereRadius));
   viewitm.col2 = sunDirV;
@@ -469,16 +607,16 @@ bool RendInstGenData::RtData::updateImpostorsPreshadow(int poolNo, const Point3 
   pool.shadowCol0 = Color4(shadowMatrix.m[0][0], shadowMatrix.m[1][0], shadowMatrix.m[2][0], shadowMatrix.m[3][0]);
   pool.shadowCol1 = Color4(shadowMatrix.m[0][1], shadowMatrix.m[1][1], shadowMatrix.m[2][1], shadowMatrix.m[3][1]);
   pool.shadowCol2 = Color4(shadowMatrix.m[0][2], shadowMatrix.m[1][2], shadowMatrix.m[2][2], shadowMatrix.m[3][2]);
-  ShaderGlobal::set_color4(impostorShadowXVarId, pool.shadowCol0);
-  ShaderGlobal::set_color4(impostorShadowYVarId, pool.shadowCol1);
-  ShaderGlobal::set_color4(impostorShadowZVarId, pool.shadowCol2);
+  ShaderGlobal::set_float4(impostorShadowXVarId, pool.shadowCol0);
+  ShaderGlobal::set_float4(impostorShadowYVarId, pool.shadowCol1);
+  ShaderGlobal::set_float4(impostorShadowZVarId, pool.shadowCol2);
 
 
   ShaderGlobal::set_int_fast(rendinst::render::rendinstRenderPassVarId,
     eastl::to_underlying(rendinst::RenderPass::ToShadow)); // rendinst_render_pass_impostor_color.
 
   pool.impostor.currentHalfWidth = pool.impostor.currentHalfHeight = 1;
-  ShaderGlobal::set_color4(worldViewPosVarId, Color4(0, 0, 0, 0));
+  ShaderGlobal::set_float4(worldViewPosVarId, Color4(0, 0, 0, 0));
 
   pool.setDynamicImpostorBoundingSphere(cb);
   cb.setOpacity(0.f, 1.f);
@@ -487,39 +625,17 @@ bool RendInstGenData::RtData::updateImpostorsPreshadow(int poolNo, const Point3 
   ShaderGlobal::setBlock(rendinst::render::globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
   ShaderGlobal::setBlock(rendinst::render::rendinstDepthSceneBlockId, ShaderGlobal::LAYER_SCENE);
 
-  cb.setInstancing(paletteOffset, 3, 0, 0);
+  cb.setInstancing(paletteOffset, 3, RI_CBUFFER_FLAGS__PER_DRAW_DATA_FROM_CONST_BUFFER, 0);
   rendinst::render::setCoordType(rendinst::render::COORD_TYPE_TM);
   cb.flushPerDraw();
   d3d::set_immediate_const(STAGE_VS, ZERO_PTR<uint32_t>(), 1);
   shaders::overrides::set(rendinst::render::impostorShadowOverride);
 
-
-  GlobalVertexData *currentVertexData = nullptr;
   RenderableInstanceResource *sourceScene = riResLodScene(poolNo, sourceLodNo);
   // RenderableInstanceResource *sourceScene = riResLodScene(poolNo, 0);
   ShaderMesh *mesh = sourceScene->getMesh()->getMesh()->getMesh();
   dag::Span<ShaderMesh::RElem> elems = mesh->getElems(mesh->STG_opaque, mesh->STG_atest);
-  for (unsigned int elemNo = 0; elemNo < elems.size(); elemNo++)
-  {
-    ShaderMesh::RElem &elem = elems[elemNo];
-
-    if (!elem.e)
-      continue;
-
-    if (elem.vertexData != currentVertexData)
-    {
-      currentVertexData = elem.vertexData;
-      currentVertexData->setToDriver();
-    }
-
-    if (!elem.e->setStates(0, true))
-      continue;
-
-    d3d_err(elem.drawIndTriList());
-#if _TARGET_C1 | _TARGET_C2
-
-#endif
-  }
+  rendinst::render::impostorRenderer.render(elems);
   shaders::overrides::reset();
 
   d3d::resource_barrier({pool.shadowImpostorTexture, RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
@@ -552,6 +668,30 @@ bool RendInstGenData::RtData::updateImpostorsPreshadow(int poolNo, const Point3 
   const rendinst::gen::RotationPaletteManager::Palette palette =
     rendinst::gen::get_rotation_palette_manager()->getPalette({layerIdx, poolNo});
 
+  struct PinWindStateToZero
+  {
+    float savedTime;
+    Color4 savedAmbientWind;
+    int ambientWindId;
+    PinWindStateToZero()
+    {
+      static int varId = -1;
+      if (varId < 0)
+        varId = ::get_shader_variable_id("ambient_wind__speed__current_time__previous_time", true);
+      ambientWindId = varId;
+      savedTime = get_shader_global_time();
+      savedAmbientWind = ShaderGlobal::get_float4(ambientWindId);
+      set_shader_global_time(0.0f);
+      ShaderGlobal::set_float4(ambientWindId, Color4(0, 0, 0, 0));
+    }
+    ~PinWindStateToZero()
+    {
+      set_shader_global_time(savedTime);
+      ShaderGlobal::set_float4(ambientWindId, savedAmbientWind);
+    }
+  } pinWindStateToZero;
+
+  get_impostor_texture_mgr()->buildRendinstElems();
   UniqueTex depthAtlas = get_impostor_texture_mgr()->renderDepthAtlasForShadow(riRes[poolNo]);
   G_ASSERT_RETURN(depthAtlas, false);
 
@@ -643,25 +783,29 @@ void renderImpostorMips(rendinst::render::RtPoolData &pool, int currentRenderMip
 
     impostorMipSRVBarrier(pool, src_mip);
 
+    RenderTarget rts[rendinst::render::IMP_COUNT] = {};
+    int rtCount = 0;
     for (int j = 0; j < pool.impostor.tex.size(); ++j)
     {
       UniqueTex &tex = pool.impostor.tex[j];
       BaseTexture *pTex = tex.getBaseTex();
       if (pTex)
       {
-        d3d::set_render_target(j, pTex, dst_mip);
+        rts[j] = {pTex, static_cast<uint32_t>(dst_mip), 0};
+        rtCount = j + 1;
         ShaderGlobal::set_texture(rendinst::render::sourceTexVarId[j], tex.getTexId());
         pTex->texmiplevel(src_mip, src_mip);
       }
     }
+    d3d::set_render_target({}, DepthAccess::RW, make_span_const(rts, rtCount));
 
     UniqueTex &tex = pool.impostor.tex[0];
     TextureInfo ti;
     tex.getBaseTex()->getinfo(ti, src_mip);
-    ShaderGlobal::set_color4(rendinst::render::texelSizeVarId, 1.f, 1.f, 1.f / ti.w, 1.f / ti.h);
+    ShaderGlobal::set_float4(rendinst::render::texelSizeVarId, 1.f, 1.f, 1.f / ti.w, 1.f / ti.h);
     ShaderGlobal::set_int(rendinst::render::texIndVid, -1);
 
-    d3d::clearview(CLEAR_DISCARD_TARGET, 0, 0.f, 0);
+    d3d::clearview(DISCARD_TARGET, 0, 0.f, 0);
     pFx->render();
   }
 
@@ -752,7 +896,10 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
     d3d::set_render_target(); // Remove other MRTs
     bool hasShadow = shadowDistance > range;
     // debug("impostor range = %g, original range =%g shadowD=%g", range, pool.lodRange[sourceLodNo], shadowDistance);
-    if ((hasShadow || res->isBakedImpostor()) && !pool.hasUpdatedShadowImpostor)
+    bool needsPreshadow = hasShadow || res->isBakedImpostor();
+    if (res->isBakedImpostor())
+      needsPreshadow &= res->getImpostorParams().preshadowEnabled;
+    if (needsPreshadow && !pool.hasUpdatedShadowImpostor)
       pool.hasUpdatedShadowImpostor = updateImpostorsPreshadow(poolNo, sunDir0);
 
     // Set new matrices.
@@ -798,8 +945,8 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
 
     if (res->isBakedImpostor())
     {
-      // if preshadow baking is failed, we need to try again next frame
-      if (!hasShadow || pool.hasUpdatedShadowImpostor)
+      // if preshadow baking was not skipped and has failed, we need to try again next frame
+      if (!needsPreshadow || !hasShadow || pool.hasUpdatedShadowImpostor)
         updatePoolNo++;
       break;
     }
@@ -853,19 +1000,18 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
     ShaderGlobal::set_int_fast(rendinst::render::rendinstRenderPassVarId,
       eastl::to_underlying(rendinst::RenderPass::ImpostorColor)); // rendinst_render_pass_impostor_color.
 
-    ShaderGlobal::set_color4(worldViewPosVarId, *(Color4 *)&cameraPos.x);
+    ShaderGlobal::set_float4(worldViewPosVarId, *(Color4 *)&cameraPos.x);
 
     if (hasShadow)
     {
       ShaderGlobal::set_texture(impostorShadowVarId, pool.shadowImpostorTextureId);
-      ShaderGlobal::set_color4(impostorShadowXVarId, pool.shadowCol0);
-      ShaderGlobal::set_color4(impostorShadowYVarId, pool.shadowCol1);
-      ShaderGlobal::set_color4(impostorShadowZVarId, pool.shadowCol2);
+      ShaderGlobal::set_float4(impostorShadowXVarId, pool.shadowCol0);
+      ShaderGlobal::set_float4(impostorShadowYVarId, pool.shadowCol1);
+      ShaderGlobal::set_float4(impostorShadowZVarId, pool.shadowCol2);
     }
 
     // required to be set before block, soopengl driver use correct axis flipping
-    d3d::set_render_target(pool.impostor.tex[0].getBaseTex(), 0);
-    d3d::set_depth(nullptr, DepthAccess::RW);
+    d3d::set_render_target({}, DepthAccess::RW, {{pool.impostor.tex[0].getBaseTex(), 0, 0}});
     ShaderGlobal::setBlock(rendinst::render::globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
     ShaderGlobal::setBlock(rendinst::render::rendinstSceneBlockId, ShaderGlobal::LAYER_SCENE);
 
@@ -873,7 +1019,7 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
     cb.setOpacity(0.f, 1.f);
     cb.setCrossDissolveRange(0);
 
-    cb.setInstancing(0, 3, 0, 0);
+    cb.setInstancing(0, 3, RI_CBUFFER_FLAGS__PER_DRAW_DATA_FROM_CONST_BUFFER, 0);
     rendinst::render::setCoordType(rendinst::render::COORD_TYPE_TM);
     cb.flushPerDraw();
 
@@ -911,15 +1057,12 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
           G_UNUSED(tinfo);
           G_ASSERT(tinfo.w == tinfo0.w && tinfo.h == tinfo0.h);
 
-          d3d::set_render_target(0, pTex, baseMip);
+          d3d::set_render_target({}, DepthAccess::RW, {{pTex, static_cast<uint32_t>(baseMip), 0}});
           d3d::clearview(CLEAR_TARGET, ::grs_draw_wire ? (E3DCOLOR)0xFF000000 : rendinst::render::impostor_clear_color[j], 1.f, 0);
         }
       }
       // reset index of mrt clear sequence to 0, to complete the mrt block
       d3d::driver_command(Drv3dCommand::BEGIN_MRT_CLEAR_SEQUENCE, ((uint8_t *)0));
-
-      // required to be set before block, soopengl driver use correct axis flipping
-      d3d::set_render_target(dstRT[0]->getBaseTex(), baseMip);
 
       auto depthTexIt = rendinst::render::impostorDepthTextures.find(IPoint2(tinfo0.w >> baseMip, tinfo0.h >> baseMip));
       if (depthTexIt == rendinst::render::impostorDepthTextures.end())
@@ -927,19 +1070,26 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
         depthTexIt =
           rendinst::render::impostorDepthTextures.emplace(IPoint2(tinfo0.w >> baseMip, tinfo0.h >> baseMip), UniqueTex()).first;
         String name(0, "impostorDepth%dx%d", tinfo0.w >> baseMip, tinfo0.h >> baseMip);
-        depthTexIt->second =
-          dag::create_tex(nullptr, tinfo0.w >> baseMip, tinfo0.h >> baseMip, TEXCF_RTARGET | TEXFMT_DEPTH16, 1, name.str());
+        depthTexIt->second = dag::create_tex(nullptr, tinfo0.w >> baseMip, tinfo0.h >> baseMip, TEXCF_RTARGET | TEXFMT_DEPTH16, 1,
+          name.str(), RESTAG_RENDINST);
       }
-      d3d::set_depth(depthTexIt->second.getTex2D(), d3d::get_driver_code().is(d3d::metal) ? DepthAccess::SampledRO : DepthAccess::RW);
+      // required to be set before block, soopengl driver use correct axis flipping
+      eastl::array<RenderTarget, Driver3dRenderTarget::MAX_SIMRT> impostorRts = {};
+      impostorRts[0] = {dstRT[0]->getBaseTex(), uint32_t(baseMip), 0};
+      uint32_t impostorRtCount = 1;
+      for (int j = 1; j < pool.impostor.tex.size(); ++j)
+        if (dstRT[j]->getBaseTex())
+        {
+          impostorRts[j] = {dstRT[j]->getBaseTex(), uint32_t(baseMip), 0};
+          impostorRtCount = j + 1;
+        }
+      d3d::set_render_target({depthTexIt->second.getTex2D(), 0, 0},
+        d3d::get_driver_code().is(d3d::metal) ? DepthAccess::SampledRO : DepthAccess::RW,
+        make_span_const(impostorRts.data(), impostorRtCount));
 
       unsigned impostor_clear_color = (::grs_draw_wire ? 0xFF000000 : 0) | rendinst::render::impostor_clear_color[0];
       if (d3d::get_driver_code().is(!d3d::metal)) // clear color/depth for non-METAL here or it is not cleared at all!
         d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER, impostor_clear_color, 0.f, 0);
-      for (int j = 1; j < pool.impostor.tex.size(); ++j)
-        if (dstRT[j]->getBaseTex())
-        {
-          d3d::set_render_target(j, dstRT[j]->getBaseTex(), baseMip);
-        }
 
       // Do not split renderpass into 2 passes by doing clear before set_render_target
       // The cleared depth is not preserved between them!
@@ -947,9 +1097,6 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
         d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER, impostor_clear_color, 0.f, 0);
       // mrt clear sequence complete, continue as normal
       d3d::driver_command(Drv3dCommand::END_MRT_CLEAR_SEQUENCE, (uint8_t *)1);
-#if _TARGET_C1 | _TARGET_C2
-
-#endif
 
       // set viewport
       float viewportPartX = 1.f, viewportPartY = 1.f;
@@ -973,30 +1120,9 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
       }
 
       // draw geometry to baseMip of texture
-      GlobalVertexData *currentVertexData = nullptr;
       ShaderMesh *mesh = sourceScene->getMesh()->getMesh()->getMesh();
       dag::Span<ShaderMesh::RElem> elems = mesh->getElems(mesh->STG_opaque, mesh->STG_decal);
-      for (unsigned int elemNo = 0; elemNo < elems.size(); elemNo++)
-      {
-        ShaderMesh::RElem &elem = elems[elemNo];
-
-        if (!elem.e)
-          continue;
-
-        if (elem.vertexData != currentVertexData)
-        {
-          currentVertexData = elem.vertexData;
-          currentVertexData->setToDriver();
-        }
-
-        if (!elem.e->setStates(0, true))
-          continue;
-
-        d3d_err(elem.drawIndTriList());
-#if _TARGET_C1 | _TARGET_C2
-
-#endif
-      }
+      rendinst::render::impostorRenderer.render(elems);
 
       for (int j = 0; j < pool.impostor.tex.size(); ++j)
       {
@@ -1015,20 +1141,24 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
       {
         static int maxTranslucancyVarId = ::get_shader_variable_id("rendinst_max_translucancy");
 
+        RenderTarget rts[rendinst::render::IMP_COUNT] = {};
+        int rtCount = 0;
         for (int j = 0; j < pool.impostor.tex.size(); ++j)
         {
           UniqueTex &tex = pool.impostor.tex[j];
           BaseTexture *pTex = tex.getBaseTex();
           if (pTex)
           {
-            d3d::set_render_target(j, pTex, pool.impostor.baseMip);
+            rts[j] = {pTex, static_cast<uint32_t>(pool.impostor.baseMip), 0};
+            rtCount = j + 1;
             ShaderGlobal::set_texture(rendinst::render::sourceTexVarId[j], tempTargetPtrs[j]->getTexId());
             ShaderGlobal::set_sampler(rendinst::render::sourceTexSmpVarId[j], rendinst::render::smp);
           }
         }
+        d3d::set_render_target({}, DepthAccess::RW, make_span_const(rts, rtCount));
         TextureInfo ti;
         tempTargetPtrs[0]->getBaseTex()->getinfo(ti, 0);
-        ShaderGlobal::set_color4(rendinst::render::texelSizeVarId, viewportPartX, viewportPartY, 1.f / ti.w, 1.f / ti.h);
+        ShaderGlobal::set_float4(rendinst::render::texelSizeVarId, viewportPartX, viewportPartY, 1.f / ti.w, 1.f / ti.h);
         ShaderGlobal::set_int(maxTranslucancyVarId, 0);
         ShaderGlobal::set_int(rendinst::render::texIndVid, -1);
 
@@ -1071,7 +1201,7 @@ void RendInstGenData::RtData::updateImpostors(float shadowDistance, const Point3
     return; // nothing has been rendered
   ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_SCENE);
 
-  ShaderGlobal::set_color4(worldViewPosVarId, Color4(view_itm.getcol(3).x, view_itm.getcol(3).y, view_itm.getcol(3).z, 1));
+  ShaderGlobal::set_float4(worldViewPosVarId, Color4(view_itm.getcol(3).x, view_itm.getcol(3).y, view_itm.getcol(3).z, 1));
 
   ShaderGlobal::set_int_fast(rendinst::render::rendinstRenderPassVarId,
     eastl::to_underlying(rendinst::RenderPass::Normal)); // rendinst_render_pass_normal.
@@ -1090,6 +1220,39 @@ void rendinst::resetRiGenImpostors()
     ScopedLockRead lock(rgl->rtData->riRwCs);
     rgl->rtData->dynamicImpostorToUpdateNo = 0;
   }
+  if (ImpostorTextureManager *mgr = get_impostor_texture_mgr())
+    mgr->afterDeviceReset();
+}
+
+bool rendinst::render::areImpostorsUpToDate()
+{
+  if (!RendInstGenData::renderResRequired || RendInstGenData::isLoading)
+    return false;
+  if (rendinst::render::impostorPreshadowNeedUpdate)
+    return false;
+  if (rendinst::render::dynamic_impostor_texture_const_no < 0)
+    return true;
+  FOR_EACH_RG_LAYER_DO (rgl)
+  {
+    if (!rgl->rtData)
+      continue;
+    ScopedLockRead lock(rgl->rtData->riRwCs);
+    if (rgl->rtData->dynamicImpostorToUpdateNo < rgl->rtData->rtPoolData.size())
+      return false;
+  }
+  return true;
+}
+
+static void log_impostors_convergence()
+{
+  static const bool enabled = ::dgs_get_settings()->getBlockByNameEx("debug")->getBool("logRenderConvergence", false);
+  if (!enabled)
+    return;
+  static bool logged = false;
+  const bool upToDate = rendinst::render::areImpostorsUpToDate();
+  if (upToDate && !logged)
+    debug("[convergence] impostors");
+  logged = upToDate;
 }
 
 void rendinst::updateRIGenImpostors(float shadowDistance, const Point3 &sunDir0, const TMatrix &view_itm, const mat44f &proj_tm)
@@ -1108,6 +1271,7 @@ void rendinst::updateRIGenImpostors(float shadowDistance, const Point3 &sunDir0,
 
   FOR_EACH_RG_LAYER_DO (rgl)
   {
+    d3d::GpuAutoLock gpuLock;
     ScopedLockRead lock(rgl->rtData->riRwCs);
     float shadowDistOfs = (rendinst::render::per_instance_visibility ? 0 : (0.5f * rgl->grid2world * rgl->cellSz * subCellDistMul));
 
@@ -1124,4 +1288,5 @@ void rendinst::updateRIGenImpostors(float shadowDistance, const Point3 &sunDir0,
   }
 
   rendinst::render::impostorPreshadowNeedUpdate = false;
+  log_impostors_convergence();
 }

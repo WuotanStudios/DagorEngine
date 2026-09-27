@@ -19,15 +19,9 @@ public:
     lim[0] = lim0;
     lim[1] = lim1;
   }
-  IBBox2() { setEmpty(); }
+  constexpr IBBox2() : lim{IPoint2(INT_MAX, INT_MAX), IPoint2(INT_MIN, INT_MIN)} {}
 
-  void setEmpty()
-  {
-    lim[0].x = INT_MAX;
-    lim[0].y = INT_MAX;
-    lim[1].x = INT_MIN;
-    lim[1].y = INT_MIN;
-  }
+  constexpr void setEmpty() { *this = IBBox2(); }
 
   bool isEmpty() const { return lim[0].x > lim[1].x || lim[0].y > lim[1].y; }
 
@@ -200,3 +194,5 @@ inline unsigned sq_distance_ipoint_to_ibox2(const IPoint2 &p, const IBBox2 &box)
     return squared_int(p.y - box[1].y);
   return 0; // inside
 }
+
+inline IBBox2 get_intersection(const IBBox2 &left, const IBBox2 &right) { return {max(left[0], right[0]), min(left[1], right[1])}; }

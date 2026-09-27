@@ -9,20 +9,32 @@
 #include <drv/3d/dag_tex3d.h>
 #include <memory/dag_framemem.h>
 #include <EASTL/vector_map.h>
+#include <math/integer/dag_IPoint2.h>
 
 namespace denoiser
 {
+
+struct DynamicResolutionParams
+{
+  IPoint2 res = IPoint2::ONE;
+  IPoint2 prevRes = IPoint2::ONE;
+  IPoint2 halfRes = IPoint2::ONE;
+  IPoint2 prevHalfRes = IPoint2::ONE;
+  bool usingViewport = false;
+};
 
 struct Config
 {
   int width = 0;
   int height = 0;
   bool useRayReconstruction = false;
-  void init(int w, int h, bool use_rr)
+  bool ptgiUseRayReconstruction = true;
+  void init(int w, int h, bool use_rr, bool ptgi_use_rr)
   {
     width = w;
     height = h;
     useRayReconstruction = use_rr;
+    ptgiUseRayReconstruction = ptgi_use_rr;
   }
   struct RTRSM
   {
@@ -91,7 +103,7 @@ struct Config
   } ptgi;
   void initPTGI(bool is_half_res)
   {
-    if (useRayReconstruction)
+    if (ptgiUseRayReconstruction)
     {
       G_ASSERT(is_half_res == false);
       ptgi.width = width;
@@ -107,10 +119,12 @@ struct Config
   }
   void closePTGI() { ptgi = {}; }
   void closeAll() { *this = {}; }
+  // Updated every frame in denoiser::prepare
+  DynamicResolutionParams dynRes;
 };
 extern Config resolution_config;
 
-using TexMap = eastl::vector_map<const char *, TextureIDPair, eastl::less<const char *>, framemem_allocator>;
+using TexMap = eastl::vector_map<const char *, Texture *, eastl::less<const char *>, framemem_allocator>;
 using TexInfoMap = eastl::vector_map<const char *, TextureInfo, eastl::less<const char *>, framemem_allocator>;
 
 struct FrameParams
@@ -127,6 +141,9 @@ struct FrameParams
   Point2 prevJitter = Point2::ZERO;
   Point3 motionMultiplier = Point3::ZERO;
   bool reset = false;
+  eastl::optional<DynamicResolutionParams> dynRes;
+  // Anything closer than this to the camera is marked camera attached
+  float denoiserCameraAttachedRadius = 0;
 
   TexMap textures;
 };
@@ -138,15 +155,17 @@ enum class ReflectionMethod
 };
 
 bool is_available();
-void initialize(int width, int height, bool use_ray_reconstruction);
+void initialize(int width, int height, bool use_ray_reconstruction, bool ptgi_use_ray_reconstruction);
 void teardown();
 
 bool is_ray_reconstruction_enabled();
+bool is_ptgi_ray_reconstruction_enabled();
 
 void prepare(const FrameParams &params);
 
 // The RT system is working with the pointer values, not the string contents!
-void get_required_persistent_texture_descriptors(TexInfoMap &persistent_textures, bool need_half_res);
+void get_required_persistent_texture_descriptors(TexInfoMap &persistent_textures, bool need_half_res_close_set,
+  bool need_checkerboard_set, bool need_smart_depth_set);
 
 void get_required_persistent_texture_descriptors_for_ao(TexInfoMap &persistent_textures);
 void get_required_transient_texture_descriptors_for_ao(TexInfoMap &transient_textures);
@@ -162,11 +181,15 @@ void get_required_transient_texture_descriptors_for_gi(TexInfoMap &transient_tex
 
 struct TextureNames
 {
-#define ENUM_PERSISTENT_NAMES          \
-  NAME(denoiser_normal_roughness)      \
-  NAME(denoiser_view_z)                \
-  NAME(denoiser_half_normal_roughness) \
-  NAME(denoiser_half_view_z)
+#define ENUM_PERSISTENT_NAMES              \
+  NAME(denoiser_normal_roughness)          \
+  NAME(denoiser_view_z)                    \
+  NAME(denoiser_half_normal_roughness)     \
+  NAME(denoiser_half_view_z)               \
+  NAME(denoiser_half_normal_roughness_rtr) \
+  NAME(denoiser_half_view_z_rtr)           \
+  NAME(denoiser_half_motion_vectors_rtr)   \
+  NAME(half_selected_depth_rtr)
 
 #define NAME(name) static const char *name;
   ENUM_PERSISTENT_NAMES
@@ -235,6 +258,7 @@ struct AODenoiser
   NAME(ao_prev_view_z)                    \
   NAME(ao_prev_normal_roughness)          \
   NAME(ao_prev_internal_data)             \
+  NAME(ao_diff_history)                   \
   NAME(ao_diff_fast_history)
 #define ENUM_AO_DENOISED_TRANSIENT_NAMES \
   NAME(ao_tiles)                         \
@@ -258,6 +282,7 @@ struct GIDenoiser
   Point4 hitDistParams = Point4::ZERO;
   Point2 antilagSettings = Point2(4, 3);
   int maxStabilizedFrameNum = MAX_HISTORY_FRAME_NUM;
+  bool antiFirefly = false;
   bool performanceMode = true;
   bool checkerboard = true;
   bool halfResolution = true;
@@ -286,6 +311,7 @@ struct GIDenoiser
 #define NAME(name) static const char *name;
     ENUM_GI_DENOISED_NAMES
 #undef NAME
+    static const char *gi_validation;
   };
 };
 
@@ -300,9 +326,10 @@ struct ReflectionDenoiser
   int maxStabilizedFrameNum = 31;
   int maxFastStabilizedFrameNum = 6;
   bool halfResolution = false;
-  bool antiFirefly = false;
+  bool antiFirefly = true;
   bool performanceMode = true;
   bool checkerboard = true;
+  bool useSmartDepth = false;
   TexMap textures;
 
 #define ENUM_RTR_DENOISED_REBLUR_PERSISTENT_NAMES \
@@ -361,42 +388,48 @@ struct ReflectionDenoiser
   };
 };
 
+void set_shadow_maps_bindless(Texture *csm_texture, d3d::SamplerHandle csm_sampler, Texture *vsm_texture,
+  d3d::SamplerHandle vsm_sampler);
+void set_shadow_output_bindless(Texture *shadow_texture, bool translucent = false);
 void denoise_shadow(const ShadowDenoiser &params);
 void denoise_ao(const AODenoiser &params);
 void denoise_gi(const GIDenoiser &params);
 void denoise_reflection(const ReflectionDenoiser &params);
+void denoise_reflection_noop(const ReflectionDenoiser &params);
 
 int get_frame_number();
 
 } // namespace denoiser
 
-#define ACQUIRE_DENOISER_TEXTURE(p, name)                                                          \
-  Texture *name = nullptr;                                                                         \
-  TEXTUREID name##_id = BAD_TEXTUREID;                                                             \
-  {                                                                                                \
-    auto name##Iter = p.textures.find(eastl::remove_reference_t<decltype(p)>::TextureNames::name); \
-    if (name##Iter == p.textures.end())                                                            \
-    {                                                                                              \
-      G_ASSERT(false);                                                                             \
-      return;                                                                                      \
-    }                                                                                              \
-    name = name##Iter->second.getTex2D();                                                          \
-    name##_id = name##Iter->second.getId();                                                        \
-  }                                                                                                \
-  if (!name)                                                                                       \
-  {                                                                                                \
-    G_ASSERT(false);                                                                               \
-    return;                                                                                        \
+#define DENOISER_TEX_NAMES(params_type)   eastl::remove_reference_t<params_type>::TextureNames
+#define DENOISER_PARAMS_TEX_NAMES(params) DENOISER_TEX_NAMES(decltype(params))
+
+#define ACQUIRE_DENOISER_TEXTURE_BASE(texture_names, textures, name, return_val) \
+  Texture *name = nullptr;                                                       \
+  {                                                                              \
+    auto name##Iter = textures.find(texture_names::name);                        \
+    if (name##Iter == textures.end())                                            \
+    {                                                                            \
+      G_ASSERT(false);                                                           \
+      return return_val;                                                         \
+    }                                                                            \
+    name = name##Iter->second;                                                   \
+  }                                                                              \
+  if (!name)                                                                     \
+  {                                                                              \
+    G_ASSERT(false);                                                             \
+    return return_val;                                                           \
   }
+
+#define ACQUIRE_DENOISER_TEXTURE(p, name, return_value) \
+  ACQUIRE_DENOISER_TEXTURE_BASE(DENOISER_PARAMS_TEX_NAMES(p), p.textures, name, return_value)
 
 #define ACQUIRE_OPTIONAL_DENOISER_TEXTURE(p, name)                                                 \
   Texture *name = nullptr;                                                                         \
-  TEXTUREID name##_id = BAD_TEXTUREID;                                                             \
   {                                                                                                \
     auto name##Iter = p.textures.find(eastl::remove_reference_t<decltype(p)>::TextureNames::name); \
     if (name##Iter != p.textures.end())                                                            \
     {                                                                                              \
-      name = name##Iter->second.getTex2D();                                                        \
-      name##_id = name##Iter->second.getId();                                                      \
+      name = name##Iter->second;                                                                   \
     }                                                                                              \
   }

@@ -5,14 +5,23 @@
 #pragma once
 
 #include <propPanel/control/propertyControlBase.h>
+#include <propPanel/constants.h>
 
 namespace PropPanel
 {
 
 class ICustomControl;
+class IDragSourceHandler;
+class IDropTargetHandler;
 class ISetControlParams;
 class ITreeControlEventHandler;
 class PropPanelScheme;
+class ITreeDragHandler;
+class ITreeDropHandler;
+class IListDragHandler;
+class IListDropHandler;
+class ITreeRenderEx;
+class ITreeFilter;
 
 class ContainerPropertyControl : public PropertyControlBase
 {
@@ -24,24 +33,39 @@ public:
   // Creates
 
   virtual ContainerPropertyControl *createContainer(int id, bool new_line = true, hdpi::Px interval = hdpi::Px::ZERO);
-  virtual ContainerPropertyControl *createExtensible(int id, bool new_line = true);
-  virtual ContainerPropertyControl *createExtGroup(int id, const char caption[]);
+  virtual ContainerPropertyControl *createExtensible(int id, bool new_line = true, const char *menu_button_icon = nullptr,
+    const char *menu_button_tooltip = nullptr, const char *menu_button_label = "...");
+  virtual ContainerPropertyControl *createExtGroup(int id, const char caption[], const char *menu_button_icon = nullptr,
+    const char *menu_button_tooltip = nullptr);
   virtual ContainerPropertyControl *createGroup(int id, const char caption[]);
   virtual ContainerPropertyControl *createGroupHorzFlow(int id, const char caption[]);
   virtual ContainerPropertyControl *createGroupBox(int id, const char caption[]);
   virtual ContainerPropertyControl *createRadioGroup(int id, const char caption[], bool new_line = true);
+  virtual ContainerPropertyControl *createHorizontalSplitter(int id);
+  virtual ContainerPropertyControl *createVerticalSplitter(int id);
   virtual ContainerPropertyControl *createTabPanel(int id, const char caption[]);
   virtual ContainerPropertyControl *createTabPage(int id, const char caption[]);
-  virtual ContainerPropertyControl *createToolbarPanel(int id, const char caption[], bool new_line = true);
+  virtual ContainerPropertyControl *createToolbarPanel(int id = 0, bool use_tight_button_placement = false, bool new_line = true,
+    int toolbar_control_width = Constants::TOOLBAR_DEFAULT_CONTROL_WIDTH);
   virtual ContainerPropertyControl *createTree(int id, const char caption[], hdpi::Px height, bool new_line = true);
   virtual ContainerPropertyControl *createTreeCheckbox(int id, const char caption[], hdpi::Px height, bool new_line = true,
     bool icons_show = true);
   virtual ContainerPropertyControl *createMultiSelectTree(int id, const char caption[], hdpi::Px height, bool new_line = true);
   virtual ContainerPropertyControl *createMultiSelectTreeCheckbox(int id, const char caption[], hdpi::Px height, bool new_line = true);
 
-  virtual void createStatic(int id, const char caption[], bool new_line = true);
+  // wrap_width_in_chars: the parameter is only used if word_wrap is set.
+  //   If this parameter's value <= 0 then the text will be wrapped at the window's right edge.
+  //   If this parameter's value > 0 then the value behaves like CSS's "ch" unit. 1ch means the width of the '0' character
+  //   in the current font and font size. The text will be wrapped at (wrap_width_in_chars * the width of '0') pixels or
+  //   at the window's right edge if the requested width would go beyond that.
+  virtual void createStatic(int id, const char caption[], bool new_line = true, bool use_text_width = false, bool word_wrap = false,
+    bool monospace = false, int wrap_width_in_chars = 0);
+
+  // You can also use Constants::EDITBOX_MULTILINE_8_LINES_HEIGHT and Constants::EDITBOX_MULTILINE_FULL_HEIGHT for height.
   virtual void createEditBox(int id, const char caption[], const char text[] = "", bool enabled = true, bool new_line = true,
-    bool multiline = false, hdpi::Px multi_line_height = hdpi::_pxScaled(40));
+    bool multiline = false, hdpi::Px multi_line_height = Constants::EDITBOX_MULTILINE_DEFAULT_HEIGHT, bool auto_height = false);
+
+  virtual void createSearchEditBox(int id, const char caption[], const char text[] = "", bool enabled = true, bool new_line = true);
   virtual void createFileEditBox(int id, const char caption[], const char file[] = "", bool enabled = true, bool new_line = true);
   virtual void createFileButton(int id, const char caption[], const char file[] = "", bool enabled = true, bool new_line = true);
   virtual void createTargetButton(int id, const char caption[], const char text[] = "", bool enabled = true, bool new_line = true);
@@ -75,10 +99,14 @@ public:
   virtual void createMultiSelectList(int id, const Tab<String> &vals, hdpi::Px height, bool enabled = true, bool new_line = true);
 
   virtual void createRadio(int id, const char caption[], bool enabled = true, bool new_line = true);
+  // use_modal_color_selector: if false then the color selector will be modeless and onChange events will be sent
+  //   instantly on every change
   virtual void createColorBox(int id, const char caption[], E3DCOLOR value = E3DCOLOR(0, 0, 0, 255), bool enabled = true,
-    bool new_line = true);
+    bool new_line = true, bool use_modal_color_selector = true);
+  // width: by default the color button width is getDefaultRightSideEditWidth() if there is a caption, otherwise it takes all the
+  //   available space. Constants::SIMPLE_COLOR_BUTTON_FRAME_SIZE can also be used.
   virtual void createSimpleColor(int id, const char caption[], E3DCOLOR value = E3DCOLOR(0, 0, 0, 255), bool enabled = true,
-    bool new_line = true);
+    bool new_line = true, hdpi::Px width = hdpi::Px::ZERO);
   virtual void createPoint2(int id, const char caption[], Point2 value = Point2(0, 0), int prec = 2, bool enabled = true,
     bool new_line = true);
   virtual void createPoint3(int id, const char caption[], Point3 value = Point3(0, 0, 0), int prec = 2, bool enabled = true,
@@ -96,6 +124,7 @@ public:
   virtual void createTwoColorIndicator(int id, const char caption[], hdpi::Px height = hdpi::Px::ZERO, bool enabled = true,
     bool new_line = true);
   virtual void createPaletteCell(int id, const char caption[], bool enabled = true, bool new_line = true);
+  virtual void createStaticWithIcon(int id, const char caption[], bool new_line = true, bool word_wrap = false);
   virtual PropertyControlBase *createPlaceholder(int id, hdpi::Px height, bool new_line = true);
   virtual void createCustomControlHolder(int id, ICustomControl *control, bool new_line = true);
   virtual TLeafHandle createTreeLeaf(TLeafHandle parent, const char caption[], const char image[]);
@@ -103,6 +132,8 @@ public:
   virtual void createIndirect(DataBlock &dataBlock, ISetControlParams &controlParams);
 
   virtual PropPanelScheme *createSceme();
+
+  virtual void addControl(PropertyControlBase *pcontrol, bool new_line = true);
 
   // Sets
   virtual void setEnabledById(int id, bool enabled);
@@ -124,7 +155,12 @@ public:
   virtual void setTextGradient(int id, const TextGradient &source);
   virtual void setControlPoints(int id, Tab<Point2> &points);
 
+  // Sets the test automation name of the child control identified by id. See PropertyControlBase::setAutomationName().
+  virtual void setControlAutomationName(int id, const char automation_name[]);
+
   virtual void setTooltipId(int id, const char text[]);
+  virtual void setShowTooltipAlwaysById(int id, bool show);
+  virtual void setDefaultValueById(int id, Variant var);
 
   // for indirect fill
 
@@ -135,6 +171,11 @@ public:
   virtual void setCaption(int id, const char value[]);
   virtual void setButtonPictures(int id, const char *fname = NULL);
   virtual void setListBoxEventHandler(int id, IListBoxControlEventHandler *handler);
+  virtual void setListDragHandler(int id, IListDragHandler *handler);
+  virtual void setListDropHandler(int id, IListDropHandler *handler);
+  virtual void setDragSourceHandlerById(int id, IDragSourceHandler *handler);
+  virtual void setDropTargetHandlerById(int id, IDropTargetHandler *handler);
+  virtual void setValueHighlightById(int id, ColorOverride::ColorIndex color);
 
   // change strings in list
   virtual int addString(int id, const char *value);
@@ -209,6 +250,10 @@ public:
   virtual bool removeById(int id);
   virtual bool moveById(int id, int ba_id = -1, bool after = false);
 
+  // SplitterPropertyControl
+  virtual void setSplitRatios([[maybe_unused]] dag::ConstSpan<float> ratios) {}
+  virtual dag::ConstSpan<float> getSplitRatios() const { return {}; }
+
   // tree leaf handling
   virtual void setCaption(TLeafHandle leaf, const char value[])
   {
@@ -223,6 +268,12 @@ public:
   }
 
   virtual int getChildCount(TLeafHandle leaf) const
+  {
+    G_UNUSED(leaf);
+    return 0;
+  }
+
+  virtual int getChildCountFiltered(TLeafHandle leaf) const
   {
     G_UNUSED(leaf);
     return 0;
@@ -277,18 +328,6 @@ public:
   {
     G_UNUSED(leaf);
     G_UNUSED(value);
-  }
-
-  virtual void setBool(TLeafHandle leaf, bool open)
-  {
-    G_UNUSED(leaf);
-    G_UNUSED(open);
-  }
-
-  virtual bool getBool(TLeafHandle leaf) const
-  {
-    G_UNUSED(leaf);
-    return false;
   }
 
   virtual void setUserData(TLeafHandle leaf, const void *value)
@@ -356,25 +395,80 @@ public:
     G_UNUSED(fname);
   }
 
+  virtual void setNewParent(TLeafHandle leaf, TLeafHandle new_parent_leaf)
+  {
+    G_UNUSED(leaf);
+    G_UNUSED(new_parent_leaf);
+  }
+
+  virtual int getChildIndex(TLeafHandle leaf) const
+  {
+    G_UNUSED(leaf);
+    return -1;
+  }
+
+  virtual void setChildIndex(TLeafHandle leaf, int idx)
+  {
+    G_UNUSED(leaf);
+    G_UNUSED(idx);
+  }
+
   // for multi select tree
-  virtual void getSelectedLeafs(dag::Vector<TLeafHandle> &leafs) const { G_UNUSED(leafs); }
+  virtual void getSelectedLeafs([[maybe_unused]] dag::Vector<TLeafHandle> &leafs, [[maybe_unused]] bool search_in_collapsed,
+    [[maybe_unused]] bool include_filtered_out) const
+  {
+    G_UNUSED(leafs);
+  }
+
+  virtual void setExpanded([[maybe_unused]] TLeafHandle leaf, [[maybe_unused]] bool val) {}
+  virtual void setExpandedRecursively([[maybe_unused]] TLeafHandle leaf, [[maybe_unused]] bool val) {}
+  virtual bool isExpanded([[maybe_unused]] TLeafHandle leaf) const { return false; }
+  virtual bool isFilteredIn([[maybe_unused]] TLeafHandle leaf) const { return false; }
+
+  virtual void setTreeRenderEx(ITreeRenderEx *interface) { G_UNUSED(interface); }
 
   virtual void enableResizeCallback() {}
   virtual void disableResizeCallback() {}
 
   // When there are more than one control on a line then the available space is distributed evenly among them by default.
   // After calling setUseFixedWidthColumns the width of the controls is used instead.
-  virtual void setUseFixedWidthColumns() { useFixedWidthColumns = true; }
+  virtual void setUseFixedWidthColumns(bool stretch_zero_width_columns = false)
+  {
+    useFixedWidthColumns = true;
+    stretchZeroWidthColumns = stretch_zero_width_columns;
+  }
+
+  void setUseFixedWidthColumnsWithZeroWidthStretch() { setUseFixedWidthColumns(true); }
 
   virtual void setHorizontalSpaceBetweenControls(hdpi::Px space);
 
   virtual void setAlignRightFromChild(int index) { alignRightFromChild = index; }
   virtual int getAlignRightFromChild() { return alignRightFromChild; }
 
+  int getVerticalSpaceBetweenControls() const { return verticalSpaceBetweenControls; }
+
+  virtual void setTreeDragHandler([[maybe_unused]] ITreeDragHandler *handler) {}
+  virtual void setTreeDragDropFlags([[maybe_unused]] ImGuiDragDropFlags flags) {}
+  virtual void setTreeDropHandler([[maybe_unused]] ITreeDropHandler *handler) {}
   virtual void setTreeEventHandler([[maybe_unused]] ITreeControlEventHandler *event_handler) {}
   virtual void setTreeCheckboxIcons([[maybe_unused]] const char *checked, [[maybe_unused]] const char *unchecked) {}
+  virtual void setTreeFilter([[maybe_unused]] ITreeFilter *filter) {}
+  virtual void setTreeMessage([[maybe_unused]] const char *message) {}
+  virtual void filterTree() {}
+
+  virtual IDropTargetHandler *getDropTargetHandler() const { return dropTargetHandler; }
+  virtual void setDropTargetHandler(IDropTargetHandler *drop_target_handler);
+
+  bool isDefaultValueSet() const override;
+  void applyDefaultValue() override;
 
   void updateImgui() override;
+
+  // Aggregates the children's getPreferredSize().
+  // Controls sharing a line (see the new_line parameter of the various create functions) contribute their widths side
+  // by side, lines stack vertically.
+  // A child that returns (0, 0) contributes nothing, so the result is a best-effort minimum, not an exact size.
+  Point2 getPreferredSize(float max_width_px) const override;
 
 protected:
   virtual void resizeControl(unsigned w, unsigned h)
@@ -383,7 +477,6 @@ protected:
     G_UNUSED(h);
   }
 
-  virtual void addControl(PropertyControlBase *pcontrol, bool new_line = true);
   virtual void onControlAdd(PropertyControlBase *control) { G_UNUSED(control); } // for container resize or add scroll
 
   virtual int getNextControlX(bool new_line = true);
@@ -397,6 +490,10 @@ protected:
   // children (for example the spacing between pop-up menu items).
   void addVerticalSpaceAfterControl();
 
+  void handleDragAndDropForControl(PropertyControlBase &control);
+
+  void setAutomationNameFromCaption(PropertyControlBase *control, const char caption[]);
+
   Tab<PropertyControlBase *> mControlArray;
   Tab<bool> mControlsNewLine;
   Tab<ImVec2> mControlsLastRectSize;
@@ -406,11 +503,14 @@ private:
 
   int verticalSpaceBetweenControls;
   bool useFixedWidthColumns = false;
+  bool stretchZeroWidthColumns = false;
 
   bool useCustomHorizontalSpacing = false;
   float horizontalSpaceBetweenControls = 0.0f;
 
   int alignRightFromChild = -1;
+
+  IDropTargetHandler *dropTargetHandler = nullptr;
 };
 
 // iterate all tree leaves recursively (using children), root is usually nullptr and not iterated

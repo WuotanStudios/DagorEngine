@@ -1,3 +1,4 @@
+#include "daScript/misc/das_common.h"
 #include "daScript/misc/platform.h"
 #include "daScript/misc/performance_time.h"
 
@@ -5,19 +6,21 @@
 #include "daScript/ast/ast_serializer.h"
 #include "daScript/ast/ast_handle.h"
 #include "daScript/ast/ast.h"
+#include "daScript/ast/ast_visitor.h"
 #include <cstdarg>
 #include <stdexcept>
+#include <type_traits>
 
 namespace das {
 
     AstSerializer::AstSerializer ( SerializationStorage * storage, bool isWriting ) {
-        astModule = Module::require("ast");
-        astModule->handleTypes.foreach([&](const AnnotationPtr & annotation) {
+        astModule = Module::require("ast_core");
+        for ( auto & [key, annotation] : astModule->handleTypes ) {
             if ( starts_with(annotation->name,"Expr") ) {
                 uint32_t hash = hash_tag(annotation->name.c_str());
-                rttiHash2Annotation[hash] = annotation.get();
+                rttiHash2Annotation[hash] = annotation;
             }
-        });
+        }
         writing = isWriting;
         buffer = storage;
     }
@@ -63,13 +66,26 @@ namespace das {
     }
 
     template <typename TT>
-    void patchRefs ( vector<pair<TT**,uint64_t>> & refs, const das_hash_map<uint64_t, smart_ptr<TT>> & objects) {
+    void patchRefs ( vector<pair<TT**,SerializeNodeId>> & refs, const das_hash_map<SerializeNodeId, smart_ptr<TT>> & objects) {
         for ( auto & p : refs ) {
             auto it = objects.find(p.second);
             if ( it == objects.end() ) {
-                throw std::runtime_error{"ast serializer function ref not found"};
+                throw dasException{"ast serializer function ref not found", LineInfo()};
             } else {
                 *p.first = it->second.get();
+            }
+        }
+        refs.clear();
+    }
+
+    template <typename TT>
+    void patchRefs ( vector<pair<TT**,SerializeNodeId>> & refs, const das_hash_map<SerializeNodeId, TT*> & objects) {
+        for ( auto & p : refs ) {
+            auto it = objects.find(p.second);
+            if ( it == objects.end() ) {
+                throw dasException{"ast serializer function ref not found", LineInfo()};
+            } else {
+                *p.first = it->second;
             }
         }
         refs.clear();
@@ -80,11 +96,12 @@ namespace das {
         va_start(args, fmt);
 
         char err[256];
-        vsnprintf(err, 256, fmt, args);
+        int len = vsnprintf(err, 256, fmt, args);
+        err[len] = '\0';
 
         va_end(args);
 
-        throw std::runtime_error{err};
+        throw dasException{err, LineInfo()};
     }
 
     #define SERIALIZER_VERIFYF(cond, ...) {                 \
@@ -117,7 +134,7 @@ namespace das {
                 throw_formatted_error("too many candidates for structure '%s'", name.c_str());
             }
         // set the missing field field
-            *field = struct_.front()->findField(fieldname);
+            *field = struct_.front()->findFieldRef(fieldname);
         }
         fieldRefs.clear();
     }
@@ -144,7 +161,7 @@ namespace das {
         try {
             cb(*this);
             return true;
-        } catch ( const std::runtime_error & ) {
+        } catch ( ... ) {
             failed = true;
             return false;
         }
@@ -209,6 +226,62 @@ namespace das {
         }
     }
 
+    AstSerializer & AstSerializer::operator << ( SerializeNodeId & value ) {
+        dtag(HASH_TAG("SerializeNodeId"));
+        // 64-bit user-space pointers fit in 48 bits (canonical form on x86-64
+        // and AArch64 Linux/macOS — top 16 bits are sign-extended copies of
+        // bit 47, and we only ever see user-space addresses here, so they are
+        // zero — but we mask them on write regardless, since ptr is an identity
+        // key only). Pack a small epoch into those unused top 16 bits so the
+        // common case is a single 8-byte word. Reserve sentinel 0xFFFF for
+        // "epoch overflow" — fall back to a separate adaptive-size write.
+        // 32-bit hosts have no headroom; always emit ptr + adaptive epoch.
+        if constexpr ( sizeof(void *) == 8 ) {
+            constexpr uint64_t kPtrMask  = (uint64_t(1) << 48) - 1;
+            constexpr uint64_t kEpochOverflowTag = 0xFFFFull << 48;
+            if ( writing ) {
+                uintptr_t pbits = reinterpret_cast<uintptr_t>(value.ptr) & kPtrMask;
+                if ( value.epoch < 0xFFFFull ) {
+                    uint64_t packed = (uint64_t(value.epoch) << 48) | uint64_t(pbits);
+                    *this << packed;
+                } else {
+                    uint64_t packed = kEpochOverflowTag | uint64_t(pbits);
+                    *this << packed;
+                    uint32_t epoch32 = uint32_t(value.epoch);
+                    serializeAdaptiveSize32(epoch32);
+                }
+            } else {
+                uint64_t packed = 0;
+                *this << packed;
+                uint64_t topBits = packed & ~kPtrMask;
+                value.ptr = reinterpret_cast<void *>(uintptr_t(packed & kPtrMask));
+                if ( topBits == kEpochOverflowTag ) {
+                    uint32_t epoch32 = 0;
+                    serializeAdaptiveSize32(epoch32);
+                    value.epoch = size_t(epoch32);
+                } else {
+                    value.epoch = size_t(topBits >> 48);
+                }
+            }
+        } else {
+            // 32-bit: pointer fills the word; epoch goes in its own adaptive int.
+            if ( writing ) {
+                uint32_t pbits = uint32_t(reinterpret_cast<uintptr_t>(value.ptr));
+                uint32_t epoch32 = uint32_t(value.epoch);
+                *this << pbits;
+                serializeAdaptiveSize32(epoch32);
+            } else {
+                uint32_t pbits = 0;
+                *this << pbits;
+                uint32_t epoch32 = 0;
+                serializeAdaptiveSize32(epoch32);
+                value.ptr = reinterpret_cast<void *>(uintptr_t(pbits));
+                value.epoch = size_t(epoch32);
+            }
+        }
+        return *this;
+    }
+
     AstSerializer & AstSerializer::operator << ( string & str ) {
         dtag(HASH_TAG("string"));
         if ( writing ) {
@@ -247,20 +320,20 @@ namespace das {
         return *this;
     }
 
-    template <typename V>
-    AstSerializer & AstSerializer::operator << ( safebox<V> & box ) {
+    template <typename V, typename VT>
+    AstSerializer & AstSerializer::operator << ( safebox<V,VT> & box ) {
         dtag(HASH_TAG("Safebox"));
         if ( writing ) {
             uint64_t size = box.unlocked_size(); *this << size;
-            box.foreach_with_hash ([&](smart_ptr<V> obj, uint64_t hash) {
+            box.foreach_with_hash ([&](VT obj, uint64_t hash) {
                 *this << hash << obj;
             });
             return *this;
         }
         uint64_t size = 0; *this << size;
-        safebox<V> deser;
+        safebox<V,VT> deser;
         for ( uint64_t i = 0; i < size; i++ ) {
-            smart_ptr<V> obj; uint64_t hash = 0;
+            VT obj {}; uint64_t hash = 0;
             *this << hash << obj;
             deser.insert(hash, obj);
         }
@@ -288,11 +361,41 @@ namespace das {
         value = das::move(deser);
     }
 
-    template <typename K, typename V>
-    AstSerializer & AstSerializer::operator << ( das_hash_map<K, V> & value ) {
-        serialize_hash_map<K, V, hash<K>, equal_to<K>>(value);
+    template <typename K, typename V, typename H, typename E>
+    AstSerializer & AstSerializer::operator << ( das_hash_map<K, V, H, E> & value ) {
+        serialize_hash_map<K, V, H, E>(value);
         return *this;
     }
+
+    // Guarded: see ast_serializer.h note. Under DAS_CUSTOM_HASH=0 these would
+    // duplicate the das_hash_map definitions above (identical aliases).
+#if DAS_CUSTOM_HASH
+    template <typename K, typename V, typename H, typename E>
+    void AstSerializer::serialize_hash_map ( das_insert_only_hash_map<K, V, H, E> & value ) {
+        dtag(HASH_TAG("DasHashmap"));
+        if ( writing ) {
+            uint64_t size = value.size(); *this << size;
+            for ( auto & item : value ) {
+                *this << item.first << item.second;
+            }
+            return;
+        }
+        uint64_t size = 0; *this << size;
+        das_insert_only_hash_map<K, V, H, E> deser;
+        deser.reserve(size);
+        for ( uint64_t i = 0; i < size; i++ ) {
+            K k; V v; *this << k << v;
+            deser.emplace(das::move(k),das::move(v));
+        }
+        value = das::move(deser);
+    }
+
+    template <typename K, typename V, typename H, typename E>
+    AstSerializer & AstSerializer::operator << ( das_insert_only_hash_map<K, V, H, E> & value ) {
+        serialize_hash_map<K, V, H, E>(value);
+        return *this;
+    }
+#endif
 
     template <typename V>
     AstSerializer & AstSerializer::operator << ( safebox_map<V> & box ) {
@@ -306,41 +409,23 @@ namespace das {
         return *this;
     }
 
-    AstSerializer & AstSerializer::operator << ( ExpressionPtr & expr ) {
-        dtag(HASH_TAG("ExpressionPtr"));
-        bool is_null = expr == nullptr;
-        *this << is_null;
-        if ( is_null ) {
-            if ( !writing ) expr = nullptr;
-            return *this;
-        }
-        if ( writing ) {
-            uint32_t rtti = hash_tag(expr->__rtti);
-            DAS_ASSERT(rtti);
-            *this << rtti;
-            expr->serialize(*this);
-        } else {
-            uint32_t rtti = 0; *this << rtti;
-            auto itA = rttiHash2Annotation.find(rtti);
-            SERIALIZER_VERIFYF(itA != rttiHash2Annotation.end(), "annotation '%u' is not found", rtti);
-            auto annotation = itA->second;
-            expr.reset((Expression *) static_cast<TypeAnnotation*>(annotation)->factory());
-            expr->serialize(*this);
-        }
-        dtag(HASH_TAG("/ExpressionPtr"));
-        return *this;
-    }
-
     bool AstSerializer::isInThisModule ( Function * & ptr ) {
         return ptr->module == thisModule;
     }
 
+    // A module-less struct/enum (e.g. a local/anonymous type reached through a
+    // Variable's type or init) has no identification to write -- treat it as
+    // in-this-module so it goes through the id/patch path instead of
+    // writeIdentifications, which would dereference the null module. Mirrors the
+    // isInThisModule(Variable*&) overload below. Defence-in-depth for the
+    // serializePointer(parent/classParent) sites; the TypeDecl struct/enum cases
+    // route module-less types through the inline path before reaching here.
     bool AstSerializer::isInThisModule ( Enumeration * & ptr ) {
-        return ptr->module == thisModule;
+        return ptr->module == thisModule || ptr->module == nullptr;
     }
 
     bool AstSerializer::isInThisModule ( Structure * & ptr ) {
-        return ptr->module == thisModule;
+        return ptr->module == thisModule || ptr->module == nullptr;
     }
 
     bool AstSerializer::isInThisModule ( Variable * & ptr ) {
@@ -377,43 +462,43 @@ namespace das {
         *this << ptr->module->nameHash << ptr->name;
     }
 
-    void AstSerializer::fillOrPatchLater ( Function * & func, uint64_t id ) {
+    void AstSerializer::fillOrPatchLater ( Function * & func, SerializeNodeId id ) {
         auto it = smartFunctionMap.find(id);
         if ( it == smartFunctionMap.end() ) {
             func = ( Function * ) 1;
             functionRefs.emplace_back(&func, id);
         } else {
-            func = it->second.get();
+            func = it->second;
         }
     }
 
-    void AstSerializer::fillOrPatchLater ( Enumeration * & ptr, uint64_t id ) {
+    void AstSerializer::fillOrPatchLater ( Enumeration * & ptr, SerializeNodeId id ) {
         auto it = smartEnumerationMap.find(id);
         if ( it == smartEnumerationMap.end() ) {
             ptr = ( Enumeration * ) 1;
             enumerationRefs.emplace_back(&ptr, id);
         } else {
-            ptr = it->second.get();
+            ptr = it->second;
         }
     }
 
-    void AstSerializer::fillOrPatchLater ( Structure * & ptr, uint64_t id ) {
+    void AstSerializer::fillOrPatchLater ( Structure * & ptr, SerializeNodeId id ) {
         auto it = smartStructureMap.find(id);
         if ( it == smartStructureMap.end() ) {
             ptr = ( Structure * ) 1;
             structureRefs.emplace_back(&ptr, id);
         } else {
-            ptr = it->second.get();
+            ptr = it->second;
         }
     }
 
-    void AstSerializer::fillOrPatchLater ( Variable * & ptr, uint64_t id ) {
+    void AstSerializer::fillOrPatchLater ( Variable * & ptr, SerializeNodeId id ) {
         auto it = smartVariableMap.find(id);
         if ( it == smartVariableMap.end() ) {
             ptr = ( Variable * ) 1;
             variableRefs.emplace_back(&ptr, id);
         } else {
-            ptr = it->second.get();
+            ptr = it->second;
         }
     }
 
@@ -443,14 +528,14 @@ namespace das {
         }
         auto f = funcModule->findFunction(mangledName);
         if ( f ) {
-            func = f.get();
+            func = f;
         } else if ( auto genericFn = funcModule->findGeneric(mangledName) ) {
-            func = genericFn.get();
+            func = genericFn;
         }
         if ( func == nullptr && funcModule->wasParsedNameless ) {
             string modname, funcname;
             splitTypeName(mangledName, modname, funcname);
-            func = funcModule->findFunction(funcname).get();
+            func = funcModule->findFunction(funcname);
         }
         if ( func == nullptr ) {
             failed = true;
@@ -460,33 +545,45 @@ namespace das {
 
     void AstSerializer::findExternal ( Enumeration * & ptr ) {
         auto [mod, mangledNameHash] = readModuleAndNameHash();
-        ptr = mod->findEnumByMangledNameHash(mangledNameHash).get();
+        // under ignoreEmptyExternal (function arguments / field inits) a missing external
+        // module reaches here as mod==nullptr. Unlike a function (which infer re-resolves
+        // by name when the default expr is cloned at a call site), a null type pointer is
+        // never re-resolved and crashes later -- so fail the read; the boundary catches
+        // the exception and the caller falls back to text parsing
+        SERIALIZER_VERIFYF(mod, "module for enumeration '%llu' is not found", mangledNameHash);
+        ptr = mod->findEnumByMangledNameHash(mangledNameHash);
         SERIALIZER_VERIFYF(ptr!=nullptr, "enumeration '%llu' is not found", mangledNameHash);
     }
 
     void AstSerializer::findExternal ( Structure * & ptr ) {
         auto [mod, mangledNameHash] = readModuleAndNameHash();
-        ptr = mod->findStructureByMangledNameHash(mangledNameHash).get();
+        // missing external module under ignoreEmptyExternal - see findExternal(Enumeration*&)
+        SERIALIZER_VERIFYF(mod, "module for structure '%llu' is not found", mangledNameHash);
+        ptr = mod->findStructureByMangledNameHash(mangledNameHash);
         SERIALIZER_VERIFYF(ptr!=nullptr, "structure '%llu' is not found", mangledNameHash);
     }
 
     void AstSerializer::findExternal ( Variable * & ptr ) {
         auto [mod, mangledName] = readModuleAndName();
-        ptr = mod->findVariable(mangledName).get();
+        // missing external module under ignoreEmptyExternal - see findExternal(Enumeration*&)
+        SERIALIZER_VERIFYF(mod, "module for variable '%s' is not found", mangledName.c_str());
+        ptr = mod->findVariable(mangledName);
         SERIALIZER_VERIFYF(ptr!=nullptr, "variable '%s' is not found", mangledName.c_str());
     }
 
     void AstSerializer::findExternal ( TypeInfoMacro * & ptr ) {
         auto [mod, mangledName] = readModuleAndName();
-        ptr = mod->findTypeInfoMacro(mangledName).get();
-        SERIALIZER_VERIFYF(ptr!=nullptr, "variable '%s' is not found", mangledName.c_str());
+        // missing external module under ignoreEmptyExternal - see findExternal(Enumeration*&)
+        SERIALIZER_VERIFYF(mod, "module for type info macro '%s' is not found", mangledName.c_str());
+        ptr = mod->findTypeInfoMacro(mangledName);
+        SERIALIZER_VERIFYF(ptr!=nullptr, "type info macro '%s' is not found", mangledName.c_str());
     }
 
     template<typename TT>
     AstSerializer & AstSerializer::serializePointer ( TT * & ptr ) {
-        uint64_t fid = uintptr_t(ptr);
+        auto fid = getSerializeId(ptr);
         *this << fid;
-        if ( !fid ) {
+        if ( !fid.ptr ) {
             if ( !writing ) ptr = nullptr;
             return *this;
         }
@@ -506,32 +603,33 @@ namespace das {
         return *this;
     }
 
-    AstSerializer & AstSerializer::operator << ( Function * & ptr ) {
-        dtag(HASH_TAG("Function pointer"));
-        return serializePointer(ptr);
-    }
-
-    AstSerializer & AstSerializer::operator << ( Structure * & ptr ) {
-        dtag(HASH_TAG("Structure pointer"));
-        return serializePointer(ptr);
-    }
-
-    AstSerializer & AstSerializer::operator << ( Enumeration * & ptr ) {
-        dtag(HASH_TAG("Enumeration pointer"));
-        return serializePointer(ptr);
-    }
-
-    AstSerializer & AstSerializer::operator << ( Variable * & ptr ) {
-        dtag(HASH_TAG("Variable pointer"));
-        return serializePointer(ptr);
-    }
 
     AstSerializer & AstSerializer::operator << ( FunctionPtr & func ) {
         dtag(HASH_TAG("FunctionPtr"));
         if ( writing && func ) {
             SERIALIZER_VERIFYF(!func->builtIn, "cannot serialize built-in function");
         }
-        serializeSmartPtr(func, smartFunctionMap);
+        auto id = getSerializeId(func);
+        *this << id;
+        if ( id.ptr == 0 ) {
+            if ( !writing ) func = nullptr;
+            return *this;
+        }
+        if ( writing ) {
+            if ( smartFunctionMap.find(id) == smartFunctionMap.end() ) {
+                smartFunctionMap[id] = func;
+                func->serialize(*this);
+            }
+        } else {
+            auto it = smartFunctionMap.find(id);
+            if ( it == smartFunctionMap.end() ) {
+                func = new Function();
+                smartFunctionMap[id] = func;
+                func->serialize(*this);
+            } else {
+                func = it->second;
+            }
+        }
         if ( func ) {
             if ( writing ) {
                 string name = func->name;
@@ -539,7 +637,7 @@ namespace das {
             } else {
                 string name; *this << name;
                 string expect = func->name;
-                SERIALIZER_VERIFYF(name == expect, "expected different function");
+                SERIALIZER_VERIFYF(name == expect, "expected different function %s %s", name.c_str(), expect.c_str());
             }
         }
         return *this;
@@ -547,9 +645,12 @@ namespace das {
 
     AstSerializer & AstSerializer::operator << ( TypeInfoMacro * & ptr ) {
         dtag(HASH_TAG("TypeInfoMacroPtr"));
-        uint64_t id = uintptr_t(ptr);
-        *this << id;
-        if ( !id ) {
+        // TypeInfoMacro is not gc_node and is always external (lives in another
+        // module). It is identified by name+module hash, so the wire form only
+        // needs a presence bit — no pointer/id leaks into the stream.
+        bool is_null = ptr == nullptr;
+        *this << is_null;
+        if ( is_null ) {
             if ( !writing ) ptr = nullptr;
             return *this;
         }
@@ -575,7 +676,7 @@ namespace das {
             if ( !writing ) type = nullptr;
             return *this;
         }
-        uint64_t id = intptr_t(type.get());
+        auto id = getSerializeId(type);
         *this << id;
         if ( writing ) {
             if ( smartTypeDeclMap[id] == nullptr ) {
@@ -584,7 +685,7 @@ namespace das {
             }
         } else {
             if ( smartTypeDeclMap[id] == nullptr ) {
-                type = make_smart<TypeDecl>();
+                type = new TypeDecl();
                 smartTypeDeclMap[id] = type;
                 type->serialize(*this);
             } else {
@@ -602,7 +703,7 @@ namespace das {
 
     AstSerializer & AstSerializer::operator << ( AnnotationDeclarationPtr & annotation_decl ) {
         dtag(HASH_TAG("AnnotationDeclarationPtr"));
-        if ( !writing ) annotation_decl = make_smart<AnnotationDeclaration>();
+        if ( !writing ) annotation_decl = new AnnotationDeclaration();
         annotation_decl->serialize(*this);
         return *this;
     }
@@ -642,11 +743,20 @@ namespace das {
                     ser << anno->module->nameHash;
                 }
             } else {
-                // If the macro is from current module, do nothing
-                // it will probably take care of itself during compilation
-                SERIALIZER_VERIFYF( anno->module->macroContext,
-                    "expected to see macro module '%s'", anno->module->name.c_str()
-                );
+                // das-declared distinct-type entities round-trip with the module itself
+                // (Module::serialize registers them before anything that references them
+                // deserializes), so an own-module reference resolves by name
+                bool isDistinct = anno->rtti_isDistinctTypeAnnotation();
+                ser << isDistinct;
+                if ( isDistinct ) {
+                    ser << anno->name;
+                } else {
+                    // If the macro is from current module, do nothing
+                    // it will probably take care of itself during compilation
+                    SERIALIZER_VERIFYF( anno->module->macroContext,
+                        "expected to see macro module '%s'", anno->module->name.c_str()
+                    );
+                }
             }
         } else {
             bool inThisModule = false;
@@ -663,8 +773,18 @@ namespace das {
                     ser << moduleNameHash;
                     auto mod = ser.moduleLibrary->findModuleByMangledNameHash(moduleNameHash);
                     SERIALIZER_VERIFYF(mod!=nullptr, "module '%llu' is not found", moduleNameHash);
-                    anno = mod->findAnnotation(name).get();
+                    anno = mod->findAnnotation(name);
                     SERIALIZER_VERIFYF(anno!=nullptr, "annotation '%s' is not found", name.c_str());
+                }
+            } else {
+                bool isDistinct = false;
+                ser << isDistinct;
+                if ( isDistinct ) {
+                    string name;
+                    ser << name;
+                    anno = ser.thisModule->findAnnotation(name);
+                    SERIALIZER_VERIFYF(anno!=nullptr && anno->rtti_isDistinctTypeAnnotation(),
+                        "distinct type '%s' is not found in module '%s'", name.c_str(), ser.thisModule->name.c_str());
                 }
             }
         }
@@ -761,7 +881,27 @@ namespace das {
     }
 
     AstSerializer & AstSerializer::operator << ( StructurePtr & struct_ ) {
-        serializeSmartPtr(struct_, smartStructureMap);
+        auto id = getSerializeId(struct_);
+        *this << id;
+        if ( id.ptr == 0 ) {
+            if ( !writing ) struct_ = nullptr;
+            return *this;
+        }
+        if ( writing ) {
+            if ( smartStructureMap.find(id) == smartStructureMap.end() ) {
+                smartStructureMap[id] = struct_;
+                struct_->serialize(*this);
+            }
+        } else {
+            auto it = smartStructureMap.find(id);
+            if ( it == smartStructureMap.end() ) {
+                struct_ = new Structure();
+                smartStructureMap[id] = struct_;
+                struct_->serialize(*this);
+            } else {
+                struct_ = it->second;
+            }
+        }
         return *this;
     }
 
@@ -790,14 +930,14 @@ namespace das {
             return *this;
         }
         if ( writing ) {
-            uint64_t p = (uint64_t) ptr.get();
+            auto p = getSerializeId(ptr.get());
             *this << p;
             if ( fileAccessMap[p] == nullptr ) {
                 fileAccessMap[p] = ptr.get();
                 ptr->serialize(*this);
             }
         } else {
-            uint64_t p = 0; *this << p;
+            SerializeNodeId p; *this << p;
             if ( fileAccessMap[p] == nullptr ) {
                 uint8_t tag = 0; *this << tag;
                 switch ( tag ) {
@@ -816,32 +956,6 @@ namespace das {
         return *this;
     }
 
-    // This method creates concrete (i.e. non-polymorphic types without duplications)
-    template<typename T>
-    void AstSerializer::serializeSmartPtr( smart_ptr<T> & obj, das_hash_map<uint64_t, smart_ptr<T>> & objMap) {
-        uint64_t id = uint64_t(uintptr_t(obj.get()));
-        *this << id;
-        if ( id == 0 ) {
-            if ( !writing ) obj = nullptr;
-            return;
-        }
-        if ( writing ) {
-            if ( objMap.find(id) == objMap.end() ) {
-                objMap[id] = obj;
-                obj->serialize(*this);
-            }
-        } else {
-            auto it = objMap.find(id);
-            if ( it == objMap.end() ) {
-                obj = make_smart<T>();
-                objMap[id] = obj;
-                obj->serialize(*this);
-            } else {
-                obj = it->second;
-            }
-        }
-    }
-
     AstSerializer & AstSerializer::operator << ( EnumerationPtr & enum_type ) {
         if ( writing ) {
             bool builtin = enum_type->module->builtIn && !enum_type->module->promoted;
@@ -851,7 +965,12 @@ namespace das {
                 string name = enum_type->name;
                 *this << module << name;
             } else {
-                serializeSmartPtr(enum_type, smartEnumerationMap);
+                auto id = getSerializeId(enum_type);
+                *this << id;
+                if ( smartEnumerationMap.find(id) == smartEnumerationMap.end() ) {
+                    smartEnumerationMap[id] = enum_type;
+                    enum_type->serialize(*this);
+                }
             }
         } else {
             bool builtin = false;
@@ -865,7 +984,17 @@ namespace das {
                 enum_type = pModule->findEnum(name);
                 SERIALIZER_VERIFYF(enum_type, "expected to find enumeration '%llu'::'%s'", module, name.c_str());
             } else {
-                serializeSmartPtr(enum_type, smartEnumerationMap);
+                SerializeNodeId id;
+                *this << id;
+                SERIALIZER_VERIFYF(id.ptr != 0, "expected non-null enumeration id");
+                auto it = smartEnumerationMap.find(id);
+                if ( it == smartEnumerationMap.end() ) {
+                    enum_type = new Enumeration();
+                    smartEnumerationMap[id] = enum_type;
+                    enum_type->serialize(*this);
+                } else {
+                    enum_type = it->second;
+                }
                 SERIALIZER_VERIFYF(enum_type, "expected to find enumeration");
             }
         }
@@ -880,21 +1009,34 @@ namespace das {
 
     // Note for review: this is the usual downward serialization, no need to backpatch
     AstSerializer & AstSerializer::operator << ( TypeAnnotationPtr & type_anno ) {
-        AnnotationPtr a = static_pointer_cast<Annotation>(type_anno);
+        AnnotationPtr a = static_cast<Annotation*>(type_anno);
         *this << a;
-        type_anno = static_pointer_cast<TypeAnnotation>(a);
-        return *this;
-    }
-
-    AstSerializer & AstSerializer::operator << ( TypeAnnotation * & type_anno ) {
-        TypeAnnotationPtr t = type_anno;
-        *this << t;
-        type_anno = t.get();
+        type_anno = static_cast<TypeAnnotation*>(a);
         return *this;
     }
 
     AstSerializer & AstSerializer::operator << ( VariablePtr & var ) {
-        serializeSmartPtr(var, smartVariableMap);
+        auto id = getSerializeId(var);
+        *this << id;
+        if ( id.ptr == 0 ) {
+            if ( !writing ) var = nullptr;
+            return *this;
+        }
+        if ( writing ) {
+            if ( smartVariableMap.find(id) == smartVariableMap.end() ) {
+                smartVariableMap[id] = var;
+                var->serialize(*this);
+            }
+        } else {
+            auto it = smartVariableMap.find(id);
+            if ( it == smartVariableMap.end() ) {
+                var = new Variable();
+                smartVariableMap[id] = var;
+                var->serialize(*this);
+            } else {
+                var = it->second;
+            }
+        }
         return *this;
     }
 
@@ -945,11 +1087,11 @@ namespace das {
 
     AstSerializer & AstSerializer::operator << ( ExprBlock * & block ) {
         dtag(HASH_TAG("ExprBlock*"));
-        void * addr = block;
-        *this << addr;
-        if ( !writing && addr ) {
+        auto id = getSerializeId(block);
+        *this << id;
+        if ( !writing && id.ptr ) {
             block = ( ExprBlock * ) 1;
-            blockRefs.emplace_back(&block, (uint64_t) addr);
+            blockRefs.emplace_back(&block, id);
         }
         return *this;
     }
@@ -967,12 +1109,38 @@ namespace das {
     }
 
     AstSerializer & AstSerializer::operator << ( MakeFieldDeclPtr & ptr ) {
-        serializeSmartPtr(ptr, smartMakeFieldDeclMap);
+        dtag(HASH_TAG("MakeFieldDeclPtr"));
+        bool is_null = ptr == nullptr;
+        *this << is_null;
+        if ( is_null ) {
+            if ( !writing ) ptr = nullptr;
+            return *this;
+        }
+        if ( writing ) {
+            ptr->serialize(*this);
+        } else {
+            ptr = new MakeFieldDecl();
+            ptr->serialize(*this);
+        }
+        dtag(HASH_TAG("/MakeFieldDeclPtr"));
         return *this;
     }
 
     AstSerializer & AstSerializer::operator << ( MakeStructPtr & ptr ) {
-        serializeSmartPtr(ptr, smartMakeStructMap);
+        dtag(HASH_TAG("MakeStructPtr"));
+        bool is_null = ptr == nullptr;
+        *this << is_null;
+        if ( is_null ) {
+            if ( !writing ) ptr = nullptr;
+            return *this;
+        }
+        if ( writing ) {
+            ptr->serialize(*this);
+        } else {
+            ptr = new MakeStruct();
+            ptr->serialize(*this);
+        }
+        dtag(HASH_TAG("/MakeStructPtr"));
         return *this;
     }
 
@@ -1003,22 +1171,27 @@ namespace das {
         switch ( baseType ) {
             case Type::typeMacro:
             case Type::typeDecl:
-                ser << alias << dimExpr;
+                ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
+            case Type::tFixedArray:
+                ser << alias << firstType << fixedDim << fixedDimExpr;
+                DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !secondType,
+                                argTypes.empty(), argNames.empty());
+                break;
             case Type::alias:
-                ser << alias << firstType << dim << dimExpr;
+                ser << alias << firstType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !secondType,
                                 !alias.empty(), argTypes.empty(), argNames.empty());
                 break;
             case option:
-                ser << argTypes << dim << dimExpr;
+                ser << argTypes;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 alias.empty(), !argTypes.empty(), argNames.empty());
                 break;
             case autoinfer:
-                ser << dim << dimExpr << alias;
+                ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
@@ -1048,7 +1221,30 @@ namespace das {
             case tFloat4:
             case tDouble:
             case tString:
-                ser << alias << dim << dimExpr;
+            case tFloat16:
+            case tHalf2:
+            case tHalf3:
+            case tHalf4:
+            case tHalf8:
+            case tShort2:
+            case tShort3:
+            case tShort4:
+            case tShort8:
+            case tUShort2:
+            case tUShort3:
+            case tUShort4:
+            case tUShort8:
+            case tByte2:
+            case tByte3:
+            case tByte4:
+            case tByte8:
+            case tByte16:
+            case tUByte2:
+            case tUByte3:
+            case tUByte4:
+            case tUByte8:
+            case tUByte16:
+                ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
@@ -1056,61 +1252,92 @@ namespace das {
             case tURange:
             case tRange64:
             case tURange64: // blow up!
-                ser << alias << dim << dimExpr;
+                ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
-            case tStructure:
-                ser << alias << structType << dim << dimExpr;
+            case tStructure: {
+                ser << alias;
+                // A genuinely cross-module struct is referenced by name (serializePointer):
+                // the plain smart-map operator would materialize a per-stream COPY on read,
+                // breaking type identity when a parsed module infers against cached
+                // signatures (mixed compiles after a partial cache invalidation) -- see
+                // Structure::serialize (parent). A same-module OR module-less struct (e.g. a
+                // local/anonymous type reached through a Variable's type) has no external
+                // identity to write, so keep the inline smart-map path, which serializes its
+                // content once and preserves identity within this stream. The chosen path is
+                // stamped into the stream so read takes the matching branch.
+                bool crossModule = ser.writing && structType && structType->module && structType->module != ser.thisModule;
+                ser << crossModule;
+                if ( crossModule ) ser.serializePointer(structType);
+                else               ser << structType;
                 DAS_VERIFYF_MULTI(!annotation, !!structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
+            }
             case tHandle:
-                ser << alias << annotation << dim << dimExpr;
+                ser << alias << annotation;
                 DAS_VERIFYF_MULTI(!!annotation, !structType, !enumType, !firstType, !secondType,
+                                argTypes.empty(), argNames.empty());
+                break;
+            case tDistinct:
+                ser << alias << annotation << firstType;
+                DAS_VERIFYF_MULTI(!!annotation, !structType, !enumType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
             case tEnumeration:
             case tEnumeration8:
             case tEnumeration16:
-            case tEnumeration64:
-                ser << alias << enumType << dim << dimExpr;
+            case tEnumeration64: {
+                ser << alias;
+                // cross-module by name, else inline smart-map — see tStructure above
+                bool crossModule = ser.writing && enumType && enumType->module && enumType->module != ser.thisModule;
+                ser << crossModule;
+                if ( crossModule ) ser.serializePointer(enumType);
+                else               ser << enumType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !!enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
-            case tBitfield:  // blow up!
-                ser << alias << argNames << dim << dimExpr;
+            }
+            case tBitfield:
+            case tBitfield8:
+            case tBitfield16:
+            case tBitfield64:
+                ser << alias << argNames;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty());
                 break;
             case tIterator:
             case tPointer:
             case tArray: // blow up!
-                ser << alias << firstType << dim << dimExpr;
+                ser << alias << firstType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
             case tFunction:
             case tLambda:
             case tBlock:
-                ser << alias << firstType << argTypes << argNames << dim << dimExpr;
+                ser << alias << firstType << argTypes << argNames;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !secondType);
                 break;
             case tTable:
-                ser << alias << firstType << secondType << dim << dimExpr;
+                ser << alias << firstType << secondType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !!firstType,
                                 argTypes.empty(), argNames.empty());
                 break;
             case tTuple:
             case tVariant:
-                ser << alias << argTypes << argNames << dim << dimExpr;
-                DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
-                                !argTypes.empty());
+                ser << alias << argTypes << argNames;
+                DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType);
                 break;
             default:
                 SERIALIZER_VERIFYF(false,  "not expected to be here");
                 break;
         }
+
+        // unconditional: typeMacro/typeDecl payload, and the tag payload riding on an
+        // autoinfer firstType (FIXED_ARRAY_REWORK.md, 1b)
+        ser << typeMacroExpr;
 
         ser << flags << at << module;
     }
@@ -1128,7 +1355,6 @@ namespace das {
     void AnnotationDeclaration::serialize ( AstSerializer & ser ) {
         ser.dtag(HASH_TAG("AnnotationDeclaration"));
         ser << annotation << arguments << at << flags;
-        ptr_ref_count::serialize(ser);
     }
 
     void ptr_ref_count::serialize ( AstSerializer & ser ) {
@@ -1179,7 +1405,6 @@ namespace das {
         ser << name     << cppName  << at << list << module
             << external << baseType << isPrivate;
         serializeAnnotationList(ser, annotations);
-        ptr_ref_count::serialize(ser);
     }
 
     void Structure::serialize ( AstSerializer & ser ) {
@@ -1187,30 +1412,50 @@ namespace das {
         ser << name;
         ser << at     << module;
         ser << fields << fieldLookup;
-        ser << parent // parent could be in the current module or in some other
-                      // module
-            << flags
+        ser << aliases;
+        // A cross-module parent may live in another module whose content is NOT in this
+        // stream; serializePointer binds it by name to the real library structure, avoiding
+        // a private COPY on read that would break pointer-identity checks (is_subclass_of
+        // walks parent pointers). A same-module or module-less parent has no external
+        // identity, so keep the inline smart-map path -- see the tStructure case in
+        // TypeDecl::serialize.
+        bool parentCross = ser.writing && parent && parent->module && parent->module != ser.thisModule;
+        ser << parentCross;
+        if ( parentCross ) ser.serializePointer(parent);
+        else               ser << parent;
+        ser << flags
             << ownSemanticHash;
         serializeAnnotationList(ser, annotations);
-        ptr_ref_count::serialize(ser);
     }
 
     void Variable::serialize ( AstSerializer & ser ) {
         ser.tag(HASH_TAG("Variable"));
         ser << name << aka << type << init << source << at << index << stackTop
             << extraLocalOffset << module
-            << initStackSize << flags << access_flags << annotation;
-        ptr_ref_count::serialize(ser);
+            << initStackSize << flags << access_flags << access_info << annotation;
     }
 
     void Function::AliasInfo::serialize ( AstSerializer & ser ) {
         ser.tag(HASH_TAG("AliasInfo"));
-        ser << var << func << viaPointer;
+        // var is often a global owned by ANOTHER module (deriveAliasing pulls
+        // useGlobalVariables transitively across modules). The owning module's content is
+        // NOT in this stream, so the inline operator<<(VariablePtr&) would serialize a
+        // foreign or half-constructed var->type and read garbage (0xCD-filled type pointer
+        // -> AV at TypeDecl::serialize). Cross-module vars resolve by module+name, exactly
+        // like serializeUseVariables and Structure::serialize (parent); same-module or
+        // module-less vars stay inline (smart-map).
+        bool crossModule = ser.writing && var && var->module && var->module != ser.thisModule;
+        ser << crossModule;
+        if ( crossModule ) ser.serializePointer(var);
+        else               ser << var;
+        ser.serializePointer(func);
+        ser << viaPointer;
     }
 
     void InferHistory::serialize ( AstSerializer & ser ) {
         ser.tag(HASH_TAG("InferHistory"));
-        ser << at << func;
+        ser << at;
+        ser.serializePointer(func);
     }
 
 // function
@@ -1225,451 +1470,625 @@ namespace das {
         ser.ignoreEmptyExternal = false;
         ser << result;
         ser << body;
-        ser << classParent;
+        // cross-module by name, else inline smart-map — see Structure::serialize (parent)
+        bool classParentCross = ser.writing && classParent && classParent->module && classParent->module != ser.thisModule;
+        ser << classParentCross;
+        if ( classParentCross ) ser.serializePointer(classParent);
+        else                    ser << classParent;
         //ser << fromGeneric;
         ser << index         << totalStackSize  << totalGenLabel;
         ser << at            << atDecl          << module;
         ser << hash          << aotHash;  // do not serialize inferStack
         ser << resultAliases << argumentAliases << resultAliasesGlobals;
-        ser << flags         << moreFlags       << sideEffectFlags;
+        ser << flags         << moreFlags       << moreFlags2      << sideEffectFlags;
     }
 
 // Expressions
+//
+// Per-node serialization lives in SerializeVisitor. AstSerializer::operator<<(ExpressionPtr&)
+// calls expr->dispatch(v), which selects the matching preVisit(ExprXxx*) override below.
+// Helper methods serializeXxx(...) replicate the old virtual inheritance chain
+// (ExprOp1 -> ExprOp -> ExprCallFunc -> ExprLooksLikeCall -> Expression) without
+// relying on virtual dispatch inside this visitor.
 
-    void ExprReader::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprReader"));
-        Expression::serialize(ser);
-        ser << macro << sequence;
+    class SerializeVisitor : public Visitor {
+        AstSerializer & ser;
+
+        void serializeBase          ( Expression * expr );
+        void serializeLooksLikeCall ( ExprLooksLikeCall * expr );
+        void serializeCallFunc      ( ExprCallFunc * expr );
+        void serializeOp            ( ExprOp * expr );
+        void serializeOp2           ( ExprOp2 * expr );
+        void serializeConst         ( ExprConst * expr );
+        void serializeMakeLocal     ( ExprMakeLocal * expr );
+        void serializeAt            ( ExprAt * expr );
+        void serializePtr2Ref       ( ExprPtr2Ref * expr );
+        void serializeField         ( ExprField * expr );
+        void serializeMakeArray     ( ExprMakeArray * expr );
+
+    public:
+        explicit SerializeVisitor ( AstSerializer & s ) : ser(s) {}
+        using Visitor::preVisit;
+
+        void preVisitExpression ( Expression            * expr ) override;
+        void preVisit ( ExprReader             * expr ) override;
+        void preVisit ( ExprLabel              * expr ) override;
+        void preVisit ( ExprGoto               * expr ) override;
+        void preVisit ( ExprRef2Value          * expr ) override;
+        void preVisit ( ExprRef2Ptr            * expr ) override;
+        void preVisit ( ExprPtr2Ref            * expr ) override;
+        void preVisit ( ExprAddr               * expr ) override;
+        void preVisit ( ExprNullCoalescing     * expr ) override;
+        void preVisit ( ExprDelete             * expr ) override;
+        void preVisit ( ExprAt                 * expr ) override;
+        void preVisit ( ExprSafeAt             * expr ) override;
+        void preVisit ( ExprBlock              * expr ) override;
+        void preVisit ( ExprVar                * expr ) override;
+        void preVisit ( ExprTag                * expr ) override;
+        void preVisit ( ExprField              * expr ) override;
+        void preVisit ( ExprSafeAsVariant      * expr ) override;
+        void preVisit ( ExprSwizzle            * expr ) override;
+        void preVisit ( ExprSafeField          * expr ) override;
+        void preVisit ( ExprLooksLikeCall      * expr ) override;
+        void preVisit ( ExprCallMacro          * expr ) override;
+        void preVisit ( ExprOp1                * expr ) override;
+        void preVisit ( ExprOp2                * expr ) override;
+        void preVisit ( ExprCopy               * expr ) override;
+        void preVisit ( ExprMove               * expr ) override;
+        void preVisit ( ExprClone              * expr ) override;
+        void preVisit ( ExprOp3                * expr ) override;
+        void preVisit ( ExprTryCatch           * expr ) override;
+        void preVisit ( ExprReturn             * expr ) override;
+        void preVisit ( ExprConst              * expr ) override;
+        void preVisit ( ExprConstPtr           * expr ) override;
+        void preVisit ( ExprConstEnumeration   * expr ) override;
+        void preVisit ( ExprConstBitfield      * expr ) override;
+        void preVisit ( ExprConstString        * expr ) override;
+        void preVisit ( ExprStringBuilder      * expr ) override;
+        void preVisit ( ExprLet                * expr ) override;
+        void preVisit ( ExprFor                * expr ) override;
+        void preVisit ( ExprUnsafe             * expr ) override;
+        void preVisit ( ExprWhile              * expr ) override;
+        void preVisit ( ExprWith               * expr ) override;
+        void preVisit ( ExprAssume             * expr ) override;
+        void preVisit ( ExprMakeBlock          * expr ) override;
+        void preVisit ( ExprMakeGenerator      * expr ) override;
+        void preVisit ( ExprYield              * expr ) override;
+        void preVisit ( ExprInvoke             * expr ) override;
+        void preVisit ( ExprAssert             * expr ) override;
+        void preVisit ( ExprQuote              * expr ) override;
+        void preVisit ( ExprTypeInfo           * expr ) override;
+        void preVisit ( ExprIs                 * expr ) override;
+        void preVisit ( ExprAscend             * expr ) override;
+        void preVisit ( ExprCast               * expr ) override;
+        void preVisit ( ExprNew                * expr ) override;
+        void preVisit ( ExprCall               * expr ) override;
+        void preVisit ( ExprIfThenElse         * expr ) override;
+        void preVisit ( ExprNamedCall          * expr ) override;
+        void preVisit ( ExprMakeStruct         * expr ) override;
+        void preVisit ( ExprMakeVariant        * expr ) override;
+        void preVisit ( ExprMakeArray          * expr ) override;
+        void preVisit ( ExprMakeTuple          * expr ) override;
+        void preVisit ( ExprArrayComprehension * expr ) override;
+        void preVisit ( ExprTypeDecl           * expr ) override;
+    };
+
+    void SerializeVisitor::serializeBase ( Expression * expr ) {
+        ser << expr->at
+            << expr->type
+            << expr->genFlags
+            << expr->flags
+            << expr->printFlags;
+        ser.dtag(HASH_TAG("ptr_ref_count"));
     }
 
-    void ExprLabel::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprLabel"));
-        Expression::serialize(ser);
-        ser << label << comment;
+    void SerializeVisitor::serializeLooksLikeCall ( ExprLooksLikeCall * expr ) {
+        serializeBase(expr);
+        ser << expr->name                   << expr->arguments;
+        ser << expr->argumentsFailedToInfer << expr->aliasSubstitution << expr->atEnclosure;
+        ser << expr->pipedCallArgument;
     }
 
-    void ExprGoto::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprGoto"));
-        Expression::serialize(ser);
-        ser << label << subexpr;
+    void SerializeVisitor::serializeCallFunc ( ExprCallFunc * expr ) {
+        serializeLooksLikeCall(expr);
+        ser.serializePointer(expr->func);
+        ser << expr->stackTop;
     }
 
-    void ExprRef2Value::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprRef2Value"));
-        Expression::serialize(ser);
-        ser << subexpr;
+    void SerializeVisitor::serializeOp ( ExprOp * expr ) {
+        serializeCallFunc(expr);
+        ser << expr->op;
     }
 
-    void ExprRef2Ptr::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprRef2Ptr"));
-        Expression::serialize(ser);
-        ser << subexpr;
+    void SerializeVisitor::serializeOp2 ( ExprOp2 * expr ) {
+        serializeOp(expr);
+        ser << expr->left;
+        ser << expr->right;
     }
 
-    void ExprPtr2Ref::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprPtr2Ref"));
-        Expression::serialize(ser);
-        ser << subexpr << unsafeDeref << assumeNoAlias;
+    void SerializeVisitor::serializeConst ( ExprConst * expr ) {
+        serializeBase(expr);
+        ser << expr->baseType << expr->value << expr->foldedNonConst << expr->promotedFromInt << expr->inexactFloatPromotion;
     }
 
-    void ExprAddr::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprAddr"));
-        Expression::serialize(ser);
-        ser << target << funcType << func;
+    void SerializeVisitor::serializeMakeLocal ( ExprMakeLocal * expr ) {
+        serializeBase(expr);
+        ser << expr->makeType << expr->stackTop << expr->extraOffset << expr->makeFlags;
     }
 
-    void ExprNullCoalescing::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprNullCoalescing"));
-        ExprPtr2Ref::serialize(ser);
-        ser << defaultValue;
-    }
-
-    void ExprDelete::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprDelete"));
-        Expression::serialize(ser);
-        ser << subexpr << sizeexpr << native;
-    }
-
-    void ExprAt::serialize ( AstSerializer & ser ) {
+    void SerializeVisitor::serializeAt ( ExprAt * expr ) {
         ser.dtag(HASH_TAG("ExprAt"));
-        Expression::serialize(ser);
-        ser << subexpr << index;
-        ser << atFlags;
+        serializeBase(expr);
+        ser << expr->subexpr << expr->index;
+        ser << expr->atFlags;
     }
 
-    void ExprSafeAt::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprSafeAt"));
-        ExprAt::serialize(ser);
+    void SerializeVisitor::serializePtr2Ref ( ExprPtr2Ref * expr ) {
+        serializeBase(expr);
+        ser << expr->subexpr << expr->unsafeDeref << expr->assumeNoAlias;
     }
 
-    void ExprBlock::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprBlock"));
-        Expression::serialize(ser);
+    void SerializeVisitor::serializeField ( ExprField * expr ) {
+        ser.dtag(HASH_TAG("ExprField"));
+        serializeBase(expr);
+        ser << expr->value      << expr->name       << expr->atField
+            << expr->fieldIndex << expr->annotation << expr->derefFlags
+            << expr->fieldFlags;
 
         if ( ser.writing ) {
-            void * thisBlock = this;
-            ser << thisBlock;
+            bool has_field = expr->value->type && (
+                expr->value->type->isStructure() || ( expr->value->type->isPointer() && expr->value->type->firstType->isStructure() )
+            );
+            ser << has_field;
+            if ( !has_field ) return;
+            string mangledName;
+            if ( expr->value->type->isPointer() ) {
+                SERIALIZER_VERIFYF(expr->value->type->firstType->isStructure(), "expected to see structure field access via pointer");
+                mangledName = expr->value->type->firstType->structType->getMangledName();
+                ser << expr->value->type->firstType->structType->module;
+            } else {
+                SERIALIZER_VERIFYF(expr->value->type->isStructure(), "expected to see structure field access");
+                mangledName = expr->value->type->structType->getMangledName();
+                ser << expr->value->type->structType->module;
+            }
+            ser << mangledName;
+            if ( expr->annotation != nullptr && expr->annotation->getFieldOffset(expr->name) == static_cast<uint32_t>(-1) ) {
+                LOG(LogLevel::warning) << "das: serialize: Field '" << expr->name << "' not found in '" << expr->annotation->name << "'";
+            }
         } else {
-            void * thisBlock = nullptr; ser << thisBlock;
-            ser.exprBlockMap.emplace((uint64_t) thisBlock, this);
+            if ( expr->annotation != nullptr && expr->annotation->getFieldOffset(expr->name) == static_cast<uint32_t>(-1) ) {
+                SERIALIZER_VERIFYF(false, "Field '%s' not found in '%s'", expr->name.c_str(), expr->annotation->name.c_str());
+            }
+            bool has_field = false; ser << has_field;
+            if ( !has_field ) return;
+            Module * module = nullptr; ser << module;
+            string mangledName; ser << mangledName;
+            ser.fieldRefs.emplace_back(&expr->fieldRef, module, das::move(mangledName), expr->name);
         }
-
-        ser << list << finalList << returnType << arguments << stackTop
-            << stackVarTop << stackVarBottom << stackCleanVars << maxLabelIndex
-            << annotationData << annotationDataSid << blockFlags
-            << inFunction;
-
-        serializeAnnotationList(ser, annotations);
     }
 
-    void ExprVar::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprVar"));
-        Expression::serialize(ser);
+    void SerializeVisitor::serializeMakeArray ( ExprMakeArray * expr ) {
+        serializeMakeLocal(expr);
+        ser << expr->recordType << expr->values << expr->gen2 << expr->makeArrayOnHeap;
+    }
 
-        ser << name << argumentIndex << varFlags;
-        ser << pBlock;
+    void SerializeVisitor::preVisitExpression ( Expression * expr ) {
+        // ExprMakeLocal::dispatch routes here (no dedicated preVisit overload).
+        // ExprMakeLocal carries makeType/stackTop/extraOffset/makeFlags that
+        // serializeBase alone would drop, so detect it and use the proper helper.
+        if ( expr->rtti_isMakeLocal() ) {
+            serializeMakeLocal(static_cast<ExprMakeLocal*>(expr));
+            return;
+        }
+        serializeBase(expr);
+    }
+
+    void SerializeVisitor::preVisit ( ExprReader * expr ) {
+        ser.dtag(HASH_TAG("ExprReader"));
+        serializeBase(expr);
+        ser << expr->macro << expr->sequence;
+    }
+
+    void SerializeVisitor::preVisit ( ExprLabel * expr ) {
+        ser.dtag(HASH_TAG("ExprLabel"));
+        serializeBase(expr);
+        ser << expr->label << expr->comment;
+    }
+
+    void SerializeVisitor::preVisit ( ExprGoto * expr ) {
+        ser.dtag(HASH_TAG("ExprGoto"));
+        serializeBase(expr);
+        ser << expr->label << expr->subexpr;
+    }
+
+    void SerializeVisitor::preVisit ( ExprRef2Value * expr ) {
+        ser.dtag(HASH_TAG("ExprRef2Value"));
+        serializeBase(expr);
+        ser << expr->subexpr;
+    }
+
+    void SerializeVisitor::preVisit ( ExprRef2Ptr * expr ) {
+        ser.dtag(HASH_TAG("ExprRef2Ptr"));
+        serializeBase(expr);
+        ser << expr->subexpr;
+    }
+
+    void SerializeVisitor::preVisit ( ExprPtr2Ref * expr ) {
+        ser.dtag(HASH_TAG("ExprPtr2Ref"));
+        serializePtr2Ref(expr);
+    }
+
+    void SerializeVisitor::preVisit ( ExprAddr * expr ) {
+        ser.dtag(HASH_TAG("ExprAddr"));
+        serializeBase(expr);
+        ser << expr->target << expr->funcType;
+        ser.serializePointer(expr->func);
+    }
+
+    void SerializeVisitor::preVisit ( ExprNullCoalescing * expr ) {
+        ser.dtag(HASH_TAG("ExprNullCoalescing"));
+        serializePtr2Ref(expr);
+        ser << expr->defaultValue;
+    }
+
+    void SerializeVisitor::preVisit ( ExprDelete * expr ) {
+        ser.dtag(HASH_TAG("ExprDelete"));
+        serializeBase(expr);
+        ser << expr->subexpr << expr->sizeexpr << expr->native;
+    }
+
+    void SerializeVisitor::preVisit ( ExprAt * expr ) {
+        serializeAt(expr);
+    }
+
+    void SerializeVisitor::preVisit ( ExprSafeAt * expr ) {
+        ser.dtag(HASH_TAG("ExprSafeAt"));
+        serializeAt(expr);
+    }
+
+    void SerializeVisitor::preVisit ( ExprBlock * expr ) {
+        ser.dtag(HASH_TAG("ExprBlock"));
+        serializeBase(expr);
+
+        if ( ser.writing ) {
+            auto thisBlockId = ser.getSerializeId(expr);
+            ser << thisBlockId;
+        } else {
+            SerializeNodeId thisBlockId; ser << thisBlockId;
+            ser.exprBlockMap.emplace(thisBlockId, expr);
+        }
+
+        ser << expr->list << expr->finalList << expr->returnType << expr->arguments << expr->stackTop
+            << expr->stackVarTop << expr->stackVarBottom << expr->stackCleanVars << expr->maxLabelIndex
+            << expr->annotationData << expr->annotationDataSid << expr->blockFlags;
+        ser.serializePointer(expr->inFunction);
+
+        serializeAnnotationList(ser, expr->annotations);
+    }
+
+    void SerializeVisitor::preVisit ( ExprVar * expr ) {
+        ser.dtag(HASH_TAG("ExprVar"));
+        serializeBase(expr);
+
+        ser << expr->name << expr->argumentIndex << expr->varFlags;
+        ser << expr->pBlock;
 
         // The variable is smart_ptr but we actually need
         // non-owning semantics
         if ( ser.writing ) {
-            bool inThisModule =  variable == nullptr // this happens with [generic] functions, for example
-                      || variable->module == nullptr
-                      || variable->module == ser.thisModule;
+            bool inThisModule =  expr->variable == nullptr // this happens with [generic] functions, for example
+                      || expr->variable->module == nullptr
+                      || expr->variable->module == ser.thisModule;
             ser << inThisModule;
             if ( inThisModule ) {
-                ser << variable; // serialize as smart pointer
+                ser << expr->variable; // serialize as smart pointer
             } else {
-                ser << variable->name;
-                ser << variable->module->nameHash;
+                ser << expr->variable->name;
+                ser << expr->variable->module->nameHash;
             }
         } else {
 
             bool inThisModule = false; ser << inThisModule;
             if ( inThisModule ) {
-                ser << variable;
+                ser << expr->variable;
             } else {
                 string varname;
                 uint64_t modname = 0;
                 ser << varname << modname;
                 auto mod = ser.moduleLibrary->findModuleByMangledNameHash(modname);
                 SERIALIZER_VERIFYF(mod, "expected to find module '%llu'", modname);
-                variable = mod->findVariable(varname);
+                expr->variable = mod->findVariable(varname);
             }
 
         }
     }
 
-    void ExprTag::serialize ( AstSerializer & ser ) {
+    void SerializeVisitor::preVisit ( ExprTag * expr ) {
         ser.dtag(HASH_TAG("ExprTag"));
-        Expression::serialize(ser);
-        ser << subexpr << value << name;
+        serializeBase(expr);
+        ser << expr->subexpr << expr->value << expr->name;
     }
 
-    void ExprField::serialize ( AstSerializer & ser ) {
-        ser.dtag(HASH_TAG("ExprField"));
-        Expression::serialize(ser);
-        ser << value      << name       << atField
-            << fieldIndex << annotation << derefFlags
-            << fieldFlags;
+    void SerializeVisitor::preVisit ( ExprField * expr ) {
+        serializeField(expr);
+    }
 
-        if ( ser.writing ) {
-            bool has_field = value->type && (
-                value->type->isStructure() || ( value->type->isPointer() && value->type->firstType->isStructure() )
-            );
-            ser << has_field;
-            if ( !has_field ) return;
-            string mangledName;
-            if ( value->type->isPointer() ) {
-                SERIALIZER_VERIFYF(value->type->firstType->isStructure(), "expected to see structure field access via pointer");
-                mangledName = value->type->firstType->structType->getMangledName();
-                ser << value->type->firstType->structType->module;
-            } else {
-                SERIALIZER_VERIFYF(value->type->isStructure(), "expected to see structure field access");
-                mangledName = value->type->structType->getMangledName();
-                ser << value->type->structType->module;
+    void SerializeVisitor::preVisit ( ExprSafeAsVariant * expr ) {
+        serializeField(expr);
+        ser << expr->skipQQ;
+    }
+
+    void SerializeVisitor::preVisit ( ExprSwizzle * expr ) {
+        serializeBase(expr);
+        ser << expr->value << expr->mask << expr->fields << expr->fieldFlags;
+    }
+
+    void SerializeVisitor::preVisit ( ExprSafeField * expr ) {
+        serializeField(expr);
+        ser << expr->skipQQ;
+    }
+
+    void SerializeVisitor::preVisit ( ExprLooksLikeCall * expr ) {
+        // ExprCallFunc::dispatch and ExprOp::dispatch route here (no dedicated
+        // preVisit overload). They carry func/stackTop/callFlags (and op for
+        // ExprOp) that serializeLooksLikeCall alone would drop, so detect them
+        // via __rtti and use the proper helper.
+        if ( expr->rtti_isCallFunc() ) {
+            if ( expr->__rtti && strcmp(expr->__rtti, "ExprOp") == 0 ) {
+                serializeOp(static_cast<ExprOp*>(expr));
+                return;
             }
-            ser << mangledName;
-            if ( annotation != nullptr && annotation->getFieldOffset(name) == static_cast<uint32_t>(-1) ) {
-                LOG(LogLevel::warning) << "das: serialize: Field '" << name << "' not found in '" << annotation->name << "'";
-            }
-        } else {
-            if ( annotation != nullptr && annotation->getFieldOffset(name) == static_cast<uint32_t>(-1) ) {
-                SERIALIZER_VERIFYF("Field '%s' not found in '%s'", name.c_str(), annotation->name.c_str());
-            }
-            bool has_field = false; ser << has_field;
-            if ( !has_field ) return;
-            Module * module = nullptr; ser << module;
-            string mangledName; ser << mangledName;
-            field = ( Structure::FieldDeclaration * ) 1;
-            ser.fieldRefs.emplace_back(&field, module, das::move(mangledName), name);
+            serializeCallFunc(static_cast<ExprCallFunc*>(expr));
+            return;
         }
+        serializeLooksLikeCall(expr);
     }
 
-    void ExprSafeAsVariant::serialize ( AstSerializer & ser ) {
-        ExprField::serialize(ser);
-        ser << skipQQ;
+    void SerializeVisitor::preVisit ( ExprCallMacro * expr ) {
+        serializeLooksLikeCall(expr);
+        ser << expr->macro;
+        ser.serializePointer(expr->inFunction);
     }
 
-    void ExprSwizzle::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << value << mask << fields << fieldFlags;
+    void SerializeVisitor::preVisit ( ExprOp1 * expr ) {
+        serializeOp(expr);
+        ser << expr->subexpr;
     }
 
-    void ExprSafeField::serialize ( AstSerializer & ser ) {
-        ExprField::serialize(ser);
-        ser << skipQQ;
+    void SerializeVisitor::preVisit ( ExprOp2 * expr ) {
+        serializeOp2(expr);
     }
 
-    void ExprLooksLikeCall::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << name                   << arguments;
-        ser << argumentsFailedToInfer << aliasSubstitution << atEnclosure;
+    void SerializeVisitor::preVisit ( ExprCopy * expr ) {
+        serializeOp2(expr);
+        ser << expr->copyFlags;
     }
 
-    void ExprCallMacro::serialize ( AstSerializer & ser ) {
-        ExprLooksLikeCall::serialize(ser);
-        ser << macro << inFunction;
+    void SerializeVisitor::preVisit ( ExprMove * expr ) {
+        serializeOp2(expr);
+        ser << expr->moveFlags;
     }
 
-    void ExprCallFunc::serialize ( AstSerializer & ser ) {
-        ExprLooksLikeCall::serialize(ser);
-        ser << func << stackTop;
+    void SerializeVisitor::preVisit ( ExprClone * expr ) {
+        serializeOp2(expr);
     }
 
-    void ExprOp::serialize ( AstSerializer & ser ) {
-        ExprCallFunc::serialize(ser);
-        ser << op;
+    void SerializeVisitor::preVisit ( ExprOp3 * expr ) {
+        serializeOp(expr);
+        ser << expr->subexpr << expr->left << expr->right;
     }
 
-    void ExprOp1::serialize ( AstSerializer & ser ) {
-        ExprOp::serialize(ser);
-        ser << subexpr;
+    void SerializeVisitor::preVisit ( ExprTryCatch * expr ) {
+        serializeBase(expr);
+        ser << expr->try_block << expr->catch_block;
     }
 
-    void ExprOp2::serialize ( AstSerializer & ser ) {
-        ExprOp::serialize(ser);
-        ser << left;
-        ser << right;
+    void SerializeVisitor::preVisit ( ExprReturn * expr ) {
+        serializeBase(expr);
+        ser << expr->subexpr    << expr->returnFlags << expr->stackTop << expr->refStackTop
+            << expr->returnFunc << expr->block       << expr->returnType;
     }
 
-    void ExprCopy::serialize ( AstSerializer & ser ) {
-        ExprOp2::serialize(ser);
-        ser << copyFlags;
+    void SerializeVisitor::preVisit ( ExprConst * expr ) {
+        serializeConst(expr);
     }
 
-    void ExprMove::serialize ( AstSerializer & ser ) {
-        ExprOp2::serialize(ser);
-        ser << moveFlags;
+    void SerializeVisitor::preVisit ( ExprConstPtr * expr ) {
+        serializeConst(expr);
+        ser << expr->isSmartPtr << expr->ptrType;
     }
 
-    void ExprClone::serialize ( AstSerializer & ser ) {
-        ExprOp2::serialize(ser);
+    void SerializeVisitor::preVisit ( ExprConstEnumeration * expr ) {
+        serializeConst(expr);
+        // cross-module enum by name (serializePointer avoids a per-stream COPY that breaks
+        // identity and leaves dangling pointers in deserialized const expressions); a
+        // same-module or module-less enum keeps the inline smart-map path -- see the
+        // tStructure/tEnumeration cases in TypeDecl::serialize.
+        bool crossModule = ser.writing && expr->enumType && expr->enumType->module && expr->enumType->module != ser.thisModule;
+        ser << crossModule;
+        if ( crossModule ) ser.serializePointer(expr->enumType);
+        else               ser << expr->enumType;
+        ser << expr->text;
     }
 
-    void ExprOp3::serialize ( AstSerializer & ser ) {
-        ExprOp::serialize(ser);
-        ser << subexpr << left << right;
+    void SerializeVisitor::preVisit ( ExprConstBitfield * expr ) {
+        serializeConst(expr);
+        ser << expr->bitfieldType;
     }
 
-    void ExprTryCatch::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << try_block << catch_block;
+    void SerializeVisitor::preVisit ( ExprConstString * expr ) {
+        serializeConst(expr);
+        ser << expr->text;
     }
 
-    void ExprReturn::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << subexpr    << returnFlags << stackTop << refStackTop
-            << returnFunc << block       << returnType;
+    void SerializeVisitor::preVisit ( ExprStringBuilder * expr ) {
+        serializeBase(expr);
+        ser << expr->elements << expr->stringBuilderFlags;
     }
 
-    void ExprConst::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << baseType << value << foldedNonConst;
+    void SerializeVisitor::preVisit ( ExprLet * expr ) {
+        serializeBase(expr);
+        ser << expr->variables << expr->visibility << expr->atInit << expr->letFlags;
     }
 
-    void ExprConstPtr::serialize( AstSerializer & ser ) {
-        ExprConstT<void *,ExprConstPtr>::serialize(ser);
-        ser << isSmartPtr << ptrType;
+    void SerializeVisitor::preVisit ( ExprFor * expr ) {
+        serializeBase(expr);
+        ser << expr->iterators << expr->iteratorsAka << expr->iteratorsAt << expr->iteratorsTupleExpansion << expr->iteratorsTags
+            << expr->iteratorVariables << expr->sources << expr->body << expr->visibility
+            << expr->allowIteratorOptimization << expr->canShadow << expr->annotations;
     }
 
-     void ExprConstEnumeration::serialize( AstSerializer & ser ) {
-        ExprConst::serialize(ser);
-        ser << enumType << text;
-     }
-
-    void ExprConstString::serialize(AstSerializer& ser) {
-        ExprConst::serialize(ser);
-        ser << text;
+    void SerializeVisitor::preVisit ( ExprUnsafe * expr ) {
+        serializeBase(expr);
+        ser << expr->body;
     }
 
-    void ExprStringBuilder::serialize(AstSerializer& ser) {
-        Expression::serialize(ser);
-        ser << elements << stringBuilderFlags;
+    void SerializeVisitor::preVisit ( ExprWhile * expr ) {
+        serializeBase(expr);
+        ser << expr->cond << expr->body << expr->annotations;
     }
 
-    void ExprLet::serialize(AstSerializer& ser) {
-        Expression::serialize(ser);
-        ser << variables << visibility << atInit << letFlags;
+    void SerializeVisitor::preVisit ( ExprWith * expr ) {
+        serializeBase(expr);
+        ser << expr->with << expr->body << expr->moduleName << expr->moduleUnsafeByProject;
     }
 
-    void ExprFor::serialize(AstSerializer& ser) {
-        Expression::serialize(ser);
-        ser << iterators << iteratorsAka << iteratorsAt << iteratorsTupleExpansion << iteratorsTags
-            << iteratorVariables << sources << body << visibility
-            << allowIteratorOptimization << canShadow;
+    void SerializeVisitor::preVisit ( ExprAssume * expr ) {
+        serializeBase(expr);
+        ser << expr->alias << expr->subexpr << expr->assumeType;
     }
 
-    void ExprUnsafe::serialize(AstSerializer& ser) {
-        Expression::serialize(ser);
-        ser << body;
+    void SerializeVisitor::preVisit ( ExprMakeBlock * expr ) {
+        serializeBase(expr);
+        ser << expr->capture << expr->captureAt << expr->block << expr->stackTop << expr->mmFlags;
     }
 
-    void ExprWhile::serialize(AstSerializer& ser) {
-        Expression::serialize(ser);
-        ser << cond << body;
+    void SerializeVisitor::preVisit ( ExprMakeGenerator * expr ) {
+        serializeLooksLikeCall(expr);
+        ser << expr->iterType << expr->capture << expr->captureAt;
     }
 
-    void ExprWith::serialize(AstSerializer& ser) {
-        Expression::serialize(ser);
-        ser << with << body;
+    void SerializeVisitor::preVisit ( ExprYield * expr ) {
+        serializeBase(expr);
+        ser << expr->subexpr << expr->returnFlags;
     }
 
-    void ExprAssume::serialize(AstSerializer& ser) {
-        Expression::serialize(ser);
-        ser << alias << subexpr;
+    void SerializeVisitor::preVisit ( ExprInvoke * expr ) {
+        serializeLooksLikeCall(expr);
+        ser << expr->stackTop << expr->doesNotNeedSp << expr->isInvokeMethod << expr->cmresAlias;
     }
 
-    void ExprMakeBlock::serialize(AstSerializer & ser) {
-        Expression::serialize(ser);
-        ser << capture << block << stackTop << mmFlags;
+    void SerializeVisitor::preVisit ( ExprAssert * expr ) {
+        serializeLooksLikeCall(expr);
+        ser << expr->isVerify;
     }
 
-    void ExprMakeGenerator::serialize(AstSerializer & ser) {
-        ExprLooksLikeCall::serialize(ser);
-        ser << iterType << capture;
+    void SerializeVisitor::preVisit ( ExprQuote * expr ) {
+        serializeLooksLikeCall(expr);
     }
 
-    void ExprYield::serialize(AstSerializer & ser) {
-        Expression::serialize(ser);
-        ser << subexpr << returnFlags;
+    void SerializeVisitor::preVisit ( ExprTypeInfo * expr ) {
+        serializeBase(expr);
+        ser << expr->trait << expr->subexpr << expr->typeexpr << expr->subtrait << expr->extratrait << expr->macro;
     }
 
-    void ExprInvoke::serialize(AstSerializer & ser) {
-        ExprLikeCall<ExprInvoke>::serialize(ser);
-        ser << stackTop << doesNotNeedSp << isInvokeMethod << cmresAlias;
+    void SerializeVisitor::preVisit ( ExprIs * expr ) {
+        serializeBase(expr);
+        ser << expr->subexpr << expr->typeexpr;
     }
 
-    void ExprAssert::serialize(AstSerializer & ser) {
-        ExprLikeCall<ExprAssert>::serialize(ser);
-        ser << isVerify;
+    void SerializeVisitor::preVisit ( ExprAscend * expr ) {
+        serializeBase(expr);
+        ser << expr->subexpr << expr->ascType << expr->stackTop << expr->ascendFlags;
     }
 
-    void ExprQuote::serialize(AstSerializer & ser) {
-        ExprLikeCall<ExprQuote>::serialize(ser);
+    void SerializeVisitor::preVisit ( ExprCast * expr ) {
+        serializeBase(expr);
+        ser << expr->subexpr << expr->castType << expr->castFlags;
     }
 
-    template <typename It, typename SimNodeT, bool first>
-    void ExprTableKeysOrValues<It,SimNodeT,first>::serialize(AstSerializer & ser) {
-        ExprLooksLikeCall::serialize(ser);
+    void SerializeVisitor::preVisit ( ExprNew * expr ) {
+        serializeCallFunc(expr);
+        ser << expr->typeexpr << expr->initializer << expr->allocate_on_stack;
     }
 
-    template <typename It, typename SimNodeT>
-    void ExprArrayCallWithSizeOrIndex<It,SimNodeT>::serialize(AstSerializer & ser) {
-        ExprLooksLikeCall::serialize(ser);
+    void SerializeVisitor::preVisit ( ExprCall * expr ) {
+        serializeCallFunc(expr);
+        ser << expr->doesNotNeedSp << expr->cmresAlias;
     }
 
-    void ExprTypeInfo::serialize(AstSerializer & ser) {
-        Expression::serialize(ser);
-        ser << trait << subexpr << typeexpr << subtrait << extratrait << macro;
+    void SerializeVisitor::preVisit ( ExprIfThenElse * expr ) {
+        serializeBase(expr);
+        ser << expr->cond << expr->if_true << expr->if_false << expr->ifFlags;
     }
 
-    void ExprIs::serialize(AstSerializer & ser) {
-        Expression::serialize(ser);
-        ser << subexpr << typeexpr;
+    void SerializeVisitor::preVisit ( ExprNamedCall * expr ) {
+        serializeBase(expr);
+        ser << expr->name << expr->nonNamedArguments << expr->arguments << expr->argumentsFailedToInfer;
     }
 
-    void ExprAscend::serialize(AstSerializer & ser) {
-        Expression::serialize(ser);
-        ser << subexpr << ascType << stackTop << ascendFlags;
+    void SerializeVisitor::preVisit ( ExprMakeStruct * expr ) {
+        serializeMakeLocal(expr);
+        ser << expr->structs << expr->block << expr->makeStructFlags;
+        ser.serializePointer(expr->constructor);
     }
 
-    void ExprCast::serialize(AstSerializer & ser) {
-        Expression::serialize(ser);
-        ser << subexpr << castType << castFlags;
+    void SerializeVisitor::preVisit ( ExprMakeVariant * expr ) {
+        serializeMakeLocal(expr);
+        ser << expr->variants;
     }
 
-    void ExprNew::serialize(AstSerializer & ser) {
-        ExprCallFunc::serialize(ser);
-        ser << typeexpr << initializer;
+    void SerializeVisitor::preVisit ( ExprMakeArray * expr ) {
+        serializeMakeArray(expr);
     }
 
-    void ExprCall::serialize(AstSerializer & ser) {
-        ExprCallFunc::serialize(ser);
-        ser << doesNotNeedSp << cmresAlias;
+    void SerializeVisitor::preVisit ( ExprMakeTuple * expr ) {
+        serializeMakeArray(expr);
+        ser << expr->isKeyValue << expr->recordNames << expr->shorthandRecordNames;
     }
 
-    void ExprIfThenElse::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << cond << if_true << if_false << ifFlags;
+    void SerializeVisitor::preVisit ( ExprArrayComprehension * expr ) {
+        serializeBase(expr);
+        ser << expr->exprFor << expr->exprWhere << expr->subexpr << expr->generatorSyntax << expr->tableSyntax;
+    }
+
+    void SerializeVisitor::preVisit ( ExprTypeDecl * expr ) {
+        serializeBase(expr);
+        ser << expr->typeexpr;
+    }
+
+    AstSerializer & AstSerializer::operator << ( ExpressionPtr & expr ) {
+        dtag(HASH_TAG("ExpressionPtr"));
+        bool is_null = expr == nullptr;
+        *this << is_null;
+        if ( is_null ) {
+            if ( !writing ) expr = nullptr;
+            return *this;
+        }
+        SerializeVisitor sv(*this);
+        if ( writing ) {
+            uint32_t rtti = hash_tag(expr->__rtti);
+            DAS_ASSERT(rtti);
+            *this << rtti;
+            expr->dispatch(sv);
+        } else {
+            uint32_t rtti = 0; *this << rtti;
+            auto itA = rttiHash2Annotation.find(rtti);
+            SERIALIZER_VERIFYF(itA != rttiHash2Annotation.end(), "annotation '%u' is not found", rtti);
+            auto annotation = itA->second;
+            expr = (Expression *) static_cast<TypeAnnotation*>(annotation)->factory();
+            expr->dispatch(sv);
+        }
+        dtag(HASH_TAG("/ExpressionPtr"));
+        return *this;
     }
 
     void MakeFieldDecl::serialize ( AstSerializer & ser ) {
         ser << at << name << value << tag << flags;
-        ptr_ref_count::serialize(ser);
     }
 
     void MakeStruct::serialize( AstSerializer & ser ) {
         ser << static_cast <vector<MakeFieldDeclPtr> &> ( *this );
-        ptr_ref_count::serialize(ser);
-    }
-
-    void ExprNamedCall::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << name << nonNamedArguments << arguments << argumentsFailedToInfer;
-    }
-
-    void ExprMakeLocal::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << makeType << stackTop << extraOffset << makeFlags;
-    }
-
-    void ExprMakeStruct::serialize ( AstSerializer & ser ) {
-        ExprMakeLocal::serialize(ser);
-        ser << structs << block << makeStructFlags << constructor;
-    }
-
-    void ExprMakeVariant::serialize ( AstSerializer & ser ) {
-        ExprMakeLocal::serialize(ser);
-        ser << variants;
-    }
-
-    void ExprMakeArray::serialize ( AstSerializer & ser ) {
-        ExprMakeLocal::serialize(ser);
-        ser << recordType << values << gen2;
-    }
-
-    void ExprMakeTuple::serialize ( AstSerializer & ser ) {
-        ExprMakeArray::serialize(ser);
-        ser << isKeyValue << recordNames;
-    }
-
-    void ExprArrayComprehension::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << exprFor << exprWhere << subexpr << generatorSyntax << tableSyntax;
-    }
-
-    void ExprTypeDecl::serialize ( AstSerializer & ser ) {
-        Expression::serialize(ser);
-        ser << typeexpr;
-    }
-
-    void Expression::serialize ( AstSerializer & ser ) {
-        ser << at
-            << type
-            << genFlags
-            << flags
-            << printFlags;
-        ptr_ref_count::serialize(ser);
     }
 
     void FileInfo::serialize ( AstSerializer & ser ) {
@@ -1724,13 +2143,12 @@ namespace das {
                 callFactory, "could not find CallMacro '%s' in the module '%s'",
                 name.c_str(), mod->name.c_str()
             );
-            auto exprLooksLikeCall = (*callFactory)({});
+            gc_local<Expression> exprLooksLikeCall = (*callFactory)({});
             SERIALIZER_VERIFYF(
                 strncmp("ExprCallMacro", exprLooksLikeCall->__rtti, 14) == 0,
                 "excepted to see an ExprCallMacro"
             );
-            ptr = static_cast<ExprCallMacro *>(exprLooksLikeCall)->macro;
-            delete exprLooksLikeCall;
+            ptr = static_cast<ExprCallMacro *>(exprLooksLikeCall.ptr)->macro;
         }
         return *this;
     }
@@ -1779,7 +2197,7 @@ namespace das {
                     return true;
                 },"*");
             // always finalize annotations
-                (*daScriptEnvironment::bound)->g_Program = program;
+                daScriptEnvironment::getBound()->g_Program = program;
                 program->finalizeAnnotations();
 
                 if ( is_macro_module ) {
@@ -1787,8 +2205,16 @@ namespace das {
                     reinstantiateMacroModuleState(ser, program);
                     ser.totMacroTime += get_time_usec(time0);
                 }
+
+            // collect TypeDecl nodes onto module root
+                this_mod->gc_collect(gc_root::gc_get_active_root());
+
             // unbind the module from the program
                 program->thisModule.release();
+            } else {
+                // we DO NOT collect something which is "already exists"
+                // we leave it hanging, and we keep links to types from other modules and let them claim
+                // this_mod->gc_collect(gc_root::gc_get_active_root());
             }
         }
     }
@@ -1800,20 +2226,24 @@ namespace das {
             uint64_t sz = f->useFunctions.size();
             ser << sz;
             for ( auto & usedFun : f->useFunctions ) {
-                bool builtin = usedFun->module->builtIn;
+                // cross-module refs by module+mangled-name-hash — see serializeUseVariables(FunctionPtr)
+                bool builtin = usedFun->module->builtIn || usedFun->module != f->module;
                 ser << builtin;
                 if ( builtin ) {
                     uint64_t module = usedFun->module->nameHash;
                     uint64_t mnh = usedFun->getMangledNameHash();
                     ser << module << mnh;
                 } else {
-                    void * addr = usedFun;
-                    ser << addr;
+                    auto fid = ser.getSerializeId(usedFun);
+                    if ( ser.smartFunctionMap.find(fid) == ser.smartFunctionMap.end() )
+                        LOG(LogLevel::warning) << "das: serialize: [write] unregistered id for function '" << usedFun->name
+                            << "' of module '" << usedFun->module->name << "' in use-set of fn '" << f->name << "' - will be unresolvable on read\n";
+                    ser << fid;
                 }
             }
         } else {
             string fname; ser << fname;
-            SERIALIZER_VERIFYF(fname == f->name, "expected to serialize in the same order");
+            SERIALIZER_VERIFYF(fname == f->name, "expected to serialize in the same order: %s != %s", fname.c_str(), f->name.c_str());
             uint64_t size = 0; ser << size;
             f->useFunctions.reserve(size);
             for ( uint64_t i = 0; i < size; i++ ) {
@@ -1824,15 +2254,18 @@ namespace das {
                     uint64_t mnh = 0;
                     ser << module << mnh;
                     auto pModule = ser.moduleLibrary->findModuleByMangledNameHash(module);
-                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu'", module);
+                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu' (useFunctions[%llu/%llu] of function '%s')",
+                        (unsigned long long) module, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     auto fun = pModule->findFunctionByMangledNameHash(mnh);
-                    SERIALIZER_VERIFYF(fun, "expected to find function");
-                    f->useFunctions.emplace(fun.get());
+                    SERIALIZER_VERIFYF(fun, "expected to find function (mnh %llu in module '%s', useFunctions[%llu/%llu] of function '%s')",
+                        (unsigned long long) mnh, pModule->name.c_str(), (unsigned long long) i, (unsigned long long) size, f->name.c_str());
+                    f->useFunctions.emplace(fun);
                 } else {
-                    void * addr = nullptr; ser << addr;
-                    auto fun = ser.smartFunctionMap[(uint64_t)(uintptr_t) addr];
-                    SERIALIZER_VERIFYF(fun, "expected to find function");
-                    f->useFunctions.emplace(fun.get());
+                    SerializeNodeId fid; ser << fid;
+                    auto fun = ser.smartFunctionMap[fid];
+                    SERIALIZER_VERIFYF(fun, "expected to find function (id %p:%llu, useFunctions[%llu/%llu] of function '%s')",
+                        fid.ptr, (unsigned long long) fid.epoch, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
+                    f->useFunctions.emplace(fun);
                 }
             }
         }
@@ -1845,21 +2278,24 @@ namespace das {
             uint64_t sz = f->useFunctions.size();
             ser << sz;
             for ( auto & usedFun : f->useFunctions ) {
-                bool builtin = usedFun->module->builtIn;
+                // cross-module refs by module+mangled-name-hash — see serializeUseVariables(FunctionPtr)
+                bool builtin = usedFun->module->builtIn || usedFun->module != f->module;
                 ser << builtin;
                 if ( builtin ) {
                     uint64_t module = usedFun->module->nameHash;
                     uint64_t mnh = usedFun->getMangledNameHash();
                     ser << module << mnh;
                 } else {
-                    // we serialize the address of the function (not the function itself
-                    void * addr = usedFun;
-                    ser << addr;
+                    auto fid = ser.getSerializeId(usedFun);
+                    if ( ser.smartFunctionMap.find(fid) == ser.smartFunctionMap.end() )
+                        LOG(LogLevel::warning) << "das: serialize: [write] unregistered id for function '" << usedFun->name
+                            << "' of module '" << usedFun->module->name << "' in use-set of global '" << f->name << "' - will be unresolvable on read\n";
+                    ser << fid;
                 }
             }
         } else {
             string name; ser << name;
-            SERIALIZER_VERIFYF(name == f->name, "expected to serialize in the same order");
+            SERIALIZER_VERIFYF(name == f->name, "expected to serialize in the same order: %s != %s", name.c_str(), f->name.c_str());
             uint64_t size = 0; ser << size;
             f->useFunctions.reserve(size);
             for ( uint64_t i = 0; i < size; i++ ) {
@@ -1870,15 +2306,18 @@ namespace das {
                     uint64_t mnh = 0;
                     ser << module << mnh;
                     auto pModule = ser.moduleLibrary->findModuleByMangledNameHash(module);
-                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu'", module);
+                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu' (useFunctions[%llu/%llu] of global '%s')",
+                        (unsigned long long) module, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     auto fun = pModule->findFunctionByMangledNameHash(mnh);
-                    SERIALIZER_VERIFYF(fun, "expected to find function");
-                    f->useFunctions.emplace(fun.get());
+                    SERIALIZER_VERIFYF(fun, "expected to find function (mnh %llu in module '%s', useFunctions[%llu/%llu] of global '%s')",
+                        (unsigned long long) mnh, pModule->name.c_str(), (unsigned long long) i, (unsigned long long) size, f->name.c_str());
+                    f->useFunctions.emplace(fun);
                 } else {
-                    void * addr = nullptr; ser << addr;
-                    auto fun = ser.smartFunctionMap[(uint64_t)(uintptr_t) addr];
-                    SERIALIZER_VERIFYF(fun, "expected to find function");
-                    f->useFunctions.emplace(fun.get());
+                    SerializeNodeId fid; ser << fid;
+                    auto fun = ser.smartFunctionMap[fid];
+                    SERIALIZER_VERIFYF(fun, "expected to find function (id %p:%llu, useFunctions[%llu/%llu] of global '%s')",
+                        fid.ptr, (unsigned long long) fid.epoch, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
+                    f->useFunctions.emplace(fun);
                 }
             }
         }
@@ -1891,20 +2330,27 @@ namespace das {
             uint64_t sz = f->useGlobalVariables.size();
             ser << sz;
             for ( auto & use : f->useGlobalVariables ) {
-                bool builtin = use->module->builtIn;
+                // cross-module refs must resolve by module+name: the owning module's content
+                // is NOT re-serialized in this program's stream (isNew=false skips it), so a
+                // SerializeNodeId written here would be unresolvable on read. The id branch is
+                // only valid for the function's own module, whose content is in this stream.
+                bool builtin = use->module->builtIn || use->module != f->module;
                 ser << builtin;
                 if ( builtin ) {
                     uint64_t module = use->module->nameHash;
                     string varname = use->name;
                     ser << module << varname;
                 } else {
-                    void * addr = use;
-                    ser << addr;
+                    auto vid = ser.getSerializeId(use);
+                    if ( ser.smartVariableMap.find(vid) == ser.smartVariableMap.end() )
+                        LOG(LogLevel::warning) << "das: serialize: [write] unregistered id for variable '" << use->name
+                            << "' of module '" << use->module->name << "' in use-set of fn '" << f->name << "' - will be unresolvable on read\n";
+                    ser << vid;
                 }
             }
         } else {
             string name; ser << name;
-            SERIALIZER_VERIFYF(name == f->name, "expected to serialize in the same order");
+            SERIALIZER_VERIFYF(name == f->name, "expected to serialize in the same order: %s %s", name.c_str(), f->name.c_str());
             uint64_t size = 0; ser << size;
             f->useGlobalVariables.reserve(size);
             for ( uint64_t i = 0; i < size; i++ ) {
@@ -1915,15 +2361,18 @@ namespace das {
                     string varname;
                     ser << module << varname;
                     auto pModule = ser.moduleLibrary->findModuleByMangledNameHash(module);
-                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu'", module);
+                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu' (useGlobalVariables[%llu/%llu] of function '%s')",
+                        (unsigned long long) module, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     auto var = pModule->findVariable(varname);
-                    SERIALIZER_VERIFYF(var, "expected to find variable '%s::%s'", pModule->name.c_str(), varname.c_str());
-                    f->useGlobalVariables.emplace(var.get());
+                    SERIALIZER_VERIFYF(var, "expected to find variable '%s::%s' (useGlobalVariables[%llu/%llu] of function '%s')",
+                        pModule->name.c_str(), varname.c_str(), (unsigned long long) i, (unsigned long long) size, f->name.c_str());
+                    f->useGlobalVariables.emplace(var);
                 } else {
-                    void * addr = nullptr; ser << addr;
-                    auto var = ser.smartVariableMap[(uint64_t)(uintptr_t) addr];
-                    SERIALIZER_VERIFYF(var, "expected to find variable");
-                    f->useGlobalVariables.emplace(var.get());
+                    SerializeNodeId vid; ser << vid;
+                    auto var = ser.smartVariableMap[vid];
+                    SERIALIZER_VERIFYF(var, "expected to find variable (id %p:%llu, useGlobalVariables[%llu/%llu] of function '%s')",
+                        vid.ptr, (unsigned long long) vid.epoch, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
+                    f->useGlobalVariables.emplace(var);
                 }
             }
         }
@@ -1936,20 +2385,24 @@ namespace das {
             uint64_t sz = f->useGlobalVariables.size();
             ser << sz;
             for ( auto & use : f->useGlobalVariables ) {
-                bool builtin = use->module->builtIn;
+                // cross-module refs by module+name — see serializeUseVariables(FunctionPtr)
+                bool builtin = use->module->builtIn || use->module != f->module;
                 ser << builtin;
                 if ( builtin ) {
                     uint64_t module = use->module->nameHash;
                     string varname = use->name;
                     ser << module << varname;
                 } else {
-                    void * addr = use;
-                    ser << addr;
+                    auto vid = ser.getSerializeId(use);
+                    if ( ser.smartVariableMap.find(vid) == ser.smartVariableMap.end() )
+                        LOG(LogLevel::warning) << "das: serialize: [write] unregistered id for variable '" << use->name
+                            << "' of module '" << use->module->name << "' in use-set of global '" << f->name << "' - will be unresolvable on read\n";
+                    ser << vid;
                 }
             }
         } else {
             string name; ser << name;
-            SERIALIZER_VERIFYF(name == f->name, "expected to serialize in the same order");
+            SERIALIZER_VERIFYF(name == f->name, "expected to serialize in the same order: %s != %s", name.c_str(), f->name.c_str());
             uint64_t size = 0; ser << size;
             f->useGlobalVariables.reserve(size);
             for ( uint64_t i = 0; i < size; i++ ) {
@@ -1960,31 +2413,34 @@ namespace das {
                     string varname;
                     ser << module << varname;
                     auto pModule = ser.moduleLibrary->findModuleByMangledNameHash(module);
-                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu'", module);
+                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu' (useGlobalVariables[%llu/%llu] of global '%s')",
+                        (unsigned long long) module, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     auto var = pModule->findVariable(varname);
-                    SERIALIZER_VERIFYF(var, "expected to find variable '%s::%s'", pModule->name.c_str(), varname.c_str());
-                    f->useGlobalVariables.emplace(var.get());
+                    SERIALIZER_VERIFYF(var, "expected to find variable '%s::%s' (useGlobalVariables[%llu/%llu] of global '%s')",
+                        pModule->name.c_str(), varname.c_str(), (unsigned long long) i, (unsigned long long) size, f->name.c_str());
+                    f->useGlobalVariables.emplace(var);
                 } else {
-                    void * addr = nullptr; ser << addr;
-                    auto var = ser.smartVariableMap[(uint64_t)(uintptr_t) addr];
-                    SERIALIZER_VERIFYF(var, "expected to find variable");
-                    f->useGlobalVariables.emplace(var.get());
+                    SerializeNodeId vid; ser << vid;
+                    auto var = ser.smartVariableMap[vid];
+                    SERIALIZER_VERIFYF(var, "expected to find variable (id %p:%llu, useGlobalVariables[%llu/%llu] of global '%s')",
+                        vid.ptr, (unsigned long long) vid.epoch, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
+                    f->useGlobalVariables.emplace(var);
                 }
             }
         }
     }
 
-    void serializeGlobals ( AstSerializer & ser, safebox<Variable> & globals ) {
+    void serializeGlobals ( AstSerializer & ser, safebox<Variable, VariablePtr> & globals ) {
         if ( ser.writing ) {
             uint64_t size = globals.unlocked_size(); ser << size;
             globals.foreach ( [&] ( VariablePtr g ) {
                 ser << g;
             });
         } else {
-            safebox<Variable> result;
+            safebox<Variable, VariablePtr> result;
             uint64_t size = 0; ser << size;
             for ( uint64_t i = 0; i < size; i++ ) {
-                VariablePtr g; ser << g;
+                VariablePtr g = nullptr; ser << g;
                 SERIALIZER_VERIFYF(g!=nullptr, "expected to find variable");
                 result.insert(g->name, g);
             }
@@ -1992,7 +2448,7 @@ namespace das {
         }
     }
 
-    void serializeStructures ( AstSerializer & ser, safebox<Structure> & structures ) {
+    void serializeStructures ( AstSerializer & ser, safebox<Structure, StructurePtr> & structures ) {
         if ( ser.writing ) {
             uint64_t size = structures.unlocked_size(); ser << size;
             structures.foreach ( [&] ( StructurePtr g ) {
@@ -2001,14 +2457,14 @@ namespace das {
         } else {
             uint64_t size = 0; ser << size;
             for ( uint64_t i = 0; i < size; i++ ) {
-                StructurePtr g; ser << g;
+                StructurePtr g = nullptr; ser << g;
                 SERIALIZER_VERIFYF(g!=nullptr, "expected to find structure");
                 structures.insert(g->name, g);
             }
         }
     }
 
-    void serializeFunctions ( AstSerializer & ser, safebox<Function> & functions ) {
+    void serializeFunctions ( AstSerializer & ser, safebox<Function, FunctionPtr> & functions ) {
         if ( ser.writing ) {
             uint64_t size = functions.unlocked_size(); ser << size;
             functions.foreach ( [&] ( FunctionPtr g ) {
@@ -2019,10 +2475,24 @@ namespace das {
             uint64_t size = 0; ser << size;
             for ( uint64_t i = 0; i < size; i++ ) {
                 string name; ser << name;
-                FunctionPtr g; ser << g;
+                FunctionPtr g = nullptr; ser << g;
                 SERIALIZER_VERIFYF(g!=nullptr, "expected to find function");
                 functions.insert(name, g);
             }
+        }
+    }
+
+    void serializeFunctionPointerVector ( AstSerializer & ser, vector<Function *> & functions ) {
+        ser.dtag("Vector",hash_tag("Vector"));
+        if ( ser.writing ) {
+            uint64_t size = functions.size();
+            ser.serializeAdaptiveSize64(size);
+            for ( auto & f : functions ) ser.serializePointer(f);
+        } else {
+            uint64_t size = 0;
+            ser.serializeAdaptiveSize64(size);
+            functions.resize(size);
+            for ( auto & f : functions ) ser.serializePointer(f);
         }
     }
 
@@ -2034,7 +2504,7 @@ namespace das {
             uint32_t count = 0;
             functionsByName.foreach ([&] ( uint64_t nameHash, vector<Function *> & functions ) {
                 ser << nameHash;
-                ser << functions;
+                serializeFunctionPointerVector(ser, functions);
                 count ++;
             });
             DAS_VERIFYF(count == size, "expected to serialize all functions");
@@ -2044,7 +2514,8 @@ namespace das {
             functionsByName.reserve(capacity);
             for ( uint32_t i = 0; i < size; i++ ) {
                 uint64_t nameHash = 0; ser << nameHash;
-                vector<Function *> functions; ser << functions;
+                vector<Function *> functions;
+                serializeFunctionPointerVector(ser, functions);
                 functionsByName[nameHash] = das::move(functions);
             }
         }
@@ -2054,7 +2525,63 @@ namespace das {
         ser.tag(HASH_TAG("Module"));
         ser << name << nameHash << moduleFlags;
         ser << annotationData << requireModule;
+        // das-declared distinct types round-trip with the module (C++-module annotations
+        // re-register on load, parser-created ones don't). they stream BEFORE aliasTypes and
+        // enumerations - any TypeDecl deserialized below resolves tDistinct annotation
+        // pointers via findAnnotation, so the entities must exist first
+        if ( ser.writing ) {
+            uint64_t dtSize = 0;
+            for ( auto & [key, ann] : handleTypes ) {
+                (void) key;
+                if ( ann->rtti_isDistinctTypeAnnotation() ) dtSize ++;
+            }
+            ser << dtSize;
+            for ( auto & [key, ann] : handleTypes ) {
+                (void) key;
+                if ( !ann->rtti_isDistinctTypeAnnotation() ) continue;
+                auto dann = static_cast<DistinctTypeAnnotation *>(ann);
+                ser << dann->name << dann->cppName << dann->at << dann->isPrivate << dann->underlyingType;
+            }
+        } else {
+            uint64_t dtSize = 0;
+            ser << dtSize;
+            for ( uint64_t i=0; i<dtSize; ++i ) {
+                string dname, dcppName;
+                LineInfo dat;
+                bool dpriv = false;
+                TypeDeclPtr dunder = nullptr;
+                ser << dname << dcppName << dat << dpriv << dunder;
+                auto dann = new DistinctTypeAnnotation(dname, dunder, dcppName);
+                dann->at = dat;
+                dann->isPrivate = dpriv;
+                addAnnotation(dann, true);
+            }
+        }
         ser << aliasTypes     << enumerations;
+        /*
+        // serialize handleTypes (annotation lookup table)
+        if ( ser.writing ) {
+            uint64_t htSize = handleTypes.size();
+            ser << htSize;
+            for ( auto & [key, ann] : handleTypes ) {
+                ser << key;
+                AnnotationPtr a = ann;
+                ser << a;
+            }
+        } else {
+            uint64_t htSize = 0;
+            ser << htSize;
+            for ( uint64_t i = 0; i < htSize; i++ ) {
+                uint64_t key = 0;
+                ser << key;
+                AnnotationPtr a = nullptr;
+                ser << a;
+                if ( a ) {
+                    handleTypes[key] = a;
+                }
+            }
+        }
+        */
         ser << keywords;
         ser << typeFunctions;
         serializeGlobals(ser, globals); // globals require insertion in the same order
@@ -2067,34 +2594,36 @@ namespace das {
         serializeFunctionsByName(ser, genericsByName);
         ser << ownFileInfo;     //<< promotedAccess;
 
-        functions.foreach ([&] ( smart_ptr<Function> f ) {
+        functions.foreach ([&] ( FunctionPtr f ) {
             if ( ser.writing ) {
                 ser << f->name;
             } else {
                 string fname; ser << fname;
-                SERIALIZER_VERIFYF(fname == f->name, "expected to walk in the same order");
+                SERIALIZER_VERIFYF(fname == f->name, "expected to walk in the same order: %s != %s", fname.c_str(), f->name.c_str());
             }
             serializeUseVariables(ser, f);
             serializeUseFunctions(ser, f);
         });
 
-        generics.foreach ([&] ( smart_ptr<Function> f ) {
+        generics.foreach ([&] ( FunctionPtr f ) {
             if ( ser.writing ) {
                 ser << f->name;
             } else {
                 string fname; ser << fname;
-                SERIALIZER_VERIFYF(fname == f->name, "expected to walk in the same order");
+                SERIALIZER_VERIFYF(fname == f->name, "expected to walk in the same order: %s != %s", fname.c_str(), f->name.c_str());
             }
             serializeUseVariables(ser, f);
             serializeUseFunctions(ser, f);
         });
 
-        globals.foreach_with_hash ([&](smart_ptr<Variable> g, uint64_t hash) {
+        globals.foreach ([&]( VariablePtr g ) {
+            uint64_t hash = hash64z(g->name.c_str());
             if ( ser.writing ) {
                 ser << hash;
             } else {
                 uint64_t h = 0; ser << h;
-                SERIALIZER_VERIFYF(h == hash, "expected to walk in the same order");
+                SERIALIZER_VERIFYF(h == hash, "expected to walk in the same order: %llu != %llu",
+                    (unsigned long long) h, (unsigned long long) hash);
             }
             serializeUseVariables(ser, g);
             serializeUseFunctions(ser, g);
@@ -2130,6 +2659,15 @@ namespace das {
         void visit( Module * mod ) {
             if ( visited[mod] != NOT_SEEN ) return;
             visited[mod] = IN_PROGRESS;
+            // visibleEverywhere modules (!inscope)
+            // are implicit dependencies of every other module
+            if ( !mod->visibleEverywhere ) {
+                for ( const auto dep : input ) {
+                    if ( dep != mod && dep->visibleEverywhere ) {
+                        visit(dep);
+                    }
+                }
+            }
             for ( auto [module, required] : mod->requireModule ) {
                 if ( module != mod ) {
                     visit(module);
@@ -2151,12 +2689,17 @@ namespace das {
         // This is like so because of several fields with strings
         *this << value.aot
               << value.aot_module
+              << value.aot_macros
+              << value.tune_frozen
               << value.completion
+              << value.building_documentation
               << value.export_all
+              << value.serialize_main_module
               << value.keep_alive
               << value.very_safe_context
-              << value.always_report_candidates_threshold
               << value.max_infer_passes
+              << value.max_call_depth
+              << value.verify_infer_types
               << value.stack
               << value.intern_strings
               << value.persistent_heap
@@ -2166,6 +2709,11 @@ namespace das {
               << value.solid_context
               << value.macro_context_persistent_heap
               << value.macro_context_collect
+              << value.max_static_variables_size
+              << value.max_heap_allocated
+              << value.max_string_heap_allocated
+              << value.max_unreserved_size
+              << value.track_allocations
               << value.rtti
               << value.unsafe_table_lookup
               << value.relaxed_pointer_const
@@ -2174,6 +2722,7 @@ namespace das {
               << value.relaxed_assign
               << value.no_unsafe
               << value.local_ref_is_unsafe
+              << value.with_module_is_unsafe
               << value.no_global_variables
               << value.no_global_variables_at_all
               << value.no_global_heap
@@ -2194,16 +2743,38 @@ namespace das {
               << value.no_members_functions_in_struct
               << value.no_local_class_members
               << value.no_unsafe_uninitialized_structures
+              << value.default_init_containers
               << value.strict_properties
+              << value.no_writing_to_nameless
               << value.no_optimizations
+              << value.fast_math
+              << value.disable_dse
+              << value.disable_cse
+              << value.disable_temp_string_reclaim
+              << value.disable_inline
+              << value.disable_auto_inline
+              << value.auto_inline_functions
+              << value.auto_inline_cost
+              << value.disable_run
+              << value.no_infer_time_folding
               << value.fail_on_no_aot
               << value.fail_on_lack_of_aot_export
               << value.no_fast_call
+              << value.fusion
+              << value.scoped_stack_allocator
+              << value.force_inscope_pod
+              << value.log_inscope_pod
               << value.debugger
-              << value.debug_module
               << value.profiler
-              << value.profile_module
-              << value.jit
+              << value.jit_enabled
+              << value.jit_jit_all_functions
+              << value.jit_debug_info
+              << value.jit_opt_level
+              << value.jit_size_level
+              << value.jit_dll_mode
+              << value.jit_output_path
+              << value.jit_path_to_shared_lib
+              << value.jit_path_to_linker
               << value.threadlock_context;
         return *this;
     }
@@ -2214,8 +2785,58 @@ namespace das {
     }
 
     // Used in eden
+    // if an early return (bad hash, missing module, throw) leaves the thread-active
+    // root pointing at a scope-local gc_root, repoint it to the permanent thread root
+    // before the local dies
+    struct ActiveRootGuard {
+        gc_root * scopeRoot;
+        ~ActiveRootGuard() {
+            auto & active = gc_root::gc_get_active_root();
+            if ( active == scopeRoot ) active = &gc_root::gc_get_thread_root();
+        }
+    };
+
+    // embedders are built without exception handling, so nothing may escape this
+    // rail: contain dasException here (truncated/corrupt cache streams throw from
+    // the stream readers) and report failure through the failed/failToCompile flags
     void AstSerializer::serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept {
+        try {
+            serializeProgramImpl(program, libGroup);
+        } catch ( const dasException & r ) {
+            LOG(LogLevel::warning) << "das: serialize: program " << (writing ? "write" : "read") << " failed: " << r.what() << "\n";
+            failed = true;
+            seenNewModule = true;
+            if ( program ) program->failToCompile = true;
+            // scope guards in the impl repointed the active gc root during unwind;
+            // the caller replaces the (now gutted) program via replaceProgramKeepGcRootValid
+        } catch ( ... ) {
+            // this method is noexcept for embedders built without EH; a non-das
+            // exception (e.g. std::bad_alloc deep in deserialization) escaping here
+            // would std::terminate. Contain it the same way and report failure.
+            LOG(LogLevel::warning) << "das: serialize: program " << (writing ? "write" : "read") << " failed: unknown exception\n";
+            failed = true;
+            seenNewModule = true;
+            if ( program ) program->failToCompile = true;
+        }
+    }
+
+    void AstSerializer::serializeProgramImpl ( ProgramPtr program, ModuleGroup & libGroup ) {
         auto & ser = *this;
+        // version gate — the module-cache path (trySerializeProgramModule) checks only
+        // mtime+filename before this; a cache written by a different serializer version must
+        // fail cleanly here (the caller falls back to a full parse on ser.failed), not misparse
+        // every field after the first layout difference
+        uint32_t version = getVersion();
+        ser << version;
+        if ( !ser.writing && version != getVersion() ) {
+            LOG(LogLevel::warning) << "das: deserialize: module cache version " << version
+                << " does not match serializer version " << getVersion() << "\n";
+            ser.failed = true;
+            return;
+        }
+        // Bump epoch so reused pointer addresses across program boundaries
+        // get distinct SerializeNodeIds on this persistent serializer.
+        ser.epoch++;
 
         ser << program->thisNamespace << program->thisModuleName;
 
@@ -2226,6 +2847,7 @@ namespace das {
         ser << program->options << program->policies;
 
         if ( writing ) {
+            moduleLibrary = &program->library;  // Module::serialize binds *moduleLibrary (finalizeModule)
             TopSort ts(program->library.getModules());
             auto modules = ts.getDependecyOrdered(program->thisModule.get());
 
@@ -2241,13 +2863,27 @@ namespace das {
                     continue;
                 }
 
-                if ( writingReadyModules.count(m) == 0 ) {
+                bool isNew = writingReadyModules.count(m) == 0;
+                *this << isNew;
+                if ( isNew ) {
                     writingReadyModules.insert(m);
                     *this << *m;
                 }
             }
         } else {
             uint64_t size = 0; ser << size;
+
+            // parseDaScript runs with the placeholder thisModule's gc root as the
+            // thread-active root; library.reset() below deletes that module (and its
+            // root) — repoint the active root as we go, or every node deserialized
+            // after this line gc_links through a dangling pointer into freed memory
+            auto & activeRoot = gc_root::gc_get_active_root();
+            const bool activeWasThisModule = program->thisModule && activeRoot == program->thisModule->module_gc_root.get();
+            // throwaway already-exists reads park nodes here — they may be referenced
+            // through the patch maps until all modules are read, then sweep with scope
+            gc_root throwaway_root;
+            ActiveRootGuard throwaway_guard { &throwaway_root };
+            if ( activeWasThisModule ) activeRoot = &throwaway_root;
 
             program->library.reset();
             program->thisModule.release();
@@ -2274,48 +2910,112 @@ namespace das {
                     continue;
                 }
 
-                if ( auto m = libGroup.findModule(name) ) {
-                    program->library.addModule(m);
-                    continue;
+                bool isNew = false;
+                *this << isNew;
+                Module * existing = libGroup.findModule(name);
+                if ( !isNew ) {
+                    if ( existing ) {
+                        program->library.addModule(existing);
+                        continue;
+                    }
+                    LOG(LogLevel::warning) << "das: serialize: module '" << name << "' not found";
+                    program->failToCompile = true;
+                    return;
                 }
 
                 Module* deser = nullptr;
                 try {
                     deser = new Module();
                     deser->setModuleName(name);
+                    if ( existing ) {
+                        program->library.addModule(existing);
+                        // throwaway read into a temp module — keep nodes off its root
+                        // (they may be referenced through the patch maps past `delete deser`)
+                        ser.serializeModule(*deser, /*already_exists*/true);
+                        deser->builtIn = false; // suppress dtor unlink assert
+                        delete deser;
+                        continue;
+                    }
                     program->library.addModule(deser);
+                    if ( activeWasThisModule ) activeRoot = deser->module_gc_root.get();
                     ser << *deser;
-                } catch ( const std::runtime_error & r ) {
+                    if ( activeWasThisModule ) activeRoot = &throwaway_root;
+                } catch ( const dasException & r ) {
+                    if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
                     delete deser;
-                    LOG(LogLevel::warning) << "das: serialize: " << r.what();
+                    LOG(LogLevel::warning) << "das: serialize: reading module '" << name << "' (" << i << "/" << size
+                                           << (existing ? ", already exists" : ", new") << "): " << r.what() << "\n";
                     program->failToCompile = true;
                     return;
+                } catch ( ... ) {
+                    // a non-das exception (e.g. std::bad_alloc) escaping ser << *deser would
+                    // otherwise leave the thread active root pointing at deser's root, which
+                    // dies with the replaced program (the ActiveRootGuard only tracks
+                    // throwaway_root). Restore the thread root and rethrow to the noexcept
+                    // serializeProgram boundary, which reports failure.
+                    if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
+                    delete deser;
+                    throw;
                 }
             }
 
-            program->thisModule.reset(program->library.getModules().back());
-        }
-    }
+            // corrupt stream can read module count as 0: back() on the empty list is UB
+            if ( program->library.getModules().empty() ) {
+                LOG(LogLevel::warning) << "das: serialize: program stream has no modules\n";
+                program->failToCompile = true;
+                return;
+            }
 
-    uint32_t AstSerializer::getVersion () {
-        static constexpr uint32_t currentVersion = 138;
-        return currentVersion;
+            program->thisModule.reset(program->library.getModules().back());
+            // the deserialized module is the program's module now — new nodes and the
+            // ModuleGcFinalize collect belong on its root
+            if ( activeWasThisModule ) activeRoot = program->thisModule->module_gc_root.get();
+        }
+
+        // drop ref_counts
+        smartEnumerationMap.clear();
+        smartStructureMap.clear();
+        smartVariableMap.clear();
+        smartFunctionMap.clear();
+        smartMakeStructMap.clear();
+        smartTypeDeclMap.clear();
+        exprBlockMap.clear();
     }
 
     // Serializes the whole script as opposed to just one module
-    bool AstSerializer::serializeScript ( ProgramPtr program ) noexcept {
+    bool WIN_EH_NO_ASAN AstSerializer::serializeScript ( ProgramPtr program ) noexcept {
         try {
             program->serialize(*this);
             return true;
-        } catch ( const std::runtime_error & r ) {
+        } catch ( const dasException & r ) {
             program->failToCompile = true;
-            LOG(LogLevel::warning) << "das: serialize: " << r.what();
+            LOG(LogLevel::warning) << "das: serialize:" << r.what();
+            return false;
+        } catch ( ... ) {
+            // noexcept for embedders built without EH: a non-das exception (e.g.
+            // std::bad_alloc deep in serialize) would std::terminate here. Contain it.
+            program->failToCompile = true;
+            LOG(LogLevel::warning) << "das: serialize: unknown exception\n";
             return false;
         }
     }
 
     // Used in daNetGame currently
     void Program::serialize ( AstSerializer & ser ) {
+        // version gate: any layout change shifts every subsequent field, so a stale stream must
+        // fail cleanly here — not misparse into a patch() throw thousands of fields later
+        uint32_t version = AstSerializer::getVersion();
+        ser << version;
+        if ( !ser.writing && version != AstSerializer::getVersion() ) {
+            LOG(LogLevel::warning) << "das: deserialize: stream version " << version
+                << " does not match serializer version " << AstSerializer::getVersion() << "\n";
+            failToCompile = true;
+            return;
+        }
+        // Bump epoch so reused pointer addresses across program boundaries
+        // get distinct SerializeNodeIds on this persistent serializer.
+        ser.epoch++;
+
         ser << thisNamespace << thisModuleName;
 
         ser << totalFunctions      << totalVariables << newLambdaIndex;
@@ -2350,7 +3050,7 @@ namespace das {
             for ( auto & m : modules ) {
                 bool builtin = m->builtIn, promoted = m->promoted;
                 ser << builtin << promoted;
-                ser << m->name << m->fileName;
+                ser << m->name << m->fileName << m->promotedRequire;
 
                 if ( m->builtIn && m->promoted ) {
                     bool isNew = ser.writingReadyModules.count(m) == 0;
@@ -2370,6 +3070,17 @@ namespace das {
             return;
         }
 
+        // parseDaScript runs with the placeholder thisModule's gc root as the
+        // thread-active root; library.reset() below deletes that module (and its
+        // root) - without repointing, every node deserialized after this line would
+        // gc_link through a dangling root pointer into freed memory
+        auto & activeRoot = gc_root::gc_get_active_root();
+        const bool activeWasThisModule = thisModule && activeRoot == thisModule->module_gc_root.get();
+        // throwaway already-exists reads park nodes here - they may be referenced
+        // through the patch maps until all modules are read, then sweep with scope
+        gc_root throwaway_root;
+        ActiveRootGuard throwaway_guard { &throwaway_root };
+        if ( activeWasThisModule ) activeRoot = &throwaway_root;
         library.reset();
         thisModule.release();
         ser.moduleLibrary = &library;
@@ -2384,8 +3095,8 @@ namespace das {
         uint64_t size = 0; ser << size;
         for ( uint64_t i = 0; i < size; i++ ) {
             bool builtin = false, promoted = false;
-            string name, fileName;
-            ser << builtin << promoted << name << fileName;
+            string name, fileName, promotedRequire;
+            ser << builtin << promoted << name << fileName << promotedRequire;
             if ( builtin && !promoted ) {
                 // pass
             } else if ( builtin && promoted ) {
@@ -2397,14 +3108,27 @@ namespace das {
                     mod->fileName = fileName;
                     if ( prev ) {
                         library.addModule(prev);
+                        // throwaway read into a temp module — keep nodes off its root
+                        // (they may be referenced through the patch maps past `delete mod`)
                         ser.serializeModule(*mod, /*already_exists*/true);
                         mod->builtIn = false; // suppress assert
                         delete mod;
                     } else {
                         library.addModule(mod);
-                        ser.serializeModule(*mod, /*already_exists*/false);
+                        if ( activeWasThisModule ) activeRoot = mod->module_gc_root.get();
+                        // the active root points at mod's root while it is read; if the read
+                        // throws, mod dies with the replaced program, so drop the active root
+                        // back to the permanent thread root before the exception propagates
+                        // (the ActiveRootGuard only tracks throwaway_root, not this one)
+                        try {
+                            ser.serializeModule(*mod, /*already_exists*/false);
+                        } catch ( ... ) {
+                            if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
+                            throw;
+                        }
+                        if ( activeWasThisModule ) activeRoot = &throwaway_root;
                         mod->builtIn = false; // suppress assert
-                        mod->promoteToBuiltin(nullptr);
+                        mod->promoteToBuiltin(nullptr, promotedRequire);
                     }
                 } else {
                     Module * m = Module::require(name);
@@ -2415,11 +3139,23 @@ namespace das {
                 mod->setModuleName(name);
                 mod->fileName = fileName;
                 library.addModule(mod);
-                ser << *mod;
+                if ( activeWasThisModule ) activeRoot = mod->module_gc_root.get();
+                // see the promoted-new branch above: restore the thread root if the read
+                // throws, so a dangling mod->module_gc_root never stays the active root
+                try {
+                    ser << *mod;
+                } catch ( ... ) {
+                    if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
+                    throw;
+                }
+                if ( activeWasThisModule ) activeRoot = &throwaway_root;
             }
         }
 
         thisModule.reset(library.modules.back());
+        // the deserialized module is the program's module now — new nodes (allocateStack
+        // init script, etc.) and the ModuleGcFinalize collect belong on its root
+        if ( activeWasThisModule ) activeRoot = thisModule->module_gc_root.get();
 
         ser << allRequireDecl;
 
@@ -2428,6 +3164,94 @@ namespace das {
         removeUnusedSymbols();
         TextWriter logs;
         allocateStack(logs,true,false);
+    }
+
+    AstSerializerState * rtti_create_ast_serializer () {
+        auto state = new AstSerializerState();
+        state->storage = make_unique<SerializationStorageVector>();
+        state->serializer = make_unique<AstSerializer>(state->storage.get(), true);
+        return state;
+    }
+
+    AstSerializerState * rtti_create_ast_deserializer ( const TArray<uint8_t> & data ) {
+        auto state = new AstSerializerState();
+        state->storage = make_unique<SerializationStorageVector>();
+        state->storage->buffer.assign(data.data, data.data + data.size);
+        state->serializer = make_unique<AstSerializer>(state->storage.get(), false);
+        return state;
+    }
+
+    void rtti_delete_ast_serializer ( AstSerializerState * state ) {
+        if ( state ) {
+            state->serializer->moduleLibrary = nullptr;
+            delete state;
+        }
+    }
+
+    bool rtti_ast_serializer_serialize_program (
+            AstSerializerState * state,
+            const smart_ptr<Program> & program ) {
+        auto & prog = const_cast<smart_ptr<Program> &>(program);
+        prog->serialize(*state->serializer);
+        return !prog->failToCompile;
+    }
+
+    void rtti_ast_serializer_deserialize_program (
+            AstSerializerState * state,
+            const TBlock<void,bool,smart_ptr<Program>,const string> & block,
+            Context * context, LineInfoArg * at ) {
+        auto prog = make_smart<Program>();
+        {
+            gc_guard deserialize_gc_scope;
+            // same-version streams can still be truncated/corrupt: the stream readers throw
+            // dasException — turn it into the clean failToCompile path (mirrors serializeScript)
+            try {
+                prog->serialize(*state->serializer);
+            } catch ( const dasException & r ) {
+                prog->failToCompile = true;
+                LOG(LogLevel::warning) << "das: deserialize: " << r.what() << "\n";
+            }
+            /*
+            // THIS ONES ARE FROM THE "already exist" MODULES
+            auto leftover = deserialize_gc_scope.guard_root.gc_count;
+            if ( leftover ) {
+                LOG(LogLevel::warning) << "das: deserialize: " << leftover << " gc_node(s) left after deserialization\n";
+                deserialize_gc_scope.guard_root.gc_dump_to_thread_root();
+            }
+            */
+        }
+        // Module::serialize leaves g_Program pointing to a temporary program with a
+        // released thisModule. Restore it so compiling_module() sees the correct module
+        // during simulate() and while tests run inside the block.
+        auto & bound = *daScriptEnvironment::getBound();
+        auto savedProg = bound.g_Program;
+        bound.g_Program = prog.get();
+        if ( prog->failToCompile ) {
+            string err = "deserialization failed";
+            das_invoke<void>::invoke<bool,smart_ptr<Program>,const string &>(
+                context, at, block, false, ProgramPtr(), err);
+            (void)prog->thisModule.release();
+            prog->library.reset();
+            bound.g_Program = savedProg;
+            return;
+        }
+        string okStr;
+        das_invoke<void>::invoke<bool,smart_ptr<Program>,const string &>(
+            context, at, block, true, prog, okStr);
+        (void)prog->thisModule.release();
+        prog->library.reset();
+        bound.g_Program = savedProg;
+    }
+
+    void rtti_ast_serializer_get_data (
+            AstSerializerState * state,
+            const TBlock<void,TTemporary<TArray<uint8_t> const>> & block,
+            Context * context, LineInfoArg * at ) {
+        Array arr;
+        array_mark_locked(arr, state->storage->buffer.data(),
+            uint64_t(state->storage->buffer.size()), uint64_t(state->storage->buffer.size()));
+        vec4f args[1] = { cast<Array *>::from(&arr) };
+        context->invoke(block, args, nullptr, at);
     }
 
 }

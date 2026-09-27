@@ -19,7 +19,9 @@ using editorcore_extapi::dagGeom;
 
 objgenerator::WorldHugeBitmask bm_loft_mask[LAYER_ORDER_MAX], bm_poly_mask;
 //! allocated for this DLL plugin (but should be avoided in future)
+#if !_TARGET_STATIC_LIB
 objgenerator::WorldHugeBitmask objgenerator::lcmapExcl, objgenerator::splgenExcl;
+#endif
 
 
 static void build_loft_sizes(Tab<Point4> &lso, splineclass::LoftGeomGenData *g)
@@ -105,7 +107,9 @@ bool HmapLandPlugin::rebuildSplinesPolyBitmask(BBox2 &out_dirty_box)
     const objgenerator::LandClassData *lcd = sobj->getLandClass();
     if (lcd && lcd->data && lcd->data->genGeom && lcd->data->genGeom->foundationGeom)
     {
-      rasterize_poly_2(*bmPoly.bm, sobj->points, bmPoly.ox, bmPoly.oz, bmPoly.scale);
+      Tab<Point3> poly_pts(tmpmem);
+      sobj->getSmoothPoly(poly_pts);
+      rasterize_poly_2(*bmPoly.bm, poly_pts, bmPoly.ox, bmPoly.oz, bmPoly.scale);
       poly_count++;
     }
   }
@@ -419,9 +423,8 @@ void HmapLandPlugin::rebuildSplinesBitmask(bool auto_regen)
   if (IRendInstGenService *rigenSrv = DAGORED2->queryEditorInterface<IRendInstGenService>())
     rigenSrv->setSweepMask(objgenerator::lcmapExcl.bm, objgenerator::lcmapExcl.ox, objgenerator::lcmapExcl.oz,
       objgenerator::lcmapExcl.scale);
-  if (ISplineGenService *splSrv = EDITORCORE->queryEditorInterface<ISplineGenService>())
-    splSrv->setSweepMask(objgenerator::splgenExcl.bm, objgenerator::splgenExcl.ox, objgenerator::splgenExcl.oz,
-      objgenerator::splgenExcl.scale);
+  splSrv->setSweepMaskForSplines(objgenerator::splgenExcl);
+  splSrv->setSweepMaskForPolygons(objgenerator::lcmapExcl);
 
   if (excl_changed || poly_changed || loft_changed)
   {

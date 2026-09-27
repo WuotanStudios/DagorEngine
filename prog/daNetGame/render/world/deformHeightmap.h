@@ -39,8 +39,11 @@ public:
   bool isValid() const;
   bool isEnabled() const;
   void requestClear() { needClearDepth = true; }
+  void afterDeviceReset();
+  inline TMatrix getViewTm() const { return viewTm; }
   inline TMatrix getInverseViewTm() const { return iViewTm; }
   Point4 getDeformRect() const;
+  float getRadius() const { return boxSize * 0.5f; }
   void beforeRenderWorld(const Point3 &cam_pos);
   void beforeRenderDepth();
   void afterRenderDepth();
@@ -61,11 +64,15 @@ private:
   eastl::array<UniqueTex, 2> postFxTextures;
   eastl::array<UniqueTex, 2> maskGridTextures;
   eastl::array<UniqueTex, 2> deformInfoTextures;
+  UniqueBufWithShaderVar deformOccupiedTilesBitvector;
+  UniqueBufWithShaderVar reprojectionIndirectBuf;
+  UniqueBufWithShaderVar deformInfoTexClearTilesIndices;
   UniqueBuf postFxCellBuffer, clearCellBuffer;
   UniqueBuf indirectBuffer;
-  UniqueBufHolder hmapDeformParamsBuffer;
+  UniqueBufWithShaderVar hmapDeformParamsBuffer;
   eastl::unique_ptr<PostFxRenderer> reprojectPostFx;
   eastl::unique_ptr<ComputeShaderElement> clearMaskCs, deformCs, clearIndirect, dispatcherCs, edgeDetectCs, blurCs, clearerCs;
+  eastl::unique_ptr<ComputeShaderElement> clearReprojectionIndirect, classifyReprojectionTiles;
   shaders::UniqueOverrideStateId zFuncAlwaysStateId;
 
   bool needClearDepth;
@@ -77,8 +84,10 @@ private:
   ViewProjMatrixContainer origViewProj;
 
   void clear();
+  void fillDeformParams();
   void saveStates();
   void restoreStates();
 
   bool isCameraInFpsView() const;
+  bool supportsTiledReprojection() const;
 };

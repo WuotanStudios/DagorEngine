@@ -7,25 +7,19 @@ include "project_base_hmap.dshl"
 include "world_sdf.dshl"
 include "gbuffer.dshl"
 include "dagi_project_trace_common.dshl"
-
-hlsl {
-  #define DAGI_LIT_SCENE_TYPED_UAV_LOAD 1//fixme
-}
+include "dagi_blue_noise.dshl"
 
 macro NOISE(code)
+  DAGI_BLUE_NOISE(code)
   hlsl(code) {
-    #include <pcg_hash.hlsl>
-    #include <hammersley.hlsl>
-    #define TOTAL_JITTER_FRAMES 32//pow-of-2
     //[-0.5 0.5] texel (/w)
     float2 rand3D_radiance_grid_probe(uint3 v, uint2 oct_coord, uint w, uint frame = 0)
     {
-      uint3 rand;
-      frame &= (TOTAL_JITTER_FRAMES-1);
-      //rand = pcg3d_hash_16bit((v<<3) + uint3(oct_coord, frame));
-      //return float2(rand.xy*(1./65535)/w - 0.5/w);
-      rand = pcg3d_hash_16bit((v<<3) + uint3(oct_coord, 0));
-      return hammersley_rand16( frame, TOTAL_JITTER_FRAMES, rand.xy )/w - 0.5/w;
+      // the blue-noise R2 rotation has odd 16-bit strides, so a probe refreshed every
+      // batchCount-th clipFrame still visits 65536/gcd(batchCount,65536) sub-texel phases
+      // (8192 for pow-2 batch counts; the 32-entry Hammersley here collapsed to 4)
+      uint2 pixel = v.xy*w + oct_coord + v.z*uint2(59, 37);
+      return dagi_blue_noise2(pixel, frame)/w - 0.5/w;
     }
   }
 endmacro
@@ -54,7 +48,7 @@ macro RADIANCE_GRID_TRACE_PROBE(code)
   PROJECT_GET_WORLD_RADIANCE_AT(code)
   DAGI_RAD_GRID_LOAD(code)
   DAGI_MEDIA_SCENE_SAMPLE(code)
-  PROJECT_TRACE(code)
+  PROJECT_TRACE(code, false)
   hlsl(code) {
     #include <dagi_rad_grid_math.hlsl>
     float3 radiance_grid_trace_probe(uint startSDF, int3 probeWorldCoordClip, uint radiance_grid_clip, uint2 octCoord, uint frameId, uint radiance_res, out float encoded_dist, float maxT, float biasK)
@@ -72,7 +66,7 @@ macro RADIANCE_GRID_TRACE_PROBE(code)
       #endif
 
       float2 octTC = (octCoord + 0.5)/radiance_res;
-      #if DAGI_LIT_SCENE_TYPED_UAV_LOAD
+      #if DAGI_RAD_GRID_TYPED_UAV_LOAD
         //sample higher grid if we are inside it
         //this allows optimize a
         const float featureToCaptureSize = 4.f; // solid angle of feature (both dark and bright) that we can miss is 1./4 (0.25)
@@ -84,7 +78,6 @@ macro RADIANCE_GRID_TRACE_PROBE(code)
       float3 radiance;
       float t = 0;
       float2 jitteredOctTC = octTC;
-      //todo:we probably need some spatial-temporal-coherent blue noise
       jitteredOctTC += rand3D_radiance_grid_probe(probeWorldCoordClip.xyz, octCoord, radiance_res, frameId);
       float3 rayDir = radiance_grid_dir_decode(jitteredOctTC*2-1);
       //rayDir.y = abs(rayDir.y);
@@ -95,16 +88,22 @@ macro RADIANCE_GRID_TRACE_PROBE(code)
       DaGiProjectHitRes hit;
       if (dagi_project_trace_surface(worldPos, 0, rayDir, maxT, hit))
       {
-        radiance = dagi_get_radiance_at_with_albedo(hit.hitCamPos, hit.hitNormal, hit.hitAlbedo);
-        //radiance = project_get_lit_color_at_trace_hit(hit.hitPos, hit.hitNormal, hit.hitAlbedo);
+        #if DAGI_PROJECT_TRACE_HAS_ALBEDO
+        radiance = dagi_get_radiance_at_with_albedo(hit.hitCamPos, hit.hitNormal, hit.hitAlbedo, float4(-rayDir, t));
+        #else
+        // the trace albedo is not meaningful (e.g. a collision only bvh returns
+        // white); sample the albedo scene at the hit instead
+        radiance = dagi_get_radiance_at(hit.hitCamPos, hit.hitNormal, float4(-rayDir, t));
+        #endif
         t = hit.hitAt;
         encoded_dist = saturate(t / (probeSize*sqrt(3)));
       }
       #else
+      float distAtRayStart;
       if (//startClip < MAX_WORLD_SDF_CLIPS &&
         //world_sdf_step_out(worldPos, sdfStartClip, 0.05, 0.5) &&
         world_sdf_trace_stepOut(worldPos, max(0.125*probeSize, 0.01), 0.5, sdfStartClip) &&
-        world_sdf_trace_start(sdfStartClip, worldPos, rayDir, maxT, t, sdfClip, biasK))
+        world_sdf_trace_start(sdfStartClip, worldPos, rayDir, maxT, t, distAtRayStart, sdfClip, biasK))
       {
         float3 worldPosAt = worldPos + rayDir*t;
         float3 gradient = world_sdf_sample_gradient(sdfClip, worldPosAt);
@@ -114,14 +113,14 @@ macro RADIANCE_GRID_TRACE_PROBE(code)
         if (dot(worldNormal, rayDir) > 0)
           worldNormal = -rayDir;
         //radiance = dagi_get_radiance_at(worldPosAt - rayDir*min(t, world_sdf_voxel_size(sdfClip)*0.5), worldNormal);
-        radiance = dagi_get_radiance_at(worldPosAt, worldNormal);
+        radiance = dagi_get_radiance_at(worldPosAt, worldNormal, float4(-rayDir, t + distAtRayStart));
         encoded_dist = saturate(t / (probeSize*sqrt(3)));
       }
       #endif
       else
       {
         t = maxT;
-        #if DAGI_LIT_SCENE_TYPED_UAV_LOAD
+        #if DAGI_RAD_GRID_TYPED_UAV_LOAD
           float3 worldPosAt = worldPos + rayDir*max(t - sqrt(3)*nextProbeSize, 0);
           //nextClip = dagi_rad_grid_get_best_enclosing_clip_border(worldPosAt, radiance_grid_clip+1, .5f);
           if (nextClip < dagi_rad_grid_get_clip_count())

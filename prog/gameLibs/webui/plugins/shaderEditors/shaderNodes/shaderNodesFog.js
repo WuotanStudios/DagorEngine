@@ -69,8 +69,8 @@ var GE_nodeDescriptionsAdditional =
       category: "Fog Filtering",
       synonyms:"fog,filter,compare,branch,check,test",
       pins: [
-        {name:"close", types:["int", "float", "float2", "float3", "float4"], singleConnect:true, typeGroup:"group1", role:"in", data:{def_val:"0.0", def_val_blk:"0.0"}},
-        {name:"far", types:["int", "float", "float2", "float3", "float4"], singleConnect:true, typeGroup:"group1", role:"in", data:{def_val:"0.0", def_val_blk:"0.0"}},
+        {name:"close", types:["int", "float", "float2", "float3", "float4"], singleConnect:true, typeGroup:"group1", role:"in", data:{def_1:false}},
+        {name:"far", types:["int", "float", "float2", "float3", "float4"], singleConnect:true, typeGroup:"group1", role:"in", data:{def_1:false}},
         {name: "result", types:["int", "float", "float2", "float3", "float4"], singleConnect: false, typeGroup:"group1", role: "out",
           data: { code: "((volfog_froxel_range_params.w) ? ($far$) : ($close$))"} }
       ],
@@ -85,8 +85,8 @@ var GE_nodeDescriptionsAdditional =
       category: "Fog Filtering",
       synonyms:"fog,filter,compare,branch,check,test",
       pins: [
-        {name:"froxel fog", types:["int", "float", "float2", "float3", "float4"], singleConnect:true, typeGroup:"group1", role:"in", data:{def_val:"0.0", def_val_blk:"0.0"}},
-        {name:"distant fog", types:["int", "float", "float2", "float3", "float4"], singleConnect:true, typeGroup:"group1", role:"in", data:{def_val:"0.0", def_val_blk:"0.0"}},
+        {name:"froxel fog", types:["int", "float", "float2", "float3", "float4"], singleConnect:true, typeGroup:"group1", role:"in", data:{def_1:false}},
+        {name:"distant fog", types:["int", "float", "float2", "float3", "float4"], singleConnect:true, typeGroup:"group1", role:"in", data:{def_1:false}},
         {name: "result", types:["int", "float", "float2", "float3", "float4"], singleConnect:false, typeGroup:"group1", role:"out",
           data: { code: "((IS_DISTANT_FOG) ? ($distant fog$) : ($froxel fog$))"} }
       ],
@@ -223,7 +223,6 @@ var GE_defaultExternalsAdditional =
     {type: "float", name:"volfog_prev_range_ratio"},
     {type: "texture3D_nosampler", name:"prev_volfog_shadow"},
     {type: "texture2D_nosampler", name:"volfog_shadow_occlusion"},
-    {type: "float", name:"nbs_clouds_start_altitude2_meters"},
     {type: "float4", name:"volfog_froxel_volume_res"},
     {type: "float4", name:"inv_volfog_froxel_volume_res"},
     {type: "float4", name:"volfog_froxel_range_params"},
@@ -238,7 +237,9 @@ var GE_defaultExternalsAdditional =
     {type: "texture2D_nosampler", name:"downsampled_close_depth_tex"},
     {type: "texture2D", name:"prev_distant_fog_raymarch_start_weights"},
     {type: "float4",  name:"distant_fog_raymarch_resolution"},
+    {type: "float4",  name:"distant_fog_raymarch_dyn_scales"},
     {type: "float4",  name:"distant_fog_reconstruction_resolution"},
+    {type: "float4",  name:"distant_fog_reconstruction_dyn_scales"},
     {type: "float4",  name:"distant_fog_raymarch_params_0"},
     {type: "float4",  name:"distant_fog_raymarch_params_1"},
     {type: "float4",  name:"distant_fog_raymarch_params_2"},
@@ -257,7 +258,11 @@ var GE_defaultExternalsAdditional =
     {type: "float4",  name:"nbs_world_pos_to_clouds_alt__inv_clouds_weather_size__neg_clouds_thickness_m"},
     {type: "float4",  name:"skies_primary_sun_light_dir"},
     {type: "float4",  name:"clouds_origin_offset"},
-    {type: "texture2D", name:"clouds_shadows_2d"},
+    {type: "texture2D", name:"clouds_bsm"},
+    {type: "float4",  name:"clouds_bsm_world"},
+    {type: "float4",  name:"clouds_bsm_consts"},
+    {type: "float4",  name:"clouds_bsm_stat"},
+    {type: "float4",  name:"clouds_bsm_texel"},
     {type: "float4",  name:"clouds_hole_pos"},
     {type: "float4",  name:"distant_fog_local_view_z"},
 
@@ -286,5 +291,4 @@ var GE_defaultExternalsAdditional =
     {type:"float", name:"camera_in_camera_postfx_lens_view"},
     {type:"float", name:"camera_in_camera_active"},
   ];
-
 

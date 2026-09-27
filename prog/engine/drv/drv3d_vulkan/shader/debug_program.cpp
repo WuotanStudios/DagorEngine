@@ -184,6 +184,36 @@ alignas(uint32_t) static const uint8_t debug_frag_program[] = //
     0x00, 0x00, 0x3d, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x03, 0x00,
     0x09, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x01, 0x00, 0x38, 0x00, 0x01, 0x00};
 
+/* output of glslang for:
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+void main() {}
+*/
+// clang-format off
+alignas(uint32_t) static const uint8_t stub_compute_program[] = {
+  0x03, 0x02, 0x23, 0x07, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x03, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x05, 0x00, 0x05, 0x00, 0x00, 0x00,
+  0x04, 0x00, 0x00, 0x00, 0x6d, 0x61, 0x69, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x06, 0x00,
+  0x04, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+  0x01, 0x00, 0x00, 0x00, 0x13, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x21, 0x00, 0x03, 0x00,
+  0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x36, 0x00, 0x05, 0x00, 0x02, 0x00, 0x00, 0x00,
+  0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00,
+  0x05, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x01, 0x00, 0x38, 0x00, 0x01, 0x00};
+// clang-format on
+
+void ShaderProgramDatabase::initStubComputeProg(DeviceContext &dc)
+{
+  ShaderModuleHeader smh = {};
+  smh.header = {};
+  smh.hash = spirv::HashValue::calculate(&smh.header, 1);
+  smh.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+
+  ShaderModuleBlob smb(stub_compute_program, stub_compute_program + sizeof(stub_compute_program));
+
+  stubComputeProgId = progs.compute.add(dc, {smh, smb});
+}
+
 void ShaderProgramDatabase::initDebugProg(bool has_bindless, DeviceContext &dc)
 {
   // insert debug input layout [will be 0]
@@ -209,6 +239,9 @@ void ShaderProgramDatabase::initDebugProg(bool has_bindless, DeviceContext &dc)
   il.attribs[1] = cola;
   auto ili = shaderDesc.layouts.add(dc, {il});
 
+  constexpr uint16_t vsImplicitRegCount = 4 * 4;
+  constexpr uint16_t fsImplicitRegCount = 0;
+
   ShaderID vs, fs;
   {
     // configure header for
@@ -217,41 +250,38 @@ void ShaderProgramDatabase::initDebugProg(bool has_bindless, DeviceContext &dc)
     // - output on 1
     ShaderModuleHeader smh = {};
     spirv::ShaderHeader &spvHeader = smh.header;
-    spvHeader.descriptorTypes[0] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    spvHeader.imageViewTypes[0] = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-    spvHeader.descriptorCounts[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    spvHeader.descriptorTypes[0].set(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC);
+    spvHeader.descriptorCounts[0].type.set(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC);
     spvHeader.descriptorCounts[0].descriptorCount = 1;
-    spvHeader.maxConstantCount = 4 * 4;
-    spvHeader.bonesConstantsUsed = -1; // @TODO: remove
+    spvHeader.implicitCbufRegCount = vsImplicitRegCount;
     spvHeader.bRegisterUseMask = 1;
     spvHeader.inputMask = (1ul << 0) | (1ul << 3);
     spvHeader.outputMask = 1ul << 0;
-    spvHeader.registerIndex[0] = spirv::B_CONST_BUFFER_OFFSET + 0;
-    spvHeader.constBufferCheckIndices[0] = 0;
     spvHeader.missingTableIndex[0] = spirv::FALLBACK_TO_C_GLOBAL_BUFFER;
-    spvHeader.constBufferCount = 1;
     spvHeader.descriptorCountsCount = 1;
     spvHeader.registerCount = 1;
+    spvHeader.slotToRegisterMapping[spirv::REGISTER_MAPPING_B_OFFSET] = 0;
+    spvHeader.registerToSlotMapping[0] = {0, spirv::EngineSlotMapping::REG_B};
 
     smh.hash = spirv::HashValue::calculate(&spvHeader, 1);
     smh.stage = VK_SHADER_STAGE_VERTEX_BIT;
 
-    ShaderModuleBlob smb = {};
-    // needs to typecast or insert will extend each element from u8 to u32
     const uint8_t *vertDump = has_bindless ? debug_vert_program_bindless : debug_vert_program;
     size_t vertDumpSz = has_bindless ? sizeof(debug_vert_program_bindless) : sizeof(debug_vert_program);
-    auto from = reinterpret_cast<const uint32_t *>(vertDump);
-    auto to = reinterpret_cast<const uint32_t *>(vertDump + vertDumpSz);
-    smb.blob.insert(end(smb.blob), from, to);
-    smb.hash = spirv::HashValue::calculate(smb.blob.data(), smb.blob.size());
+
+    ShaderModuleBlob smb(vertDump, vertDump + vertDumpSz);
+
+#if VULKAN_LOAD_SHADER_EXTENDED_DEBUG_DATA
+    smb.name = "debugVS";
+#endif
 
     vs = newShader(dc, smh, smb);
 
 #if VULKAN_LOAD_SHADER_EXTENDED_DEBUG_DATA
     ShaderDebugInfo dbgInf;
-    dbgInf.name = "debugVS"; // -V691
-    dbgInf.debugName = "debugVS";
-    attachDebugInfo(vs, dbgInf);
+    dbgInf.name = smb.name;
+    dbgInf.debugName = smb.name;
+    attachDebugInfo(vs, dbgInf, {});
 #endif
   }
 
@@ -263,26 +293,26 @@ void ShaderProgramDatabase::initDebugProg(bool has_bindless, DeviceContext &dc)
     spirv::ShaderHeader &spvHeader = smh.header;
     spvHeader.inputMask = 1ul << 0;
     spvHeader.outputMask = 1ul << 0;
+    spvHeader.implicitCbufRegCount = fsImplicitRegCount;
 
     smh.hash = spirv::HashValue::calculate(&spvHeader, 1);
     smh.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    ShaderModuleBlob smb = {};
-    // needs to typecast or insert will extend each element from u8 to u32
-    auto from = reinterpret_cast<const uint32_t *>(debug_frag_program);
-    auto to = reinterpret_cast<const uint32_t *>(debug_frag_program + sizeof(debug_frag_program));
-    smb.blob.insert(end(smb.blob), from, to);
-    smb.hash = spirv::HashValue::calculate(smb.blob.data(), smb.blob.size());
+    ShaderModuleBlob smb(debug_frag_program, debug_frag_program + sizeof(debug_frag_program));
+
+#if VULKAN_LOAD_SHADER_EXTENDED_DEBUG_DATA
+    smb.name = "debugFS";
+#endif
 
     fs = newShader(dc, smh, smb);
 
 #if VULKAN_LOAD_SHADER_EXTENDED_DEBUG_DATA
     ShaderDebugInfo dbgInf;
-    dbgInf.name = "debugFS"; // -V691
-    dbgInf.debugName = "debugFS";
-    attachDebugInfo(fs, dbgInf);
+    dbgInf.name = smb.name;
+    dbgInf.debugName = smb.name;
+    attachDebugInfo(fs, dbgInf, {});
 #endif
   }
 
-  debugProgId = progs.graphics.add(dc, {ili, shaders.get(vs), shaders.get(fs)});
+  debugProgId = progs.graphics.add(dc, {ili, shaders.get(vs), shaders.get(fs), vsImplicitRegCount, fsImplicitRegCount});
 }

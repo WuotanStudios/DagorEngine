@@ -31,6 +31,8 @@
 #include <shaders/dag_overrideStateId.h>
 #include <sceneRay/dag_sceneRayDecl.h>
 
+#include <EASTL/vector.h>
+
 #include <stdarg.h>
 
 enum ImGuiKey : int;
@@ -102,6 +104,11 @@ struct TexImage32;
 struct TexImage8;
 struct DagUUID;
 
+namespace console
+{
+class ICommandProcessor;
+struct CommandOptions;
+} // namespace console
 namespace ddsx
 {
 struct Buffer;
@@ -161,6 +168,7 @@ public:
   virtual void addTriangleToVbuffer(DebugPrimitivesVbuffer &vbuf, const Point3 p[3], E3DCOLOR color) const = 0;
   virtual bool isLinesVbufferValid(DebugPrimitivesVbuffer &vbuf) const = 0;
   virtual void setVbufferTm(DebugPrimitivesVbuffer &vbuf, const TMatrix &tm) const = 0;
+  virtual void setVbufferZBias(DebugPrimitivesVbuffer &vbuf, float z_bias, float slope_z_bias) const = 0;
 
   // DynamicShadersBuffer
   virtual DynamicShadersBuffer *newDynamicShadersBuffer(IMemAlloc *alloc = NULL) const = 0;
@@ -263,8 +271,6 @@ public:
   virtual const char *geomObjectGetShaderName(const GeomObject &go, int idx) const = 0;
   virtual ShaderMesh *geomObjectGetShaderMesh(const GeomObject &go, int idx) const = 0;
 
-  virtual bool geomObjectShadowRayHitTest(GeomObject &go, const Point3 &p, const Point3 &dir, real maxt,
-    int trace_flags = 0) const = 0;
   virtual bool geomObjectTraceRay(GeomObject &go, const Point3 &p, const Point3 &dir, real &maxt, Point3 *norm) const = 0;
   virtual bool geomObjectReloadRayTracer(GeomObject &go) const = 0;
   virtual StaticSceneRayTracer *geomObjectGetRayTracer(GeomObject &go) const = 0;
@@ -440,8 +446,18 @@ public:
   virtual void showConsole(CoolConsole &con, bool activate = false) const = 0;
   virtual void hideConsole(const CoolConsole &con) const = 0;
 
-  virtual bool registerCommand(CoolConsole &con, const char *cmd, IConsoleCmd *handler) const = 0;
-  virtual bool unregisterCommand(CoolConsole &con, const char *cmd, IConsoleCmd *handler) const = 0;
+  // Add a new console processor.
+  // Corresponds to add_con_proc() from dag_console.h.
+  virtual void addConProc(console::ICommandProcessor *proc) = 0;
+
+  // Delete the console processor.
+  // Returns true if the console processor has been found, destroy()-ed and removed.
+  // Corresponds to del_con_proc() from dag_console.h.
+  virtual bool delConProc(console::ICommandProcessor *proc) = 0;
+
+  // This is just a helper method that makes console::collector_cmp() accesible to DLLs.
+  virtual int conCollectorCmp(const char *arg, int ac, const char *cmd, int min_ac, int max_ac, const char *description = "",
+    const char *argsDescription = "", const char *varValue = "", eastl::vector<console::CommandOptions> *cmdOptions = nullptr) = 0;
 
 /// void addMessage(CoolConsole& con, MessageType type, const char *fmt, typesafe-var-args...)
 #define DSA_OVERLOADS_PARAM_DECL CoolConsole &con, ILogWriter::MessageType t,
@@ -451,6 +467,10 @@ public:
 #undef DSA_OVERLOADS_PARAM_PASS
 };
 
+// Use this to return error result from CONSOLE_CHECK_NAME() for console commands that must work from ConBatch.
+// In those commands a false return value means error, and the simplest way to propagate that error to ConBatch is
+// returning false to processCommand().
+#define CONSOLE_COMMAND_BATCH_MODE_RESULT(result) return result
 
 // input functions to use from DLLs (see ec_input.h for non-DLL usage)
 class IDagorInput
@@ -501,19 +521,8 @@ public:
 class IDagorScene
 {
 public:
-  // StaticSceneRayTracer
-  virtual int staticSceneRayTracerTraceRay(StaticSceneRayTracer &rt, const Point3 &p, const Point3 &wdir2, real &mint2,
-    int from_face = -1) const = 0;
-
   // FastRtDump
   virtual int fastRtDumpTraceRay(FastRtDump &frt, int custom, const Point3 &p, const Point3 &dir, real &t, int &out_pmid) const = 0;
-
-  // BuildableStaticSceneRayTracer
-  virtual BuildableStaticSceneRayTracer *createBuildableStaticmeshsceneRaytracer(const Point3 &lsz, int lev) const = 0;
-  virtual bool buildableStaticSceneRayTracerAddmesh(BuildableStaticSceneRayTracer &rt, const Point3 *vert, int vcount,
-    const unsigned *face, unsigned stride, int fn, const unsigned *face_flags, bool rebuild = true) const = 0;
-  virtual bool buildableStaticSceneRayTracerReserve(BuildableStaticSceneRayTracer &rt, int face_count, int vert_count) const = 0;
-  virtual bool buildableStaticSceneRayTracerRebuild(BuildableStaticSceneRayTracer &rt) const = 0;
 
   // StaticSceneBuilder::StdTonemapper
   virtual StaticSceneBuilder::StdTonemapper *newStdTonemapper(IMemAlloc *alloc = NULL) const = 0;
@@ -524,10 +533,6 @@ public:
   virtual void stdTonemapperRecalc(StaticSceneBuilder::StdTonemapper &mapper) const = 0;
   virtual void stdTonemapperSave(StaticSceneBuilder::StdTonemapper &mapper, DataBlock &blk) const = 0;
   virtual void stdTonemapperLoad(StaticSceneBuilder::StdTonemapper &mapper, const DataBlock &blk) const = 0;
-
-  // resources
-  virtual GameResource *getGameResource(GameResHandle handle, bool no_factory_fatal = true) const = 0;
-  virtual void releaseGameResource(GameResource *resource) const = 0;
 };
 
 

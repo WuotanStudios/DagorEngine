@@ -8,11 +8,11 @@
 #include "enet/utility.h"
 #include "enet/time.h"
 #include "enet/enet.h"
+#if _DAGOR_ENET_EXT
+#include "enet/enet_dagor.h"
+#endif
 
 #define ENET_MIN_ROUND_TRIP_TIMEOUT (30)
-
-#define HOSTPORT_FMT   "%d.%d.%d.%d:%d"
-#define HOSTPORT(h, p) (h) & 255, ((h) >> 8) & 255, ((h) >> 16) & 255, (h) >> 24, (p)
 
 static size_t commandSizes [ENET_PROTOCOL_COMMAND_COUNT] =
 {
@@ -29,7 +29,7 @@ static size_t commandSizes [ENET_PROTOCOL_COMMAND_COUNT] =
     sizeof (ENetProtocolBandwidthLimit),
     sizeof (ENetProtocolThrottleConfigure),
     sizeof (ENetProtocolSendFragment),
-    sizeof (ENetProtocolPingTargetPortForRelay),
+    _DAGOR_ENET_INJECT_PROTOCOL_TYPES_SIZES
 };
 
 size_t
@@ -119,6 +119,7 @@ enet_protocol_dispatch_incoming_commands (ENetHost * host, ENetEvent * event)
        }
     }
 
+    _DAGOR_ENET_INJECT_UNCONNECTED_PEER_RECEIVE_MESSAGES;
     return 0;
 }
 
@@ -251,7 +252,7 @@ enet_protocol_remove_sent_reliable_command (ENetPeer * peer, enet_uint16 reliabl
        {
           -- channel -> reliableWindows [reliableWindow];
           if (! channel -> reliableWindows [reliableWindow])
-            channel -> usedReliableWindows &= ~ (1 << reliableWindow);
+            channel -> usedReliableWindows &= ~ (1u << reliableWindow);
        }
     }
 
@@ -493,13 +494,13 @@ enet_protocol_handle_send_unsequenced (ENetHost * host, ENetPeer * peer, const E
         memset (peer -> unsequencedWindow, 0, sizeof (peer -> unsequencedWindow));
     }
     else
-    if (peer -> unsequencedWindow [index / 32] & (1 << (index % 32)))
+    if (peer -> unsequencedWindow [index / 32] & (1u << (index % 32)))
       return 0;
       
     if (enet_peer_queue_incoming_command (peer, command, (const enet_uint8 *) command + sizeof (ENetProtocolSendUnsequenced), dataLength, ENET_PACKET_FLAG_UNSEQUENCED, 0) == NULL)
       return -1;
    
-    peer -> unsequencedWindow [index / 32] |= 1 << (index % 32);
+    peer -> unsequencedWindow [index / 32] |= 1u << (index % 32);
  
     return 0;
 }
@@ -546,7 +547,8 @@ enet_protocol_handle_send_fragment (ENetHost * host, ENetPeer * peer, const ENet
 
     fragmentLength = ENET_NET_TO_HOST_16 (command -> sendFragment.dataLength);
     * currentData += fragmentLength;
-    if (fragmentLength > host -> maximumPacketSize ||
+    if (fragmentLength <= 0 ||
+        fragmentLength > host -> maximumPacketSize ||
         * currentData < host -> receivedData ||
         * currentData > & host -> receivedData [host -> receivedDataLength])
       return -1;
@@ -570,10 +572,11 @@ enet_protocol_handle_send_fragment (ENetHost * host, ENetPeer * peer, const ENet
     if (fragmentCount > ENET_PROTOCOL_MAXIMUM_FRAGMENT_COUNT ||
         fragmentNumber >= fragmentCount ||
         totalLength > host -> maximumPacketSize ||
+        totalLength < fragmentCount ||
         fragmentOffset >= totalLength ||
         fragmentLength > totalLength - fragmentOffset)
       return -1;
- 
+
     for (currentCommand = enet_list_previous (enet_list_end (& channel -> incomingReliableCommands));
          currentCommand != enet_list_end (& channel -> incomingReliableCommands);
          currentCommand = enet_list_previous (currentCommand))
@@ -615,11 +618,11 @@ enet_protocol_handle_send_fragment (ENetHost * host, ENetPeer * peer, const ENet
          return -1;
     }
     
-    if ((startCommand -> fragments [fragmentNumber / 32] & (1 << (fragmentNumber % 32))) == 0)
+    if ((startCommand -> fragments [fragmentNumber / 32] & (1u << (fragmentNumber % 32))) == 0)
     {
        -- startCommand -> fragmentsRemaining;
 
-       startCommand -> fragments [fragmentNumber / 32] |= (1 << (fragmentNumber % 32));
+       startCommand -> fragments [fragmentNumber / 32] |= (1u << (fragmentNumber % 32));
 
        if (fragmentOffset + fragmentLength > startCommand -> packet -> dataLength)
          fragmentLength = startCommand -> packet -> dataLength - fragmentOffset;
@@ -656,7 +659,8 @@ enet_protocol_handle_send_unreliable_fragment (ENetHost * host, ENetPeer * peer,
 
     fragmentLength = ENET_NET_TO_HOST_16 (command -> sendFragment.dataLength);
     * currentData += fragmentLength;
-    if (fragmentLength > host -> maximumPacketSize ||
+    if (fragmentLength <= 0 ||
+        fragmentLength > host -> maximumPacketSize ||
         * currentData < host -> receivedData ||
         * currentData > & host -> receivedData [host -> receivedDataLength])
       return -1;
@@ -686,6 +690,7 @@ enet_protocol_handle_send_unreliable_fragment (ENetHost * host, ENetPeer * peer,
     if (fragmentCount > ENET_PROTOCOL_MAXIMUM_FRAGMENT_COUNT ||
         fragmentNumber >= fragmentCount ||
         totalLength > host -> maximumPacketSize ||
+        totalLength < fragmentCount ||
         fragmentOffset >= totalLength ||
         fragmentLength > totalLength - fragmentOffset)
       return -1;
@@ -733,11 +738,11 @@ enet_protocol_handle_send_unreliable_fragment (ENetHost * host, ENetPeer * peer,
          return -1;
     }
 
-    if ((startCommand -> fragments [fragmentNumber / 32] & (1 << (fragmentNumber % 32))) == 0)
+    if ((startCommand -> fragments [fragmentNumber / 32] & (1u << (fragmentNumber % 32))) == 0)
     {
        -- startCommand -> fragmentsRemaining;
 
-       startCommand -> fragments [fragmentNumber / 32] |= (1 << (fragmentNumber % 32));
+       startCommand -> fragments [fragmentNumber / 32] |= (1u << (fragmentNumber % 32));
 
        if (fragmentOffset + fragmentLength > startCommand -> packet -> dataLength)
          fragmentLength = startCommand -> packet -> dataLength - fragmentOffset;
@@ -759,22 +764,6 @@ enet_protocol_handle_ping (ENetHost * host, ENetPeer * peer, const ENetProtocol 
     if (peer -> state != ENET_PEER_STATE_CONNECTED && peer -> state != ENET_PEER_STATE_DISCONNECT_LATER)
       return -1;
 
-    return 0;
-}
-
-static int
-enet_protocol_handle_ping_target_port_for_relay (ENetHost * host, ENetPeer * peer, const ENetProtocol * command)
-{
-    enet_uint16 port = command->pingTargetPortForRelay.port;
-    ENetAddress addr;
-    addr.host = peer->address.host;
-    addr.port = port;
-    enet_uint32 empty_buffer[1] = { 0 };
-    ENetBuffer buffer;
-    buffer.data = (void *)&empty_buffer[0];
-    buffer.dataLength = 1;
-    enet_socket_send(host->socket, &addr, &buffer, 1);
-    enet_logf("punch udp hole for peer " HOSTPORT_FMT, HOSTPORT(addr.host, addr.port));
     return 0;
 }
 
@@ -1025,6 +1014,8 @@ enet_protocol_handle_verify_connect (ENetHost * host, ENetEvent * event, ENetPee
     return 0;
 }
 
+#define HOSTPORT_FMT "%d.%d.%d.%d:%d"
+#define HOSTPORT(h, p) (h)&255,((h)>>8)&255,((h)>>16)&255,(h)>>24,(p)
 
 static int
 enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
@@ -1051,6 +1042,12 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
     if (host -> checksum != NULL)
       headerSize += sizeof (enet_uint32);
 
+    /* A datagram shorter than its declared header would underflow receivedDataLength - headerSize
+       (used as the decompressor input limit) and mis-address the checksum read. */
+    if (host -> receivedDataLength < headerSize)
+      return 0;
+
+    _DAGOR_ENET_INJECT_DEBUG_LOG_RECEIVED(host, peerID)
     if (peerID == ENET_PROTOCOL_MAXIMUM_PEER_ID)
       peer = NULL;
     else
@@ -1098,7 +1095,7 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
           enet_logf("peer #%d (" HOSTPORT_FMT "|" HOSTPORT_FMT "): decompression of packet %d bytes failed. Tampered packet?",
                     (int)peerID, HOSTPORT(peer ? peer -> address.host : 0, peer ? peer -> address.port : 0),
                     HOSTPORT(host -> receivedAddress.host, host -> receivedAddress.port),
-                    host -> receivedDataLength);
+                    (int) host -> receivedDataLength);
           return 0;
         }
         else if (originalSize > sizeof (host -> packetData [1]) - headerSize)
@@ -1111,11 +1108,14 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 
     if (host -> checksum != NULL)
     {
-        enet_uint32 * checksum = (enet_uint32 *) & host -> receivedData [headerSize - sizeof (enet_uint32)],
-                    desiredChecksum = * checksum;
+        enet_uint32 * checksum = (enet_uint32 *) & host -> receivedData [headerSize - sizeof (enet_uint32)];
+        enet_uint32 desiredChecksum, newChecksum;
         ENetBuffer buffer;
+        /* Checksum may be an unaligned pointer, use memcpy to avoid undefined behaviour. */
+        memcpy (& desiredChecksum, checksum, sizeof (enet_uint32));
 
-        * checksum = peer != NULL ? peer -> connectID : 0;
+        newChecksum = peer != NULL ? peer -> connectID : 0;
+        memcpy (checksum, & newChecksum, sizeof (enet_uint32));
 
         buffer.data = host -> receivedData;
         buffer.dataLength = host -> receivedDataLength;
@@ -1160,7 +1160,8 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 
        currentData += commandSize;
 
-       if (peer == NULL && commandNumber != ENET_PROTOCOL_COMMAND_CONNECT)
+       if (peer == NULL && commandNumber != ENET_PROTOCOL_COMMAND_CONNECT
+           _DAGOR_ENET_EXTRA_PEERLESS_COMMANDS(commandNumber))
          break;
          
        command -> header.reliableSequenceNumber = ENET_NET_TO_HOST_16 (command -> header.reliableSequenceNumber);
@@ -1230,11 +1231,7 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
             goto commandError;
           break;
 
-       case ENET_PROTOCOL_COMMAND_PING_TARGET_PORT_FOR_RELAY:
-          if (enet_protocol_handle_ping_target_port_for_relay (host, peer, command))
-            goto commandError;
-          break;
-
+       _DAGOR_ENET_INJECT_CASES_TO_HANDLE_CUSTOM_COMMANDS;
        default:
           goto commandError;
        }
@@ -1270,13 +1267,14 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
     }
 
 commandError:
+    _DAGOR_ENET_INJECT_CLEAR_NEEDS_DISPATCH_ON_UNCONNECTED_PEER;
     if (event != NULL && event -> type != ENET_EVENT_TYPE_NONE)
       return 1;
 
     return 0;
 }
  
-static int
+int
 enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
 {
     int packets;
@@ -1293,6 +1291,9 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
                                              & host -> receivedAddress,
                                              & buffer,
                                              1);
+
+       if (receivedLength == -2)
+         continue;
 
        if (receivedLength < 0)
          return -1;
@@ -1312,18 +1313,11 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
           {
           case 1:
              if (event != NULL && event -> type != ENET_EVENT_TYPE_NONE)
-             {
-               if (event -> type == ENET_EVENT_TYPE_INTERCEPTED)
-               {
-                 if (packets == 255)
-                   return 1;
-               }
-               else
-                 return 1;
-             }
+               _DAGOR_ENET_INTERCEPT_CASE_HANDLING(event, packets)
 
              continue;
-          
+
+          _DAGOR_ENET_INTERCEPT_CASE_HANDLING_CASE_2_FORCE_INTERRUPT(event, packets);
           case -1:
              return -1;
         
@@ -1611,8 +1605,8 @@ enet_protocol_send_reliable_outgoing_commands (ENetHost * host, ENetPeer * peer)
                outgoingCommand -> sendAttempts < 1 && 
                ! (outgoingCommand -> reliableSequenceNumber % ENET_PEER_RELIABLE_WINDOW_SIZE) &&
                (channel -> reliableWindows [(reliableWindow + ENET_PEER_RELIABLE_WINDOWS - 1) % ENET_PEER_RELIABLE_WINDOWS] >= ENET_PEER_RELIABLE_WINDOW_SIZE ||
-                 channel -> usedReliableWindows & ((((1 << ENET_PEER_FREE_RELIABLE_WINDOWS) - 1) << reliableWindow) | 
-                   (((1 << ENET_PEER_FREE_RELIABLE_WINDOWS) - 1) >> (ENET_PEER_RELIABLE_WINDOWS - reliableWindow)))))
+                 channel -> usedReliableWindows & ((((1u << (ENET_PEER_FREE_RELIABLE_WINDOWS + 2)) - 1) << reliableWindow) |
+                   (((1u << (ENET_PEER_FREE_RELIABLE_WINDOWS + 2)) - 1) >> (ENET_PEER_RELIABLE_WINDOWS - reliableWindow)))))
              windowWrap = 1;
           if (windowWrap)
           {
@@ -1657,7 +1651,7 @@ enet_protocol_send_reliable_outgoing_commands (ENetHost * host, ENetPeer * peer)
 
        if (channel != NULL && outgoingCommand -> sendAttempts < 1)
        {
-          channel -> usedReliableWindows |= 1 << reliableWindow;
+          channel -> usedReliableWindows |= 1u << reliableWindow;
           ++ channel -> reliableWindows [reliableWindow];
        }
 
@@ -1863,9 +1857,12 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
         if (host -> checksum != NULL)
         {
             enet_uint32 * checksum = (enet_uint32 *) & headerData [host -> buffers -> dataLength];
-            * checksum = currentPeer -> outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID ? currentPeer -> connectID : 0;
+            enet_uint32 newChecksum = currentPeer -> outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID ? currentPeer -> connectID : 0;
+            /* Checksum may be unaligned, use memcpy to avoid undefined behaviour. */
+            memcpy(checksum, & newChecksum, sizeof (enet_uint32));
             host -> buffers -> dataLength += sizeof (enet_uint32);
-            * checksum = host -> checksum (host -> buffers, host -> bufferCount);
+            newChecksum = host -> checksum (host -> buffers, host -> bufferCount);
+            memcpy(checksum, & newChecksum, sizeof (enet_uint32));
         }
 
         if (shouldCompress > 0)
@@ -2064,37 +2061,4 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
     } while (waitCondition & ENET_SOCKET_WAIT_RECEIVE);
 
     return 0; 
-}
-
-
-int
-enet_host_service_only_incoming_commands (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
-{
-  if (event != NULL)
-  {
-    event -> type = ENET_EVENT_TYPE_NONE;
-    event -> peer = NULL;
-    event -> packet = NULL;
-  }
-
-  host -> serviceTime = enet_time_get ();
-
-  timeout += host -> serviceTime;
-
-  switch (enet_protocol_receive_incoming_commands (host, event))
-  {
-  case 1:
-    return 1;
-
-  case -1:
-#ifdef ENET_DEBUG
-    perror ("Error receiving incoming packets");
-#endif
-
-    return -1;
-
-  default:
-    break;
-  }
-  return 0;
 }

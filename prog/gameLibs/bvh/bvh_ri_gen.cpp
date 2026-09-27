@@ -7,15 +7,27 @@
 #include <util/dag_bitwise_cast.h>
 #include <util/dag_finally.h>
 #include <math/dag_frustum.h>
+#include <memory/dag_framemem.h>
+#include <util/dag_convar.h>
 
 #include "bvh_color_from_pos.h"
 #include "bvh_ri_common.h"
 #include "bvh_tools.h"
 #include "bvh_add_instance.h"
+#include "bvh_voxel_activity.h"
+
+CONSOLE_BOOL_VAL("raytracing", bvh_ri_gen_split_enabled, true);
+CONSOLE_INT_VAL("raytracing", bvh_ri_gen_split_chunk_budget, 1000, 100, 100000);
 
 #if DAGOR_DBGLEVEL > 0
 extern bool bvh_ri_gen_range_enable;
 extern float bvh_ri_gen_range;
+#endif
+
+#if 0
+CONSOLE_BOOL_VAL("render", stationary_rt_trees, false);
+#else
+#define stationary_rt_trees true
 #endif
 
 #define ENABLE_HAS_COLLISION_DEBUG 0
@@ -70,7 +82,7 @@ struct DECLSPEC_ALIGN(16) IPoint4_vec4 : public IPoint4
 {
 } ATTRIBUTE_ALIGN(16);
 
-template <map_tree_fn mapper>
+template <map_rendinst_fn mapper>
 static bool handle_leaves(ContextId context_id, uint64_t object_id, int lod_ix, mat44f_cref tm, rendinst::riex_handle_t handle,
   eastl::optional<TMatrix4> &inv_world_tm, LeavesInfo &leavesInfo, MeshMetaAllocator::AllocId &metaAllocId, void *user_data)
 {
@@ -87,19 +99,29 @@ static bool handle_leaves(ContextId context_id, uint64_t object_id, int lod_ix, 
     v_stu(&inv_world_tm.value().row[3], inv44.col3);
   }
 
-  auto data = mapper(context_id, object_id, tm.col3, handle, lod_ix, user_data, leavesInfo.recycled);
+  int dummy;
+  auto data = mapper(context_id, object_id, handle, lod_ix, user_data, leavesInfo.recycled, dummy);
 
   if (!data)
-    return false;
+  {
+    auto buffers = context_id->stationaryTreeBuffers.find(object_id);
+    if (buffers == context_id->stationaryTreeBuffers.end())
+      return false;
+
+    leavesInfo.recycled = false;
+    leavesInfo.stationary = true;
+    data = &buffers->second;
+  }
+  else
+    leavesInfo.stationary = false;
 
   if (data->metaAllocId == MeshMetaAllocator::INVALID_ALLOC_ID)
-    data->metaAllocId = context_id->allocateMetaRegion(1);
+    data->metaAllocId = context_id->allocateMetaRegion(1, "riGenLeaves");
 
   metaAllocId = data->metaAllocId;
 
   leavesInfo.invWorldTm = inv_world_tm.value();
-  leavesInfo.transformedBuffer = &data->buffer;
-  leavesInfo.transformedBlas = &data->blas;
+  leavesInfo.transformedData = data;
 
   return true;
 }
@@ -123,6 +145,8 @@ static struct RiGenBVHJob : public cpujobs::IJob
   vec4f viewPositionY;
   vec4f viewPositionZ;
 
+  vec4f lightDirection;
+
   RiGenVisibility *riGenVisibility;
   ContextId contextId;
   int threadIx;
@@ -136,235 +160,313 @@ static struct RiGenBVHJob : public cpujobs::IJob
   int riGenCount;
   int impostorCount;
 
+  uint32_t voxelConsidered;
+  uint32_t voxelCulled;
+
   unsigned counter;
 
-  eastl::unordered_map<uint64_t, ReferencedTransformDataWithAge> newUniqueTreeBuffers[Context::maxUniqueLods];
+  bbox3f treeArea;
 
-  static ReferencedTransformData *mapTree(ContextId context_id, uint64_t object_id, vec4f pos, rendinst::riex_handle_t handle,
-    int lod_ix, void *user_data, bool &recycled)
+  eastl::unordered_map<uint64_t, ReferencedTransformDatasForInstance> newUniqueTreeBuffers[Context::maxUniqueLods];
+  RiGenBVHJob *otherFlip = nullptr;
+  threadpool::JobPriority prio = threadpool::PRIO_DEFAULT;
+  dag::AtomicInteger<unsigned> chunkBudgetItems = 0;
+  bool hitChunkBudget = false;
+  bool globalObjectTessellationEnabled = false;
+
+  static ReferencedTransformData *mapTreeRiGen(ContextId context_id, uint64_t object_id, uint64_t id, int lod_ix, void *user_data,
+    bool &recycled, int &anim_index)
   {
-    G_UNUSED(handle);
+    MapRendinstPointers pointers;
+    pointers.uniqueBuffers = make_span(context_id->uniqueTreeBuffers, Context::maxUniqueLods);
+    pointers.newUniqueBuffers = make_span(static_cast<RiGenBVHJob *>(user_data)->newUniqueTreeBuffers, Context::maxUniqueLods);
+    pointers.contextId = context_id;
+    pointers.freeUniqueBLASes = &context_id->freeUniqueTreeBLASes;
+    return map_rendinst_base<true>(object_id, id, lod_ix, recycled, anim_index, pointers);
+  }
 
-    recycled = false;
+  void updateSplitBudgetHit()
+  {
+    const unsigned heuristic = riGenCount * 27 + impostorCount;
+    if (DAGOR_UNLIKELY(heuristic >= chunkBudgetItems.load(dag::memory_order_relaxed)))
+      hitChunkBudget = true;
+  }
 
-    Point4 p4;
-    v_stu(&p4, pos);
-    auto kx = (uint64_t)bitwise_cast<uint32_t, float>(p4.x + p4.y);
-    auto kz = (uint64_t)bitwise_cast<uint32_t, float>(p4.z - p4.y);
-    auto id = (kx << 32 | kz) ^ object_id;
-
-    // No need to have a lock here to access the containers. While this function is called from multiple threads,
-    // the uniqueTreeBuffers is only read from all threads. All new items are added to the newUniqueTreeBuffers,
-    // which is thread local. Then later it will be merged into the uniqueTreeBuffers on the main thread.
-
-    G_ASSERT(lod_ix < Context::maxUniqueLods);
-    auto &uniqueContainer = context_id->uniqueTreeBuffers[lod_ix];
-
-    ReferencedTransformDataWithAge *tree = nullptr;
-    if (auto instanceIter = uniqueContainer.find(id); instanceIter != uniqueContainer.end())
+  template <bool use_min_lod, bool filter_out_view_frustum, bool use_tree_anim_max_distance>
+  static void onInstance(RiGenBVHJob *thiz, int layer_ix, int pool_ix, int lod_ix, int last_lod_ix, bool impostor, mat44f_cref tm,
+    const E3DCOLOR *colors, uint32_t bvh_id, uint64_t unique_id, uint32_t palette_id)
+    DAG_TS_REQUIRES_SHARED(thiz->contextId->objectsLock)
+  {
+#if DAGOR_DBGLEVEL > 0
+    if (DAGOR_UNLIKELY(bvh_ri_gen_range_enable))
     {
-      tree = &instanceIter->second;
+      auto distSq = v_extract_x(v_length3_sq_x(v_sub(tm.col3, thiz->viewPosition)));
+      if (sqr(bvh_ri_gen_range) < distSq)
+        return;
+    }
+#endif
+
+    mat43f tm43;
+    v_mat44_transpose_to_mat43(tm43, tm);
+
+    RenderableInstanceLodsResource *riRes = rendinst::getRIGenRes(layer_ix, pool_ix);
+    if (!riRes || riRes->getBvhId() == 0)
+      return;
+
+    auto isInFrustum = [&]() -> bool {
+      bbox3f originalBox = v_ldu_bbox3(riRes->bbox);
+      bbox3f transformedBbox;
+      v_bbox3_init(transformedBbox, tm, originalBox);
+      return thiz->viewFrustum.testBoxB(transformedBbox.bmin, transformedBbox.bmax);
+    };
+
+    if constexpr (filter_out_view_frustum)
+      if (isInFrustum())
+        return;
+
+    if (voxel_activity::culling_active(thiz->contextId))
+    {
+      const vec4f voxelCheckBsphere =
+        v_mat44_mul_bsph(tm, v_make_vec4f(riRes->bsphCenter.x, riRes->bsphCenter.y, riRes->bsphCenter.z, riRes->bsphRad));
+      if (!voxel_activity::keep_instance(thiz->contextId, voxelCheckBsphere, thiz->voxelConsidered, thiz->voxelCulled))
+        return;
+    }
+
+    if (impostor)
+    {
+      if (!thiz->contextId->hasAny(Features::RIFull))
+        return;
+
+      tm43.row0 = v_sub(tm43.row0, thiz->viewPositionX);
+      tm43.row1 = v_sub(tm43.row1, thiz->viewPositionY);
+      tm43.row2 = v_sub(tm43.row2, thiz->viewPositionZ);
+
+      auto color = random_color_from_pos(tm.col3, palette_id, colors[0], colors[1]);
+
+      if (add_impostor_instance(thiz->contextId, make_relem_mesh_id(bvh_id, lod_ix, 0), tm43, color.u, thiz->threadIx,
+            thiz->meta_alloc_id_accel, thiz->blas_accel, thiz->mesh_id_accel))
+        v_bbox3_add_pt(thiz->treeArea, v_mat43_extract_pos(tm43));
+
+      thiz->impostorCount++;
+
+      thiz->updateSplitBudgetHit();
+      return;
+    }
+
+    if (thiz->contextId->hasAny(Features::RIBaked))
+      lod_ix = last_lod_ix;
+
+    if constexpr (use_min_lod)
+      lod_ix = max<int>(lod_ix, riRes->getBvhMinLod());
+
+    lod_ix = min<int>(lod_ix, riRes->lods.size() - 1);
+
+    auto &lod = riRes->lods[lod_ix]; //-V522
+    auto elems = lod.scene->getMesh()->getMesh()->getMesh()->getElems(ShaderMesh::STG_opaque, ShaderMesh::STG_atest);
+
+    G_ASSERT(lod_ix < 16);
+
+    bool hasTreeOrLeaves =
+      eastl::any_of(elems.begin(), elems.end(), [&](auto &e) { return is_tree(thiz->contextId, e) || is_leaves(thiz->contextId, e); });
+
+    if (!hasTreeOrLeaves)
+    {
+      auto objectId = make_relem_mesh_id(bvh_id, lod_ix, 0);
+      add_riGen_instance(thiz->contextId, objectId, tm43, thiz->threadIx);
+      thiz->riGenCount++;
     }
     else
     {
-      tree = &static_cast<RiGenBVHJob *>(user_data)->newUniqueTreeBuffers[lod_ix][id];
-    }
+      eastl::optional<TMatrix4> invWorldTm;
 
-    auto &data = tree->elems[object_id];
-
-    // Hash collision. It is possible that the same position is used for different trees of the same type.
-    if (data.used)
-      return nullptr;
-
-    data.used = true;
-
-    tree->age = -1;
-
-    if (!data.buffer)
-    {
-      if (auto iter = context_id->freeUniqueTreeBLASes.find(object_id); iter != context_id->freeUniqueTreeBLASes.end())
-      {
-        if (int index = iter->second.cursor.sub_fetch(1); index >= 0)
-        {
-          auto &blas = iter->second.blases[index];
-          data.blas.swap(blas);
-          recycled = true;
-        }
-      }
-    }
-
-    return &data;
-  }
-
-  template <bool filter_out_view_frustum>
-  void doJobImpl()
-  {
-    counter = 0;
-
-    auto callback = [](int layer_ix, int pool_ix, int lod_ix, int last_lod_ix, bool impostor, mat44f_cref tm, const E3DCOLOR *colors,
-                      uint32_t bvh_id, void *user_data) {
-      auto thiz = (RiGenBVHJob *)user_data;
-
-      if ((++thiz->counter & ~32) == 0)
-        bvh_yield();
-
-#if DAGOR_DBGLEVEL > 0
-      if (DAGOR_UNLIKELY(bvh_ri_gen_range_enable))
-      {
-        auto distSq = v_extract_x(v_length3_sq(v_sub(tm.col3, thiz->viewPosition)));
-        if (sqr(bvh_ri_gen_range) < distSq)
-          return;
-      }
-#endif
-
-      ContextId context_id = thiz->contextId;
-
-      mat43f tm43;
-      v_mat44_transpose_to_mat43(tm43, tm);
-
-      RenderableInstanceLodsResource *riRes = nullptr;
-
-      if constexpr (filter_out_view_frustum)
-      {
-        riRes = rendinst::getRIGenRes(layer_ix, pool_ix);
-        if (!riRes || riRes->getBvhId() == 0)
-          return;
-
-        // These are already present in the other visibility
-        bbox3f originalBox = v_ldu_bbox3(riRes->bbox);
-        bbox3f transformedBbox;
-        v_bbox3_init(transformedBbox, tm, originalBox);
-        if (thiz->viewFrustum.testBoxB(transformedBbox.bmin, transformedBbox.bmax))
-          return;
-      }
-
-      if (impostor)
-      {
-        if (!thiz->contextId->has(Features::RIFull))
-          return;
-
-        tm43.row0 = v_sub(tm43.row0, thiz->viewPositionX);
-        tm43.row1 = v_sub(tm43.row1, thiz->viewPositionY);
-        tm43.row2 = v_sub(tm43.row2, thiz->viewPositionZ);
-
-        auto color = random_color_from_pos(tm.col3, 0, colors[0], colors[1]);
-
-        add_impostor_instance(context_id, make_relem_mesh_id(bvh_id, lod_ix, 0), tm43, color.u, thiz->threadIx,
-          thiz->meta_alloc_id_accel, thiz->blas_accel, thiz->mesh_id_accel);
-        thiz->impostorCount++;
-        return;
-      }
-
-      if (thiz->contextId->has(Features::RIBaked))
-        lod_ix = last_lod_ix;
-
+      bool isStationary = false;
       if constexpr (!filter_out_view_frustum)
-      {
-        riRes = rendinst::getRIGenRes(layer_ix, pool_ix);
-        if (!riRes || riRes->getBvhId() == 0)
-          return;
-      }
-
-      auto &lod = riRes->lods[lod_ix]; //-V522
-      auto elems = lod.scene->getMesh()->getMesh()->getMesh()->getElems(ShaderMesh::STG_opaque, ShaderMesh::STG_atest);
-
-      G_ASSERT(lod_ix < 16);
-
-      bool hasTreeOrLeaves = eastl::any_of(elems.begin(), elems.end(),
-        [&](auto &e) { return is_tree(thiz->contextId, e) || is_leaves(thiz->contextId, e); });
-
-      if (!hasTreeOrLeaves)
-      {
-        auto objectId = make_relem_mesh_id(bvh_id, lod_ix, 0);
-        add_riGen_instance(context_id, objectId, tm43, thiz->threadIx);
-        thiz->riGenCount++;
-      }
-      else
-      {
-        eastl::optional<TMatrix4> invWorldTm;
-
-        for (auto [elemIx, elem] : enumerate(elems))
+        if (stationary_rt_trees)
         {
-          bool hasIndices;
-          if (!elem.vertexData->isRenderable(hasIndices))
-            continue;
+          // Within the double of the shadow check range, use testSweptSphere to avoid testing against
+          // largely expanded AABBs up close. testSweptSphere is more expensive, but we need the precision,
+          // and also smaller bounds to check results in fewer trees animated.
+          static constexpr float preciseCheckingTreshold = sqr(max_light_dist_for_bvh_shadow * 2);
 
-          auto meshId = make_relem_mesh_id(bvh_id, lod_ix, elemIx);
-
-          if (is_tree(thiz->contextId, elem))
+          float distSq = v_extract_x(v_length3_sq_x(v_sub(tm.col3, thiz->viewPosition)));
+          vec4f localBounds = v_make_vec4f(riRes->bsphCenter.x, riRes->bsphCenter.y, riRes->bsphCenter.z, riRes->bsphRad);
+          vec4f worldBounds = v_mat44_mul_bsph(tm, localBounds);
+          if (distSq < preciseCheckingTreshold)
           {
-            bool isPosInst = rendinst::isRIGenOnlyPosInst(layer_ix, pool_ix);
-
-            TreeInfo treeInfo;
-            MeshMetaAllocator::AllocId metaAllocId = MeshMetaAllocator::INVALID_ALLOC_ID;
-            if (!handle_tree<mapTree>(thiz->contextId, elem, meshId, lod_ix, isPosInst, tm, tm.col3, colors, 0, invWorldTm, treeInfo,
-                  metaAllocId, thiz))
-              continue;
-            add_riGen_instance(context_id, meshId, tm43, &treeInfo, metaAllocId, thiz->threadIx);
-            thiz->riGenCount++;
-          }
-          else if (is_leaves(thiz->contextId, elem))
-          {
-            LeavesInfo leavesInfo;
-            MeshMetaAllocator::AllocId metaAllocId = MeshMetaAllocator::INVALID_ALLOC_ID;
-            if (!handle_leaves<mapTree>(thiz->contextId, meshId, lod_ix, tm, 0, invWorldTm, leavesInfo, metaAllocId, thiz))
-              continue;
-            add_riGen_instance(context_id, meshId, tm43, &leavesInfo, metaAllocId, thiz->threadIx);
-            thiz->riGenCount++;
+            isStationary = !instance_needs_animation_broad_phase(worldBounds, thiz->viewFrustum, thiz->lightDirection) ||
+                           !instance_needs_animation_narrow_phase(worldBounds, thiz->viewFrustum, thiz->lightDirection);
           }
           else
-          {
-            add_riGen_instance(context_id, meshId, tm43, thiz->threadIx);
-            thiz->riGenCount++;
-          }
+            isStationary = !instance_needs_animation_broad_phase(worldBounds, thiz->viewFrustum, thiz->lightDirection);
+        }
+      if constexpr (use_tree_anim_max_distance)
+        if (!isStationary)
+          isStationary = v_test_vec_x_gt(v_length3_sq_x(v_sub(tm.col3, thiz->viewPosition)), ri_tree_anim_max_distance_sq_v);
+
+      for (auto [elemIx, elem] : enumerate(elems))
+      {
+        bool hasIndices;
+        if (!elem.vertexData->isRenderable(hasIndices))
+          continue;
+
+        auto meshId = make_relem_mesh_id(bvh_id, lod_ix, elemIx);
+
+        if (is_tree(thiz->contextId, elem))
+        {
+          bool isPosInst = rendinst::isRIGenOnlyPosInst(layer_ix, pool_ix);
+
+          TreeInfo treeInfo;
+          MeshMetaAllocator::AllocId metaAllocId = MeshMetaAllocator::INVALID_ALLOC_ID;
+          bool iok = isStationary ? handle_tree<map_rendinst_stationary, false>(thiz->contextId, elem, meshId, lod_ix, isPosInst, tm,
+                                      tm.col3, colors, unique_id, invWorldTm, treeInfo, metaAllocId, thiz, true, false, palette_id)
+                                  : handle_tree<mapTreeRiGen, false>(thiz->contextId, elem, meshId, lod_ix, isPosInst, tm, tm.col3,
+                                      colors, unique_id, invWorldTm, treeInfo, metaAllocId, thiz, false, false, palette_id);
+          if (!iok)
+            continue;
+          const bool forceEnableBackfaceCulling =
+            thiz->globalObjectTessellationEnabled && riRes->isTessellated() && treeInfo.data.isTrunk;
+          add_riGen_instance(thiz->contextId, meshId, tm43, &treeInfo, isStationary, metaAllocId, thiz->threadIx,
+            forceEnableBackfaceCulling);
+          thiz->riGenCount++;
+        }
+        else if (is_leaves(thiz->contextId, elem))
+        {
+          LeavesInfo leavesInfo;
+          MeshMetaAllocator::AllocId metaAllocId = MeshMetaAllocator::INVALID_ALLOC_ID;
+          bool iok = isStationary ? handle_leaves<map_rendinst_stationary>(thiz->contextId, meshId, lod_ix, tm, unique_id, invWorldTm,
+                                      leavesInfo, metaAllocId, thiz)
+                                  : handle_leaves<mapTreeRiGen>(thiz->contextId, meshId, lod_ix, tm, unique_id, invWorldTm, leavesInfo,
+                                      metaAllocId, thiz);
+          if (!iok)
+            continue;
+          add_riGen_instance(thiz->contextId, meshId, tm43, &leavesInfo, isStationary, metaAllocId, thiz->threadIx);
+          thiz->riGenCount++;
+        }
+        else
+        {
+          add_riGen_instance(thiz->contextId, meshId, tm43, thiz->threadIx);
+          thiz->riGenCount++;
         }
       }
-    };
+    }
+
+    thiz->updateSplitBudgetHit();
+  }
+
+  template <bool use_min_lod, bool filter_out_view_frustum, bool use_tree_anim_max_distance>
+  void doJobImpl()
+  {
+    Context::BvhObjectReadLock objectsGuard(contextId->objectsLock);
+    counter = 0;
 
     riGenCount = 0;
     impostorCount = 0;
+    voxelConsidered = 0;
+    voxelCulled = 0;
 
     mesh_id_accel = -1;
     meta_alloc_id_accel = -1;
     blas_accel = 0;
 
+    auto callback = [](int layer_ix, int pool_ix, int lod_ix, int last_lod_ix, bool impostor, mat44f_cref tm, const E3DCOLOR *colors,
+                      uint32_t bvh_id, uint64_t unique_id, void *user_data, uint32_t palette_id)
+                      DAG_TS_REQUIRES_SHARED(((RiGenBVHJob *)user_data)->contextId->objectsLock) {
+                        onInstance<use_min_lod, filter_out_view_frustum, use_tree_anim_max_distance>((RiGenBVHJob *)user_data,
+                          layer_ix, pool_ix, lod_ix, last_lod_ix, impostor, tm, colors, bvh_id, unique_id, palette_id);
+                      };
     rendinst::foreachRiGenInstance(riGenVisibility, callback, this, accels[visibilityIndex].accel1, accels[visibilityIndex].accel2,
-      accels[visibilityIndex].accel1Cursor, accels[visibilityIndex].accel2Cursor, true);
+      accels[visibilityIndex].accel1Cursor, accels[visibilityIndex].accel2Cursor, true, hitChunkBudget);
 
     DA_PROFILE_TAG_DESC(getJobNameProfDesc(), "riGen count: %d, impostor count: %d", riGenCount, impostorCount);
   }
 
   void doJob()
   {
-    if (visibilityIndex == OUT_OF_FRUSTUM_VISIVILITY_INDEX)
-      doJobImpl<true>();
-    else
-      doJobImpl<false>();
+    struct CallHelper
+    {
+      using jobCallType = void (*)(RiGenBVHJob &job);
+      jobCallType callHelper[8] = {
+        [](RiGenBVHJob &job) { job.doJobImpl<false, false, false>(); },
+        [](RiGenBVHJob &job) { job.doJobImpl<false, true, false>(); },
+        [](RiGenBVHJob &job) { job.doJobImpl<true, false, false>(); },
+        [](RiGenBVHJob &job) { job.doJobImpl<true, true, false>(); },
+        [](RiGenBVHJob &job) { job.doJobImpl<false, false, true>(); },
+        [](RiGenBVHJob &job) { job.doJobImpl<false, true, true>(); },
+        [](RiGenBVHJob &job) { job.doJobImpl<true, false, true>(); },
+        [](RiGenBVHJob &job) { job.doJobImpl<true, true, true>(); },
+      };
+
+      void operator()(RiGenBVHJob &job, bool filterOutViewFrustum, bool useMinLod, bool useTreeAnimMaxDist)
+      {
+        callHelper[(useTreeAnimMaxDist ? 4 : 0) + (useMinLod ? 2 : 0) + (filterOutViewFrustum ? 1 : 0)](job);
+      }
+    } doJobWrapper;
+
+    hitChunkBudget = false;
+
+    const bool filterOutViewFrustum = visibilityIndex == OUT_OF_FRUSTUM_VISIVILITY_INDEX;
+    const bool useMinLod = bvh::ri::get_ri_lod_dist_bias() > 0;
+    const bool useTreeAnimMaxDist = v_test_vec_x_gt_0(ri_tree_anim_max_distance_sq_v);
+    doJobWrapper(*this, filterOutViewFrustum, useMinLod, useTreeAnimMaxDist);
+
+    contextId->voxelActivity.riGenConsidered.fetch_add(voxelConsidered);
+    contextId->voxelActivity.riGenCulled.fetch_add(voxelCulled);
+
+    // flip-flop scheduling: start the other pair right before this one finishes, so the parallel processing finish is consistent
+    if (hitChunkBudget)
+    {
+      G_ASSERT(otherFlip);
+      threadpool::wait(otherFlip); // just in case it is still running
+      parallel_instance_processing::before_job_start(contextId);
+      threadpool::add(otherFlip, prio);
+    }
+
+    parallel_instance_processing::after_job_end(contextId);
   }
 
-  const char *getJobName(bool &) const override { return "RiGenBVHJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("RiGenBVHJob"); }
 
-} ri_gen_bvh_job[ri_gen_thread_count];
+} ri_gen_bvh_job[ri_gen_thread_count][2]; // flip-flop pair
 
-void wait_ri_gen_instances_update(ContextId context_id)
+void wait_ri_gen_instances_update([[maybe_unused]] ContextId context_id)
 {
+  bbox3f treeArea;
+  v_bbox3_init_empty(treeArea);
+
   for (int threadIx = 0; threadIx < ri_gen_thread_count; ++threadIx)
   {
-    TIME_PROFILE_NAME(bvh::update_ri_extra_instances,
-      String(128, "wait ri_gen_bvh_job for %s: %d", context_id->name.data(), threadIx));
-    threadpool::wait(&ri_gen_bvh_job[threadIx]);
+    // skip budget check and process the rest
+    ri_gen_bvh_job[threadIx][0].chunkBudgetItems.store(~0u, dag::memory_order_relaxed);
+    ri_gen_bvh_job[threadIx][1].chunkBudgetItems.store(~0u, dag::memory_order_relaxed);
   }
+  for (int threadIx = 0; threadIx < ri_gen_thread_count; ++threadIx)
+  {
+    TIME_PROFILE(bvh::update_ri_gen_instances);
+    DA_PROFILE_TAG(bvh::update_ri_gen_instances, "wait thread %d", threadIx);
+    threadpool::wait(&ri_gen_bvh_job[threadIx][0]);
+    threadpool::wait(&ri_gen_bvh_job[threadIx][1]);
+    threadpool::wait(&ri_gen_bvh_job[threadIx][0]); // just in case for the edge case when job[0] starts job[1] in-between
+    v_bbox3_add_box(treeArea, ri_gen_bvh_job[threadIx][0].treeArea);
+    v_bbox3_add_box(treeArea, ri_gen_bvh_job[threadIx][1].treeArea);
+  }
+
+  static int rtsm_tree_areaVarId = get_shader_variable_id("rtsm_tree_area");
+  ShaderGlobal::set_float4(rtsm_tree_areaVarId, v_extract_x(treeArea.bmin), v_extract_z(treeArea.bmin), v_extract_x(treeArea.bmax),
+    v_extract_z(treeArea.bmax));
 }
 
 void update_ri_gen_instances(ContextId context_id, const dag::Vector<RiGenVisibility *> &ri_gen_visibilities,
-  const Point3 &view_position, const Frustum &view_frustum, threadpool::JobPriority prio)
+  const Point3 &view_position, const Point3 &light_direction, const Frustum &view_frustum, threadpool::JobPriority prio)
 {
-  if (ri_gen_visibilities.empty() || !context_id->has(Features::RIFull | Features::RIBaked))
+  if (ri_gen_visibilities.empty() || !context_id->hasAny(Features::AnyRI))
     return;
   G_ASSERT(ri_gen_visibilities.size() <= 2);
 
   wait_ri_gen_instances_update(context_id);
   start_new_tree_mapping_debug_frame();
+  voxel_activity::begin_ri_gen_placement(context_id);
+
+  const bool globalObjectTessellationEnabled = is_global_object_tessellation_enabled();
 
   for (auto [i, ri_gen_visibility] : enumerate(ri_gen_visibilities))
   {
@@ -372,101 +474,109 @@ void update_ri_gen_instances(ContextId context_id, const dag::Vector<RiGenVisibi
     RiGenBVHJob::accels[i].accel1Cursor = 0;
     RiGenBVHJob::accels[i].accel2Cursor = 0;
 
+    const unsigned chunkBudgetItems = bvh_ri_gen_split_enabled ? (unsigned)bvh_ri_gen_split_chunk_budget.get() : ~0u;
+
     int threadStart = get_ri_gen_worker_count() * i;
     int threadEnd = get_ri_gen_worker_count() * (i + 1);
     for (int threadIx = threadStart; threadIx < threadEnd; ++threadIx)
     {
-      auto &job = ri_gen_bvh_job[threadIx];
-      job.riGenVisibility = ri_gen_visibility;
-      job.contextId = context_id;
-      job.threadIx = threadIx;
-      job.visibilityIndex = i;
-      job.viewPosition = v_ldu_p3_safe(&view_position.x);
-      job.viewFrustum = view_frustum;
-      job.viewPositionX = v_make_vec4f(0, 0, 0, view_position.x);
-      job.viewPositionY = v_make_vec4f(0, 0, 0, view_position.y);
-      job.viewPositionZ = v_make_vec4f(0, 0, 0, view_position.z);
-
-      threadpool::add(&job, prio);
+      for (int flip = 0; flip < 2; ++flip)
+      {
+        auto &job = ri_gen_bvh_job[threadIx][flip];
+        job.riGenVisibility = ri_gen_visibility;
+        job.contextId = context_id;
+        job.threadIx = threadIx;
+        job.visibilityIndex = i;
+        job.viewPosition = v_ldu_p3_safe(&view_position.x);
+        job.viewFrustum = view_frustum;
+        job.viewPositionX = v_make_vec4f(0, 0, 0, view_position.x);
+        job.viewPositionY = v_make_vec4f(0, 0, 0, view_position.y);
+        job.viewPositionZ = v_make_vec4f(0, 0, 0, view_position.z);
+        job.lightDirection = v_ldu_p3_safe(&light_direction.x);
+        job.prio = prio;
+        job.otherFlip = &ri_gen_bvh_job[threadIx][flip ^ 1];
+        job.chunkBudgetItems.store(chunkBudgetItems, dag::memory_order_relaxed);
+        job.globalObjectTessellationEnabled = globalObjectTessellationEnabled;
+        v_bbox3_init_empty(job.treeArea);
+      }
+      parallel_instance_processing::before_job_start(context_id);
+      threadpool::add(&ri_gen_bvh_job[threadIx][0], prio);
     }
   }
 }
 
-static struct CutDownTreesJob : public cpujobs::IJob
+void collect_riex_staged_blas_addresses(ContextId context_id, dag::Vector<uint64_t> &addresses);
+
+// A tree that appears this frame has a BLAS that will only be merged to the TLAS after the build()
+// The context doesn't know about it yet, but it will get referenced in this frame.
+void collect_staged_blas_addresses(ContextId context_id, dag::Vector<uint64_t> &addresses)
+{
+  for (auto &jobFlips : ri_gen_bvh_job)
+    for (int flip = 0; flip < 2; ++flip)
+      for (auto &lodRes : jobFlips[flip].newUniqueTreeBuffers)
+        for (auto &tree : lodRes)
+          for (auto &elem : tree.second.elems)
+            if (elem.second.blas)
+              addresses.push_back(elem.second.blas.getGPUAddress());
+
+  collect_riex_staged_blas_addresses(context_id, addresses);
+}
+
+void tidy_up_rigen_trees(ContextId context_id)
+{
+  TIME_PROFILE(tidy_up_rigen_trees);
+
+  for (auto &jobFlips : ri_gen_bvh_job)
+  {
+    for (int flip = 0; flip < 2; ++flip)
+    {
+      auto &job = jobFlips[flip];
+      for (auto [lodIndex, lodRes] : enumerate(job.newUniqueTreeBuffers))
+      {
+        for (auto &tree : lodRes)
+        {
+          auto [it, inserted] = context_id->uniqueTreeBuffers[lodIndex].insert(std::move(tree));
+          if (!inserted)
+            for (auto &elem : tree.second.elems)
+              context_id->freeMetaRegion(elem.second.metaAllocId);
+        }
+        lodRes.clear();
+      }
+    }
+  }
+  TidyUpRendinstPointers pointers;
+  pointers.uniqueBuffers = make_span(context_id->uniqueTreeBuffers, Context::maxUniqueLods);
+  pointers.contextId = context_id;
+  pointers.freeUniqueBLASes = &context_id->freeUniqueTreeBLASes;
+  tidy_up_rendinsts_base<true>(context_id, pointers);
+}
+void tidy_up_riex_trees(ContextId context_id);
+void tidy_up_riex_flags(ContextId context_id);
+
+static struct TidyUpRendinstsJob : public cpujobs::IJob
 {
   ContextId contextId;
 
-  const char *getJobName(bool &) const override { return "CutDownTreesJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("TidyUpRendinstsJob"); }
 
   void doJob() override
   {
     // Remove unique tree buffers that was not used for a long time
 
-    WinAutoLock lock(contextId->cutdownTreeLock);
-
-    for (auto &job : ri_gen_bvh_job)
-    {
-      for (auto [index, lod] : enumerate(job.newUniqueTreeBuffers))
-      {
-        for (auto &tree : lod)
-          contextId->uniqueTreeBuffers[index].insert(std::move(tree));
-        lod.clear();
-      }
-    }
-
-    // We make use of the fact that resize does not shrink the vector itself, only the elem count is changed
-    for (auto &freeTrees : contextId->freeUniqueTreeBLASes)
-    {
-      if (freeTrees.second.cursor.load() < 0)
-        freeTrees.second.cursor.store(0);
-      freeTrees.second.blases.resize(freeTrees.second.cursor.load());
-    }
-
-    int dropCount = 0;
-
-    for (auto [index, lod] : enumerate(contextId->uniqueTreeBuffers))
-      for (auto iter = lod.begin(); iter != lod.end();)
-      {
-        // Reset the used flags, so in the next frame, all start fresh
-        for (auto &elem : iter->second.elems)
-          elem.second.used = false;
-
-        iter->second.age++;
-        if (iter->second.age < 1)
-        {
-          ++iter;
-          continue;
-        }
-
-        for (auto &elem : iter->second.elems)
-        {
-          auto &storage = contextId->freeUniqueTreeBLASes[elem.first].blases.push_back();
-          storage.swap(elem.second.blas);
-
-          contextId->freeMetaRegion(elem.second.metaAllocId);
-          contextId->releaseBuffer(elem.second.buffer.get());
-
-          if (auto iter = contextId->processBufferAllocators.find(elem.second.buffer.allocator);
-              iter != contextId->processBufferAllocators.end())
-            iter->second.free(elem.second.buffer);
-        }
-
-        dropCount++;
-        iter = lod.erase(iter);
-      }
-
-    for (auto &freeTrees : contextId->freeUniqueTreeBLASes)
-      freeTrees.second.cursor.store(freeTrees.second.blases.size());
+    WinAutoLock lock(contextId->tidyUpRendinstsLock);
+    tidy_up_rigen_trees(contextId);
+    tidy_up_riex_trees(contextId);
+    tidy_up_riex_flags(contextId);
   }
-} cut_down_trees_job;
+} tidy_up_rendinsts_job;
 
-void cut_down_trees(ContextId context_id)
+void tidy_up_rendinsts(ContextId context_id)
 {
-  cut_down_trees_job.contextId = context_id;
-  threadpool::add(&cut_down_trees_job, threadpool::PRIO_HIGH);
+  tidy_up_rendinsts_job.contextId = context_id;
+  threadpool::add(&tidy_up_rendinsts_job, threadpool::PRIO_HIGH);
 }
 
-void wait_cut_down_trees() { threadpool::wait(&cut_down_trees_job); }
+void wait_tidy_up_rendinsts() { threadpool::wait(&tidy_up_rendinsts_job); }
 
 void teardown_ri_gen()
 {

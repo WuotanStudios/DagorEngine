@@ -4,7 +4,7 @@
 #include <drv/3d/dag_driver.h>
 #include <EASTL/tuple.h>
 #include <generic/dag_smallTab.h>
-#include <resourceName.h>
+#include "resourceName.h"
 
 
 class BaseTextureImpl : public D3dResourceNameImpl<BaseTexture>
@@ -29,8 +29,6 @@ public:
   D3DResourceType getType() const override { return type; }
 
   virtual int update(BaseTexture *src) = 0;
-  virtual int updateSubRegion(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
-    int dest_subres_idx, int dest_x, int dest_y, int dest_z) = 0;
 
   int level_count() const override;
   virtual int texmiplevel(int minlev, int maxlev) = 0;

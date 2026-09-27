@@ -4,6 +4,9 @@
 //
 #pragma once
 
+#include <drv/3d/dag_multi_interface.h>
+#include <util/dag_stdint.h>
+
 class DataBlock;
 
 struct FrameEvents
@@ -20,6 +23,25 @@ struct DeviceResetEventHandler
 
   virtual void preRecovery() = 0;
   virtual void recovery() = 0;
+};
+
+// Controls driver background processing mode. Check https://microsoft.github.io/DirectX-Specs/d3d/BackgroundProcessing.html.
+enum class DriverBackgroundProcessingMode : uint32_t
+{
+  ALLOWED = 0,                      // Default. Drivers may instrument workloads and submit low priority optimization tasks.
+  ALLOW_INTRUSIVE_MEASUREMENTS = 1, // Prioritizes richness of instrumentation over avoiding glitches, for training/profiling.
+  DISABLE_BACKGROUND_WORK = 2,      // Prevents execution of background processing tasks. Requires developer mode.
+  DISABLE_PROFILING_BY_SYSTEM = 3,  // Superset of DISABLE_BACKGROUND_WORK, also avoids behavioral changes. Requires developer mode.
+  KEEP_CURRENT = 4,                 // Does not request any change. Previous mode remains valid.
+};
+
+// Specifies what to do with the results of previous profiling measurements.
+enum class DriverMeasurementsAction : uint32_t
+{
+  KEEP_ALL = 0,                     // Does not request any change. Previous results remain valid.
+  COMMIT_RESULTS = 1,               // Hints that the workload seen so far is complete, kick off optimizations.
+  COMMIT_RESULTS_HIGH_PRIORITY = 2, // Superset of COMMIT_RESULTS, executes tasks at higher priority. Requires developer mode.
+  DISCARD_PREVIOUS = 3,             // Hints that the workload changed significantly, previous measurements are invalid.
 };
 
 enum class Drv3dCommand
@@ -55,6 +77,9 @@ enum class Drv3dCommand
   ASYNC_PIPELINE_COMPILE_RANGE_END,
 
   // recives current amount of pipelines in compilation queue
+  // par1 - pointer to uint32_t, if not null, recives amount of frames to complete current frame on GPU
+  // par2 - pointer to size_t, if not null, recives amount of async compiled pipelines from app startup
+  //        par2 is optionally implemented, when implemented value is always > 0, when not implemented value is intact
   GET_PIPELINE_COMPILATION_QUEUE_LENGTH,
   // forms async pipeline compilation feeedback in range of draw commands executed between begin&end
   // par1 - user pointer to uint32_t, pointer must not be released (i.e. permanent pointer!)
@@ -72,6 +97,20 @@ enum class Drv3dCommand
   TIMESTAMPISSUE,
   TIMESTAMPGET,
 
+
+  //! Gets timestamp queries to measure gpu stalls on backbuffer flip waits.
+  // Used to detect gpu vsync stalls.
+  // Timestamp returns 0 until a gpu flip wait occurs (first backbuffer write in the frame).
+  // par1 - begin timestamp
+  // par2 - end timestamp
+  // Warning! Should be issued once per frame!
+  TIMESTAMP_FLIP_STALL_ISSUE,
+
+  //! Releases timestamp issued with TIMESTAMP_FLIP_STALL_ISSUE.
+  // par1 - begin timestamp
+  // par2 - end timestamp
+  TIMESTAMP_FLIP_STALL_RELEASE,
+
   //! Gets CPU and GPU time nearly at the same moment
   // par1 - cpu timestamp
   // par2 - gpu timestamp
@@ -83,6 +122,9 @@ enum class Drv3dCommand
   FLUSH_STATES, // flush all states, except buffer. will resolve msaa, generate mips, etc - if supported!
   D3D_FLUSH,    // ID3D11DeviceContext::Flush or IDirect3DQuery9::GetData(D3DGETDATA_FLUSH).
   GPU_BARRIER_WAIT_ALL_COMMANDS,
+
+  // flushes and submits current software command queue. similar with D3D_FLUSH without gpu wait
+  D3D_FLUSH_COMMAND_BUFFER,
 
   //! flush pipeline states to compile pipeline
   // par1: uintptr_t that stores ShaderStage
@@ -105,9 +147,6 @@ enum class Drv3dCommand
   // It is useful in cases when part of some rendering is performed beyond the borders of the driver
   BEGIN_EXTERNAL_ACCESS,
   END_EXTERNAL_ACCESS,
-
-  SET_VS_DEBUG_INFO,
-  SET_PS_DEBUG_INFO,
 
   // MRT clear sequence is an optimization to clear mrt targets with different colors in
   // an optimized fashion for target APIs like Vulkan.
@@ -150,6 +189,10 @@ enum class Drv3dCommand
   IS_HDR_ENABLED,
   INT10_HDR_BUFFER,
   HDR_OUTPUT_MODE,
+  HDR_HEADROOM,
+  //! change to the hdr mode without a device reset.
+  //! returns 0 when the driver cannot do it
+  APPLY_HDR_MODE,
   GET_LUMINANCE,
 
   MEM_STAT, // Single line tex and buffers statistics.
@@ -175,6 +218,10 @@ enum class Drv3dCommand
   // Ask driver by what factor it was limited when rendering last frame
   GET_FRAMERATE_LIMITING_FACTOR,
 
+  // Returns the number of frames the swapchain presented for the last finished frame: 1, or more with
+  // frame generation. Safe to call from any thread. No parameters required
+  GET_PRESENTED_FRAME_COUNT,
+
   // Loads additional pipeline cache from path @par1
   LOAD_PIPELINE_CACHE,
   // Saves current pipeline cache on FS.
@@ -199,8 +246,9 @@ enum class Drv3dCommand
   IS_XESS_QUALITY_AVAILABLE_AT_RESOLUTION,
 
   // Return current XESS rendering resolution in par1 and par2
-  // par1: int *width
-  // par2: int *height
+  // par1: IPoint2 *optimalResolution
+  // par2: IPoint2 *minResolution
+  // par3: IPoint2 *maxResolution
   GET_XESS_RESOLUTION,
 
   // Returns current XESS version as a string.
@@ -224,6 +272,29 @@ enum class Drv3dCommand
   // par2: int *view_index
   EXECUTE_DLSS_G,
 
+  // Sets DLSS-G enabled state. Routed through the render backend thread so slDLSSGSetOptions is not
+  // called from the calling (e.g. main) thread.
+  // par1: int *frames_to_generate
+  // par2: int *view_index
+  SET_DLSS_G_ENABLED,
+
+  // Sets DLSS (super resolution / ray reconstruction) options. Routed through the render backend thread
+  // so slDLSS(D)SetOptions is not called from the calling (e.g. main) thread.
+  // par1: nv::DlssOptions *
+  // par2: int *view_index
+  SET_DLSS_OPTIONS,
+
+  // Executes DLSS-NR (neural rendering)
+  // par1: nv::DlssNRParams *
+  // par2: int *view_index
+  EXECUTE_DLSS_NR,
+
+  // Sets DLSS-NR options. Routed through the render backend thread so slDLSSNRSetOptions is not
+  // called from the calling (e.g. main) thread.
+  // par1: nv::DlssNROptions *
+  // par2: int *view_index
+  SET_DLSS_NR_OPTIONS,
+
   // Executes DLSS
   // par1: XessParams *
   EXECUTE_XESS,
@@ -236,10 +307,6 @@ enum class Drv3dCommand
   // Gets the number of frames XeSS can generate.
   // par1: int* frames
   GET_XESS_SUPPORTED_GEN_FRAMES,
-
-  // Gets the number of frames XeSS was presented since the last real frame
-  // par1: int* presented_frames
-  GET_XESS_PRESENTED_FRAME_COUNT,
 
   // Tells if XeSS frame generation is enabled
   // par1: bool* enabled
@@ -257,6 +324,53 @@ enum class Drv3dCommand
   // par1: XessFgParams *
   XESS_SCHEDULE_GEN_FRAME,
 
+  // Initialize or reinitialize FSR upscaling with the provided context args
+  // par1: amd::FSR::ContextArgs *
+  INIT_FSR_UPSCALING,
+
+  // Tear down the current FSR upscaling context. No parameters required
+  TEARDOWN_FSR_UPSCALING,
+
+  // Returns if FSR interface is loaded. No parameters required
+  GET_FSR_LOADED,
+
+  // Returns if FSR upscaling is supported. No parameters required
+  GET_FSR_UPSCALING_SUPPORTED,
+
+  // Return FSR rendering resolution for a target resolution and mode
+  // par1: IPoint2 *targetResolution
+  // par2: int *mode
+  // par3: IPoint2 *renderResolution
+  GET_FSR_RESOLUTION,
+
+  // Returns current FSR version as a string.
+  // par1: char *version
+  // par2: size_t versionSize
+  GET_FSR_VERSION,
+
+  // Gets the number of frames FSR can generate.
+  // par1: int* frames
+  GET_FSR_SUPPORTED_GEN_FRAMES,
+
+  // Tells if FSR frame generation is active
+  // par1: bool* enabled
+  GET_FSR_FG_ENABLED,
+
+  // Tells if FSR frame generation is supported. No parameters required
+  GET_FSR_FG_SUPPORTED,
+
+  // Tells if FSR frame generation is suppressed
+  // par1: bool* suppressed
+  GET_FSR_FG_SUPPRESSED,
+
+  // Enable or disable FSR frame generation
+  // par1: bool* enable
+  FSR_ENABLE_FG,
+
+  // Suppress or continue FSR frame generation. Suppressing doesn't free up GPU resources.
+  // par1: bool* suppress
+  FSR_SUPPRESS_FG,
+
   // Execute FSR
   // par1: amd::FSR::UpscalingArgs *
   EXECUTE_FSR,
@@ -264,18 +378,6 @@ enum class Drv3dCommand
   // Execute FSR
   // par1: amd::FSR::FrameGenArgs *
   EXECUTE_FSR_FG,
-
-  // Execute FSR2
-  // par1: Fsr2Params *
-  EXECUTE_FSR2,
-
-  // Returns current FSR2 state as Fsr2State casted to int. No parameters required
-  GET_FSR2_STATE,
-
-  // Return current FSR2 rendering resolution in par1 and par2
-  // par1: int *width
-  // par2: int *height
-  GET_FSR2_RESOLUTION,
 
   // Execute PSSR
   // par1: d3d::PSSR::FrameParameters *
@@ -405,9 +507,6 @@ enum class Drv3dCommand
   // Sets to the PS5 driver which eye is rendered in VR and get back the distortion resolve LUT's ID
   SET_PS5_FSR_VIEW,
 
-  // par1: bool enable/disable HDR
-  SET_HDR,
-
   // This raises a debug break event / signal in the driver when it is executed.
   // Drivers with backend workers this will be executed in that thread.
   // This command allows to debug break into the backend to help with issues during execution of d3d commands.
@@ -426,11 +525,22 @@ enum class Drv3dCommand
   // par1: CompilePipelineSet*
   COMPILE_PIPELINE_SET,
 
+  // Pauses/resumes pipeline set compilation (spreading over frames).
+  // par1 - if not null, pauses compilation; if null, resumes
+  // returns 1 if supported
+  PAUSE_PIPELINE_SET_COMPILATION,
+
   // par1: Sbuffer*
   // par2: uint64_t*
   GET_BUFFER_GPU_ADDRESS,
 
   ENABLE_WORKER_LOW_LATENCY_MODE,
+
+  // Controls driver background processing. Only dx12 and dev builds. Some of the flags require developer mode to be enabled.
+  // par1: optional pointer to DriverBackgroundProcessingMode, nullptr keeps current mode.
+  // par2: optional pointer to DriverMeasurementsAction, nullptr is treated as KEEP_ALL.
+  // Returns 1 if current processing wants more frames, otherwise 0.
+  DRIVER_BACKGROUND_PROCESSING_MODE,
 
   // par1 enable (if par1 not null)/disable logerr reporting when doing sync readback of textures/buffers
   LOGERR_ON_SYNC,
@@ -458,6 +568,11 @@ enum class Drv3dCommand
   // par2: uint32_t * - place where AS size after compaction will be stored
   GET_PS5_COMPACTED_BLAS_SIZE,
 
+  // par1: RaytraceBottomAccelerationStructure * - array of BLAS to compact
+  // par2: uint64_t - count of BLAS passed to command
+  // each BLAS must be build and available on CPU
+  COMPACT_BLAS,
+
   // Returns a vendor specific implementation of the GpuLatency interface
   // par1: Pointer to the vendor id
   // par2: Pointer to a pointer, reciving the interface
@@ -474,6 +589,10 @@ enum class Drv3dCommand
   //  - delay-continue pair must be completed before flushing/submitting workload to GPU
   DELAY_SYNC,
   CONTINUE_SYNC,
+  // sync completion command to avoid issues over ill formed user barriers when action point is missing
+  // action point - any draw,dispatch,etc. if there is no action point, user barriers are always batched up
+  // sometimes causing ill formed sync, when missing action point is not expected
+  COMPLETE_SYNC,
 
   //
   // Changes GPU queue/pipeline where order dependant action commands will be submitted
@@ -492,12 +611,100 @@ enum class Drv3dCommand
   // Returns whether PIX Capturer is loaded
   IS_PIX_CAPTURE_LOADED,
 
+  // Returns whether any GPU capture tool (PIX, RenderDoc, Nsight, ...) is loaded. Broader than
+  // IS_PIX_CAPTURE_LOADED. Useful to relax resource-size limits that such tools inflate with debug data.
+  IS_ANY_CAPTURE_TOOL_LOADED,
+
   SET_RT_VALIDATION_CALLBACK,
 
   // Driver attempts to create a GPU page fault deliberately.
   // A page fault on the GPU will cause it to halt and be reset by the OS.
   // Drivers should only implement this command for development and debug builds.
   CAUSE_GPU_PAGE_FAULT,
+
+  /// This command set a driver internal const buffer to a a slot of a
+  /// pipeline stage with the shader binding table data of the given
+  /// compute program. The provided data will be provided as
+  /// raytrace::RayDispatchGroupTableSet defines it.
+  /// To help with padding with constant buffers, the provided buffer
+  /// is aligned to the 256 byte boundary and padded with zeros.
+  /// This makes it easier to copy the table as a series of uint4's
+  /// (table is 26 uints, so 7 uint4s with padding) into argument
+  /// buffers.
+  /// This command will activate a override for the given const buffer
+  /// slot, for the given shader stage, when the provided program is
+  /// a compute program that uses the RayGen on CS mode, otherwise
+  /// it will deactivate previous overrides of that slot.
+  /// When the override is disabled, the originally set buffer will
+  /// be used again.
+  /// When an override is activated, it will remain active until it
+  /// was deactivated, as described above.
+  /// param1: uintptr_t: Stage: valid values are STAGE_VS, STAGE_PS or STAGE_CS.
+  /// param2: uintptr_t: Slot: any valid const buffer slot index.
+  /// param3: uintptr_t: Program: any compute program that uses the RayGen as CS mode, or BAD_PROGRAM.
+  SET_COMPUTE_ON_RAY_TRACE_SHADER_BINDING_TABLE_CONST_BUFFER,
+
+  /// Set how the `d3d::update_screen` behaves in manner of syncronisation.
+  /// param1: bool*: AsyncMode: If true then the `d3d::update_screen` and the underlying present call can execute asynchronously.
+  /// If false then the `d3d::update_screen` will wait to the present return.
+  /// If the param1 is nullptr, then reset the behavior to the default.
+  /// On DX11 the default is the false case, on other drivers e.g. DX12 the true case is the default.
+  /// Currently it is implemented in DX12 driver.
+  SET_PRESENT_ASYNC_MODE,
+
+  // Use this command to activate low-level driver data trace for production builds.
+  // Traced data will be dumped to clog, when GPU crash is ocurred.
+  // Use it for selected block of code, to get more information about specific GPU crash.
+  // par1: set flag uintptr_t (0 - Disable, !0 - Enable)
+  SET_GPU_POSTMORTEM_DATA_TRACE_ENABLED,
+
+  // Informs backend that we have deleted programs/shaders and the corresponding backing memory is about
+  // to be deleted as well. Useful when backends are able to compile pipelines states/shader in separate
+  // threads and can be used to clean compilation queue from dead shaders/programs. Blocks until async
+  // compilation queue is empty
+  UNLOAD_SHADER_MEMORY,
+
+  // Reports the current allocation status, like max slot index, free regions and how much is left until exhaustion
+  REPORT_BINDLESS_HEAP_ALLOCATION_STATUS_TO_DEBUG_LOG,
+
+  // Reports the current status of all bindless slots until the max allocated slot index.
+  // This consists of free ranges and ranges of textures and buffers.
+  REPORT_BINDLESS_HEAP_SLOT_STATUS_TO_DEBUG_LOG,
+
+  // Called inside coredump handler
+  SONY_ATTACH_CRASH_DUMP_INFO,
+
+  // Pipeline statistics query (dx12 only)
+  // Start the query. par1: void ** - query pointer, if *par1 is nullptr, the new query is created
+  PIPELINE_STATS_BEGIN,
+  // End the query. Must be called before frame end.
+  // par1: void * - query pointer received from PIPELINE_STAT_BEGIN
+  PIPELINE_STATS_END,
+  // Lazy queries are used to get the approximate number of primitives sent to rasterizer with minimal overhead.
+  // The lazy query always use gpu metrics for indirect draw calls, or when draw/draw_indexed methods use geometry/tessellation stages.
+  // The number of primitives on the CPU side can be returned for the draw/draw_indexed methods
+  // if they are called before a call with guaranteed GPU statistics.
+  // BEGIN_LAZY
+  //   draw(6, 1) (returns 6 primitives from the CPU side if there is no gs/ts)
+  //   draw_indirect(...) (returns the number of primitives from the GPU side)
+  //   draw(6, 1) (returns the number of primitives from the GPU side - 0 (if dont_render) or 6)
+  // END_LAZY
+  // The LIFO order for lazy queries must be preserved.
+  PIPELINE_STATS_BEGIN_LAZY,
+  PIPELINE_STATS_END_LAZY,
+  // Get the number of primitives that were sent to the rasterizer for the query.
+  // par1: void * - query pointer, par2: uint64_t * - pointer to result variable
+  // returns 1 if the result is ready, otherwise 0. If the result is not ready, the value pointed by par2 is not modified.
+  // You must wait till the result is ready before starting a BEGIN/END pair with the same query pointer.
+  // Otherwise the behavior is undefined.
+  PIPELINE_STATS_INVOKED_PRIMITIVES,
+  // Create pipeline statistics query. par1: void ** - query pointer.
+  // After this call the query pointer is valid and can be used in PIPELINE_STAT_BEGIN/END
+  PIPELINE_STATS_CREATE_QUERY,
+  // Release pipeline statistics query. par1: void ** - query pointer, after this call the query pointer is nullptr
+  PIPELINE_STATS_RELEASE_QUERY,
+
+  GET_SWAPCHAIN_PRE_ROTATION,
 
   USER = 1000,
 };
@@ -528,36 +735,28 @@ struct Drv3dTimings
 /// All values are optional, but graphics and mesh pipelines can not be created without output and render state sets.
 struct CompilePipelineSet
 {
-  /// V1 and V2 value. When not specified, the driver assumes its driver specific format (if supported) and otherwise engine.
+  /// When not specified, the driver assumes its driver specific format (if supported) and otherwise engine.
   const char *defaultFormat;
-  /// V1 and V2 block. A block with a set of feature sets referenced by pipelines in the pipeline sets to indicate required features.
+  /// A block with a set of feature sets referenced by pipelines in the pipeline sets to indicate required features.
   const DataBlock *featureSet;
-  /// V1 and V2 block. A block with a set of blocks describing input layouts.
+  /// A block with a set of blocks describing input layouts.
   const DataBlock *inputLayoutSet;
-  /// V1 and V2 block. A block with a set of blocks describing render states. The driver will ignore render states that are
+  /// A block with a set of blocks describing render states. The driver will ignore render states that are
   /// incompatible with the system.
   const DataBlock *renderStateSet;
-  /// V1 and V2 block. A block with a set of blocks describing output format states. The driver will ignore output format states that
+  /// A block with a set of blocks describing output format states. The driver will ignore output format states that
   /// are incompatible wit the system.
   const DataBlock *outputFormatSet;
-  /// V1 block. A block with a set of blocks describing graphics pipelines. The driver will ignore pipelines using unsupported input
-  /// layouts, render states or output formats.
-  const DataBlock *graphicsPipelineSet;
-  /// V1 block. A block with a set of blocks describing mesh pipelines. The driver will ignore pipelines using unsupported render
-  /// states or output formats.
-  const DataBlock *meshPipelineSet;
-  /// V1 block. A block with a set of blocks describing compute pipelines.
-  const DataBlock *computePipelineSet;
-  /// V2 block, this block stores shader class signatures, this ensures we try not to load incompatible shader class uses.
+  /// This block stores shader class signatures, this ensures we try not to load incompatible shader class uses.
   const DataBlock *signature;
-  /// V2 block, new compute use set, uses shader class names and codes.
+  /// Compute use set, uses shader class names and codes.
   const DataBlock *computeSet;
-  /// V2 block, new graphics use set, uses shader class names and codes.
+  /// Graphics use set, uses shader class names and codes.
   const DataBlock *graphicsSet;
-  /// V2 block, new graphics use set, uses shader class names and codes. This set has pipelines where the paired pixel shader is
+  /// Graphics use set, uses shader class names and codes. This set has pipelines where the paired pixel shader is
   /// replaced by the null pixel shader.
   const DataBlock *graphicsNullPixelOverrideSet;
-  /// V2 block, new graphics use set, uses shader class names and codes. This set has pipelines where the paired pixel shader uses a
+  /// Graphics use set, uses shader class names and codes. This set has pipelines where the paired pixel shader uses a
   /// differen shader class name and codes than the vertex shader.
   const DataBlock *graphicsPixelOverrideSet;
 };
@@ -573,11 +772,11 @@ struct Drv3dMakeTextureParams
   ResourceBarrier currentState;
 };
 
-namespace d3d
+namespace d3d _MULTI_INTERFACE
 {
 /// send specific command to driver
 int driver_command(Drv3dCommand command, void *par1 = nullptr, void *par2 = nullptr, void *par3 = nullptr);
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 #if _TARGET_D3D_MULTI
 #include <drv/3d/dag_interface_table.h>

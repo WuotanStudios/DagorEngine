@@ -5,7 +5,7 @@
 #include "guiScene.h"
 #include "elementRef.h"
 
-#include <sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
 #include <sqstdaux.h>
 
 #include <dasModules/dasSystem.h>
@@ -18,45 +18,98 @@ namespace darg
 {
 
 
+// Point inst->dasCtx/dasFunc at a live resolution of the DasScript (return 0), or throw.
+// Runs every _call: resolves lazily (script may still be LOADING) and re-validates the cache,
+// since an owned-env reload frees the Context while our dasScriptObj keeps the handle alive -
+// a stale cache would call into freed memory. If still compiling, drains the worker here.
+static SQInteger resolve_das_function(HSQUIRRELVM vm, GuiScene *scene, DasFunction *inst)
+{
+  if (inst->dasFunc)
+  {
+    // Trust the cache only while it still points at the script's current, ready Context.
+    DasScript *script = inst->dasScriptObj.Cast<DasScript *>();
+    if (script && script->isReady() && script->ctx.get() == inst->dasCtx)
+      return 0;
+    inst->dasFunc = nullptr;
+    inst->dasCtx = nullptr;
+  }
+  if (inst->resolveFailed)
+    return sqstd_throwerrorf(vm, "DasFunction '%s': script failed to load", inst->funcName.c_str());
+
+  if (inst->dasScriptObj.GetType() != OT_INSTANCE || !Sqrat::ClassType<DasScript>::IsClassInstance(inst->dasScriptObj.GetObject()))
+  {
+    inst->resolveFailed = true;
+    return sq_throwerror(vm, "Invalid 'script' for DasFunction");
+  }
+
+  DasScript *script = inst->dasScriptObj.Cast<DasScript *>();
+
+  if (script->isLoading())
+    scene->dasScriptsData->waitScriptResolved(script);
+
+  if (!script->isReady() || !script->ctx)
+  {
+    inst->resolveFailed = true;
+    return sqstd_throwerrorf(vm, "DasFunction '%s': script failed to load", inst->funcName.c_str());
+  }
+
+  das::daScriptEnvironmentGuard envGuard(scene->dasScriptsData->dasEnv, scene->dasScriptsData->dasEnv);
+  das::Context *ctx = script->ctx.get();
+  bool isUnique = false;
+  das::SimFunction *dasFunc = ctx->findFunction(inst->funcName.c_str(), isUnique);
+  if (!dasFunc)
+  {
+    inst->resolveFailed = true;
+    return sqstd_throwerrorf(vm, "Function '%s' not found in das script", inst->funcName.c_str());
+  }
+  if (!isUnique)
+  {
+    inst->resolveFailed = true;
+    return sqstd_throwerrorf(vm, "Function '%s' is not unique", inst->funcName.c_str());
+  }
+
+  inst->dasCtx = ctx;
+  inst->dasFunc = dasFunc;
+  return 0;
+}
+
+
 SQInteger DasFunction::script_ctor(HSQUIRRELVM vm)
 {
   HSQOBJECT hScript;
   G_VERIFY(SQ_SUCCEEDED(sq_getstackobj(vm, 2, &hScript)));
   Sqrat::Object scriptObj(hScript, vm);
 
-  if (sq_type(hScript) != OT_INSTANCE || !Sqrat::ClassType<DasScript>::IsClassInstance(hScript, false))
+  if (sq_type(hScript) != OT_INSTANCE || !Sqrat::ClassType<DasScript>::IsClassInstance(hScript))
     return sq_throwerror(vm, "Invalid 'script' argument for DasFunction constructor");
 
   const char *funcName = nullptr;
   G_VERIFY(SQ_SUCCEEDED(sq_getstring(vm, 3, &funcName)));
 
+  GuiScene *scene = GuiScene::get_from_sqvm(vm);
+  if (!scene->dasScriptsData.get())
+    return sq_throwerror(vm, "daScript is not initialized");
+
+  DasFunction *inst = new DasFunction();
+  inst->dasScriptObj = scriptObj;
+  inst->funcName = funcName;
+
+  // If the script already finished loading, resolve eagerly so a genuine "function not found"
+  // is reported at construction time (preserves the old loud behaviour for ready scripts).
+  // While the script is still LOADING we defer resolution to the first _call - no block here.
+  DasScript *script = scriptObj.Cast<DasScript *>();
+  if (script->isReady())
   {
-    GuiScene *scene = GuiScene::get_from_sqvm(vm);
-    das::daScriptEnvironmentGuard envGuard(scene->dasScriptsData->dasEnv, scene->dasScriptsData->dasEnv);
-
-    if (!scene->dasScriptsData.get())
-      return sq_throwerror(vm, "daScript is not initialized");
-
-    DasScript *script = scriptObj.Cast<DasScript *>();
-    das::Context *ctx = script->ctx.get();
-
-    bool isUnique = false;
-    das::SimFunction *dasFunc = ctx->findFunction(funcName, isUnique);
-    if (!dasFunc)
-      return sqstd_throwerrorf(vm, "Function '%s' not found in das script", funcName);
-
-    if (!isUnique)
-      return sqstd_throwerrorf(vm, "Function '%s' is not unique", funcName);
-
-    DasFunction *inst = new DasFunction();
-
-    inst->dasScriptObj = scriptObj;
-    inst->dasCtx = ctx;
-    inst->dasFunc = dasFunc;
-
-    Sqrat::ClassType<DasFunction>::SetManagedInstance(vm, 1, inst);
-    return 0;
+    SQInteger r = resolve_das_function(vm, scene, inst);
+    if (SQ_FAILED(r))
+    {
+      delete inst;
+      return r;
+    }
   }
+
+  Sqrat::ClassType<DasFunction>::SetManagedInstance(vm, 1, inst);
+  return 0;
 }
 
 SQInteger DasFunction::script_call(HSQUIRRELVM vm)
@@ -65,15 +118,28 @@ SQInteger DasFunction::script_call(HSQUIRRELVM vm)
     return SQ_ERROR;
 
   DasFunction *inst = Sqrat::Var<DasFunction *>(vm, 1).value;
-  if (!inst || !inst->dasFunc || !inst->dasCtx)
+  if (!inst)
     return sq_throwerror(vm, "Invalid DasFunction instance");
 
   GuiScene *scene = GuiScene::get_from_sqvm(vm);
+
+  // Resolve lazily and re-validate the cached Context every call (see resolve_das_function).
+  {
+    SQInteger r = resolve_das_function(vm, scene, inst);
+    if (SQ_FAILED(r))
+      return r;
+  }
+  if (!inst->dasFunc || !inst->dasCtx)
+    return sq_throwerror(vm, "Invalid DasFunction instance");
+
   das::daScriptEnvironmentGuard envGuard(scene->dasScriptsData->dasEnv, scene->dasScriptsData->dasEnv);
 
   das::SimFunction *dasFunc = inst->dasFunc;
   das::Context *ctx = inst->dasCtx;
   das::FuncInfo *info = dasFunc->debugInfo;
+
+  if (dasFunc->cmres)
+    return sqstd_throwerrorf(vm, "DasFunction '%s': unsupported return type (struct returned by value)", inst->funcName.c_str());
 
   int numArgs = sq_gettop(vm) - 2;
   int dasArgCount = info ? info->count : 0;
@@ -105,6 +171,9 @@ SQInteger DasFunction::script_call(HSQUIRRELVM vm)
     }
     else
     {
+      if (argType->isRef() || argType->dimSize != 0)
+        return sqstd_throwerrorf(vm, "Argument %d: unsupported type for cross-call (ref or array)", i + 1);
+
       switch (argType->type)
       {
         case das::Type::tInt:
@@ -136,6 +205,7 @@ SQInteger DasFunction::script_call(HSQUIRRELVM vm)
     }
   }
 
+  darg_das_check_eval_thread(ctx);
   ctx->tryRestartAndLock();
   bind_dascript::RAIIStackwalkOnLogerr stackwalkOnLogerr(ctx);
 
@@ -143,13 +213,17 @@ SQInteger DasFunction::script_call(HSQUIRRELVM vm)
 
   if (const char *ex = ctx->getException())
   {
+    // Breadcrumb: the sq error may be caught by script, so logerr is the only durable record;
+    // emitted only on actual eval/compile overlap.
+    if (darg_das_compile_in_flight())
+      logerr("DasFunction '%s': das exception while a worker das compile was in flight"
+             " (eval/compile overlap, see daRg async-load): %s",
+        inst->funcName.c_str(), ex);
     ctx->unlock();
-    ctx->restartHeaps();
     return sqstd_throwerrorf(vm, "das exception: %s", ex);
   }
 
   ctx->unlock();
-  ctx->restartHeaps();
 
   das::TypeInfo *retType = info ? info->result : nullptr;
   if (!retType || retType->type == das::Type::tVoid)
@@ -172,7 +246,7 @@ void DasFunction::register_script_class(Sqrat::Table &exports)
   Sqrat::Class<DasFunction, Sqrat::NoCopy<DasFunction>> clsDasFunc(vm, "DasFunction");
   clsDasFunc //
     .SquirrelCtor(script_ctor, 3, ".xs")
-    .SquirrelFunc("_call", script_call, -1, "x", "Call the function with the given arguments")
+    .SquirrelFunc("_call", script_call, -1, "x", SQ_DOC("Call the function with the given arguments"))
     /**/;
 
   exports.Bind("DasFunction", clsDasFunc);

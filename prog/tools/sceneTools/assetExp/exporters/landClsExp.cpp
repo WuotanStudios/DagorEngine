@@ -68,16 +68,17 @@ public:
     for (int i = 0; i < a.props.blockCount(); i++)
       if (a.props.getBlock(i)->getBlockNameId() == nid_obj_plant_generate)
       {
-        const char *densMap = a.props.getBlock(i)->getStr("densityMap", NULL);
-        if (!densMap)
-          continue;
-
-        DagorAsset *tm_a = get_asset_by_name(a.getMgr(), densMap, tifmask_atype);
-        if (!tm_a)
-          continue;
-        SimpleString fn(tm_a->getTargetFilePath());
-        if (find_value_idx(files, fn) < 0)
-          files.push_back(fn);
+        // a block may list several densityMap params and processAssetBlk() fans them out into one generation each,
+        // so all of them are build inputs while getStr() sees only the first
+        const DataBlock &b = *a.props.getBlock(i);
+        dblk::iterate_params_by_name_and_type(b, "densityMap", DataBlock::TYPE_STRING, [&](int param_idx) {
+          DagorAsset *tm_a = get_asset_by_name(a.getMgr(), b.getStr(param_idx), tifmask_atype);
+          if (!tm_a)
+            return;
+          SimpleString fn(tm_a->getTargetFilePath());
+          if (find_value_idx(files, fn) < 0)
+            files.push_back(fn);
+        });
       }
   }
 
@@ -175,32 +176,52 @@ public:
   static void processDetailsDataBlock(const DataBlock &blk, Tab<IDagorAssetRefProvider::Ref> &refs, DagorAssetMgr &amgr,
     const char *a_name)
   {
-    const int detailTypeNameCount = 3;
-    static const char *detailTypeNames[detailTypeNameCount] = {"albedo", "normal", "reflectance"};
+    Tab<const char *> paramNm, paramDefVal;
 
-    const int blockCount = blk.blockCount();
-    for (int blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+    if (const DataBlock *schemeBlk = blk.getBlockByName("scheme"))
     {
-      const DataBlock &subBlock = *blk.getBlock(blockIndex);
-      for (int detailTypeIndex = 0; detailTypeIndex < detailTypeNameCount; ++detailTypeIndex)
-      {
-        const int paramIndex = subBlock.findParam(detailTypeNames[detailTypeIndex]);
-        if (paramIndex >= 0 && subBlock.getParamType(paramIndex) == DataBlock::TYPE_STRING)
+      int detail_group_nid = blk.getNameId("detail_group");
+      dblk::iterate_params_by_type(*schemeBlk, DataBlock::TYPE_STRING, [&](int param_idx, int param_name_id, int /*param_type*/) {
+        if (param_name_id != detail_group_nid)
         {
-          const char *textureName = subBlock.getStr(paramIndex);
-          if (textureName && *textureName)
-          {
-            const int refCount = refs.size();
-            add_asset_ref(refs, amgr, textureName, false, false, -1, true);
-            if (refs.size() != refCount && refs.back().getBrokenRef() && !report_broken_landclass_tex_refs)
-            {
-              refs.pop_back();
-              logwarn("Asset '%s' has broken reference: '%s'", a_name, textureName);
-            }
-          }
+          paramNm.push_back(schemeBlk->getName(param_name_id));
+          paramDefVal.push_back(schemeBlk->getStr(param_idx));
+        }
+      });
+    }
+
+    FastNameMap usedDetails;
+    dblk::iterate_child_blocks_by_name(blk, "detail", [&](const DataBlock &b) {
+      for (int pi = 0; pi < paramNm.size(); pi++)
+      {
+        const char *detail_nm = b.getStr(paramNm[pi], paramDefVal[pi]);
+        if (usedDetails.getNameId(detail_nm) < 0)
+        {
+          if (blk.getBlockByName(detail_nm))
+            usedDetails.addNameId(detail_nm);
+          else
+            logerr("Asset '%s' has broken detail reference: '%s' (for param='%s', defval='%s'", //
+              a_name, detail_nm, paramNm[pi], paramDefVal[pi]);
         }
       }
-    }
+    });
+
+    iterate_names_in_id_order(usedDetails, [&](int /*id*/, const char *detail_nm) {
+      static const char *detailTypeNames[] = {"albedo", "normal", "reflectance"};
+      const DataBlock &detailBlk = *blk.getBlockByNameEx(detail_nm);
+      for (auto *nm : detailTypeNames)
+        if (auto *texture_nm = detailBlk.getStr(nm, nullptr); texture_nm && *texture_nm)
+        {
+          // debug(" %s=%s", nm, texture_nm);
+          const int refCount = refs.size();
+          add_asset_ref(refs, amgr, texture_nm, false, false, -1, true);
+          if (refs.size() != refCount && refs.back().getBrokenRef() && !report_broken_landclass_tex_refs)
+          {
+            refs.pop_back();
+            logwarn("Asset '%s' has broken reference: '%s' in %s", a_name, texture_nm, detail_nm);
+          }
+        }
+    });
   }
 
   static void processAssetBlk(DataBlock &blk, DagorAssetMgr &amgr, Tab<IDagorAssetRefProvider::Ref> &ri_list, bool cleanup,
@@ -450,7 +471,11 @@ public:
 
   void __stdcall getAssetRefs(DagorAsset &a, Tab<Ref> &refs) override
   {
-    LandClassExporter::processAssetBlk(a.props, a.getMgr(), refs, false, a.getName(), nullptr);
+    // processAssetBlk() rewrites the blk it is handed, so it gets a copy like exportAsset() gives it:
+    // the props are the asset's own, and whoever reads them next must not see them depend on refs having been gathered
+    DataBlock blk;
+    blk = a.props;
+    LandClassExporter::processAssetBlk(blk, a.getMgr(), refs, false, a.getName(), nullptr);
   }
 };
 
@@ -490,6 +515,3 @@ protected:
 DABUILD_PLUGIN_API IDaBuildPlugin *__stdcall get_dabuild_plugin() { return new (midmem) LandClassExporterPlugin; }
 END_DABUILD_PLUGIN_NAMESPACE(land)
 REGISTER_DABUILD_PLUGIN(land, nullptr)
-
-#include <oldEditor/de_interface.h>
-IDagorEd2Engine *IDagorEd2Engine::__dagored_global_instance = NULL;

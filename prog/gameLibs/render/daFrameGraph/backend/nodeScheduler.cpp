@@ -17,11 +17,12 @@
 namespace dafg
 {
 
-auto NodeScheduler::schedule(const intermediate::Graph &graph, const PassColoring &pass_coloring) -> NodePermutation
+auto NodeScheduler::schedule(const intermediate::Graph &graph, const PassColoring &pass_coloring,
+  const IdIndexedMapping<intermediate::NodeIndex, intermediate::NodeIndex> &prev_positions) -> NodePermutation
 {
   static constexpr intermediate::NodeIndex NOT_VISITED = MINUS_ONE_SENTINEL_FOR<intermediate::NodeIndex>;
 
-  NodePermutation result(graph.nodes.size(), NOT_VISITED);
+  NodePermutation result(graph.nodes.totalKeys(), NOT_VISITED);
 
   FRAMEMEM_VALIDATE;
 
@@ -31,14 +32,14 @@ auto NodeScheduler::schedule(const intermediate::Graph &graph, const PassColorin
   // we are capable of generating ANY correct topological sort.
 
   // "how many edges point into me?"
-  IdIndexedMapping<intermediate::NodeIndex, uint16_t, framemem_allocator> inDegree(graph.nodes.size());
+  IdIndexedMapping<intermediate::NodeIndex, uint16_t, framemem_allocator> inDegree(graph.nodes.totalKeys());
   for (auto [nodeId, node] : graph.nodes.enumerate())
     for (auto pred : node.predecessors)
       ++inDegree[pred];
 
   // "how many edges point into this pass from different passes?"
   IdIndexedMapping<PassColor, uint16_t, framemem_allocator> passInDegree;
-  passInDegree.reserve(graph.nodes.size());
+  passInDegree.reserve(graph.nodes.totalKeys());
   for (auto [nodeId, _] : graph.nodes.enumerate())
     passInDegree.expandMapping(pass_coloring[nodeId], 0);
 
@@ -49,14 +50,23 @@ auto NodeScheduler::schedule(const intermediate::Graph &graph, const PassColorin
 
   // The frontier contains all nodes with in-degree 0
   dag::Vector<intermediate::NodeIndex, framemem_allocator> frontier;
-  frontier.reserve(graph.nodes.size());
-  frontier.push_back(static_cast<intermediate::NodeIndex>(graph.nodes.size() - 1));
+  frontier.reserve(graph.nodes.totalKeys());
+  frontier.push_back(graph.nodes.backKey());
 
-  eastl::underlying_type_t<intermediate::NodeIndex> timer = graph.nodes.size() - 1;
+  eastl::underlying_type_t<intermediate::NodeIndex> timer = graph.nodes.used() - 1;
   PassColor lastColor = pass_coloring.back();
 
+  dag::Vector<uint64_t, framemem_allocator> stabilityRank(graph.nodes.totalKeys(), 0);
+  for (auto idx : graph.nodes.keys())
+  {
+    uint64_t prevPos = UINT32_MAX;
+    if (prev_positions.isMapped(idx) && prev_positions[idx] != intermediate::NODE_NOT_MAPPED)
+      prevPos = eastl::to_underlying(prev_positions[idx]);
+    stabilityRank[eastl::to_underlying(idx)] = (prevPos << 32) | (UINT32_MAX - eastl::to_underlying(idx));
+  }
 
-  auto orderComp = [&graph, &lastColor, &pass_coloring, &passInDegree](intermediate::NodeIndex l, intermediate::NodeIndex r) {
+  auto orderComp = [&graph, &lastColor, &pass_coloring, &passInDegree, &stabilityRank](intermediate::NodeIndex l,
+                     intermediate::NodeIndex r) {
     if (graph.nodes[l].multiplexingIndex != graph.nodes[r].multiplexingIndex)
       return graph.nodes[l].multiplexingIndex < graph.nodes[r].multiplexingIndex;
 
@@ -69,7 +79,7 @@ auto NodeScheduler::schedule(const intermediate::Graph &graph, const PassColorin
     if (graph.nodes[l].priority != graph.nodes[r].priority)
       return graph.nodes[l].priority < graph.nodes[r].priority;
 
-    return eastl::to_underlying(l) > eastl::to_underlying(r);
+    return stabilityRank[eastl::to_underlying(l)] < stabilityRank[eastl::to_underlying(r)];
   };
 
   // The core property of the pass coloring is that if we condense the
@@ -112,8 +122,8 @@ auto NodeScheduler::schedule(const intermediate::Graph &graph, const PassColorin
     logwarn("daFG: Node scheduler could not schedule some passes to be contiguous! This is fine, but sub-optimal.");
 
 #if DAGOR_DBGLEVEL > 0
-  for (auto i : result)
-    G_ASSERTF(i != NOT_VISITED, "daFG: IR graph was not a DAG! This is an invariant that MUST hold!");
+  for (auto [from, to] : result.enumerate())
+    G_ASSERTF(!graph.nodes.isMapped(from) || to != NOT_VISITED, "daFG: IR graph was not a DAG! This is an invariant that MUST hold!");
 #endif
 
   return result;

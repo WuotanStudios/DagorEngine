@@ -17,9 +17,9 @@ static ecs::CompileTimeQueryDesc animchar_shadow_occlusion_manager_ecs_query_des
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void animchar_shadow_occlusion_manager_ecs_query(Callable function)
+inline void animchar_shadow_occlusion_manager_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, animchar_shadow_occlusion_manager_ecs_query_desc.getHandle(),
+  perform_query(&manager, animchar_shadow_occlusion_manager_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -34,23 +34,22 @@ inline void animchar_shadow_occlusion_manager_ecs_query(Callable function)
 }
 static constexpr ecs::ComponentDesc expand_bbox_by_attach_ecs_query_comps[] =
 {
-//start of 4 ro components at [0]
+//start of 3 ro components at [0]
   {ECS_HASH("animchar_shadow_cull_bbox"), ecs::ComponentTypeInfo<bbox3f>()},
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
-  {ECS_HASH("animchar_attach__attachedTo"), ecs::ComponentTypeInfo<ecs::EntityId>()},
   {ECS_HASH("animchar_render__enabled"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL}
 };
 static ecs::CompileTimeQueryDesc expand_bbox_by_attach_ecs_query_desc
 (
   "expand_bbox_by_attach_ecs_query",
   empty_span(),
-  make_span(expand_bbox_by_attach_ecs_query_comps+0, 4)/*ro*/,
+  make_span(expand_bbox_by_attach_ecs_query_comps+0, 3)/*ro*/,
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void expand_bbox_by_attach_ecs_query(ecs::EntityId eid, Callable function)
+inline void expand_bbox_by_attach_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, expand_bbox_by_attach_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, expand_bbox_by_attach_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -60,7 +59,6 @@ inline void expand_bbox_by_attach_ecs_query(ecs::EntityId eid, Callable function
           function(
               ECS_RO_COMP(expand_bbox_by_attach_ecs_query_comps, "animchar_shadow_cull_bbox", bbox3f)
             , ECS_RO_COMP(expand_bbox_by_attach_ecs_query_comps, "animchar_visbits", animchar_visbits_t)
-            , ECS_RO_COMP(expand_bbox_by_attach_ecs_query_comps, "animchar_attach__attachedTo", ecs::EntityId)
             );
 
         }
@@ -83,9 +81,9 @@ static ecs::CompileTimeQueryDesc test_box_half_size_ecs_query_desc
   make_span(test_box_half_size_ecs_query_comps+2, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void test_box_half_size_ecs_query(Callable function)
+inline void test_box_half_size_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, test_box_half_size_ecs_query_desc.getHandle(),
+  perform_query(&manager, test_box_half_size_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -101,28 +99,27 @@ inline void test_box_half_size_ecs_query(Callable function)
 }
 static constexpr ecs::ComponentDesc gather_soldier_bboxes_to_cull_ecs_query_comps[] =
 {
-//start of 7 ro components at [0]
-  {ECS_HASH("eid"), ecs::ComponentTypeInfo<ecs::EntityId>()},
+//start of 6 ro components at [0]
   {ECS_HASH("animchar_render"), ecs::ComponentTypeInfo<AnimV20::AnimcharRendComponent>()},
   {ECS_HASH("animchar_bsph"), ecs::ComponentTypeInfo<vec4f>()},
   {ECS_HASH("animchar_shadow_cull_bbox"), ecs::ComponentTypeInfo<bbox3f>()},
   {ECS_HASH("animchar_visbits"), ecs::ComponentTypeInfo<animchar_visbits_t>()},
   {ECS_HASH("attaches_list"), ecs::ComponentTypeInfo<ecs::EidList>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("animchar_render__enabled"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-//start of 1 rq components at [7]
+//start of 1 rq components at [6]
   {ECS_HASH("human"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static ecs::CompileTimeQueryDesc gather_soldier_bboxes_to_cull_ecs_query_desc
 (
   "gather_soldier_bboxes_to_cull_ecs_query",
   empty_span(),
-  make_span(gather_soldier_bboxes_to_cull_ecs_query_comps+0, 7)/*ro*/,
-  make_span(gather_soldier_bboxes_to_cull_ecs_query_comps+7, 1)/*rq*/,
+  make_span(gather_soldier_bboxes_to_cull_ecs_query_comps+0, 6)/*ro*/,
+  make_span(gather_soldier_bboxes_to_cull_ecs_query_comps+6, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void gather_soldier_bboxes_to_cull_ecs_query(Callable function)
+inline void gather_soldier_bboxes_to_cull_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gather_soldier_bboxes_to_cull_ecs_query_desc.getHandle(),
+  perform_query(&manager, gather_soldier_bboxes_to_cull_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -130,8 +127,7 @@ inline void gather_soldier_bboxes_to_cull_ecs_query(Callable function)
           if ( !(ECS_RO_COMP_OR(gather_soldier_bboxes_to_cull_ecs_query_comps, "animchar_render__enabled", bool( true))) )
             continue;
           function(
-              ECS_RO_COMP(gather_soldier_bboxes_to_cull_ecs_query_comps, "eid", ecs::EntityId)
-            , ECS_RO_COMP(gather_soldier_bboxes_to_cull_ecs_query_comps, "animchar_render", AnimV20::AnimcharRendComponent)
+              ECS_RO_COMP(gather_soldier_bboxes_to_cull_ecs_query_comps, "animchar_render", AnimV20::AnimcharRendComponent)
             , ECS_RO_COMP(gather_soldier_bboxes_to_cull_ecs_query_comps, "animchar_bsph", vec4f)
             , ECS_RO_COMP(gather_soldier_bboxes_to_cull_ecs_query_comps, "animchar_shadow_cull_bbox", bbox3f)
             , ECS_RO_COMP(gather_soldier_bboxes_to_cull_ecs_query_comps, "animchar_visbits", animchar_visbits_t)

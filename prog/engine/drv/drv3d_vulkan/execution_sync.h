@@ -42,15 +42,13 @@ struct SyncOpUid
   uint32_t v;
   static uint32_t frame_local_next_op_uid;
 
-  static SyncOpUid next() { return {frame_local_next_op_uid++}; }
-
+  static SyncOpUid next(Resource *obj);
   static void frame_end() { frame_local_next_op_uid = 0; }
 };
 #else
 struct SyncOpUid
 {
-  static SyncOpUid next() { return {}; }
-
+  static SyncOpUid next(Resource *) { return {}; }
   static void frame_end() {}
 };
 #endif
@@ -312,7 +310,7 @@ public:
   void addBufferAccess(LogicAddress laddr, Buffer *buf, BufferArea area);
   void addImageWriteDiscard(LogicAddress laddr, Image *img, VkImageLayout layout, ImageArea area)
   {
-    addImageAccessImpl(laddr, img, layout, area, /* nrp_attachment */ true, /* discard */ true);
+    addImageAccessImpl(laddr, img, layout, area, /* nrp_attachment */ false, /* discard */ true);
   }
 
   void addImageAccess(LogicAddress laddr, Image *img, VkImageLayout layout, ImageArea area)
@@ -340,6 +338,11 @@ public:
   void aliasSync(Resource *lobj, VkPipelineStageFlags stage);
 
 private:
+#if DAGOR_DBGLEVEL > 0
+  bool checkWriteCompletedForRelaxedFrameEndSync(LogicAddress laddr);
+#else
+  bool checkWriteCompletedForRelaxedFrameEndSync(LogicAddress) { return true; }
+#endif
   void workItemEndSync(size_t gpu_work_id);
   void addImageAccessImpl(LogicAddress laddr, Image *img, VkImageLayout layout, ImageArea area, bool nrp_attachment, bool discard);
 

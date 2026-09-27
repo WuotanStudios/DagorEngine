@@ -1,0 +1,17 @@
+Root    ?= ../../../.. ;
+Location = prog/tools/libTools/graphEditor ;
+
+TargetType  = lib ;
+Target      = tools/libTools/graphEditor.lib ;
+
+AddIncludes =
+  $(Root)/prog/tools/sharedInclude
+  $(Root)/prog/3rdPartyLibs/imgui-node-editor
+;
+
+Sources =
+  graph_data.cpp
+  graph_subgraph_expand.cpp
+;
+
+include $(Root)/prog/_jBuild/build.jam ;

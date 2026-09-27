@@ -20,6 +20,15 @@
 # include <streambuf>
 # include <type_traits>
 
+// MODIFICATION BY GAIJIN
+void ImRectFloor(ImRect &r)
+{
+  r.Min.x = IM_TRUNC(r.Min.x);
+  r.Min.y = IM_TRUNC(r.Min.y);
+  r.Max.x = IM_TRUNC(r.Max.x);
+  r.Max.y = IM_TRUNC(r.Max.y);
+}
+
 // https://stackoverflow.com/a/8597498
 # define DECLARE_HAS_NESTED(Name, Member)                                          \
                                                                                    \
@@ -92,7 +101,8 @@ namespace ed = ax::NodeEditor::Detail;
 
 
 //------------------------------------------------------------------------------
-static const int c_BackgroundChannelCount = 1;
+// MODIFICATION BY GAIJIN: a second background channel, see c_BackgroundChannel_SelectionRectTop.
+static const int c_BackgroundChannelCount = 2;
 static const int c_LinkChannelCount       = 4;
 static const int c_UserLayersCount        = 5;
 
@@ -102,6 +112,8 @@ static const int c_LinkStartChannel       = c_BackgroundChannelStart + c_Backgro
 static const int c_NodeStartChannel       = c_LinkStartChannel       + c_LinkChannelCount;
 
 static const int c_BackgroundChannel_SelectionRect = c_BackgroundChannelStart + 0;
+// MODIFICATION BY GAIJIN: EditorContext::End lifts this one above the node and link channels.
+static const int c_BackgroundChannel_SelectionRectTop = c_BackgroundChannelStart + 1;
 
 static const int c_UserChannel_Content         = c_UserLayerChannelStart + 1;
 static const int c_UserChannel_Grid            = c_UserLayerChannelStart + 2;
@@ -466,6 +478,51 @@ static void ImDrawList_PolyFillScanFlood(ImDrawList *draw, std::vector<ImVec2>* 
 }
 */
 
+// MODIFICATION BY GAIJIN
+// Dashed link stroke, used for "muted" edges in the daEditorX graph editor. Kept here rather than in
+// the caller so a dashed link goes through Link::Draw like any other: same draw channel, same
+// hover/selected extra thickness.
+//
+// Deliberately does NOT use ImCubicBezierFixedStep. That solves arc length by bisection with a
+// 24-point quadrature per probe and allocates a std::map per call (see its own #todo), which is far
+// too much for a stroke redrawn every frame -- and with a curve shorter than one step it emits a
+// single sample, drawing nothing at all. Sampling at a fixed parametric step and accumulating
+// segment length is enough to phase a dash pattern, allocates nothing, and always reaches P3.
+static void ImDrawList_AddDashedBezier(ImDrawList* drawList, const ImCubicBezierPoints& curve, float thickness, ImU32 color, float dash_size)
+{
+    if (dash_size <= 0.0f || (color & IM_COL32_A_MASK) == 0)
+        return;
+
+    // The control polygon bounds the arc length from above, so it is a safe basis for the sample
+    // count without measuring the curve; ~3px per sample keeps the dashes smooth.
+    const float polyLength = ImSqrt(ImLengthSqr(curve.P1 - curve.P0)) + ImSqrt(ImLengthSqr(curve.P2 - curve.P1))
+                           + ImSqrt(ImLengthSqr(curve.P3 - curve.P2));
+    const int segmentCount = ImClamp(static_cast<int>(polyLength / 3.0f), 16, 256);
+
+    const float period = dash_size * 2.0f;
+    float walked = 0.0f;
+    ImVec2 prev = curve.P0;
+    for (int i = 1; i <= segmentCount; ++i)
+    {
+        const ImVec2 point     = ImCubicBezierSample(curve, static_cast<float>(i) / segmentCount);
+        const ImVec2 delta     = point - prev;
+        const float  segLength = ImSqrt(ImLengthSqr(delta));
+
+        float done = 0.0f;
+        while (done < segLength) // skipped outright for a zero-length step, so never divides by 0
+        {
+            const float phase = ImFmod(walked, period);
+            const bool  on    = phase < dash_size;
+            const float step  = ImMin(on ? (dash_size - phase) : (period - phase), segLength - done);
+            if (on)
+                drawList->AddLine(prev + delta * (done / segLength), prev + delta * ((done + step) / segLength), color, thickness);
+            done   += step;
+            walked += step;
+        }
+        prev = point;
+    }
+}
+
 static void ImDrawList_AddBezierWithArrows(ImDrawList* drawList, const ImCubicBezierPoints& curve, float thickness,
     float startArrowSize, float startArrowWidth, float endArrowSize, float endArrowWidth,
     bool fill, ImU32 color, float strokeThickness, const ImVec2* startDirHint = nullptr, const ImVec2* endDirHint = nullptr)
@@ -733,7 +790,15 @@ void ed::Node::GetGroupedNodes(std::vector<Node*>& result, bool append)
         return;
 
     const auto firstNodeIndex = result.size();
-    Editor->FindNodesInRect(m_GroupBounds, result, true, false);
+    // MODIFICATION BY GAIJIN
+    if (Editor->GetConfig().ContainGroupedNodesByCenter)
+        Editor->FindNodesByCenter(m_GroupBounds, result, true);
+    else
+        Editor->FindNodesInRect(m_GroupBounds, result, true, false);
+
+    // MODIFICATION BY GAIJIN
+    // do not self recurse, FindNodesByCenter hits this issue and with FindNodesInRect it is easily reproducable with custom UI
+    result.erase(std::remove(result.begin() + firstNodeIndex, result.end(), this), result.end());
 
     for (auto index = firstNodeIndex; index < result.size(); ++index)
         result[index]->GetGroupedNodes(result, true);
@@ -915,6 +980,14 @@ void ed::Link::Draw(ImDrawList* drawList, ImU32 color, float extraThickness) con
         return;
 
     const auto curve = GetCurve();
+
+    // MODIFICATION BY GAIJIN: dashed links (see ImDrawList_AddDashedBezier). Arrows are skipped --
+    // a dashed link is a "carries no data" marker, so the endpoint decoration would only add noise.
+    if (m_DashSize > 0.0f)
+    {
+        ImDrawList_AddDashedBezier(drawList, curve, m_Thickness + extraThickness, color, m_DashSize);
+        return;
+    }
 
     ImDrawList_AddBezierWithArrows(drawList, curve, m_Thickness + extraThickness,
         m_StartPin && m_StartPin->m_ArrowSize  > 0.0f ? m_StartPin->m_ArrowSize  + extraThickness : 0.0f,
@@ -1553,14 +1626,17 @@ void ed::EditorContext::End()
         m_DrawList->ChannelsSetCurrent(0);
 
         auto channelCount = m_DrawList->_Splitter._Count;
-        ImDrawList_ChannelsGrow(m_DrawList, channelCount + 3);
-        ImDrawList_SwapChannels(m_DrawList, c_UserChannel_HintsBackground, channelCount + 0);
-        ImDrawList_SwapChannels(m_DrawList, c_UserChannel_Hints,           channelCount + 1);
-        ImDrawList_SwapChannels(m_DrawList, c_UserChannel_Content,         channelCount + 2);
+        ImDrawList_ChannelsGrow(m_DrawList, channelCount + 4);
+        // MODIFICATION BY GAIJIN: the selection rect is submitted in canvas space, so it keeps its
+        // own clip rect and takes no preTransformClipRect; it only has to leave the background.
+        ImDrawList_SwapChannels(m_DrawList, c_BackgroundChannel_SelectionRectTop, channelCount + 0);
+        ImDrawList_SwapChannels(m_DrawList, c_UserChannel_HintsBackground, channelCount + 1);
+        ImDrawList_SwapChannels(m_DrawList, c_UserChannel_Hints,           channelCount + 2);
+        ImDrawList_SwapChannels(m_DrawList, c_UserChannel_Content,         channelCount + 3);
 
-        preTransformClipRect(channelCount + 0);
         preTransformClipRect(channelCount + 1);
         preTransformClipRect(channelCount + 2);
+        preTransformClipRect(channelCount + 3);
     }
 # endif
 
@@ -1603,7 +1679,12 @@ void ed::EditorContext::End()
     if (HasSelectionChanged())
         MakeDirty(SaveReasonFlags::Selection);
 
-    if (m_Settings.m_IsDirty && !m_CurrentAction)
+    // MODIFICATION BY GAIJIN: skip the full settings serialization when nothing can consume it. With
+    // no SettingsFile and no save callback, Config::Save() discards the data and returns false, so
+    // m_IsDirty never clears and SaveSettings() re-serializes the whole graph (O(N) build + O(N^2)
+    // FindNode loop) every frame for nothing. Only run it when a save target exists.
+    if (m_Settings.m_IsDirty && !m_CurrentAction &&
+        (m_Config.SettingsFile || m_Config.SaveSettings || m_Config.SaveNodeSettings))
         SaveSettings();
 
     m_DrawList = nullptr;
@@ -1612,6 +1693,11 @@ void ed::EditorContext::End()
 
 bool ed::EditorContext::DoLink(LinkId id, PinId startPinId, PinId endPinId, ImU32 color, float thickness)
 {
+    // MODIFICATION BY GAIJIN: SetNextLinkDashSize is one-shot, so clear it even on the early-out
+    // paths below -- otherwise a dash set for a link whose pin got culled would leak to the next one.
+    const float dashSize = m_NextLinkDashSize;
+    m_NextLinkDashSize = 0.0f;
+
     //auto& editorStyle = GetStyle();
 
     auto startPin = FindPin(startPinId);
@@ -1629,6 +1715,7 @@ bool ed::EditorContext::DoLink(LinkId id, PinId startPinId, PinId endPinId, ImU3
     link->m_Color         = color;
     link->m_HighlightColor= GetColor(StyleColor_HighlightLinkBorder);
     link->m_Thickness     = thickness;
+    link->m_DashSize      = dashSize; // MODIFICATION BY GAIJIN
     link->m_IsLive        = true;
 
     link->UpdateEndpoints();
@@ -1648,7 +1735,7 @@ void ed::EditorContext::SetNodePosition(NodeId nodeId, const ImVec2& position)
     if (node->m_Bounds.Min != position)
     {
         node->m_Bounds.Translate(position - node->m_Bounds.Min);
-        node->m_Bounds.Floor();
+        ImRectFloor(node->m_Bounds); // MODIFICATION BY GAIJIN
         MakeDirty(NodeEditor::SaveReasonFlags::Position, node);
     }
 }
@@ -1668,7 +1755,7 @@ void ed::EditorContext::SetGroupSize(NodeId nodeId, const ImVec2& size)
     {
         node->m_GroupBounds.Min = node->m_Bounds.Min;
         node->m_GroupBounds.Max = node->m_Bounds.Min + size;
-        node->m_GroupBounds.Floor();
+        ImRectFloor(node->m_GroupBounds); // MODIFICATION BY GAIJIN
         MakeDirty(NodeEditor::SaveReasonFlags::Size, node);
     }
 }
@@ -1746,10 +1833,10 @@ void ed::EditorContext::UpdateNodeState(Node* node)
 
     node->m_Bounds.Min      = settings->m_Location;
     node->m_Bounds.Max      = node->m_Bounds.Min + settings->m_Size;
-    node->m_Bounds.Floor();
+    ImRectFloor(node->m_Bounds); // MODIFICATION BY GAIJIN
     node->m_GroupBounds.Min = settings->m_Location;
     node->m_GroupBounds.Max = node->m_GroupBounds.Min + settings->m_GroupSize;
-    node->m_GroupBounds.Floor();
+    ImRectFloor(node->m_GroupBounds); // MODIFICATION BY GAIJIN
 }
 
 void ed::EditorContext::RemoveSettings(Object* object)
@@ -1853,6 +1940,28 @@ void ed::EditorContext::FindNodesInRect(const ImRect& r, vector<Node*>& result, 
     for (auto node : m_Nodes)
         if (node->TestHit(r, includeIntersecting))
             result.push_back(node);
+}
+
+// MODIFICATION BY GAIJIN
+void ed::EditorContext::FindNodesByCenter(const ImRect& r, vector<Node*>& result, bool append)
+{
+    if (!append)
+        result.resize(0);
+
+    if (ImRect_IsEmpty(r))
+        return;
+
+    for (auto node : m_Nodes)
+    {
+        if (!node->m_IsLive)
+            continue;
+        const auto bounds = node->GetBounds();
+        if (ImRect_IsEmpty(bounds))
+            continue;
+        const ImVec2 center((bounds.Min.x + bounds.Max.x) * 0.5f, (bounds.Min.y + bounds.Max.y) * 0.5f);
+        if (r.Contains(center))
+            result.push_back(node);
+    }
 }
 
 void ed::EditorContext::FindLinksInRect(const ImRect& r, vector<Link*>& result, bool append)
@@ -3541,6 +3650,15 @@ void ed::NavigateAction::StopNavigation()
     m_Animation.Stop();
 }
 
+// MODIFICATION BY GAIJIN
+void ed::NavigateAction::ScrollCanvasPointToScreen(const ImVec2& canvasPoint, const ImVec2& screenPoint)
+{
+    // Pan (keeping zoom) so canvasPoint lands at screenPoint. Same math as CalcCenterView /
+    // SetViewRect, but with an arbitrary screen target instead of the widget centre.
+    StopNavigation();
+    m_Scroll += m_Canvas.FromLocalV(canvasPoint - m_Canvas.ToLocal(screenPoint));
+}
+
 void ed::NavigateAction::FinishNavigation()
 {
     m_Animation.Finish();
@@ -3706,11 +3824,15 @@ ed::EditorAction::AcceptResult ed::SizeAction::Accept(const Control& control)
 
     if (control.ActiveNode && IsGroup(control.ActiveNode) && ImGui::IsMouseDragging(Editor->GetConfig().DragButtonIndex, 1))
     {
-        //const auto mousePos     = to_point(ImGui::GetMousePos());
-        //const auto closestPoint = control.ActiveNode->Bounds.get_closest_point_hollow(mousePos, static_cast<int>(control.ActiveNode->Rounding));
-
-        auto pivot = GetRegion(control.ActiveNode);
-        if (pivot != NodeRegion::Header && pivot != NodeRegion::Center)
+        // MODIFICATION BY GAIJIN
+        // pivot from click position, not current cursor. If the user drags outward
+        // from an edge, the cursor can leave m_Bounds before
+        // IsMouseDragging returns true, making GetRegion return None and the resize a
+        // silent no-op. MouseClickedPos is canvas-space inside ne::Begin/End
+        // (imgui_canvas.cpp:484). Rejecting None too prevents a no-op SizeAction start.
+        const ImVec2 clickPos = ImGui::GetIO().MouseClickedPos[Editor->GetConfig().DragButtonIndex];
+        auto pivot = control.ActiveNode->GetRegion(clickPos);
+        if (pivot != NodeRegion::Header && pivot != NodeRegion::Center && pivot != NodeRegion::None)
         {
             m_StartBounds      = control.ActiveNode->m_Bounds;
             m_StartGroupBounds = control.ActiveNode->m_GroupBounds;
@@ -3774,7 +3896,7 @@ bool ed::SizeAction::Process(const Control& control)
         if ((m_Pivot & NodeRegion::Right) == NodeRegion::Right)
             newBounds.Max.x = ImMax(newBounds.Min.x + minimumSize.x, Editor->AlignPointToGrid(newBounds.Max.x + dragOffset.x));
 
-        newBounds.Floor();
+        ImRectFloor(newBounds); // MODIFICATION BY GAIJIN
 
         m_LastSize = newBounds.GetSize();
 
@@ -4188,7 +4310,10 @@ void ed::SelectAction::Draw(ImDrawList* drawList)
     const auto fillColor    = Editor->GetColor(m_SelectLinkMode ? StyleColor_LinkSelRect       : StyleColor_NodeSelRect, alpha);
     const auto outlineColor = Editor->GetColor(m_SelectLinkMode ? StyleColor_LinkSelRectBorder : StyleColor_NodeSelRectBorder, alpha);
 
-    drawList->ChannelsSetCurrent(c_BackgroundChannel_SelectionRect);
+    // MODIFICATION BY GAIJIN: see Config::DrawSelectionRectOnTop.
+    drawList->ChannelsSetCurrent(Editor->GetConfig().DrawSelectionRectOnTop
+        ? c_BackgroundChannel_SelectionRectTop
+        : c_BackgroundChannel_SelectionRect);
 
     auto min  = ImVec2(std::min(m_StartPoint.x, m_EndPoint.x), std::min(m_StartPoint.y, m_EndPoint.y));
     auto max  = ImVec2(ImMax(m_StartPoint.x, m_EndPoint.x), ImMax(m_StartPoint.y, m_EndPoint.y));
@@ -5284,7 +5409,7 @@ void ed::NodeBuilder::End()
     ImGui::EndGroup();
 
     m_NodeRect = ImGui_GetItemRect();
-    m_NodeRect.Floor();
+    ImRectFloor(m_NodeRect); // MODIFICATION BY GAIJIN
 
     if (m_CurrentNode->m_Bounds.GetSize() != m_NodeRect.GetSize())
     {
@@ -5392,7 +5517,7 @@ void ed::NodeBuilder::PinRect(const ImVec2& a, const ImVec2& b)
     IM_ASSERT(nullptr != m_CurrentPin);
 
     m_CurrentPin->m_Bounds = ImRect(a, b);
-    m_CurrentPin->m_Bounds.Floor();
+    ImRectFloor(m_CurrentPin->m_Bounds); // MODIFICATION BY GAIJIN
     m_ResolvePinRect     = false;
 }
 
@@ -5442,7 +5567,7 @@ void ed::NodeBuilder::Group(const ImVec2& size)
         ImGui::Dummy(size);
 
     m_GroupBounds = ImGui_GetItemRect();
-    m_GroupBounds.Floor();
+    ImRectFloor(m_GroupBounds); // MODIFICATION BY GAIJIN
 }
 
 ImDrawList* ed::NodeBuilder::GetUserBackgroundDrawList() const

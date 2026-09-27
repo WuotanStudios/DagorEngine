@@ -6,6 +6,8 @@
 
 #include <EASTL/type_traits.h>
 
+#include <drv/3d/dag_samplerHandle.h>
+
 #include <render/daFrameGraph/usage.h>
 #include <render/daFrameGraph/stage.h>
 #include <render/daFrameGraph/virtualResourceHandle.h>
@@ -23,15 +25,6 @@ namespace detail
 template <detail::ResourceRequestPolicy, detail::ResourceRequestPolicy>
 class VirtualAttachmentRequest;
 } // namespace detail
-
-#ifndef DOXYGEN
-// TODO: Replace this hackyness with constraints as soon as C++20 drops
-#define REQUIRE_IMPL(...) class Dummy1 = void, class = typename eastl::enable_if<(__VA_ARGS__), Dummy1>::type
-#define REQUIRE(...)      template <REQUIRE_IMPL(__VA_ARGS__)>
-#else
-#define REQUIRE_IMPL(...) class = void
-#define REQUIRE(...)
-#endif
 
 /**
  * \brief Request for a virtual resource known to FG.
@@ -69,6 +62,7 @@ class VirtualResourceRequest
   friend class VirtualResourceRequest;
 
   friend class VirtualResourceCreationSemiRequest;
+  friend class VirtualResourceRegistrationSemiRequest;
 
   template <detail::DispatchRequestPolicy dispatch_type>
   friend class DispatchRequest;
@@ -78,7 +72,7 @@ class VirtualResourceRequest
 
   template <detail::ResourceRequestPolicy>
   friend class VirtualResourceSemiRequest;
-  friend class Registry;
+  friend class BaseRegistry;
   VirtualResourceRequest(detail::ResUid resId, NodeNameId node, InternalRegistry *reg) : Base{resId, node, reg} {}
 
   using RRP = detail::ResourceRequestPolicy;
@@ -87,7 +81,11 @@ class VirtualResourceRequest
 
   static constexpr bool hasPolicy(RRP p, const char *) { return hasPolicy(p); }
 
+  static constexpr bool isTypedBlob(const char *) { return !eastl::is_same_v<Res, AnyBlob>; }
+
   static constexpr RRP flipPolicy(RRP p) { return static_cast<RRP>(eastl::to_underlying(policy) ^ eastl::to_underlying(p)); }
+
+  static constexpr RRP setPolicy(RRP p) { return static_cast<RRP>(eastl::to_underlying(policy) | eastl::to_underlying(p)); }
 
   using HandleType =
     VirtualResourceHandle<eastl::conditional_t<hasPolicy(RRP::Readonly), const Res, Res>, is_gpu, hasPolicy(RRP::Optional)>;
@@ -97,7 +95,8 @@ public:
    * \brief Makes this request optional. The node will not get disabled
    * if the resource is missing, the handle will return an empty value.
    */
-  REQUIRE(!hasPolicy(RRP::Optional, "ERROR: Please, remove the duplicate .optional() call!"))
+  template <typename = void>
+    requires(!hasPolicy(RRP::Optional, "ERROR: Please remove the duplicate .optional() call!"))
   VirtualResourceRequest<Res, flipPolicy(RRP::Optional)> optional() &&
   {
     Base::optional();
@@ -114,9 +113,13 @@ public:
    * \param shader_var_name The name of the shader variable to bind.
    *   If not specified, the name of the resource will be used.
    */
-  REQUIRE(!is_gpu || (hasPolicy(RRP::HasUsageStage, "ERROR: Please, call .atStage(usage stage) before .bindToShaderVar(...)!") &&
-                       !hasPolicy(RRP::HasUsageType, "ERROR: Please, don't call .useAs(usage type) before .bindToShaderVar(...)!")))
-  VirtualResourceRequest<Res, flipPolicy(RRP::HasUsageType)> bindToShaderVar(const char *shader_var_name = nullptr) &&
+  template <typename = void>
+    requires(
+      !is_gpu || (hasPolicy(RRP::HasUsageStage, "ERROR: Please call .atStage(usage stage) before .bindToShaderVar(...)!") &&
+                   (!hasPolicy(RRP::HasUsageType, "ERROR: Please don't call .useAs(usage type) before .bindToShaderVar(...)!") ||
+                     hasPolicy(RRP::HasShaderVarBinding))))
+  VirtualResourceRequest<Res, setPolicy(RRP::HasShaderVarBinding | RRP::HasUsageType)> bindToShaderVar(
+    const char *shader_var_name = nullptr) &&
   {
     Base::bindToShaderVar(shader_var_name, tag_for<Res>(), detail::identity_projector);
     return {resUid, nodeId, registry};
@@ -132,7 +135,8 @@ public:
    * \param shader_var_name The name of the shader variable to bind.
    *   If not specified, the name of the resource will be used.
    */
-  template <auto projector, REQUIRE_IMPL(!is_gpu && eastl::is_invocable_v<decltype(projector), Res>)>
+  template <auto projector>
+    requires(!is_gpu && eastl::is_invocable_v<decltype(projector), Res>)
   VirtualResourceRequest<Res, policy> bindToShaderVar(const char *shader_var_name = nullptr) &&
   {
     using ProjectedType = detail::ProjectedType<projector>;
@@ -141,10 +145,80 @@ public:
   }
 
   /**
+   * \brief Requests for this resource to be set into a named refined_block
+   * pass block shader variable. The value is pushed into the block after the
+   * frame graph is compiled and before refined_block::flush(), so it is
+   * available when the block's constant buffer is flushed.
+   *
+   * The usage stage MUST have been set beforehand for GPU resources.
+   *
+   * \param block_name The name of a pass block registered via registerBlock.
+   * \param shader_var_name The name of the shader variable within the block.
+   *   If not specified, the name of the resource will be used.
+   */
+  template <typename = void>
+    requires(is_gpu && hasPolicy(RRP::HasUsageStage, "ERROR: Please call .atStage(usage stage) before .forBlock(...)!") &&
+             (!hasPolicy(RRP::HasUsageType, "ERROR: Please don't call .useAs(usage type) before .forBlock(...)!") ||
+               hasPolicy(RRP::HasShaderVarBinding)))
+  VirtualResourceRequest<Res, setPolicy(RRP::HasShaderVarBinding | RRP::HasUsageType)> forBlock(const char *block_name,
+    const char *shader_var_name = nullptr) &&
+  {
+    Base::forBlock(block_name, shader_var_name, tag_for<Res>());
+    return {resUid, nodeId, registry};
+  }
+
+  /**
+   * \brief Requests for this resource to be registered in a bindless
+   * descriptor range and for its bindless index to be set to the int
+   * shader variable with the specified name via ShaderGlobals::set_int().
+   * The shader should consume the index via a `@i1` int var and use it
+   * to index the bindless descriptor array.
+   * The variable is set to -1 when the resource is missing or the
+   * driver does not support bindless resources.
+   * The usage stage MUST have been set beforehand and MUST include all
+   * shader stages that this resource will be accessed from
+   * within this node.
+   *
+   * \param shader_var_name The name of the int shader variable to set.
+   */
+  template <typename = void>
+    requires(is_gpu && hasPolicy(RRP::HasUsageStage, "ERROR: Please call .atStage(usage stage) before .bindlessShaderVar(...)!") &&
+             (!hasPolicy(RRP::HasUsageType, "ERROR: Please don't call .useAs(usage type) before .bindlessShaderVar(...)!") ||
+               hasPolicy(RRP::HasShaderVarBinding)))
+  VirtualResourceRequest<Res, setPolicy(RRP::HasShaderVarBinding | RRP::HasUsageType)> bindlessShaderVar(
+    const char *shader_var_name) &&
+  {
+    Base::bindlessShaderVar(shader_var_name, tag_for<Res>());
+    return {resUid, nodeId, registry};
+  }
+
+  /**
+   * \brief Registers a `d3d::SamplerHandle` blob in the global bindless
+   * sampler table and sets its slot index to the int shader variable with
+   * the specified name via ShaderGlobals::set_int(). The shader should
+   * consume the index via a `@i1` int var and use it to index the bindless
+   * sampler array. The variable is set to -1 when the resource is missing
+   * or the driver does not support bindless resources.
+   *
+   * Unlike the texture/buffer overload, no usage stage is required: a
+   * sampler is not a GPU resource that participates in scheduling.
+   *
+   * \param shader_var_name The name of the int shader variable to set.
+   */
+  template <typename = void>
+    requires(!is_gpu && eastl::is_same_v<eastl::remove_cvref_t<Res>, d3d::SamplerHandle>)
+  VirtualResourceRequest<Res, setPolicy(RRP::HasShaderVarBinding)> bindlessShaderVar(const char *shader_var_name) &&
+  {
+    Base::bindlessShaderVar(shader_var_name, tag_for<Res>());
+    return {resUid, nodeId, registry};
+  }
+
+  /**
    * \brief Requests for a matrix-like blob to be bound as the current
    * view matrix.
    */
-  REQUIRE(!is_gpu)
+  template <typename = void>
+    requires(!is_gpu)
   VirtualResourceRequest<Res, policy> bindAsView() &&
   {
     Base::bindAsView(tag_for<Res>(), detail::identity_projector);
@@ -159,7 +233,8 @@ public:
    *   the blob. Can be a pointer-to-member, i.e. `&BlobType::field`
    *   or a (pure) function pointer.
    */
-  template <auto projector, REQUIRE_IMPL(!is_gpu && eastl::is_invocable_v<decltype(projector), Res>)>
+  template <auto projector>
+    requires(!is_gpu && eastl::is_invocable_v<decltype(projector), Res>)
   VirtualResourceRequest<Res, policy> bindAsView() &&
   {
     using ProjectedType = detail::ProjectedType<projector>;
@@ -171,7 +246,8 @@ public:
    * \brief Requests for a matrix-like blob to be bound as the current
    * projection matrix.
    */
-  REQUIRE(!is_gpu)
+  template <typename = void>
+    requires(!is_gpu)
   VirtualResourceRequest<Res, policy> bindAsProj() &&
   {
     Base::bindAsProj(tag_for<Res>(), detail::identity_projector);
@@ -186,7 +262,8 @@ public:
    *   the blob. Can be a pointer-to-member, i.e. `&BlobType::field`
    *   or a (pure) function pointer.
    */
-  template <auto projector, REQUIRE_IMPL(!is_gpu && eastl::is_invocable_v<decltype(projector), const Res &>)>
+  template <auto projector>
+    requires(!is_gpu && eastl::is_invocable_v<decltype(projector), const Res &>)
   VirtualResourceRequest<Res, policy> bindAsProj() &&
   {
     using ProjectedType = detail::ProjectedType<projector>;
@@ -199,7 +276,8 @@ public:
    * \param stream The vertex stream index to bind the buffer to.
    * \param stride The stride of the buffer.
    */
-  REQUIRE(eastl::is_same_v<Res, Sbuffer> &&hasPolicy(RRP::HasUsageType))
+  template <typename = void>
+    requires(eastl::is_same_v<Res, Sbuffer> && hasPolicy(RRP::HasUsageType))
   VirtualResourceRequest<Res, policy> bindAsVertexBuffer(uint32_t stream, uint32_t stride) &&
   {
     Base::bindAsVertexBuffer(stream, stride);
@@ -209,7 +287,8 @@ public:
   /**
    * \brief Requests for a buffer to be bound as current index buffer.
    */
-  REQUIRE(eastl::is_same_v<Res, Sbuffer> &&hasPolicy(RRP::HasUsageType))
+  template <typename = void>
+    requires(eastl::is_same_v<Res, Sbuffer> && hasPolicy(RRP::HasUsageType))
   VirtualResourceRequest<Res, policy> bindAsIndexBuffer() &&
   {
     Base::bindAsIndexBuffer();
@@ -221,7 +300,8 @@ public:
    * the handle or bound to a shader var to specify what shader stage
    * this resource will be used at.
    */
-  REQUIRE(is_gpu && !hasPolicy(RRP::HasUsageStage, "ERROR: Please, remove the duplicate .atStage(usage stage) call!"))
+  template <typename = void>
+    requires(is_gpu && !hasPolicy(RRP::HasUsageStage, "ERROR: Please remove the duplicate .atStage(usage stage) call!"))
   VirtualResourceRequest<Res, flipPolicy(RRP::HasUsageStage)> atStage(Stage stage) &&
   {
     Base::atStage(stage);
@@ -232,7 +312,8 @@ public:
    * \brief Must be used when the resource is manually accessed through
    * the handle to specify how exactly the resource will be used.
    */
-  REQUIRE(is_gpu && !hasPolicy(RRP::HasUsageType, "ERROR: Please, remove the duplicate .useAs(usage type) call!"))
+  template <typename = void>
+    requires(is_gpu && !hasPolicy(RRP::HasUsageType, "ERROR: Please remove the duplicate .useAs(usage type) call!"))
   VirtualResourceRequest<Res, flipPolicy(RRP::HasUsageType)> useAs(Usage type) &&
   {
     Base::useAs(type);
@@ -246,20 +327,59 @@ public:
    * should never be cached by reference.
    * See \ref dafg::VirtualResourceHandle for further details.
    */
-  REQUIRE(!is_gpu || (hasPolicy(RRP::HasUsageStage, "ERROR: Please, call .atStage(usage stage) before .handle()!") &&
-                       hasPolicy(RRP::HasUsageType, "ERROR: Please, call .useAs(usage type) before .handle()!")))
-  [[nodiscard]] HandleType handle() && { return {resUid, Base::provider()}; }
+  template <typename = void>
+    requires(isTypedBlob("ERROR: Please specify the blob type via .blob<T>() to use .handle()!") &&
+             (!is_gpu || (hasPolicy(RRP::HasUsageStage, "ERROR: Please call .atStage(usage stage) before .handle()!") &&
+                           hasPolicy(RRP::HasUsageType, "ERROR: Please call .useAs(usage type) before .handle()!"))))
+  [[nodiscard]] HandleType handle() &&
+  {
+    return {resUid, Base::provider()};
+  }
+
+  /**
+   * \brief Enables history for this GPU resource creation request.
+   * \details A history for a virtual resource is a physical resource that
+   * contains the data this virtual resource had at the end of the
+   * previous frame. See dafg::History for details.
+   * \param history Specifies the way in which history should be handled for this resource.
+   */
+  template <typename = void>
+    requires(is_gpu && hasPolicy(RRP::CanSpecifyHistory,
+                         "ERROR: Please call .withHistory(History history) only once and after create()/rename()!"))
+  VirtualResourceRequest<Res, flipPolicy(RRP::CanSpecifyHistory)> withHistory(History history) &&
+  {
+    Base::withHistory(history);
+    return {resUid, nodeId, registry};
+  }
+
+  /**
+   * \brief Enables history for this CPU resource creation request.
+   * \details A history for a virtual resource is a physical resource that
+   * contains the data this virtual resource had at the end of the
+   * previous frame. See dafg::History for details.
+   */
+  template <typename = void>
+    requires(!is_gpu && hasPolicy(RRP::CanSpecifyHistory,
+                          "ERROR: Please call .withHistory(History history) only once and after create()/rename()!"))
+  VirtualResourceRequest<Res, flipPolicy(RRP::CanSpecifyHistory)> withHistory() &&
+  {
+    Base::withHistory(History::ClearZeroOnFirstFrame);
+    return {resUid, nodeId, registry};
+  }
 
   /**
    * \brief Clears the resource with the specified clear value on activation (or render pass begin if its applicable).
    * \details This is only applicable to textures.
    * \param clear_value The value to clear the resource with.
+   * \param flags The flags that show how to clear resource
    */
-  REQUIRE(eastl::is_same_v<Res, BaseTexture> &&
-          !hasPolicy(RRP::HasClearValue, "ERROR: Please, remove the duplicate .clear(clear value)/.disacrd() call!"))
-  VirtualResourceRequest<Res, flipPolicy(RRP::HasClearValue)> clear(const ResourceClearValue &clear_value) &&
+  template <typename = void>
+    requires(eastl::is_same_v<Res, BaseTexture> && !hasPolicy(RRP::Readonly, "ERROR: Readonly resources cannot be cleared!") &&
+             !hasPolicy(RRP::HasClearValue, "ERROR: Please remove the duplicate .clear(clear value)/.discard() call!"))
+  VirtualResourceRequest<Res, flipPolicy(RRP::HasClearValue)> clear(const ResourceClearValue &clear_value,
+    ResourceClearFlags flags = ResourceClearFlags::RESOURCE_CLEAR_ALL_CONTENT) &&
   {
-    Base::clear(clear_value);
+    Base::clear(clear_value, flags);
     return {resUid, nodeId, registry};
   }
 
@@ -267,12 +387,15 @@ public:
    * \brief Clears the resource with the specified clear value on activation (or render pass begin if its applicable).
    * \details This is only applicable to textures.
    * \param blob_name The name of the blob that contains the clear value.
+   * \param flags The flags that show how to clear resource
    */
-  REQUIRE(eastl::is_same_v<Res, BaseTexture> &&
-          !hasPolicy(RRP::HasClearValue, "ERROR: Please, remove the duplicate .clear(clear value)/.disacrd() call!"))
-  VirtualResourceRequest<Res, flipPolicy(RRP::HasClearValue)> clear(const char *blob_name) &&
+  template <typename = void>
+    requires(eastl::is_same_v<Res, BaseTexture> && !hasPolicy(RRP::Readonly, "ERROR: Readonly resources cannot be cleared!") &&
+             !hasPolicy(RRP::HasClearValue, "ERROR: Please remove the duplicate .clear(clear value)/.discard() call!"))
+  VirtualResourceRequest<Res, flipPolicy(RRP::HasClearValue)> clear(const char *blob_name,
+    ResourceClearFlags flags = ResourceClearFlags::RESOURCE_CLEAR_ALL_CONTENT) &&
   {
-    Base::clear(tag_for<ResourceClearValue>(), blob_name, detail::identity_projector);
+    Base::clear(tag_for<ResourceClearValue>(), blob_name, detail::identity_projector, flags);
     return {resUid, nodeId, registry};
   }
 
@@ -280,16 +403,18 @@ public:
    * \brief Clears the resource with the specified clear value on activation (or render pass begin if its applicable).
    * \details This is only applicable to textures.
    * \param blob_name The name of the blob that contains the clear value.
+   * \param flags The flags that show how to clear resource
    */
   template <auto projector>
-    requires(eastl::is_same_v<Res, BaseTexture> &&
-             !hasPolicy(RRP::HasClearValue, "ERROR: Please, remove the duplicate .clear(clear value)/.disacrd() call!"))
-  VirtualResourceRequest<Res, flipPolicy(RRP::HasClearValue)> clear(const char *blob_name) &&
+    requires(eastl::is_same_v<Res, BaseTexture> && !hasPolicy(RRP::Readonly, "ERROR: Readonly resources cannot be cleared!") &&
+             !hasPolicy(RRP::HasClearValue, "ERROR: Please remove the duplicate .clear(clear value)/.discard() call!"))
+  VirtualResourceRequest<Res, flipPolicy(RRP::HasClearValue)> clear(const char *blob_name,
+    ResourceClearFlags flags = ResourceClearFlags::RESOURCE_CLEAR_ALL_CONTENT) &&
   {
     using ProjectedType = detail::ProjectedType<projector>;
     using ProjecteeType = detail::ProjecteeType<projector>;
     static_assert(eastl::is_same_v<ProjectedType, ResourceClearValue>, "Expected the projector to return a ResourceClearValue!");
-    Base::clear(tag_for<ProjecteeType>(), blob_name, detail::erase_projector_type<projector, ProjecteeType>());
+    Base::clear(tag_for<ProjecteeType>(), blob_name, detail::erase_projector_type<projector, ProjecteeType>(), flags);
     return {resUid, nodeId, registry};
   }
 
@@ -298,12 +423,13 @@ public:
    * \details This is only applicable to textures. Default behaviour is discard, so we need this method only to cast the request to
    * have the same type as modify request.
    */
-  REQUIRE(eastl::is_same_v<Res, BaseTexture> &&
-          !hasPolicy(RRP::HasClearValue, "ERROR: Please, remove the duplicate .clear(clear value)/.disacrd() call!"))
-  VirtualResourceRequest<Res, flipPolicy(RRP::HasClearValue)> discard() && { return {resUid, nodeId, registry}; }
+  template <typename = void>
+    requires(eastl::is_same_v<Res, BaseTexture> && !hasPolicy(RRP::Readonly, "ERROR: Readonly resources cannot be discarded!") &&
+             !hasPolicy(RRP::HasClearValue, "ERROR: Please remove the duplicate .clear(clear value)/.discard() call!"))
+  VirtualResourceRequest<Res, flipPolicy(RRP::HasClearValue)> discard() &&
+  {
+    return {resUid, nodeId, registry};
+  }
 };
-
-#undef REQUIRE_IMPL
-#undef REQUIRE
 
 } // namespace dafg

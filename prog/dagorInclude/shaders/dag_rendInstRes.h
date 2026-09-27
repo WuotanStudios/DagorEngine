@@ -6,6 +6,7 @@
 
 #include <shaders/dag_shadersRes.h>
 #include <shaders/dag_instShaderMeshRes.h>
+#include <shaders/dag_voxelSurfaceData.h>
 #include <math/dag_bounds3.h>
 #include <3d/dag_textureIDHolder.h>
 #include <math/dag_Point4.h>
@@ -55,6 +56,9 @@ public:
   InstShaderMeshResource *getMesh() { return rigid.mesh; }
   const InstShaderMeshResource *getMesh() const { return rigid.mesh; }
 
+  VoxelSurfaceData *getVoxelSurface() const { return voxelSurface.get(); }
+  int getVoxelDataOffset() const { return voxelDataOffset; }
+
   RenderableInstanceResource *clone() const;
   void updateShaderElems()
   {
@@ -72,6 +76,8 @@ protected:
   };
 
   RigidObject rigid;
+  Ptr<VoxelSurfaceData> voxelSurface;
+  int voxelDataOffset = 0; // from starting vertex of element 0
 
   RenderableInstanceResource() {}
 end_dclass_decl();
@@ -88,6 +94,7 @@ public:
     real range;
     float texScale;
     int getAllElems(Tab<dag::ConstSpan<ShaderMesh::RElem>> &out_elems) const;
+    VoxelSurfaceData *getVoxelSurface() const { return scene ? scene->getVoxelSurface() : nullptr; }
   };
   struct ImpostorData
   {
@@ -158,9 +165,6 @@ public:
     const DataBlock *desc = nullptr);
   static RenderableInstanceLodsResource *makeStubRes(const DataBlock *b = NULL);
 
-  using ImpostorTextureCallback = void (*)(const RenderableInstanceLodsResource *);
-  static void setImpostorTextureCallback(ImpostorTextureCallback callback);
-
   void gatherUsedTex(TextureIdSet & tex_id_list) const;
   void gatherUsedMat(Tab<ShaderMaterial *> & mat_list) const;
 
@@ -180,6 +184,20 @@ public:
   }
 
   inline float getMaxDist() const { return lods.size() ? lods.back().range : 0; }
+
+  inline int getBestLodForDist(float dist) const
+  {
+    if (dist <= 0)
+      return 0;
+
+    int lastLod = hasImpostor() ? lods.size() - 2 : lods.size() - 1;
+    for (int i = 0; i <= lastLod; ++i)
+    {
+      if (dist < lods[i].range)
+        return i;
+    }
+    return lastLod;
+  }
 
   bool isBakedImpostor() const;
   bool setImpostorVars(ShaderMaterial * mat) const;
@@ -231,6 +249,9 @@ public:
   static void unlockClonesList() {}
   static void (*on_higher_lod_required)(RenderableInstanceLodsResource *res, unsigned req_lod, unsigned cur_lod);
 
+  static bool always_load_last_tree_geom_lod;
+  static bool disable_voxel_lods;
+
   static constexpr short int qlReqLodInitialValue = 16;
   unsigned getQlReqLod() const { return interlocked_relaxed_load(qlReqLod); }
   unsigned getQlReqLodEff() const
@@ -242,6 +263,9 @@ public:
   int getQlReqLFU() const { return interlocked_relaxed_load(qlReqLFU); }
   void updateReqLod(unsigned lod)
   {
+    if (always_load_last_tree_geom_lod && isBakedImpostor())
+      lod = min<unsigned>(lod, max<unsigned>(lods.size(), 2u) - 2u);
+
     if (lod < qlMinAllowedLod)
       lod = qlMinAllowedLod;
     const int reqLFU = getQlReqLFU();
@@ -316,19 +340,24 @@ protected:
   };
   static_assert(RES_LD_FLG_SHIFT + RES_LD_FLG_SIZE == 32,
     "Since we use one dword for the bitfield, we shouldn't have unhandled bits there.");
+  static constexpr uint32_t bvhIdBits = 29;
   uint32_t packedFields = 0;
   unsigned char rotationPaletteSize = 1;
   unsigned char qlMinAllowedLod = 0;
   volatile unsigned short qlReqLod = qlReqLodInitialValue, qlReqLodPrev = qlReqLodInitialValue;
   volatile unsigned short qlReloadCnt = 0, qlDiscardCnt = 0;
   int qlReqLFU = 0;
-  mutable uint32_t bvhId : 31 = 0;
+  mutable unsigned char bvhMinLod = 0;
+  mutable uint32_t bvhId : bvhIdBits = 0;
+  mutable bool usedAsDagdp : 1 = false;
   mutable bool hasTreeOrFlagMaterial : 1 = false;
+  mutable bool isTessellatedMaterial : 1 = false;
   Ptr<ShaderMatVdata> smvd;
-  PATCHABLE_32BIT_PAD32(_resv[3]);
+  PATCHABLE_32BIT_PAD32(_resv[1]);
 
 public:
-  PatchableTab<Lod> lods;
+  // start of dump:
+  alignas(16) PatchableTab<Lod> lods;
   BBox3 bbox;        //< in local coords: bounding box
   Point3 bsphCenter; //< in local coords: bounding sphere center
   real bsphRad;      //< in local coords: bounding sphere radius
@@ -356,16 +385,30 @@ protected:
 
 public:
   uint32_t getBvhId() const { return bvhId; }
-  void setBvhId(uint32_t id) const { bvhId = id; }
+  void setBvhId(uint32_t id) const
+  {
+    G_ASSERT(id < (1 << bvhIdBits));
+    bvhId = id;
+  }
+
+  uint8_t getBvhMinLod() const { return bvhMinLod; }
+  void updateBvhMinLod(float lod_dist_bias) const { bvhMinLod = getBestLodForDist(lod_dist_bias); }
 
   bool hasTreeOrFlag() const { return hasTreeOrFlagMaterial; }
+  bool isTessellated() const { return isTessellatedMaterial; }
 
-#if _TARGET_64BIT && !defined(DEBUG_DOBJECTS)
+  void markForUseInDagdp() const { usedAsDagdp = true; }
+  bool isUsedAsDagdp() const { return usedAsDagdp; }
+
+#ifdef DEBUG_DOBJECTS
+  constexpr void setRiExtraId(int) {}
+  constexpr int getRiExtraId() const { return -1; }
+#elif _TARGET_64BIT
   void setRiExtraId(int id) { DObject::_resv = id; }
   int getRiExtraId() const { return DObject::_resv; }
 #else
-  constexpr void setRiExtraId(int) {}
-  constexpr int getRiExtraId() const { return -1; }
+  void setRiExtraId(int id) { _resv[0] = id; }
+  int getRiExtraId() const { return _resv[0]; }
 #endif
 
   void loadImpostorData(const char *name);
@@ -402,7 +445,7 @@ protected:
   RenderableInstanceLodsResource(const RenderableInstanceLodsResource &);
   ~RenderableInstanceLodsResource() { clearData(); }
 
-  void patchAndLoadData(int res_sz, IGenLoad &crd, int flags, const char *name);
+  void patchAndLoadData(int res_sz, IGenLoad &crd, int srl_flags, const char *name);
 
   ImpostorRtData *impRtdPtr() const
   {

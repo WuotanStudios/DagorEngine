@@ -6,14 +6,23 @@
 
 void CompositeEditorUndoParams::restore(bool save_redo)
 {
+  const CompositeEditor &compositeEditor = get_app().getCompositeEditor();
+
   if (save_redo)
   {
     DataBlock redoDataBlock;
-    get_app().getCompositeEditor().saveForUndo(redoDataBlock);
+    compositeEditor.saveForUndo(redoDataBlock);
+
+    unsigned redoSelection = IDataBlockIdHolder::invalid_id;
+    dag::Vector<unsigned> redoMultiSelections;
+    if (containsSavedSelection())
+      compositeEditor.getSelectedTreeNodeDataBlockIds(redoMultiSelections, redoSelection);
 
     loadUndo();
 
     saveUndoFromDataBlock(redoDataBlock);
+    selectedTreeNodeDataBlockId = redoSelection;
+    selectedTreeNodeDataBlockIds.assign(redoMultiSelections.begin(), redoMultiSelections.end());
   }
   else
     loadUndo();
@@ -23,17 +32,32 @@ void CompositeEditorUndoParams::redo() { restore(/*save_redo = */ true); }
 
 void CompositeEditorUndoParams::loadUndo() const
 {
+  CompositeEditor &compositeEditor = get_app().getCompositeEditor();
+
   InPlaceMemLoadCB memoryLoad(buffer.get(), bufferSize);
   DataBlock dataBlock;
   dataBlock.loadFromStream(memoryLoad);
-  get_app().getCompositeEditor().loadFromUndo(dataBlock);
+
+  compositeEditor.loadFromUndo(dataBlock, selectedTreeNodeDataBlockId, selectedTreeNodeDataBlockIds);
 }
 
-void CompositeEditorUndoParams::saveUndo()
+void CompositeEditorUndoParams::saveUndo(bool save_selection)
 {
+  const CompositeEditor &compositeEditor = get_app().getCompositeEditor();
+
   DataBlock dataBlock;
-  get_app().getCompositeEditor().saveForUndo(dataBlock);
+  compositeEditor.saveForUndo(dataBlock);
   saveUndoFromDataBlock(dataBlock);
+
+  if (save_selection)
+  {
+    compositeEditor.getSelectedTreeNodeDataBlockIds(selectedTreeNodeDataBlockIds, selectedTreeNodeDataBlockId);
+  }
+  else
+  {
+    selectedTreeNodeDataBlockId = IDataBlockIdHolder::invalid_id;
+    selectedTreeNodeDataBlockIds.clear();
+  }
 }
 
 void CompositeEditorUndoParams::saveUndoFromDataBlock(const DataBlock &dataBlock)
@@ -47,4 +71,9 @@ void CompositeEditorUndoParams::saveUndoFromDataBlock(const DataBlock &dataBlock
   bufferSize = memorySave.size();
   buffer.reset(new uint8_t[bufferSize]);
   memcpy(buffer.get(), memorySave.data(), bufferSize);
+}
+
+bool CompositeEditorUndoParams::containsSavedSelection() const
+{
+  return selectedTreeNodeDataBlockId != IDataBlockIdHolder::invalid_id || selectedTreeNodeDataBlockIds.size() > 0;
 }

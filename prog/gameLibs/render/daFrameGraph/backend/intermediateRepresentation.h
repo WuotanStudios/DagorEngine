@@ -11,6 +11,7 @@
 #include <generic/dag_functionRef.h>
 #include <dag/dag_vector.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_enhanced_barrier.h>
 #include <3d/dag_resPtr.h>
 #include <drv/3d/dag_variableRateShading.h>
 #include <shaders/dag_shaderCommon.h>
@@ -30,8 +31,12 @@
 
 #include <common/autoResolutionData.h>
 #include <common/bindingType.h>
+#include <common/untrackedResources.h>
 
+#include <memory/dag_framemem.h>
 #include <id/idIndexedMapping.h>
+#include <id/idSparseIndexedMapping.h>
+#include <id/idIndexedFlags.h>
 #include <id/idSentinels.h>
 
 
@@ -66,6 +71,8 @@ struct ResourceUsage
   Usage type;
   Access access : 2;
   Stage stage : 6;
+
+  bool operator==(const ResourceUsage &other) const = default;
 };
 static_assert(sizeof(ResourceUsage) <= 4);
 
@@ -75,6 +82,8 @@ struct Request
   ResourceUsage usage;
   // Marks that a node wants to use the last frame version of this resource
   bool fromLastFrame;
+
+  bool operator==(const Request &other) const = default;
 };
 
 struct Node
@@ -85,6 +94,11 @@ struct Node
   // Resources that are used by this node
   dag::RelocatableFixedVector<Request, 16> resourceRequests{};
 
+  // Requests that this node technically makes but doesn't use,
+  // so we suppress them from the main requests list to avoid pessimizing
+  // further graph optimization.
+  dag::RelocatableFixedVector<ResourceIndex, 16> supressedRequests{};
+
   // Nodes that have to be executed before this one
   dag::FixedVectorSet<NodeIndex, 16> predecessors{};
 
@@ -92,6 +106,10 @@ struct Node
 
   // Multiplexing iteration this node will be executed on
   MultiplexingIndex multiplexingIndex{Invalid};
+
+  bool hasSideEffects = false;
+
+  bool operator==(const Node &other) const = default;
 };
 
 using CtorFunc = dag::FunctionRef<void(void *) const>;
@@ -106,6 +124,8 @@ struct BlobDescription
   CtorFunc ctor;
   DtorFunc dtor;
   CopyFunc copy;
+
+  bool operator==(const BlobDescription &) const = default;
 };
 
 struct DynamicParameter
@@ -114,32 +134,69 @@ struct DynamicParameter
 
   ResourceSubtypeTag projectedTag;
   detail::TypeErasedProjector projector;
+
+  bool operator==(const DynamicParameter &) const = default;
 };
 
 enum class ClearStage
 {
   None,       ///< No clear stage, resource is not cleared
   Activation, ///< Resource is cleared on activation
-  RenderPass  ///< Resource is cleared in render pass
+  RenderPass, ///< Resource is cleared in render pass
+
+  MAX_VAL = RenderPass,
+};
+
+using EnhancedBarrier = eastl::variant<eastl::monostate, d3d::BufferBarrier, d3d::TextureBarrier>;
+
+struct GpuDescription : ResourceDescription
+{
+  using ResourceDescription::ResourceDescription;
+  GpuDescription(const ResourceDescription &desc) : ResourceDescription{desc} {}
+
+  bool operator==(const GpuDescription &other) const
+  {
+    return ResourceDescription::operator==(other) && asBasicRes.activation == other.asBasicRes.activation;
+  }
 };
 
 struct ScheduledResource
 {
-  eastl::variant<ResourceDescription, BlobDescription> description;
+  eastl::variant<GpuDescription, BlobDescription> description;
   ResourceType resourceType;
   eastl::optional<AutoResolutionData> resolutionType;
   ClearStage clearStage;
   eastl::variant<ResourceClearValue, DynamicParameter> clearValue;
+  ResourceClearFlags clearFlags;
   History history;
   bool autoMipCount;
 
-  bool isGpuResource() const { return eastl::holds_alternative<ResourceDescription>(description); }
+  bool operator==(const ScheduledResource &) const = default;
+
+  bool isGpuResource() const { return eastl::holds_alternative<GpuDescription>(description); }
   bool isCpuResource() const { return eastl::holds_alternative<BlobDescription>(description); }
 
+  bool isUntracked() const
+  {
+    if (!isGpuResource())
+      return false;
+    const uint32_t cFlags = getGpuDescription().asBasicRes.cFlags;
+    if (resourceType == ResourceType::Buffer)
+      return (cFlags & SBCF_NO_STATE_TRACKING) != 0;
+    if (resourceType == ResourceType::Texture)
+      return (cFlags & TEXCF_NO_STATE_TRACKING) != 0;
+    return false;
+  }
+
+  ResourceDescription &getGpuDescription()
+  {
+    G_ASSERT(isGpuResource());
+    return eastl::get<GpuDescription>(description);
+  }
   const ResourceDescription &getGpuDescription() const
   {
     G_ASSERT(isGpuResource());
-    return eastl::get<ResourceDescription>(description);
+    return eastl::get<GpuDescription>(description);
   }
   const BlobDescription &getCpuDescription() const
   {
@@ -153,18 +210,36 @@ struct ScheduledResource
 struct BufferInfo
 {
   int flags;
+
+  bool operator==(const BufferInfo &) const = default;
 };
 
 struct ExternalResource
 {
   eastl::variant<TextureInfo, BufferInfo> info;
+
+  bool operator==(const ExternalResource &other) const
+  {
+    if (const auto *tex = eastl::get_if<TextureInfo>(&info))
+    {
+      const auto *otherTex = eastl::get_if<TextureInfo>(&other.info);
+      return otherTex && tex->w == otherTex->w && tex->h == otherTex->h && tex->d == otherTex->d && tex->a == otherTex->a &&
+             tex->mipLevels == otherTex->mipLevels && tex->type == otherTex->type && tex->isCommitted == otherTex->isCommitted &&
+             tex->cflg == otherTex->cflg;
+    }
+    const auto *buf = eastl::get_if<BufferInfo>(&info);
+    const auto *otherBuf = eastl::get_if<BufferInfo>(&other.info);
+    return buf && otherBuf && *buf == *otherBuf;
+  }
 };
 
 // Backbuffers are not available on the main thread and their acquisition
 // is deferred to the driver thread, so we handle them separately.
 // Currently, this is can only be the backbuffer.
 struct DriverDeferredTexture
-{};
+{
+  bool operator==(const DriverDeferredTexture &) const = default;
+};
 
 using ConcreteResource = eastl::variant<eastl::monostate, ScheduledResource, ExternalResource, DriverDeferredTexture>;
 
@@ -180,6 +255,8 @@ struct Resource
 
   // Multiplexing iteration this resource is produced on
   MultiplexingIndex multiplexingIndex{Invalid};
+
+  bool operator==(const Resource &) const = default;
 
   bool isExternal() const { return eastl::holds_alternative<ExternalResource>(resource); }
   bool isScheduled() const { return eastl::holds_alternative<ScheduledResource>(resource); }
@@ -220,6 +297,31 @@ struct Resource
       },
       eastl::move(resource));
   }
+  bool isUntrackedBuffer() const
+  {
+    if (!untracked_resources_supported())
+      return false;
+    if (getResType() != ResourceType::Buffer)
+      return false;
+    if (isScheduled())
+      return asScheduled().isUntracked();
+    if (isExternal())
+      return (eastl::get<BufferInfo>(asExternal().info).flags & SBCF_NO_STATE_TRACKING) != 0;
+    return false;
+  }
+  bool isUntrackedTexture() const
+  {
+    if (!untracked_resources_supported())
+      return false;
+    if (getResType() != ResourceType::Texture)
+      return false;
+    if (isScheduled())
+      return asScheduled().isUntracked();
+    if (isExternal())
+      return (eastl::get<TextureInfo>(asExternal().info).cflg & TEXCF_NO_STATE_TRACKING) != 0;
+    return false;
+  }
+  bool isUntracked() const { return isUntrackedBuffer() || isUntrackedTexture(); }
 };
 
 // Default value here is "unbind everything"
@@ -228,6 +330,12 @@ struct Binding
   BindingType type = BindingType::Invalid;
   eastl::optional<ResourceIndex> resource = eastl::nullopt;
   bool history = false;
+
+  // do we need to reset it to default value after node is executed
+  bool reset = false;
+
+  // is this binding created with .optional()
+  bool optional = false;
 
   // projected type of "what"
   ResourceSubtypeTag projectedTag = ResourceSubtypeTag::Invalid;
@@ -276,6 +384,8 @@ struct RenderPass
   dag::FixedVectorMap<ResourceIndex, ResourceIndex, 2> resolves;
   bool isLegacyPass = false;
   eastl::optional<SubresourceRef> vrsRateAttachment;
+
+  friend bool operator==(const RenderPass &first, const RenderPass &second) = default;
 };
 
 struct ShaderBlockBindings
@@ -309,16 +419,22 @@ using DebugResourceName = eastl::fixed_string<char, 128>;
 
 struct Graph
 {
-  IdIndexedMapping<ResourceIndex, Resource> resources;
-  IdIndexedMapping<NodeIndex, Node> nodes;
-  // DoD suggests these should not be inside Node/Resource
-  IdIndexedMapping<NodeIndex, RequiredNodeState> nodeStates;
-  IdIndexedMapping<NodeIndex, DebugNodeName> nodeNames;
-  IdIndexedMapping<ResourceIndex, DebugResourceName> resourceNames;
+  IdSparseIndexedMapping<ResourceIndex, Resource> resources;
+  IdSparseIndexedMapping<NodeIndex, Node> nodes;
+  IdSparseIndexedMapping<NodeIndex, RequiredNodeState> nodeStates;
+  IdSparseIndexedMapping<NodeIndex, DebugNodeName> nodeNames;
+  IdSparseIndexedMapping<ResourceIndex, DebugResourceName> resourceNames;
 
-  // Choses a subgraph by selecting some nodes and specifying their order
-  // Argument must map "old -> new" index and not contain any gaps
-  void choseSubgraph(eastl::span<const intermediate::NodeIndex> old_to_new_index_mapping);
+  void clear()
+  {
+    resources.clear();
+    nodes.clear();
+    nodeStates.clear();
+    nodeNames.clear();
+    resourceNames.clear();
+  }
+
+  void pruneResources();
 
   // Calculates the original resources/nodes -> IR resources/nodes mapping
   Mapping calculateMapping() const;
@@ -327,6 +443,12 @@ struct Graph
   // only useful for finding bugs in IR generation
   void validate() const;
 };
+
+IdIndexedMapping<NodeIndex, NodeIndex, framemem_allocator> apply_node_remap(Graph &graph, const Graph &source_graph,
+  const IdIndexedMapping<NodeIndex, NodeIndex, framemem_allocator> &source_to_desired,
+  const IdIndexedMapping<NodeIndex, NodeIndex> &source_to_prev_dst,
+  const IdIndexedFlags<NodeIndex, framemem_allocator> &source_nodes_changed,
+  IdIndexedFlags<NodeIndex, framemem_allocator> &out_nodes_changed);
 
 
 // These support structures can be used to determine which IR entity

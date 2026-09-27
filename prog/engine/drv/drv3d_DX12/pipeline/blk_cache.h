@@ -219,15 +219,15 @@ public:
 };
 
 
-class FormatedDecoder
+class FormattedDecoder
 {
 protected:
   const char *defaultFormat = "dx12";
 
 public:
-  FormatedDecoder() = default;
-  FormatedDecoder(const char *fmt) : defaultFormat{fmt} {}
-  FormatedDecoder(const FormatedDecoder &) = default;
+  FormattedDecoder() = default;
+  FormattedDecoder(const char *fmt) : defaultFormat{fmt} {}
+  FormattedDecoder(const FormattedDecoder &) = default;
 };
 
 template <typename D, size_t N = 64>
@@ -281,7 +281,7 @@ struct ObjectHashDecoder
   }
 };
 
-class InputLayoutDeEncoder : FormatedDecoder,
+class InputLayoutDeEncoder : FormattedDecoder,
                              public DefaultHashNameInvokeDecoder<InputLayout, InputLayoutDeEncoder>,
                              public EncoderBlockNameStore<InputLayoutDeEncoder>,
                              public EncoderBlockHashNameStore<InputLayout>,
@@ -293,7 +293,7 @@ class InputLayoutDeEncoder : FormatedDecoder,
 public:
   static inline const char *blockFormat = "il_%u";
 
-  using FormatedDecoder::FormatedDecoder;
+  using FormattedDecoder::FormattedDecoder;
 
   bool decode(const DataBlock &blk, InputLayout &target, dxil::HashValue &hash) const;
   bool encode(DataBlock &blk, const InputLayout &source) const;
@@ -302,7 +302,7 @@ public:
 using InputLayoutDecoder = InputLayoutDeEncoder;
 using InputLayoutEncoder = InputLayoutDeEncoder;
 
-class RenderStateDeEncoder : FormatedDecoder,
+class RenderStateDeEncoder : FormattedDecoder,
                              public DefaltInvokeDecoder<RenderStateSystem::StaticState, RenderStateDeEncoder>,
                              public EncoderBlockNameStore<RenderStateDeEncoder>,
                              public EncoderBlockHashNameStore<RenderStateSystem::StaticState>,
@@ -314,7 +314,7 @@ class RenderStateDeEncoder : FormatedDecoder,
 public:
   static inline const char *blockFormat = "rs_%u";
 
-  using FormatedDecoder::FormatedDecoder;
+  using FormattedDecoder::FormattedDecoder;
 
   bool decode(const DataBlock &blk, RenderStateSystem::StaticState &target, dxil::HashValue &hash) const;
   bool encode(DataBlock &blk, const RenderStateSystem::StaticState &source) const;
@@ -323,7 +323,7 @@ public:
 using RenderStateDecoder = RenderStateDeEncoder;
 using RenderStateEncoder = RenderStateDeEncoder;
 
-class FramebufferLayoutDeEncoder : FormatedDecoder,
+class FramebufferLayoutDeEncoder : FormattedDecoder,
                                    public DefaltInvokeDecoder<FramebufferLayout, FramebufferLayoutDeEncoder>,
                                    public EncoderBlockNameStore<FramebufferLayoutDeEncoder>,
                                    public EncoderBlockHashNameStore<FramebufferLayout>,
@@ -335,7 +335,7 @@ class FramebufferLayoutDeEncoder : FormatedDecoder,
 public:
   static inline const char *blockFormat = "fb_%u";
 
-  using FormatedDecoder::FormatedDecoder;
+  using FormattedDecoder::FormattedDecoder;
 
   bool decode(const DataBlock &blk, FramebufferLayout &target, dxil::HashValue &hash) const;
   bool encode(DataBlock &blk, const FramebufferLayout &source) const;
@@ -344,179 +344,6 @@ public:
 using FramebufferLayoutDecoder = FramebufferLayoutDeEncoder;
 using FramebufferLayoutEncoder = FramebufferLayoutDeEncoder;
 
-class GraphicsPipelineVariantDeEncoder : public EncoderBlockNameStore<GraphicsPipelineVariantDeEncoder>
-{
-public:
-  static inline const char *blockFormat = "v_%u";
-
-  GraphicsPipelineVariantDeEncoder() = default;
-
-  template <typename T>
-  bool invoke(const DataBlock &blk, T target) const
-  {
-    GraphicsPipelineVariantState out;
-    if (!decode(blk, out))
-    {
-      return false;
-    }
-    return target(out);
-  }
-  bool decode(const DataBlock &blk, GraphicsPipelineVariantState &target) const;
-  bool encode(DataBlock &blk, const GraphicsPipelineVariantState &source, int feature_set_id = -1) const;
-};
-using GraphicsPipelineVariantDecoder = GraphicsPipelineVariantDeEncoder;
-using GraphicsPipelineVariantEncoder = GraphicsPipelineVariantDeEncoder;
-
-class GraphicsPipelineDeEncoder : public EncoderBlockNameStore<GraphicsPipelineDeEncoder>
-{
-public:
-  static inline const char *blockFormat = "gp_%u";
-
-  GraphicsPipelineDeEncoder() = default;
-  template <typename T>
-  bool invoke(const DataBlock &blk, T target) const
-  {
-    BasePipelineIdentifier base;
-    DynamicArray<GraphicsPipelineVariantState> vars;
-    if (!decode(blk, base, vars))
-    {
-      return false;
-    }
-    return target(base, vars);
-  }
-  template <typename VC>
-  bool decode(const DataBlock &blk, BasePipelineIdentifier &base, VC &variants) const
-  {
-    auto vertexHash = blk.getStr("vertexHash", nullptr);
-    auto pixelHash = blk.getStr("pixelHash", nullptr);
-    if (!vertexHash || !pixelHash)
-    {
-      return false;
-    }
-
-    base.vs = dxil::HashValue::fromString(vertexHash);
-    base.ps = dxil::HashValue::fromString(pixelHash);
-
-    DataBlockDecodeEnumarator<GraphicsPipelineVariantDecoder> enumerator{blk, 0};
-    variants.resize(enumerator.remaining());
-    uint32_t enumerated = 0;
-    for (; !enumerator.completed(); enumerator.next())
-    {
-      if (enumerator.decode(variants[enumerated]))
-      {
-        ++enumerated;
-      }
-    }
-    variants.resize(enumerated);
-    return enumerated > 0;
-  }
-  template <typename VC>
-  bool encode(DataBlock &blk, const BasePipelineIdentifier &base, const VC &variants, int feature_set_id = -1) const
-  {
-    BasePipelineIdentifierHashSet hashSet = base;
-    blk.setStr("vertexHash", hashSet.vsHash);
-    blk.setStr("pixelHash", hashSet.psHash);
-    DataBlockEncodeVisitor<GraphicsPipelineVariantEncoder> visitor{blk};
-    for (auto &variant : variants)
-    {
-      visitor.encode(variant, feature_set_id);
-    }
-    return true;
-  }
-};
-
-using GraphicsPipelineDecoder = GraphicsPipelineDeEncoder;
-using GraphicsPipelineEncoder = GraphicsPipelineDeEncoder;
-
-class MeshPipelineVariantDeEncoder : public DefaltInvokeDecoder<MeshPipelineVariantState, MeshPipelineVariantDeEncoder>,
-                                     public EncoderBlockNameStore<GraphicsPipelineDeEncoder>
-{
-public:
-  static inline const char *blockFormat = "v_%u";
-
-  MeshPipelineVariantDeEncoder() = default;
-  bool decode(const DataBlock &blk, MeshPipelineVariantState &target) const;
-  bool encode(DataBlock &blk, const MeshPipelineVariantState &source, int feature_set_id = -1) const;
-};
-
-using MeshPipelineVariantDecoder = MeshPipelineVariantDeEncoder;
-using MeshPipelineVariantEncoder = MeshPipelineVariantDeEncoder;
-
-class MeshPipelineDeEncoder : public EncoderBlockNameStore<GraphicsPipelineDeEncoder>
-{
-public:
-  static inline const char *blockFormat = "mp_%u";
-
-  MeshPipelineDeEncoder() = default;
-
-  template <typename T>
-  bool invoke(const DataBlock &blk, T target) const
-  {
-    BasePipelineIdentifier base;
-    DynamicArray<MeshPipelineVariantState> vars;
-    if (!decode(blk, base, vars))
-    {
-      return false;
-    }
-    return target(base, vars);
-  }
-  template <typename VC>
-  bool decode(const DataBlock &blk, BasePipelineIdentifier &base, VC &variants) const
-  {
-    auto meshHash = blk.getStr("meshHash", nullptr);
-    auto pixelHash = blk.getStr("pixelHash", nullptr);
-    if (!meshHash || !pixelHash)
-    {
-      return false;
-    }
-
-    base.vs = dxil::HashValue::fromString(meshHash);
-    base.ps = dxil::HashValue::fromString(pixelHash);
-
-    DataBlockDecodeEnumarator<MeshPipelineVariantDecoder> enumerator{blk, 0};
-    variants.resize(enumerator.remaining());
-    uint32_t enumerated = 0;
-    for (; !enumerator.completed(); enumerator.next())
-    {
-      if (enumerator.decode(variants[enumerated]))
-      {
-        ++enumerated;
-      }
-    }
-    variants.resize(enumerated);
-    return enumerated > 0;
-  }
-  template <typename VC>
-  bool encode(DataBlock &blk, const BasePipelineIdentifier &base, const VC &variants, int feature_set_id = -1) const
-  {
-    BasePipelineIdentifierHashSet hashSet = base;
-    blk.setStr("meshHash", hashSet.vsHash);
-    blk.setStr("pixelHash", hashSet.psHash);
-    DataBlockEncodeVisitor<MeshPipelineVariantEncoder> visitor{blk};
-    for (auto &variant : variants)
-    {
-      visitor.encode(variant, feature_set_id);
-    }
-    return true;
-  }
-};
-
-using MeshPipelineDecoder = MeshPipelineDeEncoder;
-using MeshPipelineEncoder = MeshPipelineDeEncoder;
-
-class ComputePipelineDeEncoder : public DefaltInvokeDecoder<ComputePipelineIdentifier, ComputePipelineDeEncoder>,
-                                 public EncoderBlockNameStore<ComputePipelineDeEncoder>
-{
-public:
-  static inline const char *blockFormat = "cp_%u";
-  ComputePipelineDeEncoder() = default;
-  bool decode(const DataBlock &blk, ComputePipelineIdentifier &target) const;
-  bool encode(DataBlock &blk, const ComputePipelineIdentifier &target, int feature_set_id = -1) const;
-};
-
-using ComputePipelineDecoder = ComputePipelineDeEncoder;
-using ComputePipelineEncoder = ComputePipelineDeEncoder;
-
 class SignatueHashDeEncoder : public DefaltInvokeDecoder<cacheBlk::SignatureHash, SignatueHashDeEncoder>
 {
 public:
@@ -524,7 +351,7 @@ public:
   bool decode(const DataBlock &blk, uint32_t param_index, cacheBlk::SignatureHash &target) const;
   bool decode(const DataBlock &blk, cacheBlk::SignatureHash &target) const;
   bool encode(DataBlock &blk, const cacheBlk::SignatureHash &source) const;
-  bool encode(DataBlock &blk, const char *name, const char *value, int64_t timestamp) const;
+  bool encode(DataBlock &blk, const char *name, const char *value, int64_t timestamp, int32_t psoCacheVersion) const;
 };
 
 using SignatueHashDecoder = SignatueHashDeEncoder;

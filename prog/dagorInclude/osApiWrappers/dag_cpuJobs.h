@@ -6,6 +6,7 @@
 
 #include <util/dag_stdint.h>
 #include <perfMon/dag_daProfilerToken.h>
+#include <perfMon/dag_daProfilerString.h>
 #include <util/dag_compilerDefs.h>
 #include <supp/dag_define_KRNLIMP.h>
 #include <osApiWrappers/dag_atomic.h>
@@ -30,11 +31,12 @@ public:
   //! called by job manager after job is performed; executed in context of main thread
   virtual void releaseJob() {}
 
-  //! called by job manager to perform task; executed in context of worker thread
-  virtual unsigned getJobTag() { return 0; };
+  //! called by job manager to remove jobs by tag; executed in context of main thread
+  virtual unsigned getJobTag() { return 0; }
 
   //! called by job manager before performing the task for measurements;
-  //! set `copystr` to true if string need to be copied (i.e not static/persistently allocated)
+  //! set `copystr` to true if string need to be copied (i.e not static/persistently allocated);
+  //! wrap literal names in DAPROFILER_STRING() so they compile out where the profiler does not exist
   virtual const char *getJobName(bool & /*copystr*/) const = 0;
   da_profiler::desc_id_t getJobNameProfDesc() const;
 
@@ -47,8 +49,8 @@ public:
   mutable da_profiler::desc_id_t jobNameProfDesc = 0;
   union
   {
-    volatile int needRelease;
-    volatile int done;
+    volatile unsigned needRelease;
+    volatile unsigned done;
   };
 };
 
@@ -57,7 +59,8 @@ inline da_profiler::desc_id_t IJob::getJobNameProfDesc() const
   if (auto jd = interlocked_acquire_load(jobNameProfDesc); DAGOR_LIKELY(jd))
     return jd;
   bool copystr = false;
-  return addJobNameProfDesc(getJobName(copystr), copystr);
+  const char *name = getJobName(copystr);
+  return addJobNameProfDesc(name, copystr);
 }
 
 static constexpr int DEFAULT_THREAD_PRIORITY = 0; // MS - THREAD_PRIORITY_NORMAL
@@ -85,8 +88,12 @@ inline int get_core_count() { return get_logical_core_count(); } // compat alias
 //! return number of physical CPU cores
 KRNLIMP int get_physical_core_count();
 
-//! return number of logical CPU cores per Last Level Cache (typically L3).
-KRNLIMP int get_core_count_per_llc();
+//! return number of performance CPU cores on a hybrid (P/E) architecture (or 0 otherwise)
+#if _TARGET_PC_WIN
+KRNLIMP int get_performance_core_count();
+#else
+constexpr inline int get_performance_core_count() { return 0; }
+#endif
 
 //! start job manager on specified Core. require reserve_jobmgr_cores = true passed in init
 KRNLIMP bool start_job_manager(int core_id, int stack_sz = 64 << 10, const char *thread_name = NULL,

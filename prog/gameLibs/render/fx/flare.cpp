@@ -10,6 +10,7 @@
   VAR(flare_use_covering)    \
   VAR(flareSrc)              \
   VAR(flareSrc_samplerstate) \
+  VAR(flareSrcDownsampled)   \
   VAR(flareSrcGlob)          \
   VAR(texelOffset)           \
   VAR(duv1duv2)
@@ -57,12 +58,6 @@ void Flare::init(const Point2 low_res_size, const char *lense_covering_tex_name,
   }
   flareDownsample = new PostFxRenderer();
   flareDownsample->init("flare_downsample");
-  {
-    d3d::SamplerInfo smpInfo;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = d3d::AddressMode::Clamp;
-    smpInfo.filter_mode = d3d::FilterMode::Point;
-    flareDownsample->getMat()->set_sampler_param(flareSrc_samplerstateVarId, d3d::request_sampler(smpInfo));
-  }
   flareFeature = new PostFxRenderer();
   flareFeature->init("flare_feature");
   flareBlur = new PostFxRenderer();
@@ -74,7 +69,7 @@ void Flare::init(const Point2 low_res_size, const char *lense_covering_tex_name,
 }
 
 
-void Flare::apply(Texture *src_tex, TEXTUREID src_id)
+void Flare::apply(Texture *src_tex)
 {
   if (!flareBlur)
   {
@@ -101,8 +96,8 @@ void Flare::apply(Texture *src_tex, TEXTUREID src_id)
   // downsample
   {
     d3d::resource_barrier({src_tex, RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
-    d3d::set_render_target(tmpFlareTex->getTex2D(), 0);
-    d3d::clearview(CLEAR_DISCARD_TARGET, 0, 0.f, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{tmpFlareTex->getTex2D(), 0, 0}});
+    d3d::clearview(DISCARD_TARGET, 0, 0.f, 0);
 
     // compute texel offset
     d3d::get_target_size(targetWidth, targetHeight);
@@ -111,17 +106,17 @@ void Flare::apply(Texture *src_tex, TEXTUREID src_id)
     // texture is same size, don't need to downsample
 
     flareDownsample->getMat()->set_color4_param(texelOffsetVarId, texelOffset);
-    flareDownsample->getMat()->set_texture_param(flareSrcVarId, src_id);
+    ShaderGlobal::set_texture_unsafe(flareSrcDownsampledVarId, src_tex);
     flareDownsample->render();
-    flareDownsample->getMat()->set_texture_param(flareSrcVarId, BAD_TEXTUREID);
     d3d::resource_barrier({tmpFlareTex->getBaseTex(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
+    ShaderGlobal::set_texture_unsafe(flareSrcDownsampledVarId, nullptr);
   }
 
   // feature
   {
     TIME_D3D_PROFILE(feature);
-    d3d::set_render_target(flareTex->getTex2D(), 0);
-    d3d::clearview(CLEAR_DISCARD_TARGET, 0, 0.f, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{flareTex->getTex2D(), 0, 0}});
+    d3d::clearview(DISCARD_TARGET, 0, 0.f, 0);
     flareFeature->getMat()->set_color4_param(texelOffsetVarId, texelOffset);
     flareFeature->getMat()->set_texture_param(flareSrcVarId, tmpFlareTex->getTexId());
     flareFeature->getMat()->set_sampler_param(flareSrc_samplerstateVarId, flareTexSampler);
@@ -136,8 +131,8 @@ void Flare::apply(Texture *src_tex, TEXTUREID src_id)
     float du, dv;
 
     // Phase 1. horizontal. flareTex_1 -> flareTex_0
-    d3d::set_render_target(tmpFlareTex->getTex2D(), 0);
-    d3d::clearview(CLEAR_DISCARD_TARGET, 0, 0.f, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{tmpFlareTex->getTex2D(), 0, 0}});
+    d3d::clearview(DISCARD_TARGET, 0, 0.f, 0);
     du = 1.0f / targetWidth;
     dv = 0.0f;
     flareBlur->getMat()->set_color4_param(duv1duv2VarId, Color4(du * 1.0f, dv * 1.0f, du * 2.0f, dv * 2.0f));
@@ -149,8 +144,8 @@ void Flare::apply(Texture *src_tex, TEXTUREID src_id)
     d3d::resource_barrier({tmpFlareTex->getBaseTex(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
 
     // Phase 2. vertical. flareTex_0 -> flareTex_1
-    d3d::set_render_target(flareTex->getTex2D(), 0);
-    d3d::clearview(CLEAR_DISCARD_TARGET, 0, 0.f, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{flareTex->getTex2D(), 0, 0}});
+    d3d::clearview(DISCARD_TARGET, 0, 0.f, 0);
     du = 0.0f;
     dv = 1.0f / targetHeight;
     flareBlur->getMat()->set_color4_param(duv1duv2VarId, Color4(du * 1.0f, dv * 1.0f, du * 2.0f, dv * 2.0f));

@@ -20,13 +20,22 @@ public:
   static constexpr int MINIMUM_TRACK_BAR_SLIDER_WIDTH_TO_SHOW = 20;
 
   // The space between edit box and the "..." button in the FileEditBoxPropertyControl.
-  static constexpr int SPACE_BETWEEN_EDIT_BOX_AND_BUTTON_IN_COMBINED_CONTROL = 0.0f;
+  static constexpr int SPACE_BETWEEN_EDIT_BOX_AND_BUTTON_IN_COMBINED_CONTROL = 0;
 
   // The space between the picker button and the clear button in the FileButtonPropertyControl.
-  static constexpr int SPACE_BETWEEN_BUTTONS_IN_COMBINED_CONTROL = 2.0f;
+  static constexpr int SPACE_BETWEEN_BUTTONS_IN_COMBINED_CONTROL = 2;
 
   // Vertical space between a label and a control when they are on a separate line.
-  static constexpr int SPACE_BETWEEN_SEPARATE_LINE_LABEL_AND_CONTROL = 0.0f;
+  static constexpr int SPACE_BETWEEN_SEPARATE_LINE_LABEL_AND_CONTROL = 0;
+
+  // The default height is ~2.5 lines for multiline editboxes.
+  static constexpr hdpi::Px EDITBOX_MULTILINE_DEFAULT_HEIGHT = (hdpi::Px)1;
+
+  // 8 line tall multiline editbox. (This is ImGui's default height.)
+  static constexpr hdpi::Px EDITBOX_MULTILINE_8_LINES_HEIGHT = (hdpi::Px)0;
+
+  // Use all the available height for multiline editboxes.
+  static constexpr hdpi::Px EDITBOX_MULTILINE_FULL_HEIGHT = (hdpi::Px)2;
 
   // The default height can fit ~7 items.
   static constexpr hdpi::Px LISTBOX_DEFAULT_HEIGHT = (hdpi::Px)0;
@@ -34,8 +43,29 @@ public:
   // Use all the available height.
   static constexpr hdpi::Px LISTBOX_FULL_HEIGHT = (hdpi::Px)1;
 
+  // Use the frame height (ImGui::GetFrameHeight()) for simple color button's size.
+  static constexpr hdpi::Px SIMPLE_COLOR_BUTTON_FRAME_SIZE = (hdpi::Px)1;
+
+  // The length of the splitter's resize grip along the split axis. So for a vertical splitter this is the height of the grip.
+  static constexpr int SPLITTER_GRIP_LENGTH = 32;
+
   // The inner window padding of toolbars.
   static constexpr ImVec2 TOOLBAR_WINDOW_PADDING = ImVec2(0.0f, 5.0f);
+
+  // The default width of controls like combo box or edit box on the toolbar.
+  static constexpr int TOOLBAR_DEFAULT_CONTROL_WIDTH = 100;
+
+  // Item spacing between a group of tightly placed buttons on the toolbar.
+  static constexpr int TOOLBAR_TIGHT_BUTTON_SPACING = 1;
+
+  // The corner radius in px of modal windows.
+  static constexpr float MODAL_WINDOW_ROUNDING = 6.0f;
+
+  // The inner padding of modal windows.
+  static constexpr int MODAL_WINDOW_PADDING = 6;
+
+  // Space between the items (e.g.: buttons) of a modal window.
+  static constexpr int MODAL_WINDOW_ITEM_SPACING = 12;
 };
 
 } // namespace PropPanel

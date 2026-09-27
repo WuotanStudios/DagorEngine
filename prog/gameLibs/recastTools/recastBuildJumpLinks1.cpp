@@ -18,9 +18,6 @@ struct JumpLink
   Edge end;
 };
 
-void add_off_mesh_connection(recastnavmesh::OffMeshConnectionsStorage &storage, const float *spos, const float *epos, float rad,
-  unsigned char bidir, unsigned short flags = pathfinder::POLYFLAG_JUMP, unsigned short area = pathfinder::POLYAREA_JUMP);
-
 template <class T>
 inline void swapVal(T &a, T &b)
 {
@@ -110,11 +107,11 @@ int findPotentialJumpOverEdges(const rcCompactHeightfield *m_chf, const Edge &ed
   ax.normalize();
   Point3 az = Point3(ax[2], 0, -ax[0]);
   az.normalize();
-  Point3 ay = {0.f, 1.f, 0.f};
+  const Point3 ay = {0.f, 1.f, 0.f};
 
   TMatrix a = TMatrix::IDENT;
   a.setcol(0, ax);
-  a.setcol(1, Point3(0, 1, 0));
+  a.setcol(1, ay);
   a.setcol(2, az);
   a.setcol(3, Point3(0.f, 0.f, 0.f));
 

@@ -21,29 +21,19 @@
 #include <string.h>
 
 #include <math/dag_declAlign.h>
-#include <math/dag_occlusionTest.h>
+#include <math/dag_occlusionZBuffer.h>
 
 #include <emmintrin.h>
 #include <immintrin.h>
 #include <smmintrin.h>
 
-#if OCCLUSION_BUFFER == OCCLUSION_Z_BUFFER
 #define DEPTH_VMIN _mmw_max_ps
-#elif OCCLUSION_BUFFER == OCCLUSION_WBUFFER
-#define DEPTH_VMIN _mmw_min_ps
-#elif OCCLUSION_BUFFER == OCCLUSION_INVWBUFFER
-#define DEPTH_VMIN _mmw_max_ps
-#endif
 
-#if OCCLUSION_BUFFER == OCCLUSION_WBUFFER
-#define CONVERT_MASKED_TO_DEPTH(a) v_rcp(a)
-#elif OCCLUSION_BUFFER == OCCLUSION_INVWBUFFER
 #define CONVERT_MASKED_TO_DEPTH(a) (a)
-#else
-#error unselected occlusion type
-#endif
 
 #include <3d/dag_maskedOcclusionCulling.h>
+#include <daBVH/dag_swBLAS_leaf.h>
+#include <daBVH/dag_swBLAS_soa4.h>
 #if DAGOR_DBGLEVEL > 0
 #define OCCLUSION_ASSERT assert
 #else
@@ -308,6 +298,24 @@ MaskedOcclusionCulling::CullingResult MaskedOcclusionCulling::RenderTriangles(co
   int nTris, const float *modelToClipMatrix, BackfaceWinding bfWinding, ClipPlanes clipPlaneMask)
 {
   return MOC_STATIC_DOWNCAST(this)->RenderTriangles(inVtx, inTris, nTris, modelToClipMatrix, bfWinding, clipPlaneMask);
+}
+
+MaskedOcclusionCulling::CullingResult MaskedOcclusionCulling::RenderBlasStackless(const unsigned char *blasData, int vertOffset,
+  int treeStart, int treeEnd, const float *rawToClipMatrix, uint32_t *cacheIndices, uint32_t cacheIndicesCapacity,
+  uint32_t &cacheTriCount, CacheMode cacheMode, BackfaceWinding bfWinding, ClipPlanes clipPlaneMask, uint32_t triSkip,
+  uint32_t triLimit)
+{
+  return MOC_STATIC_DOWNCAST(this)->RenderBlasStackless(blasData, vertOffset, treeStart, treeEnd, rawToClipMatrix, cacheIndices,
+    cacheIndicesCapacity, cacheTriCount, cacheMode, bfWinding, clipPlaneMask, triSkip, triLimit);
+}
+
+MaskedOcclusionCulling::CullingResult MaskedOcclusionCulling::RenderBlasSOA4(const unsigned char *blasData, int vertOffset,
+  const soa4::RootRef &root, const float *rawToClipMatrix, uint32_t *cacheIndices, uint32_t cacheIndicesCapacity,
+  uint32_t &cacheTriCount, CacheMode cacheMode, BackfaceWinding bfWinding, ClipPlanes clipPlaneMask, uint32_t triSkip,
+  uint32_t triLimit)
+{
+  return MOC_STATIC_DOWNCAST(this)->RenderBlasSOA4(blasData, vertOffset, root, rawToClipMatrix, cacheIndices, cacheIndicesCapacity,
+    cacheTriCount, cacheMode, bfWinding, clipPlaneMask, triSkip, triLimit);
 }
 
 MaskedOcclusionCulling::CullingResult MaskedOcclusionCulling::TestRect(float xmin, float ymin, float xmax, float ymax,

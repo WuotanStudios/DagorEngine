@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "netPhysSnapshots.h"
+#include "netPhysSyncState.h"
 #include "physUtils.h"
 #include <daECS/net/msgDecl.h>
 #include <daECS/net/msgSink.h>
@@ -11,7 +12,9 @@
 #include <math/dag_bits.h>
 #include "net/net.h"
 #include <daECS/net/replay.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <daECS/net/object.h>
 #include <daECS/net/network.h>
 #include <util/dag_convar.h>
@@ -25,14 +28,14 @@
 #include <stddef.h> // offsetof
 #include <supp/dag_alloca.h>
 #include <daECS/net/netbase.h>
-#include <ecs/core/utility/ecsRecreate.h>
+#include <daECS/core/utility/ecsRecreate.h>
 #include <daECS/net/msgDecl.h>
 #include <daNet/getTime.h>
 #include "net/netStat.h"
 #include "net/time.h"
 #include "net/dedicated.h" // get_server_tick_time_us
 #include "net/plosscalc.h"
-#include "net/authEvents.h"
+#include "net/authCountryCode.h"
 #include <daECS/net/recipientFilters.h>
 
 #ifdef _MSC_VER
@@ -50,10 +53,37 @@ extern StaticTab<void (*)(const net::IMessage *msg), (int)PhysType::NUM> snapsho
 static const int net_lod_zones_freq[] = {0, 0, 1, 3, 0}; // pow2-1: 100%, 100%, 50%, 25%
 static ConVarI sv_force_serializetype("net.sv_force_serialize_type", -1, -1, (int)PhysSnapSerializeType::HIDDEN, nullptr);
 
+void write_cur_time(danet::BitStream &bs, double ct)
+{
+  G_ASSERTF(ct >= 0, "%g", ct);
+  if (ct < (1 << 17)) [[likely]] // < ~36 hours
+    bs.Write(float(ct));
+  else
+  {
+    double negCurTime = -ct;              // set MSB; assume positive `ct`
+    bs.Write((char *)&negCurTime + 4, 4); // hi, assume little endian
+    bs.Write((char *)&negCurTime, 4);
+  }
+}
+
+void read_cur_time(const danet::BitStream &bs, double &ct)
+{
+  float curTime = 0.f;
+  G_VERIFY(bs.Read(curTime));
+  if (curTime >= 0) [[likely]]
+    ct = curTime;
+  else
+  {
+    uint32_t ctLo = 0;
+    G_VERIFY(bs.Read(ctLo));
+    ct = dag::bit_cast<double>(uint64_t(dag::bit_cast<uint32_t>(curTime) ^ (1u << 31)) << 32 | uint64_t(ctLo));
+  }
+}
+
 class PhysSnapshotsMsgSender
 {
 public:
-  PhysSnapshotsMsgSender(float ct) : bs(framemem_ptr()), curTime(ct) { reserveHeader(); } //-V730
+  PhysSnapshotsMsgSender(double ct) : bs(framemem_ptr()), curTime(ct) { reserveHeader(); } //-V730
   bool haveSpaceToWrite(danet::BitStream &tmpBs, int sizeLimit)
   {
     // try to fit in MTU (except first write in case if snapshot is bigger then MTU)
@@ -94,17 +124,17 @@ public:
     written = 0;
     bs.SetWriteOffset(0);
     bs.Write((uint8_t)0); // written
-    bs.Write(curTime);
+    write_cur_time(bs, curTime);
   }
 
   uint16_t written;
   bool sentSomething;
-  float curTime;
+  double curTime;
   danet::BitStream bs;
 };
 
 template <typename Callable>
-static __forceinline void base_phys_actor_eid_ecs_query(ecs::EntityId eid, Callable c);
+static __forceinline void base_phys_actor_eid_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable c);
 
 ECS_REQUIRE(ecs::Tag msg_sink)
 ECS_TAG(netClient)
@@ -117,18 +147,10 @@ static inline void net_phys_receive_snapshots_es_event_handler(const ecs::EventN
       return physreg::snapshotMsgCb[&cls - physreg::snapshotMsgCls.cbegin()](msg);
 }
 
-enum class PhysActorSyncState // Note: shall fit in 2 bits
-{
-  Normal,
-  Asleep,
-  Hidden,
-  Invalid // can't happen
-};
-
 static void send_phys_snapshots_impl(net::IConnection &conn,
   danet::BitStream &tmpBs,
   PhysSnapshotsMsgSender &unreliableSender,
-  float curTime,
+  double curTime,
   ecs::EntityId msg_sink_eid,
   dag::ConstSpan<SendRecordsTypeRange> sr_type_ranges,
   dag::ConstSpan<PhysActorSendRecord> send_records,
@@ -183,13 +205,17 @@ static void send_phys_snapshots_impl(net::IConnection &conn,
       PhysSnapSerializeType pst = plr ? PhysSnapSerializeType::FARAWAY : PhysSnapSerializeType::CLOSEST;
       bool skipUpdate = false;
       PhysActorSyncState curSyncState = ((sr.flags & PHYS_ASLEEP) == 0) ? PhysActorSyncState::Normal : PhysActorSyncState::Asleep;
+
+      PhysActorSyncState prevSyncState = read_phys_actor_sync_state(make_span_const(syncStates), sr.netPhysId, connBecameResponsive);
+      DAECS_EXT_FAST_ASSERT(prevSyncState != PhysActorSyncState::Invalid);
+
       if (vPlayerLookAt)
       {
         vec4f vpos = ((sizeof(PhysActorSendRecord) % 16) == 0 && (offsetof(PhysActorSendRecord, pos) % 16) == 0) ? v_ld(&sr.pos.x)
                                                                                                                  : v_ldu(&sr.pos.x);
         vec4f dirToActor = v_sub(vpos, *vPlayerLookAt);
         vec4f lenToEntitySq = v_length3_sq(dirToActor);
-        int zitN = __popcount(v_signmask(v_cmp_gt(lenToEntitySq, sr_range.netLodZones)));
+        int zitN = v_count_true(v_cmp_gt(lenToEntitySq, sr_range.netLodZones));
         int freqMinusOne = net_lod_zones_freq[zitN];
 
         DAECS_EXT_FAST_ASSERT(zitN <= (size_t)PhysSnapSerializeType::HIDDEN);
@@ -202,7 +228,7 @@ static void send_phys_snapshots_impl(net::IConnection &conn,
           bool should_be_min_visible = game::is_teams_friendly(plrTeam, sr.team)  // teammates are visible regardless of it's distance
                                        || (sr.flags & PHYS_ALWAYS_SEND_SHANPSHOT) // marks are visible on a huge distance
             ;
-          if (!should_be_min_visible)
+          if (!should_be_min_visible && should_query_phys_actor_min_visible(prevSyncState, send_seq_value, sr.netPhysId))
             g_entity_mgr->sendEventImmediate(sr.eid, QueryPhysSnapshotMustBeMinVisible(plrTeam, &should_be_min_visible));
           if (should_be_min_visible)
             pst = PhysSnapSerializeType::MIN;
@@ -241,23 +267,8 @@ static void send_phys_snapshots_impl(net::IConnection &conn,
         pst = (PhysSnapSerializeType)sv_force_serializetype.get();
 #endif
 
-      PhysActorSyncState prevSyncState = PhysActorSyncState::Normal;
-      static constexpr unsigned RECSPERBYTE = 4; // CHAR_BIT/2 bits
-      unsigned stByteIdx = sr.netPhysId / RECSPERBYTE;
-      // If connection became responsive - resend all reliable state changes (asleep/hidden)
-      if (uint8_t stbyte = (stByteIdx >= syncStates.size() || connBecameResponsive) ? 0 : syncStates[stByteIdx])
-      {
-        prevSyncState = PhysActorSyncState((stbyte >> (sr.netPhysId % RECSPERBYTE * 2)) % RECSPERBYTE);
-        DAECS_EXT_FAST_ASSERT(prevSyncState != PhysActorSyncState::Invalid);
-      }
-
       if (curSyncState != prevSyncState)
-      {
-        if (DAGOR_UNLIKELY(stByteIdx >= syncStates.size()))
-          syncStates.resize(stByteIdx + 1);
-        unsigned bshift = sr.netPhysId % RECSPERBYTE * 2;
-        syncStates[stByteIdx] = (syncStates[stByteIdx] & ~(0b11 << bshift)) | (unsigned(curSyncState) << bshift);
-      }
+        write_phys_actor_sync_state(syncStates, sr.netPhysId, curSyncState);
 
       if ((curSyncState == PhysActorSyncState::Normal) ? skipUpdate : (curSyncState == prevSyncState))
         continue;
@@ -265,7 +276,7 @@ static void send_phys_snapshots_impl(net::IConnection &conn,
       {
         tmpBs.ResetWritePointer();
         if (curSyncState != PhysActorSyncState::Normal)
-          tmpBs.Write(curTime);
+          write_cur_time(tmpBs, curTime);
         DAECS_EXT_ASSERT(sr.netPhysId != USHRT_MAX);
         tmpBs.WriteCompressed(sr.netPhysId);
         unsigned pstWriteOffs = tmpBs.GetWriteOffset();
@@ -296,9 +307,9 @@ static void send_phys_snapshots_impl(net::IConnection &conn,
 }
 
 template <typename Callable>
-inline void player_snapshots_ecs_query(Callable c);
+inline void player_snapshots_ecs_query(ecs::EntityManager &manager, Callable c);
 
-static void send_phys_snapshots(float curTime,
+static void send_phys_snapshots(double curTime,
   ecs::EntityId msg_sink_eid,
   dag::ConstSpan<SendRecordsTypeRange> sr_type_ranges,
   dag::ConstSpan<PhysActorSendRecord> send_records)
@@ -307,8 +318,8 @@ static void send_phys_snapshots(float curTime,
   // We serialize time instead of tick since different entities might have different timeStep (hence tick would be different too)
   PhysSnapshotsMsgSender unreliableSender(curTime);
 
-  player_snapshots_ecs_query([&](ECS_REQUIRE_NOT(ecs::Tag playerIsBot) ecs::EntityId eid, game::Player &player, int connid,
-                               int &clientNetFlags, int team = TEAM_UNASSIGNED) {
+  player_snapshots_ecs_query(*g_entity_mgr, [&](ECS_REQUIRE_NOT(ecs::Tag playerIsBot) ecs::EntityId eid, game::Player &player,
+                                              int connid, int &clientNetFlags, int team = TEAM_UNASSIGNED) {
     net::IConnection *cptr = (connid != net::INVALID_CONNECTION_ID) ? get_client_connection(connid) : nullptr;
 
     if (!cptr || !(clientNetFlags & CNF_REPLICATE_PHYS_ACTORS))
@@ -349,11 +360,13 @@ static void send_phys_snapshots(float curTime,
     send_phys_snapshots_impl(*cptr, tmpBs, unreliableSender, curTime, msg_sink_eid, sr_type_ranges, send_records);
 }
 
-extern net::CNetwork *get_net_internal();
 
-void net_send_phys_snapshots(float curTime, float /*dt*/)
+void net_send_phys_snapshots(double curTime, float /*dt*/)
 {
-  net::CNetwork *netw = is_server() ? get_net_internal() : nullptr;
+  if (!net::is_net_lifecycle_thread())
+    return;
+
+  net::CNetwork *netw = is_server() ? GET_NET() : nullptr;
   if (!netw)
     return;
 
@@ -383,7 +396,7 @@ static void report_snapshots_ploss(net::sequence_t snap_seq)
     if (const char *addr = get_server_route_host(get_current_server_route_id()))
     {
       eastl::string country_code;
-      g_entity_mgr->broadcastEventImmediate(NetAuthGetCountryCodeEvent{&country_code});
+      auth_get_country_code(*g_entity_mgr, country_code);
       statsd::profile("snapshots_rx_packet_loss_percent", plossCalc.calcPacketLoss() * 100.f, // 1 lost packet from 9*30 is 0.37%
         {{"addr", addr}, {"country", country_code.c_str()}});
     }
@@ -402,10 +415,10 @@ void net_rcv_phys_snapshots(const net::IMessage &,
   float tsDelay = get_timespeed_accumulated_delay_sec();
 
   uint8_t numMinusOne = 0;
-  float atTime = -1.f;
+  double atTime = -1.f;
   if (to_msg_sink)
     G_VERIFY(bs.Read(numMinusOne));
-  G_VERIFY(bs.Read(atTime));
+  read_cur_time(bs, atTime);
   G_ASSERT_RETURN(atTime >= 0, );
 
   char *snapBuf = (char *)((intptr_t(alloca(physreg::snapshotSizeMax + sizeof(void *))) + sizeof(void *) - 1) & ~(sizeof(void *) - 1));
@@ -435,7 +448,8 @@ void net_rcv_phys_snapshots(const net::IMessage &,
     {
       G_ASSERTF(0, "failed to deserialize snapshot for actor eid=%d/netPhysId=%d",
         (netPhysId < eids_list.size()) ? (ecs::entity_id_t)eids_list[netPhysId] : 0, netPhysId);
-      break;
+      // the bitstream offset is now unreliable; do not read the trailer fields below
+      return;
     }
   }
 

@@ -6,11 +6,10 @@
 
 #define UINT32_MINUS_ONE (0xFFFFFFFF)
 
-#define SQ_CLOSURESTREAM_HEAD (('S'<<24)|('Q'<<16)|('I'<<8)|('R'))
-#define SQ_CLOSURESTREAM_PART (('P'<<24)|('A'<<16)|('R'<<8)|('T'))
-#define SQ_CLOSURESTREAM_TAIL (('T'<<24)|('A'<<16)|('I'<<8)|('L'))
-
 struct SQSharedState;
+
+typedef SQUnsignedInteger32 SQDocStringId;
+static const SQDocStringId SQ_MAX_DOCSTRING_ID = 0xFFFFFFu;
 
 #define METAMETHODS_LIST \
     MM_IMPL(MT_ADD      ,"_add")\
@@ -190,15 +189,19 @@ struct SQObjectPtr;
     }
 struct SQObjectPtr : public SQObject
 {
-    SQObjectPtr()
+    SQObjectPtr() noexcept
     {
-        memset(this, 0, sizeof(SQObjectPtr));
-        _type=OT_NULL;
+        memset(this, 0, sizeof(SQObjectPtr)); // OT_NULL == 0
     }
     SQObjectPtr(const SQObjectPtr &__restrict o)
     {
         memcpy(this, &o, sizeof(o));
         __AddRef(_type,_unVal);
+    }
+    SQObjectPtr(SQObjectPtr &&__restrict o) noexcept
+    {
+        memcpy(this, &o, sizeof(o));
+        memset(&o, 0, sizeof(SQObjectPtr)); // OT_NULL == 0
     }
     explicit SQObjectPtr(const SQObject &__restrict o)
     {
@@ -220,10 +223,13 @@ struct SQObjectPtr : public SQObject
     _REF_TYPE_DECL(OT_FUNCPROTO,SQFunctionProto,pFunctionProto)
 
     _SCALAR_TYPE_DECL(OT_INTEGER,SQInteger,nInteger)
+#ifdef _SQ64
+    _SCALAR_TYPE_DECL(OT_INTEGER,SQInt32,nInteger)
+#endif
     _SCALAR_TYPE_DECL(OT_FLOAT,SQFloat,fFloat)
     _SCALAR_TYPE_DECL(OT_USERPOINTER,SQUserPointer,pUserPointer)
 
-    SQObjectPtr(SQVM *vm, const SQChar *str, SQInteger len = -1);
+    SQObjectPtr(SQVM *vm, const char *str, SQInteger len = -1);
 
     explicit SQObjectPtr(bool bBool)
     {
@@ -265,6 +271,15 @@ struct SQObjectPtr : public SQObject
         __Release(tOldType,unOldVal);
         return *this;
     }
+    inline SQObjectPtr& operator=(SQObjectPtr&& __restrict obj) noexcept
+    {
+        if (this != &obj) {
+            __Release(_type, _unVal);
+            memcpy(this, &obj, sizeof(SQObjectPtr));
+            memset(&obj, 0, sizeof(SQObjectPtr));  // OT_NULL == 0
+        }
+        return *this;
+    }
     inline void Null()
     {
         SQObjectType  tOldType = _type;
@@ -274,7 +289,7 @@ struct SQObjectPtr : public SQObject
         __Release(tOldType ,unOldVal);
     }
     private:
-        SQObjectPtr(const SQChar *){} //safety
+        SQObjectPtr(const char *){} //safety
 };
 
 
@@ -284,6 +299,13 @@ inline void _Swap(SQObject &a,SQObject &b)
     a = b;
     b = t;
 }
+
+SQDocStringId sq_getdocstring_id(const SQObject &obj);
+
+struct SQCollectable;
+// Counterpart to SQRELEASEHOOK: lets a native binding trace HSQOBJECTs hidden behind an
+// instance _userpointer by forwarding each to SQSharedState::MarkObject(obj, chain).
+typedef void (*SQMARKHOOK)(SQUserPointer up, SQCollectable **chain);
 
 /////////////////////////////////////////////////////////////////////////////////////
 #ifndef NO_GARBAGE_COLLECTOR
@@ -341,8 +363,8 @@ inline SQUnsignedInteger TranslateIndex(const SQObjectPtr &idx)
 
 typedef sqvector<SQObjectPtr> SQObjectPtrVec;
 typedef sqvector<SQInteger> SQIntVec;
-const SQChar *GetTypeName(const SQObject &obj1);
-const SQChar *IdType2Name(SQObjectType type);
+const char *GetTypeName(const SQObject &obj1);
+const char *IdType2Name(SQObjectType type);
 
 
 

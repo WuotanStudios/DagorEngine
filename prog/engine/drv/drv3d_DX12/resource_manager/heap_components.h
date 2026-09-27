@@ -6,16 +6,16 @@
 #include <driver.h>
 #include <pipeline.h>
 #include <resource_memory.h>
-#include <typed_bit_set.h>
 
 #include <debug/dag_log.h>
 #include <drv/3d/dag_heap.h>
-#include <EASTL/bitset.h>
 #include <EASTL/numeric.h>
+#include <EASTL/optional.h>
 #include <EASTL/variant.h>
 #include <EASTL/vector.h>
 #include <free_list_utils.h>
 #include <value_range.h>
+#include <generic/dag_expected.h>
 
 
 namespace drv3d_dx12
@@ -29,58 +29,66 @@ namespace resource_manager
 #if _TARGET_PC_WIN
 class ResourceHeapFeatureController : public BufferDescriptorProvider
 {
-  using BaseType = BufferDescriptorProvider;
-
-  struct Features
+public:
+  struct FeatureSet
   {
-    enum Bits
-    {
-      IS_UMA,
-      CAN_MIX_RESOURCES,
-      COUNT
-    };
-    using Type = eastl::bitset<Bits::COUNT>;
+    bool isUMA : 1 = false;
+    bool isCacheCoherentUMA : 1 = false;
+    bool resourceHeapTier2 : 1 = false;
+    bool hasUploadHeapsGPU : 1 = false;
   };
 
-  Features::Type features{};
+private:
+  using BaseType = BufferDescriptorProvider;
+
+  FeatureSet featureSet;
 
 protected:
+  struct SetupInfo : BaseType::SetupInfo
+  {
+    bool disableUploadHeapsGPU = false;
+  };
   void setup(const SetupInfo &info)
   {
     BaseType::setup(info);
 
+    featureSet = {};
+
     logdbg("DX12: Checking resource heap properties...");
     D3D12_FEATURE_DATA_ARCHITECTURE archInfo{};
-    if (DX12_DEBUG_FAIL(info.device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &archInfo, sizeof(archInfo))))
+    if (DX12_DEBUG_OK(info.device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &archInfo, sizeof(archInfo))))
     {
-      // assume NUMA system
-      features.reset(Features::IS_UMA);
-      logdbg("DX12: Assuming NUMA memory architecture...");
-    }
-    else
-    {
-      features.set(Features::IS_UMA, FALSE != archInfo.UMA);
-      logdbg("DX12: %s memory architecture...", archInfo.UMA ? "UMA" : "NUMA");
+      featureSet.isUMA = FALSE != archInfo.UMA;
+      featureSet.isCacheCoherentUMA = FALSE != archInfo.CacheCoherentUMA;
     }
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS featureInfo{};
-    if (DX12_DEBUG_FAIL(info.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &featureInfo, sizeof(featureInfo))))
+    if (DX12_DEBUG_OK(info.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &featureInfo, sizeof(featureInfo))))
     {
-      // assume D3D12_RESOURCE_HEAP_TIER_1
-      features.reset(Features::CAN_MIX_RESOURCES);
-      logdbg("DX12: Assuming resource heap tier 1...");
+      featureSet.resourceHeapTier2 = D3D12_RESOURCE_HEAP_TIER_2 <= featureInfo.ResourceHeapTier;
     }
-    else
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 featureInfo16{};
+    if (DX12_DEBUG_OK(info.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &featureInfo16, sizeof(featureInfo16))))
     {
-      features.set(Features::CAN_MIX_RESOURCES, D3D12_RESOURCE_HEAP_TIER_2 <= featureInfo.ResourceHeapTier);
-      logdbg("DX12: Resource heap tier %u...", static_cast<uint32_t>(featureInfo.ResourceHeapTier));
+      featureSet.hasUploadHeapsGPU = FALSE != featureInfo16.GPUUploadHeapSupported;
+    }
+
+    logdbg("DX12: resource heap properties...");
+    logdbg("DX12: featureSet.isUMA = %s...", featureSet.isUMA ? "Yes" : "No");
+    logdbg("DX12: featureSet.isCacheCoherentUMA = %s...", featureSet.isCacheCoherentUMA ? "Yes" : "No");
+    logdbg("DX12: featureSet.resourceHeapTier2 = %s...", featureSet.resourceHeapTier2 ? "Yes" : "No");
+    logdbg("DX12: featureSet.hasUploadHeapsGPU = %s...", featureSet.hasUploadHeapsGPU ? "Yes" : "No");
+    if (info.disableUploadHeapsGPU && featureSet.hasUploadHeapsGPU)
+    {
+      featureSet.hasUploadHeapsGPU = false;
+      logdbg("DX12: featureSet.hasUploadHeapsGPU has been overridden by config to No");
     }
   }
 
   // can be useful to make this available to the public
 public:
-  bool isUMASystem() const { return features.test(Features::IS_UMA); }
-  bool canMixResources() const { return features.test(Features::CAN_MIX_RESOURCES); }
+  FeatureSet getFeatureSet() const { return featureSet; }
 };
 
 class MemoryBudgetObserver : public ResourceHeapFeatureController
@@ -97,7 +105,9 @@ protected:
 
   struct SetupInfo : BaseType::SetupInfo
   {
-    DXGIAdapter *adapter;
+    DXGIAdapter *adapter = nullptr;
+    bool reportMemoryInfo = false;
+    bool reportOverBudget = true;
 
     DXGIAdapter *getAdapter() const { return adapter; }
   };
@@ -108,10 +118,10 @@ protected:
   };
 
   static constexpr uint64_t page_size = 0x10000;
-  static constexpr uint64_t static_texture_page_count = 0x400;
-  static constexpr uint64_t rtdsv_texture_page_count = 0x400;
-  static constexpr uint64_t buffer_page_count = 0x400;
-  static constexpr uint64_t upload_page_count = 0x400;
+  static constexpr uint64_t static_texture_page_count = 0x800;
+  static constexpr uint64_t rtdsv_texture_page_count = 0x800;
+  static constexpr uint64_t buffer_page_count = 0x800;
+  static constexpr uint64_t upload_page_count = 0x800;
   static constexpr uint64_t read_back_page_count = 0x100;
   static constexpr uint64_t static_texture_heap_size_scale = 2;
   static constexpr uint64_t rtdsv_texture_heap_size_scale = 2;
@@ -122,221 +132,298 @@ protected:
 
   union ResourceHeapProperties
   {
-    uint32_t raw = 0;
-    struct
+    enum class MemoryTypes : uint32_t
     {
-      uint32_t isRenderTargetOrWriteCombined : 1;
-      uint32_t isTexture : 1;
-      uint32_t isL0Pool : 1;
+      DeviceBuffer = 0,
+      DeviceRenderTarget = 1,
+      DeviceTexture = 2,
+      DeviceTextureMSAA = 3,
+      DeviceBufferHostWriteCombine = 4,
+      HostWriteBack = 5,
+      HostWriteCombine = 6,
     };
-
-    // can only be b101 as b100 is cpu visible write back and b101 is cpu visible write combined,
-    // any other bits for cpu visible is unused.
-    static constexpr uint32_t max_value = 1 << 2 | 1 << 0;
+    uint32_t raw = 0;
+    MemoryTypes type;
+    static constexpr uint32_t max_value = static_cast<uint32_t>(MemoryTypes::HostWriteCombine);
     static constexpr uint32_t group_count = max_value + 1;
     static constexpr uint32_t bits = 3;
 
-    void presetL0WriteCombine()
+    const char *typeName() const
     {
-      isL0Pool = 1;
-      isTexture = 0;
-      isRenderTargetOrWriteCombined = 1;
-    }
-
-    void presetL0WriteBack()
-    {
-      isL0Pool = 1;
-      isTexture = 0;
-      isRenderTargetOrWriteCombined = 0;
-    }
-
-    void presetL1Buffer()
-    {
-      isL0Pool = 0;
-      isTexture = 0;
-      isRenderTargetOrWriteCombined = 0;
-    }
-
-    void presetL1Texture()
-    {
-      isL0Pool = 0;
-      isTexture = 1;
-      isRenderTargetOrWriteCombined = 0;
-    }
-
-    void presetL1RenderTarget()
-    {
-      isL0Pool = 0;
-      isTexture = 0;
-      isRenderTargetOrWriteCombined = 1;
-    }
-
-    void presetL1RenderTargetMSAA()
-    {
-      isL0Pool = 0;
-      isTexture = 1;
-      isRenderTargetOrWriteCombined = 1;
-    }
-
-    void setBufferWriteCombinedCPUMemory() { presetL0WriteCombine(); }
-
-    void setBufferWriteBackCPUMemory() { presetL0WriteBack(); }
-
-    void setTextureMemory(bool is_unified, bool is_uma)
-    {
-      if (is_unified)
+      switch (type)
       {
-        if (is_uma)
-        {
-          presetL0WriteCombine();
-        }
-        else
-        {
-          presetL1Buffer();
-        }
+        case MemoryTypes::DeviceBuffer: return "DeviceBuffer";
+        case MemoryTypes::DeviceRenderTarget: return "DeviceRenderTarget";
+        case MemoryTypes::DeviceTexture: return "DeviceTexture";
+        case MemoryTypes::DeviceTextureMSAA: return "DeviceTextureMSAA";
+        case MemoryTypes::DeviceBufferHostWriteCombine: return "DeviceBufferHostWriteCombine";
+        case MemoryTypes::HostWriteBack: return "HostWriteBack";
+        case MemoryTypes::HostWriteCombine: return "HostWriteCombine";
+      }
+      return "Unknown";
+    }
+
+    void setAnyWriteCombinedGPUMemory(const FeatureSet &fs)
+    {
+      if (fs.isCacheCoherentUMA)
+      {
+        type = MemoryTypes::HostWriteBack;
+      }
+      else if (fs.isUMA)
+      {
+        type = MemoryTypes::HostWriteCombine;
       }
       else
       {
-        presetL1Texture();
+        type = MemoryTypes::DeviceBufferHostWriteCombine;
       }
     }
 
-    void setRenderTargetMemory(bool is_unified, bool is_uma)
+    void setBufferWriteCombinedCPUMemory(const FeatureSet &fs)
     {
-      if (is_unified)
+      if (fs.isCacheCoherentUMA)
       {
-        if (is_uma)
-        {
-          presetL0WriteCombine();
-        }
-        else
-        {
-          presetL1Buffer();
-        }
+        type = MemoryTypes::HostWriteBack;
       }
       else
       {
-        presetL1RenderTarget();
+        type = MemoryTypes::HostWriteCombine;
       }
     }
 
-    void setBufferMemory(bool is_uma)
+    void setBufferWriteCombinedGPUMemmory(const FeatureSet &fs)
     {
-      if (is_uma)
+      if (fs.isCacheCoherentUMA)
       {
-        presetL0WriteCombine();
+        type = MemoryTypes::HostWriteBack;
+      }
+      else if (fs.isUMA)
+      {
+        type = MemoryTypes::HostWriteCombine;
+      }
+      else if (fs.hasUploadHeapsGPU)
+      {
+        type = MemoryTypes::DeviceBufferHostWriteCombine;
       }
       else
       {
-        presetL1Buffer();
+        type = MemoryTypes::HostWriteCombine;
       }
     }
 
-    void setMSAARenderTargetMemory() { presetL1RenderTargetMSAA(); }
+    void setBufferWriteBackCPUMemory() { type = MemoryTypes::HostWriteBack; }
+
+    void setTextureMemory(const FeatureSet &fs)
+    {
+      if (fs.resourceHeapTier2)
+      {
+        setBufferMemory(fs);
+      }
+      else
+      {
+        type = MemoryTypes::DeviceTexture;
+      }
+    }
+
+    void setRenderTargetMemory(const FeatureSet &fs)
+    {
+      if (fs.resourceHeapTier2)
+      {
+        setBufferMemory(fs);
+      }
+      else
+      {
+        type = MemoryTypes::DeviceRenderTarget;
+      }
+    }
+
+    void setBufferMemory(const FeatureSet &fs)
+    {
+      if (fs.isCacheCoherentUMA)
+      {
+        type = MemoryTypes::HostWriteBack;
+      }
+      else if (fs.isUMA)
+      {
+        type = MemoryTypes::HostWriteCombine;
+      }
+      else
+      {
+        type = MemoryTypes::DeviceBuffer;
+      }
+    }
+
+    void setMSAARenderTargetMemory() { type = MemoryTypes::DeviceTextureMSAA; }
 
     constexpr D3D12_HEAP_TYPE getHeapType() const { return D3D12_HEAP_TYPE_CUSTOM; }
 
-    D3D12_CPU_PAGE_PROPERTY getCpuPageProperty(bool is_uma) const
+    D3D12_CPU_PAGE_PROPERTY getCpuPageProperty(const FeatureSet &fs) const
     {
-      if (isL0Pool && !isRenderTargetOrWriteCombined)
+      switch (type)
       {
-        return D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        case MemoryTypes::DeviceBuffer:
+          return fs.isCacheCoherentUMA ? D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+                 : fs.isUMA            ? D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
+                                       : D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+        case MemoryTypes::DeviceRenderTarget:
+        case MemoryTypes::DeviceTexture:
+        case MemoryTypes::DeviceTextureMSAA: return D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+        case MemoryTypes::DeviceBufferHostWriteCombine:
+        case MemoryTypes::HostWriteCombine:
+          return fs.isCacheCoherentUMA ? D3D12_CPU_PAGE_PROPERTY_WRITE_BACK : D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+        case MemoryTypes::HostWriteBack: return D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
       }
-      else if (isL0Pool || is_uma)
-      {
-        return D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
-      }
-      else
-      {
-        return D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
-      }
+      G_ASSERT(!"Switch bypassed");
+      return D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
     }
 
-    D3D12_MEMORY_POOL getMemoryPool(bool is_uma) const { return (isL0Pool || is_uma) ? D3D12_MEMORY_POOL_L0 : D3D12_MEMORY_POOL_L1; }
-
-    D3D12_HEAP_FLAGS getFlags(bool is_unified) const
+    // This follows the DXGI rules when on UMA system, so all memory is considered on device.
+    // On NUMA system is as expected, Device* types will be true and Host* types will be false.
+    bool isOnDevice(const FeatureSet &fs) const
     {
-      if (is_unified)
+      // UMA is always considered on device
+      if (fs.isUMA)
+      {
+        return true;
+      }
+      switch (type)
+      {
+        case MemoryTypes::DeviceBuffer:
+        case MemoryTypes::DeviceRenderTarget:
+        case MemoryTypes::DeviceTexture:
+        case MemoryTypes::DeviceTextureMSAA:
+        case MemoryTypes::DeviceBufferHostWriteCombine: return true;
+        case MemoryTypes::HostWriteBack:
+        case MemoryTypes::HostWriteCombine: return false;
+      }
+      G_ASSERT(!"Switch bypassed");
+      return false;
+    }
+
+    // This returns L0 on UMA systems, **always**.
+    // On NUMA it will return for types that are Device* L1 and for Host* L0.
+    D3D12_MEMORY_POOL getMemoryPool(const FeatureSet &fs) const
+    {
+      // This is a quirk of DXGI and DX12 differences when it comes to memory types for UMA systems.
+      // On DXGI all memory is considered "on device" (or fast access by the device), but for DX12
+      // all memory is L0, from system memory that is shared with the device. Conceptually both make
+      // sense, but together this is just dump to have 2 (with device desc is it even 3) ways of
+      // addressing the same type of memory in different ways.
+      // With that, on UMA everything is L0.
+      if (fs.isUMA)
+      {
+        return D3D12_MEMORY_POOL_L0;
+      }
+      return isOnDevice(fs) ? D3D12_MEMORY_POOL_L1 : D3D12_MEMORY_POOL_L0;
+    }
+
+    D3D12_HEAP_FLAGS getFlags(const FeatureSet &fs) const
+    {
+      if (fs.resourceHeapTier2)
       {
         return D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
       }
-      else
+      switch (type)
       {
-        if (isL0Pool)
-        {
-          return D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
-        }
-        else
-        {
-          // NOTE: that isTexture can be true here, so this **has** to be checked first.
-          if (isRenderTargetOrWriteCombined)
-          {
-            return D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
-          }
-          else if (isTexture)
-          {
-            return D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
-          }
-          else
-          {
-            return D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
-          }
-        }
+        case MemoryTypes::DeviceBuffer: return D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
+        case MemoryTypes::DeviceTexture: return D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
+        case MemoryTypes::DeviceRenderTarget:
+        case MemoryTypes::DeviceTextureMSAA: return D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
+        case MemoryTypes::DeviceBufferHostWriteCombine:
+        case MemoryTypes::HostWriteCombine:
+        case MemoryTypes::HostWriteBack: return D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
       }
+      G_ASSERT(!"Switch bypassed");
+      return D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
     }
 
     bool operator==(const ResourceHeapProperties &other) const { return raw == other.raw; }
     bool operator!=(const ResourceHeapProperties &other) const { return !(*this == other); }
 
-    bool isCPUVisible() const { return 0 != isL0Pool; }
+    bool isForTexture() const
+    {
+      switch (type)
+      {
+        case MemoryTypes::DeviceRenderTarget:
+        case MemoryTypes::DeviceTexture:
+        case MemoryTypes::DeviceTextureMSAA: return true;
+        case MemoryTypes::DeviceBuffer:
+        case MemoryTypes::DeviceBufferHostWriteCombine:
+        case MemoryTypes::HostWriteBack:
+        case MemoryTypes::HostWriteCombine: return false;
+      }
+      G_ASSERT(!"Switch bypassed");
+      return false;
+    }
+
+    bool isCPUVisible(const FeatureSet &fs) const { return getCpuPageProperty(fs) > D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE; }
+    bool isCPUCached(const FeatureSet &fs) const { return getCpuPageProperty(fs) == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK; }
 
     uint64_t getAlignment() const
     {
-      return (!isL0Pool && isRenderTargetOrWriteCombined && isTexture) ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
-                                                                       : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      return type != MemoryTypes::DeviceTextureMSAA ? D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT
+                                                    : D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
     }
 
-    bool isCompatible(const ResourceHeapProperties &other, bool is_unified, bool is_uma, bool is_uav) const
+    bool isCompatible(const ResourceHeapProperties &other, const FeatureSet &fs, bool is_uav) const
     {
-      if (getFlags(is_unified) != other.getFlags(is_unified))
-        return false; // isTexture==0 does not mean that it is a buffer heap, we have to check the flags
+      // usage flags have to match exactly
+      if (getFlags(fs) != other.getFlags(fs))
+      {
+        return false;
+      }
 
       if (getAlignment() > other.getAlignment())
+      {
         return false;
-
-      if (isRenderTargetOrWriteCombined != other.isRenderTargetOrWriteCombined)
-      {
-        // write-combined can use write-back as fallback when isTexture is false
-        if (isTexture != false)
-          return false;
-        if (getCpuPageProperty(is_uma) != D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE)
-          return false;
-        if (other.getCpuPageProperty(is_uma) != D3D12_CPU_PAGE_PROPERTY_WRITE_BACK)
-          return false;
       }
 
-      if (isTexture != other.isTexture)
+      switch (type)
       {
-        if (!is_unified)
-          return false;
+        case MemoryTypes::DeviceBuffer:
+          switch (other.type)
+          {
+            case MemoryTypes::DeviceBuffer:
+            case MemoryTypes::DeviceRenderTarget:
+            case MemoryTypes::DeviceTexture:
+            case MemoryTypes::DeviceTextureMSAA:
+            case MemoryTypes::DeviceBufferHostWriteCombine: return true;
+            case MemoryTypes::HostWriteBack:
+            case MemoryTypes::HostWriteCombine: return !is_uav;
+          }
+        case MemoryTypes::DeviceRenderTarget:
+        case MemoryTypes::DeviceTexture:
+        case MemoryTypes::DeviceTextureMSAA:
+          switch (other.type)
+          {
+            case MemoryTypes::DeviceBuffer:
+            case MemoryTypes::DeviceRenderTarget:
+            case MemoryTypes::DeviceTexture:
+            case MemoryTypes::DeviceTextureMSAA:
+            case MemoryTypes::DeviceBufferHostWriteCombine: return true;
+            case MemoryTypes::HostWriteBack:
+            case MemoryTypes::HostWriteCombine: return false;
+          }
+        case MemoryTypes::DeviceBufferHostWriteCombine:
+        case MemoryTypes::HostWriteBack:
+        case MemoryTypes::HostWriteCombine:
+          switch (other.type)
+          {
+            case MemoryTypes::DeviceBuffer:
+            case MemoryTypes::DeviceRenderTarget:
+            case MemoryTypes::DeviceTexture:
+            case MemoryTypes::DeviceTextureMSAA: return false;
+            case MemoryTypes::DeviceBufferHostWriteCombine:
+            case MemoryTypes::HostWriteBack:
+            case MemoryTypes::HostWriteCombine: return true;
+          }
       }
 
-      if (isL0Pool && !other.isL0Pool)
-        return false;
-
-      if (!isL0Pool && other.isL0Pool)
-      {
-        // for buffers that are not UAV accessible we can downgrade from L1 to L0
-        if (isTexture)
-          return false;
-        if (is_uav)
-          return false;
-      }
-
-      return true;
+      return false;
     }
   };
 
+private:
   uint64_t getPoolBudget(uint32_t pool_type) const
   {
     auto &pool = poolStates[pool_type];
@@ -352,11 +439,10 @@ protected:
     {
       return 0;
     }
-    else if (host_local_memory_pool == pool_type)
+    else if (host_local_memory_pool == pool_type || (device_local_memory_pool == pool_type && getFeatureSet().isUMA))
     {
-      uint64_t virtualTotal = heapBudgetOffset[host_local_memory_pool] < processVirtualTotal
-                                ? processVirtualTotal - heapBudgetOffset[host_local_memory_pool]
-                                : processVirtualTotal;
+      uint64_t virtualTotal =
+        heapBudgetOffset[pool_type] < processVirtualTotal ? processVirtualTotal - heapBudgetOffset[pool_type] : processVirtualTotal;
       // reduce to total 70% to account for fragmentation and other things
       virtualTotal = (virtualTotal * 7) / 10;
       return min(totalBudget - pool.CurrentUsage,
@@ -374,6 +460,7 @@ protected:
   static constexpr uint32_t host_local_memory_pool = 1;
   static constexpr uint32_t total_memory_pool_count = 2;
 
+protected:
   enum class BudgetPressureLevels
   {
     PANIC,
@@ -398,24 +485,28 @@ protected:
     }
   }
 
+private:
   MemoryPoolStatus poolStates[total_memory_pool_count]{};
   MemoryPoolStatus reportedPoolStates[total_memory_pool_count]{};
   uint64_t poolBudgetLevels[total_memory_pool_count][static_cast<uint32_t>(BudgetPressureLevels::LOW)]{};
   BudgetPressureLevels poolBudgetLevelstatus[total_memory_pool_count]{};
+  bool deviceLocalPanicTrimScheduled = false;
+  bool hostCommitPanicTrimScheduled = false;
   uint64_t processVirtualAddressUse = 0;
   uint64_t processVirtualTotal = 0;
-  enum class BehaviorBits
+  struct BehaviorStatus
   {
-    DISABLE_HOST_MEMORY_STATUS_QUERY,
-    DISABLE_DEVICE_MEMORY_STATUS_QUERY,
-    DISABLE_VIRTUAL_ADDRESS_SPACE_STATUS_QUERY,
-
-    COUNT
+    bool disableHostMemoryStatusQuery : 1 = false;
+    bool disableDeviceMemoryStatusQuery : 1 = false;
+    bool disableVirtualAddressSpaceStatusQuery : 1 = false;
+    bool printMemoryReports : 1 = false;
+    bool reportOverBudget : 1 = false;
   };
-  TypedBitSet<BehaviorBits> behaviorStatus;
+  BehaviorStatus behaviorStatus;
   // offsets are used to artificially shrink the available budget value we use for further calculations
   uint64_t heapBudgetOffset[total_memory_pool_count]{};
 
+protected:
   uint64_t getDeviceLocalRawBudget() const { return poolStates[device_local_memory_pool].Budget; }
 
   uint64_t getDeviceLocalHeapBudgetOffset() const { return heapBudgetOffset[device_local_memory_pool]; }
@@ -428,6 +519,8 @@ public:
   uint64_t getDeviceLocalBudget() const { return getPoolBudget(device_local_memory_pool); }
 
   uint64_t getDeviceLocalAvailablePoolBudget() const { return getAvailablePoolBudget(device_local_memory_pool); }
+
+  uint64_t getDeviceLocalCurrentUsage() const { return poolStates[device_local_memory_pool].CurrentUsage; }
 
   uint64_t getDeviceLocalPhysicalLimit() const { return getPhysicalLimit(device_local_memory_pool); }
 
@@ -450,6 +543,8 @@ public:
 
   uint64_t getHostLocalAvailablePoolBudget() const { return getAvailablePoolBudget(host_local_memory_pool); }
 
+  uint64_t getHostLocalCurrentUsage() const { return poolStates[host_local_memory_pool].CurrentUsage; }
+
   uint64_t getHostLocalPhysicalLimit() const { return getPhysicalLimit(host_local_memory_pool); }
 
 protected:
@@ -458,6 +553,38 @@ protected:
   uint64_t getHostLocalBudgetLimit(BudgetPressureLevels level) const
   {
     return poolBudgetLevels[host_local_memory_pool][as_uint(level)];
+  }
+
+  void recordCommittedResourceAllocated(uint32_t size, bool is_gpu)
+  {
+    if (is_gpu)
+    {
+      poolStates[device_local_memory_pool].CurrentUsage += size;
+      behaviorStatus.disableDeviceMemoryStatusQuery = false;
+    }
+    else
+    {
+      poolStates[host_local_memory_pool].CurrentUsage += size;
+      behaviorStatus.disableHostMemoryStatusQuery = false;
+    }
+
+    updateBudgetLevelStatus();
+  }
+
+  void recordCommittedResourceFreed(uint32_t size, bool is_gpu)
+  {
+    if (is_gpu)
+    {
+      poolStates[device_local_memory_pool].CurrentUsage -= size;
+      behaviorStatus.disableDeviceMemoryStatusQuery = false;
+    }
+    else
+    {
+      poolStates[host_local_memory_pool].CurrentUsage -= size;
+      behaviorStatus.disableHostMemoryStatusQuery = false;
+    }
+
+    updateBudgetLevelStatus();
   }
 
   // updates done to CurrentUsage are later overwritten by an update of the structures by completeFrameExecution
@@ -469,12 +596,12 @@ protected:
     if (is_gpu)
     {
       poolStates[device_local_memory_pool].CurrentUsage += size;
-      behaviorStatus.reset(BehaviorBits::DISABLE_DEVICE_MEMORY_STATUS_QUERY);
+      behaviorStatus.disableDeviceMemoryStatusQuery = false;
     }
     else
     {
       poolStates[host_local_memory_pool].CurrentUsage += size;
-      behaviorStatus.reset(BehaviorBits::DISABLE_HOST_MEMORY_STATUS_QUERY);
+      behaviorStatus.disableHostMemoryStatusQuery = false;
     }
 
     updateBudgetLevelStatus();
@@ -486,12 +613,12 @@ protected:
     if (is_gpu)
     {
       poolStates[device_local_memory_pool].CurrentUsage -= size;
-      behaviorStatus.reset(BehaviorBits::DISABLE_DEVICE_MEMORY_STATUS_QUERY);
+      behaviorStatus.disableDeviceMemoryStatusQuery = false;
     }
     else
     {
       poolStates[host_local_memory_pool].CurrentUsage -= size;
-      behaviorStatus.reset(BehaviorBits::DISABLE_HOST_MEMORY_STATUS_QUERY);
+      behaviorStatus.disableHostMemoryStatusQuery = false;
     }
 
     updateBudgetLevelStatus();
@@ -502,7 +629,7 @@ protected:
   {
     BaseType::recordRaytraceAccelerationStructurePoolAllocated(size);
     poolStates[device_local_memory_pool].CurrentUsage += size;
-    behaviorStatus.reset(BehaviorBits::DISABLE_DEVICE_MEMORY_STATUS_QUERY);
+    behaviorStatus.disableDeviceMemoryStatusQuery = false;
   }
 
   // pools are using committed resources so they are bypassing heaps, so we need to count them against the usage too
@@ -510,36 +637,40 @@ protected:
   {
     BaseType::recordRaytraceAccelerationStructurePoolFreed(size);
     poolStates[device_local_memory_pool].CurrentUsage -= size;
-    behaviorStatus.reset(BehaviorBits::DISABLE_DEVICE_MEMORY_STATUS_QUERY);
+    behaviorStatus.disableDeviceMemoryStatusQuery = false;
   }
 
   void setup(const SetupInfo &info);
 
-  bool shouldTrimFramePushRingBuffer() const { return getHostLocalBudgetLevel() < BudgetPressureLevels::HIGH; }
-
-  bool shouldTrimUploadRingBuffer() const { return getHostLocalBudgetLevel() < BudgetPressureLevels::HIGH; }
+  bool shouldTrimFramePushRingBuffer() const
+  {
+    auto level = getFeatureSet().isUMA ? getDeviceLocalBudgetLevel() : getHostLocalBudgetLevel();
+    return level < BudgetPressureLevels::HIGH;
+  }
 
   // Checks current memory status of the system and updates the behavior of the memory manager depending on
   // the memory usage pressure.
   void completeFrameExecution(const CompletedFrameExecutionInfo &info, PendingForCompletedFrameData &data);
 
-  enum class AllocationFlag
+  struct AllocationFlags
   {
-    DEDICATED_HEAP,
-    DISALLOW_LOCKED_RANGES,
-    EXISTING_HEAPS_ONLY,
-    NEW_HEAPS_ONLY_WITH_BUDGET,
-    DEFRAGMENTATION_OPERATION,
-    DISABLE_ALTERNATE_HEAPS,
-    IS_UAV,
-    IS_RTV,
+    bool dedicatedHeap : 1 = false;
+    bool disallowLockedRanges : 1 = false;
+    bool existingHeapsOnly : 1 = false;
+    bool defragmentationOperation : 1 = false;
+    bool disableAlternateHeaps : 1 = false;
+    bool isUav : 1 = false;
+    bool isRtv : 1 = false;
 
-    COUNT
+    uint32_t toUlong() const
+    {
+      return (dedicatedHeap ? 1u : 0u) | (disallowLockedRanges ? 2u : 0u) | (existingHeapsOnly ? 4u : 0u) |
+             (defragmentationOperation ? 8u : 0u) | (disableAlternateHeaps ? 16u : 0u) | (isUav ? 32u : 0u) | (isRtv ? 64u : 0u);
+    }
   };
 
-  using AllocationFlags = TypedBitSet<AllocationFlag>;
-
   uint64_t getHeapSizeFromAllocationSize(uint64_t size, ResourceHeapProperties properties, AllocationFlags flags);
+  MemoryAllocationError makeMemoryAllocationError(HRESULT error_code, uint64_t size, ResourceHeapProperties properties);
 };
 #else
 #include "resource_manager/heap_components_xbox.inl.h"
@@ -555,14 +686,6 @@ protected:
     uint32_t index;
   };
   struct ScratchBufferReference
-  {
-    ID3D12Resource *buffer;
-  };
-  struct PushRingBufferReference
-  {
-    ID3D12Resource *buffer;
-  };
-  struct UploadRingBufferReference
   {
     ID3D12Resource *buffer;
   };
@@ -582,9 +705,9 @@ protected:
   {
     ID3D12Resource *buffer;
   };
-  using AnyResourceReference = eastl::variant<eastl::monostate, Image *, BufferGlobalId, AliasHeapReference, ScratchBufferReference,
-    PushRingBufferReference, UploadRingBufferReference, TempUploadBufferReference, PersistentUploadBufferReference,
-    PersistentReadBackBufferReference, PersistentBidirectionalBufferReference>;
+  using AnyResourceReference =
+    eastl::variant<eastl::monostate, Image *, BufferGlobalId, AliasHeapReference, ScratchBufferReference, TempUploadBufferReference,
+      PersistentUploadBufferReference, PersistentReadBackBufferReference, PersistentBidirectionalBufferReference>;
   struct HeapResourceInfo
   {
     ValueRange<uint64_t> range;
@@ -594,7 +717,122 @@ protected:
     HeapResourceInfo(const HeapResourceInfo &) = default;
     HeapResourceInfo(ValueRange<uint64_t> r) : range{r} {}
   };
-  struct BasicResourceHeap
+
+  class ResourceTypesBreakdownTracker
+  {
+  private:
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+    uint64_t bufferSize = 0;
+    uint64_t rtvSize = 0;
+    uint64_t uavSize = 0;
+    uint64_t otherImageSize = 0;
+    uint64_t aliasSize = 0;
+    uint64_t otherSize = 0;
+    eastl::optional<D3D12_RESIDENCY_PRIORITY> priorityToUpdate;
+
+    D3D12_RESIDENCY_PRIORITY calculateResidencyPriority() const
+    {
+      const uint64_t totalTracked = bufferSize + rtvSize + uavSize + otherImageSize + aliasSize + otherSize;
+      if (totalTracked == 0)
+        return D3D12_RESIDENCY_PRIORITY_LOW;
+
+      constexpr uint64_t buffersPriority = D3D12_RESIDENCY_PRIORITY_NORMAL + 0x00100000ull;
+      constexpr uint64_t uavPriority = D3D12_RESIDENCY_PRIORITY_HIGH + 0x00200000ull;
+      constexpr uint64_t rtvPriority = D3D12_RESIDENCY_PRIORITY_HIGH + 0x00300000ull;
+      constexpr uint64_t aliasPriority = D3D12_RESIDENCY_PRIORITY_HIGH + 0x00400000ull;
+
+      const bool hasAlias = aliasSize > 0;
+      const bool hasRtv = rtvSize > 0;
+      const bool hasUav = uavSize > 0;
+      const bool hasBuffers = bufferSize > 0;
+      const bool hasOtherImages = otherImageSize > 0;
+
+      if (!hasAlias && !hasRtv && !hasUav && !hasBuffers && !hasOtherImages)
+        return D3D12_RESIDENCY_PRIORITY_NORMAL;
+
+      uint64_t base = buffersPriority;
+      uint64_t bucketSize = bufferSize;
+      if (hasUav)
+      {
+        base = uavPriority;
+        bucketSize = uavSize;
+      }
+      if (hasRtv)
+      {
+        base = rtvPriority;
+        bucketSize = rtvSize;
+      }
+      if (hasAlias)
+      {
+        base = aliasPriority;
+        bucketSize = aliasSize;
+      }
+
+      constexpr uint64_t tenMb = 10ull * 1024ull * 1024ull;
+      const uint64_t div = bucketSize / tenMb;
+      const uint64_t sizeCode = eastl::min<uint64_t>(div, 0xFFFFull);
+
+      const uint32_t priorityValue = base + sizeCode;
+      return static_cast<D3D12_RESIDENCY_PRIORITY>(priorityValue);
+    }
+
+    void updateCategorySize(const AnyResourceReference &ref, int64_t size_delta)
+    {
+      if (eastl::holds_alternative<eastl::monostate>(ref))
+        return;
+
+      if (eastl::holds_alternative<BufferGlobalId>(ref))
+        bufferSize += size_delta;
+      else if (eastl::holds_alternative<Image *>(ref))
+      {
+        Image *const *ptr = eastl::get_if<Image *>(&ref);
+        G_ASSERT(ptr);
+        Image *image = *ptr;
+        const auto desc = image->getHandle()->GetDesc();
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+          rtvSize += size_delta;
+        else if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+          uavSize += size_delta;
+        else
+          otherImageSize += size_delta;
+      }
+      else if (eastl::holds_alternative<AliasHeapReference>(ref))
+        aliasSize += size_delta;
+      else
+        otherSize += size_delta;
+    }
+
+    void onAlloc(const AnyResourceReference &ref, uint64_t size) { updateCategorySize(ref, static_cast<int64_t>(size)); }
+
+    void onFree(const AnyResourceReference &ref, uint64_t size) { updateCategorySize(ref, -static_cast<int64_t>(size)); }
+#endif
+
+  public:
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+    const eastl::optional<D3D12_RESIDENCY_PRIORITY> &getResidencyPriority() const { return priorityToUpdate; }
+#endif
+
+    void updateResourceTypesOnFree([[maybe_unused]] const AnyResourceReference &ref, [[maybe_unused]] uint64_t size)
+    {
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+      onFree(ref, size);
+      priorityToUpdate = calculateResidencyPriority();
+#endif
+    }
+
+    void updateResourceTypesOnUpdate([[maybe_unused]] const AnyResourceReference &old_ref,
+      [[maybe_unused]] const AnyResourceReference &new_ref, [[maybe_unused]] uint64_t size)
+    {
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+      onFree(old_ref, size);
+      onAlloc(new_ref, size);
+      priorityToUpdate = calculateResidencyPriority();
+#endif
+    }
+  };
+
+
+  struct BasicResourceHeap : ResourceTypesBreakdownTracker
   {
     using FreeRangeSetType = dag::Vector<ValueRange<uint64_t>>;
     using UsedRangeSetType = dag::Vector<HeapResourceInfo>;
@@ -656,6 +894,7 @@ protected:
       G_ASSERT(rangeRef != end(usedRanges) && rangeRef->range == range);
       if (rangeRef != end(usedRanges) && rangeRef->range == range)
       {
+        updateResourceTypesOnFree(rangeRef->resource, rangeRef->range.size());
         usedRanges.erase(rangeRef);
       }
       free_list_insert_and_coalesce(freeRanges, range);
@@ -670,6 +909,7 @@ protected:
       G_ASSERT(rangeRef != end(usedRanges) && rangeRef->range == range);
       if (rangeRef != end(usedRanges) && rangeRef->range == range)
       {
+        updateResourceTypesOnUpdate(rangeRef->resource, ref, rangeRef->range.size());
         rangeRef->resource = eastl::forward<T>(ref);
       }
     }
@@ -735,7 +975,10 @@ protected:
 
     bool isValidRange(FreeRangeSetType::iterator selected) { return end(freeRanges) != selected; }
 
-    ValueRange<uint64_t> allocateFromRange(const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, FreeRangeSetType::iterator selected)
+    /// Empty when the selected free range can not hold the request after alignment. Callers that
+    /// picked the range themselves have to decide whether that is a normal miss or a planning bug.
+    eastl::optional<ValueRange<uint64_t>> allocateFromRange(const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info,
+      FreeRangeSetType::iterator selected)
     {
       G_ASSERT(isValidRange(selected));
 
@@ -787,6 +1030,9 @@ protected:
     uint64_t freeMemorySize = 0;
     uint32_t generation = 0;
     uint32_t defragmentationGeneration = 0;
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+    uint32_t updatePrioritiesGeneration = 0;
+#endif
 
     void reset()
     {
@@ -815,12 +1061,7 @@ protected:
   void addHeapGroupFreeSpace(uint32_t heap_group, uint64_t size) { heapGroupExtraData[heap_group].freeMemorySize += size; }
   void subtractHeapGroupFreeSpace(uint32_t heap_group, uint64_t size) { heapGroupExtraData[heap_group].freeMemorySize -= size; }
 
-  void updateHeapGroupGeneration(uint32_t heap_group, bool update_defragmentation)
-  {
-    ++heapGroupExtraData[heap_group].generation;
-    if (update_defragmentation)
-      ++heapGroupExtraData[heap_group].defragmentationGeneration;
-  }
+  void updateHeapGroupGeneration(uint32_t heap_group) { ++heapGroupExtraData[heap_group].generation; }
   uint32_t getHeapGroupGeneration(uint32_t heap_group) const { return heapGroupExtraData[heap_group].generation; }
   bool checkDefragmentationGeneration(uint32_t heap_group) const
   {
@@ -832,6 +1073,19 @@ protected:
     auto &extraData = heapGroupExtraData[heap_group];
     extraData.defragmentationGeneration = extraData.generation;
   }
+
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+  uint32_t getHeapGroupPrioritiesUpdateGeneration(uint32_t heap_group) const
+  {
+    return heapGroupExtraData[heap_group].updatePrioritiesGeneration;
+  }
+
+  void setHeapGroupPrioritiesUpdateGeneration(uint32_t heap_group)
+  {
+    auto &extraData = heapGroupExtraData[heap_group];
+    extraData.updatePrioritiesGeneration = extraData.generation;
+  }
+#endif
 
   // Helper to iterate over free and used range in order of offset into the heap
   // Usage: for(BasicResourceHeapRangesIterator it{heap}; it; ++it) {<do stuff with it>}
@@ -938,6 +1192,8 @@ protected:
     props.raw = id.group;
     return props;
   }
+
+  using ResourceMemoryAllocationResult = dag::Expected<ResourceMemory, MemoryAllocationError>;
 };
 
 #if _TARGET_XBOX
@@ -977,11 +1233,15 @@ protected:
       freeRange(range);
     }
 
-    ResourceMemory allocate(const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, HeapID heap_id, FreeRangeSetType::iterator selected)
+    eastl::optional<ResourceMemory> allocate(const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, HeapID heap_id,
+      FreeRangeSetType::iterator selected)
     {
       auto range = allocateFromRange(alloc_info, selected);
-      G_ASSERT(!range.empty());
-      return {heap.get() + range.front(), range.size(), heap_id};
+      if (!range)
+      {
+        return {};
+      }
+      return ResourceMemory{heap.get() + range->front(), range->size(), heap_id};
     }
   };
 
@@ -1001,15 +1261,15 @@ protected:
         totalSize.name(), freeSize.units(), freeSize.name());
     }
 
-    void visitHeapGroup(uint32_t ident, size_t count, bool is_cpu_visible, bool is_cpu_cached, bool is_gpu_executable)
+    void visitHeapGroup(uint32_t ident, size_t count, bool is_gpu, bool is_cpu_visible, bool is_cpu_cached, bool is_gpu_executable)
     {
-      logdbg("DX12: Heap Group %08X (%s, %s%s) with %d heaps", ident, is_cpu_visible ? "CPU visible" : "dedicated GPU",
+      logdbg("DX12: Heap Group %08X (%s, %s%s) with %d heaps", ident, is_gpu ? "GPU" : "CPU",
         is_cpu_visible ? is_cpu_cached ? "CPU cached, " : "CPU write combine, " : "",
         is_gpu_executable ? "GPU executable" : "Not GPU executable", count);
       totalHeapCount += count;
     }
 
-    void visitHeap(ByteUnits total_size, ByteUnits free_size, uint32_t fragmentation_percent, uintptr_t)
+    void visitHeap(ByteUnits total_size, ByteUnits free_size, uint32_t fragmentation_percent, uintptr_t, uint32_t)
     {
       totalSize += total_size;
       freeSize += free_size;
@@ -1033,13 +1293,20 @@ protected:
 public:
   static D3D12_RESOURCE_STATES propertiesToInitialState(D3D12_RESOURCE_DIMENSION dim, D3D12_RESOURCE_FLAGS flags,
     DeviceMemoryClass memory_class);
-  static ResourceHeapProperties getProperties(D3D12_RESOURCE_FLAGS flags, DeviceMemoryClass memory_class, uint64_t aligment);
+  static ResourceHeapProperties getProperties(D3D12_RESOURCE_FLAGS flags, DeviceMemoryClass memory_class, uint64_t alignment);
   static ResourceHeapProperties getPropertiesFromMemory(ResourceMemory memory)
   {
     ResourceHeapProperties p;
     p.raw = memory.getHeapID().group;
     return p;
   }
+
+  void updateMemoryRangeUseNoLock(ResourceMemory mem, Image *texture)
+  {
+    auto &heap = groups[mem.getHeapID().group][mem.getHeapID().index];
+    heap.updateMemoryRangeUse(make_value_range(heap.calculateOffset(mem), mem.size()), texture);
+  }
+
   void updateMemoryRangeUse(ResourceMemory mem, Image *texture)
   {
     auto heapID = mem.getHeapID();
@@ -1048,12 +1315,16 @@ public:
       return;
     }
 
-    auto &group = groups[heapID.group];
-
     OSSpinlockScopedLock lock{heapGroupMutex};
-    auto &heap = group[heapID.index];
-    heap.updateMemoryRangeUse(make_value_range(heap.calculateOffset(mem), mem.size()), texture);
+    updateMemoryRangeUseNoLock(mem, texture);
   }
+
+  void updateMemoryRangeUseNoLock(ResourceMemory mem, BufferGlobalId buffer_id)
+  {
+    auto &heap = groups[mem.getHeapID().group][mem.getHeapID().index];
+    heap.updateMemoryRangeUse(make_value_range(heap.calculateOffset(mem), mem.size()), buffer_id);
+  }
+
   void updateMemoryRangeUse(ResourceMemory mem, BufferGlobalId buffer_id)
   {
     auto heapID = mem.getHeapID();
@@ -1062,19 +1333,22 @@ public:
       return;
     }
 
-    auto &group = groups[heapID.group];
-
     OSSpinlockScopedLock lock{heapGroupMutex};
-    auto &heap = group[heapID.index];
-    heap.updateMemoryRangeUse(make_value_range(heap.calculateOffset(mem), mem.size()), buffer_id);
+    updateMemoryRangeUseNoLock(mem, buffer_id);
   }
+
+  template <typename T>
+  void updateMemoryRangeUseNoLock(ResourceMemory mem, T &&ref)
+  {
+    auto &heap = groups[mem.getHeapID().group][mem.getHeapID().index];
+    heap.updateMemoryRangeUse(make_value_range(heap.calculateOffset(mem), mem.size()), eastl::forward<T>(ref));
+  }
+
   template <typename T>
   void updateMemoryRangeUse(ResourceMemory mem, T &&ref)
   {
-    auto heapID = mem.getHeapID();
-    auto &group = groups[heapID.group];
-
 #if _TARGET_XBOXONE
+    auto heapID = mem.getHeapID();
     auto properties = getHeapProperties(heapID);
     if (properties.isESRAM)
     {
@@ -1083,8 +1357,7 @@ public:
 #endif
 
     OSSpinlockScopedLock lock{heapGroupMutex};
-    auto &heap = group[heapID.index];
-    heap.updateMemoryRangeUse(make_value_range(heap.calculateOffset(mem), mem.size()), eastl::forward<T>(ref));
+    updateMemoryRangeUseNoLock(mem, eastl::forward<T>(ref));
   }
 
 protected:
@@ -1097,9 +1370,14 @@ public:
 
   bool preAllocateHeap(ResourceHeapProperties properties, size_t heap_size);
 
-  ResourceMemory allocate(DXGIAdapter *adapter, ID3D12Device *device, ResourceHeapProperties props,
-    const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, AllocationFlags flags, HRESULT *pErrorCode = nullptr);
-  void free(ResourceMemory allocation, bool update_defragmentation_generation);
+  ResourceMemoryAllocationResult allocate(DXGIAdapter *adapter, ID3D12Device *device, ResourceHeapProperties props,
+    const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, AllocationFlags flags);
+  /// Allocates from a free range that the caller has already selected, so a failure to fit means
+  /// the caller and the heap disagree; it is reported as E_INVALIDARG, not as an allocation failure.
+  ResourceMemoryAllocationResult allocateMemoryInPlace(HeapID heap_id, uint32_t free_range_index,
+    const D3D12_RESOURCE_ALLOCATION_INFO &allocInfo);
+  void free(ResourceMemory allocation);
+  void freeNoLock(ResourceMemory allocation, bool is_heap_deletion_allowed);
 
   template <typename T>
   void visitHeaps(T clb)
@@ -1110,7 +1388,7 @@ public:
     for (properties.raw = 0; properties.raw < groups.size(); ++properties.raw)
     {
       auto &group = groups[properties.raw];
-      clb.visitHeapGroup(properties.raw, group.size(), true, 0 != properties.isCPUCoherent, 0 != properties.isGPUExecutable);
+      clb.visitHeapGroup(properties.raw, group.size(), true, true, 0 != properties.isCPUCoherent, 0 != properties.isGPUExecutable);
       for (auto &heap : group)
       {
         uint64_t freeSize = 0;
@@ -1118,7 +1396,7 @@ public:
         {
           freeSize += r.size();
         }
-        clb.visitHeap(heap.totalSize, freeSize, free_list_calculate_fragmentation(heap.freeRanges), (uintptr_t)heap.heapPointer());
+        clb.visitHeap(heap.totalSize, freeSize, free_list_calculate_fragmentation(heap.freeRanges), (uintptr_t)heap.heapPointer(), 0);
         // we going to visit used and free ranges in order of offset, each set of ranges is sorted so
         // a simple compare of each position in the set will tell which one is next
         auto usedPos = begin(heap.usedRanges);
@@ -1157,8 +1435,8 @@ public:
   }
 
 private:
-  ResourceMemory tryAllocateFromMemoryWithProperties(ResourceHeapProperties heap_properties,
-    const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, AllocationFlags flags, HRESULT *pErrorCode);
+  ResourceMemoryAllocationResult tryAllocateFromMemoryWithProperties(ResourceHeapProperties heap_properties,
+    const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, AllocationFlags flags);
 };
 #else
 class ResourceMemoryHeapProvider : public ResourceMemoryHeapBase
@@ -1180,7 +1458,7 @@ protected:
     bool isPartOf(ResourceMemory mem) const { return mem.getHeap() == heap.Get(); }
 
     // only valid if isPartOf(mem) is true
-    uint32_t calculateOffset(ResourceMemory mem) const { return mem.getRange().front(); }
+    uint64_t calculateOffset(ResourceMemory mem) const { return mem.getRange().front(); }
 
     ID3D12Heap *heapPointer() const { return heap.Get(); }
 
@@ -1188,11 +1466,15 @@ protected:
 
     void free(ResourceMemory mem) { freeRange(mem.getRange()); }
 
-    ResourceMemory allocate(const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, HeapID heap_id, FreeRangeSetType::iterator selected)
+    eastl::optional<ResourceMemory> allocate(const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, HeapID heap_id,
+      FreeRangeSetType::iterator selected)
     {
       auto range = allocateFromRange(alloc_info, selected);
-      G_ASSERT(!range.empty());
-      return {heap.Get(), range, heap_id};
+      if (!range)
+      {
+        return {};
+      }
+      return ResourceMemory{heap.Get(), *range, heap_id};
     }
   };
 
@@ -1201,13 +1483,20 @@ protected:
 public:
   static D3D12_RESOURCE_STATES propertiesToInitialState(D3D12_RESOURCE_DIMENSION dim, D3D12_RESOURCE_FLAGS flags,
     DeviceMemoryClass memory_class);
-  ResourceHeapProperties getProperties(D3D12_RESOURCE_FLAGS flags, DeviceMemoryClass memory_class, uint64_t aligment);
+  ResourceHeapProperties getProperties(D3D12_RESOURCE_FLAGS flags, DeviceMemoryClass memory_class, uint64_t alignment);
   static ResourceHeapProperties getPropertiesFromMemory(ResourceMemory memory)
   {
     ResourceHeapProperties p;
     p.raw = memory.getHeapID().group;
     return p;
   }
+
+  void updateMemoryRangeUseNoLock(ResourceMemory mem, Image *texture)
+  {
+    auto &heap = groups[mem.getHeapID().group][mem.getHeapID().index];
+    heap.updateMemoryRangeUse(mem.getRange(), texture);
+  }
+
   void updateMemoryRangeUse(ResourceMemory mem, Image *texture)
   {
     auto heapID = mem.getHeapID();
@@ -1216,12 +1505,16 @@ public:
       return;
     }
 
-    auto &group = groups[heapID.group];
-
     OSSpinlockScopedLock lock{heapGroupMutex};
-    auto &heap = group[heapID.index];
-    heap.updateMemoryRangeUse(mem.getRange(), texture);
+    updateMemoryRangeUseNoLock(mem, texture);
   }
+
+  void updateMemoryRangeUseNoLock(ResourceMemory mem, BufferGlobalId buffer_id)
+  {
+    auto &heap = groups[mem.getHeapID().group][mem.getHeapID().index];
+    heap.updateMemoryRangeUse(mem.getRange(), buffer_id);
+  }
+
   void updateMemoryRangeUse(ResourceMemory mem, BufferGlobalId buffer_id)
   {
     auto heapID = mem.getHeapID();
@@ -1230,33 +1523,104 @@ public:
       return;
     }
 
-    auto &group = groups[heapID.group];
-
     OSSpinlockScopedLock lock{heapGroupMutex};
-    auto &heap = group[heapID.index];
-    heap.updateMemoryRangeUse(mem.getRange(), buffer_id);
+    updateMemoryRangeUseNoLock(mem, buffer_id);
   }
-  template <typename T>
-  void updateMemoryRangeUse(ResourceMemory mem, T &&ref)
-  {
-    auto heapID = mem.getHeapID();
-    auto &group = groups[heapID.group];
 
-    OSSpinlockScopedLock lock{heapGroupMutex};
-    auto &heap = group[heapID.index];
+
+  template <typename T>
+  void updateMemoryRangeUseNoLock(ResourceMemory mem, T &&ref)
+  {
+    auto &heap = groups[mem.getHeapID().group][mem.getHeapID().index];
     heap.updateMemoryRangeUse(mem.getRange(), eastl::forward<T>(ref));
   }
 
+  template <typename T>
+  void updateMemoryRangeUse(ResourceMemory mem, T &&ref)
+  {
+    OSSpinlockScopedLock lock{heapGroupMutex};
+    updateMemoryRangeUseNoLock(mem, eastl::forward<T>(ref));
+  }
+
 protected:
+  struct GPUHeapMemoryMappingConfig
+  {
+    bool mapRenderTargetTextureMSAAMemory : 1 = false;
+    bool mapRenderTargetTextureMemory : 1 = false;
+    bool mapTextureMemory : 1 = false;
+    bool mapDeviceResidentBufferMemory : 1 = false;
+    bool mapHostResidentHostReadOnlyBufferMemory : 1 = false;
+    bool mapHostResidentHostReadWriteBufferMemory : 1 = false;
+    bool mapReadBackBufferMemory : 1 = false;
+    bool mapBidirectionalBufferMemory : 1 = false;
+    bool mapTemporaryUploadBufferMemory : 1 = false;
+    bool mapHostResidentHostWriteOnlyBufferMemory : 1 = false;
+    bool mapPushRingBufferMemory : 1 = false;
+    bool mapDeviceResidentHostWriteOnlyBufferMemory : 1 = false;
+  };
+  struct SetupInfo : BaseType::SetupInfo
+  {
+    GPUHeapMemoryMappingConfig gpuHeapMemoryMappingConfig;
+  };
+  void setup(const SetupInfo &info)
+  {
+    gpuHeapMemoryMappingConfig = info.gpuHeapMemoryMappingConfig;
+    BaseType::setup(info);
+  }
   void shutdown();
   void preRecovery();
 
+  GPUHeapMemoryMappingConfig gpuHeapMemoryMappingConfig{};
+
 public:
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+  struct CompletedFrameRecordingInfo : BaseType::CompletedFrameRecordingInfo
+  {
+    D3DDevice *device = nullptr;
+  };
+#endif
+
+  void completeFrameRecording(const CompletedFrameRecordingInfo &info)
+  {
+    BaseType::completeFrameRecording(info);
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+    OSSpinlockScopedLock lock{heapGroupMutex};
+    for (ResourceHeapProperties props = {.raw = 0}; props.raw < ResourceHeapProperties::group_count; props.raw++)
+    {
+      if (props.getMemoryPool(getFeatureSet()) != D3D12_MEMORY_POOL_L1)
+        continue;
+      if (getHeapGroupGeneration(props.raw) == getHeapGroupPrioritiesUpdateGeneration(props.raw))
+        continue;
+      for (auto &heap : groups[props.raw])
+      {
+        if (const auto &priority = heap.getResidencyPriority())
+        {
+          prioritiesToSet.push_back(*priority);
+          resourcesToSetPriorities.push_back(heap.heapPointer());
+        }
+      }
+    }
+    G_ASSERT(resourcesToSetPriorities.size() == prioritiesToSet.size());
+    if (!resourcesToSetPriorities.empty())
+    {
+      DX12_CHECK_RESULT(
+        info.device->SetResidencyPriority(prioritiesToSet.size(), resourcesToSetPriorities.data(), prioritiesToSet.data()));
+      prioritiesToSet.clear();
+      resourcesToSetPriorities.clear();
+    }
+#endif
+  }
+
   static D3D12_RESOURCE_STATES getInitialTextureResourceState(D3D12_RESOURCE_FLAGS flags);
 
-  ResourceMemory allocate(DXGIAdapter *adapter, ID3D12Device *device, ResourceHeapProperties props,
-    const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, AllocationFlags flags, HRESULT *pErrorCode = nullptr);
-  void free(ResourceMemory allocation, bool update_defragmentation_generation);
+  ResourceMemoryAllocationResult allocate(DXGIAdapter *adapter, ID3D12Device *device, ResourceHeapProperties props,
+    const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, AllocationFlags flags);
+  /// Allocates from a free range that the caller has already selected, so a failure to fit means
+  /// the caller and the heap disagree; it is reported as E_INVALIDARG, not as an allocation failure.
+  ResourceMemoryAllocationResult allocateMemoryInPlace(HeapID heap_id, uint32_t free_range_index,
+    const D3D12_RESOURCE_ALLOCATION_INFO &allocInfo);
+  void free(ResourceMemory allocation);
+  void freeNoLock(ResourceMemory allocation, bool is_heap_deletion_allowed);
 
   template <typename T>
   void visitHeaps(T clb)
@@ -1267,17 +1631,19 @@ public:
     for (props.raw = 0; props.raw < groups.size(); ++props.raw)
     {
       auto &group = groups[props.raw];
-      clb.visitHeapGroup(props.raw, group.size(), props.isCPUVisible(),
-        props.getCpuPageProperty(isUMASystem()) == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, true);
+      clb.visitHeapGroup(props.raw, group.size(), props.isOnDevice(getFeatureSet()), props.isCPUVisible(getFeatureSet()),
+        props.isCPUCached(getFeatureSet()), true);
       for (auto &heap : group)
       {
-        uint64_t freeSize = 0;
-        for (auto r : heap.freeRanges)
-        {
-          freeSize += r.size();
-        }
+        uint64_t freeSize = heap.freeSize();
 
-        clb.visitHeap(heap.totalSize, freeSize, free_list_calculate_fragmentation(heap.freeRanges), (uintptr_t)heap.heapPointer());
+        uint32_t residencyPriority = 0;
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+        if (const auto priority = heap.getResidencyPriority())
+          residencyPriority = static_cast<uint32_t>(*priority);
+#endif
+        clb.visitHeap(heap.totalSize, freeSize, free_list_calculate_fragmentation(heap.freeRanges), (uintptr_t)heap.heapPointer(),
+          residencyPriority);
         // we going to visit used and free ranges in order of offset, each set of ranges is sorted so
         // a simple compare of each position in the set will tell which one is next
         auto usedPos = begin(heap.usedRanges);
@@ -1316,8 +1682,13 @@ public:
   }
 
 private:
-  ResourceMemory tryAllocateFromMemoryWithProperties(ID3D12Device *device, ResourceHeapProperties heap_properties,
-    AllocationFlags flags, const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info, HRESULT *error_code);
+  ResourceMemoryAllocationResult tryAllocateFromMemoryWithProperties(ID3D12Device *device, ResourceHeapProperties heap_properties,
+    AllocationFlags flags, const D3D12_RESOURCE_ALLOCATION_INFO &alloc_info);
+
+#if DX12_SET_HEAP_RESIDENCY_PRIORITY
+  eastl::vector<ID3D12Pageable *> resourcesToSetPriorities;
+  eastl::vector<D3D12_RESIDENCY_PRIORITY> prioritiesToSet;
+#endif
 };
 #endif
 

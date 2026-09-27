@@ -27,22 +27,45 @@ struct WrapType<smart_ptr_raw<T>> { enum { value = true }; typedef smart_ptr_jit
 template <typename T>
 struct WrapType<smart_ptr<T>> { enum { value = true }; typedef smart_ptr_jit * type; typedef smart_ptr_jit * rettype; };
 
+// Resolve WrapType transitively: if WrapType<T>::type is itself wrapped, follow the chain.
+// e.g. Quat -> Point4 -> vec4f resolves to vec4f.
+template <typename T, bool = WrapType<typename WrapType<T>::type>::value>
+struct ResolvedWrapType : WrapType<T> {};
+
+template <typename T>
+struct ResolvedWrapType<T, true> {
+    using inner = typename WrapType<T>::type;
+    enum { value = true };
+    typedef typename WrapType<inner>::type type;
+    typedef typename WrapType<inner>::rettype rettype;
+};
+
+template <typename T>
+using JitSideT = ResolvedWrapType<
+    conditional_t<JitConstRefByValue<T>::value,
+        remove_cv_t<remove_reference_t<T>>,
+        T>
+    >;
+
+template <typename T>
+using JitSideT_t = typename JitSideT<T>::type;
 
 template <typename... Ts> struct AnyVectorType;
 template <> struct AnyVectorType<> { enum { value = false }; };
-template <typename T> struct AnyVectorType<T> { enum { value = WrapType<T>::value }; };
+template <typename T> struct AnyVectorType<T> { enum { value = JitSideT<T>::value }; };
 template <typename Head, typename... Tail> struct AnyVectorType<Head, Tail...>
-    { enum { value = WrapType<Head>::value || AnyVectorType<Tail...>::value }; };
+    { enum { value = JitSideT<Head>::value || AnyVectorType<Tail...>::value }; };
 
 template <typename TT> struct NeedVectorWrap;
 template <typename Ret, typename ... Args> struct NeedVectorWrap< Ret(*)(Args...) > {
     enum {
-        result = WrapType<Ret>::value,
+        result = JitSideT<Ret>::value,
         arguments = AnyVectorType<Args...>::value,
         value = result || arguments
     };
 };
 
+// llvm ir -> c++
 template <int CMRES, int wrap, typename FuncT, FuncT fn> struct ImplWrapCall;
 
 template <typename FuncT, FuncT fn>     // no cmres, no wrap
@@ -57,9 +80,13 @@ struct ImplWrapCall<false,false,FuncT,fn> {
 
 template <int wrap, typename RetT, typename ...Args, RetT(*fn)(Args...)>    // cmres
 struct ImplWrapCall<true,wrap,RetT(*)(Args...),fn> {                        // when cmres, we always wrap
-    static void static_call (typename remove_cv<RetT>::type * result, typename WrapType<Args>::type... args ) {
+    // sanity check
+    static_assert(((!JitConstRefByValue<Args>::value || (is_lvalue_reference_v<Args> && is_const_v<remove_reference_t<Args>>)) && ...),
+            "JitConstRefByValue can be implemented only for const T&!");
+    static void static_call (remove_cv_t<RetT> * result, JitSideT_t<Args>... args ) {
         typedef RetT (* FuncType)(typename WrapArgType<Args>::type...);
-        auto fnPtr = reinterpret_cast<FuncType>(fn);
+        // deliberate fn-pointer type-erasure: round-trip through a generic fn pointer
+        auto fnPtr = reinterpret_cast<FuncType>(reinterpret_cast<void(*)()>(fn));
         new (result) RetT (fnPtr(args...));
     };
     static void * get_builtin_address() { return (void *) &static_call; }
@@ -67,12 +94,24 @@ struct ImplWrapCall<true,wrap,RetT(*)(Args...),fn> {                        // w
 
 template <typename RetT, typename ...Args, RetT(*fn)(Args...)>
 struct ImplWrapCall<false,true,RetT(*)(Args...),fn> {   // no cmres, wrap
-    static typename WrapType<RetT>::rettype static_call (typename WrapType<Args>::type... args ) {
+    DAS_SUPPRESS_UB
+    static typename ResolvedWrapType<RetT>::rettype static_call (JitSideT_t<Args>... args ) {
         typedef typename WrapRetType<RetT>::type (* FuncType)(typename WrapArgType<Args>::type...);
-        auto fnPtr = reinterpret_cast<FuncType>(fn);
-        return static_cast<typename WrapType<RetT>::rettype>(fnPtr(args...));   // note explicit cast
+        // deliberate fn-pointer type-erasure: round-trip through a generic fn pointer
+        auto fnPtr = reinterpret_cast<FuncType>(reinterpret_cast<void(*)()>(fn));
+        return static_cast<typename ResolvedWrapType<RetT>::rettype>(fnPtr(args...));   // note explicit cast
     };
     static void * get_builtin_address() { return (void *) &static_call; }
+};
+
+// c++ -> llvm ir
+template <typename RetT, typename ...Args>
+struct CallJitFn {   // no cmres, wrap
+    static RetT static_call (const JitFn &fn, Args... args ) { // Explicitly cast arguments
+        typedef typename ResolvedWrapType<RetT>::type (* FuncType)(typename ResolvedWrapType<Args>::rettype...);
+        auto fnPtr = reinterpret_cast<FuncType>(fn.jitFn);
+        return static_cast<typename WrapArgType<RetT>::type>(fnPtr(static_cast<typename WrapRetType<Args>::type>(args)...));
+    }
 };
 
 #if defined(_MSC_VER)
@@ -103,6 +142,9 @@ namespace detail {
         case Type::tInt4:           return detail::TableWrap<decltype(TAB_FUN<int4>), TAB_FUN<int4>>::get_builtin_address(); \
         case Type::tUInt:           return detail::TableWrap<decltype(TAB_FUN<uint32_t>), TAB_FUN<uint32_t>>::get_builtin_address(); \
         case Type::tBitfield:       return detail::TableWrap<decltype(TAB_FUN<uint32_t>), TAB_FUN<uint32_t>>::get_builtin_address(); \
+        case Type::tBitfield8:      return detail::TableWrap<decltype(TAB_FUN<uint8_t>), TAB_FUN<uint8_t>>::get_builtin_address(); \
+        case Type::tBitfield16:     return detail::TableWrap<decltype(TAB_FUN<uint16_t>), TAB_FUN<uint16_t>>::get_builtin_address(); \
+        case Type::tBitfield64:     return detail::TableWrap<decltype(TAB_FUN<uint64_t>), TAB_FUN<uint64_t>>::get_builtin_address(); \
         case Type::tUInt2:          return detail::TableWrap<decltype(TAB_FUN<uint2>), TAB_FUN<uint2>>::get_builtin_address(); \
         case Type::tUInt3:          return detail::TableWrap<decltype(TAB_FUN<uint3>), TAB_FUN<uint3>>::get_builtin_address(); \
         case Type::tUInt4:          return detail::TableWrap<decltype(TAB_FUN<uint4>), TAB_FUN<uint4>>::get_builtin_address(); \

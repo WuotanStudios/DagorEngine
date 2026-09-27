@@ -26,10 +26,6 @@ texture ssr_prev_target;
 texture prev_downsampled_close_depth_tex;
 texture prev_downsampled_normals;
 
-float ssr_clamping_gamma = 1.0;
-float ssr_neighborhood_bias_tight = 0.0;
-float ssr_neighborhood_bias_wide = 0.05;
-float ssr_neighborhood_velocity_difference_scale = 100;
 float4 ssr_back_surface_fix_distance = (1, 2, 0, 0);
 
 float4 analytic_light_sphere_pos_r=(0,0,0,0);
@@ -140,11 +136,10 @@ endmacro
 
 macro SSR_REPROJECTION(code)
   hlsl(code) {
-    ##if prev_downsampled_close_depth_tex != NULL
-      #define USE_PREV_DOWNSAMPLED_CLOSE_DEPTH 1
-      ##if prev_downsampled_normals != NULL
-        #define USE_PREV_DOWNSAMPLED_NORMALS 1
-      ##endif
+    #define USE_PREV_DOWNSAMPLED_CLOSE_DEPTH 1
+
+    ##if prev_downsampled_normals != NULL
+      #define USE_PREV_DOWNSAMPLED_NORMALS 1
     ##endif
   }
   //VIEW_VEC_OPTIMIZED(code)
@@ -179,7 +174,6 @@ macro SSR_REPROJECTION(code)
 endmacro
 
 macro SSR_COMMON(code)
-  ENABLE_ASSERT(code)
   SETUP_SSR(code)
   VIEW_VEC_OPTIMIZED(code)
   INIT_TEXTURES(code)
@@ -243,7 +237,6 @@ macro SSR_DISOCCLUSION(code)
         float2 gatherUV = floorCrd*prev_downsampled_close_depth_tex_target_size.zw + prev_downsampled_close_depth_tex_target_size.zw;
         float2 fractCrd = historyCrdf - floorCrd;
         float4 depths = prev_downsampled_close_depth_tex.GatherRed(prev_downsampled_close_depth_tex_samplerstate, gatherUV).wzxy;
-        //uv = uv - 0.5*prev_downsampled_close_depth_tex_target_size.zw;// re-center uv
         float4 linearDepths = linearize_z4(depths, prev_zn_zfar.zw);
         float4 depthDiff = abs(linearDepths - prev_linear_depth);
         float threshold = 0.1*prev_linear_depth;
@@ -263,7 +256,6 @@ macro SSR_DISOCCLUSION(code)
           weights *= lowresSmoothness > half(CALC_SSR_SMOOTHNESS_THRESHOLD);
         #endif
 
-        //half weight = saturate(dot(weights, 1)); // ignore bilateral weights
         #ifdef MOTION_TO_PREV_JITTERED_UV_OFS
           fractCrd = saturate(fractCrd - MOTION_TO_PREV_JITTERED_UV_OFS*prev_downsampled_close_depth_tex_target_size.xy);
         #endif
@@ -294,8 +286,7 @@ macro SSR_DISOCCLUSION(code)
     half historyNormalWeight(half4 sample_normal_roughness, half3 normal, half roughness)
     {
       //we can use higher smoothness history in lower smoothness (to a certain degree), but not visa verse
-      return sample_normal_roughness.w < half(CALC_SSR_ROUGHNESS_THRESHOLD) ? pow2(dot(normal, sample_normal_roughness.xyz)*saturate(1.0 - abs(roughness - sample_normal_roughness.w))) : 0;
-      //return pow2(dot(normal, sample_normal_smoothness.xyz)*saturate(1.0 - (sample_normal_smoothness.w - smoothness)));
+      return sample_normal_roughness.w < half(CALC_SSR_ROUGHNESS_THRESHOLD) ? pow2(saturate(dot(normal, sample_normal_roughness.xyz))*saturate(1.0 - abs(roughness - sample_normal_roughness.w))) : 0;
     }
     half4 historyNormalWeights(half4 normalW, half roughness)
     {
@@ -314,7 +305,6 @@ macro SSR_DISOCCLUSION(code)
       float2 gatherUV = floorCrd*prev_downsampled_close_depth_tex_target_size.zw + prev_downsampled_close_depth_tex_target_size.zw;
       float2 fractCrd = historyCrdf - floorCrd;
       float4 depths = prev_downsampled_close_depth_tex.GatherRed(prev_downsampled_close_depth_tex_samplerstate, gatherUV).wzxy;
-      //uv = uv - 0.5*prev_downsampled_close_depth_tex_target_size.zw;// re-center uv
       float4 linearDepths = linearize_z4(depths, prev_zn_zfar.zw);
       float4 depthDiff = abs(linearDepths - prev_linear_depth);
       float threshold = 0.1*prev_linear_depth;
@@ -369,7 +359,6 @@ macro SSR_DISOCCLUSION(code)
       half4 historyVirtualSample;
       half virtualWeight = get_ssr_disocclusion_weight_sample_virtual(current_normal, current_roughness, historyVirtualUV, prev_linear_depth, historyVirtualSample);
       half ret = max(virtualWeight, historyWeight);
-      //virtualWeight = virtualWeight > 0.01;
       virtualWeight *= rough_virtual_weight;
       historyWeight *= (1.0-pow4(virtualWeight));
       //virtualWeight *= inf_refl_virtual_weight;
@@ -417,7 +406,7 @@ macro SSR_GET_TEMPORAL_REPROJECTION_DUO(code)
       float2 oldExactUV = prevScreenExact.xy*float2(0.5,-0.5) + float2(0.5,0.5);
       float3 oldExactUVZ = float3(oldExactUV, clamp(linearize_z(prevScreenExact.z, prev_zn_zfar.zw), prev_zn_zfar.x, prev_zn_zfar.y));
 
-      float rayLength = length(cameraToPoint);
+      float rayLength = max(1e-4f, length(cameraToPoint));
       half linearRoughnessIsRoughW = get_is_rough_surface_param(linear_roughness);
       float reflectionDistanceUse = lerp(reflectionDistance, 0, linearRoughnessIsRoughW);
       float4 prevReflClip = mul(float4(prevViewVec*(reflectionDistanceUse + rayLength)/rayLength, 1), prevGlobtmNoOfs);
@@ -442,9 +431,6 @@ macro SSR_GET_TEMPORAL_REPROJECTION_DUO(code)
         if (!CHECK_VALID_MOTION_VECTOR(reflecting_surface_3d_motion))
           reflecting_surface_3d_motion = oldExactUVZ - float3(curViewTc, w);
 
-        //motion_type reflect_motion = tex2Dlod(MOTION_VECTORS_TEXTURE, float4(cameraHitUVZ.xy,0,0)).motion_attr;
-        //if (CHECK_VALID_MOTION_VECTOR(reflect_motion) && all(abs(cameraHitUVZ.xy*2-1) < 1))
-        //  prevUVZ = cameraHitUVZ + reflect_motion;
         bool staticPixel = all(abs(curViewTc + reflecting_surface_3d_motion.xy - oldExactUVZ.xy) < 0.5*ssr_target_size.zw);
       #else
         reflecting_surface_3d_motion = oldExactUVZ - float3(curViewTc, w);
@@ -455,8 +441,6 @@ macro SSR_GET_TEMPORAL_REPROJECTION_DUO(code)
       float2 useUV = curViewTc + reflecting_surface_3d_motion.xy;
       float currentPosToPrevW = w + reflecting_surface_3d_motion.z;
       {
-
-        //&& any(abs(prevVirtualUV.xy - useUV.xy) > ssr_target_size.zw)
         weight = get_ssr_disocclusion_weight_sample(normal, linear_roughness, useUV, currentPosToPrevW, prevFrame);
         virtualWeight = 0;
         float invDepth = rcp(w);

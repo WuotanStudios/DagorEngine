@@ -79,6 +79,19 @@ clang_args = clang_args + ['-D_ECS_CODEGEN']
 all_gets = []
 allParsedFunctions = parse_ecs_functions(input_file_name, os.path.basename(input_file_name), clang_args, is_es_name, False, compiler_errors, all_gets)
 
+# clang recovers from syntax errors by dropping code (e.g. a misplaced ECS_REQUIRE
+# annotation), which silently generates wrong query descriptors. Fail only on parse
+# issues in the parsed file itself: semantic errors (undefined ecs_query templates,
+# incomplete types) are expected as codegen parses an incomplete translation unit.
+input_file_errors = [e for e in compiler_errors
+                     if e['category'] == 'Parse Issue'
+                     and e['file'] and os.path.normcase(os.path.realpath(e['file'])) == os.path.normcase(os.path.realpath(input_file_name))]
+if len(input_file_errors) > 0:
+  for e in input_file_errors:
+    print("{file}:{line}:{column}: error: {spelling}".format(**e))
+  print("ERROR: clang failed to parse " + input_file_name + ", generated code would be incomplete")
+  sys.exit(1)
+
 resultCode = gen_es(allParsedFunctions, event_handler_suffix, input_file_name)
 gets_code = ""
 gets_type_code = ""
@@ -113,19 +126,12 @@ resultCode = include_preamble + resultCode
 if len(gets_code) > 0:
   resultCode = "#include <daECS/core/internal/ltComponentList.h>\n" + gets_code + resultCode + gets_type_code
 
-is_file_changed = True
-if len(sys.argv) > 4 and sys.argv[4] == 'CHECK':
-  is_file_changed = False
-
 existing_lines = ''
 
 if os.path.isfile(output_file_name):
   with io.open(output_file_name, 'rt', encoding='utf-8') as f:
     existing_lines = f.read()
-
-  if resultCode != existing_lines:
-    is_file_changed = True
-
+  is_file_changed = (resultCode != existing_lines)
 else:
   is_file_changed = True
 
@@ -144,6 +150,11 @@ if len(sys.argv) > 4 and (sys.argv[4] == 'CHECK'):
 
 if is_file_changed:
   # Use windows line ending if WSL linux detected
-  nl = '\r\n' if ('linux' in sys.platform and 'Microsoft' in open('/proc/sys/kernel/osrelease').read()) else None
+  nl = {'LF': '\n', 'CRLF': '\r\n', 'CR': '\r'}.get(
+    os.environ.get('ECS_CODEGEN_LINE_ENDING'),
+    '\r\n' if ('linux' in sys.platform and 'Microsoft' in open('/proc/sys/kernel/osrelease').read()) else None)
   with io.open(output_file_name, 'wt', encoding='utf-8', newline=nl) as f:
     f.write(unicode(resultCode, 'utf-8') if sys.version_info[0] == 2 else resultCode)
+elif os.path.isfile(output_file_name):
+  # bump the target's mtime to mark generation up to date for build systems
+  os.utime(output_file_name, None)

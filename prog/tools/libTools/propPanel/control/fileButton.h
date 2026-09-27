@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <EASTL/optional.h>
 #include <propPanel/control/propertyControlBase.h>
 #include <propPanel/constants.h>
 #include <propPanel/imguiHelper.h>
@@ -51,11 +52,31 @@ public:
 
   void setEnabled(bool enabled) override { controlEnabled = enabled; }
 
+  bool isDefaultValueSet() const override { return defaultValue ? *defaultValue == controlValue.str() : true; }
+
+  void applyDefaultValue() override
+  {
+    if (isDefaultValueSet())
+    {
+      return;
+    }
+
+    if (defaultValue)
+    {
+      setTextValue(*defaultValue);
+      onWcChange(nullptr);
+    }
+  }
+
+  void setDefaultValue(Variant var) override { defaultValue = var.convert<SimpleString>(); }
+
+  const char *getImguiTypeName() const override { return "FileButton"; }
+
   void updateImgui() override
   {
     ScopedImguiBeginDisabled scopedDisabled(!controlEnabled);
 
-    ImguiHelper::separateLineLabel(controlCaption);
+    separateLineLabelWithTooltip(controlCaption.begin(), controlCaption.end());
     setFocusToNextImGuiControlIfRequested();
 
     const float clearButtonWidth = ImGui::GetFrameHeight(); // Simply use a square button.
@@ -64,10 +85,12 @@ public:
 
     const bool clickedOnPickButton =
       ImGui::Button(controlValue.empty() ? "none" : controlValue.c_str(), ImVec2(pickButtonWidth, 0.0f));
+    setImguiTestItemInfo();
     setPreviousImguiControlTooltip();
 
     ImGui::SameLine(0.0f, spaceBetweenControls);
     const bool clickedOnClearButton = ImGui::Button("x", ImVec2(clearButtonWidth, 0.0f));
+    setImguiTestItemInfo("clear");
     setPreviousImguiControlTooltip();
 
     if (clickedOnPickButton)
@@ -91,6 +114,7 @@ private:
   String controlValue;
   bool controlEnabled = true;
   String masks;
+  eastl::optional<SimpleString> defaultValue;
 };
 
 } // namespace PropPanel

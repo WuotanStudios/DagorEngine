@@ -7,6 +7,7 @@
 #include <dag/dag_vector.h>
 #include <drv/3d/dag_driver.h>
 #include <generic/dag_initOnDemand.h>
+#include <util/dag_convar.h>
 
 #include <frontend/internalRegistry.h>
 #include <frontend/nameResolver.h>
@@ -14,10 +15,10 @@
 #include <frontend/nodeTracker.h>
 #include <frontend/registryValidator.h>
 #include <frontend/irGraphBuilder.h>
-#include <frontend/recompilationData.h>
 
 #include <backend/nodeScheduler.h>
 #include <backend/resourceScheduling/resourceScheduler.h>
+#include <backend/resourceScheduling/resourceAllocator.h>
 #include <backend/passColoring.h>
 #include <backend/intermediateRepresentation.h>
 #include <backend/nodeStateDeltas.h>
@@ -25,8 +26,9 @@
 #include <runtime/nodeExecutor.h>
 #include <runtime/compilationStage.h>
 #include <runtime/typeDb.h>
+#include <runtime/bindlessSlotManager.h>
 
-#include <debug/dafgVisualizerInterface.h>
+#include <debug/visualizationManagerInterface.h>
 
 
 template <typename, bool, typename>
@@ -34,6 +36,8 @@ struct InitOnDemand;
 
 namespace dafg
 {
+
+inline CONSOLE_BOOL_VAL("dafg", verbose, false);
 
 class Runtime
 {
@@ -55,7 +59,7 @@ public:
   static void shutdown()
   {
     instance.demandDestroy();
-    sd::Alloc::wipe();
+    NodeTracker::Alloc::wipe();
     debug("daFG: runtime shut down!");
   }
 
@@ -65,22 +69,30 @@ public:
   NodeTracker &getNodeTracker() { return nodeTracker; }
   TypeDb &getTypeDb() { return typeDb; }
   InternalRegistry &getInternalRegistry() { return registry; }
-  visualization::IVisualizer *getVisualizerPtr() { return fgVisualizer.get(); }
+  intermediate::Graph &getIntermediateGraph() { return intermediateGraph; }
+  sd::NodeStateDeltas &getNodeStateDeltas() { return perNodeStateDeltas; }
+  visualization::IVisualizationManager *getVisualizerPtr() { return fgVisManager.get(); }
+  DependencyData &getDependencyData() { return dependencyDataCalculator.depData; }
   void updateExternalState(ExternalState state) { nodeExec->externalState = state; }
+  multiplexing::Extents getMultiplexingExtents() const { return currentMultiplexingExtents; }
   void setMultiplexingExtents(multiplexing::Extents extents);
-  bool runNodes();
+  bool runNodes(bool flush_blocks = false);
 
-  void markStageDirty(CompilationStage stage)
+  void markStageDirty(CompilationStage stage, const char *reason_msg = nullptr)
   {
     if (stage < currentStage)
+    {
       currentStage = stage;
+      if (verbose && reason_msg)
+        logdbg("daFG: Marking stage %d dirty: %s", eastl::to_underlying(stage), reason_msg);
+    }
   }
 
   void invalidateHistory();
-  void onStaticResolutionChange()
+  void onStaticResolutionChange(AutoResTypeNameId id)
   {
-    deltaCalculator.invalidateCaches();
-    Runtime::get().markStageDirty(CompilationStage::REQUIRES_STATE_DELTA_RECALCULATION);
+    deltaCalculator.invalidateCachesForAutoResType(id);
+    Runtime::get().markStageDirty(CompilationStage::REQUIRES_NODE_DECLARATION_UPDATE, "static resolution changed");
   }
 
   void beforeDeviceReset();
@@ -92,6 +104,7 @@ public:
 private:
   CompilationStage currentStage = CompilationStage::UP_TO_DATE;
   multiplexing::Extents currentMultiplexingExtents;
+  multiplexing::Extents prevMultiplexingExtents;
   multiplexing::Extents historyMultiplexingExtents;
 
   // === Components of FG backend ===
@@ -104,65 +117,98 @@ private:
   // This registry represents the entire user-specified graph with
   // simple encapsulation-less data (at least in theory)
   InternalRegistry registry{currentlyProvidedResources};
-  NameResolver nameResolver{registry, frontendRecompilationData};
+  NameResolver nameResolver{registry};
 
   // Not part of the user graph per se, just immutable partial info about
   // types the user has ever used
   TypeDb typeDb;
 
-  DependencyDataCalculator dependencyDataCalculator{registry, nameResolver, frontendRecompilationData};
+  DependencyDataCalculator dependencyDataCalculator{registry, nameResolver};
 
-  FrontendRecompilationData frontendRecompilationData;
-  NodeTracker nodeTracker{registry, dependencyDataCalculator.depData, frontendRecompilationData};
+  NodeTracker nodeTracker{registry};
 
   RegistryValidator registryValidator{registry, dependencyDataCalculator.depData, nameResolver};
 
   IrGraphBuilder irGraphBuilder{registry, dependencyDataCalculator.depData, registryValidator.validityInfo, nameResolver};
 
+  PassColorer passColorer;
+
   NodeScheduler cullingScheduler;
+
+  ResourceLifetimeCalculator resourceLifetimeCalculator;
 
   BarrierScheduler barrierScheduler; //-V730_NOINIT
 
   BadResolutionTracker badResolutionTracker{intermediateGraph};
 
-  eastl::unique_ptr<ResourceScheduler> resourceScheduler;
+  eastl::unique_ptr<ResourceAllocator> resourceAllocator;
+  ResourceScheduler resourceScheduler;
+
+  // Populated during resource scheduling, consumed during history update.
+  PotentialDeactivationSet pendingDeactivations;
 
   // ===
 
 
+  intermediate::Graph unsortedIntermediateGraph;
   intermediate::Graph intermediateGraph;
   intermediate::Mapping irMapping;
+  IdIndexedMapping<intermediate::NodeIndex, intermediate::NodeIndex> prevPermutation;
 
   PassColoring passColoring;
   sd::NodeStateDeltas perNodeStateDeltas;
-  BarrierScheduler::EventsCollectionRef allResourceEvents;
+  BarrierScheduler::EventsCollection allResourceEvents;
+  IdIndexedMapping<intermediate::ResourceIndex, intermediate::EnhancedBarrier> untrackedReleaseBarriers;
 
   sd::DeltaCalculator deltaCalculator{intermediateGraph};
+
+  // Owns the bindless texture and buffer descriptor ranges for bindlessShaderVar requests.
+  BindlessSlotManager bindlessSlotManager;
 
   // Deferred init
   eastl::optional<NodeExecutor> nodeExec;
 
   uint32_t frameIndex = 0;
 
-  eastl::unique_ptr<visualization::IVisualizer> fgVisualizer;
+  eastl::unique_ptr<visualization::IVisualizationManager> fgVisManager;
 
 private:
   Runtime();
   ~Runtime();
 
+  void resetIncrementalState();
+  void recompile();
+  void debugDanglingReferences();
+  void testIncrementality();
+
   void updateDynamicResolution(int curr_frame);
 
-  void updateNodeDeclarations();
-  void resolveNames();
-  void calculateDependencyData();
-  void validateRegistry();
-  void buildIrGraph();
-  void colorPasses();
-  void scheduleNodes();
-  void scheduleBarriers();
-  void recalculateStateDeltas();
-  void scheduleResources();
-  void initializeHistoryOfNewResources();
-  void updateVisualization();
+  using NodesChanged = IdIndexedFlags<NodeNameId, framemem_allocator>;
+  using ResourcesChanged = IdIndexedFlags<ResNameId, framemem_allocator>;
+  using IrNodesChanged = IdIndexedFlags<intermediate::NodeIndex, framemem_allocator>;
+  using IrResourcesChanged = IdIndexedFlags<intermediate::ResourceIndex, framemem_allocator>;
+  using BlockProviderMap = dag::VectorMap<RefinedBlockNameId, const RefinedBlockProvider *>;
+
+  auto updateNodeDeclarations();
+  auto resolveNames(const NodesChanged &nodes_changed);
+  auto calculateDependencyData(const NodesChanged &nodes_changed);
+  void resolveBlobTypes();
+  void validateRegistry(NodesChanged &nodeChanges, ResourcesChanged &resourceChanges, ResourcesChanged &resourceRequestChanges);
+  auto buildIrGraph(const ResourcesChanged &resources_changed, const ResourcesChanged &resource_requests_changed,
+    const NodesChanged &nodes_changed);
+  void colorPasses(const IrNodesChanged &irNodesChanged);
+  IrNodesChanged scheduleNodes(const IrNodesChanged &irNodesChanged, const IrResourcesChanged &irResourcesChanged);
+  IrResourcesChanged calculateResourceLifetimes();
+  void scheduleBarriers(const IrNodesChanged &nodesChanged, const IrResourcesChanged &resourcesChanged,
+    const IrResourcesChanged &resourceRequestsChanged, const IrResourcesChanged &lifetimeChangedResources);
+  void cacheUntrackedReleaseBarriers();
+  void recalculateStateDeltas(const IrNodesChanged &nodesChanged, const IrResourcesChanged &resourcesChanged,
+    const IrResourcesChanged &resourceRequestsChanged);
+  void updateAutoResolutions();
+  void scheduleResources(const IrResourcesChanged &lifetimeChangedResources);
+  void applyAliasSyncStages(const ResourceSchedule &schedule, const BadResolutionTracker::Corrections &corrections);
+  void updateHistory();
+  void updateVisualization(const NodesChanged &nodes_changed);
+  BlockProviderMap applyRefinedBlockBindings(int curr_frame, int prev_frame);
 };
 } // namespace dafg

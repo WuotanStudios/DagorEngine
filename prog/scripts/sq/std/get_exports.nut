@@ -1,7 +1,7 @@
-from "modules" import get_native_module_names
 from "dagor.system" import get_arg_value_by_name, get_all_arg_values_by_name
 from "dagor.fs" import scan_folder
 from "json.nut" import saveJson
+from "types" import Table
 
 
 function get_all_exports_for_file(fpath){
@@ -13,13 +13,13 @@ function getClassOfInstanceName(v){
   return v?.__name__ ?? v?.__name ?? v?.name ?? v?.getName()
 }
 
-function isNativeClassOrInstance(v){
+function isNativeClassOrInstance(v): bool {
   let tt = type(v)
   return (tt=="instance" || tt=="class") && "__getTable" in v && "__setTable" in v
 }
 
 local make_module_description
-make_module_description = function(module, frozen=null){
+make_module_description = function(module, frozen=null): table {
   let t = type(module)
   if (isNativeClassOrInstance(module))
     return {"type":t, frozenable=true, name=getClassOfInstanceName(module)}
@@ -47,9 +47,14 @@ make_module_description = function(module, frozen=null){
       if (isNativeClassOrInstance(v))
         return {"type":tt, frozenable=true, name=getClassOfInstanceName(v)}
       if (tt =="array" || tt=="table"){
-        frozen = frozen || v.is_frozen()
-        return {frozen, "type":tt}.__update( tt =="array" || tt=="table" ? {content = v.$map(@(i) make_module_description(i, frozen))} : {}, tt=="instance" ? {name=getClassOfInstanceName(v)} : {})
+        let fr = frozen || v.is_frozen()
+        return {frozen=fr, "type":tt, content = v.$map(@(i) make_module_description(i, fr))}
       }
+      else if (tt=="instance") {
+        let fr = frozen || v.is_frozen()
+        return {frozen=fr, "type":tt, name=getClassOfInstanceName(v)}
+      }
+
       return {"type":tt}
     })
   }
@@ -64,7 +69,7 @@ function get_all_exports_in_folder(root = ".", res=null){
       fpath = fpath.slice(1)
     //let fname = fpath[fpath.len()-1]
     fpath = "/".join(fpath)
-    if (fpath in res || __file__.indexof(fpath)!=null)
+    if (fpath in res || __file__.contains(fpath))
       continue
     try{
       let info = get_all_exports_for_file(fpath)
@@ -91,14 +96,13 @@ if (__name__ == "__main__"){
       res[fpath] <- make_module_description(get_all_exports_for_file(fpath))
     if (outFname==null) {
       foreach (f, module_info in res) {
-        let info = type(module_info) != "table"
+        let info = !(module_info instanceof Table)
           ? ""
           : "  ".join(module_info.reduce(@(r, _, k) r.append($"{k}"), []))
         println($"File:'{f}'\n{info}\n")
       }
     }
-//    foreach(nm in get_native_module_names())
-//      res[nm] <- make_module_description(require(nm))
+
     if (outFname) {
       if (replacePath) {
         assert (replacePath.split(";").len() == 2, @() $"{replacePath} is incorrect format, should be '<replace_prefix>';<replace_with>, like 'ui/;ui/' ")

@@ -5,10 +5,10 @@
 #include <pathFinder/tileCache.h>
 #include <pathFinder/tileCacheUtil.h>
 #include <scene/dag_tiledScene.h>
-#include <detourCommon.h>
-#include <detourNavMeshBuilder.h>
-#include <detourNavMesh.h>
-#include <detourNavMeshQuery.h>
+#include <DetourCommon.h>
+#include <DetourNavMeshBuilder.h>
+#include <DetourNavMesh.h>
+#include <DetourNavMeshQuery.h>
 #include <string.h>
 #include <startup/dag_globalSettings.h>
 #include <perfMon/dag_cpuFreq.h>
@@ -16,7 +16,7 @@
 #include <ioSys/dag_dataBlock.h>
 #include <ioSys/dag_lzmaIo.h>
 #include <ioSys/dag_zstdIo.h>
-#include <gameMath/traceUtils.h>
+#include <rendInst/traceUtils.h>
 #include <gameMath/mathUtils.h>
 #include <rendInst/rendInstGen.h>
 #include <landMesh/lmeshManager.h>
@@ -35,7 +35,7 @@
 #include <EASTL/fixed_function.h>
 #include <math/random/dag_random.h>
 
-#include <detourPathCorridor.h>
+#include <DetourPathCorridor.h>
 #include <generic/dag_smallTab.h>
 #include <generic/dag_relocatableFixedVector.h>
 #include <generic/dag_span.h>
@@ -77,11 +77,39 @@ struct NavMeshData
 #else
   eastl::unique_ptr<uint8_t[], DtFreer> navData;
 #endif
+  int navDataSize = 0;
+  NavMeshType navMeshType = NMT_SIMPLE;
+  TiledNavMeshBuildSettings tiledBuildSettings;
 };
 
 static NavMeshData navMeshData[NMS_COUNT];
 static dtNavMesh *&navMesh = navMeshData[NM_MAIN].navMesh;
 static dtNavMeshQuery *&navQuery = navMeshData[NM_MAIN].navQuery;
+
+static bool read_tilecache_detail_settings(unsigned char *&cur_ptr, const unsigned char *end_ptr, TileCacheDetailSettings &settings)
+{
+  if (end_ptr - cur_ptr < sizeof(settings))
+    return false;
+
+  settings.includeDetailedData = *(uint32_t *)cur_ptr;
+  cur_ptr += sizeof(settings.includeDetailedData);
+  settings.detailSampleDist = *(float *)cur_ptr;
+  cur_ptr += sizeof(settings.detailSampleDist);
+  settings.detailSampleMaxError = *(float *)cur_ptr;
+  cur_ptr += sizeof(settings.detailSampleMaxError);
+  return true;
+}
+
+static bool read_tilecache_detail_settings(IGenLoad &crd, TileCacheDetailSettings &settings)
+{
+  if (crd.getBlockRest() < sizeof(settings))
+    return false;
+
+  settings.includeDetailedData = crd.readInt();
+  settings.detailSampleDist = crd.readReal();
+  settings.detailSampleMaxError = crd.readReal();
+  return true;
+}
 
 static Tab<Point3> pathForDebug;
 static Tab<BBox3> navDebugBoxes;
@@ -93,6 +121,13 @@ static NavMeshData &get_nav_mesh_data(int nav_mesh_idx)
 {
   G_ASSERT((unsigned int)(nav_mesh_idx) < NMS_COUNT);
   return navMeshData[nav_mesh_idx];
+}
+
+NavMeshType get_nav_mesh_type(int nav_mesh_idx) { return get_nav_mesh_data(nav_mesh_idx).navMeshType; }
+
+TiledNavMeshBuildSettings get_tiled_navmesh_build_settings(int nav_mesh_idx)
+{
+  return get_nav_mesh_data(nav_mesh_idx).tiledBuildSettings;
 }
 
 dtNavMesh *get_nav_mesh_ptr(int nav_mesh_idx) { return get_nav_mesh_data(nav_mesh_idx).navMesh; }
@@ -127,6 +162,8 @@ public:
     // leave obstacle box in a shortest path possible and detour it afterwards. The easiest way to achieve this
     // is making obstacle area walkable, but with extremely high cost.
     setAreaCost(POLYAREA_OBSTACLE, 10000.f);
+    setHeuristicScale(nav_params.heuristic_scale);
+    setReopenTotalThreshold(nav_params.reopen_total_threshold);
   }
 
   explicit NavQueryFilter(int nav_mesh_idx, const CustomNav *custom_nav, float max_jump_up_height = FLT_MAX, bool for_optimize = false,
@@ -266,13 +303,17 @@ void clear_nav_mesh(int nav_mesh_idx, bool clear_nav_data)
   nmData.tcMeshProc.setNavMesh(nullptr);
   nmData.tcMeshProc.setNavMeshQuery(nullptr);
   nmData.tcMeshProc.setTileCache(nullptr);
-  if (nmData.navMesh)
-    dtFreeNavMesh(nmData.navMesh);
-  nmData.navMesh = NULL;
+  nmData.tcMeshProc.setDetailedData(false, 0.0f, 0.0f);
+  if (auto navmsh = eastl::exchange(nmData.navMesh, nullptr))
+    dtFreeNavMesh(navmsh);
+  nmData.tcComp.reset();
   if (clear_nav_data)
   {
     nmData.navData = decltype(nmData.navData)();
+    nmData.navDataSize = 0;
     nmData.tcMeshProc.setLadders(nullptr);
+    nmData.navMeshType = NMT_SIMPLE;
+    nmData.tiledBuildSettings = TiledNavMeshBuildSettings();
   }
   if (nmData.navQuery)
     dtFreeNavMeshQuery(nmData.navQuery);
@@ -387,6 +428,10 @@ static bool loadNavMeshChunked(IGenLoad &crd, NavMeshType type, tile_check_cb_t 
     }
   }
   READ_BYTES(numObsResNameHashes * sizeof(uint32_t));
+  if (crd.getBlockRest() >= sizeof(TileCacheDetailSettings))
+  {
+    READ_BYTES(sizeof(TileCacheDetailSettings));
+  }
 #undef READ_TYPE
 #undef READ_BYTES
   *(int *)&out_buff[numTilesOff] = actualNumTiles;
@@ -450,11 +495,12 @@ static void loadNavMeshBucketFormat(TileCacheCompressor &tc_comp, IGenLoad &crd,
   Tab<uint8_t> obsResNameHashesBuff(numObsResNameHashes * sizeof(uint32_t));
   crd.read(obsResNameHashesBuff.data(), obsResNameHashesBuff.size());
 
-  int dictSize = crd.readInt();
-  Tab<char> dictBuff(dictSize);
-  crd.read(dictBuff.data(), dictBuff.size());
-
-  tc_comp.reset(true, dictBuff);
+  if (int dictSize = crd.readInt(); dictSize > 0)
+  {
+    Tab<char> dictBuff(dictSize);
+    crd.read(dictBuff.data(), dictBuff.size());
+    tc_comp.initDict(dictBuff);
+  }
 
   int numBuckets = crd.readInt();
   const int64_t refTime = ref_time_ticks();
@@ -530,6 +576,10 @@ static void loadNavMeshBucketFormat(TileCacheCompressor &tc_comp, IGenLoad &crd,
 
     crd.endBlock();
   }
+
+  TileCacheDetailSettings detailSettings;
+  const bool hasDetailSettings = read_tilecache_detail_settings(crd, detailSettings);
+
   const int timeUsec = get_time_usec(refTime);
   const uint32_t blockSize = BlockType::static_size / (1024 * 1024);
   debug("navmesh: tiles loaded: %d; used blocks: %u of %u mb; time %d us", totalNumTiles, tilesBuff.size() + tcTilesBuff.size(),
@@ -543,6 +593,8 @@ static void loadNavMeshBucketFormat(TileCacheCompressor &tc_comp, IGenLoad &crd,
   for (const BlockType *block : tcTilesBuff)
     reqCap += block->size();
   reqCap += obsResNameHashesBuff.size();
+  if (hasDetailSettings)
+    reqCap += sizeof(TileCacheDetailSettings);
   clear_and_shrink(out_buff); // Final buffer is always bigger then temp ones so no need to realloc
   out_buff.reserve(reqCap);   // To consider: use phys mem alloc?
   append_items(out_buff, sizeof(nmParams), (const uint8_t *)&nmParams);
@@ -561,6 +613,8 @@ static void loadNavMeshBucketFormat(TileCacheCompressor &tc_comp, IGenLoad &crd,
     delete block;
   }
   append_items(out_buff, obsResNameHashesBuff.size(), obsResNameHashesBuff.data());
+  if (hasDetailSettings)
+    append_items(out_buff, sizeof(detailSettings), (const uint8_t *)&detailSettings);
   G_ASSERT(reqCap == out_buff.size());
 }
 
@@ -568,17 +622,34 @@ void initWeights(const DataBlock *navQueryFilterWeightsBlk) { init_weights_ex(NM
 
 void init_weights_ex(int nav_mesh_idx, const DataBlock *navQueryFilterWeightsBlk)
 {
+  if (nav_mesh_idx < 0 || nav_mesh_idx >= NMS_COUNT)
+  {
+    LOGERR_CTX("Invalid nav mesh index(%d) in weights init", nav_mesh_idx);
+    return;
+  }
   NavParams &navParams = get_nav_params(nav_mesh_idx);
+  navParams = NavParams();
   navParams.enable_jumps = (get_nav_mesh_kind(nav_mesh_idx)[0] == '\0');
   if (navQueryFilterWeightsBlk)
+    override_weights_ex(nav_mesh_idx, *navQueryFilterWeightsBlk);
+}
+
+void override_weights_ex(int nav_mesh_idx, const DataBlock &blk)
+{
+  if (nav_mesh_idx < 0 || nav_mesh_idx >= NMS_COUNT)
   {
-    navParams.enable_jumps = navQueryFilterWeightsBlk->getBool("enableJumps", navParams.enable_jumps);
-    navParams.max_path_weight = navQueryFilterWeightsBlk->getReal("maxPathWeight", FLT_MAX);
-    navParams.jump_weight = navQueryFilterWeightsBlk->getReal("jumpWeight", 40.f);
-    navParams.jump_down_weight = navQueryFilterWeightsBlk->getReal("jumpDownWeight", 20.f);
-    navParams.jump_over_weight = navQueryFilterWeightsBlk->getReal("jumpOverWeight", 20.f);
-    navParams.jump_down_threshold = navQueryFilterWeightsBlk->getReal("jumpDownThreshold", 0.4f);
+    LOGERR_CTX("Invalid nav mesh index(%d) in weights override", nav_mesh_idx);
+    return;
   }
+  NavParams &navParams = get_nav_params(nav_mesh_idx);
+  navParams.enable_jumps = blk.getBool("enableJumps", navParams.enable_jumps);
+  navParams.max_path_weight = blk.getReal("maxPathWeight", navParams.max_path_weight);
+  navParams.jump_weight = blk.getReal("jumpWeight", navParams.jump_weight);
+  navParams.jump_down_weight = blk.getReal("jumpDownWeight", navParams.jump_down_weight);
+  navParams.jump_over_weight = blk.getReal("jumpOverWeight", navParams.jump_over_weight);
+  navParams.jump_down_threshold = blk.getReal("jumpDownThreshold", navParams.jump_down_threshold);
+  navParams.heuristic_scale = blk.getReal("heuristicScale", navParams.heuristic_scale);
+  navParams.reopen_total_threshold = blk.getReal("reopenTotalThreshold", navParams.reopen_total_threshold);
 }
 
 template <class T>
@@ -595,11 +666,16 @@ struct PlacementFreer
 
 void tilecache_start_ladders(const scene::TiledScene *ladders) { get_nav_mesh_data(NM_MAIN).tcMeshProc.setLadders(ladders); }
 
-static bool load_nav_mesh_orig(int nav_mesh_idx, unsigned char *curPtr, int patchedTilesSize, const char *patchNavMeshFileName,
-  int extra_tiles)
+TileCacheDetailSettings tilecache_get_detailed_data_settings()
+{
+  return get_nav_mesh_data(NM_MAIN).tcMeshProc.getDetailedDataSettings();
+}
+
+static bool load_nav_mesh_orig(int nav_mesh_idx, unsigned char *curPtr, int navDataSize, const char *patchNavMeshFileName,
+  PatchedNavMeshFileInfo patch_info, int reload_extra_tiles)
 {
   NavMeshData &nmData = get_nav_mesh_data(nav_mesh_idx);
-  const bool tileCacheNeeded = nav_mesh_idx == NM_MAIN;
+  const unsigned char *endPtr = curPtr + navDataSize;
 #define INIT_BY_PTR(typ, name) \
   typ *name = (typ *)curPtr;   \
   curPtr += sizeof(typ);
@@ -608,26 +684,81 @@ static bool load_nav_mesh_orig(int nav_mesh_idx, unsigned char *curPtr, int patc
   INIT_BY_PTR(int, numTiles);
   INIT_BY_PTR(int, numTCTiles);
   INIT_BY_PTR(int, numObsResNameHashes);
-  nmParams->maxTiles += extra_tiles;
-  if (dtStatusFailed(nmData.navMesh->init(nmParams, false)))
+  // Patch refs are raw save file data: a legitimate save cannot pin a tile index at
+  // or above the exported grid tile count (free slots are allocated lowest first),
+  // so drop the whole patch before it can inflate the allocation or partially apply.
+  if (patch_info.maxNavTileIndex >= 0 && patch_info.maxNavTileIndex >= nmParams->maxTiles)
+  {
+    LOGERR_CTX("navmesh: patch '%s' pins tile index %d beyond the %d tiles grid, patch ignored", patchNavMeshFileName,
+      patch_info.maxNavTileIndex, nmParams->maxTiles);
+    patch_info = PatchedNavMeshFileInfo();
+  }
+  // Copies: the dump stays untouched so a reload sizes from the original params again.
+  dtNavMeshParams meshParams = *nmParams;
+  dtTileCacheParams cacheParams = *tcParams;
+  // Free-list headroom added to both tile arrays below.
+  int freeExtraTiles = reload_extra_tiles + max(patch_info.numTcTiles, patch_info.numNavTiles);
+#ifdef DT_POLYREF64
+  // Exported maxTiles counts the whole tile grid while the dump only stores tiles with
+  // data. With DT_POLYREF64 the poly ref bit layout does not depend on maxTiles, so size
+  // the tile arrays by what can actually occupy a slot: prebuilt nav tiles and patch nav
+  // tiles restore into their saved indices, tile cache tiles and runtime rebuilds take
+  // free slots (each tile cache tile may build one nav tile).
+  {
+    int maxTileIndex = patch_info.maxNavTileIndex;
+    const unsigned char *scanPtr = curPtr;
+    const intptr_t recordHeaderSize = sizeof(dtTileRef) + sizeof(int);
+    for (int i = 0; i < *numTiles; ++i)
+    {
+      // the tile table is not validated yet, so never scan past the loaded dump
+      if (endPtr - scanPtr < recordHeaderSize)
+        break;
+      const dtTileRef tileRef = *(const dtTileRef *)scanPtr;
+      const int tileDataSize = *(const int *)(scanPtr + sizeof(dtTileRef));
+      if (!tileRef || tileDataSize <= 0 || tileDataSize > endPtr - scanPtr - recordHeaderSize)
+        break;
+      maxTileIndex = max(maxTileIndex, (int)nmData.navMesh->decodePolyIdTile(tileRef));
+      scanPtr += recordHeaderSize + tileDataSize;
+    }
+    // int64: numTCTiles comes from the dump, the sums must not wrap before min() clamps
+    const int64_t pinnedTiles = max(maxTileIndex + 1, 1);
+    const int64_t tcTileCount = max(*numTCTiles, 0);
+    // rebuildNavMesh_initFromCurrent may grow the number of occupied slots with no
+    // reload, so its net new tiles are not covered by extra_tiles like on the reload
+    // paths; keep free slots for that growth (the rebuild skips with a logerr when
+    // they run out).
+    const int64_t runtimeHeadroom = tcTileCount + max(nmParams->maxTiles / 2048, 128);
+    meshParams.maxTiles = (int)min((int64_t)meshParams.maxTiles, pinnedTiles + tcTileCount + runtimeHeadroom);
+    // pinned refs are raw file data, so never let them size past the exported grid,
+    // the upper bound the old grid sized allocation had (patch refs are validated
+    // above, this guards dump refs; a slot below it is always covered by the min())
+    meshParams.maxTiles = (int)max((int64_t)meshParams.maxTiles, min(pinnedTiles, (int64_t)nmParams->maxTiles));
+    cacheParams.maxTiles = (int)min((int64_t)cacheParams.maxTiles, tcTileCount + runtimeHeadroom);
+    // patch nav tiles restore into pinned slots counted above, only patch tile cache
+    // tiles allocate from the free lists and need headroom
+    freeExtraTiles = reload_extra_tiles + patch_info.numTcTiles;
+    debug("navmesh: tile arrays sized for %d nav / %d tc tiles (dump %d / %d), %d extra", meshParams.maxTiles, cacheParams.maxTiles,
+      nmParams->maxTiles, tcParams->maxTiles, freeExtraTiles);
+  }
+#endif
+  meshParams.maxTiles += freeExtraTiles;
+  if (dtStatusFailed(nmData.navMesh->init(&meshParams, false)))
   {
     LOGERR_CTX("Could not init tiled Detour navmesh");
     return false;
   }
   dtTileCache *tc = nullptr;
-  if (tileCacheNeeded)
+  if (nav_mesh_idx == NM_MAIN)
   {
     tc = dtAllocTileCache();
-    if (!tc)
-    {
-      LOGERR_CTX("dtAllocTileCache fails");
-      return false;
-    }
+    G_ASSERT(tc);
     nmData.tcMeshProc.setNavMesh(nmData.navMesh);
     nmData.tcMeshProc.setNavMeshQuery(nullptr);
     nmData.tcMeshProc.setTileCache(tc);
-    tcParams->maxTiles += extra_tiles;
-    if (dtStatusFailed(tc->init(tcParams, &nmData.tcAllocator, &nmData.tcComp, &nmData.tcMeshProc)))
+    cacheParams.maxTiles += freeExtraTiles;
+    // Note: the exported maxObstacles is ignored, the obstacle pool is paged on
+    // demand up to the 16 bit dtObstacleRef index limit (dtTileCache::allocObstacle)
+    if (dtStatusFailed(tc->init(&cacheParams, &nmData.tcAllocator, &nmData.tcComp, &nmData.tcMeshProc)))
     {
       LOGERR_CTX("Could not init tiled Detour tile cache");
       dtFreeTileCache(tc);
@@ -648,7 +779,7 @@ static bool load_nav_mesh_orig(int nav_mesh_idx, unsigned char *curPtr, int patc
     curPtr += *tileDataSize;
   }
   ska::flat_hash_set<uint32_t> obstacleResNameHashes;
-  if (tileCacheNeeded && tc)
+  if (tc)
   {
     for (int i = 0; i < *numTCTiles; ++i)
     {
@@ -673,13 +804,27 @@ static bool load_nav_mesh_orig(int nav_mesh_idx, unsigned char *curPtr, int patc
     }
 #undef INIT_BY_PTR
   }
-  if (patchedTilesSize > 0)
+  TileCacheDetailSettings detailSettings;
+  if (read_tilecache_detail_settings(curPtr, endPtr, detailSettings))
+    nmData.tcMeshProc.setDetailedData(detailSettings.includeDetailedData != 0, detailSettings.detailSampleDist,
+      detailSettings.detailSampleMaxError);
+  else
+    nmData.tcMeshProc.setDetailedData(false, 0.0f, 0.0f);
+
+  if (patch_info.fileSize > 0)
   {
     nmData.navMesh->reconstructFreeList();
-    patchedNavMesh_loadFromFile(patchNavMeshFileName, tc, curPtr, obstacleResNameHashes);
+    // a patch that fails mid way leaves inconsistent tiles behind, so fail the load
+    if (!patchedNavMesh_loadFromFile(patchNavMeshFileName, tc, curPtr, obstacleResNameHashes))
+    {
+      LOGERR_CTX("Could not apply navmesh patch '%s'", patchNavMeshFileName);
+      if (tc)
+        dtFreeTileCache(tc);
+      return false;
+    }
   }
   nmData.navMesh->reconstructFreeList();
-  if (tileCacheNeeded)
+  if (tc)
     tilecache_init(tc, obstacleResNameHashes);
 
   return true;
@@ -708,8 +853,6 @@ static bool init_nav_query(int nav_mesh_idx)
 static bool create_nav_mesh(int nav_mesh_idx)
 {
   NavMeshData &nmData = get_nav_mesh_data(nav_mesh_idx);
-  nmData.tcComp.reset(false);
-
   nmData.navMesh = dtAllocNavMesh();
   if (!nmData.navMesh)
   {
@@ -723,11 +866,12 @@ static bool create_nav_mesh(int nav_mesh_idx)
 bool reload_nav_mesh(int extra_tiles)
 {
   clear_nav_mesh(NM_MAIN, false);
+  NavMeshData &nmData = get_nav_mesh_data(NM_MAIN);
 
   if (!create_nav_mesh(NM_MAIN))
     return false;
 
-  if (!load_nav_mesh_orig(NM_MAIN, &get_nav_mesh_data(NM_MAIN).navData[0], 0, "", extra_tiles))
+  if (!load_nav_mesh_orig(NM_MAIN, &nmData.navData[0], nmData.navDataSize, "", {}, extra_tiles))
     return false;
 
   if (!init_nav_query(NM_MAIN))
@@ -753,6 +897,8 @@ bool load_nav_mesh_ex(int nav_mesh_idx, const char *kind, IGenLoad &_crd, NavMes
 
   if (!create_nav_mesh(nav_mesh_idx))
     return false;
+  nmData.navMeshType = type;
+  nmData.tiledBuildSettings = TiledNavMeshBuildSettings();
 
   unsigned navDataSize = _crd.readInt();
   bool isBucketFormat = (type == NMT_TILECACHED) && (navDataSize == 0x80000000);
@@ -793,19 +939,18 @@ bool load_nav_mesh_ex(int nav_mesh_idx, const char *kind, IGenLoad &_crd, NavMes
       chunkedReadBuf.resize(navDataSize);
   }
 
-  int patchedExtraTiles = 0;
-  unsigned patchedTilesSize = 0;
+  PatchedNavMeshFileInfo patchInfo;
   if (type == NMT_TILECACHED && patchNavMeshFileName && *patchNavMeshFileName)
-    patchedTilesSize = patchedNavMesh_getFileSizeAndNumTiles(patchNavMeshFileName, patchedExtraTiles);
+    patchInfo = patchedNavMesh_getFileInfo(patchNavMeshFileName);
 #if !_TARGET_PC_TOOLS_BUILD
-  if (DAGOR_UNLIKELY(patchedTilesSize)) // TODO: pass to loadNavMesh{BucketFormat,Chunked} to avoid this realloc
+  if (DAGOR_UNLIKELY(patchInfo.fileSize)) // TODO: pass to loadNavMesh{BucketFormat,Chunked} to avoid this realloc
   {
-    chunkedReadBuf.reserve(chunkedReadBuf.size() + patchedTilesSize); // Realloc to exact size (without sizex1.5)
+    chunkedReadBuf.reserve(chunkedReadBuf.size() + patchInfo.fileSize); // Realloc to exact size (without sizex1.5)
     chunkedReadBuf.resize(chunkedReadBuf.capacity());
   }
   auto &navDataLocal = chunkedReadBuf;
 #else // Note: Tools might use custom dtAlloc/dtFree so conform to it
-  decltype(nmData.navData) navDataLocal((uint8_t *)dtAlloc(chunkedReadBuf.size() + patchedTilesSize, DT_ALLOC_PERM));
+  decltype(nmData.navData) navDataLocal((uint8_t *)dtAlloc(chunkedReadBuf.size() + patchInfo.fileSize, DT_ALLOC_PERM));
   memcpy(navDataLocal.get(), chunkedReadBuf.data(), chunkedReadBuf.size());
 #endif
 
@@ -841,12 +986,38 @@ bool load_nav_mesh_ex(int nav_mesh_idx, const char *kind, IGenLoad &_crd, NavMes
   else if (type == NMT_TILED)
   {
     unsigned char *curPtr = &navDataLocal[0];
+    const unsigned char *endPtr = curPtr + navDataSize;
 #define INIT_BY_PTR(typ, name) \
   typ *name = (typ *)curPtr;   \
   curPtr += sizeof(typ);
     INIT_BY_PTR(dtNavMeshParams, params);
     INIT_BY_PTR(int, numTiles);
-    if (dtStatusFailed(nmData.navMesh->init(params, false)))
+    dtNavMeshParams meshParams = *params;
+#ifdef DT_POLYREF64
+    // Exported maxTiles counts the whole tile grid while the buffer only holds tiles
+    // with data. With DT_POLYREF64 the poly ref bit layout does not depend on maxTiles,
+    // so size the tile array by the highest index in use.
+    {
+      int maxTileIndex = -1;
+      const unsigned char *scanPtr = curPtr;
+      const unsigned char *endPtr = &navDataLocal[0] + navDataSize;
+      const intptr_t recordHeaderSize = sizeof(dtTileRef) + sizeof(int);
+      for (int i = 0; i < *numTiles; ++i)
+      {
+        // the tile table is not validated yet, so never scan past the loaded dump
+        if (endPtr - scanPtr < recordHeaderSize)
+          break;
+        const dtTileRef tileRef = *(const dtTileRef *)scanPtr;
+        const int tileDataSize = *(const int *)(scanPtr + sizeof(dtTileRef));
+        if (!tileRef || tileDataSize <= 0 || tileDataSize > endPtr - scanPtr - recordHeaderSize)
+          break;
+        maxTileIndex = max(maxTileIndex, (int)nmData.navMesh->decodePolyIdTile(tileRef));
+        scanPtr += recordHeaderSize + tileDataSize;
+      }
+      meshParams.maxTiles = min(meshParams.maxTiles, max(maxTileIndex + 1, 1));
+    }
+#endif
+    if (dtStatusFailed(nmData.navMesh->init(&meshParams, false)))
     {
       LOGERR_CTX("Could not init tiled Detour navmesh");
       return false;
@@ -857,41 +1028,58 @@ bool load_nav_mesh_ex(int nav_mesh_idx, const char *kind, IGenLoad &_crd, NavMes
       INIT_BY_PTR(int, tileDataSize);
       if (!*tileRef || !*tileDataSize)
         break;
-#if _TARGET_CPU_BE
-      if (!dtNavMeshHeaderSwapEndian(curPtr, *tileDataSize))
-      {
-        LOGERR_CTX("dtNavMeshHeaderSwapEndian fails");
-        return false;
-      }
-      if (!dtNavMeshDataSwapEndian(curPtr, *tileDataSize))
-      {
-        LOGERR_CTX("dtNavMeshDataSwapEndian fails");
-        return false;
-      }
-#endif
       const dtMeshHeader *header = (const dtMeshHeader *)curPtr;
-      if (!tile_check_cb || tile_check_cb(BBox3(Point3(header->bmin[0], header->bmin[1], header->bmin[2]),
-                              Point3(header->bmax[0], header->bmax[1], header->bmax[2]))))
-      {
-        if (dtStatusFailed(nmData.navMesh->addTile(curPtr, *tileDataSize, 0, *tileRef, nullptr)))
+      auto addTile = [&](uint8_t *td) {
+        int flags = (td == curPtr) ? 0 : DT_TILE_FREE_DATA;
+        if (dtStatusFailed(nmData.navMesh->addTile(td, *tileDataSize, flags, *tileRef, nullptr))) [[unlikely]]
         {
-          LOGERR_CTX("navMesh->addTile fails");
+          LOGERR_CTX("navMesh->addTile(%d) fails", i);
           return false;
         }
+        return true;
+      };
+      if (!tile_check_cb)
+      {
+        if (!addTile(curPtr))
+          return false;
+      }
+      else if (tile_check_cb(BBox3(Point3(header->bmin[0], header->bmin[1], header->bmin[2]),
+                 Point3(header->bmax[0], header->bmax[1], header->bmax[2]))))
+      {
+        if (!addTile((uint8_t *)memcpy(dtAlloc(*tileDataSize, DT_ALLOC_PERM), curPtr, *tileDataSize)))
+          return false;
       }
       curPtr += *tileDataSize;
     }
+    if (endPtr - curPtr >= (intptr_t)sizeof(uint32_t))
+    {
+      uint32_t settingsSize = 0;
+      memcpy(&settingsSize, curPtr, sizeof(settingsSize));
+      if (settingsSize >= sizeof(uint32_t) && settingsSize <= (uint32_t)(endPtr - curPtr))
+      {
+        const size_t copySize = settingsSize < sizeof(nmData.tiledBuildSettings) ? settingsSize : sizeof(nmData.tiledBuildSettings);
+        memcpy(&nmData.tiledBuildSettings, curPtr, copySize);
+      }
+    }
+    nmData.tiledBuildSettings.size = sizeof(nmData.tiledBuildSettings);
+    if (tile_check_cb) // Free whole data since we added only needed tiles `DT_TILE_FREE_DATA`
+      navDataLocal = eastl::remove_cvref_t<decltype(navDataLocal)>{};
     nmData.navMesh->reconstructFreeList();
 #undef INIT_BY_PTR
   }
   else if (type == NMT_TILECACHED)
-    load_nav_mesh_orig(nav_mesh_idx, &navDataLocal[0], patchedTilesSize, patchNavMeshFileName, patchedExtraTiles);
+  {
+    if (!load_nav_mesh_orig(nav_mesh_idx, &navDataLocal[0], (int)navDataSize, patchNavMeshFileName, patchInfo, 0))
+      return false;
+  }
   else
     G_ASSERTF_RETURN(0, false, "Unknown navmesh type %#x", (int)type);
 
-  init_nav_query(nav_mesh_idx);
+  if (!init_nav_query(nav_mesh_idx))
+    return false;
 
   nmData.navData = eastl::move(navDataLocal);
+  nmData.navDataSize = (int)navDataSize;
 
   return true;
 }
@@ -1013,7 +1201,8 @@ static int fixupShortcuts(dtPolyRef *path, int npath, dtNavMeshQuery *nav_query)
 bool get_offmesh_connection_end_points(int nav_mesh_idx, dtPolyRef poly, const float *next_pos, Point3 &start, Point3 &end);
 
 static bool getSteerTarget(int nav_mesh_idx, const float *startPos, const float *endPos, const float minTargetDist,
-  const dtPolyRef *path, const int pathSize, float *steerPos, unsigned char &steerPosFlag, dtPolyRef &steerPosRef)
+  const dtPolyRef *path, const int pathSize, float *steerPos, unsigned char &steerPosFlag, dtPolyRef &steerPosRef,
+  bool skipClosePoints = false)
 {
   NavMeshData &nmData = get_nav_mesh_data(nav_mesh_idx);
   // Find steer target.
@@ -1030,8 +1219,15 @@ static bool getSteerTarget(int nav_mesh_idx, const float *startPos, const float 
   int ns = 0;
   while (ns < nsteerPath)
   {
-    // Stop at Off-Mesh link or when point is further than slop away.
-    if ((steerPathFlags[ns] & DT_STRAIGHTPATH_OFFMESH_CONNECTION) || !inRange(&steerPath[ns * 3], startPos, minTargetDist, 1000.0f))
+    // Stop at Off-Mesh link.
+    if (steerPathFlags[ns] & DT_STRAIGHTPATH_OFFMESH_CONNECTION)
+      break;
+    // Stop when moveAlongSurface is stuck against a wall (skipClosePoints=true)
+    // and this is not the start position itself (ns > 0).
+    if (skipClosePoints && ns > 0)
+      break;
+    // Stop when the point is far enough.
+    if (!inRange(&steerPath[ns * 3], startPos, minTargetDist, 1000.0f))
       break;
     uint16_t polyFlags = 0;
     // cut-off almost passed offmesh connections
@@ -1110,7 +1306,7 @@ static Point3 get_poly_center(const dtMeshTile *tile, const dtPoly *poly);
 // req_first & req_second -- info via which polys_first & polys_second were calculated
 // req_first.end ougth to be equal req_second.start
 // resulting path is stored in polys_first
-inline FindPathResult smooth_concatenate_paths(dtNavMeshQuery *nav_query, FindRequest &req_first, FindRequest req_second,
+inline FindPathResult smooth_concatenate_paths(dtNavMeshQuery *nav_query, FindRequest &req_first, const FindRequest &req_second,
   const NavParams &nav_params, dtPolyRef *polys_first, const dtPolyRef *polys_second, int offset_first, int offset_second,
   const dtQueryFilter &filter, int max_path)
 {
@@ -1120,7 +1316,7 @@ inline FindPathResult smooth_concatenate_paths(dtNavMeshQuery *nav_query, FindRe
   {
     int numPolysTmp = req_first.numPolys - offset_first - 1;
     FindRequest auxReq = {Point3(), Point3(), req_first.includeFlags, req_first.excludeFlags, req_first.extents,
-      req_first.maxJumpUpHeight, 0, polys_first[numPolysTmp], polys_second[offset_second], req_first.areasCost};
+      req_first.maxJumpUpHeight, 0, polys_first[numPolysTmp], polys_second[offset_second]};
 
     const dtMeshTile *tile = nullptr;
     const dtPoly *poly = nullptr;
@@ -1179,22 +1375,13 @@ inline FindPathResult find_poly_path_curved(dtNavMeshQuery *nav_query, FindReque
   offset *= deflectionOffsetLen;
   const Point3 end = wishPos + offset;
 
+  // the segments below are only queried with the filter built above, their own area costs are never read
   FindRequest initialSegment = {
-    req.start,
-    start,
-    req.includeFlags,
-    req.excludeFlags,
-    req.extents,
-    req.maxJumpUpHeight,
-    0,
-    dtPolyRef(),
-    dtPolyRef(),
-    req.areasCost,
-  };
+    req.start, start, req.includeFlags, req.excludeFlags, req.extents, req.maxJumpUpHeight, 0, dtPolyRef(), dtPolyRef()};
   FindRequest movementSegment = {
-    start, end, req.includeFlags, req.excludeFlags, req.extents, req.maxJumpUpHeight, 0, dtPolyRef(), dtPolyRef(), req.areasCost};
+    start, end, req.includeFlags, req.excludeFlags, req.extents, req.maxJumpUpHeight, 0, dtPolyRef(), dtPolyRef()};
   FindRequest finalSegment = {
-    end, req.end, req.includeFlags, req.excludeFlags, req.extents, req.maxJumpUpHeight, 0, dtPolyRef(), dtPolyRef(), req.areasCost};
+    end, req.end, req.includeFlags, req.excludeFlags, req.extents, req.maxJumpUpHeight, 0, dtPolyRef(), dtPolyRef()};
 
   if (
     dtStatusFailed(nav_query->findNearestPoly(&initialSegment.start.x, &req.extents.x, &filter, &initialSegment.startPoly, nullptr)) ||
@@ -1287,6 +1474,9 @@ FindPathResult find_path_ex(int nav_mesh_idx, Tab<Point3> &path, FindRequest &re
       dtVcopy(&smoothPath[nsmoothPath * 3], iterPos);
       nsmoothPath++;
 
+      const float steerStuckThresholdSqr = sqr(0.01f);
+      bool skipClosePoints = false;
+
       // Move towards target a small advancement at a time until target reached or
       // when ran out of memory to store the path.
       while (npolys && nsmoothPath < MAX_SMOOTH)
@@ -1296,7 +1486,8 @@ FindPathResult find_path_ex(int nav_mesh_idx, Tab<Point3> &path, FindRequest &re
         unsigned char steerPosFlag;
         dtPolyRef steerPosRef;
 
-        if (!getSteerTarget(nav_mesh_idx, iterPos, targetPos, slop, polys_c, npolys, steerPos, steerPosFlag, steerPosRef))
+        if (!getSteerTarget(nav_mesh_idx, iterPos, targetPos, slop, polys_c, npolys, steerPos, steerPosFlag, steerPosRef,
+              skipClosePoints))
           break;
 
         bool endOfPath = (steerPosFlag & DT_STRAIGHTPATH_END) ? true : false;
@@ -1319,6 +1510,8 @@ FindPathResult find_path_ex(int nav_mesh_idx, Tab<Point3> &path, FindRequest &re
         dtPolyRef visited[16];
         int nvisited = 0;
         nmData.navQuery->moveAlongSurface(polys_c[0], iterPos, moveTgt, &filter, result, visited, &nvisited, 16);
+
+        skipClosePoints = dtVdistSqr(result, moveTgt) > steerStuckThresholdSqr;
 
         if (nvisited > 0)
           npolys = fixupCorridor(polys_c, npolys, max_path_size, visited, nvisited);
@@ -1394,10 +1587,11 @@ FindPathResult find_path_ex(int nav_mesh_idx, Tab<Point3> &path, FindRequest &re
 }
 
 FindPathResult find_path_ex(int nav_mesh_idx, const Point3 &start_pos, const Point3 &end_pos, Tab<Point3> &path, float dist_to_path,
-  float step_size, float slop, const CustomNav *custom_nav, const dag::Vector<Point2> &areasCost, int incl_flags, int excl_flags)
+  float step_size, float slop, const CustomNav *custom_nav, dag::ConstSpan<Point2> areasCost, int incl_flags, int excl_flags)
 {
   const Point3 extents(dist_to_path, FLT_MAX, dist_to_path);
-  FindRequest req = {start_pos, end_pos, incl_flags, excl_flags, extents, FLT_MAX, 0, dtPolyRef(), dtPolyRef(), areasCost};
+  FindRequest req = {start_pos, end_pos, incl_flags, excl_flags, extents, FLT_MAX, 0, dtPolyRef(), dtPolyRef()};
+  req.areasCost.assign(areasCost.begin(), areasCost.end());
   return find_path_ex(nav_mesh_idx, path, req, step_size, slop, custom_nav);
 }
 
@@ -1414,10 +1608,11 @@ FindPathResult findPath(Tab<Point3> &path, FindRequest &req, float step_size, fl
 }
 
 FindPathResult findPath(const Point3 &start_pos, const Point3 &end_pos, Tab<Point3> &path, float dist_to_path, float step_size,
-  float slop, const CustomNav *custom_nav, const dag::Vector<Point2> &areasCost, int incl_flags, int excl_flags)
+  float slop, const CustomNav *custom_nav, dag::ConstSpan<Point2> areasCost, int incl_flags, int excl_flags)
 {
   const Point3 extents(dist_to_path, FLT_MAX, dist_to_path);
-  FindRequest req = {start_pos, end_pos, incl_flags, excl_flags, extents, FLT_MAX, 0, dtPolyRef(), dtPolyRef(), areasCost};
+  FindRequest req = {start_pos, end_pos, incl_flags, excl_flags, extents, FLT_MAX, 0, dtPolyRef(), dtPolyRef()};
+  req.areasCost.assign(areasCost.begin(), areasCost.end());
   return findPath(path, req, step_size, slop, custom_nav);
 }
 
@@ -1695,19 +1890,36 @@ bool navmesh_point_has_obstacle(const Point3 &pos, const CustomNav *custom_nav)
   return false;
 }
 
-static bool query_navmesh_projections_impl(const Point3 &pos, const Point3 &extents, Tab<Point3> &projections,
-  Tab<dtPolyRef> *out_polys, int points_num, const CustomNav *custom_nav)
+template <class PolyContainer>
+static bool query_navmesh_polys_impl(const Point3 &pos, const Point3 &extents, PolyContainer &out_polys, int max_polys,
+  const CustomNav *custom_nav)
 {
   if (!navQuery)
     return false;
   NavQueryFilter filter(NM_MAIN, custom_nav);
   filter.setIncludeFlags(POLYFLAGS_WALK);
   filter.setExcludeFlags(0);
-  eastl::fixed_vector<dtPolyRef, 16, true, framemem_allocator> polys;
-  polys.resize(points_num);
+  out_polys.resize(max_polys);
   int numPolys = 0;
-  navQuery->queryPolygons(&pos.x, &extents.x, &filter, polys.data(), &numPolys, points_num);
-  for (auto &poly : polys)
+  navQuery->queryPolygons(&pos.x, &extents.x, &filter, out_polys.data(), &numPolys, max_polys);
+  out_polys.resize(numPolys);
+  return numPolys > 0;
+}
+
+bool query_navmesh_polys(const Point3 &pos, const Point3 &extents, Tab<dtPolyRef> &out_polys, int max_polys,
+  const CustomNav *custom_nav)
+{
+  return query_navmesh_polys_impl(pos, extents, out_polys, max_polys, custom_nav);
+}
+
+static bool query_navmesh_projections_impl(const Point3 &pos, const Point3 &extents, Tab<Point3> &projections,
+  Tab<dtPolyRef> *out_polys, int points_num, const CustomNav *custom_nav)
+{
+  if (!navQuery)
+    return false;
+  eastl::fixed_vector<dtPolyRef, 16, true, framemem_allocator> polys;
+  query_navmesh_polys_impl(pos, extents, polys, points_num, custom_nav);
+  for (auto poly : polys)
   {
     Point3 res;
     bool posOverPoly;
@@ -2006,7 +2218,7 @@ void renderDebug(const Frustum *p_frustum, int nav_mesh_idx, bool flag_coloring)
           perpDir = normalize(Point3(-perpDir.z, 0.f, perpDir.x));
           Point3 arrowPos1 = a + perpDir * 0.03f;
           Point3 arrowPos2 = a - perpDir * 0.03f;
-          E3DCOLOR color = E3DCOLOR(30, 0, 170);
+          E3DCOLOR color = E3DCOLOR(255, 0, 170);
           draw_cached_debug_line(a, b, color);
           draw_cached_debug_line(arrowPos1, b, color);
           draw_cached_debug_line(arrowPos2, b, color);
@@ -2083,12 +2295,13 @@ void init_path_corridor(dtPathCorridor &corridor) { corridor.init(max_path_size)
 
 inline NavQueryFilter init_request_filter(int nav_mesh_idx, const CorridorInput &inp, const CustomNav *custom_nav, FindRequest &req)
 {
-  req = {inp.start, inp.target, inp.includeFlags, inp.excludeFlags, inp.extents, inp.maxJumpUpHeight, 0, inp.startPoly, inp.targetPoly,
-    inp.areasCost};
+  // the costs are only needed by the filter, the request itself is queried through it
+  req = {
+    inp.start, inp.target, inp.includeFlags, inp.excludeFlags, inp.extents, inp.maxJumpUpHeight, 0, inp.startPoly, inp.targetPoly};
   NavQueryFilter filter(nav_mesh_idx, custom_nav, req.maxJumpUpHeight, false, inp.costAddition);
   filter.setIncludeFlags(req.includeFlags);
   filter.setExcludeFlags(req.excludeFlags);
-  filter.setAreasCost(req.areasCost);
+  filter.setAreasCost(inp.areasCost);
 
   return filter;
 }
@@ -2188,6 +2401,7 @@ int find_corridor_corners_ex(int nav_mesh_idx, dtPathCorridor &corridor, float *
     return 0;
 
   static const float MIN_TARGET_DIST = 0.01f;
+  static const float MAX_JUMPLINK_DIST = 1.5f;
 
   int ncorners = 0;
   nmData.navQuery->findStraightPath(corridor.getPos(), corridor.getTarget(), corridor.getPath(), corridor.getPathCount(), corner_verts,
@@ -2196,8 +2410,10 @@ int find_corridor_corners_ex(int nav_mesh_idx, dtPathCorridor &corridor, float *
   // Prune points in the beginning of the path which are too close.
   while (ncorners)
   {
-    if ((corner_flags[0] & DT_STRAIGHTPATH_OFFMESH_CONNECTION) ||
-        dtVdist2DSqr(&corner_verts[0], corridor.getPos()) > dtSqr(MIN_TARGET_DIST))
+    if (corner_flags[0] & DT_STRAIGHTPATH_OFFMESH_CONNECTION)
+      break;
+    const float nextDistSq = dtVdist2DSqr(&corner_verts[0], corridor.getPos());
+    if (nextDistSq > dtSqr(MAX_JUMPLINK_DIST))
       break;
     uint16_t polyFlags = 0;
     // cut-off almost passed offmesh connections
@@ -2212,6 +2428,8 @@ int find_corridor_corners_ex(int nav_mesh_idx, dtPathCorridor &corridor, float *
         break;
       }
     }
+    if (nextDistSq > dtSqr(MIN_TARGET_DIST))
+      break;
     ncorners--;
     if (ncorners)
     {
@@ -2360,7 +2578,8 @@ int move_over_offmesh_link_in_corridor(dtPathCorridor &corridor, const Point3 &p
     if (over_link != OVER_JUMP_LINK)
     {
       Point2 dir = normalize(Point2::xz(end - start));
-      if (dir * Point2::xz(start - pos) > min(extents.x, extents.z)) // we haven't reached start yet
+      Point2 delta = Point2::xz(start - pos);
+      if (dir * delta > extents.x || abs(dir.y * delta.x - dir.x * delta.y) > extents.z) // we haven't reached start yet
         return 0;
     }
 
@@ -2402,7 +2621,8 @@ int move_over_offmesh_link_in_corridor(dtPathCorridor &corridor, const Point3 &p
     static const float MIN_TARGET_DIST_SQ = 0.01f;
     static const float MAX_HEIGHT_OVER = 0.25f;
     static const float MIN_JUMP_THRESHOLD = 2.5f;
-    if (lengthSq(end - pos) < MIN_TARGET_DIST_SQ)
+    const float distToEndSq = lengthSq(end - pos);
+    if (distToEndSq < MIN_TARGET_DIST_SQ)
       overConnection = false;
     else if (pos.y > start.y + MAX_HEIGHT_OVER && pos.y > end.y + MAX_HEIGHT_OVER)
       overConnection = false;
@@ -2413,6 +2633,12 @@ int move_over_offmesh_link_in_corridor(dtPathCorridor &corridor, const Point3 &p
     insert_item_at(corners, 0, end);
     if (curRef == endRef) // we're over final polygon - prune
     {
+      over_link = 0;
+      corridor.moveOverOffmeshConnection(connRef, refs, &tmp.x, &end.x, navQuery);
+    }
+    else if (standaloneJumpLink && distToEndSq < lengthSq(end - start) && lengthSq(start - pos) >= sqr(0.3f))
+    {
+      // we moved far enough from start to end - prune
       over_link = 0;
       corridor.moveOverOffmeshConnection(connRef, refs, &tmp.x, &end.x, navQuery);
     }
@@ -2874,6 +3100,80 @@ bool find_polys_in_circle(dag::Vector<dtPolyRef, framemem_allocator> &polys, con
   return find_polys_in_circle_ex(NM_MAIN, polys, pos, radius, height_half_offset);
 }
 
+bool is_navmesh_position_suitable_ex(int nav_mesh_idx, const Point3 &pos, float horz_extents, float vert_extents, int min_polys,
+  int max_depth)
+{
+  NavMeshData &nmData = get_nav_mesh_data(nav_mesh_idx);
+  if (!nmData.navQuery)
+    return false;
+
+  NavQueryFilter filter(nav_mesh_idx, nullptr);
+  filter.setIncludeFlags(POLYFLAGS_WALK);
+  filter.setExcludeFlags(0);
+
+  const Point3 extents(horz_extents, vert_extents, horz_extents);
+  dtPolyRef startRef = 0;
+  Point3 projectedPos;
+  if (dtStatusFailed(nmData.navQuery->findNearestPoly(&pos.x, &extents.x, &filter, &startRef, &projectedPos.x)) || startRef == 0)
+    return false;
+  if (abs(pos.y - projectedPos.y) > vert_extents)
+    return false;
+
+  if (min_polys <= 0)
+    return true;
+
+  const dtNavMesh *nav = nmData.navQuery->getAttachedNavMesh();
+
+  static const int MAX_POLYS = 64;
+  dtPolyRef polys[MAX_POLYS];
+  int count = 0;
+  polys[count++] = startRef;
+  min_polys = clamp(min_polys, 1, MAX_POLYS);
+
+  int prevEnd = 0;
+  for (int d = 0; d < max_depth && count < min_polys; ++d)
+  {
+    int curEnd = count;
+    for (int i = prevEnd; i < curEnd && count < min_polys; ++i)
+    {
+      const dtMeshTile *tile = nullptr;
+      const dtPoly *poly = nullptr;
+      nav->getTileAndPolyByRefUnsafe(polys[i], &tile, &poly);
+
+      for (unsigned int k = poly->firstLink; k != DT_NULL_LINK; k = tile->links[k].next)
+      {
+        dtPolyRef neiRef = tile->links[k].ref;
+        if (!neiRef)
+          continue;
+
+        const dtMeshTile *neiTile = nullptr;
+        const dtPoly *neiPoly = nullptr;
+        nav->getTileAndPolyByRefUnsafe(neiRef, &neiTile, &neiPoly);
+
+        if (neiPoly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION)
+          continue;
+
+        bool found = false;
+        for (int v = 0; v < count; ++v)
+          if (polys[v] == neiRef)
+          {
+            found = true;
+            break;
+          }
+        if (found)
+          continue;
+
+        polys[count++] = neiRef;
+        if (count >= min_polys)
+          return true;
+      }
+    }
+    prevEnd = curEnd;
+  }
+
+  return count >= min_polys;
+}
+
 void mark_polygons_lower(float world_level, uint8_t area_id)
 {
   if (!navMesh)
@@ -3262,6 +3562,19 @@ bool update_walkability(int nav_mesh_idx, const eastl::function<bool(const Point
   }
 
   return true;
+}
+
+String make_file_path_for_nav_mesh_kind(const char *base_file_path, const char *nav_mesh_kind)
+{
+  String res(base_file_path);
+  if (!nav_mesh_kind || !*nav_mesh_kind)
+    return res;
+  const char *extentionPos = res.find('.', nullptr, /*forward*/ false);
+  if (!extentionPos)
+    return res;
+  String navMeshKindPostfix(100, "_%s", nav_mesh_kind);
+  res.insert(extentionPos - res.begin(), navMeshKindPostfix);
+  return res;
 }
 
 } // namespace pathfinder

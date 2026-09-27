@@ -11,9 +11,7 @@ namespace denoiser
 ENUM_PERSISTENT_NAMES
 const char *TextureNames::motion_vectors = "motion_vectors";
 const char *TextureNames::half_motion_vectors = "half_motion_vectors";
-const char *TextureNames::half_normals = "half_normals";
 const char *TextureNames::half_depth = "half_depth";
-const char *TextureNames::reblur_history_confidence = "reblur_history_confidence";
 #undef NAME
 
 #define NAME(name) const char *AODenoiser::TextureNames::name = TOSTRING(name);
@@ -22,6 +20,7 @@ ENUM_AO_DENOISED_NAMES
 
 #define NAME(name) const char *GIDenoiser::TextureNames::name = TOSTRING(name);
 ENUM_GI_DENOISED_NAMES
+const char *GIDenoiser::TextureNames::gi_validation = "gi_validation";
 #undef NAME
 
 #define NAME(name) const char *ReflectionDenoiser::TextureNames::name = TOSTRING(name);

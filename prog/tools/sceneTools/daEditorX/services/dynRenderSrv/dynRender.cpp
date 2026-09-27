@@ -2,15 +2,19 @@
 
 #include <de3_dynRenderService.h>
 #include <de3_skiesService.h>
+#include <EditorCore/ec_imguiInitialization.h>
 #include <EditorCore/ec_interface.h>
 #include <EditorCore/ec_ViewportWindow.h>
 #include <EditorCore/ec_camera_elem.h>
+#include <EditorCore/ec_gizmofilter.h>
 #include <EditorCore/ec_wndGlobal.h>
 #include <EditorCore/ec_wndPublic.h>
 #include <libTools/renderViewports/cachedViewports.h>
 #include <libTools/renderViewports/renderViewport.h>
 #include <libTools/staticGeom/geomObject.h>
 #include <libTools/util/strUtil.h>
+#include <propPanel/commonWindow/dialogManager.h>
+#include <propPanel/imguiHelper.h>
 #include <render/texDebug.h>
 #include <render/variance.h>
 #include <render/renderType.h>
@@ -18,10 +22,11 @@
 #include <render/waterObjects.h>
 #include <render/rain.h>
 #include <render/deferredRenderer.h>
+#include <render/specialVision/specialVision.h>
 #include <render/cascadeShadows.h>
 #include <render/lightCube.h>
 #include <render/ssao.h>
-#include <render/screenSpaceReflections.h>
+#include <screenSpaceReflections_api.h>
 #include <render/downsampleDepth.h>
 #include <render/motionVectorAccess.h>
 #include <render/viewVecs.h>
@@ -71,11 +76,13 @@
 #include <drv/3d/dag_platform_pc.h>
 #include <drv/3d/dag_resetDevice.h>
 #include <3d/dag_render.h>
+#include <3d/dag_resPtr.h>
 #include <3d/dag_texPackMgr2.h>
 #include <osApiWrappers/dag_direct.h>
 #include <osApiWrappers/dag_miscApi.h>
 #include <debug/dag_debug.h>
 #include <debug/dag_debug3d.h>
+#include <perfMon/dag_cpuFreq.h>
 #include <shaders/dag_overrideStateId.h>
 #include <shaders/dag_overrideStates.h>
 #include <shaders/dag_renderStateId.h>
@@ -88,10 +95,14 @@
 #include <drv/dag_vr.h>
 #include <shaders/dag_shaderMesh.h>
 
+#include "thermalVision.h"
+
 #if _TARGET_PC_WIN
 #include <windows.h>
 #endif
 
+static constexpr float SPARSE_SHADOW_UPDATE_MINDIST = 40.0f;
+static constexpr int SPARSE_SHADOW_UPDATE_FRAME = 4;
 static const uint32_t EXPOSURE_BUF_SIZE = 8;
 static TexStreamingContext currentTexCtx = {0};
 
@@ -130,6 +141,7 @@ static int shadowQuality = 0;
 static bool dynamicRenderInited = false;
 static bool vsm_allowed = true;
 static bool render_enabled = false;
+static bool present_suppressed = false;
 static float visibleScale = 1.0;
 static float maxVisibleRange = MAX_REAL;
 static float visibility_multiplier = 1.0;
@@ -205,16 +217,25 @@ public:
     RTYPE_DYNAMIC_DEFERRED = IDynRenderService::RTYPE_DYNAMIC_DEFERRED,
   };
   int rtype;
-  bool reqEnviProbeUpdate;
+  bool reqEnviProbeUpdate = false;
+  int enviProbeTexCheckAtMs = 0, enviProbeCaptureDeadlineMs = 0;
   int dbgShowType;
   int effects_depth_texVarId = -1;
   bool renderMatrixOk;
   bool tryToggleVr = false;
+  ThermalVision thermalVision;
   shaders::OverrideStateId geomEnviId;
   shaders::RenderStateId defaultRenderStateId;
   shaders::RenderStateId alphaWriterRenderStateId;
   shaders::RenderStateId depthMaskRenderStateId;
   eastl::unique_ptr<FullColorGradingTonemapLUT> tonemapLUT;
+  UniqueBuf coloredQuadVb;
+  struct Vertex
+  {
+    Point3 p;
+    E3DCOLOR c;
+  };
+  static rendinst::DrawCollisionsFlag collisionFlags;
 
 public:
   DaEditor3DynamicScene()
@@ -240,14 +261,13 @@ public:
     enviProbe = NULL;
     enviProbeBlack = NULL;
     deferredCsm = NULL;
-    reqEnviProbeUpdate = true;
     deferredRtFmt = TEXFMT_A8R8G8B8 | TEXCF_SRGBREAD | TEXCF_SRGBWRITE;
     postfxRtFmt = TEXFMT_A8R8G8B8;
     deferred_mrt_cnt = 0;
     memset(deferred_mrt_fmts, 0, sizeof(deferred_mrt_fmts));
     srgb_backbuf_wr = false;
-    csmMinSparseDist = 100000;
-    csmMinSparseFrame = -1000;
+    csmMinSparseDist = SPARSE_SHADOW_UPDATE_MINDIST;
+    csmMinSparseFrame = SPARSE_SHADOW_UPDATE_FRAME;
     csmLambda = 0.8;
     csmMaxDist = 2000;
     vsmSz = 512;
@@ -294,12 +314,18 @@ public:
 
     rs.zFunc = CMPF_ALWAYS;
     alphaWriterRenderStateId = shaders::render_states::create(rs);
+    coloredQuadVb = dag::create_vb(sizeof(Vertex) * 4, SBCF_BIND_VERTEX | SBCF_DYNAMIC | SBCF_FRAMEMEM, "colored_quad_vb");
 
     effects_depth_texVarId = ::get_shader_variable_id("effects_depth_tex", true);
 
     if (VariableMap::isVariablePresent(get_shader_variable_id("Exposure", true)))
     {
       exposureBuffer = dag::buffers::create_ua_sr_structured(4, EXPOSURE_BUF_SIZE, "Exposure");
+      writeExposure(1.0f);
+    }
+    else if (VariableMap::isVariablePresent(get_shader_variable_id("exposure_params", true)))
+    {
+      exposureParamsVarId = get_shader_variable_id("exposure_params", true);
       writeExposure(1.0f);
     }
 
@@ -311,6 +337,8 @@ public:
     texdebug::teardown();
     shaders::overrides::destroy(geomEnviId);
     del_it(postFx);
+    del_d3dres(postfxRt);
+    del_d3dres(sceneRt);
     combinedShadowsRenderer.clear();
     deferredTarget.reset();
     light_probe::destroy(enviProbe);
@@ -325,6 +353,13 @@ public:
 
   void toggleVrMode() { tryToggleVr = true; }
 
+  void setThermalVision(bool on)
+  {
+    if (on == thermalVision.isEnabled())
+      return;
+    thermalVision.setEnabled(on);
+  }
+
   void onTonemapSettingsChanged()
   {
     if (tonemapLUT)
@@ -334,6 +369,10 @@ public:
   const ManagedTex &getDownsampledFarDepth()
   {
     return DAEDITOR3.getStereoIndex() == StereoIndex::Mono ? downsampledFarDepth : vrResources.downsampledFarDepth;
+  }
+  const ManagedTex &getPrevDownsampledFarDepth()
+  {
+    return DAEDITOR3.getStereoIndex() == StereoIndex::Mono ? downsampledFarDepthPrev : vrResources.downsampledFarDepthPrev;
   }
 
   void actScene() override
@@ -403,12 +442,22 @@ public:
     if (skip_next_frame)
       return;
 
-    if (rtype == RTYPE_DYNAMIC_DEFERRED && reqEnviProbeUpdate && enviProbe && isDaSkiesTexReady())
+    if (rtype == RTYPE_DYNAMIC_DEFERRED && reqEnviProbeUpdate && enviProbe && isDaSkiesTexReady() &&
+        get_time_msec() >= enviProbeTexCheckAtMs)
     {
-      debug("deferredRender: update enviProbe, grs_cur_view.pos=%@", grs_cur_view.pos);
-      gatherRendSrv();
-      updateEnviProbe();
-      reqEnviProbeUpdate = false;
+      // A capture renders 6 cube faces, so make one only when texture loading is idle and the sky lighting has
+      // converged. A capture taken while the sky still converges bakes in a darker ambient color, and nothing refreshes
+      // it later. Give up at the deadline, because asset rebuilds or a sky that never converges can keep this pending
+      // indefinitely.
+      unsigned int pendingTexCount = 0;
+      const bool texLoadIdle = !EDITORCORE->getPendingTextureLoadTotalCount(pendingTexCount) || pendingTexCount == 0;
+      if ((texLoadIdle && isDaSkiesLightingConverged()) || get_time_msec() >= enviProbeCaptureDeadlineMs)
+      {
+        debug("deferredRender: update enviProbe, grs_cur_view.pos=%@", grs_cur_view.pos);
+        gatherRendSrv();
+        updateEnviProbe();
+        reqEnviProbeUpdate = false;
+      }
     }
     if (tonemapLUT)
       tonemapLUT->render();
@@ -419,6 +468,12 @@ public:
   {
     if (ISkiesService *skiesSrv = EDITORCORE->queryEditorInterface<ISkiesService>())
       return skiesSrv->areCloudTexturesReady();
+    return true;
+  }
+  static bool isDaSkiesLightingConverged()
+  {
+    if (ISkiesService *skiesSrv = EDITORCORE->queryEditorInterface<ISkiesService>())
+      return skiesSrv->isLightingConverged();
     return true;
   }
 
@@ -451,6 +506,11 @@ public:
         ltSun1 = *ltService->getSun(1);
       else
         memset(&ltSun1, 0, sizeof(ltSun1));
+    }
+    if (deferredCsm && !are_approximately_equal(ltSun0.ltDir, lastSunDir))
+    {
+      lastSunDir = ltSun0.ltDir;
+      deferredCsm->invalidate();
     }
 
     if (tryToggleVr)
@@ -500,18 +560,9 @@ public:
       }
     }
 
-#if _TARGET_PC_WIN
-    HWND hwnd = (HWND)EDITORCORE->getWndManager()->getMainWindow();
-
-    RECT rect;
-    GetClientRect(hwnd, &rect);
-    const int clientRectWidth = rect.right - rect.left;
-    const int clientRectHeight = rect.bottom - rect.top;
-#else
     int clientRectWidth = 0;
     int clientRectHeight = 0;
     d3d::get_screen_size(clientRectWidth, clientRectHeight);
-#endif
 
     if (::grs_draw_wire)
       d3d::setwire(0);
@@ -529,19 +580,9 @@ public:
       rect.bottom = clientRectHeight;
       d3d::stretch_rect(d3d::get_backbuffer_tex(), vrResources.imguiTex.getTex2D(), &rect, &rect);
     }
-
-#if _TARGET_PC_WIN // TODO: tools Linux porting: check_and_restore_3d_device
-    // When toggling the application's window between minimized and maximized state the client size could be 0. This is
-    // here to avoid the assert in d3d::stretch_rect.
-    if (clientRectWidth <= 0 || clientRectHeight <= 0)
-      hwnd = nullptr;
-
-    if (check_and_restore_3d_device())
-      d3d::pcwin::set_present_wnd(hwnd);
-#else
-    check_and_restore_3d_device();
-#endif
   }
+
+  bool canPresentAndReset() override { return !present_suppressed || PropPanel::is_any_modal_dialog_open(); }
 
   BaseTexture *getRenderBuffer() { return sceneRt; }
 
@@ -562,6 +603,15 @@ public:
     if (!deferredTarget)
       return sceneRt;
 
+    if (isThermalVisionActive())
+    {
+      if (::grs_draw_wire)
+        d3d::setwire(0);
+      thermalVision.apply(sceneRt, postfxRt);
+      d3d::set_render_target({deferredTarget->getDepth(), 0, 0}, DepthAccess::SampledRO, {{postfxRt, 0, 0}});
+      return postfxRt;
+    }
+
     if (use_postfx)
     {
       if (::grs_draw_wire)
@@ -575,9 +625,8 @@ public:
       TMatrix4 projTm;
       d3d::gettm(TM_PROJ, &projTm);
       postFx->downsample(sceneRt, sceneRtId);
-      postFx->apply(sceneRt, sceneRtId, postfxRt, postfxRtId, ::grs_cur_view.tm, projTm, true);
-      d3d::set_render_target(postfxRt, 0);
-      d3d::set_depth(deferredTarget->getDepth(), DepthAccess::SampledRO);
+      postFx->apply(sceneRt, postfxRt, curView.tm, projTm, true);
+      d3d::set_render_target({deferredTarget->getDepth(), 0, 0}, DepthAccess::SampledRO, {{postfxRt, 0, 0}});
       return postfxRt;
     }
     else if (noPfxResolve.getMat())
@@ -585,8 +634,7 @@ public:
       static int sourceTexVarId = get_shader_variable_id("source_tex");
       if (::grs_draw_wire)
         d3d::setwire(0);
-      d3d::set_render_target(postfxRt, 0);
-      d3d::set_depth(deferredTarget->getDepth(), DepthAccess::SampledRO);
+      d3d::set_render_target({deferredTarget->getDepth(), 0, 0}, DepthAccess::SampledRO, {{postfxRt, 0, 0}});
       ShaderGlobal::set_texture(sourceTexVarId, sceneRtId);
       noPfxResolve.render();
       ShaderGlobal::set_texture(sourceTexVarId, BAD_TEXTUREID);
@@ -595,13 +643,19 @@ public:
     return sceneRt;
   }
 
-  void setupMotionParams(const ViewportWindow &vpw)
+  void setupMotionParams(const ViewportWindow &vpw, const TMatrix4 &proj_tm)
   {
     TMatrix viewItm;
     vpw.getCameraTransform(viewItm);
     float zn, zf;
     vpw.getZnearZfar(zn, zf);
-    motion_vector_access::CameraParams currentCamera{vpw.getViewTm(), viewItm, vpw.getProjTm(), viewItm.getcol(3), zn, zf};
+    Driver3dPerspective p;
+    if (d3d::getpersp(p)) // beforeRender hooks (Environment plugin) may override the z range
+    {
+      zn = p.zn;
+      zf = p.zf;
+    }
+    motion_vector_access::CameraParams currentCamera{vpw.getViewTm(), viewItm, proj_tm, viewItm.getcol(3), zn, zf};
     motion_vector_access::set_motion_vector_type(motion_vector_access::MotionVectorType::StaticUVZ);
     motion_vector_access::set_params(currentCamera, previousCamera.has_value() ? previousCamera.value() : currentCamera, {}, {},
       eastl::nullopt);
@@ -627,18 +681,15 @@ public:
     float viewportMinZ, viewportMaxZ;
     bool use_postfx = (::hdr_render_mode != HDR_MODE_NONE) && postFx && !renderNoPostfx;
 
+    curView.tm = vpw->getViewTm();
+    vpw->getCameraTransform(curView.itm);
+    curView.pos = curView.itm.getcol(3);
+
     d3d::get_render_target(rt);
     d3d::getview(viewportX, viewportY, viewportW, viewportH, viewportMinZ, viewportMaxZ);
 
-    if (renderNoPostfx)
-      setExposure(1.0f);
-
     if (use_heat_haze)
-    {
-      auto renderHazeParticles = [this]() { renderGeomDistortionFx(); };
-      auto renderHazeRI = [this]() { renderGeomDistortion(); };
-      heat_haze_glue.setFunctions(renderHazeParticles, renderHazeRI);
-    }
+      setHeatHazeFunctions();
 
     if (cached_render && sceneRt && viewportW == targetW && viewportH == targetH && hdr_render_format == sceneFmt)
       goto skip_render_scene;
@@ -647,13 +698,12 @@ public:
 
     updateBackBufSize(viewportW, viewportH);
     use_postfx = (::hdr_render_mode != HDR_MODE_NONE) && postFx && !renderNoPostfx;
-    if (renderNoPostfx)
-      setExposure(1.0f);
     if (!sceneRt)
       goto empty_render;
 
     // G_ASSERT(!rt.tex);
-    G_ASSERT(rt.isBackBufferColor());
+    // TODO: update Driver3dRenderTarget to support not null backbuffer texture
+    G_ASSERT(rt.isColorUsed(0) && (!rt.getColor(0).tex || d3d::get_backbuffer_tex() == rt.getColor(0).tex));
 
     if (vpw->needStat3d() && dgs_app_active)
     {
@@ -663,8 +713,7 @@ public:
     enable_wireframe = vpw->wireframeOverlayEnabled();
 
     beforeRender();
-    d3d::set_render_target(sceneRt, 0);
-    d3d::set_depth(fallbackSceneDepth.getTex2D(), DepthAccess::RW);
+    d3d::set_render_target({fallbackSceneDepth.getTex2D(), 0, 0}, DepthAccess::RW, {{sceneRt, 0, 0}});
     d3d::setview(0, 0, viewportW, viewportH, 0, 1);
     d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER | CLEAR_STENCIL, E3DCOLOR(64, 64, 64, 0), 0, 0);
 
@@ -675,11 +724,15 @@ public:
     }
     else if (rtype == RTYPE_DYNAMIC_DEFERRED)
     {
-      setupMotionParams(*vpw);
-      deferredRender(vpw->getViewTm(), vpw->getProjTm(), false);
+      // beforeRender let plugins adjust the driver projection (Environment z range);
+      // render with the projection actually set, not the viewport's own matrix
+      TMatrix4 projTm;
+      d3d::gettm(TM_PROJ, &projTm);
+      setupMotionParams(*vpw, projTm);
+      deferredRender(vpw->getViewTm(), projTm, false);
     }
 
-    if (use_heat_haze)
+    if (use_heat_haze && !isThermalVisionActive())
       heat_haze_glue.render();
 
   skip_render_scene:
@@ -694,8 +747,8 @@ public:
     {
       if (::grs_draw_wire)
         d3d::setwire(0);
-      d3d::set_render_target(finalRt, 0);
-      deferredTarget->debugRender(dbgShowType);
+      d3d::set_render_target({}, DepthAccess::RW, {{finalRt, 0, 0}});
+      deferredTarget->debugRender(nullptr, dbgShowType);
       goto skip_non_geom_render;
     }
 
@@ -737,11 +790,6 @@ public:
       d3d::set_program(d3d::get_debug_program());
       d3d::set_vs_const(0, &TMatrix4_vec4::IDENT, 4);
 
-      struct Vertex
-      {
-        Point3 p;
-        E3DCOLOR c;
-      };
       static Vertex v[4];
       v[0].p.set(-1, -1, 0);
       v[1].p.set(+1, -1, 0);
@@ -750,7 +798,10 @@ public:
 
       shaders::render_states::set(alphaWriterRenderStateId);
       v[0].c = v[1].c = v[2].c = v[3].c = 0xFFFFFFFF;
-      d3d::draw_up(PRIM_TRISTRIP, 2, v, sizeof(v[0]));
+      coloredQuadVb->updateData(0, sizeof(v), v, VBLOCK_WRITEONLY | VBLOCK_DISCARD);
+      d3d::setvsrc(0, coloredQuadVb.getBuf(), sizeof(Vertex));
+      d3d::draw(PRIM_TRISTRIP, 0, 2);
+      d3d::setvsrc(0, nullptr, 0);
 
       d3d::set_program(BAD_PROGRAM);
       shaders::overrides::reset();
@@ -771,7 +822,7 @@ public:
     dagor_frame_no_increment();
   }
 
-  void renderScreenShot()
+  void renderScreenShot(bool force_disable_wireframe)
   {
     int viewportX, viewportY, viewportW, viewportH;
     float viewportMinZ, viewportMaxZ;
@@ -779,18 +830,20 @@ public:
 
     d3d::get_render_target(rt);
     d3d::getview(viewportX, viewportY, viewportW, viewportH, viewportMinZ, viewportMaxZ);
+
+    // screenshot paths set up the view directly on the driver
+    d3d::gettm(TM_VIEW, curView.tm);
+    curView.itm = orthonormalized_inverse(curView.tm);
+    curView.pos = curView.itm.getcol(3);
+
     bool rt_ready = (sceneRt && viewportW == targetW && viewportH == targetH && sceneFmt == hdr_render_format);
     updateBackBufSize(viewportW, viewportH);
 
     bool use_postfx = (::hdr_render_mode != HDR_MODE_NONE) && postFx && !renderNoPostfx;
 
-    if (renderNoPostfx)
-      setExposure(1.0f);
-
   render_again:
     beforeRender();
-    d3d::set_render_target(sceneRt, 0);
-    d3d::set_depth(fallbackSceneDepth.getTex2D(), DepthAccess::RW);
+    d3d::set_render_target({fallbackSceneDepth.getTex2D(), 0, 0}, DepthAccess::RW, {{sceneRt, 0, 0}});
     d3d::setview(0, 0, viewportW, viewportH, viewportMinZ, viewportMaxZ);
     d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER | CLEAR_STENCIL, E3DCOLOR(64, 64, 64, 0), 0, 0);
 
@@ -815,24 +868,15 @@ public:
 
     Texture *finalRt = resolvePostProcessing(use_postfx, false);
 
-    if (rtype == RTYPE_DYNAMIC_DEFERRED && dbgShowType != -1)
+    const bool gbufferDebug = rtype == RTYPE_DYNAMIC_DEFERRED && dbgShowType != -1;
+    if (gbufferDebug)
     {
       if (::grs_draw_wire)
         d3d::setwire(0);
-      d3d::set_render_target(finalRt, 0);
-      deferredTarget->debugRender(dbgShowType);
-      goto skip_non_geom_render;
+      d3d::set_render_target({}, DepthAccess::RW, {{finalRt, 0, 0}});
+      deferredTarget->debugRender(nullptr, dbgShowType);
     }
 
-    IEditorCoreEngine::get()->renderObjects();
-    IEditorCoreEngine::get()->renderTransObjects();
-    ec_camera_elem::freeCameraElem->render();
-    ec_camera_elem::maxCameraElem->render();
-    ec_camera_elem::fpsCameraElem->render();
-    ec_camera_elem::tpsCameraElem->render();
-    ec_camera_elem::carCameraElem->render();
-
-  skip_non_geom_render:
     RectInt r;
     r.left = viewportX;
     r.top = viewportY;
@@ -844,11 +888,12 @@ public:
 
     // fill alfa mask using depthBuf
     {
-      d3d::set_render_target(rt.getColor(0).tex, 0);
+      BaseTexture *alphaMaskDepth;
       if (rtype == RTYPE_DYNAMIC_DEFERRED)
-        d3d::set_depth(deferredTarget->getDepth(), DepthAccess::RW);
+        alphaMaskDepth = deferredTarget->getDepth();
       else
-        d3d::set_depth(fallbackSceneDepth.getTex2D(), DepthAccess::RW);
+        alphaMaskDepth = fallbackSceneDepth.getTex2D();
+      d3d::set_render_target({alphaMaskDepth, 0, 0}, DepthAccess::RW, {{rt.getColor(0).tex, 0, 0}});
       d3d::setview(0, 0, viewportW, viewportH, viewportMinZ, viewportMaxZ);
 
       shaders::overrides::reset();
@@ -868,15 +913,38 @@ public:
 
       shaders::render_states::set(alphaWriterRenderStateId);
       v[0].c = v[1].c = v[2].c = v[3].c = 0xFFFFFFFF;
-      d3d::draw_up(PRIM_TRISTRIP, 2, v, sizeof(v[0]));
+      coloredQuadVb->updateData(0, sizeof(v), v, VBLOCK_WRITEONLY | VBLOCK_DISCARD);
+      d3d::setvsrc(0, coloredQuadVb.getBuf(), sizeof(Vertex));
+      d3d::draw(PRIM_TRISTRIP, 0, 2);
+      d3d::setvsrc(0, nullptr, 0);
 
       shaders::render_states::set(depthMaskRenderStateId);
       v[0].c = v[1].c = v[2].c = v[3].c = 0x00FFFFFF;
-      d3d::draw_up(PRIM_TRISTRIP, 2, v, sizeof(v[0]));
+      coloredQuadVb->updateData(0, sizeof(v), v, VBLOCK_WRITEONLY | VBLOCK_DISCARD);
+      d3d::setvsrc(0, coloredQuadVb.getBuf(), sizeof(Vertex));
+      d3d::draw(PRIM_TRISTRIP, 0, 2);
+      d3d::setvsrc(0, nullptr, 0);
 
       d3d::set_program(BAD_PROGRAM);
       shaders::overrides::reset();
       shaders::render_states::set(defaultRenderStateId);
+    }
+
+    if (!gbufferDebug)
+    {
+      if (!force_disable_wireframe && enable_wireframe && wireframeTex && wireframeRenderer.getMat())
+      {
+        wireframeTex.setVar();
+        wireframeRenderer.render();
+      }
+
+      IEditorCoreEngine::get()->renderObjects();
+      IEditorCoreEngine::get()->renderTransObjects();
+      ec_camera_elem::freeCameraElem->render();
+      ec_camera_elem::maxCameraElem->render();
+      ec_camera_elem::fpsCameraElem->render();
+      ec_camera_elem::tpsCameraElem->render();
+      ec_camera_elem::carCameraElem->render();
     }
 
     d3d_err(d3d::set_render_target(rt));
@@ -909,7 +977,6 @@ public:
           smpInfo.anisotropic_max = ::dgs_tex_anisotropy;
           d3d::SamplerHandle smp = d3d::request_sampler(smpInfo);
           ShaderGlobal::set_sampler(get_shader_variable_id("character_micro_details_samplerstate", true), smp);
-          ShaderGlobal::set_sampler(get_shader_variable_id("land_micro_details_samplerstate", true), smp);
         }
         ShaderGlobal::set_int(get_shader_variable_id("character_micro_details_count", true), microDetailCount);
         debug("microDetailCount = %d", microDetailCount);
@@ -926,11 +993,12 @@ public:
       return;
     }
 
-    ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
+    // restore the caller's frame block on exit; deferredRender resolve relies on it staying bound
+    FRAME_LAYER_GUARD(-1);
     BBox3 viewBox;
     static Point3 oldViewPos(0, 0, 0);
-    if (lengthSq(::grs_cur_view.pos - oldViewPos) > 400)
-      oldViewPos = ::grs_cur_view.pos;
+    if (lengthSq(curView.pos - oldViewPos) > 400)
+      oldViewPos = curView.pos;
     viewBox[0] = oldViewPos - Point3(vsmMaxDist, 2000, vsmMaxDist);
     viewBox[1] = oldViewPos + Point3(vsmMaxDist, 2000, vsmMaxDist);
 
@@ -943,8 +1011,8 @@ public:
 
       if (rtype == RTYPE_DYNAMIC_DEFERRED)
       {
-        tz = ShaderGlobal::get_color4_fast(transformZVarId);
-        ShaderGlobal::set_color4_fast(transformZVarId, 0.f, 0.f, 0, 1.f);
+        tz = ShaderGlobal::get_float4(transformZVarId);
+        ShaderGlobal::set_float4(transformZVarId, 0.f, 0.f, 0, 1.f);
       }
 
       for (int i = 0; i < rendSrv.size(); i++)
@@ -952,7 +1020,7 @@ public:
 
       if (rtype == RTYPE_DYNAMIC_DEFERRED)
       {
-        ShaderGlobal::set_color4_fast(transformZVarId, tz.r, tz.g, tz.b, tz.a);
+        ShaderGlobal::set_float4(transformZVarId, tz.r, tz.g, tz.b, tz.a);
       }
     }
     vsm.endShadowMap();
@@ -977,7 +1045,7 @@ public:
     SCOPE_VIEW_PROJ_MATRIX;
 
     Point3 dirToSun = ltSun0.ltDir;
-    Point3 groundPos = Point3::xVz(::grs_cur_view.pos, worldLevel);
+    Point3 groundPos = Point3::xVz(curView.pos, worldLevel);
     Point3 fomViewPos = groundPos + dirToSun * (fomZDistance + fomZViewBoxSize / dirToSun.y);
 
     BBox3 worldBox(groundPos + Point3(-fomXyViewBoxSize, 0, -fomXyViewBoxSize),
@@ -1012,9 +1080,9 @@ public:
       rendSrv[i]->renderGeometry(IRenderingService::STG_RENDER_SHADOWS_FOM);
 
     TMatrix4 texTm = TMatrix4(fomView) * fomProj * screen_to_tex_scale_tm_xy();
-    ShaderGlobal::set_color4(fom_shadows_tm_xVarId, texTm.m[0][0], texTm.m[1][0], texTm.m[2][0], texTm.m[3][0]);
-    ShaderGlobal::set_color4(fom_shadows_tm_yVarId, texTm.m[0][1], texTm.m[1][1], texTm.m[2][1], texTm.m[3][1]);
-    ShaderGlobal::set_color4(fom_shadows_tm_zVarId, texTm.m[0][2], texTm.m[1][2], texTm.m[2][2], texTm.m[3][2]);
+    ShaderGlobal::set_float4(fom_shadows_tm_xVarId, texTm.m[0][0], texTm.m[1][0], texTm.m[2][0], texTm.m[3][0]);
+    ShaderGlobal::set_float4(fom_shadows_tm_yVarId, texTm.m[0][1], texTm.m[1][1], texTm.m[2][1], texTm.m[3][1]);
+    ShaderGlobal::set_float4(fom_shadows_tm_zVarId, texTm.m[0][2], texTm.m[1][2], texTm.m[2][2], texTm.m[3][2]);
 
     d3d::resource_barrier({fomShadowsCos.getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
     d3d::resource_barrier({fomShadowsSin.getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});
@@ -1023,14 +1091,14 @@ public:
   }
   void disableFOM()
   {
-    ShaderGlobal::set_color4(fom_shadows_tm_xVarId, 0, 0, 0, -1);
-    ShaderGlobal::set_color4(fom_shadows_tm_yVarId, 0, 0, 0, -1);
-    ShaderGlobal::set_color4(fom_shadows_tm_zVarId, 0, 0, 0, -1e7);
+    ShaderGlobal::set_float4(fom_shadows_tm_xVarId, 0, 0, 0, -1);
+    ShaderGlobal::set_float4(fom_shadows_tm_yVarId, 0, 0, 0, -1);
+    ShaderGlobal::set_float4(fom_shadows_tm_zVarId, 0, 0, 0, -1e7);
   }
   void beforeRender()
   {
     ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
-    ShaderGlobal::set_color4(worldViewPosVarId, Color4(::grs_cur_view.pos.x, ::grs_cur_view.pos.y, ::grs_cur_view.pos.z, 1.f));
+    ShaderGlobal::set_float4(worldViewPosVarId, Color4(curView.pos.x, curView.pos.y, curView.pos.z, 1.f));
     IEditorCoreEngine::get()->beforeRenderObjects();
     if (hasEnvironmentSnapshot())
       applyEnvironmentSnapshot();
@@ -1038,7 +1106,7 @@ public:
     for (int i = 0; i < rendSrv.size(); i++)
       rendSrv[i]->renderGeometry(IRenderingService::STG_BEFORE_RENDER);
 
-    ShaderGlobal::set_color4(worldViewPosVarId, Color4(::grs_cur_view.pos.x, ::grs_cur_view.pos.y, ::grs_cur_view.pos.z, 1.f));
+    ShaderGlobal::set_float4(worldViewPosVarId, Color4(curView.pos.x, curView.pos.y, curView.pos.z, 1.f));
 
     mat44f viewMatrix4;
     d3d::gettm(TM_VIEW, viewMatrix4);
@@ -1051,8 +1119,8 @@ public:
     Frustum f;
     f.construct(pv);
     d3d::getpersp(p);
-    EDITORCORE->queryEditorInterface<IVisibilityFinderProvider>()->getVisibilityFinder().set(v_ldu(&::grs_cur_view.pos.x), f, 0, 0, 1,
-      p.hk, current_occlusion);
+    EDITORCORE->queryEditorInterface<IVisibilityFinderProvider>()->getVisibilityFinder().set(v_ldu(&curView.pos.x), f, 0, 0, 1, p.hk,
+      current_occlusion);
     currentTexCtx = TexStreamingContext(p, targetW);
 
 
@@ -1069,10 +1137,10 @@ public:
 
       Driver3dPerspective p(0, 0, 0.1, 1000, 0, 0);
       d3d::getpersp(p);
-      ShaderGlobal::set_color4(zn_zfarVarId, p.zn, p.zf, 0, 0);
-      ShaderGlobal::set_real(sky_plane_wVarId, p.zf * 0.999f);
+      ShaderGlobal::set_float4(zn_zfarVarId, p.zn, p.zf, 0, 0);
+      ShaderGlobal::set_float(sky_plane_wVarId, p.zf * 0.999f);
 
-      ShaderGlobal::set_color4(from_sun_directionVarId, -ltSun0.ltDir.x, -ltSun0.ltDir.y, -ltSun0.ltDir.z, 0);
+      ShaderGlobal::set_float4(from_sun_directionVarId, -ltSun0.ltDir.x, -ltSun0.ltDir.y, -ltSun0.ltDir.z, 0);
       setDeferredEnviLight();
       TMatrix4 projTm;
       d3d::gettm(TM_PROJ, &projTm);
@@ -1086,12 +1154,12 @@ public:
         mode.maxDist = csmMaxDist;
         mode.shadowStart = p.zn;
         mode.numCascades = 4;
-        deferredCsm->prepareShadowCascades(mode, ltSun0.ltDir, ::grs_cur_view.tm, ::grs_cur_view.pos, projTm, Frustum(globtm),
-          Point2(p.zn, p.zf), p.zn);
+        deferredCsm->prepareShadowCascades(mode, ltSun0.ltDir, curView.tm, curView.pos, projTm, Frustum(globtm), Point2(p.zn, p.zf),
+          p.zn);
       }
 
       TMatrix viewRot;
-      d3d::gettm(TM_VIEW, viewRot);
+      v_mat_43cu_from_mat44(viewRot.array, viewMatrix4);
       viewRot.setcol(3, 0.f, 0.f, 0.f);
 
       TMatrix4 resTm;
@@ -1111,9 +1179,12 @@ public:
       }
     }
 
-    if (hasExposure() && hasExposureChanged)
-      if (writeExposure(exposure))
-        hasExposureChanged = false;
+    const float wanted = getEffectiveExposure();
+    if (hasExposure() && wanted != writtenExposure)
+      writeExposure(wanted);
+
+    if (globalFrameBlockId != -1)
+      ShaderGlobal::setBlock(globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
   }
 
 
@@ -1149,25 +1220,21 @@ public:
     const Color4 *sphHarm = light_probe::getSphHarm(enviProbe);
 
     if (renderNoSun)
-      ShaderGlobal::set_color4(sun_color_0_varId, black);
+      ShaderGlobal::set_float4(sun_color_0_varId, black);
 
     bool no_ess = !hasEnvironmentSnapshot();
     if (renderNoAmb || no_ess)
       for (int i = 0; i < SphHarmCalc::SPH_COUNT; ++i)
-        ShaderGlobal::set_color4(envi_sph_N_texVarId[i], renderNoAmb ? black : sphHarm[i]);
+        ShaderGlobal::set_float4(envi_sph_N_texVarId[i], renderNoAmb ? black : sphHarm[i]);
 
     if (renderNoEnvRefl || no_ess) // set light probe only after updateEnviProbe() called at least once
     {
       ShaderGlobal::set_texture(local_light_probe_texVarId, *light_probe::getManagedTex(renderNoEnvRefl ? enviProbeBlack : enviProbe));
-      ShaderGlobal::set_sampler(get_shader_variable_id("local_light_probe_tex_samplerstate", true), d3d::request_sampler({}));
     }
   }
 
   void deferredRender(const TMatrix &view_tm, const TMatrix4 &proj_tm, bool vr_mode)
   {
-    static int global_frame_const_blockid = ShaderGlobal::getBlockId("global_const_block");
-    ShaderGlobal::setBlock(global_frame_const_blockid, ShaderGlobal::LAYER_GLOBAL_CONST);
-
     if (render_shadow())
     {
       deferredCsm->renderShadowsCascades();
@@ -1182,6 +1249,7 @@ public:
     auto deferredTarget = vr_mode ? vrResources.deferredTarget.get() : this->deferredTarget.get();                            //-V688
     auto &resolvedDepth = vr_mode ? vrResources.resolvedDepth : this->resolvedDepth;                                          //-V688
     auto &downsampledFarDepth = vr_mode ? vrResources.downsampledFarDepth : this->downsampledFarDepth;                        //-V688
+    auto &downsampledFarDepthPrev = vr_mode ? vrResources.downsampledFarDepthPrev : this->downsampledFarDepthPrev;            //-V688
     auto &combinedShadowsTex = vr_mode ? vrResources.combinedShadowsTex : this->combinedShadowsTex;                           //-V688
     auto sceneRt = vr_mode ? vrResources.sceneRt.getTex2D() : this->sceneRt;                                                  //-V688
     bool renderSSR = vr_mode ? false : (bool)::renderSSR;                                                                     //-V688
@@ -1195,29 +1263,38 @@ public:
 
     renderGeomOpaque();
 
-    d3d::set_depth(deferredTarget->getDepth(), DepthAccess::SampledRO);
+    deferredTarget->setRt(DepthAccess::SampledRO);
     renderGeomDeferredDecals();
-    d3d::set_depth(deferredTarget->getDepth(), DepthAccess::RW);
+    deferredTarget->setRt(DepthAccess::RW);
 
     if (::grs_draw_wire)
       d3d::setwire(0);
 
     static int intz_depth_texVarId = get_shader_variable_id("intz_depth_tex", true);
     ShaderGlobal::set_texture(intz_depth_texVarId, deferredTarget->getDepthId());
-    d3d::set_render_target(resolvedDepth.getTex2D(), 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{resolvedDepth.getTex2D(), 0, 0}});
     resolvedDepthRenderer.render();
 
     ShaderGlobal::set_texture(combinedShadowsTex.getVarId(), BAD_TEXTUREID);
 
-    if (render_shadow() && combinedShadowsTex && combinedShadowsRenderer.getMat())
+    if (combinedShadowsTex)
     {
-      deferredTarget->setVar();
-      deferredCsm->setCascadesToShader();
-      d3d::set_render_target(combinedShadowsTex.getTex2D(), 0);
-      d3d::clearview(CLEAR_TARGET, 0xffffffff, 0, 0);
-      ::set_viewvecs_to_shader(view_tm, proj_tm);
-      combinedShadowsRenderer.render();
-      combinedShadowsTex.setVar();
+      if (render_shadow() && combinedShadowsRenderer.getMat())
+      {
+        deferredTarget->setVar();
+        deferredCsm->setCascadesToShader();
+        d3d::set_render_target({}, DepthAccess::RW, {{combinedShadowsTex.getTex2D(), 0, 0}});
+        d3d::clearview(CLEAR_TARGET, 0xffffffff, 0, 0);
+        ::set_viewvecs_to_shader(view_tm, proj_tm);
+        combinedShadowsRenderer.render();
+        combinedShadowsTex.setVar();
+      }
+      else
+      {
+        d3d::set_render_target({}, DepthAccess::RW, {{combinedShadowsTex.getTex2D(), 0, 0}});
+        d3d::clearview(CLEAR_TARGET, 0xffffffff, 0, 0);
+        combinedShadowsTex.setVar();
+      }
     }
     else if (render_shadow())
       deferredCsm->setCascadesToShader();
@@ -1226,27 +1303,23 @@ public:
 
     // always downsample depth to downsampledFarDepth
     {
+      static int downsampledFarDepthTexVarId = get_shader_variable_id("downsampled_far_depth_tex");
       deferredTarget->setVar();
+      eastl::swap(downsampledFarDepth, downsampledFarDepthPrev);
+      ShaderGlobal::set_texture(downsampledFarDepthTexVarId, downsampledFarDepth.getTexId());
       TextureIDPair fullDepthPair = TextureIDPair(deferredTarget->getDepthAll().getTex2D(), deferredTarget->getDepthAll().getTexId());
       TextureIDPair farDepthPair = TextureIDPair(downsampledFarDepth.getTex2D(), downsampledFarDepth.getTexId());
       TextureIDPair normalPair = TextureIDPair(downsampledNormals.getTex2D(), downsampledNormals.getTexId());
       TextureIDPair checkerDepthPair = TextureIDPair(checkerboardDepth.getTex2D(), checkerboardDepth.getTexId());
 
-      downsample_depth::downsamplePS(fullDepthPair, deferredTarget->getWidth(), deferredTarget->getHeight(), &farDepthPair, nullptr,
-        &normalPair, nullptr, &checkerDepthPair);
-      downsampledFarDepth.setVar();
+      downsample_depth::downsamplePS(fullDepthPair.getTex2D(), deferredTarget->getWidth(), deferredTarget->getHeight(),
+        farDepthPair.getTex2D(), nullptr, normalPair.getTex2D(), nullptr, nullptr, checkerDepthPair.getTex2D());
       downsampledNormals.setVar();
       checkerboardDepth.setVar();
       if (upscaleSamplingRenderer)
         upscaleSamplingRenderer->render();
       if (renderSSAO)
-      {
-        TMatrix viewTm;
-        TMatrix4 projTm;
-        d3d::gettm(TM_VIEW, viewTm);
-        d3d::gettm(TM_PROJ, &projTm);
-        ssao->render(viewTm, projTm, downsampledFarDepth.getTex2D());
-      }
+        ssao->render(view_tm, proj_tm, downsampledFarDepth.getTex2D());
       if (renderSSR)
       {
         static int causticsOptionsVarId = get_shader_variable_id("caustics_options", true);
@@ -1256,22 +1329,18 @@ public:
           Point2 causticsHeight = Point2(5.0f, 5.0f);
           Point4 causticsHeroPos = Point4(0, -100000, 0, 0);
 
-          ShaderGlobal::set_color4(causticsOptionsVarId, 0.2f,
+          ShaderGlobal::set_float4(causticsOptionsVarId, 0.2f,
             0.0f, // todo: insert time
             causticsHeight.x, causticsHeight.y);
-          ShaderGlobal::set_color4(causticsHeroPosVarId, Color4::xyzw(causticsHeroPos));
+          ShaderGlobal::set_float4(causticsHeroPosVarId, Color4::xyzw(causticsHeroPos));
         }
 
         static int ssrWorldViewPosVarId = get_shader_variable_id("ssr_world_view_pos", true);
         if (ssrWorldViewPosVarId >= 0)
         {
-          ShaderGlobal::set_color4(ssrWorldViewPosVarId, Color4::xyz1(::grs_cur_view.pos));
+          ShaderGlobal::set_float4(ssrWorldViewPosVarId, Color4::xyz1(curView.pos));
         }
-        TMatrix viewTm;
-        TMatrix4 projTm;
-        d3d::gettm(TM_VIEW, viewTm);
-        d3d::gettm(TM_PROJ, &projTm);
-        ssr->render(viewTm, projTm);
+        ssr->render(view_tm, proj_tm);
       }
     }
     if (!renderSSAO)
@@ -1281,7 +1350,7 @@ public:
 
     static int ao_ssrVarId = ::get_shader_glob_var_id("ao_ssr", true);
     if (ao_ssrVarId >= 0)
-      ShaderGlobal::set_color4(ao_ssrVarId, (int)renderSSAO, (int)renderSSR, 0, 0);
+      ShaderGlobal::set_float4(ao_ssrVarId, (int)renderSSAO, (int)renderSSR, 0, 0);
 
     if (!tonemapLUT)
     {
@@ -1297,12 +1366,12 @@ public:
     if (effects_depth_texVarId != -1)
       ShaderGlobal::set_texture(effects_depth_texVarId, deferredTarget->getDepthId());
 
-    ShaderGlobal::setBlock(global_frame_const_blockid, ShaderGlobal::LAYER_GLOBAL_CONST);
+    if (isThermalVisionActive())
+      thermalVision.resolve(*deferredTarget, sceneRt, view_tm, proj_tm);
+    else
+      deferredTarget->resolve(sceneRt, view_tm, proj_tm);
 
-    deferredTarget->resolve(sceneRt, view_tm, proj_tm);
-
-    d3d::set_render_target(sceneRt, 0);
-    d3d::set_depth(deferredTarget->getDepth(), DepthAccess::SampledRO);
+    d3d::set_render_target({deferredTarget->getDepth(), 0, 0}, DepthAccess::SampledRO, {{sceneRt, 0, 0}});
 
     renderGeomEnvi();
 
@@ -1333,19 +1402,18 @@ public:
 
     renderGeomEffects();
 
-    d3d::set_depth(deferredTarget->getDepth(), DepthAccess::RW);
+    d3d::set_render_target({deferredTarget->getDepth(), 0, 0}, DepthAccess::RW, {{sceneRt, 0, 0}});
 
     if (enable_wireframe)
     {
       TIME_D3D_PROFILE_NAME(render_vsm, "render_wireframe");
 
-      d3d::set_depth(deferredTarget->getDepth(), DepthAccess::RW);
       if (!::grs_draw_wire)
         d3d::setwire(1);
 
       if (wireframeTex)
       {
-        d3d::set_render_target(wireframeTex.getTex2D(), 0);
+        d3d::set_render_target({deferredTarget->getDepth(), 0, 0}, DepthAccess::RW, {{wireframeTex.getTex2D(), 0, 0}});
         d3d::clearview(CLEAR_TARGET, E3DCOLOR(255, 255, 255, 255), 0, 0);
       }
 
@@ -1353,7 +1421,8 @@ public:
       int use_atest = ShaderGlobal::get_int(use_atestVarId);
       ShaderGlobal::set_int(use_atestVarId, 0);
 
-      d3d::set_depth(deferredTarget->getDepth(), DepthAccess::SampledRO);
+      BaseTexture *wireframeColor = wireframeTex ? wireframeTex.getTex2D() : sceneRt;
+      d3d::set_render_target({deferredTarget->getDepth(), 0, 0}, DepthAccess::SampledRO, {{wireframeColor, 0, 0}});
       shaders::overrides::set(wireframeState);
       renderGeomForWireframe();
       shaders::overrides::reset();
@@ -1368,24 +1437,30 @@ public:
     // Workaround for z-fighting
     constexpr float drawCollisionsBias = 0.00001f;
 
-    TMatrix4 proj;
-    d3d::gettm(TM_PROJ, &proj);
+    TMatrix4 proj = proj_tm;
     TMatrix4 savedProj = proj;
     proj[3][2] += drawCollisionsBias;
     d3d::settm(TM_PROJ, &proj);
 
     mat44f globtm;
     d3d::getglobtm(globtm);
-    rendinst::drawDebugCollisions({}, globtm, ::grs_cur_view.pos, true);
+    rendinst::drawDebugCollisions(collisionFlags, globtm, curView.pos, true);
 
     d3d::settm(TM_PROJ, &savedProj);
 #endif
   }
-  Point4 getCascadeShadowAnchor(int cascade_no) override { return Point4::xyz0(-::grs_cur_view.itm.getcol(3)); }
+  Point4 getCascadeShadowAnchor(int cascade_no) override { return Point4::xyz0(-curView.pos); }
   void renderCascadeShadowDepth(int cascade_no, const Point2 &znzf) override
   {
     d3d::settm(TM_VIEW, TMatrix::IDENT);
     d3d::settm(TM_PROJ, &deferredCsm->getWorldRenderMatrix(cascade_no));
+
+    static int shadow_zn_zfarVarId = get_shader_variable_id("shadow_zn_zfar", true);
+    static int impostor_shadow_depth_offset_signVarId = get_shader_variable_id("impostor_shadow_depth_offset_sign", true);
+
+    ShaderGlobal::set_float4(shadow_zn_zfarVarId, znzf.x, znzf.y, 0.0f, 0.0f); // Used to restore depth of impostors.
+    ShaderGlobal::set_float(impostor_shadow_depth_offset_signVarId, 1.0f);
+
     const TMatrix &shadowViewItm = deferredCsm->getShadowViewItm(cascade_no);
     windEffect.setNoAnimShaderVars(shadowViewItm.getcol(0), shadowViewItm.getcol(1), shadowViewItm.getcol(2));
     if (render_shadow())
@@ -1396,8 +1471,16 @@ public:
   void getCascadeShadowSparseUpdateParams(int cascade_no, const Frustum & /*cascade_frustum*/, float &out_min_sparse_dist,
     int &out_min_sparse_frame) override
   {
-    out_min_sparse_dist = csmMinSparseDist;
-    out_min_sparse_frame = csmMinSparseFrame;
+    if (IEditorCoreEngine::get()->getGizmoEventFilter().isStarted())
+    {
+      out_min_sparse_dist = 100000;
+      out_min_sparse_frame = -1000;
+    }
+    else
+    {
+      out_min_sparse_dist = csmMinSparseDist;
+      out_min_sparse_frame = csmMinSparseFrame;
+    }
   }
 
   void restartPostfx(const DataBlock &game_params)
@@ -1433,11 +1516,11 @@ public:
       d3d::setwire(false);
       shaders::overrides::set(geomEnviId);
 
-      if (!preparing_light_probe)
+      if (!preparing_light_probe && !isThermalVisionActive())
         if (auto *hlp = EDITORCORE->queryEditorInterface<IRenderHelperService>())
         {
           if (BaseTexture *bt = acquire_managed_tex(enviCubeTexId))
-            hlp->renderEnviCubeTexture(bt, Color4(1, 1, 1, 1) * getExposure(), Color4(0, 0, 0, 1));
+            hlp->renderEnviCubeTexture(bt, Color4(1, 1, 1, 1) * getEffectiveExposure(), Color4(0, 0, 0, 1));
           release_managed_tex(enviCubeTexId);
         }
 
@@ -1447,17 +1530,29 @@ public:
       return;
     }
 
+    static int earthColorVarId = ::get_shader_variable_id("earth_color_for_editor", true);
+    Color4 oldEarthColor;
+    bool thermalOn = isThermalVisionActive() && !preparing_light_probe;
+    if (thermalOn)
+    {
+      oldEarthColor = ShaderGlobal::get_float4(earthColorVarId);
+      ShaderGlobal::set_float4(earthColorVarId, Color4(0, 0, 0, 0));
+    }
+
     for (int i = 0; i < rendSrv.size(); i++)
       rendSrv[i]->renderGeometry(IRenderingService::STG_RENDER_ENVI);
     if (enviReqSceneBlk)
       ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_SCENE);
     for (int i = 0; i < rendSrv.size(); i++)
       rendSrv[i]->renderGeometry(IRenderingService::STG_RENDER_CLOUDS);
+
+    if (thermalOn)
+      ShaderGlobal::set_float4(earthColorVarId, oldEarthColor);
   }
   void renderGeomOpaque()
   {
     TIME_D3D_PROFILE_NAME(render_vsm, "render_opaque");
-    windEffect.setShaderVars(::grs_cur_view.itm);
+    windEffect.setShaderVars(curView.itm);
 
     for (int i = 0; i < rendSrv.size(); i++)
       rendSrv[i]->renderGeometry(IRenderingService::STG_RENDER_STATIC_OPAQUE);
@@ -1476,8 +1571,8 @@ public:
   }
   void renderGeomDistortion()
   {
-    ShaderGlobal::set_color4(camera_rightVarId, ::grs_cur_view.itm.getcol(0));
-    ShaderGlobal::set_color4(camera_upVarId, ::grs_cur_view.itm.getcol(1));
+    ShaderGlobal::set_float4(camera_rightVarId, curView.itm.getcol(0));
+    ShaderGlobal::set_float4(camera_upVarId, curView.itm.getcol(1));
 
     TIME_D3D_PROFILE_NAME(render_vsm, "render_distortion");
     for (int i = 0; i < rendSrv.size(); i++)
@@ -1509,6 +1604,11 @@ public:
     TIME_D3D_PROFILE_NAME(render_vsm, "render_distortion_fx");
     for (int i = 0; i < rendSrv.size(); i++)
       rendSrv[i]->renderGeometry(IRenderingService::STG_RENDER_FX_DISTORTION);
+  }
+  // every render path must arm the glue: it holds the callbacks by value, not this object
+  void setHeatHazeFunctions()
+  {
+    heat_haze_glue.setFunctions([this]() { renderGeomDistortionFx(); }, [this]() { renderGeomDistortion(); });
   }
   void renderGeomForShadows()
   {
@@ -1550,12 +1650,7 @@ public:
     imgui_update(client_rect_width, client_rect_height);
     renderingService->updateImgui();
 
-    for (int i = 0; i < rendSrv.size(); i++)
-    {
-      rendSrv[i]->renderUI();
-    }
-
-    imgui_perform_registered(/*with_menu_bar = */ false);
+    editor_core_render_dag_imgui_windows();
     imgui_endframe();
     imgui_render();
   }
@@ -1590,6 +1685,7 @@ public:
     enviProbe = light_probe::create("envi", blk.getInt("lightProbeSz", 128), fmt);
     enviProbeBlack = light_probe::create("enviBlack", 4, TEXFMT_A16B16G16R16F);
     resetEnviProbesToBlack(true);
+    requestEnviProbeUpdate();
 
     deferredRtFmt = parseTexFmt(blk.getStr("sceneFmt", "A2B10G10R10"), TEXFMT_A8R8G8B8 | TEXCF_SRGBREAD | TEXCF_SRGBWRITE);
     postfxRtFmt = parseTexFmt(blk.getStr("postfxFmt", "ARGB8"), TEXFMT_A8R8G8B8);
@@ -1625,6 +1721,7 @@ public:
     downsample_depth::init("downsample_depth2x");
     volFogCallback.init();
     noPfxResolve.init("deferred_no_postfx_resolve", true);
+    thermalVision.init();
     preIntegratedGF = render_preintegrated_fresnel_GGX("preIntegratedGF", PREINTEGRATE_SPECULAR_DIFFUSE_QUALITY_MAX);
 
     shaders::OverrideState state;
@@ -1645,8 +1742,8 @@ public:
     csmSettings.splitsH = blk.getInt("csmH", 2);
     csmSettings.shadowFadeOut = 10.0f;
     csmSettings.fadeOutMul = 1.0f;
-    csmMinSparseDist = blk.getReal("csmMinSparseDist", 100000);
-    csmMinSparseFrame = blk.getReal("csmMinSparseFrame", -1000);
+    csmMinSparseDist = blk.getReal("csmMinSparseDist", SPARSE_SHADOW_UPDATE_MINDIST);
+    csmMinSparseFrame = blk.getReal("csmMinSparseFrame", SPARSE_SHADOW_UPDATE_FRAME);
     csmLambda = blk.getReal("csmLambda", 0.8);
     csmMaxDist = blk.getReal("csmMaxDist", 100);
     deferredCsm = CascadeShadows::make(this, csmSettings);
@@ -1668,8 +1765,8 @@ public:
     d3d::getglobtm(globtm);
     TMatrix4 projTm;
     d3d::gettm(TM_PROJ, &projTm);
-    deferredCsm->prepareShadowCascades(mode, Point3(0, -1, 0), ::grs_cur_view.tm, ::grs_cur_view.pos, projTm, Frustum(globtm),
-      Point2(1, 15000), 1.f);
+    deferredCsm->prepareShadowCascades(mode, Point3(0, -1, 0), curView.tm, curView.pos, projTm, Frustum(globtm), Point2(1, 15000),
+      1.f);
 
     fomZDistance = blk.getInt("fom_z_distance", 80);
     fomXyViewBoxSize = blk.getInt("fom_xy_distance", 128);
@@ -1693,16 +1790,27 @@ public:
     resolvedDepthRenderer.init("intz_scene_to_float", true);
   }
 
+  bool isThermalVisionSupported() const { return rtype == RTYPE_DYNAMIC_DEFERRED && thermalVision.isSupported(); }
+
+  bool isThermalVisionActive() const { return thermalVision.isActive(); }
+
+  void requestEnviProbeUpdate()
+  {
+    reqEnviProbeUpdate = true;
+    enviProbeTexCheckAtMs = get_time_msec() + 250;
+    enviProbeCaptureDeadlineMs = get_time_msec() + 5000;
+  }
+
   void resetEnviProbesToBlack(bool set_sph_harm_vars)
   {
     G_ASSERT(enviProbeBlack);
     G_ASSERT(enviProbe);
     d3d::GpuAutoLock gpuLock;
-    for (int i = 0; i < 6; ++i)
+    for (uint32_t i = 0; i < 6; ++i)
     {
-      d3d::set_render_target(light_probe::getManagedTex(enviProbeBlack)->getCubeTex(), i, 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{light_probe::getManagedTex(enviProbeBlack)->getCubeTex(), 0, i}});
       d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER | CLEAR_STENCIL, 0, 0, 0);
-      d3d::set_render_target(light_probe::getManagedTex(enviProbe)->getCubeTex(), i, 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{light_probe::getManagedTex(enviProbe)->getCubeTex(), 0, i}});
       d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER | CLEAR_STENCIL, 0, 0, 0);
     }
     light_probe::update(enviProbeBlack, NULL);
@@ -1715,7 +1823,7 @@ public:
       {
         const Color4 *sphHarm = light_probe::getSphHarm(enviProbe);
         for (int i = 0; i < SphHarmCalc::SPH_COUNT; ++i)
-          ShaderGlobal::set_color4(get_shader_variable_id(String(128, "enviSPH%d", i)), sphHarm[i]);
+          ShaderGlobal::set_float4(get_shader_variable_id(String(128, "enviSPH%d", i)), sphHarm[i]);
       }
     }
     d3d::set_render_target();
@@ -1724,6 +1832,9 @@ public:
   {
     float cur_exposure = getExposure();
     setExposure(1.0f);
+    bool cur_thermal = isThermalVisionActive();
+    if (cur_thermal)
+      thermalVision.setEnabled(false);
     ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
     for (auto *rs : rendSrv)
       rs->renderGeometry(IRenderingService::STG_BEFORE_RENDER);
@@ -1732,9 +1843,10 @@ public:
     static int light_probe_posVarId = get_shader_variable_id("light_probe_pos", true);
     const float zn = 0.5, zf = 100;
 
-    ShaderGlobal::set_color4(worldViewPosVarId, 0, 0, 0, 1);
-    ShaderGlobal::set_color4(zn_zfarVarId, zn, zf, 0, 0);
-    ShaderGlobal::set_color4(light_probe_posVarId, 0, 0, 0, 1);
+    ShaderGlobal::set_float4(worldViewPosVarId, 0, 0, 0, 1);
+    ShaderGlobal::set_float4(zn_zfarVarId, zn, zf, 0, 0);
+    ShaderGlobal::set_float4(light_probe_posVarId, 0, 0, 0, 1);
+    ShaderGlobal::set_texture(get_shader_variable_id("envi_probe_specular"), BAD_TEXTUREID);
 
     Point3 last_pos = ::grs_cur_view.pos;
     ::grs_cur_view.pos.zero();
@@ -1743,15 +1855,15 @@ public:
     for (int i = 0; i < SphHarmCalc::SPH_COUNT; ++i)
       enviSPHVarId[i] = get_shader_variable_id(String(128, "enviSPH%d", i));
     for (int i = 0; i < SphHarmCalc::SPH_COUNT; ++i)
-      ShaderGlobal::set_color4(enviSPHVarId[i], 0, 0, 0, 0);
+      ShaderGlobal::set_float4(enviSPHVarId[i], 0, 0, 0, 0);
 
-    for (int i = 0; i < 6; ++i)
+    for (uint32_t i = 0; i < 6; ++i)
     {
       d3d::setpersp(Driver3dPerspective(1, 1, zn, zf, 0, 0));
       TMatrix cameraMatrix = cube_matrix(TMatrix::IDENT, i);
       d3d::settm(TM_VIEW, inverse(cameraMatrix));
 
-      d3d::set_render_target(light_probe::getManagedTex(enviProbe)->getCubeTex(), i, 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{light_probe::getManagedTex(enviProbe)->getCubeTex(), 0, i}});
       d3d::clearview(CLEAR_TARGET, 0, 0, 0);
       renderGeomEnvi(/*preparing_light_probe*/ true);
     }
@@ -1762,7 +1874,7 @@ public:
     {
       const Color4 *sphHarm = light_probe::getSphHarm(enviProbe);
       for (int i = 0; i < SphHarmCalc::SPH_COUNT; ++i)
-        ShaderGlobal::set_color4(enviSPHVarId[i], sphHarm[i]);
+        ShaderGlobal::set_float4(enviSPHVarId[i], sphHarm[i]);
     }
     else
       logerr("Can't calculate harmonics");
@@ -1770,10 +1882,10 @@ public:
 
     d3d::set_render_target();
 
+    thermalVision.setEnabled(cur_thermal);
     setExposure(cur_exposure);
     ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
     ShaderGlobal::set_texture(get_shader_variable_id("envi_probe_specular"), *light_probe::getManagedTex(enviProbe));
-    ShaderGlobal::set_sampler(get_shader_variable_id("envi_probe_specular_samplerstate"), d3d::request_sampler({}));
 
 #if 0 // NOTE: can use console command `tex.show envi_probe_specular#2 rgb` for visualization
     static int ord = 0;
@@ -1788,14 +1900,20 @@ public:
 
   void afterD3DReset(bool full_reset)
   {
+    // A device reset leaves preIntegratedGF blank, and every environment lit surface loses its ambient light.
+    if (preIntegratedGF.getTex2D())
+      render_preintegrated_fresnel_GGX(preIntegratedGF.getTex2D(), nullptr, 0, 1);
     if (ssao)
       ssao->reset();
     if (enviProbe)
     {
       resetEnviProbesToBlack(false);
-      updateEnviProbe(); // call this once before reqEnviProbeUpdate to get non-black probe
-      reqEnviProbeUpdate = true;
+      updateEnviProbe(); // get the sky light, but scene textures are still loading
+      requestEnviProbeUpdate();
     }
+    if (deferredCsm)
+      deferredCsm->invalidate();
+    after_device_reset_ambient_wind();
   }
 
   void shutdown()
@@ -1806,6 +1924,7 @@ public:
     blackTex.close();
     downsampledNormals.close();
     downsampledFarDepth.close();
+    downsampledFarDepthPrev.close();
     checkerboardDepth.close();
     downsampledOpaqueTarget.close();
     tonemapLUT.reset();
@@ -1889,7 +2008,7 @@ public:
 
       if (vrWidth && !vrResources.combinedShadowsTex)
         if (VariableMap::isGlobVariablePresent(get_shader_variable_id("combined_shadows", true)))
-          vrResources.combinedShadowsTex = UniqueTexHolder(
+          vrResources.combinedShadowsTex = UniqueTexWithShaderVar(
             dag::create_tex(nullptr, vrWidth, vrHeight, TEXFMT_R8 | TEXCF_RTARGET, 1, "vr_combined_shadows"), "combined_shadows");
       ShaderGlobal::set_sampler(get_shader_variable_id("combined_shadows_samplerstate", true), d3d::request_sampler({}));
     }
@@ -1910,7 +2029,9 @@ public:
       downsampledNormals.close();
       downsampledOpaqueTarget.close();
       downsampledFarDepth.close();
+      downsampledFarDepthPrev.close();
       checkerboardDepth.close();
+      thermalVision.closeTargets();
       volFogCallback.depthId = BAD_TEXTUREID;
     }
 
@@ -1922,14 +2043,14 @@ public:
     sceneFmt = hdr_render_format;
 
     static int screen_pos_to_texcoordVarId = ::get_shader_variable_id("screen_pos_to_texcoord");
-    ShaderGlobal::set_color4(screen_pos_to_texcoordVarId, 1.f / w, 1.f / h, 0, 0);
+    ShaderGlobal::set_float4(screen_pos_to_texcoordVarId, 1.f / w, 1.f / h, 0, 0);
     static int lowres_tex_sizeVarId = ::get_shader_variable_id("lowres_tex_size");
-    ShaderGlobal::set_color4(lowres_tex_sizeVarId, w / 2, h / 2, 1.0f / (w / 2), 1.0f / (h / 2));
+    ShaderGlobal::set_float4(lowres_tex_sizeVarId, w / 2, h / 2, 1.0f / (w / 2), 1.0f / (h / 2));
 
     if (rtype == RTYPE_DYNAMIC_DEFERRED)
     {
-      sceneRt = d3d::create_tex(NULL, w, h, TEXCF_RTARGET | deferredRtFmt, 1);
-      postfxRt = d3d::create_tex(NULL, w, h, TEXCF_RTARGET | postfxRtFmt, 1);
+      sceneRt = d3d::create_tex(NULL, w, h, TEXCF_RTARGET | deferredRtFmt, 1, "sceneRt");
+      postfxRt = d3d::create_tex(NULL, w, h, TEXCF_RTARGET | postfxRtFmt, 1, "postfxRt");
 
       if (vrWidth)
       {
@@ -1939,8 +2060,8 @@ public:
     }
     else
     {
-      sceneRt = d3d::create_tex(NULL, w, h, TEXCF_RTARGET | hdr_render_format, 1);
-      postfxRt = d3d::create_tex(NULL, w, h, TEXCF_RTARGET | postfxRtFmt, 1);
+      sceneRt = d3d::create_tex(NULL, w, h, TEXCF_RTARGET | hdr_render_format, 1, "sceneRt");
+      postfxRt = d3d::create_tex(NULL, w, h, TEXCF_RTARGET | postfxRtFmt, 1, "postfxRt");
       fallbackSceneDepth = dag::create_tex(nullptr, w, h, TEXCF_RTARGET | TEXFMT_DEPTH32, 1, "scene_depth");
     }
     resolvedDepth = dag::create_tex(nullptr, w, h, TEXCF_RTARGET | TEXFMT_R32F, 1, "depth_tex");
@@ -1990,7 +2111,7 @@ public:
           DeferredRT::StereoMode::MonoOrMultipass, 0, deferred_mrt_cnt, deferred_mrt_fmts, TEXFMT_DEPTH32);
 
       int halfW = targetW / 2, halfH = h / 2;
-      ShaderGlobal::set_color4(::get_shader_variable_id("lowres_rt_params", true), halfW, halfH, 0, 0);
+      ShaderGlobal::set_float4(::get_shader_variable_id("lowres_rt_params", true), halfW, halfH, 0, 0);
 
       ssao = eastl::make_unique<SSAORenderer>(targetW / 2, targetH / 2, 1, SSAO_ALLOW_IMPLICIT_FLAGS_FROM_SHADER_ASSUMES);
       ssr = eastl::make_unique<ScreenSpaceReflections>(targetW / 2, targetH / 2);
@@ -2022,11 +2143,13 @@ public:
       }
 
       lowresFxTex = dag::create_tex(nullptr, targetW / 2, targetH / 2, fmt | TEXCF_RTARGET, 1, "low_res_fx_rt");
-      ShaderGlobal::set_sampler(get_shader_variable_id("lowres_fx_source_tex_samplerstate", true), d3d::request_sampler({}));
+      thermalVision.resize(targetW, targetH);
 
+      downsampledFarDepthPrev =
+        dag::create_tex(nullptr, targetW / 2, targetH / 2, TEXCF_RTARGET | TEXFMT_R32F, 1, "downsampled_far_depth_tex_prev");
       downsampledFarDepth =
         dag::create_tex(nullptr, targetW / 2, targetH / 2, TEXCF_RTARGET | TEXFMT_R32F, 1, "downsampled_far_depth_tex");
-      downsampledFarDepth.setVar();
+      ShaderGlobal::set_texture(get_shader_variable_id("downsampled_far_depth_tex"), downsampledFarDepth.getTexId());
       {
         d3d::SamplerInfo smpInfo;
         smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Border;
@@ -2035,13 +2158,12 @@ public:
         ShaderGlobal::set_sampler(get_shader_variable_id("downsampled_far_depth_tex_samplerstate"), d3d::request_sampler(smpInfo));
       }
 
-      if (vrWidth)
-      {
-        vrResources.downsampledFarDepth = UniqueTexHolder(
-          dag::create_tex(nullptr, vrWidth / 2, vrHeight / 2, TEXCF_RTARGET | TEXFMT_R32F, 1, "downsampled_far_depth_tex_vr"),
-          "downsampled_far_depth_tex");
-        vrResources.downsampledFarDepth.setVar();
-      }
+
+      vrResources.downsampledFarDepthPrev =
+        dag::create_tex(nullptr, targetW / 2, targetH / 2, TEXCF_RTARGET | TEXFMT_R32F, 1, "downsampled_far_depth_tex_vr_prev");
+      vrResources.downsampledFarDepth =
+        dag::create_tex(nullptr, targetW / 2, targetH / 2, TEXCF_RTARGET | TEXFMT_R32F, 1, "downsampled_far_depth_tex_vr");
+      ShaderGlobal::set_texture(get_shader_variable_id("downsampled_far_depth_tex"), vrResources.downsampledFarDepth.getTexId());
 
       checkerboardDepth =
         dag::create_tex(nullptr, targetW / 2, targetH / 2, TEXCF_RTARGET | TEXFMT_DEPTH32, 1, "downsampled_checkerboard_depth_tex");
@@ -2087,9 +2209,11 @@ public:
     if (rtype == RTYPE_CLASSIC)
       return;
 
-    if (render_shadow())
+    if (render_shadow() && !is_managed_textures_streaming_load_on_demand())
       ddsx::tex_pack2_perform_delayed_data_loading();
     rendinst::set_global_shadows_needed(render_shadow());
+    if (deferredCsm)
+      deferredCsm->invalidate();
     if (!render_shadow())
       if (rtype == RTYPE_DYNAMIC_DEFERRED)
         deferredCsm->renderShadowsCascades();
@@ -2222,21 +2346,32 @@ public:
       postFx->getDemonPostFx()->setSettings(set);
   }
 
-  bool hasExposure() const { return exposureBuffer.getBufId() != BAD_TEXTUREID; }
+  bool hasExposure() const { return exposureBuffer.getBufId() != BAD_TEXTUREID || exposureParamsVarId != VariableMap::BAD_ID; }
 
   float getExposure() const { return exposure; }
 
-  void setExposure(float exposure_value)
+  float getEffectiveExposure() const
   {
-    exposure = exposure_value;
-    hasExposureChanged = true;
+    if (isThermalVisionActive())
+      return render::special_vision::exposureThermal;
+    return renderNoPostfx ? 1.0f : exposure;
   }
+
+  void setExposure(float exposure_value) { exposure = exposure_value; }
 
 private:
   bool writeExposure(float exposure_value)
   {
     if (!exposureBuffer.getBuf())
+    {
+      if (exposureParamsVarId != VariableMap::BAD_ID)
+      {
+        ShaderGlobal::set_float4(exposureParamsVarId, exposure_value, 1.0f / max(1e-4f, exposure_value), 1.0f, 0.0f);
+        writtenExposure = exposure_value;
+        return true;
+      }
       return false;
+    }
 
     float *exposureDestination;
     if (exposureBuffer.getBuf()->lock(0, 0, (void **)&exposureDestination, VBLOCK_WRITEONLY) && exposureDestination)
@@ -2247,6 +2382,7 @@ private:
         EXPOSURE_MAX_LOG - EXPOSURE_MIN_LOG, 1.0f / (EXPOSURE_MAX_LOG - EXPOSURE_MIN_LOG)};
       memcpy(exposureDestination, exposureData, EXPOSURE_BUF_SIZE * sizeof(float));
       exposureBuffer.getBuf()->unlock();
+      writtenExposure = exposure_value;
       return true;
     }
     else
@@ -2279,20 +2415,20 @@ private:
   TEXTUREID sceneRtId, postfxRtId;
   UniqueTex fallbackSceneDepth; // For case when we don't have deferred rendering (do we have such case on practice?).
 
-  UniqueTexHolder wireframeTex;
+  UniqueTexWithShaderVar wireframeTex;
   shaders::OverrideStateId wireframeState;
   PostFxRenderer wireframeRenderer;
 
   UniqueTex resolvedDepth;
   PostFxRenderer resolvedDepthRenderer;
-  UniqueTexHolder preIntegratedGF;
+  UniqueTexWithShaderVar preIntegratedGF;
 
   DataBlock gameParamsBlk;
 
   eastl::unique_ptr<DeferredRenderTarget> deferredTarget;
   CascadeShadows *deferredCsm;
   PostFxRenderer combinedShadowsRenderer;
-  UniqueTexHolder combinedShadowsTex;
+  UniqueTexWithShaderVar combinedShadowsTex;
   light_probe::Cube *enviProbe;
   light_probe::Cube *enviProbeBlack;
   int deferredRtFmt;
@@ -2302,19 +2438,25 @@ private:
   bool srgb_backbuf_wr;
   eastl::unique_ptr<SSAORenderer> ssao;
   eastl::unique_ptr<ScreenSpaceReflections> ssr;
-  UniqueTexHolder downsampledNormals, downsampledOpaqueTarget, downsampledFarDepth, checkerboardDepth;
+  UniqueTexWithShaderVar downsampledNormals, downsampledOpaqueTarget, checkerboardDepth;
+  UniqueTex downsampledFarDepth, downsampledFarDepthPrev;
   UniqueTex lowresFxTex;
   UniqueTex blackTex;
   eastl::unique_ptr<UpscaleSamplingTex> upscaleSamplingRenderer;
   PostFxRenderer applyLowResFx;
   eastl::optional<motion_vector_access::CameraParams> previousCamera;
+  // view of the frame being rendered; captured at each render entry
+  // (viewport frame, screenshot, VR eye) so internal passes do not
+  // depend on the ::grs_cur_view global
+  DagorCurView curView;
 
   PostFxUserSettings pfx;
   const DataBlock *pfxLevelBlk;
 
-  UniqueBufHolder exposureBuffer;
+  UniqueBufWithShaderVar exposureBuffer;
+  int exposureParamsVarId = VariableMap::BAD_ID;
   float exposure = 1.0f;
-  bool hasExposureChanged = true;
+  float writtenExposure = -1.0f;
 
   struct VolFogCallback : public DemonPostFxCallback
   {
@@ -2347,6 +2489,7 @@ private:
   float csmMinSparseFrame;
   float csmLambda;
   float csmMaxDist;
+  Point3 lastSunDir = Point3::ZERO;
   int vsmSz;
   float vsmMaxDist;
   Variance::VsmType vsmType;
@@ -2354,7 +2497,7 @@ private:
   float fomXyViewBoxSize;
   float fomZViewBoxSize;
   float fomTexSize;
-  UniqueTexHolder fomShadowsCos, fomShadowsSin;
+  UniqueTexWithShaderVar fomShadowsCos, fomShadowsSin;
   DataBlock enviBlk;
   SunLightProps enviSlp;
   TEXTUREID enviCubeTexId;
@@ -2372,8 +2515,8 @@ private:
     UniqueTex sceneRt, postfxRt;
     UniqueTex resolvedDepth;
     UniqueTex imguiTex;
-    UniqueTexHolder downsampledFarDepth;
-    UniqueTexHolder combinedShadowsTex;
+    UniqueTex downsampledFarDepth, downsampledFarDepthPrev;
+    UniqueTexWithShaderVar combinedShadowsTex;
 
     eastl::unique_ptr<SSAORenderer> ssao;
 
@@ -2387,6 +2530,7 @@ private:
       resolvedDepth.close();
       imguiTex.close();
       downsampledFarDepth.close();
+      downsampledFarDepthPrev.close();
       combinedShadowsTex.close();
       ssao.reset();
       upscaleSamplingRenderer.reset();
@@ -2445,26 +2589,34 @@ private:
     auto &view = frame_data.views[stereo_index == StereoIndex::Right ? 1 : 0];
     auto viewTransform = TMatrix(view.viewTransform);
     auto cameraTransform = TMatrix(view.cameraTransform);
-    TMatrix4 projTransform;
-    d3d::calcproj(view.projection, projTransform);
 
     d3d::settm(TM_VIEW, viewTransform);
     d3d::setpersp(view.projection);
 
+    // other plugins still read the eye view from the global during this frame
     ::grs_cur_view.tm = viewTransform;
     ::grs_cur_view.itm = cameraTransform;
     ::grs_cur_view.pos = cameraTransform.getcol(3);
 
+    curView.tm = viewTransform;
+    curView.itm = cameraTransform;
+    curView.pos = cameraTransform.getcol(3);
+
     beforeRender();
-    d3d::set_render_target(vrResources.sceneRt.getTex2D(), 0);
-    d3d::set_depth(nullptr, DepthAccess::RW);
+    // as in renderViewportFrame: pick up beforeRender projection overrides (keeps eye wk/hk)
+    TMatrix4 projTransform;
+    d3d::gettm(TM_PROJ, &projTransform);
+    d3d::set_render_target({}, DepthAccess::RW, {{vrResources.sceneRt.getTex2D(), 0, 0}});
     d3d::setview(0, 0, width, height, 0, 1);
     d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER | CLEAR_STENCIL, E3DCOLOR(64, 64, 64, 0), 0, 0);
 
     deferredRender(viewTransform, projTransform, true);
 
     if (use_heat_haze)
+    {
+      setHeatHazeFunctions();
       heat_haze_glue.render();
+    }
 
     bool use_postfx = (::hdr_render_mode != HDR_MODE_NONE) && postFx && !renderNoPostfx;
 
@@ -2480,7 +2632,7 @@ private:
       TMatrix rotY;
       rotY.rotyTM(-PI / 2);
       d3d::settm(TM_WORLD, orig_cam_transform * rotY);
-      d3d::set_render_target(target.getTex2D(), 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{target.getTex2D(), 0, 0}});
       vrgui::render_to_surface(vrResources.imguiTex.getTexId());
       d3d::settm(TM_WORLD, TMatrix::IDENT);
     }
@@ -2531,6 +2683,7 @@ private:
     }
   }
 };
+rendinst::DrawCollisionsFlag DaEditor3DynamicScene::collisionFlags = {};
 
 class GenericDynRenderService : public IDynRenderService
 {
@@ -2542,6 +2695,7 @@ public:
   Tab<const char *> dbgShowTypeNm;
   Tab<int> dbgShowTypeVal;
   int dbgShowType;
+  int thermalShowTypeIdx = -1;
   DynamicRenderOption *dynRendOpt[ROPT_COUNT];
   Tab<const char *> shadowQualityNm;
   Tab<const DataBlock *> shadowQualityProps;
@@ -2666,9 +2820,17 @@ public:
       dynScene->initClassic();
     else if (dynScene->rtype == RTYPE_DYNAMIC_DEFERRED)
       dynScene->initDeferred(deferredBlk, shadowQualityProps[shadowQuality]);
+    if (thermalShowTypeIdx < 0 && dynScene->isThermalVisionSupported())
+    {
+      thermalShowTypeIdx = dbgShowTypeNm.size();
+      dbgShowTypeNm.push_back("thermal vision");
+      dbgShowTypeVal.push_back(-1);
+    }
+    init_draw_cached_debug_twocolored_shader();
   }
   void term() override
   {
+    close_draw_cached_debug();
     dagor_select_game_scene(nullptr);
 
     heat_haze_glue.term();
@@ -2680,6 +2842,8 @@ public:
   }
 
   void enableRender(bool enable) override { render_enabled = enable; }
+
+  void suppressScenePresent(bool suppress) override { present_suppressed = suppress; }
 
   void selectAsGameScene() override { dagor_select_game_scene(dynScene); }
 
@@ -2703,7 +2867,7 @@ public:
   void onLightingSettingsChanged() override
   {
     if (dynScene)
-      dynScene->reqEnviProbeUpdate = true;
+      dynScene->requestEnviProbeUpdate();
   }
 
   void beforeD3DReset(bool full_reset) override {}
@@ -2736,10 +2900,10 @@ public:
       d3d::clearview(CLEAR_TARGET | CLEAR_ZBUFFER | CLEAR_STENCIL, E3DCOLOR(10, 10, 64, 0), 0, 0);
     }
   }
-  void renderScreenshot() override
+  void renderScreenshot(const Driver3dPerspective &persp, bool is_ortho, bool force_disable_wireframe = false) override
   {
     if (dynScene)
-      dynScene->renderScreenShot();
+      dynScene->renderScreenShot(force_disable_wireframe);
   }
 
   dag::ConstSpan<int> getSupportedRenderTypes() const override { return rtypeSupp; }
@@ -2758,10 +2922,12 @@ public:
   {
     if (t < 0 || t >= dbgShowTypeNm.size())
       return false;
+    dynScene->setThermalVision(t == thermalShowTypeIdx);
     dbgShowType = t;
     dynScene->dbgShowType = dbgShowTypeVal[t];
     return true;
   }
+  bool isThermalVisionActive() const override { return dynScene && dynScene->isThermalVisionActive(); }
 
   const char *getRenderOptName(int ropt) override { return (ropt >= 0 && ropt < ROPT_COUNT) ? dynRendOpt[ropt]->name : NULL; }
   bool getRenderOptSupported(int ropt) override
@@ -2782,10 +2948,6 @@ public:
         case ROPT_SHADOWS: dynScene->updateCsm(); break;
         case ROPT_SHADOWS_VSM: dynScene->updateVsm(); break;
       }
-    if (ropt == ROPT_NO_POSTFX && !enable)
-    {
-      setExposure(1.0f);
-    }
   }
   bool getRenderOptEnabled(int ropt) override
   {
@@ -2827,6 +2989,8 @@ public:
       return 0.0f;
   };
 
+  float getEffectiveExposure() override { return dynScene ? dynScene->getEffectiveExposure() : 0.0f; }
+
   void getPostFxSettings(DemonPostFxSettings &set) override
   {
     if (dynScene)
@@ -2851,6 +3015,7 @@ public:
   static void onTonemapSettingsChanged();
 
   const ManagedTex &getDownsampledFarDepth() override { return dynScene->getDownsampledFarDepth(); }
+  const ManagedTex &getPrevDownsampledFarDepth() override { return dynScene->getPrevDownsampledFarDepth(); }
 
   void toggleVrMode() override { dynScene->toggleVrMode(); }
 
@@ -2957,7 +3122,7 @@ static void vr_controls_window()
     ImGui::EndListBox();
   }
 
-  ImGui::Checkbox("Enable shadows", &render_vr_shadows);
+  PropPanel::ImguiHelper::checkboxWithDragSelection("Enable shadows", &render_vr_shadows);
 
   if (newPreset || newEnv || newWtype)
   {
@@ -2975,3 +3140,96 @@ static void vr_controls_window()
 REGISTER_IMGUI_WINDOW("VR", "VR controls", vr_controls_window);
 
 #endif
+
+static uint32_t collisionFlags = 0;
+static void showCollisionFlags()
+{
+
+  bool none = collisionFlags == 0;
+  if (PropPanel::ImguiHelper::checkboxWithDragSelection("None", &none))
+    if (none)
+      collisionFlags = 0;
+
+  bool all = collisionFlags == (uint32_t)rendinst::DrawCollisionsFlag::ALL_FLAGS;
+  if (PropPanel::ImguiHelper::checkboxWithDragSelection("All flags", &all))
+  {
+    if (all)
+      collisionFlags = (uint32_t)rendinst::DrawCollisionsFlag::ALL_FLAGS;
+    else
+      collisionFlags = 0;
+  }
+  bool allRi = (collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::All) == (uint32_t)rendinst::DrawCollisionsFlag::All;
+  if (PropPanel::ImguiHelper::checkboxWithDragSelection("All Rendinst", &allRi))
+  {
+    if (allRi)
+      collisionFlags |= uint32_t(rendinst::DrawCollisionsFlag::All);
+    else
+      collisionFlags &= ~uint32_t(rendinst::DrawCollisionsFlag::All);
+  }
+  bool rendInst = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::RendInst;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("Rendinst", &rendInst);
+  if (rendInst)
+    collisionFlags |= uint32_t(rendinst::DrawCollisionsFlag::RendInst);
+  else
+    collisionFlags &= ~uint32_t(rendinst::DrawCollisionsFlag::RendInst);
+
+  bool rendInstExtra = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::RendInstExtra;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("Rendinst Extra", &rendInstExtra);
+  if (rendInstExtra)
+    collisionFlags |= uint32_t(rendinst::DrawCollisionsFlag::RendInstExtra);
+  else
+    collisionFlags &= ~uint32_t(rendinst::DrawCollisionsFlag::RendInstExtra);
+
+  bool wireFrame = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::Wireframe;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("Wireframe", &wireFrame);
+  if (wireFrame)
+    collisionFlags |= (uint32_t)rendinst::DrawCollisionsFlag::Wireframe;
+  else
+    collisionFlags &= ~(uint32_t)rendinst::DrawCollisionsFlag::Wireframe;
+
+  bool opacity = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::Opacity;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("Opacity", &opacity);
+  if (opacity)
+    collisionFlags |= (uint32_t)rendinst::DrawCollisionsFlag::Opacity;
+  else
+    collisionFlags &= ~(uint32_t)rendinst::DrawCollisionsFlag::Opacity;
+
+  bool invisible = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::Invisible;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("Invisible", &invisible);
+  if (invisible)
+    collisionFlags |= (uint32_t)rendinst::DrawCollisionsFlag::Invisible;
+  else
+    collisionFlags &= ~(uint32_t)rendinst::DrawCollisionsFlag::Invisible;
+
+  bool canopy = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::RendInstCanopy;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("RendInstCanopy", &canopy);
+  if (canopy)
+    collisionFlags |= (uint32_t)rendinst::DrawCollisionsFlag::RendInstCanopy;
+  else
+    collisionFlags &= ~(uint32_t)rendinst::DrawCollisionsFlag::RendInstCanopy;
+
+  bool physOnly = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::PhysOnly;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("PhysOnly", &physOnly);
+  if (physOnly)
+    collisionFlags |= (uint32_t)rendinst::DrawCollisionsFlag::PhysOnly;
+  else
+    collisionFlags &= ~(uint32_t)rendinst::DrawCollisionsFlag::PhysOnly;
+
+  bool traceOnly = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::TraceOnly;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("TraceOnly", &traceOnly);
+  if (traceOnly)
+    collisionFlags |= (uint32_t)rendinst::DrawCollisionsFlag::TraceOnly;
+  else
+    collisionFlags &= ~(uint32_t)rendinst::DrawCollisionsFlag::TraceOnly;
+
+  bool occlusion = collisionFlags & (uint32_t)rendinst::DrawCollisionsFlag::Occlusion;
+  PropPanel::ImguiHelper::checkboxWithDragSelection("Occlusion", &occlusion);
+  if (occlusion)
+    collisionFlags |= (uint32_t)rendinst::DrawCollisionsFlag::Occlusion;
+  else
+    collisionFlags &= ~(uint32_t)rendinst::DrawCollisionsFlag::Occlusion;
+
+  DaEditor3DynamicScene::collisionFlags = (rendinst::DrawCollisionsFlag)collisionFlags;
+}
+
+REGISTER_IMGUI_WINDOW("", "Collision", showCollisionFlags);

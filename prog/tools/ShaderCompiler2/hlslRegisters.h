@@ -38,10 +38,10 @@ inline constexpr eastl::array<HlslRegisterSpace, HLSL_RSPACE_COUNT> HLSL_RSPACE_
 };
 
 inline constexpr eastl::array<const char *, HLSL_RSPACE_COUNT> HLSL_RSPACE_ALL_NAMES = {
-  "texture",
+  "SRV",
   "sampler",
   "constant",
-  "uav",
+  "UAV",
   "constbuffer",
 };
 
@@ -52,6 +52,8 @@ inline constexpr eastl::array<char, HLSL_RSPACE_COUNT> HLSL_RSPACE_ALL_SYMBOLS =
   'u',
   'b',
 };
+
+inline constexpr int SLOTS_PER_C_REGISTER = 4; // packoffset(reg.x/y/z/w)
 
 inline void for_each_hlsl_reg_space(auto &&cb)
 {
@@ -75,8 +77,9 @@ enum class HlslSlotSemantic : uint8_t
   RESERVED,
   RESERVED_FOR_PREDEFINES,
   RESERVED_FOR_IMPLICIT_CONST_CBUF,
-  RESERVED_FOR_GLOBAL_CONST_CBUF,
+  RESERVED_FOR_REFINED_BLOCK_CBUF,
   RESERVED_FOR_MATERIAL_PARAMS_CBUF,
+  RESERVED_FOR_IMMEDIATE_CBUF,
 };
 
 struct HlslRegRange
@@ -101,13 +104,14 @@ class HlslRegAllocator
 
 public:
   static constexpr const char *SLOT_SEMANTIC_DESCS[]{
-    "allocated",                // ALLOCATED
-    "hardcoded",                // HARDCODED
-    "supp blk",                 // RESERVED
-    "predefined",               // RESERVED_FOR_PREDEFINES
-    "implicit const buf",       // RESERVED_FOR_IMPLICIT_CONST_CBUF
-    "global const buf",         // RESERVED_FOR_GLOBAL_CONST_CBUF
-    "material params const buf" // RESERVED_FOR_MATERIAL_PARAMS_CBUF
+    "allocated",                 // ALLOCATED
+    "hardcoded",                 // HARDCODED
+    "supp blk",                  // RESERVED
+    "predefined",                // RESERVED_FOR_PREDEFINES
+    "implicit const buf",        // RESERVED_FOR_IMPLICIT_CONST_CBUF
+    "refined block const buf",   // RESERVED_FOR_REFINED_BLOCK_CBUF
+    "material params const buf", // RESERVED_FOR_MATERIAL_PARAMS_CBUF
+    "immediate const buf"        // RESERVED_FOR_IMMEDIATE_CBUF
   };
 
   static const allocator_scan_routine_t DEFAULT_SCAN, BACKWARDS_SCAN;
@@ -127,7 +131,8 @@ private:
   static_assert(sizeof(Slot) == 1);
 
   dag::Vector<Slot> slots{};
-  uint32_t minUsed, usedCap; // min >= cap means none are used
+  // min >= cap means none are used; a default-constructed allocator must still be a valid empty one
+  uint32_t minUsed = 0, usedCap = 0;
   Policy policy{};
 
 public:
@@ -174,9 +179,6 @@ public:
     return reg;
   }
 
-  // @TODO: do the void specialization for Expected!
-  struct ReserveSuccess
-  {};
   struct ReserveFailure
   {
     bool outOfRange = false;
@@ -191,7 +193,7 @@ public:
     return slots[reg].semantic;
   }
 
-  dag::Expected<ReserveSuccess, ReserveFailure> reserve(HlslSlotSemantic semantic, int32_t reg, uint32_t count = 1)
+  dag::Expected<void, ReserveFailure> reserve(HlslSlotSemantic semantic, int32_t reg, uint32_t count = 1)
   {
     G_ASSERT(reg >= 0);
     G_ASSERTF(semantic != HlslSlotSemantic::ALLOCATED, "Can't reserve a register as if it were allocated");
@@ -215,12 +217,12 @@ public:
       slots[i].semantic = semantic;
     }
     updateRange(reg, count);
-    return ReserveSuccess{};
+    return {};
   }
 
-  dag::Expected<ReserveSuccess, Tab<ReserveFailure>> reserveAllFrom(const HlslRegAllocator &supp)
+  template <bool skip_hardcoded = false>
+  dag::Expected<void, Tab<ReserveFailure>> reserveAllFrom(const HlslRegAllocator &supp)
   {
-    G_ASSERT(policy.base == supp.policy.base);
     G_ASSERT(policy.cap == supp.policy.cap);
     if (slots.size() < supp.slots.size())
       slots.resize(supp.slots.size());
@@ -229,12 +231,16 @@ public:
     {
       if (slot.used)
       {
+        if constexpr (skip_hardcoded)
+          if (slot.semantic == HlslSlotSemantic::HARDCODED)
+            continue;
+
         if (auto result = reserve(max(HlslSlotSemantic::RESERVED, slot.semantic), id); !result)
           failedReserves.push_back(result.error());
       }
     }
     if (failedReserves.empty())
-      return ReserveSuccess{};
+      return {};
     else
       return dag::Unexpected{eastl::move(failedReserves)};
   }
@@ -260,7 +266,7 @@ public:
   void dumpUsage(HlslRegisterSpace space, auto &&logger, auto &&info_provider) const
   {
     auto [min, cap] = maxAllowedRange();
-    logger("Used registers in allowed range [%d, %d]:", min, cap - 1);
+    logger("Used registers in allowed range [%d, %d]:\n", min, cap - 1);
     int skip = 0;
     for (auto [ind, slot] : enumerate(slots))
     {
@@ -268,9 +274,9 @@ public:
         --skip;
       else if (slot.used)
       {
-        auto [name, size] = info_provider(ind);
+        auto [desc, size] = info_provider(ind);
         logger("  %c%-3d %-5s: %s, %s", HLSL_RSPACE_ALL_SYMBOLS[space], ind, size == 1 ? "" : string_f("[%d]", size).c_str(),
-          name.c_str(), SLOT_SEMANTIC_DESCS[size_t(slot.semantic)]);
+          SLOT_SEMANTIC_DESCS[size_t(slot.semantic)], desc.c_str());
         skip = size - 1;
       }
     }
@@ -317,11 +323,7 @@ inline eastl::string get_reg_alloc_dump(const HlslRegAllocator &alloc, HlslRegis
 {
   eastl::string usageDump{};
   alloc.dumpUsage(
-    rspace,
-    [&usageDump]<class... Ts>(const char *fmt, Ts &&...args) {
-      usageDump.append_sprintf(fmt, eastl::forward<Ts>(args)...);
-      usageDump.push_back('\n');
-    },
+    rspace, [&usageDump]<class... Ts>(const char *fmt, Ts &&...args) { usageDump.append_sprintf(fmt, eastl::forward<Ts>(args)...); },
     info_provider);
   return usageDump;
 }
@@ -344,7 +346,7 @@ inline void report_reg_reserve_failed(const char *name, int reg, int count, Hlsl
   }
 
   const eastl::string nameRef = name ? string_f(" '%s'", name) : "";
-  sh_debug(SHLOG_ERROR, "Trying to reserve a %s param%s with register '%c%d' of size %d, which is %s\n%s",
+  sh_debug(SHLOG_ERROR, "Can not reserve a %s param%s with register '%c%d' of size %d, which is %s\n%s",
     HlslRegAllocator::SLOT_SEMANTIC_DESCS[size_t(desired_semantic)], nameRef.c_str(), HLSL_RSPACE_ALL_SYMBOLS[rspace], reg, count,
     collisionInfo.c_str(), get_reg_alloc_dump(alloc, rspace, info_provider).c_str());
 }

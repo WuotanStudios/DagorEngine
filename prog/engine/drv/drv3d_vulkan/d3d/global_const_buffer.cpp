@@ -9,22 +9,6 @@
 
 using namespace drv3d_vulkan;
 
-int d3d::set_cs_constbuffer_size(int required_size)
-{
-  VERIFY_GLOBAL_LOCK_ACQUIRED();
-
-  D3D_CONTRACT_ASSERTF(required_size >= 0, "Negative register count?");
-  return Frontend::GCB.setComputeConstRegisterCount(required_size);
-}
-
-int d3d::set_vs_constbuffer_size(int required_size)
-{
-  VERIFY_GLOBAL_LOCK_ACQUIRED();
-
-  D3D_CONTRACT_ASSERTF(required_size >= 0, "Negative register count?");
-  return Frontend::GCB.setVertexConstRegisterCount(required_size);
-}
-
 bool d3d::set_const(unsigned stage, unsigned first, const void *data, unsigned count)
 {
   VERIFY_GLOBAL_LOCK_ACQUIRED();

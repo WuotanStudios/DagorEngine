@@ -55,7 +55,7 @@ static constexpr ecs::ComponentDesc screen_effect_render_es_comps[] =
 //start of 1 rw components at [0]
   {ECS_HASH("screen_effect__is_active"), ecs::ComponentTypeInfo<bool>()},
 //start of 4 ro components at [1]
-  {ECS_HASH("screen_effect__buffer"), ecs::ComponentTypeInfo<UniqueBufHolder>()},
+  {ECS_HASH("screen_effect__buffer"), ecs::ComponentTypeInfo<UniqueBufWithShaderVar>()},
   {ECS_HASH("screen_effect__countVar"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("screen_effect__texVars"), ecs::ComponentTypeInfo<ecs::IntList>()},
   {ECS_HASH("screen_effect_renderer__enable"), ecs::ComponentTypeInfo<bool>()}
@@ -65,7 +65,8 @@ static void screen_effect_render_es_all_events(const ecs::Event &__restrict evt,
   G_FAST_ASSERT(evt.is<UpdateStageInfoBeforeRender>());
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     screen_effect_render_es(static_cast<const UpdateStageInfoBeforeRender&>(evt)
-        , ECS_RO_COMP(screen_effect_render_es_comps, "screen_effect__buffer", UniqueBufHolder)
+        , components.manager()
+    , ECS_RO_COMP(screen_effect_render_es_comps, "screen_effect__buffer", UniqueBufWithShaderVar)
     , ECS_RO_COMP(screen_effect_render_es_comps, "screen_effect__countVar", int)
     , ECS_RO_COMP(screen_effect_render_es_comps, "screen_effect__texVars", ecs::IntList)
     , ECS_RO_COMP(screen_effect_render_es_comps, "screen_effect_renderer__enable", bool)
@@ -148,7 +149,7 @@ static ecs::EntitySystemDesc screen_effect_node_disable_es_es_desc
 static constexpr ecs::ComponentDesc screen_effect_renderer_ecs_query_comps[] =
 {
 //start of 3 rw components at [0]
-  {ECS_HASH("screen_effect__buffer"), ecs::ComponentTypeInfo<UniqueBufHolder>()},
+  {ECS_HASH("screen_effect__buffer"), ecs::ComponentTypeInfo<UniqueBufWithShaderVar>()},
   {ECS_HASH("screen_effect__countVar"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("screen_effect__texVars"), ecs::ComponentTypeInfo<ecs::IntList>()},
 //start of 1 ro components at [3]
@@ -162,16 +163,16 @@ static ecs::CompileTimeQueryDesc screen_effect_renderer_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void screen_effect_renderer_ecs_query(ecs::EntityId eid, Callable function)
+inline void screen_effect_renderer_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, screen_effect_renderer_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, screen_effect_renderer_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
         {
           function(
               ECS_RO_COMP(screen_effect_renderer_ecs_query_comps, "eid", ecs::EntityId)
-            , ECS_RW_COMP(screen_effect_renderer_ecs_query_comps, "screen_effect__buffer", UniqueBufHolder)
+            , ECS_RW_COMP(screen_effect_renderer_ecs_query_comps, "screen_effect__buffer", UniqueBufWithShaderVar)
             , ECS_RW_COMP(screen_effect_renderer_ecs_query_comps, "screen_effect__countVar", int)
             , ECS_RW_COMP(screen_effect_renderer_ecs_query_comps, "screen_effect__texVars", ecs::IntList)
             );
@@ -201,9 +202,9 @@ static ecs::CompileTimeQueryDesc get_screen_effect_renderer_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_screen_effect_renderer_ecs_query(Callable function)
+inline void get_screen_effect_renderer_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_screen_effect_renderer_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_screen_effect_renderer_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do

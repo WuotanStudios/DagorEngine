@@ -23,7 +23,6 @@ Sources +=
   debug_eval.das
   defer.das
   enum_trait.das
-  export_constructor.das
   functional.das
   if_not_null.das
   instance_function.das
@@ -48,6 +47,7 @@ Sources +=
   templates.das
   templates_boost.das
   typemacro_boost.das
+  utf8_utils.das
 ;
 
 ExplicitLicenseUsed += $(Root)/prog/1stPartyLibs/daScript ;

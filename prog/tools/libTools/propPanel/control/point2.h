@@ -2,9 +2,10 @@
 #pragma once
 
 #include <propPanel/control/propertyControlBase.h>
+#include <propPanel/colors.h>
 #include <propPanel/imguiHelper.h>
 #include <propPanel/immediateFocusLossHandler.h>
-#include "spinEditStandalone.h"
+#include <propPanel/control/spinEditStandalone.h>
 #include "../scopedImguiBeginDisabled.h"
 
 namespace PropPanel
@@ -29,7 +30,11 @@ public:
       set_focused_immediate_focus_loss_handler(nullptr);
   }
 
-  unsigned getTypeMaskForSet() const override { return CONTROL_DATA_TYPE_POINT2 | CONTROL_CAPTION | CONTROL_DATA_PREC; }
+  unsigned getTypeMaskForSet() const override
+  {
+    return CONTROL_DATA_TYPE_POINT2 | CONTROL_DATA_MIN_MAX_STEP | CONTROL_CAPTION | CONTROL_DATA_PREC;
+  }
+
   unsigned getTypeMaskForGet() const override { return CONTROL_DATA_TYPE_POINT2; }
 
   Point2 getPoint2Value() const override { return controlValue; }
@@ -41,6 +46,12 @@ public:
     spinEditY.setValue(value.y);
   }
 
+  void setMinMaxStepValue(float min, float max, float step) override
+  {
+    spinEditX.setMinMaxStepValue(min, max, step);
+    spinEditY.setMinMaxStepValue(min, max, step);
+  }
+
   void setPrecValue(int prec) override
   {
     spinEditX.setPrecValue(prec);
@@ -49,30 +60,61 @@ public:
 
   void setCaptionValue(const char value[]) override { controlCaption = value; }
 
+  void setValueHighlight(ColorOverride::ColorIndex color) override { valueHighlightColor = color; }
+
   void reset() override
   {
-    setPoint2Value(Point2::ZERO);
+    const float minValue = spinEditX.getMinValue();
+    setPoint2Value(Point2(minValue, minValue));
 
     PropertyControlBase::reset();
   }
 
   void setEnabled(bool enabled) override { controlEnabled = enabled; }
 
+  bool isDefaultValueSet() const override { return defaultValue ? *defaultValue == getPoint2Value() : true; }
+
+  void applyDefaultValue() override
+  {
+    if (isDefaultValueSet())
+    {
+      return;
+    }
+
+    if (defaultValue)
+    {
+      setPoint2Value(*defaultValue);
+      onWcChange(nullptr);
+    }
+  }
+
+  void setDefaultValue(Variant var) override { defaultValue = var.convert<Point2>(); }
+
+  const char *getImguiTypeName() const override { return "Point2"; }
+
   void updateImgui() override
   {
     ScopedImguiBeginDisabled scopedDisabled(!controlEnabled);
 
-    ImguiHelper::separateLineLabel(controlCaption);
+    separateLineLabelWithTooltip(controlCaption.begin(), controlCaption.end());
     setFocusToNextImGuiControlIfRequested();
+
+    // Override the background color of the edit box.
+    const bool valueHighlightColorSet = valueHighlightColor != ColorOverride::NONE;
+    if (valueHighlightColorSet)
+      ImGui::PushStyleColor(ImGuiCol_FrameBg, getOverriddenColor(valueHighlightColor));
 
     ImGui::PushMultiItemsWidths(2, ImGui::GetContentRegionAvail().x);
 
-    spinEditX.updateImgui(*this, &controlTooltip, this);
+    spinEditX.updateImgui(*this, &controlTooltip, this, this, "x");
     ImGui::PopItemWidth();
 
     ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x); // NOTE: PushMultiItemsWidths calculated with ItemInnerSpacing.
-    spinEditY.updateImgui(*this, &controlTooltip, this);
+    spinEditY.updateImgui(*this, &controlTooltip, this, this, "y");
     ImGui::PopItemWidth();
+
+    if (valueHighlightColorSet)
+      ImGui::PopStyleColor();
 
     if (spinEditX.isTextInputFocused() || spinEditY.isTextInputFocused())
       set_focused_immediate_focus_loss_handler(this);
@@ -91,8 +133,8 @@ private:
 
   void onImmediateFocusLoss() override
   {
-    spinEditX.sendWcChangeIfVarChanged(*this);
-    spinEditY.sendWcChangeIfVarChanged(*this);
+    spinEditX.sendWcChangeAndFinishIfVarChanged(*this);
+    spinEditY.sendWcChangeAndFinishIfVarChanged(*this);
   }
 
   String controlCaption;
@@ -100,6 +142,8 @@ private:
   bool controlEnabled = true;
   SpinEditControlStandalone spinEditX;
   SpinEditControlStandalone spinEditY;
+  eastl::optional<Point2> defaultValue;
+  ColorOverride::ColorIndex valueHighlightColor = ColorOverride::NONE;
 };
 
 } // namespace PropPanel

@@ -61,6 +61,7 @@ struct RendInstPhys
   gamephys::DynamicPhysModel *physModel;
   PhysBody *physBody;
   PhysBody *additionalBody;
+  PhysBody *bendHelperBody;
   Tab<PhysJoint *> joints;
   TMatrix centerOfMassTm;
   Point3 scale;
@@ -88,4 +89,5 @@ struct RendInstPhys
   RendInstPhys &operator=(const RendInstPhys &) = delete;
   RendInstPhys &operator=(RendInstPhys &&) = default;
   void cleanup();
+  bool isPhysObject() const { return physModel->physType == gamephys::DynamicPhysModel::E_PHYS_OBJECT; }
 };

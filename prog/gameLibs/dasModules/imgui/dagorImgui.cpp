@@ -2,6 +2,7 @@
 
 #include <daScript/daScript.h>
 #include <dasModules/aotDagorImgui.h>
+#include <dasModules/dagorTexture3d.h>
 
 DAS_BASE_BIND_ENUM(ImGuiState, ImGuiState, OFF, ACTIVE, OVERLAY)
 
@@ -14,19 +15,29 @@ ImguiRegistry windowsRegistry;
 
 class DagorImguiModule final : public das::Module
 {
+  static constexpr const char *moduleName = "DagorImgui";
+
 public:
-  DagorImguiModule() : das::Module("DagorImgui")
+  bind_dascript::RegisterImguiFunctionAnnotation *funcReg;
+  bind_dascript::RegisterImguiWindowAnnotation *windowReg;
+
+public:
+  DagorImguiModule() : das::Module(moduleName)
   {
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("DagorDataBlock"));
-    addEnumeration(das::make_smart<EnumerationImGuiState>());
-    auto funcReg = das::make_smart<bind_dascript::RegisterImguiFunctionAnnotation>(functionsRegistry, functionsRegistryMutex);
+    addEnumeration(new EnumerationImGuiState());
+    funcReg = new bind_dascript::RegisterImguiFunctionAnnotation(functionsRegistry, functionsRegistryMutex);
     addAnnotation(funcReg);
-    auto windowReg = das::make_smart<bind_dascript::RegisterImguiWindowAnnotation>(windowsRegistry, windowsRegistryMutex);
+    windowReg = new bind_dascript::RegisterImguiWindowAnnotation(windowsRegistry, windowsRegistryMutex);
     addAnnotation(windowReg);
-    das::onDestroyCppDebugAgent(name.c_str(), [funcReg, windowReg](das::Context *ctx) {
-      funcReg->unloadContext(ctx);
-      windowReg->unloadContext(ctx);
+    das::onDestroyCppDebugAgent(name.c_str(), [](das::Context *ctx) {
+      auto mod = das::Module::require(moduleName);
+      if (mod == nullptr)
+        return;
+      auto dagorImguiMod = static_cast<DagorImguiModule *>(mod);
+      dagorImguiMod->funcReg->unloadContext(ctx);
+      dagorImguiMod->windowReg->unloadContext(ctx);
     });
 
     das::addExtern<DAS_BIND_FUN(imgui_set_bold_font)>(*this, lib, "imgui_set_bold_font", das::SideEffects::modifyExternal,
@@ -39,6 +50,8 @@ public:
       "::imgui_window_set_visible");
     das::addExtern<DAS_BIND_FUN(imgui_window_is_visible)>(*this, lib, "imgui_window_is_visible", das::SideEffects::accessExternal,
       "::imgui_window_is_visible");
+    das::addExtern<DAS_BIND_FUN(imgui_window_request_focus)>(*this, lib, "imgui_window_request_focus",
+      das::SideEffects::modifyExternal, "::imgui_window_request_focus");
     das::addExtern<DAS_BIND_FUN(imgui_get_state)>(*this, lib, "imgui_get_state", das::SideEffects::accessExternal,
       "::imgui_get_state");
     das::addExtern<DAS_BIND_FUN(imgui_save_blk)>(*this, lib, "imgui_save_blk", das::SideEffects::accessExternal, "::imgui_save_blk");
@@ -46,6 +59,8 @@ public:
       das::SideEffects::accessExternal, "::bind_dascript::imgui_get_blk");
     das::addExtern<DAS_BIND_FUN(::imgui_apply_style_from_blk)>(*this, lib, "imgui_apply_style_from_blk",
       das::SideEffects::modifyExternal, "::imgui_apply_style_from_blk");
+    das::addExtern<DAS_BIND_FUN(::convert_dag_res_id_to_imgui)>(*this, lib, "convert_dag_res_id_to_imgui", das::SideEffects::none,
+      "::convert_dag_res_id_to_imgui");
 
     verifyAotReady();
   }

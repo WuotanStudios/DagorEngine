@@ -66,7 +66,7 @@ void AnimTreeAnimationPlayer::clear()
   resetDynModel();
   if (selectedA2d)
   {
-    ::release_game_resource((GameResource *)selectedA2d);
+    ::release_game_resource_ex(selectedA2d, Anim2DataGameResClassId);
     selectedA2d = nullptr;
   }
   selectedA2dName.clear();
@@ -110,7 +110,7 @@ void AnimTreeAnimationPlayer::resetDynModel()
   if (ctrl)
     ctrl->setSkeletonForRender(nullptr);
   destroy_it(entity);
-  geomTree = GeomNodeTree();
+  geomTree.clear();
   ctrl = nullptr;
   origGeomTree = nullptr;
   animNodes.clear();
@@ -130,12 +130,22 @@ void AnimTreeAnimationPlayer::reloadDynModel(const DagorAsset &asset)
   }
 
   entity = DAEDITOR3.createEntity(*modelAsset);
+  if (!entity)
+  {
+    logerr("Can't create entity for load dynModel: %s", modelName);
+    return;
+  }
   entity->setSubtype(DAEDITOR3.registerEntitySubTypeId("single_ent"));
   ctrl = entity->queryInterface<ILodController>();
+  if (!ctrl)
+  {
+    logerr("Can't get ILodController for dynModel: %s", modelName);
+    return;
+  }
   origGeomTree = ctrl->getSkeleton();
   if (!origGeomTree)
     return;
-  geomTree = *origGeomTree;
+  geomTree.replaceContentFrom(*origGeomTree);
   ctrl->setSkeletonForRender(&geomTree);
 }
 
@@ -155,9 +165,8 @@ void AnimTreeAnimationPlayer::setValuesFromCommonNode(PropPanel::ContainerProper
   }
   else
   {
-    const int lastTrackIdx = selectedA2d->dumpData.noteTrack.size() - 1;
     firstKey = 0;
-    lastKey = selectedA2d->dumpData.noteTrack[lastTrackIdx].time;
+    lastKey = selectedA2d->dumpData.noteTrack.empty() ? 0 : selectedA2d->dumpData.noteTrack.back().time;
   }
 }
 
@@ -199,7 +208,7 @@ void AnimTreeAnimationPlayer::loadA2dResource(PropPanel::ContainerPropertyContro
 
   if (selectedA2d)
   {
-    ::release_game_resource((GameResource *)selectedA2d);
+    ::release_game_resource_ex(selectedA2d, Anim2DataGameResClassId);
     selectedA2d = nullptr;
   }
   animNodes.clear();
@@ -209,7 +218,7 @@ void AnimTreeAnimationPlayer::loadA2dResource(PropPanel::ContainerPropertyContro
   if (validate_without_error && assetMgr.getAssetNameId(selectedA2dName) == -1)
     return;
 
-  selectedA2d = (AnimV20::AnimData *)::get_game_resource_ex(GAMERES_HANDLE_FROM_STRING(selectedA2dName), Anim2DataGameResClassId);
+  selectedA2d = (AnimV20::AnimData *)::get_game_resource_ex(selectedA2dName, Anim2DataGameResClassId);
   if (!selectedA2d)
     return;
 
@@ -221,9 +230,8 @@ void AnimTreeAnimationPlayer::loadA2dResource(PropPanel::ContainerPropertyContro
   PropPanel::ContainerPropertyControl *tree = panel->getById(PID_ANIM_BLEND_NODES_TREE)->getContainer();
   if (tree->getUserData(leaf) == &ANIM_BLEND_NODE_A2D)
   {
-    const int lastTrackIdx = selectedA2d->dumpData.noteTrack.size() - 1;
     firstKey = 0;
-    lastKey = selectedA2d->dumpData.noteTrack[lastTrackIdx].time;
+    lastKey = selectedA2d->dumpData.noteTrack.empty() ? 0 : selectedA2d->dumpData.noteTrack.back().time;
     animTime = 1.f;
     loop = false;
     type = BlendNodeType::UNSET;

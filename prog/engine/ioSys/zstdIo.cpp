@@ -292,8 +292,13 @@ ZSTD_DDict_s *zstd_create_ddict(dag::ConstSpan<char> dict_buf, bool use_buf_ref)
 {
   if (!dict_buf.size())
     return nullptr;
+#if DAGOR_ZSTD_DDICT_FORCE_OWNED_BYTES
+  G_UNUSED(use_buf_ref);
+  return ZSTD_createDDict(dict_buf.data(), dict_buf.size());
+#else
   return use_buf_ref ? ZSTD_createDDict_byReference(dict_buf.data(), dict_buf.size())
                      : ZSTD_createDDict(dict_buf.data(), dict_buf.size());
+#endif
 }
 void zstd_destroy_ddict(ZSTD_DDict_s *ddict) { ZSTD_freeDDict(ddict); }
 
@@ -317,6 +322,7 @@ bool ZstdLoadFromMemCB::initDecoder(dag::ConstSpan<char> enc_data, const ZSTD_DD
 {
   encDataBuf.set((const unsigned char *)enc_data.data(), enc_data.size());
   encDataPos = 0;
+  frameFinished = false; // per-stream state: a reused reader must not report the previous frame
 
   ZSTD_DStream *strm = ZSTD_createDStream_advanced(tmp ? ZSTD_framememCMem : ZSTD_dagorCMem);
   G_VERIFY(ZSTD_initDStream(strm) != 0);
@@ -352,10 +358,29 @@ inline int ZstdLoadFromMemCB::tryReadImpl(void *ptr, int size)
   outBuf.size = size;
   outBuf.pos = 0;
 
-  while (size_t ret = ZSTD_decompressStream(dstrm, &outBuf, &inBuf))
+  // any further decode attempt (a concatenated or trailing frame) invalidates the completion
+  // mark until that frame also ends cleanly, so the flag covers the whole consumed block
+  frameFinished = false;
+
+  for (;;)
   {
+    size_t ret = ZSTD_decompressStream(dstrm, &outBuf, &inBuf);
+    if (ret == 0)
+    {
+      // frame decoded to its end marker; readers stop here, so trailing block bytes (padding or
+      // follow-up sections some consumers carry) are never misparsed as another frame
+      frameFinished = true;
+      break;
+    }
     if (ZSTD_isError(ret))
     {
+#if DAGOR_DBGLEVEL == 0
+      if (errorMode == ZstdErrorMode::Soft)
+      {
+        logerr("zstd error %d (%s) in %s\nsource: '%s'", ret, ZSTD_getErrorName(ret), "ZSTD_decompressStream", getTargetName());
+        return 0;
+      }
+#endif
       DAG_FATAL("zstd error %d (%s) in %s\nsource: '%s'\n", ret, ZSTD_getErrorName(ret), "ZSTD_decompressStream", getTargetName());
       RETURN_X_AFTER_FATAL(0);
     }
@@ -415,6 +440,7 @@ void ZstdLoadCB::open(IGenLoad &in_crd, int in_size, const ZSTD_DDict_s *dict, b
 {
   G_ASSERT(!loadCb && "already opened?");
   G_ASSERT(in_size > 0);
+  frameFinished = false;
   loadCb = &in_crd;
   inBufLeft = in_size;
   initDecoder(make_span_const(rdBuf, 0), dict, tmp);
@@ -435,6 +461,8 @@ bool ZstdLoadCB::supplyMoreData()
     encDataPos = 0;
     encDataBuf.set(encDataBuf.data(), loadCb->tryRead(rdBuf, int(inBufLeft > RD_BUFFER_SIZE ? RD_BUFFER_SIZE : inBufLeft)));
     inBufLeft -= encDataBuf.size();
+    if (encDataBuf.size() == 0)
+      frameFinished = false; // declared compressed bytes are missing: the block never completed
   }
   return encDataPos < encDataBuf.size();
 }

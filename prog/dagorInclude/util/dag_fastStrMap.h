@@ -9,11 +9,12 @@
 #include <osApiWrappers/dag_localConv.h>
 #include <string.h>
 #include <util/dag_stdint.h>
+#include <util/dag_compilerDefs.h>
 
 
 /// Fast string map (add string/strId, get strId by string)
 template <typename T, intptr_t invalidId = -1>
-class FastStrMapT
+class DAGOR_WARN_IF_UNUSED FastStrMapT
 {
 public:
   typedef T IdType;
@@ -186,32 +187,6 @@ protected:
 #ifdef _TARGET_STATIC_LIB
 extern template class FastStrMapT<int, -1>;
 extern template class FastStrMapT<int, 0>;
-extern template class FastStrMapT<char *, 0>;
 #endif
 
 typedef FastStrMapT<int, -1> FastStrMap;
-typedef FastStrMapT<char *, 0> FastStrStrMap_;
-
-#include <supp/dag_define_KRNLIMP.h>
-
-class FastStrStrMap : public FastStrStrMap_
-{
-public:
-  KRNLIMP FastStrStrMap(IMemAlloc *mem = NULL, bool ignore_case = false);
-  KRNLIMP FastStrStrMap(const FastStrStrMap &m);
-  KRNLIMP ~FastStrStrMap();
-
-  /// Returns strId for given name (adds str to the list if not found)
-  KRNLIMP IdType addStrId(const char *str, IdType id);
-
-  /// Set strId for given name (adds str to the list if not found and returns true)
-  KRNLIMP bool setStrId(const char *str, IdType id);
-
-  KRNLIMP bool delStrId(const char *str);
-
-  KRNLIMP bool delStrId(IdType str_id);
-
-  KRNLIMP void reset(bool erase_only = true);
-};
-
-#include <supp/dag_undef_KRNLIMP.h>

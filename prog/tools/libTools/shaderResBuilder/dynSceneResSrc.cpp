@@ -2,6 +2,7 @@
 
 #include <libTools/shaderResBuilder/dynSceneResSrc.h>
 #include <libTools/shaderResBuilder/lodsEqMatGather.h>
+#include <libTools/shaderResBuilder/validateAlphaTest.h>
 #include <libTools/shaderResBuilder/globalVertexDataConnector.h>
 #include <libTools/util/makeBindump.h>
 #include <libTools/util/binDumpUtil.h>
@@ -21,10 +22,12 @@
 #include <libTools/dagFileRW/dagFileNode.h>
 #include <startup/dag_restart.h>
 #include <util/dag_bitArray.h>
-#include <sceneRay/dag_sceneRay.h>
+#include <gameRes/collisionResourceBuilder.h>
 #include "collapseData.h"
+#include "clothProxyBuild.h"
 #include <debug/dag_log.h>
 #include <debug/dag_debug.h>
+#include <math/dag_bits.h>
 #include <EASTL/vector_set.h>
 #include <EASTL/string.h>
 
@@ -68,14 +71,13 @@ int dynmodel_max_vpr_const_count = 256 * 3;
 
 static unsigned max_vpr_const_for_skinned_mesh() { return dynmodel_max_vpr_const_count; }
 
-StaticSceneRayTracer *theRayTracer = NULL;
-
 //=== DynamicRenderableSceneLodsResSrc =====================================//
 
 bool dynmodel_exp_empty_bone_names_allowed = false;
 bool DynamicRenderableSceneLodsResSrc::optimizeForCache = true;
 int DynamicRenderableSceneLodsResSrc::limitBonePerVertex = -1;
 int DynamicRenderableSceneLodsResSrc::setBonePerVertex = -1;
+bool DynamicRenderableSceneLodsResSrc::use16BitBoneIndices = false;
 bool (*DynamicRenderableSceneLodsResSrc::process_scene)(const char *fn, int lod_n, AScene &sc, float start_range,
   const DataBlock &props) = NULL;
 DataBlock *DynamicRenderableSceneLodsResSrc::buildResultsBlk = NULL;
@@ -221,7 +223,8 @@ void DynamicRenderableSceneLodsResSrc::calcSkinNodeBbox(Node *n_)
 }
 
 // add mesh node
-void DynamicRenderableSceneLodsResSrc::addMeshNode(Lod &lod, Node *n_, LodsEqualMaterialGather &mat_gather)
+void DynamicRenderableSceneLodsResSrc::addMeshNode(int lod_no, Lod &lod, Node *n_, LodsEqualMaterialGather &mat_gather,
+  const CollisionResource *ao_occluders)
 {
   if (!n_)
     return;
@@ -252,7 +255,7 @@ void DynamicRenderableSceneLodsResSrc::addMeshNode(Lod &lod, Node *n_, LodsEqual
           isMaterialRealTwoSidedArray.reset(materialNo);
           continue;
         }
-        if (theRayTracer && !meshHasAO)
+        if (ao_occluders && !meshHasAO)
         {
           matSubst.substMatClass(*subMat);
           subMat = processMaterial(subMat, false);
@@ -361,11 +364,8 @@ void DynamicRenderableSceneLodsResSrc::addMeshNode(Lod &lod, Node *n_, LodsEqual
         prt2e.resize_verts(meshData.vertnorm.size());
         prt3e.resize_verts(meshData.vertnorm.size());
       }
-      if (meshHasAO && theRayTracer)
-      {
-        float maxDist = theRayTracer->getSphere().r * 2;
-        calculatePRT(meshData, toWorld, theRayTracer, RAYS_PER_VERTEX_AMBIENT_OCCLUSION, 1000, 100, maxDist, prt1, prt2, prt3);
-      }
+      if (meshHasAO && ao_occluders)
+        calculatePRT(meshData, toWorld, *ao_occluders, RAYS_PER_VERTEX_AMBIENT_OCCLUSION, 1000, 100, prt1, prt2, prt3);
       else if (meshHasAO)
       {
         MeshData::ExtraChannel &prt1e = meshData.extra[prt1];
@@ -413,6 +413,8 @@ void DynamicRenderableSceneLodsResSrc::addMeshNode(Lod &lod, Node *n_, LodsEqual
         shmat[i] = mat_gather.addEqual((MaterialData *)subMat);
         if (shmat[i])
           has_any_mat = true;
+        if (log && shmat[i])
+          AlphaTestValidation::validate(mesh, i, *subMat, *shmat[i], lod.fileName, n.name, *log);
       }
       if (!has_any_mat || !mesh.getVert().size() || !mesh.getFace().size()) // no renderable geometry
         goto add_children;
@@ -436,7 +438,7 @@ void DynamicRenderableSceneLodsResSrc::addMeshNode(Lod &lod, Node *n_, LodsEqual
         G_ASSERTF(md.elems.size() == 0, "md.elem.size()=%d node=<%s> key_node=<%s>", md.elems.size(), n.name, key_node->name);
 
         ::collapse_materials(mesh, shmat);
-        md.build(mesh, shmat.data(), numMat, IdentColorConvert::object, false, rigidId);
+        md.build(mesh, shmat.data(), numMat, IdentColorConvert::object, false, rigidId, lod_no, n.name);
 
         if (optimizeForCache)
           md.optimizeForCache();
@@ -452,7 +454,7 @@ void DynamicRenderableSceneLodsResSrc::addMeshNode(Lod &lod, Node *n_, LodsEqual
 add_children:
   for (int i = 0; i < n.child.size(); ++i)
   {
-    addMeshNode(lod, n.child[i], mat_gather);
+    addMeshNode(lod_no, lod, n.child[i], mat_gather, ao_occluders);
   }
 }
 
@@ -472,6 +474,9 @@ static void gatherSkinNodeUsedBones(Node *n_, MeshBones &nmb)
       DataBlock node_blk;
       dblk::load_text(node_blk, make_span_const(n.script), dblk::ReadFlag::ROBUST, "Node::script");
       int limit_bpv = node_blk.getInt("limitBonePerVertex", DynamicRenderableSceneLodsResSrc::limitBonePerVertex);
+      int max_skin_bones = node_blk.getInt("setBonePerVertex", DynamicRenderableSceneLodsResSrc::setBonePerVertex);
+      if (max_skin_bones <= 0)
+        max_skin_bones = 4;
 
       int bcount = mh.bones->boneNames.size();
       int vcount = mesh.getVert().size();
@@ -483,7 +488,7 @@ static void gatherSkinNodeUsedBones(Node *n_, MeshBones &nmb)
 
       for (int i = 0; i < vcount; i++)
       {
-        for (int j = 0; j < MAX_SKINBONES; j++)
+        for (int j = 0; j < max_skin_bones; j++)
         {
           real bw = 0;
           int bb = -1;
@@ -579,7 +584,7 @@ static void remapMeshSkinning(Node *n_, MeshBones &nmb, ILogWriter *log)
 }
 
 // add skin node
-void DynamicRenderableSceneLodsResSrc::addSkinNode(Lod &lod, Node *n_, LodsEqualMaterialGather &mat_gather)
+void DynamicRenderableSceneLodsResSrc::addSkinNode(int lod_no, Lod &lod, Node *n_, LodsEqualMaterialGather &mat_gather)
 {
   if (!n_)
     return;
@@ -649,6 +654,8 @@ void DynamicRenderableSceneLodsResSrc::addSkinNode(Lod &lod, Node *n_, LodsEqual
         G_ASSERTF(m, "node=%s (%d verts, %d faces) mat[%d] name=\"%s\" shader=\"%s\" script=\"%s\"", n.name, meshData.vert.size(),
           meshData.face.size(), i, subMat->matName, subMat->className, subMat->matScript);
         shmat[i] = m;
+        if (log && shmat[i])
+          AlphaTestValidation::validate(mesh, i, *subMat, *shmat[i], lod.fileName, n.name, *log);
       }
 
       int sideChannelId = meshData.add_extra_channel(MeshData::CHT_FLOAT1, SCUSAGE_EXTRA, 55);
@@ -690,11 +697,13 @@ void DynamicRenderableSceneLodsResSrc::addSkinNode(Lod &lod, Node *n_, LodsEqual
         dblk::load_text(node_blk, make_span_const(n.script), dblk::ReadFlag::ROBUST, "Node::script");
         int limit_bpv = node_blk.getInt("limitBonePerVertex", limitBonePerVertex);
         int set_bpv = node_blk.getInt("setBonePerVertex", setBonePerVertex);
+        bool use16Bits = node_blk.getBool("use16BitBoneIndices", use16BitBoneIndices);
 
         if (limit_bpv > 0)
           meshData->limitBonesPerVertex(limit_bpv);
         if (set_bpv > 0)
-          meshData->setBonesPerVertex(set_bpv);
+          meshData->setBonesPerVertex(min(set_bpv, MAX_SKINBONES));
+        meshData->setUse16BitBoneIndices(use16Bits);
 
         Mesh localMesh = mesh;
         bool needToPackVcolor = false;
@@ -702,7 +711,8 @@ void DynamicRenderableSceneLodsResSrc::addSkinNode(Lod &lod, Node *n_, LodsEqual
           if (auto *submat = n.mat->getSubMat(j))
             if (strstr(submat->matScript, "cut_mesh=1"))
               needToPackVcolor = true;
-        if (!meshData->build(localMesh, *mh.bones, shmat.data(), shmat.size(), curCount, &nodeNameMap, needToPackVcolor))
+        if (
+          !meshData->build(localMesh, *mh.bones, shmat.data(), shmat.size(), curCount, &nodeNameMap, needToPackVcolor, lod_no, n.name))
         {
           DAG_FATAL("cannot build skinned mesh data! (node='%s'; VPRConstCount=%d)", (const char *)n.name, curCount);
         }
@@ -742,7 +752,7 @@ void DynamicRenderableSceneLodsResSrc::addSkinNode(Lod &lod, Node *n_, LodsEqual
 
   for (int i = 0; i < n.child.size(); ++i)
   {
-    addSkinNode(lod, n.child[i], mat_gather);
+    addSkinNode(lod_no, lod, n.child[i], mat_gather);
   }
 }
 
@@ -781,7 +791,7 @@ static bool meshesHaveAO(Node &n, DynamicRenderableSceneLodsResSrc *dm)
   return false;
 }
 
-static void addMeshToBuilder(Node &n, BuildableStaticSceneRayTracer *rayTracer, DynamicRenderableSceneLodsResSrc *dm)
+static void addMeshToBuilder(Node &n, CollisionResourceBuilder &builder, DynamicRenderableSceneLodsResSrc *dm)
 {
   if ((n.flags & NODEFLG_RENDERABLE) && n.mat && n.mat->subMatCount() && n.obj && n.obj->isSubOf(OCID_MESHHOLDER))
   {
@@ -790,11 +800,6 @@ static void addMeshToBuilder(Node &n, BuildableStaticSceneRayTracer *rayTracer, 
     {
       // add mesh
       const Mesh &mesh = *mh.mesh;
-      SmallTab<Point3, TmpmemAlloc> vert;
-      clear_and_resize(vert, mesh.getVert().size());
-      for (int i = 0; i < mesh.getVert().size(); ++i)
-        vert[i] = n.wtm * mesh.getVert()[i];
-
 
       Bitarray isMaterialTrans;
       isMaterialTrans.resize(n.mat->subMatCount());
@@ -828,68 +833,71 @@ static void addMeshToBuilder(Node &n, BuildableStaticSceneRayTracer *rayTracer, 
       }
       if (totalTrans < n.mat->subMatCount())
       {
-        SmallTab<unsigned, TmpmemAlloc> flags;
-        clear_and_resize(flags, mesh.getFace().size());
-        for (int i = 0; i < flags.size(); ++i)
+        dag::Vector<uint32_t> indices;
+        indices.reserve(mesh.getFace().size() * 3);
+        for (int i = 0; i < mesh.getFace().size(); ++i)
         {
           int mat = mesh.getFaceMaterial(i);
           if (mat >= isMaterialTrans.size())
             mat = isMaterialTrans.size() - 1;
-          flags[i] = isMaterialTrans[mat] ? rayTracer->USER_INVISIBLE : rayTracer->CULL_BOTH;
+          if (isMaterialTrans[mat])
+            continue;
+          for (int k = 0; k < 3; ++k)
+            indices.push_back(mesh.getFace()[i].v[k]);
         }
-        rayTracer->addmesh(&vert[0], vert.size(), (const unsigned int *)&mesh.getFace()[0].v[0], elem_size(mesh.getFace()),
-          mesh.getFace().size(), flags.data(), false);
+        if (!indices.empty())
+        {
+          dag::Vector<Point3_vec4> vert(mesh.getVert().size());
+          BBox3 bbox;
+          for (int i = 0; i < mesh.getVert().size(); ++i)
+          {
+            vert[i] = n.wtm * mesh.getVert()[i];
+            bbox += vert[i];
+          }
+          builder.addMeshNode(n.name, /*phys_mat_id*/ -1, TMatrix::IDENT, bbox, dag::ConstSpan<Point3_vec4>(vert.data(), vert.size()),
+            dag::ConstSpan<uint32_t>(indices.data(), indices.size()));
+        }
       }
     }
   }
   for (int i = 0; i < n.child.size(); ++i)
   {
-    addMeshToBuilder(*n.child[i], rayTracer, dm);
+    addMeshToBuilder(*n.child[i], builder, dm);
   }
 }
 
-void DynamicRenderableSceneLodsResSrc::addNode(Lod &lod, Node *n_, LodsEqualMaterialGather &mat_gather)
+void DynamicRenderableSceneLodsResSrc::addNode(int lod_no, Lod &lod, Node *n_, LodsEqualMaterialGather &mat_gather)
 {
   if (!n_)
     return;
   Node &n = *n_;
 
-  BuildableStaticSceneRayTracer *rayTracer = NULL;
+  Ptr<CollisionResource> occluders;
   bool hasAO = !shadermeshbuilder_strip_d3dres && meshesHaveAO(n, this);
-  theRayTracer = NULL;
   if (hasAO)
     debug("Ambient Occlusion needed.");
-    //__int64 refTime = ref_time_ticks();
 #if RAYS_PER_VERTEX_AMBIENT_OCCLUSION
   if (hasAO)
   {
     debug("Computing PRT...");
-    rayTracer = create_buildable_staticmeshscene_raytracer(Point3(0.20, 0.20, 0.20), 6);
-    addMeshToBuilder(n, rayTracer, this);
-    // debug("adding %dus", get_time_usec ( refTime ));
-    // refTime = ref_time_ticks();
-    rayTracer->rebuild();
+    CollisionResourceBuilder builder;
+    addMeshToBuilder(n, builder, this);
+    builder.collapse("dynmodel AO");
+    builder.recomputeBounds();
+    builder.collisionFlags |= COLLISION_RES_FLAG_BLAS_TWO_SIDED;
+    occluders = builder.build("dynmodel AO");
   }
 #endif
-  // debug("building %dus",get_time_usec ( refTime ));
 
   // enum skins
-  addSkinNode(lod, &n, mat_gather);
-  if (rayTracer)
-  {
-    theRayTracer = rayTracer;
-    theRayTracer->setCullFlags(StaticSceneRayTracer::CULL_BOTH);
-  }
+  addSkinNode(lod_no, lod, &n, mat_gather);
   // enum meshes
-  addMeshNode(lod, &n, mat_gather);
-  theRayTracer = NULL;
-  if (rayTracer)
-    delete rayTracer;
+  addMeshNode(lod_no, lod, &n, mat_gather, occluders.get());
 }
 
 bool DynamicRenderableSceneLodsResSrc::addLod(const char *filename, real range, LodsEqualMaterialGather &mat_gather,
   Tab<AScene *> &scene_list, bool all_animated, const DataBlock &props, bool need_reset_nodes_tm_scale,
-  const DataBlock &material_overrides)
+  const DataBlock &material_overrides, const ProxyLodProps &proxy)
 {
   PtrTab<MaterialData> matList;
   scene_list.push_back(new AScene());
@@ -915,6 +923,7 @@ bool DynamicRenderableSceneLodsResSrc::addLod(const char *filename, real range, 
 
   lod.fileName = filename;
   lod.range = range;
+  lod.proxy = proxy;
 
   curDagFname = filename;
   {
@@ -958,9 +967,14 @@ bool DynamicRenderableSceneLodsResSrc::build(const DataBlock &blk)
 
     const char *fileName = lodBlk.getStr("scene", NULL);
     real range = lodBlk.getReal("range", MAX_REAL);
+    const int proxyInt = lodBlk.getInt("proxy", 0);
+    validate_cloth_proxy_type(proxyInt, fileName, log);
+    ProxyLodProps proxy;
+    proxy.type = (ProxyType)proxyInt;
+    proxy.clothBindFalloffSq = lodBlk.getReal("clothBindFalloffSq", proxy.clothBindFalloffSq);
     const DataBlock *materialOverrides = lodBlk.getBlockByNameEx("materialOverrides");
 
-    if (!addLod(fileName, range, matGather, curScenes, all_animated, lodBlk, needResetNodesTmScale, *materialOverrides))
+    if (!addLod(fileName, range, matGather, curScenes, all_animated, lodBlk, needResetNodesTmScale, *materialOverrides, proxy))
     {
       clear_all_ptr_items(curScenes);
       return false;
@@ -1048,9 +1062,11 @@ bool DynamicRenderableSceneLodsResSrc::build(const DataBlock &blk)
   {
     curDagFname = lods[i].fileName;
 
-    addNode(lods[i], curScenes[i]->root, matGather);
+    addNode(i, lods[i], curScenes[i]->root, matGather);
     curDagFname = NULL;
   }
+
+  build_cloth_proxy_bindings(*this, log);
 
   ShaderChannelId::setPosBounding(Point3(0, 0, 0), Point3(1, 1, 1));
 

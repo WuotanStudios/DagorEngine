@@ -57,9 +57,11 @@ public:
   virtual void createGrass(DataBlock &grassBlk) = 0;
   virtual void closeGrass() = 0;
   virtual DataBlock *createDefaultGrass() = 0;
+  virtual DataBlock *getSettings() = 0;
   virtual BBox3 *getGrassBbox() = 0;
 
   virtual bool isGrassEnabled() const = 0;
+  virtual bool isGrassValid() const = 0;
   virtual int getTypeCount() const = 0;
   virtual GPUGrassType &getType(int index) = 0;
   virtual GPUGrassType &addType(const char *name) = 0;
@@ -74,4 +76,7 @@ public:
   virtual bool findDecalId(int id) const = 0;
 
   virtual void invalidate() = 0;
+
+  virtual void setIsSmallGrass(bool flag) = 0;
+  virtual bool isSmallGrass() const = 0;
 };

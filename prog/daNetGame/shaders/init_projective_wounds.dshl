@@ -12,7 +12,8 @@ float4 blood_wound_flesh_color_low_intensity = (0.002, 0, 0, 1);
 float4 blood_wound_skin_flesh_color_high_intensity = (0.007, 0, 0, 1);
 float4 blood_wound_skin_flesh_color_low_intensity = (0.002, 0, 0, 1);
 
-float4 blood_wound_angle_dist_fadeoff_range = (0.0, 0.9, 1.0, 0.55);
+// zw is the distance fade in center-relative squared uv radius
+float4 blood_wound_angle_dist_fadeoff_range = (0.0, 0.9, 0.25, 0.15);
 
 float blood_wound_dark_albedo_compensation_factor = 0.04;
 float blood_wound_low_porosity_reflectance = 0.3;
@@ -23,11 +24,16 @@ float4 blood_wound_skin_color_high_intensity = (0.05, 0, 0, 1);
 float4 blood_wound_skin_color_low_intensity = (0.3, 0.02, 0, 1);
 
 float bloody_time = 0.25;
+float wound_hole_cut_radius = 0.35;
+float wound_hole_edge_reach = 1.5;
+float wound_hole_splatter_cut_threshold = 0.85;
+float wound_hole_vertex_cut_ratio = 0.5;
 float blood_tex_discard_threshold = 0.85;
 float sample_tex_inside_of = 0.9;
 float blood_brightness = 2.0;
+float blood_edge_fade_width = 0.0;
 int debug_torn_wounds = 0;
-interval debug_torn_wounds: off<1, on;
+interval debug_torn_wounds: off<1, coverage<2, distance<3, bands;
 
 macro INIT_BURNED_DIFFUSE_FUNCTION()
   (ps) {
@@ -44,6 +50,17 @@ macro INIT_PROJECTIVE_WOUNDS()
   blood_tex_discard_threshold@f1 = blood_tex_discard_threshold;
   sample_tex_inside_of@f1 = sample_tex_inside_of;
   blood_brightness@f1 = blood_brightness;
+  blood_edge_fade_inv_width@f1 = (1.0 / max(blood_edge_fade_width, 1e-4));
+  wound_hole_cut_radius@f1 = wound_hole_cut_radius;
+  wound_hole_edge_reach@f1 = max(wound_hole_edge_reach, 1.0001);
+  wound_hole_splatter_cut_threshold@f1 = wound_hole_splatter_cut_threshold;
+}
+
+(vs) {
+  wounds_time@f1 = time_phase(0,0);
+  wound_hole_cut_radius@f1 = wound_hole_cut_radius;
+  wound_hole_edge_reach@f1 = max(wound_hole_edge_reach, 1.0001);
+  wound_hole_vertex_cut_ratio@f1 = wound_hole_vertex_cut_ratio;
 }
 
 local float blood_wound_flesh_begin_thickness = 1.0 - blood_wound_flesh_intensity_border;
@@ -77,28 +94,28 @@ local float blood_wound_flesh_edge_thickness_width = blood_wound_flesh_begin_thi
 endmacro
 
 macro INIT_BURNED_DIFFUSE_FUNCTION_BLOCK()
-if (compatibility_mode != compatibility_mode_on && mobile_render == off)
+if (compatibility_mode != compatibility_mode_on)
 {
   INIT_BURNED_DIFFUSE_FUNCTION()
 }
 endmacro
 
 macro INIT_PROJECTIVE_WOUNDS_BLOCK()
-if (compatibility_mode != compatibility_mode_on && mobile_render == off)
+if (compatibility_mode != compatibility_mode_on)
 {
   INIT_PROJECTIVE_WOUNDS()
 }
 endmacro
 
 macro INIT_BURNED_DIFFUSE_FUNCTION_SHADER()
-if (!(compatibility_mode != compatibility_mode_on && mobile_render == off))
+if (!(compatibility_mode != compatibility_mode_on))
 {
   INIT_BURNED_DIFFUSE_FUNCTION()
 }
 endmacro
 
 macro INIT_PROJECTIVE_WOUNDS_SHADER()
-if (!(compatibility_mode != compatibility_mode_on && mobile_render == off))
+if (!(compatibility_mode != compatibility_mode_on))
 {
   INIT_PROJECTIVE_WOUNDS()
 }

@@ -55,6 +55,32 @@ static ecs::EntitySystemDesc outline_renderer_create_es_event_handler_es_desc
                        ecs::EventComponentsAppear>::build(),
   0
 );
+static constexpr ecs::ComponentDesc outline_renderer_destroy_es_event_handler_comps[] =
+{
+//start of 1 rw components at [0]
+  {ECS_HASH("outline_renderer"), ecs::ComponentTypeInfo<OutlineRenderer>()}
+};
+static void outline_renderer_destroy_es_event_handler_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
+{
+  auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
+    outline_renderer_destroy_es_event_handler(evt
+        , ECS_RW_COMP(outline_renderer_destroy_es_event_handler_comps, "outline_renderer", OutlineRenderer)
+    );
+  while (++comp != compE);
+}
+static ecs::EntitySystemDesc outline_renderer_destroy_es_event_handler_es_desc
+(
+  "outline_renderer_destroy_es",
+  "prog/daNetGameLibs/outline/render/outlineRendererES.cpp.inl",
+  ecs::EntitySystemOps(nullptr, outline_renderer_destroy_es_event_handler_all_events),
+  make_span(outline_renderer_destroy_es_event_handler_comps+0, 1)/*rw*/,
+  empty_span(),
+  empty_span(),
+  empty_span(),
+  ecs::EventSetBuilder<ecs::EventEntityDestroyed,
+                       ecs::EventComponentsDisappear>::build(),
+  0
+);
 static constexpr ecs::ComponentDesc disable_outline_on_ri_destroyed_es_event_handler_comps[] =
 {
 //start of 1 rw components at [0]
@@ -133,35 +159,30 @@ static ecs::EntitySystemDesc outline_render_resolution_es_event_handler_es_desc
   ecs::EventSetBuilder<SetResolutionEvent>::build(),
   0
 ,"render");
-static constexpr ecs::ComponentDesc create_outline_node_es_comps[] =
+static constexpr ecs::ComponentDesc outline_view_nodes_es_comps[] =
 {
-//start of 2 rw components at [0]
-  {ECS_HASH("outline_prepare_node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()},
-  {ECS_HASH("outline_apply_node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()}
+//start of 1 rq components at [0]
+  {ECS_HASH("outline_renderer"), ecs::ComponentTypeInfo<OutlineRenderer>()}
 };
-static void create_outline_node_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
+static void outline_view_nodes_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
-    create_outline_node_es(evt
-        , ECS_RW_COMP(create_outline_node_es_comps, "outline_prepare_node", dafg::NodeHandle)
-    , ECS_RW_COMP(create_outline_node_es_comps, "outline_apply_node", dafg::NodeHandle)
+  G_FAST_ASSERT(evt.is<OnCameraMainViewNodeConstruction>());
+  outline_view_nodes_es(static_cast<const OnCameraMainViewNodeConstruction&>(evt)
+        , components.manager()
     );
-  while (++comp != compE);
 }
-static ecs::EntitySystemDesc create_outline_node_es_es_desc
+static ecs::EntitySystemDesc outline_view_nodes_es_es_desc
 (
-  "create_outline_node_es",
+  "outline_view_nodes_es",
   "prog/daNetGameLibs/outline/render/outlineRendererES.cpp.inl",
-  ecs::EntitySystemOps(nullptr, create_outline_node_es_all_events),
-  make_span(create_outline_node_es_comps+0, 2)/*rw*/,
+  ecs::EntitySystemOps(nullptr, outline_view_nodes_es_all_events),
   empty_span(),
   empty_span(),
+  make_span(outline_view_nodes_es_comps+0, 1)/*rq*/,
   empty_span(),
-  ecs::EventSetBuilder<ChangeRenderFeatures,
-                       ecs::EventEntityCreated,
-                       ecs::EventComponentsAppear>::build(),
+  ecs::EventSetBuilder<OnCameraMainViewNodeConstruction>::build(),
   0
-);
+,"render");
 static constexpr ecs::ComponentDesc render_outline_ecs_query_comps[] =
 {
 //start of 2 rw components at [0]
@@ -176,9 +197,9 @@ static ecs::CompileTimeQueryDesc render_outline_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void render_outline_ecs_query(Callable function)
+inline void render_outline_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, render_outline_ecs_query_desc.getHandle(),
+  perform_query(&manager, render_outline_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do

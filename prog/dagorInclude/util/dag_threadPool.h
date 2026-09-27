@@ -19,7 +19,7 @@ namespace threadpool
 {
 #if _TARGET_C1 | _TARGET_XBOXONE
 static constexpr int MAX_WORKER_COUNT = 6;
-#elif _TARGET_ANDROID
+#elif _TARGET_ANDROID | _TARGET_IOS
 static constexpr int MAX_WORKER_COUNT = 4;
 #elif _TARGET_C3
 
@@ -71,13 +71,12 @@ public:
 
 // if num_workers == 0, jobs will be executed synchronously
 // queue_size must be power of 2
-KRNLIMP void init_ex(int num_workers, int queue_sizes[NUM_PRIO], size_t stack_size = 64 << 10,
-  uint64_t max_workers_prio = 0); // max per-worker prio (2 bits per worker)
+KRNLIMP void init_ex(int num_workers, int queue_sizes[NUM_PRIO], size_t stack_size = 64 << 10);
 
-inline void init(int num_workers, int queue_size, size_t stack_size = 64 << 10, uint64_t max_workers_prio = 0)
+inline void init(int num_workers, int queue_size, size_t stack_size = 64 << 10)
 {
   int q_sizes[] = {queue_size, queue_size, queue_size};
-  init_ex(num_workers, q_sizes, stack_size, max_workers_prio);
+  init_ex(num_workers, q_sizes, stack_size);
 }
 
 KRNLIMP void shutdown();
@@ -115,6 +114,9 @@ inline bool add(cpujobs::IJob *j, JobPriority prio = PRIO_DEFAULT, bool wake_up 
 }
 KRNLIMP bool add_node(threadpool::IJobNode *j, uint32_t start_index, uint32_t num_jobs, JobPriority prio = PRIO_DEFAULT,
   bool wake_up = true);
+
+// Pop and perform one pending job of exactly `prio` (no wait). Returns true if a job was performed.
+KRNLIMP bool perform_pending_job(JobPriority prio);
 
 // If lowest_prio_to_perform is in [PRIO_HIGH..NUM_PRIO] - waiting will be busy doing other jobs of higher priorities (NUM_PRIO mean
 // all) The reasons to do that depends on caller estimations of waiting times

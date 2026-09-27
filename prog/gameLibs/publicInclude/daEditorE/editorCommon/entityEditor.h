@@ -10,6 +10,7 @@
 #include <daECS/core/componentTypes.h>
 #include <daECS/scene/scene.h>
 #include <util/dag_console.h>
+#include <osApiWrappers/dag_critSec.h>
 #include <EASTL/unique_ptr.h>
 #include <ska_hash_map/flat_hash_map2.hpp>
 #include <sqrat.h>
@@ -62,16 +63,20 @@ public:
 
   typedef eastl::vector<eastl::string> SaveOrderRules;
   void setSaveOrderRules(const SaveOrderRules &rules) { saveOrderRules = rules; }
-  int saveObjectsInternal(const char *fpath, bool save_child_scenes);
-  void saveObjectsCopy(const char *fpath, const char *reason, bool save_child_scenes = false);
-  void saveObjects(const char *new_fpath = NULL, bool save_child_scenes = false);
+  const SaveOrderRules &getSaveOrderRules() const { return saveOrderRules; }
+
+  void setMainScenePath(const char *fpath);
+  void saveMainSceneCopy(const char *fpath, const char *reason);
+  void requestSaveMainSceneCopy(const char *fpath, const char *reason);
+  void dropPendingSaveMainSceneCopy();
+  void saveMainScene();
+  void saveDirtyScenes();
+  void saveScenes(const eastl::vector<ecs::Scene::SceneId> scenes_to_save);
+
   void saveEntityToBlk(ecs::EntityId eid, DataBlock &blk) const;
   bool hasUnsavedChanges() const;
-  bool hasUnsavedChildScenes() const;
-  bool isChildScene(uint32_t load_type, uint32_t scene_idx);
-  void setChildSceneEditable(uint32_t load_type, uint32_t scene_idx, bool enable);
-  int getEditableScenesCount() const;
-  void setTargetScene(uint32_t load_type, uint32_t scene_idx);
+  bool isChildScene(ecs::Scene::SceneId id);
+  void setTargetScene(ecs::Scene::SceneId id);
 
   void hideSelectedTemplate();
   void hideUnmarkedEntities(Sqrat::Array eids_arr);
@@ -94,6 +99,10 @@ public:
   void setFocusedEntity(ecs::EntityId eid);
   ecs::EntityId getFirstSelectedEntity();
 
+  void initSceneObjects();
+  void addScene(ecs::Scene::SceneId sid);
+  void removeScene(ecs::Scene::SceneId sid);
+
   void setParentForSelection();
   void clearParentForSelection();
   void toggleFreeTransformForSelection();
@@ -102,12 +111,14 @@ public:
   void scheduleObjRemoval(EditableObject *o) { objsToRemove.push_back(o); }
 
   static void register_script_class(HSQUIRRELVM vm);
+  static Sqrat::Table getSceneTree(HSQUIRRELVM vm, EntityObjEditor *editor); // null editor: empty tree
 
   static eastl::string getTemplateNameForUI(ecs::EntityId eid);
   static bool hasTemplateComponent(const char *template_name, const char *comp_name);
   static bool getSavedComponents(ecs::EntityId eid, eastl::vector<eastl::string> &out_comps);
   static void resetComponent(ecs::EntityId eid, const char *comp_name);
   static void saveComponent(ecs::EntityId eid, const char *comp_name);
+  static void getChangedComponentsToDataBlock(ecs::EntityId eid, DataBlock &blk);
   static void saveAddTemplate(ecs::EntityId eid, const char *templ_name);
   static void saveDelTemplate(ecs::EntityId eid, const char *templ_name, bool use_undo = false);
 
@@ -120,8 +131,20 @@ public:
   void forEachEntityObjWithTemplate(F fn);
   template <typename F>
   void forEachEntityObj(F fn);
+  template <typename F>
+  void forEachSceneObj(F fn);
 
   EditableObject *getObjectByEid(ecs::EntityId eid) const;
+  EditableObject *getSceneObjectById(ecs::Scene::SceneId sid) const;
+
+  static uint32_t writeSceneToBlk(DataBlock &blk, const ecs::Scene::SceneRecord &record, EntityObjEditor &editor);
+
+  bool isEntityHidden(ecs::EntityId eid) const;
+  bool isSceneHidden(ecs::Scene::SceneId sid) const;
+
+  bool isEntityLocked(ecs::EntityId eid) const;
+  bool isSceneLocked(ecs::Scene::SceneId sid) const;
+  bool isSceneInLockedHierarchy(ecs::Scene::SceneId sid) const;
 
 protected:
   virtual void cloneSelection() override;
@@ -152,16 +175,41 @@ private:
     dag::Vector<HierarchyItem *> children;
   };
 
-  int saveSceneObjectsInternal(const char *fpath, uint32_t scene_idx, uint32_t load_type, bool save_child_scenes);
-  int saveChildSceneObjectsInternal(const ecs::Scene::ScenesList *scene_records, uint32_t scene_idx, uint32_t load_type);
-
   bool isSceneEntity(ecs::EntityId eid);
   bool checkSceneEntities(const char *rule);
   int getEntityRecordLoadType(ecs::EntityId eid);
-  int getEntityRecordIndex(ecs::EntityId eid);
+  ecs::Scene::SceneId getEntityRecordSceneId(ecs::EntityId eid) const;
+
+  void addImportScene(ecs::Scene::SceneId parent_id, const char *fpath);
+
+  bool isEntityTransformable(ecs::EntityId eid) const;
+  bool isSceneInTransformableHierarchy(ecs::Scene::SceneId scene_id) const;
+
+  // Pivot, transformable, pretty name getters/setters work on Import scenes
+  bool isSceneTransformable(ecs::Scene::SceneId scene_id) const;
+  void setSceneTransformable(ecs::Scene::SceneId scene_id, bool val);
+  Point3 getScenePivot(ecs::Scene::SceneId scene_id) const;
+  void setScenePivot(ecs::Scene::SceneId scene_id, const Point3 &pivot);
+  const char *getScenePrettyName(ecs::Scene::SceneId scene_id) const;
+  void setScenePrettyName(ecs::Scene::SceneId scene_id, const char *name);
+  void setSceneNewParent(ecs::Scene::SceneId new_parent_id, Sqrat::Array items);
+  void setSceneNewParentAndOrder(ecs::Scene::SceneId new_parent_id, uint32_t order, Sqrat::Array items);
+  void setSceneOrder(ecs::Scene::SceneId id, uint32_t order);
+  uint32_t getSceneOrder(ecs::Scene::SceneId id) const;
+  uint32_t getSceneEntityCount(ecs::Scene::SceneId id) const;
+
+  Sqrat::Array getSceneOrderedEntries(HSQUIRRELVM vm, ecs::Scene::SceneId id);
+  void removeObjectsSq(Sqrat::Array objects_ids);
+  void hideObjectsSq(Sqrat::Array objects_ids);
+  void unhideObjectsSq(Sqrat::Array objects_ids);
+  void lockObjectsSq(Sqrat::Array object_ids);
+  void unlockObjectsSq(Sqrat::Array objects_ids);
 
   ecs::EntityId reCreateEditorEntity(ecs::EntityId eid);
   ecs::EntityId makeSingletonEntity(const char *tplName);
+
+  static SQInteger get_modified_scene_ids(HSQUIRRELVM vm);
+  Sqrat::Array getModifiedSceneIds(HSQUIRRELVM vm) const;
 
   void selectEntities(Sqrat::Array eids);
   Sqrat::Array getEntities(HSQUIRRELVM vm);
@@ -170,6 +218,7 @@ private:
   static SQInteger get_entites(HSQUIRRELVM vm);
   static SQInteger get_ecs_templates(HSQUIRRELVM vm);
   static SQInteger get_ecs_templates_groups(HSQUIRRELVM vm);
+  static SQInteger get_scene_ordered_entries(HSQUIRRELVM vm);
 
   Sqrat::Array getSceneEntities(HSQUIRRELVM vm);
   Sqrat::Array getSceneImports(HSQUIRRELVM vm);
@@ -179,6 +228,10 @@ private:
   static SQInteger get_scene_imports(HSQUIRRELVM vm);
   static SQInteger get_scene_record(HSQUIRRELVM vm);
   static SQInteger get_target_scene(HSQUIRRELVM vm);
+
+  void saveScenesSq(Sqrat::Array ids);
+  void savePendingMainSceneCopy();
+  void selectObjectsSq(Sqrat::Array objects_ids);
 
   void mapEidToEditableObject(EntityObj *obj);
   void unmapEidFromEditableObject(EntityObj *obj);
@@ -195,15 +248,21 @@ private:
   void gizmoStarted() override;
   void gizmoEnded(bool apply) override;
 
+  void undoLastOperationSq();
+  void redoLastOperationSq();
+
 private:
   static constexpr int DELAY_TO_UPDATE_EIDS = 60;
   int delay_to_update_eids = DELAY_TO_UPDATE_EIDS;
   bool sceneInit = false;
   SimpleString sceneFilePath;
   SaveOrderRules saveOrderRules;
+  WinCritSec pendingSceneCopyCritSec;
+  SimpleString pendingSceneCopyPath, pendingSceneCopyReason;
   Tab<EditableObject *> objsToRemove;
   Ptr<EditableObject> newObj;
   bool newObjOk = false;
+  bool isCreatingSampleEntity = false;
   eastl::unique_ptr<IObjectCreator> objCreator;
   HierarchicalUndoGroup *hierarchicalUndoGroup = nullptr;
   ska::flat_hash_set<ecs::EntityId, ecs::EidHash> eidsCreated;
@@ -211,10 +270,14 @@ private:
   eastl::vector<eastl::string> hiddenTemplates;
   HierarchyItem temporaryHierarchyForGizmoChange;
   bool showOnlySceneEntities = false;
+  bool isEntityListed(EntityObj *o) const; // shown in the entity lists under the current work mode
 
   int lastCreateObjFrames = 0;
   Ptr<EditableObject> lastCreatedObj;
   Point3 lastCreatedObjPos;
+
+  ska::flat_hash_set<ecs::Scene::SceneId> createdSceneObjs;
+  ska::flat_hash_map<ecs::Scene::SceneId, EditableObject *> sceneIdToEObj;
 
   struct TemplatesGroup
   {

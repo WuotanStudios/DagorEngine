@@ -12,11 +12,15 @@
 
 #include "spw_interface.h"
 
-class SquirrelObject;
 class DataBlock;
 class ScriptPanelContainer;
-struct SquirrelVMSys;
 class SqModules;
+typedef struct SQVM *HSQUIRRELVM;
+
+namespace Sqrat
+{
+class Table;
+}
 
 enum
 {
@@ -50,8 +54,15 @@ public:
   int getPidByName(const char *name);
   void sendMessage(int pid, int msg, void *arg);
 
-  void setSystemVM();
-  void setCurrentVM();
+  SqModules *getModuleMgr() const { return moduleMgr; }
+  HSQUIRRELVM getScriptVm() const;
+
+  // publish module exports under require(<name>) and as legacy root globals.
+  // The two surfaces are independent copies seeded from this table, not
+  // aliases. An export whose name is already bound on the root (scheme, the
+  // std lib bindings) is refused and logged; repeat calls for a registered
+  // name no-op.
+  static void publishNativeModule(SqModules &module_mgr, const char *name, const Sqrat::Table &module_exports);
 
 protected:
   void init();
@@ -65,8 +76,6 @@ protected:
   // FileUpdateCallback
   void UpdateFile() override;
 
-  SquirrelVMSys *createCleanVM();
-
 private:
   PropPanel::ContainerPropertyControl *mPanel;
   SimpleString mScriptFilename;
@@ -75,7 +84,6 @@ private:
   IScriptPanelTargetCB *objCB;
   int mPid, mPostEventCounter;
 
-  SquirrelVMSys *sysVM, *curVM;
   IScriptPanelEventHandler *mHandler;
   SqModules *moduleMgr = nullptr;
 

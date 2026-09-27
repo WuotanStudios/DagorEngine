@@ -31,6 +31,7 @@ public:
   virtual ~IAsyncHTTPCallback() {}
 
   virtual void onRequestDone(RequestStatus status, int http_code, dag::ConstSpan<char> response, StringMap const &resp_headers) = 0;
+  virtual void onConnectionInfo(const char * /*primary_ip*/) {}
   virtual void onHttpProgress(size_t /*dltotal*/, size_t /*dlnow*/) {}
   virtual void onHttpHeadersResponse(StringMap const & /*resp_headers*/) {}
 
@@ -152,6 +153,7 @@ enum class HTTPReq
 {
   GET,
   POST,
+  PUT,
   HEAD,
   DEL
 };
@@ -222,5 +224,7 @@ struct InitAsyncParams
 };
 
 void init_async(InitAsyncParams const &params);
+// Also registered with atexit by the first init, so a process that never calls it
+// still shuts down before the static destructors; explicit calls are idempotent
 void shutdown_async();
 } // namespace httprequests

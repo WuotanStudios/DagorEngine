@@ -45,20 +45,23 @@ struct BVHConnection : public bvh::BVHConnection
     buffer_id = BAD_D3DRESID;
 
     auto riRes = rendinst::getRIGenExtraRes(id);
-    if (riRes->getBvhId() == 0)
+    if (!riRes || riRes->getBvhId() == 0)
       return false;
 
     auto &mapping = metainfoMappingsById[id];
     if (!mapping.mapping)
     {
       String bname(64, "bvh_gpuobject_mapping_%d", id);
-      mapping.mapping = dag::buffers::create_persistent_sr_structured(sizeof(GpuObjectsBvhMapping), maxLodCount, bname);
+      mapping.mapping = dag::buffers::create_persistent_sr_structured(sizeof(GpuObjectsBvhMapping), maxLodCount, bname,
+        d3d::buffers::Init::No, RESTAG_BVH);
 
       HANDLE_LOST_DEVICE_STATE(mapping.mapping, false);
     }
 
     if (mapping.dirty)
     {
+      TIME_PROFILE(bvh_objects_lock_gobj);
+      Context::BvhObjectReadLock objectsGuard((*contexts.begin())->objectsLock);
       GpuObjectsBvhMapping mappings[maxLodCount];
       for (auto [lodIx, mapping] : enumerate(mappings))
       {
@@ -67,8 +70,8 @@ struct BVHConnection : public bvh::BVHConnection
 
         if (object && object->blas && MeshMetaAllocator::is_valid(object->metaAllocId))
         {
-          mapping.blas.x = object->blas.getGPUAddress() & 0xFFFFFFFFLLU;
-          mapping.blas.y = object->blas.getGPUAddress() >> 32;
+          mapping.blas.x = object->blas.getGPUAddress() & GPU_ADDRESS_LOW_MASK;
+          mapping.blas.y = object->blas.getGPUAddress() >> GPU_ADDRESS_HIGH_SHIFT;
           mapping.metaIndex = MeshMetaAllocator::decode(object->metaAllocId);
         }
         else
@@ -112,31 +115,32 @@ void teardown()
 
 void init(ContextId context_id)
 {
-  if (!context_id->has(Features::GpuObjects))
+  if (!context_id->hasAny(Features::GpuObjects))
     return;
 
   bvhConnection.contexts.insert(context_id);
 }
 
-void teardown(ContextId context_id)
-{
-  if (!context_id->has(Features::GpuObjects))
-    return;
-
-  bvhConnection.contexts.erase(context_id);
-}
-
 void on_unload_scene(ContextId context_id)
 {
-  if (!context_id->has(Features::GpuObjects))
+  if (!context_id->hasAny(Features::GpuObjects))
     return;
 
   bvhConnection.teardown();
 }
 
+void teardown(ContextId context_id)
+{
+  if (!context_id->hasAny(Features::GpuObjects))
+    return;
+
+  bvh::gobj::on_unload_scene(context_id);
+  bvhConnection.contexts.erase(context_id);
+}
+
 void get_instances(ContextId context_id, Sbuffer *&instances, Sbuffer *&instance_count)
 {
-  if (context_id->has(Features::GpuObjects))
+  if (context_id->hasAny(Features::GpuObjects))
   {
     instances = bvhConnection.instances.getBuf();
     instance_count = bvhConnection.counter.getBuf();

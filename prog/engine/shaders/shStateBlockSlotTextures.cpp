@@ -6,16 +6,16 @@
 #include <EASTL/string.h>
 
 #include "shStateBlock.h"
-#include "concurrentElementPool.h"
-#include "concurrentRangePool.h"
+#include <generic/dag_concurrentElementPool.h>
+#include <generic/dag_concurrentRangePool.h>
 
 using namespace shaders;
 
 struct SBSamplerState
 {
-  using TexDataCont = ConcurrentRangePool<TEXTUREID, 12>;
+  using TexDataCont = dag::ConcurrentRangePool<TEXTUREID, 12>;
   static TexDataCont data;
-  static ConcurrentElementPool<TexStateIdx, SBSamplerState, 10> all; // first one is default
+  static dag::ConcurrentElementPool<TexStateIdx, SBSamplerState, 10> all; // first one is default
   static OSSpinlock mutex;
 
   static_assert(DEFAULT_TEX_STATE_ID == decltype(all)::FIRST_ID);
@@ -28,9 +28,12 @@ struct SBSamplerState
   {
     const auto dataView = data.view(textures);
 
-    const auto setTex = [&](TEXTUREID tid, ShaderStage stage, int slot, int smp_slot) {
+    const auto setTex = [&](TEXTUREID tid, ShaderStage stage, int slot) {
       mark_managed_tex_lfu(tid, tex_level);
       d3d::set_tex(stage, slot, D3dResManagerData::getBaseTex(tid));
+    };
+
+    const auto setSampler = [&](TEXTUREID tid, ShaderStage stage, int smp_slot) {
       if (auto smp = get_texture_separate_sampler(tid); DAGOR_LIKELY(smp != d3d::INVALID_SAMPLER_HANDLE))
       {
         d3d::set_sampler(stage, smp_slot, smp);
@@ -42,19 +45,27 @@ struct SBSamplerState
       }
     };
 
-    for (uint32_t i = 0, e = psRange.count; i < e; ++i)
-      setTex(dataView[i], STAGE_PS, psRange.texBase + i, psRange.smpBase + i);
-    for (uint32_t i = 0, e = vsRange.count; i < e; ++i)
-      setTex(dataView[psRange.count + i], STAGE_VS, vsRange.texBase + i, vsRange.smpBase + i);
+    for (uint32_t i = 0, e = psRange.texCount; i < e; ++i)
+    {
+      setTex(dataView[i], STAGE_PS, psRange.texBase + i);
+      if (i < psRange.smpCount)
+        setSampler(dataView[i], STAGE_PS, psRange.smpBase + i);
+    }
+    for (uint32_t i = 0, e = vsRange.texCount; i < e; ++i)
+    {
+      setTex(dataView[psRange.texCount + i], STAGE_VS, vsRange.texBase + i);
+      if (i < vsRange.smpCount)
+        setSampler(dataView[psRange.texCount + i], STAGE_VS, vsRange.smpBase + i);
+    }
   }
 
   void reqTexLevel(int tex_level)
   {
     const auto dataView = data.view(textures);
-    for (uint32_t i = 0, e = psRange.count; i < e; ++i)
+    for (uint32_t i = 0, e = psRange.texCount; i < e; ++i)
       mark_managed_tex_lfu(dataView[i], tex_level);
-    for (uint32_t i = 0, e = vsRange.count; i < e; ++i)
-      mark_managed_tex_lfu(dataView[psRange.count + i], tex_level);
+    for (uint32_t i = 0, e = vsRange.texCount; i < e; ++i)
+      mark_managed_tex_lfu(dataView[psRange.texCount + i], tex_level);
   }
 
   static TexStateIdx create(const TEXTUREID *ps, SlotTexturesRangeInfo ps_range, const TEXTUREID *vs, SlotTexturesRangeInfo vs_range)
@@ -66,8 +77,8 @@ struct SBSamplerState
         if (c.psRange != ps_range || c.vsRange != vs_range)
           return false;
         const auto dataView = data.view(c.textures);
-        if (memcmp(dataView.data(), ps, ps_range.count * sizeof(*ps)) == 0 &&
-            memcmp(dataView.data() + ps_range.count, vs, vs_range.count * sizeof(*vs)) == 0)
+        if (memcmp(dataView.data(), ps, ps_range.texCount * sizeof(*ps)) == 0 &&
+            memcmp(dataView.data() + ps_range.texCount, vs, vs_range.texCount * sizeof(*vs)) == 0)
         {
           return true;
         }
@@ -77,10 +88,10 @@ struct SBSamplerState
         return id;
     }
 
-    const auto dataId = data.allocate(ps_range.count + vs_range.count);
+    const auto dataId = data.allocate(ps_range.texCount + vs_range.texCount);
     const auto dataView = data.view(dataId);
-    memcpy(dataView.data(), ps, ps_range.count * sizeof(*ps));
-    memcpy(dataView.data() + ps_range.count, vs, vs_range.count * sizeof(*vs));
+    memcpy(dataView.data(), ps, ps_range.texCount * sizeof(*ps));
+    memcpy(dataView.data() + ps_range.texCount, vs, vs_range.texCount * sizeof(*vs));
 
     const TexStateIdx result = all.allocate();
     all[result] = SBSamplerState{dataId, ps_range, vs_range};
@@ -101,10 +112,10 @@ decltype(SBSamplerState::mutex) SBSamplerState::mutex;
 
 struct ConstState
 {
-  using ConstsDataCont = ConcurrentRangePool<Point4, 13>;
+  using ConstsDataCont = dag::ConcurrentRangePool<Point4, 13>;
   static ConstsDataCont dataConsts;
-  static ConcurrentElementPool<ConstStateIdx, ConstState, 11> all;        // first one is default
-  static ConcurrentElementPool<ConstStateIdx, Sbuffer *, 11> allConstBuf; // parallel to all
+  static dag::ConcurrentElementPool<ConstStateIdx, ConstState, 11> all;        // first one is default
+  static dag::ConcurrentElementPool<ConstStateIdx, Sbuffer *, 11> allConstBuf; // parallel to all
   static OSSpinlock mutex;
 
   static_assert(DEFAULT_CONST_STATE_ID == decltype(all)::FIRST_ID);
@@ -168,7 +179,7 @@ struct ConstState
     {
       eastl::string s(eastl::string::CtorSprintf{}, "staticCbuf%d", eastl::to_underlying(const_state_idx));
       const auto constsView = dataConsts.view(state.consts);
-      Sbuffer *constBuf = d3d::buffers::create_persistent_cb(constsView.size(), s.c_str());
+      Sbuffer *constBuf = d3d::buffers::create_persistent_cb(constsView.size(), s.c_str(), RESTAG_ENGINE);
       if (!constBuf)
       {
         logerr("Could not create Sbuffer for const buf.");

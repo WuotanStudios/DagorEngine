@@ -8,8 +8,10 @@
 #include "shcode.h"
 #include "shsem.h"
 #include "shMessages.h"
+#include "codeBlocks.h"
 #include "shaderVariant.h"
 #include "shSemCode.h"
+#include "preshaderCompilation.h"
 
 
 namespace shc
@@ -22,6 +24,7 @@ struct TypeTables
   ShaderVariant::TypeTable allStaticTypes;
   ShaderVariant::TypeTable allDynamicTypes;
   ShaderVariant::TypeTable referencedTypes;
+  dag::VectorSet<int> uniqueIntervalNameIdsReferencedInBoolExpressions{};
 
   explicit TypeTables(shc::TargetContext &ctx) : allStaticTypes{ctx}, allDynamicTypes{ctx}, referencedTypes{ctx} {}
 };
@@ -29,28 +32,36 @@ struct TypeTables
 class ShaderContext
 {
   const char *mName;
+  int mNameId;
   const ShaderBlockLevel mBlockLevel;
   Terminal *mDeclTerm;
   eastl::unique_ptr<ShaderClass> mShaderClass;
   TypeTables mTypes;
   IntervalList mIntervals{};
-  BoolVarTable mBoolVarTable{};
+  BoolVarTable mBoolVarTable;
   PerHlslStage<String> mLocalHlslSource{};
+  PerHlslStage<CodeSourceBlocks> mHlslCodeBlocks{};
+  PreshaderCompilationCache mPreshaderCache{};
   ShaderAssumesTable mLocalAssumes;
   ShaderMessages mMessages{};
   bool mDebugModeEnabled = false;
+  bool mImmediateCbSlotRequired = false;
 
   TargetContext &mParent;
-  const CompilationContext &mCompParent;
+  CompilationContext &mCompParent;
+
+  carray<ShaderTerminal::external_state_block *, STAGE_MAX> mShaderAssertPreshaderBlocks{};
 
 public:
   PINNED_TYPE(ShaderContext)
 
   TargetContext &tgtCtx() { return mParent; }
   const TargetContext &tgtCtx() const { return mParent; }
+  CompilationContext &compCtx() { return mCompParent; }
   const CompilationContext &compCtx() const { return mCompParent; }
 
   const char *name() const { return mName; }
+  int nameId() const { return mNameId; }
   ShaderBlockLevel blockLevel() const { return mBlockLevel; }
 
   Terminal *declTerm() { return mDeclTerm; }
@@ -73,14 +84,42 @@ public:
   auto &localHlslSrc() { return mLocalHlslSource; }
   const auto &localHlslSrc() const { return mLocalHlslSource; }
 
+  auto &hlslCodeBlocks() { return mHlslCodeBlocks; }
+  const auto &hlslCodeBlocks() const { return mHlslCodeBlocks; }
+
+  PreshaderCompilationCache &preshaderCache() { return mPreshaderCache; }
+  const PreshaderCompilationCache &preshaderCache() const { return mPreshaderCache; }
+
   ShaderAssumesTable &assumes() { return mLocalAssumes; }
   const ShaderAssumesTable &assumes() const { return mLocalAssumes; }
 
   ShaderMessages &messages() { return mMessages; }
   const ShaderMessages &messages() const { return mMessages; }
 
+  ShaderTerminal::external_state_block *debugBlock(uint32_t stage) { return mShaderAssertPreshaderBlocks[stage]; }
+
   bool isDebugModeEnabled() const { return mDebugModeEnabled; }
-  void setDebugModeEnabled(bool val) { mDebugModeEnabled = val; }
+  void setDebugModeEnabled(bool val)
+  {
+    mDebugModeEnabled = val;
+    if (!mDebugModeEnabled)
+      return;
+
+    auto compile = [this](uint32_t stage, const char *name) {
+      // See assert.dshl for the definition of __ASSERT_PRESHADER(stage)
+      String text = String(0, "\n__ASSERT_PRESHADER(%s)\n", name);
+      auto *assert_stat = ShaderParser::parse_shader_stat(text, text.length(), tgtCtx(), nullptr);
+      G_ASSERT(assert_stat && assert_stat->external_block);
+      mShaderAssertPreshaderBlocks[stage] = assert_stat->external_block;
+    };
+    for (auto stage : {STAGE_VS, STAGE_PS, STAGE_CS})
+      compile(stage, SHADER_STAGE_SHORT_NAMES[stage]);
+    // compile(STAGE_VS + 1, "ms");
+    // compile(STAGE_VS + 2, "as");
+  }
+
+  bool immediateCbSlotRequired() const { return IMMEDIATE_CB_REGISTER >= 0 && mImmediateCbSlotRequired; } //-V560 -1 on some targets
+  void reportImmediateCbSlotRequired() { mImmediateCbSlotRequired = true; }
 
   VariantContext makeVariantContext(ShaderVariant::VariantInfo variant, ShaderSemCode &target_code,
     ShaderSemCode::PassTab *target_pass = nullptr, bool use_branches_for_cppstcode = false);
@@ -91,15 +130,16 @@ private:
   // @TODO: include option to not initialize shader-only systems (for blocks)
 
   explicit ShaderContext(const char *shname, ShaderBlockLevel block_level, Terminal *shname_term, TargetContext &parent,
-    const CompilationContext &comp_parent) :
+    CompilationContext &comp_parent) :
     mName{shname},
+    mNameId{parent.shaderNameMap().addNameId(shname)},
     mBlockLevel{block_level},
     mDeclTerm{shname_term},
     mShaderClass{new ShaderClass{shname}},
     mTypes{parent}, // @TODO: a more precise reference to a needed resource?
-    mBoolVarTable{parent.globBoolVars().maxId()},
+    mBoolVarTable{parent.boolVarNameMap(), &parent.globBoolVars()},
     mLocalHlslSource{parent.globHlslSrc()},
-    mLocalAssumes{*shc::config().assumedVarsConfig->getBlockByNameEx(shname), &parent.globAssumes(), shname},
+    mLocalAssumes{*shc::config().assumedVarsConfig->getBlockByNameEx(shname), parent.intervalNameMap(), &parent.globAssumes(), shname},
     mParent{parent},
     mCompParent{comp_parent}
   {

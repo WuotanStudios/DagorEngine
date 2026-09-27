@@ -60,16 +60,38 @@ using std::chrono::milliseconds;
 
 #define DAS_GLOBAL_NEW 1
 
+#if defined(DAS_LLVM_AOT)
+#define DAS_BIND_EXTERNAL 1
+#else
 #define DAS_BIND_EXTERNAL 0
+#endif
 
 #define DAS_SMART_PTR_TRACKER 0
+#if defined(_DEBUG_TAB_)
+#define DAS_SMART_PTR_MAGIC 1
+#else
+#define DAS_SMART_PTR_MAGIC 0
+#endif
 
 #define DAS_NO_GLOBAL_NEW_AND_DELETE 1
 
 #define DAS_FAST_INTEGER_MOD 0 // fast-math does not work with integer mod
 
-#define DAS_ASSERT    G_ASSERT
-#define DAS_ASSERTF   G_ASSERTF
+#ifdef __SANITIZE_ADDRESS__
+#define DAS_SAFE_HASH 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer)
+#define DAS_SAFE_HASH 1
+#endif
+#endif
+
+#if defined(_DEBUG_TAB_) || DAGOR_DBGLEVEL > 1
+#define DAS_ASSERT G_ASSERT
+#define DAS_ASSERTF G_ASSERTF
+#else
+#define DAS_ASSERT G_FAST_ASSERT
+#define DAS_ASSERTF(cond, ...) DAS_ASSERT(cond)
+#endif
 #define DAS_FATAL_LOG logerr
 #define DAS_FATAL_ERROR(...) \
   {                          \
@@ -79,10 +101,14 @@ using std::chrono::milliseconds;
 #define DAS_NO_FILEIO 1
 #endif
 
+#ifndef DAS_USE_BASE_CRASH_HANDLER
+#define DAS_USE_BASE_CRASH_HANDLER 0
+#endif
+
 #include <vecmath/dag_vecMathDecl.h>
 
 #define DAS_ALIGNED_ALLOC 1
-inline void *das_aligned_alloc16(uint32_t size) { return new char[size]; }
+inline void *das_aligned_alloc16(uint64_t size) { return new char[size]; }
 inline void das_aligned_free16(void *ptr) { delete[] (char *)ptr; }
 inline size_t das_aligned_memsize(void *ptr) { return defaultmem->getSize(ptr); }
 
@@ -122,18 +148,42 @@ inline size_t das_aligned_memsize(void *ptr) { return defaultmem->getSize(ptr); 
 #include <ska_hash_map/flat_hash_map2.hpp>
 namespace das
 {
-template <typename K, typename V, typename H = das::hash<K>, typename E = das::equal_to<K>>
+// Default hasher for the das_* maps. Upstream defines daslang_hash in
+// das_hash_map.h (only used when DAS_CUSTOM_HASH is on). Dagor uses ska +
+// eastl::hash instead, so we provide our own daslang_hash that forwards to
+// das::hash (eastl::hash) for the general case. This keeps hashing identical to
+// before for every existing key, while letting headers specialize daslang_hash
+// for their own key types (e.g. AstSerializer's SerializeNodeId) and have that
+// specialization picked up as the map's hasher.
+template <typename T, typename Enable = void>
+struct daslang_hash {
+  size_t operator()(const T &key) const noexcept { return das::hash<T>()(key); }
+};
+template <typename K, typename V, typename H = das::daslang_hash<K>, typename E = das::equal_to<K>>
 using das_map = ska::flat_hash_map<K, V, H, E>;
-template <typename K, typename H = das::hash<K>, typename E = das::equal_to<K>>
+template <typename K, typename H = das::daslang_hash<K>, typename E = das::equal_to<K>>
 using das_set = ska::flat_hash_set<K, H, E>;
-template <typename K, typename V, typename H = das::hash<K>, typename E = das::equal_to<K>>
+template <typename K, typename V, typename H = das::daslang_hash<K>, typename E = das::equal_to<K>>
 using das_hash_map = ska::flat_hash_map<K, V, H, E>;
-template <typename K, typename H = das::hash<K>, typename E = das::equal_to<K>>
+template <typename K, typename H = das::daslang_hash<K>, typename E = das::equal_to<K>>
 using das_hash_set = ska::flat_hash_set<K, H, E>;
 template <typename K, typename V>
 using das_safe_map = eastl::map<K, V>;
 template <typename K, typename C = das::less<K>>
 using das_safe_set = eastl::set<K, C>;
+// Insert-only / grow-only flavors. Dagor uses ska::flat_hash_map (no in-tree
+// daslang_insert_only_hash_map here), and DAS_CUSTOM_HASH is undefined, so these
+// must alias to the same type as das_hash_map/das_hash_set. The serializer and
+// das_common.h "ordered" insert-only overloads are guarded behind DAS_CUSTOM_HASH
+// precisely so that the regular das_hash_map overloads serve insert-only args.
+template <typename K, typename V, typename H = das::daslang_hash<K>, typename E = das::equal_to<K>>
+using das_insert_only_map = ska::flat_hash_map<K, V, H, E>;
+template <typename K, typename H = das::daslang_hash<K>, typename E = das::equal_to<K>>
+using das_insert_only_set = ska::flat_hash_set<K, H, E>;
+template <typename K, typename V, typename H = das::daslang_hash<K>, typename E = das::equal_to<K>>
+using das_insert_only_hash_map = ska::flat_hash_map<K, V, H, E>;
+template <typename K, typename H = das::daslang_hash<K>, typename E = das::equal_to<K>>
+using das_insert_only_hash_set = ska::flat_hash_set<K, H, E>;
 } // namespace das
 
 
@@ -142,7 +192,6 @@ using das_safe_set = eastl::set<K, C>;
 #ifndef das_to_stdout_level_prefix_text
 #define das_to_stdout_level_prefix_text(level, prefix, text)        \
   {                                                                 \
-    (void)prefix;                                                   \
     logmessage_(level >= das::LogLevel::error     ? LOGLEVEL_ERR    \
                 : level >= das::LogLevel::warning ? LOGLEVEL_WARN   \
                                                   : LOGLEVEL_DEBUG, \

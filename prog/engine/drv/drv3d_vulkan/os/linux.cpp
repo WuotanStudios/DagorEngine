@@ -1,0 +1,189 @@
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+
+#include "os.h"
+
+#include <stdlib.h>
+#include <debug/dag_debug.h>
+#include <drv_utils.h>
+#include <osApiWrappers/dag_linuxGUI.h>
+#include <startup/dag_globalSettings.h>
+
+#include "globals.h"
+#include "../workCycle/workCyclePriv.h"
+
+using namespace drv3d_vulkan;
+
+void drv3d_vulkan::get_video_modes_list(Tab<String> &list) { linux_GUI::get_video_mode_list(list); }
+
+bool drv3d_vulkan::get_monitors_list(Tab<String> &monitors)
+{
+  linux_GUI::get_monitors(monitors);
+  return monitors.size() > 0;
+}
+
+bool drv3d_vulkan::get_monitor_info(const char *monitor_name, String *friendly_name, int *monitor_index)
+{
+  return linux_GUI::get_monitor_info(monitor_name, friendly_name, monitor_index);
+}
+
+bool drv3d_vulkan::get_resolutions_from_monitor(const char *monitor_name, Tab<String> &resolutions)
+{
+  linux_GUI::get_resolutions_from_monitor(monitor_name, resolutions);
+  return resolutions.size() > 0;
+}
+
+bool drv3d_vulkan::validate_vulkan_signature(void *file)
+{
+  G_UNREFERENCED(file);
+  // on linux no way to verify driver signature?!?
+  return true;
+}
+
+VulkanSurfaceKHRHandle drv3d_vulkan::init_window_surface(VulkanInstance &instance, void *window)
+{
+  VulkanSurfaceKHRHandle result{};
+  if (!window)
+    return result;
+  G_UNUSED(instance);
+  if (linux_GUI::is_wayland())
+  {
+#if VK_KHR_wayland_surface
+    if (instance.hasExtension<SurfaceWaylandKHR>())
+    {
+      VkWaylandSurfaceCreateInfoKHR wlsci;
+      wlsci.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+      wlsci.pNext = NULL;
+      wlsci.flags = 0;
+      wlsci.display = (wl_display *)linux_GUI::get_native_display();
+      wlsci.surface = (wl_surface *)linux_GUI::get_native_window(window);
+      instance.vkCreateWaylandSurfaceKHR(instance.get(), &wlsci, NULL, ptr(result));
+    }
+#endif
+  }
+  else if (linux_GUI::is_x11())
+  {
+#if VK_KHR_xlib_surface
+    if (instance.hasExtension<SurfaceXlibKHR>())
+    {
+      VkXlibSurfaceCreateInfoKHR xlibsci;
+      xlibsci.sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR;
+      xlibsci.pNext = NULL;
+      xlibsci.flags = 0;
+      xlibsci.dpy = (Display *)linux_GUI::get_native_display();
+      xlibsci.window = (Window)linux_GUI::get_native_window(window);
+      instance.vkCreateXlibSurfaceKHR(instance.get(), &xlibsci, NULL, ptr(result));
+    }
+#endif
+  }
+  else
+    D3D_ERROR("vulkan: linux windowing system failed to init");
+  return result;
+}
+
+VkExtent2D drv3d_vulkan::get_window_client_rect_extent(void *window)
+{
+  int width = 0, height = 0;
+  linux_GUI::get_window_client_size(window, width, height);
+  return {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+}
+
+void drv3d_vulkan::WindowState::set(void *, const char *, int, void *, void *, const char *title, void *wnd_proc)
+{
+  if (!linux_GUI::init())
+    DAG_FATAL("vulkan: unable to init windowing subsystem check that X11/Wayland is avaialble");
+
+  windowTitle = title;
+  mainCallback = (main_wnd_f *)wnd_proc;
+}
+
+void drv3d_vulkan::WindowState::getRenderWindowSettings()
+{
+  int w, h;
+  bool isAuto, isRetina;
+  linux_GUI::get_display_size(w, h, dgs_get_window_mode() == WindowMode::FULLSCREEN_EXCLUSIVE);
+  bool windowed =
+    dgs_get_window_mode() != WindowMode::FULLSCREEN_EXCLUSIVE && dgs_get_window_mode() != WindowMode::WINDOWED_FULLSCREEN;
+  if (windowed && linux_GUI::get_main_window_ptr_handle())
+  {
+    const auto extent = get_window_client_rect_extent(linux_GUI::get_main_window_ptr_handle());
+    w = extent.width;
+    h = extent.height;
+  }
+  get_settings_resolution(settings.resolutionX, settings.resolutionY, isRetina, w, h, isAuto);
+
+  const DataBlock &videoBlk = *dgs_get_settings()->getBlockByNameEx("video");
+  const int positionIndex = videoBlk.findParam("position");
+  if (positionIndex >= 0 && videoBlk.getParamType(positionIndex) == DataBlock::TYPE_IPOINT2)
+    settings.position = videoBlk.getIPoint2(positionIndex);
+  else
+    settings.position.reset();
+
+  settings.maximized = videoBlk.getBool("maximized", true);
+}
+
+bool drv3d_vulkan::WindowState::setRenderWindowParams()
+{
+  if (dgs_get_window_mode() == WindowMode::WINDOWED_RESIZABLE && linux_GUI::get_main_window_ptr_handle())
+  {
+    const auto extent = get_window_client_rect_extent(linux_GUI::get_main_window_ptr_handle());
+    currentResolutionX = extent.width;
+    currentResolutionY = extent.height;
+  }
+
+  if (windowMode == (int)dgs_get_window_mode() && currentResolutionX == settings.resolutionX &&
+      currentResolutionY == settings.resolutionY && ownsWindow)
+    return true;
+
+  closeWindow();
+
+  linux_GUI::WindowCreationOptions windowCreationOptions{
+    .position = settings.position,
+    .maximized = settings.maximized,
+  };
+
+  if (linux_GUI::init_window(windowTitle, settings.resolutionX, settings.resolutionY, windowCreationOptions))
+  {
+    bool windowed = dgs_get_window_mode() != WindowMode::FULLSCREEN_EXCLUSIVE &&
+                    dgs_get_window_mode() != WindowMode::WINDOWED_FULLSCREEN &&
+                    dgs_get_window_mode() != WindowMode::WINDOWED_NO_BORDER;
+    linux_GUI::set_fullscreen_mode(!windowed);
+    currentResolutionX = settings.resolutionX;
+    currentResolutionY = settings.resolutionY;
+    windowMode = (int)dgs_get_window_mode();
+    settings.aspect = (float)settings.resolutionX / settings.resolutionY;
+    ownsWindow = true;
+    return true;
+  }
+  return false;
+}
+
+void *drv3d_vulkan::WindowState::getMainWindow()
+{
+  if (!ownsWindow)
+    return nullptr;
+  return linux_GUI::get_main_window_ptr_handle();
+}
+
+void drv3d_vulkan::WindowState::closeWindow()
+{
+  if (ownsWindow)
+  {
+    linux_GUI::destroy_main_window();
+    ownsWindow = false;
+  }
+}
+
+void drv3d_vulkan::os_restore_display_mode() {}
+
+void drv3d_vulkan::os_set_display_mode(int, int) {}
+
+void drv3d_vulkan::os_present_window_lock() { linux_GUI::lock_window(linux_GUI::get_main_window_ptr_handle()); }
+
+void drv3d_vulkan::os_present_window_unlock() { linux_GUI::unlock_window(linux_GUI::get_main_window_ptr_handle()); }
+
+eastl::string drv3d_vulkan::os_get_additional_ext_requirements(VulkanPhysicalDeviceHandle, const dag::Vector<VkExtensionProperties> &)
+{
+  return "";
+}
+
+void drv3d_vulkan::WindowState::updateRefreshRateFromCurrentDisplayMode() { refreshRate = linux_GUI::get_screen_refresh_rate(); }

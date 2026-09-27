@@ -20,19 +20,25 @@
 #include <debug/dag_log.h>
 #include <stdio.h> // for SNPRINTF
 
-#include "internal/delayed.h"
+#include "internal/delayed_internal.h"
 #include "internal/releasing.h"
-#include "internal/streams.h"
-#include "internal/soundSystem.h"
-#include "internal/events.h"
-#include "internal/occlusion.h"
-#include "internal/debug.h"
+#include "internal/streams_internal.h"
+#include "internal/soundSystem_internal.h"
+#include "internal/events_internal.h"
+#include "internal/occlusion_internal.h"
+#include "internal/occlusionGPU_internal.h"
+#include "internal/debug_internal.h"
+#include "internal/steamAudio/steamAudio_internal.h"
 
 #include <math/random/dag_random.h>
 #include <osApiWrappers/dag_atomic_types.h>
 
 #if _TARGET_IOS
 #include "soundSystem_ios.h"
+#endif
+
+#if _TARGET_PC_WIN
+#include <objbase.h>
 #endif
 
 #if FMOD_VERSION < 0x00020100 && _TARGET_XBOX
@@ -95,6 +101,7 @@ enum Defaults
 };
 
 static dag::AtomicInteger<bool> g_is_inited = false;
+static dag::AtomicInteger<bool> g_enable_asserts_monitor = false;
 static uint32_t g_version = 0;
 static size_t g_memory_block_size = 0;
 static void *g_memory_block = nullptr;
@@ -122,8 +129,10 @@ static bool init_live_update = false;
 static int maxVorbisCodecs = 0;
 static int maxFADPCMCodecs = 0;
 static bool fmod_synchronous_mode = false;
+static bool fmod_allow_missing_plugins = false;
 static bool enable_spatial_sound = false;
 static int samplerate = 48000;
+static bool enable_fmod_debug = true;
 #if DAGOR_DBGLEVEL > 0
 static bool memory_tracking_mode = false;
 #endif
@@ -139,8 +148,10 @@ static void settings_init(const DataBlock &blk)
   settings::maxVorbisCodecs = blk.getInt("maxVorbisCodecs", 0);
   settings::maxFADPCMCodecs = blk.getInt("maxFADPCMCodecs", 0);
   settings::fmod_synchronous_mode = blk.getBool("fmodSynchronousMode", false);
+  settings::fmod_allow_missing_plugins = blk.getBool("fmodAllowMissingPlugins", false);
   settings::samplerate = blk.getInt("sampleRate", 48000);
   settings::enable_spatial_sound = blk.getBool("fmodEnableSpatialSound", false);
+  settings::enable_fmod_debug = blk.getBool("enableFmodDebug", true);
 #if DAGOR_DBGLEVEL > 0
   settings::memory_tracking_mode = blk.getBool("memoryTrackingMode", false);
 #endif
@@ -155,8 +166,10 @@ static void settings_init(const DataBlock &blk)
   LOG_VALUE(maxVorbisCodecs, "%u");
   LOG_VALUE(maxFADPCMCodecs, "%u");
   LOG_VALUE(fmod_synchronous_mode, "%d");
+  LOG_VALUE(fmod_allow_missing_plugins, "%d");
   LOG_VALUE(samplerate, "%u");
   LOG_VALUE(enable_spatial_sound, "%d");
+  LOG_VALUE(enable_fmod_debug, "%d");
 #if DAGOR_DBGLEVEL > 0
   LOG_VALUE(memory_tracking_mode, "%d");
 #endif
@@ -281,6 +294,24 @@ static bool speakermode_setup()
 #endif
   return true;
 }
+
+static bool set_dsp_buffer_size(const DataBlock &blk)
+{
+#if _TARGET_C1
+
+
+#else
+  const int bufferLength = blk.getInt("dspBufferLength", 0);
+  const int numBuffers = blk.getInt("dspNumBuffers", 0);
+#endif
+  if (bufferLength > 0 && numBuffers > 0)
+  {
+    debug("[SNDSYS] setDSPBufferSize(%d, %d)", bufferLength, numBuffers);
+    SOUNDINIT_VERIFY(g_low_level_system->setDSPBufferSize(bufferLength, numBuffers));
+  }
+  return true;
+}
+
 static bool advanced_tweak(const DataBlock &blk)
 {
 #if FMOD_VERSION > 0x00020100
@@ -315,10 +346,12 @@ static bool advanced_tweak(const DataBlock &blk)
 static bool g_null_output = false;
 static bool system_init(const DataBlock &blk, bool null_output)
 {
-  if (!system_create() || !channels_setup() || !speakermode_setup() || !advanced_tweak(blk))
+  if (!system_create() || !channels_setup() || !speakermode_setup() || !set_dsp_buffer_size(blk) || !advanced_tweak(blk))
     return false;
 
-  uint32_t fmodInitFlags = FMOD_INIT_NORMAL | FMOD_INIT_VOL0_BECOMES_VIRTUAL;
+  uint32_t fmodInitFlags = FMOD_INIT_NORMAL;
+  if (settings::virtual_vol_limit > 0.f)
+    fmodInitFlags = FMOD_INIT_VOL0_BECOMES_VIRTUAL;
   if (settings::init_profile)
   {
     debug("FMOD profiling enabled");
@@ -335,12 +368,18 @@ static bool system_init(const DataBlock &blk, bool null_output)
   if (settings::fmod_synchronous_mode)
     fmodStudioInitFlags |= FMOD_STUDIO_INIT_SYNCHRONOUS_UPDATE;
 
+  if (settings::fmod_allow_missing_plugins)
+    fmodStudioInitFlags |= FMOD_STUDIO_INIT_ALLOW_MISSING_PLUGINS;
+
 #if DAGOR_DBGLEVEL > 0
   if (settings::memory_tracking_mode)
   {
     fmodInitFlags |= FMOD_INIT_MEMORY_TRACKING;
     fmodStudioInitFlags |= FMOD_STUDIO_INIT_MEMORY_TRACKING;
   }
+#endif
+#if __e2k__ || (_TARGET_PC_WIN && _M_ARM64) // no ported binary of ResonanceAudio plugin for these arch
+  fmodStudioInitFlags |= FMOD_STUDIO_INIT_ALLOW_MISSING_PLUGINS;
 #endif
   g_null_output = null_output;
   FMOD_OUTPUTTYPE currentOutput = FMOD_OUTPUTTYPE_UNKNOWN;
@@ -451,8 +490,26 @@ static bool system_init(const DataBlock &blk, bool null_output)
   return true;
 }
 
-#if DAGOR_DBGLEVEL > 0
 static bool treat_fmod_errors_as_warnings = false;
+static eastl::vector<eastl::string> fmod_warn_substrings;
+
+static void load_fmod_loglevel_filter(const DataBlock &blk)
+{
+  static const char *const default_warn_substrings[] = {
+    "assertion: 'inchannels <= mMixMatrixCurrent.numin()' failed",
+    "returned 0x88890004",
+  };
+
+  fmod_warn_substrings.clear();
+  for (const char *substr : default_warn_substrings)
+    fmod_warn_substrings.emplace_back(substr);
+
+  const DataBlock *filterBlk = blk.getBlockByNameEx("fmodErrorsAsWarningsFilter");
+  for (uint32_t i = 0, n = filterBlk->paramCount(); i < n; ++i)
+    if (filterBlk->getParamType(i) == DataBlock::TYPE_STRING)
+      fmod_warn_substrings.emplace_back(filterBlk->getStr(i));
+}
+
 static int get_loglevel(FMOD_DEBUG_FLAGS flags, const char *message)
 {
   if (flags & FMOD_DEBUG_LEVEL_ERROR)
@@ -460,11 +517,9 @@ static int get_loglevel(FMOD_DEBUG_FLAGS flags, const char *message)
     if (treat_fmod_errors_as_warnings)
       return LOGLEVEL_WARN;
 
-    if (strstr(message, "assertion: 'inchannels <= mMixMatrixCurrent.numin()' failed"))
-      return LOGLEVEL_WARN; // workaround: suppress FMOD assert to disable logerr reporting
-
-    if (strstr(message, "returned 0x88890004")) // suppress FMOD assert (0x88890004 = AUDCLNT_E_DEVICE_INVALIDATED)
-      return LOGLEVEL_WARN; // e.g. "IAudioCaptureClient::GetCurrentPadding returned 0x88890004. Device was unplugged!"
+    for (const eastl::string &substr : fmod_warn_substrings)
+      if (strstr(message, substr.c_str()))
+        return LOGLEVEL_WARN;
 
     return LOGLEVEL_ERR;
   }
@@ -480,10 +535,45 @@ static FMOD_RESULT F_CALLBACK fmod_debug_cb(FMOD_DEBUG_FLAGS flags, const char *
 {
   const int ll = get_loglevel(flags, message);
 
-  logmessage(ll, "[FMOD] %s: %.*s", func, /*cut `\n' off */ strlen(message) - 1, message);
+  logmessage(ll, "[FMOD] %s: %.*s", func, /*cut `\n' off */ int(strlen(message)) - 1, message);
+
+  asserts_monitor::on_fmod_message(func, message);
 
   return FMOD_OK;
 }
+
+#if _TARGET_PC_WIN
+static bool g_com_initialized = false;
+
+static void com_initialize()
+{
+  APTTYPE apt;
+  APTTYPEQUALIFIER aptq;
+  HRESULT hres = CoGetApartmentType(&apt, &aptq);
+  if (SUCCEEDED(hres))
+  {
+    g_com_initialized = true;
+    return;
+  }
+
+  hres = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (SUCCEEDED(hres))
+  {
+    g_com_initialized = true;
+    return;
+  }
+  logerr("[acessound] Failed to initialize COM library. Error code = %0x", hres);
+}
+
+static void com_uninitialize()
+{
+  if (g_com_initialized)
+    CoUninitialize();
+  g_com_initialized = false;
+}
+#else
+static void com_initialize() {}
+static void com_uninitialize() {}
 #endif
 
 bool init(const DataBlock &blk)
@@ -493,6 +583,8 @@ bool init(const DataBlock &blk)
   G_ASSERT(!is_inited());
   if (is_inited())
     return false;
+
+  com_initialize();
 
   ScoopedJavaThreadAttacher scoopedJavaThreadAttacher;
 
@@ -507,21 +599,23 @@ bool init(const DataBlock &blk)
 
   settings_init(blk);
 
-#if DAGOR_DBGLEVEL > 0
-  treat_fmod_errors_as_warnings = blk.getBool("fmodErrorsAsWarnings", false);
-  const char *fmodLoglevel = blk.getStr("fmodLoglevel", "errors");
-  FMOD_DEBUG_FLAGS debugFlags = FMOD_DEBUG_LEVEL_NONE;
-  if (strcmp(fmodLoglevel, "errors") == 0)
-    debugFlags = FMOD_DEBUG_LEVEL_ERROR;
-  else if (strcmp(fmodLoglevel, "warnings") == 0)
-    debugFlags = FMOD_DEBUG_LEVEL_ERROR | FMOD_DEBUG_LEVEL_WARNING;
-  else if (strcmp(fmodLoglevel, "log") == 0)
-    debugFlags = FMOD_DEBUG_LEVEL_LOG;
-  FMOD_RESULT debugInitializeCbRes = FMOD::Debug_Initialize(debugFlags, FMOD_DEBUG_MODE_CALLBACK, &fmod_debug_cb, nullptr);
-  G_VERIFYF(debugInitializeCbRes == FMOD_ERR_UNSUPPORTED || // might be if fmod built without FMOD_DEBUG
-              debugInitializeCbRes == FMOD_OK,
-    "[SNDSYS] FMOD error: %s", FMOD_ErrorString(debugInitializeCbRes));
-#endif
+  if (settings::enable_fmod_debug)
+  {
+    treat_fmod_errors_as_warnings = blk.getBool("fmodErrorsAsWarnings", false);
+    load_fmod_loglevel_filter(blk);
+    const char *fmodLoglevel = blk.getStr("fmodLoglevel", "errors");
+    FMOD_DEBUG_FLAGS debugFlags = FMOD_DEBUG_LEVEL_NONE;
+    if (strcmp(fmodLoglevel, "errors") == 0)
+      debugFlags = FMOD_DEBUG_LEVEL_ERROR;
+    else if (strcmp(fmodLoglevel, "warnings") == 0)
+      debugFlags = FMOD_DEBUG_LEVEL_ERROR | FMOD_DEBUG_LEVEL_WARNING;
+    else if (strcmp(fmodLoglevel, "log") == 0)
+      debugFlags = FMOD_DEBUG_LEVEL_LOG;
+    FMOD_RESULT debugInitializeCbRes = FMOD::Debug_Initialize(debugFlags, FMOD_DEBUG_MODE_CALLBACK, &fmod_debug_cb, nullptr);
+    G_VERIFYF(debugInitializeCbRes == FMOD_ERR_UNSUPPORTED || // might be if fmod built without FMOD_DEBUG
+                debugInitializeCbRes == FMOD_OK,
+      "[SNDSYS] FMOD error: %s", FMOD_ErrorString(debugInitializeCbRes));
+  }
 
   const bool nullOutput = blk.getBool("nullOutput", false);
   if (!memory_init(blk) || !system_init(blk, nullOutput))
@@ -539,6 +633,11 @@ bool init(const DataBlock &blk)
 
   if (blk.getBool("occlusionInit", false))
     occlusion::init(blk, g_low_level_system);
+
+  else if (blk.getBool("occlusionGPUInit", false))
+    occlusion_gpu::init(blk);
+
+  steam_audio::init(blk, g_low_level_system);
 
   eastl::basic_string<char, framemem_allocator> memoryInfo;
   if (g_fixed_mem_pool)
@@ -572,7 +671,11 @@ void shutdown()
 
   events_close();
 
+  steam_audio::shutdown();
+
   occlusion::close();
+
+  occlusion_gpu::close();
 
   // debug fmod memory usage
   int used = 0, used_max = 0;
@@ -581,7 +684,10 @@ void shutdown()
 
   // release system
   if (g_system)
+  {
+    g_system->flushCommands();
     g_system->release();
+  }
   g_system = nullptr;
   g_low_level_system = nullptr;
 
@@ -601,10 +707,15 @@ void shutdown()
 
 #endif
 
+  com_uninitialize();
+
   g_is_inited.store(false);
 }
 
 bool is_inited() { return g_is_inited.load(); }
+
+bool is_asserts_monitor_enabled() { return g_enable_asserts_monitor.load(); }
+void set_asserts_monitor_enabled(bool enabled) { g_enable_asserts_monitor.store(enabled); }
 
 void get_memory_statistics(unsigned &system_allocated, unsigned &current_allocated, unsigned &max_allocated)
 {
@@ -849,6 +960,20 @@ void flush_commands()
   SNDSYS_IS_MAIN_THREAD;
   SNDSYS_IF_NOT_INITED_RETURN;
   g_system->flushCommands();
+}
+
+void get_command_buffer_size(int &current, int &peak, int &capacity, int &stallcount, int &studio_handle_hapacity)
+{
+  FMOD_STUDIO_BUFFER_USAGE usage = {};
+  FMOD_RESULT result = g_system->getBufferUsage(&usage);
+  G_ASSERTF(FMOD_OK == result, "[SNDSYS] FMOD getBufferUsage error: %s", FMOD_ErrorString(result));
+  if (FMOD_OK != result)
+    return;
+  current = usage.studiocommandqueue.currentusage;
+  peak = usage.studiocommandqueue.peakusage;
+  capacity = usage.studiocommandqueue.capacity;
+  stallcount = usage.studiocommandqueue.stallcount;
+  studio_handle_hapacity = usage.studiohandle.capacity;
 }
 
 int get_max_channels() { return g_max_channels; }

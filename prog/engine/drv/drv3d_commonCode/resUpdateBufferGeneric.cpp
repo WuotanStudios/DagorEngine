@@ -14,7 +14,9 @@ rubgeneric::ResUpdateBuffer *rubgeneric::allocate_update_buffer_for_tex_region(B
   dest_base_texture->getinfo(ti, dest_mip);
 
   int cflg = (ti.cflg & (TEXFMT_MASK | TEXCF_SRGBWRITE | TEXCF_SRGBREAD)) | TEXCF_SYSMEM | TEXCF_WRITEONLY;
+#if _TARGET_C1 || _TARGET_C2
 
+#endif
   unsigned texFmt = ti.cflg & TEXFMT_MASK;
   const TextureFormatDesc &fmtInfo = get_tex_format_desc(texFmt);
 
@@ -39,9 +41,7 @@ rubgeneric::ResUpdateBuffer *rubgeneric::allocate_update_buffer_for_tex_region(B
   D3D_CONTRACT_ASSERT_RETURN(offset_y + height <= targetHeight, nullptr);
   D3D_CONTRACT_ASSERT_RETURN(offset_z + depth <= targetDepth, nullptr);
 
-  bool updateDirectly = d3d::is_in_device_reset_now();
-  if (d3d::get_driver_code().is(d3d::metal))
-    updateDirectly = true;
+  const bool updateDirectly = d3d::is_in_device_reset_now();
 
   BaseTexture *stagingTex = nullptr;
   char *dst = nullptr;
@@ -74,7 +74,8 @@ rubgeneric::ResUpdateBuffer *rubgeneric::allocate_update_buffer_for_tex_region(B
   else
   {
     bool voltex = (ti.type == D3DResourceType::VOLTEX);
-    stagingTex = voltex ? d3d::create_voltex(width, height, depth, cflg, 1) : d3d::create_tex(nullptr, width, height, cflg, 1);
+    stagingTex = voltex ? d3d::create_voltex(width, height, depth, cflg, 1, RESTAG_STAGING)
+                        : d3d::create_tex(nullptr, width, height, cflg, 1, RESTAG_STAGING);
     if (!stagingTex)
     {
       if (!d3d::is_in_device_reset_now())
@@ -123,9 +124,10 @@ rubgeneric::ResUpdateBuffer *rubgeneric::allocate_update_buffer_for_tex(BaseText
   TextureInfo ti;
   dest_tex->getinfo(ti, dest_mip);
   int cflg = (ti.cflg & (TEXFMT_MASK | TEXCF_SRGBWRITE | TEXCF_SRGBREAD)) | TEXCF_SYSMEM | TEXCF_WRITEONLY;
-  unsigned tex_fmt = ti.cflg & TEXFMT_MASK;
-  bool is_block_fmt = tex_fmt == TEXFMT_DXT1 || tex_fmt == TEXFMT_DXT3 || tex_fmt == TEXFMT_DXT5 || tex_fmt == TEXFMT_BC7 ||
-                      tex_fmt == TEXFMT_BC6H || tex_fmt == TEXFMT_ATI1N || tex_fmt == TEXFMT_ATI2N;
+#if _TARGET_C1 || _TARGET_C2
+
+#endif
+  bool is_block_fmt = is_bc_texformat(ti.cflg);
 
   if (is_block_fmt && (ti.w < 4 || ti.h < 4))
   {
@@ -133,9 +135,7 @@ rubgeneric::ResUpdateBuffer *rubgeneric::allocate_update_buffer_for_tex(BaseText
     ti.h = max<uint16_t>(ti.h, 4);
   }
 
-  bool update_directly = d3d::is_in_device_reset_now();
-  if (d3d::get_driver_code().is(d3d::metal))
-    update_directly = true;
+  const bool update_directly = d3d::is_in_device_reset_now();
 
   BaseTexture *staging_tex = nullptr;
   char *dst = nullptr;
@@ -171,7 +171,8 @@ rubgeneric::ResUpdateBuffer *rubgeneric::allocate_update_buffer_for_tex(BaseText
   else
   {
     bool voltex = (dest_tex->getType() == D3DResourceType::VOLTEX);
-    staging_tex = voltex ? d3d::create_voltex(ti.w, ti.h, 1, cflg, 1) : d3d::create_tex(nullptr, ti.w, ti.h, cflg, 1);
+    staging_tex = voltex ? d3d::create_voltex(ti.w, ti.h, 1, cflg, 1, RESTAG_STAGING)
+                         : d3d::create_tex(nullptr, ti.w, ti.h, cflg, 1, RESTAG_STAGING);
     if (!staging_tex)
     {
       if (!d3d::is_in_device_reset_now())
@@ -258,10 +259,10 @@ bool rubgeneric::update_texture_and_release_update_buffer(ResUpdateBuffer *&src_
     int dest_slice = src_rub->destSlice;
     D3D_CONTRACT_ASSERTF_RETURN((dest->getType() == D3DResourceType::VOLTEX) == voltex, false, "dest->type=%d staging->type=%d",
       eastl::to_underlying(dest->getType()), eastl::to_underlying(src_rub->staging->getType()));
-    if (!dest->updateSubRegion(/*src*/ src_rub->staging, 0, 0, 0, 0, /*size*/ src_rub->w, src_rub->h, src_rub->d,
-          /*dest*/ dest->calcSubResIdx(dest_mip, dest_slice), src_rub->x, src_rub->y, src_rub->z))
+    if (!d3d::update_sub_region(/*src*/ src_rub->staging, 0, 0, 0, 0, /*size*/ src_rub->w, src_rub->h, src_rub->d,
+          /*dest*/ dest, dest->calcSubResIdx(dest_mip, dest_slice), src_rub->x, src_rub->y, src_rub->z))
       if (!d3d::is_in_device_reset_now())
-        D3D_ERROR("%s: updateSubRegion(%dx%d) -> %d:%d failed", dest->getTexName(), src_rub->w, src_rub->h, dest_mip, dest_slice);
+        D3D_ERROR("%s: update_sub_region(%dx%d) -> %d:%d failed", dest->getTexName(), src_rub->w, src_rub->h, dest_mip, dest_slice);
   }
   release_update_buffer(src_rub);
   return true;

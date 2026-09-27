@@ -1,30 +1,37 @@
 options gen2
 
 options indenting = 4
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
+options no_global_variables = false
 options strict_smart_pointers = true
 
 module quote shared private
+
+//! AST quasiquoting infrastructure.
+//!
+//! Internal module that provides the ``qmacro`` / ``qmacro_block`` /
+//! ``qmacro_type`` / ``qmacro_function`` quasiquoting macros and their
+//! supporting splicing and substitution helpers.
 
 require daslib/ast_boost public
 require daslib/strings_boost
 require daslib/contracts
 
 def find_unique_function_ptr(mod : Module?; name : string; canfail : bool = false) {
-    var inscope fn = find_unique_function(mod, name, canfail);
-    return <- fn.get_ptr()
+    var fn = find_unique_function(mod, name, canfail)
+    return fn
 }
 
 /*
  * We need this wrappers for initialization of Handle types
  */
-struct CaptureEntryInitData {
-    name : string
-    mode : CaptureMode
+struct public CaptureEntryInitData {
+    //! Initialization data for a captured variable entry.
+    name : string       //! Variable name being captured.
+    mode : CaptureMode  //! Capture mode (copy, reference, move, or clone).
 }
 
 def public clone(var a : dasvector`CaptureEntry; b : array<CaptureEntryInitData>) {
+    //! Clones an array of CaptureEntryInitData into a dasvector of CaptureEntry.
     a |> resize(length(b))
     for (e, i in b, count()) {
         a[i].name := e.name
@@ -32,16 +39,18 @@ def public clone(var a : dasvector`CaptureEntry; b : array<CaptureEntryInitData>
     }
 }
 
-struct LineInfoInitData {
-    fileInfo : FileInfo?
-    column : uint
-    line : uint
-    last_column : uint
-    last_line : uint
+struct public LineInfoInitData {
+    //! Initialization data for source line info reconstruction.
+    fileInfo : FileInfo?  //! Pointer to the source file info.
+    column : uint         //! Column number (1-based).
+    line : uint           //! Line number (1-based).
+    last_column : uint    //! Last column number of the range.
+    last_line : uint      //! Last line number of the range.
 }
 
 
 def public clone_line_info(var b : LineInfoInitData) : LineInfo {
+    //! Creates a LineInfo from a LineInfoInitData struct.
     return LineInfo(fileInfo = b.fileInfo,
                     column = b.column,
                     line = b.line,
@@ -50,6 +59,7 @@ def public clone_line_info(var b : LineInfoInitData) : LineInfo {
 }
 
 def public clone(var a : dasvector`LineInfo; b : array<LineInfoInitData>) {
+    //! Clones an array of LineInfoInitData into a dasvector of LineInfo.
     a |> resize(length(b))
     for (e, i in b, count()) {
         a[i].column := e.column
@@ -59,42 +69,46 @@ def public clone(var a : dasvector`LineInfo; b : array<LineInfoInitData>) {
     }
 }
 
-def public clone(var args : rtti::AnnotationList; var nargs : array<smart_ptr<rtti::AnnotationDeclaration>>) {
+def public clone(var args : rtti::AnnotationList; var nargs : array<rtti::AnnotationDeclaration?>) {
+    //! Clones an array of AnnotationDeclaration pointers into an AnnotationList.
     _::clear(args)
     for (narg in nargs) {
         _::emplace(args, narg)
     }
-    delete nargs
 }
 
 
-struct EnumEntryInitData {
-    name : string
-    cppName : string
+struct public EnumEntryInitData {
+    //! Initialization data for a quoted enum entry.
+    name : string     //! Enum entry name.
+    cppName : string  //! C++-side name for the entry (used when generating bindings).
     // at : LineInfo
     // value : ExpressionPtr
 }
 
 def public clone(var a : dasvector`EnumEntry; var b : array<EnumEntryInitData>) {
+    //! Clones an array of EnumEntryInitData into a dasvector of EnumEntry.
     a |> resize(length(b))
     for (e, i in b, count()) {
         a[i].name := e.name
         a[i].cppName := e.cppName
-        // move_new(a[i].value) <| e.value
+        // a[i].value = e.value
     }
 }
 
-struct AnnotationArgumentInitData {
-    basicType : Type
-    name : string
-    sValue : string
-    bValue : bool
-    iValue : int
-    fValue : float
+struct public AnnotationArgumentInitData {
+    //! Initialization data for a quoted annotation argument.
+    basicType : Type  //! Argument type tag (string / bool / int / float / etc.).
+    name : string     //! Argument name as written in the annotation.
+    sValue : string   //! String value (used when basicType is tString).
+    bValue : bool     //! Bool value (used when basicType is tBool).
+    iValue : int      //! Int value (used when basicType is tInt).
+    fValue : float    //! Float value (used when basicType is tFloat).
     // @safe_when_uninitialized at: LineInfo // todo: add if needed
 }
 
 def public clone(var a : AnnotationArgumentList; b : array<AnnotationArgumentInitData>) {
+    //! Clones an array of AnnotationArgumentInitData into an AnnotationArgumentList.
     a |> resize(length(b))
     for (e, i in b, count()) {
         a[i].name := e.name
@@ -112,140 +126,175 @@ def public clone(var a : AnnotationArgumentList; b : array<AnnotationArgumentIni
     }
 }
 
-def public cvt_to_mks(var args) : smart_ptr<MakeStruct> {
-    var inscope res <- new MakeStruct(uninitialized);
+def public cvt_to_mks(var args) : MakeStruct? {
+    //! Converts an array of arguments into a MakeStruct pointer.
+    var res = new MakeStruct(uninitialized);
     *res |> resize(length(args))
     for (arg, i in args, count()) {
-        if (true) {
-            move_new((*res)[i]) <| arg;
-        }
+        (*res)[i] = arg;
     }
-    return <- res;
+    return res;
 }
 
-struct FileInfoInitData {
-    name : string
-    tabSize : int
+struct public FileInfoInitData {
+    //! Initialization data for reconstructing file info.
+    name : string   //! File name string.
+    tabSize : int   //! Tab size for the file.
 }
 
 def public clone_file_info(b : FileInfoInitData) : FileInfo? {
+    //! Creates a FileInfo from a FileInfoInitData struct.
     return clone_file_info(b.name, b.tabSize)
 }
 
+var private g_resolved_file_infos : table<string; FileInfo?>
+
+def public resolve_file_info(b : FileInfoInitData) : FileInfo? {
+    //! Stable FileInfo for reconstructed LineInfos: one interned dummy per (file name, tab size)
+    //! (per context), instead of a fresh allocation per evaluation.
+    let key = "{b.name}:{b.tabSize}"
+    if (!key_exists(g_resolved_file_infos, key)) {
+        g_resolved_file_infos[key] = clone_file_info(b.name, b.tabSize)
+    }
+    return g_resolved_file_infos[key]
+}
+
 let blacklist = [
-    ("ast::Function", "inferStack"),
-    ("ast::Function", "annotations"),
-    ("ast::Function", "classParent"), // loop
-    ("ast::ExprReturn", "_block"), // loop
-    ("ast::ExprVar", "pBlock"), // loop
-    ("ast::EnumEntry", "value"), // loop
-    ("ast::EnumEntry", "at"), // ignore it for now
-    ("rtti::AnnotationArgument", "at"),
-    ("ast::CaptureEntry", "at"), // ignore it for now
-    ("ast::MakeFieldDecl", "at"), // ignore it for now
-    ("ast::Enumeration", "list"), // too huge in TypeDecl
+    ("ast_core::Function", "inferStack"),
+    ("ast_core::Function", "annotations"),
+    ("ast_core::Function", "classParent"), // loop
+    ("ast_core::ExprReturn", "_block"), // loop
+    ("ast_core::ExprVar", "pBlock"), // loop
+    ("ast_core::EnumEntry", "value"), // loop
+    ("ast_core::EnumEntry", "at"), // ignore it for now
+    ("ast_core::ExprBlock", "stackCleanVars"), // post-infer bookkeeping (allocateStack); always empty in quoted trees, and its vector<pair> type has no AOT mapping
+    ("rtti_core::AnnotationArgument", "at"),
+    ("ast_core::CaptureEntry", "at"), // ignore it for now
+    ("ast_core::MakeFieldDecl", "at"), // ignore it for now
+    ("ast_core::Enumeration", "list"), // too huge in TypeDecl
 ]
 
 let managed_types = [
-    "rtti::Module",
-    "rtti::Annotation",
-    "rtti::TypeAnnotation",
-    "ast::Structure",
-    "ast::CallMacro",
-    "ast::Function",
-    "rtti::FileInfo",
-    "ast::MakeStruct",
-    "rtti::LineInfo",
+    "rtti_core::Module",
+    "rtti_core::Annotation",
+    "rtti_core::TypeAnnotation",
+    "ast_core::Structure",
+    "ast_core::CallMacro",
+    "ast_core::Function",
+    "ast_core::Enumeration",
+    "rtti_core::FileInfo",
+    "ast_core::MakeStruct",
+    "rtti_core::LineInfo",
 ];
 
-def private get_dst_type(var _src_tp : TypeDeclPtr) {
-    var inscope src_tp <- _src_tp;
+def private get_dst_type(src_tp : TypeDecl?) {
     let tstr = describe(src_tp);
     if (tstr |> starts_with("$::das_string")) {
-        return <- new TypeDecl(baseType = Type.tString);
-    } elif (tstr |> starts_with("ast::CaptureEntry")) {
-        return <- typeinfo ast_typedecl(type<CaptureEntryInitData>);
-    } elif (tstr |> starts_with("ast::EnumEntry")) {
-        return <- typeinfo ast_typedecl(type<EnumEntryInitData>);
-    } elif (tstr |> starts_with("rtti::LineInfo")) {
-        return <- typeinfo ast_typedecl(type<LineInfoInitData>);
-    } elif (tstr |> starts_with("rtti::AnnotationArgument")) {
-        return <- typeinfo ast_typedecl(type<AnnotationArgumentInitData>);
-    } elif (tstr |> starts_with("rtti::FileInfo")) {
-        return <- typeinfo ast_typedecl(type<FileInfoInitData>);
+        return new TypeDecl(baseType = Type.tString);
+    } elif (tstr |> starts_with("ast_core::CaptureEntry")) {
+        return typeinfo ast_typedecl(type<CaptureEntryInitData>);
+    } elif (tstr |> starts_with("ast_core::EnumEntry")) {
+        return typeinfo ast_typedecl(type<EnumEntryInitData>);
+    } elif (tstr |> starts_with("rtti_core::LineInfo")) {
+        return typeinfo ast_typedecl(type<LineInfoInitData>);
+    } elif (tstr |> starts_with("rtti_core::AnnotationArgument")) {
+        return typeinfo ast_typedecl(type<AnnotationArgumentInitData>);
+    } elif (tstr |> starts_with("rtti_core::FileInfo")) {
+        return typeinfo ast_typedecl(type<FileInfoInitData>);
     } else {
-        return <- src_tp;
+        return clone_type(src_tp);
     }
 }
 
 
 def private create_string_expr(name) {
-    return <- new ExprConstString(value := name);
+    return new ExprConstString(value := name);
+}
+
+def private fix_path_spelling(p : string) : string {
+    var r = p |> replace("\\", "/")
+    if (length(r) >= 2) {
+        r = r |> modify_data() $(var arr) {
+            let c = int(arr[0])
+            if (int(arr[1]) == ':' && c >= 'a' && c <= 'z') {
+                arr[0] = uint8(c - 'a' + 'A')
+            }
+        }
+    }
+    return r
+}
+
+def private normalize_source_path(p : string) : string {
+    // the same source file may be opened via different spellings at AOT-generation time and at runtime (slash form, drive-letter case, dasroot-absolute vs repo-relative);
+    var root = fix_path_spelling(get_das_root())
+    if (!(root |> ends_with("/"))) {
+        root += "/"
+    }
+    return fix_path_spelling(p) |> trim_prefix(root)
 }
 
 
-def private to_array_move_expr(var mkArr : smart_ptr<ExprMakeArray>, at : LineInfo) {
-    var inscope mkToArrayMove <- new ExprCall(at = at, name := "to_array_move")
+def private to_array_move_expr(var mkArr : ExprMakeArray?, at : LineInfo) {
+    var mkToArrayMove = new ExprCall(at = at, name := "to_array_move")
     emplace(mkToArrayMove.arguments, mkArr)
-    return <- mkToArrayMove
+    return mkToArrayMove
 }
 
-def private to_arr_move_args(var args : array<ExpressionPtr>; var dst_tp : TypeDeclPtr; at : LineInfo) {
-    assert(args |> length > 0);
+def private to_arr_move_args(var args : array<Expression?>; var dst_tp : TypeDeclPtr; at : LineInfo) {
+    assert(!empty(args));
     unsafe {
-        return <- to_array_move_expr(new ExprMakeArray(values := args,
+        return to_array_move_expr(new ExprMakeArray(values := args,
                                                        gen2 = true,
-                                                       makeType <- clone_type(dst_tp),
+                                                       makeType = clone_type(dst_tp),
                                                        at = at), at)
     }
 }
 
-def private convert_vec_expr(mod : Module?; field_values : uint8 const?; xtype : TypeDeclPtr, at : LineInfo) : ExpressionPtr {
-    var inscope src_tp <- get_handled_type_index_type_declaration(xtype.annotation,
+def private convert_vec_expr(mod : Module?; field_values : uint8 const?; xtype : TypeDeclPtr, at : LineInfo) : Expression? {
+    var src_tp = get_handled_type_index_type_declaration(xtype.annotation,
                              default<Expression?>, default<Expression?>);
-    src_tp.flags &= ~TypeDeclFlags.ref; // vec type has ref, we don't need it
-    var inscope dst_tp <- get_dst_type(clone(src_tp));
-    var inscope args : array<ExpressionPtr>;
+    src_tp.flags.ref = false; // vec type has ref, we don't need it
+    var dst_tp = get_dst_type(clone(src_tp));
+    var args : array<Expression?>;
 
-    if (get_vector_length(field_values, src_tp) == 0) {
-        return <- new ExprMakeStruct(at = at, makeType <- new TypeDecl(baseType = Type.tArray, firstType <- clone_type(dst_tp)),
+    if (get_vector_length(field_values, src_tp) == 0) return new ExprMakeStruct(at = at, makeType = new TypeDecl(baseType = Type.tArray, firstType = clone_type(dst_tp)),
                                      makeStructFlags = ExprMakeStructFlags.canShadowBlock);
-    }
     for (idx in range(get_vector_length(field_values, src_tp))) {
-        if (true) {
-            var inscope arg_expr <- convert_quote_expr(mod, unsafe(reinterpret<uint8?>(get_vector_ptr_at_index(field_values, src_tp.get_ptr(), idx))), src_tp, at);
-            if (dst_tp.baseType != Type.tString && dst_tp != src_tp) {
-                var inscope make_str <- unsafe(reinterpret<smart_ptr<ExprMakeStruct>>(arg_expr));
-                move_new(make_str.makeType) <| clone_type(dst_tp);
+        {
+            var arg_expr = convert_quote_expr(mod, unsafe(reinterpret<uint8?>(get_vector_ptr_at_index(field_values, src_tp, idx))), src_tp, at);
+            // retarget the element make-struct to the InitData wrapper type when get_dst_type substituted one; pointer compare (dst_tp != src_tp) is always true after clone_type, and writing makeType through a reinterpret of a non-ExprMakeStruct stomps the node
+            if (dst_tp.baseType != Type.tString && describe(dst_tp) != describe(src_tp) && arg_expr is ExprMakeStruct) {
+                var make_str = unsafe(reinterpret<ExprMakeStruct?>(arg_expr));
+                make_str.makeType = clone_type(dst_tp);
                 args |> emplace(make_str);
             } else {
                 args |> emplace(arg_expr);
             }
         }
     }
-    if (describe(xtype) == "ast::MakeStruct") {
+    if (describe(xtype) == "ast_core::MakeStruct") {
         unsafe {
-            return <- new ExprCall(at = at, name := "cvt_to_mks",
-                                arguments := array<ExpressionPtr>(
+            return new ExprCall(at = at, name := "cvt_to_mks",
+                                arguments := array<Expression?>(
                                    new ExprMakeArray(values := args,
                                       gen2 = true,
-                                      makeType <- clone_type(dst_tp),
+                                      makeType = clone_type(dst_tp),
                                       at = at)
                                 )
                             )
         }
     }
-    return <- to_arr_move_args(args, dst_tp, at);
+    return to_arr_move_args(args, dst_tp, at);
 }
 
 def private find_module_expr(name, at) {
-     return <- new ExprCall(at = at, name := "get_module",
-                            arguments := array<ExpressionPtr>(create_string_expr(name)))
+     return new ExprCall(at = at, name := "get_module",
+                            arguments := array<Expression?>(create_string_expr(name)))
 }
 
 def private get_find_in_module_expr(fn_name; module_name; obj_name; at) {
-     return <- new ExprCall(at = at, name := fn_name,
-         arguments := array<ExpressionPtr>(
+     return new ExprCall(at = at, name := fn_name,
+         arguments := array<Expression?>(
             find_module_expr(module_name, at),
             create_string_expr(obj_name)
          )
@@ -255,172 +304,202 @@ def private get_find_in_module_expr(fn_name; module_name; obj_name; at) {
 def private is_quote_field_allowed(f_name, class_name, data) {
     for ((cl, fld) in blacklist) {
         if (fld == f_name && (cl == "*" || class_name == cl ||
-                             (class_name == "ast::Expression" &&
-                              unsafe(reinterpret<Expression>(data)).__rtti == cl))) {
-            return false;
-        }
+                             (class_name == "ast_core::Expression" &&
+                              unsafe(reinterpret<Expression>(data)).__rtti == cl))) return false;
     }
     return true;
 
 }
 
 def private create_field_expr(name; var res_field; loc; flags) {
-    return <- new MakeFieldDecl(name := name, value <- res_field, at := loc, flags = flags);
+    return new MakeFieldDecl(name := name, value = res_field, at := loc, flags = flags);
 }
 
 def private convert_quote_struct_field(mod : Module?, data : uint8 const?,
                                        tstr : string, name : string,
-                                       offset : uint; xtype : TypeDeclPtr; parent_loc : LineInfo) : smart_ptr<MakeFieldDecl> {
-    if (!is_quote_field_allowed(name, tstr, data)) {
-        return <- null;
-    }
+                                       offset : uint; xtype : TypeDeclPtr; parent_loc : LineInfo) : MakeFieldDecl? {
+    if (!is_quote_field_allowed(name, tstr, data)) return null;
 
     var fdata = unsafe(data + int(offset));
-    var inscope res_field <- convert_quote_expr(mod, fdata, xtype, parent_loc);
-    if (res_field == null) { return <- null; }
+    var res_field = convert_quote_expr(mod, fdata, xtype, parent_loc);
+    if (res_field == null) return null;
 
     var flags : MakeFieldDeclFlags;
     if (!xtype.canCopy) {
         flags = ((describe(xtype) == "$::das_string" || isYetAnotherVectorTemplate(xtype)) ?
                         MakeFieldDeclFlags.cloneSemantics : MakeFieldDeclFlags.moveSemantics);
     }
-    if (describe(xtype) == "rtti::LineInfo") {
-        var inscope prev <- res_field;
-        move_new(res_field) <| new ExprCall(at = parent_loc, name := "clone_line_info",
-                               arguments := array<ExpressionPtr>(prev))
+    if (describe(xtype) == "rtti_core::LineInfo") {
+        var prev = res_field;
+        res_field = new ExprCall(at = parent_loc, name := "clone_line_info",
+                               arguments := array<Expression?>(prev))
+    }
+    if (tstr == "rtti_core::FileInfo" && name == "name" && res_field is ExprConstString) {
+        var cs = unsafe(reinterpret<ExprConstString?>(res_field))
+        cs.value := normalize_source_path(string(cs.value))
     }
 
-    return <- create_field_expr(name, clone(res_field), parent_loc, flags);
+    return create_field_expr(name, clone(res_field), parent_loc, flags);
 }
 
 def private convert_quote_structure(mod : Module?; data : uint8 const?;
-                                    tstr : string; info : TypeDeclPtr; at : LineInfo) : ExpressionPtr {
+                                    tstr : string; info : TypeDeclPtr; at : LineInfo) : Expression? {
     assume ann = info.annotation;
-    var inscope mkS1 <- new default<MakeStruct>;
-    for_each_field(*unsafe(reinterpret<BasicStructureAnnotation?>(ann))) <| $(name, cppName, xtype, offset) {
-        var inscope mkFld = convert_quote_struct_field(mod, data, tstr, name, offset, xtype, at);
+    var mkS1 = new MakeStruct(uninitialized);
+    for_each_field(*unsafe(reinterpret<BasicStructureAnnotation?>(ann))) $(name, _cppName, xtype, offset) {
+        var mkFld = convert_quote_struct_field(mod, data, tstr, name, offset, xtype, at);
         if (mkFld != null) {
             emplace(*mkS1, mkFld);
         }
     }
-    var inscope mkStr <- new ExprMakeStruct(makeType <- get_dst_type(clone_type(info)), at = at)
+    var mkStr = new ExprMakeStruct(makeType = get_dst_type(clone_type(info)), at = at)
     emplace(mkStr.structs, mkS1)
     mkStr.makeStructFlags |= ExprMakeStructFlags.useInitializer | ExprMakeStructFlags.canShadowBlock;
-    if (describe(info) == "rtti::FileInfo") {
-        return <- new ExprCall(at = at, name := "clone_file_info",
-                               arguments := array<ExpressionPtr>(mkStr))
-    }
-    return <- mkStr;
+    if (describe(info) == "rtti_core::FileInfo") return new ExprCall(at = at, name := "resolve_file_info",
+                               arguments := array<Expression?>(mkStr))
+    return mkStr;
 }
 
-def private convert_pointer_expr(mod; data; info; at) : ExpressionPtr {
-    assume pdata = *unsafe(reinterpret<uint8 const ??> data);
-    if (pdata == null) {
-        return <- new ExprConstPtr(at = at);
-    }
+def public make_alias_type_decl(name : string) : TypeDecl? {
+    //! Reconstruction helper: a by-name alias TypeDecl, resolved by re-infer at the splice site.
+    return new TypeDecl(baseType = Type.alias, alias := name)
+}
+
+def private convert_pointer_expr(mod; data; info; at) : Expression? {
+    assume pdata = *unsafe(reinterpret<uint8 const ??>(data));
+    if (pdata == null) return new ExprConstPtr(at = at);
     assume first_tstr = describe(info.firstType);
-    var inscope final_type <- clone(info.firstType);
-    if (first_tstr == "ast::Expression") {
-        assume annotation = mod |> module_find_type_annotation(unsafe(reinterpret<ExpressionPtr>(pdata)).__rtti);
-        move_new(final_type) <| new TypeDecl(baseType = Type.tHandle, annotation = annotation)
+    if (first_tstr == "ast_core::TypeDecl") {
+        // a type that references an enum/struct from an anonymous module (the program's
+        // main module) can't be reconstructed by name — rebuild it as the alias the parser
+        // would have produced for an unresolved name; splice-site re-infer resolves it
+        assume td = unsafe(reinterpret<TypeDecl?>(pdata));
+        var aliasName = ""
+        if (td.enumType != null && (td.enumType._module == null || empty(td.enumType._module.name))) {
+            aliasName = string(td.enumType.name)
+        } elif (td.structType != null && (td.structType._module == null || empty(td.structType._module.name))) {
+            aliasName = string(td.structType.name)
+        }
+        if (!empty(aliasName)) {
+            return new ExprCall(at = at, name := "make_alias_type_decl",
+                arguments := array<Expression?>(create_string_expr(aliasName)));
+        }
     }
-    var inscope subexpr <- convert_quote_expr(mod, pdata, final_type, at);
+    var final_type = clone_type(info.firstType);
+    if (first_tstr == "ast_core::Expression") {
+        assume annotation = mod |> module_find_type_annotation(unsafe(reinterpret<Expression?>(pdata)).__rtti);
+        final_type = new TypeDecl(baseType = Type.tHandle, annotation = annotation)
+    }
+    var subexpr = convert_quote_expr(mod, pdata, final_type, at);
 
     // This types are created on cpp side by managed functions.
     // We already got pointer, no need to ascend.
     for (t in managed_types) {
-        if (t == first_tstr) {
-            return <- subexpr
-        }
+        if (t == first_tstr) return subexpr
     }
-    return <- new ExprAscend(subexpr <- subexpr, at = subexpr != null ? subexpr.at : at);
+    return new ExprAscend(subexpr = subexpr, at = subexpr != null ? subexpr.at : at);
 }
 
-def private convert_quote_expr(mod : Module?; var data : uint8 const?; info : TypeDeclPtr; at : LineInfo) : ExpressionPtr {
-    if (data == null) {
-        return <- null;
-    }
-    if (info.baseType != Type.tHandle && info.baseType != Type.tPointer) {
-        return <- walk_and_convert(data, info, at);
-    }
-    if (isYetAnotherVectorTemplate(info)) {
-        return <- convert_vec_expr(mod, data, info, at);
-    }
+def private convert_quote_expr(mod : Module?; var data : uint8 const?; info : TypeDeclPtr; at : LineInfo) : Expression? {
+    if (data == null) return null;
+    if (info.baseType != Type.tHandle && info.baseType != Type.tPointer) return walk_and_convert(data, info, at);
+    if (isYetAnotherVectorTemplate(info)) return convert_vec_expr(mod, data, info, at);
     let tstr = describe(info);
 
     // First check managed types
-    if (tstr == "rtti::Annotation") {
+    if (tstr == "rtti_core::Annotation") {
         assume pdata = unsafe(reinterpret<rtti::Annotation>(data));
-        return <- get_find_in_module_expr("module_find_annotation", pdata._module.name, pdata.name, at);
-    } elif (tstr == "rtti::TypeAnnotation") {
+        return get_find_in_module_expr("module_find_annotation", pdata._module.name, pdata.name, at);
+    } elif (tstr == "rtti_core::TypeAnnotation") {
          assume pdata = unsafe(reinterpret<rtti::TypeAnnotation>(data));
-         return <- get_find_in_module_expr("module_find_type_annotation", pdata._module.name, pdata.name, at)
-    } elif (tstr == "ast::CallMacro") {
+         return get_find_in_module_expr("module_find_type_annotation", pdata._module.name, pdata.name, at)
+    } elif (tstr == "ast_core::CallMacro") {
          assume pdata = unsafe(reinterpret<CallMacro?>(data));
-         return <- get_find_in_module_expr("find_call_macro", pdata._module.name, pdata.name, at)
-    } elif (tstr == "ast::Structure") {
+         return get_find_in_module_expr("find_call_macro", pdata._module.name, pdata.name, at)
+    } elif (tstr == "ast_core::Structure") {
          assume pdata = unsafe(reinterpret<Structure?>(data));
          // disable support for Structure::Module. If we compile without shared_modules it's impossible
-         if (pdata._module.name == "ast_boost") { // How to check COP.shared_modules = false?
-            return <- null;
-         }
+         if (pdata._module.name == "ast_boost") return null  // disabled when shared_modules=false (no direct check)
          // It's unnecessary, however there is bug in aot with ternary operator
-         var inscope tmp = get_find_in_module_expr("module_find_structure", pdata._module.name, pdata.name, at);
-         return <- tmp;
-    } elif (tstr == "ast::Function") {
+         var tmp = get_find_in_module_expr("module_find_structure", pdata._module.name, pdata.name, at);
+         return tmp;
+    } elif (tstr == "ast_core::Function") {
          assume pdata = unsafe(reinterpret<Function?>(data));
-         return <- get_find_in_module_expr("find_unique_function_ptr", pdata._module.name, pdata.name, at);
-    } elif (tstr == "rtti::Module") {
+         return get_find_in_module_expr("find_unique_function_ptr", pdata._module.name, pdata.name, at);
+    } elif (tstr == "ast_core::Enumeration") {
+         assume pdata = unsafe(reinterpret<Enumeration?>(data));
+         // anonymous module (e.g. the program's main module) can't be found by name at reconstruction time; the TypeDecl-level alias fallback covers that shape
+         if (pdata._module == null || empty(pdata._module.name)) return null
+         return get_find_in_module_expr("module_find_enumeration", pdata._module.name, pdata.name, at);
+    } elif (tstr == "rtti_core::Module") {
          assume cur_mod = unsafe(reinterpret<Module?>(data));
-         return <- find_module_expr(cur_mod.name, at);
-    } elif (tstr == "$::das_string") {
-        return <- create_string_expr(*unsafe(reinterpret<das_string?>(data)));
-    }
+         return find_module_expr(cur_mod.name, at);
+    } elif (tstr == "$::das_string") return create_string_expr(*unsafe(reinterpret<das_string?>(data)));
     // Convert pointers
-    if (info.baseType == Type.tPointer) {
-        return <- convert_pointer_expr(mod, data, info, at);
-    }
+    if (info.baseType == Type.tPointer) return convert_pointer_expr(mod, data, info, at);
     // Convert structures
     if (info.annotation != null && info.annotation.isBasicStructureAnnotation) {
         var field_loc = at;
         // if possible use Expression.at
         if (isExpression(info)) {
-            assume fval = unsafe(reinterpret<ExpressionPtr>(data));
+            assume fval = unsafe(reinterpret<Expression?>(data));
             field_loc = fval.at;
         }
-        return <- convert_quote_structure(mod, data, tstr, info, field_loc);
+        return convert_quote_structure(mod, data, tstr, info, field_loc);
     }
     panic("Unexpected type {tstr}!");
-    return <- null;
+    return null;
 }
 
-def convert_quote_to_expression(var arg_expr : ExpressionPtr; at : LineInfo) : ExpressionPtr {
-    let mod = get_module("ast");
+def convert_quote_to_expression(var arg_expr : Expression?; at : LineInfo) : Expression? {
+    let mod = get_module("ast_core");
     assume annotation = mod |> module_find_type_annotation(arg_expr.__rtti);
-    var inscope tp <- new TypeDecl(baseType = Type.tHandle, annotation = annotation);
-    tp.flags |= TypeDeclFlags.smartPtr;
-    return <- new ExprAscend(subexpr <- convert_quote_expr(mod, unsafe(reinterpret<uint8 const?>(arg_expr.get_ptr())), tp, at));
+    var tp = new TypeDecl(baseType = Type.tHandle, annotation = annotation);
+    tp.flags.smartPtr = true;
+    return new ExprAscend(subexpr = convert_quote_expr(mod, unsafe(reinterpret<uint8 const?>(arg_expr)), tp, at));
 }
 
 class QuoteConverter : AstVisitor {
+    //! AST visitor that converts quoted expressions to init data.
     astChanged : bool = false
-    def override visitExprQuote(var expr : smart_ptr<ExprQuote>) : ExpressionPtr {
+    mod : Module?
+    counter : int = 0
+    def override visitExprQuote(var expr : ExprQuote?) : Expression? {
         astChanged = true
-        return <- convert_quote_to_expression(expr.arguments[0], expr.at)
+        var conv = convert_quote_to_expression(expr.arguments[0], expr.at)
+        // wrap the construction in a per-quote generated function and replace the quote with a call: the (large) construction expression then occupies one non-recursive leaf frame instead of inflating every caller's frame (fatal in recursive macros)
+        var fname = ""
+        while (true) {
+            fname = "`quote`lowered`{counter}"
+            counter++
+            break if (find_unique_function(mod, fname, true) == null)
+        }
+        var fn = new Function(at = expr.at, atDecl = expr.at, name := fname,
+            flags = FunctionFlags.generated | FunctionFlags.privateFunction)
+        // preserve the raw quote's static type (Expression?) — autoinfer would leak the concrete node type (e.g. ExprConstInt?) and break consumers that need type identity, e.g. `cond ? clone_expression(x) : quote(0)`
+        fn.result = expr._type != null ? clone_type(expr._type) : new TypeDecl(baseType = Type.autoinfer)
+        var blk = new ExprBlock(at = expr.at)
+        emplace_new(blk.list) <| new ExprReturn(at = expr.at, subexpr = conv)
+        fn.body = blk
+        mod |> add_function(fn)
+        return new ExprCall(at = expr.at, name := fname)
     }
 }
 
 [infer_macro]
 class QuotePass : AstPassMacro {
+    //! Pass macro that processes quoted AST expressions.
     def override apply(prog : ProgramPtr; mod : Module?) : bool {
         // Unwrapping ExprQuote is slow and inefficient, do it only if necessary.
-        if (!compiling_program().policies.aot_macros) {
-            return false // nothing to do
+        let lower = (compiling_program().policies.aot_macros
+            || (compiling_program().policies.jit_enabled && !prog.flags.needMacroModule)
+            || (prog._options |> find_arg("aot_macros") ?as tBool ?? false))
+        if (!lower) return false // nothing to do
+        var astVisitor = new QuoteConverter(mod = compiling_module())
+        make_visitor(*astVisitor) $(astVisitorAdapter) {
+            visit(prog, astVisitorAdapter)
         }
-        var astVisitor = new QuoteConverter()
-        var inscope astVisitorAdapter <- make_visitor(*astVisitor)
-        visit(prog, astVisitorAdapter)
-        var result = astVisitor.astChanged
+        let result = astVisitor.astChanged
         unsafe {
             delete astVisitor
         }

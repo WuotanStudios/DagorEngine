@@ -3,13 +3,18 @@
 #include "genVisibility.h"
 #include <rendInst/visibility.h>
 #include <rendInst/gpuObjects.h>
+#include <rendInst/rendInstGenRtTools.h>
 
 #include "render/genRender.h"
+#include "render/riShaderConstBuffers.h"
 #include "riGen/genObjUtil.h"
 #include "visibility/cellVisibility.h"
 #include "visibility/cullingMath.h"
 
 #include <osApiWrappers/dag_cpuJobs.h>
+#include <util/dag_convar.h>
+
+CONSOLE_BOOL_VAL("rendinst", tree_horizontal_cull, false);
 
 
 RiGenVisibility *rendinst::createRIGenVisibility(IMemAlloc *mem)
@@ -41,6 +46,15 @@ void rendinst::destroyRIGenVisibility(RiGenVisibility *visibility)
   }
 }
 
+void rendinst::shrinkRIGenVisibility(RiGenVisibility *visibility)
+{
+  if (visibility)
+  {
+    visibility[0].shrink();
+    visibility[1].shrink();
+  }
+}
+
 void rendinst::setRIForcedLocalPoolOrder(RiGenVisibility *visibility, bool forced_local_pool_order)
 {
   visibility->riex.forcedLocalPoolOrder = forced_local_pool_order;
@@ -50,6 +64,11 @@ void rendinst::setRIGenVisibilityMinLod(RiGenVisibility *visibility, int ri_lod,
 {
   visibility[0].forcedLod = visibility[1].forcedLod = ri_lod;
   visibility[0].riex.forcedExtraLod = visibility[1].riex.forcedExtraLod = ri_extra_lod;
+}
+
+void rendinst::setRIGenVisibilityForcedLodRangeCull(RiGenVisibility *visibility, bool range_cull)
+{
+  visibility[0].forcedLodRangeCull = visibility[1].forcedLodRangeCull = range_cull;
 }
 
 void rendinst::setRIGenVisibilityAtestSkip(RiGenVisibility *visibility, bool skip_atest, bool skip_noatest)
@@ -64,26 +83,29 @@ void rendinst::setRIGenVisibilityAtestSkip(RiGenVisibility *visibility, bool ski
     skip_atest ? visibility->SKIP_ATEST : (skip_noatest ? visibility->SKIP_NO_ATEST : visibility->RENDER_ALL);
 }
 
-void rendinst::setRIGenVisibilityRendering(RiGenVisibility *visibility, VisibilityRenderingFlags v) { visibility[0].rendering = v; }
+void rendinst::setRIGenVisibilityRendering(RiGenVisibility *visibility, VisibilityRenderingFlags v)
+{
+  visibility[0].riex.rendering = v;
+}
 
-bool rendinst::prepareRIGenVisibility(const Frustum &frustum, const Point3 &vpos, RiGenVisibility *visibility, bool forShadow,
-  Occlusion *use_occlusion, bool for_visual_collision, const rendinst::VisibilityExternalFilter &external_filter)
+void rendinst::setRIGenVisibilityRequestDestrLods(RiGenVisibility *vis, bool request) { vis[0].riex.requestDestrLods = request; }
+
+bool rendinst::prepareRIGenVisibility(RiGenVisibility *visibility, const Frustum &frustum, const PrepareRiGenVisibilityParams &params)
 {
   if (!RendInstGenData::renderResRequired || RendInstGenData::isLoading)
     return false;
   G_ASSERT(visibility);
   bool ret = false;
-  if (!external_filter)
+  if (!params.externalFilter)
   {
     FOR_EACH_RG_LAYER_DO (rgl)
-      if (rgl->prepareVisibility(frustum, vpos, visibility[_layer], forShadow, {}, use_occlusion, for_visual_collision))
+      if (rgl->prepareVisibility(visibility[_layer], frustum, params))
         ret = true;
   }
   else
   {
     FOR_EACH_RG_LAYER_DO (rgl)
-      if (rgl->prepareVisibility<true>(frustum, vpos, visibility[_layer], forShadow, {}, use_occlusion, for_visual_collision,
-            external_filter))
+      if (rgl->prepareVisibility<true>(visibility[_layer], frustum, params))
         ret = true;
   }
   return ret;
@@ -130,18 +152,16 @@ void RendInstGenData::filterRIGenVisibilityById(const RiGenVisibility &visibilit
 
   if (!visibility.vismask)
   {
-    filteredVis.resizeRanges(0, 0);
+    filteredVis.resizeRanges(0);
     filteredVis.startTreeInstances();
     filteredVis.closeTreeInstances();
     filteredVis.vismask = 0;
     return;
   }
 
-  filteredVis.resizeRanges(rtData->riRes.size(), 8);
+  filteredVis.resizeRanges(rtData->riRes.size());
   filteredVis.forcedLod = visibility.forcedLod;
-  filteredVis.riex = visibility.riex;
   filteredVis.riDistMul = visibility.riDistMul;
-  filteredVis.stride = visibility.stride;
   filteredVis.vismask = 0;
 
   Tab<uint32_t> passedInstanceIndices(tmpmem);
@@ -157,6 +177,7 @@ void RendInstGenData::filterRIGenVisibilityById(const RiGenVisibility &visibilit
     RenderRanges &rr = filteredVis.renderRanges[ri_idx];
     rr.vismask = 0;
 
+    filteredVis.stride = stride;
     filteredVis.startRenderRange(ri_idx);
     for (int lodI = 0; lodI < alphaFarLodNo; ++lodI)
     {
@@ -193,7 +214,8 @@ void RendInstGenData::filterRIGenVisibilityById(const RiGenVisibility &visibilit
             TMatrix tm;
             v_mat_43cu_from_mat44(tm.array, tm44);
 
-            if (id_filter(ri_idx, tm))
+            int pregenId = rendinst::get_pregen_id_from_layer_idx_and_ri_idx(rtData->layerIdx, ri_idx);
+            if (id_filter(pregenId, tm))
               passedInstanceIndices.push_back(instanceOfs);
           }
         }
@@ -233,7 +255,35 @@ void RendInstGenData::filterRIGenVisibilityById(const RiGenVisibility &visibilit
     filteredVis.vismask |= rr.vismask;
   }
 
+  carray<int, RiGenVisibility::PER_INSTANCE_LODS> perInstanceData;
+  mem_set_ff(perInstanceData);
   filteredVis.startTreeInstances();
+  for (int lod = 0; lod < RiGenVisibility::PER_INSTANCE_LODS; ++lod)
+  {
+    if (visibility.perInstanceVisibilityCells[lod].empty())
+      continue;
+
+    for (int cell = 0; cell < visibility.perInstanceVisibilityCells[lod].size() - 1; ++cell)
+    {
+      const IPoint2 &visCell = visibility.perInstanceVisibilityCells[lod][cell];
+      const int ri_idx = visCell.x;
+
+      if (!rtData->rtPoolData[ri_idx] || rtData->isHiddenId(ri_idx))
+        continue;
+
+      for (int inst = visCell.y; inst < visibility.perInstanceVisibilityCells[lod][cell + 1].y; ++inst)
+      {
+        const vec4f &v_pos = visibility.instanceData[lod][inst];
+        const Point3 pos(v_extract_x(v_pos), v_extract_y(v_pos), v_extract_z(v_pos));
+
+        TMatrix tm;
+        auto result = rendinst::get_rendinst_matrix_by_ri_idx(rtData->layerIdx, ri_idx, pos, tm);
+        int pregenId = rendinst::get_pregen_id_from_layer_idx_and_ri_idx(rtData->layerIdx, ri_idx);
+        if (result == rendinst::GetRendInstMatrixByRiIdxResult::Success && id_filter(pregenId, tm))
+          filteredVis.addTreeInstance(ri_idx, perInstanceData[lod], v_pos, visibility.instanceIds[lod][inst], lod);
+      }
+    }
+  }
   filteredVis.closeTreeInstances();
 
   // update vismask
@@ -250,11 +300,17 @@ void RendInstGenData::filterRIGenVisibilityById(const RiGenVisibility &visibilit
 }
 
 template <bool use_external_filter>
-bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &camera_pos, RiGenVisibility &visibility, bool forShadow,
-  rendinst::LayerFlags layer_flags, Occlusion *use_occlusion, bool for_visual_collision,
-  const rendinst::VisibilityExternalFilter &external_filter)
+bool RendInstGenData::prepareVisibility(RiGenVisibility &visibility, const Frustum &frustum,
+  const rendinst::PrepareRiGenVisibilityParams &__restrict params)
 {
   TIME_D3D_PROFILE(prepare_ri_visibility);
+  const rendinst::LayerFlags layer_flags = params.layerFlags;
+  const Point3 &camera_pos = params.viewPos;
+  Occlusion *use_occlusion = params.occlusion;
+  const rendinst::VisibilityExternalFilter &external_filter = params.externalFilter;
+  const bool forShadow = params.forShadow;
+  const bool for_visual_collision = params.forVisualCollision;
+
   if (rendinst::render::per_instance_visibility)
   {
     visibility.startTreeInstances();
@@ -267,27 +323,40 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
     use_occlusion = nullptr;
   vec3f curViewPos = v_ldu(&camera_pos.x);
   Tab<RenderRanges> &riRenderRanges = visibility.renderRanges;
+  const int forcedLod = rendinst::get_effective_forced_lod(visibility.forcedLod);
+  const bool rangeCull = forcedLod < 0 || visibility.forcedLodRangeCull;
+  // horizontal cull is main-view only; shadow passes stay 3d on purpose:
+  // distant tree shadows come from the baked clipmap shadow
+  const bool horTreeCull = tree_horizontal_cull.get() && !forShadow && forcedLod < 0;
   Frustum curFrustum = frustum;
-  if (!forShadow)
+  // the shrunk far plane is a 3d bound and would clip trees far below a high camera,
+  // so with horizontal cull the distance tests bound the work instead
+  if (!forShadow && !horTreeCull)
   {
-    float maxRIDist = rtData->get_trees_last_range(rtData->rendinstFarPlane);
+    float maxRIDist = rtData->get_trees_last_range(rtData->rendinstFarPlane) * visibility.riDistMul;
     shrink_frustum_zfar(curFrustum, curViewPos, v_splats(maxRIDist));
   }
-
   float forcedLodDist = 0.f;
-  float forcedLodDistSq = 0.f;
-  Point3_vec4 viewPos = camera_pos;
-  if (visibility.forcedLod >= 0)
+  Point3_vec4 viewPos;
+  bbox3f fbox;
+  if (!rangeCull)
   {
-    bbox3f box;
-    frustum.calcFrustumBBox(box);
-    curViewPos = v_bbox3_center(box);
+    frustum.calcFrustumBBox(fbox);
+    curViewPos = v_bbox3_center(fbox);
     v_st(&viewPos.x, curViewPos);
-
-    float rad = v_extract_x(v_bbox3_outer_rad(box));
-    forcedLodDist = rad;
-    forcedLodDistSq = forcedLodDist * forcedLodDist;
+    forcedLodDist = v_extract_x(v_bbox3_outer_rad(fbox));
   }
+  else
+  {
+    viewPos = camera_pos;
+#if DAGOR_DBGLEVEL > 0
+    v_bbox3_init_empty(fbox); // For assertion below
+#endif
+  }
+#define P3V(p) v_extract_x(p), v_extract_y(p), v_extract_z(p)
+  G_ASSERTF(!check_nan(viewPos), "Nans in viewPos=(%g,%g,%g), camPos=(%g,%g,%g) forcedLod=%d/%d fbox=(%g,%g,%g)(%g,%g,%g)",
+    P3D(viewPos), P3D(camera_pos), forcedLod, visibility.forcedLod, P3V(fbox.bmin), P3V(fbox.bmax));
+#undef P3V
   bbox3f worldBBox;
   float grid2worldcellSz = grid2world * cellSz;
 
@@ -306,7 +375,7 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
   v_sti(regions, regionI);
   float grid2worldcellSzDiag = grid2worldcellSz * 1.4142f;
   visibility.subCells.clear();
-  visibility.resizeRanges(rtData->riRes.size(), forShadow ? 4 : 8);
+  visibility.resizeRanges(rtData->riRes.size());
 
   ScopedLockRead lock(rtData->riRwCs);
   rendinst::VisibleCells<RendInstGenData::MAX_VISIBLE_CELLS, RendInstGenData::SUBCELL_DIV> visData;
@@ -330,7 +399,11 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
     const auto calcRiCellVisibility = [&](int cell_idx, int cell_x, int cell_z) {
       const auto cellRtData = cells[cell_idx].isReady();
       if (cellRtData)
+      {
+        if (params.tileCullBox && !v_bbox3_test_box_intersect(cellRtData->bbox[0], *params.tileCullBox))
+          return;
         visData.calcCellVisibility(cell_x, cell_z, curViewPos, curFrustum, cellRtData->bbox.data(), use_occlusion);
+      }
     };
 
     int maxRadius =
@@ -374,6 +447,7 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
   static constexpr unsigned MAX_INSTANCES_TO_SORT = 256;
   dag::Vector<carray<IPoint2, MAX_INSTANCES_TO_SORT>, framemem_allocator, false> perInstanceDistance(rendinst::MAX_LOD_COUNT);
   dag::Vector<carray<vec4f, MAX_INSTANCES_TO_SORT>, framemem_allocator, false> sortedInstances(rendinst::MAX_LOD_COUNT);
+  dag::Vector<carray<uint64_t, MAX_INSTANCES_TO_SORT>, framemem_allocator, false> sortedInstanceIds(rendinst::MAX_LOD_COUNT);
   if (rendinst::render::per_instance_visibility)
   {
     for (int vi = 0; vi < min<int>(MAX_PER_INSTANCE_CELLS, visData.cells.size()); ++vi)
@@ -382,7 +456,7 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
       int z = visData.cells[vi].z;
       int cellId = x + z * cellNumW;
       RendInstGenData::Cell &cell = cells[cellId];
-      RendInstGenData::CellRtData &crt = *cell.rtData;
+      RendInstGenData::CellRtData &crt = *cell.cellRtData;
       v_cell_add[vi] = crt.cellOrigin;
       v_cell_mul[vi] = v_mul(rendinst::gen::VC_1div32767, v_make_vec4f(grid2worldcellSz, crt.cellHeight, grid2worldcellSz, 0));
     }
@@ -514,8 +588,13 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
         continue;
 
       float minDist = visData.cells[vi].distance;
-      float maxDist = visibility.forcedLod < 0 ? farLodEndRange : forcedLodDist;
-      if (minDist >= maxDist)
+      float maxDist = rangeCull ? farLodEndRange : forcedLodDist;
+      if (horTreeCull && hasImpostor)
+      {
+        if (v_extract_x(v_distance_sq_to_bbox_2d_x(crt.bbox[0].bmin, crt.bbox[0].bmax, curViewPos)) >= farLodEndRangeSq)
+          continue;
+      }
+      else if (minDist >= maxDist)
         continue;
       int startVbOfs = crt.getCellSlice(ri_idx, 0).ofs;
       // fixme: we can separate for subcells if alphaBlendOnRadius is splitting cell, so part of subcells will be blended and part not
@@ -523,14 +602,14 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
       mem_set_0(perInstanceDistanceCnt);
       if (auto layerForcedLod = rendinst::get_forced_lod(layer_flags);
           (!farLodNo && forShadow) || (minDist > farLodStartRangeCellDist && (minDist > 0.f || minDist <= alphaBlendOnCellRadius)) ||
-          layerForcedLod >= 0 || visibility.forcedLod >= 0)
+          layerForcedLod >= 0 || forcedLod >= 0)
       {
         // add all ranges to far lod
 
         int lodI;
-        if (visibility.forcedLod >= 0)
+        if (forcedLod >= 0)
         {
-          lodI = min(visibility.forcedLod, farLodNo);
+          lodI = min(forcedLod, farLodNo);
         }
         else if (layerForcedLod >= 0)
         {
@@ -592,8 +671,11 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
             const auto bboxIdx = cri + visData.SUBCELL_BBOX_OFFSET;
             float subCellDistSq = v_extract_x(v_distance_sq_to_bbox_x(crt.bbox[bboxIdx].bmin, crt.bbox[bboxIdx].bmax, curViewPos));
 
-            float maxDistSq = visibility.forcedLod < 0 ? farLodEndRangeSq : forcedLodDistSq;
-            if (subCellDistSq >= maxDistSq)
+            float maxDistSq = farLodEndRangeSq;
+            float cullDistSq = (horTreeCull && hasImpostor)
+                                 ? v_extract_x(v_distance_sq_to_bbox_2d_x(crt.bbox[bboxIdx].bmin, crt.bbox[bboxIdx].bmax, curViewPos))
+                                 : subCellDistSq;
+            if (cullDistSq >= maxDistSq)
               continue; // too far away
 
             if (use_external_filter)
@@ -670,10 +752,12 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
                       instanceLod = rtData->riRes[ri_idx]->getQlBestLod();
 
                     vec4f v_packed_data = rendinst::gen::pack_entity_data(v_pos, v_scale, v_palette_id);
+                    const uint64_t uniqueId = crt.getUniqueId(uint32_t((const uint8_t *)data - crt.sysMemData.get()));
                     if (pool_front_to_back && (instanceLod <= RiGenVisibility::PI_LAST_MESH_LOD) &&
                         perInstanceDistanceCnt[instanceLod] < perInstanceDistance[instanceLod].size())
                     {
                       sortedInstances[instanceLod][perInstanceDistanceCnt[instanceLod]] = v_packed_data;
+                      sortedInstanceIds[instanceLod][perInstanceDistanceCnt[instanceLod]] = uniqueId;
                       int distance = bitwise_cast<int, float>(instance_dist2);
 
                       if (forShadow) // we shall sort from front to back
@@ -684,7 +768,7 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
                       perInstanceDistanceCnt[instanceLod]++;
                     }
                     else
-                      visibility.addTreeInstance(ri_idx, perInstanceData[instanceLod], v_packed_data, instanceLod);
+                      visibility.addTreeInstance(ri_idx, perInstanceData[instanceLod], v_packed_data, uniqueId, instanceLod);
 
                     visibility.instNumberCounter[max(0, instanceLod - lodTranslation)]++;
                     if (instanceLod == visibility.PI_ALPHA_LOD) // PI_ALPHA_LOD also requires an impostor texture.
@@ -722,8 +806,12 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
         stlsort::sort(perInstanceDistance[lodI].data(), perInstanceDistance[lodI].data() + perInstanceDistanceCnt[lodI], SortByY());
         int perInstanceStart = visibility.addTreeInstances(ri_idx, perInstanceData[lodI], nullptr, perInstanceDistanceCnt[lodI], lodI);
         vec4f *dest = &visibility.instanceData[lodI][perInstanceStart];
-        for (int i = 0; i < perInstanceDistanceCnt[lodI]; ++i, dest++)
+        uint64_t *destId = &visibility.instanceIds[lodI][perInstanceStart];
+        for (int i = 0; i < perInstanceDistanceCnt[lodI]; ++i, dest++, destId++)
+        {
           *dest = sortedInstances[lodI][perInstanceDistance[lodI][i].x];
+          *destId = sortedInstanceIds[lodI][perInstanceDistance[lodI][i].x];
+        }
       }
     }
     for (int lodI = 0; lodI < visibility.instanceData.size(); ++lodI)
@@ -772,7 +860,161 @@ bool RendInstGenData::prepareVisibility(const Frustum &frustum, const Point3 &ca
 }
 
 // Explicit instantiation of all specialization, cuz we use them in other translation units.
-template bool RendInstGenData::prepareVisibility<true>(const Frustum &, const Point3 &, RiGenVisibility &, bool, rendinst::LayerFlags,
-  Occlusion *, bool, const rendinst::VisibilityExternalFilter &);
-template bool RendInstGenData::prepareVisibility<false>(const Frustum &, const Point3 &, RiGenVisibility &, bool, rendinst::LayerFlags,
-  Occlusion *, bool, const rendinst::VisibilityExternalFilter &);
+template bool RendInstGenData::prepareVisibility<true>(RiGenVisibility &, const Frustum &,
+  const rendinst::PrepareRiGenVisibilityParams &);
+template bool RendInstGenData::prepareVisibility<false>(RiGenVisibility &, const Frustum &,
+  const rendinst::PrepareRiGenVisibilityParams &);
+
+static ShaderMesh *get_pool_mesh_at_lod(RenderableInstanceLodsResource *res, int lodIdx)
+{
+  if (!res || res->lods.size() == 0)
+    return nullptr;
+  uint32_t lodForMesh = (lodIdx == rendinst::MAX_LOD_COUNT - 1) ? (uint32_t)res->lods.size() - 1 : (uint32_t)max(lodIdx, 0);
+  if ((int)lodForMesh < res->getQlBestLod())
+    lodForMesh = (uint32_t)res->getQlBestLod();
+  if (lodForMesh >= res->lods.size())
+    lodForMesh = res->lods.size() - 1;
+  if (!res->lods[lodForMesh].scene)
+    return nullptr;
+  auto *meshRes = res->lods[lodForMesh].scene->getMesh();
+  if (!meshRes)
+    return nullptr;
+  auto *inner = meshRes->getMesh();
+  return inner ? inner->getMesh() : nullptr;
+}
+
+struct PerInstanceDrawStats
+{
+  int numElems = 0;
+  int totalFaces = 0;
+};
+
+static PerInstanceDrawStats gather_per_instance_draw_stats(ShaderMesh *mesh, uint32_t atest_mask, int atest_skip_mask, int start_stage,
+  int end_stage)
+{
+  PerInstanceDrawStats agg;
+  if (!mesh)
+    return agg;
+  for (int stage = start_stage; stage <= end_stage; ++stage)
+  {
+    const auto elems = mesh->getElems(stage);
+    for (uint32_t e = 0; e < elems.size(); ++e, atest_mask >>= 1)
+    {
+      if (!elems[e].e)
+        continue;
+      if ((int)(atest_mask & 1u) == atest_skip_mask)
+        continue;
+      ++agg.numElems;
+      agg.totalFaces += elems[e].numf;
+    }
+  }
+  return agg;
+}
+
+rendinst::RiVisibilityDrawStats rendinst::getRIGenVisibleDrawStats(const RiGenVisibility *visibility, int start_stage, int end_stage)
+{
+  RiVisibilityDrawStats stats;
+  if (!visibility)
+    return stats;
+  const int atestSkipMask = visibility[0].atest_skip_mask;
+  FOR_EACH_RG_LAYER_DO (rgl)
+  {
+    if (!rgl->rtData)
+      continue;
+    const RiGenVisibility &v = visibility[_layer];
+    auto &rtData = *rgl->rtData;
+    const auto &riRes = rtData.riRes;
+    const int poolCount = min((int)riRes.size(), (int)v.renderRanges.size());
+
+    for (int poolIdx = 0; poolIdx < poolCount; ++poolIdx)
+    {
+      RenderableInstanceLodsResource *res = riRes[poolIdx];
+      if (!res || poolIdx >= (int)rtData.rtPoolData.size() || !rtData.rtPoolData[poolIdx])
+        continue;
+      if (rtData.isHiddenId(poolIdx) || rendinst::isResHidden(rtData.riResHideMask[poolIdx]))
+        continue;
+      const RenderRanges &rr = v.renderRanges[poolIdx];
+      if (!rr.hasOpaque() && !rr.hasTransparent())
+        continue;
+
+      const int firstLod = rtData.riResFirstLod(poolIdx);
+      const int lodCnt = rtData.riResLodCount(poolIdx);
+      for (int lodIdx = firstLod; lodIdx <= lodCnt; ++lodIdx)
+      {
+        if (lodIdx >= (int)v.cellsLod.size())
+          break;
+        if (rr.endCell[lodIdx] <= rr.startCell[lodIdx])
+          continue;
+
+        int subcellRanges = 0, instances = 0;
+        for (int ci = rr.startCell[lodIdx]; ci < rr.endCell[lodIdx]; ++ci)
+        {
+          const RiGenVisibility::CellRange &cell = v.cellsLod[lodIdx][ci];
+          subcellRanges += cell.startSubCellCnt;
+          for (int s = 0; s < (int)cell.startSubCellCnt; ++s)
+            instances += v.subCells[cell.startSubCell + s].cnt;
+        }
+        if (!subcellRanges)
+          continue;
+
+        const int maskOffset = lodIdx < lodCnt ? lodIdx : lodCnt - 1;
+        const uint32_t atestMask = rtData.riResElemMask[poolIdx * rendinst::MAX_LOD_COUNT + maskOffset].atest;
+        ShaderMesh *mesh = get_pool_mesh_at_lod(res, lodIdx);
+        const PerInstanceDrawStats agg = gather_per_instance_draw_stats(mesh, atestMask, atestSkipMask, start_stage, end_stage);
+        if (!agg.numElems)
+          continue;
+
+        stats.drawCalls += subcellRanges * agg.numElems;
+        stats.submittedInstances += instances * agg.numElems;
+        stats.triangles += instances * agg.totalFaces;
+        stats.visibleInstances += instances;
+      }
+    }
+
+    for (int instLod = 0; instLod < (int)RiGenVisibility::PER_INSTANCE_LODS; ++instLod)
+    {
+      const auto &cells = v.perInstanceVisibilityCells[instLod];
+      if (cells.size() < 2)
+        continue;
+      for (int c = 0; c + 1 < (int)cells.size(); ++c)
+      {
+        const int poolIdx = cells[c].x;
+        if (poolIdx < 0)
+          break;
+        if (poolIdx >= poolCount || !rtData.rtPoolData[poolIdx] || rtData.isHiddenId(poolIdx) ||
+            rendinst::isResHidden(rtData.riResHideMask[poolIdx]))
+          continue;
+        RenderableInstanceLodsResource *res = riRes[poolIdx];
+        if (!res)
+          continue;
+
+        int lodIdx = (instLod == RiGenVisibility::PI_ALPHA_LOD) ? (int)RiGenVisibility::PI_IMPOSTOR_LOD : instLod;
+        int lodTranslation = (int)rendinst::MAX_LOD_COUNT - rtData.riResLodCount(poolIdx);
+        if (lodTranslation > 0 && !rtData.rtPoolData[poolIdx]->hasImpostor())
+          lodTranslation--;
+        lodIdx -= lodTranslation;
+        if (lodIdx < 0)
+          continue;
+
+        const int instCount = cells[c + 1].y - cells[c].y;
+        if (instCount <= 0)
+          continue;
+
+        const int lodCnt = rtData.riResLodCount(poolIdx);
+        const int maskOffset = lodIdx < lodCnt ? lodIdx : lodCnt - 1;
+        const uint32_t atestMask = rtData.riResElemMask[poolIdx * rendinst::MAX_LOD_COUNT + maskOffset].atest;
+        ShaderMesh *mesh = get_pool_mesh_at_lod(res, lodIdx);
+        const PerInstanceDrawStats agg = gather_per_instance_draw_stats(mesh, atestMask, atestSkipMask, start_stage, end_stage);
+        if (!agg.numElems)
+          continue;
+
+        const int chunks = (instCount + (int)rendinst::render::MAX_INSTANCES - 1) / (int)rendinst::render::MAX_INSTANCES;
+        stats.drawCalls += chunks * agg.numElems;
+        stats.submittedInstances += instCount * agg.numElems;
+        stats.triangles += instCount * agg.totalFaces;
+        stats.visibleInstances += instCount;
+      }
+    }
+  }
+  return stats;
+}

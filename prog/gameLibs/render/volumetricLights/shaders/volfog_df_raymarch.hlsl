@@ -78,17 +78,6 @@ struct AccumulationConstParams
 };
 
 
-// copy-paste from clouds_shadow.sh
-float clouds_shadow(float3 worldPos, AccumulationConstParams cp)
-{
-  float alt = cp.world_pos_to_clouds_alt.x*worldPos.y + cp.world_pos_to_clouds_alt.y;
-  worldPos.xz = cp.clouds_weather_inv_size__alt_scale.yz*alt + worldPos.xz;
-  float shadow = tex2Dlod(clouds_shadows_2d,
-    float4(worldPos.xz*cp.clouds_weather_inv_size__alt_scale.x + cp.world_pos_to_clouds_alt.zw + clouds_hole_pos.zw, 0, 0)).x;
-  return lerp(shadow,1, max(alt,0));
-}
-
-
 void accumulatePreparedFogStep(AccumulationConstParams const_params,
   float4 media, float dist, float3 worldPos, float step_len, float shadow,
   inout float4 accumulated_scattering, out float transmittance)
@@ -124,7 +113,7 @@ void accumulateFogStep(
     float subTransmittance;
     float stepLen = const_params.stepLen;
 
-    float shadow = clouds_shadow(worldPos, const_params);
+    float shadow = get_clouds_shadow(worldPos);//from USE_CLOUDS_BSM, see clouds_bsm.dshl
     FLATTEN // not having a branch for static shadows is faster when it is enabled (and it is an edge case to have it disabled, but not DF)
     if (distant_fog_use_static_shadows)
       shadow *= getStaticShadow(worldPos);
@@ -375,8 +364,7 @@ float4 accumulateFog_impl(uint2 dtId, float4 transformed_znzfar, float2 screen_t
     out_debug.ra = 1;
 #endif
 
-  #define VOLFOG_NIGHT_SUN_COS 0.046f // at this magic value it seems to be consistent with surface shadows // TODO: make it make sense!
-  const float shadowMul = from_sun_direction.y > -VOLFOG_NIGHT_SUN_COS ? 0 : 1;
+  const float shadowMul = -from_sun_direction.y < NIGHT_SUN_COS ? 0 : 1;
 
   float3 sunColor = sun_color_0.rgb;
   sunColor *= shadowMul;
@@ -514,6 +502,9 @@ float4 accumulateFog_impl(uint2 dtId, float4 transformed_znzfar, float2 screen_t
       accumulateFogStep(useSubsteps, cp, dist, sampleWeight, accumulatedScattering, transmittance, fogStartDist, sampleCnt);
 
       float weight = 1 - transmittance;
+      float weightDecay = accumulatedScattering.w; // to make sure the weighted average dist is close to the visible blobs of fog
+      weight *= weightDecay;
+
       out_weighted_end_dist += dist*weight;
       weightSum += weight;
       dist += cp.stepSize;
@@ -594,8 +585,10 @@ void get_occlusion_weights(float2 prev_tc, out float start_step, out float step_
     {
       UNROLL for (int x = -WEIGHT_KERNEL_SIZE; x <= WEIGHT_KERNEL_SIZE; x++)
       {
+        float2 tc = prev_tc + float2(x, y) * occlusionWeightSampleOffset;
+        tc *= distant_fog_raymarch_dyn_scales.zw;
         float2 weights = tex2Dlod(prev_distant_fog_raymarch_start_weights,
-          float4(prev_tc + float2(x, y) * occlusionWeightSampleOffset, 0, occlusion_weight_mip_level)).xy;
+          float4(tc, 0, occlusion_weight_mip_level)).xy;
         maxWeights = max(maxWeights, weights);
       }
     }

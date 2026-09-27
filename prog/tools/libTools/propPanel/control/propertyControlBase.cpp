@@ -2,7 +2,10 @@
 
 #include <propPanel/control/propertyControlBase.h>
 #include <propPanel/control/container.h>
+#include <propPanel/imguiHelper.h>
+#include <gui/dag_imgui.h>
 #include "../tooltipHelper.h"
+#include "../changeFinishTracker.h"
 
 namespace PropPanel
 {
@@ -20,7 +23,17 @@ PropertyControlBase::PropertyControlBase(int id, ControlEventHandler *event_hand
   mEnabledChanges(false)
 {}
 
-PropertyControlBase::~PropertyControlBase() { mEventHandler = nullptr; }
+PropertyControlBase::~PropertyControlBase()
+{
+  // A pending change of a destroyed control is dropped, its finish notification never arrives.
+  if (changeFinishPending)
+  {
+    changeFinishPending = false;
+    change_finish_tracker.remove(*this);
+  }
+
+  mEventHandler = nullptr;
+}
 
 int PropertyControlBase::addStringValue(const char *value) { return 0; }
 
@@ -62,6 +75,28 @@ bool PropertyControlBase::getCurveCubicCoefsValue(Tab<Point2> &xy_4c_per_seg) co
   return false;
 }
 
+const char *PropertyControlBase::getAutomationName() const { return automationName.c_str(); }
+
+void PropertyControlBase::setImguiTestItemInfo(const char *subcomponent_name) const
+{
+  ImGuiTestItemExternalInfo ext;
+  ext.displayName = automationName.c_str();
+  ext.subcomponentName = subcomponent_name;
+  ext.controlType = getImguiTypeName();
+  ext.controlId = mId;
+  imgui_test_runtime_set_last_item_info(ext);
+}
+
+void PropertyControlBase::setImguiTestItemInfoById(unsigned item_id, const char *subcomponent_name) const
+{
+  ImGuiTestItemExternalInfo ext;
+  ext.displayName = automationName.c_str();
+  ext.subcomponentName = subcomponent_name;
+  ext.controlType = getImguiTypeName();
+  ext.controlId = mId;
+  imgui_test_runtime_set_item_info(item_id, ext);
+}
+
 const char *PropertyControlBase::getTooltip() const { return controlTooltip.c_str(); }
 
 int PropertyControlBase::getStringsValue(Tab<String> &vals)
@@ -88,8 +123,38 @@ long PropertyControlBase::onWcChanging(WindowBase *source)
 
 void PropertyControlBase::onWcChange(WindowBase *source)
 {
+  if (!mEnabledChanges || !mEventHandler)
+    return;
+
+  if (!changeFinishPending)
+  {
+    changeFinishPending = true;
+    change_finish_tracker.add(*this);
+  }
+
+  mEventHandler->onChange(mId, getRootParent());
+}
+
+void PropertyControlBase::onWcChangeFinished(WindowBase *source)
+{
+  if (changeFinishPending)
+  {
+    changeFinishPending = false;
+    change_finish_tracker.remove(*this);
+  }
+
   if (mEnabledChanges && mEventHandler)
-    mEventHandler->onChange(mId, getRootParent());
+    mEventHandler->onChangeFinished(mId, getRootParent());
+}
+
+void PropertyControlBase::heldActiveImguiItem() { activeImguiItemFrame = ImGui::GetFrameCount(); }
+
+bool PropertyControlBase::isEditInProgress() const { return activeImguiItemFrame == ImGui::GetFrameCount(); }
+
+void PropertyControlBase::sendChangeFinishedIfPending()
+{
+  if (changeFinishPending)
+    onWcChangeFinished(nullptr);
 }
 
 void PropertyControlBase::onWcClick(WindowBase *source)
@@ -145,6 +210,22 @@ ContainerPropertyControl *PropertyControlBase::getParent() { return mParent; }
 void PropertyControlBase::setPreviousImguiControlTooltip()
 {
   if (controlTooltip.empty())
+    return;
+
+  tooltip_helper.setPreviousImguiControlTooltip(this, controlTooltip.begin(), controlTooltip.end());
+}
+
+void PropertyControlBase::labelWithTooltip(const char *label, const char *label_end, bool use_text_width)
+{
+  if (!ImguiHelper::labelOnly(label, label_end, use_text_width))
+    return;
+
+  tooltip_helper.setPreviousImguiControlTooltip(this, controlTooltip.begin(), controlTooltip.end());
+}
+
+void PropertyControlBase::separateLineLabelWithTooltip(const char *label, const char *label_end)
+{
+  if (!ImguiHelper::separateLineLabel(label, label_end))
     return;
 
   tooltip_helper.setPreviousImguiControlTooltip(this, controlTooltip.begin(), controlTooltip.end());

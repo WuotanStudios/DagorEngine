@@ -17,8 +17,8 @@ namespace tire_tracks
 {
 
 // returns true if a new track node has been created, false otherwise
-bool emit(int id, const Point3 &norm, const Point3 &pos, const Point3 &movedir, real opacity, int tex_id, float additional_width,
-  float omnidirectional_tex_blend, bool correct_previous_node = false);
+bool emit(int id, const Point3 &norm, const Point3 &pos, const Point3 &movedir, real opacity, real wetness, int tex_id,
+  float additional_width, float omnidirectional_tex_blend, bool correct_previous_node = false, bool direction_changed = false);
 
 // init system. load settings from blk-file
 void init(const char *blk_file, bool has_normalmap, bool stub_render_mode);
@@ -33,10 +33,13 @@ void update_samplers();
 void clear(bool completeClear = false);
 
 // update buffer
-void before_render(float dt, const Point3 &origin);
+void before_render(float dt, const Point3 &origin, bool need_deform_pressure_buffer = false);
 
 // render tires
-void render(const Frustum &frustum, bool for_displacement);
+void render_strips(bool apply_clipmap_writemask);
+void render_projective_decals();
+
+void render_debug(bool show_nodes_data);
 
 // create new track emitter
 // prio_scale_factor - the smaller number is (>=0) the bigger is priority. Visible distance is affected.
@@ -44,6 +47,8 @@ void render(const Frustum &frustum, bool for_displacement);
 // so, if prio_scale_factor is 10 - it will be suppose to be sqrt(10) times more distant, and so, less important
 // ownership will be obtained for minTimeToOwn
 int create_emitter(float width, float texture_length_factor, float minTimeToOwn, float prio_scale_factor, int track_type_no);
+
+void set_emitter_deform_pressure(int id, float deform_pressure_mult);
 
 // delete track emitter.
 void delete_emitter(int id);

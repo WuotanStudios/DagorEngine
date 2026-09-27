@@ -1,0 +1,21 @@
+from "async" import Future
+
+// A subclass of Future whose constructor does not invoke super.constructor()
+// leaves _userpointer NULL while _typetag still matches Future's. The
+// script-callable methods used to dereference NULL on this; they must now
+// throw "invalid 'this'" instead.
+
+class Sub(Future) {
+  constructor() {
+    // intentionally skip super.constructor()
+  }
+}
+
+let s = Sub()
+
+try { s.getState() }    catch (e) { println($"getState: {e}") }
+try { s.resolve(1) }    catch (e) { println($"resolve: {e}") }
+
+// A plain Future still works.
+let p = Future()
+println($"plain: {p.getState()}")

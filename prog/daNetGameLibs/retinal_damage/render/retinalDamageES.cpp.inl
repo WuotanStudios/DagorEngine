@@ -1,7 +1,9 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <daECS/core/coreEvents.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <ecs/camera/getActiveCameraSetup.h>
 #include <ecs/render/resPtr.h>
 #include <render/daFrameGraph/ecs/frameGraphNode.h>
@@ -12,20 +14,20 @@
 
 
 template <typename Callable>
-inline void start_retinal_damage_ecs_query(Callable c);
+inline void start_retinal_damage_ecs_query(ecs::EntityManager &manager, Callable c);
 
 template <typename Callable>
-inline void stop_retinal_damage_ecs_query(Callable c);
+inline void stop_retinal_damage_ecs_query(ecs::EntityManager &manager, Callable c);
 
 ECS_TAG(render)
 ECS_ON_EVENT(on_appear)
 static void retinal_damage_es_event_handler(
-  const ecs::Event &, const Point3 &retinal_damage__explosion_world_position, float retinal_damage__scale)
+  const ecs::Event &, ecs::EntityManager &manager, const Point3 &retinal_damage__explosion_world_position, float retinal_damage__scale)
 {
-  start_retinal_damage_ecs_query(
+  start_retinal_damage_ecs_query(manager,
     [retinal_damage__explosion_world_position, retinal_damage__scale](float retinal_damage__total_lifetime,
       float retinal_damage__base_scale, float retinal_damage__scale_increase_rate, float &retinal_damage__remaining_time,
-      dafg::NodeHandle &retinal_damage__node_handle, UniqueTexHolder &retinal_damage__tex) {
+      dafg::NodeHandle &retinal_damage__node_handle, UniqueTexWithShaderVar &retinal_damage__tex) {
       TMatrix4 globTm = calc_active_camera_globtm();
       Point4 pos = Point4::xyz1(retinal_damage__explosion_world_position) * globTm;
       if (!is_equal_float(pos.w, 0.f))
@@ -36,14 +38,15 @@ static void retinal_damage_es_event_handler(
 
       retinal_damage__remaining_time = retinal_damage__total_lifetime;
       IPoint2 render_resolution = get_rendering_resolution();
-      ShaderGlobal::set_color4(::get_shader_variable_id("retinal_damage_screen_position", true), screen_pos.x, screen_pos.y);
-      ShaderGlobal::set_real(::get_shader_variable_id("screen_aspect_ratio"), (float)render_resolution.x / (float)render_resolution.y);
-      ShaderGlobal::set_real(::get_shader_variable_id("retinal_damage_effect_scale"),
+      ShaderGlobal::set_float4(::get_shader_variable_id("retinal_damage_screen_position", true), screen_pos.x, screen_pos.y);
+      ShaderGlobal::set_float(::get_shader_variable_id("screen_aspect_ratio"),
+        (float)render_resolution.x / (float)render_resolution.y);
+      ShaderGlobal::set_float(::get_shader_variable_id("retinal_damage_effect_scale"),
         retinal_damage__scale * retinal_damage__base_scale);
-      ShaderGlobal::set_real(::get_shader_variable_id("retinal_damage_scale_increase_rate"), retinal_damage__scale_increase_rate);
+      ShaderGlobal::set_float(::get_shader_variable_id("retinal_damage_scale_increase_rate"), retinal_damage__scale_increase_rate);
 
       float seed = sin((pos.x + pos.y) * 1000.); // for better control over randomness of an appearing spot
-      ShaderGlobal::set_color4(::get_shader_variable_id("retinal_damage_seeds"), seed, cos(seed * 2.), sin(seed * 4.));
+      ShaderGlobal::set_float4(::get_shader_variable_id("retinal_damage_seeds"), seed, cos(seed * 2.), sin(seed * 4.));
 
       retinal_damage__tex.close();
       retinal_damage__tex = dag::create_tex(NULL, render_resolution.x / 2, render_resolution.y / 2, TEXFMT_R11G11B10F | TEXCF_RTARGET,
@@ -53,7 +56,7 @@ static void retinal_damage_es_event_handler(
         TIME_D3D_PROFILE(render_retinal_damage_tex);
         d3d::GpuAutoLock gpuLock;
         SCOPE_RENDER_TARGET;
-        d3d::set_render_target(retinal_damage__tex.getTex2D(), 0);
+        d3d::set_render_target({}, DepthAccess::RW, {{retinal_damage__tex.getTex2D(), 0, 0}});
         renderer.render();
       }
       retinal_damage__node_handle = dafg::register_node("retinal_damage_node", DAFG_PP_NODE_SRC, [](dafg::Registry registry) {
@@ -66,14 +69,14 @@ static void retinal_damage_es_event_handler(
 ECS_TAG(render)
 ECS_REQUIRE(Point3 retinal_damage__explosion_world_position, float retinal_damage__scale)
 ECS_ON_EVENT(on_disappear)
-static void retinal_damage_stop_es_event_handler(const ecs::Event &)
+static void retinal_damage_stop_es_event_handler(const ecs::Event &, ecs::EntityManager &manager)
 {
-  stop_retinal_damage_ecs_query(
-    [](dafg::NodeHandle &retinal_damage__node_handle, UniqueTexHolder &retinal_damage__tex, float &retinal_damage__remaining_time) {
-      retinal_damage__tex.close();
-      retinal_damage__remaining_time = 0.0;
-      ShaderGlobal::set_real(::get_shader_variable_id("retinal_damage_remaining_time_fraction", true), 0.0);
-      ShaderGlobal::set_real(::get_shader_variable_id("retinal_damage_opacity", true), 0.0);
-      retinal_damage__node_handle = dafg::NodeHandle();
-    });
+  stop_retinal_damage_ecs_query(manager, [](dafg::NodeHandle &retinal_damage__node_handle, UniqueTexWithShaderVar &retinal_damage__tex,
+                                           float &retinal_damage__remaining_time) {
+    retinal_damage__tex.close();
+    retinal_damage__remaining_time = 0.0;
+    ShaderGlobal::set_float(::get_shader_variable_id("retinal_damage_remaining_time_fraction", true), 0.0);
+    ShaderGlobal::set_float(::get_shader_variable_id("retinal_damage_opacity", true), 0.0);
+    retinal_damage__node_handle = dafg::NodeHandle();
+  });
 }

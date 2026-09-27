@@ -92,3 +92,15 @@ entity{
 entity{
   _template:t="lens_flare_renderer"
 }
+
+entity{
+  _template:t="dynamic_lighting"
+}
+
+entity{
+  _template:t="ui_nodes"
+}
+
+entity{
+  _template:t="film_grain_lut"
+}

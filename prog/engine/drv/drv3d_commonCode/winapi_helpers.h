@@ -1,11 +1,13 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
-#include <windows.h>
+#include <EASTL/fixed_vector.h>
 #include <EASTL/span.h>
 #include <EASTL/string_view.h>
 #include <EASTL/tuple.h>
 #include <EASTL/unique_ptr.h>
+
+#include <Windows.h>
 
 
 struct UnloadLibHandler
@@ -85,12 +87,48 @@ struct RegistryKey
 
   eastl::tuple<DWORD, DWORD, DWORD> queryValueCountMaxLengthAndSize() const;
 
-  eastl::string_view enumKeyName(DWORD index, eastl::span<char> buffer);
+  eastl::string_view enumKeyName(DWORD index, eastl::span<char> buffer) const;
 
-  eastl::string_view enumValueName(DWORD index, eastl::span<char> buffer);
+  eastl::string_view enumValueName(DWORD index, eastl::span<char> buffer) const;
 
   eastl::tuple<eastl::string_view, eastl::span<char>> enumValueNameAndValue(DWORD index, eastl::span<char> name_buffer,
-    eastl::span<char> data_buffer);
+    eastl::span<char> data_buffer) const;
 
   explicit operator bool() const { return static_cast<bool>(ptr); }
 };
+
+struct DeviceDesc
+{
+  constexpr DeviceDesc() = default;
+  constexpr DeviceDesc(uint16_t vendor_id, uint16_t device_id) : vendorId(vendor_id), deviceId(device_id) {}
+  DeviceDesc(const struct DXGI_ADAPTER_DESC &desc);
+  DeviceDesc(const struct DXGI_ADAPTER_DESC1 &desc);
+  constexpr bool isSoftwareDevice() const { return vendorId == 0x1414 && deviceId == 0x008C; }
+  uint16_t vendorId = 0;
+  uint16_t deviceId = 0;
+};
+
+eastl::fixed_vector<DeviceDesc, 8> getDisplayDevices();
+
+enum class GpuHwSchedulingState
+{
+  Unknown,
+  NotSupported,
+  Disabled,
+  Enabled
+};
+
+constexpr const char *to_string(GpuHwSchedulingState value)
+{
+  switch (value)
+  {
+    using enum GpuHwSchedulingState;
+    case Unknown: return "Unknown";
+    case NotSupported: return "NotSupported";
+    case Disabled: return "Disabled";
+    case Enabled: return "Enabled";
+  }
+  return "<invalid>";
+}
+
+GpuHwSchedulingState get_hw_scheduling_from_luid(const LUID &luid);

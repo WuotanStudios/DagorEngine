@@ -6,8 +6,10 @@
 
 #include <dag/dag_vector.h>
 #include <EASTL/unique_ptr.h>
+#include <EASTL/shared_ptr.h>
 #include <EASTL/fixed_function.h>
 #include <EASTL/optional.h>
+#include <EASTL/bitvector.h>
 #include <generic/dag_carray.h>
 #include <rendInst/riexHandle.h>
 #include <3d/dag_resPtr.h>
@@ -17,24 +19,32 @@
 #include <memory/dag_linearHeapAllocator.h>
 
 class Sbuffer;
+class CollisionResource;
+struct CollisionNode;
 
 class LRURendinstCollision
 {
 public:
   LRURendinstCollision();
   LRURendinstCollision(const LRURendinstCollision &) = delete;
-  ~LRURendinstCollision();
+
+  // The compute voxelizer packs a resource's tri count into the low 20 bits of its dispatch word
+  // (instance count takes the high 12) and skips anything bigger, so this is the largest face count
+  // one voxelizable collision resource may carry. Callers building such geometry must cap to it.
+  static constexpr uint32_t MAX_VOXELIZATION_TRIS = (1u << 20) - 1;
+
+  // the voxelization buffers and lru heaps carry fixed managed-resource names,
+  // so two live instances would alias each other's buffers: every user in a
+  // process must share the one instance this returns
+  static eastl::shared_ptr<LRURendinstCollision> acquire();
 
   bool updateLRU(dag::ConstSpan<rendinst::riex_handle_t> ri);
   void reset();
   void clearRiInfo();
-  bool canVoxelize() const { return (voxelizeCollisionElem || voxelize_collision_cs); }
-  void voxelize(dag::ConstSpan<rendinst::riex_handle_t> handles, VolTexture *color, VolTexture *alpha);
   void draw(dag::ConstSpan<rendinst::riex_handle_t> handles, VolTexture *color, VolTexture *alpha, uint32_t inst_mul,
     ShaderElement &elem, bool primitves = false);
   void dispatchInstances(dag::ConstSpan<rendinst::riex_handle_t> handles, VolTexture *color, VolTexture *alpha,
     ComputeShaderElement &cs);
-  ShaderElement *getVoxelizeCollisionElem() { return voxelizeCollisionElem; }
 
 protected:
   void drawInstances(dag::ConstSpan<rendinst::riex_handle_t> handles, VolTexture *color, VolTexture *alpha, uint32_t inst_mul,
@@ -50,6 +60,7 @@ protected:
     bool isEmpty() const { return ibSize == 0; }
   };
   dag::Vector<RiDataInfo> riInfo; // direct mapping.
+  eastl::bitvector<> riInfoSettled;
   RiDataInfo getRiData(uint32_t type);
   struct LRUEntry
   {
@@ -69,6 +80,16 @@ protected:
 
   carray<uint16_t, COLLISION_BOX_INDICES_NUM> boxIndices;
 
+  // Per-node voxelization vb byte size, or false if the node contributes nothing.
+  // A BOX has no faces to filter, so its whole-node material test lives here; a mesh/convex node is judged material-independently, and
+  // the per-face filter can still empty it.
+  // Both passes then have to drop it: the sizing pass by its face count, the fill pass by re-checking that count itself.
+  static bool voxelization_node_verts(const CollisionResource *coll_res, int ni, const CollisionNode *node, uint32_t &vb_size);
+  // Per-node voxelization ib/vb byte sizes, or false if the node contributes nothing.
+  // Counts faces, so it belongs to the sizing pass only.
+  static bool voxelization_node_size(const CollisionResource *coll_res, int ni, const CollisionNode *node, uint32_t &ib_size,
+    uint32_t &vb_size);
+
   void drawInstances(uint32_t st_inst, const uint32_t *types_counts, uint32_t batches, VolTexture *color, VolTexture *alpha,
     uint32_t inst_mul, bool prims);
   void dispatchInstances(uint32_t st_inst, const uint32_t *types_counts, uint32_t batches, VolTexture *color, VolTexture *alpha,
@@ -76,15 +97,12 @@ protected:
   using batch_instances_cb_t =
     eastl::fixed_function<sizeof(void *) * 4, void(uint32_t start_instance, const uint32_t *types_counts, uint32_t count)>;
   void batchInstances(const rendinst::riex_handle_t *begin, const rendinst::riex_handle_t *end, batch_instances_cb_t cb);
-  UniqueBufHolder instanceTms;
+  UniqueBufWithShaderVar instanceTms;
   LinearHeapAllocatorSbuffer vbAllocator, ibAllocator;
   UniqueBuf multiDrawBuf;
   bool supportNoOverwrite = false;
   uint32_t lastUpdatedInstance = 0;
   uint32_t lastFrameTmsUsed = 0;
-  eastl::unique_ptr<ComputeShaderElement> voxelize_collision_cs;
-  eastl::unique_ptr<ShaderMaterial> voxelizeCollisionMat;
-  ShaderElement *voxelizeCollisionElem = 0;
   serial_buffer::SerialBufferCounter serialBuf;
 
 public:
@@ -97,11 +115,10 @@ public:
     int vertexCount;
     int indexCount;
     int vertexStride;
+    int indexStride; // bytes per index; the shared ib heap is uniformly 32-bit
     int positionOffset;
     int positionFormat;
   };
 
   eastl::optional<MeshData> getModelData(int modelId) const;
-
-  static bool useSRVBuffers;
 };

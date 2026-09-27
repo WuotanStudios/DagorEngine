@@ -6,7 +6,6 @@ shader_root_dir:t="."
 include common_inc_dirs.blk
 source
 {
-  file:t = "../deferred_shadow.dshl"
   file:t = "../no_postfx_resolve.dshl"
   file:t = "../../../prog/gameLibs/vr/shaders/vrGuiSurface.dshl"
   file:t = "ssr_ps.dshl"
@@ -22,6 +21,7 @@ common_assume_vars {
   gi_quality:i=-1
   ssao_use_wsao:i=0
   gpu_objects_gpu_instancing:i=0
+  gpu_objects_is_grass:i=0
 }
 
 Compile
@@ -29,7 +29,7 @@ Compile
   fsh:t = 5.0
   group_size_in_kb:i=128
   assume_vars {
-    supports_sh_6_1:i = 0
+    supports_barycentrics:i = 0
     sparkles_enable:i=1
     static_shadows_cascades:i=1
     particles_buffer_id:i=-1
@@ -51,6 +51,7 @@ Compile
     envi_cover_intensity_map:i = 0
     current_ambient:i = 0
     in_editor:i = 1
+    force_in_editor:i = 0 // only for game shaders
     use_contact_shadows:i = 1
     use_vr_reprojection:i = 0
     depth_bounds_support:i = 0
@@ -58,12 +59,10 @@ Compile
     hero_ao:i = 0
     num_of_cascades:i=4
     compatibility_mode:i = 0
-    mobile_render:i=0
-    mobile_simplified_materials:i=0
     use_postfx:i = 1
+    film_grain_mode:i=1
     has_discard_without_prepass:i=0
     volumetric_light_assumed_off:i=1
-    froxel_fog_use_experimental_offscreen_reprojection:i = 0
     use_directional_blood_on_screen:i=0
     small_sampled_buffers:i=0
     assume_fom_shadows:i=1
@@ -74,9 +73,9 @@ Compile
     baked_impostor_multisample:i=1
     fx_apply_volfog_per_pixel:i=1
     fx_has_volfog_injection:i=1
-    froxel_fog_use_experimental_offscreen_reprojection:i = 0
     use_ssss:i=0
     ssss_quality:i=0
+    rendinst_render_type:i=0
     rendinst_use_cell_sbuffer:i=0
     special_vision:i=0
     grassify:i=1
@@ -85,7 +84,20 @@ Compile
     dagi_warp64_irradiance:i=0
     use_gui_glob_tm:i=0
     glass_rt_reflection:i=0
+    allow_rt_glass_reflection:i=0
     can_use_half_precision:i=0
+    deform_occupied_tiles_bitvector:i=0
+    need_character_microdetails_texture_check:i=1
+    character_micro_details:i=1
+    brdf_type:i=0
+    debug_torn_wounds:i=0
+    enable_ri_disintegration_animation:i=0
+    plod_gen:i=0
+    micro_details_quality:i=2
+    dafx_use_gravity_zone:i=1
+    max_flowmap_cascades:i=2
+    parallax_shadow_enabled:i=1
+    parallax_ao_enabled:i=1
   }
   required_shaders {}
 }
@@ -95,6 +107,5 @@ explicit_var_ref
 {
   include common_tools_var_ref.blk
   ref:t = in_editor
-  ref:t = random_pattern_tex
   ref:t = dafx_frame_boundary_buffer_enabled
 }

@@ -8,6 +8,7 @@
 #include "emitters.h"
 #include <EASTL/vector.h>
 #include <EASTL/bonus/tuple_vector.h>
+#include <memory/dag_framemem.h>
 
 namespace dafx
 {
@@ -126,8 +127,10 @@ enum : int
 
 #if DAFX_STAT
   INST_RENDERABLE_TRIS,
+  INST_STAT_GROUP,
 #else
   INST_RENDERABLE_TRIS = -1,
+  INST_STAT_GROUP = -1,
 #endif
 
 #if DAGOR_DBGLEVEL > 0
@@ -214,7 +217,8 @@ using InstanceStream = eastl::tuple_vector<InstanceId, // INST_RID
 
 #if DAFX_STAT
   ,
-  unsigned int // INST_RENDERABLE_TRIS
+  unsigned int, // INST_RENDERABLE_TRIS
+  uint8_t       // INST_STAT_GROUP
 #endif
 
 #if DAGOR_DBGLEVEL > 0
@@ -326,5 +330,6 @@ void set_instance_visibility_from_queue(Context &ctx);
 void set_instance_emission_rate_from_queue(Context &ctx);
 void set_instance_value_from_queue(Context &ctx);
 void adjust_buffer_size_by_quality(Context &ctx, const SystemTemplate &sys, int &cpu_size, int &gpu_size, bool force_dummy);
+void gather_subinstances(Context &ctx, int sid, uint32_t req_flags, uint32_t excl_flags, eastl::vector<int, framemem_allocator> &dst);
 } // namespace dafx
 DAG_DECLARE_RELOCATABLE(dafx::InstanceStream);

@@ -1,5 +1,6 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
+#include "debug/names.h"
 #include "device.h"
 
 #if D3D_HAS_RAY_TRACING
@@ -7,8 +8,8 @@ namespace
 {
 struct ShaderResourceUsageTableWithResourceTypes
 {
-  dxil::ShaderResourceUsageTable resourceUsageTable;
-  drv3d_dx12::RayTracePipelineResourceTypeTable resourceTypeTable;
+  dxil::ShaderResourceUsageTable resourceUsageTable{};
+  drv3d_dx12::RayTracePipelineResourceTypeTable resourceTypeTable{};
 };
 
 struct ShaderCollectionImportInfo
@@ -101,7 +102,8 @@ void append_name(eastl::wstring &target, const eastl::wstring_view prefix, Shade
   }
 
   target.append(begin(prefix), end(prefix));
-  to_dx12_lib(ref.library)->appendNameOfTo(ref.index, target);
+  auto name = to_dx12_lib(ref.library)->nameOf(ref.index);
+  target.append(name.begin(), name.end());
 }
 
 const wchar_t *make_hit_group_name(ShaderInLibraryReference any_hit, ShaderInLibraryReference closest_hit,
@@ -117,15 +119,21 @@ const wchar_t *make_hit_group_name(ShaderInLibraryReference any_hit, ShaderInLib
   return target.data();
 }
 
-const wchar_t *copy_string_to(DynamicArray<wchar_t> &&source, DynamicArray<wchar_t> &target)
+const wchar_t *copy_string_to(eastl::wstring_view source, auto &container)
 {
-  target = eastl::move(source);
+  if (source.empty())
+  {
+    return nullptr;
+  }
+  auto &target = container.emplace_back();
+  target.resize(source.length() + 1);
+  eastl::copy(source.begin(), source.begin() + target.size(), target.data());
   return target.data();
 }
 
-DynamicArray<wchar_t> name_of_shader_ref(const ShaderInLibraryReference &ref)
+eastl::wstring_view name_of_shader_ref(const ShaderInLibraryReference &ref)
 {
-  return InvalidShaderLibrary != ref.library ? to_dx12_lib(ref.library)->makeNameOfAsDynArray(ref.index) : DynamicArray<wchar_t>{};
+  return InvalidShaderLibrary != ref.library ? to_dx12_lib(ref.library)->nameOf(ref.index) : eastl::wstring_view{};
 }
 
 template <unsigned C>
@@ -137,7 +145,11 @@ struct AutoLifetimeTimer
   AutoLifetimeTimer(T maker) : timingFormatString{maker()}, timingData{timingFormatString.c_str()}
   {}
 
-  void abbortTiming() { timingData.fmt = nullptr; }
+  void abbortTiming()
+  {
+    if constexpr (requires { timingData.fmt; })
+      timingData.fmt = nullptr;
+  }
 };
 
 // TODO copy pasta from compute signature builder, needs to be refactored
@@ -208,6 +220,16 @@ struct RootSignatureGeneratorCallback
     // NYI
     G_UNUSED(space);
     G_UNUSED(index);
+  }
+  void useResourceDescriptorHeapIndexing()
+  {
+    signature->def.useResourceDescriptorHeapIndexing = true;
+    desc.Flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+  }
+  void useSamplerDescriptorHeapIndexing()
+  {
+    signature->def.useSamplerDescriptorHeapIndexing = true;
+    desc.Flags |= D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
   }
   void beginConstantBuffers()
   {
@@ -293,8 +315,8 @@ struct RootSignatureGeneratorCallback
     // compute has only one stage, all unbounded samplers should be added within a single begin-end block
     G_ASSERT(unboundedSamplersRootParam == nullptr);
     G_ASSERT(desc.NumParameters < countof(params));
-    //        signature->def.layout.bindlessSamplersParamIndex = desc.NumParameters++;
-    unboundedSamplersRootParam = &params[0 /*signature->def.layout.bindlessSamplersParamIndex*/];
+    signature->def.layout.bindlessSamplersParamIndex = desc.NumParameters++;
+    unboundedSamplersRootParam = &params[signature->def.layout.bindlessSamplersParamIndex];
     unboundedSamplersRootParam->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     unboundedSamplersRootParam->DescriptorTable.pDescriptorRanges = rangePosition;
     unboundedSamplersRootParam->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -348,8 +370,8 @@ struct RootSignatureGeneratorCallback
   void beginBindlessShaderResourceViews()
   {
     G_ASSERT(desc.NumParameters < countof(params));
-    //        signature->def.layout.bindlessShaderResourceViewParamIndex = desc.NumParameters++;
-    bindlessSRVRootParam = &params[0 /*signature->def.layout.bindlessShaderResourceViewParamIndex*/];
+    signature->def.layout.bindlessShaderResourceViewParamIndex = desc.NumParameters++;
+    bindlessSRVRootParam = &params[signature->def.layout.bindlessShaderResourceViewParamIndex];
     bindlessSRVRootParam->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     bindlessSRVRootParam->DescriptorTable.pDescriptorRanges = rangePosition;
     bindlessSRVRootParam->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -405,7 +427,8 @@ struct RootSignatureGeneratorCallback
 struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
 {
   PipelineBuilder(const ::raytrace::PipelineExpandInfo &ei, uint32_t min_rec, uint32_t min_pl, uint32_t min_attr,
-    const drv3d_dx12::RaytracePipelineSignature &rps, const drv3d_dx12::RayTracePipelineResourceTypeTable &rtprtt) :
+    bool allow_opacity_micro_maps, const drv3d_dx12::RaytracePipelineSignature &rps,
+    const drv3d_dx12::RayTracePipelineResourceTypeTable &rtprtt) :
     AutoLifetimeTimer<AFP_MSEC>{[&ei]() {
       eastl::string s;
       s = "DX12: PipelineBuilder: Expanding pipeline <";
@@ -416,17 +439,21 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     pipelineInfo{ei},
     minRecursion{min_rec},
     minPayload{min_pl},
-    minAttributes{min_attr}
+    minAttributes{min_attr},
+    allowOpacityMicroMaps{allow_opacity_micro_maps}
   {
     resourceUses.resourceUsageTable = rps.def.registers;
     resourceUses.resourceTypeTable = rtprtt;
+    useResourceDescriptorHeapIndexing = rps.def.useResourceDescriptorHeapIndexing;
+    useSamplerDescriptorHeapIndexing = rps.def.useSamplerDescriptorHeapIndexing;
     nameTable.reserve(ei.groupMemebers.size());
     for (auto m : ei.groupMemebers)
     {
       m.visit([this](const auto &member) { onMember(member); });
     }
   }
-  PipelineBuilder(const ::raytrace::PipelineCreateInfo &ci) :
+  PipelineBuilder(const ::raytrace::PipelineCreateInfo &ci, const drv3d_dx12::RayTracePipeline::BuildConfig &build_config,
+    bool device_allows_omm = false) :
     AutoLifetimeTimer<AFP_MSEC>{[&ci]() {
       eastl::string s;
       s = "DX12: PipelineBuilder: building pipeline <";
@@ -437,25 +464,50 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     pipelineInfo{ci},
     minRecursion{max<uint32_t>(1, ci.maxRecursionDepth)},
     minPayload{max<uint32_t>(4u, ci.maxPayloadSize)},
-    minAttributes{max<uint32_t>(sizeof(float) * 2, ci.maxAttributeSize)}
+    minAttributes{max<uint32_t>(sizeof(float) * 2, ci.maxAttributeSize)},
+    allowOpacityMicroMaps{ci.allowOpacityMicroMaps},
+    buildConfig{build_config},
+    combineLibraryOmm{true},
+    deviceAllowsOmm{device_allows_omm}
   {
     nameTable.reserve(ci.groupMemebers.size());
     for (auto m : ci.groupMemebers)
     {
       m.visit([this](const auto &member) { onMember(member); });
     }
+    // The single OMM device-support gate. Callers pass raw "wants OMM" (the C++ create-info seed above
+    // plus each library's DSHL opt-in OR-ed in during the visit); we AND device support here, once,
+    // right before the config subobject is built, so no other site has to repeat the check.
+    allowOpacityMicroMaps = allowOpacityMicroMaps && deviceAllowsOmm;
   }
   const ::raytrace::PipelineExpandInfo &pipelineInfo;
   const char *name() const { return pipelineInfo.name ? pipelineInfo.name : "UNKNOWN"; }
   bool isOk = true;
   ShaderResourceUsageTableWithResourceTypes resourceUses;
   eastl::vector<ShaderCollectionImportInfo> importInfos;
+  eastl::vector<D3D12_SHADER_BYTECODE> embeddedDxilLibraries;
   eastl::vector<D3D12_HIT_GROUP_DESC> hitGroups;
   dag::Vector<DynamicArray<wchar_t>> nameTable;
   dag::Vector<DynamicArray<wchar_t>> tempNameTable;
   uint32_t minRecursion = 1;
   uint32_t minPayload = 4;
   uint32_t minAttributes = sizeof(float) * 2;
+  bool allowOpacityMicroMaps = false;
+  // OR-reduced across the visited libraries: any library authored via a DSHL raytrace_pipeline block
+  // forces a CPU-side pipeline config even when useEmbeddedObjects would otherwise trust the DXIL one.
+  bool hasExplicitPipelineConfig = false;
+  bool useResourceDescriptorHeapIndexing = false;
+  bool useSamplerDescriptorHeapIndexing = false;
+  drv3d_dx12::RayTracePipeline::BuildConfig buildConfig;
+  // Fresh builds fold each library's DSHL OMM opt-in into the driver-built config; expansion inherits
+  // the base pipeline's (already gated) flag instead. deviceAllowsOmm applies the sole device gate.
+  bool combineLibraryOmm = false;
+  bool deviceAllowsOmm = false;
+  // Whether the driver emits the config subobjects itself. Embedded (collection) pipelines carry both
+  // in their DXIL, so the driver stays out of the way -- except that a DSHL raytrace_pipeline block
+  // always forces the pipeline config CPU-side. hasExplicitPipelineConfig is final only after the visit.
+  bool buildsShaderConfigCpuSide() const { return !buildConfig.useEmbeddedObjects; }
+  bool buildsPipelineConfigCpuSide() const { return !buildConfig.useEmbeddedObjects || hasExplicitPipelineConfig; }
   void onError()
   {
     isOk = false;
@@ -463,9 +515,19 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
   }
   void addImport(const drv3d_dx12::ShaderLibrary *lib, uint32_t index)
   {
-    auto shaderName = lib->makeNameOfAsDynArray(index);
-    if (0 == shaderName.size())
+    auto shaderName = lib->nameOf(index);
+    if (shaderName.empty())
     {
+      return;
+    }
+    if (lib->isEmbeddable())
+    {
+      // A DXIL_LIBRARY subobject exports every symbol of the library by its own name, so per-shader
+      // export tracking is unnecessary here; the raygen/hit/miss names still resolve by name.
+      const D3D12_SHADER_BYTECODE dxil = lib->getEmbeddableDxil();
+      if (eastl::find_if(begin(embeddedDxilLibraries), end(embeddedDxilLibraries),
+            [&](const D3D12_SHADER_BYTECODE &e) { return e.pShaderBytecode == dxil.pShaderBytecode; }) == end(embeddedDxilLibraries))
+        embeddedDxilLibraries.push_back(dxil);
       return;
     }
     auto importRef = eastl::find_if(begin(importInfos), end(importInfos),
@@ -476,7 +538,7 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
       importRef->desc.pExistingCollection = lib->get();
     }
     auto &newExport = importRef->exports.emplace_back();
-    newExport.Name = copy_string_to(eastl::move(shaderName), tempNameTable.emplace_back());
+    newExport.Name = copy_string_to(eastl::move(shaderName), tempNameTable);
     newExport.ExportToRename = nullptr;
     newExport.Flags = D3D12_EXPORT_FLAG_NONE;
     importRef->desc.NumExports = importRef->exports.size();
@@ -500,6 +562,13 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     }
 
     auto lib = to_dx12_lib(shader_ref.library);
+    if (shader_ref.index >= lib->shaderCount())
+    {
+      D3D_ERROR("DX12: RayTracePipeline::PipelineBuilder: shader index %u is out of range for library <%s>", shader_ref.index,
+        lib->name());
+      onError();
+      return false;
+    }
     if (pipelineInfo.expandable)
     {
       if (!lib->canBeUsedByExpandablePipelines())
@@ -516,8 +585,8 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
 
     logdbg("DX12: RayTracePipeline::PipelineBuilder: Trying to merge resource usages");
     bool hasConflict = false;
-    auto newUses =
-      merge(resourceUses, lib->getShaderPropertiesOf(shader_ref.index).resourceUsageTable, lib->getGlobalResourceInfo(), hasConflict);
+    auto &properties = lib->getShaderPropertiesOf(shader_ref.index);
+    auto newUses = merge(resourceUses, properties.resourceUsageTable, lib->getGlobalResourceInfo(), hasConflict);
     if (hasConflict)
     {
       D3D_ERROR("DX12: RayTracePipeline::PipelineBuilder: Unable to merge resource usages of shaders");
@@ -528,10 +597,34 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
 
     resourceUses = newUses;
 
-    auto &properties = lib->getShaderPropertiesOf(shader_ref.index);
+    uint64_t requirementMask = drv3d_dx12::get_feature_requirement_mask(properties.deviceRequirement);
+    useResourceDescriptorHeapIndexing =
+      useResourceDescriptorHeapIndexing || 0 != (D3D_SHADER_REQUIRES_RESOURCE_DESCRIPTOR_HEAP_INDEXING & requirementMask);
+    useSamplerDescriptorHeapIndexing =
+      useSamplerDescriptorHeapIndexing || 0 != (D3D_SHADER_REQUIRES_SAMPLER_DESCRIPTOR_HEAP_INDEXING & requirementMask);
+
     minRecursion = max<uint32_t>(minRecursion, properties.maxRecusionDepth);
     minPayload = max<uint32_t>(minPayload, properties.maxPayloadSizeInBytes);
     minAttributes = max<uint32_t>(minAttributes, properties.maxAttributeSizeInBytes);
+
+    hasExplicitPipelineConfig =
+      hasExplicitPipelineConfig || 0 != (properties.rtPipelineFlags & dxil::RT_PIPELINE_FLAG_HAS_EXPLICIT_CONFIG);
+
+    // When the driver builds the pipeline config itself, a library that carries a DXIL-embedded
+    // RaytracingPipelineConfig would produce a second, conflicting config subobject in the state
+    // object. Reject it up front instead of letting CreateStateObject fail obscurely.
+    if (buildsPipelineConfigCpuSide() && 0 != (properties.rtPipelineFlags & dxil::RT_PIPELINE_FLAG_HAS_DXIL_CONFIG))
+    {
+      D3D_ERROR("DX12: RayTracePipeline::PipelineBuilder: shader library <%s> carries a DXIL-embedded RaytracingPipelineConfig, "
+                "which conflicts with the driver-built pipeline config; author a raytrace_pipeline DSHL block instead",
+        lib->name());
+      onError();
+      return false;
+    }
+    // Fold this library's DSHL OMM opt-in into the raw "wants OMM"; device gating happens once in the
+    // build-ctor after all libraries are visited.
+    if (combineLibraryOmm)
+      allowOpacityMicroMaps = allowOpacityMicroMaps || 0 != (properties.rtPipelineFlags & dxil::RT_PIPELINE_FLAG_ALLOW_OMM);
 
     addImport(lib, shader_ref.index);
 
@@ -542,27 +635,27 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
   {
     if (addResourceUsageTable(member.rayGen, false))
     {
-      copy_string_to(name_of_shader_ref(member.rayGen), nameTable.emplace_back());
+      copy_string_to(name_of_shader_ref(member.rayGen), nameTable);
     }
   }
   void onMember(const raytrace::MissShaderGroupMember &member)
   {
     if (addResourceUsageTable(member.miss, false))
     {
-      copy_string_to(name_of_shader_ref(member.miss), nameTable.emplace_back());
+      copy_string_to(name_of_shader_ref(member.miss), nameTable);
     }
   }
   void onMember(const raytrace::CallableShaderGroupMember &member)
   {
     if (addResourceUsageTable(member.callable, false))
     {
-      copy_string_to(name_of_shader_ref(member.callable), nameTable.emplace_back());
+      copy_string_to(name_of_shader_ref(member.callable), nameTable);
     }
   }
   void onMember(const raytrace::TriangleShaderGroupMember &member)
   {
     bool hasHit = addResourceUsageTable(member.anyHit, true);
-    bool hasCHit = addResourceUsageTable(member.closestHit, !hasHit);
+    bool hasCHit = addResourceUsageTable(member.closestHit, hasHit);
 
     if (hasHit || hasCHit)
     {
@@ -570,25 +663,25 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
       hitGroup.HitGroupExport =
         make_hit_group_name(member.anyHit, member.closestHit, {InvalidShaderLibrary, 0}, nameTable.emplace_back());
       hitGroup.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-      hitGroup.AnyHitShaderImport = copy_string_to(name_of_shader_ref(member.anyHit), tempNameTable.emplace_back());
-      hitGroup.ClosestHitShaderImport = copy_string_to(name_of_shader_ref(member.closestHit), tempNameTable.emplace_back());
+      hitGroup.AnyHitShaderImport = copy_string_to(name_of_shader_ref(member.anyHit), tempNameTable);
+      hitGroup.ClosestHitShaderImport = copy_string_to(name_of_shader_ref(member.closestHit), tempNameTable);
       hitGroup.IntersectionShaderImport = nullptr;
     }
   }
   void onMember(const raytrace::ProceduralShaderGroupMember &member)
   {
     bool hasHit = addResourceUsageTable(member.anyHit, true);
-    bool hasCHit = addResourceUsageTable(member.closestHit, !hasHit);
+    bool hasCHit = addResourceUsageTable(member.closestHit, hasHit);
     bool hasIsec = addResourceUsageTable(member.intersection, false);
 
     if ((hasHit || hasCHit) && hasIsec)
     {
       D3D12_HIT_GROUP_DESC &hitGroup = hitGroups.emplace_back();
       hitGroup.HitGroupExport = make_hit_group_name(member.anyHit, member.closestHit, member.intersection, nameTable.emplace_back());
-      hitGroup.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-      hitGroup.AnyHitShaderImport = copy_string_to(name_of_shader_ref(member.anyHit), tempNameTable.emplace_back());
-      hitGroup.ClosestHitShaderImport = copy_string_to(name_of_shader_ref(member.closestHit), tempNameTable.emplace_back());
-      hitGroup.IntersectionShaderImport = copy_string_to(name_of_shader_ref(member.intersection), tempNameTable.emplace_back());
+      hitGroup.Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
+      hitGroup.AnyHitShaderImport = copy_string_to(name_of_shader_ref(member.anyHit), tempNameTable);
+      hitGroup.ClosestHitShaderImport = copy_string_to(name_of_shader_ref(member.closestHit), tempNameTable);
+      hitGroup.IntersectionShaderImport = copy_string_to(name_of_shader_ref(member.intersection), tempNameTable);
     }
   }
 
@@ -600,29 +693,42 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     generator.signature = &target;
     target.def.registers = resourceUses.resourceUsageTable;
     type_table = resourceUses.resourceTypeTable;
-    decode_compute_root_signature(true, resourceUses.resourceUsageTable, generator);
+    decode_compute_root_signature(
+      {
+        .hasAccelerationStructure = true,
+        .useResourceDescriptorHeapIndexing = useResourceDescriptorHeapIndexing,
+        .useSamplerDescriptorHeapIndexing = useSamplerDescriptorHeapIndexing,
+      },
+      resourceUses.resourceUsageTable, generator);
     logdbg("DX12: Completed with %u parameters, creating object", generator.desc.NumParameters);
     ComPtr<ID3DBlob> rootSignBlob;
     ComPtr<ID3DBlob> errorBlob;
 
     if (DX12_CHECK_FAIL(serializer(&generator.desc, D3D_ROOT_SIGNATURE_VERSION_1, &rootSignBlob, &errorBlob)))
     {
-      D3D_ERROR("DX12: D3D12SerializeRootSignature failed with %s", reinterpret_cast<const char *>(errorBlob->GetBufferPointer()));
+      D3D_ERROR("DX12: D3D12SerializeRootSignature failed with %s",
+        errorBlob ? reinterpret_cast<const char *>(errorBlob->GetBufferPointer()) : "unknown error");
       return false;
     }
 
     auto errorCode = DX12_CHECK_RESULT(
       device->CreateRootSignature(0, rootSignBlob->GetBufferPointer(), rootSignBlob->GetBufferSize(), COM_ARGS(&target.signature)));
-    return DX12_CHECK_OK(errorCode);
+    if (!DX12_CHECK_OK(errorCode))
+    {
+      return false;
+    }
+    drv3d_dx12::debug::name_object(target.signature.Get(), drv3d_dx12::debug::make_pool_object_name("RayTraceRootSignature"));
+    return true;
   }
 
   ComPtr<ID3D12StateObject> createPipeline(ID3D12Device5 *device, ID3D12RootSignature *signature)
   {
     eastl::vector<D3D12_STATE_SUBOBJECT> subObjects;
-    subObjects.reserve(4 + importInfos.size() + hitGroups.size());
+    subObjects.reserve(4 + importInfos.size() + embeddedDxilLibraries.size() + hitGroups.size());
 
-    D3D12_STATE_OBJECT_CONFIG config;
-    config.Flags = D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
+    D3D12_STATE_OBJECT_CONFIG config{};
+    if (pipelineInfo.expandable)
+      config.Flags = D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
     D3D12_STATE_SUBOBJECT configSubObject{D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &config};
     subObjects.push_back(configSubObject);
 
@@ -633,12 +739,40 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     eastl::transform(begin(importInfos), end(importInfos), eastl::back_inserter(subObjects),
       [](const auto &e) { return D3D12_STATE_SUBOBJECT{D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &e.desc}; });
 
+    eastl::vector<D3D12_DXIL_LIBRARY_DESC> libDescs;
+    libDescs.reserve(embeddedDxilLibraries.size());
+    for (const D3D12_SHADER_BYTECODE &dxil : embeddedDxilLibraries)
+    {
+      auto &libDesc = libDescs.emplace_back();
+      libDesc.DXILLibrary = dxil;
+      libDesc.NumExports = 0;
+      libDesc.pExports = nullptr;
+      subObjects.push_back({D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc});
+    }
+
     D3D12_RAYTRACING_SHADER_CONFIG rtCFG{minPayload, minAttributes};
-    D3D12_STATE_SUBOBJECT rtCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &rtCFG};
-    subObjects.push_back(rtCFGSubObject);
+    if (buildsShaderConfigCpuSide())
+    {
+      D3D12_STATE_SUBOBJECT rtCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &rtCFG};
+      subObjects.push_back(rtCFGSubObject);
+    }
+
     D3D12_RAYTRACING_PIPELINE_CONFIG pCFG{minRecursion};
-    D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pCFG};
-    subObjects.push_back(pCFGSubObject);
+#if DX12_HAS_OMM_INTERFACE
+    D3D12_RAYTRACING_PIPELINE_CONFIG1 pCFG1{minRecursion,
+      allowOpacityMicroMaps ? D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS : D3D12_RAYTRACING_PIPELINE_FLAG_NONE};
+    if (allowOpacityMicroMaps)
+    {
+      D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1, &pCFG1};
+      subObjects.push_back(pCFGSubObject);
+    }
+    else
+#endif
+      if (buildsPipelineConfigCpuSide())
+    {
+      D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pCFG};
+      subObjects.push_back(pCFGSubObject);
+    }
 
     eastl::transform(begin(hitGroups), end(hitGroups), eastl::back_inserter(subObjects),
       [](const auto &desc) { return D3D12_STATE_SUBOBJECT{D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &desc}; });
@@ -648,7 +782,11 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     desc.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
     desc.NumSubobjects = subObjects.size();
     desc.pSubobjects = subObjects.data();
-    device->CreateStateObject(&desc, COM_ARGS(&o));
+    if (DX12_CHECK_FAIL(device->CreateStateObject(&desc, COM_ARGS(&o))))
+    {
+      D3D_ERROR("DX12: Failed to create RT pipeline");
+    }
+    drv3d_dx12::debug::name_object(o.Get(), drv3d_dx12::debug::format_object_name("RayTracePipeline:%s", name()));
     return o;
   }
 
@@ -657,8 +795,9 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     eastl::vector<D3D12_STATE_SUBOBJECT> subObjects;
     subObjects.reserve(4 + importInfos.size() + hitGroups.size());
 
-    D3D12_STATE_OBJECT_CONFIG config;
-    config.Flags = D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
+    D3D12_STATE_OBJECT_CONFIG config{};
+    if (pipelineInfo.expandable)
+      config.Flags = D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
     D3D12_STATE_SUBOBJECT configSubObject{D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &config};
     subObjects.push_back(configSubObject);
 
@@ -670,11 +809,28 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
       [](const auto &e) { return D3D12_STATE_SUBOBJECT{D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &e.desc}; });
 
     D3D12_RAYTRACING_SHADER_CONFIG rtCFG{minPayload, minAttributes};
-    D3D12_STATE_SUBOBJECT rtCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &rtCFG};
-    subObjects.push_back(rtCFGSubObject);
+    if (buildsShaderConfigCpuSide())
+    {
+      D3D12_STATE_SUBOBJECT rtCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &rtCFG};
+      subObjects.push_back(rtCFGSubObject);
+    }
+
     D3D12_RAYTRACING_PIPELINE_CONFIG pCFG{minRecursion};
-    D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pCFG};
-    subObjects.push_back(pCFGSubObject);
+#if DX12_HAS_OMM_INTERFACE
+    D3D12_RAYTRACING_PIPELINE_CONFIG1 pCFG1{minRecursion,
+      allowOpacityMicroMaps ? D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS : D3D12_RAYTRACING_PIPELINE_FLAG_NONE};
+    if (allowOpacityMicroMaps)
+    {
+      D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1, &pCFG1};
+      subObjects.push_back(pCFGSubObject);
+    }
+    else
+#endif
+      if (buildsPipelineConfigCpuSide())
+    {
+      D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pCFG};
+      subObjects.push_back(pCFGSubObject);
+    }
 
     eastl::transform(begin(hitGroups), end(hitGroups), eastl::back_inserter(subObjects),
       [](const auto &desc) { return D3D12_STATE_SUBOBJECT{D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &desc}; });
@@ -684,7 +840,11 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     desc.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
     desc.NumSubobjects = subObjects.size();
     desc.pSubobjects = subObjects.data();
-    device->AddToStateObject(&desc, base, COM_ARGS(&o));
+    if (DX12_CHECK_FAIL(device->AddToStateObject(&desc, base, COM_ARGS(&o))))
+    {
+      D3D_ERROR("DX12: Failed to add to RT pipeline");
+    }
+    drv3d_dx12::debug::name_object(o.Get(), drv3d_dx12::debug::format_object_name("ExpandedRayTracePipeline:%s", name()));
     return o;
   }
 
@@ -695,8 +855,9 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     eastl::vector<D3D12_STATE_SUBOBJECT> subObjects;
     subObjects.reserve(4 + importInfos.size() + hitGroups.size() + base_imports.size() + base_hit_groups.size());
 
-    D3D12_STATE_OBJECT_CONFIG config;
-    config.Flags = D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
+    D3D12_STATE_OBJECT_CONFIG config{};
+    if (pipelineInfo.expandable)
+      config.Flags = D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
     D3D12_STATE_SUBOBJECT configSubObject{D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &config};
     subObjects.push_back(configSubObject);
 
@@ -710,11 +871,28 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
       [](const auto &e) { return D3D12_STATE_SUBOBJECT{D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &e}; });
 
     D3D12_RAYTRACING_SHADER_CONFIG rtCFG{minPayload, minAttributes};
-    D3D12_STATE_SUBOBJECT rtCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &rtCFG};
-    subObjects.push_back(rtCFGSubObject);
+    if (buildsShaderConfigCpuSide())
+    {
+      D3D12_STATE_SUBOBJECT rtCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &rtCFG};
+      subObjects.push_back(rtCFGSubObject);
+    }
+
     D3D12_RAYTRACING_PIPELINE_CONFIG pCFG{minRecursion};
-    D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pCFG};
-    subObjects.push_back(pCFGSubObject);
+#if DX12_HAS_OMM_INTERFACE
+    D3D12_RAYTRACING_PIPELINE_CONFIG1 pCFG1{minRecursion,
+      allowOpacityMicroMaps ? D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS : D3D12_RAYTRACING_PIPELINE_FLAG_NONE};
+    if (allowOpacityMicroMaps)
+    {
+      D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1, &pCFG1};
+      subObjects.push_back(pCFGSubObject);
+    }
+    else
+#endif
+      if (buildsPipelineConfigCpuSide())
+    {
+      D3D12_STATE_SUBOBJECT pCFGSubObject{D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pCFG};
+      subObjects.push_back(pCFGSubObject);
+    }
 
     eastl::transform(begin(hitGroups), end(hitGroups), eastl::back_inserter(subObjects), [](const auto &desc) {
       return D3D12_STATE_SUBOBJECT{D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &desc};
@@ -729,47 +907,12 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
     desc.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
     desc.NumSubobjects = subObjects.size();
     desc.pSubobjects = subObjects.data();
-    device->CreateStateObject(&desc, COM_ARGS(&o));
+    if (DX12_CHECK_FAIL(device->CreateStateObject(&desc, COM_ARGS(&o))))
+    {
+      D3D_ERROR("DX12: Failed to create RT pipeline");
+    }
+    drv3d_dx12::debug::name_object(o.Get(), drv3d_dx12::debug::format_object_name("RebuiltRayTracePipeline:%s", name()));
     return o;
-  }
-
-  // stores all names next to each other in name_store and outputs the table of name string pointers into shader_names
-  void exportShaderRefData(DynamicArray<const wchar_t *> &shader_names, DynamicArray<wchar_t> &name_store)
-  {
-    auto totalSize = eastl::accumulate(begin(nameTable), end(nameTable), 0, [](size_t v, const auto &e) { return v + e.size(); });
-
-    name_store.resize(totalSize);
-    shader_names.resize(nameTable.size());
-
-    size_t offset = 0;
-    eastl::transform(begin(nameTable), end(nameTable), shader_names.data(), [&name_store, &offset](const auto &e) {
-      auto target = name_store.data() + offset;
-      eastl::copy(e.data(), e.data() + e.size(), target);
-      offset += e.size();
-      return target;
-    });
-  }
-
-  void exportShaderRefData(DynamicArray<const wchar_t *> &shader_names, DynamicArray<wchar_t> &name_store,
-    const DynamicArray<const wchar_t *> &base_shader_names, const DynamicArray<wchar_t> &base_name_store)
-  {
-    auto totalSize = eastl::accumulate(begin(nameTable), end(nameTable), 0, [](size_t v, const auto &e) { return v + e.size(); });
-
-    name_store.resize(totalSize + base_name_store.size());
-    eastl::copy(base_name_store.data(), base_name_store.data() + base_name_store.size(), name_store.data());
-
-    shader_names.resize(nameTable.size() + base_shader_names.size());
-    eastl::transform(base_shader_names.data(), base_shader_names.data() + base_shader_names.size(), shader_names.data(),
-      [&](const wchar_t *str) { return name_store.data() + (str - base_name_store.data()); });
-
-    size_t offset = base_name_store.size();
-    eastl::transform(begin(nameTable), end(nameTable), shader_names.data() + base_shader_names.size(),
-      [&name_store, &offset](const auto &e) {
-        auto target = name_store.data() + offset;
-        eastl::copy(e.data(), e.data() + e.size(), target);
-        offset += e.size();
-        return target;
-      });
   }
 
   // visitor should return false to exit early
@@ -791,12 +934,16 @@ struct PipelineBuilder : AutoLifetimeTimer<AFP_MSEC>
   bool hasEqualRootSignature(const drv3d_dx12::RaytracePipelineSignature &rps,
     const drv3d_dx12::RayTracePipelineResourceTypeTable &rtprtt) const
   {
+    if (useResourceDescriptorHeapIndexing != rps.def.useResourceDescriptorHeapIndexing)
+      return false;
+    if (useSamplerDescriptorHeapIndexing != rps.def.useSamplerDescriptorHeapIndexing)
+      return false;
     return equals(resourceUses, rps.def.registers, rtprtt);
   }
 };
 } // namespace
 
-bool drv3d_dx12::RayTracePipeline::build(AnyDevicePtr device_ptr, bool has_native_expand,
+bool drv3d_dx12::RayTracePipeline::build(AnyDevicePtr device_ptr, bool has_native_expand, bool device_allows_omm,
   PFN_D3D12_SERIALIZE_ROOT_SIGNATURE serializer, RayTracePipeline *base, const ::raytrace::PipelineCreateInfo &ci)
 {
   if (ci.name)
@@ -817,7 +964,7 @@ bool drv3d_dx12::RayTracePipeline::build(AnyDevicePtr device_ptr, bool has_nativ
   {
     return false;
   }
-  PipelineBuilder pipelineBuilder{ci};
+  PipelineBuilder pipelineBuilder{ci, {}, device_allows_omm};
 
   if (!pipelineBuilder.isOk)
   {
@@ -897,11 +1044,82 @@ bool drv3d_dx12::RayTracePipeline::build(AnyDevicePtr device_ptr, bool has_nativ
 
   if (ci.expandable)
   {
-    expansionData.minRecursion = pipelineBuilder.minRecursion;
-    expansionData.minPayload = pipelineBuilder.minPayload;
-    expansionData.minAttributes = pipelineBuilder.minAttributes;
-    expansionData.isSupported = true;
+    expansionData = ExpansionSupportData{
+      .minRecursion = pipelineBuilder.minRecursion,
+      .minPayload = pipelineBuilder.minPayload,
+      .minAttributes = pipelineBuilder.minAttributes,
+      .allowOpacityMicroMaps = pipelineBuilder.allowOpacityMicroMaps,
+    };
   }
+  return true;
+}
+
+// TODO refactor common stuff into helpers
+bool drv3d_dx12::RayTracePipeline::build(D3DDevice *device, const RaytracePipelineSignature &root_signature,
+  const RayTracePipelineResourceTypeTable &res_type_table, const ::raytrace::PipelineCreateInfo &ci, const BuildConfig &build_config,
+  bool device_allows_omm)
+{
+  G_ASSERTF(false == ci.expandable, "DX12: [DRIVER BUG] Can not allow expansion for internal ray trace pipelines");
+  if (ci.name)
+  {
+    debugName = ci.name;
+  }
+
+  PipelineBuilder pipelineBuilder{ci, build_config, device_allows_omm};
+
+  if (!pipelineBuilder.isOk)
+  {
+    return false;
+  }
+
+  if (!pipelineBuilder.hasEqualRootSignature(root_signature, res_type_table))
+  {
+    pipelineBuilder.onError();
+    // if we end up here, there is a bug somewhere
+    D3D_ERROR(
+      "DX12: [DRIVER BUG] Trying to build a ray trace pipeline with predefined root signature that does not match the pipelines "
+      "needs");
+    return false;
+  }
+
+  rootSignature = root_signature;
+  resourceTypeTable = res_type_table;
+
+  object = pipelineBuilder.createPipeline(device, rootSignature.signature.Get());
+  if (!object)
+  {
+    pipelineBuilder.onError();
+    return false;
+  }
+
+  ComPtr<ID3D12StateObjectProperties> objectProperties;
+  object.As(&objectProperties);
+  if (!objectProperties)
+  {
+    D3D_ERROR("DX12: Unable to obtain pipeline properties interface");
+    pipelineBuilder.onError();
+    return false;
+  }
+
+  shaderReferenceTableStorage.resize(ci.groupMemebers.size() * D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+  bool hadError = !pipelineBuilder.visitShaderNames(
+    [target = shaderReferenceTableStorage.data(), props = objectProperties.Get()](uint32_t index, const wchar_t *name) {
+      auto ptr = props->GetShaderIdentifier(name);
+      if (!ptr)
+      {
+        return false;
+      }
+      memcpy(&target[index * D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES], ptr, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+      return true;
+    });
+
+  if (hadError)
+  {
+    D3D_ERROR("DX12: Error while obtaining shader identifiers");
+    pipelineBuilder.onError();
+    return false;
+  }
+
   return true;
 }
 
@@ -913,8 +1131,8 @@ drv3d_dx12::RayTracePipeline *drv3d_dx12::RayTracePipeline::expand(ID3D12Device7
     logwarn("DX12: Attempted to expand ray trace pipeline that does not support expansion");
     return nullptr;
   }
-  PipelineBuilder pipelineBuilder{
-    ei, expansionData.minRecursion, expansionData.minPayload, expansionData.minAttributes, rootSignature, resourceTypeTable};
+  PipelineBuilder pipelineBuilder{ei, expansionData->minRecursion, expansionData->minPayload, expansionData->minAttributes,
+    expansionData->allowOpacityMicroMaps, rootSignature, resourceTypeTable};
 
   if (!pipelineBuilder.isOk)
   {
@@ -987,10 +1205,12 @@ drv3d_dx12::RayTracePipeline *drv3d_dx12::RayTracePipeline::expand(ID3D12Device7
 
   if (ei.expandable)
   {
-    newObject->expansionData.minRecursion = pipelineBuilder.minRecursion;
-    newObject->expansionData.minPayload = pipelineBuilder.minPayload;
-    newObject->expansionData.minAttributes = pipelineBuilder.minAttributes;
-    newObject->expansionData.isSupported = true;
+    newObject->expansionData = ExpansionSupportData{
+      .minRecursion = pipelineBuilder.minRecursion,
+      .minPayload = pipelineBuilder.minPayload,
+      .minAttributes = pipelineBuilder.minAttributes,
+      .allowOpacityMicroMaps = pipelineBuilder.allowOpacityMicroMaps,
+    };
   }
   return newObject.release();
 }

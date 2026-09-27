@@ -133,7 +133,9 @@ namespace das {
             DAS_PROFILE_NODE \
             auto prv = (char **) subexpr.compute##COMPUTE(context); \
             if ( !prv || !*prv ) context.throw_error_at(debugInfo,"dereferencing null pointer%s",errorMessage); \
-            return v_ldu((const float *) ((*prv)+offset)); \
+            vec4f __r; \
+            DAS_LDU_WORKHORSE(__r, (*prv)+offset, CTYPE); \
+            return __r; \
         } \
     };
 
@@ -150,7 +152,9 @@ namespace das {
         DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override { \
             DAS_PROFILE_NODE \
             auto prv = (char **) subexpr.compute##COMPUTE(context); \
-            return v_ldu((const float *) ((*prv)+offset)); \
+            vec4f __r; \
+            DAS_LDU_WORKHORSE(__r, (*prv)+offset, CTYPE); \
+            return __r; \
         } \
     };
 
@@ -165,11 +169,11 @@ namespace das {
     {
         REGISTER_OP1_WORKHORSE_FUSION_POINT(FieldDerefR2V);
         REGISTER_OP1_NUMERIC_VEC(FieldDerefR2V);
-        (**g_fusionEngine)["FieldDeref"].emplace_back(new Op1FusionPoint_FieldDeref_vec4f());
+        (*getFusionEngine())["FieldDeref"].emplace_back(new Op1FusionPoint_FieldDeref_vec4f());
 
         REGISTER_OP1_WORKHORSE_FUSION_POINT(PtrFieldDerefR2V);
         REGISTER_OP1_NUMERIC_VEC(PtrFieldDerefR2V);
-        (**g_fusionEngine)["PtrFieldDeref"].emplace_back(new Op1FusionPoint_PtrFieldDeref_vec4f());
+        (*getFusionEngine())["PtrFieldDeref"].emplace_back(new Op1FusionPoint_PtrFieldDeref_vec4f());
     }
 }
 

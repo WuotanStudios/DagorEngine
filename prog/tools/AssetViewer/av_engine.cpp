@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "av_appwnd.h"
+#include "av_environment.h"
 #include "av_mainAssetSelector.h"
 #include "av_plugin.h"
 #include "assetBuildCache.h"
@@ -17,12 +18,12 @@
 
 #include <3d/dag_render.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_matricesAndPerspective.h>
 #include <3d/dag_texPackMgr2.h>
 #include <3d/dag_stereoIndex.h>
 #include <shaders/dag_shaders.h>
 #include <shaders/dag_shaderMesh.h>
 #include <shaders/dag_shaderBlock.h>
-#include <render/dag_cur_view.h>
 
 #include <EditorCore/ec_gizmofilter.h>
 
@@ -38,6 +39,7 @@
 #include <gameRes/dag_gameResSystem.h>
 
 #include <propPanel/control/panelWindow.h>
+#include <propPanel/control/toolbarContainer.h>
 
 #include <EASTL/vector_set.h>
 
@@ -55,12 +57,13 @@ extern void *get_generic_color_range_service();
 extern void *get_generic_rendinstgen_service();
 extern void *get_generic_spline_gen_service();
 extern void *get_generic_wind_service();
+extern void *get_dng_based_wind_service();
 extern void *get_pixel_perfect_selection_service();
 extern void *get_visibility_finder_service();
 
 extern void terminate_interface_de3();
 extern InitOnDemand<DebugTexOverlay> av_show_tex_helper;
-
+extern EditorCommandSystem editor_command_system;
 
 static int worldViewPosVarId = -2;
 
@@ -91,9 +94,9 @@ static void getAssetReferencesRecursively(DagorAsset &asset, eastl::vector_set<D
 
 static bool hasAssetBeenLoadedPreviouslyInThisSession(DagorAsset &asset)
 {
-  const int resId = dabuildcache::get_asset_res_id(asset);
-  const int classId = get_game_res_class_id(resId);
-  return classId != 0 && is_game_resource_loaded(GAMERES_HANDLE_FROM_STRING(asset.getName()), classId);
+  auto resId = dabuildcache::get_asset_res_id(asset);
+  auto classId = get_game_res_class_id(resId);
+  return classId != 0 && is_game_resource_loaded(asset.getName(), classId);
 }
 
 static void logAssetBuildWarningsForASingleAsset(DagorAsset &asset)
@@ -147,6 +150,8 @@ void AssetViewerApp::terminateInterface()
     del_it(plugin[i]);
   }
 
+  free_unused_game_resources();
+  reset_game_resources();
   terminate_interface_de3();
   IEditorCoreEngine::set(NULL);
 }
@@ -183,7 +188,7 @@ void *AssetViewerApp::queryEditorInterfacePtr(unsigned huid)
     return get_generic_spline_gen_service();
 
   if (huid == HUID_IWindService)
-    return !useDngBasedSceneRender ? get_generic_wind_service() : nullptr;
+    return useDngBasedSceneRender ? get_dng_based_wind_service() : get_generic_wind_service();
 
   if (huid == HUID_IPixelPerfectSelectionService)
     return get_pixel_perfect_selection_service();
@@ -191,19 +196,24 @@ void *AssetViewerApp::queryEditorInterfacePtr(unsigned huid)
   if (huid == HUID_IVisibilityFinderProvider)
     return get_visibility_finder_service();
 
+  if (huid == IEditorCommandSystem::HUID)
+    return &editor_command_system;
+
   RETURN_INTERFACE(huid, IMainWindowImguiRenderingService);
+  RETURN_INTERFACE(huid, IEditorCommandKeyChordChangeEventHandler);
+  RETURN_INTERFACE(huid, IGridSettingChangeEventHandler);
 
   return NULL;
 }
 
-void AssetViewerApp::screenshotRender(bool skip_debug_objects)
+void AssetViewerApp::screenshotRender(const Driver3dPerspective &persp, bool is_ortho, bool skip_debug_objects)
 {
   const bool lastSkipDebugObjects = skipRenderObjects;
 
   skipRenderObjects = skip_debug_objects;
   skipSetViewProj = true;
 
-  queryEditorInterface<IDynRenderService>()->renderScreenshot();
+  queryEditorInterface<IDynRenderService>()->renderScreenshot(persp, is_ortho, skipRenderObjects);
 
   skipSetViewProj = false;
   skipRenderObjects = lastSkipDebugObjects;
@@ -295,6 +305,9 @@ void AssetViewerApp::switchToPlugin(int id)
     return;
   }
 
+  if (curAsset)
+    logdbg("Switching to asset \"%s\".", curAsset->getNameTypified().c_str());
+
   if (curAsset && assetBuildWarningDisplay != AssetBuildWarningDisplay::ShowWhenBuilding)
     logAssetBuildWarnings(*curAsset, assetBuildWarningDisplay == AssetBuildWarningDisplay::ShowOncePerSession);
 
@@ -303,8 +316,9 @@ void AssetViewerApp::switchToPlugin(int id)
   if (next && !next->begin(curAsset))
   {
     curPluginId = oldCur;
-    showAdditinalToolWindow(cur->haveToolPanel());
-    cur->begin(curAsset);
+    showAdditinalToolWindow(cur && cur->haveToolPanel());
+    if (cur)
+      cur->begin(curAsset);
     return;
   }
 
@@ -315,6 +329,8 @@ void AssetViewerApp::switchToPlugin(int id)
 
   if (autoZoomAndCenter)
     zoomAndCenter();
+  else
+    getCompositeEditor().applyPendingCameraTransform();
 }
 
 
@@ -412,6 +428,15 @@ PropPanel::DialogWindow *AssetViewerApp::createDialog(hdpi::Px w, hdpi::Px h, co
 void AssetViewerApp::deleteDialog(PropPanel::DialogWindow *dlg) { delete dlg; }
 
 
+eastl::unique_ptr<PropPanel::IMenu> AssetViewerApp::createContextMenu()
+{
+  return eastl::unique_ptr<PropPanel::IMenu>(PropPanel::create_context_menu());
+}
+
+
+bool AssetViewerApp::renderContextMenu(PropPanel::IMenu &menu) { return PropPanel::render_context_menu(menu); }
+
+
 //==============================================================================
 void AssetViewerApp::updateViewports() { shouldUpdateViewports = true; }
 
@@ -459,6 +484,16 @@ bool AssetViewerApp::getSelectionBox(BBox3 &box)
 }
 
 //==============================================================================
+bool AssetViewerApp::getGlobalBox(BBox3 &box)
+{
+  box.setempty();
+
+  IGenEditorPlugin *current = curPlugin();
+
+  return current ? current->getGlobalBox(box) : false;
+}
+
+//==============================================================================
 void AssetViewerApp::setupColliderParams(int, const BBox3 &) {}
 
 //==================================================================================================
@@ -486,6 +521,14 @@ bool AssetViewerApp::traceRay(const Point3 &src, const Point3 &dir, float &dist,
   return false;
 }
 
+//==================================================================================================
+bool AssetViewerApp::trackChangesContinuous(int assets_to_check, bool notify_dabuild)
+{
+  const bool assetsChanged = assetMgr.trackChangesContinuous(assets_to_check);
+  if (notify_dabuild && assetsChanged)
+    ::post_base_update_notify_dabuild();
+  return assetsChanged;
+}
 
 //==============================================================================
 void AssetViewerApp::actObjects(real dt)
@@ -512,31 +555,6 @@ void AssetViewerApp::actObjects(real dt)
   for (int i = 0; i < plugin.size(); ++i)
     plugin[i]->actObjects(dt);
 
-  // NOTE: ImGui porting: delay the selection of the last used asset (from the previous application run) till we have a
-  // valid viewport. This is needed to make sure that when ViewportWindow::zoomAndCenter executes the viewport's size is
-  // set. This is ugly but probably still more robust than handling it in ViewportWindow would be.
-  if (!assetToInitiallySelect.empty())
-  {
-    IGenViewportWnd *viewport = ged.getViewport(0);
-    if (viewport)
-    {
-      int viewportWidth = 0;
-      int viewportHeight = 0;
-      viewport->getViewportSize(viewportWidth, viewportHeight);
-      if (viewportWidth > 0 && viewportHeight > 0)
-      {
-        const DagorAsset *asset = DAEDITOR3.getAssetByName(assetToInitiallySelect);
-        assetToInitiallySelect.clear();
-        if (asset)
-          selectAsset(*asset);
-
-        if (mPropPanel)
-          mPropPanel->loadState(propPanelStateOfTheAssetToInitiallySelect, true);
-        propPanelStateOfTheAssetToInitiallySelect.reset();
-      }
-    }
-  }
-
   static unsigned last_t = 0;
   if (last_t + 1000 < get_time_msec())
   {
@@ -549,8 +567,10 @@ void AssetViewerApp::actObjects(real dt)
 //==============================================================================
 void AssetViewerApp::beforeRenderObjects()
 {
-  ddsx::tex_pack2_perform_delayed_data_loading();
+  if (!is_managed_textures_streaming_load_on_demand())
+    ddsx::tex_pack2_perform_delayed_data_loading();
   ViewportWindow *vpw = ged.getRenderViewport();
+  Point3 cameraPos(0, 0, 0);
   if (vpw)
   {
     if (!skipSetViewProj)
@@ -560,6 +580,10 @@ void AssetViewerApp::beforeRenderObjects()
     vpw->getViewportSize(vp_w, vp_h);
     TMatrix4 globTm = TMatrix4(vpw->getViewTm()) * vpw->getProjTm();
     prepare_debug_text_marks(globTm, vp_w, vp_h);
+
+    TMatrix cameraTm;
+    vpw->getCameraTransform(cameraTm);
+    cameraPos = cameraTm.getcol(3);
   }
 
   IGenEditorPlugin *curPlug = curPlugin();
@@ -567,7 +591,9 @@ void AssetViewerApp::beforeRenderObjects()
   if (worldViewPosVarId == -2)
     worldViewPosVarId = ::get_shader_variable_id("world_view_pos");
   if (worldViewPosVarId >= 0)
-    ShaderGlobal::set_color4(worldViewPosVarId, Color4(::grs_cur_view.pos.x, ::grs_cur_view.pos.y, ::grs_cur_view.pos.z, 1.f));
+    ShaderGlobal::set_float4(worldViewPosVarId, Color4(cameraPos.x, cameraPos.y, cameraPos.z, 1.f));
+
+  environment::before_render_objects();
 
   plugin[0]->beforeRenderObjects();
   if (curPlug)
@@ -653,8 +679,15 @@ void AssetViewerApp::renderGrid()
   vpw->getCameraTransform(camera);
 
   float dh = fabs(camera.getcol(3).y - grid.getGridHeight()) + 1;
+
+  // the grid must depth-match the pass being rendered (VR eye matrices, plugin
+  // z range overrides), which is the driver state here, not the viewport's own matrix
+  TMatrix gridViewTm;
+  TMatrix4 gridProjTm;
+  d3d::gettm(TM_VIEW, gridViewTm);
+  d3d::gettm(TM_PROJ, &gridProjTm);
   grid.render(pt.data(), dirs.data(), fabs(vpw->isOrthogonal() ? vpw->getOrthogonalZoom() : perspectiveZoom / dh),
-    ged.findViewportIndex(vpw));
+    ged.findViewportIndex(vpw), gridViewTm, gridProjTm);
 }
 
 //==============================================================================
@@ -709,3 +742,35 @@ IEditorCoreEngine::ModeType AssetViewerApp::getGizmoModeType() { return gizmoEH-
 bool AssetViewerApp::isGizmoOperationStarted() const { return gizmoEH->isStarted(); }
 
 //==============================================================================
+
+IEditorCoreEngine::BasisType AssetViewerApp::getGizmoBasisType()
+{
+  if (isCompositeEditorShown())
+    return compositeEditor.getToolbar().getBasisType();
+
+  return BASIS_World;
+}
+
+IEditorCoreEngine::BasisType AssetViewerApp::getGizmoBasisTypeForMode(ModeType mode_type)
+{
+  if (isCompositeEditorShown())
+    return compositeEditor.getToolbar().getGizmoBasisTypeForMode(mode_type);
+
+  return BASIS_World;
+}
+
+IEditorCoreEngine::CenterType AssetViewerApp::getGizmoCenterType()
+{
+  if (isCompositeEditorShown())
+    return compositeEditor.getToolbar().getCenterType();
+
+  return CENTER_Pivot;
+}
+
+IEditorCoreEngine::CenterType AssetViewerApp::getGizmoCenterTypeForMode(ModeType mode_type)
+{
+  if (isCompositeEditorShown())
+    return compositeEditor.getToolbar().getGizmoCenterTypeForMode(mode_type);
+
+  return CENTER_Pivot;
+}

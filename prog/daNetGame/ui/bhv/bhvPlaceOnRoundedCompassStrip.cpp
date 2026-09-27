@@ -8,7 +8,9 @@
 #include <daRg/dag_element.h>
 #include <daRg/dag_transform.h>
 #include <3d/dag_render.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <math/dag_mathAng.h>
 
 
@@ -19,6 +21,21 @@ SQ_PRECACHED_STRINGS_REGISTER_WITH_BHV(BhvPlaceRoundCompassOnCompassStrip, bhv_p
 
 
 BhvPlaceRoundCompassOnCompassStrip::BhvPlaceRoundCompassOnCompassStrip() : Behavior(darg::Behavior::STAGE_BEFORE_RENDER, 0) {}
+
+
+void BhvPlaceRoundCompassOnCompassStrip::onAttach(Element *elem)
+{
+  fov = 360.f;
+  fadeOutZone = 0.f;
+
+  Sqrat::Table data = elem->props.scriptDesc.RawGetSlot(elem->csk->data);
+  if (data.IsNull())
+    return;
+
+  fov = data.RawGetSlotValue("fov", fov);
+  fadeOutZone = data.RawGetSlotValue("fadeOutZone", fadeOutZone);
+}
+
 
 int BhvPlaceRoundCompassOnCompassStrip::update(UpdateStage /*stage*/, darg::Element *elem, float /*dt*/)
 {
@@ -49,7 +66,7 @@ int BhvPlaceRoundCompassOnCompassStrip::update(UpdateStage /*stage*/, darg::Elem
     }
     else
     {
-      float relativeAngle = data.RawGetSlotValue("relativeAngle", VERY_BIG_NUMBER);
+      float relativeAngle = data.RawGetSlotValue(strings->relativeAngle, VERY_BIG_NUMBER);
       if (relativeAngle != VERY_BIG_NUMBER)
       {
         d = relativeAngle;
@@ -96,6 +113,13 @@ int BhvPlaceRoundCompassOnCompassStrip::update(UpdateStage /*stage*/, darg::Elem
     }
 
     d = norm_s_ang_deg(d);
+
+    float childFov = data.RawGetSlotValue(strings->fov, fov);
+    float childFadeOutZone = data.RawGetSlotValue(strings->fadeOutZone, fadeOutZone);
+
+    float opacity = cvt(fabs(d), childFov * 0.5f - childFadeOutZone, childFov * 0.5f, 1.0f, 0.0f);
+    child->props.setCurrentOpacity(opacity);
+
     float rad = (d - 90.0f) * DEG_TO_RAD;
 
     Point2 childSize = child->screenCoord.size;
@@ -115,11 +139,13 @@ int BhvPlaceRoundCompassOnCompassStrip::update(UpdateStage /*stage*/, darg::Elem
     float fixedPosX = c * childSize.y / 2 - childSize.x / 2;
     float fixedPosY = s * childSize.y / 2 - childSize.y / 2;
 
-    float x = (radius * c) + radius + fixedPosX;
-    float y = (radius * s) + radius + fixedPosY;
+    float childRadius = radius + data.RawGetSlotValue(strings->radiusOffset, 0);
+
+    float x = (childRadius * c) + radius + fixedPosX;
+    float y = (childRadius * s) + radius + fixedPosY;
 
     child->transform->translate = Point2(x, y);
-    if (data.RawGetSlotValue("doNotRotate", false))
+    if (data.RawGetSlotValue(strings->doNotRotate, false))
       continue;
 
     child->transform->rotate = rad + (90 * DEG_TO_RAD);

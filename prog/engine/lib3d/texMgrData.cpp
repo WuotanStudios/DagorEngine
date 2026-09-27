@@ -39,7 +39,7 @@ DECL_RESMGR_PRIVATE_DATA(texDesc);
 DECL_RESMGR_PRIVATE_DATA(pairedBaseTexId);
 DECL_RESMGR_PRIVATE_DATA(texBaseData);
 DECL_RESMGR_PRIVATE_DATA(texUsedSz);
-DECL_RESMGR_PRIVATE_DATA(maxReqLevelPrev);
+DECL_RESMGR_PRIVATE_DATA(texAllocLev);
 DECL_RESMGR_PRIVATE_DATA(texImportance);
 DECL_RESMGR_PRIVATE_DATA(texSamplers);
 DECL_RESMGR_PRIVATE_DATA(texSamplerInfo);
@@ -85,7 +85,7 @@ void texmgr_internal::D3dResMgrDataFinal::init(int max_res_entry_count)
   ALLOC_DATA_V(pairedBaseTexId, BAD_TEXTUREID);
   ALLOC_DATA_Z(texBaseData);
   ALLOC_DATA_Z(texUsedSz);
-  ALLOC_DATA_Z(maxReqLevelPrev);
+  ALLOC_DATA_Z(texAllocLev);
   ALLOC_DATA_Z(texImportance);
   ALLOC_DATA_V(texSamplers, d3d::INVALID_SAMPLER_HANDLE);
   ALLOC_DATA_V(texSamplerInfo, d3d::SamplerInfo{});
@@ -138,7 +138,7 @@ void texmgr_internal::D3dResMgrDataFinal::term()
   RELEASE_DATA(pairedBaseTexId);
   RELEASE_DATA(texBaseData);
   RELEASE_DATA(texUsedSz);
-  RELEASE_DATA(maxReqLevelPrev);
+  RELEASE_DATA(texAllocLev);
   RELEASE_DATA(texImportance);
   RELEASE_DATA(texSamplers);
   RELEASE_DATA(texSamplerInfo);
@@ -194,6 +194,9 @@ TextureIdSet anisotropy_exceptions;
 TextureFactory *default_tex_mgr_factory = NULL;
 FastStrMapT<int, -1> managed_tex_map_by_name(strmem, false);
 Tab<const char *> managed_tex_map_by_idx(strmem);
+bool defer_managed_tex_map_erase = false;
+// Owned name buffers of entries marked dead while erase is deferred; freed in compact_managed_tex_map.
+Tab<const char *> deferred_freed_tex_names(strmem);
 TexTagInfoArray textagInfo;
 int mt_enabled = 0;
 bool auto_add_tex_on_get_id = false;
@@ -218,7 +221,7 @@ static struct RmgrTerminator
   ~RmgrTerminator() { RMGR.term(); }
 } rmgrTerminator;
 CritSecStorage crit_sec;
-WinCritSec rec_lock;
+TexRecLock rec_lock;
 int (*drv3d_cmd)(Drv3dCommand command, void *par1, void *par2, void *par3) = NULL;
 }; // namespace texmgr_internal
 
@@ -232,7 +235,7 @@ bool tql::lq_not_more_than_split_bq_difftex = true;
 
 static void skip_on_tex_created(BaseTexture *) {}
 static void skip_on_tex_released(BaseTexture *) {}
-static void skip_on_buf_changed(bool, int) {}
+static void skip_on_persistent_changed(bool, int) {}
 static void skip_unload_on_drv_shutdown() {}
 static unsigned no_tex_lfu(TEXTUREID) { return 0; }
 static TexQL no_tex_cur_ql(TEXTUREID) { return TQL_base; }
@@ -240,7 +243,7 @@ static bool texture_id_always_valid(TEXTUREID) { return true; }
 
 void (*tql::on_tex_created)(BaseTexture *t) = &skip_on_tex_created;
 void (*tql::on_tex_released)(BaseTexture *t) = &skip_on_tex_released;
-void (*tql::on_buf_changed)(bool add, int delta_sz_kb) = &skip_on_buf_changed;
+void (*tql::on_persistent_changed)(bool add, int delta_sz_kb) = &skip_on_persistent_changed;
 void (*tql::unload_on_drv_shutdown)() = &skip_unload_on_drv_shutdown;
 void (*tql::on_frame_finished)() = NULL;
 unsigned (*tql::get_tex_lfu)(TEXTUREID texId) = &no_tex_lfu;
@@ -254,9 +257,9 @@ static const char *return_tex_info(TEXTUREID texId, bool /*verbose*/, String &tm
     return "";
 
   int idx = texId.index();
-  tmp_stor.printf(0, "  LFU=%d req=%X/%X  desc=0x%04X ld=%X rd=%X max=%X(%X/%X) rc=%d bt.rc=%d ql=%d(%d) gpu=%dK(+%dK) bd=%dK",
-    RMGR.getResLFU(idx), RMGR.resQS[idx].getMaxReqLev(), RMGR.maxReqLevelPrev[idx], RMGR.levDesc[idx], RMGR.resQS[idx].getLdLev(),
-    RMGR.resQS[idx].getRdLev(), RMGR.texDesc[idx].dim.maxLev, RMGR.resQS[idx].getQLev(), RMGR.resQS[idx].getMaxLev(),
+  tmp_stor.printf(0, "  LFU=%d req=%X  desc=0x%04X ld=%X rd=%X alloc=%X max=%X(%X/%X) rc=%d bt.rc=%d ql=%d(%d) gpu=%dK(+%dK) bd=%dK",
+    RMGR.getResLFU(idx), RMGR.resQS[idx].getMaxReqLev(), RMGR.levDesc[idx], RMGR.resQS[idx].getLdLev(), RMGR.resQS[idx].getRdLev(),
+    RMGR.getTexAllocLev(idx), RMGR.texDesc[idx].dim.maxLev, RMGR.resQS[idx].getQLev(), RMGR.resQS[idx].getMaxLev(),
     RMGR.getRefCount(idx), RMGR.getBaseTexUsedCount(idx), RMGR.resQS[idx].getCurQL(), RMGR.resQS[idx].getMaxQL(),
     RMGR.getTexMemSize4K(idx) * 4, RMGR.getTexAddMemSizeNeeded4K(idx) * 4, RMGR.getTexBaseDataSize(idx) >> 10);
   return tmp_stor;
@@ -271,6 +274,7 @@ WinCritSec tql::reqLDCritSection;
 eastl::vector_set<TEXTUREID> tql::reqLD;
 int tql::mem_used_persistent_kb = 0;
 int tql::mem_quota_reserve_kb = 256 << 10;
+int tql::gpu_mem_backend_overhead_kb = 0;
 #if _TARGET_C1 | _TARGET_C2
 
 #elif _TARGET_64BIT && _TARGET_PC_WIN
@@ -310,7 +314,8 @@ TexLoadRes (*texmgr_internal::d3d_load_genmip_sysmemcopy)(TEXTUREID, TEXTUREID, 
 
 bool texmgr_internal::is_gpu_mem_enough_to_load_hq_tex()
 {
-  int actual_quota_kb = tql::mem_quota_kb - interlocked_relaxed_load(tql::mem_used_persistent_kb) - tql::mem_quota_reserve_kb;
+  int actual_quota_kb = tql::mem_quota_kb - interlocked_relaxed_load(tql::mem_used_persistent_kb) -
+                        interlocked_relaxed_load(tql::gpu_mem_backend_overhead_kb) - tql::mem_quota_reserve_kb;
   int overuse = tql::mem_quota_reserve_kb / 4;
   return actual_quota_kb + overuse > RMGR.getTotalUsedTexSzKB() + min(RMGR.getTotalAddMemNeededSzKB(), overuse) ||
          !texmgr_internal::texq_load_on_demand;
@@ -396,10 +401,21 @@ void texmgr_internal::remove_from_managed_tex_map(int idx)
   auto &mp = static_cast<PublicFastStrMapT<int, -1> &>(texmgr_internal::managed_tex_map_by_name);
 
   auto f = RMGR.getFactory(idx);
-  if (!(f && f->isPersistentTexName(name)))
-    memfree((void *)name, dag::get_allocator(mp.fastMap));
+  bool owns_name = !(f && f->isPersistentTexName(name));
 
   texmgr_internal::managed_tex_map_by_idx[idx] = nullptr;
+  if (DAGOR_UNLIKELY(defer_managed_tex_map_erase))
+  {
+    // Keep the entry name valid so getStrIndex binary search stays correct across the
+    // deferred window; the owned buffer is freed in compact_managed_tex_map.
+    mp.fastMap[map_idx].id = -1;
+    if (owns_name)
+      deferred_freed_tex_names.push_back(name);
+    return;
+  }
+
+  if (owns_name)
+    memfree((void *)name, dag::get_allocator(mp.fastMap));
   erase_items(mp.fastMap, map_idx, 1);
 
 #if DAGOR_DBGLEVEL > 0 && (_TARGET_PC || 0) && CHECK_MANAGED_TEX_MAP
@@ -407,6 +423,24 @@ void texmgr_internal::remove_from_managed_tex_map(int idx)
   for (int i = 0; i < e.size(); ++i)
     G_ASSERTF(e[i].id != idx, "e[%d].id=%d map_idx=%d idx=%d name=%s", i, e[i].id, map_idx, idx, name);
 #endif
+}
+
+void texmgr_internal::compact_managed_tex_map()
+{
+  // Compact in place so surviving entries keep their name pointers (still shared with
+  // managed_tex_map_by_idx). Removing entries from a sorted array preserves the sort order.
+  auto &fastMap = static_cast<PublicFastStrMapT<int, -1> &>(texmgr_internal::managed_tex_map_by_name).fastMap;
+  int dst = 0;
+  for (int src = 0; src < fastMap.size(); ++src)
+    if (fastMap[src].id != -1)
+      fastMap[dst++] = fastMap[src];
+  erase_items(fastMap, dst, fastMap.size() - dst);
+
+  for (const char *name : deferred_freed_tex_names)
+    memfree((void *)name, dag::get_allocator(fastMap));
+  clear_and_shrink(deferred_freed_tex_names);
+
+  defer_managed_tex_map_erase = false;
 }
 
 struct GetTexName

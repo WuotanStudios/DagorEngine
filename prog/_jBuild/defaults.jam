@@ -8,6 +8,7 @@ if ! $(__DEFAULTS_INCLUDED) {
 
   include $(Root)/prog/_jBuild/defPlatform.jam ;
 
+  if $(UseGDK) = yes { PlatformSpec ?= clang ; }
   PlatformSpec_$(Platform) ?= $(PlatformSpec_$(Platform)_$(PlatformArch)) ;
   PlatformSpec_windows ?= vc17 ;
   PlatformSpec_xboxOne ?= clang ;
@@ -20,7 +21,8 @@ if ! $(__DEFAULTS_INCLUDED) {
   PlatformSpec_nswitch ?= clang ;
   PlatformSpec_android ?= clang ;
   PlatformSpec_linux ?= gcc ;
-  CLangVer ?= 18.1.8 ;
+  CLangVer ?= 21.1.8 ;
+  MSVCVer ?= 14.51 ;
   DefaultCPPStd = 20 ;
   CPPStd ?= 20 ;
   Sanitize ?= disabled ;
@@ -56,7 +58,7 @@ if ! $(__DEFAULTS_INCLUDED) {
   Config        ?= dev ;
   KernelLinkage ?= static ;
   UseGDK        ?= no ; # explicitly enabled later for xboxes
-  GdkVer        ?= 250401 ;
+  GdkVer        ?= 260403 ;
   GdkWinSdk     ?= 22621 ;
   PS4SdkVer     ?= 1050 ;
   local 1200 = 1000 ;
@@ -64,10 +66,10 @@ if ! $(__DEFAULTS_INCLUDED) {
   local 1050 = 700 ;
   local 850 = 300 ;
   PS4CrossGenSdkVer ?= $($(PS4SdkVer)) ;
-  PS5SdkVer     ?= 900 ;
+  PS5SdkVer     ?= 1100 ;
   MacOSXVer     ?= 11.0 ;
   MacOSXMinVer  ?= $(MacOSXVer) ;
-  iOSVer        ?= 15.0 ;
+  iOSVer        ?= 16.0 ;
   iOSMinVer     ?= $(iOSVer) ;
   tvOSVer       ?= 11.4 ;
   tvOSMinVer    ?= $(tvOSVer) ;
@@ -85,22 +87,26 @@ if ! $(__DEFAULTS_INCLUDED) {
   UseLtoJobs    ?= 0 ;
   TencentEnabled ?= no ;
   CheckOnly     ?= no ;
+  StrictHeaderDeps ?= no ; # Fail on missing *.d (header deps) files
   ForcePdb      ?= no ;
   DefOpenSSLVer = 3.x ;
   OpenSSLVer    ?= $(DefOpenSSLVer) ;
   UseZlibVer    ?= ng ;
-  OpenXrVer     ?= 1.0.27 ;
-  DlssEnabled   ?= no ;
+  OpenXrVer     ?= 1.1.54 ;
   XessEnabled   ?= no ;
-  AgsEnabled    ?= no ;
-  Fsr2Enabled   ?= no ;
   BundleVersion ?= 1.0.0 ;
   ZstdVer       ?= 1.4.5 ;
   DbgDigest     ?= once ;  # once, min, max, stop
-  AgilitySdkVer ?= 1.616.1 ;
-  AgsSdkVer     ?= 6.2.0 ;
+  AgilitySdkVer ?= 1.619.3 ;
+  AftermathSdkVer ?= 2025.5.0.25317 ;
+  NvApiVer      ?= R610 ;
+  NvtxSdkVersion ?= 3.5 ;
   DefFreeTypeVer = 2.8 ;
   FreeTypeVer   ?= $(DefFreeTypeVer) ;
+  FidelityFXVer ?= 2.1.1 ;
+  StreamlineVer ?= 2.14.1 ;
+
+  if $(Config) != rel { AgsSdkVer ?= 6.3.0 ; }
 
   if $(Platform) = nswitch {
     # 3.x fails silently somewhere deep inside of macro hell
@@ -111,7 +117,7 @@ if ! $(__DEFAULTS_INCLUDED) {
     UseGDK = yes ; # we always use GDK on xbox platforms.
   }
 
-  if ! $(Platform) in windows xboxOne scarlett && $(UseGDK) != no {
+  if ! $(Platform) in windows xboxOne scarlett && $(UseGDK) = yes {
     exit GDK is supported only for windows, xboxOne and scarlett targets ;
   }
 
@@ -147,6 +153,8 @@ if ! $(__DEFAULTS_INCLUDED) {
     SSEVersion ?= 2 ;
   }
   VCMathOption ?= -fp:fast ;
+  # TBAA (-fstrict-aliasing): on by default for posix/sony compilers, off for *-windows-msvc triple
+  if $(Platform) in windows xboxOne scarlett android || $(VCMathOption) != -fp:fast { StrictAliasing ?= no ; } else { StrictAliasing ?= yes ; }
 
   if $(FullOOPEnabled) = yes {
     Exceptions ?= yes ;
@@ -161,13 +169,9 @@ if ! $(__DEFAULTS_INCLUDED) {
     CatchSEH ?= no ;
     Rtti ?= no ;
   }
-  
-  UseWholeOpt ?= no ;
-  UseMemTracker ?= no ;
 
-  if $(UseMemTracker) != no {
-    UseMemoryDebugLevel = mtrk ;
-  }
+  UseWholeOpt ?= no ;
+  UseWholeOptDevirt ?= $(UseWholeOpt) ; # whole-program devirt, on with LTO unless overridden
 
   if $(Config) in rel irel { MimDebug ?= 0 ; }
   else { MimDebug ?= 2 ; }
@@ -196,8 +200,8 @@ if ! $(__DEFAULTS_INCLUDED) {
     GDEVTOOL ?= $(HOME)/devtools ;
   }
 
-  if ! $(_DEVTOOL) && ! $(GDEVTOOL) { 
-    EXIT 'GDEVTOOL' (or '_DEVTOOL') env-variable must be defined (in UPPERCASE!), aborting ; 
+  if ! $(_DEVTOOL) && ! $(GDEVTOOL) {
+    EXIT 'GDEVTOOL' (or '_DEVTOOL') env-variable must be defined (in UPPERCASE!), aborting ;
   }
   _DEVTOOL ?= $(GDEVTOOL) ;
   # construct _DEVTOOL_RE compatible with regexp syntax
@@ -253,6 +257,15 @@ if ! $(__DEFAULTS_INCLUDED) {
     exit OpenXr SDK not found in $(OpenXrSdkPath), please update devtools ;
   }
 
+  StreamlineSdkPath = $(_DEVTOOL)/streamline-$(StreamlineVer) ;
+  if $(StreamlineFeatures) && $(Platform) in windows && $(PlatformArch) in x86_64 arm64 {
+    if ! [ GLOB $(StreamlineSdkPath) : * ] {
+      exit Streamline SDK not found in $(StreamlineSdkPath), please update devtools ;
+    }
+    # drv3d_commonCode, drv3d_vulkan and copy_bundles.jam must agree, so decide once here
+    UseStreamline = yes ;
+  }
+
   if $(GOUT_ROOT) {
     local slashes = [ MATCH "(.*[\\])" : $(GOUT_ROOT) ] ;
     if $(slashes) { exit GOUT_ROOT\=$(GOUT_ROOT) must not contain '\\' slashes! ; }
@@ -281,24 +294,29 @@ if ! $(__DEFAULTS_INCLUDED) {
     }
 
     if $(Fuzzer) != no {
-      target = $(target:B)-fuzz$(target:S) ;
+      target = $(target:S=-fuzz$(target:S)) ;
     }
 
-    if $(Platform) = windows && $(UseGDK) != no {
-      target = $(target:B)-gdk$(target:S) ;
+    if $(ClangCoverage) = yes {
+      target = $(target:B)-cov$(target:S) ;
+    }
+
+    if $(Platform) = windows && $(UseGDK) = yes {
+      target = $(target:S=-gdk$(target:S)) ;
     }
 
     if $(Sanitize) != disabled {
       local address = asan ;
+      local hwaddress = hwasan ;
       local thread = tsan ;
       local leak = lsan ;
       local undefined = ubsan ;
       local memory = msan ;
-      target = $(target:B)-$($(Sanitize))$(target:S) ;
+      target = $(target:S=-$($(Sanitize))$(target:S)) ;
     }
 
     if $(Config) != rel {
-      if [ GetKnownExecutableSuffix $(1) ] { target = $(target:B)-$(Config)$(target:S) ; } else { target = $(target)-$(Config) ; }
+      if [ GetKnownExecutableSuffix $(1) ] { target = $(target:S=-$(Config)$(target:S)) ; } else { target = $(target)-$(Config) ; }
     }
 
     return $(target) ;
@@ -348,17 +366,19 @@ if ! $(__DEFAULTS_INCLUDED) {
   {
     local _platform = $(Platform) ;
     local _platform_spec = $(PlatformSpec) ;
+    local _platform_arch = $(PlatformArch) ;
 
     if $(Platform) in xboxOne scarlett {
       if $(PlatformSpec) = clang { _platform_spec = $(_platform_spec)-$(CLangVer) ; }
       _platform_spec = $(_platform_spec)-$(GdkWinSdk) ;
-    } else if $(PlatformSpec) in vc14 vc14 vc15 vc16 vc17 && $(VCUpdateVer) {
+    } else if $(PlatformSpec) in vc14 vc15 vc16 vc17 && $(VCUpdateVer) {
       _platform_spec = $(_platform_spec)-$(VCUpdateVer) ;
+    } else if $(PlatformSpec) = msvc && $(Platform) in windows {
+      _platform_spec = $(_platform_spec)-v$(MSVCVer) ;
     } else if $(PlatformSpec) = clang && $(Platform) in windows {
       _platform_spec = $(_platform_spec)-$(CLangVer) ;
     }
     if $(PlatformOutputDir) { _platform_spec = $(PlatformOutputDir) ; }
-
     if $(Platform) = ps4 {
       _platform = $(_platform)-$(PS4SdkVer) ;
       if $(PS4CrossGenSdkVer) != none { _platform = $(_platform)c$(PS4CrossGenSdkVer) ; }
@@ -368,9 +388,12 @@ if ! $(__DEFAULTS_INCLUDED) {
       _platform = $(_platform)-$(GdkVer) ;
     } else if $(Platform) = macOS {
       _platform = $(_platform)-$(MacOSXVer)~m$(MacOSXMinVer) ;
-      if $(PlatformArch) = arm64 {
+      if $(PlatformArch) = arm64 || $(MacUniversalBinary) = yes {
         local ver = [ MATCH "([^\.]+)\.(.+)" : $(MacOSXMinVer) ] ;
-        if ! $(ver[0]) || ! $(ver[0]) in 11 12 13 14 15 { Exit PlatformArch=$(PlatformArch) requires MacOSXMinVer 11+ ($(MacOSXMinVer) is not allowed) ; }
+        if ! $(ver[0]) || ! $(ver[0]) in 11 12 13 14 15 {
+          Exit PlatformArch=arm64 (or x86_64+arm64 universal binary) requires MacOSXMinVer 11+ ($(MacOSXMinVer) is not allowed) ;
+        }
+        if $(MacUniversalBinary) = yes { _platform_arch = x86_64~arm64~universal ; }
       }
     } else if $(Platform) = iOS {
       _platform = $(_platform)-$(iOSVer)~m$(iOSMinVer) ;
@@ -386,12 +409,14 @@ if ! $(__DEFAULTS_INCLUDED) {
       if ( ! $(ver[2]) ) || ( ! $(ver[1]) in win win32 ) { Exit bad WinSdkVer\=$(WinSdkVer) ; }
       if $(ver[2]) = sdk && $(ver[3]) { ver = $(ver[3]) ; } else { ver = $(ver[2-]:J) ; }
       _platform = $(_platform)-$(ver) ;
-      if $(UseGDK) != no {
+      if $(UseGDK) = yes {
         _platform = $(_platform)-g$(GdkVer) ;
       }
     }
 
-    local out = $(_platform)~$(PlatformArch)~$(Config)~$(_platform_spec) ;
+    local out = $(_platform)~$(_platform_arch)~$(Config)~$(_platform_spec) ;
+
+    if $(Platform) = linux && $(MAbi) && $(MAbi) != 64 { out = $(out)~m$(MAbi) ; }
 
     if $(CPPStd) != $(DefaultCPPStd) {
       out = $(out)~cpp$(CPPStd) ;
@@ -415,7 +440,7 @@ if ! $(__DEFAULTS_INCLUDED) {
       out = $(out)~krnlimp ;
     }
 
-    if $(Platform) in windows macOS linux {
+    if $(Platform) in windows macOS linux && $(PlatformArch) in x86 x86_64 e2k {
       out = $(out)~s$(SSEVersion) ;
     }
     if $(Platform) in windows xboxOne scarlett {
@@ -427,7 +452,7 @@ if ! $(__DEFAULTS_INCLUDED) {
       }
     }
     if $(ForceLogs) = yes {
-      if $(Config) != rel { Exit why set ForceLogs=$(ForceLogs) for Config=$(Config) \!\= rel  ?? ; }
+      if ! $(Config) in rel irel { Exit why set ForceLogs=$(ForceLogs) for Config=$(Config) \!\= rel  ?? ; }
       if ! -DDAGOR_FORCE_LOGS in $(GlobalCPPopt) { GlobalCPPopt += -DDAGOR_FORCE_LOGS ; }
       out = $(out)~log ;
     }
@@ -449,11 +474,8 @@ if ! $(__DEFAULTS_INCLUDED) {
     if $(OutputSuffix) {
       out = $(out)~$(OutputSuffix) ;
     }
-    if $(UseLtoJobs) != 0 {
-      out = $(out)~lto ;
-    }
     if $(CheckedContainers) = yes {
-      local defines = -D_DEBUG_TAB_ ;
+      local defines = -D_DEBUG_TAB_ -DEASTL_DEBUG -DEASTL_DEBUGPARAMS_LEVEL=0 -DEASTL_NAME_ENABLED=0 ;
       for d in $(defines) { if ! $(d) in $(GlobalCPPopt) { GlobalCPPopt += $(d) ; } }
       out = $(out)~c ;
     }
@@ -476,8 +498,8 @@ if ! $(__DEFAULTS_INCLUDED) {
       out = $(out)~nmb ;
     }
 
-    if $(UseWholeOpt) != no {
-      out = $(out)~who ;
+    if $(UseWholeOpt) != no || $(UseLtoJobs) != 0 {
+      out = $(out)~lto ;
     }
 
     if $(UseSystemOpenSSL) = yes {
@@ -487,6 +509,7 @@ if ! $(__DEFAULTS_INCLUDED) {
     }
 
     if $(Analyze) = yes { out = $(out)~a ; }
+    if $(ClangCoverage) = yes { out = $(out)~cov ; }
 
     _Output   = $(_OutputRoot)/$(out) ;
     _PrintedOutput   = [$(out)] ;
@@ -509,5 +532,6 @@ if ! $(__DEFAULTS_INCLUDED) {
   }
 
   include $(Root)/prog/_jBuild/jCommonRules.jam ;
+  include $(Root)/prog/_jBuild/cocoapods.jam ;
   NotFile ALL_CODEGEN_TARGET ;
 }

@@ -14,12 +14,12 @@
 #include <shaders/dag_overrideStateId.h>
 #include <osApiWrappers/dag_critSec.h>
 #include <landMesh/lmeshManager.h>
-#include <landMesh/landRayTracer.h>
 #include <util/dag_oaHashNameMap.h>
 #include <stdlib.h>
 #include "gridRender.h"
 #include <de3_collisionPreview.h>
 #include <3d/dag_resPtr.h>
+#include <gameRes/dag_collisionResource.h>
 
 class DataBlock;
 class LandMeshRenderer;
@@ -31,6 +31,7 @@ struct ObjectsToPlace;
 class Clipmap;
 class ToroidalHeightmap;
 class IWaterService;
+class DebugPrimitivesVbuffer;
 
 
 struct BBoxTreeElement
@@ -70,7 +71,9 @@ public:
   void setZTransformPersp();
   void setZTransformPersp(float zn, float zf);
   void renderClipmaps();
-  void invalidateClipmap(bool force_redraw);
+  void invalidateClipmap(bool force_redraw, bool rebuild_last_clip = true);
+  void beforeD3DReset();
+  void afterD3DReset(bool full_reset);
 
   void prepareFixedClip(int texture_size);
   void setFixedClipToShader();
@@ -85,6 +88,10 @@ public:
   void setLandscapeMirroring(bool mirror) { useLandMirroring = mirror; }
   void setupMirroring();
 
+  // The static scene, whichever tag the level carried: nothing outside this class reads the members.
+  bool hasStaticScene() const;
+  void clearStaticScene();
+  void drawStaticSceneClip(const Point3 &view_pos, float max_dist) const;
   bool tracerayNormalizedStaticScene(const Point3 &p, const Point3 &dir, real &t, int *out_pmid, Point3 *out_norm);
 
   bool tracerayNormalizedHeightmap(const Point3 &p0, const Point3 &dir, float &t, Point3 *norm);
@@ -92,7 +99,12 @@ public:
   bool isInited() { return intited; }
 
   LandMeshManager *lmeshMgr;
-  FastRtDump frtDump;
+
+private:
+  FastRtDump frtDump;                // the static collision of a level exported as an FRT dump (tag FRT) ...
+  Ptr<CollisionResource> staticColl; // ... or as a CollisionResource stream (tag SCol); one of the two per level
+
+public:
   collisionpreview::Collision lrtCollision;
   bool skipEnviData;
   bool pendingBuildDf;
@@ -150,7 +162,7 @@ protected:
   FastNameMap requiredResources;
   bool intited;
 
-  UniqueTexHolder last_clip;
+  UniqueTexWithShaderVar last_clip;
   d3d::SamplerInfo last_clip_sampler;
   int lastClipTexSz;
   bool rebuildLastClip;
@@ -163,8 +175,9 @@ protected:
     BezierSpline3d spl;
   };
   Tab<SplineData> splines;
+  DebugPrimitivesVbuffer *splinesVbuf = nullptr;
 
-  void renderSplineCurve(const BezierSpline3d &spl, bool opaque);
+  void rebuildSplineVbuf();
 
   static bool __stdcall custom_get_height(Point3 &p, Point3 *n);
   static vec3f __stdcall custom_update_pregen_pos_y(vec4f pos, int16_t *dest_packed_y, float csz_y, float oy);

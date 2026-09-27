@@ -459,6 +459,8 @@ struct Link final: Object
     ImU32  m_Color;
     ImU32  m_HighlightColor;
     float  m_Thickness;
+    // MODIFICATION BY GAIJIN: dash and gap length; 0 strokes the link solid as before.
+    float  m_DashSize;
     ImVec2 m_Start;
     ImVec2 m_End;
 
@@ -469,6 +471,7 @@ struct Link final: Object
         , m_EndPin(nullptr)
         , m_Color(IM_COL32_WHITE)
         , m_Thickness(1.0f)
+        , m_DashSize(0.0f)
     {
     }
 
@@ -850,6 +853,8 @@ struct NavigateAction final: EditorAction
     void NavigateTo(const ImRect& bounds, ZoomMode zoomMode, float duration = -1.0f, NavigationReason reason = NavigationReason::Unknown);
     void StopNavigation();
     void FinishNavigation();
+    // MODIFICATION BY GAIJIN
+    void ScrollCanvasPointToScreen(const ImVec2& canvasPoint, const ImVec2& screenPoint);
 
     bool MoveOverEdge(const ImVec2& canvasSize);
     void StopMoveOverEdge();
@@ -1301,6 +1306,9 @@ struct EditorContext
 
     bool DoLink(LinkId id, PinId startPinId, PinId endPinId, ImU32 color, float thickness);
 
+    // MODIFICATION BY GAIJIN: consumed and cleared by the next DoLink, see Link::m_DashSize.
+    void SetNextLinkDashSize(float dashSize) { m_NextLinkDashSize = dashSize; }
+
 
     NodeBuilder& GetNodeBuilder() { return m_NodeBuilder; }
     HintBuilder& GetHintBuilder() { return m_HintBuilder; }
@@ -1343,6 +1351,11 @@ struct EditorContext
 
     Node* FindNodeAt(const ImVec2& p);
     void FindNodesInRect(const ImRect& r, vector<Node*>& result, bool append = false, bool includeIntersecting = true);
+    // MODIFICATION BY GAIJIN
+    // Counterpart to FindNodesInRect for the "centre lies inside r" test, used by
+    // Node::GetGroupedNodes when Config::ContainGroupedNodesByCenter is set so the looser
+    // half-inside heuristic stays out of the strict overlap/contain path used elsewhere.
+    void FindNodesByCenter(const ImRect& r, vector<Node*>& result, bool append = false);
     void FindLinksInRect(const ImRect& r, vector<Link*>& result, bool append = false);
 
     bool HasAnyLinks(NodeId nodeId) const;
@@ -1433,6 +1446,11 @@ struct EditorContext
     {
         auto zoomMode = zoomIn ? NavigateAction::ZoomMode::WithMargin : NavigateAction::ZoomMode::None;
         m_NavigateAction.NavigateTo(bounds, zoomMode, duration);
+    }
+    // MODIFICATION BY GAIJIN
+    void ScrollCanvasPointToScreen(const ImVec2& canvasPoint, const ImVec2& screenPoint)
+    {
+        m_NavigateAction.ScrollCanvasPointToScreen(canvasPoint, screenPoint);
     }
 
     void RegisterAnimation(Animation* animation);
@@ -1537,6 +1555,8 @@ private:
 
     bool                m_IsInitialized;
     Settings            m_Settings;
+
+    float               m_NextLinkDashSize = 0.0f; // MODIFICATION BY GAIJIN, see SetNextLinkDashSize
 
     ImDrawList*         m_DrawList;
     int                 m_ExternalChannel;

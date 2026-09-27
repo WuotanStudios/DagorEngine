@@ -2,7 +2,6 @@
 #pragma once
 
 #include "Brushes/hmlBrush.h"
-#include <squirrel.h>
 
 #include <EditorCore/ec_brush.h>
 #include <EditorCore/ec_ObjectEditor.h>
@@ -12,13 +11,15 @@
 #include <de3_assetService.h>
 #include <de3_bitMaskMgr.h>
 #include <de3_hmapStorage.h>
+#include "blockedDetTexMap.h"
 #include <de3_heightmap.h>
 #include <de3_roadsProvider.h>
 #include <de3_genObjHierMask.h>
 #include <de3_fileTracker.h>
 #include <de3_landmesh.h>
-#include <coolConsole/iConsoleCmd.h>
 #include <math/dag_color.h>
+#include <EASTL/bitset.h>
+#include <generic/dag_span.h>
 
 #include <3d/dag_texMgr.h>
 
@@ -28,8 +29,10 @@
 
 #include "hmlObjectsEditor.h"
 #include "hmlLayers.h"
+#include "hmlTypedVars.h"
 #include <de3_grassSrv.h>
 #include <de3_gpuGrassService.h>
+#include <de3_hmapDebugShadingService.h>
 #include <de3_waterSrv.h>
 #include <de3_waterProjFxSrv.h>
 #include <de3_cableSrv.h>
@@ -137,13 +140,13 @@ class HmapLandPlugin : public IGenEditorPlugin,
                        public IRenderingService,
                        public IOnExportNotify,
                        public IPluginAutoSave,
+                       public IPluginBeforeClose,
                        public PropPanel::ControlEventHandler,
                        public IWndManagerWindowHandler,
                        public IPostProcessGeometry,
 #if defined(USE_HMAP_ACES)
                        public IEnvironmentSettings,
 #endif
-                       public IConsoleCmd,
                        public IExportToDag,
                        public IAssetUpdateNotify
 {
@@ -165,11 +168,13 @@ public:
   static bool preferZstdPacking;
   static bool allowOodlePacking;
   static bool pcPreferASTC;
+  static bool includeHiddenLayersInExportedNavMesh;
   static bool useASTC(unsigned tc) { return tc == _MAKE4C('iOS') || (tc == _MAKE4C('PC') && pcPreferASTC); }
 
   static IHmapService *hmlService;
   static IBitMaskImageMgr *bitMaskImgMgr;
   static IDagorPhys *dagPhys;
+  static ISplineGenService *splSrv;
 
   Tab<uint8_t> lcRemap;
 
@@ -210,6 +215,7 @@ public:
   void beforeMainLoop() override;
 
   void registerMenuSettings(unsigned menu_id, int base_id) override;
+  void registerEditorCommands(IEditorCommandSystem &command_system) override;
   void registerMenuAccelerators() override;
   bool begin(int toolbar_id, unsigned menu_id) override;
   bool end() override;
@@ -223,12 +229,14 @@ public:
   void clearObjects() override;
   void onNewProject() override;
   void autoSaveObjects(DataBlock &local_data) override;
+  void beforeClose() override;
   void saveObjects(DataBlock &blk, DataBlock &local_data, const char *base_path) override;
   void loadObjects(const DataBlock &blk, const DataBlock &local_data, const char *base_path) override;
   bool acceptSaveLoad() const override { return true; }
 
   void selectAll() override { objEd.selectAll(); }
   void deselectAll() override { objEd.unselectAll(); }
+  void invertSelection() override { objEd.invertSelection(); }
   void invalidateObjectProps() { objEd.invalidateObjectProps(); }
 
   void actObjects(float dt) override;
@@ -264,7 +272,6 @@ public:
   // IRenderingService
   void renderGeometry(Stage stage) override;
   void prepare(const Point3 &center_pos, const BBox3 &box) override;
-  int setSubDiv(int lod) override;
 
   // IGenEventHandler
   IGenEventHandler *getWrappedHandler() override { return &objEd; }
@@ -288,13 +295,13 @@ public:
   // IWriteAddLtinputData
   void writeAddLtinputData(IGenSave &cwr) override;
 
-  // IConsoleCmd
-  bool onConsoleCommand(const char *cmd, dag::ConstSpan<const char *> params) override;
-  const char *onConsoleCommandHelp(const char *cmd) override;
-
   // ILandmesh
   BBox3 getBBoxWithHMapWBBox() const override;
   bool isLandmeshRenderingMode() const override;
+  LandMeshManager *getLandMeshManager() const override;
+  LandMeshRenderer *getLandMeshRenderer() const override;
+  bool getEditorHeightmapInfo(EditorHeightmapInfo *out) const override;
+  bool buildEditorHeightmap(DynamicMemGeneralSaveCB *cb) override;
 
   void updateLandDetailTexture(unsigned i);
 
@@ -312,19 +319,19 @@ public:
     return max((mapSize / meshCells) * getGridCellSize(), 1.0f);
   }
   Point3 getOffset() const;
+  float getRIMinCellSz() const { return riMinCellSz; }
   float getRIMaxCellSz() const { return riMaxCellSz; }
   int getRIMaxGenLayerCellDiv() const { return riMaxGenLayerCellDivisor; }
 
-  void readLandDetailTexturePixel(unsigned &ret_u, unsigned &ret_u2, int cx, int cy, dag::ConstSpan<uint8_t> type_remap);
+  // the texel's weight of each landclass slot type_remap selects, the map's own 8-bit values
+  void readLandDetailWeights(int cx, int cy, dag::ConstSpan<uint8_t> type_remap, uint8_t out_wt[HMAX_DET_TEX_NUM]);
 
-  // Loads Land Datail Texture for LandMesh
-  void loadLandDetailTexture(int x0, int y0, Texture *tex1, Texture *tex2, carray<uint8_t, LMAX_DET_TEX_NUM> &detail_tex_ids,
-    bool *done_mark, int tex_size, int elem_size);
-
-  int loadLandDetailTexture(unsigned targetCode, int x0, int y0, char *imgPtr, int stride, char *imgPtr2, int stride2,
-    carray<uint8_t, LMAX_DET_TEX_NUM> &detail_tex_ids, bool *done_mark, int size, int elem_size, bool tex1_rgba, bool tex2_rgba);
-
-  int getMostUsedDetTex(int x0, int y0, int texDataSize, uint8_t *det_tex_ids, uint8_t *idx_remap, int max_dtn);
+  int getMostUsedDetTex(int x0, int y0, int w, int h, uint8_t *det_tex_ids, uint8_t *idx_remap, int max_dtn);
+  // the landclass slots of the cell at (x0, y0): the votes of its texels and of
+  // the apron around them, the neighbours' texels the weight atlas page border
+  // samples; a landclass that dies exactly at a cell edge needs a slot on both sides
+  static constexpr int DET_SELECT_APRON = 1;
+  int getCellDetTex(int x0, int y0, int elem_size, uint8_t *det_tex_ids, uint8_t *idx_remap, int max_dtn);
 
   // from IGatherStaticGeometry
   void gatherStaticVisualGeometry(StaticGeometryContainer &cont) override
@@ -344,7 +351,6 @@ public:
 
   // IDagorEdCustomCollider
   bool traceRay(const Point3 &p, const Point3 &dir, real &maxt, Point3 *norm) override;
-  bool shadowRayHitTest(const Point3 &p, const Point3 &dir, real maxt) override;
   const char *getColliderName() const override { return "HeightMap"; }
   bool isColliderVisible() const override;
 
@@ -373,11 +379,12 @@ public:
 
   bool traceRayPrivate(const Point3 &p, const Point3 &dir, real &maxt, Point3 *norm);
 
+  IBBox2 calcDetRectC(const BBox2 &rect, int divisor);
   void createHeightmapFile(CoolConsole &con);
   void upscaleHeightMap(CoolConsole &con);
-  void resizeHeightMapDet(CoolConsole &con);
+  void resizeHeightMapDet(CoolConsole &con, float def_value = 0.0f);
+  void recreateHeightMapDetForNewMain(CoolConsole &con);
   void createColormapFile(CoolConsole &con);
-  void createLightmapFile(CoolConsole &con);
   void resizeLandClassMapFile(CoolConsole &con);
 
   void resetLandmesh() { pendingLandmeshRebuild = true; }
@@ -397,21 +404,21 @@ public:
   const char *pickScriptImage(const char *current_name, int bpp);
   void prepareScriptImage(const char *name, int img_size_mul, int img_bpp);
   int getScriptImage(const char *name, int img_size_mul = 0, int img_bpp = 0);
-  int getScriptImageWidth(int id);
-  int getScriptImageHeight(int id);
-  int getScriptImageBpp(int id);
-  E3DCOLOR sampleScriptImageUV(int id, real x, real y, bool clamp_x, bool clamp_y);
-  E3DCOLOR sampleScriptImagePixelUV(int id, real x, real y, bool clamp_x, bool clamp_y);
+  int getScriptImageWidth(int id) const;
+  int getScriptImageHeight(int id) const;
+  int getScriptImageBpp(int id) const;
+  E3DCOLOR sampleScriptImageUV(int id, real x, real y, bool clamp_x, bool clamp_y) const;
+  E3DCOLOR sampleScriptImagePixelUV(int id, real x, real y, bool clamp_x, bool clamp_y) const;
   bool saveImage(int idx);
 
   void paintScriptImageUV(int id, real x0, real y0, real x1, real y1, bool clamp_x, bool clamp_y, E3DCOLOR color);
 
-  float sampleMask1UV(int id, real x, real y);
-  float sampleMask1UV(int id, real x, real y, bool clamp_x, bool clamp_y);
-  float sampleMask8UV(int id, real x, real y);
-  float sampleMask8UV(int id, real x, real y, bool clamp_x, bool clamp_y);
-  float sampleMask1PixelUV(int id, real x, real y);
-  float sampleMask8PixelUV(int id, real x, real y);
+  float sampleMask1UV(int id, real x, real y) const;
+  float sampleMask1UV(int id, real x, real y, bool clamp_x, bool clamp_y) const;
+  float sampleMask8UV(int id, real x, real y) const;
+  float sampleMask8UV(int id, real x, real y, bool clamp_x, bool clamp_y) const;
+  float sampleMask1PixelUV(int id, real x, real y) const;
+  float sampleMask8PixelUV(int id, real x, real y) const;
   void paintMask1UV(int id, real x0, real y0, bool c);
   void paintMask8UV(int id, real x0, real y0, char c);
 
@@ -430,8 +437,6 @@ public:
 
     virtual void save(DataBlock &blk) = 0;
     virtual void load(const DataBlock &blk) = 0;
-
-    virtual void setToScript(HSQUIRRELVM vm) = 0;
 
     virtual bool onPPChangeEx(int pid, PropPanel::ContainerPropertyControl &panel)
     {
@@ -521,13 +526,19 @@ public:
   void *getLayersHandle() const { return landClsLayersHandle; }
   int getDetLayerIdx() const { return detLayerIdx; }
   MapStorage<uint32_t> &getlandClassMap() { return landClsMap; }
+  bool isLandClsMapGenerated() const { return landClsMapGenerated; }
 
-  MapStorage<uint64_t> *getDetTexIdxMap() const { return detTexIdxMap; }
-  MapStorage<uint64_t> *getDetTexWtMap() const { return detTexWtMap; }
+  hmap_storage::BlockedDetTexMap *getDetTexMap() const { return detTexMap; }
   void prepareDetTexMaps();
 
   LandClassSlotsManager &getLandClassMgr() { return *lcMgr; }
   bool setDetailTexSlot(int s, const char *blk_name);
+  // True if any genLayer targets this detail-tex slot with writeDetTex
+  // enabled; false if the slot is registered (has a name) but every layer
+  // feeding it is land-only (writeDetTex=false). Used by the exporter to
+  // tell "legitimately no detTex writes" apart from "masks/thresholds drove
+  // every pixel to zero for a detTex-writing layer".
+  bool isDetTexSlotWritten(int slot_idx) const;
 
   bool exportLightmapToFile(const char *file_name, int target_code, bool high_quality);
 
@@ -548,7 +559,6 @@ public:
   bool isSnowAvailable() { return (snowValSVId != -1 && snowPrevievSVId != -1); }
   float getSnowValue() { return ambSnowValue; }
   bool hasSnowSpherePreview() { return (snowSpherePreview && snowDynPreview); }
-  void updateSnowSources() { objEd.updateSnowSources(); }
 
   void setSelectMode();
 
@@ -563,12 +573,56 @@ public:
   bool getHeight(const Point2 &p, real &ht, Point3 *normal) const;
   void setShowBlueWhiteMask();
 
+  bool isShowingLandClassColors() const { return showLandClassColors; }
+  void refreshLandClassColorsTex() { updateBlueWhiteMask(nullptr); }
+
   void refillPanel(bool schedule_regen = false);
 
   void prepareEditableLandClasses();
   void addGenLayer(const char *name, int insert_before = -1);
   bool moveGenLayer(ScriptParam *gl, bool up);
   bool delGenLayer(ScriptParam *gl);
+  // Returns true if some other gen layer already has this paramName. Empty/null names
+  // are never considered "in use" so multiple unnamed layers can coexist (their masks
+  // are not exposed via mask_<name> anyway). `exclude` skips one layer from the scan,
+  // used by rename so renaming to the same name is a no-op rather than a self-conflict.
+  bool isGenLayerNameInUse(const char *name, const ScriptParam *exclude = nullptr) const;
+  // Returns true if `name` is acceptable for a gen layer's paramName. Empty names
+  // are allowed (placeholder layers); non-empty names must consist solely of
+  // [A-Za-z0-9_] so the derived mask_<name> binding is a valid identifier and can
+  // be referenced from peer / common expressions. Names with spaces or punctuation
+  // would otherwise be silently unreferenceable.
+  static bool isValidGenLayerName(const char *name);
+
+  // Snapshot every gen layer's current exprValid into `out` (parallel index). Used by
+  // the Apply paths together with findFirstRegressedGenLayer to detect a "valid layer
+  // becomes invalid" regression after a recompile and roll the change back.
+  void snapshotGenLayerValidity(Tab<bool> &out) const;
+  // Returns the index of the first gen layer whose exprValid was true in `wasValid`
+  // but is false now (filling outName/outErr with that layer's paramName / lastErr),
+  // or -1 if no regression. wasValid is expected to have exactly genLayers.size()
+  // entries (older snapshots from a different layer count are tolerated by clamping).
+  int findFirstRegressedGenLayer(const Tab<bool> &wasValid, SimpleString &outName, SimpleString &outErr) const;
+  void rebuildLandSlots();
+  // Resync the shared varMap and recompile every gen-layer expression (and the common
+  // expression). add/move/del call this internally; entry point for external callers
+  // (rename, Apply, slider drag). shrink_arenas=false is the per-keystroke path.
+  void recompileGenLayerExpressions(bool shrink_arenas = true);
+  // Common-expression accessors (multi-line edit text). The setter stores newline-free
+  // text; getCommonExprDisplayText re-inserts `\n` after every `;` so the multi-line
+  // edit shows one statement per line. Setter also triggers a recompile.
+  const SimpleString &getCommonExprText() const { return commonExprText; }
+  void setCommonExprText(const char *txt);
+  eastl::string getCommonExprDisplayText() const;
+  // Debug-expression accessors -- analogous to commonExpr* but the expression is
+  // evaluated only by updateDebugWeightTex() and never by the bake.
+  const SimpleString &getDebugExprText() const { return debugExprText; }
+  void setDebugExprText(const char *txt);
+  eastl::string getDebugExprDisplayText() const;
+  // Apply a new debug view mode (and a layer name when mode == DV_LAYER).
+  // Sets showBlueWhiteMask / showLandClassColors / showDebugWeightOverlay
+  // accordingly and refreshes the overlay texture.
+  void setDebugViewMode(int mode, const char *layer_name = nullptr);
 
   struct HMDetGH
   {
@@ -609,8 +663,8 @@ public:
     return true;
   }
 
-  bool usesGenScript() const { return !colorGenScriptFilename.empty(); }
   PropPanel::ContainerPropertyControl *getPropPanel() const;
+  PropPanel::ContainerPropertyControl *getToolbar() const;
 
   bool insideDetRectC(int x, int y) const
   {
@@ -629,6 +683,11 @@ public:
 
   void onObjectSelectionChanged(RenderableEditableObject *obj);
   void onObjectsRemove();
+
+  bool runLandLtmapCmd(dag::ConstSpan<const char *> params);
+
+  // Same as rendinst::forceRiExtra.
+  static bool isForceRiExtra() { return forceRiExtra; }
 
 private:
   // Caches datailed textures for LandMesh
@@ -700,6 +759,8 @@ private:
 
     int hm2displacementQ;
     bool showFinalHM;
+    bool useMetricsHM;
+    bool useHm2Mirror;
 
     RenderParams() { init(); }
 
@@ -743,6 +804,14 @@ private:
   HeightMapStorage heightMap;
 
   MapStorage<uint32_t> &landClsMap;
+  // True once generateLandColors has populated landClsMap (and, when enabled,
+  // colorMap / detTexMap) for the current project open session. Needed
+  // because resizeLandClassMapFile sizes the map to heightMap*lcmScale up
+  // front -- so a getMapSizeX()>0 check passes even for a freshly sized but
+  // empty map. Export guards and LandClassSlotsManager::reinitRIGen check
+  // this bit to avoid acting on the pre-generate zero state. Cleared by
+  // loadObjects and eraseHeightmap; set at the end of generateLandColors.
+  bool landClsMapGenerated = false;
   int lcmScale;
   void *landClsLayersHandle;
   dag::Span<HmapBitLayerDesc> landClsLayer;
@@ -770,7 +839,7 @@ private:
   bool applyHeightBakeSplines = true;
   bool applyHeightBakeSplinesOnEdit = false;
 
-  MapStorage<uint64_t> *detTexIdxMap, *detTexWtMap;
+  hmap_storage::BlockedDetTexMap *detTexMap = nullptr;
 
   int detDivisor;
   HeightMapStorage heightMapDet;
@@ -782,9 +851,9 @@ private:
   int numDetailTextures;
   Tab<SimpleString> detailTexBlkName;
 
-  String lastHmapImportPath, lastLandExportPath, lastHmapExportPath, lastColormapExportPath, colorGenScriptFilename, lastTexImportPath,
-    lastGATExportPath, lastWaterHeightmapImportPath, lastHmapImportPathDet, lastHmapImportPathMain, lastWaterHeightmapImportPathDet,
-    lastWaterHeightmapImportPathMain;
+  String lastHmapImportPath, lastLandExportPath, lastHmapExportPath, lastColormapExportPath, lastWaterHeightmapExportPath,
+    lastTexImportPath, lastGATExportPath, lastWaterHeightmapImportPath, lastHmapImportPathDet, lastHmapImportPathMain,
+    lastWaterHeightmapImportPathDet, lastWaterHeightmapImportPathMain;
   struct FileChangeStat
   {
     int64_t size = 0, mtime = 0;
@@ -833,8 +902,109 @@ private:
   bool disableZtestForDebugNavMesh = false;
 
   PtrTab<ScriptParam> genLayers;
+  // Artist-editable typed parameters (Float / Range / Mask / Curve). Persisted
+  // under sibling block "landVars" of the genLayers BLK, surfaced in the property
+  // panel for add/delete and live edits. recompileGenLayerExpressions registers
+  // each entry into the shared landClassEval varMap with its type, builds
+  // evalCurves from Curve entries, and populates typedVarRuntime so the bake
+  // loop can write the per-pixel value into exprVars[]. Mask resolves its asset
+  // name to a script-image index at recompile and samples per-pixel via the
+  // shared sampleMask*UV path.
+  Tab<TypedVar> typedVars;
+
+  // Per-typedVar runtime binding rebuilt on every recompile, parallel-indexed to
+  // typedVars. Definition lives in hmlTypedVars.h so free helpers in
+  // hmlGenColorMap.cpp can take it by reference without poking at private state.
+  Tab<TypedVarRuntime> typedVarRuntime;
+
+  // CubicCurveSampler array fed to LcExprCurveNode via EvalCtx::userCtx. Index i
+  // is the slot stored as the float value of a Curve-typed var; CurveNode reads
+  // that float, casts to int, and samples evalCurves[idx]. Rebuilt from
+  // typedVars at every recompile; out-of-sync indices return 0 at eval time.
+  Tab<CubicCurveSampler> evalCurves;
+  // Optional "common expression": run once per pixel before any layer's expression so
+  // multiple layers can share intermediate values via `var name = ...`. Source text is
+  // stored as a single line in the .blk (newlines stripped on save, `;` -> `;\n` on
+  // load); commonExprArena holds the compiled bytecode and commonExprValid gates eval.
+  // Arena typed as Tab<uint8_t> (same as lcexpr::Arena) to avoid pulling landClassEval
+  // headers into this one. The bitset width 256 mirrors lcexpr::MAX_VAR_ID; a
+  // static_assert in hmlGenColorMap.cpp pins the two values together.
+  SimpleString commonExprText;
+  Tab<uint8_t> commonExprArena;
+  uint32_t commonExprRoot = 0;
+  eastl::bitset<256> commonExprVarMask;
+  bool commonExprValid = false;
+  // Last parse/compile error from compile_common_into; empty on success or empty text.
+  // Read by the common-expression Apply handler to surface the error in a message box.
+  SimpleString commonExprLastErr;
+  // Stashed by recompileGenLayerExpressions(): bake-time sizing for the per-pixel
+  // exprVars[] buffer and the evalFinite() bound.
+  //   commonExprNv     -- nv after compiling base + mask_<enabled_name> + common's
+  //                       var/let. Boundary between common-visible slots (shared
+  //                       across all layers) and per-layer private user-var slots.
+  //   lcMaxNv          -- max named-vars count used by any enabled layer's bytecode,
+  //                       PLUS lcexpr::MAX_TEMP_REGS reserved unconditionally for
+  //                       `{ block }`-scoped temp regs (caller-side simplification:
+  //                       cheaper to always reserve 16 floats than to track each
+  //                       expression's actual peak). Per-pixel exprVars[] is sized
+  //                       to max(VAR_COUNT + numLayers, lcMaxNv).
+  //   lcNumLayerVars   -- genLayers.size() at recompile time -- defines the per-layer
+  //                       mask slot range [VAR_COUNT, VAR_COUNT + lcNumLayerVars).
+  uint16_t commonExprNv = 0;
+  uint16_t lcMaxNv = 0;
+  int lcNumLayerVars = 0;
   bool showBlueWhiteMask;
+  bool showLandClassColors = false;
+  // Debug view mode -- single source of truth for the panel's combobox.
+  // showBlueWhiteMask / showLandClassColors are kept derived from it. The
+  // mask-edit render-path gates in hmlIGenEditorPlugin.cpp use
+  // (editedScriptImage && showEditedMask()) -- showEditedMask() is the
+  // brush-overlay predicate that does NOT depend on showBlueWhiteMask, so
+  // selecting DV_DEBUG_EXPR / DV_LAYER cannot suppress the brush.
+  enum DebugViewMode : int
+  {
+    DV_NONE = 0,
+    DV_BLUE_WHITE = 1,
+    DV_LANDCLASS_COLORS = 2,
+    DV_DEBUG_EXPR = 3,
+    DV_LAYER = 4,
+  };
+  int debugViewMode = DV_BLUE_WHITE;
+  // For DV_LAYER: paramName of the gen layer to visualize. Identifying the layer
+  // by name (rather than by index) keeps the overlay tied to the user's choice
+  // through add/move/delete reorders without per-mutation fix-ups; if the named
+  // layer is gone (deleted, renamed, or absent in a freshly-loaded project),
+  // updateDebugWeightTex auto-clears the overlay back to DV_NONE.
+  SimpleString debugLayerName;
+  // True for DV_DEBUG_EXPR / DV_LAYER: the debug overlay tex was built by
+  // re-evaluating an expression per pixel and bound via blue_white_mask_tex
+  // (same plumbing as showLandClassColors).
+  bool showDebugWeightOverlay = false;
+  // Debug expression: artist-editable expression evaluated per pixel for visual
+  // debugging only. Compiled in the same scope as a layer expression (sees base
+  // vars + mask_<name> + common's var/let). Never affects bake output.
+  SimpleString debugExprText;
+  Tab<uint8_t> debugExprArena;
+  uint32_t debugExprRoot = 0;
+  eastl::bitset<256> debugExprVarMask;
+  bool debugExprValid = false;
+  SimpleString debugExprLastErr;
+  uint16_t debugExprNv = 0;
   void updateBlueWhiteMask(const IBBox2 *);
+  void updateLandClassColorsTex();
+  // Re-evaluate the debug expression / selected layer expression at every cell
+  // and pack as grayscale into bluewhiteTex (sized to detTexMap dims). Bound via
+  // blue_white_mask_tex like the colored-landclass overlay; renders alongside
+  // the lmesh without the lex-sort/blend occlusion that the bake applies.
+  void updateDebugWeightTex();
+  // Shared per-pixel exprVars population + commonExpr eval, called by both
+  // the bake (generateLandColors) and the debug overlay (updateDebugWeightTex).
+  // layer_mask_needed and used_mask_tvs are passed as ConstSpan so any small-
+  // buffer-optimised (RelocatableFixedVector / StaticTab) or heap-backed (Tab)
+  // container can be passed verbatim. See implementation comment in
+  // hmlGenColorMap.cpp.
+  void fillPerPixelExprVarsAndEvalCommon(float *expr_vars_ptr, float fx, float fy, int layer_slots,
+    dag::ConstSpan<uint8_t> layer_mask_needed, uint16_t typed_vars_end_nv, dag::ConstSpan<int> used_mask_tvs);
   void updateGenerationMask(const IBBox2 *rect);
 
   bool showMonochromeLand;
@@ -917,11 +1087,14 @@ private:
   void eraseWaterHeightmap();
   void autocenterHeightmap(PropPanel::ContainerPropertyControl *panel, bool reset_render = true);
 
-  void exportHeightmap();
+  void exportHeightmap(bool export_detailed);
   bool exportHeightmap(String &filename, real min_height, real height_range, bool exp_det_hmap);
 
   void exportColormap();
   bool exportColormap(String &filename);
+
+  void exportWaterHeightmap(bool export_detailed);
+  bool exportWaterHeightmap(const String &filename, real min_height, real height_range, bool export_detailed);
 
   void exportLand();
   bool exportLand(String &filename);
@@ -930,10 +1103,10 @@ private:
   void exportSplines(mkbindump::BinDumpSaveCB &cwr);
   void exportLoftMasks(const char *out_folder, int main_hmap_sz, int det_hmap_sz, float hmin, float hmax, int prefab_dest_idx);
 
-  bool exportLandMesh(mkbindump::BinDumpSaveCB &cwr, IWriterToLandmesh *land_modifier, LandRayTracer *raytracer,
+  bool exportLandMesh(mkbindump::BinDumpSaveCB &cwr, IWriterToLandmesh *land_modifier, EditorLandRayTracer *raytracer,
     bool tools_internal = false);
 
-  void generateLandColors(const IBBox2 *in_rect = NULL, bool finished = true);
+  void generateLandColors(const IBBox2 *in_rect = NULL, bool finished = true, bool may_rebuild_lmesh_if_needed = true);
 
   void onLandRegionChanged(int x0, int y0, int x1, int y1, bool recalc_all = false, bool finished = true);
   void onWholeLandChanged();
@@ -949,6 +1122,8 @@ private:
   void recalcLightingInRect(const IBBox2 &rect);
   void updateRendererLighting();
 
+  bool resolveTileTex(const char *name, TEXTUREID &out_id, String *out_resolved_name = nullptr);
+
   void updateLandOnPaint(Brush *brush, bool finished);
   void delayedResetRenderer();
   void rebuildLandmeshDump();
@@ -963,20 +1138,57 @@ private:
 
   void createWaterHmapFile(CoolConsole &con, bool det);
 
-  bool generateLandMeshMap(LandMeshMap &map, CoolConsole &con, bool import_sgeom, LandRayTracer **out_tracer,
-    bool strip_det_hmap_from_tracer = true);
+  bool generateLandMeshMap(LandMeshMap &map, CoolConsole &con, bool import_sgeom, EditorLandRayTracer **out_tracer,
+    bool strip_det_hmap_from_tracer = true, bool early_pass = false);
 
   void rebuildWaterSurface(Tab<Point3> *loft_pt_cloud = NULL, Tab<Point3> *water_border_polys = NULL,
     Tab<Point2> *hmap_sweep_polys = NULL);
 
-  bool compileAndRunColorGenScript(bool &was_inited, SQPRINTFUNCTION &old_print_func, SQPRINTFUNCTION &old_err_func);
-  void closeColorGenScript(bool &was_inited, SQPRINTFUNCTION &old_print_func, SQPRINTFUNCTION &old_err_func);
-  bool createDefaultScript(const char *path) const;
-
-  bool getColorGenVarsFromScript();
-
   bool loadGenLayers(const DataBlock &blk);
   bool saveGenLayers(DataBlock &blk);
+
+  // Scan every layer's exprText and the common expression for identifier-boundary
+  // references to the typed-var's parser-visible name(s). Returns true if any
+  // call sites were found, with human-readable descriptions in `outSites`. For
+  // Range, scans both <name>_lo and <name>_hi. Used by the Delete button to
+  // refuse removing a variable still in use.
+  bool scanTypedVarRefs(const TypedVar &v, Tab<String> &outSites) const;
+
+  // True if `name` would collide with a name the recompile path will register
+  // outside the typed-var slot range. Covers the 6 fixed builtins (height,
+  // angle, curvature, mask, world_x, world_y) and every mask_<layer> binding
+  // for the current genLayers list. Used by the Add dialog so the artist hits
+  // a clear error up front instead of silently aliasing an existing slot when
+  // recompileGenLayerExpressions runs.
+  //
+  // Public so the Add dialog (free function in hmlTypedVars.cpp) can call it
+  // through HmapLandPlugin::self.
+public:
+  bool isReservedVarName(const char *name) const;
+
+  // True if `name` is declared as `var <name>` or `let <name>` somewhere in
+  // commonExprText or any layer's exprText. lcexpr's parser rejects redeclaring
+  // a name already in the shared varMap, so a typed var sharing this name would
+  // make the next recompile fail. The Add dialog calls this so the artist hits
+  // a clear up-front error instead of seeing a recompile failure after the
+  // panel has already mutated. `outSite` returns a human-readable origin
+  // (`common expression` or `layer '<name>' expression`).
+  bool findVarLetDeclSite(const char *name, SimpleString &outSite) const;
+
+  // True if `probe` matches any current typed var's parser-visible name (bare
+  // name for non-Range, <name>_lo / <name>_hi for Range). On a hit `outConflict`
+  // returns the offending typed-var's display name. Used by the typed-var Add
+  // dialog and by the layer add/rename path (probe = "mask_<layerName>") so a
+  // collision is caught before the change commits.
+  bool collidesWithTypedVar(const char *probe, SimpleString &outConflict) const;
+
+private:
+  // Live-rebuild the CubicCurveSampler at evalCurves[typedVarRuntime[row].curveIdx]
+  // from typedVars[row]. Called from onChange when a curve var's control points or
+  // approximation type are edited so the next bake samples the updated shape
+  // without paying for a full recompileGenLayerExpressions. Safe no-op when the
+  // row is not a Curve, has no runtime binding, or the curveIdx is out of range.
+  void rebuildEvalCurveForRow(int row);
   void regenLayerTex();
   void storeLayerTex();
 
@@ -985,7 +1197,7 @@ private:
   void renderHeight();
   void renderGrassMask();
 #if defined(USE_HMAP_ACES)
-  bool getRenderNoTex() { return !(showBlueWhiteMask && editedScriptImage); }
+  bool getRenderNoTex() { return !(editedScriptImage && showEditedMask()); }
 #else
   bool getRenderNoTex() { return false; }
 #endif
@@ -1025,15 +1237,15 @@ private:
 
     const char *getName() const { return name; }
 
-    E3DCOLOR sampleImageUV(real x, real y, bool clamp_x, bool clamp_y);
-    E3DCOLOR sampleImagePixelUV(real x, real y, bool clamp_x, bool clamp_y);
-    float sampleMask1UV(real x, real y);
-    float sampleMask1PixelUV(real x, real y);
-    float sampleMask8UV(real x, real y);
-    float sampleMask8PixelUV(real x, real y);
+    E3DCOLOR sampleImageUV(real x, real y, bool clamp_x, bool clamp_y) const;
+    E3DCOLOR sampleImagePixelUV(real x, real y, bool clamp_x, bool clamp_y) const;
+    float sampleMask1UV(real x, real y) const;
+    float sampleMask1PixelUV(real x, real y) const;
+    float sampleMask8UV(real x, real y) const;
+    float sampleMask8PixelUV(real x, real y) const;
 
-    float sampleMask1UV(real x, real y, bool clamp_x, bool clamp_y);
-    float sampleMask8UV(real x, real y, bool clamp_x, bool clamp_y);
+    float sampleMask1UV(real x, real y, bool clamp_x, bool clamp_y) const;
+    float sampleMask8UV(real x, real y, bool clamp_x, bool clamp_y) const;
 
     void paintImageUV(real x0, real y0, real x1, real y1, bool clamp_x, bool clamp_y, E3DCOLOR color);
     void paintMask1UV(real x, real y, bool val);
@@ -1047,9 +1259,9 @@ private:
     bool isSaved;
     int fileNotifyId;
 
-    inline void calcClampMapping(float &fx, float &fy, int &ix, int &iy, int &nx, int &ny);
-    inline void calcClampMapping(float fx, float fy, int &ix, int &iy);
-    inline void calcMapping(float &fx, float &fy, int &ix, int &iy, int &nx, int &ny, bool clamp_u, bool clamp_v);
+    inline void calcClampMapping(float &fx, float &fy, int &ix, int &iy, int &nx, int &ny) const;
+    inline void calcClampMapping(float fx, float fy, int &ix, int &iy) const;
+    inline void calcMapping(float &fx, float &fy, int &ix, int &iy, int &nx, int &ny, bool clamp_u, bool clamp_v) const;
     void registerFnotify();
     void onFileChanged(int /*file_name_id*/) override; // IFileChangedNotify
   };
@@ -1108,6 +1320,7 @@ private:
   int numMeshVertices;
   int lod1TrisDensity;
   float importanceMaskScale;
+  float riMinCellSz = 0.f;
   float riMaxCellSz = 2048.f;
   int riMaxGenLayerCellDivisor = 8;
 
@@ -1127,7 +1340,6 @@ private:
   bool snowDynPreview, snowSpherePreview;
   float ambSnowValue, dynSnowValue;
   int snowValSVId, snowPrevievSVId;
-  bool calculating_shadows; // calculating shadows - now
 
   DebugPrimitivesVbuffer *navMeshBuf;
   DebugPrimitivesVbuffer *coversBuf;
@@ -1141,4 +1353,6 @@ private:
   Tab<NavmeshAreasProcessing> navmeshAreasProcessing;
 
   int settingsBaseId;
+
+  static bool forceRiExtra;
 };

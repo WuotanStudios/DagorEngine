@@ -16,7 +16,7 @@ class VariantContext
   const ShaderVariant::VariantInfo mVariant;
   ShaderSemCode &mParsedSemcodeRef;
   ShaderSemCode::PassTab *mParsedPassRef;
-  NamedConstBlock mNamedConstsTable{};
+  NamedConstBlock mNamedConstsTable;
   BoolVarTable mBoolVarTable;
   LocalVarTable mLocVars;
   StcodeBytecodeAccumulator mStcodeBytecode;
@@ -24,7 +24,7 @@ class VariantContext
 
   ShaderContext &mParent;
   TargetContext &mTgtParent;
-  const CompilationContext &mCompParent;
+  CompilationContext &mCompParent;
 
 public:
   PINNED_TYPE(VariantContext)
@@ -33,6 +33,7 @@ public:
   const ShaderContext &shCtx() const { return mParent; }
   TargetContext &tgtCtx() { return mTgtParent; }
   const TargetContext &tgtCtx() const { return mTgtParent; }
+  CompilationContext &compCtx() { return mCompParent; }
   const CompilationContext &compCtx() const { return mCompParent; }
 
   const ShaderVariant::VariantInfo &variant() const { return mVariant; }
@@ -65,11 +66,11 @@ private:
   friend class ShaderContext;
 
   VariantContext(ShaderVariant::VariantInfo variant, ShaderSemCode &parsed_code, ShaderSemCode::PassTab *parsed_pass,
-    bool use_branches_for_cppstcode, ShaderContext &parent, TargetContext &tgt_parent, const CompilationContext &comp_parent) :
+    bool use_branches_for_cppstcode, ShaderContext &parent, TargetContext &tgt_parent, CompilationContext &comp_parent) :
     mVariant{variant},
     mParsedSemcodeRef{parsed_code},
     mParsedPassRef{parsed_pass},
-    mBoolVarTable{tgt_parent.globBoolVars().maxId()},
+    mBoolVarTable{tgt_parent.boolVarNameMap(), &tgt_parent.globBoolVars()},
     mLocVars{tgt_parent},
     mStcodeBytecode{tgt_parent.sourceParseState().parser},
     mCppStcode{use_branches_for_cppstcode},

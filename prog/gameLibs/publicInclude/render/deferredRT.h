@@ -6,8 +6,12 @@
 
 #include <drv/3d/dag_consts.h>
 #include <drv/3d/dag_decl.h>
+#include <drv/3d/dag_renderTarget.h>
 #include <3d/dag_texMgr.h>
+#include <math/dag_Point4.h>
+#include <math/integer/dag_IPoint4.h>
 #include <resourcePool/resourcePool.h>
+#include <EASTL/array.h>
 
 class BaseTexture;
 typedef BaseTexture Texture;
@@ -24,9 +28,19 @@ public:
   static const int MAX_NUM_MRT = 5;
 
   void close();
-  void setRt();
-  void resolve();
+  // Binds the gbuffer color slots and the deferred depth in the given access mode.
+  // Pass a non-null depth_override to attach a different depth texture instead.
+  void setRt(DepthAccess depth_access = DepthAccess::RW, BaseTexture *depth_override = nullptr);
   void setVar();
+  void resetVar();
+  void publishSizeAndTransformVars() const;
+  // How shaders address this gbuffer, published by setVar() along with the textures it describes. Defaults to
+  // 1-to-1; only a gbuffer shared by several views needs to set it, one sub-rect per eye under VR multiview.
+  void setUvTransform(const Point4 &uv_transform, const IPoint4 &uv_transform_i)
+  {
+    uvTransform = uv_transform;
+    uvTransformI = uv_transform_i;
+  }
   void debugRender(int show_gbuffer);
   void initDebugTex();
   const ManagedTex &getDbgTex();
@@ -53,12 +67,8 @@ public:
     return mrts[idx] ? mrts[idx]->getTexId() : BAD_TEXTUREID;
     G_UNUSED(optional);
   }
-  const ManagedTex &getRtAll(uint32_t idx) const
-  {
-    G_ASSERT(mrts[idx]);
-    return *mrts[idx];
-  }
   uint32_t getRtNum() const { return numRt; }
+  const ManagedTex &getOrCreateBvhDummyTex();
   void swapDepth(ResizableTex &ndepth) { eastl::swap(depth, ndepth); }
   d3d::SamplerHandle getSampler() const { return baseSampler; }
   bool useRt(uint32_t idx) const
@@ -66,8 +76,6 @@ public:
     G_ASSERT(idx < MAX_NUM_MRT);
     return mrtPools[idx] != nullptr;
   }
-  void acquirePooledRTs();
-  void releasePooledRT(uint32_t idx);
 
 protected:
   uint32_t recreateDepthInternal(uint32_t fmt);
@@ -77,6 +85,9 @@ protected:
   StereoMode stereoMode = StereoMode::MonoOrMultipass;
   int numRt = 0, width = 0, height = 0;
   char name[64] = {};
+
+  Point4 uvTransform = Point4(1, 1, 0, 0);
+  IPoint4 uvTransformI = IPoint4::ZERO;
 
   ResizableRTargetPool::Ptr mrtPools[MAX_NUM_MRT];
   ResizableRTarget::Ptr mrts[MAX_NUM_MRT];
@@ -89,3 +100,7 @@ protected:
   bool useResolvedDepth = false;
   bool shouldRenderDbgTex = false;
 };
+
+bool deferred_rt_needs_bvh_dummy_tex();
+
+using GbufRtArray = eastl::array<BaseTexture *, DeferredRT::MAX_NUM_MRT>;

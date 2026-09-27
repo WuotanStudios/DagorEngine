@@ -9,11 +9,13 @@
 namespace darg
 {
 
-const char *profiler_metric_names[NUM_PROFILER_METRICS] = {
+static const char *const profiler_metric_names_arr[] = {
   "Render total",
   "Before render total",
   "Render text",
   "Render 9rect",
+  "Render textarea",
+  "Recalc textarea",
   "Update total",
   "Component script",
   "RList rebuild",
@@ -22,21 +24,23 @@ const char *profiler_metric_names[NUM_PROFILER_METRICS] = {
   "Bhv br",
   "ETree br",
   "Recalc layout *",
+  "FRP update",
+  "Rebuild invalidated",
+  "ETree rebuild *",
   "<dbg>",
 };
-
+static_assert(countof(profiler_metric_names_arr) == NUM_PROFILER_METRICS);
+const char *const *profiler_metric_names = profiler_metric_names_arr;
 
 static bool is_metric_cumulative(ProfilerMetricId m)
 {
   return m == M_RENDER_TEXT || m == M_RENDER_9RECT || m == M_COMPONENT_SCRIPT || m == M_RECALC_LAYOUT || m == M_ETREE_BEFORE_RENDER ||
-         m == M_RENDER_LIST_REBUILD;
+         m == M_RENDER_LIST_REBUILD || m == M_ETREE_REBUILD;
 }
 
 
 Metric::Metric()
 {
-  G_ASSERT(profiler_metric_names[NUM_PROFILER_METRICS - 1]);
-
   memset(history, 0, sizeof(history));
   count = 0;
   firstPos = 0;
@@ -175,6 +179,7 @@ void Profiler::afterUpdate()
 {
   metrics[M_COMPONENT_SCRIPT].apply();
   metrics[M_RECALC_LAYOUT].apply();
+  metrics[M_ETREE_REBUILD].apply();
 }
 
 

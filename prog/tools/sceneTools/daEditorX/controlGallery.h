@@ -37,6 +37,7 @@ private:
     Gallery_Combo,
     Gallery_CurveEdit,
     Gallery_EditBox,
+    Gallery_EditBox_Icon,
     Gallery_EditBox_Multiline,
     Gallery_EditFloat,
     Gallery_EditInt,
@@ -77,7 +78,7 @@ private:
     Gallery_EndControl,
   };
 
-  void onChange(int pcb_id, PropPanel::ContainerPropertyControl *panel) override
+  void onChange(int pcb_id, PropPanel::ContainerPropertyControl *) override
   {
     if (pcb_id == Gallery_EnabledControls)
     {
@@ -102,7 +103,7 @@ private:
     }
   }
 
-  void onPostEvent(int pcb_id, PropPanel::ContainerPropertyControl *panel) override
+  void onPostEvent(int pcb_id, PropPanel::ContainerPropertyControl *) override
   {
     if (pcb_id == Gallery_EnabledControls || pcb_id == Gallery_SeparatorBetweenControls)
     {
@@ -151,6 +152,11 @@ private:
     addControlGallerySeparator();
 
     panelWindow->createEditBox(Gallery_EditBox, "EditBox", "", enabledControls);
+    addControlGallerySeparator();
+
+    panelWindow->createEditBox(Gallery_EditBox_Icon, "EditBox with icon", "", enabledControls);
+    panelWindow->getById(Gallery_EditBox_Icon)->setButtonPictureValues("search");
+    panelWindow->getById(Gallery_EditBox_Icon)->setPlaceholderText("Placeholder");
     addControlGallerySeparator();
 
     panelWindow->createEditBox(Gallery_EditBox_Multiline, "EditBox multiline", "", enabledControls, true, true, hdpi::_pxScaled(80));

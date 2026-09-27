@@ -1,25 +1,59 @@
 from "dagor.http" import httpRequest, HTTP_FAILED, HTTP_ABORTED, HTTP_SUCCESS
+from "types" import String, Table, Array, Function
 from "functools.nut" import *
 let { Task } = require("monads.nut")
 //local dlog = require("log.nut")().dlog
-/*
-  todo:
-    ? handle http code different from 200..300 as error
-*/
-
-let statusText = {
+let statusText = freeze({
   [HTTP_SUCCESS] = "SUCCESS",
   [HTTP_FAILED] = "FAILED",
   [HTTP_ABORTED] = "ABORTED",
+})
+function mkHttpCallback(resolveFn, rejectFn, url){
+  return tryCatch(
+    function(response){
+      let {status, http_code, body=null} = response
+
+      let sttxt = statusText?[status]
+      println($"http status for '{url}' = {sttxt}")
+      if (status != HTTP_SUCCESS || !(http_code==0 || (http_code>=200 && http_code<300))) {
+        throw({error=$"http error status = {sttxt}, http_code = {http_code}", http_code, status, body})
+      }
+      resolveFn(body)
+    },
+    rejectFn
+  )
+}
+function httpGet(url, resolveFn, rejectFn=null, params=null){
+  assert(url instanceof String, "url should be string")
+  assert(resolveFn instanceof Function, "resolveFn should be function that accepts responce body blob object (has 'as_string' method)")
+  assert(rejectFn==null || rejectFn instanceof Function, "rejectFn should be null or function that accepts error object that can be string or object with 'status', 'http_code' and 'body' fields, or any other error")
+  httpRequest({url, method = "GET", callback = mkHttpCallback(resolveFn, rejectFn, url)}.__update(params ?? {}))
 }
 
-function httpGet(url, callback){
-  httpRequest({
-    url
-    method = "GET"
-    callback
-  })
+function httpPost(url, resolveFn, rejectFn=null, params=null){
+  assert(url instanceof String, "url should be string")
+  assert(resolveFn instanceof Function, "resolveFn should be function that accepts responce body blob object (has 'as_string' method)")
+  assert(rejectFn==null || rejectFn instanceof Function, "rejectFn should be null or function that accepts error object that can be string or object with 'status', 'http_code' and 'body' fields, or any other error")
+  httpRequest({ method = "POST", url, callback=mkHttpCallback(resolveFn, rejectFn, url)}.__update(params ?? {}))
 }
+
+function httpFormPost(url, data, resolveFn, rejectFn=null) {
+  assert(url instanceof String, "url should be string")
+  assert(resolveFn instanceof Function, "resolveFn should be function that accepts responce body blob object (has 'as_string' method)")
+  assert(rejectFn==null || rejectFn instanceof Function, "rejectFn should be null or function that accepts error object that can be string or object with 'status', 'http_code' and 'body' fields, or any other error")
+  assert(data instanceof Table, "data should be object with string keys")
+  httpRequest({ method = "POST", url, data, callback=mkHttpCallback(resolveFn, rejectFn, url)})
+}
+
+function httpJson(url, json, resolveFn, rejectFn=null){
+  assert(url instanceof String, "url should be string")
+  assert(resolveFn instanceof Function, "resolveFn should be function that accepts responce body blob object (has 'as_string' method)")
+  assert(rejectFn==null || rejectFn instanceof Function, "rejectFn should be null or function that accepts error object that can be string or object with 'status', 'http_code' and 'body' fields, or any other error")
+  assert(json instanceof Table || json instanceof String, "'json`' should be object or string")
+  httpRequest({ method = "POST", url, json, callback=mkHttpCallback(resolveFn, rejectFn, url)})
+}
+
+
 function TaskHttpGet(url) {
   return Task(function(rejectFn, resolveFn) {
     println($"http 'get' requested for '{url}'")
@@ -28,10 +62,11 @@ function TaskHttpGet(url) {
       method = "GET"
       callback = tryCatch(
         function(response){
-          let status = response.status
+          let {status, http_code} = response
+
           let sttxt = statusText?[status]
           println($"http status for '{url}' = {sttxt}")
-          if (status != HTTP_SUCCESS) {
+          if (status != HTTP_SUCCESS || !(http_code==0 || (http_code>=200 && http_code<300))) {
             throw($"http error status = {sttxt}")
           }
           resolveFn(response.body)
@@ -47,8 +82,8 @@ let RESOLVED = persist("RESOLVED", @() {})
 let REJECTED = persist("REJECTED", @() {})
 
 function TaskHttpMultiGet(urls, rejectOne=@(x) x, resolveOne=@(x) x) {
-  assert(type(urls) == "array", @() $"expected urls as 'array' got '{type(urls)}'")
-  assert(type(rejectOne) == "function" && type(resolveOne) == "function", "incorrect type of arguments")
+  assert(urls instanceof Array, @() $"expected urls as 'array' got '{type(urls)}'")
+  assert(rejectOne instanceof Function && resolveOne instanceof Function, "incorrect type of arguments")
   return Task(function(rejectFn, resolveFn) {
     let total = urls.len()
     let res = array(total)
@@ -93,11 +128,16 @@ function TaskHttpMultiGet(urls, rejectOne=@(x) x, resolveOne=@(x) x) {
         )
       })
     }
+    if (total == 0)
+      checkStatus()
   })
 }
 
-return{
+return freeze({
   TaskHttpGet
-  httpGet
   TaskHttpMultiGet
-}
+  httpGet
+  httpPost
+  httpJson
+  httpFormPost
+})

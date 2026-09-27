@@ -34,8 +34,8 @@ uint32_t DataBlock::complexParamsSize() const
   return data->data.size() - ((isBlocksOwned() ? blocksCount * sizeof(block_id_t) : 0) + paramsCount * sizeof(Param));
 }
 
-DataBlock::DataBlock(IMemAlloc *) : shared(new DataBlockShared) { nameIdAndFlags |= IS_TOPMOST; }
-DataBlock::DataBlock(const char *filename, IMemAlloc *a) : DataBlock(a) { load(filename); }
+DataBlock::DataBlock() : shared(new DataBlockShared), nameIdAndFlags(IS_TOPMOST) {}
+DataBlock::DataBlock(const char *filename, IMemAlloc *) : DataBlock() { load(filename); }
 DataBlock::DataBlock(const DataBlock &b) : DataBlock()
 {
   if (!b.hasNoNameId())
@@ -128,7 +128,7 @@ void DataBlock::deleteShared()
   }
 }
 
-const DataBlock DataBlock::emptyBlock((IMemAlloc *)nullptr);
+const DataBlock DataBlock::emptyBlock;
 
 const DataBlock::Param *DataBlock::getParamsPtr() const { return getParamsImpl(); }
 const DataBlock *const *DataBlock::getBlockRWPtr() const
@@ -779,7 +779,10 @@ int DataBlock::paramCountById(int nid) const
 void DataBlock::changeParamName(uint32_t i, const char *name)
 {
   if (i < paramCount())
-    (isOwned() ? getParam<true>(i) : getParam<false>(i)).nameId = addNameId(name);
+  {
+    toOwned(); // RO param data can be shared with other blocks (dedup dump), never write it in place
+    getParam<true>(i).nameId = addNameId(name);
+  }
 }
 
 template <bool rw>
@@ -911,15 +914,10 @@ bool DataBlock::removeParam(uint32_t idx)
 {
   if (uint32_t(idx) >= (uint32_t)paramCount())
     return false;
-  Param *p = getParamsImpl();
-  p += idx;
-  if (isOwned())
-  {
-    memmove(p, p + 1, data->data.data() + data->data.size() - (const char *)(p + 1));
-    data->data.resize(data->data.size() - sizeof(Param));
-  }
-  else
-    memmove(p, p + 1, (paramsCount - 1 - idx) * sizeof(Param));
+  toOwned(); // RO param data can be shared with other blocks (dedup dump), never write it in place
+  Param *p = getParams<true>() + idx;
+  memmove(p, p + 1, data->data.data() + data->data.size() - (const char *)(p + 1));
+  data->data.resize(data->data.size() - sizeof(Param));
   paramsCount--;
   return true;
 }

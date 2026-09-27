@@ -4,7 +4,7 @@ testData/static_analyzer/w285.nut:9:5
 local uu = ::sys.gh("fff") ?? ""
 if ((uu ?? "") != "")
      ^-
-  ::print($"x: {uu}")
+  print($"x: {uu}")
 
 
 WARNING: w285 (expr-cannot-be-null) The expression to the left of the 'null coalescing' cannot be null.
@@ -28,5 +28,14 @@ testData/static_analyzer/w285.nut:20:9
 local regions3 = ::x ? 2 : 4
 let _h = regions3 != null
          ^-------
+
+
+WARNING: w285 (expr-cannot-be-null) The expression to the left of the 'equal check' cannot be null.
+testData/static_analyzer/w285.nut:55:9
+
+  local x = 5
+  while (x != null)
+         ^
+    x++
 
 

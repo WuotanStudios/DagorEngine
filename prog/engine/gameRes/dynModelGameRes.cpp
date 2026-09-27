@@ -58,7 +58,7 @@ public:
     return find_value_idx(obsoleteRes, r) >= 0 || findGameRes(r) >= 0;
   }
 
-  GameResource *getGameResource(int res_id) override;
+  GameResource *getGameResource(RRL rrl, int res_id) override;
 
 
   bool addRefGameResource(GameResource *resource) override;
@@ -67,12 +67,12 @@ public:
 
   bool releaseGameResource(GameResource *resource) override;
 
-  bool freeUnusedResources(bool forced_free_unref_packs, bool once = false) override;
+  bool freeUnusedResources(RRL rrl, bool forced_free_unref_packs, bool once = false) override;
 
   GameResource *discardOlderResAfterUpdate(int res_id);
 
   void loadGameResourceData(int res_id, IGenLoad &cb) override;
-  void createGameResource(int /*res_id*/, const int * /*ref_ids*/, int /*num_refs*/) override {}
+  void createGameResource(RRL, int, const int *, int) override {}
 
   void reset() override;
 
@@ -99,15 +99,16 @@ int DynModelGameResFactory::findGameRes(DynamicRenderableSceneLodsResource *res)
 }
 
 
-GameResource *DynModelGameResFactory::getGameResource(int res_id)
+GameResource *DynModelGameResFactory::getGameResource(RRL rrl, int res_id)
 {
+  WinAutoLock lock(get_gameres_main_cs());
+
   int id = findGameRes(res_id);
-
   if (id < 0)
-    ::load_game_resource_pack(res_id);
-
-  id = findGameRes(res_id);
-
+  {
+    load_game_resource_pack_gameres_main_cs_locked(res_id, rrl);
+    id = findGameRes(res_id);
+  }
   if (id < 0)
     return NULL;
 
@@ -161,12 +162,12 @@ bool DynModelGameResFactory::releaseGameResource(GameResource *resource)
 }
 
 
-bool DynModelGameResFactory::freeUnusedResources(bool forced_free_unref_packs, bool once /*= false*/)
+bool DynModelGameResFactory::freeUnusedResources(RRL rrl, bool forced_free_unref_packs, bool once /*= false*/)
 {
   bool result = false;
   for (int i = gameRes.size() - 1; i >= 0; --i)
   {
-    if (get_refcount_game_resource_pack_by_resid(gameRes[i].resId) > 0)
+    if (rrl && is_res_required(rrl, gameRes[i].resId))
       continue;
     // 1 ref for dmUnitedVdata, 1 ref for res, others are for created instances
     if (gameRes[i].sceneRes && gameRes[i].sceneRes->getRefCount() > 1 + dmUnitedVdataUsed)
@@ -218,7 +219,7 @@ void DynModelGameResFactory::reset()
   if (dmUnitedVdataUsed)
   {
     dmUnitedVdata.clear();
-    freeUnusedResources(false, false);
+    freeUnusedResources(nullptr, false, false);
   }
 
   if (!gameRes.empty())
@@ -245,7 +246,6 @@ void DynModelGameResFactory::loadGameResourceData(int res_id, IGenLoad &cb)
       return;
   }
 
-#ifndef NO_3D_GFX
   String name;
   get_game_resource_name(res_id, name);
   FATAL_CONTEXT_AUTO_SCOPE(name);
@@ -256,17 +256,17 @@ void DynModelGameResFactory::loadGameResourceData(int res_id, IGenLoad &cb)
   int flags = (dmUnitedVdataUsed ? SRLOAD_SRC_ONLY : 0) | SRLOAD_NO_TEX_REF;
   if (makeBuffersBindable)
     flags |= SRLOAD_BIND_SHADER_RES;
+
   Ptr<DynamicRenderableSceneLodsResource> srcRes =
-    DynamicRenderableSceneLodsResource::loadResource(cb, flags, -1, gameres_dynmodel_desc.getBlockByName(name));
+    DynamicRenderableSceneLodsResource::loadResource(cb, flags, name, -1, gameres_dynmodel_desc.getBlockByName(name));
+
   if (srcRes && dmUnitedVdataUsed)
     dmUnitedVdata.addRes(srcRes);
   textag_mark_end();
   dagor_reset_sm_tex_load_ctx();
   if (!srcRes)
     logerr("Error loading DynModel resource %s", name);
-#else
-  DynamicRenderableSceneLodsResource *srcRes = NULL;
-#endif
+
   WinAutoLock lock2(cs);
   GameRes &gr = gameRes.push_back();
   gr.resId = res_id;
@@ -334,14 +334,15 @@ static void batch_reload_res(void *)
   int64_t reft = profile_ref_ticks();
 #endif
 
+  PtrTab<DynamicRenderableSceneLodsResource> pendingReloadResListCopy;
   {
+    // Move buffer away, so that we can release the lock before calling functions on dmUnitedVdata
     std::lock_guard<std::mutex> scopedLock(pendingReloadResListMutex);
     rcnt = pendingReloadResList.size();
-    dmUnitedVdata.discardUnusedResToFreeReqMem();
-    for (DynamicRenderableSceneLodsResource *res : pendingReloadResList)
-      dmUnitedVdata.reloadRes(res);
-    pendingReloadResList.clear();
+    pendingReloadResListCopy = eastl::move(pendingReloadResList);
   }
+  dmUnitedVdata.reloadResList(std::move(pendingReloadResListCopy));
+  dmUnitedVdata.discardUnusedResToFreeReqMem();
 
   const auto &mt_stats = ShaderMatVdata::get_model_load_stats(VDATA_MT_DYNMODEL);
   if (interlocked_acquire_load(mt_stats.reloadDataCount) == last_reported_mls.reloadDataCount)
@@ -360,14 +361,14 @@ static void batch_reload_res(void *)
     COPY_STAT(reloadDataCount);
 #undef COPY_STAT
     String status_str(framemem_ptr());
-    dmUnitedVdata.buildStatusStr(status_str, false);
-    debug("unitedVdata<%s>: reloaded %u models (%uK for %u msec) during last %u msec [total reloaded %uK of %u models]\n\n%s\n",
+    dmUnitedVdata.buildStatusStrThrottled(status_str, 30 * 1000000);
+    debug("unitedVdata<%s>: reloaded %u models (%uK for %u msec) during last %u msec [total reloaded %uK of %u models]%s",
       DynamicRenderableSceneLodsResource::getStaticClassName(), diff_mls.reloadDataCount, diff_mls.reloadDataSizeKb,
       diff_mls.reloadTimeMsec, profile_time_usec(last_reported_mls_reft) / 1000, last_reported_mls.reloadDataSizeKb,
       last_reported_mls.reloadDataCount, status_str);
     last_reported_mls_reft = profile_ref_ticks();
   }
-#if DAGOR_DBGLEVEL > 0
+#if DAGOR_DBGLEVEL > 0 && !defined(DAGOR_THREAD_SANITIZER)
   const unsigned end_frame_no = interlocked_acquire_load(mss.end_frame_no);
   const unsigned start_frame_no = interlocked_acquire_load(mss.start_frame_no);
   if (dagor_frame_no() > end_frame_no + 16 || end_frame_no > start_frame_no + 600)

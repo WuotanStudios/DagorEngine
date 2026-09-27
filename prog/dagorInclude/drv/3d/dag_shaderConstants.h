@@ -8,10 +8,11 @@
 #include <util/dag_globDef.h>
 
 #include <drv/3d/dag_consts.h>
+#include <drv/3d/dag_multi_interface.h>
 
 class Sbuffer;
 
-namespace d3d
+namespace d3d _MULTI_INTERFACE
 {
 /**
  * @brief Sets shader constants for the specified stage.
@@ -140,34 +141,15 @@ bool set_const_buffer(unsigned stage, unsigned slot, const float *data, unsigned
  * @brief Sets a constant buffer for the specified stage using a buffer object.
  *
  * Constant buffers are valid until driver acquire call or end of frame.
- * To unbind, use set_const_buffer(stage, 0, nullptr).
+ * To unbind, use set_const_buffer(stage, slot, nullptr).
  *
  * @param stage The shader stage (STAGE_VS, STAGE_PS, STAGE_CS).
- * @param slot The buffer slot.
- * @param buffer Pointer to the buffer object. Must be created with d3d::buffers::create_persistent_cb or
- * d3d::buffers::create_one_frame_cb.
- * @param consts_offset The offset of the constants in the buffer. (Not used)
- * @param consts_size The size of the constants in the buffer. (Not used)
- * @todo consts_offset and consts_size are not used. Remove them?
+ * @param slot The buffer slot. Must be less than the platform constant-buffer count; [0, 12) is portable.
+ * @param buffer Pointer to the buffer object. When non-null it must have SBCF_BIND_CONSTANT (created with
+ * d3d::buffers::create_persistent_cb or d3d::buffers::create_one_frame_cb).
  * @return True if the constant buffer was set successfully, false otherwise.
  */
-bool set_const_buffer(unsigned stage, unsigned slot, Sbuffer *buffer, uint32_t consts_offset = 0, uint32_t consts_size = 0);
-
-/**
- * @brief Sets the size of the vertex shader constant buffer that can be filled with set_const call.
- *
- * @param required_size The required size of the constant buffer. If 0, the default size is set.
- * @return The actual size of the constant buffer.
- */
-int set_vs_constbuffer_size(int required_size);
-
-/**
- * @brief Sets the size of the compute shader constant buffer that can be filled with set_const call.
- *
- * @param required_size The required size of the constant buffer. If 0, the default size is set.
- * @return The actual size of the constant buffer.
- */
-int set_cs_constbuffer_size(int required_size);
+bool set_const_buffer(unsigned stage, unsigned slot, Sbuffer *buffer);
 
 /**
  * @brief Sets a constant buffer at slot 0 for the specified stage. Uses the fastest method available on the platform.
@@ -209,7 +191,7 @@ inline void release_cb0_data(unsigned stage)
 #endif
 }
 
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 #if _TARGET_D3D_MULTI
 #include <drv/3d/dag_interface_table.h>
@@ -225,13 +207,7 @@ inline bool set_immediate_const(unsigned stage, const uint32_t *data, unsigned n
   return d3di.set_immediate_const(stage, data, num_words);
 }
 
-inline int set_vs_constbuffer_size(int required_size) { return d3di.set_vs_constbuffer_size(required_size); }
-inline int set_cs_constbuffer_size(int required_size) { return d3di.set_cs_constbuffer_size(required_size); }
-
-inline bool set_const_buffer(unsigned stage, unsigned slot, Sbuffer *buffer, uint32_t consts_offset, uint32_t consts_size)
-{
-  return d3di.set_const_buffer(stage, slot, buffer, consts_offset, consts_size);
-}
+inline bool set_const_buffer(unsigned stage, unsigned slot, Sbuffer *buffer) { return d3di.set_const_buffer(stage, slot, buffer); }
 
 } // namespace d3d
 #endif

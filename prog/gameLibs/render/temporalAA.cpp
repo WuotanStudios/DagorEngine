@@ -2,6 +2,7 @@
 
 #include <render/temporalAA.h>
 #include <drv/3d/dag_renderTarget.h>
+#include <EASTL/array.h>
 #include <drv/3d/dag_driver.h>
 #include <math/dag_TMatrix4D.h>
 #include <math/random/dag_halton.h>
@@ -74,10 +75,11 @@ TemporalAA::TemporalAA(const char *shader, const IPoint2 &input_resolution, cons
   if (!name)
     name = defaultName;
 
-  int historyFmt = mobile_taa ? resolve_tex_fmt : TEXFMT_A16B16G16R16F;
+  historyFmt = mobile_taa ? resolve_tex_fmt : TEXFMT_A16B16G16R16F;
   historyFmt |= TEXCF_RTARGET;
 
-  historyTexPool = RTargetPool::get(outputResolution.x, outputResolution.y, historyFmt, 1);
+  historyResolution = outputResolution;
+  historyTexPool = RTargetPool::get(historyResolution.x, historyResolution.y, historyFmt, 1);
 
   wasDynamicTexPool =
     req_dynamic_tex ? RTargetPool::get(outputResolution.x, outputResolution.y, TEXCF_RTARGET | TEXFMT_R8, 1) : nullptr;
@@ -85,9 +87,8 @@ TemporalAA::TemporalAA(const char *shader, const IPoint2 &input_resolution, cons
   if (mobile_taa)
   {
     const int precomputedWeightsSize = 64;
-    taaPrecomputedWeights.set(d3d::create_tex(nullptr, precomputedWeightsSize, precomputedWeightsSize,
-                                TEXFMT_A16B16G16R16F | TEXCF_RTARGET, 1, "taa_precomputed_weights"),
-      "taa_precomputed_weights");
+    taaPrecomputedWeights = dag::create_tex(nullptr, precomputedWeightsSize, precomputedWeightsSize,
+      TEXFMT_A16B16G16R16F | TEXCF_RTARGET, 1, "taa_precomputed_weights", RESTAG_AA);
     d3d::SamplerInfo smpInfo;
     smpInfo.filter_mode = d3d::FilterMode::Linear;
     d3d::SamplerHandle smp = d3d::request_sampler(smpInfo);
@@ -116,18 +117,16 @@ bool TemporalAA::beforeRenderFrame()
 bool TemporalAA::beforeRenderView(const TMatrix4 &uv_reproject_tm_no_jitter)
 {
   jitterPixelOfs = get_taa_jitter(frame, params);
-  jitterTexelOfs.x = jitterPixelOfs.x * (2.f / inputResolution.x);
-  jitterTexelOfs.y = jitterPixelOfs.y * (2.f / inputResolution.y);
 
   set_temporal_parameters(uv_reproject_tm_no_jitter, jitterPixelOfs, frame == 0 ? 10.f : dtUsecs / 1e6, inputResolution.x, params);
 
-  ShaderGlobal::set_color4(gv_taa_input_resolution, inputResolution.x, inputResolution.y, 0, 0);
-  ShaderGlobal::set_color4(gv_taa_output_resolution, outputResolution.x, outputResolution.y, 0, 0);
+  ShaderGlobal::set_float4(gv_taa_input_resolution, inputResolution.x, inputResolution.y, 0, 0);
+  ShaderGlobal::set_float4(gv_taa_output_resolution, outputResolution.x, outputResolution.y, 0, 0);
 
   return isValid();
 }
 
-void TemporalAA::applyImpl(TEXTUREID currentFrameId)
+void TemporalAA::applyImpl(Texture *currentFrameTex, Texture *target)
 {
   if (taaPrecomputedWeights.getTex2D() && !precomputedWeightsReady)
   {
@@ -135,32 +134,43 @@ void TemporalAA::applyImpl(TEXTUREID currentFrameId)
     PostFxRenderer precompute;
     precompute.init("taa_precompute");
     SCOPE_RESET_SHADER_BLOCKS;
-    d3d::set_render_target();
-    d3d::set_render_target(0, taaPrecomputedWeights.getTex2D(), 0);
-    ShaderGlobal::set_color4(gv_taa_input_resolution, inputResolution.x, inputResolution.y, 0, 0);
-    ShaderGlobal::set_color4(gv_taa_output_resolution, outputResolution.x, outputResolution.y, 0, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{taaPrecomputedWeights.getTex2D(), 0, 0}});
+    ShaderGlobal::set_float4(gv_taa_input_resolution, inputResolution.x, inputResolution.y, 0, 0);
+    ShaderGlobal::set_float4(gv_taa_output_resolution, outputResolution.x, outputResolution.y, 0, 0);
     precompute.render();
     taaPrecomputedWeights.setVar();
     precomputedWeightsReady = true;
   }
 
-  RTarget::Ptr nextHistory = historyTexPool->acquire();
-  d3d::set_render_target(1, nextHistory->getTex2D(), 0);
+  TextureInfo targetInfo;
+  target->getinfo(targetInfo);
+  if (targetInfo.w != historyResolution.x || targetInfo.h != historyResolution.y)
+  {
+    historyResolution = IPoint2(targetInfo.w, targetInfo.h);
+    historyTex.forEach([](RTarget::Ptr &t) { t = nullptr; });
+    historyTexPool = RTargetPool::get(historyResolution.x, historyResolution.y, historyFmt, 1);
+  }
 
+  RTarget::Ptr nextHistory = historyTexPool->acquire();
   RTarget::Ptr nextWasDynamic;
   if (wasDynamicTexPool)
-  {
     nextWasDynamic = wasDynamicTexPool->acquire();
-    d3d::set_render_target(2, nextWasDynamic->getTex2D(), 0);
-  }
-  d3d::clearview(CLEAR_DISCARD_TARGET, 0, 0, 0);
+
+  eastl::array<RenderTarget, 3> rts = {};
+  uint32_t rtCount = 0;
+  rts[rtCount++] = {target, 0, 0};
+  rts[rtCount++] = {nextHistory->getTex2D(), 0, 0};
+  if (nextWasDynamic)
+    rts[rtCount++] = {nextWasDynamic->getTex2D(), 0, 0};
+  d3d::set_render_target({}, DepthAccess::RW, dag::ConstSpan<RenderTarget>(rts.data(), rtCount));
+  d3d::clearview(DISCARD_TARGET, 0, 0, 0);
 
   const TEXTUREID historyTexId = historyTex.current() ? historyTex.current()->getTexId() : BAD_TEXTUREID;
   const TEXTUREID wasDynamicTexId = wasDynamicTex.current() ? wasDynamicTex.current()->getTexId() : BAD_TEXTUREID;
   ShaderGlobal::set_texture(gv_taa_history_tex, historyTexId);
   ShaderGlobal::set_texture(gv_taa_was_dynamic_tex, wasDynamicTexId);
 
-  ShaderGlobal::set_texture(gv_taa_frame_tex, currentFrameId);
+  ShaderGlobal::set_texture_unsafe(gv_taa_frame_tex, currentFrameTex);
   render.render();
   ShaderGlobal::set_texture(gv_taa_frame_tex, BAD_TEXTUREID);
 
@@ -170,19 +180,17 @@ void TemporalAA::applyImpl(TEXTUREID currentFrameId)
   frame++;
 }
 
-void TemporalAA::apply(TEXTUREID currentFrameId, Texture *target)
+void TemporalAA::apply(Texture *currentFrameTex, Texture *target)
 {
   SCOPE_RENDER_TARGET;
 
-  d3d::set_render_target(target, 0);
-
-  applyImpl(currentFrameId);
+  applyImpl(currentFrameTex, target);
 }
 
-void TemporalAA::applyToCurrentTarget(TEXTUREID currentFrameId)
+void TemporalAA::applyToCurrentTarget(Texture *currentFrameTex, Texture *target)
 {
   SCOPE_RENDER_TARGET;
-  applyImpl(currentFrameId);
+  applyImpl(currentFrameTex, target);
 }
 
 void TemporalAA::setCurrentView(int view)
@@ -283,10 +291,10 @@ void set_temporal_reprojection_matrix(const TMatrix4 &uv_reproject_tm_no_jitter)
   if (gv_reproject_psf_0 < 0)
     init_gvars();
 
-  ShaderGlobal::set_color4(gv_reproject_psf_0, uv_reproject_tm_no_jitter.getcol(0));
-  ShaderGlobal::set_color4(gv_reproject_psf_1, uv_reproject_tm_no_jitter.getcol(1));
-  ShaderGlobal::set_color4(gv_reproject_psf_2, uv_reproject_tm_no_jitter.getcol(2));
-  ShaderGlobal::set_color4(gv_reproject_psf_3, uv_reproject_tm_no_jitter.getcol(3));
+  ShaderGlobal::set_float4(gv_reproject_psf_0, uv_reproject_tm_no_jitter.getcol(0));
+  ShaderGlobal::set_float4(gv_reproject_psf_1, uv_reproject_tm_no_jitter.getcol(1));
+  ShaderGlobal::set_float4(gv_reproject_psf_2, uv_reproject_tm_no_jitter.getcol(2));
+  ShaderGlobal::set_float4(gv_reproject_psf_3, uv_reproject_tm_no_jitter.getcol(3));
 }
 
 void set_temporal_resampling_filter_parameters(const Point2 &temporal_jitter_proj_offset)
@@ -302,10 +310,10 @@ void set_temporal_resampling_filter_parameters(const Point2 &temporal_jitter_pro
   if (gv_taa_filter0 < 0)
     init_gvars();
 
-  ShaderGlobal::set_color4(gv_taa_filter0, filter[0], filter[1], filter[2], filter[3]);
-  ShaderGlobal::set_color4(gv_taa_filter1, filter[4], filter[5], filter[6], filter[7]);
-  ShaderGlobal::set_real(gv_taa_filter2, filter[8]);
-  ShaderGlobal::set_color4(gv_taa_jitter_offset, temporal_jitter_proj_offset.x, temporal_jitter_proj_offset.y, 0, 0);
+  ShaderGlobal::set_float4(gv_taa_filter0, filter[0], filter[1], filter[2], filter[3]);
+  ShaderGlobal::set_float4(gv_taa_filter1, filter[4], filter[5], filter[6], filter[7]);
+  ShaderGlobal::set_float(gv_taa_filter2, filter[8]);
+  ShaderGlobal::set_float4(gv_taa_jitter_offset, temporal_jitter_proj_offset.x, temporal_jitter_proj_offset.y, 0, 0);
 }
 
 void set_temporal_miscellaneous_parameters(float dt, int wd, const TemporalAAParams &p)
@@ -334,23 +342,23 @@ void set_temporal_miscellaneous_parameters(float dt, int wd, const TemporalAAPar
   if (gv_taa_clamping_gamma_factor < 0)
     init_gvars();
 
-  ShaderGlobal::set_real(gv_taa_clamping_gamma_factor, p.clampingGamma);
-  ShaderGlobal::set_real(gv_taa_new_frame_weight, newFrameWeight);
-  ShaderGlobal::set_real(gv_taa_new_frame_weight_for_motion, newFrameWeightForMotion);
-  ShaderGlobal::set_real(gv_taa_new_frame_weight_dynamic, newFrameWeightDynamic);
-  ShaderGlobal::set_real(gv_taa_new_frame_weight_dynamic_for_motion, newFrameWeightDynamicForMotion);
-  ShaderGlobal::set_real(gv_taa_new_frame_weight_motion_lerp0, p.frameWeightMotionThreshold);
-  ShaderGlobal::set_real(gv_taa_new_frame_weight_motion_lerp1, p.frameWeightMotionMax);
+  ShaderGlobal::set_float(gv_taa_clamping_gamma_factor, p.clampingGamma);
+  ShaderGlobal::set_float(gv_taa_new_frame_weight, newFrameWeight);
+  ShaderGlobal::set_float(gv_taa_new_frame_weight_for_motion, newFrameWeightForMotion);
+  ShaderGlobal::set_float(gv_taa_new_frame_weight_dynamic, newFrameWeightDynamic);
+  ShaderGlobal::set_float(gv_taa_new_frame_weight_dynamic_for_motion, newFrameWeightDynamicForMotion);
+  ShaderGlobal::set_float(gv_taa_new_frame_weight_motion_lerp0, p.frameWeightMotionThreshold);
+  ShaderGlobal::set_float(gv_taa_new_frame_weight_motion_lerp1, p.frameWeightMotionMax);
 
-  ShaderGlobal::set_real(gv_taa_sharpening_factor, sharpening);
-  ShaderGlobal::set_real(gv_taa_motion_difference_max_inv, motionDifferenceMaxInverse);
-  ShaderGlobal::set_real(gv_taa_motion_difference_max_weight, motionDifferenceMaxWeight);
-  ShaderGlobal::set_real(gv_taa_luminance_max, luminanceMax);
+  ShaderGlobal::set_float(gv_taa_sharpening_factor, sharpening);
+  ShaderGlobal::set_float(gv_taa_motion_difference_max_inv, motionDifferenceMaxInverse);
+  ShaderGlobal::set_float(gv_taa_motion_difference_max_weight, motionDifferenceMaxWeight);
+  ShaderGlobal::set_float(gv_taa_luminance_max, luminanceMax);
   ShaderGlobal::set_int(gv_taa_restart_temporal, shouldRestart);
 
   ShaderGlobal::set_int(gv_taa_adaptive_filter, p.useAdaptiveFilter);
-  ShaderGlobal::set_real(gv_taa_scale_aabb_with_motion_steepness, p.scaleAabbWithMotionSteepness);
-  ShaderGlobal::set_real(gv_taa_scale_aabb_with_motion_max, p.scaleAabbWithMotionMax);
+  ShaderGlobal::set_float(gv_taa_scale_aabb_with_motion_steepness, p.scaleAabbWithMotionSteepness);
+  ShaderGlobal::set_float(gv_taa_scale_aabb_with_motion_max, p.scaleAabbWithMotionMax);
 }
 
 void set_temporal_parameters(const TMatrix4 &uv_reproject_tm_no_jitter, const Point2 &temporal_jitter_proj_offset, float dt, int wd,

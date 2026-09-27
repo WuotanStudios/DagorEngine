@@ -5,9 +5,22 @@
 #pragma once
 
 #include <vecmath/dag_vecMath.h>
-#include <3d/dag_occlusionSystem.h>
+#include <math/dag_occlusionTest.h>
+#include <3d/dag_stereoIndex.h>
 #include <3d/dag_textureIDHolder.h>
 #include <generic/dag_span.h>
+
+class BaseTexture;
+typedef BaseTexture Texture;
+class MaskedOcclusionCulling;
+class OcclusionImpl;
+
+enum CockpitReprojectionMode
+{
+  COCKPIT_NO_REPROJECT,
+  COCKPIT_REPROJECT_OUT_OF_SCREEN,
+  COCKPIT_REPROJECT_ANIMATED
+};
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -26,36 +39,22 @@
 class Occlusion
 {
 public:
+  static constexpr int CULL_FRUSTUM = OcclusionTest::CULL_FRUSTUM;
+  static constexpr int VISIBLE = OcclusionTest::VISIBLE;
+  static constexpr int CULL_OCCLUSION = OcclusionTest::CULL_OCCLUSION;
+  static constexpr int DEFAULT_MAX_TEST_MIP = 3;
+
   Occlusion() = default;
-  void init(const char *hzb_tex_name = "hzb")
-  {
-    occ = OcclusionSystem::create();
-    occ->init(hzb_tex_name);
-  }
-  void close() { del_it(occ); }
+  void init(const char *hzb_tex_name = "hzb");
+  void close();
   ~Occlusion() { close(); }
+  Occlusion(const Occlusion &) = delete;
   Occlusion &operator=(const Occlusion &) = delete;
-  inline void reset() { occ->reset(); }
-  inline operator bool() const { return occ != nullptr; }
-  inline void prepareDebug()
-  {
-    if (!occ)
-      return;
-    occ->prepareDebug();
-    occ->prepareDebugSWRasterization();
-  }
-  inline void setReprojectionUseCameraTranslatedSpace(bool enabled)
-  {
-    if (!occ)
-      return;
-    occ->setReprojectionUseCameraTranslatedSpace(enabled);
-  }
-  inline bool getReprojectionUseCameraTranslatedSpace() const
-  {
-    if (!occ)
-      return false;
-    return occ->getReprojectionUseCameraTranslatedSpace();
-  }
+  void reset();
+  inline operator bool() const { return impl != nullptr; }
+  void prepareDebug();
+  void setReprojectionUseCameraTranslatedSpace(bool enabled);
+  bool getReprojectionUseCameraTranslatedSpace() const;
   inline vec3f getCurViewPos() const { return curViewPos; }
   inline mat44f getCurViewProj() const { return curViewProj; }
   inline mat44f getCurView() const { return curView; }
@@ -90,41 +89,35 @@ public:
 #endif
   }
   inline void startFrame(vec3f viewPos, mat44f_cref view, mat44f_cref proj, mat44f_cref viewProj, float cockpit_distance,
-    CockpitReprojectionMode cockpit_mode, const mat44f &cockpit_anim, float, float)
+    CockpitReprojectionMode cockpit_mode, const mat44f &cockpit_anim, const mat44f *cockpit_proj, float, float)
   {
     rasterizedQuadOccluders = rasterizedBoxOccluders = rasterizedTriOccluders = 0;
     cockpitMode = cockpit_mode;
     cockpitAnim = cockpit_anim;
+    hasSeparateCockpitProj = cockpit_proj != nullptr;
+    if (hasSeparateCockpitProj)
+      cockpitProjTm = *cockpit_proj;
+    else
+      v_mat44_ident(cockpitProjTm);
     hasMergedOcclusion = false;
     resetStats();
     setFrameParams(viewPos, view, proj, viewProj, cockpit_distance);
   }
-  inline void readbackGPU() { occ->readGPUframe(); }
-
-  inline void reprojectGPUFrame()
-  {
-    occ->prepareGPUDepthFrame(curViewPos, curView, curProj, curViewProj, cockpitDistance, cockpitMode, cockpitAnim);
-  }
-  inline void clear() { occ->clear(); }
+  void readbackGPU();
+  void reprojectGPUFrame();
+  void clear();
 
   inline void prepare(vec3f viewPos, mat44f_cref view, mat44f_cref proj, mat44f_cref viewProj, float cockpit_distance,
-    CockpitReprojectionMode cockpit_mode, const mat44f &cockpit_anim, float threshold_x, float threshold_y)
+    CockpitReprojectionMode cockpit_mode, const mat44f &cockpit_anim, const mat44f *cockpit_proj, float threshold_x, float threshold_y)
   {
-    startFrame(viewPos, view, proj, viewProj, cockpit_distance, cockpit_mode, cockpit_anim, threshold_x, threshold_y);
+    startFrame(viewPos, view, proj, viewProj, cockpit_distance, cockpit_mode, cockpit_anim, cockpit_proj, threshold_x, threshold_y);
     readbackGPU();
     reprojectGPUFrame();
   }
 
-  bool hasGPUFrame() const { return occ->hasGPUFrame(); }
-  void prepareNextFrame(float zn, float zf, TextureIDPair mipped_depth, Texture *depth = nullptr)
-  {
-    occ->prepareNextFrame(curViewPos, curView, curProj, curViewProj, zn, zf, mipped_depth, depth);
-  }
-
-  void prepareNextFrame(float zn, float zf, TextureIDPair mipped_depth, Texture *depth, StereoIndex stereo_index)
-  {
-    occ->prepareNextFrame(curViewPos, curView, curProj, curViewProj, zn, zf, mipped_depth, depth, stereo_index);
-  }
+  bool hasGPUFrame() const;
+  void prepareNextFrame(float zn, float zf, Texture *mipped_depth, Texture *depth = nullptr);
+  void prepareNextFrame(float zn, float zf, Texture *mipped_depth, Texture *depth, StereoIndex stereo_index);
 
   VECTORCALL bool isVisibleSphere(vec3f sph_center, vec4f radius, vec4f threshold = v_zero()) const
   {
@@ -142,23 +135,44 @@ public:
 
   VECTORCALL bool isVisibleBox(vec3f bmin, vec3f bmax, vec4f threshold = v_zero()) const
   {
-    int visibility = occ->testVisibility(bmin, bmax, threshold, curViewProj);
+    int visibility = occlusionTest.testVisibility(bmin, bmax, threshold, curViewProj, DEFAULT_MAX_TEST_MIP);
 #if CAN_DEBUG_OCCLUSION
-    interlocked_increment(objects[visibility]);
+    if (countOccludees)
+      interlocked_increment(objects[visibility]);
 #endif
-    return visibility == occ->VISIBLE;
+    return visibility == VISIBLE;
   }
   VECTORCALL bool isVisibleBox(vec3f bmin, vec3f bmax, mat44f_cref worldViewProjTm, vec4f threshold = v_zero()) const
   {
-    int visibility = occ->testVisibility(bmin, bmax, threshold, worldViewProjTm);
+    int visibility = occlusionTest.testVisibility(bmin, bmax, threshold, worldViewProjTm, DEFAULT_MAX_TEST_MIP);
 #if CAN_DEBUG_OCCLUSION
-    interlocked_increment(objects[visibility]);
+    if (countOccludees)
+      interlocked_increment(objects[visibility]);
 #endif
-    return (visibility == occ->VISIBLE);
+    return (visibility == VISIBLE);
   }
   VECTORCALL bool isVisibleBox(bbox3f_cref box, vec4f threshold = v_zero()) const
   {
     return isVisibleBox(box.bmin, box.bmax, threshold);
+  }
+  // As isVisibleBox, for a box the caller has ALREADY frustum-classified as at least partially visible:
+  // skips the frustum test and the clip-Z row (~30% cheaper), bit-identical result under that contract.
+  // For a fully-outside box the bool can go either way (a clamped edge rect may even walk to occluded),
+  // but exact isVisibleBox also returns false there (CULL_FRUSTUM) - relative to it this can only err
+  // toward visible, so a false result never culls visible content. Safe as a pure culling gate ONLY;
+  // wrong wherever the frustum classification itself matters.
+  VECTORCALL bool isVisibleBoxInFrustum(vec3f bmin, vec3f bmax, vec4f threshold = v_zero()) const
+  {
+    int visibility = occlusionTest.testVisibilityInFrustum(bmin, bmax, threshold, curViewProj, DEFAULT_MAX_TEST_MIP);
+#if CAN_DEBUG_OCCLUSION
+    if (countOccludees)
+      interlocked_increment(objects[visibility]);
+#endif
+    return visibility == VISIBLE;
+  }
+  VECTORCALL bool isVisibleBoxInFrustum(bbox3f_cref box, vec4f threshold = v_zero()) const
+  {
+    return isVisibleBoxInFrustum(box.bmin, box.bmax, threshold);
   }
 
 
@@ -178,9 +192,25 @@ public:
 
   VECTORCALL bool isOccludedBox(vec3f bmin, vec3f bmax) const
   {
-    const int visibility = occ->testVisibility(bmin, bmax, v_zero(), curViewProj);
+    return occludedBoxResult(occlusionTest.testVisibility(bmin, bmax, v_zero(), curViewProj, DEFAULT_MAX_TEST_MIP), bmin, bmax);
+  }
+  // As isOccludedBox, for a box the caller has ALREADY frustum-classified as at least partially visible:
+  // bit-identical result under that contract (see isVisibleBoxInFrustum). A contract-violating (fully
+  // outside) box may be reported occluded where the exact test reports CULL_FRUSTUM - such a box has no
+  // visible content, so culling on true still culls nothing visible; gate use only.
+  VECTORCALL bool isOccludedBoxInFrustum(vec3f bmin, vec3f bmax) const
+  {
+    return occludedBoxResult(occlusionTest.testVisibilityInFrustum(bmin, bmax, v_zero(), curViewProj, DEFAULT_MAX_TEST_MIP), bmin,
+      bmax);
+  }
+
+private:
+  VECTORCALL bool occludedBoxResult(int visibility, vec3f bmin, vec3f bmax) const
+  {
+    G_UNUSED(bmin);
+    G_UNUSED(bmax);
 #if CAN_DEBUG_OCCLUSION
-    if (visibility != occ->CULL_OCCLUSION)
+    if (visibility != CULL_OCCLUSION)
     {
       if (storeOccludees && storeOccludeesNotOccluded)
       {
@@ -191,7 +221,8 @@ public:
         debugNotOccludedBoxes.push_back(box);
         debugNotOccludedBoxes.unlock();
       }
-      interlocked_increment(objects[occ->VISIBLE]);
+      if (countOccludees)
+        interlocked_increment(objects[VISIBLE]);
       return false;
     }
     if (storeOccludees)
@@ -203,78 +234,64 @@ public:
       debugOccludedBoxes.push_back(box);
       debugOccludedBoxes.unlock();
     }
-    interlocked_increment(objects[occ->CULL_OCCLUSION]);
+    if (countOccludees)
+      interlocked_increment(objects[CULL_OCCLUSION]);
     return true;
 #else
-    return visibility == occ->CULL_OCCLUSION;
+    return visibility == CULL_OCCLUSION;
 #endif
   }
+
+public:
   VECTORCALL bool isOccludedBox(vec3f bmin, vec3f bmax, mat44f_cref worldViewProjTm) const
   {
-    const int visibility = occ->testVisibility(bmin, bmax, v_zero(), worldViewProjTm);
+    const int visibility = occlusionTest.testVisibility(bmin, bmax, v_zero(), worldViewProjTm, DEFAULT_MAX_TEST_MIP);
 #if CAN_DEBUG_OCCLUSION
-    if (visibility != occ->CULL_OCCLUSION)
+    if (visibility != CULL_OCCLUSION)
     {
-      interlocked_increment(objects[occ->VISIBLE]);
+      if (countOccludees)
+        interlocked_increment(objects[VISIBLE]);
       return false;
     }
-    interlocked_increment(objects[occ->CULL_OCCLUSION]);
+    if (countOccludees)
+      interlocked_increment(objects[CULL_OCCLUSION]);
     return true;
 #else
-    return visibility == occ->CULL_OCCLUSION;
+    return visibility == CULL_OCCLUSION;
 #endif
   }
   VECTORCALL bool isOccludedBox(bbox3f_cref box) const { return isOccludedBox(box.bmin, box.bmax); }
 
-  void startSWOcclusion(float zn)
-  {
-    occ->initSWRasterization();
-    occ->startRasterization(zn);
-  }
-  void finalizeBoxes(const bbox3f *box, const mat44f *mat, int cnt)
-  {
-    rasterizedBoxOccluders += cnt;
-    occ->rasterizeBoxes(curViewProj, box, mat, cnt);
-  }
-  void finalizeQuads(const vec4f *verts, int cnt) // verts size is cnt*4
-  {
-    rasterizedQuadOccluders += cnt;
-    occ->rasterizeQuads(curViewProj, verts, cnt);
-  }
+  void startSWOcclusion(float zn);
+  void finalizeBoxes(const bbox3f *box, const mat44f *mat, int cnt);
+  void finalizeQuads(const vec4f *verts, int cnt);
   void rasterizeMesh(mat44f_cref viewproj, vec3f bmin, vec3f bmax, const vec4f *verts, int vert_cnt, const unsigned short *faces,
-    int tri_count)
-  {
-    rasterizedTriOccluders += tri_count;
-    occ->rasterizeMesh(viewproj, bmin, bmax, verts, vert_cnt, faces, tri_count);
-  }
-  void finalizeSWOcclusion()
-  {
-    if (rasterizedQuadOccluders || rasterizedBoxOccluders || rasterizedTriOccluders || hasMergedOcclusion)
-      occ->combineWithSWRasterization();
-  }
-  void finalizeOcclusion() { occ->buildMips(); }
-  void mergeOcclusionsZmin(MaskedOcclusionCulling **another_occl, uint32_t occl_count, uint32_t first_tile, uint32_t last_tile)
-  {
-    occ->mergeOcclusionsZmin(another_occl, occl_count, first_tile, last_tile);
-  }
+    int tri_count);
+  void finalizeSWOcclusion();
+  void finalizeOcclusion();
+  void mergeOcclusionsZmin(MaskedOcclusionCulling **another_occl, uint32_t occl_count, uint32_t first_tile, uint32_t last_tile);
   void finalizeSWOcclusionMerge() { hasMergedOcclusion = true; }
-  void getMaskedResolution(uint32_t &width, uint32_t &height) const { occ->getMaskedResolution(width, height); }
+  void getMaskedResolution(uint32_t &width, uint32_t &height) const;
 
 #if CAN_DEBUG_OCCLUSION
   dag::ConstSpan<bbox3f> getDebugOccludedBoxes() const { return debugOccludedBoxes; }
   dag::ConstSpan<bbox3f> getDebugNotOccludedBoxes() const { return debugNotOccludedBoxes; }
+  inline void setCountOccludees(bool on) { countOccludees = on; }
+  inline bool getCountOccludees() const { return countOccludees; }
   inline void setStoreOccludees(bool on) { storeOccludees = on; }
   inline bool getStoreOccludees() const { return storeOccludees; }
   inline void setStoreNotOccluded(bool on) { storeOccludeesNotOccluded = on; }
   inline bool getStoreNotOccluded() const { return storeOccludeesNotOccluded; }
-  inline int getOccludedObjectsCount() const { return objects[occ->CULL_OCCLUSION]; }
-  inline int getFrustumCulledObjectsCount() const { return objects[occ->CULL_FRUSTUM]; }
-  inline int getVisibleObjectsCount() const { return objects[occ->VISIBLE]; }
+  inline int getOccludedObjectsCount() const { return objects[CULL_OCCLUSION]; }
+  inline int getFrustumCulledObjectsCount() const { return objects[CULL_FRUSTUM]; }
+  inline int getVisibleObjectsCount() const { return objects[VISIBLE]; }
   inline int getRasterizedBoxOccluders() const { return rasterizedBoxOccluders; }
   inline int getRasterizedQuadOccluders() const { return rasterizedQuadOccluders; }
 #else
   dag::ConstSpan<bbox3f> getDebugOccludedBoxes() const { return {}; }
   dag::ConstSpan<bbox3f> getDebugNotOccludedBoxes() const { return {}; }
+  inline void setCountOccludees(bool) {}
+  inline bool getCountOccludees() const { return false; }
   inline void setStoreOccludees(bool) {}
   inline bool getStoreOccludees() const { return false; }
   inline void setStoreNotOccluded(bool) {}
@@ -286,22 +303,28 @@ public:
   inline int getRasterizedQuadOccluders() const { return 0; }
 #endif
 
-  OcclusionTest<OCCLUSION_W, OCCLUSION_H> &getOcclusionTest() { return occ->getOcclusionTest(); }
-  const OcclusionTest<OCCLUSION_W, OCCLUSION_H> &getOcclusionTest() const { return occ->getOcclusionTest(); }
+  OcclusionZBuffer &getOcclusionZBuffer() { return occlusionZBuffer; }
+  const OcclusionZBuffer &getOcclusionZBuffer() const { return occlusionZBuffer; }
+  OcclusionTest &getOcclusionTest() { return occlusionTest; }
+  const OcclusionTest &getOcclusionTest() const { return occlusionTest; }
 
 protected:
   mat44f curViewProj = {};
   mat44f curView = {};
   mat44f curProj = {};
   vec3f curViewPos = v_zero();
-  OcclusionSystem *occ = 0;
+  OcclusionZBuffer occlusionZBuffer;
+  OcclusionTest occlusionTest{occlusionZBuffer};
+  OcclusionImpl *impl = nullptr;
   float cockpitDistance = 0;
   CockpitReprojectionMode cockpitMode = COCKPIT_NO_REPROJECT;
   mat44f cockpitAnim = {};
+  mat44f cockpitProjTm = {};
+  bool hasSeparateCockpitProj = false;
   int rasterizedBoxOccluders = 0, rasterizedQuadOccluders = 0, rasterizedTriOccluders = 0;
   bool hasMergedOcclusion = false;
 #if CAN_DEBUG_OCCLUSION
-  bool storeOccludees = false, storeOccludeesNotOccluded = false;
+  bool countOccludees = false, storeOccludees = false, storeOccludeesNotOccluded = false;
   mutable TabWithLock<bbox3f> debugOccludedBoxes;
   mutable TabWithLock<bbox3f> debugNotOccludedBoxes;
   mutable int objects[3] = {0};

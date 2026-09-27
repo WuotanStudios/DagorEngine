@@ -1,12 +1,13 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <propPanel/control/contextMenu.h>
 #include <propPanel/control/listBoxInterface.h>
+#include <propPanel/control/dragAndDropHandler.h>
 #include <propPanel/c_window_event_handler.h>
 #include <propPanel/colors.h>
 #include <propPanel/constants.h>
 #include <propPanel/imguiHelper.h>
-#include "../contextMenuInternal.h"
 #include "../scopedImguiBeginDisabled.h"
 #include "../tooltipHelper.h"
 
@@ -37,6 +38,12 @@ public:
   }
 
   dag::ConstSpan<String> getValues() { return values; }
+
+  int getValues(Tab<String> &vals)
+  {
+    vals = values;
+    return values.size();
+  }
 
   void setSelectedIndex(int index)
   {
@@ -132,6 +139,7 @@ public:
         ImGui::SetNextItemSelectionUserData(i);
 
         const char *label = values[i].empty() ? "<empty>" : values[i].c_str();
+        ImGui::PushID(i);
         if (ImGui::Selectable(label, wasSelected, ImGuiSelectableFlags_AllowDoubleClick))
         {
           if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
@@ -142,6 +150,7 @@ public:
         {
           rightClicked = true;
         }
+        ImGui::PopID();
 
         if (wasSelected)
           ImGui::PopStyleColor();
@@ -158,6 +167,17 @@ public:
           const ImVec2 labelSize = ImGui::CalcTextSize(label, nullptr, true);
           if (labelSize.x > listBoxInnerWidth)
             tooltip_helper.setPreviousImguiControlTooltip((const void *)((uintptr_t)ImGui::GetItemID()), label);
+        }
+        if (dragHandler && ImGui::BeginDragDropSource(dragHandler->getDragDropFlags()))
+        {
+          dragHandler->onBeginDrag(i, values[i]);
+          ImGui::EndDragDropSource();
+        }
+        if (dropHandler && ImGui::BeginDragDropTarget())
+        {
+          DragAndDropResult result = dropHandler->onDropTarget(i);
+          PropPanel::handleDragAndDropNotAllowed(result);
+          ImGui::EndDragDropTarget();
         }
       }
 
@@ -180,13 +200,12 @@ public:
         eventHandler->onWcRightClick(windowBaseForEventHandler);
     }
 
-    if (contextMenu)
-    {
-      const bool open = contextMenu->updateImgui();
-      if (!open)
-        contextMenu.reset();
-    }
+    if (contextMenu && !contextMenu->updateImgui())
+      contextMenu.reset();
   }
+
+  void setDragEventHandler(IListDragHandler *handler) { dragHandler = handler; }
+  void setDropEventHandler(IListDropHandler *handler) { dropHandler = handler; }
 
 private:
   void applySelectionRequests(const ImGuiMultiSelectIO &multi_select_io)
@@ -208,6 +227,8 @@ private:
   }
 
   WindowControlEventHandler *eventHandler = nullptr;
+  IListDragHandler *dragHandler = nullptr;
+  IListDropHandler *dropHandler = nullptr;
   WindowBase *windowBaseForEventHandler = nullptr;
   bool controlEnabled = true;
   Tab<String> values;

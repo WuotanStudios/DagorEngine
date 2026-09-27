@@ -81,7 +81,7 @@ public:
   uint16_t fileRef = 0;
   uint8_t mipCountTwoSided = 0;
   uint8_t mipCount() const { return mipCountTwoSided & 0x3; }
-  bool mostlyTwoSided() const { return bool(mipCountTwoSided >> 1); }
+  bool mostlyTwoSided() const { return bool(mipCountTwoSided >> 7); }
 
   carray<SparseSDFMip, SDF_NUM_MIPS> mipInfo;
 };
@@ -195,9 +195,9 @@ struct ObjectsAtlasLru
   int atlas_bw = 0, atlas_bh = 0, atlas_bd = 0; // in blocks
   uint32_t maxBlocksSpace = 0;
   uint32_t currentMaxObjectsCnt = 0;
-  UniqueTexHolder object_sdf_mip_atlas;
+  UniqueTexWithShaderVar object_sdf_mip_atlas;
   FastNameMapTS<> files;
-  UniqueBufHolder object_sdf_mips;
+  UniqueBufWithShaderVar object_sdf_mips;
   uint16_t addFileRefSafe(const char *fileName)
   {
     auto id = files.addNameId(fileName);
@@ -260,12 +260,12 @@ struct ObjectsAtlasLru
     objectsRef.clear();
     objectsRef.reserve(objects);
     objectsLRU.clear();
-    objectsLRU.push_back(objects);
+    objectsLRU.reserve(objects);
     currentObjectMipsEncoded.clear();
     currentObjectMipsEncoded.reserve(objects);
     object_sdf_mips.close();
     object_sdf_mips = dag::create_sbuffer(sizeof(float) * 4, currentMaxObjectsCnt * SDF_PACKED_MIP_SIZE,
-      SBCF_MISC_STRUCTURED | SBCF_BIND_SHADER_RES | SBCF_BIND_UNORDERED, 0, "object_sdf_mips");
+      SBCF_MISC_STRUCTURED | SBCF_BIND_SHADER_RES | SBCF_BIND_UNORDERED, 0, "object_sdf_mips", RESTAG_DASDF);
   }
   int size() const { return objectsRef.size(); }
   void updateLRUtick()
@@ -609,7 +609,7 @@ struct ObjectsAtlasLru
   // one in submitGPUCommands in updateData
   // this allows us to perform everything besides actual dispatches in not main thread (even updateData can be done in other thread)
   // however, we don't use it now, so if there is enough space in dest buffer we can do just one (with lock discard), saving one memcpy
-  UniqueBufHolder indirectionsUpdateBuf, indirectionCommandsBuf, objectInfoCommandsBuf, blocksCommandsBuf;
+  UniqueBufWithShaderVar indirectionsUpdateBuf, indirectionCommandsBuf, objectInfoCommandsBuf, blocksCommandsBuf;
   enum
   {
     DEFAULT_INDIR_COMMAND_SIZE = 1024,
@@ -628,7 +628,7 @@ struct ObjectsAtlasLru
     // todo : SBCF_FRAMEMEM
     if (!indirectionsUpdateBuf)
       indirectionsUpdateBuf = dag::create_sbuffer(sizeof(uint32_t), indirectionsUpdateBufSize = in_sz,
-        SBCF_MISC_ALLOW_RAW | SBCF_BIND_SHADER_RES, 0, "sdf_indirection_update_buf");
+        SBCF_MISC_ALLOW_RAW | SBCF_BIND_SHADER_RES, 0, "sdf_indirection_update_buf", RESTAG_DASDF);
   }
   void allocateGpuUpdateCommandsBufs(uint32_t info_sz, uint32_t blocks_sz, uint32_t in_commands_sz, uint32_t in_sz)
   {
@@ -637,18 +637,18 @@ struct ObjectsAtlasLru
       objectInfoCommandsBuf.close();
     if (!objectInfoCommandsBuf)
       objectInfoCommandsBuf = dag::create_sbuffer(sizeof(PackedObjectMip), updateInfoBufSize = info_sz,
-        SBCF_MISC_STRUCTURED | SBCF_BIND_SHADER_RES, 0, "sdf_info_update_commands_buf");
+        SBCF_MISC_STRUCTURED | SBCF_BIND_SHADER_RES, 0, "sdf_info_update_commands_buf", RESTAG_DASDF);
     if (updateBlocksBufSize != blocks_sz)
       blocksCommandsBuf.close();
     if (!blocksCommandsBuf)
       blocksCommandsBuf = dag::create_sbuffer(sizeof(uint32_t),
         (updateBlocksBufSize = blocks_sz) * sizeof(GpuUpdateCommands::BlockCommand) / sizeof(uint32_t),
-        SBCF_MISC_ALLOW_RAW | SBCF_BIND_SHADER_RES, 0, "sdf_block_update_commands_buf");
+        SBCF_MISC_ALLOW_RAW | SBCF_BIND_SHADER_RES, 0, "sdf_block_update_commands_buf", RESTAG_DASDF);
     if (indirectionUpdateCommandsBufSize != in_commands_sz)
       indirectionCommandsBuf.close();
     if (!indirectionCommandsBuf)
       indirectionCommandsBuf = dag::create_sbuffer(sizeof(IndirectionCommand), indirectionUpdateCommandsBufSize = in_commands_sz,
-        SBCF_MISC_STRUCTURED | SBCF_BIND_SHADER_RES, 0, "sdf_indirection_update_commands_buf");
+        SBCF_MISC_STRUCTURED | SBCF_BIND_SHADER_RES, 0, "sdf_indirection_update_commands_buf", RESTAG_DASDF);
     allocateIndirectionsSize(in_sz);
   }
   void initGpuUpdateCommands()
@@ -748,7 +748,7 @@ struct ObjectsAtlasLru
   }
   uint8_t getClampedMip(uint16_t oi, const uint8_t *new_mips, uint32_t cnt) const
   {
-    if (oi > cnt)
+    if (oi >= cnt)
       return SDF_NUM_MIPS;
     const uint8_t maxMip = getTotalMipCount(oi) - 1;
     auto newMip = new_mips[oi];
@@ -958,12 +958,12 @@ struct ObjectsAtlasLru
     atlas_bd = abd;
     int atlas_w = atlas_bw * SDF_BLOCK_SIZE, atlas_h = atlas_bh * SDF_BLOCK_SIZE, atlas_d = atlas_bd * SDF_BLOCK_SIZE; // in texels
     object_sdf_mip_atlas.close();
-    object_sdf_mip_atlas = dag::create_voltex(atlas_w, atlas_h, atlas_d, TEXCF_UNORDERED | TEXFMT_R8, 1,
-      "object_sdf_mip_atlas"); // TEXCF_UPDATE_DESTINATION
-    ShaderGlobal::set_color4(sdf_inv_atlas_size_in_blocksVarId, 1. / atlas_bw, 1. / atlas_bh, 1. / atlas_bd, 0);
-    ShaderGlobal::set_color4(sdf_internal_block_size_tcVarId, float(SDF_INTERNAL_BLOCK_SIZE) / atlas_w,
+    object_sdf_mip_atlas = dag::create_voltex(atlas_w, atlas_h, atlas_d, TEXCF_UNORDERED | TEXFMT_R8, 1, "object_sdf_mip_atlas",
+      RESTAG_DASDF); // TEXCF_UPDATE_DESTINATION
+    ShaderGlobal::set_float4(sdf_inv_atlas_size_in_blocksVarId, 1. / atlas_bw, 1. / atlas_bh, 1. / atlas_bd, 0);
+    ShaderGlobal::set_float4(sdf_internal_block_size_tcVarId, float(SDF_INTERNAL_BLOCK_SIZE) / atlas_w,
       float(SDF_INTERNAL_BLOCK_SIZE) / atlas_h, float(SDF_INTERNAL_BLOCK_SIZE) / atlas_d, 0);
-    ShaderGlobal::set_color4(sdf_inv_atlas_sizeVarId, 1. / atlas_w, 1. / atlas_h, 1. / atlas_d, 0);
+    ShaderGlobal::set_float4(sdf_inv_atlas_sizeVarId, 1. / atlas_w, 1. / atlas_h, 1. / atlas_d, 0);
     initAtlas();
   }
 
@@ -1081,7 +1081,7 @@ struct ObjectsSDFImpl : public ObjectsSDF
   float getMipVoxelMaxSize(int i) const { return mipVoxelMaxSizes[i]; }
   float getMipSize(int mip) const override { return 0.5 * (1 << mip); } // todo: fixme: we read approximate average
 
-  UniqueBufHolder object_sdf_instances;
+  UniqueBufWithShaderVar object_sdf_instances;
 
   uint32_t instancesCount = 0, instancesBufferSize = 0;
   uint32_t getInstances() const { return instancesCount; }
@@ -1113,7 +1113,7 @@ struct ObjectsSDFImpl : public ObjectsSDF
       mipVoxelSizes[i] += maxVoxelDim;
 
     maxObjectsBlocks += meshSDF.mipInfo.front().sdfBlocksCount;
-    allObjectsLowBlocks += meshSDF.mipInfo.back().sdfBlocksCount;
+    allObjectsLowBlocks += meshSDF.mipInfo[meshSDF.mipCount() - 1].sdfBlocksCount;
     meshSDF.fileRef = atlasLRU.addFileRefSafe(cb.getTargetName());
     return atlasLRU.addObject(eastl::move(meshSDF));
   }
@@ -1183,10 +1183,10 @@ struct ObjectsSDFImpl : public ObjectsSDF
     TMatrix4 globtm;
     d3d::getglobtm(globtm);
     globtm = globtm.transpose();
-    ShaderGlobal::set_color4(globtm_psf_0VarId, Color4(globtm[0]));
-    ShaderGlobal::set_color4(globtm_psf_1VarId, Color4(globtm[1]));
-    ShaderGlobal::set_color4(globtm_psf_2VarId, Color4(globtm[2]));
-    ShaderGlobal::set_color4(globtm_psf_3VarId, Color4(globtm[3]));
+    ShaderGlobal::set_float4(globtm_psf_0VarId, Color4(globtm[0]));
+    ShaderGlobal::set_float4(globtm_psf_1VarId, Color4(globtm[1]));
+    ShaderGlobal::set_float4(globtm_psf_2VarId, Color4(globtm[2]));
+    ShaderGlobal::set_float4(globtm_psf_3VarId, Color4(globtm[3]));
     sdf_object_debug.render();
   }
   int getMipsCount() const override { return SDF_NUM_MIPS; }
@@ -1220,10 +1220,10 @@ struct ObjectsSDFImpl : public ObjectsSDF
       mat44f localToWorld;
       v_mat44_mul43(localToWorld, localToWorldInst, rescaleTm);
 
+      ObjectSDFInstancePacked inst;
 #if SDF_SUPPORT_OBJECT_TRACING
       v_mat44_transpose_to_mat43(inst.localToWorld, localToWorld);
 #endif
-      ObjectSDFInstancePacked inst;
       mat44f worldToLocal;
       v_mat44_inverse43(worldToLocal, localToWorld);
       v_mat44_transpose_to_mat43(inst.worldToLocal, worldToLocal);
@@ -1231,7 +1231,7 @@ struct ObjectsSDFImpl : public ObjectsSDF
       inst.extent = meshSDF.getExt();
       vec4f vtws = v_perm_xaxa(v_length3_x(localToWorld.col0), v_length3_x(localToWorld.col1));
       vtws = v_perm_xyab(vtws, v_length3_x(localToWorld.col2));
-      vtws = v_perm_xyzd(vtws, v_min(v_splat_x(vtws), v_min(v_splat_y(vtws), v_splat_z(vtws))));
+      vtws = v_perm_xyzd(vtws, v_hmin3(vtws));
       v_st(&inst.volumeToWorldScale.x, vtws);
       // world space bounding sphere
       bbox3f destBox;
@@ -1250,7 +1250,7 @@ struct ObjectsSDFImpl : public ObjectsSDF
       instancesBufferSize = (requiredSz + page_size - 1) & (~(page_size - 1));
       object_sdf_instances.close();
       object_sdf_instances = dag::create_sbuffer(sizeof(float) * 4, instancesBufferSize, SBCF_MISC_STRUCTURED | SBCF_BIND_SHADER_RES,
-        0, "object_sdf_instances");
+        0, "object_sdf_instances", RESTAG_DASDF);
     }
 
     G_ASSERT(instancesBounds.size() == instancesData.size());

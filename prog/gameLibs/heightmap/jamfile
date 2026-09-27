@@ -6,13 +6,18 @@ Target      = gameLibs/heightmap.lib ;
 
 Sources =
   heightmapCompressError.cpp
+  lodGridVertexData.cpp
+  simpleHeightmapRenderer.cpp
   heightmapRenderer.cpp
   heightmapPhysHandler.cpp
-  heightmapTesselationData.cpp
+  heightmapMaxDelta.cpp
+  heightmapMetricsCalc.cpp
+  heightmapMetricsCulling.cpp
   heightmapCulling.cpp
+  heightmapLoader.cpp
   heightmapHandler.cpp
-  flexGridRenderer.cpp
-  flexGridSubdivision.cpp
+  riverMasks/hmapCriticalPath.cpp
+  riverMasks/hmapLodMaskBuild.cpp
 ;
 
 AddIncludes = 

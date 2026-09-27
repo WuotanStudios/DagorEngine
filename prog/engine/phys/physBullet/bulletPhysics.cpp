@@ -557,6 +557,20 @@ void PhysBody::setMassMatrix(real mass, real ixx, real iyy, real izz)
     exec_or_add_after_phys_action<ReAddToWorldAction>(*world, this, groupMask, layerMask);
 }
 
+void PhysBody::setLockedStatic(bool locked, real mass, const Point3 &momj)
+{
+  // Zero mass makes the Bullet body static (re-added to the world as static); restoring the mass/inertia
+  // returns it to dynamic.
+  if (locked)
+  {
+    setVelocity(Point3(0, 0, 0));
+    setAngularVelocity(Point3(0, 0, 0));
+    setMassMatrix(0.f, 0.f, 0.f, 0.f);
+  }
+  else
+    setMassMatrix(mass, momj.x, momj.y, momj.z);
+}
+
 
 void PhysBody::getMassMatrix(real &mass, real &ixx, real &iyy, real &izz)
 {
@@ -712,17 +726,33 @@ btCollisionShape *PhysBody::create_bt_collision_shape_no_margin(const PhysCollis
     case PhysCollision::TYPE_TRIMESH:
     {
       auto meshColl = static_cast<const PhysTriMeshCollision *>(c);
-      btIndexedMesh part;
 
-      part.m_vertexBase = (const unsigned char *)meshColl->vdata;
+      // Bullet does not copy vertex/index data - it stores pointers from btIndexedMesh.
+      // PhysTriMeshCollision only holds non-owning pointers that may become invalid,
+      // so we must copy the data here and tie its lifetime to the mesh interface.
+      // Single allocation holds vertices then indices; freed via m_vertexBase in dtor.
+      struct OwnedIndexVertexArray : public btTriangleIndexVertexArray
+      {
+        ~OwnedIndexVertexArray() override { delete[] m_indexedMeshes[0].m_vertexBase; }
+      };
+
+      unsigned vdataSize = meshColl->vnum * meshColl->vstride;
+      unsigned idataSize = meshColl->inum * meshColl->istride;
+      unsigned char *buf = new unsigned char[vdataSize + idataSize];
+      memcpy(buf, meshColl->vdata, vdataSize);
+      memcpy(buf + vdataSize, meshColl->idata, idataSize);
+
+      auto *meshInterface = new OwnedIndexVertexArray;
+
+      btIndexedMesh part;
+      part.m_vertexBase = buf;
       part.m_vertexStride = meshColl->vstride;
       part.m_numVertices = meshColl->vnum;
-      part.m_triangleIndexBase = (const unsigned char *)meshColl->idata;
+      part.m_triangleIndexBase = buf + vdataSize;
       part.m_triangleIndexStride = 3 * meshColl->istride;
       part.m_numTriangles = meshColl->inum / 3;
       part.m_vertexType = meshColl->vtypeShort ? PHY_SHORT : PHY_FLOAT;
 
-      btTriangleIndexVertexArray *meshInterface = new btTriangleIndexVertexArray;
       meshInterface->addIndexedMesh(part, (meshColl->istride == 2) ? PHY_SHORT : PHY_INTEGER);
       if (lengthSq(meshColl->scale - Point3(1, 1, 1)) > 1e-12)
         meshInterface->setScaling(to_btVector3(meshColl->scale));
@@ -1590,6 +1620,8 @@ void PhysRagdollBallJoint::setTargetOrientation(const TMatrix &tm)
   G_UNUSED(tm);
   LOGERR_ONCE("PhysRagdollBallJoint::setTargetOrientation not implemented");
 }
+
+void PhysRagdollBallJoint::disableMotors() { LOGERR_ONCE("PhysRagdollBallJoint::disableMotors not implemented"); }
 
 void PhysRagdollBallJoint::setTwistSwingMotorSettings(float twistFrequency, float twistDamping, float swingFrequency,
   float swingDamping)

@@ -3,6 +3,7 @@
 #include <util/dag_globDef.h>
 #include <anim/dag_animChannels.h>
 #include <anim/dag_animKeyInterp.h>
+#include <math/dag_quatInterp.h>
 #include <gameRes/dag_gameResources.h>
 #include <ioSys/dag_fileIo.h>
 #include <generic/dag_tab.h>
@@ -87,6 +88,7 @@ AnimData::AnimData(AnimData *src_anim, const NameMap &node_list, IMemAlloc *ma) 
   // set source pointer
   src = src_anim;
   animAdditive = src->animAdditive;
+  initialA2dSize = src->initialA2dSize;
 
   // compute size of data to be duplicated and altered
   DumpData &d = src->dumpData;
@@ -218,6 +220,25 @@ PrsAnimNodeRef AnimData::getPrsAnim(const char *node_name)
   return prs;
 }
 
+float AnimData::getDuration() const { return anim.rot.animTracks ? anim.rot.animTracks->get_duration() : 0.0f; }
+
+bool AnimData::sampleNodeTm(dag::Index16 node_id, float time, TMatrix &tm) const
+{
+  PrsAnimNodeRef prs;
+  prs.anim = anim.rot.animTracks;
+  prs.trackId = anim.rot.getTrackId(node_id);
+  if (!prs.valid())
+    return false;
+
+  vec3f p, s;
+  quat4f r;
+  AnimV20Math::PrsAnimNodeSampler<AnimV20Math::OneShotConfig> sampler(prs, time);
+  sampler.sampleTransform(&p, &r, &s);
+
+  tm = AnimV20Math::makeTM((Point3 &)p, (Quat &)r, (Point3 &)s);
+  return true;
+}
+
 int AnimData::getLabelTime(const char *name, bool fatal_err)
 {
   for (int i = 0; i < dumpData.noteTrack.size(); i++)
@@ -263,9 +284,10 @@ bool AnimData::load(IGenLoad &crd, class IMemAlloc *ma)
 
   crd.read(&dumpData, sizeof(dumpData));
   dumpData.patchData(dump);
-  animAdditive = (hdr.ver == 0x301);
+  animAdditive = (hdr.ver == 0x301) ? 1u : 0;
 
   anim.setup(dumpData);
+  initialA2dSize = sizeof(hdr) + hdr.dumpSize + sizeof(dumpData);
   if ((anim.pos.animTracks && anim.pos.animTracks != anim.rot.animTracks) ||
       (anim.scl.animTracks && anim.scl.animTracks != anim.rot.animTracks))
   {

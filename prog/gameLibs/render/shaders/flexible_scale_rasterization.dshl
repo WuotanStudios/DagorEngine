@@ -1,12 +1,20 @@
+
+int allow_fsr_distortion = 0 always_referenced;
+interval allow_fsr_distortion : no < 1, yes;
+assume_if_not_assumed allow_fsr_distortion = no; // FSR distortion variants are disabled by default.
+                                                 // To enable FSR distortion support add allow_fsr_distortion:i=1 assumption to game's shaders .blk.
+
 // If the FSR was used during gbuffer rendering, then this var will have YES for the whole frame
-int fsr_distortion = 0;
-interval fsr_distortion: no < 1, yes;
+int use_fsr_distortion = 0;
+interval use_fsr_distortion: no < 1, yes;
+
+bool fsr_distortion_enabled = allow_fsr_distortion == yes && hardware.ps5 && use_fsr_distortion == yes;
 
 int fsr_resolve_lut_id = 0;
 int fsr_distortion_lut_id = 0;
 
 macro USE_FSR(code)
-  if (hardware.ps5 && fsr_distortion == yes)
+  if (fsr_distortion_enabled)
   {
     (code)
     {
@@ -16,13 +24,15 @@ macro USE_FSR(code)
 
     hlsl(code)
     {
-      RegularBuffer<sce::Gnm::Texture> fsr_static_textures : BINDLESS_TEX_REGISTER;
-      RegularBuffer<sce::Gnm::Sampler> fsr_static_samplers : BINDLESS_SAMPLER_REGISTER;
-
+      #ifndef FSR_BINDLESS
+        RegularBuffer<sce::Gnm::Texture> fsr_static_textures : BINDLESS_TEX_REGISTER;
+        RegularBuffer<sce::Gnm::Sampler> fsr_static_samplers : BINDLESS_SAMPLER_REGISTER;
+      #endif
       float2 linearToDistortedTc(float2 tc)
       {
         Texture1D<float> fsrLutH = fsr_static_textures[fsr_lut_id.x];
         Texture1D<float> fsrLutV = fsr_static_textures[fsr_lut_id.x + 1];
+
         SamplerState smp = fsr_static_samplers[0];
 
         return float2(fsrLutH.Sample(smp, tc.x), fsrLutV.Sample(smp, tc.y));
@@ -32,6 +42,7 @@ macro USE_FSR(code)
       {
         Texture1D<float> fsrLutH = fsr_static_textures[fsr_lut_id.y];
         Texture1D<float> fsrLutV = fsr_static_textures[fsr_lut_id.y + 1];
+
         SamplerState smp = fsr_static_samplers[0];
 
         return float2(fsrLutH.Sample(smp, tc.x), fsrLutV.Sample(smp, tc.y));

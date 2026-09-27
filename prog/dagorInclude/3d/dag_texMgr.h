@@ -56,6 +56,7 @@ public:
   //! \param id ID of the texture to load
   //! \param req_ql Required quality level
   //! \returns `true` when loading scheduled successfully
+  //! \note On `false` the manager reverts the pending reading state itself; the factory must not cancel it
   virtual bool scheduleTexLoading(TEXTUREID /*id*/, TexQL /*req_ql*/) { return false; }
 
   //! \brief Loads and returns contents of texture as DDSx data
@@ -75,6 +76,11 @@ public:
   virtual bool isPersistentTexName(const char * /*nm*/) { return false; }
 
   //! \brief When a texture factory instance is destroyed at runtime, this function **must** be called to notify the manager about it.
+  //! \details Unreferenced entries of \p f are removed. A still referenced entry is detached from \p f: shader vars bound
+  //! to it are reset, its d3d resource is leaked (only \p f could release it, and users may still hold the pointer) and its
+  //! name stays registered until the last release, so the name can not be added again before that.
+  //! \warning The owner must stop all users of \p f first: no texture of \p f may be acquired, held, loading or released
+  //! concurrently. The manager calls into \p f outside its lock, so it can not serialize this itself.
   //! \warning This should not be called from factories which are static
   //! singletons or are destroyed after the manager was already de-initialized.
   static void onTexFactoryDeleted(TextureFactory *f);
@@ -204,6 +210,12 @@ bool is_managed_textures_streaming_load_on_demand();
 //! \brief Dumps current memory usage (Sys/Gpu) state of texture streaming
 void dump_texture_streaming_memory_state();
 
+//! \brief Returns total number of textures pending load across all streaming priorities.
+//! \details Useful as a "streaming idle?" signal for code that needs to wait until streaming has settled.
+//! Zero means no DDSx texture loads are queued.
+//! \returns Sum of pending texture load counts across all priority levels.
+int get_managed_textures_streaming_pending_count();
+
 //! \brief Checks whether the specified texture is split BQ/HQ with missing HQ part
 //! \param id ID of the texture to check
 //! \returns `true` if the texture is missing HQ part, `false` otherwise
@@ -221,29 +233,27 @@ void add_anisotropy_exception(TEXTUREID id);
 //! \param tex_name_filter Substring filter to match texture names
 void reset_anisotropy(const char *tex_name_filter = nullptr);
 
+//! \brief Attempts to load multiple textures for usage on the current frame and check for immediate success.
+//! \param tex_list List of texture IDs to load and check
+//! \param fq_loaded `true` to load and check for full quality, `false` for any quality
+//! \returns `true` if all textures are loaded, `false` otherwise
+bool prefetch_and_check_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_list, bool fq_loaded = false);
+
 //! \brief Attempts to load the texture for usage on the current frame and simply checks for immediate success.
 //! \param id ID of the texture to load and check
-//! \param fq_loaded `true` to check for full quality, `false` for any quality
+//! \param fq_loaded `true` to load and check for full quality, `false` for any quality
 //! \returns `true` if the texture is loaded, `false` otherwise
 inline bool prefetch_and_check_managed_texture_loaded(TEXTUREID id, bool fq_loaded = false)
 {
-  if (check_managed_texture_loaded(id, fq_loaded))
-    return true;
-  bool loaded = is_managed_textures_streaming_load_on_demand() ? prefetch_managed_texture(id) : false;
-  mark_managed_tex_lfu(id);
-  return (loaded && fq_loaded) ? check_managed_texture_loaded(id, fq_loaded) : loaded;
+  return prefetch_and_check_managed_textures_loaded({&id, 1}, fq_loaded);
 }
-
-//! \brief Attempts to load multiple textures for usage on the current frame and check for immediate success.
-//! \param tex_list List of texture IDs to load and check
-//! \param fq_loaded `true` to check for full quality, `false` for any quality
-//! \returns `true` if all textures are loaded, `false` otherwise
-bool prefetch_and_check_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_list, bool fq_loaded = false);
 
 //! \brief Synchronously loads a list of textures, blocking the current thread until all textures are loaded.
 //! \param tex_list List of texture IDs to load
 //! \param fq_loaded `true` to wait for full quality, `false` for any quality
-void prefetch_and_wait_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_list, bool fq_loaded = false);
+//! \param timeout_usec is the timeout in microseconds, or 0 for default value
+//! \returns whether all textures could be loaded successfully before the timeout
+bool prefetch_and_wait_managed_textures_loaded(dag::ConstSpan<TEXTUREID> tex_list, bool fq_loaded = false, int timeout_usec = 0);
 
 //! \brief Utility for iterating all managed textures.
 //! \details Managed textures form a linked list, so for an arbitrary ID, this function returns the "next" ID in the list.

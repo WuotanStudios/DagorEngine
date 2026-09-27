@@ -1,8 +1,8 @@
 from "%scripts/ui/ui_library.nut" import *
 import "dainput2" as dainput
-
-let { controlsGeneration } = require("%scripts/ui/settings/input_generation.nut")
-let {isGamepad} = require("%scripts/ui/settings/active_input.nut")
+from "types" import String
+from "%scripts/ui/settings/active_input.nut" import isGamepad
+from "%scripts/ui/settings/input_generation.nut" import controlsGeneration
 
 let dtext = @(text, params = null) {text, rendObj = ROBJ_TEXT}.__update(params ?? {})
 let format_ctrl_name = dainput.format_ctrl_name
@@ -36,7 +36,7 @@ function buildModifiersList(binding) {
 }
 
 let inParents = @(locId) "({0})".subst(locId)
-let eventTypeMap = {
+const eventTypeMap = {
   [dainput.BTN_pressed] = null,
   [dainput.BTN_pressed_long] = "Hold",
   [dainput.BTN_pressed2] = "Double Click",
@@ -46,7 +46,7 @@ let eventTypeMap = {
   [dainput.BTN_released_long] = "Hold Released"
 }
 
-let eventTypeLabels = {
+const eventTypeLabels = {
   [dainput.BTN_pressed] = "On Pressed",
   [dainput.BTN_pressed_long] = "On Hold",
   [dainput.BTN_pressed2] = "Double Click",
@@ -61,7 +61,7 @@ let notImportantEventsTexts = [dainput.BTN_released_short, dainput.BTN_released]
 const axesSeparatorTxt = "/"
 const axesGroupSeparatorTxt = ";"
 
-let sticksAliases = {
+const sticksAliases = {
   lx = ["J:L.Thumb.h", "J:Axis1"]
   ly = ["J:L.Thumb.v", "J:Axis2"]
   rx = ["J:R.Thumb.h", "J:Axis3"]
@@ -189,7 +189,7 @@ function buildElems(textlist, params = {imgFunc=null, textFunc=mkText, eventText
     return function(){
       if (eventTypeValues.indexof(text)!=null)
         return eventTextFunc?(inParents(loc(text)))
-      else if (type(text)=="string")
+      else if (text instanceof String)
         return textFunc(loc(text))
       else
         return null

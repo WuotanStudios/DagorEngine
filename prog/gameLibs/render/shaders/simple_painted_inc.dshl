@@ -1,5 +1,7 @@
 include "paint_details_inc.dshl"
 include "const_color_inc.dshl"
+include "sheen_common_inc.dshl"
+include "voxel_baking.dshl"
 
 macro INIT_SIMPLE_PAINTED()
   static float paint_details = 1.0; // paint_strength
@@ -24,15 +26,19 @@ macro INIT_SIMPLE_PAINTED()
 endmacro
 
 // If use_translucency is set to true, translucent_inc.dshl:INIT_TRANSLUCENCY_SETTING(ps) should be called before
-macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_microdetail_sampler) //not for depth or shadow, for them use RENDER_TO_SHADOW_PS()
+macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, use_sheen, has_char_microdetail_sampler, order) //not for depth or shadow, for them use RENDER_TO_SHADOW_PS()
   USE_PIXEL_TANGENT_SPACE()
   if (is_writing_gbuffer)
   {
     WRITE_GBUFFER()
+    if (use_sheen)
+    {
+      USE_SHEEN_COMMON()
+    }
   }
   (ps) {
-    diffuse_tex@static = tex;
-    normal_tex@static = normal;
+    diffuse_tex@staticSmp = tex;
+    normal_tex@staticSmp = normal;
   }
 
   if (compatibility_mode == compatibility_mode_off)
@@ -41,13 +47,22 @@ macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_micr
   }
 
   USE_CONST_COLOR_OVERRIDES()
+  USE_VOXEL_BAKING()
 
   hlsl(ps) {
+    #ifndef handle_if_two_sided
+      #define handle_if_two_sided(gbuffer)
+    #endif
+
+#if RENDINST_IMPOSTOR_VOXEL
+    VOXEL_BAKER_OUTPUT simple_painted_ps(VsOutput input INPUT_VFACE HW_USE_SCREEN_POS)
+#else
     #if VOXELIZE_ALBEDO_PASS
       void simple_painted_ps(VsOutput input)
     #else
       GBUFFER_OUTPUT simple_painted_ps(VsOutput input INPUT_VFACE HW_USE_SCREEN_POS)
     #endif
+#endif
     {
       #if SET_UP_MULTIDRAW
         INIT_MULTIDRAW(input);
@@ -55,12 +70,11 @@ macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_micr
       #endif
       #ifdef VOXELIZE_DISCARD_PRIM
         VOXELIZE_DISCARD_PRIM
+      #else
+        VOXEL_BAKER_PRE_DISCARD
       #endif
       #ifndef IS_DYNAMIC
         #define IS_DYNAMIC 0
-      #endif
-      #ifndef FORCE_AUTO_MOTION_VECTOR
-        #define FORCE_AUTO_MOTION_VECTOR 0
       #endif
 
       float2 texCoord = input.diffuseTexcoord.xy;
@@ -70,7 +84,13 @@ macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_micr
       ##endif
 
       // note: paint_const_color overrides overlay map color too!
-      float3 colorMul = get_color_mul(input, get_paint_const_color());
+      #if RENDINST_IMPOSTOR_VOXEL
+        half4 overcolor = get_paint_const_color();
+        uint palRow = input.colorMul.x;
+        uint palIndex = input.colorMul.y;
+      #else
+        float3 colorMul = get_color_mul(input, get_paint_const_color());
+      #endif
 
       half mask = luminance(diffuseColor.rgb);
       if (get_use_alpha_as_mask())
@@ -79,7 +99,12 @@ macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_micr
       }
 
       half details = get_paint_scale_bias_mult_details().w * saturate(mask * get_paint_scale_bias_mult_details().x + get_paint_scale_bias_mult_details().y);
-      diffuseColor.rgb  = lerp(diffuseColor.rgb, diffuseColor.rgb * colorMul * get_paint_scale_bias_mult_details().z, details);
+      #if RENDINST_IMPOSTOR_VOXEL
+        half3 coloringMul = diffuseColor.rgb * overcolor.rgb * (1 - overcolor.a) * get_paint_scale_bias_mult_details().z * details;
+        diffuseColor.rgb = diffuseColor.rgb * lerp(1, overcolor.rgb * overcolor.a * get_paint_scale_bias_mult_details().z, details);
+      #else
+        diffuseColor.rgb = lerp(diffuseColor.rgb, diffuseColor.rgb * colorMul * get_paint_scale_bias_mult_details().z, details);
+      #endif
 
       float3 worldPos = world_view_pos.xyz - input.pointToEye.xyz;
 
@@ -112,14 +137,18 @@ macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_micr
         half ao = 1;
         half3 worldNormal = normalize(input.normal.xyz);
         ##if compatibility_mode == compatibility_mode_off
-          BRANCH
-          if (character_micro_detail_layer>=0)
-          {
-            apply_character_micro_detail(sample_character_micro_detail(input.diffuseTexcoord.xy*get_character_micro_detail_scale().xy, character_micro_detail_layer),
-                                    diffuseColor.rgb, normalMap, reflectance, smoothness);
-          }
-          worldNormal = perturb_normal_precise(normalMap, worldNormal, input.pointToEye.xyz, input.diffuseTexcoord.xy);
-          apply_wetness_by_microdetail(character_micro_detail_layer, worldPos, diffuseColor.rgb, worldNormal, reflectance, smoothness, ao);
+          #if RENDINST_IMPOSTOR_VOXEL
+            worldNormal = perturb_normal_precise(normalMap, worldNormal, input.pointToEye.xyz, input.diffuseTexcoord.xy);
+          #else
+            BRANCH
+            if (character_micro_detail_layer>=0)
+            {
+              apply_character_micro_detail(sample_character_micro_detail(input.diffuseTexcoord.xy*get_character_micro_detail_scale().xy, character_micro_detail_layer),
+                                      diffuseColor.rgb, normalMap, reflectance, smoothness);
+            }
+            worldNormal = perturb_normal_precise(normalMap, worldNormal, input.pointToEye.xyz, input.diffuseTexcoord.xy);
+            apply_wetness_by_microdetail(character_micro_detail_layer, worldPos, diffuseColor.rgb, worldNormal, reflectance, smoothness, ao);
+          #endif
         ##else
           worldNormal = perturb_normal_precise(normalMap, worldNormal, input.pointToEye.xyz, input.diffuseTexcoord.xy);
         ##endif
@@ -140,6 +169,11 @@ macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_micr
           init_metalness(gbuffer, metalnessOrTranslucency);
           init_material(gbuffer, SHADING_NORMAL);
         }
+        ##if use_sheen
+          #if OVERRIDE_MATERIAL
+            init_material_override(gbuffer);
+          #endif
+        ##endif
 
         init_ao(gbuffer, ao);
         init_smoothness(gbuffer, smoothness);
@@ -149,8 +183,7 @@ macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_micr
         handle_if_two_sided(gbuffer);
 
         init_dynamic(gbuffer,IS_DYNAMIC);
-        init_order(gbuffer, GBUFFER_ORDER_STATIC);
-        init_auto_motion_vector(gbuffer, FORCE_AUTO_MOTION_VECTOR);
+        init_order(gbuffer, order);
         #ifdef MOTION_VECTORS_ENABLED
           float3 motion = encode_motion_vector( input.out_pos, input.out_pos_prev );
           init_motion_vector(gbuffer, motion);
@@ -158,13 +191,27 @@ macro SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, has_char_micr
         #ifdef PLOD_PS_GEN
           PLOD_PS_GEN(input, pack_gbuffer(gbuffer), normalMap)
         #endif
+#if RENDINST_IMPOSTOR_VOXEL
+        half alpha = 1;
+        ##if atest == atestOn
+          alpha = diffuseColor.a;
+        ##endif
+
+        VOXEL_BAKER_DEPTH(worldPos, GET_SCREEN_POS(input.pos).xy);
+        return baker_output_from_gbuffer(gbuffer, depth, alpha,
+          coloringMul, palRow, palIndex);
+#else
         return encode_gbuffer(gbuffer, input.pointToEye.xyz, GET_SCREEN_POS(input.pos));
+#endif
       #endif
     }
   }
   compile("target_ps", "simple_painted_ps");
 endmacro
 
-macro SIMPLE_PAINTED_PS(is_writing_gbuffer, use_translucency)
-  SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, true)
+macro SIMPLE_PAINTED_PS(is_writing_gbuffer, use_translucency, use_sheen, order)
+  if (!is_triangle_size_debug)
+  {
+    SIMPLE_PAINTED_PS_IMPL(is_writing_gbuffer, use_translucency, use_sheen, true, order)
+  }
 endmacro

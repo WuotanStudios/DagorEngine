@@ -3,16 +3,18 @@ from "dagor.math" import Point2, Point3, Point4
 from "string" import endswith
 from "%darg/ui_imports.nut" import *
 from "%darg/laconic.nut" import *
-from "%sqstd/ecs.nut" import *
+from "types" import Table, Array, String
 
 let entity_editor = require_optional("entity_editor")
-let { getValFromObj, isCompReadOnly, updateComp } = require("components/attrUtil.nut")
-let { filterString, propPanelVisible, propPanelClosed, selectedCompName, extraPropPanelCtors, selectedEntity, selectedEntities, de4workMode, wantOpenRISelect } = require("state.nut")
+let { isCompReadOnly, valueAtPath, writeComponent } = require("components/attrUtil.nut")
+let { filterString, propPanelVisible, propPanelClosed, selectedCompName, extraPropPanelCtors, selectedEntity,
+  selectedEntities, focusEntity, de4workMode, wantOpenRISelect, edObjectFlagsUpdateTrigger } = require("state.nut")
+let { sceneIdMap, allModifiableScenes, sceneToComboboxEntry, canSceneBeModified } = require("sceneModel.nut")
 let { colors, gridHeight } = require("components/style.nut")
 
 let selectedCompComp = Watched(null)
 let selectedCompPath = Watched(null)
-let deselectComp = function() {
+function deselectComp() {
   selectedCompName.set("")
   selectedCompComp.set(null)
   selectedCompPath.set(null)
@@ -21,11 +23,11 @@ let deselectComp = function() {
 let textButton = require("components/textButton.nut")
 let closeButton = require("components/closeButton.nut")
 let textInput = require("%daeditor/components/textInput.nut")
-let { addModalWindow, removeModalWindow, modalWindowsComponent } = require("%daeditor/components/modalWindows.nut")
+let { addModalWindow, removeModalWindow } = require("%daeditor/components/modalWindows.nut")
 let { showMsgbox } = require("%daeditor/components/msgbox.nut")
 let infoBox = @(text) showMsgbox({text})
 let mkSortModeButton = require("components/mkSortModeButton.nut")
-let nameFilter = require("components/nameFilter.nut")
+let { mkListFilter } = require("components/mkFilteredList.nut")
 
 let cursors = require("components/cursors.nut")
 let { mkTemplateTooltip, mkCompMetaInfoText } = require("components/templateHelp.nut")
@@ -38,17 +40,48 @@ let compNameFilter = require("components/apNameFilter.nut")(filterString, select
 let { riSelectShown, riSelectWindow, openRISelectForEntity } = require("riSelect.nut")
 
 let combobox = require("%daeditor/components/combobox.nut")
-let { getEntityExtraName, getSceneLoadTypeText } = require("%daeditor/daeditor_es.nut")
+let { getEntityExtraName, getSceneLoadTypeText, isEntityInLockedHierarchy } = require("%daeditor/daeditor_es.nut")
+
+let ecs = require("%sqstd/ecs.nut")
+
+function ecsObjToQuirrel(x) {
+  return x.map(@(val) val?.getAll() ?? val)
+}
+
+// The row list is built from this snapshot, not from ECS, so every path that
+// writes a component of the selected entity refreshes it.
+let getCurComps = @() (selectedEntity.get() ?? ecs.INVALID_ENTITY_ID) == ecs.INVALID_ENTITY_ID ? {} : ecsObjToQuirrel(ecs._dbg_get_all_comps_inspect(selectedEntity.get()))
+let curEntityComponents = Watched(getCurComps())
+let setCurComps = @() curEntityComponents.set(getCurComps())
+
+function saveComponent(eid, cname, object) {
+  writeComponent(eid, cname, null, object)
+  setCurComps()
+}
 
 let entitySortState = Watched({})
+
+// Both live across panel rebuilds: makeSideScroll would create a fresh handler
+// per build, and a new one never learns the geometry, since subscribe() does not
+// notify and BhvScrollEvent fires only when one of the six values it tracks
+// changes - the scroll offset, the content size or the element size. One each,
+// because a ScrollHandler binds to a single element.
+let gridScrollHandler = ScrollHandler()
+let listScrollHandler = ScrollHandler()
+
+// Only a different entity replaces the row list, so only that starts at the top
+selectedEntity.subscribe(@(_eid) gridScrollHandler.scrollToY(0))
 
 let windowState = Watched({
   pos = [-fsh(1.1), fsh(5)]
   size = [sw(29), sh(80)]
 })
 
+const noSceneParent = "No Scene"
 
-function onMoveResize(dx, dy, dw, dh) {
+let allSceneTexts = Computed(@() allModifiableScenes.get().map(@(scene, _idx) sceneToComboboxEntry(scene)).append(noSceneParent))
+
+function onMoveResize(dx, dy, dw, dh): table {
   let w = windowState.get()
   w.pos[0] = math.clamp(w.pos[0]+dx, -(sw(100)-w.size[0]), 0)
   w.pos[1] = math.max(w.pos[1]+dy, 0)
@@ -57,17 +90,17 @@ function onMoveResize(dx, dy, dw, dh) {
   return w
 }
 
-function get_tags(comp_flags){
+function get_tags(comp_flags: int|null): array {
   let tags = []
   comp_flags = comp_flags ?? 0
-  if (comp_flags & COMP_FLAG_REPLICATED)
+  if (comp_flags & ecs.COMP_FLAG_REPLICATED)
     tags.append("r")
-  if (comp_flags & COMP_FLAG_CHANGE_EVENT)
+  if (comp_flags & ecs.COMP_FLAG_CHANGE_EVENT)
     tags.append("t")
   return tags
 }
 
-function get_tagged_comp_name(comp_flags, comp_name) {
+function get_tagged_comp_name(comp_flags: int|null, comp_name) {
   local tags = get_tags(comp_flags).map(@(v) $"[{v}]")
   tags = "".join(tags)
   if (tags.len() <= 0)
@@ -75,9 +108,9 @@ function get_tagged_comp_name(comp_flags, comp_name) {
   return $"{tags} {comp_name}"
 }
 
-function makeBgToggle(initial=true) {
+function makeBgToggle(initial=true): function {
   local showBg = !initial
-  function toggleBg() {
+  function toggleBg(): bool {
     showBg = !showBg
     return showBg
   }
@@ -85,8 +118,8 @@ function makeBgToggle(initial=true) {
 }
 
 
-let getModComps = function() {
-  if (selectedEntity.get() == INVALID_ENTITY_ID)
+function getModComps(): table|null {
+  if (selectedEntity.get() == ecs.INVALID_ENTITY_ID)
     return {}
   let comps = entity_editor?.get_saved_components(selectedEntity.get())
   if (comps == null) // non-scene entity
@@ -98,10 +131,11 @@ let getModComps = function() {
 let modifiedComponents = Watched(getModComps())
 let updateModComps = @() modifiedComponents.set(getModComps())
 
-function isNonSceneEntity() {
+function isNonSceneEntity(): bool {
   return modifiedComponents.get() == null
 }
-function isModifiedComponent(cname, cpath) {
+
+function isModifiedComponent(cname, cpath): bool {
   if (cname == null || (cpath?.len()??0) > 0)
     return false
   if (cname == "transform")
@@ -116,48 +150,49 @@ function doResetComponent(eid, comp_name) {
   selectedCompName.set(null)
   selectedCompComp.set(null)
   selectedCompPath.set(null)
-  selectedCompName.trigger()
+  setCurComps()
 }
+
 function doResetSelectedComponent() {
-  let eid = selectedEntity.get() ?? INVALID_ENTITY_ID
-  if (eid == INVALID_ENTITY_ID)
+  let eid = selectedEntity.get() ?? ecs.INVALID_ENTITY_ID
+  if (eid == ecs.INVALID_ENTITY_ID)
     return
   if (selectedCompComp.get() == null)
     return
   doResetComponent(eid, selectedCompComp.get())
 }
 
+function panelRowColor(stateFlags: int, isOdd) {
+  return stateFlags & S_TOP_HOVER ? colors.GridRowHover
+    : isOdd ? colors.GridBg[0]
+    : colors.GridBg[1]
+}
 
 function panelRowColorC(comp_fullname, stateFlags, selectedCompNameVal, isOdd){
   local color = 0
   if (comp_fullname == selectedCompNameVal) {
     color = colors.Active
   } else {
-    color = stateFlags & S_TOP_HOVER ? colors.GridRowHover
-      : isOdd ? colors.GridBg[0]
-      : colors.GridBg[1]
+    color = panelRowColor(stateFlags, isOdd)
   }
   return color
 }
 
-let metaComponentPrefix     = "· "
-let metaContainerPrefix     = "· "
-let modifiedComponentPrefix = "• "
-let modifiedContainerPrefix = "• "
-let modifiedNoMetaPrefix    = "• "
-let transformPrefix         = "¤ "
-let modifiedSuffix          = ""
+const metaComponentPrefix     = "· "
+const metaContainerPrefix     = "· "
+const modifiedComponentPrefix = "• "
+const modifiedContainerPrefix = "• "
+const modifiedNoMetaPrefix    = "• "
+const transformPrefix         = "¤ "
+const modifiedSuffix          = ""
 
-let mkCompNameText = function(comp_name, comp_name_text, metaInfo, modified, group=null) {
-  let prefix = (comp_name=="transform") ? transformPrefix :
-               modified ? (metaInfo ? modifiedComponentPrefix : modifiedNoMetaPrefix)
-               : (metaInfo ? metaComponentPrefix : "")
-  let suffix = modified ? modifiedSuffix : ""
+
+function mkEntityRowText(prefix, name, suffix, group=null) {
   return {
     rendObj = ROBJ_TEXT
-    text = $"{prefix}{comp_name_text}{suffix}"
+    text = $"{prefix}{name}{suffix}"
     color = colors.TextDefault
-    size = [flex(), fontH(100)]
+    size = const [flex(), fontH(100)]
     margin = fsh(0.5)
     group = group
     behavior = Behaviors.Marquee
@@ -165,6 +200,14 @@ let mkCompNameText = function(comp_name, comp_name_text, metaInfo, modified, gro
     delay = 0.3
     speed = hdpx(100)
   }
+}
+
+function mkCompNameText(comp_name, comp_name_text, metaInfo, modified, group=null) {
+  let prefix = (comp_name=="transform") ? transformPrefix :
+               modified ? (metaInfo ? modifiedComponentPrefix : modifiedNoMetaPrefix)
+               : (metaInfo ? metaComponentPrefix : "")
+  let suffix = modified ? modifiedSuffix : ""
+  return mkEntityRowText(prefix, comp_name_text, suffix, group)
 }
 
 local toggleBg = makeBgToggle()
@@ -196,75 +239,129 @@ function mkCompTooltip(metaInfo) {
   }
 }
 
-function panelCompRow(params={}) {
-  let comp_name_ext = params?.comp_name_ext
-  let comp_flags = params?.comp_flags ?? 0
-  let {eid, comp_sq_type, rawComponentName, path, obj=null} = params
-  let comp_name = params?.comp_name ?? comp_name_ext
-  let fieldEditCtor = getCompNamePropEdit(rawComponentName) ?? getCompSqTypePropEdit(comp_sq_type) ?? fieldReadOnly
-  let isOdd = toggleBg()
-  let stateFlags = Watched(0)
-  let group = ElemGroup()
-  local comp_name_text = get_tagged_comp_name(comp_flags, (comp_name_ext ? comp_name_ext : comp_name))
-  if (comp_sq_type == "TMatrix")
-    comp_name_text = $"{comp_name_text}[3]"
-
-  local comp_fullname = clone rawComponentName
-  foreach (comp_key in (path ?? []))
-    comp_fullname = $"{comp_fullname}.{comp_key}"
-  let metaInfo = path==null ? g_entity_mgr.getTemplateDB().getComponentMetaInfo(comp_name) : null
-  let modified = !isNonSceneEntity() && isModifiedComponent(comp_name, path)
-  return function() {
-    return {
-      size = [flex(), gridHeight]
-      behavior = Behaviors.Button
-
-      onClick = function() {
-        let deselect = (selectedCompName.get() == comp_fullname)
-        selectedCompName.set(deselect ? null : comp_fullname)
-        selectedCompComp.set(deselect ? null : rawComponentName)
-        selectedCompPath.set(deselect ? null : path)
-      }
-      onHover = @(on) cursors.setTooltip(on ? mkCompTooltip(metaInfo) : null)
-      eventPassThrough = true
-      onElemState = @(sf) stateFlags.set(sf & S_TOP_HOVER)
-      group = group
-
-      children = [
-        @(){
-          size = [flex(), gridHeight]
-          rendObj = ROBJ_SOLID
-          watch = stateFlags
-          color = panelRowColorC(comp_fullname, stateFlags.get(), selectedCompName.get(), isOdd)
-          group
-        }
-        {
-          group
-          gap = hdpx(2)
-          valign = ALIGN_CENTER
-          size = [flex(), gridHeight]
-          flow = FLOW_HORIZONTAL
-          children = [
-            mkCompNameText(comp_name, comp_name_text, metaInfo, modified, group)
-            fieldEditCtor(params.__merge({eid, obj, comp_name, rawComponentName}))
-          ]
-        }
-      ]
-    }
-  }
+// Identifies a component, or one value inside it, in a single string. Used as
+// the selection identity, the open-state cache key and the row key.
+function mkCompPathKey(cname, cpath) {
+  local key = cname
+  foreach (k in (cpath ?? []))
+    key = $"{key}.{k}"
+  return key
 }
 
-let removeSelectedByEditorTemplate = @(tname) tname.replace("+daeditor_selected+","+").replace("+daeditor_selected","").replace("daeditor_selected+","")
+// A leaf row. The instance lives while the row is in the window, across every
+// flatten, so its state and its field editor are built once here. The editor
+// type is decided at mount from the sq type and the lock state, so the key
+// carries both and a change there remounts the row. The ECS read-only flag is
+// read at mount too; it is a template property and does not change on a live
+// entity.
+let CompRow = StatefulComp(function(scope, mountParams, isOdd) {
+  let p = mountParams.get()
+  let { eid, comp_sq_type, rawComponentName, path, pathKey, isLocked, obj = null } = p
+  let comp_name_ext = p?.comp_name_ext
+  let comp_flags = p?.comp_flags ?? 0
+  let comp_name = p?.comp_name ?? comp_name_ext
+  let indent = p?.indent ?? 0
+
+  let stateFlags = scope.Watched(0)
+  let isSelected = scope.Computed(@() selectedCompName.get() == pathKey)
+  let group = ElemGroup()
+  let rowSize = [flex(), gridHeight]
+
+  // The gizmo moves the transform outside the panel, so that row polls ECS
+  // while it is mounted; every other row follows the snapshot.
+  local value = null
+  local refreshLive = null
+  if (rawComponentName == "transform" && path == null) {
+    let live = scope.Watched(ecs._dbg_get_comp_val_inspect(eid, rawComponentName))
+    refreshLive = @() live.set(ecs._dbg_get_comp_val_inspect(eid, rawComponentName))
+    let pollId = {} // per instance: a closure id would collide with the next mount of this row
+    gui_scene.setInterval(0.1, refreshLive, pollId)
+    scope.onDetach(@() gui_scene.clearTimer(pollId))
+    value = live
+  }
+  else
+    value = scope.Computed(@() valueAtPath(curEntityComponents.get()?[rawComponentName], path))
+
+  // A TMatrix row edits the position only. Writing it as column 3 takes the
+  // other columns from the fresh read in writeComponent, not from the snapshot.
+  let writePath = comp_sq_type == "TMatrix" ? (clone (path ?? [])).append(3) : path
+  function setValue(val) {
+    if (!writeComponent(eid, rawComponentName, writePath, val))
+      return false
+    // show the write at once, and again after the tracked ES ran
+    refreshLive?()
+    setCurComps()
+    gui_scene.resetTimeout(0.1, setCurComps)
+    return true
+  }
+
+  let fieldEditCtor = isLocked ? fieldReadOnly
+    : (getCompNamePropEdit(rawComponentName) ?? getCompSqTypePropEdit(comp_sq_type) ?? fieldReadOnly)
+  let editor = fieldEditCtor(p.__merge({
+    eid, obj, comp_name, rawComponentName, value, setValue
+    readOnly = isLocked || isCompReadOnly(eid, rawComponentName)
+    sqType = comp_sq_type
+    key = pathKey
+  }))
+
+  local comp_name_text = get_tagged_comp_name(comp_flags, comp_name_ext ? comp_name_ext : comp_name)
+  if (comp_sq_type == "TMatrix")
+    comp_name_text = $"{comp_name_text}[3]"
+  let metaInfo = path == null ? ecs.g_entity_mgr.getTemplateDB().getComponentMetaInfo(comp_name) : null
+  // A save marks the component modified while the row stays mounted
+  let modified = scope.Computed(@() modifiedComponents.get() != null && isModifiedComponent(comp_name, path))
+  let nameText = @() mkCompNameText(comp_name, comp_name_text, metaInfo, modified.get(), group)
+    .__update({ watch = modified })
+
+  let rowBg = @() {
+    size = rowSize
+    rendObj = ROBJ_SOLID
+    watch = [stateFlags, isSelected, isOdd]
+    color = isSelected.get() ? colors.Active : panelRowColor(stateFlags.get(), isOdd.get())
+    group
+  }
+
+  return {
+    size = rowSize
+    behavior = Behaviors.Button
+    margin = [0, 0, 0, indent]
+
+    onClick = function() {
+      let deselect = selectedCompName.get() == pathKey
+      selectedCompName.set(deselect ? null : pathKey)
+      selectedCompComp.set(deselect ? null : rawComponentName)
+      selectedCompPath.set(deselect ? null : path)
+    }
+    onHover = @(on) cursors.setTooltip(on ? mkCompTooltip(metaInfo) : null)
+    eventPassThrough = true
+    onElemState = @(sf) stateFlags.set(sf & S_TOP_HOVER)
+    group
+
+    children = [
+      rowBg
+      {
+        group
+        gap = hdpx(2)
+        valign = ALIGN_CENTER
+        size = rowSize
+        flow = FLOW_HORIZONTAL
+        children = [nameText, editor]
+      }
+    ]
+  }
+}, @(mountParams) $"{mountParams.eid}:{mountParams.pathKey}:{mountParams.comp_sq_type}:{mountParams.isLocked}")
+
+let removeSelectedByEditorTemplate = @(tname: string): string tname.replace("+daeditor_selected+","+").replace("+daeditor_selected","").replace("daeditor_selected+","")
 
 const attrPanelAddEntityTemplateUID = "attr_panel_add_entity_template"
 
 function doAddTemplate(templateName) {
   let eid = selectedEntity.get()
-  if (eid != INVALID_ENTITY_ID) {
-    if (g_entity_mgr.getTemplateDB().getTemplateByName(templateName) == null) {
+  if (eid != ecs.INVALID_ENTITY_ID) {
+    if (ecs.g_entity_mgr.getTemplateDB().getTemplateByName(templateName) == null) {
       infoBox("Invalid template name")
     } else {
-      recreateEntityWithTemplates({eid, addTemplates=[templateName], callback=function(recreatedEid) {
+      ecs.recreateEntityWithTemplates({eid, addTemplates=[templateName], callback=function(recreatedEid) {
         log("Added entity template =", templateName)
         entity_editor?.save_add_template(recreatedEid, templateName)
       }, checkComps=false})
@@ -273,7 +370,7 @@ function doAddTemplate(templateName) {
     infoBox("Entity not selected")
   }
   removeModalWindow(attrPanelAddEntityTemplateUID)
-  selectedEntity.trigger()
+  selectedCompName.set(null)
 }
 
 function openAddTemplateDialog() {
@@ -308,14 +405,14 @@ const attrPanelDelEntityTemplateUID = "attr_panel_del_entity_template"
 
 function doDelTemplate(templateName) {
   let eid = selectedEntity.get()
-  if (eid != INVALID_ENTITY_ID) {
-    local tname = removeSelectedByEditorTemplate(g_entity_mgr.getEntityTemplateName(eid))
+  if (eid != ecs.INVALID_ENTITY_ID) {
+    local tname = removeSelectedByEditorTemplate(ecs.g_entity_mgr.getEntityTemplateName(eid) ?? "")
     if (tname == templateName) {
       infoBox("You can't remove last template")
-    } else if (g_entity_mgr.getTemplateDB().getTemplateByName(templateName) == null) {
+    } else if (ecs.g_entity_mgr.getTemplateDB().getTemplateByName(templateName) == null) {
       infoBox("Invalid template name")
     } else {
-      recreateEntityWithTemplates({eid, removeTemplates=[templateName], callback=function(recreatedEid) {
+      ecs.recreateEntityWithTemplates({eid, removeTemplates=[templateName], callback=function(recreatedEid) {
         log("Removed entity template =", templateName)
         entity_editor?.save_del_template(recreatedEid, templateName)
       }, checkComps=false})
@@ -324,7 +421,7 @@ function doDelTemplate(templateName) {
     infoBox("Entity not selected")
   }
   removeModalWindow(attrPanelDelEntityTemplateUID)
-  selectedEntity.trigger()
+  selectedCompName.set(null)
 }
 
 function openDelTemplateDialog() {
@@ -364,16 +461,14 @@ function panelCaption(text, tpl_name, sceneText) {
     fillColor = Color(0,10,20,210)//colors.ControlBg
     borderColor = Color(30,30,30,20)
     borderWidth = hdpx(1)
-    padding = [0,hdpx(5)]
+    padding = const [0,hdpx(5)]
     scrollOnHover = true
     eventPassThrough = true
     behavior = [Behaviors.Marquee, Behaviors.Button]
     onHover = @(on) templateTooltip.set(on && tpl_name ? mkTemplateTooltip(tpl_name, sceneText) : null)
     onClick = function() {
-      if (selectedEntities.get().len() > 1) {
-        selectedEntity.set(INVALID_ENTITY_ID)
-        entity_editor?.get_instance()?.setFocusedEntity(INVALID_ENTITY_ID)
-      }
+      if (selectedEntities.get().len() > 1)
+        focusEntity(ecs.INVALID_ENTITY_ID)
     }
 
     children = {
@@ -381,7 +476,7 @@ function panelCaption(text, tpl_name, sceneText) {
       valign = ALIGN_CENTER
       rendObj = ROBJ_TEXT
       text = text
-      margin = [hdpx(5), 0]
+      margin = const [hdpx(5), 0]
     }
   }
 }
@@ -391,7 +486,7 @@ function warningGenerated() {
     size = FLEX_H
     rendObj = ROBJ_BOX
     fillColor = Color(0,10,10,210)
-    padding = [0,hdpx(5)]
+    padding = const [0,hdpx(5)]
 
     children = {
       halign = ALIGN_CENTER
@@ -400,7 +495,7 @@ function warningGenerated() {
       color = Color(192,150,150)
       fontSize = hdpx(12)
       text = " BEWARE : Generated entities are never saved to scene file, all changes will be lost upon restart"
-      margin = [hdpx(5), 0]
+      margin = const [hdpx(5), 0]
     }
   }
 }
@@ -410,14 +505,15 @@ function closePropPanel() {
   propPanelClosed.set(true)
 }
 
-function panelButtons() {
+function panelButtons(eid) {
+  let isLocked = isEntityInLockedHierarchy(eid)
   return {
-    size = [flex(), fsh(3.3)]
+    size = const [flex(), fsh(3.3)]
     rendObj = ROBJ_BOX
     fillColor = Color(0,10,20,210)//colors.ControlBg
     borderColor = Color(30,30,30,100)
     borderWidth = hdpx(1)
-    padding = [0,hdpx(5)]
+    padding = const [0,hdpx(5)]
     eventPassThrough = true
     watch = [selectedCompComp, selectedCompPath]
     children = {
@@ -426,17 +522,21 @@ function panelButtons() {
       vplace = ALIGN_CENTER
       children = [
         isModifiedComponent(selectedCompComp.get(), selectedCompPath.get()) ? textButton("R", doResetSelectedComponent) : null
-        textButton("-", openDelTemplateDialog)
-        textButton("+", openAddTemplateDialog)
+        !isLocked ? textButton("-", openDelTemplateDialog) : null
+        !isLocked ? textButton("+", openAddTemplateDialog) : null
         textButton("Close", closePropPanel)
       ]
     }
   }
 }
 
-let autoOpenClosePropPanel = function(_) {
-  local show = selectedEntity.get() != INVALID_ENTITY_ID || selectedEntities.get().len() > 0
+function autoOpenClosePropPanel(_) {
+  local show = selectedEntity.get() != ecs.INVALID_ENTITY_ID || selectedEntities.get().len() > 0
   if (show && propPanelClosed.get())
+    return
+  // An RI pick recreates the entity, and the selection is empty until the new
+  // entity is selected again; the panel that hosts the picker must not close on that.
+  if (!show && riSelectShown.get())
     return
   propPanelVisible.set(show)
 }
@@ -451,7 +551,7 @@ let hiddenComponents = {
   daeditor__selected = true
 }
 
-function isComponentHidden(k){
+function isComponentHidden(k): bool {
   if (hiddenComponents?[k] || k.slice(0,1)=="_")
     return true
   if (endswith(k, "$copy"))
@@ -459,7 +559,7 @@ function isComponentHidden(k){
   return false
 }
 
-function isKeyInFilter(key, filterStr=null){
+function isKeyInFilter(key, filterStr=null): bool {
   if (filterStr==null || filterStr.len()==0 || key.tolower().contains(filterStr.tolower()))
     return true
   return false
@@ -473,7 +573,7 @@ let mkTagFromTextColor = @(text, fillColor = Color(100,100,100), size = SIZE_TO_
   borderWidth = 0
   borderRadius = hdpx(4)
   fillColor
-  padding = [0,hdpx(1)]
+  padding = const [0,hdpx(1)]
   vplace = ALIGN_CENTER
   children = {
     rendObj = ROBJ_TEXT
@@ -489,23 +589,25 @@ let mkTagFromText = @(text) mkTagFromTextColor(text)
 let ecsObjectSign = mkTagFromText("obj")
 let emptyTag = mkTagFromText("empty")
 let constTag = mkTagFromText("Shared")
-let isOpenedCache = persist("isOpenedCache", @() {})
-selectedEntity.subscribe(function(_eid){
-  const maxCacheEntries = 100
-  if (isOpenedCache.len()>maxCacheEntries)
-    isOpenedCache.clear()
-})
+// {eid: {pathKey: true}}. The panel watches it: a toggle changes the flat row list.
+let openedPaths = mkWatched(persist, "openedPaths", {})
 
-function getOpenedCacheEntry(eid, cname, cpath) {
-  local cachekey = clone cname
-  foreach (key in (cpath ?? []))
-    cachekey = $"{cachekey}.{key}"
-  let isOpened = isOpenedCache?[eid][cachekey] ?? Watched(false)
-  if (eid not in isOpenedCache)
-    isOpenedCache[eid] <- {}
-  if (isOpenedCache?[eid][cachekey]==null)
-    isOpenedCache[eid][cachekey] <- isOpened
-  return isOpened
+let isOpened = @(eid, cname, cpath) openedPaths.get()?[eid][mkCompPathKey(cname, cpath)] ?? false
+
+function setOpened(eid, cname, cpath, v) {
+  const maxEntities = 100
+  let key = mkCompPathKey(cname, cpath)
+  openedPaths.mutate(function(all) {
+    if (eid not in all) {
+      if (all.len() >= maxEntities)
+        all.clear()
+      all[eid] <- {}
+    }
+    if (v)
+      all[eid][key] <- true
+    else
+      all[eid].$rawdelete(key)
+  })
 }
 
 
@@ -514,7 +616,7 @@ let addPropValueTypes = ["text" "real" "bool" "integer" "array" "object" "Point2
 const attrPanelAddObjectValueUID = "attr_panel_add_object_value"
 
 function doAddObjectValue(eid, cname, cpath, value_name, value_type) {
-  local object = _dbg_get_comp_val_inspect(eid, cname)
+  local object = ecs._dbg_get_comp_val_inspect(eid, cname)
   local ccobj = object
   foreach (key in (cpath ?? []))
     ccobj = ccobj?[key]
@@ -541,11 +643,9 @@ function doAddObjectValue(eid, cname, cpath, value_name, value_type) {
     else if (value_type == "Point4")
       ccobj[value_name] = Point4(0,0,0,0)
 
-    obsolete_dbg_set_comp_val(eid, cname, object)
-    entity_editor?.save_component(eid, cname)
+    saveComponent(eid, cname, object)
 
-    getOpenedCacheEntry(eid, cname, cpath).set(true)
-    selectedCompName.trigger()
+    setOpened(eid, cname, cpath, true)
   } catch (e) {
     logerr($"Failed to add object value {value_name} (type {value_type}), reason: {e}")
   }
@@ -590,7 +690,7 @@ function openAddObjectValueDialog(eid, cname, cpath, ccobj) {
 const attrPanelAddArrayValueUID = "attr_panel_add_array_value"
 
 function doAddArrayValue(eid, cname, cpath, ckey, value_type) {
-  local object = _dbg_get_comp_val_inspect(eid, cname)
+  local object = ecs._dbg_get_comp_val_inspect(eid, cname)
   local ccobj = object
   foreach (key in (cpath ?? []))
     ccobj = ccobj?[key]
@@ -625,10 +725,8 @@ function doAddArrayValue(eid, cname, cpath, ckey, value_type) {
   if (ckey==null) {
     try {
       ccobj.append(value)
-      obsolete_dbg_set_comp_val(eid, cname, object)
-      entity_editor?.save_component(eid, cname)
-      getOpenedCacheEntry(eid, cname, cpath).set(true)
-      selectedCompName.trigger()
+      saveComponent(eid, cname, object)
+      setOpened(eid, cname, cpath, true)
     } catch(e) {
       logerr($"Failed to append array value, reason: {e}")
     }
@@ -636,10 +734,8 @@ function doAddArrayValue(eid, cname, cpath, ckey, value_type) {
   else {
     try {
       ccobj.insert(ckey.tointeger(), value)
-      obsolete_dbg_set_comp_val(eid, cname, object)
-      entity_editor?.save_component(eid, cname)
-      getOpenedCacheEntry(eid, cname, cpath).set(true)
-      selectedCompName.trigger()
+      saveComponent(eid, cname, object)
+      setOpened(eid, cname, cpath, true)
     } catch(e) {
       logerr($"Failed to insert array value, reason: {e}")
     }
@@ -692,7 +788,7 @@ function doContainerOp(eid, comp_name, cont_path, op) {
       ckey = spath[spath.len()-1]
   }
 
-  local object = _dbg_get_comp_val_inspect(eid, cname)
+  local object = ecs._dbg_get_comp_val_inspect(eid, cname)
   local ccobj = object
   foreach (key in (cpath ?? []))
     ccobj = ccobj?[key]
@@ -707,11 +803,10 @@ function doContainerOp(eid, comp_name, cont_path, op) {
     selectedCompComp.set(comp_name)
     selectedCompPath.set(cpath)
     doContainerOp(eid, comp_name, dpath, "delete")
-    selectedCompName.trigger()
     return
   }
 
-  if (type(ccobj)=="table" || ccobj instanceof CompObject) {
+  if (ccobj instanceof Table || ccobj instanceof ecs.CompObject) {
     if (op=="insert") {
       openAddObjectValueDialog(eid, cname, cpath, ccobj)
     }
@@ -721,17 +816,19 @@ function doContainerOp(eid, comp_name, cont_path, op) {
         return
       }
       try {
-        ccobj.remove(ckey)
+        if (ccobj instanceof Table)
+          ccobj.rawdelete(ckey)
+        else
+          ccobj.remove(ckey)
       } catch(e) {
         logerr($"Failed to remove value {ckey}, reason: {e}")
       }
-      obsolete_dbg_set_comp_val(eid, cname, object)
-      entity_editor?.save_component(eid, cname)
-      getOpenedCacheEntry(eid, cname, cpath).set(true)
+      saveComponent(eid, cname, object)
+      setOpened(eid, cname, cpath, true)
       deselectComp()
     }
   }
-  else if (type(ccobj)=="array" || ccobj?.getAll()!=null) {
+  else if (ccobj instanceof Array || ccobj?.getAll()!=null) {
     if (op=="insert") {
       let listType = ccobj?.listType()
 
@@ -746,7 +843,7 @@ function doContainerOp(eid, comp_name, cont_path, op) {
         value = false
       else if (listType=="float")
         value = 0.0
-      else if (listType=="int")
+      else if (listType=="int" || listType=="integer")
         value = 0
       else if (listType=="Point2")
         value = Point2(0,0)
@@ -763,10 +860,8 @@ function doContainerOp(eid, comp_name, cont_path, op) {
       if (ckey==null) {
         try {
           ccobj.append(value)
-          obsolete_dbg_set_comp_val(eid, cname, object)
-          entity_editor?.save_component(eid, cname)
-          getOpenedCacheEntry(eid, cname, cpath).set(true)
-          selectedCompName.trigger()
+          saveComponent(eid, cname, object)
+          setOpened(eid, cname, cpath, true)
         } catch(e) {
           logerr($"Failed to append array value, reason: {e}")
         }
@@ -774,10 +869,8 @@ function doContainerOp(eid, comp_name, cont_path, op) {
       else {
         try {
           ccobj.insert(ckey.tointeger(), value)
-          obsolete_dbg_set_comp_val(eid, cname, object)
-          entity_editor?.save_component(eid, cname)
-          getOpenedCacheEntry(eid, cname, cpath).set(true)
-          selectedCompName.trigger()
+          saveComponent(eid, cname, object)
+          setOpened(eid, cname, cpath, true)
         } catch(e) {
           logerr($"Failed to insert array value, reason: {e}")
         }
@@ -787,10 +880,8 @@ function doContainerOp(eid, comp_name, cont_path, op) {
       if (ckey==null) {
         try {
           ccobj.pop()
-          obsolete_dbg_set_comp_val(eid, cname, object)
-          entity_editor?.save_component(eid, cname)
-          getOpenedCacheEntry(eid, cname, cpath).set(true)
-          selectedCompName.trigger()
+          saveComponent(eid, cname, object)
+          setOpened(eid, cname, cpath, true)
         } catch(e) {
           logerr($"Failed to pop array value, reason: {e}")
         }
@@ -798,9 +889,8 @@ function doContainerOp(eid, comp_name, cont_path, op) {
       else {
         try {
           ccobj.remove(ckey.tointeger())
-          obsolete_dbg_set_comp_val(eid, cname, object)
-          entity_editor?.save_component(eid, cname)
-          getOpenedCacheEntry(eid, cname, cpath).set(true)
+          saveComponent(eid, cname, object)
+          setOpened(eid, cname, cpath, true)
           deselectComp()
         } catch(e) {
           logerr($"Failed to remove array value, reason: {e}")
@@ -813,8 +903,8 @@ function doContainerOp(eid, comp_name, cont_path, op) {
 let collapsibleButtonsStyle = {
   boxStyle = {
     normal = {
-        margin = [0,hdpx(3)]
-        padding = [0,hdpx(8)]
+        margin = const [0,hdpx(3)]
+        padding = const [0,hdpx(8)]
         borderColor = Color(0,0,0,100)
         fillColor = Color(0,0,0,0)
     }
@@ -828,8 +918,8 @@ let collapsibleButtonsStyle = {
 let collapsibleButtonsStyleDark = {
   boxStyle = {
     normal = {
-        margin = [0,hdpx(3)]
-        padding = [0,hdpx(8)]
+        margin = const [0,hdpx(3)]
+        padding = const [0,hdpx(8)]
         borderColor = Color(0,0,0,0)
         fillColor = Color(0,0,0,0)
     }
@@ -841,11 +931,59 @@ let collapsibleButtonsStyleDark = {
   }
 }
 
-function mkCollapsible(isConst, caption, childrenCtor=@() null, len=0, tags = null, eid=null, rawComponentName=null, path=null){
-  let empty = len==0
+let rowHeightByShape = {}
+local rowHeightScreenH = 0
+
+// 'shape' has to name every condition that decides which children the row draws.
+// Change what a row contains without changing its key and this serves a stale
+// height, which surfaces only later as rows drifting from the scroll offset.
+function measuredRowHeight(shape, ctor) {
+  // hdpx, fsh and the font all scale with the screen height, so a resolution
+  // change makes every cached height wrong
+  let screenH = sh(100)
+  if (screenH != rowHeightScreenH) {
+    rowHeightByShape.clear()
+    rowHeightScreenH = screenH
+  }
+  if (shape not in rowHeightByShape)
+    rowHeightByShape[shape] <- calc_comp_size(ctor)[1]
+  return rowHeightByShape[shape]
+}
+
+function mkRowAcc() {
+  let ctors = []
+  let ownH = []
+  let marginV = []
+  return {
+    ctors
+    ownH
+    marginV
+    add = function(ctor, h, margin_v) {
+      ctors.append(ctor)
+      ownH.append(h)
+      marginV.append(margin_v)
+    }
+    addLeaf = function(ctor) {
+      ctors.append(ctor)
+      ownH.append(gridHeight)
+      marginV.append(0)
+    }
+  }
+}
+
+let rowIndent = @(depth) depth > 0 ? depth * fsh(1) : 0
+
+let compTag = memoize(mkTagFromText)
+let mkCompFlagTag = memoize(@(text) mkTagFromTextColor(text, Color(40,90,90, 50), [SIZE_TO_CONTENT, hdpx(15)]))
+let mkFlagTags = @(eid, rawComponentName)
+  get_tags(ecs.get_comp_flags(eid, rawComponentName)).map(mkCompFlagTag)
+
+local flattenComp
+
+function containerRows(acc, isConst, caption, len, tags, eid, rawComponentName, path, depth, walk_children) {
   tags = tags ?? []
   let isRoot = (path?.len()??0) < 1
-  let metaInfo = isRoot ? g_entity_mgr.getTemplateDB().getComponentMetaInfo(rawComponentName) : null
+  let metaInfo = isRoot ? ecs.g_entity_mgr.getTemplateDB().getComponentMetaInfo(rawComponentName) : null
   let modified = isRoot && !isNonSceneEntity() ? isModifiedComponent(rawComponentName, null) : false
   let prefix = modified ? (metaInfo ? modifiedContainerPrefix : modifiedNoMetaPrefix)
                : (metaInfo ? metaContainerPrefix : "")
@@ -853,9 +991,14 @@ function mkCollapsible(isConst, caption, childrenCtor=@() null, len=0, tags = nu
   let captionText = {rendObj = ROBJ_TEXT, text = $"{prefix}{caption}{suffix}", color = Color(180,180,180)}
   let padding = [hdpx(5), hdpx(5)]
   let gap = hdpx(4)
+  let hasReset = !isConst && isModifiedComponent(rawComponentName, path)
+  // consumed whether or not this row is striped, so a caption row still takes
+  // its step and the leaf rows under it keep the alternating rhythm
   let isOdd = toggleBg()
-  if (empty){
-    return @() {
+  let indent = rowIndent(depth)
+
+  if (len == 0) {
+    let emptyRow = @() {
       size = FLEX_H
       flow = FLOW_HORIZONTAL
       children = [
@@ -871,7 +1014,7 @@ function mkCollapsible(isConst, caption, childrenCtor=@() null, len=0, tags = nu
           hplace = ALIGN_RIGHT
           flow = FLOW_HORIZONTAL
           children = [
-            isConst || !isModifiedComponent(rawComponentName, path) ? null : textButton("R", @() doResetComponent(eid, rawComponentName), collapsibleButtonsStyleDark)
+            !hasReset          ? null : textButton("R", @() doResetComponent(eid, rawComponentName), collapsibleButtonsStyleDark)
             isConst || isRoot  ? null : textButton("X", @() doContainerOp(eid, rawComponentName, path, "delself"), collapsibleButtonsStyleDark)
             isConst            ? null : textButton("+", @() doContainerOp(eid, rawComponentName, path, "insert"), collapsibleButtonsStyle)
           ]
@@ -884,16 +1027,22 @@ function mkCollapsible(isConst, caption, childrenCtor=@() null, len=0, tags = nu
       color = isOdd ? colors.GridBg[0] : colors.GridBg[1]
       behavior = Behaviors.Button
       onHover = @(on) cursors.setTooltip(on ? mkCompTooltip(metaInfo) : null)
+      margin = [0, 0, 0, indent]
     }
+    acc.add(emptyRow, measuredRowHeight($"e|{isConst}|{modified}|{hasReset}|{isRoot}|{tags.len()}", emptyRow), 0)
+    return
   }
-  let isOpened = getOpenedCacheEntry(eid, rawComponentName, path)
+
+  let opened = isOpened(eid, rawComponentName, path)
+  // one home for the caption's vertical margin: the fold below has to add
+  // exactly what the desc lays out, or the heights drift from the positions
+  let captionMarginV = hdpx(1)
   let captionUi = @() {
-    watch = isOpened
     rendObj = ROBJ_BOX
     fillColor = Color(0,10,20,210)//colors.ControlBg
     borderColor = Color(30,30,30,20)
     padding
-    key = caption
+    key = mkCompPathKey(rawComponentName, path)
     gap
     borderWidth = hdpx(1)
     children = [
@@ -902,163 +1051,124 @@ function mkCollapsible(isConst, caption, childrenCtor=@() null, len=0, tags = nu
         size = FLEX_H
         hplace = ALIGN_LEFT
         flow = FLOW_HORIZONTAL
-        children = [isOpened.get() ? downArrow : rightArrow].append(isConst ? constTag : null).extend(tags).append(captionText)
+        children = [opened ? downArrow : rightArrow].append(isConst ? constTag : null).extend(tags).append(captionText)
       }
       {
         gap
         hplace = ALIGN_RIGHT
         flow = FLOW_HORIZONTAL
         children = [
-          isConst || !isModifiedComponent(rawComponentName, path) ? null : textButton("R", @() doResetComponent(eid, rawComponentName), collapsibleButtonsStyleDark)
-          !isOpened.get() || isConst ? null : textButton("-", @() doContainerOp(eid, rawComponentName, path, "delete"), collapsibleButtonsStyle)
-          !isOpened.get() || isConst ? null : textButton("+", @() doContainerOp(eid, rawComponentName, path, "insert"), collapsibleButtonsStyle)
+          !hasReset ? null : textButton("R", @() doResetComponent(eid, rawComponentName), collapsibleButtonsStyleDark)
+          !opened || isConst ? null : textButton("-", @() doContainerOp(eid, rawComponentName, path, "delete"), collapsibleButtonsStyle)
+          !opened || isConst ? null : textButton("+", @() doContainerOp(eid, rawComponentName, path, "insert"), collapsibleButtonsStyle)
         ]
       }
     ]
     flow = FLOW_HORIZONTAL
     behavior = Behaviors.Button
-    onClick = @() isOpened.set(!isOpened.get())
+    onClick = @() setOpened(eid, rawComponentName, path, !isOpened(eid, rawComponentName, path))
     onHover = @(on) cursors.setTooltip(on ? mkCompTooltip(metaInfo) : null)
     size = FLEX_H
-    margin = [hdpx(1),0]
+    margin = [captionMarginV, 0, captionMarginV, indent]
   }
-  return function(){
-    local content = null
-    if (isOpened.get())
-      content = {children = childrenCtor(), size=FLEX_H, flow = FLOW_VERTICAL, margin = [0,0,0, fsh(1)]}
-    return {
-      children = [captionUi, content]
-      watch = isOpened
-      flow = FLOW_VERTICAL
-      size = FLEX_H
-    }
-  }
+  acc.add(captionUi, measuredRowHeight($"c|{isConst}|{modified}|{hasReset}|{isRoot}|{opened}|{tags.len()}", captionUi),
+    captionMarginV)
+
+  if (opened)
+    walk_children(depth + 1)
 }
 
-local mkCompList
-local mkCompObject
-local mkComp
-
-let compTag = memoize(mkTagFromText)
-let mkCompFlagTag = memoize(@(text) mkTagFromTextColor(text, Color(40,90,90, 50), [SIZE_TO_CONTENT, hdpx(15)]))
-let mkFlagTags = @(eid, rawComponentName)
-  get_tags(get_comp_flags(eid, rawComponentName)).map(mkCompFlagTag)
-
-function updateAttrComponent(eid, cname) {
-  updateComp(eid, cname)
-  gui_scene.resetTimeout(0.1, @() selectedCompName.trigger())
-}
-
-mkCompObject = function(eid, rawComponentName, rawObject, caption=null, onChange = null, path = null){
-  local isFirst = caption==null
-  caption = caption ?? rawComponentName
-  isFirst = isFirst || rawComponentName==caption
-  onChange = @() updateAttrComponent(eid, rawComponentName)
-  let object = getValFromObj(eid, rawComponentName, path)
-  let objData = object?.getAll() ?? object
-  let objLen = objData.len()
-  path = path ?? []
-  function childrenCtor() {
-    let contentChildren = []
-    let objKeys = objData.keys().filter(@(v) !isComponentHidden(v)).sort(@(a, b) a <=> b)
-    foreach (ok in objKeys) {
-      let nkeys = (clone path).append(ok)
-      if (objData[ok]?.getAll() != null ) {
-        contentChildren.append(mkComp(eid, rawComponentName, rawObject, ok, onChange, nkeys))
-      }
-      else if (type(objData[ok])=="table") {
-        contentChildren.append(mkComp(eid, rawComponentName, rawObject, ok, onChange, nkeys))
-      }
-      else if (type(objData[ok])=="array") {
-        contentChildren.append(mkComp(eid, rawComponentName, rawObject, ok, onChange, nkeys))
-      }
-      else {
-        contentChildren.append(panelCompRow({rawComponentName, comp_name_ext = ok, obj=rawObject, eid, comp_sq_type = typeof objData[ok], onChange, path=nkeys}))
-      }
-    }
-    return contentChildren
-  }
-  let isConst = isCompReadOnly(eid, rawComponentName)
-  let tags = isFirst ? mkFlagTags(eid, rawComponentName).append(ecsObjectSign) : [ecsObjectSign]
-  return mkCollapsible(isConst, caption, childrenCtor, objLen, tags, eid, rawComponentName, path)
-}
-
-let compTypeName = function(object){
+function compTypeName(object): string {
   local typeName = ""
-  if (type(object)=="array")
+  if (object instanceof Array)
     typeName = "Array"
-  else if (type(object)=="table")
+  else if (object instanceof Table)
     typeName = "Obj"
   else {
     typeName = object.tostring()
-    let isComp = typeName.indexof("Comp") !=null
+    let isComp = typeName.contains("Comp")
     typeName = typeName.slice(isComp ? "Comp".len() : 0, typeName.indexof(" (") ?? typeName.len())
   }
   return typeName
 }
 
-mkCompList = function(eid, rawComponentName, rawObject, caption=null, onChange=null, path = null){
-  let isFirst = caption == null
-  caption = caption ?? rawComponentName
-  onChange = @() updateAttrComponent(eid, rawComponentName)
-  let object = getValFromObj(eid, rawComponentName, path)
-  let len = object?.len() ?? 0
-  path = path ?? []
-  function childrenCtor(){
-    let res = []
-    foreach (num, _val in (object?.getAll() ?? object)) {
-      let nkeys = (clone path).append(num)
-      res.append(mkComp(eid, rawComponentName, rawObject, $"{caption}[{num}]", onChange, nkeys))
-    }
-    return res
-  }
-  let isConst = isCompReadOnly(eid, rawComponentName)
-  let fCaption = len>0 ? $"{caption} [{len}]" : caption
-  let typeTag = compTag(compTypeName(object))
-  let tags = isFirst ? mkFlagTags(eid, rawComponentName).append(typeTag) : [typeTag]
-  return mkCollapsible(isConst, fCaption, childrenCtor, len, tags, eid, rawComponentName, path)
-}
-
-
-mkComp = function(eid, rawComponentName, rawObject, caption=null, onChange = null, path = null){
-  onChange = @() updateAttrComponent(eid, rawComponentName)
-  let object = getValFromObj(eid, rawComponentName, path)
+flattenComp = function(acc, eid, rawComponentName, rawObject, isLocked, caption, path, depth) {
+  let object = valueAtPath(rawObject, path)
   let comp_sq_type = typeof object
+  let indent = rowIndent(depth)
 
-  let isFirst = caption==null
+  // striping is assigned here, in display order; the row mounts only when it
+  // enters the window
+  let addLeafRow = function(row_params) {
+    let pathKey = mkCompPathKey(row_params.rawComponentName, row_params.path)
+    acc.addLeaf(CompRow(row_params.__merge({ pathKey }), toggleBg()))
+  }
+
+  let isFirst = caption == null
   let params = {
-    eid, comp_sq_type, onChange, path
-    comp_flags = isFirst ? get_comp_flags(eid, rawComponentName) : null,
+    eid, comp_sq_type, path
+    comp_flags = isFirst ? ecs.get_comp_flags(eid, rawComponentName) : null,
     comp_name=rawComponentName,
     rawComponentName,
     comp_name_ext = caption
     obj = rawObject
+    isLocked
+    indent
   }
-  if (path == null && get_comp_type(eid, rawComponentName) != TYPE_STRING && type(object) == "string"){
-    return panelCompRow(params.__merge({comp_sq_type="null" comp_flags = get_comp_flags(eid, rawComponentName)}))
+  if (path == null && ecs.get_comp_type(eid, rawComponentName) != ecs.TYPE_STRING && object instanceof String) {
+    addLeafRow(params.__merge({comp_sq_type="null" comp_flags = ecs.get_comp_flags(eid, rawComponentName)}))
+    return
   }
   if (getCompSqTypePropEdit(comp_sq_type) != null) {
-    return panelCompRow(params)
+    addLeafRow(params)
+    return
   }
-  if (type(object) == "table" || object instanceof CompObject) {
-    return mkCompObject(eid, rawComponentName, rawObject, caption, onChange, path)
-  }
-  if (object?.getAll()!=null || type(object)=="array") {
-    return mkCompList(eid, rawComponentName, rawObject, caption, onChange, path)
-  }
-  return panelCompRow(params)
-}
 
-function ecsObjToQuirrel(x) {
-  return x.map(@(val) val?.getAll() ?? val)
-}
+  let cpath = path ?? []
 
-let getCurComps = @() (selectedEntity.get() ?? INVALID_ENTITY_ID) == INVALID_ENTITY_ID ? {} : ecsObjToQuirrel(_dbg_get_all_comps_inspect(selectedEntity.get()))
-let curEntityComponents = Watched(getCurComps())
-let setCurComps = @() curEntityComponents.set(getCurComps())
+  if (object instanceof Table || object instanceof ecs.CompObject) {
+    let isConst = isCompReadOnly(eid, rawComponentName) // an ECS inspect, so only where a container needs it
+    local cap = caption ?? rawComponentName
+    let isObjFirst = isFirst || rawComponentName == cap
+    let objData = object?.getAll() ?? object
+    let tags = isObjFirst ? mkFlagTags(eid, rawComponentName).append(ecsObjectSign) : [ecsObjectSign]
+    containerRows(acc, isConst, cap, objData.len(), tags, eid, rawComponentName, cpath, depth,
+      function(child_depth) {
+        let objKeys = objData.keys().filter(@(v) !isComponentHidden(v)).sort(@(a, b) a <=> b)
+        foreach (ok in objKeys) {
+          let nkeys = (clone cpath).append(ok)
+          if (objData[ok]?.getAll() != null || objData[ok] instanceof Table || objData[ok] instanceof Array)
+            flattenComp(acc, eid, rawComponentName, rawObject, isLocked, ok, nkeys, child_depth)
+          else
+            addLeafRow({rawComponentName, comp_name_ext = ok, obj=rawObject, eid,
+              comp_sq_type = typeof objData[ok], path=nkeys, isLocked, indent = rowIndent(child_depth)})
+        }
+      })
+    return
+  }
+
+  if (object?.getAll()!=null || object instanceof Array) {
+    let isConst = isCompReadOnly(eid, rawComponentName)
+    let cap = caption ?? rawComponentName
+    let len = object?.len() ?? 0
+    let typeTag = compTag(compTypeName(object))
+    let tags = isFirst ? mkFlagTags(eid, rawComponentName).append(typeTag) : [typeTag]
+    let fCaption = len>0 ? $"{cap} [{len}]" : cap
+    containerRows(acc, isConst, fCaption, len, tags, eid, rawComponentName, cpath, depth,
+      function(child_depth) {
+        foreach (num, _val in (object?.getAll() ?? object)) {
+          let nkeys = (clone cpath).append(num)
+          flattenComp(acc, eid, rawComponentName, rawObject, isLocked, $"{cap}[{num}]", nkeys, child_depth)
+        }
+      })
+    return
+  }
+
+  addLeafRow(params)
+}
 
 selectedEntity.subscribe_with_nasty_disregard_of_frp_update(function(eid){
-  gui_scene.resetTimeout(0.1, setCurComps)
+  setCurComps()
 
   if (wantOpenRISelect.get()) {
     wantOpenRISelect.set(false)
@@ -1068,9 +1178,9 @@ selectedEntity.subscribe_with_nasty_disregard_of_frp_update(function(eid){
   }
 })
 
-register_es("update_cur_components_on_entity_recreated",
+ecs.register_es("update_cur_components_on_entity_recreated",
 {
-  [[EventEntityRecreated]] = function(...){
+  [[ecs.EventEntityRecreated]] = function(...){
     setCurComps()
   }
 },{
@@ -1095,23 +1205,18 @@ let filteredCurComponents = Computed(function(){
 })
 
 function getSceneForEntity(eid) {
-  if (eid != INVALID_ENTITY_ID) {
-    local loadTypeVal = entity_editor?.get_instance().getEntityRecordLoadType(eid)
-    if (loadTypeVal != 0) {
-      let index = entity_editor?.get_instance().getEntityRecordIndex(eid)
-      return entity_editor?.get_instance().getSceneRecord(loadTypeVal, index)
-    }
+  if (eid != ecs.INVALID_ENTITY_ID) {
+    return entity_editor?.get_instance().getSceneRecord(entity_editor?.get_instance().getEntityRecordSceneId(eid))
   }
   return {}
 }
 
-function getSceneIdTextForEntity(eid) {
-  if (eid != INVALID_ENTITY_ID) {
+function getSceneIdTextForEntity(eid): string {
+  if (eid != ecs.INVALID_ENTITY_ID) {
     local loadTypeVal = entity_editor?.get_instance().getEntityRecordLoadType(eid)
     if (loadTypeVal != 0) {
       let loadType = getSceneLoadTypeText(loadTypeVal)
-      let index = entity_editor?.get_instance().getEntityRecordIndex(eid)
-      return "{0}:{1}".subst(loadType, index)
+      return "{0}:{1}".subst(loadType, entity_editor?.get_instance().getEntityRecordSceneId(eid))
     }
   }
   return ""
@@ -1136,10 +1241,8 @@ function mkEntityRow(eid, template_name, name, is_odd) {
       if (selectedEntities.get().len() > 1) {
         if (evt.ctrlKey)
           entity_editor?.get_instance().selectEntity(eid, false/*selected*/)
-        else {
-          selectedEntity.set(eid)
-          entity_editor?.get_instance().setFocusedEntity(eid)
-        }
+        else
+          focusEntity(eid)
       }
     }
     onHover = @(_on) null
@@ -1155,10 +1258,10 @@ function mkEntityRow(eid, template_name, name, is_odd) {
         color = panelRowColorC(name, stateFlags.get(), "", is_odd)
         group
       }
-      @(){
+      {
         rendObj = ROBJ_TEXT
         text = $"{eid}  {div}  {name} {extra}  {sceneText}"
-        size = [flex(), fontH(100)]
+        size = const [flex(), fontH(100)]
         margin = fsh(0.5)
         group = group
         behavior = Behaviors.Marquee
@@ -1170,13 +1273,121 @@ function mkEntityRow(eid, template_name, name, is_odd) {
   }
 }
 
+
+function mkSceneComboBox(eid, sceneId) {
+  let currentScene = Watched(null)
+  if (sceneId == ecs.INVALID_SCENE_ID) {
+    currentScene.set(noSceneParent)
+  }
+  else {
+    let scene = sceneIdMap?.get()[sceneId]
+    currentScene.set(sceneToComboboxEntry(scene))
+  }
+
+  // A lock shrinks the options while the row is mounted; only a pick may reparent.
+  return combobox(
+    { value = currentScene,
+      changeVarOnListUpdate = false,
+      update = function(v) {
+        local newSceneId = ecs.INVALID_SCENE_ID
+        if (v != noSceneParent) {
+          local index = allSceneTexts.get().indexof(v)
+          if (index == null) {
+            return
+          }
+          newSceneId = allModifiableScenes.get()[index].id
+        }
+        if (sceneId != newSceneId) {
+          let item = {}
+          item.isEntity <- true
+          item.id <- eid
+          entity_editor?.get_instance().setSceneNewParent(newSceneId, [item])
+        }
+      }
+    }, allSceneTexts)
+}
+
+
+// Returns the rows plus what the virtual grid needs to window them: a height per
+// row and the always-built tail sections. The rows are flat, so an expanded
+// container is a caption row followed by its children as siblings - every item
+// is one row of known height, which a nested container could not promise.
+function mkEntityEditableDataRows(eid) {
+  let acc = mkRowAcc()
+  let isLocked = isEntityInLockedHierarchy(eid)
+
+  // Kept out of the builder, which reruns whenever the row re-enters the window:
+  // toggleBg is shared state, and taking its step eagerly also puts this row
+  // first, which is where it displays.
+  let stateFlags = Watched(0)
+  let group = ElemGroup()
+  let isOdd = toggleBg()
+  acc.addLeaf( // the scene row below declares gridHeight
+    function() {
+      let sceneId = entity_editor?.get_instance().getEntityRecordSceneId(eid) ?? ecs.INVALID_SCENE_ID
+      let readOnly = (sceneId != ecs.INVALID_SCENE_ID && !canSceneBeModified(sceneIdMap.get()[sceneId])) || isLocked
+
+      return {
+        size = [flex(), gridHeight]
+        behavior = Behaviors.Button
+        eventPassThrough = true
+        onElemState = @(sf) stateFlags.set(sf & S_TOP_HOVER)
+        group = group
+        watch = sceneIdMap
+        children = [
+          @(){
+            size = [flex(), gridHeight]
+            rendObj = ROBJ_SOLID
+            watch = stateFlags
+            color = panelRowColor(stateFlags.get(), isOdd)
+            group
+          }
+          {
+            group
+            gap = hdpx(2)
+            valign = ALIGN_CENTER
+            size = [flex(), gridHeight]
+            flow = FLOW_HORIZONTAL
+            children = [
+              mkEntityRowText("", "Scene", "")
+              readOnly
+                ? {
+                  rendObj = ROBJ_TEXT
+                  halign = ALIGN_LEFT
+                  valign = ALIGN_CENTER
+                  size = flex()
+                  text = sceneId != ecs.INVALID_SCENE_ID ? sceneToComboboxEntry(sceneIdMap.get()[sceneId]) : noSceneParent
+                }
+                : mkSceneComboBox(eid, sceneId)
+            ]
+          }
+        ]
+      }
+    })
+
+  foreach (v in filteredCurComponents.get())
+    flattenComp(acc, eid, v.compName, v.compObj, isLocked, null, null, 0)
+
+  // daRg puts max(prev.margin.rb, next.margin.lt) between flowing children, so
+  // fold that into each row height to keep the item offsets exact. The last row
+  // of a window renders only its own trailing margin rather than the folded max,
+  // so the content size can run a pixel short until the window reaches the end.
+  let n = acc.ctors.len()
+  let heights = []
+  foreach (i, h in acc.ownH)
+    heights.append(h + (i + 1 < n ? math.max(acc.marginV[i], acc.marginV[i + 1]) : 0))
+
+  let tail = (extraPropPanelCtors.get() ?? []).map(@(ctor) ctor(eid)).filter(@(c) c != null)
+  return { rows = acc.ctors, heights, tail }
+}
+
 let sortedEntities = Computed(function() {
   if (!propPanelVisible.get())
     return []
 
   local entitiesList = []
   foreach (eid, _v in selectedEntities.get()) {
-    let tplName = g_entity_mgr.getEntityTemplateName(eid) ?? ""
+    let tplName = ecs.g_entity_mgr.getEntityTemplateName(eid) ?? ""
     let name = removeSelectedByEditorTemplate(tplName)
     entitiesList.append({
       tplName
@@ -1200,30 +1411,9 @@ let filteredEntities = Computed(function() {
     : sortedEntities.get()
 })
 
-let templateFilter = nameFilter(templateFilterText, {
-  placeholder = "Filter by template"
-
-  function onChange(text) {
-    templateFilterText.set(text)
-  }
-
-  function onEscape() {
-    set_kb_focus(null)
-  }
-
-  function onReturn() {
-    set_kb_focus(null)
-  }
-
-  function onClear() {
-    templateFilterText.set("")
-    set_kb_focus(null)
-  }
-})
-
+let templateFilter = mkListFilter(templateFilterText, { placeholder = "Filter by template" })
 
 function compPanel() {
-
   if (!propPanelVisible.get()) {
     return {
       watch = propPanelVisible
@@ -1234,34 +1424,36 @@ function compPanel() {
 
     toggleBg = makeBgToggle() // achtung!: implicit state reset - better pass it via arguments
 
-    let showComps = !riSelectShown.get() && selectedEntity.get() != INVALID_ENTITY_ID
+    let showComps = !riSelectShown.get() && selectedEntity.get() != ecs.INVALID_ENTITY_ID
     let showList  = !riSelectShown.get() && !showComps && selectedEntities.get().len() > 1
 
     let eid = selectedEntity.get()
-    let rows = filteredCurComponents.get().map(function(v) {
-      return mkComp(eid, v.compName, v.compObj)
-    })
-    rows.extend((extraPropPanelCtors.get() ?? []).map(@(ctor) ctor(eid)))
+    let grid = mkEntityEditableDataRows(eid)
+    let gridRootBase = {
+      size = flex()
+      flow = FLOW_VERTICAL
+      behavior = Behaviors.Pannable
+    }
     let scrolledGrid = {
       size = flex()
       rendObj = ROBJ_SOLID
       color = Color(50,50,50,100)
-      children = makeVertScroll(rows, {
-        rootBase = {
-          size = flex()
-          flow = FLOW_VERTICAL
-          behavior = Behaviors.Pannable
-        }
+      children = makeVertScroll(null, {
+        scrollHandler = gridScrollHandler
+        rootBase = gridRootBase
+        virtualItems = grid.rows
+        virtualItemHeights = grid.heights
+        virtualTail = grid.tail
       })
     }
 
     let nonSceneEntity = isNonSceneEntity()
     local captionPrefix = nonSceneEntity ? "[generated] " : ""
-    if (eid!=INVALID_ENTITY_ID && selectedEntities.get().len() > 1)
+    if (eid!=ecs.INVALID_ENTITY_ID && selectedEntities.get().len() > 1)
       captionPrefix = $"<- {selectedEntities.get().len()} entities | {captionPrefix}"
 
-    let templName = eid!=INVALID_ENTITY_ID ? removeSelectedByEditorTemplate(g_entity_mgr.getEntityTemplateName(eid) ?? "") : null
-    let uiTemplName = eid!=INVALID_ENTITY_ID ? entity_editor?.get_template_name_for_ui(eid) : null
+    let templName = eid!=ecs.INVALID_ENTITY_ID ? removeSelectedByEditorTemplate(ecs.g_entity_mgr.getEntityTemplateName(eid) ?? "") : null
+    let uiTemplName = eid!=ecs.INVALID_ENTITY_ID ? entity_editor?.get_template_name_for_ui(eid) : null
     local extraName = getEntityExtraName(eid)
     extraName = (extraName != null) ? $" / {extraName}" : ""
 
@@ -1272,7 +1464,7 @@ function compPanel() {
       sceneTooltipText = "{0} {1}".subst(sceneIdText, scene.path)
     }
 
-    let captionText = eid!=INVALID_ENTITY_ID ? "{0}{1}: {2}{3}  {4}".subst(captionPrefix, eid, uiTemplName, extraName, sceneIdText) :
+    let captionText = eid!=ecs.INVALID_ENTITY_ID ? "{0}{1}: {2}{3}  {4}".subst(captionPrefix, eid, uiTemplName, extraName, sceneIdText) :
       selectedEntities.get().len() == 0 ? "No entity selected"
       : $"{selectedEntities.get().len()} entities selected"
 
@@ -1289,6 +1481,7 @@ function compPanel() {
       rendObj = ROBJ_SOLID
       color = Color(50,50,50,100)
       children = makeVertScroll(listRows, {
+        scrollHandler = listScrollHandler
         rootBase = {
           size = flex()
           flow = FLOW_VERTICAL
@@ -1300,10 +1493,11 @@ function compPanel() {
     return {
       watch = [
         selectedEntity, selectedEntities, propPanelVisible, filterString,
-        windowState, isCurEntityComponents, filteredCurComponents, selectedCompName,
-        de4workMode, riSelectShown, filteredEntities
+        windowState, isCurEntityComponents, filteredCurComponents,
+        de4workMode, riSelectShown, filteredEntities, edObjectFlagsUpdateTrigger,
+        openedPaths
       ]
-      size = [sw(100), sh(100)]
+      size = const [sw(100), sh(100)]
 
       children = [
         {
@@ -1342,16 +1536,15 @@ function compPanel() {
                     closeButton(closePropPanel)
                   ]
                 }
+                riSelectShown.get() ? riSelectWindow : null
                 showList ? templateFilter : null
                 nonSceneEntity ? warningGenerated() : null
                 showComps && isCurEntityComponents.get() ? compNameFilter : null
                 showComps ? scrolledGrid : null
-                showComps ? panelButtons : null
+                showComps ? @() panelButtons(eid) : null
                 showList  ? scrolledList : null
               ]
             }
-            riSelectShown.get() ? riSelectWindow : null
-            modalWindowsComponent
           ]
         }
         @() {

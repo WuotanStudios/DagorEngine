@@ -1,7 +1,8 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include "scintilla/include/scintilla.h"
-#include "scintilla/include/sciLexer.h"
+#include <ILexer.h>
+#include <Lexilla.h>
+#include <sciLexer.h>
 
 #include "scintilla_window.h"
 #include <util/dag_simpleString.h>
@@ -29,6 +30,8 @@ enum
   CM_GO_TO_LINE,
 };
 
+typedef void *(*CreateLexerFn)(const char *name);
+
 const int WM_SC_NOTYFY = WM_USER + 101;
 const char SCPARENT_WINDOW_CLASS_NAME[] = "ScParentWindowClass";
 const unsigned long UPDATE_IGNORE_DELAY_MS = 500;
@@ -36,7 +39,8 @@ const unsigned UPDATE_TIME_SHIFT_MS = 300;
 
 
 static const int MARGIN_SCRIPT_FOLD_INDEX = 1;
-void *CScintillaWindow::sciLexerDll = NULL;
+void *CScintillaWindow::scintillaDll = NULL;
+void *CScintillaWindow::lexillaDll = NULL;
 
 
 const char nutKeyWords[] = "break case catch class clone continue \
@@ -160,13 +164,22 @@ CScintillaWindow::~CScintillaWindow()
 void CScintillaWindow::initScintilla()
 {
 #if _TARGET_64BIT
-  sciLexerDll = ::LoadLibrary("SciLexer64.DLL");
+  scintillaDll = ::LoadLibrary("Scintilla.DLL");
+  lexillaDll = ::LoadLibrary("Lexilla.DLL");
 #else
-  sciLexerDll = ::LoadLibrary("SciLexer.DLL");
+  scintillaDll = ::LoadLibrary("Scintilla.DLL");
+  lexillaDll = ::LoadLibrary("Lexilla.DLL");
 #endif
-  if (sciLexerDll == NULL)
-    debug("[ScriptEditor::registerWndClass]Scintilla DLL \
+  if (scintillaDll == NULL)
+    debug("[BlkEditor::registerWndClass]Scintilla DLL \
     could not be loaded.");
+  if (lexillaDll == NULL)
+    debug("[BlkEditor::registerWndClass]Lexilla DLL \
+    could not be loaded.");
+
+  CreateLexerFn createLexer =
+    reinterpret_cast<CreateLexerFn>(::GetProcAddress(reinterpret_cast<HMODULE>(lexillaDll), LEXILLA_CREATELEXER));
+  lexer = createLexer("cpp");
 
   INITCOMMONCONTROLSEX initRec;
 
@@ -174,7 +187,7 @@ void CScintillaWindow::initScintilla()
   initRec.dwICC = ICC_PROGRESS_CLASS;
 
   if (!InitCommonControlsEx(&initRec))
-    debug("[ScriptEditor::registerWndClass] Unable to init common controls");
+    debug("[BlkEditor::registerWndClass] Unable to init common controls");
 
   const HINSTANCE inst = ::GetModuleHandle(NULL);
 
@@ -199,9 +212,9 @@ void CScintillaWindow::initScintilla()
 }
 
 
-int CScintillaWindow::sendEditor(unsigned Msg, uintptr_t wParam, intptr_t lParam)
+sptr_t CScintillaWindow::sendEditor(unsigned Msg, uintptr_t wParam, intptr_t lParam)
 {
-  return ::SendMessage((HWND)hwndScintilla, Msg, wParam, lParam);
+  return static_cast<sptr_t>(::SendMessage((HWND)hwndScintilla, Msg, wParam, lParam));
 }
 
 
@@ -220,9 +233,11 @@ void CScintillaWindow::setupScintilla()
 {
   COLORREF black = 0;
 
-  sendEditor(SCI_SETLEXER, SCLEX_RUBY);
+  sendEditor(SCI_SETILEXER, 0, reinterpret_cast<sptr_t>(lexer));
+
+  // sendEditor(SCI_SETLEXER, SCLEX_RUBY);
   // sendEditor(SCI_SETSTYLEBITS, 7);
-  sendEditor(SCI_SETSTYLEBITS, 5);
+  // sendEditor(SCI_SETSTYLEBITS, 5);
   sendEditor(SCI_SETTABWIDTH, 2);
   sendEditor(SCI_SETINDENT, 0); //< same as tab width
   sendEditor(SCI_SETUSETABS, 0);
@@ -367,10 +382,10 @@ void CScintillaWindow::getText(SimpleString &text)
   if (!hwndScintilla)
     return;
 
-  int len = sendEditor(SCI_GETLENGTH);
+  Sci_Position len = sendEditor(SCI_GETLENGTH);
   char *data = new char[len + 1];
 
-  TextRange tr;
+  Sci_TextRange tr;
   tr.chrg.cpMin = 0;
   tr.chrg.cpMax = len;
   tr.lpstrText = data;

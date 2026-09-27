@@ -20,6 +20,7 @@ Sources =
   dumpSysInfo.cpp
   userSystemInfo.cpp
   uuidgen.cpp
+  redistInfo.cpp
 ;
 if [ GLOB $(Root)/$(Location) : systemInfo_private.cpp ] {
   Sources += systemInfo_private.cpp ;
@@ -40,12 +41,23 @@ if $(Platform) in windows {
   ;
 }
 
+if $(Platform) in ps4 ps5 {
+  AddLibs += -lSceAppContent_stub_weak ; # the platform link adds it for exe targets only, prx modules need it here
+}
+
+if $(Platform) in nswitch {
+  UseProgLibs +=
+    gameLibs/nswitch/mounts
+    gameLibs/nswitch/journalizedMount
+  ;
+}
+
 if $(Platform) in macOS {
   Sources +=
     macosx_spec.mm
   ;
 
-  AddLibs += -framework DiskArbitration ;
+  AddLibs += "-framework DiskArbitration" "-framework IOKit" ;
 }
 
 if $(Platform) in iOS {
@@ -74,6 +86,14 @@ if $(Platform) in android linux macOS ps4 ps5 scarlett xboxOne windows && $(Plat
   CPPopt += -DUSE_CPU_FEATURES ;
 }
 
-UseProgLibs += 3rdPartyLibs/hash ;
+UseProgLibs +=
+  3rdPartyLibs/hash
+  engine/drv/vr_device
+;
+
+# consoles report their own storage in get_disk_space and never resolve a path
+if $(Platform) in windows linux macOS iOS android {
+  UseProgLibs += gameLibs/folders ;
+}
 
 include $(Root)/prog/_jBuild/build.jam ;

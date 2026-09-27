@@ -1,0 +1,63 @@
+//
+// Dagor Engine 6.5
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+//
+#pragma once
+
+#include <daECS/core/baseIo.h>
+
+class framemem_allocator;
+namespace eastl
+{
+template <typename T, typename A>
+class vector;
+template <typename A, typename T, typename C>
+class bitvector;
+} // namespace eastl
+
+namespace danet
+{
+class BitStream;
+}
+namespace ecs
+{
+struct DataComponent;
+}
+
+namespace net
+{
+
+struct InternedStringsBase;
+struct InternedStringsRepl;
+class IConnection;
+
+struct BitstreamDeserializer final : public ecs::DeserializerCb
+{
+  const danet::BitStream &bs;
+  ecs::EntityManager &mgr;
+  InternedStringsRepl *objectKeys = nullptr;
+  BitstreamDeserializer(ecs::EntityManager &mgr, const danet::BitStream &bs_, InternedStringsRepl *keys = nullptr) :
+    mgr(mgr), bs(bs_), objectKeys(keys)
+  {}
+  bool read(void *to, size_t sz_in_bits, ecs::component_type_t user_type) const override;
+  bool skip(ecs::component_index_t cidx, const ecs::DataComponent &compInfo);
+};
+struct BitstreamSerializer final : public ecs::SerializerCb
+{
+  danet::BitStream &bs;
+  ecs::EntityManager &mgr;
+  InternedStringsRepl *objectKeys = nullptr;
+  using ObjectKeysBitVector = eastl::bitvector<framemem_allocator, uint64_t, eastl::vector<uint64_t, framemem_allocator>>;
+  ObjectKeysBitVector *outObjectKeysUsed = nullptr;
+  // component being written, set only where it is known - it makes serialization logerrs actionable
+  ecs::EntityId curEid;
+  ecs::component_index_t curCidx = ecs::INVALID_COMPONENT_INDEX;
+  BitstreamSerializer(ecs::EntityManager &mgr, danet::BitStream &bs_) : mgr(mgr), bs(bs_) {}
+  BitstreamSerializer(ecs::EntityManager &mgr, danet::BitStream &bs_, InternedStringsRepl *object_keys,
+    ObjectKeysBitVector *out_keys_used) :
+    mgr(mgr), bs(bs_), objectKeys(object_keys), outObjectKeysUsed(out_keys_used)
+  {}
+  void write(const void *from, size_t sz_in_bits, ecs::component_type_t user_type) override;
+};
+
+} // namespace net

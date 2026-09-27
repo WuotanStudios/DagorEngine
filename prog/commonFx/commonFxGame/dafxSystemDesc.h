@@ -3,6 +3,7 @@
 
 #include <EASTL/vector_map.h>
 #include <math/dag_curveParams.h>
+#include <math/dag_mathUtils.h>
 
 namespace dafx_ex
 {
@@ -23,10 +24,18 @@ enum
   RTAG_VOLFOG_INJECTION = 12,
   RTAG_BVH = 13,
   RTAG_XRAY = 14,
+  RTAG_HIGHRES_ATEST = 15,
 };
 
 static const char *renderTags[] = {"lowres", "highres", "distortion", "transmittance", "thermal", "water_proj_advanced", "water_proj",
-  "vol_thickness", "vol_depth", "vol_wboit", "fom", "underwater", "volfog_injection", "bvh", "xray"};
+  "vol_thickness", "vol_depth", "vol_wboit", "fom", "underwater", "volfog_injection", "bvh", "xray", "highres_atest"};
+
+enum class StatGroup : uint8_t
+{
+  Unknown = 0,
+  ModFx = 1,
+  Sparks = 2,
+};
 
 enum TransformType
 {
@@ -52,7 +61,24 @@ struct SystemInfo
     float end_distance = 100;
     CubicCurveSampler curve = {};
 
-    void apply(TMatrix &tm, float distance);
+    float calcScale(float distance) const
+    {
+      if (!enabled)
+        return 1.f;
+
+      distance = cvt(distance, begin_distance, end_distance, 0.f, 1.f);
+      return max(curve.sample(distance), 0.f);
+    }
+    void apply(TMatrix &tm, float distance) const
+    {
+      if (!enabled)
+        return;
+
+      float scale = calcScale(distance);
+      tm.col[0] *= scale;
+      tm.col[1] *= scale;
+      tm.col[2] *= scale;
+    }
   } distanceScale;
 
   enum ValueType
@@ -85,6 +111,7 @@ struct SystemInfo
     VAL_LIGHT_COLOR,
     VAL_LIGHT_RADIUS,
     VAL_FAKE_BRIGHTNESS_BACKGROUND_POS,
+    VAL_POS_SPLINE_DATA,
   };
   eastl::vector_map<int, int> valueOffsets;
 };

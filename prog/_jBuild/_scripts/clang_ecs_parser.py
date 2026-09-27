@@ -350,12 +350,6 @@ def dump_obj(obj, level=0):
             dump_obj(value, level + 2)
 
 
-def get_diag_info(diag):
-    return {'severity': diag.severity,
-            'location': diag.location,
-            'spelling': diag.spelling}
-
-
 def parse_ecs_functions(input_filename, search_filename, clang_args, should_parse_name, skipFunctionBodies, compiler_errors, all_gets):
     from clang.cindex import Index
     if os.environ.get('CLANG_LIBRARY_PATH', None):
@@ -380,7 +374,10 @@ def parse_ecs_functions(input_filename, search_filename, clang_args, should_pars
             libclang = 'libclang.%s' % soext
             libclangpath = os.path.join(libDir, libclang)
         if not os.path.isfile(libclangpath):
-            libclangpath = subprocess.check_output('clang --print-file-name %s' % libclang, shell=True)[:-1] # :-1 to cut trailing \n
+            for libclangname in ('libclang.%s.%s.1' % (soext, clangmajver), 'libclang.%s.%s' % (soext, clangmajver), libclang):
+                libclangpath = subprocess.check_output('clang --print-file-name %s' % libclangname , shell=True)[:-1] # :-1 to cut trailing \n
+                if libclangpath != libclangname:
+                    break
         clang.cindex.conf.set_library_file(libclangpath)
         clang_args += ["-resource-dir", resDir]
 
@@ -409,7 +406,11 @@ def parse_ecs_functions(input_filename, search_filename, clang_args, should_pars
         return []
     for diag in tu.diagnostics:
         if (diag.severity >= clang.cindex.Diagnostic.Error):
-            compiler_errors = compiler_errors + [{'severity': diag.severity, 'location': diag.location, 'spelling': diag.spelling}]
+            # stringify location: SourceLocation must not outlive the translation unit
+            compiler_errors.append({'severity': diag.severity, 'category': diag.category_name,
+                                    'file': str(diag.location.file) if diag.location.file else '',
+                                    'line': diag.location.line, 'column': diag.location.column,
+                                    'spelling': diag.spelling})
         if (diag.severity >= clang.cindex.Diagnostic.Fatal):
             print("Fatal error: can't parse file <{file}>".format(file=input_filename))
             print(diag.location)

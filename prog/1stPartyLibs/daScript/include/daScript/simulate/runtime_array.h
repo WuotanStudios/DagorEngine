@@ -1,5 +1,6 @@
 #pragma once
 
+#include "daScript/simulate/runtime_iterator.h"
 #include "daScript/simulate/simulate.h"
 #include "daScript/misc/arraytype.h"
 
@@ -7,30 +8,87 @@
 
 namespace das
 {
-    // AT (INDEX)
-    struct SimNode_ArrayAt : SimNode {
+    // AT (INDEX) - CHECKED bounds-checks; unchecked variant skips the check (index proven in range)
+    template <bool CHECKED>
+    struct SimNode_ArrayAtT : SimNode {
         DAS_PTR_NODE;
+        SimNode_ArrayAtT ( const LineInfo & at, SimNode * ll, SimNode * rr, uint32_t sz, uint32_t o)
+            : SimNode(at), l(ll), r(rr), stride(sz), offset(o) {}
+        __forceinline char * compute ( Context & context ) {
+            DAS_PROFILE_NODE
+            Array * pA = (Array *) l->evalPtr(context);
+            int32_t idx = r->evalInt(context);
+            if constexpr ( CHECKED )
+                if ( idx<0 || uint64_t(idx) >= pA->size ) context.throw_error_at(debugInfo,"array index out of range, %d of %llu", idx, (unsigned long long)pA->size);
+            return pA->data + uint64_t(idx)*uint64_t(stride) + offset;
+        }
+        SimNode * l, * r;
+        uint32_t stride, offset;
+    };
+
+    struct SimNode_ArrayAt : SimNode_ArrayAtT<true> {
         SimNode_ArrayAt ( const LineInfo & at, SimNode * ll, SimNode * rr, uint32_t sz, uint32_t o)
+            : SimNode_ArrayAtT<true>(at,ll,rr,sz,o) {}
+        virtual SimNode * visit ( SimVisitor & vis ) override;
+    };
+
+    template <typename TT, bool CHECKED>
+    struct SimNode_ArrayAtR2VT : SimNode_ArrayAtT<CHECKED> {
+        SimNode_ArrayAtR2VT ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t strd, uint32_t o )
+            : SimNode_ArrayAtT<CHECKED>(at,rv,idx,strd,o) {}
+        SimNode * visit ( SimVisitor & vis ) override {
+            V_BEGIN();
+            if constexpr ( CHECKED ) { V_OP_TT(ArrayAtR2V); } else { V_OP_TT(ArrayAtR2VU); }
+            V_SUB_THIS(l);
+            V_SUB_THIS(r);
+            V_ARG_THIS(stride);
+            V_ARG_THIS(offset);
+            V_END();
+        }
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+            DAS_PROFILE_NODE
+            TT * pR = (TT *) this->compute(context);
+            return cast<TT>::from(*pR);
+        }
+#define EVAL_NODE(TYPE,CTYPE)                                       \
+        virtual CTYPE eval##TYPE ( Context & context ) override {   \
+            DAS_PROFILE_NODE \
+            return *(CTYPE *)this->compute(context);                \
+        }
+        DAS_EVAL_NODE
+#undef EVAL_NODE
+    };
+
+    template <typename TT>
+    struct SimNode_ArrayAtR2V : SimNode_ArrayAtR2VT<TT,true> {
+        SimNode_ArrayAtR2V ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t strd, uint32_t o )
+            : SimNode_ArrayAtR2VT<TT,true>(at,rv,idx,strd,o) {}
+    };
+
+    // AT (INDEX) - int64 index
+    struct SimNode_ArrayAt_I64 : SimNode {
+        DAS_PTR_NODE;
+        SimNode_ArrayAt_I64 ( const LineInfo & at, SimNode * ll, SimNode * rr, uint32_t sz, uint32_t o)
             : SimNode(at), l(ll), r(rr), stride(sz), offset(o) {}
         virtual SimNode * visit ( SimVisitor & vis ) override;
         __forceinline char * compute ( Context & context ) {
             DAS_PROFILE_NODE
             Array * pA = (Array *) l->evalPtr(context);
-            auto idx = uint32_t(r->evalInt(context));
-            if ( idx >= pA->size ) context.throw_error_at(debugInfo,"array index out of range, %u of %u", idx, pA->size);
-            return pA->data + idx*stride + offset;
+            int64_t idx = r->evalInt64(context);
+            if ( idx<0 || uint64_t(idx) >= pA->size ) context.throw_error_at(debugInfo,"array index out of range, %lld of %llu", (long long)idx, (unsigned long long)pA->size);
+            return pA->data + uint64_t(idx)*uint64_t(stride) + offset;
         }
         SimNode * l, * r;
         uint32_t stride, offset;
     };
 
     template <typename TT>
-    struct SimNode_ArrayAtR2V : SimNode_ArrayAt {
-        SimNode_ArrayAtR2V ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t strd, uint32_t o )
-            : SimNode_ArrayAt(at,rv,idx,strd,o) {}
+    struct SimNode_ArrayAtR2V_I64 : SimNode_ArrayAt_I64 {
+        SimNode_ArrayAtR2V_I64 ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t strd, uint32_t o )
+            : SimNode_ArrayAt_I64(at,rv,idx,strd,o) {}
         SimNode * visit ( SimVisitor & vis ) override {
             V_BEGIN();
-            V_OP_TT(ArrayAtR2V);
+            V_OP_TT(ArrayAtR2V_I64);
             V_SUB(l);
             V_SUB(r);
             V_ARG(stride);
@@ -51,6 +109,63 @@ namespace das
 #undef EVAL_NODE
     };
 
+    // AT (INDEX) - uint64 index
+    struct SimNode_ArrayAt_U64 : SimNode {
+        DAS_PTR_NODE;
+        SimNode_ArrayAt_U64 ( const LineInfo & at, SimNode * ll, SimNode * rr, uint32_t sz, uint32_t o)
+            : SimNode(at), l(ll), r(rr), stride(sz), offset(o) {}
+        virtual SimNode * visit ( SimVisitor & vis ) override;
+        __forceinline char * compute ( Context & context ) {
+            DAS_PROFILE_NODE
+            Array * pA = (Array *) l->evalPtr(context);
+            uint64_t idx = r->evalUInt64(context);
+            if ( idx >= pA->size ) context.throw_error_at(debugInfo,"array index out of range, %llu of %llu", (unsigned long long)idx, (unsigned long long)pA->size);
+            return pA->data + idx*uint64_t(stride) + offset;
+        }
+        SimNode * l, * r;
+        uint32_t stride, offset;
+    };
+
+    template <typename TT>
+    struct SimNode_ArrayAtR2V_U64 : SimNode_ArrayAt_U64 {
+        SimNode_ArrayAtR2V_U64 ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t strd, uint32_t o )
+            : SimNode_ArrayAt_U64(at,rv,idx,strd,o) {}
+        SimNode * visit ( SimVisitor & vis ) override {
+            V_BEGIN();
+            V_OP_TT(ArrayAtR2V_U64);
+            V_SUB(l);
+            V_SUB(r);
+            V_ARG(stride);
+            V_ARG(offset);
+            V_END();
+        }
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+            DAS_PROFILE_NODE
+            TT * pR = (TT *) compute(context);
+            return cast<TT>::from(*pR);
+        }
+#define EVAL_NODE(TYPE,CTYPE)                                       \
+        virtual CTYPE eval##TYPE ( Context & context ) override {   \
+            DAS_PROFILE_NODE \
+            return *(CTYPE *)compute(context);                      \
+        }
+        DAS_EVAL_NODE
+#undef EVAL_NODE
+    };
+
+    // AT (INDEX) - unchecked, no bounds check (index proven in range)
+    struct SimNode_ArrayAtU : SimNode_ArrayAtT<false> {
+        SimNode_ArrayAtU ( const LineInfo & at, SimNode * ll, SimNode * rr, uint32_t sz, uint32_t o)
+            : SimNode_ArrayAtT<false>(at,ll,rr,sz,o) {}
+        virtual SimNode * visit ( SimVisitor & vis ) override;
+    };
+
+    template <typename TT>
+    struct SimNode_ArrayAtR2VU : SimNode_ArrayAtR2VT<TT,false> {
+        SimNode_ArrayAtR2VU ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t strd, uint32_t o )
+            : SimNode_ArrayAtR2VT<TT,false>(at,rv,idx,strd,o) {}
+    };
+
     // AT (INDEX)
     struct SimNode_SafeArrayAt : SimNode_ArrayAt {
         DAS_PTR_NODE;
@@ -61,9 +176,41 @@ namespace das
             DAS_PROFILE_NODE
             Array * pA = (Array *) l->evalPtr(context);
             if ( !pA ) return nullptr;
-            auto idx = uint32_t(r->evalInt(context));
+            int32_t idx = r->evalInt(context);
+            if (idx<0 || uint64_t(idx) >= pA->size) return nullptr;
+            return pA->data + uint64_t(idx)*uint64_t(stride) + offset;
+        }
+    };
+
+    // SAFE AT (INDEX) - int64 index
+    struct SimNode_SafeArrayAt_I64 : SimNode_ArrayAt_I64 {
+        DAS_PTR_NODE;
+        SimNode_SafeArrayAt_I64 ( const LineInfo & at, SimNode * ll, SimNode * rr, uint32_t sz, uint32_t o)
+            : SimNode_ArrayAt_I64(at,ll,rr,sz,o) {}
+        virtual SimNode * visit ( SimVisitor & vis ) override;
+        __forceinline char * compute ( Context & context ) {
+            DAS_PROFILE_NODE
+            Array * pA = (Array *) l->evalPtr(context);
+            if ( !pA ) return nullptr;
+            int64_t idx = r->evalInt64(context);
+            if (idx<0 || uint64_t(idx) >= pA->size) return nullptr;
+            return pA->data + uint64_t(idx)*uint64_t(stride) + offset;
+        }
+    };
+
+    // SAFE AT (INDEX) - uint64 index
+    struct SimNode_SafeArrayAt_U64 : SimNode_ArrayAt_U64 {
+        DAS_PTR_NODE;
+        SimNode_SafeArrayAt_U64 ( const LineInfo & at, SimNode * ll, SimNode * rr, uint32_t sz, uint32_t o)
+            : SimNode_ArrayAt_U64(at,ll,rr,sz,o) {}
+        virtual SimNode * visit ( SimVisitor & vis ) override;
+        __forceinline char * compute ( Context & context ) {
+            DAS_PROFILE_NODE
+            Array * pA = (Array *) l->evalPtr(context);
+            if ( !pA ) return nullptr;
+            uint64_t idx = r->evalUInt64(context);
             if (idx >= pA->size) return nullptr;
-            return pA->data + idx*stride + offset;
+            return pA->data + idx*uint64_t(stride) + offset;
         }
     };
 
@@ -88,23 +235,23 @@ namespace das
     };
 
     struct FixedArrayIterator : Iterator {
-        FixedArrayIterator ( char * d, uint32_t sz, uint32_t st, LineInfo * at ) : Iterator(at), data(d), size(sz), stride(st) {}
+        FixedArrayIterator ( char * d, uint64_t sz, uint32_t st, LineInfo * at ) : Iterator(at), data(d), size(sz), stride(st) {}
         virtual bool first ( Context & context, char * value ) override;
         virtual bool next  ( Context & context, char * value ) override;
         virtual void close ( Context & context, char * value ) override;
         char *      data;
-        uint32_t    size;
+        uint64_t    size;            // widened from uint32_t for fixed-array iteration over >INT_MAX elements (decs Archetype with int64 size)
         uint32_t    stride;
         char *      fixed_array_end = nullptr;
     };
 
     struct SimNode_FixedArrayIterator : SimNode {
-        SimNode_FixedArrayIterator ( const LineInfo & at, SimNode * s, uint32_t sz, uint32_t st )
+        SimNode_FixedArrayIterator ( const LineInfo & at, SimNode * s, uint64_t sz, uint32_t st )
             : SimNode(at), source(s), size(sz), stride(st) { }
         virtual SimNode * visit ( SimVisitor & vis ) override;
         DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override;
         SimNode *   source;
-        uint32_t    size;
+        uint64_t    size;            // widened with FixedArrayIterator
         uint32_t    stride;
     };
 
@@ -136,29 +283,47 @@ namespace das
                 ph[t]  = pha[t]->data;
             }
             char ** __restrict pi[totalCount];
-            int szz = INT_MAX;
+            uint64_t szz = ~uint64_t(0);
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + stackTop[t]);
-                szz = das::min(szz, int(pha[t]->size));
+                szz = das::min(szz, pha[t]->size);
             }
-            SimNode ** __restrict tail = list + total;
-            for (int i = 0; i!=szz; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = list + total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += strides[t];
+                    }
+                    SimNode ** __restrict body = list;
+                loopbegin:;
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
                 }
-                SimNode ** __restrict body = list;
-            loopbegin:;
-                for (; body!=tail; ++body) {
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            } else {
+                SimNode ** __restrict tail = list + total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += strides[t];
+                    }
+                    SimNode ** __restrict body = list;
+                loopbegin_fin:;
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
             for ( int t=0; t!=totalCount; ++t ) {
                 array_unlock(context, *pha[t], &this->debugInfo);
             }
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -173,9 +338,8 @@ namespace das
             V_FINAL();
             V_END();
         }
-        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+        DAS_EVAL_ABI virtual vec4f eval ( Context & ) override {
             DAS_PROFILE_NODE
-            evalFinal(context);
             return v_zero();
         }
     };
@@ -194,22 +358,38 @@ namespace das
             array_lock(context, *pha, &this->debugInfo);
             ph = pha->data;
             char ** __restrict pi;
-            int szz = int(pha->size);
+            uint64_t szz = pha->size;
             pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode ** __restrict tail = list + total;
-            for (int i = 0; i!=szz; ++i) {
-                *pi = ph;
-                ph += stride;
-                SimNode ** __restrict body = list;
-            loopbegin:;
-                for (; body!=tail; ++body) {
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = list + total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin:;
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
+                }
+            } else {
+                SimNode ** __restrict tail = list + total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin_fin:;
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            evalFinal(context);
             array_unlock(context, *pha, &this->debugInfo);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
@@ -232,22 +412,34 @@ namespace das
                 ph[t]  = pha[t]->data;
             }
             char ** __restrict pi[totalCount];
-            int szz = INT_MAX;
+            uint64_t szz = ~uint64_t(0);
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + stackTop[t]);
-                szz = das::min(szz, int(pha[t]->size));
+                szz = das::min(szz, pha[t]->size);
             }
-            SimNode * __restrict body = list[0];
-            for (int i = 0; i!=szz && !context.stopFlags; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += strides[t];
+                    }
+                    body->eval(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
                 }
-                body->eval(context);
-                DAS_PROCESS_LOOP1_FLAGS(continue);
+            } else {
+                SimNode * __restrict body = list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += strides[t];
+                    }
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            evalFinal(context);
             for ( int t=0; t!=totalCount; ++t ) {
                 array_unlock(context, *pha[t], &this->debugInfo);
             }
@@ -265,9 +457,8 @@ namespace das
             V_FINAL();
             V_END();
         }
-        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+        DAS_EVAL_ABI virtual vec4f eval ( Context & ) override {
             DAS_PROFILE_NODE
-            evalFinal(context);
             return v_zero();
         }
     };
@@ -286,18 +477,28 @@ namespace das
             array_lock(context, *pha, &this->debugInfo);
             ph = pha->data;
             char ** __restrict pi;
-            int szz = int(pha->size);
+            uint64_t szz = pha->size;
             pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode * __restrict body = list[0];
-            for (int i = 0; i!=szz && !context.stopFlags; ++i) {
-                *pi = ph;
-                ph += stride;
-                body->eval(context);
-                DAS_PROCESS_LOOP1_FLAGS(continue);
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    body->eval(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
+            } else {
+                SimNode * __restrict body = list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            evalFinal(context);
             array_unlock(context, *pha, &this->debugInfo);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
@@ -323,30 +524,49 @@ namespace das
                 ph[t]  = pha[t]->data;
             }
             char ** __restrict pi[totalCount];
-            int szz = INT_MAX;
+            uint64_t szz = ~uint64_t(0);
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + this->stackTop[t]);
-                szz = das::min(szz, int(pha[t]->size));
+                szz = das::min(szz, pha[t]->size);
             }
-            SimNode ** __restrict tail = this->list + this->total;
-            for (int i = 0; i!=szz; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += this->strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = this->list + this->total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode ** __restrict body = this->list;
+                loopbegin:;
+                    DAS_KEEPALIVE_LOOP(&context);
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
                 }
-                SimNode ** __restrict body = this->list;
-            loopbegin:;
-                DAS_KEEPALIVE_LOOP(&context);
-                for (; body!=tail; ++body) {
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            } else {
+                SimNode ** __restrict tail = this->list + this->total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode ** __restrict body = this->list;
+                loopbegin_fin:;
+                    DAS_KEEPALIVE_LOOP(&context);
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
             for ( int t=0; t!=totalCount; ++t ) {
                 array_unlock(context, *pha[t], &this->debugInfo);
             }
-            this->evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -368,23 +588,40 @@ namespace das
             array_lock(context, *pha, &this->debugInfo);
             ph = pha->data;
             char ** __restrict pi;
-            int szz = int(pha->size);
+            uint64_t szz = pha->size;
             pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode ** __restrict tail = list + total;
-            for (int i = 0; i!=szz; ++i) {
-                *pi = ph;
-                ph += stride;
-                SimNode ** __restrict body = list;
-            loopbegin:;
-                DAS_KEEPALIVE_LOOP(&context);
-                for (; body!=tail; ++body) {
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = list + total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin:;
+                    DAS_KEEPALIVE_LOOP(&context);
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
+                }
+            } else {
+                SimNode ** __restrict tail = list + total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin_fin:;
+                    DAS_KEEPALIVE_LOOP(&context);
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            evalFinal(context);
             array_unlock(context, *pha, &this->debugInfo);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
@@ -404,22 +641,34 @@ namespace das
                 ph[t]  = pha[t]->data;
             }
             char ** __restrict pi[totalCount];
-            int szz = INT_MAX;
+            uint64_t szz = ~uint64_t(0);
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + this->stackTop[t]);
-                szz = das::min(szz, int(pha[t]->size));
+                szz = das::min(szz, pha[t]->size);
             }
-            SimNode * __restrict body = this->list[0];
-            for (int i = 0; i!=szz && !context.stopFlags; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += this->strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = this->list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    body->eval(context);
+                    DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
                 }
-                body->eval(context);
-                DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+            } else {
+                SimNode * __restrict body = this->list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            this->evalFinal(context);
             for ( int t=0; t!=totalCount; ++t ) {
                 array_unlock(context, *pha[t], &this->debugInfo);
             }
@@ -444,18 +693,28 @@ namespace das
             array_lock(context, *pha, &this->debugInfo);
             ph = pha->data;
             char ** __restrict pi;
-            int szz = int(pha->size);
+            uint64_t szz = pha->size;
             pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode * __restrict body = list[0];
-            for (int i = 0; i!=szz && !context.stopFlags; ++i) {
-                *pi = ph;
-                ph += stride;
-                body->eval(context);
-                DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    body->eval(context);
+                    DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+                }
+            } else {
+                SimNode * __restrict body = list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            evalFinal(context);
             array_unlock(context, *pha, &this->debugInfo);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
@@ -483,30 +742,49 @@ namespace das
                 ph[t]  = pha[t]->data;
             }
             char ** __restrict pi[totalCount];
-            int szz = INT_MAX;
+            uint64_t szz = ~uint64_t(0);
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + this->stackTop[t]);
-                szz = das::min(szz, int(pha[t]->size));
+                szz = das::min(szz, pha[t]->size);
             }
-            SimNode ** __restrict tail = this->list + this->total;
-            for (int i = 0; i!=szz; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += this->strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = this->list + this->total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode ** __restrict body = this->list;
+                loopbegin:;
+                    for (; body!=tail; ++body) {
+                        DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
                 }
-                SimNode ** __restrict body = this->list;
-            loopbegin:;
-                for (; body!=tail; ++body) {
-                    DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            } else {
+                SimNode ** __restrict tail = this->list + this->total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode ** __restrict body = this->list;
+                loopbegin_fin:;
+                    for (; body!=tail; ++body) {
+                        DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
             for ( int t=0; t!=totalCount; ++t ) {
                 array_unlock(context, *pha[t], &this->debugInfo);
             }
-            this->evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -528,23 +806,40 @@ namespace das
             array_lock(context, *pha, &this->debugInfo);
             ph = pha->data;
             char ** __restrict pi;
-            int szz = int(pha->size);
+            uint64_t szz = pha->size;
             pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode ** __restrict tail = list + total;
-            for (int i = 0; i!=szz; ++i) {
-                *pi = ph;
-                ph += stride;
-                SimNode ** __restrict body = list;
-            loopbegin:;
-                for (; body!=tail; ++body) {
-                    DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = list + total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin:;
+                    for (; body!=tail; ++body) {
+                        DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
+                }
+            } else {
+                SimNode ** __restrict tail = list + total;
+                for (uint64_t i = 0; i!=szz; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin_fin:;
+                    for (; body!=tail; ++body) {
+                        DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            evalFinal(context);
             array_unlock(context, *pha, &this->debugInfo);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
@@ -564,23 +859,36 @@ namespace das
                 ph[t]  = pha[t]->data;
             }
             char ** __restrict pi[totalCount];
-            int szz = INT_MAX;
+            uint64_t szz = ~uint64_t(0);
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + this->stackTop[t]);
-                szz = das::min(szz, int(pha[t]->size));
+                szz = das::min(szz, pha[t]->size);
             }
-            SimNode * __restrict body = this->list[0];
-            for (int i = 0; i!=szz && !context.stopFlags; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += this->strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = this->list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    DAS_SINGLE_STEP(context,body->debugInfo,true);
+                    body->eval(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
                 }
-                DAS_SINGLE_STEP(context,body->debugInfo,true);
-                body->eval(context);
-                DAS_PROCESS_LOOP1_FLAGS(continue);
+            } else {
+                SimNode * __restrict body = this->list[0];
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    DAS_SINGLE_STEP(context,body->debugInfo,true);
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            this->evalFinal(context);
             for ( int t=0; t!=totalCount; ++t ) {
                 array_unlock(context, *pha[t], &this->debugInfo);
             }
@@ -605,19 +913,30 @@ namespace das
             array_lock(context, *pha, &this->debugInfo);
             ph = pha->data;
             char ** __restrict pi;
-            int szz = int(pha->size);
+            uint64_t szz = pha->size;
             pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            for (int i = 0; i!=szz && !context.stopFlags; ++i) {
-                *pi = ph;
-                ph += stride;
-                SimNode * body = list[0];    // note: instruments
-                DAS_SINGLE_STEP(context,body->debugInfo,true);
-                body->eval(context);
-                DAS_PROCESS_LOOP1_FLAGS(continue);
+            if ( this->totalFinal == 0 ) {
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode * body = list[0];    // note: instruments
+                    DAS_SINGLE_STEP(context,body->debugInfo,true);
+                    body->eval(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
+            } else {
+                for (uint64_t i = 0; i!=szz && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode * body = list[0];    // note: instruments
+                    DAS_SINGLE_STEP(context,body->debugInfo,true);
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            evalFinal(context);
             array_unlock(context, *pha, &this->debugInfo);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
@@ -647,21 +966,39 @@ namespace das
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + stackTop[t]);
             }
-            SimNode ** __restrict tail = list + total;
-            for (uint32_t i=0, is=size; i!=is; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = list + total;
+                for (uint32_t i=0, is=size; i!=is; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += strides[t];
+                    }
+                    SimNode ** __restrict body = list;
+                loopbegin:;
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
                 }
-                SimNode ** __restrict body = list;
-            loopbegin:;
-                for (; body!=tail; ++body) {
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            } else {
+                SimNode ** __restrict tail = list + total;
+                for (uint32_t i=0, is=size; i!=is; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += strides[t];
+                    }
+                    SimNode ** __restrict body = list;
+                loopbegin_fin:;
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -676,9 +1013,8 @@ namespace das
             V_FINAL();
             V_END();
         }
-        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+        DAS_EVAL_ABI virtual vec4f eval ( Context & ) override {
             DAS_PROFILE_NODE
-            evalFinal(context);
             return v_zero();
         }
     };
@@ -694,19 +1030,35 @@ namespace das
             char * __restrict ph = cast<char *>::to(sources[0]->eval(context));
             char ** __restrict pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode ** __restrict tail = list + total;
-            for (uint32_t i=0, is=size; i!=is; ++i) {
-                *pi = ph;
-                ph += stride;
-                SimNode ** __restrict body = list;
-            loopbegin:;
-                for (; body!=tail; ++body) {
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = list + total;
+                for (uint32_t i=0, is=size; i!=is; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin:;
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
+                }
+            } else {
+                SimNode ** __restrict tail = list + total;
+                for (uint32_t i=0, is=size; i!=is; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin_fin:;
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -729,17 +1081,29 @@ namespace das
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + stackTop[t]);
             }
-            SimNode * __restrict body = list[0];
-            for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = list[0];
+                for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += strides[t];
+                    }
+                    body->eval(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
                 }
-                body->eval(context);
-                DAS_PROCESS_LOOP1_FLAGS(continue);
+            } else {
+                SimNode * __restrict body = list[0];
+                for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += strides[t];
+                    }
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -754,9 +1118,8 @@ namespace das
             V_FINAL();
             V_END();
         }
-        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+        DAS_EVAL_ABI virtual vec4f eval ( Context & ) override {
             DAS_PROFILE_NODE
-            evalFinal(context);
             return v_zero();
         }
     };
@@ -772,15 +1135,25 @@ namespace das
             char * __restrict ph = cast<char *>::to(sources[0]->eval(context));
             char ** __restrict pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode * __restrict body = list[0];
-            for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
-                *pi = ph;
-                ph += stride;
-                body->eval(context);
-                DAS_PROCESS_LOOP1_FLAGS(continue);
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = list[0];
+                for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    body->eval(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
+            } else {
+                SimNode * __restrict body = list[0];
+                for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -806,22 +1179,41 @@ namespace das
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + this->stackTop[t]);
             }
-            SimNode ** __restrict tail = this->list + this->total;
-            for (uint32_t i=0, is=this->size; i!=is; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += this->strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = this->list + this->total;
+                for (uint32_t i=0, is=this->size; i!=is; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode ** __restrict body = this->list;
+                loopbegin:;
+                    DAS_KEEPALIVE_LOOP(&context);
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
                 }
-                SimNode ** __restrict body = this->list;
-            loopbegin:;
-                DAS_KEEPALIVE_LOOP(&context);
-                for (; body!=tail; ++body) {
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            } else {
+                SimNode ** __restrict tail = this->list + this->total;
+                for (uint32_t i=0, is=this->size; i!=is; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode ** __restrict body = this->list;
+                loopbegin_fin:;
+                    DAS_KEEPALIVE_LOOP(&context);
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            this->evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -840,20 +1232,37 @@ namespace das
             char * __restrict ph = cast<char *>::to(sources[0]->eval(context));
             char ** __restrict pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode ** __restrict tail = list + total;
-            for (uint32_t i=0, is=size; i!=is; ++i) {
-                *pi = ph;
-                ph += stride;
-                SimNode ** __restrict body = list;
-            loopbegin:;
-                DAS_KEEPALIVE_LOOP(&context);
-                for (; body!=tail; ++body) {
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = list + total;
+                for (uint32_t i=0, is=size; i!=is; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin:;
+                    DAS_KEEPALIVE_LOOP(&context);
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
+                }
+            } else {
+                SimNode ** __restrict tail = list + total;
+                for (uint32_t i=0, is=size; i!=is; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin_fin:;
+                    DAS_KEEPALIVE_LOOP(&context);
+                    for (; body!=tail; ++body) {
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -876,17 +1285,29 @@ namespace das
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + this->stackTop[t]);
             }
-            SimNode * __restrict body = this->list[0];
-            for (uint32_t i=0, is=this->size; i!=is && !context.stopFlags; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += this->strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = this->list[0];
+                for (uint32_t i=0, is=this->size; i!=is && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    body->eval(context);
+                    DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
                 }
-                body->eval(context);
-                DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+            } else {
+                SimNode * __restrict body = this->list[0];
+                for (uint32_t i=0, is=this->size; i!=is && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            this->evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -905,15 +1326,25 @@ namespace das
             char * __restrict ph = cast<char *>::to(sources[0]->eval(context));
             char ** __restrict pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode * __restrict body = list[0];
-            for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
-                *pi = ph;
-                ph += stride;
-                body->eval(context);
-                DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+            if ( this->totalFinal == 0 ) {
+                SimNode * __restrict body = list[0];
+                for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    body->eval(context);
+                    DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+                }
+            } else {
+                SimNode * __restrict body = list[0];
+                for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_KEEPALIVE_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -942,22 +1373,41 @@ namespace das
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + this->stackTop[t]);
             }
-            SimNode ** __restrict tail = this->list + this->total;
-            for (uint32_t i=0, is=this->size; i!=is; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += this->strides[t];
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = this->list + this->total;
+                for (uint32_t i=0, is=this->size; i!=is; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode ** __restrict body = this->list;
+                loopbegin:;
+                    for (; body!=tail; ++body) {
+                        DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
                 }
-                SimNode ** __restrict body = this->list;
-            loopbegin:;
-                for (; body!=tail; ++body) {
-                    DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            } else {
+                SimNode ** __restrict tail = this->list + this->total;
+                for (uint32_t i=0, is=this->size; i!=is; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode ** __restrict body = this->list;
+                loopbegin_fin:;
+                    for (; body!=tail; ++body) {
+                        DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            this->evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -976,20 +1426,37 @@ namespace das
             char * __restrict ph = cast<char *>::to(sources[0]->eval(context));
             char ** __restrict pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            SimNode ** __restrict tail = list + total;
-            for (uint32_t i=0, is=size; i!=is; ++i) {
-                *pi = ph;
-                ph += stride;
-                SimNode ** __restrict body = list;
-            loopbegin:;
-                for (; body!=tail; ++body) {
-                    DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
-                    (*body)->eval(context);
-                    DAS_PROCESS_LOOP_FLAGS(break);
+            if ( this->totalFinal == 0 ) {
+                SimNode ** __restrict tail = list + total;
+                for (uint32_t i=0, is=size; i!=is; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin:;
+                    for (; body!=tail; ++body) {
+                        DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS(break);
+                    }
+                }
+            } else {
+                SimNode ** __restrict tail = list + total;
+                for (uint32_t i=0, is=size; i!=is; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode ** __restrict body = list;
+                loopbegin_fin:;
+                    for (; body!=tail; ++body) {
+                        DAS_SINGLE_STEP(context,(*body)->debugInfo,true);
+                        (*body)->eval(context);
+                        DAS_PROCESS_LOOP_FLAGS_LABELED(loopbegin_fin,loopend_fin,break);
+                    }
+                loopend_fin:;
+                    this->evalFinal(context);
+                    if ( context.stopFlags & (EvalFlags::stopForBreak | EvalFlags::stopForReturn) ) goto loopend;
                 }
             }
         loopend:;
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -1009,18 +1476,31 @@ namespace das
             for ( int t=0; t!=totalCount; ++t ) {
                 pi[t] = (char **)(context.stack.sp() + this->stackTop[t]);
             }
-            for (uint32_t i=0, is=this->size; i!=is && !context.stopFlags; ++i) {
-                for (int t = 0; t != totalCount; ++t) {
-                    *pi[t] = ph[t];
-                    ph[t] += this->strides[t];
+            if ( this->totalFinal == 0 ) {
+                for (uint32_t i=0, is=this->size; i!=is && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode * body = this->list[0]; // note: instruments
+                    DAS_SINGLE_STEP(context,body->debugInfo,true);
+                    body->eval(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
                 }
-                SimNode * body = this->list[0]; // note: instruments
-                DAS_SINGLE_STEP(context,body->debugInfo,true);
-                body->eval(context);
-                DAS_PROCESS_LOOP1_FLAGS(continue);
+            } else {
+                for (uint32_t i=0, is=this->size; i!=is && !context.stopFlags; ++i) {
+                    for (int t = 0; t != totalCount; ++t) {
+                        *pi[t] = ph[t];
+                        ph[t] += this->strides[t];
+                    }
+                    SimNode * body = this->list[0]; // note: instruments
+                    DAS_SINGLE_STEP(context,body->debugInfo,true);
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            this->evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }
@@ -1039,16 +1519,27 @@ namespace das
             char * __restrict ph = cast<char *>::to(sources[0]->eval(context));
             char ** __restrict pi = (char **)(context.stack.sp() + stackTop[0]);
             auto stride = strides[0];
-            for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
-                *pi = ph;
-                ph += stride;
-                SimNode * body = list[0];    // note: instruments
-                DAS_SINGLE_STEP(context,body->debugInfo,true);
-                body->eval(context);
-                DAS_PROCESS_LOOP1_FLAGS(continue);
+            if ( this->totalFinal == 0 ) {
+                for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode * body = list[0];    // note: instruments
+                    DAS_SINGLE_STEP(context,body->debugInfo,true);
+                    body->eval(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
+            } else {
+                for (uint32_t i=0, is=size; i!=is && !context.stopFlags; ++i) {
+                    *pi = ph;
+                    ph += stride;
+                    SimNode * body = list[0];    // note: instruments
+                    DAS_SINGLE_STEP(context,body->debugInfo,true);
+                    body->eval(context);
+                    this->evalFinal(context);
+                    DAS_PROCESS_LOOP1_FLAGS(continue);
+                }
             }
         loopend:;
-            evalFinal(context);
             context.stopFlags &= ~EvalFlags::stopForBreak;
             return v_zero();
         }

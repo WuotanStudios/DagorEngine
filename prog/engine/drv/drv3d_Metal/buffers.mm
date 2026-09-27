@@ -7,8 +7,6 @@
 
 #include <osApiWrappers/dag_miscApi.h>
 
-#include "pools.h"
-
 static inline int DivideRoundingUp(int i, int j)
 {
   return (i + (j - 1)) / j;
@@ -52,7 +50,12 @@ namespace drv3d_metal
       g_buffer_memory_used += bufsize;
 
     if (flags & SBCF_ZEROMEM)
-      render.clearBuffer(buf, this);
+    {
+      if (storage & MTLResourceStorageModePrivate)
+        render.clearBuffer(buf, this);
+      else
+        memset(buffer.contents, 0, buffer.length);
+    }
     else
       initialized = true;
 
@@ -67,7 +70,7 @@ namespace drv3d_metal
     {
       texture = nullptr;
     }
-    TEXQL_ON_BUF_ALLOC(this);
+    TEXQL_ON_PERSISTENT_ALLOC(this);
 
     BufferProxyPtr e;
     e.obj = this;
@@ -108,7 +111,7 @@ namespace drv3d_metal
       else
         g_buffer_memory_used -= bufsize;
     }
-    TEXQL_ON_BUF_RELEASE(this);
+    TEXQL_ON_PERSISTENT_RELEASE(this);
 
     g_buffers.lock();
     if (g_buffers.isIndexValid(tid))
@@ -130,14 +133,14 @@ namespace drv3d_metal
       allow_resize_ring_buffer = true;
     }
 
-    bufSize = 0;
     bufFlags = 0;
     structSize = buf_flags & SBCF_MISC_ALLOW_RAW ? 4 : ssize;
 
     locked_offset = -1;
     locked_size = -1;
 
-    bufSize = ((ssize > 0 ? bsize * ssize : bsize) + 3) & ~3;
+    bufSizeUnaligned = ssize > 0 ? bsize * ssize : bsize;
+    bufSize = (bufSizeUnaligned + 3) & ~3;
     bufFlags = buf_flags;
 
     D3D_CONTRACT_ASSERTF(set_tex_format == 0 || ((bufFlags&(SBCF_BIND_VERTEX|SBCF_BIND_INDEX|SBCF_MISC_STRUCTURED|SBCF_MISC_ALLOW_RAW)) == 0),
@@ -149,7 +152,7 @@ namespace drv3d_metal
       MTLPixelFormat metal_format = Texture::format2Metal(tex_format);
 
       alignment = [render.device minimumLinearTextureAlignmentForPixelFormat:metal_format];
-      bufSize = fmax(bufSize, alignment);
+      bufSizeUnaligned = bufSize = fmax(bufSize, alignment);
 
       int widBytes, nBytes;
       Texture::getStride(tex_format, 1, 1, 0, widBytes, nBytes);
@@ -161,13 +164,13 @@ namespace drv3d_metal
         w = 4096;
         h = DivideRoundingUp(bufSize, 4096 * widBytes);
         alignment = w * widBytes;
-        bufSize = h * alignment;
+        bufSizeUnaligned = bufSize = h * alignment;
       }
       else
       {
         if (bufSize % alignment != 0)
         {
-          bufSize = DivideRoundingUp(bufSize, alignment) * alignment;
+          bufSizeUnaligned = bufSize = DivideRoundingUp(bufSize, alignment) * alignment;
         }
 
         alignment = bufSize;
@@ -183,7 +186,6 @@ namespace drv3d_metal
         pTexDesc.usage |= MTLTextureUsageShaderWrite;
     }
 
-    checkLockParams(0, bufSize, VBLOCK_DISCARD, bufFlags);
     isDynamic = bufFlags & SBCF_DYNAMIC;
     fast_discard = bufFlags & SBCF_FRAMEMEM;
 
@@ -261,7 +263,7 @@ namespace drv3d_metal
 
     tex_format = 0;
     structSize = 4;
-    bufSize = buf.length;
+    bufSizeUnaligned = bufSize = buf.length;
     bufFlags = buf_flags;
     use_upload_buffer = true;
     storage = MTLResourceStorageModePrivate;
@@ -284,7 +286,7 @@ namespace drv3d_metal
   {
     D3D_CONTRACT_ASSERT(locked_offset == -1);
     D3D_CONTRACT_ASSERT(locked_size == -1);
-    checkLockParams(ofs_bytes, size_bytes, flags, bufFlags);
+    checkLockParams(ofs_bytes, size_bytes, flags, bufFlags, getName(), bufSize);
     if (!ptr)
     {
       last_locked_submit = render.submits_scheduled;
@@ -311,32 +313,43 @@ namespace drv3d_metal
     if (fast_discard)
     {
       D3D_CONTRACT_ASSERT(offset_bytes == 0);
-#if DAGOR_DBGLEVEL > 0
-      if (render.validate_framemem_bounds)
+      G_ASSERT(!(flags & VBLOCK_READONLY) || (bufFlags & (SBCF_CPU_ACCESS_READ | SBCF_CPU_ACCESS_WRITE)) == (SBCF_CPU_ACCESS_READ | SBCF_CPU_ACCESS_WRITE));
+      if (flags & VBLOCK_READONLY)
       {
-        String name;
-        name.printf(0, "dynamic for %s %llu", getName(), render.frame);
-
-        uint32_t s = bufFlags & SBCF_BIND_CONSTANT ? bufSize : locked_size;
-        dynamic_buffer = [render.device newBufferWithLength : s
-                                                    options : MTLResourceCPUCacheModeWriteCombined | MTLResourceStorageModeShared];
-        dynamic_buffer.label = [NSString stringWithUTF8String : name.c_str()];
-        dynamic_offset = 0;
-        render.queueResourceForDeletion(dynamic_buffer);
+        D3D_CONTRACT_ASSERT(dynamic_buffer);
+        D3D_CONTRACT_ASSERT(dynamic_frame == render.frame);
+        D3D_CONTRACT_ASSERT(dynamic_size >= locked_size);
       }
       else
+      {
+#if DAGOR_DBGLEVEL > 0
+        if (render.validate_framemem_bounds)
+        {
+          String name;
+          name.printf(0, "dynamic for %s %llu", getName(), render.frame);
+
+          uint32_t s = bufFlags & SBCF_BIND_CONSTANT ? bufSize : locked_size;
+          dynamic_buffer = [render.device newBufferWithLength : s
+                                                      options : MTLResourceCPUCacheModeWriteCombined | MTLResourceStorageModeShared];
+          dynamic_buffer.label = [NSString stringWithUTF8String : name.c_str()];
+          dynamic_offset = 0;
+          render.queueResourceForDeletion(dynamic_buffer);
+        }
+        else
 #endif
-        dynamic_buffer = render.AllocateDynamicBuffer(locked_size, dynamic_offset, bufSize);
+          dynamic_buffer = render.AllocateDynamicBuffer(locked_size, dynamic_offset, bufSize);
+
+        dynamic_frame = render.frame;
+        dynamic_size = locked_size;
+
+        if (render.isRenderAcquiredInThisThread())
+          render.markBufferDirty(this);
+
+        cur_render_buffer = cur_buffer;
+      }
       G_ASSERT(dynamic_buffer);
-      dynamic_frame = render.frame;
 
-      if (render.acquire_depth.load())
-        render.markBufferDirty(this);
-
-      cur_render_buffer = cur_buffer;
-
-      uint8_t *ret = (uint8_t*)dynamic_buffer.contents + dynamic_offset + offset_bytes;
-      return ret;
+      return (uint8_t*)dynamic_buffer.contents + dynamic_offset + offset_bytes;
     }
 
     if (isDynamic)
@@ -366,7 +379,7 @@ namespace drv3d_metal
 
           cur_buffer = buf;
 
-          if (render.acquire_depth.load())
+          if (render.isRenderAcquiredInThisThread())
             render.markBufferDirty(this);
         }
         else if (render.submits_completed < cur_buffer->last_submit)
@@ -379,7 +392,7 @@ namespace drv3d_metal
           render.flush(true);
           render.releaseOwnership();
         }
-        else if (render.acquire_depth.load())
+        else if (render.isRenderAcquiredInThisThread())
           render.markBufferDirty(this);
       }
 
@@ -405,7 +418,24 @@ namespace drv3d_metal
 
     if (use_upload_buffer && !(flags & VBLOCK_READONLY))
     {
-      locked_size = (locked_size + 3) & ~3;
+      // if we're locking the whole buffer, its fine to align up
+      if (offset_bytes == 0 && locked_size == bufSizeUnaligned)
+        locked_size = bufSize;
+      // blit copy in unlock() needs 4 byte aligned offset and size
+      if (DAGOR_UNLIKELY((offset_bytes & 3) != 0))
+      {
+        D3D_CONTRACT_ASSERT_FAIL("unaligned lock offset %u of buffer %s", offset_bytes, getName());
+        locked_offset = -1;
+        locked_size = -1;
+        return nullptr;
+      }
+      if (DAGOR_UNLIKELY((locked_size & 3) != 0))
+      {
+        D3D_CONTRACT_ASSERT_FAIL("unaligned lock size %d of buffer %s", locked_size, getName());
+        locked_offset = -1;
+        locked_size = -1;
+        return nullptr;
+      }
       @autoreleasepool
       {
         String name;
@@ -413,9 +443,6 @@ namespace drv3d_metal
         upload_buffer = render.createBuffer(locked_size, MTLResourceCPUCacheModeWriteCombined | MTLResourceStorageModeShared, name);
         upload_buffer_offset = 0;
       }
-      D3D_CONTRACT_ASSERT((upload_buffer_offset & 3) == 0);
-      D3D_CONTRACT_ASSERT((offset_bytes & 3) == 0);
-      D3D_CONTRACT_ASSERT((locked_size & 3) == 0);
 
       return (void*)((uint8_t*)[upload_buffer contents] + upload_buffer_offset);
     }
@@ -439,9 +466,8 @@ namespace drv3d_metal
     if (use_upload_buffer && upload_buffer)
     {
       D3D_CONTRACT_ASSERT(upload_buffer);
-      D3D_CONTRACT_ASSERT(cur_buffer->initialized);
       D3D_CONTRACT_ASSERT(!fast_discard);
-      render.queueCopyBuffer(this, upload_buffer, upload_buffer_offset, cur_buffer->buffer, locked_offset, locked_size);
+      render.queueCopyBuffer(this, cur_buffer, upload_buffer, upload_buffer_offset, cur_buffer->buffer, locked_offset, locked_size);
       render.queueResourceForDeletion(upload_buffer);
       upload_buffer = nil;
       upload_buffer_offset = 0;
@@ -456,11 +482,13 @@ namespace drv3d_metal
   bool Buffer::updateData(uint32_t ofs_bytes, uint32_t size_bytes, const void *__restrict src, uint32_t lockFlags)
   {
     D3D_CONTRACT_ASSERT_RETURN(size_bytes != 0, false);
+    // reject before updateDataWithLock: it retries forever when lock keeps failing
+    D3D_CONTRACT_ASSERTF_RETURN(!use_upload_buffer || (ofs_bytes & 3) == 0, false,
+        "unaligned update offset %u of buffer %s", ofs_bytes, getName());
+    D3D_CONTRACT_ASSERTF_RETURN(!use_upload_buffer || (size_bytes & 3) == 0, false,
+        "unaligned update size %u of buffer %s", size_bytes, getName());
 
-    uint64_t cur_thread = 0;
-    pthread_threadid_np(NULL, &cur_thread);
-
-    bool from_thread = render.acquire_depth == 0 || cur_thread != render.cur_thread;
+    bool from_thread = !render.isRenderAcquiredInThisThread();
     if ((lockFlags & (VBLOCK_DISCARD | VBLOCK_NOOVERWRITE)) || isDynamic || fast_discard || from_thread)
     {
       // in those cases we need to use locking to keep everything consistent
@@ -470,6 +498,9 @@ namespace drv3d_metal
     D3D_CONTRACT_ASSERT(!fast_discard);
     D3D_CONTRACT_ASSERT(dynamic_offset == 0);
     D3D_CONTRACT_ASSERT(ofs_bytes + size_bytes <= bufSize);
+    // blit copy needs 4 byte aligned offset and size
+    D3D_CONTRACT_ASSERTF_RETURN((ofs_bytes & 3) == 0, false, "unaligned update offset %u of buffer %s", ofs_bytes, getName());
+    D3D_CONTRACT_ASSERTF_RETURN((size_bytes & 3) == 0, false, "unaligned update size %u of buffer %s", size_bytes, getName());
 
     id<MTLBuffer> tempBuffer = nil;
     int tempOffset = 0;
@@ -496,12 +527,18 @@ namespace drv3d_metal
 
   bool Buffer::copyTo(Sbuffer * dest)
   {
+    D3D_CONTRACT_ASSERTF_RETURN(dest->getSize() >= getSize(), false,
+      "Metal: copyTo destination (%u bytes) is smaller than source (%u bytes)", dest->getSize(), getSize());
+    render.acquireOwnership();
     render.copyBuffer(this, 0, dest, 0, 0);
+    render.releaseOwnership();
     return true;
   }
 
   bool Buffer::copyTo(Sbuffer * dest, uint32_t dst_ofs_bytes, uint32_t src_ofs_bytes, uint32_t size_bytes)
   {
+    if (size_bytes == 0)
+      return true;
     render.acquireOwnership();
     render.copyBuffer(this, src_ofs_bytes, dest, dst_ofs_bytes, size_bytes);
     render.releaseOwnership();

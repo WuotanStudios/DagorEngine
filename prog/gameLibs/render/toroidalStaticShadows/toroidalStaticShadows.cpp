@@ -2,6 +2,7 @@
 
 #include <drv/3d/dag_renderTarget.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_lock.h>
 #include <util/dag_stlqsort.h>
@@ -12,7 +13,9 @@
 #include <shaders/dag_shaders.h>
 #include <vecmath/dag_vecMath.h>
 
-ToroidalStaticShadows::~ToroidalStaticShadows() = default;
+static int static_shadows_cascades = -1;
+
+ToroidalStaticShadows::~ToroidalStaticShadows() { ShaderGlobal::set_int(static_shadows_cascades, 0); }
 
 void ToroidalStaticShadows::invalidate(bool force)
 {
@@ -75,8 +78,6 @@ void ToroidalStaticShadows::setMaxHtRange(float max_ht_range)
     c.setMaxHtRange(maxHtRange);
 }
 
-static int static_shadows_cascades = -1;
-
 ToroidalStaticShadows::ToroidalStaticShadows(int tsz, int cnt, float dist, float ht_range, bool is_array)
 {
   isRendered = false;
@@ -99,10 +100,9 @@ ToroidalStaticShadows::ToroidalStaticShadows(int tsz, int cnt, float dist, float
   }
   const uint32_t fmt =
     d3d::get_driver_desc().issues.hasRenderPassClearDataRace ? TEXCF_RTARGET | TEXFMT_DEPTH32_S8 : TEXCF_RTARGET | TEXFMT_DEPTH16;
-  TexPtr tex = is_array ? dag::create_array_tex(texSize, texSize, cnt, fmt, 1, "static_shadow_tex_arr")
-                        : dag::create_tex(nullptr, texSize, texSize, fmt, 1, "static_shadow_tex2d");
-  staticShadowTex = UniqueTexHolder(eastl::move(tex), "static_shadow_tex");
-  restoreShadowSampler();
+  TexPtr tex = is_array ? dag::create_array_tex(texSize, texSize, cnt, fmt, 1, "static_shadow_tex_arr", RESTAG_SHADOW)
+                        : dag::create_tex(nullptr, texSize, texSize, fmt, 1, "static_shadow_tex2d", RESTAG_SHADOW);
+  staticShadowTex = UniqueTexWithShaderVar(eastl::move(tex), "static_shadow_tex");
   clearTexture();
   static_shadows_cascades = get_shader_variable_id("static_shadows_cascades", true);
   // @NOTE: this check is enough as long as we never resize cascades anywhere but here
@@ -114,14 +114,6 @@ ToroidalStaticShadows::ToroidalStaticShadows(int tsz, int cnt, float dist, float
       logerr("static_shadows_cascades was assumed to =%d, but using %d cascades", assumedVal, desiredVal);
   }
   setSunDir(Point3(0, 1, 0), 2, 2); // to force non-zero matrices in cascades
-}
-
-void ToroidalStaticShadows::restoreShadowSampler()
-{
-  d3d::SamplerInfo smpInfo;
-  smpInfo.filter_mode = d3d::FilterMode::Compare;
-  smpInfo.mip_map_mode = d3d::MipMapMode::Point;
-  ShaderGlobal::set_sampler(get_shader_variable_id("static_shadow_tex_samplerstate", true), d3d::request_sampler(smpInfo));
 }
 
 ToroidalStaticShadowCascade::BeforeRenderReturned ToroidalStaticShadows::updateOriginAndRender(const Point3 &origin,
@@ -337,20 +329,19 @@ void ToroidalStaticShadows::clearTexture()
 {
   d3d::GpuAutoLock lock;
   SCOPE_RENDER_TARGET;
-  d3d::set_render_target(nullptr, 0);
   const float shadowClearValue =
     ToroidalStaticShadows::GetShadowClearValue(cascades.empty() ? false : cascades[0].isSunBelowHorizon());
   if (staticShadowTex.getArrayTex())
   {
-    for (int i = 0; i < cascadesCount(); ++i)
+    for (uint32_t i = 0; i < cascadesCount(); ++i)
     {
-      d3d::set_depth(staticShadowTex.getArrayTex(), i, DepthAccess::RW);
+      d3d::set_render_target({staticShadowTex.getArrayTex(), 0, i}, DepthAccess::RW, {});
       d3d::clearview(CLEAR_ZBUFFER | CLEAR_STENCIL, 0, shadowClearValue, 0);
     }
   }
   else
   {
-    d3d::set_depth(staticShadowTex.getTex2D(), DepthAccess::RW);
+    d3d::set_render_target({staticShadowTex.getTex2D(), 0, 0}, DepthAccess::RW, {});
     d3d::clearview(CLEAR_ZBUFFER | CLEAR_STENCIL, 0, shadowClearValue, 0);
   }
   d3d::resource_barrier({staticShadowTex.getBaseTex(), RB_RO_SRV | RB_STAGE_PIXEL | RB_STAGE_COMPUTE, 0, 0});
@@ -403,4 +394,16 @@ void ToroidalStaticShadows::printCascadesStatistics() const
   }
   debug("%s", statMessage.c_str());
 #endif
+}
+
+uint32_t ToroidalStaticShadows::getMinCompletelyValidFramesAcrossAllCascades() const
+{
+  // Rel build has no statistics, so treat it as if all cascades are always valid.
+  // It doesn't matter, because this is dev-only feature.
+  uint32_t minCompletelyValidFrames = static_cast<uint32_t>(INT_MAX);
+#if COLLECT_STATIC_SHADOWS_STATISTICS
+  for (const ToroidalStaticShadowCascade &cascade : cascades)
+    minCompletelyValidFrames = min(minCompletelyValidFrames, cascade.staticShadowsStatistics.completelyValidFramesSinceLastUpdate);
+#endif
+  return minCompletelyValidFrames;
 }

@@ -28,6 +28,14 @@ DAS_BASE_BIND_ENUM(d3d::BorderColor::Color, BorderColor_Color, TransparentBlack,
 DAS_BASE_BIND_ENUM_BOTH(DAS_BIND_ENUM_QUALIFIED_HELPER, d3d::SamplerHandle, SamplerHandle, EnumerationSamplerHandle, // -V1008
   Invalid);
 
+DAS_BIND_ENUM_CAST(DriverBackgroundProcessingMode);
+DAS_BASE_BIND_ENUM(DriverBackgroundProcessingMode, DriverBackgroundProcessingMode, ALLOWED, ALLOW_INTRUSIVE_MEASUREMENTS,
+  DISABLE_BACKGROUND_WORK, DISABLE_PROFILING_BY_SYSTEM, KEEP_CURRENT);
+
+DAS_BIND_ENUM_CAST(DriverMeasurementsAction);
+DAS_BASE_BIND_ENUM(DriverMeasurementsAction, DriverMeasurementsAction, KEEP_ALL, COMMIT_RESULTS, COMMIT_RESULTS_HIGH_PRIORITY,
+  DISCARD_PREVIOUS);
+
 void bind_driver_consts(das::Module &module);
 
 struct ShadersECSAnnotation : das::ManagedStructureAnnotation<ShadersECS, false>
@@ -65,6 +73,16 @@ struct SamplerInfoAnnotation : das::ManagedStructureAnnotation<d3d::SamplerInfo,
     addField<DAS_BIND_MANAGED_FIELD(border_color)>("border_color");
     addField<DAS_BIND_MANAGED_FIELD(anisotropic_max)>("anisotropic_max");
     addField<DAS_BIND_MANAGED_FIELD(mip_map_bias)>("mip_map_bias");
+  }
+};
+
+struct RenderTargetAnnotation : das::ManagedStructureAnnotation<RenderTarget, false>
+{
+  RenderTargetAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("RenderTarget", ml, "RenderTarget")
+  {
+    addField<DAS_BIND_MANAGED_FIELD(tex)>("tex");
+    addField<DAS_BIND_MANAGED_FIELD(mip_level)>("mip_level");
+    addField<DAS_BIND_MANAGED_FIELD(layer)>("layer");
   }
 };
 
@@ -123,20 +141,23 @@ public:
   {
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("DagorTexture3D"));
-    addAnnotation(das::make_smart<TexStreamingContextAnnotation>(lib));
-    addAnnotation(das::make_smart<Driver3dPerspectiveAnnotation>(lib));
-    addAnnotation(das::make_smart<ShadersECSAnnotation>(lib));
-    addAnnotation(das::make_smart<PostFxRendererAnnotation>(lib));
-    addAnnotation(das::make_smart<ComputeShaderAnnotation>(lib));
-    addAnnotation(das::make_smart<OverrideStateAnnotation>(lib));
-    addEnumeration(das::make_smart<EnumerationDepthAccess>());
-    addEnumeration(das::make_smart<EnumerationSamplerHandle>());
-    addEnumeration(das::make_smart<EnumerationMipMapMode>());
-    addEnumeration(das::make_smart<EnumerationFilterMode>());
-    addEnumeration(das::make_smart<EnumerationAddressMode>());
-    addEnumeration(das::make_smart<EnumerationBorderColor_Color>());
-    addAnnotation(das::make_smart<BorderColorAnnotation>(lib));
-    addAnnotation(das::make_smart<SamplerInfoAnnotation>(lib));
+    addAnnotation(new TexStreamingContextAnnotation(lib));
+    addAnnotation(new Driver3dPerspectiveAnnotation(lib));
+    addAnnotation(new ShadersECSAnnotation(lib));
+    addAnnotation(new PostFxRendererAnnotation(lib));
+    addAnnotation(new ComputeShaderAnnotation(lib));
+    addAnnotation(new OverrideStateAnnotation(lib));
+    addEnumeration(new EnumerationDepthAccess());
+    addEnumeration(new EnumerationSamplerHandle());
+    addEnumeration(new EnumerationMipMapMode());
+    addEnumeration(new EnumerationFilterMode());
+    addEnumeration(new EnumerationAddressMode());
+    addEnumeration(new EnumerationBorderColor_Color());
+    addAnnotation(new BorderColorAnnotation(lib));
+    addAnnotation(new SamplerInfoAnnotation(lib));
+    addAnnotation(new RenderTargetAnnotation(lib));
+    addEnumeration(new EnumerationDriverBackgroundProcessingMode());
+    addEnumeration(new EnumerationDriverMeasurementsAction());
 
     das::addUsing<shaders::OverrideState>(*this, lib, "shaders::OverrideState");
 
@@ -161,11 +182,7 @@ public:
     BIND_FUNC_SIGNATURE(d3d::set_depth, "d3d_set_depth", modifyArgumentAndExternal, bool (*)(BaseTexture *, DepthAccess));
     BIND_FUNC_SIGNATURE(d3d::set_depth, "d3d_set_depth", modifyArgumentAndExternal, bool (*)(BaseTexture *, int, DepthAccess));
     BIND_FUNC_SIGNATURE(d3d::set_render_target, "d3d_set_render_target", modifyArgumentAndExternal, bool (*)());
-    BIND_FUNC_SIGNATURE(d3d::set_render_target, "d3d_set_render_target", modifyArgumentAndExternal, bool (*)(BaseTexture *, uint8_t));
-    BIND_FUNC_SIGNATURE(d3d::set_render_target, "d3d_set_render_target", modifyArgumentAndExternal,
-      bool (*)(int, BaseTexture *, uint8_t));
-    BIND_FUNC_SIGNATURE(d3d::set_render_target, "d3d_set_render_target", modifyArgumentAndExternal,
-      bool (*)(int, BaseTexture *, int, uint8_t));
+    BIND_WRAP_FUNC(d3d_set_render_target, "d3d_set_render_target", modifyArgumentAndExternal);
     BIND_FUNC(d3d::set_rwtex, "d3d_set_rwtex", modifyArgumentAndExternal);
     BIND_FUNC(d3d::get_screen_size, "d3d_get_screen_size", modifyArgument);
     BIND_FUNC(d3d::setwire, "d3d_setwire", modifyExternal);
@@ -184,6 +201,7 @@ public:
     BIND_WRAP_FUNC(d3d_resource_barrier_tex, "d3d_resource_barrier", modifyExternal);
     BIND_WRAP_FUNC(d3d_resource_barrier_buf, "d3d_resource_barrier", modifyExternal);
     BIND_WRAP_FUNC(d3d_get_vsync_refresh_rate, "d3d_get_vsync_refresh_rate", accessExternal);
+    BIND_WRAP_FUNC(d3d_driver_background_processing_mode, "d3d_driver_background_processing_mode", modifyExternal);
 
     das::addCtor<PostFxRenderer, const char *>(*this, lib, "PostFxRenderer", "PostFxRenderer");
     CLASS_MEMBER(PostFxRenderer::render, "render", das::SideEffects::modifyExternal)

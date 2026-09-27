@@ -2,6 +2,7 @@
 #pragma once
 
 #include <rendInst/rendInstGen.h>
+#include <rendInst/riexHandle.h>
 #include <rendInst/rotation_palette_consts.hlsli>
 #include <gameMath/objgenPrng.h>
 #include "riGenExtra.h"
@@ -36,11 +37,11 @@ static const uint16_t PALETTE_ID_MASK = (1 << PALETTE_BITS) - 1;
 #if _TARGET_SIMD_SSE
 #define REPLICATE4(X) X, X, X, X
 alignas(16) static const vec4i_const VCI_PALETTE_ID_MASK = {REPLICATE4(PALETTE_ID_MASK)};
-alignas(16) static const vec4i_const VCI_SCALE_MASK = {REPLICATE4(0xFFFF & ~PALETTE_ID_BIT_COUNT)};
+alignas(16) static const vec4i_const VCI_SCALE_MASK = {REPLICATE4(0xFFFF & ~PALETTE_ID_MASK)};
 #undef REPLICATE4
 #elif _TARGET_SIMD_NEON
 alignas(16) static const vec4i_const VCI_PALETTE_ID_MASK = v_splatsi(PALETTE_ID_MASK);
-alignas(16) static const vec4i_const VCI_SCALE_MASK = v_splatsi(0xFFFF & ~PALETTE_ID_BIT_COUNT);
+alignas(16) static const vec4i_const VCI_SCALE_MASK = v_splatsi(0xFFFF & ~PALETTE_ID_MASK);
 #endif
 
 struct InstancePackData
@@ -150,7 +151,7 @@ static inline bool unpack_tm_pos(mat44f &tm, const int16_t *data, vec3f add, vec
   tm.col1 = v_and(scale, (vec4f)V_CI_MASK0100);
   tm.col2 = v_and(scale, (vec4f)V_CI_MASK0010);
   tm.col3 = v_madd(v, mul, add);
-  return false;
+  return true;
 }
 static inline bool unpack_tm_pos(vec4f &pos, vec4f &scale, const int16_t *data, vec3f add, vec3f mul, bool palette_rotation,
   vec4i *palette_id = nullptr)
@@ -287,36 +288,44 @@ static inline size_t pack_entity_16(const InstancePackData &data, const TMatrix 
   return pack_entity_tm_16(data, tm, target_ptr);
 }
 
+struct RiGenCellCtx
+{
+  RiGenCellCtx(const RendInstGenData &rgl, const RendInstGenData::CellRtData &crt, int x, int z, int cell_id);
+
+  float ox, oy, oz, cell_xz_sz, cell_y_sz;
+  bbox3f bbox;
+  bbox3f *per_pool_local_bb;
+  const char *const *pool_names;
+  dag::ConstSpan<const TMatrix *> sweep_boxes_itm;
+  int cur_cell_id;
+  int cur_ri_extra_ord = 0;
+  int ri_extra_counter = 0;
+  bool persistent_ri_extra_instances;
+};
+
 struct SingleEntityPool
 {
   void *basePtr;
   void *topPtr;
   int avail;
   int shortage;
+  int per_inst_data_dwords;
 
-  static float ox, oy, oz, cell_xz_sz, cell_y_sz;
-  static bbox3f bbox;
-  static bbox3f *per_pool_local_bb;
-  static dag::ConstSpan<const TMatrix *> sweep_boxes_itm;
-  static dag::ConstSpan<E3DCOLOR> ri_col_pair;
-  static int cur_cell_id, cur_ri_extra_ord;
-  static int per_inst_data_dwords;
-
-  static bool intersectWithSweepBoxes(float x, float z)
+  static bool intersectWithSweepBoxes(const RiGenCellCtx &ctx, float x, float z)
   {
-    for (int i = 0; i < sweep_boxes_itm.size(); i++)
+    for (int i = 0; i < ctx.sweep_boxes_itm.size(); i++)
     {
       Point2 p;
-      p.set_xz(sweep_boxes_itm[i][0] * Point3(x, 0, z));
+      p.set_xz(ctx.sweep_boxes_itm[i][0] * Point3(x, 0, z));
       if (fabsf(p.x) < 1.f && fabsf(p.y) < 1.f)
         return true;
     }
     return false;
   }
 
-  bool tryAdd(float x, float z)
+  bool tryAdd(const RiGenCellCtx &ctx, float x, float z)
   {
-    if (intersectWithSweepBoxes(x, z))
+    if (intersectWithSweepBoxes(ctx, x, z))
       return false;
 
     if (avail != 0)
@@ -326,55 +335,78 @@ struct SingleEntityPool
   }
 
   template <typename F>
-  static inline void verifyInstanceScale(const mat44f &m, int pool, F get_pool_name)
+  static inline void verifyInstanceScale(const mat44f &m, int pool, F get_pool_name, const float *scl_thres = nullptr)
   {
 #if DAGOR_DBGLEVEL > 0 && !_TARGET_PC_TOOLS_BUILD
-    vec4f instScaleSq = v_perm_xzac(v_perm_xycd(v_length3_sq(m.col0), v_length3_sq(m.col1)), v_length3_sq(m.col2));
-    if (DAGOR_UNLIKELY(v_signmask(v_cmp_lt(instScaleSq, v_splats(/* 1% */ 1e-4f)))))
+    vec4f instScaleSq = v_mat44_scale43_sq(m);
+    // mask .w out: v_mat44_scale43_sq returns 0 there, which is always below the threshold
+    if (v_check_xyz_any_true(v_cmp_le(instScaleSq, v_splats(scl_thres ? *scl_thres : /* (3/32)^2=9.375% */ 8.789e-3f)))) [[unlikely]]
       if (!v_test_all_bits_zeros(instScaleSq)) // Assume that zero scale is destroyed one (so not an error)
       {
         Point3_vec4 instScale;
         v_st(&instScale.x, v_sqrt(instScaleSq));
         Point3_vec4 instPos;
         v_st(&instPos.x, m.col3);
-        logerr("Insane ri%s[%d](%s) instance scale: (%g, %g, %g) @ %@", pool >= 0 ? "" : "Extra", pool >= 0 ? pool : (-pool - 1),
-          get_pool_name(pool), P3D(instScale), instPos);
+        logerr("ri%s[%d](%s) collision-unsafe scale (%g, %g, %g), min axis %g, pos (%f, %f, %f)", pool >= 0 ? "" : "Extra",
+          pool >= 0 ? pool : (-pool - 1), get_pool_name(pool), P3D(instScale), min(min(instScale.x, instScale.y), instScale.z),
+          P3D(instPos));
       }
 #else
     G_UNUSED(m);
     G_UNUSED(pool);
     G_UNUSED(get_pool_name);
+    G_UNUSED(scl_thres);
 #endif
   }
 
-  void addEntity(const TMatrix &tm, bool posInst, int32_t pool_idx, int32_t palette_id)
+  void addEntity(RiGenCellCtx &ctx, const TMatrix &tm, bool posInst, int32_t pool_idx, int32_t palette_id)
   {
     mat44f m;
     v_mat44_make_from_43cu_unsafe(m, tm.m[0]);
     if (avail > 0)
     {
-      verifyInstanceScale(m, pool_idx, [](int) { return (const char *)nullptr; });
+      verifyInstanceScale(m, pool_idx, [&ctx](int p) { return ctx.pool_names[p]; });
 
       int16_t *ptr = reinterpret_cast<int16_t *>(topPtr);
-      InstancePackData data{ox, oy, oz, cell_xz_sz, cell_y_sz, per_inst_data_dwords};
+      InstancePackData data{ctx.ox, ctx.oy, ctx.oz, ctx.cell_xz_sz, ctx.cell_y_sz, per_inst_data_dwords};
       size_t addedSize = pack_entity_16(data, tm, posInst, palette_id, ptr);
       G_ASSERT(addedSize % sizeof(*ptr) == 0);
       ptr += addedSize / sizeof(*ptr);
 
-      v_bbox3_add_transformed_box(bbox, m, per_pool_local_bb[pool_idx]);
+      v_bbox3_add_transformed_box(ctx.bbox, m, ctx.per_pool_local_bb[pool_idx]);
       topPtr = ptr;
       avail--;
     }
     else if (avail < 0)
     {
-      if (!posInst && per_inst_data_dwords > 0)
+      int riex_idx = -avail - 1;
+      constexpr bool hasColl = true;
+      if (!ctx.persistent_ri_extra_instances)
+      {
+        rendinst::riex_handle_t *ptr = reinterpret_cast<rendinst::riex_handle_t *>(basePtr);
+        if (!ptr)
+        {
+          ctx.ri_extra_counter++; // skip creating in precomputeCell() phase, just count them
+          return;
+        }
+        G_FAST_ASSERT(ptr + ctx.ri_extra_counter < reinterpret_cast<rendinst::riex_handle_t *>(topPtr));
+        if (!posInst && per_inst_data_dwords > 0)
+        {
+          int instSeed = mem_hash_fnv1((const char *)&tm[3][0], 12);
+          ptr[ctx.ri_extra_counter++] =
+            rendinst::addRIGenExtra44(riex_idx, m, hasColl, ctx.cur_cell_id, ctx.cur_ri_extra_ord, 1, &instSeed);
+        }
+        else
+          ptr[ctx.ri_extra_counter++] = rendinst::addRIGenExtra44(riex_idx, m, hasColl, ctx.cur_cell_id, ctx.cur_ri_extra_ord);
+      }
+      else if (!posInst && per_inst_data_dwords > 0)
       {
         int instSeed = mem_hash_fnv1((const char *)&tm[3][0], 12);
-        rendinst::addRIGenExtra44(-avail - 1, m, true /*has_collision*/, cur_cell_id, cur_ri_extra_ord, 1, &instSeed);
+        rendinst::addRIGenExtra44(riex_idx, m, hasColl, ctx.cur_cell_id, ctx.cur_ri_extra_ord, 1, &instSeed);
       }
       else
-        rendinst::addRIGenExtra44(-avail - 1, m, true /*has_collision*/, cur_cell_id, cur_ri_extra_ord);
-      cur_ri_extra_ord += 16 * (rendinst::riExtra[-avail - 1].destrDepth + 1);
+        rendinst::addRIGenExtra44(riex_idx, m, hasColl, ctx.cur_cell_id, ctx.cur_ri_extra_ord);
+      ctx.cur_ri_extra_ord += 16 * (rendinst::riExtra[riex_idx].destrDepth + 1);
     }
   }
 };

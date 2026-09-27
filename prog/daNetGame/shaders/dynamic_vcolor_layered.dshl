@@ -4,17 +4,15 @@ include "normaldetail.dshl"
 include "paint_details_inc.dshl"
 include "vcolor_layered_inc.dshl"
 include "random_color.dshl"
+include "dynamic_destr_disappear_inc.dshl"
 
 shader dynamic_vcolor_layered
 {
-  ENABLE_ASSERT(ps)
   DYNAMIC_BLOCK()
   INIT_VCOLOR_LAYERED(true)
   INIT_RANDOMIZED_TC(vs)
-  if (in_editor_assume == no)
-  {
-    NO_DYNSTCODE()
-  }
+  DYNAMIC_DESTR_DISAPPEAR_INIT()
+  NO_DYNSTCODE()
 
   static int num_bones = 0;
   interval num_bones: no_bones<1, four_bones;
@@ -34,7 +32,7 @@ shader dynamic_vcolor_layered
       #define USE_INITIAL_POS 1
       struct VsOutput
       {
-        VS_OUT_POSITION(pos)
+        PRECISE VS_OUT_POSITION(pos)
         float4 pointToEye                       : TEXCOORD0;
         float3 normal                           : TEXCOORD1;
         float2 diffuseTexcoord                  : TEXCOORD2;
@@ -42,10 +40,13 @@ shader dynamic_vcolor_layered
         nointerpolation float3 colorMul         : TEXCOORD3;
         #endif
         #ifdef MOTION_VECTORS_ENABLED
-        float4 out_pos                          : TEXCOORD4;
-        float4 out_pos_prev                     : TEXCOORD5;
+        float3 out_pos                          : TEXCOORD4;
+        float3 out_pos_prev                     : TEXCOORD5;
         #endif
         float3 vcolMask                         : TEXCOORD6;
+        #if DYNAMIC_DESTR_DISAPPEAR_ENABLED
+        float4 destr_params                     : TEXCOORD7;
+        #endif
       };
     }
   }
@@ -55,6 +56,7 @@ shader dynamic_vcolor_layered
     #define NEED_VCOL_MASK 1
   }
   DYNAMIC_SIMPLE_VS_BASE_PREAMBLE()
+  DYNAMIC_DESTR_DISAPPEAR_USE()
 
   if (dyn_model_render_pass == render_pass_normal) {
     USE_RANDOMIZED_TC(vs)
@@ -80,9 +82,13 @@ shader dynamic_vcolor_layered
 
   USE_VCOLOR_LAYERED(ps)
 
-  if (dyn_model_render_pass != render_pass_normal)
+  if (is_triangle_size_debug)
   {
-    SPECIAL_RENDER_NOALPHATEST()
+    DYNAMIC_TRIANGLE_SIZE_DEBUG_PS()
+  }
+  else if (dyn_model_render_pass != render_pass_normal)
+  {
+    SPECIAL_RENDER_NOALPHATEST(enable_ri_disintegration_animation == enabled)
   }
   else
   {
@@ -90,6 +96,6 @@ shader dynamic_vcolor_layered
       #define NORMAL_RENDER_PASS 1
       #define IS_DYNAMIC 1
     }
-    VCOLOR_LAYERED_PS(true, false, false)
+    VCOLOR_LAYERED_PS(true, false, false, false, GBUFFER_ORDER_DYNAMIC)
   }
 }

@@ -1,4 +1,5 @@
 import "io" as io
+from "types" import *
 from "dagor.fs" import file_exists, mkdir
 from "dagor.system" import argv, get_arg_value_by_name
 from "modules" import get_native_module_names
@@ -11,17 +12,30 @@ let {getbuildinfo=@() {}} = require_optional("debug")
     we need return type of function or it is mostly useless even for stubs
     class are not generated yet
 */
-function saveFile(file_path, data){
-  assert(type(data) == "string", "data should be string")
+function saveFile(file_path, data): bool {
+  assert(data instanceof String, "data should be string")
   let file = io.file(file_path, "wt+")
   file.writestring(data)
   file.close()
   return true
 }
 
+let builtin_types = ["", 0, 0.1, [], {}].reduce(
+  function(res, a) {
+    res[type(a)] <- classof(a)
+    return res
+  },
+  {}
+)
+
+let funcinfos = {
+  quirrel_funcinfos = (function() {@@"""docstring"""}).getfuncinfos()
+  native_funcinfos = (print).getfuncinfos()
+}
+
 function generateStubs(stubsDir="", verbose=false) {
   stubsDir = stubsDir ?? ""
-  foreach(nm in get_native_module_names()) {
+  foreach (nm in get_native_module_names()) {
     local path = stubsDir=="" ? nm : $"{stubsDir}/{nm}"
     let manualModuleInfoPath = $"mans/{nm}.info.nut"
     let manModuleInfo = require_optional(manualModuleInfoPath)
@@ -30,8 +44,16 @@ function generateStubs(stubsDir="", verbose=false) {
       mkdir(stubsDir)
     saveFile(path, $"return {mkStubStr(require(nm), null, 0, verbose, manModuleInfo)}")
   }
-  foreach (i in [["__root__", clone getroottable()], ["__globalconst__", clone getconsttable()], ["__build__", getbuildinfo()]]) {
-    let [pseudo_module_name,  pseudo_module] = i
+
+  let pseudoModules = {
+    ["__root__"] = clone getroottable(),
+    ["__globalconst__"] = clone getconsttable(),
+    ["__build__"] = getbuildinfo(),
+    ["__builtin_types__"] = builtin_types,
+    ["__funcinfos__"] = funcinfos,
+  }
+
+  foreach (pseudo_module_name, pseudo_module in pseudoModules) {
     let path = stubsDir=="" ? pseudo_module_name : $"{stubsDir}/{pseudo_module_name}"
     pseudo_module?.$rawdelete("__argv")
     saveFile(path, $"return {mkStubStr(pseudo_module, null, 0, verbose)}")

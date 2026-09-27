@@ -3,9 +3,10 @@
 #include <drv/3d/dag_tex3d.h>
 #include <drv/3d/dag_resUpdateBuffer.h>
 
+#include <osApiWrappers/dag_miscApi.h>
+#include <memory/dag_mem.h>
 #include "buffer_resource.h"
 #include "texture.h"
-#include <osApiWrappers/dag_miscApi.h>
 #include "globals.h"
 #include "device_memory.h"
 #include "resource_manager.h"
@@ -13,18 +14,12 @@
 #include "frontend.h"
 #include "driver_config.h"
 #include "device_context.h"
+#include "backend/cmd/resources.h"
+#include "resource_update_buffer.h"
+#include "external_resource_pools.h"
+#include "validation.h"
 
 using namespace drv3d_vulkan;
-
-struct ResUpdateBufferImp
-{
-  BaseTex *destTex;
-  Image *originalImg;
-  Buffer *stagingBuffer;
-  VkBufferImageCopy uploadInfo;
-  size_t pitch;
-  size_t slicePitch;
-};
 
 d3d::ResUpdateBuffer *d3d::allocate_update_buffer_for_tex_region(BaseTexture *dest_base_texture, unsigned dest_mip,
   unsigned dest_slice, unsigned offset_x, unsigned offset_y, unsigned offset_z, unsigned width, unsigned height, unsigned depth)
@@ -67,11 +62,14 @@ d3d::ResUpdateBuffer *d3d::allocate_update_buffer_for_tex_region(BaseTexture *de
   if (Globals::cfg.debugLevel)
     stagingBuffer->setDebugName(String(64, "RUB for %s", dest_tex->image->getDebugName()));
 
-  ResUpdateBufferImp *rub = (ResUpdateBufferImp *)memalloc(sizeof(ResUpdateBufferImp), tmpmem);
+  ResUpdateBufferImp *rub = Globals::Res::rub.allocate();
 
   rub->destTex = dest_tex;
   rub->originalImg = dest_tex->image;
   rub->stagingBuffer = stagingBuffer;
+  // WSL2 (GPU via dxgkrnl) cannot kernel-fread into host-visible memory; the DDSX read lands in
+  // this RAM shadow and update() memcpys it into the staging buffer (a user-space write is fine).
+  rub->cpuShadow = Globals::cfg.bits.stageRubThroughCpu ? memalloc(size, tmpmem) : nullptr;
   rub->pitch = fmt.calculateRowPitch(width);
   rub->slicePitch = slicePitch;
   rub->uploadInfo =
@@ -112,11 +110,14 @@ d3d::ResUpdateBuffer *d3d::allocate_update_buffer_for_tex(BaseTexture *dest_base
     memset(stagingBuffer->ptrOffsetLoc(0), 0, size);
   }
 
-  ResUpdateBufferImp *rub = (ResUpdateBufferImp *)memalloc(sizeof(ResUpdateBufferImp), tmpmem);
+  ResUpdateBufferImp *rub = Globals::Res::rub.allocate();
 
   rub->destTex = dest_tex;
   rub->originalImg = dest_tex->image;
   rub->stagingBuffer = stagingBuffer;
+  // WSL2 (GPU via dxgkrnl) cannot kernel-fread into host-visible memory; the DDSX read lands in
+  // this RAM shadow and update() memcpys it into the staging buffer (a user-space write is fine).
+  rub->cpuShadow = Globals::cfg.bits.stageRubThroughCpu ? memalloc(size, tmpmem) : nullptr;
   rub->pitch = fmt.calculateRowPitch(level_w);
   rub->slicePitch = size;
 
@@ -142,8 +143,10 @@ void d3d::release_update_buffer(d3d::ResUpdateBuffer *&rub)
 {
   if (ResUpdateBufferImp *&rub_imp = reinterpret_cast<ResUpdateBufferImp *&>(rub))
   {
-    drv3d_vulkan::Globals::ctx.destroyBuffer(rub_imp->stagingBuffer);
-    memfree(rub_imp, tmpmem); // release update buffer
+    if (rub_imp->cpuShadow)
+      memfree(rub_imp->cpuShadow, tmpmem);
+    Globals::ctx.dispatchCmd<CmdDestroyBuffer>({rub_imp->stagingBuffer});
+    Globals::Res::rub.free(rub_imp);
     rub = nullptr;
   }
 }
@@ -152,6 +155,8 @@ char *d3d::get_update_buffer_addr_for_write(d3d::ResUpdateBuffer *rub)
 {
   if (ResUpdateBufferImp *rub_imp = reinterpret_cast<ResUpdateBufferImp *>(rub))
   {
+    if (rub_imp->cpuShadow)
+      return reinterpret_cast<char *>(rub_imp->cpuShadow);
     G_ASSERT(rub_imp->stagingBuffer->hasMappedMemory());
     return reinterpret_cast<char *>(rub_imp->stagingBuffer->ptrOffsetLoc(0));
   }
@@ -176,6 +181,9 @@ bool d3d::update_texture_and_release_update_buffer(d3d::ResUpdateBuffer *&rub)
     return false;
 
   ResUpdateBufferImp *&rub_imp = reinterpret_cast<ResUpdateBufferImp *&>(rub);
+
+  if (rub_imp->cpuShadow)
+    memcpy(rub_imp->stagingBuffer->ptrOffsetLoc(0), rub_imp->cpuShadow, rub_imp->slicePitch);
 
   rub_imp->stagingBuffer->markNonCoherentRangeLoc(0, rub_imp->stagingBuffer->getBlockSize(), true);
 

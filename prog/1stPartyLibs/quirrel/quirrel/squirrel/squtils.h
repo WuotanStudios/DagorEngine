@@ -36,9 +36,14 @@ void sq_vm_free(SQAllocContext ctx, void *p,SQUnsignedInteger size);
   #endif
 #endif
 
-
-#if !defined(SQ_STATIC_ASSERT)
-#define SQ_STATIC_ASSERT(x) static_assert((x), "assertion failed: " #x)
+#ifndef SQ_NOINLINE
+  #if defined(__GNUC__) || defined(__clang__)
+    #define SQ_NOINLINE __attribute__((noinline))
+  #elif defined(_MSC_VER)
+    #define SQ_NOINLINE __declspec(noinline)
+  #else
+    #define SQ_NOINLINE
+  #endif
 #endif
 
 
@@ -116,6 +121,12 @@ public:
         if(_allocated <= _size)
             _realloc(_size * 2);
         return *(new ((void *)&_vals[_size++]) T(val));
+    }
+    inline T &push_back(T&& val)
+    {
+        if(_allocated <= _size)
+            _realloc(_size * 2);
+        return *(new ((void *)&_vals[_size++]) T(std::move(val)));
     }
     inline void pop_back()
     {

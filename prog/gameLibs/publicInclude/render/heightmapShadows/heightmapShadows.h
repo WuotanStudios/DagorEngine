@@ -7,6 +7,7 @@
 #include <math/integer/dag_IBBox2.h>
 #include <generic/dag_staticTab.h>
 #include <3d/dag_resPtr.h>
+#include <EASTL/unique_ptr.h>
 
 // is_same = true means that we are continue to render same cascade
 // needed_now is always within needed_for_cascade
@@ -44,7 +45,7 @@ protected:
   uint32_t renderCascade(const UpdateCascade &c, int steps, const hmap_shadows_prepare_cb &cb);
   void updateCascades(const Point3 &pos, const Point3 &from_sun_dir, const hmap_shadows_prepare_cb &cb, int steps);
   void setVars();
-  UniqueTexHolder heightmap_shadow;
+  UniqueTexWithShaderVar heightmap_shadow;
   UniqueBuf heightmap_shadow_start;
   struct Cascade
   {

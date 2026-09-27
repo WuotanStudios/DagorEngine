@@ -9,6 +9,7 @@
 #include <scene/dag_occlusion.h>
 #include <util/dag_convar.h>
 #include <render/occlusion/parallelOcclusionRasterizer.h>
+#include <render/occlusion/occlusionMaskApplier.h>
 
 #define INSIDE_RENDERER 1
 #include <render/world/private_worldRenderer.h>
@@ -147,7 +148,8 @@ void VisibilityPrepareJob::start(const VisibilityJobsContext *jc,
   const CameraParams &cur_frame_camera,
   const PartitionSphere &transparentPartitionSphere_,
   const IPoint2 &rendering_resolution,
-  const ShadowVisibilityContext &shadow_ctx)
+  const ShadowVisibilityContext &shadow_ctx,
+  OcclusionMaskApplier *occlusion_mask_applier)
 {
   threadpool::wait(this, 0, threadpool::NUM_PRIO);
   TMatrix4_vec4 viewTm = TMatrix4(cur_frame_camera.viewTm);
@@ -164,6 +166,7 @@ void VisibilityPrepareJob::start(const VisibilityJobsContext *jc,
   transparentPartitionSphere = transparentPartitionSphere_;
   target = rendering_resolution;
   shadowCtx = shadow_ctx;
+  occlusionMaskApplier = occlusion_mask_applier;
   threadpool::add(this, VisibilityReprojectJob::prio);
 }
 
@@ -201,6 +204,9 @@ void VisibilityPrepareJob::prepareVisibility()
       occlusion->finalizeSWOcclusion();
     }
 
+    if (occlusionMaskApplier)
+      occlusionMaskApplier->apply(*occlusion);
+
     occlusion->finalizeOcclusion();
   }
 }
@@ -233,6 +239,9 @@ void VisibilityPrepareJob::finalize()
 
   // will be needed after CSM, but before lights
   G_ASSERT(rendinstMainVisibility);
+  rendinst::setRIGenVisibilityRendering(rendinstMainVisibility,
+    rendinst::VisibilityRenderingFlag::All | rendinst::VisibilityRenderingFlag::AllowSeparateRendering);
+  jobs->riExtraRenderJob->renderingSubset = rendinst::RiExtraRenderingSubset::OnlyStatic;
   jobs->rendinstExtraVisibilityJobs[RENDER_MAIN_JOB].start(jobs, occlusion, (mat44f &)globtm, itm.getcol(3),
     transparentPartitionSphere, rendinstMainVisibility, false, threadpool::PRIO_NORMAL, target, RI_EXTRA_VIS_MAIN_JOB);
   jobs->rendinstVisibilityJobs[RENDER_MAIN_JOB].start(occlusion, frustum, itm.getcol(3), rendinstMainVisibility, false,
@@ -256,14 +265,12 @@ void LodsByDistanceJob::doJob() { rendinst::requestRiExtraLodsByDistance(cameraP
 void GroundCullingJob::start(const VisibilityJobsContext *jc,
   LandMeshCullingData *culling_data,
   LandMeshManager *lmesh_mgr,
-  LandMeshRenderer *lmesh_renderer,
   Occlusion *occl,
   const Frustum &frustum_,
   const Point3 &viewPos_,
   const TMatrix4 &viewProj_,
-  const float hmap_camera_height,
-  const float water_level,
   const int displacement_sub_div,
+  const float displacement_radius,
   threadpool::JobPriority prio)
 {
   threadpool::wait(this, 0, threadpool::NUM_PRIO);
@@ -271,36 +278,31 @@ void GroundCullingJob::start(const VisibilityJobsContext *jc,
     return;
 
   jobs = jc;
-  lmeshCullingState.copyLandmeshState(*lmesh_mgr, *lmesh_renderer);
   lmeshCullingData = culling_data;
   lmeshMgr = lmesh_mgr;
-  lmeshRenderer = lmesh_renderer;
-  occlusion = occl;
-  frustum = frustum_;
-  viewPos = viewPos_;
-  viewProj = viewProj_;
-  hmapCameraHeight = hmap_camera_height;
-  waterLevel = water_level;
-  displacementSubDiv = displacement_sub_div;
+  cullDesc = LandMeshCullDesc::forView(viewPos_, frustum_);
+  cullDesc.occlusion = occl;
+  cullDesc.useExclBox = lmesh_mgr->cullingState.useExclBox; // sample now: prepare() may retarget it before doJob runs
+  HeightmapMetricsQuality mq = {proj_to_distance_scale(viewProj_)};
+  mq.maxRelativeTexelTess = displacement_sub_div;
+  mq.displacementDist = displacement_radius;
+  mq.displacementFalloff = 0.25f;
+  cullDesc.hmapMetrics = mq;
   threadpool::add(this, prio, /*wake*/ false);
 }
 
 void GroundCullingJob::doJob()
 {
   threadpool::wait(jobs->visibilityJob, 0, threadpool::NUM_PRIO);
-  lmeshCullingState.frustumCulling(*lmeshMgr, *lmeshCullingData, NULL, 0,
-    HeightmapFrustumCullingInfo{viewPos, hmapCameraHeight, waterLevel, frustum, occlusion, 0, displacementSubDiv, 1, viewProj});
+  landmesh::frustum_cull(*lmeshMgr, cullDesc, *lmeshCullingData);
 }
 
 void GroundReflectionCullingJob::start(const VisibilityJobsContext *jc,
   LandMeshCullingData *culling_data,
   LandMeshManager *lmesh_mgr,
-  LandMeshRenderer *lmesh_renderer,
   const Frustum &frustum_,
   const Point3 &viewPos_,
   const TMatrix4 &viewProj_,
-  const float hmap_camera_height,
-  const float water_level,
   threadpool::JobPriority prio)
 {
   threadpool::wait(this, 0, threadpool::NUM_PRIO);
@@ -308,24 +310,18 @@ void GroundReflectionCullingJob::start(const VisibilityJobsContext *jc,
     return;
 
   jobs = jc;
-  lmeshCullingState.copyLandmeshState(*lmesh_mgr, *lmesh_renderer);
   lmeshCullingData = culling_data;
   lmeshMgr = lmesh_mgr;
-  lmeshRenderer = lmesh_renderer;
-  frustum = frustum_;
-  viewPos = viewPos_;
-  hmapCameraHeight = hmap_camera_height;
-  viewProj = viewProj_;
-  waterLevel = water_level;
+  cullDesc = LandMeshCullDesc::forView(viewPos_, frustum_);
+  cullDesc.useExclBox = lmesh_mgr->cullingState.useExclBox;
+  cullDesc.hmapMetrics = {proj_to_distance_scale(viewProj_), -1, HeightmapMetricsQuality::FASTEST};
   threadpool::add(this, prio, /*wake*/ false);
 }
 
 void GroundReflectionCullingJob::doJob()
 {
   threadpool::wait(jobs->visibilityJob, 0, threadpool::NUM_PRIO);
-  lmeshCullingState.frustumCulling(*lmeshMgr, *lmeshCullingData, NULL, 0,
-    HeightmapFrustumCullingInfo{
-      viewPos, hmapCameraHeight, waterLevel, frustum, nullptr, 0, 0, 1, viewProj, 0.5, HeightmapFrustumCullingInfo::FASTEST});
+  landmesh::frustum_cull(*lmeshMgr, cullDesc, *lmeshCullingData);
 }
 
 void LightsCullingJob::start(Occlusion *occlusion_, const CameraParams &cur_frame_camera, threadpool::JobPriority prio)
@@ -339,6 +335,8 @@ void LightsCullingJob::start(Occlusion *occlusion_, const CameraParams &cur_fram
   proj = (mat44f_cref)cur_frame_camera.noJitterProjTm;
   viewPos = v_ldu(cur_frame_camera.viewItm.m[3]);
   zn = cur_frame_camera.noJitterPersp.zn;
+  zf = cur_frame_camera.noJitterPersp.zf;
+  hk = cur_frame_camera.noJitterPersp.hk;
   threadpool::add(this, prio, /*wake*/ false);
 }
 
@@ -346,7 +344,7 @@ void LightsCullingJob::doJob()
 {
   // int64_t reft = ref_time_ticks();
   if (get_world_renderer())
-    ((WorldRenderer *)get_world_renderer())->cullFrustumLights(occlusion, viewPos, globtm, view, proj, zn);
+    ((WorldRenderer *)get_world_renderer())->cullFrustumLights(occlusion, viewPos, globtm, view, proj, zn, zf, hk);
   // debug("lights done %dus", get_time_usec(reft));
 }
 

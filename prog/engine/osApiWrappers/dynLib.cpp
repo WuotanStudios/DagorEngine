@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <osApiWrappers/dag_dynLib.h>
+#include <util/dag_compilerDefs.h>
 
 #if _TARGET_PC_LINUX | _TARGET_APPLE | _TARGET_ANDROID
 #include <dlfcn.h>
@@ -35,7 +36,7 @@ void *os_dll_load_deep_bind(const char *filename)
   // RTLD_DEEPBIND is incompatible with sanitizer runtime
   // RTLD_DEEPBIND requires GLIBC 2.3.4 (introduced in 2004-12-29),
   //   keep it disabled on game client builds, as we have complains for it!
-#if !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+#if !DAGOR_ADDRESS_SANITIZER && !DAGOR_THREAD_SANITIZER
   return ::dlopen(filename, RTLD_LAZY | RTLD_DEEPBIND);
 #else
   return ::dlopen(filename, RTLD_LAZY);
@@ -76,6 +77,20 @@ void *os_dll_get_symbol(void *handle, const char *function)
 #endif
 }
 
+// Get handle to a loaded dynamic library by name. Return NULL if failed.
+void *os_dll_get_handle(const char *name)
+{
+#if _TARGET_PC_LINUX | _TARGET_APPLE | _TARGET_ANDROID
+
+  return ::dlopen(name, RTLD_NOLOAD | RTLD_LAZY);
+#elif _TARGET_PC_WIN | _TARGET_XBOX
+
+  return ::GetModuleHandle(name);
+#else
+  return NULL;
+#endif
+}
+
 
 // Close dynamic library.
 bool os_dll_close(void *handle)
@@ -102,6 +117,7 @@ const char *os_dll_get_dll_name_from_addr(char *out_buf, size_t out_buf_size, co
     return nullptr;
 
   strncpy(out_buf, info.dli_fname, out_buf_size);
+  out_buf[out_buf_size - 1] = '\0';
   return out_buf;
 
 #elif _TARGET_PC_WIN | _TARGET_XBOX

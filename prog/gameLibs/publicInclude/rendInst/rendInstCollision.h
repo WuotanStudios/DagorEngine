@@ -4,11 +4,11 @@
 //
 #pragma once
 
-#include <EASTL/fixed_function.h>
+#include <generic/dag_functionRef.h>
 #include <generic/dag_fixedMoveOnlyFunction.h>
 #include <scene/dag_physMatIdDecl.h>
 #include <gameRes/dag_collResDecl.h>
-#include <gameMath/traceUtils.h>
+#include <rendInst/traceUtils.h>
 #include <util/dag_simpleString.h>
 #include <memory/dag_framemem.h>
 #include <rendInst/rendInstDesc.h>
@@ -20,7 +20,6 @@
 struct RendInstGenData;
 
 class CollisionResource;
-class Bitarray;
 
 namespace rendinst
 {
@@ -29,9 +28,10 @@ struct CollisionInfo
 {
   void *handle = nullptr;
   CollisionResource *collRes = nullptr;
-  SimpleString destrFxTemplate;
   RendInstDesc desc;
   int riPoolRef = -1;
+  // pool matId, resolved with the other pool props; PHYSMAT_INVALID when the pool has none
+  PhysMat::MatID matId = PHYSMAT_INVALID;
   TMatrix tm = TMatrix::IDENT;
   BBox3 localBBox = BBox3::IDENT;
   float destrImpulse = 0.0f;
@@ -47,8 +47,6 @@ struct CollisionInfo
   bool isParent = false;
   bool destructibleByParent = false;
   int destroyNeighbourDepth = 1;
-  SimpleString tag;
-  SimpleString destroyedByTag;
 
   explicit CollisionInfo(const RendInstDesc &ri_desc = RendInstDesc()) : desc(ri_desc) {}
 };
@@ -89,7 +87,8 @@ void testObjToRendInstIntersection(const Capsule &obj_capsule, RendInstCollision
 const char *get_rendinst_res_name_from_col_info(const CollisionInfo &col_info);
 CollisionInfo getRiGenDestrInfo(const RendInstDesc &desc);
 
-CheckBoxRIResultFlags checkBoxToRIGenIntersection(const BBox3 &box);
+CheckBoxRIResultFlags checkSphereToRIGenIntersection(const BSphere3 &sphere);
+CheckBoxRIResultFlags checkCapsuleToRIGenIntersection(const Capsule &capsule);
 void gatherRIGenCollidableInRadius(rigen_collidable_data_t &out_data, const Point3 &pos, float radius, GatherRiTypeFlags flags,
   bool ignore_immortal = false);
 
@@ -143,9 +142,12 @@ uint32_t setMaxNumRiCollisionCb(uint32_t new_max_num);
 
 // ======= trace ray stuff ========
 
+// Non-owning: the callable must outlive the call, do not bind a temporary.
+using TraceRayIgnoreRiExtraCbType = dag::FunctionRef<bool(riex_handle_t) const>;
+
 bool traceRayRendInstsNormalized(const Point3 &from, const Point3 &dir, float &tout, Point3 &norm, bool extend_bbox = false,
   bool trace_meshes = false, rendinst::RendInstDesc *ri_desc = nullptr, bool trace_trees = false, int ray_mat_id = -1,
-  int *out_mat_id = nullptr);
+  int *out_mat_id = nullptr, TraceRayIgnoreRiExtraCbType ignore_func = {});
 bool traceRayRendInstsListNormalized(const Point3 &from, const Point3 &dir, float dist, RendInstsIntersectionsList &ri_data,
   bool trace_meshes = false);
 
@@ -167,6 +169,18 @@ bool traceRayRendInstsRayBatchAllIntersections(dag::Span<Trace> traces, RendInst
 bool traceRayRIGenNormalized(dag::Span<Trace> traces, TraceFlags trace_flags, int ray_mat_id = -1,
   rendinst::RendInstDesc *ri_desc = nullptr, const TraceMeshFaces *ri_cache = nullptr,
   riex_handle_t skip_riex_handle = rendinst::RIEX_HANDLE_NULL);
+
+bool rayhitRIGenNormalized(dag::Span<Trace> traces, TraceFlags trace_flags, int ray_mat_id = -1,
+  rendinst::RendInstDesc *ri_desc = nullptr, const TraceMeshFaces *ri_cache = nullptr,
+  riex_handle_t skip_riex_handle = rendinst::RIEX_HANDLE_NULL);
+
+// Closest-hit ray batch that fills one RendInstDesc per ray (unlike traceRayRIGenNormalized,
+// whose single ri_desc collapses a batch). ri_descs must be the same size as traces.
+bool traceRayRIGenNormalizedMultiRay(dag::Span<Trace> traces, TraceFlags trace_flags, dag::Span<rendinst::RendInstDesc> ri_descs,
+  int ray_mat_id = -1, const TraceMeshFaces *ri_cache = nullptr, riex_handle_t skip_riex_handle = rendinst::RIEX_HANDLE_NULL);
+
+bool traceRayRIGenNormalizedWithIgnoreFunc(dag::Span<Trace> traces, TraceFlags trace_flags, int ray_mat_id = -1,
+  rendinst::RendInstDesc *ri_desc = nullptr, const TraceMeshFaces *ri_cache = nullptr, TraceRayIgnoreRiExtraCbType ignore_func = {});
 
 void initTraceTransparencyParameters(float tree_trunk_opacity, float tree_canopy_opacity);
 
@@ -194,22 +208,23 @@ inline bool traceRayRendInstsNormalized(dag::Span<Trace> traces, bool = false, b
   return traceRayRIGenNormalized(traces, traceFlags, ray_mat_id, ri_desc, ri_cache);
 }
 
-using TraceDownMutiRayIgnoreCbType = eastl::fixed_function<sizeof(void *), bool(const RendInstDesc &)>;
+// Warn: for RI (i.e. not RiEx) called once per pool
+// Non-owning: the callable must outlive the call, do not bind a temporary.
+using TraceDownMutiRayIgnoreCbType = dag::FunctionRef<bool(const RendInstDesc &) const>;
 // Note: all rays should be down
 bool traceDownMultiRayNoCache(dag::Span<Trace> traces, bbox3f_cref rayBox, dag::Span<RendInstDesc> ri_desc, int ray_mat_id = -1,
-  TraceFlags trace_flags = TraceFlag::Destructible, TraceDownMutiRayIgnoreCbType ignore_func = {},
-  Bitarray *filter_pools = nullptr); // Note: Only supported in tools
+  TraceFlags trace_flags = TraceFlag::Destructible, TraceDownMutiRayIgnoreCbType ignore_func = {});
 bool traceDownMultiRayCached(dag::Span<Trace> traces, bbox3f_cref rayBox, dag::Span<RendInstDesc> ri_desc,
   const TraceMeshFaces &ri_cache, int ray_mat_id = -1, TraceFlags trace_flags = TraceFlag::Destructible,
   TraceDownMutiRayIgnoreCbType ignore_func = {});
 inline bool traceDownMultiRay(dag::Span<Trace> traces, bbox3f_cref rayBox, dag::Span<RendInstDesc> ri_desc,
   const TraceMeshFaces *ri_cache = {}, int ray_mat_id = -1, TraceFlags trace_flags = TraceFlag::Destructible,
-  TraceDownMutiRayIgnoreCbType ignore_func = {}, Bitarray *filter_pools = nullptr)
+  TraceDownMutiRayIgnoreCbType ignore_func = {})
 {
   if (ri_cache)
     return traceDownMultiRayCached(traces, rayBox, ri_desc, *ri_cache, ray_mat_id, trace_flags, ignore_func);
   else
-    return traceDownMultiRayNoCache(traces, rayBox, ri_desc, ray_mat_id, trace_flags, ignore_func, filter_pools);
+    return traceDownMultiRayNoCache(traces, rayBox, ri_desc, ray_mat_id, trace_flags, ignore_func);
 }
 
 bool rayhitRendInstNormalized(const Point3 &from, const Point3 &dir, float t, int ray_mat_id, const RendInstDesc &ri_desc);
@@ -221,21 +236,34 @@ inline bool rayhitRendInstsNormalized(const Point3 &from, const Point3 &dir, flo
   return rayhitRendInstsNormalized(from, dir, t, 0.0f, ray_mat_id, ri_desc);
 }
 
+bool rayhitRIExtraOnlyNormalized(const Point3 &from, const Point3 &dir, float t, int ray_mat_id, RendInstDesc *out_ri_desc = nullptr,
+  float min_size = 0.f);
+
 struct ForeachCB
 {
   virtual void executeForTm(RendInstGenData * /* rgl */, const RendInstDesc & /* ri_desc */, const TMatrix & /* tm */) {}
   virtual void executeForPos(RendInstGenData * /* rgl */, const RendInstDesc & /* ri_desc */, const TMatrix & /* tm */) {}
 };
 void foreachRIGenInBox(const BBox3 &box, GatherRiTypeFlags ri_types, ForeachCB &cb);
+void foreachRIGenInSphere(const BSphere3 &sphere, GatherRiTypeFlags ri_types, ForeachCB &cb);
 
 using GetTmsCallbackType = dag::FixedMoveOnlyFunction<16, void(const RendInstDesc &, const mat44f &) const>;
 void getRIGenTMsInBox(const BBox3 &box, dag::ConstSpan<int16_t> pool_ids, GetTmsCallbackType &&tm_callback);
+// world space root pos, the palette yaw (identity quat for pools without palette rotation), placement scale
+using GetPosInstCallbackType = dag::FixedMoveOnlyFunction<16, void(const RendInstDesc &, vec3f pos, quat4f rot, vec3f scale) const>;
+// pos instance pools (trees, bushes), also the collision-less ones the collision walks miss.
+// guaranteed: every instance the cell and subcell content bboxes cover against the box.
+// extras: at most the roots inside the box grown per axis by margin (the unit scale reach)
+// times the instance max scale. callbacks run under the layer read lock
+void foreachRIGenPosInstanceInBox(const BBox3 &box, const Point3 &margin, bool (*pool_filter)(int layer_ix, int pool_ix, void *user),
+  void *user, GetPosInstCallbackType &&callback);
 
 void clipCapsuleRI(const ::Capsule &c, Point3 &lpt, Point3 &wpt, real &md, const Point3 &movedirNormalized,
   const TraceMeshFaces *ri_cache);
 
 bool checkCachedRiData(const TraceMeshFaces *ri_cache);
 bool initializeCachedRiData(TraceMeshFaces *ri_cache);
+bool initializeCachedRiData(TraceMeshFaces *ri_cache, const Capsule &capsule, bool ri_extra_only = false);
 
 } // namespace rendinst
 

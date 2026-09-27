@@ -14,10 +14,11 @@
 #include <daRg/dag_renderObject.h>
 #include <daRg/dag_uiSound.h>
 #include <daRg/dag_panelRenderer.h>
-#include <sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
 #include <quirrel/sqConsole/sqConsole.h>
-#include <squirrel/memtrace.h>
+#include <quirrel/quirrelHost/memtrace.h>
 #include <quirrel/sqEventBus/sqEventBus.h>
+#include <quirrel/asyncRuntime/dagorAsyncRuntime.h>
 #include <bindQuirrelEx/bindQuirrelEx.h>
 #include <sound/dag_genAudio.h>
 
@@ -47,6 +48,7 @@
 #include <drv/hid/dag_hiGlobals.h>
 #include <drv/hid/dag_hiJoyData.h>
 #include <drv/hid/dag_hiXInputMappings.h>
+#include <drv/hid/dag_hiComposite.h>
 #include <gui/dag_stdGuiRender.h>
 #include <debug/dag_debug.h>
 #include <gui/dag_visualLog.h>
@@ -72,10 +74,10 @@
 
 #include <webui/httpserver.h>
 #include <webui/helpers.h>
+#include <webui/dargMcpPlugin.h>
 #include <webui/sqDebuggerPlugin.h>
 #include <quirrel/sqDebugger/sqDebugger.h>
 #include <quirrel/sqDebugger/scriptProfiler.h>
-#include <quirrel/lastInputMonitor/lastInputMonitor.h>
 #if HAS_MATCHING_MODULE
 #include <quirrel/matchingModule/matchingModule.h>
 #endif
@@ -131,6 +133,8 @@ static eastl::unique_ptr<ioevents::IOEventsPoll> io_events_poll;
 static darg::IGuiScene *darg_scene = NULL;
 static darg::JoystickHandler *joystick_handler = NULL;
 
+static eastl::unique_ptr<sqasync_dagor::AsyncRuntimeScope> async_runtime;
+
 int dargbox_get_exit_code()
 {
   if (had_darg_error)
@@ -159,8 +163,13 @@ das::Context *get_context(int stack_size) { return new das::Context(stack_size);
 
 das::smart_ptr<das::FileAccess> get_file_access(char *pak)
 {
-  if (pak)
-    return das::make_smart<das::FsFileAccess>(pak, das::make_smart<das::FsFileAccess>());
+  if (pak && *pak)
+  {
+    das::ModuleGroup libGroup;
+    das::TextWriter logs;
+    auto program = das::compileDaScript(pak, das::make_smart<das::FsFileAccess>(), logs, libGroup);
+    return das::make_smart<das::FsFileAccess>(pak, program);
+  }
   return das::make_smart<das::FsFileAccess>();
 }
 
@@ -173,11 +182,14 @@ static struct GuiSceneCb : public darg::IGuiSceneCallback
   void onDismissError() override {}
   void onShutdownScript(HSQUIRRELVM vm) override
   {
+    if (async_runtime)
+      async_runtime->shutdown();
+
     destroy_script_console_processor(vm);
     unbind_dargbox_script_api(vm);
 
 #if DAGOR_DBGLEVEL > 0
-    dag_sq_debuggers.shutdownDebugger(0);
+    webui::shutdown_quirrel_debugger(darg_scene->getModuleMgr());
 #endif
   }
 } gui_scene_cb;
@@ -189,15 +201,13 @@ static void init_webui(const DataBlock *debug_block)
     debug_block = dgs_get_settings()->getBlockByNameEx("debug");
   if (debug_block->getBool("http_server", true))
   {
-    static webui::HttpPlugin test_http_plugins[] = {webui::profiler_http_plugin, webui::shader_http_plugin,
-      webui::color_pipette_http_plugin, webui::colorpicker_http_plugin,
-      {"sqdebug_darg", "squirrel debugger (daRg)", NULL, webui::on_sqdebug<0>}, NULL};
+    static webui::HttpPlugin test_http_plugins[] = {
+      webui::profiler_http_plugin, webui::shader_http_plugin, webui::color_pipette_http_plugin, webui::colorpicker_http_plugin, NULL};
     // webui::plugin_lists[1] = aces_http_plugins;
     webui::plugin_lists[0] = webui::dagor_http_plugins;
     webui::plugin_lists[1] = test_http_plugins;
-
-    if (scripts_used)
-      webui::plugin_lists[2] = webui::squirrel_http_plugins;
+    webui::plugin_lists[2] = webui::darg_mcp_http_plugins;
+    webui::set_darg_mcp_scene_provider(get_ui_scene);
 
     webui::Config cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -326,21 +336,15 @@ public:
     if (ftime)
       delete (ftime);
 
-      // shutdownWebcache();
-#if _TARGET_PC_WIN && !_TARGET_64BIT
-    if (dgs_get_settings()->getBool("dumpMemLeaksAfterScene", false))
-    {
-      DEBUG_CTX("%s: dump leaks", __FUNCTION__);
-      DagDbgMem::dump_leaks(true);
-    }
-#endif
+    // shutdownWebcache();
   }
 
 
   void closeDargScene()
   {
     del_it(joystick_handler);
-    del_it(darg_scene);
+    del_it(darg_scene);    // triggers onShutdownScript, then sq_close
+    async_runtime.reset(); // safe now: VM is gone, no closure can deref the scope pointer
   }
 
 
@@ -384,16 +388,11 @@ public:
     HSQUIRRELVM vm = darg_scene->getScriptVM();
     SqModules *moduleMgr = darg_scene->getModuleMgr();
 
-    sq_enabledebuginfo(vm, true);
     sq_enablevartrace(vm, true);
-
 
 #if DAGOR_DBGLEVEL > 0
-    sq_enabledebuginfo(vm, true);
-    sq_enablevartrace(vm, true);
-    dag_sq_debuggers.initDebugger(0, moduleMgr, "daRg Scripts");
+    webui::register_quirrel_debugger(moduleMgr, "sqdebug_darg", "quirrel debugger - daRg");
     scriptprofile::register_profiler_module(vm, moduleMgr);
-
     const bool varTraceOn = sq_isvartracesupported();
 #else
     const bool varTraceOn = false;
@@ -401,9 +400,8 @@ public:
 
     Sqrat::Table(Sqrat::ConstTable(vm)).SetValue("VAR_TRACE_ENABLED", varTraceOn);
 
-    darg::bind_lottie_animation(moduleMgr);
-
     bind_dargbox_script_api(moduleMgr);
+    async_runtime = eastl::make_unique<sqasync_dagor::AsyncRuntimeScope>(moduleMgr);
     create_script_console_processor(moduleMgr, "sq.exec");
 
     const char *scriptFn = dgs_get_settings()->getStr("script", "scripts/script.nut");
@@ -572,7 +570,15 @@ public:
 
     if (darg_scene && joystick_handler)
     {
-      joystick_handler->onJoystickStateChanged(darg_scene, joy, joy_ord_id);
+      if (auto drv = ::global_cls_composite_drv_joy; drv && joy_ord_id == 0)
+      {
+        for (int i = 1, e = drv->getRealDeviceCount(true) + 1; i < e; ++i) // offset from #0 - compositeJoy
+          if (auto realJoy = drv->getDevice(i); realJoy && realJoy->isXinputCompatible())
+            joystick_handler->onJoystickStateChanged(darg_scene, realJoy, i);
+      }
+      else
+        joystick_handler->onJoystickStateChanged(darg_scene, joy, joy_ord_id);
+
       gamelib::input::on_joystick_state_changed(darg_scene->getScriptVM(), joy, joy_ord_id);
     }
   }
@@ -615,6 +621,8 @@ public:
     visuallog::act(::dagor_game_act_time);
 
     cpujobs::release_done_jobs();
+    if (darg_scene && async_runtime)
+      async_runtime->pump();
     PictureManager::discard_unused_picture();
 
     if (::global_cls_drv_joy)
@@ -623,6 +631,7 @@ public:
     if (darg_scene)
     {
       gamelib::input::process_pending_joystick_btn_stack(darg_scene->getScriptVM());
+      sqeventbus::process_events(darg_scene->getScriptVM());
 
       d3d::GpuAutoLock lock;
 
@@ -690,7 +699,7 @@ public:
     StdGuiRender::update_internals_per_act();
 
     // Quit Game
-    if (requestExit)
+    if (requestExit || requested_exit_code_by_script >= 0)
       quit_game(dargbox_get_exit_code());
     // !!! Alt+F4 or closing with X button will still exit with 0 code
   }
@@ -715,7 +724,6 @@ public:
   void beforeDrawScene(int /*realtime_elapsed_usec*/, float /*gametime_elapsed_sec*/) override
   {
     PictureManager::per_frame_update();
-    inputmonitor::notify_input_devices_used();
 
     if (darg_scene)
       darg_scene->mainThreadBeforeRender();
@@ -768,8 +776,6 @@ public:
 
     // initWebcache();
 
-    DagDbgMem::next_generation();
-
     loadScene();
   }
 
@@ -789,11 +795,11 @@ public:
 
         for (auto index : {StereoIndex::Left, StereoIndex::Right})
         {
-          d3d::set_render_target(vr::get_frame_target(index), 0);
+          d3d::set_render_target({}, DepthAccess::RW, {{vr::get_frame_target(index), 0, 0}});
           d3d::clearview(CLEAR_TARGET, E3DCOLOR(30, 40, 50), 0, 0);
         }
 
-        d3d::set_render_target(vr::get_gui_texture(), 0);
+        d3d::set_render_target({}, DepthAccess::RW, {{vr::get_gui_texture(), 0, 0}});
         d3d::clearview(CLEAR_TARGET, 0, 0, 0);
 
         renderUi();
@@ -945,9 +951,12 @@ static class ScriptConsole : public console::ICommandProcessor
     CONSOLE_CHECK_NAME("scripts", "hard_reload", 1, 1) { delayed_reload_scripts(true); }
     CONSOLE_CHECK_NAME("scripts", "soft_reload", 1, 1) { delayed_reload_scripts(false); }
     CONSOLE_CHECK_NAME("sq_memtrace", "reset_all", 1, 1) { sqmemtrace::reset_all(); }
-    CONSOLE_CHECK_NAME("sq_memtrace", "dump_all", 1, 2)
+    CONSOLE_CHECK_NAME_EX("sq_memtrace", "dump_all", 1, 3, "dumps script memory allocations with callstacks",
+      "<out_file_name> <first_n_records>")
     {
-      sqmemtrace::dump_all(argc > 1 ? console::to_int(argv[1]) : -1);
+      const char *fname = argc > 1 ? argv[1] : nullptr;
+      int firstNRecords = argc > 2 ? console::to_int(argv[2]) : -1;
+      sqmemtrace::dump_all(fname, firstNRecords);
       flush_debug_file();
     }
 
@@ -978,8 +987,9 @@ static void shutdown_sound() { gamelib::sound::finalize(); }
 static void das_init()
 {
   das::daScriptEnvironment::ensure();
-  (*das::daScriptEnvironment::bound)->das_def_tab_size = 2; // our coding style requires indenting of 2
+  das::daScriptEnvironment::getBound()->das_def_tab_size = 2; // our coding style requires indenting of 2
 
+  NEED_FUSION;
   NEED_MODULE(Module_BuiltIn);
   NEED_MODULE(Module_Math);
   NEED_MODULE(Module_Strings);

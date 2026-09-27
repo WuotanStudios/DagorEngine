@@ -68,13 +68,13 @@ public:
   {
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("DagorDataBlock"));
-    addEnumeration(das::make_smart<EnumerationConsoleModel>());
+    addEnumeration(new EnumerationConsoleModel());
     das::addExtern<DAS_BIND_FUN(fatal_func)>(*this, lib, "fatal", das::SideEffects::modifyExternal, "bind_dascript::fatal_func");
     das::addExtern<DAS_BIND_FUN(exit_func)>(*this, lib, "exit", das::SideEffects::modifyExternal, "bind_dascript::exit_func");
     das::addExtern<DAS_BIND_FUN(logmsg_func)>(*this, lib, "logmessage", das::SideEffects::modifyExternal,
       "bind_dascript::logmsg_func");
     das::addExtern<DAS_BIND_FUN(logerr_func)>(*this, lib, "logerr", das::SideEffects::modifyExternal, "bind_dascript::logerr_func")
-      ->annotations.push_back(annotation_declaration(das::make_smart<LogFmtHashFunctionAnnotation>()));
+      ->annotations.push_back(annotation_declaration(new LogFmtHashFunctionAnnotation()));
     das::addExtern<DAS_BIND_FUN(logerr_func_hash)>(*this, lib, "logerr", das::SideEffects::modifyExternal,
       "bind_dascript::logerr_func_hash");
     das::addExtern<DAS_BIND_FUN(logwarn_func)>(*this, lib, "logwarn", das::SideEffects::modifyExternal, "bind_dascript::logwarn_func");
@@ -101,6 +101,8 @@ public:
       "get_console_model_revision"); // although platform doesn't change in runtime, but AoT will generate one code
     das::addExtern<DAS_BIND_FUN(get_dagor_frame_no)>(*this, lib, "get_dagor_frame_no", das::SideEffects::accessExternal,
       "bind_dascript::get_dagor_frame_no");
+    das::addExtern<DAS_BIND_FUN(get_dagor_frames_presented)>(*this, lib, "get_dagor_frames_presented",
+      das::SideEffects::accessExternal, "bind_dascript::get_dagor_frames_presented");
     das::addExtern<DAS_BIND_FUN(get_dagor_game_act_time)>(*this, lib, "get_dagor_game_act_time", das::SideEffects::accessExternal,
       "bind_dascript::get_dagor_game_act_time");
     das::addExtern<DAS_BIND_FUN(clipboard::set_clipboard_ansi_text)>(*this, lib, "set_clipboard_ansi_text",
@@ -115,6 +117,9 @@ public:
       "::profile_time_usec");
     das::addExtern<DAS_BIND_FUN(get_DAGOR_DBGLEVEL)>(*this, lib, "get_DAGOR_DBGLEVEL", das::SideEffects::accessExternal,
       "bind_dascript::get_DAGOR_DBGLEVEL");
+    // not none: none allows const folding, and the AOT compiler platform may differ from the target platform
+    das::addExtern<DAS_BIND_FUN(get_TARGET_PC)>(*this, lib, "get_TARGET_PC", das::SideEffects::accessExternal,
+      "bind_dascript::get_TARGET_PC");
     das::addExtern<DAS_BIND_FUN(get_DAGOR_ADDRESS_SANITIZER)>(*this, lib, "get_DAGOR_ADDRESS_SANITIZER",
       das::SideEffects::accessExternal, "bind_dascript::get_DAGOR_ADDRESS_SANITIZER");
     das::addExtern<DAS_BIND_FUN(get_DAGOR_THREAD_SANITIZER)>(*this, lib, "get_DAGOR_THREAD_SANITIZER",

@@ -13,12 +13,13 @@ namespace drv3d_vulkan
 struct BackGraphicsStateStorage;
 struct FrontGraphicsStateStorage;
 struct BackDynamicGraphicsStateStorage;
+struct BackExtDynamicGraphicsStateStorage;
 struct BufferRef;
 class RenderPassClass;
 class VariatedGraphicsPipeline;
 class GraphicsPipeline;
 class GraphicsPipelineLayout;
-class ExecutionContext;
+class BEContext;
 
 // front fields
 
@@ -186,7 +187,7 @@ struct StateFieldGraphicsRenderPassClass : TrackedStateFieldBase<true, false>, T
 
 struct StateFieldGraphicsBasePipeline : TrackedStateFieldBase<true, false>, TrackedStateFieldGenericPtr<VariatedGraphicsPipeline>
 {
-  void resolveResourceBarriers(BackGraphicsStateStorage &storage, ExecutionContext &target);
+  void resolveResourceBarriers(BackGraphicsStateStorage &storage, BEContext &target);
 
   VULKAN_TRACKED_STATE_FIELD_CB_NON_CONST_DEFENITIONS();
 };
@@ -215,12 +216,7 @@ struct StateFieldGraphicsPipeline : TrackedStateFieldBase<true, false>
 
   VULKAN_TRACKED_STATE_FIELD_CB_NON_CONST_DEFENITIONS();
 
-  void set(Invalidate)
-  {
-    if (ptr)
-      oldPtr = ptr;
-    ptr = nullptr;
-  }
+  void set(Invalidate) { ptr = nullptr; }
   bool diff(Invalidate) { return true; }
 
   void set(FullInvalidate)
@@ -229,13 +225,6 @@ struct StateFieldGraphicsPipeline : TrackedStateFieldBase<true, false>
     oldPtr = nullptr;
   }
   bool diff(FullInvalidate) { return true; }
-
-  void set(GraphicsPipeline *value)
-  {
-    oldPtr = ptr;
-    ptr = value;
-  }
-  bool diff(GraphicsPipeline *value) const { return ptr != value; }
 };
 
 struct StateFieldGraphicsFramebuffer : TrackedStateFieldBase<true, false>,
@@ -354,6 +343,62 @@ struct StateFieldGraphicsStencilRefOverride : TrackedStateFieldBase<true, false>
 
 struct StateFieldGraphicsStencilMask : TrackedStateFieldBase<true, false>, TrackedStateFieldGenericSmallPOD<uint16_t>
 {
+  VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
+};
+
+// VK_EXT_extended_dynamic_state driven fields, applied post pipe bind and only when the device
+// supports the extension (see BackExtDynamicGraphicsState). Their values are sourced from the render
+// state dynamic part; when the ext is unavailable they stay baked into the pipeline static state.
+
+// raw dagor cull value: 0 none, 1 cw, 2 ccw (mapped to VkCullModeFlags on apply, matching pipeline)
+struct StateFieldGraphicsExtCullMode : TrackedStateFieldBase<true, false>, TrackedStateFieldGenericSmallPOD<uint8_t>
+{
+  VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
+};
+
+struct StateFieldGraphicsExtDepthTest : TrackedStateFieldBase<true, false>
+{
+  struct DataType
+  {
+    uint8_t testEnable;
+    uint8_t func; // VkCompareOp
+  };
+
+  DataType data;
+
+  void reset(BackExtDynamicGraphicsStateStorage &) { data = {}; }
+  void set(const DataType &val) { data = val; }
+  bool diff(const DataType &val) { return data.testEnable != val.testEnable || data.func != val.func; }
+
+  VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
+};
+
+struct StateFieldGraphicsExtDepthBoundsTestEnable : TrackedStateFieldBase<true, false>, TrackedStateFieldGenericSmallPOD<uint8_t>
+{
+  VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
+};
+
+struct StateFieldGraphicsExtStencilTest : TrackedStateFieldBase<true, false>
+{
+  struct DataType
+  {
+    uint8_t testEnable;
+    uint8_t failOp;      // VkStencilOp
+    uint8_t passOp;      // VkStencilOp
+    uint8_t depthFailOp; // VkStencilOp
+    uint8_t compareOp;   // VkCompareOp
+  };
+
+  DataType data;
+
+  void reset(BackExtDynamicGraphicsStateStorage &) { data = {}; }
+  void set(const DataType &val) { data = val; }
+  bool diff(const DataType &val)
+  {
+    return data.testEnable != val.testEnable || data.failOp != val.failOp || data.passOp != val.passOp ||
+           data.depthFailOp != val.depthFailOp || data.compareOp != val.compareOp;
+  }
+
   VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
 };
 
@@ -549,9 +594,8 @@ struct StateFieldGraphicsFlush : TrackedStateFieldBase<false, false>
   bool diff(uint32_t) { return true; }
   const bool &getValueRO() const { return needPipeline; }
 
-  void applyDescriptors(BackGraphicsStateStorage &state, ExecutionContext &target) const;
-  void applyBarriers(BackGraphicsStateStorage &state, ExecutionContext &target) const;
-  void syncTLayoutsToRenderPass(BackGraphicsStateStorage &state, ExecutionContext &target) const;
+  void applyDescriptors(BackGraphicsStateStorage &state, BEContext &target) const;
+  void syncTLayoutsToRenderPass(BackGraphicsStateStorage &state, BEContext &target) const;
 
   VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
 };
@@ -624,6 +668,23 @@ struct StateFieldGraphicsQueryScopeCloser : TrackedStateFieldBase<true, false>
 struct StateFieldGraphicsRenderPassArea : TrackedStateFieldBase<true, false>, TrackedStateFieldGenericPOD<VkRect2D>
 {
   const VkRect2D &getValueRO() const { return data; };
+  VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
+};
+
+struct StateFieldGraphicsShadingRate : TrackedStateFieldBase<true, false>, TrackedStateFieldGenericPOD<uint32_t>
+{
+  static uint32_t encode(uint8_t x, uint8_t y, uint8_t vcombiner, uint8_t pcombiner)
+  {
+    return (x << 24) | (y << 16) | (vcombiner << 8) | pcombiner;
+  }
+  // 1x1 KEEP KEEP -- equals to default or disabled shading rate
+  static constexpr uint32_t default_shading_rate = 1 << 24 | 1 << 16;
+  bool isDefault() const { return data == default_shading_rate || data == 0; }
+
+  VkExtent2D getFragmentSize() const { return data ? VkExtent2D{(data >> 24) & 0xFF, (data >> 16) & 0xFF} : VkExtent2D{1, 1}; }
+  VkFragmentShadingRateCombinerOpKHR getCombinerV() const { return VkFragmentShadingRateCombinerOpKHR((data >> 8) & 0xFF); }
+  VkFragmentShadingRateCombinerOpKHR getCombinerP() const { return VkFragmentShadingRateCombinerOpKHR(data & 0xFF); }
+
   VULKAN_TRACKED_STATE_FIELD_CB_DEFENITIONS();
 };
 

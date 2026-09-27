@@ -23,6 +23,10 @@
       "das::das_call_member<" #SIGNATURE ", &" #CLASS_NAME "::" #FUNC_NAME ">::invoke"); \
   }
 
+
+DAS_BASE_BIND_ENUM(darg::InputDevice, InputDevice, DEVID_NONE, DEVID_KEYBOARD, DEVID_MOUSE, DEVID_JOYSTICK, DEVID_TOUCH, DEVID_VR,
+  DEVID_MOUSE_AXIS, DEVID_JOYSTICK_AXIS)
+
 namespace darg
 {
 
@@ -45,12 +49,28 @@ struct ElemRenderDataAnnotation : das::ManagedStructureAnnotation<::darg::ElemRe
 
 struct ElementAnnotation : das::ManagedStructureAnnotation<::darg::Element>
 {
-  ElementAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("Element", ml, "::darg::Element") { ADD_FIELD(props); }
+  ElementAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("Element", ml, "::darg::Element")
+  {
+    ADD_FIELD(props);
+    ADD_FIELD(screenCoord);
+  }
 };
 
 struct PropertiesAnnotation : das::ManagedStructureAnnotation<::darg::Properties>
 {
   PropertiesAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("Properties", ml, "::darg::Properties") {}
+};
+
+struct ScreenCoordAnnotation : das::ManagedStructureAnnotation<::darg::ScreenCoord>
+{
+  ScreenCoordAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("ScreenCoord", ml, "::darg::ScreenCoord")
+  {
+    ADD_FIELD(relPos);
+    ADD_FIELD(screenPos);
+    ADD_FIELD(size);
+    ADD_FIELD(contentSize);
+    ADD_FIELD(scrollOffs);
+  }
 };
 
 struct PictureAnnotation : das::ManagedStructureAnnotation<::darg::Picture>
@@ -101,27 +121,31 @@ public:
     addBuiltinDependency(lib, require("DagorStdGuiRender"));
     addBuiltinDependency(lib, require("DagorDataBlock"));
 
-    addAnnotation(das::make_smart<ElemRenderDataAnnotation>(lib));
-    addAnnotation(das::make_smart<RenderStateAnnotation>(lib));
-    addAnnotation(das::make_smart<PropertiesAnnotation>(lib));
-    addAnnotation(das::make_smart<ElementAnnotation>(lib));
-    addAnnotation(das::make_smart<PictureAnnotation>(lib));
+    addEnumeration(new EnumerationInputDevice());
+
+    addAnnotation(new ElemRenderDataAnnotation(lib));
+    addAnnotation(new RenderStateAnnotation(lib));
+    addAnnotation(new PropertiesAnnotation(lib));
+    addAnnotation(new ScreenCoordAnnotation(lib));
+    addAnnotation(new ElementAnnotation(lib));
+    addAnnotation(new PictureAnnotation(lib));
 
 
     // Properties
 
-    das::addExtern<DAS_BIND_FUN(props_get_int)>(*this, lib, "getInt", das::SideEffects::none, "::darg::props_get_int");
-    das::addExtern<DAS_BIND_FUN(props_get_float)>(*this, lib, "getFloat", das::SideEffects::none, "::darg::props_get_float");
-    das::addExtern<DAS_BIND_FUN(props_get_bool)>(*this, lib, "getBool", das::SideEffects::none, "::darg::props_get_bool");
-    das::addExtern<DAS_BIND_FUN(props_get_color)>(*this, lib, "getColor", das::SideEffects::none, "::darg::props_get_color");
-    das::addExtern<DAS_BIND_FUN(props_get_picture)>(*this, lib, "getPicture", das::SideEffects::none, "::darg::props_get_picture");
-    das::addExtern<DAS_BIND_FUN(props_get_blk)>(*this, lib, "getBlk", das::SideEffects::none, "::darg::props_get_blk");
+    das::addExtern<DAS_BIND_FUN(props_get_int)>(*this, lib, "getInt", das::SideEffects::accessExternal, "::darg::props_get_int");
+    das::addExtern<DAS_BIND_FUN(props_get_float)>(*this, lib, "getFloat", das::SideEffects::accessExternal, "::darg::props_get_float");
+    das::addExtern<DAS_BIND_FUN(props_get_bool)>(*this, lib, "getBool", das::SideEffects::accessExternal, "::darg::props_get_bool");
+    das::addExtern<DAS_BIND_FUN(props_get_color)>(*this, lib, "getColor", das::SideEffects::accessExternal, "::darg::props_get_color");
+    das::addExtern<DAS_BIND_FUN(props_get_picture)>(*this, lib, "getPicture", das::SideEffects::accessExternal,
+      "::darg::props_get_picture");
+    das::addExtern<DAS_BIND_FUN(props_get_blk)>(*this, lib, "getBlk", das::SideEffects::accessExternal, "::darg::props_get_blk");
     das::addExtern<void (*)(StdGuiRender::GuiContext &, Picture *, Point2, Point2, E3DCOLOR), ::darg::render_picture>(*this, lib,
       "render_picture", das::SideEffects::modifyExternal, "::darg::render_picture");
     das::addExtern<void (*)(StdGuiRender::GuiContext &, Picture *, Point2, Point2, E3DCOLOR, float, float, bool, bool, float),
       ::darg::render_picture>(*this, lib, "render_picture", das::SideEffects::modifyExternal, "::darg::render_picture");
-    BIND_MEMBER(::darg::Properties, getFontId, "getFontId", das::SideEffects::none);
-    BIND_MEMBER(::darg::Properties, getFontSize, "getFontSize", das::SideEffects::none);
+    BIND_MEMBER(::darg::Properties, getFontId, "getFontId", das::SideEffects::accessExternal);
+    BIND_MEMBER(::darg::Properties, getFontSize, "getFontSize", das::SideEffects::accessExternal);
 
     verifyAotReady();
   }

@@ -4,7 +4,13 @@
 #include "input/globInput.h"
 #include "input/uiInput.h"
 #include "input/touchInput.h"
-#include <ecs/core/entitySystem.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/ecsQuery.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/entityComponent.h>
+#include <daECS/core/entityManager.h>
 
 ECS_DEF_PULL_VAR(input);
 size_t framework_input_pulls = 0;
@@ -23,6 +29,7 @@ void controls::process_input(double) {}
 void controls::destroy() {}
 void controls::global_init() {}
 void controls::global_destroy() {}
+void controls::check_system_keys() {}
 
 void uiinput::mask_dainput_buttons(dag::ConstSpan<darg::HotkeyButton>, bool, int) {}
 void uiinput::mask_dainput_pointers(int, int) {}

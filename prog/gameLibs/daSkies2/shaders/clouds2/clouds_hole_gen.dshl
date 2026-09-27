@@ -8,7 +8,8 @@ buffer clouds_hole_buf;
 float clouds_hole_density;
 
 macro USE_CLOUDS_HOLE(stage)
-  (stage) {clouds_shadows_volume@smp = clouds_shadows_volume hlsl {Texture3D<float2> clouds_shadows_volume@smp; }}
+  (stage) {clouds_shadows_volume@tex = clouds_shadows_volume hlsl {Texture3D<float2> clouds_shadows_volume@tex; }}
+  (stage) {clouds_shadows_volume_samplerstate@sampler = clouds_shadows_volume_samplerstate;}
   (stage) {clouds_hole_density@f1 = (clouds_hole_density);}
   hlsl(stage) {
     #include <cloud_settings.hlsli>
@@ -53,10 +54,13 @@ endmacro
 shader clouds_hole_cs
 {
   USE_CLOUDS_HOLE(cs)
-  ENABLE_ASSERT(cs)
+  (cs) {
+    holePosition@uav : register(0) hlsl {
+      RWStructuredBuffer<uint> holePosition@uav; //layer's opaque pixels count
+    }
+  }
   hlsl(cs) {
     groupshared uint thread_result[8*8];
-    RWStructuredBuffer<uint> holePosition : register(u0);//layer's opaque pixels count
     [numthreads(8, 8, 1)]
     void clouds_hole_cs(uint2 dtid : SV_DispatchThreadID, uint flatIdx : SV_GroupIndex)
     {
@@ -148,15 +152,17 @@ endmacro
 shader clouds_hole_pos_cs
 {
   USE_CLOUDS_HOLE_POS(cs)
-  ENABLE_ASSERT(cs)
-  (cs) { clouds_hole_buf@buf = clouds_hole_buf hlsl
-  {
-    StructuredBuffer<int> clouds_hole_buf@buf;
-  }}
+  (cs) {
+    clouds_hole_buf@buf = clouds_hole_buf hlsl
+    {
+      StructuredBuffer<int> clouds_hole_buf@buf;
+    }
+    holePosition@uav : register(0) hlsl {
+      RWTexture2D<float4> holePosition@uav;
+    }
+  }
   hlsl(cs)
   {
-    RWTexture2D<float4> holePosition : register(u0);
-
     [numthreads(1, 1, 1)]
     void clouds_hole_pos_cs()
     {
@@ -209,7 +215,12 @@ shader clouds_hole_pos_ps
 }
 /*shader clouds_hole_offset
 {
-  (cs) {clouds_shadows_volume@smp3d = clouds_shadows_volume;}
+  (cs) {
+    clouds_shadows_volume@smp3d = clouds_shadows_volume;
+    holePosition@uav : register(0) hlsl {
+      RWStructuredBuffer<uint> holePosition@uav; //layer's opaque pixels count
+    }
+  }
   hlsl(cs) {
     float downsampledShadow(uint2 dtid, float inv_res)
     {
@@ -228,7 +239,6 @@ shader clouds_hole_pos_ps
     #define LEN_SHIFT (2*COORD_BITS)
     #define LEN_BITS (32 - LEN_SHIFT - SHADOW_BITS)
     groupshared uint thread_result[8*8];
-    RWStructuredBuffer<uint> holePosition : register(u0);//layer's opaque pixels count
     [numthreads(8, 8, 1)]
     void cs_main(uint2 dtid : SV_DispatchThreadID, uint flatIdx : SV_GroupIndex)
     {

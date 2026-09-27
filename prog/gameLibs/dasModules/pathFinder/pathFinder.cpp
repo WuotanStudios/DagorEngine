@@ -36,7 +36,7 @@ struct FindRequestAnnotation : das::ManagedStructureAnnotation<pathfinder::FindR
     addField<DAS_BIND_MANAGED_FIELD(startPoly)>("startPoly");
     addField<DAS_BIND_MANAGED_FIELD(endPoly)>("endPoly");
     addField<DAS_BIND_MANAGED_FIELD(numPolys)>("numPolys");
-    addField<DAS_BIND_MANAGED_FIELD(areasCost)>("areasCost");
+    // areasCost is a framemem container das has no type for, scripts fill it with find_request_add_area_cost
   }
 };
 
@@ -54,7 +54,7 @@ struct CorridorInputAnnotation : das::ManagedStructureAnnotation<pathfinder::Cor
     addField<DAS_BIND_MANAGED_FIELD(targetPoly)>("targetPoly");
     addField<DAS_BIND_MANAGED_FIELD(extents)>("extents");
     addField<DAS_BIND_MANAGED_FIELD(maxJumpUpHeight)>("maxJumpUpHeight");
-    addField<DAS_BIND_MANAGED_FIELD(areasCost)>("areasCost");
+    // areasCost is a framemem container das has no type for, scripts fill it with corridor_input_add_area_cost
   }
 };
 
@@ -104,20 +104,20 @@ public:
     addBuiltinDependency(lib, require("math"));
     addBuiltinDependency(lib, require("DagorMath"));
     G_STATIC_ASSERT(sizeof(dtPolyRef) == sizeof(uint64_t));
-    auto pType = das::make_smart<das::TypeDecl>(das::Type::tUInt64);
+    auto pType = new das::TypeDecl(das::Type::tUInt64);
     pType->alias = "dtPolyRef";
     addAlias(pType);
 
-    addEnumeration(das::make_smart<EnumerationFindPathResult>());
-    addEnumeration(das::make_smart<EnumerationPolyFlag>());
+    addEnumeration(new EnumerationFindPathResult());
+    addEnumeration(new EnumerationPolyFlag());
     das::addEnumFlagOps<pathfinder::PolyFlag>(*this, lib, "pathfinder::PolyFlag");
-    addEnumeration(das::make_smart<EnumerationStraightPathFlags>());
-    addAnnotation(das::make_smart<CustomNavAnnotation>(lib));
-    addAnnotation(das::make_smart<FindRequestAnnotation>(lib));
-    addAnnotation(das::make_smart<CorridorInputAnnotation>(lib));
-    addAnnotation(das::make_smart<DtPathCorridorAnnotation>(lib));
-    addAnnotation(das::make_smart<NavMeshTriangleAnnotation>(lib));
-    addAnnotation(das::make_smart<FindCornersResultAnnotation>(lib));
+    addEnumeration(new EnumerationStraightPathFlags());
+    addAnnotation(new CustomNavAnnotation(lib));
+    addAnnotation(new FindRequestAnnotation(lib));
+    addAnnotation(new CorridorInputAnnotation(lib));
+    addAnnotation(new DtPathCorridorAnnotation(lib));
+    addAnnotation(new NavMeshTriangleAnnotation(lib));
+    addAnnotation(new FindCornersResultAnnotation(lib));
 
     das::addExtern<DAS_BIND_FUN(find_path_req)>(*this, lib, "find_path", das::SideEffects::modifyArgumentAndAccessExternal,
       "bind_dascript::find_path_req");
@@ -178,10 +178,15 @@ public:
     das::addExtern<DAS_BIND_FUN(pathfinder::corridor_moveOverOffmeshConnection)>(*this, lib, "corridor_moveOverOffmeshConnection",
       das::SideEffects::modifyArgumentAndAccessExternal, "pathfinder::corridor_moveOverOffmeshConnection");
 
+    // NOTE: Here 'avoid_obstacles' means first try without ignoring obstacles and only them try to ignore them
+    das::addExtern<DAS_BIND_FUN(project_to_nearest_navmesh_point_avoid_obstacles_3d)>(*this, lib,
+      "project_to_nearest_navmesh_point_avoid_obstacles", das::SideEffects::modifyArgumentAndAccessExternal,
+      "bind_dascript::project_to_nearest_navmesh_point_avoid_obstacles_3d");
+
+    // NOTE: Here 'no_obstacles' means IGNORING obstacles
     das::addExtern<DAS_BIND_FUN(project_to_nearest_navmesh_point_no_obstacles_3d)>(*this, lib,
       "project_to_nearest_navmesh_point_no_obstacles", das::SideEffects::modifyArgumentAndAccessExternal,
       "bind_dascript::project_to_nearest_navmesh_point_no_obstacles_3d");
-
     das::addExtern<DAS_BIND_FUN(project_to_nearest_navmesh_point_no_obstacles_3d_ex)>(*this, lib,
       "project_to_nearest_navmesh_point_no_obstacles_ex", das::SideEffects::modifyArgumentAndAccessExternal,
       "bind_dascript::project_to_nearest_navmesh_point_no_obstacles_3d_ex");
@@ -198,13 +203,16 @@ public:
     das::addExtern<float (*)(const Point3 &pos, float horz_extents, float search_rad, const pathfinder::CustomNav *custom_nav),
       pathfinder::get_distance_to_wall>(*this, lib, "get_distance_to_wall", das::SideEffects::accessExternal,
       "::pathfinder::get_distance_to_wall")
-      ->arg_init(3 /*custom_nav*/, das::make_smart<das::ExprConstPtr>());
+      ->arg_init(3 /*custom_nav*/, new das::ExprConstPtr());
 
     das::addExtern<float (*)(const Point3 &pos, float horz_extents, float search_rad, Point3 &hit_norm,
                      const pathfinder::CustomNav *custom_nav),
       pathfinder::get_distance_to_wall>(*this, lib, "get_distance_to_wall", das::SideEffects::modifyArgument,
       "::pathfinder::get_distance_to_wall")
-      ->arg_init(4 /*custom_nav*/, das::make_smart<das::ExprConstPtr>());
+      ->arg_init(4 /*custom_nav*/, new das::ExprConstPtr());
+
+    das::addExtern<DAS_BIND_FUN(pathfinder::is_navmesh_position_suitable_ex)>(*this, lib, "is_navmesh_position_suitable_ex",
+      das::SideEffects::accessExternal, "pathfinder::is_navmesh_position_suitable_ex");
 
     das::addExtern<DAS_BIND_FUN(pathfinder::isLoaded)>(*this, lib, "pathfinder_is_loaded", das::SideEffects::accessExternal,
       "::pathfinder::isLoaded");
@@ -224,6 +232,8 @@ public:
 
     das::addExtern<DAS_BIND_FUN(pathfinder::tilecache_is_blocking)>(*this, lib, "tilecache_is_blocking",
       das::SideEffects::accessExternal, "::pathfinder::tilecache_is_blocking");
+    das::addExtern<DAS_BIND_FUN(pathfinder::tilecache_get_obstacle_handle)>(*this, lib, "tilecache_get_obstacle_handle",
+      das::SideEffects::accessExternal, "::pathfinder::tilecache_get_obstacle_handle");
     das::addExtern<DAS_BIND_FUN(pathfinder::tilecache_is_working)>(*this, lib, "tilecache_is_working",
       das::SideEffects::accessExternal, "::pathfinder::tilecache_is_working");
 
@@ -253,6 +263,9 @@ public:
     das::addExtern<DAS_BIND_FUN(pathfinder::change_navpolys_flags_all)>(*this, lib, "change_navpolys_flags_all",
       das::SideEffects::modifyExternal, "pathfinder::change_navpolys_flags_all");
 
+    das::addExtern<DAS_BIND_FUN(pathfinder::override_weights_ex)>(*this, lib, "override_pathfinder_weights_ex",
+      das::SideEffects::modifyExternal, "pathfinder::override_weights_ex");
+
     das::addExtern<DAS_BIND_FUN(pathfinder::is_loaded_ex)>(*this, lib, "pathfinder_is_loaded_ex", das::SideEffects::accessExternal,
       "::pathfinder::is_loaded_ex");
 
@@ -278,33 +291,6 @@ public:
     das::addExtern<DAS_BIND_FUN(pathfinder::get_poly_flags_ex)>(*this, lib, "get_poly_flags_ex", das::SideEffects::modifyArgument,
       "pathfinder::get_poly_flags_ex");
 
-    das::addExtern<DAS_BIND_FUN(pathfinder::rebuildNavMesh_init)>(*this, lib, "rebuildNavMesh_init", das::SideEffects::modifyExternal,
-      "pathfinder::rebuildNavMesh_init");
-
-    das::addExtern<void (*)(const char *, float), &pathfinder::rebuildNavMesh_setup>(*this, lib, "rebuildNavMesh_setup",
-      das::SideEffects::modifyExternal, "pathfinder::rebuildNavMesh_setup");
-
-    das::addExtern<void (*)(const char *, const Point2 &), &pathfinder::rebuildNavMesh_setup>(*this, lib, "rebuildNavMesh_setup",
-      das::SideEffects::modifyExternal, "pathfinder::rebuildNavMesh_setup");
-
-    das::addExtern<DAS_BIND_FUN(pathfinder::rebuildNavMesh_addBBox)>(*this, lib, "rebuildNavMesh_addBBox",
-      das::SideEffects::modifyExternal, "pathfinder::rebuildNavMesh_addBBox");
-
-    das::addExtern<DAS_BIND_FUN(pathfinder::rebuildNavMesh_update)>(*this, lib, "rebuildNavMesh_update",
-      das::SideEffects::modifyExternal, "pathfinder::rebuildNavMesh_update");
-
-    das::addExtern<DAS_BIND_FUN(pathfinder::rebuildNavMesh_getProgress)>(*this, lib, "rebuildNavMesh_getProgress",
-      das::SideEffects::modifyExternal, "pathfinder::rebuildNavMesh_getProgress");
-
-    das::addExtern<DAS_BIND_FUN(pathfinder::rebuildNavMesh_getTotalTiles)>(*this, lib, "rebuildNavMesh_getTotalTiles",
-      das::SideEffects::modifyExternal, "pathfinder::rebuildNavMesh_getTotalTiles");
-
-    das::addExtern<DAS_BIND_FUN(pathfinder::rebuildNavMesh_saveToFile)>(*this, lib, "rebuildNavMesh_saveToFile",
-      das::SideEffects::modifyExternal, "pathfinder::rebuildNavMesh_saveToFile");
-
-    das::addExtern<DAS_BIND_FUN(pathfinder::rebuildNavMesh_close)>(*this, lib, "rebuildNavMesh_close",
-      das::SideEffects::modifyExternal, "pathfinder::rebuildNavMesh_close");
-
     das::addExtern<DAS_BIND_FUN(tilecache_obstacle_move)>(*this, lib, "tilecache_obstacle_move", das::SideEffects::modifyExternal,
       "bind_dascript::tilecache_obstacle_move");
     das::addExtern<DAS_BIND_FUN(tilecache_obstacle_move_with_type)>(*this, lib, "tilecache_obstacle_move",
@@ -324,6 +310,9 @@ public:
 
     das::addExtern<DAS_BIND_FUN(query_navmesh_projections_with_polys)>(*this, lib, "query_navmesh_projections",
       das::SideEffects::accessExternal, "bind_dascript::query_navmesh_projections_with_polys");
+
+    das::addExtern<DAS_BIND_FUN(query_navmesh_polys)>(*this, lib, "query_navmesh_polys",
+      das::SideEffects::modifyArgumentAndAccessExternal, "bind_dascript::query_navmesh_polys");
 
     das::addExtern<DAS_BIND_FUN(pathfinder::init_path_corridor)>(*this, lib, "init_path_corridor",
       das::SideEffects::modifyArgumentAndExternal, "pathfinder::init_path_corridor");
@@ -429,6 +418,24 @@ public:
 
     das::addExtern<DAS_BIND_FUN(bind_dascript::for_each_nmesh_poly)>(*this, lib, "for_each_nmesh_poly",
       das::SideEffects::accessExternal, "bind_dascript::for_each_nmesh_poly");
+
+    das::addExtern<DAS_BIND_FUN(bind_dascript::for_each_poly_triangle)>(*this, lib, "for_each_poly_triangle",
+      das::SideEffects::accessExternal, "bind_dascript::for_each_poly_triangle");
+
+    das::addExtern<DAS_BIND_FUN(bind_dascript::get_poly_detail_triangle_count)>(*this, lib, "get_poly_detail_triangle_count",
+      das::SideEffects::accessExternal, "bind_dascript::get_poly_detail_triangle_count");
+
+    das::addExtern<DAS_BIND_FUN(bind_dascript::get_poly_detail_triangle)>(*this, lib, "get_poly_detail_triangle",
+      das::SideEffects::modifyArgumentAndAccessExternal, "bind_dascript::get_poly_detail_triangle");
+
+    das::addExtern<DAS_BIND_FUN(bind_dascript::for_each_poly_vertex)>(*this, lib, "for_each_poly_vertex",
+      das::SideEffects::accessExternal, "bind_dascript::for_each_poly_vertex");
+
+    das::addExtern<DAS_BIND_FUN(bind_dascript::get_poly_vertex_count)>(*this, lib, "get_poly_vertex_count",
+      das::SideEffects::accessExternal, "bind_dascript::get_poly_vertex_count");
+
+    das::addExtern<DAS_BIND_FUN(bind_dascript::get_poly_vertex)>(*this, lib, "get_poly_vertex",
+      das::SideEffects::modifyArgumentAndAccessExternal, "bind_dascript::get_poly_vertex");
 
     das::addUsing<dtPathCorridor>(*this, lib, " ::dtPathCorridor");
 

@@ -40,7 +40,7 @@ private:
   PostFxRenderer iesGenerator;
   IPoint3 currentResolution = IPoint3(0, 0, 0);
   UniqueTex dynamicIesTexArray;
-  UniqueBufHolder sortedPhotometryControlPointsBuf;
+  UniqueBufWithShaderVar sortedPhotometryControlPointsBuf;
   eastl::string originalTextureName;
   eastl::vector<PhotometryControlPoint> sortedPhotometryControlPoints;
   bool needsRender = true;
@@ -77,9 +77,9 @@ public:
   int getTextureIdx(const char *name);
   void gatherAndReloadTextures();
   void reloadTextures();
-  void addTexture(const char *textureName);
+  int addTexture(const char *texture_name);
   void close();
-  PhotometryData getTextureData(int tex_idx) const;
+  PhotometryData getTextureData(int tex_id) const;
   TEXTUREID getTextureArrayId();
 
   IesEditor *requireEditor();

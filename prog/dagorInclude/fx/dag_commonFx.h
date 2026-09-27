@@ -5,6 +5,7 @@
 #pragma once
 
 void register_light_fx_factory();
+void register_outdatedFx_factory(bool enabled);
 void register_dafx_sparks_factory();
 void register_dafx_modfx_factory();
 void register_dafx_compound_factory();
@@ -36,6 +37,7 @@ enum FxErrorType
 namespace acesfx
 {
 struct StartFxParams;
+struct FXSoundInitParams; // defined in fx/fx.h (skyquake-specific)
 enum class PrefetchType : int
 {
   DEFAULT = 0,

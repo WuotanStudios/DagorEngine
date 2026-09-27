@@ -3,6 +3,7 @@
 
 #include <winGuiWrapper/wgw_timer.h>
 #include <libTools/util/hdpiUtil.h>
+#include <Scintilla.h>
 
 class DataBlock;
 class SimpleString;
@@ -50,7 +51,7 @@ protected:
   void update() override;
 
   void initScintilla();
-  int sendEditor(unsigned Msg, uintptr_t wParam = 0, intptr_t lParam = 0);
+  sptr_t sendEditor(unsigned Msg, uintptr_t wParam = 0, intptr_t lParam = 0);
   void setAStyle(int style, unsigned long fore, unsigned long back = 0xFFFFFF, int size = -1, const char *face = 0);
   void setupScintilla();
   void onEditorChange();
@@ -60,9 +61,11 @@ protected:
   void *hwndScParent;
   void *mParentHandle;
 
-  static void *sciLexerDll;
+  static void *scintillaDll;
+  static void *lexillaDll;
   ScintillaEH *eventHandler;
   unsigned long lastSetTime;
   bool needCallModify;
   WinTimer *updateTimer;
+  void *lexer;
 };

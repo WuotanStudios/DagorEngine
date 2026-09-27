@@ -8,7 +8,7 @@ namespace das {
 
 template <> struct typeFactory<ax::NodeEditor::NodeId> {
 	static TypeDeclPtr make(const ModuleLibrary &) {
-		auto t = make_smart<TypeDecl>(Type::tInt);
+		auto t = new TypeDecl(Type::tInt);
 		t->alias = "ax::NodeEditor::NodeId";
 		t->aotAlias = true;
 		return t;
@@ -31,7 +31,7 @@ template <> struct cast_res<ax::NodeEditor::NodeId> {
 
 template <> struct typeFactory<ax::NodeEditor::PinId> {
 	static TypeDeclPtr make(const ModuleLibrary &) {
-		auto t = make_smart<TypeDecl>(Type::tInt);
+		auto t = new TypeDecl(Type::tInt);
 		t->alias = "ax::NodeEditor::PinId";
 		t->aotAlias = true;
 		return t;
@@ -54,7 +54,7 @@ template <> struct cast_res<ax::NodeEditor::PinId> {
 
 template <> struct typeFactory<ax::NodeEditor::LinkId> {
 	static TypeDeclPtr make(const ModuleLibrary &) {
-		auto t = make_smart<TypeDecl>(Type::tInt);
+		auto t = new TypeDecl(Type::tInt);
 		t->alias = "ax::NodeEditor::LinkId";
 		t->aotAlias = true;
 		return t;
@@ -91,20 +91,12 @@ struct imgui_node_editorTempFn {
             }
         }
 
-        bool anyString = false;
         for ( auto &arg : fn->arguments ) {
-            if ( arg->type->constant && arg->type->ref && arg->type->dim.size() == 0 ) {
+            if ( arg->type->constant && arg->type->ref && !arg->type->isFixedArray() ) {
                 if ( arg->type->baseType == Type::tFloat2 || arg->type->baseType == Type::tFloat4 ) {
                     arg->type->ref = false;
                 }
             }
-            if ( arg->type->isString() && !arg->type->ref ) {
-                anyString = true;
-            }
-        }
-
-        if (anyString) {
-            fn->needStringCast = true;
         }
 
         return true;

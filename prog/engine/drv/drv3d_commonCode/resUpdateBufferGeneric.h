@@ -2,6 +2,7 @@
 #pragma once
 
 #include <drv/3d/dag_resUpdateBuffer.h>
+#include "validation.h"
 
 namespace rubgeneric
 {

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <EditorCore/ec_interface.h>
+#include <EditorCore/ec_wndPublic.h>
 #include <oldEditor/de_interface.h>
 #include <oldEditor/de_common_interface.h>
 #include <oldEditor/de_collision.h>
@@ -16,6 +17,7 @@ class BinSceneViewPlugin : public IGenEditorPlugin,
                            public IRenderingService,
                            public IPluginAutoSave,
                            public PropPanel::ControlEventHandler,
+                           public IWndManagerWindowHandler,
                            public ILevelBinLoader,
                            public IEnvironmentSettings,
                            public IDagorEdCustomCollider
@@ -41,6 +43,8 @@ public:
   void unregistered() override;
   void beforeMainLoop() override {}
 
+  void registerEditorCommands(IEditorCommandSystem &command_system) override;
+  void registerMenuAccelerators() override;
   bool begin(int toolbar_id, unsigned menu_id) override;
   bool end() override;
   void onNewProject() override {}
@@ -56,11 +60,13 @@ public:
   void loadObjects(const DataBlock &blk, const DataBlock &local_data, const char *base_path) override;
   void selectAll() override {}
   void deselectAll() override {}
+  void invertSelection() override {}
 
   void actObjects(float dt) override;
   void beforeRenderObjects(IGenViewportWnd *vp) override;
   void renderObjects() override;
   void renderTransObjects() override;
+  void updateImgui() override;
 
   void *queryInterfacePtr(unsigned huid) override;
 
@@ -68,11 +74,18 @@ public:
 
   bool catchEvent(unsigned ev_huid, void *userData) override;
 
+  void onBeforeReset3dDevice() override;
+
   // IRenderingService
   void renderGeometry(Stage stage) override;
 
   // ControlEventHandler
+  void onChange(int pcb_id, PropPanel::ContainerPropertyControl *panel) override;
   void onClick(int pcb_id, PropPanel::ContainerPropertyControl *panel) override;
+
+  // IWndManagerWindowHandler
+  void *onWmCreateWindow(int type) override;
+  bool onWmDestroyWindow(void *window) override;
 
   // IPluginAutoSave
   void autoSaveObjects(DataBlock &local_data) override;
@@ -83,7 +96,6 @@ public:
 
   // IDagorEdCustomCollider
   bool traceRay(const Point3 &p, const Point3 &dir, real &maxt, Point3 *norm) override;
-  bool shadowRayHitTest(const Point3 &p, const Point3 &dir, real maxt) override;
   const char *getColliderName() const override { return "Binary scene view plugin"; }
   bool isColliderVisible() const override { return getVisible(); }
 
@@ -97,6 +109,13 @@ public:
   AcesScene *getScene() { return streamingScene; };
 
 private:
+  void showPanel();
+  void fillPanel();
+
+  void fillToolbar();
+
+  bool loadScene(const char *streaming_folder);
+
   bool isVisible;
   bool isDebugVisible;
   bool showSplines;
@@ -111,8 +130,9 @@ private:
   DataBlock strmBlk;
   AcesScene *streamingScene;
   int toolBarId;
-
-  bool loadScene(const char *streaming_folder);
+  PropPanel::PanelWindowPropertyControl *propPanel = nullptr;
+  DataBlock mainPanelState;
+  bool propPanelVisible = true;
 };
 
 static BinSceneViewPlugin *plugin = NULL;

@@ -16,8 +16,7 @@
   VAR(screen_droplets_intensity) \
   VAR(screen_droplets_has_leaks) \
   VAR(screen_droplets_grid_x)    \
-  VAR(frame_tex)                 \
-  VAR(frame_tex_samplerstate)
+  VAR(frame_tex)
 
 #define VAR(a) static int a##VarId = -1;
 SCREEN_DROPLETS_VARS
@@ -47,10 +46,10 @@ void init_screen_droplets_params(bool has_leaks, float rain_cone_max, float rain
   hasLeaks.set(has_leaks);
 }
 
-void init_screen_droplets_mgr(int w, int h, bool has_leaks, float rain_cone_max, float rain_cone_off)
+void init_screen_droplets_mgr(bool has_leaks, float rain_cone_max, float rain_cone_off)
 {
   init_screen_droplets_params(has_leaks, rain_cone_max, rain_cone_off);
-  screen_droplets_mgr = eastl::make_unique<ScreenDroplets>(w, h);
+  screen_droplets_mgr = eastl::make_unique<ScreenDroplets>();
 }
 
 void init_screen_droplets_mgr(int w, int h, uint32_t rtFmt, bool has_leaks, float rain_cone_max, float rain_cone_off)
@@ -62,31 +61,23 @@ void close_screen_droplets_mgr() { screen_droplets_mgr.reset(); }
 
 ScreenDroplets::ScreenDroplets(int w, int h, uint32_t rtFmt)
 {
-  resolution = IPoint2(w, h);
   screenDropletsFx.init("screen_droplets");
 #define VAR(a) a##VarId = ::get_shader_variable_id(#a, true);
   SCREEN_DROPLETS_VARS
 #undef VAR
-  mipRenderer.init();
+  mipRenderer.init(d3d::AddressMode::Clamp);
 
   rtTemp = RTargetPool::get(w, h, rtFmt | TEXCF_RTARGET, 2);
-  d3d::SamplerInfo smpInfo;
-  smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
-  clampSampler = d3d::request_sampler(smpInfo);
 }
 
 
-ScreenDroplets::ScreenDroplets(int w, int h)
+ScreenDroplets::ScreenDroplets()
 {
   screenDropletsFx.init("screen_droplets");
 #define VAR(a) a##VarId = ::get_shader_variable_id(#a, true);
   SCREEN_DROPLETS_VARS
 #undef VAR
-  mipRenderer.init();
-  resolution = IPoint2(w, h);
-  d3d::SamplerInfo smpInfo;
-  smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
-  clampSampler = d3d::request_sampler(smpInfo);
+  mipRenderer.init(d3d::AddressMode::Clamp);
 }
 
 ScreenDroplets::~ScreenDroplets() { abortDrops(); }
@@ -133,14 +124,14 @@ void ScreenDroplets::abortDrops()
 {
   rainStarted = rainEnded = rainCurrent = -screenTime;
   isUnderwaterLast = false;
-  ShaderGlobal::set_color4(screen_droplets_setupVarId, 0, 0, 0, 100);
+  ShaderGlobal::set_float4(screen_droplets_setupVarId, 0, 0, 0, 100);
 }
 
 void ScreenDroplets::updateShaderState() const
 {
   if (isUnderwaterLast)
   {
-    ShaderGlobal::set_color4(screen_droplets_setupVarId, 0, 0, 0, 100);
+    ShaderGlobal::set_float4(screen_droplets_setupVarId, 0, 0, 0, 100);
     return;
   }
 
@@ -151,10 +142,10 @@ void ScreenDroplets::updateShaderState() const
   if (rainCurrent > 0)
     rainForce = lerp(1.0f, rainCurrent, transition);
 
-  ShaderGlobal::set_color4(screen_droplets_setupVarId, rainStarted, rainEnded, intensity * rainForce, fadeout);
-  ShaderGlobal::set_real(screen_droplets_intensityVarId, max(EPS, intensity));
+  ShaderGlobal::set_float4(screen_droplets_setupVarId, rainStarted, rainEnded, intensity * rainForce, fadeout);
+  ShaderGlobal::set_float(screen_droplets_intensityVarId, max(EPS, intensity));
   ShaderGlobal::set_int(screen_droplets_has_leaksVarId, hasLeaks);
-  ShaderGlobal::set_real(screen_droplets_grid_xVarId, gridX);
+  ShaderGlobal::set_float(screen_droplets_grid_xVarId, gridX);
 }
 
 void ScreenDroplets::update(bool is_underwater, const TMatrix &itm, float dt)
@@ -230,50 +221,55 @@ bool ScreenDroplets::isVisible() const
   return enabled && !(rainStarted <= rainEnded && get_shader_global_time_phase(0, 0) >= rainEnded + screenTime);
 }
 
-IPoint2 ScreenDroplets::getSuggestedResolution(int rendering_w, int rendering_h)
+IPoint2 ScreenDroplets::getSuggestedResolution(const IPoint2 &current_resolution, const IPoint2 &max_resolution)
 {
   // The droplets are blurred with a gaussian downsampling, so the screen space blur is resolution dependent.
   static constexpr int TARGET_W = 1920, TARGET_H = 1080;
-  G_ASSERT_RETURN(rendering_w > 0 && rendering_h > 0, IPoint2(TARGET_W / 2, TARGET_H / 2));
-  int w = TARGET_W, h = TARGET_H;
-  if (rendering_w * TARGET_H > TARGET_W * rendering_h) // Wide Screen
+  G_ASSERT_RETURN(current_resolution.x > 0 && current_resolution.y > 0, IPoint2(TARGET_W / 2, TARGET_H / 2));
+
+  IPoint2 res = current_resolution;
+  if (max_resolution.x * TARGET_H > TARGET_W * max_resolution.y) // Wide Screen
   {
-    h = min(rendering_h, TARGET_H);
-    w = h * rendering_w / rendering_h;
+    if (current_resolution.y > TARGET_H)
+      res = IPoint2(TARGET_H * max_resolution.x / max_resolution.y, TARGET_H);
   }
   else
   {
-    w = min(rendering_w, TARGET_W);
-    h = w * rendering_h / rendering_w;
+    if (current_resolution.x > TARGET_W)
+      res = IPoint2(TARGET_W, TARGET_W * max_resolution.y / max_resolution.x);
   }
-  return IPoint2(w / 2, h / 2);
+  res /= 2;
+
+  // Ensure, that res is not bigger than res for max_resolution
+  if (current_resolution != max_resolution)
+    res = min(res, getSuggestedResolution(max_resolution, max_resolution));
+
+  return res;
 }
 
-RTarget::CPtr ScreenDroplets::render(TEXTUREID frame_tex)
+RTarget::CPtr ScreenDroplets::renderToTmpTarget(BaseTexture *frame_tex)
 {
   if (!isVisible())
     return nullptr;
 
   // TODO This is using full resolution current frame.
   // Wanted to use downsampled previous frame, but that doesn't contain transparent objects.
-  ShaderGlobal::set_texture(frame_texVarId, frame_tex);
-  ShaderGlobal::set_sampler(frame_tex_samplerstateVarId, clampSampler);
+  ShaderGlobal::set_texture_unsafe(frame_texVarId, frame_tex);
 
   RTarget::Ptr rTargetTemp = rtTemp->acquire();
   render(rTargetTemp->getTex2D());
-  ShaderGlobal::set_sampler(frame_tex_samplerstateVarId, d3d::INVALID_SAMPLER_HANDLE);
+  ShaderGlobal::set_texture_unsafe(frame_texVarId, nullptr);
 
   return rTargetTemp;
 }
 
-void ScreenDroplets::render(ManagedTexView rtarget, TEXTUREID frame_tex)
+void ScreenDroplets::render(BaseTexture *rtarget, BaseTexture *frame_tex)
 {
   if (!isVisible())
     return;
-  ShaderGlobal::set_texture(frame_texVarId, frame_tex);
-  ShaderGlobal::set_sampler(frame_tex_samplerstateVarId, clampSampler);
-  render(rtarget.getTex2D());
-  ShaderGlobal::set_sampler(frame_tex_samplerstateVarId, d3d::INVALID_SAMPLER_HANDLE);
+  ShaderGlobal::set_texture_unsafe(frame_texVarId, frame_tex);
+  render(rtarget);
+  ShaderGlobal::set_texture_unsafe(frame_texVarId, nullptr);
 }
 
 void ScreenDroplets::render(BaseTexture *rtarget)
@@ -281,7 +277,7 @@ void ScreenDroplets::render(BaseTexture *rtarget)
   TIME_D3D_PROFILE(screen_droplets);
   {
     SCOPE_RENDER_TARGET;
-    d3d::set_render_target(rtarget, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{rtarget, 0, 0}});
     screenDropletsFx.render();
     mipRenderer.render(rtarget);
   }

@@ -19,6 +19,7 @@
 #include <EASTL/algorithm.h>
 #include <stdlib.h>
 #include "../hid_commonCode/touch_api_impl.inc.cpp"
+#include <gui/dag_imgui.h>
 
 #if _TARGET_PC_WIN
 #include <workCycle/threadedWindow.h>
@@ -138,7 +139,9 @@ bool WinMouseDevice::getCursorPos(POINT &pt, RECT *wr)
 
   bool isIn = (pt.x >= 0 && pt.y >= 0 && pt.x <= r.right && pt.y <= r.bottom);
 
-#if _TARGET_PC_WIN || _TARGET_PC_LINUX
+  // state.mouse is in render space, so any window-to-backbuffer factor has to cancel here;
+  // clip rect and clients (imgui, darg) assume d3d::get_screen_size() units
+#if _TARGET_PC_WIN || _TARGET_PC_LINUX || _TARGET_PC_MACOSX
   int w = 1, h = 1;
   d3d::get_screen_size(w, h);
   if (w && h)
@@ -438,7 +441,9 @@ IWndProcComponent::RetCode WinMouseDevice::process(void *hwnd, unsigned msg, uin
 
     DEBUG_TRACE_INPDEV("WM:mouse: mouse.usFlags=0x%x (%d,%d) %X %p", ri.data.mouse.usFlags, ri.data.mouse.lLastX, ri.data.mouse.lLastY,
       ri.data.mouse.usButtonFlags, client);
-    if (stg_pnt.emuTouchScreenWithMouse)
+
+    static bool touch_started[2] = {false, false};
+    if (stg_pnt.emuTouchScreenWithMouse && imgui_get_state() != ImGuiState::ACTIVE)
     {
       POINT pt;
       RECT r;
@@ -446,7 +451,6 @@ IWndProcComponent::RetCode WinMouseDevice::process(void *hwnd, unsigned msg, uin
       raw_state_pnt.mouse.x = state.mouse.x = pt.x;
       raw_state_pnt.mouse.y = state.mouse.y = pt.y;
 
-      static bool touch_started[2] = {false, false};
       if ((ri.data.mouse.usButtonFlags & RI_MOUSE_BUTTON_1_DOWN) && !touch_started[0])
       {
         hid::gpcm_TouchBegan(state, this, client, pt.x, pt.y, 1, PointingRawState::Touch::TS_emuTouchScreen);
@@ -485,6 +489,8 @@ IWndProcComponent::RetCode WinMouseDevice::process(void *hwnd, unsigned msg, uin
 
       return PROCEED_DEF_WND_PROC;
     }
+    else
+      touch_started[0] = touch_started[1] = false;
 
     if (ri.data.mouse.lLastX || ri.data.mouse.lLastY)
     {
@@ -962,7 +968,8 @@ void WinMouseDevice::deviceSetPosition(int x, int y)
   POINT pt;
   pt.x = x;
   pt.y = y;
-#if _TARGET_PC_WIN || _TARGET_PC_LINUX
+  // inverse of the mapping getCursorPos() applies, keep both in sync
+#if _TARGET_PC_WIN || _TARGET_PC_LINUX || _TARGET_PC_MACOSX
   RECT r;
   ::mouse_api_GetClientRect(win32_get_main_wnd(), &r);
   int w = 1, h = 1;

@@ -37,13 +37,13 @@ static void custom_envi_probe_set_shadervars(float x_rotation, float y_rotation,
   sincos(DegToRad(x_rotation), sinX, cosX);
   float sinY, cosY;
   sincos(DegToRad(y_rotation), sinY, cosY);
-  ShaderGlobal::set_color4(envi_probe_rotationVarId, cosX, sinX, cosY, sinY);
-  ShaderGlobal::set_real(envi_probe_mulVarId, mul);
+  ShaderGlobal::set_float4(envi_probe_rotationVarId, cosX, sinX, cosY, sinY);
+  ShaderGlobal::set_float(envi_probe_mulVarId, mul);
 }
 
 ECS_TAG(render)
 static void custom_envi_probe_created_es_event_handler(
-  const ecs::EventEntityCreated &, const SharedTexHolder &custom_envi_probe__cubemap, bool &custom_envi_probe__needs_render)
+  const ecs::EventEntityCreated &, const SharedTexWithShaderVar &custom_envi_probe__cubemap, bool &custom_envi_probe__needs_render)
 {
 #define VAR(a) a##VarId = get_shader_variable_id(#a);
   CUSTOM_ENVI_PROBE_VARS
@@ -55,7 +55,7 @@ static void custom_envi_probe_created_es_event_handler(
 ECS_TAG(render, dev)
 ECS_TRACK(custom_envi_probe__cubemap_res)
 static void custom_cube_texture_name_changed_es_event_handler(ecs::EventComponentChanged,
-  SharedTexHolder &custom_envi_probe__cubemap,
+  SharedTexWithShaderVar &custom_envi_probe__cubemap,
   const ecs::string &custom_envi_probe__cubemap_res,
   const ecs::string &custom_envi_probe__cubemap_var,
   bool &custom_envi_probe__needs_render,
@@ -93,7 +93,7 @@ ECS_AFTER(animchar_before_render_es) // require for execute animchar_before_rend
 static void custom_cube_texture_before_render_es(const UpdateStageInfoBeforeRender &event,
   bool &custom_envi_probe__needs_render,
   bool &custom_envi_probe__is_inside,
-  const SharedTexHolder &custom_envi_probe__cubemap)
+  const SharedTexWithShaderVar &custom_envi_probe__cubemap)
 {
   TIME_D3D_PROFILE(custom_cube_texture_before_render)
   const auto *indoorProbeMgr = WRDispatcher::getIndoorProbeManager();
@@ -108,15 +108,12 @@ static void custom_cube_texture_before_render_es(const UpdateStageInfoBeforeRend
     return;
   if (prefetch_and_check_managed_texture_loaded(custom_envi_probe__cubemap.getTexId(), true))
   {
-    int frameBlock = ShaderGlobal::getBlock(ShaderGlobal::LAYER_FRAME);
-    ShaderGlobal::setBlock(-1, ShaderGlobal::LAYER_FRAME);
-    get_world_renderer()->reloadCube(false);
+    get_world_renderer()->scheduleEnviProbeReRender();
     custom_envi_probe__needs_render = false;
-    ShaderGlobal::setBlock(frameBlock, ShaderGlobal::LAYER_FRAME);
   }
 }
 
-static void custom_envi_probe_after_reset_es(const AfterDeviceReset &, bool &custom_envi_probe__needs_render)
+static void custom_envi_probe_after_reset_es(const EventAfterDeviceReset &, bool &custom_envi_probe__needs_render)
 {
   custom_envi_probe__needs_render = true;
 }
@@ -129,7 +126,7 @@ static void custom_envi_probe_render_es_event_handler(const CustomEnviProbeRende
   float custom_envi_probe__y_rotation,
   float custom_envi_probe__outside_mul,
   float custom_envi_probe__inside_mul,
-  const SharedTexHolder &custom_envi_probe__cubemap)
+  const SharedTexWithShaderVar &custom_envi_probe__cubemap)
 {
   const ManagedTex *cubeTarget = evt.get<0>();
   int faceNum = evt.get<1>();
@@ -145,9 +142,9 @@ static void custom_envi_probe_render_es_event_handler(const CustomEnviProbeRende
     SCOPE_RENDER_TARGET;
     SCOPE_VIEW_PROJ_MATRIX;
     SCOPE_VIEWPORT;
-    for (int i = faceBegin; i < faceEnd; i++)
+    for (uint32_t i = faceBegin; i < faceEnd; i++)
     {
-      d3d::set_render_target(cubeTarget->getCubeTex(), i, 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{cubeTarget->getCubeTex(), 0u, i}});
       TMatrix4 projTm;
       d3d::setpersp(Driver3dPerspective(1, 1, 0.25, 400), &projTm); // set a square perspective, zn zf doesn't matter
       TMatrix cameraMatrix = cube_matrix(TMatrix::IDENT, i);

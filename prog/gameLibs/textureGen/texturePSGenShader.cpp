@@ -18,6 +18,7 @@
 #include <util/dag_string.h>
 #include <generic/dag_carray.h>
 #include <generic/dag_smallTab.h>
+#include <generic/dag_DObject.h>
 #include <math/dag_Point2.h>
 #include <math/dag_Point3.h>
 #include <math/dag_Point4.h>
@@ -29,6 +30,11 @@
 #include <textureGen/entitiesSaver.h>
 #include <3d/dag_textureIDHolder.h>
 #include <render/blkToConstBuffer.h>
+#include <shaders/dag_shaders.h>
+#include <shaders/dag_shBindumps.h>
+#include <shaders/dag_shaderVarsUtils.h>
+#include <textureGen/textureGenDshl.h>
+#include <debug/dag_log.h>
 
 #include <hash/sha1.h>
 #include <EASTL/string.h>
@@ -36,6 +42,7 @@
 #include <EASTL/hash_map.h>
 #include <EASTL/unique_ptr.h>
 #include <shaders/dag_overrideStates.h>
+#include <generic/dag_span.h>
 #include <drv/3d/dag_renderStates.h>
 #include <shaders/dag_renderStateId.h>
 // #include <EASTL/shared_ptr.h>
@@ -87,6 +94,11 @@ static VprogCached common_vprog, common_particles_vprog;
 static VDECL common_vdecl = BAD_VDECL;
 static Sbuffer *particlesInstancesIndirect = 0;
 static Sbuffer *textureParamsCB = 0;
+// Node params for dsc2-compiled (dshl) variants are bound at b3 via set_const_buffer; the legacy
+// set_ps_const(0)->b0 path is not honored for a set_program-bound dsc2 element. Sized well above any
+// node's packed-param count (the old set_ps_const path capped near MAX_PS_CONSTS ~272).
+static constexpr int TEXGEN_NODE_PARAMS_CB_REGS = 512;
+static Sbuffer *textureNodeParamsCB = 0;
 static String premain, postmain;
 static TextureIDHolder biggest_depth;
 static int bigW = 0, bigH = 0;
@@ -98,7 +110,8 @@ static void create_biggest_depth(int w, int h)
   bigW = max(bigW, w);
   bigH = max(bigH, h);
   biggest_depth.close();
-  biggest_depth.set(d3d::create_tex(NULL, bigW, bigH, TEXCF_RTARGET | TEXFMT_DEPTH16, 1, "texgen_depth"), "texgen_depth");
+  biggest_depth.set(d3d::create_tex(NULL, bigW, bigH, TEXCF_RTARGET | TEXFMT_DEPTH16, 1, "texgen_depth", RESTAG_TEXGEN),
+    "texgen_depth");
 }
 
 static constexpr int MAX_PARAMS_SIZE = 128;
@@ -134,7 +147,12 @@ public:
   {
     G_ASSERT(refCount == 0);
     String outErr;
+#if _TARGET_PC_WIN
     shader = d3d::create_pixel_shader_hlsl(shader_text, len, "main_ps", "ps_5_0", &outErr);
+#else
+    shader = BAD_FSHADER, outErr = "hlsl n/a";
+    G_UNUSED(shader_text), G_UNUSED(len);
+#endif
     if (!outErr.empty())
       logger.log(shader != BAD_FSHADER ? LOGLEVEL_WARN : LOGLEVEL_ERR, outErr);
     refCount = 1;
@@ -379,6 +397,31 @@ public:
     return defShader.prog != BAD_PROGRAM;
   }
 
+  // Configure this shader to render a precompiled dshl bindump variant (Stage-3 dshl pipeline).
+  // Element creation is deferred to the first process() (needs the GPU lock + the loaded bindump).
+  void initDshl(ShaderBindumpHandle bindump, const char *variant_name, const DataBlock *params_blk, int inputs, int outputs,
+    int def_sub_size, TextureGenLogger &logger)
+  {
+    dshlBindump = bindump;
+    dshlVariant = variant_name;
+    defMaxSubStepSize = def_sub_size;
+    regs[TSHADER_REG_TYPE_INPUT] = inputs;
+    regs[TSHADER_REG_TYPE_OUTPUT] = outputs;
+    if (params_blk)
+      initConstants(*params_blk, logger);
+  }
+
+  void ensureDshlElem(TextureGenLogger &logger)
+  {
+    if (dshlElem || dshlBindump == INVALID_BINDUMP_HANDLE)
+      return;
+    // _optional variant: a stale/mismatched bindump degrades to null (logged below), never DAG_FATAL.
+    dshlMat = new_shader_material_by_name_optional(dshlBindump, dshlVariant.c_str());
+    dshlElem = dshlMat ? dshlMat->make_elem() : nullptr;
+    if (!dshlElem)
+      logger.log(LOGLEVEL_ERR, String(128, "texgen dshl: variant <%s> not found in bindump", dshlVariant.c_str()));
+  }
+
   virtual const char *getName() const { return name.str(); }
   virtual int getInputParametersCount() const { return params.paramCount(); }
   virtual bool isInputParameterOptional(int) const { return true; }
@@ -559,8 +602,8 @@ public:
       }
     }
 
-    d3d::set_render_target();
     int outputsCnt = min<int>(outputs.size(), getRegCount(TSHADER_REG_TYPE_OUTPUT));
+    eastl::array<RenderTarget, Driver3dRenderTarget::MAX_SIMRT> outRts = {};
     bool textureSet = false;
     int particlesOut = 0, rtOut = 0;
     for (int i = 0; i < outputsCnt; ++i)
@@ -582,17 +625,11 @@ public:
       }
       rtOut++;
       if (!outputs[i])
-      {
-        d3d::set_render_target(rtOut - 1, 0, 0);
         continue;
-      }
 
       Texture *tex = outputs[i]->getType() == D3DResourceType::TEX ? ((Texture *)outputs[i]) : 0;
       if (!tex)
-      {
-        d3d::set_render_target(rtOut - 1, 0, 0);
         continue;
-      }
       TextureInfo tinfo;
       tex->getinfo(tinfo, 0);
       if (tinfo.cflg & TEXCF_RTARGET)
@@ -600,51 +637,78 @@ public:
         if (tinfo.cflg & TEXCF_UNORDERED)
           d3d::set_rwtex(STAGE_PS, 8 - rtOut, tex, 0, 0);
         else
-          d3d::set_render_target(rtOut - 1, tex, 0);
+          outRts[rtOut - 1] = {tex, 0, 0};
         textureSet = true;
       }
     }
 
-    if (!textureSet)
-      d3d::set_render_target((Texture *)NULL, 0);
-
+    BaseTexture *depthTex = nullptr;
     if (depth || !textureSet)
     {
       create_biggest_depth(w, h);
-      d3d::set_depth(biggest_depth.getTex2D(), DepthAccess::RW);
+      depthTex = biggest_depth.getTex2D();
     }
+    d3d::set_render_target({depthTex, 0, 0}, DepthAccess::RW, make_span_const(outRts.data(), rtOut));
 
     d3d::setview(0, 0, w, h, 0, 1);
 
-    const char *shader_postcode = params_override.getStr("shader_postcode", NULL);
-    if (shader_postcode)
+    // dshl pipeline: the per-node variant is a precompiled bindump shader (VS+PS). Bind ONLY its program
+    // (exactly like the old raw d3d::create_program path) via get_dynamic_variant_states + set_program.
+    // We deliberately do NOT call ShaderElement::setStates(): that runs the shader-block conformity check
+    // which, in texgen's frame/scene block context, auto-sets the environment's default object block
+    // (gui_aces_object) and floods the log. texgen owns all render state (overrides above) + the raw
+    // texture/const/UAV binding below; the variant declares no shadervars, so nothing else is needed.
+    if (dshlBindump != INVALID_BINDUMP_HANDLE)
     {
-      auto shaderFound = shaders.find_as(shader_postcode);
-      if (shaderFound != shaders.end())
+      ensureDshlElem(*texgen_get_logger(&texGen));
+      bool setProgram = false;
+      if (dshlElem)
       {
-        d3d::set_program(shaderFound->second.prog == BAD_PROGRAM
-                           ? (particles ? defShader.particlesProg : defShader.prog)
-                           : (particles ? shaderFound->second.particlesProg : shaderFound->second.prog));
+        shaders::CombinedDynVariantState dynVarState = get_dynamic_variant_states(dshlElem->native());
+        if (is_valid(dynVarState) && dynVarState.program != BAD_PROGRAM)
+        {
+          d3d::set_program(dynVarState.program);
+          setProgram = true;
+        }
       }
-      else
+      if (!setProgram)
       {
-        ShaderCode code;
-        if (linkShader(shader_postcode, code, params_override.getBlockByName("substitutions"), *texgen_get_logger(&texGen)))
-        {
-          shaders[shader_postcode] = eastl::move(code);
-          d3d::set_program(particles ? code.particlesProg : code.prog);
-          code.reset();
-        }
-        else
-        {
-          shaders[shader_postcode] = eastl::move(ShaderCode());
-          texgen_get_logger(&texGen)->log(LOGLEVEL_ERR, String(128, "can not link shader name<%s> post<%s>", name, shader_postcode));
-          return false;
-        }
+        texgen_get_logger(&texGen)->log(LOGLEVEL_ERR, String(128, "texgen dshl: no program for variant <%s>", dshlVariant.c_str()));
+        return false;
       }
     }
     else
-      d3d::set_program(particles ? defShader.particlesProg : defShader.prog);
+    {
+      const char *shader_postcode = params_override.getStr("shader_postcode", NULL);
+      if (shader_postcode)
+      {
+        auto shaderFound = shaders.find_as(shader_postcode);
+        if (shaderFound != shaders.end())
+        {
+          d3d::set_program(shaderFound->second.prog == BAD_PROGRAM
+                             ? (particles ? defShader.particlesProg : defShader.prog)
+                             : (particles ? shaderFound->second.particlesProg : shaderFound->second.prog));
+        }
+        else
+        {
+          ShaderCode code;
+          if (linkShader(shader_postcode, code, params_override.getBlockByName("substitutions"), *texgen_get_logger(&texGen)))
+          {
+            shaders[shader_postcode] = eastl::move(code);
+            d3d::set_program(particles ? code.particlesProg : code.prog);
+            code.reset();
+          }
+          else
+          {
+            shaders[shader_postcode] = eastl::move(ShaderCode());
+            texgen_get_logger(&texGen)->log(LOGLEVEL_ERR, String(128, "can not link shader name<%s> post<%s>", name, shader_postcode));
+            return false;
+          }
+        }
+      }
+      else
+        d3d::set_program(particles ? defShader.particlesProg : defShader.prog);
+    }
 
     if (particles && depth && subStep <= 0)
     {
@@ -653,6 +717,13 @@ public:
     d3d::set_vs_const1(0, 1.0, 0, 0, 0); // fixme: remove
     uint32_t *dwraps = NULL;
     d3d_err(textureParamsCB->lock(0, 0, (void **)&dwraps, VBLOCK_WRITEONLY | VBLOCK_DISCARD));
+    if (!dwraps)
+    {
+      // lock returns null when the device was lost (e.g. a prior node's draw hung the GPU). Bail with a
+      // clean failure instead of dereferencing null, so a device-removed turns into a logged error.
+      texgen_get_logger(&texGen)->log(LOGLEVEL_ERR, String(128, "texgen: textureParamsCB lock failed for <%s> (device lost?)", name));
+      return false;
+    }
     for (int i = 0; i < inputs.size(); ++i)
       dwraps[i] = inputs[i].wrap ? 1 : 0;
     textureParamsCB->unlock();
@@ -661,7 +732,29 @@ public:
 
     Tab<Point4> constBuffer;
     create_constant_buffer(params, params_override, constBuffer);
-    if (constBuffer.size())
+    if (dshlBindump != INVALID_BINDUMP_HANDLE)
+    {
+      // dsc2 elements are bound here via set_program only (no setStates), so legacy set_ps_const(0)
+      // (which targets b0) never reaches the shader -- params would be garbage. Deliver them through a
+      // dedicated cbuffer at b3 (the assembler pins `cbuffer global` to b3), the same explicit-register +
+      // set_const_buffer path textureParamsCB uses at b1.
+      if (constBuffer.size() && textureNodeParamsCB)
+      {
+        void *dst = nullptr;
+        d3d_err(textureNodeParamsCB->lock(0, 0, &dst, VBLOCK_WRITEONLY | VBLOCK_DISCARD));
+        if (!dst)
+        {
+          texgen_get_logger(&texGen)->log(LOGLEVEL_ERR,
+            String(128, "texgen: node params CB lock failed for <%s> (device lost?)", name));
+          return false;
+        }
+        const int srcBytes = (int)constBuffer.size() * (int)sizeof(Point4);
+        memcpy(dst, constBuffer.data(), min(srcBytes, TEXGEN_NODE_PARAMS_CB_REGS * (int)sizeof(Point4)));
+        textureNodeParamsCB->unlock();
+        d3d::set_const_buffer(STAGE_PS, 3, textureNodeParamsCB);
+      }
+    }
+    else if (constBuffer.size())
       d3d::set_ps_const(0, &constBuffer[0].x, constBuffer.size());
 
     if (scissorEnabled)
@@ -690,6 +783,7 @@ public:
 
     d3d::set_render_target();
     d3d::set_const_buffer(STAGE_PS, 1, 0);
+    d3d::set_const_buffer(STAGE_PS, 3, 0);
 
     d3d::driver_command(Drv3dCommand::D3D_FLUSH);
 
@@ -706,16 +800,28 @@ protected:
   int totalParamsSize;
   int defMaxSubStepSize = 4096;
   eastl::hash_map<eastl::string, ShaderCode> shaders;
+
+  // dshl pipeline (Stage 3): when dshlBindump is set, process() renders this precompiled bindump
+  // variant via a ShaderElement instead of runtime-compiling HLSL. Created lazily on the first
+  // process() (needs the GPU lock + loaded bindump); Ptr<> releases the material/element when this
+  // shader is destroyed (add_dshl_shader_texgen re-registers a fresh PSGenShader per generate).
+  ShaderBindumpHandle dshlBindump = INVALID_BINDUMP_HANDLE;
+  eastl::string dshlVariant;
+  Ptr<ShaderMaterial> dshlMat;
+  Ptr<ShaderElement> dshlElem;
 };
 
 bool init_pixel_shader_texgen()
 {
   prune_cache();
   del_d3dres(textureParamsCB);
-  textureParamsCB = d3d::buffers::create_persistent_cb(16, "textureParamsCB");
+  textureParamsCB = d3d::buffers::create_persistent_cb(16, "textureParamsCB", RESTAG_TEXGEN);
+
+  del_d3dres(textureNodeParamsCB);
+  textureNodeParamsCB = d3d::buffers::create_persistent_cb(TEXGEN_NODE_PARAMS_CB_REGS, "textureNodeParamsCB", RESTAG_TEXGEN);
 
   del_d3dres(particlesInstancesIndirect);
-  particlesInstancesIndirect = d3d::create_sbuffer(4, 4, SBCF_UA_INDIRECT, 0, "particlesInstancesIndirect");
+  particlesInstancesIndirect = d3d::create_sbuffer(4, 4, SBCF_UA_INDIRECT, 0, "particlesInstancesIndirect", RESTAG_TEXGEN);
   if (particlesInstancesIndirect)
   {
     uint32_t *data;
@@ -741,7 +847,11 @@ static void init_cached_vprog(VprogCached &vprog, const char *shader)
   make_sha1_string(shader, len, sha1);
   if (memcmp(vprog.sha1, sha1, sizeof(sha1)) == 0)
     return;
+#if _TARGET_PC_WIN
   vprog.vprog = d3d::create_vertex_shader_hlsl(shader, len, "main_vs", "vs_5_0");
+#else
+  vprog.vprog = BAD_VPROG;
+#endif
   memcpy(vprog.sha1, sha1, sizeof(sha1));
 }
 
@@ -778,7 +888,6 @@ bool add_pixel_shader_texgen(const DataBlock &shaders, TextureGenerator *texGen)
     return false;
 
   DynamicMemGeneralSaveCB mem(tmpmem, 2048);
-  String resultShader;
   for (int i = 0; i < shaders.blockCount(); ++i)
   {
     const DataBlock *shaderBlock = shaders.getBlock(i);
@@ -837,6 +946,15 @@ bool add_pixel_shader_texgen(const DataBlock &shaders, TextureGenerator *texGen)
   return true;
 }
 
+bool add_dshl_shader_texgen(TextureGenerator *tex_gen, const char *shader_name, const char *variant_name, ShaderBindumpHandle bindump,
+  const DataBlock *params_blk, int inputs, int outputs, int def_sub_size)
+{
+  PSGenShader *shader = new PSGenShader(shader_name);
+  shader->initDshl(bindump, variant_name, params_blk, inputs, outputs, def_sub_size, *texgen_get_logger(tex_gen));
+  texgen_add_shader(tex_gen, shader_name, shader);
+  return true;
+}
+
 void close_pixel_shader_texgen()
 {
   d3d::delete_vdecl(common_vdecl);
@@ -849,6 +967,8 @@ void close_pixel_shader_texgen()
 
   del_d3dres(textureParamsCB);
   textureParamsCB = NULL;
+  del_d3dres(textureNodeParamsCB);
+  textureNodeParamsCB = NULL;
   clear_and_shrink(premain);
   clear_and_shrink(postmain);
   biggest_depth.close();
@@ -874,16 +994,16 @@ static int create_constants_param_block(DataBlock &params, const DataBlock &para
     paramsSize += typeSize;
     switch (params_.getParamType(i))
     {
-      case params_.TYPE_INT: params.addInt(name, params_.getInt(i)); break;
-      case params_.TYPE_REAL: params.addReal(name, params_.getReal(i)); break;
-      case params_.TYPE_IPOINT2: params.addIPoint2(name, params_.getIPoint2(i)); break;
-      case params_.TYPE_POINT2: params.addPoint2(name, params_.getPoint2(i)); break;
-      case params_.TYPE_IPOINT3: params.addIPoint3(name, params_.getIPoint3(i)); break;
-      case params_.TYPE_IPOINT4: params.addIPoint4(name, params_.getIPoint4(i)); break;
-      case params_.TYPE_POINT3: params.addPoint3(name, params_.getPoint3(i)); break;
-      case params_.TYPE_POINT4: params.addPoint4(name, params_.getPoint4(i)); break;
-      case params_.TYPE_BOOL: params.addBool(name, params_.getBool(i)); break;
-      case params_.TYPE_E3DCOLOR: params.addE3dcolor(name, params_.getE3dcolor(i)); break;
+      case DataBlock::TYPE_INT: params.addInt(name, params_.getInt(i)); break;
+      case DataBlock::TYPE_REAL: params.addReal(name, params_.getReal(i)); break;
+      case DataBlock::TYPE_IPOINT2: params.addIPoint2(name, params_.getIPoint2(i)); break;
+      case DataBlock::TYPE_POINT2: params.addPoint2(name, params_.getPoint2(i)); break;
+      case DataBlock::TYPE_IPOINT3: params.addIPoint3(name, params_.getIPoint3(i)); break;
+      case DataBlock::TYPE_IPOINT4: params.addIPoint4(name, params_.getIPoint4(i)); break;
+      case DataBlock::TYPE_POINT3: params.addPoint3(name, params_.getPoint3(i)); break;
+      case DataBlock::TYPE_POINT4: params.addPoint4(name, params_.getPoint4(i)); break;
+      case DataBlock::TYPE_BOOL: params.addBool(name, params_.getBool(i)); break;
+      case DataBlock::TYPE_E3DCOLOR: params.addE3dcolor(name, params_.getE3dcolor(i)); break;
     }
   }
 

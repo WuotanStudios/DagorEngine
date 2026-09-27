@@ -43,17 +43,16 @@ void GPUGrassPanel::fillPanel(IGPUGrassService *service, DataBlock *grass_blk, P
   G_ASSERT_RETURN(grass_blk, );
   srv = service;
   blk = grass_blk;
-  grassPanel = panel.createGroup(PID_GPU_GRASS_GROUP, "Grass");
+  grassPanel = panel.createGroup(PID_GPU_GRASS_GROUP, service->isSmallGrass() ? "Small Grass" : "Grass");
   grassPanel->createCheckBox(PID_GPU_GRASS_ENABLE, "Enable grass", srv->isGrassEnabled());
   grassPanel->createButton(PID_GPU_GRASS_LOADFROM_LEVELBLK, "Load from level.blk");
   grassPanel->createFileEditBox(PID_GPU_GRASS_TYPES, "Types", blk->getStr("grass_types", ""));
   grassPanel->createFileEditBox(PID_GPU_GRASS_MASKS, "Masks", blk->getStr("grass_masks", ""));
-  grassPanel->createTrackFloat(PID_GPU_GRASS_GRID_SIZE, "Grid size", blk->getReal("grass_grid_size"), 0.0, 1.0, 0.025);
+  grassPanel->createTrackFloat(PID_GPU_GRASS_GRID_SIZE, "Grid size", blk->getReal("grass_grid_size"), 0.00625, 1.0, 0.025);
   grassPanel->createEditFloat(PID_GPU_GRASS_DISTANCE, "Distance", blk->getReal("grass_distance"));
   grassPanel->createEditInt(PID_GPU_GRASS_MASK_RESOLUTION, "Mask resolution", blk->getInt("grassMaskResolution"));
   grassPanel->createEditFloat(PID_GPU_GRASS_HOR_SIZE_MUL, "Horizontal size mul", blk->getReal("hor_size_mul"));
-  grassPanel->createStatic(0, "Type");
-  grassPanel->createSeparator(0, false);
+  grassPanel->createSeparatorText(0, "Type");
   grassPanel->createButton(PID_GPU_GRASS_ADD_TYPE, "Add...", srv->getTypeCount() < GRASS_MAX_TYPES);
   grassPanel->createButton(PID_GPU_GRASS_REMOVE_TYPE, "Remove...", srv->getTypeCount(), false);
   grassPanel->createButton(PID_GPU_GRASS_RENAME_TYPE, "Rename...", srv->getTypeCount(), false);
@@ -98,8 +97,7 @@ void GPUGrassPanel::fillPanel(IGPUGrassService *service, DataBlock *grass_blk, P
     typePanel->createCheckBox(basePID + (int)GPUGrassTypePID::UNDERWATER, "Underwater", type.underwater);
   }
 
-  grassPanel->createStatic(0, "Decal");
-  grassPanel->createSeparator(0, false);
+  grassPanel->createSeparatorText(0, "Decal");
   grassPanel->createButton(PID_GPU_GRASS_ADD_DECAL, "Add...", srv->getDecalCount() < GRASS_MAX_CHANNELS);
   grassPanel->createButton(PID_GPU_GRASS_REMOVE_DECAL, "Remove...", srv->getDecalCount(), false);
   grassPanel->createButton(PID_GPU_GRASS_RENAME_DECAL, "Rename...", srv->getDecalCount(), false);
@@ -122,32 +120,9 @@ void GPUGrassPanel::fillPanel(IGPUGrassService *service, DataBlock *grass_blk, P
   panel.setBool(PID_GPU_GRASS_GROUP, true);
 }
 
-bool GPUGrassPanel::isGrassValid() const
-{
-  if (!srv || srv->getTypeCount() == 0 || (srv->getTypeCount() == 1 && srv->getType(0).name == "nograss"))
-    return false;
-  for (int i = 0; i < srv->getDecalCount(); ++i)
-  {
-    const GPUGrassDecal &decal = srv->getDecal(i);
-    if (decal.channels.empty())
-      continue;
-    for (const auto &channel : decal.channels)
-    {
-      if (channel.second < 1.0)
-        continue;
-      const GPUGrassType *type = srv->getTypeByName(channel.first.c_str());
-      if (!type)
-        continue;
-      if (!type->diffuse.empty() && !type->normal.empty())
-        return true;
-    }
-  }
-  return false;
-}
-
 void GPUGrassPanel::reload()
 {
-  if (isGrassValid())
+  if (srv->isGrassValid())
     srv->createGrass(*blk);
   else
     srv->closeGrass();
@@ -317,6 +292,7 @@ void GPUGrassPanel::onClick(int pcb_id, PropPanel::ContainerPropertyControl *pan
         GPUGrassType &type = srv->addType(name.c_str());
         addGrassType(type);
         fillPanel();
+        reload();
       }
     }
     break;
@@ -604,7 +580,7 @@ bool GPUGrassPanel::showMultiListDialog(const char *title, const Tab<String> &en
 
 bool GPUGrassPanel::showListDialog(const char *title, const Tab<String> &entries, int &res)
 {
-  eastl::unique_ptr<PropPanel::DialogWindow> dialog(DAGORED2->createDialog(_pxScaled(250), _pxScaled(200), title));
+  eastl::unique_ptr<PropPanel::DialogWindow> dialog(DAGORED2->createDialog(_pxScaled(250), _pxScaled(240), title));
   PropPanel::ContainerPropertyControl *dlgPanel = dialog->getPanel();
   enum
   {

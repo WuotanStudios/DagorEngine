@@ -36,9 +36,16 @@ upscale_node {
 
   "upscale_tex_gen_node:dafg::NodeHandle"{}
 
-  "upscale_shader:PostFxRenderer"{}
-  upscale_shader_name:t="upscale_sampling"
+  "upscale_shader:ComputeShader"{}
+  upscale_shader_name:t="upscale_sampling_cs"
 
-  "upscale_weights_buffer:UniqueBufHolder"{}
+  "upscale_weights_buffer:UniqueBufWithShaderVar"{}
 
+}
+
+water_refraction_stub {
+  _singleton:b=true
+  _tags:t="render"
+
+  "water_refraction_stub:UniqueTexWithShaderVar"{}
 }

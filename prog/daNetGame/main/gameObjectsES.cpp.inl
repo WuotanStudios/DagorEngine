@@ -3,10 +3,14 @@
 #include "gameObjects.h"
 #include <scene/dag_objsToPlace.h>
 #include <daECS/core/updateStage.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <daECS/core/template.h>
-#include <ecs/core/attributeEx.h>
-#include <ecs/core/utility/ecsRecreate.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/entityComponent.h>
+#include <daECS/core/utility/ecsRecreate.h>
 #include "level.h"
 #include <debug/dag_debug3d.h>
 #include <daEditorE/editorCommon/inGameEditor.h>
@@ -25,7 +29,7 @@ ECS_REGISTER_RELOCATABLE_TYPE(GameObjects, nullptr);
 ECS_AUTO_REGISTER_COMPONENT(GameObjects, "game_objects", nullptr, 0);
 
 template <typename Callable>
-static void all_grid_holders_ecs_query(Callable fn);
+static void all_grid_holders_ecs_query(ecs::EntityManager &manager, Callable fn);
 
 scene::TiledScene *create_ladders_scene(GameObjects &game_objects)
 {
@@ -54,6 +58,7 @@ void create_game_objects(Tab<ObjectsToPlace *> &&objectsToPlace)
         if (game_objects) // client doesn't have this component
         {
           scene::TiledScene *indoor_walls = nullptr;
+          scene::TiledScene *indoor_envbox1 = nullptr;
           for (auto &obj : objMap->objs)
           {
             const RoDataBlock &blk = *obj.addData.getBlockByNameEx("__asset");
@@ -82,6 +87,8 @@ void create_game_objects(Tab<ObjectsToPlace *> &&objectsToPlace)
                 game_objects->indoors = scn;
               else if (strcmp(scn_name, "indoor_walls") == 0)
                 indoor_walls = scn;
+              else if (strcmp(scn_name, "envi_probe_box") == 0)
+                indoor_envbox1 = scn;
             }
             else
               scn = insertPair.first->second.get();
@@ -143,9 +150,9 @@ void create_game_objects(Tab<ObjectsToPlace *> &&objectsToPlace)
               }
             }
           }
-          if (!game_objects->indoors && indoor_walls) // if no native "indoors" inherit from "indoor_walls"
+          if (!game_objects->indoors && (indoor_walls || indoor_envbox1))
           {
-            // NOTE: We have to clone "indoor_walls" scene instead of just pointing to it, because it will
+            // NOTE: We have to clone source scenes nodes instead of just using them, because they will
             //       be stolen by render on client with local server, but we need "indoors" scene for game
             //       on any server, including local server (generally low memory footprint 1Kb..64Kb)
             //
@@ -155,9 +162,18 @@ void create_game_objects(Tab<ObjectsToPlace *> &&objectsToPlace)
               GameObjectsTiledScene *indoors = new GameObjectsTiledScene();
               insertPair.first->second.reset(indoors);
               indoors->setPoolBBox(0, bbox3f{v_neg(V_C_HALF), V_C_HALF});
-              indoors->reserve(indoor_walls->getNodesCount());
-              for (scene::node_index ni : *indoor_walls)
-                indoors->allocate(indoor_walls->getNode(ni), /*pool*/ 0, /*flags*/ 0);
+              uint32_t nodesCount = 0;
+              if (indoor_walls)
+                nodesCount += indoor_walls->getNodesCount();
+              if (indoor_envbox1)
+                nodesCount += indoor_envbox1->getNodesCount();
+              indoors->reserve(nodesCount);
+              if (indoor_walls)
+                for (scene::node_index ni : *indoor_walls)
+                  indoors->allocate(indoor_walls->getNode(ni), /*pool*/ 0, /*flags*/ 0);
+              if (indoor_envbox1)
+                for (scene::node_index ni : *indoor_envbox1)
+                  indoors->allocate(indoor_envbox1->getNode(ni), /*pool*/ 0, /*flags*/ 0);
               game_objects->indoors = indoors;
             }
           }
@@ -232,6 +248,7 @@ static void game_objects_bspheres_es(const UpdateStageInfoRenderDebug &info) { g
 
 ECS_TAG(server)
 static void game_objects_events_es_event_handler(const EventGameObjectsCreated &,
+  ecs::EntityManager &manager,
   GameObjects &game_objects,
   const int *game_objects__seed,
   const ecs::Object *game_objects__syncCreation,
@@ -242,7 +259,7 @@ static void game_objects_events_es_event_handler(const EventGameObjectsCreated &
   int count = 0;
   for (const auto &instances : game_objects.objects)
   {
-    if (!g_entity_mgr->getTemplateDB().getTemplateByName(instances.first))
+    if (!manager.getTemplateDB().getTemplateByName(instances.first))
     {
       logwarn("missing template <%s> for game_object", instances.first);
       continue;
@@ -282,17 +299,18 @@ static void game_objects_events_es_event_handler(const EventGameObjectsCreated &
       }
 
       if (!(game_objects__syncCreation && game_objects__syncCreation->getMemberOr(instanceHash, false)))
-        g_entity_mgr->createEntityAsync(templName.c_str(), eastl::move(attrs));
+        manager.createEntityAsync(templName.c_str(), eastl::move(attrs));
       else
-        g_entity_mgr->createEntitySync(templName.c_str(), eastl::move(attrs));
+        manager.createEntitySync(templName.c_str(), eastl::move(attrs));
       count++;
     }
   }
-  g_entity_mgr->broadcastEvent(EventGameObjectsEntitiesScheduled(count));
+  manager.broadcastEvent(EventGameObjectsEntitiesScheduled(count));
 }
 
 ECS_TAG(gameClient)
-static void game_objects_client_events_es_event_handler(const EventGameObjectsOptimize &, GameObjects &game_objects)
+static void game_objects_client_events_es_event_handler(
+  const EventGameObjectsOptimize &, ecs::EntityManager &manager, GameObjects &game_objects)
 {
   if (has_in_game_editor()) // we keep objects for visibility
     return;
@@ -304,7 +322,7 @@ static void game_objects_client_events_es_event_handler(const EventGameObjectsOp
       continue;
     }
     bool to_remove = instances->first == "loot_box" || instances->first == "loot_crate"; // hardcoded loot boxes
-    if (to_remove || !g_entity_mgr->getTemplateDB().getTemplateByName(instances->first))
+    if (to_remove || !manager.getTemplateDB().getTemplateByName(instances->first))
     {
       debug("keep game_obj %s", instances->first.c_str());
       instances++;
@@ -316,7 +334,8 @@ static void game_objects_client_events_es_event_handler(const EventGameObjectsOp
 }
 
 ECS_TAG(server)
-static void game_objects_events_es_event_handler(const EventGameObjectsOptimize &, GameObjects &game_objects)
+static void game_objects_events_es_event_handler(
+  const EventGameObjectsOptimize &, ecs::EntityManager &manager, GameObjects &game_objects)
 {
   if (has_in_game_editor()) // we keep objects for visibility
     return;
@@ -327,7 +346,7 @@ static void game_objects_events_es_event_handler(const EventGameObjectsOptimize 
       instances++;
       continue;
     }
-    if (!g_entity_mgr->getTemplateDB().getTemplateByName(instances->first))
+    if (!manager.getTemplateDB().getTemplateByName(instances->first))
     {
       debug("keep game_obj %s", instances->first.c_str());
       instances++;

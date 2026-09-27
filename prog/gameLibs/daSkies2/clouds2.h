@@ -36,8 +36,6 @@ struct Clouds2
   }
   bool hasVisibleClouds() const; // GPU readback!
 
-  void setErosionNoiseWindDir(const Point2 &wind_dir) { windDir = wind_dir; } // normalized
-
   void setCloudsShadowCoverage();
 
   void setGameParams(const DaSkies::CloudsSettingsParams &game_params);
@@ -45,6 +43,7 @@ struct Clouds2
   void setWeatherGen(const DaSkies::CloudsWeatherGen &weather_params);
   void setCloudsForm(const DaSkies::CloudsForm &form_params);
   void setCloudsRendering(const DaSkies::CloudsRendering &rendering_params);
+  void setTraceCheckerboard(bool v) { clouds.traceCheckerboard = v; }
 
   // temporary function for a workaround on A8 iPads (gpu hang)
   void setRenderingEnabled(bool enabled) { renderingEnabled = enabled; }
@@ -52,23 +51,37 @@ struct Clouds2
   // causes clouds to change lighting
   void invalidateAll();
 
+  void invalidateLight() { light.invalidate(); }
+
   void init(bool use_hole = true);
-  void update(float dt);
+  void update(float dt, const Point2 &wind_dir);
   void setCloudsOffsetVars(CloudsRendererData &data) { clouds.setCloudsOffsetVars(data, weatherParams.worldSize); }
   void setCloudsOffsetVars(float current_clouds_offset) { clouds.setCloudsOffsetVars(current_clouds_offset, weatherParams.worldSize); }
-  IPoint2 getResolution(CloudsRendererData &data) { return IPoint2(data.w, data.h); }
-  void renderClouds(CloudsRendererData &data, const TextureIDPair &depth, const TextureIDPair &prev_depth, const TMatrix &view_tm,
-    const TMatrix4 &proj_tm, const bool acquare_new_resource = true, const bool set_camera_vars = true);
-  void renderCloudsScreen(CloudsRendererData &data, const TextureIDPair &downsampled_depth, TEXTUREID target_depth,
-    const Point4 &target_depth_transform, const TMatrix &view_tm, const TMatrix4 &proj_tm);
+  IPoint2 getResolution(const CloudsRendererData &data) { return data.cloudTexRes; }
+  void renderCloudsPrepare(CloudsRendererData &data, BaseTexture *depth, BaseTexture *prev_depth, const TMatrix &view_tm,
+    const TMatrix4 &proj_tm, const CloudsRenderFlags flags = CloudsRenderFlags::Default);
+  void renderCloudsApply(CloudsRendererData &data, BaseTexture *downsampled_depth, BaseTexture *target_depth,
+    const Point4 &target_depth_transform, const TMatrix &view_tm, const TMatrix4 &proj_tm,
+    const CloudsRenderFlags flags = CloudsRenderFlags::Default);
 
   bool isPrepareRequired() const { return noises.isPrepareRequired(); }
   bool isReady() const { return noises.isReady(); }
 
-  CloudsChangeFlags prepareLighting(const Point3 &main_light_dir, const Point3 &second_light_dir);
-  void renderCloudVolume(VolTexture *cloud_volume, float max_dist, const TMatrix &view_tm, const TMatrix4 &proj_tm);
-  void setUseShadows2D(bool on);
-  void reset() { noises.reset(); }
+  CloudsChangeFlags prepareLighting(const Point3 &main_light_dir, const Point3 &second_light_dir, bool scattering_ready,
+    const Point2 &camera_xz);
+  // camera teleport catch-up for a per-view origin learned after prepareLighting
+  void ensureBSMWindow(const Point2 &camera_xz, const Point3 &main_light_dir)
+  {
+    cloudShadows.ensureBSMWindow(camera_xz, main_light_dir);
+  }
+  void renderCloudVolume(VolTexture *cloud_volume, TEXTUREID prev_cloud_volume, float max_dist, const TMatrix &view_tm,
+    const TMatrix4 &proj_tm, const TMatrix4 &prev_glob_tm);
+  void resetCloudsShadows();
+  void reset()
+  {
+    noises.reset();
+    noises.close();
+  }
 
   void layersHeightsBarrier() { field.layersHeightsBarrier(); }
 
@@ -85,13 +98,30 @@ struct Clouds2
       field.invalidate();
   }
 
+  void initNBS(const String &root_graph) { field.initNBS(root_graph); }
+  bool updateNBSShaders(const String &shader_name, const DataBlock &shader_blk, String &out_errors)
+  {
+    if (field.updateNBSShaders(shader_name, shader_blk, out_errors))
+    {
+      cloudShadows.invalidate();
+      return true;
+    }
+
+    return false;
+  }
+  void enableNBSOptionalGraph(const String &graph_name, bool enable) { field.enableNBSOptionalGraph(graph_name, enable); }
+  void closeNBS() { field.closeNBS(); }
+
+  bool isLightRendered() const;
+
+  bool isLightingConverged() const;
+
 private:
   void initHole();
   bool findHole(const Point3 &main_light_dir);
   bool validateHole(const Point3 &main_light_dir);
 
   void invalidateWeather();
-  void invalidateLight() { light.invalidate(); }
   void invalidateShadows();
   void setCloudLightVars();
   void setCloudRenderingVars();
@@ -100,7 +130,7 @@ private:
   static Point2 alt_to_diap(float bottom, float thickness, float bigger_bottom, float bigger_thickness);
   void calcCloudsAlt();
 
-  void updateErosionNoiseWind(float dt);
+  void updateErosionNoiseWind(float dt, const Point2 &wind_dir);
 
 protected:
   GenWeather weather;
@@ -118,9 +148,12 @@ protected:
   DaSkies::CloudsWeatherGen weatherParams;
   DaSkies::CloudsForm formParams;
   DaSkies::CloudsRendering renderingParams;
+  // a visible rendering param changed: report CLOUDS_INVALIDATED once so a converged
+  // panorama re-renders (the light volume alone updates incrementally and never does)
+  bool renderingParamsDirty = false;
 
   Point2 clouds_erosion_noise_wind_ofs = {0, 0};
-  Point2 windDir = {0, 0}, erosionWindChange = {0, 0};
+  Point2 erosionWindChange = {0, 0};
   Point3 holeTarget = {0, 0, 0};
   float holeDensity = 0;
   enum class HoleFindStatus
@@ -132,8 +165,8 @@ protected:
   EventQueryHolder holeReadbackQuery;
   bool useHole = true;
 
-  UniqueBufHolder holeBuf;
-  UniqueTexHolder holeTex;
+  UniqueBufWithShaderVar holeBuf;
+  UniqueTexWithShaderVar holeTex;
   UniqueTex holePosTex;
 
   eastl::unique_ptr<ComputeShaderElement> clouds_hole_cs;

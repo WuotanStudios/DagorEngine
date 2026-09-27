@@ -26,6 +26,7 @@ struct CameraSetup
 
   float fovSettings = 90.f;
   float fov = 90.f;
+  float cockpitFov = -1.0f;
   float znear = 0.1f;
   float zfar = 5000.f;
 
@@ -45,8 +46,8 @@ namespace ecs
 {
 class EntityManager;
 }
-CameraSetup get_active_camera_setup(ecs::EntityManager &manager);
-CameraSetup get_active_camera_setup();
+CameraSetup get_active_camera_setup(ecs::EntityManager &manager, bool allow_missing_camera = false);
+CameraSetup get_active_camera_setup(bool allow_missing_camera = false);
 
 //! Convinience function to calculate glob tm from camera
 TMatrix4 calc_active_camera_globtm();

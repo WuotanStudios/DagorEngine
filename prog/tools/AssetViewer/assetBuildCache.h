@@ -1,6 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include <propPanel/control/menu.h>
 #include <generic/dag_tabFwd.h>
 #include <util/dag_string.h>
 
@@ -8,18 +9,73 @@ class DagorAssetMgr;
 class DagorAsset;
 class DataBlock;
 
+using PackId = uint64_t;
+static constexpr uint64_t INVALID_PACK_ID = ~uint64_t(0);
 
 bool init_dabuild_cache(const char *start_dir);
 void term_dabuild_cache();
+
+struct DaBuildProgress
+{
+  int phase = 0; // 0 = none, 1 = tex packs, 2 = grp packs
+  int packDone = 0;
+  int packTotal = 0;
+  int assetDone = 0;
+  int assetTotal = 0;
+};
+
+bool is_dabuild_running();
+void stop_dabuild_background();
+void update_dabuild_background(PropPanel::IMenu *mm);
+DaBuildProgress get_dabuild_progress();
+int get_dabuild_jobs();
+void set_dabuild_jobs(int jobs);
+int get_dabuild_max_jobs();
+bool get_dabuild_current_build_uses_jobs();
+void render_dabuild_imgui();
+void bring_dabuild_to_front_explicit();
+
+bool is_queued(uint64_t pack_id, unsigned tc);
+void queue_add_pack(uint64_t pack_id, unsigned tc);
+void queue_remove_pack(uint64_t pack_id, unsigned tc);
+void queue_toggle_pack(uint64_t pack_id, unsigned tc);
+// PC first, then the additional platforms: export_queue() groups packs by tc sequence, not by set
+void queue_get_all_platform_tcs(Tab<unsigned> &out_tcs);
+
+enum class PacksQueueState
+{
+  None,
+  Partial,
+  All
+};
+// label and action must both read this or they drift apart; ids that resolve to no pack are skipped
+PacksQueueState queue_get_packs_state(dag::ConstSpan<uint64_t> pack_ids, unsigned tc);
+// All counts the current platforms only; None means nothing at all is stored, including a code the workspace no longer lists
+PacksQueueState queue_get_packs_state_all_platforms(dag::ConstSpan<uint64_t> pack_ids);
+
+void queue_add_missing_packs(dag::ConstSpan<uint64_t> pack_ids, unsigned tc);
+void queue_add_missing_packs_all_platforms(dag::ConstSpan<uint64_t> pack_ids);
+void queue_remove_packs(dag::ConstSpan<uint64_t> pack_ids, unsigned tc);
+void queue_remove_packs_all_platforms(dag::ConstSpan<uint64_t> pack_ids);
+void queue_add_pack_all_platforms(uint64_t pack_id);
+void queue_remove_all();
+void queue_select_all_known_packs();
+void export_queue();
+
+dag::ConstSpan<unsigned> queue_get_pack_tcs(uint64_t pack_id);
 
 int bind_dabuild_cache_with_mgr(DagorAssetMgr &mgr, DataBlock &appblk, const char *appdir);
 
 void post_base_update_notify_dabuild();
 
-const char *get_asset_pack_name(DagorAsset *asset);
+String get_asset_pack_name(DagorAsset *asset);
 String get_asset_pkg_name(DagorAsset *asset);
+uint64_t make_pack_id(const char *pkg, const char *pack);
 
 bool check_assets_base_up_to_date(dag::ConstSpan<const char *> packs, bool tex, bool res);
+
+// Fast, approximate variant for the startup scan only - see IDaBuildInterface::quickCheckUpToDate().
+bool quick_check_assets_base_up_to_date(dag::ConstSpan<const char *> packs, bool tex, bool res);
 void rebuild_assets_in_folders_single(unsigned trg_code, dag::ConstSpan<int> folders_idx, bool tex, bool res);
 void rebuild_assets_in_folders(dag::ConstSpan<unsigned> tc, dag::ConstSpan<int> folders_idx, bool tex, bool res);
 void rebuild_assets_in_root(dag::ConstSpan<unsigned> tc, bool build_tex, bool build_res);

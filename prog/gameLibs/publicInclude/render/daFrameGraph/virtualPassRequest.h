@@ -133,7 +133,7 @@ private:
  */
 class VirtualPassRequest
 {
-  friend class Registry;
+  friend class BaseRegistry;
   VirtualPassRequest(NodeNameId node, InternalRegistry *reg);
 
   using RRP = detail::ResourceRequestPolicy;
@@ -158,12 +158,28 @@ public:
   using DepthRoVirtualAttachmentRequest =
     detail::VirtualAttachmentRequest<RRP::Optional | RRP::HasUsageStage | RRP::HasUsageType, RRP::None>;
   /**
+   * \brief Test-only depth: accepts a string name, a modify request or a
+   * read request. Optional/explicit usage are not allowed (we set them).
+   * Readonly is permitted because the caller may want to bind a depth
+   * obtained via an explicit `.read(...)` chain (e.g. cross-namespace).
+   */
+  using DepthReadTestOnlyVirtualAttachmentRequest =
+    detail::VirtualAttachmentRequest<RRP::Optional | RRP::HasUsageStage | RRP::HasUsageType, RRP::None>;
+  /**
    * \brief For RO depth that is also sampled through a shader var (SV),
    * we also prohibit optional requests and while the usage type is
    * determined by us (simultaneous depth+sampling), stage should
    * be provided separately.
    */
   using DepthRoAndSvBindVirtualAttachmentRequest = detail::VirtualAttachmentRequest<RRP::Optional | RRP::HasUsageType, RRP::None>;
+  /**
+   * \brief For RO depth that is also sampled through a shader var (SV),
+   * we also prohibit optional requests and while the usage type is
+   * determined by us (simultaneous depth+sampling), stage should
+   * be provided separately.
+   */
+  using DepthReadTestAndSampleVirtualAttachmentRequest =
+    detail::VirtualAttachmentRequest<RRP::Optional | RRP::HasUsageType, RRP::None>;
   /**
    * \brief Input attachments are not allowed to be history, as renderpasses
    * cannot span frame boundaries. Usage is determined by us.
@@ -194,43 +210,84 @@ public:
 
   /**
    * \brief Specifies the depth attachment for this virtual pass and
-   * enables depth write. The specified resource request MUST
+   * enables depth read+write. The specified resource request MUST
    * be a modify request.
    * Call this with either a resource request object or an object name.
    * You can also optionally specify mip/layer using braces:
    * `{"cube", 0, 1}`.
    *
+   * Behavior:
+   *  - Decompression: NO (the depth surface stays in its native, compressed form).
+   *  - Z-write override: NO (shaders may write depth as usual).
+   *  - Sampling: NO (the depth texture is not bound to any shader var by this call).
+   *
    * \param attachment The attachment to use as depth.
    *   This method should be usable without understanding the internals
    *   of detail::VirtualAttachmentRequest most of the time.
    */
-  VirtualPassRequest depthRw(RwVirtualAttachmentRequest attachment) &&;
-
-  // DEPRECATED AND POINTLESS, DON'T USE
-  VirtualPassRequest depthRo(DepthRoVirtualAttachmentRequest attachment) &&;
+  VirtualPassRequest depth(RwVirtualAttachmentRequest attachment) &&;
 
   /**
-   * \brief Specifies the depth attachment for this virtual pass,
-   * disables depth write and binds it to several shader variable for
-   * sampling inside a shader.
+   * \brief Specifies the depth attachment for this virtual pass as a
+   * read+write depth target while restricting the node to read/test-only
+   * usage of depth.
    *
-   * \details This can only be called with a resource request object
-   * and not a string name, due to requiring `stage` to be specified as
-   * all stages where these shader vars will be used.
+   * The depth target is bound exactly like \ref depth() (no driver-side
+   * decompression), but the node is ordered as if it were a depth READER
+   * (so it can run after a depth writer in parallel with other readers).
+   *
+   * Use this when the node only needs to test against depth (e.g. a
+   * decals/transparency pass that wants depth-test but not depth-write
+   * and does not sample the depth texture in shaders).
+   *
+   * \warning Contract: shaders rendered in this node MUST NOT write to
+   * depth. This is not enforced by daFG - the framework binds depth as
+   * RW (to avoid decompression) and relies on shader pipeline state to
+   * keep Z-write disabled. Violating the contract causes data races with
+   * other depth readers since this node is ordered as a reader in the
+   * graph. If your shaders may write Z, use \ref depth() instead.
+   *
+   * Behavior:
+   *  - Decompression: NO (the depth surface stays compressed; this is the
+   *    main reason to prefer this over depthReadTestAndSample()).
+   *  - Z-write enforcement: NO (caller's responsibility, see warning above).
+   *  - Sampling: NO (the depth texture is not bound to any shader var by
+   *    this call). Use \ref depthReadTestAndSample() if shaders need to
+   *    sample depth.
+   *
+   * \param attachment The attachment to use as depth.
+   */
+  VirtualPassRequest depthReadTestOnly(DepthReadTestOnlyVirtualAttachmentRequest attachment) &&;
+
+  /**
+   * \brief Specifies the depth attachment for this virtual pass as a
+   * read-only (decompressed) target and binds the underlying depth
+   * texture to one or more shader variables for sampling inside shaders.
+   *
+   * \details This can be called with a resource request object or a
+   * plain string name. Resource requests may carry an explicit stage
+   * (for the rare case of sampling depth in non-PS stages); string-named
+   * requests default to POST_RASTER stage.
    *
    * Note however that the resource request may be either read or
    * modify, which will determine the ordering for this node.
    *
-   * This is is only multi-usage API in daFG, an exception to the one
+   * This is the only multi-usage API in daFG, an exception to the one
    * usage per node guideline.
    *
-   * Warning: switching between RO and RW depth requires decompression
-   * and recompression on AMD hardware, which is expensive.
+   * Behavior:
+   *  - Decompression: YES (depth is bound RO/decompressed so shaders can
+   *    sample it; switching back to RW later requires recompression on
+   *    AMD hardware, which is expensive).
+   *  - Z-write override: implicit -- the render pass binds depth as RO,
+   *    so the GPU itself prevents depth writes regardless of shader state.
+   *  - Sampling: YES (the depth texture is bound to each shader var in
+   *    \p shader_var_names).
    *
    * \param attachment The resource request for the depth attachment.
    * \param shader_var_names A list of shader var names to be bound.
    */
-  VirtualPassRequest depthRoAndBindToShaderVars(DepthRoAndSvBindVirtualAttachmentRequest attachment,
+  VirtualPassRequest depthReadTestAndSample(DepthReadTestAndSampleVirtualAttachmentRequest attachment,
     std::initializer_list<const char *> shader_var_names) &&;
 
   /**

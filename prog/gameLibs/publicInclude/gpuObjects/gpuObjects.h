@@ -6,6 +6,7 @@
 
 #include <EASTL/span.h>
 #include <EASTL/stack.h>
+#include <EASTL/utility.h>
 #include <EASTL/unique_ptr.h>
 #include <EASTL/vector_set.h>
 #include <EASTL/vector_map.h>
@@ -18,6 +19,7 @@
 #include <rendInst/renderPass.h>
 #include <rendInst/layerFlags.h>
 #include <rendInst/riShaderConstBuffers.h>
+#include <rendInst/clientRiexPool.h>
 #include <math/integer/dag_IPoint3.h>
 #include <math/dag_hlsl_floatx.h>
 #include <math/dag_frustum.h>
@@ -52,7 +54,6 @@ private:
   ToroidalHelper toroidalGrid;
   BufPtr gatheredBuffer;
   BufPtr countersBuffer, bboxesBuffer;
-  BufPtr matricesOffsetsBuffer;
   uint32_t cellDispatchTile = 0;
   uint32_t cellTile = 0, cellTileOrig = 0, cellsSideCount = 0, cellsCount = 0;
   uint32_t maxObjectsCountInCell = 0;
@@ -73,7 +74,6 @@ private:
   eastl::vector<AppendOrder> appendOrder;
   eastl::vector<uint32_t> counters;
   eastl::vector<bbox3f> cellsBboxes;
-  eastl::vector<uint32_t> matricesOffsets;
   eastl::unique_ptr<ComputeShaderElement> inCellPlacer, counterAndBboxCleaner;
   eastl::unique_ptr<ComputeShaderElement> gatherMatrices;
   bool waitingForGpuData = false;
@@ -93,27 +93,28 @@ private:
   void updateBuffer();
   void setShaderVarsAndConsts();
   bool dispatchNextCell();
-  void makeMatricesOffsetsBuffer();
 
   void onLandPlacing();
   void setBombHoleShaderGlobals(const CellToUpdateData cellData);
 
   void processBboxes(const eastl::span<int32_t> &raw_bboxes);
-  void copyMatrices(const eastl::vector<uint32_t> &cells_to_copy, const eastl::vector<uint32_t> &cell_counters, Sbuffer *dst_buffer,
-    Sbuffer *src_buffer, uint32_t max_in_cell, uint32_t dst_offset_bytes, uint32_t lod);
+  void copyMatrices(const eastl::vector<uint32_t> &cells_to_copy, Sbuffer *dst_buffer, Sbuffer *src_buffer, Sbuffer *shared_offsets,
+    uint32_t max_in_cell, uint32_t dst_offset_bytes, uint32_t lod);
   eastl::string assetName;
-  uint32_t riPoolId;
+  rendinst::ClientRiexPoolId riPoolId;
   uint32_t riPoolOffset;
-  SharedTexHolder mapTexId;
+  SharedTexWithShaderVar mapTexId;
   int numLods;
   eastl::array<float, MAX_LODS> distSqLod;
   eastl::array<eastl::vector<uint32_t>, MAX_LODS> cellIndexesByLods;
+  eastl::array<uint32_t, MAX_LODS> sharedOffsetsBase = {};
+  eastl::array<uint32_t, MAX_LODS> maxMatricesPerCell = {};
 
   eastl::vector<Point4> bomb_holes;
 
 public:
   rendinst::LayerFlag layer = rendinst::LayerFlag::Opaque;
-  ObjectManager(const char *name, uint32_t ri_pool_id, int cell_tile, int cells_size_count, float cell_size,
+  ObjectManager(const char *name, rendinst::ClientRiexPoolId ri_pool_id, int cell_tile, int cells_size_count, float cell_size,
     float bounding_sphere_radius, dag::ConstSpan<float> dist_sq_lod, const PlacingParameters &parameters);
   ObjectManager(const ObjectManager &) = delete;
   ObjectManager(ObjectManager &&);
@@ -128,14 +129,15 @@ public:
   float getLodRange(int lod) { return sqrt(distSqLod[lod]); }
   int getCellsSizeCount() { return cellsSideCount; }
 
-  uint32_t getRiId() const { return riPoolId; }
+  uint32_t getRiId() const { return riPoolId.id(); }
 
   void getParameters(PlacingParameters &p) { p = parameters; }
 
   void update(const Point3 &origin);
   void gatherBuffers();
   void updateVisibilityAndLods(const Frustum &frustum, const Occlusion *occlusion, ShadowPass for_shadow);
-  void addMatricesToBuffer(Sbuffer *buffer, uint32_t offset_in_bytes, int lod);
+  void appendMatricesOffsets(eastl::vector<eastl::pair<uint32_t, uint32_t>> &shared_offsets, int lod);
+  void addMatricesToBuffer(Sbuffer *buffer, uint32_t offset_in_bytes, int lod, Sbuffer *shared_offsets);
   void onLandGpuInstancing(Sbuffer *indirection_buffer, int offset);
   uint32_t getInstancesToDraw(uint32_t lod) const;
   uint32_t getInstancesInGridToDraw(uint32_t lod) const;
@@ -200,24 +202,26 @@ private:
   };
   eastl::vector<CascadeData> cascades;
   eastl::vector<ObjectManager> objects;
-  eastl::vector<uint16_t> objectIds;
+  eastl::vector<rendinst::ClientRiexPoolId> objectIds;
   uint32_t maxRowsCountInBuffer = 0;
+  BufPtr sharedOffsetsBuffer;
+  eastl::vector<eastl::pair<uint32_t, uint32_t>> sharedOffsets;
   eastl::unique_ptr<ComputeShaderElement> gpuInstancingGenerateIndirect;
   eastl::unique_ptr<ComputeShaderElement> gpuInstancingRebuildRelems;
-
-  static BVHConnection *bvhConnection;
 
   struct GatherBuffersJob final : public cpujobs::IJob
   {
     GpuObjects *thiz = nullptr;
     int threadIx = 0;
-    const char *getJobName(bool &) const override { return "GatherBuffersJob"; }
+    const char *getJobName(bool &) const override { return DAPROFILER_STRING("GatherBuffersJob"); }
     void doJob() override;
   } gatherBuffersJobs[4];
 
 public:
+  static BVHConnection *bvhConnection;
   static void setBVHConnection(BVHConnection *bvh_connection) { bvhConnection = bvh_connection; }
 
+  GpuObjects();
   ~GpuObjects();
 
   void invalidate()
@@ -249,20 +253,21 @@ public:
     G_ASSERT_FAIL("GPU objects don't handle this rendinst layer: %d", eastl::to_underlying(layer_ri));
     return GPUOBJ_LAYER_OPAQUE;
   }
-  void addObject(const char *name, const int id, int cell_tile, int grid_size, float cell_size, float bounding_sphere_radius,
-    dag::ConstSpan<float> dist_sq_lod, const PlacingParameters &parameters)
+  void addObject(const char *name, rendinst::ClientRiexPoolId ri_pool_id, int cell_tile, int grid_size, float cell_size,
+    float bounding_sphere_radius, dag::ConstSpan<float> dist_sq_lod, const PlacingParameters &parameters)
   {
-    if (eastl::find(objectIds.begin(), objectIds.end(), id) != objectIds.end())
+    if (eastl::find(objectIds.begin(), objectIds.end(), ri_pool_id) != objectIds.end())
       return;
 
     if (objects.size() == MAX_GPU_OBJECTS)
     {
-      logerr("GPUObjects: Trying to add object %s with id %d, but reached maximum number of objects (%d)", name, id, MAX_GPU_OBJECTS);
+      logerr("GPUObjects: Trying to add object %s with id %d, but reached maximum number of objects (%d)", name, ri_pool_id.id(),
+        MAX_GPU_OBJECTS);
       return;
     }
 
-    objects.emplace_back(name, id, cell_tile, grid_size, cell_size, bounding_sphere_radius, dist_sq_lod, parameters);
-    objectIds.push_back(id);
+    objects.emplace_back(name, ri_pool_id, cell_tile, grid_size, cell_size, bounding_sphere_radius, dist_sq_lod, parameters);
+    objectIds.push_back(ri_pool_id);
     for (CascadeData &cascade : cascades)
     {
       cascade.matricesBuffer.close();
@@ -317,7 +322,7 @@ public:
     return make_span_const(cascades[cascade].layers[layerIdx].objectLodOffsets, MAX_LODS);
   }
 
-  void changeParameters(int idx, const PlacingParameters &parameters)
+  void changeParameters(rendinst::ClientRiexPoolId idx, const PlacingParameters &parameters)
   {
     for (int i = 0; i < objectIds.size(); ++i)
       if (objectIds[i] == idx)
@@ -327,7 +332,7 @@ public:
       }
   }
 
-  void changeGrid(int idx, int cell_tile, int grid_size, float cell_size)
+  void changeGrid(rendinst::ClientRiexPoolId idx, int cell_tile, int grid_size, float cell_size)
   {
     for (int i = 0; i < objectIds.size(); ++i)
       if (objectIds[i] == idx)
@@ -338,7 +343,7 @@ public:
       }
   }
 
-  void getCellData(int idx, int &cell_tile, int &cells_size_count, float &cell_size)
+  void getCellData(rendinst::ClientRiexPoolId idx, int &cell_tile, int &cells_size_count, float &cell_size)
   {
     for (int i = 0; i < objectIds.size(); ++i)
       if (objectIds[i] == idx)
@@ -348,7 +353,7 @@ public:
       }
   }
 
-  void getParameters(int idx, PlacingParameters &p)
+  void getParameters(rendinst::ClientRiexPoolId idx, PlacingParameters &p)
   {
     for (int i = 0; i < objectIds.size(); ++i)
       if (objectIds[i] == idx)

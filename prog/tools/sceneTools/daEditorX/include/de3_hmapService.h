@@ -12,9 +12,9 @@
 #include <util/dag_stdint.h>
 #include <libTools/util/makeBindump.h>
 #include <physMap/physMap.h>
+#include <heightmap/heightmapCulling.h>
 
 class HeightmapLandRenderer;
-class IHeightmapLandProvider;
 class LandMeshRenderer;
 class LandMeshManager;
 class IBBox2;
@@ -85,8 +85,11 @@ public:
 
   //! Heightmap2 renderer support
   virtual void initLodGridHm2(const DataBlock &blk) = 0;
+  virtual void updateMetricsHm2(bool use_metrics, const HeightMapStorage &htStorage, bool show_final_hmap, float cellSize,
+    float waterLevel) = 0;
+  virtual bool areMetricsUsedForHm2() const = 0;
   virtual void setupRenderHm2(float sx, float sy, float ax, float ay, Texture *htTexMain, TEXTUREID htTexIdMain, float mx0, float my0,
-    float mw, float mh, Texture *htTexDet, TEXTUREID htTexIdDet, float dx0, float dy0, float dw, float dh) = 0;
+    float mw, float mh, Texture *htTexDet, TEXTUREID htTexIdDet, float dx0, float dy0, float dw, float dh, const Point3 &vpos) = 0;
   virtual void renderHm2(LandMeshRenderer &r, const Point3 &vpos, bool infinite, bool render_hm = false) const = 0;
   virtual void renderHm2VSM(LandMeshRenderer &r, const Point3 &vpos) const = 0;
 
@@ -110,12 +113,27 @@ public:
   virtual void renderLandMeshGrassMask(LandMeshRenderer &r, LandMeshManager &p) const = 0;
   virtual void startUAVFeedback() const = 0;
   virtual void endUAVFeedback() const = 0;
+  virtual void copyUAVFeedback() const = 0;
+
+  virtual void beforeD3DReset(bool full_reset) = 0;
+  virtual void afterD3DReset(bool full_reset) = 0;
+  virtual void afterD3DResetLandMesh(LandMeshManager &p, LandMeshRenderer *r, bool full_reset) = 0;
+
+  virtual void invalidatePhysMatHtTex() = 0;
+  virtual void setShouldShowPhysMatColors(bool val) = 0;
 
   virtual void updateGrassTranslucency(LandMeshRenderer &r, LandMeshManager &p) const = 0;
 
   virtual void updatePropertiesFromLevelBlk(const DataBlock &level_blk) = 0;
 
   virtual void resetTexturesLandMesh(LandMeshRenderer &r) const = 0;
+
+  // land detail weights: the plugin reads the painted map into one page-sized
+  // weight plane per landclass slot (see landMesh/lmeshWeightAtlas.h), the
+  // atlas packs them
+  virtual int getLandWeightCellTexSize(LandMeshManager &p) const = 0;
+  virtual void setLandWeights(LandMeshManager &p, int cell_idx, const uint8_t *const *planes, int num_tex) const = 0;
+  virtual void uploadLandWeights(LandMeshManager &p) const = 0;
 
   virtual bool exportToGameLandMesh(mkbindump::BinDumpSaveCB &cwr, dag::ConstSpan<landmesh::Cell> cells,
     dag::ConstSpan<MaterialData> materials, int lod1TrisDensity, bool tools_internal) const = 0;
@@ -126,19 +144,22 @@ public:
   //! LandMesh CachedTexElement support
   virtual bool mapStorageFileExists(const char *fname) const = 0;
   virtual void onLevelBlkLoaded(const DataBlock &blk) = 0;
+  //! Re-apply the land micro details of the last loaded level blk. The service owns them, but the
+  //! shadervars are global, so another renderer loading its own level can drop them.
+  virtual void reloadLandMicroDetails() = 0;
 
   //! detail coloring support
   // obsolete
-  virtual void createDetLayerClassList(const DataBlock &blk) {}
+  virtual void createDetLayerClassList(const DataBlock &) {}
   virtual dag::Span<HmapDetLayerProps> getDetLayerClassList() { return {}; }
-  virtual int resolveDetLayerClassName(const char *nm) { return -1; }
+  virtual int resolveDetLayerClassName(const char *) { return -1; }
 
-  virtual void *createDetailRenderData(const DataBlock &layers, LandClassDetailInfo *detTex) { return 0; }
-  virtual void destroyDetailRenderData(void *handle) {}
-  virtual void updateDetailRenderData(void *handle, const DataBlock &layers) {}
-  virtual Texture *getDetailRenderDataMaskTex(void *handle, const char *name) { return 0; }
-  virtual TEXTUREID getDetailRenderDataTex(void *handle, const char *name) { return BAD_TEXTUREID; }
-  virtual void storeDetailRenderData(void *handle, const char *prefix, bool store_cmap, bool store_smap) {}
+  virtual void *createDetailRenderData(const DataBlock &, LandClassDetailInfo *) { return 0; }
+  virtual void destroyDetailRenderData(void *) {}
+  virtual void updateDetailRenderData(void *, const DataBlock &) {}
+  virtual Texture *getDetailRenderDataMaskTex(void *, const char *) { return 0; }
+  virtual TEXTUREID getDetailRenderDataTex(void *, const char *) { return BAD_TEXTUREID; }
+  virtual void storeDetailRenderData(void *, const char *, bool, bool) {}
   //==
 
   virtual const char *getLandPhysMatName(int pmatId) = 0;
@@ -162,10 +183,14 @@ public:
   virtual void prepare(LandMeshRenderer &r, LandMeshManager &p, const Point3 &center_pos, const BBox3 &box) = 0;
   virtual LMeshRenderingMode setGrassMaskRenderingMode(LandMeshRenderer &r) = 0;
   virtual void restoreRenderingMode(LandMeshRenderer &r, LMeshRenderingMode oldMode) = 0;
-  virtual int setLod0SubDiv(int) = 0;
   virtual BBox3 getLMeshBBoxWithHMapWBBox(LandMeshManager &p) const = 0;
   virtual PhysMap *loadPhysMap(LandMeshManager *landMeshManager, IGenLoad &crd) = 0;
   virtual void beforeRender() = 0;
+
+  virtual const char *getGlobalPaintDetailsTexName() const = 0;
+
+  using DecalsCb = void (*)(const BBox3 &);
+  virtual DecalsCb getDecalsRenderCb() const = 0;
 };
 
 struct HmapBitLayerDesc

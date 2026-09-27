@@ -9,6 +9,9 @@
 #include "editorLandRayTracer.h"
 #include <landMesh/lmeshRenderer.h>
 #include <landMesh/lmeshManager.h>
+#include <landMesh/lmeshWeightAtlas.h>
+#include <landMesh/landRayTracerSoA4.h>
+#include <ioSys/dag_memIo.h>
 #include <ioSys/dag_ioUtils.h>
 #include <ioSys/dag_lzmaIo.h>
 #include <ioSys/dag_zstdIo.h>
@@ -69,9 +72,8 @@ enum
   BOTTOM_COUNT
 };
 
-LandMeshMap::LandMeshMap() : size(0, 0), origin(0, 0), cellSize(0), editorLandTracer(NULL), materials(midmem), textures(tmpmem)
+LandMeshMap::LandMeshMap() : size(0, 0), origin(0, 0), cellSize(0), materials(midmem), textures(tmpmem)
 {
-  gameLandTracer = NULL;
   landMatSG = new StaticGeometryMaterial;
   landMatSG->name = "LandMeshGenerated@hmap";
   landMatSG->className = "land_mesh";
@@ -171,7 +173,8 @@ void LandMeshMap::clear(bool clear_tracer)
   clear_and_shrink(cells);
   if (clear_tracer)
   {
-    del_it(editorLandTracer);
+    for (auto &t : editorLandTracer)
+      del_it(t);
     del_it(gameLandTracer);
   }
 
@@ -199,23 +202,25 @@ BBox3 LandMeshMap::getBBox(int x, int y, float *sphere_radius)
 }
 
 // traceRay
-bool LandMeshMap::traceRay(const Point3 &p, const Point3 &dir, real &t, Point3 *normal) const
+bool LandMeshMap::traceRay(bool lmesh_only, const Point3 &p, const Point3 &dir, real &t, Point3 *normal) const
 {
-  return editorLandTracer && editorLandTracer->traceRay(p, dir, t, normal);
+  auto *tr = editorLandTracer[(!lmesh_only && editorLandTracer[0]) ? 0 : 1];
+  return tr && tr->traceRay(p, dir, t, normal);
 }
 
-bool LandMeshMap::getHeight(const Point2 &p, real &ht, Point3 *normal) const
+bool LandMeshMap::getHeight(bool lmesh_only, const Point2 &p, real &ht, Point3 *normal) const
 {
-  return editorLandTracer && editorLandTracer->getHeight(p, ht, normal);
+  auto *tr = editorLandTracer[(!lmesh_only && editorLandTracer[0]) ? 0 : 1];
+  return tr && tr->getHeight(p, ht, normal);
 }
 
-void LandMeshMap::setEditorLandRayTracer(EditorLandRayTracer *lrt)
+void LandMeshMap::setEditorLandRayTracer(EditorLandRayTracer *lrt, bool full)
 {
-  if (editorLandTracer)
-    delete editorLandTracer;
-  editorLandTracer = lrt;
+  auto &t = editorLandTracer[full ? 1 : 0];
+  del_it(t);
+  t = lrt;
 }
-void LandMeshMap::setGameLandRayTracer(LandRayTracer *lrt)
+void LandMeshMap::setGameLandRayTracer(EditorLandRayTracer *lrt)
 {
   if (gameLandTracer)
     delete gameLandTracer;
@@ -550,11 +555,12 @@ void LandMeshMap::getMd5HashForGenerate(unsigned char *md5_hash, HeightMapStorag
 // return true if loaded from cache
 static bool delaunayGenerateCached(LandMeshMap &land, HeightMapStorage &heightmap, float error_threshold, int point_limit,
   delaunay::Map *hmap, Mesh &mesh_out, float cell, const Point3 &ofs, DelaunayImportanceMask *mask, dag::ConstSpan<Point3> add_pts,
-  dag::ConstSpan<Point3> water_border_polys)
+  dag::ConstSpan<Point3> water_border_polys, bool early_pass)
 {
   CoolConsole &con = DAGORED2->getConsole();
 
-  String fnameData(DAGORED2->getPluginFilePath(HmapLandPlugin::self, "delaunayGen.cache.bin"));
+  String fnameData(
+    DAGORED2->getPluginFilePath(HmapLandPlugin::self, early_pass ? "delaunayGenEarly.cache.bin" : "delaunayGen.cache.bin"));
 
   unsigned char currentHash[MD5_LEN];
   land.getMd5HashForGenerate(currentHash, heightmap, error_threshold, point_limit, cell, ofs, mask, add_pts, water_border_polys);
@@ -600,6 +606,8 @@ static bool delaunayGenerateCached(LandMeshMap &land, HeightMapStorage &heightma
         DEBUG_DUMP_VAR(Point3::xzy(v));
     }
 
+    int prev_bottom_pts = 0;
+    eastl::unique_ptr<ctl::DelaunayTriangulation> dt;
     while (need_re_delaunay && re_delaunay_iter < 10)
     {
       debug_flush(true);
@@ -607,56 +615,64 @@ static bool delaunayGenerateCached(LandMeshMap &land, HeightMapStorage &heightma
       int time0l = dagTools->getTimeMsec();
       mesh_out.face.resize(0);
 
-      ctl::DelaunayTriangulation dt{boundary, 64 << 10};
-      bool detected_errors = false;
+      if (!dt)
+      {
+        dt.reset(new ctl::DelaunayTriangulation{boundary, 64 << 10});
+        bool detected_errors = false;
 
-      // add land boundary points first to force proper sides
-      for (const auto &v : mesh_out.vert)
-        if (fabs(v.x - boundary[0].x) < 1e-6 || fabs(v.z - boundary[0].y) < 1e-6 || //
-            fabs(v.x - boundary[2].x) < 1e-6 || fabs(v.z - boundary[2].y) < 1e-6)
-          dt.InsertConstrainedPoint({v.x, v.z, v.y});
+        // add land boundary points first to force proper sides
+        for (const auto &v : mesh_out.vert)
+          if (fabs(v.x - boundary[0].x) < 1e-6 || fabs(v.z - boundary[0].y) < 1e-6 || //
+              fabs(v.x - boundary[2].x) < 1e-6 || fabs(v.z - boundary[2].y) < 1e-6)
+            dt->InsertConstrainedPoint({v.x, v.z, v.y});
 
-      ctl::PointList poly_pts;
-      for (int i = 0; i < water_border_polys.size(); i++)
-        if (water_border_polys[i].x > 1e12f)
+        ctl::PointList poly_pts;
+        for (int i = 0; i < water_border_polys.size(); i++)
+          if (water_border_polys[i].x > 1e12f)
+          {
+            auto points = make_span_const(&water_border_polys[i + 1], unsigned(water_border_polys[i].y));
+            if (water_border_polys[i].z >= 2)
+            {
+              debug("skip corrupted border %d pts", points.size());
+              continue;
+            }
+            bool closed = water_border_polys[i].z < 0.5f;
+            // debug("add new border %d pts, closed=%d", points.size(), closed);
+            poly_pts.clear();
+            poly_pts.reserve(points.size());
+            for (const auto &p : points)
+              poly_pts.push_back({p.x, p.z, p.y});
+            if (closed)
+              poly_pts.push_back({poly_pts[0]});
+            dt->InsertConstrainedLineString(poly_pts);
+            if (dt->error())
+            {
+              detected_errors = true;
+              logerr("detected corrupted border %d pts, closed=%d", points.size(), closed);
+              const_cast<float &>(water_border_polys[i].z) = 2; // mark corrupted
+              // reinit DelaunayTriangulation
+              dt.reset(new ctl::DelaunayTriangulation{boundary, 64 << 10});
+            }
+            i += points.size();
+          }
+        if (detected_errors) // restart with skipping corrupted borders
         {
-          auto points = make_span_const(&water_border_polys[i + 1], unsigned(water_border_polys[i].y));
-          if (water_border_polys[i].z >= 2)
-          {
-            debug("skip corrupted border %d pts", points.size());
-            continue;
-          }
-          bool closed = water_border_polys[i].z < 0.5f;
-          // debug("add new border %d pts, closed=%d", points.size(), closed);
-          poly_pts.clear();
-          poly_pts.reserve(points.size());
-          for (const auto &p : points)
-            poly_pts.push_back({p.x, p.z, p.y});
-          if (closed)
-            poly_pts.push_back({poly_pts[0]});
-          dt.InsertConstrainedLineString(poly_pts);
-          if (dt.error())
-          {
-            detected_errors = true;
-            logerr("detected corrupted border %d pts, closed=%d", points.size(), closed);
-            const_cast<float &>(water_border_polys[i].z) = 2; // mark corrupted
-            // reinit DelaunayTriangulation
-            dt.~DelaunayTriangulation();
-            new (&dt, _NEW_INPLACE) ctl::DelaunayTriangulation{boundary, 64 << 10};
-          }
-          i += points.size();
+          dt.reset();
+          continue;
         }
-      if (detected_errors) // restart with skipping corrupted borders
-        continue;
 
-      for (const auto &v : mesh_out.vert)
-        dt.InsertConstrainedPoint({v.x, v.z, v.y});
-      for (const auto &v : add_pts)
-        dt.InsertConstrainedPoint({v.x, v.z, v.y});
-      for (const auto &v : add_bottom_pts)
-        dt.InsertConstrainedPoint({v.x, v.z, v.y});
+        for (const auto &v : mesh_out.vert)
+          dt->InsertConstrainedPoint({v.x, v.z, v.y});
+        for (const auto &v : add_pts)
+          dt->InsertConstrainedPoint({v.x, v.z, v.y});
+      }
+      else
+      {
+        for (int j = prev_bottom_pts; j < (int)add_bottom_pts.size(); j++)
+          dt->InsertConstrainedPoint({add_bottom_pts[j].x, add_bottom_pts[j].z, add_bottom_pts[j].y});
+      }
 
-      ctl::TIN tin(&dt);
+      ctl::TIN tin(dt.get());
 
       debug("");
       debug("out: %d vert, %d tri", tin.verts.size(), tin.triangles.size() / 3);
@@ -664,7 +680,7 @@ static bool delaunayGenerateCached(LandMeshMap &land, HeightMapStorage &heightma
       double water_lev = HmapLandPlugin::self->getWaterSurfLevel();
 
       need_re_delaunay = false;
-      int prev_bottom_pts = add_bottom_pts.size();
+      prev_bottom_pts = add_bottom_pts.size();
       for (int i = 0; i < tin.triangles.size(); i += 3)
       {
         int vi0 = tin.triangles[i + 0];
@@ -741,6 +757,7 @@ static bool delaunayGenerateCached(LandMeshMap &land, HeightMapStorage &heightma
         mesh_out.face.size() - old_fc, re_delaunay_iter);
     }
 
+    dt.reset();
     MemorySaveCB memSave(NULL, false);
     mesh_out.saveData(memSave);
     ::saveCache(fnameData, memSave.getMem(), currentHash);
@@ -761,7 +778,7 @@ static void split(Mesh &from, Mesh &pos, float A, float B, float C, float D, flo
 {
   Mesh neg;
   from.split(neg, pos, A, B, C, D, eps);
-  from = neg; //==can be optimized
+  from = eastl::move(neg); // avoid deep copy (dag::Vector move is a swap)
   /*from.optimize_tverts();
   pos.optimize_tverts();*/
 }
@@ -791,7 +808,7 @@ public:
     if (cell.patches_mesh)
       cb(*cell.patches_mesh);
   }
-  const char *getJobName(bool &) const override { return "OptimizeJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("OptimizeJob"); }
   void doJob() override
   {
     bbox3f box;
@@ -799,7 +816,7 @@ public:
     forEachCellMesh([&](Mesh &m) {
       m.kill_unused_verts(5e-4f); // only saves few vertices
       m.kill_bad_faces();
-      forEachMeshVert(m, [&](const Point3 &v) { v_bbox3_add_pt(box, v_ldu(&v.x)); });
+      forEachMeshVert(m, [&](const Point3 &v) { v_bbox3_add_pt(box, v_ldu_p3_safe(&v.x)); });
     });
     v_stu_bbox3(cell.box, box);
 
@@ -813,27 +830,21 @@ public:
     uint32_t numKilledFaces = 0;
     forEachCellMesh([&](Mesh &m) {
       forEachMeshVert(m, [&](Point3 &v) {
-        vec3f pv = v_ldu(&v.x);
+        vec3f pv = v_ldu_p3_safe(&v.x);
         vec3f qv = v_round(v_mul(v_sub(pv, cmpofs), cmpscales));
         vec3f cv = v_min(v_max(qv, v_zero()), v_splats(USHRT_MAX));
         v_stu_p3(&v.x, v_mul(cv, cmpunscale));
       });
       m.kill_unused_verts(5e-4f);
       uint32_t prevNumFaces = m.face.size();
-      m.kill_bad_faces2(1e-20f, 3e-3f, 50000.f);
+      m.kill_sliver_faces(1e-20f, 5e4);
       numKilledFaces += prevNumFaces - m.face.size();
-      forEachMeshVert(m, [&](Point3 &v) { v_stu_p3(&v.x, v_add(cmpofs, v_ldu(&v.x))); });
+      forEachMeshVert(m, [&](Point3 &v) { v_stu_p3(&v.x, v_add(cmpofs, v_ldu_p3_safe(&v.x))); });
     });
     if (numKilledFaces)
       debug("cell[%d] killed %d degen faces in land meshes", &cell - &cell0, numKilledFaces);
   }
   void releaseJob() override { delete this; }
-};
-
-class Point2Deref : public Point2
-{
-public:
-  Point3 getPt() const { return Point3::x0y(*this); }
 };
 
 #if 1
@@ -869,7 +880,7 @@ static EditorLandRayTracer *generate_editor_land_tracer(Mesh &mesh, Point3 offse
     landBox += mesh.vert[i];
   Mesh *pMesh = &mesh;
   bool built = lrt->build(1, 1, max(landBox.width().x, landBox.width().z), offset, landBox, make_span(&pMesh, 1),
-    make_span((Mesh **)NULL, 0), minGrid, maxGrid, false);
+    make_span((Mesh **)NULL, 0), minGrid, maxGrid);
   if (!built)
   {
     DAEDITOR3.conError("Can't build editor landtracer.");
@@ -880,8 +891,8 @@ static EditorLandRayTracer *generate_editor_land_tracer(Mesh &mesh, Point3 offse
   return lrt;
 }
 
-bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, bool import_sgeom, LandRayTracer **game_tracer,
-  bool strip_det_hmap_from_tracer)
+bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, bool import_sgeom, EditorLandRayTracer **game_tracer,
+  bool strip_det_hmap_from_tracer, bool early_pass)
 {
   // landMeshMap.clear();
   if (!heightMap.isFileOpened())
@@ -910,15 +921,16 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
   loft_pt_cloud.reserve(4096);
 
   IDagorEdCustomCollider *coll = this;
+  if (!detDivisor && exportType != EXPORT_HMAP)
+    strip_det_hmap_from_tracer = false;
+  bool use_det_hmap = (detDivisor && exportType != EXPORT_HMAP);
   int prev_exp_type = exportType;
 
   DAGORED2->setColliders(make_span(&coll, 1), 0x7FFFFFFF);
   exportType = EXPORT_HMAP;
 
   rebuildWaterSurface(&loft_pt_cloud, &water_border_polys, &hmap_sweep_polys);
-  if (!detDivisor)
-    strip_det_hmap_from_tracer = false;
-  if (strip_det_hmap_from_tracer)
+  if (strip_det_hmap_from_tracer && use_det_hmap)
   {
     int time0l = dagTools->getTimeMsec();
 
@@ -1013,19 +1025,14 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
     exclMask = new objgenerator::HugeBitmask(hmap.width(), hmap.height());
   if (hmap_sweep_polys.size() && exclMask)
   {
-    Tab<Point2Deref *> pts(tmpmem);
-
     for (int i = 0; i < hmap_sweep_polys.size(); i++)
       if (hmap_sweep_polys[i].x > 1e12f)
       {
-        pts.resize(hmap_sweep_polys[i].y);
+        auto pts = make_span_const(&hmap_sweep_polys[i + 1], (int)hmap_sweep_polys[i].y);
         debug("add new sweep %d pts", pts.size());
-        i++;
-        for (int j = 0; j < pts.size(); j++, i++)
-          pts[j] = static_cast<Point2Deref *>(&hmap_sweep_polys[i]);
-
-        rasterize_poly_2_nz(*exclMask, pts, heightMapOffset.x, heightMapOffset.y, 1.0f / gridCellSize);
-        i--;
+        if (!rasterize_poly_2_nz(*exclMask, pts, heightMapOffset.x, heightMapOffset.y, 1.0f / gridCellSize))
+          DAEDITOR3.conError("rasterize_poly_2_nz failed for sweep poly %d (%d pts)", i, (int)pts.size());
+        i += pts.size();
       }
   }
   for (int i = 0; i < loft_pt_cloud.size() && exclMask; i++)
@@ -1118,7 +1125,7 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
   Point3 ofs(heightMapOffset[0], 0, heightMapOffset[1]);
   Mesh mesh;
   bool loadedFromCache = ::delaunayGenerateCached(map, heightMap, meshErrorThreshold, numMeshVertices, &hmap, mesh, gridCellSize, ofs,
-    mask, loft_pt_cloud, water_border_polys);
+    mask, loft_pt_cloud, water_border_polys, early_pass);
 
   delete mask;
   del_it(exclMask);
@@ -1135,18 +1142,18 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
     generate_ok = false;
   }
 
-  if (!loadedFromCache || !landMeshMap.getEditorLandRayTracer())
+  if (!loadedFromCache || !landMeshMap.getEditorLandRayTracer(true))
   {
     EditorLandRayTracer *lrt = generate_ok ? ::generate_editor_land_tracer(mesh, ofs) : NULL;
-    landMeshMap.setEditorLandRayTracer(lrt);
+    landMeshMap.setEditorLandRayTracer(lrt, true);
   }
   if (generate_ok && applyHtConstraintBitmask(mesh))
   {
     EditorLandRayTracer *lrt = ::generate_editor_land_tracer(mesh, ofs);
-    landMeshMap.setEditorLandRayTracer(lrt);
+    landMeshMap.setEditorLandRayTracer(lrt, true);
   }
 
-  if (strip_det_hmap_from_tracer && generate_ok)
+  if (strip_det_hmap_from_tracer && use_det_hmap && generate_ok)
   {
     int time0l = dagTools->getTimeMsec();
     float csz = gridCellSize / detDivisor;
@@ -1256,7 +1263,7 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
     con.setActionDesc("gather static visual...");
     con.startProgress();
 
-    DataBlock applicationBlk(DAGORED2->getWorkspace().getAppPath());
+    DataBlock applicationBlk(DAGORED2->getWorkspace().getAppBlkPath());
     bool joinSplineMeshes = applicationBlk.getBlockByNameEx("heightMap")->getBool("joinSplineMeshes", true);
 
     con.setTotal(DAGORED2->getPluginCount());
@@ -1343,7 +1350,7 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
             prevSplineMat = node->mesh->mats[0];
             splineBatch++;
           }
-          int loftLayer = node->script.getInt("layer", 0);
+          int loftLayer = node->layer;
           nodeLayer = loftLayer * LAYER_ORDER_MAX + splineLayer          // Split meshes by layers.
                       + splineBatch * LAYER_ORDER_MAX * LAYER_ORDER_MAX; // Do not join meshes if another mesh is between them to avoid
                                                                          // changing the render order.
@@ -1437,7 +1444,7 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
   }
 
   int time1 = dagTools->getTimeMsec();
-  con.setActionDesc("cutting meshes...");
+  con.setActionDesc("cutting %d meshes...", meshes.size());
   con.startProgress();
   con.setTotal(totalAllFaces);
   Tab<int> vert2Cell(tmpmem);
@@ -1532,18 +1539,80 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
       continue;
     }
 
-    // can be optimized by using binary(quad) tree of splits.
-    Mesh *prevY = new Mesh, *nextY = NULL;
-    split(mesh, *prevY, 0, 0, 1.f, -ofs.z, epsilon);
-
-    if (!prevY->face.size())
+    // Narrow the split work to only the cells actually touched by meshBox.
+    // Previously every mesh was split across all numCellsX*numCellsY cells regardless of size;
+    // with thousands of small static meshes each occupying ~1 cell that was dominant.
+    const int numCellsX = cells.getNumCellsX();
+    const int numCellsY = cells.getNumCellsY();
+    const float gridMaxX = ofs.x + numCellsX * meshCellSize;
+    const float gridMaxZ = ofs.z + numCellsY * meshCellSize;
+    if (meshBox.isempty() || meshBox[1].x < ofs.x || meshBox[0].x > gridMaxX || meshBox[1].z < ofs.z || meshBox[0].z > gridMaxZ)
     {
       cfaces += origFaceCount;
       con.setDone(cfaces);
       continue;
     }
+    // Mesh::split treats verts within +/-epsilon of a cell boundary plane as on-plane and
+    // routes the resulting face to the neg (lower-index) side. Match that here so a meshBox
+    // endpoint that lands on (or within eps of) an internal boundary maps to the lower cell;
+    // otherwise floorf would push boundary content into the upper cell and the initial Y/X
+    // crop at the new lower edge would also discard it.
+    auto findCellIdx = [&](float coord, float origin, int numCells) {
+      int idx = (int)floorf((coord - origin) / meshCellSize);
+      if (idx > 0 && fabsf((coord - origin) - idx * meshCellSize) <= epsilon)
+        --idx;
+      return clamp(idx, 0, numCells - 1);
+    };
+    const int cellYStart = findCellIdx(meshBox[0].z, ofs.z, numCellsY);
+    const int cellYEnd = findCellIdx(meshBox[1].z, ofs.z, numCellsY);
+    const int cellXStart = findCellIdx(meshBox[0].x, ofs.x, numCellsX);
+    const int cellXEnd = findCellIdx(meshBox[1].x, ofs.x, numCellsX);
 
-    for (int cellY = 0; cellY < cells.getNumCellsY(); ++cellY)
+    // Fast path: mesh fits entirely inside a single cell -> skip all splits.
+    if (cellYStart == cellYEnd && cellXStart == cellXEnd)
+    {
+      const float cellMinX = ofs.x + cellXStart * meshCellSize;
+      const float cellMinZ = ofs.z + cellYStart * meshCellSize;
+      const float cellMaxX = cellMinX + meshCellSize - ((cellXStart == numCellsX - 1) ? gridCellSize : 0);
+      const float cellMaxZ = cellMinZ + meshCellSize - ((cellYStart == numCellsY - 1) ? gridCellSize : 0);
+      if (meshBox[0].x >= cellMinX - epsilon && meshBox[1].x <= cellMaxX + epsilon && meshBox[0].z >= cellMinZ - epsilon &&
+          meshBox[1].z <= cellMaxZ + epsilon)
+      {
+        Mesh *destmesh = NULL;
+        if (!nodes[mi])
+          destmesh = cells.getCellLandMesh(cellXStart, cellYStart, true);
+        else if (isPatch[mi])
+          destmesh = cells.getCellPatchesMesh(cellXStart, cellYStart, true);
+        else if (isDecal[mi])
+          destmesh = cells.getCellDecalMesh(cellXStart, cellYStart, true);
+        else
+          destmesh = cells.getCellCombinedMesh(cellXStart, cellYStart, true);
+
+        if (destmesh)
+        {
+          if (nodes[mi])
+            mesh.optimize_tverts(-1.0);
+          destmesh->attach(mesh);
+        }
+        cfaces += mesh.face.size();
+        con.setDone(cfaces);
+        continue;
+      }
+    }
+
+    // can be optimized by using binary(quad) tree of splits.
+    Mesh *prevY = new Mesh, *nextY = NULL;
+    split(mesh, *prevY, 0, 0, 1.f, -(ofs.z + cellYStart * meshCellSize), epsilon);
+
+    if (!prevY->face.size())
+    {
+      del_it(prevY);
+      cfaces += origFaceCount;
+      con.setDone(cfaces);
+      continue;
+    }
+
+    for (int cellY = cellYStart; cellY <= cellYEnd; ++cellY)
     {
       if (nextY)
       {
@@ -1554,19 +1623,19 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
       if (!prevY->face.size())
         break;
       nextY = new Mesh;
-      split(*prevY, *nextY, 0.f, 0.f, 1.f,
-        -((cellY + 1) * meshCellSize - ((cellY == cells.getNumCellsY() - 1) ? gridCellSize : 0) + ofs.z), epsilon);
+      split(*prevY, *nextY, 0.f, 0.f, 1.f, -((cellY + 1) * meshCellSize - ((cellY == numCellsY - 1) ? gridCellSize : 0) + ofs.z),
+        epsilon);
       if (!prevY->face.size())
         continue;
       Mesh *prevX = new Mesh, *nextX = NULL;
-      split(*prevY, *prevX, 1.f, 0.f, 0.f, -ofs.x, epsilon);
+      split(*prevY, *prevX, 1.f, 0.f, 0.f, -(ofs.x + cellXStart * meshCellSize), epsilon);
       if (!prevX->face.size())
       {
         del_it(prevX);
         continue;
       }
       prevX->optimize_tverts(-1.0);
-      for (int cellX = 0; cellX < cells.getNumCellsX(); ++cellX)
+      for (int cellX = cellXStart; cellX <= cellXEnd; ++cellX)
       {
         if (nextX)
         {
@@ -1603,8 +1672,8 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
         if (!prevX->face.size())
           break;
         nextX = new Mesh;
-        split(*prevX, *nextX, 1.f, 0.f, 0.f,
-          -((cellX + 1) * meshCellSize - ((cellX == cells.getNumCellsX() - 1) ? gridCellSize : 0) + ofs.x), epsilon);
+        split(*prevX, *nextX, 1.f, 0.f, 0.f, -((cellX + 1) * meshCellSize - ((cellX == numCellsX - 1) ? gridCellSize : 0) + ofs.x),
+          epsilon);
         if (!prevX->face.size())
           continue;
         if (nodes[mi])
@@ -1696,8 +1765,13 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
   clear_and_resize(cellCombinedMeshes, cm.size());
   for (int i = 0; i < cm.size(); ++i)
   {
-    if (strip_det_hmap_from_tracer && cm[i].box[0].x + gridCellSize >= detRect[0].x && cm[i].box[1].x - gridCellSize <= detRect[1].x &&
-        cm[i].box[0].z + gridCellSize >= detRect[0].y && cm[i].box[1].z - gridCellSize <= detRect[1].y)
+    BBox2 eff_rect = use_det_hmap
+                       ? detRect
+                       : BBox2(heightMapOffset, heightMapOffset + gridCellSize * Point2(getHeightmapSizeX(), getHeightmapSizeY()));
+
+    if (strip_det_hmap_from_tracer && cm[i].box[0].x + gridCellSize >= eff_rect[0].x &&
+        cm[i].box[1].x - gridCellSize <= eff_rect[1].x && cm[i].box[0].z + gridCellSize >= eff_rect[0].y &&
+        cm[i].box[1].z - gridCellSize <= eff_rect[1].y)
     {
       debug("strip landMesh cell[%d] %@ (replaced by detaled HMAP)", i, cm[i].box);
       cellLandMeshes[i] = NULL;
@@ -1719,11 +1793,11 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
 
   {
     con.setActionDesc("building land tracer...");
-    LandRayTracer *lrt = new LandRayTracer;
+    EditorLandRayTracer *lrt = new EditorLandRayTracer;
     landMeshMap.setGameLandRayTracer(lrt);
     int minGrid = 8, maxGrid = 32;
     bool built = lrt->build(cells.getNumCellsX(), cells.getNumCellsY(), meshCellSize, ofs, landBox, cellLandMeshes, cellCombinedMeshes,
-      minGrid, maxGrid, true);
+      minGrid, maxGrid);
     if (!built)
     {
       landMeshMap.setGameLandRayTracer(NULL);
@@ -1731,9 +1805,9 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
     }
     if (game_tracer)
     {
-      *game_tracer = lrt = new LandRayTracer;
+      *game_tracer = lrt = new EditorLandRayTracer;
       built = lrt->build(cells.getNumCellsX(), cells.getNumCellsY(), meshCellSize, ofs, landBox, cellLandMeshes, cellCombinedMeshes,
-        minGrid, maxGrid, false);
+        minGrid, maxGrid);
       if (!built)
       {
         del_it(game_tracer[0]);
@@ -1749,13 +1823,14 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
     int minGrid = 8, maxGrid = 32;
     EditorLandRayTracer *lrt = new EditorLandRayTracer;
     if (lrt->build(cells.getNumCellsX(), cells.getNumCellsY(), meshCellSize, ofs, landBox, cellLandMeshes, cellCombinedMeshes, minGrid,
-          maxGrid, true))
-      landMeshMap.setEditorLandRayTracer(lrt);
+          maxGrid))
+      landMeshMap.setEditorLandRayTracer(lrt, false);
     else
     {
       delete lrt;
-      DAEDITOR3.conError("Can't build landtracer for editor (with stripped DET HMAP), resetting main landtracer.");
-      landMeshMap.setEditorLandRayTracer(nullptr);
+      DAEDITOR3.conError("Can't build landtracer for editor (with stripped %s HMAP), resetting main landtracer.",
+        use_det_hmap ? "DET" : "MAIN");
+      landMeshMap.setEditorLandRayTracer(nullptr, false);
     }
   }
 
@@ -1794,7 +1869,7 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
     }
 
   // resync border taking into account landmesh vertex quantization
-  if (strip_det_hmap_from_tracer)
+  if (strip_det_hmap_from_tracer && use_det_hmap)
   {
     int step = 32, w = (detRectC[1].x - detRectC[0].x) / step, h = (detRectC[1].y - detRectC[0].y) / step;
 
@@ -1833,8 +1908,13 @@ bool HmapLandPlugin::generateLandMeshMap(LandMeshMap &map, CoolConsole &con, boo
     landMeshMap.clear(true);
   guard_det_border = true;
 
-  if (generate_ok)
-    rebuildLandmeshDump();
+  // lmDump is intentionally not rebuilt here: at every callsite landClsMap
+  // (and the rest of the derived maps) is still empty -- generateLandColors
+  // hasn't run yet -- so serializing now would just bake an empty snapshot
+  // into lmDump that the renderer would then serve. Callers that actually
+  // need lmDump (beforeMainLoop after generateLandColors, PID_REBUILD_MESH
+  // via resetLandmesh -> pendingLandmeshRebuild) rebuild it themselves
+  // once the derived maps reflect the final state.
   return generate_ok;
 }
 
@@ -1855,21 +1935,63 @@ void HmapLandPlugin::refillTexCache()
     return;
   for (int i = 0; i < landMeshManager->getDetailMap().cells.size(); i++)
     updateLandDetailTexture(i);
+  hmlService->uploadLandWeights(*landMeshManager);
 }
 
+// repacks one cell of the weight atlas from the painted detail map; call
+// upload() once after a batch of cells (see resetTexCacheRect)
 void HmapLandPlugin::updateLandDetailTexture(unsigned i)
 {
   if (!landMeshManager || landMeshManager->getDetailMap().cells.size() <= i)
     return;
 
-  LoadElement &element = landMeshManager->getDetailMap().cells[i];
-  int num_elems_x = landMeshManager->getDetailMap().sizeX;
-  int elemSize = landMeshManager->getDetailMap().texElemSize;
-  int texSize = landMeshManager->getDetailMap().texSize;
+  const int elemSize = landMeshManager->getDetailMap().texElemSize;
+  const int x0 = (i % landMeshManager->getDetailMap().sizeX) * elemSize;
+  const int y0 = (i / landMeshManager->getDetailMap().sizeX) * elemSize;
 
-  bool done;
-  loadLandDetailTexture(i % num_elems_x, i / num_elems_x, (Texture *)element.tex1, (Texture *)element.tex2, element.detTexIds, &done,
-    texSize, elemSize);
+  SmallTab<uint8_t, TmpmemAlloc> typeRemap;
+  clear_and_resize(typeRemap, 256);
+  mem_set_ff(typeRemap);
+  carray<uint8_t, LMAX_DET_TEX_NUM> &detTexIds = landMeshManager->getDetailMap().cells[i].detTexIds;
+  memset(detTexIds.data(), 0xFF, LMAX_DET_TEX_NUM);
+  getCellDetTex(x0, y0, elemSize, detTexIds.data(), typeRemap.data(), LMAX_DET_TEX_NUM);
+  int numTex = 0;
+  for (int ch = 0; ch < LMAX_DET_TEX_NUM; ch++)
+    if (detTexIds[ch] != 0xFF)
+      numTex++;
+
+  // the atlas record keeps the final landclass ids, so remap before it is
+  // written; the paint read below goes through typeRemap and does not care
+  for (int ch = 0; ch < LMAX_DET_TEX_NUM; ch++)
+    if (detTexIds[ch] != 0xFF)
+      detTexIds[ch] = lcRemap.size() ? lcRemap[detTexIds[ch]] : 0xFF;
+
+  // with no atlas the ids above still give the renderer the cell's first landclass (the load logs why); the weights have nowhere to go
+  const int pageW = hmlService->getLandWeightCellTexSize(*landMeshManager);
+  if (pageW <= 0)
+    return;
+
+  // the painted map is global, so the 2px page border is simply read past the
+  // cell (clamped at the map edge, as mirrored cells expect) instead of being
+  // stitched from the neighbours the way the level-data conversion has to;
+  // the level export reads the same bytes, so the preview shows what ships
+  const int pageTexels = pageW * pageW;
+  Tab<uint8_t> planeBuf(tmpmem);
+  planeBuf.resize(LMAX_DET_TEX_NUM * pageTexels);
+  const uint8_t *planes[LMAX_DET_TEX_NUM];
+  for (int ch = 0; ch < LMAX_DET_TEX_NUM; ch++)
+    planes[ch] = &planeBuf[ch * pageTexels];
+  const int mapW = detTexMap ? detTexMap->getMapSizeX() : 0, mapH = detTexMap ? detTexMap->getMapSizeY() : 0;
+  for (int py = 0, t = 0; py < pageW; py++)
+    for (int px = 0; px < pageW; px++, t++)
+    {
+      uint8_t wt[LMAX_DET_TEX_NUM];
+      readLandDetailWeights(clamp(x0 + px - LAND_WEIGHT_BORDER, 0, mapW - 1), clamp(y0 + py - LAND_WEIGHT_BORDER, 0, mapH - 1),
+        make_span(typeRemap), wt);
+      for (int ch = 0; ch < LMAX_DET_TEX_NUM; ch++)
+        planeBuf[ch * pageTexels + t] = wt[ch];
+    }
+  hmlService->setLandWeights(*landMeshManager, i, planes, numTex);
 }
 
 void HmapLandPlugin::resetTexCacheRect(const IBBox2 &box_)
@@ -1883,13 +2005,18 @@ void HmapLandPlugin::resetTexCacheRect(const IBBox2 &box_)
   IBBox2 box = box_;
   if (detDivisor)
     box[0] /= detDivisor, box[1] /= detDivisor;
+  // the neighbors' page borders hold copies of the edited texels, so they are
+  // repacked as well - by cell index, or the last one on each side is missed
+  box[0] -= IPoint2(LAND_WEIGHT_BORDER, LAND_WEIGHT_BORDER);
+  box[1] += IPoint2(LAND_WEIGHT_BORDER, LAND_WEIGHT_BORDER);
+  const int lastX = num_elems_x - 1, lastY = landMeshManager->getDetailMap().sizeY - 1;
+  const int cx0 = clamp(box[0].x / elemSize, 0, lastX), cx1 = clamp(box[1].x / elemSize, 0, lastX);
+  const int cy0 = clamp(box[0].y / elemSize, 0, lastY), cy1 = clamp(box[1].y / elemSize, 0, lastY);
 
-  for (int y = box[0].y; y <= box[1].y; y += elemSize)
-    for (int x = box[0].x; x <= box[1].x; x += elemSize)
-    {
-      int i = (x / elemSize) + (y / elemSize) * num_elems_x;
-      updateLandDetailTexture(i);
-    }
+  for (int cy = cy0; cy <= cy1; cy++)
+    for (int cx = cx0; cx <= cx1; cx++)
+      updateLandDetailTexture(cx + cy * num_elems_x);
+  hmlService->uploadLandWeights(*landMeshManager);
 }
 
 float HmapLandPlugin::getLandCellSize() const { return landMeshMap.getCellSize(); }
@@ -1946,8 +2073,8 @@ bool HmapLandPlugin::addUsedTextures(ITextureNumerator &tn)
   String ltmap_fn = ::make_full_path(prj, "builtScene/lightmap.tga");
 
   DataBlock app_blk;
-  if (!app_blk.load(DAGORED2->getWorkspace().getAppPath()))
-    DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppPath());
+  if (!app_blk.load(DAGORED2->getWorkspace().getAppBlkPath()))
+    DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppBlkPath());
   const DataBlock *cvtBlk = app_blk.getBlockByNameEx("heightMap")->getBlockByName("lightmapCvtProps");
 
   if (cvtBlk)
@@ -1985,64 +2112,8 @@ bool HmapLandPlugin::addUsedTextures(ITextureNumerator &tn)
 extern bool hmap_export_tex(mkbindump::BinDumpSaveCB &cb, const char *tex_name, const char *fname, bool clamp, bool gamma1);
 
 extern bool aces_export_detail_maps(mkbindump::BinDumpSaveCB &cb, int det_map_w, int det_map_h, int tex_elem_size,
-  const Tab<SimpleString> &landclass_names, int base_ofs, bool optimize_size = false, bool tools_internal = false);
+  const Tab<SimpleString> &landclass_names, int base_ofs, bool tools_internal = false);
 
-
-class LandRaySaver
-{
-public:
-  static void save(mkbindump::BinDumpSaveCB &cb, LandRayTracer &lt)
-  {
-    cb.writeRaw((void *)"LTdump", 6);
-    cb.writeInt32e(lt.numCellsX);
-    cb.writeInt32e(lt.numCellsY);
-    cb.writeReal(lt.cellSize);
-    cb.writeReal(lt.offset.x);
-    cb.writeReal(lt.offset.y);
-    cb.writeReal(lt.offset.z);
-    cb.writeReal(lt.bbox[0].x);
-    cb.writeReal(lt.bbox[0].y);
-    cb.writeReal(lt.bbox[0].z);
-    cb.writeReal(lt.bbox[1].x);
-    cb.writeReal(lt.bbox[1].y);
-    cb.writeReal(lt.bbox[1].z);
-
-    Tab<LandRayTracer::LandRayCellD> cellsD(tmpmem);
-    lt.convertCellsToOut(cellsD);
-
-    cb.writeInt32e(cellsD.size());
-    cb.write32ex(cellsD.data(), data_size(cellsD));
-    cb.writeInt32e(lt.grid.size());
-    cb.writeTabData32e(lt.grid);
-    cb.writeInt32e(lt.gridHt.size());
-    cb.write32ex(lt.gridHt.data(), data_size(lt.gridHt));
-    cb.writeInt32e(lt.allFaces.size());
-    cb.writeTabData16e(lt.allFaces);
-    cb.writeInt32e(lt.allVerts.size());
-    cb.write32ex(lt.allVerts.data(), data_size(lt.allVerts));
-    cb.writeInt32e(lt.faceIndices.size());
-    cb.writeTabData16e(lt.faceIndices);
-  }
-};
-
-static void exportRayTracersToGame(mkbindump::BinDumpSaveCB &cwr, LandRayTracer *lrt)
-{
-  int time0 = dagTools->getTimeMsec();
-  CoolConsole &con = DAGORED2->getConsole();
-  con.setActionDesc("saving lmesh tracers...");
-  cwr.beginBlock();
-  if (lrt)
-  {
-    // todo: add zlib compression
-    int size = cwr.tell();
-    LandRaySaver::save(cwr, *lrt);
-    size = cwr.tell() - size;
-    con.addMessage(ILogWriter::NOTE, "landray tracer saved %d bytes", size);
-  }
-  else
-    con.addMessage(ILogWriter::WARNING, "No landray tracer");
-  cwr.endBlock();
-}
 
 int HmapLandPlugin::markUndergroundFaces(MeshData &mesh, Bitarray &facesAbove, TMatrix *wtm)
 {
@@ -2074,7 +2145,7 @@ int HmapLandPlugin::markUndergroundFaces(MeshData &mesh, Bitarray &facesAbove, T
 
   if (!mesh.face.size())
     return 0;
-  EditorLandRayTracer *tracer = landMeshMap.getEditorLandRayTracer();
+  EditorLandRayTracer *tracer = landMeshMap.getEditorLandRayTracer(true);
   if (!tracer)
     return 0;
   Bitarray vertsBelow;
@@ -2178,7 +2249,7 @@ int HmapLandPlugin::markUndergroundFaces(MeshData &mesh, Bitarray &facesAbove, T
 
 void HmapLandPlugin::removeInvisibleFaces(StaticGeometryContainer &container)
 {
-  if (!landMeshMap.getEditorLandRayTracer())
+  if (!landMeshMap.getEditorLandRayTracer(true))
     return;
   CoolConsole &con = DAGORED2->getConsole();
   con.setActionDesc("removing undeground faces...");
@@ -2228,7 +2299,7 @@ void HmapLandPlugin::removeInvisibleFaces(StaticGeometryContainer &container)
     con.addMessage(ILogWriter::NOTE, "no faces for removal in %dms", dagTools->getTimeMsec() - time0);
 }
 
-bool HmapLandPlugin::exportLandMesh(mkbindump::BinDumpSaveCB &cb, IWriterToLandmesh *land_modifier, LandRayTracer *landRayTracer,
+bool HmapLandPlugin::exportLandMesh(mkbindump::BinDumpSaveCB &cb, IWriterToLandmesh *land_modifier, EditorLandRayTracer *landRayTracer,
   bool tools_internal)
 {
   int time0 = dagTools->getTimeMsec();
@@ -2247,8 +2318,8 @@ bool HmapLandPlugin::exportLandMesh(mkbindump::BinDumpSaveCB &cb, IWriterToLandm
   bool game_res_sys_v2 = false;
   {
     DataBlock app_blk;
-    if (!app_blk.load(DAGORED2->getWorkspace().getAppPath()))
-      DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppPath());
+    if (!app_blk.load(DAGORED2->getWorkspace().getAppBlkPath()))
+      DAEDITOR3.conError("cannot read <%s>", DAGORED2->getWorkspace().getAppBlkPath());
     game_res_sys_v2 = app_blk.getBlockByNameEx("assets")->getBlockByName("export") != NULL;
   }
   G_ASSERT(game_res_sys_v2);
@@ -2310,26 +2381,37 @@ bool HmapLandPlugin::exportLandMesh(mkbindump::BinDumpSaveCB &cb, IWriterToLandm
 
   // export detail maps and textures
   int detailDataOfs = cb.tell();
-  int dmw = detTexWtMap ? detTexWtMap->getMapSizeX() : landClsMap.getMapSizeX();
-  int dmh = detTexWtMap ? detTexWtMap->getMapSizeY() : landClsMap.getMapSizeY();
-  int dm_tex_elem_size = (landMeshMap.getCellSize() / gridCellSize) * (detTexWtMap ? 1 : lcmScale);
-  if (dmw / dm_tex_elem_size != landMeshMap.getNumCellsX() || dmh / dm_tex_elem_size != landMeshMap.getNumCellsY())
+  int dmw = detTexMap ? detTexMap->getMapSizeX() : landClsMap.getMapSizeX();
+  int dmh = detTexMap ? detTexMap->getMapSizeY() : landClsMap.getMapSizeY();
+  int dm_tex_elem_size = (landMeshMap.getCellSize() / gridCellSize) * (detTexMap ? 1 : lcmScale);
+  const int dmwPerTexElemSize = dm_tex_elem_size == 0 ? 0 : (dmw / dm_tex_elem_size);
+  const int dmhPerTexElemSize = dm_tex_elem_size == 0 ? 0 : (dmh / dm_tex_elem_size);
+  if (dm_tex_elem_size <= 0 || dmwPerTexElemSize != landMeshMap.getNumCellsX() || dmhPerTexElemSize != landMeshMap.getNumCellsY())
   {
     DAEDITOR3.conError("bad detMapSz=%dx%d and elemSz=%d gives elems=%dx%d while cells are %dx%d\n"
-                       "  (detTexWtMap=%dx%d landClsMap=%dx%d lcmScale=%d)",
-      dmw, dmh, dm_tex_elem_size, dmw / dm_tex_elem_size, dmh / dm_tex_elem_size, landMeshMap.getNumCellsX(),
-      landMeshMap.getNumCellsY(), detTexWtMap ? detTexWtMap->getMapSizeX() : 0, detTexWtMap ? detTexWtMap->getMapSizeY() : 0,
-      landClsMap.getMapSizeX(), landClsMap.getMapSizeY(), lcmScale);
+                       "  (detTexMap=%dx%d landClsMap=%dx%d lcmScale=%d)",
+      dmw, dmh, dm_tex_elem_size, dmwPerTexElemSize, dmhPerTexElemSize, landMeshMap.getNumCellsX(), landMeshMap.getNumCellsY(),
+      detTexMap ? detTexMap->getMapSizeX() : 0, detTexMap ? detTexMap->getMapSizeY() : 0, landClsMap.getMapSizeX(),
+      landClsMap.getMapSizeY(), lcmScale);
+
+    if (landMeshMap.getNumCellsX() <= 0 || landMeshMap.getNumCellsY() <= 0)
+    {
+      DAEDITOR3.conError("failed to export color/detail maps: cells are %dx%d", landMeshMap.getNumCellsX(),
+        landMeshMap.getNumCellsY());
+      return false;
+    }
 
     dm_tex_elem_size = dmw / landMeshMap.getNumCellsX();
-    if (dm_tex_elem_size != dmh / landMeshMap.getNumCellsY())
+    if (dm_tex_elem_size <= 0 || dm_tex_elem_size != dmh / landMeshMap.getNumCellsY())
     {
-      DAEDITOR3.conError("failed to export color/detail maps: corrected elems=%dx%d wile cells is %dx%d", dmw / dm_tex_elem_size,
-        dmh / dm_tex_elem_size, landMeshMap.getNumCellsX(), landMeshMap.getNumCellsY());
+      const int dmwPerTexElemSize = dm_tex_elem_size == 0 ? 0 : (dmw / dm_tex_elem_size);
+      const int dmhPerTexElemSize = dm_tex_elem_size == 0 ? 0 : (dmh / dm_tex_elem_size);
+      DAEDITOR3.conError("failed to export color/detail maps: corrected elems=%dx%d wile cells is %dx%d", dmwPerTexElemSize,
+        dmhPerTexElemSize, landMeshMap.getNumCellsX(), landMeshMap.getNumCellsY());
       return false;
     }
   }
-  if (!aces_export_detail_maps(cb, dmw, dmh, dm_tex_elem_size, detailTexBlkName, headerOfs, true, tools_internal))
+  if (!aces_export_detail_maps(cb, dmw, dmh, dm_tex_elem_size, detailTexBlkName, headerOfs, tools_internal))
   {
     DAEDITOR3.conError("failed to export color/detail maps");
     return false;
@@ -2354,35 +2436,14 @@ bool HmapLandPlugin::exportLandMesh(mkbindump::BinDumpSaveCB &cb, IWriterToLandm
   DAGORED2->getConsole().addMessage(ILogWriter::REMARK, "exported tile tex in %g seconds", (dagTools->getTimeMsec() - time0) / 1000.0);
   time0 = dagTools->getTimeMsec();
 
-  int rayTracerOffset = cb.tell();
-  if (!landRayTracer)
-    rayTracerOffset = headerOfs;
-  else
-  {
-    mkbindump::BinDumpSaveCB cwr_lt(2 << 10, cb);
-    exportRayTracersToGame(cwr_lt, landRayTracer);
-
-    cb.beginBlock();
-    MemoryLoadCB mcrd(cwr_lt.getMem(), false);
-    if (preferZstdPacking && allowOodlePacking)
-    {
-      cb.writeInt32e(cwr_lt.getSize());
-      oodle_compress_data(cb.getRawWriter(), mcrd, cwr_lt.getSize());
-    }
-    else if (preferZstdPacking)
-      zstd_compress_data(cb.getRawWriter(), mcrd, cwr_lt.getSize(), 1 << 20, 19);
-    else
-      lzma_compress_data(cb.getRawWriter(), 9, mcrd, cwr_lt.getSize());
-    cb.endBlock(preferZstdPacking ? (allowOodlePacking ? btag_compr::OODLE : btag_compr::ZSTD) : btag_compr::UNSPECIFIED);
-    rayTracerOffset += 4;
-  }
-
   int resultOffset = cb.tell();
   cb.seekto(headerOfs);
   cb.writeInt32e(meshOfs - headerOfs);
   cb.writeInt32e(detailDataOfs - headerOfs);
   cb.writeInt32e(tileDataOfs - headerOfs);
-  cb.writeInt32e(rayTracerOffset - headerOfs);
+  // the legacy LTdump stream is no longer written: this is the no-tracer encoding, so old
+  // loaders read new levels as tracer-less while new runtimes load the LTS4 stream below
+  cb.writeInt32e(0);
   cb.seekto(resultOffset);
   con.endLog();
 
@@ -2406,6 +2467,108 @@ bool HmapLandPlugin::exportLandMesh(mkbindump::BinDumpSaveCB &cb, IWriterToLandm
     cb.writeReal(1.f / max(vertDetTexYtile, 1e-3f));
     cb.writeReal(vertDetTexYOffset / max(vertDetTexYtile, 1e-3f));
   }
+#else
+  // classic writes the empty field so the tail stays uniform for the stream below
+  cb.writeDwString("");
 #endif
+
+  // The only tracer stream, written by both exporter variants after the vertical-texture tail:
+  // old loaders parse the tail and stop before the self-identifying tag, seeing a tracer-less level
+  if (landRayTracer)
+  {
+    LandRayTracerSoA4 s4;
+    DynamicMemGeneralSaveCB s4mem(tmpmem, 0, 4 << 20);
+    // gather the editor tracer's cells through the enumeration API into the SoA4 direct build
+    const int s4cells = landRayTracer->getCellCount();
+    dag::Vector<dag::Vector<Point3>> s4verts(s4cells);
+    dag::Vector<dag::Vector<int>> s4inds(s4cells);
+    dag::Vector<LandRayTracerSoA4::CellSource> s4src(s4cells);
+    for (int i = 0; i < s4cells; ++i)
+    {
+      s4verts[i].reserve(landRayTracer->getCellVertCount(i));
+      landRayTracer->iterateCellVertices(i, [&](const Point3 &pt) { s4verts[i].push_back(pt); });
+      s4inds[i].reserve(landRayTracer->getCellTriCount(i) * 3);
+      landRayTracer->iterateCellFaces(i, [&](int a, int b, int c) {
+        s4inds[i].push_back(a);
+        s4inds[i].push_back(b);
+        s4inds[i].push_back(c);
+      });
+      s4src[i].verts = make_span_const(s4verts[i]);
+      s4src[i].indices = make_span_const(s4inds[i]);
+    }
+    bool s4built = s4.build((int)landRayTracer->getNumCellsX(), (int)landRayTracer->getNumCellsY(), landRayTracer->getCellSize(),
+      landRayTracer->getOffset(), landRayTracer->getBBox(), make_span_const(s4src));
+    // per-cell conversion is deliberately lenient at runtime, but an EXPORT that quietly dropped
+    // a populated cell would ship a level with holes in its mesh collision: refuse it here
+    int64_t srcTris = 0;
+    for (int i = 0; i < landRayTracer->getCellCount(); ++i)
+    {
+      srcTris += landRayTracer->getCellTriCount(i);
+      if (s4built && landRayTracer->getCellTriCount(i) > 0 && s4.getCellTriCount(i) <= 0)
+      {
+        DAGORED2->getConsole().addMessage(ILogWriter::ERROR, "SoA4 land tracer dropped populated cell %d", i);
+        s4built = false;
+      }
+    }
+    // NaN does not propagate through box min/max, so a bad vertex can pass every derived-mapping
+    // gate while packing garbage: catch it at the source, where the level author can act on it
+    for (int i = 0; s4built && i < s4cells; ++i)
+      for (const Point3 &v : s4verts[i])
+        if (!check_finite(v.x + v.y + v.z))
+        {
+          DAGORED2->getConsole().addMessage(ILogWriter::ERROR, "land cell %d has a non-finite vertex", i);
+          s4built = false;
+          break;
+        }
+    // refuse at export what the runtime loader would reject: the same content gates, no reparse
+    if (s4built)
+      if (const char *why = s4.validate())
+      {
+        DAGORED2->getConsole().addMessage(ILogWriter::ERROR, "SoA4 land tracer fails runtime validation: %s", why);
+        s4built = false;
+      }
+    if (s4built && s4.save(s4mem) && s4mem.size() <= LandRayTracerSoA4::MAX_STREAM_SIZE)
+    {
+      const int s4size = (int)s4mem.size();
+      cb.writeInt32e(unsigned(_MAKE4C('LTS4')));
+      MemGeneralLoadCB s4crd(s4mem.data(), s4size);
+      // never lzma, whatever the project packing preference: the loader only decodes codecs
+      // with a non-fatal error path, so stream corruption cannot kill the level load
+      cb.beginBlock();
+      int64_t packed = 0;
+      if (preferZstdPacking && allowOodlePacking)
+      {
+        cb.writeInt32e(unsigned(s4size));
+        packed = oodle_compress_data(cb.getRawWriter(), s4crd, s4size);
+      }
+      else
+        packed = zstd_compress_data(cb.getRawWriter(), s4crd, s4size, 1 << 20, 19);
+      cb.endBlock((preferZstdPacking && allowOodlePacking) ? btag_compr::OODLE : btag_compr::ZSTD);
+      if (packed <= 0) // e.g. a stub oodle build: the block would decode to nothing and the level would lose collision
+      {
+        DAGORED2->getConsole().addMessage(ILogWriter::ERROR, "SoA4 land tracer stream compression failed (%lld)", (long long)packed);
+        return false;
+      }
+      DAGORED2->getConsole().addMessage(ILogWriter::NOTE, "SoA4 land tracer saved %d bytes raw", s4size);
+    }
+    else
+    {
+      if (!s4built && !srcTris)
+        // legitimate for geometry-less levels: runtimes see a tracer-less level
+        DAGORED2->getConsole().addMessage(ILogWriter::NOTE, "SoA4 land tracer not built (no cell geometry), stream not embedded");
+      else
+      {
+        // real geometry with no tracer stream would finalize a level that silently lost its
+        // mesh collision: fail the export instead
+        const char *reason = "failed to save SoA4 land tracer for export";
+        if (!s4built)
+          reason = "SoA4 land tracer build failed for export";
+        else if (s4mem.size() > LandRayTracerSoA4::MAX_STREAM_SIZE)
+          reason = "SoA4 land tracer stream too large to embed";
+        DAGORED2->getConsole().addMessage(ILogWriter::ERROR, reason);
+        return false;
+      }
+    }
+  }
   return true;
 }

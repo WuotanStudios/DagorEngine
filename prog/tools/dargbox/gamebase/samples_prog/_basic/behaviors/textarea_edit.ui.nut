@@ -1,5 +1,4 @@
 from "%darg/ui_imports.nut" import *
-from "math" import max
 
 let cursors = require("samples_prog/_cursors.nut")
 
@@ -33,7 +32,7 @@ return {
   gap = sh(2)
   children = [
     {
-      size = static [sh(80), sh(50)]
+      size = const [sh(80), sh(50)]
       //size = sh(30)
       rendObj = ROBJ_BOX
       borderWidth = 2
@@ -60,9 +59,21 @@ return {
       rendObj = ROBJ_TEXT
       text = $"Text length = {lenWatched.get()}"
     }
+    {
+      size = FLEX_H
+      rendObj = ROBJ_TEXTAREA
+      behavior = Behaviors.TextArea
+      color = Color(150,150,120)
+      text = @"
+        F3 - Replace text
+        F4 - Insert text at caret position
+        F5 - Insert text at the beginning"
+    }
   ]
 
   hotkeys = [
-    ["F3", @() editableText.text = "Brand new text"]
+    ["F3", @() editableText.text = "Brand new text"],
+    ["F4", @() editableText.insertText("[inserted at caret]")],
+    ["F5", @() editableText.insertText("[start]", 0)]
   ]
 }

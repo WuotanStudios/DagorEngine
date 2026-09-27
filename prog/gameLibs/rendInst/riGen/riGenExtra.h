@@ -8,10 +8,10 @@
 #include "riGen/rendInstTiledScene.h"
 
 #include <vecmath/dag_vecMathDecl.h>
-#include <osApiWrappers/dag_rwLock.h>
 #include <util/dag_oaHashNameMap.h>
 #include <scene/dag_physMat.h>
 #include <dag/dag_vector.h>
+#include <generic/dag_span.h>
 #include <3d/dag_texStreamingContext.h>
 #include <EASTL/bitvector.h>
 #include <util/dag_multicastEvent.h>
@@ -51,18 +51,32 @@ namespace rendinst
 {
 inline constexpr int RIEXTRA_VECS_COUNT = 4;
 
-class RiExtraPoolsVec : public dag::Vector<RiExtraPool> // To consider: move this methods to dag::Vector?
+struct RiExtraPoolsVec : private dag::Vector<RiExtraPool>
 {
-public:
-  using dag::Vector<RiExtraPool>::Vector;
+  RiExtraPool *data() { return mpBegin(); }
+  RiExtraPool &operator[](int id) { return dag::Vector<RiExtraPool>::operator[](id); }
+  void clear();
   uint32_t size_interlocked() const { return interlocked_acquire_load(*(const volatile int *)&mCount); }
-  uint32_t interlocked_increment_size();
+  uint32_t size() const { return dag::Vector<RiExtraPool>::size(); }
+  bool empty() const { return dag::Vector<RiExtraPool>::empty(); }
+  bool isValid(int id) const { return unsigned(id) < size(); }
+
+  // custom atomic insert() in order to avoid to read partially constructed pool data
+  void interlocked_insert(int id) DAG_TS_REQUIRES(rendinst::ccExtra);
+
+  void interlocked_set_was_not_saved_to_elems(int id)
+  {
+    using Bits = decltype(poolWasNotSavedToElems);
+    using Word = Bits::element_type;
+    interlocked_or(reinterpret_cast<volatile Word &>(poolWasNotSavedToElems.data()[id / Bits::kBitCount]),
+      Word(1) << (id % Bits::kBitCount));
+  }
+
+  eastl::bitvector<> poolWasNotSavedToElems;
 };
 extern RiExtraPoolsVec riExtra;
 extern FastNameMap riExtraMap;
-extern eastl::bitvector<> riExtraPoolWasNotSavedToElems; // Parallel to `riExtra`
 
-extern SmartReadWriteFifoLock ccExtra;
 extern int maxExtraRiCount;
 extern float extendTreeRiExtraTreeBbox;
 
@@ -77,10 +91,38 @@ void termRIGenExtra();
 
 bool isRIGenExtraObstacle(const char *nm);
 bool isRIGenExtraUsedInDestr(const char *nm);
+// riExtra{<name>{}} description from the registered riConfig, or null; never a legacy dmg{} block
+const DataBlock *getRIGenExtraBlockByName(const char *ri_res_name);
+void update_deferred_push_res();
 bool rayHitRIGenExtraCollidable(const Point3 &p0, const Point3 &norm_dir, float len, rendinst::RendInstDesc &ri_desc,
   const MaterialRayStrat &strategy, float min_r);
 void reapplyLodRanges();
 void addRiExtraRefs(DataBlock *b, const DataBlock *riConf, const char *name);
+
+/** \brief iterate over RiExtraPool
+ *
+ * \return false if callback returned false (and iteration stopped), true otherwise
+ */
+template <typename Func>
+inline bool iterateRIExtra(const Func &callback)
+{
+  using RetType = eastl::invoke_result_t<Func, int, RiExtraPool &>;
+  RiExtraPool *pool = riExtra.data();
+  int size = riExtra.size_interlocked();
+  if constexpr (eastl::is_same_v<RetType, bool>)
+  {
+    for (int id = 0; id < size; ++id, ++pool)
+      if (!callback(id, *pool))
+        return false;
+  }
+  else
+  {
+    static_assert(eastl::is_void_v<RetType>);
+    for (int id = 0; id < size; ++id, ++pool)
+      callback(id, *pool);
+  }
+  return true;
+}
 
 enum
 {
@@ -90,6 +132,7 @@ enum
 typedef TiledScenesGroup<4> RITiledScenes;
 extern RITiledScenes riExTiledScenes;
 extern float riExTiledSceneMaxDist[RITiledScenes::MAX_COUNT];
+extern float riExTiledSceneMaxSize[RITiledScenes::MAX_COUNT];
 
 using RiExPerInstanceParameters = uint32_t;
 
@@ -107,7 +150,7 @@ void remove_instance_from_tiled_scene(scene::node_index nodeId);
 void init_instance_user_data_for_tiled_scene(rendinst::RiExtraPool &pool, scene::node_index ni, vec4f sphere, int add_data_dwords,
   const int32_t *add_data);
 void set_instance_user_data(scene::node_index ni, int add_data_dwords, const int32_t *add_data);
-const uint32_t *get_user_data(rendinst::riex_handle_t);
+dag::ConstSpan<int32_t> get_user_data(rendinst::riex_handle_t);
 vec4f get_node_bsphere(rendinst::riex_handle_t, float &);
 void prefetch_node(rendinst::riex_handle_t);
 } // namespace rendinst

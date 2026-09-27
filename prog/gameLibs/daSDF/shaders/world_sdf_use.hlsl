@@ -12,9 +12,9 @@ float sample_world_sdf_value(uint clip, float3 worldPos)
   return sample_world_sdf_value_clip_tc(clip, world_pos_to_world_sdf_tc(clip, worldPos));
 }
 
-float compute_simple_sdf_occlusion(float3 worldPos, float3 worldNorm, float range)
+float compute_simple_sdf_occlusion(float3 worldPos, float3 worldNorm, float range, float normal_bias)
 {
-  float r = range * 0.5;
+  float r = range * normal_bias;
   float3 pos = worldPos + worldNorm * r;
 
   const uint lastClip = world_sdf_num_cascades() - 1;
@@ -22,7 +22,7 @@ float compute_simple_sdf_occlusion(float3 worldPos, float3 worldNorm, float rang
 
   while (clip <= lastClip)
   {
-    if (clip == lastClip || (range <= world_sdf_voxel_size(clip) && world_sdf_is_inside_clip(clip, pos, 1)))
+    if ((range <= world_sdf_voxel_size(clip) && world_sdf_is_inside_clip(clip, pos, 1)))
     {
       float v = sample_world_sdf_value(clip, pos);
       if (v < 1)

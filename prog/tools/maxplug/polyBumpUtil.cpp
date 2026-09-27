@@ -10,10 +10,12 @@
 #include "resource.h"
 #include "math3d.h"
 #include <string>
+#include <vector>
+#include <filesystem>
 #include "debug.h"
+#include "common.h"
 
-std::string wideToStr(const TCHAR *sw);
-M_STD_STRING strToWide(const char *sz);
+namespace fs = std::filesystem;
 
 #define ERRMSG_DELAY 3000
 
@@ -29,24 +31,23 @@ enum
 class PolyBumpUtil : public UtilityObj
 {
 public:
-  TCHAR clsname[MAX_CLSNAME];
-  TCHAR output_path[256];
-  IUtil *iu;
-  Interface *ip;
-  HWND hPolyPanel;
-  ICustEdit *forwdist_p_eid;
-  ICustEdit *backdist_p_eid;
-  int antialias;
-  int poly_width, poly_height;
-  int highpolyid, lowpolyid;
-  real backdist_p, forwdist_p;
-  real back_weight;
-  bool latest_hit;
-  int expanddist;
-  int space;
-  bool selected_faces;
-  int map_channel;
-  PolyBumpUtil();
+  TCHAR clsname[MAX_CLSNAME] = {};
+  TCHAR output_path[256] = {};
+  IUtil *iu = NULL;
+  Interface *ip = NULL;
+  HWND hPolyPanel = NULL;
+  ICustEdit *forwdist_p_eid = NULL;
+  ICustEdit *backdist_p_eid = NULL;
+  int antialias = 0;
+  int poly_width = 256, poly_height = 256;
+  int highpolyid = 0, lowpolyid = 0;
+  real backdist_p = 3, forwdist_p = 10;
+  real back_weight = 0.3f;
+  bool latest_hit = false;
+  int expanddist = 32;
+  int space = OBJECT_SPACE;
+  bool selected_faces = false;
+  int map_channel = 1;
   void BeginEditParams(Interface *ip, IUtil *iu) override;
   void EndEditParams(Interface *ip, IUtil *iu) override;
   void DeleteThis() override {}
@@ -83,11 +84,7 @@ public:
   int IsPublic() override { return 1; }
   void *Create(BOOL loading = FALSE) override { return &util; }
   const TCHAR *ClassName() override { return GetString(IDS_POLYBUMPUTIL_NAME); }
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
   const MCHAR *NonLocalizedClassName() override { return ClassName(); }
-#else
-  const MCHAR *NonLocalizedClassName() { return ClassName(); }
-#endif
   SClass_ID SuperClassID() override { return UTILITY_CLASS_ID; }
   Class_ID ClassID() override { return PolyBumpUtil_CID; }
   const TCHAR *Category() override { return GetString(IDS_UTIL_CAT); }
@@ -175,7 +172,7 @@ IOResult PolyBumpUtilDesc::Load(ILoad *io)
         memset(util.output_path, 0, sizeof(util.output_path));
         if (io->ReadCStringChunk(&str) != IO_OK)
           return IO_ERROR;
-        _tcsncpy(util.output_path, str, 255);
+        _tcsncpy_s(util.output_path, _countof(util.output_path), str, _TRUNCATE);
       }
       break;
       case CH_POLYBUMP2:
@@ -194,8 +191,6 @@ IOResult PolyBumpUtilDesc::Load(ILoad *io)
 static PolyBumpUtilDesc utilDesc;
 ClassDesc *GetPolyBumpCD() { return &utilDesc; }
 
-bool get_edint(ICustEdit *e, int &a);
-bool get_edfloat(ICustEdit *e, float &a);
 bool get_chkbool(int id, char &chk, HWND pan = NULL);
 bool get_chkbool(int id, bool &chk, HWND pan = NULL)
 {
@@ -236,10 +231,7 @@ BOOL PolyBumpUtil::polybumpdlg_proc(HWND hw, UINT msg, WPARAM wpar, LPARAM lpar)
         case IDC_MAPCHANNEL:
           if (HIWORD(wpar) == CBN_SELCHANGE)
           {
-            char buf[256];
-            buf[255] = 0;
-            SendMessage(GetDlgItem(hPolyPanel, IDC_MAPCHANNEL), WM_GETTEXT, 255, (LPARAM)buf);
-            map_channel = atoi(buf);
+            map_channel = _ttoi(get_window_text(GetDlgItem(hPolyPanel, IDC_MAPCHANNEL)).c_str());
           }
           break;
       }
@@ -247,27 +239,6 @@ BOOL PolyBumpUtil::polybumpdlg_proc(HWND hw, UINT msg, WPARAM wpar, LPARAM lpar)
     default: return FALSE;
   }
   return TRUE;
-}
-
-PolyBumpUtil::PolyBumpUtil()
-{
-  _tcscpy(clsname, _T(""));
-  iu = NULL;
-  ip = NULL;
-  hPolyPanel = NULL;
-  forwdist_p_eid = backdist_p_eid = NULL;
-  poly_height = poly_width = 256;
-  highpolyid = lowpolyid = 0;
-  expanddist = 32;
-  backdist_p = 3;
-  forwdist_p = 10;
-  back_weight = 0.3f;
-  latest_hit = false;
-  space = OBJECT_SPACE;
-  selected_faces = false;
-  map_channel = 1;
-  antialias = 0;
-  memset(output_path, 0, sizeof(output_path));
 }
 
 void PolyBumpUtil::BeginEditParams(Interface *ip, IUtil *iu)
@@ -291,8 +262,8 @@ void PolyBumpUtil::update_poly_dist_ui()
 {
   if (!hPolyPanel)
     return;
-  char buf[256];
-  SendMessage(GetDlgItem(hPolyPanel, IDC_LOWPOLYNAME), WM_SETTEXT, 0, (LPARAM) "(none)");
+  TCHAR buf[256];
+  SendMessage(GetDlgItem(hPolyPanel, IDC_LOWPOLYNAME), WM_SETTEXT, 0, (LPARAM) _T("(none)"));
   if (lowpolyid)
   {
     INode *node = ip->GetINodeByHandle(lowpolyid);
@@ -309,21 +280,21 @@ void PolyBumpUtil::update_poly_dist_ui()
         real raylg = forwdist_p * lg;
         if (raylg >= 1000)
         {
-          sprintf(buf, "= %.2f m", raylg / 100);
+          _stprintf_s(buf, _countof(buf), _T("= %.2f m"), raylg / 100);
         }
         else
         {
-          sprintf(buf, "= %.2f cm", raylg);
+          _stprintf_s(buf, _countof(buf), _T("= %.2f cm"), raylg);
         }
         SendMessage(GetDlgItem(hPolyPanel, IDC_FDIST_CM), WM_SETTEXT, 0, LPARAM(buf));
         raylg = backdist_p * lg;
         if (raylg >= 1000)
         {
-          sprintf(buf, "= %.2f m", raylg / 100);
+          _stprintf_s(buf, _countof(buf), _T("= %.2f m"), raylg / 100);
         }
         else
         {
-          sprintf(buf, "= %.2f cm", raylg);
+          _stprintf_s(buf, _countof(buf), _T("= %.2f cm"), raylg);
         }
         SendMessage(GetDlgItem(hPolyPanel, IDC_BDIST_CM), WM_SETTEXT, 0, LPARAM(buf));
       }
@@ -335,7 +306,7 @@ void PolyBumpUtil::update_poly_mapchannels()
 {
   if (!hPolyPanel)
     return;
-  char buf[256];
+  TCHAR buf[256];
   if (lowpolyid)
   {
     INode *node = ip->GetINodeByHandle(lowpolyid);
@@ -357,7 +328,7 @@ void PolyBumpUtil::update_poly_mapchannels()
       {
         if (abs(map_channel - i) < abs(map_channel - nearest_supported))
           nearest_supported = i;
-        sprintf(buf, "%d", i);
+        _stprintf_s(buf, _countof(buf), _T("%d"), i);
         SendMessage(GetDlgItem(hPolyPanel, IDC_MAPCHANNEL), CB_ADDSTRING, 0, (LPARAM)buf);
       }
     }
@@ -367,7 +338,7 @@ void PolyBumpUtil::update_poly_mapchannels()
       if (map_channel >= MAX_MESHMAPS)
         map_channel = MAX_MESHMAPS - 1;
     }
-    sprintf(buf, "%d", map_channel);
+    _stprintf_s(buf, _countof(buf), _T("%d"), map_channel);
     SendMessage(GetDlgItem(hPolyPanel, IDC_MAPCHANNEL), WM_SETTEXT, 0, (LPARAM)buf);
 
     if (lowtri != ob)
@@ -379,34 +350,34 @@ void PolyBumpUtil::update_poly_ui()
 {
   if (!hPolyPanel)
     return;
-  char buf[256];
+  TCHAR buf[256];
   if (space == TANGENT_SPACE)
   {
-    SendMessage(GetDlgItem(hPolyPanel, IDC_SPACE), WM_SETTEXT, 0, (LPARAM) "Tangent space");
+    SendMessage(GetDlgItem(hPolyPanel, IDC_SPACE), WM_SETTEXT, 0, (LPARAM) _T("Tangent space"));
   }
   else if (space == OBJECT_SPACE)
   {
     space = OBJECT_SPACE;
-    SendMessage(GetDlgItem(hPolyPanel, IDC_SPACE), WM_SETTEXT, 0, (LPARAM) "Object space");
+    SendMessage(GetDlgItem(hPolyPanel, IDC_SPACE), WM_SETTEXT, 0, (LPARAM) _T("Object space"));
   }
   else
   {
     space = WORLD_SPACE;
-    SendMessage(GetDlgItem(hPolyPanel, IDC_SPACE), WM_SETTEXT, 0, (LPARAM) "World space");
+    SendMessage(GetDlgItem(hPolyPanel, IDC_SPACE), WM_SETTEXT, 0, (LPARAM) _T("World space"));
   }
 
-  sprintf(buf, "%d", poly_width);
+  _stprintf_s(buf, _countof(buf), _T("%d"), poly_width);
   SendMessage(GetDlgItem(hPolyPanel, IDC_WIDTH), WM_SETTEXT, 0, (LPARAM)buf);
-  sprintf(buf, "%d", poly_height);
+  _stprintf_s(buf, _countof(buf), _T("%d"), poly_height);
   SendMessage(GetDlgItem(hPolyPanel, IDC_HEIGHT), WM_SETTEXT, 0, (LPARAM)buf);
 
   if (expanddist)
-    sprintf(buf, "%d", expanddist);
+    _stprintf_s(buf, _countof(buf), _T("%d"), expanddist);
   else
-    sprintf(buf, "None");
+    _stprintf_s(buf, _countof(buf), _T("None"));
 
   SendMessage(GetDlgItem(hPolyPanel, IDC_EXPAND), WM_SETTEXT, 0, (LPARAM)buf);
-  SendMessage(GetDlgItem(hPolyPanel, IDC_HIGHPOLYNAME), WM_SETTEXT, 0, (LPARAM) "(none)");
+  SendMessage(GetDlgItem(hPolyPanel, IDC_HIGHPOLYNAME), WM_SETTEXT, 0, (LPARAM) _T("(none)"));
 
   if (highpolyid)
   {
@@ -426,11 +397,6 @@ void PolyBumpUtil::update_poly_ui()
   }
   update_poly_dist_ui();
 
-  /*int i;
-  for(i=0;i<12;++i) if( (1<<i)>=poly_width) break;
-  SendMessage(GetDlgItem(hPolyPanel,IDC_WIDTH),CB_SETCURSEL,i-4,0);
-  for(i=0;i<12;++i) if( (1<<i)>=poly_height) break;
-  SendMessage(GetDlgItem(hPolyPanel,IDC_HEIGHT),CB_SETCURSEL,i-4,0);*/
   CheckDlgButton(hPolyPanel, IDC_LATEST, latest_hit ? BST_CHECKED : BST_UNCHECKED);
   CheckDlgButton(hPolyPanel, IDC_SELFACES, selected_faces ? BST_CHECKED : BST_UNCHECKED);
   SendMessage(GetDlgItem(hPolyPanel, IDC_BACK_WEIGHT), TBM_SETPOS, (WPARAM)TRUE, (LPARAM) int(back_weight * 1000));
@@ -442,21 +408,16 @@ void PolyBumpUtil::update_poly_vars()
 {
   if (!hPolyPanel)
     return;
-  // debug("try get");
-  char buf[256];
-  buf[255] = 0;
-  SendMessage(GetDlgItem(hPolyPanel, IDC_WIDTH), WM_GETTEXT, 255, (LPARAM)buf);
-  poly_width = atoi(buf);
-  SendMessage(GetDlgItem(hPolyPanel, IDC_HEIGHT), WM_GETTEXT, 255, (LPARAM)buf);
-  poly_height = atoi(buf);
-  SendMessage(GetDlgItem(hPolyPanel, IDC_EXPAND), WM_GETTEXT, 255, (LPARAM)buf);
-  expanddist = atoi(buf);
-  SendMessage(GetDlgItem(hPolyPanel, IDC_SPACE), WM_GETTEXT, 255, (LPARAM)buf);
-  if (strnicmp(buf, "tangent", strlen("tangent")) == 0)
+  poly_width = _ttoi(get_window_text(GetDlgItem(hPolyPanel, IDC_WIDTH)).c_str());
+  poly_height = _ttoi(get_window_text(GetDlgItem(hPolyPanel, IDC_HEIGHT)).c_str());
+  expanddist = _ttoi(get_window_text(GetDlgItem(hPolyPanel, IDC_EXPAND)).c_str());
+
+  const std::wstring space_name = get_window_text(GetDlgItem(hPolyPanel, IDC_SPACE));
+  if (istarts_with(space_name, L"tangent"))
   {
     space = TANGENT_SPACE;
   }
-  else if (strnicmp(buf, "object", strlen("object")) == 0)
+  else if (istarts_with(space_name, L"object"))
   {
     space = OBJECT_SPACE;
   }
@@ -464,15 +425,11 @@ void PolyBumpUtil::update_poly_vars()
   {
     space = WORLD_SPACE;
   }
-  SendMessage(GetDlgItem(hPolyPanel, IDC_MAPCHANNEL), WM_GETTEXT, 255, (LPARAM)buf);
-  map_channel = atoi(buf);
+  map_channel = _ttoi(get_window_text(GetDlgItem(hPolyPanel, IDC_MAPCHANNEL)).c_str());
   get_chkbool(IDC_SELFACES, selected_faces, hPolyPanel);
   get_chkbool(IDC_LATEST, latest_hit, hPolyPanel);
   get_edfloat(forwdist_p_eid, forwdist_p);
   get_edfloat(backdist_p_eid, backdist_p);
-  /*poly_width=1<<(4+SendMessage( GetDlgItem(hPolyPanel,IDC_WIDTH),CB_GETCURSEL,0,0));
-  poly_height=1<<(4+SendMessage( GetDlgItem(hPolyPanel,IDC_HEIGHT),CB_GETCURSEL,0,0));*/
-  // debug("got %d %d",poly_width,poly_height);
   back_weight = SendMessage(GetDlgItem(hPolyPanel, IDC_BACK_WEIGHT), TBM_GETPOS, (WPARAM)0, (LPARAM)0) / 1000.0;
 }
 
@@ -480,31 +437,29 @@ void PolyBumpUtil::InitPoly(HWND hw)
 {
   // Width
   hPolyPanel = hw;
-  char buf[256];
+  TCHAR buf[256];
   int i;
   for (i = 4; i <= 11; ++i)
   {
-    sprintf(buf, "%d", 1 << i);
+    _stprintf_s(buf, _countof(buf), _T("%d"), 1 << i);
     SendMessage(GetDlgItem(hw, IDC_WIDTH), CB_ADDSTRING, 0, (LPARAM)buf);
     SendMessage(GetDlgItem(hw, IDC_HEIGHT), CB_ADDSTRING, 0, (LPARAM)buf);
   }
-  SendMessage(GetDlgItem(hw, IDC_SPACE), CB_ADDSTRING, 0, (LPARAM) "World space");
-  SendMessage(GetDlgItem(hw, IDC_SPACE), CB_ADDSTRING, 0, (LPARAM) "Object space");
-  SendMessage(GetDlgItem(hw, IDC_SPACE), CB_ADDSTRING, 0, (LPARAM) "Tangent space");
+  SendMessage(GetDlgItem(hw, IDC_SPACE), CB_ADDSTRING, 0, (LPARAM) _T("World space"));
+  SendMessage(GetDlgItem(hw, IDC_SPACE), CB_ADDSTRING, 0, (LPARAM) _T("Object space"));
+  SendMessage(GetDlgItem(hw, IDC_SPACE), CB_ADDSTRING, 0, (LPARAM) _T("Tangent space"));
 
-  // SendMessage(GetDlgItem(hw,IDC_WIDTH),  WM_SETTEXT, 0, (LPARAM) str[8-4]);
   SendMessage(GetDlgItem(hPolyPanel, IDC_WIDTH), CB_SETCURSEL, 4, 0);
   SendMessage(GetDlgItem(hPolyPanel, IDC_HEIGHT), CB_SETCURSEL, 4, 0);
-  // SendMessage(GetDlgItem(hw,IDC_HEIGHT), WM_SETTEXT, 0, (LPARAM) str[8-4]);
 
-  sprintf(buf, "None");
+  _stprintf_s(buf, _countof(buf), _T("None"));
   SendMessage(GetDlgItem(hw, IDC_EXPAND), CB_ADDSTRING, 0, (LPARAM)buf);
   for (i = 0; i <= 6; ++i)
   {
-    sprintf(buf, "%d", 1 << i);
+    _stprintf_s(buf, _countof(buf), _T("%d"), 1 << i);
     SendMessage(GetDlgItem(hw, IDC_EXPAND), CB_ADDSTRING, 0, (LPARAM)buf);
   }
-  sprintf(buf, "%d", 2048);
+  _stprintf_s(buf, _countof(buf), _T("%d"), 2048);
   SendMessage(GetDlgItem(hw, IDC_EXPAND), CB_ADDSTRING, 0, (LPARAM)buf);
 
   forwdist_p_eid = GetICustEdit(GetDlgItem(hw, IDC_FDIST_PERCENT));
@@ -688,6 +643,7 @@ void VNormal::Normalize()
     {
       norm += ptr->norm;
       prev->next = ptr->next;
+      ptr->next = NULL; // detach before delete, else ~VNormal recursively frees the live tail
       delete ptr;
       ptr = prev->next;
     }
@@ -774,29 +730,27 @@ void ComputeVertexNormals(Mesh *mesh, Tab<Point3> &vnrm, Tab<FaceNGr> &fngr, Poi
   }
 }
 
-static BOOL file_exists(TCHAR *filename)
+// Pattern (e.g. "*.tga") for a 1-based filter index in an OPENFILENAME filter
+// list -- a double-null-terminated "desc\0pattern\0desc\0pattern\0\0" block.
+static const TCHAR *filter_pattern(const TCHAR *p, int index)
 {
-  HANDLE findhandle;
-  WIN32_FIND_DATA file;
-  findhandle = FindFirstFile(filename, &file);
-  FindClose(findhandle);
-  if (findhandle == INVALID_HANDLE_VALUE)
-    return FALSE;
-  else
-    return TRUE;
+  for (int i = 1; i < index; i++)
+  {
+    p += _tcslen(p) + 1; // skip description
+    p += _tcslen(p) + 1; // skip pattern
+  }
+  return p + _tcslen(p) + 1; // skip selected pair's description -> its pattern
 }
 
 bool PolyBumpUtil::BrowseOutFile(TSTR &file)
 {
-  // BOOL silent = TheManager->SetSilentMode(TRUE);
-  // BitmapInfo biOutFile;
   FilterList fl;
 
   OPENFILENAME ofn;
   // get OPENFILENAME items
   HWND hWnd = GetCOREInterface()->GetMAXHWnd();
   TCHAR file_name[260];
-  _tcsncpy(file_name, file, 260);
+  _tcsncpy_s(file_name, _countof(file_name), file, _TRUNCATE);
   TSTR cap_str = GetString(IDS_SELECT_OUTPUT);
 
   fl.Append(GetString(IDS_FILTER_TARGA));
@@ -815,61 +769,37 @@ bool PolyBumpUtil::BrowseOutFile(TSTR &file)
   ofn.lpstrFilter = fl;
   ofn.nFilterIndex = 1;
   ofn.lpstrTitle = cap_str;
-  ofn.lpstrFileTitle = (PTCHAR) _T("");
+  ofn.lpstrFileTitle = (PTCHAR)L"";
   ofn.nMaxFileTitle = 0;
-  ofn.lpstrInitialDir = (PTCHAR) _T("");
+  ofn.lpstrInitialDir = (PTCHAR)L"";
   ofn.Flags = OFN_HIDEREADONLY;
-  // ofn.lpstrDefExt=_T("tga");
 
   // throw up the dialog
   while (GetSaveFileName(&ofn))
   {
-    TCHAR *fn = new TCHAR[_tcslen(ofn.lpstrFile) + 4 + 1], *p;
-    DWORD i;
-    _tcscpy(fn, ofn.lpstrFile);
-    TCHAR type[_MAX_PATH];
-    // BMMSplitFilename(ofn.lpstrFile, NULL, NULL, type);
-    // char drv[_MAX_DRIVE],dir[_MAX_DIR],fn[_MAX_PATH];
-    _tsplitpath(ofn.lpstrFile, NULL, NULL, NULL, type);
-    if (type[0] == 0 || _tcschr(type, _T('\\')) != NULL) // no suffix, add from filter types if not *.*
+    fs::path fn = ofn.lpstrFile;
+    if (!fn.has_extension()) // no suffix typed: take the default from the selected filter
     {
-      for (i = 1, p = (TCHAR *)ofn.lpstrFilter; i < ofn.nFilterIndex; i++)
-      {
-        while (*p)
-          p++;
-        p++;
-        while (*p)
-          p++;
-        p++; // skip to indexed type
-      }
-      while (*p)
-        p++;
-      p++;
-      p++;                                  // jump descripter, '*'
-      if (*p == _T('.') && p[1] != _T('*')) // add if .xyz
-        _tcscat(fn, p);
+      fs::path ext = fs::path(filter_pattern(ofn.lpstrFilter, ofn.nFilterIndex)).extension();
+      if (!ext.empty() && ext.native() != L".*") // skip the "*.*" (all files) filter
+        fn.replace_extension(ext);
     }
 
-    if (file_exists(fn))
+    if (fs::exists(fn))
     {
-      // file already exists, query owverwrite
-      TCHAR buf[256];
+      // file already exists, query overwrite
+      std::wstring msg = L"\"" + fn.native() + L"\" " + GetString(IDS_FILE_REPLACE);
       MessageBeep(MB_ICONEXCLAMATION);
-      _stprintf(buf, _T("\"%s\" %s"), fn, GetString(IDS_FILE_REPLACE));
-      if (MessageBox(hWnd, buf, GetString(IDS_SAVE_AS), MB_ICONQUESTION | MB_YESNO) == IDNO)
+      if (MessageBox(hWnd, msg.c_str(), GetString(IDS_SAVE_AS), MB_ICONQUESTION | MB_YESNO) == IDNO)
       {
-        // don't overwrite, remove the path from the name, try again
-        _tcscpy(buf, file_name + ofn.nFileOffset);
-        _tcscpy(file_name, buf);
-        delete[] fn;
+        // don't overwrite, keep just the file name and re-run the dialog
+        std::wstring bare = fs::path(file_name).filename().wstring();
+        _tcscpy(file_name, bare.c_str());
         continue;
       }
     }
-    file = fn;
-    delete[] fn;
-
+    file = fn.c_str();
     return true;
-    break;
   }
   return false;
 }
@@ -879,7 +809,7 @@ bool PolyBumpUtil::select_output()
   TSTR file = output_path;
   if (BrowseOutFile(file))
   {
-    _tcsncpy(output_path, file, 255);
+    _tcsncpy_s(output_path, _countof(output_path), file, _TRUNCATE);
     SendMessage(GetDlgItem(hPolyPanel, IDC_OUTPUTPATH), WM_SETTEXT, 0, (LPARAM)output_path);
     return true;
   }
@@ -976,7 +906,7 @@ void PolyBumpUtil::build_normal_map()
     return;
   }
 
-  uint *pixels = new uint[poly_width * poly_height];
+  std::vector<uint> pixels(poly_width * poly_height);
   Tab<Point3> lowvnrm;
   Tab<FaceNGr> lowfngr;
   Tab<Point3> lowvert;
@@ -998,7 +928,6 @@ void PolyBumpUtil::build_normal_map()
           lowtri->DeleteMe();
         if (hightri != higho)
           hightri->DeleteMe();
-        delete[] pixels;
         return;
       }
     }
@@ -1008,8 +937,6 @@ void PolyBumpUtil::build_normal_map()
     lowvert[v] = ltm.PointTransform(lowm.verts[v]);
   ComputeVertexNormals(&lowm, lowvnrm, lowfngr, lowvert.Addr(0));
 
-
-  memset(pixels, 0, poly_width * poly_height * 4);
 
   Box3 bbox;
   lowo->GetDeformBBox(time, bbox, &ltm);
@@ -1024,8 +951,8 @@ void PolyBumpUtil::build_normal_map()
     ip->ProgressStart(_T("Working..."), TRUE, dummyprogressfn, NULL);
     build_normal_map(selected_faces ? &lowm.FaceSel() : NULL, lowm.faces, lowm.numFaces, lowvert.Addr(0), lowm.numVerts,
       lowm.mapFaces(map_channel), lowm.mapVerts(map_channel), lowfngr.Addr(0), lowvnrm.Addr(0), Inverse(ltm), poly_width, poly_height,
-      pixels, highm, highnode->GetObjTMAfterWSM(time), lg * forwdist_p / 100.0f, lg * backdist_p / 100.0f, !latest_hit, back_weight,
-      expanddist, highnode);
+      pixels.data(), highm, highnode->GetObjTMAfterWSM(time), lg * forwdist_p / 100.0f, lg * backdist_p / 100.0f, !latest_hit,
+      back_weight, expanddist, highnode);
     if (ip->GetCancel())
     {
       ip->ProgressEnd();
@@ -1037,7 +964,7 @@ void PolyBumpUtil::build_normal_map()
 
       std::string s = wideToStr(output_path);
 
-      if (!save_tga32(s.c_str(), (char *)pixels, poly_width, poly_height, poly_width * 4))
+      if (!save_tga32(s.c_str(), (char *)pixels.data(), poly_width, poly_height, poly_width * 4))
       {
         ip->DisplayTempPrompt(GetString(IDS_CANTWRITE_FILE));
       }
@@ -1052,7 +979,6 @@ void PolyBumpUtil::build_normal_map()
     lowtri->DeleteMe();
   if (hightri != higho)
     hightri->DeleteMe();
-  delete[] pixels;
 }
 
 static inline Point2 Point3to2(const Point3 &p) { return Point2(p.x, 1 - p.y); }
@@ -1173,13 +1099,11 @@ public:
   INode *node;
   Mesh *mesh;
   int face;
-  // Matrix3 cam2obj,obj2cam;
   Box3 objbox;
   Point3 bary, norm, normal, facenorm, view, orgview, pt, dpt, dpt_dx, dpt_dy, vp[3], bv[3], bo;
   Point3 tv[MAX_MESHMAPS][3];
   float curve, face_sz, sz_ratio, facecurve;
   Tab<Point3> fnorm;
-  // Tab<Point3[3]> vnorm;
   Point3 *highvnrm;
   FaceNGr *facengr;
   bool hastv[MAX_MESHMAPS];
@@ -1195,14 +1119,7 @@ public:
     face = -1;
     ambientLight = Color(0, 0, 0);
   }
-  void setnode(INode *n)
-  {
-    node = n;
-    /*if(n) {
-      obj2cam=n->GetObjectTM(curtime);
-      cam2obj=Inverse(obj2cam);
-    }*/
-  }
+  void setnode(INode *n) { node = n; }
   void setmesh(Mesh &m, Point3 *vnr, FaceNGr *ngr)
   {
     mesh = &m;
@@ -1241,7 +1158,7 @@ public:
     mtlNum = f.getMatID();
     int i;
     for (i = 0; i < 3; ++i)
-      vp[i] = mesh->verts[f.v[i]]; //*obj2cam;
+      vp[i] = mesh->verts[f.v[i]];
     for (i = 0; i < MAX_MESHMAPS; ++i)
       hastv[i] = false;
     face_sz = fabsf(vp[1].x - vp[0].x);
@@ -1328,12 +1245,8 @@ public:
     dx = dpt_dx;
     dy = dpt_dy;
   }
-  Point3 PObj() override { return pt; } // *cam2obj
-  Point3 DPObj() override
-  {
-    // return VectorTransform(dpt,cam2obj);
-    return dpt;
-  }
+  Point3 PObj() override { return pt; }
+  Point3 DPObj() override { return dpt; }
   Box3 ObjectBox() override { return objbox; }
   Point3 PObjRelBox() override
   {
@@ -1390,10 +1303,7 @@ public:
     switch (ito)
     {
       case REF_WORLD:
-      case REF_CAMERA:
-        return p;
-        // case REF_OBJECT:
-        //	return p*cam2obj;
+      case REF_CAMERA: return p;
     }
     return p;
   }
@@ -1402,10 +1312,7 @@ public:
     switch (ito)
     {
       case REF_WORLD:
-      case REF_CAMERA:
-        return p;
-        // case REF_OBJECT:
-        //	return p*obj2cam;
+      case REF_CAMERA: return p;
     }
     return p;
   }
@@ -1414,10 +1321,7 @@ public:
     switch (ito)
     {
       case REF_WORLD:
-      case REF_CAMERA:
-        return p;
-        // case REF_OBJECT:
-        //	return VectorTransform(p,cam2obj);
+      case REF_CAMERA: return p;
     }
     return p;
   }
@@ -1426,10 +1330,7 @@ public:
     switch (ito)
     {
       case REF_WORLD:
-      case REF_CAMERA:
-        return p;
-        // case REF_OBJECT:
-        //	return VectorTransform(p,obj2cam);
+      case REF_CAMERA: return p;
     }
     return p;
   }
@@ -1530,7 +1431,6 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
     }
 
     tg_face.SetCount(numf);
-    // memset(tg_face.Addr(0),0xFF,numf*sizeof(FaceNGr));
 
     for (i = 0; i < numv; ++i)
     {
@@ -1557,11 +1457,10 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
         S = Normalize(S);
         T = Normalize(T);
         tg_face[f][vi][0] = S;
-        tg_face[f][vi][1] = T; // CrossProd(S,vertnorm[facengr[f][vi]]);
+        tg_face[f][vi][1] = T;
         tg_face[f][vi][2] = Normalize(CrossProd(S, T));
         if (DotProd(tg_face[f][vi][2], vertnorm[facengr[f][vi]]) < 0)
           tg_face[f][vi][2] = -tg_face[f][vi][2];
-        // tg_face[f][vi][2]=vertnorm[facengr[f][vi]];
       }
     }
     for (i = 0; i < numv; ++i)
@@ -1652,7 +1551,7 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
       x0 += wd;
     for (int v = v0; v <= v1; ++v, y = (++y >= ht ? 0 : y))
     {
-      real tv = v / real(ht); //+dv;
+      real tv = v / real(ht);
       real de[3];
       int i;
       for (i = 0; i < 3; ++i)
@@ -1698,7 +1597,7 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
         if (be < 0)
         {
           // point on the face
-          real tu = u / real(wd); //+du;
+          real tu = u / real(wd);
           real k1 = ((tu - tu0) * tv2 - (tv - tv0) * tu2) * det;
           real k2 = ((tv - tv0) * tu1 - (tu - tu0) * tv1) * det;
           pos[p] = p1 * k1 + p2 * k2 + p0;
@@ -1709,10 +1608,6 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
             farea[f].p0 = p;
           if (p > farea[f].p1)
             farea[f].p1 = p;
-          /*if ( p < fm0 )
-          fm0 = p;
-          if ( p > fm1 )
-      fm1 = p;*/
         }
         else
         {
@@ -1726,7 +1621,6 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
             if (lengthSq(dp) >= lengthSq(get_point2(pofs[p])))
               continue;
           }
-          // if(f==7) debug(" uv=%d,%d dp=" FMT_P2 "",u,v,P2D(dp));
           pofs[p] = store_point2(dp);
           t.x /= wd;
           t.y /= ht;
@@ -1736,15 +1630,10 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
           nrm[p] = n1 * k1 + n2 * k2 + n0;
           lowbc[p] = Point3(1 - k1 - k2, k1, k2);
           fm[p] = (f | EFLG);
-          // lmcol[p] = ambcol;
           if (p < farea[f].p0)
             farea[f].p0 = p;
           if (p > farea[f].p1)
             farea[f].p1 = p;
-          /*if ( p < fm0 )
-          fm0 = p;
-          if ( p > fm1 )
-      fm1 = p;*/
         }
       }
     }
@@ -1752,11 +1641,6 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
 
   //==tracerays
   Mesh trhm = hm;
-  /*for(f=0;f<trhm.numFaces;++f) {
-  int v0=trhm.faces[f].v[0];
-  trhm.faces[f].v[0]=trhm.faces[f].v[1];
-  trhm.faces[f].v[1]=v0;
-  }*/
   Tab<Point3> highvnrm;
   Tab<FaceNGr> highfngr;
   Tab<Point3> highvert;
@@ -1837,12 +1721,9 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
       Point3 n;
       ray.dir = n = Normalize(nrm[i]);
       ray.p = pos[i];
-      // DWORD fi;
-      // Point3 nrm;
       float forat = fordist;
       int forfi;
       Point3 forbary;
-      // if(trhm.IntersectRay(ray,at,nrm,fi,bary)){
       bool forhit;
 
       float backat = backdist;
@@ -1952,8 +1833,6 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
             UVVert uv = bary.x * tv[tf[fi].t[0]] + bary.y * tv[tf[fi].t[1]] + bary.z * tv[tf[fi].t[2]];
             sc.setpt(uv.x, uv.y, 1.0f / wd, 1.0f / ht);
             Point3 bn = btex->EvalNormalPerturb(sc) * ((StdMat *)submtl)->GetTexmapAmt(ID_BU, time);
-            // if(!((BMTex*)btex)->thebm) debug("None");
-            // debug("a %g %g %g",bn.x,bn.y,bn.z);
             releasenrm[i] += bn;
             releasenrm[i] = Normalize(releasenrm[i]);
           }
@@ -1982,7 +1861,6 @@ void PolyBumpUtil::build_normal_map(BitArray *facesel, Face *face, int numf, Poi
   {
     for (int x = 0; x < reswd; ++x, ++ri)
     {
-      // i=x+y*wd;
       Point3 nr(0, 0, 0);
       int nc = 0;
       int a = 0;

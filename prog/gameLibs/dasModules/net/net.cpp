@@ -3,7 +3,7 @@
 #include <dasModules/aotNet.h>
 #include <dasModules/dasDataBlock.h>
 #include <daScript/daScript.h>
-#include <daECS/net/dasEvents.h>
+#include <ecs/net/dasEvents.h>
 #include <dasModules/dasEvent.h>
 #include <dasModules/dasModulesCommon.h>
 #include <dasModules/dasSystem.h>
@@ -24,6 +24,11 @@ struct ConnectionIdAnnotation : das::ManagedValueAnnotation<net::ConnectionId>
 
   virtual void walk(das::DataWalker &walker, void *data) override
   {
+    if (walker.collecting)
+    {
+      das::ManagedValueAnnotation<net::ConnectionId>::walk(walker, data);
+      return;
+    }
     if (!walker.reading)
     {
       const net::ConnectionId *t = (net::ConnectionId *)data;
@@ -49,6 +54,7 @@ struct NetObjectAnnotation final : das::ManagedStructureAnnotation<net::Object, 
     cppName = " ::net::Object";
     addProperty<DAS_BIND_MANAGED_PROP(getCreationOrder)>("creationOrder", "getCreationOrder");
     addProperty<DAS_BIND_MANAGED_PROP(getEid)>("eid", "getEid");
+    addProperty<DAS_BIND_MANAGED_PROP(isReplica)>("isReplica", "isReplica");
   }
 };
 
@@ -179,8 +185,8 @@ struct RegisterComponentFilterAnnotation : das::FunctionAnnotation
 
   bool apply(const das::FunctionPtr &fn, das::ModuleGroup &, const das::AnnotationArgumentList &, eastl::string &err) override
   {
-    auto program = (*das::daScriptEnvironment::bound)->g_Program;
-    if (program->thisModule->isModule)
+    das::Module *mod = fn->fromGeneric ? fn->fromGeneric->module : fn->module;
+    if (mod && mod->isModule)
     {
       err = "register_component_filter shouldn't be placed in the module. Please move the function to a file without module directive";
       return false;
@@ -304,11 +310,11 @@ public:
   {
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("DagorDataBlock")); // for get_circuit_conf
-    addEnumeration(das::make_smart<EnumerationCompReplicationFilter>());
-    addAnnotation(das::make_smart<ConnectionIdAnnotation>(lib));
-    addAnnotation(das::make_smart<IConnectionAnnotation>(lib));
-    addAnnotation(das::make_smart<NetObjectAnnotation>(lib));
-    addAnnotation(das::make_smart<RegisterComponentFilterAnnotation>());
+    addEnumeration(new EnumerationCompReplicationFilter());
+    addAnnotation(new ConnectionIdAnnotation(lib));
+    addAnnotation(new IConnectionAnnotation(lib));
+    addAnnotation(new NetObjectAnnotation(lib));
+    addAnnotation(new RegisterComponentFilterAnnotation());
     das::addExtern<DAS_BIND_FUN(server_send_schemeless_event)>(*this, lib, "server_send_schemeless_event",
       das::SideEffects::modifyExternal, "bind_dascript::server_send_schemeless_event");
     das::addExtern<DAS_BIND_FUN(server_send_schemeless_event_to)>(*this, lib, "server_send_schemeless_event",

@@ -4,8 +4,6 @@
 #include "hmlSplineObject.h"
 #include "hmlSplinePoint.h"
 #include "hmlEntity.h"
-#include "hmlSnow.h"
-#include "hmlLight.h"
 #include <de3_objEntity.h>
 #include <libTools/dagFileRW/splineShape.h>
 #include <libTools/dagFileRW/dagFileShapeObj.h>
@@ -179,6 +177,7 @@ void HmapLandObjectEditor::exportAsComposit()
 
   PtrTab<LandscapeEntityObject> ent_objs;
   PtrTab<SplineObject> spl_objs;
+  int bakedFillets = 0;
   DataBlock splitSplinesBlk;
   unsigned comp_count = 0;
   for (int i = 0; i < selection.size(); ++i)
@@ -271,16 +270,23 @@ void HmapLandObjectEditor::exportAsComposit()
       center = s->points[0]->getPt();
       centerSetted = true;
     }
-    int pt_cnt = s->points.size() - (s->isClosed() ? 1 : 0);
-    orig_pts.resize(pt_cnt);
-    for (int j = 0; j < pt_cnt; j++)
+    // snapshot source points: setPos rebuilds the curve, and reconciliation reshuffles the array between offset and restore
+    PtrTab<SplinePointObject> pts(tmpmem);
+    s->gatherSourcePoints(pts);
+    orig_pts.resize(pts.size());
+    for (int j = 0; j < pts.size(); j++)
     {
-      orig_pts[j] = s->points[j]->getPt();
-      s->points[j]->setPos(s->points[j]->getPt() - center);
+      orig_pts[j] = pts[j]->getPt();
+      pts[j]->setPos(orig_pts[j] - center);
     }
-    s->save(*blk.addNewBlock("node"));
-    for (int j = 0; j < pt_cnt; j++)
-      s->points[j]->setPos(orig_pts[j]);
+    for (auto &p : pts)
+      if (p->hasActiveFillet())
+        bakedFillets++;
+    // the composite has no reconcile of its own, so its spline carries baked knots. The export leaves the source spline
+    // untouched, so a fillet-less composite is a matter of clearing filletR and exporting again
+    s->save(*blk.addNewBlock("node"), SplineObject::FILLET_BAKE);
+    for (int j = 0; j < pts.size(); j++)
+      pts[j]->setPos(orig_pts[j]);
   }
   for (int i = 0; i < splitSplinesBlk.blockCount(); i++)
   {
@@ -313,7 +319,12 @@ void HmapLandObjectEditor::exportAsComposit()
     if (!compositBlk.saveToTextFile(path))
       con.addMessage(ILogWriter::ERROR, "error while saving file '%s'", path.str());
     else
+    {
       con.addMessage(ILogWriter::NOTE, "created composit with %d entities", exportedCnt);
+      if (bakedFillets)
+        con.addMessage(ILogWriter::NOTE,
+          "baked %d filleted corner(s) into the composit spline(s), a placed composit has no reconciler", bakedFillets);
+    }
   }
 
   con.endLog();
@@ -411,8 +422,8 @@ void HmapLandObjectEditor::exportToDag()
               blk.addPoint2("polyObjOffs", exp_spl[i]->getPolyObjOffs());
               blk.addReal("polyObjRot", exp_spl[i]->getPolyObjRot());
               blk.addBool("exportable", exp_spl[i]->isExportable());
-              blk.addBool("altGeom", exp_spl[i]->polyGeom.altGeom);
-              blk.addReal("bboxAlignStep", exp_spl[i]->polyGeom.bboxAlignStep);
+              blk.addBool("altGeom", exp_spl[i]->getProps().poly.altGeom);
+              blk.addReal("bboxAlignStep", exp_spl[i]->getProps().poly.bboxAlignStep);
               blk.addInt("cornerType", exp_spl[i]->getProps().cornerType);
 
               DataBlock *mblk = blk.addNewBlock("modifParams");
@@ -444,39 +455,15 @@ void HmapLandObjectEditor::exportToDag()
             RenderableEditableObject *o = exp_obj[i];
 
             LandscapeEntityObject *ent_obj = RTTI_cast<LandscapeEntityObject>(o);
-            SnowSourceObject *snow_obj = RTTI_cast<SnowSourceObject>(o);
-            SphereLightObject *light_obj = RTTI_cast<SphereLightObject>(o);
 
-            if (!ent_obj && !snow_obj && !light_obj)
+            if (!ent_obj)
               continue;
 
             if (dagGeom->dagSaverStartSaveNode(*save, o->getName(), o->getWtm()))
             {
               DataBlock blk;
-
-              if (ent_obj)
-              {
-                blk.addStr("entity_name", ent_obj->getProps().entityName);
-                blk.addInt("place_type", ent_obj->getProps().placeType);
-              }
-              else
-              {
-                DataBlock *props = blk.addBlock("props");
-
-                if (snow_obj)
-                {
-                  blk.addStr("object_type", "snow");
-                  snow_obj->save(*props);
-                }
-                else if (light_obj)
-                {
-                  blk.addStr("object_type", "light");
-                  light_obj->save(*props);
-                }
-
-                props->removeParam("name");
-                props->removeParam("tm");
-              }
+              blk.addStr("entity_name", ent_obj->getProps().entityName);
+              blk.addInt("place_type", ent_obj->getProps().placeType);
 
               DynamicMemGeneralSaveCB cb(tmpmem);
               if (blk.saveToTextStream(cb))
@@ -695,8 +682,8 @@ void HmapLandObjectEditor::importFromNode(const Node *node, bool &for_all, int &
             so->setPolyObjOffs(blk.getPoint2("polyObjOffs", Point2(0, 0)));
             so->setPolyObjRot(blk.getReal("polyObjRot", 0));
             so->setExportable(blk.getBool("exportable", false));
-            so->polyGeom.altGeom = blk.getBool("altGeom", false);
-            so->polyGeom.bboxAlignStep = blk.getReal("bboxAlignStep", blk.getReal("minGridStep", 1.0f));
+            so->setPolyAltGeom(blk.getBool("altGeom", false));
+            so->setPolyBboxAlignStep(blk.getReal("bboxAlignStep", blk.getReal("minGridStep", 1.0f)));
             so->setCornerType(blk.getInt("cornerType", 0));
 
             DataBlock *mblk = blk.getBlockByName("modifParams");
@@ -746,26 +733,8 @@ void HmapLandObjectEditor::importFromNode(const Node *node, bool &for_all, int &
             LandscapeEntityObject::Props pr = o->getProps();
             pr.placeType = coll;
             o->setProps(pr);
+            o->generatePinnedPerInstSeed(); // a new object in the level, like a placed or cloned one
             addObject(o);
-          }
-          else
-          {
-            DataBlock *props = blk.addBlock("props");
-            props->setStr("name", node->name);
-            props->setTm("tm", node->wtm);
-
-            if (stricmp(objType, "snow") == 0)
-            {
-              SnowSourceObject *snow_obj = new SnowSourceObject();
-              addObject(snow_obj);
-              snow_obj->load(*props);
-            }
-            else if (stricmp(objType, "light") == 0)
-            {
-              SphereLightObject *light_obj = new SphereLightObject();
-              addObject(light_obj);
-              light_obj->load(*props);
-            }
           }
         }
       }

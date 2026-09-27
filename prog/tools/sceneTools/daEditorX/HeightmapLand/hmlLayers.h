@@ -14,7 +14,7 @@ struct EditLayerProps
     PLG,
     TYPENUM
   };
-  static const int MAX_LAYERS = 60;
+  static const int MAX_LAYERS = 124;
 
   unsigned lock : 1, hide : 1, renderToMask : 1, exp : 1;
   unsigned renameable : 1; // A new layer is only renameable before the saving of the level.
@@ -24,6 +24,9 @@ struct EditLayerProps
   EditLayerProps() : lock(0), hide(0), renderToMask(0), exp(1), renameable(0), type(TYPENUM), nameId(0) {}
   EditLayerProps(unsigned t, unsigned nid) : lock(0), hide(0), renderToMask(0), exp(1), renameable(0), type(t), nameId(nid) {}
   const char *name() const { return layerNames.getName(nameId); }
+
+  bool isLayerOrTypeHidden() const;
+  bool isLayerOrTypeLocked() const;
 
 public:
   static FastNameMapEx layerNames;
@@ -76,4 +79,17 @@ public:
   }
   static void renameLayer(int idx, const char *new_name);
   static const char *layerName(int idx) { return layerProps[idx].name(); }
+  static void updateEntityLayerHiddenMask();
+};
+
+struct LandscapeObjectTypeState
+{
+  bool visible = true;
+  bool locked = false;
+
+  static LandscapeObjectTypeState types[EditLayerProps::TYPENUM];
+
+  static void resetAllObjectTypesToDefault();
+  static void saveAllObjectTypeConfig(DataBlock &local_data);
+  static void loadAllObjectTypeConfig(const DataBlock &local_data);
 };

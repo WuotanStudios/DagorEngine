@@ -89,7 +89,7 @@ static ecs::EntitySystemDesc skies_settings_skies_loaded_es_event_handler_es_des
 ,nullptr,nullptr,"clouds_form_es,clouds_weather_gen_es,sky_atmosphere_es,strata_clouds_es");
 static constexpr ecs::ComponentDesc clouds_rendering_es_event_handler_comps[] =
 {
-//start of 9 ro components at [0]
+//start of 24 ro components at [0]
   {ECS_HASH("clouds_rendering__forward_eccentricity"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("clouds_rendering__back_eccentricity"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("clouds_rendering__forward_eccentricity_weight"), ecs::ComponentTypeInfo<float>()},
@@ -99,14 +99,30 @@ static constexpr ecs::ComponentDesc clouds_rendering_es_event_handler_comps[] =
   {ECS_HASH("clouds_rendering__ms_attenuation"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("clouds_rendering__ms_ecc_attenuation"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("clouds_rendering__erosionWindSpeed"), ecs::ComponentTypeInfo<float>()},
-//start of 1 rq components at [9]
+  {ECS_HASH("clouds_rendering__droplet_diameter_um"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__edge_albedo"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__edge_albedo_sharpness"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__taa_exposure_scale"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__layer0_aerosolness"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__layer1_aerosolness"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__cumulonimbus_aerosolness"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__cloudAerosolDropletsMieStrength"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__aerosol_reach_below_km"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__bsm_log2_amortize_frames"), ecs::ComponentTypeInfo<int>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__bsm_scattering_physicality"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__erosion_strength"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__erosion_height_bias"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__erosion_edge_mul"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+  {ECS_HASH("clouds_rendering__erosion_edge_add"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
+//start of 1 rq components at [24]
   {ECS_HASH("skies_settings_tag"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static void clouds_rendering_es_event_handler_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     clouds_rendering_es_event_handler(evt
-        , ECS_RO_COMP(clouds_rendering_es_event_handler_comps, "clouds_rendering__forward_eccentricity", float)
+        , components.manager()
+    , ECS_RO_COMP(clouds_rendering_es_event_handler_comps, "clouds_rendering__forward_eccentricity", float)
     , ECS_RO_COMP(clouds_rendering_es_event_handler_comps, "clouds_rendering__back_eccentricity", float)
     , ECS_RO_COMP(clouds_rendering_es_event_handler_comps, "clouds_rendering__forward_eccentricity_weight", float)
     , ECS_RO_COMP(clouds_rendering_es_event_handler_comps, "clouds_rendering__erosion_noise_size", float)
@@ -115,6 +131,21 @@ static void clouds_rendering_es_event_handler_all_events(const ecs::Event &__res
     , ECS_RO_COMP(clouds_rendering_es_event_handler_comps, "clouds_rendering__ms_attenuation", float)
     , ECS_RO_COMP(clouds_rendering_es_event_handler_comps, "clouds_rendering__ms_ecc_attenuation", float)
     , ECS_RO_COMP(clouds_rendering_es_event_handler_comps, "clouds_rendering__erosionWindSpeed", float)
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__droplet_diameter_um", float(20.f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__edge_albedo", float(0.8f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__edge_albedo_sharpness", float(4.f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__taa_exposure_scale", float(0.4f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__layer0_aerosolness", float(0.35f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__layer1_aerosolness", float(0.35f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__cumulonimbus_aerosolness", float(0.5f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__cloudAerosolDropletsMieStrength", float(1.f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__aerosol_reach_below_km", float(0.5f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__bsm_log2_amortize_frames", int(4))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__bsm_scattering_physicality", float(1.f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__erosion_strength", float(0.15f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__erosion_height_bias", float(0.5f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__erosion_edge_mul", float(2.f))
+    , ECS_RO_COMP_OR(clouds_rendering_es_event_handler_comps, "clouds_rendering__erosion_edge_add", float(0.25f))
     );
   while (++comp != compE);
 }
@@ -124,8 +155,35 @@ static ecs::EntitySystemDesc clouds_rendering_es_event_handler_es_desc
   "prog/gameLibs/ecs/weather/skiesSettingsES.cpp.inl",
   ecs::EntitySystemOps(nullptr, clouds_rendering_es_event_handler_all_events),
   empty_span(),
-  make_span(clouds_rendering_es_event_handler_comps+0, 9)/*ro*/,
-  make_span(clouds_rendering_es_event_handler_comps+9, 1)/*rq*/,
+  make_span(clouds_rendering_es_event_handler_comps+0, 24)/*ro*/,
+  make_span(clouds_rendering_es_event_handler_comps+24, 1)/*rq*/,
+  empty_span(),
+  ecs::EventSetBuilder<EventSkiesLoaded,
+                       ecs::EventEntityCreated,
+                       ecs::EventComponentsAppear>::build(),
+  0
+,nullptr,"*");
+static constexpr ecs::ComponentDesc sky_wind_es_comps[] =
+{
+//start of 1 ro components at [0]
+  {ECS_HASH("wind__dir"), ecs::ComponentTypeInfo<float>()}
+};
+static void sky_wind_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
+{
+  auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
+    sky_wind_es(evt
+        , ECS_RO_COMP(sky_wind_es_comps, "wind__dir", float)
+    );
+  while (++comp != compE);
+}
+static ecs::EntitySystemDesc sky_wind_es_es_desc
+(
+  "sky_wind_es",
+  "prog/gameLibs/ecs/weather/skiesSettingsES.cpp.inl",
+  ecs::EntitySystemOps(nullptr, sky_wind_es_all_events),
+  empty_span(),
+  make_span(sky_wind_es_comps+0, 1)/*ro*/,
+  empty_span(),
   empty_span(),
   ecs::EventSetBuilder<EventSkiesLoaded,
                        ecs::EventEntityCreated,
@@ -144,7 +202,8 @@ static void strata_clouds_es_event_handler_all_events(const ecs::Event &__restri
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     strata_clouds_es_event_handler(evt
-        , ECS_RO_COMP(strata_clouds_es_event_handler_comps, "strata_clouds__amount", Point2)
+        , components.manager()
+    , ECS_RO_COMP(strata_clouds_es_event_handler_comps, "strata_clouds__amount", Point2)
     , ECS_RO_COMP(strata_clouds_es_event_handler_comps, "strata_clouds__altitude", Point2)
     );
   while (++comp != compE);
@@ -174,7 +233,8 @@ static void strata_clouds_tex_es_all_events(const ecs::Event &__restrict evt, co
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     strata_clouds_tex_es(evt
-        , ECS_RO_COMP(strata_clouds_tex_es_comps, "strata_clouds__tex", ecs::string)
+        , components.manager()
+    , ECS_RO_COMP(strata_clouds_tex_es_comps, "strata_clouds__tex", ecs::string)
     );
   while (++comp != compE);
 }
@@ -208,7 +268,8 @@ static void clouds_form_es_event_handler_all_events(const ecs::Event &__restrict
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     clouds_form_es_event_handler(evt
-        , ECS_RO_COMP(clouds_form_es_event_handler_comps, "clouds_form__layers", ecs::Array)
+        , components.manager()
+    , ECS_RO_COMP(clouds_form_es_event_handler_comps, "clouds_form__layers", ecs::Array)
     , ECS_RO_COMP(clouds_form_es_event_handler_comps, "clouds_form__extinction", Point2)
     , ECS_RO_COMP(clouds_form_es_event_handler_comps, "clouds_form__turbulenceStrength", Point2)
     , ECS_RO_COMP(clouds_form_es_event_handler_comps, "clouds_form__shapeNoiseScale", int)
@@ -246,7 +307,8 @@ static void clouds_settings_es_event_handler_all_events(const ecs::Event &__rest
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     clouds_settings_es_event_handler(evt
-        , ECS_RO_COMP(clouds_settings_es_event_handler_comps, "clouds_settings__maximum_averaging_ratio", float)
+        , components.manager()
+    , ECS_RO_COMP(clouds_settings_es_event_handler_comps, "clouds_settings__maximum_averaging_ratio", float)
     , ECS_RO_COMP(clouds_settings_es_event_handler_comps, "clouds_settings__quality", int)
     , ECS_RO_COMP(clouds_settings_es_event_handler_comps, "clouds_settings__target_quality", int)
     , ECS_RO_COMP(clouds_settings_es_event_handler_comps, "clouds_settings__competitive_advantage", bool)
@@ -283,7 +345,8 @@ static void clouds_weather_gen_es_event_handler_all_events(const ecs::Event &__r
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     clouds_weather_gen_es_event_handler(evt
-        , ECS_RO_COMP(clouds_weather_gen_es_event_handler_comps, "clouds_weather_gen__layers", ecs::Array)
+        , components.manager()
+    , ECS_RO_COMP(clouds_weather_gen_es_event_handler_comps, "clouds_weather_gen__layers", ecs::Array)
     , ECS_RO_COMP(clouds_weather_gen_es_event_handler_comps, "clouds_weather_gen__epicness", float)
     , ECS_RO_COMP(clouds_weather_gen_es_event_handler_comps, "clouds_weather_gen__cumulonimbusCoverage", Point2)
     , ECS_RO_COMP(clouds_weather_gen_es_event_handler_comps, "clouds_weather_gen__cumulonimbusSeed", Point2)
@@ -307,7 +370,7 @@ static ecs::EntitySystemDesc clouds_weather_gen_es_event_handler_es_desc
 ,nullptr,"*");
 static constexpr ecs::ComponentDesc sky_atmosphere_es_event_handler_comps[] =
 {
-//start of 29 ro components at [0]
+//start of 30 ro components at [0]
   {ECS_HASH("sky_atmosphere__average_ground_albedo"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("sky_atmosphere__min_ground_offset"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("sky_settings__haze_strength"), ecs::ComponentTypeInfo<float>()},
@@ -336,15 +399,17 @@ static constexpr ecs::ComponentDesc sky_atmosphere_es_event_handler_comps[] =
   {ECS_HASH("sky_atmosphere__sun_brightness"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("sky_atmosphere__moon_brightness"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("sky_atmosphere__moon_color"), ecs::ComponentTypeInfo<Point3>()},
+  {ECS_HASH("sky_atmosphere__polarization_strength"), ecs::ComponentTypeInfo<float>(), ecs::CDF_OPTIONAL},
   {ECS_HASH("sky_disable_sky_influence"), ecs::ComponentTypeInfo<bool>(), ecs::CDF_OPTIONAL},
-//start of 1 rq components at [29]
+//start of 1 rq components at [30]
   {ECS_HASH("skies_settings_tag"), ecs::ComponentTypeInfo<ecs::Tag>()}
 };
 static void sky_atmosphere_es_event_handler_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     sky_atmosphere_es_event_handler(evt
-        , ECS_RO_COMP(sky_atmosphere_es_event_handler_comps, "sky_atmosphere__average_ground_albedo", float)
+        , components.manager()
+    , ECS_RO_COMP(sky_atmosphere_es_event_handler_comps, "sky_atmosphere__average_ground_albedo", float)
     , ECS_RO_COMP(sky_atmosphere_es_event_handler_comps, "sky_atmosphere__min_ground_offset", float)
     , ECS_RO_COMP(sky_atmosphere_es_event_handler_comps, "sky_settings__haze_strength", float)
     , ECS_RO_COMP(sky_atmosphere_es_event_handler_comps, "sky_settings__haze_min_angle", float)
@@ -372,6 +437,7 @@ static void sky_atmosphere_es_event_handler_all_events(const ecs::Event &__restr
     , ECS_RO_COMP(sky_atmosphere_es_event_handler_comps, "sky_atmosphere__sun_brightness", float)
     , ECS_RO_COMP(sky_atmosphere_es_event_handler_comps, "sky_atmosphere__moon_brightness", float)
     , ECS_RO_COMP(sky_atmosphere_es_event_handler_comps, "sky_atmosphere__moon_color", Point3)
+    , ECS_RO_COMP_OR(sky_atmosphere_es_event_handler_comps, "sky_atmosphere__polarization_strength", float(0.f))
     , ECS_RO_COMP_OR(sky_atmosphere_es_event_handler_comps, "sky_disable_sky_influence", bool(false))
     );
   while (++comp != compE);
@@ -382,8 +448,8 @@ static ecs::EntitySystemDesc sky_atmosphere_es_event_handler_es_desc
   "prog/gameLibs/ecs/weather/skiesSettingsES.cpp.inl",
   ecs::EntitySystemOps(nullptr, sky_atmosphere_es_event_handler_all_events),
   empty_span(),
-  make_span(sky_atmosphere_es_event_handler_comps+0, 29)/*ro*/,
-  make_span(sky_atmosphere_es_event_handler_comps+29, 1)/*rq*/,
+  make_span(sky_atmosphere_es_event_handler_comps+0, 30)/*ro*/,
+  make_span(sky_atmosphere_es_event_handler_comps+30, 1)/*rq*/,
   empty_span(),
   ecs::EventSetBuilder<EventSkiesLoaded,
                        ecs::EventEntityCreated,
@@ -431,7 +497,8 @@ static void clouds_hole_es_event_handler_all_events(const ecs::Event &__restrict
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     clouds_hole_es_event_handler(evt
-        , ECS_RO_COMP(clouds_hole_es_event_handler_comps, "transform", TMatrix)
+        , components.manager()
+    , ECS_RO_COMP(clouds_hole_es_event_handler_comps, "transform", TMatrix)
     , ECS_RO_COMP(clouds_hole_es_event_handler_comps, "density", float)
     );
   while (++comp != compE);
@@ -457,9 +524,9 @@ static constexpr ecs::ComponentDesc disappear_clouds_hole_es_comps[] =
 };
 static void disappear_clouds_hole_es_all_events(const ecs::Event &__restrict evt, const ecs::QueryView &__restrict components)
 {
-  G_UNUSED(components);
   disappear_clouds_hole_es(evt
-        );
+        , components.manager()
+    );
 }
 static ecs::EntitySystemDesc disappear_clouds_hole_es_es_desc
 (
@@ -486,7 +553,8 @@ static void moon_params_es_event_handler_all_events(const ecs::Event &__restrict
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     moon_params_es_event_handler(evt
-        , ECS_RO_COMP(moon_params_es_event_handler_comps, "moon_res_name", ecs::string)
+        , components.manager()
+    , ECS_RO_COMP(moon_params_es_event_handler_comps, "moon_res_name", ecs::string)
     , ECS_RO_COMP(moon_params_es_event_handler_comps, "moon_size", float)
     );
   while (++comp != compE);
@@ -548,9 +616,9 @@ static ecs::CompileTimeQueryDesc is_cloud_hole_enabled_for_preset_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void is_cloud_hole_enabled_for_preset_ecs_query(Callable function)
+inline void is_cloud_hole_enabled_for_preset_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, is_cloud_hole_enabled_for_preset_ecs_query_desc.getHandle(),
+  perform_query(&manager, is_cloud_hole_enabled_for_preset_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -578,9 +646,9 @@ static ecs::CompileTimeQueryDesc is_panorama_forced_ecs_query_desc
   make_span(is_panorama_forced_ecs_query_comps+1, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void is_panorama_forced_ecs_query(Callable function)
+inline void is_panorama_forced_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, is_panorama_forced_ecs_query_desc.getHandle(),
+  perform_query(&manager, is_panorama_forced_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -609,9 +677,9 @@ static ecs::CompileTimeQueryDesc validate_volumetric_clouds_settings_ecs_query_d
   make_span(validate_volumetric_clouds_settings_ecs_query_comps+2, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void validate_volumetric_clouds_settings_ecs_query(Callable function)
+inline void validate_volumetric_clouds_settings_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, validate_volumetric_clouds_settings_ecs_query_desc.getHandle(),
+  perform_query(&manager, validate_volumetric_clouds_settings_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do

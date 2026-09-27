@@ -7,7 +7,7 @@ ECS_DEF_PULL_VAR(staticFlares);
 static constexpr ecs::ComponentDesc init_static_flares_es_comps[] =
 {
 //start of 3 rw components at [0]
-  {ECS_HASH("static_flares__instancesBuf"), ecs::ComponentTypeInfo<UniqueBufHolder>()},
+  {ECS_HASH("static_flares__instancesBuf"), ecs::ComponentTypeInfo<UniqueBufWithShaderVar>()},
   {ECS_HASH("static_flares__instances"), ecs::ComponentTypeInfo<StaticFlareInstances>()},
   {ECS_HASH("static_flares__node"), ecs::ComponentTypeInfo<dafg::NodeHandle>()},
 //start of 1 ro components at [3]
@@ -17,8 +17,9 @@ static void init_static_flares_es_all_events(const ecs::Event &__restrict evt, c
 {
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     init_static_flares_es(evt
-        , ECS_RO_COMP(init_static_flares_es_comps, "static_flares__maxCount", int)
-    , ECS_RW_COMP(init_static_flares_es_comps, "static_flares__instancesBuf", UniqueBufHolder)
+        , components.manager()
+    , ECS_RO_COMP(init_static_flares_es_comps, "static_flares__maxCount", int)
+    , ECS_RW_COMP(init_static_flares_es_comps, "static_flares__instancesBuf", UniqueBufWithShaderVar)
     , ECS_RW_COMP(init_static_flares_es_comps, "static_flares__instances", StaticFlareInstances)
     , ECS_RW_COMP(init_static_flares_es_comps, "static_flares__node", dafg::NodeHandle)
     );
@@ -42,7 +43,7 @@ static constexpr ecs::ComponentDesc static_flare_before_render_es_comps[] =
 //start of 1 rw components at [0]
   {ECS_HASH("static_flares__copiedCount"), ecs::ComponentTypeInfo<int>()},
 //start of 4 ro components at [1]
-  {ECS_HASH("static_flares__instancesBuf"), ecs::ComponentTypeInfo<UniqueBufHolder>()},
+  {ECS_HASH("static_flares__instancesBuf"), ecs::ComponentTypeInfo<UniqueBufWithShaderVar>()},
   {ECS_HASH("static_flares__instances"), ecs::ComponentTypeInfo<StaticFlareInstances>()},
   {ECS_HASH("static_flares__count"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("static_flares__visible"), ecs::ComponentTypeInfo<bool>()}
@@ -55,7 +56,7 @@ static void static_flare_before_render_es_all_events(const ecs::Event &__restric
     if ( !(ECS_RO_COMP(static_flare_before_render_es_comps, "static_flares__visible", bool)) )
       continue;
     static_flare_before_render_es(static_cast<const UpdateStageInfoBeforeRender&>(evt)
-          , ECS_RO_COMP(static_flare_before_render_es_comps, "static_flares__instancesBuf", UniqueBufHolder)
+          , ECS_RO_COMP(static_flare_before_render_es_comps, "static_flares__instancesBuf", UniqueBufWithShaderVar)
       , ECS_RO_COMP(static_flare_before_render_es_comps, "static_flares__instances", StaticFlareInstances)
       , ECS_RO_COMP(static_flare_before_render_es_comps, "static_flares__count", int)
       , ECS_RW_COMP(static_flare_before_render_es_comps, "static_flares__copiedCount", int)
@@ -92,9 +93,9 @@ static ecs::CompileTimeQueryDesc get_static_flares_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void get_static_flares_ecs_query(Callable function)
+inline void get_static_flares_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, get_static_flares_ecs_query_desc.getHandle(),
+  perform_query(&manager, get_static_flares_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -129,9 +130,9 @@ static ecs::CompileTimeQueryDesc add_static_flare_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void add_static_flare_ecs_query(Callable function)
+inline void add_static_flare_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, add_static_flare_ecs_query_desc.getHandle(),
+  perform_query(&manager, add_static_flare_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do

@@ -1,5 +1,6 @@
 #include "daScript/misc/platform.h"
 #include "daScript/ast/ast.h"
+#include "daScript/simulate/debug_info.h"
 
 #if !defined(DAS_NO_FILEIO)
 #include <sys/stat.h>
@@ -16,10 +17,9 @@ namespace das {
         if (context) delete context;
     }
 
-    ModuleFileAccess::ModuleFileAccess ( const string & pak, const FileAccessPtr & access ) {
-        ModuleGroup dummyLibGroup;
+    ModuleFileAccess::ModuleFileAccess ( const string & pak, const ProgramPtr & program ) {
         TextWriter tout;
-        if ( auto program = compileDaScript(pak, access, tout, dummyLibGroup) ) {
+        if ( program ) {
             if ( program->failed() ) {
                 for ( auto & err : program->errors ) {
                     tout << reportError(err.at, err.what, err.extra, err.fixme, err.cerr );
@@ -42,10 +42,14 @@ namespace das {
                 includeGet = context->findFunction("include_get");          // note, this one CAN be null
                 moduleAllowed = context->findFunction("module_allowed");    // note, this one CAN be null
                 moduleUnsafe = context->findFunction("module_allowed_unsafe");    // note, this one CAN be null
+                withModuleUnsafe = context->findFunction("with_module_unsafe");    // note, this one CAN be null
                 canModuleBeRequired = context->findFunction("can_module_be_required");    // note, this one CAN be null
                 sameFileName = context->findFunction("is_same_file_name");    // note, this one CAN be null
                 optionAllowed = context->findFunction("option_allowed");    // note, this one CAN be null
+                optionBlocked = context->findFunction("option_blocked");    // note, this one CAN be null
                 annotationAllowed = context->findFunction("annotation_allowed");    // note, this one CAN be null
+                podInScopeAllowed = context->findFunction("is_pod_in_scope_allowed"); // note, this one CAN be null
+                dynModulesFolderGet = context->findFunction("dyn_modules_folder");          // note, this one CAN be null
                 // get it ready
                 context->restart();
                 context->runInitScript();   // note: we assume sane init stack size here
@@ -94,11 +98,23 @@ namespace das {
         return cast<bool>::to(res);
     }
 
-    bool ModuleFileAccess::canBeRequired ( const string & mod, const string & fileName ) const {
-        if(failed() || !canModuleBeRequired) return FileAccess::canBeRequired(mod,fileName);
+    bool ModuleFileAccess::isWithModuleUnsafe ( const string & mod, const string & fileName ) const {
+        if(failed() || !withModuleUnsafe) return FileAccess::isWithModuleUnsafe(mod,fileName);
         vec4f args[2];
         args[0] = cast<const char *>::from(mod.c_str());
         args[1] = cast<const char *>::from(fileName.c_str());
+        auto res = context->evalWithCatch(withModuleUnsafe, args, nullptr);
+        auto exc = context->getException(); exc;
+        DAS_ASSERTF(!exc, "exception failed in `with_module_unsafe`: %s", exc);
+        return cast<bool>::to(res);
+    }
+
+    bool ModuleFileAccess::canBeRequired ( const string & mod, const string & fileName, bool isPublic ) const {
+        if(failed() || !canModuleBeRequired) return FileAccess::canBeRequired(mod,fileName,isPublic);
+        vec4f args[3];
+        args[0] = cast<const char *>::from(mod.c_str());
+        args[1] = cast<const char *>::from(fileName.c_str());
+        args[2] = cast<bool>::from(isPublic);
         auto res = context->evalWithCatch(canModuleBeRequired, args, nullptr);
         auto exc = context->getException(); exc;
         DAS_ASSERTF(!exc, "exception failed in `can_module_be_required`: %s", exc);
@@ -137,6 +153,14 @@ namespace das {
         return info;
     }
 
+    string ModuleFileAccess::getDynModulesFolder() const {
+        if(failed() || !dynModulesFolderGet) return FileAccess::getDynModulesFolder();
+        auto res = context->evalWithCatch(dynModulesFolderGet, nullptr, nullptr);
+        auto exc = context->getException(); exc;
+        DAS_ASSERTF(!exc, "exception failed in `dyn_modules_folder`: %s", exc);
+        return cast<const char *>::to(res);
+    }
+
     string ModuleFileAccess::getIncludeFileName ( const string & fileName, const string & incFileName ) const {
         if (failed() || !includeGet) return FileAccess::getIncludeFileName(fileName,incFileName);
         vec4f args[2];
@@ -171,6 +195,17 @@ namespace das {
         return cast<bool>::to(res);
     }
 
+    bool ModuleFileAccess::isOptionBlocked ( const string & opt, const string & from ) const {
+        if (failed() || !optionBlocked) return FileAccess::isOptionBlocked(opt,from);
+        vec4f args[2];
+        args[0] = cast<const char *>::from(opt.c_str());
+        args[1] = cast<const char *>::from(from.c_str());
+        vec4f res = context->evalWithCatch(optionBlocked, args, nullptr);
+        auto exc = context->getException(); exc;
+        DAS_ASSERTF(!exc, "exception failed in `option_blocked`: %s", exc);
+        return cast<bool>::to(res);
+    }
+
     bool ModuleFileAccess::isAnnotationAllowed ( const string & ann, const string & from ) const {
         if (failed() || !annotationAllowed) return FileAccess::isAnnotationAllowed(ann,from);
         vec4f args[2];
@@ -179,6 +214,17 @@ namespace das {
         vec4f res = context->evalWithCatch(annotationAllowed, args, nullptr);
         auto exc = context->getException(); exc;
         DAS_ASSERTF(!exc, "exception failed in `annotation_allowed`: %s", exc);
+        return cast<bool>::to(res);
+    }
+
+    bool ModuleFileAccess::isPodInScopeAllowed ( const string & moduleName, const string & fileName ) const {
+        if (failed() || !podInScopeAllowed) return FileAccess::isPodInScopeAllowed(moduleName,fileName);
+        vec4f args[2];
+        args[0] = cast<const char *>::from(moduleName.c_str());
+        args[1] = cast<const char *>::from(fileName.c_str());
+        vec4f res = context->evalWithCatch(podInScopeAllowed, args, nullptr);
+        auto exc = context->getException(); exc;
+        DAS_ASSERTF(!exc, "exception failed in `pod_in_scope_allowed`: %s", exc);
         return cast<bool>::to(res);
     }
 }

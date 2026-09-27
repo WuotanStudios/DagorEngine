@@ -8,6 +8,10 @@
 #include <EASTL/unique_ptr.h>
 #include <3d/dag_resPtr.h>
 #include <shaders/dag_postFxRenderer.h>
+#include <daBVH/dag_swTLAS.h>
+#include <daBVH/dag_quadBLASBuilder.h>
+#include <dag/dag_vector.h>
+#include <generic/dag_tab.h>
 
 namespace build_bvh
 {
@@ -19,87 +23,165 @@ void destroy(TLASData *&);
 } // namespace build_bvh
 class ComputeShaderElement;
 
+namespace daSWRT
+{
+// Self-contained, FP16-encoded BLAS chunk for one model. Produced by the thread-safe
+// RenderSWRT::buildBLAS; consumed by RenderSWRT::addBuiltModel (which must run under the
+// caller's mutex). Empty `data` marks a pure axis-aligned box -- addBuiltModel routes it
+// through the box path using `box` directly.
+struct BuiltBLAS
+{
+  bbox3f box = {};
+  // FP16 tree bytes, then the GPU vertex payload (12 B float3 or 8 B fp16 per `vertsFp16`). Verts are
+  // reached through each leaf's relative base, NOT at data+treeBytes: a padded producer (the collision
+  // single-node chunk splice) 8-aligns the pool, so padding can sit between the tree and the vertex payload.
+  dag::Vector<uint8_t> data;
+  uint32_t treeBytes = 0; // tree-walk span in bytes (GPU traversal bound), not the vertex offset; 0 iff pure box
+  float dimAsBoxDist = 0;
+  // Vertex format of `data` (true = 8 B fp16, false = 12 B float3). addBuiltModel asserts it matches the
+  // target RenderSWRT::blasVertsFp16, so a build made for one format cannot be registered into the other.
+  bool vertsFp16 = true;
+  // Every source face was degenerate: nothing traceable. Distinct from isBox() (empty data is the
+  // genuine-box sentinel) -- addBuiltModel returns -1 (no model) instead of registering the AABB,
+  // which would cast phantom occlusion.
+  bool noGeometry = false;
+  bool isBox() const { return data.empty(); }
+};
+} // namespace daSWRT
+
 struct RenderSWRT
 {
   void init();
   void close();
   ~RenderSWRT();
+
+  // GPU BLAS vertex format for the models this instance serializes: true = 8 B (x float, y/z fp16),
+  // false = 12 B float3. Must match BLAS_VERT_FP16 in the shaders that read bottomBuf. Runtime, not a
+  // compile constant, so one build can serve shaders of either format. Set before adding models.
+  bool blasVertsFp16 = true;
+
+  // Opt-in: buildBottomLevelStructures also derives the flat BLAS leaf table
+  // (bvh_blas_leaf_table / bvh_blas_leaf_ranges) needed by geometry-driven consumers
+  // (SDF leaf raster). Costs an O(tree bytes) walk per build plus two GPU buffers, so
+  // callers without such a consumer leave it off. Set before buildBottomLevelStructures.
+  bool buildBlasLeafTables = false;
+
   int addBoxModel(vec4f bmin, vec4f bmax);
-  // if threshold_to_dim_as_box > 0, shadow rays would assume the model is it's bounding box, if ray originate farther than
-  // threshold_to_dim_as_box*boxSize
+
+  // Builds a BuiltBLAS from a raw index/vertex mesh. Detects pure axis-aligned boxes
+  // automatically (the returned BuiltBLAS is isBox() in that case). Thread-safe: does not
+  // touch any RenderSWRT state, safe to invoke from threadpool workers. For threshold
+  // semantics of `dim_as_box_dist` see addBoxModel / addBuiltModel. Returns an empty
+  // (isBox(), zero box) BuiltBLAS for invalid input (which, if passed to addBuiltModel,
+  // registers a zero-volume box), and a noGeometry one when every face is degenerate.
+  static daSWRT::BuiltBLAS buildBLAS(const uint16_t *indices, int index_count, const Point3_vec4 *vertices, int vertex_count,
+    float dim_as_box_dist = 0, bool fp16_verts = true);
+  // 32-bit index entry: uint16 indices cannot address >65535 verts, so meshes above that
+  // threshold must use this one (below it, prefer the 16-bit entry). Same contract as above
+  // (thread-safe; empty BuiltBLAS on invalid input, noGeometry when every face is degenerate -
+  // both share the build tail), except box detection is skipped: a wide mesh cannot be an
+  // 8-vert box.
+  static daSWRT::BuiltBLAS buildBLAS(const uint32_t *indices, int index_count, const Point3_vec4 *vertices, int vertex_count,
+    float dim_as_box_dist = 0, bool fp16_verts = true);
+
+  // Registers a BuiltBLAS into SWRT. Small, fast: appends bytes into the internal concat
+  // buffer and pushes to the tracking arrays. Not thread-safe; parallel callers must
+  // serialize with their own mutex. Moves `built` in.
+  int addBuiltModel(daSWRT::BuiltBLAS &&built);
+
+  // uint16-index convenience wrapper: buildBLAS + addBuiltModel (wide meshes pair the
+  // uint32 buildBLAS with addBuiltModel directly). For parallel add, prefer calling
+  // buildBLAS from worker threads and addBuiltModel under a mutex so the heavy build
+  // stays outside the critical section.
   int addModel(const uint16_t *indices, int index_count, const Point3_vec4 *vertices, int vertex_count,
     float threshold_to_dim_as_box = 0);
-  void addToLastModel(uint16_t const *indices, int index_count, const Point3_vec4 *vertices, int vertex_count);
+
+  // Legacy entry for callers that still produce externally-serialized uint16-quantized BLAS
+  // bytes (see build_bvh::writeDoubleQuadBLAS). Re-encodes to FP16 and registers. New code should
+  // build a BuiltBLAS directly and use addBuiltModel. Validation runs before any side
+  // effects; rejected input leaves SWRT state unchanged.
+  int addPreBuiltModel(bbox3f box, dag::Vector<uint8_t> &&blas_data, int verts_count, int tree_nodes_count, int prims_count,
+    float dim_as_box_dist = 0);
 
   inline void addInstance(int model_index, const mat43f &tm)
   {
-    G_ASSERT(uint32_t(model_index) < max(blasStartOffsets.size(), models.size()));
+    G_ASSERT(uint32_t(model_index) < blasDataInfo.size());
     instances.push_back(model_index);
     matrices.push_back(tm);
   }
-  build_bvh::BLASData *buildBottomLevelStructures(uint32_t workers);
+
+  build_bvh::BLASData *buildBottomLevelStructures();
   build_bvh::TLASData *buildTopLevelStructures();
+  build_bvh::TLASData *buildTopLevelStructures(build_bvh::TLASData *d); // reuses TLAS, no log messages
+  void copyToGPU(build_bvh::BLASData *);
   void copyToGPUAndDestroy(build_bvh::BLASData *);
   void copyToGPUAndDestroy(build_bvh::TLASData *);
+  void copyToGPUAndClear(build_bvh::TLASData *); // clear TLASData, so it can be reused without re-allocs
   static void destroy(build_bvh::BLASData *&);
   static void destroy(build_bvh::TLASData *&);
 
   void drawRT();
   void reserveAddInstances(int cnt);
   uint32_t currentInstancesCount() const { return instances.size(); }
-  void purgeMeshData()
-  {
-    ibd.clear();
-    ibd.shrink_to_fit();
-    vbd.clear();
-    vbd.shrink_to_fit();
-  }
-  void clearTLASSourceData();
+
+  uint32_t getBLASCount() const { return blasDataInfo.size(); }
+  uint32_t getBLASBytes() const { return blasBytes.size(); }
+
+  void clearTLASSourceData(bool shrink_arrays = true);
   void clearBLASSourceData();
   void clearTLASBuffers();
   void clearBLASBuffers();
   void clearBLASBuiltData();
+  void clearAll();
 
   static uint32_t getTileBufferSizeDwords(uint32_t w, uint32_t h);
   enum
   {
     NO_CHECKER_BOARD = 0
   };
-  void renderShadows(const Point3 &dir_to_sun, float sun_size, uint32_t checkerboad_frame, const ManagedBufView &shadow_mask_buf,
-    const ManagedTexView &shadow_target);
+  // frame_no: real frame counter for the soft-sun jitter (separate from checkerboad_frame, which is
+  // NO_CHECKER_BOARD in non-checkerboard mode). src_w: real source (half-res depth) width.
+  void renderShadows(const Point3 &dir_to_sun, float sun_size, uint32_t frame_no, uint32_t checkerboad_frame, int src_w,
+    Sbuffer *shadow_mask_buf, BaseTexture *shadow_target, bool set_target_var);
   bool hasData() const { return bool(topBuf); }
 
 protected:
   ComputeShaderElement *checkerboard_shadows_swrt_cs = nullptr, *shadows_swrt_cs = nullptr, *mask_shadow_swrt_cs = nullptr;
   void renderShadowFrustumTiles(int w, int h, const Point3 &dir_to_sun, float sun_size);
-  UniqueBufHolder bottomBuf;
-  UniqueBufHolder topBuf;
-  UniqueBufHolder topLeavesBuf;
+  build_bvh::TLASData *buildTopLevelStructuresInternal(build_bvh::TLASData *d, bool do_debug);
+  void copyToGPUInternal(build_bvh::TLASData *d, bool do_del, bool do_debug);
+  UniqueBufWithShaderVar bottomBuf;
+  UniqueBufWithShaderVar topBuf;
+  UniqueBufWithShaderVar topLeavesBuf;
+  // flat per-model BLAS leaf table (1 dword/leaf): random access to leaf bodies for
+  // geometry-driven consumers (SDF leaf raster) - the skip-tree has no O(1) enumeration
+  UniqueBufWithShaderVar blasLeafTableBuf;
+  UniqueBufWithShaderVar blasLeafRangesBuf;
 
-  dag::Vector<uint16_t> ibd;
-  dag::Vector<vec4f> vbd;
-  struct Info
-  {
-    enum
-    {
-      FACES_IS_BOX = 0
-    };
-    int faces = 0, verts = 0;
-    int ibO = 0, vbO = 0;
-  };
-  dag::Vector<Info> models;
-  dag::Vector<int> blasStartOffsets;
+  // Per-registered-model tracking, pushed from addBuiltModel/addBoxModel. Sizes stay in
+  // lockstep; `blasDataInfo[i]` encodes {byte offset into blasBytes, tree byte count}, or
+  // {BLAS_IS_BOX, 0} for pure box entries. `blasTotalSizeInfo[i]` is the full chunk size
+  // (tree + vertex payload) for model i; 0 for pure boxes. Needed to locate and remove a
+  // model's bytes from blasBytes -- blasDataInfo only gives tree span, not the full range.
+  dag::Vector<build_bvh::BLASDataInfo> blasDataInfo;
   dag::Vector<uint16_t> blasDimAsBox;
   dag::Vector<bbox3f> blasBoxes;
+  dag::Vector<uint32_t> blasTotalSizeInfo;
+
+  // Concatenated FP16-encoded BLAS bytes for all non-box models added since the last
+  // clearBLASSourceData. buildBottomLevelStructures copies this into a BLASData* for GPU
+  // upload; callers who want to resume adding and rebuild simply keep addBuiltModel'ing.
+  dag::Vector<uint8_t> blasBytes;
+  // Vertex format (blasVertsFp16 as 0/1) the current blasBytes were appended with; -1 when empty. Locks on
+  // the first non-box addBuiltModel so a later blasVertsFp16 flip cannot mix 8 B and 12 B payloads in one
+  // bottomBuf. Reset by clearBLASSourceData.
+  int8_t blasBytesVertsFp16 = -1;
 
   dag::Vector<int> tlasLeavesOffsets;
   dag::Vector<mat43f> matrices;
   dag::Vector<int> instances;
-  eastl::unique_ptr<ShaderMaterial> mat;
-  ShaderElement *elem = 0;
   PostFxRenderer rt;
   bool inited = false;
 
-  void build_tlas(dag::Vector<bbox3f> &tlas_boxes, const dag::Vector<bbox3f> &blas_boxes);
-  bool buildModel(int model, build_bvh::SplitHelper &h, dag::Vector<bbox3f> &tempBoxes, int &root);
+  void build_tlas(Tab<bbox3f> &tlas_boxes, const dag::Vector<bbox3f> &blas_boxes, bool do_debug);
 };

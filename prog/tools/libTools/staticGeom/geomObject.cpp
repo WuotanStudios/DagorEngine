@@ -85,6 +85,8 @@ Point3 GeomObject::lightingDir = ::sph_ang_to_dir(Point2(lightingDirAngles.y, li
 NameMap GeomObject::shadersMap;
 static int shadersMapRefs = 0;
 
+static constexpr float LAND_SHORT_DECODE_NORM = 1.0f / 32767.f;
+
 StaticSceneBuilder::StdTonemapper *GeomObject::toneMapper = NULL;
 
 int GeomObject::hdrLightmapScaleId = -2;
@@ -535,7 +537,7 @@ void GeomObject::render()
 
   // BBox3 bbox = getBoundBox();
 
-  //    ShaderGlobal::set_color4(worldViewPosId,
+  //    ShaderGlobal::set_float4(worldViewPosId,
   //      Color4(::grs_cur_view.pos.x, ::grs_cur_view.pos.y, ::grs_cur_view.pos.z, 1.f));
 
   for (int i = 0; i < shMesh.size(); ++i)
@@ -588,7 +590,7 @@ void GeomObject::renderTrans()
 
   // BBox3 bbox = getBoundBox();
 
-  //    ShaderGlobal::set_color4(worldViewPosId,
+  //    ShaderGlobal::set_float4(worldViewPosId,
   //      Color4(::grs_cur_view.pos.x, ::grs_cur_view.pos.y, ::grs_cur_view.pos.z, 1.f));
 
   for (int i = 0; i < shMesh.size(); ++i)
@@ -1286,17 +1288,30 @@ const char *filter_class_name = NULL;
 
 void GeomObject::RenderObject::render()
 {
-  ShaderGlobal::set_real(hdrLightmapScaleId, LIGHTMAP_SCALE);
+  ShaderGlobal::set_float(hdrLightmapScaleId, LIGHTMAP_SCALE);
 
   beforeRenderCheck();
   static int lmesh_vs_const__pos_to_worldVarId = ::get_shader_variable_id("lmesh_vs_const__pos_to_world", true);
   static int lmesh_vs_const__pos_to_world = clamp(ShaderGlobal::get_int_fast(lmesh_vs_const__pos_to_worldVarId), 0, 512);
+  static int landCellShortDecodeXZVarId = ::get_shader_variable_id("landCellShortDecodeXZ", true);
+  static int landCellShortDecodeYVarId = ::get_shader_variable_id("landCellShortDecodeY", true);
+  Color4 dec_xz_0(0, 0, 0, 0), dec_y_0(0, 0, 0, 0);
   if (lmesh_vs_const__pos_to_world >= 0 && lods[curLod].hasLandmesh)
   {
     d3d::set_vs_const1(lmesh_vs_const__pos_to_world, lods[curLod].pos_to_world_scale.x, lods[curLod].pos_to_world_scale.y,
       lods[curLod].pos_to_world_scale.z, 0);
     d3d::set_vs_const1(lmesh_vs_const__pos_to_world + 1, lods[curLod].pos_to_world_ofs.x, lods[curLod].pos_to_world_ofs.y,
       lods[curLod].pos_to_world_ofs.z, 1);
+    if (landCellShortDecodeXZVarId >= 0)
+    {
+      dec_xz_0 = ShaderGlobal::get_float4(landCellShortDecodeXZVarId);
+      ShaderGlobal::set_float4(landCellShortDecodeXZVarId, LAND_SHORT_DECODE_NORM, 0, 0, 0);
+    }
+    if (landCellShortDecodeYVarId >= 0)
+    {
+      dec_y_0 = ShaderGlobal::get_float4(landCellShortDecodeYVarId);
+      ShaderGlobal::set_float4(landCellShortDecodeYVarId, LAND_SHORT_DECODE_NORM, 0, 0, 0);
+    }
   }
   if (filter_class_name)
   {
@@ -1330,6 +1345,10 @@ void GeomObject::RenderObject::render()
   {
     d3d::set_vs_const1(lmesh_vs_const__pos_to_world, 1, 1, 1, 0);
     d3d::set_vs_const1(lmesh_vs_const__pos_to_world + 1, 0, 0, 0, 0);
+    if (landCellShortDecodeXZVarId >= 0)
+      ShaderGlobal::set_float4(landCellShortDecodeXZVarId, dec_xz_0);
+    if (landCellShortDecodeYVarId >= 0)
+      ShaderGlobal::set_float4(landCellShortDecodeYVarId, dec_y_0);
     ShaderElement::invalidate_cached_state_block();
   }
 }
@@ -1339,20 +1358,37 @@ void GeomObject::RenderObject::renderTrans()
 {
   static int lmesh_vs_const__pos_to_worldVarId = ::get_shader_variable_id("lmesh_vs_const__pos_to_world", true);
   static int lmesh_vs_const__pos_to_world = clamp(ShaderGlobal::get_int_fast(lmesh_vs_const__pos_to_worldVarId), 0, 512);
+  static int landCellShortDecodeXZVarId = ::get_shader_variable_id("landCellShortDecodeXZ", true);
+  static int landCellShortDecodeYVarId = ::get_shader_variable_id("landCellShortDecodeY", true);
+  Color4 dec_xz_0(0, 0, 0, 0), dec_y_0(0, 0, 0, 0);
   if (lmesh_vs_const__pos_to_world >= 0 && lods[curLod].hasLandmesh)
   {
     d3d::set_vs_const1(lmesh_vs_const__pos_to_world, lods[curLod].pos_to_world_scale.x, lods[curLod].pos_to_world_scale.y,
       lods[curLod].pos_to_world_scale.z, 0);
     d3d::set_vs_const1(lmesh_vs_const__pos_to_world + 1, lods[curLod].pos_to_world_ofs.x, lods[curLod].pos_to_world_ofs.y,
       lods[curLod].pos_to_world_ofs.z, 1);
+    if (landCellShortDecodeXZVarId >= 0)
+    {
+      dec_xz_0 = ShaderGlobal::get_float4(landCellShortDecodeXZVarId);
+      ShaderGlobal::set_float4(landCellShortDecodeXZVarId, LAND_SHORT_DECODE_NORM, 0, 0, 0);
+    }
+    if (landCellShortDecodeYVarId >= 0)
+    {
+      dec_y_0 = ShaderGlobal::get_float4(landCellShortDecodeYVarId);
+      ShaderGlobal::set_float4(landCellShortDecodeYVarId, LAND_SHORT_DECODE_NORM, 0, 0, 0);
+    }
   }
-  ShaderGlobal::set_real(hdrLightmapScaleId, LIGHTMAP_SCALE);
+  ShaderGlobal::set_float(hdrLightmapScaleId, LIGHTMAP_SCALE);
 
   lods[curLod].mesh->render_trans();
   if (lmesh_vs_const__pos_to_world >= 0 && lods[curLod].hasLandmesh)
   {
     d3d::set_vs_const1(lmesh_vs_const__pos_to_world, 1, 1, 1, 0);
     d3d::set_vs_const1(lmesh_vs_const__pos_to_world + 1, 0, 0, 0, 0);
+    if (landCellShortDecodeXZVarId >= 0)
+      ShaderGlobal::set_float4(landCellShortDecodeXZVarId, dec_xz_0);
+    if (landCellShortDecodeYVarId >= 0)
+      ShaderGlobal::set_float4(landCellShortDecodeYVarId, dec_y_0);
     ShaderElement::invalidate_cached_state_block();
   }
 }

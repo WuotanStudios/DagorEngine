@@ -1,7 +1,7 @@
+// slot 0 nonzero = close layer not rendered this frame (consumers skip it), slot 1 = non-empty tile count
 buffer clouds_close_layer_is_outside;
 
 macro CLOSE_LAYER_EARLY_EXIT(code)
-  ENABLE_ASSERT(code)
   if (clouds_close_layer_is_outside != NULL) {
     (code) {clouds_close_layer_is_outside@buf = clouds_close_layer_is_outside hlsl {StructuredBuffer<uint> clouds_close_layer_is_outside@buf;};}
     hlsl(code) {

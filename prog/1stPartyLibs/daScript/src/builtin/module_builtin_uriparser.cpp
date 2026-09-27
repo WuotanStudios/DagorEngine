@@ -112,9 +112,14 @@ char * unix_file_name_to_uri ( char * uristr, Context * context, LineInfoArg * a
 char * windows_file_name_to_uri ( char * uristr, Context * context, LineInfoArg * at ) {
     if ( !uristr ) return nullptr;
     int len = stringLength(*context,uristr);
+    // Normalize '/' -> '\\' so each path segment is percent-escaped; otherwise a
+    // '/'-only path yields an invalid URI (see windowsFileNameSlashesToBackslashes
+    // in uric.h). No allocation when the path has no '/'.
+    string slashStorage;
+    const char * winName = windowsFileNameSlashesToBackslashes(uristr, slashStorage);
     auto buf = new char[8 + 3 * len + 1];
     char * result = nullptr;
-    if ( uriWindowsFilenameToUriStringA(uristr, buf) == URI_SUCCESS ) {
+    if ( uriWindowsFilenameToUriStringA(winName, buf) == URI_SUCCESS ) {
         result = context->allocateString(buf, uint32_t(strlen(buf)), at);
     }
     delete [] buf;
@@ -305,15 +310,15 @@ public:
         ModuleLibrary lib(this);
         lib.addBuiltInModule();
         // uri
-        addAnnotation(make_smart<UriTextRangeAAnnotation>(lib));
-        addAnnotation(make_smart<UriIp4StructAnnotation>(lib));
-        addAnnotation(make_smart<UriIp6StructAnnotation>(lib));
-        addAnnotation(make_smart<UriHostDataAAnnotation>(lib));
-        auto psa = make_smart<UriPathSegmentStructAAnnotation>(lib);
+        addAnnotation(new UriTextRangeAAnnotation(lib));
+        addAnnotation(new UriIp4StructAnnotation(lib));
+        addAnnotation(new UriIp6StructAnnotation(lib));
+        addAnnotation(new UriHostDataAAnnotation(lib));
+        auto psa = new UriPathSegmentStructAAnnotation(lib);
         addAnnotation(psa);
         initRecAnnotation(psa,lib);
-        addAnnotation(make_smart<UriUriAAnnotation>(lib));
-        addAnnotation(make_smart<UriAnnotation>(lib));
+        addAnnotation(new UriUriAAnnotation(lib));
+        addAnnotation(new UriAnnotation(lib));
         addCtorAndUsing<Uri>(*this,lib,"Uri","Uri");
         addCtorAndUsing<Uri,const char *>(*this,lib,"Uri","Uri");
         addExtern<DAS_BIND_FUN(delete_uri)> (*this, lib, "finalize",
@@ -332,7 +337,7 @@ public:
                 ->args({"base","relative"});
         using remove_base_uri_method = DAS_CALL_MEMBER(das::Uri::removeBaseUri);
         addExtern<DAS_CALL_METHOD(remove_base_uri_method),SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "remove_base_uri",
-            SideEffects::none, DAS_CALL_MEMBER_CPP(das::Uri::BaseUri))
+            SideEffects::none, DAS_CALL_MEMBER_CPP(das::Uri::removeBaseUri))
                 ->args({"base","relative"});
         using normalize_method = DAS_CALL_MEMBER(das::Uri::normalize);
         addExtern<DAS_CALL_METHOD(normalize_method)>(*this, lib, "normalize",

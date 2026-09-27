@@ -105,6 +105,18 @@ struct Config
     int                     SelectButtonIndex;      // Mouse button index select action will react to (0-left, 1-right, 2-middle)
     int                     NavigateButtonIndex;    // Mouse button index navigate action will react to (0-left, 1-right, 2-middle)
     int                     ContextMenuButtonIndex; // Mouse button index context menu action will react to (0-left, 1-right, 2-middle)
+    // MODIFICATION BY GAIJIN
+    // Opt-in: when true, Node::GetGroupedNodes treats a node as grouped if its centre lies
+    // inside the group rect, instead of requiring full rect.Contains(bounds) containment.
+    // This widens drag-with-group and z-reorder to nodes that are visually "half inside" the
+    // group. Default false preserves the historic strict-contain behaviour for callers that
+    // have not asked for the looser test.
+    bool                    ContainGroupedNodesByCenter;
+    // MODIFICATION BY GAIJIN
+    // Opt-in: when true, the box selection rect is drawn above the node and link channels
+    // instead of just above the grid, so it reads as a marquee over the graph. Default false
+    // keeps the historic order for callers that have not asked for it.
+    bool                    DrawSelectionRectOnTop;
 
     Config()
         : SettingsFile("NodeEditor.json")
@@ -121,6 +133,8 @@ struct Config
         , SelectButtonIndex(0)
         , NavigateButtonIndex(1)
         , ContextMenuButtonIndex(1)
+        , ContainGroupedNodesByCenter(false)
+        , DrawSelectionRectOnTop(false)
     {
     }
 };
@@ -321,6 +335,19 @@ IMGUI_NODE_EDITOR_API ImDrawList* GetNodeBackgroundDrawList(NodeId nodeId);
 
 IMGUI_NODE_EDITOR_API bool Link(LinkId id, PinId startPinId, PinId endPinId, const ImVec4& color = ImVec4(1, 1, 1, 1), float thickness = 1.0f);
 
+// MODIFICATION BY GAIJIN
+// Dash and gap length for the next Link() call, then back to 0 (solid). The next Link() consumes it
+// whichever way it goes: a call that returns false because an endpoint pin is not live this frame
+// still clears it, so the dash cannot carry over to an unrelated link. Kept as SetNext-style state
+// rather than a Link() parameter so the existing Link() signature stays put -- the daScript imgui
+// bindings (dasImgui) bind it by exact function-pointer type.
+IMGUI_NODE_EDITOR_API void SetNextLinkDashSize(float dashSize);
+
+// Returns the bezier control points for a link in canvas space.
+// Use to draw custom link visuals (e.g. gradient) on top of a transparent ed::Link call.
+struct LinkBezierCurve { ImVec2 P0, P1, P2, P3; };
+IMGUI_NODE_EDITOR_API LinkBezierCurve GetLinkCurve(LinkId id);
+
 IMGUI_NODE_EDITOR_API void Flow(LinkId linkId, FlowDirection direction = FlowDirection::Forward);
 
 IMGUI_NODE_EDITOR_API bool BeginCreate(const ImVec4& color = ImVec4(1, 1, 1, 1), float thickness = 1.0f);
@@ -346,6 +373,8 @@ IMGUI_NODE_EDITOR_API void SetGroupSize(NodeId nodeId, const ImVec2& size);
 IMGUI_NODE_EDITOR_API ImVec2 GetNodePosition(NodeId nodeId);
 IMGUI_NODE_EDITOR_API ImVec2 GetNodeSize(NodeId nodeId);
 IMGUI_NODE_EDITOR_API void CenterNodeOnScreen(NodeId nodeId);
+// MODIFICATION BY GAIJIN
+IMGUI_NODE_EDITOR_API ImVec2 GetPinPosition(PinId pinId); // pin centre in editor/canvas space (0,0 if not found)
 IMGUI_NODE_EDITOR_API void SetNodeZPosition(NodeId nodeId, float z); // Sets node z position, nodes with higher value are drawn over nodes with lower value
 IMGUI_NODE_EDITOR_API float GetNodeZPosition(NodeId nodeId); // Returns node z position, defaults is 0.0f
 
@@ -379,6 +408,9 @@ IMGUI_NODE_EDITOR_API int BreakLinks(PinId pinId); // Break all links connected 
 
 IMGUI_NODE_EDITOR_API void NavigateToContent(float duration = -1);
 IMGUI_NODE_EDITOR_API void NavigateToSelection(bool zoomIn = false, float duration = -1);
+// MODIFICATION BY GAIJIN
+// Pan the view (keeping zoom) so that canvasPoint (editor/canvas space) lands at screenPoint (screen pixels).
+IMGUI_NODE_EDITOR_API void ScrollCanvasPointToScreen(const ImVec2& canvasPoint, const ImVec2& screenPoint);
 
 IMGUI_NODE_EDITOR_API bool ShowNodeContextMenu(NodeId* nodeId);
 IMGUI_NODE_EDITOR_API bool ShowPinContextMenu(PinId* pinId);

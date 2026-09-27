@@ -1,9 +1,9 @@
 #pragma once
 
 #include <dag_noise/dag_uint_noise.h>
-#if (__clang_major__ < 12 || (__clang_major__ >= 17 && __clang_major__ <= 18)) && defined(__clang__) && defined(__FAST_MATH__)
+#if defined(__GNUC__) || defined(__clang__)
 #include <cstring> // memcpy
-#include <cmath> // INFINITY
+#include <cstdint>
 #endif
 
 namespace das {
@@ -57,6 +57,18 @@ namespace das {
     __forceinline float dot3(vec4f a, vec4f b){return v_extract_x(v_dot3_x(a, b));}
     __forceinline float dot4(vec4f a, vec4f b){return v_extract_x(v_dot4_x(a, b));}
 
+    // horizontal reduce of a float vector to a scalar. hmin/hmax NaN behavior follows
+    // the underlying SIMD min/max (not daslang scalar min/max), so don't feed them NaN.
+    __forceinline float hmin2(vec4f a){return v_extract_x(v_min(a, v_rot_1(a)));}
+    __forceinline float hmin3(vec4f a){return v_extract_x(v_hmin3(a));}
+    __forceinline float hmin4(vec4f a){return v_extract_x(v_hmin(a));}
+    __forceinline float hmax2(vec4f a){return v_extract_x(v_max(a, v_rot_1(a)));}
+    __forceinline float hmax3(vec4f a){return v_extract_x(v_hmax3(a));}
+    __forceinline float hmax4(vec4f a){return v_extract_x(v_hmax(a));}
+    __forceinline float hadd2(vec4f a){return v_extract_x(v_add_x(a, v_rot_1(a)));}
+    __forceinline float hadd3(vec4f a){return v_extract_x(v_hadd3_x(a));}
+    __forceinline float hadd4(vec4f a){return v_extract_x(v_hadd4_x(a));}
+
     __forceinline vec4f normalize2(vec4f a){return v_norm2(a); }
     __forceinline vec4f normalize3(vec4f a){return v_norm3(a); }
     __forceinline vec4f normalize4(vec4f a){return v_norm4(a); }
@@ -68,48 +80,53 @@ namespace das {
 
     __forceinline vec4f lerp_vec_float(vec4f a, vec4f b, float t) { return v_madd(v_sub(b, a), v_splats(t), a); }
 
+    __forceinline float step_float(float edge, float x) { return x < edge ? 0.0f : 1.0f; }
+    __forceinline float smoothstep_float(float e0, float e1, float x) {
+        float t = (x - e0) / (e1 - e0);
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        return t * t * (3.0f - 2.0f * t);
+    }
+    __forceinline vec4f step_vec(vec4f edge, vec4f x) {
+        // GLSL: step(edge,x) = x<edge ? 0 : 1 (so x==edge yields 1). v_sel(a,b,mask) = mask?b:a.
+        return v_sel(v_splats(1.0f), v_zero(), v_cmp_lt(x, edge));
+    }
+    __forceinline vec4f smoothstep_vec(vec4f e0, vec4f e1, vec4f x) {
+        vec4f t = v_saturate(v_div(v_sub(x, e0), v_sub(e1, e0)));
+        return v_mul(v_mul(t, t), v_madd(v_splats(-2.0f), t, v_splats(3.0f)));
+    }
+
+    __forceinline float radians_float(float deg) { return deg * (3.14159265358979323846f / 180.0f); }
+    __forceinline float degrees_float(float rad) { return rad * (180.0f / 3.14159265358979323846f); }
+    __forceinline vec4f radians_vec(vec4f deg) { return v_mul(deg, v_splats(3.14159265358979323846f / 180.0f)); }
+    __forceinline vec4f degrees_vec(vec4f rad) { return v_mul(rad, v_splats(180.0f / 3.14159265358979323846f)); }
+
 #if defined(__GNUC__) || defined(__clang__)
-#if !defined(__clang__)
-#define DAS_FINITE_MATH __attribute__((optimize("no-finite-math-only")))
-#else
-#define DAS_FINITE_MATH
-#endif
-#if defined(__clang__) && !defined(__arm64__) && !defined(__e2k__) && !defined(_TARGET_C3)
-#pragma float_control(push)
-#pragma float_control(precise, on)
-#endif
-#if (__clang_major__ < 12 || (__clang_major__ >= 17 && __clang_major__ <= 18)) && defined(__clang__) && defined(__FAST_MATH__)
-    //unfortunately older clang versions do not work with float_control, and in clang 17-18.1 it's broken
-    __forceinline DAS_FINITE_MATH bool   fisnan(float  a) { volatile float b = a; return b != a; }
-    __forceinline DAS_FINITE_MATH bool   disnan(double  a) { volatile double b = a; return b != a; }
-    __forceinline DAS_FINITE_MATH bool   fisfinite(float a)
-    {
-      uint32_t i;
-      memcpy(&i, &a, sizeof(a));
-      i &= ~(1 << 31);
-      memcpy(&a, &i, sizeof(a));
-      static volatile float inf = INFINITY;
-      return a != inf;
+    // A finite-math build folds the builtins, and clang 17+ marks every float parameter
+    // nofpclass(nan inf), which folds a plain exponent test too; no pragma or attribute lifts
+    // that from a parameter. A precise build is not safe either: an inlined builtin folds
+    // inside the fast-math region aot.h emits around every `options fast_math` function.
+    // The volatile copy launders the value in every build; the exponent test is integer
+    // math, which fast math leaves alone. Gated by tests-cpp/small/test_isnan_fastmath*.cpp.
+    __forceinline bool fisnan(float a) {
+        volatile float vb = a; float b = vb;
+        uint32_t i; memcpy(&i, &b, sizeof(b));
+        return (i & 0x7F800000u) == 0x7F800000u && (i & 0x007FFFFFu) != 0u;
     }
-    __forceinline DAS_FINITE_MATH bool   disfinite(double a)
-    {
-      uint64_t i;
-      memcpy(&i, &a, sizeof(a));
-      i &= ~(1ull << 63);
-      memcpy(&a, &i, sizeof(a));
-      static volatile double inf = INFINITY;
-      return a != inf;
+    __forceinline bool disnan(double a) {
+        volatile double vb = a; double b = vb;
+        uint64_t i; memcpy(&i, &b, sizeof(b));
+        return (i & 0x7FF0000000000000ull) == 0x7FF0000000000000ull && (i & 0x000FFFFFFFFFFFFFull) != 0ull;
     }
-#else
-    ___noinline DAS_FINITE_MATH inline bool   fisnan(float  a) { return __builtin_isnan(a); }
-    ___noinline DAS_FINITE_MATH inline bool   disnan(double  a) { return __builtin_isnan(a); }
-    ___noinline DAS_FINITE_MATH inline bool   fisfinite(float  a) { return __builtin_isfinite(a); }
-    ___noinline DAS_FINITE_MATH inline bool   disfinite(double  a) { return __builtin_isfinite(a); }
-#endif
-#undef DAS_FINITE_MATH
-#if defined(__clang__) && !defined(__arm64__) && !defined(__e2k__) && !defined(_TARGET_C3)
-#pragma float_control(pop)
-#endif
+    __forceinline bool fisfinite(float a) {
+        volatile float vb = a; float b = vb;
+        uint32_t i; memcpy(&i, &b, sizeof(b));
+        return (i & 0x7F800000u) != 0x7F800000u;
+    }
+    __forceinline bool disfinite(double a) {
+        volatile double vb = a; double b = vb;
+        uint64_t i; memcpy(&i, &b, sizeof(b));
+        return (i & 0x7FF0000000000000ull) != 0x7FF0000000000000ull;
+    }
 #else
     //msvc just does not optimize fast math
     __forceinline bool   fisfinite(float  a) { return isfinite(a); }
@@ -132,23 +149,162 @@ namespace das {
     __forceinline double dcos  (double a){return cos(a);}
     __forceinline double dasin (double a){return asin(a);}
     __forceinline double dacos (double a){return acos(a);}
+    __forceinline double dsafe_asin (double a){return asin(a >= -1.0 ? (a <= 1.0 ? a : 1.0) : -1.0);}
+    __forceinline double dsafe_acos (double a){return acos(a >= -1.0 ? (a <= 1.0 ? a : 1.0) : -1.0);}
     __forceinline double dtan  (double a){return tan(a);}
     __forceinline double datan (double a){return atan(a);}
     __forceinline double datan2(double a,double b){return atan2(a,b);}
+    __forceinline double dsinh (double a){return sinh(a);}
+    __forceinline double dcosh (double a){return cosh(a);}
+    __forceinline double dtanh (double a){return tanh(a);}
+    __forceinline double dasinh(double a){return asinh(a);}
+    __forceinline double dacosh(double a){return acosh(a);}
+    __forceinline double datanh(double a){return atanh(a);}
+    __forceinline double dlog10(double a){return log10(a);}
+    __forceinline double dlog1p(double a){return log1p(a);}
+    __forceinline double dexpm1(double a){return expm1(a);}
+    __forceinline double dcbrt (double a){return cbrt(a);}
+    __forceinline double dhypot(double a,double b){return hypot(a,b);}
+    __forceinline double dfmod(double a,double b){return fmod(a,b);}
+    __forceinline double dremainder(double a,double b){return remainder(a,b);}
+    __forceinline double dtrunc(double a){return trunc(a);}
 
     __forceinline float fasin (float a){return asin(a);}
     __forceinline float facos (float a){return acos(a);}
+    __forceinline float fsafe_asin (float a){return asin(a >= -1.0f ? (a <= 1.0f ? a : 1.0f) : -1.0f);}
+    __forceinline float fsafe_acos (float a){return acos(a >= -1.0f ? (a <= 1.0f ? a : 1.0f) : -1.0f);}
     __forceinline float fatan (float a){return atan(a);}
     __forceinline float fatan_est (float a){return v_extract_x(v_atan_est_x(v_set_x(a)));}
     __forceinline float fatan2(float a,float b){return atan2(a,b);}
     __forceinline float fatan2_est(float a,float b){return v_extract_x(v_atan2_est_x(v_set_x(a), v_set_x(b)));}
+    __forceinline float fsinh (float a){return sinh(a);}
+    __forceinline float fcosh (float a){return cosh(a);}
+    __forceinline float ftanh (float a){return tanh(a);}
+    __forceinline float fasinh(float a){return asinh(a);}
+    __forceinline float facosh(float a){return acosh(a);}
+    __forceinline float fatanh(float a){return atanh(a);}
+    __forceinline float flog10(float a){return log10(a);}
+    __forceinline float flog1p(float a){return log1p(a);}
+    __forceinline float fexpm1(float a){return expm1(a);}
+    __forceinline float fcbrt (float a){return cbrt(a);}
+    __forceinline float fhypot(float a,float b){return hypot(a,b);}
+    __forceinline float ffmod(float a,float b){return fmod(a,b);}
+    __forceinline float fremainder(float a,float b){return remainder(a,b);}
+    __forceinline float ftrunc(float a){return trunc(a);}
 
     __forceinline vec4f vasin(vec4f a){return v_asin(a);}
     __forceinline vec4f vacos(vec4f a){return v_acos(a);}
+    __forceinline vec4f vsafe_asin(vec4f a){return v_safe_asin(a);}
+    __forceinline vec4f vsafe_acos(vec4f a){return v_safe_acos(a);}
     __forceinline vec4f vatan(vec4f a){return v_atan(a);}
     __forceinline vec4f vatan_est(vec4f a){return v_atan_est(a);}
     __forceinline vec4f vatan2(vec4f a, vec4f b){return v_atan2(a,b);}
     __forceinline vec4f vatan2_est(vec4f a, vec4f b){return v_atan2_est(a,b);}
+    __forceinline vec4f vsinh(vec4f a){
+        return v_make_vec4f(
+            sinh(v_extract_x(a)),
+            sinh(v_extract_y(a)),
+            sinh(v_extract_z(a)),
+            sinh(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vcosh(vec4f a){
+        return v_make_vec4f(
+            cosh(v_extract_x(a)),
+            cosh(v_extract_y(a)),
+            cosh(v_extract_z(a)),
+            cosh(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vtanh(vec4f a){
+        return v_make_vec4f(
+            tanh(v_extract_x(a)),
+            tanh(v_extract_y(a)),
+            tanh(v_extract_z(a)),
+            tanh(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vasinh(vec4f a){
+        return v_make_vec4f(
+            asinh(v_extract_x(a)),
+            asinh(v_extract_y(a)),
+            asinh(v_extract_z(a)),
+            asinh(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vacosh(vec4f a){
+        return v_make_vec4f(
+            acosh(v_extract_x(a)),
+            acosh(v_extract_y(a)),
+            acosh(v_extract_z(a)),
+            acosh(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vatanh(vec4f a){
+        return v_make_vec4f(
+            atanh(v_extract_x(a)),
+            atanh(v_extract_y(a)),
+            atanh(v_extract_z(a)),
+            atanh(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vlog10(vec4f a){
+        return v_make_vec4f(
+            log10(v_extract_x(a)),
+            log10(v_extract_y(a)),
+            log10(v_extract_z(a)),
+            log10(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vlog1p(vec4f a){
+        return v_make_vec4f(
+            log1p(v_extract_x(a)),
+            log1p(v_extract_y(a)),
+            log1p(v_extract_z(a)),
+            log1p(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vexpm1(vec4f a){
+        return v_make_vec4f(
+            expm1(v_extract_x(a)),
+            expm1(v_extract_y(a)),
+            expm1(v_extract_z(a)),
+            expm1(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vcbrt(vec4f a){
+        return v_make_vec4f(
+            cbrt(v_extract_x(a)),
+            cbrt(v_extract_y(a)),
+            cbrt(v_extract_z(a)),
+            cbrt(v_extract_w(a))
+        );
+    }
+    __forceinline vec4f vhypot(vec4f a, vec4f b){
+        return v_make_vec4f(
+            hypot(v_extract_x(a), v_extract_x(b)),
+            hypot(v_extract_y(a), v_extract_y(b)),
+            hypot(v_extract_z(a), v_extract_z(b)),
+            hypot(v_extract_w(a), v_extract_w(b))
+        );
+    }
+    __forceinline vec4f vfmod(vec4f a, vec4f b){
+        return v_make_vec4f(
+            fmod(v_extract_x(a), v_extract_x(b)),
+            fmod(v_extract_y(a), v_extract_y(b)),
+            fmod(v_extract_z(a), v_extract_z(b)),
+            fmod(v_extract_w(a), v_extract_w(b))
+        );
+    }
+    __forceinline vec4f vremainder(vec4f a, vec4f b){
+        return v_make_vec4f(
+            remainder(v_extract_x(a), v_extract_x(b)),
+            remainder(v_extract_y(a), v_extract_y(b)),
+            remainder(v_extract_z(a), v_extract_z(b)),
+            remainder(v_extract_w(a), v_extract_w(b))
+        );
+    }
+    __forceinline vec4f vtrunc(vec4f a){return v_trunc(a);}
 
     __forceinline void sincosF ( float a, float & sv, float & cv ) {
         vec4f s,c;

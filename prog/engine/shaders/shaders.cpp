@@ -6,6 +6,8 @@
 #include "shadersBinaryData.h"
 #include "shStateBlk.h"
 #include "shStateBlock.h"
+#include "mapBinarySearch.h"
+#include "shBindumpsPrivate.h"
 #include <ioSys/dag_fileIo.h>
 #include <ioSys/dag_memIo.h>
 #include <ioSys/dag_dataBlock.h>
@@ -18,6 +20,7 @@
 #include <debug/dag_debug.h>
 #include <debug/dag_log.h>
 #include <stdio.h>
+#include <EASTL/array.h>
 #include <EASTL/vector_map.h>
 #include <EASTL/vector_set.h>
 #include <osApiWrappers/dag_critSec.h>
@@ -30,20 +33,29 @@
 #include "shaders/sh_vars.h"
 #include <supp/dag_alloca.h>
 #include <drv/3d/dag_vertexIndexBuffer.h>
+#include <drv/3d/dag_lock.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <3d/tql.h>
+#include <drv/3d/dag_buffers.h>
+#include <drv/3d/dag_tex3d.h>
+#include <shaders/dag_linkedListOfShadervars.h>
 
 //
 
 const char *ShaderMaterial::loadingStirngInfo = NULL;
 #if DAGOR_DBGLEVEL > 0
 #include <shaders/dag_shaderDbg.h>
-#include <ioSys/dag_dataBlock.h>
 #include <startup/dag_globalSettings.h>
 namespace shaderbindump
 {
 extern void dump_shader_var_names();
 }
 #endif
+
+namespace shaderbindump
+{
+uint32_t get_generation() { return shBinDumpOwner().generation; }
+} // namespace shaderbindump
 
 // set sting for error info while loading material. don't forget to clear it after loading!
 void ShaderMaterial::setLoadingString(const char *s) { loadingStirngInfo = s; }
@@ -83,58 +95,94 @@ real get_shader_global_time_phase(float period, float offset)
 
 void ShaderGlobal::reset_textures(bool removed_tex_only)
 {
-  auto &state = shBinDumpOwner().globVarsState;
+  auto &dumpOwner = shBinDumpOwner();
+  auto &globalData = shGlobalData();
+  auto &state = globalData.globVarsState;
   const auto &vars = shBinDump().globVars;
 
   for (int i = 0, e = state.size(); i < e; i++)
   {
     const auto type = vars.getType(i);
+
     if (type == SHVT_TEXTURE)
     {
       auto &tex = state.get<shaders_internal::Tex>(i);
-      if (removed_tex_only)
-        if (get_managed_texture_name(tex.texId) || get_managed_texture_refcount(tex.texId) <= 0)
-          continue;
-      release_managed_tex(tex.texId);
+      if (tex.isTextureManaged())
+      {
+        if (removed_tex_only)
+          if (get_managed_texture_name(tex.texId) || get_managed_texture_refcount(tex.texId) <= 0)
+            continue;
+        release_managed_tex(tex.texId);
+      }
+      else
+      {
+#if DAGOR_DBGLEVEL > 0
+        auto oldIt = globalData.globResourceVarPointerUsageMap.find(tex.tex);
+        if (oldIt != globalData.globResourceVarPointerUsageMap.end())
+        {
+          if (--oldIt->second <= 0)
+          {
+            globalData.globResourceVarPointerUsageMap.erase(tex.tex);
+          }
+        }
+#endif
+      }
       tex.texId = BAD_TEXTUREID;
       tex.tex = nullptr;
 
-      int iid = shBinDumpOwner().globVarIntervalIdx[i];
+      int iid = globalData.globVarIntervalIdx[i];
       if (iid >= 0)
-        shBinDumpOwner().globIntervalNormValues[iid] = 0;
+        globalData.globIntervalNormValues[iid] = 0;
     }
     else if (type == SHVT_BUFFER)
     {
       auto &buf = state.get<shaders_internal::Buf>(i);
-      if (removed_tex_only)
-        if (get_managed_res_name(buf.bufId) || get_managed_res_refcount(buf.bufId) <= 0)
-          continue;
-      release_managed_tex(buf.bufId);
-      buf.bufId = BAD_TEXTUREID;
+      if (buf.isBufferManaged())
+      {
+        if (removed_tex_only)
+          if (get_managed_res_name(buf.bufId) || get_managed_res_refcount(buf.bufId) <= 0)
+            continue;
+        release_managed_res(buf.bufId);
+      }
+      else
+      {
+#if DAGOR_DBGLEVEL > 0
+        auto oldIt = globalData.globResourceVarPointerUsageMap.find(buf.buf);
+        if (oldIt != globalData.globResourceVarPointerUsageMap.end())
+        {
+          if (--oldIt->second <= 0)
+          {
+            globalData.globResourceVarPointerUsageMap.erase(buf.buf);
+          }
+        }
+#endif
+      }
+      buf.bufId = BAD_D3DRESID;
       buf.buf = nullptr;
 
-      int iid = shBinDumpOwner().globVarIntervalIdx[i];
+      int iid = globalData.globVarIntervalIdx[i];
       if (iid >= 0)
-        shBinDumpOwner().globIntervalNormValues[iid] = 0;
+        globalData.globIntervalNormValues[iid] = 0;
     }
   }
 }
 
 void ShaderGlobal::reset_stale_vars()
 {
-  auto &state = shBinDumpOwner().globVarsState;
+  auto &state = shGlobalData().globVarsState;
   const auto &vars = shBinDump().globVars;
   for (int i = 0, e = state.size(); i < e; i++)
     if (vars.getType(i) == SHVT_TLAS)
       state.set<RaytraceTopAccelerationStructure *>(i, nullptr);
 }
 
-void ShaderGlobal::reset_from_vars(TEXTUREID id)
+void ShaderGlobal::sync_managed_resource(TEXTUREID id, D3dResource *old_res_ptr)
 {
   if (id == BAD_TEXTUREID)
     return;
 
-  auto &state = shBinDumpOwner().globVarsState;
+  auto &globalData = shGlobalData();
+  auto &state = globalData.globVarsState;
   const auto &vars = shBinDump().globVars;
 
   for (int i = 0, e = state.size(); i < e; i++)
@@ -143,30 +191,171 @@ void ShaderGlobal::reset_from_vars(TEXTUREID id)
     if (type == SHVT_TEXTURE)
     {
       auto &tex = state.get<shaders_internal::Tex>(i);
-      if (tex.texId != id)
-        continue;
-      if (get_managed_texture_refcount(id) > 0)
-        release_managed_tex(id);
-      tex.texId = BAD_TEXTUREID;
-      tex.tex = nullptr;
 
-      int iid = shBinDumpOwner().globVarIntervalIdx[i];
+      if (tex.isTextureManaged() && tex.texId != id)
+        continue;
+
+      if (tex.isTextureUnmanaged() && (!old_res_ptr || tex.tex != old_res_ptr))
+        continue;
+
+      auto *actualTexPtr = (BaseTexture *)D3dResManagerData::getD3dRes(id);
+
+#if DAGOR_DBGLEVEL > 0
+      if (tex.isTextureUnmanaged())
+      {
+
+        auto oldIt = globalData.globResourceVarPointerUsageMap.find(tex.tex);
+        if (oldIt != globalData.globResourceVarPointerUsageMap.end())
+        {
+          if (--oldIt->second <= 0)
+          {
+            globalData.globResourceVarPointerUsageMap.erase(tex.tex);
+          }
+        }
+
+        if (actualTexPtr)
+        {
+          auto &newCounter = globalData.globResourceVarPointerUsageMap[actualTexPtr];
+          ++newCounter;
+        }
+      }
+#endif
+
+      tex.tex = actualTexPtr;
+
+      int iid = globalData.globVarIntervalIdx[i];
       if (iid >= 0)
-        shBinDumpOwner().globIntervalNormValues[iid] = 0;
+        globalData.globIntervalNormValues[iid] = static_cast<uint8_t>(tex.tex != nullptr);
     }
     else if (type == SHVT_BUFFER)
     {
       auto &buf = state.get<shaders_internal::Buf>(i);
-      if (buf.bufId != id)
+
+      if (buf.isBufferManaged() && buf.bufId != id)
         continue;
-      if (get_managed_res_refcount(id) > 0)
-        release_managed_res(id);
+
+      if (buf.isBufferUnmanaged() && (!old_res_ptr || buf.buf != old_res_ptr))
+        continue;
+
+      auto *actualBufPtr = (Sbuffer *)D3dResManagerData::getD3dRes(id);
+
+#if DAGOR_DBGLEVEL > 0
+      if (buf.isBufferUnmanaged())
+      {
+
+        auto oldIt = globalData.globResourceVarPointerUsageMap.find(buf.buf);
+        if (oldIt != globalData.globResourceVarPointerUsageMap.end())
+        {
+          if (--oldIt->second <= 0)
+          {
+            globalData.globResourceVarPointerUsageMap.erase(buf.buf);
+          }
+        }
+
+        if (actualBufPtr)
+        {
+          auto &newCounter = globalData.globResourceVarPointerUsageMap[actualBufPtr];
+          ++newCounter;
+        }
+      }
+
+#endif
+
+      buf.buf = actualBufPtr;
+
+      int iid = globalData.globVarIntervalIdx[i];
+      if (iid >= 0)
+        globalData.globIntervalNormValues[iid] = static_cast<uint8_t>(buf.buf != nullptr);
+    }
+  }
+}
+
+void ShaderGlobal::reset_from_vars(TEXTUREID id)
+{
+  if (id == BAD_TEXTUREID)
+    return;
+
+  auto *resPtr = D3dResManagerData::getD3dRes(id);
+
+  auto &globalData = shGlobalData();
+  auto &state = globalData.globVarsState;
+  const auto &vars = shBinDump().globVars;
+
+  for (int i = 0, e = state.size(); i < e; i++)
+  {
+    auto type = vars.getType(i);
+    if (type == SHVT_TEXTURE)
+    {
+      auto &tex = state.get<shaders_internal::Tex>(i);
+
+      G_ASSERTF(!(tex.texId == id && tex.tex != resPtr),
+        "inconsistent texture shader var binding. bound resource ptr: %p | managed resource ptr: %p", tex.tex, resPtr);
+
+      if (tex.isTextureManaged())
+      {
+        if (tex.texId != id)
+          continue;
+        if (get_managed_texture_refcount(id) > 0)
+          release_managed_tex(id);
+      }
+      else
+      {
+        if (tex.tex != resPtr)
+          continue;
+#if DAGOR_DBGLEVEL > 0
+        auto oldIt = globalData.globResourceVarPointerUsageMap.find(tex.tex);
+        if (oldIt != globalData.globResourceVarPointerUsageMap.end())
+        {
+          if (--oldIt->second <= 0)
+          {
+            globalData.globResourceVarPointerUsageMap.erase(tex.tex);
+          }
+        }
+#endif
+      }
+
+      tex.texId = BAD_TEXTUREID;
+      tex.tex = nullptr;
+
+      int iid = globalData.globVarIntervalIdx[i];
+      if (iid >= 0)
+        globalData.globIntervalNormValues[iid] = 0;
+    }
+    else if (type == SHVT_BUFFER)
+    {
+      auto &buf = state.get<shaders_internal::Buf>(i);
+
+      G_ASSERTF(!(buf.bufId == id && buf.buf != resPtr),
+        "inconsistent buffer shader var binding. bound resource ptr: %p | managed resource ptr: %p", buf.buf, resPtr);
+
+      if (buf.isBufferManaged())
+      {
+        if (buf.bufId != id)
+          continue;
+        if (get_managed_res_refcount(id) > 0)
+          release_managed_res(id);
+      }
+      else
+      {
+        if (buf.buf != resPtr)
+          continue;
+#if DAGOR_DBGLEVEL > 0
+        auto oldIt = globalData.globResourceVarPointerUsageMap.find(buf.buf);
+        if (oldIt != globalData.globResourceVarPointerUsageMap.end())
+        {
+          if (--oldIt->second <= 0)
+          {
+            globalData.globResourceVarPointerUsageMap.erase(buf.buf);
+          }
+        }
+#endif
+      }
       buf.bufId = BAD_D3DRESID;
       buf.buf = nullptr;
 
-      int iid = shBinDumpOwner().globVarIntervalIdx[i];
+      int iid = globalData.globVarIntervalIdx[i];
       if (iid >= 0)
-        shBinDumpOwner().globIntervalNormValues[iid] = 0;
+        globalData.globIntervalNormValues[iid] = 0;
     }
   }
 }
@@ -495,7 +684,7 @@ class JobManagersSyncPoint
 
     explicit FenceJob(SyncPointSharedState *state) : state{state} {}
 
-    const char *getJobName(bool &) const override { return "FenceJob"; }
+    const char *getJobName(bool &) const override { return DAPROFILER_STRING("FenceJob"); }
 
     void doJob() override
     {
@@ -566,8 +755,7 @@ bool load_shaders_bindump_with_fence(const char *src_filename, d3d::shadermodel:
   return load_shaders_bindump(src_filename, shader_model_version);
 }
 
-static void build_shaderdump_filename(char fname[DAGOR_MAX_PATH], const char *src_filename,
-  d3d::shadermodel::Version shader_model_version)
+static void build_shaderdump_filename(char *fname, const char *src_filename, d3d::shadermodel::Version shader_model_version)
 {
   const auto getFormatForStubDriver = [] {
     const char *ret = "%s.%s.shdump.bin";
@@ -606,124 +794,259 @@ static void build_shaderdump_filename(char fname[DAGOR_MAX_PATH], const char *sr
   fname[sizeof_fname - 1] = 0;
 }
 
-// load current binary code to disk. no up-to-date checking performed
-static bool load_shaders_bindump(const char *src_filename, d3d::shadermodel::Version shader_model_version,
-  ScriptedShadersBinDumpOwner &dest)
+// Only invalidate global state for the main shaderdump
+static void init_global_systems_after_main_dump_reload(ScriptedShadersBinDumpOwner &dest, ScriptedShadersGlobalData *gdata)
 {
-  stcode::unload();
+  auto *dump = dest.getDump();
+  G_UNUSED(gdata);
 
-  shaders_internal::init_stateblocks();
-  char fname[DAGOR_MAX_PATH];
-  build_shaderdump_filename(fname, src_filename, shader_model_version);
+  // init block state
+  shaderbindump::blockStateWord = 0;
+  static const char *null_name[shaderbindump::MAX_BLOCK_LAYERS] = {"!frame", "!scene", "!obj"};
+  for (int i = 0; i < shaderbindump::MAX_BLOCK_LAYERS; i++)
+  {
+    int id = mapbinarysearch::bfindStrId(dump->blockNameMap, null_name[i]);
+    if (id < 0)
+      shaderbindump::nullBlock[i] = nullptr;
+    else
+    {
+      shaderbindump::nullBlock[i] = &dump->blocks[id];
+      shaderbindump::blockStateWord |= shaderbindump::nullBlock[i]->uidVal;
+    }
+  }
+
+  shaderbindump::reset_interval_binds();
+
+  shadervars::resolve_shadervars();
+  IShaderBindumpReloadListener::resolveAll(); // @TODO: separate subscriptions for different dumps?
+  extern void reset_shaders_logerr_info();
+  reset_shaders_logerr_info();
+
+  d3d::driver_command(Drv3dCommand::REGISTER_SHADER_DUMP, &dest, (void *)dest.name.str());
+}
+
+static void shutdown_global_systems_before_main_dump_unload() { d3d::driver_command(Drv3dCommand::REGISTER_SHADER_DUMP); }
+
+static void clear_shaders_bindump(ScriptedShadersBinDumpOwner &dest, ScriptedShadersGlobalData *gdata, bool is_main)
+{
+  if (is_main)
+    shutdown_global_systems_before_main_dump_unload();
+  dest.clear();
+  if (gdata)
+    gdata->clear();
+}
+
+bool load_shaders_bindump_asset(ShadersBinDumpAssetData &dump_asset, char const *src_filename,
+  d3d::shadermodel::Version shader_model_version)
+{
+  dump_asset.fullName.resize(DAGOR_MAX_PATH);
+  build_shaderdump_filename(dump_asset.fullName.data(), src_filename, shader_model_version);
+  dump_asset.fullName.updateSz();
 
   // FIXME
   // vromfs_get_file_data cause error for miniui shaders, this is workaround to avoid it
   const size_t inplace_load_min_size_threshold = 1 << 20;
 
-  VromReadHandle dump_data = ::vromfs_get_file_data(fname);
+  VromReadHandle dump_data = ::vromfs_get_file_data(dump_asset.fullName.str());
   if (dump_data.data() && data_size(dump_data) > inplace_load_min_size_threshold)
   {
-    debug("[SH] Loading precompiled shaders from VROMFS::'%s'...[%p]", fname, dump_data.data());
-    if (dest.loadData((uint8_t *)dump_data.data(), data_size(dump_data)))
+    debug("[SH] Loading precompiled shaders from VROMFS::'%s'...[%p]", dump_asset.fullName.str(), dump_data.data());
+    dump_asset.memCrd.emplace(dump_data.data(), data_size(dump_data));
+    dump_asset.dumpFileSz = data_size(dump_data);
+    dump_asset.mmapedLoad = false;
+  }
+  else
+  {
+#if _TARGET_ANDROID
+    if (!android_get_asset_data(dump_asset.fullName.str(), dump_asset.assetData))
+      clear_and_shrink(dump_asset.assetData);
+    if (dump_asset.assetData.data())
     {
-      return stcode::load(fname);
+      dump_asset.memCrd.emplace(dump_asset.assetData.data(), data_size(dump_asset.assetData));
+      dump_asset.dumpFileSz = data_size(dump_asset.assetData);
+      dump_asset.mmapedLoad = false;
+    }
+    else
+#endif
+    {
+      dump_asset.fileCrd.emplace(dump_asset.fullName.str(), DF_IGNORE_MISSING | DF_READ);
+      if (dump_asset.fileCrd->fileHandle)
+        dump_asset.dumpFileSz = df_length(dump_asset.fileCrd->fileHandle);
+      else
+        dump_asset.fileCrd.reset();
     }
   }
+
+  return dump_asset.valid();
+}
+
+// load current binary code to disk. no up-to-date checking performed
+static bool load_shaders_bindump(const char *src_filename, d3d::shadermodel::Version shader_model_version,
+  ScriptedShadersBinDumpOwner &dest, ScriptedShadersGlobalData *gdata)
+{
+  // @NOTE: will not be asserted once additional dumps are added
+  G_ASSERT(gdata);
+  if (dest.getDump())
+    G_ASSERT(gdata->backing == &dest);
+
+  bool const isMainDump = &dest == &shBinDumpOwner();
+
+  if (isMainDump)
+    G_ASSERT(gdata == &shGlobalData());
+  else if (&dest == &shBinDumpExOwner(false))
+    G_ASSERT(gdata == &shGlobalDataEx(false));
+
   if (!shaders_internal::shader_reload_allowed && dest.getDump() && dest->classes.size())
   {
     DAG_FATAL("shader reload is disabled by project");
     return false;
   }
 
-  IGenLoad *crd = NULL;
-  int dump_file_sz = 0;
-  FullFileLoadCB crd_file(fname, DF_IGNORE_MISSING | DF_READ);
-  bool full_file_load = true; // To consider: make something like FullMMappedFileLoadCB
-
-#if _TARGET_ANDROID
-  Tab<char> assetData;
-  if (!android_get_asset_data(fname, assetData))
-    clear_and_shrink(assetData);
-  InPlaceMemLoadCB crd_mem(assetData.data(), data_size(assetData));
-  if (assetData.data())
-  {
-    crd = &crd_mem;
-    dump_file_sz = data_size(assetData);
-    full_file_load = false;
-  }
-#endif
-
-  if (!crd && crd_file.fileHandle)
-  {
-    crd = &crd_file;
-    dump_file_sz = df_length(crd_file.fileHandle);
-  }
-
-  if (!crd)
+  ShadersBinDumpAssetData dumpAsset{};
+  if (!load_shaders_bindump_asset(dumpAsset, src_filename, shader_model_version))
   {
     // rebuild shaders
-    debug("[SH] Precompiled shader file '%s' not found", fname);
+    debug("[SH] Precompiled shader file '%s' not found", dumpAsset.fullName.str());
     return false;
   }
 
+  if (isMainDump)
+    stcode::unload(dest.stcodeCtx);
+
+  shaders_internal::init_stateblocks();
+
+  // flush all driver commands, which potentially can reference old scripted shader bin dump
+  d3d::GpuAutoLock gpuLock;
+
+  // have to delete shaders before ruining memory with move because if loading will fail
+  // we do dest.initAfterLoad which clears shader arrays without destroying them
+  shaders_internal::cleanup_shaders_on_reload(dest);
+  // why is it here if we are only reloading dest bindump?
+  iterate_all_additional_shader_dumps([](ScriptedShadersBinDumpOwner &owner) { shaders_internal::cleanup_shaders_on_reload(owner); });
+
+  // signal backend that the memory backing shader bytecode is about to be invalidated
+  d3d::driver_command(Drv3dCommand::UNLOAD_SHADER_MEMORY);
+
+  d3d::driver_command(Drv3dCommand::D3D_FLUSH);
+
+  dest.assertionCtx.close();
+
   ScriptedShadersBinDumpOwner prev_sh = eastl::move(dest);
+  ScriptedShadersGlobalData prev_gdata = eastl::move(*gdata);
+
+  // Transfer cppstcode settings
+  dest.stcodeCtx = eastl::move(prev_sh.stcodeCtx);
+
+  clear_shaders_bindump(dest, gdata, isMainDump);
+
+  auto initAfterLoad = [&] {
+    gdata->initAfterLoad(&dest, isMainDump);
+    dest.initAfterLoad(isMainDump);
+    if (isMainDump)
+      init_global_systems_after_main_dump_reload(dest, gdata);
+    dest.assertionCtx.init(dest);
+  };
 
   // load precached file
   DAGOR_TRY
   {
-    debug("[SH] Loading precompiled shaders from '%s'...", fname);
-    if (dest.load(*crd, dump_file_sz, full_file_load))
+    debug("[SH] Loading precompiled shaders from '%s'...", dumpAsset.fullName.str());
+    if (dest.loadFromFile(dumpAsset.getCrd(), dumpAsset.dumpFileSz, dumpAsset.mmapedLoad))
     {
-      debug("[SH] Precompiled shaders from '%s' loaded OK regs = %d", fname, dest->maxRegSize);
+      initAfterLoad();
+
+      debug("[SH] Precompiled shaders from '%s' loaded OK regs = %d", dumpAsset.fullName.str(), dest->maxRegSize);
       if (dest->maxRegSize > MAX_TEMP_REGS)
         DAG_FATAL("too much shader temp registers %d, current limit is %d", dest->maxRegSize, MAX_TEMP_REGS);
 
-      if (!prev_sh.getDump() || shaders_internal::reload_shaders_materials(prev_sh))
+      if (!prev_sh.getDump() || shaders_internal::reload_shaders_materials(dest, gdata, prev_sh, &prev_gdata))
       {
         prev_sh.clear();
-        if (dest.getDump() == &shBinDump())
+        prev_gdata.clear();
+
+        if (isMainDump)
           shglobvars::init_varids_loaded();
 
-        return stcode::load(fname);
+        iterate_all_additional_shader_dumps([&gdata](ScriptedShadersBinDumpOwner &owner) { reinit_shaders_bindump(owner, *gdata); });
+
+        return stcode::load(dest.stcodeCtx, dumpAsset.fullName.str());
       }
     }
   }
-  DAGOR_CATCH(const IGenLoad::LoadException &e) { debug("[SH] exception while loading %s!", fname); }
+  DAGOR_CATCH(const IGenLoad::LoadException &e) { debug("[SH] exception while loading %s!", dumpAsset.fullName.str()); }
 
-  dest.clear();
+  clear_shaders_bindump(dest, gdata, isMainDump);
+
   dest = eastl::move(prev_sh);
+  *gdata = eastl::move(prev_gdata);
+
   if (dest.getDump() && dest->classes.size())
   {
-    dest.initAfterLoad();
+    initAfterLoad();
+    iterate_all_additional_shader_dumps([&gdata](ScriptedShadersBinDumpOwner &owner) { reinit_shaders_bindump(owner, *gdata); });
+    if (isMainDump)
+      stcode::load(dest.stcodeCtx, dumpAsset.fullName.str());
     return false;
   }
 
-  debug("[SH] Invalid '%s' version", fname);
-  DAG_FATAL("Invalid '%s' version - recompile shaders!", fname);
+  debug("[SH] Invalid '%s' version", dumpAsset.fullName.str());
+  DAG_FATAL("Invalid '%s' version - recompile shaders!", dumpAsset.fullName.str());
   return false;
 }
 static String last_loaded_dump[2];
 
 const char *last_loaded_shaders_bindump(bool sec) { return last_loaded_dump[sec ? 1 : 0].c_str(); }
 
+static eastl::array<d3d::shadermodel::Version, 2> last_loaded_version = {d3d::smNone, d3d::smNone};
+
+static int debugDumpUsers = 0;
+static String debugDumpFile;
+
 bool load_shaders_bindump(const char *src_filename, d3d::shadermodel::Version shader_model_version, bool sec_dump_for_exp)
 {
   String &dump = last_loaded_dump[sec_dump_for_exp ? 1 : 0];
+  const String prevDump(dump);
   if (src_filename)
     dump = src_filename;
-  return load_shaders_bindump(dump.c_str(), shader_model_version, shBinDumpExOwner(!sec_dump_for_exp));
+  const bool loaded =
+    load_shaders_bindump(dump.c_str(), shader_model_version, shBinDumpExOwner(!sec_dump_for_exp), &shGlobalDataEx(!sec_dump_for_exp));
+  if (!loaded)
+  {
+    dump = prevDump;
+    return false;
+  }
+  last_loaded_version[sec_dump_for_exp ? 1 : 0] = shader_model_version;
+
+  if (!sec_dump_for_exp && debugDumpUsers > 0 && dump != debugDumpFile)
+  {
+    debugDumpUsers = 0;
+    logwarn("Reloaded %s over the debug shaderdump, toggle debug views to get it back", dump);
+  }
+  return true;
 }
 
-static void unload_shaders_bindump(ScriptedShadersBinDumpOwner &dest)
+static void unload_shaders_bindump(ScriptedShadersBinDumpOwner &dest, ScriptedShadersGlobalData *gdata)
 {
-  stcode::unload();
+  stcode::unload(dest.stcodeCtx);
 
-  dest.clear();
+  // flush all driver commands, which potentially can reference old scripted shader bin dump
+  d3d::GpuAutoLock gpuLock;
+
+  // signal backend that the memory backing shader bytecode is about to be invalidated
+  d3d::driver_command(Drv3dCommand::UNLOAD_SHADER_MEMORY);
+
+  d3d::driver_command(Drv3dCommand::D3D_FLUSH);
+
+  clear_shaders_bindump(dest, gdata, &dest == &shBinDumpOwner());
+
 #if DAGOR_DBGLEVEL > 0
-  shaderbindump::resetInvalidVariantMarks();
+  shaderbindump::resetInvalidVariantMarks(dest.selfHandle);
 #endif
 }
-void unload_shaders_bindump(bool sec_dump_for_exp) { unload_shaders_bindump(shBinDumpExOwner(!sec_dump_for_exp)); }
+void unload_shaders_bindump(bool sec_dump_for_exp)
+{
+  unload_shaders_bindump(shBinDumpExOwner(!sec_dump_for_exp), &shGlobalDataEx(!sec_dump_for_exp));
+}
 
 static d3d::shadermodel::Version forceFSH = d3d::smAny;
 
@@ -731,14 +1054,30 @@ static d3d::shadermodel::Version forceFSH = d3d::smAny;
 d3d::shadermodel::Version getMaxFSHVersion() { return forceFSH; }
 void limitMaxFSHVersion(d3d::shadermodel::Version f) { forceFSH = f; }
 
-static bool debugDump = false;
+static String normalDumpName;
+static d3d::shadermodel::Version normalDumpVersion = d3d::smNone;
 
-bool load_shaders_debug_bindump(d3d::shadermodel::Version version)
-{
 #if DAGOR_DBGLEVEL > 0
-  if (debugDump)
-    return true;
+static bool is_debug_dump_stale(const String &debug_dump_name, d3d::shadermodel::Version version)
+{
+  eastl::array<char, DAGOR_MAX_PATH> normalFile = {};
+  eastl::array<char, DAGOR_MAX_PATH> debugFile = {};
+  build_shaderdump_filename(normalFile.data(), normalDumpName.c_str(), normalDumpVersion);
+  build_shaderdump_filename(debugFile.data(), debug_dump_name.c_str(), version);
 
+  DagorStat normalStat, debugStat;
+  if (df_stat(normalFile.data(), &normalStat) != 0 || df_stat(debugFile.data(), &debugStat) != 0)
+    return false; // packed or missing file, let the loader report it
+
+  if (debugStat.mtime >= normalStat.mtime)
+    return false;
+
+  logerr("Debug shaderdump %s is older than %s, recompile the debug shaders", debugFile.data(), normalFile.data());
+  return true;
+}
+
+static bool load_shaders_debug_bindump(d3d::shadermodel::Version version)
+{
   if (d3d::get_driver_code() != d3d::dx12 || dgs_get_settings()->getBlockByNameEx("video")->getBool("compatibilityMode", false))
   {
     debug("Debug shaderdumps only exist for PC DX12");
@@ -747,34 +1086,90 @@ bool load_shaders_debug_bindump(d3d::shadermodel::Version version)
 
   static String shadersDir = String(dgs_get_settings()->getBlockByNameEx("debug")->getStr("shadersDir", "compiledShaders")) + ".debug";
 
-  if (load_shaders_bindump(shadersDir + "/game_debug", version))
-  {
-    debugDump = true;
+  normalDumpName = last_loaded_dump[0];
+  normalDumpVersion = last_loaded_version[0];
+
+  String debugDumpName = shadersDir + "/game_debug";
+  if (is_debug_dump_stale(debugDumpName, version))
+    return false;
+  debugDumpFile = debugDumpName;
+
+  rebuild_shaders_stateblocks();
+  if (load_shaders_bindump_with_fence(debugDumpName, version))
     return true;
-  }
   debug("The debug shaderdump cannot be found, make sure it exists: %s/game_debugDX12.ps%d%d.shdump", shadersDir, version.minor,
     version.major);
-#endif
   return false;
 }
 
-bool unload_shaders_debug_bindump(d3d::shadermodel::Version version)
+static bool restore_normal_shaders_bindump()
+{
+  if (normalDumpName.empty())
+  {
+    logerr("Cannot drop the debug shaderdump: the normal shaderdump was never loaded by name");
+    return false;
+  }
+
+  rebuild_shaders_stateblocks();
+  if (load_shaders_bindump_with_fence(normalDumpName, normalDumpVersion))
+    return true;
+
+  logerr("The normal shaderdump cannot be found, make sure it exists: %s (ps%d%d)", normalDumpName, normalDumpVersion.minor,
+    normalDumpVersion.major);
+  return false;
+}
+#endif
+
+int debug_shaders_refcount() { return debugDumpUsers; }
+
+bool require_debug_shaders()
 {
 #if DAGOR_DBGLEVEL > 0
-  if (!debugDump)
-    return true;
+  bool loaded = debugDumpUsers > 0;
 
-  static String shadersDir = String(dgs_get_settings()->getBlockByNameEx("debug")->getStr("shadersDir", "compiledShaders")) + ".debug";
+  if (!loaded)
+    loaded = load_shaders_debug_bindump(last_loaded_version[0]);
 
-  if (load_shaders_bindump(shadersDir + "/game", d3d::shadermodel::Version(5, 0)))
+  // no debug dump at the running shader model: fall back to any supported one,
+  // matching the old lookup for games that compile the debug dump at a single version
+  if (!loaded)
   {
-    debugDump = false;
-    return true;
+    const auto shaderModel = d3d::get_driver_desc().shaderModel;
+    for (auto version : d3d::smAll)
+    {
+      if (shaderModel < version || version == last_loaded_version[0])
+        continue;
+      loaded = load_shaders_debug_bindump(version);
+      if (loaded)
+        break;
+    }
   }
-  debug("The normal shaderdump cannot be found, make sure it exists: %s/gameDX12.ps%d%d.shdump", shadersDir, version.minor,
-    version.major);
-#endif
+
+  if (loaded)
+    debugDumpUsers++;
+  return loaded;
+#else
   return false;
+#endif
+}
+
+bool release_debug_shaders()
+{
+#if DAGOR_DBGLEVEL > 0
+  if (debugDumpUsers <= 0)
+    return true;
+  debugDumpUsers--;
+  if (debugDumpUsers > 0)
+    return true;
+  if (restore_normal_shaders_bindump())
+    return true;
+
+  // the debug dump is still the loaded one, keep its user so the next release retries
+  debugDumpUsers++;
+  return false;
+#else
+  return true;
+#endif
 }
 
 void dump_shader_statistics()
@@ -793,7 +1188,10 @@ void dump_shader_statistics()
 #endif
 }
 
-void set_stcode_special_tag_interp(stcode::SpecialBlkTagInterpreter &&interp) { stcode::set_special_tag_interp(eastl::move(interp)); }
+void set_stcode_special_tag_interp(stcode::SpecialBlkTagInterpreter &&interp)
+{
+  stcode::set_special_tag_interp(::shBinDumpOwner().stcodeCtx, eastl::move(interp));
+}
 
 class ShadersRestartProc : public SRestartProc
 {
@@ -868,21 +1266,19 @@ public:
     close_vdecl();
 
     // reset public varIds
-    shaders_internal::close_global_constbuffers();
     shaders_internal::close_stateblocks();
-    shaders_internal::shader_mats.clear();
-    shaders_internal::shader_mat_elems.clear();
     ShaderStateBlock::clear();
     auto &dumpOwner = shBinDumpOwner();
+    auto &globalData = shGlobalData();
     const auto &dump = shBinDump();
     if (dump.varMap.size())
     {
       unsigned vars_resolved = 0, glob_vars_resolved = 0;
       for (int i = 0, ie = VariableMap::getVariablesCount(); i < ie; i++)
-        if (dumpOwner.varIndexMap[i] < SHADERVAR_IDX_ABSENT)
+        if (globalData.varIndexMap[i] < SHADERVAR_IDX_ABSENT)
         {
           vars_resolved++;
-          if (dumpOwner.globvarIndexMap[i] < SHADERVAR_IDX_ABSENT)
+          if (globalData.globvarIndexMap[i] < SHADERVAR_IDX_ABSENT)
             glob_vars_resolved++;
         }
 
@@ -899,6 +1295,9 @@ public:
     }
 
     unload_shaders_bindump();
+    debugDumpUsers = 0;
+
+    shaderbindump::g_stub_texture_repo.shutdown();
   }
 };
 
@@ -910,5 +1309,9 @@ void startup_shaders(const char *src_filename, d3d::shadermodel::Version shader_
   shaders_rproc->fileName = src_filename;
   shaders_rproc->maxFshVer = shader_model_version;
 
+  IShaderBindumpReloadListener::reportStaticInitDone();
+
   add_restart_proc(shaders_rproc);
 }
+
+void shutdown_shaders() { del_restart_proc(shaders_rproc); }

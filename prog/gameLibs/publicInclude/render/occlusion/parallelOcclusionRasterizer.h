@@ -11,6 +11,8 @@
 #include <EASTL/fixed_function.h>
 
 #include <3d/dag_maskedOcclusionCulling.h>
+#include <generic/dag_tab.h>
+#include <memory/dag_framemem.h>
 #include <scene/dag_occlusion.h>
 #include <math/dag_frustum.h>
 #include <osApiWrappers/dag_cpuJobs.h>
@@ -18,21 +20,65 @@
 #include <perfMon/dag_statDrv.h>
 #include <util/dag_threadPool.h>
 #include <vecmath/dag_vecMathDecl.h>
+// SoA4 BLAS root handle for the RenderBlasSOA4 mode-2 path: only the dependency-free RootRef type,
+// so consumers of this header do not parse the SoA4 storage format.
+#include <daBVH/dag_swBLASRootRef.h>
 
 class Occlusion;
 
 class ParallelOcclusionRasterizer
 {
 public:
-  struct RasterizationTaskData
+  struct RasterizationTaskData //-V730
   {
     mat44f viewproj;
     vec3f bmin;
     vec3f bmax;
-    const float *verts;
-    const uint16_t *faces;
-    uint32_t tri_count;
+    // Two modes, picked at job time:
+    //   1) Legacy verts/faces: caller supplies a vertex array + uint16 index buffer for the slice
+    //      (raw triangle soup; the landmesh occluder). Rendered via RenderTriangles.
+    //   2) BLAS: caller supplies a pointer to vert21-packed BLAS data (vertOffset locates the vert21
+    //      stream within blasData) plus the tree to walk -- soa4Root or (treeStart, treeEnd), see
+    //      soa4Root below. The walker frustum-culls per BVH node and emits triangle indices into a
+    //      job-local cache RenderVert21TriList consumes. Used by the CollisionResource feeder for a
+    //      node's per-node chunk BLAS. blasData must outlive rasterizeMeshes -- safe because
+    //      CollisionResource chunks are resource-persistent.
+    //   verts != nullptr selects mode 1; else (blasData != nullptr) mode 2.
+    // tri_count is the exact triangle count for the slice in mode 1; in mode 2 it is the BLAS walker's
+    // triLimit cap. triSkip is the BLAS-order triangle offset for mode 2, non-zero only for the 2nd+
+    // slice of a BLAS partitioned by triangles_partition. doJob also uses tri_count to decide between
+    // the per-job static index cache and a framemem-backed buffer.
+    const float *verts = nullptr;
+    const uint16_t *faces = nullptr;
+    uint32_t tri_count = 0;
+    const uint8_t *blasData = nullptr;
+    uint32_t vertOffset = 0; // mode 2: byte offset of the vert21 stream within blasData (gather base = blasData + vertOffset)
+    uint32_t treeStart = 0;
+    uint32_t treeEnd = 0;
+    uint32_t triSkip = 0;
+    // Mode 2 walker select: a valid root walks the SoA4 tree (RenderBlasSOA4) over blasData/
+    // vertOffset and treeStart/treeEnd go unused; invalid (default) walks the stackless slice
+    // (treeStart, treeEnd) via RenderBlasStackless. The collision occluder feeder sets it for every
+    // chunk task (CollisionResource CPU trees are SoA4); stackless remains for non-collision feeds.
+    soa4::RootRef soa4Root;
   };
+
+  // Mode-2 BLAS walker dispatch, shared by doJob and callable by tests (testMocBLAS gates that each
+  // task shape reaches its own walker): a valid SoA4 root selects the SoA4 walk, otherwise the
+  // stackless treeStart/treeEnd walk. CACHE_INSUFFICIENT matches the job usage: walk-and-emit per call.
+  static void renderBlasTask(MaskedOcclusionCulling *occlusion, const RasterizationTaskData &task, uint32_t *index_cache,
+    uint32_t index_cache_capacity, uint32_t &tri_count, MaskedOcclusionCulling::BackfaceWinding bf_winding,
+    MaskedOcclusionCulling::ClipPlanes clip_planes)
+  {
+    if (task.soa4Root.valid())
+      occlusion->RenderBlasSOA4(task.blasData, (int)task.vertOffset, task.soa4Root, (float *)&task.viewproj, index_cache,
+        index_cache_capacity, tri_count, MaskedOcclusionCulling::CACHE_INSUFFICIENT, bf_winding, clip_planes, task.triSkip,
+        task.tri_count);
+    else
+      occlusion->RenderBlasStackless(task.blasData, (int)task.vertOffset, (int)task.treeStart, (int)task.treeEnd,
+        (float *)&task.viewproj, index_cache, index_cache_capacity, tri_count, MaskedOcclusionCulling::CACHE_INSUFFICIENT, bf_winding,
+        clip_planes, task.triSkip, task.tri_count);
+  }
 
 private:
   static constexpr int MAX_JOBS_COUNT = 6;
@@ -65,7 +111,13 @@ private:
       // Note: would be wake-up either by wake_up_all in `animchar_before_render_es` or `bvh_start_before_render_jobs_es`
       threadpool::add(this, prio, qpos, threadpool::AddFlags::None);
     }
-    const char *getJobName(bool &) const override { return "rasterizer_all_tasks"; }
+    const char *getJobName(bool &) const override { return DAPROFILER_STRING("rasterizer_all_tasks"); }
+    // Per-job triangle index cache, reused across BLAS-mode tasks. The feeder partitions tasks to
+    // triangles_partition slices so tri_count normally fits this static cap; a single unpartitioned
+    // BLAS slice could exceed it and falls back to a framemem-backed spill.
+    static constexpr int BLAS_TRI_CACHE_MAX = 4096;
+    alignas(16) uint32_t blasTriCache[BLAS_TRI_CACHE_MAX * 3];
+
     virtual void doJob() override
     {
       uint32_t taskId = context->processedTasks.fetch_add(1);
@@ -78,9 +130,35 @@ private:
         {
           auto clipPlanes =
             (ret == Frustum::INTERSECT) ? MaskedOcclusionCulling::CLIP_PLANE_ALL : MaskedOcclusionCulling::CLIP_PLANE_NONE;
-          occlusion->RenderTriangles(task.verts, task.faces, task.tri_count, (float *)&task.viewproj, context->backfaceWinding,
-            clipPlanes);
-          trianglesCount += task.tri_count;
+          if (task.verts)
+          {
+            // Legacy verts/faces path (raw triangle soup; landmesh occluder).
+            occlusion->RenderTriangles(task.verts, task.faces, task.tri_count, (float *)&task.viewproj, context->backfaceWinding,
+              clipPlanes);
+            trianglesCount += task.tri_count;
+          }
+          else if (task.blasData)
+          {
+            // BLAS-walk path: a CollisionResource node's per-node chunk BLAS. The walker
+            // frustum-culls and emits triangles
+            // directly to RenderVert21TriList -- no caller-side vert/face arrays, and blasData is
+            // persistent so it satisfies the async task lifetime a decoded scratch could not.
+            // CACHE_INSUFFICIENT = walk-and-emit on this call; triSkip/tri_count select this slice of
+            // the partitioned BLAS triangle range.
+            uint32_t triCount = 0;
+            uint32_t *indexCache = blasTriCache;
+            uint32_t indexCacheCap = (uint32_t)BLAS_TRI_CACHE_MAX;
+            dag::Vector<uint32_t, framemem_allocator, false> spillCache;
+            if (task.tri_count > indexCacheCap)
+            {
+              spillCache.resize(task.tri_count * 3);
+              indexCache = spillCache.data();
+              indexCacheCap = task.tri_count;
+            }
+            // SoA4-vs-stackless dispatch lives in renderBlasTask (shared with the testMocBLAS gate).
+            renderBlasTask(occlusion, task, indexCache, indexCacheCap, triCount, context->backfaceWinding, clipPlanes);
+            trianglesCount += triCount;
+          }
         }
         taskId = context->processedTasks.fetch_add(1);
       }
@@ -96,7 +174,7 @@ private:
     MaskedOcclusionCulling *occlusion = nullptr;
     void start(uint32_t &qpos) { threadpool::add(this, prio, qpos, threadpool::AddFlags::None); }
     void doJob() override { occlusion->ClearBuffer(); }
-    const char *getJobName(bool &) const override { return "clear_rasterizer_occlusion"; };
+    const char *getJobName(bool &) const override { return DAPROFILER_STRING("clear_rasterizer_occlusion"); };
   };
 
   struct MergingJob final : public cpujobs::IJob
@@ -120,7 +198,7 @@ private:
       quant = quant_;
       initialTile = mergedTiles.fetch_add(quant, dag::memory_order_relaxed);
     }
-    const char *getJobName(bool &) const override { return "merge_occlusion"; }
+    const char *getJobName(bool &) const override { return DAPROFILER_STRING("merge_occlusion"); }
     virtual void doJob() override
     {
       for (uint32_t startTile = initialTile; startTile < endTile; startTile = mergedTiles.fetch_add(quant))
@@ -143,7 +221,7 @@ public:
     MaskedOcclusionCulling::BackfaceWinding backface_winding = MaskedOcclusionCulling::BACKFACE_CW,
     eastl::fixed_function<sizeof(void *) * 3, void()> &&done_cb = {});
   // Merge rasterized geometry
-  uint32_t mergeRasterizationResults(Occlusion &occlusion);
+  uint32_t mergeRasterizationResults(Occlusion &occlusion, bool active_wait = true);
 
   void waitRasterizeJobs()
   {

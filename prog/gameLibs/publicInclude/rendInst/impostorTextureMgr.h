@@ -13,6 +13,7 @@
 #include <shaders/dag_overrideStateId.h>
 #include <shaders/dag_postFxRenderer.h>
 #include <util/dag_stdint.h>
+#include <rendInst/renderPass.h>
 
 #include <EASTL/unique_ptr.h>
 
@@ -79,16 +80,16 @@ public:
   void generate_mask(const Point3 &point_to_eye, RenderableInstanceLodsResource *res, DeferredRenderTarget *rt, Texture *mask_tex,
     int lod = -1);
   void render_slice_octahedral(uint32_t h, uint32_t v, const TMatrix &view_to_content, const GenerationData &gen_data,
-    RenderableInstanceLodsResource *res, int block_id, int lod = -1);
-  void render_instances(const TMatrix &view_to_world, float scale_x, float scale_y, float zn, float zf,
-    RenderableInstanceLodsResource *res, dag::Span<TMatrix> placement, int block_id, int lod = -1);
-  void render_slice_billboard(uint32_t sliceId, const TMatrix &view_to_content, RenderableInstanceLodsResource *res, int block_id,
-    int lod = -1);
+    RenderableInstanceLodsResource *res, rendinst::RenderPass render_pass, int block_id, int lod = -1);
+  void render_slice_billboard(uint32_t sliceId, const TMatrix &view_to_content, RenderableInstanceLodsResource *res,
+    rendinst::RenderPass render_pass, int block_id, int lod = -1);
+  void render_slice_voxels(const TMatrix &view_to_model, float width, float height, float zn, float zf,
+    RenderableInstanceLodsResource *res, rendinst::RenderPass render_pass, int block_id, int lod = 0);
   void generate_mask_billboard(uint32_t sliceId, RenderableInstanceLodsResource *res, DeferredRenderTarget *rt, Texture *mask_tex,
     int lod = -1);
   void generate_mask_octahedral(uint32_t h, uint32_t v, const GenerationData &gen_data, RenderableInstanceLodsResource *res,
     DeferredRenderTarget *rt, Texture *mask_tex, int lod = -1);
-  void start_rendering_slices(DeferredRenderTarget *rt);
+  void start_rendering_slices(DeferredRenderTarget *rt, bool is_voxel = false);
   void start_rendering_branches(Texture *rt);
   void end_rendering_slices();
 
@@ -100,24 +101,26 @@ public:
   int getPreferredShadowAtlasMipOffset() const;
 
   void setTreeCrownDataBuf(Sbuffer *buf) { treeCrownDataBuf = buf; }
+  void buildRendinstElems();
+  void afterDeviceReset();
 
 private:
   shaders::UniqueOverrideStateId impostorShaderState;
+  shaders::UniqueOverrideStateId impostorVoxelShaderState;
   PostFxRenderer impostorMaskShader;
   PostFxRenderer impostorShadowShader;
 
   eastl::unique_ptr<BcCompressor> shadowAtlasCompressor;
   UniqueTex impostorCompressionBuffer;
-  d3d::SamplerHandle sampler;
   Sbuffer *treeCrownDataBuf = nullptr;
   int treeCrownBufSlot = -1;
 
-  void render(const Point3 &point_to_eye, const TMatrix &post_view_tm, RenderableInstanceLodsResource *res, int block_id,
-    int lod) const;
+  UniqueBuf rendinstMatrixBuf;
+
+  void render(const Point3 &point_to_eye, const TMatrix &post_view_tm, RenderableInstanceLodsResource *res,
+    rendinst::RenderPass render_pass, int block_id, int lod) const;
 
   static bool prefer_bc_compression();
-
-  friend void impostor_texture_mgr_after_reset(bool);
 };
 
 void init_impostor_texture_mgr();

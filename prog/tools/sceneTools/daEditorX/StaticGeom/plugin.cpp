@@ -9,6 +9,7 @@
 #include <de3_occludersFromGeom.h>
 #include <de3_entityFilter.h>
 
+#include <EditorCore/ec_editorCommandSystem.h>
 #include <EditorCore/ec_IEditorCore.h>
 #include <EditorCore/ec_wndPublic.h>
 
@@ -50,6 +51,15 @@ enum
   CM_RESET_GEOMETRY,
 };
 
+namespace EditorCommandIds
+{
+
+static constexpr const char *IMPORT_WITHOUT_TEX = "Plugin.SGeometry.ImportDAG";
+static constexpr const char *DAG_OPTIMIZE = "Plugin.SGeometry.OptimizeDAG";
+static constexpr const char *RESET_GEOMETRY = "Plugin.SGeometry.EraseGeometry";
+
+} // namespace EditorCommandIds
+
 
 StaticGeometryPlugin::StaticGeometryPlugin() : doResetGeometry(false), geom(NULL), loadingFailed(false)
 {
@@ -83,39 +93,53 @@ void StaticGeometryPlugin::setVisible(bool vis)
 
 
 //==============================================================================
+void StaticGeometryPlugin::registerEditorCommands(IEditorCommandSystem &command_system)
+{
+  command_system.addCommand(EditorCommandIds::IMPORT_WITHOUT_TEX, ImGuiMod_Ctrl | ImGuiKey_O);
+  command_system.addCommand(EditorCommandIds::DAG_OPTIMIZE);
+  command_system.addCommand(EditorCommandIds::RESET_GEOMETRY);
+}
+
+
+//==============================================================================
 void StaticGeometryPlugin::registerMenuAccelerators()
 {
   IWndManager &wndManager = *DAGORED2->getWndManager();
-  wndManager.addViewportAccelerator(CM_IMPORT_WITHOUT_TEX, ImGuiMod_Ctrl | ImGuiKey_O);
+  wndManager.addViewportAccelerator(CM_IMPORT_WITHOUT_TEX, EditorCommandIds::IMPORT_WITHOUT_TEX);
+  wndManager.addViewportAccelerator(CM_DAG_OPTIMIZE, EditorCommandIds::DAG_OPTIMIZE);
+  wndManager.addViewportAccelerator(CM_RESET_GEOMETRY, EditorCommandIds::RESET_GEOMETRY);
 }
 
 
 //==============================================================================
 bool StaticGeometryPlugin::begin(int toolbar_id, unsigned menu_id)
 {
+  IEditorCommandSystem *commandSystem = DAGORED2->queryEditorInterface<IEditorCommandSystem>();
+  G_ASSERT(commandSystem);
+
   // menu
 
   PropPanel::IMenu *mainMenu = DAGORED2->getMainMenu();
 
-  mainMenu->addItem(menu_id, CM_IMPORT_WITHOUT_TEX, "Import DAG...\tCtrl+O");
-  mainMenu->addItem(menu_id, CM_DAG_OPTIMIZE, "Optimize DAG");
+  commandSystem->addMenuItem(*mainMenu, menu_id, CM_IMPORT_WITHOUT_TEX, EditorCommandIds::IMPORT_WITHOUT_TEX, "Import DAG...");
+  commandSystem->addMenuItem(*mainMenu, menu_id, CM_DAG_OPTIMIZE, EditorCommandIds::DAG_OPTIMIZE, "Optimize DAG");
   mainMenu->addSeparator(menu_id);
-  mainMenu->addItem(menu_id, CM_RESET_GEOMETRY, "Erase geometry");
+  commandSystem->addMenuItem(*mainMenu, menu_id, CM_RESET_GEOMETRY, EditorCommandIds::RESET_GEOMETRY, "Erase geometry");
 
   // toolbar
   PropPanel::ContainerPropertyControl *toolbar = DAGORED2->getCustomPanel(toolbar_id);
   G_ASSERT(toolbar);
   toolbar->setEventHandler(this);
 
-  PropPanel::ContainerPropertyControl *tool = toolbar->createToolbarPanel(CM_TOOL, "");
+  PropPanel::ContainerPropertyControl *tool = toolbar->createToolbarPanel(CM_TOOL);
 
-  tool->createButton(CM_IMPORT_WITHOUT_TEX, "Import DAG (Ctrl+O)");
+  commandSystem->createToolbarButton(*tool, CM_IMPORT_WITHOUT_TEX, EditorCommandIds::IMPORT_WITHOUT_TEX, "Import DAG");
   tool->setButtonPictures(CM_IMPORT_WITHOUT_TEX, "import_dag");
 
-  tool->createButton(CM_DAG_OPTIMIZE, "Optimize DAG");
+  commandSystem->createToolbarButton(*tool, CM_DAG_OPTIMIZE, EditorCommandIds::DAG_OPTIMIZE, "Optimize DAG");
   tool->setButtonPictures(CM_DAG_OPTIMIZE, "dag_optimize");
   tool->createSeparator(0);
-  tool->createButton(CM_RESET_GEOMETRY, "Erase geometry");
+  commandSystem->createToolbarButton(*tool, CM_RESET_GEOMETRY, EditorCommandIds::RESET_GEOMETRY, "Erase geometry");
   tool->setButtonPictures(CM_RESET_GEOMETRY, "clear");
 
   return true;
@@ -183,6 +207,7 @@ void StaticGeometryPlugin::renderGeometry(Stage stage)
       dagGeom->geomObjectRender(*geom);
       // dagGeom->geomObjectRenderTrans(*geom);
       break;
+    default: break;
   }
 }
 
@@ -492,23 +517,6 @@ bool StaticGeometryPlugin::traceRay(const Point3 &p, const Point3 &dir, real &ma
     return false;
 
   return dagGeom->geomObjectTraceRay(*geom, p, dir, maxt, norm);
-}
-
-
-bool StaticGeometryPlugin::shadowRayHitTest(const Point3 &p, const Point3 &dir, real maxt)
-{
-  if (maxt <= 0)
-    return false;
-
-  if (!loaded)
-  {
-    loadGeometry();
-
-    if (loadingFailed)
-      return false;
-  }
-
-  return dagGeom->geomObjectShadowRayHitTest(*geom, p + dir * maxt, -dir, maxt);
 }
 
 

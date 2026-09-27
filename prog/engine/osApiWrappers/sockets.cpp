@@ -261,7 +261,7 @@ int os_socket_send(os_socket_t s, const char *buf, int len, int flags) { return 
 int os_socket_set_option(os_socket_t s, OsSocketOption option, intptr_t value)
 {
   int r = 0;
-  switch (option)
+  switch (option) //-V785 OsSocketOption has a single value for now
   {
     case OSO_NONBLOCK:
     {
@@ -383,7 +383,7 @@ int os_socket_enable_keepalive(os_socket_t socket, bool keep_alive)
 
 int os_socket_error(os_socket_t s)
 {
-  int val;
+  int val = 0;
   socklen_t vallen = sizeof(val);
   getsockopt(s, SOL_SOCKET, SO_ERROR, (SockOptArg)&val, &vallen);
   return val;

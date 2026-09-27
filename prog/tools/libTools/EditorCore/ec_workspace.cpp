@@ -7,6 +7,8 @@
 #include <generic/dag_sort.h>
 #include <libTools/util/fileUtils.h>
 #include <libTools/util/strUtil.h>
+#include <libTools/util/setupNamedMounts.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <libTools/containers/tab_sort.h>
 #include <coolConsole/coolConsole.h>
 
@@ -17,8 +19,43 @@
 
 #include <winGuiWrapper/wgw_dialogs.h>
 
+// The one canonical form of an application.blk path, so that a search, a load and a save cannot disagree.
+static String canonical_app_blk_path(const char *path)
+{
+  String canonicalPath = make_path_absolute(path);
+  simplify_fname(canonicalPath);
+  return canonicalPath;
+}
+
+static String get_wsp_app_blk_path(const DataBlock &wsp_blk)
+{
+  String path(wsp_blk.getStr("application_path", ""));
+  if (path.empty())
+  {
+    const char *dir = wsp_blk.getStr("application_dir", "");
+    if (!*dir)
+      return String();
+
+    path = ::make_full_path(dir, "application.blk");
+  }
+
+  return canonical_app_blk_path(path);
+}
+
+static const char *make_short_name(const char *fpath)
+{
+  const char *fn = dd_get_fname(fpath);
+  if (!fn || fn == fpath)
+    return fpath;
+  fn--;
+  while (fn > fpath && *(fn - 1) != '/')
+    fn--;
+  return fn;
+}
+
 //==================================================================================================
-EditorWorkspace::EditorWorkspace() : deDisabled(midmem), reDisabled(midmem), wspData(NULL), platforms(midmem), maxTraceDistance(1000.0)
+EditorWorkspace::EditorWorkspace() :
+  deDisabled(midmem), reDisabled(midmem), wspData(NULL), platforms(midmem), maxTraceDistance(1000.0), useDngBasedSceneRender(false)
 {}
 
 
@@ -39,6 +76,7 @@ bool EditorWorkspace::initWorkspaceBlk(const char *path)
 
   if (!dd_file_exist(path))
   {
+    dd_mkpath(path);
     wspData->blk.saveToTextFile(path);
   }
 
@@ -84,7 +122,7 @@ void EditorWorkspace::freeWorkspaceBlk() { del_it(wspData); }
 //==================================================================================================
 void EditorWorkspace::getWspNames(Tab<String> &list) const
 {
-  G_ASSERT(wspData);
+  G_ASSERT_RETURN(wspData, );
 
   list.resize(wspData->names.size());
 
@@ -96,6 +134,123 @@ void EditorWorkspace::getWspNames(Tab<String> &list) const
     list[i++] = key;
 
   sort(list, &tab_sort_stringsi);
+}
+
+
+//==================================================================================================
+void EditorWorkspace::getWspNamesByAppBlkPath(const char *app_blk_path, Tab<String> &list) const
+{
+  list.clear();
+
+  G_ASSERT_RETURN(wspData, );
+
+  const String path = canonical_app_blk_path(app_blk_path);
+
+  String wspName;
+  DataBlock *wspBlk;
+
+  for (bool ok = wspData->names.getFirst(wspName, wspBlk); ok; ok = wspData->names.getNext(wspName, wspBlk))
+  {
+    const String wspPath = get_wsp_app_blk_path(*wspBlk);
+
+    if (!wspPath.empty() && ::dag_path_compare(wspPath, path) == 0)
+      list.push_back(wspName);
+  }
+
+  sort(list, &tab_sort_stringsi);
+}
+
+
+//==================================================================================================
+eastl::optional<String> EditorWorkspace::getWspNameByAppBlkPathIfOnlyOneMatches(const char *app_blk_path, String &error_message) const
+{
+  Tab<String> names;
+  getWspNamesByAppBlkPath(app_blk_path, names);
+
+  if (names.size() > 1)
+  {
+    String nameList;
+    for (const String &name : names)
+      nameList.aprintf(0, nameList.empty() ? "\"%s\"" : ", \"%s\"", name.str());
+
+    error_message.printf(0,
+      "Cannot tell which workspace to use for\n\"%s\"\n\n"
+      "The workspaces %s all use it.\n\n"
+      "Start with \"-ws:<name>\" alone, or remove the workspaces you do not need.",
+      app_blk_path, nameList);
+    return eastl::nullopt;
+  }
+
+  error_message.clear();
+  return names.empty() ? String() : names[0];
+}
+
+
+//==================================================================================================
+String EditorWorkspace::addWspForAppBlkPath(const char *app_blk_path, String &error_message)
+{
+  if (!wspData)
+  {
+    error_message = "The workspace file has not been loaded.";
+    return String();
+  }
+
+  const String path = canonical_app_blk_path(app_blk_path);
+  if (!::dd_file_exist(path))
+  {
+    error_message.printf(0, "Cannot add a workspace for \"%s\". The file does not exist.", path);
+    return String();
+  }
+
+  const String wspName = get_workspace_name_from_application_blk_path(path);
+  if (wspName.empty())
+  {
+    error_message.printf(0, "Cannot add a workspace for \"%s\". Cannot detect the workspace name to use.", path);
+    return String();
+  }
+
+  // One application.blk gets one workspace.
+  Tab<String> pathOwners;
+  getWspNamesByAppBlkPath(path, pathOwners);
+  if (!pathOwners.empty())
+  {
+    error_message.printf(0, "Cannot add a workspace for \"%s\". The workspace \"%s\" already uses it.", path, pathOwners[0]);
+    return String();
+  }
+
+  DataBlock *existingName;
+  if (wspData->names.get(wspName, existingName))
+  {
+    const char *existingPath = existingName->getStr("application_path", existingName->getStr("application_dir", ""));
+    error_message.printf(0,
+      "Cannot add a workspace for \"%s\". A workspace named \"%s\" already exists, but uses a different path: \"%s\".", path, wspName,
+      existingPath);
+    return String();
+  }
+
+  // A failed load must not leave a workspace registered, so validate before save().
+  if (!loadIndirect(path))
+  {
+    error_message.printf(0, "Cannot add a workspace for \"%s\". Loading the file has failed.", path);
+    return String();
+  }
+
+  setName(wspName);
+
+  if (!save())
+  {
+    setName("");
+    error_message.printf(0, "Cannot add workspace \"%s\" for \"%s\". Saving \"%s\" has failed.", wspName, path, blkPath);
+    return String();
+  }
+
+  // wspData is this instance's view of the file, and save() does not touch it, so we have to update it.
+  DataBlock *addedBlk = findWspBlk(wspData->blk, wspName, true);
+  if (writeWspBlk(*addedBlk))
+    wspData->names.add(wspName, addedBlk);
+
+  error_message.clear();
+  return wspName;
 }
 
 
@@ -140,8 +295,11 @@ bool EditorWorkspace::loadIndirect(const char *app_blk_path)
     applicationDir = make_path_absolute(applicationDir);
     G_ASSERT(!applicationDir.empty());
     append_slash(applicationDir);
+    simplify_fname(applicationDir);
 
-    appBlk.setStr("application_path", app_blk_path);
+    String appicationBlkPath(app_blk_path);
+    simplify_fname(appicationBlkPath);
+    appBlk.setStr("application_path", appicationBlkPath);
     appBlk.setStr("application_dir", applicationDir);
 
     return loadFromBlk(appBlk);
@@ -159,30 +317,24 @@ bool EditorWorkspace::loadFromBlk(DataBlock &blk, bool *app_path_set)
   reDisabled.clear();
 
   appDir = blk.getStr("application_dir", "");
-  appPath = blk.getStr("application_path", "");
-  if (appDir.length() && !appPath.length())
-    appPath = ::make_full_path(appDir, "application.blk");
-
-  if (!appPath.length() || !::dd_file_exist(appPath))
-  {
-    ::debug("Application settings not exist or not specified for workspace \"%s\"", (const char *)name);
-  }
-
-  String appBlkPath = appPath;
+  simplify_fname(appDir);
+  appBlkPath = get_wsp_app_blk_path(blk);
+  set_canonical_app_dir_mount(appDir);
 
   if (!::dd_file_exist(appBlkPath))
   {
-    ::debug("Couldn't open file \"%s\"", (const char *)appBlkPath);
+    debug("Cannot open the application.blk of workspace \"%s\": \"%s\"", (const char *)name, appBlkPath);
     return false;
   }
 
-  DataBlock appBlk;
+  appBlkShortName = make_short_name(appBlkPath);
 
+  DataBlock appBlk;
   if (!appBlk.load(appBlkPath))
   {
-    ::debug("Errors while loading \"%s\"", (const char *)appBlkPath);
+    debug("Errors while loading \"%s\"", appBlkPath);
     wingw::message_box(0, "Workspace initialization failed", "Errors while loading \"%s\". Workspace initialization failed",
-      (const char *)appBlkPath);
+      appBlkPath);
 
     return false;
   }
@@ -196,14 +348,12 @@ bool EditorWorkspace::loadFromBlk(DataBlock &blk, bool *app_path_set)
     return false;
   }
 
-  sdkDir = ::make_full_path(appDir, sdkBlk->getStr("sdk_folder", ""));
-  libDir = ::make_full_path(appDir, sdkBlk->getStr("lib_folder", ""));
-  levelsDir = ::make_full_path(appDir, sdkBlk->getStr("levels_folder", ""));
-  resDir = ::make_full_path(appDir, sdkBlk->getStr("resource_database_folder", ""));
-  scriptDir = ::make_full_path(appDir, sdkBlk->getStr("script_scheme_folder", ""));
-
-  const char *asd = sdkBlk->getStr("asset_script_scheme_folder", NULL);
-  assetScriptsDir = (asd) ? ::make_full_path(appDir, asd) : "";
+  make_eff_app_relative_path(sdkDir, sdkBlk->getStr("sdk_folder", ""), true);
+  make_eff_app_relative_path(libDir, sdkBlk->getStr("lib_folder", ""), true);
+  make_eff_app_relative_path(levelsDir, sdkBlk->getStr("levels_folder", ""), true);
+  make_eff_app_relative_path(resDir, sdkBlk->getStr("resource_database_folder", ""), true);
+  make_eff_app_relative_path(scriptDir, sdkBlk->getStr("script_scheme_folder", ""), true);
+  make_eff_app_relative_path(assetScriptsDir, sdkBlk->getStr("asset_script_scheme_folder", nullptr), true);
 
   const DataBlock *gameBlk = appBlk.getBlockByName("game");
 
@@ -215,12 +365,10 @@ bool EditorWorkspace::loadFromBlk(DataBlock &blk, bool *app_path_set)
     return false;
   }
 
-  gameDir = ::make_full_path(appDir, gameBlk->getStr("game_folder", ""));
-
-  levelsBinDir = ::make_full_path(appDir, gameBlk->getStr("levels_bin_folder", ""));
-  const char *tmp = gameBlk->getStr("physmat", "/game/config/physmat.blk");
-  physmatPath = (tmp && tmp[0]) ? ::make_full_path(appDir, tmp) : "";
-  scriptLibrary = ::make_full_path(appDir, gameBlk->getStr("script_objects", ""));
+  make_eff_app_relative_path(gameDir, gameBlk->getStr("game_folder", ""));
+  make_eff_app_relative_path(levelsBinDir, gameBlk->getStr("levels_bin_folder", ""));
+  physmatPath = make_eff_app_relative_path(gameBlk->getStr("physmat", "game/config/physmat.blk"));
+  make_eff_app_relative_path(scriptLibrary, gameBlk->getStr("script_objects", ""));
 
   const DataBlock *deDisabledBlk = appBlk.getBlockByName("dagored_disabled_plugins");
 
@@ -266,9 +414,23 @@ bool EditorWorkspace::loadFromBlk(DataBlock &blk, bool *app_path_set)
   if (paramsBlk)
     maxTraceDistance = paramsBlk->getReal("maxTraceDistance", 1000.0);
 
+  const DataBlock *gameSettingBlk = appBlk.getBlockByName("game");
+  if (gameSettingBlk)
+    useDngBasedSceneRender = gameSettingBlk->getBool("daNetGameEditorRender", false);
+
   collisionName = appBlk.getStr("collision", "Bullet");
   if (stricmp(collisionName, "unigine") == 0)
     collisionName = "Bullet";
+
+  make_eff_app_relative_path(sceneDir, appBlk.getBlockByNameEx("projectDefaults")
+                                         ->getBlockByNameEx("locationScene")
+                                         ->getStr("locationSceneFolder", "prog/gamebase/gamedata/scenes"));
+
+  mountPoints.clear();
+  if (const DataBlock *mnt = appBlk.getBlockByName("mountPoints"))
+  {
+    dblk::iterate_child_blocks(*mnt, [this](const DataBlock &b) { mountPoints.push_back(String{b.getBlockName()}); });
+  }
 
   if (!loadAppSpecific(appBlk))
     return false;
@@ -314,18 +476,22 @@ bool EditorWorkspace::save()
   if (!blk.load(blkPath))
     return false;
 
-  if (name && *name)
+  if (!name.empty())
   {
-    DataBlock *wspSaveBlk = findWspBlk(blk, name, true);
-
-    wspSaveBlk->setStr("name", name);
-    wspSaveBlk->setStr("application_dir", appDir);
-    wspSaveBlk->setStr("application_path", appPath);
-
-    if (!saveSpecific(*wspSaveBlk))
+    if (!writeWspBlk(*findWspBlk(blk, name, true)))
       return false;
   }
   return blk.saveToTextFile(blkPath);
+}
+
+
+//==================================================================================================
+bool EditorWorkspace::writeWspBlk(DataBlock &wsp_blk)
+{
+  wsp_blk.setStr("name", name);
+  wsp_blk.setStr("application_dir", appDir);
+  wsp_blk.setStr("application_path", appBlkPath);
+  return saveSpecific(wsp_blk);
 }
 
 
@@ -358,9 +524,10 @@ void EditorWorkspace::setAppPath(const char *new_path)
 {
   if (::dd_file_exist(new_path))
   {
-    appPath = new_path;
+    appBlkPath = canonical_app_blk_path(new_path);
     appDir = new_path;
     ::location_from_path(appDir);
+    appBlkShortName = make_short_name(appBlkPath);
   }
 }
 
@@ -401,4 +568,11 @@ DataBlock *EditorWorkspace::findWspBlk(DataBlock &blk, const char *wsp_name, boo
   }
 
   return retBlk;
+}
+
+String get_workspace_name_from_application_blk_path(const char *app_blk_path)
+{
+  String appDir, appBlkName;
+  split_path(app_blk_path, appDir, appBlkName);
+  return String(get_file_name(appDir));
 }

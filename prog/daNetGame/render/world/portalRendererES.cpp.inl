@@ -1,13 +1,13 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <daECS/core/coreEvents.h>
-#include <ecs/core/entityManager.h>
 #include <daECS/core/entitySystem.h>
 #include <daECS/core/entityManager.h>
 #include <daECS/core/componentTypes.h>
 #include <ecs/render/updateStageRender.h>
+#include <game/gameEvents.h>
 
-#include <render/world/animCharRenderAdditionalData.h>
+#include <render/dynmodelRenderer/animCharRenderAdditionalData.h>
 
 #include <render/world/portalRenderer.h>
 #include <shaders/portal_render.hlsli>
@@ -17,19 +17,26 @@ ECS_REGISTER_BOXED_TYPE(PortalRenderer, nullptr)
 
 
 template <typename Callable>
-static void get_portal_renderer_manager_ecs_query(ecs::EntityId, Callable);
+static void get_portal_renderer_manager_ecs_query(ecs::EntityManager &manager, ecs::EntityId, Callable);
 
 
 PortalRenderer *portal_renderer_mgr::query_portal_renderer()
 {
   PortalRenderer *result = nullptr;
-  get_portal_renderer_manager_ecs_query(g_entity_mgr->getSingletonEntity(ECS_HASH("portal_renderer_manager")),
+  get_portal_renderer_manager_ecs_query(*g_entity_mgr, g_entity_mgr->getSingletonEntity(ECS_HASH("portal_renderer_manager")),
     [&](PortalRenderer &portal_renderer) { result = &portal_renderer; });
 
   // if (!result)
   //   logerr("PortalRenderer not found");
 
   return result;
+}
+
+
+ECS_TAG(render)
+static inline void portal_wait_visibility_job_es(const EventWaitBeforeAct &, const PortalRenderer &portal_renderer)
+{
+  portal_renderer.waitVisibilityJob();
 }
 
 

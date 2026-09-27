@@ -5,6 +5,7 @@
 #include <de3_entityPool.h>
 #include <de3_entityFilter.h>
 #include <de3_lightService.h>
+#include <de3_lodController.h>
 #include <de3_baseInterfaces.h>
 #include <de3_writeObjsToPlaceDump.h>
 #include <de3_entityUserData.h>
@@ -62,7 +63,7 @@ public:
     clear_and_shrink(scenes);
     if (pd)
     {
-      release_game_resource((GameResource *)(DynamicPhysObjectData *)pd);
+      release_game_resource_ex(pd, PhysObjGameResClassId);
       pd = NULL;
     }
     del_it(userDataBlk);
@@ -92,7 +93,7 @@ public:
     const char *name = asset.getName();
     assetNameId = asset.getNameId();
 
-    pd = (DynamicPhysObjectData *)::get_one_game_resource_ex(GAMERES_HANDLE_FROM_STRING(name), PhysObjGameResClassId);
+    pd = (DynamicPhysObjectData *)::get_one_game_resource_ex(name, PhysObjGameResClassId);
     if (!pd)
     {
       DAEDITOR3.conError("cannot load physObj: %s", name);
@@ -108,7 +109,7 @@ public:
 
     if (!cnt)
     {
-      release_game_resource((GameResource *)(DynamicPhysObjectData *)pd);
+      release_game_resource_ex(pd, PhysObjGameResClassId);
       pd = NULL;
       return;
     }
@@ -155,21 +156,22 @@ public:
   SmallTab<DynamicRenderableSceneInstance *, MidmemAlloc> scenes;
 };
 
-class PhysObjEntity : public VirtualPhysObjEntity, public IRandomSeedHolder
+class PhysObjEntity : public VirtualPhysObjEntity, public IRandomSeedHolder, public ILodController
 {
 public:
-  PhysObjEntity(int cls) : VirtualPhysObjEntity(cls), idx(MAX_ENTITIES), nodeTree(NULL) { tm.identity(); }
+  PhysObjEntity(int cls) : VirtualPhysObjEntity(cls), idx(MAX_ENTITIES) { tm.identity(); }
   ~PhysObjEntity() { clear(); }
 
   void *queryInterfacePtr(unsigned huid) override
   {
     RETURN_INTERFACE(huid, IRandomSeedHolder);
+    RETURN_INTERFACE(huid, ILodController);
     return NULL;
   }
 
   void clear()
   {
-    del_it(nodeTree);
+    nodeTree.reset();
     VirtualPhysObjEntity::clear();
   }
 
@@ -234,7 +236,7 @@ public:
   void setup(const DagorAsset &asset)
   {
     VirtualPhysObjEntity::setup(asset);
-    nodeTree = pd && pd->nodeTree ? new GeomNodeTree(*pd->nodeTree) : NULL;
+    nodeTree.reset(pd && pd->nodeTree ? GeomNodeTree::make(*pd->nodeTree) : nullptr);
   }
 
   void copyFrom(const PhysObjEntity &e)
@@ -247,8 +249,8 @@ public:
     bsph = e.bsph;
 
     nameId = e.nameId;
-    game_resource_add_ref((GameResource *)(DynamicPhysObjectData *)pd);
-    nodeTree = pd->nodeTree ? new GeomNodeTree(*pd->nodeTree) : NULL;
+    game_resource_add_ref_ex(pd, PhysObjGameResClassId);
+    nodeTree.reset(pd->nodeTree ? GeomNodeTree::make(*pd->nodeTree) : nullptr);
 
     clear_and_resize(scenes, e.scenes.size());
     for (int i = 0, cnt = 0; i < pd->models.size(); i++)
@@ -264,6 +266,18 @@ public:
   {
     for (int n = 0; n < scenes.size(); n++)
       scenes[n]->chooseLodByDistSq(lengthSq(grs_cur_view.pos - tm.getcol(3)));
+
+    auto rs = EDITORCORE->queryEditorInterface<IDynRenderService>();
+    if (rs && rs->getRenderType() == IDynRenderService::RTYPE_DNG_BASED)
+    {
+      for (int i = 0; i < scenes.size(); i++)
+        for (uint32_t n = 0; n < scenes[i]->getNodeCount(); ++n)
+        {
+          TMatrix wtm = scenes[i]->getNodeWtm(n);
+          wtm.setcol(3, wtm.getcol(3) - ::grs_cur_view.pos);
+          scenes[i]->setPrevNodeWtm(n, wtm);
+        }
+    }
   }
   void render(IDynRenderService *rs, IRenderingService::Stage stage)
   {
@@ -330,6 +344,28 @@ public:
   void setPerInstanceSeed(int seed) override { instanceSeed = seed; }
   int getPerInstanceSeed() override { return instanceSeed; }
 
+  // ILodController
+  int getLodCount() override { return scenes.empty() ? 0 : scenes[0]->getLodsCount(); }
+
+  void setCurLod(int lod_n) override
+  {
+    for (DynamicRenderableSceneInstance *scene : scenes)
+    {
+      const int lodCount = scene->getLodsCount();
+      const int finalLod = (lod_n >= 0 && lodCount > 1) ? clamp(lod_n, 0, lodCount - 1) : -1;
+      scene->setLod(finalLod);
+    }
+  }
+
+  real getLodRange(int lod_n) override { return scenes.empty() ? 0.0 : scenes[0]->getLodsResource()->lods[lod_n].range; }
+
+  // no named node support
+  int getNamedNodeCount() override { return 0; }
+  const char *getNamedNode(int idx) override { return nullptr; }
+  int getNamedNodeIdx(const char *nm) override { return -1; }
+  bool getNamedNodeVisibility(int idx) override { return true; }
+  void setNamedNodeVisibility(int idx, bool vis) override {}
+
 public:
   enum
   {
@@ -338,7 +374,7 @@ public:
 
   unsigned idx;
   TMatrix tm;
-  GeomNodeTree *nodeTree;
+  GeomNodeTreeUniquePtr nodeTree;
   int instanceSeed = 0;
 };
 
@@ -372,7 +408,7 @@ public:
   void renderService() override
   {
     int subtypeMask = IObjEntityFilter::getSubTypeMask(IObjEntityFilter::STMASK_TYPE_RENDER);
-    uint64_t lh_mask = IObjEntityFilter::getLayerHiddenMask();
+    const LayerHiddenMask lh_mask = IObjEntityFilter::getLayerHiddenMask();
     if (subtypeMask & collisionSubtypeMask)
     {
       dag::ConstSpan<PhysObjEntity *> ent = objPool.getEntities();
@@ -399,7 +435,7 @@ public:
   void renderGeometry(Stage stage) override
   {
     int st_mask = IObjEntityFilter::getSubTypeMask(IObjEntityFilter::STMASK_TYPE_RENDER);
-    uint64_t lh_mask = IObjEntityFilter::getLayerHiddenMask();
+    const LayerHiddenMask lh_mask = IObjEntityFilter::getLayerHiddenMask();
     if ((st_mask & rendEntGeomMask) != rendEntGeomMask)
       return;
 

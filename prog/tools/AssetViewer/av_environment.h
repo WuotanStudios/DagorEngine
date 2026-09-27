@@ -10,6 +10,7 @@
 
 struct SunLightProps;
 struct Color4;
+class IModelessWindowController;
 class IObjEntity;
 class BaseTexture;
 class DagorAsset;
@@ -73,8 +74,7 @@ public:
 
 namespace environment
 {
-void show_environment_settings(void *handle, AssetLightData *ald);
-void close_environment_settings_dialog();
+IModelessWindowController *get_environment_settings_dialog_controller();
 void load_settings(DataBlock &blk, AssetLightData *ald, const AssetLightData *ald_def, bool &rend_grid);
 void save_settings(DataBlock &blk, AssetLightData *ald, const AssetLightData *ald_def, bool &rend_grid);
 
@@ -83,6 +83,7 @@ void save_skies_settings(DataBlock &blk);
 
 void renderEnvironment(bool ortho);
 void renderEnviEntity(AssetLightData &ald);
+void destroyEnviEntity(AssetLightData &ald);
 void clear();
 
 const char *getEnviTitleStr(AssetLightData *ald);
@@ -94,4 +95,6 @@ E3DCOLOR getSinglePaintColor();
 void updatePaintColorTexture();
 
 void on_asset_changed(const DagorAsset &asset, AssetLightData &ald);
+void before_render_objects();
+void after_d3d_reset(bool full_reset);
 }; // namespace environment

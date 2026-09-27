@@ -20,18 +20,19 @@
 #include <resourcePool/resourcePool.h>
 #include <3d/dag_textureIDHolder.h>
 #include <render/toroidalHelper.h>
-#include <render/clusteredLights.h>
+#include <voxelizedMedia/rendInstMediaVolumes.h>
+#include <render/lights/clusteredLights.h>
 #include <rendInst/rendInstExtra.h>
 #include <landMesh/lmeshCulling.h>
-#include "gpuDeformObjects.h"
+#include <render/gpuDeformObjects.h>
 #include <EASTL/unique_ptr.h>
+#include <EASTL/vector_map.h>
 #include <scene/dag_occlusion.h>
 #include <shaders/dag_overrideStateId.h>
-#include <mutex>
 #include <render/world/fomShadowsManager.h>
 #include <render/world/deformHeightmap.h>
 #include <render/world/rendInstHeightmap.h>
-#include <render/world/mobileDeferredResources.h>
+#include <render/world/waterRenderMode.h>
 #include <render/gpuVisibilityTest.h>
 #include <ioSys/dag_dataBlock.h>
 #include <render/fx/fx.h>
@@ -42,19 +43,22 @@
 #include <render/world/frameGraphNodes/motionBlurNode.h>
 #include <render/world/cameraViewVisibilityManager.h>
 #include <render/deferredRenderer.h>
+#include <render/antialiasing.h>
+#include <render/antiAliasing_legacy.h>
 #include <render/resourceSlot/nodeHandleWithSlotsAccess.h>
 #include <render/motionVectorAccess.h>
 #include <render/heroData.h>
 #include "satelliteRenderer.h"
 
 #include "antiAliasingMode.h"
-#include "cameraParams.h"
+#include <render/cameraParams.h>
 #include "shadowsManager.h"
 #include "postFxManager.h"
 #include "partitionSphere.h"
 #include "shoreRenderer.h"
 
 class CollisionResource;
+class RenderableInstanceLodsResource;
 class Point2;
 class BaseTexture;
 typedef BaseTexture Texture;
@@ -100,17 +104,17 @@ class LRURendinstCollision;
 class DebugBoxRenderer;
 class IndoorProbeNodes;
 class IndoorProbeManager;
-class TreesAboveDepth;
 class Occlusion;
 class GaussMipRenderer;
 union LightShadowParams;
 struct AimRenderingData;
 class DebugLightProbeShapeRenderer;
+class DebugCollisionDensityRenderer;
 class IndoorProbeScenes;
 class DynamicShadowRenderExtender;
 class EnviCover;
 
-enum class WaterRenderMode;
+enum class MainNodeRenderPass;
 
 namespace light_probe
 {
@@ -139,17 +143,16 @@ class WorldRenderer final : public IRenderWorld, public IShadowInfoProvider
   friend struct WRDispatcher;
 
   friend eastl::fixed_vector<dafg::NodeHandle, 3> makeControlOpaqueDynamicsNodes(const char *prev_region_ns);
-  friend dafg::NodeHandle makeOpaqueDynamicsNode();
+  friend dafg::NodeHandle makeOpaqueDynamicsNode(MainNodeRenderPass);
   friend eastl::fixed_vector<dafg::NodeHandle, 4> makeControlOpaqueStaticsNodes(const char *prev_region_ns);
+  friend eastl::fixed_vector<dafg::NodeHandle, 2> makeOpaqueMainNodes(dafg::NameSpace, bool, MainNodeRenderPass);
   friend eastl::fixed_vector<dafg::NodeHandle, 8> makeOpaqueStaticNodes(bool);
 
-  friend dafg::NodeHandle makePrepareGbufferNode(
-    uint32_t global_flags, uint32_t gbuf_cnt, eastl::span<uint32_t> main_gbuf_fmts, bool has_motion_vectors);
+  friend dafg::NodeHandle makePrepareGbufferNode();
   friend dafg::NodeHandle makePrepareLightsNode();
   friend dafg::NodeHandle makeDepthWithTransparencyNode();
   friend dafg::NodeHandle makeDownsampleDepthWithTransparencyNode();
   friend dafg::NodeHandle makeSSAANode();
-  friend eastl::fixed_vector<dafg::NodeHandle, 3> makeFsrNodes();
   friend dafg::NodeHandle makeStaticUpsampleNode(const char *source_name);
   friend resource_slot::NodeHandleWithSlotsAccess makePreparePostFxNode();
   friend dafg::NodeHandle makePrepareTiledLightsNode();
@@ -162,49 +165,59 @@ class WorldRenderer final : public IRenderWorld, public IShadowInfoProvider
   friend dafg::NodeHandle makeGiFeedbackNode();
 
   friend dafg::NodeHandle makePrepareWaterNode();
-  friend eastl::fixed_vector<dafg::NodeHandle, 5, false> makeSubsamplingNodes(bool sub_sampling, bool super_sampling);
+  friend eastl::fixed_vector<dafg::NodeHandle, 5, false> makeSubsamplingNodes(
+    bool sub_sampling, bool super_sampling, bool is_screenshot);
   friend dafg::NodeHandle makeFrameToPresentProducerNode();
   friend eastl::array<dafg::NodeHandle, 2> makeExternalFinalFrameControlNodes(bool requires_multisampling);
   friend dafg::NodeHandle makePostfxTargetProducerNode(bool requires_multisampling);
   friend dafg::NodeHandle makeAimDofRestoreNode();
-  friend dafg::NodeHandle mk_occlusion_preparing_mobile_node();
-  friend dafg::NodeHandle mk_postfx_target_producer_mobile_node();
-  friend dafg::NodeHandle mk_postfx_mobile_node();
-  friend dafg::NodeHandle mk_finalize_frame_mobile_node();
-  friend dafg::NodeHandle mk_debug_render_mobile_node();
-  friend dafg::NodeHandle makeGroundNode(bool early);
+  friend dafg::NodeHandle makeGroundNode(bool early, MainNodeRenderPass mode);
   friend eastl::array<dafg::NodeHandle, 2> makeSceneShadowPassNodes(const DataBlock *level_blk);
-  friend dafg::NodeHandle makeTransparentSceneLateNode();
+  friend void prepare_scene_shadows_in_lights_job(WorldRenderer &wr, vec3f view_pos, mat44f_cref globtm, float hk);
+  friend dafg::NodeHandle makeTransparentSceneLateNode(MainNodeRenderPass mode);
   friend dafg::NodeHandle makeAcesFxTransparentNode();
-  friend eastl::fixed_vector<dafg::NodeHandle, 2, false> makeAcesFxLowresTransparentNodes();
 
   friend dafg::NodeHandle makeAfterWorldRenderNode();
-  friend eastl::array<dafg::NodeHandle, 9> makeVolumetricLightsNodes();
-  friend dafg::NodeHandle mk_panorama_prepare_mobile_node();
-  friend dafg::NodeHandle mk_panorama_apply_mobile_node();
-  friend dafg::NodeHandle mk_panorama_apply_forward_node();
+  friend eastl::array<dafg::NodeHandle, 10> makeVolumetricLightsNodes();
   friend dafg::NodeHandle makeWaterNode(WaterRenderMode mode);
-  friend eastl::fixed_vector<dafg::NodeHandle, 2, false> makeWaterSSRNode(WaterRenderMode mode);
-  friend dafg::NodeHandle mk_opaque_setup_mobile_node();
-  friend dafg::NodeHandle mk_opaque_begin_rp_node();
-  friend dafg::NodeHandle mk_opaque_mobile_node();
-  friend dafg::NodeHandle mk_opaque_resolve_mobile_node();
-  friend dafg::NodeHandle mk_opaque_setup_forward_node();
-  friend dafg::NodeHandle mk_static_opaque_forward_node();
-  friend dafg::NodeHandle mk_dynamic_opaque_forward_node();
-  friend dafg::NodeHandle mk_frame_data_setup_node();
-  friend dafg::NodeHandle mk_water_prepare_mobile_node();
-  friend dafg::NodeHandle mk_water_mobile_node();
-  friend dafg::NodeHandle mk_under_water_fog_mobile_node();
+  friend eastl::fixed_vector<dafg::NodeHandle, 3, false> makeWaterSSRNode(WaterRenderMode mode);
   friend void acesfx::finish_update(const TMatrix4 &tm, Occlusion *occlusion);
-  friend eastl::fixed_vector<dafg::NodeHandle, 2, false> makeCameraInCameraSetupNodes();
+  friend dafg::NodeHandle makeLensAreaCameraSourceNode();
 
   friend dafg::NodeHandle makeReprojectedHzbImportNode(); // remove when non-multiplexed camera-view params will be added to fg
+
+  friend void clipmap_prepare_render_callback(dag::ConstSpan<Texture *> bufferTex, dag::ConstSpan<Texture *> compressorTex);
 
   // platform/game specific default initialized once
   FeatureRenderFlagMask defaultFeatureRenderFlags;
 
+  bool pendingFullGiInvalidation = false;
+  // world boxes of this frame's destructions, invalidated together on the next one. a list,
+  // not a running union: two events far apart would union into a box covering the level.
+  // the writers are game side callbacks (destruction, restore, the grass eraser) and the
+  // reader drains it on the render path: both sides hold the lock, and the full
+  // invalidation request above shares it (its writers reach the loading thread through
+  // onSceneLoaded)
+  static constexpr int MAX_GI_INVALIDATE_BOXES = 8;
+  BBox3 pendingGiInvalidateBoxes[MAX_GI_INVALIDATE_BOXES];
+  uint32_t pendingGiInvalidateCount = 0;
+  OSSpinlock pendingGiInvalidateLock;
+  void processGIInvalidationRequests();
+
+  bool hasPendingHeroTeleportation = false;
+  void processHeroTeleportation();
+
+  struct NodesRegistratorSlot
+  {
+    ecs::EntityId eid;
+    bool enabled = true;
+    uint32_t mainOffset = 0, mainCount = 0;
+    uint32_t lensOffset = 0, lensCount = 0;
+  };
+
 public:
+  void onHeroTeleportation() { hasPendingHeroTeleportation = true; };
+
   bool hasFeature(FeatureRenderFlags f) const { return renderer_has_feature(f); }
   FeatureRenderFlagMask getFeatures() const { return get_current_render_features(); }
 
@@ -214,14 +227,15 @@ public:
 
   // IRenderWorld
   virtual void update(float dt, float real_dt, const TMatrix &itm); // can be called independent on draw
-  void setUpView(const TMatrix &view_itm, const DPoint3 &view_pos, const Driver3dPerspective &persp);
+  void setUpView(const TMatrix &view_itm, const DPoint3 &view_pos, const Driver3dPerspective &persp, const TMatrix4D &proj_tm);
   virtual void beforeRender(float scaled_dt,
     float act_dt,
     float real_dt,
     float game_time,
     const TMatrix &view_itm,
     const DPoint3 &view_pos,
-    const Driver3dPerspective &persp) override;
+    const Driver3dPerspective &persp,
+    const TMatrix4D &proj_tm) override;
 
   void updateLodsScaling();
 
@@ -245,6 +259,10 @@ public:
   virtual void onLightmapSet(TEXTUREID lmap_tid);
   // to be called from loading thread
   virtual void onLandmeshLoaded(const DataBlock &level_blk, const char *bin_scene, LandMeshManager *lmesh);
+  void onUIFinished();
+  virtual void setLandmesh(
+    LandMeshManager *lmesh_mgr, LandMeshRenderer *lmesh_renderer, void (*decals_cb)(const BBox3 &landPart)) override;
+  void invalidateClipmap(bool force) override;
 
   virtual void unloadLevel();
   virtual void closeNBSShaders();
@@ -280,28 +298,21 @@ public:
 
   //
   // todo: instead of direct mapping wecan create some grid structire to hide and remove lights which are too far
-  void destroyLight(light_id id)
-  {
-    std::lock_guard<std::mutex> scopedLock(lightLock);
-    lights.destroyLight(id);
-  } // this one has to be replaced with queue
+  void destroyLight(light_id id) { lights.destroyLight(id); } // this one has to be replaced with queue
 
   light_id addOmniLight(const OmniLight &light, OmniLightMaskType mask = OmniLightMaskType::OMNI_LIGHT_MASK_DEFAULT)
   {
-    std::lock_guard<std::mutex> scopedLock(lightLock);
     return lights.addOmniLight(light, mask);
   }
 
   // keep mask
   void setLight(light_id id, const OmniLight &light, bool invalidate_shadow)
   {
-    std::lock_guard<std::mutex> scopedLock(lightLock);
     lights.setLight(id, light, invalidate_shadow);
   } // todo:this one has to be replaced with queue
 
   void setLightWithMask(light_id id, const OmniLight &light, OmniLightMaskType mask, bool invalidate_shadow)
   {
-    std::lock_guard<std::mutex> scopedLock(lightLock);
     lights.setLightWithMask(id, light, mask, invalidate_shadow);
   } // todo:this one has to be replaced with queue
 
@@ -309,16 +320,16 @@ public:
 
   void setLight(light_id id, const SpotLight &light, SpotLightMaskType mask, bool invalidate_shadow)
   {
-    std::lock_guard<std::mutex> scopedLock(lightLock);
     lights.setLight(id, light, mask, invalidate_shadow);
   } // todo:this one has to be replaced with queue
 
   SpotLight getSpotLight(light_id id) const { return lights.getSpotLight(id); }
 
-  light_id addSpotLight(const SpotLight &light, SpotLightMaskType mask)
+  light_id addSpotLight(const SpotLight &light, SpotLightMaskType mask) { return lights.addSpotLight(light, mask); }
+
+  void getSpotLightShadowViewProj(light_id id, mat44f &view_itm, mat44f &proj)
   {
-    std::lock_guard<std::mutex> scopedLock(lightLock);
-    return lights.addSpotLight(light, mask);
+    return lights.getSpotLightShadowViewProj(id, view_itm, proj);
   }
 
   bool isLightVisible(light_id id) const { return lights.isLightVisible(id); }
@@ -353,6 +364,7 @@ public:
 
   void shadowsInvalidate(const BBox3 &box) override { shadowsManager.shadowsInvalidate(box); }
   void shadowsAddInvalidBBox(const BBox3 &box) override { shadowsManager.shadowsAddInvalidBBox(box); }
+  void invalidateGI(const BBox3 &world_box) override;
 
   dynamic_shadow_render::QualityParams getShadowRenderQualityParams() const override;
   DynamicShadowRenderExtender::Handle registerShadowRenderExtension(DynamicShadowRenderExtender::Extension &&extension) override;
@@ -365,52 +377,90 @@ public:
   void prepareLightProbeRIVisibilityAsync(const mat44f &globtm, const Point3 &view_pos);
   void endRenderLightProbe();
 
-  inline void invalidateCubeReloadOnly() { enviProbeNeedsReload = true; }
-
   // just other public
   void init();
   void createNodes();
+  void toggleCameraInCamera(bool active);
+  void registerCameraViewNodes(const char *name, ecs::EntityId eid);
+  void unregisterCameraViewNodes(const char *name, ecs::EntityId eid);
+  void disableCameraViewNodes(const char *name, ecs::EntityId eid);
+  void reCreateCameraViewNodes(const char *name);
+  void clearCameraSlot(const NodesRegistratorSlot &);
   // Recreates nodes right before rendering the frame, causing a lag
   // spike. SHould only be used for debug (e.g. pulling convars)
-  void debugRecreateNodesLate();
+  void debugRecreateNodes();
 
-  void createDownsampleDepthNode();
-  void createPrepareMotionVectorsAfterTransparentNode();
-  void createGbufferControlNodes();
   void createFinalOpaqueControlNodes();
-  void createTransparentControlNodes();
-  void createAsyncAnimcharRenderingStartNode();
-  void createHzbResolveNode();
-  void createTransparentParticlesNode();
-  void createDownsampleDepthWithWaterNode();
-  void createEnvironmentNode();
-  void createMotionBlurControlNodes();
-  void createShadowPassNodes();
-  void createOpaqueStaticNodes();
-  void createVolumetricLightsNode();
   void createGiNodes();
-  void createResolveGbufferNode();
-  void createDeferredLightNode();
-  void createUINodes();
-  void createMotionVectorResolveAndEnviCoverNodes();
 
   static WaterRenderMode determineWaterRenderMode(bool underWater, bool belowClouds);
+  bool isCameraBelowClouds() const;
+  WaterRenderMode getWaterRenderMode() const { return waterRenderMode; }
+  void updateWaterRenderMode();
+  void recreateWaterNodes();
+
+  struct AntiAliasingAppGlue : public render::antialiasing::AppGlue
+  {
+    TMatrix4 getUvReprojectionToPrevFrameTmNoJitter() const override { return TMatrix4::IDENT; }
+    IPoint2 getInputResolution() const override
+    {
+      if (auto *wr = get_wr())
+      {
+        IPoint2 result;
+        wr->getRenderingResolution(result.x, result.y);
+        return result;
+      }
+      return IPoint2::ZERO;
+    }
+    IPoint2 getOutputResolution() const override
+    {
+      if (auto *wr = get_wr())
+      {
+        IPoint2 result;
+        wr->getPostFxInternalResolution(result.x, result.y);
+        return result;
+      }
+      return IPoint2::ZERO;
+    }
+    IPoint2 getDisplayResolution() const override
+    {
+      if (auto *wr = get_wr())
+      {
+        IPoint2 result;
+        wr->getDisplayResolution(result.x, result.y);
+        return result;
+      }
+      return IPoint2::ZERO;
+    }
+    bool hasMinimumRenderFeatures() const override { return true; }
+    bool isTiledRender() const override { return false; }
+    bool useMobileCodepath() const override { return false; }
+    bool isRayTracingEnabled() const override { return false; }
+    int getTargetFormat() const override { return 0; }
+    int getHangarPassValue() const override { return 0; }
+    SGSR2Interface *createSGSR2(const IPoint2 &, const IPoint2 &) const override { return nullptr; };
+    bool isVrHmdEnabled() const override { return false; }
+    bool pushSSAAoption() const override { return true; }
+
+  private:
+    static WorldRenderer *get_wr() { return static_cast<WorldRenderer *>(get_world_renderer()); }
+  };
 
   void setResolution() override;
   void setAntialiasing();
   void applyAutoResolution();
   void close();
-  void setFadeMul(float mul);
   bool haveVolumeLights() { return volumeLight != nullptr; }
   void enableVolumeFogOptionalShader(const String &shader_name, bool enable);
   void enableEnviCoverOptionalShader(const String &shader_name, bool enable);
+  void enableCloudsOptionalShader(const String &shader_name, bool enable);
   // void initGIWalls(eastl::unique_ptr<scene::TiledScene> &&walls);
   void initGIWindows(eastl::unique_ptr<scene::TiledScene> &&windows);
   void initRestrictionBoxes(eastl::unique_ptr<scene::TiledScene> &&walls);
-  void invalidateGI(const BBox3 &model_bbox, const TMatrix &tm, const BBox3 &approx) override;
   void invalidateVolumeLight();
 
-  void cullFrustumLights(Occlusion *occlusion, vec3f viewPos, mat44f_cref globtm, mat44f_cref view, mat44f_cref proj, float zn);
+  void cullFrustumLights(
+    Occlusion *occlusion, vec3f viewPos, mat44f_cref globtm, mat44f_cref view, mat44f_cref proj, float zn, float zf, float hk);
   void getMaxPossibleRenderingResolution(int &width, int &height) const;
   void getRenderingResolution(int &w, int &h) const override;
   void getPostFxInternalResolution(int &w, int &h) const override;
@@ -442,35 +492,22 @@ public:
   };
   GiQuality getGiQuality() const;
   bool isThinGBuffer() const;
-  bool isForwardRender() const;
-  bool isMobileDeferred() const;
-  bool isDepthAccessible() const { return !isForwardRender(); }
+  bool isDepthAccessible() const { return true; }
   bool isSSREnabled() const;
   bool isWaterSSREnabled() const;
   bool isLowResLUT() const;
 
-  void invalidateAllShadows() { return lights.invalidateAllShadows(); }
+  bool hasSSRAlternateReflections() const { return ssrWantsAlternateReflections; }
+  bool hasWaterSSRAlternateReflections() const;
+
+  void invalidateAllShadows()
+  {
+    OSSpinlockScopedLock scopedLock{lights.lightLock};
+    return lights.invalidateAllShadows();
+  }
 
   void setPostFx(const ecs::Object &postFx);
   void postFxTonemapperChanged();
-
-  enum class MobileTerrainQuality
-  {
-    Minimum = 0,
-    Low = 1,
-    Medium = 2,
-    High = 3
-  };
-  void initMobileTerrainSettings() const;
-  void setMobileTerrainQuality(const MobileTerrainQuality quality) const;
-  enum class MobileStaticShadowQuality
-  {
-    Off = 0,
-    Fast = 1,
-    FXAA = 2
-  };
-  void initMobileShadowSettings() const;
-  void initMobileShadersSettings() const;
 
   virtual bool getBoxAround(const Point3 &position, TMatrix &box) const override;
 
@@ -478,6 +515,7 @@ public:
 
   void loadFogNodes(const String &graph_name, float low_range, float high_range, float low_height, float high_height);
   void loadEnviCoverNodes(const String &graph_name);
+  void loadCloudsNodes(const String &graph_name);
 
   void changePreset();
   FeatureRenderFlagMask getOverridenRenderFeatures();
@@ -485,6 +523,7 @@ public:
   void setFeatureFromSettings(const FeatureRenderFlags f);
   void setChromaticAberrationFromSettings();
   void setFilmGrainFromSettings();
+
   void toggleFeatures(const FeatureRenderFlagMask &f, bool turn_on);
   void changeFeatures(const FeatureRenderFlagMask &f);
   void validateFeatures(FeatureRenderFlagMask &features, const FeatureRenderFlagMask &changed_features);
@@ -492,6 +531,9 @@ public:
   bool forceEnableMotionVectors() const;
   bool needMotionVectors() const;
   bool needSeparatedUI() const override;
+  bool needUIBlendingForScreenshot() const override;
+
+  void requireStencilGbuf(bool require) override;
 
   void removePuddlesInCrater(const Point3 &pos, float radius);
   void delayedInvalidateAfterHeightmapChange(const BBox3 &box);
@@ -512,7 +554,6 @@ public:
 protected:
   void ctorCommon();
   void ctorDeferred();
-  void ctorForward();
 
   void initResetable();
   void closeResetable();
@@ -520,8 +561,7 @@ protected:
   friend class RandomGrassRenderHelper;
   friend class LandmeshCMRenderer;
   friend struct HmapPatchesCallback;
-  friend bool fog_shader_compiler(
-    uint32_t variant_id, const String &name, const String &code, const DataBlock &shader_blk, String &out_errors);
+  friend bool fog_shader_compiler(const String &name, const DataBlock &shader_blk, String &out_errors);
 
   void setDirToSun();
   void updateSky(float realDt);
@@ -534,13 +574,13 @@ protected:
 
   void closeClipmap();
   void initClipmap();
-  void invalidateClipmap(bool force);
   void dumpClipmap();
   void prepareLastClip();
   bool useClipmapFeedbackOversampling();
 
   void initRendinstVisibility();
   void closeRendinstVisibility();
+  void shrinkRendinstVisibilities();
   friend struct VisibilityPrepareJob;
   friend struct GroundCullingJob;
   friend struct GroundReflectionCullingJob;
@@ -573,13 +613,16 @@ protected:
   void renderDisplacementRiLandclasses(const Point3 &camera_pos);
 
   void renderGround(const LandMeshCullingData &lmesh_culling_data, bool is_first_iter);
-  void renderGroundForward(const LandMeshCullingData &lmesh_culling_data);
 
-  void renderStaticSceneOpaque(int shadow_cascade, const Point3 &camera_pos, const TMatrix &view_itm, const Frustum &culling_frustum);
+  void renderStaticSceneOpaque(int shadow_cascade,
+    const Point3 &camera_pos,
+    const TMatrix &view_itm,
+    const Frustum &culling_frustum,
+    RiGenVisibility *scene_shadow_ri_visibility);
   void renderDynamicOpaque(
     int shadow_cascade, const TMatrix &view_itm, const TMatrix &view_tm, const TMatrix4 &proj_tm, const Point3 &cam_pos);
 
-  void renderRendinst(int shadow_cascade, const TMatrix &view_itm);
+  void renderRendinst(int shadow_cascade, const TMatrix &view_itm, RiGenVisibility *scene_shadow_ri_visibility);
   void renderRITreePrepass(const TMatrix &view_itm);
   void renderFullresRITreePrepass(const TMatrix &view_itm);
   void renderRITree();
@@ -591,17 +634,17 @@ protected:
 
   struct DelayedRenderContext
   {
-    struct
+    struct //-V730
     {
-      bool render;
-      const ManagedTex *texPtr;
+      bool render = false;
+      const ManagedTex *texPtr = nullptr;
       Point3 position;
       int faceNumber;
     } lightProbeData;
 
     struct
     {
-      bool render;
+      bool render = false;
       TMatrix itm;
     } depthAOAboveData;
 
@@ -627,18 +670,6 @@ protected:
     float cockpitDistance = 0.f;
     bool occlusionAvailable = false;
   } vehicleCockpitOcclusionData;
-
-  MobileDeferredResources mobileRp;
-
-  void renderStaticOpaqueForward(const LandMeshCullingData &lmesh_culling_data, const TMatrix &itm);
-  void renderStaticDecalsForward(ManagedTexView depth,
-    const CameraParams &current_camera,
-    const TexStreamingContext tex_ctx,
-    const RiGenVisibility *ri_main_visibility,
-    const TMatrix &prev_view_tm,
-    const TMatrix4 &prev_proj_current_jitter);
-  void renderDynamicOpaqueForward(const TMatrix &itm);
-  bool renderParticlesSpecial(uint8_t render_tag);
   void copyClipmapUAVFeedback();
 
   void onBareMinimumSettingsChanged();
@@ -646,20 +677,21 @@ protected:
   void updateTransformations(const DPoint3 &move,
     const TMatrix4_vec4 &jittered_cam_pos_to_unjittered_history_clip,
     const TMatrix4_vec4 &prev_origo_relative_view_proj_tm);
-  void prepareClipmap(const Point3 &origin, float additional_speed, const TMatrix &view_itm, const TMatrix4 &globtm);
+  void prepareClipmapState(const Point3 &origin, const TMatrix &view_itm, const TMatrix4 &globtm, float wk, int minimum_zoom);
   void prepareDeformHmap();
   enum class DistantWater : bool
   {
     No,
     Yes
   };
-  void renderWater(const TMatrix &itm, DistantWater render_distant_water, bool render_ssr);
-  void renderWaterSSR(const TMatrix &itm, const Driver3dPerspective &persp);
+  void renderWater(const CameraParams &camera, DistantWater render_distant_water, bool render_ssr, int sub_camera = 0);
+  void renderWaterNormals(const CameraParams &camera, int sub_camera);
 
   void generatePaintingTexture();
   void prefetchPartsOfPaintingTexture();
   SharedTex localPaintTex, globalPaintTex;
   TEXTUREID localPaintTexId = BAD_TEXTUREID; // ID stored like this to prefetch it again after device reset
+  eastl::string globalPaintTexName;
 
   enum EnviProbeRenderFlags
   {
@@ -668,28 +700,29 @@ protected:
   };
   uint32_t getEnviProbeRenderFlags() const;
 
-  bool enviProbeInvalid = false;
-  bool specularCubesContainerNeedsReinit = false;
-  inline void setSpecularCubesContainerForReinit() { specularCubesContainerNeedsReinit = true; }
-  inline void invalidateCube()
+  enum class EnviProbeState
   {
-    enviProbeInvalid = true;
-    setSpecularCubesContainerForReinit();
-  }
-  void reinitCubeIfInvalid();
-  void reinitSpecularCubesContainerIfNeeded(int cube_size = -1);
+    Ready,
+    NeedsReRender,
+    NeedsFullReload
+  };
+  EnviProbeState enviProbeState = EnviProbeState::NeedsFullReload;
 
+public:
+  void scheduleEnviProbeReRender() override { enviProbeState = max(enviProbeState, EnviProbeState::NeedsReRender); }
+  inline void scheduleEnviProbeFullReload() { enviProbeState = EnviProbeState::NeedsFullReload; }
+
+protected:
   uint32_t cubeResolution = 128;
-  void reinitCube(int ew, const Point3 &at);
-  void reinitCube(const Point3 &at);
-  inline void reinitCube() { reinitCube(enviProbePos); }
-
-  bool enviProbeNeedsReload = false;
-  virtual void reloadCube(bool first);
+  void recreateEnviProbe();
+  void clearEnviProbe();
+  void renderEnviProbe();
+  void updateEnviProbe();
 
   void updateSkyProbeDiffuse();
   uint32_t attemptsToUpdateSkySph = 0;
   void setEnviProbePos(const Point3 &at) { enviProbePos = at; }
+  void setCubeResolution(uint32_t res) { cubeResolution = res; }
 
   String showTexCommand(const char *argv[], int argc);
   String showTonemapCommand(const char *argv[], int argc);
@@ -703,14 +736,19 @@ protected:
   void closeCharacterMicroDetails();
 
   void applySettingsChanged();
-  void createFramegraphNodes();
-  IPoint2 getFsrScaledResolution(const IPoint2 &orig_resolution) const;
-  void updateLevelGraphicsSettings(const DataBlock &level_blk);
+
+  bool hasPendingFgRecreation = false;
+  void processPendingFgRecreation();
+  void requestFgRecreation(const char *tag)
+  {
+    debug("WR:mark FG for recompilation [%s]", tag);
+    hasPendingFgRecreation = true;
+  }
+
   bool forceStaticResolutionOff = false;
 
   void invalidateLightProbes();
   void initIndoorProbesIfNecessary();
-  void invalidateNodeBasedResources();
 
 protected:
   friend struct PostFxManager;
@@ -732,8 +770,6 @@ protected:
   eastl::unique_ptr<FomShadowsManager> fomShadowManager;
 
   GpuDeformObjectsManager gpuDeformObjectsManager;
-
-  std::mutex lightLock;
 
   eastl::unique_ptr<RenderDynamicCube> cube;
 
@@ -757,29 +793,29 @@ protected:
   shaders::UniqueOverrideStateId additiveBlendStateId;
   shaders::UniqueOverrideStateId enabledDepthBoundsId;
   shaders::UniqueOverrideStateId zFuncEqualStateId;
-  UniqueTexHolder last_clip;
+  UniqueTexWithShaderVar last_clip;
   d3d::SamplerInfo last_clip_sampler;
 
   float glassShadowK = 0.7;
 
   float cachedStaticResolutionScale = 100.f;
-  UniqueTexHolder distantHeightmapTex;
-  UniqueTexHolder paintColorsTex;
+  UniqueTexWithShaderVar distantHeightmapTex;
+  UniqueTexWithShaderVar paintColorsTex;
 
   TEXTUREID landMicrodetailsId = BAD_TEXTUREID, characterMicrodetailsId = BAD_TEXTUREID;
 
   BaseStreamingSceneHolder *binScene = nullptr; // owned by corresponding entity
   BBox3 binSceneBbox;
-  dafg::NodeHandle binSceneTransparencyNode;
-  void initBinSceneTransparencyNode();
 
   TEXTUREID lightmapTexId = BAD_TEXTUREID;
   LandMeshManager *lmeshMgr = nullptr; // not owned!
   LandMeshRenderer *lmeshRenderer = nullptr;
+  bool editorHeightmapActive = false;
   int displacementSubDiv = 2;
   int subdivSettings = 0;
   void initSubDivSettings();
   float cameraHeight = 0.f;
+  float cameraActualHeight = 0.f;
   float lodDistanceScaleBase = 1.3f;
 
   // queried in every frame in before draw
@@ -812,6 +848,8 @@ protected:
 
   carray<RiGenVisibility *, ShadowsManager::CSM_MAX_CASCADES> rendinst_shadows_visibility = {};
   RiGenVisibility *rendinst_dynamic_shadow_visibility = nullptr;
+  SceneShadowRenderData sceneShadowRenderData;
+  bool sceneShadowRiGpuObjectsPending = false; // sampled on the main thread for the lights job
 
 
   RiGenVisibility *rendinst_cube_visibility = nullptr;
@@ -838,7 +876,7 @@ protected:
   };
   Afr afr;
 
-  int water_ssr_id = -1;
+  int water_ssr_ids[2] = {-1, -1};
 
   eastl::unique_ptr<DynamicQuality> dynamicQuality;
   void resetDynamicQuality();
@@ -860,12 +898,6 @@ protected:
   const ManagedTex *finalTargetFrame = nullptr;
   ExternalTex backbufferTex;
   UniqueTex ownedBackbufferTex;
-
-  UniqueBuf superResolutionUpscalingConsts;
-  UniqueBuf superResolutionSharpeningConsts;
-  float fsrScale = 1.0f;
-  float fsrMipBias = 0.0f;
-  bool fsrEnabled = false;
 
   bool overrideDisplayRes = false;
   IPoint2 overridenDisplayRes = {};
@@ -895,37 +927,29 @@ protected:
   bool isStaticUpsampleEnabled() const;
   void applyStaticUpsampleQuality();
 
+  AntiAliasingAppGlue aaGlue;
   AntiAliasingMode currentAntiAliasingMode = AntiAliasingMode::TSR;
-  bool hasDepthHistory = false;
-  dafg::NodeHandle prepareDepthForPostFxNode;
-  void makePrepareDepthForPostFxNode();
-  int msaaQuality = 0;
   eastl::unique_ptr<AntiAliasing> antiAliasing;
 #if !_TARGET_PC && !_TARGET_ANDROID && !_TARGET_IOS && !_TARGET_C3
   IPoint2 fixedPostfxResolution;
   IPoint2 getFixedPostfxResolution(const IPoint2 &orig_resolution) const;
 #endif
 
-  bool isMSAAEnabled() const { return currentAntiAliasingMode == AntiAliasingMode::MSAA; }
   void loadAntiAliasingSettings();
   void applyFXAASettings();
-  void loadFsrSettings();
-  bool isFsrEnabled() const;
   bool hasMotionVectors = false;
-  constexpr static int GBUF_TARGET_GLOBAL_FLAGS = TEXCF_ESRAM_ONLY;
   void initTarget();
+  bool isEnviCoverCompatible = false;
+  void updateEnviCoverCompatibility();
   void initGbufferDepthProducer();
   void toggleMotionVectors();
+
+  bool stencilGbufRequired = false;
 
   dafg::NodeHandle ssaaNode;
   float ssaaMipBias = 0.0f;
   bool isSSAAEnabled() const { return currentAntiAliasingMode == AntiAliasingMode::SSAA; }
   IPoint2 getSSAAResolution(const IPoint2 &orig_resolution) const { return orig_resolution * 2; }
-
-  // forward rendering
-  void setResolutionForward();
-  void initResetableForward();
-  void createNodesForward();
 
   void setSettingsSSR();
   void updateSettingsSSR(int w, int h);
@@ -934,17 +958,15 @@ protected:
   {
     LOW,
     MEDIUM,
-    HIGH
+    HIGH,
+    ULTRA
   };
   AoQuality aoQuality = AoQuality::MEDIUM;
   void resetSSAOImpl();
   FFTWater *water = nullptr;
-  dafg::NodeHandle prepareWaterNode;
-  eastl::array<dafg::NodeHandle, 3> waterNodes;
-  eastl::array<eastl::fixed_vector<dafg::NodeHandle, 2, false>, 3> waterSSRNodes;
   ShoreRenderer shoreRenderer;
   static constexpr int lowresWaterHeightmapSize = 1024;
-  UniqueTexHolder lowresWaterHeightmap;
+  UniqueTexWithShaderVar lowresWaterHeightmap;
   PostFxRenderer lowresWaterHeightmapRenderer;
 
   int fftWaterQualitySetting = 0;
@@ -954,7 +976,7 @@ protected:
 
   SkiesData *refl_pov_data = nullptr;
 
-  UniqueTexHolder cloudsVolume;
+  UniqueTexWithShaderVar cloudsVolume;
 
   eastl::unique_ptr<GaussMipRenderer> planarReflectionMipRenderer;
   TMatrix waterPlanarReflectionViewItm;
@@ -964,7 +986,6 @@ protected:
   dafg::NodeHandle waterPlanarReflectionCloudsNode;
   dafg::NodeHandle waterPlanarReflectionTerrainNode;
 
-  void recreateWaterNodes();
   void initWaterPlanarReflection();
   void closeWaterPlanarReflection();
   void initWaterPlanarReflectionTerrainNode();
@@ -974,33 +995,56 @@ protected:
   void recreateCloudsVolume();
 
 public:
-  CollisionResource *getStaticSceneCollisionResource() const { return staticSceneCollisionResource.get(); }
+  const CollisionResource *getStaticSceneCollisionResource() const { return staticSceneCollisionResource.get(); }
   eastl::unique_ptr<DeferredRT> target;
-  void setupSkyPanoramaAndReflectionFromSetting(bool first_init);
+  void setupSkyPanoramaAndReflectionFromSetting();
   float daGdpRangeScale = 1;
   float gameTime = 0.f;
   float realDeltaTime = 0.f;
+  uint32_t renderedFrames = 0;
   Clipmap *getClipmap() const { return clipmap; }
   bool getBareMinimumPreset() const { return bareMinimumPreset; }
   AntiAliasingMode getAntiAliasingMode() { return currentAntiAliasingMode; }
-  WorldSDF *getWorldSDF() override;
+  DaGI *getGI() override;
   uint32_t getGIHistoryFrames() const;
+  void setGILightsToShader(bool allow_frustum_lights);
+  struct GIConvergenceState
+  {
+    bool requiresUpdate;
+    uint32_t historyFrames;
+    uint32_t historyFramesNeed;
+  };
+  struct StaticShadowsConvergenceState
+  {
+    uint32_t completelyValidFrames;
+    uint32_t completelyValidFramesNeed;
+  };
+  void logConvergenceMarkers();
+  GIConvergenceState logGIConvergence();
+  StaticShadowsConvergenceState logStaticShadowsConvergence();
+  // makes every marker log again, so a test can wait for convergence more than once
+  void resetConvergenceMarkers();
+  bool giConvergenceLogged = false;
+  bool texStreamingConvergenceLogged = false;
+  bool staticShadowsConvergenceLogged = false;
 
 private:
-  Point3 panoramaPosition = {0, 10, 0};
-  void setupSkyPanoramaAndReflection(bool use_panorama, bool first_init);
+  void setupSkyPanoramaAndReflection(bool use_panorama);
   void switchVolumetricAndPanoramicClouds(); // for debugging
 
   UniqueTex screenshotSuperFrame;
   PostFxRenderer underWater;
   float cameraSpeed = 0;
+
   Clipmap *clipmap = nullptr;
+  dafg::NodeHandle clipmapPrepareRenderNode;
+  int clipmapCutoffZoom = -1, clipmapCutoffMipsCnt = -1;
 
   eastl::unique_ptr<MultiFramePGF> preIntegratedGF;
 
-  UniqueTexHolder heightmapAround;
-  UniqueTexHolder hmapPatchesDepthTex;
-  UniqueTexHolder hmapPatchesTex;
+  UniqueTexWithShaderVar heightmapAround;
+  UniqueTexWithShaderVar hmapPatchesDepthTex;
+  UniqueTexWithShaderVar hmapPatchesTex;
   bool hmapPatchesEnabled = false;
   PostFxRenderer processHmapPatchesDepth;
   ToroidalHelper displacementData;
@@ -1013,7 +1057,7 @@ private:
   void invalidateAfterHeightmapChange();
 
   // TODO: separate it from WR
-  UniqueTexHolder riLandclassDepthTextureArr;
+  UniqueTexWithShaderVar riLandclassDepthTextureArr;
   dag::Vector<int> riLandclassIndices;
   dag::Vector<int> riLandclassIndicesPrev;
   dag::Vector<ToroidalHelper> riLandclassDisplacementDataArr;
@@ -1026,7 +1070,6 @@ private:
   bool bareMinimumPreset = false;
   void updateImpostorSettings();
 
-  eastl::unique_ptr<TreesAboveDepth> treesAbove;
   rendinst::RIOcclusionData *riOcclusionData = nullptr;
 
   DebugTexOverlay *debug_tex_overlay = nullptr;
@@ -1038,15 +1081,10 @@ private:
   bool initClipmapAfterResetDevice = false;
 
   bool ignoreStaticShadowsForGI = false;
+  bool globalGiLightsPrepared = false;
 
-  void fillDebugCollisionDensity(int threshold, const Point3 &cell, bool raster_collision, bool raster_phys);
   void renderDebugCollisionDensity();
-  void initDebugCollisionDensity();
-  void closeDebugCollisionDensity();
-  BufPtr debugCollisionSB, debugCollisionCounterSB;
-  eastl::unique_ptr<ShaderMaterial> drawFacesCountMat;
-  ShaderElement *drawFacesCountElem = 0;
-  int debugVoxelsCount = 0;
+  eastl::unique_ptr<DebugCollisionDensityRenderer> debugCollisionDensityRenderer;
 
   eastl::unique_ptr<DepthAOAboveContext> depthAOAboveCtx;
   ClusteredLights lights;
@@ -1054,6 +1092,7 @@ private:
   PostFxRenderer debugFillGbufferShader;
   shaders::UniqueOverrideStateId specularOverride, diffuseOverride;
 
+  void changeGrassShadowQuality();
   int getDynamicShadowQuality();
   void changeDynamicShadowResolution();
   void setDynamicShadowsMaxUpdatePerFrame();
@@ -1084,7 +1123,6 @@ private:
     return {rendinst_shadows_visibility.data(), rendinst_shadows_visibility.size()};
   }
   bool hasRenderFeature(FeatureRenderFlags f) const override { return hasFeature(f); }
-  bool isForward() const override { return isForwardRender(); }
   BBox3 getStaticShadowsBBox() const override
   {
     BBox3 res = getWorldBBox3();
@@ -1102,7 +1140,7 @@ private:
   void renderStaticSceneForShadowPass(
     int cascade, const Point3 &camera_pos, const TMatrix &view_itm, const Frustum &culling_frustum) override
   {
-    renderStaticSceneOpaque(cascade, camera_pos, view_itm, culling_frustum);
+    renderStaticSceneOpaque(cascade, camera_pos, view_itm, culling_frustum, nullptr);
   }
   void renderDynamicsForShadowPass(int cascade, const TMatrix &itm, const Point3 &cam_pos) override;
 
@@ -1112,8 +1150,8 @@ private:
 
   bool legacyGPUObjectsVisibilityInitialized = false;
   void clearLegacyGPUObjectsVisibility();
-  RiGenVisibility *rendinst_trees_visibility = nullptr;
   DaGI *daGI2 = 0;
+  RendInstMediaVolumes mediaVolumes;
   eastl::unique_ptr<GIWindows> giWindows;
   float giDynamicQuality = 1;
   LRUCollisionVoxelization *voxelizeCollision = nullptr;
@@ -1121,8 +1159,11 @@ private:
   float giHmapOffsetFromLow = 8.0, giHmapOffsetFromUp = 32 - 8.0f;
   float giIntersectedAmount = 0.125f, giNonIntersectedAmount = 0.125f;
   float giMaxUpdateHeightAboveFloor = 32.0f;
+  BBox3 giCurrentGlobalLightsBox;
+  bool giGlobalLightsPrepared = false;
   RiGenVisibility *rendinst_voxelize_visibility = nullptr;
-  eastl::unique_ptr<LRURendinstCollision> lruCollision;
+  eastl::shared_ptr<LRURendinstCollision> lruCollision;
+  eastl::unique_ptr<DaGISettings> giSettingsOverride;
 
   PostFxRenderer ambientBilateralBlur, ambientPerPixelVoxelsRT;
   eastl::unique_ptr<DataBlock> giBlk;
@@ -1131,14 +1172,17 @@ private:
   void resetGI();
   void giBeforeRender();
   void renderGiCollision(const TMatrix &view_itm, const Frustum &);
+  bool requiresGIUpdate() const;
   void updateGIPos(const Point3 &pos, const TMatrix &view_itm, float hmin, float hmax);
   void drawGIDebug(const Frustum &camera_frustum);
-  void invalidateGI(bool force);
+  void invalidateAllGI();
+  void doInvalidateGI();
+  void invalidateRiCollision();
   void setGIQualityFromSettings();
   bool giNeedsReprojection();
-
-  void initFsr(const IPoint2 &postfx_resolution, const IPoint2 &display_resolution);
-  void closeFsr();
+  void overrideGISettings(const DaGISettings &settings) override;
+  void resetGISettingsOverride() override;
+  DaGISettings getGISettings() const;
 
   const scene::TiledScene *getWallsScene() const;
   const scene::TiledScene *getWindowsScene() const;
@@ -1149,7 +1193,8 @@ private:
   FxRenderTargetOverride fxRtOverride = FX_RT_OVERRIDE_DEFAULT;
   void setFxQuality();
 
-  void setEnviromentDetailsQuality();
+  void setEnvironmentDetailsQuality();
+  void setNbsQuality();
 
   void resetLatencyMode();
   void resetVsyncMode();
@@ -1159,9 +1204,10 @@ private:
 
   HeroWtmAndBox heroData;
   CameraViewVisibilityMgr mainCameraVisibilityMgr{RI_EXTRA_VB_CTX_ASYNC, "main_cam"};
-  CameraViewVisibilityMgr camcamVisibilityMgr{
-    RI_EXTRA_VB_CTX_CAMCAM_ASYNC, "cam_in_cam", CameraViewVisibilityFlags::DontReprojectCockpitOcclusion};
+  CameraViewVisibilityMgr camcamVisibilityMgr{RI_EXTRA_VB_CTX_CAMCAM_ASYNC, "cam_in_cam", CameraViewVisibilityMgr::SUB_VIEW};
   eastl::optional<CameraParams> camcamParams;
+  eastl::optional<CameraParams> prevCamcamParams;
+  CameraParams cockpitCameraParams;
   CameraParams currentFrameCamera;
   CameraParams prevFrameCamera;
   TexStreamingContext currentTexCtx = TexStreamingContext(0);
@@ -1173,6 +1219,7 @@ public:
   const TMatrix &getCameraViewItm() const { return currentFrameCamera.viewItm; }
   const TMatrix4_vec4 &getCameraProjtm() const { return currentFrameCamera.noJitterProjTm; }
   TexStreamingContext getTexCtx() const { return currentTexCtx; }
+  void setCockpitReprojectionMode(CockpitReprojectionMode mode) { mainCameraVisibilityMgr.setCockpitReprojectionMode(mode); }
 
 private:
   int maxWaterTessellation = 7;
@@ -1189,7 +1236,8 @@ private:
 
   bool shouldToggleVRS(const AimRenderingData &aim_data);
 
-  eastl::unique_ptr<CollisionResource> staticSceneCollisionResource;
+  // dacoll's; RIEX_HANDLE_NULL in the LRU voxelizer
+  Ptr<CollisionResource> staticSceneCollisionResource;
 
   BBox3 worldBBox;
   BBox3 additionalBBox;
@@ -1197,35 +1245,24 @@ private:
   SatelliteRenderer satelliteRenderer;
 
   eastl::vector<dafg::NodeHandle> fgNodeHandles;
+  dafg::NodeHandle mainViewCameraProviderNode, lensViewCameraProviderNode;
+  eastl::vector<dafg::NodeHandle> mainViewNodes;
+  eastl::vector<dafg::NodeHandle> lensViewNodes;
+  bool lensViewNodesActive = false;
+
+  eastl::vector_map<eastl::string, NodesRegistratorSlot> nodesRegistrators;
+  void dispatchCameraViewNodes(NodesRegistratorSlot &slot, bool is_main_view);
+  eastl::fixed_vector<dafg::NodeHandle, 5> vrsNodeHandles;
+  bool vrsNodesUseMotionVrs = false;
+  bool vrsNodesUseMotionVrsDispatches = false;
+  eastl::fixed_vector<dafg::NodeHandle, 8, false> waterNodes;
+  WaterRenderMode waterRenderMode = WaterRenderMode::EARLY_AFTER_ENVI;
   eastl::vector<resource_slot::NodeHandleWithSlotsAccess> resSlotHandles;
   dafg::NodeHandle prepareGbufferDepthFGNode;
   dafg::NodeHandle prepareGbufferFGNode;
-  dafg::NodeHandle reactiveMaskClearNode;
-  eastl::array<dafg::NodeHandle, 3> downsampleDepthFGNodes;
-  dafg::NodeHandle prepareMotionVectorsAfterTransparentNode;
-  dafg::NodeHandle asyncAnimcharRenderingStartFGNode;
 
-  eastl::fixed_vector<dafg::NodeHandle, 3> gbufferCloseupsControlNodes;
-  eastl::fixed_vector<dafg::NodeHandle, 4> gbufferStaticsControlNodes;
-  eastl::fixed_vector<dafg::NodeHandle, 3> gbufferDynamicsControlNodes;
-  eastl::fixed_vector<dafg::NodeHandle, 3> gbufferDecorationsControlNodes;
-  dafg::NodeHandle gbufferPublishNode;
-
-  eastl::fixed_vector<dafg::NodeHandle, 6> transparentControlNodes;
   eastl::fixed_vector<dafg::NodeHandle, 4> finalOpaqueControlNodes;
-  dafg::NodeHandle transparentPublishNode;
 
-  eastl::fixed_vector<dafg::NodeHandle, 5> motionBlurControlNodes;
-  dafg::NodeHandle hzbResolveFGNode;
-  dafg::NodeHandle acesFxTransparentNode;
-  eastl::fixed_vector<dafg::NodeHandle, 2, false> acesFxLowresTransparentNodes;
-  dafg::NodeHandle downsampledDepthWithWaterNode;
-  eastl::fixed_vector<dafg::NodeHandle, 4> environmentFGNodes;
-  eastl::array<dafg::NodeHandle, 2> shadowPassFGNodes;
-  eastl::array<dafg::NodeHandle, 9> volumetricLightsFGNodes;
-  eastl::fixed_vector<dafg::NodeHandle, 3> ssrFGNodes;
-  eastl::fixed_vector<dafg::NodeHandle, 8> opaqueStaticNodes;
-  eastl::array<dafg::NodeHandle, 3> aoFGNodes;
   dafg::NodeHandle giRenderFGNode;
 
   dafg::NodeHandle giCalcFGNode;
@@ -1233,8 +1270,6 @@ private:
   dafg::NodeHandle giScreenDebugFGNode;
   dafg::NodeHandle giScreenDebugDepthFGNode;
 
-  eastl::array<dafg::NodeHandle, 2> deferredLightNodes;
-  eastl::fixed_vector<dafg::NodeHandle, 2, false> resolveGbufferNodes;
   eastl::fixed_vector<dafg::NodeHandle, 5, false> subSuperSamplingNodes;
   dafg::NodeHandle frameToPresentProducerNode;
   eastl::array<dafg::NodeHandle, 2> externalFinalFrameControlNodes;
@@ -1245,15 +1280,12 @@ private:
   dafg::NodeHandle motionBlurApplyNode;
   MotionBlurNodeStatus motionBlurStatus = MotionBlurNodeStatus::UNINITIALIZED;
   dafg::NodeHandle fxaaNode;
-  eastl::fixed_vector<dafg::NodeHandle, 2> beforeUIControlNodes;
-  dafg::NodeHandle uiRenderNode;
-  dafg::NodeHandle uiBlendNode;
-  eastl::array<dafg::NodeHandle, 3> resolveMotionVectorsAndEnviCoverNodes;
 
   int superPixels = 1;
   int subPixels = 1;
   bool requiresSubsampling = false;
   bool requiresSupersampling = false;
+  bool isScreenshotScheduled = false;
   bool ssrWantsAlternateReflections = false;
 
 private:

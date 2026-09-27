@@ -37,6 +37,7 @@
 #include <workCycle/dag_workCycle.h>
 
 #include <de3_interface.h>
+#include <libTools/voxel/voxelCache.h>
 #include <rendInst/rendInstGenRender.h>
 #include <rendInst/rendInstExtra.h>
 
@@ -65,7 +66,7 @@ extern Vbuffer *oneInstanceTmVb;
 #define NORMAL_TRANSLUCENCY_NAME "nt"
 #define AO_SMOOTHNESS_NAME       "as"
 
-#define FILE_REGEX "^.*_(aa|nt|as)\\.(tiff|tex\\.blk)$"
+#define FILE_REGEX "^.*_((aa|nt|as)\\.(tiff|tex\\.blk)|voxCache\\.bin)$"
 
 #define GLOBAL_VARS_LIST                   \
   VAR(impostor_sdf_max_distance)           \
@@ -274,7 +275,7 @@ static void perform_padding(const PostFxRenderer &padder, ImpostorBaker::Imposto
   TextureInfo info;
   destination.albedo_alpha.getTex2D()->getinfo(info, mip);
   d3d::setview(0, 0, info.w, info.h, 0, 1);
-  ShaderGlobal::set_color4(texture_sizeVarId, Color4(info.w, info.h, 0, 0));
+  ShaderGlobal::set_float4(texture_sizeVarId, Color4(info.w, info.h, 0, 0));
   source.albedo_alpha.getTex2D()->texmiplevel(mip, mip);
   source.normal_translucency.getTex2D()->texmiplevel(mip, mip);
   source.ao_smoothness.getTex2D()->texmiplevel(mip, mip);
@@ -284,7 +285,7 @@ static void perform_padding(const PostFxRenderer &padder, ImpostorBaker::Imposto
   padder.render();
 }
 
-static inline bool prefetch_textures(dag::ConstSpan<TEXTUREID> tex_list, int timeout = 60000000 /*start with 1 minute*/)
+bool ImpostorBaker::prefetch_textures(dag::ConstSpan<TEXTUREID> tex_list, int timeout)
 {
   static constexpr int timeout_max = 10 * 60 * 1000000 /*10 minutes max!*/, timeout_inc = 60 * 1000000 /*1 min increment*/;
   int64_t reft = ref_time_ticks(), reft_report = reft;
@@ -445,6 +446,8 @@ ImpostorBaker::ImpostorData ImpostorBaker::generate(DagorAsset *asset, const Imp
   aoFalloffStopLocal = blkProp->getReal("aoFalloffStop", aoFalloffStop);
   treeCrownData.brightness_falloff_start_stop_dist = Point4(aoBrightnessLocal, aoFalloffStartLocal, aoFalloffStopLocal, 0.);
 
+  get_impostor_texture_mgr()->buildRendinstElems();
+
   treeCrown->updateDataWithLock(0, sizeof(TreeCrown), (void *)&treeCrownData, VBLOCK_WRITEONLY);
   for (int v = 0; v < gen_data.verticalSamples; ++v)
   {
@@ -460,7 +463,7 @@ ImpostorBaker::ImpostorData ImpostorBaker::generate(DagorAsset *asset, const Imp
       d3d::driver_command(Drv3dCommand::D3D_FLUSH);
       get_impostor_texture_mgr()->setTreeCrownDataBuf(nullptr);
 
-      if (auto data = lock_texture_ro(impostorMask.getTex2D(), 0, TEXLOCK_READ))
+      if (auto data = lock_texture<const uint8_t>(impostorMask.getTex2D(), 0, TEXLOCK_READ))
       {
         Point3 pointToEye;
         if (gen_data.octahedralImpostor)
@@ -533,7 +536,7 @@ ImpostorBaker::ImpostorData ImpostorBaker::generate(DagorAsset *asset, const Imp
 
   ShaderGlobal::setBlock(globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
   ShaderGlobal::set_int(impostor_sdf_max_distanceVarId, RENDER_OVERSCALE * 8);
-  UniqueTexHolder impostorSdfTex =
+  UniqueTexWithShaderVar impostorSdfTex =
     dag::create_tex(nullptr, gen_data.textureWidth, gen_data.textureHeight, TEXFMT_R32UI | TEXCF_UNORDERED, 1, "impostor_sdf_tex");
   uint32_t maxDistance[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
   d3d::clear_rwtexi(impostorSdfTex.getTex2D(), maxDistance, 0, 0);
@@ -571,9 +574,11 @@ ImpostorBaker::ImpostorData ImpostorBaker::generate(DagorAsset *asset, const Imp
         TMatrix viewToContent = sliceLayout.getViewToContent(sliceId, IPoint2(gen_data.textureWidth, gen_data.textureHeight));
 
         if (gen_data.octahedralImpostor)
-          get_impostor_texture_mgr()->render_slice_octahedral(h, v, viewToContent, gen_data, res, rendinstSceneBlockId, last_lod);
+          get_impostor_texture_mgr()->render_slice_octahedral(h, v, viewToContent, gen_data, res, rendinst::RenderPass::ImpostorColor,
+            rendinstSceneBlockId, last_lod);
         else
-          get_impostor_texture_mgr()->render_slice_billboard(sliceId, viewToContent, res, rendinstSceneBlockId, last_lod);
+          get_impostor_texture_mgr()->render_slice_billboard(sliceId, viewToContent, res, rendinst::RenderPass::ImpostorColor,
+            rendinstSceneBlockId, last_lod);
         d3d::driver_command(Drv3dCommand::D3D_FLUSH);
         get_impostor_texture_mgr()->setTreeCrownDataBuf(nullptr);
         get_impostor_texture_mgr()->end_rendering_slices();
@@ -591,9 +596,11 @@ ImpostorBaker::ImpostorData ImpostorBaker::generate(DagorAsset *asset, const Imp
         TMatrix viewToContent = sliceLayout.getViewToContent(sliceId, IPoint2(gen_data.textureWidth, gen_data.textureHeight));
 
         if (gen_data.octahedralImpostor)
-          get_impostor_texture_mgr()->render_slice_octahedral(h, v, viewToContent, gen_data, res, rendinstSceneBlockId, last_lod);
+          get_impostor_texture_mgr()->render_slice_octahedral(h, v, viewToContent, gen_data, res, rendinst::RenderPass::ImpostorColor,
+            rendinstSceneBlockId, last_lod);
         else
-          get_impostor_texture_mgr()->render_slice_billboard(sliceId, viewToContent, res, rendinstSceneBlockId, last_lod);
+          get_impostor_texture_mgr()->render_slice_billboard(sliceId, viewToContent, res, rendinst::RenderPass::ImpostorColor,
+            rendinstSceneBlockId, last_lod);
         d3d::driver_command(Drv3dCommand::D3D_FLUSH);
         get_impostor_texture_mgr()->setTreeCrownDataBuf(nullptr);
         ShaderGlobal::set_int(branch_mask_renderVarId, 0);
@@ -608,11 +615,11 @@ ImpostorBaker::ImpostorData ImpostorBaker::generate(DagorAsset *asset, const Imp
             {packedTextures.ao_smoothness.getTex2D(), 0}});
         d3d::setview(0, 0, gen_data.textureWidth, gen_data.textureHeight, 0, 1);
         rt->setVar();
-        ShaderGlobal::set_color4(texture_sizeVarId, Color4(gen_data.textureWidth, gen_data.textureHeight, 0, 0));
+        ShaderGlobal::set_float4(texture_sizeVarId, Color4(gen_data.textureWidth, gen_data.textureHeight, 0, 0));
         if (sliceLayout.slices[h].flipped)
-          ShaderGlobal::set_color4(impostor_texture_transformVarId, Color4(1, -1, 0, 1));
+          ShaderGlobal::set_float4(impostor_texture_transformVarId, Color4(1, -1, 0, 1));
         else
-          ShaderGlobal::set_color4(impostor_texture_transformVarId, Color4(1, 1, 0, 0));
+          ShaderGlobal::set_float4(impostor_texture_transformVarId, Color4(1, 1, 0, 0));
         // The STATE_GUARD_NULLPTR macro fails with these expressions
         Texture *const tex1 = rt->getRt(0);
         Texture *const tex2 = rt->getRt(1);
@@ -642,7 +649,7 @@ ImpostorBaker::ImpostorData ImpostorBaker::generate(DagorAsset *asset, const Imp
       {{prePaddingTextures.albedo_alpha.getTex2D(), 0}, {prePaddingTextures.normal_translucency.getTex2D(), 0},
         {prePaddingTextures.ao_smoothness.getTex2D(), 0}});
     d3d::setview(0, 0, gen_data.textureWidth, gen_data.textureHeight, 0, 1);
-    ShaderGlobal::set_color4(texture_sizeVarId, Color4(gen_data.textureWidth, gen_data.textureHeight, 0, 0));
+    ShaderGlobal::set_float4(texture_sizeVarId, Color4(gen_data.textureWidth, gen_data.textureHeight, 0, 0));
     ShaderGlobal::set_texture(impostor_packed_albedo_alphaVarId, packedTextures.albedo_alpha.getTexId());
     ShaderGlobal::set_texture(impostor_packed_normal_translucencyVarId, packedTextures.normal_translucency.getTexId());
     ShaderGlobal::set_texture(impostor_packed_ao_smoothnessVarId, packedTextures.ao_smoothness.getTexId());
@@ -660,7 +667,7 @@ ImpostorBaker::ImpostorData ImpostorBaker::generate(DagorAsset *asset, const Imp
         {{prePaddingTextures.albedo_alpha.getTex2D(), mip}, {prePaddingTextures.normal_translucency.getTex2D(), mip},
           {prePaddingTextures.ao_smoothness.getTex2D(), mip}});
       d3d::setview(0, 0, gen_data.textureWidth >> mip, gen_data.textureHeight >> mip, 0, 1);
-      ShaderGlobal::set_color4(texture_sizeVarId, Color4(gen_data.textureWidth >> mip, gen_data.textureHeight >> mip, 0, 0));
+      ShaderGlobal::set_float4(texture_sizeVarId, Color4(gen_data.textureWidth >> mip, gen_data.textureHeight >> mip, 0, 0));
       ret.textures.albedo_alpha.getTex2D()->texmiplevel(mip - 1, mip - 1);
       ret.textures.normal_translucency.getTex2D()->texmiplevel(mip - 1, mip - 1);
       ret.textures.ao_smoothness.getTex2D()->texmiplevel(mip - 1, mip - 1);
@@ -998,9 +1005,10 @@ eastl::string ImpostorBaker::getDDSxPackName(const char *folder_path)
 
 void ImpostorBaker::computeDDSxPackSizes(dag::ConstSpan<DagorAsset *> assets)
 {
+  DA_PROFILE;
   for (auto *asset : assets)
   {
-    if (!isSupported(asset))
+    if ((getSupported(asset) & FLAT) == NONE)
       continue;
     const char *folderPath = asset->getFolderPath();
     eastl::string ddsxPackName = getDDSxPackName(folderPath);
@@ -1018,16 +1026,18 @@ void ImpostorBaker::generateFolderBlk(DagorAsset *asset, const ImpostorOptions &
   generateFolderBlk(getAssetFolder(asset), getDDSxPackName(folderPath).c_str(), options);
 }
 
-bool ImpostorBaker::hasSupportedType(DagorAsset *asset) const
+bool ImpostorBaker::hasSupportedType(DagorAsset *asset, ImpostorType) const
 {
   static int rendInstEntityClassId = DAEDITOR3.getAssetTypeId("rendInst");
   return asset->getType() == rendInstEntityClassId;
 }
 
-bool ImpostorBaker::isSupported(DagorAsset *asset) const
+ImpostorBaker::ImpostorType ImpostorBaker::getSupported(DagorAsset *asset) const
 {
-  if (!hasSupportedType(asset))
-    return false;
+  DA_PROFILE;
+  if (!hasSupportedType(asset, ALL))
+    return NONE;
+  ImpostorType type = NONE;
   int nid = asset->props.getNameId("lod");
   for (int i = 0; DataBlock *lodBlk = asset->props.getBlock(i); i++)
   {
@@ -1036,9 +1046,15 @@ bool ImpostorBaker::isSupported(DagorAsset *asset) const
     if (!lodBlk->paramExists("fname"))
       continue;
     if (strstr(lodBlk->getStr("fname", ""), "billboard_octagon_impostor") != nullptr)
-      return true;
+    {
+      type |= FLAT;
+      break;
+    }
   }
-  return false;
+  auto vblk = asset->props.getBlockByName("voxel_impostor");
+  if (vblk ? vblk->getBool("enabled", true) : defaultVoxelParams.getBool("enabled", false))
+    type |= VOXEL;
+  return type;
 }
 
 static int to_sh(float v) { return int(round(v * 1000.f)); }
@@ -1090,7 +1106,33 @@ ska::flat_hash_map<eastl::string, int> ImpostorBaker::getHashes(DagorAsset *asse
     aoFalloffStopLocal = impostorBlock->getReal("aoFalloffStop", aoFalloffStop);
     ret["aoBrightness"] = to_sh(aoBrightnessLocal);
     ret["aoFalloffStart"] = to_sh(aoFalloffStartLocal);
-    ret["aoFalloffStart"] = to_sh(aoFalloffStopLocal);
+    ret["aoFalloffStop"] = to_sh(aoFalloffStopLocal);
+  }
+
+  auto voxelBlk = asset->props.getBlockByName("voxel_impostor");
+  if (voxelBlk || defaultVoxelParams.getBool("enabled", false))
+  {
+    auto getReal = [this, voxelBlk](const char *name, float defval) {
+      defval = defaultVoxelParams.getReal(name, defval);
+      if (voxelBlk)
+        return voxelBlk->getReal(name, defval);
+      return defval;
+    };
+    auto getInt = [this, voxelBlk](const char *name, int defval) {
+      defval = defaultVoxelParams.getInt(name, defval);
+      if (voxelBlk)
+        return voxelBlk->getInt(name, defval);
+      return defval;
+    };
+
+    ret["targetFov"] = to_sh(getReal("targetFov", defaults::targetFov));
+    ret["targetResolution"] = to_sh(getReal("targetResolution", defaults::targetResolution));
+    ret["triangleThreshold"] = to_sh(getReal("triangleThreshold", defaults::triangleThreshold));
+    ret["minMapSize"] = getInt("minMapSize", defaults::minMapSize);
+    ret["maxMapSize"] = getInt("maxMapSize", defaults::maxMapSize);
+    ret["voxelSize"] = to_sh(getReal("voxelSize", defaults::voxelSize));
+    ret["minVoxelSize"] = to_sh(getReal("minVoxelSize", defaults::minVoxelSize));
+    ret["lodToBake"] = getInt("lodToBake", defaults::lodToBake);
   }
 
   return ret;
@@ -1144,12 +1186,13 @@ ImpostorBaker::ImpostorData ImpostorBaker::exportToFile(const ImpostorTextureMan
 
 void ImpostorBaker::gatherExportedFiles(DagorAsset *asset, eastl::set<String, StrLess> &files) const
 {
-  if (!isSupported(asset))
+  auto type = getSupported(asset);
+  if (type == NONE)
     return;
 
   String baseFolder = getAssetFolder(asset);
 
-  if (asset->props.blockExists("impostor"))
+  if (asset->props.blockExists("impostor") && (type & FLAT))
   {
     files.insert(String(0, "%s/%s_%s.tiff", baseFolder.c_str(), asset->getName(), ALBEDO_ALPHA_NAME));
     files.insert(String(0, "%s/%s_%s.tiff", baseFolder.c_str(), asset->getName(), NORMAL_TRANSLUCENCY_NAME));
@@ -1158,23 +1201,40 @@ void ImpostorBaker::gatherExportedFiles(DagorAsset *asset, eastl::set<String, St
     files.insert(String(0, "%s/%s_%s.tex.blk", baseFolder.c_str(), asset->getName(), NORMAL_TRANSLUCENCY_NAME));
     files.insert(String(0, "%s/%s_%s.tex.blk", baseFolder.c_str(), asset->getName(), AO_SMOOTHNESS_NAME));
   }
+
+  if (type & VOXEL)
+  {
+    files.insert(String(0, "%s/%s_%s", baseFolder.c_str(), asset->getName(), voxelcache::VOXEL_CACHE_NAME));
+  }
+}
+
+void ImpostorBaker::setOptions(const ImpostorOptions &options)
+{
+  if (options.defaultVoxelImpostor)
+    defaultVoxelParams.setBool("enabled", options.defaultVoxelImpostor.value());
 }
 
 void ImpostorBaker::clean(dag::ConstSpan<DagorAsset *> assets, const ImpostorOptions &options)
 {
+  DA_PROFILE;
+  setOptions(options);
   std::regex impostorTexReg{FILE_REGEX};
   eastl::set<String, StrLess> files;
   eastl::set<String, StrLess> folders;
   bool stop = false;
-  for (int i = 0; i < assets.size(); ++i)
-    if (isSupported(assets[i]))
+  {
+    TIME_PROFILE(gather_exported_files);
+    for (int i = 0; i < assets.size(); ++i)
       gatherExportedFiles(assets[i], files);
+  }
   for (unsigned int i = 0; i < assets.size(); ++i)
   {
     String folder = getAssetFolder(assets[i]);
-    if (folders.count(folder) > 0 || !::dd_dir_exist(folder.c_str()))
+    if (folders.count(folder) > 0)
       continue;
     folders.insert(folder);
+    if (!::dd_dir_exist(folder.c_str()))
+      continue;
     conlog("Cleaning %s/*", folder.c_str());
     for (const alefind_t &tex : dd_find_iterator(String(0, "%s/*", folder.c_str()).c_str(), DA_FILE))
     {
@@ -1355,7 +1415,7 @@ bool ImpostorBaker::generateAssetTexBlk(DagorAsset *asset, const ImpostorTexture
 
 bool ImpostorBaker::updateAssetTexBlk(DagorAsset *asset, int &out_processed, int &out_changed)
 {
-  const eastl::array<const char *, 5> tex_suff = {
+  const eastl::array<const char *, 3> tex_suff = {
     ALBEDO_ALPHA_NAME,
     NORMAL_TRANSLUCENCY_NAME,
     AO_SMOOTHNESS_NAME,
@@ -1366,7 +1426,7 @@ bool ImpostorBaker::updateAssetTexBlk(DagorAsset *asset, int &out_processed, int
   for (const char *tsuff : tex_suff)
   {
     String filename = String(0, "%s/%s_%s.tex.blk", getAssetFolder(asset), asset->getName(), tsuff);
-    DEBUG_DUMP_VAR(filename);
+    // DEBUG_DUMP_VAR(filename);
     if (dd_file_exists(filename) && dblk::load(blk, filename))
     {
       out_processed++;

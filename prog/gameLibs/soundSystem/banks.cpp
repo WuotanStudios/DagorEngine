@@ -22,13 +22,13 @@
 #include <osApiWrappers/dag_miscApi.h>
 #include <startup/dag_globalSettings.h>
 #include "internal/framememString.h"
-#include "internal/attributes.h"
-#include "internal/banks.h"
+#include "internal/attributes_internal.h"
+#include "internal/banks_internal.h"
 #include "internal/banks.verifyMods.h"
 #include "internal/pathHash.h"
-#include "internal/visualLabels.h"
-#include "internal/attributes.h"
-#include "internal/debug.h"
+#include "internal/visualLabels_internal.h"
+#include "internal/attributes_internal.h"
+#include "internal/debug_internal.h"
 #if _TARGET_ANDROID || _TARGET_IOS
 #include <crashlytics/firebase_crashlytics.h>
 #endif
@@ -44,6 +44,8 @@ using Bitset = eastl::bitset<max_banks>;
 
 static bool g_report_bank_loading_time = false;
 
+using FileInfoStr = eastl::fixed_string<char, 96>;
+
 struct Bank
 {
   using id_t = uint32_t;
@@ -51,6 +53,9 @@ struct Bank
 
   FMOD::Studio::Bank *fmodBank = nullptr;
   const eastl::string path;
+  int64_t fileSize = -1;
+  int64_t fileMTime = -1;
+  uint64_t fileHeadTailHash = 0;
   const label_t label; // filename trimmed after dot (e.g. hash("master_bank"), same for "/master_bank.bank",
                        // "/master_bank.strings.bank", "/master_bank.assets.bank")
   const id_t id = 0;
@@ -60,10 +65,11 @@ struct Bank
   const bool isLoadToMemory = false;
   const bool isOptional = false;
   const bool isMod = false;
+  const bool isPathOptional = false;
 
   Bank() = delete;
-  Bank(const char *path, label_t label, id_t id, bool is_async, bool is_preload, bool is_load_to_memory, bool is_optional,
-    bool is_mod) :
+  Bank(const char *path, label_t label, id_t id, bool is_async, bool is_preload, bool is_load_to_memory, bool is_optional, bool is_mod,
+    bool is_path_optional) :
     path(path),
     label(label),
     id(id),
@@ -71,7 +77,8 @@ struct Bank
     isPreload(is_preload),
     isLoadToMemory(is_load_to_memory),
     isOptional(is_optional),
-    isMod(is_mod)
+    isMod(is_mod),
+    isPathOptional(is_path_optional)
   {}
 };
 
@@ -222,6 +229,65 @@ static inline void make_localized(FrameStr &str) { replace(str, "<loc>", locale.
 
 // ............................................................
 
+static void get_file_size_and_mtime(const char *filename, int64_t &size, int64_t &mtime)
+{
+  size = -1;
+  mtime = -1;
+  DagorStat stat = {};
+  if (df_stat(filename, &stat) == 0)
+  {
+    size = stat.size;
+    mtime = stat.mtime;
+  }
+}
+
+static constexpr int head_tail_chunk_size = 64 << 10;
+
+// hash of file size, first and last head_tail_chunk_size bytes; reads up to 2 * head_tail_chunk_size bytes
+static uint64_t get_file_head_tail_hash(const char *filename)
+{
+  file_ptr_t fp = df_open(filename, DF_READ | DF_IGNORE_MISSING);
+  if (!fp)
+    return 0;
+  FINALLY([fp]() { df_close(fp); });
+
+  const intptr_t filesize = df_length(fp);
+  if (filesize <= 0)
+    return 0;
+
+  const intptr_t headSize = min(filesize, (intptr_t)head_tail_chunk_size);
+  eastl::vector<char, framemem_allocator> buf;
+  buf.resize(headSize);
+  G_ASSERT_RETURN(buf.size() == headSize, 0);
+
+  const int64_t filesize64 = filesize;
+  uint64_t hash = mod_file_hash_fun((const char *)&filesize64, sizeof(filesize64), 0);
+
+  if (df_read(fp, buf.begin(), headSize) != headSize)
+    return 0;
+  hash = mod_file_hash_fun(buf.begin(), headSize, hash);
+
+  if (filesize > head_tail_chunk_size)
+  {
+    if (df_seek_to(fp, filesize - head_tail_chunk_size) != 0)
+      return 0;
+    if (df_read(fp, buf.begin(), head_tail_chunk_size) != head_tail_chunk_size)
+      return 0;
+    hash = mod_file_hash_fun(buf.begin(), head_tail_chunk_size, hash);
+  }
+
+  return hash;
+}
+
+static FileInfoStr make_file_info_str(const Bank &bank)
+{
+  FileInfoStr str;
+  str.sprintf("size=%lld, mtime=%lld", (long long)bank.fileSize, (long long)bank.fileMTime);
+  if (bank.fileHeadTailHash != 0)
+    str.append_sprintf(", headTailHash=%llu", (unsigned long long)bank.fileHeadTailHash);
+  return str;
+}
+
 static inline FMOD_RESULT load_bank_memory(const char *filename, FMOD_STUDIO_LOAD_BANK_FLAGS flags, FMOD::Studio::Bank **fmod_bank)
 {
   eastl::vector<char> data;
@@ -277,6 +343,16 @@ static inline void load_bank(Bank &bank, const PathTags &path_tags)
     patch_path_with_mod(taggedPath);
 
   const char *realPath = df_get_real_name(taggedPath.c_str());
+  if (!realPath && bank.isPathOptional && !bank.isMod)
+  {
+    if (const char *fileName = dd_get_fname(taggedPath.c_str()))
+    {
+      FrameStr fallback;
+      fallback.sprintf("%s/%s", g_banks_folder.c_str(), fileName);
+      taggedPath = eastl::move(fallback);
+      realPath = df_get_real_name(taggedPath.c_str());
+    }
+  }
   if (!realPath)
   {
     failed_banks.set(bank.id);
@@ -291,6 +367,9 @@ static inline void load_bank(Bank &bank, const PathTags &path_tags)
 
   FMOD_STUDIO_LOAD_BANK_FLAGS flags = is_async(bank.id) ? FMOD_STUDIO_LOAD_BANK_NONBLOCKING : FMOD_STUDIO_LOAD_BANK_NORMAL;
   const int32_t start = get_time_msec();
+
+  get_file_size_and_mtime(realPath, bank.fileSize, bank.fileMTime);
+  bank.fileHeadTailHash = get_file_head_tail_hash(realPath);
 
   const FMOD_RESULT result = bank.isLoadToMemory ? load_bank_memory(realPath, flags, &bank.fmodBank)
                                                  : fmodapi::get_studio_system()->loadBankFile(realPath, flags, &bank.fmodBank);
@@ -317,7 +396,7 @@ static inline void load_bank(Bank &bank, const PathTags &path_tags)
     if (g_report_bank_loading_time)
     {
       const int32_t now = get_time_msec();
-      debug("[SNDSYS] load bank \"%s\" in %d ms", realPath, now - start);
+      debug("[SNDSYS] loaded bank (sync) \"%s\" in %d ms  %s", realPath, now - start, make_file_info_str(bank).c_str());
     }
   }
 }
@@ -337,7 +416,7 @@ static inline void unload_bank(Bank &bank, eastl::vector<FMOD::Studio::Bank *, f
 }
 
 static inline void append_bank(const char *path, Bank::label_t label, bool is_async, bool is_preload, bool is_load_to_memory,
-  bool is_optional, bool is_mod, Preset &preset)
+  bool is_optional, bool is_mod, bool is_path_optional, Preset &preset)
 {
   auto pred = [path](const Bank &bank) { return bank.path == path; };
   auto it = eastl::find_if(all_banks.begin(), all_banks.end(), pred);
@@ -345,14 +424,14 @@ static inline void append_bank(const char *path, Bank::label_t label, bool is_as
   if (it != all_banks.end())
   {
     bankId = it - all_banks.begin();
-    G_ASSERTF(it->isMod == is_mod && it->isOptional == is_optional && it->isOptional == is_optional && it->isAsync == is_async &&
-                it->isPreload == is_preload && it->isLoadToMemory == is_load_to_memory,
+    G_ASSERTF(it->isMod == is_mod && it->isOptional == is_optional && it->isPathOptional == is_path_optional &&
+                it->isAsync == is_async && it->isPreload == is_preload && it->isLoadToMemory == is_load_to_memory,
       "Append new to existing bank parameters mismatch: there is already bank with same path but different options");
   }
   else
   {
     bankId = all_banks.size();
-    all_banks.emplace_back(path, label, bankId, is_async, is_preload, is_load_to_memory, is_optional, is_mod);
+    all_banks.emplace_back(path, label, bankId, is_async, is_preload, is_load_to_memory, is_optional, is_mod, is_path_optional);
     G_ASSERT(all_banks.size() <= max_banks);
   }
   preset.banks.set(bankId);
@@ -360,7 +439,7 @@ static inline void append_bank(const char *path, Bank::label_t label, bool is_as
 
 static inline bool is_preset_loaded(const Preset &preset)
 {
-  return preset.banks.any() && preset.banks == (preset.banks & (loaded_banks | failed_banks));
+  return preset.banks.any() && (preset.banks & loaded_banks).any() && preset.banks == (preset.banks & (loaded_banks | failed_banks));
 }
 
 using loaded_presets_t = eastl::vector<eastl::pair<str_hash_t /*preset_hash*/, bool /*is_loaded*/>, framemem_allocator>;
@@ -502,7 +581,9 @@ static void update_impl(loaded_presets_t &lp)
         SOUND_VERIFY(bank.fmodBank->unload());
         bank.fmodBank = nullptr;
       }
-      err_cb("error loading bank", FMOD_ErrorString(result), bank.path.c_str(), bank.isMod);
+      FrameStr errMessage;
+      errMessage.sprintf("error loading bank, %s", make_file_info_str(bank).c_str());
+      err_cb(errMessage.c_str(), FMOD_ErrorString(result), bank.path.c_str(), bank.isMod);
       continue;
     }
 
@@ -511,7 +592,8 @@ static void update_impl(loaded_presets_t &lp)
 
     if (state == FMOD_STUDIO_LOADING_STATE_LOADED)
     {
-      debug("[SNDSYS] loaded bank '%s', isMod=%s", bank.path.c_str(), bank.isMod ? "true" : "false");
+      debug("[SNDSYS] loaded bank '%s', isMod=%s, %s", bank.path.c_str(), bank.isMod ? "true" : "false",
+        make_file_info_str(bank).c_str());
       loaded_banks.set(bank.id);
       if (is_preload(bank.id))
       {
@@ -608,10 +690,11 @@ static void add_bank(const char *file_name, const DataBlock &blk, const char *ba
 
   G_STATIC_ASSERT((eastl::is_same<Bank::label_t, str_hash_t>::value));
   append_bank(path.c_str(), SND_HASH_SLOW(label.c_str()), blk.getBool("async", false), blk.getBool("preload", false),
-    blk.getBool("loadToMemory", false), blk.getBool("optional", false), isMod || isModAndTagged, preset);
+    blk.getBool("loadToMemory", false), blk.getBool("optional", false), isMod || isModAndTagged, blk.getBool("isPathOptional", false),
+    preset);
 };
 
-void init(const DataBlock &blk, const ProhibitedBankDescs &prohibited_bank_descs)
+void init(const DataBlock &blk, const ProhibitedBankDescs &prohibited_bank_descs, dag::ConstSpan<const char *> no_mod_banks_names)
 {
   SNDSYS_IS_MAIN_THREAD;
   G_ASSERT_RETURN(sndsys::is_inited(), );
@@ -644,7 +727,6 @@ void init(const DataBlock &blk, const ProhibitedBankDescs &prohibited_bank_descs
 
   g_report_bank_loading_time = blk.getBool("reportBankLoadingTime", false);
 
-  FrameStr name, path;
   const DataBlock &presetsBlk = *banksBlk.getBlockByNameEx("presets");
   all_presets.reserve(presetsBlk.blockCount());
   for (int j = 0; j < presetsBlk.blockCount(); ++j)
@@ -656,7 +738,16 @@ void init(const DataBlock &blk, const ProhibitedBankDescs &prohibited_bank_descs
     for (int i = 0; i < presetBlk->blockCount(); ++i)
     {
       const DataBlock *bankBlk = presetBlk->getBlock(i);
-      add_bank(bankBlk->getBlockName(), *bankBlk, folder, extension, enableMod, preset);
+      const char *bankName = bankBlk->getBlockName();
+      bool enableModForBank = enableMod;
+      for (const char *noModName : no_mod_banks_names)
+        if (!strcmp(noModName, bankName))
+        {
+          enableModForBank = false;
+          break;
+        }
+
+      add_bank(bankBlk->getBlockName(), *bankBlk, folder, extension, enableModForBank, preset);
     }
 
     for (int i = 0; i < presetBlk->paramCount(); ++i)
@@ -674,6 +765,10 @@ void init(const DataBlock &blk, const ProhibitedBankDescs &prohibited_bank_descs
   {
     const DataBlock *pluginBlk = pluginsBlk->getBlock(j);
     const char *fileName = pluginBlk->getStr(PLUGIN_SUBSYSTEM);
+#if __e2k__ || (_TARGET_PC_WIN && _M_ARM64) // no ported binary of ResonanceAudio plugin for these arch
+    if (strstr(fileName, "resonanceaudio"))
+      continue;
+#endif
     all_plugins.emplace_back(fileName);
   }
 }
@@ -746,7 +841,17 @@ bool are_banks_from_preset_exist(const char *preset_name, const char *lang, cons
         if (type)
           replace(bankPath, "<type>", type);
         if (!dd_file_exist(bankPath.c_str()))
-          return false;
+        {
+          if (!bank.isPathOptional || bank.isMod)
+            return false;
+          const char *fileName = dd_get_fname(bankPath.c_str());
+          if (!fileName)
+            return false;
+          FrameStr fallback;
+          fallback.sprintf("%s/%s", g_banks_folder.c_str(), fileName);
+          if (!dd_file_exist(fallback.c_str()))
+            return false;
+        }
       }
     }
     return true;

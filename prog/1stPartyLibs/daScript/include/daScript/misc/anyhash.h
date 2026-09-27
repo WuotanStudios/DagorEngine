@@ -2,6 +2,15 @@
 
 #include "daScript/misc/wyhash.h"
 
+// defensive fallbacks — anyhash.h may be pulled in through das_config.h
+// before platform.h / vecmath/dag_vecMathDecl.h have defined these.
+#ifndef DAS_SUPPRESS_UB
+#define DAS_SUPPRESS_UB
+#endif
+#ifndef NO_ASAN_INLINE
+#define NO_ASAN_INLINE inline
+#endif
+
 /*
     this is where we configure low level hash implementation
 */
@@ -10,8 +19,24 @@
 #define HASH_KILLED64    1
 #define DAS_WYHASH_SEED  UINT64_C(0x1234567890abcdef)
 
+// Under ASAN, default DAS_SAFE_HASH to 1. The fast path's `*(uint16_t *)block`
+// reads 1 byte past the C-string null, which crosses the std::string allocation
+// boundary and ASAN flags. NO_ASAN_INLINE on hash_blockz64 (below) is best-effort
+// only — its fallback in this header is empty, so the attribute may not actually
+// take effect depending on whether vecmath/dag_vecMathDecl.h has been included.
+//
+// __has_feature is Clang-only; guard it with the standard portability shim so
+// GCC's preprocessor doesn't choke parsing the RHS of `&&` (short-circuit is
+// semantic, not lexical).
+#ifndef __has_feature
+    #define __has_feature(x) 0
+#endif
 #ifndef DAS_SAFE_HASH
-#define DAS_SAFE_HASH    0
+    #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+        #define DAS_SAFE_HASH 1
+    #else
+        #define DAS_SAFE_HASH 0
+    #endif
 #endif
 
 namespace das {
@@ -21,15 +46,21 @@ namespace das {
         return h <= HASH_KILLED64 ? UINT64_C(1099511628211) : h;
     }
 
+    DAS_SUPPRESS_UB
     static NO_ASAN_INLINE uint64_t hash_blockz64 ( const uint8_t * block ) {
         auto FNV_offset_basis = UINT64_C(14695981039346656037);
         auto FNV_prime = UINT64_C(1099511628211);
         if ( !block ) return FNV_offset_basis;
         auto h = FNV_offset_basis;
 #if DAS_SAFE_HASH
-        while ( *block ) {
-            h ^= *block++;
+        while ( true ) {
+            uint64_t v = block[0];
+            if ( v==0 ) break;
+            v |= uint64_t(block[1])<<8;
+            h ^= v;
             h *= FNV_prime;
+            if ( v < 0x100 ) break;
+            block += 2;
         }
 #else
         while ( true ) {

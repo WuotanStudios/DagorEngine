@@ -10,22 +10,24 @@
 #include <shaders/dag_shaderVarType.h>
 #include <shaders/shInternalTypes.h>
 #include <shaders/shader_layout.h>
+#include <math/dag_TMatrix.h>
 
 
 struct RaytraceTopAccelerationStructure;
 
 // NOTE: this CAN be done through templates, but I hate it
 // Also note that we use simd types for their alignment
-#define SHVAR_TYPES                      \
-  X(SHVT_INT, int)                       \
-  X(SHVT_REAL, float)                    \
-  X(SHVT_COLOR4, vec4f)                  \
-  X(SHVT_TEXTURE, shaders_internal::Tex) \
-  X(SHVT_BUFFER, shaders_internal::Buf)  \
-  X(SHVT_INT4, vec4i)                    \
-  X(SHVT_FLOAT4X4, TMatrix4_vec4)        \
-  X(SHVT_SAMPLER, d3d::SamplerHandle)    \
-  X(SHVT_TLAS, RaytraceTopAccelerationStructure *)
+#define SHVAR_TYPES                                \
+  X(SHVT_INT, int)                                 \
+  X(SHVT_REAL, float)                              \
+  X(SHVT_COLOR4, vec4f)                            \
+  X(SHVT_TEXTURE, shaders_internal::Tex)           \
+  X(SHVT_BUFFER, shaders_internal::Buf)            \
+  X(SHVT_INT4, vec4i)                              \
+  X(SHVT_FLOAT4X4, TMatrix4_vec4)                  \
+  X(SHVT_SAMPLER, d3d::SamplerHandle)              \
+  X(SHVT_TLAS, RaytraceTopAccelerationStructure *) \
+  X(SHVT_FLOAT4x3, TMatrix)
 
 class ShaderVarsState
 {
@@ -73,9 +75,11 @@ public:
     const auto offsets = recalc_layout(dump.globVars);
 
     {
-      const size_t storageAlign = *eastl::max_element(SHVAR_TYPE_ALIGNMENTS.begin(), SHVAR_TYPE_ALIGNMENTS.end());
+#define X(SHVT, Type) G_STATIC_ASSERT(alignof(Type) <= 16);
+      SHVAR_TYPES
+#undef X
       const size_t storageSize = offsets.back();
-      storage.reset(static_cast<char *>(memalloc_aligned_default(storageSize, storageAlign)));
+      storage.reset(static_cast<char *>(memalloc_default(storageSize)));
     }
 
     const d3d::SamplerHandle defaultSamplerHnd = d3d::request_sampler({});
@@ -127,14 +131,9 @@ public:
 private:
   dag::Vector<VarDescription> variables;
 
-  struct AlignedDeleter
-  {
-    void operator()(void *ptr) const { memfree_aligned_default(ptr); }
-  };
-
   // Single contiguous storage with order preserved from the original
   // layout increases probability of cache hits
-  eastl::unique_ptr<char[], AlignedDeleter> storage;
+  eastl::unique_ptr<char[]> storage;
 };
 
 #undef SHVAR_TYPES

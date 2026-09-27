@@ -4,6 +4,7 @@
 //
 #pragma once
 
+#include <de3_layerHiddenMask.h>
 #include <util/dag_stdint.h>
 
 class DagorAsset;
@@ -17,7 +18,13 @@ class IObjEntity
 public:
   static const int ST_NOT_COLLIDABLE = 31; //< hardcoded subtype that disables collision test for entity
 
-  inline IObjEntity(int cls) : entityClass(cls), subType(0), editLayerIdx(0), flags(0) {}
+  // Reserved editLayerIdx values, outside the range that edit layers use.
+  // Hiding LAYER_INDEX_ALWAYS_HIDDEN is the user's responsibility, LayerHiddenMask does not set it to hidden.
+  // See IObjEntityFilter::setLayerHiddenMask().
+  static constexpr int LAYER_INDEX_ALWAYS_HIDDEN = LayerHiddenMask::BIT_COUNT - 1;
+  static constexpr int LAYER_INDEX_LANDCLASS = LayerHiddenMask::BIT_COUNT - 2;
+
+  inline IObjEntity(int cls) : entityClass(cls), subType(0), flags(0), editLayerIdx(0) {}
 
   virtual void setTm(const TMatrix &tm) = 0;
   virtual void getTm(TMatrix &tm) const = 0;
@@ -42,9 +49,9 @@ public:
   virtual void setEditLayerIdx(int t) { editLayerIdx = t; }
 
   inline int checkSubtypeMask(unsigned mask) const { return (1 << subType) & mask; }
-  inline int checkSubtypeAndLayerHiddenMasks(unsigned stmask, uint64_t lhmask) const
+  inline int checkSubtypeAndLayerHiddenMasks(unsigned stmask, LayerHiddenMask lhmask) const
   {
-    return ((stmask >> subType) & 1) && !((lhmask >> editLayerIdx) & 1);
+    return ((stmask >> subType) & 1) && !lhmask.isHidden(editLayerIdx);
   }
 
   inline unsigned getFlags() const { return flags; }
@@ -65,8 +72,9 @@ public:
 protected:
   int entityClass;
   unsigned subType : 6;
-  unsigned editLayerIdx : 6;
   unsigned flags : 20;
+  uint8_t editLayerIdx;
+  G_STATIC_ASSERT(LayerHiddenMask::BIT_COUNT <= (1 << (sizeof(editLayerIdx) * 8)));
 };
 
 

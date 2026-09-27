@@ -11,6 +11,8 @@
 #include <EASTL/string_view.h>
 #include <EASTL/span.h>
 
+class IMalloc;
+
 namespace dxil
 {
 struct CompileResult
@@ -26,6 +28,12 @@ enum class PDBMode
   NONE,
   SMALL,
   FULL
+};
+enum class BlobDebugParts
+{
+  STRIP,
+  KEEP,
+  EMBED
 };
 enum class DXCVersion
 {
@@ -59,17 +67,18 @@ struct DXCSettings
   bool pipelineIsMesh = false;
   bool pipelineHasAmplification = false;
   bool scarlettWaveSize32 = false;
-  bool saveHlslToBlob = false;
   bool hlsl2021 = false;
   // 0 (disable) - 3 (best)
   uint32_t optimizeLevel = 3;
   PDBMode pdbMode = PDBMode::NONE;
+  BlobDebugParts blobDebugParts = BlobDebugParts::STRIP;
   eastl::wstring_view PDBBasePath;
+  eastl::wstring_view PDBNameOverride;
   eastl::wstring_view rootSignatureDefine;
   dag::Vector<DXCDefine> defines;
 };
 CompileResult compileHLSLWithDXC(dag::ConstSpan<char> src, const char *entry, const char *profile, const DXCSettings &settings,
-  void *dxc_lib, DXCVersion dxc_version);
+  void *dxc_lib, DXCVersion dxc_version, IMalloc *allocation_cb = nullptr);
 eastl::string disassemble(eastl::span<const uint8_t> data, void *dxc_lib);
 uint16_t parse_NVIDIA_extension_use(eastl::string_view dxil_asm, eastl::string &log);
 uint16_t parse_AMD_extension_use(eastl::string_view dxil_asm, eastl::string &log);
@@ -81,6 +90,7 @@ struct PreprocessResult
   eastl::string errorLog;
   eastl::string messageLog;
 };
-PreprocessResult preprocessHLSLWithDXC(dag::ConstSpan<char> src, dag::ConstSpan<DXCDefine> defines, void *dxc_lib);
+PreprocessResult preprocessHLSLWithDXC(const char *profile, dag::ConstSpan<char> src, dag::ConstSpan<DXCDefine> defines, void *dxc_lib,
+  IMalloc *allocation_cb = nullptr);
 
 } // namespace dxil

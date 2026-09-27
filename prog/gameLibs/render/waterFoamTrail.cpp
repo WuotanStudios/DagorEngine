@@ -49,11 +49,15 @@ struct Segment
   bbox3f box;
   Tab<Vertex> points;
   int owner; // which cascade is already claimed it
+
+  Segment *prevSeg;
+  Segment *nextSeg;
 };
 
-static float get_segment_fade_out_time(Segment *p)
+static float get_segment_fade_out_time(Segment *p, float t)
 {
-  return g_settings.fadeOutTime * (get_settings().enableGenMuls ? p->genMul * p->forcedGenMul : 1.f);
+  float forcedGenMul = p->nextSeg ? lerp(p->forcedGenMul, p->nextSeg->forcedGenMul, t) : p->forcedGenMul;
+  return g_settings.fadeOutTime * (get_settings().enableGenMuls ? p->genMul * forcedGenMul : 1.f);
 }
 
 template <typename Ctx>
@@ -172,6 +176,9 @@ struct Emitter
     {
       G_ASSERT(lastSeg->points.size() > 1);
 
+      seg->prevSeg = lastSeg;
+      lastSeg->nextSeg = seg;
+
       seg->totalLength = lastSeg->totalLength;
 
       const Vertex &pl = lastSeg->points[lastSeg->points.size() - 1];
@@ -224,7 +231,7 @@ struct Emitter
     Vertex &v1 = points.back();
 
     float genMulRcp = 1.f / seg->genMul;
-    float st = (step ? 1.f : -1.f) / get_segment_fade_out_time(seg);
+    float st = (step ? 1.f : -1.f) / get_segment_fade_out_time(seg, 0.0f);
     alpha *= alphaMul;
     alpha *= min(len / max(g_settings.tailFadeInLength, 1e-3f), 1.0f);
 
@@ -261,7 +268,6 @@ struct Renderer
   {
     float areaSize;
     bbox3f box;
-    TMatrix4 mat;
     int activeBufferTriCount;
     int finalizedBufferTriCount;
   };
@@ -277,15 +283,11 @@ struct Renderer
   Ptr<ShaderElement> shElem;
   Ptr<ShaderMaterial> shMat;
 
-  int texArrayVarId;
-  TEXTUREID texArrayId;
-
-  ArrayTexture *texArray;
-  SharedTexHolder maskTex;
+  SharedTexWithShaderVar maskTex;
 
   shaders::UniqueOverrideStateId blendOpStateId;
 
-  Renderer(Ctx *ctx_) : ctx(ctx_), texArray(NULL), texArrayId(BAD_TEXTUREID)
+  Renderer(Ctx *ctx_) : ctx(ctx_)
   {
     for (int i = 0; i < g_settings.cascadeCount; ++i)
     {
@@ -322,8 +324,9 @@ struct Renderer
 
     shElem = shMat->make_elem();
 
-    activeBuffer = d3d::create_vb(g_settings.activeVertexCount * sizeof(Vertex), SBCF_DYNAMIC, "water_foam_trail_a");
-    finalizedBuffer = d3d::create_vb(g_settings.finalizedVertexCount * sizeof(Vertex), SBCF_DYNAMIC, "water_foam_trail_f");
+    activeBuffer = d3d::create_vb(g_settings.activeVertexCount * sizeof(Vertex), SBCF_DYNAMIC, "water_foam_trail_a", RESTAG_WATER);
+    finalizedBuffer =
+      d3d::create_vb(g_settings.finalizedVertexCount * sizeof(Vertex), SBCF_DYNAMIC, "water_foam_trail_f", RESTAG_WATER);
 
     SharedTex maskTexRes = dag::get_tex_gameres(g_settings.texName);
     G_ASSERT(maskTexRes);
@@ -331,14 +334,7 @@ struct Renderer
     if (!is_managed_textures_streaming_load_on_demand())
       ddsx::tex_pack2_perform_delayed_data_loading();
 
-    maskTex = SharedTexHolder(eastl::move(maskTexRes), "water_foam_trail_mask");
-    ShaderGlobal::set_sampler(::get_shader_variable_id("water_foam_trail_mask_samplerstate", true),
-      get_texture_separate_sampler(maskTex.getTexId()));
-
-    texArrayVarId = ::get_shader_variable_id("water_foam_trail");
-    d3d::SamplerInfo smpInfo;
-    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Wrap;
-    ShaderGlobal::set_sampler(::get_shader_variable_id("water_foam_trail_samplerstate", true), d3d::request_sampler(smpInfo));
+    maskTex = SharedTexWithShaderVar(eastl::move(maskTexRes), "water_foam_trail_mask");
 
     shaders::OverrideState blendOpState;
     blendOpState.set(shaders::OverrideState::BLEND_OP | shaders::OverrideState::BLEND_OP_A);
@@ -352,9 +348,6 @@ struct Renderer
   ~Renderer()
   {
     blendOpStateId.reset();
-
-    ShaderGlobal::set_texture(texArrayVarId, BAD_TEXTUREID);
-    ShaderGlobal::reset_from_vars_and_release_managed_tex_verified(texArrayId, texArray);
 
     del_d3dres(activeBuffer);
     del_d3dres(finalizedBuffer);
@@ -387,12 +380,7 @@ struct Renderer
 
         seg->owner = c_id == 0 ? endCascade : seg->owner; // clear ownership for new frame
 
-        if (!g_settings.useTexArray)
-        {
-          if (!frustum.testBoxB(seg->box.bmin, seg->box.bmax))
-            continue;
-        }
-        else if (seg->owner < c_id || !v_bbox3_test_box_intersect(csc.box, seg->box))
+        if (!frustum.testBoxB(seg->box.bmin, seg->box.bmax))
           continue;
 
         seg->owner = c_id;
@@ -425,14 +413,6 @@ struct Renderer
 
   void calcCascades()
   {
-    static int matVarId[8] = {::get_shader_variable_id("water_foam_trail_mat00"), ::get_shader_variable_id("water_foam_trail_mat01"),
-      ::get_shader_variable_id("water_foam_trail_mat10"), ::get_shader_variable_id("water_foam_trail_mat11"),
-      ::get_shader_variable_id("water_foam_trail_mat20"), ::get_shader_variable_id("water_foam_trail_mat21"),
-      ::get_shader_variable_id("water_foam_trail_mat30"), ::get_shader_variable_id("water_foam_trail_mat31")};
-
-    TMatrix4 view = matrix_look_at_lh(Point3::x0y(ctx->currentOrigin) + Point3(0.f, 1.f, 0.f), Point3::x0y(ctx->currentOrigin),
-      Point3(0.f, 0.f, 1.f));
-
     for (int ci = 0; ci < cascades.size(); ++ci)
     {
       Cascade &c = cascades[ci];
@@ -442,23 +422,12 @@ struct Renderer
 
       float s = c.areaSize * g_settings.cascadeAreaScale;
       float hs = s * 0.5f;
-      TMatrix4 proj = matrix_ortho_lh_forward(s, s, 0.f, 1.f);
-      c.mat = view * proj;
-      c.mat._41 = floor(c.mat._41 / texelAlign.x) * texelAlign.x;
-      c.mat._42 = floor(c.mat._42 / texelAlign.y) * texelAlign.y;
 
       Point2 lt = Point2(-hs, -hs) + ctx->currentOrigin;
       Point2 rb = Point2(+hs, +hs) + ctx->currentOrigin;
       v_bbox3_init_empty(c.box);
       v_bbox3_add_pt(c.box, v_make_vec4f(lt.x, -1.f, lt.y, 0.f));
       v_bbox3_add_pt(c.box, v_make_vec4f(rb.x, +1.f, rb.y, 0.f));
-
-      int mat0VarId = matVarId[ci * 2 + 0];
-      int mat1VarId = matVarId[ci * 2 + 1];
-
-      ShaderGlobal::set_color4_fast(mat0VarId, Color4(c.mat[0][0], c.mat[1][0], c.mat[2][0], c.mat[3][0]));
-
-      ShaderGlobal::set_color4_fast(mat1VarId, Color4(c.mat[0][1], c.mat[1][1], c.mat[2][1], c.mat[3][1]));
     }
   }
 
@@ -478,10 +447,7 @@ struct Renderer
     bool needTrail = g_settings.useTrail && (activeBufferTriCount > 0 || finalizedBufferTriCount > 0);
 
     if (!needTrail)
-    {
-      ShaderGlobal::set_texture(texArrayVarId, BAD_TEXTUREID);
       return false;
-    }
 
     SCOPE_RENDER_TARGET;
     SCOPE_VIEW_PROJ_MATRIX;
@@ -498,8 +464,6 @@ struct Renderer
 
     shaders::overrides::reset();
 
-    ShaderGlobal::set_texture(texArrayVarId, texArrayId);
-
     return true;
   }
 
@@ -515,16 +479,6 @@ struct Renderer
       TIME_D3D_PROFILE_NAME(water_trail_render_, name);
 
       const Cascade &c = cascades[ci];
-
-      if (texArray)
-      {
-        d3d::settm(TM_VIEW, &TMatrix4::IDENT);
-        d3d::settm(TM_PROJ, &c.mat);
-
-        ShaderGlobal::set_texture(texArrayVarId, BAD_TEXTUREID);
-        d3d::set_render_target(0, texArray, ci, 0);
-        d3d::clearview(CLEAR_TARGET, 0x00000000, 0.f, 0);
-      }
 
       shElem->setStates(0, true);
 
@@ -545,26 +499,23 @@ struct Renderer
     }
 
     static int currentGenVarId = ::get_shader_variable_id("water_foam_trail_gen");
-    ShaderGlobal::set_real(currentGenVarId, ctx->currentGen);
+    ShaderGlobal::set_float(currentGenVarId, ctx->currentGen);
 
     static int paramsVarId = ::get_shader_variable_id("water_foam_trail_params");
-    ShaderGlobal::set_color4(paramsVarId, 1.f / g_settings.fadeInTime, 1.f / g_settings.fadeOutTime, g_settings.forwardExpand, 0.f);
+    ShaderGlobal::set_float4(paramsVarId, 1.f / g_settings.fadeInTime, 1.f / g_settings.fadeOutTime, g_settings.forwardExpand, 0.f);
   }
 
   void resetTex()
   {
     texelAlign = Point2(2.f / g_settings.texSize, 2.f / g_settings.texSize);
 
-    ShaderGlobal::set_texture(texArrayVarId, BAD_TEXTUREID);
-    ShaderGlobal::reset_from_vars_and_release_managed_tex_verified(texArrayId, texArray);
+    ShaderGlobal::set_sampler(::get_shader_variable_id("water_foam_trail_mask_samplerstate", true),
+      d3d::request_sampler(get_sampler_info(get_texture_meta_data(maskTex.getTexId()))));
 
-    if (g_settings.useTexArray)
-    {
-      texArray = d3d::create_array_tex(g_settings.texSize, g_settings.texSize, cascades.size(), TEXFMT_R8 | TEXCF_RTARGET, 1,
-        "water_foam_trail");
-
-      texArrayId = register_managed_tex("water_foam_trail", texArray);
-    }
+    d3d::SamplerInfo smpInfo;
+    smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Wrap;
+    smpInfo.anisotropic_max = ::dgs_tex_anisotropy;
+    ShaderGlobal::set_sampler(::get_shader_variable_id("water_foam_trail_samplerstate", true), d3d::request_sampler(smpInfo));
   }
 };
 
@@ -678,6 +629,12 @@ struct Context
     v_bbox3_init_empty(p->box);
     p->id = activeSegmentsPool.size();
     p->owner = 0;
+    if (p->prevSeg)
+      p->prevSeg->nextSeg = p->nextSeg;
+    if (p->nextSeg)
+      p->nextSeg->prevSeg = p->prevSeg;
+    p->prevSeg = nullptr;
+    p->nextSeg = nullptr;
     activeSegmentsPool.push_back(p);
     totalActiveVertices += g_settings.maxPointsPerSegment + 4;
 
@@ -707,6 +664,12 @@ struct Context
     freeSegmentsPool.push_back(p);
     p->id = -1;
     p->points.clear();
+    if (p->prevSeg)
+      p->prevSeg->nextSeg = p->nextSeg;
+    if (p->nextSeg)
+      p->nextSeg->prevSeg = p->prevSeg;
+    p->prevSeg = nullptr;
+    p->nextSeg = nullptr;
   }
 
   void finalizeSegment(Segment *p)
@@ -746,15 +709,29 @@ struct Context
 
     removeSegment(p);
 
+    auto accelerateFadeout = [](Segment *curr_seg, float gen_speed) -> void {
+      curr_seg->forcedGenMul = max(curr_seg->forcedGenMul - gen_speed, 0.25f);
+
+      int n = curr_seg->points.size() - 1;
+      if (n <= 0)
+        n = 1;
+      for (int i = 0; i < curr_seg->points.size(); ++i)
+      {
+        float fadeOutTime = get_segment_fade_out_time(curr_seg, float(i) / float(n));
+        Vertex &v = curr_seg->points[i];
+        v.prm.w = (v.prm.w > 0.0f ? 1.0f : -1.0f) / fadeOutTime;
+      }
+    };
+
     if (p->totalTurns * g_turns_to_points_ratio >= g_settings.maxPointsPerSegment)
     {
-      p->forcedGenMul = 0.25f;
-      float fadeOutTime = get_segment_fade_out_time(p);
-
-      for (int i = 0; i < p->points.size(); ++i)
+      float genSpeedUp = 0.05f;
+      float genSpeed = genSpeedUp;
+      accelerateFadeout(p, genSpeed);
+      for (Segment *i = p; i->prevSeg && i->prevSeg->id != -1; i = i->prevSeg)
       {
-        Vertex &v = p->points[i];
-        v.prm.w = (v.prm.w > 0.0f ? 1.0f : -1.0f) / fadeOutTime;
+        genSpeed += genSpeedUp;
+        accelerateFadeout(i->prevSeg, genSpeed);
       }
     }
 
@@ -772,7 +749,8 @@ struct Context
     for (int i = 0; i < finalizedSegments.size(); ++i)
     {
       Segment *seg = finalizedSegments[i];
-      if (currentGen > seg->lastGen + get_segment_fade_out_time(seg))
+      float fadeOutTime = max(get_segment_fade_out_time(seg, 0.0f), get_segment_fade_out_time(seg, 1.0f));
+      if (currentGen > seg->lastGen + fadeOutTime)
       {
         G_ASSERT(i == finalizedSegments[i]->id);
         destroySegment(seg);
@@ -800,11 +778,7 @@ struct Context
       del_it(renderer);
 
     if (!renderer)
-    {
-      static int texVarId = ::get_shader_variable_id("water_foam_trail");
-      ShaderGlobal::set_texture(texVarId, BAD_TEXTUREID);
       return;
-    }
 
     renderer->calcCascades();
 

@@ -4,6 +4,8 @@
 //
 #pragma once
 
+#include <generic/dag_span.h>
+
 #include <rendInst/riexHandle.h>
 #include <rendInst/layerFlags.h>
 #include <vecmath/dag_vecMathDecl.h>
@@ -18,11 +20,9 @@ class CollisionResource;
 namespace rendinst
 {
 
-float get_riextra_destr_time_to_live(riex_handle_t);
-float get_riextra_destr_default_time_to_live(riex_handle_t);
-float get_riextra_destr_time_to_kinematic(riex_handle_t);
-float get_riextra_destr_time_to_sink_underground(riex_handle_t);
 bool get_riextra_immortality(riex_handle_t);
+
+bool is_riextra_rendinst_clipmap(riex_handle_t);
 
 uint32_t get_riextra_instance_seed(riex_handle_t);
 void set_riextra_instance_seed(riex_handle_t, int32_t data);
@@ -30,6 +30,9 @@ void set_riextra_instance_seed(riex_handle_t, int32_t data);
 const mat43f &getRIGenExtra43(riex_handle_t id);
 const mat43f &getRIGenExtra43(riex_handle_t id, uint32_t &seed);
 void getRIGenExtra44(riex_handle_t id, mat44f &out_tm);
+void getRIGenExtra44NoLock(riex_handle_t id, mat44f &out_tm);
+
+dag::ConstSpan<mat43f> getAllRIGenExtra43FromPool(uint32_t pool);
 
 void getRIExtraCollInfo(riex_handle_t id, CollisionResource **out_collision, BSphere3 *out_bsphere);
 const CollisionResource *getDestroyedRIExtraCollInfo(riex_handle_t handle);
@@ -37,25 +40,31 @@ const CollisionResource *getDestroyedRIExtraCollInfo(riex_handle_t handle);
 void setRIGenExtraImmortal(uint32_t pool, bool value);
 bool isRIGenExtraImmortal(uint32_t pool);
 bool isRIGenExtraWalls(uint32_t pool);
+vec4f getRIGenExtraPoolBSphere(uint32_t pool);
+float getMaxLodDist(uint32_t pool);
 float getRIGenExtraBsphRad(uint32_t pool);
 Point3 getRIGenExtraBsphPos(uint32_t pool);
 Point4 getRIGenExtraBSphereByTM(uint32_t pool, const TMatrix &tm);
 int getRIGenExtraParentForDestroyedRiIdx(uint32_t pool);
 bool isRIGenExtraDestroyedPhysResExist(uint32_t pool);
 int getRIGenExtraDestroyedRiIdx(uint32_t pool);
+bool isRIGenExtraRendinstClipmapOrLandclass(uint32_t pool);
 vec4f getRIGenExtraBSphere(riex_handle_t id);
 // special values: 0 (default HP with regen), -1 (default HP no regen), -2 (invincible)
 void setRiGenExtraHp(riex_handle_t id, float hp);
 
 float getInitialHP(riex_handle_t id);
 float getHP(riex_handle_t id);
+float getDamageThreshold(riex_handle_t id);
+bool isInvincible(riex_handle_t id);
 bool isPaintFxOnHit(riex_handle_t id);
 bool isKillsNearEffects(riex_handle_t id);
 
 const char *getRIGenExtraName(uint32_t res_idx);
-int getRIGenExtraPreferrableLod(uint32_t res_idx, float squared_distance);
-int getRIGenExtraPreferrableLod(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod);
-int getRIGenExtraPreferrableLodRawDistance(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod);
+int getRIGenExtraPreferableLod(uint32_t res_idx, float squared_distance);
+int getRIGenExtraPreferableLod(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod);
+int getRIGenExtraPreferableLodRawDistanceUnsafe(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod);
+int getRIGenExtraPreferableLodRawDistance(uint32_t res_idx, float squared_distance, bool &over_max_lod, int &last_lod);
 bool isRIExtraGenPosInst(uint32_t res_idx);
 bool updateRiExtraReqLod(uint32_t res_idx, unsigned lod);
 
@@ -69,8 +78,11 @@ bool hasRiLayer(int res_idx, LayerFlag layer);
 
 vec4f getNodeBsphere(riex_handle_t handle, float &pool_rad);
 void prefetchNode(riex_handle_t handle);
-// hash is not filled out when the result is false!
-bool isVisibleByLodEst(riex_handle_t id, vec4f view_pos, float dist_mul, const mat43f *&mat_out, vec3f &pos, uint32_t &hash);
+
+bool isNodeVisible(riex_handle_t id, uint32_t res_idx, const mat44f *&mat_out, uint32_t &hash);
+bool isNodeAlive(riex_handle_t id, vec4f &bsphere, float &pool_rad);
+bool isNodeAllocated(riex_handle_t id);
+bool isRIGenExtraPlacedInTiledScenes(int res_idx);
 
 float getCullDistSqMul();
 struct AllRendinstExtraScenesLockImpl;

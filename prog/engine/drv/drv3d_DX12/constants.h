@@ -9,7 +9,7 @@ namespace drv3d_dx12
 #if _TARGET_PC_WIN
 inline constexpr uint32_t FRAME_FRAME_BACKLOG_LENGTH = 4;
 #else
-inline constexpr uint32_t FRAME_FRAME_BACKLOG_LENGTH = 2;
+inline constexpr uint32_t FRAME_FRAME_BACKLOG_LENGTH = 3;
 #endif
 // has to be two to avoid constantly triggering waits on gpu and cpu
 inline constexpr uint32_t FRAME_LATENCY = 2;
@@ -39,6 +39,7 @@ inline constexpr uint32_t INITIAL_UPDATE_BUFFER_BLOCK_SIZE = 1024 * 1024 * 2;
 // can be adjusted as needed, but be careful, too many may degrade performance because of spilling
 inline constexpr uint32_t MAX_ROOT_CONSTANTS = 4;
 inline constexpr uint32_t ROOT_CONSTANT_BUFFER_INDEX = 8;
+inline constexpr uint32_t ROOT_CONSTANT_BUFFER_MASK = ~(1u << ROOT_CONSTANT_BUFFER_INDEX);
 
 inline constexpr uint32_t MAX_MIPMAPS = 16;
 inline constexpr uint32_t TEXTURE_TILE_SIZE = 64 * 1024;
@@ -53,6 +54,8 @@ inline constexpr uint32_t MIN_COMPUTE_CONST_REGISTERS = DEF_CS_CONSTS;
 inline constexpr uint32_t VERTEX_SHADER_MAX_REGISTERS = 4096;
 inline constexpr uint32_t VERTEX_SHADER_MIN_REGISTERS = DEF_VS_CONSTS;
 inline constexpr uint32_t PIXEL_SHADER_REGISTERS = MAX_PS_CONSTS;
+
+inline constexpr uint32_t UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT = UINT32_MAX;
 } // namespace drv3d_dx12
 
 namespace gpu

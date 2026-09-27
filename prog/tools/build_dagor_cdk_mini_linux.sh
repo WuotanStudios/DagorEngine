@@ -3,6 +3,14 @@ jam -s Root=../.. -f libTools/daKernel/jamfile
 jam -s Root=../.. -f sceneTools/assetExp/jamfile
 jam -s Root=../.. -f converters/ddsxCvt2/jamfile
 
+# DaEditorX
+jam -s Root=../.. -f sceneTools/daEditorX/jamfile-editor
+jam -s Root=../.. -f sceneTools/daEditorX/jamfile
+
+# AssetViewer
+jam -s Root=../.. -f AssetViewer/jamfile
+jam -s Root=../.. -f sceneTools/findUnusedTex/jamfile
+
 # daImpostorBaker
 jam -s Root=../.. -f sceneTools/impostorBaker/tool/jamfile
 
@@ -14,6 +22,8 @@ jam -s Root=../.. -s Tegra_exp=yes -f sceneTools/assetExp/ddsxConv/jamfile
 # shader compilers
 jam -s Root=../.. -f ShaderCompiler2/jamfile
 jam -s Root=../.. -f ShaderCompiler2/jamfile-stub
+jam -s Root=../.. -f ShaderCompiler2/nodeBased/jamfile
+jam -s Root=../.. -f ../3rdPartyLibs/scripts/duktape/jamfile
 
 # common minimal gui shaders for tools
 pushd sceneTools/guiShaders_commonData

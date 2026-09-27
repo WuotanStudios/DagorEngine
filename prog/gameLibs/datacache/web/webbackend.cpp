@@ -36,6 +36,15 @@ static bool is_url(const char *name) // starts with "http:" or "https:"
   return strncmp(name, http, sizeof(http) - 1) == 0 && (name[4] == ':' || (name[4] == 's' && name[5] == ':'));
 }
 
+static void make_raw_http_cache_key(const char *url, char *out_key, size_t out_key_size)
+{
+  uint8_t urlHash[SHA_DIGEST_LENGTH];
+  char urlHashStr[SHA_DIGEST_LENGTH * 2 + 1];
+  SHA1((const uint8_t *)url, strlen(url), urlHash);
+  hashstr(urlHash, urlHashStr);
+  SNPRINTF(out_key, out_key_size, "%s/%.2s/%s", RAW_HTTP_CACHE, urlHashStr, urlHashStr + 2);
+}
+
 WebBackend::WebBackend() :
   UBMagic(INIT_UB_MAGIC),
   indexState(INDEX_NOT_LOADED),
@@ -194,6 +203,7 @@ Backend *WebBackend::create(WebBackendConfig &config)
   bck->skipKey = config.skipKey;
   config.aioJobId = bck->getOrCreateJobMgr(config.jobMgrName);
 
+  config.csMgr = bck->csMgr;
   bck->filecache = FileBackend::create(config);
   if (bck->filecache)
     DOTRACE1("webcache mounted");
@@ -212,7 +222,6 @@ Backend *WebBackend::create(WebBackendConfig &config)
   bck->maxSyncCheckSize = config.maxSyncCheckSizeKb << 10;
   if (bck->csMgr)
     G_ASSERTF(bck->noIndex && bck->returnStaleData, "noIndex=%d returnStaleData=%d", bck->noIndex, bck->returnStaleData);
-  bck->filecache->control(_MAKE4C('CS'), bck->csMgr);
 
   return bck;
 }
@@ -323,6 +332,12 @@ struct DownloadRequest : public AsyncJob
   ~DownloadRequest() { delete stream; }
 
   virtual streamio::ProcessResult onStreamData(dag::ConstSpan<char>) { return streamio::ProcessResult::Discarded; }
+
+  // Called between fallback attempts (when the current attempt failed and we're
+  // about to re-issue against the next base URL). Subclasses that stream data
+  // directly into a cache write stream override this to discard whatever bytes
+  // the failed attempt wrote, so the next attempt starts from offset 0.
+  virtual void prepareForRetry() {}
 };
 
 struct IndexDownloadRequest : public DownloadRequest
@@ -336,7 +351,7 @@ struct IndexDownloadRequest : public DownloadRequest
     entry = back->filecache->set(INDEX_FILE_NAME);
   }
 
-  const char *getJobName(bool &) const override { return "IndexDownloadRequest"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("IndexDownloadRequest"); }
 
   virtual void doJob()
   {
@@ -403,7 +418,7 @@ struct FileDownloadRequest : public DownloadRequest
     entry = back->filecache->set(key_);
   }
 
-  const char *getJobName(bool &) const override { return "FileDownloadRequest"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("FileDownloadRequest"); }
 
   virtual void doJob()
   {
@@ -420,6 +435,7 @@ struct FileDownloadRequest : public DownloadRequest
     char buf1[SHA_DIGEST_LENGTH * 2 + 1], keyBuf[DAGOR_MAX_PATH];
     const char *realKey = get_real_key(key.str(), keyBuf);
     EntriesMap::iterator it = backend->entries.find(get_entry_hash_key(realKey));
+    removeThisFromInFlightJobs(); // before callCb to avoid re-entrant userCb push_back invalidating iteration storage
     if (it == backend->entries.end())
     {
       DOTRACE1("downloaded unknown file '%s': not found in index", realKey);
@@ -486,7 +502,32 @@ struct NonIndexedFileDownloadRequest : public DownloadRequest
     return streamio::ProcessResult::Consumed;
   }
 
-  const char *getJobName(bool &) const override { return "NonIndexedFileDownloadRequest"; }
+  virtual void prepareForRetry() override
+  {
+    // Discard bytes streamed from the failed attempt: close and erase the temp
+    // file, then reopen a fresh write stream so the retry against the next base
+    // URL starts from offset 0. Without this, a non-2xx body (e.g. a 502 error
+    // page) from a previous attempt would remain prepended to whatever the next
+    // attempt streams, corrupting the cached file if a later attempt succeeds.
+    // `entry` is established in the ctor and the rest of this class (doJob,
+    // releaseJob) treats it as non-null, so no null guard here either.
+    if (writeStream)
+    {
+      // entry->closeStream() will delete the IGenSave object, so drop our copy
+      // of the pointer first to avoid leaving it dangling.
+      writeStream = nullptr;
+      entry->del();
+      entry->closeStream();
+      interlocked_decrement(num_opened_write_streams);
+    }
+    if (max_opened_write_streams > 0 && interlocked_acquire_load(num_opened_write_streams) >= max_opened_write_streams)
+      return;
+    writeStream = entry->getWriteStream();
+    if (writeStream)
+      interlocked_increment(num_opened_write_streams);
+  }
+
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("NonIndexedFileDownloadRequest"); }
 
   virtual void doJob()
   {
@@ -529,6 +570,7 @@ struct NonIndexedFileDownloadRequest : public DownloadRequest
     else
       entry->free();
     entry = NULL;
+    removeThisFromInFlightJobs(); // before callCb to avoid re-entrant userCb push_back invalidating iteration storage
     callCb(realKey, error);
     delete this;
   }
@@ -544,7 +586,7 @@ struct AsyncHashCalcJob : public AsyncJob
     G_ASSERT(entry);
     memset(entryHash, 0, sizeof(entryHash));
   }
-  const char *getJobName(bool &) const override { return "AsyncHashCalcJob"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("AsyncHashCalcJob"); }
   virtual void doJob()
   {
     dag::ConstSpan<uint8_t> edata = entry->getData();
@@ -600,7 +642,7 @@ struct PassRespHeadersToCallback final : public cpujobs::IJob
       respHeadersList.push_back(eastl::make_pair(to_string(kv.first), to_string(kv.second)));
   }
 
-  const char *getJobName(bool &) const override { return "PassRespHeadersToCallback"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("PassRespHeadersToCallback"); }
   virtual void doJob() override {}
   void releaseJob() override
   {
@@ -676,6 +718,7 @@ void WebBackend::onHttpReqComplete(DownloadRequest *req, const char *url, int er
   {
     DOTRACE1("re-request '%s' from new base %s", url, baseUrl.data());
     delete stream;
+    req->prepareForRetry();
     getOrCreateStreamCtx().createStream(url, onHttpReqCompleteCb, onHttpDataCb, onHttpRespHeadersCb, nullptr, req, req->lastModified);
   }
 }
@@ -726,7 +769,7 @@ int WebBackend::getOrCreateJobMgr(const char *jobmgr_name)
       jobmgr_name = tmp; //-V507
     }
     using namespace cpujobs;
-    jobMgr = create_virtual_job_manager(512 << 10, WORKER_THREADS_AFFINITY_MASK, jobmgr_name, DEFAULT_THREAD_PRIORITY,
+    jobMgr = create_virtual_job_manager(192 << 10, WORKER_THREADS_AFFINITY_MASK, jobmgr_name, DEFAULT_THREAD_PRIORITY,
       DEFAULT_IDLE_TIME_SEC / 2);
   }
   return jobMgr;
@@ -900,17 +943,12 @@ Entry *WebBackend::getEntryNoIndex(const char *key, const char *url, ErrorCode *
   if (!filecache->hasFreeSpace())
     RETURN_ENTRY(NULL, ERR_MEMORY_LIMIT);
 
-  char realKey[DAGOR_MAX_PATH], urlHashStr[SHA_DIGEST_LENGTH * 2 + 1];
-  uint8_t urlHash[SHA_DIGEST_LENGTH];
+  char realKey[DAGOR_MAX_PATH];
 
   if (key)
     get_real_key(key, realKey);
   else
-  {
-    SHA1((const uint8_t *)url, strlen(url), urlHash);
-    hashstr(urlHash, urlHashStr);
-    SNPRINTF(realKey, sizeof(realKey), "%s/%.2s/%s", RAW_HTTP_CACHE, urlHashStr, urlHashStr + 2);
-  }
+    make_raw_http_cache_key(url, realKey, sizeof(realKey));
 
   WinAutoLockOpt lock(csMgr);
   if (tryAddExistingJobCb(key ? realKey : url, user_cb))
@@ -1100,7 +1138,18 @@ void WebBackend::poll()
     ctx->poll();
 }
 
-bool WebBackend::del(const char *key) { return noIndex ? filecache->del(key) : false; }
+bool WebBackend::del(const char *key)
+{
+  if (!noIndex)
+    return false;
+  if (is_url(key))
+  {
+    char realKey[DAGOR_MAX_PATH];
+    make_raw_http_cache_key(key, realKey, sizeof(realKey));
+    return filecache->del(realKey);
+  }
+  return filecache->del(key);
+}
 
 void WebBackend::delAll()
 {

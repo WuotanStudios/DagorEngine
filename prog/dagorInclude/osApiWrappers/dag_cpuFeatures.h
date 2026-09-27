@@ -32,11 +32,13 @@ KRNLIMP extern bool cpu_feature_f16c_checked;
 KRNLIMP extern bool cpu_feature_avx_checked;
 KRNLIMP extern bool cpu_feature_avx2_checked;
 KRNLIMP extern bool cpu_feature_fast_256bit_avx_checked;
+KRNLIMP extern bool cpu_feature_avx_vnni_checked;
+KRNLIMP extern bool cpu_family_haswell_or_better;
 
 #if (__cplusplus >= 201703L) || (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) // for inline bool
 // MSVC defines only __AVX__ and __AVX2__
 
-#if defined(__AVX2__)
+#if defined(__F16C__) || defined(__AVX2__)
 constexpr bool cpu_feature_f16c = true; // checked this assumption with https://github.com/mmcloughlin/cpudb.git
 #elif !_TARGET_SIMD_SSE
 constexpr bool cpu_feature_f16c = false;
@@ -92,6 +94,14 @@ constexpr bool cpu_feature_avx2 = false;
 inline bool &cpu_feature_avx2 = cpu_feature_avx2_checked;
 #endif // __AVX2__
 
+#ifdef __AVXVNNI__
+constexpr bool cpu_feature_avx_vnni = true;
+#elif !_TARGET_SIMD_SSE
+constexpr bool cpu_feature_avx_vnni = false;
+#else
+inline bool &cpu_feature_avx_vnni = cpu_feature_avx_vnni_checked;
+#endif
+
 #if defined _TARGET_C1 || defined _TARGET_XBOXONE || !defined(_TARGET_64BIT)
 constexpr bool cpu_feature_fast_256bit_avx = false; // AMD Jaguar has no benefits from using 256-bit regs (which is used in prevgen
                                                     // consoles - ps4, xb1)
@@ -100,6 +110,10 @@ constexpr bool cpu_feature_fast_256bit_avx = true;
 #else
 inline bool &cpu_feature_fast_256bit_avx = cpu_feature_fast_256bit_avx_checked;
 #endif // __AVX__
+
+KRNLIMP extern bool dag_check_cpu_features();
+KRNLIMP extern bool dag_check_cpu_features_basic();
+KRNLIMP extern bool dag_check_cpu_features_without_cpuid();
 
 #endif // __cplusplus >= 201703L
 

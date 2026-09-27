@@ -8,6 +8,9 @@
 #include "linkShaders.h"
 #include "cppStcode.h"
 #include "const3d.h"
+#include "variantSemantic.h"
+#include "variantAssembly.h"
+#include "preshaderCompilation.h"
 #include <math/dag_mathBase.h>
 #include <shaders/shOpcodeFormat.h>
 #include <shaders/shOpcode.h>
@@ -18,16 +21,18 @@
 #include "fast_isalnum.h"
 #include <EASTL/bitvector.h>
 #include <EASTL/string_view.h>
+#include <generic/dag_sort.h>
+#include <drvCommonConsts.h>
 
-NamedConstBlock::CstHandle NamedConstBlock::addConst(int stage, const char *name, HlslRegisterSpace reg_space, int sz,
-  int hardcoded_reg, bool is_dynamic, bool is_global_const_block)
+NamedConstBlock::CstHandle NamedConstBlock::addConst(int stage, const char *name, Terminal *decl_term, Lexer &lexer,
+  HlslRegisterSpace reg_space, int sz, int hardcoded_reg, bool is_dynamic)
 {
   G_ASSERT(sz > 0);
   G_ASSERT(is_dynamic || hardcoded_reg == -1);
 
   RegisterProperties NamedConstBlock::*propsField = nullptr;
   HlslRegAllocator *regAlloc = nullptr;
-  if (reg_space == HLSL_RSPACE_C && (!is_dynamic || is_global_const_block))
+  if (reg_space == HLSL_RSPACE_C && !is_dynamic)
   {
     propsField = &NamedConstBlock::bufferedConstProps;
     regAlloc = &bufferedConstsRegAllocator;
@@ -60,7 +65,7 @@ NamedConstBlock::CstHandle NamedConstBlock::addConst(int stage, const char *name
   auto &xsn = props.sn;
   auto &xsc = props.sc;
 
-  auto nameProvider = makeInfoProvider(propsField, reg_space);
+  auto infoProvider = makeInfoProvider(propsField, reg_space, lexer);
 
   int id = xsn.getNameId(name);
   if (id == -1)
@@ -72,7 +77,7 @@ NamedConstBlock::CstHandle NamedConstBlock::addConst(int stage, const char *name
       if (auto res = regAlloc->reserve(HlslSlotSemantic::HARDCODED, hardcoded_reg, sz); !res)
       {
         report_reg_reserve_failed(name, hardcoded_reg, sz, reg_space, HlslSlotSemantic::HARDCODED, res.error(), *regAlloc,
-          nameProvider);
+          infoProvider);
       }
 
       regIndex = hardcoded_reg;
@@ -82,8 +87,9 @@ NamedConstBlock::CstHandle NamedConstBlock::addConst(int stage, const char *name
       regIndex = regAlloc->allocate(sz);
       if (regIndex == -1)
       {
-        sh_debug(SHLOG_ERROR, "Failed to allocate %i register%s for param '%s'\n%s", sz, sz > 1 ? "s" : "", name,
-          get_reg_alloc_dump(*regAlloc, reg_space, nameProvider).c_str());
+        sh_debug(SHLOG_ERROR, "Out of space to allocate %i register%s for param '%s'. Please remove some preshader declarations.\n%s",
+          sz, sz > 1 ? "s" : "", name, get_reg_alloc_dump(*regAlloc, reg_space, infoProvider).c_str());
+        return CstHandle::makeErrorHandle(ShaderStage(stage), &props == &bufferedConstProps);
       }
     }
     id = xsn.addNameId(name);
@@ -92,13 +98,15 @@ NamedConstBlock::CstHandle NamedConstBlock::addConst(int stage, const char *name
     xsc[id].size = sz;
     xsc[id].regIndex = regIndex;
     xsc[id].isDynamic = is_dynamic;
+    xsc[id].declTerm = decl_term;
 
     return {ShaderStage(stage), id, &props == &bufferedConstProps};
   }
   return CstHandle::makeInvalidHandle(ShaderStage(stage), &props == &bufferedConstProps);
 }
 
-bool NamedConstBlock::initSlotTextureSuballocators(int vs_tex_count, int ps_tex_count)
+bool NamedConstBlock::initSlotTextureSuballocators(int vs_tex_count, int vs_smp_count, int ps_tex_count, int ps_smp_count,
+  Lexer &lexer)
 {
   G_ASSERT(!shc::config().enableBindless);
 
@@ -108,15 +116,16 @@ bool NamedConstBlock::initSlotTextureSuballocators(int vs_tex_count, int ps_tex_
   int psSamplerRangeBase = 0;
 
   if (vs_tex_count)
-  {
     vsTexRangeBase = vertexRegAllocators[HLSL_RSPACE_T].allocate(vs_tex_count);
-    vsSamplerRangeBase = vertexRegAllocators[HLSL_RSPACE_S].allocate(vs_tex_count);
-  }
+
+  if (vs_smp_count)
+    vsSamplerRangeBase = vertexRegAllocators[HLSL_RSPACE_S].allocate(vs_smp_count);
+
   if (ps_tex_count)
-  {
     psTexRangeBase = pixelOrComputeRegAllocators[HLSL_RSPACE_T].allocate(ps_tex_count);
-    psSamplerRangeBase = pixelOrComputeRegAllocators[HLSL_RSPACE_S].allocate(ps_tex_count);
-  }
+
+  if (ps_smp_count)
+    psSamplerRangeBase = pixelOrComputeRegAllocators[HLSL_RSPACE_S].allocate(ps_smp_count);
 
   if (vsTexRangeBase < 0 || psTexRangeBase < 0 || vsSamplerRangeBase < 0 || psSamplerRangeBase < 0)
   {
@@ -127,15 +136,18 @@ bool NamedConstBlock::initSlotTextureSuballocators(int vs_tex_count, int ps_tex_
         auto NamedConstBlock::*propsField = stage == STAGE_VS ? &NamedConstBlock::vertexProps : &NamedConstBlock::pixelProps;
         auto &props = this->*propsField;
         auto &allocators = stage == STAGE_VS ? vertexRegAllocators : pixelOrComputeRegAllocators;
-        errorMessage.append_sprintf("\nFailed to allocate %d contiguous static %s %s.\n", vs_tex_count,
-          SHADER_STAGE_SHORT_NAMES[stage], rspace == HLSL_RSPACE_S ? "samplers" : "textures");
-        errorMessage += get_reg_alloc_dump(allocators[rspace], rspace, makeInfoProvider(propsField, rspace));
+        const char *typeName = rspace == HLSL_RSPACE_S ? "samplers" : "textures";
+        errorMessage.append_sprintf("\nOut of space to allocate %d contiguous static %s %s. Please remove some hardcoded %s.\n",
+          vs_tex_count, SHADER_STAGE_SHORT_NAMES[stage], typeName, typeName);
+        errorMessage += get_reg_alloc_dump(allocators[rspace], rspace, makeInfoProvider(propsField, rspace, lexer));
       }
     };
     reportIfFailed(vsTexRangeBase, vs_tex_count, STAGE_VS, HLSL_RSPACE_T);
     reportIfFailed(vsSamplerRangeBase, vs_tex_count, STAGE_VS, HLSL_RSPACE_S);
     reportIfFailed(psTexRangeBase, ps_tex_count, STAGE_PS, HLSL_RSPACE_T);
     reportIfFailed(psSamplerRangeBase, ps_tex_count, STAGE_PS, HLSL_RSPACE_S);
+    if (!errorMessage.empty())
+      sh_debug(SHLOG_ERROR, errorMessage.c_str());
     return false;
   }
 
@@ -144,14 +156,14 @@ bool NamedConstBlock::initSlotTextureSuballocators(int vs_tex_count, int ps_tex_
     slotTextureSuballocators.vsTex =
       HlslRegAllocator{HlslRegAllocator::Policy{uint32_t(vsTexRangeBase), uint32_t(vsTexRangeBase + vs_tex_count)}};
     slotTextureSuballocators.vsSamplers =
-      HlslRegAllocator{HlslRegAllocator::Policy{uint32_t(vsSamplerRangeBase), uint32_t(vsSamplerRangeBase + vs_tex_count)}};
+      HlslRegAllocator{HlslRegAllocator::Policy{uint32_t(vsSamplerRangeBase), uint32_t(vsSamplerRangeBase + vs_smp_count)}};
   }
   if (ps_tex_count)
   {
     slotTextureSuballocators.psTex =
       HlslRegAllocator{HlslRegAllocator::Policy{uint32_t(psTexRangeBase), uint32_t(psTexRangeBase + ps_tex_count)}};
     slotTextureSuballocators.psSamplers =
-      HlslRegAllocator{HlslRegAllocator::Policy{uint32_t(psSamplerRangeBase), uint32_t(psSamplerRangeBase + ps_tex_count)}};
+      HlslRegAllocator{HlslRegAllocator::Policy{uint32_t(psSamplerRangeBase), uint32_t(psSamplerRangeBase + ps_smp_count)}};
   }
 
   return true;
@@ -164,7 +176,7 @@ void NamedConstBlock::addHlslDecl(CstHandle hnd, String &&hlsl_decl, String &&hl
   slot.hlslPostfix = eastl::move(hlsl_postfix);
 }
 
-CryptoHash NamedConstBlock::getDigest(ShaderStage stage, const MergedVariablesData &merged_vars) const
+CryptoHash NamedConstBlock::getDigest(ShaderStage stage, const CompiledPreshader &preshader) const
 {
   CryptoHasher hasher;
   hasher.update(suppBlk.size());
@@ -187,7 +199,7 @@ CryptoHash NamedConstBlock::getDigest(ShaderStage stage, const MergedVariablesDa
     constUpdates(vertexProps.sn, vertexProps.sc);
 
   {
-    buildAllHlsl(nullptr, merged_vars, stage);
+    buildAllHlsl(nullptr, preshader, stage);
     auto &source = stage == STAGE_VS ? cachedVertexHlsl : cachedPixelOrComputeHlsl;
     hasher.update(source.data(), source.length());
   }
@@ -238,7 +250,93 @@ static constexpr eastl::array<int, 13> TYPE_PADDINGS = {
   3, // int
 };
 
-void NamedConstBlock::buildStaticConstBufHlslDecl(String &out_text, const MergedVariablesData &merged_vars) const
+static void emitBindlessArraysHlsl(String &out_text)
+{
+  // Shared bindless heap arrays used by static-material bindless, refined-block bindless and
+  // @bindless*. The caller emits this once per stage via emitBindlessArraysIfNeeded().
+#if _CROSS_TARGET_C1 || _CROSS_TARGET_C2
+
+#else
+  using semantic::bindless_array_desc;
+  using semantic::BindlessShape;
+  // Texture heaps in register/binding order; the indices below must match the runtime bindless layout.
+  static constexpr BindlessShape texShapes[] = {
+    BindlessShape::Tex2D, BindlessShape::TexCube, BindlessShape::TexArray, BindlessShape::TexCubeArray, BindlessShape::Tex3D};
+  int slot = 0;
+  for (BindlessShape shape : texShapes)
+  {
+    const auto d = bindless_array_desc(shape);
+#if _CROSS_TARGET_SPIRV
+    out_text.aprintf(0, "[[vk::binding(0, BINDLESS_TEXTURE_SET_META_ID)]] %s %s[];\n", d.elemType, d.arrayName);
+#elif _CROSS_TARGET_METAL
+    out_text.aprintf(0, "[[vk::binding(%d, 32)]] %s %s[];\n", slot, d.elemType, d.arrayName);
+#else
+    out_text.aprintf(0, "%s %s[] : BINDLESS_REGISTER(t, %d);\n", d.elemType, d.arrayName, slot + 1);
+#endif
+    ++slot;
+  }
+  const auto smp = bindless_array_desc(BindlessShape::Sampler);
+#if _CROSS_TARGET_SPIRV
+  out_text.aprintf(0, "[[vk::binding(0, BINDLESS_SAMPLER_SET_META_ID)]] %s %s[];\n", smp.elemType, smp.arrayName);
+#elif _CROSS_TARGET_METAL
+  out_text.aprintf(0, "[[vk::binding(0, 33)]] %s %s[];\n", smp.elemType, smp.arrayName);
+#else
+  out_text.aprintf(0, "%s %s[] : BINDLESS_REGISTER(s, 1);\n", smp.elemType, smp.arrayName);
+#endif
+  // Buffer heap takes the next free t-space after the texture heaps (slot now == their count).
+  const auto buf = bindless_array_desc(BindlessShape::ByteBuffer);
+#if _CROSS_TARGET_SPIRV
+  out_text.aprintf(0, "[[vk::binding(0, BINDLESS_BUFFER_SET_META_ID)]] %s %s[];\n", buf.elemType, buf.arrayName);
+#elif _CROSS_TARGET_METAL
+  out_text.aprintf(0, "[[vk::binding(0, 34)]] %s %s[];\n", buf.elemType, buf.arrayName);
+#else
+  out_text.aprintf(0, "%s %s[] : BINDLESS_REGISTER(t, %d);\n", buf.elemType, buf.arrayName, slot + 1);
+#endif
+#endif
+}
+
+bool NamedConstBlock::hasExplicitBindlessDecls(ShaderStage stage) const
+{
+  if (anyExplicitBindless(stage == STAGE_VS ? vertexProps : pixelProps))
+    return true;
+  const StageGroup group = stage == STAGE_VS ? StageGroup::VS : StageGroup::PS_CS;
+  for (const ShaderStateBlock *sb : suppBlk)
+  {
+    if (sb->shConst.explicitBindlessSubtree.test(size_t(group)))
+      return true;
+  }
+  return false;
+}
+
+bool NamedConstBlock::anyExplicitBindless(const RegisterProperties &props)
+{
+  for (const NamedConst &nc : props.sc)
+  {
+    if (nc.isExplicitBindless)
+      return true;
+  }
+  return false;
+}
+
+void NamedConstBlock::cacheExplicitBindlessSubtree()
+{
+  explicitBindlessSubtree.set(size_t(StageGroup::VS), hasExplicitBindlessDecls(STAGE_VS));
+  explicitBindlessSubtree.set(size_t(StageGroup::PS_CS), hasExplicitBindlessDecls(STAGE_PS)); // PS group also covers CS
+}
+
+void NamedConstBlock::emitBindlessArraysIfNeeded(String &out_text, ShaderStage stage) const
+{
+  // Keep in sync with the array-emitting paths: buildStaticConstBufHlslDecl,
+  // buildRefinedBlockBufHlslDecl, preprocessHlslDecls.
+  bool needed =
+    shc::config().enableBindless && (!bufferedConstProps.sc.empty() || (mRefinedBlockLayout && !mRefinedBlockLayout->empty()));
+  if (!needed)
+    needed = hasExplicitBindlessDecls(stage);
+  if (needed)
+    emitBindlessArraysHlsl(out_text);
+}
+
+void NamedConstBlock::buildStaticConstBufHlslDecl(String &out_text, const CompiledPreshader &preshader) const
 {
   using MergedVarInfo = ShaderParser::VariablesMerger::MergedVarInfo;
   using MergedVars = ShaderParser::VariablesMerger::MergedVars;
@@ -253,36 +351,9 @@ void NamedConstBlock::buildStaticConstBufHlslDecl(String &out_text, const Merged
 
   if (shc::config().enableBindless)
   {
-#if _CROSS_TARGET_C1 || _CROSS_TARGET_C2
-
-#elif _CROSS_TARGET_SPIRV
-    const eastl::string_view bindlessProlog =
-      "[[vk::binding(0, BINDLESS_TEXTURE_SET_META_ID)]] Texture2D static_textures[];\n"
-      "[[vk::binding(0, BINDLESS_TEXTURE_SET_META_ID)]] TextureCube static_textures_cube[];\n"
-      "[[vk::binding(0, BINDLESS_TEXTURE_SET_META_ID)]] Texture2DArray static_textures_array[];\n"
-      "[[vk::binding(0, BINDLESS_TEXTURE_SET_META_ID)]] TextureCube static_textures_cube_array[];\n"
-      "[[vk::binding(0, BINDLESS_TEXTURE_SET_META_ID)]] TextureCube static_textures3d[];\n"
-      "[[vk::binding(0, BINDLESS_SAMPLER_SET_META_ID)]] SamplerState static_samplers[];\n";
-#elif _CROSS_TARGET_METAL
-    constexpr eastl::string_view bindlessProlog = "[[vk::binding(0, 32)]] Texture2D static_textures[];\n"
-                                                  "[[vk::binding(1, 32)]] TextureCube static_textures_cube[];\n"
-                                                  "[[vk::binding(2, 32)]] Texture2DArray static_textures_array[];\n"
-                                                  "[[vk::binding(3, 32)]] TextureCube static_textures_cube_array[];\n"
-                                                  "[[vk::binding(4, 32)]] TextureCube static_textures3d[];\n"
-                                                  "[[vk::binding(0, 33)]] SamplerState static_samplers[];\n";
-#else
-    constexpr eastl::string_view bindlessProlog = "Texture2D static_textures[] : BINDLESS_REGISTER(t, 1);\n"
-                                                  "SamplerState static_samplers[] : BINDLESS_REGISTER(s, 1);\n"
-                                                  "TextureCube static_textures_cube[] : BINDLESS_REGISTER(t, 2);\n"
-                                                  "Texture2DArray static_textures_array[] : BINDLESS_REGISTER(t, 3);\n"
-                                                  "TextureCube static_textures_cube_array[] : BINDLESS_REGISTER(t, 4);\n"
-                                                  "TextureCube static_textures3d[] : BINDLESS_REGISTER(t, 5);\n";
-#endif
     const eastl::string_view bindlessType =
       multidrawCbuf ? eastl::string_view{"#define BINDLESS_CBUFFER_ARRAY\n"} : eastl::string_view{"#define BINDLESS_CBUFFER_SINGLE\n"};
-
     out_text.append(bindlessType.data(), bindlessType.length());
-    out_text.append(bindlessProlog.data(), bindlessProlog.length());
   }
 
   out_text.append("struct MaterialProperties\n{\n");
@@ -325,9 +396,9 @@ void NamedConstBlock::buildStaticConstBufHlslDecl(String &out_text, const Merged
 
     // If this constant is a key in the merger's map, it means that it is not a normal constant, but a few constants
     // packed together into one register. In this case, we have to define getters for each individual packed const
-    if (const MergedVars *originalVars = merged_vars.findOriginalBufferedVarsInfo(constName))
+    if (auto originalVarsIt = preshader.bufferedPackedVarsMap.find(constName); originalVarsIt != preshader.bufferedPackedVarsMap.end())
     {
-      for (const MergedVarInfo &varInfo : *originalVars)
+      for (const MergedVarInfo &varInfo : originalVarsIt->second)
       {
         postfix.aprintf(0, "%s get_%s() { return %s[DRAW_CALL_ID].%s.%s; }\n", varInfo.getType(), varInfo.name, MATERIAL_PROPS_NAME,
           constName, varInfo.getSwizzle().c_str());
@@ -355,70 +426,163 @@ void NamedConstBlock::buildStaticConstBufHlslDecl(String &out_text, const Merged
   out_text.append("\n\n");
 }
 
-void NamedConstBlock::buildGlobalConstBufHlslDecl(String &out_text) const
+void NamedConstBlock::buildRefinedBlockBufHlslDecl(String &out_text, ShaderStage stage) const
 {
-  if (!bufferedConstProps.sc.empty())
+  if (!mRefinedBlockLayout || mRefinedBlockLayout->empty())
+    return;
+
+  eastl::fixed_vector<shc::RefinedBlockVar, 32> vars;
+  mRefinedBlockLayout->forEachVar([&](int, const shc::RefinedBlockVar &v) { vars.push_back(v); });
+
+  eastl::fixed_vector<shc::RefinedBlockVar, 32> cbufVars;
+  eastl::fixed_vector<shc::RefinedBlockVar, 32> resVars;
+
+  const bool bindless = shc::config().enableBindless;
+
+  const auto texBufStaticArrayName = [](semantic::VariableType vt) -> const char * {
+    using semantic::VariableType;
+    switch (vt)
+    {
+      case VariableType::tex2d: return "static_textures";
+      case VariableType::tex3d: return "static_textures3d";
+      case VariableType::texArray: return "static_textures_array";
+      case VariableType::texCube: return "static_textures_cube";
+      case VariableType::texCubeArray: return "static_textures_cube_array";
+      case VariableType::sampler: return "static_samplers";
+      default: return nullptr;
+    }
+  };
+
+  const auto bindlessIdName = [](const eastl::string &name) -> eastl::string { return name + "_bindless_id"; };
+
+  const auto isBindlessVar = [&](const shc::RefinedBlockVar &v) {
+    // Var with custom hlsl declaration cannot go bindless
+    return bindless && v.hlslDecl.empty() &&
+           (semantic::vt_is_tex(v.varType) || semantic::vt_is_buf(v.varType) || v.varType == semantic::VariableType::sampler);
+  };
+
+  for (const shc::RefinedBlockVar &v : vars)
   {
-    out_text += "cbuffer global_const_block : register(b2) {\n";
-    for (const NamedConst &nc : bufferedConstProps.sc)
+    if (isBindlessVar(v) || semantic::vt_is_numeric(v.varType))
+      cbufVars.push_back(v);
+
+    if (!semantic::vt_is_numeric(v.varType))
+      resVars.push_back(v);
+  }
+  // Some hlsl compilers require sorted cbuffer fields by offset.
+  fast_sort(cbufVars, [](const shc::RefinedBlockVar &a, const shc::RefinedBlockVar &b) {
+    return a.cbufOffset.value_or(-1) < b.cbufOffset.value_or(-1);
+  });
+
+  out_text.aprintf(0, "cbuffer refined_block_buf : register(b%d)\n{\n", REFINED_BLOCK_CONST_BUF_REGISTER);
+
+  static constexpr const char *COMPONENT_SUFFIXES[] = {"x", "y", "z", "w"};
+
+  for (const shc::RefinedBlockVar &v : cbufVars)
+  {
+    auto [varTypeStr, samplerTypeStr] = assembly::build_hlsl_type(v.varType);
+    using semantic::VariableType;
+    const int regIdx = v.cbufOffset.value_or(0) / SLOTS_PER_C_REGISTER;
+    const int compOfs = v.cbufOffset.value_or(0) % SLOTS_PER_C_REGISTER;
+    if (isBindlessVar(v))
+      out_text.aprintf(0, "  uint %s : packoffset(c%d.%s);\n", bindlessIdName(v.varName).c_str(), regIdx, COMPONENT_SUFFIXES[compOfs]);
+    else
+      out_text.aprintf(0, "  %s %s : packoffset(c%d.%s);\n", varTypeStr, v.varName.c_str(), regIdx, COMPONENT_SUFFIXES[compOfs]);
+  }
+  out_text += "};\n\n";
+
+  for (const shc::RefinedBlockVar &v : resVars)
+  {
+    auto [varTypeStr, _] = assembly::build_hlsl_type(v.varType);
+    if (isBindlessVar(v))
     {
-      G_ASSERT(nc.isDynamic);
-      if (const char *hlsl = nc.hlslDecl.c_str())
-        out_text.append(hlsl);
+      const char *arrayName = texBufStaticArrayName(v.varType);
+      out_text.aprintf(0, "%s get_%s() { return %s[%s]; }\n", varTypeStr, v.varName.c_str(), arrayName,
+        bindlessIdName(v.varName).c_str());
     }
-    out_text += "\n};\n\n";
-    for (const NamedConst &nc : bufferedConstProps.sc)
+    else
     {
-      if (const char *post = nc.hlslPostfix.c_str())
-        out_text.append(post);
+      if (!v.slot[stage].has_value())
+        continue;
+      const eastl::string regSpecification =
+        assembly::build_placement_specifier(v.slot[stage].value(), false, 1, v.space, true, false);
+      if (v.hlslDecl.empty())
+      {
+        out_text.aprintf(0, "%s %s %s;\n", varTypeStr, v.varName.c_str(), regSpecification.c_str());
+        out_text.aprintf(0, "%s get_%s() { return %s; }\n", varTypeStr, v.varName.c_str(), v.varName.c_str());
+      }
+      else
+      {
+        String hlslDecl(v.hlslDecl.c_str());
+        hlslDecl.replaceAll(type_to_namespace(v.varType), regSpecification.c_str());
+        out_text.aprintf(0, "%s\n", hlslDecl.c_str());
+      }
     }
-    out_text += "\n\n";
   }
 }
 
-void NamedConstBlock::doBuildHlslDeclText(String &out_text, ShaderStage stage,
-  eastl::vector_set<const NamedConstBlock *> &built_blocks) const
+void NamedConstBlock::preprocessHlslDecls(String &out_text, ShaderStage stage,
+  eastl::vector_set<const NamedConstBlock *> &built_blocks, eastl::vector<const NamedConst *> &out_gathered_consts) const
 {
   if (built_blocks.find(this) != built_blocks.end())
     return;
 
   built_blocks.insert(this);
 
-  if (globConstBlk && built_blocks.find(&globConstBlk->shConst) == built_blocks.end())
-  {
-    globConstBlk->shConst.buildGlobalConstBufHlslDecl(out_text);
-    built_blocks.insert(&globConstBlk->shConst);
-  }
   for (const ShaderStateBlock *sb : suppBlk)
-    sb->shConst.doBuildHlslDeclText(out_text, stage, built_blocks);
+    sb->shConst.preprocessHlslDecls(out_text, stage, built_blocks, out_gathered_consts);
+
+#if _CROSS_TARGET_SPIRV
+  const bool needSortingGlobalConsts = shc::config().sortGlobalConstsByOffset;
+#else
+  const bool needSortingGlobalConsts = false;
+#endif
 
   auto &props = (stage == STAGE_VS) ? vertexProps : pixelProps;
-  for (const NamedConst &nc : props.sc)
+
+  if (needSortingGlobalConsts)
   {
-    if (const char *hlsl = nc.hlslDecl.c_str())
-      out_text += hlsl;
+    for (const NamedConst &nc : props.sc)
+    {
+      if (nc.rspace == HLSL_RSPACE_C)
+        out_gathered_consts.push_back(&nc);
+    }
   }
   for (const NamedConst &nc : props.sc)
   {
-    if (const char *hlsl = nc.hlslPostfix.c_str())
-      out_text += hlsl;
+    if (!needSortingGlobalConsts || nc.rspace != HLSL_RSPACE_C)
+      if (const char *hlsl = nc.hlslDecl.c_str())
+        out_text += hlsl;
+  }
+  for (const NamedConst &nc : props.sc)
+  {
+    if (!needSortingGlobalConsts || nc.rspace != HLSL_RSPACE_C)
+      if (const char *hlsl = nc.hlslPostfix.c_str())
+        out_text += hlsl;
   }
 }
 
-eastl::pair<int, int> NamedConstBlock::getStaticTexRange(ShaderStage stage) const
+void NamedConstBlock::buildHlslDeclText(String &out_text, ShaderStage stage) const
 {
-  const auto &sc = stage == STAGE_VS ? vertexProps.sc : pixelProps.sc;
-  int minTex = INT_MAX, maxTex = -1;
-  for (const auto &nc : sc)
+  eastl::vector_set<const NamedConstBlock *> builtBlocks{};
+  eastl::vector<const NamedConst *> gatheredConsts;
+  preprocessHlslDecls(out_text, stage, builtBlocks, gatheredConsts);
+#if _CROSS_TARGET_SPIRV
+  if (shc::config().sortGlobalConstsByOffset)
   {
-    // @NOTE: there are no static buffers/tlas-es => only static textures are static in T space
-    if (nc.isDynamic || nc.rspace != HLSL_RSPACE_T)
-      continue;
-    minTex = min(minTex, nc.regIndex);
-    maxTex = max(maxTex, nc.regIndex);
+    fast_sort(gatheredConsts, [&](const auto *first, const auto *second) { return first->regIndex < second->regIndex; });
+    for (const NamedConst *nc : gatheredConsts)
+    {
+      if (const char *hlsl = nc->hlslDecl.c_str())
+        out_text += hlsl;
+    }
+    for (const NamedConst *nc : gatheredConsts)
+    {
+      if (const char *hlsl = nc->hlslPostfix.c_str())
+        out_text += hlsl;
+    }
   }
-
-  return {minTex, maxTex + 1};
+#endif
 }
 
 template <typename TF> // TF: void(HlslRegisterSpace regt_space, int regt_id, eastl::string_view code_fragment)
@@ -478,10 +642,10 @@ static void process_hardcoded_register_declarations(const char *hlsl_src, TF &&p
 }
 
 // TODO: rename pixel_shader to pixel_or_compute_shader everywhere applicable in this file. Or just pass shader stage instead.
-void NamedConstBlock::patchHlsl(String &src, ShaderStage stage, const MergedVariablesData &merged_vars, int &max_const_no_used,
-  eastl::string_view hw_defines, bool uses_dual_source_blending)
+void NamedConstBlock::patchHlsl(String &src, ShaderStage stage, const CompiledPreshader &preshader, Lexer &lexer,
+  int &implicit_cbuf_size, eastl::string_view hw_defines, bool uses_dual_source_blending)
 {
-  max_const_no_used = -1;
+  implicit_cbuf_size = 0;
   String res;
   res.reserve(src.length() + hw_defines.length());
 
@@ -494,9 +658,16 @@ void NamedConstBlock::patchHlsl(String &src, ShaderStage stage, const MergedVari
   process_hardcoded_register_declarations(src, [&, this](HlslRegisterSpace rspace, int regt_id, eastl::string_view fragment) {
     if (auto res = regAllocators[rspace].reserve(HlslSlotSemantic::HARDCODED, regt_id); !res)
     {
+      // @HACK: avoid false conflict on immediate cbuf
+      if (IMMEDIATE_CB_REGISTER >= 0 && rspace == HLSL_RSPACE_B && regt_id == IMMEDIATE_CB_REGISTER && //-V560 -1 on some targets
+          fragment.find("immediate_const_buffer:register(b") != eastl::string::npos)
+      {
+        return;
+      }
+
       // @TODO: implement arrays checking
       report_reg_reserve_failed(eastl::string{fragment}.c_str(), regt_id, 1, rspace, HlslSlotSemantic::HARDCODED, res.error(),
-        regAllocators[rspace], makeInfoProvider(propsField, rspace));
+        regAllocators[rspace], makeInfoProvider(propsField, rspace, lexer));
       return;
     }
   });
@@ -507,14 +678,14 @@ void NamedConstBlock::patchHlsl(String &src, ShaderStage stage, const MergedVari
       {
         // @TODO: implement arrays checking
         report_reg_reserve_failed(eastl::string{fragment}.c_str(), regt_id, 1, rspace, HlslSlotSemantic::HARDCODED, res.error(),
-          regAllocators[rspace], makeInfoProvider(propsField, rspace));
+          regAllocators[rspace], makeInfoProvider(propsField, rspace, lexer));
         return;
       }
     });
 
   res.append(hw_defines.data(), hw_defines.length());
 
-  buildAllHlsl(&res, merged_vars, stage);
+  buildAllHlsl(&res, preshader, stage);
   dropHlslCaches();
 
   res.append(src.c_str(), src.length());
@@ -541,6 +712,8 @@ void NamedConstBlock::patchHlsl(String &src, ShaderStage stage, const MergedVari
     }
   }
 
+  auto infoProvider = makeInfoProvider(propsField, HLSL_RSPACE_C, lexer);
+
   {
     auto [firstAlloc, allocCap] = regAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
     auto [firstHc, hcCap] = regAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::HARDCODED);
@@ -548,15 +721,25 @@ void NamedConstBlock::patchHlsl(String &src, ShaderStage stage, const MergedVari
     if (!((firstHc >= allocCap) || (firstAlloc >= hcCap)))
     {
       sh_debug(SHLOG_ERROR,
-        "Overlap between allocated register range [%d, %d] and hardcoded registers [%d, %d] is not allowed for %s constants",
-        firstAlloc, allocCap - 1, firstHc, hcCap - 1, SHADER_STAGE_SHORT_NAMES[stage]);
+        "Overlap between allocated register range [%d, %d] and hardcoded registers [%d, %d] is not allowed for %s constants.\n%s",
+        firstAlloc, allocCap - 1, firstHc, hcCap - 1, SHADER_STAGE_SHORT_NAMES[stage],
+        get_reg_alloc_dump(regAllocators[HLSL_RSPACE_C], HLSL_RSPACE_C, infoProvider).c_str());
+    }
+  }
+
+  {
+    auto [first, cap] = regAllocators[HLSL_RSPACE_C].getRange();
+    if (stage == STAGE_PS && first < cap && cap > MAX_PS_CONSTS)
+    {
+      sh_debug(SHLOG_ERROR, "Pixel shader register range [%d, %d] is too large for the driver cap of %d registers.\n%s", first,
+        cap - 1, MAX_PS_CONSTS, get_reg_alloc_dump(regAllocators[HLSL_RSPACE_C], HLSL_RSPACE_C, infoProvider).c_str());
     }
   }
 
   // @TODO: validate other namespaces: s u b
 
   if (regAllocators[HLSL_RSPACE_C].hasRegs())
-    max_const_no_used = regAllocators[HLSL_RSPACE_C].getRange().cap - 1;
+    implicit_cbuf_size = regAllocators[HLSL_RSPACE_C].getRange().cap;
 }
 
 ShaderStateBlock::ShaderStateBlock(const char *nm, ShaderBlockLevel lev, NamedConstBlock &&ncb, dag::Span<int> stcode,
@@ -566,19 +749,19 @@ ShaderStateBlock::ShaderStateBlock(const char *nm, ShaderBlockLevel lev, NamedCo
   if (stcode.size())
   {
     stcodeId = add_stcode(stcode, a_ctx);
-    if (shc::config().generateCppStcodeValidationData && cpp_stcode)
-      add_stcode_validation_mask(stcodeId, cpp_stcode->constMask.release(), a_ctx);
   }
   if (cpp_stcode->hasCode())
   {
-    const bool isGlobCbuf = lev == ShaderBlockLevel::GLOBAL_CONST;
-    const HlslRegRange vsRegRange = isGlobCbuf ? cpp_stcode->collectSetRegistersRange(STAGE_VS)
-                                               : shConst.vertexRegAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
-    const HlslRegRange psOrCsRegRange = isGlobCbuf
-                                          ? cpp_stcode->collectSetRegistersRange(STAGE_PS /* STAGE_CS has the same effect */)
-                                          : shConst.pixelOrComputeRegAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
+    const HlslRegRange vsRegRange = shConst.vertexRegAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
+    const HlslRegRange psOrCsRegRange = shConst.pixelOrComputeRegAllocators[HLSL_RSPACE_C].getRange(HlslSlotSemantic::ALLOCATED);
     cppStcodeId = a_ctx.cppStcode().addCode(eastl::move(*cpp_stcode), psOrCsRegRange, vsRegRange);
   }
+  if (shc::config().generateCppStcodeValidationData && cpp_stcode)
+    add_stcode_validation_mask(stcodeId, cpp_stcode->constMask.release(), a_ctx);
+
+  // shConst (moved in above) already has its consts and supp links; supp blocks are
+  // lower-level and were cached when they were constructed, so this aggregates bottom-up.
+  shConst.cacheExplicitBindlessSubtree();
 }
 
 int ShaderStateBlock::getVsNameId(const char *name) const

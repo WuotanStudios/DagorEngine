@@ -41,6 +41,8 @@ public:
   virtual void eval(immediate_const_block &) = 0;
   virtual void eval_supports(supports_stat &) = 0;
   virtual void eval_render_stage(render_stage_stat &) = 0;
+  // Only AssembleShaderEvalCB authors RT pipeline config; other callbacks ignore the block.
+  virtual void eval_raytrace_pipeline(raytrace_pipeline_stat &) {}
   virtual void eval_assume_stat(assume_stat &) = 0;
   virtual void eval_assume_if_not_assumed_stat(assume_if_not_assumed_stat &) = 0;
   virtual void eval_command(shader_directive &) = 0;
@@ -53,6 +55,8 @@ public:
 
   virtual void eval_hlsl_compile(hlsl_compile_class &hlsl_compile) = 0;
   virtual void eval_hlsl_decl(hlsl_local_decl_class &hlsl_compile) = 0;
+
+  virtual void end_eval(shader_decl &) {}
 };
 
 class ShaderBoolEvalCB
@@ -63,8 +67,8 @@ public:
   virtual int eval_interval_value(const char *ival_name) = 0;
   virtual void report_bool_eval_error(const char *error) {}
 
-  virtual void decl_bool_alias(const char *name, bool_expr &expr) {}
-  virtual int add_message(const char *message, bool file_name) { return 0; }
+  virtual void decl_bool_alias(const char *name, const char *base_name) {}
+  virtual int add_message(const char *message) { return 0; }
   virtual int is_debug_mode_enabled() { return false; }
 };
 

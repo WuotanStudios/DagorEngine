@@ -8,25 +8,25 @@
 #include "render_state.h"
 #include "shader_program_id.h"
 #include "tagged_handles.h"
+#include "constants.h"
 
 #include <perfMon/dag_autoFuncProf.h>
+#include <perfMon/dag_cpuFreq.h>
 #include <dag/dag_vectorSet.h>
 #include <drv/shadersMetaData/dxil/compiled_shader_header.h>
-#include <drv/shadersMetaData/dxil/utility.h>
 #include "drv_log_defs.h"
-#include "drv_assert_defs.h"
 #include <EASTL/array.h>
-#include <EASTL/sort.h>
-#include <EASTL/unordered_set.h>
 #include <EASTL/variant.h>
 #include <generic/dag_bitset.h>
 #include <memory/dag_framemem.h>
 #include <osApiWrappers/dag_atomic.h>
-#include <osApiWrappers/dag_critSec.h>
 #include <osApiWrappers/dag_rwLock.h>
 #include <shadersBinaryData.h>
+#include <ska_hash_map/flat_hash_map2.hpp>
 #include <util/dag_hashedKeyMap.h>
 #include <util/dag_watchdog.h>
+
+#include <shaders/shader_name_format.h>
 
 
 inline constexpr uint32_t MAX_VERTEX_ATTRIBUTES = 16;
@@ -273,10 +273,11 @@ struct StageShaderModuleHeader
 
 struct StageShaderModule : StageShaderModuleHeader
 {
-  eastl::unique_ptr<uint8_t[]> byteCode;
-  size_t byteCodeSize = 0;
+  ShaderSource source;
+  uint32_t bytecodeOffset = 0;
+  uint32_t bytecodeSize = 0;
 
-  explicit operator bool() const { return 0 != byteCodeSize; }
+  explicit operator bool() const { return 0 != bytecodeSize; }
 };
 
 struct VertexShaderModule : StageShaderModule
@@ -371,7 +372,17 @@ struct GraphicsProgramUsageInfo
 {
   InputLayoutID input = InputLayoutID::Null();
   GraphicsProgramID programId = GraphicsProgramID::Null();
+  uint32_t vsImplicitCbufRegCount = 0;
+  uint32_t psImplicitCbufRegCount = 0;
 };
+
+struct ComputeProgramUsageInfo
+{
+  ProgramID programId = ProgramID::Null();
+  uint32_t implicitCbufRegCount = 0;
+};
+
+uint16_t decode_implicit_cbuf_reg_count(dag::ConstSpan<uint8_t> metadata, bool expect_vertex_pipeline);
 
 class IdManager
 {
@@ -504,8 +515,11 @@ void inspect_scripted_shader_bin_dump(ScriptedShadersBinDumpOwner *dump, T inspe
   {
     return;
   }
+
+  int64_t tSetup = ref_time_ticks();
   inspector.vertexShaderCount(v2->vprCount);
   inspector.pixelOrComputeShaderCount(v2->fshCount);
+  int setupUsec = get_time_usec(tSetup);
 
   static constexpr uint32_t BucketCount = 32;
   class UniquePrograms
@@ -530,23 +544,55 @@ void inspect_scripted_shader_bin_dump(ScriptedShadersBinDumpOwner *dump, T inspe
     }
   } uniquePrograms;
 
+  uint32_t totalRefs = 0, uniqueCount = 0;
+  uint32_t graphicsCount = 0, graphicsNullPsCount = 0, computeCount = 0;
+  int64_t dedupUsec = 0, graphicsUsec = 0, graphicsNullPsUsec = 0, computeUsec = 0;
+
   for (auto &cls : v2->classes)
   {
     for (auto &prog : cls.shrefStorage)
     {
       ::watchdog_kick(); // REMOVEME: dirty, dirty hack to work around watchdog killing us during pipeline cache loading
 
-      if (!uniquePrograms.tryAddProgram(prog.vprId, prog.fshId))
+      ++totalRefs;
+      int64_t tDedup = ref_time_ticks();
+      bool isNew = uniquePrograms.tryAddProgram(prog.vprId, prog.fshId);
+      dedupUsec += get_time_usec(tDedup);
+
+      if (!isNew)
         continue;
+      ++uniqueCount;
 
       if (prog.vprId != 0xFFFF && prog.fshId != 0xFFFF)
+      {
+        int64_t t0 = ref_time_ticks();
         inspector.addGraphicsProgram(prog.vprId, prog.fshId);
+        graphicsUsec += get_time_usec(t0);
+        ++graphicsCount;
+      }
       else if (prog.vprId != 0xFFFF)
+      {
+        int64_t t0 = ref_time_ticks();
         inspector.addGraphicsProgramWithNullPixelShader(prog.vprId);
+        graphicsNullPsUsec += get_time_usec(t0);
+        ++graphicsNullPsCount;
+      }
       else
+      {
+        int64_t t0 = ref_time_ticks();
         inspector.addComputeProgram(prog.fshId);
+        computeUsec += get_time_usec(t0);
+        ++computeCount;
+      }
     }
   }
+
+  logdbg("DX12: inspect_scripted_shader_bin_dump breakdown:"
+         " setup=%dus, totalRefs=%u, unique=%u,"
+         " dedup=%lldus,"
+         " graphics=%u/%lldus, graphicsNullPs=%u/%lldus, compute=%u/%lldus",
+    setupUsec, totalRefs, uniqueCount, dedupUsec, graphicsCount, graphicsUsec, graphicsNullPsCount, graphicsNullPsUsec, computeCount,
+    computeUsec);
 }
 
 class ShaderProgramGroup
@@ -555,6 +601,9 @@ class ShaderProgramGroup
   ScriptedShadersBinDumpOwner *dump = nullptr;
   dag::Vector<eastl::variant<eastl::monostate, ShaderID, ProgramID>> pixelShaderComputeProgramIDMap;
   dag::Vector<GraphicsProgramTemplate> graphicsProgramTemplates;
+  dag::Vector<uint16_t> dumpShaderImplicitCbufRegCount;
+  dag::Vector<uint16_t> pixelShaderDumpIndex;
+  dag::Vector<uint16_t> computeProgramDumpIndex;
   uint32_t vertexShaderCount = 0;
   uint32_t pixelShaderCount = 0;
   uint32_t computeShaderCount = 0;
@@ -577,6 +626,7 @@ class ShaderProgramGroup
       {
         psID = ShaderID::make(groupID, target->pixelShaderCount++);
         target->pixelShaderComputeProgramIDMap[ps_index] = psID;
+        target->pixelShaderDumpIndex.push_back(target->vertexShaderCount + ps_index);
       }
       auto vsID = ShaderID::make(groupID, vs_index);
       target->graphicsProgramTemplates.push_back({vsID, psID});
@@ -591,9 +641,24 @@ class ShaderProgramGroup
       if (!eastl::holds_alternative<ProgramID>(target->pixelShaderComputeProgramIDMap[shader_index]))
       {
         target->pixelShaderComputeProgramIDMap[shader_index] = ProgramID::asComputeProgram(groupID, target->computeShaderCount++);
+        target->computeProgramDumpIndex.push_back(target->vertexShaderCount + shader_index);
       }
     }
   };
+
+  void decodeImplicitCbufRegCounts()
+  {
+    if (!dump->getDump())
+      return;
+    const auto &metadata = dump->getDump()->shaders_metadata;
+    const uint32_t shaderCount = min<uint32_t>(vertexShaderCount + pixelShaderComputeProgramIDMap.size(), metadata.size());
+    dumpShaderImplicitCbufRegCount.resize(shaderCount);
+    for (uint32_t i = 0; i < shaderCount; ++i)
+    {
+      dumpShaderImplicitCbufRegCount[i] =
+        decode_implicit_cbuf_reg_count(make_span_const(metadata[i].data(), metadata[i].size()), i < vertexShaderCount);
+    }
+  }
 
 protected:
   void clear()
@@ -601,6 +666,9 @@ protected:
     dump = nullptr;
     pixelShaderComputeProgramIDMap.clear();
     graphicsProgramTemplates.clear();
+    dumpShaderImplicitCbufRegCount.clear();
+    pixelShaderDumpIndex.clear();
+    computeProgramDumpIndex.clear();
     vertexShaderCount = 0;
     pixelShaderCount = 0;
     computeShaderCount = 0;
@@ -610,6 +678,7 @@ protected:
   {
     dump = d;
     inspect_scripted_shader_bin_dump(d, ScriptedShaderBinDumpInspector{getGroupID(base), null_pixel_shader, this});
+    decodeImplicitCbufRegCounts();
     graphicsProgramTemplates.shrink_to_fit();
     logdbg("DX12: Shader bindump %p contains %u vertex shaders, %u pixel shaders, %u graphics programs, %u compute programs", d,
       vertexShaderCount, pixelShaderCount, graphicsProgramTemplates.size(), computeShaderCount);
@@ -623,9 +692,35 @@ protected:
   {
     pixelShaderComputeProgramIDMap.shrink_to_fit();
     graphicsProgramTemplates.shrink_to_fit();
+    pixelShaderDumpIndex.shrink_to_fit();
+    computeProgramDumpIndex.shrink_to_fit();
   }
 
   uint32_t getGroupID(const ShaderProgramGroup *base) const { return 1 + (this - base); }
+
+  uint32_t getDumpShaderImplicitCbufRegCount(uint32_t dump_index) const
+  {
+    return dump_index < dumpShaderImplicitCbufRegCount.size() ? dumpShaderImplicitCbufRegCount[dump_index]
+                                                              : UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT;
+  }
+
+  uint32_t getVertexShaderImplicitCbufRegCount(ShaderID id) const
+  {
+    return id.getIndex() < vertexShaderCount ? getDumpShaderImplicitCbufRegCount(id.getIndex())
+                                             : UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT;
+  }
+
+  uint32_t getPixelShaderImplicitCbufRegCount(ShaderID id) const
+  {
+    return id.getIndex() < pixelShaderDumpIndex.size() ? getDumpShaderImplicitCbufRegCount(pixelShaderDumpIndex[id.getIndex()])
+                                                       : UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT;
+  }
+
+  uint32_t getComputeProgramImplicitCbufRegCount(ProgramID id) const
+  {
+    return id.getIndex() < computeProgramDumpIndex.size() ? getDumpShaderImplicitCbufRegCount(computeProgramDumpIndex[id.getIndex()])
+                                                          : UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT;
+  }
 
   template <typename T>
   void iterateComputeShaders(T clb) const
@@ -762,6 +857,21 @@ class ShaderProgramGroups
   IdManager vertexShaderIds;
   IdManager pixelShaderIds;
   IdManager computeIds;
+  dag::Vector<uint16_t> vertexShaderImplicitCbufRegCount;
+  dag::Vector<uint16_t> pixelShaderImplicitCbufRegCount;
+  dag::Vector<uint16_t> computeProgramImplicitCbufRegCount;
+
+  static void setImplicitCbufRegCount(dag::Vector<uint16_t> &table, uint32_t index, uint16_t count)
+  {
+    if (table.size() <= index)
+      table.resize(index + 1, 0);
+    table[index] = count;
+  }
+
+  static uint32_t getImplicitCbufRegCount(const dag::Vector<uint16_t> &table, uint32_t index)
+  {
+    return index < table.size() ? table[index] : UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT;
+  }
 
   typedef uint64_t hash_key_t;
   HashedKeyMap<hash_key_t, uint32_t, hash_key_t(0), oa_hashmap_util::MumStepHash<hash_key_t>> graphicsProgramsHashMap;
@@ -889,20 +999,47 @@ public:
     }
     computeIds.iterateAllocated([&](uint32_t id) { clb(ProgramID::asComputeProgram(0, id)); });
   }
-  ProgramID addComputeShaderProgram()
+  ProgramID addComputeShaderProgram(uint32_t implicit_cbuf_reg_count)
   {
     auto program = ProgramID::asComputeProgram(0, computeIds.allocate());
+    setImplicitCbufRegCount(computeProgramImplicitCbufRegCount, program.getIndex(), implicit_cbuf_reg_count);
     return program;
   }
-  ShaderID addPixelShader()
+  ShaderID addPixelShader(uint32_t implicit_cbuf_reg_count)
   {
     auto id = ShaderID::make(0, pixelShaderIds.allocate());
+    setImplicitCbufRegCount(pixelShaderImplicitCbufRegCount, id.getIndex(), implicit_cbuf_reg_count);
     return id;
   }
-  ShaderID addVertexShader()
+  ShaderID addVertexShader(uint32_t implicit_cbuf_reg_count)
   {
     auto id = ShaderID::make(0, vertexShaderIds.allocate());
+    setImplicitCbufRegCount(vertexShaderImplicitCbufRegCount, id.getIndex(), implicit_cbuf_reg_count);
     return id;
+  }
+  uint32_t getVertexShaderImplicitCbufRegCount(ShaderID id) const
+  {
+    if (ShaderID::Null() == id)
+      return UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT;
+    if (auto shaderGroup = getShaderGroupForShader(id))
+      return shaderGroup->getVertexShaderImplicitCbufRegCount(id);
+    return getImplicitCbufRegCount(vertexShaderImplicitCbufRegCount, id.getIndex());
+  }
+  uint32_t getPixelShaderImplicitCbufRegCount(ShaderID id) const
+  {
+    if (ShaderID::Null() == id)
+      return UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT;
+    if (auto shaderGroup = getShaderGroupForShader(id))
+      return shaderGroup->getPixelShaderImplicitCbufRegCount(id);
+    return getImplicitCbufRegCount(pixelShaderImplicitCbufRegCount, id.getIndex());
+  }
+  uint32_t getComputeProgramImplicitCbufRegCount(ProgramID id) const
+  {
+    if (ProgramID::Null() == id)
+      return UNKNOWN_CONST_REGISTER_COUNT_REQUIREMENT;
+    if (auto shaderGroup = getShaderGroupForProgram(id))
+      return shaderGroup->getComputeProgramImplicitCbufRegCount(id);
+    return getImplicitCbufRegCount(computeProgramImplicitCbufRegCount, id.getIndex());
   }
   void reset()
   {
@@ -911,6 +1048,9 @@ public:
     vertexShaderIds.clear();
     pixelShaderIds.clear();
     computeIds.clear();
+    vertexShaderImplicitCbufRegCount.clear();
+    pixelShaderImplicitCbufRegCount.clear();
+    computeProgramImplicitCbufRegCount.clear();
     graphicsProgramTemplates.clear();
     clearGraphicsProgramsInstances();
   }
@@ -1078,6 +1218,16 @@ public:
     const auto &inst = graphicsProgramInstances[program.getIndex()];
     info.input = inst.inputLayout;
     info.programId = inst.internalProgram;
+    if (GraphicsProgramID::Null() != inst.internalProgram)
+    {
+      GraphicsProgramTemplate shaders;
+      if (auto shaderGroup = getShaderGroupForGraphicsProgram(inst.internalProgram))
+        shaders = shaderGroup->getShadersOfGraphicsProgram(inst.internalProgram);
+      else
+        shaders = graphicsProgramTemplates[inst.internalProgram.getIndex()];
+      info.vsImplicitCbufRegCount = getVertexShaderImplicitCbufRegCount(shaders.vertexShader);
+      info.psImplicitCbufRegCount = getPixelShaderImplicitCbufRegCount(shaders.pixelShader);
+    }
 
     return info;
   }
@@ -1156,116 +1306,28 @@ public:
   }
 };
 
-StageShaderModule shader_layout_to_module(const bindump::Mapper<dxil::Shader> &layout);
-template <typename ModuleType>
-inline ModuleType decode_shader_layout(const void *data)
-{
-  ModuleType result;
-  auto *container = bindump::map<dxil::ShaderContainer>((const uint8_t *)data);
-  if (!container)
-    return result;
-
-  dag::ConstSpan<uint8_t> containerData = container->data;
-  const bindump::Mapper<dxil::ShaderWithStreamOutput> *programWithSo = nullptr;
-  if (container->type.hasStreamOutput)
-  {
-    programWithSo = bindump::map<dxil::ShaderWithStreamOutput>(containerData.data());
-    containerData = programWithSo->data;
-  }
-
-  if (container->type.shaderType == dxil::StoredShaderType::combinedVertexShader)
-  {
-    if constexpr (eastl::is_same_v<ModuleType, VertexShaderModule>)
-    {
-      if (auto *combined = bindump::map<dxil::VertexShaderPipeline>(containerData.data()))
-      {
-        result = shader_layout_to_module(*combined->vertexShader);
-        if (programWithSo)
-        {
-          result.streamOutputDesc.resize(programWithSo->streamOutputComponents.size());
-          eastl::copy(programWithSo->streamOutputComponents.begin(), programWithSo->streamOutputComponents.end(),
-            result.streamOutputDesc.begin());
-        }
-        result.ident.shaderHash = container->dataHash;
-        result.ident.shaderSize = containerData.size();
-        if (combined->geometryShader)
-        {
-          result.geometryShader = eastl::make_unique<StageShaderModule>(shader_layout_to_module(*combined->geometryShader));
-        }
-        if (combined->hullShader)
-        {
-          result.hullShader = eastl::make_unique<StageShaderModule>(shader_layout_to_module(*combined->hullShader));
-        }
-        if (combined->domainShader)
-        {
-          result.domainShader = eastl::make_unique<StageShaderModule>(shader_layout_to_module(*combined->domainShader));
-        }
-      }
-      else
-      {
-        G_ASSERTF(false, "Couldn't map to dxil::VertexShaderPipeline.");
-      }
-    }
-  }
-  else if (container->type.shaderType == dxil::StoredShaderType::meshShader)
-  {
-    if constexpr (eastl::is_same_v<ModuleType, VertexShaderModule>)
-    {
-      if (auto *combined = bindump::map<dxil::MeshShaderPipeline>(containerData.data()))
-      {
-        result = shader_layout_to_module(*combined->meshShader);
-        if (programWithSo)
-        {
-          result.streamOutputDesc.resize(programWithSo->streamOutputComponents.size());
-          eastl::copy(programWithSo->streamOutputComponents.begin(), programWithSo->streamOutputComponents.end(),
-            result.streamOutputDesc.begin());
-        }
-        result.ident.shaderHash = container->dataHash;
-        result.ident.shaderSize = containerData.size();
-        if (combined->amplificationShader)
-        {
-          result.geometryShader = eastl::make_unique<StageShaderModule>(shader_layout_to_module(*combined->amplificationShader));
-        }
-      }
-      else
-      {
-        G_ASSERTF(false, "Couldn't map to dxil::MeshShaderPipeline.");
-      }
-    }
-  }
-  else
-  {
-    if (auto *shader = bindump::map<dxil::Shader>(containerData.data()))
-    {
-      result = shader_layout_to_module(*shader);
-      if constexpr (eastl::is_same_v<ModuleType, VertexShaderModule>)
-        if (programWithSo)
-        {
-          result.streamOutputDesc.resize(programWithSo->streamOutputComponents.size());
-          eastl::copy(programWithSo->streamOutputComponents.begin(), programWithSo->streamOutputComponents.end(),
-            result.streamOutputDesc.begin());
-        }
-      result.ident.shaderHash = container->dataHash;
-      result.ident.shaderSize = containerData.size();
-    }
-    else
-    {
-      G_ASSERTF(false, "Couldn't map to dxil::Shader.");
-    }
-  }
-  return result;
-}
-StageShaderModule decode_shader_binary(const void *data, uint32_t size);
-eastl::unique_ptr<VertexShaderModule> decode_vertex_shader(const void *data, uint32_t size);
-eastl::unique_ptr<PixelShaderModule> decode_pixel_shader(const void *data, uint32_t size);
+eastl::unique_ptr<VertexShaderModule> decode_vertex_shader(const ShaderSourceExt &source);
+eastl::unique_ptr<PixelShaderModule> decode_pixel_shader(const ShaderSourceExt &source);
+ComputeShaderModule decode_compute_shader(const ShaderSource &source);
 
 struct StageShaderModuleInBinaryRef : StageShaderModuleHeader
 {
+  eastl::span<const uint8_t> metadata;
   eastl::span<const uint8_t> byteCode;
 };
 inline uint32_t offset_to_base(const void *base, const StageShaderModuleInBinaryRef &shader)
 {
-  return shader.byteCode.data() - reinterpret_cast<const uint8_t *>(base);
+  auto value = shader.byteCode.data() - reinterpret_cast<const uint8_t *>(base);
+  if (value < 0)
+  {
+    DAG_FATAL("DX12: Code offset %lld was negative", int64_t{value});
+  }
+  if (value > eastl::numeric_limits<uint32_t>::max())
+  {
+    DAG_FATAL("DX12: Code offset %lld exceeded 32 bits range", int64_t{value});
+  }
+
+  return static_cast<uint32_t>(value);
 }
 using PixelShaderModuleInBinaryRef = StageShaderModuleInBinaryRef;
 
@@ -1278,97 +1340,8 @@ struct VertexShaderModuleInBinaryRef : StageShaderModuleInBinaryRef
   eastl::span<const dxil::StreamOutputComponentInfo> streamOutputDesc;
 };
 
-StageShaderModuleInBinaryRef shader_layout_to_module_ref(const bindump::Mapper<dxil::Shader> &layout);
-template <typename ModuleType>
-inline ModuleType decode_shader_layout_ref(const void *data)
-{
-  ModuleType result;
-  auto *container = bindump::map<dxil::ShaderContainer>((const uint8_t *)data);
-  if (!container)
-    return result;
-
-  dag::ConstSpan<uint8_t> containerData = container->data;
-  const bindump::Mapper<dxil::ShaderWithStreamOutput> *programWithSo = nullptr;
-  if (container->type.hasStreamOutput)
-  {
-    programWithSo = bindump::map<dxil::ShaderWithStreamOutput>(containerData.data());
-    containerData = programWithSo->data;
-  }
-
-  if (container->type.shaderType == dxil::StoredShaderType::combinedVertexShader)
-  {
-    if constexpr (eastl::is_same_v<ModuleType, VertexShaderModuleInBinaryRef>)
-    {
-      if (auto *combined = bindump::map<dxil::VertexShaderPipeline>(containerData.data()))
-      {
-        static_cast<StageShaderModuleInBinaryRef &>(result) = shader_layout_to_module_ref(*combined->vertexShader);
-        if (programWithSo)
-          result.streamOutputDesc = programWithSo->streamOutputComponents;
-        result.ident.shaderHash = container->dataHash;
-        result.ident.shaderSize = containerData.size();
-        if (combined->geometryShader)
-        {
-          result.geometryShader = shader_layout_to_module_ref(*combined->geometryShader);
-        }
-        if (combined->hullShader)
-        {
-          result.hullShader = shader_layout_to_module_ref(*combined->hullShader);
-        }
-        if (combined->domainShader)
-        {
-          result.domainShader = shader_layout_to_module_ref(*combined->domainShader);
-        }
-      }
-      else
-      {
-        G_ASSERTF(false, "Couldn't map to dxil::VertexShaderPipeline.");
-      }
-    }
-  }
-  else if (container->type.shaderType == dxil::StoredShaderType::meshShader)
-  {
-    if constexpr (eastl::is_same_v<ModuleType, VertexShaderModuleInBinaryRef>)
-    {
-      if (auto *combined = bindump::map<dxil::MeshShaderPipeline>(containerData.data()))
-      {
-        static_cast<StageShaderModuleInBinaryRef &>(result) = shader_layout_to_module_ref(*combined->meshShader);
-        if (programWithSo)
-          result.streamOutputDesc = programWithSo->streamOutputComponents;
-        result.ident.shaderHash = container->dataHash;
-        result.ident.shaderSize = containerData.size();
-        if (combined->amplificationShader)
-        {
-          result.geometryShader = shader_layout_to_module_ref(*combined->amplificationShader);
-        }
-      }
-      else
-      {
-        G_ASSERTF(false, "Couldn't map to dxil::MeshShaderPipeline.");
-      }
-    }
-  }
-  else
-  {
-    if (auto *shader = bindump::map<dxil::Shader>(containerData.data()))
-    {
-      static_cast<StageShaderModuleInBinaryRef &>(result) = shader_layout_to_module_ref(*shader);
-      if constexpr (eastl::is_same_v<ModuleType, VertexShaderModuleInBinaryRef>)
-        if (programWithSo)
-          result.streamOutputDesc = programWithSo->streamOutputComponents;
-      result.ident.shaderHash = container->dataHash;
-      result.ident.shaderSize = containerData.size();
-    }
-    else
-    {
-      G_ASSERTF(false, "Couldn't map to dxil::MeshShaderPipeline.");
-    }
-  }
-  return result;
-}
-
-StageShaderModuleInBinaryRef decode_shader_binary_ref(const void *data, uint32_t size);
-VertexShaderModuleInBinaryRef decode_vertex_shader_ref(const void *data, uint32_t size);
-PixelShaderModuleInBinaryRef decode_pixel_shader_ref(const void *data, uint32_t size);
+VertexShaderModuleInBinaryRef decode_vertex_shader_ref(const void *data, uint32_t size, const uint8_t *bytecode);
+PixelShaderModuleInBinaryRef decode_pixel_shader_ref(const void *data, uint32_t size, const uint8_t *bytecode);
 
 struct InputLayoutIDWithHash
 {
@@ -1390,26 +1363,25 @@ class ShaderProgramDatabase
 
   void initDebugProgram(DeviceContext &ctx);
   void initNullPixelShader(DeviceContext &ctx);
-  ShaderID newRawVertexShader(DeviceContext &ctx, const dxil::ShaderHeader &header, dag::ConstSpan<uint8_t> byte_code);
-  ShaderID newRawPixelShader(DeviceContext &ctx, const dxil::ShaderHeader &header, dag::ConstSpan<uint8_t> byte_code);
 
 public:
-  ProgramID newComputeProgram(DeviceContext &ctx, const void *data, CSPreloaded preloaded);
+  ProgramID newComputeProgram(DeviceContext &ctx, const ShaderSourceExt &source, CSPreloaded preloaded);
   ProgramID newGraphicsProgram(DeviceContext &ctx, InputLayoutID vdecl, ShaderID vs, ShaderID ps);
   InputLayoutID getInputLayoutForGraphicsProgram(ProgramID program);
   GraphicsProgramUsageInfo getGraphicsProgramForStateUpdate(ProgramID program);
+  ComputeProgramUsageInfo getComputeProgramForStateUpdate(ProgramID program);
   InputLayoutID registerInputLayoutInternal(DeviceContext &ctx, const InputLayout &layout);
   InputLayoutID registerInputLayout(DeviceContext &ctx, const InputLayout &layout);
   void setup(DeviceContext &ctx, bool disable_precache);
   void shutdown(DeviceContext &ctx);
-  ShaderID newVertexShader(DeviceContext &ctx, const void *data);
-  ShaderID newPixelShader(DeviceContext &ctx, const void *data);
+  ShaderID newVertexShader(DeviceContext &ctx, const ShaderSourceExt &source);
+  ShaderID newPixelShader(DeviceContext &ctx, const ShaderSourceExt &source);
   ProgramID getDebugProgram();
   void removeProgram(DeviceContext &ctx, ProgramID prog);
   void deleteVertexShader(DeviceContext &ctx, ShaderID shader);
   void deletePixelShader(DeviceContext &ctx, ShaderID shader);
-  void updateVertexShaderName(DeviceContext &ctx, ShaderID shader, const char *name);
-  void updatePixelShaderName(DeviceContext &ctx, ShaderID shader, const char *name);
+  ShaderID newRawVertexShader(DeviceContext &ctx, const dxil::ShaderHeader &header, dag::ConstSpan<uint8_t> byte_code);
+  ShaderID newRawPixelShader(DeviceContext &ctx, const dxil::ShaderHeader &header, dag::ConstSpan<uint8_t> byte_code);
 
   void registerShaderBinDump(DeviceContext &ctx, ScriptedShadersBinDumpOwner *dump, const char *name);
   void getBindumpShader(DeviceContext &ctx, uint32_t index, ShaderCodeType type, void *ident);
@@ -1517,23 +1489,50 @@ public:
 class ScriptedShadersBinDumpManager
 {
   using UncompressedMemoryProvider = Tab<uint8_t>;
-  struct DecompressedGroup
+  // Shader hashes are SHA1 digests, so any 8 leading bytes are already a well-distributed key.
+  struct ShaderHashValueHasher
   {
-    UncompressedMemoryProvider uncompressed;
-    bindump::Mapper<shader_layout::ShGroup> *shaderGroup = nullptr;
+    size_t operator()(const dxil::HashValue &h) const
+    {
+      size_t v = 0;
+      memcpy(&v, h.value, sizeof(v));
+      return v;
+    }
   };
+  using ShaderHashLookup = ska::flat_hash_map<dxil::HashValue, uint32_t, ShaderHashValueHasher>;
   struct ScriptedShadersBinDumpState
   {
     ScriptedShadersBinDumpOwner *owner = nullptr;
-    eastl::unique_ptr<DecompressedGroup[]> decompressedGroups;
+    eastl::unique_ptr<UncompressedMemoryProvider[]> decompressedShaders;
+    size_t decompressedShadersSize = 0;
     eastl::string name;
+    ShaderHashLookup vprHashToIndex;
+    ShaderHashLookup computeHashToIndex;
+
+    void buildShaderHashLookup()
+    {
+      vprHashToIndex.clear();
+      computeHashToIndex.clear();
+      auto v2 = owner ? owner->getDumpV2() : nullptr;
+      if (!v2)
+        return;
+      const uint32_t vprCount = v2->vprCount;
+      const uint32_t total = v2->shaderHashes.size();
+      vprHashToIndex.reserve(vprCount);
+      computeHashToIndex.reserve(total > vprCount ? total - vprCount : 0);
+      for (uint32_t i = 0; i < vprCount && i < total; ++i)
+        vprHashToIndex.emplace(v2->shaderHashes[i], i);
+      for (uint32_t i = vprCount; i < total; ++i)
+        computeHashToIndex.emplace(v2->shaderHashes[i], i - vprCount);
+    }
   };
   ScriptedShadersBinDumpState dumps[max_scripted_shaders_bin_groups]{};
+  OSSpinlock decompressionCacheLock;
 
 public:
   ScriptedShadersBinDumpOwner *getDump(uint32_t group) { return dumps[group].owner; }
   template <typename T>
-  void enumerateShaderFromHash(const dxil::HashValue &hash, T reciever) const
+  void enumerateShaderFromHash(const dxil::HashValue &hash, T receiver) const
   {
     for (uint32_t gi = 0; gi < countof(dumps); ++gi)
     {
@@ -1553,7 +1552,7 @@ public:
         {
           continue;
         }
-        if (!reciever(gi, si, v2->vprCount))
+        if (!receiver(gi, si, v2->vprCount))
         {
           break;
         }
@@ -1564,49 +1563,75 @@ public:
   {
     auto &target = dumps[shaderGroup];
     target.owner = dump;
-    target.decompressedGroups = eastl::make_unique<DecompressedGroup[]>(dump->getDump()->shGroups.size());
+    target.decompressedShaders = eastl::make_unique<UncompressedMemoryProvider[]>(dump->getDump()->shaders.size());
+    target.decompressedShadersSize = 0;
     target.name = name;
+    target.buildShaderHashLookup();
   }
   void resetDumpOfGroup(uint32_t shaderGroup)
   {
     auto &target = dumps[shaderGroup];
     target.owner = nullptr;
-    target.decompressedGroups.reset();
+    target.decompressedShaders.reset();
+    target.decompressedShadersSize = 0;
     target.name.clear();
+    ShaderHashLookup{}.swap(target.vprHashToIndex);
+    ShaderHashLookup{}.swap(target.computeHashToIndex);
   }
   // returned memory range is valid until the end of the frame, after that its undefined.
-  eastl::span<uint8_t> getShaderByteCode(uint32_t shaderGroup, uint32_t compression_group, uint32_t compression_index)
+  struct GetShaderByteCodeResult
   {
+    eastl::span<const uint8_t> byteCode;
+    bool cacheHit;
+  };
+  struct GetShaderByteCodeResultMeta
+  {
+    eastl::span<const uint8_t> metadata;
+    eastl::span<uint8_t> byteCode;
+    bool cacheHit;
+  };
+  GetShaderByteCodeResultMeta getShaderByteCode(uint32_t shaderGroup, uint32_t compression_index)
+  {
+    OSSpinlockScopedLock lock{decompressionCacheLock};
     auto &dump = dumps[shaderGroup];
-    if (!dump.decompressedGroups)
+    if (!dump.decompressedShaders)
     {
-      return {nullptr, nullptr};
+      return {.byteCode = {nullptr, nullptr}, .cacheHit = false};
     }
-    auto &compGroup = dump.decompressedGroups[compression_group];
-    if (!compGroup.shaderGroup)
+    auto src = dump.owner->getCodeById(compression_index);
+    auto &shader = dump.decompressedShaders[compression_index];
+    bool cacheHit = true;
+    if (!shader.size())
     {
-      logdbg("DX12: Decompressing shader shaderGroup %u of dump %p...", compression_group, dump.owner);
-      compGroup.shaderGroup = dump.owner->getDump()->shGroups[compression_group].decompress(compGroup.uncompressed,
-        bindump::BehaviorOnUncompressed::Reference, dump.owner->getDecompressionDict());
-      ByteUnits uncompressedByteSize = compGroup.uncompressed.size();
-      logdbg("DX12: ...decompressed into %.2f %s...", uncompressedByteSize.units(), uncompressedByteSize.name());
+      auto src = dump.owner->getCodeById(compression_index);
+      src.uncompress(shader);
+      dump.decompressedShadersSize += shader.size();
+      ByteUnits uncompressedByteSize = shader.size();
+      cacheHit = false;
     }
-    auto &shader = compGroup.shaderGroup->shaders[compression_index];
-    return {shader.begin(), shader.end()};
+    return {.metadata = src.metadata, .byteCode = {shader.begin(), shader.end()}, .cacheHit = cacheHit};
   }
-  // currently always evicts cache
+
   void evictDecompressionCache()
   {
+    OSSpinlockScopedLock lock{decompressionCacheLock};
     for (auto &dump : dumps)
     {
-      if (!dump.decompressedGroups)
+      if (!dump.decompressedShaders || !dump.decompressedShadersSize)
         continue;
-      for (uint32_t i = 0; i < dump.owner->getDump()->shGroups.size(); ++i)
-      {
-        UncompressedMemoryProvider{}.swap(dump.decompressedGroups[i].uncompressed);
-        dump.decompressedGroups[i].shaderGroup = nullptr;
-      }
+      for (uint32_t i = 0; i < dump.owner->getDump()->shaders.size(); ++i)
+        UncompressedMemoryProvider{}.swap(dump.decompressedShaders[i]);
+      dump.decompressedShadersSize = 0;
     }
+  }
+
+  size_t getBytecodeCacheMemoryUsage()
+  {
+    OSSpinlockScopedLock lock{decompressionCacheLock};
+    size_t totalMemory = 0;
+    for (const auto &dump : dumps)
+      totalMemory += dump.decompressedShadersSize;
+    return totalMemory;
   }
 
   const eastl::string &getGroupName(uint32_t group) const { return dumps[group].name; }
@@ -1650,18 +1675,10 @@ public:
       {
         continue;
       }
-      auto v2 = group.owner->getDumpV2();
-      if (!v2)
+      auto it = group.vprHashToIndex.find(hash);
+      if (it != group.vprHashToIndex.end())
       {
-        continue;
-      }
-      auto shaderCount = v2->vprCount;
-      for (uint32_t shaderIndex = 0; shaderIndex < shaderCount; ++shaderIndex)
-      {
-        if (v2->shaderHashes[shaderIndex] == hash)
-        {
-          return {groupIndex, shaderIndex};
-        }
+        return {groupIndex, it->second};
       }
     }
     return {max_scripted_shaders_bin_groups, 0};
@@ -1682,22 +1699,45 @@ public:
       {
         continue;
       }
-      auto v2 = group.owner->getDumpV2();
-      if (!v2)
+      auto it = group.computeHashToIndex.find(hash);
+      if (it != group.computeHashToIndex.end())
       {
-        continue;
-      }
-      auto shaderIndexOffset = v2->vprCount;
-      auto shaderCount = v2->shGroupsMapping.size() - shaderIndexOffset;
-      for (uint32_t shaderIndex = 0; shaderIndex < shaderCount; ++shaderIndex)
-      {
-        if (v2->shaderHashes[shaderIndexOffset + shaderIndex] == hash)
-        {
-          return {groupIndex, shaderIndex};
-        }
+        return {groupIndex, it->second};
       }
     }
     return {max_scripted_shaders_bin_groups, 0};
+  }
+
+  // A dump can hold the same byte code under several indices while findVertexShader() and
+  // findPixelShader() answer with the first of them. Every index used to key a pass or to look one
+  // up has to be reduced to that first index, or the two sides name the same shader differently.
+  uint32_t canonicalVertexShaderIndex(uint32_t group, uint32_t vpr_id)
+  {
+    auto &dumpGroup = dumps[group];
+    auto v2 = dumpGroup.owner ? dumpGroup.owner->getDumpV2() : nullptr;
+    if (!v2 || 0xFFFF == vpr_id || vpr_id >= uint32_t(v2->vprCount) || vpr_id >= v2->shaderHashes.size())
+    {
+      return vpr_id;
+    }
+    auto it = dumpGroup.vprHashToIndex.find(v2->shaderHashes[vpr_id]);
+    return it != dumpGroup.vprHashToIndex.end() ? it->second : vpr_id;
+  }
+
+  uint32_t canonicalPixelShaderIndex(uint32_t group, uint32_t fsh_id)
+  {
+    auto &dumpGroup = dumps[group];
+    auto v2 = dumpGroup.owner ? dumpGroup.owner->getDumpV2() : nullptr;
+    if (!v2 || 0xFFFF == fsh_id || fsh_id >= uint32_t(v2->fshCount))
+    {
+      return fsh_id;
+    }
+    const uint32_t dumpIndex = uint32_t(v2->vprCount) + fsh_id;
+    if (dumpIndex >= v2->shaderHashes.size())
+    {
+      return fsh_id;
+    }
+    auto it = dumpGroup.computeHashToIndex.find(v2->shaderHashes[dumpIndex]);
+    return it != dumpGroup.computeHashToIndex.end() ? it->second : fsh_id;
   }
 
   struct RenderStateIterationInfo
@@ -1774,12 +1814,109 @@ public:
     }
     return {max_scripted_shaders_bin_groups, 0, 0};
   }
+
+  struct GraphicsPassIndex
+  {
+    struct PassRef
+    {
+      uint32_t classIndex;
+      uint32_t staticIndex;
+      uint32_t dynamicIndex;
+      uint16_t renderState;
+    };
+    using PassRefs = dag::Vector<PassRef>;
+    ska::flat_hash_map<uint32_t, PassRefs> byVsPs;
+    dag::Vector<PassRefs> byVs;
+    dag::Vector<PassRefs> byPs;
+    dag::Vector<RenderStateSystem::StaticState> staticStates;
+    bool built = false;
+    bool valid = false;
+
+    const PassRefs *passesOfVsPs(uint32_t vs, uint32_t ps) const
+    {
+      auto it = byVsPs.find((vs << 16) | ps);
+      return it == byVsPs.end() ? nullptr : &it->second;
+    }
+    const PassRefs *passesOfVs(uint32_t vs) const { return vs < byVs.size() ? &byVs[vs] : nullptr; }
+    const PassRefs *passesOfPs(uint32_t ps) const { return ps < byPs.size() ? &byPs[ps] : nullptr; }
+  };
+
+  struct GraphicsPassIndexCache
+  {
+    GraphicsPassIndex perGroup[max_scripted_shaders_bin_groups];
+  };
+
+  bool buildGraphicsPassIndex(uint32_t group, GraphicsPassIndex &index)
+  {
+    auto &dumpGroup = dumps[group];
+    if (!dumpGroup.owner)
+    {
+      return false;
+    }
+    auto v2 = dumpGroup.owner->getDumpV2();
+    if (!v2)
+    {
+      return false;
+    }
+
+    index.staticStates.reserve(v2->renderStates.size());
+    for (auto &rs : v2->renderStates)
+    {
+      index.staticStates.push_back(RenderStateSystem::StaticState::fromRenderState(rs));
+    }
+
+    index.byVs.resize(v2->vprCount);
+    index.byPs.resize(v2->fshCount);
+
+    for (uint32_t ci = 0; ci < v2->classes.size(); ++ci)
+    {
+      auto &cls = v2->classes[ci];
+      for (uint32_t si = 0; si < cls.code.size(); ++si)
+      {
+        auto &sVar = cls.code[si];
+        for (uint32_t di = 0; di < sVar.passes.size(); ++di)
+        {
+          if (!sVar.passes[di].rpass)
+          {
+            continue;
+          }
+          auto &pass = *sVar.passes[di].rpass;
+          const GraphicsPassIndex::PassRef ref{ci, si, di, pass.renderStateNo};
+          const uint32_t vprId = canonicalVertexShaderIndex(group, pass.vprId);
+          const uint32_t fshId = canonicalPixelShaderIndex(group, pass.fshId);
+          index.byVsPs[(vprId << 16) | fshId].push_back(ref);
+          if (vprId < index.byVs.size())
+          {
+            index.byVs[vprId].push_back(ref);
+          }
+          if (fshId < index.byPs.size())
+          {
+            index.byPs[fshId].push_back(ref);
+          }
+        }
+      }
+    }
+    index.valid = !index.staticStates.empty();
+    return index.valid;
+  }
+
+  GraphicsPassIndex &getGraphicsPassIndex(GraphicsPassIndexCache &cache, uint32_t group)
+  {
+    auto &index = cache.perGroup[group];
+    if (!index.built)
+    {
+      index.built = true;
+      buildGraphicsPassIndex(group, index);
+    }
+    return index;
+  }
 };
 
 struct StageShaderModuleBytecode
 {
-  eastl::unique_ptr<uint8_t[]> bytecode;
-  size_t bytecodeSize = 0;
+  ShaderSource source;
+  uint32_t bytecodeOffset = 0;
+  uint32_t bytecodeSize = 0;
 };
 
 struct VertexShaderModuleBytecode : StageShaderModuleBytecode
@@ -1807,8 +1944,9 @@ struct StageShaderModuleBytcodeInDumpOffsets
 
 struct StageShaderModuleBytcodeInDump : StageShaderModuleBytcodeInDumpOffsets
 {
-  uint16_t compressionGroup = 0;
-  uint16_t compressionIndex = 0;
+  // Indexes the combined vertex plus pixel and compute shader table of the dump, so it counts up
+  // to vprCount + fshCount while a pass can only name 65535 of either kind on its own.
+  uint32_t compressionIndex = 0;
 };
 
 struct VertexShaderModuleBytcodeInDump : StageShaderModuleBytcodeInDump
@@ -1854,6 +1992,16 @@ struct VertexShaderModuleRefStore
 {
   VertexShaderModuleHeader &header;
   eastl::variant<VertexShaderModuleBytecodeRef, VertexShaderModuleBytcodeInDumpRef> bytecode;
+
+  const uint8_t *uncompress(Tab<uint8_t> &tmpstorage) const
+  {
+    if (auto *vs = eastl::get_if<VertexShaderModuleBytecodeRef>(&bytecode))
+    {
+      vs->bytecode->source.uncompress(tmpstorage);
+      return tmpstorage.data();
+    }
+    return nullptr;
+  }
 };
 
 inline const dxil::ShaderHeader *get_gs(const VertexShaderModuleRefStore &ref)
@@ -1890,344 +2038,21 @@ struct PixelShaderModuleRefStore
 {
   const PixelShaderModuleHeader &header;
   eastl::variant<PixelShaderModuleBytecodeRef, PixelShaderModuleBytcodeInDumpRef> bytecode;
+
+  const uint8_t *uncompress(Tab<uint8_t> &tmpstorage) const
+  {
+    if (auto *ps = eastl::get_if<PixelShaderModuleBytecodeRef>(&bytecode))
+    {
+      ps->bytecode->source.uncompress(tmpstorage);
+      return tmpstorage.data();
+    }
+    return nullptr;
+  }
 };
 
 class PipelineNameGenerator : public ScriptedShadersBinDumpManager
 {
   using BaseType = ScriptedShadersBinDumpManager;
-
-  struct GeneratorContext
-  {
-    struct DynamicVariantInfo
-    {
-      uint32_t index = 0;
-      dag::Vector<uint32_t> codes;
-    };
-    struct StaticVarantInfo
-    {
-      uint32_t index = 0;
-      dag::Vector<uint32_t> codes;
-      dag::Vector<DynamicVariantInfo> dynamicVariants;
-    };
-    struct ClassInfo
-    {
-      const shaderbindump::ShaderClass *shaderClass = nullptr;
-      dag::Vector<StaticVarantInfo> staticVariants;
-    };
-    dag::Vector<ClassInfo> classReferences;
-    ScriptedShadersBinDumpV2 *v2 = nullptr;
-    uint32_t lastStaticCode = ~0u;
-    uint32_t lastStaticVariantIndex = 0;
-    uint32_t lastDynamicCode = ~0u;
-    eastl::string_view affixes[2];
-    eastl::string finalName;
-
-    const shaderbindump::ShaderClass *lastShaderClass() const
-    {
-      if (classReferences.empty())
-      {
-        return nullptr;
-      }
-      return classReferences.back().shaderClass;
-    }
-
-    struct VariableValueTable
-    {
-      struct VariableInfo
-      {
-        eastl::string_view name;
-        eastl::span<const float> valueRange;
-        // intervals usually intervals have about 2-4 indices, instead of having a set with each value, we simply use a bit mask where
-        // each bit stands for the used index
-        uint32_t valueMask;
-        bool isEnumeration() const
-        {
-          if (!valueRange.data())
-          {
-            return true;
-          }
-          for (uint32_t i = 0; i < valueRange.size(); ++i)
-          {
-            if (uint32_t(valueRange[i]) != i)
-            {
-              return false;
-            }
-          }
-          return true;
-        }
-        bool usesIntegerValues() const
-        {
-          if (!valueRange.data())
-          {
-            return true;
-          }
-          for (auto &value : valueRange)
-          {
-            if (floor(value) != value)
-            {
-              return false;
-            }
-          }
-          return true;
-        }
-        bool usesAllValues() const
-        {
-          if (!valueRange.data())
-          {
-            return true;
-          }
-          return 0 == (valueMask ^ (1u << (valueRange.size() + 1)) - 1);
-        }
-        // has 3 formatting modes:
-        // - float interval, all values are appended as float (%f), all except the last index is prefixed with a '<' to match the
-        // interval definition, the last entry is prefixed with '>=' to indicate its the last value representing everything else.
-        // - int interval, when all values in the interval can be represented as int without loss, the values are append as int (%d),
-        // prefixing is the same as for the float interval.
-        // - enum, when all values in an interval match their index value, then each index is appended as uint (%u) without prefix.
-        void appendValuesToString(eastl::string &target)
-        {
-          if (!valueMask)
-          {
-            return;
-          }
-          if (usesAllValues())
-          {
-            target += "any-value";
-            return;
-          }
-
-          char buf[32];
-          bool isInt = usesIntegerValues();
-          bool isEnum = false;
-          if (isInt)
-          {
-            isEnum = isEnumeration();
-          }
-          for (uint32_t i = 0; i < 32; ++i)
-          {
-            if (0 == (valueMask & (1u << i)))
-            {
-              continue;
-            }
-            if (isEnum || !valueRange.data())
-            {
-              sprintf_s(buf, "%u", i);
-              target += buf;
-              target.push_back(',');
-              continue;
-            }
-            auto index = i;
-            if (index >= valueRange.size())
-            {
-              target.push_back('>');
-              target.push_back('=');
-              --index;
-            }
-            else
-            {
-              target.push_back('<');
-            }
-            if (isInt)
-            {
-              sprintf_s(buf, "%d", int(valueRange[index]));
-            }
-            else
-            {
-              sprintf_s(buf, "%f", valueRange[index]);
-            }
-            target += buf;
-            target.push_back(',');
-          }
-          target.pop_back();
-        }
-      };
-      dag::Vector<VariableInfo> variables;
-      void addVariableValue(eastl::string_view name, eastl::span<const float> value_range, uint32_t value)
-      {
-        auto ref = eastl::find_if(begin(variables), end(variables), [name](auto &info) { return name == info.name; });
-        if (ref == end(variables))
-        {
-          VariableInfo newValue{name, value_range, 0};
-          ref = variables.insert(ref, newValue);
-        }
-        G_ASSERT(value < 32);
-        ref->valueMask |= 1u << value;
-      }
-      void appendToString(eastl::string &name)
-      {
-        for (auto &var : variables)
-        {
-          // don't print intervals that don't contribute
-          if (var.usesAllValues())
-          {
-            continue;
-          }
-          name.append(begin(var.name), end(var.name));
-          name.push_back('=');
-          name.push_back('[');
-          var.appendValuesToString(name);
-          name.push_back(']');
-          name.push_back(',');
-        }
-      }
-      bool hasValues() const { return !variables.empty(); }
-      void clear() { variables.clear(); }
-    };
-
-    void insertUniqueVariableValues(const shaderbindump::VariantTable &variants, eastl::span<const uint32_t> codes,
-      VariableValueTable &target)
-    {
-      if (0 == variants.codePieces.size())
-      {
-        return;
-      }
-      for (auto [intervalID, intervalMul] : variants.codePieces)
-      {
-        auto &interval = v2->intervals[intervalID];
-        for (auto code : codes)
-        {
-          target.addVariableValue(static_cast<eastl::string_view>(v2->varMap[interval.nameId]),
-            {interval.maxVal.data(), interval.maxVal.size()}, (code / intervalMul) % interval.getValCount());
-        }
-      }
-    }
-
-    void start(ScriptedShadersBinDumpV2 *dump) { v2 = dump; }
-    void finish()
-    {
-      if (classReferences.empty())
-      {
-        return;
-      }
-      finalName.clear();
-      VariableValueTable variableValues;
-      for (auto &cRef : classReferences)
-      {
-        variableValues.clear();
-        finalName.append({static_cast<const char *>(cRef.shaderClass->name), cRef.shaderClass->name.size() - 1});
-        for (auto &sVar : cRef.staticVariants)
-        {
-          insertUniqueVariableValues(cRef.shaderClass->stVariants, sVar.codes, variableValues);
-        }
-        if (variableValues.hasValues())
-        {
-          beginVariableBlock(true);
-          variableValues.appendToString(finalName);
-          endVariableBlock(true);
-        }
-        variableValues.clear();
-        for (auto &sVar : cRef.staticVariants)
-        {
-          for (auto &dVar : sVar.dynamicVariants)
-          {
-            insertUniqueVariableValues(cRef.shaderClass->code[sVar.index].dynVariants, dVar.codes, variableValues);
-          }
-        }
-        if (variableValues.hasValues())
-        {
-          beginVariableBlock(false);
-          variableValues.appendToString(finalName);
-          endVariableBlock(false);
-        }
-        finalName.push_back('\n');
-      }
-      finalName.pop_back();
-      for (auto &affix : affixes)
-      {
-        finalName.append(begin(affix), end(affix));
-      }
-    }
-    void setAffixes(eastl::string_view affix_1, eastl::string_view affix_2)
-    {
-      affixes[0] = affix_1;
-      affixes[1] = affix_2;
-    }
-
-    void beginShaderClass(const shaderbindump::ShaderClass &shader_class)
-    {
-      if (lastShaderClass() == &shader_class)
-      {
-        return;
-      }
-      lastStaticCode = ~uint32_t{0};
-      ClassInfo newClassInfo;
-      newClassInfo.shaderClass = &shader_class;
-      classReferences.push_back(eastl::move(newClassInfo));
-    }
-    void beginStaticVariant(uint32_t code)
-    {
-      if (lastStaticCode == code || !lastShaderClass())
-      {
-        return;
-      }
-      lastStaticCode = code;
-      lastStaticVariantIndex = lastShaderClass()->stVariants.findVariant(code);
-      lastDynamicCode = ~uint32_t{0};
-      auto &target = classReferences.back();
-      auto ref = eastl::find_if(begin(target.staticVariants), end(target.staticVariants),
-        [this](const auto &s_var) { return s_var.index == this->lastStaticVariantIndex; });
-      if (ref == end(target.staticVariants))
-      {
-        StaticVarantInfo sVar;
-        sVar.index = lastStaticVariantIndex;
-        ref = target.staticVariants.insert(ref, std::move(sVar));
-      }
-      ref->codes.push_back(code);
-    }
-    void beginDynamicVariant(uint32_t code)
-    {
-      if (lastDynamicCode == code || !lastShaderClass())
-      {
-        return;
-      }
-      lastDynamicCode = code;
-      auto index = lastShaderClass()->code[lastStaticVariantIndex].dynVariants.findVariant(code);
-      auto &base = classReferences.back();
-      auto baseRef = eastl::find_if(begin(base.staticVariants), end(base.staticVariants),
-        [this](const auto &s_var) { return s_var.index == this->lastStaticVariantIndex; });
-      auto ref = eastl::find_if(begin(baseRef->dynamicVariants), end(baseRef->dynamicVariants),
-        [index](const auto &d_var) { return d_var.index == index; });
-      if (ref == end(baseRef->dynamicVariants))
-      {
-        DynamicVariantInfo dVar;
-        dVar.index = index;
-        ref = baseRef->dynamicVariants.insert(ref, eastl::move(dVar));
-      }
-      ref->codes.push_back(code);
-    }
-    void prepareStringSpace(size_t extra_space) { finalName.reserve(finalName.size() + extra_space); }
-    void beginVariableBlock(bool is_static_vars) { finalName.push_back(is_static_vars ? '(' : '{'); }
-    void endVariableBlock(bool is_static_vars) { finalName.back() = is_static_vars ? ')' : '}'; }
-    void beginValueSet()
-    {
-      finalName.back() = '=';
-      finalName.push_back('{');
-    }
-    void endValueSet()
-    {
-      finalName.back() = '}';
-      finalName.push_back(' ');
-    }
-    void appendVariableValue(uint32_t value)
-    {
-      char buffer[12];
-      auto ln = sprintf_s(buffer, "%u", value);
-      finalName.append(buffer, buffer + ln);
-      finalName.push_back(',');
-    }
-    void appendVariableName(eastl::string_view name)
-    {
-      finalName.append(begin(name), end(name));
-      finalName.push_back(',');
-    }
-
-    void onShaderClassPassUse(const shaderbindump::ShaderClass &shader_class, uint32_t static_code, uint32_t dynamic_code)
-    {
-      beginShaderClass(shader_class);
-      beginStaticVariant(static_code);
-      beginDynamicVariant(dynamic_code);
-    }
-  };
 
   void iterateShaderClassesForComputeShader(const dxil::HashValue &hash, eastl::string &out_name)
   {
@@ -2237,9 +2062,11 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
       return;
     }
 
-    GeneratorContext ctx;
     auto v2 = getDump(group)->getDumpV2();
-    ctx.start(v2);
+    if (!v2)
+      return;
+
+    const auto &nameSettings = getDump(group)->shaderNameFormatSettings;
 
     for (auto &cls : v2->classes)
     {
@@ -2261,17 +2088,14 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
             continue;
           }
 
-          generateNamesForShaderClassCodes(cls, si, di, ctx);
+          generateNamesForShaderClassCodes(v2, cls, si, di, out_name, nameSettings);
         }
       }
     }
-
-    ctx.finish();
-    out_name = eastl::move(ctx.finalName);
   }
 
   template <typename U>
-  void visitShaderClassesForComputeShader(const dxil::HashValue &hash, U hanlder)
+  void visitShaderClassesForComputeShader(const dxil::HashValue &hash, U handler)
   {
     auto [group, index] = findComputeShader(0, hash);
     if (group >= max_scripted_shaders_bin_groups)
@@ -2280,6 +2104,8 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
     }
 
     auto v2 = getDump(group)->getDumpV2();
+    if (!v2)
+      return;
 
     for (auto &cls : v2->classes)
     {
@@ -2301,75 +2127,51 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
             continue;
           }
 
-          visitForShaderClassCodes(cls, si, di, false, false, false, false, hanlder);
+          visitForShaderClassCodes(cls, si, di, false, false, false, false, handler);
         }
       }
     }
   }
 
-  void generateNamesForShaderClassCodes(const shaderbindump::ShaderClass &shader_class, uint32_t static_code, uint32_t dynamic_code,
-    GeneratorContext &ctx)
+  void generateNamesForShaderClassCodes(const ScriptedShadersBinDumpV2 *v2, const shaderbindump::ShaderClass &shader_class,
+    uint32_t static_index, uint32_t dynamic_index, auto &out_name,
+    const shader_name_format::VariantNameCompilationSettings &name_settings)
   {
-    auto &sVar = shader_class.code[static_code];
-
-    shader_class.stVariants.enumerateCodesForVariant(static_code, [&shader_class, &ctx, &sVar, dynamic_code](uint32_t s_code) {
-      sVar.dynVariants.enumerateCodesForVariant(dynamic_code,
-        [&shader_class, &ctx, s_code](uint32_t d_code) { ctx.onShaderClassPassUse(shader_class, s_code, d_code); });
+    auto &sVar = shader_class.code[static_index];
+    shader_class.stVariants.enumerateCodesForVariant(static_index, [&](uint32_t s_code) {
+      sVar.dynVariants.enumerateCodesForVariant(dynamic_index, [&](uint32_t d_code) {
+        if (!out_name.empty())
+        {
+          if (name_settings.listAllAliases)
+            out_name.append(" | ");
+          else
+            return;
+        }
+        shader_name_format::compile_human_readable_variant_name_single(out_name,
+          shader_name_format::VariantIdentifierRef{
+            .shClassName = shader_class.name.data(), .stVarCode = int(s_code), .dynVarCode = int(d_code)},
+          *v2, *v2);
+      });
     });
   }
 
   template <typename U>
   void visitForShaderClassCodes(const shaderbindump::ShaderClass &shader_class, uint32_t static_index, uint32_t dynamic_index,
     bool use_static_state_override, bool use_null_pixel_shader, bool use_with_pixel_shader_override, bool is_pixel_shader_override,
-    U hanlder)
+    U handler)
   {
     auto &sVar = shader_class.code[static_index];
 
     shader_class.stVariants.enumerateCodesForVariant(static_index,
-      [&shader_class, &sVar, dynamic_index, &hanlder, use_static_state_override, use_null_pixel_shader, use_with_pixel_shader_override,
+      [&shader_class, &sVar, dynamic_index, &handler, use_static_state_override, use_null_pixel_shader, use_with_pixel_shader_override,
         is_pixel_shader_override](uint32_t s_code) {
         sVar.dynVariants.enumerateCodesForVariant(dynamic_index,
-          [&shader_class, s_code, &hanlder, use_static_state_override, use_null_pixel_shader, use_with_pixel_shader_override,
+          [&shader_class, s_code, &handler, use_static_state_override, use_null_pixel_shader, use_with_pixel_shader_override,
             is_pixel_shader_override](uint32_t d_code) {
-            hanlder(shader_class, s_code, d_code, use_static_state_override, use_null_pixel_shader, use_with_pixel_shader_override,
+            handler(shader_class, s_code, d_code, use_static_state_override, use_null_pixel_shader, use_with_pixel_shader_override,
               is_pixel_shader_override);
           });
       });
-  }
-
-  template <typename T, typename U>
-  uint32_t visitMatchingRenderPasses(uint32_t group, T checker, bool use_static_state_override, bool use_null_pixel_shader,
-    bool use_with_pixel_shader_override, bool is_pixel_shader_override, U hanlder)
-  {
-    uint32_t visitCount = 0;
-    auto v2 = getDump(group)->getDumpV2();
-
-    for (auto &cls : v2->classes)
-    {
-      // shrefStorage stores all the unique combinations of shaders used by this class
-      auto ref = eastl::find_if(eastl::begin(cls.shrefStorage), eastl::end(cls.shrefStorage), checker);
-      if (ref == eastl::end(cls.shrefStorage))
-      {
-        continue;
-      }
-
-      for (uint32_t si = 0; si < cls.code.size(); ++si)
-      {
-        auto &sVar = cls.code[si];
-        for (uint32_t di = 0; di < sVar.passes.size(); ++di)
-        {
-          auto &dVar = sVar.passes[di];
-          if (checker(*dVar.rpass))
-          {
-            visitForShaderClassCodes(cls, si, di, use_static_state_override, use_null_pixel_shader, use_with_pixel_shader_override,
-              is_pixel_shader_override, hanlder);
-            ++visitCount;
-          }
-        }
-      }
-    }
-
-    return visitCount;
   }
 
 
@@ -2378,10 +2180,12 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
     eastl::string &out_name, T clb)
   {
     uint32_t visitCount = 0;
-    GeneratorContext ctx;
-    ctx.setAffixes(post_fix, post_fix_2);
+
     auto v2 = getDump(group)->getDumpV2();
-    ctx.start(v2);
+    if (!v2)
+      return 0;
+
+    const auto &nameSettings = getDump(group)->shaderNameFormatSettings;
 
     for (auto &cls : v2->classes)
     {
@@ -2400,15 +2204,19 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
           auto &dVar = sVar.passes[di];
           if (clb(*dVar.rpass))
           {
-            generateNamesForShaderClassCodes(cls, si, di, ctx);
+            generateNamesForShaderClassCodes(v2, cls, si, di, out_name, nameSettings);
             ++visitCount;
           }
         }
       }
     }
 
-    ctx.finish();
-    out_name.append(ctx.finalName);
+    if (visitCount > 0)
+    {
+      for (auto affix : {post_fix, post_fix_2})
+        out_name.append(begin(affix), end(affix));
+    }
+
     return visitCount;
   }
 
@@ -2602,7 +2410,7 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
         count = generateNamesForMatchingRenderPasses(vGroup, "[Render state override]", {}, out_name,
           [vert = vShader, pix = pShader](auto &pass) { return vert == pass.vprId && pix == pass.fshId; });
       }
-      totalCount = count;
+      totalCount += count;
       lastGroup = vGroup + 1;
     }
 
@@ -2740,7 +2548,7 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
       auto count = generateNamesForMatchingRenderPasses(vGroup, {}, {}, out_name,
         [vert = vShader, pix = pShader](auto &pass) { return vert == pass.vprId && pix == pass.fshId; });
 
-      totalCount = count;
+      totalCount += count;
       lastGroup = vGroup + 1;
     }
 
@@ -2807,293 +2615,34 @@ class PipelineNameGenerator : public ScriptedShadersBinDumpManager
     }
   }
 
-  template <typename C>
-  void visitShaderClassesForGraphicsShadersWithNullPixelShader(const dxil::HashValue &vertex_shader,
-    const RenderStateSystem::StaticState &static_state, C target)
+  // A module taken from a dump carries the group and the index it was taken from, which is what
+  // the pass index is keyed by. Byte code that is in no dump has no such answer.
+  ShaderInGroupIndex vertexShaderIndexInDump(const VertexShaderModuleRefStore &vertex_shader)
   {
-    uint32_t totalCount = 0;
-    uint32_t lastGroup = 0;
-    while (lastGroup < max_scripted_shaders_bin_groups)
+    auto ref = eastl::get_if<VertexShaderModuleBytcodeInDumpRef>(&vertex_shader.bytecode);
+    if (!ref || !ref->bytecode || ref->shaderGroup >= max_scripted_shaders_bin_groups)
     {
-      auto [vGroup, vShader] = findVertexShader(lastGroup, vertex_shader);
-      if (vGroup >= max_scripted_shaders_bin_groups)
-      {
-        break;
-      }
-
-      auto [rGroup, rState, rDist] = walkRenderStates(vGroup, 0, 0, static_state);
-      if (rGroup != vGroup)
-      {
-        lastGroup = rGroup;
-        continue;
-      }
-
-      auto count = visitMatchingRenderPasses(
-        vGroup,
-        [shader = vShader, state = rState](auto &pass) {
-          return shader == pass.vprId && 0xFFFF == pass.fshId && state == pass.renderStateNo;
-        },
-        false, false, false, false, target);
-      while (0 == count)
-      {
-        auto [crGroup, crState, crDist] = walkRenderStates(vGroup, rState + 1, rDist, static_state);
-        if (crGroup != vGroup)
-        {
-          break;
-        }
-        rState = crState;
-        rDist = crDist;
-        count = visitMatchingRenderPasses(
-          vGroup,
-          [shader = vShader, state = crState](auto &pass) {
-            return shader == pass.vprId && 0xFFFF == pass.fshId && state == pass.renderStateNo;
-          },
-          true, false, false, false, target);
-      }
-
-      if (0 == count)
-      {
-        count = visitMatchingRenderPasses(
-          vGroup, [shader = vShader](auto &pass) { return shader == pass.vprId && 0xFFFF == pass.fshId; }, true, false, false, false,
-          target);
-      }
-      totalCount += count;
-      lastGroup = vGroup + 1;
+      return {max_scripted_shaders_bin_groups, 0};
     }
-
-    if (0 != totalCount)
-    {
-      // found at least one instance, we are done here
-      return;
-    }
-
-    // we where unable to find anything, so this uses some shader class combined with the null pixel shader as an "override"
-    lastGroup = 0;
-    while (lastGroup < max_scripted_shaders_bin_groups)
-    {
-      auto [vGroup, vShader] = findVertexShader(lastGroup, vertex_shader);
-      if (vGroup >= max_scripted_shaders_bin_groups)
-      {
-        break;
-      }
-
-      auto [rGroup, rState, rDist] = walkRenderStates(vGroup, 0, 0, static_state);
-      if (rGroup != vGroup)
-      {
-        lastGroup = rGroup;
-        continue;
-      }
-
-      auto count = visitMatchingRenderPasses(
-        vGroup, [shader = vShader, state = rState](auto &pass) { return shader == pass.vprId && state == pass.renderStateNo; }, false,
-        true, false, false, target);
-      while (0 == count)
-      {
-        auto [crGroup, crState, crDist] = walkRenderStates(vGroup, rState + 1, rDist, static_state);
-        if (crGroup != vGroup)
-        {
-          break;
-        }
-        rState = crState;
-        rDist = crDist;
-        count = visitMatchingRenderPasses(
-          vGroup, [shader = vShader, state = crState](auto &pass) { return shader == pass.vprId && state == pass.renderStateNo; },
-          true, true, false, false, target);
-      }
-
-      if (0 == count)
-      {
-        count = visitMatchingRenderPasses(
-          vGroup, [shader = vShader](auto &pass) { return shader == pass.vprId; }, true, true, false, false, target);
-      }
-      totalCount += count;
-      lastGroup = vGroup + 1;
-    }
+    return {ref->shaderGroup, canonicalVertexShaderIndex(ref->shaderGroup, ref->bytecode->compressionIndex)};
   }
 
-  template <typename C>
-  void visitShaderClassesForGraphicsShaders(const dxil::HashValue &vertex_shader, const dxil::HashValue &pixel_shader,
-    const RenderStateSystem::StaticState &static_state, C target)
+  ShaderInGroupIndex pixelShaderIndexInDump(const PixelShaderModuleRefStore &pixel_shader)
   {
-    uint32_t totalCount = 0;
-    uint32_t lastGroup = 0;
-    while (lastGroup < max_scripted_shaders_bin_groups)
+    auto ref = eastl::get_if<PixelShaderModuleBytcodeInDumpRef>(&pixel_shader.bytecode);
+    if (!ref || !ref->bytecode || ref->shaderGroup >= max_scripted_shaders_bin_groups)
     {
-      auto [vGroup, vShader] = findVertexShader(lastGroup, vertex_shader);
-      if (vGroup >= max_scripted_shaders_bin_groups)
-      {
-        break;
-      }
-
-      auto [pGroup, pShader] = findPixelShader(vGroup, pixel_shader);
-      if (pGroup != vGroup)
-      {
-        lastGroup = pGroup;
-        continue;
-      }
-
-      auto [rGroup, rState, rDist] = walkRenderStates(vGroup, 0, 0, static_state);
-      if (rGroup != vGroup)
-      {
-        lastGroup = rGroup;
-        continue;
-      }
-
-      auto count = visitMatchingRenderPasses(
-        vGroup,
-        [vert = vShader, pix = pShader, state = rState](auto &pass) {
-          return vert == pass.vprId && pix == pass.fshId && state == pass.renderStateNo;
-        },
-        false, false, false, false, target);
-      while (0 == count)
-      {
-        auto [crGroup, crState, crDist] = walkRenderStates(vGroup, rState + 1, rDist, static_state);
-        if (crGroup != vGroup)
-        {
-          break;
-        }
-        rState = crState;
-        rDist = crDist;
-        count = visitMatchingRenderPasses(
-          vGroup, /*"[Render state override]", {}, out_name,*/
-          [vert = vShader, pix = pShader, state = crState](auto &pass) {
-            return vert == pass.vprId && pix == pass.fshId && state == pass.renderStateNo;
-          },
-          true, false, false, false, target);
-      }
-
-      if (0 == count)
-      {
-        count = visitMatchingRenderPasses(
-          vGroup, /*"[Render state override]", {}, out_name,*/
-          [vert = vShader, pix = pShader](auto &pass) { return vert == pass.vprId && pix == pass.fshId; }, true, false, false, false,
-          target);
-      }
-      totalCount = count;
-      lastGroup = vGroup + 1;
+      return {max_scripted_shaders_bin_groups, 0};
     }
-
-    if (0 != totalCount)
+    auto dump = getDump(ref->shaderGroup);
+    auto v2 = dump ? dump->getDumpV2() : nullptr;
+    // the stored index addresses the whole shader table, a pass counts pixel shaders on their own
+    if (!v2 || ref->bytecode->compressionIndex < uint32_t(v2->vprCount))
     {
-      return;
+      return {max_scripted_shaders_bin_groups, 0};
     }
-
-    // we where unable to find anything, so this uses some shader class combined with the null pixel shader as an "override"
-    lastGroup = 0;
-    while (lastGroup < max_scripted_shaders_bin_groups)
-    {
-      auto [vGroup, vShader] = findVertexShader(lastGroup, vertex_shader);
-      if (vGroup >= max_scripted_shaders_bin_groups)
-      {
-        break;
-      }
-
-      auto [rGroup, rState, rDist] = walkRenderStates(vGroup, 0, 0, static_state);
-      if (rGroup != vGroup)
-      {
-        lastGroup = rGroup;
-        continue;
-      }
-
-      auto count = visitMatchingRenderPasses(
-        vGroup, /*{}, "[with pixel shader override]", out_name,*/
-        [shader = vShader, state = rState](auto &pass) { return shader == pass.vprId && state == pass.renderStateNo; }, false, false,
-        true, false, target);
-      while (0 == count)
-      {
-        auto [crGroup, crState, crDist] = walkRenderStates(vGroup, rState + 1, rDist, static_state);
-        if (crGroup != vGroup)
-        {
-          break;
-        }
-        rState = crState;
-        rDist = crDist;
-        count = visitMatchingRenderPasses(
-          vGroup, /*"[Render state override]", "[with pixel shader override]", out_name,*/
-          [shader = vShader, state = crState](auto &pass) { return shader == pass.vprId && state == pass.renderStateNo; }, true, false,
-          true, false, target);
-      }
-
-      if (0 == count)
-      {
-        count = visitMatchingRenderPasses(
-          vGroup, /*"[Render state override]", "[with pixel shader override]", out_name,*/
-          [shader = vShader](auto &pass) { return shader == pass.vprId; }, true, false, true, false, target);
-      }
-      totalCount += count;
-      lastGroup = vGroup + 1;
-    }
-
-    if (0 == totalCount)
-    {
-      // if we end up here, something in the shader dump is broken, as a vertex shader is in the dump, but is not used by
-      // and shader class / pass.
-      return;
-    }
-
-    totalCount = 0;
-
-    // now try to find paired pixel shader
-    lastGroup = 0;
-    while (lastGroup < max_scripted_shaders_bin_groups)
-    {
-      auto [pGroup, pShader] = findPixelShader(lastGroup, pixel_shader);
-      if (pGroup >= max_scripted_shaders_bin_groups)
-      {
-        break;
-      }
-
-      auto [rGroup, rState, rDist] = walkRenderStates(pGroup, 0, 0, static_state);
-      if (rGroup != pGroup)
-      {
-        lastGroup = rGroup;
-        continue;
-      }
-
-      auto count = visitMatchingRenderPasses(
-        pGroup, /*{}, {}, out_name,*/
-        [shader = pShader, state = rState](auto &pass) { return shader == pass.fshId && state == pass.renderStateNo; }, false, false,
-        true, true, target);
-      while (0 == count)
-      {
-        auto [crGroup, crState, crDist] = walkRenderStates(pGroup, rState + 1, rDist, static_state);
-        if (crGroup != pGroup)
-        {
-          break;
-        }
-        rState = crState;
-        rDist = crDist;
-        count = visitMatchingRenderPasses(
-          pGroup, /*"[Render state override]", {}, out_name,*/
-          [shader = pShader, state = crState](auto &pass) { return shader == pass.fshId && state == pass.renderStateNo; }, true, false,
-          true, true, target);
-      }
-
-      if (0 == count)
-      {
-        count = visitMatchingRenderPasses(
-          pGroup, /*"[Render state override]", {}, out_name,*/
-          [shader = pShader](auto &pass) { return shader == pass.fshId; }, true, false, true, true, target);
-      }
-      totalCount += count;
-      lastGroup = pGroup + 1;
-    }
-
-    if (0 == totalCount)
-    {
-      /*
-       out_name += "[pixel shader not in dump]";
-       char buf[sizeof(dxil::HashValue) * 2 + 1];
-       pixel_shader.convertToString(buf, sizeof(buf));
-       out_name += "{";
-       out_name += buf;
-       out_name += "}";
-       vertex_shader.convertToString(buf, sizeof(buf));
-       out_name += "{";
-       out_name += buf;
-       out_name += "}";
-      */
-    }
+    const uint32_t fshId = ref->bytecode->compressionIndex - uint32_t(v2->vprCount);
+    return {ref->shaderGroup, canonicalPixelShaderIndex(ref->shaderGroup, fshId)};
   }
 
   bool isNullPixelShader(const PixelShaderModuleRefStore &pixel_shader) const
@@ -3130,16 +2679,176 @@ public:
   }
 
   template <typename C>
-  void visitShaderClassPassesForGraphicsPipeline(const VertexShaderModuleRefStore &vertex_shader,
-    const PixelShaderModuleRefStore &pixel_shader, const RenderStateSystem::StaticState &static_state, C target)
+  uint32_t visitIndexedPassRefs(uint32_t group, const GraphicsPassIndex &index, const GraphicsPassIndex::PassRefs *refs,
+    const RenderStateSystem::StaticState &static_state, bool use_null_pixel_shader, bool use_with_pixel_shader_override,
+    bool is_pixel_shader_override, C target)
   {
-    if (isNullPixelShader(pixel_shader))
+    if (!refs)
     {
-      visitShaderClassesForGraphicsShadersWithNullPixelShader(vertex_shader.header.hash, static_state, target);
+      return 0;
     }
-    else
+
+    uint32_t bestState = ~0u;
+    uint32_t bestDistance = ~0u;
+    for (const auto &ref : *refs)
     {
-      visitShaderClassesForGraphicsShaders(vertex_shader.header.hash, pixel_shader.header.hash, static_state, target);
+      if (ref.renderState >= index.staticStates.size())
+      {
+        continue;
+      }
+      const uint32_t distance = index.staticStates[ref.renderState].distance(static_state);
+      if (distance < bestDistance || (distance == bestDistance && ref.renderState < bestState))
+      {
+        bestDistance = distance;
+        bestState = ref.renderState;
+      }
+    }
+
+    auto v2 = getDump(group)->getDumpV2();
+    uint32_t count = 0;
+    if (~0u == bestState)
+    {
+      for (const auto &ref : *refs)
+      {
+        visitForShaderClassCodes(v2->classes[ref.classIndex], ref.staticIndex, ref.dynamicIndex, true, use_null_pixel_shader,
+          use_with_pixel_shader_override, is_pixel_shader_override, target);
+        ++count;
+      }
+      return count;
+    }
+
+    bool stateOverride = true;
+    if (0 == bestDistance)
+    {
+      stateOverride = false;
+      for (uint32_t stateIndex = 0; stateIndex < bestState && !stateOverride; ++stateIndex)
+      {
+        stateOverride = 0 == index.staticStates[stateIndex].distance(static_state);
+      }
+    }
+
+    for (const auto &ref : *refs)
+    {
+      if (ref.renderState != bestState)
+      {
+        continue;
+      }
+      visitForShaderClassCodes(v2->classes[ref.classIndex], ref.staticIndex, ref.dynamicIndex, stateOverride, use_null_pixel_shader,
+        use_with_pixel_shader_override, is_pixel_shader_override, target);
+      ++count;
+    }
+    return count;
+  }
+
+  template <typename C>
+  void visitShaderClassPassesForGraphicsPipelineIndexed(GraphicsPassIndexCache &indices,
+    const VertexShaderModuleRefStore &vertex_shader, const PixelShaderModuleRefStore &pixel_shader,
+    const RenderStateSystem::StaticState &static_state, C target)
+  {
+    const bool nullPixelShader = isNullPixelShader(pixel_shader);
+
+    // phase 1: exact vertex and pixel shader pair (the null pixel shader is id 0xFFFF)
+    uint32_t totalCount = 0;
+    uint32_t lastGroup = 0;
+
+    const ShaderInGroupIndex vsInDump = vertexShaderIndexInDump(vertex_shader);
+    bool exactPairKnown = vsInDump.group < max_scripted_shaders_bin_groups;
+    uint32_t exactPixelShader = 0xFFFF;
+    if (exactPairKnown && !nullPixelShader)
+    {
+      const ShaderInGroupIndex psInDump = pixelShaderIndexInDump(pixel_shader);
+      // a pass pairs shaders within one dump, so a pair split over two of them is not one
+      exactPairKnown = psInDump.group == vsInDump.group;
+      exactPixelShader = psInDump.shader;
+    }
+
+    if (exactPairKnown)
+    {
+      auto &index = getGraphicsPassIndex(indices, vsInDump.group);
+      if (index.valid)
+      {
+        totalCount = visitIndexedPassRefs(vsInDump.group, index, index.passesOfVsPs(vsInDump.shader, exactPixelShader), static_state,
+          false, false, false, target);
+      }
+    }
+    while (!exactPairKnown && lastGroup < max_scripted_shaders_bin_groups)
+    {
+      auto [vGroup, vShader] = findVertexShader(lastGroup, vertex_shader.header.hash);
+      if (vGroup >= max_scripted_shaders_bin_groups)
+      {
+        break;
+      }
+      lastGroup = vGroup + 1;
+
+      uint32_t pShader = 0xFFFF;
+      if (!nullPixelShader)
+      {
+        auto [pGroup, pIndex] = findPixelShader(vGroup, pixel_shader.header.hash);
+        if (pGroup != vGroup)
+        {
+          lastGroup = pGroup;
+          continue;
+        }
+        pShader = pIndex;
+      }
+      auto &index = getGraphicsPassIndex(indices, vGroup);
+      if (!index.valid)
+      {
+        continue;
+      }
+
+      const uint32_t count =
+        visitIndexedPassRefs(vGroup, index, index.passesOfVsPs(vShader, pShader), static_state, false, false, false, target);
+      totalCount += count;
+    }
+
+    if (0 != totalCount)
+    {
+      return;
+    }
+
+    // phase 2: the pipeline uses some shader class with a pixel shader (or null pixel shader)
+    // override, match by vertex shader only
+    lastGroup = 0;
+    while (lastGroup < max_scripted_shaders_bin_groups)
+    {
+      auto [vGroup, vShader] = findVertexShader(lastGroup, vertex_shader.header.hash);
+      if (vGroup >= max_scripted_shaders_bin_groups)
+      {
+        break;
+      }
+      lastGroup = vGroup + 1;
+      auto &index = getGraphicsPassIndex(indices, vGroup);
+      if (!index.valid)
+      {
+        continue;
+      }
+      totalCount +=
+        visitIndexedPassRefs(vGroup, index, index.passesOfVs(vShader), static_state, nullPixelShader, !nullPixelShader, false, target);
+    }
+
+    if (nullPixelShader || 0 == totalCount)
+    {
+      return;
+    }
+
+    // phase 3: record the classes that use this pixel shader with other vertex shaders
+    // as pixel shader override usages
+    lastGroup = 0;
+    while (lastGroup < max_scripted_shaders_bin_groups)
+    {
+      auto [pGroup, pShader] = findPixelShader(lastGroup, pixel_shader.header.hash);
+      if (pGroup >= max_scripted_shaders_bin_groups)
+      {
+        break;
+      }
+      lastGroup = pGroup + 1;
+      auto &index = getGraphicsPassIndex(indices, pGroup);
+      if (!index.valid)
+      {
+        continue;
+      }
+      visitIndexedPassRefs(pGroup, index, index.passesOfPs(pShader), static_state, false, true, true, target);
     }
   }
 
@@ -3154,6 +2863,13 @@ public:
     else
     {
       iterateShaderClassesForGraphicsShaders(vertex_shader.header.hash, pixel_shader.header.hash, static_state, outName);
+    }
+
+    if (outName.empty())
+    {
+      outName = generateGraphicsPipelineNameFromModules(vertex_shader, pixel_shader);
+      if (!outName.empty())
+        outName += static_state.toString();
     }
 
     if (outName.empty())
@@ -3191,6 +2907,9 @@ public:
     }
 
     if (outName.empty())
+      outName = generateGraphicsPipelineNameFromModules(vertex_shader, pixel_shader);
+
+    if (outName.empty())
     {
       outName = "NotInDump={";
       char buf[sizeof(dxil::HashValue) * 2 + 1];
@@ -3206,6 +2925,19 @@ public:
       outName += "}";
     }
 
+    return outName;
+  }
+
+  eastl::string generateGraphicsPipelineNameFromModules(const VertexShaderModuleRefStore &vertex_shader,
+    const PixelShaderModuleRefStore &pixel_shader)
+  {
+    eastl::string outName;
+    if (!vertex_shader.header.debugName.empty() && !pixel_shader.header.debugName.empty())
+      outName = vertex_shader.header.debugName + " & " + pixel_shader.header.debugName;
+    else if (!vertex_shader.header.debugName.empty())
+      outName = vertex_shader.header.debugName + " &";
+    else if (!pixel_shader.header.debugName.empty())
+      outName = "& " + pixel_shader.header.debugName;
     return outName;
   }
 };
@@ -3245,121 +2977,125 @@ class ShaderModuleManager : public PipelineNameGenerator
     dag::Vector<eastl::unique_ptr<GroupPixelShaderModule>> pixel;
   } shaderGroup[max_scripted_shaders_bin_groups - 1];
 
-  eastl::span<uint8_t> getBytecode(const PixelShaderModuleBytecodeRef &ref)
+  GetShaderByteCodeResult getBytecode(const PixelShaderModuleBytecodeRef &ref, const uint8_t *bytecode)
   {
-    return {ref.bytecode->bytecode.get(), ref.bytecode->bytecode.get() + ref.bytecode->bytecodeSize};
+    bytecode += ref.bytecode->bytecodeOffset;
+    return {.byteCode = {bytecode, ref.bytecode->bytecodeSize}, .cacheHit = true};
   }
 
-  eastl::span<uint8_t> getBytecode(const PixelShaderModuleBytcodeInDumpRef &ref)
+  GetShaderByteCodeResult getBytecode(const PixelShaderModuleBytcodeInDumpRef &ref, const uint8_t *)
   {
-    auto binary = getShaderByteCode(ref.shaderGroup, ref.bytecode->compressionGroup, ref.bytecode->compressionIndex);
-    return binary.subspan(ref.bytecode->shaderOffset, ref.bytecode->shaderSize);
+    auto [meta, byteCode, cacheHit] = getShaderByteCode(ref.shaderGroup, ref.bytecode->compressionIndex);
+    return {.byteCode = byteCode.subspan(ref.bytecode->shaderOffset, ref.bytecode->shaderSize), .cacheHit = cacheHit};
   }
 
-  eastl::span<uint8_t> getVsBytecode(const VertexShaderModuleHeader &, const VertexShaderModuleBytecodeRef &ref)
+  GetShaderByteCodeResult getVsBytecode(const VertexShaderModuleHeader &, const VertexShaderModuleBytecodeRef &ref,
+    const uint8_t *bytecode)
   {
-    return {ref.bytecode->bytecode.get(), ref.bytecode->bytecode.get() + ref.bytecode->bytecodeSize};
+    bytecode += ref.bytecode->bytecodeOffset;
+    return {.byteCode = {bytecode, ref.bytecode->bytecodeSize}, .cacheHit = true};
   }
-  eastl::span<uint8_t> getVsBytecode(const VertexShaderModuleHeader &, const VertexShaderModuleBytcodeInDumpRef &ref)
+  GetShaderByteCodeResult getVsBytecode(const VertexShaderModuleHeader &, const VertexShaderModuleBytcodeInDumpRef &ref,
+    const uint8_t *)
   {
-    auto binary = getShaderByteCode(ref.shaderGroup, ref.bytecode->compressionGroup, ref.bytecode->compressionIndex);
-    return binary.subspan(ref.bytecode->shaderOffset, ref.bytecode->shaderSize);
+    auto [meta, byteCode, cacheHit] = getShaderByteCode(ref.shaderGroup, ref.bytecode->compressionIndex);
+    return {.byteCode = byteCode.subspan(ref.bytecode->shaderOffset, ref.bytecode->shaderSize), .cacheHit = cacheHit};
   }
-  eastl::span<uint8_t> getMsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytecodeRef &ref)
+  auto getMsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytecodeRef &ref, const uint8_t *bytecode)
   {
-    return getVsBytecode(header, ref);
+    return getVsBytecode(header, ref, bytecode);
   }
-  eastl::span<uint8_t> getMsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytcodeInDumpRef &ref)
+  auto getMsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytcodeInDumpRef &ref, const uint8_t *bytecode)
   {
-    return getVsBytecode(header, ref);
+    return getVsBytecode(header, ref, bytecode);
   }
-  eastl::span<uint8_t> getGsBytecode(const VertexShaderModuleHeader &, const VertexShaderModuleBytecodeRef &ref)
+  auto getGsBytecode(const VertexShaderModuleHeader &, const VertexShaderModuleBytecodeRef &ref, const uint8_t *bytecode)
+  {
+    return getSubShaderBytecode(0, ref, bytecode);
+  }
+  auto getGsBytecode(const VertexShaderModuleHeader &, const VertexShaderModuleBytcodeInDumpRef &ref, const uint8_t *)
   {
     return getSubShaderBytecode(0, ref);
   }
-  eastl::span<uint8_t> getGsBytecode(const VertexShaderModuleHeader &, const VertexShaderModuleBytcodeInDumpRef &ref)
+  auto getAsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytecodeRef &ref, const uint8_t *bytecode)
   {
-    return getSubShaderBytecode(0, ref);
+    return getGsBytecode(header, ref, bytecode);
   }
-  eastl::span<uint8_t> getAsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytecodeRef &ref)
+  auto getAsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytcodeInDumpRef &ref, const uint8_t *bytecode)
   {
-    return getGsBytecode(header, ref);
+    return getGsBytecode(header, ref, bytecode);
   }
-  eastl::span<uint8_t> getAsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytcodeInDumpRef &ref)
+  auto getHsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytecodeRef &ref, const uint8_t *bytecode)
   {
-    return getGsBytecode(header, ref);
+    return getSubShaderBytecode(header.hasGsOrAs ? 1 : 0, ref, bytecode);
   }
-  eastl::span<uint8_t> getHsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytecodeRef &ref)
+  auto getHsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytcodeInDumpRef &ref, const uint8_t *)
   {
     return getSubShaderBytecode(header.hasGsOrAs ? 1 : 0, ref);
   }
-  eastl::span<uint8_t> getHsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytcodeInDumpRef &ref)
+  auto getDsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytecodeRef &ref, const uint8_t *bytecode)
   {
-    return getSubShaderBytecode(header.hasGsOrAs ? 1 : 0, ref);
+    return getSubShaderBytecode(header.hasGsOrAs ? 2 : 1, ref, bytecode);
   }
-  eastl::span<uint8_t> getDsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytecodeRef &ref)
+  auto getDsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytcodeInDumpRef &ref, const uint8_t *)
   {
     return getSubShaderBytecode(header.hasGsOrAs ? 2 : 1, ref);
   }
-  eastl::span<uint8_t> getDsBytecode(const VertexShaderModuleHeader &header, const VertexShaderModuleBytcodeInDumpRef &ref)
-  {
-    return getSubShaderBytecode(header.hasGsOrAs ? 2 : 1, ref);
-  }
-  eastl::span<uint8_t> getSubShaderBytecode(uint32_t sub_shader_index, const VertexShaderModuleBytecodeRef &ref)
+  GetShaderByteCodeResult getSubShaderBytecode(uint32_t sub_shader_index, const VertexShaderModuleBytecodeRef &ref,
+    const uint8_t *bytecode)
   {
     auto &subShader = ref.bytecode->subShaders[sub_shader_index];
-    return {subShader.bytecode.get(), subShader.bytecode.get() + subShader.bytecodeSize};
+    bytecode += subShader.bytecodeOffset;
+    return {.byteCode = {bytecode, subShader.bytecodeSize}, .cacheHit = true};
   }
-  eastl::span<uint8_t> getSubShaderBytecode(uint32_t sub_shader_index, const VertexShaderModuleBytcodeInDumpRef &ref)
+  GetShaderByteCodeResult getSubShaderBytecode(uint32_t sub_shader_index, const VertexShaderModuleBytcodeInDumpRef &ref)
   {
     auto &subShader = ref.bytecode->subShaders[sub_shader_index];
-    auto binary = getShaderByteCode(ref.shaderGroup, ref.bytecode->compressionGroup, ref.bytecode->compressionIndex);
-    return binary.subspan(subShader.shaderOffset, subShader.shaderSize);
+    auto [meta, byteCode, cacheHit] = getShaderByteCode(ref.shaderGroup, ref.bytecode->compressionIndex);
+    return {.byteCode = byteCode.subspan(subShader.shaderOffset, subShader.shaderSize), .cacheHit = cacheHit};
   }
 
 public:
   void addVertexShader(ShaderID id, VertexShaderModule *module);
   void addPixelShader(ShaderID id, PixelShaderModule *module);
   const dxil::HashValue &getVertexShaderHash(ShaderID id) const;
-  void setVertexShaderName(ShaderID id, eastl::span<const char> name);
   const dxil::HashValue &getPixelShaderHash(ShaderID id) const;
-  void setPixelShaderName(ShaderID id, eastl::span<const char> name);
   VertexShaderModuleRefStore getVertexShader(ShaderID id);
   PixelShaderModuleRefStore getPixelShader(ShaderID id);
 
-  eastl::span<uint8_t> getBytecode(const PixelShaderModuleRefStore &ref)
+  auto getBytecode(const PixelShaderModuleRefStore &ref, const uint8_t *bytecode)
   {
-    return eastl::visit([this](auto &r) -> eastl::span<uint8_t> { return this->getBytecode(r); }, ref.bytecode);
+    return eastl::visit([this, bytecode](auto &r) { return this->getBytecode(r, bytecode); }, ref.bytecode);
   }
 
-  eastl::span<uint8_t> getVsBytecode(const VertexShaderModuleRefStore &ref)
+  auto getVsBytecode(const VertexShaderModuleRefStore &ref, const uint8_t *bytecode)
   {
-    return eastl::visit([this, &ref](auto &r) -> eastl::span<uint8_t> { return this->getVsBytecode(ref.header, r); }, ref.bytecode);
+    return eastl::visit([this, &ref, bytecode](auto &r) { return this->getVsBytecode(ref.header, r, bytecode); }, ref.bytecode);
   }
 
-  eastl::span<uint8_t> getMsBytecode(const VertexShaderModuleRefStore &ref)
+  auto getMsBytecode(const VertexShaderModuleRefStore &ref, const uint8_t *bytecode)
   {
-    return eastl::visit([this, &ref](auto &r) -> eastl::span<uint8_t> { return this->getMsBytecode(ref.header, r); }, ref.bytecode);
+    return eastl::visit([this, &ref, bytecode](auto &r) { return this->getMsBytecode(ref.header, r, bytecode); }, ref.bytecode);
   }
 
-  eastl::span<uint8_t> getGsBytecode(const VertexShaderModuleRefStore &ref)
+  auto getGsBytecode(const VertexShaderModuleRefStore &ref, const uint8_t *bytecode)
   {
-    return eastl::visit([this, &ref](auto &r) -> eastl::span<uint8_t> { return this->getGsBytecode(ref.header, r); }, ref.bytecode);
+    return eastl::visit([this, &ref, bytecode](auto &r) { return this->getGsBytecode(ref.header, r, bytecode); }, ref.bytecode);
   }
 
-  eastl::span<uint8_t> getAsBytecode(const VertexShaderModuleRefStore &ref)
+  auto getAsBytecode(const VertexShaderModuleRefStore &ref, const uint8_t *bytecode)
   {
-    return eastl::visit([this, &ref](auto &r) -> eastl::span<uint8_t> { return this->getAsBytecode(ref.header, r); }, ref.bytecode);
+    return eastl::visit([this, &ref, bytecode](auto &r) { return this->getAsBytecode(ref.header, r, bytecode); }, ref.bytecode);
   }
 
-  eastl::span<uint8_t> getHsBytecode(const VertexShaderModuleRefStore &ref)
+  auto getHsBytecode(const VertexShaderModuleRefStore &ref, const uint8_t *bytecode)
   {
-    return eastl::visit([this, &ref](auto &r) -> eastl::span<uint8_t> { return this->getHsBytecode(ref.header, r); }, ref.bytecode);
+    return eastl::visit([this, &ref, bytecode](auto &r) { return this->getHsBytecode(ref.header, r, bytecode); }, ref.bytecode);
   }
 
-  eastl::span<uint8_t> getDsBytecode(const VertexShaderModuleRefStore &ref)
+  auto getDsBytecode(const VertexShaderModuleRefStore &ref, const uint8_t *bytecode)
   {
-    return eastl::visit([this, &ref](auto &r) -> eastl::span<uint8_t> { return this->getDsBytecode(ref.header, r); }, ref.bytecode);
+    return eastl::visit([this, &ref, bytecode](auto &r) { return this->getDsBytecode(ref.header, r, bytecode); }, ref.bytecode);
   }
 
   using AnyShaderModuleUniquePointer =
@@ -3370,10 +3106,8 @@ public:
   AnyShaderModuleUniquePointer releasePixelShader(ShaderID id);
   void resetDumpOfGroup(uint32_t group_index);
   void reserveVertexShaderRange(uint32_t group_index, uint32_t count);
-  void setVertexShaderCompressionGroup(uint32_t group_index, uint32_t index, const dxil::HashValue &hash, uint32_t compression_group,
-    uint32_t compression_index);
-  void setPixelShaderCompressionGroup(uint32_t group_index, uint32_t index, const dxil::HashValue &hash, uint32_t compression_group,
-    uint32_t compression_index);
+  void setVertexShaderCompressionGroup(uint32_t group_index, uint32_t index, const dxil::HashValue &hash, uint32_t compression_index);
+  void setPixelShaderCompressionGroup(uint32_t group_index, uint32_t index, const dxil::HashValue &hash, uint32_t compression_index);
   ShaderID findVertexShader(const dxil::HashValue &hash) const
   {
     for (uint32_t si = 0; si < shaderGroupZero.vertex.size(); ++si)

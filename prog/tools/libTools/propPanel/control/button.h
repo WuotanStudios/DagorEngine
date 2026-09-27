@@ -2,6 +2,7 @@
 #pragma once
 
 #include <propPanel/control/propertyControlBase.h>
+#include <propPanel/imguiHelper.h>
 #include "../messageQueueInternal.h"
 #include "../scopedImguiBeginDisabled.h"
 #include "../c_constants.h"
@@ -22,9 +23,16 @@ public:
 
   void setTextValue(const char value[]) override { controlCaption = value; }
 
+  int getTextValue(char *buffer, int buflen) const override
+  {
+    return ImguiHelper::getTextValueForString(controlCaption, buffer, buflen);
+  }
+
   void setCaptionValue(const char value[]) override { controlCaption = value; }
 
   void setEnabled(bool enabled) override { controlEnabled = enabled; }
+
+  const char *getImguiTypeName() const override { return "Button"; }
 
   void updateImgui() override
   {
@@ -43,6 +51,7 @@ public:
     }
 
     const bool clicked = ImGui::Button(controlCaption, ImVec2(width, 0.0f));
+    setImguiTestItemInfo();
 
     if (leftAlignText)
       ImGui::GetStyle().ButtonTextAlign.x = oldAlignX;

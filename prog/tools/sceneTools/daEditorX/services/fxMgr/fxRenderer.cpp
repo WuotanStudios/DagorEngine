@@ -25,9 +25,6 @@ void FxRenderer::initResolution(int width, int height)
 
   colorRt.close();
   colorRt = dag::create_tex(NULL, width, height, TEXCF_RTARGET | TEXFMT_DEFAULT, 1, "fx_debug_color_rt");
-  d3d::SamplerInfo smpInfo;
-  smpInfo.address_mode_u = smpInfo.address_mode_v = smpInfo.address_mode_w = d3d::AddressMode::Clamp;
-  ShaderGlobal::set_sampler(get_shader_variable_id("fx_debug_color_rt_samplerstate"), d3d::request_sampler(smpInfo));
 }
 
 void FxRenderer::render(IGenViewportWnd &wnd, eastl::function<void()> render_fx_cb)
@@ -43,8 +40,7 @@ void FxRenderer::render(IGenViewportWnd &wnd, eastl::function<void()> render_fx_
 
   {
     SCOPE_RENDER_TARGET;
-    d3d::set_render_target();
-    d3d::set_render_target(colorRt.getTex2D(), 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{colorRt.getTex2D(), 0, 0}});
 
     d3d::clearview(CLEAR_TARGET, E3DCOLOR_MAKE(0, 0, 0, 255), 0, 0);
 

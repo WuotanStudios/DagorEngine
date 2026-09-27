@@ -62,6 +62,18 @@ int does_line_intersect_box_side(const BBox3 &box, const Point3 &line_start, con
   return v_segment_box_intersection_side(v_ldu(&line_start.x), v_ldu(&line_end.x), v_ldu_bbox3(box), at, atMax);
 }
 
+bool does_line_intersect_box(const BBox3 &box, const Point3 &line_start, const Point3 &line_end, real &at)
+{
+  vec4f vStart = v_ldu(&line_start.x);
+  vec4f vEnd = v_ldu(&line_end.x);
+  vec4f dir = v_sub(vEnd, vStart);
+  vec4f t = V_C_ONE;
+  bool hit = v_ray_box_intersection(vStart, dir, t, v_ldu_bbox3(box));
+  if (hit)
+    at = v_extract_x(t);
+  return hit;
+}
+
 bool clip_homogeneous(Point4 &p0, Point4 &p1)
 {
   if (p0.w < 0.0f && p1.w < 0.0f)
@@ -111,23 +123,4 @@ bool clip_homogeneous(Point4 &p0, Point4 &p1)
     p0 = p0 + t0 * delta;
 
   return true;
-}
-
-bool test_point_convex_intersection(const Point2 &p, const Point2 *pts, int32_t count)
-{
-  if (count < 3)
-    return false;
-  bool allNonPositive = true;
-  bool allNonNegative = true;
-  for (int i = 0; i < count; ++i)
-  {
-    const Point2 &a = pts[i];
-    const Point2 &b = pts[(i + 1) % count];
-    float cr = cross(b - a, p - a);
-    if (cr > 0)
-      allNonPositive = false;
-    if (cr < 0)
-      allNonNegative = false;
-  }
-  return allNonPositive || allNonNegative;
 }

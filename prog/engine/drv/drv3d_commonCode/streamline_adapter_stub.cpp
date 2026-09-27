@@ -13,7 +13,14 @@ void StreamlineAdapter::setAdapterAndDevice(IDXGIAdapter1 *adapter, ID3D11Device
 void StreamlineAdapter::setAdapterAndDevice(IDXGIAdapter1 *adapter, ID3D12Device5 *device) {}
 void StreamlineAdapter::setVulkan() {}
 void *StreamlineAdapter::hook(IUnknown *object) { return object; }
-void *StreamlineAdapter::unhook(IUnknown *object) { return object; }
+void *StreamlineAdapter::unhook(IUnknown *object)
+{
+#if _TARGET_PC_WIN
+  if (object)
+    object->AddRef();
+#endif
+  return object;
+}
 
 void *StreamlineAdapter::getInterposerSymbol(const InterposerHandleType &, const char *) { return nullptr; }
 StreamlineAdapter::InterposerHandleType StreamlineAdapter::loadInterposer() { return {nullptr, nullptr}; }
@@ -23,6 +30,7 @@ void StreamlineAdapter::recover() {}
 nv::SupportState StreamlineAdapter::isDlssSupported() const { return nv::SupportState::NotSupported; }
 nv::SupportState StreamlineAdapter::isDlssGSupported() const { return nv::SupportState::NotSupported; }
 nv::SupportState StreamlineAdapter::isDlssRRSupported() const { return nv::SupportState::NotSupported; }
+nv::SupportState StreamlineAdapter::isDlssNRSupported() const { return nv::SupportState::NotSupported; }
 nv::SupportState StreamlineAdapter::isReflexSupported() const { return nv::SupportState::NotSupported; }
 
 dag::Expected<eastl::string, nv::SupportState> StreamlineAdapter::getDlssVersion() const
@@ -32,11 +40,22 @@ dag::Expected<eastl::string, nv::SupportState> StreamlineAdapter::getDlssVersion
 bool DLSSSuperResolution::isModeAvailableAtResolution(nv::DLSS::Mode, const IPoint2 &) { return false; }
 nv::DLSS *StreamlineAdapter::createDlssFeature(int, IPoint2, void *) { return nullptr; }
 DLSSFrameGeneration *StreamlineAdapter::createDlssGFeature(int, void *) { return nullptr; }
+DLSSNeuralRendering *StreamlineAdapter::createDlssNRFeature(int, void *) { return nullptr; }
 Reflex *StreamlineAdapter::createReflexFeature() { return nullptr; }
+uint64_t StreamlineAdapter::getMemorySize() const { return {}; }
 
 DLSSFrameGeneration::~DLSSFrameGeneration() {}
 void DLSSFrameGeneration::setEnabled(int) {}
-void DLSSFrameGeneration::setSuppressed(bool) {}
 bool DLSSFrameGeneration::evaluate(const nv::DlssGParams<void> &, void *) { return true; }
 unsigned DLSSFrameGeneration::getActualFramesPresented() const { return 1; }
-int DLSSFrameGeneration::getMaximumNumberOfGeneratedFrames() { return 1; }
+nv::DLSSFrameGenerationCapabilities DLSSFrameGeneration::getFrameGenerationCapabilities() { return {}; }
+
+DLSSNeuralRendering::~DLSSNeuralRendering() {}
+bool DLSSNeuralRendering::setOptions(const nv::DlssNROptions &) { return false; }
+bool DLSSNeuralRendering::evaluate(const nv::DlssNRParams<void> &, void *) { return true; }
+
+bool Reflex::setOptions(GpuLatency::Mode, unsigned) { return false; }
+eastl::optional<Reflex::State> Reflex::getState() const { return eastl::nullopt; }
+bool Reflex::sleep(uint32_t) { return false; }
+void Reflex::startFrame(uint32_t) {}
+bool Reflex::setMarker(uint32_t, lowlatency::LatencyMarkerType) { return false; }

@@ -60,6 +60,9 @@ protected:
   void updateDebugTexture();
   void resetFrameBoundaryResult();
 
+  void setUsedTextureId(TEXTUREID textureId);
+  void resetUsedTextureId() { setUsedTextureId(BAD_TEXTUREID); }
+
   bool isSupported = false;
   bool approximateFill = false;
   unsigned int lastUpdatedFrame = -1;
@@ -68,12 +71,14 @@ protected:
   dag::Vector<FrameBoundaryElem> frameBoundaryElemArr;
   dag::Vector<FrameBoundaryElem> dirtyElemArr;
 
+  TEXTUREID usedTextureId = BAD_TEXTUREID;
+
   int frameBoundaryBufferInitialSize = 0;
   int bufferElemCnt = 0;
 
   UniqueBuf frameBoundaryBuffer;
   UniqueBuf frameBoundaryBufferTmp;
-  UniqueTexHolder debugTexture;
+  UniqueTexWithShaderVar debugTexture;
 
   Ptr<ComputeShaderElement> fillBoundaryLegacyCs;
   Ptr<ComputeShaderElement> fillBoundaryApproxCs;

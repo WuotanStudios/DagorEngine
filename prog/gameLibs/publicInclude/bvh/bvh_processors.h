@@ -11,8 +11,13 @@
 #include <shaders/dag_shaderVariableInfo.h>
 #include <perfMon/dag_statDrv.h>
 #include <vecmath/dag_vecMath.h>
+#include <EASTL/vector_map.h>
 #include <EASTL/vector_multimap.h>
+#include <EASTL/unordered_map.h>
+#include <bvh/bvh.h>
 
+struct BvhTreeInstanceData;
+struct BvhSkinnedInstanceData;
 namespace bvh
 {
 
@@ -53,8 +58,10 @@ struct BufferProcessor
     eastl::function<void()> setTransformsFn;
     eastl::function<void(Point4 &, Point4 &)> getHeliParamsFn;
     eastl::function<void(float &, Point2 &)> getDeformParamsFn;
+    eastl::function<Sbuffer *(uint32_t &)> getSplineDataFn;
     TreeData tree;
     FlagData flag;
+    SkinData skin;
 
     float impostorHeightOffset;
     Point4 impostorScale;
@@ -71,11 +78,12 @@ struct BufferProcessor
   virtual bool isOneTimeOnly() const = 0;
   virtual bool isReady(const ProcessArgs &) const { return true; }
   virtual bool isGeneratingSecondaryVertices() const { return false; }
-  virtual bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const = 0;
+  virtual uint32_t getOutputPositionFormat(uint32_t input_format) const { return input_format; }
+  virtual bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const = 0;
 
   virtual void begin() const {}
-  virtual void end() const {}
+  virtual void end(bool is_prototype_buidling) const { G_UNUSED(is_prototype_buidling); }
 
   eastl::unique_ptr<ComputeShaderElement> shader;
 };
@@ -84,8 +92,8 @@ struct IndexProcessor
 {
   IndexProcessor() : shader(new_compute_shader("bvh_process_dynrend_indices")) {}
 
-  void process(Sbuffer *source, UniqueBVHBufferWithOffset &processed_buffer, int index_format, int index_count, int index_start,
-    int start_vertex);
+  void process(Sbuffer *source, BVHGeometryBufferWithOffset &processed_buffer, int index_format, int index_count, int index_start,
+    int start_vertex, ContextId context_id);
 
   eastl::unique_ptr<ComputeShaderElement> shader;
   UniqueBVHBuffer outputs[32];
@@ -96,8 +104,9 @@ struct AHSProcessor
 {
   AHSProcessor() : shader(new_compute_shader("bvh_process_ahs_vertices")) {}
 
-  void process(Sbuffer *indices, Sbuffer *vertices, UniqueBVHBufferWithOffset &processed_buffer, int index_format, int index_count,
-    int texcoord_offset, int texcoord_format, int vertex_stride, int color_offset);
+  void process(ContextId context_id, const BVHGeometryBufferWithOffset &geometry, UniqueBVHBufferWithOffset &processed_buffer,
+    uint32_t &bindless_id, int index_format, int index_count, int texcoord_offset, int texcoord_format, int vertex_stride,
+    int color_offset);
 
   eastl::unique_ptr<ComputeShaderElement> shader;
   UniqueBVHBuffer output;
@@ -111,29 +120,97 @@ struct SkinnedVertexProcessor : public BufferProcessor
   SkinnedVertexProcessor() : BufferProcessor("bvh_process_skinned_vertices") {}
 
   bool isOneTimeOnly() const override { return false; }
+  uint32_t getOutputPositionFormat(uint32_t) const override { return VSDT_FLOAT3; }
 
-  bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const override;
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
+};
+
+struct SkinnedVertexProcessorBatched : public BufferProcessor
+{
+  mutable uint32_t counter = 0;
+  mutable uint32_t lastInstanceOffset = 0;
+  mutable uint32_t instanceDataBaseOffset = 0;
+  // WT dynmodel path: the two dwords the non-batched path passes as immediate
+  // consts, and the ring buffer they index. The ring buffer differs per dynrend
+  // context, so it is part of the dispatch key.
+  mutable uint32_t lastInstanceDataDwords[2] = {0, 0};
+  mutable D3DRESID lastInstanceDataBufferId = BAD_D3DRESID;
+
+  using VariantKey = uint32_t;
+  struct DispatchData
+  {
+    eastl::vector<BvhSkinnedInstanceData> instanceData;
+    uint32_t maxVertexCount = 0;
+    ~DispatchData();
+  };
+  struct DispatchKey
+  {
+    Sbuffer *targetBuffer;
+    D3DRESID instanceDataBuffer;
+    bool operator==(const DispatchKey &o) const
+    {
+      return targetBuffer == o.targetBuffer && instanceDataBuffer == o.instanceDataBuffer;
+    }
+  };
+  struct DispatchKeyHash
+  {
+    size_t operator()(const DispatchKey &key) const
+    {
+      return eastl::hash<void *>()(key.targetBuffer) ^ (size_t(unsigned(key.instanceDataBuffer)) * 2654435761u);
+    }
+  };
+
+  mutable eastl::vector_map<VariantKey, eastl::unordered_map<DispatchKey, DispatchData, DispatchKeyHash>> dispatchDataMapping;
+  mutable UniqueBuf instanceDataBuffer;
+
+  SkinnedVertexProcessorBatched() : BufferProcessor("bvh_process_skinned_vertices_batched") {}
+
+  bool isOneTimeOnly() const override { return false; }
+  uint32_t getOutputPositionFormat(uint32_t) const override { return VSDT_FLOAT3; }
+
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
+
+  void begin() const override;
+  void end(bool is_prototype_building = false) const override;
+
+private:
+  void updateData() const;
+  static VariantKey packVariants(bool is_cloth_wind, bool is_face_morph);
+  static void unpackVariants(VariantKey key, bool &is_cloth_wind, bool &is_face_morph);
 };
 
 struct TreeVertexProcessor : public BufferProcessor
 {
   mutable uint32_t counter = 0;
 
-  mutable dag::Vector<UniqueBVHBuffer> cbuffers;
-  mutable int cbufferCursor = 0;
+  using VariantKey = uint32_t;
+  struct DispatchData
+  {
+    eastl::vector<BvhTreeInstanceData> instanceData;
+    uint32_t maxVertexCount = 0;
+    ~DispatchData();
+  };
+
+  mutable eastl::vector_map<VariantKey, eastl::unordered_map<Sbuffer *, DispatchData>> dispatchDataMapping;
+  mutable UniqueBuf instanceDataBuffer;
 
   TreeVertexProcessor() : BufferProcessor("bvh_process_tree_vertices") {}
 
   bool isOneTimeOnly() const override { return false; }
+  uint32_t getOutputPositionFormat(uint32_t) const override { return VSDT_FLOAT3; }
 
-  bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const override;
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
 
   void begin() const override;
-  void end() const override;
+  void end(bool is_prototype_buidling) const override;
 
-  Sbuffer *getNextCbuffer() const;
+private:
+  void updateData() const;
+  static VariantKey packVariants(bool is_pos_instance, bool is_pivoted);
+  static void unpackVariants(VariantKey key, bool &is_pos_instance, bool &is_pivoted);
 };
 
 struct LeavesVertexProcessor : public BufferProcessor
@@ -144,8 +221,8 @@ struct LeavesVertexProcessor : public BufferProcessor
 
   bool isOneTimeOnly() const override { return false; }
 
-  bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const override;
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
 };
 
 struct HeliRotorVertexProcessor : public BufferProcessor
@@ -155,9 +232,10 @@ struct HeliRotorVertexProcessor : public BufferProcessor
   HeliRotorVertexProcessor() : BufferProcessor("bvh_process_heli_rotor_vertices") {}
 
   bool isOneTimeOnly() const override { return false; }
+  uint32_t getOutputPositionFormat(uint32_t) const override { return VSDT_FLOAT3; }
 
-  bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const override;
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
 };
 
 struct FlagVertexProcessor : public BufferProcessor
@@ -167,9 +245,10 @@ struct FlagVertexProcessor : public BufferProcessor
   FlagVertexProcessor() : BufferProcessor("bvh_process_flag_vertices") {}
 
   bool isOneTimeOnly() const override { return false; }
+  uint32_t getOutputPositionFormat(uint32_t) const override { return VSDT_FLOAT3; }
 
-  bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const override;
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
 };
 
 struct DeformedVertexProcessor : public BufferProcessor
@@ -179,9 +258,10 @@ struct DeformedVertexProcessor : public BufferProcessor
   DeformedVertexProcessor() : BufferProcessor("bvh_process_deformed_vertices") {}
 
   bool isOneTimeOnly() const override { return false; }
+  uint32_t getOutputPositionFormat(uint32_t) const override { return VSDT_FLOAT3; }
 
-  bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const override;
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
 };
 
 struct ImpostorVertexProcessor : public BufferProcessor
@@ -191,11 +271,12 @@ struct ImpostorVertexProcessor : public BufferProcessor
   ImpostorVertexProcessor() : BufferProcessor("bvh_process_impostor_vertices") {}
 
   bool isOneTimeOnly() const override { return true; }
+  uint32_t getOutputPositionFormat(uint32_t) const override { return VSDT_FLOAT3; }
 
   bool isGeneratingSecondaryVertices() const override { return true; }
 
-  bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const override;
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
 };
 
 struct BakeTextureToVerticesProcessor : public BufferProcessor
@@ -211,8 +292,21 @@ struct BakeTextureToVerticesProcessor : public BufferProcessor
     return args.texture == BAD_TEXTUREID || get_managed_res_loaded_lev(args.texture) >= args.textureLevel;
   }
 
-  bool process(ContextId context_id, Sbuffer *source, UniqueOrReferencedBVHBuffer &processed_buffer, ProcessArgs &args,
-    bool skip_processing) const override;
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
+};
+
+struct SplineGenVertexProcessor : public BufferProcessor
+{
+  mutable uint32_t counter = 0;
+
+  SplineGenVertexProcessor() : BufferProcessor("bvh_process_splinegen_vertices") {}
+
+  bool isOneTimeOnly() const override { return false; }
+  uint32_t getOutputPositionFormat(uint32_t) const override { return VSDT_FLOAT3; }
+
+  bool process(ContextId context_id, Sbuffer *source, int source_offset, uint32_t source_buffer_bindless,
+    UniqueOrReferencedBVHBuffer &processed_buffer, uint32_t &bindless_id, ProcessArgs &args, bool skip_processing) const override;
 };
 
 struct ProcessorInstances
@@ -236,6 +330,13 @@ struct ProcessorInstances
     if (!skinnedVertex)
       skinnedVertex.reset(new SkinnedVertexProcessor());
     return *skinnedVertex;
+  }
+
+  static const BufferProcessor &getSkinnedVertexProcessorBatched()
+  {
+    if (!skinnedVertexBatched)
+      skinnedVertexBatched.reset(new SkinnedVertexProcessorBatched());
+    return *skinnedVertexBatched;
   }
 
   static const BufferProcessor &getTreeVertexProcessor()
@@ -287,11 +388,24 @@ struct ProcessorInstances
     return *bakeTexture;
   }
 
+  static const BufferProcessor &getSplineGenVertexProcessor()
+  {
+    if (!splineGenVertex)
+      splineGenVertex.reset(new SplineGenVertexProcessor());
+    return *splineGenVertex;
+  }
+
+  static bool isVertexProcessorBatched(const BufferProcessor &processor)
+  {
+    return &processor == skinnedVertexBatched.get() || &processor == treeVertex.get();
+  }
+
   static void teardown()
   {
     dynrendIndex.reset();
     ahsVertex.reset();
     skinnedVertex.reset();
+    skinnedVertexBatched.reset();
     treeVertex.reset();
     leavesVertex.reset();
     heliRotorVertex.reset();
@@ -299,12 +413,14 @@ struct ProcessorInstances
     deformedVertex.reset();
     impostorVertex.reset();
     bakeTexture.reset();
+    splineGenVertex.reset();
   }
 
 private:
   static inline eastl::unique_ptr<IndexProcessor> dynrendIndex = {};
   static inline eastl::unique_ptr<AHSProcessor> ahsVertex = {};
   static inline eastl::unique_ptr<SkinnedVertexProcessor> skinnedVertex = {};
+  static inline eastl::unique_ptr<SkinnedVertexProcessorBatched> skinnedVertexBatched = {};
   static inline eastl::unique_ptr<TreeVertexProcessor> treeVertex = {};
   static inline eastl::unique_ptr<LeavesVertexProcessor> leavesVertex = {};
   static inline eastl::unique_ptr<HeliRotorVertexProcessor> heliRotorVertex = {};
@@ -312,6 +428,7 @@ private:
   static inline eastl::unique_ptr<DeformedVertexProcessor> deformedVertex = {};
   static inline eastl::unique_ptr<ImpostorVertexProcessor> impostorVertex = {};
   static inline eastl::unique_ptr<BakeTextureToVerticesProcessor> bakeTexture = {};
+  static inline eastl::unique_ptr<SplineGenVertexProcessor> splineGenVertex = {};
 };
 
 } // namespace bvh

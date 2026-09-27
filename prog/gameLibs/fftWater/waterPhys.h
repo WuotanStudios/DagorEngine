@@ -58,7 +58,7 @@ protected:
   void setCascades(const NVWaveWorks_FFT_CPU_Simulation::Params &p);
 
 public:
-  const char *getJobName(bool &) const override { return "water_phys"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("water_phys"); }
   virtual void doJob(); // from IJob
 
   void setSmallWaveFraction(float smallWaveFraction)
@@ -111,7 +111,7 @@ public:
     fifo2 = (fifo1 + 1);
 
     fifo2Part = fifoT - fifoFloored;
-    if (fifo1 < firstTick)
+    if (fifo1 < firstTick) //-V1051
     {
       fifo2 = fifo1 = firstTick;
       fifo2Part = 0;

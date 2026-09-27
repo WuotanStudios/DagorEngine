@@ -1,16 +1,17 @@
 #include "daScript/misc/platform.h"
 
+#include "daScript/simulate/runtime_iterator.h"
 #include "daScript/simulate/runtime_table_nodes.h"
 
 namespace das
 {
     template <typename KeyType>
-    void table_reserve_internal ( Context & context, Table & arr, uint32_t newCapacity, uint32_t valueTypeSize, LineInfo * at ) {
+    void table_reserve_internal ( Context & context, Table & arr, uint64_t newCapacity, uint32_t valueTypeSize, LineInfo * at ) {
         TableHash<KeyType> hash(&context, valueTypeSize);
         hash.reserve(arr, newCapacity, at);
     }
 
-    void table_reserve_impl ( Context & context, Table & arr, int32_t baseType, uint32_t newCapacity, uint32_t valueTypeSize, LineInfo * at ) {
+    void table_reserve_impl ( Context & context, Table & arr, int32_t baseType, uint64_t newCapacity, uint32_t valueTypeSize, LineInfo * at ) {
         if ( arr.isLocked() ) context.throw_error_at(at, "can't reserve locked table");
         if ( !newCapacity ) return;
         switch ( Type(baseType) ) {
@@ -26,6 +27,9 @@ namespace das
             case Type::tEnumeration16:  table_reserve_internal<int16_t>(context, arr, newCapacity, valueTypeSize, at); break;
             case Type::tEnumeration64:  table_reserve_internal<int64_t>(context, arr, newCapacity, valueTypeSize, at); break;
             case Type::tBitfield:       table_reserve_internal<uint32_t>(context, arr, newCapacity, valueTypeSize, at); break;
+            case Type::tBitfield8:      table_reserve_internal<uint8_t>(context, arr, newCapacity, valueTypeSize, at); break;
+            case Type::tBitfield16:     table_reserve_internal<uint16_t>(context, arr, newCapacity, valueTypeSize, at); break;
+            case Type::tBitfield64:     table_reserve_internal<uint64_t>(context, arr, newCapacity, valueTypeSize, at); break;
             case Type::tInt:            table_reserve_internal<int32_t>(context, arr, newCapacity, valueTypeSize, at); break;
             case Type::tInt2:           table_reserve_internal<int2>(context, arr, newCapacity, valueTypeSize, at); break;
             case Type::tInt3:           table_reserve_internal<int3>(context, arr, newCapacity, valueTypeSize, at); break;
@@ -54,7 +58,7 @@ namespace das
     void table_clear ( Context & context, Table & arr, LineInfo * at ) {
         if ( arr.isLocked() ) context.throw_error_at(at, "can't clear locked table");
         if ( arr.data ) {
-            memset(arr.hashes, 0, arr.capacity*sizeof(TableHashKey));
+            memset(arr.hashes, 0, arr.capacity*tableHashSlotBytes(arr));
             memset(arr.data, 0, arr.keys - arr.data);
         }
         arr.size = 0;
@@ -63,21 +67,42 @@ namespace das
 
     void table_lock ( Context & context, Table & arr, LineInfo * at ) {
         if ( arr.shared || arr.hopeless ) return;
-        arr.lock ++;
-        if ( arr.lock==0 ) context.throw_error_at(at, "table lock overflow");
+        if ( arr.lock==0 ) {
+            if ( arr.magic != 0 ) {
+                context.throw_error_at(at, "table magic mismatch on first lock, was it moved or overwritten?");
+            }
+            arr.lock = 1;
+            arr.magic = DAS_ARRAY_MAGIC;
+        } else {
+            if ( arr.magic != DAS_ARRAY_MAGIC ) {
+                context.throw_error_at(at, "table magic mismatch on lock, was it moved or overwritten?");
+            }
+            arr.lock ++;
+            if ( arr.lock==0 ) {
+                context.throw_error_at(at, "table lock overflow, was it moved or overwritten?");
+            }
+        }
     }
 
     void table_unlock ( Context & context, Table & arr, LineInfo * at ) {
         if ( arr.shared || arr.hopeless ) return;
-        if ( arr.lock==0 ) context.throw_error_at(at, "table lock underflow");
+        if ( arr.magic != DAS_ARRAY_MAGIC ) {
+            context.throw_error_at(at, "table magic mismatch on unlock, was it moved or overwritten?");
+        }
+        if ( arr.lock==0 ) {
+            context.throw_error_at(at, "table lock underflow, was it moved or overwritten?");
+        }
         arr.lock --;
+        if ( arr.lock==0 ) {
+            arr.magic = 0;
+        }
     }
 
     // TableIterator
 
     size_t TableIterator::nextValid ( size_t index ) const {
         for ( auto indexs=table->capacity; index < indexs; index++) {
-            if (table->hashes[index] > HASH_KILLED64) {
+            if (tableLiveSlot(*table, index)) {
                 break;
             }
         }
@@ -88,6 +113,7 @@ namespace das
         char ** value = (char **)_value;
         table_lock(context, *(Table *)table, nullptr);
         data  = getData();
+        originData = data;
         table_end = data + table->capacity*stride;
         size_t index = nextValid(0);
         data += index * stride;
@@ -97,10 +123,9 @@ namespace das
 
     bool TableIterator::next  ( Context &, char * _value ) {
         char ** value = (char **) _value;
-        char * tableData = getData();
-        size_t index = (data-tableData)/stride;
+        size_t index = (data-originData)/stride;
         index = nextValid(index + 1);
-        data = tableData + index * stride;
+        data = originData + index * stride;
         *value = data;
         return data != table_end;
     }
@@ -109,6 +134,9 @@ namespace das
         if ( _value ) {
             char ** value = (char **) _value;
             *value = nullptr;
+        }
+        if ( getData()!=originData ) {
+            context.throw_error_at(debugInfo, "table was modified during iteration");
         }
         table_unlock(context, *(Table *)table, nullptr);
         context.freeIterator((char *)this, debugInfo);
@@ -125,21 +153,28 @@ namespace das
         virtual bool first ( Context & context, char * _value ) override {
             table_lock(context, *(Table *)table, nullptr);
             data  = getData();
+            originData = data;
             table_end = data + table->capacity*stride;
             size_t index = nextValid(0);
             data += index * stride;
-            if ( data ) *(KeyType *)_value = *(KeyType *)data;
+            // Only read the key when the slot is real: an empty / fully-erased table lands data at
+            // table_end (one past the keys block). For a non-string packed table the keys block is
+            // the last region (no hash array follows), so dereferencing there is a heap overflow.
+            if ( data != table_end ) *(KeyType *)_value = *(KeyType *)data;
             return (bool) table->size;
         }
         virtual bool next  ( Context &, char * _value ) override {
-            char * tableData = getData();
-            size_t index = (data-tableData)/stride;
+            size_t index = (data-originData)/stride;
             index = nextValid(index + 1);
-            data = tableData + index * stride;
-            *(KeyType *)_value = *(KeyType *)data;
-            return data != table_end;
+            data = originData + index * stride;
+            bool more = data != table_end;
+            if ( more ) *(KeyType *)_value = *(KeyType *)data;   // skip the past-end read on exhaustion
+            return more;
         }
         virtual void close ( Context & context, char * ) override {
+            if ( getData()!=originData ) {
+                context.throw_error_at(debugInfo, "table was modified during iteration");
+            }
             table_unlock(context, *(Table *)table, nullptr);
             context.freeIterator((char *)this, debugInfo);
         }
@@ -147,7 +182,6 @@ namespace das
 
     void builtin_table_keys ( Sequence & result, const Table & tab, int32_t stride, Context * __context__, LineInfoArg * at ) {
         char * iter = __context__->allocateIterator(sizeof(TableKeysIterator<uint8_t>),"table keys iterator", at);
-        if ( !iter ) __context__->throw_out_of_memory(false, sizeof(TableKeysIterator<uint8_t>)+16, at);
         switch ( stride ) {
         case 1:     new (iter) TableKeysIterator<uint8_t>(&tab, stride, at); break;
         case 2:     new (iter) TableKeysIterator<uint16_t>(&tab, stride, at); break;
@@ -166,9 +200,27 @@ namespace das
 
     void builtin_table_values ( Sequence & result, const Table & tab, int32_t stride, Context * __context__, LineInfoArg * at ) {
         char * iter = __context__->allocateIterator(sizeof(TableValuesIterator),"table values iterator", at);
-        if ( !iter ) __context__->throw_out_of_memory(false, sizeof(TableValuesIterator)+16, at);
         new (iter) TableValuesIterator(&tab, stride, at);
         result = { (Iterator *) iter };
+    }
+
+    void builtin_table_get_key ( void * result, const Table & tab, const void * value_ptr, int32_t value_stride, int32_t key_stride, Context * __context__, LineInfoArg * at ) {
+        const char * vp = (const char *)value_ptr;
+        if ( vp < tab.data || vp >= tab.data + tab.capacity * value_stride ) {
+            __context__->throw_error_at(at, "get_key: value pointer is not inside the table");
+            return;
+        }
+        ptrdiff_t offset = vp - tab.data;
+        if ( offset % value_stride != 0 ) {
+            __context__->throw_error_at(at, "get_key: value pointer is not aligned to value stride");
+            return;
+        }
+        ptrdiff_t index = offset / value_stride;
+        if ( !tableLiveSlot(tab, (uint64_t)index) ) {
+            __context__->throw_error_at(at, "get_key: value points to an empty or deleted table slot");
+            return;
+        }
+        memcpy(result, tab.keys + index * key_stride, key_stride);
     }
 
     // delete
@@ -180,7 +232,7 @@ namespace das
         for ( uint32_t i=0, is=total; i!=is; ++i, pTable-- ) {
             if ( pTable->data ) {
                 if ( !pTable->isLocked() ) {
-                    uint32_t oldSize = pTable->capacity*(vts_add_kts + sizeof(TableHashKey));
+                    uint64_t oldSize = pTable->capacity * uint64_t(vts_add_kts) + pTable->capacity*tableHashSlotBytes(*pTable);
                     context.free(pTable->data, oldSize, &debugInfo);
                 } else {
                     context.throw_error_at(debugInfo, "deleting locked table%s", errorMessage);

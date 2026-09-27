@@ -1,0 +1,108 @@
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+
+#include <daECS/core/component.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/componentType.h>
+
+namespace ecs
+{
+
+ChildComponent ChildComponent::null_attr; // ro!
+
+void ChildComponent::initTypeIndex(component_type_t component_type)
+{
+  componentType = component_type;
+  componentTypeIndex = EntityManager::shared_component_types().findType(componentType);
+}
+
+
+ChildComponent::ChildComponent(size_t size, type_index_t ti, component_type_t t, const void *raw_data)
+{
+  G_STATIC_ASSERT(offsetof(ChildComponent, value) == 0);
+  componentTypeSize = size;
+  componentTypeIndex = ti;
+  componentType = t;
+  memcpy(&value, raw_data, sizeof(Value));
+}
+
+void ChildComponent::setRaw(component_type_t component_type, const void *raw_data, CopyType copy_type)
+{
+  if (DAGOR_UNLIKELY(component_type == 0))
+  {
+    reset();
+    return;
+  }
+  initTypeIndex(component_type);
+  ComponentTypes &types = EntityManager::shared_component_types();
+  const ComponentType typeInfo = types.getTypeInfo(componentTypeIndex);
+  componentTypeSize = typeInfo.size;
+  if (!isCompBoxedBySize())
+  {
+    G_ASSERT(componentTypeSize <= sizeof(Value));
+    memcpy(&value, raw_data, componentTypeSize);
+  }
+  else
+  {
+    value.data = memalloc(componentTypeSize, tmpmem);
+    memcpy(value.data, raw_data, componentTypeSize);
+  }
+  if ((typeInfo.flags & COMPONENT_TYPE_BOXED) && copy_type == CopyType::Shallow)
+    return;
+  if (need_constructor(typeInfo.flags)) // we will need copy constructor
+  {
+    if (ComponentTypeManager *tm = types.createTypeManager(componentTypeIndex))
+      tm->copy(getRawData(), raw_data, componentTypeIndex);
+  }
+}
+
+ChildComponent &ChildComponent::operator=(const ChildComponent &a)
+{
+  if (DAGOR_UNLIKELY(this == &a))
+    return *this;
+  if (!isNull() && componentType == a.componentType) // fast path, assigning over the same type reuses the storage
+  {
+    ComponentTypes &types = EntityManager::shared_component_types();
+    const ComponentType typeInfo = types.getTypeInfo(componentTypeIndex);
+    if (!need_constructor(typeInfo.flags))
+    {
+      memcpy(getRawData(), a.getRawData(), componentTypeSize);
+      return *this;
+    }
+    // a shared component has to start sharing the source object, but its assign writes through the pointer instead
+    if (!(typeInfo.flags & COMPONENT_TYPE_CREATE_ON_TEMPL_INSTANTIATE))
+      if (ComponentTypeManager *tm = types.createTypeManager(componentTypeIndex))
+        if (tm->assign(getRawData(), a.getRawData()))
+          return *this;
+  }
+  free();
+  setRaw(a.getUserType(), a.getRawData());
+  return *this;
+}
+
+void ChildComponent::free()
+{
+  if (DAGOR_LIKELY(componentType != 0))
+  {
+    ComponentTypes &types = EntityManager::shared_component_types();
+    const ComponentType typeInfo = types.getTypeInfo(componentTypeIndex);
+    if (need_constructor(typeInfo.flags))
+    {
+      if (ComponentTypeManager *tm = types.createTypeManager(componentTypeIndex))
+        tm->destroy(getRawData());
+    }
+    resetBoxedMem();
+  }
+  else
+    reset();
+}
+
+ChildComponent::ChildComponent(const EntityComponentRef &a) { setRaw(a.getUserType(), a.getRawData()); }
+
+const EntityComponentRef ChildComponent::getEntityComponentRef() const
+{
+  return EntityComponentRef(const_cast<void *>(getRawData()), getUserType(), getTypeId(), INVALID_COMPONENT_INDEX);
+}
+bool ChildComponent::operator==(const EntityComponentRef &a) const { return getEntityComponentRef() == a; }
+bool ChildComponent::operator==(const ChildComponent &a) const { return getEntityComponentRef() == a.getEntityComponentRef(); }
+
+}; // namespace ecs

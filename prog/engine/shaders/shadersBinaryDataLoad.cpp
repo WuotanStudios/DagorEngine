@@ -1,9 +1,11 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "shadersBinaryData.h"
+#include "shBindumpsPrivate.h"
 #include "mapBinarySearch.h"
 #include <shaders/dag_shaderCommon.h>
 #include <shaders/dag_dynVariantsCache.h>
+#include <shaders/shLimits.h>
 #include <ioSys/dag_zstdIo.h>
 #include <osApiWrappers/dag_files.h>
 #include <ioSys/dag_dataBlock.h>
@@ -14,13 +16,16 @@
 #include <perfMon/dag_statDrv.h>
 #include <shaders/dag_bindumpReloadListener.h>
 #include <shaders/dag_shaderVariableInfo.h>
+#include <shaders/shader_name_format.h>
 #include <drv/3d/dag_commands.h>
-#include <hash/sha256.h>
+#include <util/dag_watchdog.h>
+#include <generic/dag_align.h>
+#include <3d/dag_lockTexture.h>
+#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_resetDevice.h>
 
 namespace shaderbindump
 {
-static uint32_t generation = 0;
-uint32_t get_generation() { return generation; }
 static dag::Vector<shaderbindump::VariantTable::IntervalBind> intervalBinds;
 struct IntervalBindRange
 {
@@ -29,6 +34,14 @@ struct IntervalBindRange
 };
 static dag::Vector<IntervalBindRange> intervalBindRanges;
 static OSSpinlock mutex;
+
+ShaderStubTexturesRepository g_stub_texture_repo;
+
+void reset_interval_binds()
+{
+  intervalBinds.clear();
+  intervalBindRanges.clear();
+}
 
 uint32_t get_dynvariant_collection_id(const shaderbindump::ShaderCode &code)
 {
@@ -74,7 +87,7 @@ uint32_t get_dynvariant_collection_id(const shaderbindump::ShaderCode &code)
 template <typename T>
 inline void build_dynvariant_collection_cache_impl(T &cache)
 {
-  const auto &sh = shBinDumpOwner();
+  const auto &globalData = shGlobalData();
   OSSpinlockScopedLock lock(mutex);
   cache.resize_noinit(intervalBindRanges.size());
   int *p = cache.data();
@@ -82,7 +95,7 @@ inline void build_dynvariant_collection_cache_impl(T &cache)
   {
     int v = 0;
     for (uint32_t j = r.start, je = j + r.count; j < je; ++j)
-      v += sh.globIntervalNormValues[intervalBinds[j].intervalId] * intervalBinds[j].totalMul;
+      v += globalData.globIntervalNormValues[intervalBinds[j].intervalId] * intervalBinds[j].totalMul;
     *p++ = v;
   }
 }
@@ -101,14 +114,25 @@ template class DynVariantsCache<framemem_allocator>;
 template class DynVariantsCache<EASTLAllocatorType>;
 
 template <typename F>
-static bool read_shdump_file(IGenLoad &crd, int size, bool full_file_load, F cb)
+static bool read_shdump_file(IGenLoad &crd, int size, bool mmaped_load, F cb)
 {
-  if (full_file_load) // mmaped code path
+  if (mmaped_load) // mmaped code path
   {
     G_ASSERT(crd.tell() == 0);
     int flen = -1;
     auto fdata = (const uint8_t *)df_mmap(static_cast<FullFileLoadCB &>(crd).fileHandle, &flen);
-    if (!fdata || flen != size || !cb(fdata, size))
+    if (!fdata)
+    {
+      debug("[SH] Failed to map bindump file");
+      return false;
+    }
+    if (flen != size)
+    {
+      debug("[SH] Bindump file mapped size doesn't match required size");
+      df_unmap(fdata, flen);
+      return false;
+    }
+    if (!cb(fdata, size))
     {
       df_unmap(fdata, flen);
       return false;
@@ -118,77 +142,94 @@ static bool read_shdump_file(IGenLoad &crd, int size, bool full_file_load, F cb)
   else // generic path with memcopy
   {
     Tab<uint8_t> dump(size);
-    if (crd.tryRead(dump.data(), size) != size || !cb(dump.data(), size))
+    if (crd.tryRead(dump.data(), size) != size)
+    {
+      debug("[SH] Failed to fread bindump file contents");
       return false;
+    }
+    if (!cb(dump.data(), size))
+    {
+      return false;
+    }
   }
   return true;
 }
 
-bool ScriptedShadersBinDumpOwner::load(IGenLoad &crd, int size, bool full_file_load)
+bool ScriptedShadersBinDumpOwner::loadFromFile(IGenLoad &crd, int size, bool mmaped_load)
+{
+  // Clear before loading the file to avoid holding more data in memory than necessary
+  clear();
+
+  // on systems with slow disk drives this may lead to freeze detection kicking in
+  watchdog_kick();
+
+  return read_shdump_file(crd, size, mmaped_load,
+    [&](const uint8_t *data, int size_) { return loadFromData(data, size_, crd.getTargetName()); });
+}
+
+template <template <enum bindump::detail::Target> class L>
+static auto get_layout_hash()
+{
+  return bindump::getHash<bindump::detail::EnableHash<L, bindump::detail::HASHER>>();
+}
+
+template <template <enum bindump::detail::Target> class ExtType>
+static void map_optional_extension(bindump::Mapper<ExtType> *&out_ptr, uint8_t *data, const char *tag)
+{
+  out_ptr = bindump::map<ExtType>(data);
+  if (out_ptr)
+  {
+    debug("[SH] Mapped optional bindump extension structure %s, layout hash is %llx", tag, get_layout_hash<ExtType>());
+  }
+  else
+  {
+    debug("[SH] Failed to map optional bindump extension structure %s, will not be used", tag);
+  }
+}
+
+bool ScriptedShadersBinDumpOwner::loadFromData(uint8_t const *dump, int size, char const *dump_name)
 {
   clear();
 
-  if (!read_shdump_file(crd, size, full_file_load, [&](const uint8_t *data, int size_) { return loadData(data, size_); }))
-    return false;
+  debug("[SH] Dump file loaded at %p, size is %d bytes", dump, size);
 
-  const DataBlock *graphicsBlk = ::dgs_get_settings()->getBlockByName("graphics");
-  const size_t maxBindumpShadervars =
-    graphicsBlk ? graphicsBlk->getInt("max_bindump_shadervars", DEFAULT_MAX_SHVARS) : DEFAULT_MAX_SHVARS;
-
-  G_ASSERTF(mShaderDump->varMap.size() <= maxBindumpShadervars,
-    "Total number of shadervars (%d) exceeds the max allowed for mapping (%d). "
-    "Remove redundant shadervars, or increase graphics/max_bindump_shadervars in the config",
-    mShaderDump->varMap.size(), maxBindumpShadervars);
-
-  initVarIndexMaps(maxBindumpShadervars);
-  shadervars::resolve_shadervars();
-  IShaderBindumpReloadListener::resolveAll();
-  extern void reset_shaders_logerr_info();
-  reset_shaders_logerr_info();
-  if (mShaderDump == &shBinDump())
-    d3d::driver_command(Drv3dCommand::REGISTER_SHADER_DUMP, this, (void *)crd.getTargetName());
-
-  mInitialDataHash = mem_hash_fnv1<64>((char *)mSelfData.data(), mSelfData.size());
-  return true;
-}
-
-static auto make_hash_log_string(const uint8_t (&hash)[SHA256_DIGEST_LENGTH])
-{
-  eastl::string res{};
-  for (uint8_t byte : hash)
-    res.append_sprintf("%02x", byte);
-  return res;
-}
-
-bool ScriptedShadersBinDumpOwner::loadData(const uint8_t *dump, int size)
-{
-  clear();
+  if (dump_name)
+    name.setStr(dump_name);
 
   auto mappedDump = bindump::map<shader_layout::ScriptedShadersBinDumpCompressed>(dump);
   if (!mappedDump)
+  {
+    debug("[SH] Failed to map bindump compressed structure");
     return false;
+  }
+
+  debug("[SH] Mapped compressed bindump structure, layout hash is %llx",
+    get_layout_hash<shader_layout::ScriptedShadersBinDumpCompressed>());
 
   const auto &header = mappedDump->header;
 
   if (header.magicPart1 != _MAKE4C('VSPS') || header.magicPart2 != _MAKE4C('dump') || header.version != SHADER_BINDUMP_VER)
   {
     // @TODO: should this be a fatal too? seems like sign maybe should cause a fatal, but version -- allow to look for other dumps.
+    debug("[SH] Invalid bindump magic=%x|%x version=%d (expected magic=%x|%x version=%d)", header.magicPart1, header.magicPart2,
+      header.version, _MAKE4C('VSPS'), _MAKE4C('dump'), SHADER_BINDUMP_VER);
     return false;
   }
 
-  uint8_t dataHash[SHA256_DIGEST_LENGTH] = {};
-  static_assert(sizeof(dataHash) == sizeof(header.checksumHash));
-
   static_assert(offsetof(eastl::remove_pointer_t<decltype(mappedDump)>, scriptedShadersBindumpCompressed) == sizeof(header));
   auto data = dag::ConstSpan<uint8_t>{dump, size}.subspan(sizeof(header));
-  sha256_csum(data.data(), data.size(), dataHash);
 
-  if (memcmp(header.checksumHash, dataHash, sizeof(dataHash)) != 0)
+  debug("[SH] Calculating checksum for dump data without header at %p, size is %lu bytes", data.data(), data.size());
+
+  Blake3Csum csum = blake3_csum(data.data(), data.size());
+  static_assert(sizeof(csum.data) == sizeof(header.checksumHash));
+
+  if (memcmp(header.checksumHash, csum.data, sizeof(csum.data)) != 0)
   {
     DAG_FATAL("Corrupt file: shaders bindump checksum validation failed\n"
               "  checksum from header : %s\n"
               "  checksum computed from content : %s",
-      make_hash_log_string(header.checksumHash).c_str(), make_hash_log_string(dataHash).c_str());
+      make_hash_log_string(header.checksumHash).c_str(), make_hash_log_string(csum.data).c_str());
     return false;
   }
 
@@ -205,128 +246,57 @@ bool ScriptedShadersBinDumpOwner::loadData(const uint8_t *dump, int size)
 
   mShaderDump = mappedDump->scriptedShadersBindumpCompressed.decompress(mSelfData, bindump::BehaviorOnUncompressed::Copy);
   if (!mShaderDump)
-    return false;
-
-  if (mShaderDump == &shBinDump())
   {
-    initAfterLoad();
-    mDictionary = eastl::unique_ptr<ZSTD_DDict_s, ZstdDictionaryDeleter>(
-      zstd_create_ddict(dag::ConstSpan<char>(mShaderDump->dictionary.data(), mShaderDump->dictionary.size()), true));
+    debug("[SH] Failed to map bindump main structure");
+    return false;
   }
 
-  mShaderDumpV2 = bindump::map<shader_layout::ScriptedShadersBinDumpV2>(mSelfData.data());
-  mShaderDumpV3 = bindump::map<shader_layout::ScriptedShadersBinDumpV3>(mSelfData.data());
+  debug("[SH] Mapped main bindump structure, layout hash is %llx", get_layout_hash<shader_layout::ScriptedShadersBinDump>());
 
-  uint64_t cache_size_in_mb = 0;
-  const DataBlock *graphicsBlk = ::dgs_get_settings()->getBlockByNameEx("graphics");
-  cache_size_in_mb = graphicsBlk->getInt("decompressed_shaders_cache_size_in_mb", 0);
+  const int variantCount = mShaderDump->vprCount + mShaderDump->fshCount;
+  if (variantCount > SOFT_SHADER_VARIANT_LIMIT)
+  {
+    logerr("[SH] Bindump contains %d shader bins, while dagor rule is no more than %d! Too many shaders cause excessive compilations, "
+           "FREEZES and CRASHES for users! Optimize shaders and reduce shader variants!",
+      variantCount, SOFT_SHADER_VARIANT_LIMIT);
+  }
 
-  uint64_t decompressed_size = mShaderDump->shGroups.empty() ? 0 : mShaderDump->shGroups[0].getDecompressedSize();
-  uint64_t cache_capacity =
-    cache_size_in_mb && decompressed_size ? eastl::max((uint64_t)1, (cache_size_in_mb << 20) / decompressed_size) : 1;
+  map_optional_extension(mShaderDumpV2, mSelfData.data(), "V2");
+  map_optional_extension(mShaderDumpV3, mSelfData.data(), "V3");
+  map_optional_extension(mShaderDumpV4, mSelfData.data(), "V4");
+  map_optional_extension(mShaderDumpV5, mSelfData.data(), "V5");
 
-  mDecompressedGropusLru = eastl::make_unique<decompressed_groups_cache_t>(cache_capacity);
+  mDictionary = eastl::unique_ptr<ZSTD_DDict_s, ZstdDictionaryDeleter>(
+    zstd_create_ddict(dag::ConstSpan<char>(mShaderDump->dictionary.data(), mShaderDump->dictionary.size()), true));
+  mInitialDataHash = mem_hash_fnv1<64>((char *)mSelfData.data(), mSelfData.size());
 
   return true;
 }
 
-void ScriptedShadersBinDumpOwner::copyDecompressedShader(const DecompressedGroup &group, uint16_t index_in_group,
-  ShaderBytecode &tmpbuf)
+ShaderSourceExt ScriptedShadersBinDumpOwner::getCode(uint32_t id, ShaderCodeType type) const
 {
-  auto &shader = group.sh_group->shaders[index_in_group];
-  clear_and_resize(tmpbuf, (shader.size() + sizeof(uint32_t) - 1) / sizeof(uint32_t));
-  eastl::copy(shader.begin(), shader.end(), (uint8_t *)tmpbuf.data());
+  id += type == ShaderCodeType::VERTEX ? 0 : mShaderDump->vprCount;
+  return getCodeById(id);
 }
 
-void ScriptedShadersBinDumpOwner::loadDecompressedShader(uint16_t group_id, uint16_t index_in_group, ShaderBytecode &tmpbuf)
-{
-  OSSpinlockScopedLock lock(mDecompressedGroupsLruMutex);
-  // Note: .get() is actually inserting new empty data for missing key
-  const DecompressedGroup &group = mDecompressedGropusLru->get(group_id);
-  if (!group.decompressed_data.empty())
-    copyDecompressedShader(group, index_in_group, tmpbuf);
-}
-
-void ScriptedShadersBinDumpOwner::storeDecompressedGroup(uint16_t group_id, DecompressedGroup &&decompressed_group)
-{
-  OSSpinlockScopedLock lock(mDecompressedGroupsLruMutex);
-  DecompressedGroup &group = mDecompressedGropusLru->get(group_id);
-  group = eastl::move(decompressed_group);
-}
-
-dag::ConstSpan<uint32_t> ScriptedShadersBinDumpOwner::getCode(uint32_t id, ShaderCodeType type, ShaderBytecode &tmpbuf)
+ShaderSourceExt ScriptedShadersBinDumpOwner::getCodeById(uint32_t id) const
 {
   TIME_PROFILE(decompress_shader);
 
-  id += type == ShaderCodeType::VERTEX ? 0 : vprId.size();
-  auto &sh_index = mShaderDump->shGroupsMapping[id];
-
-  tmpbuf.clear();
-  loadDecompressedShader(sh_index.groupId, sh_index.indexInGroup, tmpbuf);
-  if (tmpbuf.empty())
-  {
-    DecompressedGroup group;
-    group.sh_group = mShaderDump->shGroups[sh_index.groupId].decompress(group.decompressed_data, bindump::BehaviorOnUncompressed::Copy,
-      mDictionary.get());
-    copyDecompressedShader(group, sh_index.indexInGroup, tmpbuf);
-    storeDecompressedGroup(sh_index.groupId, eastl::move(group));
-  }
-  return make_span_const(tmpbuf);
+  const auto &compressed_data = mShaderDump->shaders[id];
+  const auto &metadata = mShaderDump->shaders_metadata[id];
+  uint32_t size = dag::align_up(mShaderDump->uncompressed_shader_sizes[id], sizeof(uint32_t));
+  return {{//
+    .compressedData = make_span_const(compressed_data.data(), compressed_data.size()),
+    .metadata = make_span_const(metadata.data(), metadata.size()),
+    .uncompressedSize = size,
+    .dictionary = mDictionary.get()}};
 }
 
-void ScriptedShadersBinDumpOwner::initAfterLoad()
+void ScriptedShadersBinDumpOwner::initAfterLoad(bool is_main)
 {
-  shaderbindump::generation++;
-  // init block state
-  shaderbindump::blockStateWord = 0;
-  static const char *null_name[shaderbindump::MAX_BLOCK_LAYERS] = {"!frame", "!scene", "!obj"};
-  for (int i = 0; i < shaderbindump::MAX_BLOCK_LAYERS; i++)
-  {
-    int id = mapbinarysearch::bfindStrId(mShaderDump->blockNameMap, null_name[i]);
-    if (id < 0)
-      shaderbindump::nullBlock[i] = nullptr;
-    else
-    {
-      shaderbindump::nullBlock[i] = &mShaderDump->blocks[id];
-      shaderbindump::blockStateWord |= shaderbindump::nullBlock[i]->uidVal;
-    }
-  }
-
   G_ASSERT(mShaderDump->globVars.v.size() < 0x2000);
   G_ASSERT(mShaderDump->varMap.size() < 0x2000);
-
-  clear_and_resize(globVarIntervalIdx, mShaderDump->globVars.v.size());
-  mem_set_ff(globVarIntervalIdx);
-  clear_and_resize(globIntervalNormValues, mShaderDump->intervals.size());
-  mem_set_0(globIntervalNormValues);
-  for (int i = 0; i < mShaderDump->intervals.size(); i++)
-  {
-    if (mShaderDump->intervals[i].type == mShaderDump->intervals[i].TYPE_GLOBAL_INTERVAL)
-    {
-      int gvid = bfind_packed_uint16_x2(mShaderDump->gvMap, mShaderDump->intervals[i].nameId);
-      float v = 0.0f;
-      switch (mShaderDump->globVars.v[gvid].type)
-      {
-        case SHVT_INT: v = mShaderDump->globVars.get<int>(gvid); break;
-        case SHVT_REAL: v = mShaderDump->globVars.get<real>(gvid); break;
-        case SHVT_TEXTURE:
-        case SHVT_BUFFER:
-        case SHVT_TLAS: break;
-        default: continue;
-      }
-      globVarIntervalIdx[gvid] = i;
-      globIntervalNormValues[i] = mShaderDump->intervals[i].getNormalizedValue(v);
-    }
-    else if (mShaderDump->intervals[i].type == mShaderDump->intervals[i].TYPE_ASSUMED_INTERVAL)
-    {
-      int gvid = bfind_packed_uint16_x2(mShaderDump->gvMap, mShaderDump->intervals[i].nameId);
-      if (gvid >= 0 && mShaderDump->globVars.v[gvid].type == SHVT_INT)
-        globVarIntervalIdx[gvid] = i;
-    }
-  }
-
-  shaderbindump::intervalBinds.clear();
-  shaderbindump::intervalBindRanges.clear();
 
   clear_and_resize(vprId, mShaderDump->vprCount);
   eastl::fill(vprId.begin(), vprId.end(), BAD_VPROG);
@@ -336,25 +306,204 @@ void ScriptedShadersBinDumpOwner::initAfterLoad()
   clear_and_resize(cshId, mShaderDump->fshCount);
   eastl::fill(cshId.begin(), cshId.end(), BAD_PROGRAM);
 
-  globVarsState.load(*mShaderDump);
+  if (d3d::is_inited()) // This is valid for exp shaders dumps and whatnot -- we can't and don't need to create stub textures.
+  {
+    // Even if we don't have a used tex keys list from V5, pre-create defaults to use just in case
+    for (
+      ShaderVarTextureType svtt : {SHVT_TEX_UNKNOWN, SHVT_TEX_2D, SHVT_TEX_3D, SHVT_TEX_CUBE, SHVT_TEX_2D_ARRAY, SHVT_TEX_CUBE_ARRAY})
+    {
+      shaderbindump::g_stub_texture_repo.add({0xFFFFFFFF, svtt});
+    }
+    if (mShaderDumpV5)
+    {
+      for (auto key : mShaderDumpV5->usedStubTextureKeys)
+        shaderbindump::g_stub_texture_repo.add(key);
+    }
+    // If shader-dump V5 is not mapped, don't logerr here. We might never ask for any stub textures and then it won't matter
+  }
 
-  shBinDumpOwner().violatedAssumedIntervals.clear();
+  shader_name_format::read_compilation_settings_from_blk( //
+    shaderNameFormatSettings,                             //
+    *::dgs_get_settings()->getBlockByNameEx("shaderNameFormat"));
+
+  ++generation;
 }
 
 void ScriptedShadersBinDumpOwner::clear()
 {
-  if (mShaderDump == &shBinDump())
-  {
-    // tell the driver that we are going to unload this bindump
-    d3d::driver_command(Drv3dCommand::REGISTER_SHADER_DUMP);
-  }
-  mDecompressedGropusLru.reset();
   mDictionary.reset();
   mSelfData = {};
   mShaderDump = nullptr;
+  mShaderDumpV2 = nullptr;
+  mShaderDumpV3 = nullptr;
+  mShaderDumpV4 = nullptr;
+  mShaderDumpV5 = nullptr;
   mDictionary = nullptr;
   vprId.clear();
   fshId.clear();
   cshId.clear();
-  globVarsState.clear();
+  name = {};
+  shaderMats = {};
+  shaderMatElems = {};
+  assertionCtx.close();
+  shaderNameFormatSettings = {};
 }
+
+void ScriptedShadersGlobalData::initAfterLoad(ScriptedShadersBinDumpOwner const *backing_dump, bool is_main)
+{
+  isInitialized = true;
+
+  backing = backing_dump;
+  G_ASSERT_RETURN(backing, );
+  auto const *dump = backing->getDump();
+  G_ASSERT_RETURN(dump, );
+
+  clear_and_resize(globVarIntervalIdx, dump->globVars.v.size());
+  mem_set_ff(globVarIntervalIdx);
+  clear_and_resize(globIntervalNormValues, dump->intervals.size());
+  mem_set_0(globIntervalNormValues);
+
+  for (int i = 0; i < dump->intervals.size(); i++)
+  {
+    if (dump->intervals[i].type == dump->intervals[i].TYPE_GLOBAL_INTERVAL)
+    {
+      int gvid = bfind_packed_uint16_x2(dump->gvMap, dump->intervals[i].nameId);
+      float v = 0.0f;
+      switch (dump->globVars.v[gvid].type)
+      {
+        case SHVT_INT: v = dump->globVars.get<int>(gvid); break;
+        case SHVT_REAL: v = dump->globVars.get<real>(gvid); break;
+        case SHVT_TEXTURE:
+        case SHVT_BUFFER:
+        case SHVT_TLAS: break;
+        default: continue;
+      }
+      globVarIntervalIdx[gvid] = i;
+      globIntervalNormValues[i] = dump->intervals[i].getNormalizedValue(v);
+    }
+    else if (dump->intervals[i].type == dump->intervals[i].TYPE_ASSUMED_INTERVAL)
+    {
+      int gvid = bfind_packed_uint16_x2(dump->gvMap, dump->intervals[i].nameId);
+      if (gvid >= 0)
+        globVarIntervalIdx[gvid] = i;
+    }
+  }
+
+  globVarsState.load(*dump);
+  preRequestStaticSamplers(*backing);
+
+  violatedAssumedIntervals.clear();
+
+  const DataBlock *graphicsBlk = ::dgs_get_settings()->getBlockByName("graphics");
+  const size_t maxBindumpShadervars =
+    graphicsBlk ? graphicsBlk->getInt("max_bindump_shadervars", DEFAULT_MAX_SHVARS) : DEFAULT_MAX_SHVARS;
+
+  G_ASSERTF(dump->varMap.size() <= maxBindumpShadervars,
+    "Total number of shadervars (%d) exceeds the max allowed for mapping (%d). "
+    "Remove redundant shadervars, or increase graphics/max_bindump_shadervars in the config",
+    dump->varMap.size(), maxBindumpShadervars);
+
+  initVarIndexMaps(maxBindumpShadervars);
+  initBlockIndexMap();
+}
+
+void ScriptedShadersGlobalData::clear() { globVarsState.clear(); }
+
+const UniqueTex &ShaderStubTexturesRepository::query(uint32_t col, ShaderVarTextureType shvtt) const
+{
+  G_ASSERTF_RETURN(initialized(), stubTextureStore[0],
+    "ShaderStubTexturesRepository::query called on a non-inited repo"); // callee-checked
+  shvtt = shvtt == SHVT_TEX_UNKNOWN ? SHVT_TEX_2D : shvtt;
+  auto it = stubTexturesMap.find(shader_layout::StubTextureKey{col, shvtt});
+  if (DAGOR_UNLIKELY(it == stubTexturesMap.end()))
+  {
+    logerr("[SH] Stub texture for col=%x type=%d was not found, using white stub. This is probably due to V5 bindump header format "
+           "change. Use up-to-date/build game and shaders! If that does not work (stub textures are probably required by NBS), also "
+           "try updating resources/running dabuild.",
+      col, int(shvtt));
+    it = stubTexturesMap.find(shader_layout::StubTextureKey{0xFFFFFFFF, shvtt});
+    G_ASSERT_RETURN(it != stubTexturesMap.end(), stubTextureStore[0]);
+  }
+  return stubTextureStore[it->second];
+}
+
+static bool write_color_to_stub_texture(UniqueTex &tex, shader_layout::StubTextureKey key)
+{
+  if (key.textype == SHVT_TEX_3D) // volumetric textures are not supported by the lock_texture API.
+  {
+    uint32_t *data;
+    int rowPitch, slicePitch;
+    if (!tex.getBaseTex()->lockbox((void **)&data, rowPitch, slicePitch, 0, TEXLOCK_WRITE))
+    {
+      return false;
+    }
+    *data = key.col;
+    tex.getBaseTex()->unlockbox();
+  }
+  else
+  {
+    const bool isCube = (key.textype == SHVT_TEX_CUBE || key.textype == SHVT_TEX_CUBE_ARRAY);
+    const bool isLayered = isCube || key.textype == SHVT_TEX_2D_ARRAY;
+
+    for (int layer = 0, lc = isCube ? 6 : 1; layer < lc; ++layer)
+    {
+      eastl::optional<int> ll{};
+      if (isLayered)
+        ll.emplace(layer);
+      if (auto lock = lock_texture<uint32_t>(tex.getBaseTex(), 0, TEXLOCK_WRITE, ll))
+      {
+        lock.at(0, 0) = key.col;
+      }
+      else
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void ShaderStubTexturesRepository::add(shader_layout::StubTextureKey key)
+{
+  auto [it, isNew] = stubTexturesMap.emplace(key, stubTextureStore.size());
+  if (!isNew)
+    return;
+
+  auto &tex = stubTextureStore.emplace_back();
+
+  char namebuf[64];
+  SNPRINTF(namebuf, sizeof(namebuf), "shader_stubtex_%d_%x", key.textype, key.col);
+  int flags = TEXFMT_R8G8B8A8 | TEXCF_WRITEONLY;
+
+  switch (key.textype)
+  {
+    case SHVT_TEX_UNKNOWN:
+    case SHVT_TEX_2D: tex = dag::create_tex(nullptr, 1, 1, flags, 1, namebuf); break;
+    case SHVT_TEX_3D: tex = dag::create_voltex(1, 1, 1, flags, 1, namebuf); break;
+    case SHVT_TEX_CUBE: tex = dag::create_cubetex(1, flags, 1, namebuf); break;
+    case SHVT_TEX_2D_ARRAY: tex = dag::create_array_tex(1, 1, 1, flags, 1, namebuf); break;
+    case SHVT_TEX_CUBE_ARRAY: tex = dag::create_cube_array_tex(1, 1, flags, 1, namebuf); break;
+    default: G_ASSERT(0);
+  }
+
+  if (!write_color_to_stub_texture(tex, key))
+  {
+    logerr("[SH] Failed to create stubtex for col=%x type=%d", key.col, key.textype);
+    stubTexturesMap.erase(it);
+    stubTextureStore.pop_back();
+  }
+}
+
+void ShaderStubTexturesRepository::afterResetDevice()
+{
+  for (auto [key, texIdx] : stubTexturesMap)
+  {
+    UniqueTex &tex = stubTextureStore[texIdx];
+    if (!write_color_to_stub_texture(tex, key))
+      logerr("[SH] Failed to restore stubtex for col=%x type=%d", key.col, key.textype);
+  }
+}
+
+static void reload_stub_textures_after_reset_device(bool /*full_reset*/) { shaderbindump::g_stub_texture_repo.afterResetDevice(); }
+
+REGISTER_D3D_AFTER_RESET_FUNC(reload_stub_textures_after_reset_device);

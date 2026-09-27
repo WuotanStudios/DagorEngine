@@ -1,36 +1,41 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <sqrat.h>
-#include <sqModules/sqModules.h>
+#include <quirrel/bindQuirrelEx/sqModulesDagor.h>
 #include <util/dag_string.h>
 #include <ioSys/dag_dataBlock.h>
 #include <startup/dag_globalSettings.h>
 #include <quirrel/bindQuirrelEx/bindQuirrelEx.h>
 #include "scriptBindings.h"
+#include <memory/dag_framemem.h>
 
 
-static void script_print_func(HSQUIRRELVM /*v*/, const SQChar *s, ...)
+static void script_print_func(HSQUIRRELVM /*v*/, const char *s, ...)
 {
   va_list vl;
   va_start(vl, s);
-  cvlogmessage(_MAKE4C('SQRL'), s, vl);
+  String msg(framemem_ptr());
+  msg.cvprintf(0, s, vl);
+  logmessage(_MAKE4C('SQRL'), "%s", msg.c_str());
   va_end(vl);
 }
 
 
-static void script_err_print_func(HSQUIRRELVM v, const SQChar *s, ...)
+static void script_err_print_func(HSQUIRRELVM /*v*/, const char *s, ...)
 {
   va_list vl;
   va_start(vl, s);
-  cvlogmessage(LOGLEVEL_ERR, s, vl);
+  String msg(framemem_ptr());
+  msg.cvprintf(0, s, vl);
+  logmessage(LOGLEVEL_ERR, "%s", msg.c_str());
   va_end(vl);
 }
 
 
-static void compile_error_handler(HSQUIRRELVM v, SQMessageSeverity sev, const SQChar *desc, const SQChar *source, SQInteger line,
-  SQInteger column, const SQChar *)
+static void compile_error_handler(HSQUIRRELVM v, SQMessageSeverity sev, const char *desc, const char *source, SQInteger line,
+  SQInteger column, const char *)
 {
-  const SQChar *sevName = "error";
+  const char *sevName = "error";
   if (sev == SEV_HINT)
     sevName = "hint";
   else if (sev == SEV_WARNING)
@@ -46,15 +51,18 @@ static void compile_error_handler(HSQUIRRELVM v, SQMessageSeverity sev, const SQ
 
 static SQInteger runtime_error_handler(HSQUIRRELVM v)
 {
-  G_ASSERT(sq_gettop(v) == 2);
-  const char *errMsg = nullptr;
-  if (SQ_FAILED(sq_getstring(v, 2, &errMsg)))
-    errMsg = "Unknown error";
+  // (this, error, trace): async faults carry the captured trace as a third arg.
+  G_ASSERT(sq_gettop(v) == 3);
+  sqstd_aux_error_to_string(v, 2);
+  const char *errMsg = "Unknown error";
+  sq_getstring(v, -1, &errMsg);
 
   sqstd_printcallstack(v);
   DAG_FATAL(errMsg);
 
-  return sq_suspendvm(v);
+  sq_poptop(v);
+
+  return 0;
 }
 
 void run_init_script(const char *scriptKey)
@@ -71,18 +79,20 @@ void run_init_script(const char *scriptKey)
 
 
   {
-    SqModules moduleMgr(sqvm);
+    SqModulesDagorFileAccess fileAccess(false);
+    SqModules moduleMgr(sqvm, &fileAccess);
     bindquirrel::apply_compiler_options_from_game_settings(&moduleMgr);
 
     sq_setprintfunc(sqvm, script_print_func, script_err_print_func);
     sq_setcompilererrorhandler(sqvm, compile_error_handler);
 
     sq_newclosure(sqvm, runtime_error_handler, 0);
+    sq_setparamscheck(sqvm, 3, nullptr);
     sq_seterrorhandler(sqvm);
 
     bind_dargbox_script_api(&moduleMgr);
 
-    String errMsg;
+    Sqrat::string errMsg;
     Sqrat::Object initScriptExports;
     if (!moduleMgr.reloadModule(scriptFn, true, SqModules::__main__, initScriptExports, errMsg))
     {

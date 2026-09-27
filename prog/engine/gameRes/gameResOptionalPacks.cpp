@@ -44,10 +44,20 @@ void gameresprivate::registerOptionalGameResPack(const char *filename)
 
   using namespace gamerespackbin;
   GrpHeader ghdr;
+  if (dump_data.size() < sizeof(GrpHeader))
+  {
+    debug("Corrupt optional cache.bin %s (size=%u)", filename, dump_data.size());
+    return;
+  }
   crd.read(&ghdr, sizeof(ghdr));
   if (ghdr.label != _MAKE4C('GRP2') && ghdr.label != _MAKE4C('GRP3'))
   {
     debug("no GRP2 label (hdr: 0x%x 0x%x 0x%x 0x%x)", ghdr.label, ghdr.descOnlySize, ghdr.fullDataSize, ghdr.restFileSize);
+    return;
+  }
+  if (!grp_desc_block_valid(ghdr.descOnlySize, dump_data.size()))
+  {
+    debug("Corrupt optional cache.bin %s: descOnlySize=%u, size=%u", filename, ghdr.descOnlySize, dump_data.size());
     return;
   }
 
@@ -149,6 +159,9 @@ static bool gameres_update_desc(DataBlock &desc, const char *desc_fn, const char
         return false;
       }
       int processed_cnt = 0, replaced_cnt = 0;
+      // before the loop, not after: removeBlock renumbers every later block,
+      // so a lookup that runs while it is in progress reads the index against a desc it no longer describes
+      gameres_invalidate_ri_desc_index(desc);
       for (int j = 0; j < blk.blockCount(); j++)
       {
         unsigned pack_idx = blk.getBlock(j)->getIntByNameId(pack_nid, -1);
@@ -321,6 +334,7 @@ bool gameres_optional::update_gameres_from_ready_packs(dag::ConstSpan<PackId> pa
   return true;
 }
 
+// TODO: move this to separate module (something akin "gameResConsole.cpp")
 #include <util/dag_console.h>
 static bool gameres_console_handler(const char *argv[], int argc)
 {
@@ -336,6 +350,13 @@ static bool gameres_console_handler(const char *argv[], int argc)
     auto pack_id = gameres_optional::get_pack_name_id(pack_name);
     if (!gameres_optional::update_gameres_from_ready_packs(make_span_const(&pack_id, 1)))
       console::print_d("unrecognized ext: %s", ext);
+    else
+    {
+      // the update leaves the descs mutable and the riDesc index dropped, and nothing would reoptimize them until the next run;
+      // a no-op when the update touched no desc
+      gameres_final_optimize_desc(gameres_rendinst_desc, "riDesc");
+      gameres_final_optimize_desc(gameres_dynmodel_desc, "dynModelDesc");
+    }
   }
   CONSOLE_CHECK_NAME("gameres", "list_missing_for_res", 2, 3)
   {
@@ -381,6 +402,7 @@ static bool gameres_console_handler(const char *argv[], int argc)
     else
       console::print_d("no missing optional packs");
   }
+  CONSOLE_CHECK_NAME("gameres", "free_unused_game_resources", 1, 1) { free_unused_game_resources(); }
   return found;
 }
 REGISTER_CONSOLE_HANDLER(gameres_console_handler);

@@ -34,7 +34,10 @@ protected:
   AliasMap aliasesMap;
   key_t currentKey = 0;
   resid_t lastResId = Helper<ManagedTex>::BAD_ID;
+  uint32_t lastResetGeneration = 0;
   BaseTexture *originalTexture = nullptr;
+  int defaultWidth = 0;
+  int defaultHeight = 0;
 
   void swap(AliasableManagedTex2D &other)
   {
@@ -42,19 +45,29 @@ protected:
     eastl::swap(aliasesMap, other.aliasesMap);
     eastl::swap(currentKey, other.currentKey);
     eastl::swap(lastResId, other.lastResId);
+    eastl::swap(lastResetGeneration, other.lastResetGeneration);
     eastl::swap(originalTexture, other.originalTexture);
+    eastl::swap(defaultWidth, other.defaultWidth);
+    eastl::swap(defaultHeight, other.defaultHeight);
   }
   AliasableManagedTex2D() = default;
   void calcKey();
   void recreate(int width, int height, int flags, int levels, key_t new_key);
+  void resetAliasCacheIfStale();
 
 public:
   void alias(int width, int height, int flags, int levels);
   void resize(int width, int height);
   uint32_t getResSizeBytes() const;
+  void setDefaultSize(int width, int height)
+  {
+    defaultWidth = width;
+    defaultHeight = height;
+  }
+  void resetDefaultSize();
 };
 
-class AliasableManagedTex2DHolder : public ManagedResHolder<AliasableManagedTex2D>
+class AliasableManagedTex2DHolder : public ManagedResWithShaderVar<AliasableManagedTex2D>
 {
 protected:
   AliasableManagedTex2DHolder() = default;
@@ -68,7 +81,7 @@ public:
 };
 
 using AliasableTex2D = UniqueRes<AliasableManagedTex2D>;
-using AliasableTex2DHolder = ConcreteResHolder<UniqueRes<AliasableManagedTex2DHolder>>;
+using AliasableTex2DHolder = ConcreteResWithShaderVar<UniqueRes<AliasableManagedTex2DHolder>>;
 
 } // namespace resptr_detail
 

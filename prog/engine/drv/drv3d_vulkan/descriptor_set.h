@@ -29,7 +29,8 @@ private:
     eastl::fixed_vector<VulkanDescriptorSetHandle, POOL_SIZE, false> freeSets;
     VulkanDescriptorPoolHandle pool;
 
-    PoolInfo(dag::ConstSpan<VkDescriptorPoolSize> comp, VulkanDescriptorSetLayoutHandle layout, uint32_t frame_index) :
+    PoolInfo(dag::ConstSpan<spirv::CompressedVkDescriptorPoolSize> comp, VulkanDescriptorSetLayoutHandle layout,
+      uint32_t frame_index) :
       frameIndex(frame_index)
     {
       VkDescriptorPoolSize composition[spirv::SHADER_HEADER_DECRIPTOR_COUNT_SIZE];
@@ -37,9 +38,9 @@ private:
       for (auto &&c : comp)
       {
         VkDescriptorPoolSize &t = composition[compositionCount++];
-        t = c;
+        t.type = c.type.get();
         // need to scale by POOL_SIZE
-        t.descriptorCount *= POOL_SIZE;
+        t.descriptorCount = c.descriptorCount * POOL_SIZE;
       }
       G_ASSERTF(compositionCount, "vulkan: shader without binds trying to create descriptor sets");
       VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -140,17 +141,8 @@ public:
   };
   spirv::ShaderHeader header = {};
   spirv::HashValue hash = {};
-  bool matches(const ShaderModuleHeader *shModule) const
-  {
-    if (shModule == nullptr)
-      return (hash == spirv::HashValue{});
-
-    if (shModule->hash != hash)
-      return false;
-
-    return memcmp(&header, &shModule->header, sizeof(header)) == 0;
-  }
-  inline dag::ConstSpan<VkDescriptorPoolSize> getPoolDescriptorSizes() const
+  uint32_t dynamicBRegisterMask = 0;
+  inline dag::ConstSpan<spirv::CompressedVkDescriptorPoolSize> getPoolDescriptorSizes() const
   {
     return make_span_const(header.descriptorCounts, header.descriptorCountsCount);
   }
@@ -164,8 +156,7 @@ public:
 #endif
     do
     {
-      uint32_t absReg = header.registerIndex[i];
-      const VkAnyDescriptorInfo &dsInfo = desc_array[absReg];
+      const VkAnyDescriptorInfo &dsInfo = desc_array[header.getDescriptorTableIndex(i)];
       VkWriteDescriptorSet &wdi = output.writeInfoSet[i];
 
       wdi.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -173,7 +164,7 @@ public:
       wdi.dstBinding = i;
       wdi.dstArrayElement = 0;
       wdi.descriptorCount = 1;
-      wdi.descriptorType = header.descriptorTypes[i];
+      wdi.descriptorType = header.descriptorTypes[i].get();
 #if VK_KHR_ray_tracing_pipeline || VK_KHR_ray_query
       if (wdi.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
       {
@@ -198,10 +189,52 @@ public:
       }
     } while (++i < header.registerCount);
   }
-  void init(const spirv::HashValue &hsh, const spirv::ShaderHeader &cfg, VkShaderStageFlags stage_bits)
+  // downgrade b slots beyond the dynamic budget from dynamic to plain uniform buffers and rebuild the
+  // pool composition to match; operates on the local header copy so the module stays untouched
+  void normalizeDynamicUniformBuffers(uint32_t dynamic_b_slots)
+  {
+    bool changed = false;
+    for (uint8_t i = 0; i < header.registerCount; ++i)
+    {
+      const auto &map = header.registerToSlotMapping[i];
+      if (map.type == spirv::EngineSlotMapping::REG_B && map.slot >= dynamic_b_slots &&
+          header.descriptorTypes[i].get() == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+      {
+        header.descriptorTypes[i].set(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        changed = true;
+      }
+    }
+    if (!changed)
+      return;
+
+    uint8_t typeCounts[spirv::SHADER_HEADER_DECRIPTOR_COUNT_SIZE] = {};
+    for (uint8_t i = 0; i < header.registerCount; ++i)
+      if (header.descriptorTypes[i].value < spirv::SHADER_HEADER_DECRIPTOR_COUNT_SIZE)
+        ++typeCounts[header.descriptorTypes[i].value];
+
+    uint8_t countsCount = 0;
+    for (uint8_t i = 0; i < spirv::SHADER_HEADER_DECRIPTOR_COUNT_SIZE; ++i)
+      if (typeCounts[i])
+      {
+        header.descriptorCounts[countsCount].type.setIndex(i);
+        header.descriptorCounts[countsCount].descriptorCount = typeCounts[i];
+        ++countsCount;
+      }
+    header.descriptorCountsCount = countsCount;
+  }
+
+  // b register slots at or above dynamic_b_slots are bound as plain uniform buffers instead of dynamic
+  // ones so the layout stays within the device per pipeline dynamic uniform buffer total
+  void init(const spirv::HashValue &hsh, const spirv::ShaderHeader &cfg, VkShaderStageFlags stage_bits, uint32_t dynamic_b_slots)
   {
     hash = hsh;
     header = cfg;
+    normalizeDynamicUniformBuffers(dynamic_b_slots);
+    dynamicBRegisterMask = 0;
+    for (uint32_t i = 0; i < header.registerCount; ++i)
+      if (header.registerToSlotMapping[i].type == spirv::EngineSlotMapping::REG_B &&
+          header.descriptorTypes[i].get() == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+        dynamicBRegisterMask |= 1u << header.registerToSlotMapping[i].slot;
     // we don't know shader debug info here to make meaningfull message
     // but shader compiler should NOT pass such shaders, so verify shader compiler code!
     G_ASSERTF(header.registerCount <= spirv::REGISTER_ENTRIES,
@@ -211,7 +244,7 @@ public:
     for (uint32_t i = 0; i < header.registerCount; ++i)
     {
       VkDescriptorSetLayoutBinding &target = bindingDefs[i];
-      target.descriptorType = header.descriptorTypes[i];
+      target.descriptorType = header.descriptorTypes[i].get();
 
       target.binding = i;
       target.descriptorCount = 1;
@@ -228,17 +261,11 @@ public:
 
   void initEmpty()
   {
-    header.maxConstantCount = 0;
-    header.bonesConstantsUsed = 0;
+    header.implicitCbufRegCount = 0;
     header.tRegisterUseMask = 0;
     header.uRegisterUseMask = 0;
     header.bRegisterUseMask = 0;
     header.inputMask = 0;
-    header.imageCount = 0;
-    header.bufferCount = 0;
-    header.bufferViewCount = 0;
-    header.constBufferCount = 0;
-    header.accelerationStructureCount = 0;
     header.descriptorCountsCount = 0;
     header.registerCount = 0;
 
@@ -271,8 +298,8 @@ public:
         target.dstBinding = i;
         target.dstArrayElement = 0;
         target.descriptorCount = 1;
-        target.descriptorType = header.descriptorTypes[i];
-        target.offset = header.registerIndex[i] * sizeof(VkAnyDescriptorInfo);
+        target.descriptorType = header.descriptorTypes[i].get();
+        target.offset = header.getDescriptorTableIndex(i) * sizeof(VkAnyDescriptorInfo);
         target.stride = 0; // ignored, only used if descriptorCount > 1
       }
 

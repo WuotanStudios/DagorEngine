@@ -2,18 +2,18 @@
 
 #include <max.h>
 #include <utilapi.h>
-#include <locale.h>
+#include <format>
 #include "dagor.h"
 #include "enumnode.h"
+#include "common.h"
 #include "resource.h"
 #include <string>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 #define ERRMSG_DELAY 3000
 
-std::string wideToStr(const TCHAR *sw);
-M_STD_STRING strToWide(const char *sz);
-
-int get_save_filename(HWND owner, const TCHAR *title, FilterList &filter, const TCHAR *def_ext, TSTR &exp_fname);
 
 class FontUtil : public UtilityObj
 {
@@ -21,7 +21,7 @@ public:
   IUtil *iu;
   Interface *ip;
   HWND hPanel;
-  TSTR fd_fname;
+  fs::path fd_fname;
 
   FontUtil();
   void BeginEditParams(Interface *ip, IUtil *iu) override;
@@ -41,11 +41,7 @@ public:
   int IsPublic() override { return 1; }
   void *Create(BOOL loading = FALSE) override { return &util; }
   const TCHAR *ClassName() override { return GetString(IDS_FONTUTIL_NAME); }
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
   const MCHAR *NonLocalizedClassName() override { return ClassName(); }
-#else
-  const MCHAR *NonLocalizedClassName() { return ClassName(); }
-#endif
   SClass_ID SuperClassID() override { return UTILITY_CLASS_ID; }
   Class_ID ClassID() override { return FontUtil_CID; }
   const TCHAR *Category() override { return GetString(IDS_UTIL_CAT); }
@@ -61,11 +57,10 @@ enum
 
 IOResult FontUtilDesc::Save(ISave *io)
 {
-  //        ULONG nw;
-  if (util.fd_fname.Length())
+  if (!util.fd_fname.empty())
   {
     io->BeginChunk(CH_FD_FNAME);
-    if (io->WriteCString(util.fd_fname) != IO_OK)
+    if (io->WriteCString(util.fd_fname.c_str()) != IO_OK)
       return IO_ERROR;
     io->EndChunk();
   }
@@ -74,7 +69,6 @@ IOResult FontUtilDesc::Save(ISave *io)
 
 IOResult FontUtilDesc::Load(ILoad *io)
 {
-  //        ULONG nr;
   TCHAR *str;
   while (io->OpenChunk() == IO_OK)
   {
@@ -114,13 +108,6 @@ static INT_PTR CALLBACK FontUtilDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
         break;
       }
       break;
-      /*
-          case WM_LBUTTONDOWN:
-          case WM_LBUTTONUP:
-          case WM_MOUSEMOVE:
-            util.ip->RollupMouseMessage(hWnd,msg,wParam,lParam);
-            break;
-      */
     default: return FALSE;
   }
   return TRUE;
@@ -239,25 +226,25 @@ public:
     if (n->GetVisibility(time) < 0)
       return ECB_CONT;
     const TCHAR *nm = n->GetName();
-    if (_tcsnicmp(nm, _T("hdiv"), 4) == 0)
+    if (istarts_with(nm, L"hdiv"))
     {
       float v;
       getuv(n, NULL, &v);
       hdiv.Append(1, &v);
     }
-    else if (_tcsnicmp(nm, _T("base"), 4) == 0)
+    else if (istarts_with(nm, L"base"))
     {
       float v;
       getuv(n, NULL, &v);
       base.Append(1, &v);
     }
-    else if (_tcsnicmp(nm, _T("vdiv"), 4) == 0)
+    else if (istarts_with(nm, L"vdiv"))
     {
       VDiv d;
       getuv(n, &d.u, &d.v);
       vdiv.Append(1, &d);
     }
-    else if (_tcsnicmp(nm, _T("chars"), 4) == 0)
+    else if (istarts_with(nm, L"chars"))
     {
       Chars c;
       getuv(n, NULL, &c.v);
@@ -332,36 +319,31 @@ public:
       ip->DisplayTempPrompt(GetString(IDS_FILE_CREATE_ERR), ERRMSG_DELAY);
       return 0;
     }
-    setlocale(LC_NUMERIC, "C");
     for (int i = 0; i < hdiv.Count(); ++i)
     {
-      fprintf(h, "\nhdiv %g %g \"", hdiv[i], base[i]);
-      for (TCHAR *s = chars[i].s; *s; ++s)
+      fputs(std::format("\nhdiv {:g} {:g} \"", hdiv[i], base[i]).c_str(), h);
+      for (char c : wideToStr(chars[i].s))
       {
-        if (*s == '\"')
-          fprintf(h, "~\"");
-        else if (*s == '~')
-          fprintf(h, "~~");
+        if (c == '\"')
+          fputs("~\"", h);
+        else if (c == '~')
+          fputs("~~", h);
         else
-        {
-          std::string s1 = wideToStr(s);
-          fputc(*s1.c_str(), h);
-        }
+          fputc(c, h);
       }
-      fprintf(h, "\" {\n");
+      fputs("\" {\n", h);
       char f = 1;
       for (int j = 0; j < vdiv.Count(); ++j)
         if (vdiv[j].d == i)
         {
           if (f)
-            fprintf(h, "%g\n", vdiv[j].u);
+            fputs(std::format("{:g}\n", vdiv[j].u).c_str(), h);
           else
-            fprintf(h, "%g ", vdiv[j].u);
+            fputs(std::format("{:g} ", vdiv[j].u).c_str(), h);
           f = !f;
         }
-      fprintf(h, "}\n");
+      fputs("}\n", h);
     }
-    setlocale(LC_NUMERIC, "");
     fclose(h);
     return 1;
   }
@@ -380,6 +362,6 @@ void FontUtil::exportData()
   enum_nodes(ip->GetRootNode(), &cb);
   if (!cb.check(ip))
     return;
-  if (!cb.save(fd_fname.data(), ip))
+  if (!cb.save(fd_fname.c_str(), ip))
     return;
 }

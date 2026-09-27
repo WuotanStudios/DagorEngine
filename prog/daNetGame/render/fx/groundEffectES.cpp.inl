@@ -1,7 +1,11 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entityManager.h>
-#include <ecs/core/attributeEx.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/entityComponent.h>
 #include <daECS/core/updateStage.h>
 #include <daECS/core/coreEvents.h>
 
@@ -41,7 +45,7 @@ __forceinline float unoise2D(int x, int y, uint32_t seed, float min, float max)
 }
 
 template <typename Callable>
-inline void ground_fx_stop_ecs_query(ecs::EntityId, Callable c);
+inline void ground_fx_stop_ecs_query(ecs::EntityManager &manager, ecs::EntityId, Callable c);
 
 class GroundEffectManager
 {
@@ -83,8 +87,8 @@ public:
         return false;
       }
     }
-    else if (biomeIds.empty())
-      return true; // In this case we don't use biome ids => wait until biome groups will be initialized.
+    else
+      return true; // Wait until biome groups will be initialized
 
     ToroidalGatherCallback::RegionTab regions;
     ToroidalGatherCallback cb(regions);
@@ -111,7 +115,6 @@ public:
 
   void setParameters(const char *fx_name,
     const char *biome_group_name,
-    dag::Vector<int> &&biome_ids,
     float grid_cell_size,
     Point2 grid_world_origin,
     float vis_radius,
@@ -123,7 +126,7 @@ public:
     ecs::EntityId eid)
   {
     bool needUpdateAllCells = fx_name != fxType || tm_params != params.tmParams || rand_tm_params != params.randTmParams ||
-                              biome_group_name != biomeGroupName || biome_ids != biomeIds || grid_cell_size != params.gridCellSize ||
+                              biome_group_name != biomeGroupName || grid_cell_size != params.gridCellSize ||
                               grid_world_origin != params.gridWorldOrigin || vis_radius != params.visRadius ||
                               biome_weight_for_active_thr != params.biomeWeightForActiveThr || fx_radius != params.fxRadius;
 
@@ -133,7 +136,6 @@ public:
     fxType = fx_name;
     fxHash = ECS_HASH_SLOW(fx_name).hash;
     biomeGroupName = biome_group_name;
-    biomeIds = biome_ids;
     params.gridCellSize = grid_cell_size;
     params.gridWorldOrigin = grid_world_origin;
     params.visRadius = vis_radius;
@@ -153,9 +155,9 @@ public:
     toroidalHelper.curOrigin = IPoint2{-100000, -100000};
     toroidalHelper.mainOrigin = IPoint2{0, 0};
 
-    const bool useBiomes = (biome_group_name && *biome_group_name != '\0') || biome_ids.size() > 0;
+    const bool useBiomes = biome_group_name && *biome_group_name != '\0';
     if (!useBiomes)
-      logerr("ground_effect__biome_group_name or ground_effect__biome_ids "
+      logerr("ground_effect__biome_group_name "
              "should be set for template ground_effect\n"
              "ground_effect__fx_name='%s' for %@<%@>",
         fx_name, (ecs::entity_id_t)eid, manager.getEntityTemplateName(eid));
@@ -200,16 +202,9 @@ protected:
       if (state == GpuReadbackResultState::SUCCEEDED)
       {
         float weight = 0.0f;
-        bool firstGroupMatch = qResult.mostFrequentBiomeGroupIndex == biomeGroupId;
-        bool secondGroupMatch = qResult.secondMostFrequentBiomeGroupIndex == biomeGroupId;
-        for (int biomeId : biomeIds)
-        {
-          firstGroupMatch |= qResult.mostFrequentBiomeGroupIndex == biomeId;
-          secondGroupMatch |= qResult.secondMostFrequentBiomeGroupIndex == biomeId;
-        }
-        if (firstGroupMatch)
+        if (qResult.mostFrequentBiomeGroupIndex == biomeGroupId)
           weight += qResult.mostFrequentBiomeGroupWeight;
-        if (secondGroupMatch)
+        if (qResult.secondMostFrequentBiomeGroupIndex == biomeGroupId)
           weight += qResult.secondMostFrequentBiomeGroupWeight;
 
         updateCellProcessed(query.cellX, query.cellY, weight > params.biomeWeightForActiveThr, weight);
@@ -226,7 +221,7 @@ protected:
   void updateCellProcessed(int x, int y, bool active, float spawnRate)
   {
     unsigned id = getCellId(x, y);
-    ground_fx_stop_ecs_query(fxPool[id], [](TheEffect &effect) {
+    ground_fx_stop_ecs_query(*g_entity_mgr, fxPool[id], [](TheEffect &effect) {
       for (auto &fx : effect.getEffects())
         acesfx::kill_effect(fx.fx);
     });
@@ -307,7 +302,6 @@ protected:
   eastl::string biomeGroupName; // Need to store since biomes aren't initialized when the entity is created.
   int biomeGroupId = -1;
   dag::Vector<GroundEffectQuery> queryQueue;
-  dag::Vector<int> biomeIds;
 };
 
 ECS_DECLARE_RELOCATABLE_TYPE(GroundEffectManager);
@@ -316,16 +310,17 @@ ECS_AUTO_REGISTER_COMPONENT(GroundEffectManager, "ground_effect__manager", nullp
 
 
 template <typename Callable>
-void get_camera_position_ecs_query(ecs::EntityId, Callable);
+void get_camera_position_ecs_query(ecs::EntityManager &manager, ecs::EntityId, Callable);
 
 ECS_AFTER(camera_animator_update_es)
 ECS_TAG(render)
-static void update_ground_effects_es(const ecs::UpdateStageInfoAct &, ecs::EntityId eid, GroundEffectManager &ground_effect__manager)
+static void update_ground_effects_es(
+  const ecs::UpdateStageInfoAct &, ecs::EntityManager &manager, ecs::EntityId eid, GroundEffectManager &ground_effect__manager)
 {
   Point3 camPos(0, 0, 0);
-  get_camera_position_ecs_query(get_cur_cam_entity(), [&](const TMatrix &transform) { camPos = transform.getcol(3); });
+  get_camera_position_ecs_query(manager, get_cur_cam_entity(), [&](const TMatrix &transform) { camPos = transform.getcol(3); });
   if (!ground_effect__manager.isValid() || !ground_effect__manager.update(camPos))
-    g_entity_mgr->destroyEntity(eid);
+    manager.destroyEntity(eid);
 }
 
 ECS_TAG(render)
@@ -337,7 +332,6 @@ static void update_ground_effect_params_es_event_handler(const ecs::Event &,
   GroundEffectManager &ground_effect__manager,
   const ecs::string &ground_effect__fx_name,
   const ecs::string &ground_effect__biome_group_name,
-  const ecs::Array &ground_effect__biome_ids,
   float ground_effect__grid_cell_size,
   Point2 ground_effect__grid_world_origin,
   float ground_effect__vis_radius,
@@ -353,13 +347,6 @@ static void update_ground_effect_params_es_event_handler(const ecs::Event &,
   Point2 ground_effect__scale_y,
   Point2 ground_effect__scale_z)
 {
-  dag::Vector<int> biomeIds;
-  if (uint32_t bsz = ground_effect__biome_ids.size())
-  {
-    biomeIds.resize_noinit(bsz);
-    for (int i = 0; i < bsz; ++i)
-      biomeIds[i] = ground_effect__biome_ids[i].get<int>();
-  }
   GroundEffectTransform tmParams[2];
   for (int i = 0; i < 2; ++i)
   {
@@ -367,7 +354,7 @@ static void update_ground_effect_params_es_event_handler(const ecs::Event &,
     tmParams[i].rot = Point3(DegToRad(ground_effect__rot_x[i]), DegToRad(ground_effect__rot_y[i]), DegToRad(ground_effect__rot_z[i]));
     tmParams[i].scale = Point3(ground_effect__scale_x[i], ground_effect__scale_y[i], ground_effect__scale_z[i]);
   };
-  ground_effect__manager.setParameters(ground_effect__fx_name.c_str(), ground_effect__biome_group_name.c_str(), eastl::move(biomeIds),
+  ground_effect__manager.setParameters(ground_effect__fx_name.c_str(), ground_effect__biome_group_name.c_str(),
     ground_effect__grid_cell_size, ground_effect__grid_world_origin, ground_effect__vis_radius,
     ground_effect__biome_weight_for_active_thr, ground_effect__fx_radius, tmParams[0], tmParams[1], manager, eid);
 }

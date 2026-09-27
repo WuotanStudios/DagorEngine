@@ -12,9 +12,26 @@ namespace das {
 #define MAKE_TYPE_FACTORY(TYPE, CTYPE)                                      \
 namespace das {                                                             \
     template <>                                                             \
-    struct typeFactory<CTYPE> {                                             \
+    struct DAS_MOD_API typeFactory<CTYPE> {                                 \
         static ___noinline TypeDeclPtr make(const ModuleLibrary & library ) { \
             return makeHandleType(library, #TYPE);                           \
+        }                                                                   \
+    };                                                                      \
+                                                                            \
+    template <>                                                             \
+    struct typeName<CTYPE> {                                                \
+        constexpr static const char * name() { return #TYPE; }              \
+    };                                                                      \
+};
+
+// distinct type (`distinct TYPE = <underlying>`) registered from C++ via DistinctTypeAnnotation;
+// extern signatures then carry the distinct type instead of the raw underlying
+#define MAKE_DISTINCT_TYPE_FACTORY(TYPE, CTYPE)                             \
+namespace das {                                                             \
+    template <>                                                             \
+    struct DAS_MOD_API typeFactory<CTYPE> {                                 \
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & library ) { \
+            return makeDistinctType(library, #TYPE);                        \
         }                                                                   \
     };                                                                      \
                                                                             \
@@ -28,13 +45,13 @@ namespace das {                                                             \
 namespace das {                                                             \
     class ModuleLibrary;                                                    \
     struct TypeDecl;                                                        \
-    typedef smart_ptr<TypeDecl> TypeDeclPtr;                                \
+    typedef TypeDecl * TypeDeclPtr;                                         \
                                                                             \
     template <typename TT>                                                  \
     struct typeFactory;                                                     \
                                                                             \
     template <>                                                             \
-    struct typeFactory<CTYPE> {                                             \
+    struct DAS_MOD_API typeFactory<CTYPE> {                                 \
         static ___noinline TypeDeclPtr make(const ModuleLibrary & library );\
     };                                                                      \
                                                                             \

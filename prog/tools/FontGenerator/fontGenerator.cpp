@@ -211,6 +211,7 @@ struct FontInfo
     FreeTypeFont f;
     bool forceAutoHinting = true;
     bool ttfLazyLoad = false;
+    bool optional = false;
     bool sysFontMark = false;
     dag::Vector<String> systemNames;
 
@@ -224,6 +225,7 @@ struct FontInfo
       FontInfo::processRanges(*fb_props.getBlockByNameEx("exclude"), exclude);
       forceAutoHinting = fb_props.getBool("forceAutoHinting", true);
       ttfLazyLoad = fb_props.getBool("ttfLazyLoad", def_lazy);
+      optional = fb_props.getBool("optional", false);
       sysFontMark = strncmp(file, "<system>", 8) == 0;
       dblk::iterate_params_by_name_and_type(fb_props, "sysfont", DataBlock::TYPE_STRING,
         [&](int pidx) { systemNames.push_back() = fb_props.getStr(pidx); });
@@ -245,6 +247,7 @@ struct FontInfo
   bool monochrome;
   bool forceAutoHinting = true, checkExtents = false;
   bool ttfLazyLoad = false;
+  bool optional = false;
   Tab<int> hRes;
   dag::Vector<FontInfo> additional;
   Tab<unicode_range_t> monoWdGrp;
@@ -263,6 +266,7 @@ struct FontInfo
   E3DCOLOR border_color, font_color;
   bool caseSensitive, useFontColor;
   dag::Vector<String> systemNames;
+  dag::Vector<String> fontFeatureSettingsList;
 
   struct RasterGlyph
   {
@@ -377,6 +381,9 @@ struct FontInfo
       return false;
     }
 
+    dblk::iterate_params_by_name_and_type(blk, "fontFeatureSettings", DataBlock::TYPE_STRING,
+      [&](int pidx) { fontFeatureSettingsList.push_back() = blk.getStr(pidx); });
+
     if (!::dgs_execute_quiet)
       debug("font name = %s, def_sz = %f, size_multiplier = %f, size_percents = %f, size_pixels =  %f, size_pixels_by_screen = %d",
         name, def_sz, size_multiplier, blk.getReal("size_percents", -1), blk.getReal("size_pixels", -1), size_pixels_by_screenheight);
@@ -416,6 +423,7 @@ struct FontInfo
     monochrome = blk.getBool("bw", false);
     forceAutoHinting = blk.getBool("forceAutoHinting", true);
     ttfLazyLoad = blk.getBool("ttfLazyLoad", false);
+    optional = blk.getBool("optional", false);
     checkExtents = blk.getBool("checkExtents", false);
 
     if (size < 0)
@@ -1997,7 +2005,7 @@ static void stdout_report_fatal_error(const char *title, const char *msg, const 
 }
 
 static void build_config_for_fully_dynamic_fonts(const char *dest_fn, dag::Span<FontInfo> fontPack, const char *copyto_dir,
-  bool make_Ranges_txt)
+  bool make_Ranges_txt, bool verbose = false)
 {
   DataBlock dynFontBlk;
 
@@ -2088,20 +2096,22 @@ static void build_config_for_fully_dynamic_fonts(const char *dest_fn, dag::Span<
         for (const auto &fbf : f.fallBackFonts)
           if (unsigned cnt = resoved_cnt[&fbf - f.fallBackFonts.data()])
           {
-            printf("NOTE: reusing %d unicode chars from fallback font: %s\n", cnt, fbf.file.c_str());
+            if (verbose)
+              printf("NOTE: reusing %d unicode chars from fallback font: %s\n", cnt, fbf.file.c_str());
             FontInfo &af = f.additional.push_back();
             af.file = fbf.file;
             af.size = f.size * fbf.htScale;
             af.include = fb_used[&fbf - f.fallBackFonts.data()];
             af.forceAutoHinting = fbf.forceAutoHinting;
             af.ttfLazyLoad = fbf.ttfLazyLoad;
+            af.optional = fbf.optional;
             af.systemNames = fbf.systemNames;
             for (int afi = 0; afi < initial_add_cnt; afi++)
               for (int i = 1, inc = 1; i < missingSym.FULL_SZ; i += inc)
                 if (af.include.getIter(i, inc))
                   f.additional[afi].include.clr(i);
           }
-        if (missing_cnt)
+        if (missing_cnt && verbose)
           printf("NOTE: '%s': unresolved %d missing unicode chars left\n", f.name.str(), missing_cnt);
 
         if (make_Ranges_txt)
@@ -2184,6 +2194,11 @@ static void build_config_for_fully_dynamic_fonts(const char *dest_fn, dag::Span<
     }
     if (!f.forceAutoHinting)
       b.setBool("forceAutoHint", f.forceAutoHinting);
+    if (f.optional)
+      b.setBool("optional", true);
+
+    for (auto &s : f.fontFeatureSettingsList)
+      b.addStr("fontFeatureSettings", s);
 
     unicode_range_t usedSym;
     for (auto &af : f.additional)
@@ -2269,6 +2284,8 @@ static void build_config_for_fully_dynamic_fonts(const char *dest_fn, dag::Span<
         b2.setBool("forceAutoHint", af.forceAutoHinting);
       if (af.ttfLazyLoad)
         b2.setBool("lazyLoad", af.ttfLazyLoad);
+      if (af.optional)
+        b2.setBool("optional", true);
 
       for (int i = 0, idx = &af - f.additional.data(); i < sym_ranges.size(); i++)
         if (sym_ranges[i].x == idx)
@@ -2324,8 +2341,8 @@ static void build_config_for_fully_dynamic_fonts(const char *dest_fn, dag::Span<
 int DagorWinMain(bool debugmode)
 {
   if (!::dgs_execute_quiet)
-    printf("Dagor Font Generator v3.16 (based on freetype-%d.%d.%d)\n"
-           "Copyright (c) Gaijin Games KFT, 2023\n"
+    printf("Dagor Font Generator v3.17 (based on freetype-%d.%d.%d)\n"
+           "Copyright (c) Gaijin Games KFT, 2026\n"
            "All rights reserved\n",
       FREETYPE_MAJOR, FREETYPE_MINOR, FREETYPE_PATCH);
   ::register_tga_tex_load_factory();
@@ -2466,7 +2483,7 @@ int DagorWinMain(bool debugmode)
   {
     build_config_for_fully_dynamic_fonts(
       String(0, "%s/%s.dynFont.blk", blk.getStr("copyto", prefix), masterAtlas ? masterAtlas : "all"), make_span(fontPack),
-      blk.getStr("copyto", prefix), blk.getBool("makeRangesTxt", false));
+      blk.getStr("copyto", prefix), blk.getBool("makeRangesTxt", false), verbose);
     fontPack.clear();
     return 0;
   }
@@ -2481,11 +2498,11 @@ int DagorWinMain(bool debugmode)
       continue;
     clear_and_shrink(atlas);
     atlas.push_back(&fontPack[i]);
-    if (fontPack[i].atlas)
+    if (!fontPack[i].atlas.empty())
     {
       for (int j = i + 1; j < fontPack.size(); j++)
       {
-        if (!fontPack[j].wasCompiled && fontPack[j].atlas && !strcmp(fontPack[i].atlas, fontPack[j].atlas))
+        if (!fontPack[j].wasCompiled && !fontPack[j].atlas.empty() && !strcmp(fontPack[i].atlas, fontPack[j].atlas))
         {
           fontPack[j].wasCompiled = true;
           atlas.push_back(&fontPack[j]);

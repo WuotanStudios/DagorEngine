@@ -42,8 +42,8 @@ public:
   virtual int run(int width, int height, const char *caption, const char *icon = "", WindowSizeInit size = WSI_NORMAL) = 0;
   virtual void close() = 0;
 
-  virtual bool loadLayout(const char *filename = NULL) = 0;
-  virtual void saveLayout(const char *filename = NULL) = 0;
+  virtual void loadMainWindowPositionAndSize(const DataBlock &blk) = 0;
+  virtual void saveMainWindowPositionAndSize(DataBlock &blk) = 0;
 
   virtual void setMainWindowCaption(const char *caption) = 0;
 
@@ -68,15 +68,17 @@ public:
   // creator
   static IWndManager *createManager(IWndManagerEventHandler *event_handler);
 
-  virtual bool init3d(const char *drv_name = NULL, const DataBlock *blkTexStreaming = NULL) = 0;
+  virtual bool init3d(const char *drv_name = NULL, const DataBlock *blkTexStreaming = NULL, const char *caption = "",
+    const char *icon = "") = 0;
 
   // accelerators
   virtual void addAccelerator(unsigned cmd_id, ImGuiKeyChord key_chord) = 0;
-  virtual void addAcceleratorUp(unsigned cmd_id, ImGuiKeyChord key_chord) = 0;
+  virtual void addAccelerator(unsigned cmd_id, const char *command_id) = 0;
   virtual void addViewportAccelerator(unsigned cmd_id, ImGuiKeyChord key_chord, bool allow_repeat = false) = 0;
+  virtual void addViewportAccelerator(unsigned cmd_id, const char *command_id, bool allow_repeat = false) = 0;
   virtual void clearAccelerators() = 0;
-  virtual unsigned processImguiAccelerator() = 0;
-  virtual unsigned processImguiViewportAccelerator(ImGuiID viewport_id) = 0;
+  // active_viewport_canvas_id: the ImGui ID of the active viewport's canvas item, 0 if no viewport is active.
+  virtual unsigned processImguiAccelerator(ImGuiID active_viewport_canvas_id, bool &viewport_accelerator) = 0;
 
   virtual void initCustomMouseCursors(const char *path) = 0;
   virtual void updateImguiMouseCursor() = 0;

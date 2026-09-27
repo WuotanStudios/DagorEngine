@@ -16,7 +16,7 @@ macro ALBEDO_SCENE_MARK_FROM_GBUF(code)
     globtm_psf@f44 = {globtm_psf_0, globtm_psf_1, globtm_psf_2, globtm_psf_3};
     world_view_pos@f3 = world_view_pos;
   }
-  if (hardware.dx11 && !hardware.dx12)
+  if (hardware.dx11)
   {
     hlsl(code) {
       #pragma force_min_opt_level 4
@@ -129,13 +129,13 @@ shader dagi_albedo_scene_from_gbuf_cs
 {
   INIT_ZNZFAR_STAGE(cs)
 
-  ENABLE_ASSERT(cs)
   (cs) {
     globtm_inv@f44 = globtm_inv;
     depth_gbuf@tex2d = depth_gbuf;
     depth_gbuf_dim@f2 = get_dimensions(depth_gbuf, 0);
     dagi_albedo_scene_update_count@i2 = dagi_albedo_scene_update_count;
   }
+  INIT_PACK_UNPACK_DYNSTCODE(cs)
   ALBEDO_SCENE_MARK_FROM_GBUF(cs)
 
   hlsl(cs) {

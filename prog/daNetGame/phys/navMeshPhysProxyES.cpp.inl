@@ -1,23 +1,21 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include "navMeshPhysProxy.h"
 #include <phys/dag_physics.h>
 #include <gamePhys/collision/collisionLib.h>
 #include "game/gameEvents.h"
 
 template <typename Callable>
-static bool navphys_collision_data_ecs_query(ecs::EntityId, Callable);
-
-void *NavMeshPhysProxy::vtblPtr = nullptr;
+static bool navphys_collision_data_ecs_query(ecs::EntityManager &manager, ecs::EntityId, Callable);
 
 // Just one. This means that NavMeshPhysProxy to NavMeshPhysProxy collision isn't going to work as both will use the same object.
 static CollisionObject nvmphys_capsule_coll;
 
 NavMeshPhysProxy::NavMeshPhysProxy(ecs::EntityId eid, float dt)
 {
-  if (!vtblPtr)
-    vtblPtr = ((void **)this)[0];
   timeStep = dt;
   pseudoVelDelta = ZERO<Point3>();
 
@@ -25,7 +23,7 @@ NavMeshPhysProxy::NavMeshPhysProxy(ecs::EntityId eid, float dt)
     nvmphys_capsule_coll = dacoll::add_dynamic_capsule_collision(TMatrix::IDENT, /*radius*/ 1.f, /*heigh*/ 1.f, /*user_ptr*/ nullptr,
       /*add_to_world*/ false);
 
-  if (navphys_collision_data_ecs_query(eid,
+  if (navphys_collision_data_ecs_query(*g_entity_mgr, eid,
         [this](const TMatrix &transform, const float nphys_coll__capsuleRadius, const float nphys_coll__capsuleHeight,
           const Point3 navmesh_phys__currentWalkVelocity, const float nphys__mass) {
           loc.fromTM(transform);

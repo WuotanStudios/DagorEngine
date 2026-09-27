@@ -60,7 +60,7 @@ def water_sound_field_init(evt : Event;
   offset = water_sound_field__worldAABB.xy
   ncells = int2(ceil((water_sound_field__worldAABB.zw - water_sound_field__worldAABB.xy) / cellSize))
 
-  var water : array<float>
+  var inscope water : array<float>
   make_water(water, ncells, cellSize, water_sound_field__depthThreshold, offset, 2)
 
   resize(water_sound_field__cells, ncells.x * ncells.y)
@@ -74,6 +74,8 @@ def water_sound_field_init(evt : Event;
 
   sound_debug("init water_sound_field ncells={ncells}, size(kb)={ncells.x * ncells.y / 1024}")
 
+  shrink_heap_memory()
+
 
 [es(no_order, tag=sound, on_event=ParallelUpdateFrameDelayed)]
 def water_sound_field_update(evt : Event;
@@ -82,6 +84,7 @@ def water_sound_field_update(evt : Event;
                              water_sound_field__numCells : int2;
                              water_sound_field__cells : UInt8List;
                              water_sound_field__path : string;
+                             water_sound_field__waterLevel : float;
                              var water_sound_field__eventRadius : float&;
                              var water_sound_field__event : SoundEvent&;
                              var water_sound_field__eventPos : float3&)
@@ -110,6 +113,7 @@ def water_sound_field_update(evt : Event;
 
   var shouldPlay = vol > (water_sound_field__event.enabled ? 0. : 0.05)
   water_sound_field__eventPos = floor_on_water(cam2d)
+  water_sound_field__eventPos.y += water_sound_field__waterLevel
   if sound_banks_is_master_preset_loaded()
     if shouldPlay
       if water_sound_field__eventRadius <= 0.

@@ -1,14 +1,15 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
+#include "driver_defs.h"
 #include <util/dag_globDef.h>
 #include <generic/dag_smallTab.h>
 #include <generic/dag_fixedMoveOnlyFunction.h>
 #include <3d/ddsxTex.h>
 #include <DXGIFormat.h>
-#include "generic/dag_tabExt.h"
 #include <3d/tql.h>
 #include "basetexture.h"
+#include "keyMapPools.h"
 
 #define MAX_STAT_NAME 64
 #define MAX_MIPLEVELS 16
@@ -143,6 +144,11 @@ public:
   uint16_t wasCopiedToStage : 1;
   uint16_t dirtyRt : 1;
   uint16_t wasUsed : 1;
+  uint16_t hasUavViews : 1;
+  uint16_t backbufferCount : 3 = 1; // > 1 for swapchain created textures
+  // a TEXLOCK_DONOTUPDATE unlock left staging content pending; next updating unlock must upload all
+  // subresources instead of only the locked one
+  uint16_t uploadSkipped : 1;
 
   static BaseTex *create_tex(uint32_t cflg, D3DResourceType type);
   static void destroy_tex(BaseTex *);
@@ -164,14 +170,6 @@ public:
   int update(BaseTexture *src) override;
   int updateSubRegionImpl(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
     int dest_subres_idx, int dest_x, int dest_y, int dest_z);
-  int updateSubRegion(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
-    int dest_subres_idx, int dest_x, int dest_y, int dest_z) override;
-  // Only difference between this and ref implementation is the use of updateSubRegionImpl to bypass copy dest flag check.
-  BaseTexture *downSize(int new_width, int new_height, int new_depth, int new_mips, unsigned start_src_level,
-    unsigned level_offset) override;
-  // Only difference between this and ref implementation is the use of updateSubRegionImpl to bypass copy dest flag check.
-  BaseTexture *upSize(int new_width, int new_height, int new_depth, int new_mips, unsigned start_src_level,
-    unsigned level_offset) override;
   void clear();
 
   void destroyObject();
@@ -197,7 +195,7 @@ public:
 
   bool markTexelsUninitialized() const;
 
-  inline bool isTexResEqual(BaseTexture *bt) const;
+  bool isTexResEqual(BaseTexture *bt) const { return bt && (((BaseTex *)bt)->tex.texRes == tex.texRes); }
 
   int lockimg(void **p, int &stride, int lev, unsigned flags);
   int lockimg(void **p, int &stride, int face, int level, unsigned flags);

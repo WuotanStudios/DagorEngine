@@ -8,7 +8,7 @@ distribution of this software and related documentation without an express
 license agreement from NVIDIA CORPORATION is strictly prohibited.
 */
 
-#include <shared/assert.h>
+#include "util/assert.h"
 
 #include "shader_bindings.h"
 
@@ -16,13 +16,13 @@ namespace omm
 {
 
 void ShaderBindings::BindResource(const ResourceBinding& resource) {
-    auto res = resources.insert(std::make_pair(resource.nameHash, resource)).second;
+    auto res = resources.emplace(resource.nameHash, resource).second;
     OMM_ASSERT(res);
     resourcesVec.push_back(resource);
 }
 
 void ShaderBindings::BindSubResource(const SubResourceBinding& subresource) {
-    auto res = subResources.insert(std::make_pair(subresource.nameHash, subresource)).second;
+    auto res = subResources.emplace(subresource.nameHash, subresource).second;
     OMM_ASSERT(res);
     subResourcesVec.push_back(subresource);
 }

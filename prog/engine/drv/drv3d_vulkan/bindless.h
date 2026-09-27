@@ -17,7 +17,6 @@ namespace drv3d_vulkan
 {
 
 struct BaseTex;
-class ExecutionContext;
 class SamplerResource;
 class Buffer;
 
@@ -30,7 +29,6 @@ public:
   void afterDeviceReset();
 
   uint32_t allocateBindlessResourceRange(D3DResourceType type, uint32_t count);
-  uint32_t resizeBindlessResourceRange(D3DResourceType type, uint32_t index, uint32_t currentCount, uint32_t newCount);
   void queueFreeBindlessResourceRange(D3DResourceType type, uint32_t index, uint32_t count);
   uint32_t registerBindlessSampler(const SamplerResource *sampler);
 
@@ -60,7 +58,7 @@ struct BindlessImageSlot
 {
   Image *img;
   ImageViewState viewState;
-  bool stub;
+  void *owner;
 };
 
 class BindlessManagerBackend // -V730
@@ -77,8 +75,9 @@ public:
   void evictBindlessTexture(uint32_t index, Image *image);
   void cleanupBindlessTexture(uint32_t index, Image *image);
   // true - slot was updated
-  bool updateBindlessTexture(uint32_t index, Image *image, const ImageViewState view, bool stub, bool stub_swap);
-  void setBindlessTexture(uint32_t index, Image *image, const ImageViewState view, bool stub);
+  bool updateBindlessTexture(uint32_t index, Image *image, void *owner, const ImageViewState view);
+  void setBindlessTexture(uint32_t index, Image *image, void *owner, const ImageViewState view);
+  bool isBindlessTextureOwnedBy(uint32_t index, void *owner);
 
   void restoreBindlessBuffer(uint32_t index, Buffer *buf);
   void evictBindlessBuffer(uint32_t index, Buffer *buf);
@@ -86,14 +85,13 @@ public:
   void updateBindlessBuffer(uint32_t index, const BufferRef &buf);
 
   void updateBindlessSampler(uint32_t index, const SamplerInfo *samplerInfo);
-  void copyBindlessDescriptors(D3DResourceType type, uint32_t src, uint32_t dst, uint32_t count);
 
   void fillSetLayouts(BindlessSetLayouts &tgt) const { tgt = layouts; }
 
   uint32_t getActiveBindlessSetCount() const;
 
   void advance();
-  void bindSets(VkPipelineBindPoint bindPoint, VulkanPipelineLayoutHandle pipelineLayout);
+  void bindSets(VkPipelineBindPoint bindPoint, VulkanPipelineLayoutHandle pipelineLayout, uint8_t sets_to_use);
   void resetSets();
 
 private:

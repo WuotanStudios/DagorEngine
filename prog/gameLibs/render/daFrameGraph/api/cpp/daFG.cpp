@@ -29,6 +29,11 @@ detail::NodeUid detail::register_node(NameSpaceNameId nsId, const char *name, co
   return {nodeId, nodeData.generation, 1};
 }
 
+void detail::mark_custom_execution(NodeNameId node_id, InternalRegistry *registry)
+{
+  registry->nodes[node_id].hasCustomExecution = true;
+}
+
 void detail::unregister_node(detail::NodeUid uid)
 {
   if (!Runtime::isInitialized())
@@ -50,13 +55,16 @@ void set_multiplexing_default_mode(multiplexing::Mode mode, multiplexing::Mode h
   {
     registry.defaultMultiplexingMode = mode;
     registry.defaultHistoryMultiplexingMode = history_mode;
-    runtime.markStageDirty(CompilationStage::REQUIRES_IR_GRAPH_BUILD);
+    runtime.markStageDirty(CompilationStage::REQUIRES_IR_GRAPH_BUILD, "default multiplexing mode changed");
   }
 }
 
 void set_multiplexing_extents(multiplexing::Extents extents) { Runtime::get().setMultiplexingExtents(extents); }
 
-bool run_nodes() { return Runtime::get().runNodes(); }
+bool run_nodes(PreExecuteAction pre_execute_action)
+{
+  return Runtime::get().runNodes(pre_execute_action == PreExecuteAction::FlushRefinedBlocks);
+}
 
 void startup() { Runtime::startup(); }
 

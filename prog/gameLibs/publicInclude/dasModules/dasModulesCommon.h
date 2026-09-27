@@ -22,7 +22,7 @@ namespace das
     static TypeDeclPtr make(const ModuleLibrary &lib)          \
     {                                                          \
       G_UNUSED(lib);                                           \
-      auto t = make_smart<TypeDecl>(Type::DAS_DECL_TYPE);      \
+      auto t = new TypeDecl(Type::DAS_DECL_TYPE);              \
       t->alias = #TYPE;                                        \
       t->aotAlias = true;                                      \
       return t;                                                \
@@ -81,18 +81,41 @@ struct Point4_WrapArg : Point4
 struct Point3_WrapArg : Point3
 {
   Point3_WrapArg(vec4f t) : Point3(v_extract_x(t), v_extract_y(t), v_extract_z(t)) {}
-  operator vec4f() const { return das::vec_loadu(&x); }
+  operator vec4f() const { return das::vec_loadu3(&x); }
 };
 
 struct Point2_WrapArg : Point2
 {
   Point2_WrapArg(vec4f t) : Point2(v_extract_x(t), v_extract_y(t)) {}
+  operator vec4f() const { return das::vec_loadu_half(&x); }
+};
+
+struct IPoint4_WrapArg : IPoint4
+{
+  IPoint4_WrapArg(vec4f t) :
+    IPoint4(v_extract_xi(v_cast_vec4i(t)), v_extract_yi(v_cast_vec4i(t)), v_extract_zi(v_cast_vec4i(t)), v_extract_wi(v_cast_vec4i(t)))
+  {}
   operator vec4f() const { return das::vec_loadu(&x); }
+};
+
+struct IPoint3_WrapArg : IPoint3
+{
+  IPoint3_WrapArg(vec4f t) : IPoint3(v_extract_xi(v_cast_vec4i(t)), v_extract_yi(v_cast_vec4i(t)), v_extract_zi(v_cast_vec4i(t))) {}
+  operator vec4f() const { return das::vec_loadu3(&x); }
+};
+
+struct IPoint2_WrapArg : IPoint2
+{
+  IPoint2_WrapArg(vec4f t) : IPoint2(v_extract_xi(v_cast_vec4i(t)), v_extract_yi(v_cast_vec4i(t))) {}
+  operator vec4f() const { return das::vec_loadu_half(&x); }
 };
 
 MAKE_POINT_TYPE_WRAPPER(Point4)
 MAKE_POINT_TYPE_WRAPPER(Point3)
 MAKE_POINT_TYPE_WRAPPER(Point2)
+MAKE_POINT_TYPE_WRAPPER(IPoint4)
+MAKE_POINT_TYPE_WRAPPER(IPoint3)
+MAKE_POINT_TYPE_WRAPPER(IPoint2)
 
 #undef MAKE_POINT_TYPE_WRAPPER
 
@@ -105,12 +128,11 @@ struct das_alias<TMatrix4> : das::das_alias_vec<TMatrix4, float4x4>
 {};
 
 template <typename TAnnotation, typename TParentAnnotation>
-inline bool add_annotation(das::Module *module, const das::smart_ptr<TAnnotation> &ann,
-  const das::smart_ptr<TParentAnnotation> &parent_ann)
+inline bool add_annotation(das::Module *module, TAnnotation *ann, TParentAnnotation *parent_ann)
 {
   bool result = module->addAnnotation(ann);
   if (result)
-    ann->from(parent_ann.get());
+    ann->from(parent_ann);
   return result;
 }
 

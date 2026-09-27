@@ -254,14 +254,19 @@ macro USE_DAGDP_COMMON_HEIGHTMAP(isStage1)
 
       GroupMemoryBarrierWithGroupSync();
 
-      uint baseInstanceOffset = g_storage[rInfo.baseThreadId];
+      // branchless mask out Out-Of-Range address error when rInfo.baseThreadId == ~0
+      uint baseInstanceOffset = g_storage[rInfo.baseThreadId & (TILE_INSTANCE_COUNT - 1)];
       BRANCH
       if (isPlaced && baseInstanceOffset != ~0u)
       {
         uint instanceElementOffset = 4 * (allocRegion.instanceBaseIndex + baseInstanceOffset + rInfo.offset); // TODO: float4, float4x3
         ##assert(allocRegion.capacity > baseInstanceOffset + rInfo.offset, "capacity %d must be greater than offset %d + %d. (count = %d)", allocRegion.capacity, baseInstanceOffset, rInfo.offset, rInfo.count);
 
-        writeInstance(placeable, pd.position, pd.surfaceNormal, stablePos, randScale, instanceElementOffset, extra);
+        float3 randRot;
+        randRot.x = stableRand(stablePos, prng_seed_yaw);
+        randRot.y = stableRand(stablePos, prng_seed_pitch);
+        randRot.z = stableRand(stablePos, prng_seed_roll);
+        writeInstance(placeable, pd.position, pd.surfaceNormal, randRot, randScale, instanceElementOffset, extra);
       }
     }
   }

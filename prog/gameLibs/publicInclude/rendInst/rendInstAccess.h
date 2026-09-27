@@ -10,11 +10,13 @@
 #include <math/dag_bounds3.h>
 #include <vecmath/dag_vecMathDecl.h>
 #include <dag/dag_vector.h>
+#include <generic/dag_carray.h>
 
 // The functions in this file provide access to various properties of rendInsts.
 
 class CollisionResource;
 class RenderableInstanceLodsResource;
+class DynamicPhysObjectData;
 struct RendInstGenData;
 struct RiGenVisibility;
 
@@ -50,27 +52,51 @@ struct AutoLockWritePrimaryAndExtra
 };
 
 int getRIGenMaterialId(const RendInstDesc &desc, bool need_lock = true);
+// Destruction strings of the pool, never null ("" when unset). They are owned by the pool
+// props, so use the result inside the call and never store it. Read without riRwCs, like
+// the other pool prop readers on the destruction paths (see rendinst::fillTreeInstData).
+const char *getRIGenDestrPropsTag(const RendInstDesc &desc);
+const char *getRIGenDestrPropsDestroyedByTag(const RendInstDesc &desc);
+const char *getRIGenDestrPropsFxTemplate(const RendInstDesc &desc);
+bool getRIGenOverrideMaterialForTraces(const RendInstDesc &desc, bool need_lock = true);
 bool getRIGenCanopyBBox(const RendInstDesc &desc, const TMatrix &tm, BBox3 &out_canopy_bbox, bool need_lock = true);
+int getRIGenCanopyShape(const RendInstDesc &desc);
 CollisionResource *getRIGenCollInfo(const RendInstDesc &desc);
 void *getCollisionResourceHandle(const RendInstDesc &desc);
 const CollisionResource *getRiGenCollisionResource(const RendInstDesc &desc);
+const DynamicPhysObjectData *getRIGenDestroyedPhysRes(const RendInstDesc &desc);
 bool isRIGenPosInst(const RendInstDesc &desc);
 bool isRIGenOnlyPosInst(int layer_ix, int pool_ix);
 bool isDestroyedRIExtraFromNextRes(const RendInstDesc &desc);
 bool isValidRILayerAndPool(const RendInstDesc &desc);
 int getRIExtraNextResIdx(int pool_id);
 
+const char *getRIGenResNameByPool(int layer, int pool);
+
 TMatrix getRIGenMatrix(const RendInstDesc &desc);
 // Assumes that everything required is already locked
 TMatrix getRIGenMatrixNoLock(const RendInstDesc &desc);
-TMatrix getRIGenMatrixDestr(const RendInstDesc &desc);
 const char *getRIGenResName(const RendInstDesc &desc);
 const char *getRIGenDestrName(const RendInstDesc &desc);
 const char *getRIGenDestrFxTemplateName(const RendInstDesc &desc);
 bool isRIGenDestr(const RendInstDesc &desc);
 
+struct RendInstBufferData
+{
+  // in case of RI extra it also holds restorable cellIdx and offs
+  RendInstDesc desc;
+  mat44f tm;
+  union
+  {
+    carray<int16_t, 12> data;
+    carray<int32_t, 15 + 1> riExUserData; // last element is word count
+  };
+};
+bool fillRendInstBufferData(const RendInstDesc &desc, RendInstBufferData &out_buffer);
+
 int getRIGenStrideRaw(int layer_idx, int pool_id);
 int getRIGenStride(int layer_idx, int cell_id, int pool_id);
+BBox3 getRIGenCellBBox(int layer_idx, int cell_idx);
 Point4 getRIGenBSphere(const RendInstDesc &desc);
 BBox3 getRIGenBBox(const RendInstDesc &desc);
 BBox3 getRIGenFullBBox(const RendInstDesc &desc);
@@ -95,14 +121,23 @@ bool ri_gen_has_collision(const RendInstDesc &ri_desc);
 
 RendInstDesc get_restorable_desc(const RendInstDesc &ri_desc);
 int find_restorable_data_index(const RendInstDesc &desc);
+bool resolve_rigen_desc_subcell(RendInstDesc &desc);
 
 RenderableInstanceLodsResource *getRIGenRes(RendInstGenData *rgl, const RendInstDesc &desc);
 RenderableInstanceLodsResource *getRIGenRes(int layer_ix, int pool_ix);
+// the pool res with a ref taken, or null while riGen loads (the fill holds no lock;
+// outside the isLoading window the tables only append). delRef when done. out_res_name,
+// when asked for, is set whenever the pool exists, even with a null res (a dedicated
+// build pool); the chars live only as long as the layer, so use them in place
+RenderableInstanceLodsResource *getRIGenResAddRef(int layer_ix, int pool_ix, const char **out_res_name = nullptr);
+int getRIGenLayersCount();
+int getRIGenPoolsCount(int layer_ix); // 0 when the layer is absent or not loaded yet
 
 using RiGenIterator = void (*)(int layer_ix, int pool_ix, int lod_ix, int last_lod_ix, bool impostor, mat44f_cref tm,
-  const E3DCOLOR *colors, uint32_t bvh_id, void *user_data);
+  const E3DCOLOR *colors, uint32_t bvh_id, uint64_t unique_id, void *user_data, uint32_t palette_id);
 void foreachRiGenInstance(RiGenVisibility *visibility, RiGenIterator callback, void *user_data, const dag::Vector<uint32_t> &accel1,
-  const dag::Vector<uint64_t> &accel2, volatile int &cursor1, volatile int &cursor2, bool simplified_impostor_matrix);
+  const dag::Vector<uint64_t> &accel2, volatile int &cursor1, volatile int &cursor2, bool simplified_impostor_matrix,
+  bool &early_termination);
 void build_ri_gen_thread_accel(RiGenVisibility *visibility, dag::Vector<uint32_t> &accel1, dag::Vector<uint64_t> &accel2);
 
 } // namespace rendinst

@@ -46,7 +46,7 @@ float4 hierarchRayMarch(float2 rayStart_uv, float3 R, float linear_roughness, fl
   float3 rayStepScreen = rayEndScreen - rayStartScreen;
 
   // calculate border of screen
-  float3 screenBorder = (rayStepScreen >= 0) ? float3(1, 1, 1) : float3(-1, -1, 0);
+  float3 screenBorder = select(rayStepScreen >= 0, float3(1, 1, 1), float3(-1, -1, 0));
   float3 bScale = (screenBorder - rayStartScreen) / rayStepScreen;
   float borderScale = min3(bScale.x, bScale.y, bScale.z);
   rayStepScreen *= borderScale;
@@ -83,7 +83,7 @@ float4 hierarchRayMarch(float2 rayStart_uv, float3 R, float linear_roughness, fl
 
     bool4 toleranceUpResult = bool4(depthDiff > compareToleranceUp);
 
-    bool4 hasHit = bool4(depthDiff < 0) && toleranceUpResult;
+    bool4 hasHit = and(bool4(depthDiff < 0), toleranceUpResult);
 
     useHitHack = useHitHack || any(!toleranceUpResult);
 
@@ -102,7 +102,7 @@ float4 hierarchRayMarch(float2 rayStart_uv, float3 R, float linear_roughness, fl
     else
     {
       sampleNormDistT += 4.0 * traceStep;
-      levelToSample = min(levelToSample + 1, 2);
+      levelToSample = min(levelToSample + 1, 1); // using mip level 2 produces noticable artefacts in hangar (bridge refl)
     }
   }
 
@@ -147,11 +147,11 @@ half4 sample_vignetted_color(float3 hit_uv_z, float fade, float linear_roughness
   BRANCH
   if (fade>0)
   {
-    result.rgb = tex2Dlod(prev_frame_tex, float4(sampleUV.xy, 0, 0*TXlod)).rgb;
+    result.rgb = tex2Dlod(prev_frame_tex, float4(sampleUV.xy, 0, 0 * TXlod)).rgb;
     result.a = 1;
     float2 vignette = saturate(abs(screenPos) * 10 - 9);
 
-    result *= saturate(1.0 - dot(vignette, vignette));
+    result.a *= saturate(1.0 - dot(vignette, vignette)); // only .a - don't want black to creep into color
     result.rgb = max(result.rgb, 0.0);
     result *= fade;
   }
@@ -174,9 +174,11 @@ float brdf_G_GGX(float3 n, float3 v, float linear_roughness)
 
 half4 performSSR(uint2 pixelPos, float2 UV, float linear_roughness, float3 N,
                  float linearDepth, float3 cameraToPoint, float4x4 viewProjNoOfsTm,
-                 inout float depth, out float ssrRawDepth)
+                 inout float depth, out float ssrRawDepth, out float2 hitUV, out float hitValid)
 {
   half4 result = 0;
+  hitUV = UV;
+  hitValid = 0;
 
   float3 originToPoint = cameraToPoint;
   originToPoint = normalize(originToPoint);
@@ -192,6 +194,8 @@ half4 performSSR(uint2 pixelPos, float2 UV, float linear_roughness, float3 N,
   BRANCH if (hit_uv_z_fade.w > 0)
   {
     result = sample_vignetted_color(hit_uv_z_fade.xyz, hit_uv_z_fade.w, linear_roughness);
+    hitUV = hit_uv_z_fade.xy;
+    hitValid = 1;
   }
   depth = hit_uv_z_fade.z;
 

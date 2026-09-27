@@ -76,7 +76,7 @@ bool ProjectSettingsDlg::onOk()
 
 //==============================================================================
 
-long ProjectSettingsDlg::onChanging(int pcb_id, PropPanel::ContainerPropertyControl *panel)
+long ProjectSettingsDlg::onChanging(int pcb_id, PropPanel::ContainerPropertyControl *)
 {
   if (externalTab)
     externalTab->fixPath(pcb_id);
@@ -95,7 +95,7 @@ void ProjectSettingsDlg::onChange(int pcb_id, PropPanel::ContainerPropertyContro
 }
 
 
-void ProjectSettingsDlg::onClick(int pcb_id, PropPanel::ContainerPropertyControl *panel)
+void ProjectSettingsDlg::onClick(int, PropPanel::ContainerPropertyControl *)
 {
   if (lightTab)
     lightTab->onApply();
@@ -188,7 +188,6 @@ bool PsExternalTab::onOkPressed()
     if ((bool)app->getPluginData(i)->externalSource != checked || app->getPluginData(i)->externalPath != fn)
     {
       const char *name = app->getPlugin(i)->getInternalName();
-      String dir, fname;
 
       if (needSave)
         if (!app->getPluginData(i)->externalSource || !app->getPluginData(i)->externalPath.length())
@@ -203,7 +202,6 @@ bool PsExternalTab::onOkPressed()
 
       app->getPlugin(i)->clearObjects();
 
-      String path(256, "%s/%s/", (const char *)dir, name);
       DataBlock blk(DAGORED2->getPluginFilePath(app->getPlugin(i), name) + ".plugin.blk");
 
       app->getPlugin(i)->loadObjects(blk, DataBlock(), DAGORED2->getPluginFilePath(app->getPlugin(i), "."));
@@ -232,7 +230,7 @@ void PsExternalTab::fixPath(int pcb_id)
 }
 
 
-int PsExternalTab::handleEvent(int pcb_id, PropPanel::ContainerPropertyControl *panel)
+int PsExternalTab::handleEvent(int pcb_id, PropPanel::ContainerPropertyControl *)
 {
   IDagorEd2Engine *app = IDagorEd2Engine::get();
   G_ASSERT(app && "PsExternalTab::handleEvent: app is NULL!!!");
@@ -430,7 +428,7 @@ void PsLightTab::onApply()
 
 
 //==============================================================================
-int PsLightTab::handleEvent(int pcb_id, PropPanel::ContainerPropertyControl *panel)
+int PsLightTab::handleEvent(int pcb_id, PropPanel::ContainerPropertyControl *)
 {
   switch (pcb_id)
   {
@@ -498,7 +496,6 @@ bool MiscTab::onOkPressed()
     case TEXQUALITY_RADIO_UL_ID: ::dgs_tex_quality = ddstexture::quality_UltraLow; break;
   }
 
-  bool setShaderVar = false;
   bool mbShown = false;
 
   if (old != ::dgs_tex_quality)

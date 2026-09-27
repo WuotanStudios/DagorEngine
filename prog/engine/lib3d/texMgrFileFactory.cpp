@@ -88,15 +88,12 @@ BaseTexture *FileTextureFactory::createTexture(TEXTUREID id)
 
     logmessage(df_is_fname_url_like(textureName.c_str()) ? LOGLEVEL_WARN : LOGLEVEL_ERR, "missing texture '%s'", textureName.c_str());
 
+    // acquire returns the shared d3dRes; the ref is released in releaseTexture()
     BaseTexture *t = ::acquire_managed_tex(missingTexId);
     texmgr_internal::acquire_texmgr_lock();
     if (!missingTex)
-    {
       missingTex = t;
-      t = NULL;
-    }
     texmgr_internal::release_texmgr_lock();
-    del_d3dres(t);
     return missingTex;
   }
 
@@ -107,6 +104,11 @@ BaseTexture *FileTextureFactory::createTexture(TEXTUREID id)
 // Release created texture
 void FileTextureFactory::releaseTexture(BaseTexture *texture, TEXTUREID id)
 {
+  using texmgr_internal::RMGR;
+  int idx = RMGR.toIndex(id);
+  if (idx >= 0)
+    RMGR.exchangeD3dRes(idx, nullptr, texture);
+
   if (texture == missingTex && id != missingTexId)
   {
     // it's replacement for missing texture, free missingTex instead
@@ -114,11 +116,8 @@ void FileTextureFactory::releaseTexture(BaseTexture *texture, TEXTUREID id)
     return;
   }
 
-  using texmgr_internal::RMGR;
-  int idx = RMGR.toIndex(id);
-  if (RMGR.texDesc[idx].dim.stubIdx >= 0)
+  if (idx >= 0 && RMGR.texDesc[idx].dim.stubIdx >= 0)
   {
-    RMGR.setD3dRes(idx, nullptr);
     if (RMGR.resQS[idx].isReading())
       RMGR.cancelReading(idx);
     RMGR.markUpdated(idx, 0);

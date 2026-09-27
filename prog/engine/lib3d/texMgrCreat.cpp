@@ -8,6 +8,7 @@
 #include <debug/dag_log.h>
 #include <debug/dag_debug.h>
 #include <osApiWrappers/dag_atomic.h>
+#include <util/dag_finally.h>
 #include <util/dag_string.h>
 
 using namespace texmgr_internal;
@@ -31,15 +32,15 @@ D3dResource *acquire_managed_res(D3DRESID rid)
       return NULL;
     }
 
+    TEX_REC_LOCK();
     rc = RMGR.incRefCount(idx);
     auto d3dRes = RMGR.getD3dRes(idx);
     auto f = RMGR.getFactory(idx);
+    if (rc == 1 && d3dRes && f)
+      RMGR.decReadyForDiscardTex(idx);
+    TEX_REC_UNLOCK();
     if (d3dRes || (!f && rc > 1))
-    {
-      if (rc == 1 && f)
-        RMGR.decReadyForDiscardTex(idx);
       return d3dRes;
-    }
 
     if (!f)
     {
@@ -123,7 +124,8 @@ void release_managed_res_impl(D3DRESID rid, D3dResource *cmp)
   if (idx < 0)
     return;
 
-  int new_rc = RMGR.decRefCount(idx) & ~RMGR.RCBIT_FOR_REMOVE;
+  int new_rc = RMGR.getFactory(idx) ? RMGR.decRefCountAndIncReadyForDiscardTex(idx) : (RMGR.decRefCount(idx) & ~RMGR.RCBIT_FOR_REMOVE);
+
   if (new_rc > 0)
     return;
 
@@ -150,7 +152,6 @@ void release_managed_res_impl(D3DRESID rid, D3dResource *cmp)
   {
     // release original texture if needed
     TEX_REC_LOCK();
-    RMGR.incReadyForDiscardTex(idx);
     if (should_release_tex(RMGR.baseTexture(idx)) || RMGR.isScheduledForRemoval(idx))
     {
       TEX_REC_UNLOCK();
@@ -193,7 +194,7 @@ void discard_unused_managed_texture(TEXTUREID tid)
     if (t)
     {
       RMGR.decReadyForDiscardTex(idx);
-      RMGR.changeTexUsedMem(idx, 0, 0);
+      RMGR.changeTexUsedMem(idx, 0, 0, 0);
     }
 
     if (!t || t->getTID() == BAD_TEXTUREID) // only for non-texPackMgr2
@@ -215,17 +216,17 @@ bool texmgr_internal::evict_managed_tex_and_id(TEXTUREID tid)
 
   int idx = tid.index();
   acquire_texmgr_lock();
+  FINALLY([&] { release_texmgr_lock(); });
 
   int rc = RMGR.getRefCount(idx);
   if (rc < 0)
   {
-    release_texmgr_lock();
     DEV_FATAL("remove already removed texture 0x%x", tid);
     return false;
   }
 
-  bool ret = false;
-  if (rc == 0 || rc == RMGR.RCBIT_FOR_REMOVE)
+  auto canEvict = [&] { return rc == 0 || rc == RMGR.RCBIT_FOR_REMOVE; };
+  if (canEvict())
   {
     // if (RMGR.isScheduledForRemoval(idx))
     //   debug("[TEXMGR] remove (delayed) tex 0x%x, current ref = %d, ptr = %p",
@@ -241,6 +242,16 @@ bool texmgr_internal::evict_managed_tex_and_id(TEXTUREID tid)
       discard_unused_managed_texture(tid);
       TEX_REC_LOCK();
     }
+    // re-read under rec_lock, streaming takes refs under it alone and can land in the window
+    rc = RMGR.getRefCount(idx);
+    // a ref that appears here is usually transient streaming work; scheduling removal would strand
+    // the entry (only a user release resumes it), so keep it alive instead
+    if (!canEvict())
+    {
+      logwarn("[TEXMGR] evict 0x%x(%s) skipped: ref appeared, rc=%d", tid, RMGR.getName(idx), rc & ~RMGR.RCBIT_FOR_REMOVE);
+      return false;
+    }
+
     if (auto f = RMGR.getFactory(idx))
       f->onUnregisterTexture(tid);
     else if (auto res = RMGR.getD3dResRelaxed(idx))
@@ -257,7 +268,8 @@ bool texmgr_internal::evict_managed_tex_and_id(TEXTUREID tid)
     RMGR.clearReleasedRec(idx);
     RMGR.markUpdated(idx, 0);
     RMGR.releaseEntry(idx);
-    ret = true;
+
+    return true;
   }
   else
   {
@@ -266,11 +278,8 @@ bool texmgr_internal::evict_managed_tex_and_id(TEXTUREID tid)
     logerr("[TEXMGR] QUEUE for remove texId=0x%x(%s), current refCount=%d, ptr=%p", tid, RMGR.getName(idx),
       RMGR.getRefCount(idx) & ~RMGR.RCBIT_FOR_REMOVE, RMGR.getD3dRes(idx));
     // debug_dump_stack();
-    ret = false;
+    return false;
   }
-  release_texmgr_lock();
-
-  return ret;
 }
 bool evict_managed_tex_id(TEXTUREID &id)
 {
@@ -341,12 +350,14 @@ static void texmgr_before_device_reset(bool full_reset)
           if (t->getTID() == BAD_TEXTUREID) // skip non-texPackMgr2 textures
             continue;
         // debug("%s: ldLev=%d -> 1", RMGR.getName(idx), RMGR.resQS[idx].getLdLev());
+        RMGR.incRefCountAndDecReadyForDiscardTex(idx);
         RMGR.resQS[idx].setMaxReqLev(
-          (RMGR.getRefCount(idx) > 0) ? min(RMGR.resQS[idx].getLdLev(), RMGR.getLevDesc(idx, TQL_base)) : 1);
+          (RMGR.getRefCount(idx) > 1) ? min(RMGR.resQS[idx].getLdLev(), RMGR.getLevDesc(idx, TQL_base)) : 1);
         RMGR.resQS[idx].setLdLev(1);
         RMGR.resQS[idx].setCurQL(TQL_stub);
-        RMGR.changeTexUsedMem(idx, 0, 0);
+        RMGR.changeTexUsedMem(idx, 0, 0, 0);
         cnt++;
+        RMGR.decRefCountAndIncReadyForDiscardTex(idx);
       }
     }
   debug("texmgr: reset ldState for %d managed textures", cnt);

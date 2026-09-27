@@ -6,15 +6,20 @@
 
 #include <sys/stat.h>
 
-#if defined(_MSC_VER)
-
+// Three header buckets:
+//   _WIN32       — io.h / direct.h        (every Windows toolchain via MS CRT)
+//   !_MSC_VER    — dirent.h / unistd.h    (POSIX shims; mingw-w64 ships them)
+//   !_WIN32      — libgen.h / sys/mman.h  (pure POSIX, absent on Windows)
+#if defined(_WIN32)
 #include <io.h>
 #include <direct.h>
-
-#else
-#include <libgen.h>
+#endif
+#if !defined(_MSC_VER)
 #include <dirent.h>
 #include <unistd.h>
+#endif
+#if !defined(_WIN32)
+#include <libgen.h>
 #include <sys/mman.h>
 #endif
 #endif
@@ -28,14 +33,22 @@ namespace das {
 
 #if !DAS_NO_FILEIO
 
+    // 64-bit-size stat: MSVC's plain `struct stat` is _stat64i32 (32-bit st_size), and its
+    // stat/fstat FAIL with EOVERFLOW on files >2GB — an 8GB GGUF stat'd as absent/unmappable.
+#if defined(_WIN32)
+    typedef struct _stat64 das_filestat;
+#else
+    typedef struct stat das_filestat;
+#endif
+
     struct FStat {
-        struct stat stats;
+        das_filestat stats;
         bool        is_valid;
         uint64_t size() const   { return stats.st_size; }
         Time     atime() const  { return { stats.st_atime }; }
         Time     ctime() const  { return { stats.st_ctime }; }
         Time     mtime() const  { return { stats.st_mtime }; }
-#if defined(_MSC_VER)
+#if defined(_WIN32)
         bool     is_reg() const { return stats.st_mode & _S_IFREG; }
         bool     is_dir() const { return stats.st_mode & _S_IFDIR; }
 #else
@@ -43,39 +56,109 @@ namespace das {
         bool     is_dir() const { return S_ISDIR(stats.st_mode); }
 #endif
     };
+#else
+    // No filesystem: keep FStat a complete type so fio_core registers the same
+    // API. Queries are never populated (builtin_stat/fstat are stubs).
+    struct FStat {
+        bool     is_valid = false;
+        uint64_t size() const   { return 0; }
+        Time     atime() const  { return Time{}; }
+        Time     ctime() const  { return Time{}; }
+        Time     mtime() const  { return Time{}; }
+        bool     is_reg() const { return false; }
+        bool     is_dir() const { return false; }
+    };
 #endif
 
-    const FILE * builtin_fopen  ( const char * name, const char * mode );
-    void builtin_fclose ( const FILE * f, Context * context, LineInfoArg * at );
-    void builtin_fflush ( const FILE * f, Context * context, LineInfoArg * at );
-    void builtin_fprint ( const FILE * f, const char * text, Context * context, LineInfoArg * at );
-    char * builtin_fread ( const FILE * _f, Context * context, LineInfoArg * at );
-    char* builtin_fgets(const FILE* _f, Context* context, LineInfoArg * at );
-    void builtin_fwrite(const FILE * _f, char * str, Context * context, LineInfoArg * at );
-    bool builtin_feof(const FILE* _f);
-    int64_t builtin_ftell ( const FILE * f, Context * context, LineInfoArg * at );
-    int64_t builtin_fseek ( const FILE * f, int64_t offset, int32_t mode, Context * context, LineInfoArg * at );
-    vec4f builtin_read ( Context &, SimNode_CallBase * call, vec4f * args );
-    vec4f builtin_write ( Context &, SimNode_CallBase * call, vec4f * args );
-    vec4f builtin_load ( Context & context, SimNode_CallBase *, vec4f * args );
-    void builtin_map_file ( const FILE* _f, const TBlock<void, TTemporary<TArray<uint8_t>>>& blk, Context*, LineInfoArg * at );
-    char * builtin_dirname ( const char * name, Context * context, LineInfoArg * at );
-    char * builtin_basename ( const char * name, Context * context, LineInfoArg * at );
-    bool builtin_fstat ( const FILE * f, FStat & fs, Context * context, LineInfoArg * at );
-    bool builtin_stat ( const char * filename, FStat & fs );
-    void builtin_dir ( const char * path, const Block & fblk, Context * context, LineInfoArg * at );
-    bool builtin_mkdir ( const char * path );
-    bool builtin_chdir ( const char * path );
-    char * builtin_getcwd ( Context * context, LineInfoArg * at );
-    const FILE * builtin_stdin();
-    const FILE * builtin_stdout();
-    const FILE * builtin_stderr();
-    int builtin_popen ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
-    int builtin_popen_binary ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
-    char * get_full_file_name ( const char * path, Context * context, LineInfoArg * );
-    bool builtin_remove_file ( const char * path );
-    bool builtin_rename_file ( const char * old_path, const char * new_path );
-    bool has_env_variable ( const char * var, Context * context, LineInfoArg * at );
-    char * get_env_variable ( const char * var, Context * context, LineInfoArg * at );
-    char * sanitize_command_line ( const char * cmd, Context * context, LineInfoArg * at );
+    DAS_API const FILE * builtin_fopen  ( const char * name, const char * mode, Context * context, LineInfoArg * at );
+    DAS_API void builtin_fclose ( const FILE * f, Context * context, LineInfoArg * at );
+    DAS_API void builtin_fflush ( const FILE * f, Context * context, LineInfoArg * at );
+    DAS_API void builtin_fprint ( const FILE * f, const char * text, Context * context, LineInfoArg * at );
+    DAS_API char * builtin_fread ( const FILE * _f, Context * context, LineInfoArg * at );
+    DAS_API char* builtin_fgets(const FILE* _f, Context* context, LineInfoArg * at );
+    DAS_API void builtin_fwrite(const FILE * _f, char * str, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_feof(const FILE* _f);
+    DAS_API int64_t builtin_ftell ( const FILE * f, Context * context, LineInfoArg * at );
+    DAS_API int64_t builtin_fseek ( const FILE * f, int64_t offset, int32_t mode, Context * context, LineInfoArg * at );
+    DAS_API vec4f builtin_read ( Context &, SimNode_CallBase * call, vec4f * args );
+    DAS_API vec4f builtin_write ( Context &, SimNode_CallBase * call, vec4f * args );
+    DAS_API vec4f builtin_read64 ( Context &, SimNode_CallBase * call, vec4f * args );
+    DAS_API vec4f builtin_write64 ( Context &, SimNode_CallBase * call, vec4f * args );
+    DAS_API vec4f builtin_load ( Context & context, SimNode_CallBase *, vec4f * args );
+    DAS_API void builtin_map_file ( const FILE* _f, const TBlock<void, TTemporary<TArray<uint8_t>>>& blk, Context*, LineInfoArg * at );
+    DAS_API void * builtin_fmap_open ( const char * name, uint64_t * size, Context * context, LineInfoArg * at );
+    DAS_API void * builtin_fmap_open_rw ( const char * name, uint64_t * size, Context * context, LineInfoArg * at );
+    DAS_API void builtin_fmap_close ( void * data, uint64_t size, Context * context, LineInfoArg * at );
+    DAS_API void * builtin_dwrite_open ( const char * name, uint64_t total_bytes, uint64_t band_bytes, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_dwrite_append ( void * h, void * data, uint64_t bytes, Context * context, LineInfoArg * at );
+    DAS_API void * builtin_dwrite_band ( void * h, uint64_t * avail, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_dwrite_commit ( void * h, uint64_t bytes, Context * context, LineInfoArg * at );
+    DAS_API uint64_t builtin_dwrite_stat ( void * h, int32_t which, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_dwrite_close ( void * h, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_prefetch_map ( void * base, uint64_t bytes, Context * context, LineInfoArg * at );
+    DAS_API char * builtin_dirname ( const char * name, Context * context, LineInfoArg * at );
+    DAS_API char * builtin_basename ( const char * name, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_fstat ( const FILE * f, FStat & fs, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_stat ( const char * filename, FStat & fs );
+    DAS_API void builtin_dir ( const char * path, const Block & fblk, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_mkdir ( const char * path );
+    DAS_API bool builtin_chdir ( const char * path );
+    DAS_API char * builtin_getcwd ( Context * context, LineInfoArg * at );
+    DAS_API const FILE * builtin_stdin();
+    DAS_API const FILE * builtin_stdout();
+    DAS_API const FILE * builtin_stderr();
+    DAS_API bool builtin_is_terminal ( int32_t fd );
+    DAS_API int32_t builtin_terminal_width ();
+    DAS_API int builtin_popen ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
+    DAS_API int builtin_popen_binary ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
+    DAS_API int builtin_popen_timeout ( const char * cmd, float timeout_sec, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
+    DAS_API bool builtin_spawn_argv ( const Array & args_arr, Context * context, LineInfoArg * at );
+    DAS_API int builtin_popen_argv ( const Array & args_arr, float timeout_sec, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at );
+    DAS_API int builtin_popen_argv_pipe ( const Array & args_arr, const TBlock<void,const FILE *,const FILE *> & blk, Context * context, LineInfoArg * at );
+    DAS_API char * get_full_file_name ( const char * path, Context * context, LineInfoArg * );
+    DAS_API char * builtin_resolve_this_module_dir ( const char * baked_path, bool standalone, Context * context );
+    DAS_API bool builtin_remove_file ( const char * path );
+    DAS_API bool builtin_rename_file ( const char * old_path, const char * new_path );
+    DAS_API bool builtin_rmdir ( const char * path );
+    DAS_API bool builtin_fexist ( const char * path );
+    DAS_API bool builtin_rmdir_rec ( const char * path );
+    DAS_API bool has_env_variable ( const char * var, Context * context, LineInfoArg * at );
+    DAS_API char * get_env_variable ( const char * var, Context * context, LineInfoArg * at );
+    DAS_API void set_env_variable ( const char * var, const char * value, Context * context, LineInfoArg * at );
+    DAS_API char * sanitize_command_line ( const char * cmd, Context * context, LineInfoArg * at );
+    // filesystem operations (C++17 <filesystem>)
+    struct DiskSpaceInfo {
+        uint64_t capacity = 0;
+        uint64_t free = 0;
+        uint64_t available = 0;
+    };
+    // path manipulation
+    DAS_API char * builtin_fs_extension ( const char * path, Context * context, LineInfoArg * at );
+    DAS_API char * builtin_fs_stem ( const char * path, Context * context, LineInfoArg * at );
+    DAS_API char * builtin_fs_replace_extension ( const char * path, const char * new_ext, Context * context, LineInfoArg * at );
+    DAS_API char * builtin_fs_join ( const char * a, const char * b, Context * context, LineInfoArg * at );
+    DAS_API char * builtin_fs_normalize ( const char * path, Context * context, LineInfoArg * at );
+    DAS_API bool   builtin_fs_is_absolute ( const char * path );
+    DAS_API char * builtin_fs_relative ( const char * path, const char * base, char * & error, Context * context, LineInfoArg * at );
+    DAS_API char * builtin_fs_parent ( const char * path, Context * context, LineInfoArg * at );
+    // file queries
+    DAS_API int64_t builtin_fs_file_size ( const char * path, char * & error, Context * context, LineInfoArg * at );
+    DAS_API bool    builtin_fs_equivalent ( const char * a, const char * b, char * & error, Context * context, LineInfoArg * at );
+    DAS_API bool    builtin_fs_is_symlink ( const char * path, char * & error, Context * context, LineInfoArg * at );
+    // file operations
+    DAS_API bool    builtin_fs_copy_file ( const char * src, const char * dst, bool overwrite, char * & error, Context * context, LineInfoArg * at );
+    DAS_API bool    builtin_fs_set_mtime ( const char * path, Time time, char * & error, Context * context, LineInfoArg * at );
+    // directory operations
+    DAS_API void    builtin_fs_dir_rec ( const char * path, const TBlock<void, char *, bool> & blk, char * & error, Context * context, LineInfoArg * at );
+    // system queries
+    DAS_API char *  builtin_fs_temp_directory ( char * & error, Context * context, LineInfoArg * at );
+    DAS_API char *  builtin_fs_create_temp_file ( const char * prefix, const char * ext, char * & error, Context * context, LineInfoArg * at );
+    DAS_API char *  builtin_fs_create_temp_directory ( const char * prefix, char * & error, Context * context, LineInfoArg * at );
+    DAS_API bool    builtin_fs_disk_space ( const char * path, DiskSpaceInfo & info, char * & error, Context * context, LineInfoArg * at );
+    // POSIX operations with error reporting
+    DAS_API bool    builtin_remove_file_ec ( const char * path, char * & error, Context * context, LineInfoArg * at );
+    DAS_API bool    builtin_rename_file_ec ( const char * old_path, const char * new_path, char * & error, Context * context, LineInfoArg * at );
+    DAS_API bool    builtin_mkdir_ec ( const char * path, char * & error, Context * context, LineInfoArg * at );
+    DAS_API bool    builtin_rmdir_ec ( const char * path, char * & error, Context * context, LineInfoArg * at );
+    DAS_API bool    builtin_rmdir_rec_ec ( const char * path, char * & error, Context * context, LineInfoArg * at );
 }

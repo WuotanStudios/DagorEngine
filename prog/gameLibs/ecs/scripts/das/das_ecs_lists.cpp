@@ -6,9 +6,7 @@
 #include <dasModules/dasModulesCommon.h>
 #include <dasModules/aotEcsContainer.h>
 
-#define DECL_LIST_TYPE(lt, t)                   \
-  IMPLEMENT_EXTERNAL_TYPE_FACTORY(lt, ecs::lt); \
-  IMPLEMENT_EXTERNAL_TYPE_FACTORY(Shared##lt, ecs::SharedComponent<ecs::lt>);
+#define DECL_LIST_TYPE(lt, t) IMPLEMENT_EXTERNAL_TYPE_FACTORY(lt, ecs::lt);
 ECS_DECL_LIST_TYPES
 #undef DECL_LIST_TYPE
 
@@ -32,13 +30,21 @@ namespace bind_dascript
     {                                                                                                                            \
       return context.code->makeNode<das::SimNode_CloneRefValueT<ecs::T>>(at, l, r);                                              \
     }                                                                                                                            \
-  };                                                                                                                             \
-  struct T##SharedAnnotation final : das::ManagedStructureAnnotation<ecs::SharedComponent<ecs::T>, false>                        \
-  {                                                                                                                              \
-    T##SharedAnnotation(das::ModuleLibrary &ml) : ManagedStructureAnnotation("Shared" #T, ml)                                    \
+    /* JIT counterpart of simulateClone: without it a clone of this type sends the whole */                                      \
+    /* enclosing function back to the interpreter (the JIT asks the annotation, per type). */                                    \
+    static void jit_clone_list(void *dst, const void *src) { *(ecs::T *)dst = *(const ecs::T *)src; }                            \
+    virtual void *jitGetClone() const override { return (void *)&jit_clone_list; }                                               \
+    virtual void gc_collect(das::gc_root *target, das::gc_root *from) override                                                   \
     {                                                                                                                            \
-      cppName = "ecs::SharedComponent< ::ecs::" #T ">";                                                                          \
-      addPropertyForManagedType<DAS_BIND_MANAGED_PROP(get)>("get");                                                              \
+      das::ManagedVectorAnnotation<ecs::T>::gc_collect(target, from);                                                            \
+      if (parentType)                                                                                                            \
+        parentType->gc_collect(target, from);                                                                                    \
+    }                                                                                                                            \
+    virtual void visitTypeDecls(const das::function<void(das::TypeDecl *)> &cb) override                                         \
+    {                                                                                                                            \
+      das::ManagedVectorAnnotation<ecs::T>::visitTypeDecls(cb);                                                                  \
+      if (parentType)                                                                                                            \
+        cb(parentType);                                                                                                          \
     }                                                                                                                            \
   };
 
@@ -50,10 +56,7 @@ ECS_DECL_LIST_TYPES
 
 void ECS::addList(das::ModuleLibrary &lib)
 {
-#define DECL_LIST_TYPE(lt, t)                          \
-  addAnnotation(das::make_smart<lt##Annotation>(lib)); \
-  addAnnotation(das::make_smart<lt##SharedAnnotation>(lib));
-
+#define DECL_LIST_TYPE(lt, t) addAnnotation(new lt##Annotation(lib));
   ECS_DECL_LIST_TYPES
 #undef DECL_LIST_TYPE
   static constexpr bool is_same = sizeof(das::vector<int>) == sizeof(ecs::List<int>::base_type); // parentType =

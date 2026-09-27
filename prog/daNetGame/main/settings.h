@@ -4,8 +4,14 @@
 #include <EASTL/functional.h>
 #include <startup/dag_loadSettings.h>
 #include <util/dag_oaHashNameMap.h>
+#include <daECS/core/event.h>
 
 class DataBlock;
+
+// Fired synchronously on every settings [re]load right after the game defaults blk is loaded,
+// but before user config / command line are applied: overrides merged here (dgs_apply_config_blk)
+// become defaults that explicit user settings still win over.
+ECS_BROADCAST_EVENT_TYPE(EventOnSettingsLoaded)
 
 String get_config_filename();
 
@@ -33,17 +39,17 @@ const char *get_platform_string();
 
 DataBlock *get_settings_override_blk();
 
+// Per-project overrides re-applied to global settings on every reload (inside
+// load_settings_and_apply_config), so they aren't wiped by save_settings the way a one-shot
+// setBool would be. Pass a populated block at project launch; pass an empty block at project
+// close to drop the overrides. Stored by value, not persisted to disk.
+void dgs_set_project_override_blk(const DataBlock &blk);
+
 // apply changes to config, from commandline, graphics preset
 void dgs_apply_changes_to_config(DataBlock &config_blk, bool need_merge_cmd = false, const OverrideFilter *override_filter = nullptr);
 
 // apply changes by graphics preset name from .patch file
 void dgs_apply_console_preset_params(DataBlock &config_blk, const char *preset_name);
 
-// apply changes by graphics preset name from settings.blk, to avoid waiting for UI (only "essential" params, ie. texture quality)
-void dgs_apply_essential_pc_preset_params(DataBlock &config_blk, const char *preset_name);
-
-// apply preset params (from pcGraphicalPresets) to config, from commandline
-void dgs_apply_essential_pc_preset_params_to_config_from_cmd();
-
-// apply auto graphical settings based on hardware
-void try_apply_auto_graphical_settings();
+// apply changes by graphics preset name from settings.blk
+void dgs_apply_pc_preset_params(DataBlock &config_blk, const char *preset_name);

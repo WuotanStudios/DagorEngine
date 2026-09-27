@@ -4,6 +4,7 @@ include "gbuffer.dshl"
 include "monteCarlo.dshl"
 include "roughToMip.dshl"
 include "camera_in_camera.dshl"
+include "sky_polarization_filter_term_inc.dshl"
 
 include "ssr_use.dshl"
 include "ssr_inc.dshl"
@@ -18,6 +19,7 @@ include "custom_probe_inc.dshl"
 include "world_sdf.dshl"
 include "use_gi.dshl"
 include "reproject_gi.dshl"
+include "ibl_cube_sample.dshl"
 
 int shadow_frame = 0;
 
@@ -26,11 +28,11 @@ texture perlin_noise3d;
 float4 depth_bounds = float4(0, 1, 0, 0);
 float4 hero_cockpit_camera_to_point = (0, 0, 0, 0);
 
-float fake_underwater_attenuation = 0.1;
-
 macro INIT_DAGI_IRRADIANCE_GRID(code)
   hlsl {
     #define DAGI_IRRADIANCE_GRID_TYPE DAGI_IRRADIANCE_GRID_TYPE_IRRADIANCE
+    // Applied lighting will be at least half of the SH1 constant term (ambient).
+    #define DAGI_IRRADIANCE_SH1_MIN_THRESHOLD_AMBIENT_MUL 0.5
   }
   DAGI_IRRADIANCE_GRID_SAMPLE(code)
   DAGI_RAD_GRID_SAMPLE(code)
@@ -81,6 +83,8 @@ macro INIT_AND_USE_DEFERRED_LIGHT_COMMON(code)
   USE_SKYLIGHT_PARAMS(code)
   INIT_SKY_DIFFUSE_BASE(code)
   USE_SKY_DIFFUSE_BASE(code)
+  INIT_SKY_POLARIZATION_FILTER_TERM(code)
+  USE_SKY_POLARIZATION_FILTER_TERM(code)
   INIT_ENVI_SPECULAR_SAMPLE(code)
   USE_ENVI_SPECULAR_SAMPLE(code)
   USE_INDOOR_LIGHT_PROBES(code, false)
@@ -88,10 +92,11 @@ macro INIT_AND_USE_DEFERRED_LIGHT_COMMON(code)
   USE_HDR(code)
   INIT_HDR(code)
 
+  INIT_IBL_CUBE(code)
+  USE_IBL_CUBE(code)
+
   (code) {
     hero_cockpit_camera_to_point@f3 = hero_cockpit_camera_to_point;
-    water_level@f1 = water_level;
-    fake_underwater_attenuation@f1 = fake_underwater_attenuation;
   }
 
   hlsl(code) {
@@ -124,6 +129,7 @@ macro INIT_AND_USE_DEFERRED_LIGHT_COMMON(code)
 
 ##if gi_quality > off
       #define HAS_AMBIENT_TARGET 1
+      #include <dagi_specular_clamp.hlsl>
 ##endif
 
       void ComputeDeferredLight(ProcessedGbuffer gbuffer, float3 worldPos, float rawDepth, float2 viewTexcoord, float2 viewPixcoord,
@@ -146,6 +152,19 @@ macro INIT_AND_USE_DEFERRED_LIGHT_COMMON(code)
         float3 reflectionVec = 2 * NdotV * gbuffer.normal - view;
         float NoV = abs( NdotV ) + 1e-5;
         float ggx_alpha = gbuffer.ggx_alpha;
+
+        BRANCH
+        if (ibl_cube_is_inside != 0 && ibl_cube_pixel_inside(worldPos))
+        {
+          float iblFalloff = ibl_cube_falloff(worldPos);
+          float iblMulSpecular = lerp(ibl_cube_mul_specular_falloff_end, ibl_cube_mul_specular, iblFalloff);
+          float iblMulDiffuse = lerp(ibl_cube_mul_diffuse_falloff_end, ibl_cube_mul_diffuse, iblFalloff);
+          outSpecular = pack_hdr(ibl_cube_sample_specular(reflectionVec, gbuffer.linearRoughness) * iblMulSpecular);
+          outAmbient = pack_hdr(ibl_cube_sample_diffuse(gbuffer.normal) * iblMulDiffuse);
+          outPixelAge = 0;
+          return;
+        }
+
         float3 filteredWorldPos = worldPos;
 
         const float3 noise_speed = float3(0.02,0.03,0.025);
@@ -197,7 +216,6 @@ macro INIT_AND_USE_DEFERRED_LIGHT_COMMON(code)
             ##endif
               #define HAS_CONST_SPECULAR 1
               #define HACK_SPECULAR_BRIGHTNESS 1
-              #define HACK_SPECULAR_BRIGHTNESS_LIMITED 1
               #define HACK_ROUGH_SPECULAR_TO_IRRADIANCE 1
             }
             ##elif (gi_quality == colored)
@@ -210,9 +228,9 @@ macro INIT_AND_USE_DEFERRED_LIGHT_COMMON(code)
             ##elif (gi_quality == only_ao)
               float ofs = max(dist*0.04, 0.25*dagi_sky_vis_probe_size(0));
               float3 filteredWorldPos = worldPos + view*ofs;
-              float4 sh1 = dagi_get_sky_visibility_smooth_sh1(world_view_pos.xyz, filteredWorldPos, view, max(0, dist-ofs), normal, interleavedGradientNoise( viewPixcoord.xy ) );
-              if (all(sh1 != 1))
-                ambient = GetSHFunctionValueSimple(enviLightingNormal, enviSPH0*sh1.wyzx, enviSPH1*sh1.wyzx, enviSPH2*sh1.wyzx);
+              float vignette;
+              float4 sh1 = dagi_get_sky_visibility_smooth_vignette(world_view_pos.xyz, filteredWorldPos, view, max(0, dist-ofs), normal, interleavedGradientNoise( viewPixcoord.xy ), vignette );
+              ambient = lerp(GetSHFunctionValueSimple(enviLightingNormal, enviSPH0*sh1.wyzx, enviSPH1*sh1.wyzx, enviSPH2*sh1.wyzx), ambient, vignette);
               #define HAS_SPECULAR 0
               #define HACK_SPECULAR_BRIGHTNESS 1
             ##endif
@@ -253,29 +271,19 @@ macro INIT_AND_USE_DEFERRED_LIGHT_COMMON(code)
             #if HACK_SPECULAR_BRIGHTNESS
             {
               //fixme: we can and probably should use sh1 for SkyVis and radiance grid for colored GI
-              //another (much faster) fake from Volumetric Global Illumination at Treyarch
-              float mipForTrick = gbuffer.linearRoughness*NUM_PROBE_MIPS;
-              float maximumSpecValue = max3(
               ##if gi_quality == screen_probes
-                4.0,
+              const float minSpecScale = 8.0;
+              ##elif (gi_quality == colored)
+              const float minSpecScale = 4.0;
               ##else
-                1.26816,
+              const float minSpecScale = 1.26816;
               ##endif
-                9.13681 * exp2( 6.85741 - 2 * mipForTrick ) * NdotV,
-                9.70809 * exp2( 7.085 - mipForTrick - 0.403181 * pow2(mipForTrick)) * NdotV );
-              maximumSpecValue = min(maximumSpecValue, 32);//to be removed with envi light probes in rooms
-              float3 adjustedMaxSpec = ambient * maximumSpecValue;
-              float3 reflection = environmentAmbientReflection * (adjustedMaxSpec / ( adjustedMaxSpec + environmentAmbientReflection + 0.001));//avoid nans
-              #if HACK_SPECULAR_BRIGHTNESS_LIMITED
-              //only apply hack to ratehr rough surfaces
-              const float maxRoughnessToUseRadianceHack = 0.8;
-              const float minRoughnessToUseIrradianceHack = 0.9;
-              const float roughnessToIrradianceHackA = rcp(minRoughnessToUseIrradianceHack - maxRoughnessToUseRadianceHack),
-                          roughnessToIrradianceHackB = -maxRoughnessToUseRadianceHack*roughnessToIrradianceHackA;
-              environmentAmbientReflection = lerp(environmentAmbientReflection, reflection, saturate(gbuffer.linearRoughness*roughnessToIrradianceHackA + roughnessToIrradianceHackB));
-              #else
-              environmentAmbientReflection = reflection;
-              #endif
+              float maxSpecScale = dagi_max_specular_scale(gbuffer.linearRoughness, NdotV, minSpecScale, NUM_PROBE_MIPS);
+              ##if gi_quality == screen_probes
+                environmentAmbientReflection = dagi_bound_probe_specular(environmentAmbientReflection, ambient, maxSpecScale);
+              ##else
+                environmentAmbientReflection = dagi_clamp_untrusted_specular(environmentAmbientReflection, ambient, maxSpecScale);
+              ##endif
             }
             #endif
             #if HACK_ROUGH_SPECULAR_TO_IRRADIANCE
@@ -319,9 +327,6 @@ macro INIT_AND_USE_DEFERRED_LIGHT_COMMON(code)
           -pointToEye, viewTexcoord, rawDepth, linearize_z(rawDepth, zn_zfar.zw), outAmbient, roughSpecular, outPixelAge);
         outSpecular = lerp(roughSpecular, outSpecular, saturate(1 - 2*gbuffer.linearRoughness)*0.9);
         ##endif
-        float attenuation = worldPos.y < water_level ? fake_underwater_attenuation : 1.;
-        outAmbient *= attenuation;
-        outSpecular *= attenuation;
         outAmbient = pack_hdr(outAmbient);
         outSpecular = pack_hdr(outSpecular);
       }

@@ -50,6 +50,12 @@ function btn(params) {
   })
 
   mainNode = XmbNode({
+    function onFocus() {
+      vlog($"onFocus {params.text}")
+    }
+    function onBlur() {
+      vlog($"onBlur {params.text}")
+    }
     function onLeave(dir) {
       dlog($"onLeave({dir})")
       if (dir == DIR_LEFT)
@@ -123,7 +129,7 @@ function hPanel() {
       watch = gui_scene.xmbMode
       rendObj = ROBJ_SOLID
       color = gui_scene.xmbMode.get() ? Color(30,30,80) : Color(0,0,50)
-      size = static [sh(40), flex()]
+      size = const [sh(40), flex()]
       flow = FLOW_VERTICAL
       xmbNode = XmbNode({
         canFocus = false

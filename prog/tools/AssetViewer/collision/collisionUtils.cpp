@@ -3,66 +3,98 @@
 #include "collisionUtils.h"
 #include <util/dag_string.h>
 
-bool add_verts_from_node(const dag::ConstSpan<CollisionNode> &nodes, const String &node_name, dag::Vector<Point3_vec4> &verts)
+bool add_verts_from_node(const CollisionResource &collres, const dag::ConstSpan<CollisionNode> &nodes, const String &node_name,
+  dag::Vector<Point3_vec4> &verts)
 {
   for (const auto &node : nodes)
   {
-    if (node_name == node.name.c_str())
+    if (node_name == collres.getNodeName(node.nodeIndex))
     {
-      for (const auto &vertex : node.vertices)
+      if (collres.getNodeVertCount(node.nodeIndex) == 0)
       {
-        verts.push_back(vertex * node.tm);
+        logerr("Node <%s> has no vertices to merge. This node can be used only for box or sphere collision type creation.", node_name);
+        return false; // empty ref: report failure so KDOP/convex preview is not silently built without it
       }
+      const TMatrix &nodeTm = collres.getNodeTm(node.nodeIndex);
+      collres.iterateNodeVerts(node.nodeIndex, [&](int, vec4f v) {
+        Point3_vec4 p;
+        v_st(&p.x, v);
+        verts.push_back(p * nodeTm);
+      });
       return true;
     }
   }
   return false;
 }
 
-bool add_verts_and_indices_from_node(const dag::ConstSpan<CollisionNode> &nodes, const String &node_name, dag::Vector<Point3> &verts,
-  dag::Vector<uint16_t> &indices)
+bool add_verts_and_indices_from_node(const CollisionResource &collres, const dag::ConstSpan<CollisionNode> &nodes,
+  const String &node_name, dag::Vector<Point3> &verts, dag::Vector<uint16_t> &indices)
 {
   for (const auto &node : nodes)
   {
-    if (node_name == node.name.c_str())
+    if (node_name == collres.getNodeName(node.nodeIndex))
     {
-      if (node.vertices.empty())
+      if (collres.getNodeVertCount(node.nodeIndex) == 0)
+      {
         logerr("Node <%s> don't have vertices for merge. This node can be used only for box or sphere collision type creation.",
           node_name);
+        return false; // empty ref: abort the merge so the caller doesn't keep a partial combined node
+      }
+      // 16-bit merged index buffer: faces add the running vert offset, so the cumulative size -- not just
+      // this node -- must stay <= 65536. Bail rather than merge corrupted geometry (the uint32 overload
+      // below handles arbitrarily large nodes).
+      if (verts.size() + collres.getNodeVertCount(node.nodeIndex) > 65536)
+      {
+        logerr("Node <%s> would overflow the 16-bit merged index buffer (have %d verts, node adds %d).", node_name, (int)verts.size(),
+          collres.getNodeVertCount(node.nodeIndex));
+        return false;
+      }
+      const TMatrix &nodeTm = collres.getNodeTm(node.nodeIndex);
       const auto vertsSize = verts.size();
-      for (const auto &vertex : node.vertices)
-      {
-        verts.push_back(vertex * node.tm);
-      }
-      for (const auto index : node.indices)
-      {
-        indices.push_back(index + vertsSize);
-      }
+      collres.iterateNodeVerts(node.nodeIndex, [&](int, vec4f v) {
+        Point3_vec4 p;
+        v_st(&p.x, v);
+        verts.push_back(p * nodeTm);
+      });
+      collres.iterateNodeFaces(node.nodeIndex, [&](int, uint32_t i0, uint32_t i1, uint32_t i2) {
+        indices.push_back(i0 + vertsSize);
+        indices.push_back(i1 + vertsSize);
+        indices.push_back(i2 + vertsSize);
+      });
       return true;
     }
   }
   return false;
 }
 
-bool add_verts_and_indices_from_node(const dag::ConstSpan<CollisionNode> &nodes, const String &node_name, dag::Vector<float> &verts,
-  dag::Vector<unsigned int> &indices)
+bool add_verts_and_indices_from_node(const CollisionResource &collres, const dag::ConstSpan<CollisionNode> &nodes,
+  const String &node_name, dag::Vector<float> &verts, dag::Vector<unsigned int> &indices)
 {
   for (const auto &node : nodes)
   {
-    if (node_name == node.name.c_str())
+    if (node_name == collres.getNodeName(node.nodeIndex))
     {
-      const auto vertsSize = verts.size() / 3;
-      for (const auto &vertex : node.vertices)
+      if (collres.getNodeVertCount(node.nodeIndex) == 0)
       {
-        Point3 vert = vertex * node.tm;
+        logerr("Node <%s> don't have vertices for merge. This node can be used only for box or sphere collision type creation.",
+          node_name);
+        return false; // empty ref: abort the merge so the caller doesn't keep a partial combined node
+      }
+      const TMatrix &nodeTm = collres.getNodeTm(node.nodeIndex);
+      const auto vertsSize = verts.size() / 3;
+      collres.iterateNodeVerts(node.nodeIndex, [&](int, vec4f v) {
+        Point3_vec4 p;
+        v_st(&p.x, v);
+        Point3 vert = p * nodeTm;
         verts.push_back(vert.x);
         verts.push_back(vert.y);
         verts.push_back(vert.z);
-      }
-      for (const auto index : node.indices)
-      {
-        indices.push_back(index + vertsSize);
-      }
+      });
+      collres.iterateNodeFaces(node.nodeIndex, [&](int, uint32_t i0, uint32_t i1, uint32_t i2) {
+        indices.push_back(i0 + vertsSize);
+        indices.push_back(i1 + vertsSize);
+        indices.push_back(i2 + vertsSize);
+      });
       return true;
     }
   }

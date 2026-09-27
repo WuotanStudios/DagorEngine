@@ -4,31 +4,50 @@
 //
 #pragma once
 
-#include <recast.h>
+#include <Recast.h>
 
-#include <detourCommon.h>
-#include <detourNavMesh.h>
-#include <detourTileCache.h>
-#include <detourTileCacheBuilder.h>
-#include <detourNavMeshBuilder.h>
-
+#include <DetourCommon.h>
+#include <DetourNavMesh.h>
+#include <DetourTileCache.h>
+#include <DetourTileCacheBuilder.h>
+#include <DetourNavMeshBuilder.h>
+#include <recastTools/recastTileCacheDetail.h>
+#include <EASTL/bonus/tuple_vector.h>
 #include <EASTL/unique_ptr.h>
+#include <memory/dag_memPtrAllocator.h>
 #include <math/integer/dag_IPoint2.h>
-
-#define MAX_OFFMESH_CONNECTIONS 512
+#include <pathFinder/pathFinder.h> // POLYFLAG_*/POLYAREA_*
 
 namespace recastnavmesh
 {
+
+enum OffMeshCon
+{
+  Verts,
+  Rads,
+  BiDirs,
+  Areas,
+  Flags,
+  Id
+};
+
+// Mark manual links so that runtime rebuild can restore those.
+// Only valid for Tiled navmesh. May collide with other ids in TileCached.
+static constexpr uint32_t MANUAL_JUMPLINK_USER_ID_BIT = 0x80000000U;
+
 struct OffMeshConnectionsStorage
 {
-  float m_offMeshConVerts[MAX_OFFMESH_CONNECTIONS * 3 * 2] = {0};
-  float m_offMeshConRads[MAX_OFFMESH_CONNECTIONS] = {0};
-  unsigned char m_offMeshConDirs[MAX_OFFMESH_CONNECTIONS] = {0};
-  unsigned char m_offMeshConAreas[MAX_OFFMESH_CONNECTIONS] = {0};
-  unsigned short m_offMeshConFlags[MAX_OFFMESH_CONNECTIONS] = {0};
-  unsigned int m_offMeshConId[MAX_OFFMESH_CONNECTIONS] = {0};
-  int m_offMeshConCount = 0;
+  eastl::tuple_vector_alloc<dag::MemPtrAllocator, eastl::pair<Point3, Point3>, float, uint8_t, uint8_t, uint16_t, uint32_t> offMeshCon;
 };
+inline void add_off_mesh_connection(OffMeshConnectionsStorage &storage, const float *spos, const float *epos, float rad,
+  unsigned char bidir, unsigned short flags = pathfinder::POLYFLAG_JUMP, unsigned char area = pathfinder::POLYAREA_JUMP,
+  uint32_t user_id = 0)
+{
+  if (!user_id)
+    user_id = 1000 + storage.offMeshCon.size();
+  storage.offMeshCon.emplace_back(eastl::make_pair(*(const Point3 *)spos, *(const Point3 *)epos), +rad, +bidir, +area, +flags,
+    +user_id);
+}
 
 struct BuildTileData
 {
@@ -97,11 +116,131 @@ struct RecastTileContext
   }
 };
 
+inline bool build_navmesh_tiled_tile_mesh(rcContext &ctx, const rcConfig &cfg, RecastTileContext &tile_ctx,
+  Tab<BuildTileData> &tile_data)
+{
+  tile_ctx.pmesh = rcAllocPolyMesh();
+  if (!tile_ctx.pmesh)
+  {
+    ctx.log(RC_LOG_ERROR, "buildNavigation: Out of memory 'tile_ctx.pmesh'.");
+    tile_ctx.clearIntermediate(&tile_data);
+    return false;
+  }
+  if (!rcBuildPolyMesh(&ctx, *tile_ctx.cset, cfg.maxVertsPerPoly, *tile_ctx.pmesh))
+  {
+    ctx.log(RC_LOG_ERROR, "buildNavigation: Could not triangulate contours.");
+    tile_ctx.clearIntermediate(&tile_data);
+    return false;
+  }
+
+  tile_ctx.dmesh = rcAllocPolyMeshDetail();
+  if (!tile_ctx.dmesh)
+  {
+    ctx.log(RC_LOG_ERROR, "buildNavigation: Out of memory 'pmdtl'.");
+    tile_ctx.clearIntermediate(&tile_data);
+    return false;
+  }
+  if (!rcBuildPolyMeshDetail(&ctx, *tile_ctx.pmesh, *tile_ctx.chf, cfg.detailSampleDist, cfg.detailSampleMaxError, *tile_ctx.dmesh))
+  {
+    ctx.log(RC_LOG_ERROR, "buildNavigation: Could not build detail mesh.");
+    tile_ctx.clearIntermediate(&tile_data);
+    return false;
+  }
+
+  return true;
+}
+
+inline bool finalize_navmesh_tiled_tile(rcContext &ctx, const rcConfig &cfg, OffMeshConnectionsStorage *conn_storage,
+  RecastTileContext &tile_ctx, int tx, int ty, float walkable_height, float walkable_radius, float jump_height,
+  float header_walkable_climb, Tab<BuildTileData> &tile_data, bool save_tile_ctx_data = false)
+{
+  if (!save_tile_ctx_data)
+  {
+    rcFreeCompactHeightfield(tile_ctx.chf);
+    tile_ctx.chf = nullptr;
+    rcFreeContourSet(tile_ctx.cset);
+    tile_ctx.cset = nullptr;
+  }
+
+  if (cfg.maxVertsPerPoly <= DT_VERTS_PER_POLYGON && tile_ctx.pmesh->npolys > 0)
+  {
+    for (int i = 0; i < tile_ctx.pmesh->npolys; ++i)
+      tile_ctx.pmesh->flags[i] = 1;
+
+    dtNavMeshCreateParams params{};
+    params.verts = tile_ctx.pmesh->verts;
+    params.vertCount = tile_ctx.pmesh->nverts;
+    params.polys = tile_ctx.pmesh->polys;
+    params.polyAreas = tile_ctx.pmesh->areas;
+    params.polyFlags = tile_ctx.pmesh->flags;
+    params.polyCount = tile_ctx.pmesh->npolys;
+    params.nvp = tile_ctx.pmesh->nvp;
+    params.detailMeshes = tile_ctx.dmesh->meshes;
+    params.detailVerts = tile_ctx.dmesh->verts;
+    params.detailVertsCount = tile_ctx.dmesh->nverts;
+    params.detailTris = tile_ctx.dmesh->tris;
+    params.detailTriCount = tile_ctx.dmesh->ntris;
+    if (conn_storage && !conn_storage->offMeshCon.empty())
+    {
+      auto offMeshCon0 = conn_storage->offMeshCon.front();
+      params.offMeshConVerts = &eastl::get<OffMeshCon::Verts>(offMeshCon0).first.x; //-V503
+      params.offMeshConRad = &eastl::get<OffMeshCon::Rads>(offMeshCon0);
+      params.offMeshConDir = &eastl::get<OffMeshCon::BiDirs>(offMeshCon0);
+      params.offMeshConAreas = &eastl::get<OffMeshCon::Areas>(offMeshCon0);
+      params.offMeshConFlags = &eastl::get<OffMeshCon::Flags>(offMeshCon0);
+      params.offMeshConUserID = &eastl::get<OffMeshCon::Id>(offMeshCon0);
+      params.offMeshConCount = conn_storage->offMeshCon.size();
+    }
+    params.walkableHeight = walkable_height;
+    params.walkableRadius = walkable_radius;
+    // Why:
+    // jl are culled based on detailed navmesh
+    // It is elevated by cellHeight for some reason: verts[j*3+1] += orig[1] + chf.ch;
+    // But later in the game jl will likely connect to crude navmesh
+    // (if geometry is simple and detailed mesh isn't required)
+    // jumpHeight * 0.5 is based on the highest possible point of a double-jl
+    // params.walkableClimb inflates the culling bbox inside dtCreateNavMeshData, so this is a hack
+    // Since walkableClimb is then assigned to header->walkableClimb, it will have to be modified separately
+    params.walkableClimb = header_walkable_climb + rcMax(cfg.ch, jump_height * 0.5f);
+    params.tileX = tx;
+    params.tileY = ty;
+    params.tileLayer = 0;
+    rcVcopy(params.bmin, tile_ctx.pmesh->bmin);
+    rcVcopy(params.bmax, tile_ctx.pmesh->bmax);
+    params.cs = cfg.cs;
+    params.ch = cfg.ch;
+    params.buildBvTree = false;
+
+    unsigned char *navData = nullptr;
+    int navDataSize = 0;
+    if (!dtCreateNavMeshData(&params, &navData, &navDataSize))
+    {
+      ctx.log(RC_LOG_ERROR, "Could not build Detour navmesh.");
+      tile_ctx.clearIntermediate(&tile_data);
+      return false;
+    }
+    // Surgically revert params.walkableClimb back
+    // This is needed to avoid modifying 3rd party code
+    reinterpret_cast<dtMeshHeader *>(navData)->walkableClimb = header_walkable_climb;
+
+    if (!save_tile_ctx_data)
+      tile_ctx.clearIntermediate(&tile_data);
+    BuildTileData &td = tile_data.push_back() = BuildTileData();
+    td.navMeshData = navData;
+    td.navMeshDataSz = navDataSize;
+    return true;
+  }
+
+  if (!save_tile_ctx_data)
+    tile_ctx.clearIntermediate(&tile_data);
+  return true;
+}
+
 template <class T, class TFunc>
 bool finalize_navmesh_tilecached_tile(rcContext &ctx, const rcConfig &cfg, dtTileCacheAlloc *tcAllocator,
   dtTileCacheCompressor *tcComp, OffMeshConnectionsStorage *conn_storage, RecastTileContext &tile_ctx, int tx, int ty,
-  float walkableClimb, float walkableHeight, float walkableRadius, const T &obstacles, Tab<BuildTileData> &tile_data,
-  TFunc markObstaclesCb)
+  float walkableClimb, float walkableHeight, float walkableRadius, bool include_detailed_data, const T &obstacles,
+  Tab<BuildTileData> &tile_data, TFunc markObstaclesCb)
 {
   tile_ctx.lset = rcAllocHeightfieldLayerSet();
   if (!tile_ctx.lset)
@@ -247,18 +386,20 @@ bool finalize_navmesh_tilecached_tile(rcContext &ctx, const rcConfig &cfg, dtTil
     params.polyFlags = lctx.lmesh->flags;
     params.polyCount = lctx.lmesh->npolys;
     params.nvp = lctx.lmesh->nvp;
-    if (conn_storage)
+
+    if (conn_storage && !conn_storage->offMeshCon.empty())
     {
       // we're feeding offmesh links built for all layers to each separate layer
       // but that's ok, dtCreateNavMeshData will take care of that, it'll strip
       // all offmesh links that don't intersect with this layer.
-      params.offMeshConVerts = conn_storage->m_offMeshConVerts;
-      params.offMeshConRad = conn_storage->m_offMeshConRads;
-      params.offMeshConDir = conn_storage->m_offMeshConDirs;
-      params.offMeshConAreas = conn_storage->m_offMeshConAreas;
-      params.offMeshConFlags = conn_storage->m_offMeshConFlags;
-      params.offMeshConUserID = conn_storage->m_offMeshConId;
-      params.offMeshConCount = conn_storage->m_offMeshConCount;
+      auto offMeshCon0 = conn_storage->offMeshCon.front();
+      params.offMeshConVerts = &eastl::get<OffMeshCon::Verts>(offMeshCon0).first.x; //-V503
+      params.offMeshConRad = &eastl::get<OffMeshCon::Rads>(offMeshCon0);
+      params.offMeshConDir = &eastl::get<OffMeshCon::BiDirs>(offMeshCon0);
+      params.offMeshConAreas = &eastl::get<OffMeshCon::Areas>(offMeshCon0);
+      params.offMeshConFlags = &eastl::get<OffMeshCon::Flags>(offMeshCon0);
+      params.offMeshConUserID = &eastl::get<OffMeshCon::Id>(offMeshCon0);
+      params.offMeshConCount = conn_storage->offMeshCon.size();
     }
     params.walkableHeight = walkableHeight;
     params.walkableRadius = walkableRadius;
@@ -271,6 +412,18 @@ bool finalize_navmesh_tilecached_tile(rcContext &ctx, const rcConfig &cfg, dtTil
     params.cs = cfg.cs;
     params.ch = cfg.ch;
     params.buildBvTree = false;
+
+    TileCacheDetailStorage detailStorage; // Owns memory and must survive till dtCreateNavMeshData
+    if (include_detailed_data)
+    {
+      if (!detailStorage.build(ctx, *lctx.layer, params, cfg.maxSimplificationError, cfg.detailSampleDist, cfg.detailSampleMaxError))
+      {
+        ctx.log(RC_LOG_ERROR, "Could not build tile cache detail mesh.");
+        tile_ctx.clearIntermediate(&tile_data);
+        return false;
+      }
+      detailStorage.apply(params);
+    }
 
     unsigned char *navData = 0;
     int navDataSize = 0;

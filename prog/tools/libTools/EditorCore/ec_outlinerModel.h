@@ -4,7 +4,7 @@
 #include <EditorCore/ec_rendEdObject.h>
 #include <EditorCore/ec_outlinerInterface.h>
 #include <ioSys/dag_dataBlock.h>
-#include <util/dag_string.h>
+#include <util/dag_strUtil.h>
 #include <EASTL/unique_ptr.h>
 #include <EASTL/vector_set.h>
 #include <ska_hash_map/flat_hash_map2.hpp>
@@ -42,6 +42,7 @@ public:
 
   virtual ItemType getType() const = 0;
   virtual const char *getLabel() const = 0;
+  virtual eastl::string_view getLabelStringView() const = 0;
   virtual int getUnfilteredChildCount() const = 0;
   virtual OutlinerTreeItem *getUnfilteredChild(int index) const = 0;
   virtual int getFilteredChildCount() const = 0;
@@ -52,24 +53,28 @@ public:
   {
     G_ASSERT(!tree_item.registeredToFilteredTree);
     tree_item.registeredToFilteredTree = true;
+    markLinearizedTreeItemsDirty();
   }
 
   virtual void removeFromFilteredChildren(OutlinerTreeItem &tree_item)
   {
     G_ASSERT(tree_item.registeredToFilteredTree);
     tree_item.registeredToFilteredTree = false;
+    markLinearizedTreeItemsDirty();
   }
 
   OutlinerTreeItem *getParent() const { return parent; }
-  void setParent(OutlinerTreeItem *in_parent) { parent = in_parent; }
+  void setParent(OutlinerTreeItem *in_parent);
   bool isExpanded() const { return expanded; }
-  void setExpanded(bool in_expanded) { expanded = in_expanded; }
+  void setExpanded(bool in_expanded);
   void setExpandedRecursive(bool in_expanded);
   bool isSelected() const { return selected; }
   void setSelected(bool in_selected);
   bool isRegisteredToFilteredTree() const { return registeredToFilteredTree; }
 
 protected:
+  void markLinearizedTreeItemsDirty();
+
   OutlinerModel &outlinerModel;
 
 private:
@@ -92,6 +97,7 @@ public:
 
   ItemType getType() const override { return ItemType::ObjectAssetName; }
   const char *getLabel() const override { return assetName; }
+  eastl::string_view getLabelStringView() const override { return to_string_view(assetName); }
   int getUnfilteredChildCount() const override { return 0; }
   OutlinerTreeItem *getUnfilteredChild(int index) const override { return nullptr; }
   int getFilteredChildCount() const override { return 0; }
@@ -110,6 +116,7 @@ public:
 
   ItemType getType() const override { return ItemType::Object; }
   const char *getLabel() const override { return renderableEditableObject->getName(); }
+  eastl::string_view getLabelStringView() const override { return renderableEditableObject->getNameStringView(); }
   int getUnfilteredChildCount() const override { return objectAssetNameTreeItem.get() ? 1 : 0; }
   OutlinerTreeItem *getUnfilteredChild(int index) const override { return objectAssetNameTreeItem.get(); }
   int getFilteredChildCount() const override { return objectAssetNameTreeItem.get() ? 1 : 0; }
@@ -121,13 +128,17 @@ public:
     if (object_asset_name && *object_asset_name)
     {
       if (!objectAssetNameTreeItem)
+      {
         objectAssetNameTreeItem.reset(new ObjectAssetNameTreeItem(outlinerModel, this));
+        markLinearizedTreeItemsDirty();
+      }
 
       objectAssetNameTreeItem->assetName = object_asset_name;
     }
     else if (objectAssetNameTreeItem)
     {
       objectAssetNameTreeItem.reset();
+      markLinearizedTreeItemsDirty();
     }
   }
 
@@ -140,7 +151,7 @@ struct ObjectTreeItemLess
 {
   bool operator()(ObjectTreeItem *a, ObjectTreeItem *b) const
   {
-    const int result = strcmp(a->getLabel(), b->getLabel());
+    const int result = a->getLabelStringView().compare(b->getLabelStringView());
     if (result < 0)
       return true;
     else if (result > 0)
@@ -172,6 +183,7 @@ public:
 
   ItemType getType() const override { return ItemType::Layer; }
   const char *getLabel() const override { return layerName; }
+  eastl::string_view getLabelStringView() const override { return to_string_view(layerName); }
   int getUnfilteredChildCount() const override { return sortedObjects.size(); }
   OutlinerTreeItem *getUnfilteredChild(int index) const override { return sortedObjects[index]; }
   int getFilteredChildCount() const override { return filteredSortedObjects.size(); }
@@ -235,11 +247,20 @@ public:
     G_ASSERT(selectedObjectCount <= sortedObjects.size());
   }
 
+  struct RenderCache
+  {
+    bool layerVisible = false;
+    bool layerLocked = false;
+    bool dimLayerColor = false;
+    bool dimLayerChildColor = false;
+  };
+
   const int perTypeLayerIndex;
   String layerName;
   eastl::vector_set<ObjectTreeItem *, ObjectTreeItemLess> sortedObjects;
   eastl::vector_set<ObjectTreeItem *, ObjectTreeItemLess> filteredSortedObjects;
   int selectedObjectCount = 0;
+  RenderCache renderCache;
 };
 
 class ObjectTypeTreeItem : public OutlinerTreeItem
@@ -259,6 +280,7 @@ public:
 
   ItemType getType() const override { return ItemType::ObjectType; }
   const char *getLabel() const override { return objectTypeName; }
+  eastl::string_view getLabelStringView() const override { return to_string_view(objectTypeName); }
   int getUnfilteredChildCount() const override { return layers.size(); }
   OutlinerTreeItem *getUnfilteredChild(int index) const override { return layers[index]; }
   int getFilteredChildCount() const override { return filteredLayers.size(); }
@@ -295,11 +317,19 @@ public:
     return state;
   }
 
+  struct RenderCache
+  {
+    bool typeVisible = false;
+    bool typeLocked = false;
+    bool dimTypeColor = false;
+  };
+
   const int objectTypeIndex;
   String objectTypeName;
   dag::Vector<LayerTreeItem *> layers;
   dag::Vector<LayerTreeItem *> filteredLayers;
   bool objectTypeVisible = true;
+  RenderCache renderCache;
 };
 
 class RootTreeItem : public OutlinerTreeItem
@@ -312,6 +342,7 @@ public:
 
   ItemType getType() const override { return ItemType::Root; }
   const char *getLabel() const override { return nullptr; }
+  eastl::string_view getLabelStringView() const override { return eastl::string_view(); }
   int getUnfilteredChildCount() const override { return objectTypes.size(); }
   OutlinerTreeItem *getUnfilteredChild(int index) const override { return objectTypes[index]; }
   int getFilteredChildCount() const override { return filteredObjectTypes.size(); }
@@ -340,6 +371,12 @@ public:
   {
     for (ObjectTypeTreeItem *objectTypeTreeItem : filteredObjectTypes)
       objectTypeTreeItem->setExpandedRecursive(expand);
+  }
+
+  void expandParents(OutlinerTreeItem &tree_item)
+  {
+    for (OutlinerTreeItem *parent = tree_item.getParent(); parent != &rootTreeItem; parent = parent->getParent())
+      parent->setExpanded(true);
   }
 
   void loadOutlinerState(IOutliner &tree_interface, const DataBlock &state)
@@ -479,6 +516,7 @@ public:
     }
 
     updateSearchMatch(tree_interface, *objectTreeItem);
+    markLinearizedTreeItemsDirty(); // Changing name can change the order in the tree.
   }
 
   void onObjectSelectionChanged(IOutliner &tree_interface, RenderableEditableObject &object)
@@ -590,6 +628,8 @@ public:
   {
     if (&deleted_tree_item == focusedTreeItem)
       focusedTreeItem = nullptr;
+
+    markLinearizedTreeItemsDirty();
   }
 
   void onTreeItemSelectionChanged(OutlinerTreeItem &tree_item)
@@ -845,9 +885,41 @@ public:
     return objects;
   }
 
+  ObjectTreeItem *getFirstSelectedObjectTreeItem() const
+  {
+    for (const ObjectTypeTreeItem *objectTypeTreeItem : filteredObjectTypes)
+      for (const LayerTreeItem *layerTreeItem : objectTypeTreeItem->filteredLayers)
+        for (ObjectTreeItem *objectTreeItem : layerTreeItem->filteredSortedObjects)
+          if (objectTreeItem->isSelected())
+            return objectTreeItem;
+
+    return nullptr;
+  }
+
   OutlinerTreeItem *getSelectionHead() const { return (focusedTreeItem && focusedTreeItem->isSelected()) ? focusedTreeItem : nullptr; }
 
   void setSelectionHead(OutlinerTreeItem *tree_item) { focusedTreeItem = tree_item; }
+
+  void markLinearizedTreeItemsDirty() { linearizedTreeItemsDirty = true; }
+
+  dag::Span<OutlinerTreeItem *> getLinearizedTreeItems()
+  {
+    if (linearizedTreeItemsDirty)
+    {
+      linearizedTreeItemsDirty = false;
+      linearizedTreeItems.clear();
+      linearizeTreeItem(rootTreeItem);
+    }
+    return make_span(linearizedTreeItems);
+  }
+
+  int getTreeItemLevel(const OutlinerTreeItem &tree_item) const
+  {
+    int level = 0;
+    for (const OutlinerTreeItem *n = tree_item.getParent(); n != &rootTreeItem; n = n->getParent())
+      ++level;
+    return level;
+  }
 
   dag::Vector<ObjectTypeTreeItem *> objectTypes;
   dag::Vector<ObjectTypeTreeItem *> filteredObjectTypes;
@@ -900,6 +972,18 @@ private:
     }
   }
 
+  void linearizeTreeItem(OutlinerTreeItem &tree_item)
+  {
+    const int filteredChildCount = tree_item.getFilteredChildCount();
+    for (int i = 0; i < filteredChildCount; ++i)
+    {
+      OutlinerTreeItem *child = tree_item.getFilteredChild(i);
+      linearizedTreeItems.push_back(child);
+      if (child->isExpanded() && child->getFilteredChildCount() > 0)
+        linearizeTreeItem(*child);
+    }
+  }
+
   static void loadTreeExpansionState(const DataBlock &state, OutlinerTreeItem &tree_item)
   {
     const int childCount = tree_item.getUnfilteredChildCount();
@@ -939,6 +1023,8 @@ private:
   OutlinerTreeItem *focusedTreeItem = nullptr; // Use getSelectionHead() instead!
   int selectionCountPerItemType[(int)OutlinerTreeItem::ItemType::Count];
   bool showAssetNameUnderObjects = true;
+  dag::Vector<OutlinerTreeItem *> linearizedTreeItems;
+  bool linearizedTreeItemsDirty = false;
 };
 
 } // namespace Outliner

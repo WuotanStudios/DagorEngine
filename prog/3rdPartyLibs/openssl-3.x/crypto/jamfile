@@ -27,7 +27,7 @@ Sources =
   crypto/cpt_err.c
   crypto/cversion.c
   crypto/der_writer.c
-  crypto/dllmain.c
+  #crypto/dllmain.c
   crypto/ebcdic.c
   crypto/ex_data.c
   crypto/info.c
@@ -182,7 +182,9 @@ if $(Platform) in windows xboxOne scarlett {
 
   if $(PlatformSpec) in gcc {
     # false positive from gcc13 "rsaz_exp_x2.c:496:16: error: iteration 19 invokes undefined behavior"
-    Copt += -Wno-aggressive-loop-optimizations ;
+    Copt += -Wno-aggressive-loop-optimizations
+            -Wno-discarded-qualifiers
+    ;
   }
 }
 
@@ -196,6 +198,8 @@ if $(PlatformSpec) = clang {
   if $(Sanitize) = undefined {
     Copt += -fno-sanitize=undefined ;
   }
+
+  Copt += -Wno-incompatible-pointer-types-discards-qualifiers ;
 }
 
 if $(PlatformArch) = e2k { Copt += -Wno-reduced-alignment ; }

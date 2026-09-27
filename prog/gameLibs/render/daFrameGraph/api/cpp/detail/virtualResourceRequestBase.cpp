@@ -4,66 +4,118 @@
 #include <frontend/internalRegistry.h>
 #include <render/daFrameGraph/resourceCreation.h>
 #include <runtime/runtime.h>
-
+#include <drv/3d/dag_driverDesc.h>
+#include <EASTL/vector_set.h>
 
 namespace dafg::detail
 {
+
+static eastl::vector_set<int> shadervars_to_reset;
 
 static constexpr int FAKE_ID_FOR_VIEW_MATRIX_BINDINGS = -1;
 static constexpr int FAKE_ID_FOR_PROJ_MATRIX_BINDINGS = -2;
 
 void VirtualResourceRequestBase::texture(const Texture2dCreateInfo &info)
 {
-  auto &res = registry->resources.get(resUid.resId);
-  res.type = ResourceType::Texture;
-  res.creationInfo = info;
-  // TODO: get rid of this, simply use res.createInfo everywhere
+  if (auto r = eastl::get_if<IPoint2>(&info.resolution); r && DAGOR_UNLIKELY(r->x == 0 || r->y == 0))
+    logerr("daFG: Encountered zero-sized texture creation request (%dx%d) within '%s' frame graph node!", r->x, r->y,
+      registry->knownNames.getName(nodeId));
+
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
+
+  createdRes->type = ResourceType::Texture;
+  createdRes->creationInfo = info;
+  // TODO: get rid of this, simply use createdRes->creationInfo everywhere
   if (auto r = eastl::get_if<AutoResolutionRequest<2>>(&info.resolution); r)
-    res.resolution = AutoResolutionData{r->autoResTypeId, r->multiplier};
+    createdRes->resolution = AutoResolutionData{r->autoResTypeId, r->multiplier};
   else
-    res.resolution = eastl::nullopt;
+    createdRes->resolution = eastl::nullopt;
 }
 
 void VirtualResourceRequestBase::texture(const Texture3dCreateInfo &info)
 {
-  auto &res = registry->resources.get(resUid.resId);
-  res.type = ResourceType::Texture;
-  res.creationInfo = info;
-  // TODO: get rid of this, simply use res.createInfo everywhere
+  if (auto r = eastl::get_if<IPoint3>(&info.resolution); r && DAGOR_UNLIKELY(r->x == 0 || r->y == 0 || r->z == 0))
+    logerr("daFG: Encountered zero-sized texture creation request (%dx%dx%d) within '%s' frame graph node!", r->x, r->y, r->z,
+      registry->knownNames.getName(nodeId));
+
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
+
+  createdRes->type = ResourceType::Texture;
+  createdRes->creationInfo = info;
+  // TODO: get rid of this, simply use createdRes->creationInfo everywhere
   if (auto r = eastl::get_if<AutoResolutionRequest<3>>(&info.resolution); r)
-    res.resolution = AutoResolutionData{r->autoResTypeId, r->multiplier};
+    createdRes->resolution = AutoResolutionData{r->autoResTypeId, r->multiplier};
   else
-    res.resolution = eastl::nullopt;
+    createdRes->resolution = eastl::nullopt;
 }
 
 void VirtualResourceRequestBase::buffer(const BufferCreateInfo &info)
 {
-  if (DAGOR_UNLIKELY(info.elementCount == 0u))
-    logerr("daFG: Encountered zero-sized buffer creation request within '%s' frame graph node!", registry->knownNames.getName(nodeId));
+  if (DAGOR_UNLIKELY(info.elementCount == 0u || info.elementSize == 0u))
+    logerr("daFG: Encountered zero-sized buffer creation request (elementSize=%u, elementCount=%u) within '%s' frame graph node!",
+      info.elementSize, info.elementCount, registry->knownNames.getName(nodeId));
+  if (DAGOR_UNLIKELY((info.flags & (SBCF_DYNAMIC | SBCF_FRAMEMEM | SBCF_CPU_ACCESS_WRITE | SBCF_CPU_ACCESS_READ)) != 0u))
+    logerr("daFG: Encountered CPU-accessed buffer creation request within '%s' frame graph node!",
+      registry->knownNames.getName(nodeId));
 
-  auto &res = registry->resources.get(resUid.resId);
-  res.creationInfo = info;
-  res.type = ResourceType::Buffer;
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
+
+  createdRes->creationInfo = info;
+  createdRes->type = ResourceType::Buffer;
 }
 
-void VirtualResourceRequestBase::blob(BlobDescription &&desc, detail::RTTI &&rtti)
+void VirtualResourceRequestBase::blob(BlobDescription &&desc, RTTI::RecursiveMakerRef rtti_maker)
 {
-  auto &res = registry->resources.get(resUid.resId);
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
 
-  res.creationInfo = eastl::move(desc);
-  res.type = ResourceType::Blob;
+  const auto typeTag = desc.typeTag;
+  createdRes->creationInfo = eastl::move(desc);
+  createdRes->type = ResourceType::Blob;
 
-  dafg::Runtime::get().getTypeDb().registerNativeType(desc.typeTag, eastl::move(rtti));
+  auto &typeDb = dafg::Runtime::get().getTypeDb();
+  if (typeDb.getRTTI(typeTag) == nullptr)
+  {
+    RTTI::TempStorage blobSubRttis;
+    auto [blobTag, blobRtti] = rtti_maker(blobSubRttis);
 
-  markWithTag(desc.typeTag);
+    typeDb.registerNativeType(blobTag, eastl::move(blobRtti));
+    for (auto &[tag, rtti] : blobSubRttis)
+      typeDb.registerNativeType(tag, eastl::move(rtti));
+  }
+
+  markWithTag(typeTag);
+}
+
+void VirtualResourceRequestBase::backBuffer()
+{
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
+
+  createdRes->creationInfo = DriverDeferredTexture{};
+  createdRes->type = ResourceType::Texture;
+}
+
+void VirtualResourceRequestBase::externalBuffer(dafg::ExternalResourceProvider &&external_resource_provider)
+{
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
+
+  createdRes->creationInfo = eastl::move(external_resource_provider);
+  createdRes->type = ResourceType::Buffer;
+}
+
+void VirtualResourceRequestBase::externalTexture(dafg::ExternalResourceProvider &&external_resource_provider)
+{
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
+
+  createdRes->creationInfo = eastl::move(external_resource_provider);
+  createdRes->type = ResourceType::Texture;
 }
 
 void VirtualResourceRequestBase::markWithTag(ResourceSubtypeTag tag) { thisRequest().subtypeTag = tag; }
 
 void VirtualResourceRequestBase::optional() { thisRequest().optional = true; }
 
-void VirtualResourceRequestBase::bindToShaderVar(const char *shader_var_name, ResourceSubtypeTag projected_tag,
-  TypeErasedProjector projector)
+void VirtualResourceRequestBase::recordShaderVarBinding(BindingType binding_type, const char *shader_var_name,
+  ResourceSubtypeTag projected_tag, TypeErasedProjector projector)
 {
   if (shader_var_name == nullptr)
     shader_var_name = registry->knownNames.getShortName(resUid.resId);
@@ -74,6 +126,8 @@ void VirtualResourceRequestBase::bindToShaderVar(const char *shader_var_name, Re
   // latter time.
   const int svId = VariableMap::getVariableId(shader_var_name);
 
+  bool reset = shadervars_to_reset.count(svId) > 0;
+
   auto &bindings = registry->nodes[nodeId].bindings;
 
   if (DAGOR_UNLIKELY(bindings.find(svId) != bindings.end()))
@@ -83,10 +137,50 @@ void VirtualResourceRequestBase::bindToShaderVar(const char *shader_var_name, Re
       shader_var_name, registry->knownNames.getName(nodeId));
     return;
   }
-  bindings[svId] = Binding{BindingType::ShaderVar, resUid.resId, static_cast<bool>(resUid.history), projected_tag, projector};
+  bindings[svId] =
+    Binding{binding_type, resUid.resId, static_cast<bool>(resUid.history), reset, thisRequest().optional, projected_tag, projector};
 
   // NOTE: we don't need to set this for blobs, but it doesn't matter anyways
   thisRequest().usage.type = Usage::SHADER_RESOURCE;
+}
+
+void VirtualResourceRequestBase::forBlock(const char *block_name, const char *shader_var_name, ResourceSubtypeTag projected_tag)
+{
+  G_ASSERT_RETURN(block_name != nullptr, );
+
+  if (shader_var_name == nullptr)
+    shader_var_name = registry->knownNames.getShortName(resUid.resId);
+
+  const int svId = VariableMap::getVariableId(shader_var_name);
+
+  const auto nodeNsId = registry->knownNames.getParent(nodeId);
+  const auto blockId = registry->knownNames.getNameId<RefinedBlockNameId>(nodeNsId, block_name);
+  auto &blockBindings = registry->nodes[nodeId].refinedBlockBindings[blockId];
+
+  if (DAGOR_UNLIKELY(blockBindings.find(svId) != blockBindings.end()))
+  {
+    logerr("daFG: shader var '%s' is set into block '%s' more than once within '%s' frame graph node! Ignoring one of them!",
+      shader_var_name, block_name, registry->knownNames.getName(nodeId));
+    return;
+  }
+
+  blockBindings[svId] = Binding{BindingType::ShaderVar, resUid.resId, static_cast<bool>(resUid.history), false, thisRequest().optional,
+    projected_tag, +[](const void *data) { return data; }};
+
+  // Mark the resource as used so it is scheduled and kept alive.
+  thisRequest().usage.type = Usage::SHADER_RESOURCE;
+}
+
+void VirtualResourceRequestBase::bindToShaderVar(const char *shader_var_name, ResourceSubtypeTag projected_tag,
+  TypeErasedProjector projector)
+{
+  recordShaderVarBinding(BindingType::ShaderVar, shader_var_name, projected_tag, projector);
+}
+
+void VirtualResourceRequestBase::bindlessShaderVar(const char *shader_var_name, ResourceSubtypeTag projected_tag)
+{
+  G_ASSERT(d3d::get_driver_desc().caps.hasBindless);
+  recordShaderVarBinding(BindingType::BindlessShaderVar, shader_var_name, projected_tag, identity_projector);
 }
 
 void VirtualResourceRequestBase::bindAsView(ResourceSubtypeTag projected_tag, TypeErasedProjector projector)
@@ -99,8 +193,8 @@ void VirtualResourceRequestBase::bindAsView(ResourceSubtypeTag projected_tag, Ty
       registry->knownNames.getName(nodeId));
     return;
   }
-  bindings[FAKE_ID_FOR_VIEW_MATRIX_BINDINGS] =
-    Binding{BindingType::ViewMatrix, resUid.resId, static_cast<bool>(resUid.history), projected_tag, projector};
+  bindings[FAKE_ID_FOR_VIEW_MATRIX_BINDINGS] = Binding{
+    BindingType::ViewMatrix, resUid.resId, static_cast<bool>(resUid.history), false, thisRequest().optional, projected_tag, projector};
 }
 
 void VirtualResourceRequestBase::bindAsProj(ResourceSubtypeTag projected_tag, TypeErasedProjector projector)
@@ -113,8 +207,8 @@ void VirtualResourceRequestBase::bindAsProj(ResourceSubtypeTag projected_tag, Ty
       registry->knownNames.getName(nodeId));
     return;
   }
-  bindings[FAKE_ID_FOR_PROJ_MATRIX_BINDINGS] =
-    Binding{BindingType::ProjMatrix, resUid.resId, static_cast<bool>(resUid.history), projected_tag, projector};
+  bindings[FAKE_ID_FOR_PROJ_MATRIX_BINDINGS] = Binding{
+    BindingType::ProjMatrix, resUid.resId, static_cast<bool>(resUid.history), false, thisRequest().optional, projected_tag, projector};
 }
 
 void VirtualResourceRequestBase::bindAsVertexBuffer(uint32_t stream, uint32_t stride)
@@ -139,7 +233,12 @@ void VirtualResourceRequestBase::bindAsIndexBuffer()
 
 void VirtualResourceRequestBase::atStage(Stage stage) { thisRequest().usage.stage = stage; }
 
-void VirtualResourceRequestBase::useAs(Usage type) { thisRequest().usage.type = type; }
+void VirtualResourceRequestBase::useAs(Usage type)
+{
+  auto &request = thisRequest();
+  request.usage.type = type;
+  request.usageDeclared = true;
+}
 
 const ResourceProvider *VirtualResourceRequestBase::provider() { return &registry->resourceProviderReference; }
 
@@ -149,27 +248,60 @@ ResourceRequest &VirtualResourceRequestBase::thisRequest()
   return resUid.history ? nodeData.historyResourceReadRequests[resUid.resId] : nodeData.resourceRequests[resUid.resId];
 }
 
-void VirtualResourceRequestBase::clear(const ResourceClearValue &clear_value)
+void VirtualResourceRequestBase::withHistory(History history)
 {
-  auto &res = registry->resources.get(resUid.resId);
-  res.clearValue = clear_value;
+  auto resId = resUid.resId;
+  for (const auto &[toResId, fromResId] : registry->nodes[nodeId].renamedResources)
+  {
+    if (fromResId == resUid.resId)
+    {
+      resId = toResId;
+      break;
+    }
+  }
+  auto &hist = registry->resources.get(resId).history;
+
+  hist = history;
 }
 
-void VirtualResourceRequestBase::clear(ResourceSubtypeTag projectee, const char *blob_name, detail::TypeErasedProjector projector)
+void VirtualResourceRequestBase::clear(const ResourceClearValue &clear_value, ResourceClearFlags flags)
+{
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
+
+  createdRes->clearValue = clear_value;
+  createdRes->clearFlags = flags;
+}
+
+void VirtualResourceRequestBase::clear(ResourceSubtypeTag projectee, const char *blob_name, detail::TypeErasedProjector projector,
+  ResourceClearFlags flags)
 {
   auto &nodeData = registry->nodes[nodeId];
-  auto &res = registry->resources.get(resUid.resId);
+  auto &createdRes = registry->resources.get(resUid.resId).createdResData;
 
   const auto ourNs = registry->knownNames.getParent(nodeId);
   const auto blobId = registry->knownNames.addNameId<ResNameId>(ourNs, blob_name);
 
   // Implicitly read the blob
   nodeData.readResources.insert(blobId);
-  nodeData.resourceRequests.emplace(blobId, ResourceRequest{{}, false, false, projectee});
+  nodeData.resourceRequests.emplace(blobId, ResourceRequest{.subtypeTag = projectee});
 
   detail::VirtualResourceRequestBase fakeReq{{blobId, false}, nodeId, registry};
   fakeReq.markWithTag(projectee);
 
-  res.clearValue = DynamicParameter{blobId, tag_for<ResourceClearValue>(), projector};
+  createdRes->clearValue = DynamicParameter{blobId, tag_for<ResourceClearValue>(), projector};
+  createdRes->clearFlags = flags;
 }
 } // namespace dafg::detail
+
+namespace dafg
+{
+void reset_shadervar_after_use(const char *name)
+{
+  G_ASSERT(name);
+  int id = VariableMap::getVariableId(name);
+  if (VariableMap::isVariablePresent(id))
+    detail::shadervars_to_reset.insert(id);
+  else
+    logerr("[daFG] can't register %s to be autoreset, the variable is not present", name);
+}
+} // namespace dafg

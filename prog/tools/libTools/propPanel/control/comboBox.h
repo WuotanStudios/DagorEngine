@@ -4,8 +4,9 @@
 #include <propPanel/control/propertyControlBase.h>
 #include <propPanel/imguiHelper.h>
 #include "../scopedImguiBeginDisabled.h"
-#include "filteredComboBoxStandalone.h"
+#include <propPanel/control/filteredComboBoxStandalone.h>
 #include <EASTL/sort.h>
+#include <EASTL/optional.h>
 
 namespace PropPanel
 {
@@ -39,6 +40,8 @@ public:
     return ImguiHelper::getTextValueForString(selectedText, buffer, buflen);
   }
 
+  dag::ConstSpan<String> getStringsValue() override { return values; }
+
   void setTextValue(const char value[]) override
   {
     const int index = ImguiHelper::getStringIndexInTab(values, value);
@@ -59,6 +62,8 @@ public:
 
   void setCaptionValue(const char value[]) override { controlCaption = value; }
 
+  void setValueHighlight(ColorOverride::ColorIndex color) override { valueHighlightColor = color; }
+
   void reset() override
   {
     setIntValue(-1);
@@ -68,18 +73,49 @@ public:
 
   void setEnabled(bool enabled) override { controlEnabled = enabled; }
 
+  bool isDefaultValueSet() const override { return defaultValue ? *defaultValue == getIntValue() : true; }
+
+  void applyDefaultValue() override
+  {
+    if (isDefaultValueSet())
+    {
+      return;
+    }
+
+    if (defaultValue)
+    {
+      setIntValue(*defaultValue);
+      onWcChange(nullptr);
+    }
+  }
+
+  void setDefaultValue(Variant var) override { defaultValue = var.convert<int>(); }
+
+  const char *getImguiTypeName() const override { return "ComboBox"; }
+
   void updateImgui() override
   {
     ScopedImguiBeginDisabled scopedDisabled(!controlEnabled);
 
-    ImguiHelper::separateLineLabel(controlCaption);
+    separateLineLabelWithTooltip(controlCaption.begin(), controlCaption.end());
     setFocusToNextImGuiControlIfRequested();
 
     // Use full width by default.
     ImGui::SetNextItemWidth(mW > 0 ? min((float)mW, ImGui::GetContentRegionAvail().x) : -FLT_MIN);
 
+    // Override the background color of the edit box.
+    const bool valueHighlightColorSet = valueHighlightColor != ColorOverride::NONE;
+    if (valueHighlightColorSet)
+      ImGui::PushStyleColor(ImGuiCol_FrameBg, getOverriddenColor(valueHighlightColor));
+
     const char *selectedText = selectedDisplayIndex >= 0 ? values[displayIndexToIndex[selectedDisplayIndex]].c_str() : "";
-    if (!filteredComboBox.beginCombo("##bc", selectedText, selectedDisplayIndex))
+    const bool dropdownOpen = filteredComboBox.beginCombo("##bc", selectedText, selectedDisplayIndex);
+    setImguiTestItemInfo();
+
+    if (valueHighlightColorSet)
+      ImGui::PopStyleColor();
+
+    if (!dropdownOpen)
       return;
 
     if (filteredComboBox.beginFiltering(displayIndexToIndex.size()))
@@ -148,6 +184,8 @@ private:
   dag::Vector<int> displayIndexToIndex;
   int selectedDisplayIndex;
   FilteredComboBoxStandalone filteredComboBox;
+  eastl::optional<int> defaultValue;
+  ColorOverride::ColorIndex valueHighlightColor = ColorOverride::NONE;
 };
 
 } // namespace PropPanel

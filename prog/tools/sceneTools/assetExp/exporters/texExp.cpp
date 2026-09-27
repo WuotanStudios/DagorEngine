@@ -29,6 +29,7 @@
 #include <ispc_texcomp.h>
 #endif
 #include <libTools/dtx/astcenc.h>
+#include <libTools/dtx/makeDDS.h>
 #if !_TARGET_STATIC_LIB
 ASTCENC_DECLARE_STATIC_DATA();
 #endif
@@ -52,7 +53,7 @@ static unsigned astcenc_jobs_limit = 0;
 
 #include <math/dag_imageFunctions.h>
 
-#include <render/renderLightsConsts.hlsli>
+#include <render/lights/renderLightsConsts.hlsli>
 
 BEGIN_DABUILD_PLUGIN_NAMESPACE(tex)
 
@@ -87,7 +88,7 @@ struct FilterBase
   }
   ~FilterBase() { memfree(fdata, tmpmem); }
 
-  bool isGammaSpace() { return fabsf(gamma - 1.0f) < 0.01f; }
+  bool isGammaSpace() { return is_equal_float(gamma, 1.0f); }
   static int align_4k(int sz) { return (sz + 0xFFF) & ~0xFFF; }
 
   template <class Filter>
@@ -375,7 +376,11 @@ public:
       }
 
       mkbindump::BinDumpSaveCB mcwr(17 << 20, cwr.getTarget(), false);
-      write_built_dds_final(mcwr.getRawWriter(), *ma, cwr.getTarget(), cwr.getProfile(), &log);
+      if (write_built_dds_final(mcwr.getRawWriter(), *ma, cwr.getTarget(), cwr.getProfile(), &log) <= 0 || mcwr.getSize() == 0)
+      {
+        log.addMessage(log.ERROR, "%s: internal error, write_built_dds_final(%s) failed", a.getName(), ma->getName());
+        return false;
+      }
 
       MemoryLoadCB mcrd(mcwr.getRawWriter().takeMem(), true);
       DDSURFACEDESC2 base_dds_hdr;
@@ -529,13 +534,11 @@ public:
     }
     return buildTexAsset(a, cwr, log);
   }
-  bool getAssetSourceHash(SimpleString &dest_hash, DagorAsset &a, void *cache_shared_data_ptr, unsigned target_code) override
+  bool getAssetSourceHash(SimpleString &dest_hash, DagorAsset &a, unsigned target_code) override
   {
-    AssetExportCache::setSharedDataPtr(cache_shared_data_ptr);
     unsigned char hash[15];
     memset(hash, 0, sizeof(hash));
     bool ret = AssetExportCache::sharedDataGetFileHash(a.getTargetFilePath(), hash);
-    AssetExportCache::setSharedDataPtr(nullptr);
     if (ret)
     {
       String fmt_spec;
@@ -569,7 +572,7 @@ public:
         b->removeBlock(a.getName());
     }
   }
-  bool updateBuildResultsBlk(DagorAsset &a, void *cache_shared_data_ptr, unsigned tc) override
+  bool updateBuildResultsBlk(DagorAsset &a, unsigned tc) override
   {
     G_ASSERT_RETURN(buildResultsBlk, true);
     if (const char *p = strrchr(a.getName(), '$'))
@@ -586,7 +589,7 @@ public:
     }
 
     SimpleString hash;
-    if (getAssetSourceHash(hash, a, cache_shared_data_ptr, tc))
+    if (getAssetSourceHash(hash, a, tc))
     {
       uint64_t tc_storage = 0;
       const char *pkname = a.getCustomPackageName(mkbindump::get_target_str(tc, tc_storage), nullptr);
@@ -615,7 +618,7 @@ public:
     const char *mipFilt = GET_PROP(Str, "mipFilter", "");
     int mipCnt = GET_PROP(Int, "mipCnt", -1);
     int tex3d_depth = GET_PROP(Int, "texDepth", 1);
-    const float gamma = GET_PROP(Real, "gamma", 2.2);
+    float gamma = GET_PROP(Real, "gamma", 2.2);
     bool iesTexture = GET_PROP(Bool, "buildIES", false);
     bool bcFmtExpandImageTransp = GET_PROP(Bool, "bcFmtExpandImageTransp", false);
     bool splitHigh = GET_PROP(Bool, "splitHigh", false);
@@ -628,6 +631,7 @@ public:
     const char *fmt = GET_PROP(Str, "fmt", "ARGB");
     if (const DataBlock *b = blkAssetsBuildTex.getBlockByName(target_str))
       fmt = b->getBlockByNameEx("fmtSubst")->getStr(fmt, fmt);
+    fix_gamma_for_fmt(gamma, fmt);
     if (!splitOverrided)
       splitAt = a.props.getBlockByNameEx(target_str)->getInt("splitAtSize", splitAt);
     TextureMetaData tmd;
@@ -646,7 +650,7 @@ public:
       dest_hdr.flags |= dest_hdr.FLG_VOLTEX;
     if (GET_PROP(Bool, "rtMipGen", false))
       dest_hdr.flags |= stricmp(mipFilt, "filterKaizer") == 0 ? dest_hdr.FLG_GENMIP_KAIZER : dest_hdr.FLG_GENMIP_BOX;
-    if (fabsf(gamma - 1.0f) < 1e-3f)
+    if (is_equal_float(gamma, 1.0f))
       dest_hdr.flags |= dest_hdr.FLG_GAMMA_EQ_1;
 
     bool alpha_used = false;
@@ -859,7 +863,7 @@ public:
     }
 
     if (buildResultsBlk)
-      updateBuildResultsBlk(a, nullptr, cwr.getTarget());
+      updateBuildResultsBlk(a, cwr.getTarget());
 
 #define GET_PROP(TYPE, PROP, DEF) props.get##TYPE(PROP, &props != &a.props ? a.props.get##TYPE(PROP, DEF) : DEF)
     G_ASSERT(!cwr.WRITE_BE);
@@ -923,7 +927,7 @@ public:
     const float mipFiltWidth = 3;
     const float mipFiltAlpha = GET_PROP(Real, "mipFilterAlpha", 4);
     const float mipFiltStretch = GET_PROP(Real, "mipFilterStretch", 1);
-    const float gamma = GET_PROP(Real, "gamma", 2.2);
+    float gamma = GET_PROP(Real, "gamma", 2.2);
 
     uint64_t tc_storage = 0;
     const char *targetPlatform = mkbindump::get_target_str(cwr.getTarget(), tc_storage);
@@ -968,6 +972,11 @@ public:
 
     if (const DataBlock *b = blkAssetsBuildTex.getBlockByName(targetPlatform))
       fmt = b->getBlockByNameEx("fmtSubst")->getStr(fmt, fmt);
+
+    float old_gamma = gamma;
+    if (fix_gamma_for_fmt(gamma, fmt))
+      log.addMessage(log.WARNING, "%s: gamma=%.1f is applied to format %s that doesn't support sRGB. Resetting gamma to 1.0",
+        a.getName(), old_gamma, fmt);
 
     nvtt::Compressor compressor;
     nvtt::InputOptions inpOptions;
@@ -1140,9 +1149,15 @@ public:
     {
       bool allow_mipstripe = GET_PROP(Bool, "useDDSmips", true);
       int initial_mipCnt = mipCnt;
-      img = decode_image_from_dds(a, allow_mipstripe, mipCnt, mipCustomFilt, alpha_used, log);
+      uint32_t dds_d3dfmt = 0;
+      img = decode_image_from_dds(a, allow_mipstripe, mipCnt, mipCustomFilt, alpha_used, dds_d3dfmt, log);
       if (allow_mipstripe && initial_mipCnt != mipCnt && mipCnt > 0)
         mipCnt -= tmd.hqMip;
+      if (img && !is_equal_float(gamma, 1.0f) && !is_srgb_capable_d3d_fmt(dds_d3dfmt))
+      {
+        gamma = 1.0f;
+        inpOptions.setGamma(1.0f, 1.0f);
+      }
     }
 
     if (!img)
@@ -2297,7 +2312,7 @@ public:
       }
       // save_tga32(String(0, "%s-pre.tga", a.getName()),(TexPixel32*)image->pixels(), image->width(), image->height(),
       // image->width()*4);
-      return convert_to_astc(cwr.getRawWriter(), imgSurf, texType, voltex_depth, fabs(gamma - 1.0) < 1e-3, tc_format,
+      return convert_to_astc(cwr.getRawWriter(), imgSurf, texType, voltex_depth, is_equal_float(gamma, 1.0f), tc_format,
         outHandler.hqPartLev, a.getName());
     }
 
@@ -3526,7 +3541,7 @@ public:
   }
 
   static TexImage32 *decode_image_from_dds(DagorAsset &a, bool allow_mipstripe, int &out_mipCnt, int &mipCustomFilt, bool &alpha_used,
-    ILogWriter &log)
+    uint32_t &d3dFormat, ILogWriter &log)
   {
     nv::DirectDrawSurface dds(a.getTargetFilePath());
     if (!dds.isValid())
@@ -3540,6 +3555,22 @@ public:
       log.addMessage(log.ERROR, "%s: not Tex2D %s", a.getName(), a.getTargetFilePath());
       return NULL;
     }
+
+    if (file_ptr_t f = df_open(a.getTargetFilePath(), DF_READ))
+    {
+      DDSURFACEDESC2 base_dds_hdr;
+      df_seek_to(f, 4);
+      df_read(f, &base_dds_hdr, sizeof(base_dds_hdr));
+      df_close(f);
+      ddsx::Header tmp_hdr;
+      make_ddsx_hdr(tmp_hdr, base_dds_hdr);
+      d3dFormat = tmp_hdr.d3dFormat;
+    }
+    else
+    {
+      d3dFormat = D3DFMT_UNKNOWN;
+    }
+
     TexImage32 *img = TexImage32::create(dds.width() * (allow_mipstripe && dds.mipmapCount() > 1 ? 2 : 1), dds.height());
     if (dds.mipmapCount() > 1 && allow_mipstripe)
       mipCustomFilt = MMF_stripe;

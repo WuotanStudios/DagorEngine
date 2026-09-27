@@ -18,6 +18,7 @@
 #include <math/dag_color.h>
 #include <vecmath/dag_vecMathDecl.h>
 #include <daSkies2/daScattering.h>
+#include <daSkies2/cloudsRenderFlags.h>
 #include <EASTL/fixed_vector.h>
 #include <EASTL/vector_map.h>
 #include <3d/dag_ringCPUQueryLock.h>
@@ -27,9 +28,7 @@
 
 struct SkiesData;
 struct Clouds2;
-struct AuroraBorealis;
 class SphereRenderer;
-
 
 enum class CloudsResolution
 {
@@ -37,6 +36,13 @@ enum class CloudsResolution
   FullresCloseClouds,
   ForceFullresClouds
 };
+
+// cloudsQuality 0..2 -> common dividers; 3,4 -> mobile low quality
+inline int get_clouds_res_divider(int quality)
+{
+  static constexpr int dividers[] = {1, 2, 4, 3, 4};
+  return dividers[quality];
+}
 
 enum class UpdateSky
 {
@@ -50,6 +56,12 @@ enum class RenderPrepared
   Off,
   LowresOnFarPlane,
   LowresOnSphere,
+};
+
+enum class CheckCloudVisibility
+{
+  No,
+  Yes
 };
 
 class DaSkies
@@ -123,7 +135,10 @@ public:
   _PARAM_RAND(float, turbulenceStrength, 0.21f)                                                                                   \
   _PARAM(int, shapeNoiseScale, 9)                                                                                                 \
   _PARAM(int, cumulonimbusShapeScale, 4)                                                                                          \
-  _PARAM(int, turbulenceFreq, 2)
+  _PARAM(int, turbulenceFreq, 2)                                                                                                  \
+  _PARAM_RAND(float, perlin_worley_dilation, 0.3)                                                                                 \
+  _PARAM_RAND(float, worley_erosion, 1.0)                                                                                         \
+  _PARAM_RAND(float, shape_gamma, 1.25)
     struct Layer
     {
       float startAt, thickness, density;
@@ -140,28 +155,67 @@ public:
     int shapeNoiseScale = 9, cumulonimbusShapeScale = 4;
     int turbulenceFreq = 2;
     float turbulenceStrength = 0.21;
+    float perlin_worley_dilation = 0.3f, worley_erosion = 1.0f, shape_gamma = 1.25f;
     // float gradient_per1km = 1000;//both FB and HZD papers suggest to skew clouds in wind direction. I don't see the benefit, it
     // doesn't look natural
     bool operator==(const CloudsForm &a) const;
     bool operator!=(const CloudsForm &a) const { return !(*this == a); }
   };
 
-  struct CloudsRendering // this structure has parameters that won't cause re-lighting, it just affects how it looks on screen
+  struct CloudsRendering // parameters that never relight the clouds: most only change how clouds look on
+                         // screen; the aerosol subgroup changes the atmosphere medium instead (DaSkies::prepare
+                         // re-derives it and re-bakes the small scattering LUTs)
   {
-#define CLOUDS_RENDERING_PARAMS                                                                           \
-  _PARAM(float, forward_eccentricity, 0.8f)        /*FB and RDR2 uses 0.8 by default*/                    \
-  _PARAM(float, back_eccentricity, 0.5f)           /*FB and RDR2 uses 0.5 by default*/                    \
-  _PARAM(float, forward_eccentricity_weight, 0.5f) /*FB and RDR2 uses 0.5 by default*/                    \
-  _PARAM(float, erosion_noise_size, 811.f / 32)    /*this is arguably affecting lighting as well*/        \
-  _PARAM(float, ambient_desaturation, 0.5f)        /*FB uses 0.5 by default*/                             \
-  _PARAM(float, ms_contribution, 0.7f)             /*on sunset 0.7 is better, in noon 0.5-0.6 is better*/ \
-  _PARAM(float, ms_attenuation, 0.3f)              /*in sunset 0.25 is better, in noon 0.45 is better*/   \
-  _PARAM(float, ms_ecc_attenuation, 0.6f)          /*probably better not to touch at all*/                \
-  _PARAM(float, erosionWindSpeed, 0.6f) /*this should not affect rendering at all, but currently it actually will, causing rebuild*/
+// separate macro so change-detection sites neutralize the subgroup via copyAerosolFrom
+// instead of listing fields by hand (a missed field would silently diverge the sites)
+#define CLOUDS_RENDERING_AEROSOL_PARAMS                                                                                       \
+  _PARAM(float, layer0_aerosolness, 0.35f)            /*droplet aerosol (mie3) shed by cloud layer 0: sub-cloud haze amount*/ \
+  _PARAM(float, layer1_aerosolness, 0.35f)            /*droplet aerosol (mie3) shed by cloud layer 1: sub-cloud haze amount*/ \
+  _PARAM(float, cumulonimbus_aerosolness, 0.5f)       /*rain/virga aerosol ground slab, gated by cumulonimbusCoverage*/       \
+  _PARAM(float, cloudAerosolDropletsMieStrength, 1.f) /*master scale for the cloud droplet aerosol; 0 = off*/                 \
+  _PARAM(float, aerosol_reach_below_km, 0.5f)         /*dry 1/e reach of the sub-cloud haze below the base; rain extends it to ground*/
+
+#define CLOUDS_RENDERING_PARAMS                                                                                                      \
+  _PARAM(float, forward_eccentricity, 0.8f)        /*FB and RDR2 uses 0.8 by default*/                                               \
+  _PARAM(float, back_eccentricity, 0.5f)           /*FB and RDR2 uses 0.5 by default*/                                               \
+  _PARAM(float, forward_eccentricity_weight, 0.5f) /*FB and RDR2 uses 0.5 by default*/                                               \
+  _PARAM(float, erosion_noise_size, 811.f / 32)    /*this is arguably affecting lighting as well*/                                   \
+  _PARAM(float, ambient_desaturation, 0.5f)        /*FB uses 0.5 by default*/                                                        \
+  _PARAM(float, ms_contribution, 0.7f)             /*on sunset 0.7 is better, in noon 0.5-0.6 is better*/                            \
+  _PARAM(float, ms_attenuation, 0.3f)              /*in sunset 0.25 is better, in noon 0.45 is better*/                              \
+  _PARAM(float, ms_ecc_attenuation, 0.6f)          /*probably better not to touch at all*/                                           \
+  _PARAM(float, erosionWindSpeed, 0.6f) /*this should not affect rendering at all, but currently it actually will, causing rebuild*/ \
+  _PARAM(float, droplet_diameter_um, 20.f)  /*droplet phase LUT (fogbow/glory; dual HG in compatibility), 5..50 um*/                 \
+  _PARAM(float, edge_albedo, 0.8f)          /*scattering albedo at zero accumulated view-ray opacity; 1 = off, art 0.85-0.95*/       \
+  _PARAM(float, edge_albedo_sharpness, 4.f) /*how fast albedo returns to 1 with accumulated opacity*/                                \
+  CLOUDS_RENDERING_AEROSOL_PARAMS                                                                                                    \
+  _PARAM(float, taa_exposure_scale, 0.4f)        /*TAA compresses above luma 0.5/(scale*scene_exposure); 0 = off*/                   \
+  _PARAM(int, bsm_log2_amortize_frames, 4)       /*bake spread over 2^N frames (0..6); 0 = instant on events*/                       \
+  _PARAM(float, bsm_scattering_physicality, 1.f) /*BSM in scattering: 1 = physical (shafts), 0 = ms-brightened (ambient)*/           \
+  _PARAM(float, erosion_strength, 0.15f)         /*total erosion amount; cores are density-protected*/                               \
+  _PARAM(float, erosion_height_bias, 0.5f)       /*erosion distribution: 0 = uniform, 1 = tops only*/                                \
+  _PARAM(float, erosion_edge_mul, 2.f)           /*edge ease density*saturate(d*mul+add): edge opacity/softness, not shape*/         \
+  _PARAM(float, erosion_edge_add, 0.25f)
 
     CLOUDS_RENDERING_PARAMS
+    // make the aerosol subgroup equal to a's so comparisons see only visible-param changes
+    void copyAerosolFrom(const CloudsRendering &a);
     bool operator==(const CloudsRendering &a) const;
     bool operator!=(const CloudsRendering &a) const { return !(*this == a); }
+  };
+
+  struct CloudsTurbulence // flow-noise erosion warp; sample-time only, no relighting and no bake
+  {
+#define CLOUDS_TURBULENCE_PARAMS                                                             \
+  _PARAM(float, warp, 0.12f)       /*curl warp amplitude in erosion-tile UV, 0.12 ~ 100 m*/  \
+  _PARAM(float, height_bias, 0.5f) /*fade warp towards cloud base; subtle, kept out of gui*/ \
+  _PARAM(float, edge_bias, 0.5f)   /*fade warp inside dense cores; subtle, kept out of gui*/ \
+  _PARAM(float, curl_size, 2.f)    /*curl feature size multiplier over the 1311 m base, >0*/ \
+  _PARAM(float, shear, 0.05f)      /*detail stretch along the wind with altitude; erosion-tile UV at cloud top*/
+
+    CLOUDS_TURBULENCE_PARAMS
+    bool operator==(const CloudsTurbulence &a) const;
+    bool operator!=(const CloudsTurbulence &a) const { return !(*this == a); }
   };
 
   struct StrataClouds
@@ -184,6 +238,7 @@ public:
   const CloudsWeatherGen &getWeatherGen() const { return cloudsWeatherGen; }
   const CloudsForm &getCloudsForm() const { return cloudsForm; }
   const CloudsRendering &getCloudsRendering() const { return cloudsRendering; }
+  const CloudsTurbulence &getCloudsTurbulence() const { return cloudsTurbulence; }
 
   const SkyAtmosphereParams &getSkyParams() const { return skyParams; }
   const StrataClouds &getStrataClouds() const { return strataCloudsParams; }
@@ -199,27 +254,43 @@ public:
   }
 
   void setCloudsRendering(const CloudsRendering &v) { cloudsRendering = v; }
+  void setCloudsTurbulence(const CloudsTurbulence &v);
 
   // temporary function for a workaround on A8 iPads (gpu hang)
   void setNearCloudsRenderingEnabled(bool enabled);
+
+  // quarter-rate checkerboard clouds trace (compute path, main-view-flagged renders):
+  // a graphics quality setting the game threads from its settings, not weather data.
+  // The renderer ignores the flag on configs that assume clouds_checkerboard = 0 -
+  // they ship no checker shader variants; canCheckerboardTrace() is the precheck
+  void setCloudsCheckerboardTrace(bool on) { cloudsCheckerboardTrace = on; }
+  bool getCloudsCheckerboardTrace() const { return cloudsCheckerboardTrace; }
+  // whether the checkerboard trace can actually engage with the loaded shader set
+  // and driver (variants compiled, not assumed off, compute available): games that
+  // trade the flag against the clouds target size must not upsize on configs where
+  // the flag stays inert. Valid once the 3d driver and shaders are initialized
+  static bool canCheckerboardTrace();
 
   void setSkyParams(const SkyAtmosphereParams &p);
   void setStrataClouds(const StrataClouds &a);
   void setStrataCloudsTexture(const char *tex_name);
 
-  // if project is relying on clouds being 'high in the sky' and never intersect anything close to camera
-  //  it can uses CLOUDS_SHADOWS_BASE_2D in clouds_shadow.sh to shadow stuff from clouds
-  //  this can be both faster and better looking
-  // if you make a sky / flight sim, you'd better rely on CLOUDS_SHADOWS_BASE_REF  and you don't need that
-  // off by default
-  void projectUses2DShadows(bool on);
+  // receiver shadows sample the Beer shadow map; the *_CLOUDS_SHADOW_BASE_2D macros
+  // in clouds_shadow.dshl remain only as compatibility aliases of it, there is no
+  // separate faster 2D mode anymore
+  // instant Beer-shadow-map re-render on the next frame, bypassing the amortized
+  // convergence - for app-driven resets the change detection cannot see
+  void resetCloudsShadows();
 
   void reset(); // todo: make protected, check generation
   void invalidate();
 
   bool isPrepareRequired() const;
   bool isCloudsReady() const;
-  void prepare(const Point3 &dir_to_sun, bool force_update_cpu, float dt);
+  bool isScatteringReady() const;
+  bool isLightingConverged() const;
+  void logLightingConvergence();
+  void prepare(const Point3 &dir_to_sun, float dt);
 
   void cloudsLayersHeightsBarrier();
 
@@ -257,11 +328,18 @@ public:
         panoramic ? PreparedSkiesParams::Panoramic::ON : PreparedSkiesParams::Panoramic::OFF,
         panoramic ? PreparedSkiesParams::Reprojection::OFF : PreparedSkiesParams::Reprojection::ON});
   }
-  IPoint2 getCloudsResolution(SkiesData *data);
+  // the ALLOCATED clouds resolution; under dynamic resolution the clouds render into a sub-rect
+  // of it, see the render_resolution argument of changeSkiesData
+  IPoint2 getCloudsResolution(const SkiesData *data);
   void skiesDataScatteringVolumeBarriers(SkiesData *data);
+
+#if DAGOR_DBGLEVEL > 0
+  void overrideSkiesDataCloudsUseCompute(SkiesData *data, bool use_compute);
+#endif
   // if sky_quality_div>1, additional textures required
   void changeSkiesData(int sky_detail_level, int clouds_detail_level, bool fly_through_clouds, int targetW, int targetH,
-    SkiesData *data, CloudsResolution clouds_resolution = CloudsResolution::Default, bool use_blurred_clouds = false);
+    SkiesData *data, CloudsResolution clouds_resolution = CloudsResolution::Default, bool use_blurred_clouds = false,
+    bool ignore_panorama_state = false, const IPoint2 &render_resolution = IPoint2::ZERO);
   void initSky(int clouds_fog_resolution = 32, uint32_t skyfmt = 0xFFFFFFFF, bool useHole = true);
   void closeSky();
   void updateCloudsOrigin();
@@ -295,6 +373,14 @@ public:
   Point2 getCloudsHolePosition() const; // that's for debug only!
   void setExternalWeatherTexture(TEXTUREID tid);
 
+  // Node-based-shader driven cloud density field bake. initCloudsNBS loads a
+  // precompiled graph asset (shipping); updateCloudsNBSShaders is the dev live-edit
+  // recompile hook; closeCloudsNBS reverts to the legacy procedural bake.
+  void initCloudsNBS(const char *root_graph);
+  bool updateCloudsNBSShaders(const char *shader_name, const DataBlock &shader_blk, String &out_errors);
+  void enableCloudsNBSOptionalGraph(const char *graph_name, bool enable);
+  void closeCloudsNBS();
+
   DPoint2 getCloudsOrigin() const { return DPoint2(cloudsOrigin.x, cloudsOrigin.z); }
   DPoint2 getStrataCloudsOrigin() const { return DPoint2(cloudsOrigin.strataX, cloudsOrigin.strataZ); }
 
@@ -304,54 +390,64 @@ public:
   void useFog(const Point3 &origin, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm,
     UpdateSky update_sky = UpdateSky::On, float altitude_tolerance = SKY_PREPARE_THRESHOLD);
 
-  // either use renderEnvi or prepareSkyAndClouds + renderSky + renderClouds
-  void renderEnvi(bool infinite, const DPoint3 &origin, const DPoint3 &viewdir, uint32_t render_sun_moon, // we can skip sun rendering
-                                                                                                          // for, say cubic
-    const ManagedTex &cloudsDepth, const ManagedTex &prevCloudsDepth, // clouds Depth(s) is supposed to be 1/2 of target depth with
-                                                                      // mips, if required lower resolution
-
-    TEXTUREID targetDepth, // targetDepth
-    SkiesData *data,       // if data is null than only sky will be rendered
+  // either use renderEnvi or prepareSkyAndClouds/prepareInfiniteSkyAndClouds + renderSky + renderCloudsToTarget
+  // render_sun_moon: we can skip sun rendering for, say cubic
+  // cloudsDepth/prevCloudsDepth: must be 1/2 of target depth (with mips, if lower resolution is required)
+  // data: if null, only sky will be rendered
+  // flags: pass RestartTAA when consecutive renders of the same data are not temporally
+  // continuous (e.g. envi probe cube faces), or clouds TAA accumulates across views
+  void renderEnvi(bool can_be_inside_clouds, const DPoint3 &origin, const DPoint3 &viewdir, uint32_t render_sun_moon,
+    const ManagedTex &cloudsDepth, const ManagedTex &prevCloudsDepth, BaseTexture *targetDepth, SkiesData *data,
     const TMatrix &view_tm, const TMatrix4 &proj_tm, const Driver3dPerspective &persp, UpdateSky update_sky = UpdateSky::On,
-    bool fixed_offset = false, float altitude_tolerance = SKY_PREPARE_THRESHOLD, AuroraBorealis *aurora = nullptr);
+    bool fixed_offset = false, float altitude_tolerance = SKY_PREPARE_THRESHOLD,
+    const CloudsRenderFlags flags = CloudsRenderFlags::Default);
 
-  // if fixed_offset is true, cloud offset will be 0
-  void prepareSkyAndClouds(bool infinite, const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon, // we can skip sun
-                                                                                                               // rendering for, say
-                                                                                                               // cubic
-    const TextureIDPair &cloudsDepth, const TextureIDPair &prevCloudsDepth, // clouds Depth(s) is supposed to be 1/2 of target depth
-                                                                            // with mips, if required lower resolution
-    SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm, UpdateSky update_sky, bool fixed_offset,
-    float altitude_tolerance = SKY_PREPARE_THRESHOLD, AuroraBorealis *aurora = nullptr, const bool acquare_new_resource = true,
-    const bool set_camera_vars = true);
+  // fixed_offse: if true, cloud offset will be 0
+  // cloudsDepth/prevCloudsDepth: must be 1/2 of target depth (with mips, if lower resolution is required)
+  // render_sun_moon: we can skip sun rendering for, say cubic
+  void prepareSkyAndClouds(bool can_be_inside_clouds, const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon,
+    BaseTexture *cloudsDepth, BaseTexture *prevCloudsDepth, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm,
+    UpdateSky update_sky, bool fixed_offset, float altitude_tolerance = SKY_PREPARE_THRESHOLD,
+    const CloudsRenderFlags flags = CloudsRenderFlags::Default);
 
+  void prepareSky(const DPoint3 &origin, uint32_t render_sun_moon, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm,
+    UpdateSky update_sky, float altitude_tolerance, const CloudsRenderFlags flags);
 
-  // ResPtr variant
-  void prepareSkyAndClouds(bool infinite, const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon,
-    const ManagedTex &cloudsDepth, const ManagedTex &prevCloudsDepth, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm,
-    UpdateSky update_sky, bool fixed_offset, float altitude_tolerance = SKY_PREPARE_THRESHOLD, AuroraBorealis *aurora = nullptr,
-    const bool acquare_new_resource = true, const bool set_camera_vars = true);
+  void prepareClouds(bool can_be_inside_clouds, const DPoint3 &origin, const DPoint3 &dir, BaseTexture *clouds_depth,
+    BaseTexture *prev_clouds_depth, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm, UpdateSky update_sky,
+    bool fixed_offset, const CloudsRenderFlags flags);
+
+  void prepareSkyAndInfiniteClouds(const DPoint3 &origin, const DPoint3 &dir, uint32_t render_sun_moon, SkiesData *data,
+    const TMatrix &view_tm, const TMatrix4 &proj_tm, UpdateSky update_sky, bool fixed_offset,
+    float altitude_tolerance = SKY_PREPARE_THRESHOLD, const CloudsRenderFlags flags = CloudsRenderFlags::Default);
 
   bool isCloudsVisible(SkiesData *data);
 
-  void renderClouds(bool infinite, const ManagedTex &cloudsDepth, TEXTUREID targetDepth, SkiesData *data, const TMatrix &view_tm,
-    const TMatrix4 &proj_tm, const Point4 &targetDepthTransform = Point4(1, 1, 0, 0));
-
-  void renderClouds(bool infinite,
-    const TextureIDPair &cloudsDepth, // clouds Depth(s) is supposed to be 1/2 of target depth with mips, if required lower resolution
-    TEXTUREID targetDepth, SkiesData *data, // should have prepared data
-    const TMatrix &view_tm, const TMatrix4 &proj_tm, const Point4 &targetDepthTransform = Point4(1, 1, 0, 0));
+  // ResPtr variant
+  void renderCloudsToTarget(bool can_be_inside_clouds, BaseTexture *cloudsDepth, BaseTexture *targetDepth, SkiesData *data,
+    const TMatrix &view_tm, const TMatrix4 &proj_tm, const Point4 &targetDepthTransform = Point4(1, 1, 0, 0),
+    const CloudsRenderFlags flags = CloudsRenderFlags::Default);
 
   void renderSky(SkiesData *data, // should have prepared data
     const TMatrix &view_tm, const TMatrix4 &proj_tm, const Driver3dPerspective &persp,
-    RenderPrepared render_prepared = RenderPrepared::LowresOnFarPlane, const SphereRenderer *sphere_renderer = nullptr,
-    AuroraBorealis *aurora = nullptr);
+    RenderPrepared render_prepared = RenderPrepared::LowresOnFarPlane, const SphereRenderer *sphere_renderer = nullptr);
+
+  void renderSkyWithoutOverlay(SkiesData *data, // should have prepared data
+    const TMatrix &view_tm, const TMatrix4 &proj_tm, const Driver3dPerspective &persp,
+    RenderPrepared render_prepared = RenderPrepared::LowresOnFarPlane, const SphereRenderer *sphere_renderer = nullptr);
+
+  // overlay is basically strata clouds, stars, moon etc.
+  void renderSkyOverlay(SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm, const Driver3dPerspective &persp,
+    RenderPrepared render_prepared = RenderPrepared::LowresOnFarPlane);
+
   void renderStars(const Driver3dPerspective &persp, const Point3 &origin, float stars_intensity_mul);
   float getCloudsStartAlt(); // effective, i.e. can change based on gpu readback
   float getCloudsTopAlt();   // effective, i.e. can change based on gpu readback
   float getCloudsStartAltSettings() const;
   float getCloudsTopAltSettings() const;
-  void setWindDirection(const Point2 &windDir);
+  void setWindDirection(const Point2 &wind_dir) { windDir = wind_dir; }
+  void setSolidColorMode(bool enabled, const E3DCOLOR &val = E3DCOLOR());
+  bool isSolidColorMode() const { return solidColorMode; }
 
   void renderCelestialObject(const Point3 &dir, float phase, float intensity, float size);
   void renderCelestialObject(TEXTUREID tid, const Point3 &dir, float phase, float intensity, float size);
@@ -426,8 +522,9 @@ public:
   }
   void setAstronomicalSunMoon();
   void calcSunMoonDir(float forward_time, Point3 &sun_dir, Point3 &moon_dir) const;
-  void renderCloudVolume(VolTexture *cloudVolume, float max_dist, const TMatrix &view_tm, const TMatrix4 &proj_tm);
-  void invalidatePanorama(bool force = false, bool waitResourcesLoaded = false);
+  void renderCloudVolume(VolTexture *cloudVolume, TEXTUREID prevCloudVolume, float max_dist, const TMatrix &view_tm,
+    const TMatrix4 &proj_tm, const TMatrix4 &prev_glob_tm);
+  void invalidatePanorama(bool force = false, bool prefetchDependencies = false);
 
   // void setSkiesRenderData(const Point3 &world_view_pos, const Point3 &sun_light_dir, const Color3 &sun_light_color);
 
@@ -436,6 +533,15 @@ public:
   {
     panoramaReprojectionWeight = clamp(w, 0.f, 1.f);
   } // 1- fully reproject, 0 - no reprojection
+
+  void setStaticPanoramaOrigin(const Point3 &origin)
+  {
+    if (origin != panorama_render_origin)
+      invalidatePanorama();
+    panorama_render_origin = origin;
+    panoramaRenderOriginStatic = true;
+  }
+
   void setSunAndMoonDir(const Point3 &sun_dir, const Point3 &moon_dir);
   bool getMoonIsPrimary() const { return moonIsPrimary; }
 
@@ -446,6 +552,8 @@ public:
   float getMinCloudThickness() const { return minCloudThickness; }
   void setMinCloudThickness(float v) { minCloudThickness = v; }
 
+  bool isCpuOnly() const { return cpuOnly; }
+
   void enablePanoramaDownsampledDepth(bool state)
   {
     renderDownsampledDepth = state;
@@ -453,6 +561,8 @@ public:
   }
 
   void getCloudsTextureResourceDependencies(Tab<TEXTUREID> &dependencies) const;
+
+  void debugUI();
 
 protected:
   // internal
@@ -485,17 +595,10 @@ protected:
   float getMaxDensityFilteredInt(int x, int z, float fracX, float fracZ) const;
   void calcScatteringParams();
   void setScatteringParams(const SkyAtmosphereParams &params);
-  void prepareRenderClouds(bool infinite, const Point3 &origin, const TextureIDPair &cloudsDepth,
-    const TextureIDPair &prevCloudsDepth, // clouds Depth(s) is supposed to be 1/2 of target depth with mips, if required lower
-                                          // resolution
-    SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm, bool check_cloud_visibility,
-    const bool acquare_new_resource = true, const bool set_camera_vars = true);
-  void renderCloudsToTarget(bool infinite, const Point3 &origin, const TextureIDPair &downsampledDepth, TEXTUREID targetDepth,
-    const Point4 &targetDepthTransform, SkiesData *data, const TMatrix &view_tm, const TMatrix4 &proj_tm);
 
   void closeCloudsTex();
   void initCloudsTex();
-  void prepareSkies(bool invalidate_cpu = false);
+  void prepareSkies();
 
   void initTracer();
   void closeTracer();
@@ -503,14 +606,15 @@ protected:
   void initCloudsRender(bool useHoles);
   void initPerlinNoise();
 
-  void renderStrataClouds(const Point3 &origin, const TMatrix &view_tm, const TMatrix4 &proj_tm, bool panorama);
+  void setStrataCloudsVars() const;
+  void renderStrataClouds(const Point3 &origin, const TMatrix &view_tm, const TMatrix4 &proj_tm);
   void renderCloudsFullRes(const Point3 &origin, TEXTUREID targetDepth);
   void setCloudsVars();
 
-  bool updatePanorama(const Point3 &origin, const TMatrix &view_tm, const TMatrix4 &proj_tm);
+  bool updatePanorama(const Point3 &origin);
   void renderPanorama(const Point3 &origin, const TMatrix &view_tm, const TMatrix4 &proj_tm, const Driver3dPerspective &persp);
-  void downsamplePanoramaDepth(UniqueTex &depth, UniqueTexHolder &downsampled_depth);
-  void createPanoramaDepthTexHelper(UniqueTex &depth, const char *depth_name, UniqueTexHolder &downsampled_depth,
+  void downsamplePanoramaDepth(UniqueTex &depth, UniqueTexWithShaderVar &downsampled_depth);
+  void createPanoramaDepthTexHelper(UniqueTex &depth, const char *depth_name, UniqueTexWithShaderVar &downsampled_depth,
     const char *downsampled_depth_name, int w, int h, d3d::AddressMode addru, d3d::AddressMode addrv);
   void createPanoramaDepthTex();
   void createDepthPanoramaPatchTex();
@@ -542,6 +646,7 @@ protected:
   uint32_t panoramaValid;
   PostFxRenderer skyPanorama, cloudsPanorama, cloudsAlphaPanorama;
   PostFxRenderer applyCloudsPanorama;
+  PostFxRenderer applySolidColor;
 
   float panoramaRGBMScaleFactor = 1.f;
   // values more than 15 make compression and rgbm artifacts more noticeable
@@ -563,15 +668,13 @@ protected:
 
   carray<UniqueTex, 3> cloudsPanoramaTex, cloudsPanoramaPatchTex; // fixme: we need couple for blending + 1 for 'volume fog'
   UniqueTex cloudsDepthPanoramaTex, cloudsDepthPanoramaPatchTex;
-  UniqueTexHolder cloudsDepthDownsampledPanoramaTex, cloudsDepthDownsampledPanoramaPatchTex;
-  UniqueTexHolder cloudsAlphaPanoramaTex;
-  UniqueTexHolder skyPanoramaTex;
-  UniqueTexHolder cloudsPanoramaMipTex;
+  UniqueTexWithShaderVar cloudsDepthDownsampledPanoramaTex, cloudsDepthDownsampledPanoramaPatchTex;
+  UniqueTexWithShaderVar cloudsAlphaPanoramaTex;
+  UniqueTexWithShaderVar skyPanoramaTex;
+  UniqueTexWithShaderVar cloudsPanoramaMipTex;
   PostFxRenderer cloudsPanoramaMip;
 
   bool panoramaTemporarilyDisabled = false;
-
-  bool panoramaShouldWaitResourcesLoaded = false;
 
   struct PanoramaSavedSettings
   {
@@ -619,8 +722,10 @@ protected:
   Point3 panorama_render_origin = {0, 0, 0};
   float panoramaReprojectionWeight = 0.5f; // 0 - we don't use reprojection, 1 - we fully reproject
   bool panoramaAllowAsyncPipelineFeedback = false;
+  bool panoramaRenderOriginStatic = false;
 
   Point3 real_skies_sun_light_dir;
+  Point2 cloudsCameraXZ = {0, 0}; // last prepared view origin, drives the shadow map window re-centering
   float moonEffect = 0, sunEffect = 1;
 
   // primary sun is either real sun, or moon, depending on what is brighter
@@ -636,7 +741,7 @@ protected:
   PostFxRenderer strata;
   PostFxRenderer skiesApply;
   DynamicShaderHelper skiesSphereApplyShader;
-  SharedTexHolder strataClouds;
+  SharedTexWithShaderVar strataClouds;
   MipRenderer mipRenderer;
   float averageCloudsDensity = 0.5; // todo:
 
@@ -649,8 +754,14 @@ protected:
   CloudsWeatherGen cloudsWeatherGen;
   CloudsForm cloudsForm;
   CloudsRendering cloudsRendering;
+  CloudsTurbulence cloudsTurbulence;
+  bool cloudsCheckerboardTrace = true;
+  Point2 windDir = Point2::ZERO;
 
   bool cpuOnly; // server
+  bool loggedLightingConverged = false;
+  bool solidColorMode = false;
+  E3DCOLOR solidColor;
   class DaStars *skyStars;
   float moonAge;
   Point3 moonDir;
@@ -723,7 +834,12 @@ inline bool DaSkies::CloudsSettingsParams::operator==(const DaSkies::CloudsSetti
 inline bool DaSkies::CloudsWeatherGen::operator==(const DaSkies::CloudsWeatherGen &a) const { return CLOUDS_WEATHER_GEN_PARAMS true; }
 inline bool DaSkies::CloudsForm::operator==(const DaSkies::CloudsForm &a) const { return CLOUDS_FORM_PARAMS true; }
 inline bool DaSkies::CloudsRendering::operator==(const DaSkies::CloudsRendering &a) const { return CLOUDS_RENDERING_PARAMS true; }
+inline bool DaSkies::CloudsTurbulence::operator==(const DaSkies::CloudsTurbulence &a) const { return CLOUDS_TURBULENCE_PARAMS true; }
 inline bool DaSkies::StrataClouds::operator==(const DaSkies::StrataClouds &a) const { return STRATA_CLOUDS_PARAMS true; }
 #undef _PARAM
 #undef _PARAM_RAND
 #undef _PARAM_RAND_CLAMP
+
+#define _PARAM(type, name, def_value) name = a.name;
+inline void DaSkies::CloudsRendering::copyAerosolFrom(const DaSkies::CloudsRendering &a) { CLOUDS_RENDERING_AEROSOL_PARAMS }
+#undef _PARAM

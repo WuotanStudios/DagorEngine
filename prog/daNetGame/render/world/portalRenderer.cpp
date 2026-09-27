@@ -1,7 +1,7 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "portalRenderer.h"
-#include <render/world/cameraParams.h>
+#include <render/cameraParams.h>
 #include <osApiWrappers/dag_cpuJobs.h>
 #include <util/dag_threadPool.h>
 #include <util/dag_convar.h>
@@ -13,13 +13,16 @@
 #include <render/viewVecs.h>
 #include <rendInst/visibility.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
+#include <drv/3d/dag_texture.h>
 #include <shaders/dag_shaderBlock.h>
 #include <rendInst/rendInstGenRender.h>
 #include <main/main.h>
 #include <generic/dag_enumerate.h>
 #include <perfMon/dag_statDrv.h>
 #include "render/renderEvent.h"
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <shaders/portal_render.hlsli>
 #include <rendInst/riExtraRenderer.h>
 
@@ -77,17 +80,17 @@ struct ScopedShVars
 
   ScopedShVars(const Point3 &in_pos, const PortalParams &portal_params)
   {
-    originalZnZfar = ShaderGlobal::get_color4(zn_zfarVarId);
-    originalWorldPos = ShaderGlobal::get_color4(world_view_posVarId);
-    originalVolfogParams = ShaderGlobal::get_color4(volfog_froxel_range_paramsVarId);
+    originalZnZfar = ShaderGlobal::get_float4(zn_zfarVarId);
+    originalWorldPos = ShaderGlobal::get_float4(world_view_posVarId);
+    originalVolfogParams = ShaderGlobal::get_float4(volfog_froxel_range_paramsVarId);
     glassDynamicLight = ShaderGlobal::get_int(glass_dynamic_lightVarId);
     disableWind = ShaderGlobal::get_int(var::disable_wind);
     disableObstacleInteraction = ShaderGlobal::get_int(var::disable_obstacle_interaction);
-    ShaderGlobal::set_color4(world_view_posVarId, in_pos.x, in_pos.y, in_pos.z, 1);
-    ShaderGlobal::set_color4(zn_zfarVarId, Z_NEAR, portal_params.portalRange, 0, 0);
-    ShaderGlobal::set_color4(volfog_froxel_range_paramsVarId, 0, 0, 0, 0); // disable volfog
+    ShaderGlobal::set_float4(world_view_posVarId, in_pos.x, in_pos.y, in_pos.z, 1);
+    ShaderGlobal::set_float4(zn_zfarVarId, Z_NEAR, portal_params.portalRange, 0, 0);
+    ShaderGlobal::set_float4(volfog_froxel_range_paramsVarId, 0, 0, 0, 0); // disable volfog
     ShaderGlobal::set_int(var::portal_use_dense_fog, portal_params.useDenseFog);
-    ShaderGlobal::set_real(var::portal_fog_start_distance, portal_params.fogStartDist);
+    ShaderGlobal::set_float(var::portal_fog_start_distance, portal_params.fogStartDist);
     ShaderGlobal::set_int(glass_dynamic_lightVarId, 0);
     ShaderGlobal::set_int(var::disable_wind, 1);
     ShaderGlobal::set_int(var::disable_obstacle_interaction, 1);
@@ -95,11 +98,11 @@ struct ScopedShVars
 
   ~ScopedShVars()
   {
-    ShaderGlobal::set_color4(zn_zfarVarId, originalZnZfar);
-    ShaderGlobal::set_color4(world_view_posVarId, originalWorldPos);
-    ShaderGlobal::set_color4(volfog_froxel_range_paramsVarId, originalVolfogParams);
+    ShaderGlobal::set_float4(zn_zfarVarId, originalZnZfar);
+    ShaderGlobal::set_float4(world_view_posVarId, originalWorldPos);
+    ShaderGlobal::set_float4(volfog_froxel_range_paramsVarId, originalVolfogParams);
     ShaderGlobal::set_int(var::portal_use_dense_fog, 0);
-    ShaderGlobal::set_real(var::portal_fog_start_distance, 0);
+    ShaderGlobal::set_float(var::portal_fog_start_distance, 0);
     ShaderGlobal::set_int(glass_dynamic_lightVarId, glassDynamicLight);
     ShaderGlobal::set_int(var::disable_wind, disableWind);
     ShaderGlobal::set_int(var::disable_obstacle_interaction, disableObstacleInteraction);
@@ -145,7 +148,7 @@ public:
 
   void wait() { threadpool::wait(this); }
 
-  const char *getJobName(bool &) const override { return "portal_visibility_cull"; }
+  const char *getJobName(bool &) const override { return DAPROFILER_STRING("portal_visibility_cull"); }
 
   void doJob() override
   {
@@ -195,6 +198,14 @@ void PortalRenderer::PortalVisibility::startVisibilityJob(const mat44f &cull_tm,
   portal_visibility_cull_job.start(cull_tm, view_pos, getVisibility());
 }
 
+void PortalRenderer::waitVisibilityJob()
+{
+  if (interlocked_acquire_load(portal_visibility_cull_job.done))
+    return;
+  TIME_PROFILE(wait_portal_visibility);
+  portal_visibility_cull_job.wait();
+}
+
 PortalRenderer::PortalRenderer()
 {
   G_STATIC_ASSERT(PortalRenderer::MAX_RENDERED_CUBES < (1 << PORTAL_INDEX_BITS));
@@ -223,7 +234,6 @@ PortalRenderer::PortalRenderer()
 
   envCubeTexArr = dag::create_cube_array_tex(cube_res, MAX_RENDERED_CUBES, renderTargetFmt | TEXCF_RTARGET | TEXCF_CLEAR_ON_CREATE, 1,
     "portal_env_cube_arr");
-  ShaderGlobal::set_sampler(get_shader_variable_id("portal_env_cube_arr_samplerstate", true), d3d::request_sampler({}));
 
   const char *shatteredGlassMaskTexName = "shattered_glass_mask_tex_n";
   shatteredGlassMaskTex = dag::get_tex_gameres(shatteredGlassMaskTexName, "portal_screen_mask");
@@ -242,6 +252,11 @@ static TMatrix getModifiedCameraMatrix(const TMatrix view_itm)
   TMatrix tm = TMatrix::IDENT;
   tm.setcol(3, view_itm.getcol(3));
   return tm;
+}
+
+void PortalRenderer::setTransparentRt()
+{
+  d3d::set_render_target({renderTargetGbuf->getDepth(), 0}, DepthAccess::SampledRO, {{tmpRenderTargetTex.getBaseTex(), 0}});
 }
 
 void PortalRenderer::renderCube(int portal_cube_index, CameraParams &camera_params)
@@ -328,8 +343,9 @@ void PortalRenderer::renderCube(int portal_cube_index, CameraParams &camera_para
       callbackParams.renderRiNormal(view_itm, riGenVisibility, currentTexCtx, riex_renderer);
     }
     {
-      // dummy transparent rendering (gbuffer is used as target), only used for texture streaming
+      // dummy transparent rendering, only used for texture streaming
       TIME_D3D_PROFILE(portal_render_ri_trans);
+      setTransparentRt();
       callbackParams.renderRiTrans(view_itm, riGenVisibility, currentTexCtx, riex_renderer);
     }
     return;
@@ -371,13 +387,13 @@ void PortalRenderer::renderCube(int portal_cube_index, CameraParams &camera_para
   {
     TIME_D3D_PROFILE(portal_render_water);
     ShaderGlobal::set_texture(downsampled_far_depth_texVarId, renderTargetGbuf->getDepthId());
-    callbackParams.renderWater(tmpRenderTargetTex.getBaseTex(), view_itm, renderTargetGbuf->getDepth());
+    callbackParams.renderWater(tmpRenderTargetTex.getBaseTex(), camera_params, renderTargetGbuf->getDepth());
   }
 
   {
     TIME_D3D_PROFILE(portal_render_ri_trans);
     FRAME_LAYER_GUARD(globalFrameBlockId);
-    d3d::set_render_target({renderTargetGbuf->getDepth(), 0}, DepthAccess::SampledRO, {{tmpRenderTargetTex.getBaseTex(), 0}});
+    setTransparentRt();
     callbackParams.renderRiTrans(view_itm, riGenVisibility, currentTexCtx, riex_renderer);
   }
 
@@ -619,7 +635,7 @@ void PortalRenderer::copyFrameImpl(int cube_index, int face_start, int face_coun
     for (int faceNumber = face_start; faceNumber < face_start + face_count; ++faceNumber)
     {
       const int dstCubeFace = mip + mips * (faceNumber + cube_index * 6);
-      arrayTex->updateSubRegion(tmpRenderTargetTex.getTex2D(), mip, 0, 0, 0, cubeMipSide, cubeMipSide, 1, dstCubeFace, 0, 0, 0);
+      d3d::update_sub_region(tmpRenderTargetTex.getTex2D(), mip, 0, 0, 0, cubeMipSide, cubeMipSide, 1, arrayTex, dstCubeFace, 0, 0, 0);
     }
   }
 }
@@ -732,6 +748,15 @@ int PortalRenderer::getRenderedPortalCubeSlot(int portal_index, TMatrix &portal_
   life = activePortalLifeArr[cubeSlot];
 
   return cubeSlot;
+}
+
+void PortalRenderer::afterDeviceReset()
+{
+  for (auto &data : portalDataVec)
+  {
+    if (data.state == PortalState::Rendered || data.state == PortalState::IsBaking)
+      data.state = PortalState::Dirty;
+  }
 }
 
 

@@ -28,11 +28,11 @@ static void verbose_tex_info(int idx)
     ti.w = ti.h = ti.d = 0;
 
   console::print_d(
-    "%d: %dx%dx%d,L%d, desc=0x%04X max=%d(%d/%d) ld=%d rd=%d req=%d  tm=%X  "
+    "%d: %dx%dx%d,L%d, desc=0x%04X max=%d(%d/%d) ld=%d rd=%d alloc=%d req=%d  tm=%X  "
     "TQ=%d:%d BQ=%d:%d HQ=%d:%d UHQ=%d:%d rc=%d bt.rc=%d bt.id=%d ql=%d(%d) stubIdx=%d gpu=%dK(+%dK) bd=%dK lfu=%u%c(%s)",
     idx, ti.w, ti.h, ti.d, ti.mipLevels, RMGR.levDesc[idx], RMGR.texDesc[idx].dim.maxLev, RMGR.resQS[idx].getQLev(),
-    RMGR.resQS[idx].getMaxLev(), RMGR.resQS[idx].getLdLev(), RMGR.resQS[idx].getRdLev(), RMGR.resQS[idx].getMaxReqLev(),
-    RMGR.getTagMask(idx), RMGR.texDesc[idx].packRecIdx[TQL_thumb].pack,
+    RMGR.resQS[idx].getMaxLev(), RMGR.resQS[idx].getLdLev(), RMGR.resQS[idx].getRdLev(), RMGR.getTexAllocLev(idx),
+    RMGR.resQS[idx].getMaxReqLev(), RMGR.getTagMask(idx), RMGR.texDesc[idx].packRecIdx[TQL_thumb].pack,
     RMGR.uint16_to_int(RMGR.texDesc[idx].packRecIdx[TQL_thumb].rec), RMGR.texDesc[idx].packRecIdx[TQL_base].pack,
     RMGR.uint16_to_int(RMGR.texDesc[idx].packRecIdx[TQL_base].rec), RMGR.texDesc[idx].packRecIdx[TQL_high].pack,
     RMGR.uint16_to_int(RMGR.texDesc[idx].packRecIdx[TQL_high].rec), RMGR.texDesc[idx].packRecIdx[TQL_uhq].pack,
@@ -196,8 +196,7 @@ static bool texmgr_dbgcontrol_console_handler(const char *argv[], int argc)
     TEXTUREID tid = resolve_tid(argv[1]);
     if (tid != BAD_TEXTUREID)
     {
-      if (RMGR.decRefCount(tid.index()) == 0)
-        RMGR.incReadyForDiscardTex(tid.index());
+      RMGR.decRefCountAndIncReadyForDiscardTex(tid.index());
       console::print_d("del ref for (%s)=0x%x -> rc=%d", RMGR.getName(tid.index()), tid, RMGR.getRefCount(tid));
       verbose_tex_info(tid.index());
     }

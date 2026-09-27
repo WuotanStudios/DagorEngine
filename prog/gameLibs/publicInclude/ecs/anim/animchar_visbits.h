@@ -4,7 +4,9 @@
 //
 #pragma once
 
-using animchar_visbits_t = uint16_t;
+#include <render/cascadeShadowsDecl.h>
+
+using animchar_visbits_t = uint32_t;
 
 enum AnimcharVisbits : animchar_visbits_t
 {
@@ -22,7 +24,11 @@ enum AnimcharVisbits : animchar_visbits_t
   VISFLG_SEMI_TRANS_RENDERED = 1 << 13,
   VISFLG_CSM_SHADOW_RENDERED = 1 << 14,
   VISFLG_MAIN_CAMERA_RENDERED = 1 << 15,
-  VISFLG_ALL_BITS = 0xFFFF
+  VISFLG_BVH_MAIN_VISIBLE = 1 << 16, // Passed occlusion test on mainOcclusion, does NOT use increased lods
+  VISFLG_SHADOW_CASCADE_0_VISIBLE = 1 << 17,
+  VISFLG_SHADOW_CASCADE_LAST_VISIBLE = VISFLG_SHADOW_CASCADE_0_VISIBLE << (CSM_MAX_CASCADES - 1),
+  VISFLG_SHADOW_CASCADE_VISIBLE_MASK = ((VISFLG_SHADOW_CASCADE_LAST_VISIBLE << 1) - 1) & ~(VISFLG_SHADOW_CASCADE_0_VISIBLE - 1),
+  VISFLG_ALL_BITS = 0xFFFFFFFF
 };
 
 inline void mark_cockpit_visible(animchar_visbits_t &animchar_visbits)

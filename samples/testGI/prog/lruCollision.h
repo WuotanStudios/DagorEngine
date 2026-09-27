@@ -2,9 +2,12 @@
 #pragma once
 
 #include <gameRes/dag_collisionResource.h>
+#include <gameRes/collisionResourceBuilder.h>
+#include <debug/dag_log.h>
 #include <render/lruCollision.h>
 #include <daGI2/lruCollisionVoxelization.h>
 #include <scene/dag_tiledScene.h>
+#include <rendInst/riCollisionDump.h>
 
 // todo: add tiledScene or something
 struct LRUCollision
@@ -18,61 +21,96 @@ struct LRUCollision
   size_t count = 0;
   scene::TiledScene scene;
   size_t size() const { return collRes.size(); }
-  size_t addCollRes(const dag::Vector<Point3_vec4> &vertices, const dag::Vector<uint16_t> &indices)
+  size_t addCollRes(const dag::Vector<Point3_vec4> &vertices, const dag::Vector<uint32_t> &indices)
   {
-    eastl::unique_ptr<CollisionResource> coll(new CollisionResource());
-    coll->numMeshNodes = 1;
-    auto &n = coll->createNode();
-    coll->meshNodesHead = &n;
-    n.flags = n.IDENT;
-    n.tm = TMatrix::IDENT;
-    n.resetVertices(make_span(memalloc_typed<Point3_vec4>(vertices.size(), midmem), vertices.size()));
-    mem_copy_from(n.vertices, vertices.data());
-    n.resetIndices(make_span(memalloc_typed<uint16_t>(indices.size(), midmem), indices.size()));
-    mem_copy_from(n.indices, indices.data());
-    v_bbox3_init_empty(coll->vFullBBox);
+    bbox3f bbox;
+    v_bbox3_init_empty(bbox);
     for (auto &v : vertices)
-      v_bbox3_add_pt(coll->vFullBBox, v_ld(&v.x));
-    collRes.push_back(eastl::move(coll));
+      v_bbox3_add_pt(bbox, v_ld(&v.x));
+    alignas(16) BBox3 bBox;
+    v_st(&bBox[0].x, bbox.bmin);
+    v_stu_p3(&bBox[1].x, bbox.bmax);
+    CollisionResourceBuilder builder;
+    builder.addMeshNode("mesh", -1, TMatrix::IDENT, bBox, make_span_const(vertices), make_span_const(indices));
+    builder.recomputeBounds();
+    builder.collapse("mesh");
+    collRes.emplace_back(builder.build("mesh"));
     return collRes.size() - 1;
   }
   void load(IGenLoad &cb)
   {
-    cb.readInt();
-    struct Mesh
+    // Keeps every record: widens legacy 16-bit indices to uint32, builds a
+    // CollisionResource per mesh and the per-instance boxes/spheres.
+    struct LoadHandler
     {
-      dag::Vector<uint16_t> indices;
-      dag::Vector<Point3> vertices;
-    };
-    Mesh mesh;
-    dag::Vector<Point3_vec4> vertices;
-    for (int i = 0; cb.tell() < cb.getTargetDataSize(); ++i)
-    {
-      mesh.indices.resize(cb.readInt());
-      cb.read(mesh.indices.begin(), mesh.indices.size() * sizeof(*mesh.indices.data()));
-      mesh.vertices.resize(cb.readInt());
-      cb.read(mesh.vertices.begin(), mesh.vertices.size() * sizeof(*mesh.vertices.data()));
-      vertices.resize(mesh.vertices.size());
-      for (int j = 0; j < mesh.vertices.size(); ++j)
-        vertices[j] = mesh.vertices[j];
-      addCollRes(vertices, mesh.indices);
+      LRUCollision &self;
+      dag::Vector<uint32_t> indices;   // wide dest, or legacy widened in endMesh
+      dag::Vector<uint16_t> indices16; // legacy read scratch
+      dag::Vector<Point3> verts;       // raw read scratch
+      dag::Vector<Point3_vec4> verts4; // the builder's mesh input
 
-      int instCount = cb.readInt();
-      instances.push_back().resize(instCount);
-      cb.read(instances.back().data(), instances.back().size() * sizeof(mat43f));
-      v_bbox3_init_empty(typeBoxes.push_back());
-      bbox3f ibox = collRes.back()->vFullBBox;
-      instancesSph.push_back().resize(instCount);
-      for (size_t j = 0, je = instances.back().size(); j != je; ++j)
+      bool wantMesh(int, bool) { return true; }
+      void *indexBuffer(int count, bool wide)
       {
-        mat44f m;
-        v_mat43_transpose_to_mat44(m, instances.back()[j]);
-        bbox3f boxAABB;
-        v_bbox3_init(boxAABB, m, ibox);
-        v_bbox3_add_box(typeBoxes.back(), boxAABB);
-        instancesSph.back()[j] = v_perm_xyzd(v_bbox3_center(boxAABB), v_splat_x(v_bbox3_outer_rad(boxAABB)));
+        if (wide)
+        {
+          indices.resize(count);
+          return indices.data();
+        }
+        indices16.resize(count);
+        return indices16.data();
       }
-      count += instances.back().size();
+      Point3 *vertexBuffer(int count)
+      {
+        verts.resize(count);
+        return verts.data();
+      }
+      mat43f *instanceBuffer(int count)
+      {
+        auto &inst = self.instances.push_back();
+        inst.resize(count);
+        return inst.data();
+      }
+      void endMesh(int, bool wide, int indexCount, int vertCount, int)
+      {
+        if (!wide)
+        {
+          indices.resize(indexCount);
+          for (int j = 0; j < indexCount; ++j)
+            indices[j] = indices16[j];
+        }
+        verts4.resize(vertCount);
+        for (int j = 0; j < vertCount; ++j)
+          verts4[j] = verts[j];
+        self.addCollRes(verts4, indices);
+
+        const dag::Vector<mat43f> &inst = self.instances.back();
+        v_bbox3_init_empty(self.typeBoxes.push_back());
+        bbox3f ibox = self.collRes.back()->vFullBBox;
+        auto &sph = self.instancesSph.push_back();
+        sph.resize(inst.size());
+        for (size_t j = 0, je = inst.size(); j != je; ++j)
+        {
+          mat44f m;
+          v_mat43_transpose_to_mat44(m, inst[j]);
+          bbox3f boxAABB;
+          v_bbox3_init(boxAABB, m, ibox);
+          v_bbox3_add_box(self.typeBoxes.back(), boxAABB);
+          sph[j] = v_perm_xyzd(v_bbox3_center(boxAABB), v_splat_x(v_bbox3_outer_rad(boxAABB)));
+        }
+        self.count += inst.size();
+      }
+    } handler{*this};
+    if (!read_ri_collision_dump(cb, handler))
+    {
+      // Corrupt/truncated dump: reject wholesale rather than build a partial scene from it.
+      logerr("ri_collisions: corrupt or truncated collision dump; rejecting load");
+      collRes.clear();
+      instances.clear();
+      instancesSph.clear();
+      typeBoxes.clear();
+      count = 0;
+      return;
     }
     init();
   }

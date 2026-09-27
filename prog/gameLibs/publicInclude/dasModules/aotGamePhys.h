@@ -7,6 +7,7 @@
 #include <dasModules/dasModulesCommon.h>
 #include <dasModules/aotDagorMath.h>
 #include <dasModules/dasManagedTab.h>
+#include <util/dag_bitwise_cast.h>
 #include <gamePhys/common/loc.h>
 #include <gamePhys/common/mass.h>
 #include <gamePhys/props/atmosphere.h>
@@ -18,8 +19,6 @@ class ECSCustomPhysStateSyncer;
 
 MAKE_TYPE_FACTORY(Orient, gamephys::Orient);
 MAKE_TYPE_FACTORY(Loc, gamephys::Loc);
-MAKE_TYPE_FACTORY(LocalOrient, gamephys::SimpleLoc::LocalOrient);
-MAKE_TYPE_FACTORY(SimpleLoc, gamephys::SimpleLoc);
 MAKE_TYPE_FACTORY(CommonPhysPartialState, CommonPhysPartialState);
 MAKE_TYPE_FACTORY(MassProps, gamephys::MassProps);
 MAKE_TYPE_FACTORY(MassState, gamephys::MassState);
@@ -27,6 +26,8 @@ MAKE_TYPE_FACTORY(Mass, gamephys::Mass);
 MAKE_TYPE_FACTORY(FloatingVolume, gamephys::floating_volumes::FloatingVolume);
 MAKE_TYPE_FACTORY(VolumetricDamageData, gamephys::VolumetricDamageData);
 MAKE_TYPE_FACTORY(ECSCustomPhysStateSyncer, ECSCustomPhysStateSyncer);
+MAKE_TYPE_FACTORY(FuelTankProps, gamephys::FuelTankProps);
+MAKE_TYPE_FACTORY(FuelTankState, gamephys::FuelTankState);
 
 using SpheresTab = Tab<BSphere3>;
 DAS_BIND_VECTOR(SpheresTab, SpheresTab, BSphere3, "SpheresTab"); // Used in FloatingVolume, PhysObj:ccdSpheres, ...
@@ -44,9 +45,13 @@ inline void orient_transformInv(const gamephys::Orient &orient, das::float3 &vec
 {
   orient.transformInv(reinterpret_cast<Point3 &>(vec));
 }
-inline void location_toTM(const gamephys::Loc &location, das::float3x4 &tm) { location.toTM(reinterpret_cast<TMatrix &>(tm)); }
+inline void location_toTM(const gamephys::Loc &location, das::float3x4 &tm)
+{
+  TMatrix res;
+  location.toTM(res);
+  tm = dag::bit_cast<das::float3x4>(res);
+}
 inline TMatrix location_makeTM(const gamephys::Loc &location) { return location.makeTM(); }
-inline gamephys::SimpleLoc make_empty_SimpleLoc() { return gamephys::SimpleLoc(); }
 
 template <typename Phys>
 inline void registerCustomPhysStateSyncer(Phys &phys, ECSCustomPhysStateSyncer &syncer)
@@ -58,6 +63,16 @@ template <typename Phys>
 inline bool unregisterCustomPhysStateSyncer(Phys &phys, ECSCustomPhysStateSyncer &syncer)
 {
   return phys.unregisterCustomPhysStateSyncer(syncer);
+}
+
+inline gamephys::FuelTankProps massProps_getFuelTankProps(const gamephys::MassProps &mass_props, int idx)
+{
+  return mass_props.fuelTankProps[idx];
+}
+
+inline gamephys::FuelTankState massState_getFuelTankState(const gamephys::MassState &mass_state, int idx)
+{
+  return mass_state.fuelTankStates[idx];
 }
 
 } // namespace bind_dascript

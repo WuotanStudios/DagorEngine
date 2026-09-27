@@ -47,7 +47,7 @@ static eastl::optional<PROCESS_INFORMATION> create_child_process(const char *cmd
 static int read_from_pipe(HANDLE hOutReadPipe, eastl::fixed_string<char, OUTPUT_SIZE> &output)
 {
   DWORD dwRead;
-  CHAR chBuf[PIPE_SIZE];
+  CHAR chBuf[PIPE_SIZE + 1];
   BOOL bSuccess = FALSE;
   int tries = 0;
   for (; tries < PIPE_MAX_READ_TRIES; ++tries)
@@ -197,6 +197,10 @@ bool check_modified_files(dag::ConstSpan<SimpleString> file_paths)
     sh_debug(SHLOG_INFO, "There are local changes in shaders. Timestamps for compiled shaders is forced to 0");
     return true;
   }
+  output.clear();
+  execute_cmd("git branch --show-current", output);
+  if (output != "master\n" && output != "master")
+    return false;
   output.clear();
   execute_cmd("git rev-list --count HEAD --not origin/master", output);
   const bool hasLocalCommits = output.empty() || output[0] != '0';

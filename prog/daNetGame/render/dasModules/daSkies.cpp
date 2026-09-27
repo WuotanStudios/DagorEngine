@@ -2,7 +2,7 @@
 
 #include "render/dasModules/daSkies.h"
 #include <main/weatherPreset.h>
-#include <render/light_consts.hlsli>
+#include <render/lights/light_consts.hlsli>
 
 struct DngSkiesAnnotation : das::ManagedStructureAnnotation<DngSkies, false>
 {
@@ -38,8 +38,8 @@ public:
     das::ModuleLibrary lib(this);
     addBuiltinDependency(lib, require("DagorDataBlock"));
     addBuiltinDependency(lib, require("DagorDataBlock"));
-    addAnnotation(das::make_smart<StrataCloudsAnnotation>(lib));
-    addAnnotation(das::make_smart<DngSkiesAnnotation>(lib));
+    addAnnotation(new StrataCloudsAnnotation(lib));
+    addAnnotation(new DngSkiesAnnotation(lib));
     das::addExtern<DAS_BIND_FUN(get_daskies_time)>(*this, lib, "get_daskies_time", das::SideEffects::accessExternal,
       "get_daskies_time");
     das::addExtern<DAS_BIND_FUN(set_daskies_time)>(*this, lib, "set_daskies_time", das::SideEffects::modifyExternal,
@@ -62,8 +62,6 @@ public:
       "bind_dascript::daskies_setStarsJulianDay");
     das::addExtern<DAS_BIND_FUN(daskies_currentGroundSunSkyColor)>(*this, lib, "daskies_currentGroundSunSkyColor",
       das::SideEffects::modifyArgument, "bind_dascript::daskies_currentGroundSunSkyColor");
-    das::addExtern<DAS_BIND_FUN(select_weather_preset_delayed)>(*this, lib, "select_weather_preset_delayed",
-      das::SideEffects::modifyExternal, "select_weather_preset_delayed");
     das::addExtern<DAS_BIND_FUN(das_get_current_weather_preset_name)>(*this, lib, "get_current_weather_preset_name",
       das::SideEffects::accessExternal, "::bind_dascript::das_get_current_weather_preset_name");
     compileBuiltinModule("daSkies.das", (unsigned char *)daSkies_das, sizeof(daSkies_das));

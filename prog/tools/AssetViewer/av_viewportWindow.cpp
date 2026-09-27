@@ -34,28 +34,84 @@ static const char *asset_stat_names[AssetStatType::Count] = {
   "triangles renderable", "phys geometry", "trace geometry", "material count", "texture count", "current LOD"};
 static bool displayed_asset_stats[AssetStatType::Count] = {true, true, true, true, true, true};
 
+struct FxStatType
+{
+  enum
+  {
+    Instances = 0,
+    Particles,
+    SimulatedElems,
+    DrawCalls,
+    ModfxTris,
+    SparksTris,
+    ElemSizes,
+    Count,
+  };
+};
+
+G_STATIC_ASSERT(FxStatType::Count == 7);
+static const char *fx_stat_names[FxStatType::Count] = {
+  "instances", "particles", "simulated elems", "draw calls", "modfx tris", "sparks tris", "element sizes"};
+static bool displayed_fx_stats[FxStatType::Count] = {true, true, true, true, true, true, true};
+
+static int get_fx_stat_index_by_name(const char *name)
+{
+  for (int i = 0; i < FxStatType::Count; ++i)
+    if (strcmp(fx_stat_names[i], name) == 0)
+      return i;
+  return -1;
+}
+
+int AssetViewerViewportWindow::onMenuItemClick(unsigned id)
+{
+  switch (id)
+  {
+    case CM_CAMERAS_FREE:
+    case CM_CAMERAS_FPS:
+    case CM_CAMERAS_TPS: static_cast<PropPanel::IMenuEventHandler &>(get_app()).onMenuItemClick(id); break;
+  }
+
+  return ViewportWindow::onMenuItemClick(id);
+}
+
 void AssetViewerViewportWindow::load(const DataBlock &blk)
 {
   ViewportWindow::load(blk);
 
-  showAssetStats = blk.getBool("show_asset_stats", false);
+  showAssetStats = blk.getBool("show_asset_stats", showAssetStats);
+  showFxStats = blk.getBool("show_fx_stats", showFxStats);
 
-  const DataBlock *assetStatBlock = blk.getBlockByName("displayed_asset_stat_list");
-  if (!assetStatBlock)
-    return;
+  if (const auto *assetStatBlock = blk.getBlockByName("displayed_asset_stat_list"))
+  {
+    for (int i = 0; i < AssetStatType::Count; ++i)
+      displayed_asset_stats[i] = false;
 
-  for (int i = 0; i < AssetStatType::Count; ++i)
-    displayed_asset_stats[i] = false;
+    const int nid = assetStatBlock->getNameId("stat");
+    for (int i = 0; i < assetStatBlock->paramCount(); ++i)
+      if (assetStatBlock->getParamType(i) == DataBlock::TYPE_STRING && assetStatBlock->getParamNameId(i) == nid)
+      {
+        const char *statName = assetStatBlock->getStr(i);
+        const int statIndex = getAssetStatIndexByName(statName);
+        if (statIndex >= 0)
+          displayed_asset_stats[statIndex] = true;
+      }
+  }
 
-  const int nid = assetStatBlock->getNameId("stat");
-  for (int i = 0; i < assetStatBlock->paramCount(); ++i)
-    if (assetStatBlock->getParamType(i) == DataBlock::TYPE_STRING && assetStatBlock->getParamNameId(i) == nid)
-    {
-      const char *statName = assetStatBlock->getStr(i);
-      const int statIndex = getAssetStatIndexByName(statName);
-      if (statIndex >= 0)
-        displayed_asset_stats[statIndex] = true;
-    }
+  if (const DataBlock *fxStatBlock = blk.getBlockByName("displayed_fx_stat_list"))
+  {
+    for (int i = 0; i < FxStatType::Count; ++i)
+      displayed_fx_stats[i] = false;
+
+    const int nid = fxStatBlock->getNameId("stat");
+    for (int i = 0; i < fxStatBlock->paramCount(); ++i)
+      if (fxStatBlock->getParamType(i) == DataBlock::TYPE_STRING && fxStatBlock->getParamNameId(i) == nid)
+      {
+        const char *statName = fxStatBlock->getStr(i);
+        const int statIndex = get_fx_stat_index_by_name(statName);
+        if (statIndex >= 0)
+          displayed_fx_stats[statIndex] = true;
+      }
+  }
 }
 
 void AssetViewerViewportWindow::save(DataBlock &blk) const
@@ -63,6 +119,7 @@ void AssetViewerViewportWindow::save(DataBlock &blk) const
   ViewportWindow::save(blk);
 
   blk.setBool("show_asset_stats", showAssetStats);
+  blk.setBool("show_fx_stats", showFxStats);
 
   DataBlock *assetStatBlock = blk.addBlock("displayed_asset_stat_list");
   assetStatBlock->clearData();
@@ -70,6 +127,13 @@ void AssetViewerViewportWindow::save(DataBlock &blk) const
   for (int i = 0; i < AssetStatType::Count; ++i)
     if (displayed_asset_stats[i])
       assetStatBlock->addStr("stat", asset_stat_names[i]);
+
+  DataBlock *fxStatBlock = blk.addBlock("displayed_fx_stat_list");
+  fxStatBlock->clearData();
+
+  for (int i = 0; i < FxStatType::Count; ++i)
+    if (displayed_fx_stats[i])
+      fxStatBlock->addStr("stat", fx_stat_names[i]);
 }
 
 void AssetViewerViewportWindow::formatGeometryStat(String &statText, const char *stat_name, const AssetStats::GeometryStat &geometry)
@@ -128,62 +192,109 @@ void AssetViewerViewportWindow::paint(int w, int h)
 
   ViewportWindow::paint(w, h);
 
-  if (!needShowAssetStats())
+  const bool showAsset = needShowAssetStats();
+  const bool showFx = needShowFxStats() && fxStats.valid;
+  if (!showAsset && !showFx)
     return;
 
   StdGuiRender::start_render();
 
   String statText;
-
-  if (assetStats.assetType == AssetStats::AssetType::None)
-  {
-    statText = "asset stats: -";
-    drawText(_pxScaled(8), nextStat3dLineY, statText);
+  auto drawLine = [&](const String &text) {
+    drawText(_pxScaled(8), nextStat3dLineY, text);
     nextStat3dLineY += _pxScaled(20);
-  }
-  else
+  };
+
+  if (showAsset)
   {
-    for (int i = 0; i < AssetStatType::Count; ++i)
+    if (assetStats.assetType == AssetStats::AssetType::None)
     {
-      if (!displayed_asset_stats[i])
-        continue;
-
-      if (assetStats.assetType == AssetStats::AssetType::Collision && i != AssetStatType::PhysGeometry &&
-          i != AssetStatType::TraceGeometry)
-        continue;
-
-      if (i == AssetStatType::CurrentLod)
+      if (!showFx)
       {
-        if (assetStats.mixedLod)
-          statText.printf(64, "%s: mixed", asset_stat_names[AssetStatType::CurrentLod]);
-        else if (assetStats.currentLod >= 0)
-          statText.printf(64, "%s: %d", asset_stat_names[AssetStatType::CurrentLod], assetStats.currentLod);
-        else
-          statText.printf(64, "%s: none", asset_stat_names[AssetStatType::CurrentLod]);
+        statText = "asset stats: -";
+        drawLine(statText);
       }
-      else if (i == AssetStatType::PhysGeometry)
-        formatGeometryStat(statText, asset_stat_names[i], assetStats.physGeometry);
-      else if (i == AssetStatType::TraceGeometry)
-        formatGeometryStat(statText, asset_stat_names[i], assetStats.traceGeometry);
-      else
-        statText.printf(64, "%s: %d", asset_stat_names[i], getAssetStatByIndex(i));
+    }
+    else
+    {
+      for (int i = 0; i < AssetStatType::Count; ++i)
+      {
+        if (!displayed_asset_stats[i])
+          continue;
 
-      drawText(_pxScaled(8), nextStat3dLineY, statText);
-      nextStat3dLineY += _pxScaled(20);
+        if (assetStats.assetType == AssetStats::AssetType::Collision && i != AssetStatType::PhysGeometry &&
+            i != AssetStatType::TraceGeometry)
+          continue;
+
+        if (i == AssetStatType::CurrentLod)
+        {
+          if (assetStats.mixedLod)
+            statText.printf(64, "%s: mixed", asset_stat_names[AssetStatType::CurrentLod]);
+          else if (assetStats.currentLod >= 0)
+            statText.printf(64, "%s: %d", asset_stat_names[AssetStatType::CurrentLod], assetStats.currentLod);
+          else
+            statText.printf(64, "%s: none", asset_stat_names[AssetStatType::CurrentLod]);
+        }
+        else if (i == AssetStatType::PhysGeometry)
+          formatGeometryStat(statText, asset_stat_names[i], assetStats.physGeometry);
+        else if (i == AssetStatType::TraceGeometry)
+          formatGeometryStat(statText, asset_stat_names[i], assetStats.traceGeometry);
+        else
+          statText.printf(64, "%s: %d", asset_stat_names[i], getAssetStatByIndex(i));
+
+        drawLine(statText);
+      }
+    }
+  }
+
+  if (showFx)
+  {
+    for (int i = 0; i < FxStatType::Count; ++i)
+    {
+      if (!displayed_fx_stats[i])
+        continue;
+
+      switch (i)
+      {
+        case FxStatType::Instances: statText.printf(64, "fx instances: %d", fxStats.instances); break;
+        case FxStatType::Particles: statText.printf(64, "fx particles: %d", fxStats.totalParticles); break;
+        case FxStatType::SimulatedElems:
+          statText.printf(64, "fx cpu elems: %d", fxStats.cpuElemProcessed);
+          drawLine(statText);
+          statText.printf(64, "fx gpu elems: %d", fxStats.gpuElemProcessed);
+          break;
+        case FxStatType::DrawCalls: statText.printf(64, "fx draw calls: %d", fxStats.drawCalls); break;
+        case FxStatType::ModfxTris: statText.printf(64, "modfx tris: %d", fxStats.modfxTris); break;
+        case FxStatType::SparksTris: statText.printf(64, "sparks tris: %d", fxStats.sparksTris); break;
+        case FxStatType::ElemSizes:
+          statText.printf(96, "param ren: %d, sim: %d", fxStats.paramRenSize, fxStats.paramSimSize);
+          drawLine(statText);
+          statText.printf(96, "particle ren: %d, sim: %d", fxStats.partRenSize, fxStats.partSimSize);
+          break;
+      }
+
+      drawLine(statText);
     }
   }
 
   StdGuiRender::end_render();
 }
 
-void AssetViewerViewportWindow::fillStatSettingsDialog(ViewportWindowStatSettingsDialog &dialog)
+void AssetViewerViewportWindow::fillStatSettingsDialog(ViewportWindowStatSettingsDialog &dialog, bool include_camera_distance)
 {
-  ViewportWindow::fillStatSettingsDialog(dialog);
+  ViewportWindow::fillStatSettingsDialog(dialog, include_camera_distance);
 
-  PropPanel::TLeafHandle assetStatsGroup = dialog.addGroup(CM_STATS_SETTINGS_ASSET_STATS_GROUP, "Asset stats", showAssetStats);
+  PropPanel::TLeafHandle assetStatsGroup =
+    dialog.addGroup(CM_STATS_SETTINGS_ASSET_STATS_GROUP, "Asset stats", showAssetStats, DEFAULT_SHOW_ASSET_STATS);
   G_STATIC_ASSERT((CM_STATS_SETTINGS_ASSET_STAT_LAST - CM_STATS_SETTINGS_ASSET_STAT_FIRST + 1) == AssetStatType::Count);
   for (int i = 0; i < AssetStatType::Count; ++i)
     dialog.addOption(assetStatsGroup, CM_STATS_SETTINGS_ASSET_STAT_FIRST + i, asset_stat_names[i], displayed_asset_stats[i]);
+
+  PropPanel::TLeafHandle fxStatsGroup =
+    dialog.addGroup(CM_STATS_SETTINGS_FX_STATS_GROUP, "FX stats", showFxStats, DEFAULT_SHOW_FX_STATS);
+  G_STATIC_ASSERT((CM_STATS_SETTINGS_FX_STAT_LAST - CM_STATS_SETTINGS_FX_STAT_FIRST + 1) == FxStatType::Count);
+  for (int i = 0; i < FxStatType::Count; ++i)
+    dialog.addOption(fxStatsGroup, CM_STATS_SETTINGS_FX_STAT_FIRST + i, fx_stat_names[i], displayed_fx_stats[i]);
 }
 
 void AssetViewerViewportWindow::handleStatSettingsDialogChange(int pcb_id, bool value)
@@ -196,6 +307,10 @@ void AssetViewerViewportWindow::handleStatSettingsDialogChange(int pcb_id, bool 
   }
   else if (pcb_id == CM_STATS_SETTINGS_ASSET_STATS_GROUP)
     showAssetStats = value;
+  else if (pcb_id >= CM_STATS_SETTINGS_FX_STAT_FIRST && pcb_id <= CM_STATS_SETTINGS_FX_STAT_LAST)
+    displayed_fx_stats[pcb_id - CM_STATS_SETTINGS_FX_STAT_FIRST] = value;
+  else if (pcb_id == CM_STATS_SETTINGS_FX_STATS_GROUP)
+    showFxStats = value;
   else
     ViewportWindow::handleStatSettingsDialogChange(pcb_id, value);
 }

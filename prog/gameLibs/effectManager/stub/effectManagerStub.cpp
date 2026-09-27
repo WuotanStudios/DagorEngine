@@ -10,6 +10,8 @@ void AcesEffect::setVelocity(const Point3 &) {}
 void AcesEffect::setVelocityScaleMinMax(const Point2 &) {}
 void AcesEffect::setSpawnRate(float) {}
 void AcesEffect::setLightRadiusMultiplier(float) {}
+void AcesEffect::setLightFlags(uint32_t) {}
+void AcesEffect::setLightSourceRadius(float) {}
 void AcesEffect::setColorMult(const Color4 &) {}
 void AcesEffect::setVisibility(uint32_t) {}
 void AcesEffect::hide(bool) {}
@@ -24,3 +26,4 @@ const Point3 &AcesEffect::getWorldPos() const { return ZERO<Point3>(); }
 float AcesEffect::lifeTime() const { return 0; }
 void AcesEffect::pauseSound(bool) {}
 bool AcesEffect::hasSound() const { return false; }
+void AcesEffect::warmup(float, float) {}

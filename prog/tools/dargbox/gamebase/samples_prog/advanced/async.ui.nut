@@ -1,8 +1,8 @@
-from "%sqstd/asyncHttp.nut" import TaskHttpGet, TaskHttpMultiGet
+from "%sqstd/asyncHttp.nut" import TaskHttpGet
 from "%darg/ui_imports.nut" import *
 from "%darg/laconic.nut" import *
 
-let Promise = require("%sqstd/Promise.nut")
+let { Future, delay } = require("async")
 let { Task } = require("%sqstd/monads.nut")
 
 function btn(text, handler){
@@ -18,15 +18,51 @@ function conlog(...){
   consoleStream.set(v)
 }
 
-function checkPromises(){
-  Promise(@(resolve, _reject)
-    gui_scene.setTimeout(0.2, @() resolve("Promise resolved first one"))
-  ).then(function(res){
-      conlog(res)
-      return Promise(@(resolve, _)
-          gui_scene.setTimeout(0.2, @() resolve("Promise resolved second one"))
-      )
-  }).then(@(res) conlog(res) )
+// Wrap a callback-shape API (gui_scene.setTimeout) into an awaitable Future.
+// Same pattern used to adapt eventbus / httpRequest / file IO callbacks.
+// Plain sync function returning a Future: `await` peels one level, so the
+// await site sees the resolved value. The `: instance` annotation tells the
+// analyzer the return may be a Future, suppressing w328 redundant-await at callers.
+function timeoutFuture(sec, value): instance {
+  let p = Future()
+  gui_scene.setTimeout(sec, @() p.resolve(value))
+  return p
+}
+
+// Async function that throws after a delay. A thrown value faults the
+// task-future and surfaces via the await-throw channel for bug-shaped
+// failures; Future.reject(value) is the other way to a faulted state.
+async function delayedThrow(sec, reason) {
+  await delay(sec)
+  throw reason
+}
+
+async function checkFutures() {
+  // Sequential awaits
+  await delay(0.2)
+  conlog("step 1: delay done")
+
+  // Wrapped callback API consumed via await
+  let wrapped = await timeoutFuture(0.2, "wrapped value")
+  conlog($"step 2: got {wrapped}")
+
+  // Parallel: start both before awaiting either. Total ~0.4s, not 0.7s.
+  let a = delay(0.4)
+  let b = delay(0.3)
+  await a
+  conlog("step 3: a (0.4s) settled")
+  await b
+  conlog("step 3: b (0.3s) was already settled")
+
+  // Bug-shaped failure caught via try/catch around await.
+  // (For documented failures, resolve with {ok=false, err=...} instead.)
+  try {
+    await delayedThrow(0.2, "simulated bug")
+  } catch (e) {
+    conlog($"step 4: caught {e}")
+  }
+
+  conlog("checkFutures complete")
 }
 
 function checkObservables(){
@@ -84,7 +120,7 @@ function checkHttpTask(){
 */
 
 let console = @() {
-  watch = consoleStream vplace = ALIGN_BOTTOM rendObj = ROBJ_SOLID size = static [sw(30), flex()] clipChildren = true color = Color(10,10,10) valign = ALIGN_BOTTOM
+  watch = consoleStream vplace = ALIGN_BOTTOM rendObj = ROBJ_SOLID size = const [sw(30), flex()] clipChildren = true color = Color(10,10,10) valign = ALIGN_BOTTOM
   children = vflow(consoleStream.get().map(txt), Gap(hdpx(2)))
 }
 let setTimeout = @(func, timeout) gui_scene.setTimeout(timeout, func)
@@ -149,7 +185,7 @@ return {
   children = [
     vflow(
       Gap(hdpx(2))
-      btn("check promise", checkPromises)
+      btn("check future", checkFutures)
       btn("check HttpTask monad", checkHttpTask)
       btn("check observables", checkObservables)
       helloTaskBtn

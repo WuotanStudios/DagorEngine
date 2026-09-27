@@ -56,6 +56,9 @@ public:
 
   virtual void enableRender(bool enable) = 0;
 
+  // Suppress presenting the scene's rendered frame to the screen, unless a modal dialog needs to be shown.
+  virtual void suppressScenePresent(bool suppress) = 0;
+
   // Set the service's scene as the current game scene (with dagor_select_game_scene()).
   virtual void selectAsGameScene() = 0;
 
@@ -69,7 +72,7 @@ public:
 
   virtual TexStreamingContext getMainViewStreamingContext() = 0;
   virtual void renderViewportFrame(ViewportWindow *vpw) = 0;
-  virtual void renderScreenshot() = 0;
+  virtual void renderScreenshot(const Driver3dPerspective &persp, bool is_ortho, bool force_disable_wireframe) = 0;
 
   virtual dag::ConstSpan<int> getSupportedRenderTypes() const = 0;
   virtual int getRenderType() const = 0;
@@ -91,6 +94,7 @@ public:
   virtual bool hasExposure() const = 0;
   virtual void setExposure(float exposure) = 0;
   virtual float getExposure() = 0;
+  virtual float getEffectiveExposure() { return getExposure(); }
 
   virtual void getPostFxSettings(DemonPostFxSettings &set) = 0;
   virtual void setPostFxSettings(DemonPostFxSettings &set) = 0;
@@ -104,11 +108,20 @@ public:
   virtual BaseTexture *getDepthBuffer() = 0;
   virtual D3DRESID getDepthBufferId() = 0;
   virtual const ManagedTex &getDownsampledFarDepth() = 0;
+  virtual const ManagedTex &getPrevDownsampledFarDepth() = 0;
 
   virtual void toggleVrMode() = 0;
 
   virtual void renderOneDynModelInstance(DynamicRenderableSceneInstance *sceneInstance, Stage stage, int *optional_inst_seed = nullptr,
     bool raw_render = false) = 0;
+
+  virtual void invalidateEditorClipmap() {}
+  virtual void updateEditorLandmesh() {}
+  virtual void setEditorHmapMirroring(bool) {}
+
+  virtual void onGrassCreated(const DataBlock *) {}
+
+  virtual bool isThermalVisionActive() const { return false; }
 };
 
 class IRenderHelperService

@@ -1355,7 +1355,7 @@ void StVarValueExpression::assembleCpp(StcodeExpression &cpp_expr, bool is_integ
   const char *initialTypeName = stcode::value_type_to_stcode_type(getValueType(), isInteger);
   const char *castToTypeName = convertIntToFloat ? stcode::value_type_to_stcode_type(getValueType(), false) : nullptr;
   const bool isResource = valueType == shexpr::VT_TEXTURE || valueType == shexpr::VT_BUFFER;
-  if (isGlobalFlag)
+  if (isGlobalFlag && !cpp_expr.noGlobal)
   {
     cpp_expr.specifyNextExprElement(StcodeExpression::ElementType::GLOBVAR, getTerminal()->text, castToTypeName,
       (void *)(!isResource));
@@ -1533,7 +1533,7 @@ void FunctionExpression::assembleBytecode(CodeTable &code, Register &dest_reg, S
   }
 
   auto addFunctionCall = [&, this](int dreg) {
-    code.push_back(shaderopcode::makeOp3(SHCOD_CALL_FUNCTION, func, int(dreg), opRegs.size()));
+    code.push_back(shaderopcode::makeOpFunctionCall(SHCOD_CALL_FUNCTION, func, int(dreg), opRegs.size()));
     for (int i = 0; i < getOperandCount(); i++)
       code.push_back(int(opRegs[i]));
   };

@@ -2,6 +2,7 @@ include "shader_global.dshl"
 include "rendinst_opaque_inc.dshl"
 include "static_shadow.dshl"
 include "rtr_use.dshl"
+include "unpack_unit_vector_inc.dshl"
 
 macro INIT_RENDINST_INTERIOR_MAPPING()
   texture tex = material.texture.diffuse;
@@ -49,20 +50,24 @@ macro USE_RENDINST_INTERIOR_MAPPING(offset)
   channel color8 norm = norm unsigned_pack;
   channel float2 tc[0] = tc[0];
 
-  (ps) { diffuse_tex@staticCube = tex; }
+  (ps) { diffuse_tex@staticSmpCube = tex; }
   if (envi_reflection != NULL)
   {
-    (ps) { envi_reflection@staticCube = envi_reflection; }
+    (ps) { envi_reflection@staticSmpCube = envi_reflection; }
   }
   else
   {
     if (in_editor_assume == yes && local_light_probe_tex != NULL)
     {
-      (ps) { envi_reflection@smpCube = local_light_probe_tex; }
+      (ps) { envi_reflection@texCube = local_light_probe_tex; }
     }
     else
     {
-      (ps) { envi_reflection@smpCube = envi_probe_specular; }
+      (ps) { envi_reflection@texCube = envi_probe_specular; }
+    }
+    INIT_GLOBAL_LINEAR_WRAP_SAMPLER(ps)
+    hlsl(ps) {
+      #define envi_reflection_samplerstate global_linear_wrap_sampler
     }
   }
 
@@ -143,6 +148,7 @@ macro USE_RENDINST_INTERIOR_MAPPING(offset)
   }
 
   RENDINST_INSTANCING()
+  USE_UNPACK_UNIT_VECTOR_VS()
   if (rendinst_render_pass != rendinst_render_pass_to_shadow)
   {
     WRITE_GBUFFER()
@@ -175,7 +181,7 @@ macro USE_RENDINST_INTERIOR_MAPPING(offset)
 
       float3 localNormal = float3(0, 1, 0);
 #if RENDINST_FULL_VDECL
-      localNormal = normalize(BGR_SWIZZLE(input.normal.xyz)*2.f-1.f);
+      localNormal = normalize(unpack_unit_vector(input.normal.xyz));
 #endif
       float3 localPos = input.pos;
       VB_PERFORM_INSTANCING
@@ -329,17 +335,17 @@ macro USE_RENDINST_INTERIOR_MAPPING(offset)
           // Usually get_tile().xy >= 1 and we render one or several windows in one poly.
           // But sometimes it is usefull get_tile().x < 1 for render part of texture
           // In this cases we should restore right insidePos to find right contortion get_tile() (window part with unique contortion).
-          float2 insidePos = (get_tile().xy < 1) ? ((localPos.xy + 1) / get_tile().xy - 1) : localPos.xy;
+          float2 insidePos = select(get_tile().xy < 1, (localPos.xy + 1) / get_tile().xy - 1, localPos.xy);
           insidePos.x *= -1; // invert horizontal direction, should be left to right
           // convexCoord should be in [-1,1] range inside each window for convexity correct behaviour
           float2 convexCoord = insidePos * 0.5 + 0.5;
-          convexCoord = (convexCoord < get_contortion_convexity_coef().xy) ?
-              convexCoord / get_contortion_convexity_coef().xy :
-              (convexCoord - get_contortion_convexity_coef().xy) * get_contortion_convexity_coef().zw;
+          convexCoord = select(convexCoord < get_contortion_convexity_coef().xy,
+              convexCoord / get_contortion_convexity_coef().xy,
+              (convexCoord - get_contortion_convexity_coef().xy) * get_contortion_convexity_coef().zw);
           convexCoord = (frac(convexCoord) * 2 - 1) * get_tile_space().xy;
           // Add random for get_convexity_slope() by window parts, defined by get_contortion_tiling()
-          int2 partCoord = insidePos.xy > get_contortion_tiling().zw ?
-            int2(get_contortion_coef().xy * insidePos.xy + get_contortion_coef().zw) : 0;
+          int2 partCoord = select(insidePos.xy > get_contortion_tiling().zw,
+            int2(get_contortion_coef().xy * insidePos.xy + get_contortion_coef().zw), 0);
           randVal = uint_noise2D(roomCoords.x + hash * randomRotate, roomCoords.y + partCoord.y + partCoord.x*17, 42);
 
           viewVec.xy *= get_tile().xy * get_tile_space().xy;
@@ -405,8 +411,6 @@ macro USE_RENDINST_INTERIOR_MAPPING(offset)
 
           if (isRTREnabled())
             init_glass(gbuffer);
-
-          handle_if_two_sided(gbuffer);
 
           #if NUKEDESTR_ACTIVE
             NUKEDESTR_CHARRING(gbuffer, checkerTC)

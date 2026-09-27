@@ -331,7 +331,7 @@ static void send_internal(const char *metric, dag::ConstSpan<MetricTag> tags, Me
     bytesAdded = _snprintf(pos, bytes_left, ",%s=%s", tag.key, tag.value);
     if ((size_t)bytesAdded >= bytes_left)
     {
-      logerr("%s: Metric too long for batch, skipping: %s", buf);
+      logerr("%s: Metric too long for batch, skipping: %s", __FUNCTION__, metric);
       return;
     }
 
@@ -344,7 +344,7 @@ static void send_internal(const char *metric, dag::ConstSpan<MetricTag> tags, Me
     bytesAdded = _snprintf(pos, bytes_left, value_spec_string_new<ValueType>, val_prefix, value, type);
     if ((size_t)bytesAdded >= bytes_left)
     {
-      logerr("%s: Metric too long for batch, skipping: %s", buf);
+      logerr("%s: Metric too long for batch, skipping: %s", __FUNCTION__, metric);
       return;
     }
 
@@ -380,7 +380,7 @@ void send_internal_args(const char *metric, ValueType value, const Args &...args
 template <MetricType mtype, typename ValueType>
 void send_internal_tags(const char *metric, ValueType value, std::initializer_list<MetricTag> _tags)
 {
-  eastl::fixed_vector<MetricTag, 3, true, framemem_allocator> tags;
+  eastl::fixed_vector<MetricTag, 5, true, framemem_allocator> tags;
   for (auto &a : _tags)
     tags.push_back(a);
   send_internal(metric, dag::ConstSpan<MetricTag>(tags.data(), tags.size()), mtype, value);

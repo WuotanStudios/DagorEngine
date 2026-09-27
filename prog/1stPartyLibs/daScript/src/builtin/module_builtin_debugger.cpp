@@ -35,7 +35,7 @@ namespace das
 
 // we declare Dapi version of each structure in debugger.das
 // to fake the API we need C++ version, which we now make locally
-namespace debugapi {
+namespace debugger {
     typedef Array DapiArray;
     typedef Table DapiTable;
     typedef Lambda DapiLambda;
@@ -304,6 +304,13 @@ namespace debugapi {
                 invoke_afterVariant(context,fn_afterVariant,classPtr,ps,*ti);
             }
         }
+        virtual bool canVisitDim ( char * ps, TypeInfo * ti ) override {
+            if ( auto fn_canVisitDim = get_canVisitDim(classPtr) ) {
+                return invoke_canVisitDim(context,fn_canVisitDim,classPtr,ps,*ti);
+            } else {
+                return true;
+            }
+        }
         virtual bool canVisitArray ( Array * pa, TypeInfo * ti ) override {
             if ( auto fn_canVisitArray = get_canVisitArray(classPtr) ) {
                 return invoke_canVisitArray(context,fn_canVisitArray,classPtr,pa,*ti);
@@ -311,29 +318,29 @@ namespace debugapi {
                 return true;
             }
         }
-        virtual bool canVisitArrayData ( TypeInfo * ti, uint32_t count ) override {
+        virtual bool canVisitArrayData ( TypeInfo * ti, uint64_t count ) override {
             if ( auto fn_canVisitArrayData = get_canVisitArrayData(classPtr) ) {
                 return invoke_canVisitArrayData(context,fn_canVisitArrayData,classPtr,*ti,count);
             } else {
                 return true;
             }
         }
-        virtual void beforeArrayData ( char * pa, uint32_t stride, uint32_t count, TypeInfo * ti ) override {
+        virtual void beforeArrayData ( char * pa, uint32_t stride, uint64_t count, TypeInfo * ti ) override {
             if ( auto fn_beforeArrayData = get_beforeArrayData(classPtr) ) {
                 invoke_beforeArrayData(context,fn_beforeArrayData,classPtr,pa,stride,count,*ti);
             }
         }
-        virtual void afterArrayData ( char * pa, uint32_t stride, uint32_t count, TypeInfo * ti ) override {
+        virtual void afterArrayData ( char * pa, uint32_t stride, uint64_t count, TypeInfo * ti ) override {
             if ( auto fn_afterArrayData = get_afterArrayData(classPtr) ) {
                 invoke_afterArrayData(context,fn_afterArrayData,classPtr,pa,stride,count,*ti);
             }
         }
-        virtual void beforeArrayElement ( char * pa, TypeInfo * ti, char * pe, uint32_t index, bool last ) override {
+        virtual void beforeArrayElement ( char * pa, TypeInfo * ti, char * pe, uint64_t index, bool last ) override {
             if ( auto fn_beforeArrayElement = get_beforeArrayElement(classPtr) ) {
                 invoke_beforeArrayElement(context,fn_beforeArrayElement,classPtr,pa,*ti,pe,index,last);
             }
         }
-        virtual void afterArrayElement ( char * pa, TypeInfo * ti, char * pe, uint32_t index, bool last ) override {
+        virtual void afterArrayElement ( char * pa, TypeInfo * ti, char * pe, uint64_t index, bool last ) override {
             if ( auto fn_afterArrayElement = get_afterArrayElement(classPtr) ) {
                 invoke_afterArrayElement(context,fn_afterArrayElement,classPtr,pa,*ti,pe,index,last);
             }
@@ -377,22 +384,22 @@ namespace debugapi {
                 invoke_beforeTable(context,fn_beforeTable,classPtr,*pa,*ti);
             }
         }
-        virtual void beforeTableKey ( Table * pa, TypeInfo * ti, char * pk, TypeInfo * ki, uint32_t index, bool last ) override {
+        virtual void beforeTableKey ( Table * pa, TypeInfo * ti, char * pk, TypeInfo * ki, uint64_t index, bool last ) override {
            if ( auto fn_beforeTableKey = get_beforeTableKey(classPtr) ) {
                 invoke_beforeTableKey(context,fn_beforeTableKey,classPtr,*pa,*ti,pk,*ki,index,last);
             }
         }
-        virtual void afterTableKey ( Table * pa, TypeInfo * ti, char * pk, TypeInfo * ki, uint32_t index, bool last ) override {
+        virtual void afterTableKey ( Table * pa, TypeInfo * ti, char * pk, TypeInfo * ki, uint64_t index, bool last ) override {
            if ( auto fn_afterTableKey = get_afterTableKey(classPtr) ) {
                 invoke_afterTableKey(context,fn_afterTableKey,classPtr,*pa,*ti,pk,*ki,index,last);
             }
         }
-        virtual void beforeTableValue ( Table * pa, TypeInfo * ti, char * pv, TypeInfo * kv, uint32_t index, bool last ) override {
+        virtual void beforeTableValue ( Table * pa, TypeInfo * ti, char * pv, TypeInfo * kv, uint64_t index, bool last ) override {
            if ( auto fn_beforeTableValue = get_beforeTableValue(classPtr) ) {
                 invoke_beforeTableValue(context,fn_beforeTableValue,classPtr,*pa,*ti,pv,*kv,index,last);
             }
         }
-        virtual void afterTableValue ( Table * pa, TypeInfo * ti, char * pv, TypeInfo * kv, uint32_t index, bool last ) override {
+        virtual void afterTableValue ( Table * pa, TypeInfo * ti, char * pv, TypeInfo * kv, uint64_t index, bool last ) override {
            if ( auto fn_afterTableValue = get_afterTableValue(classPtr) ) {
                 invoke_afterTableValue(context,fn_afterTableValue,classPtr,*pa,*ti,pv,*kv,index,last);
             }
@@ -554,6 +561,21 @@ namespace debugapi {
                 invoke_Bitfield(context,fn_Bitfield,classPtr,value,*ti);
             }
         }
+        virtual void Bitfield8 ( uint8_t & value, TypeInfo * ti ) override {
+           if ( auto fn_Bitfield8 = get_Bitfield8(classPtr) ) {
+                invoke_Bitfield8(context,fn_Bitfield8,classPtr,value,*ti);
+            }
+        }
+        virtual void Bitfield16 ( uint16_t & value, TypeInfo * ti ) override {
+           if ( auto fn_Bitfield16 = get_Bitfield16(classPtr) ) {
+                invoke_Bitfield16(context,fn_Bitfield16,classPtr,value,*ti);
+            }
+        }
+        virtual void Bitfield64 ( uint64_t & value, TypeInfo * ti ) override {
+            if ( auto fn_Bitfield64 = get_Bitfield64(classPtr) ) {
+                invoke_Bitfield64(context,fn_Bitfield64,classPtr,value,*ti);
+            }
+        }
         virtual void Int2 ( int2 & value ) override {
            if ( auto fn_Int2 = get_Int2(classPtr) ) {
                 invoke_Int2(context,fn_Int2,classPtr,value);
@@ -617,6 +639,121 @@ namespace debugapi {
         virtual void URange64 ( urange64 & value ) override {
            if ( auto fn_URange = get_URange64(classPtr) ) {
                 invoke_URange64(context,fn_URange,classPtr,value);
+            }
+        }
+        virtual void Float16 ( float16_t & value ) override {
+           if ( auto fn_Float16 = get_Float16(classPtr) ) {
+                invoke_Float16(context,fn_Float16,classPtr,value);
+            }
+        }
+        virtual void Half2 ( half2 & value ) override {
+           if ( auto fn_Half2 = get_Half2(classPtr) ) {
+                invoke_Half2(context,fn_Half2,classPtr,value);
+            }
+        }
+        virtual void Half3 ( half3 & value ) override {
+           if ( auto fn_Half3 = get_Half3(classPtr) ) {
+                invoke_Half3(context,fn_Half3,classPtr,value);
+            }
+        }
+        virtual void Half4 ( half4 & value ) override {
+           if ( auto fn_Half4 = get_Half4(classPtr) ) {
+                invoke_Half4(context,fn_Half4,classPtr,value);
+            }
+        }
+        virtual void Half8 ( half8 & value ) override {
+           if ( auto fn_Half8 = get_Half8(classPtr) ) {
+                invoke_Half8(context,fn_Half8,classPtr,value);
+            }
+        }
+        virtual void Short2 ( short2 & value ) override {
+           if ( auto fn_Short2 = get_Short2(classPtr) ) {
+                invoke_Short2(context,fn_Short2,classPtr,value);
+            }
+        }
+        virtual void Short3 ( short3 & value ) override {
+           if ( auto fn_Short3 = get_Short3(classPtr) ) {
+                invoke_Short3(context,fn_Short3,classPtr,value);
+            }
+        }
+        virtual void Short4 ( short4 & value ) override {
+           if ( auto fn_Short4 = get_Short4(classPtr) ) {
+                invoke_Short4(context,fn_Short4,classPtr,value);
+            }
+        }
+        virtual void Short8 ( short8 & value ) override {
+           if ( auto fn_Short8 = get_Short8(classPtr) ) {
+                invoke_Short8(context,fn_Short8,classPtr,value);
+            }
+        }
+        virtual void UShort2 ( ushort2 & value ) override {
+           if ( auto fn_UShort2 = get_UShort2(classPtr) ) {
+                invoke_UShort2(context,fn_UShort2,classPtr,value);
+            }
+        }
+        virtual void UShort3 ( ushort3 & value ) override {
+           if ( auto fn_UShort3 = get_UShort3(classPtr) ) {
+                invoke_UShort3(context,fn_UShort3,classPtr,value);
+            }
+        }
+        virtual void UShort4 ( ushort4 & value ) override {
+           if ( auto fn_UShort4 = get_UShort4(classPtr) ) {
+                invoke_UShort4(context,fn_UShort4,classPtr,value);
+            }
+        }
+        virtual void UShort8 ( ushort8 & value ) override {
+           if ( auto fn_UShort8 = get_UShort8(classPtr) ) {
+                invoke_UShort8(context,fn_UShort8,classPtr,value);
+            }
+        }
+        virtual void Byte2 ( byte2 & value ) override {
+           if ( auto fn_Byte2 = get_Byte2(classPtr) ) {
+                invoke_Byte2(context,fn_Byte2,classPtr,value);
+            }
+        }
+        virtual void Byte3 ( byte3 & value ) override {
+           if ( auto fn_Byte3 = get_Byte3(classPtr) ) {
+                invoke_Byte3(context,fn_Byte3,classPtr,value);
+            }
+        }
+        virtual void Byte4 ( byte4 & value ) override {
+           if ( auto fn_Byte4 = get_Byte4(classPtr) ) {
+                invoke_Byte4(context,fn_Byte4,classPtr,value);
+            }
+        }
+        virtual void Byte8 ( byte8 & value ) override {
+           if ( auto fn_Byte8 = get_Byte8(classPtr) ) {
+                invoke_Byte8(context,fn_Byte8,classPtr,value);
+            }
+        }
+        virtual void Byte16 ( byte16 & value ) override {
+           if ( auto fn_Byte16 = get_Byte16(classPtr) ) {
+                invoke_Byte16(context,fn_Byte16,classPtr,value);
+            }
+        }
+        virtual void UByte2 ( ubyte2 & value ) override {
+           if ( auto fn_UByte2 = get_UByte2(classPtr) ) {
+                invoke_UByte2(context,fn_UByte2,classPtr,value);
+            }
+        }
+        virtual void UByte3 ( ubyte3 & value ) override {
+           if ( auto fn_UByte3 = get_UByte3(classPtr) ) {
+                invoke_UByte3(context,fn_UByte3,classPtr,value);
+            }
+        }
+        virtual void UByte4 ( ubyte4 & value ) override {
+           if ( auto fn_UByte4 = get_UByte4(classPtr) ) {
+                invoke_UByte4(context,fn_UByte4,classPtr,value);
+            }
+        }
+        virtual void UByte8 ( ubyte8 & value ) override {
+           if ( auto fn_UByte8 = get_UByte8(classPtr) ) {
+                invoke_UByte8(context,fn_UByte8,classPtr,value);
+            }
+        }
+        virtual void UByte16 ( ubyte16 & value ) override {
+           if ( auto fn_UByte16 = get_UByte16(classPtr) ) {
+                invoke_UByte16(context,fn_UByte16,classPtr,value);
             }
         }
         virtual void WalkBlock ( Block * value ) override {
@@ -742,6 +879,11 @@ namespace debugapi {
                 return true;
             }
         }
+        virtual void onCorruptStack ( Prologue * pp ) override {
+            if ( auto fnOnCorruptStack = get_onCorruptStack(classPtr) ) {
+                invoke_onCorruptStack(context,fnOnCorruptStack,classPtr,*pp);
+            }
+        }
     protected:
         void *      classPtr;
         Context *   context;
@@ -753,11 +895,13 @@ namespace debugapi {
         }
     };
 
-
-    #include "debugger.das.inc"
-
-    StackWalkerPtr makeStackWalker ( const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<StackWalkerAdapter>((char *)pClass,info,context);
+    void makeStackWalker ( const void * pClass, const StructInfo * info,
+            const TBlock<void, StackWalker *> & blk, Context * context, LineInfoArg * at ) {
+        auto adapter = new StackWalkerAdapter((char *)pClass,info,context);
+        vec4f args[1];
+        args[0] = cast<StackWalker *>::from(adapter);
+        context->invoke(blk, args, nullptr, at);
+        delete adapter;
     }
 
     DebugAgentPtr makeDebugAgent ( const void * pClass, const StructInfo * info, Context * context ) {
@@ -790,8 +934,19 @@ namespace debugapi {
         context.stackWalk(&lineInfo, true, true);
     }
 
-    DataWalkerPtr makeDataWalker ( const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<DataWalkerAdapter>((char *)pClass,info,context);
+    char * debuggerGetStackWalk ( Context & context, const LineInfo & lineInfo,
+            bool args, bool vars, bool outOfScope, bool topOnly, Context * toContext, LineInfoArg * at ) {
+        // allocate in the calling context's heap - the walked context may be a different one
+        return toContext->allocateString(context.getStackWalk(&lineInfo, args, vars, outOfScope, topOnly), at);
+    }
+
+    void makeDataWalker ( const void * pClass, const StructInfo * info,
+            const TBlock<void, DataWalker *> & blk, Context * context, LineInfoArg * at ) {
+        auto adapter = new DataWalkerAdapter((char *)pClass,info,context);
+        vec4f args[1];
+        args[0] = cast<DataWalker *>::from(adapter);
+        context->invoke(blk, args, nullptr, at);
+        delete adapter;
     }
 
     void dapiWalkData ( DataWalkerPtr walker, void * data, const TypeInfo & info ) {
@@ -810,7 +965,7 @@ namespace debugapi {
     #if DAS_ENABLE_STACK_WALK
         char * sp = context.stack.ap();
         int32_t depth = 0;
-        while (  sp < context.stack.top() ) {
+        while ( sp < context.stack.top() ) {
             Prologue * pp = (Prologue *) sp;
             Block * block = nullptr;
             FuncInfo * info = nullptr;
@@ -825,7 +980,16 @@ namespace debugapi {
                     info = pp->info;
                 }
             }
-            sp += info ? info->stackSize : pp->stackSize;
+            auto incr = info ? info->stackSize : pp->stackSize;
+            if ( incr >= context.stack.size() || incr<sizeof(Prologue) ) {
+                // corrupted stack
+                break;
+            }
+            sp += incr;
+            if ( sp > context.stack.top() ) {
+                // corrupted stack
+                break;
+            }
             depth ++;
         }
         return depth;
@@ -839,7 +1003,7 @@ namespace debugapi {
     #if DAS_ENABLE_STACK_WALK
         char * sp = context.stack.ap();
         const LineInfo * lineAt = &at;
-        while (  sp < context.stack.top() ) {
+        while ( sp < context.stack.top() ) {
             Prologue * pp = (Prologue *) sp;
             Block * block = nullptr;
             FuncInfo * info = nullptr;
@@ -854,9 +1018,18 @@ namespace debugapi {
                     info = pp->info;
                 }
             }
+            auto incr = info ? info->stackSize : pp->stackSize;
+            if ( incr >= context.stack.size() || incr<sizeof(Prologue) ) {
+                walker->onCorruptStack(pp);
+                break;
+            }
             walker->onBeforeCall(pp,SP);
             if ( !info ) {
-                walker->onCallAOT(pp,pp->fileName);
+                if (pp->is_jit) {
+                    walker->onCallJIT(pp,pp->fileName);
+                } else {
+                    walker->onCallAOT(pp,pp->fileName);
+                }
             } else if ( pp->line ) {
                 walker->onCallAt(pp,info,pp->line);
             } else {
@@ -894,7 +1067,11 @@ namespace debugapi {
                 }
             }
             lineAt = info ? pp->line : nullptr;
-            sp += info ? info->stackSize : pp->stackSize;
+            sp += incr;
+            if ( sp > context.stack.top() ) {
+                walker->onCorruptStack(pp);
+                break;
+            }
             if ( !walker->onAfterCall(pp) ) break;
         }
     #else
@@ -947,7 +1124,7 @@ namespace debugapi {
         return res;
     }
 
-    vec4f pinvoke_impl2 ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+    vec4f pinvoke_impl2_core ( Context & context, SimNode_CallBase * call, vec4f * args, int32_t nUserArgs ) {
         auto invCtx = cast<Context *>::to(args[0]);
         if ( !invCtx ) context.throw_error_at(call->debugInfo, "pinvoke with null context");
         auto fn = cast<Func>::to(args[1]);
@@ -955,8 +1132,8 @@ namespace debugapi {
         auto simFn = fn.PTR;
         if ( !simFn ) context.throw_error_at(call->debugInfo, "pinvoke can't find function #%p", (void *)simFn);
         if ( !invCtx->contextMutex ) context.throw_error_at(call->debugInfo,"threadlock_context is not set");
-        if ( simFn->debugInfo->count!=uint32_t(call->nArguments-2) ) context.throw_error_at(call->debugInfo,
-            "pinvoke function expects %u arguments, but %u provided", simFn->debugInfo->count, call->nArguments-2);
+        if ( simFn->debugInfo->count!=uint32_t(nUserArgs) ) context.throw_error_at(call->debugInfo,
+            "pinvoke function expects %u arguments, but %u provided", simFn->debugInfo->count, nUserArgs);
         vec4f res = v_zero();
         LineInfo exAt;
         string exText;
@@ -980,6 +1157,10 @@ namespace debugapi {
         });
         if ( !exText.empty() ) context.throw_error_at(exAt, "%s", exText.c_str());
         return res;
+    }
+
+    vec4f pinvoke_impl2 ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        return pinvoke_impl2_core(context, call, args, call->nArguments - 2);
     }
 
     vec4f pinvoke_impl3 ( Context & context, SimNode_CallBase * call, vec4f * args ) {
@@ -1028,22 +1209,33 @@ namespace debugapi {
     vec4f invokeInDebugAgent ( Context & context, SimNode_CallBase * call, vec4f * args ) {
         if ( call->nArguments>=MAX_DEBUG_AGENT_ARGS-3 ) context.throw_error_at(call->debugInfo, "too many arguments");
         const char * category = cast<char *>::to(args[0]);
-        if ( !category ) context.throw_error_at(call->debugInfo, "need to specify category");
         const char * function_name = cast<char *>::to(args[1]);
         if ( !function_name ) context.throw_error_at(call->debugInfo, "need to specify method name");
         g_DebugAgentMutex.lock();
-        auto it = g_DebugAgents.find(category);
-        if ( it == g_DebugAgents.end() ) {
-            g_DebugAgentMutex.unlock();
-            context.throw_error_at(call->debugInfo, "can't get debug agent '%s'", category);
+        Context * invCtx = nullptr;
+        DebugAgentAdapter * adapter = nullptr;
+        if ( !category || category[0] == '\0' ) {
+            if ( *daScriptEnvironment::g_threadLocalDebugAgent && (*daScriptEnvironment::g_threadLocalDebugAgent)->debugAgent ) {
+                invCtx = (*daScriptEnvironment::g_threadLocalDebugAgent)->debugAgentContext.get();
+                adapter = (DebugAgentAdapter *)(*daScriptEnvironment::g_threadLocalDebugAgent)->debugAgent.get();
+            } else {
+                g_DebugAgentMutex.unlock();
+                context.throw_error_at(call->debugInfo, "no thread-local debug agent available");
+            }
+        } else {
+            auto it = g_DebugAgents.find(category);
+            if ( it == g_DebugAgents.end() ) {
+                g_DebugAgentMutex.unlock();
+                context.throw_error_at(call->debugInfo, "can't get debug agent '%s'", category);
+            }
+            invCtx = it->second.debugAgentContext.get();
+            adapter = (DebugAgentAdapter *) it->second.debugAgent.get();
         }
-        auto invCtx = it->second.debugAgentContext.get();
-        if ( !invCtx ) {
+        if ( !invCtx || !adapter ) {
             g_DebugAgentMutex.unlock();
             context.throw_error_at(call->debugInfo, "debug agent '%s' is a CPP-only agent", category);
         }
         Func * func = nullptr;
-        auto adapter = (DebugAgentAdapter *) it->second.debugAgent.get();
         auto sinfo = adapter->classInfo;
         for ( uint32_t fi=0, fis=sinfo->count; fi!=fis; ++fi ) {
             auto field = sinfo->fields[fi];
@@ -1056,7 +1248,7 @@ namespace debugapi {
                 for ( int32_t ai=2, ais=call->nArguments; ai!=ais; ++ai ) {
                     args2[ai + 1] = args[ai];
                 }
-                auto result = pinvoke_impl2(context, call, args2);
+                auto result = pinvoke_impl2_core(context, call, args2, call->nArguments - 1);
                 g_DebugAgentMutex.unlock();
                 return result;
             }
@@ -1072,17 +1264,29 @@ namespace debugapi {
     vec4f invokeInDebugAgent2 ( Context & context, SimNode_CallBase * call, vec4f * args ) {
         if ( call->nArguments>=MAX_DEBUG_AGENT_ARGS-3 ) context.throw_error_at(call->debugInfo, "too many arguments");
         const char * category = cast<char *>::to(args[0]);
-        if ( !category ) context.throw_error_at(call->debugInfo, "need to specify category");
         const char * function_name = cast<char *>::to(args[1]);
-        if ( !function_name ) context.throw_error_at(call->debugInfo, "need to specify method name");
+        if ( !function_name ) context.throw_error_at(call->debugInfo, "need to specify function name");
         g_DebugAgentMutex.lock();
-        auto it = g_DebugAgents.find(category);
-        if ( it == g_DebugAgents.end() ) {
-            g_DebugAgentMutex.unlock();
-            context.throw_error_at(call->debugInfo, "can't get debug agent '%s'", category);
+        Context * invCtx = nullptr;
+        DebugAgentAdapter * adapter = nullptr;
+        if ( !category || category[0] == '\0' ) {
+            if ( *daScriptEnvironment::g_threadLocalDebugAgent && (*daScriptEnvironment::g_threadLocalDebugAgent)->debugAgent ) {
+                invCtx = (*daScriptEnvironment::g_threadLocalDebugAgent)->debugAgentContext.get();
+                adapter = (DebugAgentAdapter *)(*daScriptEnvironment::g_threadLocalDebugAgent)->debugAgent.get();
+            } else {
+                g_DebugAgentMutex.unlock();
+                context.throw_error_at(call->debugInfo, "no thread-local debug agent available");
+            }
+        } else {
+            auto it = g_DebugAgents.find(category);
+            if ( it == g_DebugAgents.end() ) {
+                g_DebugAgentMutex.unlock();
+                context.throw_error_at(call->debugInfo, "can't get debug agent '%s'", category);
+            }
+            invCtx = it->second.debugAgentContext.get();
+            adapter = (DebugAgentAdapter *) it->second.debugAgent.get();
         }
-        auto invCtx = it->second.debugAgentContext.get();
-        if ( !invCtx ) {
+        if ( !invCtx || !adapter ) {
             g_DebugAgentMutex.unlock();
             context.throw_error_at(call->debugInfo, "debug agent '%s' is a CPP-only agent", category);
         }
@@ -1092,7 +1296,6 @@ namespace debugapi {
             g_DebugAgentMutex.unlock();
             context.throw_error_at(call->debugInfo, "function '%s' not found in debug agent '%s'", function_name, category);
         }
-        auto adapter = (DebugAgentAdapter *) it->second.debugAgent.get();
         vec4f args2[MAX_DEBUG_AGENT_ARGS];
         args2[0] = cast<Context *>::from(invCtx);
         args2[1] = cast<Func>::from(func);
@@ -1100,7 +1303,7 @@ namespace debugapi {
         for ( int32_t ai=2, ais=call->nArguments; ai!=ais; ++ai ) {
             args2[ai + 1] = args[ai];
         }
-        auto result = pinvoke_impl2(context, call, args2);
+        auto result = pinvoke_impl2_core(context, call, args2, call->nArguments - 1);
         g_DebugAgentMutex.unlock();
         return result;
     }
@@ -1219,10 +1422,11 @@ namespace debugapi {
 #endif
 
     void track_insane_pointer ( void * ptr, Context * ctx ) {
+        ptr;
 #if DAS_TRACK_INSANE_POINTER
         das_track_insane_pointer(ptr);
 #else
-        ctx->throw_error("insane pointer tracking is disabled, recompile with DAS_TRACK_INSANE_POINTER=1 && DAS_TRACK_ALLOCATIONS=1");
+        ctx->throw_error("insane pointer tracking is disabled, recompile with DAS_TRACK_INSANE_POINTER=1 and set options track_allocations = true (or policies.track_allocations)");
 #endif
     }
 
@@ -1232,12 +1436,12 @@ namespace debugapi {
             DAS_PROFILE_SECTION("Module_Debugger");
             ModuleLibrary lib(this);
             lib.addBuiltInModule();
-            addBuiltinDependency(lib, Module::require("rtti"));
+            addBuiltinDependency(lib, Module::require("rtti_core"), true);
             // annotations
-            addAnnotation(make_smart<PrologueAnnotation>(lib));
-            addAnnotation(make_smart<AstDebugAgentAnnotation>(lib));
-            addAnnotation(make_smart<AstDataWalkerAnnotation>(lib));
-            addAnnotation(make_smart<AstStackWalkerAnnotation>(lib));
+            addAnnotation(new PrologueAnnotation(lib));
+            addAnnotation(new AstDebugAgentAnnotation(lib));
+            addAnnotation(new AstDataWalkerAnnotation(lib));
+            addAnnotation(new AstStackWalkerAnnotation(lib));
             // debug agent
             addExtern<DAS_BIND_FUN(makeDebugAgent)>(*this, lib,  "make_debug_agent",
                 SideEffects::modifyExternal, "makeDebugAgent")
@@ -1270,6 +1474,9 @@ namespace debugapi {
             addExtern<DAS_BIND_FUN(forkDebugAgentContext)>(*this, lib,  "fork_debug_agent_context",
                 SideEffects::modifyExternal, "forkDebugAgentContext")
                     ->args({"function","context","line"});;
+            addExtern<DAS_BIND_FUN(deleteDebugAgent)>(*this, lib,  "delete_debug_agent_context",
+                SideEffects::modifyExternal, "deleteDebugAgent")
+                    ->args({"category","line","context"});;
             addExtern<DAS_BIND_FUN(isInDebugAgentCreation)>(*this, lib, "is_in_debug_agent_creation",
                 SideEffects::accessExternal, "isInDebugAgentCreation");
             addExtern<DAS_BIND_FUN(debuggerSetContextSingleStep)>(*this, lib,  "set_single_step",
@@ -1278,6 +1485,13 @@ namespace debugapi {
             addExtern<DAS_BIND_FUN(debuggerStackWalk)>(*this, lib, "stackwalk",
                 SideEffects::modifyExternal, "debuggerStackWalk")
                     ->args({"context","line"});
+            auto fngsw = addExtern<DAS_BIND_FUN(debuggerGetStackWalk)>(*this, lib, "get_stackwalk",
+                SideEffects::accessExternal, "debuggerGetStackWalk")
+                    ->args({"context","line","args","vars","out_of_scope","top_only","context","at"})->setTempStringResult();
+            fngsw->arguments[2]->init = new ExprConstBool(true);
+            fngsw->arguments[3]->init = new ExprConstBool(true);
+            fngsw->arguments[4]->init = new ExprConstBool(false);
+            fngsw->arguments[5]->init = new ExprConstBool(false);
             addExtern<DAS_BIND_FUN(dapiReportContextState)>(*this, lib, "report_context_state",
                 SideEffects::modifyExternal, "dapiReportContextState")
                     ->args({"context","category","name","info","data"});
@@ -1312,8 +1526,8 @@ namespace debugapi {
                     ->args({"command"});
             // data walker
             addExtern<DAS_BIND_FUN(makeDataWalker)>(*this, lib,  "make_data_walker",
-                SideEffects::modifyExternal, "makeDataWalker")
-                    ->args({"class","info","context"});
+                SideEffects::modifyExternal|SideEffects::invoke, "makeDataWalker")
+                    ->args({"class","info","block","context","at"});
             addExtern<DAS_BIND_FUN(dapiWalkData)>(*this, lib,  "walk_data",
                 SideEffects::modifyExternal, "dapiWalkData")
                     ->args({"walker","data","info"});
@@ -1325,8 +1539,8 @@ namespace debugapi {
                     ->args({"walker","data","struct_info"});
             // stack walker
             addExtern<DAS_BIND_FUN(makeStackWalker)>(*this, lib,  "make_stack_walker",
-                SideEffects::modifyExternal, "makeStackWalker")
-                    ->args({"class","info","context"});
+                SideEffects::modifyExternal|SideEffects::invoke, "makeStackWalker")
+                    ->args({"class","info","block","context","at"});
             addExtern<DAS_BIND_FUN(dapiStackWalk)>(*this, lib,  "walk_stack",
                 SideEffects::modifyExternal, "dapiStackWalk")
                     ->args({"walker","context","line"});
@@ -1488,8 +1702,6 @@ namespace debugapi {
             addExtern<DAS_BIND_FUN(track_insane_pointer)>(*this, lib, "track_insane_pointer",
                 SideEffects::modifyArgumentAndAccessExternal, "track_insane_pointer")
                     ->args({"ptr","context"})->unsafeOperation = true;
-            // add builtin module
-            compileBuiltinModule("debugger.das",debugger_das,sizeof(debugger_das));
             // lets make sure its all aot ready
             verifyAotReady();
         }

@@ -15,6 +15,8 @@
 #include <generic/dag_tab.h>
 #include <debug/dag_log.h>
 #include <debug/dag_debug.h>
+#include <debug/dag_debug3d.h>
+#include <debug/dag_textMarks.h>
 #include <drv/3d/dag_draw.h>
 #include <drv/3d/dag_vertexIndexBuffer.h>
 #include <drv/3d/dag_driver.h>
@@ -47,14 +49,57 @@ typedef Range<real> RealRange;
 static bool initialized = false;
 static String shaderName;
 
-UniqueBufHolder renderDataVS;
+UniqueBufWithShaderVar renderDataVS;
+UniqueBufWithShaderVar deformPressureBuf;
 
 static Tab<BBox3> updated_regions;
 
+static uint32_t encode_float2(Point2 scaled_side_vec)
+{
+  return (float_to_half(scaled_side_vec.x) << 16) | float_to_half(scaled_side_vec.y);
+}
+
+static Point2 decode_float2(uint32_t scaled_side_vec)
+{
+  return Point2(half_to_float(scaled_side_vec >> 16), half_to_float(scaled_side_vec));
+}
+
 struct TireTrackNode
 {
-  Point4 pos; // pos xz, side vector * width
-  Point4 tc;  // tc, opacity, omnidir blend
+  Point3 pos;
+  uint32_t scaledSideVector; // side vector * width
+  uint32_t material;
+  uint32_t padding; // will be replaced by second material to blend
+  uint32_t omnidirBlendOpacity;
+  uint32_t tcWetness;
+
+  void packData(float alpha = 0.0f, float wetness = 0.0f, float omnidirectional_tex_blend = 0.0f, float texture_coord = 0.0f,
+    int current_matId = 0, int matCount = 1)
+  {
+    if (current_matId < 0) // invalid texcoords
+    {
+      alpha = 0;
+      current_matId = 0;
+    }
+
+    tcWetness = encode_float2(Point2(texture_coord, wetness));
+    omnidirBlendOpacity = encode_float2(Point2(omnidirectional_tex_blend, alpha));
+    float materialTc = (0.5f + (real)current_matId) / (real)matCount;
+    material = encode_float2(Point2(materialTc, 0));
+  }
+
+  void setOpacity(float new_opacity)
+  {
+    omnidirBlendOpacity = encode_float2(Point2(decode_float2(omnidirBlendOpacity).x, new_opacity));
+  }
+
+  float getOpacity() const { return decode_float2(omnidirBlendOpacity).y; }
+
+  float getOmnidirblend() const { return decode_float2(omnidirBlendOpacity).x; }
+
+  float getWetness() const { return decode_float2(tcWetness).y; }
+
+  Point2 getSideVector() const { return decode_float2(scaledSideVector); }
 };
 
 static int default_texture_idx = 0;
@@ -111,8 +156,12 @@ static RealRange segmentLength(0.5f, 1.0f);
 static real hAngleLimit = DEG_TO_RAD * 30.0f;
 static real vAngleLimit = DEG_TO_RAD * 20.0f;
 
+static float maxOmnidirTexBlendDelta = 1.0f;
+
 // reduce opacity on tracks' ends
 static bool fadeTrackEnds = false;
+
+static real tcYstep = 200.0f;
 
 //*************************************************
 // class TrackEmitter
@@ -124,6 +173,7 @@ private:
   float trackWidth;
   float totalBatchLen;
   int lastTex; // last emitted texture index
+  float prevOmnidirBlend;
   int currentIdx;
   Point3 lastPos;
   Point3 secondLastPos;
@@ -132,6 +182,7 @@ private:
 public:
   Tab<TireTrackNode> track;
   bool alive;
+  float deformPressureMult = -1.f;
 
   // start node of track
   int getStart() const
@@ -181,8 +232,8 @@ public:
   }
 
   // emit new track (start new or continue existing)
-  bool emit(const Point3 &norm, const Point3 &pos, const Point3 &movedir, real opacity, int tex_id, float additional_width,
-    float omnidirectional_tex_blend, bool correct_previous_node)
+  bool emit(const Point3 &norm, const Point3 &pos, const Point3 &movedir, real opacity, real wetness, int tex_id,
+    float additional_width, float omnidirectional_tex_blend, bool correct_previous_node, bool direction_changed)
   {
     lastNorm = normalize(norm);
     if (lastNorm.y < 0)
@@ -196,47 +247,53 @@ public:
 
     lastTex = tex_id;
 
-    if (totalBatchLen >= 1000 * trackTypes[trackTypeNo].textureLength)
-      totalBatchLen = 0.0f;
+    totalBatchLen += (pos - lastPos).length() / trackTypes[trackTypeNo].textureLength;
+    totalBatchLen = fmodf(totalBatchLen, tcYstep);
 
-    totalBatchLen += (pos - lastPos).length();
+    int prevIdx = currentIdx > 0 ? currentIdx - 1 : track.size() - 1;
+    if (maxOmnidirTexBlendDelta < 1.0f && prevIdx >= 0 && track[prevIdx].getOpacity() > 0.f)
+    {
+      omnidirectional_tex_blend =
+        clamp(omnidirectional_tex_blend, prevOmnidirBlend - maxOmnidirTexBlendDelta, prevOmnidirBlend + maxOmnidirTexBlendDelta);
+    }
+    TireTrackNode node = genNewNode(pos, normalize(movedir), opacity, wetness, additional_width, omnidirectional_tex_blend,
+      correct_previous_node, tex_id);
 
-    TireTrackNode node =
-      genNewNode(pos, normalize(movedir), opacity, additional_width, omnidirectional_tex_blend, correct_previous_node);
+    prevOmnidirBlend = omnidirectional_tex_blend;
 
     if (track.size() == MAX_NODES_PER_TRACK)
       track[currentIdx] = node;
     else
       track.push_back(node);
 
-    if (correct_previous_node && node.tc.w > 0.f && track.size() > 2)
+    if (correct_previous_node && node.getOpacity() > 0.f && track.size() > 2)
     {
-      auto getPrevIdx = [this](int idx) { return (idx - 1 < 0 && track.size() == MAX_NODES_PER_TRACK) ? track.size() - 1 : idx - 1; };
-      int prevIdx = getPrevIdx(currentIdx);
-      int secondPrevIdx = getPrevIdx(prevIdx);
+      int secondPrevIdx = prevIdx > 0 ? prevIdx - 1 : track.size() - 1;
 
-      Point4 &prevNodePos = track[prevIdx].pos;
-      Point4 &secondPrevNodePos = track[secondPrevIdx].pos;
+      if (direction_changed)
+        track[prevIdx].setOpacity(0.f);
 
-      Point2 lastSegmentDir = normalize(Point2::xy(node.pos) - Point2::xy(prevNodePos));
-      Point2 prevLastSegmentDir = normalize(Point2::xy(prevNodePos) - Point2::xy(secondPrevNodePos));
+      Point3 prevNodePos = track[prevIdx].pos;
+      Point3 secondPrevNodePos = track[secondPrevIdx].pos;
+
+      Point2 lastSegmentDir = normalize(Point2::xz(node.pos) - Point2::xz(prevNodePos));
+      Point2 prevLastSegmentDir = normalize(Point2::xz(prevNodePos) - Point2::xz(secondPrevNodePos));
       Point2 segmentBisector = lastSegmentDir + prevLastSegmentDir;
 
       float segmentBisectorLengthSquared = lengthSq(segmentBisector);
       if (segmentBisectorLengthSquared > 1.f) // a turn is less than 120 degrees
       {
-        Point2 sideVector = Point2(prevNodePos.z, prevNodePos.w);
+        Point2 sideVector = decode_float2(track[prevIdx].scaledSideVector);
         // A bisector of an angle between 2 polygonal chain segments is orthogonal to the bisector of corresponding vectors:
         Point2 newSideVector =
           Point2(segmentBisector.y, -segmentBisector.x) * safeinv(sqrtf(segmentBisectorLengthSquared)) * length(sideVector);
         if (dot(newSideVector, sideVector) < 0.f)
           newSideVector *= -1.f;
 
-        prevNodePos.z = newSideVector.x;
-        prevNodePos.w = newSideVector.y;
+        track[prevIdx].scaledSideVector = encode_float2(newSideVector);
 
         // We have to invalidate previous node with the corrected side vector
-        Point3 newSideVector3D = Point3(prevNodePos.z, 0.f, prevNodePos.w);
+        Point3 newSideVector3D = Point3::x0y(newSideVector);
         Point3 pPos = lastPos + newSideVector3D;
         v_bbox3_add_pt(updateBbox, v_ldu(&pPos.x));
         pPos = lastPos - newSideVector3D;
@@ -265,24 +322,15 @@ public:
   {
     for (int i = 0; i < track.size(); i++)
     {
-      Point2 posXZ = Point2(track[i].pos.x, track[i].pos.y);
+      Point2 posXZ = Point2(track[i].pos.x, track[i].pos.z);
       if (box & posXZ)
-        track[i].tc.w = 0;
+        track[i].setOpacity(0);
     }
   }
 
 private:
-  Point4 genTexCoord(float alpha, float omnidirectional_tex_blend)
-  {
-    float longitudinalPosition = totalBatchLen;
-    float textureCoord = longitudinalPosition / trackTypes[trackTypeNo].textureLength;
-    if (lastTex < 0) // invalid texcoords
-      alpha = 0;
-
-    return Point4((0.5f + (real)lastTex) / (real)trackTypes[trackTypeNo].frameCount, textureCoord, omnidirectional_tex_blend, alpha);
-  }
-  TireTrackNode genNewNode(const Point3 &pos, const Point3 &segment_dir, float alpha, float additional_width,
-    float omnidirectional_tex_blend, bool correct_previous_node)
+  TireTrackNode genNewNode(const Point3 &pos, const Point3 &segment_dir, float alpha, float wetness, float additional_width,
+    float omnidirectional_tex_blend, bool correct_previous_node, int tex_id)
   {
     const Point3 b = normalize(lastNorm % -segment_dir);
 
@@ -294,9 +342,10 @@ private:
 
     Point3 pwidth = b * width;
 
-    result.pos = Point4(pos.x, pos.z, pwidth.x, pwidth.z);
-
-    result.tc = genTexCoord(alpha * transparency, omnidirectional_tex_blend);
+    result.pos = pos;
+    result.scaledSideVector = encode_float2(Point2::xz(pwidth));
+    result.packData(alpha * transparency, wetness, omnidirectional_tex_blend, totalBatchLen, tex_id,
+      trackTypes[trackTypeNo].frameCount);
 
     // generate invalidation box
 
@@ -309,9 +358,9 @@ private:
 
       // hide previous and current nodes from render
       if (prevIdx >= 0)
-        track[prevIdx].tc.w = 0.0f;
+        track[prevIdx].setOpacity(0);
 
-      result.tc.w = 0.0f;
+      result.setOpacity(0);
     }
     else
     {
@@ -343,6 +392,8 @@ private:
 
     return result;
   }
+
+  friend void tire_tracks::render_debug(bool);
 };
 
 //*************************************************
@@ -350,6 +401,7 @@ private:
 //*************************************************
 // shaders
 DynamicShaderHelper trackMaterial;
+static DynamicShaderHelper tiresProjectiveDecalShader;
 
 //*************************************************
 // init/release
@@ -369,7 +421,7 @@ static void loadRange(DataBlock *blk, const char *name, RealRange &result)
 
 static int tires_drift_texVarId = -1, tires_diffuse_texVarId = -1, tires_normal_texVarId = -1, tires_base_yVarId = -1,
            track_smoothness_reflectanceVarId = -1, tires_texture_widthVarId = -1, tires_start_instVarId = -1,
-           tires_frame_countVarId = -1;
+           tires_frame_countVarId = -1, tires_tcY_stepVarId = -1;
 
 static uint32_t nodeCount = MAX_ALLOWED_TRACKS * (4 + MAX_NODES_PER_TRACK);
 
@@ -411,6 +463,7 @@ void init(const char *blk_file, bool has_normalmap, bool stub_render_mode)
 
     defaultTrackWidth = params->getReal("width", defaultTrackWidth);
     trackTextureWidthFactor = 1 / params->getReal("widthTexturePart", 1 / trackTextureWidthFactor);
+    ShaderGlobal::set_float(get_shader_variable_id("tires_texture_width_factor", true), trackTextureWidthFactor);
 
     loadRange(params, "length", segmentLength);
     debug("segmentLength %g %g", segmentLength.getMin(), segmentLength.getMax());
@@ -423,9 +476,12 @@ void init(const char *blk_file, bool has_normalmap, bool stub_render_mode)
 
     shaderName = params->getStr("shaderName", "tires_default");
 
+    tcYstep = params->getReal("tcYstep", 50.f);
+
     transparency = params->getReal("transparency", 1.f);
 
     fadeTrackEnds = params->getBool("fadeTrackEnds", false);
+    maxOmnidirTexBlendDelta = params->getReal("maxOmnidirTexBlendDelta", 1.0f);
   }
 
   init_emitters();
@@ -441,6 +497,10 @@ void init(const char *blk_file, bool has_normalmap, bool stub_render_mode)
   tires_base_yVarId = get_shader_variable_id("tires_base_y", true);
   tires_frame_countVarId = get_shader_variable_id("tires_frame_count", true);
   tires_start_instVarId = get_shader_variable_id("tires_start_inst", true);
+  tires_tcY_stepVarId = get_shader_variable_id("tires_tcY_step", true);
+
+  ShaderGlobal::set_float(tires_tcY_stepVarId, tcYstep);
+
   update_samplers();
 
   // load texture params
@@ -486,9 +546,9 @@ void init(const char *blk_file, bool has_normalmap, bool stub_render_mode)
 
       unsigned writeAlbedo = trackBlk->getBool("writeAlbedo", true) ? (WRITEMASK_RED0 | WRITEMASK_GREEN0 | WRITEMASK_BLUE0) : 0;
       unsigned writeNormal = trackBlk->getBool("writeNormal", true) ? (WRITEMASK_RED1 | WRITEMASK_GREEN1) : 0;
-      unsigned writeMicrodetail = trackBlk->getBool("writeMaterial", false) ? (WRITEMASK_BLUE1) : 0;
-      unsigned writeSmoothness = trackBlk->getBool("writeSmoothness", false) ? (WRITEMASK_GREEN2) : 0;
-      unsigned writeReflectance = trackBlk->getBool("writeReflectance", false) ? (WRITEMASK_BLUE2) : 0;
+      unsigned writeSmoothness = trackBlk->getBool("writeSmoothness", false) ? (WRITEMASK_BLUE1) : 0;
+      unsigned writeMicrodetail = trackBlk->getBool("writeMaterial", false) ? (WRITEMASK_BLUE2) : 0;
+      unsigned writeReflectance = trackBlk->getBool("writeReflectance", false) ? (WRITEMASK_GREEN2) : 0;
 
       unsigned writemask = writeAlbedo | writeNormal | writeMicrodetail | writeSmoothness | writeReflectance;
 
@@ -509,9 +569,11 @@ void init(const char *blk_file, bool has_normalmap, bool stub_render_mode)
   nodeCount = maxTrackCount * (4 + MAX_NODES_PER_TRACK);
 
   renderDataVS = dag::create_sbuffer(sizeof(Point4), nodeCount * sizeof(TireTrackNode) / sizeof(Point4),
-    SBCF_DYNAMIC | SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE, TEXFMT_A32B32G32R32F, String(0, "tire_tracks_data_vs"));
+    SBCF_DYNAMIC | SBCF_BIND_SHADER_RES | SBCF_CPU_ACCESS_WRITE, TEXFMT_A32B32G32R32F, String(0, "tire_tracks_data_vs"), RESTAG_TRACK);
 
   trackMaterial.init(shaderName, NULL, 0, "tire_track shader");
+  tiresProjectiveDecalShader.init("tires_projective_decal", NULL, 0, "tire_track shader", true);
+  index_buffer::init_box();
 }
 
 // release system
@@ -522,9 +584,9 @@ void setShaderVars(int track_type_no)
   ShaderGlobal::set_texture(tires_drift_texVarId, driftTexId);
 
   ShaderGlobal::set_int(tires_frame_countVarId, trackTypes[track_type_no].frameCount);
-  ShaderGlobal::set_real(tires_texture_widthVarId, trackTypes[track_type_no].textureWidth);
+  ShaderGlobal::set_float(tires_texture_widthVarId, trackTypes[track_type_no].textureWidth);
 
-  ShaderGlobal::set_color4(track_smoothness_reflectanceVarId, trackTypes[track_type_no].smoothness,
+  ShaderGlobal::set_float4(track_smoothness_reflectanceVarId, trackTypes[track_type_no].smoothness,
     trackTypes[track_type_no].reflectance, 0, 0);
 }
 void release()
@@ -555,7 +617,10 @@ void release()
   driftTexId = BAD_TEXTUREID;
   clear_and_shrink(trackTypes);
   renderDataVS.close();
+  deformPressureBuf.close();
   trackMaterial.close();
+  tiresProjectiveDecalShader.close();
+  index_buffer::release_box();
 }
 
 //*************************************************
@@ -573,12 +638,14 @@ void clear(bool completeClear)
   }
 }
 
-void before_render(float /*dt*/, const Point3 &origin)
+void before_render(float /*dt*/, const Point3 &origin, bool need_deform_pressure_buffer)
 {
   if (!renderDataVS.getBuf())
     return;
 
-  Tab<TireTrackNode> renderData(framemem_ptr()); // Note: no need to reserve, framemem can resizeInplace
+  FRAMEMEM_REGION;
+  Tab<TireTrackNode> renderData(framemem_ptr());
+  Tab<float> deformPressure(framemem_ptr());
 
   int lastSize = 0;
   int trackStartIndex = 0;
@@ -594,7 +661,7 @@ void before_render(float /*dt*/, const Point3 &origin)
         // empty node before track
         int idx = tr.getStart() > tr.track.size() ? 0 : tr.getStart();
         TireTrackNode plugNode = tr.track[idx];
-        plugNode.tc = Point4(0, 0, 0, 0);
+        plugNode.packData();
         renderData.push_back(plugNode);
       }
 
@@ -611,27 +678,37 @@ void before_render(float /*dt*/, const Point3 &origin)
         // empty node after track
         int idx = tr.getStart() > 0 ? (tr.getStart() - 1) : (tr.track.size() - 1);
         TireTrackNode plugNode = tr.track[idx];
-        plugNode.tc = Point4(0, 0, 0, 0);
+        plugNode.packData();
         renderData.push_back(plugNode);
       }
       else
       {
-        renderData[trackStartIndex].tc.w = 0;
-        renderData.back().tc.w = 0;
+        renderData[trackStartIndex].setOpacity(0);
+        renderData.back().setOpacity(0);
       }
+      if (need_deform_pressure_buffer)
+        deformPressure.resize(renderData.size(), tr.deformPressureMult);
       trackStartIndex = renderData.size();
     }
     renderCount[renderType] = renderData.size() - lastSize;
     lastSize = renderData.size();
   }
 
-  ShaderGlobal::set_real(tires_base_yVarId, origin.y);
+  ShaderGlobal::set_float(tires_base_yVarId, origin.y);
 
   uint32_t lockCount = min(renderData.size(), nodeCount);
 
   if (lockCount > 0)
     renderDataVS.getBuf()->updateDataWithLock(0, sizeof(TireTrackNode) * lockCount, renderData.data(), VBLOCK_DISCARD);
   renderDataVS.setVar();
+  if (need_deform_pressure_buffer && lockCount > 0)
+  {
+    // todo: it would be better to rework this buffer if more per emitter params is needed in future
+    if (!deformPressureBuf)
+      deformPressureBuf = dag::buffers::create_one_frame_sr_structured(sizeof(float), nodeCount, "tire_tracks_deform_pressure");
+    if (deformPressureBuf)
+      deformPressureBuf.getBuf()->updateDataWithLock(0, sizeof(float) * lockCount, deformPressure.data(), VBLOCK_DISCARD);
+  }
 }
 
 void invalidate_region(const BBox3 &bbox)
@@ -728,14 +805,21 @@ int create_emitter(float width, float /*texture_length_factor*/, float min_time,
   return id;
 }
 
-bool emit(int emitterId, const Point3 &norm, const Point3 &pos, const Point3 &movedir, real opacity, int tex_id,
-  float additional_width, float omnidirectional_tex_blend, bool correct_previous_node)
+bool emit(int emitterId, const Point3 &norm, const Point3 &pos, const Point3 &movedir, real opacity, real wetness, int tex_id,
+  float additional_width, float omnidirectional_tex_blend, bool correct_previous_node, bool direction_changed)
 {
   if (emitterId < 0 || emitterId >= emitters.size())
     return false;
 
-  return emitters[emitterId].emit(norm, pos, movedir, opacity, tex_id, additional_width, omnidirectional_tex_blend,
-    correct_previous_node);
+  return emitters[emitterId].emit(norm, pos, movedir, opacity, wetness, tex_id, additional_width, omnidirectional_tex_blend,
+    correct_previous_node, direction_changed);
+}
+
+void set_emitter_deform_pressure(int emitterId, float pressure_mult)
+{
+  if (emitterId < 0 || emitterId >= emitters.size())
+    return;
+  emitters[emitterId].deformPressureMult = pressure_mult;
 }
 
 // delete track emitter.
@@ -747,11 +831,10 @@ void delete_emitter(int emitterId)
   emitters[emitterId].alive = false;
 }
 
-void render(const Frustum &frustum, bool for_displacement)
+void render_strips(bool apply_clipmap_writemask)
 {
   if (!renderDataVS.getBuf())
     return;
-  G_UNUSED(frustum);
 
   index_buffer::Quads32BitUsageLock quads32Lock;
 
@@ -766,7 +849,7 @@ void render(const Frustum &frustum, bool for_displacement)
     setShaderVars(renderType);
     ShaderGlobal::set_int(tires_start_instVarId, rendered);
 
-    if (!for_displacement)
+    if (apply_clipmap_writemask)
     {
       shaders::overrides::reset();
       shaders::overrides::set(trackTypes[renderType].shaderOverride);
@@ -782,11 +865,72 @@ void render(const Frustum &frustum, bool for_displacement)
     rendered += renderCount[renderType];
   }
 
-  if (!for_displacement)
+  if (apply_clipmap_writemask)
   {
     shaders::overrides::reset();
     shaders::overrides::set(savedStateId);
   }
+}
+
+void render_projective_decals()
+{
+  if (!tiresProjectiveDecalShader.shader || !renderDataVS.getBuf())
+    return;
+  TIME_D3D_PROFILE(tire_tracks_decals);
+  index_buffer::use_box();
+  int startInstance = 0;
+  for (int renderType = 0; renderType < trackTypes.size(); renderType++)
+  {
+    if (renderCount[renderType] < 2)
+      continue;
+    setShaderVars(renderType);
+    ShaderGlobal::set_int(tires_start_instVarId, startInstance);
+    d3d::setvsrc_ex(0, NULL, 0, 0);
+    if (!tiresProjectiveDecalShader.shader->setStates())
+      return;
+    d3d::drawind_instanced(PRIM_TRILIST, 0, 12, 0, renderCount[renderType] - 1);
+    startInstance += renderCount[renderType];
+  }
+}
+
+void render_debug(bool show_nodes_data)
+{
+  begin_draw_cached_debug_lines(false, false, false);
+  for (const auto &tr : emitters)
+  {
+    if (tr.track.empty())
+      continue;
+    int startNodeIdx = tr.getStart();
+    Point3 prevPos = tr.track[startNodeIdx].pos;
+    E3DCOLOR trackDebugColor = E3DCOLOR(255, 0, 0);
+    E3DCOLOR textureExtendColor = E3DCOLOR(255, 255, 255);
+    for (int i = 0; i < tr.track.size(); ++i)
+    {
+      int nodeIdx = (startNodeIdx + i) % tr.track.size();
+
+      const TireTrackNode &node = tr.track[nodeIdx];
+
+      Point3 pos = node.pos;
+      Point3 sideVector = Point3::x0y(node.getSideVector());
+      draw_cached_debug_line(pos - sideVector, pos + sideVector, textureExtendColor);
+      Point3 trackHalfWidthVector = normalize(sideVector) * tr.trackWidth * 0.5f;
+      draw_cached_debug_line(pos - trackHalfWidthVector, pos + trackHalfWidthVector, trackDebugColor);
+      draw_cached_debug_line(prevPos, pos, trackDebugColor);
+      prevPos = pos;
+      if (show_nodes_data)
+      {
+        int texId = decode_float2(node.material).x * trackTypes[tr.trackTypeNo].frameCount;
+        float omnidirBlend = node.getOmnidirblend();
+        float opacity = node.getOpacity();
+        float wetness = node.getWetness();
+        add_debug_text_mark(pos, String(0, "texId: %d", texId), -1, 0.f);
+        add_debug_text_mark(pos, String(0, "omnidir: %f", omnidirBlend), -1, 1.f);
+        add_debug_text_mark(pos, String(0, "opacity: %f", opacity), -1, 2.f);
+        add_debug_text_mark(pos, String(0, "wetness: %f", wetness), -1, 3.f);
+      }
+    }
+  }
+  end_draw_cached_debug_lines();
 }
 
 bool is_initialized() { return initialized; }

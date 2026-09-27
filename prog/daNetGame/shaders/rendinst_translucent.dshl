@@ -6,11 +6,10 @@ include "rendinst_voxelize_albedo_inc.dshl"
 include "vertex_density_overlay_inc.dshl"
 include "normaldetail.dshl"
 include "character_micro_detail.dshl"
+include "unpack_unit_vector_inc.dshl"
 
 shader rendinst_translucent
 {
-  ENABLE_ASSERT(ps)
-
   VERTEX_DENSITY_INIT_VS()
   VERTEX_DENSITY_WRITE()
 
@@ -55,6 +54,7 @@ shader rendinst_translucent
   RENDINST_BLOCK()
   RI_VOXELIZE_ALBEDO()
   RENDINST_INSTANCING()
+  USE_UNPACK_UNIT_VECTOR_VS()
 
   NO_DYNSTCODE()
 
@@ -141,7 +141,7 @@ shader rendinst_translucent
 
         float3 localNormal = 1;
       ##if (rendinst_render_pass != rendinst_render_pass_depth)
-        localNormal = normalize(BGR_SWIZZLE(input.normal_ao.xyz)*2-1);
+        localNormal = normalize(unpack_unit_vector(input.normal_ao.xyz));
       ##endif
 
         float3 localPos = input.pos;
@@ -167,14 +167,14 @@ shader rendinst_translucent
       }
     }
 
-    if (rendinst_render_pass != rendinst_render_pass_depth)
+    if (!(rendinst_render_pass == rendinst_render_pass_depth || is_triangle_size_debug))
     {
       USE_PIXEL_TANGENT_SPACE()
       WRITE_GBUFFER()
 
       (ps) {
-        diffuse_tex@static = tex;
-        normal_tex@static = normal;
+        diffuse_tex@staticSmp = tex;
+        normal_tex@staticSmp = normal;
       }
 
       hlsl(ps) {
@@ -206,7 +206,6 @@ shader rendinst_translucent
 
           half smoothness = packedNormalMap.r;
           half3 normalMap = unpack_ag_normal(packedNormalMap);
-          half3 worldNormal = perturb_normal(normalMap, normalize(input.normal_ao.xyz), input.pointToEye.xyz, input.diffuseTexcoord.xy);
 
         ##if translucency_override == on
           half translucency = get_translucency_override();
@@ -225,6 +224,9 @@ shader rendinst_translucent
               smoothness);
           }
 
+          // after micro detail, so its normal perturbation is not lost
+          half3 worldNormal = perturb_normal(normalMap, normalize(input.normal_ao.xyz), input.pointToEye.xyz, input.diffuseTexcoord.xy);
+
           init_ao(gbuffer, input.normal_ao.a);
           init_translucency(gbuffer, translucency);
 
@@ -242,13 +244,17 @@ shader rendinst_translucent
           WRITE_SCENE25D_VOXEL_DATA(worldPos, gbuffer.albedo.rgb, 0, 0);
         #else
           init_dynamic(gbuffer, IS_DYNAMIC);
-          init_order(gbuffer, GBUFFER_ORDER_DYNAMIC);
+          init_order(gbuffer, GBUFFER_ORDER_STATIC);
           return encode_gbuffer(gbuffer, input.pointToEye.xyz, GET_SCREEN_POS(input.pos));
         #endif
         }
       }
 
       compile("target_ps", "simple_ps");
+    }
+    else if (is_triangle_size_debug)
+    {
+      RI_TRIANGLE_SIZE_DEBUG_PS()
     }
     else
     {

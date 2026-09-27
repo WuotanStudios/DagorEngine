@@ -1,6 +1,8 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <gui/dag_stdGuiRenderEx.h>
 #include <math/dag_easingFunctions.h>
 #include <math/dag_mathUtils.h>
@@ -13,6 +15,9 @@ ECS_TAG(render, ui)
 ECS_NO_ORDER
 static inline void offender_mark_es(const RenderEventUI &evt, ecs::EntityId possessedByPlr, ecs::Array &offender_marks)
 {
+  if (offender_marks.empty())
+    return;
+
   if (possessedByPlr != game::get_local_player_eid())
     return;
 

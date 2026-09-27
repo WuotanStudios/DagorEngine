@@ -13,11 +13,10 @@ low {
     volumeFogQuality:t="close"
     fxTarget:t="lowres"
     groundDisplacementQuality:i=1
-    tsrQuality:i=1
   }
   video {
-    antiAliasingMode:i=3
-    temporalUpsamplingRatio:r=50
+    antialiasing_mode:t="tsr"
+    antialiasing_upscaling:t="200"
   }
 }
 
@@ -36,11 +35,10 @@ medium {
     volumeFogQuality:t="medium"
     fxTarget:t="highres"
     groundDisplacementQuality:i=2
-    tsrQuality:i=0
   }
   video {
-    antiAliasingMode:i=3
-    temporalUpsamplingRatio:r=100
+    antialiasing_mode:t="tsr"
+    antialiasing_upscaling:t="100"
   }
 }
 
@@ -59,10 +57,9 @@ ultra {
     volumeFogQuality:t="far"
     fxTarget:t="highres"
     groundDisplacementQuality:i=2
-    tsrQuality:i=1
   }
   video {
-    antiAliasingMode:i=3
-    temporalUpsamplingRatio:r=100
+    antialiasing_mode:t="tsr"
+    antialiasing_upscaling:t="100"
   }
 }

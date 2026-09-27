@@ -5,10 +5,11 @@
 #pragma once
 
 #include <util/dag_inttypes.h>
+#include <drv/3d/dag_multi_interface.h>
 
 class Sbuffer;
 
-namespace d3d
+namespace d3d _MULTI_INTERFACE
 {
 /**
  * @brief Dispatches a mesh shader with the specified thread group dimensions.
@@ -16,8 +17,8 @@ namespace d3d
  * Max value for each direction is 64k, product of all dimensions can not exceed 2^22
  *
  * @param thread_group_x The number of thread groups in the X direction.
- * @param thread_group_y The number of thread groups in the Y direction.
- * @param thread_group_z The number of thread groups in the Z direction.
+ * @param thread_group_y The number of thread groups in the Y direction. Must be equal to 1.
+ * @param thread_group_z The number of thread groups in the Z direction. Must be equal to 1.
  */
 void dispatch_mesh(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z);
 
@@ -28,8 +29,8 @@ void dispatch_mesh(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t th
  * struct DispatchArgs
  * {
  *   uint32_t thread_group_x;
- *   uint32_t thread_group_y;
- *   uint32_t thread_group_z;
+ *   uint32_t thread_group_y; // must be equal to 1
+ *   uint32_t thread_group_z; // must be equal to 1
  * };
  * @param dispatch_count The number of dispatches to execute.
  * @param stride_bytes The stride between dispatch arguments in bytes.
@@ -52,7 +53,7 @@ void dispatch_mesh_indirect(Sbuffer *args, uint32_t dispatch_count, uint32_t str
  */
 void dispatch_mesh_indirect_count(Sbuffer *args, uint32_t args_stride_bytes, uint32_t args_byte_offset, Sbuffer *count,
   uint32_t count_byte_offset, uint32_t max_count);
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 #if _TARGET_D3D_MULTI
 #include <drv/3d/dag_interface_table.h>

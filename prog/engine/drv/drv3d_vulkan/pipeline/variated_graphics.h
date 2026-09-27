@@ -23,12 +23,10 @@ public:
   struct ExtendedVariantDescription
   {
     GraphicsPipelineVariantDescription base;
-    GraphicsPipelineDynamicStateMask mask;
     Index index;
   };
 
-  ExtendedVariantDescription &get(const GraphicsPipelineVariantDescription &dsc, GraphicsPipelineVariantDescription::Hash hash,
-    RenderStateSystemBackend &rs_backend, RenderPassResource *native_rp);
+  ExtendedVariantDescription &get(const GraphicsPipelineVariantDescription &dsc, GraphicsPipelineVariantDescription::Hash hash);
 
 private:
   typedef eastl::pair<GraphicsPipelineVariantDescription::Hash, Index> KeyIndexPair;
@@ -93,9 +91,7 @@ public:
 
   const char *resTypeString() { return "VariatedGraphicsPipeline"; }
 
-  VariatedGraphicsPipeline(ProgramID inProg, VulkanPipelineCacheHandle, LayoutType *l, const CreationInfo &info) :
-    DebugAttachedPipeline(l), modules(info.modules), variations(info.varStorage), program(inProg), seenBefore(info.seenBefore)
-  {}
+  VariatedGraphicsPipeline(ProgramID inProg, VulkanPipelineCacheHandle, LayoutType *l, const CreationInfo &info);
 
   GraphicsPipeline *getVariant(CompilationContext &comp_ctx, const GraphicsPipelineVariantDescription &dsc);
 
@@ -111,12 +107,17 @@ public:
 
   bool pendingCompilation();
 
+  InputLayoutID getBaseInputLayout() const { return inputLayout; }
+
+  ProgramID getProgram() const { return program; }
+
 private:
   GraphicsPipelineShaderSet<const ShaderModule *> modules;
 
   dag::Vector<eastl::pair<GraphicsPipelineVariantDescription::Hash, GraphicsPipeline *>> items;
   GraphicsPipelineVariationStorage &variations;
   ProgramID program;
+  InputLayoutID inputLayout;
   bool seenBefore;
 };
 

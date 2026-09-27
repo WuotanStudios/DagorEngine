@@ -2,7 +2,6 @@
 #include <phys/dag_physics.h>
 #include <math/dag_geomTree.h>
 #include <math/dag_geomNodeUtils.h>
-#include <math/twistCtrl.h>
 #include <stddef.h>
 #include <perfMon/dag_statDrv.h>
 
@@ -115,30 +114,8 @@ void PhysRagdoll::update(real dt, GeomNodeTree &tree, AnimV20::AnimcharBaseCompo
     }
   }
 
-  if (!nodeAlignCtrl.size() && physRes && physRes->getNodeAlignCtrl().size())
-  {
-    dag::ConstSpan<PhysicsResource::NodeAlignCtrl> c = physRes->getNodeAlignCtrl();
-    nodeAlignCtrl.reserve(c.size());
-    for (int i = 0; i < c.size(); i++)
-    {
-      NodeAlignCtrl &ctrl = nodeAlignCtrl.push_back();
-      ctrl.node0Id = tree.findNodeIndex(c[i].node0);
-      ctrl.node1Id = tree.findNodeIndex(c[i].node1);
-      ctrl.angDiff = c[i].angDiff;
-      for (int j = 0; j < countof(c[i].twist) && !c[i].twist[j].empty(); j++)
-      {
-        ctrl.twistId[j] = tree.findNodeIndex(c[i].twist[j]);
-        if (!ctrl.twistId[j])
-        {
-          ctrl.twistCnt = 0;
-          break;
-        }
-        ctrl.twistCnt = j + 1;
-      }
-      if (!ctrl.node0Id || !ctrl.node1Id || !ctrl.twistCnt)
-        nodeAlignCtrl.pop_back();
-    }
-  }
+  if (!twistCtrl.size() && physRes)
+    twistCtrl = make_phys_twist_ctrls(*physRes, tree);
 
   physSys->updateTms();
 
@@ -155,9 +132,8 @@ void PhysRagdoll::update(real dt, GeomNodeTree &tree, AnimV20::AnimcharBaseCompo
     if (recalcWtms)
       tree.invalidateWtm(i);
   }
-  for (int j = 0; j < nodeAlignCtrl.size(); j++)
-    apply_twist_ctrl(tree, nodeAlignCtrl[j].node0Id, nodeAlignCtrl[j].node1Id,
-      make_span(nodeAlignCtrl[j].twistId, nodeAlignCtrl[j].twistCnt), nodeAlignCtrl[j].angDiff);
+  for (const TwistCtrlParams &ctrl : twistCtrl)
+    apply_phys_twist_ctrl(tree, ctrl);
 }
 
 
@@ -209,9 +185,15 @@ void PhysRagdoll::setOverrideOmega(const Point3 &omega)
   shouldOverrideOmega = true;
 }
 
-void PhysRagdoll::setDriveBodiesToAnimchar(bool doDrive) { driveBodiesToAnimchar = doDrive; }
+void PhysRagdoll::setDriveBodiesToAnimchar(bool doDrive)
+{
+  driveBodiesToAnimchar = doDrive;
+  // Motors keep holding the last driven pose until they are explicitly turned off
+  if (!doDrive && physSys)
+    physSys->disableJointsMotors();
+}
 
-void PhysRagdoll::startRagdoll(int interact_layer, int interact_mask, const GeomNodeTree *tree)
+void PhysRagdoll::startRagdoll(int interact_layer, int interact_mask, const GeomNodeTree *tree, float scale)
 {
   if (physSys) // Wake up if it's already started
     wakeUp();
@@ -220,7 +202,8 @@ void PhysRagdoll::startRagdoll(int interact_layer, int interact_mask, const Geom
 
   TIME_PROFILE(startRagdoll);
 
-  physSys = new PhysSystemInstance(physRes, physWorld, nullptr, &ud, interact_layer, interact_mask);
+  const TMatrix *noAddToWorld = nullptr;
+  physSys = new PhysSystemInstance(physRes, physWorld, noAddToWorld, &ud, interact_layer, interact_mask, scale);
   clear_and_shrink(lastNodeTms);
 
   if (tree)
@@ -253,13 +236,20 @@ void PhysRagdoll::startRagdoll(int interact_layer, int interact_mask, const Geom
   }
 }
 
+void PhysRagdoll::setScaleTm(const TMatrix &scaleTm)
+{
+  if (physSys)
+  {
+    physSys->resetTm(scaleTm);
+  }
+}
 
 void PhysRagdoll::endRagdoll()
 {
   del_it(physSys);
   clear_and_shrink(nodeHelpers);
   clear_and_shrink(driveBodiesToSkeletonWtms);
-  clear_and_shrink(nodeAlignCtrl);
+  clear_and_shrink(twistCtrl);
 }
 
 // sets ccd mode

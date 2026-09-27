@@ -48,27 +48,43 @@
 #endif
 
 #ifndef DAGOR_THREAD_SANITIZER
-#if defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-#define DAGOR_THREAD_SANITIZER 1
-#endif
-#else
 #if defined(__SANITIZE_THREAD__)
+#define DAGOR_THREAD_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
 #define DAGOR_THREAD_SANITIZER 1
 #endif
 #endif
 #endif
 
 #ifndef DAGOR_ADDRESS_SANITIZER
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define DAGOR_ADDRESS_SANITIZER 1
-#elif defined(__SANITIZE_ADDRESS__)
-#define DAGOR_ADDRESS_SANITIZER 1
-#endif
-#else
 #if defined(__SANITIZE_ADDRESS__)
 #define DAGOR_ADDRESS_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer)
+#define DAGOR_ADDRESS_SANITIZER 1
 #endif
 #endif
+#endif
+
+#if defined(__clang__)
+#define DAGOR_LIFETIMEBOUND [[clang::lifetimebound]] // the built/returned object borrows from this arg, so a temporary here dangles
+#elif defined(_MSC_VER)
+#define DAGOR_LIFETIMEBOUND [[msvc::lifetimebound]] // same, but only diagnosed under /analyze
+#else
+#define DAGOR_LIFETIMEBOUND
+#endif
+
+#if defined(__clang__)
+#define DAGOR_POINTER_LIKE [[gsl::Pointer]] // non-owning view type, so -Wdangling also sees assignment from a temporary
+#else
+#define DAGOR_POINTER_LIKE // MSVC and gcc do not know this attribute
+#endif
+
+// -Wunused-variable counts a non-trivial ctor/dtor call as a use; this turns the check back
+// on for value types (containers, strings). Never on RAII guards, where that call is the point.
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(PVS_STUDIO) // PVS-Studio reads it as nodiscard
+#define DAGOR_WARN_IF_UNUSED __attribute__((warn_unused))
+#else
+#define DAGOR_WARN_IF_UNUSED
 #endif

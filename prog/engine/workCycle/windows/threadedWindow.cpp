@@ -19,11 +19,18 @@
 
 static_assert(WM_DAGOR_USER == WM_USER);
 
+#if _TARGET_PC_WIN
 namespace workcycle_internal::windows
 {
 extern eastl::pair<bool, intptr_t> main_wnd_proc(void *, unsigned, uintptr_t, intptr_t);
 extern eastl::pair<bool, intptr_t> default_wnd_proc(void *, unsigned, uintptr_t, intptr_t);
 } // namespace workcycle_internal::windows
+#else
+namespace workcycle_internal
+{
+extern intptr_t main_window_proc(void *, unsigned, uintptr_t, intptr_t);
+} // namespace workcycle_internal
+#endif
 
 namespace windows
 {
@@ -57,6 +64,8 @@ public:
   DWORD threadId = 0;
   int status = -1;
 
+  volatile int windowDestroyed = 0;
+
   RenderWindowSettings settings{};
   RenderWindowParams params{};
 
@@ -66,10 +75,12 @@ public:
   {
     Msg() = default;
     Msg(const MSG &msg) : msg{msg} {}
-    Msg(const RAWINPUT &ri) : ri{ri} {}
 
     MSG msg;
+#if _TARGET_PC_WIN
+    Msg(const RAWINPUT &ri) : ri{ri} {}
     RAWINPUT ri;
+#endif
   };
 
   eastl::vector<Msg> message_queues[2];
@@ -85,11 +96,13 @@ public:
   AVOID_FALSE_SHARING;
 
   void push_msg(const MSG &msg);
-  void push_msg(const MSG &msg, const RAWINPUT &ri);
 
   MSG *get_msg();
   bool pop_msg();
+#if _TARGET_PC_WIN
+  void push_msg(const MSG &msg, const RAWINPUT &ri);
   RAWINPUT *get_rid();
+#endif
 };
 
 static InitOnDemand<WindowThread> window_thread;
@@ -101,7 +114,10 @@ void WindowThread::execute()
   bool success = set_render_window_params(params, settings);
   os_event_set(&winCreatedEvent);
   if (!success)
+  {
+    interlocked_release_store(window_thread->windowDestroyed, 1);
     return;
+  }
 
   debug("Window has been created on thread=0x%08x", threadId);
 
@@ -128,10 +144,13 @@ void WindowThread::execute()
 
   if (interlocked_acquire_load(status) != CLOSE)
     DestroyWindow((HWND)window_thread->params.hwnd);
+
+  interlocked_release_store(window_thread->windowDestroyed, 1);
 }
 
 LRESULT WindowThread::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+#if _TARGET_PC_WIN
   if (auto [handled, result] = workcycle_internal::windows::default_wnd_proc(hwnd, message, wParam, lParam); handled)
     return result;
 
@@ -151,6 +170,7 @@ LRESULT WindowThread::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
       window_thread->push_msg(MSG{hwnd, WM_DAGOR_INPUT, wParam, lParam, window_thread->time}, ri);
   }
   else
+#endif
     window_thread->push_msg(MSG{hwnd, message, wParam, lParam, window_thread->time});
 
   return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -163,6 +183,7 @@ void WindowThread::push_msg(const MSG &msg)
   interlocked_increment(message_count);
 }
 
+#if _TARGET_PC_WIN
 void WindowThread::push_msg(const MSG &msg, const RAWINPUT &ri)
 {
   WinAutoLock lock(critSec);
@@ -170,6 +191,7 @@ void WindowThread::push_msg(const MSG &msg, const RAWINPUT &ri)
   write_queue->emplace_back(ri);
   interlocked_increment(message_count);
 }
+#endif
 
 MSG *WindowThread::get_msg()
 {
@@ -186,9 +208,11 @@ bool WindowThread::pop_msg()
   {
     switch (head->msg.message)
     {
+#if _TARGET_PC_WIN
       case WM_DAGOR_INPUT:
         head += 2; //
         break;
+#endif
       default:
         head++; //
         break;
@@ -222,6 +246,7 @@ bool WindowThread::pop_msg()
   return head != tail;
 }
 
+#if _TARGET_PC_WIN
 RAWINPUT *WindowThread::get_rid()
 {
   if (MSG *msg = get_msg(); msg != nullptr && (msg->message == WM_INPUT || msg->message == WM_DAGOR_INPUT))
@@ -229,6 +254,7 @@ RAWINPUT *WindowThread::get_rid()
 
   return nullptr;
 }
+#endif
 
 void *create_threaded_window(void *hinst, const char *name, int show, void *icon, const char *title, Driver3dInitCallback *cb)
 {
@@ -252,8 +278,10 @@ void shutdown_threaded_window()
         d3d::window_destroyed(window_thread->params.hwnd);
     }
 
-    window_thread->terminate(true);
-    window_thread.demandDestroy();
+    window_thread->terminate(true, 3000);
+
+    if (interlocked_acquire_load(window_thread->windowDestroyed))
+      window_thread.demandDestroy();
   }
 }
 
@@ -266,8 +294,12 @@ bool WindowThread::process_main_thread_messages(bool)
 
   for (; msg != nullptr; msg = window_thread->get_msg())
   {
+#if _TARGET_PC_WIN
     if (intptr_t result; !::perform_wnd_proc_components(msg->hwnd, msg->message, msg->wParam, msg->lParam, result))
       workcycle_internal::windows::main_wnd_proc(msg->hwnd, msg->message, msg->wParam, msg->lParam);
+#else
+    workcycle_internal::main_window_proc(msg->hwnd, msg->message, msg->wParam, msg->lParam);
+#endif
 
     if (!window_thread->pop_msg())
       break;
@@ -301,11 +333,13 @@ bool process_main_thread_messages(bool input_only, bool &out_ret_val)
   out_ret_val = WindowThread::process_main_thread_messages(input_only);
   return true;
 }
+#if _TARGET_PC_WIN
 RAWINPUT *get_rid()
 {
   G_ASSERT(window_thread);
   return window_thread->get_rid();
 };
+#endif
 
 unsigned long get_thread_id() { return window_thread ? window_thread->threadId : 0; }
 

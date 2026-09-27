@@ -19,6 +19,8 @@ static const char *dbg_name();
 #include <libTools/util/strUtil.h>
 #include <libTools/util/makeBindump.h>
 #include <libTools/util/fileUtils.h>
+#include <libTools/util/setupNamedMounts.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <osApiWrappers/dag_direct.h>
 #include <osApiWrappers/dag_symHlp.h>
 #include <osApiWrappers/dag_sharedMem.h>
@@ -146,7 +148,7 @@ static int do_main(bool debugmode)
   if (__argc < 4)
   {
     printf("daBuild job v1.21\n"
-           "Copyright (C) Gaijin Games KFT, 2023\n\n"
+           "Copyright (C) Gaijin Games KFT, 2026\n\n"
            "usage: daBuild-job-dev.exe <application.blk> <pid> <index>\n");
     return 1;
   }
@@ -198,7 +200,13 @@ static int do_main(bool debugmode)
 
   char app_dir[260];
   dd_get_fname_location(app_dir, __argv[1]);
-  if (!app_dir[0])
+  set_canonical_app_dir_mount(app_dir);
+  if (const char *path = dd_get_named_mount_path("appDir", 6))
+  {
+    strncpy(app_dir, path, sizeof(app_dir));
+    app_dir[sizeof(app_dir) - 1] = '\0';
+  }
+  else if (!app_dir[0])
     strcpy(app_dir, "./");
 
   DataBlock appblk;
@@ -206,9 +214,10 @@ static int do_main(bool debugmode)
   // read application.blk
   if (!appblk.load(__argv[1]))
   {
-    debug("cannot load application.blk from <%s>", __argv[1]);
+    debug("cannot load project settings from <%s>", __argv[1]);
     return false;
   }
+  setup_named_mount_points(*appblk.getBlockByNameEx("mountPoints"));
 
   bool q = dgs_execute_quiet;
   dgs_execute_quiet = true;
@@ -218,15 +227,19 @@ static int do_main(bool debugmode)
 
   // setup shaders dump path
   if (appblk.getStr("shaders", NULL))
-    appblk.setStr("shadersAbs", String(260, "%s/%s", app_dir, appblk.getStr("shaders", NULL)));
-  else
-    appblk.setStr("shadersAbs", String(260, "%s/../common/compiledShaders/tools", start_dir));
+    appblk.setStr("shadersAbs", make_eff_app_relative_path(appblk.getStr("shaders")));
 
   String cdk_dir(260, "%s/../", start_dir);
   appblk.setStr("dagorCdkDir", simplify_fname(cdk_dir));
   appblk.setBool("strip_d3dres", dabuild_strip_d3d_res);
   appblk.setBool("collapse_packs", dabuild_collapse_packs);
   appblk.setInt("dabuildJobCount", jobMem->jobCount);
+  if (jobMem->validateAlphaTest)
+  {
+    DataBlock &b = *appblk.addBlock("assets")->addBlock("build")->addBlock("validateAlphaTest");
+    b.setBool("validate", true);
+    b.setBool("strict", jobMem->validateAlphaTest > 1);
+  }
 
   DataBlock::setRootIncludeResolver(app_dir);
 
@@ -255,12 +268,7 @@ static int do_main(bool debugmode)
     return 0;
   }
 
-  // load exporter plugins
-  if (!dabuild->loadExporterPlugins())
-  {
-    dabuild->unloadExporterPlugins();
-    return 13;
-  }
+  // AssetExportCache's shared data is passed to the plugin DLLs in loadExporterPlugins(), so it must be set up before that.
 
   AssetExportCache::createSharedData(String(260, "%s/develop/.asset-local/assets-hash.bin", app_dir));
   AssetExportCache::sharedDataResetRebuildTypesList();
@@ -271,6 +279,14 @@ static int do_main(bool debugmode)
       dabuild_force_dxp_rebuild = true;
   }
   dabuild->setExpCacheSharedData(AssetExportCache::getSharedDataPtr());
+
+  // load exporter plugins
+  if (!dabuild->loadExporterPlugins())
+  {
+    dabuild->unloadExporterPlugins();
+    return 13;
+  }
+
   dabuild->processSrcHashForDestPacks();
 
   log.level = (ILogWriter::MessageType)jobMem->logLevel;
@@ -301,12 +317,14 @@ static int do_main(bool debugmode)
   Tab<bool> expTypesMask;
 
   AssetExportCache gdc;
-  String cache_base(260, "%s/%s/", app_dir, exp_blk.getStr("cache", "/develop/.cache"));
+  String cache_base = make_eff_app_relative_path(exp_blk.getStr("cache", "develop/.cache"), true);
+  String cache_base_patch(260, "%spatch/", cache_base);
   String dest_base, pack_fname_prefix;
   String cache_fname, pack_fname;
   const char *addTexPfx = exp_blk.getStr("addTexPrefix", "");
 
   simplify_fname(cache_base);
+  simplify_fname(cache_base_patch);
 
   make_exp_types_mask(expTypesMask, mgr, exp_blk, log);
 
@@ -314,6 +332,8 @@ static int do_main(bool debugmode)
   SimpleString lastProfile;
   unsigned lastTargetCode = 0;
   unsigned last_flush_time = 0, last_idle_reported_time = 0, idle_report_interval = 2000;
+
+  DataBlock *patch_build_blk = out_blk.addBlock("patchBuild");
 
   dabuild_prepare_out_blk(out_blk, mgr, build_blk);
   while (jobMem->pid != 0xFFFFFFFFU)
@@ -380,6 +400,8 @@ static int do_main(bool debugmode)
         bool upToDate = false;
         int i = ctx.packId;
 
+        patch_build_blk->setBool(pkid < 0 ? "main" : addPackages.getName(pkid), ctx.patchBuild);
+
         if (i < 0 || i >= tex_pack.size() || stricmp(tex_pack[i]->packName, ctx.data) != 0)
           for (i = 0; i < tex_pack.size() && stricmp(tex_pack[i]->packName, ctx.data) != 0; i++)
             ;
@@ -392,7 +414,8 @@ static int do_main(bool debugmode)
 
         dest_base = ctx.data + 500;
         pack_fname_prefix = ctx.data + 800;
-        make_cache_fname(cache_fname, cache_base, addPackages.getName(pkid), tex_pack[i]->packName, target_str, profile);
+        make_cache_fname(cache_fname, ctx.patchBuild ? cache_base_patch : cache_base, addPackages.getName(pkid), tex_pack[i]->packName,
+          target_str, profile);
         gdc.load(cache_fname, mgr);
 
         pack_fname.printf(260, "%s%s/%s%s", dest_base.str(), addTexPfx, pack_fname_prefix.str(), tex_pack[i]->packName.str());
@@ -435,6 +458,8 @@ static int do_main(bool debugmode)
         bool upToDate = false;
         int i = ctx.packId;
 
+        patch_build_blk->setBool(pkid < 0 ? "main" : addPackages.getName(pkid), ctx.patchBuild);
+
         if (i < 0 || i >= grp_pack.size() || stricmp(grp_pack[i]->packName, ctx.data) != 0)
           for (i = 0; i < grp_pack.size() && stricmp(grp_pack[i]->packName, ctx.data) != 0; i++)
             ;
@@ -447,7 +472,8 @@ static int do_main(bool debugmode)
 
         dest_base = ctx.data + 500;
         pack_fname_prefix = ctx.data + 800;
-        make_cache_fname(cache_fname, cache_base, addPackages.getName(pkid), grp_pack[i]->packName, target_str, profile);
+        make_cache_fname(cache_fname, ctx.patchBuild ? cache_base_patch : cache_base, addPackages.getName(pkid), grp_pack[i]->packName,
+          target_str, profile);
         gdc.load(cache_fname, mgr);
 
         pack_fname.printf(260, "%s%s%s", dest_base.str(), pack_fname_prefix.str(), grp_pack[i]->packName.str());

@@ -7,6 +7,7 @@
 #include <drv/3d/dag_platform_pc.h>
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_resetDevice.h>
+#include <drv/shadersMetaData/dx11/unpack.h>
 #include <math/dag_TMatrix.h>
 #include <math/dag_TMatrix4.h>
 #include <debug/dag_debug.h>
@@ -17,6 +18,11 @@
 #include <EASTL/unique_ptr.h>
 
 #include "driver.h"
+#include "drv_assert_defs.h"
+#include "drv_log_defs.h"
+#include "pools.h"
+#include "buffers.h"
+#include "render_state.h"
 
 #include <image/dag_texPixel.h>
 #include <debug/dag_debug.h>
@@ -36,10 +42,13 @@
 #include <util/dag_string.h>
 #include <3d/parseShaders.h>
 #include <util/dag_globDef.h>
+#include <perfMon/dag_graphStat.h>
 
 #include <debug/dag_except.h>
-
 #include <d3d11_1.h>
+
+#include "shaders.h"
+#include "texture.h"
 
 #define SHOW_DISASM   0 // show shader disassambled in create_shader
 #define SHOW_SETCONST 0 // trace shader constants setting
@@ -66,11 +75,12 @@ namespace drv3d_dx11
 {
 #include "shaderSource.inc.cpp"
 
-static ObjectPoolWithLock<PixelShader> g_pixel_shaders("pixel_shaders");
-static ObjectPoolWithLock<VertexShader> g_vertex_shaders("vertex_shaders");
-static ObjectPoolWithLock<ComputeShader, 32> g_compute_shaders("compute_shaders");
-static ObjectPoolWithLock<Program, 256> g_programs("programs");
-static ObjectPoolWithLock<ObjectProxyPtr<InputLayout>> g_input_layouts("input_layouts");
+static drv3d_generic::ObjectPoolWithLock<drv3d_generic::ObjectProxyPtr<PixelShader>> g_pixel_shaders("pixel_shaders");
+static drv3d_generic::ObjectPoolWithLock<VertexShader> g_vertex_shaders("vertex_shaders");
+static drv3d_generic::ObjectPoolWithLock<drv3d_generic::ObjectProxyPtr<ComputeShader>, 32> g_compute_shaders("compute_shaders");
+static drv3d_generic::ObjectPoolWithLock<Program, 256> g_programs("programs");
+static drv3d_generic::ObjectPoolWithLock<drv3d_generic::ObjectProxyPtr<InputLayout>> g_input_layouts("input_layouts");
+
 void get_shaders_mem_used(String &str)
 {
   str.printf(128, "g_pixel_shaders.size() =%d\n", g_pixel_shaders.size());
@@ -129,7 +139,6 @@ int ConstantBuffers::getVsConstBufferId(int required_size)
 void ConstantBuffers::create()
 {
   vsConstsUsed = psConstsUsed = csConstsUsed = 0;
-  mem_set_0(constsRequired);
   vsCurrentBuffer = -1;
 
   D3D11_BUFFER_DESC desc;
@@ -225,26 +234,13 @@ void ConstantBuffers::destroy()
   psCurrentBuffer = vsCurrentBuffer = csCurrentBuffer = 0;
   mem_set_0(csConstBuffer);
   g_render_state.modified = true;
-  mem_set_ff(constantsModified);
+  eastl::fill(constantsModified.begin(), constantsModified.end(), true);
   mem_set_0(constantsBufferChanged);
   mem_set_0(customBuffers);
   vsConstsUsed = psConstsUsed = csConstsUsed = 0;
 }
 
-static ID3D11Buffer *nullCbuf = 0;
-#define SET_CONST_BUFFERS(_ST, _START, _NUMS, _BUFFERS, _OFFSETS, _SIZES)                         \
-  if (g_device_desc.caps.hasConstBufferOffset && needOffsets)                                     \
-  {                                                                                               \
-    if (command_list_wa)                                                                          \
-    {                                                                                             \
-      dx_context->##_ST##SetConstantBuffers((_START), 1, &nullCbuf);                              \
-      if ((_NUMS) > 1)                                                                            \
-        dx_context->##_ST##SetConstantBuffers((_START) + (_NUMS) - 1, 1, &nullCbuf);              \
-    }                                                                                             \
-    dx_context1->##_ST##SetConstantBuffers1((_START), (_NUMS), (_BUFFERS), (_OFFSETS), (_SIZES)); \
-  }                                                                                               \
-  else                                                                                            \
-    dx_context->##_ST##SetConstantBuffers((_START), (_NUMS), (_BUFFERS));
+#define SET_CONST_BUFFERS(_ST, _START, _NUMS, _BUFFERS) dx_context->##_ST##SetConstantBuffers((_START), (_NUMS), (_BUFFERS))
 
 void ConstantBuffers::flush(uint32_t vsc, uint32_t psc, uint32_t hdg_bits)
 {
@@ -324,22 +320,20 @@ void ConstantBuffers::flush(uint32_t vsc, uint32_t psc, uint32_t hdg_bits)
 
   for (int stage = STAGE_CS + 1; stage < STAGE_MAX; ++stage)
   {
-    if (!constantsBufferChanged[stage])
+    // Re-mirror custom VS slots (1..N) to HS/DS/GS when an HDG stage appears, even
+    // if no buffer changed since the last bind: the new stage would otherwise read
+    // stale/zero slots. lastHDGBitsApplied only covers the slot-0 driver buffer.
+    bool vsCustomHdgChanged = stage == STAGE_VS && lastHDGBitsCustomApplied != hdg_bits && customBuffersMaxSlotUsed[STAGE_VS] > 0;
+    if (!constantsBufferChanged[stage] && !vsCustomHdgChanged)
       continue;
     carray<ID3D11Buffer *, MAX_CONST_BUFFERS> constBuffers;
-    carray<uint32_t, MAX_CONST_BUFFERS> cbOffsets;
-    carray<uint32_t, MAX_CONST_BUFFERS> cbSizes;
     mem_copy_from(constBuffers, customBuffers[stage].data());
-    mem_copy_from(cbOffsets, buffersFirstConstants[stage].data());
-    mem_copy_from(cbSizes, buffersNumConstants[stage].data());
 
     int slotsToSet = customBuffersMaxSlotUsed[stage] + 1, nextMaxUsedSlot = 0;
-    bool needOffsets = false;
     for (int slotI = 1; slotI < slotsToSet; ++slotI) //&& customBuffers[stage][maxUsedSlot]
     {
       if (constBuffers[slotI])
         nextMaxUsedSlot = slotI;
-      needOffsets |= cbOffsets[slotI] != 0;
     }
 
     ContextAutoLock contextLock;
@@ -347,34 +341,27 @@ void ConstantBuffers::flush(uint32_t vsc, uint32_t psc, uint32_t hdg_bits)
     {
       case STAGE_VS:
         if (!constBuffers[0] && vsCurrentBuffer >= 0)
-        {
           constBuffers[0] = vsConstBuffer[vsCurrentBuffer];
-          cbOffsets[0] = 0;
-          cbSizes[0] = 4096;
-        }
-        SET_CONST_BUFFERS(VS, 0, slotsToSet, constBuffers.data(), cbOffsets.data(), cbSizes.data())
+        SET_CONST_BUFFERS(VS, 0, slotsToSet, constBuffers.data());
         if (hdg_bits & HAS_HS)
         {
-          SET_CONST_BUFFERS(HS, 0, slotsToSet, constBuffers.data(), cbOffsets.data(), cbSizes.data())
+          SET_CONST_BUFFERS(HS, 0, slotsToSet, constBuffers.data());
         }
         if (hdg_bits & HAS_DS)
         {
-          SET_CONST_BUFFERS(DS, 0, slotsToSet, constBuffers.data(), cbOffsets.data(), cbSizes.data())
+          SET_CONST_BUFFERS(DS, 0, slotsToSet, constBuffers.data());
         }
         if (hdg_bits & HAS_GS)
         {
-          SET_CONST_BUFFERS(GS, 0, slotsToSet, constBuffers.data(), cbOffsets.data(), cbSizes.data())
+          SET_CONST_BUFFERS(GS, 0, slotsToSet, constBuffers.data());
         }
+        lastHDGBitsCustomApplied = hdg_bits;
         break;
       case STAGE_PS:
         if (!constBuffers[0])
-        {
           constBuffers[0] = psConstBuffer[psCurrentBuffer];
-          cbOffsets[0] = 0;
-          cbSizes[0] = 4096;
-        }
 
-        SET_CONST_BUFFERS(PS, 0, slotsToSet, constBuffers.data(), cbOffsets.data(), cbSizes.data())
+        SET_CONST_BUFFERS(PS, 0, slotsToSet, constBuffers.data());
         break;
       default: G_ASSERT(0);
     }
@@ -443,29 +430,19 @@ void ConstantBuffers::flush_cs(uint32_t csc, bool async)
     return;
 
   carray<ID3D11Buffer *, MAX_CONST_BUFFERS> constBuffers;
-  carray<uint32_t, MAX_CONST_BUFFERS> cbOffsets;
-  carray<uint32_t, MAX_CONST_BUFFERS> cbSizes;
   mem_copy_from(constBuffers, customBuffers[STAGE_CS].data());
-  mem_copy_from(cbOffsets, buffersFirstConstants[STAGE_CS].data());
-  mem_copy_from(cbSizes, buffersNumConstants[STAGE_CS].data());
   int slotsToSet = customBuffersMaxSlotUsed[stage] + 1, nextMaxUsedSlot = 0;
-  bool needOffsets = false;
   for (int slotI = 0; slotI < slotsToSet; ++slotI) //&& customBuffers[stage][maxUsedSlot]
   {
     if (constBuffers[slotI])
       nextMaxUsedSlot = slotI;
-    needOffsets |= cbOffsets[slotI] != 0;
   }
   if (!constBuffers[0])
-  {
     constBuffers[0] = csConstBuffer[csCurrentBuffer];
-    cbOffsets[0] = 0;
-    cbSizes[0] = 4096;
-  }
 
   {
     ContextAutoLock contextLock;
-    SET_CONST_BUFFERS(CS, 0, slotsToSet, constBuffers.data(), cbOffsets.data(), cbSizes.data())
+    SET_CONST_BUFFERS(CS, 0, slotsToSet, constBuffers.data());
   }
 
   customBuffersMaxSlotUsed[stage] = nextMaxUsedSlot;
@@ -479,38 +456,116 @@ VSDTYPE clear_vdecl[] = {VSD_STREAM(0), VSD_REG(VSDR_POS, VSDT_FLOAT3), VSD_REG(
 
 VSDTYPE debug_vdecl[] = {VSD_STREAM(0), VSD_REG(VSDR_POS, VSDT_FLOAT3), VSD_REG(VSDR_DIFF, VSDT_E3DCOLOR), VSD_END};
 
-VPROG create_vertex_shader_internal(const void *shader_bin, uint32_t size, uint32_t vs_consts_count, InputLayoutCache *ilCache,
-  bool do_fatal)
+template <typename CreateShaderCall>
+void validate_shader(CreateShaderCall &&create_call, const char *shader_type, const void *native_code, uint32_t size)
 {
-  G_ASSERT(vs_consts_count <= g_vsbin_max_size);
-  VertexShader e;
-  e.ilCache = ilCache;
-  e.dataOwned = 1;
-  e.constsUsed = vs_consts_count;
-  e.shader = NULL;
-  e.hs = NULL;
-  e.ds = NULL;
-  e.gs = NULL;
-  e.hsTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  e.hdgBits = 0;
+  // Returns S_FALSE if shader is valid, otherwise the current device doesn't support required features
+  // (or native_code is invalid, but it shouldn't happen here)
+  if (eastl::invoke(create_call, dx_device, native_code, static_cast<size_t>(size), nullptr, nullptr) != S_FALSE)
+    D3D_ERROR("Failed to create %s shader: required features are not supported by the device (feature level is %d.%d)", shader_type,
+      featureLevelsSupported >> 12, (featureLevelsSupported >> 8) & 0xF);
+}
+
+const void *ShaderData::getBytecode(Tab<uint8_t> &tmpmem, uint32_t &size, bool update_constants)
+{
+  const void *shader_bin = shaderBytecode.get();
+  size = shaderBytecodeSize;
+  if (shader_bin == nullptr)
+  {
+    const auto *header = reinterpret_cast<const dx11::SimpleHeader *>(source.metadata.data());
+    shader_bin = source.uncompress(tmpmem);
+    size = header->bytecodeByteSize;
+    if (update_constants)
+      constsUsed = dx11::get_used_const_count(*header);
+  }
+  return shader_bin;
+}
+
+static void set_debug_name_to_shader_data_from_source(ShaderData &data, const ShaderSourceExt &source)
+{
+  G_UNUSED(data);
+  G_UNUSED(source);
+#if DAGOR_DBGLEVEL > 0
+  if (auto debugName = source.getDebugName(); !debugName.empty())
+  {
+    data.shaderDebugName = eastl::unique_ptr<char[]>(new char[debugName.length() + 1]);
+    memcpy(data.shaderDebugName.get(), debugName.data(), debugName.length());
+    data.shaderDebugName.get()[debugName.length()] = '\0';
+  }
+#endif
+}
+
+static void set_shader_debug_name_from_data(auto *shader, const ShaderData &data)
+{
+  G_UNUSED(shader);
+  G_UNUSED(data);
+#if DAGOR_DBGLEVEL > 0
+  if (data.shaderDebugName)
+    shader->SetPrivateData(WKPDID_D3DDebugObjectName, strlen(data.shaderDebugName.get()), data.shaderDebugName.get());
+#endif
+}
+
+static void recreate_vertex_shader(VertexShader &e, bool do_fatal)
+{
   if (device_is_lost == S_OK)
   {
-    const uint32_t *u32 = (const uint32_t *)shader_bin;
-    if (u32[0] == _MAKE4C('DX11'))
-    {
-      e.hsTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED + (u32[2] >> 24);
-      uint32_t vs_ofs = 5, vs_len = u32[1];
-      uint32_t hs_ofs = vs_ofs + vs_len, hs_len = u32[2] & 0x00FFFFFF;
-      uint32_t ds_ofs = hs_ofs + hs_len, ds_len = u32[3];
-      uint32_t gs_ofs = ds_ofs + ds_len, gs_len = u32[4];
+    Tab<uint8_t> tmpmem(framemem_ptr());
+    uint32_t size = 0;
+    const void *shader_bin = e.ilCache->getBytecode(tmpmem, size);
+    e.constsUsed = e.ilCache->constsUsed;
 
-      last_hres = dx_device->CreateVertexShader(&u32[vs_ofs], vs_len * sizeof(uint32_t), NULL, &e.shader);
-      if (hs_len && SUCCEEDED(last_hres))
-        last_hres = dx_device->CreateHullShader(&u32[hs_ofs], hs_len * sizeof(uint32_t), NULL, &e.hs);
-      if (ds_len && SUCCEEDED(last_hres))
-        last_hres = dx_device->CreateDomainShader(&u32[ds_ofs], ds_len * sizeof(uint32_t), NULL, &e.ds);
-      if (gs_len && SUCCEEDED(last_hres))
-        last_hres = dx_device->CreateGeometryShader(&u32[gs_ofs], gs_len * sizeof(uint32_t), NULL, &e.gs);
+    dx11::DecodedShader decoded;
+    // driver-embedded shaders have no metadata, but are simple and don't need the decode
+    if (!e.ilCache->source.metadata.empty())
+      G_VERIFYF(dx11::decode_metadata(e.ilCache->source.metadata, decoded), "DX11: malformed shader metadata");
+    const uint8_t *bytes = (const uint8_t *)shader_bin;
+
+    enum class LastShader
+    {
+      Vertex,
+      Hull,
+      Domain,
+      Geometry
+    } lastShader = LastShader::Vertex;
+
+    const void *lastShaderBytecode = shader_bin;
+    uint32_t lastShaderSize = size;
+
+    if (decoded.combined)
+    {
+      e.hsTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED + decoded.hsTopology;
+
+      G_ASSERT(e.shader == nullptr);
+      G_ASSERT(e.hs == nullptr);
+      G_ASSERT(e.ds == nullptr);
+      G_ASSERT(e.gs == nullptr);
+
+      lastShader = LastShader::Vertex;
+      lastShaderBytecode = bytes + decoded.vs.offset;
+      lastShaderSize = decoded.vs.size;
+      last_hres = dx_device->CreateVertexShader(bytes + decoded.vs.offset, decoded.vs.size, NULL, &e.shader);
+      e.ilCache->shaderBytecodeSize = decoded.vs.size;
+      if (decoded.hs.size && SUCCEEDED(last_hres))
+      {
+        lastShader = LastShader::Hull;
+        lastShaderBytecode = bytes + decoded.hs.offset;
+        lastShaderSize = decoded.hs.size;
+        last_hres = dx_device->CreateHullShader(bytes + decoded.hs.offset, decoded.hs.size, NULL, &e.hs);
+      }
+      if (decoded.ds.size && SUCCEEDED(last_hres))
+      {
+        lastShader = LastShader::Domain;
+        lastShaderBytecode = bytes + decoded.ds.offset;
+        lastShaderSize = decoded.ds.size;
+        last_hres = dx_device->CreateDomainShader(bytes + decoded.ds.offset, decoded.ds.size, NULL, &e.ds);
+      }
+      if (decoded.gs.size && SUCCEEDED(last_hres))
+      {
+        lastShader = LastShader::Geometry;
+        lastShaderBytecode = bytes + decoded.gs.offset;
+        lastShaderSize = decoded.gs.size;
+        last_hres = dx_device->CreateGeometryShader(bytes + decoded.gs.offset, decoded.gs.size, NULL, &e.gs);
+      }
       if (e.hs)
         e.hdgBits |= HAS_HS;
       if (e.ds)
@@ -519,12 +574,34 @@ VPROG create_vertex_shader_internal(const void *shader_bin, uint32_t size, uint3
         e.hdgBits |= HAS_GS;
     }
     else
+    {
+      G_ASSERT(e.shader == nullptr);
+      e.ilCache->shaderBytecodeSize = size;
       last_hres = dx_device->CreateVertexShader(shader_bin, size, NULL, &e.shader);
+    }
     if (!device_should_reset(last_hres, "CreateVertexShader"))
+    {
+      if (FAILED(last_hres))
+      {
+        switch (lastShader)
+        {
+          case LastShader::Vertex:
+            validate_shader(&ID3D11Device::CreateVertexShader, "vertex", lastShaderBytecode, lastShaderSize);
+            break;
+          case LastShader::Hull: validate_shader(&ID3D11Device::CreateHullShader, "hull", lastShaderBytecode, lastShaderSize); break;
+          case LastShader::Domain:
+            validate_shader(&ID3D11Device::CreateDomainShader, "domain", lastShaderBytecode, lastShaderSize);
+            break;
+          case LastShader::Geometry:
+            validate_shader(&ID3D11Device::CreateGeometryShader, "geometry", lastShaderBytecode, lastShaderSize);
+            break;
+        }
+      }
       if (do_fatal)
       {
         DXFATAL(last_hres, "CreateVertexShader");
       }
+    }
 
     if (FAILED(last_hres))
       e.shader = NULL;
@@ -534,41 +611,67 @@ VPROG create_vertex_shader_internal(const void *shader_bin, uint32_t size, uint3
       {
         D3D_ERROR("CreateVertexShader (or hull/domain/geometry) failed: vs=0x%08X, hres=0x%08X", e.shader, last_hres);
         DAG_FATAL("dx11 error: broken driver");
+        e.shader = NULL;
       }
     }
+
+    if (e.shader)
+      set_shader_debug_name_from_data(e.shader, *e.ilCache);
   }
+}
+
+static VPROG create_vertex_shader_internal(const ShaderSourceExt &source, uint32_t vs_consts_count, InputLayoutCache *ilCache,
+  bool do_fatal)
+{
+  G_ASSERT(vs_consts_count <= g_vsbin_max_size);
+  VertexShader e;
+  e.ilCache = ilCache;
+  e.dataOwned = 1;
+  e.constsUsed = vs_consts_count;
+  e.ilCache->constsUsed = vs_consts_count;
+  e.shader = NULL;
+  e.hs = NULL;
+  e.ds = NULL;
+  e.gs = NULL;
+  e.hsTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  e.hdgBits = 0;
+
+  set_debug_name_to_shader_data_from_source(*ilCache, source);
+  recreate_vertex_shader(e, do_fatal);
 
   return (SUCCEEDED(last_hres) || FAILED(device_is_lost)) ? g_vertex_shaders.safeAllocAndSet(e) : BAD_VPROG;
 }
 
-VPROG create_vertex_shader_unpacked(const void *shader_bin, uint32_t size, uint32_t vs_consts_count, bool do_fatal)
+VPROG create_vertex_shader_unpacked(const ShaderSourceExt &source, const void *shader_bin, uint32_t size, uint32_t vs_consts_count,
+  bool do_fatal)
 {
-  void *copy = memalloc(size, midmem);
-  memcpy(copy, shader_bin, size);
-  shader_bin = copy;
 #if SHOW_DISASM
-  show_disasm(shader_bin, size, "VS", vs_consts_count);
+  if (shader_bin)
+    show_disasm(shader_bin, size, "VS", vs_consts_count);
 #endif
-  return create_vertex_shader_internal(shader_bin, size, vs_consts_count, new InputLayoutCache(shader_bin, size), do_fatal);
+  return create_vertex_shader_internal(source, vs_consts_count, new InputLayoutCache(source, shader_bin, size), do_fatal);
 }
 
-FSHADER create_pixel_shader_unpacked(const void *shader_bin, uint32_t size, uint32_t ps_consts_count, bool do_fatal)
+static void recreate_pixel_shader(PixelShader &e, bool do_fatal)
 {
-  G_ASSERT(ps_consts_count <= MAX_PS_CONSTS);
-  PixelShader e;
-  e.shader = NULL;
-  e.constsUsed = ps_consts_count;
-#if SHOW_DISASM
-  show_disasm(shader_bin, size, "PS", ps_consts_count);
-#endif
   if (device_is_lost == S_OK)
   {
+    G_ASSERT(e.shader == nullptr);
+
+    Tab<uint8_t> tmpmem(framemem_ptr());
+    uint32_t size = 0;
+    const void *shader_bin = e.getBytecode(tmpmem, size);
+
     last_hres = dx_device->CreatePixelShader(shader_bin, size, NULL, &e.shader);
     if (!device_should_reset(last_hres, "CreatePixelShader"))
+    {
+      if (FAILED(last_hres))
+        validate_shader(&ID3D11Device::CreatePixelShader, "pixel", shader_bin, size);
       if (do_fatal)
       {
         DXFATAL(last_hres, "CreatePixelShader");
       }
+    }
 
     if (FAILED(last_hres))
       e.shader = NULL;
@@ -578,77 +681,111 @@ FSHADER create_pixel_shader_unpacked(const void *shader_bin, uint32_t size, uint
       {
         D3D_ERROR("CreatePixelShader failed: ps=0x%08X, hres=0x%08X", e.shader, last_hres);
         DAG_FATAL("dx11 error: broken driver");
+        e.shader = NULL;
       }
     }
-  }
 
+    if (e.shader)
+      set_shader_debug_name_from_data(e.shader, e);
+  }
+}
+
+FSHADER create_pixel_shader_unpacked(const ShaderSourceExt &source, const void *shader_bin, uint32_t size, uint32_t ps_consts_count,
+  int32_t ps_max_rtv, bool do_fatal)
+{
+  G_ASSERT(ps_consts_count <= MAX_PS_CONSTS);
+  G_ASSERT(ps_max_rtv < MAX_UAV);
+  PixelShader *ps = new PixelShader;
+  ps->shader = NULL;
+  ps->constsUsed = ps_consts_count;
+  ps->maxRtv = ps_max_rtv;
+#if SHOW_DISASM
+  if (shader_bin)
+    show_disasm(shader_bin, size, "PS", ps_consts_count);
+#endif
+
+  ps->source = source;
+  if (size)
+  {
+    ps->shaderBytecode = eastl::make_unique<uint8_t[]>(size);
+    memcpy(ps->shaderBytecode.get(), shader_bin, size);
+  }
+  ps->shaderBytecodeSize = size;
+
+  set_debug_name_to_shader_data_from_source(*ps, source);
+  recreate_pixel_shader(*ps, do_fatal);
+
+  drv3d_generic::ObjectProxyPtr<PixelShader> e;
+  e.obj = ps;
   return (SUCCEEDED(last_hres) || FAILED(device_is_lost)) ? g_pixel_shaders.safeAllocAndSet(e) : BAD_FSHADER;
 }
-VPROG create_vertex_shader(const void *source_data, uint32_t size, uint32_t vs_consts_count)
-{
-  const uint32_t *native_code = (const uint32_t *)source_data;
-  return create_vertex_shader_unpacked(native_code, size, vs_consts_count, true);
-}
-FSHADER create_pixel_shader(const void *source_data, uint32_t size, uint32_t vs_consts_count)
-{
-  const uint32_t *native_code = (const uint32_t *)source_data;
-  return create_pixel_shader_unpacked(native_code, size, vs_consts_count, true);
-}
 
-SHADER_ID create_compute_shader(const uint32_t *native_code, uint32_t size, uint32_t max_const)
+static void recreate_compute_shader(ComputeShader &e)
 {
-  ComputeShader e;
-  e.shader = NULL;
-  e.constsUsed = max_const;
   if (device_is_lost == S_OK)
   {
-    last_hres = dx_device->CreateComputeShader(native_code, size, NULL, &e.shader);
+    G_ASSERT(e.shader == nullptr);
+
+    Tab<uint8_t> tmpmem(framemem_ptr());
+    uint32_t size = 0;
+    const void *shader_bin = e.getBytecode(tmpmem, size, false);
+
+    last_hres = dx_device->CreateComputeShader(shader_bin, size, NULL, &e.shader);
     if (!device_should_reset(last_hres, "CreateComputeShader"))
     {
+      if (FAILED(last_hres))
+        validate_shader(&ID3D11Device::CreateComputeShader, "compute", shader_bin, size);
       DXFATAL(last_hres, "CreateComputeShader");
     }
 
     if (FAILED(last_hres))
       e.shader = NULL;
-  }
 
+    if (e.shader)
+      set_shader_debug_name_from_data(e.shader, e);
+  }
+}
+
+static SHADER_ID create_compute_shader(const ShaderSourceExt &source)
+{
+  const auto *header = reinterpret_cast<const dx11::SimpleHeader *>(source.metadata.data());
+
+  ComputeShader *cs = new ComputeShader;
+  cs->shader = NULL;
+  cs->constsUsed = dx11::get_used_const_count(*header);
+
+  cs->source = source;
+
+  set_debug_name_to_shader_data_from_source(*cs, source);
+  recreate_compute_shader(*cs);
+
+  drv3d_generic::ObjectProxyPtr<ComputeShader> e;
+  e.obj = cs;
   return (SUCCEEDED(last_hres) || FAILED(device_is_lost)) ? g_compute_shaders.safeAllocAndSet(e) : BAD_SHADER_ID;
-}
-
-void set_vertex_shader_debug_info(VPROG vpr, const char *debug_info)
-{
-  if (g_vertex_shaders.isIndexValid(vpr))
-  {
-    VertexShader &vs = g_vertex_shaders[vpr];
-    if (vs.shader)
-      vs.shader->SetPrivateData(WKPDID_D3DDebugObjectName, (int)strlen(debug_info), debug_info);
-  }
-}
-
-void set_pixel_shader_debug_info(FSHADER fsh, const char *debug_info)
-{
-  if (g_pixel_shaders.isIndexValid(fsh))
-  {
-    PixelShader &ps = g_pixel_shaders[fsh];
-    if (ps.shader)
-      ps.shader->SetPrivateData(WKPDID_D3DDebugObjectName, (int)strlen(debug_info), debug_info);
-  }
 }
 
 void init_default_shaders()
 {
-  g_default_copy_vs = create_vertex_shader(g_default_copy_vs_src, sizeof(g_default_copy_vs_src), 0);
-  g_default_copy_ps = create_pixel_shader(g_default_copy_ps_src, sizeof(g_default_copy_ps_src), 0);
+#define DEBUG_NAME_ARGS(name) {}, c_countof(#name) - 1, #name
+  g_default_copy_vs =
+    create_vertex_shader_unpacked({DEBUG_NAME_ARGS(default_copy_vs)}, g_default_copy_vs_src, sizeof(g_default_copy_vs_src), 0, true);
+  g_default_copy_ps =
+    create_pixel_shader_unpacked({DEBUG_NAME_ARGS(default_copy_ps)}, g_default_copy_ps_src, sizeof(g_default_copy_ps_src), 0, 1, true);
   g_default_pos_vdecl = d3d::create_vdecl(simple_pos_vdecl);
 
-  g_default_clear_vs = create_vertex_shader(g_default_clear_vs_src, sizeof(g_default_clear_vs_src), 0);
-  g_default_clear_ps = create_pixel_shader(g_default_clear_ps_src, sizeof(g_default_clear_ps_src), 0);
+  g_default_clear_vs = create_vertex_shader_unpacked({DEBUG_NAME_ARGS(default_clear_vs)}, g_default_clear_vs_src,
+    sizeof(g_default_clear_vs_src), 0, true);
+  g_default_clear_ps = create_pixel_shader_unpacked({DEBUG_NAME_ARGS(default_clear_ps)}, g_default_clear_ps_src,
+    sizeof(g_default_clear_ps_src), 0, MAX_UAV - 1, true);
   g_default_clear_vdecl = d3d::create_vdecl(clear_vdecl);
 
-  g_default_debug_vs = create_vertex_shader(g_default_debug_vs_src, sizeof(g_default_debug_vs_src), 4);
-  g_default_debug_ps = create_pixel_shader(g_default_debug_ps_src, sizeof(g_default_debug_ps_src), 0);
+  g_default_debug_vs = create_vertex_shader_unpacked({DEBUG_NAME_ARGS(default_debug_vs)}, g_default_debug_vs_src,
+    sizeof(g_default_debug_vs_src), 4, true);
+  g_default_debug_ps = create_pixel_shader_unpacked({DEBUG_NAME_ARGS(default_debug_ps)}, g_default_debug_ps_src,
+    sizeof(g_default_debug_ps_src), 0, 1, true);
   g_default_debug_vdecl = d3d::create_vdecl(debug_vdecl);
   g_default_debug_program = d3d::create_program(g_default_debug_vs, g_default_debug_ps, g_default_debug_vdecl);
+#undef DEBUG_NAME_ARGS
 
   {
     d3d::SamplerInfo smpInfo;
@@ -694,12 +831,13 @@ PROGRAM get_debug_program() { return g_default_debug_program; }
 
 bool init_shaders(RenderState &rs)
 {
-  rs.nextVdecl = BAD_HANDLE;
-  rs.nextVertexShader = BAD_HANDLE;
-  rs.nextPixelShader = BAD_HANDLE;
-  rs.nextComputeShader = BAD_HANDLE;
+  rs.nextVdecl = drv3d_generic::BAD_HANDLE;
+  rs.nextVertexShader = drv3d_generic::BAD_HANDLE;
+  rs.nextPixelShader = drv3d_generic::BAD_HANDLE;
+  rs.nextComputeShader = drv3d_generic::BAD_HANDLE;
 
-  init_default_shaders();
+  if (!resetting_device_now)
+    init_default_shaders();
 
   rs.constants.create();
   return true;
@@ -707,7 +845,7 @@ bool init_shaders(RenderState &rs)
 
 void flush_cs_shaders(RenderState &rs, bool flushConsts, bool async)
 {
-  ComputeShader *cs = (rs.nextComputeShader == BAD_SHADER_ID) ? NULL : &g_compute_shaders[rs.nextComputeShader];
+  ComputeShader *cs = (rs.nextComputeShader == BAD_SHADER_ID) ? NULL : g_compute_shaders[rs.nextComputeShader].obj;
   if (rs.csModified)
   {
     rs.csModified = false;
@@ -719,21 +857,51 @@ void flush_cs_shaders(RenderState &rs, bool flushConsts, bool async)
 
   if (flushConsts)
   {
-    uint32_t csConstsCount = cs ? max((unsigned)rs.constants.constsRequired[STAGE_CS], (unsigned)cs->constsUsed) : 0;
-    rs.constants.flush_cs(csConstsCount, async);
+    rs.constants.flush_cs(cs ? cs->constsUsed : 0, async);
   }
 }
 
 void flush_shaders(RenderState &rs, bool flushConsts)
 {
-  PixelShader *ps = (rs.nextPixelShader == BAD_FSHADER) ? NULL : &g_pixel_shaders[rs.nextPixelShader];
+  PixelShader *ps = (rs.nextPixelShader == BAD_FSHADER) ? NULL : g_pixel_shaders[rs.nextPixelShader].obj;
 
   if (rs.psModified || rs.vsModified)
     Stat3D::updateProgram();
   if (rs.psModified)
   {
-    ContextAutoLock contextLock;
-    dx_context->PSSetShader(ps ? ps->shader : NULL, 0, 0);
+    {
+      ContextAutoLock contextLock;
+      dx_context->PSSetShader(ps ? ps->shader : NULL, 0, 0);
+    }
+
+    int32_t newMaxRtv = ps ? ps->maxRtv : 0;
+    if (newMaxRtv != rs.shaderMaxRtv)
+    {
+      // Only request rt flush if the shader max rtv change actually requires rtv/uav bind/unbind
+      if (!rs.rtModified)
+      {
+        int32_t rangeStart = min<int32_t>(rs.shaderMaxRtv, newMaxRtv) + 1;
+        int32_t rangeEnd = max<int32_t>(rs.shaderMaxRtv, newMaxRtv) + 1;
+        for (int32_t i = rangeStart; i < rangeEnd; ++i)
+        {
+          if (rs.nextRtState.isColorUsed(i))
+          {
+            rs.rtModified = true;
+            break;
+          }
+        }
+        if (!rs.rtModified)
+        {
+          const auto &psUavs = rs.texFetchState.uavState[STAGE_PS];
+          uint32_t rangeMask = ((1 << rangeEnd) - 1) & ~((1 << rangeStart) - 1);
+          if (psUavs.uavsUsed && (rangeMask & psUavs.uavsSet))
+            rs.rtModified = true;
+        }
+      }
+
+      rs.shaderMaxRtv = int8_t(newMaxRtv);
+    }
+
     rs.psModified = false;
   }
 
@@ -773,8 +941,7 @@ void flush_shaders(RenderState &rs, bool flushConsts)
 
   if (flushConsts)
   {
-    uint32_t vsConstsCount = vs ? max((unsigned)rs.constants.constsRequired[STAGE_VS], (unsigned)vs->constsUsed) : 0;
-    rs.constants.flush(vsConstsCount, ps ? ps->constsUsed : 0, rs.hdgBits);
+    rs.constants.flush(vs ? vs->constsUsed : 0, ps ? ps->constsUsed : 0, rs.hdgBits);
   }
 }
 
@@ -782,24 +949,59 @@ void close_shaders()
 {
   g_render_state.constants.destroy();
 
-  close_default_shaders();
-
   if (!resetting_device_now)
   {
+    close_default_shaders();
+
     if (g_input_layouts.totalUsed() > 0)
     {
       D3D_ERROR("Unreleased vdecl objects: %d", g_input_layouts.totalUsed());
     }
 
     g_input_layouts.clear();
-  }
 
-  g_pixel_shaders.clear();
-  g_vertex_shaders.clear();
-  g_compute_shaders.clear();
-  g_programs.clear();
+    g_programs.clear();
+    g_pixel_shaders.clear();
+    g_vertex_shaders.clear();
+    g_compute_shaders.clear();
+  }
+  else
+  {
+    ITERATE_OVER_OBJECT_POOL(g_vertex_shaders, i)
+      SAFE_RELEASE(g_vertex_shaders[i].shader)
+      SAFE_RELEASE(g_vertex_shaders[i].hs);
+      SAFE_RELEASE(g_vertex_shaders[i].ds);
+      SAFE_RELEASE(g_vertex_shaders[i].gs);
+      if (g_vertex_shaders[i].ilCache)
+        g_vertex_shaders[i].ilCache->clear();
+      watchdog_kick();
+    ITERATE_OVER_OBJECT_POOL_RESTORE(g_vertex_shaders);
+    ITERATE_OVER_OBJECT_POOL(g_pixel_shaders, i)
+      SAFE_RELEASE(g_pixel_shaders[i].obj->shader);
+      watchdog_kick();
+    ITERATE_OVER_OBJECT_POOL_RESTORE(g_pixel_shaders);
+    ITERATE_OVER_OBJECT_POOL(g_compute_shaders, i)
+      SAFE_RELEASE(g_compute_shaders[i].obj->shader);
+      watchdog_kick();
+    ITERATE_OVER_OBJECT_POOL_RESTORE(g_compute_shaders);
+  }
 }
 
+void recreate_shaders()
+{
+  ITERATE_OVER_OBJECT_POOL(g_vertex_shaders, i)
+    auto &vs = g_vertex_shaders[i];
+    recreate_vertex_shader(vs, true);
+  ITERATE_OVER_OBJECT_POOL_RESTORE(g_vertex_shaders);
+  ITERATE_OVER_OBJECT_POOL(g_pixel_shaders, i)
+    auto &ps = *g_pixel_shaders[i].obj;
+    recreate_pixel_shader(ps, true);
+  ITERATE_OVER_OBJECT_POOL_RESTORE(g_pixel_shaders);
+  ITERATE_OVER_OBJECT_POOL(g_compute_shaders, i)
+    auto &cs = *g_compute_shaders[i].obj;
+    recreate_compute_shader(cs);
+  ITERATE_OVER_OBJECT_POOL_RESTORE(g_compute_shaders);
+}
 
 // return shader bytecode
 /*ID3D10Blob * create_hlsl(const char *hlsl_text, unsigned len,
@@ -1077,19 +1279,17 @@ ID3D11InputLayout *InputLayoutCache::getInputLayout(int vdecl)
   D3D_CONTRACT_ASSERT(vdecl != BAD_VDECL);
   InputLayout *il = g_input_layouts[vdecl].obj;
 
-  COMProxyPtr<ID3D11InputLayout> e;
+  drv3d_generic::COMProxyPtr<ID3D11InputLayout> e;
   InputLayout::Key key = InputLayout::makeKey(vdecl);
-  const COMProxyPtr<ID3D11InputLayout> *ilp = find(key);
+  const drv3d_generic::COMProxyPtr<ID3D11InputLayout> *ilp = find(key);
   if (ilp == NULL) // not found
   {
     {
-      const uint32_t *u32 = (const uint32_t *)shaderBytecode;
+      Tab<uint8_t> tmpmem(framemem_ptr());
+      uint32_t bytecode_size = 0;
+      const uint32_t *u32 = (const uint32_t *)getBytecode(tmpmem, bytecode_size, false);
+      G_ASSERT(bytecode_size >= shaderBytecodeSize);
       size_t u32_sz = shaderBytecodeSize;
-      if (u32[0] == _MAKE4C('DX11'))
-      {
-        u32_sz = u32[1] * sizeof(uint32_t);
-        u32 += 5;
-      }
 
       HRESULT hr = S_OK;
       if (il->numElements > 0)
@@ -1099,7 +1299,7 @@ ID3D11InputLayout *InputLayoutCache::getInputLayout(int vdecl)
           u32,                                     // void *pShaderBytecodeWithInputSignature,
           u32_sz,                                  // SIZE_T BytecodeLength,
           &e.obj);                                 // ID3D11InputLayout **pInputLayout
-        LLLOG("inputlayout (shdr %p; n=%d)", shaderBytecode, il->numElements);
+        LLLOG("inputlayout (shdr %p; n=%d)", u32, il->numElements);
         if (FAILED(hr))
         {
           debug("BytecodeLength=%d, NumElements=%d", u32_sz, il->numElements);
@@ -1182,40 +1382,18 @@ ID3D11InputLayout *InputLayoutCache::getInputLayout(int vdecl)
    */
 
 
-void delete_programs_for_vs(VPROG vpr)
+void reset_state_for_vs(VPROG vpr)
 {
-  ITERATE_OVER_OBJECT_POOL(g_programs, i)
-    if (g_programs[i].vertexShader == vpr && g_programs[i].refCntX2 >= 2)
-    {
-      g_programs[i].refCntX2 = 0;
-      g_programs[i].destroyObject();
-      g_programs.releaseEntryUnsafe(i); // Note: replace to fillEntryAsInvalid(i) if don't want to re-use this index/slot anymore
-    }
-  ITERATE_OVER_OBJECT_POOL_RESTORE(g_programs);
+  RenderState &rs = g_render_state;
+  if (gpuAcquireRefCount && gpuThreadId == GetCurrentThreadId() && rs.nextVertexShader == vpr)
+    d3d::set_vertex_shader(BAD_FSHADER);
 }
 
-void delete_programs_for_ps(FSHADER fsh)
+void reset_state_for_ps(FSHADER fsh)
 {
-  ITERATE_OVER_OBJECT_POOL(g_programs, i)
-    if (g_programs[i].pixelShader == fsh && g_programs[i].refCntX2 >= 2)
-    {
-      g_programs[i].refCntX2 = 0;
-      g_programs[i].destroyObject();
-      g_programs.releaseEntryUnsafe(i); // Note: replace to fillEntryAsInvalid(i) if don't want to re-use this index/slot anymore
-    }
-  ITERATE_OVER_OBJECT_POOL_RESTORE(g_programs);
-}
-
-void delete_programs_for_vd(VDECL vd)
-{
-  ITERATE_OVER_OBJECT_POOL(g_programs, i)
-    if (g_programs[i].vdecl == vd && g_programs[i].refCntX2 >= 2)
-    {
-      g_programs[i].refCntX2 = 0;
-      g_programs[i].destroyObject();
-      g_programs.releaseEntryUnsafe(i); // Note: replace to fillEntryAsInvalid(i) if don't want to re-use this index/slot anymore
-    }
-  ITERATE_OVER_OBJECT_POOL_RESTORE(g_programs);
+  RenderState &rs = g_render_state;
+  if (gpuAcquireRefCount && gpuThreadId == GetCurrentThreadId() && rs.nextPixelShader == fsh)
+    d3d::set_pixel_shader(BAD_FSHADER);
 }
 
 bool set_compute_shader(SHADER_ID handle)
@@ -1234,50 +1412,25 @@ bool set_compute_shader(SHADER_ID handle)
 
 void Program::destroyObject()
 {
+  RenderState &rs = g_render_state;
+  if (computeShader != BAD_SHADER_ID)
+  {
+    G_ASSERT(!g_compute_shaders.isIndexInFreeList(computeShader));
+    g_compute_shaders.release(computeShader);
+
+    if (gpuAcquireRefCount && gpuThreadId == GetCurrentThreadId() && rs.nextComputeShader == computeShader)
+      set_compute_shader(BAD_SHADER_ID);
+  }
+  computeShader = BAD_SHADER_ID;
+
   // warning - these functions can delete programs recursively
   if (vertexShader == BAD_VPROG)
     return;
   pixelShader = BAD_FSHADER;
   vertexShader = BAD_VPROG;
   vdecl = BAD_VDECL;
-  if (computeShader != BAD_SHADER_ID)
-  {
-    G_ASSERT(!g_compute_shaders.isIndexInFreeList(computeShader));
-    g_compute_shaders.release(computeShader);
-  }
-  computeShader = BAD_SHADER_ID;
 }
 }; // namespace drv3d_dx11
-
-/*
-
-void reserve_fsh(int max_ps)
-{
-  if (max_ps > g_pixel_shader_list.size())
-    g_pixel_shader_list.reserve(max_ps - g_pixel_shader_list.size());
-}
-void get_stat_fsh(bool total, int &max_ps)
-{
-  max_ps = total ? g_pixel_shader_list.capacity() : g_pixel_shader_list.size();
-}*/
-
-
-/*
-FSHADER d3d::create_pixel_shader_dagor(const FSHTYPE *p,int n)
-{
-  int sz;
-  uint32_t *ps = (uint32_t*)parse_fsh_shader(p,n,sz);
-
-  if ( !ps )
-  {
-    error("create_pixel_shader_dagor error");
-    print_fsh_shader(p,n);
-    return BAD_FSHADER;
-  }
-
-  return d3d::create_pixel_shader ( ps );
-}
-*/
 
 FSHADER d3d::create_pixel_shader_hlsl(const char * /*hlsl_text*/, unsigned /*len*/, const char * /*entry*/, const char * /*profile*/,
   String * /*out_err*/)
@@ -1286,16 +1439,18 @@ FSHADER d3d::create_pixel_shader_hlsl(const char * /*hlsl_text*/, unsigned /*len
   return BAD_FSHADER;
 }
 
-FSHADER d3d::create_pixel_shader(const uint32_t *shader_bin)
+FSHADER d3d::create_pixel_shader(const ShaderSourceExt &data)
 {
-  return drv3d_dx11::create_pixel_shader(shader_bin + 3, *shader_bin, ((int *)shader_bin)[1] >= 0 ? shader_bin[1] + 1 : 0);
+  G_ASSERT(data.metadata.size() >= dx11::SIMPLE_METADATA_SIZE);
+  const auto *header = reinterpret_cast<const dx11::SimpleHeader *>(data.metadata.data());
+  return create_pixel_shader_unpacked(data, nullptr, 0, dx11::get_used_const_count(*header), header->maxRtvUsed, true);
 }
 
 void d3d::delete_pixel_shader(FSHADER handle)
 {
   G_ASSERT(!g_pixel_shaders.isIndexInFreeList(handle));
   g_pixel_shaders.release(handle);
-  delete_programs_for_ps(handle);
+  reset_state_for_ps(handle);
 }
 
 VPROG d3d::create_vertex_shader_hlsl(const char * /*hlsl_text*/, unsigned /*len*/, const char * /*entry*/, const char * /*profile*/,
@@ -1305,16 +1460,18 @@ VPROG d3d::create_vertex_shader_hlsl(const char * /*hlsl_text*/, unsigned /*len*
   return BAD_VPROG;
 }
 
-VPROG d3d::create_vertex_shader(const uint32_t *shader_bin)
+VPROG d3d::create_vertex_shader(const ShaderSourceExt &data)
 {
-  return drv3d_dx11::create_vertex_shader(shader_bin + 3, *shader_bin, (int)(((int *)shader_bin)[1] >= 0 ? shader_bin[1] + 1 : 0));
+  G_ASSERT(data.metadata.size() >= dx11::SIMPLE_METADATA_SIZE);
+  const auto *header = reinterpret_cast<const dx11::SimpleHeader *>(data.metadata.data());
+  return create_vertex_shader_unpacked(data, nullptr, 0, dx11::get_used_const_count(*header), true);
 }
 
 void d3d::delete_vertex_shader(VPROG handle)
 {
   G_ASSERT(!g_vertex_shaders.isIndexInFreeList(handle));
   g_vertex_shaders.release(handle);
-  delete_programs_for_vs(handle);
+  reset_state_for_vs(handle);
 }
 
 bool d3d::set_pixel_shader(FSHADER handle)
@@ -1359,19 +1516,11 @@ bool d3d::set_const(unsigned stage, unsigned reg_base, const void *data, unsigne
     D3D_CONTRACT_ASSERTF(reg_base + num_regs <= MAX_PS_CONSTS, "PS: Writing %u regs with base=%u over the limit=%u", num_regs,
       reg_base, MAX_PS_CONSTS);
   else if (stage == STAGE_CS)
-  {
     D3D_CONTRACT_ASSERTF(reg_base + num_regs <= g_csbin_max_size, "CS: Writing %u regs with base=%u over the hard limit=%u", num_regs,
       reg_base, g_csbin_max_size);
-    const unsigned limit = max<unsigned>(DEF_CS_CONSTS, cb.constsRequired[stage]);
-    D3D_CONTRACT_ASSERTF(reg_base + num_regs <= limit, "CS: Writing %u regs with base=%u over the hard limit=%u, (constsRequired=%u)",
-      num_regs, reg_base, limit, cb.constsRequired[stage]);
-  }
   else if (stage == STAGE_VS)
-  {
-    const unsigned limit = max<unsigned>(DEF_VS_CONSTS, cb.constsRequired[stage]);
-    D3D_CONTRACT_ASSERTF(reg_base + num_regs <= limit, "VS: Writing %u regs with base=%u over the hard limit=%u, (constsRequired=%u)",
-      num_regs, reg_base, limit, cb.constsRequired[stage]);
-  }
+    D3D_CONTRACT_ASSERTF(reg_base + num_regs <= g_vsbin_max_size, "VS: Writing %u regs with base=%u over the hard limit=%u", num_regs,
+      reg_base, g_vsbin_max_size);
   else
     D3D_CONTRACT_ASSERT_FAIL("Invalid stage %d", stage);
 #endif
@@ -1389,37 +1538,6 @@ bool d3d::set_const(unsigned stage, unsigned reg_base, const void *data, unsigne
   return true;
 }
 
-int d3d::set_cs_constbuffer_size(int required_size)
-{
-  if (required_size > 0)
-  {
-    int size = clamp(get_bigger_pow2(required_size), DEF_CS_CONSTS, g_csbin_max_size);
-    g_render_state.constants.constsRequired[STAGE_CS] = size;
-    return size;
-  }
-  else
-  {
-    g_render_state.constants.constsRequired[STAGE_CS] = 0;
-    return 0;
-  }
-}
-
-int d3d::set_vs_constbuffer_size(int required_size)
-{
-  if (required_size > 0)
-  {
-    int id = g_render_state.constants.getVsConstBufferId(required_size);
-    int size = g_vsbin_sizes[id];
-    g_render_state.constants.constsRequired[STAGE_VS] = size;
-    return size;
-  }
-  else
-  {
-    g_render_state.constants.constsRequired[STAGE_VS] = 0;
-    return 0;
-  }
-}
-
 
 VDECL d3d::create_vdecl(VSDTYPE *decl)
 {
@@ -1431,10 +1549,10 @@ VDECL d3d::create_vdecl(VSDTYPE *decl)
 
   il->makeFromVdecl(decl);
 
-  ObjectProxyPtr<InputLayout> e;
+  drv3d_generic::ObjectProxyPtr<InputLayout> e;
   e.obj = il;
   int handle = g_input_layouts.safeAllocAndSet(e);
-  if (handle == BAD_HANDLE)
+  if (handle == drv3d_generic::BAD_HANDLE)
   {
     delete il;
     return BAD_VDECL;
@@ -1452,8 +1570,6 @@ void d3d::delete_vdecl(VDECL vdecl)
     rs.nextVdecl = BAD_VDECL;
 
   g_input_layouts.release(vdecl);
-  // iterate over shaders, kill caches
-  // delete_programs_for_vd(vd);
 }
 
 bool d3d::setvdecl(VDECL vdecl)
@@ -1496,18 +1612,9 @@ PROGRAM d3d::create_program(VPROG vpr, FSHADER fsh, VDECL vdecl, unsigned *strid
   return i;
 }
 
-PROGRAM d3d::create_program(const uint32_t *vpr_native, const uint32_t *fsh_native, VDECL vdecl, unsigned *strides, unsigned streams)
+PROGRAM d3d::create_program_cs(const ShaderSourceExt &data, CSPreloaded)
 {
-  G_ASSERT(0); // Shader binaries are API dependent - remove support.
-  return BAD_PROGRAM;
-}
-
-PROGRAM d3d::create_program_cs(const uint32_t *native_code, CSPreloaded)
-{
-  SHADER_ID compute_shader = BAD_SHADER_ID;
-
-  if (memcmp(native_code + 3, "DXBC", 4) == 0) // HLSL binary format
-    compute_shader = drv3d_dx11::create_compute_shader(native_code + 3, *native_code, DEF_CS_CONSTS);
+  SHADER_ID compute_shader = drv3d_dx11::create_compute_shader(data);
   if (compute_shader == BAD_SHADER_ID)
     return BAD_PROGRAM;
 
@@ -1536,13 +1643,6 @@ PROGRAM d3d::create_program_cs(const uint32_t *native_code, CSPreloaded)
   return i;
 }
 
-VDECL d3d::get_program_vdecl(PROGRAM sh)
-{
-  if (!g_programs.isIndexValid(sh))
-    return BAD_VDECL;
-  return g_programs[sh].vdecl;
-}
-
 bool d3d::set_program(PROGRAM sh)
 {
   if (!g_programs.isIndexValid(sh))
@@ -1569,13 +1669,16 @@ void d3d::delete_program(PROGRAM sh)
   if (!g_programs.isIndexValid(sh))
     return;
   g_programs.lock();
-  D3D_CONTRACT_ASSERTF(!g_programs.isIndexInFreeListUnsafe(sh),
-    "Double delete of program %d. Refcount was equal to 0 on a previous delete.", sh);
+  if (!g_programs.isEntryUsed(sh))
+  {
+    D3D_CONTRACT_ASSERTF(false, "Double delete of program %d. g_programs.isEntryUsed(sh) is false.", sh);
+    return g_programs.unlock();
+  }
   g_programs[sh].refCntX2 -= 2;
   if (g_programs[sh].refCntX2 > 0)
     return g_programs.unlock();
   G_ASSERT(g_programs[sh].refCntX2 == 0);
-  g_programs.releaseEntryUnsafe(sh);
+  g_programs.release(sh);
   g_programs.unlock();
 }
 

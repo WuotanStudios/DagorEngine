@@ -2,9 +2,9 @@
 
 #include <drv/3d/dag_renderTarget.h>
 #include <drv/3d/dag_driver.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_lock.h>
 #include <3d/dag_picMgr.h>
-#include <3d/dag_gpuConfig.h>
 #include <debug/dag_debug.h>
 #include <debug/dag_logSys.h>
 #include <debug/dag_visualErrLog.h>
@@ -12,7 +12,6 @@
 #include <drv/hid/dag_hiGlobals.h>
 #include <gameRes/dag_gameResSystem.h>
 #include <gameRes/dag_stdGameRes.h>
-#include <gameRes/dag_collisionResource.h>
 #include <generic/dag_initOnDemand.h>
 #include <gui/dag_stdGuiRender.h>
 #include <ioSys/dag_dataBlock.h>
@@ -25,11 +24,13 @@
 #include <osApiWrappers/dag_direct.h>
 #include <osApiWrappers/dag_progGlobals.h>
 #include <osApiWrappers/dag_messageBox.h>
+#include <osApiWrappers/dag_singleProcessChecker.h>
 #include <osApiWrappers/dag_vromfs.h>
 #include <osApiWrappers/dag_miscApi.h>
 #include <osApiWrappers/dag_sockets.h>
 #include <osApiWrappers/dag_threads.h>
 #include <osApiWrappers/dag_pathDelim.h>
+#include <osApiWrappers/dag_shellExecute.h>
 #include <perfMon/dag_cpuFreq.h>
 #include <perfMon/dag_perfTimer.h>
 #include <perfMon/dag_sleepPrecise.h>
@@ -39,8 +40,7 @@
 #include <startup/dag_globalSettings.h>
 #include <startup/dag_restart.h>
 #include <startup/dag_splashScreen.h>
-#include <squirrel/memtrace.h>
-#include <quirrel/sqplus/dag_sqAux.h>
+#include <quirrel/quirrelHost/memtrace.h>
 #include <supp/dag_cpuControl.h>
 #include <workCycle/dag_gameSettings.h>
 #include <workCycle/dag_startupModules.h>
@@ -48,7 +48,9 @@
 #include <workCycle/dag_workCyclePerf.h>
 #include <util/dag_delayedAction.h>
 #include <util/dag_stlqsort.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <rendInst/rendInstGen.h>
 #include <asyncHTTPClient/asyncHTTPClient.h>
 #include <asyncHTTPClient/curl_global.h>
@@ -64,6 +66,7 @@
 #include <util/dag_localization.h>
 #include <daScript/daScript.h>
 #include <dasModules/dasSystem.h>
+#include <nvCacheTracker/nvCacheTracker.h>
 
 #include "game/gameScripts.h"
 #include "input/inputControls.h"
@@ -82,25 +85,27 @@
 #include "main/webui.h"
 #include "main/watchdog.h"
 #include "main/storeApiEvents.h"
-#include "render/animatedSplashScreen.h"
+#include <animated_splash_screen_api.h>
 #include <render/hdrRender.h>
 #include "net/dedicated.h"
 #include "net/net.h"
+#include "net/mainThreadNetInits.h"
 #include "net/telemetry.h"
 #include "render/renderer.h" // init_tex_streaming
 #include "ui/userUi.h"
 #include "level.h"
 #include "logProcessing.h"
 
-#include "game/hostedServerLauncher.h"
+#include "main/hostedServerLauncher.h"
 
 #include <sqrat.h>
 #include <quirrel/frp/dag_frp.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <crypto/ssl.h>
+#include <dagCrypto/ssl.h>
 
 #if _TARGET_C1 | _TARGET_C2
+
 
 #elif _TARGET_C4
 
@@ -130,10 +135,6 @@ extern void runIOSRunloop(const eastl::function<void()> &callback);
 #include <signal.h>
 #include <aio.h>
 #endif
-#define CURL_STATICLIB
-#if !_TARGET_C4
-#include <curl/curl.h>
-#endif
 
 #include <gui/dag_guiStartup.h>
 #include <drv/3d/dag_commands.h>
@@ -145,6 +146,8 @@ extern void runIOSRunloop(const eastl::function<void()> &callback);
 #include "updaterEvents.h"
 #include <perfMon/dag_daProfilerSettings.h>
 #include "main/gameProjConfig.h"
+#include <render/cpuBenchmark.h>
+#include <render/autoGraphics.h>
 
 extern void dng_load_localization();
 
@@ -165,6 +168,7 @@ ECS_REGISTER_EVENT(OnStoreApiTerm)
 ECS_REGISTER_EVENT(OnStoreApiUpdate)
 ECS_REGISTER_EVENT(StoreApiReportContentCorruption)
 
+extern void init_shared_memory();
 extern void init_shaders();
 extern void init_res_factories();
 extern void term_res_factories();
@@ -177,6 +181,7 @@ static void (*old_shutdown_handler)() = nullptr;
 
 #include "setup_log_prefix.h"
 
+#if !DAGOR_HOSTED_INTERNAL_SERVER
 #if _TARGET_PC_WIN
 #include <startup/dag_winMain.inc.cpp>
 #elif _TARGET_PC_LINUX
@@ -195,6 +200,7 @@ static void (*old_shutdown_handler)() = nullptr;
 
 #else
 #error "Unsupported platform"
+#endif
 #endif
 
 
@@ -230,19 +236,6 @@ void exit_game(const char *reason_static_str)
   quit_reason = reason_static_str;
 }
 
-extern "C"
-#if _TARGET_PC_WIN
-  __declspec(dllexport)
-#else
-  __attribute__((visibility("default")))
-#endif
-  void
-  exit_game_exported(const char *reason_static_str)
-{
-  debug("exit game exported %s", reason_static_str);
-  exit_game(reason_static_str);
-}
-
 
 extern void init_device_reset();
 extern void app_start(bool register_dagor_scene = true);
@@ -271,7 +264,7 @@ public:
   virtual const char *preprocessMatVdataTexName(
     const char *original_tex_name, unsigned ctx_obj_type, const char * /*ctx_obj_name*/, String &tmp_storage)
   {
-    if (ctx_obj_type == RendInstGameResClassId || ctx_obj_type == DynModelGameResClassId || ctx_obj_type == AnimCharGameResClassId)
+    if (ctx_obj_type == RendInstGameResClassId || ctx_obj_type == DynModelGameResClassId || ctx_obj_type == CharacterGameResClassId)
     {
       if (get_managed_texture_id(original_tex_name) != BAD_TEXTUREID && strstr(original_tex_name, "_tomoe"))
         return original_tex_name;
@@ -312,10 +305,44 @@ static void init_user_system_info_cache_dir()
 }
 
 
+void game_quit_and_start_launcher()
+{
+#if _TARGET_PC_WIN
+  wchar_t *path = NULL;
+  wchar_t pathBuff[MAX_PATH + 1] = {0};
+  if (GetModuleFileNameW(NULL, pathBuff, countof(pathBuff)))
+  {
+    for (int i = (int)wcslen(pathBuff) - 1; i >= 0; --i)
+      if (pathBuff[i] == L'\\' || pathBuff[i] == L'/')
+      {
+        pathBuff[i] = 0;
+        break;
+      }
+    wcsncat(pathBuff, L"\\..\\launcher.exe", countof(pathBuff) - wcslen(pathBuff) - 1);
+    pathBuff[MAX_PATH] = 0;
+    path = pathBuff;
+  }
+  os_shell_execute_w(NULL, path ? path : L"launcher.exe", NULL, NULL, true);
+  debug("quitting and launch launcher...");
+  flush_debug_file();
+  ExitProcess(1); // can't do quit_game() here
+#endif
+}
+
+
+int no_watchdog_message_box(const char *utf8_text, const char *utf8_caption, int flags = 0)
+{
+  ScopeSetWatchdogTimeout _wd(WATCHDOG_DISABLE);
+  return os_message_box(utf8_text, utf8_caption, flags);
+}
+
+
 void DagorWinMainInit(int, bool)
 {
   install_signal_handlers(); // before any thread creation (incl. logging which might create thread)
+#if !DAGOR_HOSTED_INTERNAL_SERVER
   fatal::init(); // this inits errors reporting and shall be called as early as possible (i.e. before any other initialization code)
+#endif
   DataBlock::singleBlockChecking = true;
 #if _TARGET_ANDROID
   restoreConfigIfNotExist("config.blk");
@@ -353,6 +380,7 @@ void DagorWinMainInit(int, bool)
 bool is_initial_loading_complete() { return initial_loading_complete; }
 
 extern void wait_additional_game_job_done();
+extern void set_additional_game_job_next_frame_start_cb(void (*cb)());
 
 static void post_shutdown_handler()
 {
@@ -391,10 +419,11 @@ static void post_shutdown_handler()
 #endif
 
   stop_webui();
+  shutdown_internal_server_on_host_exit();
   gameproj::reset_game_resources();
   reset_game_resources();
-  gameres_rendinst_desc.reset();
-  gameres_dynmodel_desc.reset();
+  gameres_reset_desc(gameres_rendinst_desc);
+  gameres_reset_desc(gameres_dynmodel_desc);
   term_res_factories();
   ddsx::shutdown_tex_pack2_data();
   shutdown_game(RESTART_INPUT);
@@ -410,7 +439,6 @@ static void post_shutdown_handler()
   curl_global::shutdown();
 
   crypto::cleanup_ssl();
-  shutdown_internal_server_on_host_exit();
 #if _TARGET_PC
   DaThread::terminate_all(/*wait*/ true, /*timeout*/ 7000); // wait for PurgeLogThread and similar threads
 #endif
@@ -441,6 +469,9 @@ void set_window_title(const char *net_role)
 
 static void dump_log_initial(const char *cwd)
 {
+  // Stamp before other lines so test_engine finds -test_log_uid first.
+  stamp_test_log_uid_if_present();
+
   String cmdLine(framemem_ptr());
   cmdLine.reserve(DAGOR_MAX_PATH);
 #if _TARGET_PC_LINUX
@@ -476,10 +507,7 @@ static void init_game_res()
 {
   debug("registering factories");
 
-  ::set_gameres_sys_ver(2);
   init_res_factories();
-  CollisionResource::registerFactory();
-  rendinst::register_land_gameres_factory();
 }
 
 static inline void start_launcher()
@@ -542,6 +570,9 @@ static bool init_critical()
 
 static unsigned min_frame_time_us = 0;
 static bool allow_d3d_backend_frame_limiter = false;
+static bool use_pufd_frame_limiter = false;
+void wait_for_target_fps_limit_from_additional_game_job();
+
 void set_fps_limit(int max_fps)
 {
 #if _TARGET_IOS
@@ -554,6 +585,10 @@ void set_fps_limit(int max_fps)
     min_frame_time_us = 1e6 / max_fps;
 
   allow_d3d_backend_frame_limiter = dgs_get_settings()->getBlockByNameEx("video")->getBool("d3dFrameLimiter", false);
+  use_pufd_frame_limiter = dgs_get_settings()->getBlockByNameEx("video")->getBool("pufdGpuLatencyWait", true) &&
+                           ::dgs_get_settings()->getBool("parallel_no_latency_mode", false);
+  if (use_pufd_frame_limiter)
+    set_additional_game_job_next_frame_start_cb(&wait_for_target_fps_limit_from_additional_game_job);
 }
 
 int get_fps_limit() { return min_frame_time_us ? 1e6 / min_frame_time_us : 0; }
@@ -562,8 +597,11 @@ void set_corrected_fps_limit(int fps_limit)
 {
   const int fpsLimitFromSettings = [] {
     auto videoBlk = ::dgs_get_settings()->getBlockByNameEx("video");
-    String platformFpsLimitName = String(32, "%sFpsLimit", get_platform_string_id());
-    return videoBlk->paramExists(platformFpsLimitName) ? videoBlk->getInt(platformFpsLimitName) : videoBlk->getInt("fpsLimit", 0);
+#if _TARGET_PC
+    if (d3d::get_vsync_enabled())
+      return 0;
+#endif
+    return videoBlk->getInt("fpsLimit", 0);
   }();
   if (fps_limit < 0)
     fps_limit = fpsLimitFromSettings;
@@ -573,19 +611,39 @@ void set_corrected_fps_limit(int fps_limit)
   set_fps_limit(fps_limit);
 }
 
+static volatile uint32_t fps_limit_waiter_from_additional_game_job_called = 0;
+
 struct FrameSleeper
 {
   static constexpr unsigned MIN_LOADING_FRAME_TIME_US = 1e6 / 30.0;
   // class instance is temporal (scope limited), but context for precise sleep must be preserved, so keep it alive via static
   static PreciseSleepContext precise_sleep_context;
+  inline static uint32_t lastAdditionalGameJobWait = 0;
   int64_t startRefTicks;
 
   // if allowed and d3d driver supports frame event callbacks
   // register wait callback on its backend,
   // to avoid frame rate instability
   // caused by internal driver queue being underfeeded
-  bool registerOneTimeD3DBackendWait()
+  //
+  // if wait is used before input sampling in PUFD
+  bool useAlternativeWaitPoint()
   {
+    // no alternative wait points allowed
+    if (!allow_d3d_backend_frame_limiter && !use_pufd_frame_limiter)
+      return false;
+
+    if (use_pufd_frame_limiter)
+    {
+      uint32_t counter = interlocked_acquire_load(fps_limit_waiter_from_additional_game_job_called);
+      if (lastAdditionalGameJobWait != counter)
+      {
+        lastAdditionalGameJobWait = counter;
+        return true;
+      }
+    }
+
+    // if PUFD wait is not used, use d3d backend wait only if allowed
     if (!allow_d3d_backend_frame_limiter)
       return false;
 
@@ -623,7 +681,7 @@ struct FrameSleeper
     }
   }
 
-  FrameSleeper() { startRefTicks = registerOneTimeD3DBackendWait() ? 0 : profile_ref_ticks(); }
+  FrameSleeper() { startRefTicks = useAlternativeWaitPoint() ? 0 : profile_ref_ticks(); }
 
   ~FrameSleeper()
   {
@@ -633,6 +691,16 @@ struct FrameSleeper
 };
 
 PreciseSleepContext FrameSleeper::precise_sleep_context = {};
+
+void wait_for_target_fps_limit_from_additional_game_job()
+{
+  if (!use_pufd_frame_limiter)
+    return;
+  interlocked_increment(fps_limit_waiter_from_additional_game_job_called);
+  static int64_t startRefTicks = 0;
+  FrameSleeper::waitForFrameRemainder(startRefTicks);
+  startRefTicks = profile_ref_ticks();
+}
 
 static unsigned int quirrel_alloc_ignore_size = 0;
 
@@ -781,10 +849,13 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
     debug("early init circuit name <%s>", circuit_name);
   }
 #if _TARGET_PC_LINUX
-  G_ASSERT(cwdbuf[0]);
-  dd_append_slash_c(cwdbuf);
-  dd_remove_base_path("");
-  dd_add_base_path(cwdbuf); // cwd is expected to point to game root at this point (see dagor_change_root_directory())
+  if (dedicated::is_dedicated())
+  {
+    G_ASSERT(cwdbuf[0]);
+    dd_append_slash_c(cwdbuf);
+    dd_remove_base_path("");
+    dd_add_base_path(cwdbuf); // cwd is expected to point to game root at this point (see dagor_change_root_directory())
+  }
 #endif
   g_entity_mgr.demandInit(); // init it early to be able to use broadcast events for init
   bool selfcheck_passed = true;
@@ -792,7 +863,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   if (!selfcheck_passed)
     return 3;
 
-  if (!net_init_early(*g_entity_mgr)) // do init network early as it might fail application startup (i.e. on server)
+  if (is_main_thread_network() && !net_init_early(*g_entity_mgr))
     return 1;
 
   g_entity_mgr->broadcastEventImmediate(VromfsUpdaterEarlyInitEvent{});
@@ -801,6 +872,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 
   curl_global::init();
 
+  systeminfo::init();
 
   g_entity_mgr->broadcastEventImmediate(OnStoreApiEarlyInit{});
 
@@ -831,13 +903,43 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 #if _TARGET_C1 | _TARGET_C2
 
 #endif
+  init_shared_memory(); // run before loading any vromfs (to be usable for sharing vromfs)
   initial_load_settings();
+
+#if _TARGET_PC_WIN
+  // The dev launcher passes debug/runningMultClients when it intentionally
+  // starts several clients; skip the single-instance check entirely in that
+  // case so the collision modal isn't shown on every launch.
+  if (!dedicated::is_dedicated() && !::dgs_execute_quiet &&
+      !dgs_get_settings()->getBlockByNameEx("debug")->getBool("runningMultClients", false))
+  {
+    char mutex_name[256];
+    SNPRINTF(mutex_name, sizeof(mutex_name), "Global\\DagorGame_%s", gameproj::game_user_dir_name());
+    ScopeSetWatchdogTimeout _wd(WATCHDOG_DISABLE);
+    if (check_or_prompt_existing_instance(mutex_name) == ExistingInstanceAction::ExitProcess)
+    {
+#if DAGOR_DBGLEVEL < 1
+      os_message_box("Another instance of the game is already running.", gameproj::game_window_title(),
+        GUI_MB_OK | GUI_MB_ICON_ERROR | GUI_MB_NATIVE_DLG);
+#endif
+      debug("another instance is running");
+      flush_debug_file();
+      ExitProcess(0);
+    }
+  }
+#endif
 
   // This must be called after settings load
   cpujobs::init(dgs_get_settings()->getBlockByNameEx("debug")->getInt("coreCount", -1), /*reserve_jobmgr_cores*/ false);
+  init_nv_cache_tracker();
+
+  if (dgs_get_settings()->getBool("runCpuBenchmarkOnStart", false))
+    cpu_benchmark::run_benchmark_and_log();
 
   const DataBlock &debugSettings = *dgs_get_settings()->getBlockByNameEx("debug");
   da_profiler::set_profiling_settings(debugSettings);
+  if (dgs_get_argv("profiler_no_resolve"))
+    da_profiler::set_resolve_symbols(false);
 #if TIME_PROFILER_ENABLED && DAGOR_THREAD_SANITIZER
   // old profiler had a lot of races. Todo: check new one.
   da_profiler::set_mode(0);
@@ -845,6 +947,9 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 
   { // Setup log handlers before we start any threads which can log (specifically start_purge_logs_thread) to avoid dataraces.
     visual_err_log_setup(dedicated::is_dedicated());
+    // HIS default mirror: install above visuallog so DEBUG/WARN reach the host forwarder
+    // without visuallog having to chain non-ERR levels. Eden expect_later skips this arm.
+    hosted_server_arm_log_mirror_callback();
     bindquirrel::setup_logerr_interceptor();
 
 #if DAGOR_DBGLEVEL > 0
@@ -857,6 +962,22 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   }
 
   dng_load_localization();
+
+#if _TARGET_PC_WIN && !_TARGET_C4 && (DAGOR_DBGLEVEL == 0)
+  if (!dedicated::is_dedicated() && !::dgs_execute_quiet)
+  {
+    if (::dgs_get_argv("forcestart") == NULL &&
+        !dgs_get_settings()->getBlockByNameEx("debug")->getBool("allowRunWithoutLauncher", false))
+    {
+      debug("start without launcher is forbidden");
+      if (no_watchdog_message_box(get_localized_text("launcher/update"), get_localized_text("launcher/update_header"),
+            GUI_MB_YES_NO | GUI_MB_ICON_ERROR | GUI_MB_FOREGROUND) == GUI_MB_BUTTON_1)
+      {
+        game_quit_and_start_launcher();
+      }
+    }
+  }
+#endif
 
   start_purge_logs_thread(); // as soon as settings loaded & cpujobs inited, after setting up log handlers
 
@@ -882,8 +1003,11 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   }
 #endif
 
-  workcycleperf::cpu_only_cycle_record_enabled =
-    dgs_get_settings()->getBlockByNameEx("debug")->getBool("enableCpuOnlyCycleRecord", false);
+  if (dgs_get_settings()->getBlockByNameEx("debug")->getBool("enableCpuOnlyCycleRecord", false))
+    workcycleperf::record_mode |= workcycleperf::RecordMode::CpuCycleBit;
+
+  if (dgs_get_settings()->getBlockByNameEx("debug")->getBool("enableWorkCycleRecord", false))
+    workcycleperf::record_mode |= workcycleperf::RecordMode::WorkCycleBit;
 
   // before load or video start to be able use exe for fast compilation checks
   {
@@ -893,10 +1017,19 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
     g_entity_mgr->setMaxUpdateJobs(::dgs_get_settings()->getInt("ecs_max_threads", 8));
   }
 
+  if (!dgs_get_settings()->getBool("ignoreOutdatedVcRedist", dedicated::is_dedicated()))
+    systeminfo::check_vc_redist(dgs_get_settings());
   systeminfo::dump_dll_names();
 
   folders::load_custom_folders(*dgs_get_settings()->getBlockByNameEx("folders"));
   init_user_system_info_cache_dir();
+#if _TARGET_C1 || _TARGET_C2
+
+
+
+
+
+#endif
   start_settings_async_saver_jobmgr();
   if (!dgs_get_argv("nopubcfg"))
     pubcfg::init(folders::get_path("pubcfg"), "");
@@ -913,7 +1046,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   gameproj::before_init_video();
 
   const char *wcName = "DagorWClass";
-  if (gameproj::is_hosted_server_instance())
+  if (dedicated::is_hosted_server_instance())
     wcName = nullptr; // prevents most video initialization, especially window itself
 
   ::dagor_init_video(wcName, nCmdShow,
@@ -924,16 +1057,20 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 #endif
     "Loading...", gameproj::game_window_title(), get_exe_version32());
   ::startup_game(RESTART_ALL);
-  try_apply_auto_graphical_settings();
-  fatal::set_d3d_driver_data(d3d::get_driver_name(), d3d_get_vendor_name(d3d_get_gpu_cfg().primaryVendor));
+  auto_graphics::startup::try_apply_auto_graphics_settings();
+  fatal::set_d3d_driver_data(d3d::get_driver_name(), d3d_get_vendor_name(d3d::get_driver_desc().info.vendor));
 #if _TARGET_ANDROID
   android::startup::set_android_graphics_preset();
 #endif
 #if _TARGET_ANDROID || _TARGET_IOS
   crashlytics::init(LOGLEVEL_WARN);
 #endif
-  enable_tex_mgr_mt(true, ::dgs_get_settings()->getBlockByNameEx("video")->getInt("maxTexCount", 8192));
-  dagor_show_splash_screen(); // For system splash of sony consoles until the shaders are initalized
+  // dedicated registers only a handful of stub textures, so the client-sized entry array
+  // (video/maxTexCount, ~120 bytes per entry) would be almost entirely wasted there
+  enable_tex_mgr_mt(true,
+    ::dgs_get_settings()->getBlockByNameEx("video")->getInt(dedicated::is_dedicated() ? "maxTexCountDedicated" : "maxTexCount", 8192));
+  if (!dedicated::is_dedicated())
+    dagor_show_splash_screen(); // For system splash of sony consoles until the shaders are initalized
   init_shaders();
   ::startup_game(RESTART_ALL);
   watchdog::init();
@@ -948,15 +1085,18 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
     imgui_set_override_blk(overrideBlk);
   }
 
+  if (!dedicated::is_dedicated())
+    ::prelaunch_internal_server_if_needed();
+
   class InitialLoadingThread final : public DaThread
   {
     das::daScriptEnvironment *bound = nullptr;
 
   public:
-    InitialLoadingThread() : DaThread("InitialLoadingThread", 256 << 10, 0, WORKER_THREADS_AFFINITY_MASK)
+    InitialLoadingThread() : DaThread("InitialLoadingThread", 192 << 10, 0, WORKER_THREADS_AFFINITY_MASK)
     {
       das::daScriptEnvironment::ensure();
-      bound = *das::daScriptEnvironment::bound;
+      bound = das::daScriptEnvironment::getBound();
     }
 
     void waitWithSplashAnimation()
@@ -1028,14 +1168,14 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
       ::startup_game(RESTART_ALL);
       if (!dedicated::is_dedicated())
         statsd::counter("render.driver_init", 1,
-          {{"d3d_driver", d3d::get_driver_name()}, {"gpu_vendor", d3d_get_vendor_name(d3d_get_gpu_cfg().primaryVendor)}});
+          {{"d3d_driver", d3d::get_driver_name()}, {"gpu_vendor", d3d_get_vendor_name(d3d::get_driver_desc().info.vendor)}});
 
       if (
         ::dgs_get_settings()->getBool("harmonizationRequired", false) || ::dgs_get_settings()->getBool("harmonizationEnabled", false))
         dagor_sm_tex_load_controller = &texLoadController;
 
       systeminfo::dump_sysinfo();
-      init_game_res();
+      execute_delayed_action_on_main_thread(make_delayed_action([]() { init_game_res(); }));
 
       if (dgs_get_settings()->getBlockByNameEx("texStreaming")->getBool("disableTexScan", false))
         ::set_default_tex_factory(get_stub_tex_factory());
@@ -1054,6 +1194,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
         picMgrCfg.setBool("dynAtlasLazyAllocDef", true);
         picMgrCfg.setBool("fatalOnPicLoadFailed", false);
         picMgrCfg.setBool("searchBlkBeforeTaBin", true); // *.ta.bin isn't used
+        picMgrCfg.setBool("waitForTexLoading", false);
         execute_delayed_action_on_main_thread(make_delayed_action([&]() { PictureManager::init(&picMgrCfg); }));
       }
 
@@ -1099,8 +1240,6 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
       streaming::set_streaming_now(::dgs_get_settings()->getBlockByNameEx("streaming")->getBool("enabled", false));
 #endif
 
-      sqfrp::throw_frp_script_errors = false;
-
       init_device_reset();
 
       local_storage::init();
@@ -1112,7 +1251,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
     void execute() override
     {
       TIME_PROFILE_THREAD(getCurrentThreadName());
-      *das::daScriptEnvironment::bound = bound;
+      das::daScriptEnvironment::setBound(bound);
       ScopeSetWatchdogCurrentThreadDump wctd;
 
       execThread();
@@ -1153,21 +1292,20 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
     FrameSleeper _sleep;
 #endif
     wait_additional_game_job_done();
+    update_webui(); // webui can run game logic, which needs emgr ownership returned by the PUFD job
     gameproj::update_before_dagor_work_cycle();
     ::dagor_work_cycle();
-    update_webui();
     cpujobs::release_done_jobs();
     reset_framemem();
     watchdog_kick();
   });
   /* Don't add shutdown code here - it will not be executed, use post_shutdown_handler() instead */
-  if (gameproj::is_hosted_server_instance()) // we quit the game normally, flushing everything, but do not exit the process itself
-    shutdown_game_instance();
-  else
-  {
-    quit_game(0, /*bRestart*/ false);
-    G_ASSERT(0);
-  }
+#if DAGOR_HOSTED_INTERNAL_SERVER
+  shutdown_game_instance(); // we quit the game normally, flushing everything, but do not exit the process itself
+#else
+  quit_game(0, /*bRestart*/ false);
+  G_ASSERT(0);
+#endif
   return 0;
 }
 

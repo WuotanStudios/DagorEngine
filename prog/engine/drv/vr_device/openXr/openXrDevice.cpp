@@ -287,7 +287,14 @@ OpenXRDevice::OpenXRDevice(RenderingAPI rendering_api, const ApplicationData &ap
 {
   d3d::driver_command(Drv3dCommand::REGISTER_DEVICE_RESET_EVENT_HANDLER, static_cast<DeviceResetEventHandler *>(this));
 
-#if _TARGET_ANDROID
+#if _TARGET_PC_WIN
+  // https://github.com/mbucchia/OpenXR-Toolkit/releases
+  // "AS OF 2024, SUPPORT FOR OPENXR TOOLKIT IS DISCONTINUED. THERE IS NO NEW DEVELOPMENT AND NO TECH SUPPORT OF ANY SORT. THE
+  // DEVELOPER DOES NOT RECOMMEND TO INSTALL/USE OPENXR TOOLKIT, AS IT IS KNOWN TO CAUSE ISSUES WITH MANY OF THE NEWER GAMES RELEASED
+  // IN SINCE 2024"
+  // The OpenXR Toolkit cause invalid function call during D3D12 API calls, therefore just prevent to load it.
+  putenv("DISABLE_XR_APILAYER_MBUCCHIA_toolkit=1");
+#elif _TARGET_ANDROID
   LoadPreInitOpenxrFuncs();
   android_app *state = (android_app *)win32_get_instance();
   JavaVM *jVM = state->activity->vm;
@@ -394,15 +401,24 @@ OpenXRDevice::OpenXRDevice(RenderingAPI rendering_api, const ApplicationData &ap
   applicationVersion = application_data.version;
 
   setUpInstance();
+
+  if (::dgs_get_settings()->getBlockByNameEx("xr")->getBool("useBlockingPresent", false))
+  {
+    bool asyncMode = false;
+    d3d::driver_command(Drv3dCommand::SET_PRESENT_ASYNC_MODE, &asyncMode);
+  }
 }
 
 OpenXRDevice::~OpenXRDevice()
 {
+  d3d::driver_command(Drv3dCommand::SET_PRESENT_ASYNC_MODE); // Reset to default
   d3d::driver_command(Drv3dCommand::UNREGISTER_DEVICE_RESET_EVENT_HANDLER, static_cast<DeviceResetEventHandler *>(this));
 
+  finishPendingFrame();
+  endSession();
   tearDownSwapchainImages();
   tearDownSwapchains();
-  tearDownSession();
+  destroySession();
 
   tearDownScreenMaskResources();
 
@@ -414,14 +430,19 @@ OpenXRDevice::~OpenXRDevice()
 
 bool OpenXRDevice::setUpInstance()
 {
-  XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
-  createInfo.enabledExtensionCount = requiredExtensions.size();
-  createInfo.enabledExtensionNames = requiredExtensions.data();
-  createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-  createInfo.applicationInfo.applicationVersion = applicationVersion;
-  createInfo.applicationInfo.engineVersion = 4;
+  XrInstanceCreateInfo createInfo = {
+    .type = XR_TYPE_INSTANCE_CREATE_INFO,
+    .applicationInfo =
+      {
+        .applicationVersion = applicationVersion,
+        .engineName = "Dagor",
+        .engineVersion = 4,
+        .apiVersion = XR_API_VERSION_1_0,
+      },
+    .enabledExtensionCount = uint32_t(requiredExtensions.size()),
+    .enabledExtensionNames = requiredExtensions.data(),
+  };
   strcpy_s(createInfo.applicationInfo.applicationName, applicationName.data());
-  strcpy_s(createInfo.applicationInfo.engineName, "Dagor");
 
 #if _TARGET_ANDROID
   android_app *state = (android_app *)win32_get_instance();
@@ -696,8 +717,6 @@ bool OpenXRDevice::setUpSession()
   if (!gfxApiRangeCalled)
     getRequiredGraphicsAPIRange();
 
-  XrResult result;
-
   sessionInfo.systemId = oxrSystemId;
   XR_REPORT_RETURN(xrCreateSession(oxrInstance, &sessionInfo, &oxrSession), false);
 
@@ -725,15 +744,65 @@ bool OpenXRDevice::setUpSession()
   return true;
 }
 
-void OpenXRDevice::tearDownSession()
+void OpenXRDevice::endSession()
 {
   if (!oxrSession)
     return;
 
   inputHandler.shutdown();
 
+  if (!sessionRunning)
+    return;
+
   xrRequestExitSession(oxrSession); // it is OK for this to return errors
-  xrEndSession(oxrSession);         // it is OK for this to return errors
+
+  const int deadline = ::get_time_msec() + 3000;
+  while (oxrSessionState != XR_SESSION_STATE_EXITING && oxrSessionState != XR_SESSION_STATE_IDLE && !apiRequestedQuit)
+  {
+    XrEventDataBuffer eventBuffer = {XR_TYPE_EVENT_DATA_BUFFER};
+    while (xrPollEvent(oxrInstance, &eventBuffer) == XR_SUCCESS)
+    {
+      // Instance loss kills the whole runtime, not just this session; unlike session-scoped
+      // events it must still surface as a quit, so honor it even during private teardown polling.
+      if (eventBuffer.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
+        apiRequestedQuit = true;
+      else if (eventBuffer.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
+      {
+        const auto *event = reinterpret_cast<const XrEventDataSessionStateChanged *>(&eventBuffer); //-V641
+        if (event->session == oxrSession)
+        {
+          oxrSessionState = event->state;
+          if (oxrSessionState == XR_SESSION_STATE_STOPPING)
+          {
+            XR_REPORT(xrEndSession(oxrSession));
+            sessionRunning = false;
+          }
+        }
+      }
+      eventBuffer = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+
+    if (::get_time_msec() > deadline)
+    {
+      debug("[XR][device] Timed out waiting for session to reach EXITING, current state is %d.", int(oxrSessionState));
+      break;
+    }
+    sleep_msec(2);
+  }
+  debug("[XR][device] Session teardown reached state %d.", int(oxrSessionState));
+
+  if (sessionRunning)
+  {
+    xrEndSession(oxrSession); // it is OK for this to return errors
+    sessionRunning = false;
+  }
+}
+
+void OpenXRDevice::destroySession()
+{
+  if (!oxrSession)
+    return;
+
   if (oxrRefSpace)
   {
     XR_REPORT(xrDestroySpace(oxrRefSpace));
@@ -750,6 +819,10 @@ void OpenXRDevice::tearDownSession()
   oxrSession = XR_NULL_HANDLE;
 
   sessionRunning = false;
+  frameIsOpen = false;
+
+  callSessionStartedCallbackIfAvailable = false;
+  callSessionEndedCallbackIfAvailable = false;
 }
 
 bool OpenXRDevice::setUpSwapchains()
@@ -772,7 +845,6 @@ bool OpenXRDevice::setUpSwapchains()
 bool OpenXRDevice::setUpSwapchain(SwapchainData &swapchain, int width, int height)
 {
   XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-  XrSwapchain handle;
   swapchainInfo.arraySize = 1;
   swapchainInfo.mipCount = 1;
   swapchainInfo.faceCount = 1;
@@ -940,11 +1012,66 @@ void OpenXRDevice::tearDownSwapchain(SwapchainData &swapchain)
 
   XR_REPORT(xrDestroySwapchain(swapchain.handle));
   swapchain.handle = XR_NULL_HANDLE;
+  interlocked_release_store(swapchain.acquiredImages, 0);
+  interlocked_release_store(swapchain.waitedImages, 0);
 
   if (swapchain.depth)
   {
-    XR_REPORT(xrDestroySwapchain(swapchain.depth->handle));
+    if (swapchain.depth->handle != XR_NULL_HANDLE)
+      XR_REPORT(xrDestroySwapchain(swapchain.depth->handle));
     swapchain.depth.reset();
+  }
+}
+
+void OpenXRDevice::finishPendingFrame()
+{
+  if (!oxrSession)
+    return;
+
+  auto drain = [this](SwapchainData &swapchain) {
+    if (swapchain.handle == XR_NULL_HANDLE)
+      return;
+
+    const XrSwapchainImageWaitInfo waitInfo = {
+      .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+      .timeout = 100000000, // 100ms, best effort; the 3d device may already be gone
+    };
+
+    // Only XR_SUCCESS actually waited an image; XR_TIMEOUT_EXPIRED is a success code that
+    // leaves the image unwaited, so it must not be counted or later released.
+    while (interlocked_acquire_load(swapchain.waitedImages) < interlocked_acquire_load(swapchain.acquiredImages))
+    {
+      if (xrWaitSwapchainImage(swapchain.handle, &waitInfo) != XR_SUCCESS)
+        break;
+      interlocked_increment(swapchain.waitedImages);
+    }
+
+    XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    while (interlocked_acquire_load(swapchain.waitedImages) > 0)
+    {
+      if (xrReleaseSwapchainImage(swapchain.handle, &releaseInfo) != XR_SUCCESS)
+        break;
+      interlocked_decrement(swapchain.waitedImages);
+      interlocked_decrement(swapchain.acquiredImages);
+    }
+  };
+
+  for (SwapchainData &swapchain : swapchains)
+  {
+    drain(swapchain);
+    if (swapchain.depth)
+      drain(*swapchain.depth);
+  }
+
+  if (frameIsOpen)
+  {
+    XrFrameEndInfo endInfo{
+      .type = XR_TYPE_FRAME_END_INFO,
+      .displayTime = lastPredictedDisplayTime,
+      .environmentBlendMode = supportedBlendModes.front(),
+    };
+    xrEndFrame(oxrSession, &endInfo);
+    frameIsOpen = false;
   }
 }
 
@@ -1030,6 +1157,22 @@ eastl::pair<uint64_t, uint64_t> OpenXRDevice::getRequiredGraphicsAPIRange() cons
       return {vreq.minApiVersionSupported, vreq.maxApiVersionSupported};
   }
 #endif // XR_USE_GRAPHICS_API_VULKAN
+#ifdef XR_USE_GRAPHICS_API_D3D11
+  if (renderingAPI == RenderingAPI::D3D11)
+  {
+    XrGraphicsRequirementsD3D11KHR vreq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
+    if (XR_SUCCEEDED(pfnGetD3D11GraphicsRequirementsKHR(oxrInstance, oxrSystemId, &vreq)))
+      return {int64_t(vreq.minFeatureLevel), bitwise_cast<uint64_t>(vreq.adapterLuid)};
+  }
+#endif // XR_USE_GRAPHICS_API_D3D11
+#ifdef XR_USE_GRAPHICS_API_D3D12
+  if (renderingAPI == RenderingAPI::D3D12)
+  {
+    XrGraphicsRequirementsD3D12KHR vreq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+    if (XR_SUCCEEDED(pfnGetD3D12GraphicsRequirementsKHR(oxrInstance, oxrSystemId, &vreq)))
+      return {int64_t(vreq.minFeatureLevel), bitwise_cast<uint64_t>(vreq.adapterLuid)};
+  }
+#endif // XR_USE_GRAPHICS_API_D3D12
   return {0, 0};
 }
 
@@ -1175,10 +1318,12 @@ bool OpenXRDevice::recreateOpenXr()
   d3d::release_event_query(query);
 
   auto tearDown = [this]() {
+    finishPendingFrame();
+    endSession();
     tearDownSwapchainImages();
     tearDownScreenMaskResources();
     tearDownSwapchains();
-    tearDownSession();
+    destroySession();
     tearDownInstance();
   };
 
@@ -1327,22 +1472,22 @@ void OpenXRDevice::tick(const SessionCallback &cb)
     eventBuffer = {XR_TYPE_EVENT_DATA_BUFFER};
   }
 
-  inputHandler.updateActionsState();
-
   if (callSessionStartedCallbackIfAvailable && callSessionEndedCallbackIfAvailable)
     callSessionStartedCallbackIfAvailable = callSessionEndedCallbackIfAvailable = false;
-
-  if (callSessionStartedCallbackIfAvailable && cb)
+  else
   {
-    inHmdStateTransition = true;
-    if (cb(Session::Start))
-      callSessionStartedCallbackIfAvailable = false;
-  }
-  if (callSessionEndedCallbackIfAvailable && cb)
-  {
-    inHmdStateTransition = true;
-    if (cb(Session::End))
-      callSessionEndedCallbackIfAvailable = false;
+    if (callSessionStartedCallbackIfAvailable && cb)
+    {
+      inHmdStateTransition = true;
+      if (cb(Session::Start))
+        callSessionStartedCallbackIfAvailable = false;
+    }
+    if (callSessionEndedCallbackIfAvailable && cb)
+    {
+      inHmdStateTransition = true;
+      if (cb(Session::End))
+        callSessionEndedCallbackIfAvailable = false;
+    }
   }
 
   setUpApplicationSpace();
@@ -1354,24 +1499,25 @@ bool OpenXRDevice::prepareFrame(FrameData &frameData, float zNear, float zFar)
 
   if (!sessionRunning)
   {
-    debug("[xr][device] prepareFrame failed, due to not running session.");
+    debug("[XR][device] prepareFrame failed, due to not running session.");
     return false;
   }
 
   if (oxrHadRuntimeFailure)
   {
-    debug("[xr][device] prepareFrame failed, due to a recent runtime failure.");
+    debug("[XR][device] prepareFrame failed, due to a recent runtime failure.");
     return false;
   }
 
   if (!oxrAppSpace)
   {
-    debug("[xr][device] prepareFrame failed, due to missing app space.");
+    debug("[XR][device] prepareFrame failed, due to missing app space.");
     return false;
   }
 
   XrFrameState frameState = {XR_TYPE_FRAME_STATE};
   XR_REPORT_RETURN_RTF(xrWaitFrame(oxrSession, nullptr, &frameState), false);
+  lastPredictedDisplayTime = frameState.predictedDisplayTime;
 
   uint32_t dummy;
   XrView oxrCurrentViews[] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
@@ -1459,10 +1605,23 @@ bool OpenXRDevice::prepareFrame(FrameData &frameData, float zNear, float zFar)
       v.orientation = originalOrientation;
     }
 
-  auto getSwapchainImage = [this](const SwapchainData &swapchain) -> ManagedTexView {
-    uint32_t imageId;
+  bool acquireFailed = false;
+  auto getSwapchainImage = [this, &acquireFailed](SwapchainData &swapchain) -> ManagedTexView {
+    uint32_t imageId = 0;
     XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XR_REPORT(xrAcquireSwapchainImage(swapchain.handle, &acquireInfo, &imageId));
+    if (!XR_REPORT(xrAcquireSwapchainImage(swapchain.handle, &acquireInfo, &imageId)))
+    {
+      acquireFailed = true;
+      return ManagedTexView{};
+    }
+
+    interlocked_increment(swapchain.acquiredImages);
+
+    if (imageId >= swapchain.imageViews.size())
+    {
+      acquireFailed = true;
+      return ManagedTexView{};
+    }
 
     return swapchain.imageViews[imageId];
   };
@@ -1513,6 +1672,13 @@ bool OpenXRDevice::prepareFrame(FrameData &frameData, float zNear, float zFar)
       break;
   }
 
+  if (acquireFailed)
+  {
+    debug("[XR][device] prepareFrame failed, could not acquire a swapchain image.");
+    oxrHadRuntimeFailure = true;
+    return false;
+  }
+
   frameData.depthFilled = false;
 
   frameData.nearZ = zNear;
@@ -1522,6 +1688,7 @@ bool OpenXRDevice::prepareFrame(FrameData &frameData, float zNear, float zFar)
   frameData.frameStartedSuccessfully = false;
   frameData.frameId = frameId++;
 
+  inputHandler.updateActionsState();
   inputHandler.updatePoseSpaces(oxrAppSpace, frameState.predictedDisplayTime);
   inputHandler.updateLegacyControllerPoses(oxrAppSpace, frameState.predictedDisplayTime);
   inputHandler.updateHandJoints(oxrAppSpace, frameState.predictedDisplayTime);
@@ -1565,16 +1732,24 @@ void OpenXRDevice::beginRender(FrameData &frameData)
     return;
   }
 
-  XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-  waitInfo.timeout = XR_INFINITE_DURATION;
+  frameIsOpen = true;
 
-  bool colorWait =
-    XR_REPORT_RTF(xrWaitSwapchainImage(swapchains[0].handle, &waitInfo)) &&
-    (swapchains[1].handle != XR_NULL_HANDLE ? XR_REPORT_RTF(xrWaitSwapchainImage(swapchains[1].handle, &waitInfo)) : true);
+  const XrSwapchainImageWaitInfo waitInfo = {
+    .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+    .timeout = XR_INFINITE_DURATION,
+  };
 
-  bool depthWait =
-    ((swapchains[0].depth && enable_depth) ? XR_REPORT_RTF(xrWaitSwapchainImage(swapchains[0].depth->handle, &waitInfo)) : true) &&
-    ((swapchains[1].depth && enable_depth) ? XR_REPORT_RTF(xrWaitSwapchainImage(swapchains[1].depth->handle, &waitInfo)) : true);
+  auto waitImage = [this, &waitInfo](SwapchainData &swapchain) {
+    if (!XR_REPORT_RTF(xrWaitSwapchainImage(swapchain.handle, &waitInfo)))
+      return false;
+    interlocked_increment(swapchain.waitedImages);
+    return true;
+  };
+
+  bool colorWait = waitImage(swapchains[0]) && (swapchains[1].handle != XR_NULL_HANDLE ? waitImage(swapchains[1]) : true);
+
+  bool depthWait = ((swapchains[0].depth && enable_depth) ? waitImage(*swapchains[0].depth) : true) &&
+                   ((swapchains[1].depth && enable_depth) ? waitImage(*swapchains[1].depth) : true);
 
   if (!colorWait || !depthWait)
   {
@@ -1584,6 +1759,7 @@ void OpenXRDevice::beginRender(FrameData &frameData)
     endInfo.layerCount = 0;
     endInfo.layers = nullptr;
     XR_REPORT_RTF(xrEndFrame(oxrSession, &endInfo));
+    frameIsOpen = false;
 
     frameData.frameStartedSuccessfully = false;
     return;
@@ -1605,14 +1781,20 @@ void OpenXRDevice::endRender(FrameData &frameData)
   AutoExternalAccess gpuLock(false, true, renderingAPI);
 
   XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+  auto releaseImage = [this, &releaseInfo](SwapchainData &swapchain) {
+    if (!XR_REPORT_RTF(xrReleaseSwapchainImage(swapchain.handle, &releaseInfo)))
+      return;
+    interlocked_decrement(swapchain.acquiredImages);
+    interlocked_decrement(swapchain.waitedImages);
+  };
   for (int viewIx = 0; viewIx < 2; ++viewIx)
   {
     if (swapchains[viewIx].handle == XR_NULL_HANDLE)
       break;
 
-    XR_REPORT_RTF(xrReleaseSwapchainImage(swapchains[viewIx].handle, &releaseInfo));
+    releaseImage(swapchains[viewIx]);
     if (swapchains[viewIx].depth && enable_depth)
-      XR_REPORT_RTF(xrReleaseSwapchainImage(swapchains[viewIx].depth->handle, &releaseInfo));
+      releaseImage(*swapchains[viewIx].depth);
   }
 
   if (oxrHadRuntimeFailure)
@@ -1679,6 +1861,7 @@ void OpenXRDevice::endRender(FrameData &frameData)
   endInfo.layerCount = 1;
   endInfo.layers = &layer;
   XrResult result = xrEndFrame(oxrSession, &endInfo);
+  frameIsOpen = false;
   if (result == XR_ERROR_SESSION_NOT_RUNNING)
     logdbg("[XR][device] OpenXR session ended during frame rendering. This is normal, but according to the specs, "
            "every successful xrBeginFrame call has to have a matching xrEndFrame call anyway.");
@@ -1728,8 +1911,10 @@ void OpenXRDevice::preRecovery()
 {
   logdbg("[XR][device] preRecovery");
   tearDownScreenMaskResources();
+  finishPendingFrame();
+  endSession();
   tearDownSwapchains();
-  tearDownSession();
+  destroySession();
   tearDownInstance();
 }
 
@@ -1740,7 +1925,6 @@ void OpenXRDevice::recovery()
   getAdapterId();
   setUpSession();
   setUpSwapchains();
-  setUpSwapchainImages();
 }
 
 bool OpenXRDevice::hasScreenMask()

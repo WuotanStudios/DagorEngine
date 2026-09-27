@@ -3,6 +3,7 @@
 #include "das_ecs.h"
 #include <util/dag_string.h>
 #include <dasModules/dasEvent.h>
+#include <dasModules/dasAotErrorsLog.h>
 #include <dasModules/dasScriptsLoader.h>
 #include <dasModules/dasCreatingTemplate.h>
 #include <dasModules/aotEcs.h>
@@ -24,7 +25,6 @@
 #include <daScript/daScript.h>
 #include <daScript/simulate/bin_serializer.h>
 #include <daECS/core/coreEvents.h>
-#include <daScript/misc/smart_ptr.h>
 #include <daScript/misc/sysos.h>
 #include <daScript/simulate/aot_builtin_debugger.h>
 #include <ecs/scripts/dascripts.h>
@@ -48,6 +48,7 @@
 ECS_REGISTER_EVENT(EventDaScriptReloaded);
 
 extern void require_project_specific_debugger_modules();
+extern bool NEED_DAS_AOT_COMPILE;
 
 namespace workcycle_internal
 {
@@ -106,6 +107,15 @@ ESModuleGroupData *getGroupData(das::ModuleGroup &group)
 
 struct LoadedScript;
 
+// The LLVM object driver compiles several inputs in one process, so a file another input requires
+// is compiled twice and the second pass meets its own systems. C++ AOT reports that through
+// das::is_in_aot().
+static bool is_emitting_aot_object()
+{
+  const das::daScriptEnvironment *env = das::daScriptEnvironment::getBound();
+  return env && env->g_Program && env->g_Program->policies.jit_emit_object;
+}
+
 static das::daScriptEnvironment *mainThreadBound = nullptr;
 static das::daScriptEnvironment *debuggerEnvironment = nullptr;
 static AotMode globally_aot_mode = AotMode::AOT;
@@ -116,6 +126,8 @@ static int globally_load_threads_num = 1;
 static bool globally_loading_in_queue = false;
 static eastl::string globally_thread_init_script;
 static ResolveECS globally_resolve_ecs_on_load = ResolveECS::YES;
+static bool globally_very_safe_context = false;
+static bool globally_force_inscope_pod = false;
 static int verboseExceptions = 4;
 static das::vector<eastl::string> loadingQueue;
 #if DAGOR_DBGLEVEL > 0
@@ -125,8 +137,8 @@ using DasWorkerContextsArray = eastl::array<eastl::unique_ptr<bind_dascript::EsC
 static DasWorkerContextsArray cachedWorkerContexts;
 static OSSpinlock esDescsAllocatorLock;
 static OSSpinlock esQueryDescsAllocatorLock;
-static FixedBlockAllocator esDescsAllocator(sizeof(EsDesc), 1024);
-static FixedBlockAllocator esQueryDescsAllocator(sizeof(EsQueryDesc), 1024);
+static FixedBlockAllocator esDescsAllocator(sizeof(EsDesc), 2048);
+static FixedBlockAllocator esQueryDescsAllocator(sizeof(EsQueryDesc), 1024 + 512);
 void EsDescDeleter::operator()(EsDesc *p)
 {
   if (p)
@@ -168,6 +180,7 @@ static void das_es_on_update_empty(const ecs::UpdateStageInfo &info, const ecs::
 static bool alwaysUseMainThreadEnv = true;
 static bool workerThreadsMode = false;
 static bool isInDocumentation = false;
+static bool enableDasRtti = false;
 
 bool get_always_use_main_thread_env() { return alwaysUseMainThreadEnv; }
 
@@ -178,28 +191,33 @@ void set_worker_threads_mode(bool on) { workerThreadsMode = on; }
 bool is_in_worker_threads_mode() { return workerThreadsMode; }
 
 bool is_in_documentation() { return isInDocumentation; }
+bool enable_das_rtti() { return enableDasRtti; }
 
-struct RAIIDasEnvBound
+bool set_enable_das_rtti(bool value)
 {
-  das::daScriptEnvironment *savedBound = nullptr;
-  RAIIDasEnvBound()
+  const bool res = enableDasRtti;
+  enableDasRtti = value;
+  return res;
+}
+
+RAIIDasEnvBound::RAIIDasEnvBound()
+{
+  if (alwaysUseMainThreadEnv)
   {
-    if (alwaysUseMainThreadEnv)
+    G_ASSERT(mainThreadBound);
+    if (!is_main_thread())
     {
-      G_ASSERT(mainThreadBound);
-      if (!is_main_thread())
-      {
-        savedBound = *das::daScriptEnvironment::bound; // Preserve old value for nested ESes
-        *das::daScriptEnvironment::bound = mainThreadBound;
-      }
+      savedBound = das::daScriptEnvironment::getBound(); // Preserve old value for nested ESes
+      das::daScriptEnvironment::setBound(mainThreadBound);
     }
-  };
-  ~RAIIDasEnvBound()
-  {
-    if (alwaysUseMainThreadEnv && !is_main_thread())
-      *das::daScriptEnvironment::bound = savedBound;
-  };
-};
+  }
+}
+
+RAIIDasEnvBound::~RAIIDasEnvBound()
+{
+  if (alwaysUseMainThreadEnv && !is_main_thread())
+    das::daScriptEnvironment::setBound(savedBound);
+}
 
 struct RAIIContextMgr
 {
@@ -221,6 +239,7 @@ struct UpdateStageInfoActAnnotation final : das::ManagedStructureAnnotation<ecs:
     cppName = " ::ecs::UpdateStageInfoAct";
     addField<DAS_BIND_MANAGED_FIELD(dt)>("dt");
     addField<DAS_BIND_MANAGED_FIELD(curTime)>("curTime");
+    addField<DAS_BIND_MANAGED_FIELD(curTimeD)>("curTimeD");
   }
 };
 
@@ -326,22 +345,26 @@ void BaseEsDesc::resolveUnresolvedOutOfLine(ecs::EntityManager *mgr)
 {
   if (!mgr)
     return;
-  resolved = true;
+  bool allResolved = true;
   for (uint32_t c = 0, e = dataCompCount(); c != e; ++c)
   {
     uint32_t a = argIndices[c];
-    if (stride[a]) // already resolved
+    if (interlocked_acquire_load(stride[a])) // already resolved; pairs with the release store below
       continue;
     ecs::type_index_t tpidx = mgr->getComponentTypes().findType(components[c].type);
     if (tpidx == ecs::INVALID_COMPONENT_TYPE_INDEX) // this could happen here, if and only if data is optional
     {
-      resolved = false;
+      allResolved = false;
       continue;
     }
     ecs::ComponentType tpInfo = mgr->getComponentTypes().getTypeInfo(tpidx);
     flags[a] |= (tpInfo.flags & (ecs::COMPONENT_TYPE_BOXED | ecs::COMPONENT_TYPE_CREATE_ON_TEMPL_INSTANTIATE)) ? BOXED_SRC : 0;
-    stride[a] = tpInfo.size;
+    // release marks the component resolved for concurrent resolvers: a racing thread that observes
+    // nonzero stride via the acquire above is guaranteed to also see flags[a]
+    interlocked_release_store(stride[a], tpInfo.size);
   }
+  // release-publish only after all strides/flags are written (paired with acquire in isResolved)
+  interlocked_release_store(resolved, allResolved ? 1 : 0);
 }
 
 void make_string_outer_ns(das::string &typeName)
@@ -457,7 +480,7 @@ bool get_underlying_ecs_type_with_string(const das::TypeDecl &info, das::string 
     type = das::tString;
     return true;
   }
-  return get_underlying_ecs_type(*info.firstType.get(), str, type, module_name);
+  return get_underlying_ecs_type(*info.firstType, str, type, module_name);
 }
 
 static bool get_default_ecs_value(das::Type type, das::TextWriter &str, vec4f init, int index)
@@ -511,7 +534,7 @@ static bool get_default_ecs_value(das::TypeDecl &info, das::TextWriter &str, das
 {
   if (initExpr->rtti_isConstant() && initExpr->rtti_isStringConstant())
   {
-    str << "\tauto __def_comp" << index << " = \"" << das::static_pointer_cast<das::ExprConstString>(initExpr)->text << "\";\n";
+    str << "\tauto __def_comp" << index << " = \"" << static_cast<das::ExprConstString *>(initExpr)->text << "\";\n";
     return true;
   }
   if (info.baseType == das::Type::tHandle)
@@ -582,7 +605,6 @@ bool build_components_table(const char *name, BaseEsDesc &desc, Container &comps
   uint8_t *__restrict flags = (uint8_t *)alloca(arguments.size() * sizeof(uint8_t));       // more than enough
   uint32_t optCount = 0;
   das::string typeName;
-  das::string cerr;
   for (auto argI = arguments.begin() + start_arg, argE = arguments.end(); argI != argE; ++argI)
   {
     const auto &arg = *argI;
@@ -636,17 +658,17 @@ bool build_components_table(const char *name, BaseEsDesc &desc, Container &comps
       if (arg->init->rtti_isConstant())
       {
         if (!arg->init->rtti_isStringConstant())
-          def = das::static_pointer_cast<das::ExprConst>(arg->init)->value;
+          def = static_cast<das::ExprConst *>(arg->init)->value;
         else
         {
-          desc.defStrings.emplace_back(das::static_pointer_cast<das::ExprConstString>(arg->init)->text.c_str());
+          desc.defStrings.emplace_back(static_cast<das::ExprConstString *>(arg->init)->text.c_str());
           def = das::cast<char *>::from(desc.defStrings.back().c_str());
         }
         isOptional = true;
       }
       else if (!arg->init->type->isRefType() && arg->init->noSideEffects && arg->init->rtti_isVar() &&
-               das::static_pointer_cast<das::ExprVar>(arg->init)->isGlobalVariable() &&
-               das::static_pointer_cast<das::ExprVar>(arg->init)->variable->type->constant)
+               static_cast<das::ExprVar *>(arg->init)->isGlobalVariable() &&
+               static_cast<das::ExprVar *>(arg->init)->variable->type->constant)
       {
         if (arg->type->ref)
         {
@@ -654,14 +676,14 @@ bool build_components_table(const char *name, BaseEsDesc &desc, Container &comps
         }
         else
         {
-          auto var = das::static_pointer_cast<das::ExprVar>(arg->init)->variable;
+          auto var = static_cast<das::ExprVar *>(arg->init)->variable;
           if (var->init->rtti_isConstant())
           {
             if (!var->init->rtti_isStringConstant())
-              def = das::static_pointer_cast<das::ExprConst>(var->init)->value;
+              def = static_cast<das::ExprConst *>(var->init)->value;
             else
             {
-              desc.defStrings.emplace_back(das::static_pointer_cast<das::ExprConstString>(var->init)->text.c_str());
+              desc.defStrings.emplace_back(static_cast<das::ExprConstString *>(var->init)->text.c_str());
               def = das::cast<char *>::from(desc.defStrings.back().c_str());
             }
             isOptional = true;
@@ -669,7 +691,7 @@ bool build_components_table(const char *name, BaseEsDesc &desc, Container &comps
           else
           {
             das::Context ctx;
-            auto node = var->init->simulate(ctx);
+            auto node = das::simulateExpression(ctx, var->init);
             ctx.restart();
             vec4f result = ctx.evalWithCatch(node);
             if (ctx.getException())
@@ -817,13 +839,17 @@ uint32_t ESModuleGroupData::es_resolve_function_ptrs(EsContext *ctx, dag::Vector
     // ctor puts system to the list
     const bool isDasEvent = i.first->typeInfo != nullptr;
     totalSystems++;
-    aotSystems += i.first->functionPtr->aot ? 1 : 0;
+    const bool isCompiled = i.first->functionPtr->aot || i.first->functionPtr->jit;
+    aotSystems += isCompiled ? 1 : 0;
 #if DAGOR_DBGLEVEL > 1 || DAECS_EXTENSIVE_CHECKS // we can't get logs from consoles in release
-    if (!i.first->functionPtr->aot && aot_mode_is_required == AotModeIsRequired::YES)
+    // Only complain about a missing AOT entry when this binary was built with AOT
+    // codegen linked in (per jamfile's $(NeedDasAotCompile) selecting aot.cpp vs
+    // aotstub.cpp); otherwise every non-debug ES would log a line per reload.
+    if (!isCompiled && aot_mode_is_required == AotModeIsRequired::YES && ::NEED_DAS_AOT_COMPILE)
       debug("daScript: register_es %s<%s>%s, with 0x%X update mask and %d%s events before<%s> after<%s> tags=<%s> , tracked "
             "components=<%s> "
             "%d components",
-        i.first->functionPtr->aot ? "AOT:" : "INTERPRET:", i.second.c_str(), fn ? fn : "", i.first->stageMask, i.first->evtMask.size(),
+        isCompiled ? "AOT:" : "INTERPRET:", i.second.c_str(), fn ? fn : "", i.first->stageMask, i.first->evtMask.size(),
         isDasEvent ? " scripted" : " core", i.first->beforeList.c_str(), i.first->afterList.c_str(), i.first->tagsList.c_str(),
         i.first->trackedList.c_str(), i.first->base.components.size());
 #endif
@@ -869,9 +895,9 @@ static bool build_es(BaseEsDesc &esDesc, const char *debug_name, const das::vect
   if (!err.empty())
     return false;
   components_from_list(args, "REQUIRE", components, argStrings);
-  esDesc.ends[BaseEsDesc::RQ_END] = components.size();
+  esDesc.ends[BaseEsDesc::RQ_END] = (uint16_t)components.size();
   components_from_list(args, "REQUIRE_NOT", components, argStrings);
-  esDesc.ends[BaseEsDesc::NO_END] = components.size();
+  esDesc.ends[BaseEsDesc::NO_END] = (uint16_t)components.size();
   esDesc.components.assign(components.begin(), components.end());
   return true;
 };
@@ -1006,7 +1032,11 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
         ecs::find_if_systems([&func](ecs::EntitySystemDesc *desc) { return strcmp(desc->name, func->name.c_str()) == 0; });
       if (desc)
       {
-        if (!entity_system_is_das(desc) || ((EsDesc *)desc->getUserData())->hashedScriptName != mg.hashedScriptName)
+        // `mg.hashedScriptName` is zero during AOT compilation.
+        // If we mix AOT and regular script launch (using das_scripts.cpp)
+        // we get different `mg.hashedScriptName`.
+        if (!entity_system_is_das(desc) || (((EsDesc *)desc->getUserData())->hashedScriptName != mg.hashedScriptName &&
+                                             (mg.hashedScriptName != 0 || !(das::is_in_aot() || is_emitting_aot_object()))))
         {
           err = "es <" + func->name + "> is already registered in other file";
           if (desc->getModuleName())
@@ -1070,7 +1100,6 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
 
 #if ES_TO_QUERY
     get_underlying_ecs_type(*func->arguments[0]->type, stageName, dasType);
-    das::string typeName;
     const bool hasManager = func->arguments.size() > start_arg && is_entity_manager(*func->arguments[start_arg]->type);
     // if (valid_stage_name(stageName))
     if (func->arguments.size() > (hasManager ? 2 : 1)) //!!
@@ -1085,9 +1114,9 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
       //  def funName(info:ecs::UpdateStageInfoAct; var qv:QueryView) // note, no more arguments
       //     ecs::process_view(qv) <| $( clone of function arguments, but first )
       //         clone of function body
-      auto cle = das::make_smart<das::ExprCall>(func->at, "ecs::process_view");
+      auto cle = new das::ExprCall(func->at, "ecs::process_view");
       cle->generated = true;
-      auto blk = das::make_smart<das::ExprBlock>();
+      auto blk = new das::ExprBlock();
       blk->at = func->at;
       blk->isClosure = true;
       bool first = true;
@@ -1106,8 +1135,8 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
           first = false;
         }
       }
-      blk->returnType = das::make_smart<das::TypeDecl>(das::Type::tVoid);
-      auto ann = das::make_smart<das::AnnotationDeclaration>();
+      blk->returnType = new das::TypeDecl(das::Type::tVoid);
+      auto ann = new das::AnnotationDeclaration();
       ann->annotation = this;
       ann->arguments = args;
       ann->arguments.push_back(das::AnnotationArgument("fn_name", func->name));
@@ -1116,22 +1145,22 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
       // to be uncommented when function can start skipping block interface and would generate lambda access directly
       // blk->aotSkipMakeBlock = true;
 
-      auto mkb = das::make_smart<das::ExprMakeBlock>(func->at, blk);
+      auto mkb = new das::ExprMakeBlock(func->at, blk);
       mkb->generated = true;
-      auto vinfo = das::make_smart<das::ExprVar>(func->at, "qv");
+      auto vinfo = new das::ExprVar(func->at, "qv");
       vinfo->generated = true;
 
       cle->arguments.push_back(vinfo);
       cle->arguments.push_back(mkb);
-      cle->arguments.push_back(das::make_smart<das::ExprConstUInt64>(das::hash_blockz64((const uint8_t *)tw.str().c_str())));
-      auto cleb = das::make_smart<das::ExprBlock>();
+      cle->arguments.push_back(new das::ExprConstUInt64(func->at, das::hash_blockz64((const uint8_t *)tw.str().c_str())));
+      auto cleb = new das::ExprBlock();
       cleb->generated = true;
-      cleb->at = func->body ? func->body->at : func->at;
+      cleb->at = func->body->at;
       cleb->list.push_back(cle);
       func->body = cleb;
       func->arguments.resize(1);
 
-      auto pVar = das::make_smart<das::Variable>();
+      auto pVar = new das::Variable();
       pVar->generated = true;
       pVar->at = func->at;
       pVar->name = "qv";
@@ -1151,11 +1180,12 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
     if (das::is_in_completion() || isInDocumentation)
       return true;
     ESModuleGroupData &mg = *getGroupData(mg_); // -V522
-    EsDescUP esDesc;
-    {
-      OSSpinlockScopedLock lock(esDescsAllocatorLock);
-      esDesc.reset(new (esDescsAllocator.allocateOneBlock(), _NEW_INPLACE) EsDesc());
-    }
+    EsDescUP esDesc(new (
+      [] {
+        OSSpinlockScopedLock lock(esDescsAllocatorLock);
+        return esDescsAllocator.allocateOneBlock();
+      }(),
+      _NEW_INPLACE) EsDesc{});
     esDesc->hashedScriptName = mg.hashedScriptName;
     const das::vector<das::VariablePtr> *arguments_ = &func->arguments;
     int startId = 1;
@@ -1165,16 +1195,16 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
     if (func->arguments.size() > (hasManager ? 2 : 1))
     {
       G_ASSERT(func->body->rtti_isBlock());
-      auto cleb = das::static_pointer_cast<das::ExprBlock>(func->body);
+      auto cleb = static_cast<das::ExprBlock *>(func->body);
 
       G_ASSERT(cleb->list[0]->rtti_isCall());
-      auto cle = das::static_pointer_cast<das::ExprCall>(cleb->list[0]);
+      auto cle = static_cast<das::ExprCall *>(cleb->list[0]);
 
       G_ASSERT(cle->arguments[1]->rtti_isMakeBlock());
-      auto mkBlock = das::static_pointer_cast<das::ExprMakeBlock>(cle->arguments[1]);
+      auto mkBlock = static_cast<das::ExprMakeBlock *>(cle->arguments[1]);
 
       G_ASSERT(mkBlock->block->rtti_isBlock());
-      auto block = das::static_pointer_cast<das::ExprBlock>(mkBlock->block);
+      auto block = static_cast<das::ExprBlock *>(mkBlock->block);
       arguments_ = &block->arguments;
       startId = 0;
     }
@@ -1309,11 +1339,12 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
     ESModuleGroupData &mg = *getGroupData(mg_); // -V522
     das::string blockName;
     blockName.append_sprintf("query_%s_l%d", block->at.fileInfo->name.c_str(), block->at.line);
-    EsQueryDescUP desc;
-    {
-      OSSpinlockScopedLock lock(esQueryDescsAllocatorLock);
-      desc.reset(new (esQueryDescsAllocator.allocateOneBlock(), _NEW_INPLACE) EsQueryDesc(mg.mgr));
-    }
+    EsQueryDescUP desc(new (
+      [] {
+        OSSpinlockScopedLock lock(esQueryDescsAllocatorLock);
+        return esQueryDescsAllocator.allocateOneBlock();
+      }(),
+      _NEW_INPLACE) EsQueryDesc(mg.mgr));
     if (!build_es(desc->base, blockName.c_str(), block->arguments, args, 0, err, progArgs.getBoolOption("can_trust_access", true),
           mg.argStrings))
     {
@@ -1328,7 +1359,7 @@ struct EsFunctionAnnotation final : das::FunctionAnnotation
 
     block->annotationDataSid = das::hash_blockz64((uint8_t *)mangledName.c_str());
     block->annotationData = uintptr_t(desc.get()); // todo: add indirection to control pointers
-    auto program = (*das::daScriptEnvironment::bound)->g_Program;
+    auto program = das::daScriptEnvironment::getBound()->g_Program;
     const bool promoteToBuiltin = program->promoteToBuiltin;
     desc->shared = promoteToBuiltin;
     mg.unresolvedQueries.emplace_back(QueryData{blockName, eastl::move(desc)});
@@ -1387,17 +1418,6 @@ void shutdown_systems()
     G_VERIFY(esQueryDescsAllocator.clear() == 0);
   }
   das::Module::Shutdown();
-
-#if DAS_SMART_PTR_TRACKER
-  if (das::g_smart_ptr_total > 0)
-    debug("smart pointers leaked: %@", uint64_t(das::g_smart_ptr_total));
-
-#if DAS_SMART_PTR_ID
-  debug("leaked ids:");
-  for (auto it : das::ptr_ref_count::ref_count_ids)
-    debug("0x%X", it);
-#endif
-#endif
 
   if (debuggerEnvironment)
   {
@@ -1486,11 +1506,12 @@ void collect_heap(float mem_scale_threshold, ValidateDasGC validate)
 
 bool load_das_script(const char *name, const char *program_text)
 {
-  auto access = das::make_smart<DagFileAccess>(scripts.getFileAccess(), globally_hot_reload);
+  auto access = new DagFileAccess(scripts.getFileAccess(), globally_hot_reload);
   das::string fname = das::string("inplace:") + name;
   access->setFileInfo(fname, das::make_unique<das::TextFileInfo>(program_text, strlen(program_text), false));
   return scripts.loadScript(fname, access,
-    LoadScriptCtx{globally_aot_mode, globally_resolve_ecs_on_load, globally_log_aot_errors, globally_das_syntax});
+    LoadScriptCtx{globally_aot_mode, globally_resolve_ecs_on_load, globally_log_aot_errors, globally_das_syntax, EnableDebugger::NO,
+      nullptr, false, globally_very_safe_context, globally_force_inscope_pod});
 }
 
 static inline bool internal_load_das_script_sync(const char *fname, ResolveECS resolve_ecs)
@@ -1500,8 +1521,9 @@ static inline bool internal_load_das_script_sync(const char *fname, ResolveECS r
   DA_PROFILE_TAG(file_name, fname);
   String tmpPath;
   return scripts.loadScript(dd_resolve_named_mount(tmpPath, fname) ? tmpPath.c_str() : fname,
-    das::make_smart<DagFileAccess>(scripts.getFileAccess(), globally_hot_reload),
-    LoadScriptCtx{globally_aot_mode, resolve_ecs, globally_log_aot_errors, globally_das_syntax});
+    new DagFileAccess(scripts.getFileAccess(), globally_hot_reload),
+    LoadScriptCtx{globally_aot_mode, resolve_ecs, globally_log_aot_errors, globally_das_syntax, EnableDebugger::NO, nullptr, false,
+      globally_very_safe_context, globally_force_inscope_pod});
 }
 
 bool load_das_script(const char *fname)
@@ -1530,6 +1552,7 @@ bool load_das_script_debugger(const char *fname)
   {
     bind_dascript::pull_das();
     require_project_specific_debugger_modules();
+    das::Module::Initialize();
   }
   const bool ok = internal_load_das_script_sync(fname, ResolveECS::YES);
   debuggerEnvironment = *das::daScriptEnvironment::owned;
@@ -1571,9 +1594,9 @@ bool reload_das_debug_script(const char *fname, bool debug)
     return true;
   }
   ScopedMultipleScripts scope;
-  return scripts.loadScript(fname, das::make_smart<DagFileAccess>(scripts.getFileAccess(), globally_hot_reload),
+  return scripts.loadScript(fname, new DagFileAccess(scripts.getFileAccess(), globally_hot_reload),
     LoadScriptCtx{globally_aot_mode, ResolveECS::YES, globally_log_aot_errors, globally_das_syntax,
-      debug ? EnableDebugger::YES : EnableDebugger::NO});
+      debug ? EnableDebugger::YES : EnableDebugger::NO, nullptr, false, globally_very_safe_context, globally_force_inscope_pod});
 }
 bool find_loaded_das_script(const eastl::function<bool(const char *, das::Context &, das::smart_ptr<das::Program>)> &cb)
 {
@@ -1594,7 +1617,9 @@ struct DascriptLoadJob final : public DaThread
   bool enableStackFill = true;
   int count = 0;
   bool success = true;
-#if DAGOR_ADDRESS_SANITIZER || DAGOR_DBGLEVEL > 1
+
+#if DAGOR_DBGLEVEL > 1 || ((defined(__clang__) || defined(__GNUC__)) && !defined(__OPTIMIZE__)) || DAGOR_ADDRESS_SANITIZER || \
+  DAGOR_THREAD_SANITIZER
   static constexpr size_t threadStackSize = DaThread::DEFAULT_STACK_SZ * 4;
 #else
   static constexpr size_t threadStackSize = DaThread::DEFAULT_STACK_SZ + DaThread::DEFAULT_STACK_SZ / 4;
@@ -1615,12 +1640,12 @@ struct DascriptLoadJob final : public DaThread
   void do_work(Scripts &local_scripts, das::vector<das::string> &file_names)
   {
     StackFillRAII fillStack(enableStackFill);
-    (*das::daScriptEnvironment::bound)->g_resolve_annotations = false;
+    das::daScriptEnvironment::getBound()->g_resolve_annotations = false;
     if (!globally_thread_init_script.empty())
     {
       TIME_PROFILE(loadScript)
       DA_PROFILE_TAG(file_name, globally_thread_init_script.c_str());
-      auto file_access = das::make_smart<DagFileAccess>(local_scripts.getFileAccess(), globally_hot_reload);
+      auto file_access = new DagFileAccess(local_scripts.getFileAccess(), globally_hot_reload);
       success = local_scripts.loadScript(globally_thread_init_script, file_access, ctx) && success;
     }
     while (true)
@@ -1630,11 +1655,11 @@ struct DascriptLoadJob final : public DaThread
         break;
       TIME_PROFILE(loadScript)
       DA_PROFILE_TAG(file_name, file_names[i].c_str());
-      auto file_access = das::make_smart<DagFileAccess>(local_scripts.getFileAccess(), globally_hot_reload);
+      auto file_access = new DagFileAccess(local_scripts.getFileAccess(), globally_hot_reload);
       success = local_scripts.loadScript(file_names[i], file_access, ctx) && success;
       count++;
     }
-    (*das::daScriptEnvironment::bound)->g_resolve_annotations = true;
+    das::daScriptEnvironment::getBound()->g_resolve_annotations = true;
   }
 
   void execute() override
@@ -1654,12 +1679,12 @@ struct DascriptLoadJob final : public DaThread
       localScripts.thisThreadDone();
     }
 
-    G_ASSERT(*das::daScriptEnvironment::owned == *das::daScriptEnvironment::bound);
-    G_ASSERT(!!*das::daScriptEnvironment::owned);
-    environment = *das::daScriptEnvironment::owned;
+    G_ASSERT(das::daScriptEnvironment::getOwned() == das::daScriptEnvironment::getBound());
+    G_ASSERT(!!das::daScriptEnvironment::getOwned());
+    environment = das::daScriptEnvironment::getOwned();
 
-    *das::daScriptEnvironment::owned = nullptr;
-    *das::daScriptEnvironment::bound = nullptr;
+    das::daScriptEnvironment::setOwned(nullptr);
+    das::daScriptEnvironment::setBound(nullptr);
     debug("dascript: queue: job loaded ok? %@ in %@ ms %@ files", success, profile_time_usec(startTime) / 1000, count);
   }
 };
@@ -1694,17 +1719,19 @@ static bool load_scripts_from_serialized_data()
   }
   for (const das::string &name : filenames)
   {
-    auto file_access = das::make_smart<DagFileAccess>(scripts.getFileAccess(), globally_hot_reload);
+    auto file_access = new DagFileAccess(scripts.getFileAccess(), globally_hot_reload);
     ok = scripts.loadScript(name, file_access,
-           LoadScriptCtx{globally_aot_mode, ResolveECS::NO, globally_log_aot_errors, globally_das_syntax}) &&
+           LoadScriptCtx{globally_aot_mode, ResolveECS::NO, globally_log_aot_errors, globally_das_syntax, EnableDebugger::NO, nullptr,
+             false, globally_very_safe_context, globally_force_inscope_pod}) &&
          ok;
   }
   // clean up module memory
   for (auto &[name, script] : scripts.scripts)
   {
-    if (enableSerialization && script.program && !script.program->options.getBoolOption("rtti", false) && !das::is_in_aot())
+    if (enableSerialization && script.program && !script.program->options.getBoolOption("rtti", script.program->policies.rtti) &&
+        !das::is_in_aot())
       script.program.reset();
-    if (script.moduleGroup)
+    if (script.moduleGroup && !enable_das_rtti())
       script.moduleGroup->reset();
   }
   // collect created file infos that no module owns
@@ -1754,7 +1781,8 @@ bool stop_loading_queue(TInitDas init, void *user_data)
   debug("dascript: queue: init %@ jobs", numJobs);
   dag::RelocatableFixedVector<DascriptLoadJob, 4, true> jobs;
   jobs.reserve(numJobs);
-  LoadScriptCtx ctx{globally_aot_mode, ResolveECS::NO, globally_log_aot_errors, globally_das_syntax};
+  LoadScriptCtx ctx{globally_aot_mode, ResolveECS::NO, globally_log_aot_errors, globally_das_syntax, EnableDebugger::NO, nullptr,
+    false, globally_very_safe_context, globally_force_inscope_pod};
   ctx.userData = user_data;
   for (int i = 0; i < numJobs; ++i)
   {
@@ -1794,12 +1822,14 @@ bool stop_loading_queue(TInitDas init, void *user_data)
       if (script.program)
         *initSerializer << fname;
     }
+    const bool verboseSerialization = ::dgs_get_settings()->getBlockByNameEx("debug")->getBool("verboseDasSerialization", false);
     for (auto &fname : queue)
     {
       auto &script = scripts.scripts[fname];
       if (script.program)
       {
-        debug("das: serialize: Serializing file %s", fname);
+        if (verboseSerialization)
+          debug("das: serialize: Serializing file %s", fname);
         initSerializer->serializeScript(script.program);
       }
     }
@@ -1808,10 +1838,9 @@ bool stop_loading_queue(TInitDas init, void *user_data)
   // clean up module memory
   for (auto &[fname, script] : scripts.scripts)
   {
-    if (script.program)
+    if (script.program && !script.program->options.getBoolOption("rtti", script.program->policies.rtti) && !das::is_in_aot())
     {
-      if (!script.program->options.getBoolOption("rtti", false) && !das::is_in_aot())
-        script.program.reset();
+      script.program.reset();
       if (script.moduleGroup)
         script.moduleGroup->reset();
     }
@@ -1824,8 +1853,8 @@ bool stop_loading_queue(TInitDas init, void *user_data)
       das::daScriptEnvironment *jobEnv = jobs[i].environment;
       if (jobEnv) // if jobEnv is nullptr, it means that job was not started
       {
-        *das::daScriptEnvironment::owned = jobEnv;
-        *das::daScriptEnvironment::bound = jobEnv;
+        das::daScriptEnvironment::setOwned(jobEnv);
+        das::daScriptEnvironment::setBound(jobEnv);
         das::Module::CollectFileInfo(scripts.orphanFileInfos);
         das::Module::Shutdown();
       }
@@ -1847,8 +1876,9 @@ static bool internal_load_entry_script(const char *fname)
 {
   TIME_PROFILE(internal_load_entry_script)
   DA_PROFILE_TAG(file_name, fname);
-  const bool res = scripts.loadScript(fname, das::make_smart<DagFileAccess>(scripts.getFileAccess(), globally_hot_reload),
-    LoadScriptCtx{globally_aot_mode, ResolveECS::NO, globally_log_aot_errors, globally_das_syntax});
+  const bool res = scripts.loadScript(fname, new DagFileAccess(scripts.getFileAccess(), globally_hot_reload),
+    LoadScriptCtx{globally_aot_mode, ResolveECS::NO, globally_log_aot_errors, globally_das_syntax, EnableDebugger::NO, nullptr, false,
+      globally_very_safe_context, globally_force_inscope_pod});
   return res;
 }
 
@@ -2043,7 +2073,7 @@ bool main_thread_post_load()
   const bool res = scripts.mainThreadDone();
   dump_statistics();
 
-  mainThreadBound = *das::daScriptEnvironment::bound;
+  mainThreadBound = das::daScriptEnvironment::getBound();
   G_ASSERT(mainThreadBound);
 
   return res;
@@ -2067,6 +2097,9 @@ static void es_run(const char *name, const das::Block &block, const das::LineInf
   if (esData.useManager)
     allArgs[has_info ? 1 : 0] = das::cast<ecs::EntityManager *>::from(&qv.manager());
 
+  // must precede the stride[] reads below; todo: this can also be removed by re-registering es if fully resolved
+  esData.ensureResolved(context.mgr);
+
   uint16_t *__restrict stride = esData.stride.get();
   uint8_t *__restrict flags = esData.flags.get();
   const uint8_t combinedFlags = esData.combinedFlags;
@@ -2083,8 +2116,6 @@ static void es_run(const char *name, const das::Block &block, const das::LineInf
 
   if (combinedFlags & HAS_OPTIONAL)
     memcpy(_args, esData.def.get(), nAttr * sizeof(vec4f));
-
-  esData.resolveUnresolved(context.mgr); // todo:this can also be removed by re-registering es if fully resolved
 
 #if DAECS_EXTENSIVE_CHECKS
   const ecs::component_index_t *cindices = qv.manager().queryComponents(qv.getQueryId());
@@ -2194,13 +2225,13 @@ static void es_run(const char *name, const das::Block &block, const das::LineInf
 
 static bind_dascript::EsContext *create_cached_worker_context(int i)
 {
-  auto context = (bind_dascript::EsContext *)get_context(/*stack_size*/ 4 << 10);
+  auto context = (bind_dascript::EsContext *)get_context(/*stack_size*/ 0); // Use framemem stack
   context->name.sprintf("worker #%d", i);
   context->persistent = false;
-  context->heap = das::make_smart<das::LinearHeapAllocator>();
-  context->stringHeap = das::make_smart<das::LinearStringAllocator>();
-  context->heap->setInitialSize(16 * 1024);
-  context->stringHeap->setInitialSize(16 * 1024);
+  context->heap = das::make_unique<das::LinearHeapAllocator>();
+  context->stringHeap = das::make_unique<das::LinearStringAllocator>();
+  context->heap->setInitialSize(DAS_INITIAL_HEAP_SIZE);
+  context->stringHeap->setInitialSize(DAS_INITIAL_STRING_HEAP_SIZE);
   cachedWorkerContexts[i].reset(context);
   return context;
 }
@@ -2217,6 +2248,7 @@ static EsContext *get_worker_context(const ecs::QueryView &qv, const EsDesc *esD
   if (DAGOR_UNLIKELY(workerContextId >= 0))
   {
     G_ASSERTF(!esData->context->thisHelper, "helper should be null here, otherwise remove copying of thisHelper from makeWorkerFor");
+    G_FAST_ASSERT(workerContextId < cachedWorkerContexts.size());
     EsContext *context = cachedWorkerContexts[workerContextId].get();
     if (DAGOR_UNLIKELY(!context))
       context = create_cached_worker_context(workerContextId);
@@ -2277,7 +2309,7 @@ static inline void run_es_query_lambda(const ecs::QueryView &qv, const EsDesc *e
       result = context->runWithCatch(ctxLambda);
 #if DAGOR_DBGLEVEL > 0 && TIME_PROFILER_ENABLED
   };
-  if (get_globally_enabled_aot() && !esData->functionPtr->aot)
+  if (get_globally_enabled_aot() && !esData->functionPtr->aot && !esData->functionPtr->jit)
   {
     TIME_PROFILE_DEV(das_interpret);
     runLambdaWithCatch();
@@ -2296,6 +2328,10 @@ static inline void run_es_query_lambda(const ecs::QueryView &qv, const EsDesc *e
   }
 
   context->unlock();
+
+  // Restore worker's context internal data on return from recursive calls
+  if (context != esData->context && context->code != esData->context->code)
+    context->makeWorkerFor(*esData->context);
 }
 
 
@@ -2702,9 +2738,9 @@ static bool aotEsRunBlock(das::TextWriter &ss, EsQueryDesc *desc, const bind_das
   }
   const bool doLoop = !(esType == EsType::SingleEidQuery || isEmptySystem || isUnicastSystem);
   if (doLoop)
-    body << "\tuint32_t i = qv.begin(), ie = qv.end();\n\tG_ASSERT(ie > i);\n\tdo {\n";
+    body << "\tuint32_t i = qv.begin(), ie = qv.end();\n\tG_FAST_ASSERT(ie > i);\n\tdo {\n";
   else if (!isUnicastSystem || esType == EsType::SingleEidQuery)
-    body << "\tconstexpr uint32_t i = 0;\n\tG_ASSERT(qv.end() == 1 && qv.begin() == 0);\n\t{\n";
+    body << "\tconstexpr uint32_t i = 0;\n\tG_FAST_ASSERT(qv.end() == 1 && qv.begin() == 0);\n\t{\n";
   else
     body << "\tconstexpr uint32_t i = 0;\n\t{\n";
 
@@ -2712,7 +2748,7 @@ static bool aotEsRunBlock(das::TextWriter &ss, EsQueryDesc *desc, const bind_das
   if (esType == EsType::FindQuery)
     // ss << "if (ecs::QueryCbResult::Stop == (ecs::QueryCbResult)";//should be
     body << "if ((bool)"; // should be
-  body << "block(\n";
+  body << "dagor_es_callable(block)(\n";
 
   for (auto &arg : block->arguments)
   {
@@ -2855,6 +2891,19 @@ static bool aotEsRunBlock(das::TextWriter &ss, EsQueryDesc *desc, const bind_das
     ss << (esType == EsType::FindQuery ? " == ::ecs::QueryCbResult::Stop;\n" : ";\n");
   }
   ss << "}\n\n";
+  if (esType != EsType::ES)
+  {
+    // aot_cpp dedups aotPrefix by name, so a sibling call site (e.g. an inlined clone) never
+    // gets aotSkipMakeBlock set and passes a das_make_block carrying the annotation data itself
+    ss << "template<typename BT>\n__forceinline " << (hasReturn ? "bool " : "void ") << fnName << " ( ";
+    if (esType == EsType::SingleEidQuery)
+      ss << "ecs::EntityId eid, ";
+    ss << "const BT & block, das::Context * __restrict __context, das::LineInfoArg * __restrict __line )\n{\n";
+    ss << "\t" << (hasReturn ? "return " : "") << fnName << "(";
+    if (esType == EsType::SingleEidQuery)
+      ss << "eid, ";
+    ss << "block.annotationData, block, __context, __line);\n}\n\n";
+  }
   return true;
 }
 
@@ -2905,8 +2954,8 @@ struct EsRunFunctionAnnotation : das::FunctionAnnotation
       err = "ES Query can only accept explicitly declare [es] block";
       return false;
     }
-    auto mb = das::static_pointer_cast<das::ExprMakeBlock>(call->arguments[blockArgIdx]);
-    das::ExprBlock *closure = (das::ExprBlock *)mb->block.get();
+    auto mb = static_cast<das::ExprMakeBlock *>(call->arguments[blockArgIdx]);
+    das::ExprBlock *closure = (das::ExprBlock *)mb->block;
     auto esA =
       eastl::find_if(closure->annotations.begin(), closure->annotations.end(), [](auto &a) { return a->annotation->name == "es"; });
     if (esA == closure->annotations.end())
@@ -2935,15 +2984,15 @@ struct EsRunFunctionAnnotation : das::FunctionAnnotation
   virtual das::string aotName(das::ExprCallFunc *call) override
   {
     const uint32_t blockArgIdx = ArgsOffset + (esType != EsType::ES && esType != EsType::SingleEidQuery ? 0 : 1);
-    auto mb = das::static_pointer_cast<das::ExprMakeBlock>(call->arguments[blockArgIdx]);
-    das::ExprBlock *closure = (das::ExprBlock *)mb->block.get();
+    auto mb = static_cast<das::ExprMakeBlock *>(call->arguments[blockArgIdx]);
+    das::ExprBlock *closure = (das::ExprBlock *)mb->block;
     return aotEsRunBlockName(closure, esType);
   }
   const bind_dascript::EsDesc *getEsDesc(const das::AnnotationList &annotations) const
   {
     if (esType != EsType::ES)
       return nullptr;
-    for (const das::smart_ptr<das::AnnotationDeclaration> &annotation : annotations)
+    for (const das::AnnotationDeclarationPtr &annotation : annotations)
     {
       if (annotation->annotation->name != "es")
         continue;
@@ -2951,7 +3000,7 @@ struct EsRunFunctionAnnotation : das::FunctionAnnotation
       {
         if (argument.name != "fn_name")
           continue;
-        const das::ModuleGroup *moduleGroup = (*das::daScriptEnvironment::bound)->g_Program->thisModuleGroup;
+        const das::ModuleGroup *moduleGroup = das::daScriptEnvironment::getBound()->g_Program->thisModuleGroup;
         const ESModuleGroupData *gd = (ESModuleGroupData *)moduleGroup->getUserData("es");
         for (const auto &es : gd->unresolvedEs)
           if (es.second == argument.sValue)
@@ -2964,8 +3013,8 @@ struct EsRunFunctionAnnotation : das::FunctionAnnotation
   virtual void aotPrefix(das::TextWriter &ss, das::ExprCallFunc *call) override
   {
     const uint32_t blockArgIdx = ArgsOffset + (esType != EsType::ES && esType != EsType::SingleEidQuery ? 0 : 1);
-    auto mb = das::static_pointer_cast<das::ExprMakeBlock>(call->arguments[blockArgIdx]);
-    das::ExprBlock *closure = (das::ExprBlock *)mb->block.get();
+    auto mb = static_cast<das::ExprMakeBlock *>(call->arguments[blockArgIdx]);
+    das::ExprBlock *closure = (das::ExprBlock *)mb->block;
     EsQueryDesc *desc = (EsQueryDesc *)closure->annotationData;
     aotEsRunBlock(ss, desc, esType == EsType::ES ? getEsDesc(closure->annotations) : nullptr, closure, esType);
     closure->aotSkipMakeBlock = true;
@@ -2979,8 +3028,8 @@ struct EsRunFunctionAnnotation : das::FunctionAnnotation
       err = "expecting make block argument";
       return nullptr;
     }
-    auto mkb = das::static_pointer_cast<das::ExprMakeBlock>(call->arguments[blockArgIdx]);
-    auto blk = das::static_pointer_cast<das::ExprBlock>(mkb->block);
+    auto mkb = static_cast<das::ExprMakeBlock *>(call->arguments[blockArgIdx]);
+    auto blk = static_cast<das::ExprBlock *>(mkb->block);
     bool any = false;
     for (auto &arg : blk->arguments)
       if (!arg->can_shadow)
@@ -3018,12 +3067,12 @@ int get_das_compile_errors_count() { return scripts.compileErrorsCount; }
 
 void ECS::addES(das::ModuleLibrary &lib)
 {
-  addAnnotation(das::make_smart<UpdateStageInfoActAnnotation>(lib));
-  addAnnotation(das::make_smart<UpdateStageInfoRenderDebugAnnotation>(lib));
-  addAnnotation(das::make_smart<QueryViewAnnotation>(lib));
-  addAnnotation(das::make_smart<EntityManagerAnnotation>(lib));
+  addAnnotation(new UpdateStageInfoActAnnotation(lib));
+  addAnnotation(new UpdateStageInfoRenderDebugAnnotation(lib));
+  addAnnotation(new QueryViewAnnotation(lib));
+  addAnnotation(new EntityManagerAnnotation(lib));
 
-  addAnnotation(das::make_smart<EsFunctionAnnotation>());
+  addAnnotation(new EsFunctionAnnotation());
   auto queryEidFn =
     das::addExtern<DAS_BIND_FUN(queryEsEid)>(*this, lib, "query", das::SideEffects::modifyExternal, "bind_dascript::queryEsEid");
   auto queryEidFnMgr = das::addExtern<DAS_BIND_FUN(queryEsEidMgr)>(*this, lib, "query", das::SideEffects::modifyArgumentAndExternal,
@@ -3038,53 +3087,53 @@ void ECS::addES(das::ModuleLibrary &lib)
   auto findQueryEsFnMgr = das::addExtern<DAS_BIND_FUN(findQueryEsMgr)>(*this, lib, "find_query",
     das::SideEffects::modifyArgumentAndExternal, "bind_dascript::findQueryEsMgr");
   {
-    auto queryEidFunctionAnnotation = das::make_smart<EsRunFunctionAnnotation<0>>(EsType::SingleEidQuery);
+    auto queryEidFunctionAnnotation = new EsRunFunctionAnnotation<0>(EsType::SingleEidQuery);
     addAnnotation(queryEidFunctionAnnotation);
-    auto queryEsDecl = das::make_smart<das::AnnotationDeclaration>();
+    auto queryEsDecl = new das::AnnotationDeclaration();
     queryEsDecl->annotation = queryEidFunctionAnnotation;
     queryEidFn->annotations.push_back(queryEsDecl);
   }
   {
-    auto queryEidFunctionAnnotation = das::make_smart<EsRunFunctionAnnotation<1>>(EsType::SingleEidQuery);
+    auto queryEidFunctionAnnotation = new EsRunFunctionAnnotation<1>(EsType::SingleEidQuery);
     addAnnotation(queryEidFunctionAnnotation);
-    auto queryEsDecl = das::make_smart<das::AnnotationDeclaration>();
+    auto queryEsDecl = new das::AnnotationDeclaration();
     queryEsDecl->annotation = queryEidFunctionAnnotation;
     queryEidFnMgr->annotations.push_back(queryEsDecl);
   }
   {
-    auto queryEsFunctionAnnotation = das::make_smart<EsRunFunctionAnnotation<0>>(EsType::Query);
+    auto queryEsFunctionAnnotation = new EsRunFunctionAnnotation<0>(EsType::Query);
     addAnnotation(queryEsFunctionAnnotation);
-    auto queryEsDecl = das::make_smart<das::AnnotationDeclaration>();
+    auto queryEsDecl = new das::AnnotationDeclaration();
     queryEsDecl->annotation = queryEsFunctionAnnotation;
     queryEsFn->annotations.push_back(queryEsDecl);
   }
   {
-    auto queryEsFunctionAnnotation = das::make_smart<EsRunFunctionAnnotation<1>>(EsType::Query);
+    auto queryEsFunctionAnnotation = new EsRunFunctionAnnotation<1>(EsType::Query);
     addAnnotation(queryEsFunctionAnnotation);
-    auto queryEsDecl = das::make_smart<das::AnnotationDeclaration>();
+    auto queryEsDecl = new das::AnnotationDeclaration();
     queryEsDecl->annotation = queryEsFunctionAnnotation;
     queryEsFnMgr->annotations.push_back(queryEsDecl);
   }
   {
-    auto queryEsFunctionAnnotation = das::make_smart<EsRunFunctionAnnotation<0>>(EsType::FindQuery);
+    auto queryEsFunctionAnnotation = new EsRunFunctionAnnotation<0>(EsType::FindQuery);
     addAnnotation(queryEsFunctionAnnotation);
-    auto queryEsDecl = das::make_smart<das::AnnotationDeclaration>();
+    auto queryEsDecl = new das::AnnotationDeclaration();
     queryEsDecl->annotation = queryEsFunctionAnnotation;
     findQueryEsFn->annotations.push_back(queryEsDecl);
   }
   {
-    auto queryEsFunctionAnnotation = das::make_smart<EsRunFunctionAnnotation<1>>(EsType::FindQuery);
+    auto queryEsFunctionAnnotation = new EsRunFunctionAnnotation<1>(EsType::FindQuery);
     addAnnotation(queryEsFunctionAnnotation);
-    auto queryEsDecl = das::make_smart<das::AnnotationDeclaration>();
+    auto queryEsDecl = new das::AnnotationDeclaration();
     queryEsDecl->annotation = queryEsFunctionAnnotation;
     findQueryEsFnMgr->annotations.push_back(queryEsDecl);
   }
 
   auto processViewFn = das::addExtern<DAS_BIND_FUN(process_view)>(*this, lib, "process_view", das::SideEffects::modifyExternal,
     "bind_dascript::process_view");
-  auto processViewFunctionAnnotation = das::make_smart<EsRunFunctionAnnotation<0>>(EsType::ES);
+  auto processViewFunctionAnnotation = new EsRunFunctionAnnotation<0>(EsType::ES);
   addAnnotation(processViewFunctionAnnotation);
-  auto processViewDecl = das::make_smart<das::AnnotationDeclaration>();
+  auto processViewDecl = new das::AnnotationDeclaration();
   processViewDecl->annotation = processViewFunctionAnnotation;
   processViewFn->annotations.push_back(processViewDecl);
 
@@ -3122,10 +3171,14 @@ void ECS::addES(das::ModuleLibrary &lib)
 ReloadResult reload_all_changed()
 {
   if (das_is_in_init_phase)
-    return NO_CHANGES;
-  ScopedMultipleScripts scope;
+    return ReloadResult::NO_CHANGES;
+  bind_dascript::start_multiple_scripts_loading();
   StackFillRAII fillStack(fill_stack_while_compile_das());
-  ReloadResult res = scripts.reloadAllChanged(globally_aot_mode, globally_log_aot_errors);
+  const ReloadResult res = scripts.reloadAllChanged(globally_aot_mode, globally_log_aot_errors);
+  if (res == ReloadResult::NO_CHANGES)
+    bind_dascript::drop_multiple_scripts_loading();
+  else
+    bind_dascript::end_multiple_scripts_loading();
 
   return res;
 }
@@ -3145,6 +3198,14 @@ void set_das_log_aot_errors(LogAotErrors value) { globally_log_aot_errors = valu
 
 LogAotErrors get_das_log_aot_errors() { return globally_log_aot_errors; }
 
+void set_das_very_safe_context(bool value) { globally_very_safe_context = value; }
+
+bool get_das_very_safe_context() { return globally_very_safe_context; }
+
+void set_das_force_inscope_pod(bool value) { globally_force_inscope_pod = value; }
+
+bool get_das_force_inscope_pod() { return globally_force_inscope_pod; }
+
 size_t dump_memory() { return scripts.dumpMemory(); }
 
 void dump_statistics()
@@ -3153,8 +3214,9 @@ void dump_statistics()
     scripts.statistics.aotSystemsCount, scripts.statistics.loadTimeMs, globally_load_threads_num,
     scripts.statistics.memoryUsage / 1024);
   if (globally_aot_mode == AotMode::AOT && scripts.linkAotErrorsCount > 0u)
-    logwarn("daScript: failed to link cpp aot. Errors count %d. To see errors add -config:debug/das_log_aot_errors:b=yes",
-      scripts.linkAotErrorsCount);
+    logwarn("daScript: failed to link cpp aot. Errors count %d. To get the reports into %s add "
+            "-config:debug/das_log_aot_errors:b=yes",
+      scripts.linkAotErrorsCount, das_aot_errors_file_name);
 }
 
 void init_sandbox(const char *pak)
@@ -3186,9 +3248,10 @@ DAG_DECLARE_RELOCATABLE(bind_dascript::DascriptLoadJob);
 static void pull()
 {
   das::daScriptEnvironment::ensure();
-  (*das::daScriptEnvironment::bound)->das_def_tab_size = 2; // our coding style requires indenting of 2
+  das::daScriptEnvironment::getBound()->das_def_tab_size = 2; // our coding style requires indenting of 2
   if (das::Module::require("ecs"))
     return;
+  NEED_FUSION;
   NEED_MODULE(Module_BuiltIn);
   NEED_MODULE(Module_Math);
   NEED_MODULE(Module_Strings);
@@ -3262,6 +3325,13 @@ bind_dascript::ResolveECS bind_dascript::get_resolve_ecs_on_load() { return glob
 
 void bind_dascript::set_loading_profiling_enabled(bool enabled) { scripts.profileLoading = enabled; }
 
+bool bind_dascript::set_keep_file_names(bool keep)
+{
+  const bool res = scripts.keepFileName;
+  scripts.keepFileName = keep;
+  return res;
+}
+
 
 void bind_dascript::init_das(AotMode enable_aot, HotReload allow_hot_reload, LogAotErrors log_aot_errors, DasSyntax syntax)
 {
@@ -3294,7 +3364,7 @@ void bind_dascript::init_systems(AotMode enable_aot, HotReload allow_hot_reload,
 
   if (is_main_thread())
   { // init mainThreadBound for any standalone application
-    mainThreadBound = *das::daScriptEnvironment::bound;
+    mainThreadBound = das::daScriptEnvironment::getBound();
     G_ASSERT(mainThreadBound);
   }
 }

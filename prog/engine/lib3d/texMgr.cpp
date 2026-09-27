@@ -263,21 +263,45 @@ void TextureFactory::onTexFactoryDeleted(TextureFactory *f)
     return;
 
   acquire_texmgr_lock();
-  bool d3d_already_destroyed = !d3d::is_inited();
+  const bool d3d_already_destroyed = !d3d::is_inited();
   for (unsigned i = 0, ie = RMGR.getAccurateIndexCount(); i < ie; i++)
   {
-    if (RMGR.getFactory(i) != f || !RMGR.getD3dRes(i))
+    // entries without a d3d resource still point to f: the next acquire would call into it
+    if (RMGR.getFactory(i) != f)
       continue;
 
     TEXTUREID tid = RMGR.toId(i);
     if (d3d_already_destroyed)
-      RMGR.initAllocatedRec(i, nullptr, f);
-    else if (RMGR.getRefCount(i) == 0)
     {
-      f->releaseTexture(RMGR.baseTexture(i), tid);
       RMGR.initAllocatedRec(i, nullptr, f);
+      texmgr_internal::evict_managed_tex_and_id(tid);
+      continue;
     }
-    texmgr_internal::evict_managed_tex_and_id(tid);
+
+    if (RMGR.resQS[i].isReading())
+      RMGR.cancelReading(i);
+    // shader vars hold refs and cache the pointer: unbind them first, as termTex() does
+    if (RMGR.getRefCount(i) > 0 && tql::reset_texture_from_shader_vars)
+      tql::reset_texture_from_shader_vars(tid);
+    // the reset may drop the last ref of an entry already scheduled for removal, which evicts it
+    if (RMGR.getFactory(i) != f || texmgr_internal::evict_managed_tex_and_id(tid))
+      continue;
+
+    // still referenced: the caller broke the contract (see the header note). Detach the entry so
+    // the last release never calls into f. Only f could release the texture (it may be shared between
+    // ids, like a substitute texture), so it is leaked and the raw pointers held by users stay valid
+    logerr("[TEXMGR] factory %p deleted while tex 0x%x(%s) is referenced, rc=%d: texture leaked", f, tid, RMGR.getName(i),
+      RMGR.getRefCount(i) & ~RMGR.RCBIT_FOR_REMOVE);
+    TEX_REC_LOCK();
+    if (RMGR.baseTexture(i))
+      RMGR.changeTexUsedMem(i, 0, 0, 0);
+    RMGR.setD3dRes(i, nullptr);
+    RMGR.markUpdated(i, 0);
+    String name(RMGR.getName(i));
+    RMGR.setName(i, nullptr, f); // the name may live in f's memory
+    RMGR.setFactory(i, nullptr);
+    RMGR.setName(i, name, nullptr);
+    TEX_REC_UNLOCK();
   }
   release_texmgr_lock();
 }
@@ -386,6 +410,7 @@ void set_add_lod_bias(float add, const char *required_part)
 
 void set_add_lod_bias_batch(dag::Span<const LODBiasRule> rules)
 {
+  TEX_REC_AUTO_LOCK();
   for (auto &rule : rules)
     add_mip_bias_rule(rule.substring, rule.bias);
 
@@ -548,7 +573,12 @@ bool texmgr_internal::D3dResMgrDataFinal::scheduleReading(int idx, TextureFactor
         }
       }
 
-      f->scheduleTexLoading(RMGR.toId(idx), ql);
+      // this function owns the startReading/incBaseTexRc pair, so it alone reverts them on failure
+      if (!f->scheduleTexLoading(RMGR.toId(idx), ql))
+      {
+        RMGR.cancelReading(idx);
+        return false;
+      }
       return true;
     }
   return false;
@@ -587,7 +617,8 @@ TexLoadRes texmgr_internal::D3dResMgrDataFinal::readDdsxTex(TEXTUREID tid, const
   unsigned max_lev = resQS[idx].getMaxLev();
   unsigned rd_lev = resQS[idx].getRdLev();
   unsigned min_lev = RMGR.getLevDesc(idx, TQL_thumb);
-  if (!min_lev && resQS[idx].getMaxReqLev() < RMGR.getLevDesc(idx, TQL_base))
+  unsigned max_req_lev = resQS[idx].getMaxReqLev();
+  if (!min_lev && max_req_lev < RMGR.getLevDesc(idx, TQL_base))
   {
     min_lev = max(2 + std::abs((int)get_log2i(texDesc[idx].dim.w) - (int)get_log2i(texDesc[idx].dim.h)), 5 /*approx thumb level*/);
     min_lev = max<unsigned>(min_lev, texDesc[idx].dim.maxLev - texDesc[idx].dim.l + 1);
@@ -599,7 +630,7 @@ TexLoadRes texmgr_internal::D3dResMgrDataFinal::readDdsxTex(TEXTUREID tid, const
 
   if (getRefCount(idx) == 0 && getBaseTexUsedCount(idx) == 0)
     should_skip_reading = true;
-  else if (resQS[idx].getLdLev() >= min<unsigned>(resQS[idx].getMaxReqLev(), max_lev) && !getBaseTexUsedCount(idx))
+  else if (resQS[idx].getLdLev() >= min<unsigned>(max_req_lev, max_lev) && !getBaseTexUsedCount(idx))
     should_skip_reading = true;
   else if (t && getTexAddMemSizeNeeded4K(idx) && rd_lev > getLevDesc(idx, TQL_base) &&
            !texmgr_internal::is_gpu_mem_enough_to_load_hq_tex() && getTexImportance(idx) < 1)
@@ -612,9 +643,8 @@ TexLoadRes texmgr_internal::D3dResMgrDataFinal::readDdsxTex(TEXTUREID tid, const
   else if ((hdr.flags & hdr.FLG_HOLD_SYSMEM_COPY) && !texmgr_internal::is_sys_mem_enough_to_load_basedata())
     should_skip_reading = getBaseTexUsedCount(idx) < 1;
 
-  if (t && (hdr.flags & hdr.FLG_HOLD_SYSMEM_COPY) && !hasTexBaseData(idx) && rd_lev <= resQS[idx].getLdLev()) // fully loaded texture
-                                                                                                              // with missing baseData
-    t = nullptr;
+  if (t && (hdr.flags & hdr.FLG_HOLD_SYSMEM_COPY) && !hasTexBaseData(idx) && rd_lev <= resQS[idx].getLdLev())
+    t = nullptr; // we need to reload fully loaded texture with missing baseData
 
   if (should_skip_reading)
   {
@@ -625,7 +655,8 @@ TexLoadRes texmgr_internal::D3dResMgrDataFinal::readDdsxTex(TEXTUREID tid, const
   }
   if (!(hdr.flags & (hdr.FLG_GENMIP_BOX | hdr.FLG_GENMIP_KAIZER)))
   {
-    max_lev = max<unsigned>(min<unsigned>(max_lev, resQS[idx].getMaxReqLev()), min_lev);
+    max_req_lev = max<unsigned>(max_req_lev, resQS[idx].getMaxReqLev());
+    max_lev = max<unsigned>(min<unsigned>(max_lev, max_req_lev), min_lev);
     if (rd_lev > max_lev)
       resQS[idx].setRdLev(rd_lev = max_lev);
   }
@@ -640,12 +671,12 @@ TexLoadRes texmgr_internal::D3dResMgrDataFinal::readDdsxTex(TEXTUREID tid, const
   const TEXTUREID base_tid = pairedBaseTexId[idx];
   TexLoadRes ret = TexLoadRes::ERR;
 
-  if (incRefCount(idx) == 1)
-    RMGR.decReadyForDiscardTex(idx);
+  RMGR.incRefCountAndDecReadyForDiscardTex(idx);
   const unsigned cur_sz = tql::sizeInKb(calcTexMemSize(idx, target_lev, hdr));
   const unsigned full_sz = tql::sizeInKb(calcTexMemSize(idx, resQS[idx].getQLev(), hdr));
+  const unsigned old_alloc_lev = getTexAllocLev(idx);
   if (t)
-    RMGR.changeTexUsedMem(idx, cur_sz, full_sz);
+    RMGR.changeTexUsedMem(idx, cur_sz, full_sz, target_lev);
 
   int newTexSize = t ? t->getSize() : 0;
   if (!t)
@@ -709,12 +740,11 @@ TexLoadRes texmgr_internal::D3dResMgrDataFinal::readDdsxTex(TEXTUREID tid, const
 
   if (t)
   {
-    unsigned resSzKb = tql::sizeInKb(newTexSize);
-    if (resSzKb > cur_sz)
-      RMGR.changeTexUsedMem(idx, resSzKb, max(resSzKb, full_sz));
+    // a failed read keeps the old object, so its level is restored
+    const unsigned resSzKb = max<unsigned>(tql::sizeInKb(newTexSize), cur_sz);
+    RMGR.changeTexUsedMem(idx, resSzKb, max(resSzKb, full_sz), ret == TexLoadRes::OK ? target_lev : old_alloc_lev);
   }
-  if (decRefCount(idx) == 0)
-    RMGR.incReadyForDiscardTex(idx);
+  RMGR.decRefCountAndIncReadyForDiscardTex(idx);
 
   // RMGR.dumpMemStats();
   return ret;
@@ -815,11 +845,10 @@ void textag_get_list(int textag, Tab<TEXTUREID> &out_list, bool skip_unused)
 
 TextureMetaData get_texture_meta_data(TEXTUREID id)
 {
-  int idx = RMGR.toIndex(id);
-  const char *name = RMGR.getName(idx);
-
   TextureMetaData tmd;
-  tmd.decodeData(name);
+  int idx = RMGR.toIndex(id);
+  if (idx >= 0)
+    tmd.decodeData(RMGR.getName(idx));
   return tmd;
 }
 
@@ -846,13 +875,16 @@ d3d::SamplerInfo get_sampler_info(const TextureMetaData &texture_meta_data, bool
   return samplerInfo;
 }
 
+G_STATIC_ASSERT(sizeof(d3d::SamplerHandle) == sizeof(uint64_t));
+G_STATIC_ASSERT(eastl::is_pod_v<d3d::SamplerHandle>);
+
 d3d::SamplerHandle get_texture_separate_sampler(TEXTUREID id)
 {
   int idx = RMGR.toIndex(id);
   if (DAGOR_UNLIKELY(idx < 0))
     return d3d::INVALID_SAMPLER_HANDLE;
 
-  return RMGR.texSamplers[idx];
+  return d3d::SamplerHandle(interlocked_acquire_load(reinterpret_cast<volatile uint64_t &>(RMGR.texSamplers[idx])));
 }
 
 bool set_texture_separate_sampler(TEXTUREID id, const d3d::SamplerInfo &sampler_info)
@@ -862,6 +894,7 @@ bool set_texture_separate_sampler(TEXTUREID id, const d3d::SamplerInfo &sampler_
     return false;
 
   RMGR.texSamplerInfo[idx] = sampler_info;
-  RMGR.texSamplers[idx] = d3d::request_sampler(RMGR.texSamplerInfo[idx]);
+  interlocked_release_store(reinterpret_cast<volatile uint64_t &>(RMGR.texSamplers[idx]),
+    eastl::to_underlying(d3d::request_sampler(RMGR.texSamplerInfo[idx])));
   return true;
 }

@@ -1,4 +1,5 @@
 from "%darg/ui_imports.nut" import *
+from "types" import String
 
 let tooltipBox = @(content) {
   rendObj = ROBJ_BOX
@@ -31,12 +32,12 @@ let getTooltip = @() tooltipComp.value
 
 let tooltipCmp = @(){
   key = "tooltip"
-  pos = static [0, hdpx(38)]
+  pos = const [0, hdpx(38)]
   watch = tooltipGen
   behavior = Behaviors.BoundToArea
   safeAreaMargin = sh(1)
-  transform = static {}
-  children = type(getTooltip()) == "string"
+  transform = true
+  children = getTooltip() instanceof String
   ? tooltipBox({
       rendObj = ROBJ_TEXTAREA
       behavior = Behaviors.TextArea
@@ -48,14 +49,14 @@ let tooltipCmp = @(){
 }
 
 
-let cursorC = Color(255,255,255,255)
+const cursorColor = Color(255,255,255,255)
 
-let cursor = static {
+let cursor = const {
   rendObj = ROBJ_VECTOR_CANVAS
   size = [sh(3), sh(3)]
   commands = [
     [VECTOR_WIDTH, hdpx(1)],
-    [VECTOR_FILL_COLOR, cursorC],
+    [VECTOR_FILL_COLOR, cursorColor],
     [VECTOR_COLOR, Color(20, 40, 70, 250)],
     [VECTOR_POLY, 0,0, 100,50, 56,56, 50,100],
   ]
@@ -67,12 +68,10 @@ let cursor = static {
 
 function mkCursor(...){
   return Cursor({
-    size = static [sh(2), sh(2)]
-    hotspot = static [0, 0]
+    size = const [sh(2), sh(2)]
+    hotspot = const [0, 0]
     children = vargv
-    transform = static {
-      pivot = [0, 0]
-    }
+    transform = const { pivot = [0, 0] }
   })
 }
 

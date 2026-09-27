@@ -2,11 +2,13 @@ import bpy
 
 from .getters               import get_preferences
 
+valid_props_types =['t', 'i', 'b', 'm', 'r', 'p2', 'p3', 'p4', 'ip2', 'ip3']
+
 # returns a string version of a prop value
 def prop_value_to_string(prop_value, prop_type):
     try:
 # bool
-        if prop_type == "bool":
+        if prop_type == "b":
             prop_str = 'yes' if prop_value else 'no'
 # matrix
         elif prop_type == 'm':
@@ -194,9 +196,9 @@ def guess_type_convert(str):
     if str.find('[') > -1:
         value = to_matrix(str)[0]
 # bool ?
-    elif str.lower() in ['1', 'yes', 'true']:
+    elif str.lower() in ['yes', 'true']:
         value = True
-    elif str.lower() in ['0', 'no', 'false']:
+    elif str.lower() in ['no', 'false']:
         value = False
 # vector ?
     elif str.find(',')>-1:
@@ -227,7 +229,7 @@ def guess_type_convert(str):
 
 # trying to set a specific type if possible
 def fix_type(str, expected_type = None):
-    if expected_type != None and type_converters[expected_type] is None:
+    if expected_type != None and type_converters.get(expected_type) is None:
         print(f'Error! Unknown type: "{expected_type}"')
         #  TODO: better warn
         expected_type = None
@@ -257,7 +259,9 @@ type_str_remap = {
     }
 
 def get_property_type(prop_owner, prop_name):
-    prop = prop_owner[prop_name]
+    prop = prop_owner.get(prop_name)
+    if prop is None:
+        return None
     type = prop.__class__.__name__
     if type == 'IDPropertyArray':
         length = prop.__len__()

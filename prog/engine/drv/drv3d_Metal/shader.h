@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #import <simd/simd.h>
 #import <MetalKit/MetalKit.h>
+#include "EASTL/string.h"
 
 #include "buffBindPoints.h"
 
@@ -16,12 +17,14 @@ enum
   BindlessTypeTexture2D = 1 << 2,
   BindlessTypeTextureCube = 1 << 3,
   BindlessTypeTexture2DArray = 1 << 4,
+  BindlessTypeTexture3D = 1 << 5,
+  BindlessTypeTextureCubeArray = 1 << 6,
 };
 
 class Shader
 {
 public:
-  static const int g_max_textures_in_shader = 32;
+  static const int g_max_textures_in_shader = MAX_STAGE_TEXTURES;
 
   struct VA
   {
@@ -38,6 +41,7 @@ public:
 
   NSString *src;
   char entry[96];
+  eastl::string name = "(none)";
 
   EncodedBufferRemap bufRemap[BUFFER_POINT_COUNT];
 
@@ -45,6 +49,8 @@ public:
   int num_buffers = 0;
   int immediate_slot = -1;
   uint64_t buffer_mask = 0;
+
+  bool has_biases = false;
 
   EncodedBufferRemap bindless_buffers[BUFFER_POINT_COUNT];
   int num_bindless_buffers = 0;
@@ -84,13 +90,19 @@ public:
   Shader *mesh_shader = nullptr;
   Shader *amplification_shader = nullptr;
 
+  // used to build dirty masks
+  int tex_slot_remap[BUFFER_POINT_COUNT];
+  int buf_slot_remap[BUFFER_POINT_COUNT];
+
   Shader();
-  bool compileShader(const char *source, bool async);
+  bool compileShader(const uint8_t *meta, const char *source, uint64_t hash_override, bool async);
   void release();
+
+  static eastl::string getName(const char *ptr);
 
 private:
   bool setup(const char *data, int data_size, bool async);
-  bool loadFromBinary(const char *source, bool async);
+  bool loadFromBinary(const uint8_t *meta, const char *source, uint64_t hash_override, bool async);
   bool loadFromSource(const char *source, bool async);
 };
 } // namespace drv3d_metal

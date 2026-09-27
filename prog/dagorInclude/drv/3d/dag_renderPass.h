@@ -8,6 +8,8 @@
 #include <drv/3d/dag_consts.h>
 #include <drv/3d/dag_renderTarget.h>
 #include <drv/3d/dag_resource.h>
+#include <drv/3d/dag_multi_interface.h>
+#include <generic/dag_span.h>
 
 class BaseTexture;
 
@@ -71,11 +73,6 @@ struct RenderPassDesc
   const RenderPassTargetDesc *targetsDesc;
   /// \brief Array of bindCount elements, describing all subpasses
   const RenderPassBind *binds;
-
-  /// \brief Texture binding offset for shader subpass reads used on APIs without native render passes
-  /// \details Generic(emulated) implementation will use registers starting from this offset, to bind input attachments.
-  /// This must be properly handled inside shader code for generic implementation to work properly!
-  uint32_t subpassBindingOffset;
 };
 
 /// \brief Area of render target where rendering will happen inside render pass
@@ -90,11 +87,14 @@ struct RenderPassArea
 };
 
 /**@}*/
-
 namespace d3d
 {
 //! opaque class that represents render pass
 struct RenderPass;
+} // namespace d3d
+
+namespace d3d _MULTI_INTERFACE
+{
 /** \defgroup RenderPassD3D
  * @{
  */
@@ -125,7 +125,7 @@ void delete_render_pass(RenderPass *rp);
 /// \param rp Render pass resource to begin with
 /// \param area Rendering area restriction
 /// \param targets Array of targets that will be used in rendering
-void begin_render_pass(RenderPass *rp, const RenderPassArea area, const RenderPassTarget *targets);
+void begin_render_pass(RenderPass *rp, const RenderPassArea area, dag::ConstSpan<RenderPassTarget> targets);
 /// \brief Advances to next subpass
 /// \details Increases subpass number and executes necessary synchronization as well as binding,
 /// described for this subpass
@@ -147,7 +147,7 @@ void end_render_pass();
 /// to render on top of it. Otherwise loading previous contents treated as renderpass split
 /// and the validation fails (we want to avoid RP splits cause of performance impact on TBDR).
 /// If it's known that the render target will be just fully redrawn (like in most postfx),
-/// it's better to use d3d::clearview(CLEAR_DISCARD, ...) instead of this command.
+/// it's better to use d3d::clearview(DISCARD_ALL, ...) instead of this command.
 #if DAGOR_DBGLEVEL > 0
 void allow_render_pass_target_load();
 #else
@@ -155,7 +155,7 @@ inline void allow_render_pass_target_load() {}
 #endif
 
 /** @}*/
-} // namespace d3d
+} // namespace d3d _MULTI_INTERFACE
 
 #if _TARGET_D3D_MULTI
 #include <drv/3d/dag_interface_table.h>
@@ -163,7 +163,7 @@ namespace d3d
 {
 inline RenderPass *create_render_pass(const RenderPassDesc &rp_desc) { return d3di.create_render_pass(rp_desc); }
 inline void delete_render_pass(RenderPass *rp) { d3di.delete_render_pass(rp); }
-inline void begin_render_pass(RenderPass *rp, const RenderPassArea area, const RenderPassTarget *targets)
+inline void begin_render_pass(RenderPass *rp, const RenderPassArea area, dag::ConstSpan<RenderPassTarget> targets)
 {
   d3di.begin_render_pass(rp, area, targets);
 }

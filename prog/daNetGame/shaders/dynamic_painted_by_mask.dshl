@@ -7,17 +7,17 @@ include "masked_paint_color.dshl"
 include "masked_micro_detail.dshl"
 include "projective_wounds.dshl"
 include "emissive.dshl"
+include "dynamic_destr_disappear_inc.dshl"
 
 shader dynamic_painted_by_mask
 {
-  ENABLE_ASSERT(ps)
   DECLARE_DYNAMIC_MATERIAL_PARAMS()
   DYNAMIC_BLOCK()
   SUPPORT_MULTIDRAW(false)
   USE_SIMPLIFIED_RENDERING()
   INIT_EMISSIVE_ANIMCHAR_DYNMAT_SIMPLE_PARAMS()
-
-  if (compatibility_mode != compatibility_mode_on && mobile_render == off && in_editor_assume == no){ NO_DYNSTCODE() }
+  DYNAMIC_DESTR_DISAPPEAR_INIT()
+  if (compatibility_mode != compatibility_mode_on){ NO_DYNSTCODE() }
 
   texture tex = material.texture.diffuse;
 
@@ -40,11 +40,11 @@ shader dynamic_painted_by_mask
   USING_ATEST_HALF_AND(SET_ATEST_IS_ON_DEFINE())
 
   texture normalMap = material.texture[2];
-  texture aoTex = material.texture[3];
+  texture aoTex = material.texture[3] stub=(1,1,1,1);
   texture primaryMaskTex = material.texture[4];
   texture secondaryMaskTex = material.texture[5];
 
-  (ps) { diffuse_tex@static = tex; }
+  (ps) { diffuse_tex@staticSmp = tex; }
 
   INIT_MASKED_MICRODETAIL()
   WOUNDS_AND_BURNING_INIT()
@@ -56,6 +56,7 @@ shader dynamic_painted_by_mask
 
   static int num_bones = 0;
   interval num_bones: no_bones<1, four_bones;
+  INIT_DYNAMIC_THERMAL_SIGNATURE()
 
 
   if (dyn_model_render_pass == render_pass_normal)
@@ -67,13 +68,13 @@ shader dynamic_painted_by_mask
       #define NEED_TC 1
       struct VsOutput
       {
-        VS_OUT_POSITION(pos)
+        PRECISE VS_OUT_POSITION(pos)
         float2 diffuseTexcoord                  : TEXCOORD0;
         float3 pointToEye                       : TEXCOORD1;
         float3 normal                           : TEXCOORD2;
         #ifdef MOTION_VECTORS_ENABLED
-        float4 out_pos                          : TEXCOORD4;
-        float4 out_pos_prev                     : TEXCOORD5;
+        float3 out_pos                          : TEXCOORD4;
+        float3 out_pos_prev                     : TEXCOORD5;
         #endif
         #if HAS_BLOOD_DECAL
         float4 bloodDecalTC                     : TEXCOORD6;
@@ -89,8 +90,11 @@ shader dynamic_painted_by_mask
         float3 fragPos                          : TEXCOORD10;
         float3 fragNormal                       : TEXCOORD11;
         #endif
+        #if DYNAMIC_DESTR_DISAPPEAR_ENABLED
+        float4 destr_params                     : TEXCOORD12;
+        #endif
         #if HAS_TORN_WOUNDS_DEBUG
-        float4 debugColor                       : TEXCOORD12;
+        float4 debugColor                       : TEXCOORD13;
         #endif
         #if SET_UP_MULTIDRAW
         VSOUT_DRAW_ID
@@ -100,6 +104,7 @@ shader dynamic_painted_by_mask
   }
 
   DYNAMIC_SIMPLE_VS_BASE_PREAMBLE()
+  DYNAMIC_DESTR_DISAPPEAR_USE()
   WOUNDS_AND_BURNING_USE(get_diffuse_tex().smp)
 
   hlsl(vs) {
@@ -114,15 +119,19 @@ shader dynamic_painted_by_mask
 //---------------------------------------------------
 // PS stuff.
 //---------------------------------------------------
-  if ((dyn_model_render_pass != render_pass_normal))
+  if (is_triangle_size_debug)
   {
-    if (num_bones == four_bones && has_wounds == torn_wounds)
+    DYNAMIC_TRIANGLE_SIZE_DEBUG_PS()
+  }
+  else if ((dyn_model_render_pass != render_pass_normal))
+  {
+    if (num_bones == four_bones && has_wounds >= torn_wounds)
     {
       DYNAMIC_SIMPLE_CLIP_ALPHA_DISCRAD_WOUNDS_PS()
     }
     else
     {
-      SPECIAL_RENDER_NOALPHATEST()
+      SPECIAL_RENDER_NOALPHATEST(enable_ri_disintegration_animation == enabled)
     }
   }
   else
@@ -132,22 +141,27 @@ shader dynamic_painted_by_mask
     USE_PROJECTIVE_WOUNDS()
 
     (ps){
-      normalmap_tex@static = normalMap;
-      primary_mask_tex@static = primaryMaskTex;
+      normalmap_tex@staticSmp = normalMap;
+      aoTex@staticSmp = aoTex;
+      primary_mask_tex@staticSmp = primaryMaskTex;
     }
     if (secondaryMaskTex != NULL) {
-      (ps){ secondary_mask_tex@static = secondaryMaskTex; }
-    }
-    if (aoTex != NULL)
-    {
-      (ps){ aoTex@static = aoTex; }
+      (ps){ secondary_mask_tex@staticSmp = secondaryMaskTex; }
     }
 
     hlsl(ps) {
       #define HAS_MICRO_DETAIL 1
+      #define THERMAL_TWEAK_ALBEDO_OFFSET     (-0.5)
+      #define THERMAL_TWEAK_SMOOTHNESS_OFFSET  (0.5)
+      #define THERMAL_TWEAK_METALNESS_OFFSET  (-0.75)
+    }
+    if (num_bones != no_bones)
+    {
+      hlsl(ps) { #define THERMAL_TWEAK_SKINNED_ALBEDO_MUL (0.35) }
     }
     WRITE_GBUFFER()
     USE_NORMAL_DETAIL()
+    USE_DYNAMIC_THERMAL_SIGNATURE()
 
     USE_EMISSIVE_ANIMCHAR_DYNMAT_SIMPLE_PARAMS()
 
@@ -207,9 +221,7 @@ shader dynamic_painted_by_mask
         apply_burning_and_wounds(input, character_micro_detail_layer, worldNormal,
           diffuseColor.rgb, smoothness, reflectance, skipBloodWound);
 
-        ##if aoTex != NULL
         ao *= tex2DBindless(get_aoTex(), input.diffuseTexcoord.xy).g;
-        ##endif
         UnpackedGbuffer result;
         init_gbuffer(result);
 
@@ -232,6 +244,7 @@ shader dynamic_painted_by_mask
           init_emission(result, emissiveColor.a);
           init_emission_color(result, float4(emissiveColor.rgb, emissionAlbedoMult));
         }
+        init_thermal_signature(result, diffuseColor.rgb);
         #ifdef MOTION_VECTORS_ENABLED
           float3 motion = encode_motion_vector( input.out_pos, input.out_pos_prev );
           init_motion_vector(result, motion);

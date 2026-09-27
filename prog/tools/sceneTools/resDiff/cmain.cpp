@@ -14,7 +14,7 @@ extern bool game_resources_diff_strict_tex;
 static void print_header()
 {
   printf("GRP/DxP data diff v1.2\n"
-         "Copyright (C) Gaijin Games KFT, 2023\n\n");
+         "Copyright (C) Gaijin Games KFT, 2026\n\n");
 }
 static bool ctrl_c_pressed = false;
 static void __cdecl ctrl_break_handler(int) { ctrl_c_pressed = true; }
@@ -67,9 +67,13 @@ int DagorWinMain(bool debugmode)
   int64_t ret = make_game_resources_diff(__argv[1], __argv[2], __argv[4], dryRun, vfs_fn, reslist_fn, __argv[3], diff_files);
   if (ret < 0)
   {
+    if (ret == -2)
+    {
+      printf("\nERR: found removed dynModel/rendInst/texture");
+      return 2;
+    }
     printf("\nERR: failed to diff changes from %s to %s, mount dir: %s\n", __argv[1], __argv[2], __argv[3]);
     return 1;
   }
   return 0;
 }
-size_t dagormem_max_crt_pool_sz = 256 << 20;

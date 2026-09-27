@@ -20,10 +20,6 @@ typedef int SQInt32;
 typedef unsigned int SQUnsignedInteger32;
 
 
-#ifndef __forceinline
-#define __forceinline inline
-#endif
-
 #ifdef SQUSEDOUBLE
     typedef double SQFloat;
 #else
@@ -50,15 +46,7 @@ typedef void* SQUserPointer;
 typedef SQUnsignedInteger SQBool;
 typedef SQInteger SQRESULT;
 
-typedef char SQChar;
-#define _SC(a) a
-#if defined __EMSCRIPTEN__
 #define scsprintf   snprintf
-#elif (!defined(_TARGET_PC_WIN) && !defined(_TARGET_XBOX)) || (defined(_MSC_VER) && _MSC_VER <= 1800)
-#define scsprintf   _snprintf
-#else
-#define scsprintf   snprintf
-#endif
 #ifdef _SQ64
 #ifdef _MSC_VER
 #define scstrtol    _strtoi64
@@ -68,13 +56,12 @@ typedef char SQChar;
 #else
 #define scstrtol    strtol
 #endif
-#define SQ_MAX_CHAR 0xFF
 
 #ifdef _SQ64
-    #define _PRINT_INT_PREC _SC("ll")
-    #define _PRINT_INT_FMT _SC("%" PRId64)
+    #define _PRINT_INT_PREC "ll"
+    #define _PRINT_INT_FMT "%" PRId64
 #else
-    #define _PRINT_INT_FMT _SC("%d")
+    #define _PRINT_INT_FMT "%d"
 #endif
 
 #define SQ_USED_MEM_COUNTER_DECL namespace sqmemtrace { extern unsigned mem_used; }
@@ -86,6 +73,27 @@ typedef char SQChar;
 
 #ifndef SQ_CHECK_THREAD
 #define SQ_CHECK_THREAD SQ_CHECK_THREAD_LEVEL_NONE
+#endif
+
+// Runtime docstrings and native function declaration strings.
+#ifndef SQ_STORE_DOC_OBJECTS
+#define SQ_STORE_DOC_OBJECTS 1
+#endif
+
+#if SQ_STORE_DOC_OBJECTS
+#define SQ_DOC(text) text
+#else
+#define SQ_DOC(text) ((const char *)0)
+#endif
+
+// 1 replaces getenv, setenv and system with stubs that throw (console, mobile).
+#ifndef SQ_SYSTEM_STUBS
+#define SQ_SYSTEM_STUBS 0
+#endif
+
+// if SQ_RANDOMIZE_FOREACH == 1, the foreach loop for tables will be randomized
+#ifndef SQ_RANDOMIZE_FOREACH
+#define SQ_RANDOMIZE_FOREACH 0
 #endif
 
 #define MIN_SQ_INTEGER SQInteger(1ULL << (sizeof(SQInteger) * 8 - 1))

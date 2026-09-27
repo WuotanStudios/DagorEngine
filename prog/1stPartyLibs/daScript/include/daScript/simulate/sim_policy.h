@@ -1,5 +1,7 @@
 #pragma once
 
+#include <daScript/simulate/simulate.h>
+
 namespace  das {
 
     class Context;
@@ -181,6 +183,11 @@ namespace  das {
         static __forceinline void SetDiv  ( double & a, double b, Context &, LineInfo * ) { a /= b; }
         static __forceinline double Mod ( double a, double b, Context &, LineInfo * ) { return fmod(a,b); }
         static __forceinline void SetMod ( double & a, double b, Context &, LineInfo * ) { a = fmod(a,b); }
+        static __forceinline double Floor    ( double a, Context &, LineInfo * )          { return ::floor(a); }
+        static __forceinline double Ceil     ( double a, Context &, LineInfo * )          { return ::ceil(a); }
+        static __forceinline double Round    ( double a, Context &, LineInfo * )          { return ::round(a); }
+        static __forceinline double Fract    ( double a, Context &, LineInfo * )          { return a - ::floor(a); }
+        static __forceinline double Sat      ( double a, Context &, LineInfo * )          { return a > 0 ? (a < 1.0 ? a : 1.0) : 0.0; }
         static __forceinline int Trunci ( double a, Context &, LineInfo * )          { return int(trunc(a)); }
         static __forceinline int Roundi ( double a, Context &, LineInfo * )          { return int(round(a)); }
         static __forceinline int Floori ( double a, Context &, LineInfo * )          { return int(floor(a)); }
@@ -448,9 +455,15 @@ namespace  das {
         static __forceinline vec4f Sub ( vec4f a, vec4f b, Context &, LineInfo * ) {
             return v_cast_vec4f(v_subi(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
+        static __forceinline void checkDivOverflow ( vec4i a, vec4i b, Context & context, LineInfo * at ) {
+            // INT_MIN / -1 overflows signed division (idiv #DE); mirror scalar SimPolicy_IntBin::Div
+            if ( v_signmask(v_cast_vec4f(v_andi(v_cmp_eqi(a,v_splatsi(INT32_MIN)),v_cmp_eqi(b,v_splatsi(-1))))) & mask )
+                context.throw_error_at(at,"division overflow");
+        }
         static __forceinline vec4f Div ( vec4f a, vec4f b, Context & context, LineInfo * at ) {
             if ( v_signmask(v_cast_vec4f(v_cmp_eqi(v_cast_vec4i(v_zero()),v_cast_vec4i(b)))) & mask )
                 context.throw_error_at(at,"division by zero");
+            checkDivOverflow(v_cast_vec4i(a),v_cast_vec4i(b),context,at);
                     if ( mask==7 )  return v_cast_vec4f(v_divi3(v_cast_vec4i(a),v_cast_vec4i(b)));
             else    if ( mask==3 )  return v_cast_vec4f(v_divi2(v_cast_vec4i(a),v_cast_vec4i(b)));
             else                    return v_cast_vec4f(v_divi4(v_cast_vec4i(a),v_cast_vec4i(b)));
@@ -506,6 +519,7 @@ namespace  das {
             if ( v_signmask(v_cast_vec4f(v_cmp_eqi(v_cast_vec4i(v_zero()),v_cast_vec4i(b)))) & mask )
                 context.throw_error_at(at,"division by zero");
             TT * pa = (TT *)a;
+            checkDivOverflow(v_cast_vec4i(cast<TT>::from(*pa)),v_cast_vec4i(b),context,at);
                     if ( mask==7 )  *pa = cast<TT>::to (v_cast_vec4f(v_divi3(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
             else    if ( mask==3 )  *pa = cast<TT>::to (v_cast_vec4f(v_divi2(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
             else                    *pa = cast<TT>::to (v_cast_vec4f(v_divi4(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
@@ -557,6 +571,7 @@ namespace  das {
         static __forceinline vec4f DivVecScal ( vec4f a, vec4f b, Context & context, LineInfo * at ) {
             if ( v_extract_xi(v_cast_vec4i(b))==0 )
                 context.throw_error_at(at,"division by zero");
+            checkDivOverflow(v_cast_vec4i(a),v_splat_xi(v_cast_vec4i(b)),context,at);
                     if ( mask==7 )  return v_cast_vec4f(v_divi3(v_cast_vec4i(a),v_splat_xi(v_cast_vec4i(b))));
             else    if ( mask==3 )  return v_cast_vec4f(v_divi2(v_cast_vec4i(a),v_splat_xi(v_cast_vec4i(b))));
             else                    return v_cast_vec4f(v_divi4(v_cast_vec4i(a),v_splat_xi(v_cast_vec4i(b))));
@@ -564,6 +579,7 @@ namespace  das {
         static __forceinline vec4f DivScalVec ( vec4f a, vec4f b, Context & context, LineInfo * at ) {
             if ( v_signmask(v_cast_vec4f(v_cmp_eqi(v_cast_vec4i(v_zero()),v_cast_vec4i(b)))) & mask )
                 context.throw_error_at(at,"division by zero");
+            checkDivOverflow(v_splat_xi(v_cast_vec4i(a)),v_cast_vec4i(b),context,at);
                     if ( mask==7 )  return v_cast_vec4f(v_divi3(v_splat_xi(v_cast_vec4i(a)),v_cast_vec4i(b)));
             else    if ( mask==3 )  return v_cast_vec4f(v_divi2(v_splat_xi(v_cast_vec4i(a)),v_cast_vec4i(b)));
             else                    return v_cast_vec4f(v_divi4(v_splat_xi(v_cast_vec4i(a)),v_cast_vec4i(b)));
@@ -572,6 +588,7 @@ namespace  das {
             if ( v_extract_xi(v_cast_vec4i(b))==0 )
                 context.throw_error_at(at,"division by zero");
             TT * pa = (TT *)a;
+            checkDivOverflow(v_cast_vec4i(cast<TT>::from(*pa)),v_splat_xi(v_cast_vec4i(b)),context,at);
                     if ( mask==7 )  *pa = cast<TT>::to (v_cast_vec4f(v_divi3(v_cast_vec4i(cast<TT>::from(*pa)),v_splat_xi(v_cast_vec4i(b)))));
             else    if ( mask==3 )  *pa = cast<TT>::to (v_cast_vec4f(v_divi2(v_cast_vec4i(cast<TT>::from(*pa)),v_splat_xi(v_cast_vec4i(b)))));
             else                    *pa = cast<TT>::to (v_cast_vec4f(v_divi4(v_cast_vec4i(cast<TT>::from(*pa)),v_splat_xi(v_cast_vec4i(b)))));
@@ -745,7 +762,7 @@ namespace  das {
     struct SimPolicy_Range : SimPolicy_iVec<range,3> {};
     struct SimPolicy_URange : SimPolicy_uVec<urange,3> {};
 
-    extern const char * rts_null;
+    extern DAS_API const char * rts_null;
 
     __forceinline const char * to_rts ( vec4f a ) {
         const char * s = cast<const char *>::to(a);
@@ -756,7 +773,7 @@ namespace  das {
         return s ? s : rts_null;
     }
 
-    struct SimPolicy_String {
+    struct DAS_API SimPolicy_String {
         // even more basic
         static __forceinline void Set     ( char * & a, char * b, Context &, LineInfo * ) { a = b;}
         static __forceinline bool Equ     ( char * a, char * b, Context &, LineInfo * ) { return strcmp(to_rts(a), to_rts(b))==0; }
@@ -774,6 +791,81 @@ namespace  das {
     };
 
     // generic SimPolicy<X>
+
+    // 16/8-bit lattice fp16 family. Reference semantics: promote each fp16 lane to
+    // float32, compute, round back (RNE) — correctly rounded per op, so this emulation
+    // and native fp16 hardware agree bit-exactly. The scalar float16 is the lanes=1
+    // case (its widened-lane-0 value convention shares the low 2 bytes with the packed
+    // layout). Division by zero follows IEEE (±inf/NaN), like float — no throw.
+#define DAS_FP16_OP1(OPNAME, EXPR)                                                          \
+        static __forceinline vec4f OPNAME ( vec4f x, Context &, LineInfo * ) {              \
+            union { vec4f v; float16_t h[8]; } X, R;                                        \
+            X.v = x; R.v = v_zero();                                                        \
+            const float16_t * px = X.h;                                                     \
+            float16_t * pr = R.h;                                                           \
+            for ( int i = 0; i != lanes; ++i ) { float xa = px[i].toFloat(); pr[i] = float16_t(EXPR); } \
+            return R.v;                                                                     \
+        }
+#define DAS_FP16_OP2(OPNAME, OP)                                                            \
+        static __forceinline vec4f OPNAME ( vec4f a, vec4f b, Context &, LineInfo * ) {     \
+            union { vec4f v; float16_t h[8]; } A, B, R;                                     \
+            A.v = a; B.v = b; R.v = v_zero();                                               \
+            const float16_t * pa = A.h;                                                     \
+            const float16_t * pb = B.h;                                                     \
+            float16_t * pr = R.h;                                                           \
+            for ( int i = 0; i != lanes; ++i ) pr[i] = float16_t(OP);                       \
+            return R.v;                                                                     \
+        }
+#define DAS_FP16_SET_OP2(OPNAME, OP)                                                        \
+        static __forceinline void OPNAME ( char * a, vec4f b, Context &, LineInfo * ) {     \
+            union { vec4f v; float16_t h[8]; } B;                                           \
+            B.v = b;                                                                        \
+            float16_t * pa = (float16_t *)a;                                                \
+            const float16_t * pb = B.h;                                                     \
+            for ( int i = 0; i != lanes; ++i ) pa[i] = float16_t(OP);                       \
+        }
+#define DAS_FP16_BOOL_OP2(OPNAME, OP)                                                       \
+        static __forceinline bool OPNAME ( vec4f a, vec4f b, Context &, LineInfo * ) {      \
+            union { vec4f v; float16_t h[8]; } A, B;                                        \
+            A.v = a; B.v = b;                                                               \
+            const float16_t * pa = A.h;                                                     \
+            const float16_t * pb = B.h;                                                     \
+            for ( int i = 0; i != lanes; ++i ) if ( !(pa[i].toFloat() OP pb[i].toFloat()) ) return false; \
+            return true;                                                                    \
+        }
+
+    template <int lanes>
+    struct SimPolicy_HalfVec {
+        DAS_FP16_OP1(Unp,  xa)
+        DAS_FP16_OP1(Unm, -xa)
+        DAS_FP16_OP2(Add, pa[i].toFloat() + pb[i].toFloat())
+        DAS_FP16_OP2(Sub, pa[i].toFloat() - pb[i].toFloat())
+        DAS_FP16_OP2(Mul, pa[i].toFloat() * pb[i].toFloat())
+        DAS_FP16_OP2(Div, pa[i].toFloat() / pb[i].toFloat())
+        DAS_FP16_OP2(Mod, fmodf(pa[i].toFloat(), pb[i].toFloat()))
+        DAS_FP16_SET_OP2(SetAdd, pa[i].toFloat() + pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetSub, pa[i].toFloat() - pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetMul, pa[i].toFloat() * pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetDiv, pa[i].toFloat() / pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetMod, fmodf(pa[i].toFloat(), pb[i].toFloat()))
+        // scalar x vector — the fp16 scalar operand rides widened in lane 0
+        DAS_FP16_OP2(MulVecScal, pa[i].toFloat() * pb[0].toFloat())
+        DAS_FP16_OP2(DivVecScal, pa[i].toFloat() / pb[0].toFloat())
+        DAS_FP16_OP2(MulScalVec, pa[0].toFloat() * pb[i].toFloat())
+        DAS_FP16_OP2(DivScalVec, pa[0].toFloat() / pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetMulScal, pa[i].toFloat() * pb[0].toFloat())
+        DAS_FP16_SET_OP2(SetDivScal, pa[i].toFloat() / pb[0].toFloat())
+        // ordered comparisons — registered for the scalar (lanes=1); all-lanes for vectors
+        DAS_FP16_BOOL_OP2(Less, <)
+        DAS_FP16_BOOL_OP2(LessEqu, <=)
+        DAS_FP16_BOOL_OP2(Gt, >)
+        DAS_FP16_BOOL_OP2(GtEqu, >=)
+    };
+
+#undef DAS_FP16_OP1
+#undef DAS_FP16_OP2
+#undef DAS_FP16_SET_OP2
+#undef DAS_FP16_BOOL_OP2
 
     template <typename TT>
     struct SimPolicy;
@@ -799,6 +891,11 @@ namespace  das {
     template <> struct SimPolicy<urange> : SimPolicy_URange {};
     template <> struct SimPolicy<range64> : SimPolicy_Range64 {};
     template <> struct SimPolicy<urange64> : SimPolicy_URange64 {};
+    template <> struct SimPolicy<float16_t> : SimPolicy_HalfVec<1> {};
+    template <> struct SimPolicy<half2> : SimPolicy_HalfVec<2> {};
+    template <> struct SimPolicy<half3> : SimPolicy_HalfVec<3> {};
+    template <> struct SimPolicy<half4> : SimPolicy_HalfVec<4> {};
+    template <> struct SimPolicy<half8> : SimPolicy_HalfVec<8> {};
     template <> struct SimPolicy<char *> : SimPolicy_String {};
 
 }

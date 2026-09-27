@@ -175,7 +175,8 @@ protected:
       TMatrix4_vec4 cullViewProj;
       ViewTransformData transform;
     };
-    dag::RelocatableFixedVector<RegionToRender, 8> regionsToRender;
+    static constexpr uint32_t MAX_REGIONS_TO_RENDER = 8;
+    dag::RelocatableFixedVector<RegionToRender, MAX_REGIONS_TO_RENDER> regionsToRender;
   } renderData{};
 
 #if COLLECT_STATIC_SHADOWS_STATISTICS
@@ -186,6 +187,7 @@ protected:
     uint32_t completelyValidFrames = 0;
     uint32_t renderRegionFirstTimeCount = 0;
     uint32_t invalidateRegionCount = 0;
+    uint32_t completelyValidFramesSinceLastUpdate = 0;
   } staticShadowsStatistics;
 #endif
 
@@ -235,8 +237,7 @@ public:
   float calculateCascadeDistance(int cascade, int cascade_count, float max_distance) const;
 
   float getDistance() const { return maxDistance; }
-  const ManagedTexHolder &getTex() { return staticShadowTex; }
-  void restoreShadowSampler();
+  const ManagedTexWithShaderVar &getTex() { return staticShadowTex; }
   void setMaxHtRange(float max_ht_range); // that is only for skewed matrix
   float getSmallestTexelSize() const { return cascades.empty() ? -1 : cascades[0].texelSize; }
   float getBiggestTexelSize() const { return cascades.empty() ? -1 : cascades.back().texelSize; }
@@ -245,7 +246,8 @@ public:
   int getBoxViews(const BBox3 &box, ViewTransformData *out_views, int &out_cnt) const;
   bool getCascadeWorldBoxViews(int cascade_id, ViewTransformData *out_views, int &out_cnt) const;
   void setWorldBox(const BBox3 &box); // causes unforced invalidation, if box is different
-  void setDistance(float distance);   // causes forced invalidation, if is different
+  BBox3 getWorldBox() const { return worldBox; }
+  void setDistance(float distance); // causes forced invalidation, if is different
   void setCascadeDistance(int cascade, float distance);
   bool isInside(const BBox3 &box) const;          // returns true, if box covered by static shadows
   bool isCompletelyValid(const BBox3 &box) const; // returns true, if box has no never rendered (empty) or invalid (invalidated)
@@ -267,13 +269,14 @@ public:
 
   static constexpr float ORTHOGONAL_THRESHOLD = 0.1; // auto switch to ortho shadows
   void printCascadesStatistics() const;
+  uint32_t getMinCompletelyValidFramesAcrossAllCascades() const;
 
 protected:
   bool isOrtho = false;
   bool isRendered = false;
   float maxDistance = 0; // biggest cascade distance
   float maxHtRange = 512.f;
-  UniqueTexHolder staticShadowTex;
+  UniqueTexWithShaderVar staticShadowTex;
   int texSize;
   BBox3 worldBox;
   bool useTextureSpaceAlignment = false;

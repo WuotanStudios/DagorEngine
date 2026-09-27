@@ -1,11 +1,12 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <bindQuirrelEx/bindQuirrelEx.h>
-#include <sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
 #include "actionData.h"
 #include <daInput/config_api.h>
 #include <ioSys/dag_dataBlock.h>
 #include <util/dag_delayedAction.h>
+#include <util/dag_string.h>
 
 #include <drv/hid/dag_hiKeyboard.h>
 #include <drv/hid/dag_hiPointing.h>
@@ -123,6 +124,18 @@ static float get_joystick_stick_dead_zone(int stick_idx) { return dainput::get_s
 static float get_main_gamepad_stick_dead_zone_abs(int stick_idx) { return dainput::get_stick_dead_zone_abs(stick_idx, true); }
 static float get_joystick_stick_dead_zone_abs(int stick_idx) { return dainput::get_stick_dead_zone_abs(stick_idx, false); }
 static void enable_joystick_gyroscope(bool enable) { dainput::enable_gyroscope(enable, true); }
+
+// the defaults of the declaration do not reach a bound function pointer, and a UI that wrote several rows publishes them at once
+static SQInteger sq_action_binding_changed(HSQUIRRELVM vm)
+{
+  SQInteger action = dainput::BAD_ACTION_HANDLE, column = -1;
+  if (sq_gettop(vm) > 1)
+    sq_getinteger(vm, 2, &action);
+  if (sq_gettop(vm) > 2)
+    sq_getinteger(vm, 3, &column);
+  dainput::action_binding_changed(dainput::action_handle_t(action), int(column));
+  return 0;
+}
 
 static SQInteger sq_format_ctrl_name(HSQUIRRELVM vm)
 {
@@ -704,11 +717,14 @@ void dainput::bind_sq_api(SqModules *moduleMgr)
     .Func("get_action_binding", get_action_binding)
     .Func("set_action_binding", set_action_binding)
     .Func("reset_action_binding", reset_action_binding)
+    .SquirrelFunc("action_binding_changed", sq_action_binding_changed, -1, ".ii")
 
     .Func("get_actions_count", get_actions_count)
     .Func("get_action_handle_by_ord", get_action_handle_by_ord)
     .Func("get_action_sets_count", get_action_sets_count)
     .Func("get_action_set_handle_by_ord", get_action_set_handle_by_ord)
+    .Func("get_action_set_priority", get_action_set_priority)
+    .Func("are_action_sets_exclusive", are_action_sets_exclusive)
 
     .Func("start_recording_bindings", start_recording_bindings)
     .Func("start_recording_bindings_for_single_button", start_recording_bindings_for_single_button)
@@ -819,18 +835,21 @@ void dainput::bind_sq_api(SqModules *moduleMgr)
     /**/;
 
   Sqrat::Class<DigitalAction>(vm, "DigitalAction") //
+    .UseInlineUserdata()
     .SQ_BIND_MEMBER_VAR(DigitalAction, bState)
     .SQ_BIND_MEMBER_VAR(DigitalAction, bActive)
     .SQ_BIND_MEMBER_VAR(DigitalAction, bActivePrev)
     /**/;
 
   Sqrat::Class<AnalogAxisAction>(vm, "AnalogAxisAction") //
+    .UseInlineUserdata()
     .SQ_BIND_MEMBER_VAR(AnalogAxisAction, x)
     .SQ_BIND_MEMBER_VAR(AnalogAxisAction, bActive)
     .SQ_BIND_MEMBER_VAR(AnalogAxisAction, bActivePrev)
     /**/;
 
   Sqrat::Class<AnalogStickAction>(vm, "AnalogStickAction") //
+    .UseInlineUserdata()
     .SQ_BIND_MEMBER_VAR(AnalogStickAction, x)
     .SQ_BIND_MEMBER_VAR(AnalogStickAction, y)
     .SQ_BIND_MEMBER_VAR(AnalogStickAction, bActive)

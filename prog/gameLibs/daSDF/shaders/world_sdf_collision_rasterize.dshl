@@ -10,19 +10,18 @@ interval gi_voxelize_with_instancing:instancing<2, primitives;
 
 shader world_sdf_collision_rasterize
 {
-  ENABLE_ASSERT(ps)
   supports none;
   supports global_frame;
   cull_mode = none;
   z_write = false;
   z_test = false;
   COMMON_COLLISION_BASE_RENDER()
-  if (gi_voxelize_with_instancing == primitives && supports_sh_6_1 == on)
+  if (gi_voxelize_with_instancing == primitives && supports_barycentrics == on)
   {
     dont_render;
   }
 
-  if (gi_voxelize_with_instancing == primitives && supports_sh_6_1 == off)
+  if (gi_voxelize_with_instancing == primitives && supports_barycentrics == off)
   {
     INIT_LOAD_COLLISION_PRIMITIVES(vs)
     USE_LOAD_COLLISION_PRIMITIVES(vs)
@@ -33,7 +32,7 @@ shader world_sdf_collision_rasterize
     }
   } else
   {
-    if (supports_sh_6_1 == on)
+    if (supports_barycentrics == on)
     {
       hlsl {
         #define SUPPORT_LATE_INTERPOLATION 1
@@ -51,7 +50,13 @@ shader world_sdf_collision_rasterize
       nointerpolation int axis:TEXCOORD1;
       #if RASTERIZE_PRIMS
       #if SUPPORT_LATE_INTERPOLATION
-      nointerpolation float3 vertexWorldPos : TEXCOORD2;
+
+      ##if hardware.ps4 || hardware.ps5
+        custominterp float3 vertexWorldPos : TEXCOORD2; // requires custominterp to obtain original vertex value via GetAttributeAtVertex
+      ##else
+        nointerpolation float3 vertexWorldPos : TEXCOORD2;
+      ##endif
+
       #else
       nointerpolation float3 va : TEXCOORD2;
       nointerpolation float3 vb : TEXCOORD3;
@@ -136,7 +141,7 @@ shader world_sdf_collision_rasterize
         //early out of pixel shader
         float3 bmin = min(output.va, min(output.vb, output.vc))*voxelize_world_to_rasterize_space_mul  + voxelize_world_to_rasterize_space_add;
         float3 bmax = max(output.va, max(output.vb, output.vc))*voxelize_world_to_rasterize_space_mul  + voxelize_world_to_rasterize_space_add;
-        if (any(bmin > 1 || bmax < -1))
+        if (any(or(bmin > 1, bmax < -1)))
           output.pos = NaN;
         #endif
       #endif
@@ -147,7 +152,7 @@ shader world_sdf_collision_rasterize
       return output;
     }
   }
-  if (supports_sh_6_1 == on)
+  if (supports_barycentrics == on)
   {
     compile("ps_6_1", "gi_collision_ps");
   } else

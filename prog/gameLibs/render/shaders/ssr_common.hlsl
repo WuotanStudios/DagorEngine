@@ -58,9 +58,8 @@ float4 hierarchRayMarch(float2 rayStart_uv, float3 R, float linear_roughness, fl
   float3 rayStepScreen = rayEndScreen - rayStartScreen;
 
   // calculate border of screen
-  float2 screenBorder = (rayStepScreen.xy >= 0) ? float2(1,1) : -float2(1,1);
-  float2 bScale = (abs(rayStepScreen.xy) < 1e-5) ? 1 : (screenBorder - rayStartScreen.xy) / rayStepScreen.xy;
-  bScale = (screenBorder - rayStartScreen.xy) / rayStepScreen.xy;
+  float2 screenBorder = select(rayStepScreen.xy >= 0, float2(1,1), -float2(1,1));
+  float2 bScale = select(abs(rayStepScreen.xy) < 1e-5, float2(1,1), (screenBorder - rayStartScreen.xy) / rayStepScreen.xy);
   float bScaleW = max(bScale.x, bScale.y);
   float borderScale = bScaleW > 0 ? min(bScale.x, bScale.y) : 1;
   FLATTEN
@@ -131,7 +130,7 @@ float4 hierarchRayMarch(float2 rayStart_uv, float3 R, float linear_roughness, fl
       //float compareToleranceUp = abs(rayStepUVz.z) * STEP;
       float4 compareToleranceUp = toleranceUpMAD.x * sampleNormDist + toleranceUpMAD.y;
 
-      bool4 hasHit = bool4(depthDiff < 0) && bool4(depthDiff > compareToleranceUp);
+      bool4 hasHit = and(bool4(depthDiff < 0), bool4(depthDiff > compareToleranceUp));
 
       BRANCH if (any(hasHit))
       {
@@ -293,8 +292,11 @@ half4 sample_vignetted_color(float3 hit_uv_z, float linear_roughness, float hitD
   half3 prevScreenColor = 0;
   bool hit = get_prev_frame_disocclusion_weight_sample(sampleUV.xy, prevLinearDepth, cameraToHitPoint, TXlod, prevScreenColor);
   result.rgb = prevScreenColor;
-  //hit = true;
-  //result.rgb = PREV_FRAME_UNPACK(tex2Dlod(prev_frame_tex, float4(sampleUV.xy, 0, TXlod)).rgb);
+  #define SSR_DEBUG_SKIP_DISOCCLUSION 0
+  #if SSR_DEBUG_SKIP_DISOCCLUSION
+    hit = true;
+    result.rgb = PREV_FRAME_UNPACK(tex2Dlod(prev_frame_tex, float4(sampleUV.xy, 0, TXlod)).rgb);
+  #endif
 
   BRANCH if (analytic_light_sphere_pos_r.w > 0)
   {

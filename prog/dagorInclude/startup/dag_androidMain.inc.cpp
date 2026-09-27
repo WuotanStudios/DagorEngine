@@ -16,6 +16,7 @@
 #include <osApiWrappers/dag_threads.h>
 #include <debug/dag_debug.h>
 #include <unistd.h>
+#include <signal.h>
 #include "dag_addBasePathDef.h"
 #include "dag_loadSettings.h"
 #include <workCycle/dag_workCycle.h>
@@ -31,12 +32,35 @@
 #include <osApiWrappers/dag_stackHlp.h>
 #include <EASTL/bitset.h>
 #include <EASTL/fixed_vector.h>
+#include <osApiWrappers/dag_atomic.h>
 #include <osApiWrappers/dag_atomic_types.h>
 #include <mutex>
+
+
+#ifdef DAGOR_ANDROID_DEBUG_TAG
+#define debug(...) logmessage(_MAKE4C(DAGOR_ANDROID_DEBUG_TAG), __VA_ARGS__)
+#endif
+
 
 const size_t ANDROID_ROTATED_LOGS = 3;
 
 #define AWINDOW_FLAG_KEEP_SCREEN_ON 0x00000080
+
+#ifndef DAGOR_ANDROID_EXIT_ON_CMD_DESTROY
+#define DAGOR_ANDROID_EXIT_ON_CMD_DESTROY 1
+#endif
+
+#ifndef DAGOR_ALLOW_INTENT_ARGUMENTS
+#if DAGOR_DBGLEVEL > 0
+#define DAGOR_ALLOW_INTENT_ARGUMENTS 1
+#else
+#define DAGOR_ALLOW_INTENT_ARGUMENTS 0
+#endif
+#endif
+
+#ifndef DAGOR_DEBUG_LOG_NAME
+#define DAGOR_DEBUG_LOG_NAME "debug"
+#endif
 
 void DagorWinMainInit(int nCmdShow, bool debugmode);
 int DagorWinMain(int nCmdShow, bool debugmode);
@@ -57,6 +81,8 @@ extern void messagebox_report_fatal_error(const char *title, const char *msg, co
 extern void android_d3d_reinit(void *w);
 extern void android_update_window_size(void *w);
 extern void android_init_soft_input(android_app *state);
+extern void android_hide_soft_input();
+extern void android_invalidate_soft_input();
 
 namespace workcycle_internal
 {
@@ -65,6 +91,7 @@ extern intptr_t main_window_proc(void *, unsigned, uintptr_t, intptr_t);
 
 const char *dagor_android_internal_path = NULL;
 const char *dagor_android_external_path = NULL;
+static SimpleString dagor_android_external_path_jni; // JNI fallback for externalDataPath
 const DataBlock *dagor_android_preload_settings_blk = &DataBlock::emptyBlock;
 
 SimpleString dagor_android_self_pkg_name, dagor_android_self_pkg_ver_name;
@@ -166,7 +193,9 @@ struct AndroidProcessResult
 
 static std::mutex g_android_done_command_mutex;
 static std::condition_variable g_android_done_command_condition;
+static std::condition_variable g_android_pending_command_condition;
 
+// written and reset only under g_android_done_command_mutex, in one critical section with the matching notify
 static dag::AtomicInteger<int32_t> g_android_pending_command(-1);
 
 // Normally we don't have so many input events.
@@ -315,9 +344,12 @@ struct DagorMainThread final : public DaThread
   {
     DagorHwException::setHandler("main");
 
+    // writing to a socket closed by the peer leads to SIGPIPE, process will exit if it is not ignored
+    signal(SIGPIPE, SIG_IGN);
+
     default_crt_init_kernel_lib();
 
-    if (dagor_android_external_path)
+    if (dagor_android_external_path && dagor_android_external_path[0])
     {
       char path[DAGOR_MAX_PATH];
       strcpy(path, dagor_android_external_path);
@@ -332,6 +364,13 @@ struct DagorMainThread final : public DaThread
     default_crt_init_core_lib();
     while (!win32_get_main_wnd())
     {
+      // Activity was destroyed before window was created
+      if (!win32_get_instance())
+      {
+        debug("Activity was destroyed before window was created, exiting...");
+        return;
+      }
+
       dagor_idle_cycle(false);
       debug("waiting for window to be inited...");
       sleep_msec(100);
@@ -382,7 +421,7 @@ struct DagorInputThread final : public DaThread
     {
       struct android_poll_source *source;
       int ident, events;
-      while ((ident = ALooper_pollAll(500 /* timeout */, nullptr, &events, (void **)&source)) >= 0)
+      while ((ident = ALooper_pollOnce(500 /* timeout */, nullptr, &events, (void **)&source)) >= 0)
       {
         android_app *app = (android_app *)win32_get_instance();
 
@@ -410,6 +449,31 @@ struct DagorInputThread final : public DaThread
 static DagorMainThread g_dagor_main_thread;
 static DagorInputThread g_dagor_input_thread;
 
+static std::mutex g_android_cmd_mode_mutex;
+static bool g_android_cmd_on_main_thread = false;
+
+
+static void dagor_android_restart_input_thread(struct android_app *app)
+{
+  g_dagor_input_thread.terminate(true);
+
+  g_dagor_input_thread.inputQueue = app->inputQueue;
+
+  if (g_dagor_input_thread.inputQueue)
+    g_dagor_input_thread.start();
+}
+
+
+void dagor_android_set_window_cmd_processing_on_main_thread(bool on_main_thread)
+{
+  std::lock_guard<std::mutex> lock(g_android_cmd_mode_mutex);
+  if (g_android_cmd_on_main_thread == on_main_thread)
+    return;
+
+  g_android_cmd_on_main_thread = on_main_thread;
+  debug("CMD: window commands are processed %s", on_main_thread ? "on main thread" : "in android_main");
+}
+
 
 static int push_android_input(const AndroidProcessResult &result)
 {
@@ -432,22 +496,25 @@ static void push_android_command_and_wait(int32_t cmd)
 
   int waitTimeMs = get_time_msec();
 
-  g_android_pending_command.store(cmd, dag::memory_order_release);
-
   {
     // After that time Android may generate ANR (Application Not Responsive)
     static const std::chrono::seconds ANR_TIMEOUT_SEC = std::chrono::seconds(5);
 
     std::unique_lock<std::mutex> lock(g_android_done_command_mutex);
+    g_android_pending_command.store(cmd, dag::memory_order_release);
+    g_android_pending_command_condition.notify_all();
+
     if (!g_android_done_command_condition.wait_for(lock, ANR_TIMEOUT_SEC,
           [] { return g_android_pending_command.load(dag::memory_order_acquire) < 0; }))
     {
+      lock.unlock();
       logerr("android: ANR: Handling of %s is taking more than %d sec. Context: %s", cmdName, ANR_TIMEOUT_SEC.count(),
         dagor_android_app_get_anr_execution_context ? dagor_android_app_get_anr_execution_context() : "<unknown>");
 
       if (dagor_anr_handler)
         dagor_anr_handler(cmd);
 
+      lock.lock();
       g_android_done_command_condition.wait(lock, [] { return g_android_pending_command.load(dag::memory_order_acquire) < 0; });
     }
   }
@@ -460,6 +527,8 @@ static void push_android_command_and_wait(int32_t cmd)
 
 
 static void run_android_command_as_delayed_action(int32_t cmd);
+static bool is_android_window_cmd(int32_t cmd);
+static bool dagor_android_handle_cmd_nonblocking(struct android_app *app, int32_t cmd);
 
 
 static void dagor_android_handle_cmd_thread(struct android_app *app, int32_t cmd)
@@ -467,24 +536,22 @@ static void dagor_android_handle_cmd_thread(struct android_app *app, int32_t cmd
   const char *cmdName = android::app_command_to_string(cmd);
   debug("CMD: Received: %s", cmdName);
 
+  if (dagor_android_handle_cmd_nonblocking(app, cmd))
+  {
+    debug("CMD: Done: %s (nonblocking)", cmdName);
+    return;
+  }
+
   if (dagor_allow_to_delay_android_cmd && dagor_allow_to_delay_android_cmd(cmd))
   {
     run_android_command_as_delayed_action(cmd);
     return;
   }
 
-  switch (cmd)
-  {
-    case APP_CMD_INPUT_CHANGED:
-    case APP_CMD_GAINED_FOCUS:
-    case APP_CMD_LOST_FOCUS:
-    case APP_CMD_CONTENT_RECT_CHANGED:
-    case APP_CMD_INIT_WINDOW:
-    case APP_CMD_WINDOW_RESIZED:
-    case APP_CMD_WINDOW_REDRAW_NEEDED:
-    case APP_CMD_TERM_WINDOW: push_android_command_and_wait(cmd); break;
-    default: debug("CMD: Ignored: %s", cmdName); break;
-  }
+  if (is_android_window_cmd(cmd))
+    push_android_command_and_wait(cmd);
+  else
+    debug("CMD: Ignored: %s", cmdName);
 }
 
 
@@ -521,37 +588,99 @@ dag::AtomicInteger<bool> dagor_android_in_fatal_state = false;
 bool android_should_ignore_cmd(int8_t cmd) { return dagor_should_ignore_android_cmd ? dagor_should_ignore_android_cmd(cmd) : false; }
 
 
-static void dagor_android_handle_cmd(struct android_app *app, int32_t cmd)
+static void quit_game_on_fatal_state(int32_t cmd)
 {
-  if (dagor_android_in_fatal_state.load())
+  if (!dagor_android_in_fatal_state.load())
+    return;
+
+  switch (cmd)
   {
+    case APP_CMD_INIT_WINDOW:
+    case APP_CMD_WINDOW_RESIZED:
+    case APP_CMD_TERM_WINDOW:
+    case APP_CMD_DESTROY:
+      debug("CMD: Commands can't be process during Fatal. Exit.");
+      quit_game(-1);
+      break;
+  };
+}
+
+
+static bool is_android_window_cmd(int32_t cmd)
+{
+  switch (cmd)
+  {
+    case APP_CMD_INIT_WINDOW:
+    case APP_CMD_TERM_WINDOW:
+    case APP_CMD_WINDOW_RESIZED:
+    case APP_CMD_WINDOW_REDRAW_NEEDED:
+    case APP_CMD_CONTENT_RECT_CHANGED:
+    case APP_CMD_GAINED_FOCUS:
+    case APP_CMD_LOST_FOCUS: return true;
+    default: return false;
+  }
+}
+
+
+static void call_user_message_loop_handler_delayed(struct android_app *app, int32_t cmd)
+{
+  delayed_call([app, cmd] {
+    if (dagor_android_user_message_loop_handler)
+      dagor_android_user_message_loop_handler(app, cmd);
+  });
+}
+
+
+static bool dagor_android_handle_cmd_nonblocking(struct android_app *app, int32_t cmd)
+{
+  if (cmd == APP_CMD_INPUT_CHANGED)
+  {
+    dagor_android_restart_input_thread(app);
+    call_user_message_loop_handler_delayed(app, cmd);
+    return true;
+  }
+
+  if (!is_android_window_cmd(cmd))
+    return false;
+
+  {
+    std::lock_guard<std::mutex> lock(g_android_cmd_mode_mutex);
+    if (g_android_cmd_on_main_thread)
+      return false;
+
+    quit_game_on_fatal_state(cmd);
+
     switch (cmd)
     {
       case APP_CMD_INIT_WINDOW:
-      case APP_CMD_WINDOW_RESIZED:
-      case APP_CMD_TERM_WINDOW:
-      case APP_CMD_DESTROY:
-        debug("CMD: Commands can't be process during Fatal. Exit.");
-        quit_game(-1);
+        debug("CMD: init window %p (no d3d)", app->window);
+        win32_set_main_wnd(app->window);
         break;
-    };
+      case APP_CMD_TERM_WINDOW:
+        debug("CMD: term window (no d3d)");
+        android_hide_soft_input();
+        android_invalidate_soft_input();
+        win32_set_main_wnd(NULL);
+        break;
+      case APP_CMD_GAINED_FOCUS: dgs_app_active = true; break;
+      case APP_CMD_LOST_FOCUS: dgs_app_active = false; break;
+      default: break;
+    }
   }
+
+  call_user_message_loop_handler_delayed(app, cmd);
+  return true;
+}
+
+
+static void dagor_android_handle_cmd(struct android_app *app, int32_t cmd)
+{
+  quit_game_on_fatal_state(cmd);
 
   static uint32_t lastReinitFrameNo = 0;
 
   switch (cmd)
   {
-    case APP_CMD_INPUT_CHANGED:
-      if (app->externalInputProcessing)
-      {
-        if (g_dagor_input_thread.isThreadStarted())
-          g_dagor_input_thread.terminate(true);
-        g_dagor_input_thread.inputQueue = app->inputQueue;
-
-        if (g_dagor_input_thread.inputQueue)
-          g_dagor_input_thread.start();
-      }
-      break;
     case APP_CMD_INIT_WINDOW:
       // The window is being shown, get it ready.
       if (app->window != NULL)
@@ -585,6 +714,10 @@ static void dagor_android_handle_cmd(struct android_app *app, int32_t cmd)
     case APP_CMD_TERM_WINDOW:
       // The window is being hidden or closed, clean it up.
       debug("CMD: term window");
+      // the soft-input caches (activity, decor view, global refs) are tied to this window; drop
+      // them so we don't feed stale refs into JNI after the window is gone
+      android_hide_soft_input();
+      android_invalidate_soft_input();
       discard_unused_managed_textures();
       debug("CMD: unload unused tex done");
       d3d::window_destroyed(app->window);
@@ -602,8 +735,7 @@ static void dagor_android_handle_cmd(struct android_app *app, int32_t cmd)
     case APP_CMD_DESTROY:
       debug("CMD: destroy: %s", dagor_fast_shutdown ? "fast" : "normal");
 
-      if (app->externalInputProcessing)
-        g_dagor_input_thread.terminate(true);
+      android_invalidate_soft_input();
 
       if (!dagor_fast_shutdown && d3d::is_inited())
       {
@@ -696,6 +828,13 @@ SimpleString get_library_name(JavaVM *jvm, jobject activity)
   jclass ourActivity = jni->GetObjectClass(activity);
   JNI_ASSERT(jni, ourActivity);
 
+  jmethodID getLibraryNameFoLogging = jni->GetMethodID(ourActivity, "getLibraryNameFoLogging", "()Ljava/lang/String;");
+  if (jni->ExceptionCheck())
+  {
+    jni->ExceptionClear();
+    getLibraryNameFoLogging = NULL;
+  }
+
   jmethodID getLibraryName = jni->GetMethodID(ourActivity, "getLibraryName", "()Ljava/lang/String;");
   if (jni->ExceptionCheck()) // No method in class is normal case
   {
@@ -704,7 +843,7 @@ SimpleString get_library_name(JavaVM *jvm, jobject activity)
     return SimpleString("");
   }
 
-  jstring libraryName = (jstring)jni->CallObjectMethod(activity, getLibraryName);
+  jstring libraryName = (jstring)jni->CallObjectMethod(activity, getLibraryNameFoLogging ? getLibraryNameFoLogging : getLibraryName);
   JNI_ASSERT(jni, libraryName);
 
   const char *libraryNameC = jni->GetStringUTFChars(libraryName, NULL);
@@ -721,6 +860,58 @@ SimpleString get_library_name(JavaVM *jvm, jobject activity)
   jvm->DetachCurrentThread();
   return ret;
 #undef JNI_ASSERT
+}
+
+SimpleString get_external_files_dir(JavaVM *jvm, jobject activity)
+{
+  JNIEnv *jni;
+  android::attach_current_thread(jvm, &jni, NULL);
+
+  jclass ourActivity = jni->GetObjectClass(activity);
+  if (jni->ExceptionCheck() || !ourActivity)
+  {
+    if (jni->ExceptionCheck())
+      jni->ExceptionClear();
+    jvm->DetachCurrentThread();
+    return SimpleString("");
+  }
+
+  // Activity.getExternalFilesDir(null) returns the app-specific external files directory
+  jmethodID getExternalFilesDir = jni->GetMethodID(ourActivity, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
+  if (jni->ExceptionCheck() || !getExternalFilesDir)
+  {
+    if (jni->ExceptionCheck())
+      jni->ExceptionClear();
+    jvm->DetachCurrentThread();
+    return SimpleString("");
+  }
+
+  jobject fileObj = jni->CallObjectMethod(activity, getExternalFilesDir, (jstring)NULL);
+  if (jni->ExceptionCheck() || !fileObj)
+  {
+    if (jni->ExceptionCheck())
+      jni->ExceptionClear();
+    jvm->DetachCurrentThread();
+    return SimpleString("");
+  }
+
+  jclass fileClass = jni->FindClass("java/io/File");
+  jmethodID getAbsolutePath = jni->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;");
+  jstring pathStr = (jstring)jni->CallObjectMethod(fileObj, getAbsolutePath);
+
+  if (jni->ExceptionCheck() || !pathStr)
+  {
+    if (jni->ExceptionCheck())
+      jni->ExceptionClear();
+    jvm->DetachCurrentThread();
+    return SimpleString("");
+  }
+
+  const char *pathUTF = jni->GetStringUTFChars(pathStr, NULL);
+  SimpleString ret(pathUTF);
+  jni->ReleaseStringUTFChars(pathStr, pathUTF);
+  jvm->DetachCurrentThread();
+  return ret;
 }
 
 SimpleString get_logs_folder(JavaVM *jvm, jobject activity)
@@ -775,7 +966,7 @@ SimpleString get_logs_folder(JavaVM *jvm, jobject activity)
 #undef JNI_ASSERT
 }
 
-SimpleString get_intent_arguments(JavaVM *jvm, jobject activity)
+SimpleString get_intent_string_extra(JavaVM *jvm, jobject activity, const char *key)
 {
 #define JNI_ASSERT(jni, cond)         \
   if (jni->ExceptionCheck())          \
@@ -791,7 +982,7 @@ SimpleString get_intent_arguments(JavaVM *jvm, jobject activity)
   jclass ourActivity = jni->GetObjectClass(activity);
   JNI_ASSERT(jni, ourActivity);
 
-  jmethodID getIntentArguments = jni->GetMethodID(ourActivity, "getIntentArguments", "()Ljava/lang/String;");
+  jmethodID getIntentStringExtra = jni->GetMethodID(ourActivity, "getIntentStringExtra", "(Ljava/lang/String;)Ljava/lang/String;");
   if (jni->ExceptionCheck()) // No method in class is normal case
   {
     jni->ExceptionClear();
@@ -799,7 +990,11 @@ SimpleString get_intent_arguments(JavaVM *jvm, jobject activity)
     return SimpleString("");
   }
 
-  jstring intentArguments = (jstring)jni->CallObjectMethod(activity, getIntentArguments);
+  jstring jkey = jni->NewStringUTF(key);
+  JNI_ASSERT(jni, jkey);
+
+  jstring intentArguments = (jstring)jni->CallObjectMethod(activity, getIntentStringExtra, jkey);
+  jni->DeleteLocalRef(jkey);
   JNI_ASSERT(jni, intentArguments);
 
   const char *intentArgumentsC = jni->GetStringUTFChars(intentArguments, NULL);
@@ -818,7 +1013,9 @@ SimpleString get_intent_arguments(JavaVM *jvm, jobject activity)
 #undef JNI_ASSERT
 }
 
-extern void setup_debug_system(const char *exe_fname, const char *prefix, bool datetime_name, const size_t rotatedCount);
+extern void setup_debug_system(const char *exe_fname, const char *prefix, const char *debug_fname, bool datetime_name,
+  const size_t rotatedCount);
+extern void jni_register_all_natives();
 
 static constexpr int MAX_ARGS_COUNT = 64;
 #if defined(DEBUG_ANDROID_CMDLINE_FILE)
@@ -869,18 +1066,26 @@ static void android_looper_poll_all_blocking()
 
   struct android_poll_source *source;
   int ident, events;
-  while ((ident = ALooper_pollAll(-1 /* wait until an event appears */, nullptr, &events, (void **)&source)) >= 0)
+  while ((ident = ALooper_pollOnce(-1 /* wait until an event appears */, nullptr, &events, (void **)&source)) >= 0 ||
+         ident == ALOOPER_POLL_CALLBACK)
   {
+    if (ident == ALOOPER_POLL_CALLBACK)
+      continue;
     if (source != NULL)
       source->process(source->app, source);
 
     // Check if we are exiting.
     if (app->destroyRequested != 0)
     {
+      g_dagor_input_thread.terminate(true);
       push_android_command_and_wait(APP_CMD_DESTROY);
-      android_native_app_destroy(app);
       debug("--- application destroyed ---");
+
+#if DAGOR_ANDROID_EXIT_ON_CMD_DESTROY
+      android_native_app_destroy(app);
       _exit(0);
+#endif
+
       return;
     }
   }
@@ -893,9 +1098,26 @@ void android_main(struct android_app *state)
   jobject activityObj = android::get_activity_class(state->activity);
   SimpleString logsFolder = get_logs_folder(jvm, activityObj);
 
+  // Resolve external data path: use ANativeActivity field, fall back to JNI on Android 16+
+  // where ANativeActivity::externalDataPath may be null or empty.
+  const char *externalDataPath = state->activity->externalDataPath;
+  if (!externalDataPath || !externalDataPath[0])
+  {
+    dagor_android_external_path_jni = get_external_files_dir(jvm, activityObj);
+    if (!dagor_android_external_path_jni.empty())
+      externalDataPath = dagor_android_external_path_jni.c_str();
+  }
+
+  SimpleString logsDirName = get_intent_string_extra(jvm, activityObj, "logsDirName");
   SimpleString libraryName = get_library_name(jvm, activityObj);
-  setup_debug_system((libraryName == "") ? "run" : libraryName,
-    logsFolder.empty() ? state->activity->externalDataPath : logsFolder.c_str(), DAGOR_DBGLEVEL > 0, ANDROID_ROTATED_LOGS);
+  const char *logName = logsDirName.empty() ? libraryName.empty() ? "run" : libraryName.c_str() : logsDirName.c_str();
+  // If logsDirName is specified don't use log's rotation and don't add date time to log name and keep folder name as is.
+  // For example, VersionSelector will specify logsDirName in order to have it's own log in the same folder as keep date time in log
+  // folder name.
+  const bool useDateTimeName = logsDirName.empty() ? DAGOR_DBGLEVEL > 0 : false;
+  const size_t useRotatedLogs = logsDirName.empty() ? ANDROID_ROTATED_LOGS : (DAGOR_DBGLEVEL > 0 ? 0 : ANDROID_ROTATED_LOGS);
+  setup_debug_system(logName, logsFolder.empty() ? externalDataPath : logsFolder.c_str(), DAGOR_DEBUG_LOG_NAME, useDateTimeName,
+    useRotatedLogs);
 
   g_android_joystick_events_free.set();
 
@@ -904,12 +1126,19 @@ void android_main(struct android_app *state)
 
   apply_hinstance(state, NULL);
 
+  jni_register_all_natives();
+
   android_exit_app_ptr = &android_exit_app;
 
   measure_cpu_freq();
 
   dagor_android_internal_path = state->activity->internalDataPath;
-  dagor_android_external_path = state->activity->externalDataPath;
+  dagor_android_external_path = externalDataPath;
+
+  if (externalDataPath != state->activity->externalDataPath)
+    debug("MAIN Android: externalDataPath was empty, resolved via JNI: %s", dagor_android_external_path);
+  if (!dagor_android_external_path || !dagor_android_external_path[0])
+    logerr("MAIN Android: external files dir is empty, file operations will fail");
 
   SimpleString defaultLibName{"android-native-app"};
 
@@ -928,8 +1157,8 @@ void android_main(struct android_app *state)
   const char *libname = !libraryName.empty() ? libraryName.c_str() : defaultLibName.c_str();
   copyArg(libname, ::strlen(libname));
 
-#if DAGOR_DBGLEVEL > 0
-  SimpleString intentArguments = get_intent_arguments(jvm, activityObj);
+#if DAGOR_ALLOW_INTENT_ARGUMENTS
+  SimpleString intentArguments = get_intent_string_extra(jvm, activityObj, "args");
   debug("intentArguments: %s", intentArguments.c_str());
 
   int start = 0;
@@ -951,8 +1180,11 @@ void android_main(struct android_app *state)
 #if defined(DEBUG_ANDROID_CMDLINE_FILE)
   read_argv_from_file(DEBUG_ANDROID_CMDLINE_FILE, argc, argv);
 #endif
-
-  dgs_init_argv(argc, argv);
+  char **argvptr = argv;
+#if defined OPTIONAL_ADD_ARGS
+  OPTIONAL_ADD_ARGS(argc, argvptr);
+#endif
+  dgs_init_argv(argc, argvptr);
 
   dgs_report_fatal_error = messagebox_report_fatal_error;
 
@@ -1061,7 +1293,7 @@ void android_main(struct android_app *state)
     dagor_android_scr_yres / dagor_android_scr_ydpi * 2.54);
 
   dagor_command_thread_looper = ALooper_forThread();
-  debug("Androd: dagor_command_thread_looper: %p", dagor_command_thread_looper);
+  debug("Android: dagor_command_thread_looper: %p", dagor_command_thread_looper);
 
   g_dagor_main_thread.start();
 
@@ -1086,13 +1318,20 @@ void dagor_process_sys_messages(bool /*input_only*/)
   if (!app)
     return;
 
-  const int32_t pendingCommand = g_android_pending_command.load(dag::memory_order_acquire);
-  if (pendingCommand >= 0)
+  static const std::chrono::milliseconds CHAINED_CMD_WAIT_MS = std::chrono::milliseconds(5);
+
+  int32_t pendingCommand = g_android_pending_command.load(dag::memory_order_acquire);
+  while (pendingCommand >= 0)
   {
     dagor_android_handle_cmd(app, pendingCommand);
 
+    std::unique_lock<std::mutex> lock(g_android_done_command_mutex);
     g_android_pending_command.store(-1, dag::memory_order_release);
     g_android_done_command_condition.notify_all();
+
+    const bool hasNext = g_android_pending_command_condition.wait_for(lock, CHAINED_CMD_WAIT_MS,
+      [] { return g_android_pending_command.load(dag::memory_order_acquire) >= 0; });
+    pendingCommand = hasNext ? g_android_pending_command.load(dag::memory_order_acquire) : -1;
   }
 
   int inputCallsSize = 0;
@@ -1120,10 +1359,10 @@ void dagor_process_sys_messages(bool /*input_only*/)
   free_android_joystick_events(inputCalls, inputCallsSize);
 }
 
-void dagor_idle_cycle(bool input_only)
+void dagor_idle_cycle(bool input_only, bool is_work_cycle)
 {
   TIME_PROFILE(dagor_idle_cycle);
-  perform_regular_actions_for_idle_cycle();
+  perform_regular_actions_for_idle_cycle(is_work_cycle);
   dagor_process_sys_messages(input_only);
 }
 

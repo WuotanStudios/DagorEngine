@@ -2,6 +2,7 @@
 
 #include "camera/sceneCam.h"
 #include "overlay.h"
+#include "uiShared.h"
 #include "input/inputControls.h"
 #include "input/uiInput.h"
 #include "main/app.h"
@@ -12,6 +13,8 @@
 #include "main/settings.h"
 #include <quirrel/sqSysInfo/sqSysInfo.h>
 #include <quirrel/yupfile_parse/yupfile_parse.h>
+#include <quirrel/lastInputMonitor/lastInputMonitor.h>
+#include <quirrel/ecsComputed/ecsComputed_api.h>
 #include "main/watchdog.h"
 #include "net/netBindSq.h"
 #include "net/authEvents.h"
@@ -23,9 +26,12 @@
 #include <daRg/dag_events.h>
 #include <daRg/dag_guiScene.h>
 #include <daRg/dag_browser.h>
+#include <daScript/daScript.h>
 #include <daECS/net/msgSink.h>
-#include <daECS/net/dasEvents.h>
-#include <ecs/core/entityManager.h>
+#include <ecs/net/dasEvents.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <ecs/scripts/scripts.h>
 #include <ecs/scripts/netBindSq.h>
 #include <ecs/scripts/dasEs.h>
@@ -42,11 +48,12 @@
 #include <EASTL/unique_ptr.h>
 #include <main/circuit.h>
 #include <forceFeedback/forceFeedback.h>
-#include <sqModules/sqModules.h>
+#include <sqmodules/sqmodules.h>
 #include <quirrel/bindQuirrelEx/autoBind.h>
 #include <quirrel/bindQuirrelEx/autoCleanup.h>
 #include <quirrel/bindQuirrelEx/bindQuirrelEx.h>
 #include <quirrel/http/sqHttpClient.h>
+#include <quirrel/asyncRuntime/dagorAsyncRuntime.h>
 #include <quirrel/quirrel_json/quirrel_json.h>
 #include <quirrel/sqJwt/sqJwt.h>
 #include <quirrel/clientLog/clientLog.h>
@@ -78,6 +85,9 @@
 #include <fpsProfiler/dag_perfRating.h>
 #include "main/gameLoad.h"
 
+#include <webui/httpserver.h>
+#include <webui/sqDebuggerPlugin.h>
+
 #include <soundSystem/quirrel/sqSoundSystem.h>
 
 #include <daEditorE/editorCommon/inGameEditor.h>
@@ -97,6 +107,8 @@ namespace overlay_ui
 {
 
 static eastl::unique_ptr<darg::IGuiScene> dargScene;
+
+static eastl::unique_ptr<sqasync_dagor::AsyncRuntimeScope> async_runtime;
 
 
 static const char *get_overlay_ui_script_fn()
@@ -125,8 +137,16 @@ static struct GuiSceneCb : public darg::IGuiSceneCallback
 
   virtual void onShutdownScript(HSQUIRRELVM vm) override
   {
+    uishared::set_visuallog_logerrs(-1);
+    if (async_runtime)
+      async_runtime->shutdown();
     sq::cleanup_unreg_native_api(vm);
     bindquirrel::http_client_on_vm_shutdown(vm);
+    // Scene dtor runs elements' onDetach handlers which may use ECS API,
+    // so the VM is unregistered from ECS only here, right before sq_close.
+    shutdown_ecs_sq_script(vm);
+    ecscomputed::shutdown_vm(vm); // clear_vm_entity_systems only removes squirrel ES
+    ::unregister_editor_script(vm);
   }
 
   virtual void onToggleInteractive(int iflags)
@@ -172,10 +192,10 @@ static struct GuiSceneCb : public darg::IGuiSceneCallback
 static void bind_overlay_ui_script_apis(SqModules *moduleMgr, HSQUIRRELVM vm)
 {
 #if DAGOR_DBGLEVEL > 0
-  sq_enabledebuginfo(vm, true);
   sq_enablevartrace(vm, true);
   sq_set_thread_id_function(vm, get_thread_id_func);
-  dag_sq_debuggers.initDebugger(SQ_DEBUGGER_OVERLAY_UI_SCRIPTS, moduleMgr, "Overlay UI Scripts");
+
+  webui::register_quirrel_debugger(moduleMgr, "sqdebug_overlay_ui", "quirrel debugger - Overlay UI Scripts");
   scriptprofile::register_profiler_module(vm, moduleMgr);
   const bool varTraceOn = sq_isvartracesupported();
 #else
@@ -183,7 +203,8 @@ static void bind_overlay_ui_script_apis(SqModules *moduleMgr, HSQUIRRELVM vm)
 #endif
   Sqrat::Table(Sqrat::ConstTable(vm)).SetValue("VAR_TRACE_ENABLED", varTraceOn);
 
-  sqeventbus::bind(moduleMgr, "overlay_ui", sqeventbus::ProcessingMode::MANUAL_PUMP);
+  sqeventbus::bind_ex(moduleMgr, "overlay_ui", /*freeze_wevt_tables*/ true);
+  async_runtime = eastl::make_unique<sqasync_dagor::AsyncRuntimeScope>(moduleMgr);
 
   moduleMgr->registerIoLib();
   moduleMgr->registerSystemLib();
@@ -203,6 +224,7 @@ static void bind_overlay_ui_script_apis(SqModules *moduleMgr, HSQUIRRELVM vm)
   bindquirrel::bind_http_client(moduleMgr);
   bindquirrel::bind_json_api(moduleMgr);
   bindquirrel::bind_statsd(moduleMgr);
+  inputmonitor::register_sq_module(moduleMgr);
 
   watchdog::bind_sq(moduleMgr);
 
@@ -242,7 +264,7 @@ static void bind_overlay_ui_script_apis(SqModules *moduleMgr, HSQUIRRELVM vm)
   ecs::sq::bind_net(moduleMgr);
   net::bind_danetgame_net(moduleMgr);
   bind_dascript::bind_das_events(moduleMgr);
-  bind_dascript::bind_das(moduleMgr);
+  bind_dascript::bind_das(moduleMgr, das::daScriptEnvironment::getBound());
   darg::bind_browser_behavior(moduleMgr);
   ui::videomode::bind_script(moduleMgr);
   ui::xray_ui_order::bind_script(moduleMgr);
@@ -265,7 +287,7 @@ void rebind_das()
   {
     SqModules *moduleMgr = dargScene->getModuleMgr();
     bind_dascript::bind_das_events(moduleMgr);
-    bind_dascript::bind_das(moduleMgr);
+    bind_dascript::bind_das(moduleMgr, das::daScriptEnvironment::getBound());
   }
 }
 
@@ -313,6 +335,7 @@ void init_ui()
   bindquirrel::apply_compiler_options_from_game_settings(moduleMgr);
 
   ecs_register_sq_binding(moduleMgr, true, true);
+  ecscomputed::bind_module(moduleMgr, /*default_es_tags*/ "ui");
 
   bind_overlay_ui_script_apis(moduleMgr, vm);
 
@@ -335,19 +358,20 @@ void init_ui()
 
 static inline void overlay_ui_init_on_appstart_es_event_handler(const EventOnGameAppStarted &)
 {
-  delayed_call([]() // DA to execute this after actual scene load
-    {
-      bool doconnect = false;
+  auto onAppStart = []() // DA to execute this after actual scene load
+  {
+    bool doconnect = false;
 #if DAGOR_DBGLEVEL > 0
-      if (dgs_get_argv("connect")) // do we really need it?
-        doconnect = true;
+    if (dgs_get_argv("connect")) // do we really need it?
+      doconnect = true;
 #endif
-      if (!(app_profile::get().disableRemoteNetServices || app_profile::get().devMode || doconnect))
-        overlay_ui::init_network_services();
-      else if (doconnect) //-V547
-        overlay_ui::init_network_voicechat_only();
-      overlay_ui::init_ui();
-    });
+    if (!(app_profile::get().disableRemoteNetServices || app_profile::get().devMode || doconnect))
+      overlay_ui::init_network_services();
+    else
+      overlay_ui::init_network_voicechat_only();
+    overlay_ui::init_ui();
+  };
+  delayed_call(eastl::move(onAppStart));
 }
 
 void shutdown_ui(bool quit)
@@ -372,7 +396,6 @@ void shutdown_ui(bool quit)
 
   bindquirrel::cleanup_dagor_workcycle_module(vm);
   bindquirrel::clear_logerr_interceptors(vm);
-  shutdown_ecs_sq_script(vm);
 #if _TARGET_C1 | _TARGET_C2
 
 #endif
@@ -386,13 +409,14 @@ void shutdown_ui(bool quit)
   sound::sqapi::release_vm(vm); // Note: this is also implicitly pulls 'bind_sound'
 
 #if DAGOR_DBGLEVEL > 0
-  dag_sq_debuggers.shutdownDebugger(SQ_DEBUGGER_OVERLAY_UI_SCRIPTS);
+  webui::shutdown_quirrel_debugger(dargScene->getModuleMgr());
 #endif
   // cleanup scene after all elements referncing inner VM are processed
 
   dainput::unregister_darg_scene(0);
 
-  dargScene.reset();
+  dargScene.reset();     // closes the VM via IGuiScene dtor (after onShutdownScript)
+  async_runtime.reset(); // safe now: VM is gone, no closure can deref the scope pointer
 
   if (quit)
     bindquirrel::shutdown_datacache();
@@ -401,9 +425,9 @@ void shutdown_ui(bool quit)
 
 void shutdown_network_services()
 {
+  g_entity_mgr->broadcastEventImmediate(EventScriptUiTermNetworkServices());
   if (app_profile::get().disableRemoteNetServices)
     return;
-  g_entity_mgr->broadcastEventImmediate(EventScriptUiTermNetworkServices());
 #if _TARGET_C4
 
 #endif
@@ -417,12 +441,19 @@ void update()
 
   if (dargScene)
   {
+    HSQUIRRELVM vm = dargScene->getScriptVM();
     {
       TIME_PROFILE(sq_timers);
-      bindquirrel::dagor_workcycle_frame_update(dargScene->getScriptVM());
+      bindquirrel::dagor_workcycle_frame_update(vm);
     }
 
-    sqeventbus::process_events(dargScene->getScriptVM());
+    if (async_runtime)
+      async_runtime->pump();
+
+    sqeventbus::process_events(vm);
+
+    // unregister ecs.computed systems whose script handle was collected
+    ecscomputed::sweep();
   }
 }
 

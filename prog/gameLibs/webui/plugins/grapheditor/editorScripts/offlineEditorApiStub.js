@@ -1,10 +1,17 @@
 "use strict";
 
+var NBS_PERM_LIMS = {};
+function NBS_PERM_CONST(name, value) { NBS_PERM_LIMS[name] = value }
+// node_based_perm_inc.hlsli is included right after this file
+
 var clientId = "offline";
 var errorState = false;
 var attached = false;
 var lastErrorString = null;
 var prevErrorString = null;
+var lastWarningString = null;
+var prevWarningString = null;
+var lastGraphWarnings = [];
 var offlineQueryQueue = [];
 var queryFileCache = {};
 var offlineSubgraphs = "";
@@ -81,7 +88,7 @@ function offlineUpdate()
 
     return true;
   }
-  else if (q.query.indexOf("graph&offline") == 0)
+  else if (q.query.indexOf("save_graph&offline") == 0)
   {
     offlineWriteStringToFile(offlineOutputFile, q.body);
     return true;
@@ -110,7 +117,9 @@ function readAdditionalIncludesToString(additionalIncludesFn)
 }
 
 
-function offlineBuild(fileName, outputFile, subgraphs, additionalIncludesFn)
+function offlineBuild(
+  fileName, outputFile, subgraphs,
+  additionalIncludesFn, additionalIncludesPermTable)
 {
   offlineOutputFile = outputFile;
   var graphText = offlineReadFileToString(fileName);
@@ -125,6 +134,7 @@ function offlineBuild(fileName, outputFile, subgraphs, additionalIncludesFn)
   nodeDescriptions.replaceSubgraphDescriptions("ShadersTemp", '{"descriptions":[' + subgraphs.descriptions + "]}");
   editor.restoreDescriptions();
 
+  editor.setAdditionalIncludesPermutationTable(additionalIncludesPermTable)
   editor.parseAdditionalIncludes(additionalIncludesStr);
   editor.parseGraph(graphText.length > 2 ? graphText : editor.emptyGraphStr, true);
   editor.resetHistory();

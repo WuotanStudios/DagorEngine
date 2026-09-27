@@ -20,6 +20,22 @@ namespace das
     DEFINE_VECTOR_POLICY(uint3);
     DEFINE_VECTOR_POLICY(uint4);
 
+    // fp16 family — closed arithmetic via SimPolicy_HalfVec (promote-compute-narrow).
+    // ==/!= stay on the wave-3 addEquNeqVal externs (address-bearing), so no BASIC set here.
+#define DEFINE_FP16_VECTOR_POLICY(CTYPE)                \
+    DEFINE_OP2_EVAL_NUMERIC_POLICY(CTYPE);              \
+    DEFINE_OP2_EVAL_VECNUMERIC_POLICY(CTYPE);
+
+    DEFINE_FP16_VECTOR_POLICY(half2);
+    DEFINE_FP16_VECTOR_POLICY(half3);
+    DEFINE_FP16_VECTOR_POLICY(half4);
+    DEFINE_FP16_VECTOR_POLICY(half8);
+
+    // scalar float16 — numeric + ordered comparisons (all through the generic vec4f
+    // eval path: the typed-eval ABI has no fp16 slot)
+    DEFINE_OP2_EVAL_NUMERIC_POLICY(float16_t);
+    DEFINE_OP2_EVAL_ORDERED_POLICY(float16_t);
+
     DEFINE_OP2_EVAL_BASIC_POLICY(range);
     DEFINE_OP2_EVAL_BASIC_POLICY(urange);
     DEFINE_OP2_EVAL_BASIC_POLICY(range64);
@@ -48,21 +64,21 @@ namespace das
     template <typename TT>
     void addFunctionVecBit(Module & mod, const ModuleLibrary & lib) {
         //                                     policy              ret   arg1 arg2    name
-     // mod.addFunction( make_smart<BuiltInFn<Sim_BinNot<TT>,     TT,   TT>            >("~",      lib) );
-        mod.addFunction( make_smart<BuiltInFn<Sim_BinAnd<TT>,     TT,   TT,  TT>       >("&",      lib, "BinAnd") );
-        mod.addFunction( make_smart<BuiltInFn<Sim_BinOr<TT>,      TT,   TT,  TT>       >("|",      lib, "BinOr") );
-        mod.addFunction( make_smart<BuiltInFn<Sim_BinXor<TT>,     TT,   TT,  TT>       >("^",      lib, "BinXor") );
-        mod.addFunction( make_smart<BuiltInFn<Sim_BinShl<TT>,     TT,   TT,  int32_t>  >("<<",     lib, "BinShl") );
-        mod.addFunction( make_smart<BuiltInFn<Sim_BinShr<TT>,     TT,   TT,  int32_t>  >(">>",     lib, "BinShr") );
-        mod.addFunction( make_smart<BuiltInFn<Sim_SetBinAnd<TT>,  void, TT&, TT>       >("&=",     lib, "SetBinAnd")
+     // mod.addFunction( (new BuiltInFn<Sim_BinNot<TT>,     TT,   TT>("~",      lib)) );
+        mod.addFunction( (new BuiltInFn<Sim_BinAnd<TT>,     TT,   TT,  TT>("&",      lib, "BinAnd")) );
+        mod.addFunction( (new BuiltInFn<Sim_BinOr<TT>,      TT,   TT,  TT>("|",      lib, "BinOr")) );
+        mod.addFunction( (new BuiltInFn<Sim_BinXor<TT>,     TT,   TT,  TT>("^",      lib, "BinXor")) );
+        mod.addFunction( (new BuiltInFn<Sim_BinShl<TT>,     TT,   TT,  int32_t>("<<",     lib, "BinShl")) );
+        mod.addFunction( (new BuiltInFn<Sim_BinShr<TT>,     TT,   TT,  int32_t>(">>",     lib, "BinShr")) );
+        mod.addFunction( (new BuiltInFn<Sim_SetBinAnd<TT>,  void, TT&, TT>("&=",     lib, "SetBinAnd"))
                         ->setSideEffects(SideEffects::modifyArgument) );
-        mod.addFunction( make_smart<BuiltInFn<Sim_SetBinOr<TT>,   void, TT&, TT>       >("|=",     lib, "SetBinOr")
+        mod.addFunction( (new BuiltInFn<Sim_SetBinOr<TT>,   void, TT&, TT>("|=",     lib, "SetBinOr"))
                         ->setSideEffects(SideEffects::modifyArgument) );
-        mod.addFunction( make_smart<BuiltInFn<Sim_SetBinXor<TT>,  void, TT&, TT>       >("^=",     lib, "SetBinXor")
+        mod.addFunction( (new BuiltInFn<Sim_SetBinXor<TT>,  void, TT&, TT>("^=",     lib, "SetBinXor"))
                         ->setSideEffects(SideEffects::modifyArgument) );
-        mod.addFunction( make_smart<BuiltInFn<Sim_SetBinShl<TT>,  void, TT&, int32_t>  >("<<=",    lib, "SetBinShl")
+        mod.addFunction( (new BuiltInFn<Sim_SetBinShl<TT>,  void, TT&, int32_t>("<<=",    lib, "SetBinShl"))
                         ->setSideEffects(SideEffects::modifyArgument) );
-        mod.addFunction( make_smart<BuiltInFn<Sim_SetBinShr<TT>,  void, TT&, int32_t>  >(">>=",    lib, "SetBinShr")
+        mod.addFunction( (new BuiltInFn<Sim_SetBinShr<TT>,  void, TT&, int32_t>(">>=",    lib, "SetBinShr"))
                         ->setSideEffects(SideEffects::modifyArgument) );
     }
 
@@ -117,5 +133,18 @@ namespace das
         addFunctionBasic<range64>(*this,lib);
         // urange64
         addFunctionBasic<urange64>(*this,lib);
+        // fp16 family — closed arithmetic (a*b+c on half4 yields half4); equality came
+        // with the storage wave (addEquNeqVal externs), so no addFunctionBasic here
+        addFunctionNumeric<half2>(*this,lib);
+        addFunctionVecNumeric<half2,float16_t>(*this,lib);
+        addFunctionNumeric<half3>(*this,lib);
+        addFunctionVecNumeric<half3,float16_t>(*this,lib);
+        addFunctionNumeric<half4>(*this,lib);
+        addFunctionVecNumeric<half4,float16_t>(*this,lib);
+        addFunctionNumeric<half8>(*this,lib);
+        addFunctionVecNumeric<half8,float16_t>(*this,lib);
+        // scalar float16 — numeric + ordered comparisons
+        addFunctionNumeric<float16_t>(*this,lib);
+        addFunctionOrdered<float16_t>(*this,lib);
     }
 }

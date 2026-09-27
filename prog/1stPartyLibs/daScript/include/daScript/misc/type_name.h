@@ -5,6 +5,15 @@
 #include "daScript/misc/rangetype.h"
 
 namespace das {
+    template <typename T>
+    const char *debug_type_name() {
+#if defined(_MSC_VER)
+        return __FUNCSIG__;
+#else
+        return __PRETTY_FUNCTION__;
+#endif
+    }
+
 
     template <typename TT>
     struct typeName;
@@ -17,6 +26,12 @@ namespace das {
         }
     };
 
+    template <typename TT> struct typeName<TT *> {
+        static string name() {
+            return string("ptr`") + typeName<TT>::name(); // TODO: compilation time concat
+        }
+    };
+
     template <typename FT, typename ST> struct typeName<pair<FT,ST>> {
         static string name() {
             return string("pair`") + typeName<FT>::name() + "`" + typeName<ST>::name(); // TODO: compilation time concat
@@ -26,6 +41,9 @@ namespace das {
     template <> struct typeName<int32_t>  { constexpr static const char * name() { return "int"; } };
     template <> struct typeName<uint32_t> { constexpr static const char * name() { return "uint"; } };
     template <> struct typeName<Bitfield> { constexpr static const char * name() { return "bitfield"; } };
+    template <> struct typeName<Bitfield8> { constexpr static const char * name() { return "bitfield8"; } };
+    template <> struct typeName<Bitfield16> { constexpr static const char * name() { return "bitfield16"; } };
+    template <> struct typeName<Bitfield64> { constexpr static const char * name() { return "bitfield64"; } };
     template <> struct typeName<int8_t>   { constexpr static const char * name() { return "int8"; } };
     template <> struct typeName<uint8_t>  { constexpr static const char * name() { return "uint8"; } };
     template <> struct typeName<int16_t>  { constexpr static const char * name() { return "int16"; } };
@@ -44,6 +62,29 @@ namespace das {
     template <> struct typeName<float2>   { constexpr static const char * name() { return "float2"; } };
     template <> struct typeName<float3>   { constexpr static const char * name() { return "float3"; } };
     template <> struct typeName<float4>   { constexpr static const char * name() { return "float4"; } };
+    template <> struct typeName<float16_t> { constexpr static const char * name() { return "float16"; } };
+    template <> struct typeName<half2>    { constexpr static const char * name() { return "half2"; } };
+    template <> struct typeName<half3>    { constexpr static const char * name() { return "half3"; } };
+    template <> struct typeName<half4>    { constexpr static const char * name() { return "half4"; } };
+    template <> struct typeName<half8>    { constexpr static const char * name() { return "half8"; } };
+    template <> struct typeName<short2>   { constexpr static const char * name() { return "short2"; } };
+    template <> struct typeName<short3>   { constexpr static const char * name() { return "short3"; } };
+    template <> struct typeName<short4>   { constexpr static const char * name() { return "short4"; } };
+    template <> struct typeName<short8>   { constexpr static const char * name() { return "short8"; } };
+    template <> struct typeName<ushort2>  { constexpr static const char * name() { return "ushort2"; } };
+    template <> struct typeName<ushort3>  { constexpr static const char * name() { return "ushort3"; } };
+    template <> struct typeName<ushort4>  { constexpr static const char * name() { return "ushort4"; } };
+    template <> struct typeName<ushort8>  { constexpr static const char * name() { return "ushort8"; } };
+    template <> struct typeName<byte2>    { constexpr static const char * name() { return "byte2"; } };
+    template <> struct typeName<byte3>    { constexpr static const char * name() { return "byte3"; } };
+    template <> struct typeName<byte4>    { constexpr static const char * name() { return "byte4"; } };
+    template <> struct typeName<byte8>    { constexpr static const char * name() { return "byte8"; } };
+    template <> struct typeName<byte16>   { constexpr static const char * name() { return "byte16"; } };
+    template <> struct typeName<ubyte2>   { constexpr static const char * name() { return "ubyte2"; } };
+    template <> struct typeName<ubyte3>   { constexpr static const char * name() { return "ubyte3"; } };
+    template <> struct typeName<ubyte4>   { constexpr static const char * name() { return "ubyte4"; } };
+    template <> struct typeName<ubyte8>   { constexpr static const char * name() { return "ubyte8"; } };
+    template <> struct typeName<ubyte16>  { constexpr static const char * name() { return "ubyte16"; } };
     template <> struct typeName<range>    { constexpr static const char * name() { return "range"; } };
     template <> struct typeName<urange>   { constexpr static const char * name() { return "urange"; } };
     template <> struct typeName<range64>  { constexpr static const char * name() { return "range64"; } };

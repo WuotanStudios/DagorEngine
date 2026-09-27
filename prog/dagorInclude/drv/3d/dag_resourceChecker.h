@@ -14,23 +14,39 @@ public:
 #if DAGOR_DBGLEVEL > 0
   static void init();
   static void report();
+
+  struct FramememUpdateEntry
+  {
+    const char *name;
+    uint32_t size;
+    int lockFlags;
+  };
+
+  static void recordFramememUpdate(const char *name, uint32_t size, int lock_flags);
+
 #else
   static void init() {}
   static void report() {}
 #endif
 protected:
-  void checkLockParams(uint32_t offset, uint32_t size, int flags, int bufFlags)
+  void checkLockParams(uint32_t offset, uint32_t size, int flags, int bufFlags, const char *name, uint32_t bufSize)
   {
     G_UNUSED(offset);
     G_UNUSED(size);
     G_UNUSED(flags);
     G_UNUSED(bufFlags);
+    G_UNUSED(name);
+    G_UNUSED(bufSize);
 #if DAGOR_DBGLEVEL > 0
+    if (size == 0)
+      size = bufSize;
     interlocked_add(uploaded_total, size);
     if ((bufFlags & SBCF_FRAMEMEM) == 0)
       return;
 
     interlocked_add(uploaded_framemem, size);
+
+    recordFramememUpdate(name, size, flags);
 
     // this is max size of single upload, has to fit internal ring buffer chunk size
     // otherwise its gonna be always allocated/freed. could be logerr instead of assert

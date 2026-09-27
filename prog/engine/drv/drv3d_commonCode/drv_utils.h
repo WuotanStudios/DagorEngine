@@ -1,17 +1,17 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
-#if _TARGET_PC_WIN
+#if _TARGET_PC_WIN | _TARGET_XBOX
 #include <windows.h>
 #endif
 
 #include <util/dag_stdint.h>
 #include <util/dag_compilerDefs.h>
+#include <drv/3d/dag_consts.h>
 
 class String;
 
 #define INLINE_VB_SIZE (1024 << 10)
-#define INLINE_IB_SIZE (1024 << 10)
 
 #define FALLBACK_SCREEN_WIDTH  1280
 #define FALLBACK_SCREEN_HEIGHT 720
@@ -27,7 +27,9 @@ bool get_settings_use_retina();
 void get_current_main_window_rect(int &out_def_left, int &out_def_top, int &out_def_width, int &out_def_height);
 void get_current_display_screen_mode(int &out_def_left, int &out_def_top, int &out_def_width, int &out_def_height);
 bool is_current_main_window_maximized();
+#endif
 
+#if _TARGET_PC_WIN | _TARGET_XBOX
 struct RenderWindowSettings
 {
   int resolutionX;
@@ -50,14 +52,15 @@ struct RenderWindowParams
   const char *wcname;
   int ncmdshow;
   void *hwnd;
-  void *rwnd;
   void *icon;
   const char *title;
   void *mainProc;
 };
 
 bool set_render_window_params(RenderWindowParams &p, const RenderWindowSettings &s);
+#endif
 
+#if _TARGET_PC_WIN
 int set_display_device_mode(bool inwin, int res_x, int res_y, int scr_bpp, DEVMODE &out_devm);
 
 bool get_monitor_info(const char *monitorName, String *friendlyMonitorName, int *uniqueIndex);
@@ -81,3 +84,7 @@ const char *get_monitor_name_from_settings();
 const char *resolve_monitor_name(const char *displayName);
 
 int drv_message_box(const char *utf8_text, const char *utf8_caption, int flags = 0);
+
+const char *to_string(ShaderStage stage);
+
+int get_presentation_interval_from_settings();

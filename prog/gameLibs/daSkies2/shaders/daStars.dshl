@@ -6,6 +6,7 @@ include "brunetonSkies.dshl"
 include "skies_special_vision.dshl"
 include "vr_reprojection.dshl"
 include "use_custom_fog_sky.dshl"
+include "camera_in_camera.dshl"
 
 float star_intensity = 1;
 float stars_scale = 1;
@@ -19,6 +20,9 @@ interval sky_space_mode: sky_space_off < 1, sky_space_on;
 
 int disable_volfog_on_stars = 0;
 interval disable_volfog_on_stars: no < 1, yes;
+
+int special_vision;
+interval special_vision: special_vision_off < 1, thermal_vision;
 
 shader daStars, daMoon
 {
@@ -34,7 +38,9 @@ shader daStars, daMoon
       starIntensity@f2 = (stars_scale, star_intensity + 1.2e-07, 0, 0);        // Add ~FLT_EPSILON to compensate for FP errors in interpolation. Background sky bright points randomly blend through the moon on GeForce.
       sincosLat_lst@f4 = (sin(stars_lattitude*(PI/180)), cos(stars_lattitude*(PI/180)), stars_lst*(15*PI/180), -0.5*PI);
     }
-    (ps) { stars_tex@smp2d = stars_tex; }
+    (ps) { stars_tex@tex2d = stars_tex; }
+    INIT_GLOBAL_LINEAR_WRAP_SAMPLER(ps)
+    hlsl(ps) { #define stars_tex_samplerstate global_linear_wrap_sampler }
     blend_src = 1; blend_dst = 1;
   } else
   {
@@ -51,7 +57,9 @@ shader daStars, daMoon
   {
     INIT_CLOUDS_ALPHA_PANORAMA()
     USE_CLOUDS_ALPHA_PANORAMA()
-    (ps) {sky_panorama_tex@smp2d = sky_panorama_tex; }
+    (ps) {sky_panorama_tex@tex2d = sky_panorama_tex; }
+    INIT_GLOBAL_LINEAR_WRAP_U_CLAMP_V_SAMPLER(ps)
+    hlsl(ps) { #define sky_panorama_tex_samplerstate global_linear_wrap_u_clamp_v_sampler }
   }
 
   USE_SPECIAL_VISION()
@@ -64,7 +72,6 @@ shader daStars, daMoon
   GET_ATMO(ps)
   INIT_BOUNDING_VIEW_REPROJECTION_PS()
   USE_BOUNDING_VIEW_REPROJECTION_PS()
-  ENABLE_ASSERT(ps)
 
   (ps) {
     skies_transmittance_texture@smp2d = skies_transmittance_texture;
@@ -73,6 +80,7 @@ shader daStars, daMoon
   if (disable_volfog_on_stars == no)
   {
     INIT_ZNZFAR_STAGE(ps)
+    INIT_AND_USE_ON_TOP_CAMERA_IN_CAMERA(ps)
     USE_CUSTOM_FOG_SKY(ps)
   }
 
@@ -153,7 +161,7 @@ shader daStars, daMoon
         float3 inscatterColor = sample_skies_scattering_color_camera(scrTC, view, miePhase).rgb;
       ##endif
 
-##if disable_volfog_on_stars == no
+##if disable_volfog_on_stars == no && special_vision == special_vision_off
       {
         float4 combinedFog = float4(inscatterColor, alpha);
         apply_sky_custom_fog(combinedFog, scrTC, scrTC);

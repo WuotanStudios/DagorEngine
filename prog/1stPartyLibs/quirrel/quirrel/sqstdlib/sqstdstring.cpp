@@ -4,18 +4,18 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <ctype.h>
 #include <assert.h>
 #include <stdarg.h>
 #include <sqstringlib.h>
+#include <sq_char_class.h>
 
 #define MAX_FORMAT_LEN  20
 #define MAX_WFORMAT_LEN 3
-#define ADDITIONAL_FORMAT_SPACE (100*sizeof(SQChar))
+#define ADDITIONAL_FORMAT_SPACE (100*sizeof(char))
 
 static SQUserPointer rex_typetag = NULL;
 
-static SQBool isfmtchr(SQChar ch)
+static SQBool isfmtchr(char ch)
 {
     switch(ch) {
     case '-': case '+': case ' ': case '#': case '0': return SQTrue;
@@ -23,20 +23,20 @@ static SQBool isfmtchr(SQChar ch)
     return SQFalse;
 }
 
-static SQInteger validate_format(HSQUIRRELVM v, SQChar *fmt, const SQChar *src, SQInteger n,SQInteger &width)
+static SQInteger validate_format(HSQUIRRELVM v, char *fmt, const char *src, SQInteger n,SQInteger &width)
 {
-    SQChar *dummy;
-    SQChar swidth[MAX_WFORMAT_LEN];
+    char *dummy;
+    char swidth[MAX_WFORMAT_LEN];
     SQInteger wc = 0;
     SQInteger start = n;
     fmt[0] = '%';
     while (isfmtchr(src[n])) n++;
-    while (isdigit(src[n])) {
+    while (sq_isdigit(src[n])) {
         swidth[wc] = src[n];
         n++;
         wc++;
         if(wc>=MAX_WFORMAT_LEN)
-            return sq_throwerror(v,_SC("width format too long"));
+            return sq_throwerror(v,"width format too long");
     }
     swidth[wc] = '\0';
     if(wc > 0) {
@@ -48,12 +48,12 @@ static SQInteger validate_format(HSQUIRRELVM v, SQChar *fmt, const SQChar *src, 
         n++;
 
         wc = 0;
-        while (isdigit(src[n])) {
+        while (sq_isdigit(src[n])) {
             swidth[wc] = src[n];
             n++;
             wc++;
             if(wc>=MAX_WFORMAT_LEN)
-                return sq_throwerror(v,_SC("precision format too long"));
+                return sq_throwerror(v,"precision format too long");
         }
         swidth[wc] = '\0';
         if(wc > 0) {
@@ -62,23 +62,23 @@ static SQInteger validate_format(HSQUIRRELVM v, SQChar *fmt, const SQChar *src, 
         }
     }
     if (n-start > MAX_FORMAT_LEN )
-        return sq_throwerror(v,_SC("format too long"));
-    memcpy(&fmt[1],&src[start],((n-start)+1)*sizeof(SQChar));
+        return sq_throwerror(v,"format too long");
+    memcpy(&fmt[1],&src[start],((n-start)+1)*sizeof(char));
     fmt[(n-start)+2] = '\0';
     return n;
 }
 
-SQRESULT sqstd_format(HSQUIRRELVM v,SQInteger nformatstringidx,SQInteger *outlen,SQChar **output)
+SQRESULT sqstd_format(HSQUIRRELVM v,SQInteger nformatstringidx,SQInteger *outlen,char **output)
 {
-    const SQChar *format;
-    SQChar *dest;
-    SQChar fmt[MAX_FORMAT_LEN];
+    const char *format;
+    char *dest;
+    char fmt[MAX_FORMAT_LEN + 5];
     const SQRESULT res = sq_getstring(v,nformatstringidx,&format);
     if (SQ_FAILED(res)) {
         return res; // propagate the error
     }
     SQInteger format_size = sq_getsize(v,nformatstringidx);
-    SQInteger allocated = (format_size+2)*sizeof(SQChar);
+    SQInteger allocated = (format_size+2)*sizeof(char);
     dest = sq_getscratchpad(v,allocated);
     SQInteger n = 0,i = 0, nparam = nformatstringidx+1, w = 0;
     //while(format[n] != '\0')
@@ -96,19 +96,19 @@ SQRESULT sqstd_format(HSQUIRRELVM v,SQInteger nformatstringidx,SQInteger *outlen
         else {
             n++;
             if( nparam > sq_gettop(v) )
-                return sq_throwerror(v,_SC("not enough parameters for the given format string"));
+                return sq_throwerror(v,"not enough parameters for the given format string");
             n = validate_format(v,fmt,format,n,w);
             if(n < 0) return -1;
             SQInteger addlen = 0;
             SQInteger valtype = 0;
-            const SQChar *ts = NULL;
+            const char *ts = NULL;
             SQInteger ti = 0;
             SQFloat tf = 0;
             switch(format[n]) {
             case 's':
                 if(SQ_FAILED(sq_getstring(v,nparam,&ts)))
-                    return sq_throwerror(v,_SC("string expected for the specified format"));
-                addlen = (sq_getsize(v,nparam)*sizeof(SQChar))+((w+1)*sizeof(SQChar));
+                    return sq_throwerror(v,"string expected for the specified format");
+                addlen = (sq_getsize(v,nparam)*sizeof(char))+((w+1)*sizeof(char));
                 valtype = 's';
                 break;
             case 'i': case 'd': case 'o': case 'u':  case 'x':  case 'X':
@@ -116,32 +116,32 @@ SQRESULT sqstd_format(HSQUIRRELVM v,SQInteger nformatstringidx,SQInteger *outlen
                 {
                 size_t flen = strlen(fmt);
                 SQInteger fpos = flen - 1;
-                SQChar f = fmt[fpos];
-                const SQChar *prec = (const SQChar *)_PRINT_INT_PREC;
-                while(*prec != _SC('\0')) {
+                char f = fmt[fpos];
+                const char *prec = (const char *)_PRINT_INT_PREC;
+                while(*prec != '\0') {
                     fmt[fpos++] = *prec++;
                 }
                 fmt[fpos++] = f;
-                fmt[fpos++] = _SC('\0');
+                fmt[fpos++] = '\0';
                 }
 #endif
             case 'c':
                 if(SQ_FAILED(sq_getinteger(v,nparam,&ti)))
-                    return sq_throwerror(v,_SC("integer expected for the specified format"));
-                addlen = (ADDITIONAL_FORMAT_SPACE)+((w+1)*sizeof(SQChar));
+                    return sq_throwerror(v,"integer expected for the specified format");
+                addlen = (ADDITIONAL_FORMAT_SPACE)+((w+1)*sizeof(char));
                 valtype = 'i';
                 break;
             case 'f': case 'g': case 'G': case 'e':  case 'E':
                 if(SQ_FAILED(sq_getfloat(v,nparam,&tf)))
-                    return sq_throwerror(v,_SC("float expected for the specified format"));
-                addlen = (ADDITIONAL_FORMAT_SPACE)+((w+1)*sizeof(SQChar));
+                    return sq_throwerror(v,"float expected for the specified format");
+                addlen = (ADDITIONAL_FORMAT_SPACE)+((w+1)*sizeof(char));
                 valtype = 'f';
                 break;
             default:
-                return sq_throwerror(v,_SC("invalid format"));
+                return sq_throwerror(v,"invalid format");
             }
             n++;
-            allocated += addlen + sizeof(SQChar);
+            allocated += addlen + sizeof(char);
             dest = sq_getscratchpad(v,allocated);
             switch(valtype) {
             case 's': i += scsprintf(&dest[i],allocated,fmt,ts); break;
@@ -163,13 +163,13 @@ SQRESULT sqstd_format(HSQUIRRELVM v,SQInteger nformatstringidx,SQInteger *outlen
     return SQ_OK;
 }
 
-void sqstd_pushstringf(HSQUIRRELVM v,const SQChar *s,...)
+void sqstd_pushstringf(HSQUIRRELVM v,const char *s,...)
 {
     SQInteger n=256;
     va_list args;
 begin:
     va_start(args,s);
-    SQChar *b=sq_getscratchpad(v,n);
+    char *b=sq_getscratchpad(v,n);
     SQInteger r=vsnprintf(b,n,s,args);
     va_end(args);
     if (r>=n) {
@@ -184,20 +184,20 @@ begin:
 
 static SQInteger _string_printf(HSQUIRRELVM v)
 {
-    SQChar *dest = NULL;
+    char *dest = NULL;
     SQInteger length = 0;
     if(SQ_FAILED(sqstd_format(v,2,&length,&dest)))
         return -1;
 
     SQPRINTFUNCTION printfunc = sq_getprintfunc(v);
-    if(printfunc) printfunc(v,_SC("%s"),dest);
+    if(printfunc) printfunc(v,"%s",dest);
 
     return 0;
 }
 
 static SQInteger _string_format(HSQUIRRELVM v)
 {
-    SQChar *dest = NULL;
+    char *dest = NULL;
     SQInteger length = 0;
     if(SQ_FAILED(sqstd_format(v,2,&length,&dest)))
         return -1;
@@ -220,69 +220,88 @@ IMPL_STRING_FUNC(endswith)
 #define SETUP_REX(v) \
     SQRex *self = NULL; \
     if(SQ_FAILED(sq_getinstanceup(v,1,(SQUserPointer *)&self,rex_typetag))) { \
-        return sq_throwerror(v,_SC("invalid type tag")); \
+        return sq_throwerror(v,"invalid type tag"); \
     }
 
-static SQInteger _rexobj_releasehook(SQUserPointer p, SQInteger SQ_UNUSED_ARG(size))
+static SQInteger _rexobj_releasehook(HSQUIRRELVM SQ_UNUSED_ARG(vm), SQUserPointer p, SQInteger SQ_UNUSED_ARG(size))
 {
     SQRex *self = ((SQRex *)p);
     sqstd_rex_free(self);
     return 1;
 }
 
+// an aborted match must not read as a plain mismatch
+#define CHECK_REX_ABORTED(v, self) \
+    if(sqstd_rex_matchaborted(self)) \
+        return sq_throwerror(v,"regexp match aborted: pattern too complex for this input")
+
 static SQInteger _regexp_match(HSQUIRRELVM v)
 {
     SETUP_REX(v);
-    const SQChar *str;
+    const char *str;
     sq_getstring(v,2,&str);
     if(sqstd_rex_match(self,str) == SQTrue)
     {
         sq_pushbool(v,SQTrue);
         return 1;
     }
+    CHECK_REX_ABORTED(v, self);
     sq_pushbool(v,SQFalse);
     return 1;
 }
 
-static void _addrexmatch(HSQUIRRELVM v,const SQChar *str,const SQChar *begin,const SQChar *end)
+static void _addrexmatch(HSQUIRRELVM v,const char *str,const char *begin,const char *end)
 {
     sq_newtable(v);
-    sq_pushstring(v,_SC("begin"),-1);
+    sq_pushstring(v,"begin",-1);
     sq_pushinteger(v,begin - str);
     sq_rawset(v,-3);
-    sq_pushstring(v,_SC("end"),-1);
+    sq_pushstring(v,"end",-1);
     sq_pushinteger(v,end - str);
     sq_rawset(v,-3);
+}
+
+static SQRESULT _regexp_get_string_and_start(HSQUIRRELVM v, const char **str, SQInteger *strLen, SQInteger *start)
+{
+    *start = 0;
+    if (SQ_FAILED(sq_getstringandsize(v, 2, str, strLen)))
+        return sq_throwerror(v, "string expected");
+    if (sq_gettop(v) > 2 && SQ_FAILED(sq_getinteger(v, 3, start)))
+        return sq_throwerror(v, "integer expected");
+    if (*start < 0 || *start > *strLen)
+        return sq_throwerror(v, "start index out of range");
+    return SQ_OK;
 }
 
 static SQInteger _regexp_search(HSQUIRRELVM v)
 {
     SETUP_REX(v);
-    const SQChar *str,*begin,*end;
-    SQInteger start = 0;
-    sq_getstring(v,2,&str);
-    if(sq_gettop(v) > 2) sq_getinteger(v,3,&start);
+    const char *str, *begin, *end;
+    SQInteger strLen, start;
+    if (SQ_FAILED(_regexp_get_string_and_start(v, &str, &strLen, &start)))
+        return SQ_ERROR;
     if(sqstd_rex_search(self,str+start,&begin,&end) == SQTrue) {
         _addrexmatch(v,str,begin,end);
         return 1;
     }
+    CHECK_REX_ABORTED(v, self);
     return 0;
 }
 
 static SQInteger _regexp_capture(HSQUIRRELVM v)
 {
     SETUP_REX(v);
-    const SQChar *str,*begin,*end;
-    SQInteger start = 0;
-    sq_getstring(v,2,&str);
-    if(sq_gettop(v) > 2) sq_getinteger(v,3,&start);
+    const char *str, *begin, *end;
+    SQInteger strLen, start;
+    if (SQ_FAILED(_regexp_get_string_and_start(v, &str, &strLen, &start)))
+        return SQ_ERROR;
     if(sqstd_rex_search(self,str+start,&begin,&end) == SQTrue) {
         SQInteger n = sqstd_rex_getsubexpcount(self);
         SQRexMatch match;
         sq_newarray(v,0);
         for(SQInteger i = 0;i < n; i++) {
             sqstd_rex_getsubexp(self,i,&match);
-            if(match.len > 0)
+            if(match.begin)
                 _addrexmatch(v,str,match.begin,match.begin+match.len);
             else
                 _addrexmatch(v,str,str,str); //empty match
@@ -290,6 +309,7 @@ static SQInteger _regexp_capture(HSQUIRRELVM v)
         }
         return 1;
     }
+    CHECK_REX_ABORTED(v, self);
     return 0;
 }
 
@@ -304,12 +324,12 @@ static SQInteger _regexp_constructor(HSQUIRRELVM v)
 {
     SQRex *self = NULL;
     if (SQ_FAILED(sq_getinstanceup(v, 1, (SQUserPointer *)&self, rex_typetag))) {
-        return sq_throwerror(v, _SC("invalid type tag"));
+        return sq_throwerror(v, "invalid type tag");
     }
     if (self != NULL) {
-        return sq_throwerror(v, _SC("invalid regexp object"));
+        return sq_throwerror(v, "invalid regexp object");
     }
-    const SQChar *error,*pattern;
+    const char *error,*pattern;
     sq_getstring(v,2,&pattern);
     SQRex *rex = sqstd_rex_compile(sq_getallocctx(v),pattern,&error);
     if(!rex) return sq_throwerror(v,error);
@@ -320,15 +340,15 @@ static SQInteger _regexp_constructor(HSQUIRRELVM v)
 
 static SQInteger _regexp__typeof(HSQUIRRELVM v)
 {
-    sq_pushstring(v,_SC("regexp"),-1);
+    sq_pushstring(v,"regexp",-1);
     return 1;
 }
 
 static const SQRegFunctionFromStr rexobj_funcs[] = {
     { _regexp_constructor, "constructor(pattern: string): instance" },
     { _regexp_match, "instance.match(str: string): bool" },
-    { _regexp_search, "instance.search(str: string, [start: int]): table" },
-    { _regexp_capture, "instance.capture(str: string, [start: int]): array" },
+    { _regexp_search, "instance.search(str: string, [start: int]): table|null" },
+    { _regexp_capture, "instance.capture(str: string, [start: int]): array|null" },
     { _regexp_subexpcount, "instance.subexpcount(): int" },
     { _regexp__typeof, "instance._typeof(): string" },
     { NULL, NULL }
@@ -337,21 +357,20 @@ static const SQRegFunctionFromStr rexobj_funcs[] = {
 static const SQRegFunctionFromStr stringlib_funcs[] = {
     { _string_format, "pure format(fmt: string, ...): string" },
     { _string_printf, "printf(fmt: string, ...)" },
-    { _string_strip, "pure strip(str: string): string" },
-    { _string_lstrip, "pure lstrip(str: string): string" },
-    { _string_rstrip, "pure rstrip(str: string): string" },
+    { _string_strip, "pure fastcall strip(str: string): string" },
+    { _string_lstrip, "pure fastcall lstrip(str: string): string" },
+    { _string_rstrip, "pure fastcall rstrip(str: string): string" },
     { _string_split_by_chars, "split_by_chars(str: string, separators: string, [skip_empty: bool]): array" },
     { _string_escape, "pure escape(str: string): string" },
-    { _string_startswith, "pure startswith(str: string, prefix: string): bool" },
-    { _string_endswith, "pure endswith(str: string, suffix: string): bool" },
+    { _string_startswith, "pure fastcall startswith(str: string, prefix: string): bool" },
+    { _string_endswith, "pure fastcall endswith(str: string, suffix: string): bool" },
     { NULL, NULL },
 };
-#undef _DECL_FUNC
 
 
 SQRESULT sqstd_register_stringlib(HSQUIRRELVM v)
 {
-    sq_pushstring(v, _SC("regexp"), -1);
+    sq_pushstring(v, "regexp", -1);
     sq_newclass(v, SQFalse);
     rex_typetag = (SQUserPointer)rexobj_funcs;
     sq_settypetag(v, -1, rex_typetag);

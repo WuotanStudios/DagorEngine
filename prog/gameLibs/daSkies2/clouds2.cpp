@@ -3,6 +3,9 @@
 #include "clouds2.h"
 #include "cloudsShaderVars.h"
 
+#include <math/dag_mathBase.h>
+#include "shaders/clouds2/clouds_droplet_phase.hlsli"
+
 #include <drv/3d/dag_rwResource.h>
 #include <drv/3d/dag_draw.h>
 #include <drv/3d/dag_lock.h>
@@ -22,9 +25,9 @@ bool Clouds2::hasVisibleClouds() const // GPU readback!
   return false;
 }
 
-void Clouds2::updateErosionNoiseWind(float dt)
+void Clouds2::updateErosionNoiseWind(float dt, const Point2 &wind_dir)
 {
-  erosionWindChange = windDir * (renderingParams.erosionWindSpeed * dt);
+  erosionWindChange = wind_dir * (renderingParams.erosionWindSpeed * dt);
   clouds_erosion_noise_wind_ofs += erosionWindChange;
   float erosionNoiseSize = renderingParams.erosion_noise_size * 32.f;
   clouds_erosion_noise_wind_ofs =
@@ -62,7 +65,7 @@ void Clouds2::setCloudsShadowCoverage()
         max(0.f, formParams.layers[1].thickness - (2.f / cloudsThickness / 64)) / cloudsThickness; // 2/64 is two texels
   float averageCumulonimbusCoverage = safePow(weatherParams.cumulonimbusCoverage * 2 - 1, 4) * 0.5;
   cloudsShadowCoverage = lerp(averageCoverage, averageCumulonimbusCoverage, weatherParams.cumulonimbusCoverage);
-  ShaderGlobal::set_real(clouds_shadow_coverageVarId, cloudsShadowCoverage);
+  ShaderGlobal::set_float(clouds_shadow_coverageVarId, cloudsShadowCoverage);
 }
 
 void Clouds2::setCloudLightVars()
@@ -75,57 +78,81 @@ void Clouds2::setCloudLightVars()
   ShaderGlobal::set_int(clouds_cumulonimbus_shape_scaleVarId,
     max(int(1), (int)floorf((formParams.cumulonimbusShapeScale * weatherParams.worldSize) / 65536.0 + 0.5)));
   ShaderGlobal::set_int(clouds_turbulence_freqVarId, formParams.turbulenceFreq);
-  ShaderGlobal::set_real(clouds_turbulence_scaleVarId, formParams.turbulenceStrength);
+  ShaderGlobal::set_float(clouds_turbulence_scaleVarId, formParams.turbulenceStrength);
   calcCloudsAlt();
   const float cloudsThickness = cloudsEndAt - cloudsStartAt;
-  ShaderGlobal::set_color4(clouds_layers_typesVarId, formParams.layers[0].clouds_type, formParams.layers[0].clouds_type_variance,
+  ShaderGlobal::set_float4(clouds_layers_typesVarId, formParams.layers[0].clouds_type, formParams.layers[0].clouds_type_variance,
     formParams.layers[1].clouds_type, formParams.layers[1].clouds_type_variance);
   float global_clouds_sigma = clouds_sigma_from_extinction(formParams.extinction);
-  ShaderGlobal::set_real(global_clouds_sigmaVarId, global_clouds_sigma);
-  ShaderGlobal::set_real(clouds_first_layer_densityVarId, formParams.layers[0].density);
-  ShaderGlobal::set_real(clouds_second_layer_densityVarId, formParams.layers[1].density);
-  ShaderGlobal::set_real(clouds_thickness2VarId, cloudsThickness);
-  ShaderGlobal::set_real(clouds_start_altitude2VarId, cloudsStartAt);
-  ShaderGlobal::set_color4(clouds_height_fractionsVarId,
+  ShaderGlobal::set_float(global_clouds_sigmaVarId, global_clouds_sigma);
+  ShaderGlobal::set_float(clouds_first_layer_densityVarId, formParams.layers[0].density);
+  ShaderGlobal::set_float(clouds_second_layer_densityVarId, formParams.layers[1].density);
+  ShaderGlobal::set_float(clouds_thickness2VarId, cloudsThickness);
+  ShaderGlobal::set_float(clouds_start_altitude2VarId, cloudsStartAt);
+  ShaderGlobal::set_float4(clouds_height_fractionsVarId,
     P2D(alt_to_diap(formParams.layers[0].startAt, formParams.layers[0].thickness, cloudsStartAt, cloudsThickness)),
     P2D(alt_to_diap(formParams.layers[1].startAt, formParams.layers[1].thickness, cloudsStartAt, cloudsThickness)));
+  ShaderGlobal::set_float(clouds_rain_map_max_heightVarId, (formParams.layers[0].thickness + formParams.layers[0].startAt) * 1000);
 
   // TODO: until node based shaders have preshader support, we calculate the necessary shadervars by hand here:
   float clouds_start_altitude2 = cloudsStartAt;
   float clouds_thickness2 = cloudsThickness;
   float clouds_weather_size = weatherParams.worldSize;
-  ShaderGlobal::set_color4(nbs_world_pos_to_clouds_alt__inv_clouds_weather_size__neg_clouds_thickness_mVarId,
+  ShaderGlobal::set_float4(nbs_world_pos_to_clouds_alt__inv_clouds_weather_size__neg_clouds_thickness_mVarId,
     0.001f / clouds_thickness2, -clouds_start_altitude2 / clouds_thickness2, 1.0f / clouds_weather_size, -1000 * clouds_thickness2);
-  ShaderGlobal::set_real(nbs_clouds_start_altitude2_metersVarId, cloudsStartAt * 1000);
+  ShaderGlobal::set_float(nbs_clouds_start_altitude2_metersVarId, cloudsStartAt * 1000);
 
+  ShaderGlobal::set_float(clouds_perlin_worley_dilationVarId, formParams.perlin_worley_dilation);
+  ShaderGlobal::set_float(clouds_worley_erosionVarId, formParams.worley_erosion);
+  ShaderGlobal::set_float(clouds_shape_gammaVarId, formParams.shape_gamma);
   setCloudsShadowCoverage();
 }
 
 void Clouds2::setCloudRenderingVars()
 {
-  ShaderGlobal::set_real(clouds_forward_eccentricityVarId, renderingParams.forward_eccentricity);
-  ShaderGlobal::set_real(clouds_back_eccentricityVarId, -renderingParams.back_eccentricity);
-  ShaderGlobal::set_real(clouds_forward_eccentricity_weightVarId, renderingParams.forward_eccentricity_weight);
+  ShaderGlobal::set_float(clouds_forward_eccentricityVarId, renderingParams.forward_eccentricity);
+  ShaderGlobal::set_float(clouds_back_eccentricityVarId, -renderingParams.back_eccentricity);
+  ShaderGlobal::set_float(clouds_forward_eccentricity_weightVarId, renderingParams.forward_eccentricity_weight);
   float erosionNoiseSize = renderingParams.erosion_noise_size * 32.f;
-  ShaderGlobal::set_real(clouds_erosion_noise_tile_sizeVarId, erosionNoiseSize);
-  ShaderGlobal::set_real(clouds_ambient_desaturationVarId, renderingParams.ambient_desaturation);
-  ShaderGlobal::set_real(clouds_ms_contributionVarId, renderingParams.ms_contribution);
-  ShaderGlobal::set_real(clouds_ms_attenuationVarId, renderingParams.ms_attenuation);
-  ShaderGlobal::set_real(clouds_ms_eccentricity_attenuationVarId, renderingParams.ms_ecc_attenuation);
+  ShaderGlobal::set_float(clouds_erosion_noise_tile_sizeVarId, erosionNoiseSize);
+  ShaderGlobal::set_float(clouds_erosion_strengthVarId, renderingParams.erosion_strength);
+  ShaderGlobal::set_float(clouds_erosion_height_biasVarId, renderingParams.erosion_height_bias);
+  ShaderGlobal::set_float(clouds_erosion_edge_mulVarId, renderingParams.erosion_edge_mul);
+  ShaderGlobal::set_float(clouds_erosion_edge_addVarId, renderingParams.erosion_edge_add);
+  ShaderGlobal::set_float(clouds_ambient_desaturationVarId, renderingParams.ambient_desaturation);
+  ShaderGlobal::set_float(clouds_ms_contributionVarId, renderingParams.ms_contribution);
+  ShaderGlobal::set_float(clouds_ms_attenuationVarId, renderingParams.ms_attenuation);
+  ShaderGlobal::set_float(clouds_ms_eccentricity_attenuationVarId, renderingParams.ms_ecc_attenuation);
+  ShaderGlobal::set_float(clouds_droplet_diameter_umVarId, renderingParams.droplet_diameter_um);
+  {
+    // fold the droplet HG-fit constants once (see clouds_droplet_phase.hlsli); the
+    // in-shader spike needs only ((1-w)(1-g^2)/4, (1-g)^2, 2g)
+    float dUm = clamp(renderingParams.droplet_diameter_um, 5.f, 50.f);
+    float g = clouds_droplet_hg_g(dUm), w = clouds_droplet_hg_weight(dUm);
+    ShaderGlobal::set_float4(clouds_droplet_phase_paramsVarId, (1.f - w) * (1.f - g * g) * 0.25f, (1.f - g) * (1.f - g), 2.f * g, 0.f);
+  }
+  ShaderGlobal::set_float(clouds_edge_albedoVarId, renderingParams.edge_albedo);
+  ShaderGlobal::set_float(clouds_edge_albedo_sharpnessVarId, renderingParams.edge_albedo_sharpness);
+  // negative exposure would make the TAA tonemap rcp(luma*e+1) singular; 0 = off
+  ShaderGlobal::set_float(clouds_taa_exposureVarId, max(0.f, renderingParams.taa_exposure_scale));
+  ShaderGlobal::set_float(clouds_bsm_ms_attn_sqVarId, renderingParams.ms_attenuation * renderingParams.ms_attenuation);
+  // consumer-side decode only: the bake keeps its units, so no map invalidation
+  ShaderGlobal::set_float(clouds_bsm_scattering_physicalityVarId, renderingParams.bsm_scattering_physicality);
+  cloudShadows.setBSMLog2AmortizeFrames(renderingParams.bsm_log2_amortize_frames);
 }
 
 void Clouds2::setWeatherGenVars()
 {
-  ShaderGlobal::set_real(clouds_weather_sizeVarId, weatherParams.worldSize);
-  ShaderGlobal::set_real(clouds_layer1_coverageVarId, weatherParams.layers[0].coverage);
-  ShaderGlobal::set_real(clouds_layer1_freqVarId, weatherParams.layers[0].freq);
-  ShaderGlobal::set_real(clouds_layer1_seedVarId, weatherParams.layers[0].seed);
-  ShaderGlobal::set_real(clouds_layer2_coverageVarId, weatherParams.layers[1].coverage);
-  ShaderGlobal::set_real(clouds_layer2_freqVarId, weatherParams.layers[1].freq);
-  ShaderGlobal::set_real(clouds_layer2_seedVarId, weatherParams.layers[1].seed);
-  ShaderGlobal::set_real(clouds_epicnessVarId, weatherParams.epicness);
-  ShaderGlobal::set_real(clouds_rain_clouds_amountVarId, weatherParams.cumulonimbusCoverage);
-  ShaderGlobal::set_real(clouds_rain_clouds_seedVarId, weatherParams.cumulonimbusSeed);
+  ShaderGlobal::set_float(clouds_weather_sizeVarId, weatherParams.worldSize);
+  ShaderGlobal::set_float(clouds_layer1_coverageVarId, weatherParams.layers[0].coverage);
+  ShaderGlobal::set_float(clouds_layer1_freqVarId, weatherParams.layers[0].freq);
+  ShaderGlobal::set_float(clouds_layer1_seedVarId, weatherParams.layers[0].seed);
+  ShaderGlobal::set_float(clouds_layer2_coverageVarId, weatherParams.layers[1].coverage);
+  ShaderGlobal::set_float(clouds_layer2_freqVarId, weatherParams.layers[1].freq);
+  ShaderGlobal::set_float(clouds_layer2_seedVarId, weatherParams.layers[1].seed);
+  ShaderGlobal::set_float(clouds_epicnessVarId, weatherParams.epicness);
+  ShaderGlobal::set_float(clouds_rain_clouds_amountVarId, weatherParams.cumulonimbusCoverage);
+  ShaderGlobal::set_float(clouds_rain_clouds_seedVarId, weatherParams.cumulonimbusSeed);
 }
 
 void Clouds2::setGameParams(const DaSkies::CloudsSettingsParams &game_params)
@@ -179,14 +206,32 @@ void Clouds2::setCloudsForm(const DaSkies::CloudsForm &form_params)
 
 void Clouds2::setCloudsRendering(const DaSkies::CloudsRendering &rendering_params)
 {
-  if (renderingParams == rendering_params)
+  // the aerosol params feed only the atmosphere medium (derived and edge-detected in
+  // DaSkies::prepare): neutralize them here so tuning haze does not rebuild cloud
+  // light or re-render a converged panorama
+  DaSkies::CloudsRendering visibleNew = rendering_params;
+  visibleNew.copyAerosolFrom(renderingParams);
+  if (renderingParams == visibleNew)
+  {
+    renderingParams = rendering_params; // still record the aerosol values
     return;
+  }
+  if (renderingParams.ms_attenuation != visibleNew.ms_attenuation)
+    cloudShadows.invalidateBSM(); // the map stores optical depths scaled by ms_attenuation^2
+  if (renderingParams.droplet_diameter_um != visibleNew.droplet_diameter_um)
+    cloudsForm.invalidate(); // the phase LUT is baked from the droplet size
+  if (renderingParams.erosion_strength != visibleNew.erosion_strength ||
+      renderingParams.erosion_height_bias != visibleNew.erosion_height_bias ||
+      renderingParams.erosion_edge_mul != visibleNew.erosion_edge_mul ||
+      renderingParams.erosion_edge_add != visibleNew.erosion_edge_add)
+    cloudShadows.invalidate(); // the erosion curve is live everywhere except the shadow volume, which marches with it
+  DaSkies::CloudsRendering visibleOld = renderingParams;
+  visibleOld.erosionWindSpeed = visibleNew.erosionWindSpeed; // only moves the erosion offset over time
+  renderingParamsDirty |= visibleOld != visibleNew;
   renderingParams = rendering_params;
   // fixme: only ambient desturation should cause this
   invalidateLight();
   setCloudRenderingVars();
-
-  // fixme: invalidate panorama, if we change everything besides erosion speed
 }
 
 void Clouds2::invalidateAll()
@@ -223,39 +268,46 @@ void Clouds2::init(bool use_hole)
   setCloudRenderingVars();
 }
 
-void Clouds2::update(float dt)
+void Clouds2::update(float dt, const Point2 &wind_dir)
 {
-  updateErosionNoiseWind(dt);
-  light.update(dt);
+  updateErosionNoiseWind(dt, wind_dir);
 
-  ShaderGlobal::set_color4(clouds_erosion_noise_wind_ofsVarId, clouds_erosion_noise_wind_ofs.x, 0, clouds_erosion_noise_wind_ofs.y, 0);
+  ShaderGlobal::set_float4(clouds_erosion_noise_wind_ofsVarId, clouds_erosion_noise_wind_ofs.x, 0, clouds_erosion_noise_wind_ofs.y, 0);
+  const float windLen = length(wind_dir);
+  const Point2 windDirNorm = windLen > 1e-5f ? wind_dir / windLen : Point2(0, 0);
+  ShaderGlobal::set_float4(clouds_erosion_wind_dirVarId, windDirNorm.x, 0, windDirNorm.y, 0);
 }
 
-void Clouds2::renderClouds(CloudsRendererData &data, const TextureIDPair &depth, const TextureIDPair &prev_depth,
-  const TMatrix &view_tm, const TMatrix4 &proj_tm, const bool acquare_new_resource, const bool set_camera_vars)
+void Clouds2::renderCloudsPrepare(CloudsRendererData &data, BaseTexture *depth, BaseTexture *prev_depth, const TMatrix &view_tm,
+  const TMatrix4 &proj_tm, const CloudsRenderFlags flags)
 {
   if (!renderingEnabled)
   {
     return;
   }
   noises.setVars();
-  clouds.render(data, depth, prev_depth, erosionWindChange, weatherParams.worldSize, view_tm, proj_tm, nullptr, acquare_new_resource,
-    set_camera_vars);
+  clouds.renderCloudsPrepare(data, depth, prev_depth, erosionWindChange, weatherParams.worldSize, view_tm, proj_tm, nullptr, flags);
 }
 
-void Clouds2::renderCloudsScreen(CloudsRendererData &data, const TextureIDPair &downsampled_depth, TEXTUREID target_depth,
-  const Point4 &target_depth_transform, const TMatrix &view_tm, const TMatrix4 &proj_tm)
+void Clouds2::renderCloudsApply(CloudsRendererData &data, BaseTexture *downsampled_depth, BaseTexture *target_depth,
+  const Point4 &target_depth_transform, const TMatrix &view_tm, const TMatrix4 &proj_tm, const CloudsRenderFlags flags)
 {
   if (!renderingEnabled)
   {
     return;
   }
-  clouds.renderFull(data, downsampled_depth, target_depth, target_depth_transform, view_tm, proj_tm);
+  clouds.renderCloudsApply(data, downsampled_depth, target_depth, target_depth_transform, view_tm, proj_tm, flags);
 }
 
-CloudsChangeFlags Clouds2::prepareLighting(const Point3 &main_light_dir, const Point3 &second_light_dir)
+CloudsChangeFlags Clouds2::prepareLighting(const Point3 &main_light_dir, const Point3 &second_light_dir, bool scattering_ready,
+  const Point2 &camera_xz)
 {
   uint32_t changes = CLOUDS_NO_CHANGE;
+  if (renderingParamsDirty)
+  {
+    renderingParamsDirty = false;
+    changes = CLOUDS_INVALIDATED;
+  }
   if (noises.render())
   {
     invalidateWeather();
@@ -264,39 +316,40 @@ CloudsChangeFlags Clouds2::prepareLighting(const Point3 &main_light_dir, const P
   }
   changes |= uint32_t(weather.render());
   changes |= uint32_t(cloudsForm.render());
-  changes |= uint32_t(field.render());
-
   if (noises.isReady())
+    changes |= uint32_t(field.render());
+  if (changes & CLOUDS_INVALIDATED)
   {
-    const uint32_t cloudsShadowsUpdateFlags = cloudShadows.render(main_light_dir);
+    cloudShadows.invalidate();
+    light.invalidate();
+  }
+
+  if (noises.isReady() && scattering_ready)
+  {
+    const uint32_t cloudsShadowsUpdateFlags = cloudShadows.render(main_light_dir, camera_xz);
     changes |= uint32_t(cloudsShadowsUpdateFlags);
     changes |= uint32_t(light.render(main_light_dir, second_light_dir)); // not afr ready
 
     if (cloudsShadowsUpdateFlags == CLOUDS_INVALIDATED)
       holeFound = HoleFindStatus::REQUIRE_FIND;
-  }
 
-  changes |= validateHole(main_light_dir) ? uint32_t(CLOUDS_INVALIDATED) : uint32_t(0);
+    changes |= validateHole(main_light_dir) ? uint32_t(CLOUDS_INVALIDATED) : uint32_t(0);
+  }
 
   return CloudsChangeFlags(changes);
 }
 
-void Clouds2::renderCloudVolume(VolTexture *cloud_volume, float max_dist, const TMatrix &view_tm, const TMatrix4 &proj_tm)
+void Clouds2::renderCloudVolume(VolTexture *cloud_volume, TEXTUREID prev_cloud_volume, float max_dist, const TMatrix &view_tm,
+  const TMatrix4 &proj_tm, const TMatrix4 &prev_glob_tm)
 {
   if (!renderingEnabled)
   {
     return;
   }
-  field.renderCloudVolume(cloud_volume, max_dist, view_tm, proj_tm);
+  field.renderCloudVolume(cloud_volume, prev_cloud_volume, max_dist, view_tm, proj_tm, prev_glob_tm);
 }
 
-void Clouds2::setUseShadows2D(bool on)
-{
-  if (on)
-    cloudShadows.initShadows2D();
-  else
-    cloudShadows.closeShadows2D();
-}
+void Clouds2::resetCloudsShadows() { cloudShadows.invalidateBSM(); }
 
 void Clouds2::initHole()
 {
@@ -309,7 +362,7 @@ void Clouds2::initHole()
   if (VoltexRenderer::is_compute_supported())
   {
     clouds_hole_cs.reset(new_compute_shader("clouds_hole_cs", true));
-    holeBuf = dag::buffers::create_ua_sr_structured(4, 1, "clouds_hole_buf");
+    holeBuf = dag::buffers::create_ua_sr_structured(4, 1, "clouds_hole_buf", d3d::buffers::Init::No, RESTAG_DASKIES2);
 
     clouds_hole_pos_cs.reset(new_compute_shader("clouds_hole_pos_cs", true));
     posTexFlags |= TEXCF_UNORDERED;
@@ -319,11 +372,11 @@ void Clouds2::initHole()
     clouds_hole_ps.init("clouds_hole_ps");
     clouds_hole_pos_ps.init("clouds_hole_pos_ps");
 
-    holeTex = dag::create_tex(nullptr, 1, 1, TEXCF_RTARGET | TEXFMT_R32F, 1, "clouds_hole_tex");
+    holeTex = dag::create_tex(nullptr, 1, 1, TEXCF_RTARGET | TEXFMT_R32F, 1, "clouds_hole_tex", RESTAG_DASKIES2);
     posTexFlags |= TEXCF_RTARGET;
   }
 
-  holePosTex = dag::create_tex(nullptr, 1, 1, posTexFlags, 1, "clouds_hole_pos_tex");
+  holePosTex = dag::create_tex(nullptr, 1, 1, posTexFlags, 1, "clouds_hole_pos_tex", RESTAG_DASKIES2);
   holeReadbackQuery.reset(d3d::create_event_query());
 }
 
@@ -337,7 +390,7 @@ bool Clouds2::validateHole(const Point3 &main_light_dir)
     holeFound = HoleFindStatus::REQUIRE_READBACK;
     if (!findHole(main_light_dir))
     {
-      ShaderGlobal::set_color4(clouds_hole_posVarId, Point4::ZERO);
+      ShaderGlobal::set_float4(clouds_hole_posVarId, Point4::ZERO);
       holeFound = HoleFindStatus::DONE;
       return true;
     }
@@ -349,7 +402,7 @@ bool Clouds2::validateHole(const Point3 &main_light_dir)
     if (auto locked = lock_texture<const Point4>(holePosTex.getTex2D(), 0, TEXLOCK_READ | TEXLOCK_NOSYSLOCK))
     {
       Point4 destData = locked.at(0, 0);
-      ShaderGlobal::set_color4(clouds_hole_posVarId, destData);
+      ShaderGlobal::set_float4(clouds_hole_posVarId, destData);
       holeFound = HoleFindStatus::DONE;
       return true;
     }
@@ -363,7 +416,7 @@ bool Clouds2::findHole(const Point3 &main_light_dir)
   if (!useHole || (!((holeBuf || holeTex) && cloudShadows.cloudsShadowsVol)))
     return false;
 
-  ShaderGlobal::set_real(clouds_hole_densityVarId, holeDensity);
+  ShaderGlobal::set_float(clouds_hole_densityVarId, holeDensity);
   TIME_D3D_PROFILE(look_for_hole);
   const float alt = (minimalStartAlt() + (maximumTopAlt() - minimalStartAlt()) * 0.5 / 32) * 1000.f - holeTarget.y;
   if (clouds_hole_cs && clouds_hole_pos_cs)
@@ -378,24 +431,24 @@ bool Clouds2::findHole(const Point3 &main_light_dir)
     }
     {
       STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 0, VALUE, 0, 0), holePosTex.getTex2D());
-      ShaderGlobal::set_color4(clouds_hole_target_altVarId, P3D(holeTarget), alt);
-      ShaderGlobal::set_color4(clouds_hole_light_dirVarId, P3D(main_light_dir), 0);
+      ShaderGlobal::set_float4(clouds_hole_target_altVarId, P3D(holeTarget), alt);
+      ShaderGlobal::set_float4(clouds_hole_light_dirVarId, P3D(main_light_dir), 0);
       clouds_hole_pos_cs->dispatch();
     }
   }
   else if (clouds_hole_ps.getElem() && clouds_hole_pos_ps.getElem())
   {
     SCOPE_RENDER_TARGET;
-    d3d::set_render_target(holeTex.getTex2D(), 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{holeTex.getTex2D(), 0, 0}});
     d3d::clearview(CLEAR_TARGET, E3DCOLOR(), 0, 0);
     shaders::overrides::set(blendMaxState.get());
     clouds_hole_ps.getElem()->setStates();
     d3d::draw_instanced(PRIM_TRILIST, 0, 1, CLOUDS_HOLE_GEN_RES * CLOUDS_HOLE_GEN_RES);
     shaders::overrides::reset();
 
-    ShaderGlobal::set_color4(clouds_hole_target_altVarId, P3D(holeTarget), alt);
-    ShaderGlobal::set_color4(clouds_hole_light_dirVarId, P3D(main_light_dir), 0);
-    d3d::set_render_target(holePosTex.getTex2D(), 0);
+    ShaderGlobal::set_float4(clouds_hole_target_altVarId, P3D(holeTarget), alt);
+    ShaderGlobal::set_float4(clouds_hole_light_dirVarId, P3D(main_light_dir), 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{holePosTex.getTex2D(), 0, 0}});
     d3d::clearview(CLEAR_TARGET, E3DCOLOR(), 0, 0);
     clouds_hole_pos_ps.getElem()->setStates();
     d3d::draw_instanced(PRIM_TRILIST, 0, 1, 1);
@@ -411,12 +464,12 @@ void Clouds2::setUseHole(bool set)
   useHole = set;
   if (useHole)
   {
-    ShaderGlobal::set_real(clouds_hole_densityVarId, holeDensity);
+    ShaderGlobal::set_float(clouds_hole_densityVarId, holeDensity);
   }
   else
   {
     holeFound = HoleFindStatus::REQUIRE_FIND;
-    ShaderGlobal::set_real(clouds_hole_densityVarId, 1);
+    ShaderGlobal::set_float(clouds_hole_densityVarId, 1);
   }
 }
 
@@ -429,7 +482,7 @@ void Clouds2::setHole(const Point3 &hole_target, float hole_density)
 
 Point2 Clouds2::getCloudsHole() const
 {
-  Color4 point = ShaderGlobal::get_color4(clouds_hole_posVarId);
+  Color4 point = ShaderGlobal::get_float4(clouds_hole_posVarId);
   return {point.r, point.g};
 }
 
@@ -443,4 +496,13 @@ void Clouds2::getTextureResourceDependencies(Tab<TEXTUREID> &dependencies) const
   {
     dependencies.push_back(noises.resCloud2.getTexId());
   }
+}
+
+bool Clouds2::isLightRendered() const { return light.isRendered(); }
+
+bool Clouds2::isLightingConverged() const
+{
+  if (!isReady() || !light.isRendered() || !cloudShadows.isConverged() || renderingParamsDirty)
+    return false;
+  return !useHole || holeFound == HoleFindStatus::DONE;
 }

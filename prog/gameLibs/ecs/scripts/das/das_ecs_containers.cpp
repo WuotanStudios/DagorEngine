@@ -63,48 +63,48 @@ das::TypeInfo get_type_info(ecs::component_type_t component_type)
     case ecs::ComponentTypeInfo<ecs::string>::type:
     {
       res.type = das::Type::tHandle;
-      das::Module *builintModule = das::Module::require("$");
-      res.annotation_or_name = (das::TypeAnnotation *)builintModule->findAnnotation("das_string").get();
+      static das::AnnotationInfo ai_das_string("das_string", "$", nullptr, 0);
+      res.annotation_info = &ai_das_string;
       return res;
     }
 
     case ecs::ComponentTypeInfo<ecs::EntityId>::type:
     {
       res.type = das::Type::tHandle;
-      das::Module *ecsModule = das::Module::require("ecs");
-      res.annotation_or_name = (das::TypeAnnotation *)ecsModule->findAnnotation("EntityId").get();
+      static das::AnnotationInfo ai_EntityId("EntityId", "ecs", nullptr, 0);
+      res.annotation_info = &ai_EntityId;
       return res;
     }
 
     case ecs::ComponentTypeInfo<ecs::Object>::type:
     {
       res.type = das::Type::tHandle;
-      das::Module *ecsModule = das::Module::require("ecs");
-      res.annotation_or_name = (das::TypeAnnotation *)ecsModule->findAnnotation("Object").get();
+      static das::AnnotationInfo ai_Object("Object", "ecs", nullptr, 0);
+      res.annotation_info = &ai_Object;
       return res;
     }
 
     case ecs::ComponentTypeInfo<ecs::Array>::type:
     {
       res.type = das::Type::tHandle;
-      das::Module *ecsModule = das::Module::require("ecs");
-      res.annotation_or_name = (das::TypeAnnotation *)ecsModule->findAnnotation("Array").get();
+      static das::AnnotationInfo ai_Array("Array", "ecs", nullptr, 0);
+      res.annotation_info = &ai_Array;
       return res;
     }
 
     case ecs::ComponentTypeInfo<TMatrix>::type:
     {
       res.type = das::Type::tHandle;
-      das::Module *ecsModule = das::Module::require("math");
-      res.annotation_or_name = (das::TypeAnnotation *)ecsModule->findAnnotation("float3x4").get();
+      static das::AnnotationInfo ai_float3x4("float3x4", "math", nullptr, 0);
+      res.annotation_info = &ai_float3x4;
       return res;
     }
 
     case ecs::ComponentTypeInfo<E3DCOLOR>::type:
     {
       res.type = das::Type::tHandle;
-      das::Module *ecsModule = das::Module::require("DagorMath");
-      res.annotation_or_name = (das::TypeAnnotation *)ecsModule->findAnnotation("E3DCOLOR").get();
+      static das::AnnotationInfo ai_E3DCOLOR("E3DCOLOR", "DagorMath", nullptr, 0);
+      res.annotation_info = &ai_E3DCOLOR;
       return res;
     }
   }
@@ -211,36 +211,37 @@ struct ObjectAnnotation final : das::ManagedStructureAnnotation<ecs::Object, fal
   }
   virtual bool isIterable() const override { return true; }
 
-  virtual das::TypeDeclPtr makeIteratorType(const das::ExpressionPtr &src) const override
+  virtual das::TypeDeclPtr makeIteratorType(das::ExpressionPtr src) const override
   {
     if (src->type->isConst())
-      return das::make_smart<das::TypeDecl>(*constIteratorType);
+      return new das::TypeDecl(*constIteratorType);
     else
-      return das::make_smart<das::TypeDecl>(*iteratorType);
+      return new das::TypeDecl(*iteratorType);
   }
-  virtual das::SimNode *simulateGetIterator(das::Context &context, const das::LineInfo &at,
-    const das::ExpressionPtr &src) const override
+  virtual das::SimNode *simulateGetIterator(das::Context &context, const das::LineInfo &at, das::ExpressionPtr src) const override
   {
-    auto rv = src->simulate(context);
+    auto rv = das::simulateExpression(context, src);
     if (src->type->isConst())
       return context.code->makeNode<das::SimNode_AnyIterator<const ecs::Object, DasObjectIterator<const ecs::Object>>>(at, rv);
     else
       return context.code->makeNode<das::SimNode_AnyIterator<ecs::Object, DasObjectIterator<ecs::Object>>>(at, rv);
   }
   // indexing
-  virtual das::SimNode *simulateGetAt(das::Context &context, const das::LineInfo &at, const das::TypeDeclPtr &,
-    const das::ExpressionPtr &rv, const das::ExpressionPtr &idx, uint32_t ofs) const override
+  virtual das::SimNode *simulateGetAt(das::Context &context, const das::LineInfo &at, const das::TypeDeclPtr &, das::ExpressionPtr rv,
+    das::ExpressionPtr idx, uint32_t ofs) const override
   {
+    auto rNode = das::simulateExpression(context, rv);
+    auto idxNode = das::simulateExpression(context, idx);
     if (rv->type->isConst())
-      return context.code->makeNode<SimNodeAtObject<const ecs::Object>>(at, rv->simulate(context), idx->simulate(context), ofs);
+      return context.code->makeNode<SimNodeAtObject<const ecs::Object>>(at, rNode, idxNode, ofs);
     else
-      return context.code->makeNode<SimNodeAtObject<ecs::Object>>(at, rv->simulate(context), idx->simulate(context), ofs);
+      return context.code->makeNode<SimNodeAtObject<ecs::Object>>(at, rNode, idxNode, ofs);
   }
   virtual bool isIndexable(const das::TypeDeclPtr &indexType) const override { return indexType->isSimpleType(das::Type::tString); }
-  virtual das::TypeDeclPtr makeIndexType(const das::ExpressionPtr &rv, const das::ExpressionPtr &) const override
+  virtual das::TypeDeclPtr makeIndexType(das::ExpressionPtr rv, das::ExpressionPtr) const override
   {
-    auto ret = das::make_smart<das::TypeDecl>(das::Type::tPointer);
-    ret->firstType = das::make_smart<das::TypeDecl>(*atType);
+    auto ret = new das::TypeDecl(das::Type::tPointer);
+    ret->firstType = new das::TypeDecl(*atType);
     ret->firstType->constant = rv->type->isConst();
     return ret;
   }
@@ -275,13 +276,18 @@ struct ObjectAnnotation final : das::ManagedStructureAnnotation<ecs::Object, fal
 #if DAGOR_DBGLEVEL > 0
   virtual void walk(das::DataWalker &walker, void *obj) override
   {
+    if (walker.collecting)
+    {
+      das::ManagedStructureAnnotation<ecs::Object, false>::walk(walker, obj);
+      return;
+    }
     ecs::Object *object = (ecs::Object *)obj;
     das::Table tab;
     memset(&tab, 0, sizeof(tab));
     if (!ati)
     {
-      auto dimType = das::make_smart<das::TypeDecl>(das::Type::tTable);
-      dimType->firstType = das::make_smart<das::TypeDecl>(das::Type::tString);
+      auto dimType = new das::TypeDecl(das::Type::tTable);
+      dimType->firstType = new das::TypeDecl(das::Type::tString);
       dimType->secondType = atType;
       ati = helpA.makeTypeInfo(nullptr, dimType);
     }
@@ -325,6 +331,26 @@ struct ObjectAnnotation final : das::ManagedStructureAnnotation<ecs::Object, fal
   das::TypeInfo *ati = nullptr;
 #endif
   das::TypeDeclPtr iteratorType, constIteratorType, atType;
+
+  virtual void gc_collect(das::gc_root *target, das::gc_root *from) override
+  {
+    das::ManagedStructureAnnotation<ecs::Object, false>::gc_collect(target, from);
+    if (iteratorType)
+      iteratorType->gc_collect(target, from);
+    if (constIteratorType)
+      constIteratorType->gc_collect(target, from);
+    if (atType)
+      atType->gc_collect(target, from);
+  }
+  virtual void visitTypeDecls(const das::function<void(das::TypeDecl *)> &callback) override
+  {
+    if (iteratorType)
+      callback(iteratorType);
+    if (constIteratorType)
+      callback(constIteratorType);
+    if (atType)
+      callback(atType);
+  }
 };
 
 struct ArrayAnnotation final : das::ManagedStructureAnnotation<ecs::Array, false>
@@ -350,15 +376,11 @@ struct ArrayAnnotation final : das::ManagedStructureAnnotation<ecs::Array, false
   }
   // iterating
   virtual bool isIterable() const override { return true; }
-  virtual das::TypeDeclPtr makeIteratorType(const das::ExpressionPtr &) const override
-  {
-    return das::make_smart<das::TypeDecl>(*vecType);
-  }
+  virtual das::TypeDeclPtr makeIteratorType(das::ExpressionPtr) const override { return new das::TypeDecl(*vecType); }
 
-  virtual das::SimNode *simulateGetIterator(das::Context &context, const das::LineInfo &at,
-    const das::ExpressionPtr &src) const override
+  virtual das::SimNode *simulateGetIterator(das::Context &context, const das::LineInfo &at, das::ExpressionPtr src) const override
   {
-    auto rv = src->simulate(context);
+    auto rv = das::simulateExpression(context, src);
     if (src->type->isConst())
       return context.code->makeNode<das::SimNode_AnyIterator<const ecs::Array, DasArrayIterator<const ecs::Array>>>(at, rv);
     else
@@ -368,20 +390,17 @@ struct ArrayAnnotation final : das::ManagedStructureAnnotation<ecs::Array, false
   bool isYetAnotherVectorTemplate() const override { return true; }
 
   // indexing
-  virtual das::SimNode *simulateGetAt(das::Context &context, const das::LineInfo &at, const das::TypeDeclPtr &,
-    const das::ExpressionPtr &rv, const das::ExpressionPtr &idx, uint32_t ofs) const override
+  virtual das::SimNode *simulateGetAt(das::Context &context, const das::LineInfo &at, const das::TypeDeclPtr &, das::ExpressionPtr rv,
+    das::ExpressionPtr idx, uint32_t ofs) const override
   {
-    auto rNode = rv->simulate(context), idxNode = idx->simulate(context);
+    auto rNode = das::simulateExpression(context, rv), idxNode = das::simulateExpression(context, idx);
     if (rv->type->isConst())
       return context.code->makeNode<SimNodeAtArray<const ecs::Array>>(at, rNode, idxNode, ofs);
     else
       return context.code->makeNode<SimNodeAtArray<ecs::Array>>(at, rNode, idxNode, ofs);
   }
   virtual bool isIndexable(const das::TypeDeclPtr &indexType) const override { return indexType->isIndex(); }
-  virtual das::TypeDeclPtr makeIndexType(const das::ExpressionPtr &, const das::ExpressionPtr &) const override
-  {
-    return das::make_smart<das::TypeDecl>(*vecType);
-  }
+  virtual das::TypeDeclPtr makeIndexType(das::ExpressionPtr, das::ExpressionPtr) const override { return new das::TypeDecl(*vecType); }
   template <class Array>
   struct SimNodeAtArray : das::SimNode_At
   {
@@ -415,11 +434,17 @@ struct ArrayAnnotation final : das::ManagedStructureAnnotation<ecs::Array, false
 #if DAGOR_DBGLEVEL > 0
   virtual void walk(das::DataWalker &walker, void *vec) override
   {
+    if (walker.collecting)
+    {
+      das::ManagedStructureAnnotation<ecs::Array, false>::walk(walker, vec);
+      return;
+    }
     if (!ati)
     {
-      auto dimType = das::make_smart<das::TypeDecl>(*vecType);
-      dimType->ref = 0;
-      dimType->dim.push_back(1234);
+      auto elemType = new das::TypeDecl(*vecType);
+      das::gc_local<das::TypeDecl> elemGuard(elemType);
+      elemType->ref = 0;
+      das::gc_local<das::TypeDecl> dimType(das::makeFixedArrayTypeDecl(1, elemType));
       ati = helpA.makeTypeInfo(nullptr, dimType);
     }
     ecs::Array *pVec = (ecs::Array *)vec;
@@ -429,6 +454,18 @@ struct ArrayAnnotation final : das::ManagedStructureAnnotation<ecs::Array, false
   das::TypeInfo *ati = nullptr;
 #endif
   das::TypeDeclPtr vecType;
+
+  virtual void gc_collect(das::gc_root *target, das::gc_root *from) override
+  {
+    das::ManagedStructureAnnotation<ecs::Array, false>::gc_collect(target, from);
+    if (vecType)
+      vecType->gc_collect(target, from);
+  }
+  virtual void visitTypeDecls(const das::function<void(das::TypeDecl *)> &callback) override
+  {
+    if (vecType)
+      callback(vecType);
+  }
 };
 
 struct SharedArrayAnnotation final : das::ManagedStructureAnnotation<ecs::SharedComponent<ecs::Array>, false>
@@ -476,6 +513,11 @@ struct ChildComponentAnnotation final : das::ManagedStructureAnnotation<ecs::Chi
 #if DAGOR_DBGLEVEL > 0
   virtual void walk(das::DataWalker &walker, void *child) override
   {
+    if (walker.collecting)
+    {
+      das::ManagedStructureAnnotation<ecs::ChildComponent, false>::walk(walker, child);
+      return;
+    }
     ecs::ChildComponent *comp = (ecs::ChildComponent *)child;
     das::TypeInfo dasType = get_type_info(comp->getUserType());
     if (dasType.type != das::none)
@@ -487,16 +529,79 @@ struct ChildComponentAnnotation final : das::ManagedStructureAnnotation<ecs::Chi
 #endif
 };
 
+
+// The jit lowers `.[]` only for arrays, tables and vectors; an ecs container is a handle, so it
+// needs an op with a native address to call. These are jitOnly, so interpreted and C++ AOT builds
+// keep resolving the index through the annotation.
+struct EcsIndexArgFn : das::defaultTempFn
+{
+  EcsIndexArgFn() : das::defaultTempFn() {}
+  bool operator()(das::Function *fn)
+  {
+    das::defaultTempFn::operator()(fn);
+    if (!fn->arguments.empty())
+      fn->arguments[0]->type->explicitConst = true;
+    fn->builtIn = true;
+    fn->generated = true;
+    fn->jitOnly = true;
+    return true;
+  }
+};
+
+static ecs::ChildComponent *ecs_object_at(ecs::Object &obj, const char *key, das::Context *, das::LineInfoArg *)
+{
+  auto it = obj.find_as(ECS_HASH_SLOW(key ? key : ""));
+  return it != obj.end() ? &it->second : nullptr;
+}
+
+static const ecs::ChildComponent *ecs_object_at_const(const ecs::Object &obj, const char *key, das::Context *, das::LineInfoArg *)
+{
+  auto it = obj.find_as(ECS_HASH_SLOW(key ? key : ""));
+  return it != obj.end() ? &it->second : nullptr;
+}
+
+static ecs::ChildComponent &ecs_array_at(ecs::Array &arr, int idx, das::Context *context, das::LineInfoArg *at)
+{
+  if (uint32_t(idx) >= arr.size())
+    context->throw_error_at(at, "Array index %d out of range %d", idx, arr.size());
+  return arr[idx];
+}
+
+static const ecs::ChildComponent &ecs_array_at_const(const ecs::Array &arr, int idx, das::Context *context, das::LineInfoArg *at)
+{
+  if (uint32_t(idx) >= arr.size())
+    context->throw_error_at(at, "Array index %d out of range %d", idx, arr.size());
+  return arr[idx];
+}
+
+static void registerEcsAtFunctions(das::Module &mod, das::ModuleLibrary &lib)
+{
+  das::addExtern<DAS_BIND_FUN(ecs_object_at), das::SimNode_ExtFuncCall, EcsIndexArgFn>(mod, lib, ".[]",
+    das::SideEffects::modifyArgument, "bind_dascript::ecs_object_at")
+    ->args({"obj", "key", "context", "at"});
+  das::addExtern<DAS_BIND_FUN(ecs_object_at_const), das::SimNode_ExtFuncCall, EcsIndexArgFn>(mod, lib, ".[]", das::SideEffects::none,
+    "bind_dascript::ecs_object_at_const")
+    ->args({"obj", "key", "context", "at"});
+  das::addExtern<DAS_BIND_FUN(ecs_array_at), das::SimNode_ExtFuncCallRef, EcsIndexArgFn>(mod, lib, ".[]",
+    das::SideEffects::modifyArgument, "bind_dascript::ecs_array_at")
+    ->args({"arr", "index", "context", "at"});
+  das::addExtern<DAS_BIND_FUN(ecs_array_at_const), das::SimNode_ExtFuncCallRef, EcsIndexArgFn>(mod, lib, ".[]", das::SideEffects::none,
+    "bind_dascript::ecs_array_at_const")
+    ->args({"arr", "index", "context", "at"});
+}
+
 void ECS::addContainerAnnotations(das::ModuleLibrary &lib)
 {
-  addAnnotation(das::make_smart<ChildComponentAnnotation>(lib));
+  addAnnotation(new ChildComponentAnnotation(lib));
   das::addFunctionBasic<ecs::ChildComponent>(*this, lib);
-  addAnnotation(das::make_smart<ObjectIteratorAnnotation>(lib));
-  addAnnotation(das::make_smart<ObjectConstIteratorAnnotation>(lib));
-  addAnnotation(das::make_smart<ObjectAnnotation>(lib));
-  addAnnotation(das::make_smart<ArrayAnnotation>(lib));
-  addAnnotation(das::make_smart<SharedArrayAnnotation>(lib));
-  addAnnotation(das::make_smart<SharedObjectAnnotation>(lib));
+  addAnnotation(new ObjectIteratorAnnotation(lib));
+  addAnnotation(new ObjectConstIteratorAnnotation(lib));
+  addAnnotation(new ObjectAnnotation(lib));
+  addAnnotation(new ArrayAnnotation(lib));
+  addAnnotation(new SharedArrayAnnotation(lib));
+  addAnnotation(new SharedObjectAnnotation(lib));
+
+  registerEcsAtFunctions(*this, lib);
 
   das::addUsing<ecs::ChildComponent>(*this, lib, " ::ecs::ChildComponent");
 

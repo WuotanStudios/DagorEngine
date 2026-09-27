@@ -24,6 +24,23 @@ struct VbExtraCtx
   eastl::unique_ptr<RingDynamicSB> vb;
   uint32_t gen = 0;
   int lastSwitchFrameNo = 0;
+
+  void resetUsage()
+  {
+    // FIXME:
+    // this conserve memory on PS4, as this logic used on light probe visibility, it should generate "bearable" amount of lags
+    // because most problematic part was shadow update visibility
+    // yet logic must be rewritten to handle both memory usage and avoid mem reallocation spikes
+#if _TARGET_C1
+
+
+#else
+    if (vb)
+      vb->resetPos();
+    lastSwitchFrameNo = 0;
+    // gen leaved as is because it should remain unique over whole vb lifetime
+#endif
+  }
 };
 extern carray<rendinst::render::VbExtraCtx, RI_EXTRA_VB_CTX_CNT> vbExtraCtx;
 extern UniqueBuf riExtraPerDrawData;
@@ -72,7 +89,7 @@ void update_per_draw_gathered_data(uint32_t id);
 void renderRIGenExtra(const RiGenVisibility &v, RenderPass render_pass, OptimizeDepthPass optimization_depth_pass,
   OptimizeDepthPrepass optimization_depth_prepass, IgnoreOptimizationLimits ignore_optimization_instances_limits, LayerFlag layer,
   uint32_t instance_count_mul, TexStreamingContext texCtx, AtestStage atest_stage = AtestStage::All,
-  const RiExtraRenderer *riex_renderer = nullptr);
+  const RiExtraRenderer *riex_renderer = nullptr, RiExtraRenderingSubset rendering_subset = RiExtraRenderingSubset::All);
 
 void renderRIGenExtraSortedTransparentInstanceElems(const RiGenVisibility &v, const TexStreamingContext &texCtx,
   bool draw_partitioned_elems = false);
@@ -125,7 +142,8 @@ inline int find_lod<8>(const float *__restrict lod_dists, float dist)
 __forceinline vec4f make_pos_and_rad(mat44f_cref tm, vec4f center_and_rad)
 {
   vec4f pos = v_mat44_mul_vec3p(tm, center_and_rad);
-  vec4f maxScale = v_max(v_length3_est(tm.col0), v_max(v_length3_est(tm.col1), v_length3_est(tm.col2)));
-  vec4f bb_ext = v_mul(v_splat_w(center_and_rad), maxScale);
+  // precise sqrt: length_est is 0*rsqrt_est(0)=NaN for zero-scale (destroyed) instances
+  vec4f maxScaleSq = v_max(v_length3_sq_x(tm.col0), v_max(v_length3_sq_x(tm.col1), v_length3_sq_x(tm.col2)));
+  vec4f bb_ext = v_mul(v_splat_w(center_and_rad), v_splat_x(v_sqrt_x(maxScaleSq)));
   return v_perm_xyzd(pos, bb_ext);
 }

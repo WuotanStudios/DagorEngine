@@ -160,6 +160,57 @@ static inline uint64_t wyhash(const void *key, size_t len, uint64_t seed, const 
   return  _wymix(a^secret[0]^len,b^secret[1]);
 }
 
+//streaming wyhash: produces the same result as one-shot wyhash() for any data length.
+//usage: wyhash_state s = wyhash_init(seed); wyhash_add(s, p1, l1); wyhash_add(s, p2, l2); uint64_t h = wyhash_finish(s);
+struct wyhash_state{
+  uint64_t seed, see1, see2;
+  size_t total_len;
+  alignas(8) uint8_t buf[48];
+  alignas(8) uint8_t tail[16];
+  uint8_t buf_len;
+};
+static inline wyhash_state wyhash_init(uint64_t seed, const uint64_t *secret=_wyp){
+  wyhash_state s;
+  s.seed=seed^_wymix(seed^secret[0],secret[1]);
+  s.see1=s.seed; s.see2=s.seed;
+  s.total_len=0; s.buf_len=0;
+  return s;
+}
+static inline void _wyhash_flush48(wyhash_state &s, const uint8_t *p, const uint64_t *secret=_wyp){
+  s.seed=_wymix(_wyr8(p)^secret[1],_wyr8(p+8)^s.seed);
+  s.see1=_wymix(_wyr8(p+16)^secret[2],_wyr8(p+24)^s.see1);
+  s.see2=_wymix(_wyr8(p+32)^secret[3],_wyr8(p+40)^s.see2);
+  memcpy(s.tail,p+32,16);
+}
+static inline void wyhash_add(wyhash_state &s, const void *data, size_t len, const uint64_t *secret=_wyp){
+  const uint8_t *p=(const uint8_t *)data;
+  s.total_len+=len;
+  if(_likely_(s.buf_len+len<=48)){ memcpy(s.buf+s.buf_len,p,len); s.buf_len+=(uint8_t)len; return; }
+  if(s.buf_len<48){ uint8_t fill=48-s.buf_len; memcpy(s.buf+s.buf_len,p,fill); p+=fill; len-=fill; }
+  _wyhash_flush48(s,s.buf,secret); s.buf_len=0;
+  while(len>48){ _wyhash_flush48(s,p,secret); p+=48; len-=48; }
+  memcpy(s.buf,p,len); s.buf_len=(uint8_t)len;
+}
+static inline uint64_t wyhash_finish(const wyhash_state &s, const uint64_t *secret=_wyp){
+  uint64_t seed=s.seed, a, b;
+  if(s.total_len>48) seed^=s.see1^s.see2;
+  const uint8_t *p=s.buf; size_t i=s.buf_len;
+  while(i>16){ seed=_wymix(_wyr8(p)^secret[1],_wyr8(p+8)^seed); p+=16; i-=16; }
+  if(s.total_len<=16){
+    if(s.buf_len>=4){ a=(_wyr4(s.buf)<<32)|_wyr4(s.buf+((s.buf_len>>3)<<2)); b=(_wyr4(s.buf+s.buf_len-4)<<32)|_wyr4(s.buf+s.buf_len-4-((s.buf_len>>3)<<2)); }
+    else if(s.buf_len>0){ a=_wyr3(s.buf,s.buf_len); b=0; }
+    else a=b=0;
+  }else if(s.buf_len>=16){
+    a=_wyr8(s.buf+s.buf_len-16); b=_wyr8(s.buf+s.buf_len-8);
+  }else{
+    alignas(8) uint8_t tmp[16]; uint8_t ft=16-(uint8_t)s.buf_len;
+    memcpy(tmp,s.tail+16-ft,ft); memcpy(tmp+ft,s.buf,s.buf_len);
+    a=_wyr8(tmp); b=_wyr8(tmp+8);
+  }
+  a^=secret[1]; b^=seed; _wymum(&a,&b);
+  return _wymix(a^secret[0]^s.total_len,b^secret[1]);
+}
+
 //a useful 64bit-64bit mix function to produce deterministic pseudo random numbers that can pass BigCrush and PractRand
 static inline uint64_t wyhash64(uint64_t A, uint64_t B){ A^=0xa0761d6478bd642full; B^=0xe7037ed1a0b428dbull; _wymum(&A,&B); return _wymix(A^0xa0761d6478bd642full,B^0xe7037ed1a0b428dbull);}
 
@@ -189,6 +240,69 @@ static inline uint64_t wytrand(uint64_t *seed){
 static inline uint64_t wy2u0k(uint64_t r, uint64_t k){ _wymum(&r,&k); return k; }
 #endif
 
+// Miller-Rabin primality test for make_secret, modified from https://github.com/going-digital/Prime64
+static inline uint64_t _wy_mul_mod(uint64_t a, uint64_t b, uint64_t m) {
+  uint64_t r=0;
+  while (b) {
+    if (b & 1) {
+      uint64_t r2 = r + a;
+      if (r2 < r) r2 -= m;
+      r = r2 % m;
+    }
+    b >>= 1;
+    if (b) {
+      uint64_t a2 = a + a;
+      if (a2 < a) a2 -= m;
+      a = a2 % m;
+    }
+  }
+  return r;
+}
+static inline uint64_t _wy_pow_mod(uint64_t a, uint64_t b, uint64_t m) {
+  uint64_t r=1;
+  while (b) {
+    if (b&1) r=_wy_mul_mod(r,a,m);
+    b>>=1;
+    if (b) a=_wy_mul_mod(a,a,m);
+  }
+  return r;
+}
+static inline unsigned _wy_sprp(uint64_t n, uint64_t a) {
+  uint64_t d=n-1;
+  uint8_t s=0;
+  while (!(d & 0xff)) { d>>=8; s+=8; }
+  if (!(d & 0xf)) { d>>=4; s+=4; }
+  if (!(d & 0x3)) { d>>=2; s+=2; }
+  if (!(d & 0x1)) { d>>=1; s+=1; }
+  uint64_t b=_wy_pow_mod(a,d,n);
+  if ((b==1) || (b==(n-1))) return 1;
+  uint8_t r;
+  for (r=1; r<s; r++) {
+    b=_wy_mul_mod(b,b,n);
+    if (b<=1) return 0;
+    if (b==(n-1)) return 1;
+  }
+  return 0;
+}
+static inline unsigned _wy_is_prime(uint64_t n) {
+  if (n<2||!(n&1)) return 0;
+  if (n<4) return 1;
+  if (!_wy_sprp(n,2)) return 0;
+  if (n<2047) return 1;
+  if (!_wy_sprp(n,3)) return 0;
+  if (!_wy_sprp(n,5)) return 0;
+  if (!_wy_sprp(n,7)) return 0;
+  if (!_wy_sprp(n,11)) return 0;
+  if (!_wy_sprp(n,13)) return 0;
+  if (!_wy_sprp(n,17)) return 0;
+  if (!_wy_sprp(n,19)) return 0;
+  if (!_wy_sprp(n,23)) return 0;
+  if (!_wy_sprp(n,29)) return 0;
+  if (!_wy_sprp(n,31)) return 0;
+  if (!_wy_sprp(n,37)) return 0;
+  return 1;
+}
+
 //make your own secret
 static inline void make_secret(uint64_t seed, uint64_t *secret){
   uint8_t c[] = {15, 23, 27, 29, 30, 39, 43, 45, 46, 51, 53, 54, 57, 58, 60, 71, 75, 77, 78, 83, 85, 86, 89, 90, 92, 99, 101, 102, 105, 106, 108, 113, 114, 116, 120, 135, 139, 141, 142, 147, 149, 150, 153, 154, 156, 163, 165, 166, 169, 170, 172, 177, 178, 180, 184, 195, 197, 198, 201, 202, 204, 209, 210, 212, 216, 225, 226, 228, 232, 240 };
@@ -213,6 +327,7 @@ static inline void make_secret(uint64_t seed, uint64_t *secret){
         if(x!=32){ ok=0; break; }
 #endif
       }
+      if(ok&&!_wy_is_prime(secret[i])) ok=0;
     }while(!ok);
   }
 }

@@ -208,23 +208,6 @@ namespace das {
         V_END();
     }
 
-    SimNode * SimNode_Jit::visit ( SimVisitor & vis ) {
-        uint64_t fptr = (uint64_t) func;
-        V_BEGIN();
-        V_OP(Jit);
-        V_ARG(fptr);
-        V_END();
-    }
-
-
-    SimNode * SimNode_JitBlock::visit ( SimVisitor & vis ) {
-        uint64_t fptr = (uint64_t) func;
-        V_BEGIN();
-        V_OP(JitBlock);
-        V_ARG(fptr);
-        V_END();
-    }
-
     SimNode * SimNode_NOP::visit ( SimVisitor & vis ) {
         V_BEGIN();
         V_OP(NOP);
@@ -281,6 +264,16 @@ namespace das {
         char swizzle[5] = { xyzw[fields[0]], xyzw[fields[1]], xyzw[fields[2]], xyzw[fields[3]], 0 };
         V_BEGIN();
         V_OP(Swizzle);
+        V_SUB(value);
+        V_ARG(swizzle);
+        V_END();
+    }
+
+    SimNode * SimNode_Swizzle64::visit ( SimVisitor & vis ) {
+        const char * xyzw = "xyzw";
+        char swizzle[5] = { xyzw[fields[0]], xyzw[fields[1]], 0 };
+        V_BEGIN();
+        V_OP(Swizzle64);
         V_SUB(value);
         V_ARG(swizzle);
         V_END();
@@ -367,6 +360,83 @@ namespace das {
     SimNode * SimNode_SafeAt::visit ( SimVisitor & vis ) {
         V_BEGIN();
         V_OP(SafeAt);
+        V_SUB(value);
+        V_SUB(index);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_ARG(range);
+        V_END();
+    }
+
+    SimNode * SimNode_At_I64::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(At_I64);
+        V_SUB(value);
+        V_SUB(index);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_ARG(range);
+        V_END();
+    }
+
+    SimNode * SimNode_At_U64::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(At_U64);
+        V_SUB(value);
+        V_SUB(index);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_ARG(range);
+        V_END();
+    }
+
+    SimNode * SimNode_At_I64U::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(At_I64U);
+        V_SUB(value);
+        V_SUB(index);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_ARG(range);
+        V_END();
+    }
+
+    SimNode * SimNode_At_U64U::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(At_U64U);
+        V_SUB(value);
+        V_SUB(index);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_ARG(range);
+        V_END();
+    }
+
+    SimNode * SimNode_SafeAt_I64::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(SafeAt_I64);
+        V_SUB(value);
+        V_SUB(index);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_ARG(range);
+        V_END();
+    }
+
+    SimNode * SimNode_SafeAt_U64::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(SafeAt_U64);
+        V_SUB(value);
+        V_SUB(index);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_ARG(range);
+        V_END();
+    }
+
+    SimNode * SimNode_AtU::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(AtU);
         V_SUB(value);
         V_SUB(index);
         V_ARG(stride);
@@ -734,6 +804,14 @@ namespace das {
         V_END();
     }
 
+    SimNode * SimNode_NewStack::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(NewStack);
+        V_SP(stackTop);
+        V_ARG(bytes);
+        V_END();
+    }
+
     SimNode * SimNode_NewArray::visit ( SimVisitor & vis ) {
         V_BEGIN();
         V_OP(NewArray);
@@ -872,6 +950,17 @@ namespace das {
     SimNode * SimNode_MakeLocalCMRes::visit ( SimVisitor & vis ) {
         V_BEGIN_CR();
         V_OP(MakeLocalCMRes);
+        V_BLOCK();
+        V_FINAL();
+        V_END();
+    }
+
+    SimNode * SimNode_MakeArrayHeap::visit ( SimVisitor & vis ) {
+        V_BEGIN_CR();
+        V_OP(MakeArrayHeap);
+        V_SP(stackTop);
+        V_ARG(arrayCount);
+        V_ARG(stride);
         V_BLOCK();
         V_FINAL();
         V_END();
@@ -1039,9 +1128,59 @@ namespace das {
         V_END();
     }
 
+    SimNode * SimNode_ArrayAt_I64::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(ArrayAt_I64);
+        V_SUB(l);
+        V_SUB(r);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_END();
+    }
+
+    SimNode * SimNode_ArrayAt_U64::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(ArrayAt_U64);
+        V_SUB(l);
+        V_SUB(r);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_END();
+    }
+
     SimNode * SimNode_SafeArrayAt::visit ( SimVisitor & vis ) {
         V_BEGIN();
         V_OP(SafeArrayAt);
+        V_SUB(l);
+        V_SUB(r);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_END();
+    }
+
+    SimNode * SimNode_SafeArrayAt_I64::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(SafeArrayAt_I64);
+        V_SUB(l);
+        V_SUB(r);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_END();
+    }
+
+    SimNode * SimNode_SafeArrayAt_U64::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(SafeArrayAt_U64);
+        V_SUB(l);
+        V_SUB(r);
+        V_ARG(stride);
+        V_ARG(offset);
+        V_END();
+    }
+
+    SimNode * SimNode_ArrayAtU::visit ( SimVisitor & vis ) {
+        V_BEGIN();
+        V_OP(ArrayAtU);
         V_SUB(l);
         V_SUB(r);
         V_ARG(stride);

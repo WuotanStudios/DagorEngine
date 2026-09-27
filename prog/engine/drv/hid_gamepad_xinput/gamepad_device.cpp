@@ -5,14 +5,11 @@
 #include <drv/hid/dag_hiGlobals.h>
 #include <supp/_platform.h>
 #include "emu_hooks.h"
-#if _TARGET_PC_WIN
 #include <xinput.h>
-#elif _TARGET_XBOX
-#include "xboxOneGamepad.h"
-#endif
 #include <startup/dag_demoMode.h>
 #include <debug/dag_debug.h>
 #include <perfMon/dag_cpuFreq.h>
+#include <perfMon/dag_statDrv.h>
 
 #define VIRTUAL_THUMBKEY_PRESS_THRESHOLD 0.5f
 
@@ -56,6 +53,8 @@ HumanInput::Xbox360GamepadDevice::Xbox360GamepadDevice(int gamepad_no, const cha
   doRumble(0, 0);
   deviceType = -1;
 }
+
+
 HumanInput::Xbox360GamepadDevice::~Xbox360GamepadDevice()
 {
   setClient(NULL);
@@ -65,6 +64,7 @@ HumanInput::Xbox360GamepadDevice::~Xbox360GamepadDevice()
 
 bool HumanInput::Xbox360GamepadDevice::updateState(int dt_msec, bool def, bool has_def)
 {
+  TIME_PROFILE(HID_XDEV_updateState);
   if (isVirtual)
     return false;
 
@@ -213,8 +213,6 @@ bool HumanInput::Xbox360GamepadDevice::updateState(int dt_msec, bool def, bool h
 
   if (humaninputxbox360::mouse_emu)
     humaninputxbox360::mouse_emu->updateDevices();
-  if (humaninputxbox360::kbd_emu)
-    humaninputxbox360::kbd_emu->updateDevices();
 
   if (def)
     raw_state_joy = state;
@@ -229,15 +227,13 @@ bool HumanInput::Xbox360GamepadDevice::updateState(int dt_msec, bool def, bool h
     has_def && ((state.getKeysPressed().getWord0() | state.getKeysReleased().getWord0()) & (JOY_XINPUT_REAL_MASK_L_THUMB_RIGHT - 1)))
     dagor_demo_reset_idle_timer();
 
-#if _TARGET_PC
   return !state.buttons.cmpEq(state.buttonsPrev);
-#else
-  return state.buttons.getWord0() & (JOY_XINPUT_REAL_MASK_L_THUMB_RIGHT - 1);
-#endif
 }
+
 
 void HumanInput::Xbox360GamepadDevice::doRumble(float lowFreq, float highFreq)
 {
+  TIME_PROFILE(HID_XDEV_doRumble);
   unsigned short newRumbleLeftMotor = XBOX360_GAMEPAD_RUMBLE_MAX_SPEED * lowFreq;
   unsigned short newRumbleRightMotor = XBOX360_GAMEPAD_RUMBLE_MAX_SPEED * highFreq;
   if (rumbleLeftMotor != 0 || rumbleRightMotor != 0 || newRumbleLeftMotor != 0 || newRumbleRightMotor != 0) // The rumble must be
@@ -256,14 +252,16 @@ void HumanInput::Xbox360GamepadDevice::doRumble(float lowFreq, float highFreq)
   }
 }
 
+
 bool HumanInput::Xbox360GamepadDevice::isConnected()
 {
   if (isVirtual)
     return true;
 
+  TIME_PROFILE(HID_XDEV_isConnected);
   XINPUT_STATE st;
   return (XInputGetState(userId, &st) == ERROR_SUCCESS);
 }
 
+
 HumanInput::IGenHidClassDrv *humaninputxbox360::mouse_emu = NULL;
-HumanInput::IGenHidClassDrv *humaninputxbox360::kbd_emu = NULL;

@@ -8,11 +8,14 @@
 #include <math/integer/dag_IPoint2.h>
 #include <math/dag_Point2.h>
 #include <util/dag_string.h>
+#include <EASTL/unique_ptr.h>
 
 namespace PropPanel
 {
 
 class GradientControlStandalone;
+class IMenu;
+class GradientControlContextMenuEventHandler;
 
 class TrackGradientButton
 {
@@ -64,30 +67,46 @@ public:
   void setValue(PGradient source);
   void setCurValue(float value);
   void setCycled(bool cycled) { mCycled = cycled; }
-  void setMinMax(int min, int max);
+  void setMinMax(float min, float max);
+  float getMinValue() const { return minValue; }
+  float getMaxValue() const { return maxValue; }
+  void setMinMaxPointCount(int min, int max);
   void getValue(PGradient destGradient) const;
+  float getNormalizedFromValue(float value) const;
+  float getValueFromNormalized(float normalized_value) const;
   void reset();
   void updateCycled(TrackGradientButton *button);
+  void processContextMenu(unsigned id);
 
   bool canRemove();
   void setSelected(bool value);
 
   int getGradientDisplayWidth() const { return gradientDisplaySize.x; }
 
+  // True while a key is grabbed. updateImgui() claims the mouse buttons for its own canvas id, so
+  // this control never takes ImGui's active item.
+  bool isGestureActive() const { return mouseClickKeyIndex >= 0; }
+
   void updateImgui(int width, int height);
 
 private:
   void draw();
   void onLButtonDClick(float x_pos_in_canvas_space);
+  void onRButtonDown();
   void calculateSizes(int total_width, int total_height);
   void cancelColorPickerShowRequest();
+  void handleKeyPresses(unsigned canvas_id);
+  void copyGradient();
+  void pasteGradient();
 
   void onImguiDelayedCallback(void *user_data) override;
 
   Tab<TrackGradientButton *> mKeys;
-  float mCurValue;
+  float mCurValue = 0.0f;
   bool mCycled, mSelected;
   int mMinPtCount, mMaxPtCount;
+  float minValue = 0.0f;
+  float maxValue = 1.0f;
 
   WindowControlEventHandler *mEventHandler;
   WindowBase *windowBaseForEventHandler = nullptr;
@@ -99,6 +118,8 @@ private:
   Point2 lastMouseDragPosInCanvas = Point2(-1.0f, -1.0f);
   int mouseClickKeyIndex = -1;
   int showColorPickerForKeyIndex = -1;
+  eastl::unique_ptr<IMenu> contextMenu;
+  eastl::unique_ptr<GradientControlContextMenuEventHandler> contextMenuEventHandler;
 };
 
 } // namespace PropPanel

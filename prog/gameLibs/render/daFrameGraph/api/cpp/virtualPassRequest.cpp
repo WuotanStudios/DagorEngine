@@ -3,7 +3,7 @@
 #include <render/daFrameGraph/virtualPassRequest.h>
 #include <frontend/internalRegistry.h>
 #include <render/daFrameGraph/detail/virtualResourceRequestBase.h>
-#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
 
 
 namespace dafg
@@ -55,7 +55,7 @@ VirtualPassRequest VirtualPassRequest::color(std::initializer_list<ColorRwVirtua
   return *this;
 }
 
-VirtualPassRequest VirtualPassRequest::depthRw(RwVirtualAttachmentRequest attachment) &&
+VirtualPassRequest VirtualPassRequest::depth(RwVirtualAttachmentRequest attachment) &&
 {
   auto &nodeData = registry->nodes[nodeId];
   auto &depth = nodeData.renderingRequirements->depthAttachment;
@@ -71,10 +71,11 @@ VirtualPassRequest VirtualPassRequest::depthRw(RwVirtualAttachmentRequest attach
   nodeData.resourceRequests[resId].usage = ResourceUsage{Usage::DEPTH_ATTACHMENT, Access::READ_WRITE, Stage::POST_RASTER};
   depth = VirtualSubresourceRef{resId, attachment.mipLevel, attachment.layer};
   nodeData.renderingRequirements->depthReadOnly = false;
+  nodeData.renderingRequirements->depthReadTestOnly = false;
   return *this;
 }
 
-VirtualPassRequest VirtualPassRequest::depthRo(DepthRoVirtualAttachmentRequest attachment) &&
+VirtualPassRequest VirtualPassRequest::depthReadTestOnly(DepthReadTestOnlyVirtualAttachmentRequest attachment) &&
 {
   auto &nodeData = registry->nodes[nodeId];
   auto &depth = nodeData.renderingRequirements->depthAttachment;
@@ -84,23 +85,26 @@ VirtualPassRequest VirtualPassRequest::depthRo(DepthRoVirtualAttachmentRequest a
            " in '%s' frame graph node! Ignoring one of them!",
       registry->knownNames.getName(nodeId));
   }
-
   auto [resId, hist] = getResUidForAttachment(attachment);
-  G_ASSERTF(!hist, "Internal FG infrastructure does not support history"
-                   " RO depth attachments yet!");
-  // Dirty hack to allow for depthRO to masquarade as a modification,
-  // TODO: purge with fire and remove
+  G_ASSERTF(!hist, "Internal FG infrastructure does not support history depth attachments yet!");
+  // For string-name attachments no .read()/.modify() chain ran yet, so register
+  // this node as a depth READER here. For explicit request objects, the surrounding
+  // chain has already updated the right (read or modified) set.
   if (eastl::holds_alternative<const char *>(attachment.image))
     nodeData.readResources.insert(resId);
-  nodeData.resourceRequests[resId].usage =
-    ResourceUsage{Usage::DEPTH_ATTACHMENT_AND_SHADER_RESOURCE, Access::READ_ONLY, Stage::POST_RASTER};
-
+  // Bind depth as RW (no driver-side decompression). The caller is responsible
+  // for ensuring shaders rendered in this node do not write Z - the API contract
+  // is that this node only tests against depth. Violating the contract causes
+  // races with other depth readers since this node is ordered in the graph as a
+  // reader, not a writer.
+  nodeData.resourceRequests[resId].usage = ResourceUsage{Usage::DEPTH_ATTACHMENT, Access::READ_WRITE, Stage::POST_RASTER};
   depth = VirtualSubresourceRef{resId, attachment.mipLevel, attachment.layer};
-  nodeData.renderingRequirements->depthReadOnly = true;
+  nodeData.renderingRequirements->depthReadOnly = false;
+  nodeData.renderingRequirements->depthReadTestOnly = true;
   return *this;
 }
 
-VirtualPassRequest VirtualPassRequest::depthRoAndBindToShaderVars(DepthRoAndSvBindVirtualAttachmentRequest attachment,
+VirtualPassRequest VirtualPassRequest::depthReadTestAndSample(DepthReadTestAndSampleVirtualAttachmentRequest attachment,
   std::initializer_list<const char *> shader_var_names) &&
 {
   auto &nodeData = registry->nodes[nodeId];
@@ -123,6 +127,7 @@ VirtualPassRequest VirtualPassRequest::depthRoAndBindToShaderVars(DepthRoAndSvBi
 
   depth = VirtualSubresourceRef{resId, attachment.mipLevel, attachment.layer};
   nodeData.renderingRequirements->depthReadOnly = true;
+  nodeData.renderingRequirements->depthReadTestOnly = false;
 
   detail::VirtualResourceRequestBase fakeReq{{resId, hist}, nodeId, registry};
   for (auto name : shader_var_names)

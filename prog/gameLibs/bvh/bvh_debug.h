@@ -2,6 +2,9 @@
 #pragma once
 
 #include <bvh/bvh.h>
+#include <EASTL/unordered_map.h>
+#include <EASTL/vector.h>
+#include <EASTL/string.h>
 
 namespace bvh
 {
@@ -18,59 +21,62 @@ enum class DebugMode
   CamoTexcoord,
   VertexColor,
   GI,
-  TwoSided,
   Paint,
   IntersectionCount,
   Instances,
+  NaN,
+  Lod,
+  LruCollision,
+  VoxelActivity
 };
 
-struct MemoryStatistics
+// Real RT-only memory overhead, computed from the ground up (every GPU resource the BVH context
+// allocates), categorized logically.
+struct RtMemoryOverhead
 {
-  int64_t tlasSize;
-  int64_t tlasUploadSize;
-  int64_t scratchBuffersSize;
-  int64_t transformBuffersSize;
-  int64_t meshMetaSize;
-  int meshCount;
-  int64_t meshBlasSize;
-  int64_t meshVBSize;
-  int64_t meshVBCopySize;
-  int64_t meshIBSize;
-  int skinCount;
-  int64_t skinBLASSize;
-  int64_t skinVBSize;
-  int skinCacheCount;
-  int64_t skinCacheBLASSize;
-  int treeCount;
-  int64_t treeBLASSize;
-  int64_t treeVBSize;
-  int treeCacheCount;
-  int64_t treeCacheBLASSize;
-  int64_t dynamicVBAllocatorSize;
-  int64_t terrainBlasSize;
-  int64_t terrainVBSize;
-  int64_t grassBlasSize;
-  int64_t grassVBSize;
-  int64_t grassIBSize;
-  int64_t grassMetaSize;
-  int64_t grassQuerySize;
-  int64_t cableBLASSize;
-  int64_t cableVBSize;
-  int64_t cableIBSize;
-  int64_t gobjMetaSize;
-  int64_t gobjQuerySize;
-  int blasCount;
-  int64_t perInstanceDataSize;
-  int64_t compactionSize;
-  int64_t peakCompactionSize;
-  int64_t atmosphereTextureSize;
-  int64_t totalMemory;
-  int deathRowBufferCount;
-  int64_t deathRowBufferSize;
-  int indexProcessorBufferCount;
-  int64_t indexProcessorBufferSize;
+  struct Item
+  {
+    int64_t bytes;
+    eastl::string category;
+    eastl::string sub;
+    eastl::string note; // extra, non-additive detail (count, free headroom, sub-splits); shown in brackets
+  };
+  eastl::vector<Item> items;
+  int64_t total = 0;
+  int64_t blasTotalBytes = 0;
+  int blasCount = 0;
+  int64_t lastLodBlasBytes = 0; // this is practically a constant overhead, since they are loaded no matter what
+  int lastLodBlasCount = 0;
+
+  void add(const char *category, const char *sub, int64_t b, const char *note = nullptr)
+  {
+    items.push_back(Item{b, category, sub, note ? note : ""});
+    total += b;
+  }
+
+  template <typename CategoryStartFn, typename ItemFn, typename CategoryEndFn>
+  void forEachCategory(CategoryStartFn on_category_start, ItemFn on_item, CategoryEndFn on_category_end) const
+  {
+    const eastl::string *curCat = nullptr;
+    int64_t catSum = 0;
+    for (const auto &it : items)
+    {
+      if (!curCat || *curCat != it.category)
+      {
+        if (curCat)
+          on_category_end(*curCat, catSum);
+        curCat = &it.category;
+        catSum = 0;
+        on_category_start(*curCat);
+      }
+      catSum += it.bytes;
+      on_item(it);
+    }
+    if (curCat)
+      on_category_end(*curCat, catSum);
+  }
 };
 
-MemoryStatistics get_memory_statistics(ContextId context_id);
+RtMemoryOverhead get_rt_memory_overhead(ContextId context_id);
 
 } // namespace bvh

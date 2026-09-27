@@ -13,30 +13,36 @@
 #include <gameRes/dag_gameResHooks.h>
 #include <gameRes/dag_gameResSystem.h>
 #include <gameRes/dag_stdGameResId.h>
+#include <gameRes/dag_stdGameRes.h>
 #include <3d/dag_texMgr.h>
 #include <libTools/util/makeBindump.h>
 #include <libTools/util/strUtil.h>
 #include <libTools/util/iLogWriter.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <ioSys/dag_dataBlock.h>
 #include <util/dag_oaHashNameMap.h>
 #include <util/dag_string.h>
 #include <util/dag_texMetaData.h>
 #include <util/dag_safeArg.h>
+#include <hash/xxh3.h>
 #include <osApiWrappers/dag_direct.h>
+#include <osApiWrappers/dag_critSec.h>
+#include <ioSys/dag_memIo.h>
 #include <debug/dag_debug.h>
 
 static const int ASSET_RESID_BASE = 512 << 10;
+static WinCritSec dabuild_cache_cs;
 
-static String startDir, tmpStr;
+static String startDir;
 static IDaBuildInterface *dabuild = NULL;
 static DagorAssetMgr *assetMgr = NULL;
+static DataBlock bindAssetsBlock; // own copy: caller's appblk may be a scratch object, mutated/reused later
 static ILogWriter *buildLog = NULL;
 static FastNameMapEx resMap;
 static FastNameMap assetMap;
 static Tab<unsigned> assetRev(inimem);
 static Tab<unsigned> assetTypeToClassId(inimem);
 static Tab<int> assetExpTypes(inimem);
-static Tab<int> tmpRefList(inimem);
 static int texTypeId = -1;
 
 static void install_gameres_hooks();
@@ -79,6 +85,7 @@ public:
   void onAssetBaseChanged(dag::ConstSpan<DagorAsset *> changed_assets, dag::ConstSpan<DagorAsset *> added_assets,
     dag::ConstSpan<DagorAsset *> removed_assets) override
   {
+    WinAutoLock lock(dabuild_cache_cs);
     for (int i = 0; i < changed_assets.size(); i++)
     {
       const DagorAsset &a = *changed_assets[i];
@@ -139,6 +146,7 @@ void dabuildcache::term()
   }
   reset_gameres_hooks();
   assetMgr = NULL;
+  bindAssetsBlock.reset();
 
   dabuild->unloadExporterPlugins();
   dabuild->term();
@@ -151,13 +159,14 @@ IDaBuildInterface *dabuildcache::get_dabuild() { return dabuild; }
 
 int dabuildcache::bind_with_mgr(DagorAssetMgr &mgr, DataBlock &appblk, const char *appdir, const char *ddsx_plugins_path)
 {
+  WinAutoLock lock(dabuild_cache_cs);
   if (!dabuild)
     return -1;
 
+  bindAssetsBlock.setFrom(appblk.getBlockByNameEx("assets"), appblk.resolveFilename());
+
   if (appblk.getStr("shaders", NULL))
-    appblk.setStr("shadersAbs", String(260, "%s/%s", appdir, appblk.getStr("shaders", NULL)));
-  else
-    appblk.setStr("shadersAbs", String(260, "%s/../common/compiledShaders/tools", startDir.str()));
+    appblk.setStr("shadersAbs", make_eff_app_relative_path(appblk.getStr("shaders")));
 
   String cdk_dir(260, "%s/../", startDir.str());
   ::dd_simplify_fname_c(cdk_dir);
@@ -166,6 +175,11 @@ int dabuildcache::bind_with_mgr(DagorAssetMgr &mgr, DataBlock &appblk, const cha
   int pcount = dabuild->init(startDir, mgr, appblk, appdir, ddsx_plugins_path);
   if (pcount)
   {
+    // These are passed to the plugin DLLs in loadExporterPlugins(), so they must be set up before that.
+    assetlocalprops::mkDir("cache");
+    AssetExportCache::createSharedData(assetlocalprops::makePath("assets-hash.bin"));
+    dabuild->setExpCacheSharedData(AssetExportCache::getSharedDataPtr());
+
     dabuild->loadExporterPlugins();
 
     resMap.reset();
@@ -182,9 +196,6 @@ int dabuildcache::bind_with_mgr(DagorAssetMgr &mgr, DataBlock &appblk, const cha
     assetMgr->subscribeBaseUpdateNotify(&updater);
     assetMgr->subscribeUpdateNotify(&updater, -1, texTypeId);
     install_gameres_hooks();
-    assetlocalprops::mkDir("cache");
-    AssetExportCache::createSharedData(assetlocalprops::makePath("assets-hash.bin"));
-    dabuild->setExpCacheSharedData(AssetExportCache::getSharedDataPtr());
   }
 
   assetExpTypes.reserve(assetTypeToClassId.size());
@@ -199,11 +210,11 @@ int dabuildcache::bind_with_mgr(DagorAssetMgr &mgr, DataBlock &appblk, const cha
 void dabuildcache::post_base_update_notify() { free_unused_game_resources(); }
 
 
-static String tmpConStr;
 static void post_con_error(const char *fmt, const DagorSafeArg *arg, int anum)
 {
   if (!assetMgr)
     return;
+  String tmpConStr;
   tmpConStr.vprintf(512, fmt, arg, anum);
   assetMgr->getMsgPipe().onAssetMgrMessage(IDagorAssetMsgPipe::ERROR, tmpConStr, NULL, NULL);
 }
@@ -211,6 +222,7 @@ static void post_con_warning(const char *fmt, const DagorSafeArg *arg, int anum)
 {
   if (!assetMgr)
     return;
+  String tmpConStr;
   tmpConStr.vprintf(512, fmt, arg, anum);
   assetMgr->getMsgPipe().onAssetMgrMessage(IDagorAssetMsgPipe::WARNING, tmpConStr, NULL, NULL);
 }
@@ -218,6 +230,7 @@ static void post_con_note(const char *fmt, const DagorSafeArg *arg, int anum)
 {
   if (!assetMgr)
     return;
+  String tmpConStr;
   tmpConStr.vprintf(512, fmt, arg, anum);
   assetMgr->getMsgPipe().onAssetMgrMessage(IDagorAssetMsgPipe::NOTE, tmpConStr, NULL, NULL);
 }
@@ -296,6 +309,8 @@ static bool abc_on_get_res_name(int res_id, String &out_res_name)
 {
   if (res_id < ASSET_RESID_BASE) //== fallback for old resources built separately
     return false;
+
+  WinAutoLock lock(dabuild_cache_cs);
   if (DagorAsset *a = getAssetByResId(res_id - ASSET_RESID_BASE))
   {
     out_res_name = a->getName();
@@ -303,9 +318,11 @@ static bool abc_on_get_res_name(int res_id, String &out_res_name)
   }
   return true;
 }
-static bool abc_resolve_res_handle(GameResHandle rh, unsigned class_id, int &out_res_id)
+static bool abc_resolve_res_handle(const char *aname, unsigned class_id, int &out_res_id)
 {
-  const char *aname = (const char *)rh;
+  if (!aname || !*aname)
+    return false;
+  WinAutoLock lock(dabuild_cache_cs);
   int a_type = -1;
   DagorAsset *a;
 
@@ -337,7 +354,7 @@ static bool abc_resolve_res_handle(GameResHandle rh, unsigned class_id, int &out
     if (class_id != 0xFFFFFFFFU)
     {
       gamereshooks::resolve_res_handle = NULL;
-      out_res_id = gamereshooks::aux_game_res_handle_to_id(rh, class_id);
+      out_res_id = gamereshooks::aux_game_res_handle_to_id(aname, class_id);
       gamereshooks::resolve_res_handle = abc_resolve_res_handle;
       if (out_res_id >= 0)
       {
@@ -368,6 +385,7 @@ static bool resolve_res_handle(const DagorAsset *a, int &out_res_id)
     assetRev.push_back(0);
   G_ASSERT(asset_nid < assetRev.size());
 
+  String tmpStr;
   if (assetRev[asset_nid])
     tmpStr.printf(128, "%d?%s:%s", assetRev[asset_nid], a->getName(), a->getTypeStr());
   else
@@ -391,6 +409,7 @@ static bool abc_get_game_res_class_id(int res_id, unsigned &out_class_id)
   if (res_id < ASSET_RESID_BASE) //== fallback for old resources built separately
     return false;
 
+  WinAutoLock lock(dabuild_cache_cs);
   DagorAsset *a = getAssetByResId(res_id - ASSET_RESID_BASE);
   if (!a)
   {
@@ -401,11 +420,12 @@ static bool abc_get_game_res_class_id(int res_id, unsigned &out_class_id)
   out_class_id = assetTypeToClassId[a->getType()];
   return true;
 }
-static bool abc_get_game_resource(int res_id, dag::Span<GameResourceFactory *> f, GameResource *&out_res)
+static bool abc_get_game_resource(int res_id, gameres_rrl_cptr_t rrl, dag::Span<GameResourceFactory *> f, GameResource *&out_res)
 {
   if (res_id < ASSET_RESID_BASE) //== fallback for old resources built separately
     return false;
 
+  WinAutoLock lock(dabuild_cache_cs);
   DagorAsset *a = getAssetByResId(res_id - ASSET_RESID_BASE);
   if (!a)
   {
@@ -434,46 +454,17 @@ static bool abc_get_game_resource(int res_id, dag::Span<GameResourceFactory *> f
     return true;
   }
 
-  out_res = fac->getGameResource(res_id);
+  lock.unlock();
+  out_res = fac->getGameResource(rrl, res_id);
   return true;
 }
 static bool abc_release_game_resource(int res_id, dag::Span<GameResourceFactory *> f) { return false; }
-static bool abc_release_game_res2(GameResHandle rh, dag::Span<GameResourceFactory *> f)
-{
-  const char *aname = (const char *)rh;
-  DagorAsset *a = assetMgr->findAsset(aname, assetExpTypes);
-
-  if (!a)
-  {
-    post_con_error("try release non-existing asset <%s>", aname);
-    return true;
-  }
-  if (!assetMgr->isAssetNameUnique(*a, assetExpTypes))
-  {
-    post_con_error("cannot use ambiguous asset name <%s> without type qualification", aname);
-    return true;
-  }
-  if (a->getFolderIndex() == -1) //== fallback for old resources built separately
-    return false;
-
-  int asset_nid = assetMap.getNameId(a->getNameTypified());
-  if (asset_nid == -1)
-  {
-    post_con_error("try release not created asset <%s>", aname);
-    return true;
-  }
-  if (assetRev[asset_nid] != 0)
-  {
-    post_con_error("disabled non-safe release of asset <%s>, leaks may occur", aname);
-    return true;
-  }
-  return false;
-}
 static bool abc_get_res_refs(int res_id, Tab<int> &out_refs)
 {
   if (res_id < ASSET_RESID_BASE) //== fallback for old resources built separately
     return false;
 
+  WinAutoLock lock(dabuild_cache_cs);
   DagorAsset *a = getAssetByResId(res_id - ASSET_RESID_BASE);
   out_refs.clear();
   if (!a)
@@ -496,11 +487,80 @@ static bool abc_get_res_refs(int res_id, Tab<int> &out_refs)
       if (!refList[i].getAsset())
         out_refs.push_back(-1);
       else
-        out_refs.push_back(gamereshooks::aux_game_res_handle_to_id(GAMERES_HANDLE_FROM_STRING(refList[i].refAsset->getName()),
-          assetTypeToClassId[refList[i].refAsset->getType()]));
+        out_refs.push_back(
+          gamereshooks::aux_game_res_handle_to_id(refList[i].refAsset->getName(), assetTypeToClassId[refList[i].refAsset->getType()]));
     }
   }
   return true;
+}
+
+// separateModelMatToDescBin strips materials into a "*Desc.bin" sidecar (exp_rendInst/exp_dynModel),
+// normally merged only when loading a fully prebuilt game (av_appwnd.cpp/de_engine.cpp) - the respack
+// fast path needs it too; a locally-rebuilt asset has materials embedded and doesn't.
+// Resolved once, like the game itself does at startup (no live-reload if a batch export changes it later).
+static bool matDescsLoaded = false;
+static void ensure_mat_descs_loaded()
+{
+  if (matDescsLoaded || bindAssetsBlock.isEmpty())
+    return;
+  matDescsLoaded = true;
+
+  const DataBlock &expblk = *bindAssetsBlock.getBlockByNameEx("export");
+  const DataBlock &buildblk = *bindAssetsBlock.getBlockByNameEx("build");
+  const DataBlock &pkgblk = *expblk.getBlockByNameEx("packages");
+  static const char *target_str = "PC"; // on-demand builds are always PC, no profile
+
+  struct TypeDesc
+  {
+    const char *typeName;
+    DataBlock *desc;
+  };
+  const TypeDesc types[] = {{"rendInst", &gameres_rendinst_desc}, {"dynModel", &gameres_dynmodel_desc}};
+
+  // av_appwnd.cpp/de_engine.cpp lock out further pack/desc loading after their own prebuilt-resource scan;
+  // bypass that lockdown for the duration of our own load, same as before it was installed.
+  auto savedConfirmHook = gamereshooks::on_gameres_pack_load_confirm;
+  gamereshooks::on_gameres_pack_load_confirm = nullptr;
+
+  for (const TypeDesc &t : types)
+  {
+    const DataBlock &tblk = *buildblk.getBlockByNameEx(t.typeName);
+    const char *descListOutPath = tblk.getStr("descListOutPath", nullptr);
+    if (!tblk.getBool("separateModelMatToDescBin", false) || !descListOutPath || !*descListOutPath)
+      continue;
+
+    // gameres_append_desc() dedups by file path forever (sets a same-named bool once loaded), so a
+    // stale invalidate_respack_caches() reload would otherwise silently keep the old data - force a
+    // clean reread of every path here.
+    gameres_reset_desc(*t.desc);
+
+    for (int pkid = -1; pkid < (int)pkgblk.blockCount(); pkid++)
+    {
+      const char *pkname = pkid < 0 ? nullptr : pkgblk.getBlock(pkid)->getBlockName();
+
+      // Merge base first: a resDiff-built patch only carries changed assets, so unchanged ones need base too.
+      String destBase, packFnamePrefix;
+      assethlp::build_package_dest_strings(destBase, packFnamePrefix, expblk, pkname, "%appDir", target_str, nullptr,
+        /*patch_build*/ false);
+      String descFname(260, "%s%s.bin", destBase.str(), descListOutPath);
+      simplify_fname(descFname);
+      gameres_append_desc(*t.desc, descFname, descFname, /*allow_override*/ false);
+
+      if (dabuild->isPatchBuildActive(pkname, target_str))
+      {
+        String patchDestBase, patchPackFnamePrefix;
+        assethlp::build_package_dest_strings(patchDestBase, patchPackFnamePrefix, expblk, pkname, "%appDir", target_str, nullptr,
+          /*patch_build*/ true);
+        String patchDescFname(260, "%s%s.bin", patchDestBase.str(), descListOutPath);
+        simplify_fname(patchDescFname);
+        gameres_append_desc(*t.desc, patchDescFname, patchDescFname, /*allow_override*/ true);
+      }
+    }
+
+    gameres_final_optimize_desc(*t.desc, descListOutPath);
+  }
+
+  gamereshooks::on_gameres_pack_load_confirm = savedConfirmHook;
 }
 
 class AssetCacheLoadCB final : public MemoryLoadCB
@@ -522,6 +582,7 @@ static bool abc_load_game_resource_pack(int res_id, dag::Span<GameResourceFactor
   if (res_id < ASSET_RESID_BASE) //== fallback for old resources built separately
     return false;
 
+  WinAutoLock lock(dabuild_cache_cs);
   DagorAsset *a = getAssetByResId(res_id - ASSET_RESID_BASE);
   if (!a)
     return true;
@@ -535,7 +596,7 @@ static bool abc_load_game_resource_pack(int res_id, dag::Span<GameResourceFactor
   if (!exp)
     return true;
 
-  int tmp_top = tmpRefList.size();
+  Tab<int> tmpRefList(tmpmem);
   if (IDagorAssetRefProvider *refResv = assetMgr->getAssetRefProvider(a->getType()))
   {
     Tab<IDagorAssetRefProvider::Ref> refList;
@@ -559,7 +620,7 @@ static bool abc_load_game_resource_pack(int res_id, dag::Span<GameResourceFactor
         if (!refList[i].getAsset())
           tmpRefList.push_back(-1);
         else
-          tmpRefList.push_back(gamereshooks::aux_game_res_handle_to_id(GAMERES_HANDLE_FROM_STRING(refList[i].refAsset->getName()),
+          tmpRefList.push_back(gamereshooks::aux_game_res_handle_to_id(refList[i].refAsset->getName(),
             assetTypeToClassId[refList[i].refAsset->getType()]));
       }
     }
@@ -575,23 +636,24 @@ static bool abc_load_game_resource_pack(int res_id, dag::Span<GameResourceFactor
   // save caches for dynModel and rendInst so ShaderMatVdata could setup Sbuffer::IReloadData for case of driver reset
   bool force_cache_store = (assetClassId == DynModelGameResClassId || assetClassId == RendInstGameResClassId);
 
+  if (force_cache_store)
+    ensure_mat_descs_loaded();
+
   if (dabuild->getBuiltRes(*a, cwr, exp, assetlocalprops::makePath("cache"), cachePath, dataOffset, force_cache_store))
   {
     AssetCacheLoadCB crd(cwr.getRawWriter().getMem(), false, eastl::move(cachePath), dataOffset);
 
+    lock.unlock();
     fac->loadGameResourceData(res_id, crd);
-    if (tmpRefList.size() > tmp_top)
-    {
-      Tab<int> refList;
-      refList = make_span_const(tmpRefList).subspan(tmp_top);
-      fac->createGameResource(res_id, refList.data(), refList.size());
-    }
+    lock.lock();
+
+    if (!tmpRefList.empty())
+      fac->createGameResource(nullptr, res_id, tmpRefList.data(), tmpRefList.size());
     else
-      fac->createGameResource(res_id, NULL, 0);
+      fac->createGameResource(nullptr, res_id, NULL, 0);
   }
 
   dabuild->setupReports(NULL, NULL);
-  tmpRefList.resize(tmp_top);
   return true;
 }
 
@@ -603,7 +665,6 @@ static void install_gameres_hooks()
   gamereshooks::on_get_game_res_class_id = abc_get_game_res_class_id;
   gamereshooks::on_get_game_resource = abc_get_game_resource;
   gamereshooks::on_release_game_resource = abc_release_game_resource;
-  gamereshooks::on_release_game_res2 = abc_release_game_res2;
   gamereshooks::on_load_game_resource_pack = abc_load_game_resource_pack;
   gamereshooks::on_get_res_name = &abc_on_get_res_name;
   post_con_note("assetBuildCache installed hooks to gameres system");
@@ -616,21 +677,22 @@ static void reset_gameres_hooks()
   gamereshooks::on_get_game_res_class_id = 0;
   gamereshooks::on_get_game_resource = 0;
   gamereshooks::on_release_game_resource = 0;
-  gamereshooks::on_release_game_res2 = 0;
   gamereshooks::on_load_game_resource_pack = 0;
   gamereshooks::on_get_res_name = 0;
 }
 
 int dabuildcache::get_asset_res_id(const DagorAsset &a)
 {
+  WinAutoLock lock(dabuild_cache_cs);
   int res_id = -1;
   if (resolve_res_handle(&a, res_id))
     return res_id;
-  return gamereshooks::aux_game_res_handle_to_id(GAMERES_HANDLE_FROM_STRING(a.getName()), assetTypeToClassId[a.getType()]);
+  return gamereshooks::aux_game_res_handle_to_id(a.getName(), assetTypeToClassId[a.getType()]);
 }
 
 bool dabuildcache::invalidate_asset(const DagorAsset &a, bool free_unused_resources)
 {
+  WinAutoLock lock(dabuild_cache_cs);
   if (a.getType() == texTypeId)
     ::reload_changed_texture_asset(a);
 
@@ -641,10 +703,67 @@ bool dabuildcache::invalidate_asset(const DagorAsset &a, bool free_unused_resour
     {
       GameResourceFactory *f = find_gameres_factory(assetTypeToClassId[a.getType()]);
       if (f)
-        while (f->freeUnusedResources(false)) {}
+        while (f->freeUnusedResources(nullptr, false)) {}
     }
     dabuild->invalidateBuiltRes(a, assetlocalprops::makePath("cache"));
     assetRev[anid]++;
   }
   return false;
+}
+
+bool dabuildcache::get_built_res_hash_xxh3(DagorAsset &asset, unsigned char out_hash_xxh3_128[16])
+{
+  IDagorAssetExporter *exp = asset.getMgr().getAssetExporter(asset.getType());
+  memset(out_hash_xxh3_128, 0, 16);
+  if (!exp || !dabuild)
+    return false;
+  unsigned classId = assetTypeToClassId[asset.getType()];
+  mkbindump::BinDumpSaveCB cwr(1 << 20, _MAKE4C('PC'), false);
+  cwr.setFastBuildFlag(true);
+  bool build_result = false, from_grp = false;
+
+  {
+    WinAutoLock lock(dabuild_cache_cs);
+    String cachePath;
+    int dataOffset = 0;
+    build_result = dabuild->getBuiltRes(asset, cwr, exp, assetlocalprops::makePath("cache"), cachePath, dataOffset, true, &from_grp);
+    if (build_result && from_grp && (classId == RendInstGameResClassId || classId == DynModelGameResClassId))
+      ensure_mat_descs_loaded();
+  }
+
+  if (!build_result)
+    return false;
+
+  XXH3_state_t hashState;
+  ::XXH3_128bits_reset(&hashState);
+  for (const auto *mem = cwr.getRawWriter().getMem(); mem && mem->used; mem = mem->next)
+    ::XXH3_128bits_update(&hashState, mem->data, (int)mem->used);
+
+  if (from_grp && (classId == RendInstGameResClassId || classId == DynModelGameResClassId))
+  {
+    // Only a respack-served result can have materials split into *Desc.bin (a fallback rebuild above always
+    // embeds them via setFastBuildFlag). Safe to read gameres_*_desc unlocked here.
+    DynamicMemGeneralSaveCB matCwr(tmpmem, 4 << 10, 4 << 10);
+    const DataBlock *descRoot = (classId == RendInstGameResClassId) ? &gameres_rendinst_desc : &gameres_dynmodel_desc;
+    if (const DataBlock *assetDesc = descRoot->getBlockByName(asset.getName()))
+    {
+      if (const DataBlock *texBlk = assetDesc->getBlockByName("tex"))
+        texBlk->saveToTextStream(matCwr);
+      if (const DataBlock *matBlk = assetDesc->getBlockByName("mat"))
+        matBlk->saveToTextStream(matCwr);
+    }
+    if (matCwr.size())
+      ::XXH3_128bits_update(&hashState, matCwr.data(), matCwr.size());
+  }
+
+  ::XXH128_canonicalFromHash((XXH128_canonical_t *)out_hash_xxh3_128, ::XXH3_128bits_digest(&hashState));
+  return true;
+}
+
+void dabuildcache::invalidate_respack_caches()
+{
+  WinAutoLock lock(dabuild_cache_cs);
+  matDescsLoaded = false;
+  if (dabuild)
+    dabuild->invalidateRespackCaches();
 }

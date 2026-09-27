@@ -2,9 +2,17 @@
 
 #ifndef DAS_VERSION
 #define DAS_VERSION_MAJOR 0
-#define DAS_VERSION_MINOR 5
-#define DAS_VERSION_PATCH 0
+#define DAS_VERSION_MINOR 6
+#define DAS_VERSION_PATCH 4
 #define DAS_VERSION (DAS_VERSION_MAJOR*10000 + DAS_VERSION_MINOR*100 + DAS_VERSION_PATCH)
+#endif
+
+#ifndef DAS_BUILD_ID
+#ifdef NDEBUG
+#define DAS_BUILD_ID (DAS_VERSION * 100 + sizeof(void*))
+#else
+#define DAS_BUILD_ID (DAS_VERSION * 100 + 10 + sizeof(void*))
+#endif
 #endif
 
 #ifdef __HAIKU__
@@ -25,6 +33,8 @@
 #pragma warning(disable:4714)    // marked as __forceinline not inlined
 #pragma warning(disable:4180)    // qualifier applied to function type has no meaning; ignored
 #pragma warning(disable:4305)    // truncation from 'double' to 'float'
+#pragma warning(disable:4744)    // variable has different type in different TUs (WPO false positive with inline static atomic)
+#pragma warning(disable:4743)    // type has different size in different TUs (WPO false positive with inline static atomic)
 #endif
 
 #ifdef __clang__
@@ -82,27 +92,35 @@
 
 #include <stdint.h>
 #include <float.h>
+#include <atomic>
 #include <daScript/das_config.h>
 #include <daScript/misc/hash.h>
 #include <daScript/misc/macro.h>
 
 #if _TARGET_PC_MACOSX && __SSE__
    #define DAS_EVAL_ABI [[clang::vectorcall]]
-#elif (defined(_MSC_VER) || defined(__clang__)) && __SSE__ && !defined __HAIKU__
+#elif _TARGET_PC_WIN && (defined(_MSC_VER) || defined(__clang__)) && __SSE__ && !defined __HAIKU__
     #define DAS_EVAL_ABI __vectorcall
 #else
     #define DAS_EVAL_ABI
 #endif
 
 #ifndef _MSC_VER
-    #define __forceinline inline __attribute__((always_inline))
-    #define ___noinline __attribute__((noinline))
+    // Only define if not already defined by the compiler/system headers
+    #ifndef __forceinline
+        #define __forceinline inline __attribute__((always_inline))
+    #endif
+    #ifndef ___noinline
+        #define ___noinline __attribute__((noinline))
+    #endif
 #else
-    #define ___noinline __declspec(noinline)
+    #ifndef ___noinline
+        #define ___noinline __declspec(noinline)
+    #endif
 #endif
 
 #if defined(__has_feature)
-    #if __has_feature(address_sanitizer)
+    #if __has_feature(undefined_behavior_sanitizer)
         #define DAS_SUPPRESS_UB  __attribute__((no_sanitize("undefined")))
     #endif
 #endif
@@ -237,24 +255,77 @@ __forceinline uint64_t rotr64_c(uint64_t a, uint64_t b) {
 
 #endif
 
+
+#if DAS_ENABLE_DLL
+#ifndef DAS_API
+#ifdef _WIN32
+    // __declspec(dll*) works on every Windows toolchain: MSVC, clang-cl,
+    // clang-mingw, and gcc-mingw (gcc accepts the MSVC keyword on Windows
+    // targets). ELF visibility on Windows is a no-op, so the old _MSC_VER
+    // gate left clang-mingw with untagged symbols — lld then defaulted to
+    // exporting every global and overflowed the 16-bit PE ordinal table at
+    // ~65535 symbols.
+    #define DAS_EXPORT_DLL __declspec(dllexport)
+    #define DAS_IMPORT_DLL __declspec(dllimport)
+#else
+    #define DAS_EXPORT_DLL __attribute__((visibility("default")))
+    #define DAS_IMPORT_DLL
+#endif
+
+#ifdef DAS_EXPORTS
+    #define DAS_API DAS_EXPORT_DLL
+#else
+    #define DAS_API DAS_IMPORT_DLL
+#endif
+#ifdef DAS_MOD_EXPORTS
+    #define DAS_MOD_API DAS_EXPORT_DLL
+#else
+    #define DAS_MOD_API DAS_IMPORT_DLL
+#endif
+#ifdef DAS_CC_EXPORTS
+    #define DAS_CC_API DAS_EXPORT_DLL
+#else
+    #define DAS_CC_API DAS_IMPORT_DLL
+#endif
+#endif
+#else
+
+#define DAS_EXPORT_DLL
+#define DAS_IMPORT_DLL
+#define DAS_API
+#define DAS_MOD_API
+#define DAS_CC_API
+
+#endif
+
+
 #include "daScript/misc/hal.h"
 
-void os_debug_break();
+void DAS_API os_debug_break();
+void DAS_API print_current_stack_trace();
 
 #ifndef DAS_FATAL_LOG
 #define DAS_FATAL_LOG(...)   do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 #endif
 
 #ifndef DAS_FATAL_ERROR
-#define DAS_FATAL_ERROR(...) { \
-    DAS_FATAL_LOG(__VA_ARGS__); \
-    assert(0 && "fatal error"); \
-    exit(-1); \
-}
+    #ifdef DAS_NO_ASSERTIONS
+        #define DAS_FATAL_ERROR(...) { \
+            DAS_FATAL_LOG(__VA_ARGS__); \
+            exit(-1); \
+        }
+    #else
+        #define DAS_FATAL_ERROR(...) { \
+            DAS_FATAL_LOG(__VA_ARGS__); \
+            print_current_stack_trace(); \
+            os_debug_break(); \
+            exit(-1); \
+        }
+    #endif
 #endif
 
 #ifndef DAS_ASSERT
-    #ifdef NDEBUG
+    #ifdef DAS_NO_ASSERTIONS
         #define DAS_ASSERT(cond)
     #else
         #define DAS_ASSERT(cond) { \
@@ -267,7 +338,7 @@ void os_debug_break();
 #endif
 
 #ifndef DAS_ASSERTF
-    #ifdef NDEBUG
+    #ifdef DAS_NO_ASSERTIONS
         #define DAS_ASSERTF(cond,...)
     #else
         #define DAS_ASSERTF(cond,...) { \
@@ -282,7 +353,7 @@ void os_debug_break();
 
 
 #ifndef DAS_VERIFY
-    #ifdef NDEBUG
+    #ifdef DAS_NO_ASSERTIONS
         #define DAS_VERIFY(cond) { \
             if ( !(cond) ) { \
                 DAS_FATAL_LOG("verify failed: %s, %s:%d\n", #cond, __FILE__, __LINE__); \
@@ -300,7 +371,7 @@ void os_debug_break();
 #endif
 
 #ifndef DAS_VERIFYF
-    #ifdef NDEBUG
+    #ifdef DAS_NO_ASSERTIONS
         #define DAS_VERIFYF(cond,...) { \
             if ( !(cond) ) { \
                 DAS_FATAL_LOG("verify failed: %s, %s:%d\n", #cond, __FILE__, __LINE__); \
@@ -319,22 +390,106 @@ void os_debug_break();
     #endif
 #endif
 
+// Heap-leak tracking hooks. Zero-cost when DAS_TRACK_ALLOC is off (empty inline bodies
+// fold away). When on, external implementations in src/misc/alloc_tracker.cpp record
+// every aligned allocation and symbolize survivors after Module::Shutdown().
+namespace das {
+#if DAS_TRACK_ALLOC
+    DAS_API void    track_alloc_hook(void *p, size_t sz) noexcept;
+    DAS_API void    track_free_hook(void *p) noexcept;
+    DAS_API void    arm_alloc_tracking() noexcept;
+    DAS_API size_t  dump_alloc_leaks(FILE *out);
+    // RAII: sets the tracker's tl_inside so allocations/frees inside the scope
+    // are not recorded in the LeakMap. Use for internal bookkeeping containers
+    // (e.g. lexer_track_map) whose operator delete during erase would otherwise
+    // recurse into track_free_hook, bail on the already-true tl_inside, and
+    // leave phantom LeakMap entries.
+    struct DAS_API AllocTrackerInternalGuard {
+        bool prev;
+        AllocTrackerInternalGuard() noexcept;
+        ~AllocTrackerInternalGuard() noexcept;
+    };
+    // Landmark RAII: ctor walks the stack once and stores the chain; alloc-site
+    // captures that match the landmark's RSP short-circuit with a memcpy. Place
+    // one on the stack high in the call tree (e.g. top of compile_and_run) to
+    // cut per-allocation unwind cost from ~N frames to ~depth-above-landmark.
+    // Win64 only — other platforms treat it as a no-op.
+    #if defined(_MSC_VER) && defined(_M_X64)
+        DAS_API void das_fast_stack_landmark_enter() noexcept;
+        DAS_API void das_fast_stack_landmark_exit() noexcept;
+        struct AllocTrackingLandmark {
+            AllocTrackingLandmark() noexcept  { das_fast_stack_landmark_enter(); }
+            ~AllocTrackingLandmark() noexcept { das_fast_stack_landmark_exit(); }
+        };
+    #else
+        struct AllocTrackingLandmark {
+            AllocTrackingLandmark() noexcept {}
+            ~AllocTrackingLandmark() noexcept {}
+        };
+    #endif
+#else
+    inline void   track_alloc_hook(void *, size_t) noexcept {}
+    inline void   track_free_hook(void *) noexcept {}
+    inline void   arm_alloc_tracking() noexcept {}
+    inline size_t dump_alloc_leaks(FILE *) { return 0; }
+    struct AllocTrackerInternalGuard {
+        AllocTrackerInternalGuard() noexcept {}
+        ~AllocTrackerInternalGuard() noexcept {}
+    };
+    struct AllocTrackingLandmark {
+        AllocTrackingLandmark() noexcept {}
+        ~AllocTrackingLandmark() noexcept {}
+    };
+#endif
+}
+
+#if defined(__linux__)
+#include <sys/mman.h>       // madvise/MADV_HUGEPAGE for the >=2MB hugepage tier below
+#endif
+
 #ifndef DAS_ALIGNED_ALLOC
 #define DAS_ALIGNED_ALLOC 1
+// Size-tiered alignment: blocks ≥2KB get cache-line (64B) alignment — SIMD/AMX tile
+// kernels (tileloadd row loads, 512-bit vector loads) pay a line-split on every access
+// to a 16-but-not-64-aligned panel (measured ~260M split-loads/s on SPR AMX GEMM; Intel
+// SDM ch.20 mandates 64B for tile data). Blocks ≥2MB get 2MB alignment + MADV_HUGEPAGE
+// on Linux: the hugepage hint only collapses 2M-aligned VA subranges, so without the
+// alignment the hint misses the panel head. Windows stays uniform 64B — _aligned_msize
+// must be called with the exact alignment passed at alloc time, so it cannot be
+// size-tiered there. The name keeps its historical "16" (the minimum caller contract).
+#define DAS_ALLOC_ALIGNMENT_WIN 64
+inline size_t das_alloc_alignment(size_t size) {
+    if (size >= 2*1024*1024) return 2*1024*1024;
+    if (size >= 2048) return 64;
+    return 16;
+}
 inline void *das_aligned_alloc16(size_t size) {
-#if defined(_MSC_VER)
-    return _aligned_malloc(size, 16);
+    DAS_ASSERTF(size != 0, "das_aligned_alloc16 called with size 0");
+    void *p;
+#if defined(_WIN32)
+    // All Windows toolchains (MSVC / clang-cl / clang-mingw64 / gcc-mingw64) use
+    // the MS C runtime aligned-allocator family declared in <malloc.h>.
+    p = _aligned_malloc(size, DAS_ALLOC_ALIGNMENT_WIN);
 #else
-    void * mem = nullptr;
-    if (posix_memalign(&mem, 16, size)) {
+    p = nullptr;
+    if (posix_memalign(&p, das_alloc_alignment(size), size)) {
         DAS_ASSERTF(0, "posix_memalign returned nullptr");
         return nullptr;
     }
-    return mem;
+#if defined(__linux__)
+    if (size >= 2*1024*1024) {
+        // interior only (size rounded DOWN to 2MB): hinting the partial tail page would back
+        // it with a full 2MB of RSS (a 2.05MB block ballooning to 4MB); the tail stays 4K
+        madvise(p, size & ~size_t(2*1024*1024 - 1), MADV_HUGEPAGE);
+    }
 #endif
+#endif
+    das::track_alloc_hook(p, size);
+    return p;
 }
 inline void das_aligned_free16(void *ptr) {
-#if defined(_MSC_VER)
+    das::track_free_hook(ptr);
+#if defined(_WIN32)
     _aligned_free(ptr);
 #else
     free(ptr);
@@ -342,12 +497,13 @@ inline void das_aligned_free16(void *ptr) {
 }
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
-#elif defined (__linux__) || defined (_EMSCRIPTEN_VER) || defined __HAIKU__
+#elif defined (__linux__) || defined (_EMSCRIPTEN_VER) || defined __HAIKU__ || defined(_WIN32)
+// Windows: <malloc.h> declares _aligned_msize for MSVC and the MinGW-w64 CRT.
 #include <malloc.h>
 #endif
 inline size_t das_aligned_memsize(void * ptr){
-#if defined(_MSC_VER)
-    return _aligned_msize(ptr, 16, 0);
+#if defined(_WIN32)
+    return _aligned_msize(ptr, DAS_ALLOC_ALIGNMENT_WIN, 0);
 #elif defined(__APPLE__)
     return malloc_size(ptr);
 #else
@@ -356,10 +512,13 @@ inline size_t das_aligned_memsize(void * ptr){
 }
 #endif
 
-// when enabled, Context heap memory will track where the allocation came from
-// via mark_location and mark_comment
+// when enabled, Context heap memory can track where the allocation came from
+// via mark_location and mark_comment. This is now a compile-time kill switch —
+// the actual tracking is controlled at runtime via CodeOfPolicies::track_allocations
+// and defaults to off. Setting DAS_TRACK_ALLOCATIONS=0 dead-code-eliminates the
+// tracking infrastructure for shipping builds.
 #ifndef DAS_TRACK_ALLOCATIONS
-#define DAS_TRACK_ALLOCATIONS   0
+#define DAS_TRACK_ALLOCATIONS   1
 #endif
 
 // when enabled, Context heap memory will be filled with 0xcd when deleted
@@ -371,13 +530,7 @@ inline size_t das_aligned_memsize(void * ptr){
 #define DAS_TRACK_INSANE_POINTERS 0
 #endif
 
-// when enabled, TypeDecl, Expression, Variable, Structure, Enumeration and Function
-// will be filled with 0xcd when deleted
-#ifndef DAS_MACRO_SANITIZER
-#define DAS_MACRO_SANITIZER 0
-#endif
-
-#if !_TARGET_64BIT && !defined(__clang__) && (_MSC_VER <= 1900)
+#if defined(_M_IX86) && defined(_MSC_VER) && !defined(__clang__) && _MSC_VER <= 1900
 #define _msc_inline_bug __declspec(noinline)
 #else
 #define _msc_inline_bug __forceinline
@@ -389,7 +542,7 @@ public:
     using SelfType = DasThreadLocal<T, TAG>;
 
     inline DasThreadLocal() {
-        if ( initCounter++ ) {
+        if ( initCounter.fetch_add(1, std::memory_order_relaxed) ) {
             DAS_ASSERTF(false, "Type with tag is already used, pls change tag!");
         }
     }
@@ -399,12 +552,17 @@ public:
     DasThreadLocal & operator=(const SelfType & other) = delete;
     DasThreadLocal & operator=(SelfType && other) = delete;
 
-    inline T & operator *() { return value_; }
-    inline T * operator->() { return &value_; }
+    // Function-local static thread_local: dynamic-init code lives inside the
+    // function body with a guard, so there is no separately-emitted TLS init
+    // routine (_ZTH...) for thin-LTO + COFF (mingw-clang) to drop. Same hot-path
+    // cost as a class-static thread_local (TLS load + first-touch guard).
+    // operator-> routes through operator* so both share the same storage.
+    // https://github.com/llvm/llvm-project/issues/199462
+    inline T & operator *() { static thread_local T value_{}; return value_; }
+    inline T * operator->() { return &(**this); }
 
 private:
-    inline static thread_local T value_{};
-    inline static int initCounter = 0;
+    inline static std::atomic<int> initCounter{0};
 };
 
 #ifndef DAS_THREAD_LOCAL
@@ -423,27 +581,6 @@ private:
     #endif
 #endif
 
-#if DAS_SMART_PTR_DEBUG==1
-    #define DAS_SMART_PTR_TRACKER   1
-    #define DAS_SMART_PTR_MAGIC     1
-    #define DAS_SMART_PTR_ID        1
-#endif
-
-#ifndef DAS_SMART_PTR_TRACKER
-    #ifdef NDEBUG
-        #define DAS_SMART_PTR_TRACKER   0
-    #else
-        #define DAS_SMART_PTR_TRACKER   1
-    #endif
-#endif
-
-#ifndef DAS_SMART_PTR_MAGIC
-    #ifdef NDEBUG
-        #define DAS_SMART_PTR_MAGIC     0
-    #else
-        #define DAS_SMART_PTR_MAGIC     1
-    #endif
-#endif
 
 // if -funsafe-math-optimizations or -freciprocal-math is used, this flat needs to be 0
 // unfortunately, it's not possible to detect this flag in the preprocessor
@@ -453,6 +590,28 @@ private:
     #else
         #define DAS_FAST_INTEGER_MOD 1
     #endif
+#endif
+
+// Workaround for https://github.com/google/sanitizers/issues/749
+#if DAS_ENABLE_EXCEPTIONS && defined(__clang__) && defined(_WIN32) && defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define WIN_EH_NO_ASAN __attribute__((no_sanitize_address))
+#endif
+#endif
+#ifndef WIN_EH_NO_ASAN
+#define WIN_EH_NO_ASAN
+#endif
+
+// Upper bound on JobQue worker threads, and therefore on get_total_hw_threads / get_total_hw_jobs.
+// On wasm the persistent job pool spawns one Web Worker per thread (navigator.hardwareConcurrency
+// of them without a cap), so keep 4 there; everywhere else the cores-1 rule in job_que.cpp governs
+// and the cap is effectively off. Override in CMake (-DDAS_MAX_HW_JOBS=N) either way.
+#ifndef DAS_MAX_HW_JOBS
+#if defined(__EMSCRIPTEN__)
+#define DAS_MAX_HW_JOBS 4
+#else
+#define DAS_MAX_HW_JOBS 1024
+#endif
 #endif
 
 #include "daScript/misc/smart_ptr.h"

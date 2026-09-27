@@ -2,6 +2,7 @@
 
 #include <memory/dag_framemem.h>
 #include <perfMon/dag_statDrv.h>
+#include <generic/dag_span.h>
 #include <shaders/dag_dynSceneRes.h>
 #include <shaders/dag_renderStateId.h>
 #include <EASTL/hash_map.h>
@@ -22,6 +23,8 @@ static ShaderVariableInfo draw_order_var_info("draw_order");
 
 using namespace dynmodel_renderer;
 using AnimcharAdditionalDataView = animchar_additional_data::AnimcharAdditionalDataView;
+
+const PathFilterView PathFilterView::NULL_FILTER = PathFilterView(dag::ConstSpan<uint8_t>());
 
 static struct DynModelRendering
 {
@@ -50,7 +53,7 @@ static struct DynModelRendering
 static void fill_node_collapser_data(const DynamicRenderableSceneInstance *scene,
   const eastl::span<Point4, ADDITIONAL_BONE_MTX_OFFSET> node_collapser_data)
 {
-  const DynamicRenderableSceneInstance::NodeCollapserBits &ncBits = scene->getNodeCollapserBits();
+  const DynamicRenderableSceneInstance::NodeCollapserBits::Data &ncBits = scene->getNodeCollapserBits().data;
   node_collapser_data[0] = Point4(bitwise_cast<float>(ncBits[0]), bitwise_cast<float>(ncBits[1]), bitwise_cast<float>(ncBits[2]),
     bitwise_cast<float>(ncBits[3]));
   node_collapser_data[1] = Point4(bitwise_cast<float>(ncBits[4]), bitwise_cast<float>(ncBits[5]), bitwise_cast<float>(ncBits[6]),
@@ -62,12 +65,10 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
   const DynamicRenderableSceneInstance *scene,
   const DynamicRenderableSceneResource *lodResource,
   const AnimcharAdditionalDataView additional_data,
-  bool need_previous_matrices,
-  ShaderElement *shader_override,
-  const uint8_t *path_filter,
-  uint32_t path_filter_size,
+  NeedPreviousMatrices need_previous_matrices,
+  DynamicShaderOverrides shader_overrides,
+  const PathFilterView path_filter,
   uint8_t render_mask,
-  bool need_immediate_const_ps,
   RenderPriority priority,
   const GlobalVariableStates *gvars_state,
   TexStreamingContext texCtx,
@@ -76,12 +77,12 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
   G_ASSERT(scene->getLodsResource()->getInstanceRefCount() > 0);
   int lodNo = max(scene->getCurrentLodNo(), 0);
 
-  const bool addPreviousMatrices = need_previous_matrices;
+  const bool addPreviousMatrices = need_previous_matrices == NeedPreviousMatrices::Yes;
   matrixStride = addPreviousMatrices ? MATRIX_ROWS * 2 : MATRIX_ROWS; // 3 rows for matrix and 3 for previous matrix
   float distSq = scene->getDistSq();
   int reqLevel = texCtx.getTexLevel(scene->getLodsResource()->getTexScale(lodNo), distSq);
 
-  auto addMeshToList = [&](const ShaderMesh &mesh, int instId, int bindposeBufferOffset) {
+  auto addMeshToList = [&](const ShaderMesh &mesh, int instId, int bindposeBufferOffset, ShaderElement *shader_override) {
     if (output_offset)
       output_offset->emplace_back(instId);
     if (mode == ONLY_PER_INSTANCE_DATA)
@@ -105,15 +106,9 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
       {
         if (!elem.e)
           continue;
-        uint32_t prog;
-        ShaderStateBlockId state;
-        shaders::TexStateIdx tstate;
-        shaders::ConstStateIdx cstate;
-        shaders::RenderStateId rstate;
         ShaderElement *s = (shader_override != nullptr) ? shader_override : static_cast<ShaderElement *>(elem.e);
-        int curVar;
-        curVar = get_dynamic_variant_states(gvars_state, s->native(), prog, state, rstate, cstate, tstate);
-        if (curVar < 0)
+        shaders::CombinedDynVariantState dynVarState = get_dynamic_variant_states(gvars_state, s->native());
+        if (!is_valid(dynVarState))
           continue;
         RenderPriority renderPriority = priority;
         int drawOrder;
@@ -126,12 +121,12 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
           else
             renderPriority = RenderPriority::LOW;
         }
-        if (!is_packed_material(cstate))
-          list.emplace_back(s, curVar, prog, state, rstate, tstate, cstate, elem.vertexData, reqLevel, renderPriority,
-            (uint8_t)counter, instId, elem.si, elem.numf, elem.baseVertex, need_immediate_const_ps, bindposeBufferOffset);
+        if (!is_packed_material(dynVarState.const_state))
+          list.emplace_back(s, dynVarState, elem.vertexData, reqLevel, renderPriority, (uint8_t)counter, instId, elem.si, elem.numf,
+            elem.baseVertex, bindposeBufferOffset);
         else
-          multidrawList.emplace_back(s, curVar, prog, state, rstate, tstate, cstate, elem.vertexData, reqLevel, renderPriority,
-            (uint8_t)counter, instId, elem.si, elem.numf, elem.baseVertex, need_immediate_const_ps, bindposeBufferOffset);
+          multidrawList.emplace_back(s, dynVarState, elem.vertexData, reqLevel, renderPriority, (uint8_t)counter, instId, elem.si,
+            elem.numf, elem.baseVertex, bindposeBufferOffset);
       }
   };
   // rigids
@@ -141,8 +136,8 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
     int maxBlockNo = -1;
     for (const auto &o : lodResource->getRigidsConst())
     {
-      if ((!path_filter && !scene->isNodeHidden(o.nodeId)) ||
-          (path_filter && (o.nodeId >= path_filter_size || (path_filter[o.nodeId] & render_mask) == render_mask)))
+      if ((path_filter.empty() && !scene->isNodeHidden(o.nodeId)) ||
+          (!path_filter.empty() && (o.nodeId >= path_filter.size() || (path_filter[o.nodeId] & render_mask) == render_mask)))
       {
         const int nodeId = currentRigidNo; // or may be rigid no
         const int currentBlockNo = currentRigidNo >> 8;
@@ -167,7 +162,7 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
         if (addPreviousMatrices)
           writeInst(scene->getPrevNodeWtm(o.nodeId), 3);
         const int dataAt = currentInstanceData + addDataSizeSum + (currentRigidNo & ~0xFF) * matrixStride;
-        addMeshToList(*o.mesh->getMesh(), dataAt, 0);
+        addMeshToList(*o.mesh->getMesh(), dataAt, 0, shader_overrides.rigidsShader);
       }
       currentRigidNo++;
     }
@@ -183,6 +178,7 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
     // but for simplification we use it anyway
     auto skins = lodResource->getSkins();
     const int currentInstanceData = instanceData.size();
+    G_ASSERTF_RETURN(skins[0], , "Please make full dump");
     const ShaderSkinnedMesh &skin = *skins[0]->getMesh();
     instanceData.resize(instanceData.size() + additional_data.size() + ADDITIONAL_BONE_MTX_OFFSET + skin.bonesCount() * matrixStride);
     vec4f *__restrict instanceDataPtr = (vec4f *__restrict)&instanceData[currentInstanceData];
@@ -201,10 +197,10 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
 
     auto skinNodes = lodResource->getSkinNodes();
     for (int i = 0, e = skinNodes.size(); i < e; i++)
-      if ((!path_filter && !scene->isNodeHidden(skinNodes[i])) ||
-          (path_filter && (skinNodes[i] >= path_filter_size || ((path_filter[skinNodes[i]]) & render_mask) == render_mask)))
+      if ((path_filter.empty() && !scene->isNodeHidden(skinNodes[i])) ||
+          (!path_filter.empty() && (skinNodes[i] >= path_filter.size() || ((path_filter[skinNodes[i]]) & render_mask) == render_mask)))
         addMeshToList(skins[i]->getMesh()->getShaderMesh(), currentInstanceData + additional_data.size(),
-          lodResource->getBindposeBufferIndex(i));
+          lodResource->getBindposeBufferIndex(i), shader_overrides.skinsShader);
   }
 }
 
@@ -212,12 +208,10 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
   uint32_t end_stage,
   const DynamicRenderableSceneInstance *scene,
   const AnimcharAdditionalDataView additional_data,
-  bool need_previous_matrices,
-  ShaderElement *shader_override,
-  const uint8_t *path_filter,
-  uint32_t path_filter_size,
+  NeedPreviousMatrices need_previous_matrices,
+  DynamicShaderOverrides shader_overrides,
+  const PathFilterView path_filter,
   uint8_t render_mask,
-  bool need_immediate_const_ps,
   RenderPriority priority,
   const GlobalVariableStates *gvars_state,
   TexStreamingContext texCtx)
@@ -225,8 +219,8 @@ void DynModelRenderingState::process_animchar(uint32_t start_stage,
   const DynamicRenderableSceneResource *lodResource = scene->getCurSceneResource();
   if (lodResource)
     process_animchar(start_stage, end_stage, // inclusive range of stages
-      scene, lodResource, additional_data, need_previous_matrices, shader_override, path_filter, path_filter_size, render_mask,
-      need_immediate_const_ps, priority, gvars_state, texCtx);
+      scene, lodResource, additional_data, need_previous_matrices, shader_overrides, path_filter, render_mask, priority, gvars_state,
+      texCtx);
 }
 
 namespace dynmodel_renderer
@@ -290,12 +284,12 @@ void DynModelRenderingState::coalesceDrawcalls()
   TIME_D3D_PROFILE(dyn_model_coalesce_drawcalls);
 
   const auto mergeComparator = [](const RenderElement &a, const RenderElement &b) -> bool {
-    return a.vData == b.vData && a.priority == b.priority && a.rstate == b.rstate &&
-           get_material_id(a.cstate) == get_material_id(b.cstate) && a.prog == b.prog;
+    return a.vData == b.vData && a.priority == b.priority && a.dvState.render_state == b.dvState.render_state &&
+           get_material_id(a.dvState.const_state) == get_material_id(b.dvState.const_state) && a.dvState.program == b.dvState.program;
   };
 
   drawcallRanges.push_back(PackedDrawCallsRange{0, 1});
-  bindlessStatesToUpdateTexLevels.emplace(multidrawList[0].cstate, multidrawList[0].reqTexLevel);
+  bindlessStatesToUpdateTexLevels.emplace(multidrawList[0].dvState.const_state, multidrawList[0].reqTexLevel);
 
   for (uint32_t i = 1, ie = multidrawList.size(); i < ie; ++i)
   {
@@ -305,9 +299,9 @@ void DynModelRenderingState::coalesceDrawcalls()
       drawcallRanges.back().count++;
     else
       drawcallRanges.push_back(PackedDrawCallsRange{drawcallRanges.back().count + drawcallRanges.back().start, 1});
-    auto iter = bindlessStatesToUpdateTexLevels.find(currentRelem.cstate);
+    auto iter = bindlessStatesToUpdateTexLevels.find(currentRelem.dvState.const_state);
     if (iter == bindlessStatesToUpdateTexLevels.end())
-      bindlessStatesToUpdateTexLevels.emplace(currentRelem.cstate, currentRelem.reqTexLevel);
+      bindlessStatesToUpdateTexLevels.emplace(currentRelem.dvState.const_state, currentRelem.reqTexLevel);
     else
       iter->second = max(iter->second, currentRelem.reqTexLevel);
   }
@@ -320,17 +314,17 @@ void DynModelRenderingState::prepareForRender()
     stlsort::sort(list.begin(), list.end(), [&](const RenderElement &a, const RenderElement &b) {
       if (a.priority != b.priority)
         return a.priority < b.priority;
-      if (a.rstate != b.rstate)
-        return a.rstate < b.rstate;
-      if (a.tstate != b.tstate) // maybe split state into sampler state (heavy) and const buffer (cheap)?
-        return a.tstate < b.tstate;
+      if (a.dvState.render_state != b.dvState.render_state)
+        return a.dvState.render_state < b.dvState.render_state;
+      if (a.dvState.tex_state != b.dvState.tex_state) // maybe split state into sampler state (heavy) and const buffer (cheap)?
+        return a.dvState.tex_state < b.dvState.tex_state;
       if (a.vData != b.vData)
         return (uintptr_t)a.vData < (uintptr_t)b.vData;
-      if (a.prog != b.prog)
-        return a.prog < b.prog;
+      if (a.dvState.program != b.dvState.program)
+        return a.dvState.program < b.dvState.program;
 
-      if (a.state != b.state) // maybe split state into sampler state (heavy) and const buffer (cheap)?
-        return a.state < b.state;
+      if (a.dvState.state_index != b.dvState.state_index) // maybe split state into sampler state (heavy) and const buffer (cheap)?
+        return a.dvState.state_index < b.dvState.state_index;
       if (a.instanceId != b.instanceId)
         return a.instanceId < b.instanceId;
       if (a.bindposeBufferOffset != b.bindposeBufferOffset)
@@ -347,20 +341,20 @@ void DynModelRenderingState::prepareForRender()
   {
     TIME_PROFILE(sort_packed_dynm);
     stlsort::sort(multidrawList.begin(), multidrawList.end(), [&](const RenderElement &a, const RenderElement &b) {
-      if (get_material_id(a.cstate) != get_material_id(b.cstate))
-        return get_material_id(a.cstate) < get_material_id(b.cstate);
+      if (get_material_id(a.dvState.const_state) != get_material_id(b.dvState.const_state))
+        return get_material_id(a.dvState.const_state) < get_material_id(b.dvState.const_state);
       if (a.priority != b.priority)
         return a.priority < b.priority;
-      if (a.rstate != b.rstate)
-        return a.rstate < b.rstate;
+      if (a.dvState.render_state != b.dvState.render_state)
+        return a.dvState.render_state < b.dvState.render_state;
       // TODO: split it on vbuffer/vstride comparator, because different vdata ofthen uses the same buffers
       if (a.vData != b.vData)
         return (uintptr_t)a.vData < (uintptr_t)b.vData;
-      if (a.prog != b.prog)
-        return a.prog < b.prog;
+      if (a.dvState.program != b.dvState.program)
+        return a.dvState.program < b.dvState.program;
 
-      if (a.state != b.state)
-        return a.state < b.state;
+      if (a.dvState.state_index != b.dvState.state_index)
+        return a.dvState.state_index < b.dvState.state_index;
       if (a.bindposeBufferOffset != b.bindposeBufferOffset)
         return a.bindposeBufferOffset < b.bindposeBufferOffset;
       return false;
@@ -392,14 +386,13 @@ void DynModelRenderingState::render_no_packed(int offset) const
 
   TIME_D3D_PROFILE(render_dynm);
 #if DAGOR_DBGLEVEL > 0
-  if (d3d::get_driver_desc().caps.hasWellSupportedIndirect && d3d::get_driver_desc().caps.hasBindless)
+  if (auto &caps = d3d::get_driver_desc().caps; caps.hasWellSupportedIndirect && caps.hasBindless)
     LOGWARN_ONCE("Shader \"%s\" doesn't use multidraw indirect!", list.front().curShader->getShaderClassName());
 #endif
   G_ASSERTF(ShaderGlobal::get_int(matrices_strideVarId) == matrixStride, "matrices stride should be set correctly");
   GlobalVertexData *vdata = NULL;
   int instanceId = -1;
   int bindposeBufferOffset = -1;
-  bool needPsImmConst = false;
   for (auto rliI = list.begin(), e = list.end(); rliI != e;)
   {
     auto &rli = *rliI;
@@ -410,9 +403,10 @@ void DynModelRenderingState::render_no_packed(int offset) const
     for (++rliI; rliI != e; rliI++)
     {
       auto &rlj = *rliI;
-      if (rli.instanceId == rlj.instanceId && rli.bindposeBufferOffset == rlj.bindposeBufferOffset && rli.curVar == rlj.curVar &&
-          rli.state == rlj.state && rli.prog == rlj.prog && rli.bv == rlj.bv && rli.vData == rlj.vData &&
-          rli.curShader == rlj.curShader && rlj.si == nextInd)
+      if (rli.instanceId == rlj.instanceId && rli.bindposeBufferOffset == rlj.bindposeBufferOffset &&
+          rli.dvState.variant == rlj.dvState.variant && rli.dvState.state_index == rlj.dvState.state_index &&
+          rli.dvState.program == rlj.dvState.program && rli.bv == rlj.bv && rli.vData == rlj.vData && rli.curShader == rlj.curShader &&
+          rlj.si == nextInd)
       {
         currentDipFaces += rlj.numf;
       }
@@ -424,26 +418,22 @@ void DynModelRenderingState::render_no_packed(int offset) const
     debug_mesh::set_debug_value(rli.lodNo);
 
     const bool instanceIdChanged = instanceId != rli.instanceId || bindposeBufferOffset != rli.bindposeBufferOffset;
-    const bool psImmChanged = rli.needImmediateConstPS != needPsImmConst;
-    if (instanceIdChanged || psImmChanged)
+    if (instanceIdChanged)
     {
       instanceId = rli.instanceId;
       bindposeBufferOffset = rli.bindposeBufferOffset;
-      needPsImmConst = rli.needImmediateConstPS;
 
       constexpr int immediateConstCount = 2;
       const uint32_t immediateConsts[immediateConstCount] = {(uint32_t)(offset + instanceId), (uint32_t)rli.bindposeBufferOffset * 3};
 
       if (instanceIdChanged)
+      {
         d3d::set_immediate_const(STAGE_VS, immediateConsts, immediateConstCount);
-
-      if (rli.needImmediateConstPS)
         d3d::set_immediate_const(STAGE_PS, immediateConsts, immediateConstCount);
-      else if (psImmChanged)
-        d3d::set_immediate_const(STAGE_PS, nullptr, 0);
+      }
     }
     rli.curShader->setReqTexLevel(rli.reqTexLevel);
-    set_states_for_variant(rli.curShader->native(), rli.curVar, rli.prog, rli.state);
+    set_states_for_variant(rli.curShader->native(), rli.dvState);
 
     // workaround: vertex data can be empty during geom reloading
     if (!rli.vData->isEmpty())
@@ -475,13 +465,13 @@ void DynModelRenderingState::render_multidraw(int offset) const
       const uint32_t instanceOffset = currentRelem.instanceId;
       if (DAGOR_UNLIKELY(instanceOffset >= MAX_MATRIX_OFFSET))
       {
-        logerr("Too big offset in instance matrix buffer %d.", instanceOffset);
+        LOGERR_ONCE("Too big offset in instance matrix buffer %d.", instanceOffset);
         instanceCount = 0;
       }
-      const uint32_t materialOffset = get_material_offset(currentRelem.cstate);
+      const uint32_t materialOffset = get_material_offset(currentRelem.dvState.const_state);
       if (DAGOR_UNLIKELY(materialOffset >= MAX_MATERIAL_OFFSET))
       {
-        logerr("Too big material offset %d.", materialOffset);
+        LOGERR_ONCE("Too big material offset %d.", materialOffset);
         instanceCount = 0;
       }
       perDrawData = (instanceOffset << MATERIAL_OFFSET_BITS) | materialOffset;
@@ -497,7 +487,7 @@ void DynModelRenderingState::render_multidraw(int offset) const
     auto &rli = multidrawList[dcParams.start];
 
     debug_mesh::set_debug_value(rli.lodNo); // TODO: Support show_gbuffer lods for multidraw
-    set_states_for_variant(rli.curShader->native(), rli.curVar, rli.prog, rli.state);
+    set_states_for_variant(rli.curShader->native(), rli.dvState);
 
     // workaround: vertex data can be empty during geom reloading
     if (!rli.vData->isEmpty())
@@ -570,6 +560,19 @@ void init_dynmodel_rendering(int csm_num_cascades)
 }
 
 void close_dynmodel_rendering() { dynmodel_rendering.clear(); }
+
+void shrink_states()
+{
+  for (auto &kv : dynmodel_rendering.map)
+  {
+    DynModelRenderingState &s = kv.second;
+    clear_and_shrink(s.list);
+    clear_and_shrink(s.multidrawList);
+    clear_and_shrink(s.instanceData);
+    clear_and_shrink(s.drawcallRanges);
+    s.bindlessStatesToUpdateTexLevels = decltype(s.bindlessStatesToUpdateTexLevels)();
+  }
+}
 
 DynModelRenderingState *create_state(const char *name)
 {

@@ -52,6 +52,7 @@ namespace gpu_objects
   VAR(gpu_objects_num_per_rendinst)         \
   VAR(gpu_objects_rendinst_mesh_params)     \
   VAR(gpu_objects_slope_factor)             \
+  VAR(gpu_objects_random_y_ofs)             \
   VAR(gpu_objects_weights)                  \
   VAR(gpu_objects_gather_target_offset)     \
   VAR(gpu_objects_max_count_in_cell)        \
@@ -69,6 +70,7 @@ namespace gpu_objects
   VAR(gpu_object_rendinst_instances_count)  \
   VAR(gpu_objects_coast_range)              \
   VAR(gpu_objects_face_coast)               \
+  VAR(gpu_objects_is_grass)                 \
   VAR(gpu_objects_bvh_max_count)            \
   VAR(gpu_objects_use_bvh)                  \
   VAR(gpu_objects_bvh_counter)              \
@@ -114,11 +116,11 @@ constexpr T pow2(const T &t)
   return t * t;
 }
 
-ObjectManager::ObjectManager(const char *name, uint32_t ri_pool_id, int cell_tile, int cells_size_count, float cell_size,
-  float bounding_sphere_radius, dag::ConstSpan<float> dist_sq_lod, const PlacingParameters &parameters) :
+ObjectManager::ObjectManager(const char *name, rendinst::ClientRiexPoolId ri_pool_id, int cell_tile, int cells_size_count,
+  float cell_size, float bounding_sphere_radius, dag::ConstSpan<float> dist_sq_lod, const PlacingParameters &parameters) :
   assetName(name),
   riPoolId(ri_pool_id),
-  riPoolOffset(ri_pool_id * rendinst::render::PER_DRAW_VECS_COUNT + 1),
+  riPoolOffset(ri_pool_id.id() * rendinst::render::PER_DRAW_VECS_COUNT + 1),
   boundingSphereRadius(bounding_sphere_radius),
   parameters(parameters),
   cellTileOrig(-1)
@@ -215,15 +217,14 @@ void ObjectManager::recreateGrid(int cell_tile, int cells_size_count, float cell
   if (maxObjectsCountInCell > 0)
   {
     gatheredBuffer = dag::create_sbuffer(sizeof(Point4), maxObjectsCountInCell * cellsCount * ROWS_IN_MATRIX,
-      SBCF_BIND_SHADER_RES | SBCF_BIND_UNORDERED, TEXFMT_A32B32G32R32F, String(0, "gathered_gpu_objects_%s", assetName));
+      SBCF_BIND_SHADER_RES | SBCF_BIND_UNORDERED, TEXFMT_A32B32G32R32F, String(0, "gathered_gpu_objects_%s", assetName),
+      RESTAG_GPUOBJ);
     countersBuffer = dag::buffers::create_ua_byte_address_readback(cellsCount, String(0, "ObjectManagerCounts_%s", assetName),
-      dag::buffers::Init::Zero);
+      dag::buffers::Init::Zero, RESTAG_GPUOBJ);
     bboxesBuffer = dag::buffers::create_ua_structured_readback(sizeof(int32_t), BBOX3F_SIZE_IN_INT * cellsCount,
-      String(0, "ObjectManagerCellsBboxes_%s", assetName));
+      String(0, "ObjectManagerCellsBboxes_%s", assetName), d3d::buffers::Init::No, RESTAG_GPUOBJ);
     d3d::resource_barrier({countersBuffer.get(), RB_FLUSH_UAV | RB_STAGE_COMPUTE | RB_SOURCE_STAGE_COMPUTE});
   }
-
-  makeMatricesOffsetsBuffer();
 
   size_t vectorSize = maxObjectsCountInCell > 0 ? cellsCount : 0;
   counters.assign(vectorSize, 0);
@@ -244,47 +245,48 @@ bool ObjectManager::dispatchNextCell()
   return true;
 }
 
-void ObjectManager::makeMatricesOffsetsBuffer()
-{
-  matricesOffsetsBuffer.close();
-  uint32_t size = maxObjectsCountInCell > 0 ? cellsCount : 0;
-  matricesOffsetsBuffer = dag::create_sbuffer(sizeof(uint32_t) * 2, size + 1, SBCF_BIND_SHADER_RES, TEXFMT_R32G32UI,
-    String(0, "ObjectManager_MatricesOffsets_%s", assetName));
-}
-
 void ObjectManager::setShaderVarsAndConsts()
 {
 
-  ShaderGlobal::set_real(gpu_objects_bounding_radiusVarId, boundingSphereRadius);
-  ShaderGlobal::set_real(gpu_objects_groups_countVarId, cellDispatchTile);
-  ShaderGlobal::set_real(gpu_objects_seedVarId, parameters.seed);
-  ShaderGlobal::set_color4(gpu_objects_up_vectorVarId, parameters.upVector.x, parameters.upVector.y, parameters.upVector.z,
+  ShaderGlobal::set_float(gpu_objects_bounding_radiusVarId, boundingSphereRadius);
+  ShaderGlobal::set_float(gpu_objects_groups_countVarId, cellDispatchTile);
+  ShaderGlobal::set_float(gpu_objects_seedVarId, parameters.seed);
+  ShaderGlobal::set_float4(gpu_objects_up_vectorVarId, parameters.upVector.x, parameters.upVector.y, parameters.upVector.z,
     parameters.inclineDelta);
-  ShaderGlobal::set_color4(gpu_objects_scale_rotateVarId, parameters.scale.x, parameters.scale.y, parameters.rotate.x,
+  ShaderGlobal::set_float4(gpu_objects_scale_rotateVarId, parameters.scale.x, parameters.scale.y, parameters.rotate.x,
     parameters.rotate.y);
   ShaderGlobal::set_int(gpu_objects_ri_pool_id_offsetVarId, riPoolOffset);
   if (mapTexId)
   {
-    ShaderGlobal::set_color4(gpu_objects_map_size_offsetVarId, parameters.mapSizeOffset.x, parameters.mapSizeOffset.y,
+    ShaderGlobal::set_float4(gpu_objects_map_size_offsetVarId, parameters.mapSizeOffset.x, parameters.mapSizeOffset.y,
       parameters.mapSizeOffset.z, parameters.mapSizeOffset.w);
   }
   else
   {
-    ShaderGlobal::set_int(gpu_objects_biomes_countVarId, parameters.biomes.size());
-    if (parameters.biomes.size() > 0)
-    {
-      d3d::set_cs_const(biom_indexes_const_no, &parameters.biomes[0].x, parameters.biomes.size());
-    }
-  }
-  ShaderGlobal::set_color4(gpu_objects_color_fromVarId, parameters.colorFrom);
-  ShaderGlobal::set_color4(gpu_objects_color_toVarId, parameters.colorTo);
-  ShaderGlobal::set_color4(gpu_objects_weightsVarId, parameters.weightRange.x, parameters.weightRange.y, maxObjectsCountInCell, 0);
-  ShaderGlobal::set_color4(gpu_objects_slope_factorVarId, parameters.slopeFactor);
-  ShaderGlobal::set_int(gpu_objects_place_on_waterVarId, static_cast<int>(parameters.placeOnWater));
-  ShaderGlobal::set_color4(gpu_objects_coast_rangeVarId, parameters.coastRange.x, parameters.coastRange.y, 0.0f, 0.0f);
-  ShaderGlobal::set_int(gpu_objects_face_coastVarId, static_cast<int>(parameters.faceCoast));
+    if ((int)parameters.biomes.size() > MAX_GPU_OBJECT_BIOMES)
+      LOGERR_ONCE("gpu_objects: <%s> has %u biomes, max is %d", assetName.c_str(), parameters.biomes.size(), MAX_GPU_OBJECT_BIOMES);
 
-  ShaderGlobal::set_color4(gpu_objects_world_coordVarId, 0, 0, cellSize / cellTile, 0);
+    const int biomesCount = min((int)parameters.biomes.size(), (int)MAX_GPU_OBJECT_BIOMES);
+    ShaderGlobal::set_int(gpu_objects_biomes_countVarId, biomesCount);
+
+    Point4 biomes[MAX_GPU_OBJECT_BIOMES];
+    if (biomesCount > 0)
+      memcpy(biomes, parameters.biomes.data(), biomesCount * sizeof(biomes[0]));
+    for (int i = biomesCount; i < MAX_GPU_OBJECT_BIOMES; ++i)
+      biomes[i] = Point4(-1, 1, 0, 0);
+    d3d::set_cs_const(biom_indexes_const_no, &biomes[0].x, MAX_GPU_OBJECT_BIOMES);
+  }
+  ShaderGlobal::set_float4(gpu_objects_color_fromVarId, parameters.colorFrom);
+  ShaderGlobal::set_float4(gpu_objects_color_toVarId, parameters.colorTo);
+  ShaderGlobal::set_float4(gpu_objects_weightsVarId, parameters.weightRange.x, parameters.weightRange.y, maxObjectsCountInCell, 0);
+  ShaderGlobal::set_float4(gpu_objects_slope_factorVarId, parameters.slopeFactor);
+  ShaderGlobal::set_float4(gpu_objects_random_y_ofsVarId, parameters.randomYOfs.x, parameters.randomYOfs.y, 0, 0);
+  ShaderGlobal::set_int(gpu_objects_place_on_waterVarId, static_cast<int>(parameters.placeOnWater));
+  ShaderGlobal::set_float4(gpu_objects_coast_rangeVarId, parameters.coastRange.x, parameters.coastRange.y, 0.0f, 0.0f);
+  ShaderGlobal::set_int(gpu_objects_face_coastVarId, static_cast<int>(parameters.faceCoast));
+  ShaderGlobal::set_int(gpu_objects_is_grassVarId, static_cast<int>(parameters.grass));
+
+  ShaderGlobal::set_float4(gpu_objects_world_coordVarId, 0, 0, cellSize / cellTile, 0);
 }
 
 void ObjectManager::addBombHole(const Point3 &point, const float radius)
@@ -295,17 +297,31 @@ void ObjectManager::addBombHole(const Point3 &point, const float radius)
 void ObjectManager::setBombHoleShaderGlobals(const CellToUpdateData cellData)
 {
   Point2 cellCenter{cellData.x + cellSize / 2, cellData.z + cellSize / 2};
-  eastl::sort(bomb_holes.begin(), bomb_holes.end(), [&cellCenter](Point4 p1, Point4 p2) {
-    return (Point2(p1.x, p1.z) - cellCenter).lengthSq() < (Point2(p2.x, p2.z) - cellCenter).lengthSq();
-  });
-  Point4 bomb_hole_point_radius_0 = bomb_holes.size() < 1 ? Point4::ZERO : bomb_holes[0];
-  ShaderGlobal::set_color4(gpu_objects_bomb_hole_point_radius_0VarId, bomb_hole_point_radius_0);
-  Point4 bomb_hole_point_radius_1 = bomb_holes.size() < 2 ? Point4::ZERO : bomb_holes[1];
-  ShaderGlobal::set_color4(gpu_objects_bomb_hole_point_radius_1VarId, bomb_hole_point_radius_1);
-  Point4 bomb_hole_point_radius_2 = bomb_holes.size() < 3 ? Point4::ZERO : bomb_holes[2];
-  ShaderGlobal::set_color4(gpu_objects_bomb_hole_point_radius_2VarId, bomb_hole_point_radius_2);
-  Point4 bomb_hole_point_radius_3 = bomb_holes.size() < 4 ? Point4::ZERO : bomb_holes[3];
-  ShaderGlobal::set_color4(gpu_objects_bomb_hole_point_radius_3VarId, bomb_hole_point_radius_3);
+
+  constexpr int NEAREST_HOLES_COUNT = 4;
+  eastl::fixed_vector<Point4, NEAREST_HOLES_COUNT> nearestPos(NEAREST_HOLES_COUNT, Point4::ZERO);
+  eastl::fixed_vector<float, NEAREST_HOLES_COUNT> nearestDistSq(NEAREST_HOLES_COUNT, FLT_MAX);
+  for (const Point4 &hole : bomb_holes)
+  {
+    float distSq = (Point2(hole.x, hole.z) - cellCenter).lengthSq();
+    int i = nearestDistSq.size();
+    while (i > 0 && distSq < nearestDistSq[i - 1])
+    {
+      --i;
+    }
+    if (i < nearestDistSq.size())
+    {
+      nearestDistSq.pop_back();
+      nearestDistSq.insert(nearestDistSq.begin() + i, distSq);
+      nearestPos.pop_back();
+      nearestPos.insert(nearestPos.begin() + i, hole);
+    }
+  }
+
+  ShaderGlobal::set_float4(gpu_objects_bomb_hole_point_radius_0VarId, nearestPos[0]);
+  ShaderGlobal::set_float4(gpu_objects_bomb_hole_point_radius_1VarId, nearestPos[1]);
+  ShaderGlobal::set_float4(gpu_objects_bomb_hole_point_radius_2VarId, nearestPos[2]);
+  ShaderGlobal::set_float4(gpu_objects_bomb_hole_point_radius_3VarId, nearestPos[3]);
 }
 
 void ObjectManager::onLandPlacing()
@@ -321,10 +337,10 @@ void ObjectManager::onLandPlacing()
   const CellToUpdateData cellData = updateQueue.top();
 
   ShaderGlobal::set_int4(gpu_object_ints_to_clearVarId, IPoint4(cellData.idx * BBOX3F_SIZE_IN_INT, BBOX3F_SIZE_IN_INT, 0, 0));
-  ShaderGlobal::set_color4(gpu_objects_world_coordVarId, cellData.x, cellData.z, cellSize / cellTile, 0);
-  ShaderGlobal::set_real(gpu_objects_groups_bbox_offsetVarId, cellData.idx * BBOX3F_SIZE_IN_INT);
-  ShaderGlobal::set_real(gpu_objects_cell_buffer_offsetVarId, cellData.idx * maxObjectsCountInCell);
-  ShaderGlobal::set_real(gpu_objects_group_idxVarId, cellData.idx);
+  ShaderGlobal::set_float4(gpu_objects_world_coordVarId, cellData.x, cellData.z, cellSize / cellTile, 0);
+  ShaderGlobal::set_float(gpu_objects_groups_bbox_offsetVarId, cellData.idx * BBOX3F_SIZE_IN_INT);
+  ShaderGlobal::set_float(gpu_objects_cell_buffer_offsetVarId, cellData.idx * maxObjectsCountInCell);
+  ShaderGlobal::set_float(gpu_objects_group_idxVarId, cellData.idx);
   setBombHoleShaderGlobals(cellData);
 
   constexpr int cleanerBatch = (BBOX3F_SIZE_IN_INT + GPU_OBJ_BBOX_CLEANER_SIZE - 1) / GPU_OBJ_BBOX_CLEANER_SIZE;
@@ -427,8 +443,10 @@ void ObjectManager::updateVisibilityAndLods(const Frustum &frustum, const Occlus
   for (const auto &ao : appendOrder)
   {
     unsigned idx = ao.idx;
+    // short-circuit order matters: testBoxB frustum-classifies the box first, satisfying the
+    // isVisibleBoxInFrustum contract
     if (counters[idx] && frustum.testBoxB(cellsBboxes[idx].bmin, cellsBboxes[idx].bmax) &&
-        (!occlusion || occlusion->isVisibleBox(cellsBboxes[idx])))
+        (!occlusion || occlusion->isVisibleBoxInFrustum(cellsBboxes[idx])))
     {
       float distSq = v_extract_x(v_distance_sq_to_bbox_x(cellsBboxes[idx].bmin, cellsBboxes[idx].bmax, origin));
       int lod = 0;
@@ -440,39 +458,51 @@ void ObjectManager::updateVisibilityAndLods(const Frustum &frustum, const Occlus
   }
 }
 
-void ObjectManager::copyMatrices(const eastl::vector<uint32_t> &cells_to_copy, const eastl::vector<uint32_t> &cell_counters,
-  Sbuffer *dst_buffer, Sbuffer *src_buffer, uint32_t max_in_cell, uint32_t dst_offset_rows, uint32_t lod)
+void ObjectManager::appendMatricesOffsets(eastl::vector<eastl::pair<uint32_t, uint32_t>> &shared_offsets, int lod)
 {
-  matricesOffsets.resize((cells_to_copy.size() + 1) * 2);
-  matricesOffsets[0] = 0;
-  uint32_t matricessInCell = 0;
-  for (uint32_t i = 1; i < matricesOffsets.size() / 2; ++i)
+  const eastl::vector<uint32_t> &cells = cellIndexesByLods[lod];
+  sharedOffsetsBase[lod] = shared_offsets.size();
+  maxMatricesPerCell[lod] = 0;
+  if (cells.empty())
+    return;
+
+  const size_t first = shared_offsets.size();
+  shared_offsets.resize(first + cells.size() + 1);
+  eastl::pair<uint32_t, uint32_t> *offsets = shared_offsets.data() + first;
+  uint32_t matricesPerCell = 0;
+  offsets[0].first = 0;
+  for (uint32_t i = 1; i <= cells.size(); ++i)
   {
-    matricesOffsets[2 * i] = matricesOffsets[2 * (i - 1)] + cell_counters[cells_to_copy[i - 1]];
-    matricesOffsets[2 * i - 1] = cells_to_copy[i - 1];
-    matricessInCell = max(matricessInCell, cell_counters[cells_to_copy[i - 1]]);
+    offsets[i].first = offsets[i - 1].first + counters[cells[i - 1]];
+    offsets[i - 1].second = cells[i - 1];
+    matricesPerCell = max(matricesPerCell, counters[cells[i - 1]]);
   }
-
-  if (cells_to_copy.size() > 0 && matricessInCell > 0)
-  {
-    matricesOffsetsBuffer->updateData(0, sizeof(uint32_t) * matricesOffsets.size(), matricesOffsets.data(), 0);
-    STATE_GUARD_NULLPTR(d3d::set_rwbuffer(STAGE_CS, gpu_objects_targetBuffer_reg_no, VALUE), dst_buffer);
-    STATE_GUARD_NULLPTR(d3d::set_buffer(STAGE_CS, gpu_objects_offsets_reg_no, VALUE), matricesOffsetsBuffer.get());
-    STATE_GUARD_NULLPTR(d3d::set_buffer(STAGE_CS, gpu_objects_matrices_reg_no, VALUE), src_buffer);
-
-    ShaderGlobal::set_int(gpu_objects_max_count_in_cellVarId, max_in_cell);
-    ShaderGlobal::set_int(gpu_objects_gather_target_offsetVarId, dst_offset_rows);
-    ShaderGlobal::set_int(gpu_objects_visible_cellsVarId, cells_to_copy.size());
-    ShaderGlobal::set_int(gpu_objects_copy_lod_noVarId, lod);
-
-    gatherMatrices->dispatchThreads(cells_to_copy.size(), matricessInCell, 1);
-    d3d::resource_barrier({dst_buffer, RB_NONE});
-  }
+  maxMatricesPerCell[lod] = matricesPerCell;
 }
 
-void ObjectManager::addMatricesToBuffer(Sbuffer *buffer, uint32_t offset_in_bytes, int lod)
+void ObjectManager::copyMatrices(const eastl::vector<uint32_t> &cells_to_copy, Sbuffer *dst_buffer, Sbuffer *src_buffer,
+  Sbuffer *shared_offsets, uint32_t max_in_cell, uint32_t dst_offset_rows, uint32_t lod)
 {
-  copyMatrices(cellIndexesByLods[lod], counters, buffer, gatheredBuffer.get(), maxObjectsCountInCell, offset_in_bytes, lod);
+  const uint32_t matricesPerCell = maxMatricesPerCell[lod];
+  if (cells_to_copy.empty() || matricesPerCell == 0)
+    return;
+
+  STATE_GUARD_NULLPTR(d3d::set_rwbuffer(STAGE_CS, gpu_objects_targetBuffer_reg_no, VALUE), dst_buffer);
+  STATE_GUARD_NULLPTR(d3d::set_buffer(STAGE_CS, gpu_objects_offsets_reg_no, VALUE), shared_offsets);
+  STATE_GUARD_NULLPTR(d3d::set_buffer(STAGE_CS, gpu_objects_matrices_reg_no, VALUE), src_buffer);
+
+  ShaderGlobal::set_int(gpu_objects_max_count_in_cellVarId, max_in_cell);
+  ShaderGlobal::set_int(gpu_objects_gather_target_offsetVarId, dst_offset_rows);
+  ShaderGlobal::set_int(gpu_objects_visible_cellsVarId, cells_to_copy.size());
+  ShaderGlobal::set_int(gpu_objects_copy_lod_noVarId, lod | (sharedOffsetsBase[lod] << GPUOBJ_OFFSETS_BASE_SHIFT));
+
+  gatherMatrices->dispatchThreads(cells_to_copy.size(), matricesPerCell, 1);
+  d3d::resource_barrier({dst_buffer, RB_NONE});
+}
+
+void ObjectManager::addMatricesToBuffer(Sbuffer *buffer, uint32_t offset_in_bytes, int lod, Sbuffer *shared_offsets)
+{
+  copyMatrices(cellIndexesByLods[lod], buffer, gatheredBuffer.get(), shared_offsets, maxObjectsCountInCell, offset_in_bytes, lod);
 }
 
 uint32_t ObjectManager::getInstancesInGridToDraw(uint32_t lod) const
@@ -633,8 +663,8 @@ void ObjectManager::validateParams() const
 {
   if (!do_parameter_check)
     return;
-  RenderableInstanceLodsResource *asset = reinterpret_cast<RenderableInstanceLodsResource *>(
-    get_one_game_resource_ex((GameResHandle)assetName.c_str(), RendInstGameResClassId));
+  RenderableInstanceLodsResource *asset =
+    reinterpret_cast<RenderableInstanceLodsResource *>(get_one_game_resource_ex(assetName.c_str(), RendInstGameResClassId));
 
   BBox3 bbox = asset->bbox;
   bbox.scale(parameters.scale.y); // scale with maximum
@@ -650,6 +680,13 @@ void ObjectManager::validateParams() const
     logerr("GPU object validation failed. %s : CellsCount (%d) is larger than %f !", this->assetName.c_str(), cellsCount,
       ValidationParameterCheckLimits.maxCellsCount);
   }
+}
+
+GpuObjects::GpuObjects()
+{
+#define VAR(a) a##VarId = get_shader_variable_id(#a, true);
+  GLOBAL_VARS_LIST
+#undef VAR
 }
 
 void GpuObjects::update(const Point3 &origin)
@@ -711,8 +748,8 @@ void GpuObjects::setGpuInstancingRelemParams(int cascade_no)
 
   String bufferName;
   bufferName.printf(0, "generateIndirectParamsBuffer%d", cascade_no);
-  cascades[cascade_no].generateIndirectParamsBuffer =
-    dag::create_sbuffer(sizeof(vec4f), GPUOBJDATA_SIZE * MAX_LODS * objCount, SBCF_BIND_SHADER_RES, TEXFMT_A32B32G32R32F, bufferName);
+  cascades[cascade_no].generateIndirectParamsBuffer = dag::create_sbuffer(sizeof(vec4f), GPUOBJDATA_SIZE * MAX_LODS * objCount,
+    SBCF_BIND_SHADER_RES, TEXFMT_A32B32G32R32F, bufferName, RESTAG_GPUOBJ);
 
   for (int lod = 0; lod < MAX_LODS; lod++)
   {
@@ -728,7 +765,7 @@ void GpuObjects::setGpuInstancingRelemParams(int cascade_no)
 
       ObjectManager &object = objects[objIdx];
       int layerIdx = layerRIOnLayerGpuobjRemap(object.layer);
-      RenderableInstanceLodsResource *res = rendinst::getRIGenExtraRes(objectIds[objIdx]);
+      RenderableInstanceLodsResource *res = rendinst::getRIGenExtraRes(objectIds[objIdx].id());
 
       bool lodExist = lod < res->lods.size();
       dag::ConstSpan<ShaderMesh::RElem> elems =
@@ -750,7 +787,7 @@ void GpuObjects::setGpuInstancingRelemParams(int cascade_no)
         // objects laying by objects: obj0_lod0, obj1_lod0 .. obj0_lod1, obj1_lod1 ...
         // offsets are static because we use indirect drawing, and real offsets and counts are stored in buffer
         cascades[cascade_no].layers[layerIdx].offsetsAndCounts.emplace_back(objIdx * MAX_LODS + lod, 1);
-        cascades[cascade_no].layers[layerIdx].objectIds.emplace_back(objectIds[objIdx]);
+        cascades[cascade_no].layers[layerIdx].objectIds.emplace_back(objectIds[objIdx].id());
       }
       objOffset += object.getMaxPossibleInstances();
     }
@@ -807,24 +844,25 @@ void GpuObjects::prepareGpuInstancing(int cascade_no)
     if (objCount == 0)
       return;
 
-    ShaderGlobal::set_real_fast(gpu_objects_countVarId, (float)objCount + 0.1f);
+    ShaderGlobal::set_float(gpu_objects_countVarId, (float)objCount + 0.1f);
 
     {
       String bufferName;
       bufferName.printf(0, "drawIndirectBuffer%d", cascade_no);
       cascades[cascade_no].drawIndirectBuffer =
-        dag::buffers::create_ua_indirect(dag::buffers::Indirect::DrawIndexed, MAX_LODS * objCount, bufferName);
+        dag::buffers::create_ua_indirect(dag::buffers::Indirect::DrawIndexed, MAX_LODS * objCount, bufferName, RESTAG_GPUOBJ);
     }
     {
       String bufferName;
       bufferName.printf(0, "dispatchCountBuffer%d", cascade_no);
       cascades[cascade_no].dispatchCountBuffer =
-        dag::buffers::create_ua_indirect(dag::buffers::Indirect::Dispatch, objCount, bufferName);
+        dag::buffers::create_ua_indirect(dag::buffers::Indirect::Dispatch, objCount, bufferName, RESTAG_GPUOBJ);
     }
     {
       String bufferName;
       bufferName.printf(0, "lodOffsetsBuffer%d", cascade_no);
-      cascades[cascade_no].lodOffsetsBuffer = dag::buffers::create_ua_sr_byte_address(MAX_LODS * objCount, bufferName);
+      cascades[cascade_no].lodOffsetsBuffer =
+        dag::buffers::create_ua_sr_byte_address(MAX_LODS * objCount, bufferName, d3d::buffers::Init::No, RESTAG_GPUOBJ);
     }
     {
       struct GpuObjectsIndirectParams
@@ -836,8 +874,8 @@ void GpuObjects::prepareGpuInstancing(int cascade_no)
       String bufferName;
       bufferName.printf(0, "GpuObjectsIndirectParams%d", cascade_no);
 
-      cascades[cascade_no].indirectParamsBuffer =
-        dag::buffers::create_ua_sr_structured(sizeof(GpuObjectsIndirectParams), objCount, bufferName);
+      cascades[cascade_no].indirectParamsBuffer = dag::buffers::create_ua_sr_structured(sizeof(GpuObjectsIndirectParams), objCount,
+        bufferName, d3d::buffers::Init::No, RESTAG_GPUOBJ);
     }
 
     setGpuInstancingRelemParams(cascade_no);
@@ -887,7 +925,7 @@ void GpuObjects::prepareGpuInstancing(int cascade_no)
   for (uint32_t i = 0, e = objects.size(); i < e; ++i)
   {
     ObjectManager &object = objects[i];
-    ShaderGlobal::set_real_fast(gpu_objects_noVarId, (float)i + 0.1f);
+    ShaderGlobal::set_float(gpu_objects_noVarId, (float)i + 0.1f);
 
     D3DRESID mappingId;
     bool useBvh = useBvhConnection ? bvhConnection->translateObjectId(object.getRiId(), mappingId) : false;
@@ -974,7 +1012,7 @@ void GpuObjects::beforeDraw(rendinst::RenderPass render_pass, int cascade, const
         logdbg("buffer for gpu objects created, %dMB for %d objects, %d instances placed on RI", (rowsInBuffer * sizeof(Point4)) >> 20,
           maxInstancesCount, maxInstancesCountOnRi);
       cascades[cascade].matricesBuffer = dag::create_sbuffer(sizeof(Point4), rowsInBuffer, SBCF_BIND_SHADER_RES | SBCF_BIND_UNORDERED,
-        TEXFMT_A32B32G32R32F, "GPUobjects");
+        TEXFMT_A32B32G32R32F, "GPUobjects", RESTAG_GPUOBJ);
     }
   }
 
@@ -989,6 +1027,23 @@ void GpuObjects::beforeDraw(rendinst::RenderPass render_pass, int cascade, const
     for (ObjectManager &object : objects)
     {
       object.updateVisibilityAndLods(frustum, occlusion, forShadow);
+    }
+
+    sharedOffsets.clear();
+    for (ObjectManager &object : objects)
+      for (int lod = 0; lod < MAX_LODS; ++lod)
+        object.appendMatricesOffsets(sharedOffsets, lod);
+
+    const uint32_t offsetsCount = uint32_t(sharedOffsets.size());
+    if (offsetsCount > 0)
+    {
+      if (!sharedOffsetsBuffer || sharedOffsetsBuffer->getNumElements() < offsetsCount)
+      {
+        sharedOffsetsBuffer.close();
+        sharedOffsetsBuffer =
+          dag::buffers::create_one_frame_sr_tbuf(offsetsCount * 3 / 2, TEXFMT_R32G32UI, "GPUobjects_MatricesOffsets", RESTAG_GPUOBJ);
+      }
+      sharedOffsetsBuffer->updateData(0, sizeof(sharedOffsets[0]) * offsetsCount, sharedOffsets.data(), VBLOCK_DISCARD);
     }
   }
   else
@@ -1032,20 +1087,22 @@ void GpuObjects::beforeDraw(rendinst::RenderPass render_pass, int cascade, const
         ShaderGlobal::set_buffer(gpu_objects_bvh_mappingsVarId, mappingId);
       }
 
-      object.addMatricesToBuffer(cascades[cascade].matricesBuffer.get(), bufferOffset * ROWS_IN_MATRIX, lod);
+      object.addMatricesToBuffer(cascades[cascade].matricesBuffer.get(), bufferOffset * ROWS_IN_MATRIX, lod,
+        sharedOffsetsBuffer.get());
       cascades[cascade].layers[layerIdx].offsetsAndCounts.emplace_back(bufferOffset * ROWS_IN_MATRIX, countByLod);
-      cascades[cascade].layers[layerIdx].objectIds.emplace_back(objectIds[i]);
+      cascades[cascade].layers[layerIdx].objectIds.emplace_back(objectIds[i].id());
       bufferOffset += countByLod;
     }
     if (volumePlacer)
     {
       volumePlacer->copyMatrices(cascades[cascade].matricesBuffer.get(), bufferOffset, lod, VolumePlacer::LAYER_OPAQUE,
-        cascades[cascade].layers[GPUOBJ_LAYER_OPAQUE].offsetsAndCounts, cascades[cascade].layers[GPUOBJ_LAYER_OPAQUE].objectIds);
+        cascades[cascade].layers[GPUOBJ_LAYER_OPAQUE].offsetsAndCounts, cascades[cascade].layers[GPUOBJ_LAYER_OPAQUE].objectIds,
+        useBvhConnection);
       volumePlacer->copyMatrices(cascades[cascade].matricesBuffer.get(), bufferOffset, lod, VolumePlacer::LAYER_DECAL,
-        cascades[cascade].layers[GPUOBJ_LAYER_DECAL].offsetsAndCounts, cascades[cascade].layers[GPUOBJ_LAYER_DECAL].objectIds);
+        cascades[cascade].layers[GPUOBJ_LAYER_DECAL].offsetsAndCounts, cascades[cascade].layers[GPUOBJ_LAYER_DECAL].objectIds, false);
       volumePlacer->copyMatrices(cascades[cascade].matricesBuffer.get(), bufferOffset, lod, VolumePlacer::LAYER_DISTORSION,
         cascades[cascade].layers[GPUOBJ_LAYER_DISTORSION].offsetsAndCounts,
-        cascades[cascade].layers[GPUOBJ_LAYER_DISTORSION].objectIds);
+        cascades[cascade].layers[GPUOBJ_LAYER_DISTORSION].objectIds, false);
     }
   }
 

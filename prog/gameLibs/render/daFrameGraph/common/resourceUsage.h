@@ -26,19 +26,41 @@ enum class ValidateUsageResult
   OK
 };
 
-ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, History history);
+enum class DesiredActivationBehaviour
+{
+  Discard,
+  Clear,
+};
+
+ValidateUsageResult validate_usage(ResourceUsage usage, ResourceType res_type, DesiredActivationBehaviour history, bool is_int);
 
 ResourceBarrier barrier_for_transition(intermediate::ResourceUsage usage_before, intermediate::ResourceUsage usage_after);
 
-eastl::optional<ResourceActivationAction> get_activation_from_usage(History history, intermediate::ResourceUsage usage,
-  ResourceType res_type);
-__forceinline eastl::optional<ResourceActivationAction> get_activation_from_usage(History history, ResourceUsage usage,
-  ResourceType res_type)
+intermediate::EnhancedBarrier enhanced_barrier_for_transition(intermediate::ResourceUsage usage_before,
+  intermediate::ResourceUsage usage_after, ResourceType res_type);
+
+d3d::BufferBarrier enhanced_buffer_barrier_for_release(intermediate::ResourceUsage last_usage, d3d::PipelineStageFlags sync_after);
+
+d3d::BufferBarrier enhanced_buffer_barrier_for_activation(intermediate::ResourceUsage first_usage,
+  d3d::PipelineStageFlags sync_before);
+
+inline constexpr d3d::TextureSubresourceRange ENTIRE_TEXTURE_SUBRESOURCE_RANGE{{0xffffffffu, 0}, {0, 0}, {0, 0}};
+
+d3d::TextureBarrier enhanced_texture_barrier_for_release(intermediate::ResourceUsage last_usage, d3d::PipelineStageFlags sync_after);
+
+d3d::TextureBarrier enhanced_texture_barrier_for_activation(intermediate::ResourceUsage first_usage,
+  d3d::PipelineStageFlags sync_before);
+
+eastl::optional<ResourceActivationAction> get_activation_from_usage(DesiredActivationBehaviour behavior,
+  intermediate::ResourceUsage usage, ResourceType res_type, bool is_int);
+__forceinline eastl::optional<ResourceActivationAction> get_activation_from_usage(DesiredActivationBehaviour history,
+  ResourceUsage usage, ResourceType res_type, bool is_int)
 {
-  return get_activation_from_usage(history, intermediate::ResourceUsage{usage.type, usage.access, usage.stage}, res_type);
+  return get_activation_from_usage(history, intermediate::ResourceUsage{usage.type, usage.access, usage.stage}, res_type, is_int);
 }
 
 void update_creation_flags_from_usage(uint32_t &flags, ResourceUsage usage, ResourceType res_type);
-ResourceActivationAction get_history_activation(History history, ResourceActivationAction res_activaton, bool is_int = false);
+ResourceActivationAction get_history_activation(DesiredActivationBehaviour behavior, ResourceActivationAction res_activation,
+  bool is_int = false);
 
 } // namespace dafg

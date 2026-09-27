@@ -1,6 +1,8 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <propPanel/control/container.h>
+#include <propPanel/control/dragAndDropHandler.h>
+#include <propPanel/control/spinEditFloat.h>
 #include <propPanel/c_indirect.h>
 #include <propPanel/focusHelper.h>
 #include "button.h"
@@ -26,17 +28,20 @@
 #include "point4.h"
 #include "radioButton.h"
 #include "radioGroup.h"
+#include "searchEditBox.h"
 #include "separator.h"
 #include "simpleColor.h"
-#include "spinEditFloat.h"
 #include "spinEditInt.h"
+#include "splitter.h"
 #include "static.h"
+#include "staticWithIcon.h"
 #include "tabPanel.h"
 #include "targetButton.h"
 #include "toolbar.h"
 #include "trackBarFloat.h"
 #include "trackBarInt.h"
 #include "tree.h"
+#include "matrix.h"
 #include "../messageQueueInternal.h"
 #include <imgui/imgui_internal.h>
 
@@ -50,7 +55,11 @@ ContainerPropertyControl::ContainerPropertyControl(int id, ControlEventHandler *
   setVerticalSpaceBetweenControls(hdpi::_pxScaled(Constants::DEFAULT_CONTROLS_INTERVAL));
 }
 
-ContainerPropertyControl::~ContainerPropertyControl() { message_queue.onContainerDelete(*this); }
+ContainerPropertyControl::~ContainerPropertyControl()
+{
+  clear_all_ptr_items_and_shrink(mControlArray);
+  message_queue.onContainerDelete(*this);
+}
 
 ContainerPropertyControl *ContainerPropertyControl::createContainer(int id, bool new_line, hdpi::Px interval)
 {
@@ -60,20 +69,23 @@ ContainerPropertyControl *ContainerPropertyControl::createContainer(int id, bool
   return newControl;
 }
 
-ContainerPropertyControl *ContainerPropertyControl::createExtensible(int id, bool new_line)
+ContainerPropertyControl *ContainerPropertyControl::createExtensible(int id, bool new_line, const char *menu_button_icon,
+  const char *menu_button_tooltip, const char *menu_button_label)
 {
   ExtensiblePropertyControl *newControl = new ExtensiblePropertyControl(mEventHandler, this, id, getNextControlX(),
-    getNextControlY(new_line), getClientWidth(), hdpi::Px(0));
+    getNextControlY(new_line), getClientWidth(), hdpi::Px(0), menu_button_icon, menu_button_tooltip, menu_button_label);
 
   addControl(newControl, new_line);
   return newControl;
 }
 
-ContainerPropertyControl *ContainerPropertyControl::createExtGroup(int id, const char caption[])
+ContainerPropertyControl *ContainerPropertyControl::createExtGroup(int id, const char caption[], const char *menu_button_icon,
+  const char *menu_button_tooltip)
 {
-  ExtGroupPropertyControl *newControl =
-    new ExtGroupPropertyControl(mEventHandler, this, id, getNextControlX(), getNextControlY(), getClientWidth(), hdpi::Px(0), caption);
+  ExtGroupPropertyControl *newControl = new ExtGroupPropertyControl(mEventHandler, this, id, getNextControlX(), getNextControlY(),
+    getClientWidth(), hdpi::Px(0), caption, menu_button_icon, menu_button_tooltip);
 
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl);
   return newControl;
 }
@@ -81,6 +93,7 @@ ContainerPropertyControl *ContainerPropertyControl::createExtGroup(int id, const
 ContainerPropertyControl *ContainerPropertyControl::createGroup(int id, const char caption[])
 {
   GroupPropertyControl *newControl = new GroupPropertyControl(mEventHandler, this, id, 0, 0, hdpi::Px(0), hdpi::Px(0), caption);
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl);
   return newControl;
 }
@@ -96,6 +109,7 @@ ContainerPropertyControl *ContainerPropertyControl::createGroupBox(int id, const
   GroupBoxPropertyControl *newControl =
     new GroupBoxPropertyControl(mEventHandler, this, id, getNextControlX(), getNextControlY(), getClientWidth(), hdpi::Px(0), caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl);
   return newControl;
 }
@@ -104,7 +118,26 @@ ContainerPropertyControl *ContainerPropertyControl::createRadioGroup(int id, con
 {
   RadioGroupPropertyControl *newControl =
     new RadioGroupPropertyControl(mEventHandler, this, id, 0, 0, hdpi::Px(0), hdpi::Px(0), caption);
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl, new_line);
+  return newControl;
+}
+
+ContainerPropertyControl *ContainerPropertyControl::createHorizontalSplitter(int id)
+{
+  SplitterPropertyControl *newControl =
+    new SplitterPropertyControl(mEventHandler, this, id, getNextControlX(), getNextControlY(), true);
+
+  addControl(newControl);
+  return newControl;
+}
+
+ContainerPropertyControl *ContainerPropertyControl::createVerticalSplitter(int id)
+{
+  SplitterPropertyControl *newControl =
+    new SplitterPropertyControl(mEventHandler, this, id, getNextControlX(), getNextControlY(), false);
+
+  addControl(newControl);
   return newControl;
 }
 
@@ -125,9 +158,11 @@ ContainerPropertyControl *ContainerPropertyControl::createTabPage(int id, const 
   return nullptr;
 }
 
-ContainerPropertyControl *ContainerPropertyControl::createToolbarPanel(int id, const char caption[], bool new_line)
+ContainerPropertyControl *ContainerPropertyControl::createToolbarPanel(int id, bool use_tight_button_placement, bool new_line,
+  int toolbar_control_width)
 {
-  ToolbarPropertyControl *newControl = new ToolbarPropertyControl(mEventHandler, this, id, caption);
+  ToolbarPropertyControl *newControl =
+    new ToolbarPropertyControl(mEventHandler, this, id, use_tight_button_placement, toolbar_control_width);
 
   addControl(newControl, new_line);
   return newControl;
@@ -138,6 +173,7 @@ ContainerPropertyControl *ContainerPropertyControl::createTree(int id, const cha
   TreePropertyControl *newControl = new TreePropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), height, caption, /*has_checkboxes = */ false, /*multi_select = */ false);
 
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl, new_line);
   return newControl;
 }
@@ -148,6 +184,7 @@ ContainerPropertyControl *ContainerPropertyControl::createTreeCheckbox(int id, c
   TreePropertyControl *newControl = new TreePropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), height, caption, /*has_checkboxes = */ true, /*multi_select = */ false);
 
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl, new_line);
   return newControl;
 }
@@ -157,6 +194,7 @@ ContainerPropertyControl *ContainerPropertyControl::createMultiSelectTree(int id
   TreePropertyControl *newControl = new TreePropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), height, caption, /*has_checkboxes = */ false, /*multi_select = */ true);
 
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl, new_line);
   return newControl;
 }
@@ -167,30 +205,46 @@ ContainerPropertyControl *ContainerPropertyControl::createMultiSelectTreeCheckbo
   TreePropertyControl *newControl = new TreePropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), height, caption, /*has_checkboxes = */ true, /*multi_select = */ true);
 
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl, new_line);
   return newControl;
 }
 
-void ContainerPropertyControl::createStatic(int id, const char caption[], bool new_line)
+void ContainerPropertyControl::createStatic(int id, const char caption[], bool new_line, bool use_text_width, bool word_wrap,
+  bool monospace, int wrap_width_in_chars)
 {
   StaticPropertyControl *newControl = new StaticPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
-    getNextControlY(new_line), getClientWidth(), caption, hdpi::Px(0));
+    getNextControlY(new_line), getClientWidth(), caption, hdpi::Px(0), use_text_width, word_wrap, monospace, wrap_width_in_chars);
 
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl, new_line);
 }
 
 void ContainerPropertyControl::createEditBox(int id, const char caption[], const char text[], bool enabled, bool new_line,
-  bool multiline, hdpi::Px multi_line_height)
+  bool multiline, hdpi::Px multi_line_height, bool auto_height)
 {
   EditBoxPropertyControl *newControl =
-    new EditBoxPropertyControl(id, mEventHandler, this, 0, 0, hdpi::Px(0), hdpi::Px(0), caption, multiline);
+    new EditBoxPropertyControl(id, mEventHandler, this, 0, 0, hdpi::Px(0), hdpi::Px(0), caption, multiline, auto_height);
+
+  setAutomationNameFromCaption(newControl, caption);
 
   newControl->setTextValue(text);
   newControl->setEnabled(enabled);
 
-  if (multiline)
+  if (multiline && !auto_height)
     newControl->setHeight(multi_line_height);
 
+  addControl(newControl, new_line);
+}
+
+void ContainerPropertyControl::createSearchEditBox(int id, const char caption[], const char text[], bool enabled, bool new_line)
+{
+  SearchEditBoxPropertyControl *newControl =
+    new SearchEditBoxPropertyControl(id, mEventHandler, this, 0, 0, hdpi::Px(0), hdpi::Px(0), caption);
+
+  setAutomationNameFromCaption(newControl, caption);
+  newControl->setTextValue(text);
+  newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
 
@@ -199,6 +253,7 @@ void ContainerPropertyControl::createFileEditBox(int id, const char caption[], c
   FileEditBoxPropertyControl *newControl = new FileEditBoxPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setTextValue(file);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -209,6 +264,7 @@ void ContainerPropertyControl::createFileButton(int id, const char caption[], co
   FileButtonPropertyControl *newControl = new FileButtonPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setTextValue(file);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -219,6 +275,7 @@ void ContainerPropertyControl::createTargetButton(int id, const char caption[], 
   TargetButtonPropertyControl *newControl = new TargetButtonPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setTextValue(text);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -228,6 +285,7 @@ void ContainerPropertyControl::createEditInt(int id, const char caption[], int v
 {
   SpinEditIntPropertyControl *newControl = new SpinEditIntPropertyControl(mEventHandler, this, id, caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setIntValue(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -243,6 +301,7 @@ void ContainerPropertyControl::createEditFloatWidthEx(int id, const char caption
 {
   SpinEditFloatPropertyControl *newControl =
     new SpinEditFloatPropertyControl(mEventHandler, this, id, caption, prec, width_includes_label);
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setFloatValue(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -254,6 +313,7 @@ void ContainerPropertyControl::createTrackInt(int id, const char caption[], int 
   TrackBarIntPropertyControl *newControl = new TrackBarIntPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, min, max, step);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setIntValue(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -265,6 +325,7 @@ void ContainerPropertyControl::createTrackFloat(int id, const char caption[], fl
   TrackBarFloatPropertyControl *newControl = new TrackBarFloatPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, min, max, step, TRACKBAR_DEFAULT_POWER);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setFloatValue(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -276,6 +337,7 @@ void ContainerPropertyControl::createTrackFloatLogarithmic(int id, const char ca
   TrackBarFloatPropertyControl *newControl = new TrackBarFloatPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, min, max, step, power);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setFloatValue(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -286,6 +348,7 @@ void ContainerPropertyControl::createCheckBox(int id, const char caption[], bool
   CheckBoxPropertyControl *newControl = new CheckBoxPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setBoolValue(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -294,6 +357,7 @@ void ContainerPropertyControl::createCheckBox(int id, const char caption[], bool
 void ContainerPropertyControl::createButton(int id, const char caption[], bool enabled, bool new_line)
 {
   ButtonPropertyControl *newControl = new ButtonPropertyControl(id, mEventHandler, this, 0, 0, hdpi::Px(0), hdpi::Px(0), caption);
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
@@ -302,6 +366,7 @@ void ContainerPropertyControl::createButtonLText(int id, const char caption[], b
 {
   ButtonPropertyControl *newControl =
     new ButtonPropertyControl(id, mEventHandler, this, 0, 0, hdpi::Px(0), hdpi::Px(0), caption, true);
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
@@ -327,6 +392,7 @@ void ContainerPropertyControl::createSeparatorText(int id, const char caption[],
   SeparatorPropertyControl *newControl = new SeparatorPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   addControl(newControl, new_line);
 }
 
@@ -336,6 +402,7 @@ void ContainerPropertyControl::createCombo(int id, const char caption[], const T
   ComboBoxPropertyControl *newControl = new ComboBoxPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, vals, index, /*sorted = */ false);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
@@ -353,6 +420,7 @@ void ContainerPropertyControl::createSortedCombo(int id, const char caption[], c
   ComboBoxPropertyControl *newControl = new ComboBoxPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, vals, index, /*sorted = */ true);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
@@ -363,6 +431,7 @@ void ContainerPropertyControl::createList(int id, const char caption[], const Ta
   ListBoxPropertyControl *newControl = new ListBoxPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, vals, index);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
@@ -387,25 +456,30 @@ void ContainerPropertyControl::createRadio(int id, const char caption[], bool en
 {
   RadioButtonPropertyControl *newControl =
     new RadioButtonPropertyControl(mEventHandler, this, getID(), 0, 0, hdpi::Px(0), caption, id);
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
 
-void ContainerPropertyControl::createColorBox(int id, const char caption[], E3DCOLOR value, bool enabled, bool new_line)
+void ContainerPropertyControl::createColorBox(int id, const char caption[], E3DCOLOR value, bool enabled, bool new_line,
+  bool use_modal_color_selector)
 {
   ColorBoxPropertyControl *newControl = new ColorBoxPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
-    getNextControlY(new_line), getClientWidth(), caption);
+    getNextControlY(new_line), getClientWidth(), caption, use_modal_color_selector);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setColorValue(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
 
-void ContainerPropertyControl::createSimpleColor(int id, const char caption[], E3DCOLOR value, bool enabled, bool new_line)
+void ContainerPropertyControl::createSimpleColor(int id, const char caption[], E3DCOLOR value, bool enabled, bool new_line,
+  hdpi::Px width)
 {
-  SimpleColorPropertyControl *newControl = new SimpleColorPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
-    getNextControlY(new_line), getClientWidth(), caption);
+  SimpleColorPropertyControl *newControl =
+    new SimpleColorPropertyControl(mEventHandler, this, id, getNextControlX(new_line), getNextControlY(new_line), width, caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setColorValue(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -416,6 +490,7 @@ void ContainerPropertyControl::createPoint2(int id, const char caption[], Point2
   Point2PropertyControl *newControl = new Point2PropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, prec);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setPoint2Value(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -426,6 +501,7 @@ void ContainerPropertyControl::createPoint3(int id, const char caption[], Point3
   Point3PropertyControl *newControl = new Point3PropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, prec);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setPoint3Value(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -436,6 +512,7 @@ void ContainerPropertyControl::createPoint4(int id, const char caption[], Point4
   Point4PropertyControl *newControl = new Point4PropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption, prec);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setPoint4Value(value);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
@@ -443,9 +520,13 @@ void ContainerPropertyControl::createPoint4(int id, const char caption[], Point4
 
 void ContainerPropertyControl::createMatrix(int id, const char caption[], const TMatrix &value, int prec, bool enabled, bool new_line)
 {
-  // TODO: ImGui porting: missing control: used in scriptPanelWrapper.
-  logdbg("ImGui porting: missing control: %s", __FUNCTION__);
-  G_ASSERT(false);
+  MatrixPropertyControl *newControl = new MatrixPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
+    getNextControlY(new_line), getClientWidth(), caption, prec);
+
+  setAutomationNameFromCaption(newControl, caption);
+  newControl->setMatrixValue(value);
+  newControl->setEnabled(enabled);
+  addControl(newControl, new_line);
 }
 
 void ContainerPropertyControl::createGradientBox(int id, const char caption[], bool enabled, bool new_line)
@@ -453,6 +534,7 @@ void ContainerPropertyControl::createGradientBox(int id, const char caption[], b
   GradientBoxPropertyControl *newControl = new GradientBoxPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
@@ -475,6 +557,7 @@ void ContainerPropertyControl::createCurveEdit(int id, const char caption[], hdp
   CurveEditPropertyControl *newControl = new CurveEditPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
     getNextControlY(new_line), getClientWidth(), height == hdpi::Px::ZERO ? hdpi::_pxScaled(DEFAULT_CURVE_HEIGHT) : height, caption);
 
+  setAutomationNameFromCaption(newControl, caption);
   newControl->setEnabled(enabled);
   addControl(newControl, new_line);
 }
@@ -509,6 +592,15 @@ TLeafHandle ContainerPropertyControl::createTreeLeaf(TLeafHandle parent, const c
 {
   G_ASSERT(false && "Tree leaf can be created only in Tree control!");
   return 0;
+}
+
+void ContainerPropertyControl::createStaticWithIcon(int id, const char caption[], bool new_line, bool word_wrap)
+{
+  StaticWithIconPropertyControl *newControl = new StaticWithIconPropertyControl(mEventHandler, this, id, getNextControlX(new_line),
+    getNextControlY(new_line), hdpi::Px(0), caption, hdpi::Px(0), word_wrap);
+
+  setAutomationNameFromCaption(newControl, caption);
+  addControl(newControl, new_line);
 }
 
 void ContainerPropertyControl::createIndirect(DataBlock &dataBlock, ISetControlParams &controlParams)
@@ -700,12 +792,39 @@ void ContainerPropertyControl::setControlPoints(int id, Tab<Point2> &points)
   }
 }
 
+void ContainerPropertyControl::setControlAutomationName(int id, const char automation_name[])
+{
+  PropertyControlBase *ptr = getById(id);
+  if (ptr)
+  {
+    ptr->setAutomationName(automation_name);
+  }
+}
+
 void ContainerPropertyControl::setTooltipId(int id, const char text[])
 {
   PropertyControlBase *ptr = getById(id);
   if (ptr)
   {
     ptr->setTooltip(text);
+  }
+}
+
+void ContainerPropertyControl::setShowTooltipAlwaysById(int id, bool show)
+{
+  PropertyControlBase *ptr = getById(id);
+  if (ptr)
+  {
+    ptr->setShowTooltipAlways(show);
+  }
+}
+
+void ContainerPropertyControl::setDefaultValueById(int id, Variant var)
+{
+  PropertyControlBase *ptr = getById(id);
+  if (ptr)
+  {
+    ptr->setDefaultValue(std::move(var));
   }
 }
 
@@ -768,6 +887,41 @@ void ContainerPropertyControl::setListBoxEventHandler(int id, IListBoxControlEve
   PropertyControlBase *ptr = getById(id);
   if (ptr)
     ptr->setListBoxEventHandlerValue(handler);
+}
+
+void ContainerPropertyControl::setListDragHandler(int id, IListDragHandler *handler)
+{
+  PropertyControlBase *ptr = getById(id);
+  if (ptr)
+    ptr->setListDragHandlerValue(handler);
+}
+
+void ContainerPropertyControl::setListDropHandler(int id, IListDropHandler *handler)
+{
+  PropertyControlBase *ptr = getById(id);
+  if (ptr)
+    ptr->setListDropHandlerValue(handler);
+}
+
+void ContainerPropertyControl::setDragSourceHandlerById(int id, IDragSourceHandler *handler)
+{
+  PropertyControlBase *ptr = getById(id);
+  if (ptr)
+    ptr->setDragSourceHandlerValue(handler);
+}
+
+void ContainerPropertyControl::setDropTargetHandlerById(int id, IDropTargetHandler *handler)
+{
+  PropertyControlBase *ptr = getById(id);
+  if (ptr)
+    ptr->setDropTargetHandler(handler);
+}
+
+void ContainerPropertyControl::setValueHighlightById(int id, ColorOverride::ColorIndex color)
+{
+  PropertyControlBase *ptr = getById(id);
+  if (ptr)
+    ptr->setValueHighlight(color);
 }
 
 int ContainerPropertyControl::addString(int id, const char *value)
@@ -990,15 +1144,7 @@ SimpleString ContainerPropertyControl::getCaption() const
 
 void ContainerPropertyControl::clear()
 {
-  for (int i = 0; i < mControlArray.size(); ++i)
-  {
-    if (mControlArray[i])
-    {
-      delete (mControlArray[i]); // destructor for container calls clear()
-    }
-  }
-
-  clear_and_shrink(mControlArray);
+  clear_all_ptr_items_and_shrink(mControlArray);
   clear_and_shrink(mControlsNewLine);
   clear_and_shrink(mControlsLastRectSize);
 }
@@ -1209,6 +1355,11 @@ void ContainerPropertyControl::addControl(PropertyControlBase *pcontrol, bool ne
   onControlAdd(pcontrol);
 }
 
+void ContainerPropertyControl::setAutomationNameFromCaption(PropertyControlBase *control, const char caption[])
+{
+  control->setAutomationName(caption);
+}
+
 int ContainerPropertyControl::getNextControlX(bool new_line)
 {
   // NOTE: ImGui porting: unused.
@@ -1245,6 +1396,43 @@ void ContainerPropertyControl::addVerticalSpaceAfterControl()
   ImGui::SetCursorScreenPos(ImVec2(cursor.x, cursor.y + itemSpacingY));
 }
 
+void ContainerPropertyControl::setDropTargetHandler(IDropTargetHandler *drop_target_handler)
+{
+  dropTargetHandler = drop_target_handler;
+}
+
+void ContainerPropertyControl::handleDragAndDropForControl(PropertyControlBase &control)
+{
+  if (dropTargetHandler == nullptr || !ImGui::BeginDragDropTarget())
+    return;
+
+  auto result = dropTargetHandler->handleDropTarget(control.getID(), this);
+  PropPanel::handleDragAndDropNotAllowed(result);
+
+  ImGui::EndDragDropTarget();
+}
+
+bool ContainerPropertyControl::isDefaultValueSet() const
+{
+  for (const PropertyControlBase *control : mControlArray)
+  {
+    if (!control->isDefaultValueSet())
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void ContainerPropertyControl::applyDefaultValue()
+{
+  for (PropertyControlBase *control : mControlArray)
+  {
+    control->applyDefaultValue();
+  }
+}
+
 void ContainerPropertyControl::updateImgui()
 {
   G_ASSERT(mControlArray.size() == mControlsNewLine.size());
@@ -1271,7 +1459,11 @@ void ContainerPropertyControl::updateImgui()
           for (int column = 0; column < controlsInSameLine; ++column)
           {
             PropertyControlBase *control = mControlArray[i + column];
-            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, control->getWidth());
+            const unsigned columnWidth = control->getWidth();
+            if (stretchZeroWidthColumns && columnWidth == 0)
+              ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            else
+              ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, (float)columnWidth);
           }
         }
 
@@ -1281,9 +1473,13 @@ void ContainerPropertyControl::updateImgui()
 
           ImGui::TableNextColumn();
 
+          const ImGuiID activeIdWasAlive = ImGui::GetCurrentContext()->ActiveIdIsAlive;
           ImGui::PushID(control);
           control->updateImgui();
           ImGui::PopID();
+          note_held_active_imgui_item(*control, activeIdWasAlive);
+
+          handleDragAndDropForControl(*control);
         }
 
         ImGui::EndTable();
@@ -1298,6 +1494,7 @@ void ContainerPropertyControl::updateImgui()
     {
       PropertyControlBase *control = mControlArray[i];
 
+      const ImGuiID activeIdWasAlive = ImGui::GetCurrentContext()->ActiveIdIsAlive;
       ImGui::PushID(control);
       if (control->getImguiControlType() == (int)ControlType::GroupBox)
       {
@@ -1309,10 +1506,58 @@ void ContainerPropertyControl::updateImgui()
         control->updateImgui();
       }
       ImGui::PopID();
+      note_held_active_imgui_item(*control, activeIdWasAlive);
+
+      handleDragAndDropForControl(*control);
 
       ++i;
     }
   }
+}
+
+Point2 ContainerPropertyControl::getPreferredSize(float max_width_px) const
+{
+  G_ASSERT(mControlArray.size() == mControlsNewLine.size());
+
+  Point2 totalSize(0.0f, 0.0f);
+
+  for (int i = 0; i < mControlArray.size();)
+  {
+    const int controlsInSameLine = getControlsInSameLine(i);
+
+    Point2 lineSize(0.0f, 0.0f);
+    int contributingColumns = 0;
+    for (int column = 0; column < controlsInSameLine; ++column)
+    {
+      const Point2 controlSize = mControlArray[i + column]->getPreferredSize(max_width_px);
+      lineSize.x += controlSize.x;
+      lineSize.y = max(lineSize.y, controlSize.y);
+      if (controlSize.x > 0.0f)
+        ++contributingColumns;
+    }
+
+    // Only pad between controls that actually reported a width.
+    if (contributingColumns > 1)
+    {
+      const float paddingX = useCustomHorizontalSpacing ? horizontalSpaceBetweenControls : ImGui::GetStyle().CellPadding.x;
+      lineSize.x += paddingX * (contributingColumns - 1);
+    }
+
+    totalSize.x = max(totalSize.x, lineSize.x);
+
+    // Skip spacing for a line with no preference, so the entire container can return no preference if all children
+    // reported that.
+    if (lineSize.y > 0.0f)
+    {
+      if (totalSize.y > 0.0f)
+        totalSize.y += verticalSpaceBetweenControls;
+      totalSize.y += lineSize.y;
+    }
+
+    i += controlsInSameLine;
+  }
+
+  return totalSize;
 }
 
 } // namespace PropPanel

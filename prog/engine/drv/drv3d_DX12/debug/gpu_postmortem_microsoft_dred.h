@@ -15,7 +15,7 @@ struct Direct3D12Enviroment;
 struct PipelineStageStateBase;
 namespace debug
 {
-union Configuration;
+struct Configuration;
 namespace gpu_postmortem::microsoft
 {
 class DeviceRemovedExtendedData
@@ -86,7 +86,7 @@ public:
       return false;
     }
     target.template emplace<DeviceRemovedExtendedData>();
-    return false;
+    return true;
   }
 
   template <typename T, typename K>

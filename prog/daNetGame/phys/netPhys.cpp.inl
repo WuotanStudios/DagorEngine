@@ -3,8 +3,12 @@
 #include "phys/netPhys.h"
 #include "game/gameEvents.h"
 #include "physEvents.h"
-#include <ecs/core/entityManager.h>
-#include <ecs/core/attributeEx.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/entityComponent.h>
 #include <daECS/core/coreEvents.h>
 #include <daECS/net/object.h>
 #include <daECS/net/netbase.h>
@@ -20,7 +24,7 @@
 #include <gameMath/quantization.h>
 #include <daECS/net/msgDecl.h>
 #include "net/dedicated.h"
-#include <crypto/base64.h>
+#include <dagCrypto/base64.h>
 #include <daECS/net/msgSink.h>
 #include "game/player.h"
 #include "ecs/game/generic/team.h"
@@ -31,6 +35,8 @@
 #include <ioSys/dag_dataBlock.h>
 #if !DISABLE_SYNC_DEBUG
 #include <syncDebug/syncDebug.h>
+#else
+#define PHYS_DEBUG_DESYNCS_BITSTREAM nullptr
 #endif
 #include <gamePhys/phys/utils.h>
 #include <util/dag_string.h>
@@ -43,6 +49,7 @@
 #include <gamePhys/phys/physToSolverBody.h>
 #include <gamePhys/phys/rendinstDestr.h>
 #include <scene/dag_physMat.h>
+#include <phys/dag_physics.h>
 #include "phys/gridCollision.h"
 #include <ecs/anim/anim.h>
 #include <math/dag_geomTree.h>
@@ -55,6 +62,8 @@ extern ConVarB sv_debug_phys_desyncs;
 
 #define DESTROY_ENTITY_FLOOR_Y          -(QuantizedWorldPosYScale() - 100.f)
 #define PHYS_SNAP_TELEPORT_THRESHOLD_SQ (400.f)
+// Squared tolerance for a dequantized HIDDEN_QWPOS_XYZ (quantization error is ~1.95mm, see quantization.h)
+#define HIDDEN_QWPOS_TOLERANCE_SQ       (1.f)
 
 // World box includes non-quantized physics (i.e. airplanes)
 static const BBox3 PHYS_ENTITY_WORLD_BBOX(Point3(-1e5f, DESTROY_ENTITY_FLOOR_Y, -1e5f), Point3(1e5f, 3e4f, 1e5f));
@@ -67,16 +76,10 @@ namespace physreg
 extern const char *typeStrs[(int)PhysType::NUM];
 }
 
-#define ECS_GETC(T, v, eid, n) T *v = g_entity_mgr->getNullableRW<T>(eid, ECS_HASH(#n))
-#define TEMPLATE_PHYS_ACTOR    template <typename PhysImpl, typename CustomPhys, PhysType phys_type>
-#define PHYS_ACTOR             PhysActor<PhysImpl, CustomPhys, phys_type>
-#define SAFE_TIME_TO_REUSE_PHYS_ACTOR_INDEX \
-  1.f // Assume that this much sec is enough to replicate death of entity to all remote systems
-#if !DISABLE_SYNC_DEBUG && DAGOR_DBGLEVEL > 0
-#define PHYS_DEBUG_DESYNCS_BITSTREAM &fm_sync_dump_output_stream
-#else
-#define PHYS_DEBUG_DESYNCS_BITSTREAM nullptr
-#endif
+#define TEMPLATE_PHYS_ACTOR                 template <typename PhysImpl, typename CustomPhys, PhysType phys_type>
+#define PHYS_ACTOR                          PhysActor<PhysImpl, CustomPhys, phys_type>
+// Assume that this much sec is enough to replicate death of entity to all remote systems
+#define SAFE_TIME_TO_REUSE_PHYS_ACTOR_INDEX 1.f
 
 template <typename PhysActor, typename PhysImpl, typename... Args>
 static void apply_authority_state_and_log_desync(PhysActor *unit, PhysImpl &phys, Args &&...args)
@@ -158,7 +161,7 @@ public:
   }
 };
 TEMPLATE_PHYS_ACTOR
-void PHYS_ACTOR::doEnqueueCT(float at_time)
+void PHYS_ACTOR::doEnqueueCT(double at_time)
 {
   if (!isLocalControl() || phys.isAsleep())
     return;
@@ -189,28 +192,40 @@ void PHYS_ACTOR::doEnqueueCT(float at_time)
   afterEnqueueCT();
 }
 
+static inline bool is_phys_actor_tm_finite(const TMatrix &tm)
+{
+  vec4f result = v_or(v_is_not_finite(v_ldu(tm.array)), v_is_not_finite(v_ldu(tm.array + 4)));
+  result = v_or(result, v_is_not_finite(v_ldu(tm.array + 8)));
+  return v_check_xyzw_all_false(result);
+}
+
 template <typename T>
-static void destroy_fallthrough_phys_actor(const T &actor, const TMatrix &tm)
+static void destroy_fallthrough_phys_actor(const T &actor, const TMatrix &tm, bool tm_is_finite)
 {
   const Point3 &pos = tm.getcol(3);
-  if (DAGOR_UNLIKELY(!(PHYS_ENTITY_WORLD_BBOX & pos)))
+  if (DAGOR_LIKELY(tm_is_finite && (PHYS_ENTITY_WORLD_BBOX & pos)))
+    return;
+  if (!tm_is_finite)
+    logerr("Destroying entity %d<%s> because its phys transform is not finite: %@", ecs::entity_id_t(actor.getEid()),
+      g_entity_mgr->getEntityTemplateName(actor.getEid()), tm);
+  else
   {
     int logLev = (pos.y < DESTROY_ENTITY_FLOOR_Y) ? LOGLEVEL_WARN : LOGLEVEL_ERR;
     logmessage(logLev, "Destroying entity %d<%s> because it's pos %@ exceeds 'world bbox' (%@, %@)", ecs::entity_id_t(actor.getEid()),
       g_entity_mgr->getEntityTemplateName(actor.getEid()), pos, PHYS_ENTITY_WORLD_BBOX.lim[0], PHYS_ENTITY_WORLD_BBOX.lim[1]);
-    // Force remove it from coll grid (for the duration of this frame) since objects in NaNs or "in space" might cause UB or asserts in
-    // code that isn't expecting it
-    if (auto grid_obj = g_entity_mgr->getNullableRW<GridObjComponent>(actor.getEid(), ECS_HASH("grid_obj")))
-      grid_obj->removeFromGrid();
-    g_entity_mgr->setOptional(actor.getEid(), ECS_HASH("beh_tree__enabled"), false); // ditto
-    g_entity_mgr->destroyEntity(actor.getEid());
   }
+  // Force remove it from coll grid (for the duration of this frame) since objects in NaNs or "in space" might cause UB or asserts in
+  // code that isn't expecting it
+  if (auto grid_obj = g_entity_mgr->getNullableRW<GridObjComponent>(actor.getEid(), ECS_HASH("grid_obj")))
+    grid_obj->removeFromGrid();
+  g_entity_mgr->setOptional(actor.getEid(), ECS_HASH("beh_tree__enabled"), false); // ditto
+  g_entity_mgr->destroyEntity(actor.getEid());
 }
 
 ECS_DECLARE_GET_FAST_BASE(int, net__upToCtrlTick, "net__upToCtrlTick");
 
 TEMPLATE_PHYS_ACTOR
-void PHYS_ACTOR::updateNetPhys(IPhysActor::NetRole my_role, float at_time)
+void PHYS_ACTOR::updateNetPhys(IPhysActor::NetRole my_role, double at_time)
 {
   TIME_PROFILE(PhysActor__updateNetPhys);
   if (!(my_role & (IPhysActor::URF_AUTHORITY | IPhysActor::URF_LOCAL_CONTROL)))
@@ -318,7 +333,7 @@ void PHYS_ACTOR::updateNetPhys(IPhysActor::NetRole my_role, float at_time)
 }
 
 TEMPLATE_PHYS_ACTOR
-void PHYS_ACTOR::update(float at_time, float remote_time, float dt, const BasePhysActor::UpdateContext &uctx)
+void PHYS_ACTOR::update(double at_time, double remote_time, float dt, const BasePhysActor::UpdateContext &uctx)
 {
   TIME_PROFILE(PhysActor__update);
   IPhysActor::NetRole thisRole = getRole();
@@ -342,9 +357,16 @@ void PHYS_ACTOR::update(float at_time, float remote_time, float dt, const BasePh
     else
       send_authority_state(this, phys, PHYS_SEND_AUTH_STATE_PERIOD_SEC, &phys_send_auth_state, &phys_send_part_auth_state);
   }
-  *uctx.transform = phys.visualLocation.makeTM();
+  const TMatrix tm = phys.visualLocation.makeTM();
+  const bool tmIsFinite = is_phys_actor_tm_finite(tm);
+  // destroyEntity() is deferred. Better leave the last valid value in the tm, rather than assigning NaNs
+  if (DAGOR_LIKELY(tmIsFinite))
+    *uctx.transform = tm;
   if (thisRole & IPhysActor::URF_AUTHORITY)
-    destroy_fallthrough_phys_actor(*this, *uctx.transform);
+    destroy_fallthrough_phys_actor(*this, tm, tmIsFinite);
+  else if (DAGOR_UNLIKELY(!tmIsFinite))
+    LOGERR_ONCE("Non-authority phys actor %d<%s> visual transform is not finite: %@", ecs::entity_id_t(getEid()),
+      g_entity_mgr->getEntityTemplateName(getEid()), tm);
 }
 
 TEMPLATE_PHYS_ACTOR
@@ -482,7 +504,7 @@ TEMPLATE_PHYS_ACTOR
   if (out_in_motion)
     *out_in_motion = inMotion;
 
-  return true;
+  return isOk;
 }
 
 TEMPLATE_PHYS_ACTOR
@@ -608,7 +630,7 @@ void PHYS_ACTOR::setRoleAndTickrateType(IPhysActor::NetRole new_role, PhysTickRa
   phys.setTimeStep(ts);
   // Recalc ticks to new timeStep
   float curTimeDelta = (new_role & IPhysActor::URF_LOCAL_CONTROL) ? 0.f : phys_get_present_time_delay_sec(trtype, ts);
-  phys.currentState.atTick = gamephys::floorPhysicsTickNumber(get_sync_time() - curTimeDelta, ts);
+  phys.currentState.atTick = gamephys::floorPhysicsTickNumber(get_sync_time_d() - curTimeDelta, ts);
   // On server we assume that this method is called before phys update and hence use previuos (floor) tick instead of current (ceil)
   // in order to able update it further in phys update of this frame
   if (!(new_role & IPhysActor::URF_AUTHORITY))
@@ -636,7 +658,7 @@ void PHYS_ACTOR::setRoleAndTickrateType(IPhysActor::NetRole new_role, PhysTickRa
 }
 
 TEMPLATE_PHYS_ACTOR
-const typename PHYS_ACTOR::SnapshotPair *PHYS_ACTOR::findPhysSnapshotPair(float at_time) const
+const typename PHYS_ACTOR::SnapshotPair *PHYS_ACTOR::findPhysSnapshotPair(double at_time) const
 {
   if (snapshotsHistory.size() <= 1)
     return nullptr;
@@ -653,7 +675,7 @@ const typename PHYS_ACTOR::SnapshotPair *PHYS_ACTOR::findPhysSnapshotPair(float 
 
 TEMPLATE_PHYS_ACTOR
 const typename PHYS_ACTOR::SnapshotPair *PHYS_ACTOR::updateRemoteShadowBase(
-  float remote_time, float dt, const BasePhysActor::UpdateContext &)
+  double remote_time, float dt, const BasePhysActor::UpdateContext &)
 {
   const SnapshotPair *spair = findPhysSnapshotPair(remote_time);
   if (!spair)
@@ -716,10 +738,10 @@ const typename PHYS_ACTOR::SnapshotPair *PHYS_ACTOR::updateRemoteShadowBase(
 EA_DISABLE_VC_WARNING(4582 4583) // constructor/destructor is not implicitly called
 
 TEMPLATE_PHYS_ACTOR
-PHYS_ACTOR::PhysActor(const ecs::EntityManager & /*mgr*/, ecs::EntityId in_eid) :
+PHYS_ACTOR::PhysActor(ecs::EntityManager &mgr, ecs::EntityId in_eid) :
   BasePhysActor(in_eid, staticPhysType),
   phys(offsetof(PhysActor, phys),
-    g_entity_mgr->getNullableRW<PhysVars>(in_eid, ECS_HASH("phys_vars")),
+    mgr.getNullableRW<PhysVars>(in_eid, ECS_HASH("phys_vars")),
     phys_calc_timestep(in_eid, BasePhysActor::tickrateType, customPhys))
 {
   // Do not delay physics updates in interpolation mode. This is also important for control-less physics like phys objs.
@@ -739,7 +761,7 @@ PHYS_ACTOR::PhysActor(const ecs::EntityManager & /*mgr*/, ecs::EntityId in_eid) 
     allPhysActorsLists[(int)physType] = &physEidsList;
   }
 
-  clientSideOnly = g_entity_mgr->has(in_eid, ECS_HASH("clientSide"));
+  clientSideOnly = mgr.has(in_eid, ECS_HASH("clientSide"));
 
   initRole();
 
@@ -790,19 +812,27 @@ EA_RESTORE_VC_WARNING()
       (phys_actor_resolve_by_eid_t)(&EID2ACTOR), deserializePhysSnapshot, processSnapshotNoEntity);                   \
   }
 
-static inline TMatrix &validate_phys_actor_tm(TMatrix &tm, ecs::EntityId eid)
+static inline TMatrix &validate_phys_actor_tm(TMatrix &tm, ecs::EntityId eid, ecs::EntityManager &mgr)
 {
-  if (float det = tm.det(); DAGOR_UNLIKELY(det < 1e-12f))
+  const float det = tm.det();
+  if (DAGOR_UNLIKELY(det < 1e-12f))
   {
     logerr("Creating phys actor %d<%s> with non-orthonormalized (det=%f) matrix: %@", (ecs::entity_id_t)eid,
-      g_entity_mgr->getEntityTemplateName(eid), det, tm);
+      mgr.getEntityTemplateName(eid), det, tm);
     tm.orthonormalize();
+  }
+  // (det, col[3][0], col[3][1], col[3][2]) are loaded into the vector register
+  if (DAGOR_UNLIKELY(!v_check_xyzw_all_false(v_is_not_finite(v_perm_ayzw(v_ldu(tm.array + 8), v_set_x(det))))))
+  {
+    logerr("Creating phys actor %d<%s> with a non-finite matrix: %@", (ecs::entity_id_t)eid, mgr.getEntityTemplateName(eid), tm);
+    return tm;
   }
   if (vec3f vpos = v_ldu_p3(&tm.getcol(3).x);
       DAGOR_UNLIKELY(v_extract_y(vpos) < DESTROY_ENTITY_FLOOR_Y || v_extract_x(v_length3_sq_x(vpos)) >= 9e8f))
-    if (!(PHYS_ENTITY_WORLD_BBOX & tm.getcol(3)))
+    // pos may legitimately be the HIDDEN_QWPOS_XYZ sentinel sent while we're PhysSnapSerializeType::HIDDEN
+    if (!(PHYS_ENTITY_WORLD_BBOX & tm.getcol(3)) && lengthSq(tm.getcol(3) - Point3(HIDDEN_QWPOS_XYZ)) > HIDDEN_QWPOS_TOLERANCE_SQ)
       logerr("Attempt to create phys actor %d<%s> with pos %@ out of `world bbox`: (%@, %@)", (ecs::entity_id_t)eid,
-        g_entity_mgr->getEntityTemplateName(eid), tm.getcol(3), PHYS_ENTITY_WORLD_BBOX.lim[0], PHYS_ENTITY_WORLD_BBOX.lim[1]);
+        mgr.getEntityTemplateName(eid), tm.getcol(3), PHYS_ENTITY_WORLD_BBOX.lim[0], PHYS_ENTITY_WORLD_BBOX.lim[1]);
   return tm;
 }
 
@@ -827,7 +857,7 @@ bool PHYS_ACTOR::onLoaded(ecs::EntityManager &mgr, ecs::EntityId)
     blockName = pColon + 1;
   }
 
-  const TMatrix &tm = validate_phys_actor_tm(mgr.getRW<TMatrix>(eid, ECS_HASH("transform")), eid);
+  const TMatrix &tm = validate_phys_actor_tm(mgr.getRW<TMatrix>(eid, ECS_HASH("transform")), eid, mgr);
   // Before phys load (as it might depend on correct world location being set, e.g. for adding phys bodies to phys world)
   phys.currentState.location.fromTM(tm);
 
@@ -850,19 +880,19 @@ bool PHYS_ACTOR::onLoaded(ecs::EntityManager &mgr, ecs::EntityId)
 
   // Level is expected to be loaded at this point. Make sure that level entity is placed before any phys actors in scene.
   // On client order of creation is same as on server
-  G_ASSERT(is_level_loaded());
-  float curTimeDelayed = get_sync_time() - phys_get_present_time_delay_sec(tickrateType, phys.timeStep, clientSideOnly);
+  G_ASSERT(is_level_loaded() || is_level_loading());
+  double curTimeDelayed = get_sync_time_d() - phys_get_present_time_delay_sec(tickrateType, phys.timeStep, clientSideOnly);
   phys.previousState.atTick = gamephys::floorPhysicsTickNumber(curTimeDelayed, phys.timeStep);
   phys.currentState.atTick = phys.previousState.atTick + 1;
   phys.currentState.lastAppliedControlsForTick = phys.previousState.atTick - calcControlsTickDelta();
 
   initNetPhysId(physEidsList, physIdGenerations, freeActorIndexes, syncStatesPacked,
-    g_entity_mgr->getNullableRW<int>(eid, ECS_HASH("net__physId")));
+    mgr.getNullableRW<int>(eid, ECS_HASH("net__physId")));
 
   if (eid == game::get_controlled_hero())
   {
     debug("hero phys actor %d/%p created", (ecs::entity_id_t)eid, this);
-    g_entity_mgr->broadcastEvent(EventHeroChanged(eid));
+    mgr.broadcastEvent(EventHeroChanged(eid));
   }
 
   return true;
@@ -872,7 +902,7 @@ template <typename T>
 static inline void net_phys_apply_authority_state_es(const UpdatePhysEvent &info, T &actor, bool smooth_authority_application = true)
 {
   if (actor.getRole() == IPhysActor::ROLE_LOCALLY_CONTROLLED_SHADOW)
-    apply_authority_state_and_log_desync(&actor, actor.phys, info.curTime, false, smooth_authority_application, false,
+    apply_authority_state_and_log_desync(&actor, actor.phys, info.curTimeD, false, smooth_authority_application, false,
       PHYS_DEBUG_DESYNCS_BITSTREAM,
       /*update_by_controls*/ true);
 }
@@ -880,286 +910,20 @@ static inline void net_phys_apply_authority_state_es(const UpdatePhysEvent &info
 template <typename T>
 static inline void net_phys_update_es(const UpdatePhysEvent &info, T &actor, const BasePhysActor::UpdateContext &uctx)
 {
-  float remoteTime = (actor.getRole() == IPhysActor::ROLE_REMOTELY_CONTROLLED_SHADOW)
-                       ? eastl::max(info.curTime - PhysUpdateCtx::ctx.getInterpDelay(actor.tickrateType, actor.phys.timeStep), 0.f)
-                       : info.curTime;
-  actor.update(info.curTime, remoteTime, info.dt, uctx);
+  double curTime = info.curTimeD, remoteTime = curTime;
+  if (actor.getRole() == IPhysActor::ROLE_REMOTELY_CONTROLLED_SHADOW)
+    remoteTime -= PhysUpdateCtx::ctx.getInterpDelay(actor.tickrateType, actor.phys.timeStep);
+  actor.update(curTime, remoteTime > 0 ? remoteTime : 0.0, info.dt, uctx);
 }
 
 
-static inline daphys::SolverBodyInfo phys_to_solver_body(const IPhysBase *phys, ecs::EntityId eid)
-{
-  daphys::SolverBodyInfo info = gamephys::phys_to_solver_body(phys);
-  info.tm = g_entity_mgr->getOr(eid, ECS_HASH("transform"), TMatrix::IDENT);
-  info.itm = inverse(info.tm);
-  return info;
-}
-
-// TODO: redo the omega in aircraft phys, so it'll not be needed.
-static inline void patch_solver_body_for_phys(ecs::EntityId eid, daphys::SolverBodyInfo &body)
-{
-  if (g_entity_mgr->has(eid, ECS_HASH("phys__inverseOmega")))
-    body.omega = -body.omega;
-}
-
-static inline void patch_solver_body_res(ecs::EntityId eid, daphys::SolverBodyInfo &body)
-{
-  if (g_entity_mgr->has(eid, ECS_HASH("phys__inverseOmega")))
-    body.addOmega = -body.addOmega;
-}
-
-static inline void move_collision_objects(IPhysBase &phys, const TMatrix &tm)
-{
-  for (const auto &co : phys.getCollisionObjects())
-    if (dacoll::is_obj_active(co))
-      dacoll::set_collision_object_tm(co, tm);
-}
-
-template <typename T>
-static inline void net_phys_collision_es_impl(const UpdatePhysEvent &info,
-  T &actor,
-  float bounding_rad,
+// Defined once in netPhysES.cpp.inl (compiled into the daNetGame framework) so the per-phys-type
+// collision ES wrappers below share a single instantiation instead of one copy per package.
+void net_phys_collision_es_impl(const UpdatePhysEvent &info,
+  BasePhysActor &actor,
+  const CollisionResource &collres,
   const GridHolders &grids_to_search,
-  const ecs::HashedConstString &tag_to_check)
-{
-  if (!(actor.getRole() & (IPhysActor::URF_AUTHORITY | IPhysActor::URF_LOCAL_CONTROL)))
-    return;
-
-  dag::ConstSpan<CollisionObject> curColl = actor.getPhys().getCollisionObjects();
-  uint64_t curCollActive = actor.getPhys().getActiveCollisionObjectsBitMask();
-  const TMatrix &curPhysTm = actor.getPhys().getCollisionObjectsMatrix();
-  const TraceMeshFaces *curTraceCache = actor.getPhys().getTraceHandle();
-  bool worldContactsProcessed = false;
-  PairCollisionData curBody;
-  query_pair_collision_data(actor.eid, curBody);
-  const bool curIsAsleep = actor.isAsleep() && !curBody.hasCustomMoveLogic;
-  mat44f vCurPhysTm;
-  v_mat44_make_from_43cu_unsafe(vCurPhysTm, curPhysTm.array);
-  BSphere3 bounding;
-  const float boundingExt = 1.2f; // add some padding
-  v_stu(&bounding.c.x,
-    v_perm_xyzd(vCurPhysTm.col3, v_splat_x(v_mul_x(v_set_x(bounding_rad * boundingExt), v_mat44_max_scale43_x(vCurPhysTm)))));
-  bounding.r2 = sqr(bounding.r);
-  alignas(NavMeshPhysProxy) char nmeshProxyStorage[sizeof(NavMeshPhysProxy)];
-
-  for_each_entity_in_grids(grids_to_search, bounding, GridEntCheck::BOUNDING, [&](ecs::EntityId eid, vec4f wbsph) {
-    if (eid == actor.eid)
-      return;
-    if (!g_entity_mgr->has(eid, tag_to_check)) // they don't have pair collision
-      return;
-
-    PairCollisionData testBody;
-    query_pair_collision_data(eid, testBody);
-    BasePhysActor *testActor = get_phys_actor(eid);
-
-    // don't check same collision pair twice
-    if (ecs::entity_id_t(actor.eid) > ecs::entity_id_t(eid) && testBody.havePairCollision && testActor &&
-        testActor->getRole() & (IPhysActor::URF_AUTHORITY | IPhysActor::URF_LOCAL_CONTROL))
-    {
-      if (testBody.pairCollisionTag && g_entity_mgr->has(actor.eid, ECS_HASH_SLOW(testBody.pairCollisionTag->c_str())))
-        return;
-    }
-
-    QueryPhysActorsNotCollidable qcoll(actor.eid);
-    g_entity_mgr->sendEventImmediate(eid, qcoll);
-    if (!qcoll.shouldCollide)
-      return;
-    qcoll.otherEid = eid;
-    g_entity_mgr->sendEventImmediate(actor.eid, qcoll);
-    if (!qcoll.shouldCollide)
-      return;
-
-    IPhysBase *testPhys = nullptr;
-    if (testActor)
-    {
-      if (curIsAsleep && testActor->isAsleep() && !testBody.hasCustomMoveLogic)
-        return;
-      testPhys = &testActor->getPhys();
-    }
-    else if (testBody.nphysPairCollision)
-      testPhys = new (&nmeshProxyStorage, _NEW_INPLACE) NavMeshPhysProxy(eid, info.dt);
-
-    if (testPhys == nullptr)
-      return;
-
-    dag::ConstSpan<CollisionObject> testColl = testPhys->getCollisionObjects();
-    uint64_t testCollActive = testPhys->getActiveCollisionObjectsBitMask();
-    const TMatrix &testTm = testPhys->getCollisionObjectsMatrix();
-    Tab<gamephys::CollisionContactData> contacts(framemem_ptr());
-    if (!dacoll::test_pair_collision(curColl, curCollActive, testColl, testCollActive, contacts,
-          dacoll::TestPairFlags::Default & ~dacoll::TestPairFlags::CheckInWorld))
-      return;
-
-    int contactsNum = contacts.size();
-
-    if (!worldContactsProcessed)
-    {
-      dacoll::test_collision_world(curColl, bounding.r, contacts, curTraceCache);
-      worldContactsProcessed = true;
-    }
-    const int contactsNum1 = contacts.size() - contactsNum;
-
-    Point3_vec4 testPos;
-    v_st(&testPos.x, wbsph);
-    dacoll::test_collision_world(testColl, length(testPos - testTm.getcol(3)) + v_extract_w(wbsph), contacts,
-      testPhys->getTraceHandle());
-    const int contactsNum2 = contacts.size() - contactsNum1 - contactsNum;
-
-    daphys::SolverBodyInfo curBodyInfo = phys_to_solver_body(&actor.getPhys(), actor.eid);
-    daphys::SolverBodyInfo testBodyInfo = phys_to_solver_body(testPhys, eid);
-    patch_solver_body_for_phys(actor.eid, curBodyInfo);
-    patch_solver_body_for_phys(eid, testBodyInfo);
-
-    if (!curBody.isKinematicBody && !testBody.isKinematicBody)
-    {
-      const float maxMassRatio = max(curBody.maxMassRatioForPushOnCollision, testBody.maxMassRatioForPushOnCollision);
-      if (maxMassRatio > 0.f)
-      {
-        // If one of the bodies is way heavier than the other don't push it
-        // The code fixes cases like a human pushes a tank
-        const float massRatio = safediv(actor.getPhys().getMass(), testPhys->getMass());
-        if (massRatio >= maxMassRatio)
-        {
-          curBodyInfo.invMass = 0.f;
-          curBodyInfo.invMoi.zero();
-        }
-        if (safeinv(massRatio) >= maxMassRatio)
-        {
-          testBodyInfo.invMass = 0.f;
-          testBodyInfo.invMoi.zero();
-        }
-      }
-    }
-
-    if (curBody.isKinematicBody)
-    {
-      curBodyInfo.invMass = 0.f;
-      curBodyInfo.invMoi.zero();
-    }
-
-    if (testBody.isKinematicBody)
-    {
-      testBodyInfo.invMass = 0.f;
-      testBodyInfo.invMoi.zero();
-    }
-
-    // Onesided collision ignoring:
-    // Bot cannot affect players but playres can affect bots
-    // So, this code should skip contacts with bots when it's called for player
-    // but solve contacts when it's called for bot
-    QueryPhysActorsOneSideCollidable curBodyOneSide(eid);
-    QueryPhysActorsOneSideCollidable testBodyOneSide(actor.eid);
-    g_entity_mgr->sendEventImmediate(eid, testBodyOneSide);
-    g_entity_mgr->sendEventImmediate(actor.eid, curBodyOneSide);
-
-    if (testBodyOneSide.oneSideCollidable)
-    {
-      testBodyInfo.invMass = 0.f;
-      testBodyInfo.invMoi.zero();
-    }
-    if (curBodyOneSide.oneSideCollidable)
-    {
-      curBodyInfo.invMass = 0.f;
-      curBodyInfo.invMoi.zero();
-    }
-
-    if (curBody.isAirplane)
-    {
-      curBodyInfo.commonImpulseLimit = DummyCustomPhys::aircraftCollisionImpulseSpeedMax * actor.getPhys().getMass();
-      move_collision_objects(actor.getPhys(), curPhysTm);
-    }
-    if (testBody.isAirplane)
-    {
-      testBodyInfo.commonImpulseLimit = DummyCustomPhys::aircraftCollisionImpulseSpeedMax * testPhys->getMass();
-      move_collision_objects(*testPhys, testTm);
-    }
-
-    carray<double, BasePhysActor::MAX_COLLISION_SUBOBJECTS> impulseLimits1;
-    eastl::fill(impulseLimits1.data(), impulseLimits1.data() + impulseLimits1.size(), VERY_BIG_NUMBER);
-    curBodyInfo.impulseLimits.set(make_span(impulseLimits1));
-    carray<double, BasePhysActor::MAX_COLLISION_SUBOBJECTS> impulseLimits2;
-    eastl::fill(impulseLimits2.data(), impulseLimits2.data() + impulseLimits2.size(), VERY_BIG_NUMBER);
-    testBodyInfo.impulseLimits.set(make_span(impulseLimits2));
-
-    Tab<gamephys::SeqImpulseInfo> collisions(framemem_ptr());
-    collisions.reserve(contacts.size() * 3 + contactsNum1 + contactsNum2);
-    contacts_to_solver_data(&curBodyInfo, &testBodyInfo, make_span(contacts).first(contactsNum), collisions);
-    const int collisionsNum = collisions.size();
-
-    contacts_to_solver_data(&curBodyInfo, nullptr, make_span(contacts).subspan(contactsNum, contactsNum1), collisions);
-    for (int i = collisionsNum; i < collisions.size(); ++i)
-      collisions[i].contactIndex += contactsNum;
-    const int collisionsNum1 = collisions.size() - collisionsNum;
-
-    contacts_to_solver_data(nullptr, &testBodyInfo, make_span(contacts).subspan(contactsNum + contactsNum1, contactsNum2), collisions);
-    for (int i = collisionsNum + collisionsNum1; i < collisions.size(); ++i)
-      collisions[i].contactIndex += contactsNum + contactsNum1;
-
-    actor.getPhys().prepareCollisions(curBodyInfo, testBodyInfo, true, 0.7f, make_span(contacts), make_span(collisions));
-    testPhys->prepareCollisions(curBodyInfo, testBodyInfo, false, 0.7f, make_span(contacts), make_span(collisions));
-
-    Point3 lastCollisionPos = curPhysTm.getcol(3);
-    float maxImpulse = 0.f;
-    if (daphys::resolve_pair_velocity(curBodyInfo, testBodyInfo, make_span(collisions)))
-    {
-      actor.getPhys().wakeUp();
-      actor.getPhys().rescheduleAuthorityApprovedSend();
-      testPhys->wakeUp();
-      testPhys->rescheduleAuthorityApprovedSend();
-
-      for (const gamephys::SeqImpulseInfo &collision : collisions)
-      {
-        if (collision.appliedImpulse <= maxImpulse)
-          continue;
-        maxImpulse = collision.appliedImpulse;
-        lastCollisionPos = Point3::xyz(collision.pos);
-      }
-
-      Point3 bodyTestVel = Point3::xyz(testBodyInfo.vel);
-      Point3 bodyCurVel = Point3::xyz(curBodyInfo.vel);
-      g_entity_mgr->sendEvent(actor.eid,
-        EventOnCollision(Point3::xyz(curBodyInfo.addVel), bodyCurVel, lastCollisionPos, eid, bodyTestVel, info.dt, -1.f));
-      g_entity_mgr->sendEvent(eid,
-        EventOnCollision(Point3::xyz(testBodyInfo.addVel), bodyTestVel, lastCollisionPos, actor.eid, bodyCurVel, info.dt, -1.f));
-    }
-
-    if (curBody.isHuman || testBody.isHuman)
-    {
-      // In case of human collision checks we must skip entities that have humanAdditionalCollisionChecks
-      // Human already done all collision checks inside his physics
-      if (curBody.humanAdditionalCollisionChecks || testBody.humanAdditionalCollisionChecks)
-        return;
-    }
-
-    patch_solver_body_res(actor.eid, curBodyInfo);
-    patch_solver_body_res(eid, testBodyInfo);
-    actor.getPhys().applyVelOmegaDelta(curBodyInfo.addVel, curBodyInfo.addOmega);
-    testPhys->applyVelOmegaDelta(testBodyInfo.addVel, testBodyInfo.addOmega);
-
-    daphys::resolve_pair_penetration(curBodyInfo, testBodyInfo, collisions, 2.0, 5);
-    actor.getPhys().applyPseudoVelOmegaDelta(curBodyInfo.pseudoVel * actor.getPhys().getTimeStep(),
-      curBodyInfo.pseudoOmega * actor.getPhys().getTimeStep());
-    testPhys->applyPseudoVelOmegaDelta(testBodyInfo.pseudoVel * testPhys->getTimeStep(),
-      testBodyInfo.pseudoOmega * testPhys->getTimeStep());
-
-    actor.getPhys().wakeUp();
-    testPhys->wakeUp();
-    if (NavMeshPhysProxy::vtblPtr && ((void **)testPhys)[0] == NavMeshPhysProxy::vtblPtr) // hacky RTTI check
-      static_cast<const NavMeshPhysProxy *>(testPhys)->applyChangesTo(eid);
-
-    if (is_server())
-    {
-      actor.onCollisionDamage(make_span(collisions), make_span(contacts), eid.index(), 1.0, info.curTime);
-      if (testActor != nullptr)
-        testActor->onCollisionDamage(make_span(collisions), make_span(contacts), actor.eid.index(), 1.0, info.curTime);
-    }
-  });
-
-  if (!curIsAsleep)
-    for (const CollisionObject &collObj : curColl)
-      if (collObj.isValid())
-        rendinstdestr::test_dynobj_to_ri_phys_collision(collObj, bounding.r);
-}
+  const ecs::HashedConstString &tag_to_check);
 
 template <typename T>
 inline void net_phys_event_handler(const ecs::Event &event, T &actor)
@@ -1270,7 +1034,7 @@ static void apply_phys_modifications_impl(const ecs::EntityId eid, const ecs::st
     if (grid_obj && !grid_obj->inserted)                                                                                            \
       return;                                                                                                                       \
     ecs::HashedConstString tagToCheck = pair_collision__tag ? ECS_HASH_SLOW(pair_collision__tag->c_str()) : ECS_HASH(coll_tag_str); \
-    net_phys_collision_es_impl(info, phys_comp_name, collres.getBoundingSphereRad(), pair_collision__gridHolders, tagToCheck);      \
+    net_phys_collision_es_impl(info, phys_comp_name, collres, pair_collision__gridHolders, tagToCheck);                             \
   }
 
 #define PHYS_IMPLEMENT_ON_TICKRATE_CHANGED_ES(phys_type, phys_comp_name)                                                  \
@@ -1317,5 +1081,5 @@ static void apply_phys_modifications_impl(const ecs::EntityId eid, const ecs::st
     net_phys__currentStateOrient.set(q.x, q.y, q.z, q.w);                                                                 \
     net_phys__role = phys_comp_name.getRole();                                                                            \
     if (net_phys__interpK)                                                                                                \
-      *net_phys__interpK = calc_interpk(phys_comp_name, info.curTime);                                                    \
+      *net_phys__interpK = calc_interpk(phys_comp_name, info.curTimeD);                                                   \
   }

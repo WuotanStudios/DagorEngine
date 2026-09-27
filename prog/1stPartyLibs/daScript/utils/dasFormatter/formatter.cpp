@@ -62,6 +62,7 @@ namespace das::format {
         state.last = {};
         state.options = {};
         state.content_ = {};
+        state.program = nullptr;
     }
 
     void set_to(Pos info) {
@@ -164,7 +165,7 @@ namespace das::format {
         if (!maybe_struct) {
             return false;
         } else {
-            const auto &fields = maybe_struct->get()->fields;
+            const auto &fields = (*maybe_struct)->fields;
             return all_of(fields.begin(), fields.end(), [](auto field) {
                 return field.init;
             });

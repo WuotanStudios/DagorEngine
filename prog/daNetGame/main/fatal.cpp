@@ -26,7 +26,9 @@
 #include "net/net.h" // net_stop
 #include "main/settings.h"
 #include "main/storeApiEvents.h"
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include "game/gameScripts.h"
 #include "ui/userUi.h"
 #include "ui/overlay.h"
@@ -34,7 +36,8 @@
 
 #include <statsd/statsd.h>
 #include <drv/3d/dag_info.h>
-#include <3d/dag_gpuConfig.h>
+#include <drv/3d/dag_decl.h>
+#include <drv/3d/dag_driverDesc.h>
 #include "main/gameProjConfig.h"
 
 #if _TARGET_ANDROID || _TARGET_IOS
@@ -66,7 +69,7 @@ static bool mbox_user_allows_abort(const char *msg, const char *call_stack)
   char buf[4096];
   snprintf(buf, sizeof(buf), "%s\n%s", msg, call_stack);
   buf[sizeof(buf) - 1] = 0;
-  ScopeDetachAllWndComponents wndCompsGuard; // stop handling windows input events during fatal message box
+  ScopeSuspendWndProcComponents wndCompsGuard; // stop handling windows input events during fatal message box
   int result = os_message_box(buf, "GAME FATAL ERROR", GUI_MB_ABORT_RETRY_IGNORE | GUI_MB_ICON_ERROR | GUI_MB_NATIVE_DLG);
   debug("%s result = %d", __FUNCTION__, result);
   if (result == GUI_MB_BUTTON_2) // RETRY
@@ -86,7 +89,7 @@ static inline const char *classify_fatal_type(const char *msg, const char *file)
   static const char *OOMSignatures[] = {
     "ot enough memory", // Both "Not enough memory to alloc..." & "zstd error -64 (Allocation error : not enough memory)"
     "OUTOFMEMORY", "8007000E",
-#if _TARGET_C1 | _TARGET_C1
+#if _TARGET_C1 | _TARGET_C2
 
 #endif
   };
@@ -95,7 +98,7 @@ static inline const char *classify_fatal_type(const char *msg, const char *file)
   static const char *ccSignatures[] = {"zstd error",
     "zlib error", // bin blk (BB[zZ])
     "Corrupt file", "no GRP2 label", "Can't open GameResPack", "Can't open level",
-    "Error loading file" // FMOD_ERR_FILE_BAD
+    "Error loading file", // FMOD_ERR_FILE_BAD
     "read error",
     "seek error", // LFileGeneralLoadCB
     "LoadException"};
@@ -141,13 +144,13 @@ static void enable_breakpad()
 static void statsd_report_fatal(const char *fatal_type)
 {
   if (strcmp(fatal_type, "D3D") != 0)
-    statsd::counter("fatal", 1, {{"type", fatal_type}});
+    statsd::counter("fatal", 1, {{"type", fatal_type}, {"version", get_exe_version_str()}});
   else
   {
     // Note: driver_version, error_code, etc... can't be used here due high cardinality (backend restriction)
     statsd::counter("fatal", 1,
-      {{"type", fatal_type}, {"d3d_driver", d3d::get_driver_name()},
-        {"gpu_vendor", d3d_get_vendor_name(d3d_get_gpu_cfg().primaryVendor)}});
+      {{"type", fatal_type}, {"version", get_exe_version_str()}, {"d3d_driver", d3d::get_driver_name()},
+        {"gpu_vendor", d3d_get_vendor_name(d3d::get_driver_desc().info.vendor)}});
   }
 }
 
@@ -219,7 +222,7 @@ inline void dump_sqvm_callstacks(const char *call_stack)
 #define PROCESS_FATAL_ON_INIT_VIDEO _TARGET_PC_WIN
 
 #if PROCESS_FATAL_ON_INIT_VIDEO
-void send_gpu_net_event(const char *event_name, GpuVendor video_vendor, const uint32_t *drv_ver);
+void send_gpu_net_event(const char *event_name, GpuVendor video_vendor, const DriverVersion *drv_ver);
 static void on_video_error_fatal_action()
 {
   if (dgs_execute_quiet)
@@ -228,7 +231,7 @@ static void on_video_error_fatal_action()
   const char *addressPrefix = get_localized_text("url/knowledgebase", "https://support.gaijin.net/hc/search?&query=");
   String address(1024, "%s%X", addressPrefix, 0x8111000B);
   String text(1024, "Visit <a href=\"%s\">%s</a>", address.str(), address.str());
-  ScopeDetachAllWndComponents wndCompsGuard; // stop handling windows input events during fatal message box
+  ScopeSuspendWndProcComponents wndCompsGuard; // stop handling windows input events during fatal message box
   os_message_box(text, get_localized_text("msgbox/critical_error_header"), GUI_MB_OK | GUI_MB_ICON_ERROR | GUI_MB_FOREGROUND);
   _exit(1);
 }

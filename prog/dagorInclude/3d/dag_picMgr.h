@@ -7,9 +7,11 @@
 #include <drv/3d/dag_resId.h> // TEXTUREID
 #include <drv/3d/dag_samplerHandle.h>
 #include <math/dag_Point2.h>
+#include <ioSys/dag_dataBlock.h>
 
 class DataBlock;
 class String;
+class WinAutoLock;
 
 // Picture id type
 typedef int PICTUREID;
@@ -24,6 +26,8 @@ struct PicDesc;
 
 typedef void (*async_load_done_cb_t)(PICTUREID pid, TEXTUREID tid, d3d::SamplerHandle smp, const Point2 *tcLt, const Point2 *tcRb,
   const Point2 *picture_sz, void *arg);
+
+typedef bool (*async_load_confirmation_cb_t)(void *arg);
 
 // Picture can be obtained by real texture name or by picture name in BLK file:
 //   "tex/mytex.tga"        - real texture name
@@ -48,7 +52,7 @@ void after_d3d_reset();
 // and false otherwise (i.e. it was successfully sheduled)
 bool get_picture_ex(const char *file_name, PICTUREID &out_pic_id, TEXTUREID &out_tex_id, d3d::SamplerHandle &out_smp_id,
   Point2 *out_tc_lefttop = NULL, Point2 *out_tc_rightbottom = NULL, Point2 *picture_size = NULL,
-  async_load_done_cb_t load_done_cb = NULL, void *cb_arg = NULL);
+  async_load_done_cb_t load_done_cb = NULL, void *cb_arg = NULL, async_load_confirmation_cb_t load_confirm_cb = nullptr);
 
 // add ref, fill picture description
 void get_picture(const char *file_name, PicDesc &out_pic);
@@ -82,7 +86,12 @@ bool load_tex_atlas_data(const char *ta_fn, DataBlock &out_ta_blk, String &out_t
 // returns true when atlas referred by 'file_name' picture is dynamic; optionally returns alpha format
 bool is_picture_in_dynamic_atlas(const char *file_name, bool *out_premul_alpha = NULL);
 
+// returns false while picture content is still being produced (dynamic atlas item load/restore
+// or a pending picture render factory render); read-only, never schedules loading
+bool is_picture_content_ready(PICTUREID pid);
 
+
+struct PictureRenderContext;
 struct PictureRenderFactory
 {
   PictureRenderFactory *next = NULL; // slist
@@ -97,11 +106,54 @@ struct PictureRenderFactory
   virtual void unregistered() = 0;
   virtual void clearPendReq() = 0;
   virtual bool match(const DataBlock &pic_props, int &out_w, int &out_h) = 0;
-  virtual bool render(Texture *to, int x, int y, int w, int h, const DataBlock &pic_props, PICTUREID pid) = 0;
+  virtual void queueRender(PictureRenderContext &ctx, WinAutoLock *lock) = 0;
   virtual void updatePerFrame() {}
+  // true while a queued render for the pic is not finished yet (backs is_picture_content_ready).
+  // A factory that defers rendering past queueRender() must override this, or content is
+  // reported ready between queueRender() and the actual render.
+  // Called under PictureManager's internal lock: the override must not call back into
+  // PictureManager, and any lock it takes must never be held around PictureManager calls.
+  virtual bool isPicRenderPending(PICTUREID) { return false; }
 };
+
+struct PictureDelayedRenderFactory : public PictureRenderFactory
+{
+  void queueRender(PictureRenderContext &ctx, WinAutoLock *lock) final;
+  virtual bool doRender(const PictureManager::PictureRenderContext &pic_ctx) = 0;
+};
+
 void register_pic_render_factory(PictureRenderFactory *f);
 void unregister_pic_render_factory(PictureRenderFactory *f);
+
+struct PictureRenderContext
+{
+  PictureRenderContext(PictureRenderFactory *_prf, Texture *_rt, int _x0, int _y0, int _w, int _h, const DataBlock &p,
+    PICTUREID pic_id, uint8_t gen_) :
+    prf(_prf), rt(_rt), x0(_x0), y0(_y0), w(_w), h(_h), props(p), pid(pic_id), gen(gen_)
+  {}
+
+  unsigned triedAtFrame = 0;
+  unsigned failedAttempt = 0;
+  PICTUREID pid;
+  PictureRenderFactory *prf;
+  Texture *rt;
+  int x0, y0, w, h;
+  DataBlock props;
+  uint8_t gen;
+
+  const char *extractPicName() const;
+};
+
+enum class AsyncPicState
+{
+  DisallowedToRender,
+  Discarded,
+  TooEarlyToRender,
+  ReadyToRender
+};
+
+AsyncPicState process_pic_before_render(PictureRenderContext &);
+
 } // namespace PictureManager
 
 struct PictureManager::PicDesc

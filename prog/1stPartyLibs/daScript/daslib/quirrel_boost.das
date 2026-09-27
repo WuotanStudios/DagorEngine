@@ -7,12 +7,14 @@ options no_aot = true
 
 module quirrel_boost shared private
 
-require ast
-require rtti
+require daslib/ast
+require daslib/rtti
 require strings public
 require daslib/ast_boost
 require daslib/templates_boost
 require daslib/strings_boost
+require daslib/apply
+require daslib/contracts
 require quirrel public
 
 
@@ -29,7 +31,7 @@ def public getStackValue(var vm : SQVM?; idx : int64; cb : block<(res : auto(T)?
     let itemType = sq_gettype(vm, idx)
     if (itemType != tagSQObjectType.OT_NULL) {
         return _::getStackValue(vm, idx) <| $(res2 : T) {
-            cb |> invoke(unsafe(reinterpret<T? const> unsafe(addr(res2))))
+            cb |> invoke(unsafe(reinterpret<T? const>(unsafe(addr(res2)))))
         }
     } else {
         cb |> invoke(null)
@@ -97,11 +99,11 @@ def public getStackValue(var vm : SQVM?; idx : int64; cb : block<(res : string) 
     let itemType = sq_gettype(vm, idx)
     if (itemType == tagSQObjectType.OT_STRING) {
         if (sq_getstring(vm, idx, unsafe(addr(res))) >= 0l) {
-            cb |> invoke(unsafe(reinterpret<string> res))
+            cb |> invoke(res)
             return true
         }
     } elif (itemType == tagSQObjectType.OT_NULL) {
-        cb |> invoke(unsafe(reinterpret<string> res))
+        cb |> invoke(res)
         return true
     }
     return false
@@ -174,7 +176,17 @@ def public pushValue(var vm : SQVM?; val : uint16) { sq_pushinteger(vm, int64(va
 def public pushValue(var vm : SQVM?; val : uint64) { sq_pushinteger(vm, int64(val)); }
 def public pushValue(var vm : SQVM?; val : float) { sq_pushfloat(vm, val); }
 def public pushValue(var vm : SQVM?; val : bool) { sq_pushbool(vm, val ? 1ul : 0ul); }
-def public pushValue(var vm : SQVM?; val : string) { sq_pushstring(vm, val, int64(length(val))); }
+def public pushValue(var vm : SQVM?; val : string) { sq_pushstring(vm, val, long_length(val)); }
+
+[expect_any_struct(val)]
+def public pushValue(var vm : SQVM?; val : auto) {
+    sq_newtable(vm)
+    apply(val) <| $(name : string; field) {
+        _::pushValue(vm, name)
+        _::pushValue(vm, field)
+        sq_rawset(vm, -3l)
+    }
+}
 
 def public pushValue(var vm : SQVM?; val : array<auto(T)>) {
     sq_newarray(vm, int64(length(val)))
@@ -209,7 +221,8 @@ def public paramcheck(typ) {
                 || typ.baseType == Type.tInt64 || typ.baseType == Type.tUInt || typ.baseType == Type.tUInt8
                 || typ.baseType == Type.tUInt16 || typ.baseType == Type.tUInt64
                 || typ.baseType == Type.tEnumeration || typ.baseType == Type.tEnumeration8 || typ.baseType == Type.tEnumeration16
-                || typ.baseType == Type.tVariant || typ.baseType == Type.tBitfield)
+                || typ.baseType == Type.tVariant
+                || typ.baseType == Type.tBitfield || typ.baseType == Type.tBitfield8 || typ.baseType == Type.tBitfield16 || typ.baseType == Type.tBitfield64)
     return "n" if (typ.baseType == Type.tFloat)
     return "b" if (typ.baseType == Type.tBool)
     return "s|o" if (typ.baseType == Type.tString)
@@ -221,7 +234,7 @@ def public paramcheck(typ) {
 }
 
 [macro_function]
-def read_arg(var arg : smart_ptr<ast::Variable>&; vmIdx : int64; argName : string; optional_args: bool; var errors : das_string;
+def read_arg(var arg : ast::Variable?&; vmIdx : int64; argName : string; optional_args: bool; var errors : das_string;
              var funcBody : array<ExpressionPtr>; var paramsCheck : array<string>; var nullable_arg, vm_arg : bool&) : array<ExpressionPtr> {
     nullable_arg = false
     vm_arg = false
@@ -240,7 +253,7 @@ def read_arg(var arg : smart_ptr<ast::Variable>&; vmIdx : int64; argName : strin
             if (ann.basicType != Type.tString) {
                 errors := "{errors}\nuse incorrect raw_param annotation type, string required ([[raw_param=<paramCheckName>...]] {arg.name} : int64)"
             } else {
-                var inscope expr <- qmacro_expr(${let $i(argName) = $v(vmIdx);})
+                var expr = qmacro_expr(${let $i(argName) = $v(vmIdx);})
                 funcBody |> emplace(expr, 0)
                 paramsCheck |> push("{ann.sValue}", 0)
             }
@@ -251,7 +264,7 @@ def read_arg(var arg : smart_ptr<ast::Variable>&; vmIdx : int64; argName : strin
     if (arg._type.baseType == Type.tPointer) {
         if (arg._type.firstType.annotation != null && arg._type.firstType.annotation.name == "SQVM") {
             vm_arg = true
-            var inscope expr <- qmacro_expr(${var $i(argName) = _vm_;})
+            var expr = qmacro_expr(${var $i(argName) = _vm_;})
             funcBody |> emplace(expr, 0)
             return <- funcBody
         } else {
@@ -262,9 +275,9 @@ def read_arg(var arg : smart_ptr<ast::Variable>&; vmIdx : int64; argName : strin
         }
     }
 
-    var inscope res : array<ExpressionPtr>
+    var res : array<ExpressionPtr>
     if (nullable_arg && optional_args) {
-        var inscope reader <- qmacro_block <| $() {
+        var reader = qmacro_block <| $() {
             if (!(_::getStackValue(_vm_, $v(vmIdx), _nargs_) <| $($i(argName) : $t(arg._type)) { $b(funcBody); })) {
                 let valueType = sq_gettype(_vm_, $v(vmIdx))
                 sq_throwerror(_vm_, "Unable to read argument '{$v(argName)}'. Expected '{$v(describe(arg._type))}, got {valueType}'")
@@ -273,7 +286,7 @@ def read_arg(var arg : smart_ptr<ast::Variable>&; vmIdx : int64; argName : strin
         }
         res |> emplace(reader)
     } else {
-        var inscope reader <- qmacro_block <| $() {
+        var reader = qmacro_block <| $() {
             if (!(_::getStackValue(_vm_, $v(vmIdx)) <| $($i(argName) : $t(arg._type)) { $b(funcBody); })) {
                 let valueType = sq_gettype(_vm_, $v(vmIdx))
                 sq_throwerror(_vm_, "Unable to read argument '{$v(argName)}'. Expected '{$v(describe(arg._type))}, got {valueType}'")
@@ -359,29 +372,29 @@ class QuirrelBindAnnotation : AstFunctionAnnotation {
         let bindName = nameArg is nothing ? string(fn.name) : nameArg as tString
         let wrapperName = "wrapper_{bindName}"
 
-        var inscope sameWrapper <- fn._module |> find_unique_function(wrapperName)
+        var sameWrapper = fn._module |> find_unique_function(wrapperName)
         if (sameWrapper != null) {
             errors := "multiple functions with same bind name '{bindName}'"
             return false
         }
 
-        var inscope argsList : array<ExpressionPtr>
-        var inscope funcBody : array<ExpressionPtr>
+        var argsList : array<ExpressionPtr>
+        var funcBody : array<ExpressionPtr>
         var inscope argsLog : array<string>
         let INITIAL_IDX_OFFSET = 2l
         var vmIdx = INITIAL_IDX_OFFSET
         for (arg in fn.arguments) {
             let argName = "{arg.name}"
-            argsList |> emplace_new <| qmacro($i(argName))
+            argsList |> push(qmacro($i(argName)))
             argsLog |> push("{argName} : {describe(arg._type)}")
             vmIdx += 1l
         }
 
         let fnName = "::{fn.name}"
         if (voidResult) {
-            funcBody |> emplace_new <| qmacro_expr(${ $c(fnName)($a(argsList)); })
+            funcBody |> push(qmacro_expr(${ $c(fnName)($a(argsList)); }))
         } else {
-            funcBody |> emplace_new <| qmacro_expr(${ _::pushValue(_vm_, $c(fnName)($a(argsList))); })
+            funcBody |> push(qmacro_expr(${ _::pushValue(_vm_, $c(fnName)($a(argsList))); }))
         }
 
         var argIdx = length(fn.arguments) - 1
@@ -394,11 +407,8 @@ class QuirrelBindAnnotation : AstFunctionAnnotation {
                 let argName = "{arg.name}"
                 var nullableArg = false
                 var vmArg = false
-                var inscope newFuncBody <- read_arg(arg, int64(argIdx) + INITIAL_IDX_OFFSET, argName, optionalArgs, errors, funcBody, paramsCheck, nullableArg, vmArg)
-                unsafe {
-                    delete funcBody
-                    funcBody <- newFuncBody
-                }
+                var newFuncBody <- read_arg(arg, int64(argIdx) + INITIAL_IDX_OFFSET, argName, optionalArgs, errors, funcBody, paramsCheck, nullableArg, vmArg)
+                funcBody <- newFuncBody
                 if (!vmArg) {
                     optionalArgs &&= nullableArg
                     optionalArgsNum += optionalArgs ? 1 : 0
@@ -421,17 +431,17 @@ class QuirrelBindAnnotation : AstFunctionAnnotation {
 
         if (length(fn.arguments) > 0) {
             if (optionalArgsNum > 0) {
-                var inscope nArgsExpr <- qmacro_expr(${ var _nargs_ = sq_gettop(_vm_); })
+                var nArgsExpr = qmacro_expr(${ var _nargs_ = sq_gettop(_vm_); })
                 funcBody |> emplace(nArgsExpr, 0)
             }
-            var inscope errorsExpr <- qmacro_expr(${ var _runtime_error_ = false; })
+            var errorsExpr = qmacro_expr(${ var _runtime_error_ = false; })
             funcBody |> emplace(errorsExpr, 0)
-            funcBody |> emplace_new <| qmacro_expr(${ return _runtime_error_ ? -1l : $v(voidResult && !isManualReturn ? 0l : 1l); })
+            funcBody |> push(qmacro_expr(${ return _runtime_error_ ? -1l : $v(voidResult && !isManualReturn ? 0l : 1l); }))
         } else {
-            funcBody |> emplace_new <| qmacro_expr(${ return $v(voidResult && !isManualReturn ? 0l : 1l); })
+            funcBody |> push(qmacro_expr(${ return $v(voidResult && !isManualReturn ? 0l : 1l); }))
         }
 
-        var inscope bindFn <- qmacro_function(wrapperName) <| $ [unused_argument(_vm_)] (var _vm_ : quirrel::SQVM?) : int64 {
+        var bindFn = qmacro_function(wrapperName) <| $ [unused_argument(_vm_)] (var _vm_ : quirrel::SQVM?) : int64 {
             $b(funcBody)
         }
 
@@ -439,10 +449,10 @@ class QuirrelBindAnnotation : AstFunctionAnnotation {
 
         bindFn.flags |= FunctionFlags.exports | FunctionFlags.privateFunction | FunctionFlags.generated
         let moduleName = moduleArg ?as tString ?? "dasbind"
-        let name_val =  ("name", RttiValue( tString="{bindName}") )
-        let module_name_val =  ("module_name", RttiValue( tString=moduleName ) )
-        let params_check_val =  ("params_check", RttiValue( tString="{join(paramsCheck, "")}") )
-        let params_val =  ("params", RttiValue( tInt=optionalArgsNum == 0 ? length(paramsCheck) : -length(paramsCheck)+optionalArgsNum) )
+        let name_val =  (argname="name", argvalue=RttiValue( tString="{bindName}") )
+        let module_name_val =  (argname="module_name", argvalue=RttiValue( tString=moduleName ) )
+        let params_check_val =  (argname="params_check", argvalue=RttiValue( tString="{join(paramsCheck, "")}") )
+        let params_val =  (argname="params", argvalue=RttiValue( tInt=optionalArgsNum == 0 ? length(paramsCheck) : -length(paramsCheck)+optionalArgsNum) )
 
         bindFn |> append_annotation("quirrel_boost", "quirrel_wrapper", [
             name_val,

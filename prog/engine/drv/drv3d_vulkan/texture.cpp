@@ -13,6 +13,7 @@
 #include <osApiWrappers/dag_miscApi.h>
 #include <3d/ddsFormat.h>
 #include <validateUpdateSubRegion.h>
+#include <validation/texture.h>
 #if _TARGET_PC_WIN
 #include <drv/3d/dag_platform_pc.h>
 #endif
@@ -25,6 +26,7 @@
 #include "device_context.h"
 #include "global_lock.h"
 #include "resource_upload_limit.h"
+#include "backend/cmd/resources.h"
 
 #if 0
 #define VERBOSE_DEBUG debug
@@ -68,7 +70,7 @@ void BaseTex::onDeviceReset()
     release();
   }
   readback.reset();
-  bindlessStubSwapQueue.clear();
+  gpuUpload.reset();
 }
 
 void BaseTex::afterDeviceReset()
@@ -92,6 +94,30 @@ void BaseTex::afterDeviceReset()
     initialImageFill(pars.getImageCreateInfo(), nullptr);
   if (image)
     updateTexName();
+}
+
+void BaseTex::tryFinishReadbackWithoutResultWait()
+{
+  if (!readback.isRequested())
+    return;
+
+  if (readback.isCompleted())
+    return;
+
+  G_ASSERTF(stagingBuffer, "vulkan: readback was not completed yet staging buffer (its target) no longer exist! tex %p:%s", this,
+    getName());
+
+  switch (readback.getCompletionDelay(Globals::ctx.getCurrentWorkItemId()))
+  {
+    case 0: Globals::ctx.dispatchCmd<CmdDestroyBuffer>({stagingBuffer}); break;
+    case 1: Globals::ctx.dispatchCmd<CmdDestroyBufferDelayed>({stagingBuffer}); break;
+    default:
+      finishReadback();
+      Globals::ctx.dispatchCmd<CmdDestroyBuffer>({stagingBuffer});
+      break;
+  }
+  stagingBuffer = nullptr;
+  readback.reset();
 }
 
 void BaseTex::finishReadback()
@@ -132,24 +158,24 @@ void BaseTex::copy(Image *dst)
     region.extent.depth = max<uint32_t>(1u, depthSlices >> i);
   }
 
-  Globals::ctx.copyImage(image, dst, regions.data(), pars.levels, 0, 0, pars.levels);
+  copyImage(dst, regions.data(), pars.levels, 0, 0, pars.levels);
 }
 
-void BaseTex::resolve(Image *dst) { Globals::ctx.resolveMultiSampleImage(image, dst); }
+void BaseTex::resolve(Image *dst) { Globals::ctx.dispatchCmd<CmdResolveMultiSampleImage>({image, dst}); }
 
 int BaseTex::updateSubRegionInternal(BaseTexture *srcBaseTex, int src_subres_idx, int src_x, int src_y, int src_z, int src_w,
   int src_h, int src_d, int dest_subres_idx, int dest_x, int dest_y, int dest_z, bool unordered)
 {
   if (isStub())
   {
-    D3D_CONTRACT_ERROR("updateSubRegion() called for tex=<%s> in stub state: stubTexIdx=%d", getTexName(), stubTexIdx);
+    D3D_CONTRACT_ERROR("update_sub_region() called for tex=<%s> in stub state: stubTexIdx=%d", getTexName(), stubTexIdx);
     return 0;
   }
   if (srcBaseTex)
     if (BaseTex *stex = getbasetex(srcBaseTex))
       if (stex->isStub())
       {
-        D3D_CONTRACT_ERROR("updateSubRegion() called with src tex=<%s> in stub state: stubTexIdx=%d", srcBaseTex->getTexName(),
+        D3D_CONTRACT_ERROR("update_sub_region() called with src tex=<%s> in stub state: stubTexIdx=%d", srcBaseTex->getTexName(),
           stex->stubTexIdx);
         return 0;
       }
@@ -161,6 +187,12 @@ int BaseTex::updateSubRegionInternal(BaseTexture *srcBaseTex, int src_subres_idx
   if (!validate_update_sub_region_params(src, src_subres_idx, src_x, src_y, src_z, src_w, src_h, src_d, this, dest_subres_idx, dest_x,
         dest_y, dest_z))
     return 0;
+
+  if (getFormat().getAspektFlags() != src->getFormat().getAspektFlags())
+  {
+    D3D_ERROR("vulkan: can't copy textures with different aspect flags src: %p:%s dst: %p:%s", src, src->getName(), this, getName());
+    return 0;
+  }
 
   VkImageCopy region;
   region.srcSubresource.aspectMask = getFormat().getAspektFlags();
@@ -177,6 +209,18 @@ int BaseTex::updateSubRegionInternal(BaseTexture *srcBaseTex, int src_subres_idx
   region.dstOffset.x = dest_x;
   region.dstOffset.y = dest_y;
   region.dstOffset.z = dest_z;
+
+  if (src->getFormat().isBlockFormat() && getFormat().isBlockFormat())
+  {
+    uint32_t blockX, blockY;
+    getFormat().getBytesPerPixelBlock(&blockX, &blockY);
+    uint32_t mipW = max(pars.w >> region.dstSubresource.mipLevel, 1);
+    uint32_t mipH = max(pars.h >> region.dstSubresource.mipLevel, 1);
+    if (mipW < blockX && src_w > blockX)
+      src_w = mipW;
+    if (mipH < blockY && src_h > blockY)
+      src_h = mipH;
+  }
   region.extent.width = src_w;
   region.extent.height = src_h;
   region.extent.depth = src_d;
@@ -197,8 +241,7 @@ int BaseTex::updateSubRegionInternal(BaseTexture *srcBaseTex, int src_subres_idx
     }
   }
 
-  Globals::ctx.copyImage(src->image, image, &region, 1, src_subres_idx % src->pars.levels, dest_subres_idx % pars.levels, 1,
-    unordered);
+  src->copyImage(image, &region, 1, src_subres_idx % src->pars.levels, dest_subres_idx % pars.levels, 1, unordered);
   return 1;
 }
 
@@ -264,15 +307,14 @@ int BaseTex::update(BaseTexture *src)
 {
   if (isStub())
   {
-    D3D_CONTRACT_ERROR("updateSubRegion() called for tex=<%s> in stub state: stubTexIdx=%d", getTexName(), stubTexIdx);
+    D3D_CONTRACT_ERROR("update() called for tex=<%s> in stub state: stubTexIdx=%d", getTexName(), stubTexIdx);
     return 0;
   }
   if (src)
     if (BaseTex *stex = getbasetex(src))
       if (stex->isStub())
       {
-        D3D_CONTRACT_ERROR("updateSubRegion() called with src tex=<%s> in stub state: stubTexIdx=%d", src->getTexName(),
-          stex->stubTexIdx);
+        D3D_CONTRACT_ERROR("update() called with src tex=<%s> in stub state: stubTexIdx=%d", src->getTexName(), stex->stubTexIdx);
         return 0;
       }
 
@@ -295,20 +337,6 @@ int BaseTex::update(BaseTexture *src)
   return 0;
 }
 
-int BaseTex::updateSubRegion(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h, int src_d,
-  int dest_subres_idx, int dest_x, int dest_y, int dest_z)
-{
-  return BaseTex::updateSubRegionInternal(src, src_subres_idx, src_x, src_y, src_z, src_w, src_h, src_d, dest_subres_idx, dest_x,
-    dest_y, dest_z, false);
-}
-
-int BaseTex::updateSubRegionNoOrder(BaseTexture *src, int src_subres_idx, int src_x, int src_y, int src_z, int src_w, int src_h,
-  int src_d, int dest_subres_idx, int dest_x, int dest_y, int dest_z)
-{
-  return BaseTex::updateSubRegionInternal(src, src_subres_idx, src_x, src_y, src_z, src_w, src_h, src_d, dest_subres_idx, dest_x,
-    dest_y, dest_z, true);
-}
-
 void BaseTex::destroy()
 {
   release();
@@ -325,8 +353,11 @@ bool BaseTex::setReloadCallback(IReloadData *_rld)
 
 int BaseTex::generateMips()
 {
+  if (!(pars.flg & TEXCF_GENERATEMIPS))
+    LOGWARN_ONCE("generateMips called on %s texture without TEXCF_GENERATEMIPS flag", getTexName());
+
   if (pars.levels > 1)
-    Globals::ctx.generateMipmaps(image);
+    Globals::ctx.dispatchCmd<CmdGenerateMipmaps>({image});
   return 1;
 }
 
@@ -346,7 +377,7 @@ void BaseTex::destroyStaging()
 {
   if (stagingBuffer)
   {
-    Globals::ctx.destroyBuffer(stagingBuffer);
+    Globals::ctx.dispatchCmd<CmdDestroyBuffer>({stagingBuffer});
     stagingBuffer = nullptr;
   }
 }
@@ -358,12 +389,12 @@ void BaseTex::release()
   else if (image && image->isManaged())
     TEXQL_ON_RELEASE(this);
 
-  finishReadback();
+  tryFinishReadbackWithoutResultWait();
   destroyStaging();
 
   if (image)
   {
-    Globals::ctx.destroyImage(image);
+    Globals::ctx.dispatchCmd<CmdDestroyImage>({image});
     image = nullptr;
   }
 }
@@ -375,6 +406,7 @@ bool BaseTex::updateTexResFormat(unsigned d3d_format)
   auto *img = image;
   image = nullptr; // reset pointer to stub for getFormat() inside setInitialImageViewState()
   pars.flg = implant_d3dformat(pars.flg, d3d_format);
+  check_texture_srgb_format(pars.flg, getTexName());
   fmt = FormatStore::fromCreateFlags(pars.flg);
   setInitialImageViewState();
   image = img; // reset pointer to stub
@@ -404,7 +436,19 @@ void BaseTex::updateBindlessViewsForStreamedTextures()
     return;
 
   OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
-  Frontend::replay->bindlessTexSwaps.push_back({image, image, getViewInfo()});
+  Frontend::replay->bindlessTexSwaps.push_back({image, image, this, getViewInfo()});
+}
+
+BaseTex *BaseTex::getForBindless()
+{
+  BaseTex *ret = this;
+  usedInBindless = true;
+  if (isStub())
+    ret = getStubTex();
+  else if (!image)
+    allocateTex();
+  G_ASSERT(ret->image);
+  return ret;
 }
 
 void BaseTex::replaceTexResObject(BaseTexture *&other_tex)
@@ -415,30 +459,16 @@ void BaseTex::replaceTexResObject(BaseTexture *&other_tex)
   BaseTex *other = getbasetex(other_tex);
   G_ASSERT_RETURN(other, );
 
+  if (usedInBindless)
+  {
+    D3D_CONTRACT_ASSERTF(Globals::desc.caps.hasBindless, "vulkan: bindless swap somehow reached without bindless available");
+    OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+    BaseTex *bindlessOther = other->getForBindless();
+    Frontend::replay->bindlessTexSwaps.push_back({image, bindlessOther->image, this, bindlessOther->getViewInfo()});
+  }
+
   if (isStub())
-  {
     image = nullptr;
-    if (!other->isStub() && usedInBindless)
-    {
-      // swapping from stub to non stub, consume slot writes that was done while texture was using stub
-      for (uint32_t i : bindlessStubSwapQueue)
-      {
-        Globals::ctx.updateBindlessResource(i, other_tex, true /*stub_swap*/);
-      }
-      bindlessStubSwapQueue.clear();
-    }
-  }
-  else if (image)
-  {
-    // this will create some small overbudget, but we can't move BaseTex to backend
-    // propragate updates to bindless slots to not bother caller with this
-    if (usedInBindless)
-    {
-      D3D_CONTRACT_ASSERTF(Globals::desc.caps.hasBindless, "vulkan: bindless swap somehow reached without bindless available");
-      OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
-      Frontend::replay->bindlessTexSwaps.push_back({image, other->image, other->getViewInfo()});
-    }
-  }
 
   eastl::swap(image, other->image);
   eastl::swap(stagingBuffer, other->stagingBuffer);
@@ -462,6 +492,11 @@ void BaseTex::initialImageFill(const ImageCreateInfo &ici, BaseTex::ImageMem *in
 
   if (flg & TEXCF_RTARGET)
   {
+    if (flg & TEXCF_NO_STATE_TRACKING)
+    {
+      G_ASSERTF((flg & TEXCF_CLEAR_ON_CREATE) == 0, "vulkan: can't track requested internal clear work");
+      return;
+    }
     // init render target to a known state
     VkImageSubresourceRange area;
     area.aspectMask = ici.format.getAspektFlags();
@@ -483,6 +518,7 @@ void BaseTex::initialImageFill(const ImageCreateInfo &ici, BaseTex::ImageMem *in
   }
   else
   {
+    G_ASSERTF((flg & TEXCF_NO_STATE_TRACKING) == 0, "vulkan: can't track requested internal clear/initial fill work");
     const bool tempStage = stagingBuffer == nullptr;
     carray<VkBufferImageCopy, MAX_MIPMAPS> copies;
 
@@ -513,16 +549,16 @@ void BaseTex::initialImageFill(const ImageCreateInfo &ici, BaseTex::ImageMem *in
     else
     {
       if (tempStage)
-        useStagingForSubresource(0, 0);
+        useStagingForSubresource(0, true /*temporary*/);
 
       uint32_t size = stagingBuffer->getBlockSize();
-      if (flg & TEXFMT_ASTC4)
+      uint32_t texFmt = flg & TEXFMT_MASK;
+      if (texFmt == TEXFMT_ASTC4 || texFmt == TEXFMT_ASTC8 || texFmt == TEXFMT_ASTC12)
       {
         // For astc "all zeroes" isn't considered a valid compressed block
-        // so this uint4{ 98371, 0, 0, 0 } (tied to quant method used in shader)
-        // value should be placed instead to be treated like a black color
+        // so a void-extent block should be placed instead to be treated like a transparent black color
 
-        const uint32_t blackBlock[] = {98371, 0, 0, 0};
+        const uint32_t blackBlock[] = {0xFFFFFDFC, 0xFFFFFFFF, 0, 0};
         const int blockedSize = size / (sizeof(blackBlock));
         uint32_t *dst = (uint32_t *)stagingBuffer->ptrOffsetLoc(0);
         for (int i = 0; i < blockedSize; i++, dst += 4)
@@ -556,6 +592,8 @@ bool BaseTex::allocateImageInternal(BaseTex::ImageMem *initial_data)
 
   if (image)
   {
+    if (pars.flg & TEXCF_NO_STATE_TRACKING)
+      image->disableSyncTracking();
     if (pars.isStagingPermanent())
       useStagingForWholeTexture();
   }
@@ -691,7 +729,7 @@ int BaseTex::unlock()
   }
   else
   {
-    if (lockFlags & TEXLOCK_WRITE)
+    if (lockFlags & TEXLOCK_WRITE && !unlockImageUploadSkipped)
       gpuUpload.request(Globals::ctx.getCurrentWorkItemId());
   }
 
@@ -755,8 +793,8 @@ int BaseTex::lock(void **p, int &row_stride, int *slice_stride, int mip, int sli
         if (!gpuUpload.isRequestedThisFrame(Globals::ctx.getCurrentWorkItemId()) || lockFlags & TEXLOCK_DISCARD)
         {
           BufferRef stgRef(stagingBuffer);
-          stagingBuffer =
-            Globals::ctx.discardBuffer(stgRef, DeviceMemoryClass::HOST_RESIDENT_HOST_READ_WRITE_BUFFER, FormatStore(0), 0, 0).buffer;
+          stgRef = stgRef.discard(DeviceMemoryClass::HOST_RESIDENT_HOST_READ_WRITE_BUFFER, FormatStore(0), 0, 0);
+          stagingBuffer = stgRef.buffer;
         }
       }
       else
@@ -824,6 +862,13 @@ int BaseTex::lock(void **p, int &row_stride, int *slice_stride, int mip, int sli
   return 1;
 }
 
+void BaseTex::useExternalResource(Image *resource)
+{
+  image = resource;
+  if (pars.flg & TEXCF_NO_STATE_TRACKING)
+    image->disableSyncTracking();
+}
+
 Texture *BaseTex::wrapVKImage(VkImage tex_res, ResourceBarrier current_state, int width, int height, int layers, int mips,
   const char *name, int flg)
 {
@@ -864,6 +909,8 @@ Texture *BaseTex::wrapVKImage(VkImage tex_res, ResourceBarrier current_state, in
 
   WinAutoLock lk(Globals::Mem::mutex);
   tex->image = Globals::Mem::res.alloc<Image>({ici, Image::MEM_NOT_EVICTABLE, dagorFormat, currentVkLayout}, false);
+  if (flg & TEXCF_NO_STATE_TRACKING)
+    tex->image->disableSyncTracking();
   tex->image->setDerivedHandle(VulkanHandle(tex_res));
 
   return tex;
@@ -951,5 +998,27 @@ uint8_t *BaseTex::allocSysCopyForDDSX(ddsx::Header &hdr, int quality_id)
 }
 
 #endif
+
+void BaseTex::copyImage(Image *dst, const VkImageCopy *regions, uint32_t region_count, uint32_t src_mip, uint32_t dst_mip,
+  uint32_t mip_count, bool unordered)
+{
+  CmdCopyImage cmd;
+  cmd.src = image;
+  cmd.dst = dst;
+  cmd.regionCount = region_count;
+  cmd.srcMip = src_mip;
+  cmd.dstMip = dst_mip;
+  cmd.mipCount = mip_count;
+
+  OSSpinlockScopedLock frontLock(Globals::ctx.getFrontLock());
+  cmd.regionIndex = Frontend::replay->imageCopyInfos.size();
+  Frontend::replay->imageCopyInfos.insert(Frontend::replay->imageCopyInfos.end(), regions, regions + region_count);
+
+  // allow image copy reorder if we do them outside of render thread or with unordered flag
+  if (Globals::lock.isAcquired() && !unordered)
+    Globals::ctx.dispatchCmdNoLock(cmd);
+  else
+    Frontend::replay->unorderedImageCopies.push_back(cmd);
+}
 
 } // namespace drv3d_vulkan

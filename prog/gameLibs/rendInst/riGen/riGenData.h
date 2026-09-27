@@ -3,10 +3,12 @@
 
 #include <rendInst/rendInstConsts.h>
 #include <rendInst/rendInstGen.h>
+#include <rendInst/rendInstProps.h>
 #include <rendInst/rendInstDebris.h>
 #include <rendInst/rendInstGenDamageInfo.h>
 #include <rendInst/visibility.h>
 #include <rendInst/renderPass.h>
+#include <rendInst/riexHandle.h>
 
 #include <generic/dag_patchTab.h>
 #include <generic/dag_smallTab.h>
@@ -19,6 +21,7 @@
 #include <util/dag_roHugeHierBitMap2d.h>
 #include <util/dag_stdint.h>
 #include <util/dag_fastIntList.h>
+#include <util/dag_oaHashNameMap.h>
 #include <util/dag_simpleString.h>
 #include <3d/dag_texIdSet.h>
 #include <vecmath/dag_vecMathDecl.h>
@@ -32,7 +35,18 @@
 // use additional data as hashVal only when in Tools (De3X, AV2)
 #define RIGEN_PERINST_ADD_DATA_FOR_TOOLS _TARGET_PC_TOOLS_BUILD
 
-#define RI_VERBOSE_OUTPUT (DAGOR_DBGLEVEL > 0)
+#ifndef FORCE_RI_VERBOSE_OUTPUT
+#define FORCE_RI_VERBOSE_OUTPUT (_TARGET_PC && !DAGOR_HOSTED_INTERNAL_SERVER)
+#endif
+
+#define RI_VERBOSE_OUTPUT ((DAGOR_DBGLEVEL > 0) && FORCE_RI_VERBOSE_OUTPUT)
+
+#if RI_VERBOSE_OUTPUT
+namespace rendinst
+{
+bool is_ri_verbose_dump_expected();
+} // namespace rendinst
+#endif
 
 class IGenLoad;
 class Point4;
@@ -42,7 +56,15 @@ class CollisionResource;
 class DynamicPhysObjectData;
 struct Frustum;
 struct RiGenVisibility;
+namespace rendinst
+{
+struct PrepareRiGenVisibilityParams;
+}
 typedef void *file_ptr_t;
+namespace rendinst::gen
+{
+struct RiGenCellCtx;
+}
 namespace rendinst::gen::land
 {
 class AssetData;
@@ -102,101 +124,16 @@ struct RendInstGenData
     bool needsUpdate;
   };
 
+  struct DebrisPool
+  {
+    const rendinst::props::DebrisProps *props = nullptr;
+    int resIdx = -1;
+  };
+
   struct CollisionResData
   {
     CollisionResource *collRes;
     void *handle;
-  };
-
-  struct DebrisProps
-  {
-    mat44f debrisTm;
-    Tab<short> debrisPoolIdx;
-    int delayedPoolIdx;
-    int fxType;
-    float fxScale;
-    float damageDelay;
-    float submersion;
-    float inclination;
-    float impulseOnExplosion;
-    SimpleString fxTemplate;
-    DebrisProps() : delayedPoolIdx(-1), fxType(-1), fxScale(1.f) {} //-V730
-    bool needsUpdate() const { return submersion > 0.f || inclination > 0.f; }
-  };
-  struct DebrisPool
-  {
-    const DebrisProps *props = nullptr;
-    int resIdx = -1;
-  };
-
-  struct DestrProps
-  {
-    DynamicPhysObjectData *res = nullptr; // Exists only on clients for now
-    float destructionImpulse = 0.f;
-    float collisionHeightScale = 1.0f;
-    bool destructable = false;
-    bool apexDestructible = false;
-    SimpleString apexDestructionOptionsPresetName;
-    bool isParent = false;
-    bool destructibleByParent = false;
-    int destroyNeighbourDepth = 1;
-    SimpleString tag;
-    SimpleString destroyedByTag;
-    SimpleString destrName;
-    int destrFxId = -1;
-    SimpleString destrFxName;
-    SimpleString destrFxTemplate;
-
-    DestrProps() = default;
-    DestrProps(const DestrProps &p) : DestrProps() { operator=(p); }
-    DestrProps(DestrProps &&p) : DestrProps() { operator=(eastl::move(p)); }
-    DestrProps &operator=(const DestrProps &p);
-    DestrProps &operator=(DestrProps &&p)
-    {
-      eastl::swap(res, p.res);
-      eastl::swap(destructionImpulse, p.destructionImpulse);
-      eastl::swap(collisionHeightScale, p.collisionHeightScale);
-      destructable = p.destructable;
-      apexDestructible = p.apexDestructible;
-      eastl::swap(apexDestructionOptionsPresetName, p.apexDestructionOptionsPresetName);
-      isParent = p.isParent;
-      destructibleByParent = p.destructibleByParent;
-      destroyNeighbourDepth = p.destroyNeighbourDepth;
-      eastl::swap(tag, p.tag);
-      eastl::swap(destroyedByTag, p.destroyedByTag);
-      eastl::swap(destrName, p.destrName);
-      eastl::swap(destrFxId, p.destrFxId);
-      eastl::swap(destrFxName, p.destrFxName);
-      eastl::swap(destrFxTemplate, p.destrFxTemplate);
-      return *this;
-    }
-    ~DestrProps();
-  };
-
-  enum class CanopyShape : uint8_t
-  {
-    BOX,
-    CONE,
-    SPHEROID
-  };
-
-  struct RendinstProperties
-  {
-    int matId;
-    bool immortal;
-    bool damageable;
-    bool stopsBullets;
-    bool bushBehaviour;
-    bool treeBehaviour;
-    CanopyShape canopyShape;
-    float canopyTopOffset;
-    float canopyTopPart;
-    float canopyWidthPart;
-    float canopyOpacity;
-    float trunkRadius;
-    float soundOcclusion;
-    rendinstdestr::BranchDestr treeBranchDestrFromDamage;
-    rendinstdestr::BranchDestr treeBranchDestrOther;
   };
 
   struct ElemMask
@@ -218,17 +155,21 @@ struct RendInstGenData
     eastl::bitvector<> riPaletteRotation;
     eastl::bitvector<> riZeroInstSeeds;
     Tab<const char *> riResName;
+    // pool index by riResName; -1 once substituted into riExtra, so repeated subst passes take a pool once
+    FastNameMap riResNameIds;
+    Tab<int> riResIdxByNameId;
     SmallTab<ElemMask, MidmemAlloc> riResElemMask; // bit-per-elem mask for rendinst::MAX_LOD_COUNT lod of each riRes
     SmallTab<bbox3f, MidmemAlloc> riResBb;
     SmallTab<bbox3f, MidmemAlloc> riCollResBb;
     SmallTab<rendinst::render::RtPoolData *, MidmemAlloc> rtPoolData;
-    Tab<RendinstProperties> riProperties;
+    Tab<rendinst::props::RendinstProperties> riProperties;
     SmallTab<uint8_t, MidmemAlloc> riResHideMask;
-    Tab<DebrisProps> riDebrisMap;
+    Tab<rendinst::props::DebrisProps> riDebrisMap;
     Tab<DebrisPool> riDebris;
+    Tab<int> riCustomPropsId;
     Tab<eastl::unique_ptr<rendinst::DestroyedRi>> riDebrisDelayedRi; // TODO: remove indirection (put by value)
-    Tab<DestrProps> riDestr;
-    Tab<rendinst::DestroyedCellData> riDestrCellData;
+    Tab<rendinst::props::DestrProps> riDestr;
+    Tab<rendinst::DestroyedCellData> riDestrCellData DAG_TS_GUARDED_BY(riRwCs);
     Tab<uint16_t> riExtraIdxPair;
     carray<int, 2> maxDebris, curDebris;
     uint32_t dynamicImpostorToUpdateNo;
@@ -242,8 +183,8 @@ struct RendInstGenData
     IBBox2 loadedCellsBBox;
     Point2 lastPoi;
     float lastPreloadDistance = 0.f;
-    SmartReadWriteFifoLock riRwCs;
-    WinCritSec updateVbResetCS; // TODO: ensure that `cellsVb` mutation is done in main thread only and remove this
+    SmartReadWriteFifoLock riRwCs; // TODO: add more DAG_TS_GUARDED_BY
+    WinCritSec updateVbResetCS;    // TODO: ensure that `cellsVb` mutation is done in main thread only and remove this
     float rendinstFarPlane;
     float rendinstMaxLod0Dist;
     float rendinstMaxDestructibleSizeSum;
@@ -255,6 +196,8 @@ struct RendInstGenData
     Tab<uint16_t> predicateIndices;
     vec4f occlusionBoxHalfSize;
     bbox3f maxCellBbox;
+    float maxCellMargin DAG_TS_GUARDED_BY(riRwCs) = 0.f;
+    float maxSubcellMargin DAG_TS_GUARDED_BY(riRwCs) = 0.f;
     enum class GlobalShadowPhase
     {
       // Render impostor into small texture
@@ -283,6 +226,7 @@ struct RendInstGenData
 #endif
     SmallTab<PregenEntCounter, MidmemAlloc> entCntForOldFmt;
     void *entCntOldPtr = nullptr;
+    SimpleString levelBinName;
 
   public:
     RtData(int layer_idx);
@@ -316,10 +260,10 @@ struct RendInstGenData
   private:
     bool haveNextPoolForShadowImpostors();
     bool shouldRenderGlobalShadows();
-    GlobalShadowRet renderGlobalShadow(GlobalShadowTask &task, const Point3 &sun_dir_0, bool force_update, bool use_compression);
+    GlobalShadowRet renderGlobalShadow(GlobalShadowTask &task, const Point3 &sun_dir_0, bool force_update);
 
   public:
-    GlobalShadowRet renderRendinstGlobalShadowsToTextures(const Point3 &sun_dir_0, bool force_update, bool use_compression);
+    GlobalShadowRet renderRendinstGlobalShadowsToTextures(const Point3 &sun_dir_0, bool force_update);
     bool renderRendinstClipmapShadowsToTextures(const Point3 &sunDir0, bool for_sli, bool force_update);
 
     void initImpostors();
@@ -331,7 +275,7 @@ struct RendInstGenData
 
     void initDebris(const DataBlock &ri_blk, int (*get_fx_type_by_name)(const char *name));
     void addDebris(mat44f &tm, int pool_idx, unsigned frameNo, const Point3 &axis, float accumulatedPower = 0.0f);
-    rendinst::DestroyedRi *addExternalDebris(mat44f &tm, int pool_idx);
+    rendinst::DestroyedRi *addExternalDebris(mat44f &tm, int pool_idx, uint32_t palette_id);
     void addDebrisForRiExtraRange(const DataBlock &ri_blk, uint32_t res_idx, uint32_t count);
     void updateDelayedDebrisRi(float dt, bbox3f *movedDebrisBbox);
     void updateDebris(float dt, bbox3f *movedDebrisBbox)
@@ -340,8 +284,6 @@ struct RendInstGenData
         updateDelayedDebrisRi(dt, movedDebrisBbox);
     }
 
-    void initRiSoundOccluders(const dag::ConstSpan<eastl::pair<const char *, const char *>> &ri_name_to_occluder_type,
-      const dag::ConstSpan<eastl::pair<const char *, float>> &occluders);
     bool debugGetSoundOcclusion(const char *ri_name, float &value);
 
     int riResFirstLod(int ri_idx) const { return riRes[ri_idx]->getQlMinAllowedLod(); }
@@ -402,17 +344,78 @@ struct RendInstGenData
     eastl::unique_ptr<uint8_t[]> sysMemData;
   };
 
+  // actual non-empty pools range for a cell is usually very small, so use this helper
+  // structure to only store this small span of empty pools, while allowing to index everything else
+  struct CellPoolsVec
+  {
+    CellPoolsVec() = default;
+    CellPoolsVec(CellPoolsVec &&) = default;
+    CellPoolsVec &operator=(CellPoolsVec &&) = default;
+
+    const EntPool &operator[](uint32_t idx) const
+    {
+#ifdef _DEBUG_TAB_
+      G_ASSERTF(idx < size(), "CellPoolsVec[]: n=%i size=%i", idx, fullSize);
+#endif
+      idx -= offset;
+      static const EntPool EMPTY = {}; //-V1096
+      return idx < data.size() ? data[idx] : EMPTY;
+    }
+
+    dag::Vector<EntPool> &getNonSealedVec()
+    {
+      G_ASSERT(!isSealed());
+      return data;
+    }
+    bool isSealed() const { return fullSize != 0; }
+    void setDataSpanAndSeal(uint32_t begin, uint32_t end)
+    {
+      G_ASSERT_RETURN(!isSealed(), );
+      G_ASSERT_RETURN(data.size() <= 0xFFFFu, );
+      G_ASSERT_RETURN(begin <= end && end <= data.size(), );
+      fullSize = uint16_t(data.size());
+      if (fullSize == 0)
+        return;
+      offset = uint16_t(begin);
+      decltype(data) sealData(data.begin() + begin, data.begin() + end);
+      data.swap(sealData);
+    }
+    void unseal()
+    {
+      if (!isSealed())
+        return;
+      const uint32_t dataSize = data.size();
+      data.resize(fullSize);
+      memmove(data.data() + offset, data.data(), sizeof(EntPool) * dataSize);
+      memset(data.data(), 0, offset * sizeof(EntPool));
+      memset(data.data() + offset + dataSize, 0, (data.size() - offset - dataSize) * sizeof(EntPool));
+      fullSize = offset = 0;
+    }
+    uint32_t size() const { return eastl::max(fullSize, uint16_t(data.size())); }
+
+  private:
+    dag::Vector<EntPool> data;
+    uint16_t offset = 0;
+    uint16_t fullSize = 0;
+  };
+
   struct CellRtData : CellRtDataLoaded
   {
+    int vbSize = 0;
+    uint32_t heapGen = ~0u;
     vec4f cellOrigin;
-    SmallTab<EntPool, MidmemAlloc> pools;
     bbox3f pregenRiExtraBbox;
     RtData *rtData = nullptr; // parent
     PregenEntRtAdd *pregenAdd = nullptr;
+    dag::Span<rendinst::riex_handle_t> riexHandles = {nullptr, 0};
+    CellPoolsVec pools;
     LinearHeapAllocatorSbuffer::RegionId cellVbId;
     float cellHeight = 0.f;
-    int vbSize = 0;
-    uint32_t heapGen = ~0u;
+    static constexpr uint32_t BYTES_PER_UNIQUE_ID = sizeof(int16_t);
+    static constexpr uint64_t UNIQUE_ID_INVALID = 0;
+    uint64_t uniqueIdBase = 0;
+    uint64_t getUniqueId(uint32_t sysMemDataOfs) const { return uniqueIdBase + sysMemDataOfs / BYTES_PER_UNIQUE_ID; }
+    uint32_t uniqueIdCount() const { return uint32_t(vbSize) / BYTES_PER_UNIQUE_ID; }
     enum
     {
       LOADED = 1,
@@ -424,15 +427,15 @@ struct RendInstGenData
     uint32_t cellStateFlags = LOADED;
     bool burned = false;
 
-    CellRtData(int ri_cnt, RtData *parent) : rtData(parent) //-V730
+    CellRtData(int pool_cnt, RtData *parent) : rtData(parent) //-V730
     {
-      clear_and_resize(pools, ri_cnt);
-      mem_set_0(pools);
+      pools.getNonSealedVec().resize(pool_cnt);
+      mem_set_0(pools.getNonSealedVec());
       v_bbox3_init_empty(pregenRiExtraBbox);
     }
     ~CellRtData()
     {
-      clear();
+      clearAllWithRiEx();
       del_it(pregenAdd);
       rtData = nullptr;
     }
@@ -452,7 +455,13 @@ struct RendInstGenData
     bool isDataUploaded() const { return interlocked_acquire_load(dataUploaded); }
     void setDataUploadFlag(bool value) { interlocked_release_store(dataUploaded, value); }
 
+    static void clearRiEx(dag::Span<rendinst::riex_handle_t> &h, unsigned max_time_quant_usec = 5000);
     void clear();
+    void clearAllWithRiEx()
+    {
+      clear();
+      clearRiEx(riexHandles);
+    }
     void allocate(int idx);
     void update(int size, RendInstGenData &rgd); // in bytes
     void applyBurnDecal(const bbox3f &decal_bbox);
@@ -476,7 +485,7 @@ struct RendInstGenData
       int msq;
     };
     PatchableTab<LandClassCoverage> cls;
-    PATCHABLE_DATA64(CellRtData *, rtData);
+    PATCHABLE_DATA64(CellRtData *, cellRtData);
     int16_t htMin, htDelta;
 
     // fixed (non-generated) RI data
@@ -485,7 +494,7 @@ struct RendInstGenData
 
     CellRtData *isReady()
     {
-      if (CellRtData *crt = interlocked_acquire_load_ptr(rtData))
+      if (CellRtData *crt = interlocked_acquire_load_ptr(cellRtData))
         if (crt->sysMemData)
           return crt;
       return nullptr;
@@ -493,8 +502,8 @@ struct RendInstGenData
     const CellRtData *isReady() const { return const_cast<Cell *>(this)->isReady(); }
     bool isLoaded() const
     {
-      if (const CellRtData *crt = interlocked_acquire_load_ptr((const CellRtData *const volatile &)rtData))
-        return crt->sysMemData || crt->vbSize <= 0;
+      if (const CellRtData *crt = interlocked_acquire_load_ptr((const CellRtData *const volatile &)cellRtData))
+        return crt->sysMemData || crt->riexHandles.data() || (crt->vbSize <= 0 && !crt->riexHandles.size());
       return false;
     }
     bool hasFarVisiblePregenInstances(const RendInstGenData *rgl, float thres_dist, dag::Span<float> riMaxDist) const;
@@ -543,9 +552,7 @@ public:
   void updateOnlyVb(RendInstGenData::CellRtData &crt);
   void onDeviceReset();
   template <bool use_external_filter = false>
-  bool prepareVisibility(const Frustum &frustum, const Point3 &vpos, RiGenVisibility &visibility, bool forShadow,
-    rendinst::LayerFlags layer_flags, Occlusion *use_occlusion, bool for_visual_collision = false,
-    const rendinst::VisibilityExternalFilter &external_filter = {});
+  bool prepareVisibility(RiGenVisibility &visibility, const Frustum &frustum, const rendinst::PrepareRiGenVisibilityParams &params);
   void filterRIGenVisibilityById(const RiGenVisibility &visibility, RiGenVisibility &filteredVis,
     const rendinst::VisibilityExternalIdFilter &id_filter);
   void sortRIGenVisibility(RiGenVisibility &visibility, const Point3 &viewPos, const Point3 &viewDir, float vertivalFov,
@@ -561,8 +568,8 @@ public:
   void applyBurnDecal(const bbox3f &decal)
   {
     for (auto &c : cells)
-      if (c.rtData)
-        c.rtData->applyBurnDecal(decal);
+      if (c.cellRtData)
+        c.cellRtData->applyBurnDecal(decal);
   }
 
   static RendInstGenData *create(IGenLoad &crd, int layer_idx);
@@ -577,24 +584,32 @@ public:
   static bool isLoading;
 
   static void (*riGenPrepareAddPregenCB)(CellRtData &crt, int layer_idx, int per_inst_data_dwords, float ox, float oy, float oz,
-    float cell_xz_sz, float cell_y_sz);
+    float cell_xz_sz, float cell_y_sz, bbox3f &cell_bbox);
   static CellRtData *(*riGenValidateGeneratedCell)(RendInstGenData *rgl, CellRtData *crt, int idx, int cx, int cz);
 
-  void renderRendinstShadowsToClipmap(const BBox2 &region, int cascadeNo);
+  bool tryRenderRendinstShadowsToClipmap(const BBox2 &region, int cascadeNo, int max_draws, int &draw_count);
   bool notRenderedClipmapShadowsBBox(BBox2 &box, int cascadeNo);
   bool notRenderedStaticShadowsBBox(BBox3 &box);
+  bool notRenderedStaticShadowsBBoxes(Tab<BBox3> &boxes);
   void setClipmapShadowsRendered(int cacscadeNo);
   bool updateLClassColors(const char *name, E3DCOLOR from, E3DCOLOR to); // for tuning
   void clearDelayedRi();
   void updateHeapVbNoLock();
 
+  void generateRiExFromPregenData(rendinst::gen::RiGenCellCtx &ctx, int riex_idx, RendInstGenData::CellRtData &crt, vec3f v_cell_add,
+    vec3f v_cell_mul, //
+    uint8_t *ptr, unsigned cnt, unsigned stride, bool zeroInstSeeds, const rendinst::DestroyedCellData &extraDestrData, bool store);
+  void processRiGenFromPregenData(rendinst::gen::RiGenCellCtx &ctx, int ri_idx, EntPool &pool, vec3f v_cell_add, vec3f v_cell_mul,
+    uint8_t *ptr, unsigned cnt, int stride, dag::ConstSpan<uint8_t> buf_tm32, dag::ConstSpan<uint8_t> buf_w16, uint8_t *vbPtr,
+    bool from_RIGz);
+
   static RendInstGenData *getGenDataByLayer(const rendinst::RendInstDesc &desc);
 };
-DAG_DECLARE_RELOCATABLE(RendInstGenData::DestrProps);
 
 namespace rendinst
 {
 inline constexpr int MAX_PREGEN_RI = 16384; // no more than 65536 due to riex_handle_t limitations
+inline constexpr int MAX_RG_LAYERS = 16;
 
 struct RiGenDataAttr
 {
@@ -604,9 +619,9 @@ struct RiGenDataAttr
   bool needNetSync, render, depthShadows, clipmapShadows;
 };
 
-extern StaticTab<RendInstGenData *, 16> rgLayer; //< all riGen layers (primary & secondary), upto 16
-extern StaticTab<RiGenDataAttr, 16> rgAttr;      //< riGen layer attributes (parallel to rgLayer)
-extern unsigned rgPrimaryLayers;                 //< number of primary layers (primary layers go first in rgLayer)
+extern StaticTab<RendInstGenData *, MAX_RG_LAYERS> rgLayer; //< all riGen layers (primary & secondary), upto 16
+extern StaticTab<RiGenDataAttr, MAX_RG_LAYERS> rgAttr;      //< riGen layer attributes (parallel to rgLayer)
+extern unsigned rgPrimaryLayers;                            //< number of primary layers (primary layers go first in rgLayer)
 extern unsigned rgRenderMaskO; //< bitmask (for indices of rgLayer) used for render (opaque, depth shadows, clipmap shadows, ...)
 extern unsigned rgRenderMaskDS;
 extern unsigned rgRenderMaskCMS;
@@ -659,6 +674,8 @@ extern DataBlock ri_lod_ranges_ovr;
 int get_skip_nearest_lods(const char *name, bool has_impostors, int total_lods);
 bool is_ri_extra_for_inst_count_only(const char *name);
 int getPersistentPackType(RenderableInstanceLodsResource *res, int def);
+// getPersistentPackType for a whole set, resolving in the same layer order and to the same first match
+void getPersistentPackTypes(dag::ConstSpan<RenderableInstanceLodsResource *> res, int def, dag::Span<uint8_t> out_types);
 uint8_t getResHideMask(const char *res_name, const BBox3 *lbox);
 inline bool isResHidden(uint8_t hide_mask) { return ri_game_render_mode < 0 ? false : (hide_mask >> ri_game_render_mode) & 1; }
 
@@ -686,11 +703,11 @@ void term_stub_res();
 inline bool is_rendinst_marked_collision_ignored(const int16_t *data, int per_inst_data, int stride)
 {
   if (per_inst_data)
-    return data[stride] == 0xBAD;
+    return data[stride] == RI_SEED_COLLISION_IGNORE;
   return false;
 }
 
-inline bool getRIGenCanopyBBox(const RendInstGenData::RendinstProperties &prop, const BBox3 &ri_world_bbox, BBox3 &out_canopy_bbox)
+inline bool getRIGenCanopyBBox(const props::RendinstProperties &prop, const BBox3 &ri_world_bbox, BBox3 &out_canopy_bbox)
 {
   float canopyWidth = prop.canopyWidthPart * (ri_world_bbox[1].y - ri_world_bbox[0].y) * 0.5f;
   float boxHeight = ri_world_bbox[1].y - ri_world_bbox[0].y;

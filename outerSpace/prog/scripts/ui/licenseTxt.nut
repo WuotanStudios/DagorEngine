@@ -1,12 +1,11 @@
 from "%darg/ui_imports.nut" import *
 from "%scripts/ui/widgets/simpleComponents.nut" import normalCursor, menuBtn
 from "dagor.fs" import read_text_from_file_on_disk
-
-let { makeVertScroll } = require("%scripts/ui/widgets/scrollbar.nut")
-let { hardPersistWatched } = require("%sqstd/globalState.nut")
-let { isDisableMenu } = require("%scripts/ui/app_state.nut")
-let { dgs_get_settings} = require("dagor.system")
-let { set_setting_by_blk_path_and_save } = require("settings")
+from "%scripts/ui/widgets/scrollbar.nut" import makeVertScroll
+from "%sqstd/globalState.nut" import hardPersistWatched
+from "%scripts/ui/app_state.nut" import isDisableMenu
+from "dagor.system" import dgs_get_settings
+from "settings" import set_setting_by_blk_path_and_save
 
 let rstTagsFormat = {
   h1 = {
@@ -25,7 +24,7 @@ function checkRstFmt(line) { //-disable:-return-different-types
   }
   return false
 }
-let tagsTable = {
+const tagsTable = {
   h1 = { fontSize = hdpx(30) }
   h2 = { fontSize = hdpx(30) }
 }
@@ -82,7 +81,7 @@ function licenseUi() {
     children = [
       @() {rendObj = ROBJ_TEXT text = licenseTxtFname fontSize = hdpx(30) color = Color(220,200, 150) hplace = ALIGN_LEFT}
       {
-        size = static [sw(60), flex()]
+        size = const [sw(60), flex()]
         children = makeVertScroll({
           size=FLEX_H
           rendObj = ROBJ_SOLID
@@ -97,7 +96,7 @@ function licenseUi() {
            preformatted = FMT_KEEP_SPACES
         }})
       }
-      menuBtn("Accept", acceptLicense)
+      menuBtn("Accept", acceptLicense, {hotkeys=[["Enter"]]})
     ]
   }
 }

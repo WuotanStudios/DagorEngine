@@ -5,7 +5,7 @@
 #include <propPanel/constants.h>
 #include <propPanel/imguiHelper.h>
 #include <propPanel/immediateFocusLossHandler.h>
-#include "spinEditStandalone.h"
+#include <propPanel/control/spinEditStandalone.h>
 #include "../scopedImguiBeginDisabled.h"
 
 namespace PropPanel
@@ -17,7 +17,9 @@ public:
   TrackBarIntPropertyControl(ControlEventHandler *event_handler, ContainerPropertyControl *parent, int id, int x, int y, hdpi::Px w,
     const char caption[], int min, int max, int step) :
     PropertyControlBase(id, event_handler, parent, x, y, w, hdpi::Px(0)), controlCaption(caption), spinEdit(min, max, step, 0)
-  {}
+  {
+    spinEdit.setIntegerValues(true);
+  }
 
   ~TrackBarIntPropertyControl() override
   {
@@ -59,11 +61,13 @@ public:
 
   void setEnabled(bool enabled) override { controlEnabled = enabled; }
 
+  const char *getImguiTypeName() const override { return "TrackInt"; }
+
   void updateImgui() override
   {
     ScopedImguiBeginDisabled scopedDisabled(!controlEnabled);
 
-    ImguiHelper::separateLineLabel(controlCaption);
+    separateLineLabelWithTooltip(controlCaption.begin(), controlCaption.end());
 
     const float remainingWidthAfterTheLabel = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemInnerSpacing.x;
     const float spinEditWidth = ImguiHelper::getDefaultRightSideEditWidth();
@@ -72,12 +76,17 @@ public:
     {
       ImGui::SetNextItemWidth(sliderWidth);
 
-      int value = spinEdit.getValue();
+      const char *label = "##s";
+      ImguiHelper::deactivateItemIfActiveAndDisabled(label);
+
       pushTrackBarColorOverrides();
+      int value = spinEdit.getValue();
       const bool changed =
-        ImGui::SliderInt("##s", &value, spinEdit.getMinValue(), spinEdit.getMaxValue(), "", ImGuiSliderFlags_NoInput);
+        ImGui::SliderInt(label, &value, spinEdit.getMinValue(), spinEdit.getMaxValue(), "", ImGuiSliderFlags_NoInput);
+      const bool sliderDeactivatedAfterEdit = ImGui::IsItemDeactivatedAfterEdit();
       popTrackBarColorOverrides();
 
+      setImguiTestItemInfo();
       setPreviousImguiControlTooltip();
 
       if (changed)
@@ -88,6 +97,9 @@ public:
         onWcChange(nullptr);
       }
 
+      if (sliderDeactivatedAfterEdit)
+        onWcChangeFinished(nullptr);
+
       ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
       ImGui::SetNextItemWidth(spinEditWidth);
     }
@@ -97,7 +109,7 @@ public:
     }
 
     setFocusToNextImGuiControlIfRequested();
-    spinEdit.updateImgui(*this, &controlTooltip, this);
+    spinEdit.updateImgui(*this, &controlTooltip, this, this, "value");
 
     if (spinEdit.isTextInputFocused())
       set_focused_immediate_focus_loss_handler(this);
@@ -106,7 +118,7 @@ public:
   }
 
 private:
-  void onImmediateFocusLoss() override { spinEdit.sendWcChangeIfVarChanged(*this); }
+  void onImmediateFocusLoss() override { spinEdit.sendWcChangeAndFinishIfVarChanged(*this); }
 
   String controlCaption;
   bool controlEnabled = true;

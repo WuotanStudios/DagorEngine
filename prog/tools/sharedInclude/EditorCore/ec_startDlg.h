@@ -29,6 +29,11 @@ public:
   const String &getStartWorkspace() const { return startWsp; }
   int getWorkspaceIndex(const char *name) const;
 
+  // Returns the result of the last workspace load attempt.
+  // The return value is false when the load failed (for example because the workspace's application.blk cannot be read)
+  // and it is also false before any attempt.
+  bool isSelectedWorkspaceValid() const { return selectedWorkspaceValid; }
+
   // DialogWindow interface
 
   bool onOk() override;
@@ -39,8 +44,8 @@ public:
   void onChange(int pcb_id, PropPanel::ContainerPropertyControl *panel) override;
   void onClick(int pcb_id, PropPanel::ContainerPropertyControl *panel) override;
 
-  virtual void onCustomFillPanel(PropPanel::ContainerPropertyControl &panel) {}
-  virtual bool onCustomSettings(PropPanel::ContainerPropertyControl &panel) { return true; }
+  virtual void onCustomFillPanel(PropPanel::ContainerPropertyControl &) {}
+  virtual bool onCustomSettings(PropPanel::ContainerPropertyControl &) { return true; }
 
 protected:
   EditorWorkspace &wsp;
@@ -51,7 +56,7 @@ protected:
   // IDelayedCallbackHandler
   void onImguiDelayedCallback(void *user_data) override;
 
-  void updateImguiDialog() override;
+  void updateImguiDialog(const PropPanel::DialogWindow::DialogFrameSizing &sizing) override;
 
   virtual void createCustom() {}
 

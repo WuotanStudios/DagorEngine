@@ -5,35 +5,49 @@
 #include <grid/gridImpl.h>
 #include <ADT/linearGrid.h>
 
-DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_pos(const RiGrid &grid_holder, bbox3f bbox, const RiGridObjPred &pred)
+DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_pos(const RiGrid &grid_holder, const bbox3f &bbox, const RiGridObjPred &pred)
 {
   return grid_find_in_box_by_pos_impl<RiGridObject>(grid_holder, bbox, pred);
 }
 
-DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding(const RiGrid &grid_holder, bbox3f bbox, const RiGridObjPred &pred)
+DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding(const RiGrid &grid_holder, const bbox3f &bbox, const RiGridObjPred &pred)
 {
   return grid_find_in_box_by_bounding_impl<RiGridObject>(grid_holder, bbox, pred);
 }
 
-DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding_min(const RiGrid &grid_holder, bbox3f bbox, const RiGridObjPred &pred,
-  float min_radius)
+DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding_min(const RiGrid &grid_holder, const bbox3f &bbox,
+  const RiGridObjPred &pred, float min_radius)
 {
   return grid_find_in_box_by_bounding_impl<RiGridObject>(grid_holder, bbox, pred,
     [min_radius](auto, vec4f wbsph) { return v_extract_w(wbsph) > min_radius; });
 }
 
-DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding_max(const RiGrid &grid_holder, bbox3f bbox, const RiGridObjPred &pred,
-  float max_radius)
+DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding_max(const RiGrid &grid_holder, const bbox3f &bbox,
+  const RiGridObjPred &pred, float max_radius)
 {
   return grid_find_in_box_by_bounding_impl<RiGridObject>(grid_holder, bbox, pred,
     [max_radius](auto, vec4f wbsph) { return v_extract_w(wbsph) < max_radius; });
 }
 
-DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding_pool(const RiGrid &grid_holder, bbox3f bbox, uint32_t pool,
+DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding_pool(const RiGrid &grid_holder, const bbox3f &bbox, uint32_t pool,
   const RiGridObjPred &pred)
 {
   return grid_find_in_box_by_bounding_impl<RiGridObject>(grid_holder, bbox, pred,
     [pool](RiGridObject object, vec4f) { return rendinst::handle_to_ri_type(object.getHandle()) == pool; });
+}
+
+DAGOR_NOINLINE RiGridObject rigrid_find_in_box_by_bounding_pool_bits(const RiGrid &grid_holder, const bbox3f &bbox,
+  uint32_t first_pool, dag::ConstSpan<uint32_t> pool_bits, const RiGridObjPred &pred)
+{
+  if (pool_bits.empty()) // nothing can pass: skip the box walk
+    return RiGridObject(rendinst::RIEX_HANDLE_NULL);
+  const uint32_t bitCount = uint32_t(pool_bits.size()) * 32;
+  const uint32_t *bits = pool_bits.data();
+  return grid_find_in_box_by_bounding_impl<RiGridObject>(grid_holder, bbox, pred,
+    [first_pool, bitCount, bits](RiGridObject object, vec4f) {
+      const uint32_t rel = rendinst::handle_to_ri_type(object.getHandle()) - first_pool;
+      return rel < bitCount && ((bits[rel >> 5] >> (rel & 31)) & 1);
+    });
 }
 
 DAGOR_NOINLINE RiGridObject rigrid_find_in_sphere_by_pos(const RiGrid &grid_holder, const Point3 &center, float radius,
@@ -99,4 +113,11 @@ DAGOR_NOINLINE RiGridObject rigrid_find_ray_intersections(const RiGrid &grid_hol
   const RiGridObjPred &pred)
 {
   return grid_find_ray_intersections_impl<RiGridObject>(grid_holder, v_ldu(&from.x), v_ldu(&dir.x), v_splats(len), pred);
+}
+
+DAGOR_NOINLINE RiGridObject rigrid_find_closest_ray_intersection(const RiGrid &grid_holder, const Point3 &from, const Point3 &dir,
+  float len, const float *best_t, const RiGridObjPred &pred)
+{
+  return grid_find_closest_ray_intersection_impl<RiGridObject>(grid_holder, v_ldu(&from.x), v_ldu(&dir.x), v_splats(len), best_t,
+    pred);
 }

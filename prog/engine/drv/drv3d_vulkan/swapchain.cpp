@@ -5,6 +5,7 @@
 #include <drv/3d/dag_vertexIndexBuffer.h>
 #include <drv/3d/dag_draw.h>
 #include <drv/3d/dag_shaderConstants.h>
+#include <drv/3d/dag_renderTarget.h>
 
 #include "swapchain.h"
 #include "vulkan_allocation_callbacks.h"
@@ -13,6 +14,12 @@
 #include "texture.h"
 #include "device_context.h"
 #include "timeline_latency.h"
+#include "drv_utils.h"
+#include "backend/cmd/resources.h"
+#include "backend/cmd/screen.h"
+#include "resource_manager.h"
+#include "backend.h"
+#include "backend_interop.h"
 
 #if _TARGET_ANDROID
 #include <osApiWrappers/dag_progGlobals.h>
@@ -40,6 +47,10 @@ const VkPresentModeKHR bestPresentModeMatch[4][3] = //
     //
 };
 
+constexpr VkFormat DEFAULT_SWAPCHAIN_FORMAT = VK_FORMAT_R8G8B8A8_UNORM;
+constexpr VkFormat HDR_SWAPCHAIN_FORMAT = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+constexpr VkColorSpaceKHR DEFAULT_COLOR_SPACE = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
+constexpr VkColorSpaceKHR HDR_COLOR_SPACE = VK_COLOR_SPACE_HDR10_ST2084_EXT;
 } // namespace
 
 bool SwapchainQueryCache::usePredefinedPresentFormat = false;
@@ -65,6 +76,7 @@ bool SwapchainMode::isFullscreenExclusiveAllowed()
 
 void SwapchainQueryCache::init()
 {
+  canUseHDRFormat = false;
 #if _TARGET_ANDROID
   {
     char sdkVerS[PROP_VALUE_MAX + 1];
@@ -78,10 +90,13 @@ void SwapchainQueryCache::init()
     // leaves some mutex acquired in gralloc stack, causing application to freeze
     // use format with 100% coverage instead of making a query for them
 
-    // enable by default on all android 13 if not disabled by config
-    // just in case if there is more such devices on market
-    int minSdk = Globals::cfg.getPerDriverPropertyBlock("androidDeadlockAtQueryPresentFormats")->getInt("androidMinSdkVer", 33);
-    usePredefinedPresentFormat = minSdk <= sdkVerI;
+    // enable by default on android 13 and 14 if not disabled by config, just in case there is more
+    // such devices on market. Bounded from above because the predefined format hides the hdr capable
+    // ones and hdr needs sdk 35 anyway, so raise androidMaxSdkVer per vendor if it shows up again.
+    const DataBlock *deadlockProps = Globals::cfg.getPerDriverPropertyBlock("androidDeadlockAtQueryPresentFormats");
+    int minSdk = deadlockProps->getInt("androidMinSdkVer", 33);
+    int maxSdk = deadlockProps->getInt("androidMaxSdkVer", 34);
+    usePredefinedPresentFormat = minSdk <= sdkVerI && sdkVerI <= maxSdk;
     if (usePredefinedPresentFormat)
       debug("vulkan: android: using predefined swapchain format for QueryPresentFormats deadlock workaround");
   }
@@ -92,10 +107,14 @@ bool SwapchainQueryCache::fillFormats(VulkanSurfaceKHRHandle surf)
 {
   uint32_t count = 0;
   SwapchainFormatStore formats;
+  const FormatStore hdrFormat = FormatStore::fromVkFormat(HDR_SWAPCHAIN_FORMAT);
+  const FormatStore defaultFormat = FormatStore::fromVkFormat(DEFAULT_SWAPCHAIN_FORMAT);
+
   if (usePredefinedPresentFormat)
   {
     // RGBA8 UNORM have 100% coverage, use it instead on asking available ones
-    formats.push_back(FormatStore::fromVkFormat(VK_FORMAT_R8G8B8A8_UNORM));
+    formats.push_back(defaultFormat);
+    canUseHDRFormat = false;
   }
   else if (VULKAN_CHECK_OK(Globals::VK::inst.vkGetPhysicalDeviceSurfaceFormatsKHR(Globals::VK::phy.device, surf, &count, nullptr)))
   {
@@ -104,9 +123,13 @@ bool SwapchainQueryCache::fillFormats(VulkanSurfaceKHRHandle surf)
     if (VULKAN_CHECK_OK(
           Globals::VK::inst.vkGetPhysicalDeviceSurfaceFormatsKHR(Globals::VK::phy.device, surf, &count, rawFormats.data())))
     {
+      canUseHDRFormat = false;
       for (auto &&i : rawFormats)
+      {
+        canUseHDRFormat |= (i.colorSpace == HDR_COLOR_SPACE) && (i.format == HDR_SWAPCHAIN_FORMAT);
         if (FormatStore::canBeStored(i.format))
           formats.push_back(FormatStore::fromVkFormat(i.format));
+      }
 
       if (formats.empty())
       {
@@ -126,9 +149,16 @@ bool SwapchainQueryCache::fillFormats(VulkanSurfaceKHRHandle surf)
     D3D_ERROR("vulkan: swapchain: no supported formats in query, using default engine format");
     return false;
   }
+  else
+  {
+    if (cachedSurface != surf)
+      for (FormatStore i : formats)
+        debug("vulkan: swapchain: supporting format %s", i.getNameString());
+  }
 
-  if (end(formats) != eastl::find(begin(formats), end(formats), FormatStore{})) // most common format (0 -> argb), do a fast check
-    format = FormatStore{};
+  const FormatStore &checkedFormat = (canUseHDRFormat && get_enable_hdr_from_settings()) ? hdrFormat : defaultFormat;
+  if (end(formats) != eastl::find(begin(formats), end(formats), checkedFormat))
+    format = checkedFormat;
   else
   {
     // select the format with the most bytes but that is not srgb nor float
@@ -145,11 +175,14 @@ bool SwapchainQueryCache::fillFormats(VulkanSurfaceKHRHandle surf)
   return true;
 }
 
-bool SwapchainQueryCache::update(VulkanSurfaceKHRHandle surf)
+void SwapchainQueryCache::updateBaseCaps(VulkanSurfaceKHRHandle surf)
 {
   caps = {};
   VULKAN_LOG_CALL(Globals::VK::inst.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(Globals::VK::phy.device, surf, &caps));
+}
 
+bool SwapchainQueryCache::updateModesAndFormats(VulkanSurfaceKHRHandle surf)
+{
   uint32_t count = 0;
   modes.clear();
   if (VULKAN_CHECK_OK(Globals::VK::inst.vkGetPhysicalDeviceSurfacePresentModesKHR(Globals::VK::phy.device, surf, &count, nullptr)))
@@ -167,7 +200,9 @@ bool SwapchainQueryCache::update(VulkanSurfaceKHRHandle surf)
     return false;
   }
 
-  return fillFormats(surf);
+  bool ret = fillFormats(surf);
+  cachedSurface = surf;
+  return ret;
 }
 
 VkPresentModeKHR SwapchainQueryCache::mode(VkPresentModeKHR requested) const
@@ -179,10 +214,10 @@ VkPresentModeKHR SwapchainQueryCache::mode(VkPresentModeKHR requested) const
   if (end(modes) != eastl::find(begin(modes), end(modes), requested))
     return requested;
 
-  G_ASSERTF(requested < array_size(bestPresentModeMatch),
+  G_ASSERTF(requested < eastl::size(bestPresentModeMatch),
     "vulkan: selectPresentMode(..., 'requested' = %u) is a mode that is not fully "
     "supported!");
-  if (requested >= array_size(bestPresentModeMatch))
+  if (requested >= eastl::size(bestPresentModeMatch))
     return VK_PRESENT_MODE_FIFO_KHR;
 
   for (auto &&mode : bestPresentModeMatch[requested])
@@ -194,7 +229,7 @@ VkPresentModeKHR SwapchainQueryCache::mode(VkPresentModeKHR requested) const
 
 void SwapchainImage::shutdown()
 {
-  Globals::ctx.destroyImage(img);
+  Globals::ctx.dispatchCmd<CmdDestroyImage>({img});
   if (!is_null(frame))
     VULKAN_LOG_CALL(Globals::VK::dev.vkDestroySemaphore(Globals::VK::dev.get(), frame, VKALLOC(semaphore)));
 }
@@ -205,7 +240,8 @@ void Swapchain::processAcquireStatus(VkResult rc, bool acquired)
   {
     if (rc != VK_SUCCESS)
     {
-      debug("vulkan: swapchain: queued recreation due to %s", vulkan_error_string(rc));
+      if (!queuedRecreate)
+        debug("vulkan: swapchain: queued recreation due to %s", vulkan_error_string(rc));
       queuedRecreate = true;
     }
     return;
@@ -244,10 +280,10 @@ void Swapchain::processAcquireStatus(VkResult rc, bool acquired)
   // try to restore surface if it was lost
   if (rc == VK_ERROR_SURFACE_LOST_KHR)
   {
-    newMode.surface = init_window_surface(Globals::VK::inst);
+    newMode.surfaceAndWindow.first = init_window_surface(Globals::VK::inst, newMode.surfaceAndWindow.second);
     newMode.modifySource = "surface lost restoration";
     setMode(newMode);
-    if (is_null(newMode.surface) || is_null(handle))
+    if (is_null(newMode.surfaceAndWindow.first) || is_null(handle))
       DAG_FATAL("vulkan: swapchain: can't recover on lost surface");
   }
 }
@@ -337,18 +373,26 @@ bool Swapchain::acquireSwapImage()
   // we try to block here if latency is too big (we don't want too much images)
   // or if windowing system somehow blocks on GPU regardless amount of images in swapchain
   // or if we can't allocate enough images to properly fit into async execution mode constraints
-  if (!acquired && (rc == VK_TIMEOUT || rc == VK_NOT_READY) && currentMode.extraBusyImages >= Globals::cfg.swapchainMaxExtraImages)
+  if (!acquired && (rc == VK_TIMEOUT || rc == VK_NOT_READY))
   {
-    TIME_PROFILE(vulkan_swapchain_image_blocked_acquire);
-    WinAutoLock lock(acquireMutex);
-    timeout = UINT64_MAX;
-    doAcquire();
-    if ((rc == VK_TIMEOUT || rc == VK_NOT_READY) && acquiredByBackend)
+    bool extraImageAllowed = true;
+    extraImageAllowed &= (currentMode.extraBusyImages < Globals::cfg.swapchainMaxExtraImages);
+    extraImageAllowed |= currentMode.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR;
+    extraImageAllowed &= currentMode.extraBusyImages <= query.caps.maxImageCount || query.caps.maxImageCount == 0;
+    if (!extraImageAllowed)
+    {
+      TIME_PROFILE(vulkan_swapchain_image_blocked_acquire);
+      WinAutoLock lock(acquireMutex);
+      timeout = GENERAL_GPU_TIMEOUT_NS;
       doAcquire();
+      if ((rc == VK_TIMEOUT || rc == VK_NOT_READY) && acquiredByBackend)
+        doAcquire();
+    }
   }
 
   if (acquired)
   {
+    recordAcquiredIndex(acquiredImageIdx);
     SwapchainImage &acquiredImage = images[acquiredImageIdx];
     G_ASSERT(!acquiredImage.acquired);
     acquiredImage.acquired = true;
@@ -397,6 +441,8 @@ void Swapchain::clearState()
   destroyOffscreenBuffer();
   wrappedTex->image = nullptr;
   rotateNeeded = false;
+  rotateInApp = false;
+  appRotationAngle = 0;
   queuedRecreate = false;
 }
 
@@ -407,69 +453,77 @@ VkResult Swapchain::checkAcquireExclusive(VkSwapchainCreateInfoKHR &sci)
   if (acquireExclusiveTestRunned)
     return ret;
 
+  if (currentMode.surfaceAndWindow.second != nullptr && currentMode.surfaceAndWindow.second != Globals::window.getMainWindow())
+  {
+    onlyBackendAcquire = true;
+    acquireExclusiveTestRunned = true;
+    debug("vulkan: swapchain: forced only backend acquire for secondary window %p", currentMode.surfaceAndWindow.second);
+  }
+
+  if (Globals::cfg.bits.forceSwapchainOnlyBackendAcquire)
+  {
+    onlyBackendAcquire = true;
+    acquireExclusiveTestRunned = true;
+    debug("vulkan: swapchain: forced only backend acquire mode by config");
+    return ret;
+  }
+
   if (!Globals::cfg.bits.useSwapchainAcquireExclusiveTest)
   {
     acquireExclusiveTestRunned = true;
     return ret;
   }
 
-  if (Globals::cfg.bits.forceSwapchainOnlyBackendAcquire)
+  bool allPassed = true;
+  bool anyPassed = false;
+  bool anyTimeoutOrNotReady = false;
+
+  VulkanFenceHandle fence;
+  VkFenceCreateInfo fci;
+  fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+  fci.pNext = NULL;
+  fci.flags = 0;
+  VULKAN_EXIT_ON_FAIL(Globals::VK::dev.vkCreateFence(Globals::VK::dev.get(), &fci, VKALLOC(fence), ptr(fence)));
+  for (uint32_t i = 0; i < sci.minImageCount * 2; ++i)
   {
+    uint32_t idx = ~0;
+    VkResult rc = Globals::VK::dev.vkAcquireNextImageKHR(Globals::VK::dev.get(), handle, 0, VulkanSemaphoreHandle{}, fence, &idx);
+    debug("vulkan: swapchain: check acquire %u %s %u", i, vulkan_error_string(rc), idx);
+    allPassed &= rc >= 0;
+    anyPassed |= rc >= 0;
+    anyTimeoutOrNotReady |= (rc == VK_TIMEOUT || rc == VK_NOT_READY);
+    if (idx != ~0)
+    {
+      VULKAN_LOG_CALL(Globals::VK::dev.vkWaitForFences(Globals::VK::dev.get(), 1, ptr(fence), VK_TRUE, GENERAL_GPU_TIMEOUT_NS));
+      VULKAN_LOG_CALL(Globals::VK::dev.vkResetFences(Globals::VK::dev.get(), 1, ptr(fence)));
+    }
+  }
+  VULKAN_LOG_CALL(Globals::VK::dev.vkDestroyFence(Globals::VK::dev.get(), fence, VKALLOC(fence)));
+  if (!anyTimeoutOrNotReady && allPassed)
+  {
+    debug("vulkan: swapchain: checkAcquireExclusive shows no timeout/not ready, using backend only acquire");
     onlyBackendAcquire = true;
-    debug("vulkan: swapchain: forced only backend acquire mode by config");
   }
-  else
+  else if (!allPassed)
   {
-    bool allPassed = true;
-    bool anyPassed = false;
-    bool anyTimeoutOrNotReady = false;
-
-    VulkanFenceHandle fence;
-    VkFenceCreateInfo fci;
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fci.pNext = NULL;
-    fci.flags = 0;
-    VULKAN_EXIT_ON_FAIL(Globals::VK::dev.vkCreateFence(Globals::VK::dev.get(), &fci, VKALLOC(fence), ptr(fence)));
-    for (uint32_t i = 0; i < sci.minImageCount * 2; ++i)
-    {
-      uint32_t idx = ~0;
-      VkResult rc = Globals::VK::dev.vkAcquireNextImageKHR(Globals::VK::dev.get(), handle, 0, VulkanSemaphoreHandle{}, fence, &idx);
-      debug("vulkan: swapchain: check acquire %u %s %u", i, vulkan_error_string(rc), idx);
-      allPassed &= rc >= 0;
-      anyPassed |= rc >= 0;
-      anyTimeoutOrNotReady |= (rc == VK_TIMEOUT || rc == VK_NOT_READY);
-      if (idx != ~0)
-      {
-        VULKAN_LOG_CALL(Globals::VK::dev.vkWaitForFences(Globals::VK::dev.get(), 1, ptr(fence), VK_TRUE, GENERAL_GPU_TIMEOUT_NS));
-        VULKAN_LOG_CALL(Globals::VK::dev.vkResetFences(Globals::VK::dev.get(), 1, ptr(fence)));
-      }
-    }
-    VULKAN_LOG_CALL(Globals::VK::dev.vkDestroyFence(Globals::VK::dev.get(), fence, VKALLOC(fence)));
-    if (!anyTimeoutOrNotReady && allPassed)
-    {
-      debug("vulkan: swapchain: checkAcquireExclusive shows no timeout/not ready, using backend only acquire");
-      onlyBackendAcquire = true;
-    }
-    else if (!allPassed)
-    {
-      // swapchain died somewhere inside test, will be recreated
-      debug("vulkan: swapchain: checkAcquireExclusive will retry");
-      return VK_SUCCESS;
-    }
-    if (anyPassed)
-    {
-      // recreate swapchain because we acquired some images that will never be presented
-      destroySwapchainHandle(handle);
-      ret = Globals::VK::dev.vkCreateSwapchainKHR(Globals::VK::dev.get(), &sci, VKALLOC(swapchain), ptr(handle));
-      debug("vulkan: swapchain: checkAcquireExclusive recreation result %s", vulkan_error_string(ret));
-    }
-
-    if (anyTimeoutOrNotReady && allPassed)
-    {
-      debug("vulkan: swapchain: checkAcquireExclusive shows timeout/not ready, using default acquire logic");
-      onlyBackendAcquire = false;
-    }
+    // swapchain died somewhere inside test, will be recreated
+    debug("vulkan: swapchain: checkAcquireExclusive will retry");
+    return VK_SUCCESS;
   }
+  if (anyPassed)
+  {
+    // recreate swapchain because we acquired some images that will never be presented
+    destroySwapchainHandle(handle);
+    ret = Globals::VK::dev.vkCreateSwapchainKHR(Globals::VK::dev.get(), &sci, VKALLOC(swapchain), ptr(handle));
+    debug("vulkan: swapchain: checkAcquireExclusive recreation result %s", vulkan_error_string(ret));
+  }
+
+  if (anyTimeoutOrNotReady && allPassed)
+  {
+    debug("vulkan: swapchain: checkAcquireExclusive shows timeout/not ready, using default acquire logic");
+    onlyBackendAcquire = false;
+  }
+
   acquireExclusiveTestRunned = true;
   return ret;
 }
@@ -477,26 +531,21 @@ VkResult Swapchain::checkAcquireExclusive(VkSwapchainCreateInfoKHR &sci)
 Swapchain::ObjectUpdateResult Swapchain::updateObject()
 {
   TIME_PROFILE(vulkan_swapchain_update);
-  if (!is_null(handle))
-    Globals::ctx.wait();
 
-  uint32_t fittedWidth = currentMode.extent.width;
-  uint32_t fittedHeight = currentMode.extent.height;
-
+  uint32_t fittedWidth = currentMode.displayExtent.width;
+  uint32_t fittedHeight = currentMode.displayExtent.height;
   // handle minimized state early to avoid resource recreations
-  if (!is_null(currentMode.surface) && !Globals::cfg.bits.headless)
+  if (!is_null(currentMode.surfaceAndWindow.first) && !Globals::cfg.bits.headless)
   {
-    if (!query.update(currentMode.surface))
-      return ObjectUpdateResult::FAIL;
-
+    query.updateBaseCaps(currentMode.surfaceAndWindow.first);
     auto fitExtents = [](uint32_t mode_value, uint32_t cap_value, uint32_t cap_min, uint32_t cap_max) {
       if (cap_value == -1)
         return clamp<uint32_t>(mode_value, cap_min, cap_max);
       return cap_value;
     };
-    fittedWidth = fitExtents(currentMode.extent.width, query.caps.currentExtent.width, query.caps.minImageExtent.width,
+    fittedWidth = fitExtents(currentMode.displayExtent.width, query.caps.currentExtent.width, query.caps.minImageExtent.width,
       query.caps.maxImageExtent.width);
-    fittedHeight = fitExtents(currentMode.extent.height, query.caps.currentExtent.height, query.caps.minImageExtent.height,
+    fittedHeight = fitExtents(currentMode.displayExtent.height, query.caps.currentExtent.height, query.caps.minImageExtent.height,
       query.caps.maxImageExtent.height);
 
     // this can happen if the window was minimized
@@ -504,13 +553,25 @@ Swapchain::ObjectUpdateResult Swapchain::updateObject()
       return ObjectUpdateResult::RETRY;
   }
 
+  if (!is_null(handle))
+    Globals::ctx.wait();
+
+  if (!is_null(currentMode.surfaceAndWindow.first) && !Globals::cfg.bits.headless)
+  {
+    if (!query.updateModesAndFormats(currentMode.surfaceAndWindow.first))
+      return ObjectUpdateResult::FAIL;
+  }
+
   bool imageWasAcquired = (acquiredImageIdx != ~0) || (onlyBackendAcquire && (backendAcquireImageIndex - 1 < images.size()));
-  imageWasAcquired &= Globals::cfg.bits.recreateSwapchainWhenImageAcquired > 0;
+  imageWasAcquired &= Globals::cfg.bits.recreateSwapchainWhenImageAcquired;
   clearState();
 
   // no surface - no swapchain, same goes for headless
-  if (is_null(currentMode.surface) || Globals::cfg.bits.headless)
+  if (is_null(currentMode.surfaceAndWindow.first) || Globals::cfg.bits.headless)
   {
+    // we render to offscreen without any modifications
+    // so backbuffer is always at display extents
+    currentMode.backbufferExtent = currentMode.displayExtent;
     destroySwapchainHandle(handle);
     return ObjectUpdateResult::RETRY;
   }
@@ -537,7 +598,7 @@ Swapchain::ObjectUpdateResult Swapchain::updateObject()
   else
     sci.flags = 0;
 
-  sci.surface = currentMode.surface;
+  sci.surface = currentMode.surfaceAndWindow.first;
   sci.imageArrayLayers = 1;
   sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                    VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -568,24 +629,50 @@ Swapchain::ObjectUpdateResult Swapchain::updateObject()
 
   sci.imageUsage &= query.caps.supportedUsageFlags;
 
+  sci.presentMode = query.mode(currentMode.presentMode);
   sci.minImageCount =
     max<uint32_t>(GPU_TIMELINE_HISTORY_SIZE, query.caps.minImageCount) + (MAX_ACQUIRED_IMAGES - 1) + currentMode.extraBusyImages;
+  // in mailbox mode to mimic no-vsync behavior, as we use it instead of immediate,
+  // allocate 2 extra images, to fullfill frame-skip condition
+  // but only if image count is small enough to not allow frame-skip condition to be met
+  //
+  // frame skip condition should allow us acquiring images while at least 2 is queued for presentation
+  // this gives us 4 images minumum - 1 is blocked by presentation, 2 is queued, 1 is acquired
+  // but giving fact that we may acquire more than 1, enough images for frame skip will be
+  const uint32_t ENOUGH_IMAGES_FOR_FRAME_SKIP = MAX_ACQUIRED_IMAGES + 3;
+  if (sci.presentMode == VK_PRESENT_MODE_MAILBOX_KHR && sci.minImageCount < ENOUGH_IMAGES_FOR_FRAME_SKIP)
+    sci.minImageCount = ENOUGH_IMAGES_FOR_FRAME_SKIP;
   if (query.caps.maxImageCount)
     sci.minImageCount = min<uint32_t>(sci.minImageCount, query.caps.maxImageCount);
 
   currentMode.mismatchedExtents =
-    currentMode.extent.width != sci.imageExtent.width || currentMode.extent.height != sci.imageExtent.height;
+    currentMode.displayExtent.width != sci.imageExtent.width || currentMode.displayExtent.height != sci.imageExtent.height;
   if (currentMode.mismatchedExtents)
-    debug("vulkan: swapchain: mode (%u,%u) and surface (%u, %u) extends mismatch, using scaling blit", currentMode.extent.width,
-      currentMode.extent.height, sci.imageExtent.width, sci.imageExtent.height);
+    debug("vulkan: swapchain: mode (%u,%u) and surface (%u, %u) extends mismatch, using scaling blit", currentMode.displayExtent.width,
+      currentMode.displayExtent.height, sci.imageExtent.width, sci.imageExtent.height);
+
+  rotateInApp = false;
+  appRotationAngle = 0;
+  currentMode.backbufferExtent = currentMode.displayExtent;
+  if (rotateNeeded && Globals::cfg.bits.appHandledPreRotation && !currentMode.mismatchedExtents &&
+      !(currentMode.enableSrgb && !currentMode.mutableFormat))
+  {
+    rotateInApp = true;
+    appRotationAngle = surfaceTransformToAngle(sci.preTransform);
+    rotateNeeded = false;
+    debug("vulkan: swapchain: pre-rotation %u handled by app", appRotationAngle);
+    if (appRotationAngle == 90 || appRotationAngle == 270)
+      eastl::swap(currentMode.backbufferExtent.width, currentMode.backbufferExtent.height);
+  }
 
   // swap extents to match device transform
   if ((sci.preTransform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) || (sci.preTransform & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
     eastl::swap(sci.imageExtent.width, sci.imageExtent.height);
   currentMode.format = query.format;
+  currentMode.canUseHdr = query.canUseHDRFormat;
+  currentMode.usesHdr = (currentMode.format == FormatStore::fromVkFormat(HDR_SWAPCHAIN_FORMAT));
   sci.imageFormat = currentMode.format.asVkFormat();
-  sci.imageColorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
-  sci.presentMode = query.mode(currentMode.presentMode);
+  sci.imageColorSpace = currentMode.usesHdr ? HDR_COLOR_SPACE : DEFAULT_COLOR_SPACE;
 
   debug("vulkan: swapchain: using min %u:%s images, mode %s (asked %s) rotation: %u srgb: %s", sci.minImageCount,
     currentMode.format.getNameString(), formatPresentMode(sci.presentMode), formatPresentMode(currentMode.presentMode),
@@ -629,6 +716,9 @@ Swapchain::ObjectUpdateResult Swapchain::updateObject()
   if (createResult != VK_SUCCESS)
   {
     logwarn("vulkan: swapchain: failed to create due to error %u[%s]", createResult, vulkan_error_string(createResult));
+    // retry with device reset
+    if (createResult == VK_ERROR_INITIALIZATION_FAILED && currentMode.surfaceAndWindow.second == Globals::window.getMainWindow())
+      dagor_d3d_force_driver_reset = true;
     return ObjectUpdateResult::FAIL;
   }
 
@@ -639,7 +729,50 @@ Swapchain::ObjectUpdateResult Swapchain::updateObject()
   }
   fillSemaphoresRing();
 
+  applyHdrMetadata();
+
   return ObjectUpdateResult::OK;
+}
+
+void Swapchain::applyHdrMetadata()
+{
+#if VK_EXT_hdr_metadata
+  if (!currentMode.usesHdr || is_null(handle))
+    return;
+
+  if (!Globals::VK::dev.hasExtension<HdrMetadataEXT>())
+  {
+    debug("vulkan: swapchain: HDR active but VK_EXT_hdr_metadata is not present, "
+          "presentation engine gets default/unspecified mastering metadata");
+    return;
+  }
+
+  // Vulkan/Wayland gives no way to read the sink's real HDR capabilities, so we use HDR10 / Rec.2020
+  // (BT.2100) defaults, overridable via the video block for per-display calibration.
+  const DataBlock *videoCfg = ::dgs_get_settings()->getBlockByNameEx("video");
+  const float maxNits = videoCfg->getReal("hdrMaxNits", 1000.0f);
+  const float minNits = videoCfg->getReal("hdrMinNits", 0.0f);
+  const float maxCLL = videoCfg->getReal("hdrMaxContentLightLevel", maxNits);
+  const float maxFALL = videoCfg->getReal("hdrMaxFrameAvgLightLevel", maxNits * 0.25f);
+
+  VkHdrMetadataEXT meta = {};
+  meta.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+  meta.pNext = nullptr;
+  // Rec.2020 / BT.2100 primaries and D65 white point (CIE 1931 xy)
+  meta.displayPrimaryRed = {0.708f, 0.292f};
+  meta.displayPrimaryGreen = {0.170f, 0.797f};
+  meta.displayPrimaryBlue = {0.131f, 0.046f};
+  meta.whitePoint = {0.3127f, 0.3290f};
+  meta.maxLuminance = maxNits;
+  meta.minLuminance = minNits;
+  meta.maxContentLightLevel = maxCLL;
+  meta.maxFrameAverageLightLevel = maxFALL;
+
+  VkSwapchainKHR rawHandle = handle;
+  Globals::VK::dev.vkSetHdrMetadataEXT(Globals::VK::dev.get(), 1, &rawHandle, &meta);
+  debug("vulkan: swapchain: set HDR10 metadata: max %.0f nits, min %.4f nits, maxCLL %.0f, maxFALL %.0f", maxNits, minNits, maxCLL,
+    maxFALL);
+#endif
 }
 
 void Swapchain::fillSemaphoresRing()
@@ -692,7 +825,7 @@ bool Swapchain::updateImageList(const VkSwapchainCreateInfoKHR &sci)
     for (auto &&image : imageList)
     {
       Image::Description desc = {{ii.flags, VK_IMAGE_TYPE_2D, ii.size, 1, 1, ii.usage, VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT},
-        Image::MEM_NOT_EVICTABLE, currentMode.format, VK_IMAGE_LAYOUT_UNDEFINED};
+        Image::MEM_NOT_EVICTABLE | Image::MEM_SWAPCHAIN, currentMode.format, VK_IMAGE_LAYOUT_UNDEFINED};
       Image *newImage = Globals::Mem::res.alloc<Image>(desc, false);
       newImage->setDerivedHandle(image);
       Globals::Dbg::naming.setTexName(newImage, String(64, "swapchainImage%u", &image - &imageList[0]));
@@ -715,8 +848,8 @@ void Swapchain::ensureOffscreenBuffer()
   ImageCreateInfo ii;
   ii.type = VK_IMAGE_TYPE_2D;
   ii.mips = 1;
-  ii.size.width = currentMode.extent.width;
-  ii.size.height = currentMode.extent.height;
+  ii.size.width = currentMode.displayExtent.width;
+  ii.size.height = currentMode.displayExtent.height;
   ii.size.depth = 1;
   ii.arrays = 1;
   ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -733,7 +866,7 @@ void Swapchain::destroyOffscreenBuffer()
 {
   if (offscreenBuffer)
   {
-    Globals::ctx.destroyImage(offscreenBuffer);
+    Globals::ctx.dispatchCmd<CmdDestroyImage>({offscreenBuffer});
     offscreenBuffer = nullptr;
   }
 }
@@ -758,29 +891,31 @@ bool Swapchain::init()
   return true;
 }
 
-void Swapchain::setMode(const SwapchainMode &new_mode)
+bool Swapchain::setMode(const SwapchainMode &new_mode)
 {
   bool hasChanges = false;
   bool extentFittingChange = false;
   VulkanSurfaceKHRHandle oldSurface;
-  if (currentMode.surface != new_mode.surface)
+  if (currentMode.surfaceAndWindow.first != new_mode.surfaceAndWindow.first)
   {
-    debug("vulkan: swapchain mode change request: surface %016llX -> %016llX", generalize(currentMode.surface),
-      generalize(new_mode.surface));
+    debug("vulkan: swapchain mode change request: surface %016llX -> %016llX", generalize(currentMode.surfaceAndWindow.first),
+      generalize(new_mode.surfaceAndWindow.first));
     hasChanges = true;
-    oldSurface = currentMode.surface;
+    oldSurface = currentMode.surfaceAndWindow.first;
   }
+  else
+    G_ASSERT(currentMode.surfaceAndWindow.second == new_mode.surfaceAndWindow.second);
 
-  if (currentMode.extent != new_mode.extent)
+  if (currentMode.displayExtent != new_mode.displayExtent)
   {
-    debug("vulkan: swapchain mode change request: extent [%u, %u] -> [%u, %u]", currentMode.extent.width, currentMode.extent.height,
-      new_mode.extent.width, new_mode.extent.height);
+    debug("vulkan: swapchain mode change request: extent [%u, %u] -> [%u, %u]", currentMode.displayExtent.width,
+      currentMode.displayExtent.height, new_mode.displayExtent.width, new_mode.displayExtent.height);
     hasChanges = true;
     // we are not propragating surface extent change back to engine right away, so vulkan can see extend change early than engine
     // causing two setMode calls, one from vulkan acquire, one from engine
     // one from engine should processed without swapchain recreation if it is fitting properly
-    if (images.size() && new_mode.extent.width == images[0].img->getBaseExtent2D().width &&
-        new_mode.extent.height == images[0].img->getBaseExtent2D().height)
+    if (images.size() && new_mode.displayExtent.width == images[0].img->getBaseExtent2D().width &&
+        new_mode.displayExtent.height == images[0].img->getBaseExtent2D().height)
     {
       extentFittingChange = true;
       hasChanges = false;
@@ -788,7 +923,8 @@ void Swapchain::setMode(const SwapchainMode &new_mode)
     }
   }
 
-  if (currentMode.presentMode != new_mode.presentMode)
+  bool presentModeChanged = currentMode.presentMode != new_mode.presentMode;
+  if (presentModeChanged)
   {
     debug("vulkan: swapchain mode change request: mode %s -> %s", formatPresentMode(currentMode.presentMode),
       formatPresentMode(new_mode.presentMode));
@@ -812,6 +948,12 @@ void Swapchain::setMode(const SwapchainMode &new_mode)
     hasChanges = true;
   }
 
+  if (new_mode.canUseHdr && (get_enable_hdr_from_settings() != new_mode.usesHdr))
+  {
+    debug("vulkan: swapchain mode change request: HDR toggle %s", new_mode.usesHdr ? "off" : "on");
+    hasChanges = true;
+  }
+
   if (new_mode.modifySource)
   {
     if (lastUpdateResult != ObjectUpdateResult::RETRY)
@@ -820,18 +962,26 @@ void Swapchain::setMode(const SwapchainMode &new_mode)
   }
 
   currentMode = new_mode;
+  // reset busy images on mode change to avoid higer latency on blocking present modes like FIFO
+  if (presentModeChanged)
+    currentMode.extraBusyImages = 0;
   currentMode.modifySource = nullptr;
+
+  if (this == &Frontend::swapchain)
+    Backend::interop.isVsyncOnPrimarySwapchain = currentMode.isVsyncOn();
 
   if (!hasChanges && !extentFittingChange)
   {
     debug("vulkan: no changes in swapchain mode set");
-    return;
+    return true;
   }
 
   if (extentFittingChange && !hasChanges && lastUpdateResult == ObjectUpdateResult::OK)
   {
     debug("vulkan: swapchain: no object recreation mode change");
     currentMode.mismatchedExtents = false;
+    // we render to offscreen at display extents, so backbuffer follows them
+    currentMode.backbufferExtent = currentMode.displayExtent;
     destroyOffscreenBuffer();
   }
   else
@@ -861,8 +1011,8 @@ void Swapchain::setMode(const SwapchainMode &new_mode)
       VULKAN_LOG_CALL(Globals::VK::inst.vkDestroySurfaceKHR(Globals::VK::inst.get(), oldSurface, nullptr));
   }
 
-  wrappedTex->pars.w = currentMode.extent.width;
-  wrappedTex->pars.h = currentMode.extent.height;
+  wrappedTex->pars.w = currentMode.backbufferExtent.width;
+  wrappedTex->pars.h = currentMode.backbufferExtent.height;
   wrappedTex->pars.flg = TEXCF_RTARGET | currentMode.format.asTexFlags();
   wrappedTex->fmt = FormatStore::fromCreateFlags(wrappedTex->pars.flg);
   wrappedTex->setInitialImageViewState();
@@ -870,6 +1020,7 @@ void Swapchain::setMode(const SwapchainMode &new_mode)
   ensureOffscreenBuffer();
   activeImage = offscreenBuffer;
   wrappedTex->image = activeImage;
+  return lastUpdateResult == ObjectUpdateResult::OK;
 }
 
 void Swapchain::nextFrame()
@@ -886,7 +1037,7 @@ void Swapchain::nextFrame()
   else
   {
     activeImage = images[acquiredImageIdx].img;
-    Globals::ctx.dispatchCommand<CmdSwapchainImageAcquire>({activeImage, images[acquiredImageIdx].acquire});
+    Globals::ctx.dispatchCmd<CmdSwapchainImageAcquire>({activeImage, images[acquiredImageIdx].acquire});
 
     if ((currentMode.enableSrgb && !currentMode.mutableFormat) || rotateNeeded || currentMode.mismatchedExtents)
     {
@@ -932,7 +1083,8 @@ void Swapchain::rotateFromOffscreen()
   // expect that state here is not needed to be restored
   SwapchainImage &acquiredImage = images[acquiredImageIdx];
   wrappedRotatedTex->image = acquiredImage.img;
-  d3d::set_render_target(0, wrappedRotatedTex, 0, 0);
+  d3d::set_render_target({}, DepthAccess::RW, {{wrappedRotatedTex, 0, 0}});
+  d3d::clearview(DISCARD_TARGET, 0, 0, 0);
   d3d::set_tex(STAGE_PS, 0, wrappedTex);
   d3d::set_sampler(STAGE_PS, 0, d3d::request_sampler({}));
   d3d::set_program(Globals::shaderProgramDatabase.getRotateProgram(query.caps.currentTransform).get());
@@ -940,8 +1092,8 @@ void Swapchain::rotateFromOffscreen()
   if ((uint32_t)rotateRenderState == ~0)
     rotateRenderState = d3d::create_render_state(shaders::RenderState());
   d3d::set_render_state(rotateRenderState);
-  float fv[4] = {(float)currentMode.extent.width, (float)currentMode.extent.height, 1.0f / currentMode.extent.width,
-    1.0f / currentMode.extent.height};
+  float fv[4] = {(float)currentMode.displayExtent.width, (float)currentMode.displayExtent.height,
+    1.0f / currentMode.displayExtent.width, 1.0f / currentMode.displayExtent.height};
   d3d::set_const(STAGE_PS, 0, fv, 1);
   d3d::draw(PRIM_TRILIST, 0, 1);
   wrappedRotatedTex->image = nullptr;
@@ -960,8 +1112,8 @@ void Swapchain::prePresent()
     ImageCreateInfo ii;
     ii.type = VK_IMAGE_TYPE_2D;
     ii.mips = 1;
-    ii.size.width = currentMode.extent.width;
-    ii.size.height = currentMode.extent.height;
+    ii.size.width = currentMode.backbufferExtent.width;
+    ii.size.height = currentMode.backbufferExtent.height;
     ii.size.depth = 1;
     ii.arrays = 1;
     ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -971,11 +1123,11 @@ void Swapchain::prePresent()
     ii.memFlags = Image::MEM_NOT_EVICTABLE;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     stillImage = Image::create(ii);
-    Globals::ctx.dispatchCommand(blitImage(activeImage, stillImage));
+    Globals::ctx.dispatchCmd(blitImage(activeImage, stillImage));
   }
   else if (!needStillImage && stillImage)
   {
-    Globals::ctx.destroyImage(stillImage);
+    Globals::ctx.dispatchCmd<CmdDestroyImage>({stillImage});
     stillImage = nullptr;
   }
   needStillImage = false;
@@ -1002,7 +1154,7 @@ CmdPresent Swapchain::present()
   G_ASSERT(acquiredImage.acquired);
 
   if (((currentMode.enableSrgb && !currentMode.mutableFormat) || currentMode.mismatchedExtents) && !rotateNeeded)
-    Globals::ctx.dispatchCommandNoLock(blitImage(offscreenBuffer, acquiredImage.img));
+    Globals::ctx.dispatchCmdNoLock(blitImage(offscreenBuffer, acquiredImage.img));
 
   ret.swapchain = handle;
   ret.frameSem = acquiredImage.frame;
@@ -1029,7 +1181,7 @@ void Swapchain::shutdown()
   clearState();
   if (stillImage)
   {
-    Globals::ctx.destroyImage(stillImage);
+    Globals::ctx.dispatchCmd<CmdDestroyImage>({stillImage});
     stillImage = nullptr;
   }
   wrappedTex->destroy();
@@ -1041,6 +1193,10 @@ void Swapchain::shutdown()
   }
   for (VulkanSemaphoreHandle i : semaphoresRing)
     VULKAN_LOG_CALL(Globals::VK::dev.vkDestroySemaphore(Globals::VK::dev.get(), i, VKALLOC(semaphore)));
+  lastUpdateResult = ObjectUpdateResult::OK;
+  updateConsequtiveFailures = 0;
+  acquireExclusiveTestRunned = false;
+  onlyBackendAcquire = false;
   semaphoresRing.clear();
 }
 
@@ -1059,6 +1215,80 @@ bool Swapchain::blitStillImage()
   if (!stillImage)
     return false;
 
-  Globals::ctx.dispatchCommand(blitImage(stillImage, activeImage));
+  Globals::ctx.dispatchCmd(blitImage(stillImage, activeImage));
   return true;
+}
+
+#if DAGOR_DBGLEVEL > 0
+void Swapchain::recordAcquiredIndex(uint32_t idx)
+{
+  acquireIdxHistory[acquireIdxHistoryIdx] = idx;
+  ++acquireIdxHistoryIdx;
+  if (acquireIdxHistoryIdx >= ACQUIRE_IDX_HISTORY_SZ)
+    acquireIdxHistoryIdx = 0;
+}
+
+int Swapchain::getPresentedRingSize()
+{
+  uint64_t uniqueIndexes = 0;
+  for (uint32_t i : acquireIdxHistory)
+    uniqueIndexes |= 1ull << i;
+  return dag::popcount(uniqueIndexes);
+}
+#endif
+
+Swapchain *SecondarySwapchainStorage::allocate(void *window)
+{
+  D3D_CONTRACT_ASSERTF_RETURN(freeSwapchainsMask != 0, nullptr,
+    "vulkan: Too many swapchains created, consider to use `d3d::window_destroyed` to free deleted windows resources!");
+  uint32_t swapchainIndex = __bsf(freeSwapchainsMask);
+  freeSwapchainsMask &= ~(1u << swapchainIndex);
+  auto &swapchain = swapchains[swapchainIndex];
+  swapchain.init();
+  SwapchainMode mode{};
+  mode.setPresentModeFromConfig();
+  mode.enableSrgb = false;
+  mode.surfaceAndWindow.first = init_window_surface(Globals::VK::inst, window);
+  mode.fullscreen = false;
+  mode.displayExtent = get_window_client_rect_extent(window);
+  mode.surfaceAndWindow.second = window;
+  mode.modifySource = "create swapchain for secondary window";
+  const bool isCreated = swapchain.setMode(mode);
+  if (!isCreated)
+  {
+    free(window);
+    return nullptr;
+  }
+  return &swapchain;
+}
+
+void SecondarySwapchainStorage::free(void *window)
+{
+  const auto swapchain = find(window);
+  if (swapchain == nullptr)
+    return;
+  const auto index = eastl::distance(swapchains.data(), swapchain);
+  swapchain->shutdown();
+  G_ASSERT(index < MAX_SECONDARY_SWAPCHAIN_COUNT);
+  G_ASSERT((freeSwapchainsMask & (1u << index)) == 0);
+  freeSwapchainsMask |= (1u << index);
+}
+
+void SecondarySwapchainStorage::shutdown()
+{
+  for (auto index : LsbVisitor{~freeSwapchainsMask})
+  {
+    swapchains[index].shutdown();
+    freeSwapchainsMask |= (1u << index);
+  }
+}
+
+Swapchain *SecondarySwapchainStorage::find(void *window)
+{
+  for (auto index : LsbVisitor{~freeSwapchainsMask})
+  {
+    if (swapchains[index].getMode().surfaceAndWindow.second == window)
+      return &swapchains[index];
+  }
+  return nullptr;
 }

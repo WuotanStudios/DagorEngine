@@ -4,9 +4,6 @@
 #include "splineGenGeometryRepository.h"
 #include <math/integer/dag_IPoint2.h>
 
-extern int dynamicSceneBlockId, dynamicDepthSceneBlockId;
-
-
 SplineGenGeometry::SplineGenGeometry() { reset(); }
 
 SplineGenGeometry::~SplineGenGeometry() { reset(); }
@@ -16,15 +13,17 @@ void SplineGenGeometry::reset()
   if (isRendered())
   {
     SplineGenGeometryManager &manager = getManager();
-    manager.unregisterInstance(id, isActive());
+    manager.unregisterInstance(id);
     if (manager.hasObj())
       manager.getAsset().closeInstancingData(batchIds);
   }
-  managerPtr = nullptr;
+  managerPtr.reset();
   id = INVALID_INSTANCE_ID;
   instance.objCount = 0;
   instance.flags = 0;
   inactiveFrames = 0;
+  splineLength = 0;
+  meterBetweenObjs = 0;
   instance.bbox_lim0 = float3(100000, 100000, 100000);
   instance.bbox_lim1 = float3(-100000, -100000, -100000);
 }
@@ -33,9 +32,9 @@ void SplineGenGeometry::setLod(const eastl::string &template_name)
 {
   reset();
   if (template_name.empty())
-    managerPtr = nullptr;
+    managerPtr.reset();
   else
-    managerPtr = &get_spline_gen_repository().getOrMakeManager(template_name);
+    managerPtr = get_spline_gen_repository().getOrMakeManager(template_name);
   if (!isRendered())
     return;
   SplineGenGeometryManager &manager = getManager();
@@ -45,7 +44,7 @@ void SplineGenGeometry::setLod(const eastl::string &template_name)
 SplineGenGeometryManager &SplineGenGeometry::getManager()
 {
   G_ASSERTF(isRendered(), "Always test for isRendered() before trying to access manager.");
-  return *managerPtr;
+  return *managerPtr.lock();
 }
 
 void SplineGenGeometry::requestActiveState(bool request_active)
@@ -82,7 +81,16 @@ void SplineGenGeometry::updateInstancingData(const eastl::vector<SplineGenSpline
   float tile_size_meters,
   float obj_size_mul,
   float meter_between_objs,
-  const Point4 &emissive_color)
+  const Point4 &emissive_color,
+  float cylinder_start_offset,
+  float index_of_refraction,
+  const Point4 &uv_scroll_first_offset_and_scale,
+  const Point4 &uv_scroll_second_offset_and_scale,
+  float uv_scroll_interpolation_value,
+  float surface_opaqueness,
+  const Point2 &additional_thickness_bounds,
+  const Point3 &medium_tint,
+  float is_shell)
 {
   G_ASSERT(isActive());
   G_ASSERT(max_radius >= 0.0f);
@@ -92,7 +100,8 @@ void SplineGenGeometry::updateInstancingData(const eastl::vector<SplineGenSpline
   uint32_t stripes = manager.stripes;
   const IPoint2 &displacementTexSize = manager.getDisplacementTexSize();
 
-  float splineLength = 0;
+  splineLength = 0;
+  meterBetweenObjs = meter_between_objs;
   BBox3 bbox;
   bbox += spline_vec[stripes].pos;
 
@@ -102,6 +111,7 @@ void SplineGenGeometry::updateInstancingData(const eastl::vector<SplineGenSpline
     bbox += spline_vec[i].pos;
   }
 
+  instance.cylinderStartOffset = cylinder_start_offset;
   instance.tcMul = Point2(tiles_around, splineLength / tile_size_meters);
   float texelPerSample = min(static_cast<float>(displacementTexSize.x) * instance.tcMul.x / static_cast<float>(slices),
     static_cast<float>(displacementTexSize.y) * instance.tcMul.y / static_cast<float>(stripes));
@@ -113,30 +123,46 @@ void SplineGenGeometry::updateInstancingData(const eastl::vector<SplineGenSpline
 
   instance.objSizeMul = obj_size_mul;
   if (manager.hasObj())
-  {
-    SplineGenGeometryAsset &asset = manager.getAsset();
-    extension += obj_size_mul * asset.getObjectDiameter();
-    uint32_t requestedObjCount = meter_between_objs > 0.0f ? floor(splineLength / meter_between_objs) : 0;
-    asset.updateInstancingData(instance, batchIds, requestedObjCount);
-  }
-  instance.objStripeMul = safediv(instance.objCount * meter_between_objs, splineLength);
+    extension += obj_size_mul * manager.getAsset().getObjectDiameter();
 
   bbox.inflate(extension);
   instance.bbox_lim0 = bbox.lim[0];
   instance.bbox_lim1 = bbox.lim[1];
   instance.emissiveColor = emissive_color;
 
-  manager.updateInstancingData(id, instance, spline_vec);
+  float specular = ((1 - index_of_refraction) * (1 - index_of_refraction)) / ((1 + index_of_refraction) * (1 + index_of_refraction));
+  instance.glassParams = Point2(index_of_refraction, specular);
+  instance.uvOffsets = Point4(uv_scroll_first_offset_and_scale.x, uv_scroll_first_offset_and_scale.y,
+    uv_scroll_second_offset_and_scale.x, uv_scroll_second_offset_and_scale.y);
+  instance.uvScales = Point4(uv_scroll_first_offset_and_scale.z, uv_scroll_first_offset_and_scale.w,
+    uv_scroll_second_offset_and_scale.z, uv_scroll_second_offset_and_scale.w);
+  instance.uvInterpolationValue = uv_scroll_interpolation_value;
+  instance.surfaceOpaqueness = surface_opaqueness;
+  instance.additionalThicknessBounds = additional_thickness_bounds;
+  instance.mediumTint = medium_tint;
+  instance.isShell = is_shell;
+
+  manager.writeSplineData(id, instance, spline_vec);
 }
 
 void SplineGenGeometry::updateAttachmentBatchIds()
 {
-  if (!isActive())
+  SplineGenGeometryManager &manager = getManager();
+  if (isActive())
+  {
+    if (manager.hasObj())
+    {
+      uint32_t requestedObjCount = meterBetweenObjs > 0.0f ? floor(splineLength / meterBetweenObjs) : 0;
+      manager.getAsset().updateInstancingData(instance, batchIds, requestedObjCount);
+    }
+    instance.objStripeMul = safediv(instance.objCount * meterBetweenObjs, splineLength);
+  }
+  else
     instance.flags = 0; // position doesn't change if inactive, so turn off reading the prev buffer
-  getManager().updateAttachmentBatchIds(id, instance, batchIds);
+  manager.updateAttachmentBatchIds(id, instance, batchIds);
   instance.flags |= PREV_SB_VALID | PREV_ATTACHMENT_DATA_VALID;
 }
 
 bool SplineGenGeometry::isActive() const { return inactiveFrames <= 2; }
 
-bool SplineGenGeometry::isRendered() const { return static_cast<bool>(managerPtr); }
+bool SplineGenGeometry::isRendered() const { return !managerPtr.expired(); }

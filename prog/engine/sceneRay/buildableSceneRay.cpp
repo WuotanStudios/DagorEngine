@@ -19,18 +19,11 @@ static inline void init_index_and_flags(SceneRayI24F8 &out, unsigned i, unsigned
 static inline void init_index_and_flags(uint16_t &out, unsigned i, unsigned) { out = i; }
 
 template <typename FI>
-BuildableStaticSceneRayTracerT<FI>::BuildableStaticSceneRayTracerT(const Point3 &lsz, int lev) :
-  StaticSceneRayTracerT<FI>(),
-  vertsTab(midmem),
-  facesTab(midmem),
-  faceboundsTab(midmem),
-  faceIndicesTab(midmem),
-  createdGrid(lev),
-  faceFlagsTab(midmem)
+BuildableStaticSceneRayTracerT<FI>::BuildableStaticSceneRayTracerT(const Point3 &lsz, int lev) : createdGrid(lev)
 {
   dump.leafSize = lsz;
-
   dump.grid = &createdGrid;
+  dump.version = VER_MAGIC;
 }
 
 template <typename FI>
@@ -326,7 +319,6 @@ void BuildableStaticSceneRayTracerT<FI>::buildLeaf(Leaf **leaf, SceneRayBuildCon
   delete fc1;
 }
 
-extern int tri_box_overlap(const Point3 &boxcenter, const Point3 &boxhalfsize, const Point3 *triverts);
 
 template <typename FI>
 bool BuildableStaticSceneRayTracerT<FI>::rebuild(bool fast)
@@ -347,9 +339,9 @@ bool BuildableStaticSceneRayTracerT<FI>::rebuild(bool fast)
   Tab<IPoint3> fcell(tmpmem);
   fboxes.resize(getFacesCount());
   G_ASSERTF((((intptr_t)(&dump)) & 15) == 0, "this=%p dump=%p", this, &dump);
-  G_ASSERTF((((intptr_t)(&v_rtBBox)) & 15) == 0, "this=%p v_rtBBox=%p", this, &v_rtBBox);
   G_ASSERT((((intptr_t)fboxes.data()) & 15) == 0);
   G_ASSERT((((intptr_t)(&verts(0))) & 15) == 0);
+  bbox3f v_rtBBox;
   v_bbox3_init_empty(v_rtBBox);
   for (int i = 0; i < getFacesCount(); ++i)
   {
@@ -380,6 +372,7 @@ bool BuildableStaticSceneRayTracerT<FI>::rebuild(bool fast)
   Point3 halfLeafSize = getLeafSize() * 0.5f;
   Point3 halfLeafSizeScaled = getLeafSize() * 0.50001f;
   vec4f vleafSize = v_ldu(&getLeafSize().x);
+  vec4f vHalfLeafSizeScaled = v_ldu_p3(&halfLeafSizeScaled.x);
   alignas(16) IPoint4 l0;
   alignas(16) IPoint4 l1;
   G_ASSERT((((intptr_t)&l0) & 15) == 0);
@@ -394,18 +387,20 @@ bool BuildableStaticSceneRayTracerT<FI>::rebuild(bool fast)
     v_sti(&l0, vl0);
     v_sti(&l1, vl1);
     const RTface &f = faces(i);
-    Point3 triverts[3] = {
-      verts(f.v[0]), // faces[fc[i]].vp[0];
-      verts(f.v[1]), // faces[fc[i]].vp[0]+faces[fc[i]].edge[0];
-      verts(f.v[2])  // faces[fc[i]].vp[0]+faces[fc[i]].edge[1];
-    };
+    // loaded once per face: the cell loops below only need them in registers
+    vec3f tv0 = v_ld(&verts(f.v[0]).x);
+    vec3f tv1 = v_ld(&verts(f.v[1]).x);
+    vec3f tv2 = v_ld(&verts(f.v[2]).x);
     for (int z = l0.z; z <= l1.z; ++z)
       for (int y = l0.y; y <= l1.y; ++y)
         for (int x = l0.x; x <= l1.x; ++x)
         {
           Point3 leafcenter = Point3(x * getLeafSize().x, y * getLeafSize().y, z * getLeafSize().z) + halfLeafSize;
-          // could check whether the faces really crosses this cell
-          if (!tri_box_overlap(leafcenter, halfLeafSizeScaled, triverts))
+          vec3f vLeafCenter = v_ldu_p3(&leafcenter.x);
+          bbox3f leafBox;
+          leafBox.bmin = v_sub(vLeafCenter, vHalfLeafSizeScaled);
+          leafBox.bmax = v_add(vLeafCenter, vHalfLeafSizeScaled);
+          if (!v_test_triangle_box_intersection(tv0, tv1, tv2, leafBox))
             continue;
 
           auto l = createdGrid.get_leaf(x, y, z);
@@ -450,6 +445,7 @@ bool BuildableStaticSceneRayTracerT<FI>::rebuild(bool fast)
   clear_and_shrink(faceboundsTab);
   clear_and_shrink(faceFlagsTab);
   clear_and_shrink(fboxes);
+
   return true;
 }
 

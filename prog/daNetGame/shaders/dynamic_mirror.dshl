@@ -6,7 +6,6 @@ include "psh_tangent.dshl"
 
 shader dynamic_mirror
 {
-  ENABLE_ASSERT(ps)
   DYNAMIC_BLOCK()
 
   texture normal = material.texture[2];
@@ -29,8 +28,8 @@ shader dynamic_mirror
         float2 diffuseTexcoord        : TEXCOORD0;
         float3 pointToEye             : TEXCOORD1;
         float3 normal                 : TEXCOORD2;
-        float4 out_pos                : TEXCOORD3;
-        float4 out_pos_prev           : TEXCOORD4;
+        float3 out_pos                : TEXCOORD3;
+        float3 out_pos_prev           : TEXCOORD4;
       };
     }
   }
@@ -49,7 +48,7 @@ shader dynamic_mirror
   //---------------------------------------------------
   if (dyn_model_render_pass != render_pass_normal)
   {
-    SPECIAL_RENDER_NOALPHATEST()
+    SPECIAL_RENDER_NOALPHATEST(false)
   }
   else
   {
@@ -58,7 +57,7 @@ shader dynamic_mirror
 
     (ps)
     {
-      normal_tex@static = normal;
+      normal_tex@staticSmp = normal;
     }
     hlsl(ps) {
       GBUFFER_OUTPUT dynamic_mirror_ps(VsOutput input HW_USE_SCREEN_POS)

@@ -42,17 +42,17 @@ public:
 private:
   DecalsMatrices matrixManager;
   eastl::vector<PuddleInfo> puddles;
-  UniqueBufHolder puddlesBuf;
-  UniqueBufHolder perGroupParametersBuf;
-  SharedTexHolder puddleTex;
-  SharedTexHolder flowmapTex;
+  UniqueBufWithShaderVar puddlesBuf;
+  UniqueBufWithShaderVar perGroupParametersBuf;
+  SharedTexWithShaderVar puddleTex;
+  SharedTexWithShaderVar flowmapTex;
   uint32_t maxSplashesPerFrame = 0;
   uint32_t splashesThisFrame = 0;
 
   int puddlesToRemoveCount = 0;
 
   bool isDeferredMode = false;
-  dafg::NodeHandle prepassNode;
+  eastl::array<dafg::NodeHandle, 2> prepassNodes;
   dafg::NodeHandle resolveNode;
   uint32_t updateOffset, updateLength;
   SimpleString splashFxTemplName;
@@ -149,7 +149,6 @@ public:
   template <class F>
   void erasePuddles(const F &pred)
   {
-    eastl::vector<int, framemem_allocator> queryIndices;
     const int oldSize = puddles.size();
     int removedCount = 0;
     for (int i = 0, j = 0; i < oldSize; ++i)
@@ -219,6 +218,7 @@ public:
     const Point3 &gravity);
 
   void reset();
+  void resetNodes();
   void addSplash(const Point3 &pos, const Point3 &normal, const TMatrix &itm, int matrix_id, float size);
   float getBloodFreshness(const Point3 &pos) const;
 

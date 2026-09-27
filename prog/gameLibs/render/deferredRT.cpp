@@ -14,11 +14,15 @@
 #include <util/dag_string.h>
 #include <perfMon/dag_statDrv.h>
 #include <image/dag_texPixel.h>
+#include <generic/dag_span.h>
+#include <EASTL/array.h>
 
 #define GLOBAL_VARS_LIST          \
   VAR(screen_pos_to_texcoord)     \
   VAR(screen_size)                \
   VAR(gbuffer_view_size)          \
+  VAR(gbuffer_uv_transform)       \
+  VAR(gbuffer_uv_transformi)      \
   VAR(albedo_gbuf)                \
   VAR(albedo_gbuf_samplerstate)   \
   VAR(normal_gbuf)                \
@@ -52,30 +56,39 @@ void DeferredRT::close()
 #endif
 }
 
-void DeferredRT::setRt()
+void DeferredRT::setRt(DepthAccess depth_access, BaseTexture *depth_override)
 {
-  d3d::set_render_target();
   for (int i = 0; i < numRt; ++i)
   {
     if (mrts[i] == nullptr)
     {
       mrts[i] = mrtPools[i]->acquire();
     }
-    d3d::set_render_target(i, mrts[i]->getTex2D(), 0);
   }
-  if (depth.getTex2D())
-    d3d::set_depth(depth.getTex2D(), DepthAccess::RW);
+
+#if DAGOR_DBGLEVEL > 0
+  if (shouldRenderDbgTex && !dbgTex.getTex2D())
+    initDebugTex();
+  const bool renderDbg = shouldRenderDbgTex;
+#else
+  const bool renderDbg = false;
+#endif
+
+  eastl::array<RenderTarget, 6> colorRts = {};
+  int slotsUsed = numRt;
+  for (int i = 0; i < numRt; ++i)
+    colorRts[i] = {mrts[i] ? mrts[i]->getTex2D() : nullptr, 0, 0};
+  if (renderDbg)
+  {
+    colorRts[5] = {dbgTex.getTex2D(), 0, 0};
+    slotsUsed = 6;
+  }
+  BaseTexture *depthTex = depth_override ? depth_override : depth.getTex2D();
+  d3d::set_render_target({depthTex, 0, 0}, depth_access, make_span_const(colorRts.data(), slotsUsed));
 
 #if DAGOR_DBGLEVEL > 0
   if (shouldRenderDbgTex)
-  {
-    if (!dbgTex.getTex2D())
-    {
-      initDebugTex();
-    }
-    d3d::set_render_target(5, dbgTex.getTex2D(), 0);
     d3d::clear_rt({dbgTex.getTex2D()}, make_clear_value(1.0f, 1.0f, 1.0f, 1.0f));
-  }
 #endif
 }
 
@@ -99,31 +112,67 @@ void DeferredRT::setVar()
     ShaderGlobal::set_texture(bvh_gbufVarId, mrts[4] ? mrts[4]->getTexId() : BAD_TEXTUREID);
     ShaderGlobal::set_sampler(bvh_gbuf_samplerstateVarId, baseSampler);
   }
-  else if (d3d::get_driver_code().is(d3d::vulkan || d3d::xboxOne || d3d::scarlett))
+  else if (deferred_rt_needs_bvh_dummy_tex())
   {
-    if (!blackPixelTex)
-    {
-      TexImage32 *texel = TexImage32::create(1, 1);
-      texel->getPixels()[0].u = 0;
-      String dummyName(128, "%s_bvh_dummy", name);
-      blackPixelTex = dag::create_tex(texel, 1, 1, TEXFMT_R32UI, 1, dummyName);
-      delete texel;
-      d3d::SamplerInfo smpInfo;
-      smpInfo.filter_mode = d3d::FilterMode::Point;
-      smpInfo.mip_map_mode = d3d::MipMapMode::Point;
-      blackPixelSampler = d3d::request_sampler(smpInfo);
-    }
-    ShaderGlobal::set_texture(bvh_gbufVarId, blackPixelTex.getTexId());
+    ShaderGlobal::set_texture(bvh_gbufVarId, getOrCreateBvhDummyTex().getTexId());
     ShaderGlobal::set_sampler(bvh_gbuf_samplerstateVarId, blackPixelSampler);
   }
   else
     ShaderGlobal::set_texture(bvh_gbufVarId, BAD_TEXTUREID);
 
-  ShaderGlobal::set_texture(depth_gbufVarId, depth);
-  ShaderGlobal::set_sampler(depth_gbuf_samplerstateVarId, baseSampler);
-  ShaderGlobal::set_color4(screen_pos_to_texcoordVarId, 1.f / width, 1.f / height, 0, 0);
-  ShaderGlobal::set_color4(screen_sizeVarId, width, height, 1.0 / width, 1.0 / height);
+  if (depth.getTex2D())
+  {
+    ShaderGlobal::set_texture_unsafe(depth_gbufVarId, depth.getTex2D());
+    ShaderGlobal::set_sampler(depth_gbuf_samplerstateVarId, baseSampler);
+  }
+
+  publishSizeAndTransformVars();
+}
+
+void DeferredRT::publishSizeAndTransformVars() const
+{
+  ShaderGlobal::set_float4(screen_pos_to_texcoordVarId, 1.f / width, 1.f / height, 0, 0);
+  ShaderGlobal::set_float4(screen_sizeVarId, width, height, 1.0 / width, 1.0 / height);
   ShaderGlobal::set_int4(gbuffer_view_sizeVarId, width, height, 0, 0);
+  ShaderGlobal::set_float4(gbuffer_uv_transformVarId, uvTransform);
+  ShaderGlobal::set_int4(gbuffer_uv_transformiVarId, uvTransformI);
+}
+
+const ManagedTex &DeferredRT::getOrCreateBvhDummyTex()
+{
+  if (!blackPixelTex)
+  {
+    TexImage32 *texel = TexImage32::create(1, 1);
+    texel->getPixels()[0].u = 0;
+    String dummyName(128, "%s_bvh_dummy", name);
+    blackPixelTex = dag::create_tex(texel, 1, 1, TEXFMT_R32UI, 1, dummyName, RESTAG_TARGET);
+    delete texel;
+    d3d::SamplerInfo smpInfo;
+    smpInfo.filter_mode = d3d::FilterMode::Point;
+    smpInfo.mip_map_mode = d3d::MipMapMode::Point;
+    blackPixelSampler = d3d::request_sampler(smpInfo);
+  }
+  return blackPixelTex;
+}
+
+bool deferred_rt_needs_bvh_dummy_tex() { return d3d::get_driver_code().is(d3d::vulkan || d3d::xboxOne || d3d::scarlett); }
+
+void DeferredRT::resetVar()
+{
+  ShaderGlobal::set_texture(albedo_gbufVarId, BAD_TEXTUREID);
+  ShaderGlobal::set_texture(normal_gbufVarId, BAD_TEXTUREID);
+  ShaderGlobal::set_texture(material_gbufVarId, BAD_TEXTUREID);
+
+  if (numRt > 3)
+    ShaderGlobal::set_texture(motion_gbufVarId, BAD_TEXTUREID);
+
+  ShaderGlobal::set_texture(bvh_gbufVarId, BAD_TEXTUREID);
+  ShaderGlobal::set_texture(depth_gbufVarId, BAD_TEXTUREID);
+  ShaderGlobal::set_float4(screen_pos_to_texcoordVarId, 0, 0, 0, 0);
+  ShaderGlobal::set_float4(screen_sizeVarId, 0, 0, 0, 0);
+  ShaderGlobal::set_int4(gbuffer_view_sizeVarId, 0, 0, 0, 0);
+  ShaderGlobal::set_float4(gbuffer_uv_transformVarId, Point4(1, 1, 0, 0));
+  ShaderGlobal::set_int4(gbuffer_uv_transformiVarId, IPoint4::ZERO);
 }
 
 uint32_t DeferredRT::recreateDepthInternal(uint32_t targetFmt)
@@ -144,19 +193,23 @@ uint32_t DeferredRT::recreateDepthInternal(uint32_t targetFmt)
   if (currentFmt == targetFmt)
     return currentFmt;
 
+  if (depth.getTex2D() == ShaderGlobal::get_tex_ptr_fast(depth_gbufVarId))
+  {
+    ShaderGlobal::set_texture_unsafe(depth_gbufVarId, nullptr);
+  }
   depth.close();
 
   auto cs = calcCreationSize();
 
   const uint32_t flags = TEXCF_RTARGET;
   String depthName(128, "%s_intzDepthTex", name);
-  TexPtr depthTex = dag::create_tex(NULL, cs.x, cs.y, targetFmt | flags, 1, depthName);
+  TexPtr depthTex = dag::create_tex(NULL, cs.x, cs.y, targetFmt | flags, 1, depthName, RESTAG_TARGET);
 
   if (!depthTex && (targetFmt & TEXFMT_MASK) != TEXFMT_DEPTH24)
   {
     debug("can't create depth format 0x%08x, fallback to TEXFMT_DEPTH24", targetFmt);
     targetFmt = (targetFmt & (~TEXFMT_MASK)) | TEXFMT_DEPTH24;
-    depthTex = dag::create_tex(NULL, cs.x, cs.y, targetFmt | flags, 1, depthName);
+    depthTex = dag::create_tex(NULL, cs.x, cs.y, targetFmt | flags, 1, depthName, RESTAG_TARGET);
   }
 
   if (!depthTex)
@@ -196,6 +249,7 @@ DeferredRT::DeferredRT(const char *name_, int w, int h, StereoMode stereo_mode, 
   }
 
   strncpy(name, name_, sizeof(name));
+  name[sizeof(name) - 1] = '\0';
   uint32_t currentFmt = depth_fmt;
   close();
   width = w;
@@ -212,7 +266,6 @@ DeferredRT::DeferredRT(const char *name_, int w, int h, StereoMode stereo_mode, 
     if (texFmt && texFmt[i] == 0xFFFFFFFFU)
       continue;
 
-    String mrtName(128, "%s_mrt_%d", name, i);
     unsigned mrtFmt = texFmt ? texFmt[i] : TEXFMT_A8R8G8B8;
     mrtPools[i] = ResizableRTargetPool::get(cs.x, cs.y, mrtFmt | TEXCF_RTARGET | TEXCF_CLEAR_ON_CREATE | msaaFlag, 1);
     mrts[i] = mrtPools[i]->acquire();
@@ -257,7 +310,8 @@ void DeferredRT::initDebugTex()
   if (!dbgTex.getTex2D())
   {
     IPoint2 cs = calcCreationSize();
-    auto tempTex = dag::create_tex(NULL, cs.x, cs.y, TEXFMT_R8 | TEXCF_RTARGET | TEXCF_CLEAR_ON_CREATE, 1, "dbg_gbuff_tex");
+    auto tempTex =
+      dag::create_tex(NULL, cs.x, cs.y, TEXFMT_R8 | TEXCF_RTARGET | TEXCF_CLEAR_ON_CREATE, 1, "dbg_gbuff_tex", RESTAG_TARGET);
 
     dbgTex = ResizableTex(eastl::move(tempTex), "dbg_gbuff_tex");
   }
@@ -270,23 +324,4 @@ const ManagedTex &DeferredRT::getDbgTex()
   initDebugTex();
 #endif
   return dbgTex;
-}
-
-void DeferredRT::acquirePooledRTs()
-{
-  for (int i = 0; i < numRt; ++i)
-  {
-    if (mrtPools[i] != nullptr)
-    {
-      if (mrts[i] == nullptr)
-        mrts[i] = mrtPools[i]->acquire();
-    }
-  }
-}
-
-void DeferredRT::releasePooledRT(uint32_t idx)
-{
-  if (idx >= MAX_NUM_MRT)
-    return;
-  mrts[idx] = nullptr;
 }

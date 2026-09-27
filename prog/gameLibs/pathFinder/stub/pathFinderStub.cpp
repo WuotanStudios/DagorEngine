@@ -7,11 +7,13 @@ namespace pathfinder
 
 void clear(bool) {}
 bool loadNavMesh(IGenLoad &, NavMeshType, tile_check_cb_t, const char *) { return {}; }
+NavMeshType get_nav_mesh_type(int) { return NMT_SIMPLE; }
+TiledNavMeshBuildSettings get_tiled_navmesh_build_settings(int) { return {}; }
 void initWeights(const DataBlock *) {}
 bool isLoaded() { return {}; }
 FindPathResult findPath(Tab<Point3> &, FindRequest &, float, float, const CustomNav *) { return {}; }
-FindPathResult findPath(const Point3 &, const Point3 &, Tab<Point3> &, float, float, float, const CustomNav *,
-  const dag::Vector<Point2> &, int, int)
+FindPathResult findPath(const Point3 &, const Point3 &, Tab<Point3> &, float, float, float, const CustomNav *, dag::ConstSpan<Point2>,
+  int, int)
 {
   return {};
 }
@@ -51,6 +53,7 @@ bool project_to_nearest_navmesh_point_no_obstacles_ex(int, Point3 &, const Point
 bool navmesh_point_has_obstacle(const Point3 &, const CustomNav *) { return {}; }
 bool query_navmesh_projections(const Point3 &, const Point3 &, Tab<Point3> &, int, const CustomNav *) { return {}; }
 bool query_navmesh_projections(const Point3 &, const Point3 &, Tab<Point3> &, Tab<dtPolyRef> &, int, const CustomNav *) { return {}; }
+bool query_navmesh_polys(const Point3 &, const Point3 &, Tab<dtPolyRef> &, int, const CustomNav *) { return {}; }
 float get_distance_to_wall(const Point3 &, float, float, const CustomNav *) { return {}; }
 float get_distance_to_wall(const Point3 &, float, float, Point3 &, const CustomNav *) { return {}; }
 bool find_random_point_around_circle(const Point3 &, float, Point3 &, const CustomNav *) { return {}; }
@@ -96,13 +99,15 @@ bool get_triangle_by_poly(const dtPolyRef, NavMeshTriangle &) { return {}; }
 bool find_nearest_triangle_by_pos(const Point3 &, const dtPolyRef, float, NavMeshTriangle &) { return {}; }
 int squash_jumplinks(const TMatrix &, const BBox3 &) { return {}; }
 bool find_polys_in_circle(dag::Vector<dtPolyRef, framemem_allocator> &, const Point3 &, float, float) { return {}; }
+bool is_navmesh_position_suitable_ex(int, const Point3 &, float, float, int, int) { return true; }
 void clear_nav_mesh(int, bool) {}
 bool load_nav_mesh_ex(int, const char *, IGenLoad &, NavMeshType, tile_check_cb_t, const char *) { return {}; }
 void init_weights_ex(int, const DataBlock *) {}
+void override_weights_ex(int, const DataBlock &) {}
 bool is_loaded_ex(int) { return {}; }
 FindPathResult find_path_ex(int, Tab<Point3> &, FindRequest &, float, float, const CustomNav *) { return {}; }
 FindPathResult find_path_ex(int, const Point3 &, const Point3 &, Tab<Point3> &, float, float, float, const CustomNav *,
-  const dag::Vector<Point2> &, int, int)
+  dag::ConstSpan<Point2>, int, int)
 {
   return {};
 }
@@ -129,6 +134,7 @@ void tilecache_start(tile_check_cb_t, const char *) {}
 void tilecache_start_add_ri(tile_check_cb_t, rendinst::riex_handle_t) {}
 void tilecache_start_ladders(const scene::TiledScene *) {}
 bool tilecache_is_blocking(rendinst::riex_handle_t) { return {}; }
+obstacle_handle_t tilecache_get_obstacle_handle(rendinst::riex_handle_t) { return {}; }
 bool tilecache_is_working() { return {}; }
 bool tilecache_is_loaded() { return {}; }
 bool tilecache_is_inside(const BBox3 &) { return {}; }
@@ -146,6 +152,7 @@ obstacle_handle_t tilecache_obstacle_add(const TMatrix &, const BBox3 &, const P
 obstacle_handle_t tilecache_obstacle_add(const Point3 &, const Point3 &, float, bool, bool, bool) { return {}; }
 
 void rebuildNavMesh_init() {}
+void rebuildNavMesh_initFromCurrent() {}
 void rebuildNavMesh_setup(const char *, float) {}
 void rebuildNavMesh_setup(const char *, const Point2 &) {}
 void rebuildNavMesh_addBBox(const BBox3 &) {}
@@ -155,7 +162,7 @@ int rebuildNavMesh_getTotalTiles() { return {}; }
 bool rebuildNavMesh_saveToFile(const char *) { return {}; }
 void rebuildNavMesh_close() {}
 
-uint32_t patchedNavMesh_getFileSizeAndNumTiles(const char *, int &) { return {}; }
+PatchedNavMeshFileInfo patchedNavMesh_getFileInfo(const char *) { return {}; }
 bool patchedNavMesh_loadFromFile(const char *, dtTileCache *, uint8_t *, ska::flat_hash_set<uint32_t> &) { return {}; }
 
 const Tab<uint32_t> &get_removed_tile_cache_tiles()

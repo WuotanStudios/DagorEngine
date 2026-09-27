@@ -6,7 +6,6 @@
 
 #include <drv/shadersMetaData/spirv/compiled_meta_data.h>
 
-#include <glslang/Public/ShaderLang.h>
 #include <EASTL/vector.h>
 #include <EASTL/string.h>
 #include <vector>
@@ -70,7 +69,15 @@ enum class CompileFlags : uint32_t
   // enable hlsl2021 features
   ENABLE_HLSL21 = 1 << 7,
   // enable mesh shader extension
-  ENABLE_MESH_SHADER = 1 << 8
+  ENABLE_MESH_SHADER = 1 << 8,
+  VALIDATE_GLOBAL_CONSTS_OFFSET_ORDER = 1 << 9,
+  // accept scalar block layout (DX-packed structs) for structured/uniform buffers; the consuming
+  // device must enable the scalarBlockLayout feature. For texgen's DX-packed buffers (e.g. the
+  // ParticleInstance structured buffer) when compiled for Vulkan.
+  USE_SCALAR_LAYOUT = 1 << 10,
+  // suppress DXC's -Wconversion (implicit vector truncation), so HLSL that FXC compiled silently -- e.g.
+  // texgen's shader_editor nodes assigning a float3 tc to a float2 -- also compiles to SPIR-V. Editor opt-in.
+  NO_CONVERSION_WARNINGS = 1 << 11,
 };
 
 inline CompileFlags &operator|=(CompileFlags &self, CompileFlags o)
@@ -101,8 +108,6 @@ inline CompileFlags operator&(CompileFlags l, CompileFlags r)
   return static_cast<CompileFlags>(static_cast<uint32_t>(l) & static_cast<uint32_t>(r));
 }
 
-CompileToSpirVResult compileGLSL(dag::ConstSpan<const char *> sources, EShLanguage target, CompileFlags flags);
-CompileToSpirVResult compileHLSL(dag::ConstSpan<const char *> sources, const char *entry, EShLanguage target, CompileFlags flags);
 CompileToSpirVResult compileHLSL_DXC(const DXCContext *dxc_ctx, dag::ConstSpan<char> source, const char *entry, const char *profile,
-  CompileFlags flags, const eastl::vector<eastl::string_view> &disabledSpirvOptims);
+  int implicit_cbuf_size, CompileFlags flags, const eastl::vector<eastl::string_view> &disabledSpirvOptims);
 } // namespace spirv

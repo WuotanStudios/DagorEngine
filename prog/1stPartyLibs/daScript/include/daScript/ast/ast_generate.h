@@ -6,28 +6,30 @@
 namespace das {
 
     // ExprVar, where name matches
-    bool isExpressionVariable(const ExpressionPtr & expr, const string & name);         // only var
-    bool isExpressionVariableDeref(const ExpressionPtr & expr, const string & name);    // r2v(var) or var
+    bool isExpressionVariable(ExpressionPtr expr, const string & name);         // only var
+    bool isExpressionVariableDeref(ExpressionPtr expr, const string & name);    // r2v(var) or var
     // ExprConstPtr, where value is nullptr
-    bool isExpressionNull(const ExpressionPtr & expr);
+    bool isExpressionNull(ExpressionPtr expr);
 
     // check if block is inferred enough to be promoted to lambda\local_function, return uninferred value or nullptr
     TypeDecl *isFullyInferredBlock ( ExprBlock * block );
 
     // make sure generated code contains line information etc
-    void verifyGenerated ( const ExpressionPtr & expr );
+    void verifyGenerated ( ExpressionPtr expr );
 
     // make sure fake context and fake line info are pre-assigned
     void assignDefaultArguments ( Function * func );
 
     // puts all expression's subexpressions at new location
-    ExpressionPtr forceAt ( const ExpressionPtr & expr, const LineInfo & at );
+    DAS_CC_API ExpressionPtr forceAt ( ExpressionPtr expr, const LineInfo & at );
+    DAS_CC_API FunctionPtr forceAtFunction ( const FunctionPtr & func, const LineInfo & at );
 
     // change generated flag for all subexpressions and variables
-    ExpressionPtr forceGenerated ( const ExpressionPtr & expr, bool setGenerated );
+    DAS_CC_API ExpressionPtr forceGenerated ( ExpressionPtr expr, bool setGenerated );
+    DAS_CC_API FunctionPtr forceGeneratedFunction ( const FunctionPtr & expr, bool setGenerated );
 
     // gives combined region for all subexpressions
-    LineInfo encloseAt ( const ExpressionPtr & expr );
+    DAS_CC_API LineInfo encloseAt ( ExpressionPtr expr );
 
     // replaces all occurrences of block argument name
     void renameBlockArgument ( ExprBlock * block, const string & name, const string & newName );
@@ -54,7 +56,7 @@ namespace das {
             with self
                 ...
     */
-    void modifyToClassMember ( Function * func, Structure * baseClass, bool isExplicit, bool isConstant );
+    DAS_CC_API void modifyToClassMember ( Function * func, Structure * baseClass, bool isExplicit, bool isConstant );
 
     /*
         def Foo ( ... )
@@ -62,18 +64,18 @@ namespace das {
             Foo`Foo(self,...)
             return self
     */
-    FunctionPtr makeClassConstructor ( Structure * baseClass, Function * method );
+    DAS_CC_API FunctionPtr makeClassConstructor ( Structure * baseClass, Function * method );
 
     /*
         __rtti : void? = typeinfo(rtti_classinfo type<Foo>)
     */
-    void makeClassRtti ( Structure * baseClass );
+    DAS_CC_API void makeClassRtti ( Structure * baseClass );
 
     /*
         override def __finalize()
             delete self
     */
-    FunctionPtr makeClassFinalize ( Structure * baseClass );
+    DAS_CC_API FunctionPtr makeClassFinalize ( Structure * baseClass );
 
     /*
      def STRUCT_NAME
@@ -81,13 +83,27 @@ namespace das {
      */
     FunctionPtr makeConstructor ( Structure * str, bool isPrivate );
 
+    // Walk `cls`'s inheritance chain starting from cls->parent, return the closest
+    // ancestor with a user-defined ctor (Klass`Klass not generated). Used by the
+    // synth-ctor body emitter (skip past empty intermediates straight to the deepest
+    // user code) and by the lint (super(...) walk-up matches the same target).
+    // Returns nullptr if `cls` isn't a class, has no parent, or no ancestor has a
+    // user ctor.
+    DAS_CC_API Structure * findChainCtorAncestor ( Structure * cls );
+
+    // Finalizer twin of findChainCtorAncestor: closest ancestor with a user-defined
+    // finalizer ("finalize" class method, not generated). Used by the generated
+    // structure finalizer (chain to the parent's finalize) and by the lint
+    // (derived user finalizer must `delete super.self` when this returns non-null).
+    DAS_API Structure * findChainFinalizerAncestor ( Structure * cls );
+
     /*
      def clone(var a:STRUCT_NAME; b:STRUCT_NAME)
         a.f1 := b.f1
         a.f2 := b.f2
         ...
     */
-    FunctionPtr makeClone ( Structure * str );
+    DAS_CC_API FunctionPtr makeClone ( Structure * str );
 
     /*
      def clone(var a:tuple<...>; var b:tuple<...>)
@@ -95,7 +111,7 @@ namespace das {
       a._1 := b._1
       ...
     */
-    FunctionPtr makeCloneTuple(const LineInfo & at, const TypeDeclPtr & tupleType);
+    FunctionPtr makeCloneTuple(const LineInfo & at, const TypeDeclPtr & tupleType, bool fromConst);
 
     /*
      def clone(var a:tuple<...>; var b:tuple<...>)
@@ -105,7 +121,7 @@ namespace das {
         a._1 := b._1
       ...
     */
-    FunctionPtr makeCloneVariant(const LineInfo & at, const TypeDeclPtr & variantType);
+    FunctionPtr makeCloneVariant(const LineInfo & at, const TypeDeclPtr & variantType, bool fromConst);
 
     /*
         delete var
@@ -117,6 +133,11 @@ namespace das {
      */
     struct ExprInvoke;
     ExprInvoke * makeInvokeMethod ( const LineInfo & at, Expression * a, const string & b );
+
+    /*
+        this is short for invoke(type<callStruct>.b, a, args)
+    */
+    ExprInvoke * makeInvokeMethod ( const LineInfo & at, Structure * callStruct, Expression * a, const string & b );
 
     /*
      pointer finalizer, i.e.
@@ -204,7 +225,7 @@ namespace das {
                 ...block_finally...
      */
     FunctionPtr generateLambdaFinalizer ( const string & lambdaName, ExprBlock * block,
-                                         const StructurePtr & ls );
+                                         const StructurePtr & ls, Program * thisProgram );
 
     /*
          [[__lambda_at_line_xxx
@@ -214,7 +235,7 @@ namespace das {
      */
     ExpressionPtr generateLambdaMakeStruct ( const StructurePtr & ls, const FunctionPtr & lf, const FunctionPtr & lff,
                                             const safe_var_set & capt, const vector<CaptureEntry> & capture, const LineInfo & at,
-                                            Program * thisProgram );
+                                            const LineInfo & captureAt, Program * thisProgram );
 
     /*
          array comprehension [{ for x in src; x_expr; where x_expr }]
@@ -246,13 +267,13 @@ namespace das {
             ...
             deref(blah)
      */
-    void replaceRef2Ptr ( const ExpressionPtr & expr, const string & name );
+    void replaceRef2Ptr ( ExpressionPtr expr, const string & name );
 
     /*
         give variables in the scope of 'expr' block unique names
         only for the top-level block
      */
-    void giveBlockVariablesUniqueNames  ( const ExpressionPtr & expr );
+    void giveBlockVariablesUniqueNames  ( ExpressionPtr expr );
 
     /*
         replace break and continue of a particular loop

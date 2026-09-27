@@ -15,6 +15,7 @@
 #include "net/net.h" // net::ConnectParams
 #include "main/appProfile.h"
 #include "main/physMat.h"
+#include "main/level.h"
 
 #include "game/gameLauncher.h"
 
@@ -40,7 +41,7 @@ inline const DataBlock &dgs_get_game_params()
   return res ? *res : DataBlock::emptyBlock;
 };
 
-inline const char *dgs_get_argv(const char *name) { return ::dgs_get_argv(name, ""); };
+inline bool dgs_has_arg(const char *name) { return !!::dgs_get_argv(name); };
 
 inline void dgs_get_argv_all(
   const char *name, const das::TBlock<bool, const char *> &block, das::Context *context, das::LineInfoArg *at)
@@ -65,7 +66,7 @@ inline void das_switch_scene(
 {
   eastl::vector<eastl::string> importScenes(import_scenes.size);
   for (eastl_size_t i = 0; i < import_scenes.size; ++i)
-    importScenes[i] = import_scenes[i];
+    importScenes[i] = import_scenes[i] ? import_scenes[i] : ""; // das string elements may be null char*
   sceneload::UserGameModeContext ugmCtx = ugm_ctx;
 
   sceneload::switch_scene(scene, eastl::move(importScenes), eastl::move(ugmCtx));
@@ -77,7 +78,7 @@ inline void das_connect_to_session(const das::TArray<char *> &server_urls, const
 {
   net::ConnectParams connectParams;
   for (eastl_size_t i = 0; i < server_urls.size; ++i)
-    connectParams.serverUrls.push_back(server_urls[i]);
+    connectParams.serverUrls.push_back(server_urls[i] ? server_urls[i] : "");
   sceneload::UserGameModeContext ugmCtx = ugm_ctx;
   sceneload::connect_to_session(eastl::move(connectParams), eastl::move(ugmCtx));
 }

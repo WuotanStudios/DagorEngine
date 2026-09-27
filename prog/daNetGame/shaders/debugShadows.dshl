@@ -5,16 +5,17 @@ interval show_shadows: static_shadows<1, csm_shadows<2, csm_cascades<3, contact_
 
 shader debug_shadows
 {
-  ENABLE_ASSERT(ps)
   assume depth_bounds_support = no;
   cull_mode = none;
   z_write = false;
   z_test = false;
   (ps) { world_view_pos@f3 = world_view_pos; }
+  GLOBAL_CONSTS(ps)
 
   USE_EMISSION_DECODE_COLOR_MAP(ps)
   INIT_COMBINE_SHADOWS()
   USE_COMBINE_SHADOWS()
+  INIT_PACK_UNPACK_DYNSTCODE(ps)
   INIT_READ_IS_HERO_COCKPIT(ps)
   USE_READ_IS_HERO_COCKPIT(ps)
   USE_SSSS_TRANSMITTANCE_DECODE(ps)
@@ -46,7 +47,8 @@ shader debug_shadows
   hlsl(ps) {
     float4 debug_shadows_ps(VsOutput input HW_USE_SCREEN_POS): SV_Target
     {
-      PackedShadows shadows = getShadows(input.texcoord, GET_SCREEN_POS(input.pos), input.viewVec, isGbufferHeroCockpit(GET_SCREEN_POS(input.pos).xy));
+      ProcessedGbuffer gbuffer = readProcessedGbuffer(input.texcoord);
+      PackedShadows shadows = getShadows(input.texcoord, GET_SCREEN_POS(input.pos), input.viewVec, gbuffer);
       ##if show_shadows == static_shadows
         return float4(shadows.staticShadow.xxx, 1.f);
       ##elif show_shadows == csm_shadows
@@ -105,11 +107,15 @@ shader static_shadow_debug_mesh_shader
   (vs)
   {
     globtm@f44 = globtm;
-    static_shadow_tex@smp2d = static_shadow_tex;
+    static_shadow_tex@tex2d = static_shadow_tex;
     inverseViewProjectionMatrix@f44 = static_shadow_matrix_inverse;
     texture_size@i1 = static_shadow_size;
     sampling_range@f1 = static_shadow_sampling_range;
     toroidal_center@f2 = (static_shadow_cascade_0_scale_ofs_z_tor.z, static_shadow_cascade_0_scale_ofs_z_tor.w, 0, 0);
+  }
+  INIT_GLOBAL_POINT_CLAMP_SAMPLER(vs)
+  hlsl(vs) {
+    #define static_shadow_tex_samplerstate global_point_clamp_sampler
   }
   hlsl(vs)
   {

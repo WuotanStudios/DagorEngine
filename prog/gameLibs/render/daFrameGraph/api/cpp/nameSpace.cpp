@@ -46,7 +46,8 @@ void NameSpace::setResolution(const char *type_name, T value)
       values && values->staticResolution == value && values->dynamicResolution == value)
     return;
 
-  Runtime::get().onStaticResolutionChange();
+  Runtime::get().onStaticResolutionChange(id);
+  registry.autoResTypesChanged.set(id, true);
   resData.values = ResolutionValues<T>{value, value, value};
   resData.dynamicResolutionCountdown = 0;
 }
@@ -98,7 +99,7 @@ void NameSpace::setDynamicResolution(const char *type_name, T value)
   // We can't immediately change resolution for all textures because history textures will lose
   // their data. So update counter here and decrease it by one when change resolution only for
   // current frame textures.
-  resData.dynamicResolutionCountdown = ResourceScheduler::SCHEDULE_FRAME_WINDOW;
+  resData.dynamicResolutionCountdown = dafg::SCHEDULE_FRAME_WINDOW;
 }
 
 template void NameSpace::setDynamicResolution<IPoint2>(const char *, IPoint2);
@@ -113,10 +114,10 @@ void NameSpace::fillSlot(NamedSlot slot, NameSpace res_name_space, const char *r
   auto &slots = registry.resourceSlots;
   ResNameId prevResNameId = ResNameId::Invalid;
   if (slots.isMapped(slotNameId) && slots[slotNameId].has_value())
-    prevResNameId = slots[slotNameId].value().contents;
+    prevResNameId = slots[slotNameId].value().prevContents;
   slots.set(slotNameId, SlotData{resNameId, prevResNameId});
 
-  Runtime::get().markStageDirty(CompilationStage::REQUIRES_NAME_RESOLUTION);
+  Runtime::get().markStageDirty(CompilationStage::REQUIRES_NAME_RESOLUTION, "resource slot changed");
 }
 
 void NameSpace::updateExternallyConsumedResourceSet(eastl::span<const char *const> res_names)
@@ -127,7 +128,7 @@ void NameSpace::updateExternallyConsumedResourceSet(eastl::span<const char *cons
   for (auto name : res_names)
     registry.sinkExternalResources.insert(registry.knownNames.addNameId<ResNameId>(nameId, name));
 
-  Runtime::get().markStageDirty(CompilationStage::REQUIRES_IR_GRAPH_BUILD);
+  Runtime::get().markStageDirty(CompilationStage::REQUIRES_IR_GRAPH_BUILD, "externally consumed resource set changed");
 }
 
 void NameSpace::markResourceExternallyConsumed(const char *res_name)
@@ -136,7 +137,7 @@ void NameSpace::markResourceExternallyConsumed(const char *res_name)
 
   registry.sinkExternalResources.insert(registry.knownNames.addNameId<ResNameId>(nameId, res_name));
 
-  Runtime::get().markStageDirty(CompilationStage::REQUIRES_IR_GRAPH_BUILD);
+  Runtime::get().markStageDirty(CompilationStage::REQUIRES_IR_GRAPH_BUILD, "externally consumed resource set changed");
 }
 
 void NameSpace::unmarkResourceExternallyConsumed(const char *res_name)
@@ -145,7 +146,7 @@ void NameSpace::unmarkResourceExternallyConsumed(const char *res_name)
 
   registry.sinkExternalResources.erase(registry.knownNames.addNameId<ResNameId>(nameId, res_name));
 
-  Runtime::get().markStageDirty(CompilationStage::REQUIRES_IR_GRAPH_BUILD);
+  Runtime::get().markStageDirty(CompilationStage::REQUIRES_IR_GRAPH_BUILD, "externally consumed resource set changed");
 }
 
 

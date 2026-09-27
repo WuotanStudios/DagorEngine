@@ -4,10 +4,13 @@ dagdp_manager {
   "dagdp_manager:tag"{}
   "dagdp__global_manager:dagdp::GlobalManager"{ _tags:t="render" }
   "dagdp__dyn_shadows_manager:dagdp::DynShadowsManager"{ _tags:t="render" }
+  "dagdp__bvh_manager:dagdp::BvhManager"{ _tags:t="render" }
+  "dagdp__csm_shadows_manager:dagdp::CSMShadowsManager"{ _tags:t="render" }
   "dagdp__riex_manager:dagdp::RiexManager"{ _tags:t="render" }
   "dagdp__heightmap_manager:dagdp::HeightmapManager"{ _tags:t="render" }
   "dagdp__grass_manager:dagdp::GrassManager"{ _tags:t="render" }
   "dagdp__volume_manager:dagdp::VolumeManager"{ _tags:t="render" }
+  "dagdp__grid3d_manager:dagdp::Grid3dManager"{ _tags:t="render" }
 }
 
 dagdp_level_settings {
@@ -32,6 +35,10 @@ dagdp_level_settings {
       value:i=1024
       _info { desc:t="Maximum number of ground tiles to place on." }
     }
+    "dagdp__max_3d_tiles:i"{
+      value:i=1024
+      _info { desc:t="Maximum number of 3d volume tiles to place in." }
+    }
     "dagdp__max_volumes:i"{
       value:i=64
       _info { desc:t="Maximum number of volumes." }
@@ -43,6 +50,12 @@ dagdp_level_settings {
     "dagdp__grass_max_range:r" {
       value:r=10
       _hide:b=yes
+    }
+    "dagdp__csm_max_fov:list<r>"{
+      max_fov:r=120.1
+      max_fov:r=120.1
+      max_fov:r=120.1
+      _info { desc:t="Will be rendered into csm[i] only if camera fov < csm_max_fov[i]." }
     }
   }
 }
@@ -120,6 +133,14 @@ dagdp_has_sample_range {
   "dagdp__sample_range:r"{
     value:r=-1
     _info { desc:t="If greater than 0, will sample 3 points in that range to get position and normal, instead of usual 1." }
+  }
+}
+
+dagdp_has_csm_cascade_count {
+  _track:b=yes
+  "dagdp__csm_cascade_count:i"{
+    value:i=-1
+    _info { desc:t="Will be rendered only to nearest N csm cascades." }
   }
 }
 
@@ -249,6 +270,7 @@ dagdp_placer_on_meshes {
   _use:t="dagdp_has_axis"
   _use:t="dagdp_has_distance_based_scale"
   _use:t="dagdp_has_target_mesh_lod"
+  _use:t="dagdp_has_csm_cascade_count"
   "dagdp_placer_on_meshes:tag"{}
 }
 
@@ -257,6 +279,18 @@ dagdp_placer_volume {
   "dagdp_placer_volume:tag"{}
   _use:t="dagdp_has_sample_range"
   _info { desc:t="Will place objects on geometry inside volumes that reference this placer." }
+}
+
+dagdp_placer_grid3d {
+  _use:t="dagdp_placer"
+  "dagdp_placer_grid3d:tag"{}
+  _use:t="dagdp_has_density"
+  _use:t="dagdp_has_axis"
+  _use:t="dagdp_has_distance_based_scale"
+  _use:t="dagdp_has_jitter"
+  _use:t="dagdp_has_seed"
+  _use:t="dagdp_has_csm_cascade_count"
+  _info { desc:t="Will place objects in 3d space inside volumes that reference this placer." }
 }
 
 dagdp_volume {

@@ -1,5 +1,5 @@
 import:t="%danetlibs/renderer/templates/render_settings.template.blk"
-import:t="dng_lib_entities.blk"
+import:t="lib_entities.blk"
 import:t="lens_flare.blk"
 import:t="game_objects.blk"
 import:t="color_grading_tonemap.blk"
@@ -152,6 +152,7 @@ level{
   level__useGroundHolesCollision:b=no
   level__renderFeaturesOverrideFromLevelBlk:b=no
   "level__renderFeaturesOverrides:object"{}
+  level__render:b=no // load render based on dngRenderIsActive tag
 
   "net__alwaysInScope:tag"{}
 
@@ -260,6 +261,9 @@ water{
     water__level:r=0
     water__fft_resolution:i=7
     water__max_tessellation:i=4
+    water__fresnel_specular_intensity:r=0.02
+    water__fresnel_ambient_reflection:r=0.2
+    water__fresnel_reflection:r=0.5
     water__flowmap:b=yes
     water__has_slopes:b=no
     water__flowmap_tex:t=""
@@ -456,6 +460,17 @@ capsules_ao{
   }
 }
 
+film_grain_lut{
+  _singleton:b=yes
+  film_grain_lut__gen_params:p4=2.5,0.5,1.0,64
+
+  _tracked:t="film_grain_lut__gen_params"
+
+  film_grain_lut{
+    _tags:t="render"
+  }
+}
+
 animchar{
   "animchar__updatable:b"{
     value:b=yes
@@ -544,10 +559,6 @@ animchar{
 dynmat_params_base {
   "additional_data:list<p4>"{
     _tags:t="render"
-  }
-  _group{
-    _tags:t=render
-    needImmediateConstPS:b=true
   }
   "dynamic_material_channels_arr:array" {
     _tags:t="render"
@@ -743,7 +754,7 @@ cinematic_mode_settings{
 
     //Force 100% render scale so that super resolution screenshots work
     "video/antiAliasingMode":i=3
-    "video/temporalUpsamplingRatio":r=100
+    "video/antialiasing_upscaling":t="100"
     "video/dynamicResolution/targetFPS":i=0
     "video/fsr":t="off"
     "video/ssaa":b=no
@@ -764,7 +775,9 @@ cinematic_mode_settings{
     cinematic_mode__superPixels:i=2
     cinematic_mode__vignetteStrength:r=0.0
     cinematic_mode__chromaticAberration:p3=0.01, 0.007, 1 // red, green, offset
-    cinematic_mode__filmGrain:p3=0.0, 1.0, 1.0 // strength, rate, pitch [0.5; 1.0]
+    cinematic_mode__filmGrainNoise:p3=0.0, 1.0, 1.0  // base_strength, rate, pitch [0.5; 1.0]
+    cinematic_mode__filmGrainLut:p4=0.0, 1.0, 1.0, 0 // base_strength, grain_scale, time_scale, exposure_correction
+    cinematic_mode__filmGrainMul:r=1.0
     cinematic_mode__lenseFlareIntensity:r=0.0
     cinematic_mode__lenseDust:b=no
     cinematic_mode__recording:b=no

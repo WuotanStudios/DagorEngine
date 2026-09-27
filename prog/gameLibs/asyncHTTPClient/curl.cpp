@@ -1,9 +1,9 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include <asyncHTTPClient/asyncHTTPClient.h>
+#include <asyncHTTPClient/curl_global.h>
 
 #include <debug/dag_log.h>
-#include <generic/dag_tab.h>
 #include <memory/dag_framemem.h>
 #include <osApiWrappers/dag_critSec.h>
 #include <osApiWrappers/dag_miscApi.h>
@@ -17,13 +17,21 @@
 #include <EASTL/list.h>
 #include <EASTL/string.h>
 #include <EASTL/unique_ptr.h>
+#include <EASTL/fixed_vector.h>
 
-#include <ioSys/dag_brotliIo.h>
+#include <stdlib.h>
 
-#if defined(USE_XCURL)
-#include <Xcurl.h>
-#else
 #include <curl/curl.h>
+
+// 7.32.0 replaced the double-based progress callback with the curl_off_t one
+#if LIBCURL_VERSION_NUM >= 0x072000
+#define CURLX_PROGRESSFUNCTION CURLOPT_XFERINFOFUNCTION
+#define CURLX_PROGRESSDATA     CURLOPT_XFERINFODATA
+typedef curl_off_t progress_off_t;
+#else
+#define CURLX_PROGRESSFUNCTION CURLOPT_PROGRESSFUNCTION
+#define CURLX_PROGRESSDATA     CURLOPT_PROGRESSDATA
+typedef double progress_off_t;
 #endif
 
 #if _TARGET_XBOX
@@ -77,12 +85,15 @@ static long timeout_ms;
 
 static const unsigned int TCP_CONNECT_TIMEOUT_SEC = 12;
 
+static constexpr uint8_t MAX_ACTIVE_REQUESTS = 32;
+
 static eastl::string default_user_agent = "dagor2";
 static eastl::string ca_bundle_file;
 static size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata);
 static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userdata);
+static size_t put_read_callback(char *ptr, size_t size, size_t nmemb, void *userdata);
 
-static int progress_callback(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t);
+static int progress_callback(void *userdata, progress_off_t dltotal, progress_off_t dlnow, progress_off_t, progress_off_t);
 static bool verbose_debug = false;
 
 static size_t curl_debug(CURL *, curl_infotype it, char *msg, size_t n, void *)
@@ -139,17 +150,14 @@ static CURL *make_curl_handle(const char *url, const char *user_agent, bool veri
   CURL *curl = curl_easy_init();
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
   // To consider: always pass header callback for pre-reserve `response` using `Content-Length` header
-#ifndef USE_XCURL // For custom decompressor (e.g. brotli) setup
   if (need_resp_headers || verbose_debug)
-#endif
   {
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, user_data);
   }
-  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
+  curl_easy_setopt(curl, CURLX_PROGRESSFUNCTION, progress_callback);
   curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0);
   curl_easy_setopt(curl, CURLOPT_SHARE, curlsh);
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, TCP_CONNECT_TIMEOUT_SEC);
   curl_easy_setopt(curl, CURLOPT_DNS_USE_GLOBAL_CACHE, 0);
@@ -158,7 +166,7 @@ static CURL *make_curl_handle(const char *url, const char *user_agent, bool veri
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, user_data);
-  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, user_data);
+  curl_easy_setopt(curl, CURLX_PROGRESSDATA, user_data);
   curl_easy_setopt(curl, CURLOPT_PRIVATE, user_data);
   curl_easy_setopt(curl, CURLOPT_VERBOSE, verbose_debug ? 1L : 0L);
   curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, curl_debug);
@@ -238,10 +246,6 @@ public:
 
     for (Header const &h : params.headers)
     {
-#if defined(USE_XCURL)
-      if (nullptr != strchr(h.second, '\n'))
-        logerr("xCurl doesn't support multiline headers. URL: <%s>, HEADER: <%s>", urlStr.c_str(), h.first);
-#endif
       eastl::string hstr = h.first;
       hstr += ": ";
       hstr += h.second;
@@ -271,6 +275,15 @@ public:
 
       DEBUG_VERBOSE("HTTP Request POST. Request data:%.*s", reqData.size(), reqData.data());
     }
+    else if (params.reqType == HTTPReq::PUT)
+    {
+      curl_easy_setopt(curlHandle, CURLOPT_UPLOAD, 1L);
+      curl_easy_setopt(curlHandle, CURLOPT_READFUNCTION, put_read_callback);
+      curl_easy_setopt(curlHandle, CURLOPT_READDATA, this);
+      curl_easy_setopt(curlHandle, CURLOPT_INFILESIZE_LARGE, (curl_off_t)reqData.size());
+
+      DEBUG_VERBOSE("HTTP Request PUT. Request data:%.*s", reqData.size(), reqData.data());
+    }
     else if (params.reqType == HTTPReq::HEAD)
     {
       curl_easy_setopt(curlHandle, CURLOPT_NOBODY, 1);
@@ -299,7 +312,7 @@ public:
     {
       curl_easy_setopt(curlHandle, CURLOPT_NOPROGRESS, 1);
       curl_easy_setopt(curlHandle, CURLOPT_HEADERFUNCTION, nullptr);
-      curl_easy_setopt(curlHandle, CURLOPT_XFERINFOFUNCTION, nullptr);
+      curl_easy_setopt(curlHandle, CURLX_PROGRESSFUNCTION, nullptr);
       curl_easy_cleanup(curlHandle);
     }
 
@@ -333,14 +346,17 @@ public:
 
     if (!sendResponseInMainThreadOnly || is_main_thread())
     {
+      callback->onConnectionInfo(primaryIp.c_str());
       callback->onRequestDone(result, httpCode, response, respHeadersMap);
       callback->release();
     }
     else
     {
       delayed_call([callback = this->callback, result, httpCode = this->httpCode, response = eastl::move(response),
-                     resp_headers = needResponseHeaders ? copy_string_map_view(respHeadersMap) : HeadersList{}] {
+                     resp_headers = needResponseHeaders ? copy_string_map_view(respHeadersMap) : HeadersList{},
+                     primaryIp = eastl::move(this->primaryIp)] {
         StringMap respHeaders(resp_headers.begin(), resp_headers.end());
+        callback->onConnectionInfo(primaryIp.c_str());
         callback->onRequestDone(result, httpCode, response, respHeaders);
         callback->release();
       });
@@ -361,20 +377,6 @@ public:
   size_t updateResponse(dag::Span<char> data)
   {
     size_t downloadedSize = data.size();
-#if defined(USE_XCURL)
-    Tab<char> decoded;
-    if (decompressor)
-    {
-      auto res = decompressor->decompress(dag::Span<uint8_t>((uint8_t *)data.begin(), data.size()), decoded);
-      if (res != StreamDecompressResult::FINISH && res != StreamDecompressResult::NEED_MORE_INPUT)
-      {
-        debug("Failed to decompress data from '%s'. Request aborted", urlStr.c_str());
-        return 0;
-      }
-      data = make_span(decoded.data(), decoded.size());
-    }
-#endif
-
     if (callback->onResponseData(data))
       return downloadedSize;
 
@@ -390,26 +392,9 @@ public:
     return downloadedSize;
   }
 
-#if defined(USE_XCURL)
-  void trySetDecompressorByHeader(dag::Span<char> header)
-  {
-    eastl::string_view hv(header.data(), header.size());
-    if (eastl::string_view::size_type pos = hv.find("Content-Encoding:"); pos != hv.npos)
-    {
-      decompressor.reset();
-      pos = hv.find("br", pos);
-      if (pos != hv.npos)
-        decompressor.reset(new BrotliStreamDecompress());
-    }
-  }
-#endif
-
   void addResponseHeader(dag::Span<char> header)
   {
     DEBUG_VERBOSE("add response header:%.*s", header.size(), header.data());
-#if defined(USE_XCURL)
-    trySetDecompressorByHeader(header);
-#endif
     if (needResponseHeaders)
     {
       responseHeaders.emplace_back(header.begin(), header.end());
@@ -473,6 +458,7 @@ public:
   curl_slist *headersList;
   eastl::string urlStr;
   dag::Vector<char> reqData;
+  size_t putReadOffset = 0;
 
   bool needResponseHeaders;
   bool sendResponseInMainThreadOnly;
@@ -481,12 +467,10 @@ public:
 
   int httpCode = 0;
   CURLcode curlResult = CURLE_OK;
+  eastl::string primaryIp;
   dag::Vector<char> response;
   dag::Vector<eastl::string> responseHeaders; // Note: string_view in `respHeadersMap` are pointing within
   httprequests::StringMap respHeadersMap;
-#ifdef USE_XCURL
-  eastl::unique_ptr<IStreamDecompress> decompressor;
-#endif
 };
 
 using RequestStatePtr = eastl::unique_ptr<RequestState>;
@@ -494,12 +478,29 @@ using RequestStatePtr = eastl::unique_ptr<RequestState>;
 static eastl::list<RequestStatePtr> active_requests;
 static eastl::list<RequestStatePtr> requests_queue;
 
-static int progress_callback(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t)
+static int progress_callback(void *userdata, progress_off_t dltotal, progress_off_t dlnow, progress_off_t, progress_off_t)
 {
   RequestState *context = (RequestState *)userdata;
   if (dlnow > 0 || dltotal > 0)
-    context->onDownloadProgress(dltotal, dlnow);
+    context->onDownloadProgress((size_t)dltotal, (size_t)dlnow);
   return 0;
+}
+
+static size_t put_read_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+  RequestState *context = (RequestState *)userdata;
+  size_t bufferSize = size * nmemb;
+
+  if (context->putReadOffset >= context->reqData.size())
+    return 0;
+
+  size_t remaining = context->reqData.size() - context->putReadOffset;
+  size_t toSend = remaining < bufferSize ? remaining : bufferSize;
+
+  memcpy(ptr, context->reqData.data() + context->putReadOffset, toSend);
+  context->putReadOffset += toSend;
+
+  return toSend;
 }
 
 static size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata)
@@ -531,14 +532,8 @@ static int timer_func(CURLM *, long timeout, void *)
 
 static void move_queue_to_active_requests_nolock()
 {
-#if USE_XCURL
-  static constexpr uint8_t MAX_ACTIVE_REQUESTS = 4;
-#else
-  static constexpr uint8_t MAX_ACTIVE_REQUESTS = 32;
-#endif
-
 #if _TARGET_XBOX
-  if (!gdk::has_network_access())
+  if (gdk::get_network_availability() <= gdk::NetworkAvailability::None)
     return;
 #endif
 
@@ -563,18 +558,8 @@ RequestId async_request(AsyncRequestParams const &params)
   RequestStatePtr context = eastl::make_unique<RequestState>(params);
   RequestState *ctxPtr = context.get();
   {
-    if (mutex->tryLock())
-    {
-      active_requests.push_back(eastl::move(context));
-      curl_multi_add_handle(curlm, ctxPtr->getCurlHandle());
-      mutex->unlock();
-    }
-    else
-    {
-      debug("Curl: cannot lock active_requests list. Put request to the queue.");
-      WinAutoLock lock(*queue_mutex);
-      requests_queue.push_back(eastl::move(context));
-    }
+    WinAutoLock lock(*queue_mutex);
+    requests_queue.push_back(eastl::move(context));
   }
   debug("send request to '%s'", params.url);
   return intptr_t(ctxPtr);
@@ -591,6 +576,19 @@ void abort_request(RequestId req_id)
     if (it != active_requests.end())
     {
       reqState->abort();
+      return;
+    }
+  }
+  {
+    WinAutoLock lock(*queue_mutex);
+    RequestState *reqState = (RequestState *)req_id;
+    auto it = eastl::find_if(requests_queue.begin(), requests_queue.end(),
+      [reqState](RequestStatePtr const &ptr) { return ptr.get() == reqState; });
+    if (it != requests_queue.end())
+    {
+      reqState->abort();
+      reqState->sendResult();
+      requests_queue.erase(it);
       return;
     }
   }
@@ -612,6 +610,12 @@ void abort_all_requests(AbortMode mode)
     for (RequestStatePtr &rstate : aborted)
       curl_multi_remove_handle(curlm, rstate->getCurlHandle());
   }
+  {
+    WinAutoLock lock(*queue_mutex);
+    for (RequestStatePtr &rstate : requests_queue)
+      aborted.push_back(eastl::move(rstate));
+    requests_queue.clear();
+  }
 
   for (RequestStatePtr &rstate : aborted)
   {
@@ -623,7 +627,8 @@ void abort_all_requests(AbortMode mode)
   }
 }
 
-static void update_multi_nolock(eastl::list<RequestStatePtr> &finished)
+template <typename Cont>
+static void update_multi_nolock(Cont &finished)
 {
   int numfds = 0;
   int nrunning = 0;
@@ -669,6 +674,8 @@ static void update_multi_nolock(eastl::list<RequestStatePtr> &finished)
       char *addr = NULL;
       curl_easy_getinfo(easy, CURLINFO_PRIMARY_IP, &addr);
       DEBUG_VERBOSE("Curl addr: %s", addr);
+      if (addr)
+        reqState->primaryIp = addr;
 
       double connectTime = 0;
       double totalTime = 0;
@@ -687,9 +694,15 @@ static void update_multi_nolock(eastl::list<RequestStatePtr> &finished)
               "nl %.2fms. size: %d",
           url, addr, curl_easy_strerror(code), totalTime * 1000, connectTime * 1000, nameLookupTime * 1000, reqState->responseSize());
       }
-      else
+      else if (respCode >= 200 && respCode < 400)
       {
         debug("request to '%s' ip: %s succeed with code %d. times: total %.2fms, conn %.2fms, "
+              "nl %.2fms. size: %d",
+          url, addr, (int)respCode, totalTime * 1000, connectTime * 1000, nameLookupTime * 1000, reqState->responseSize());
+      }
+      else
+      {
+        debug("request to '%s' ip: %s failed with HTTP status %d. times: total %.2fms, conn %.2fms, "
               "nl %.2fms. size: %d",
           url, addr, (int)respCode, totalTime * 1000, connectTime * 1000, nameLookupTime * 1000, reqState->responseSize());
       }
@@ -727,41 +740,8 @@ static void collect_aborted_requests_nolock(eastl::list<RequestStatePtr> &finish
 
 static void poll_on_idle_cycle(void *) { httprequests::poll(); }
 
-struct CurlPollThread final : public DaThread
+void poll_impl()
 {
-  int64_t thread_id = 0;
-  os_event_t event;
-
-  CurlPollThread() : DaThread("CurlPollThread", 128 << 10, 0, WORKER_THREADS_AFFINITY_MASK) { os_event_create(&event); }
-  ~CurlPollThread() { os_event_destroy(&event); }
-
-  void execute() override
-  {
-    thread_id = get_current_thread_id();
-    while (!isThreadTerminating())
-    {
-      // Thread will be blocked until event is set or 10ms timeout elapsed
-      // We need to make thread alertable because Sleep is not guaranteed
-      // to wake up at any specific interval
-      os_event_wait(&event, 10);
-      httprequests::poll();
-    }
-  }
-
-  void wakeup() { os_event_set(&event); }
-};
-
-static eastl::unique_ptr<CurlPollThread> g_poll_thread;
-
-
-void poll()
-{
-  if (g_poll_thread && g_poll_thread->thread_id != get_current_thread_id())
-  {
-    g_poll_thread->wakeup();
-    return;
-  }
-
   TIME_PROFILE(http_requests_poll);
 
   eastl::list<RequestStatePtr> finished;
@@ -784,6 +764,41 @@ void poll()
     request->sendResult();
 }
 
+struct CurlPollThread final : public DaThread
+{
+  os_event_t event;
+
+  CurlPollThread() : DaThread("CurlPollThread", 128 << 10, 0, WORKER_THREADS_AFFINITY_MASK) { os_event_create(&event); }
+  ~CurlPollThread() { os_event_destroy(&event); }
+
+  void execute() override
+  {
+    while (!isThreadTerminating())
+    {
+      // Thread will be blocked until event is set or 10ms timeout elapsed
+      // We need to make thread alertable because Sleep is not guaranteed
+      // to wake up at any specific interval
+      os_event_wait(&event, 10);
+      httprequests::poll_impl();
+    }
+  }
+
+  void wakeup() { os_event_set(&event); }
+};
+
+static eastl::unique_ptr<CurlPollThread> g_poll_thread;
+
+void poll()
+{
+  if (g_poll_thread)
+  {
+    g_poll_thread->wakeup();
+    return;
+  }
+
+  poll_impl();
+}
+
 
 void init_async(InitAsyncParams const &params)
 {
@@ -791,11 +806,22 @@ void init_async(InitAsyncParams const &params)
 
   if (!curlm)
   {
+    // Init the globals here, not lazily on the first easy handle: that registers
+    // OpenSSL's atexit, and ours must come later to run before it. An atexit and not
+    // a static destructor also runs before the pre-main statics (delayedActions) are
+    // gone. Once only: shutdown_async() clears curlm and a later request inits again
+    curl_global::init();
+    static bool cleanup_registered = false;
+    if (!cleanup_registered)
+      cleanup_registered = atexit(&shutdown_async) == 0;
+
     curlm = curl_multi_init();
     curl_multi_setopt(curlm, CURLMOPT_TIMERFUNCTION, &timer_func);
     curl_multi_setopt(curlm, CURLMOPT_TIMERDATA, NULL);
     curl_multi_setopt(curlm, CURLMOPT_PIPELINING, 1);
+#if LIBCURL_VERSION_NUM >= 0x071E00 // 7.30.0, no equivalent cap before that
     curl_multi_setopt(curlm, CURLMOPT_MAX_TOTAL_CONNECTIONS, 10);
+#endif
 
     curlsh = curl_share_init();
     curl_share_setopt(curlsh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
@@ -807,13 +833,6 @@ void init_async(InitAsyncParams const &params)
     queue_mutex = new WinCritSec;
 
     bool pollInThread = params.pollInThread;
-
-#if defined(USE_XCURL)
-    // xCurl will block suspend until all in-progress requests are
-    // completed, and failing to call curl_multi_perform may cause
-    // title to timeout during suspend.
-    pollInThread = true;
-#endif
 
     if (pollInThread)
     {
@@ -873,11 +892,5 @@ void shutdown_async()
   safe_delete_mutex(mutex);
   safe_delete_mutex(queue_mutex);
 }
-
-struct StaticCleanup
-{
-  ~StaticCleanup() { shutdown_async(); }
-
-} static_cleanup;
 
 } // namespace httprequests

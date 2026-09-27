@@ -6,6 +6,7 @@
 
 #include <generic/dag_tab.h>
 #include <EASTL/vector.h>
+#include <EASTL/unique_ptr.h>
 #include <generic/dag_span.h>
 #include <dag/dag_vector.h>
 
@@ -37,7 +38,7 @@ class GuiContext;
 
 namespace sqfrp
 {
-class BaseObservable;
+class WatchedHandle;
 }
 
 namespace darg
@@ -63,6 +64,7 @@ class ScrollHandler;
 class Transition;
 class ElementTree;
 class ElementRef;
+class StatefulInstance;
 
 
 struct ElemStacks
@@ -123,7 +125,7 @@ public:
     F_SIZE_CALCULATED = 0x0010,
     F_HAS_EVENT_HANDLERS = 0x0020,
     F_DISABLE_INPUT = 0x0040,
-    F_STOP_MOUSE = 0x0080,
+    F_STOP_POINTING = 0x0080,
     F_STOP_HOVER = 0x0100,
     F_STOP_HOTKEYS = 0x0200,
     F_STICK_CURSOR = 0x0400,
@@ -169,6 +171,7 @@ public:
   void calcSizeConstraints(int axis, float *sz_min, float *sz_max) const;
   void calcFixedSizes();
   void calcConstrainedSizes(int axis);
+  bool isFlowAxis(int axis) const;
 
   void putToSortedStacks(ElemStacks &stacks, ElemStackCounters &counters, int parent_z_order, bool parent_disable_input);
   void traceHit(const Point2 &p, InputStack *stack, int parent_z_order, int &hier_order);
@@ -211,7 +214,7 @@ public:
   bool isDetached() const { return hasFlags(F_DETACHED); }
   bool bboxIsClippedOut() const { return hasFlags(F_SCREEN_BOX_CLIPPED_OUT); }
 
-  Element *findChildByScriptCtor(const Sqrat::Object &ctor) const;
+  Element *findChildByScriptCtor(const Sqrat::Object &ctor, bool recursive) const;
 
   bool hitTest(const Point2 &p) const;
   bool hitTest(float x, float y) const { return hitTest(Point2(x, y)); }
@@ -231,7 +234,7 @@ public:
   void delayedCallElemStateHandler();
 
   // IStateWatcher implementation
-  virtual void onObservableRelease(sqfrp::BaseObservable *observable) override;
+  virtual void onObservableRelease(sqfrp::NodeId id) override;
   virtual bool onSourceObservableChanged() override;
   virtual Sqrat::Object dbgGetWatcherScriptInstance() override;
 
@@ -288,13 +291,13 @@ private:
   Point2 calcParentRelPos();
   void alignChildren(int axis);
   float calcContentSizeByAxis(int axis);
-  bool isFlowAxis(int axis) const;
 
   void playStateChangeSound(int prev_flags, int cur_flags);
 
   void afterRecalc();
 
   void validateStaticText();
+  void overrideRootSize(SetupMode setup_mode);
   void clampSizeToLimits(int axis, float &sz_px);
 
   void applyTransform(const GuiVertexTransform &prev_gvtm, GuiVertexTransform &res_gvtm) const;
@@ -324,7 +327,7 @@ public:
   Properties props;
   dag::Vector<Transition> transitions;
 
-  dag::Vector<sqfrp::BaseObservable *> watch;
+  dag::Vector<sqfrp::NodeId> watch;
 
   Transform *transform = nullptr;
 
@@ -335,7 +338,9 @@ public:
 
   XmbData *xmb = nullptr;
 
-  Point2 textSizeCache = Point2(-1, -1);
+  // Survives detach for the sake of fade-out callbacks: at final deletion it is
+  // moved to a queued disposer rather than released here.
+  eastl::unique_ptr<StatefulInstance> statefulInst;
 
   Point2 scrollVel = Point2(0, 0);
   ElementRef *ref = nullptr;

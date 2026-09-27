@@ -99,12 +99,11 @@ shader render_ambient
       GI_VOLUMETRIC_IRRADIANCE_INIT(ps)
       GI_VOLUMETRIC_IRRADIANCE_USE(ps)
     }
-
-
     hlsl(ps) {
       #define AMBIENT 1
       #define NEED_SAMPLE_DEPTH 1
       #include <interleavedGradientNoise.hlsl>
+      #include <dagi_specular_clamp.hlsl>
     }
   }
 
@@ -146,6 +145,15 @@ shader render_ambient
       uint age : SV_Target2;
       ##endif
     };
+
+    ##if hardware.ps4 || hardware.ps5
+      #pragma PSSL_target_output_format(target 0 FMT_32_R)
+      #pragma PSSL_target_output_format(target 1 FMT_32_R)
+      ##if (gi_quality == screen_probes)
+        #pragma PSSL_target_output_format(target 2 FMT_32_R)
+      ##endif
+    ##endif
+
     Output shadows_to_target_ps(VsOutput input HW_USE_SCREEN_POS)
     {
       Output output;
@@ -212,9 +220,9 @@ shader render_ambient
         ##elif (gi_quality == only_ao)
           float ofs = max(dist*0.04, 0.25*dagi_sky_vis_probe_size(0));
           worldPos += view*ofs;
-          float4 sh1 = dagi_get_sky_visibility_smooth_sh1(world_view_pos.xyz, worldPos, view, max(0, dist-ofs), normal, interleavedGradientNoise( screenpos.xy ) );
-          if (all(sh1 != 1))
-            ambient = GetSHFunctionValueSimple(enviLightingNormal, enviSPH0*sh1.wyzx, enviSPH1*sh1.wyzx, enviSPH2*sh1.wyzx);
+          float vignette;
+          float4 sh1 = dagi_get_sky_visibility_smooth_vignette(world_view_pos.xyz, worldPos, view, max(0, dist-ofs), normal, interleavedGradientNoise( screenpos.xy ), vignette);
+          ambient = lerp(GetSHFunctionValueSimple(enviLightingNormal, enviSPH0*sh1.wyzx, enviSPH1*sh1.wyzx, enviSPH2*sh1.wyzx), ambient, vignette);
           #define HAS_SPECULAR 0
           #define HACK_SPECULAR_BRIGHTNESS 1
         ##endif
@@ -234,16 +242,21 @@ shader render_ambient
             specular = giSpecular;
         }
         #if HACK_SPECULAR_BRIGHTNESS
-           //fixme: add support specular from radiance grid
-            half3 environmentAmbientReflection = specular;
-            //https://www.activision.com/cdn/research/Volumetric_Global_Illumination_at_Treyarch.pdf
-            //another (much faster) fake from Volumetric Global Illumination at Treyarch
-            float mipForTrick =  linearRoughness*NUM_PROBE_MIPS;
-            float maximumSpecValue = max3( 1.26816, 9.13681 * exp2( 6.85741 - 2 * mipForTrick ) * NdotV, 9.70809 * exp2( 7.085 - mipForTrick - 0.403181 * pow2(mipForTrick)) * NdotV );
-            maximumSpecValue = min(maximumSpecValue, 32);//to be removed with envi light probes in rooms
-            float3 adjustedMaxSpec = ambient * maximumSpecValue;
-            float3 reflection = environmentAmbientReflection * (adjustedMaxSpec / ( adjustedMaxSpec + environmentAmbientReflection + 0.001));//avoid nans
-            specular = reflection;
+        {
+            ##if gi_quality == screen_probes
+            const float minSpecScale = 8.0;
+            ##elif (gi_quality == colored)
+            const float minSpecScale = 4.0;
+            ##else
+            const float minSpecScale = 1.26816;
+            ##endif
+            float maxSpecScale = dagi_max_specular_scale(linearRoughness, NdotV, minSpecScale, NUM_PROBE_MIPS);
+            ##if gi_quality == screen_probes
+            specular = dagi_bound_probe_specular(specular, ambient, maxSpecScale);
+            ##else
+            specular = dagi_clamp_untrusted_specular(specular, ambient, maxSpecScale);
+            ##endif
+        }
         #endif
       ##endif
 

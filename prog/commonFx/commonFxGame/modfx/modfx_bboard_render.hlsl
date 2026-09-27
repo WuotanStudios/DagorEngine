@@ -1,6 +1,7 @@
 #ifndef DAFX_MODFX_BBOARD_RENDER_HLSL
 #define DAFX_MODFX_BBOARD_RENDER_HLSL
 
+#include "dafx_quality_flags.hlsli"
 #include "modfx/modfx_curve.hlsli"
 #include "modfx/modfx_misc.hlsli"
 #include "modfx/modfx_part_data.hlsli"
@@ -24,7 +25,7 @@
   float3 get_spot_lighting(float3 pos, float3 view_dir_norm, int spot_light_index)
   {
     RenderSpotLight sl = spot_lights_cb[spot_light_index];
-    float4 lightPosRadius = sl.lightPosRadius;
+    float4 lightPosRadius = decode_spot_light_pos_radius(sl);
     half4 lightColor = half4(sl.lightColorAngleScale);
     half4 lightDirection = half4(sl.lightDirectionAngleOffset);
 
@@ -48,50 +49,41 @@
     return attenuation * lightColor.xyz;
   }
 
+  float3 get_omni_lighting_indexed(uint omni_light_index, float3 pos)
+  {
+    RenderOmniLight light = omni_lights_cb[omni_light_index];
+    return get_omni_lighting(pos, light.posRadius.xyz, light.posRadius.a, get_omni_light_color(light).rgb);
+  }
+
   float3 get_lighting_from_clustered_lights(float3 pos, float3 view_dir_norm, float2 tc, float proj_dist)
   {
     float3 lighting = 0;
 
     // Find omni lights outside of current modfx
-    uint sliceId = min(getSliceAtDepth(proj_dist, depthSliceScale, depthSliceBias), CLUSTERS_D);
-    uint clusterIndex = getClusterIndex(tc, sliceId);
+    uint clusterIndex = frustum_clusters_get_cluster_index(tc, proj_dist, depthSliceScale, depthSliceBias);
 
-    uint omniAddress = clusterIndex*omniLightsWordCount;
-    LOOP
-    for ( uint omniWordIndex = 0; omniWordIndex < omniLightsWordCount; omniWordIndex++ )
-    {
-      // Can't use MERGE_MASK in the vertex shader, so just read mask for current vertex
-      uint mask = flatBitArray[omniAddress + omniWordIndex];
-      while ( mask != 0 )
-      {
-        uint bitIndex = firstbitlow( mask );
-        mask ^= ( 1U << bitIndex );
-        uint omni_light_index = ((omniWordIndex<<5) + bitIndex);
-        RenderOmniLight light = omni_lights_cb[omni_light_index];
-        lighting += get_omni_lighting(pos, light.posRadius.xyz, light.posRadius.a, get_omni_light_color(light).rgb);
-      }
-    }
+    uint omniAddress = get_cluster_grid_omni_address(clusterIndex, omniLightsWordCount);
+    // Can't use MERGE_MASK in the vertex shader, so just read mask for current vertex
+    #define CLUSTER_GRID_WALK_MERGE_MASK(m) (m)
+    #define CLUSTER_GRID_WALK_WORD_LOOP_ATTR LOOP
+    #define CLUSTER_GRID_WALK_ADDRESS omniAddress
+    #define CLUSTER_GRID_WALK_WORD_COUNT omniLightsWordCount
+    #define CLUSTER_GRID_WALK_LIGHT_BODY(omni_light_index) lighting += get_omni_lighting_indexed(omni_light_index, pos);
+    #include <cluster_grid_lights_walk.hlsli>
 
-    uint spotAddress = clusterIndex*spotLightsWordCount + ((CLUSTERS_D+1)*CLUSTERS_H*CLUSTERS_W*omniLightsWordCount);
-    LOOP
-    for ( uint spotWordIndex = 0; spotWordIndex < spotLightsWordCount; spotWordIndex++ )
-    {
-      // Can't use MERGE_MASK in the vertex shader, so just read mask for current vertex
-      uint mask = flatBitArray[spotAddress + spotWordIndex];
-      while ( mask != 0 )
-      {
-        uint bitIndex = firstbitlow( mask );
-        mask ^= ( 1U << bitIndex );
-        uint spot_light_index = ((spotWordIndex<<5) + bitIndex);
-        lighting += get_spot_lighting(pos, view_dir_norm, spot_light_index);
-      }
-    }
+    uint spotAddress = get_cluster_grid_spot_address(clusterIndex, spotLightsWordCount, omniLightsWordCount);
+    #define CLUSTER_GRID_WALK_MERGE_MASK(m) (m)
+    #define CLUSTER_GRID_WALK_WORD_LOOP_ATTR LOOP
+    #define CLUSTER_GRID_WALK_ADDRESS spotAddress
+    #define CLUSTER_GRID_WALK_WORD_COUNT spotLightsWordCount
+    #define CLUSTER_GRID_WALK_LIGHT_BODY(spot_light_index) lighting += get_spot_lighting(pos, view_dir_norm, spot_light_index);
+    #include <cluster_grid_lights_walk.hlsli>
 
     return lighting;
   }
 #endif
 
-#if MODFX_USE_SHADOW
+#if MODFX_USE_FAKE_BRIGHTNESS || MODFX_USE_STATIC_SHADOW
   half get_static_shadow_for_fx(float3 pos, float radius, float3 wpos, float3 view_dir_norm, float3 from_sun_direction)
   {
     static const int shadowBroadSampleCnt = 2;
@@ -166,9 +158,9 @@
     uint flags = parent_data.flags;
 
     bool reverse_order = FLAG_ENABLED( flags, MODFX_RFLAG_REVERSE_ORDER );
-    uint data_ofs = dafx_get_render_data_offset( ren_info, !reverse_order );
-
-    bool is_dead = false;
+    uint rel_iid = dafx_get_render_calc_rel_iid(ren_info, !reverse_order);
+    uint data_ofs = dafx_get_render_data_offset(ren_info, rel_iid);
+    bool is_dead = dafx_is_reduced_render_discard(ren_info, rel_iid);
 
 #if MODFX_RIBBON_SHAPE
 
@@ -190,7 +182,7 @@
     if ( ribbon_side )
     {
       ren_info.instance_id = max( (int)ren_info.instance_id - 1, 0 );
-      uint prev_data_ofs = dafx_get_render_data_offset( ren_info, !reverse_order );
+      uint prev_data_ofs = dafx_calc_rel_iid_and_get_render_data_offset( ren_info, !reverse_order );
       uint other_side_ofs = prev_data_ofs;
       if (!ribbon_start) // tail should 100% mimic older part head
       {
@@ -215,10 +207,10 @@
     uint ren_instance_id = ren_info.instance_id;
 
     ren_info.instance_id = min( ren_instance_id + 1, ren_info.count - 1 );
-    uint sample_data_ofs_newer = dafx_get_render_data_offset( ren_info, !reverse_order );
+    uint sample_data_ofs_newer = dafx_calc_rel_iid_and_get_render_data_offset( ren_info, !reverse_order );
 
     ren_info.instance_id = max( (int)ren_instance_id - 1, 0 );
-    uint sample_data_ofs_older = dafx_get_render_data_offset( ren_info, !reverse_order );
+    uint sample_data_ofs_older = dafx_calc_rel_iid_and_get_render_data_offset( ren_info, !reverse_order );
 
     if ( MODFX_RDECL_POS_ENABLED( decls ) )
     {
@@ -256,12 +248,8 @@
     float4x4 wtm = get_identity_tm();
     float wtm_scale = 1;
     if ( parent_data.mods_offsets[MODFX_RMOD_INIT_TM] )
-#if MOBILE_DEVICE
-      // old Adreno drivers fail to compile usual loader variant
+      // old Adreno drivers fail to compile usual loader variant, using noret instead
       dafx_get_44mat_scale_noret( 0, parent_data.mods_offsets[MODFX_RMOD_INIT_TM], wtm, wtm_scale);
-#else
-      wtm = dafx_get_44mat_scale( 0, parent_data.mods_offsets[MODFX_RMOD_INIT_TM], wtm_scale);
-#endif
 
     bool apply_wtm = FLAG_ENABLED( flags, MODFX_RFLAG_USE_ETM_AS_WTM );
     if ( apply_wtm )
@@ -306,12 +294,13 @@
 #endif
 
     float zfar_opacity = 1.0f;
+    float znear_opacity = 1.0f;
 
 #if !(MODFX_SHADER_VOLSHAPE || MODFX_SHADER_VOLSHAPE_WBOIT) && !MODFX_SHADER_VOLFOG_INJECTION
     if ( parent_data.mods_offsets[MODFX_RMOD_DEPTH_MASK] && !is_dead )
     {
       ModfxDepthMask pp = ModfxDepthMask_load( 0, parent_data.mods_offsets[MODFX_RMOD_DEPTH_MASK] );
-      float znear_opacity = ( view_dir_dist - gdata.znear_offset - pp.znear_clip_offset ) * pp.znear_softness_rcp;
+      znear_opacity = ( view_dir_dist - gdata.znear_offset - pp.znear_clip_offset ) * pp.znear_softness_rcp;
       if ( FLAG_ENABLED( flags, MODFX_RFLAG_DEPTH_MASK_USE_PART_RADIUS ) )
         znear_opacity *= rcp(rdata.radius);
       znear_opacity = saturate(znear_opacity);
@@ -433,6 +422,7 @@
 
 #if (MODFX_SHADER_VOLSHAPE || MODFX_SHADER_VOLSHAPE_WBOIT)
     float stable_rnd_offset = (ren_info.instance_id + ren_info.data_ofs % 20 ) * 0.001;
+    float3 original_rdata_pos = rdata.pos;
     rdata.pos += gdata.view_dir_z * stable_rnd_offset;
 
     float proj_dist_abs = abs(proj_dist);
@@ -512,7 +502,11 @@
 
       ModfxDeclShapeStaticAligned pp = ModfxDeclShapeStaticAligned_load( 0, parent_data.mods_offsets[MODFX_RMOD_SHAPE_STATIC_ALIGNED] );
 
-      float cross_k = abs( dot( normalize( cross( up_vec, right_vec ) ), view_dir_norm ) );
+      float3 pivot_delta = (pivot_offset.x * right_vec * aspect.x + pivot_offset.y * up_vec * aspect.y) * rdata.radius;
+      float3 view_dir_with_pivot = view_dir - pivot_delta;
+      float3 view_dir_with_pivot_norm = normalize(view_dir_with_pivot);
+
+      float cross_k = abs( dot( normalize( cross( up_vec, right_vec ) ), view_dir_with_pivot_norm ) );
       cross_k = saturate( cross_k - pp.cross_fade_threshold ) * rcp( 1.f - pp.cross_fade_threshold );
       float a = 1.f - pow( abs( ( 1.f - cross_k ) * pp.cross_fade_mul ), pp.cross_fade_pow );
 
@@ -591,6 +585,11 @@
     VsOutput vs_out;
 
     wpos += camera_offset * view_dir_norm;
+
+#if DAFX_USE_VOXEL_SHADOWS_PS
+    vs_out.wpos = wpos.xyz;
+#endif
+
     vs_out.pos = mul( float4( wpos, 1.f ), gdata.globtm );
 #if MODFX_PASS_FRAME_FLAGS
     vs_out.frame_flags = rdata.frame_flags;
@@ -607,11 +606,9 @@
 #endif
 
 #if MODFX_USE_GI
-    if ( FLAG_ENABLED( flags, MODFX_RFLAG_LIGHTING_AMBIENT_ENABLED ) )
-      vs_out.ambient.rgb = ambient_calculating(wpos, gdata.world_view_pos, gdata.sky_color, vs_out.pos);
-    else
-      vs_out.ambient.rgb = gdata.sky_color;
+    vs_out.ambient.rgb = ambient_calculating(wpos, gdata.world_view_pos, gdata.sky_color, vs_out.pos);
 #endif
+
 #if MODFX_RAIN
     BRANCH
     if (!is_dead)
@@ -620,11 +617,24 @@
 
 #if MODFX_BBOARD_LIGHTING_FROM_CLUSTERED_LIGHTS && !SIMPLIFIED_VS_LIGHTING
     BRANCH
-    if (FLAG_ENABLED( flags, MODFX_RFLAG_EXTERNAL_LIGHTS_ENABLED ) && !isModfxOmniLightEnabled)
+    if ((FLAG_ENABLED( flags, MODFX_RFLAG_EXTERNAL_LIGHTS_ENABLED ) && !isModfxOmniLightEnabled) || dafx_force_clustered_light_check)
     {
       // Find omni lights outside of current modfx
-      const float2 tc = (vs_out.pos.xy / vs_out.pos.w) * float2(0.5, -0.5) + 0.5;
-      lighting += get_lighting_from_clustered_lights(wpos.xyz, view_dir_norm, tc, proj_dist);
+    #if MODFX_CLUSTERED_LIGHTING_CENTERED
+      // Sample light from the particle's center rather than this corner,
+      // so it stays uniform across the quad and doesn't flicker when the particle gets rotated or oriented towards camera.
+      float4 lightSampleClipPos = mul(float4(rdata.pos, 1.f), gdata.globtm);
+      float3 lightSampleWorldPos = rdata.pos;
+    #else
+      float4 lightSampleClipPos = vs_out.pos;
+      float3 lightSampleWorldPos = wpos;
+    #endif
+      BRANCH
+      if (lightSampleClipPos.w > 0)
+      {
+        const float2 tc = (lightSampleClipPos.xy / lightSampleClipPos.w) * float2(0.5, -0.5) + 0.5;
+        lighting += get_lighting_from_clustered_lights(lightSampleWorldPos, view_dir_norm, tc, proj_dist);
+      }
     }
 #endif
 
@@ -649,11 +659,11 @@
     vs_out.emission.rgb = emission_mask;
 #endif
     float3 fwd_dir = cross( rotated_up_vec, rotated_right_vec );
-#if MODFX_USE_SHADOW || MODFX_USE_LIGHTING || DAFX_USE_CLOUD_SHADOWS
-    #if MODFX_USE_SHADOW || DAFX_USE_CLOUD_SHADOWS
+#if MODFX_USE_STATIC_SHADOW || MODFX_USE_LIGHTING || DAFX_USE_CLOUD_SHADOWS || DAFX_USE_VOXEL_SHADOWS_VS
+    #if MODFX_USE_STATIC_SHADOW || DAFX_USE_CLOUD_SHADOWS || DAFX_USE_VOXEL_SHADOWS_VS
       vs_out.lighting.a = 1.f;
     #endif
-    #if MODFX_USE_SHADOW
+    #if MODFX_USE_STATIC_SHADOW
     //this is a way to reduce flickering due to tesselation insufficiency
     //we sample shadow closer to center
     float3 shadowWorldPos = lerp(rdata.pos, wpos, rcp(2 * rdata.radius + 1.f));//the bigger radius is the closer we will be to center worldPos
@@ -663,6 +673,13 @@
     #endif
     #if DAFX_USE_CLOUD_SHADOWS
       vs_out.lighting.a *= dafx_get_clouds_shadow(rdata.pos);
+    #endif
+    #if DAFX_USE_VOXEL_SHADOWS_VS
+      float3 voxel_shadows_sample_pos = rdata.pos;
+      #if MODFX_SHADER_VOLSHAPE_WBOIT
+        voxel_shadows_sample_pos = original_rdata_pos;
+      #endif
+      vs_out.lighting.a = apply_voxel_shadows(voxel_shadows_sample_pos, vs_out.lighting.a);
     #endif
 
 #if SIMPLIFIED_VS_LIGHTING
@@ -684,7 +701,7 @@
       float ndl = saturate( dot( -gdata.from_sun_direction, wnorm ) );
       ndl = ndl * ( 1.f - normal_softness ) + normal_softness;
       ndl = lerp( ndl, 1.f, saturate( dot( gdata.from_sun_direction, fwd_dir ) ) * translucency );
-    #if MODFX_USE_SHADOW || DAFX_USE_CLOUD_SHADOWS
+    #if MODFX_USE_STATIC_SHADOW || DAFX_USE_CLOUD_SHADOWS || DAFX_USE_VOXEL_SHADOWS_VS
       half shadow = vs_out.lighting.a;
     #else
       half shadow = 1.f;
@@ -744,7 +761,7 @@
 #endif
 
 #if MODFX_SHADER_DISTORTION
-    vs_out.zfar_strength = zfar_opacity;
+    vs_out.distortion_strength = min(zfar_opacity, znear_opacity);
 #endif
 
 #if MODFX_USE_FOG
@@ -758,8 +775,31 @@
         get_fog_prepared_tc(getPreparedScatteringTc(view_dir_norm.y, view_dir_dist)),
         view_dir_dist);
     #else
-      half3 fog_mul, fog_add;
-      get_volfog_with_scattering(stc, stc, view_dir_norm, view_dir_dist, vs_out.pos.w, fog_mul, fog_add);
+      half3 fog_mul = 1;
+      half3 fog_add = 0;
+      #if MODFX_USE_MULTISAMPLE_FOG_VS_APPLY
+        #define NUM_FOG_VS_SAMPLES 4
+        UNROLL for (int i = 0; i < NUM_FOG_VS_SAMPLES; i++)
+        {
+          float3 offsetWpos = lerp(wpos, rdata.pos, float(i) / NUM_FOG_VS_SAMPLES);
+          float4 outPos = mul(float4(offsetWpos, 1.f), gdata.globtm);
+          float3 viewDir = gdata.world_view_pos - offsetWpos;
+          float viewDirDist = length(viewDir);
+          float3 viewDirNorm = viewDir * (viewDirDist > 0.01 ? rcp(viewDirDist) : 0);
+          float offsetStcRawDepth = outPos.w > 0 ? outPos.z / outPos.w : 0;
+          float2 offsetStc = outPos.w > 0 ? outPos.xy * RT_SCALE_HALF / outPos.w + float2(0.5, 0.5) : 0;
+          offsetStc = reproject_scattering(offsetStc, offsetStcRawDepth);
+          half3 fogMulPart, fogAddPart;
+          get_volfog_with_scattering(offsetStc, offsetStc, viewDirNorm, viewDirDist,
+            outPos.w, fogMulPart, fogAddPart);
+          fog_mul += fogMulPart;
+          fog_add += fogAddPart;
+        }
+        fog_mul /= NUM_FOG_VS_SAMPLES;
+        fog_add /= NUM_FOG_VS_SAMPLES;
+      #else
+        get_volfog_with_scattering(stc, stc, view_dir_norm, view_dir_dist, vs_out.pos.w, fog_mul, fog_add);
+      #endif
       #if DAFX_USE_UNDERWATER_FOG
         modify_underwater_fog(view_dir_dist, fog_mul, fog_add);
       #endif
@@ -772,12 +812,16 @@
       vs_out.fog_add = fog_add;
       #if FX_FOG_MULT_ALPHA // then COLOR_PS_FOG_MULT is defined
         vs_out.fog_mul = float3(fog_mul);
-        #if MODFX_USE_SHADOW || MODFX_USE_LIGHTING || DAFX_USE_CLOUD_SHADOWS
+        #if MODFX_USE_STATIC_SHADOW || MODFX_USE_LIGHTING || DAFX_USE_CLOUD_SHADOWS || DAFX_USE_VOXEL_SHADOWS_VS
         vs_out.lighting.rgb *= fog_mul;
         #endif
       #else
         vs_out.color.rgb *= fog_mul;
-        vs_out.emission.rgb *= fog_mul;
+        #if EMISSION_PS_FOG_MULT
+          vs_out.fog_mul = float3(fog_mul);
+        #else
+          vs_out.emission.rgb *= fog_mul;
+        #endif
       #endif
     #endif
 #endif
@@ -785,7 +829,7 @@
     vs_out.emission.w = thermal_value;
 #endif
 
-#if MODFX_USE_SHADOW
+#if MODFX_USE_STATIC_SHADOW || MODFX_USE_FAKE_BRIGHTNESS
     vs_out.fake_brightness = calculate_brightness_modifier(parent_data, rdata.pos);
 #endif
     if ( is_dead )
@@ -851,12 +895,17 @@ float4 unpack_distortion(float4 tex_input)
 
 #if MODFX_USE_LIGHTING
 void apply_shadow_to_ps_lighting(inout float3 lighting_part, VsOutput input, GlobalData gdata, float3 ndl, float3 nda,
-  float specular, float alpha, float3 translucency)
+  float specular, float alpha, float3 translucency, float2 pixel_pos)
 {
-#if MODFX_USE_SHADOW || DAFX_USE_CLOUD_SHADOWS
+#if MODFX_USE_STATIC_SHADOW || DAFX_USE_CLOUD_SHADOWS || DAFX_USE_VOXEL_SHADOWS_VS
   half shadow = input.lighting.a;
 #else
   half shadow = 1.f;
+#endif
+
+#if DAFX_USE_VOXEL_SHADOWS_PS
+  const float shadow_dither_rad = 0.75;
+  shadow = apply_voxel_shadows(input.wpos, pixel_pos, gdata.from_sun_direction, shadow_dither_rad, shadow);
 #endif
 
 #if MODFX_USE_GI
@@ -882,7 +931,7 @@ void apply_shadow_to_ps_lighting(inout float3 lighting_part, VsOutput input, Glo
 float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput input, GlobalData gdata, float ndl,
   float translucency, float3 translucency_color_mul)
 {
-#if MODFX_USE_SHADOW || DAFX_USE_CLOUD_SHADOWS
+#if MODFX_USE_STATIC_SHADOW || DAFX_USE_CLOUD_SHADOWS || DAFX_USE_VOXEL_SHADOWS_VS
   half shadow = input.lighting.a;
 #else
   half shadow = 1.f;
@@ -994,11 +1043,18 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
 #else
 
     if (tex_enabled)
-      input.tc += modfx_render_get_motion_vecs(parent_data, input.tc, input.frame_blend);
+      input.tc += modfx_render_get_motion_vecs(parent_data, input.tc, input.frame_blend, gdata);
 
     float4 src_tex_0 = 1;
     if (tex_enabled)
+    {
+  #if MODFX_SHADER_DISTORTION
+      if (FLAG_ENABLED( flags, MODFX_RFLAG_DISTORTION_IS_A_COMPONENT ))
+        src_tex_0 = tex2D( g_tex_1, input.tc.xy );
+      else
+  #endif
       src_tex_0 = tex2D( g_tex_0, input.tc.xy );
+    }
 
   #if MODFX_USE_FRAMEBLEND && !MODFX_SHADER_VOLSHAPE_WBOIT_APPLY
     if ( tex_enabled && FLAG_ENABLED( flags, MODFX_RFLAG_FRAME_ANIMATED_FLIPBOOK ) )
@@ -1089,6 +1145,10 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
       lighting_part = c;
     }
 
+#if EMISSION_PS_FOG_MULT && !MODFX_SHADER_VOLFOG_INJECTION
+    emissive_part *= input.fog_mul;
+#endif
+
 #if !(MODFX_SHADER_VOLSHAPE || MODFX_SHADER_VOLSHAPE_WBOIT || MODFX_SHADER_VOLFOG_INJECTION)
     if (color_discard_test(float4(lighting_part.xyz + emissive_part.xyz, alpha), flags))
     {
@@ -1097,7 +1157,7 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
     }
 #endif
 
-#if MODFX_USE_DEPTH_MASK && !(MODFX_SHADER_VOLSHAPE || MODFX_SHADER_VOLSHAPE_WBOIT)
+#if MODFX_USE_DEPTH_MASK && !(MODFX_SHADER_VOLSHAPE || MODFX_SHADER_VOLSHAPE_WBOIT || MODFX_SHADER_DISTORTION)
     if (!(gdata.flags & DAFX_GLOBAL_DATA_FLAG_RENDERING_WATER_REFLECTION) && parent_data.mods_offsets[MODFX_RMOD_DEPTH_MASK] )
     {
       ModfxDepthMask pp = ModfxDepthMask_load( 0, parent_data.mods_offsets[MODFX_RMOD_DEPTH_MASK] );
@@ -1246,7 +1306,7 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
         lnorm.xy = src_tex_1 * 2.f - 1.f;
         lnorm.z = sqrt( saturate( 1 - dot( lnorm.xy, lnorm.xy ) ) );
 
-        float2 flip = (input.frame_flags.xx & uint2(MODFX_FRAME_FLAGS_FLIP_X, MODFX_FRAME_FLAGS_FLIP_Y)) ? -1 : 1;
+        float2 flip = select(bool2(input.frame_flags.xx & uint2(MODFX_FRAME_FLAGS_FLIP_X, MODFX_FRAME_FLAGS_FLIP_Y)), float2(-1, -1), float2(1, 1));
         wnorm = fwd_dir * lnorm.z + flip.x * input.right_dir * lnorm.x - flip.y * input.up_dir * lnorm.y;
 
         nda = saturate( dot( sphere_normal, wnorm ) );
@@ -1259,7 +1319,7 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
       float specular = 0;
 
 #if !MODFX_RIBBON_SHAPE
-      if ( FLAG_ENABLED( flags, MODFX_RFLAG_LIGHTING_SPECULART_ENABLED ) )
+      if ( FLAG_ENABLED( flags, MODFX_RFLAG_LIGHTING_SPECULAR_ENABLED ) )
       {
         float3 h = normalize( input.view_dir - gdata.from_sun_direction );
         float ndh = saturate( dot( wnorm, h ) );
@@ -1271,10 +1331,10 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
 
       float3 translucency_lighting = 0;
 
-      BRANCH
-      if (parent_data.mods_offsets[MODFX_RMOD_ADVANCED_TRANSLUCENCY])
-      {
 #if !MODFX_RIBBON_SHAPE
+      BRANCH
+      if (parent_data.mods_offsets[MODFX_RMOD_ADVANCED_TRANSLUCENCY] && (gdata.quality & DAFX_HIGH_FX_QUALITY))
+      {
         ModfxDeclAdvancedTranslucency pp = ModfxDeclAdvancedTranslucency_load(0, parent_data.mods_offsets[MODFX_RMOD_ADVANCED_TRANSLUCENCY]);
         float3 translucency_color_mul = pp.translucency_color_mul;
 
@@ -1304,14 +1364,14 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
 
         // Applying advanced translucency
         translucency_lighting = apply_advanced_translucency_to_lighting(lighting_part, input, gdata, ndl, translucency, translucency_color_mul);
-#endif
       }
       else // default translucency
+#endif
       {
         ndl = lerp( ndl, 1.f, saturate( dot( gdata.from_sun_direction, fwd_dir ) ) * translucency );
       }
 
-      apply_shadow_to_ps_lighting(lighting_part, input, gdata, ndl, nda, specular, alpha, translucency_lighting);
+      apply_shadow_to_ps_lighting(lighting_part, input, gdata, ndl, nda, specular, alpha, translucency_lighting, pixel_pos.xy);
     }
 #endif
 #endif
@@ -1322,7 +1382,14 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
     float4 result = float4( emissive_part + lighting_part, alpha );
     float depth = 0;
 #if MODFX_SHADER_DISTORTION
-    float depthScene = tex2Dlod(haze_scene_depth_tex, float4(viewport_tc.xy,0, haze_scene_depth_tex_lod)).x;
+    float depthScene = tex2Dlod(haze_scene_depth_tex, float4(viewport_tc.xy, 0, haze_scene_depth_tex_lod)).x;
+#if MODFX_USE_DEPTH_MASK
+    if (!(gdata.flags & DAFX_GLOBAL_DATA_FLAG_RENDERING_WATER_REFLECTION) && parent_data.mods_offsets[MODFX_RMOD_DEPTH_MASK] )
+    {
+      ModfxDepthMask pp = ModfxDepthMask_load( 0, parent_data.mods_offsets[MODFX_RMOD_DEPTH_MASK] );
+      depth_mask = dafx_calc_soft_depth_mask(depthScene, gdata, pp.depth_softness_rcp, viewport_tc.w);
+    }
+#endif
     float depthHaze  = GET_SCREEN_POS(input.pos).z;
     depth = depthHaze;
 
@@ -1334,7 +1401,7 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
     }
 
     float distortionMod = dafx_get_1f(0, parent_data.mods_offsets[MODFX_RMOD_DISTORTION_STRENGTH]);
-    distortionMod *= input.zfar_strength;
+    distortionMod *= input.distortion_strength * depth_mask;
 
     if (all(abs(result.xy) < MODFX_DISTORTION_DISCARD_THRESHOLD))
       result.w = 0;
@@ -1456,7 +1523,7 @@ float3 apply_advanced_translucency_to_lighting(float3 lighting_part, VsOutput in
       result.xyz *= result.w;
     }
 
-  #if MODFX_USE_SHADOW
+  #if MODFX_USE_FAKE_BRIGHTNESS
     result.xyz *= input.fake_brightness;
   #endif
 

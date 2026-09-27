@@ -5,44 +5,82 @@
 #pragma once
 
 #include <drv/3d/dag_driver.h>
-#include <3d/dag_resPtr.h>
 #include <math/dag_boundingSphere.h>
+#include <memory/dag_linearHeapAllocator.h>
 #include <bvh/bvh_heightProvider.h>
 #include <shaders/dag_shaderMesh.h>
 #include <shaders/dag_rendInstRes.h>
+#include <shaders/dag_linearSbufferAllocator.h>
 #include <math/dag_Point4.h>
+#include <math/integer/dag_IPoint3.h>
 #include <util/dag_threadPool.h>
+#include <rendInst/riexHandle.h>
+#include <EASTL/unique_ptr.h>
+#include <EASTL/shared_ptr.h>
+#include <EASTL/fixed_function.h>
+#include <EASTL/vector_set.h>
+#include <bvh/bvh_instanceMapper.h>
 
 class Sbuffer;
 class LandMeshManager;
 class RandomGrass;
 class Cables;
+class SmokeTracerManager;
+class LRURendinstCollision;
 class TMatrix;
+class String;
+class DynamicRenderableSceneLodsResource;
 struct RaytraceGeometryDescription;
 struct RaytraceBottomAccelerationStructure;
+struct RaytraceOpacityMicroMapTriangleArray;
 struct RiGenVisibility;
 struct BVHConnection;
+struct BVHBufferReference;
+struct UniqueOrReferencedBVHBuffer;
 class DynamicRenderableSceneResource;
+class BaseStreamingSceneHolder;
+class FFTWater;
 enum class RaytraceBuildFlags : uint32_t;
+class GPUGrassBase;
 
 namespace bvh
 {
 struct Context;
+struct ReferencedTransformData;
 using ContextId = Context *;
+inline constexpr ContextId InvalidContextId = nullptr;
+extern bool use_batched_skinned_vertex_processor;
+
+inline constexpr size_t hardware_destructive_interference_size =
+#if defined(__x86_64__) || defined(_M_X64)
+  128;
+#else
+  64;
+#endif
+
+template <typename T>
+struct alignas(hardware_destructive_interference_size) Padded : T
+{};
+
 } // namespace bvh
 
 namespace dynrend
 {
-enum class ContextId;
+enum class ContextId : uint32_t;
 using BVHSetInstanceData = void (*)(int instance_offset);
 struct BVHCamoData
 {
   float condition = 1, scale = 1, rotation = 0;
   TEXTUREID burntCamo;
 };
+struct BVHSkinnedMemoryUsage
+{
+  int64_t max_bytes = -1; // negative value disables memory cap
+  int64_t current_bytes = 0;
+};
 using BVHIterateOneInstanceCallback = void (*)(const DynamicRenderableSceneInstance &inst, const DynamicRenderableSceneResource &res,
-  const uint8_t *path_filter, uint32_t path_filter_size, uint8_t render_mask, dag::ConstSpan<int> offsets,
-  BVHSetInstanceData set_instance_data, bool animate, BVHCamoData &camo_data, void *user_data);
+  dag::ConstSpan<int> offsets, BVHSetInstanceData set_instance_data, bool animate, BVHCamoData &camo_data,
+  BVHSkinnedMemoryUsage &skin_mem, void *user_data);
 using BVHIterateCallback = void (*)(BVHIterateOneInstanceCallback iter, const Point3 &view_position, void *user_data);
 } // namespace dynrend
 
@@ -97,11 +135,31 @@ struct UniqueAS
   }
 
   template <typename T = ASType>
+  static eastl::enable_if_t<eastl::is_same_v<T, RaytraceOpacityMicroMapTriangleArray>, UniqueAS> create_omm(uint32_t size)
+  {
+    G_UNUSED(size);
+
+    UniqueAS as;
+#if D3D_HAS_RAY_TRACING
+    as.as = d3d::raytrace::create_acceleration_structure(raytrace::InvalidAccelerationStructurePool,
+      raytrace::OpacityMicroMapTriangleArrayPlacementInfo{0, size})
+              .omm;
+    if (as.as)
+    {
+      as.gpuAddress = d3d::get_raytrace_acceleration_structure_gpu_handle(as.as).handle;
+      as.asSize = size;
+    }
+#endif
+    return as;
+  }
+
+  template <typename T = ASType>
   static eastl::enable_if_t<eastl::is_same_v<T, RaytraceTopAccelerationStructure>, UniqueAS> create(uint32_t instance_count,
     RaytraceBuildFlags flags, const char *name)
   {
     G_UNUSED(instance_count);
     G_UNUSED(flags);
+    G_UNUSED(name);
 
     UniqueAS as;
 #if D3D_HAS_RAY_TRACING
@@ -111,7 +169,7 @@ struct UniqueAS
       as.gpuAddress = d3d::get_raytrace_acceleration_structure_gpu_handle(as.as).handle;
       as.asSize = d3d::get_raytrace_acceleration_structure_size(as.as);
       as.scratchBuffer.reset(d3d::create_sbuffer(1, as.buildScratchSize, SBCF_USAGE_ACCELLERATION_STRUCTURE_BUILD_SCRATCH_SPACE, 0,
-        String(0, "tlas_scratch_%s", name)));
+        String(0, "tlas_scratch_%s", name), RESTAG_BVH));
     }
 #endif
     return as;
@@ -157,12 +215,8 @@ struct UniqueAS
   Sbuffer *getScratchBuffer() const { return scratchBuffer.get(); }
   uint64_t getGPUAddress() const { return gpuAddress; }
   uint32_t getASSize() const { return asSize; }
-  // This code should be used, but a bug in the D3D12 validation layers always expect the larger build size.
-  // So play along with that now.
-  // uint32_t getBuildScratchSize() const { return buildScratchSize; }
-  // uint32_t getUpdateScratchSize() const { return updateScratchSize; }
-  uint32_t getBuildScratchSize() const { return max(buildScratchSize, updateScratchSize); }
-  uint32_t getUpdateScratchSize() const { return max(buildScratchSize, updateScratchSize); }
+  uint32_t getBuildScratchSize() const { return buildScratchSize; }
+  uint32_t getUpdateScratchSize() const { return updateScratchSize; }
 
   void reset()
   {
@@ -173,6 +227,9 @@ struct UniqueAS
         d3d::delete_raytrace_bottom_acceleration_structure(as);
       else if constexpr (eastl::is_same_v<ASType, RaytraceTopAccelerationStructure>)
         d3d::delete_raytrace_top_acceleration_structure(as);
+      else if constexpr (eastl::is_same_v<ASType, RaytraceOpacityMicroMapTriangleArray>)
+        d3d::raytrace::destroy_acceleration_structure(raytrace::InvalidAccelerationStructurePool,
+          raytrace::AnyAccelerationStructure(as));
     }
 #endif
     as = nullptr;
@@ -210,6 +267,7 @@ private:
 
 using UniqueBLAS = UniqueAS<RaytraceBottomAccelerationStructure>;
 using UniqueTLAS = UniqueAS<RaytraceTopAccelerationStructure>;
+using UniqueOMM = UniqueAS<RaytraceOpacityMicroMapTriangleArray>;
 
 struct UniqueBVHBufferWithOffset
 {
@@ -229,57 +287,62 @@ struct UniqueBVHBufferWithOffset
   }
 };
 
-struct BVHBufferReference
+struct BVHGeometryBufferWithOffset
 {
-  Sbuffer *buffer = nullptr;
-  uint32_t offset = 0;
-  uint32_t allocator = 0;
+  int heapIndex = -1;
+  int bindlessIndex = -1;
+  LinearHeapAllocatorSbuffer::RegionId bufferRegion;
+  UniqueBVHBuffer processedVertexBuffer;
+  uint32_t ibOffset = 0;
+  uint32_t vbOffset = 0;
 
-  operator bool() const { return buffer != nullptr; }
-  bool operator!() const { return buffer == nullptr; }
+  operator bool() const { return heapIndex > -1; }
+  bool operator!() const { return heapIndex < 0; }
 
-  Sbuffer *get() const { return buffer; }
-  uint32_t size() const { return buffer ? buffer->getSize() : 0; }
-};
+  Sbuffer *getIndexBuffer(bvh::ContextId context_id) const;
+  Sbuffer *getVertexBuffer(bvh::ContextId context_id) const;
 
-struct UniqueOrReferencedBVHBuffer
-{
-  UniqueBVHBuffer *unique = nullptr;
-  BVHBufferReference *referenced = nullptr;
-
-  UniqueOrReferencedBVHBuffer() = default;
-  UniqueOrReferencedBVHBuffer(UniqueBVHBuffer &unique) : unique(&unique) {}
-  UniqueOrReferencedBVHBuffer(BVHBufferReference &referenced) : referenced(&referenced) {}
-
-  bool operator!() const { return !unique && !referenced; }
-  operator bool() const { return unique || referenced; }
-
-  Sbuffer *get() const { return unique ? unique->get() : referenced ? referenced->get() : nullptr; }
-  uint32_t getOffset() const { return referenced ? referenced->offset : 0; }
-
-  bool needAllocation() const { return unique && !*unique || referenced && !*referenced; }
-  bool isAllocated() const { return unique && *unique || referenced && referenced->buffer; }
+  void close(bvh::ContextId context_id);
 };
 
 namespace bvh
 {
 struct BufferProcessor;
-struct TreeData;
+
+struct SkinData
+{
+  bool isClothWind = false;
+  struct ClothWind
+  {
+    float noiseScaleX;
+    float noiseScaleY;
+    float timeScaleMin;
+    float timeScaleMax;
+    float ambientInfluence;
+    float noiseAmp;
+    uint32_t clothNoiseCombinedTexBindless;
+  } clothWind = {};
+  struct FaceMorph
+  {
+    uint32_t atlasTexBindless;
+    uint32_t uvOffset;
+    uint32_t uvSize;
+  } faceMorph = {};
+};
 
 struct MeshSkinningInfo
 {
   TMatrix4 invWorldTm;
   eastl::function<void()> setTransformsFn;
-  BVHBufferReference *skinningBuffer = nullptr;
-  UniqueBLAS *skinningBlas = nullptr;
+  ReferencedTransformData *transformedData = nullptr;
+  SkinData data = {};
 };
 
 struct MeshHeliRotorInfo
 {
   TMatrix4 invWorldTm;
   eastl::function<void(Point4 &, Point4 &)> getParamsFn;
-  BVHBufferReference *transformedBuffer = nullptr;
-  UniqueBLAS *transformedBlas = nullptr;
+  ReferencedTransformData *transformedData = nullptr;
 };
 
 struct DeformedInfo
@@ -287,22 +350,22 @@ struct DeformedInfo
   Point2 simParams;
   TMatrix4 invWorldTm;
   eastl::function<void(float &, Point2 &)> getParamsFn;
-  BVHBufferReference *transformedBuffer = nullptr;
-  UniqueBLAS *transformedBlas = nullptr;
+  ReferencedTransformData *transformedData = nullptr;
+};
+
+struct SplineGenInfo
+{
+  eastl::function<Sbuffer *(uint32_t &)> getSplineDataFn;
+  ReferencedTransformData *transformedData = nullptr;
 };
 
 struct TreeData
 {
   bool isPivoted;
   bool isPosInstance;
-  float windBranchAmp;
-  float windDetailAmp;
-  float windSpeed;
-  float windTime;
   Point4 windChannelStrength;
-  Point4 windBlendParams;
-  Texture *ppPosition;
-  Texture *ppDirection;
+  uint32_t ppPositionBindless;
+  uint32_t ppDirectionBindless;
   Point4 ppWindPerLevelAngleRotMax;
   float ppWindNoiseSpeedBase;
   float ppWindNoiseSpeedLevelMul;
@@ -312,17 +375,25 @@ struct TreeData
   float ppWindMotionDampBase;
   float ppWindMotionDampLevelMul;
   float AnimWindScale;
-  bool apply_tree_wind;
+  bool isTrunk;
   E3DCOLOR color;
   uint32_t perInstanceRenderAdditionalData;
+  float groundSnapHeightSoft;
+  float groundSnapHeightFull;
+  float groundSnapNormalOffset;
+  float groundSnapLimit;
+  float groundBendHeight;
+  float groundBendNormalOffset;
+  float groundBendTangentOffset;
 };
 
 struct TreeInfo
 {
   TMatrix4 invWorldTm;
-  BVHBufferReference *transformedBuffer;
-  UniqueBLAS *transformedBlas;
+  ReferencedTransformData *transformedData;
   bool recycled;
+  bool stationary;
+  int animIndex;
 
   TreeData data;
 };
@@ -330,9 +401,9 @@ struct TreeInfo
 struct LeavesInfo
 {
   TMatrix4 invWorldTm;
-  BVHBufferReference *transformedBuffer;
-  UniqueBLAS *transformedBlas;
+  ReferencedTransformData *transformedData;
   bool recycled;
+  bool stationary;
 };
 
 struct FlagData
@@ -367,8 +438,8 @@ struct FlagData
 struct FlagInfo
 {
   TMatrix4 invWorldTm;
-  BVHBufferReference *transformedBuffer;
-  UniqueBLAS *transformedBlas;
+  ReferencedTransformData *transformedData;
+  bool recycled;
   FlagData data;
 };
 
@@ -402,6 +473,13 @@ struct MeshInfo
   TEXTUREID alphaTextureId = BAD_TEXTUREID;
   TEXTUREID normalTextureId = BAD_TEXTUREID;
   TEXTUREID extraTextureId = BAD_TEXTUREID;
+  TEXTUREID secondaryMaskTextureId = BAD_TEXTUREID;
+  TEXTUREID ppPositionTextureId = BAD_TEXTUREID;
+  TEXTUREID ppDirectionTextureId = BAD_TEXTUREID;
+  TEXTUREID clothNoiseCombinedTexTextureId = BAD_TEXTUREID;
+  TEXTUREID faceMorphAtlasTextureId = BAD_TEXTUREID;
+  uint32_t faceMorphUvOffset = invalidOffset;
+  uint32_t faceMorphUvSize = 0;
   bool alphaTest = false;
   // ~Only needed for meshes with textures
 
@@ -427,7 +505,12 @@ struct MeshInfo
   bool isCamo = false;
   bool isMFD = false;
   bool isHeliRotor = false;
+  bool isGunBarrel = false;
   bool isEmissive = false;
+
+  bool isRiLandclass = false;
+  Point4 landclassMapping = Point4(1.0, 1.0, 0, 0);
+  int32_t riLandclassIndex = 0;
 
   bool painted = false;
   Point4 paintData;
@@ -437,6 +520,7 @@ struct MeshInfo
   uint32_t detailsData3 = 0;
   uint32_t detailsData4 = 0;
 
+  Point4 monochromeData = Point4(0, 0, 0.5, 0); // x - metalness, y - smoothness, z - reflectance
 
   bool useAtlas = false;
   float atlasTileU = 1.0;
@@ -444,9 +528,16 @@ struct MeshInfo
   uint32_t atlasFirstTile = 0;
   uint32_t atlasLastTile = 0;
 
+  bool isMonochrome = false;
   bool isLayered = false;
   bool isPerlinLayered = false;
   bool isEye = false;
+  bool forceNonMetal = false;
+  bool hasColorMod = false;
+  bool isPaintedByMask = false;
+  bool hasAnimcharDecals = false;
+  bool isCamoNet = false;
+
   float maskGammaStart = 0.5;
   float maskGammaEnd = 2;
   float maskTileU = 1;
@@ -459,23 +550,47 @@ struct MeshInfo
   float texcoordScale = 1.f;
 };
 
+enum class BvhType
+{
+  None = 0,
+  RI,
+  Dyn
+};
+
+// Keeps a resolver and not a name because resolve_game_resource_name does a linear search over all
+// resources. Resolve only when a diagnostic is written.
+struct AssetNameRef
+{
+  const void *resource = nullptr;
+  bool (*resolver)(String &out_name, const void *resource) = nullptr;
+
+  String resolve() const; // the asset name, or "?" on failure
+};
+
+AssetNameRef make_asset_name_ref(const RenderableInstanceLodsResource *resource);
+AssetNameRef make_asset_name_ref(const DynamicRenderableSceneLodsResource *resource);
+
 struct ObjectInfo
 {
   dag::Vector<MeshInfo> meshes;
+  BvhType type = BvhType::None;
   bool isAnimated = false;
+  const char *tag = "untagged";
+  // For diagnostics. Unlike tag, which is the coarse LOD category, this names the asset itself.
+  AssetNameRef assetName;
 };
 
-struct Context;
-using ContextId = Context *;
-static inline constexpr ContextId InvalidContextId = nullptr;
-
-static constexpr uint32_t bvhGroupTerrain = 1 << 0;
-static constexpr uint32_t bvhGroupRiGen = 1 << 1;
-static constexpr uint32_t bvhGroupRiExtra = 1 << 2;
-static constexpr uint32_t bvhGroupDynrend = 1 << 3;
-static constexpr uint32_t bvhGroupGrass = 1 << 4;
-static constexpr uint32_t bvhGroupImpostor = 1 << 5;
-static constexpr uint32_t bvhGroupNoShadow = 1 << 6;
+inline constexpr uint32_t bvhGroupTerrain = 1 << 0;
+inline constexpr uint32_t bvhGroupRi = 1 << 1;
+inline constexpr uint32_t bvhGroupDynrend = 1 << 2;
+inline constexpr uint32_t bvhGroupGrass = 1 << 3;
+inline constexpr uint32_t bvhGroupImpostor = 1 << 4;
+inline constexpr uint32_t bvhGroupNoShadow = 1 << 5;
+inline constexpr uint32_t bvhGroupGPUFoliage = 1 << 6;
+inline constexpr uint32_t bvhGroupGunBarrel = 1 << 6; // The same as gpu foliage by intent. Gpu foliage is DNG only, gun barrel is WT
+                                                      // only.
+inline constexpr uint32_t bvhGroupWater = 1 << 7;
+inline constexpr uint32_t bvhGroupCamoNet = 1 << 7; // The same as water by intent. Water is DNG only, CamoNet is WT only.
 
 enum Features
 {
@@ -487,12 +602,22 @@ enum Features
                                // used.
   DynrendSkinnedFull = 1 << 5, // Dynrend skinned parts are enabled with the original mesh.
   GpuObjects = 1 << 6,         // GpuObjects are enabled. Only works if and of the RI is enabled.
-  Grass = 1 << 7,              // Grass is enabled.
+  Grass = 1 << 7,              // RandomGrass is enabled.
   Fx = 1 << 8,                 // Particle effects are enabled.
   Cable = 1 << 9,              // Cable rendering is enabled
+  BinScene = 1 << 10,          // Static scene is enabled
+  FftWater = 1 << 11,          // Water with heightmap enabled
+  Dagdp = 1 << 12,             // Dagdp Only works if and of the RI is enabled.
+  GPUGrass = 1 << 13,          // GPUGrass is enabled.
+  Splinegen = 1 << 14,         // SplineGen is enabled.
+  SmokeTracers = 1 << 15,      // Smoke tracers are enabled.
+  LruCollision = 1 << 16,      // Collision geometry streamed around the camera into a dedicated TLAS.
 
-  ForRendering = Terrain | RIFull | DynrendRigidFull | DynrendSkinnedFull | GpuObjects | Grass | Fx | Cable,
+  ForRendering = Terrain | RIFull | DynrendRigidFull | DynrendSkinnedFull | GpuObjects | Grass | Fx | Cable | BinScene | SmokeTracers,
   ForGI = Terrain | RIBaked | GpuObjects,
+
+  AnyRI = RIFull | RIBaked,
+  AnyDynrend = DynrendRigidFull | DynrendRigidBaked | DynrendSkinnedFull,
 };
 
 
@@ -507,6 +632,8 @@ struct ChannelParser : public ShaderChannelsEnumCB
   uint32_t secTexcoordOffset = 0;
   uint32_t thirdTexcoordFormat = -1;
   uint32_t thirdTexcoordOffset = 0;
+  uint32_t fourthTexcoordFormat = -1;
+  uint32_t fourthTexcoordOffset = 0;
   uint32_t normalFormat = -1;
   uint32_t normalOffset = 0;
   uint32_t colorFormat = -1;
@@ -522,20 +649,59 @@ struct ChannelParser : public ShaderChannelsEnumCB
 
 bool has_enough_vram_for_rt();
 
-void set_enable(bool enable);
-
 bool is_available();
+
+enum class BvhAvailabilityCode
+{
+  AVAILABLE = 0,
+  VR_ENABLED = 1,
+  NOT_SUPPORTED = 2,
+  NOT_ENOUGH_MEMORY = 3,
+  BLACKLISTED_GPU = 4,
+  STUB = 5
+};
+BvhAvailabilityCode is_available_verbose();
 
 using elem_rules_fn = void (*)(const ShaderMesh::RElem &, MeshInfo &, const ChannelParser &,
   const RenderableInstanceLodsResource::ImpostorParams *, const RenderableInstanceLodsResource::ImpostorTextures *);
 
-void init(elem_rules_fn elem_rules = nullptr);
+using screenshot_fn = void (*)();
 
-void teardown();
+struct AdditionalSettings
+{
+  bool batchedSkinning = false;
+  float riLodDistBias = 0.0f;
+  bool prioritizeCompactions = false;
+  bool discardDestrAssets = false;
+  bool unloadDynModels = false;      // unload dynmodels unused for dynModelRetentionSec, rebuild them on the next use
+  bool buildDynOnDemand = false;     // with unloadDynModels: skip the build of all dynmodels at init
+  float dynModelRetentionSec = 5.f;  // seconds an unused dynmodel stays in the BVH
+  int singleLodFilterMaxFaces = 0;   // 0 means no filtering
+  float singleLodFilterMaxRange = 0; // 0 means no filtering
+  bool useFastTlasBuild = false;
+  bool enableCaching = true;
+  bool enableOmm = false;
+  int ommDataArrayBudget = 0;        // bytes per mesh OMM array, <= 0 means unlimited
+  bool retainOmmBakeResults = false; // keep baked buffers alive for the OMM debug viewer
+  int ommCacheRetentionFrames = 900; // frames an unreferenced OMM cache entry survives; 0 evicts at once
+  int ommCacheIdleBudget = 64 << 20; // bytes the unreferenced OMM cache entries may hold together; 0 keeps none
+  bool strictAssetChecks = false;    // report bad assets in place of a work-around for them
+  bool enableHair = true;            // hair is both VRAM and GPU time intensive
+  // Cull fx particles projected smaller than this fraction of screen height, <= 0 keeps all
+  float fxMinScreenHeight = 10.f / 1080.f;
+};
 
-ContextId create_context(const char *name, Features features = Features::ForRendering);
+void init(elem_rules_fn elem_rules = nullptr, screenshot_fn screenshot = nullptr, AdditionalSettings settings = {});
+
+void teardown(bool device_reset, bool zero_bvh_ids);
+
+ContextId create_context(const char *name, Features features, Features designated_dyn_features);
+bool has_features(ContextId context_id, uint32_t features);
 
 void teardown(ContextId &context_id);
+
+void enable_dyn_models(ContextId context_id);
+void disable_dyn_models(ContextId context_id);
 
 void start_frame();
 
@@ -545,6 +711,10 @@ void remove_terrain(ContextId context_id);
 
 void update_terrain(ContextId context_id, const Point2 &location);
 
+void add_bin_scene(ContextId context_id, BaseStreamingSceneHolder &bin_scene);
+
+void add_water(ContextId context_id, FFTWater &water);
+
 void set_for_gpu_objects(ContextId context_id);
 
 void prepare_ri_extra_instances();
@@ -553,12 +723,18 @@ void set_ri_dist_mul(float mul);
 
 void override_out_of_camera_ri_dist_mul(float dist_sq_mul_ooc);
 
-void update_instances(ContextId bvh_context_id, const Point3 &view_position, const Frustum &bvh_frustum, const Frustum &view_frustum,
+bool is_global_object_tessellation_enabled();
+
+void update_instances(ContextId bvh_context_id, const Point3 &view_position, const Point3 &lod_anchor_position,
+  const Point3 &light_direction, const TMatrix &itm, const TMatrix4 &projTm, const Frustum &bvh_frustum, const Frustum &view_frustum,
   dynrend::ContextId *dynrend_context_id, dynrend::ContextId *dynrend_no_shadow_context_id, RiGenVisibility *ri_gen_visibility,
-  threadpool::JobPriority prio);
-void update_instances(ContextId bvh_context_id, const Point3 &view_position, const Frustum &bvh_frustum, const Frustum &view_frustum,
+  dag::Vector<DynamicRenderableSceneInstance *> &&og_instances, threadpool::JobPriority prio);
+void update_instances(ContextId bvh_context_id, const Point3 &view_position, const Point3 &light_direction, const TMatrix &itm,
+  const TMatrix4 &projTm, const Frustum &bvh_frustum, const Frustum &view_frustum,
   const dag::Vector<RiGenVisibility *> &ri_gen_visibilities, dynrend::BVHIterateCallback dynrend_iterate,
   threadpool::JobPriority prio);
+
+void wait_dynamic_instances_jobs();
 
 // The upper 32 bits of the object_id are reserved for RI
 void add_object(ContextId context_id, uint64_t object_id, const ObjectInfo &info);
@@ -566,6 +742,8 @@ void add_object(ContextId context_id, uint64_t object_id, const ObjectInfo &info
 void add_instance(ContextId context_id, uint64_t object_id, mat43f_cref transform);
 
 void remove_object(ContextId context_id, uint64_t object_id);
+
+void enable_dynamic_planar_decals(bool enable);
 
 enum class BuildBudget
 {
@@ -576,13 +754,18 @@ enum class BuildBudget
 
 void build(ContextId context_id, const TMatrix &itm, const TMatrix4 &projTm, const Point3 &camera_pos, const Point3 &light_direction);
 
+void set_rigen_cpu_budget(int budget_us);
+void set_tree_anim_max_distance(float distance);
+
 void process_meshes(ContextId context_id, BuildBudget budget = BuildBudget::High);
 
-void bind_resources(ContextId context_id, int render_width);
+void bind_gbuffer_textures(ContextId context_id, Texture *gbuffer_albedo, Texture *gbuffer_normal, Texture *gbuffer_material,
+  Texture *gbuffer_motion, Texture *gbuffer_depth);
 
-// ps5 specific functions. Currently ps5 doesn't support tlas shader vars
-void bind_tlas_stage(ContextId context_id, ShaderStage stage);
-void unbind_tlas_stage(ShaderStage stage);
+void bind_fom_textures(ContextId context_id, Texture *fom_sin, Texture *fom_cos, const d3d::SamplerHandle *fom_sampler);
+
+void bind_resources(ContextId context_id, int render_width);
+void unbind_resources();
 
 void on_load_scene(ContextId context_id);
 
@@ -591,6 +774,8 @@ void on_scene_loaded(ContextId context_id);
 void on_before_unload_scene(ContextId context_id);
 
 void on_before_settings_changed(ContextId context_id);
+
+void release_game_texture_holds(ContextId context_id);
 
 void on_unload_scene(ContextId context_id);
 
@@ -610,7 +795,111 @@ bool is_building(ContextId context_id);
 
 void set_grass_range(ContextId context_id, float range);
 
+void set_grass_fraction_to_keep(ContextId context_id, float fraction);
+
 void set_debug_view_min_t(float min_t);
 
 void enable_per_frame_processing(bool enable);
+
+using dagdp_connect_callback = void (*)(BVHInstanceMapper *);
+void connect_dagdp(ContextId context_id, dagdp_connect_callback callback);
+
+void gpu_grass_make_meta(ContextId context_id, const GPUGrassBase &grass);
+void generate_gpu_grass_instances(ContextId context_id, bool has_grass);
+
+// Every frame, with all dynmodel resources the game feeds to the context. With unloadDynModels, the rest is unloaded.
+void tell_active_dynamic_resources(ContextId context_id,
+  const eastl::vector_set<const DynamicRenderableSceneLodsResource *> &resources);
+
+void gather_splinegen_instances(ContextId context_id, Sbuffer *vertex_buffer, eastl::vector<eastl::pair<uint32_t, MeshInfo>> &meshes,
+  uint32_t instance_vertex_count, uint32_t &bvh_id);
+void remove_spline_gen_instances(ContextId context_id);
+
+using smoke_tracers_connect_callback = void (*)(BVHConnection *);
+void connect_smoke_tracers(ContextId context_id, smoke_tracers_connect_callback callback);
+
+void update_smoke_tracer_instances(SmokeTracerManager *mgr);
+
+void ensure_particle_buffer_capacity(int fx_max, int smoke_tracer_max);
+
+struct LruCollisionSettings
+{
+  float radius = 256.f; // > 0; instances within origin+radius are guaranteed in the TLAS once streamed in
+  // >= 0; prefetch margin, a refresh kicks per border/2 moved; keep it below
+  // radius or window moves hit the teleport sync fill instead of streaming
+  float border = 64.f;
+  uint32_t maxModelBuildsPerFrame = 8;  // > 0; teleports and the initial fill ignore it and build everything
+  uint64_t initialCacheSize = 16 << 20; // starting BLAS cache budget; grows with the window, never shrinks
+};
+
+// enumerate instances intersecting box, one transform per handle (both vectors
+// pre-cleared by the caller). Usually runs on a threadpool worker while the
+// render thread is inside build() - it must also work on the caller's thread
+// (teleports, tools without a threadpool) and must not call back into bvh
+// (teardown and invalidate wait on it). Enumeration must be deterministic for
+// an unchanged scene: the resident set is compared order-sensitively, and a
+// reordered result bumps the revision on every refresh
+using lru_collision_gather_fn = eastl::fixed_function<sizeof(void *) * 4,
+  void(bbox3f_cref box, dag::Vector<rendinst::riex_handle_t> &out_handles, dag::Vector<mat43f> &out_transforms)>;
+
+// false and a logerr: feature flag missing, module compiled out or invalid
+// settings; silently false for InvalidContextId
+bool connect_lru_collision(ContextId context_id, LRURendinstCollision *lru_coll, lru_collision_gather_fn gather,
+  const LruCollisionSettings &settings);
+// changed collision set: drops all cached geometry; the connection stays and
+// the next build() refills the window synchronously
+void invalidate_lru_collision(ContextId context_id);
+// invalid values are rejected with a logerr, keeping the previous range
+void set_lru_collision_range(ContextId context_id, float radius, float border);
+
+struct LruCollisionStats
+{
+  uint32_t residentInstances = 0;
+  uint32_t builtModels = 0;
+  uint64_t cachedBytes = 0;
+  uint64_t cacheLimit = 0;
+  uint64_t normalsHeapBytes = 0; // the face normal pool heap
+  // bumped whenever the traced content changes: the resident set or a
+  // transform, a BLAS build landing, a cache eviction, an invalidation.
+  // Builds land in the same build() that registers them, so this alone gates
+  // consumers that cache trace results; monotonic across reconnects
+  uint32_t revision = 0;
+  // the applied window covers the configured radius and every resident model
+  // is built (or has nothing to trace); false while a gather is in flight, a
+  // model still waits on its resource or VRAM, or the gather emitted fewer
+  // transforms than handles
+  bool settled = false;
+};
+LruCollisionStats get_lru_collision_stats(ContextId context_id);
+
+
+// A camera centered, world snapped volume of voxel lives: ray hits reset their voxel to
+// activeValue, each build() decrements every live voxel by one, and instances whose voxels hold
+// no lives are dropped from the main TLAS, all but a per frame random fraction kept as revive
+// probes. Space outside the volume is not tracked and always active.
+struct VoxelActivitySettings
+{
+  float voxelSize = 16.f;               // meters per voxel edge; > 0
+  IPoint3 dims = IPoint3(128, 32, 128); // voxel count per axis; x rounded up to 4, all capped at 256
+  int activeValue = 32;                 // 1..255; the life a hit resets a voxel to
+  // 0..1; the fraction of instances kept in a dead voxel each frame, reshuffled per frame, so a
+  // kept instance can catch a ray and revive the voxel. 1 keeps everything (no culling).
+  float inactiveKeepFraction = 0.1f;
+};
+
+// Creates or reconfigures the volume; invalid settings are rejected with a logerr. Call on the
+// render thread outside the update_instances..build window: a reconfiguration writes state the
+// placement jobs read.
+void set_voxel_activity(ContextId context_id, const VoxelActivitySettings &settings);
+void remove_voxel_activity(ContextId context_id);
+
+using on_parallel_jobs_finished_callback = void (*)();
+void set_on_parallel_jobs_finished_cb(on_parallel_jobs_finished_callback callback);
+
+void render_rt_mem_overlay(ContextId context_id);
+
+void log_rt_memory_overhead(ContextId context_id);
+
+// Never blocks on BVH locks, skips the report when they cannot be taken within a timeout.
+void try_log_rt_memory_overhead(ContextId context_id);
 } // namespace bvh

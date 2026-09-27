@@ -18,10 +18,10 @@ namespace das {
     };
 
     string getExecutableFileName ( void );
-    string getDasRoot ( void );
-    void setDasRoot ( const string & dr );
+    DAS_API string getDasRoot ( void );
+    DAS_API void setDasRoot ( const string & dr );
 
-    string normalizeFileName ( const char * fileName );
+    DAS_API string normalizeFileName ( const char * fileName );
 
     string get_prefix ( const string & req );   // blah.... \ foo.bar - returns blah....
     string get_suffix ( const string & req );   // blah.... \ foo.bar - returns foo.bar
@@ -30,6 +30,7 @@ namespace das {
     void * getFunctionAddress ( void * module, const char * func );
     void * getLibraryHandle ( const char * moduleName );
     bool closeLibrary ( void * module );
+    string getDynamicLibraryError ( void );
 
 
     void hwSetBreakpointHandler ( void (* handler ) ( int, void * ) );

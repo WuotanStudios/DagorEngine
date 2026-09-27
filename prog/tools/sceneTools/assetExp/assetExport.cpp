@@ -10,6 +10,7 @@
 #include <libTools/util/progressInd.h>
 #include <libTools/util/iLogWriter.h>
 #include <libTools/util/makeBindump.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <libTools/dtx/ddsxPlugin.h>
 #include <generic/dag_span.h>
 #include <generic/dag_smallTab.h>
@@ -146,15 +147,17 @@ static inline void clearCache(const String &path, const char *mask)
   }
 }
 
-static bool checkCacheChanged(AssetExportCache &c4, DagorAsset &a, IDagorAssetExporter *exp)
+// check_only=true for callers that may save() without rebuilding, e.g. the respack fast path below.
+static bool checkCacheChanged(AssetExportCache &c4, DagorAsset &a, IDagorAssetExporter *exp, bool check_only = false)
 {
+  int test_mode = check_only ? -1 : 0;
   bool curChanged = false;
-  if (c4.checkDataBlockChanged(a.getNameTypified(), a.props))
+  if (c4.checkDataBlockChanged(a.getNameTypified(), a.props, test_mode))
     curChanged = true;
   if (c4.checkAssetExpVerChanged(a.getType(), exp->getGameResClassId(), exp->getGameResVersion()))
     curChanged = true;
 
-  if (a.isVirtual() && c4.checkFileChanged(a.getTargetFilePath()))
+  if (a.isVirtual() && c4.checkFileChanged(a.getTargetFilePath(), test_mode))
     curChanged = true;
 
   Tab<SimpleString> a_files(tmpmem);
@@ -166,7 +169,7 @@ static bool checkCacheChanged(AssetExportCache &c4, DagorAsset &a, IDagorAssetEx
     a_files.erase(a_files.begin());
   int cnt = a_files.size();
   for (int j = 0; j < cnt; j++)
-    if (c4.checkFileChanged(a_files[j]))
+    if (c4.checkFileChanged(a_files[j], test_mode))
       curChanged = true;
 
   return curChanged;
@@ -192,18 +195,16 @@ static bool is_asset_in_pack(dag::ConstSpan<AssetPack *> pack, int package_id, c
   return false;
 }
 
-String get_name_of_package_containing_asset(const DataBlock &app_blk, DagorAssetMgr &mgr, unsigned target_code, const char *profile,
-  ILogWriter &log, DagorAsset *asset)
+String get_name_of_package_containing_asset(const DataBlock &app_blk, DagorAssetMgr &mgr, dag::ConstSpan<bool> exp_types_mask,
+  unsigned target_code, const char *profile, ILogWriter &log, DagorAsset *asset)
 {
   const DataBlock &expblk = *app_blk.getBlockByNameEx("assets")->getBlockByNameEx("export");
-  Tab<bool> expTypesMask(tmpmem);
-  make_exp_types_mask(expTypesMask, mgr, expblk, log);
 
   Tab<AssetPack *> grpPack(tmpmem), texPack(tmpmem);
   FastNameMapEx packages;
   uint64_t tc_storage = 0;
   const char *targetStr = mkbindump::get_target_str(target_code, tc_storage);
-  preparePacks(mgr, make_span_const<DagorAsset *>(&asset, 1), expTypesMask, expblk, texPack, grpPack, packages, log,
+  preparePacks(mgr, make_span_const<DagorAsset *>(&asset, 1), exp_types_mask, expblk, texPack, grpPack, packages, log,
     /*export_tex = */ true, /*export_res = */ true, targetStr, profile);
 
   String packageName;
@@ -314,14 +315,14 @@ public:
         if (stricmp(pfolder, "*common") == 0)
           ret = loadExporterPluginsInFolder(String(260, "%s/plugins/dabuild", startDir.str()));
         else
-          ret = loadExporterPluginsInFolder(String(260, "%s/%s", appDir.str(), pfolder));
+          ret = loadExporterPluginsInFolder(make_eff_app_relative_path(pfolder));
 
         if (!ret)
           return false;
       }
       else if (blk.getParamType(i) == DataBlock::TYPE_STRING && blk.getParamNameId(i) == nid_plugin)
       {
-        if (!loadSingleExporterPlugin(String(260, "%s/%s", appDir.str(), blk.getStr(i))))
+        if (!loadSingleExporterPlugin(make_eff_app_relative_path(blk.getStr(i))))
           return false;
       }
 
@@ -408,22 +409,22 @@ public:
   }
   int __stdcall getRemovedPackCount() override { return stat_pack_removed; }
 
-  const char *__stdcall getPackName(DagorAsset *asset) override
+  String __stdcall getPackName(DagorAsset *asset) override
   {
     if (expTypesMask[asset->getType()])
       return asset->getDestPackName();
-    else
-      return NULL;
+    return {};
   }
 
-  const char *__stdcall getPackNameFromFolder(int fld_idx, bool tex_or_res) override
+  String __stdcall getPackNameFromFolder(int fld_idx, bool tex_or_res) override
   {
     return mgr->getFolderPackName(fld_idx, tex_or_res, NULL);
   }
 
   String __stdcall getPkgName(DagorAsset *asset) override
   {
-    return get_name_of_package_containing_asset(appBlk, *mgr, /*target_code = */ _MAKE4C('PC'), /*profile = */ nullptr, *log, asset);
+    return get_name_of_package_containing_asset(appBlk, *mgr, expTypesMask, /*target_code = */ _MAKE4C('PC'), /*profile = */ nullptr,
+      *log, asset);
   }
 
   bool __stdcall checkUpToDate(dag::ConstSpan<unsigned> tc, dag::Span<int> tc_flags, dag::ConstSpan<const char *> packs_to_check,
@@ -433,6 +434,22 @@ public:
     for (int i = 0; i < tc.size(); i++)
       if (!::checkUpToDate(*mgr, appDir, tc[i], profile, tc_flags[i], packs_to_check, expTypesMask, appBlk, *pbar, *log))
         ret = false;
+    return ret;
+  }
+
+  bool __stdcall quickCheckUpToDate(dag::ConstSpan<unsigned> tc, dag::Span<int> tc_flags, dag::ConstSpan<const char *> packs_to_check,
+    int &out_ready_packs, int &out_total_packs, int &out_removed_cache_files, int &out_worker_threads, const char *profile) override
+  {
+    DabuildQuickCheckStats stats;
+    bool ret = true;
+    for (int i = 0; i < tc.size(); i++)
+      if (!::quickCheckUpToDate(*mgr, appDir, tc[i], profile, tc_flags[i], packs_to_check, expTypesMask, appBlk, *log, &stats))
+        ret = false;
+
+    out_ready_packs = stats.readyPacks;
+    out_total_packs = stats.totalPacks;
+    out_removed_cache_files = stats.removedCacheFiles;
+    out_worker_threads = stats.workerThreads;
     return ret;
   }
 
@@ -468,9 +485,158 @@ public:
     dd_erase(cacheFname);
   }
 
-  bool __stdcall getBuiltRes(DagorAsset &a, mkbindump::BinDumpSaveCB &cwr, IDagorAssetExporter *exp, const char *cache_folder,
-    String &cache_path, int &data_offset, bool save_all_caches) override
+  struct RespackPackCache
   {
+    AssetExportCache cache;
+    String packFname;
+    unsigned cacheMTime = 0, cacheSize = 0;
+    bool upToDate = false;
+    // Set once any asset here is found genuinely changed; suppresses save() until a fresh reload, since a
+    // never-tracked-before file's hash is committed unconditionally even under check_only (see checkFileChanged).
+    bool anyAssetChanged = false;
+  };
+
+  // Memoized per (pkg_name, target_str): detect_valid_patch() is too costly per getBuiltRes call.
+  // Cleared only by invalidateRespackCaches() - nothing here detects an out-of-process dabuild run.
+  OAHashNameMap<true> patchStateKeys;
+  Tab<bool> patchStates;
+
+  bool isPatchBuildActiveCached(const char *pkg_name, const char *target_str)
+  {
+    if (!dabuild_allow_patch_build)
+      return false;
+
+    String key(0, "%s@%s", pkg_name ? pkg_name : "", target_str);
+    int id = patchStateKeys.addNameId(key);
+    if (id == patchStates.size())
+    {
+      const DataBlock &expblk = *appBlk.getBlockByNameEx("assets")->getBlockByNameEx("export");
+      patchStates.push_back(detect_valid_patch(expblk, pkg_name, appDir, target_str, nullptr, nullptr));
+    }
+    return patchStates[id];
+  }
+
+  // Resolves the same respack/cache paths dabuild's batch export would use (no profile - on-demand never uses one).
+  bool resolveRespackCacheFname(DagorAsset &a, const char *pkname, const char *target_str, bool patch_build, String &out_pack_fname,
+    String &out_cache_fname)
+  {
+    const DataBlock &expblk = *appBlk.getBlockByNameEx("assets")->getBlockByNameEx("export");
+
+    String destBase, packFnamePrefix;
+    assethlp::build_package_dest_strings(destBase, packFnamePrefix, expblk, pkname, appDir, target_str, nullptr, patch_build);
+
+    String packName = a.getDestPackName(dabuild_collapse_packs, false, true);
+    if (packName.empty())
+      return false;
+
+    out_pack_fname.printf(260, "%s%s%s", destBase.str(), packFnamePrefix.str(), packName.str());
+    simplify_fname(out_pack_fname);
+
+    String cacheBase = make_eff_app_relative_path(expblk.getStr("cache", "develop/.cache"), true);
+    if (patch_build)
+    {
+      String patchCacheBase(260, "%spatch/", cacheBase.str());
+      cacheBase = patchCacheBase;
+    }
+    make_cache_fname(out_cache_fname, cacheBase, pkname, packName, target_str, nullptr);
+    simplify_fname(out_cache_fname);
+    return true;
+  }
+
+  // Reloads automatically whenever the cache file's own mtime/size changes, so a fresh batch export is
+  // picked up without any explicit invalidation hook.
+  RespackPackCache &getRespackPackCache(const char *cache_fname, const char *pack_fname)
+  {
+    int id = respackCacheFnames.addNameId(cache_fname);
+    if (id == respackCaches.size())
+      respackCaches.push_back();
+    RespackPackCache &e = respackCaches[id];
+
+    unsigned sz = 0, mt = AssetExportCache::getFileTime(cache_fname, sz);
+    if (mt && mt == e.cacheMTime && sz == e.cacheSize && e.packFname == pack_fname)
+      return e;
+
+    e.cache.reset();
+    e.packFname = pack_fname;
+    e.cacheMTime = mt;
+    e.cacheSize = sz;
+    e.anyAssetChanged = false;
+    e.upToDate = mt && e.cache.load(cache_fname, *mgr) && !e.cache.checkTargetFileChanged(pack_fname);
+    return e;
+  }
+
+  // Returns false (without touching cwr) on any miss, including an up-to-date patch pack that simply
+  // doesn't carry this asset (a resDiff-built patch only carries changed assets).
+  bool tryServeFromRespackVariant(DagorAsset &a, mkbindump::BinDumpSaveCB &cwr, IDagorAssetExporter *exp, String &cache_path,
+    int &data_offset, const char *pkname, const char *target_str, bool patch_build)
+  {
+    String packFname, packCacheFname;
+    if (!resolveRespackCacheFname(a, pkname, target_str, patch_build, packFname, packCacheFname))
+      return false;
+
+    RespackPackCache &pc = getRespackPackCache(packCacheFname, packFname);
+    if (!pc.upToDate)
+      return false;
+    if (checkCacheChanged(pc.cache, a, exp, /*check_only*/ true))
+    {
+      pc.anyAssetChanged = true;
+      return false;
+    }
+
+    int ofs = 0, len = 0;
+    if (!pc.cache.getAssetDataPos(a.getNameTypified(), ofs, len) || len <= 0)
+      return false;
+
+    FullFileLoadCB crd(packFname);
+    if (!crd.fileHandle)
+      return false;
+
+    crd.seekto(ofs);
+    cwr.copyRaw(crd, len);
+    cache_path = packFname;
+    data_offset = ofs;
+    // Uncomment to trace respack reuse decisions; disabled by default to avoid log spam.
+    // debug("getBuiltRes(%s): reused%s respack %s @%d+%d", a.getNameTypified(), patch_build ? " patch" : "", packFname, ofs, len);
+
+    // Persist a corrected mtime so a future process start skips rehashing this pack's files.
+    if (pc.cache.isTimeChanged() && !pc.anyAssetChanged)
+    {
+      pc.cache.save(packCacheFname, *mgr);
+      pc.cache.clearTimeChanged();
+    }
+    return true;
+  }
+
+  // Returns false (without touching cwr) on any miss.
+  bool tryGetBuiltResFromRespack(DagorAsset &a, mkbindump::BinDumpSaveCB &cwr, IDagorAssetExporter *exp, String &cache_path,
+    int &data_offset)
+  {
+    uint64_t tc_storage = 0;
+    const char *target_str = mkbindump::get_target_str(cwr.getTarget(), tc_storage);
+
+    const char *pkname = a.getCustomPackageName(target_str, nullptr);
+    if (pkname && strcmp(pkname, "*") == 0)
+      pkname = nullptr;
+
+    if (isPatchBuildActiveCached(pkname, target_str) &&
+        tryServeFromRespackVariant(a, cwr, exp, cache_path, data_offset, pkname, target_str, /*patch_build*/ true))
+      return true;
+
+    return tryServeFromRespackVariant(a, cwr, exp, cache_path, data_offset, pkname, target_str, /*patch_build*/ false);
+  }
+
+  bool __stdcall getBuiltRes(DagorAsset &a, mkbindump::BinDumpSaveCB &cwr, IDagorAssetExporter *exp, const char *cache_folder,
+    String &cache_path, int &data_offset, bool save_all_caches, bool *out_served_from_respack = nullptr) override
+  {
+    if (tryGetBuiltResFromRespack(a, cwr, exp, cache_path, data_offset))
+    {
+      if (out_served_from_respack)
+        *out_served_from_respack = true;
+      return true;
+    }
+    if (out_served_from_respack)
+      *out_served_from_respack = false;
+
     cache_path = String(260, "%s/%s~%s.c4.bin", cache_folder, a.getName(), a.getTypeStr());
 
     AssetExportCache c4;
@@ -484,24 +650,41 @@ public:
 
     if (loaded && !checkCacheChanged(c4, a, exp))
     {
-      FullFileLoadCB crd(cache_path);
-      if (crd.fileHandle && (crd.readInt() == _MAKE4C('fC1')) && (crd.readInt() >= 2))
+      DAGOR_TRY
       {
-        crd.seekto(cacheEndPos);
-
-        int sz = crd.beginBlock();
-        if (sz > 0)
+        FullFileLoadCB crd(cache_path);
+        if (crd.fileHandle && (crd.readInt() == _MAKE4C('fC1')) && (crd.readInt() >= 2))
         {
-          cwr.copyRaw(crd, sz);
-          crd.endBlock();
-          return true;
+          crd.seekto(cacheEndPos);
+
+          int sz = crd.beginBlock();
+          if (sz > 0)
+          {
+            cwr.copyRaw(crd, sz);
+            crd.endBlock();
+            // Persist a corrected mtime so future calls skip rehashing this asset's source files.
+            if (c4.isTimeChanged())
+            {
+              crd.close(); // save() below reopens cache_path for write - must close our own read handle on it first
+              c4.save(cache_path, *mgr, &cwr, &data_offset);
+              data_offset += sizeof(int); // see first data_offset calculation
+            }
+            return true;
+          }
         }
+      }
+      DAGOR_CATCH(const IGenLoad::LoadException &)
+      {
+        logerr("Failed to read cache file \"%s\".", cache_path);
+        cwr.reset(0);
       }
     }
 
     int64_t ref = ref_time_ticks();
     dag::Vector<String> warnings;
+    a.props.setBool("skipJoltValidation", true);
     bool res = is_main_thread() ? warning_checking_build_asset(*exp, a, cwr, *log, warnings) : exp->exportAsset(a, cwr, *log);
+    a.props.removeParam("skipJoltValidation");
     if (!res)
       return false;
 
@@ -519,7 +702,7 @@ public:
     c4.setWarnings(warnings);
     c4.save(cache_path, *mgr, &cwr, &data_offset);
 
-    data_offset += sizeof(int); // see first data_offset caclulation
+    data_offset += sizeof(int); // see first data_offset calculation
 
     return true;
   }
@@ -551,13 +734,30 @@ public:
 
   void __stdcall setExpCacheSharedData(void *p) override { AssetExportCache::setSharedDataPtr(p); }
 
+  void __stdcall allowPatchBuild(bool v) override { dabuild_allow_patch_build = v; }
+
+  bool __stdcall isPatchBuildActive(const char *pkg_name, const char *target_str) override
+  {
+    if (pkg_name && strcmp(pkg_name, "*") == 0)
+      pkg_name = nullptr;
+    return isPatchBuildActiveCached(pkg_name, target_str);
+  }
+
+  void __stdcall invalidateRespackCaches() override
+  {
+    patchStateKeys.reset();
+    patchStates.clear();
+    respackCacheFnames.reset();
+    respackCaches.clear();
+  }
+
   void __stdcall processSrcHashForDestPacks() override
   {
     SimpleString hash;
     for (DagorAsset *a : mgr->getAssets())
       if (a->props.getBool("useIndividualPackWithSrcHash", false))
         if (IDagorAssetExporter *exp = mgr->getAssetExporter(a->getType()))
-          if (exp->getAssetSourceHash(hash, *a, AssetExportCache::getSharedDataPtr(), _MAKE4C('PC')))
+          if (exp->getAssetSourceHash(hash, *a, _MAKE4C('PC')))
           {
             const char *a_name = a->getName();
             const char *suf = strrchr(a_name, '$');
@@ -569,6 +769,7 @@ public:
 
   void cleanupAppBlk()
   {
+    const char *appBlkFname = appBlk.resolveFilename(true);
     bool had_obsolete_blocks = false;
     if (appBlk.getBlockByName("resources"))
     {
@@ -581,8 +782,9 @@ public:
       if (!bad_res_blk)
         goto skip;
 
-      logerr("application.blk has obsolete \"resources\" block; "
-             "use assets/build/<asset_type> blocks instead");
+      logerr("%s has obsolete \"resources\" block; "
+             "use assets/build/<asset_type> blocks instead",
+        appBlkFname);
       if (!appBlk.getBlockByNameEx("assets")->getBlockByName("build"))
       {
         DataBlock *build_blk = appBlk.addBlock("assets")->addBlock("build");
@@ -623,31 +825,31 @@ public:
     }
     if (appBlk.getBlockByName("resedit_add_out_dir"))
     {
-      logerr("application.blk has obsolete \"resedit_add_out_dir\" block, removing");
+      logerr("%s has obsolete \"resedit_add_out_dir\" block, removing", appBlkFname);
       while (appBlk.removeBlock("resedit_add_out_dir")) {}
       had_obsolete_blocks = true;
     }
     if (appBlk.getBlockByName("reseditor_disabled_plugins"))
     {
-      logerr("application.blk has obsolete \"reseditor_disabled_plugins\" block, removing");
+      logerr("%s has obsolete \"reseditor_disabled_plugins\" block, removing", appBlkFname);
       while (appBlk.removeBlock("reseditor_disabled_plugins")) {}
       had_obsolete_blocks = true;
     }
     if (appBlk.getBlockByNameEx("SDK")->paramExists("lib_folder"))
     {
-      logerr("application.blk has obsolete \"SDK/lib_folder\" str, removing");
+      logerr("%s has obsolete \"SDK/lib_folder\" str, removing", appBlkFname);
       while (appBlk.getBlockByName("SDK")->removeParam("lib_folder")) {}
       had_obsolete_blocks = true;
     }
     if (appBlk.getBlockByNameEx("SDK")->paramExists("resource_database_folder"))
     {
-      logerr("application.blk has obsolete \"SDK/resource_database_folder\" str, removing");
+      logerr("%s has obsolete \"SDK/resource_database_folder\" str, removing", appBlkFname);
       while (appBlk.getBlockByName("SDK")->removeParam("resource_database_folder")) {}
       had_obsolete_blocks = true;
     }
     if (appBlk.getBlockByNameEx("SDK")->getBlockByName("additional_tex_folders"))
     {
-      logerr("application.blk has obsolete \"SDK/additional_tex_folders\" block, removing");
+      logerr("%s has obsolete \"SDK/additional_tex_folders\" block, removing", appBlkFname);
       while (appBlk.getBlockByName("SDK")->removeBlock("additional_tex_folders")) {}
       had_obsolete_blocks = true;
     }
@@ -681,6 +883,9 @@ protected:
   int texTypeId = -1;
   ILogWriter *log;
   IGenericProgressIndicator *pbar;
+
+  OAHashNameMap<true> respackCacheFnames;
+  Tab<RespackPackCache> respackCaches;
 };
 
 static AssetExport daBuildExp;

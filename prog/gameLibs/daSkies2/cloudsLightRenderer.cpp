@@ -5,11 +5,13 @@
 #include <drv/3d/dag_rwResource.h>
 #include <drv/3d/dag_draw.h>
 #include <drv/3d/dag_resetDevice.h>
-#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <render/computeShaderFallback/voltexRenderer.h>
 #include <osApiWrappers/dag_miscApi.h>
 
 #include "shaders/clouds2/cloud_settings.hlsli"
+
+bool CloudsLightRenderer::isRendered() const { return resetGen != 0; }
 
 void CloudsLightRenderer::init()
 {
@@ -23,28 +25,29 @@ void CloudsLightRenderer::init()
                                                                                                           : TEXFMT_A16B16G16R16F;
   if (VoltexRenderer::is_compute_supported() && d3d::get_driver_desc().issues.hasBrokenComputeFormattedOutput)
     texfmt = TEXFMT_A32B32G32R32F;
-  clouds_light_color = dag::create_voltex(8, 8, 2 * CLOUDS_LIGHT_TEXTURE_WIDTH, texfmt | texflags, 1, "clouds_light_color");
+  clouds_light_color = dag::create_voltex(8, 8, 2 * CLOUDS_LIGHT_TEXTURE_WIDTH, texfmt | texflags | TEXCF_CLEAR_ON_CREATE, 1,
+    "clouds_light_color", RESTAG_DASKIES2);
   d3d::SamplerInfo smpInfo;
   smpInfo.address_mode_u = d3d::AddressMode::Clamp;
   smpInfo.address_mode_v = d3d::AddressMode::Clamp;
   smpInfo.address_mode_w = d3d::AddressMode::Clamp;
   ShaderGlobal::set_sampler(::get_shader_variable_id("clouds_light_color_samplerstate"), d3d::request_sampler(smpInfo));
-  resetGen = 0;
+  invalidate();
 }
 
 CloudsChangeFlags CloudsLightRenderer::render(const Point3 &main_light_dir, const Point3 &second_light_dir)
 {
-  if (fabsf(lastMainLightDirY - main_light_dir.y) > 1e-4f || fabsf(lastSecondLightDirY - second_light_dir.y) > 1e-4f) // todo: check
-                                                                                                                      // for
-                                                                                                                      // brightness
-                                                                                                                      // as well?
+  // full direction, not just elevation: azimuth matters for the far texels of the
+  // +-280km domain, and sun<->moon swaps can keep elevation while changing light.
+  // Brightness/param changes invalidate through DaSkies::setSkyParams already.
+  if (lengthSq(lastMainLightDir - main_light_dir) > 1e-8f || lengthSq(lastSecondLightDir - second_light_dir) > 1e-8f)
     invalidate();
   const uint32_t cresetGen = get_d3d_full_reset_counter();
   if (resetGen == cresetGen) // nothing to update
     return CLOUDS_NO_CHANGE;
   TIME_D3D_PROFILE(render_clouds_light);
-  lastMainLightDirY = main_light_dir.y;
-  lastSecondLightDirY = second_light_dir.y;
+  lastMainLightDir = main_light_dir;
+  lastSecondLightDir = second_light_dir;
 
   if (gen_clouds_light_texture_cs)
   {
@@ -54,7 +57,7 @@ CloudsChangeFlags CloudsLightRenderer::render(const Point3 &main_light_dir, cons
   else
   {
     SCOPE_RENDER_TARGET;
-    d3d::set_render_target(0, clouds_light_color.getVolTex(), d3d::RENDER_TO_WHOLE_ARRAY, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{clouds_light_color.getVolTex(), 0, d3d::RENDER_TO_WHOLE_ARRAY}});
     gen_clouds_light_texture_ps.getElem()->setStates();
     d3d::draw_instanced(PRIM_TRILIST, 0, 1, 2 * CLOUDS_LIGHT_TEXTURE_WIDTH);
   }

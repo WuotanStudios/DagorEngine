@@ -3,9 +3,13 @@
 #include <main/level.h>
 #include <landMesh/lmeshManager.h>
 #include <render/renderEvent.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <ecs/render/updateStageRender.h>
 #include <daECS/core/coreEvents.h>
+#include <render/world/wrDispatcher.h>
+#include <render/world/depthAOAbove.h>
 #include "puddlesManager.h"
 #include "puddlesManagerEvents.h"
 
@@ -14,9 +18,11 @@ ECS_DECLARE_RELOCATABLE_TYPE(PuddlesManager)
 ECS_REGISTER_RELOCATABLE_TYPE(PuddlesManager, nullptr)
 
 ECS_REGISTER_EVENT(RemovePuddlesInRadius)
+ECS_REGISTER_EVENT(PreparePuddles)
 
 ECS_TAG(render)
-static void init_puddles_manager_es(const OnLevelLoaded &evt, PuddlesManager &puddles__manager, float puddles__bare_minimum_dist)
+static void init_puddles_manager_es(
+  const EventRenderSceneLoaded &evt, PuddlesManager &puddles__manager, float puddles__bare_minimum_dist)
 {
   puddles__manager.init(get_landmesh_manager(), evt.level_blk,
     renderer_has_feature(FeatureRenderFlags::HIGHRES_PUDDLES) ? -1 : puddles__bare_minimum_dist);
@@ -31,13 +37,17 @@ static void reinit_puddles_es(const ChangeRenderFeatures &evt, PuddlesManager &p
 }
 
 ECS_TAG(render)
-static void prepare_puddles_es(const BeforeDraw &evt, PuddlesManager &puddles__manager)
+static void prepare_puddles_es(const PreparePuddles &evt, PuddlesManager &puddles__manager)
 {
+  if (const DepthAOAboveContext *ao = WRDispatcher::getDepthAOAboveCtx())
+    for (const BBox2 &region : ao->getRefreshedRegions())
+      puddles__manager.invalidatePuddles(region);
+
   puddles__manager.preparePuddles(evt.camPos);
 }
 
 ECS_TAG(render)
-static void after_device_reset_puddles_es(const AfterDeviceReset &, PuddlesManager &puddles__manager)
+static void after_device_reset_puddles_es(const EventAfterDeviceReset &, PuddlesManager &puddles__manager)
 {
   puddles__manager.puddlesAfterDeviceReset();
 }
@@ -55,7 +65,7 @@ static void invalidate_puddles_es(const AfterHeightmapChange &, PuddlesManager &
 }
 
 ECS_TAG(render)
-static void unload_puddles_es(const UnloadLevel &, PuddlesManager &puddles__manager)
+static void unload_puddles_es(const EventRenderSceneUnload &, PuddlesManager &puddles__manager)
 {
   puddles__manager.close();
   puddles__manager.setPuddlesScene(NULL);

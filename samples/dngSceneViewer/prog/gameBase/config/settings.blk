@@ -1,12 +1,18 @@
 log_lut:b= yes
+loadingScreen{
+  default:t="watery"
+}
 circuit:t="internal"
 
 disableRemoteNetServices:b=yes
 
 graphics{
+  max_bindump_shadervars:i=8192
   anisotropy:i = 4
   spotShadowBias:p4 = -0.00006, -0.1, 0.001, 0.005 // z, slope z, shader z, shader slope z
   dafx:t="cpu"
+  screenEffect:b=no
+  forceEnableMotionVectors:b=yes
 }
 
 vromList {
@@ -15,6 +21,10 @@ vromList {
     mnt:t="ui/"
     optional:b=yes
   }
+}
+
+debug{
+  toolsPathWin:t="../../../tools/dagor_cdk/windows-x86_64"
 }
 
 
@@ -105,10 +115,9 @@ mountPoints {
   "%dngdas"     { forSource:t="../../../prog/daNetGame/scripts/das"; forVromfs:t="das"; }
   "%daslib"     { forSource:t="../../../prog/1stPartyLibs/daScript/daslib"; forVromfs:t="daslib"; }
   "%dasImgui"   { forSource:t="../../../prog/1stPartyLibs/daScript/modules/dasImgui/daslib"; forVromfs:t="daslib"; }
-  "%dasGameLibs"{ forSource:t="../../../prog/gameLibs/das"; forVromfs:t="das"; }
-  "%gameLibs"   { forSource:t="../../../prog/gameLibs"; forVromfs:t="gameLibs";}
   "%scripts"    { forSource:t="../prog/scripts"; forVromfs:t="scripts"; }
   "%danetlibs"  { forSource:t="../../../prog/daNetGameLibs"; forVromfs:t="danetlibs"; }
+  "%gameLibs"   { forSource:t="../../../prog/gameLibs"; forVromfs:t="gamelibs"; }
   "%gameBase"   { forSource:t="../prog/gameBase"; forVromfs:t=""; }
 }
 
@@ -155,6 +164,31 @@ unitedVdata.dynModel {
 
 consoleGraphicalPresets {
   include "_graphics_presets.blk"
+}
+
+vulkan {
+  vendor {
+    AMD {
+      extensions {
+        entry {
+          // spirv with actual barycentric usage crash driver on pipeline compile
+          gpuMask:t="RX 6"
+          data {
+            VK_KHR_fragment_shader_barycentric:b=no
+          }
+        }
+      }
+      multiQueue {
+        entry {
+          // somehow data is corrupted on upload/readback on exactly this GPUs
+          gpu:t="RX 6600"
+          data {
+            allow:b=no
+          }
+        }
+      }
+    }
+  }
 }
 
 __allow_force_apply_all:b=no

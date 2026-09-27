@@ -11,18 +11,12 @@
 
 #include "bvh_context.h"
 
-namespace bvh
-{
-Sbuffer *alloc_scratch_buffer(uint32_t size, uint32_t &offset);
-}
-
 namespace bvh::cables
 {
 
-static const auto blas_flags = RaytraceBuildFlags::FAST_TRACE;
+static const auto blas_flags = RaytraceBuildFlags::FAST_TRACE | RaytraceBuildFlags::LOW_MEMORY;
 
 static constexpr int vertex_stride = sizeof(float) * 3 + sizeof(uint32_t);
-static constexpr int index_stride = sizeof(uint32_t);
 
 static MeshMetaAllocator::AllocId metaAllocId = MeshMetaAllocator::INVALID_ALLOC_ID;
 
@@ -33,11 +27,13 @@ void teardown() {}
 void init(ContextId context_id)
 {
   G_ASSERT(metaAllocId == MeshMetaAllocator::INVALID_ALLOC_ID);
-  metaAllocId = context_id->allocateMetaRegion(1);
-  MeshMeta &meta = context_id->meshMetaAllocator.get(metaAllocId)[0];
+  TIME_PROFILE(meta_lock_cable_init);
+  metaAllocId = context_id->allocateMetaRegion(1, "cable");
+  LockedMetaAccess lockedMeta(*context_id, metaAllocId);
+  auto &meta = lockedMeta[0];
 
   meta.markInitialized();
-  meta.setIndexBit(4);
+  meta.setIndexBit(2);
   meta.materialType |= MeshMeta::bvhMaterialCable;
   meta.texcoordOffset = 0xFF;
   meta.normalOffset = 0xFF;
@@ -95,7 +91,7 @@ static bool create_blas(ContextId context_id, Cables *cables, int index)
 
 void on_cables_changed(Cables *cables, ContextId context_id)
 {
-  if (!context_id->has(Features::Cable))
+  if (!context_id->hasAny(Features::Cable))
     return;
 
   context_id->cableBLASes.clear();
@@ -109,17 +105,20 @@ void on_cables_changed(Cables *cables, ContextId context_id)
 
   TIME_D3D_PROFILE("on_cables_changed");
 
+  d3d::set_render_target(RenderTarget{}, DepthAccess::SampledRO, {RenderTarget{}});
+
   auto triPerCable = cables->getTranglesPerCable();
   auto triangleCount = triPerCable * maxCables;
   auto vertexCount = (triPerCable + 2) * maxCables;
   auto indexCount = triangleCount * 3;
+  auto indexDwords = indexCount / 2;
 
   if (context_id->cableVertices && context_id->cableVertices->getNumElements() < vertexCount)
   {
     context_id->releaseBuffer(context_id->cableVertices.getBuf());
     context_id->cableVertices.close();
   }
-  if (context_id->cableIndices && context_id->cableIndices->getNumElements() < indexCount)
+  if (context_id->cableIndices && context_id->cableIndices->getNumElements() < indexDwords)
   {
     context_id->releaseBuffer(context_id->cableIndices.getBuf());
     context_id->cableIndices.close();
@@ -127,27 +126,28 @@ void on_cables_changed(Cables *cables, ContextId context_id)
 
   if (!context_id->cableVertices)
   {
-    context_id->cableVertices = dag::buffers::create_ua_sr_structured(vertex_stride, vertexCount, "bvh_cable_vertices");
+    context_id->cableVertices =
+      dag::buffers::create_ua_sr_structured(vertex_stride, vertexCount, "bvh_cable_vertices", d3d::buffers::Init::No, RESTAG_BVH);
     HANDLE_LOST_DEVICE_STATE(context_id->cableVertices, );
 
     uint32_t bindlessIndex;
     context_id->holdBuffer(context_id->cableVertices.getBuf(), bindlessIndex);
 
-    MeshMeta &meta = context_id->meshMetaAllocator.get(metaAllocId)[0];
-    meta.setVertexBufferIndex(bindlessIndex);
+    TIME_PROFILE(meta_lock_cable_vb);
+    LockedMetaAccess(*context_id, metaAllocId)[0].setVertexBufferIndex(bindlessIndex);
   }
 
   if (!context_id->cableIndices)
   {
     context_id->cableIndices =
-      dag::create_sbuffer(index_stride, indexCount, SBCF_UA_SR_STRUCTURED | SBCF_INDEX32, 0, "bvh_cable_indices");
+      dag::buffers::create_ua_sr_byte_address(indexDwords, "bvh_cable_indices", d3d::buffers::Init::No, RESTAG_BVH);
     HANDLE_LOST_DEVICE_STATE(context_id->cableIndices, );
 
     uint32_t bindlessIndex;
     context_id->holdBuffer(context_id->cableIndices.getBuf(), bindlessIndex);
 
-    MeshMeta &meta = context_id->meshMetaAllocator.get(metaAllocId)[0];
-    meta.setIndexBufferIndex(bindlessIndex);
+    TIME_PROFILE(meta_lock_cable_ib);
+    LockedMetaAccess(*context_id, metaAllocId)[0].setIndexBufferIndex(bindlessIndex);
   }
 
   static int bvh_cables_vertices_buf_reg_no = ShaderGlobal::get_int(get_shader_variable_id("bvh_cables_vertices_buf_reg_no"));

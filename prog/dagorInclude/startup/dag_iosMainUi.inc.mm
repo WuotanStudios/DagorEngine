@@ -20,6 +20,7 @@
 #include <debug/dag_debug.h>
 #include <debug/dag_logSys.h>
 #include <unistd.h>
+#include <signal.h>
 #include "dag_addBasePathDef.h"
 #include "dag_loadSettings.h"
 #include "dag_iosCallback.h"
@@ -41,6 +42,8 @@ int g_ios_fps_limit = 120;
 extern bool g_ios_pause_rendering;
 static bool g_ios_was_paused_before_sleep = false;
 static bool g_ios_main_view_is_active = true;
+// if true, the main loop will wait for native UI events to show (purchase popups, etc), the caller should set it back to false when the UI is dismissed
+static bool g_ios_wait_for_ui_events = false;
 UIInterfaceOrientation g_app_orientation = UIInterfaceOrientationUnknown;
 UIInterfaceOrientation preferredLandscapeOrientation = UIInterfaceOrientationLandscapeLeft;
 
@@ -135,6 +138,11 @@ void setFPSLimit(int lim)
   g_ios_fps_limit = lim ? lim : 120;
   if (g_displayLink)
     g_displayLink.preferredFramesPerSecond = g_ios_fps_limit;
+}
+
+void setWaitForUIEvents(bool wait)
+{
+  g_ios_wait_for_ui_events = wait;
 }
 
 int ios_get_maximum_frames_per_second() { return [UIScreen mainScreen].maximumFramesPerSecond; }
@@ -494,11 +502,6 @@ NSString *appName;
                                         selector:@selector(keyboardWillShow:)
                                         name:UIKeyboardWillShowNotification
                                         object:nil];
-
-  [[NSNotificationCenter defaultCenter] addObserver:self
-                                        selector:@selector(keyboardDidHide:)
-                                        name:UIKeyboardDidHideNotification
-                                        object:nil];
 }
 
 - (void)doneClicked
@@ -550,15 +553,8 @@ NSString *appName;
   }
 }
 
-- (void)keyboardDidHide:(NSNotification *)notification
-{
-  [UIView setAnimationsEnabled:YES];
-}
-
 - (void)keyboardWillShow:(NSNotification *)notification
 {
-  [UIView setAnimationsEnabled:NO];
-
   UIViewController *root = getMainController();
   if (root != nil && editField != nil)
   {
@@ -574,11 +570,14 @@ NSString *appName;
     editFieldFrame.origin.y = root.view.bounds.size.height - keyboardFrame.size.height - editFieldFrame.size.height;
     editFieldFrame.origin.x = ((root.view.bounds.size.width - editFieldFrame.size.width) / 2);
     editFieldFrame.size.width = screenSize.width * EDIT_FIELD_WIDTH_SCALE - safeArea.origin.x * 2;
-    editField.frame = editFieldFrame;
 
-    editFieldFrame = editToolbar.frame;
-    editFieldFrame.origin.y = root.view.bounds.size.height - keyboardFrame.size.height - editFieldFrame.size.height;
-    editToolbar.frame = editFieldFrame;
+    CGRect editToolbarFrame = editToolbar.frame;
+    editToolbarFrame.origin.y = root.view.bounds.size.height - keyboardFrame.size.height - editToolbarFrame.size.height;
+
+    [UIView performWithoutAnimation:^{
+      editField.frame = editFieldFrame;
+      editToolbar.frame = editToolbarFrame;
+    }];
   }
 }
 
@@ -592,6 +591,12 @@ NSString *appName;
     [root.view addSubview:editField];
     [editField becomeFirstResponder];
     kbdVisible = YES;
+
+    // On ProMotion (120Hz) devices the display link callback saturates the main thread,
+    // starving UIKit of time to render system keyboard key press/release animations
+    // (keys look visually stuck). Cap the frame rate while the keyboard is visible.
+    if (g_displayLink && g_ios_fps_limit > 30)
+      g_displayLink.preferredFramesPerSecond = 30;
   }
 }
 
@@ -605,6 +610,10 @@ NSString *appName;
     [editField removeFromSuperview];
     [editToolbar removeFromSuperview];
     [editBG removeFromSuperview];
+
+    // restore frame rate capped in showKeyboard
+    if (g_displayLink)
+      g_displayLink.preferredFramesPerSecond = g_ios_fps_limit;
   }
 }
 
@@ -747,8 +756,6 @@ extern "C" const char *dagor_exe_build_time;
 
 extern void messagebox_report_fatal_error(const char *title, const char *msg, const char *call_stack);
 
-char ios_global_log_fname[1024] = "";
-
 #if _TARGET_TVOS
 // need to correct close log when catch crash
 namespace debug_internal
@@ -818,21 +825,33 @@ static void remove_old_logs(const char *debug_path)
     if (error)
       return;
 
-    // Remove files like: aces-2025.02.07-15.41.38.clog
+    // Remove files like: aces-*.clog aces-*.log
     for (NSString *log : files)
-      for (const char * year : {"-2022.", "-2023.", "-2024.", "-2025."})
-        if (strstr([log UTF8String], year))
-          [fileManager removeItemAtPath:[debugPath stringByAppendingPathComponent:log] error:&error];
+      if (strstr([log UTF8String], "aces-"))
+      {
+        NSString *fullPath = [debugPath stringByAppendingPathComponent:log];
+        BOOL isDir = NO;
+        if ([fileManager fileExistsAtPath:fullPath isDirectory:&isDir] && !isDir)
+          [fileManager removeItemAtPath:fullPath error:&error];
+      }
   }
 }
 
-extern const unsigned char *get_dagor_log_crypt_key();
+extern void setup_debug_system(const char *exe_fname, const char *prefix, const char *debug_fname, bool datetime_name,
+  const size_t rotated_count);
 
 static void dagor_ios_before_main_init(int argc, char *argv[])
 {
   static DagorSettingsBlkHolder stgBlkHolder;
 
   measure_cpu_freq();
+
+#if defined OPTIONAL_ADD_ARGS
+  OPTIONAL_ADD_ARGS(argc, argv);
+#endif
+
+  dgs_init_argv(argc, argv);
+
 #if !_TARGET_TVOS
 #if DAGOR_DBGLEVEL == 0
   stderr = freopen("/dev/null", "wt", stderr);
@@ -840,45 +859,32 @@ static void dagor_ios_before_main_init(int argc, char *argv[])
   NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
   NSString *documentsDirectory = [paths objectAtIndex:0];
   {
-#if DAGOR_FORCE_LOGS
-    const char *logExt = ".clog";
-#else
-    const char *logExt = ".log";
-#endif
+    remove_old_logs([documentsDirectory UTF8String]);
 
-    char logFilename[DAGOR_MAX_PATH];
-    strcpy(logFilename, [documentsDirectory UTF8String]);
-
-    remove_old_logs(logFilename);
-
-    const char *logName = dd_get_fname(argv[0]);
-    const int logIndex = rotate_debug_files(logName, logFilename, logExt, 3/* rotatedCount */);
-    SNPRINTF(logFilename, sizeof(logFilename), "%s-%d%s", logName, logIndex, logExt);
-
-    strcpy(ios_global_log_fname,
-      [[documentsDirectory stringByAppendingPathComponent:[[NSString alloc] initWithUTF8String: logFilename]] UTF8String]);
+    const char *logsDirName = ::dgs_get_argv("logsDirName");
+    const bool useDateTimeName = logsDirName ? false : (DAGOR_DBGLEVEL > 0);
+    const size_t useRotatedLogs = logsDirName ? DAGOR_DBGLEVEL > 0 ? 0 : 3 : 3;
+    setup_debug_system(logsDirName ? logsDirName : argv[0], [documentsDirectory UTF8String], "debug", useDateTimeName, useRotatedLogs);
   }
 
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
 
-  dgs_init_argv(argc, argv);
   dgs_report_fatal_error = messagebox_report_fatal_error;
   apply_hinstance(NULL, NULL);
 
   set_debug_console_ios_file_output(true);
   set_copy_debug_to_ios_console(DAGOR_DBGLEVEL > 0);
 
-#if DAGOR_FORCE_LOGS && DAGOR_DBGLEVEL <= 0
-  crypt_debug_setup(get_dagor_log_crypt_key(), 60 << 20 /* MAX_LOGS_FILE_SIZE */);
-#endif
-
 #if DAGOR_DBGLEVEL != 0
   debug("BUILD TIMESTAMP:   %s %s\n\n", dagor_exe_build_date, dagor_exe_build_time);
 #endif
-  debug("app: <%s>", ios_global_log_fname);
+  debug("app: <%s>", get_log_filename());
 
   DagorHwException::setHandler("main");
+
+  // writing to a socket closed by the peer leads to SIGPIPE, process will exit if it is not ignored
+  signal(SIGPIPE, SIG_IGN);
 }
 
 static void dagor_ios_main_init_impl()
@@ -940,7 +946,7 @@ extern "C" void dagor_ios_delegate_step(CADisplayLink*)
 {
   if (g_frame_callback)
   {
-    if (!g_ios_pause_rendering)
+    if (!g_ios_pause_rendering && !g_ios_wait_for_ui_events)
       g_frame_callback();
   }
   else if (!g_ios_pause_rendering)
@@ -1081,7 +1087,7 @@ extern "C" void dagor_ios_delegate_dealloc()
   flush_debug_file();
 }
 
-extern "C" int main(int argc, char *argv[])
+int main(int argc, char *argv[])
 {
   dagor_ios_before_main_init(argc, argv);
 

@@ -3,6 +3,7 @@
 #include <libTools/util/conLogWriter.h>
 #include <regExp/regExp.h>
 #include <libTools/util/strUtil.h>
+#include <libTools/util/setupNamedMounts.h>
 #include <assets/assetMgr.h>
 #include <assets/asset.h>
 #include <assets/assetMsgPipe.h>
@@ -48,7 +49,7 @@ static void __cdecl ctrl_break_handler(int) { quit_game(0); }
 static void print_title()
 {
   printf("Extract skins tool v1.0\n"
-         "Copyright (C) Gaijin Games KFT, 2023\n\n");
+         "Copyright (C) Gaijin Games KFT, 2026\n\n");
 }
 
 int DagorWinMain(bool debugmode)
@@ -97,6 +98,7 @@ int DagorWinMain(bool debugmode)
     assetMgr.setMsgPipe(&pipe);
 
     String app_blk_fn(0, "%s/application.blk", argv[0]);
+    set_canonical_app_dir_mount(argv[0]);
     if (!appblk.load(app_blk_fn))
     {
       printf("ERR: cannot load %s\n", app_blk_fn.str());
@@ -106,18 +108,20 @@ int DagorWinMain(bool debugmode)
     DataBlock::setRootIncludeResolver(argv[0]);
     ::load_tex_streaming_settings(app_blk_fn, NULL, true);
 
-    // load asset base
-    const DataBlock &blk = *appblk.getBlockByNameEx("assets");
-    int base_nid = blk.getNameId("base");
+    { // load asset base
+      const DataBlock &blk = *appblk.getBlockByNameEx("assets");
+      const int base_nid = blk.getNameId("base");
+      eastl::unique_ptr<DagorAssetMgrLoadAssetsBaseContext> loadContext = assetMgr.makeLoadAssetsBaseContext();
 
-    assetMgr.setupAllowedTypes(*blk.getBlockByNameEx("types"), blk.getBlockByName("export"));
-    for (int i = 0; i < blk.paramCount(); i++)
-      if (blk.getParamNameId(i) == base_nid && blk.getParamType(i) == DataBlock::TYPE_STRING)
-      {
-        base_prefix.push_back().printf(260, "%s/%s", argv[0], blk.getStr(i));
-        dd_simplify_fname_c(base_prefix.back());
-        assetMgr.loadAssetsBase(base_prefix.back(), "global");
-      }
+      assetMgr.setupAllowedTypes(*blk.getBlockByNameEx("types"), blk.getBlockByName("export"));
+      for (int i = 0; i < blk.paramCount(); i++)
+        if (blk.getParamNameId(i) == base_nid && blk.getParamType(i) == DataBlock::TYPE_STRING)
+        {
+          base_prefix.push_back().printf(260, "%s/%s", argv[0], blk.getStr(i));
+          dd_simplify_fname_c(base_prefix.back());
+          assetMgr.loadAssetsBase(base_prefix.back(), "global", *loadContext);
+        }
+    }
   }
 
   Tab<SimpleString> blk_list;

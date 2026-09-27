@@ -1,14 +1,21 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
 #include "driver.h"
+#include "drv_assert_defs.h"
 
 // #include "immediateConstStub.inc.cpp"
 
 // this is a bit optimized version, basically less ifs and context locks
 #include "immediateConstStub.h"
+#include "genericBuffer.h"
+#include "render_state.h"
 
 #include <drv/3d/dag_shaderConstants.h>
 #include <drv/3d/dag_buffers.h>
+#include <generic/dag_carray.h>
+
+using namespace drv3d_dx11;
+
 #ifdef IMMEDIATE_CB_NAMESPACE
 IMMEDIATE_CB_NAMESPACE
 {
@@ -18,9 +25,9 @@ IMMEDIATE_CB_NAMESPACE
   {
     if (immediate_cb[STAGE_CS] && immediate_cb[STAGE_PS] && immediate_cb[STAGE_VS])
       return true;
-    immediate_cb[STAGE_CS] = d3d::buffers::create_persistent_cb(1, "_immediate_cb_cs");
-    immediate_cb[STAGE_PS] = d3d::buffers::create_persistent_cb(1, "_immediate_cb_ps");
-    immediate_cb[STAGE_VS] = d3d::buffers::create_persistent_cb(1, "_immediate_cb_vs");
+    immediate_cb[STAGE_CS] = d3d::buffers::create_persistent_cb(1, "_immediate_cb_cs", RESTAG_ENGINE);
+    immediate_cb[STAGE_PS] = d3d::buffers::create_persistent_cb(1, "_immediate_cb_ps", RESTAG_ENGINE);
+    immediate_cb[STAGE_VS] = d3d::buffers::create_persistent_cb(1, "_immediate_cb_vs", RESTAG_ENGINE);
     return immediate_cb[STAGE_CS] && immediate_cb[STAGE_PS] && immediate_cb[STAGE_VS];
   }
 
@@ -47,10 +54,9 @@ bool d3d::set_immediate_const(unsigned stage, const uint32_t *data, unsigned num
     {
       g_render_state.constants.customBuffers[stage][slot] = vb->buffer;
       g_render_state.constants.constantsBufferChanged[stage] |= 1 << slot;
-      g_render_state.constants.buffersFirstConstants[stage][slot] = 0;
-      g_render_state.constants.buffersNumConstants[stage][slot] = 16;
       if (g_render_state.constants.customBuffersMaxSlotUsed[stage] < slot)
         g_render_state.constants.customBuffersMaxSlotUsed[stage] = slot;
+      g_render_state.modified = true; // flush_states() early-outs on !modified, skipping this bind
     }
     ContextAutoLock contextLock;
     D3D11_MAPPED_SUBRESOURCE lockMsr;

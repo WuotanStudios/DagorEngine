@@ -4,6 +4,7 @@
 #include <util/dag_stdint.h>
 #include <drv/3d/dag_tex3d.h>
 #include <3d/ddsFormat.h>
+#include <3d/ddsxTex.h>
 #include <debug/dag_debug.h>
 
 inline int dds_header_size() { return sizeof(DDSURFACEDESC2) + 4; }
@@ -69,6 +70,10 @@ inline bool create_dds_header(void *data, int size, int w, int h, int bpp, int m
         if (astc)
           dsc.ddpfPixelFormat.dwRGBBitCount = 8;
         break;
+      case TEXFMT_ASTC4:
+        dfmt = MAKEFOURCC('A', 'S', 'T', '4');
+        dsc.ddpfPixelFormat.dwRGBBitCount = 8;
+        break;
       case TEXFMT_A8R8G8B8: dfmt = D3DFMT_A8R8G8B8; break;
       case TEXFMT_L16: dfmt = D3DFMT_L16; break;
       case TEXFMT_A8: dfmt = D3DFMT_A8; break;
@@ -81,4 +86,32 @@ inline bool create_dds_header(void *data, int size, int w, int h, int bpp, int m
     dsc.ddpfPixelFormat.dwFourCC = dfmt;
   }
   return true;
+}
+
+inline bool is_srgb_capable_d3d_fmt(int fmt)
+{
+  return fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8 || fmt == D3DFMT_A8B8G8R8 || fmt == D3DFMT_DXT1 || fmt == D3DFMT_DXT3 ||
+         fmt == D3DFMT_DXT5 || fmt == _MAKE4C('BC7 ') || fmt == _MAKE4C('ASTC') || fmt == _MAKE4C('AST4') || fmt == _MAKE4C('AST8');
+}
+
+inline bool is_srgb_capable_fmt(const char *fmt)
+{
+  static const char *const srgbFmts[] = {"ARGB", "RGB", "DXT1", "DXT1a", "DXT3", "DXT5", "DXT1|DXT5", "DXT1|BC7", "BC7"};
+  for (const char *s : srgbFmts)
+    if (stricmp(fmt, s) == 0)
+      return true;
+  return strnicmp(fmt, "ASTC", 4) == 0;
+}
+
+inline bool fix_gamma_for_fmt(float &gamma, const char *fmt)
+{
+  if (is_equal_float(gamma, 1.0f) || is_srgb_capable_fmt(fmt))
+    return false;
+  gamma = 1.0f;
+  return true;
+}
+
+inline bool is_srgb_config_valid(const ddsx::Header &h)
+{
+  return (h.flags & ddsx::Header::FLG_GAMMA_EQ_1) || h.d3dFormat == D3DFMT_UNKNOWN || is_srgb_capable_d3d_fmt(h.d3dFormat);
 }

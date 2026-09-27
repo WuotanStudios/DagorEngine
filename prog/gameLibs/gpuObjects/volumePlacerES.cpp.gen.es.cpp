@@ -86,7 +86,7 @@ static ecs::EntitySystemDesc gpu_object_distance_emitter_es_event_handler_es_des
 static constexpr ecs::ComponentDesc gpu_object_placer_changed_es_event_handler_comps[] =
 {
 //start of 11 rw components at [0]
-  {ECS_HASH("gpu_object_placer__ri_asset_idx"), ecs::ComponentTypeInfo<int>()},
+  {ECS_HASH("gpu_object_placer__ri_asset_idx"), ecs::ComponentTypeInfo<rendinst::ClientRiexPoolId>()},
   {ECS_HASH("gpu_object_placer__filled"), ecs::ComponentTypeInfo<bool>()},
   {ECS_HASH("gpu_object_placer__buffer_offset"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("gpu_object_placer__decal_buffer_size"), ecs::ComponentTypeInfo<int>()},
@@ -131,7 +131,7 @@ static void gpu_object_placer_changed_es_event_handler_all_events(const ecs::Eve
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     gpu_objects::gpu_object_placer_changed_es_event_handler(evt
         , ECS_RO_COMP(gpu_object_placer_changed_es_event_handler_comps, "ri_gpu_object__name", ecs::string)
-    , ECS_RW_COMP(gpu_object_placer_changed_es_event_handler_comps, "gpu_object_placer__ri_asset_idx", int)
+    , ECS_RW_COMP(gpu_object_placer_changed_es_event_handler_comps, "gpu_object_placer__ri_asset_idx", rendinst::ClientRiexPoolId)
     , ECS_RW_COMP(gpu_object_placer_changed_es_event_handler_comps, "gpu_object_placer__filled", bool)
     , ECS_RW_COMP(gpu_object_placer_changed_es_event_handler_comps, "gpu_object_placer__buffer_offset", int)
     , ECS_RW_COMP(gpu_object_placer_changed_es_event_handler_comps, "gpu_object_placer__decal_buffer_size", int)
@@ -161,7 +161,7 @@ static ecs::EntitySystemDesc gpu_object_placer_changed_es_event_handler_es_desc
 static constexpr ecs::ComponentDesc gpu_object_placer_create_es_event_handler_comps[] =
 {
 //start of 9 rw components at [0]
-  {ECS_HASH("gpu_object_placer__ri_asset_idx"), ecs::ComponentTypeInfo<int>()},
+  {ECS_HASH("gpu_object_placer__ri_asset_idx"), ecs::ComponentTypeInfo<rendinst::ClientRiexPoolId>()},
   {ECS_HASH("gpu_object_placer__filled"), ecs::ComponentTypeInfo<bool>()},
   {ECS_HASH("gpu_object_placer__buffer_size"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("gpu_object_placer__on_rendinst_geometry_count"), ecs::ComponentTypeInfo<int>()},
@@ -183,7 +183,7 @@ static void gpu_object_placer_create_es_event_handler_all_events(const ecs::Even
   auto comp = components.begin(), compE = components.end(); G_ASSERT(comp!=compE); do
     gpu_objects::gpu_object_placer_create_es_event_handler(static_cast<const ecs::EventEntityCreated&>(evt)
         , ECS_RO_COMP(gpu_object_placer_create_es_event_handler_comps, "ri_gpu_object__name", ecs::string)
-    , ECS_RW_COMP(gpu_object_placer_create_es_event_handler_comps, "gpu_object_placer__ri_asset_idx", int)
+    , ECS_RW_COMP(gpu_object_placer_create_es_event_handler_comps, "gpu_object_placer__ri_asset_idx", rendinst::ClientRiexPoolId)
     , ECS_RW_COMP(gpu_object_placer_create_es_event_handler_comps, "gpu_object_placer__filled", bool)
     , ECS_RW_COMP(gpu_object_placer_create_es_event_handler_comps, "gpu_object_placer__buffer_size", int)
     , ECS_RW_COMP(gpu_object_placer_create_es_event_handler_comps, "gpu_object_placer__on_rendinst_geometry_count", int)
@@ -286,7 +286,7 @@ static constexpr ecs::ComponentDesc gpu_object_placer_fill_ecs_query_comps[] =
   {ECS_HASH("gpu_object_placer__surface_riex_handles"), ecs::ComponentTypeInfo<gpu_objects::riex_handles>()},
 //start of 29 ro components at [10]
   {ECS_HASH("eid"), ecs::ComponentTypeInfo<ecs::EntityId>()},
-  {ECS_HASH("gpu_object_placer__ri_asset_idx"), ecs::ComponentTypeInfo<int>()},
+  {ECS_HASH("gpu_object_placer__ri_asset_idx"), ecs::ComponentTypeInfo<rendinst::ClientRiexPoolId>()},
   {ECS_HASH("gpu_object_placer__visible_distance_squared"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("gpu_object_placer__place_on_geometry"), ecs::ComponentTypeInfo<bool>()},
   {ECS_HASH("gpu_object_placer__use_strict_decal_placement"), ecs::ComponentTypeInfo<bool>()},
@@ -325,16 +325,16 @@ static ecs::CompileTimeQueryDesc gpu_object_placer_fill_ecs_query_desc
   make_span(gpu_object_placer_fill_ecs_query_comps+39, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_fill_ecs_query(Callable function)
+inline void gpu_objects::gpu_object_placer_fill_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gpu_object_placer_fill_ecs_query_desc.getHandle(),
+  perform_query(&manager, gpu_object_placer_fill_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
         {
           function(
               ECS_RO_COMP(gpu_object_placer_fill_ecs_query_comps, "eid", ecs::EntityId)
-            , ECS_RO_COMP(gpu_object_placer_fill_ecs_query_comps, "gpu_object_placer__ri_asset_idx", int)
+            , ECS_RO_COMP(gpu_object_placer_fill_ecs_query_comps, "gpu_object_placer__ri_asset_idx", rendinst::ClientRiexPoolId)
             , ECS_RO_COMP(gpu_object_placer_fill_ecs_query_comps, "gpu_object_placer__visible_distance_squared", float)
             , ECS_RO_COMP(gpu_object_placer_fill_ecs_query_comps, "gpu_object_placer__place_on_geometry", bool)
             , ECS_RO_COMP(gpu_object_placer_fill_ecs_query_comps, "gpu_object_placer__use_strict_decal_placement", bool)
@@ -399,9 +399,9 @@ static ecs::CompileTimeQueryDesc gpu_object_placer_remove_ecs_query_desc
   make_span(gpu_object_placer_remove_ecs_query_comps+6, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_remove_ecs_query(Callable function)
+inline void gpu_objects::gpu_object_placer_remove_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gpu_object_placer_remove_ecs_query_desc.getHandle(),
+  perform_query(&manager, gpu_object_placer_remove_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -436,9 +436,9 @@ static ecs::CompileTimeQueryDesc gpu_object_placer_copy_on_expand_ecs_query_desc
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_copy_on_expand_ecs_query(Callable function)
+inline void gpu_objects::gpu_object_placer_copy_on_expand_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gpu_object_placer_copy_on_expand_ecs_query_desc.getHandle(),
+  perform_query(&manager, gpu_object_placer_copy_on_expand_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -457,7 +457,7 @@ inline void gpu_objects::gpu_object_placer_copy_on_expand_ecs_query(Callable fun
 static constexpr ecs::ComponentDesc gpu_object_placer_visibility_ecs_query_comps[] =
 {
 //start of 13 ro components at [0]
-  {ECS_HASH("gpu_object_placer__ri_asset_idx"), ecs::ComponentTypeInfo<int>()},
+  {ECS_HASH("gpu_object_placer__ri_asset_idx"), ecs::ComponentTypeInfo<rendinst::ClientRiexPoolId>()},
   {ECS_HASH("gpu_object_placer__buffer_size"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("gpu_object_placer__current_distance_squared"), ecs::ComponentTypeInfo<float>()},
   {ECS_HASH("gpu_object_placer__buffer_offset"), ecs::ComponentTypeInfo<int>()},
@@ -481,9 +481,9 @@ static ecs::CompileTimeQueryDesc gpu_object_placer_visibility_ecs_query_desc
   make_span(gpu_object_placer_visibility_ecs_query_comps+13, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_visibility_ecs_query(Callable function)
+inline void gpu_objects::gpu_object_placer_visibility_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gpu_object_placer_visibility_ecs_query_desc.getHandle(),
+  perform_query(&manager, gpu_object_placer_visibility_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -491,7 +491,7 @@ inline void gpu_objects::gpu_object_placer_visibility_ecs_query(Callable functio
           if ( !(ECS_RO_COMP(gpu_object_placer_visibility_ecs_query_comps, "gpu_object_placer__filled", bool)) )
             continue;
           function(
-              ECS_RO_COMP(gpu_object_placer_visibility_ecs_query_comps, "gpu_object_placer__ri_asset_idx", int)
+              ECS_RO_COMP(gpu_object_placer_visibility_ecs_query_comps, "gpu_object_placer__ri_asset_idx", rendinst::ClientRiexPoolId)
             , ECS_RO_COMP(gpu_object_placer_visibility_ecs_query_comps, "gpu_object_placer__buffer_size", int)
             , ECS_RO_COMP(gpu_object_placer_visibility_ecs_query_comps, "gpu_object_placer__current_distance_squared", float)
             , ECS_RO_COMP(gpu_object_placer_visibility_ecs_query_comps, "gpu_object_placer__buffer_offset", int)
@@ -511,23 +511,26 @@ inline void gpu_objects::gpu_object_placer_visibility_ecs_query(Callable functio
 }
 static constexpr ecs::ComponentDesc gpu_object_placer_invalidate_ecs_query_comps[] =
 {
-//start of 4 rw components at [0]
+//start of 7 rw components at [0]
   {ECS_HASH("gpu_object_placer__filled"), ecs::ComponentTypeInfo<bool>()},
   {ECS_HASH("gpu_object_placer__buffer_offset"), ecs::ComponentTypeInfo<int>()},
   {ECS_HASH("gpu_object_placer__distance_emitter_buffer_size"), ecs::ComponentTypeInfo<int>()},
-  {ECS_HASH("gpu_object_placer__decal_buffer_size"), ecs::ComponentTypeInfo<int>()}
+  {ECS_HASH("gpu_object_placer__decal_buffer_size"), ecs::ComponentTypeInfo<int>()},
+  {ECS_HASH("gpu_object_placer__buffer_size"), ecs::ComponentTypeInfo<int>()},
+  {ECS_HASH("gpu_object_placer__on_rendinst_geometry_count"), ecs::ComponentTypeInfo<int>()},
+  {ECS_HASH("gpu_object_placer__on_terrain_geometry_count"), ecs::ComponentTypeInfo<int>()}
 };
 static ecs::CompileTimeQueryDesc gpu_object_placer_invalidate_ecs_query_desc
 (
   "gpu_objects::gpu_object_placer_invalidate_ecs_query",
-  make_span(gpu_object_placer_invalidate_ecs_query_comps+0, 4)/*rw*/,
+  make_span(gpu_object_placer_invalidate_ecs_query_comps+0, 7)/*rw*/,
   empty_span(),
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_invalidate_ecs_query(Callable function)
+inline void gpu_objects::gpu_object_placer_invalidate_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gpu_object_placer_invalidate_ecs_query_desc.getHandle(),
+  perform_query(&manager, gpu_object_placer_invalidate_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -537,6 +540,9 @@ inline void gpu_objects::gpu_object_placer_invalidate_ecs_query(Callable functio
             , ECS_RW_COMP(gpu_object_placer_invalidate_ecs_query_comps, "gpu_object_placer__buffer_offset", int)
             , ECS_RW_COMP(gpu_object_placer_invalidate_ecs_query_comps, "gpu_object_placer__distance_emitter_buffer_size", int)
             , ECS_RW_COMP(gpu_object_placer_invalidate_ecs_query_comps, "gpu_object_placer__decal_buffer_size", int)
+            , ECS_RW_COMP(gpu_object_placer_invalidate_ecs_query_comps, "gpu_object_placer__buffer_size", int)
+            , ECS_RW_COMP(gpu_object_placer_invalidate_ecs_query_comps, "gpu_object_placer__on_rendinst_geometry_count", int)
+            , ECS_RW_COMP(gpu_object_placer_invalidate_ecs_query_comps, "gpu_object_placer__on_terrain_geometry_count", int)
             );
 
         }while (++comp != compE);
@@ -559,9 +565,9 @@ static ecs::CompileTimeQueryDesc gpu_object_placer_distance_emitter_update_after
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_distance_emitter_update_after_placing_ecs_query(ecs::EntityId eid, Callable function)
+inline void gpu_objects::gpu_object_placer_distance_emitter_update_after_placing_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, gpu_object_placer_distance_emitter_update_after_placing_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, gpu_object_placer_distance_emitter_update_after_placing_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;
@@ -593,9 +599,9 @@ static ecs::CompileTimeQueryDesc gpu_object_placer_select_closest_distance_emitt
   make_span(gpu_object_placer_select_closest_distance_emitter_ecs_query_comps+2, 1)/*rq*/,
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_select_closest_distance_emitter_ecs_query(Callable function)
+inline void gpu_objects::gpu_object_placer_select_closest_distance_emitter_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gpu_object_placer_select_closest_distance_emitter_ecs_query_desc.getHandle(),
+  perform_query(&manager, gpu_object_placer_select_closest_distance_emitter_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -626,9 +632,9 @@ static ecs::CompileTimeQueryDesc gpu_object_placer_distance_emitter_update_volum
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_distance_emitter_update_volume_placers_ecs_query(Callable function)
+inline void gpu_objects::gpu_object_placer_distance_emitter_update_volume_placers_ecs_query(ecs::EntityManager &manager, Callable function)
 {
-  perform_query(g_entity_mgr, gpu_object_placer_distance_emitter_update_volume_placers_ecs_query_desc.getHandle(),
+  perform_query(&manager, gpu_object_placer_distance_emitter_update_volume_placers_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         auto comp = components.begin(), compE = components.end(); G_ASSERT(comp != compE); do
@@ -657,9 +663,9 @@ static ecs::CompileTimeQueryDesc gpu_object_placer_get_current_distance_emitter_
   empty_span(),
   empty_span());
 template<typename Callable>
-inline void gpu_objects::gpu_object_placer_get_current_distance_emitter_position_ecs_query(ecs::EntityId eid, Callable function)
+inline void gpu_objects::gpu_object_placer_get_current_distance_emitter_position_ecs_query(ecs::EntityManager &manager, ecs::EntityId eid, Callable function)
 {
-  perform_query(g_entity_mgr, eid, gpu_object_placer_get_current_distance_emitter_position_ecs_query_desc.getHandle(),
+  perform_query(&manager, eid, gpu_object_placer_get_current_distance_emitter_position_ecs_query_desc.getHandle(),
     [&function](const ecs::QueryView& __restrict components)
     {
         constexpr size_t comp = 0;

@@ -47,13 +47,22 @@ void ConvexVhacdProcessing::calcInterface(const ConvexVhacdSettings &settings)
   selectedInterface->Release();
   selectedInterface = VHACD::CreateVHACD_ASYNC();
   progressCallback.isComputed = false;
+  if (!collisionRes)
+    return;
+
   VHACD::IVHACD::Parameters p;
   dag::Vector<float> verts;
   dag::Vector<uint32_t> indices;
   dag::ConstSpan<CollisionNode> nodes = collisionRes->getAllNodes();
   for (const auto &refNode : settings.selectedNodes.refNodes)
   {
-    G_ASSERT_LOG(add_verts_and_indices_from_node(nodes, refNode, verts, indices), "Collision node not found: %s", refNode);
+    if (!add_verts_and_indices_from_node(*collisionRes, nodes, refNode, verts, indices))
+    {
+      // Missing/empty ref (callee logerr'd): the merge is incomplete, so don't feed a partial
+      // soup to Compute() -- it would silently produce a hull with geometry omitted.
+      logerr("Collision node not found: %s", refNode);
+      return;
+    }
   }
   p.m_maxRecursionDepth = settings.depth;
   p.m_maxConvexHulls = settings.maxHulls;
@@ -74,8 +83,11 @@ void ConvexVhacdProcessing::addSelectedInterface()
   selectedInterface = VHACD::CreateVHACD_ASYNC();
 }
 
+// Both delayed actions of a compute can land after the plugin ended and dropped the panel.
 void ConvexVhacdProcessing::printCalcProgress(const double progress)
 {
+  if (!panel)
+    return;
   panel->setText(PID_CONVEX_BUILD_INFO, String(100, "Progress %d%%", progress));
 }
 
@@ -97,6 +109,8 @@ void ConvexVhacdProcessing::updatePanelParams()
 
 void ConvexVhacdProcessing::checkComputedInterface()
 {
+  if (!panel)
+    return;
   for (int i = 0; i < selectedInterface->GetNConvexHulls(); ++i)
   {
     Tab<Point3> verts;

@@ -195,10 +195,10 @@ void EditorStartDialog::updateOkButtonState()
       String message;
       if (wspNames.empty())
         message = "Please add a workspace.";
-      else if (::dd_file_exist(wsp.getAppPath()))
+      else if (::dd_file_exist(wsp.getAppBlkPath()))
         message = "Some workspace settings are invalid.";
       else
-        message.printf(0, "\"%s\" cannot be found.", wsp.getAppPath());
+        message.printf(0, "\"%s\" cannot be found.", wsp.getAppBlkPath());
 
       panel->createStatic(ID_START_DIALOG_ERROR_MESSAGE, message);
       panel->setBool(ID_START_DIALOG_ERROR_MESSAGE, true); // Make it bold.
@@ -271,9 +271,9 @@ void EditorStartDialog::onImguiDelayedCallback(void *user_data)
 }
 
 
-void EditorStartDialog::updateImguiDialog()
+void EditorStartDialog::updateImguiDialog(const PropPanel::DialogWindow::DialogFrameSizing &sizing)
 {
-  DialogWindow::updateImguiDialog();
+  DialogWindow::updateImguiDialog(sizing);
 
   if (!showAddWorkspaceDialog)
     return;
@@ -324,14 +324,14 @@ WorkspaceDialog::WorkspaceDialog(EditorStartDialog *esd, const char *caption, Ed
   _grp->createFileEditBox(PID_APP_FOLDER, "Path to application BLK:");
 
   Tab<String> filters(tmpmem);
-  filters.push_back() = "Application|application.blk";
+  filters.push_back() = "Application|application*.blk";
   filters.push_back() = "BLK files|*.blk";
   _grp->setStrings(PID_APP_FOLDER, filters);
 
   if (is_editing)
   {
     _panel->setText(PID_WSP_NAME, wsp.getName());
-    _panel->setText(PID_APP_FOLDER, wsp.getAppPath());
+    _panel->setText(PID_APP_FOLDER, wsp.getAppBlkPath());
   }
   else
   {
@@ -426,24 +426,9 @@ void WorkspaceDialog::onChange(int pcb_id, PropPanel::ContainerPropertyControl *
 
       if (!wspName.length())
       {
-        const char *begin;
-        const char *end;
-
-        for (end = appPath.str() + strlen(appPath.str()); end > appPath.str(); --end)
-          if (*end == '/' || *end == '\\')
-            break;
-
-        if (end > appPath.str())
-        {
-          for (begin = end - 1; begin > appPath.str(); --begin)
-            if (*begin == '/' || *begin == '\\')
-              break;
-
-          debug("begin = %s, end = %s", begin, end);
-
-          if (begin + 1 < end)
-            panel->setText(PID_WSP_NAME, String::mk_sub_str(begin + 1, end));
-        }
+        const String nameForPath = get_workspace_name_from_application_blk_path(appPath);
+        if (!nameForPath.empty())
+          panel->setText(PID_WSP_NAME, nameForPath);
       }
     }
   }
@@ -459,7 +444,7 @@ void WorkspaceDialog::onClick(int pcb_id, PropPanel::ContainerPropertyControl *p
     if (creator.showDialog() == PropPanel::DIALOG_ID_OK)
     {
       panel->setText(PID_WSP_NAME, mWsp.getName());
-      panel->setText(PID_APP_FOLDER, mWsp.getAppPath());
+      panel->setText(PID_APP_FOLDER, mWsp.getAppBlkPath());
     }
   }
 }

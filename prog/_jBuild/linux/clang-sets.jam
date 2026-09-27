@@ -1,9 +1,10 @@
-#  Setup for clang compiler for LINUX 64-bit (to be included from jBuild.jam)
+#  Setup for clang compiler for LINUX (to be included from jBuild.jam)
 
 _OBJ_SUFFIX  = .o ;
+MAbi ?= 64 ; # 32 x32
 
 local _DEF_COM_CMDLINE =
-  -pipe -c -msse$(SSEVersion) -m64 -MMD
+  -pipe -c -msse$(SSEVersion) -m$(MAbi) -MMD
   -Wno-trigraphs -Wno-multichar -Wformat -Wno-unused-value -Wabsolute-value
   -Wuninitialized -Wno-inline-new-delete -Wno-unknown-warning-option
   -Wno-deprecated-register -Wno-invalid-offsetof -Wno-address-of-packed-member
@@ -11,20 +12,24 @@ local _DEF_COM_CMDLINE =
   -Wno-undefined-var-template -Wno-inconsistent-missing-override
   -Wno-deprecated-builtins # for EASTL that uses deprecated builtins. remove after EASTL update
   -Wno-nan-infinity-disabled
+  -Wno-nontrivial-memcall
   -ffunction-sections -fdata-sections -fno-omit-frame-pointer
   -ffast-math -ffinite-math-only -mrecip=none -minline-all-stringops
   -fdiagnostics-absolute-paths
-  -D_TARGET_PC=3 -D_TARGET_PC_LINUX=3 -D_TARGET_64BIT -D_TARGET_ARCH_X86_64 -D_TARGET_SIMD_SSE=$(SSEVersion)
-  -D__LINUX__=64
+  -D_TARGET_PC=3 -D_TARGET_PC_LINUX=3 -D_TARGET_SIMD_SSE=$(SSEVersion)
   -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS
+  -D__vectorcall=
 ;
+if $(StrictAliasing) = no { _DEF_COM_CMDLINE += -fno-strict-aliasing ; }
+if $(MAbi) = 64 { _DEF_COM_CMDLINE += -D_TARGET_64BIT -D_TARGET_ARCH_X86_64 -D__LINUX__=64 ; }
+else { _DEF_COM_CMDLINE += -D_TARGET_ARCH_X86 -D__LINUX__=32 -D_FILE_OFFSET_BITS=64 ; }
 
 if $(ClangThreadSafety) = yes {
   _DEF_COM_CMDLINE += -Wthread-safety ;
 }
 
 if $(KernelLinkage) = static { _DEF_COM_CMDLINE += -D_TARGET_STATIC_LIB ; }
-if $(PlatformArch) = e2k { _DEF_COM_CMDLINE += -D_XM_NO_INTRINSICS_ -D__vectorcall= -Wno-deprecated-declarations ; }
+if $(PlatformArch) = e2k { _DEF_COM_CMDLINE += -D_XM_NO_INTRINSICS_ -Wno-deprecated-declarations ; }
 
 local STDLIB_COMP = -stdlib=libstdc++ ;
 local STDLIB_LINK = -stdlib=libstdc++ -lstdc++ ;
@@ -35,7 +40,7 @@ if $(CxxStdLib) = libc++ {
 }
 
 local _DEF_C_CMDLINE = -std=c99 ;
-local _DEF_CPP_CMDLINE = -std=c++$(CPPStd) -Wno-invalid-offsetof $(STDLIB_COMP) ;
+local _DEF_CPP_CMDLINE = -std=c++$(CPPStd) -Wno-invalid-offsetof -fvisibility-inlines-hidden $(STDLIB_COMP) ;
 
 if $(Exceptions) != yes {
   _DEF_CPP_CMDLINE += -fno-exceptions ;
@@ -54,12 +59,24 @@ if $(CLangVerMajor) {
   _CLANG_BIN = $(_CLANG_BIN)-$(CLangVerMajor) ;
 }
 
-_LINK         = $(_CLANG_BIN) -pipe -m64 -rdynamic -isysroot /usr/include $(STDLIB_LINK) -lm ;
-_LINK_DLL     = $(_CLANG_BIN) -pipe -m64 -isysroot /usr/include -shared ;
+_LINK         = $(_CLANG_BIN) -pipe -m$(MAbi) -rdynamic -isysroot /usr/include $(STDLIB_LINK) -lm ;
+if $(MAbi) != 64 { _LINK += -no-pie ; } # linkers can't emit ILP32 PIE dynamic relocations for R_X86_64_32
+_LINK_DLL     = $(_CLANG_BIN) -pipe -m$(MAbi) -isysroot /usr/include -shared ;
 
 if $(UseMOLDLink) = yes {
   _LINK += -fuse-ld=mold ;
   _LINK_DLL += -fuse-ld=mold ;
+} else if $(UseLLDLink) = yes {
+  _LINK += -fuse-ld=lld ;
+  _LINK_DLL += -fuse-ld=lld ;
+}
+
+if $(UseWholeOpt) = yes {
+  _LINK += -flto=thin ;
+  _LINK_DLL += -flto=thin ;
+} else if $(UseWholeOpt) != no {
+  _LINK += -flto=$(UseWholeOpt) ; # e.g. full
+  _LINK_DLL += -flto=$(UseWholeOpt) ;
 }
 
 if $(Fuzzer) != no {
@@ -72,13 +89,15 @@ if $(Sanitize) != disabled {
   _LINK = $(_LINK) -fsanitize=$(Sanitize) ;
   _LINK_DLL  = $(_LINK_DLL) -fsanitize=$(Sanitize) ;
   _DEF_COM_CMDLINE = $(_DEF_COM_CMDLINE) -fsanitize=$(Sanitize) ;
+  if $(Sanitize) = address { _DEF_C_CMDLINE += -fsanitize-address-use-after-scope -fsanitize-address-use-after-return=always ; }
 }
 
 _LIB          = ar ranlib ;
-_C_COMPILER   = $(DISTCC) $(_CLANG_BIN) [ StripStrings $(_DEF_COM_CMDLINE) $(_DEF_C_CMDLINE) : $(RemoveCompilerSwitches_$(_BuildEnv)) ] ;
-_CPP_COMPILER = $(DISTCC) $(_CLANG_BIN) [ StripStrings $(_DEF_COM_CMDLINE) $(_DEF_CPP_CMDLINE) : $(RemoveCompilerSwitches_$(_BuildEnv)) ] ;
-_ASM_COMPILER = nasm -f elf64 ;
-_GAS_COMPILER = $(DISTCC) $(_CLANG_BIN) -g -c ;
+# CI can prefix a compiler cache launcher (e.g. sccache) via `jam -sCompilerWrapper=sccache`; empty by default
+_C_COMPILER   = $(CompilerWrapper) $(DISTCC) $(_CLANG_BIN) [ StripStrings $(_DEF_COM_CMDLINE) $(_DEF_C_CMDLINE) : $(RemoveCompilerSwitches_$(_BuildEnv)) ] ;
+_CPP_COMPILER = $(CompilerWrapper) $(DISTCC) $(_CLANG_BIN) [ StripStrings $(_DEF_COM_CMDLINE) $(_DEF_CPP_CMDLINE) : $(RemoveCompilerSwitches_$(_BuildEnv)) ] ;
+_ASM_COMPILER = nasm -f elf$(MAbi) ;
+_GAS_COMPILER = $(CompilerWrapper) $(DISTCC) $(_CLANG_BIN) -g -c -m$(MAbi) ;
 
 
 _INCLUDE      = $(Root)/prog/dagorInclude $(Root)/prog/1stPartyLibs $(Root)/prog/3rdPartyLibs ;

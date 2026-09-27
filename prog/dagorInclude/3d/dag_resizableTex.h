@@ -34,6 +34,7 @@ protected:
   AliasMap mAliases;
   key_t currentKey = 0;
   resid_t lastMResId = Helper<ManagedTex>::BAD_ID;
+  uint32_t lastResetGeneration = 0;
   BaseTexture *originalTexture = nullptr;
 
   void swap(ResizableManagedTex &other)
@@ -42,11 +43,13 @@ protected:
     eastl::swap(mAliases, other.mAliases);
     eastl::swap(currentKey, other.currentKey);
     eastl::swap(lastMResId, other.lastMResId);
+    eastl::swap(lastResetGeneration, other.lastResetGeneration);
     eastl::swap(originalTexture, other.originalTexture);
   }
   ResizableManagedTex() = default;
 
   void alias(int width, int height, int depth, int flags, int levels);
+  void resetAliasCacheIfStale();
 
 public:
   void calcKey();
@@ -62,10 +65,10 @@ public:
   }
 };
 
-class ResizableManagedTexHolder : public ManagedResHolder<ResizableManagedTex>
+class ResizableManagedTexWithShaderVar : public ManagedResWithShaderVar<ResizableManagedTex>
 {
 protected:
-  ResizableManagedTexHolder() = default;
+  ResizableManagedTexWithShaderVar() = default;
 
 public:
   void resize(int width, int height, int d = 1)
@@ -76,9 +79,9 @@ public:
 };
 
 using ResizableTex = UniqueRes<ResizableManagedTex>;
-using ResizableTexHolder = ConcreteResHolder<UniqueRes<ResizableManagedTexHolder>>;
+using ResizableTexWithShaderVar = ConcreteResWithShaderVar<UniqueRes<ResizableManagedTexWithShaderVar>>;
 
 } // namespace resptr_detail
 
 using ResizableTex = resptr_detail::ResizableTex;
-using ResizableTexHolder = resptr_detail::ResizableTexHolder;
+using ResizableTexWithShaderVar = resptr_detail::ResizableTexWithShaderVar;

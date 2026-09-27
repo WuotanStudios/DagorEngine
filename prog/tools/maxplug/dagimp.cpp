@@ -1,8 +1,13 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
+#include <algorithm>
 #include <functional>
 #include <regex>
+#include <format>
 #include <unordered_set>
+#include <vector>
+#include <string_view>
+#include <filesystem>
 #include <max.h>
 #include <CommCtrl.h>
 #include <plugapi.h>
@@ -16,7 +21,6 @@
 #include <bmmlib.h>
 #include <stdmat.h>
 #include <splshape.h>
-#include <notetrck.h>
 #include <MeshNormalSpec.h>
 #include "dagor.h"
 #include "dagfmt.h"
@@ -27,7 +31,8 @@
 #include "layout.h"
 #include "common.h"
 #include "dagorLogWindow.h"
-#include <io.h>
+
+namespace fs = std::filesystem;
 
 #define ERRMSG_DELAY 5000
 
@@ -58,43 +63,46 @@ typedef unsigned int uint;
 extern void convertnew(Interface *ip, bool on_import);
 extern void collapse_materials(Interface *ip);
 
-TCHAR *ReadCharString(int len, FILE *h)
+static bool read_char_string(int len, FILE *h, std::wstring &out)
 {
-  char *s = (char *)malloc(len + 1);
-  assert(s);
-  if (len)
-  {
-    if (fread(s, len, 1, h) != 1)
-    {
-      free(s);
-      return NULL;
-    }
-  }
-  s[len] = 0;
-#ifdef _UNICODE
-  TCHAR *sw = (TCHAR *)malloc(sizeof(TCHAR) * (len + 1));
-  mbstowcs(sw, s, len + 1);
-  free(s);
-  return sw;
-#else
-  return s;
-#endif
+  out.clear();
+  if (len == 0)
+    return true;
+  std::string s(len, 0);
+  if (fread(&s[0], len, 1, h) != 1)
+    return false;
+  out = strToWide(s);
+  return true;
 }
 
+// isolate struct Block to avoid linker confusion with struct Block in expUtil.cpp
 
+namespace
+{
 struct Block
 {
   int ofs, len;
   int t;
 };
+} // namespace
 
 static Tab<Block> blk;
 static FILE *fileh = NULL;
+static long file_len = 0;
 
 static void init_blk(FILE *h)
 {
   blk.SetCount(0);
   fileh = h;
+  file_len = 0;
+
+  // block lengths are declared by the file; measure it once so they can be held to it
+  const long at = ftell(h);
+  if (at < 0)
+    return;
+  if (fseek(h, 0, SEEK_END) == 0)
+    file_len = ftell(h);
+  fseek(h, at, SEEK_SET);
 }
 
 static int begin_blk()
@@ -104,8 +112,12 @@ static int begin_blk()
     return 0;
   if (fread(&b.t, 4, 1, fileh) != 1)
     return 0;
+  if (b.len < 4)
+    return 0;
   b.len -= 4;
   b.ofs = ftell(fileh);
+  if (b.ofs < 0 || file_len - b.ofs < b.len)
+    return 0;
   int n = blk.Count();
   blk.Append(1, &b);
   if (blk.Count() != n + 1)
@@ -156,90 +168,40 @@ static int blk_rest()
   return blk[i].ofs + blk[i].len - ftell(fileh);
 }
 
+// How many records of item_sz bytes are still left in the current block. Only reached right after a
+// read_blk_field() that fit, which leaves what remains of the block non-negative.
+static uint blk_rest_items(int item_sz) { return uint(blk_rest()) / uint(item_sz); }
+
+// Reads one count or header field of the current block. begin_blk() holds a block to the file, but
+// nothing holds a read to the block, so a field the block does not have would be taken from
+// whatever follows it and a zero there would pass for a real count. Once it fits, only the storage
+// can leave the read short, so the result is still worth asking for.
+static bool read_blk_field(void *dest, int size, FILE *h) { return blk_rest() >= size && fread(dest, size, 1, h) == 1; }
+
 //===============================================================================//
 
-static void do_files_include_re(std::vector<TSTR> &result, const std::vector<TSTR> &files, const TSTR &re)
+static void report_regex_error(std::wstring_view subject, const std::regex_error &e, const wchar_t *err_title)
 {
-  try
-  {
-    std::wregex reg(re, std::regex_constants::icase);
-    for (const TSTR &f : files)
-    {
-      TSTR filename, ext;
-      SplitFilename(f, 0, &filename, &ext);
-      if (std::regex_match(filename.data(), reg) || std::regex_match((filename + ext).data(), reg))
-        result.push_back(f);
-    }
-  }
-  catch (std::regex_error &e)
-  {
-    TSTR msg;
-    msg.printf(_T("%s\n%s"), re, strToWide(e.what()));
-    MessageBox(NULL, msg.data(), _T("Include error"), MB_ICONERROR | MB_OK);
-  }
+  std::wstring msg = std::format(L"{}\n{}", subject, strToWide(e.what()));
+  MessageBox(NULL, msg.c_str(), err_title, MB_ICONERROR | MB_OK);
 }
 
-static void do_files_exclude_re(std::vector<TSTR> &result, const std::vector<TSTR> &files, const TSTR &re)
+// a rule may be written with or without the .dag extension
+static bool match_re(const std::wstring &stem, const std::wstring &name, const std::wregex &reg)
 {
-  try
-  {
-    std::wregex reg(re, std::regex_constants::icase);
-    for (const TSTR &f : files)
-    {
-      TSTR filename, ext;
-      SplitFilename(f, 0, &filename, &ext);
-      if (std::regex_match(filename.data(), reg) || std::regex_match((filename + ext).data(), reg))
-        continue;
-      result.push_back(f);
-    }
-  }
-  catch (std::regex_error &e)
-  {
-    TSTR msg;
-    msg.printf(_T("%s\n%s"), re, strToWide(e.what()));
-    MessageBox(NULL, msg.data(), _T("Exclude error"), MB_ICONERROR | MB_OK);
-  }
+  return std::regex_match(stem, reg) || std::regex_match(name, reg);
 }
 
-static std::vector<TSTR> files_include_re(const std::vector<TSTR> &files, const TSTR &re)
+static bool probe_match_re(const std::vector<fs::path> &files, const std::wstring &re)
 {
-  std::vector<TSTR> result;
-  result.reserve(32);
-  do_files_include_re(result, files, re);
-  return result;
-}
-
-static std::vector<TSTR> files_exclude_re(const std::vector<TSTR> &files, const TSTR &re)
-{
-  std::vector<TSTR> result;
-  result.reserve(32);
-  do_files_exclude_re(result, files, re);
-  return result;
-}
-
-static bool probe_match_re(const std::vector<TSTR> &files, const TSTR &re)
-{
-  std::wregex reg(re, std::regex_constants::icase);
-  for (const TSTR &f : files)
-  {
-    TSTR filename, ext;
-    SplitFilename(f, 0, &filename, &ext);
-    if (std::regex_match(filename.data(), reg) || std::regex_match((filename + ext).data(), reg))
+  const std::wregex reg(re, std::regex_constants::icase);
+  for (const fs::path &f : files)
+    if (match_re(f.stem().wstring(), f.filename().wstring(), reg))
       return true;
-  }
   return false;
 }
 
-static std::wstring replace_all(std::wstring str, const std::wstring &from, const std::wstring &to)
-{
-  if (from.empty())
-    return str;
-  for (size_t pos = 0; (pos = str.find(from, pos)) != std::wstring::npos; pos += to.size())
-    str.replace(pos, from.size(), to);
-  return str;
-}
-
-static std::wstring fnmatch_to_regex(const std::wstring &wildcard)
+static std::wstring fnmatch_to_regex(std::wstring_view wildcard)
 {
   size_t i = 0, n = wildcard.size();
   std::wstring result;
@@ -300,7 +262,7 @@ static std::wstring fnmatch_to_regex(const std::wstring &wildcard)
       continue;
     }
 
-    if (isalnum(c))
+    if (iswalnum(c))
     {
       result += c;
       continue;
@@ -313,25 +275,43 @@ static std::wstring fnmatch_to_regex(const std::wstring &wildcard)
   return result;
 }
 
+// makes a literal text safe to splice into a regex
+static std::wstring escape_regex(std::wstring_view text)
+{
+  static constexpr std::wstring_view meta = L".^$|()[]{}*+?\\";
+
+  std::wstring result;
+  result.reserve(text.size());
+
+  for (wchar_t c : text)
+  {
+    if (meta.find(c) != std::wstring_view::npos)
+      result += L'\\';
+    result += c;
+  }
+
+  return result;
+}
+
 //===============================================================================//
 
 struct ImportedFile
 {
-  std::wstring fullpath;
-  std::wstring basename;
+  fs::path fullpath;
+  fs::path basename;
 
-  explicit ImportedFile(const TCHAR *fname) : fullpath(fname), basename(extract_basename(fname).data()) {}
+  explicit ImportedFile(const TCHAR *fname) : fullpath(fname), basename(fullpath.filename()) {}
   bool operator==(const ImportedFile &other) const { return fullpath == other.fullpath; }
-  bool equalBasename(const TSTR &bname) const { return basename == std::wstring(bname.data()); }
+  bool equalBasename(const fs::path &bname) const { return basename == bname; }
 };
 
 struct ImportedFileHash
 {
   size_t operator()(const ImportedFile &imp) const
   {
-    size_t h1 = std::hash<std::wstring>()(imp.fullpath);
-    size_t h2 = std::hash<std::wstring>()(imp.basename);
-    return h1 ^ (h2 << 1);
+    size_t h1 = std::hash<std::wstring>()(imp.fullpath.wstring());
+    size_t h2 = std::hash<std::wstring>()(imp.basename.wstring());
+    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
   }
 };
 
@@ -341,7 +321,7 @@ class DagImp : public SceneImport
 {
 public:
   DagImp() {}
-  ~DagImp() override {}
+  ~DagImp() override = default;
 
   int ExtCount() override { return 1; }
   const TCHAR *Ext(int n) override { return _T("dag"); }
@@ -375,28 +355,26 @@ public:
     bool destr;
     bool dp;
     bool dmg;
-
-    bool any() const { return lod || destr || dp || dmg; }
-    void enableAll() { lod = destr = dp = dmg = true; };
+    bool dm;
   };
 
   static struct Categories checked;
   static struct Categories detected;
   static ToolTipExtender tooltipExtender;
 
-  static std::vector<TSTR> batchImportFiles;
+  static std::vector<fs::path> batchImportFiles;
   static std::unordered_set<ImportedFile, ImportedFileHash> importedFiles;
 
 private:
-  int doHierImport(const TSTR &fname, ImpInterface *ii, Interface *ip, bool suppressPrompts);
-  void makeHierLayer(const std::vector<TSTR> &fnames, ImpInterface *ii, Interface *ip, bool nomsg);
-  void makeHierLayer(const TSTR &fname, ImpInterface *ii, Interface *ip, bool nomsg);
+  int doHierImport(const fs::path &fname, ImpInterface *ii, Interface *ip, bool suppressPrompts);
+  void makeHierLayer(const std::vector<fs::path> &fnames, ImpInterface *ii, Interface *ip, bool nomsg);
+  void makeHierLayer(const fs::path &fname, ImpInterface *ii, Interface *ip, bool nomsg);
 
   int doLegacyImport(const TCHAR *fname, ImpInterface *ii, Interface *ip, bool nomsg);
   int doBatchImport(const TSTR &fname, ImpInterface *ii, Interface *ip, bool nomsg);
   int doMaxscriptImport(const TSTR &fname, ImpInterface *ii, Interface *ip, bool nomsg);
 
-  bool isNamesake(const TSTR &fname) const;
+  bool isNamesake(const fs::path &fname) const;
 };
 
 class DagImpCD : public ClassDesc
@@ -405,11 +383,7 @@ public:
   int IsPublic() override { return TRUE; }
   void *Create(BOOL loading) override { return new DagImp; }
   const TCHAR *ClassName() override { return GetString(IDS_DAGIMP); }
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
   const MCHAR *NonLocalizedClassName() override { return ClassName(); }
-#else
-  const MCHAR *NonLocalizedClassName() { return ClassName(); }
-#endif
   SClass_ID SuperClassID() override { return SCENE_IMPORT_CLASS_ID; }
   Class_ID ClassID() override { return DAGIMP_CID; }
   const TCHAR *Category() override { return _T(""); }
@@ -429,8 +403,8 @@ public:
   struct Rules
   {
     bool isWildcard;
-    std::vector<TSTR> incl;
-    std::vector<TSTR> excl;
+    std::vector<std::wstring> incl;
+    std::vector<std::wstring> excl;
 
     explicit Rules(bool isWildcard_) : isWildcard(isWildcard_) {}
 
@@ -449,8 +423,8 @@ public:
 
   Rules wildcard, regex;
 
-  TSTR dirPath;
-  TSTR filePath;
+  fs::path dirPath;
+  fs::path filePath;
 
   ToolTipExtender tooltipExtender;
 
@@ -465,7 +439,6 @@ public:
   LPCTSTR tabHelp() const;
   LPCTSTR tabHint(int index) const;
 
-  void updateUi() const;
   void updateTab() const;
   void onTabChanged(HWND hDlg);
 
@@ -493,30 +466,6 @@ ImpUtil::ImpUtil() :
   dirPath(_T("c:\\tmp"))
 {}
 
-void ImpUtil::updateUi() const
-{
-  if (!hImpPanel)
-    return;
-
-  switch (selectedTab)
-  {
-    case 0: CheckDlgButton(hTabVisible, IDC_SEPARATE_LAYERS, DagImp::separateLayers); break;
-
-    case 1:
-      CheckDlgButton(hTabVisible, IDC_IMPORT_LOD, DagImp::checked.lod);
-      CheckDlgButton(hTabVisible, IDC_IMPORT_DP, DagImp::checked.dp);
-      CheckDlgButton(hTabVisible, IDC_IMPORT_DMG, DagImp::checked.dmg);
-      CheckDlgButton(hTabVisible, IDC_IMPORT_DESTR, DagImp::checked.destr);
-      CheckDlgButton(hTabVisible, (!DagImp::reimportExisting ? IDC_RENAME_NEW_LAYER : IDC_REPLACE_EXISTING_LAYER), true);
-      CheckDlgButton(hTabVisible, (DagImp::reimportExisting ? IDC_RENAME_NEW_LAYER : IDC_REPLACE_EXISTING_LAYER), false);
-      break;
-
-    default: break;
-  }
-
-  SetDlgItemText(hImpPanel, IDC_DAGORPATH, filePath.data());
-}
-
 LPCTSTR ImpUtil::tabResourceName() const
 {
   assert(selectedTab < 4);
@@ -527,7 +476,6 @@ LPCTSTR ImpUtil::tabResourceName() const
 
 static INT_PTR CALLBACK legacy_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK standard_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
-static INT_PTR CALLBACK regex_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK regex_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 
 DLGPROC ImpUtil::tabDlgProc() const
@@ -593,10 +541,6 @@ void ImpUtil::updateTab() const
   TabCtrl_AdjustRect(hTab, FALSE, &rc);
   MoveWindow(hTabVisible, rc.left, rc.top * 1.2, rc.right - rc.left, rc.bottom - rc.top, TRUE);
 
-  RECT rct;
-  GetWindowRect(hTabVisible, &rct);
-  update_layout(hTabVisible, MAKELPARAM(rc.right - rc.left, rct.bottom - rct.top));
-
   // hack: force repaint ALL the area of the panel
   ShowWindow(hTabVisible, SW_HIDE);
   ShowWindow(hTabVisible, SW_SHOW);
@@ -618,7 +562,6 @@ void ImpUtil::onTabChanged(HWND hDlg)
   DagImp::useLegacyImport = (selectedTab == 0);
 
   hTabVisible = CreateDialogParam(hInstance, tabResourceName(), hDlg, tabDlgProc(), tabInitParam());
-  attach_layout_to_dialog(hTabVisible, tabResourceName());
   updateTab();
 
   SetWindowText(GetDlgItem(hImpHelp, IDC_STATIC1), tabHelp());
@@ -628,13 +571,12 @@ void ImpUtil::onTabChanged(HWND hDlg)
   EnableWindow(GetDlgItem(hImpParam, IDC_REIMPORT_EXISTING), selectedTab >= 1);
 }
 
-static bool do_open_import_directory(TSTR &path)
+static bool do_open_import_directory(fs::path &path)
 {
-  DWORD attr = GetFileAttributes(path.data());
-  if (!(attr & FILE_ATTRIBUTE_DIRECTORY))
-    path = extract_directory(path);
+  if (!fs::is_directory(path))
+    path = path.parent_path();
 
-  INT_PTR result = (INT_PTR)ShellExecute(NULL, _T("explore"), path.data(), NULL, NULL, SW_SHOW);
+  INT_PTR result = (INT_PTR)ShellExecute(NULL, _T("explore"), path.c_str(), NULL, NULL, SW_SHOW);
   if (result <= 32)
     return false;
 
@@ -643,9 +585,12 @@ static bool do_open_import_directory(TSTR &path)
 
 void ImpUtil::openImportDirectory() const
 {
-  TSTR path = (selectedTab <= 1) ? filePath.data() : dirPath.data();
-  if (path.isNull() || !do_open_import_directory(path))
-    MessageBox(NULL, (TSTR(_T("Failed to open directory: \"")) + path + TSTR(_T("\""))).data(), _T("Error"), MB_ICONERROR | MB_OK);
+  fs::path path = (selectedTab <= 1) ? filePath : dirPath;
+  if (path.empty() || !do_open_import_directory(path))
+  {
+    std::wstring msg = L"Failed to open directory: \"" + path.wstring() + L"\"";
+    MessageBox(NULL, msg.c_str(), _T("Error"), MB_ICONERROR | MB_OK);
+  }
 }
 
 void ImpUtil::openDocumentation() const
@@ -662,29 +607,31 @@ void ImpUtil::openDocumentation() const
   ShellExecute(NULL, _T("open"), url[selectedTab], NULL, NULL, SW_SHOWNORMAL);
 }
 
-static bool is_regex_empty(const TSTR &re)
+static bool is_regex_empty(std::wstring_view re)
 {
   // rule that consists solely of spaces is invalid
-  for (int i = 0; i < re.Length(); ++i)
-    if (re[i] != _T(' '))
+  for (wchar_t c : re)
+    if (c != L' ')
       return false;
 
   return true;
 }
 
-static bool is_regex_valid(bool isWildcard, TSTR &re)
+static std::wregex make_rule_regex(bool isWildcard, std::wstring_view text)
+{
+  return std::wregex(isWildcard ? fnmatch_to_regex(text) : std::wstring(text), std::regex_constants::icase);
+}
+
+static bool is_regex_valid(bool isWildcard, std::wstring_view re)
 {
   if (is_regex_empty(re))
     return false;
 
   try
   {
-    if (isWildcard)
-      re = fnmatch_to_regex(re.data()).data();
-
-    std::wregex reg(re, std::regex_constants::icase);
+    make_rule_regex(isWildcard, re);
   }
-  catch (std::regex_error)
+  catch (const std::regex_error &)
   {
     return false;
   }
@@ -692,49 +639,118 @@ static bool is_regex_valid(bool isWildcard, TSTR &re)
   return true;
 }
 
-static std::vector<TSTR> get_valid_rules(bool isWildcard, const std::vector<TSTR> &rules)
+struct CompiledRule
 {
-  std::vector<TSTR> result;
-  result.reserve(rules.size());
+  std::wregex re;
+  std::wstring text; // the rule as it was written, to name it in an error message
+};
 
-  for (TSTR r : rules)
-    if (is_regex_valid(isWildcard, r))
-      result.push_back(r);
+struct RuleSet
+{
+  std::vector<CompiledRule> rule;
+  bool any = false; // there was at least one non-blank rule, even if it failed to compile
+};
+
+enum class RuleFilterMode
+{
+  Include, // keep the files that any rule matches
+  Exclude, // keep the files that no rule matches
+};
+
+static RuleSet compile_rules(bool isWildcard, const std::vector<std::wstring> &rules, const wchar_t *err_title)
+{
+  RuleSet result;
+  result.rule.reserve(rules.size());
+
+  for (const std::wstring &rule : rules)
+  {
+    if (is_regex_empty(rule))
+      continue;
+
+    result.any = true;
+
+    try
+    {
+      result.rule.push_back({make_rule_regex(isWildcard, rule), rule});
+    }
+    catch (const std::regex_error &e)
+    {
+      report_regex_error(rule, e, err_title);
+    }
+  }
 
   return result;
+}
+
+// a rule that fails to compile is dropped and the remaining ones still apply, but a rule that compiles and
+// then throws while matching voids the whole pass: whether it throws depends on the file it is run against,
+// so keeping it for the files it survives would make the result depend on the order they are enumerated in.
+// either way an unusable rule selects nothing, so a broken include rule never pulls in the whole folder and
+// a broken exclude rule never drops anything
+static std::vector<fs::path> filter_files_re(const std::vector<fs::path> &files, bool isWildcard,
+  const std::vector<std::wstring> &rules, RuleFilterMode mode)
+{
+  const bool keep_matched = mode == RuleFilterMode::Include;
+  const wchar_t *err_title = keep_matched ? L"Include error" : L"Exclude error";
+
+  const RuleSet ruleSet = compile_rules(isWildcard, rules, err_title);
+  if (!ruleSet.any)
+    return files;
+
+  std::vector<fs::path> result;
+  result.reserve(files.size());
+
+  for (const fs::path &f : files)
+  {
+    const std::wstring stem = f.stem().wstring(), name = f.filename().wstring();
+
+    bool matched = false;
+    for (const CompiledRule &rule : ruleSet.rule)
+    {
+      try
+      {
+        matched = match_re(stem, name, rule.re);
+      }
+      catch (const std::regex_error &e)
+      {
+        // the matcher throws error_complexity/error_stack on its own, on patterns that compiled just fine
+        report_regex_error(std::format(L"{}\n{}", rule.text, name), e, err_title);
+
+        if (keep_matched)
+          return {};
+        return files;
+      }
+
+      if (matched)
+        break;
+    }
+
+    if (matched == keep_matched)
+      result.push_back(f);
+  }
+
+  return result;
+}
+
+static std::vector<fs::path> files_include_re(const std::vector<fs::path> &files, const std::wstring &re)
+{
+  return filter_files_re(files, false, std::vector<std::wstring>{re}, RuleFilterMode::Include);
 }
 
 void ImpUtil::doStandardImport() const
 {
   Autotoggle guard(DagImp::nonInteractive);
-  GetCOREInterface()->ImportFromFile(filePath, true);
+  GetCOREInterface()->ImportFromFile(filePath.c_str(), true);
 }
 
 void ImpUtil::doRegexImport(const Rules &rules)
 {
-  std::vector<TSTR> files = glob(dirPath.data(), DagImp::searchInSubfolders);
+  std::vector<fs::path> files = glob(dirPath, DagImp::searchInSubfolders);
 
-  std::vector<TSTR> valid_rules = get_valid_rules(rules.isWildcard, rules.incl);
-  if (!valid_rules.empty())
-  {
-    std::vector<TSTR> tmp_files;
-    tmp_files.reserve(files.size());
-    for (const TSTR &re : valid_rules)
-      do_files_include_re(tmp_files, files, re);
-    files = tmp_files;
-  }
+  files = filter_files_re(files, rules.isWildcard, rules.incl, RuleFilterMode::Include);
+  files = filter_files_re(files, rules.isWildcard, rules.excl, RuleFilterMode::Exclude);
 
-  valid_rules = get_valid_rules(rules.isWildcard, rules.excl);
-  if (!valid_rules.empty())
-  {
-    std::vector<TSTR> tmp_files;
-    tmp_files.reserve(files.size());
-    for (const TSTR &re : valid_rules)
-      do_files_exclude_re(tmp_files, files, re);
-    files = tmp_files;
-  }
-
-  DagImp::batchImportFiles = files;
+  DagImp::batchImportFiles = std::move(files);
   Autotoggle guard(DagImp::calledFromBatchImport);
   GetCOREInterface()->ImportFromFile(_T("ignored.dag"), true);
 }
@@ -742,7 +758,6 @@ void ImpUtil::doRegexImport(const Rules &rules)
 void ImpUtil::doImport()
 {
   assert(selectedTab < 4);
-  // DagorLogWindow::clearLog();
   switch (selectedTab)
   {
     case 0:
@@ -759,10 +774,13 @@ class WListView
 {
   HWND hw;
   bool isWildcard;
-  std::vector<TSTR> &rules;
+  std::vector<std::wstring> &rules;
+  // compiling a regex is far too slow to do per row per repaint, so validity is kept alongside
+  // the rules and refreshed only where they change
+  std::vector<bool> ruleValid;
 
 public:
-  WListView(HWND hw_, bool isWildcard_, std::vector<TSTR> &rules_);
+  WListView(HWND hw_, bool isWildcard_, std::vector<std::wstring> &rules_);
 
   void AddRule();
   void DelRule();
@@ -770,10 +788,11 @@ public:
   void UpdateView();
 
 private:
-  COLORREF ruleColor(TSTR rule);
+  bool checkRule(std::wstring_view rule) const { return is_regex_valid(isWildcard, rule); }
+  COLORREF ruleColor(int index) const;
 };
 
-WListView::WListView(HWND hw_, bool isWildcard_, std::vector<TSTR> &rules_) : hw(hw_), isWildcard(isWildcard), rules(rules_)
+WListView::WListView(HWND hw_, bool isWildcard_, std::vector<std::wstring> &rules_) : hw(hw_), isWildcard(isWildcard_), rules(rules_)
 {
   ListView_SetExtendedListViewStyle(hw, LVS_EX_FULLROWSELECT);
 
@@ -796,7 +815,8 @@ void WListView::AddRule()
   lvi.iSubItem = 0;
   lvi.pszText = 0;
   ListView_InsertItem(hw, &lvi);
-  rules.push_back(lvi.pszText);
+  rules.emplace_back();
+  ruleValid.push_back(checkRule(rules.back()));
 }
 
 void WListView::DelRule()
@@ -806,6 +826,7 @@ void WListView::DelRule()
   {
     ListView_DeleteItem(hw, i);
     rules.erase(rules.begin() + i);
+    ruleValid.erase(ruleValid.begin() + i);
   }
 }
 
@@ -830,6 +851,7 @@ INT_PTR WListView::EditRule(LPARAM lParam)
     // simple `return TRUE/FALSE` doesn't work here, I don't know why
     ListView_SetItemText(hw, item.iItem, 0, item.pszText);
     rules[item.iItem] = item.pszText;
+    ruleValid[item.iItem] = checkRule(rules[item.iItem]);
     return TRUE;
   }
 
@@ -845,7 +867,7 @@ INT_PTR WListView::EditRule(LPARAM lParam)
     {
       LPNMLVCUSTOMDRAW lplvcd = (LPNMLVCUSTOMDRAW)lParam;
       int iItem = (int)lplvcd->nmcd.dwItemSpec;
-      lplvcd->clrTextBk = ruleColor(rules[iItem]);
+      lplvcd->clrTextBk = ruleColor(iItem);
     }
     SetWindowLong(GetParent(hw), DWLP_MSGRESULT, CDRF_DODEFAULT);
     return CDRF_DODEFAULT;
@@ -857,7 +879,9 @@ INT_PTR WListView::EditRule(LPARAM lParam)
 void WListView::UpdateView()
 {
   ListView_DeleteAllItems(hw);
-  for (TSTR &s : rules)
+  ruleValid.clear();
+  ruleValid.reserve(rules.size());
+  for (std::wstring &s : rules)
   {
     LVITEM lvi;
     memset(&lvi, 0, sizeof(lvi));
@@ -865,18 +889,22 @@ void WListView::UpdateView()
     lvi.cchTextMax = MAX_PATH;
     lvi.iItem = ListView_GetItemCount(hw);
     lvi.iSubItem = 0;
-    lvi.pszText = (LPWSTR)s.data();
+    lvi.pszText = s.data();
     ListView_InsertItem(hw, &lvi);
+    ruleValid.push_back(checkRule(s));
   }
 }
 
-COLORREF WListView::ruleColor(TSTR rule) { return is_regex_valid(isWildcard, rule) ? VALID_REGEX_COLOR_BG : INVALID_REGEX_COLOR_BG; }
+COLORREF WListView::ruleColor(int index) const
+{
+  const bool valid = index >= 0 && index < int(ruleValid.size()) && ruleValid[index];
+  return valid ? VALID_REGEX_COLOR_BG : INVALID_REGEX_COLOR_BG;
+}
 
 //==========================================================================//
 
 static INT_PTR CALLBACK legacy_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
-  static TCHAR path[MAX_PATH] = _T("");
   static bool prevent_enchange = false;
 
   switch (message)
@@ -913,14 +941,14 @@ static INT_PTR CALLBACK legacy_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, 
             case EN_CHANGE:
               if (!prevent_enchange)
               {
-                GetDlgItemText(hDlg, IDC_DAGORPATH, path, MAX_PATH);
+                const std::wstring path = get_window_text(GetDlgItem(hDlg, IDC_DAGORPATH));
 
-                TSTR new_path = drop_quotation_marks(path);
+                std::wstring new_path = drop_quotation_marks(path);
+                util.filePath = new_path;
                 if (path != new_path)
                 {
                   Autotoggle eguard(prevent_enchange);
-                  update_path_edit_control(hDlg, IDC_DAGORPATH, new_path);
-                  util.filePath = new_path;
+                  update_path_edit_control(hDlg, IDC_DAGORPATH, util.filePath);
                 }
               }
               break;
@@ -940,7 +968,6 @@ static INT_PTR CALLBACK legacy_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, 
 
 static INT_PTR CALLBACK standard_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
-  static TCHAR path[MAX_PATH];
   static bool prevent_enchange = false;
 
   switch (message)
@@ -951,12 +978,14 @@ static INT_PTR CALLBACK standard_dlg_proc(HWND hDlg, UINT message, WPARAM wParam
       CheckDlgButton(hDlg, IDC_IMPORT_DP, DagImp::checked.dp);
       CheckDlgButton(hDlg, IDC_IMPORT_DMG, DagImp::checked.dmg);
       CheckDlgButton(hDlg, IDC_IMPORT_DESTR, DagImp::checked.destr);
+      CheckDlgButton(hDlg, IDC_IMPORT_DM, DagImp::checked.dm);
       Autotoggle guard(prevent_enchange, true);
       update_path_edit_control(hDlg, IDC_DAGORPATH, util.filePath);
       util.tooltipExtender.SetToolTip(GetDlgItem(hDlg, IDC_IMPORT_LOD), TSTR(_T("Search for other levels of detail")));
       util.tooltipExtender.SetToolTip(GetDlgItem(hDlg, IDC_IMPORT_DP), TSTR(_T("Search for related Damage Parts")));
       util.tooltipExtender.SetToolTip(GetDlgItem(hDlg, IDC_IMPORT_DMG), TSTR(_T("Search for Damaged versions")));
       util.tooltipExtender.SetToolTip(GetDlgItem(hDlg, IDC_IMPORT_DESTR), TSTR(_T("Search for dynamic destr asset")));
+      util.tooltipExtender.SetToolTip(GetDlgItem(hDlg, IDC_IMPORT_DM), TSTR(_T("Search for Damage Model")));
       util.tooltipExtender.SetToolTip(GetDlgItem(hDlg, IDC_DAGORPATH), TSTR(_T("Path to file that should be imported")));
       util.tooltipExtender.SetToolTip(GetDlgItem(hDlg, IDC_SET_DAGORPATH), TSTR(_T("Open a file browser")));
     }
@@ -969,6 +998,7 @@ static INT_PTR CALLBACK standard_dlg_proc(HWND hDlg, UINT message, WPARAM wParam
         DagImp::checked.dp = IsDlgButtonChecked(hDlg, IDC_IMPORT_DP);
         DagImp::checked.dmg = IsDlgButtonChecked(hDlg, IDC_IMPORT_DMG);
         DagImp::checked.destr = IsDlgButtonChecked(hDlg, IDC_IMPORT_DESTR);
+        DagImp::checked.dm = IsDlgButtonChecked(hDlg, IDC_IMPORT_DM);
       }
       switch (LOWORD(wParam))
       {
@@ -988,16 +1018,15 @@ static INT_PTR CALLBACK standard_dlg_proc(HWND hDlg, UINT message, WPARAM wParam
             case EN_CHANGE:
               if (!prevent_enchange)
               {
-                GetDlgItemText(hDlg, IDC_DAGORPATH, path, MAX_PATH);
+                const std::wstring path = get_window_text(GetDlgItem(hDlg, IDC_DAGORPATH));
 
-                TSTR new_path = drop_quotation_marks(path);
+                std::wstring new_path = drop_quotation_marks(path);
+                util.filePath = new_path;
                 if (path != new_path)
                 {
                   Autotoggle eguard(prevent_enchange);
-                  update_path_edit_control(hDlg, IDC_DAGORPATH, new_path);
+                  update_path_edit_control(hDlg, IDC_DAGORPATH, util.filePath);
                 }
-
-                util.filePath = new_path;
               }
               break;
           }
@@ -1019,7 +1048,6 @@ static INT_PTR CALLBACK regex_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, L
 {
   static const wchar_t *PROP_INCL = _T("INCL");
   static const wchar_t *PROP_EXCL = _T("EXCL");
-  static TCHAR path[MAX_PATH];
   static bool prevent_enchange = false;
 
   switch (message)
@@ -1059,11 +1087,13 @@ static INT_PTR CALLBACK regex_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, L
 
         case IDC_SET_DAGORPATH:
         {
-          _tcscpy(path, util.dirPath.data());
-          util.ip->ChooseDirectory(hDlg, GetString(IDS_CHOOSE_DAGOR_PATH), path);
-          if (path[0])
+          TCHAR dir[MAX_PATH] = {};
+
+          _tcsncpy_s(dir, _countof(dir), util.dirPath.c_str(), _TRUNCATE);
+          util.ip->ChooseDirectory(hDlg, GetString(IDS_CHOOSE_DAGOR_PATH), dir);
+          if (dir[0])
           {
-            util.dirPath = path;
+            util.dirPath = dir;
             Autotoggle eguard(prevent_enchange);
             update_path_edit_control(hDlg, IDC_DAGORPATH, util.dirPath);
           }
@@ -1078,32 +1108,30 @@ static INT_PTR CALLBACK regex_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, L
             case EN_CHANGE:
               if (!prevent_enchange)
               {
-                GetDlgItemText(hDlg, IDC_DAGORPATH, path, MAX_PATH);
+                const std::wstring path = get_window_text(GetDlgItem(hDlg, IDC_DAGORPATH));
 
-                TSTR new_path = drop_quotation_marks(path);
-                if (path != new_path)
+                const fs::path new_path = drop_quotation_marks(path);
+                if (path != new_path.native())
                 {
                   Autotoggle eguard(prevent_enchange);
                   update_path_edit_control(hDlg, IDC_DAGORPATH, new_path);
                 }
 
-                DWORD attr = GetFileAttributes(new_path.data());
-                if (!(attr & FILE_ATTRIBUTE_DIRECTORY))
+                std::error_code ec;
+                const fs::file_status status = fs::status(new_path, ec);
+                if (fs::exists(status) && !fs::is_directory(status))
                 {
-                  TSTR dir, filename, ext;
-                  SplitFilename(new_path.data(), &dir, &filename, &ext);
-                  filename += ext;
+                  util.dirPath = new_path.parent_path();
 
                   Autotoggle eguard(prevent_enchange);
-                  update_path_edit_control(hDlg, IDC_DAGORPATH, new_path);
-
-                  util.dirPath = dir;
+                  update_path_edit_control(hDlg, IDC_DAGORPATH, util.dirPath);
 
                   util.wildcard.clear();
                   util.regex.clear();
 
-                  util.wildcard.incl.push_back(filename.data());
-                  util.regex.incl.push_back((TSTR(_T("^")) + filename + TSTR(_T("$"))).data());
+                  const std::wstring filename = new_path.filename();
+                  util.wildcard.incl.push_back(filename);
+                  util.regex.incl.push_back(L'^' + filename + L'$');
 
                   ((WListView *)GetProp(hDlg, PROP_INCL))->UpdateView();
                   ((WListView *)GetProp(hDlg, PROP_EXCL))->UpdateView();
@@ -1205,6 +1233,11 @@ static INT_PTR CALLBACK imp_dlg_proc(HWND hDlg, UINT message, WPARAM wParam, LPA
     }
       return FALSE; // don't set keyboard focus
 
+    case WM_DESTROY:
+      util.hTab = 0;
+      util.hTabVisible = 0;
+      break;
+
     case WM_NOTIFY:
     {
       LPNMHDR tc = (LPNMHDR)lParam;
@@ -1267,11 +1300,7 @@ public:
   int IsPublic() override { return 1; }
   void *Create(BOOL loading = FALSE) override { return &util; }
   const TCHAR *ClassName() override { return GetString(IDS_IMPUTIL_NAME); }
-#if defined(MAX_RELEASE_R24) && MAX_RELEASE >= MAX_RELEASE_R24
   const MCHAR *NonLocalizedClassName() override { return ClassName(); }
-#else
-  const MCHAR *NonLocalizedClassName() { return ClassName(); }
-#endif
   SClass_ID SuperClassID() override { return UTILITY_CLASS_ID; }
   Class_ID ClassID() override { return ImpUtil_CID; }
   const TCHAR *Category() override { return GetString(IDS_UTIL_CAT); }
@@ -1286,74 +1315,30 @@ ClassDesc *GetImpUtilCD() { return &utilDesc; }
 struct ImpMat
 {
   DagMater m;
-  TCHAR *name;
-  TCHAR *clsname;
-  TCHAR *script;
+  std::wstring name;
+  std::wstring clsname;
+  std::wstring script;
   Mtl *mtl;
-  ImpMat()
-  {
-    name = clsname = script = NULL;
-    mtl = NULL;
-  }
+  ImpMat() : mtl(nullptr) {}
 };
 
-struct Impnode
-{
-  ImpNode *in;
-  INode *n;
-  //      ushort pid;
-  Mtl *mtl;
-};
-
-static Tab<TCHAR *> tex;
-static Tab<ImpMat> mat;
-// static Tab<Impnode> node;
-static Tab<TCHAR *> keylabel;
-static Tab<DefNoteTrack *> ntrack;
-// static Tab<DagNoteKey*> ntrack;
-// static Tab<int> ntrack_knum;
+static std::vector<std::wstring> tex;
+static std::vector<ImpMat> mat;
+static std::vector<Mtl *> multi_mat;
 
 static TSTR scene_name = _T("");
 
-static void cleanup(int err = 0)
+static void cleanup()
 {
-  int i;
-  for (i = 0; i < tex.Count(); ++i)
-    if (tex[i])
-      free(tex[i]);
-  tex.ZeroCount();
-  for (i = 0; i < mat.Count(); ++i)
-  {
-    if (mat[i].name)
-      free(mat[i].name);
-    if (mat[i].clsname)
-      free(mat[i].clsname);
-    if (mat[i].script)
-      free(mat[i].script);
-  }
-  if (err)
-  {
-    for (i = 0; i < mat.Count(); ++i)
-      if (mat[i].mtl)
-        mat[i].mtl->DeleteThis();
-    /*              for(i=0;i<node.Count();++i) if(node[i].mtl) {
-                            for(int j=0;j<mat.Count();++j) if(mat[j].mtl==node[i].mtl) break;
-                            if(j>=mat.Count()) node[i].mtl->DeleteThis();
-                    }
-    */
-  }
-  mat.ZeroCount();
-  //      node.ZeroCount();
-  for (i = 0; i < keylabel.Count(); ++i)
-    if (keylabel[i])
-      free(keylabel[i]);
-  keylabel.ZeroCount();
-  // for(i=0;i<ntrack.Count();++i) if(ntrack[i]) free(ntrack[i]);
-  for (i = 0; i < ntrack.Count(); ++i)
-    if (ntrack[i])
-      ntrack[i]->DeleteThis();
-  ntrack.ZeroCount();
-  // ntrack_knum.ZeroCount();
+  tex.clear();
+  for (size_t i = 0; i < mat.size(); ++i)
+    if (mat[i].mtl)
+      mat[i].mtl->MaybeAutoDelete();
+  mat.clear();
+  for (size_t i = 0; i < multi_mat.size(); ++i)
+    if (multi_mat[i])
+      multi_mat[i]->MaybeAutoDelete();
+  multi_mat.clear();
 }
 
 static void make_mtl(ImpMat &m, int ind, Class_ID cid)
@@ -1367,18 +1352,14 @@ static void make_mtl(ImpMat &m, int ind, Class_ID cid)
   d->set_emis(m.m.emis);
   d->set_spec((m.m.power == 0.0f) ? Color(0, 0, 0) : Color(m.m.spec));
   d->set_power(m.m.power);
-  d->set_classname(m.clsname);
-  d->set_script(m.script);
+  d->set_classname(m.clsname.data());
+  d->set_script(m.script.data());
 
-  char noname = 0;
-  if (!m.name)
-    noname = 1;
-  else if (m.name[0] == 0)
-    noname = 1;
+  bool noname = m.name.empty();
   if (!noname)
-    m.mtl->SetName(m.name);
+    m.mtl->SetName(m.name.data());
 
-  bool real2sided = m.script ? _tcsstr(m.script, _T("real_two_sided=yes")) : false;
+  bool real2sided = m.script.find(_T("real_two_sided=yes")) != std::wstring::npos;
   if (real2sided)
   {
     d->set_2sided(IDagorMat::Sides::RealDoubleSided);
@@ -1396,9 +1377,13 @@ static void make_mtl(ImpMat &m, int ind, Class_ID cid)
 
   for (int i = 0; i < DAGTEXNUM; ++i)
   {
-    TCHAR *s = NULL;
-    if (m.m.texid[i] < tex.Count() && (i < 8 || (m.m.flags & DAG_MF_16TEX)))
-      s = tex[m.m.texid[i]];
+    const TCHAR *s = nullptr;
+    if (m.m.texid[i] < tex.size() && (i < 8 || (m.m.flags & DAG_MF_16TEX)))
+    {
+      const std::wstring &ts = tex[m.m.texid[i]];
+      if (!ts.empty())
+        s = ts.data();
+    }
     d->set_texname(i, s);
     if (i == 0 && noname)
     {
@@ -1410,9 +1395,8 @@ static void make_mtl(ImpMat &m, int ind, Class_ID cid)
       }
       else
       {
-        TSTR nm;
-        nm.printf(_T("%s #%02d"), scene_name, ind);
-        m.mtl->SetName(nm);
+        std::wstring nm = std::format(_T("{} #{:02}"), scene_name.data(), ind);
+        m.mtl->SetName(nm.c_str());
       }
     }
     d->set_param(i, 0);
@@ -1431,24 +1415,6 @@ static void adj_wtm(Matrix3 &tm)
   }
   tm.ClearIdentFlag(ROT_IDENT | SCL_IDENT);
 }
-
-static void adj_pos(Point3 &p)
-{
-  float a = p.y;
-  p.y = p.z;
-  p.z = a;
-}
-
-static void adj_rot(Quat &q)
-{
-  float a = q.y;
-  q.y = -q.z;
-  q.z = -a;
-  q.x = -q.x;
-  q = Quat(-0.7071067811865476, 0., 0., 0.7071067811865476) * q;
-}
-
-static void adj_scl(Point3 &p) { p.z = -p.z; }
 
 #define rd(p, l)                \
   {                             \
@@ -1472,7 +1438,181 @@ static void flip_normals(Mesh &m)
     m.FlipNormal(i);
 }
 
-static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab<SkinData *> &skin_data, Tab<NodeId> &node_id)
+// The two mesh blocks of DAG_NODE_OBJ differ only in these widths. They are derived from the block
+// type once and carried together: a bound that worked one of them out on its own could fall out of
+// step with the reads it is there to guard.
+struct MeshFormat
+{
+  bool big;     // DAG_OBJ_BIGMESH: four byte counts and 32 bit indices
+  int count_sz; // one count field
+  int face_sz;  // one face record
+  int tface_sz; // one map face record
+
+  explicit MeshFormat(bool big_) :
+    big(big_),
+    count_sz(big_ ? 4 : 2),
+    face_sz(int(big_ ? sizeof(DagBigFace) : sizeof(DagFace))),
+    tface_sz(int(big_ ? sizeof(DagBigTFace) : sizeof(DagTFace)))
+  {}
+};
+
+// Reads the map channel records that follow the faces of a mesh block. False if the block does not
+// hold what the records declare, and it is the block that bounds them: fread() stops at the end of
+// the file, end_blk() then seeks back over an overrun, so a record read past the block would import
+// as plausible garbage. The format gives every channel one map face per mesh face, so that count
+// comes from the mesh the records are read into. `err` names what stopped a read, for the caller to
+// log against the node: an aborted import is otherwise silent in a batch, where the prompt is off.
+// On false the mesh keeps the channels that were read before the refusal.
+#define fail(...)                   \
+  {                                 \
+    err = std::format(__VA_ARGS__); \
+    return false;                   \
+  }
+
+// The counts and the indices below are checked against the block and against each other. A record
+// read needs none of that: it is already inside its block by the count bound above it, and
+// begin_blk() keeps a block inside the file. What a bound cannot rule out is the storage failing
+// mid-file, which leaves any read short, so read_data() still asks, the way rd() does for every
+// other block of load_node().
+#define read_data(dest, size)                     \
+  do                                              \
+  {                                               \
+    const size_t nbytes = (size);                 \
+    if (nbytes && fread(dest, nbytes, 1, h) != 1) \
+      fail(_T("the file could not be read"));     \
+  } while (0)
+
+static bool read_map_channels(Mesh &m, FILE *h, const MeshFormat &fmt, std::wstring &err)
+{
+  const int nf = m.numFaces;
+  const int tface_bytes = nf * fmt.tface_sz;
+
+  uchar numch = 0;
+  if (!read_blk_field(&numch, 1, h))
+    fail(_T("the map channel count is past the end of its block"));
+
+  for (int ch = 0; ch < numch; ++ch)
+  {
+    uint ntv = 0;
+    uchar tcsz = 0, chid = 0;
+    if (!read_blk_field(&ntv, fmt.count_sz, h) || !read_blk_field(&tcsz, 1, h) || !read_blk_field(&chid, 1, h))
+      fail(_T("map channel record {} has no header left in its block"), ch);
+
+    // the channel id and the coordinate count come out of the file too, and the map verts are
+    // allocated from ntv before anything is read into them. setNumMapVerts() reports nothing, so
+    // the counts are all there is to check. A wider coordinate than the three read below would
+    // leave the rest of them in the stream and desynchronise the records that follow.
+    const int rest = blk_rest();
+    if (chid >= MAX_MESHMAPS || tcsz < 1 || tcsz > 3)
+      fail(_T("map channel record {} declares id {} and {} coordinates per vertex"), ch, chid, tcsz);
+    if (tface_bytes > rest)
+      fail(_T("the {} faces of map channel {} do not fit its block"), nf, chid);
+    if (ntv > uint(rest - tface_bytes) / uint(tcsz * 4))
+      fail(_T("map channel {} declares {} vertices, more than its block holds"), chid, ntv);
+
+    m.setMapSupport(chid);
+    m.setNumMapVerts(chid, ntv);
+    Point3 *tv = m.mapVerts(chid);
+    if (ntv && !tv)
+      fail(_T("cannot allocate {} vertices of map channel {}"), ntv, chid);
+    for (uint v = 0; v < ntv; ++v, ++tv)
+    {
+      int i = 0;
+      for (; i < tcsz; ++i)
+        read_data(&tv[0][i], 4);
+      for (; i < 3; ++i)
+        tv[0][i] = 0;
+    }
+
+    TVFace *tf = m.mapFaces(chid);
+    if (nf && !tf)
+      fail(_T("cannot allocate the faces of map channel {}"), chid);
+    for (int f = 0; f < nf; ++f)
+    {
+      DagBigTFace t;
+      if (fmt.big)
+        read_data(&t, sizeof(DagBigTFace));
+      else
+      {
+        DagTFace narrow;
+        read_data(&narrow, sizeof(DagTFace));
+        t.t[0] = narrow.t[0];
+        t.t[1] = narrow.t[1];
+        t.t[2] = narrow.t[2];
+      }
+      // the record fits the block, its indices still have to fit the channel they point into
+      if (t.t[0] >= ntv || t.t[1] >= ntv || t.t[2] >= ntv)
+        fail(_T("face {} of map channel {} points outside its {} vertices"), f, chid, ntv);
+      tf[f].t[0] = t.t[0];
+      tf[f].t[2] = t.t[1];
+      tf[f].t[1] = t.t[2];
+    }
+  }
+  return true;
+}
+
+// Reads a DAG_OBJ_MESH or DAG_OBJ_BIGMESH payload, the two differing only in the width of their
+// counts and indices. This is where the bound policy of a mesh block lives: every count comes out
+// of the file, so each is held to what the block still holds before it is used as a length or an
+// allocation size.
+//
+// Neither this nor read_map_channels() unwinds what it has already built, and a refusal can come
+// after the mesh is allocated and part filled. On false the object holding it has to be discarded,
+// the way load_node() does at read_err.
+static bool read_mesh(Mesh &m, FILE *h, const MeshFormat &fmt, std::wstring &err)
+{
+  uint nv = 0;
+  if (!read_blk_field(&nv, fmt.count_sz, h))
+    fail(_T("the vertex count is past the end of its block"));
+  if (nv > blk_rest_items(sizeof(Point3)))
+    fail(_T("{} vertices do not fit the block"), nv);
+  if (!m.setNumVerts(nv))
+    fail(_T("cannot allocate {} vertices"), nv);
+  read_data(m.verts, size_t(nv) * sizeof(Point3));
+
+  uint nf = 0;
+  if (!read_blk_field(&nf, fmt.count_sz, h))
+    fail(_T("the face count is past the end of its block"));
+  if (nf > blk_rest_items(fmt.face_sz))
+    fail(_T("{} faces do not fit the block"), nf);
+  if (!m.setNumFaces(nf))
+    fail(_T("cannot allocate {} faces"), nf);
+
+  DebugPrint(_T("   faces: %d\n"), nf);
+
+  for (uint i = 0; i < nf; ++i)
+  {
+    DagBigFace f;
+    if (fmt.big)
+      read_data(&f, sizeof(DagBigFace));
+    else
+    {
+      DagFace narrow;
+      read_data(&narrow, sizeof(DagFace));
+      f.v[0] = narrow.v[0];
+      f.v[1] = narrow.v[1];
+      f.v[2] = narrow.v[2];
+      f.smgr = narrow.smgr;
+      f.mat = narrow.mat;
+    }
+    // the record fits the block, its indices still have to fit the mesh they point into
+    if (f.v[0] >= nv || f.v[1] >= nv || f.v[2] >= nv)
+      fail(_T("face {} points outside the {} vertices of the mesh"), i, nv);
+    m.faces[i].v[0] = f.v[0];
+    m.faces[i].v[2] = f.v[1];
+    m.faces[i].v[1] = f.v[2];
+    m.faces[i].setMatID(f.mat);
+    m.faces[i].smGroup = f.smgr;
+    m.faces[i].flags |= EDGE_ALL;
+  }
+
+  return read_map_channels(m, h, fmt, err);
+}
+
+#undef read_data
+#undef fail
+
+static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, std::vector<SkinData> &skin_data, Tab<NodeId> &node_id)
 {
   float master_scale = get_master_scale();
   bool need_rescale = fabs(master_scale - 1.f) > 1e-4f;
@@ -1486,7 +1626,6 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
     ii->AddNodeToScene(in);
     n = in->GetINode();
     assert(n);
-    // pnode->AttachChild(n,0);
   }
   else
   {
@@ -1496,6 +1635,7 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
   ushort nid = ~0;
   Mtl *mtl = NULL;
   Object *obj = NULL;
+  MultiMtl *mm = nullptr;
   int nflg = 0;
   while (blk_rest() > 0)
   {
@@ -1518,10 +1658,10 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
       if (l > 0 && in)
       {
 
-        TCHAR *nm = ReadCharString(l, h);
-        in->SetName(nm, DagImp::useLegacyImport);
-        DebugPrint(_T("node <%s>\n"), nm);
-        free(nm);
+        std::wstring nm;
+        read_char_string(l, h, nm);
+        in->SetName(nm.data(), DagImp::useLegacyImport);
+        DebugPrint(_T("node <%s>\n"), nm.data());
       }
     }
     else if (blk_type() == DAG_NODE_TM && in)
@@ -1534,185 +1674,6 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
       if (pnode->IsRootNode())
         adj_wtm(tm);
       in->SetTransform(0, tm);
-      // n->SetNodeTM(0,tm);
-    }
-    else if (blk_type() == DAG_NODE_ANIM && in)
-    {
-      int adj = pnode->IsRootNode();
-      ushort ntrkid;
-      rd(&ntrkid, 2);
-      // note track
-      if (ntrkid < ntrack.Count())
-      {
-        DefNoteTrack *nt = ntrack[ntrkid];
-        if (nt)
-        {
-          DefNoteTrack *nnt = (DefNoteTrack *)NewDefaultNoteTrack();
-          assert(nnt);
-          nnt->keys = nt->keys;
-          n->AddNoteTrack(nnt);
-        }
-      }
-      /*
-      if(ntrkid<ntrack.Count()) {
-          int knum=ntrack_knum[ntrkid];
-          DagNoteKey *nk=ntrack[ntrkid];
-              DefNoteTrack *nt=(DefNoteTrack*)NewDefaultNoteTrack();
-              if(nt) {
-              for(int i=0;i<knum;++i) {
-                  char *nm="";
-                  if(nk[i].id<keylabel.Count()) nm=keylabel[nk[i].id];
-                  NoteKey *k=new NoteKey(nk[i].t,nm);
-                  nt->keys.Append(1,&k);
-              }
-              n->AddNoteTrack(nt);
-              }
-      }
-      */
-      // create PRS controller
-      Control *prs = CreatePRSControl();
-      assert(prs);
-      n->SetTMController(prs);
-      Control *pc = CreateInterpPosition();
-      assert(pc);
-      verify(prs->SetPositionController(pc));
-      Control *rc = CreateInterpRotation();
-      assert(rc);
-      verify(prs->SetRotationController(rc));
-      Control *sc = CreateInterpScale();
-      assert(sc);
-      verify(prs->SetScaleController(sc));
-      // pos track
-      IKeyControl *ik = GetKeyControlInterface(pc);
-      assert(ik);
-      ushort numk;
-      rd(&numk, 2);
-      if (numk == 1)
-      {
-        IBezPoint3Key k;
-        rd(&k.val, 12);
-        if (adj)
-          adj_pos(k.val);
-        k.intan = Point3(0, 0, 0);
-        k.outtan = Point3(0, 0, 0);
-        ik->SetNumKeys(1);
-        ik->SetKey(0, &k);
-      }
-      else
-      {
-        ik->SetNumKeys(numk);
-        IBezPoint3Key k;
-        k.flags = BEZKEY_XBROKEN | BEZKEY_YBROKEN | BEZKEY_ZBROKEN;
-        DagPosKey *dk = new DagPosKey[numk];
-        assert(dk);
-        rd(dk, sizeof(*dk) * numk);
-        for (int i = 0; i < numk; ++i)
-        {
-          k.time = dk[i].t;
-          k.val = dk[i].p;
-          float dt;
-          if (i > 0)
-            dt = (dk[i].t - dk[i - 1].t) / 3.f;
-          else
-            dt = 1;
-          k.intan = dk[i].i / dt;
-          if (i + 1 < numk)
-            dt = (dk[i + 1].t - dk[i].t) / 3.f;
-          else
-            dt = 1;
-          k.outtan = dk[i].o / dt;
-          if (adj)
-            adj_pos(k.val);
-          if (adj)
-            adj_pos(k.intan);
-          if (adj)
-            adj_pos(k.outtan);
-          ik->SetKey(i, &k);
-        }
-        delete[] dk;
-        ik->SortKeys();
-      }
-      // rot track
-      SuspendAnimate();
-      AnimateOn();
-      ik = GetKeyControlInterface(rc);
-      assert(ik);
-      rd(&numk, 2);
-      if (numk == 1)
-      {
-        Quat q;
-        rd(&q, 16);
-        q = Conjugate(q);
-        if (adj)
-          adj_rot(q);
-        rc->SetValue(0, &q);
-      }
-      else
-      {
-        DagRotKey *dk = new DagRotKey[numk];
-        assert(dk);
-        rd(dk, sizeof(*dk) * numk);
-        for (int i = 0; i < numk; ++i)
-        {
-          dk[i].p = Conjugate(dk[i].p);
-          if (adj)
-            adj_rot(dk[i].p);
-          rc->SetValue(dk[i].t, &dk[i].p);
-        }
-        delete[] dk;
-      }
-      ResumeAnimate();
-      // scl track
-      ik = GetKeyControlInterface(sc);
-      assert(ik);
-      rd(&numk, 2);
-      if (numk == 1)
-      {
-        IBezScaleKey k;
-        Point3 p;
-        rd(&p, 12);
-        if (adj)
-          adj_scl(p);
-        k.val = p;
-        k.intan = Point3(0, 0, 0);
-        k.outtan = Point3(0, 0, 0);
-        ik->SetNumKeys(1);
-        ik->SetKey(0, &k);
-      }
-      else
-      {
-        ik->SetNumKeys(numk);
-        IBezScaleKey k;
-        k.flags = BEZKEY_XBROKEN | BEZKEY_YBROKEN | BEZKEY_ZBROKEN;
-        DagPosKey *dk = new DagPosKey[numk];
-        assert(dk);
-        rd(dk, sizeof(*dk) * numk);
-        for (int i = 0; i < numk; ++i)
-        {
-          k.time = dk[i].t;
-          k.val = dk[i].p;
-          float dt;
-          if (i > 0)
-            dt = (dk[i].t - dk[i - 1].t) / 3.f;
-          else
-            dt = 1;
-          k.intan = dk[i].i / dt;
-          if (i + 1 < numk)
-            dt = (dk[i + 1].t - dk[i].t) / 3.f;
-          else
-            dt = 1;
-          k.outtan = dk[i].o / dt;
-          if (adj)
-            adj_scl(k.val.s);
-          if (adj)
-            adj_scl(k.intan);
-          if (adj)
-            adj_scl(k.outtan);
-          ik->SetKey(i, &k);
-        }
-        delete[] dk;
-        ik->SortKeys();
-      }
     }
     else if (blk_type() == DAG_NODE_SCRIPT && in)
     {
@@ -1720,9 +1681,10 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
       int l = blk_rest();
       if (l > 0)
       {
-        TCHAR *s = ReadCharString(l, h);
-        n->SetUserPropBuffer(s);
-        free(s);
+        std::wstring s;
+        read_char_string(l, h, s);
+        std::wstring trimmed = trim_params(s);
+        n->SetUserPropBuffer(trimmed.data());
       }
       DebugPrint(_T("   node script ok\n"));
     }
@@ -1732,17 +1694,18 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
       int num = blk_len() / 2;
       if (num > 1)
       {
-        MultiMtl *mm = NewDefaultMultiMtl();
+        mm = NewDefaultMultiMtl();
         assert(mm);
+        multi_mat.push_back(mm);
         mm->SetNumSubMtls(num);
         for (int i = 0; i < num; ++i)
         {
           ushort id;
           rd(&id, 2);
-          if (id < mat.Count())
+          if (id < mat.size())
           {
             if (!mat[id].mtl)
-              make_mtl(mat[id], id, DagorMat_CID);
+              make_mtl(mat[id], id, DagorMat2_CID);
             if (mat[id].mtl)
               mm->SetSubMtl(i, mat[id].mtl);
           }
@@ -1754,7 +1717,7 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
       {
         ushort id;
         rd(&id, 2);
-        if (id < mat.Count())
+        if (id < mat.size())
         {
           if (!mat[id].mtl)
             make_mtl(mat[id], id, DagorMat2_CID);
@@ -1770,268 +1733,100 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
       while (blk_rest() > 0)
       {
         bblk;
-        if (blk_type() == DAG_OBJ_BIGMESH)
+        // These two blocks are the object, unlike FACEFLG, NORMALS and BONES further down, which
+        // annotate one that already exists and can each be dropped on their own. A count that does
+        // not fit is found part way through building the mesh, so dropping the block would leave the
+        // node holding half a mesh or none, and the scene would come back quietly missing geometry
+        // rather than missing a detail. A mesh that does not fit its block fails the import instead.
+        if (blk_type() == DAG_OBJ_BIGMESH || blk_type() == DAG_OBJ_MESH)
         {
+          const MeshFormat fmt(blk_type() == DAG_OBJ_BIGMESH);
+          std::wstring err;
           TriObject *tri = CreateNewTriObject();
-          assert(tri);
-          Mesh &m = tri->mesh;
-          uint nv = 0;
-          rd(&nv, 4);
-
-          verify(m.setNumVerts(nv));
-          rd(m.verts, nv * 12);
-          if (need_rescale)
-            for (int i = 0; i < nv; ++i)
-              m.verts[i] *= master_scale;
-
-          uint nf = 0;
-          rd(&nf, 4);
-          verify(m.setNumFaces(nf));
-
-          DebugPrint(_T("   big faces: %d\n"), nf);
-
-          int i;
-          for (i = 0; i < nf; ++i)
+          bool ok = tri != nullptr;
+          if (!ok)
+            err = _T("cannot create the mesh object");
+          else
           {
-            DagBigFace f;
-            rd(&f, sizeof(f));
-            m.faces[i].v[0] = f.v[0];
-            m.faces[i].v[2] = f.v[1];
-            m.faces[i].v[1] = f.v[2];
-            m.faces[i].setMatID(f.mat);
-            m.faces[i].smGroup = f.smgr;
-            m.faces[i].flags |= EDGE_ALL;
-          }
-          uchar numch;
-          rd(&numch, 1);
-#if MAX_RELEASE >= 3000
-          for (int ch = 0; ch < numch; ++ch)
-          {
-            uint ntv = 0;
-            rd(&ntv, 4);
-            uchar tcsz, chid;
-            rd(&tcsz, 1);
-            rd(&chid, 1);
-            m.setMapSupport(chid);
-            m.setNumMapVerts(chid, ntv);
-            Point3 *tv = m.mapVerts(chid);
-            for (; ntv; --ntv, ++tv)
+            obj = tri;
+            Mesh &m = tri->mesh;
+            ok = read_mesh(m, h, fmt, err);
+            if (ok)
             {
-              for (i = 0; i < tcsz && i < 3; ++i)
-                rd(&tv[0][i], 4);
-              for (; i < 3; ++i)
-                tv[0][i] = 0;
+              if (need_rescale)
+                for (int i = 0; i < m.numVerts; ++i)
+                  m.verts[i] *= master_scale;
+              if (n->GetNodeTM(0).Parity())
+                flip_normals(m);
             }
-            TVFace *tf = m.mapFaces(chid);
-            for (i = 0; i < nf; ++i)
-            {
-              DagBigTFace f;
-              rd(&f, sizeof(f));
-              tf[i].t[0] = f.t[0];
-              tf[i].t[2] = f.t[1];
-              tf[i].t[1] = f.t[2];
-            }
-          }
-#else
-          if (numch >= 1)
-          {
-            uint ntv = 0;
-            rd(&ntv, 4);
-            uchar tcsz, chid;
-            rd(&tcsz, 1);
-            rd(&chid, 1);
-            verify(m.setNumTVFaces(nf));
-            verify(m.setNumTVerts(ntv));
-            Point3 *tv = m.tVerts;
-            for (; ntv; --ntv, ++tv)
-            {
-              for (i = 0; i < tcsz && i < 3; ++i)
-                rd((float *)*tv + i, 4);
-              for (; i < 3; ++i)
-                ((float *)*tv)[i] = 0;
-            }
-            TVFace *tf = m.tvFace;
-            for (i = 0; i < nf; ++i)
-            {
-              DagBigTFace f;
-              rd(&f, sizeof(f));
-              tf[i].t[0] = f.t[0];
-              tf[i].t[2] = f.t[1];
-              tf[i].t[1] = f.t[2];
-            }
-          }
-          if (numch >= 2)
-          {
-            uint ntv = 0;
-            rd(&ntv, 4);
-            uchar tcsz, chid;
-            rd(&tcsz, 1);
-            rd(&chid, 1);
-            verify(m.setNumVCFaces(nf));
-            verify(m.setNumVertCol(ntv));
-            Point3 *tv = m.vertCol;
-            for (; ntv; --ntv, ++tv)
-            {
-              for (i = 0; i < tcsz && i < 3; ++i)
-                rd((float *)*tv + i, 4);
-              for (; i < 3; ++i)
-                ((float *)*tv)[i] = 0;
-            }
-            TVFace *tf = m.vcFace;
-            for (i = 0; i < nf; ++i)
-            {
-              DagBigTFace f;
-              rd(&f, sizeof(f));
-              tf[i].t[0] = f.t[0];
-              tf[i].t[2] = f.t[1];
-              tf[i].t[1] = f.t[2];
-            }
-          }
-#endif
-          if (n->GetNodeTM(0).Parity())
-            flip_normals(m);
-          obj = tri;
-        }
-        else if (blk_type() == DAG_OBJ_MESH)
-        {
-          TriObject *tri = CreateNewTriObject();
-          assert(tri);
-          Mesh &m = tri->mesh;
-          uint nv = 0;
-          rd(&nv, 2);
-          verify(m.setNumVerts(nv));
-          if (nv)
-          {
-            rd(m.verts, nv * 12);
-            if (need_rescale)
-              for (int i = 0; i < nv; ++i)
-                m.verts[i] *= master_scale;
           }
 
-          uint nf = 0;
-          rd(&nf, 2);
-          verify(m.setNumFaces(nf));
-          DebugPrint(_T("   faces: %d\n"), nf);
-          int i;
-          for (i = 0; i < nf; ++i)
+          // obj already holds the mesh, so the refusal has to be carried by the reader's own answer
+          // rather than by whether it named a reason: one that returned false without naming one
+          // would otherwise leave a part built mesh on the node, unlogged
+          if (!ok)
           {
-            DagFace f;
-            rd(&f, sizeof(f));
-            m.faces[i].v[0] = f.v[0];
-            m.faces[i].v[2] = f.v[1];
-            m.faces[i].v[1] = f.v[2];
-            m.faces[i].setMatID(f.mat);
-            m.faces[i].smGroup = f.smgr;
-            m.faces[i].flags |= EDGE_ALL;
+            DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Error, _T("%s: '%s': %s, import aborted\r\n"), scene_name.data(),
+              n->GetName(), err.c_str());
+            DagorLogWindow::show();
+            goto read_err;
           }
-          uchar numch;
-          rd(&numch, 1);
-#if MAX_RELEASE >= 3000
-          for (int ch = 0; ch < numch; ++ch)
-          {
-            uint ntv = 0;
-            rd(&ntv, 2);
-            uchar tcsz, chid;
-            rd(&tcsz, 1);
-            rd(&chid, 1);
-            m.setMapSupport(chid);
-            m.setNumMapVerts(chid, ntv);
-            Point3 *tv = m.mapVerts(chid);
-            for (; ntv; --ntv, ++tv)
-            {
-              for (i = 0; i < tcsz && i < 3; ++i)
-                rd(&tv[0][i], 4);
-              for (; i < 3; ++i)
-                tv[0][i] = 0;
-            }
-            TVFace *tf = m.mapFaces(chid);
-            for (i = 0; i < nf; ++i)
-            {
-              DagTFace f;
-              rd(&f, sizeof(f));
-              tf[i].t[0] = f.t[0];
-              tf[i].t[2] = f.t[1];
-              tf[i].t[1] = f.t[2];
-            }
-          }
-#else
-          if (numch >= 1)
-          {
-            uint ntv = 0;
-            rd(&ntv, 2);
-            uchar tcsz, chid;
-            rd(&tcsz, 1);
-            rd(&chid, 1);
-            verify(m.setNumTVFaces(nf));
-            verify(m.setNumTVerts(ntv));
-            Point3 *tv = m.tVerts;
-            for (; ntv; --ntv, ++tv)
-            {
-              for (i = 0; i < tcsz && i < 3; ++i)
-                rd((float *)*tv + i, 4);
-              for (; i < 3; ++i)
-                ((float *)*tv)[i] = 0;
-            }
-            TVFace *tf = m.tvFace;
-            for (i = 0; i < nf; ++i)
-            {
-              DagTFace f;
-              rd(&f, sizeof(f));
-              tf[i].t[0] = f.t[0];
-              tf[i].t[2] = f.t[1];
-              tf[i].t[1] = f.t[2];
-            }
-          }
-          if (numch >= 2)
-          {
-            uint ntv = 0;
-            rd(&ntv, 2);
-            uchar tcsz, chid;
-            rd(&tcsz, 1);
-            rd(&chid, 1);
-            verify(m.setNumVCFaces(nf));
-            verify(m.setNumVertCol(ntv));
-            Point3 *tv = m.vertCol;
-            for (; ntv; --ntv, ++tv)
-            {
-              for (i = 0; i < tcsz && i < 3; ++i)
-                rd((float *)*tv + i, 4);
-              for (; i < 3; ++i)
-                ((float *)*tv)[i] = 0;
-            }
-            TVFace *tf = m.vcFace;
-            for (i = 0; i < nf; ++i)
-            {
-              DagTFace f;
-              rd(&f, sizeof(f));
-              tf[i].t[0] = f.t[0];
-              tf[i].t[2] = f.t[1];
-              tf[i].t[1] = f.t[2];
-            }
-          }
-#endif
-          if (n->GetNodeTM(0).Parity())
-            flip_normals(m);
-          obj = tri;
-#if MAX_RELEASE >= 12000
         }
         else if (blk_type() == DAG_OBJ_BONES)
         {
-          SkinData *sd = new SkinData;
-          sd->skinNode = n;
-          rd(&sd->numb, 2);
-          sd->bones.SetCount(sd->numb);
-          rd(&sd->bones[0], sd->bones.Count() * sizeof(DagBone));
-          rd(&sd->numvert, 4);
-          sd->wt.SetCount(sd->numvert * sd->numb);
-          rd(&sd->wt[0], sd->wt.Count() * sizeof(float));
-          skin_data.Append(1, &sd);
-#endif
+          ushort numb = 0;
+          rd(&numb, 2);
+
+          // A block that does not add up costs its own skin and not the whole scene: eblk skips the
+          // rest of it either way, the way the FACEFLG, NORMALS and LIGHT blocks of this loop
+          // already behave. A block with no bones carries no skin and no weight matrix at all.
+          if (numb)
+          {
+            // rd() reads the file and stops only at EOF, so the bones and the vertex count behind
+            // them have to be measured against what the block still holds. blk_rest() has already
+            // gone negative if the two bytes above came from outside it.
+            if (blk_rest() < int(numb * sizeof(DagBone)) + 4)
+            {
+              DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning,
+                L"%s: '%s': the table of %d bones does not fit its block, skinning skipped\r\n", scene_name.data(), n->GetName(),
+                numb);
+              DagorLogWindow::show();
+            }
+            else
+            {
+              skin_data.emplace_back();
+              SkinData &sd = skin_data.back();
+              sd.skinNode = n;
+              sd.numb = numb;
+              sd.bones.SetCount(numb);
+              rd(&sd.bones[0], numb * sizeof(DagBone));
+
+              rd(&sd.numvert, 4);
+
+              // the numb by numvert matrix of floats has to fit in what is left of the block too,
+              // which also keeps numvert * numb inside an int
+              const int maxvert = blk_rest() / int(numb * sizeof(float));
+              if (sd.numvert < 0 || sd.numvert > maxvert)
+              {
+                DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning,
+                  L"%s: '%s': the weight matrix of %d vertices does not fit its block, skinning skipped\r\n", scene_name.data(),
+                  n->GetName(), sd.numvert);
+                DagorLogWindow::show();
+                skin_data.pop_back();
+              }
+              else if (sd.numvert)
+              {
+                sd.wt.SetCount(sd.numvert * numb);
+                rd(&sd.wt[0], sd.wt.Count() * sizeof(float));
+              }
+            }
+          }
         }
         else if (blk_type() == DAG_OBJ_SPLINES)
         {
           SplineShape *shape = new SplineShape;
           assert(shape);
+          obj = shape;
           BezierShape &shp = shape->shape;
           int numspl;
           rd(&numspl, 4);
@@ -2061,13 +1856,11 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
               s.AddKnot(k);
             }
             s.SetClosed(flg & DAG_SPLINE_CLOSED ? 1 : 0);
-            //                                              s.InvalidateGeomCache();
             s.ComputeBezPoints();
           }
           shp.UpdateSels();
           shp.InvalidateGeomCache();
           shp.InvalidateCapCache();
-          obj = shape;
         }
         else if (blk_type() == DAG_OBJ_LIGHT)
         {
@@ -2105,7 +1898,6 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
           lt.SetAtten(time, ATTEN_START, dl.range);
           lt.SetAtten(time, ATTEN_END, dl.range);
           lt.SetUseAtten(TRUE);
-          // lt.SetAttenDisplay(TRUE);
           lt.SetDecayType(dl.decay);
           lt.SetDecayRadius(time, dl.drad);
           lt.SetShadow(nflg & DAG_NF_CASTSHADOW ? 1 : 0);
@@ -2166,17 +1958,14 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
 
               rd(normalSpec->GetNormalArray(), numNormals * 12);
 
-              int *indices = new int[m.numFaces * 3];
-              rd(indices, m.numFaces * 3 * 4);
-
+              std::vector<int> indices(m.numFaces * 3);
+              rd(indices.data(), sizeof(int) * indices.size());
               for (int i = 0; i < m.numFaces; i++)
               {
                 normalSpec->SetNormalIndex(i, 0, indices[i * 3]);
                 normalSpec->SetNormalIndex(i, 1, indices[i * 3 + 2]);
                 normalSpec->SetNormalIndex(i, 2, indices[i * 3 + 1]);
               }
-
-              delete[] indices;
             }
           }
         }
@@ -2207,7 +1996,6 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
   {
     if (!obj)
     {
-      //                      obj=(Object*)ii->Create(HELPER_CLASS_ID,Class_ID(DUMMY_CLASS_ID,0));
       obj = (Object *)ii->Create(GEOMOBJECT_CLASS_ID, Dummy_CID);
       assert(obj);
     }
@@ -2219,113 +2007,93 @@ static int load_node(INode *pnode, FILE *h, ImpInterface *ii, Interface *ip, Tab
   return 1;
 read_err:
   DebugPrint(_T("read error in load_node() at %X of %s\n"), ftell(h), scene_name.data());
+  if (obj)
+    obj->DeleteMe();
   return 0;
 }
 
-#if defined(MAX_RELEASE_R13) && MAX_RELEASE >= MAX_RELEASE_R13
-static bool trail_stricmp(const TCHAR *str, const TCHAR *str2)
+static bool find_co_files(const fs::path &fname, std::vector<std::wstring> &fnames)
 {
-  size_t l = _tcslen(str), l2 = _tcslen(str2);
-  return (l >= l2) ? _tcsncicmp(str + l - l2, str2, l2) == 0 : false;
-}
-
-static bool find_co_files(const TCHAR *fname, Tab<TCHAR *> &fnames)
-{
-  if (!trail_stricmp(fname, _T(".lod00.dag")))
+  if (!is_dag_file(fname) || !iequal(fname.stem().extension().c_str(), _T(".lod00")))
     return false;
-  int base_len = int(_tcslen(fname) - _tcslen(_T(".lod00.dag")));
+  const fs::path base = fname.parent_path() / fname.stem().stem();
 
-  TCHAR *p[2];
-  p[0] = _tcsdup(fname);
-  p[1] = _tcsdup(_T("LOD00"));
-  fnames.Append(2, p);
+  fnames.push_back(fname);
+  fnames.push_back(_T("LOD00"));
 
-  TCHAR str_buf[512];
+  std::wstring formatted_name;
   int i;
   for (i = 1; i < 16; i++)
   {
-    _stprintf(str_buf, _T("%.*s.lod%02d.dag"), base_len, fname, i);
-    if (::_taccess(str_buf, 4) == 0)
+    formatted_name = std::format(_T("{}.lod{:02}.dag"), base.c_str(), i);
+    if (fs::exists(formatted_name))
     {
-      p[0] = _tcsdup(str_buf);
-      _stprintf(str_buf, _T("LOD%02d"), i);
-      p[1] = _tcsdup(str_buf);
-      fnames.Append(2, p);
+      fnames.push_back(formatted_name);
+      formatted_name = std::format(_T("LOD{:02}"), i);
+      fnames.push_back(formatted_name);
     }
   }
 
-  _stprintf(str_buf, _T("%.*s_destr.lod00.dag"), base_len, fname);
-  if (::_taccess(str_buf, 4) == 0)
+  formatted_name = std::format(_T("{}_destr.lod00.dag"), base.c_str());
+  if (fs::exists(formatted_name))
   {
-    p[0] = _tcsdup(str_buf);
-    p[1] = _tcsdup(_T("DESTR"));
-    fnames.Append(2, p);
+    fnames.push_back(formatted_name);
+    fnames.push_back(_T("DESTR"));
   }
 
-  // if (base_len > 2 && _tcsncmp(&fname[base_len-2], _T("_a"), 2)==0)
-  //   base_len -= 2;
-
-  _stprintf(str_buf, _T("%.*s_dm.dag"), base_len, fname);
-  if (::_taccess(str_buf, 4) == 0)
+  formatted_name = std::format(_T("{}_dm.dag"), base.c_str());
+  if (fs::exists(formatted_name))
   {
-    p[0] = _tcsdup(str_buf);
-    p[1] = _tcsdup(_T("DM"));
-    fnames.Append(2, p);
+    fnames.push_back(formatted_name);
+    fnames.push_back(_T("DM"));
   }
 
   for (i = 0; i < 16; i++)
   {
-    _stprintf(str_buf, _T("%.*s_dmg.lod%02d.dag"), base_len, fname, i);
-    if (::_taccess(str_buf, 4) == 0)
+    formatted_name = std::format(_T("{}_dmg.lod{:02}.dag"), base.c_str(), i);
+    if (fs::exists(formatted_name))
     {
-      p[0] = _tcsdup(str_buf);
-      _stprintf(str_buf, _T("DMG_LOD%02d"), i);
-      p[1] = _tcsdup(str_buf);
-      fnames.Append(2, p);
+      fnames.push_back(formatted_name);
+      formatted_name = std::format(_T("DMG_LOD{:02}"), i);
+      fnames.push_back(formatted_name);
     }
   }
 
   for (i = 0; i < 16; i++)
   {
-    _stprintf(str_buf, _T("%.*s_dmg2.lod%02d.dag"), base_len, fname, i);
-    if (::_taccess(str_buf, 4) == 0)
+    formatted_name = std::format(_T("{}_dmg2.lod{:02}.dag"), base.c_str(), i);
+    if (fs::exists(formatted_name))
     {
-      p[0] = _tcsdup(str_buf);
-      _stprintf(str_buf, _T("DMG2_LOD%02d"), i);
-      p[1] = _tcsdup(str_buf);
-      fnames.Append(2, p);
+      fnames.push_back(formatted_name);
+      formatted_name = std::format(_T("DMG2_LOD{:02}"), i);
+      fnames.push_back(formatted_name);
     }
   }
 
   for (i = 0; i < 16; i++)
   {
-    _stprintf(str_buf, _T("%.*s_expl.lod%02d.dag"), base_len, fname, i);
-    if (::_taccess(str_buf, 4) == 0)
+    formatted_name = std::format(_T("{}_expl.lod{:02}.dag"), base.c_str(), i);
+    if (fs::exists(formatted_name))
     {
-      p[0] = _tcsdup(str_buf);
-      _stprintf(str_buf, _T("EXPL_LOD%02d"), i);
-      p[1] = _tcsdup(str_buf);
-      fnames.Append(2, p);
+      fnames.push_back(formatted_name);
+      formatted_name = std::format(_T("EXPL_LOD{:02}"), i);
+      fnames.push_back(formatted_name);
     }
   }
 
-  _stprintf(str_buf, _T("%.*s_xray.dag"), base_len, fname);
-  if (::_taccess(str_buf, 4) == 0)
+  formatted_name = std::format(_T("{}_xray.dag"), base.c_str());
+  if (fs::exists(formatted_name))
   {
-    p[0] = _tcsdup(str_buf);
-    p[1] = _tcsdup(_T("XRAY"));
-    fnames.Append(2, p);
+    fnames.push_back(formatted_name);
+    fnames.push_back(_T("XRAY"));
   }
 
-  if (fnames.Count() > 1)
+  if (fnames.size() > 1)
     return true;
 
-  for (i = 0; i < fnames.Count(); i++)
-    free(fnames[i]);
-  fnames.ZeroCount();
+  fnames.clear();
   return false;
 }
-#endif
 
 bool DagImp::separateLayers = true;
 bool DagImp::useLegacyImport = false;
@@ -2335,11 +2103,11 @@ bool DagImp::reimportExisting = false;
 bool DagImp::nonInteractive = false;
 bool DagImp::calledFromBatchImport = false;
 
-DagImp::Categories DagImp::checked = {true, true, true, true};
-DagImp::Categories DagImp::detected = {false, false, false, false};
+DagImp::Categories DagImp::checked = {true, true, true, true, true};
+DagImp::Categories DagImp::detected = {false, false, false, false, false};
 ToolTipExtender DagImp::tooltipExtender;
 
-std::vector<TSTR> DagImp::batchImportFiles;
+std::vector<fs::path> DagImp::batchImportFiles;
 std::unordered_set<ImportedFile, ImportedFileHash> DagImp::importedFiles;
 
 static BOOL CALLBACK ImportOptDlgProc(HWND hwndDlg, UINT message, WPARAM wParam, LPARAM lParam)
@@ -2362,6 +2130,9 @@ static BOOL CALLBACK ImportOptDlgProc(HWND hwndDlg, UINT message, WPARAM wParam,
       CheckDlgButton(hwndDlg, IDC_IMPORT_DESTR, DagImp::checked.destr);
       EnableWindow(GetDlgItem(hwndDlg, IDC_IMPORT_DESTR), !DagImp::useLegacyImport && DagImp::detected.destr);
 
+      CheckDlgButton(hwndDlg, IDC_IMPORT_DM, DagImp::checked.dm);
+      EnableWindow(GetDlgItem(hwndDlg, IDC_IMPORT_DM), !DagImp::useLegacyImport && DagImp::detected.dm);
+
       CheckDlgButton(hwndDlg, (DagImp::reimportExisting ? IDC_REPLACE_EXISTING_LAYER : IDC_RENAME_NEW_LAYER), true);
       EnableWindow(GetDlgItem(hwndDlg, IDC_RENAME_NEW_LAYER), !DagImp::useLegacyImport);
       EnableWindow(GetDlgItem(hwndDlg, IDC_REPLACE_EXISTING_LAYER), !DagImp::useLegacyImport);
@@ -2370,6 +2141,7 @@ static BOOL CALLBACK ImportOptDlgProc(HWND hwndDlg, UINT message, WPARAM wParam,
       DagImp::tooltipExtender.SetToolTip(GetDlgItem(hwndDlg, IDC_USE_LEGACY_IMPORT), TSTR(_T("The previous import method.")));
       DagImp::tooltipExtender.SetToolTip(GetDlgItem(hwndDlg, IDC_IMPORT_LOD), TSTR(_T("Import \"*.lodNN.dag\" files.")));
       DagImp::tooltipExtender.SetToolTip(GetDlgItem(hwndDlg, IDC_IMPORT_DP), TSTR(_T("Import \"*_dp_NN.lodNN.dag\" files.")));
+      DagImp::tooltipExtender.SetToolTip(GetDlgItem(hwndDlg, IDC_IMPORT_DM), TSTR(_T("Import \"*_dm.dag\" files.")));
       DagImp::tooltipExtender.SetToolTip(GetDlgItem(hwndDlg, IDC_IMPORT_DMG),
         TSTR(_T("Import \"*_dmg.lodNN.dag\" and \"*_dp_NN_dmg.lodNN.dag\" files.")));
       DagImp::tooltipExtender.SetToolTip(GetDlgItem(hwndDlg, IDC_IMPORT_DESTR),
@@ -2397,6 +2169,7 @@ static BOOL CALLBACK ImportOptDlgProc(HWND hwndDlg, UINT message, WPARAM wParam,
           EnableWindow(GetDlgItem(hwndDlg, IDC_IMPORT_DP), !DagImp::useLegacyImport && DagImp::detected.dp);
           EnableWindow(GetDlgItem(hwndDlg, IDC_IMPORT_DMG), !DagImp::useLegacyImport && DagImp::detected.dmg);
           EnableWindow(GetDlgItem(hwndDlg, IDC_IMPORT_DESTR), !DagImp::useLegacyImport && DagImp::detected.destr);
+          EnableWindow(GetDlgItem(hwndDlg, IDC_IMPORT_DM), !DagImp::useLegacyImport && DagImp::detected.dm);
           EnableWindow(GetDlgItem(hwndDlg, IDC_RENAME_NEW_LAYER), !DagImp::useLegacyImport);
           EnableWindow(GetDlgItem(hwndDlg, IDC_REPLACE_EXISTING_LAYER), !DagImp::useLegacyImport);
           update_export_mode(DagImp::useLegacyImport);
@@ -2407,6 +2180,7 @@ static BOOL CALLBACK ImportOptDlgProc(HWND hwndDlg, UINT message, WPARAM wParam,
           DagImp::checked.dp = IsDlgButtonChecked(hwndDlg, IDC_IMPORT_DP);
           DagImp::checked.dmg = IsDlgButtonChecked(hwndDlg, IDC_IMPORT_DMG);
           DagImp::checked.destr = IsDlgButtonChecked(hwndDlg, IDC_IMPORT_DESTR);
+          DagImp::checked.dm = IsDlgButtonChecked(hwndDlg, IDC_IMPORT_DM);
           DagImp::reimportExisting = IsDlgButtonChecked(hwndDlg, IDC_REPLACE_EXISTING_LAYER);
           EndDialog(hwndDlg, wParam);
           return TRUE;
@@ -2426,52 +2200,40 @@ static BOOL CALLBACK ImportOptDlgProc(HWND hwndDlg, UINT message, WPARAM wParam,
   return FALSE;
 }
 
-static TSTR filenameToRegex(const TSTR &filename, bool dp, bool lods, bool destr, bool dmg, TSTR &base_name, bool &exact_match)
+static std::wstring filenameToRegex(const fs::path &filename, bool dp, bool lods, bool destr, bool dmg, bool dm,
+  std::wstring &base_name_re, bool &exact_match)
 {
   static const int dag_length = 4; // ".dag"
 
-  base_name = _T("");
+  base_name_re.clear();
   exact_match = false;
 
-  static std::wregex reg(_T("\\.lod\\d\\d\\.dag$"), std::regex_constants::icase);
+  static const std::wregex reg(L"\\.lod\\d\\d\\.dag$", std::regex_constants::icase);
   std::wsmatch lod_info;
-  std::wstring fn = filename.data();
+  const std::wstring fn = filename.wstring();
   if (!std::regex_search(fn, lod_info, reg))
   {
-    TSTR re;
-    re.printf(_T("^%s$"), filename);
     exact_match = true;
-    return re;
+    return std::format(L"^{}$", escape_regex(fn));
   }
 
-  base_name = lod_info.prefix().str().data();
-  TSTR base_lod = lod_info[0].str().data();
-  base_lod = base_lod.Substr(0, base_lod.Length() - dag_length);
+  base_name_re = escape_regex(lod_info.prefix().str());
 
-  TSTR dp_re = dp ? _T("(_dp_\\d\\d|)") : _T("()");
-  TSTR dmg_re = dmg ? _T("(_dmg|)") : _T("()");
-  TSTR lods_re = lods ? _T("\\.lod\\d\\d") : base_lod.data();
+  const std::wstring lod_suffix = lod_info[0].str(); // ".lodNN.dag"
+  const std::wstring base_lod_re = escape_regex(std::wstring_view(lod_suffix).substr(0, lod_suffix.size() - dag_length));
 
-  TSTR variants_re;
-  variants_re.printf(_T("^%s%s%s%s\\.dag$"), base_name, dp_re, dmg_re, lods_re);
-  if (!destr)
-    return variants_re;
+  const wchar_t *dp_re = dp ? L"(_dp_\\d\\d|)" : L"()";
+  const wchar_t *dmg_re = dmg ? L"(_dmg|)" : L"()";
+  const wchar_t *destr_re = destr ? L"(_destr|)" : L"";
+  const std::wstring lods_re = lods ? std::wstring(L"\\.lod\\d\\d") : base_lod_re;
 
-  TSTR destr_re;
-  destr_re.printf(_T("^%s%s%s_destr\\.lod00\\.dag$"), base_name, dp_re, dmg_re);
+  const std::wstring variants_re = std::format(L"^{}{}{}{}{}\\.dag$", base_name_re, dp_re, dmg_re, destr_re, lods_re);
 
-  TSTR combined_re;
-  combined_re.printf(_T("(%s|%s)"), variants_re, destr_re);
-  return combined_re;
+  if (dm)
+    return std::format(L"({})|(^{}_dm\\.dag$)", variants_re, base_name_re);
+
+  return variants_re;
 }
-
-static void deleteNode(INode *node)
-{
-  while (node->NumChildren() > 0)
-    deleteNode(node->GetChildNode(0));
-
-  GetCOREInterface()->DeleteNode(node, true);
-};
 
 // asset.lodXX --> asset_001.lodXX
 static TSTR makeMangledLayerName(TSTR name) // by val
@@ -2489,7 +2251,7 @@ static TSTR makeMangledLayerName(TSTR name) // by val
     unsigned num = 1;
     do
     {
-      name.printf(_T("%s_%03d"), basename, num++);
+      name = std::format(_T("{}_{:03}"), basename.data(), num++).c_str();
     } while (manager->GetLayer(name));
     return name;
   }
@@ -2499,7 +2261,7 @@ static TSTR makeMangledLayerName(TSTR name) // by val
   unsigned num = 1;
   do
   {
-    name.printf(_T("%s_%03d%s"), basename, num++, suffix);
+    name = std::format(_T("{}_{:03}{}"), basename.data(), num++, suffix.data()).c_str();
   } while (manager->GetLayer(name));
   return name;
 }
@@ -2522,12 +2284,9 @@ static ResolvedLayer resolveLayerNameCollision(const TSTR &layerName)
   // no collision, just create a new layer
   if (!layer)
   {
-    layer = manager->CreateLayer(const_cast<MSTR &>(layerName)); // MAX2016 has non-const here
+    layer = manager->CreateLayer(layerName);
     if (layer)
-    {
-      manager->AddLayer(layer);
-      manager->SetCurrentLayer(layer->GetName());
-    }
+      manager->SetCurrentLayer(layerName);
     return ResolvedLayer(layer, layerName);
   }
 
@@ -2538,10 +2297,10 @@ static ResolvedLayer resolveLayerNameCollision(const TSTR &layerName)
 
     ILayerProperties *layerProp = (ILayerProperties *)layer->GetInterface(LAYERPROPERTIES_INTERFACE);
     assert(layerProp);
-    Tab<INode *> nodes;
+    INodeTab nodes;
     layerProp->Nodes(nodes);
-    for (int i = 0; i < nodes.Count(); ++i)
-      deleteNode(nodes[i]);
+    if (nodes.Count())
+      GetCOREInterface13()->DeleteNodes(nodes);
 
     return ResolvedLayer(layer, layerName);
   }
@@ -2550,24 +2309,19 @@ static ResolvedLayer resolveLayerNameCollision(const TSTR &layerName)
   TSTR mangledLayerName = makeMangledLayerName(layerName);
   layer = manager->CreateLayer(mangledLayerName);
   if (layer)
-  {
-    manager->AddLayer(layer);
-    manager->SetCurrentLayer(layer->GetName());
-  }
+    manager->SetCurrentLayer(mangledLayerName);
   return ResolvedLayer(layer, mangledLayerName);
 }
 
-void DagImp::makeHierLayer(const std::vector<TSTR> &fnames, ImpInterface *ii, Interface *ip, bool nomsg)
+void DagImp::makeHierLayer(const std::vector<fs::path> &fnames, ImpInterface *ii, Interface *ip, bool nomsg)
 {
-  static const int dag_length = 4; // ".dag"
   static const int ext_length = 6; // ".lodNN"
 
   ILayerManager *manager = GetCOREInterface13()->GetLayerManager();
 
-  for (const TSTR &fn : fnames)
+  for (const fs::path &fn : fnames)
   {
-    TSTR basename = extract_basename(fn);
-    TSTR layerName = basename.Substr(0, basename.length() - dag_length);
+    TSTR layerName = fn.stem().c_str();
 
     ResolvedLayer resolved = resolveLayerNameCollision(layerName);
     ILayer *subLayer = resolved.layer;
@@ -2590,78 +2344,66 @@ void DagImp::makeHierLayer(const std::vector<TSTR> &fnames, ImpInterface *ii, In
 
     manager->SetCurrentLayer(layerName);
 
-    if (!doImportOne(fn, ii, ip, nomsg))
+    if (!doImportOne(fn.c_str(), ii, ip, nomsg))
     {
       manager->DeleteLayer(layerName);
       if (rootLayerJustCreated)
         manager->DeleteLayer(root_layerName);
-      DebugPrint(_T("import error '%s'\n"), fn);
+      DebugPrint(_T("import error '%s'\n"), fn.c_str());
     }
   }
-  manager->SetCurrentLayer();
 }
 
-void DagImp::makeHierLayer(const TSTR &fname, ImpInterface *ii, Interface *ip, bool nomsg)
+void DagImp::makeHierLayer(const fs::path &fname, ImpInterface *ii, Interface *ip, bool nomsg)
 {
-  static const int dag_length = 4; // ".dag"
-
   ILayerManager *manager = GetCOREInterface13()->GetLayerManager();
 
-  TSTR basename = extract_basename(fname);
-  TSTR layerName = basename.Substr(0, basename.length() - dag_length);
+  TSTR layerName = fname.stem().c_str();
 
   ResolvedLayer resolved = resolveLayerNameCollision(layerName);
-  ILayer *rootLayer = resolved.layer;
   layerName = resolved.name;
 
-  if (!doImportOne(fname, ii, ip, nomsg))
+  if (!doImportOne(fname.c_str(), ii, ip, nomsg))
   {
     manager->DeleteLayer(layerName);
-    DebugPrint(_T("import error '%s'\n"), fname);
+    DebugPrint(_T("import error '%s'\n"), fname.c_str());
   }
-
-  manager->SetCurrentLayer();
 }
 
-int DagImp::doHierImport(const TSTR &fname, ImpInterface *ii, Interface *ip, bool nomsg)
+int DagImp::doHierImport(const fs::path &fname, ImpInterface *ii, Interface *ip, bool nomsg)
 {
   // show UI even on drag&drop
   if (!nonInteractive)
     nomsg = false;
 
-  TSTR dir, filename, ext;
-  SplitFilename(fname, &dir, &filename, &ext);
-  filename.Append(ext);
+  const fs::path dirPath = fname.parent_path();
 
   // investigate all files to hilite UI options
-  TSTR basename;
+  std::wstring basename_re;
   bool exact_match;
-  TSTR rex = filenameToRegex(filename, true, true, true, true, basename, exact_match);
-  std::vector<TSTR> files = files_include_re(glob(dir, searchInSubfolders), rex);
+  std::wstring rex = filenameToRegex(fname.filename(), true, true, true, true, true, basename_re, exact_match);
+  std::vector<fs::path> files = files_include_re(glob(dirPath, searchInSubfolders), rex);
 
-  TSTR lod_re;
-  lod_re.printf(_T("^%s\\.lod\\d\\d\\.dag$"), basename);
+  std::wstring lod_re = std::format(L"^{}\\.lod\\d\\d\\.dag$", basename_re);
   detected.lod = probe_match_re(files, lod_re);
 
-  TSTR dmg_re;
-  dmg_re.printf(_T("^%s_dmg\\.lod\\d\\d\\.dag$"), basename);
+  std::wstring dmg_re = std::format(L"^{}_dmg\\.lod\\d\\d\\.dag$", basename_re);
   detected.dmg = probe_match_re(files, dmg_re);
 
-  TSTR destr_re;
-  destr_re.printf(_T("^%s_destr\\.lod00\\.dag$"), basename);
+  std::wstring destr_re = std::format(L"^{}_destr\\.lod\\d\\d\\.dag$", basename_re);
   detected.destr = probe_match_re(files, destr_re);
 
-  TSTR dp_re;
-  dp_re.printf(_T("^%s_dp_\\d\\d\\.lod\\d\\d\\.dag$"), basename);
+  std::wstring dp_re = std::format(L"^{}_dp_\\d\\d\\.lod\\d\\d\\.dag$", basename_re);
   detected.dp = probe_match_re(files, dp_re);
 
-  TSTR dp_dmg_re;
-  dp_dmg_re.printf(_T("^%s_dp_\\d\\d_dmg\\.lod\\d\\d\\.dag$"), basename);
+  std::wstring dp_dmg_re = std::format(L"^{}_dp_\\d\\d_dmg\\.lod\\d\\d\\.dag$", basename_re);
   detected.dmg |= probe_match_re(files, dp_dmg_re);
 
-  TSTR dp_destr_re;
-  dp_destr_re.printf(_T("^%s_dp_\\d\\d_destr\\.lod\\d\\d\\.dag$"), basename);
+  std::wstring dp_destr_re = std::format(L"^{}_dp_\\d\\d_destr\\.lod\\d\\d\\.dag$", basename_re);
   detected.destr |= probe_match_re(files, dp_destr_re);
+
+  std::wstring dm_re = std::format(L"^{}_dm\\.dag$", basename_re);
+  detected.dm = probe_match_re(files, dm_re);
 
   if (!nomsg)
   {
@@ -2672,21 +2414,20 @@ int DagImp::doHierImport(const TSTR &fname, ImpInterface *ii, Interface *ip, boo
   if (DagImp::useLegacyImport)
     return 0;
 
-  // get proper list of files based on actual user's choice
-  rex = filenameToRegex(filename, checked.dp, checked.lod, checked.destr, checked.dmg, basename, exact_match);
-  files = files_include_re(glob(dir, searchInSubfolders), rex);
-
   if (exact_match)
   {
-    if (files.size())
-    {
-      makeHierLayer(files[0], ii, ip, nomsg);
-      return 1;
-    }
-    return 0;
+    std::error_code ec;
+    if (!fs::is_regular_file(fname, ec))
+      return 0;
+    makeHierLayer(fname, ii, ip, nomsg);
+    return 1;
   }
 
-  std::vector<TSTR> layer_files;
+  // get proper list of files based on actual user's choice
+  rex = filenameToRegex(fname.filename(), checked.dp, checked.lod, checked.destr, checked.dmg, checked.dm, basename_re, exact_match);
+  files = files_include_re(glob(dirPath, searchInSubfolders), rex);
+
+  std::vector<fs::path> layer_files;
   layer_files.reserve(32);
 
   if (checked.lod)
@@ -2694,10 +2435,14 @@ int DagImp::doHierImport(const TSTR &fname, ImpInterface *ii, Interface *ip, boo
   else
   {
     layer_files.clear();
-    layer_files.push_back(dir + TSTR(_T("\\")) + filename);
+    layer_files.push_back(fname);
   }
   if (!layer_files.empty())
     makeHierLayer(layer_files, ii, ip, nomsg);
+
+  layer_files = files_include_re(files, dm_re);
+  if (!layer_files.empty())
+    makeHierLayer(layer_files.front(), ii, ip, nomsg);
 
   layer_files = files_include_re(files, dmg_re);
   if (!layer_files.empty())
@@ -2709,19 +2454,17 @@ int DagImp::doHierImport(const TSTR &fname, ImpInterface *ii, Interface *ip, boo
 
   for (int i = 0; i < 100; ++i)
   {
-    TSTR re;
-
-    re.printf(_T("^%s_dp_%02d.lod\\d\\d\\.dag$"), basename, i);
+    std::wstring re = std::format(L"^{}_dp_{:02}\\.lod\\d\\d\\.dag$", basename_re, i);
     layer_files = files_include_re(files, re);
     if (!layer_files.empty())
       makeHierLayer(layer_files, ii, ip, nomsg);
 
-    re.printf(_T("^%s_dp_%02d_dmg.lod\\d\\d\\.dag$"), basename, i);
+    re = std::format(L"^{}_dp_{:02}_dmg\\.lod\\d\\d\\.dag$", basename_re, i);
     layer_files = files_include_re(files, re);
     if (!layer_files.empty())
       makeHierLayer(layer_files, ii, ip, nomsg);
 
-    re.printf(_T("^%s_dp_%02d_destr.lod\\d\\d\\.dag$"), basename, i);
+    re = std::format(L"^{}_dp_{:02}_destr\\.lod\\d\\d\\.dag$", basename_re, i);
     layer_files = files_include_re(files, re);
     if (!layer_files.empty())
       makeHierLayer(layer_files, ii, ip, nomsg);
@@ -2733,37 +2476,27 @@ int DagImp::doHierImport(const TSTR &fname, ImpInterface *ii, Interface *ip, boo
 
 int DagImp::doLegacyImport(const TCHAR *fname, ImpInterface *ii, Interface *ip, bool nomsg)
 {
-  Tab<TCHAR *> fnames;
+  std::vector<std::wstring> fnames;
 
   if (!find_co_files(fname, fnames))
     return doImportOne(fname, ii, ip, nomsg);
 
-  TCHAR buf[1024];
   int fn_len = (int)_tcslen(fname);
-  _stprintf(buf, _T("We detected that %s%s\nhas %d linked DAGs.\nLoad them at once into separate layers?"),
-    fn_len > 64 ? _T("...") : _T(""), fn_len > 64 ? fname + fn_len - 64 : fname, fnames.Count() / 2 - 1);
+  std::wstring buf = std::format(_T("We detected that {}{}\nhas {} linked DAGs.\nLoad them at once into separate layers?"),
+    fn_len > 64 ? _T("...") : _T(""), fn_len > 64 ? fname + fn_len - 64 : fname, (int)fnames.size() / 2 - 1);
   if ((nomsg && !DagImp::separateLayers) ||
-      (!nomsg && MessageBox(GetFocus(), buf, _T("Import layered DAGs"), MB_YESNO | MB_ICONQUESTION) != IDYES))
-  {
-    for (int i = 0; i < fnames.Count(); i++)
-      free(fnames[i]);
+      (!nomsg && MessageBox(GetFocus(), buf.c_str(), _T("Import layered DAGs"), MB_YESNO | MB_ICONQUESTION) != IDYES))
     return doImportOne(fname, ii, ip, nomsg);
-  }
 
   ILayerManager *manager = GetCOREInterface13()->GetLayerManager();
   manager->Reset();
-  for (int i = 0; i < fnames.Count(); i += 2)
+  for (size_t i = 0; i < fnames.size(); i += 2)
   {
-    TSTR layer_nm(fnames[i + 1]);
-    manager->AddLayer(manager->CreateLayer(layer_nm));
+    TSTR layer_nm(fnames[i + 1].data());
+    manager->CreateLayer(layer_nm);
     manager->SetCurrentLayer(layer_nm);
-    free(fnames[i + 1]);
-    if (!doImportOne(fnames[i], ii, ip, nomsg))
-    {
-      free(fnames[i]);
+    if (!doImportOne(fnames[i].data(), ii, ip, nomsg))
       return 0;
-    }
-    free(fnames[i]);
   }
   manager->SetCurrentLayer();
   return 1;
@@ -2776,22 +2509,19 @@ int DagImp::doBatchImport(const TSTR & /* ignored */, ImpInterface *ii, Interfac
   static std::wregex re(_T("^.*\\.lod\\d\\d\\.dag$"), std::regex_constants::icase);
 
   int res = 1;
-  Categories bkChecked = checked;
-  checked.enableAll();
 
   Autotoggle guard(nonInteractive);
 
-  std::vector<TSTR> tmp_files;
+  std::vector<fs::path> tmp_files;
   tmp_files.reserve(1);
 
   importedFiles.clear();
-  for (const TSTR &fname : batchImportFiles)
+  for (const fs::path &fname : batchImportFiles)
   {
     if (reimportExisting && isNamesake(fname))
       continue;
 
-    std::wstring fn = fname.data();
-    if (std::regex_match(fn, re))
+    if (std::regex_match(fname.wstring(), re))
     {
       tmp_files.clear();
       tmp_files.push_back(fname);
@@ -2801,7 +2531,6 @@ int DagImp::doBatchImport(const TSTR & /* ignored */, ImpInterface *ii, Interfac
       makeHierLayer(fname, ii, ip, true);
   }
 
-  checked = bkChecked;
   importedFiles.clear();
   batchImportFiles.clear();
   return res;
@@ -2809,7 +2538,7 @@ int DagImp::doBatchImport(const TSTR & /* ignored */, ImpInterface *ii, Interfac
 
 int DagImp::doMaxscriptImport(const TSTR &fname, ImpInterface *ii, Interface *ip, bool nomsg)
 {
-  return doHierImport(fname, ii, ip, nomsg);
+  return doHierImport(fname.data(), ii, ip, nomsg);
 }
 
 //
@@ -2817,8 +2546,6 @@ int DagImp::doMaxscriptImport(const TSTR &fname, ImpInterface *ii, Interface *ip
 //
 int DagImp::DoImport(const TCHAR *fname, ImpInterface *ii, Interface *ip, BOOL nomsg)
 {
-#if defined(MAX_RELEASE_R13) && MAX_RELEASE >= MAX_RELEASE_R13
-
   if (useLegacyImport)
     return doLegacyImport(fname, ii, ip, nomsg);
 
@@ -2843,25 +2570,20 @@ int DagImp::DoImport(const TCHAR *fname, ImpInterface *ii, Interface *ip, BOOL n
     return doLegacyImport(fname, ii, ip, nomsg);
 
   return res;
-
-#else
-  return doImportOne(fname, ii, ip, nomsg);
-#endif
 }
 
-bool DagImp::isNamesake(const TSTR &fname) const
+bool DagImp::isNamesake(const fs::path &fname) const
 {
-  const TSTR basename = extract_basename(fname);
+  const fs::path basename = fname.filename();
 
-  auto it = std::find_if(importedFiles.begin(), importedFiles.end(),
-    [&basename](const ImportedFile &imp) { return imp.equalBasename(basename); });
+  auto it = std::ranges::find_if(importedFiles, [&basename](const ImportedFile &imp) { return imp.equalBasename(basename); });
 
   if (it != importedFiles.end())
   {
-    if (fname.data() != it->fullpath)
+    if (fname != it->fullpath)
     {
-      DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning, _T("ignore duplicated \"%s\" (already have \"%s\")\r\n"), fname,
-        it->fullpath.data());
+      DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning, _T("ignore duplicated \"%s\" (already have \"%s\")\r\n"),
+        fname.c_str(), it->fullpath.c_str());
       DagorLogWindow::show();
     }
     return true;
@@ -2883,9 +2605,9 @@ int DagImp::doImportOne(const TCHAR *fname, ImpInterface *ii, Interface *ip, BOO
   DebugPrint(_T("import...\n"));
 
   cleanup();
-  Tab<SkinData *> skin_data;
+  std::vector<SkinData> skin_data;
   Tab<NodeId> node_id;
-  SplitFilename(TSTR(fname), NULL, &scene_name, NULL);
+  scene_name = fs::path(fname).stem().c_str();
   FILE *h = _tfopen(fname, _T("rb"));
   if (!h)
   {
@@ -2928,23 +2650,14 @@ int DagImp::doImportOne(const TCHAR *fname, ImpInterface *ii, Interface *ip, BOO
     {
       int n = 0;
       rd(&n, 2);
-      tex.SetCount(n);
+      tex.resize(n);
       for (int i = 0; i < n; ++i)
       {
         int l = 0;
         rd(&l, 1);
 
-        tex[i] = ReadCharString(l, h);
-        if (!tex[i])
+        if (!read_char_string(l, h, tex[i]))
           goto read_err;
-
-        /*tex[i] = (TCHAR *) malloc(l + 1);
-        assert(tex[i]);
-        if (l)
-        {
-          rd(tex[i], l);
-        }
-        tex[i][l] = 0;*/
       }
     }
     else if (blk_type() == DAG_MATER)
@@ -2952,100 +2665,17 @@ int DagImp::doImportOne(const TCHAR *fname, ImpInterface *ii, Interface *ip, BOO
       ImpMat m;
       int l = 0;
       rd(&l, 1);
-      if (l > 0)
-      {
-        /* m.name = (TCHAR *) malloc(l + 1);
-         assert(m.name);
-         rd(m.name, l);
-         m.name[l] = 0;*/
-
-        m.name = ReadCharString(l, h);
-        if (!m.name)
-          goto read_err;
-      }
+      if (!read_char_string(l, h, m.name))
+        goto read_err;
       rd(&m.m, sizeof(m.m));
       l = 0;
       rd(&l, 1);
-      if (l > 0)
-      {
-        /* m.clsname = (TCHAR *) malloc(l + 1);
-         assert(m.clsname);
-         rd(m.clsname, l);
-         m.clsname[l] = 0;*/
-        m.clsname = ReadCharString(l, h);
-        if (!m.clsname)
-          goto read_err;
-      }
+      if (!read_char_string(l, h, m.clsname))
+        goto read_err;
       l = blk_rest();
-      if (l > 0)
-      {
-        /* m.script = (TCHAR *) malloc(l + 1);
-         assert(m.script);
-         rd(m.script, l);
-         m.script[l] = 0;*/
-
-        m.script = ReadCharString(l, h);
-        if (!m.script)
-          goto read_err;
-      }
-      m.mtl = NULL;
-      mat.Append(1, &m);
-    }
-    else if (blk_type() == DAG_KEYLABELS)
-    {
-      int n = 0;
-      rd(&n, 2);
-      keylabel.SetCount(n);
-      int i;
-      for (i = 0; i < n; ++i)
-        keylabel[i] = NULL;
-      for (i = 0; i < n; ++i)
-      {
-        int l = 0;
-        rd(&l, 1);
-
-        /*char *s = (char *) malloc(l + 1);
-        assert(s);
-        rd(s, l); s[l] = 0;
-        keylabel[i] = s;*/
-
-        keylabel[i] = ReadCharString(l, h);
-        if (!keylabel[i])
-          goto read_err;
-      }
-    }
-    else if (blk_type() == DAG_NOTETRACK)
-    {
-      int n = blk_rest() / sizeof(DagNoteKey);
-      if (n > 0)
-      {
-        DagNoteKey *nk = (DagNoteKey *)malloc(n * sizeof(DagNoteKey));
-        assert(nk);
-        rd(nk, n * sizeof(*nk));
-        /*
-        ntrack.Append(1,&nk);
-        ntrack_knum.Append(1,&n);
-        */
-        DefNoteTrack *nt = (DefNoteTrack *)NewDefaultNoteTrack();
-        if (nt)
-        {
-          for (int i = 0; i < n; ++i)
-          {
-            const TCHAR *nm = _T("");
-            if (nk[i].id < keylabel.Count())
-              nm = keylabel[nk[i].id];
-            NoteKey *k = new NoteKey(nk[i].t, nm);
-            nt->keys.Append(1, &k);
-          }
-        }
-        ntrack.Append(1, &nt);
-        free(nk);
-      }
-      else
-      {
-        DefNoteTrack *nt = (DefNoteTrack *)NewDefaultNoteTrack();
-        ntrack.Append(1, &nt);
-      }
+      if (!read_char_string(l, h, m.script))
+        goto read_err;
+      mat.push_back(m);
     }
     else if (blk_type() == DAG_NODE)
     {
@@ -3061,22 +2691,29 @@ int DagImp::doImportOne(const TCHAR *fname, ImpInterface *ii, Interface *ip, BOO
 #undef eblk
   fclose(h);
 
-#if MAX_RELEASE >= 12000
-  for (int i = 0; i < skin_data.Count(); i++)
+  for (size_t i = 0; i < skin_data.size(); i++)
   {
-    SkinData &sd = *skin_data[i];
-    Modifier *skinMod = (Modifier *)CreateInstance(OSM_CLASS_ID, SKIN_CLASSID);
-    GetCOREInterface12()->AddModifier(*sd.skinNode, *skinMod);
+    SkinData &sd = skin_data[i];
 
-    ISkin *iskin = (ISkin *)skinMod->GetInterface(I_SKIN);
-    ISkinImportData *iskinImport = (ISkinImportData *)skinMod->GetInterface(I_SKINIMPORTDATA);
-    assert(iskin);
-    assert(iskinImport);
+    // dagfmt.h: "numv should be equal to number of mesh vertexes", and AddWeights() below indexes
+    // the node's object with it. The object cannot be judged while the bone block is read: a later
+    // block of the same node replaces it, and in->Reference() keeps the last one.
+    Object *nodeObj = sd.skinNode->GetObjectRef();
+    const int nodeVerts = (nodeObj && nodeObj->IsSubClassOf(Class_ID(TRIOBJ_CLASS_ID, 0))) ? ((TriObject *)nodeObj)->mesh.numVerts : 0;
+    if (sd.numvert != nodeVerts)
+    {
+      DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning,
+        L"%s: '%s': skin covers %d vertices but the object has %d, skinning skipped\r\n", scene_name.data(), sd.skinNode->GetName(),
+        sd.numvert, nodeVerts);
+      DagorLogWindow::show();
+      continue;
+    }
 
+    // a bone that is not in the scene takes its share of every vertex weight with it, and a skin
+    // that deforms wrong is worse than none, so the whole skin goes rather than that one bone
     Tab<INode *> bn;
-    Tab<float> wt;
     bn.SetCount(sd.numb);
-    wt.SetCount(sd.numb);
+    bool bonesResolved = true;
     for (int j = 0; j < bn.Count(); j++)
     {
       bn[j] = NULL;
@@ -3086,24 +2723,73 @@ int DagImp::doImportOne(const TCHAR *fname, ImpInterface *ii, Interface *ip, BOO
           bn[j] = node_id[k].node;
           break;
         }
-      assert(bn[j]);
-      iskinImport->AddBoneEx(bn[j], j + 1 == sd.numb);
+      if (!bn[j])
+      {
+        DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning,
+          L"%s: '%s': skin refers to missing bone %04X, skinning skipped\r\n", scene_name.data(), sd.skinNode->GetName(),
+          sd.bones[j].id);
+        DagorLogWindow::show();
+        bonesResolved = false;
+        break;
+      }
     }
+    if (!bonesResolved)
+      continue;
 
-    for (int j = 0; j < sd.numvert; j++)
+    // the interface is taken before the modifier is attached, so a refusal leaves nothing on the node
+    Modifier *skinMod = (Modifier *)CreateInstance(OSM_CLASS_ID, SKIN_CLASSID);
+    ISkinImportData *iskinImport = skinMod ? (ISkinImportData *)skinMod->GetInterface(I_SKINIMPORTDATA) : NULL;
+    if (!iskinImport)
     {
-      memcpy(&wt[0], &sd.wt[j * wt.Count()], wt.Count() * sizeof(float));
-      iskinImport->AddWeights(sd.skinNode, j, bn, wt);
+      DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning, L"%s: '%s': the skin modifier is unavailable, skinning skipped\r\n",
+        scene_name.data(), sd.skinNode->GetName());
+      DagorLogWindow::show();
+      if (skinMod)
+        skinMod->MaybeAutoDelete();
+      continue;
+    }
+    if (GetCOREInterface12()->AddModifier(*sd.skinNode, *skinMod) != Interface7::kRES_SUCCESS)
+    {
+      DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning,
+        L"%s: '%s': the skin modifier does not apply to the object, skinning skipped\r\n", scene_name.data(), sd.skinNode->GetName());
+      DagorLogWindow::show();
+      skinMod->MaybeAutoDelete();
+      continue;
     }
 
-    delete skin_data[i];
+    // AddWeights() indexes the bone table, so one bone the modifier refuses reopens the hole the
+    // resolution pass above closed, and the skin has to come off the node again
+    bool skinFilled = true;
+    std::wstring skinErr;
+    for (int j = 0; j < bn.Count() && skinFilled; j++)
+    {
+      skinFilled = iskinImport->AddBoneEx(bn[j], j + 1 == sd.numb);
+      if (!skinFilled)
+        skinErr = std::format(L"the skin modifier did not take bone {:04X}", sd.bones[j].id);
+    }
+
+    Tab<float> wt;
+    wt.SetCount(sd.numb);
+    for (int j = 0; j < sd.numvert && skinFilled; j++)
+    {
+      for (int b = 0; b < sd.numb; b++)
+        wt[b] = sd.wt[b * sd.numvert + j];
+      skinFilled = iskinImport->AddWeights(sd.skinNode, j, bn, wt);
+      if (!skinFilled)
+        skinErr = std::format(L"the skin modifier did not take the weights of vertex {}", j);
+    }
+
+    if (!skinFilled)
+    {
+      DagorLogWindow::addToLog(DagorLogWindow::LogLevel::Warning, L"%s: '%s': %s, skinning skipped\r\n", scene_name.data(),
+        sd.skinNode->GetName(), skinErr.c_str());
+      DagorLogWindow::show();
+      GetCOREInterface12()->DeleteModifier(*sd.skinNode, *skinMod);
+    }
   }
-#endif
 
   DebugPrint(_T("clean up\n"));
   cleanup();
-  //  collapse_materials(ip);
-  //  DebugPrint(_T("collapsed\n"));
   convertnew(ip, true);
 
   DebugPrint(_T("import ok\n"));
@@ -3114,7 +2800,7 @@ int DagImp::doImportOne(const TCHAR *fname, ImpInterface *ii, Interface *ip, BOO
 read_err:
   DebugPrint(_T("read error at %X of %s\n"), ftell(h), scene_name.data());
   fclose(h);
-  cleanup(1);
+  cleanup();
   if (!nomsg)
     ip->DisplayTempPrompt(GetString(IDS_FILE_READ_ERR), ERRMSG_DELAY);
   return 0;
@@ -3131,11 +2817,11 @@ class IDagorImportUtil : public FPStaticInterface
 {
 public:
   DECLARE_DESCRIPTOR(IDagorImportUtil)
-  BEGIN_FUNCTION_MAP FN_9(fun_import, TYPE_BOOL, import_dag, TYPE_STRING, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL,
-    TYPE_BOOL, TYPE_BOOL, TYPE_BOOL) END_FUNCTION_MAP
+  BEGIN_FUNCTION_MAP FN_10(fun_import, TYPE_BOOL, import_dag, TYPE_STRING, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL,
+    TYPE_BOOL, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL) END_FUNCTION_MAP
 
     BOOL import_dag(const TCHAR *fn, bool separateLayers, bool suppressPrompts, bool renameLayerCollision, bool useLegacyImport,
-      bool importLod, bool importDestr, bool importDp, bool importDmg)
+      bool importLod, bool importDestr, bool importDp, bool importDmg, bool importDm)
   {
     DagImp::Categories bkChecked = DagImp::checked;
     bool bkLegacy = DagImp::useLegacyImport;
@@ -3150,6 +2836,7 @@ public:
     DagImp::checked.destr = importDestr;
     DagImp::checked.dp = importDp;
     DagImp::checked.dmg = importDmg;
+    DagImp::checked.dm = importDm;
 
     Autotoggle guard(DagImp::nonInteractive);
     BOOL result = GetCOREInterface()->ImportFromFile(fn, suppressPrompts);
@@ -3163,17 +2850,23 @@ public:
   }
 };
 
-static IDagorImportUtil dagorimputiliface(Interface_ID(0x20906172, 0x435c11e0), _T("dagorImport"), IDS_DAGOR_IMPORT_IFACE, NULL,
-  FP_CORE, fun_import, _T("import"), -1, TYPE_BOOL, 0, 9, _T("filename"), -1, TYPE_STRING,
+// clang-format off
+static IDagorImportUtil dagorimputiliface(Interface_ID(0x20906172, 0x435c11e0),
+  _T("dagorImport"), IDS_DAGOR_IMPORT_IFACE, NULL, FP_CORE, fun_import,
+  _T("import"), -1, TYPE_BOOL, 0,
+  10,
+  _T("filename"), -1, TYPE_STRING,
   // f_keyArgDefault marks an optional keyArg param. The value
   // after that is its default value.
-  _T("separateLayers"), -1, TYPE_BOOL, f_keyArgDefault, true, _T("suppressPrompts"), -1, TYPE_BOOL, f_keyArgDefault, false,
-  _T("renameLayerCollision"), -1, TYPE_BOOL, f_keyArgDefault, true, _T("useLegacyImport"), -1, TYPE_BOOL, f_keyArgDefault, true,
-  _T("importLod"), -1, TYPE_BOOL, f_keyArgDefault, true, _T("importDestr"), -1, TYPE_BOOL, f_keyArgDefault, true, _T("importDp"), -1,
-  TYPE_BOOL, f_keyArgDefault, true, _T("importDmg"), -1, TYPE_BOOL, f_keyArgDefault, true,
-#if defined(MAX_RELEASE_R15) && MAX_RELEASE >= MAX_RELEASE_R15
+  _T("separateLayers"), -1, TYPE_BOOL, f_keyArgDefault, true,
+  _T("suppressPrompts"), -1, TYPE_BOOL, f_keyArgDefault, false,
+  _T("renameLayerCollision"), -1, TYPE_BOOL, f_keyArgDefault, true,
+  _T("useLegacyImport"), -1, TYPE_BOOL, f_keyArgDefault, true,
+  _T("importLod"), -1, TYPE_BOOL, f_keyArgDefault, true,
+  _T("importDestr"), -1, TYPE_BOOL, f_keyArgDefault, true,
+  _T("importDp"), -1, TYPE_BOOL, f_keyArgDefault, true,
+  _T("importDmg"), -1, TYPE_BOOL, f_keyArgDefault, true,
+  _T("importDm"), -1, TYPE_BOOL, f_keyArgDefault, true,
   p_end
-#else
-  end
-#endif
 );
+// clang-format on

@@ -19,7 +19,9 @@ enum class ResourceType : uint8_t
   Invalid,
   Texture,
   Buffer,
-  Blob
+  Blob,
+
+  MAX_VAL = Blob,
 };
 
 // Tags used for validating resource types on requests
@@ -34,6 +36,12 @@ inline bool resourceTagsMatch(ResourceSubtypeTag fst, ResourceSubtypeTag snd)
   return fst == ResourceSubtypeTag::Unknown || snd == ResourceSubtypeTag::Unknown || fst == snd;
 }
 
+/// Placeholder type for blob requests where the concrete type is not needed.
+/// Use .blob() without a template parameter when you only need bindToShaderVar/bindAsView/bindAsProj.
+/// Use .blob<T>() when you need .handle() to get a typed handle.
+struct AnyBlob
+{};
+
 namespace detail
 {
 template <class T>
@@ -44,6 +52,12 @@ template <class T>
 inline ResourceSubtypeTag tag_for()
 {
   return static_cast<ResourceSubtypeTag>(eastl::bit_cast<uintptr_t>(&detail::tagger<T>));
+}
+
+template <>
+inline ResourceSubtypeTag tag_for<AnyBlob>()
+{
+  return ResourceSubtypeTag::Unknown;
 }
 
 } // namespace dafg

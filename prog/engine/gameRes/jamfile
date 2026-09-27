@@ -31,7 +31,10 @@ Sources =
   collisionDebug.cpp
   collisionFactory.cpp
   collisionGameRes.cpp
-  collisionGameRes_avx.cpp
+  collisionGameResLoad.cpp
+  collisionResourceBuilder.cpp
+  collisionResourceInstance.cpp
+  collisionTraceOOL.cpp
 
   stubGameResFactories.cpp
 ;
@@ -43,6 +46,7 @@ AddIncludes =
 
 UseProgLibs +=
   3rdPartyLibs/eastl
+  engine/daBVH
 ;
 
 if $(PlatformSpec) = clang {
@@ -54,6 +58,7 @@ if $(PlatformSpec) in clang gcc && $(PlatformArch) in x86 x86_64 {
     switch $(s) {
       case *_avx512.c* : opt on $(s) = -mavx -mavx2 -mavx512f ;
       case *_avx2.c*   : opt on $(s) = -mavx -mavx2 ;
+      case *_f16c.c*   : opt on $(s) = -mavx -mf16c ;
       case *_avx.c*    : opt on $(s) = -mavx ;
       case *_sse.c*    : opt on $(s) = -msse -msse2 -msse3 ;
     }
@@ -63,13 +68,13 @@ if $(PlatformSpec) in clang gcc && $(PlatformArch) in x86 x86_64 {
     switch $(s) {
       case *_avx512.c* : opt on $(s) = /arch:AVX512 ;
       case *_avx2.c*   : opt on $(s) = /arch:AVX2 ;
+      case *_f16c.c*   : opt on $(s) = /arch:AVX2 ;
       case *_avx.c*    : opt on $(s) = /arch:AVX ;
     }
   }
 }
 if $(PlatformSpec) in clang && $(PlatformArch) in e2k {
   opt on collisionGameRes.cpp += -Wno-pass-failed ;
-  opt on collisionGameRes_avx.cpp += -Wno-pass-failed ;
 }
 
 # Disable WPO to workaround `collisionGameRes.cpp(1350) : fatal error C1001: Internal compiler error.`

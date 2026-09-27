@@ -21,6 +21,7 @@
 #include "dargDebugUtils.h"
 #include "robjMask.h"
 #include "robjDasCanvas.h"
+#include "robjShader.h"
 #include "canvasDraw.h"
 
 #include <videoPlayer/dag_videoPlayer.h>
@@ -176,10 +177,10 @@ bool RobjParamsText::load(const Element *elem)
   if (password.GetType() == OT_BOOL)
     passChar = L'*';
   else if (password.GetType() == OT_INTEGER)
-    passChar = char(password.Cast<SQInteger>());
+    passChar = wchar_t(password.Cast<SQInteger>());
   else if (password.GetType() == OT_STRING)
   {
-    const char *str = password.GetVar<const SQChar *>().value;
+    const char *str = password.GetVar<const char *>().value;
     Tab<wchar_t> buf(framemem_ptr());
     buf.resize(3);
     utf8_to_wcs_ex(str, get_next_char_size(str), buf.data(), buf.size());
@@ -204,6 +205,7 @@ bool RobjParamsText::load(const Element *elem)
 
   overflowX = (TextOverflow)props.getInt(elem->csk->textOverflowX, TOVERFLOW_CLIP);
   ellipsis = props.getBool(elem->csk->ellipsis, true);
+
   discard_text_cache(elem->robjParams);
   return true;
 }
@@ -271,9 +273,6 @@ void RenderObjectText::render(StdGuiRender::GuiContext &ctx, const Element *elem
 
   E3DCOLOR color = color_apply_mods(params->color, render_state.opacity, params->brightness);
 
-  const ScreenCoord &sc = elem->screenCoord;
-  scenerender::setTransformedViewPort(ctx, sc.screenPos, sc.screenPos + sc.size, render_state);
-
   ctx.set_color(color);
   ctx.reset_textures();
 
@@ -288,6 +287,10 @@ void RenderObjectText::render(StdGuiRender::GuiContext &ctx, const Element *elem
   int ascent = StdGuiRender::get_font_ascent(fctx);
   int descent = StdGuiRender::get_font_descent(fctx);
   int textLength = elem->props.text.length();
+
+  const ScreenCoord &sc = elem->screenCoord;
+  float vpBottom = max((float)(sc.screenPos.y + sc.size.y), (float)(sc.screenPos.y + ascent + descent));
+  scenerender::setTransformedViewPort(ctx, sc.screenPos, Point2(sc.screenPos.x + sc.size.x, vpBottom), render_state);
 
   if (params->fontFx != FFT_NONE)
     ctx.set_draw_str_attr(params->fontFx, params->fxOffsX, params->fxOffsY,
@@ -306,7 +309,17 @@ void RenderObjectText::render(StdGuiRender::GuiContext &ctx, const Element *elem
     if (const char *e = (const char *)memchr(elem->props.text.c_str(), 0, textLength))
       textLength = e - elem->props.text.c_str();
 
-    wchar_t *textU16 = (wchar_t *)alloca((textLength + 2) * sizeof(wchar_t));
+    constexpr int stackTextLimit = 1024;
+    Tab<wchar_t> heapTextU16(framemem_ptr());
+    wchar_t *textU16;
+    if (textLength + 2 <= stackTextLimit)
+      textU16 = (wchar_t *)alloca((textLength + 2) * sizeof(wchar_t));
+    else
+    {
+      // prevent stack overflow due to a pathological text
+      heapTextU16.resize(textLength + 2);
+      textU16 = heapTextU16.data();
+    }
     int used = utf8_to_wcs_ex(elem->props.text.c_str(), textLength, textU16, textLength + 1);
     G_ASSERT(used <= textLength);
     textU16[used] = 0;
@@ -320,10 +333,10 @@ void RenderObjectText::render(StdGuiRender::GuiContext &ctx, const Element *elem
     if (elem->layout.hAlign == ALIGN_CENTER)
       textOverflowMode = TOVERFLOW_CLIP; // other modes are currently disabled for centered text (TODO)
 
-    real ellipsisWidth = params->ellipsis ? StdGuiRender::get_str_bbox_u(ellipsisUtf16, 1, fctx).width().x : 0;
+    float ellipsisWidth = params->ellipsis ? StdGuiRender::get_str_bbox_u(ellipsisUtf16, 1, fctx).width().x : 0;
     int start_char_idx = 0, char_count = 0;
     float strWidth = StdGuiRender::get_str_bbox_u_ex(textU16, textLength, fctx,
-      textOverflowMode == TOVERFLOW_CLIP ? 4096 : (sc.size.x - elem->layout.padding.left() - elem->layout.padding.right()),
+      textOverflowMode == TOVERFLOW_CLIP ? 4096 : (sc.size.x - elem->layout.padding().l - elem->layout.padding().r),
       elem->layout.hAlign != ALIGN_RIGHT, start_char_idx, char_count, textOverflowMode == TOVERFLOW_WORD ? L" \t\r\n" : NULL,
       ellipsisWidth)
                        .width()
@@ -371,27 +384,29 @@ void RenderObjectText::render(StdGuiRender::GuiContext &ctx, const Element *elem
   float startPosX = sc.screenPos.x - sc.scrollOffs.x;
   float startPosY = sc.screenPos.y;
   if (elem->layout.hAlign == ALIGN_RIGHT)
-    startPosX += sc.size.x - elem->layout.padding.right() - params->strWidth;
+    startPosX += sc.size.x - elem->layout.padding().r - params->strWidth;
   else if (elem->layout.hAlign == ALIGN_CENTER)
     startPosX += floorf(sc.size.x / 2 - params->strWidth / 2);
   else // ALIGN_LEFT
-    startPosX += elem->layout.padding.left();
+    startPosX += elem->layout.padding().l;
 
   if (elem->layout.vAlign == ALIGN_BOTTOM)
-    startPosY += sc.size.y - descent - elem->layout.padding.bottom();
+    startPosY += sc.size.y - descent - elem->layout.padding().b;
   else if (elem->layout.vAlign == ALIGN_CENTER)
     startPosY += floorf((sc.size.y - strHeight) / 2 + ascent);
   else // ALIGN_TOP
-    startPosY += ascent + elem->layout.padding.top();
+    startPosY += ascent + elem->layout.padding().t;
 
-  if (all_glyphs_ready)
+  if (all_glyphs_ready || params->guiText.allGlyphsWereReady)
   {
     ctx.goto_xy(startPosX, startPosY);
     ctx.start_font_str(SCALE);
     ctx.render_str_buf(params->guiText.v, params->guiText.c, params->guiText.samplers,
       StdGuiRender::DSBFLAG_curColor | StdGuiRender::DSBFLAG_checkVis);
+    params->guiText.allGlyphsWereReady |= all_glyphs_ready;
   }
-  else
+
+  if (!all_glyphs_ready)
     params->guiText.discard();
 
   ctx.reset_draw_str_attr();
@@ -516,21 +531,21 @@ void RenderObjectInscription::render(StdGuiRender::GuiContext &ctx, const Elemen
   float fontScale = params->fontSize / StdGuiRender::get_font_caps_ht(params->fontId);
   int descent = StdGuiRender::get_font_descent(params->fontId) * fontScale;
   int ascent = StdGuiRender::get_font_ascent(params->fontId) * fontScale;
-  real startPosX, startPosY;
+  float startPosX, startPosY;
 
   if (elem->layout.hAlign == ALIGN_RIGHT)
-    startPosX = sc.screenPos.x - sc.scrollOffs.x + sc.size.x - elem->layout.padding.right() - inscrBox.right();
+    startPosX = sc.screenPos.x - sc.scrollOffs.x + sc.size.x - elem->layout.padding().r - inscrBox.right();
   else if (elem->layout.hAlign == ALIGN_CENTER)
     startPosX = sc.screenPos.x - sc.scrollOffs.x + sc.size.x / 2 - inscrBox.size().x / 2;
   else // ALIGN_LEFT
-    startPosX = sc.screenPos.x - sc.scrollOffs.x + elem->layout.padding.left() - inscrBox.left();
+    startPosX = sc.screenPos.x - sc.scrollOffs.x + elem->layout.padding().l - inscrBox.left();
 
   if (elem->layout.vAlign == ALIGN_BOTTOM)
-    startPosY = sc.screenPos.y + sc.size.y - descent - elem->layout.padding.bottom();
+    startPosY = sc.screenPos.y + sc.size.y - descent - elem->layout.padding().b;
   else if (elem->layout.vAlign == ALIGN_CENTER)
     startPosY = sc.screenPos.y + sc.size.y / 2 + inscrBox.size().y / 2 - descent;
   else // ALIGN_TOP
-    startPosY = sc.screenPos.y + ascent + elem->layout.padding.top();
+    startPosY = sc.screenPos.y + ascent + elem->layout.padding().t;
 
   Point2 startPos(floorf(startPosX), floorf(startPosY));
 
@@ -679,7 +694,7 @@ static void adjust_coord_for_image_aspect(Point2 &posLt, Point2 &posRb, Point2 &
         tc0.x = tc0.x + border;
         tc1.x = tc1.x - border;
       }
-      else if (image_valign == ALIGN_RIGHT)
+      else if (image_halign == ALIGN_RIGHT)
         tc0.x = tc1.x - w;
       else
         tc1.x = tc0.x + w;
@@ -734,7 +749,7 @@ void RenderObjectImage::render(StdGuiRender::GuiContext &ctx, const Element *ele
   if (params->saturateFactor != 1.0f)
     ctx.set_picquad_color_matrix_saturate(params->saturateFactor);
 
-  ctx.set_texture(pic.tex, pic.smp);
+  ctx.set_texture(pic.tex, pic.smp, false, image->texFormat);
   ctx.set_alpha_blend(image->getBlendMode());
 
   pic.updateTc();
@@ -991,7 +1006,7 @@ void RenderObjectVectorCanvas::render(StdGuiRender::GuiContext &ctx, const Eleme
 
     HSQOBJECT hUd = params->canvasScriptRef.GetObject();
     SQUserPointer ptr = nullptr, typeTag = nullptr;
-    G_VERIFY(SQ_SUCCEEDED(sq_direct_getuserdata(&hUd, &ptr, &typeTag)));
+    G_VERIFY(SQ_SUCCEEDED(sq_obj_getuserdata(&hUd, &ptr, &typeTag)));
     G_ASSERT(typeTag == RenderCanvasContext::get_type_tag());
 
     RenderCanvasContext **udPctx = (RenderCanvasContext **)ptr;
@@ -1565,7 +1580,7 @@ void RenderObjectTextArea::render(StdGuiRender::GuiContext &ctx, const Element *
     ctx.render_box(rdata->pos, rdata->pos + rdata->size);
     ctx.set_color(255, 255, 255, 255);
     ctx.set_font(0);
-    ctx.goto_xy(rdata->pos.x, rdata->pos.y + rdata->size.y);
+    ctx.goto_xy(rdata->pos.x, rdata->pos.y + StdGuiRender::get_font_ascent(0));
     ctx.draw_str(fmtText->formatErrorMsg.c_str(), fmtText->formatErrorMsg.length());
     return;
   }
@@ -1598,10 +1613,9 @@ void RenderObjectTextArea::render(StdGuiRender::GuiContext &ctx, const Element *
 
   Tab<wchar_t> tmpU16(framemem_ptr());
   BBox2 ellipsisBox = StdGuiRender::get_str_bbox_u(ellipsisUtf16, 1, fctxDefault);
-  real ellipsisHeight = useEllipsis ? ellipsisBox.width().y : 0;
-  real ellipsisWidth = ellipsisBox.width().x;
+  float ellipsisHeight = useEllipsis ? ellipsisBox.width().y : 0;
+  float ellipsisWidth = ellipsisBox.width().x;
 
-  bool ellipsisOnSeparateLine = useEllipsis;
   ElemAlign halign = elem->layout.hAlign;
   if (fmtText->lines.size() <= params->lowLineCount && params->lowLineCountAlign != PLACE_DEFAULT)
     halign = params->lowLineCountAlign;
@@ -1633,27 +1647,10 @@ void RenderObjectTextArea::render(StdGuiRender::GuiContext &ctx, const Element *
       continue;
 
     float xLineOffs = 0;
-    float lineWidth = (shouldBreakWithEllipsis && ellipsisOnSeparateLine) ? ellipsisWidth : line.contentWidth;
+    float lineWidth = shouldBreakWithEllipsis ? ellipsisWidth : line.contentWidth;
     int numBlocks = line.blocks.size();
 
-    int lastBlockIndexToRender = numBlocks - 1;
-
-    if (shouldBreakWithEllipsis && !ellipsisOnSeparateLine)
-    {
-      float tailBlocksWidth = 0;
-
-      while (lastBlockIndexToRender >= 0 && tailBlocksWidth < ellipsisWidth)
-      {
-        tailBlocksWidth += line.blocks[lastBlockIndexToRender]->size.x;
-        --lastBlockIndexToRender;
-      }
-    }
-
-    int numBlocksToRender = numBlocks;
-    if (shouldBreakWithEllipsis && !ellipsisOnSeparateLine)
-      numBlocksToRender = lastBlockIndexToRender + 1;
-    else if (shouldBreakWithEllipsis && ellipsisOnSeparateLine)
-      numBlocksToRender = 0;
+    int numBlocksToRender = shouldBreakWithEllipsis ? 0 : numBlocks;
 
     bool hadAllSymbols = true;
     bool nowHaveAllSymbols = true;
@@ -1709,7 +1706,7 @@ void RenderObjectTextArea::render(StdGuiRender::GuiContext &ctx, const Element *
 
         ctx.goto_xy(sc.screenPos.x - sc.scrollOffs.x + x, sc.screenPos.y - sc.scrollOffs.y + y);
 
-        if (shouldBreakWithEllipsis && (ellipsisOnSeparateLine || i > lastBlockIndexToRender))
+        if (shouldBreakWithEllipsis)
         {
           ctx.draw_str_u(ellipsisUtf16, 1);
           break;
@@ -1752,7 +1749,7 @@ void RenderObjectTextArea::render(StdGuiRender::GuiContext &ctx, const Element *
   if (hasFocus && etext)
   {
     textlayout::FormatParams fmtParams = {};
-    BhvTextAreaEdit::fill_format_params(elem, elem->screenCoord.size, fmtParams);
+    fill_textarea_format_params(elem, elem->screenCoord.size, fmtParams);
 
     StdGuiFontContext fctx;
     StdGuiRender::get_font_context(fctx, fmtParams.defFontId, fmtParams.spacing, fmtParams.monoWidth, fmtParams.defFontHt);
@@ -2219,7 +2216,7 @@ void RenderObjectBox::render(StdGuiRender::GuiContext &ctx, const Element *elem,
     movie: string, path to video file
     color: int or color, 0xFFFFFF by default
     keepAspect: bool or KEEP_ASPECT_FILL, KEEP_ASPECT_FIT, KEEP_ASPECT_NONE. KEEP_ASPECT_NONE by default
-    saturateFactor: float from 0 to 1, 1 by default.
+    picSaturate: float from 0 to 1, 1 by default.
     imageHalign: ALIGN_CENTER by default. Can be also ALIGN_RIGHT, ALIGN_LEFT
     imageValign: ALIGN_CENTER by default. Can be also ALIGN_TOP, ALIGN_BOTTOM
     loop: bool
@@ -2280,7 +2277,7 @@ void RenderObjectMovie::render(StdGuiRender::GuiContext &ctx, const Element *ele
   d3d::SamplerHandle smp;
   if (player->getFrame(texIdY, texIdU, texIdV, smp))
   {
-    const Offsets &padding = elem->layout.padding;
+    const Offsets &padding = elem->layout.padding();
 
     Point2 lt = rdata->pos + padding.lt();
     Point2 rb = rdata->pos + rdata->size - padding.rb();
@@ -2332,7 +2329,7 @@ ROBJ_FACTORY_IMPL(RenderObjectBox, RobjParamsBox)
   Renders a clipping mask to constrain rendering of child elements.
   Properties:
 
-    mask: Picture object (required)
+    image: Picture object (required)
 */
 
 ROBJ_FACTORY_IMPL(RobjMask, RobjMaskParams)
@@ -2393,6 +2390,8 @@ void register_std_rendobj_factories()
   RF(ROBJ_DAS_CANVAS, RobjDasCanvas);
 
 #undef RF
+
+  register_shader_rendobj_factory();
 }
 
 void render_picture(StdGuiRender::GuiContext &ctx, Picture *image, Point2 pos, Point2 size, E3DCOLOR image_color, float opacity,

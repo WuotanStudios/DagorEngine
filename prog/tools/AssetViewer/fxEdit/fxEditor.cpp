@@ -3,8 +3,10 @@
 #include "../av_plugin.h"
 #include "../av_tree.h"
 #include "../av_appwnd.h"
+#include "../av_viewportWindow.h"
 #include <assets/assetRefs.h>
 #include <assetsGui/av_selObjDlg.h>
+#include <assetsGui/av_assetTreeDragHandler.h>
 #include <EditorCore/ec_ObjectEditor.h>
 #include <scriptHelpers/scriptHelpers.h>
 #include <scriptHelpers/scriptPanel.h>
@@ -27,29 +29,35 @@
 #include <winGuiWrapper/wgw_dialogs.h>
 #include <propPanel/commonWindow/listDialog.h>
 #include <propPanel/commonWindow/treeviewPanel.h>
+#include <propPanel/control/dragAndDropHandler.h>
 
 #include <libTools/util/strUtil.h>
 #include <libTools/util/makeBindump.h>
 #include <3d/dag_texMgr.h>
+#include <3d/dag_resPtr.h>
 #include <generic/dag_initOnDemand.h>
 #include <util/dag_string.h>
 #include <shaders/dag_shaders.h>
 #include <drv/3d/dag_driver.h>
+#include <osApiWrappers/dag_direct.h> // dd_file_exist
 
 #include <debug/dag_debug3d.h>
 #include <debug/dag_debug.h>
+#include <math/dag_bezier.h>
 #include <math/dag_hlsl_floatx.h>
 #include <math/dag_TMatrix4.h>
-#include <gui/dag_stdGuiRenderEx.h>
 
 #include <dafxToolsHelper/dafxToolsHelper.h>
 #include <render/dag_cur_view.h>
 #include <render/wind/ambientWind.h>
 #include <render/wind/fxWindHelper.h>
+#include <render/fx/fx.h>
 
 #include "../av_cm.h"
 #include "fxSaveLoad.h"
 #include "../../commonFx/commonFxGame/dafxSystemDesc.h"
+#include "../../commonFx/commonFxGame/dafx_quality_flags.hlsli"
+#include <daFx/dafx_gravity_zone.hlsli>
 namespace dafx_ex
 {
 #include <daFx/dafx_def.hlsli>
@@ -58,6 +66,7 @@ namespace dafx_ex
 
 using hdpi::_pxActual;
 using hdpi::_pxScaled;
+using PropPanel::DragAndDropResult;
 
 enum
 {
@@ -86,10 +95,15 @@ enum
   PID_DEBUG_QUALITY = PID_DEBUG_DEFAULT_TRANSFORM + 1,
   PID_DEBUG_RESOLUTION = PID_DEBUG_QUALITY + 1,
   PID_DEBUG_CAMERA_VELOCITY = PID_DEBUG_RESOLUTION + 1,
-  PID_DEBUG_HDR_EMISSION = PID_DEBUG_CAMERA_VELOCITY + 1,
+  PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW1 = PID_DEBUG_CAMERA_VELOCITY + 1,
+  PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW2 = PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW1 + 1,
+  PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW3 = PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW2 + 1,
+  PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW4 = PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW3 + 1,
+  PID_DEBUG_HDR_EMISSION = PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW4 + 1,
   PID_DEBUG_HDR_EMISSION_THRESHOLD = PID_DEBUG_HDR_EMISSION + 1,
   PID_DEBUG_MOTION_DIR_AXIS = PID_DEBUG_HDR_EMISSION_THRESHOLD + 1,
   PID_DEBUG_PARENT_VELOCITY = PID_DEBUG_MOTION_DIR_AXIS + 1,
+  PID_DEBUG_GRAV_ROTATION = PID_DEBUG_PARENT_VELOCITY + 1,
 };
 
 static bool particles_debug_render;
@@ -108,10 +122,12 @@ float particles_debug_trail_vertical = 0;
 int particles_debug_trail_index = 0;
 float particles_debug_rot_x = 0;
 float particles_debug_rot_y = 0;
+float particles_debug_grav_rot = 0;
 float particles_debug_time_speed = 1;
 float particles_debug_wind_speed = 0;
 float particles_debug_wind_dir = 0;
 Point2 particles_debug_camera_velocity2D = Point2(0.0f, 4.5f);
+TMatrix4 particles_debug_spline_placement = TMatrix4::ZERO;
 float particles_debug_parent_velocity = 0;
 bool particles_debug_hdr_emission = false;
 float particles_debug_hdr_emission_threshold = 1;
@@ -127,6 +143,91 @@ static int simple_point_light_pos_radiusVarId = -1;
 static int simple_point_light_color_specVarId = -1;
 static int simple_point_light_box_centerVarId = -1;
 static int simple_point_light_box_extentVarId = -1;
+
+static int dafx_gravity_zone_bufferVarId = -1;
+static UniqueBuf dafx_gravity_zone_buffer_gpu;
+static GravityZoneDescriptor dafx_gravity_zone_container = {
+  TMatrix::IDENT, float3(1, 1, 1), GRAVITY_ZONE_SHAPE_BOX, GRAVITY_ZONE_TYPE_LINEAR, 1.0f};
+extern GravityZoneDescriptor_buffer dafx_gravity_zone_buffer;
+
+template <typename ValueType>
+static void apply_value(int pid, PropPanel::ContainerPropertyControl &panel, ValueType value);
+
+template <>
+void apply_value(int pid, PropPanel::ContainerPropertyControl &panel, float value)
+{
+  panel.setFloat(pid, value);
+}
+
+template <>
+void apply_value(int pid, PropPanel::ContainerPropertyControl &panel, int value)
+{
+  panel.setInt(pid, value);
+}
+
+template <>
+void apply_value(int pid, PropPanel::ContainerPropertyControl &panel, bool value)
+{
+  panel.setBool(pid, value);
+}
+
+template <>
+void apply_value(int pid, PropPanel::ContainerPropertyControl &panel, Point4 value)
+{
+  panel.setPoint4(pid, value);
+}
+
+template <typename ValueType>
+static ValueType get_param(int pid, PropPanel::ContainerPropertyControl *panel);
+
+template <>
+float get_param(int pid, PropPanel::ContainerPropertyControl *panel)
+{
+  return panel->getFloat(pid);
+}
+
+template <>
+int get_param(int pid, PropPanel::ContainerPropertyControl *panel)
+{
+  return panel->getInt(pid);
+}
+
+template <>
+bool get_param(int pid, PropPanel::ContainerPropertyControl *panel)
+{
+  return panel->getBool(pid);
+}
+
+template <>
+Point4 get_param(int pid, PropPanel::ContainerPropertyControl *panel)
+{
+  return panel->getPoint4(pid);
+}
+
+extern const DataBlock *get_project_settings_blk();
+
+uint32_t get_gpu_buffer_size_based_on_quality(uint32_t quality_mask)
+{
+  constexpr uint32_t DEFAULT_BUFFER_SIZE = 524288;
+  if (quality_mask & DAFX_LOW_FX_QUALITY)
+    return get_project_settings_blk()->getBlockByNameEx("graphics")->getInt("fxLowQualityGpuDataBufferSize", DEFAULT_BUFFER_SIZE);
+  else if (quality_mask & DAFX_MEDIUM_FX_QUALITY)
+    return get_project_settings_blk()->getBlockByNameEx("graphics")->getInt("fxMediumQualityGpuDataBufferSize", DEFAULT_BUFFER_SIZE);
+  else if (quality_mask & DAFX_HIGH_FX_QUALITY)
+    return get_project_settings_blk()->getBlockByNameEx("graphics")->getInt("fxHighQualityGpuDataBufferSize", DEFAULT_BUFFER_SIZE);
+
+  return DEFAULT_BUFFER_SIZE;
+}
+
+static void set_debug_render_tag_remap(bool debug_render)
+{
+  if (!dafx_helper_globals::ctx || !dafx_helper_globals::cull_id)
+    return;
+
+  const char *colorTag = dafx_helper_globals::particles_resolution_preview == 0 ? "lowres" : "highres";
+  dafx::remap_culling_state_tag(dafx_helper_globals::ctx, dafx_helper_globals::cull_id, "distortion",
+    debug_render ? colorTag : "distortion");
+}
 
 class EffectsPluginSaveCB : public ScriptHelpers::SaveValuesCB
 {
@@ -233,16 +334,26 @@ public:
     simple_point_light_box_centerVarId = ::get_shader_variable_id("simple_point_light_box_center", true);
     simple_point_light_box_extentVarId = ::get_shader_variable_id("simple_point_light_box_extent", true);
     fxwindhelper::load_fx_wind_curve_params(::dgs_get_game_params());
+    if (!get_app().dngBasedSceneRenderUsed())
+    {
+      dafx_gravity_zone_bufferVarId = ::get_shader_variable_id("dafx_gravity_zone_buffer", true);
+      if (dafx_gravity_zone_bufferVarId != -1)
+        dafx_gravity_zone_buffer_gpu =
+          dag::buffers::create_persistent_sr_structured(sizeof(GravityZoneDescriptor), 1, "dafx_gravity_zone_buffer");
+    }
+    dropHandler = new EffectsPropPanelDropHandler(*this);
   }
   ~EffectsPlugin() override
   {
     destroyFx();
     ScriptHelpers::set_param_change_cb(NULL);
+    dafx_gravity_zone_buffer_gpu.close();
+    del_it(dropHandler);
   }
 
   const char *getInternalName() const override { return "Effects"; }
 
-  void registered() override { register_all_common_fx_tools(); }
+  void registered() override {}
   void unregistered() override {}
 
   bool havePropPanel() override { return true; }
@@ -273,11 +384,17 @@ public:
 
     // effOE.initUi();
     fillDeclPanel();
+    loadPanelState();
 
     return true;
   }
   bool end() override
   {
+    for (int i = 0; i < EDITORCORE->getViewportCount(); ++i)
+      if (auto *viewport = static_cast<AssetViewerViewportWindow *>(EDITORCORE->getViewport(i)))
+        viewport->getFxStats().clear();
+
+    savePanelState();
     IWndManager &manager = getWndManager();
 
     ScriptHelpers::removeWindows();
@@ -295,6 +412,7 @@ public:
     ScriptHelpers::obj_editor = NULL;
 
     ShaderGlobal::set_int(dynamic_lights_countVarId, 0);
+    set_debug_render_tag_remap(false);
 
     curAsset = NULL;
 
@@ -314,7 +432,7 @@ public:
           return nullptr;
 
         mToolPanel = IEditorCoreEngine::get()->createPropPanel(this, "Effects Tools");
-        fillToolBar(*mToolPanel->createToolbarPanel(21, ""));
+        fillToolBar(*mToolPanel->createToolbarPanel(21));
 
         return mToolPanel;
       }
@@ -385,7 +503,8 @@ public:
 
       ShaderGlobal::set_int(::get_shader_variable_id("modfx_debug_render", true), particles_debug_render);
       ShaderGlobal::set_int(::get_shader_variable_id("fx_debug_editor_mode", true), (int)particles_debug_hdr_emission);
-      ShaderGlobal::set_real(::get_shader_variable_id("fx_debug_exposure_threshold", true), particles_debug_hdr_emission_threshold);
+      ShaderGlobal::set_float(::get_shader_variable_id("fx_debug_exposure_threshold", true), particles_debug_hdr_emission_threshold);
+      set_debug_render_tag_remap(particles_debug_render);
 
       if (particles_debug_motion)
       {
@@ -464,12 +583,19 @@ public:
 
         set_dafx_camera_velocity(dafx_helper_globals::ctx,
           Point3(particles_debug_camera_velocity2D.x, 0, particles_debug_camera_velocity2D.y));
+        setGravZone();
       }
 
       Point4 p4 = Point4::xyz0(particles_debug_tm.getcol(3));
       effect->setParam(_MAKE4C('PFXP'), &p4);
 
       effect->setParam(partices_default_transform == 0 ? HUID_EMITTER_TM : HUID_TM, &particles_debug_tm);
+      BezierSplineInt<Point4> spline;
+      TMatrix4 splineCoefTm = TMatrix4::ZERO;
+      spline.calculate(particles_debug_spline_placement.row);
+      for (int i = 0; i < 4; ++i)
+        splineCoefTm.row[i] = spline.sk[i];
+      effect->setParam(_MAKE4C('SPLN'), &splineCoefTm);
 
       effect->update(dt);
       IEditorCoreEngine::get()->invalidateViewportCache();
@@ -484,51 +610,48 @@ public:
 
     effectTotalLifeTime += dt;
   }
-  void drawDafxStats(BaseEffectObject &effect)
+  void fillViewportFxStats(AssetViewerViewportWindow &viewport)
   {
-    if (!dafx_helper_globals::ctx)
+    FxStats &s = viewport.getFxStats();
+    if (!effect || !dafx_helper_globals::ctx)
+    {
+      s.clear();
       return;
+    }
 
-    bool started = StdGuiRender::is_render_started();
-    if (!started)
-      StdGuiRender::continue_render();
+    dafx::Stats stats;
+    dafx::get_stats(dafx_helper_globals::ctx, stats);
+    if (!dafx::is_simulation_paused(dafx_helper_globals::ctx))
+    {
+      lastSimStats.activeInstances = stats.activeInstances;
+      lastSimStats.cpuElemProcessed = stats.cpuElemProcessed;
+      lastSimStats.gpuElemProcessed = stats.gpuElemProcessed;
+    }
 
-    StdGuiRender::set_font(0);
-    StdGuiRender::set_color(E3DCOLOR_MAKE(255, 255, 255, 255));
+    s.valid = true;
+    s.instances = lastSimStats.activeInstances / 2;
+    s.cpuElemProcessed = lastSimStats.cpuElemProcessed;
+    s.gpuElemProcessed = lastSimStats.gpuElemProcessed;
+    s.totalParticles = stats.totalParticles;
+    s.drawCalls = stats.renderDrawCalls;
+    s.modfxTris = stats.renderedTriangles[eastl::to_underlying(dafx_ex::StatGroup::ModFx)];
+    s.sparksTris = stats.renderedTriangles[eastl::to_underlying(dafx_ex::StatGroup::Sparks)];
 
-    const dafx::Stats &s = dafx_helper_globals::stats;
-    String insts(128, "instances: %d", (int)(s.activeInstances / 2)); // instances are 2 part objects
-    String cpuSim(128, "cpuSimulation: %d", s.cpuElemProcessed);
-    String gpuSim(128, "gpuSimulation: %d", s.gpuElemProcessed);
-    String dips(128, "dips: %d", s.renderDrawCalls);
-    String tris(128, "tris: %d/%d", s.visibleTriangles, s.renderedTriangles);
-
-    int fxStats[4] = {0};
-    effect.getParam(_MAKE4C('PFXX'), fxStats);
-    String params(128, "param_ren: %d, param_sim: %d", fxStats[0], fxStats[1]);
-    String data(128, "part_ren: %d, part_sim: %d", fxStats[2], fxStats[3]);
-    String distance(128, "distance to camera: %.2f", length(::grs_cur_view.pos));
-
-    int x = hdpi::_pxS(8);
-    int y = hdpi::_pxS(40);
-    int n = hdpi::_pxS(20);
-    StdGuiRender::draw_strf_to(x, y + n * 0, insts);
-    StdGuiRender::draw_strf_to(x, y + n * 1, cpuSim);
-    StdGuiRender::draw_strf_to(x, y + n * 2, gpuSim);
-    StdGuiRender::draw_strf_to(x, y + n * 3, dips);
-    StdGuiRender::draw_strf_to(x, y + n * 4, tris);
-    StdGuiRender::draw_strf_to(x, y + n * 5, data);
-    StdGuiRender::draw_strf_to(x, y + n * 6, params);
-    StdGuiRender::draw_strf_to(x, y + n * 7, distance);
-
-    StdGuiRender::flush_data();
-    if (!started)
-      StdGuiRender::end_render();
+    int elemSize[4] = {0};
+    effect->getParam(_MAKE4C('PFXX'), elemSize);
+    s.paramRenSize = elemSize[0];
+    s.paramSimSize = elemSize[1];
+    s.partRenSize = elemSize[2];
+    s.partSimSize = elemSize[3];
   }
   void beforeRenderObjects() override
   {
     if (ScriptHelpers::obj_editor)
       ScriptHelpers::obj_editor->beforeRender();
+
+    auto *viewport = static_cast<AssetViewerViewportWindow *>(EDITORCORE->getCurrentViewport());
+    if (viewport)
+      fillViewportFxStats(*viewport);
   }
   void renderObjects() override
   {
@@ -570,8 +693,6 @@ public:
         Point3 pos = particles_debug_tm.getcol(3);
         effect->drawEmitter(pos);
       }
-
-      drawDafxStats(*effect);
     }
   }
   void renderGeometry(Stage stage) override
@@ -645,6 +766,19 @@ public:
     panel.createTrackFloat(PID_DEBUG_WIND_DIR, "    debug wind angle", particles_debug_wind_dir, 0, 6.28, 0.01);
     panel.createTrackFloat(PID_DEBUG_CAMERA_VELOCITY, "  debug camera velocity", particles_debug_camera_velocity2D.y, 0, 10, 0.01);
     panel.createTrackFloat(PID_DEBUG_PARENT_VELOCITY, "  debug parent velocity", particles_debug_parent_velocity, 0, 10, 0.01);
+    panel.createTrackFloat(PID_DEBUG_GRAV_ROTATION, "    debug grav_zone rotation z", particles_debug_grav_rot, 0, 1, 0.01);
+    PropPanel::ContainerPropertyControl *splineDebugGrp = panel.createGroup(ID_SPEC_GRP, "Debug spline placement");
+    if (splineDebugGrp)
+    {
+      splineDebugGrp->createPoint4(PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW1, " first point",
+        particles_debug_spline_placement.getrow(0), 3, true);
+      splineDebugGrp->createPoint4(PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW2, " second point",
+        particles_debug_spline_placement.getrow(1), 3, true);
+      splineDebugGrp->createPoint4(PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW3, " third point",
+        particles_debug_spline_placement.getrow(2), 3, true);
+      splineDebugGrp->createPoint4(PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW4, " fourth point",
+        particles_debug_spline_placement.getrow(3), 3, true);
+    }
 
     Tab<String> transformNames(tmpmem);
     transformNames.push_back(String("world"));
@@ -679,9 +813,92 @@ public:
 
       refIdx++;
     }
+    panel.setDropTargetHandler(dropHandler);
   }
 
   void postFillPropPanel() override {}
+
+  template <typename ValueType>
+  class ParamChangeUndoRedo : public UndoRedoObject
+  {
+  public:
+    explicit ParamChangeUndoRedo(PropPanel::ContainerPropertyControl &panel, int pid, EffectsPlugin *plugin, ValueType undo,
+      ValueType redo) :
+      panel(panel), pid(pid), plugin(plugin), redoValue(redo), undoValue(undo)
+    {}
+
+    void restore(bool save_redo_data) override { applyChange(undoValue); }
+    void redo() override { applyChange(redoValue); }
+
+    size_t size() override { return sizeof(*this); }
+    void accepted() override {}
+    void get_description(String &s) override { s = "ParamChangeUndoRedo"; }
+
+  protected:
+    virtual void applyChange(ValueType value)
+    {
+      apply_value<ValueType>(pid, panel, value);
+      plugin->applyUndoOperation(true);
+      plugin->onChange(pid, &panel);
+      plugin->applyUndoOperation(false);
+    }
+    PropPanel::ContainerPropertyControl &panel;
+    EffectsPlugin *plugin;
+    ValueType undoValue;
+    ValueType redoValue;
+    int pid;
+  };
+
+  template <typename ValueType>
+  class ParamClickUndoRedo : public ParamChangeUndoRedo<ValueType>
+  {
+    using ParamChangeUndoRedo<ValueType>::panel;
+    using ParamChangeUndoRedo<ValueType>::plugin;
+    using ParamChangeUndoRedo<ValueType>::pid;
+
+  public:
+    explicit ParamClickUndoRedo(PropPanel::ContainerPropertyControl &panel, int pid, EffectsPlugin *plugin, ValueType undo,
+      ValueType redo) :
+      ParamChangeUndoRedo<ValueType>(panel, pid, plugin, undo, redo)
+    {}
+
+  protected:
+    void applyChange(ValueType value) override
+    {
+      apply_value<ValueType>(pid, panel, value);
+      plugin->applyUndoOperation(true);
+      plugin->onClick(pid, &panel);
+      plugin->applyUndoOperation(false);
+    }
+  };
+
+  template <typename ValueType>
+  ValueType getParamUndoableChange(int pid, PropPanel::ContainerPropertyControl *panel, ValueType old_value)
+  {
+    ValueType newValue = get_param<ValueType>(pid, panel);
+    if (!applyingUndoOperation)
+    {
+      get_app().getUndoSystem()->begin();
+      get_app().getUndoSystem()->put<ParamChangeUndoRedo<ValueType>>(*panel, pid, this, old_value, newValue);
+      get_app().getUndoSystem()->accept("changeParam");
+    }
+    return newValue;
+  }
+
+  template <typename ValueType>
+  ValueType getParamUndoableClick(int pid, PropPanel::ContainerPropertyControl *panel, ValueType old_value)
+  {
+    ValueType newValue = get_param<ValueType>(pid, panel);
+    if (!applyingUndoOperation)
+    {
+      get_app().getUndoSystem()->begin();
+      get_app().getUndoSystem()->put<ParamClickUndoRedo<ValueType>>(*panel, pid, this, old_value, newValue);
+      get_app().getUndoSystem()->accept("clickParam");
+    }
+    return newValue;
+  }
+
+  void applyUndoOperation(bool apply) { applyingUndoOperation = apply; }
 
   // ControlEventHandler
   void onClick(int pid, PropPanel::ContainerPropertyControl *panel) override
@@ -693,44 +910,25 @@ public:
     DataBlock *b = NULL;
     if (refIdx >= 0)
     {
-      DataBlock &main_blk = curAsset->props;
-      int refNameId = main_blk.getNameId("ref"), idx = 0;
-      for (int bi = 0; bi < main_blk.blockCount(); ++bi)
-      {
-        b = main_blk.getBlock(bi);
-        if (b->getBlockNameId() == refNameId)
-        {
-          if (refIdx == idx)
-            break;
-          idx++;
-        }
-        b = NULL;
-      }
-
-      if (!b)
+      const char *type_name = nullptr;
+      int type = -1;
+      if (!getCurEffectAssetRef(refIdx, b, type_name, type))
         return;
 
       {
-        const char *type_name = b->getStr("type", "");
-        int type = curAsset->getMgr().getAssetTypeId(type_name);
-        if (type < 0)
+        SelectAssetDlgOptions dlgOptions;
+        dlgOptions.selectableAssetTypes.push_back(type);
+        dlgOptions.initiallySelectedAsset = b->getStr("ref", "");
+        dlgOptions.dialogCaption.printf(64, "Select %s", type_name);
+        dlgOptions.selectButtonCaption.printf(64, "Select %s", type_name);
+        dlgOptions.resetButtonCaption.printf(64, "Reset %s", type_name);
+        dlgOptions.positionBesideWindow = "Properties";
+
+        const eastl::optional<String> result = DAEDITOR3.selectAsset(dlgOptions);
+        if (!result.has_value())
           return;
 
-        String sel_type(64, "Select %s", type_name), reset_type(64, "Reset %s", type_name);
-
-        SelectAssetDlg dlg(0, &curAsset->getMgr(), sel_type, sel_type, reset_type, make_span_const(&type, 1));
-
-        dlg.selectObj(b->getStr("ref", ""));
-
-        dlg.setManualModalSizingEnabled();
-        if (!dlg.hasEverBeenShown())
-          dlg.positionLeftToWindow("Properties", true);
-
-        int ret = dlg.showDialog();
-        if (ret == PropPanel::DIALOG_ID_CLOSE)
-          return;
-
-        b->setStr("ref", (ret == PropPanel::DIALOG_ID_OK) ? dlg.getSelObjName() : "");
+        b->setStr("ref", result.value());
         panel->setCaption(pid, b->getStr("ref", ""));
       }
 
@@ -794,68 +992,111 @@ public:
           revert();
         break;
 
-      case PID_SHOW_DEBUG: particles_debug_render = panel->getBool(pid); break;
+      case PID_SHOW_DEBUG: particles_debug_render = getParamUndoableClick(pid, panel, particles_debug_render); break;
 
       case PID_SHOW_STATIC_VIS_SPHERE:
-        particles_debug_static_vis_sphere = panel->getBool(pid);
+        particles_debug_static_vis_sphere = getParamUndoableClick(pid, panel, particles_debug_static_vis_sphere);
         if (dafx_helper_globals::ctx)
           dafx::set_debug_flags(dafx_helper_globals::ctx,
             dafx::DEBUG_DISABLE_CULLING | (particles_debug_static_vis_sphere ? dafx::DEBUG_SHOW_BBOXES : 0));
         break;
 
-      case PID_SHOW_VOLUME_DEBUG: particles_debug_volume = panel->getBool(pid); break;
+      case PID_SHOW_VOLUME_DEBUG: particles_debug_volume = getParamUndoableClick(pid, panel, particles_debug_volume); break;
 
       case PID_DEBUG_MOTION:
-        particles_debug_motion = panel->getBool(pid);
+        particles_debug_motion = getParamUndoableClick(pid, panel, particles_debug_motion);
         updateDebugMotionControllers(panel);
         break;
 
-      case PID_DEBUG_MOTION_DIR: particles_debug_motion_dir = panel->getBool(pid); break;
+      case PID_DEBUG_MOTION_DIR: particles_debug_motion_dir = getParamUndoableClick(pid, panel, particles_debug_motion_dir); break;
     }
   }
+
   void onChange(int pid, PropPanel::ContainerPropertyControl *panel) override
   {
     switch (pid)
     {
-      case PID_DEBUG_MOTION_DIR_AXIS: particles_debug_motion_dir_axis = panel->getInt(pid); break;
-      case PID_DEBUG_MOTION_DISTANCE: particles_debug_motion_distance = panel->getFloat(pid); break;
-      case PID_DEBUG_MOTION_SPEED: particles_debug_motion_speed = panel->getFloat(pid); break;
-      case PID_DEBUG_TRAIL_WIDTH: particles_debug_trail_width = panel->getFloat(pid); break;
-      case PID_DEBUG_TRAIL_VERTICAL: particles_debug_trail_vertical = panel->getFloat(pid); break;
+      case PID_DEBUG_MOTION_DIR_AXIS:
+        particles_debug_motion_dir_axis = getParamUndoableChange(pid, panel, particles_debug_motion_dir_axis);
+        break;
+      case PID_DEBUG_MOTION_DISTANCE:
+        particles_debug_motion_distance = getParamUndoableChange(pid, panel, particles_debug_motion_distance);
+        break;
+      case PID_DEBUG_MOTION_SPEED:
+        particles_debug_motion_speed = getParamUndoableChange(pid, panel, particles_debug_motion_speed);
+        break;
+      case PID_DEBUG_TRAIL_WIDTH: particles_debug_trail_width = getParamUndoableChange(pid, panel, particles_debug_trail_width); break;
+      case PID_DEBUG_TRAIL_VERTICAL:
+        particles_debug_trail_vertical = getParamUndoableChange(pid, panel, particles_debug_trail_vertical);
+        break;
       case PID_DEBUG_TRAIL_INDEX:
-        particles_debug_trail_index = panel->getInt(pid);
+        particles_debug_trail_index = getParamUndoableChange(pid, panel, particles_debug_trail_index);
         onScriptHelpersParamChange();
         break;
-      case PID_DEBUG_EMITTER_ROT_X: particles_debug_rot_x = panel->getFloat(pid); break;
-      case PID_DEBUG_EMITTER_ROT_Y: particles_debug_rot_y = panel->getFloat(pid); break;
+      case PID_DEBUG_EMITTER_ROT_X: particles_debug_rot_x = getParamUndoableChange(pid, panel, particles_debug_rot_x); break;
+      case PID_DEBUG_EMITTER_ROT_Y: particles_debug_rot_y = getParamUndoableChange(pid, panel, particles_debug_rot_y); break;
       case PID_DEBUG_TIME_SPEED:
-        particles_debug_time_speed = panel->getFloat(pid);
+        particles_debug_time_speed = getParamUndoableChange(pid, panel, particles_debug_time_speed);
         dafx_helper_globals::dt_mul = particles_debug_time_speed;
         break;
-      case PID_DEBUG_WIND_SPEED: particles_debug_wind_speed = panel->getFloat(pid); break;
-      case PID_DEBUG_WIND_DIR: particles_debug_wind_dir = panel->getFloat(pid); break;
-      case PID_DEBUG_DEFAULT_TRANSFORM: partices_default_transform = panel->getInt(pid); break;
-      case PID_DEBUG_QUALITY: particles_quality_preview = panel->getInt(pid); break;
-      case PID_DEBUG_RESOLUTION: dafx_helper_globals::particles_resolution_preview = panel->getInt(pid); break;
-      case PID_DEBUG_CAMERA_VELOCITY: particles_debug_camera_velocity2D.y = panel->getFloat(pid); break;
-      case PID_DEBUG_PARENT_VELOCITY: particles_debug_parent_velocity = panel->getFloat(pid); break;
-      case PID_DEBUG_HDR_EMISSION: particles_debug_hdr_emission = panel->getBool(pid); break;
-      case PID_DEBUG_HDR_EMISSION_THRESHOLD: particles_debug_hdr_emission_threshold = panel->getFloat(pid); break;
+      case PID_DEBUG_WIND_SPEED: particles_debug_wind_speed = getParamUndoableChange(pid, panel, particles_debug_wind_speed); break;
+      case PID_DEBUG_WIND_DIR: particles_debug_wind_dir = getParamUndoableChange(pid, panel, particles_debug_wind_dir); break;
+      case PID_DEBUG_DEFAULT_TRANSFORM:
+        partices_default_transform = getParamUndoableChange(pid, panel, partices_default_transform);
+        break;
+      case PID_DEBUG_QUALITY: particles_quality_preview = getParamUndoableChange(pid, panel, particles_quality_preview); break;
+      case PID_DEBUG_RESOLUTION:
+        dafx_helper_globals::particles_resolution_preview =
+          getParamUndoableChange(pid, panel, dafx_helper_globals::particles_resolution_preview);
+        break;
+      case PID_DEBUG_CAMERA_VELOCITY:
+        particles_debug_camera_velocity2D.y = getParamUndoableChange(pid, panel, particles_debug_camera_velocity2D.y);
+        break;
+      case PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW1:
+        particles_debug_spline_placement.setrow(0, getParamUndoableChange(pid, panel, particles_debug_spline_placement.getrow(0)));
+        break;
+      case PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW2:
+        particles_debug_spline_placement.setrow(1, getParamUndoableChange(pid, panel, particles_debug_spline_placement.getrow(1)));
+        break;
+      case PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW3:
+        particles_debug_spline_placement.setrow(2, getParamUndoableChange(pid, panel, particles_debug_spline_placement.getrow(2)));
+        break;
+      case PID_DEBUG_SPLINE_PLACEMENT_SPLINE_DATA_ROW4:
+        particles_debug_spline_placement.setrow(3, getParamUndoableChange(pid, panel, particles_debug_spline_placement.getrow(3)));
+        break;
+      case PID_DEBUG_PARENT_VELOCITY:
+        particles_debug_parent_velocity = getParamUndoableChange(pid, panel, particles_debug_parent_velocity);
+        break;
+      case PID_DEBUG_GRAV_ROTATION: particles_debug_grav_rot = getParamUndoableChange(pid, panel, particles_debug_grav_rot); break;
+      case PID_DEBUG_HDR_EMISSION:
+        particles_debug_hdr_emission = getParamUndoableChange(pid, panel, particles_debug_hdr_emission);
+        break;
+      case PID_DEBUG_HDR_EMISSION_THRESHOLD:
+        particles_debug_hdr_emission_threshold = getParamUndoableChange(pid, panel, particles_debug_hdr_emission_threshold);
+        break;
     }
 
     if (pid == PID_DEBUG_QUALITY && dafx_helper_globals::ctx)
     {
       dafx::Config cfg = dafx::get_config(dafx_helper_globals::ctx);
       cfg.qualityMask = 1 << particles_quality_preview;
+      cfg.gpu_data_buffer_size = get_gpu_buffer_size_based_on_quality(cfg.qualityMask);
       dafx::set_config(dafx_helper_globals::ctx, cfg);
       onScriptHelpersParamChange();
     }
   }
 
+  void registerEditorCommands(IEditorCommandSystem &command_system) override
+  {
+    effOE.registerEditorCommands(command_system);
+
+    command_system.addCommand(EditorCommandIds::FX_EDITOR_RESET_EFFECTS, ImGuiKey_S);
+  }
+
   void registerMenuAccelerators() override
   {
     IWndManager &wndManager = *EDITORCORE->getWndManager();
-    wndManager.addViewportAccelerator(CM_FX_EDITOR_RESET_EFFECTS, ImGuiKey_S);
+    wndManager.addViewportAccelerator(CM_FX_EDITOR_RESET_EFFECTS, EditorCommandIds::FX_EDITOR_RESET_EFFECTS);
   }
 
   void handleViewportAcceleratorCommand(IGenViewportWnd &wnd, unsigned id) override
@@ -941,6 +1182,44 @@ public:
 
   bool isDirty() { return isModified; }
   void setDirty(bool d = true) { isModified = d; }
+
+  void savePanelState()
+  {
+    String pluginStatesPath;
+    DataBlock pluginStatesBlk;
+    pluginStatesPath = assetlocalprops::makePath("_plugin_states.blk");
+    pluginStatesBlk.load(pluginStatesPath);
+    DataBlock *paramsState = pluginStatesBlk.addBlock("fxEditorParamsState");
+    DataBlock *fxTypeState = paramsState->addBlock(className);
+    fxTypeState->clearData();
+    ScriptHelpers::save_params_state(*fxTypeState);
+    DataBlock *windowState = pluginStatesBlk.addBlock("windowState");
+    DataBlock *fxTypeWindowState = windowState->addBlock(className);
+    fxTypeWindowState->setInt("vscroll", mToolPanel->getScrollPos());
+    pluginStatesBlk.saveToTextFile(pluginStatesPath);
+  }
+
+  void loadPanelState()
+  {
+    String pluginStatesPath;
+    DataBlock pluginStatesBlk;
+    pluginStatesPath = assetlocalprops::makePath("_plugin_states.blk");
+    if (!dd_file_exist(pluginStatesPath))
+      pluginStatesBlk.saveToTextFile(pluginStatesPath);
+    pluginStatesBlk.load(pluginStatesPath);
+    DataBlock *paramsState = pluginStatesBlk.getBlockByName("fxEditorParamsState");
+    if (paramsState && paramsState->blockExists(className))
+    {
+      DataBlock *fxTypeState = paramsState->getBlockByName(className);
+      ScriptHelpers::load_params_state(*fxTypeState);
+    }
+    DataBlock *windowState = pluginStatesBlk.getBlockByName("windowState");
+    if (windowState && windowState->blockExists(className))
+    {
+      DataBlock *fxTypeWindowState = windowState->getBlockByName(className);
+      mToolPanel->setScrollPos(fxTypeWindowState->getInt("vscroll", 0));
+    }
+  }
 
   void saveResource()
   {
@@ -1041,6 +1320,7 @@ protected:
 
   BaseEffectObject *effect;
   bool effectDafxSetupDone = false;
+  bool applyingUndoOperation = false;
 
   Tab<ScriptClass> scriptClasses;
 
@@ -1050,6 +1330,61 @@ protected:
 
   TMatrix4 globtmPrev = TMatrix4::IDENT;
   float effectTotalLifeTime = 0;
+
+  struct SimStats
+  {
+    int activeInstances = 0;
+    int cpuElemProcessed = 0;
+    int gpuElemProcessed = 0;
+  } lastSimStats;
+
+  class EffectsPropPanelDropHandler : public PropPanel::IDropTargetHandler
+  {
+  public:
+    explicit EffectsPropPanelDropHandler(EffectsPlugin &_e) : effects(_e) {}
+
+    DragAndDropResult handleDropTarget(int pcb_id, PropPanel::ContainerPropertyControl *panel) override
+    {
+      if (pcb_id < PID_CHANGE_REF || PID_RESET_REF <= pcb_id)
+        return DragAndDropResult::NONE;
+
+      const ImGuiPayload *dragAndDropPayload = PropPanel::acceptDragDropPayloadBeforeDelivery(ASSET_DRAG_AND_DROP_TYPE);
+      if (!dragAndDropPayload)
+        return DragAndDropResult::NONE;
+
+      DataBlock *b = nullptr;
+      const char *type_name = nullptr;
+      int type = -1;
+      if (!effects.getCurEffectAssetRef(pcb_id - PID_CHANGE_REF, b, type_name, type))
+        return DragAndDropResult::NONE;
+
+      AssetDragData dragData;
+      PropPanel::getDragAndDropPayloadData<AssetDragData>(dragAndDropPayload, &dragData);
+
+      // Only allow dropping into the same asset type.
+      DagorAsset *asset = dragData.asset;
+      if (asset != nullptr && asset->getType() == type)
+      {
+        if (dragAndDropPayload->IsDelivery())
+        {
+          b->setStr("ref", asset->getName());
+          panel->setCaption(pcb_id, b->getStr("ref", ""));
+
+          effects.reloadScript();
+
+          return DragAndDropResult::ACCEPTED;
+        }
+        return DragAndDropResult::NONE;
+      }
+
+      return DragAndDropResult::NOT_ALLOWED;
+    }
+
+  private:
+    EffectsPlugin &effects;
+  };
+
+  EffectsPropPanelDropHandler *dropHandler;
 
 protected:
   void onScriptHelpersParamChange() override
@@ -1087,6 +1422,31 @@ protected:
     toolbar.setButtonPictures(CM_REVERT, "import_blk");
   }
 
+  bool getCurEffectAssetRef(int ref_idx, DataBlock *&b, const char *&type_name, int &type)
+  {
+    DataBlock &main_blk = curAsset->props;
+    int refNameId = main_blk.getNameId("ref"), idx = 0;
+    for (int bi = 0; bi < main_blk.blockCount(); ++bi)
+    {
+      b = main_blk.getBlock(bi);
+      if (b->getBlockNameId() == refNameId)
+      {
+        if (ref_idx == idx)
+          break;
+        idx++;
+      }
+      b = nullptr;
+    }
+
+    if (b)
+    {
+      type_name = b->getStr("type", "");
+      type = curAsset->getMgr().getAssetTypeId(type_name);
+    }
+
+    return b != nullptr && type >= 0;
+  }
+
   void destroyFx() { del_it(effect); }
 
   void createFx()
@@ -1107,6 +1467,7 @@ protected:
 
     effect = (BaseEffectObject *)obj;
     effectDafxSetupDone = false;
+    lastSimStats = SimStats();
 
     DAEDITOR3.setFatalHandler();
     DAEDITOR3.resetFatalStatus();
@@ -1171,10 +1532,47 @@ protected:
       Point4 center(lightPos->x, lightPos->y, lightPos->z, 0.0f);
       Point4 extent(lightParams->a, lightParams->a, lightParams->a, 0.0f);
 
-      ShaderGlobal::set_color4(simple_point_light_pos_radiusVarId, posAndRad);
-      ShaderGlobal::set_color4(simple_point_light_color_specVarId, colAndSpec);
-      ShaderGlobal::set_color4(simple_point_light_box_centerVarId, center);
-      ShaderGlobal::set_color4(simple_point_light_box_extentVarId, extent);
+      ShaderGlobal::set_float4(simple_point_light_pos_radiusVarId, posAndRad);
+      ShaderGlobal::set_float4(simple_point_light_color_specVarId, colAndSpec);
+      ShaderGlobal::set_float4(simple_point_light_box_centerVarId, center);
+      ShaderGlobal::set_float4(simple_point_light_box_extentVarId, extent);
+    }
+  }
+
+  void setGravZone()
+  {
+    if (effect)
+    {
+      Matrix3 gravityTm;
+      gravityTm.rotzTM(-particles_debug_grav_rot * 3.14);
+      effect->setParam(_MAKE4C('GZTM'), (void *)&gravityTm);
+    }
+
+    if (!dafx_helper_globals::ctx)
+      return;
+
+    TMatrix gravityTm;
+    gravityTm.rotzTM(-particles_debug_grav_rot * 3.14);
+
+    if (get_app().dngBasedSceneRenderUsed())
+    {
+      acesfx::GravityZoneBuffer buffer;
+      acesfx::push_gravity_zone(buffer, gravityTm, Point3(1000, 1000, 1000), GRAVITY_ZONE_SHAPE_BOX, GRAVITY_ZONE_TYPE_LINEAR, 1.0f,
+        0.0f, true);
+      acesfx::set_gravity_zones(buffer);
+    }
+    else if (dafx_gravity_zone_bufferVarId != -1)
+    {
+      unsigned gravity_zone_count = 1;
+      dafx::set_global_value(dafx_helper_globals::ctx, "gravity_zone_count", &gravity_zone_count, sizeof(gravity_zone_count));
+
+      dafx_gravity_zone_container =
+        GravityZoneDescriptor(gravityTm, float3(1000, 1000, 1000), GRAVITY_ZONE_SHAPE_BOX, GRAVITY_ZONE_TYPE_LINEAR, 1.0f);
+
+      dafx_gravity_zone_buffer = &dafx_gravity_zone_container;
+
+      dafx_gravity_zone_buffer_gpu->updateData(0, sizeof(dafx_gravity_zone_container), &dafx_gravity_zone_container, 0);
+      ShaderGlobal::set_buffer(dafx_gravity_zone_bufferVarId, dafx_gravity_zone_buffer_gpu);
     }
   }
 };
@@ -1183,7 +1581,7 @@ DAG_DECLARE_RELOCATABLE(EffectsPlugin::ScriptClass);
 
 static InitOnDemand<EffectsPlugin> plugin;
 
-void init_plugin_effects()
+void init_plugin_effects(const DataBlock &appblk)
 {
   if (!IEditorCoreEngine::get()->checkVersion())
   {
@@ -1191,6 +1589,7 @@ void init_plugin_effects()
     return;
   }
 
+  register_all_common_fx_tools(appblk);
   ::plugin.demandInit();
   IEditorCoreEngine::get()->registerPlugin(::plugin);
 }

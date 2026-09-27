@@ -2,7 +2,7 @@ from "daRg" import sh, sw, set_kb_focus
 require("interop.nut")
 require("daeditor_es.nut")
 
-let { showHelp, editorIsActive, editorFreeCam, showTemplateSelect, propPanelVisible, showPointAction, typePointAction, entitiesListUpdateTrigger } = require("state.nut")
+let { showHelp, editorIsActive, editorFreeCam, showTemplateSelect, propPanelVisible, showPointAction, typePointAction } = require("state.nut")
 
 editorIsActive.subscribe(function(v){ if(v == false) set_kb_focus(null) })
 editorFreeCam.subscribe(function(v){ if(v == true) set_kb_focus(null) })
@@ -16,9 +16,10 @@ let cursors = require("components/cursors.nut")
 let { modalWindowsComponent } = require("components/modalWindows.nut")
 let { msgboxComponent } = require("%daeditor/components/msgbox.nut")
 let { windowsManager, registerWindow } = require("%daeditor/components/window.nut")
+let { toastNotificationManager } = require("%daeditor/components/toastNotifications.nut")
 
 registerWindow(require("entitySelect.nut"))
-registerWindow(require("loadedScenes.nut"))
+registerWindow(require("sceneOutliner.nut"))
 registerWindow(require("logsWindow.nut"))
 
 function getActionCursor(actionType) {
@@ -37,14 +38,13 @@ return function() {
   }
 
   return {
-    size = [sw(100), sh(100)]
+    size = const [sw(100), sh(100)]
     watch = [
       editorIsActive
       showTemplateSelect
       showPointAction
       typePointAction
       showHelp
-      entitiesListUpdateTrigger
       editorFreeCam
     ]
 
@@ -55,6 +55,7 @@ return function() {
     children = [
       mainToolbar,
       windowsManager,
+      toastNotificationManager,
       (showTemplateSelect.get() ? templateSelect : null), //fixme
       attrPanel, //fixme
       (showHelp.get() ? help : null),

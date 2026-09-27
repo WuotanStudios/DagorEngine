@@ -4,27 +4,15 @@
 #include <dag/dag_vector.h>
 #include <util/dag_compilerDefs.h>
 
+// Note: this header exist in gcc/clang/msvc
+#include <sanitizer/asan_interface.h>
+
 // #define CAPTURE_STACK_FRAMES 20
 
 #if CAPTURE_STACK_FRAMES
 #include <osApiWrappers/dag_stackHlp.h>
 #include <EASTL/array.h>
 #include <dag/dag_vectorMap.h>
-#endif
-
-
-#if DAGOR_ADDRESS_SANITIZER
-extern "C" void __asan_poison_memory_region(void const volatile *addr, size_t size);
-extern "C" void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
-
-#define ASAN_POISON_MEMORY_REGION(addr, size)   __asan_poison_memory_region((addr), (size))
-#define ASAN_UNPOISON_MEMORY_REGION(addr, size) __asan_unpoison_memory_region((addr), (size))
-#elif 0
-#define ASAN_POISON_MEMORY_REGION(addr, size)   memset(addr, 0x7C, size)
-#define ASAN_UNPOISON_MEMORY_REGION(addr, size) ((void)(addr), (void)(size))
-#else
-#define ASAN_POISON_MEMORY_REGION(addr, size)   ((void)(addr), (void)(size))
-#define ASAN_UNPOISON_MEMORY_REGION(addr, size) ((void)(addr), (void)(size))
 #endif
 
 
@@ -66,7 +54,7 @@ public:
   template <class U>
   struct rebind
   {
-    using other = CycAlloc<U>;
+    using other = CycAlloc<Tag>;
   };
 
   static void flip()
@@ -143,14 +131,16 @@ public:
     if (!data)
       return false;
 
-    G_ASSERT(findOwnerBlock(data) != nullptr);
+    // Only the current tail-top can be resized; prove that before trusting sizeStack.back().
+    if (state.sizeStack.empty() || !isInBlock(state.tail, data))
+      return false;
 
     const size_t oldSize = state.sizeStack.back();
 
     if (!isLastInBlock(state.tail, data, oldSize))
       return false;
 
-    if (state.tail->used - state.sizeStack.back() + new_size > state.tail->size)
+    if (state.tail->used - oldSize + new_size > state.tail->size)
       return false;
 
     if (new_size == oldSize)
@@ -177,7 +167,9 @@ public:
 
     if (Block *block = findOwnerBlock(data))
     {
-      if (isLastInBlock(block, data, state.sizeStack.back()))
+      // Reclaim only the genuine tail-top; an older block after a spill must not
+      // roll back the tail. sizeStack.back() is the padding-inclusive top size.
+      if (block == state.tail && !state.sizeStack.empty() && isLastInBlock(state.tail, data, state.sizeStack.back()))
       {
         state.tail->used -= state.sizeStack.back();
         state.sizeStack.pop_back();

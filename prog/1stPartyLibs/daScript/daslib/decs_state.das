@@ -1,15 +1,19 @@
 options gen2
 options indenting = 4
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options no_aot
 options strict_smart_pointers = true
 
 module decs_state shared private
 
+//! DECS debugger state reporting.
+//!
+//! Sends entity and archetype data to the debug-agent context
+//! for live inspection in the DAP debugger's variable view.
+//! Requires the ``decs`` module.
+
 require daslib/decs
 require daslib/strings_boost
-require debugapi
+require daslib/debugger
 
 def report_to_debugger(var ctx : Context; category, name : string; value : auto(TT)) {
     let tinfo = typeinfo rtti_typeinfo(value)
@@ -18,6 +22,7 @@ def report_to_debugger(var ctx : Context; category, name : string; value : auto(
 }
 
 struct EcsRequestView {
+    //! Read-only view of an ECS request for debug inspection.
     hash        : uint64
     REQUIRE     : string
     REQUIRE_NOT : string
@@ -27,6 +32,7 @@ struct EcsRequestView {
 }
 
 struct EcsComponentView {
+    //! Read-only view of an ECS component for debug inspection.
     name        : string
     vtype       : string
     values      : string
@@ -34,28 +40,24 @@ struct EcsComponentView {
 }
 
 struct EcsArchetypeView {
+    //! Read-only view of an ECS archetype for debug inspection.
     hash        : uint64
-    size        : int
+    size        : int64                //! widened with decs::Archetype.size (entity counts can exceed INT_MAX)
     components  : array<EcsComponentView>
 }
 
 class ContextStateAgent : DapiDebugAgent {
+    //! Debug agent that exposes DECS state for inspection.
     def override onCollect(var ctx : Context; at : LineInfo) {
         let pState = unsafe(get_context_global_variable(ctx, "decsState"))
-        if (pState == null) {
-            return
-        }
+        if (pState == null) return
         let decsState = unsafe(reinterpret<DecsState? const>(pState))
         for (arch in decsState.allArchetypes) {
-            var arq : EcsArchetypeView
-            arq.hash = arch.hash
-            arq.size = arch.size
+            var arq = EcsArchetypeView(hash = arch.hash, size = arch.size)
+            arq.components |> reserve(length(arch.components))
             for (c in arch.components) {
-                var cv : EcsComponentView
-                cv.name = c.name
-                cv.vtype = c.info.fullName
-                cv.stride = c.stride
-                if (length(c.data) > 0) {
+                var cv = EcsComponentView(name = c.name, vtype = c.info.fullName, stride = c.stride)
+                if (!empty(c.data)) {
                     var tinfo : TypeInfo const?
                     let fnTypeInfo = c.info.mkTypeInfo
                     unsafe {
@@ -64,7 +66,7 @@ class ContextStateAgent : DapiDebugAgent {
                         }
                     }
                     var arr : array<uint8>
-                    unsafe(_builtin_make_temp_array(arr, unsafe(addr(c.data[0])), arch.size))
+                    unsafe(_builtin_make_temp_array_i64(arr, unsafe(addr(c.data[0])), arch.size))
                     cv.values = sprint_data(unsafe(addr(arr)), tinfo, print_flags.singleLine)
                 }
                 arq.components |> push(cv)
@@ -74,10 +76,7 @@ class ContextStateAgent : DapiDebugAgent {
         }
         // report entity requests, pretty version
         for (eq in decsState.ecsQueries) {
-            var prq : EcsRequestView
-            prq.file = eq.at.file
-            prq.line = int(eq.at.line)
-            prq.hash = eq.hash
+            var prq = EcsRequestView(file = eq.at.file, line = int(eq.at.line), hash = eq.hash)
             if (!empty(eq.req)) {
                 prq.REQUIRE = join(eq.req, ",")
             }
@@ -92,7 +91,7 @@ class ContextStateAgent : DapiDebugAgent {
 }
 
 
-[export]
+[export, unused_argument(ctx)]
 def decs_state_agent(ctx : Context) {
     install_new_debug_agent(new ContextStateAgent(), "decs")
 }

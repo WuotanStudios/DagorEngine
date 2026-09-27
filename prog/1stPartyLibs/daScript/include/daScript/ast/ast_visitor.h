@@ -20,7 +20,7 @@ namespace das {
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #endif
 
-    class Visitor : public ptr_ref_count {
+    class Visitor {
     protected:
         virtual ~Visitor() {}
     public:
@@ -32,6 +32,7 @@ namespace das {
         virtual bool canVisitStructureFieldInit ( Structure * var ) { return true; }
         virtual bool canVisitIfSubexpr ( ExprIfThenElse * ) { return true; }
         virtual bool canVisitExpr ( ExprTypeInfo * expr, Expression * subexpr ) { return true; }
+        virtual bool canVisitMakeStructure ( ExprMakeStruct * expr ) { return true; }
         virtual bool canVisitMakeStructureBlock ( ExprMakeStruct * expr, Expression * blk ) { return true; }
         virtual bool canVisitMakeStructureBody ( ExprMakeStruct * expr ) { return true; }
         virtual bool canVisitArgumentInit ( Function * fun, const VariablePtr & var, Expression * init ) { return true; }
@@ -39,6 +40,10 @@ namespace das {
         virtual bool canVisitWithAliasSubexpression ( ExprAssume * ) { return false; }
         virtual bool canVisitMakeBlockBody ( ExprMakeBlock * expr ) { return true; }
         virtual bool canVisitCall ( ExprCall * expr ) { return true; }
+        virtual bool canVisitNamedCall ( ExprNamedCall * /*expr*/ ) { return true; }
+        virtual bool canVisitLooksLikeCall ( ExprLooksLikeCall * /*expr*/ ) { return true; }
+        virtual bool canVisitLabel ( ExprLabel * ) { return true; }
+        virtual bool canVisitReader ( ExprReader * ) { return true; }
         // WHOLE PROGRAM
         virtual void preVisitProgram ( Program * prog ) {}
         virtual void visitProgram ( Program * prog ) {}
@@ -58,6 +63,8 @@ namespace das {
         virtual EnumerationPtr visit ( Enumeration * enu ) { return enu; }
         // STRUCTURE
         virtual void preVisit ( Structure * var ) { }
+        virtual void preVisitStructureAlias ( Structure * var, const string & name, TypeDecl * at ) {}
+        virtual TypeDeclPtr visitStructureAlias ( Structure * var, const string & name, TypeDecl * at ) { return at; }
         virtual void preVisitStructureField ( Structure * var, Structure::FieldDeclaration & decl, bool last ) {}
         virtual void visitStructureField ( Structure * var, Structure::FieldDeclaration & decl, bool last ) {}
         virtual StructurePtr visit ( Structure * var ) { return var; }
@@ -99,10 +106,10 @@ namespace das {
         virtual ExpressionPtr visitGlobalLetInit ( const VariablePtr & var, Expression * that ) { return that; }
         virtual void visitGlobalLetBody ( Program * prog ) {}
         // STRING BUILDER
-        virtual void preVisit ( ExprStringBuilder * expr ) {}
+        virtual void preVisit ( ExprStringBuilder * expr ) { preVisitExpression(expr); }
         virtual void preVisitStringBuilderElement ( ExprStringBuilder * sb, Expression * expr, bool last ) {}
         virtual ExpressionPtr visitStringBuilderElement ( ExprStringBuilder * sb, Expression * expr, bool last ) { return expr; }
-        virtual ExpressionPtr visit ( ExprStringBuilder * expr ) { return expr; }
+        virtual ExpressionPtr visit ( ExprStringBuilder * expr ) { return visitExpression(expr); }
         // NEW
         virtual void preVisitNewArg ( ExprNew * call, Expression * arg, bool last ) {}
         virtual ExpressionPtr visitNewArg ( ExprNew * call, Expression * arg , bool last ) { return arg; }
@@ -252,6 +259,7 @@ namespace das {
         VISIT_EXPR(ExprConstURange64)
         VISIT_EXPR(ExprConstBool)
         VISIT_EXPR(ExprConstFloat)
+        VISIT_EXPR(ExprConstFloat16)
         VISIT_EXPR(ExprConstFloat2)
         VISIT_EXPR(ExprConstFloat3)
         VISIT_EXPR(ExprConstFloat4)
@@ -292,36 +300,57 @@ namespace das {
 
     struct AstContext {
         bool valid = false;
-        FunctionPtr             func;
+        FunctionPtr             func = nullptr;
         vector<ExpressionPtr>   loop;
         vector<ExpressionPtr>   blocks;
         vector<ExpressionPtr>   scopes;
         vector<ExpressionPtr>   with;
     };
 
-    AstContext generateAstContext( const ProgramPtr & prog, Expression * expr );
+    DAS_API AstContext generateAstContext( const ProgramPtr & prog, Expression * expr );
 
-    class PassVisitor : public Visitor {
+    // DAS_CC_API (not DAS_API): PassVisitor's virtuals live in the compiler-lib
+    // optimizer TUs (ast_const_folding/block_folding/unused.cpp). DAS_API would
+    // make MSVC dllexport the vtable from every runtime TU and fail to find the
+    // methods. It is never constructed in the runtime lib.
+    class DAS_CC_API PassVisitor : public Visitor {
     public:
+        explicit PassVisitor(int32_t round) : round(round) {}
+        using Visitor::preVisit;
+        using Visitor::visit;
         virtual void preVisitProgram ( Program * prog ) override;
         virtual void visitProgram ( Program * prog ) override;
         virtual void reportFolding();
+        virtual void preVisit ( Function * f ) override;
+        virtual FunctionPtr visit ( Function * f ) override;
+        virtual bool canVisitFunction ( Function * f ) override {
+            // The optimization round checks whether the function
+            // was changed (marked as dirty) during the current or previous
+            // optimization run.
+            // The round counter starts with 1 and the func's counter
+            // starts with 0.
+            return !f->isTemplate && funcIsDirty(f);
+        }
+        bool funcIsDirty( Function * f ) const {
+            return f->optimizationRound >= (round - 1);
+        }
         __forceinline bool didAnything() const { return anyFolding; }
     protected:
         bool        anyFolding = false;
+        int         round = 0;
         Program *   program = nullptr;
+        Function *  func = nullptr;
     };
 
-    class FoldingVisitor : public PassVisitor {
+    class DAS_CC_API FoldingVisitor : public PassVisitor {
     public:
-        FoldingVisitor(const ProgramPtr & prog)
-            : ctx(prog->getContextStackSize()), helper(ctx.debugInfo) {
+        FoldingVisitor(const ProgramPtr & prog, int32_t round = 0)
+            : PassVisitor(round), ctx(prog->getContextStackSize()), helper(ctx.debugInfo) {
             ctx.thisProgram = prog.get();
             ctx.thisHelper = &helper;
-            ctx.heap = make_smart<LinearHeapAllocator>();
-            ctx.stringHeap = make_smart<LinearStringAllocator>();
+            ctx.heap = make_unique<LinearHeapAllocator>();
+            ctx.stringHeap = make_unique<LinearStringAllocator>();
             ctx.category = uint32_t(ContextCategory::folding_context);
-            helper.rtti = true;
         }
     protected:
         Context         ctx;
@@ -331,7 +360,7 @@ namespace das {
         ExpressionPtr evalAndFold ( Expression * expr );
         ExpressionPtr evalAndFoldString ( Expression * expr );
         ExpressionPtr evalAndFoldStringBuilder ( ExprStringBuilder * expr );
-        ExpressionPtr cloneWithType ( const ExpressionPtr & expr );
+        ExpressionPtr cloneWithType ( ExpressionPtr expr );
         bool isSameFoldValue ( const TypeDeclPtr & t, vec4f a, vec4f b ) const {
             return memcmp(&a,&b,t->getSizeOf()) == 0;
         }
@@ -341,21 +370,31 @@ namespace das {
     ExpressionPtr ExprLikeCall<TT>::visit(Visitor & vis) {
         vis.preVisit(static_cast<TT *>(this));
         auto llk = ExprLooksLikeCall::visit(vis);
-        return llk.get()==this ? vis.visit(static_cast<TT *>(this)) : llk;
+        return llk==this ? vis.visit(static_cast<TT *>(this)) : llk;
     }
 
     template <typename It, typename SimNodeT, bool first>
     ExpressionPtr ExprTableKeysOrValues<It,SimNodeT,first>::visit(Visitor & vis) {
         vis.preVisit(static_cast<It *>(this));
         auto llk = ExprLooksLikeCall::visit(vis);
-        return llk.get()==this ? vis.visit(static_cast<It *>(this)) : llk;
+        return llk == this ? vis.visit(static_cast<It *>(this)) : llk;
+    }
+
+    template <typename It, typename SimNodeT, bool first>
+    void ExprTableKeysOrValues<It,SimNodeT,first>::dispatch ( Visitor & vis ) {
+        vis.preVisit(static_cast<ExprLooksLikeCall*>(this));
     }
 
     template <typename It, typename SimNodeT>
     ExpressionPtr ExprArrayCallWithSizeOrIndex<It,SimNodeT>::visit(Visitor & vis) {
         vis.preVisit(static_cast<It *>(this));
         auto llk = ExprLooksLikeCall::visit(vis);
-        return llk.get()==this ? vis.visit(static_cast<It *>(this)) : llk;
+        return llk == this ? vis.visit(static_cast<It *>(this)) : llk;
+    }
+
+    template <typename It, typename SimNodeT>
+    void ExprArrayCallWithSizeOrIndex<It,SimNodeT>::dispatch ( Visitor & vis ) {
+        vis.preVisit(static_cast<ExprLooksLikeCall*>(this));
     }
 
     template <typename TT, typename ExprConstExt>
@@ -363,7 +402,7 @@ namespace das {
         vis.preVisit((ExprConst*)this);
         vis.preVisit((ExprConstExt*)this);
         auto res = vis.visit((ExprConstExt*)this);
-        if ( res.get()!=this ) return res;
+        if ( res!=this ) return res;
         return vis.visit((ExprConst *)this);
     }
 }

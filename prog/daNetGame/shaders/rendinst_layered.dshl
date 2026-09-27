@@ -7,6 +7,7 @@ include "hmap_blend_inc.dshl"
 include "hmap_blend_use_inc.dshl"
 include "plod_inc.dshl"
 include "rendinst_top_projection_inc.dshl"
+include "unpack_unit_vector_inc.dshl"
 
 shader rendinst_layered
 {
@@ -16,7 +17,6 @@ shader rendinst_layered
     dont_render;
   }
 
-  ENABLE_ASSERT(ps)
   SETUP_TOP_PROJECTION()
 
   PLOD_GBUF_GEN_INIT(rendinst_render_pass == rendinst_render_pass_normal)
@@ -25,7 +25,7 @@ shader rendinst_layered
   INIT_LAYERED_FULL(true)
   INIT_HMAP_BLEND_STATIC()
 
-  if (rendinst_render_pass != rendinst_render_pass_to_heightmap)
+  if (rendinst_render_pass != rendinst_render_pass_to_heightmap && !use_editor_render)
   {
     NO_DYNSTCODE() // TODO: we can keep dynstcode, if we use hardcoded registers for vtex feedback UAV
   }
@@ -45,6 +45,7 @@ shader rendinst_layered
   RENDINST_BLOCK()
   RI_VOXELIZE_ALBEDO()
   RENDINST_INSTANCING()
+  USE_UNPACK_UNIT_VECTOR_VS()
 
   INIT_PAINT_DETAILS_STATIC()
   if (rendinst_render_pass == rendinst_render_pass_to_shadow)
@@ -79,7 +80,7 @@ shader rendinst_layered
     compile("target_vs", "simple_vs");
     compile("ps_null", "rendinst_render_depth_black_ps");
   } else {
-    if (paint_details_tex != NULL)
+    if (paint_details_tex != NULL || rendinst_render_pass == rendinst_render_pass_impostor_voxel)
     {
       hlsl{
         #define COLOR_NEEDED 1
@@ -96,6 +97,7 @@ shader rendinst_layered
     }
 
     if (rendinst_render_pass == rendinst_render_pass_normal ||
+        rendinst_render_pass == rendinst_render_pass_impostor_voxel ||
         rendinst_render_pass == rendinst_render_pass_to_heightmap)
     {
       USE_HMAP_BLEND_VS_PARAMS()
@@ -150,7 +152,7 @@ shader rendinst_layered
 
       float3 localNormal = 1;
 ##if (rendinst_render_pass != rendinst_render_pass_depth)
-        localNormal = normalize(BGR_SWIZZLE(input.normal) * 2 - 1);
+        localNormal = normalize(unpack_unit_vector(input.normal.xyz));
 ##endif
         float3 localPos = input.pos;
         float opacity = 1;
@@ -202,30 +204,28 @@ shader rendinst_layered
       USE_HEIGHTMAP_COMMON_PS()
       PACK_UNPACK_GBUFFER()
 
-      USE_HMAP_BLEND()
-
-      (ps) { perlin_noise3d@smp3d = perlin_noise3d; }
+      USE_HMAP_BLEND(false)
 
       LAYERED_HEIGHTMAP_PS()
     }
-    else
+    else if (!is_triangle_size_debug)
     {
-      if (rendinst_render_pass == rendinst_render_pass_normal)
+      if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_impostor_voxel)
       {
         WRITE_GBUFFER()
-        USE_HMAP_BLEND()
+        USE_HMAP_BLEND(true)
       }
 
       USE_CHARACTER_TWO_MICRODETAILS()
 
       USE_LAYERED_PS(true)
       (ps) {
-        mask_tex@static  = mask_tex;
+        mask_tex@staticSmp = mask_tex;
         paint_details@f3 = paint_details;
       }
       USE_NORMAL_DETAIL()
 
-      LAYERED_PS(rendinst_render_pass == rendinst_render_pass_normal)
+      LAYERED_PS(rendinst_render_pass == rendinst_render_pass_normal, use_parallax_shadows_or_ao)
     }
 
     if (rendinst_render_pass == rendinst_render_pass_depth)
@@ -235,6 +235,10 @@ shader rendinst_layered
     else if (rendinst_render_pass == rendinst_render_pass_to_heightmap)
     {
       compile("target_ps", "heightmap_ps");
+    }
+    else if(is_triangle_size_debug)
+    {
+      RI_TRIANGLE_SIZE_DEBUG_PS()
     }
     else
     {
@@ -271,7 +275,7 @@ shader rendinst_mask_layered
   RENDINST_BLOCK()
   RI_VOXELIZE_ALBEDO()
   RENDINST_INSTANCING()
-  ENABLE_ASSERT(ps)
+  USE_UNPACK_UNIT_VECTOR_VS()
   INIT_RANDOMIZED_TC(vs)
   INIT_PAINT_DETAILS_STATIC()
 
@@ -307,7 +311,7 @@ shader rendinst_mask_layered
     compile("target_vs", "simple_vs");
     compile("ps_null", "rendinst_render_depth_black_ps");
   } else {
-    if (paint_details_tex != NULL)
+    if (paint_details_tex != NULL || rendinst_render_pass == rendinst_render_pass_impostor_voxel)
     {
       hlsl{
         #define COLOR_NEEDED 1
@@ -320,7 +324,8 @@ shader rendinst_mask_layered
       }
     }
 
-    if (rendinst_render_pass == rendinst_render_pass_normal)
+    if (rendinst_render_pass == rendinst_render_pass_normal ||
+        rendinst_render_pass == rendinst_render_pass_impostor_voxel)
     {
       USE_HMAP_BLEND_VS_PARAMS()
     }
@@ -329,7 +334,7 @@ shader rendinst_mask_layered
       struct VsOutput
       {
         PRECISE VS_OUT_POSITION(pos)
-        ##if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_voxelize_albedo)
+        ##if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_voxelize_albedo || rendinst_render_pass == rendinst_render_pass_impostor_voxel)
         float3 normal  : TEXCOORD0;
         float2 uv12           : TEXCOORD1;
         VOXEL_CENTROID float3 pointToEye     : TEXCOORD2;
@@ -353,7 +358,7 @@ shader rendinst_mask_layered
       struct VsInput
       {
         float3 pos                  : POSITION;
-        ##if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_voxelize_albedo)
+        ##if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_voxelize_albedo || rendinst_render_pass == rendinst_render_pass_impostor_voxel)
         float3 normal               : NORMAL;
         int2 uv0                    : TEXCOORD0;
         ##endif
@@ -369,8 +374,8 @@ shader rendinst_mask_layered
         #endif
 
         float3 localNormal = 1;
-        ##if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_voxelize_albedo)
-        localNormal = normalize(BGR_SWIZZLE(input.normal)*2-1);
+        ##if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_voxelize_albedo || rendinst_render_pass == rendinst_render_pass_impostor_voxel)
+        localNormal = normalize(unpack_unit_vector(input.normal.xyz));
         ##endif
         float3 localPos = input.pos;
         float opacity = 1;
@@ -379,7 +384,7 @@ shader rendinst_mask_layered
         float3 pointToEye = world_view_pos-worldPos;
 
         output.pos = mulPointTm(worldPos + camera_base_offset, globtm);
-        ##if (rendinst_render_pass != rendinst_render_pass_depth)
+        ##if (rendinst_render_pass != rendinst_render_pass_depth && !is_triangle_size_debug)
           output.uv12.xy = input.uv0 * (1. / 4096.0);
           output.pointToEye.xyz = pointToEye;
           #if RANDOMIZE_TC
@@ -387,7 +392,7 @@ shader rendinst_mask_layered
           #endif
         ##endif
 
-        ##if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_voxelize_albedo)
+        ##if (rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_voxelize_albedo || rendinst_render_pass == rendinst_render_pass_impostor_voxel)
         output.normal.xyz = normalize(worldNormal.xyz);
         ##endif
 
@@ -412,14 +417,19 @@ shader rendinst_mask_layered
     if (rendinst_render_pass == rendinst_render_pass_depth)
     {
       compile("ps_null", "rendinst_render_depth_black_ps");
-    } else
+    }
+    else if (is_triangle_size_debug)
     {
-      if ((rendinst_render_pass == rendinst_render_pass_normal))
+      RI_TRIANGLE_SIZE_DEBUG_PS()
+    }
+    else
+    {
+      if ((rendinst_render_pass == rendinst_render_pass_normal || rendinst_render_pass == rendinst_render_pass_impostor_voxel))
       {
         WRITE_GBUFFER()
-        USE_HMAP_BLEND()
+        USE_HMAP_BLEND(true)
       }
-      MASK_LAYERED_PS(true)
+      MASK_LAYERED_PS(true, false)
     }
     COMPILE_RI_VS_TARGET("simple_vs")
   }

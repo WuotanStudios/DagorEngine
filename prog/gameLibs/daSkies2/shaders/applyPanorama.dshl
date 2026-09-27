@@ -20,11 +20,11 @@ float render_sun = 1;
 int tonemap_on = 1;
 interval tonemap_on:off<1, on;
 
-int panorama_discard_by_subpass_depth = 0;
-interval panorama_discard_by_subpass_depth: no<1, yes;
-
 int sky_panorama_patch = 1;
 interval sky_panorama_patch: off < 1, on;
+
+int special_vision;
+interval special_vision: special_vision_off < 1, thermal_vision;
 
 float skies_panorama_mobile_blendup_range = 200;
 float skies_panorama_mobile_blendup_coef = 0.0001;
@@ -51,25 +51,30 @@ shader applyCloudsPanorama
   }
 
   USE_AND_INIT_VIEW_VEC_VS()
-  ENABLE_ASSERT(ps)
   POSTFX_VS_TEXCOORD_VIEWVEC(0, texcoord, viewVect)
 
 
   (ps) {
     clouds_panorama_tex_res@f4 = (clouds_panorama_tex_res.x,clouds_panorama_tex_res.y, 1./clouds_panorama_tex_res.x, 1./clouds_panorama_tex_res.y);
-    clouds_panorama_tex@smp2d = clouds_panorama_tex;
-    clouds_panorama_patch_tex@smp2d = clouds_panorama_patch_tex;
+    clouds_panorama_tex@tex2d = clouds_panorama_tex;
+    clouds_panorama_patch_tex@tex2d = clouds_panorama_patch_tex;
     currentPanoramaWorldOffset@f3 = ((currentPanoramaWorldOffset-skies_world_view_pos)*currentPanoramaWorldOffset.w);
     skies_world_view_pos@f3 = skies_world_view_pos;
     skies_panorama_light_dir@f3 = skies_panorama_light_dir;
     skies_panorama_remove_sun_threshold@f1 = (1.5 + render_sun*1000,0,0,0);
     rgbm_panorama_scale_factor@f1 = (rgbm_panorama_scale_factor);
   }
+  INIT_GLOBAL_LINEAR_WRAP_U_CLAMP_V_SAMPLER(ps)
+  INIT_GLOBAL_LINEAR_CLAMP_SAMPLER(ps)
+  hlsl(ps) {
+    #define clouds_panorama_tex_samplerstate global_linear_wrap_u_clamp_v_sampler
+    #define clouds_panorama_patch_tex_samplerstate global_linear_clamp_sampler
+  }
 
   if (uav_depth_texture != NULL)
   {
     (ps) {
-      uav_depth_texture@smp2d = uav_depth_texture;
+      uav_depth_texture@tex2d = uav_depth_texture;
     }
   }
 
@@ -96,22 +101,6 @@ shader applyCloudsPanorama
   INIT_PANORAMA_LIGHTNING_FLASH()
   USE_PANORAMA_LIGHTNING_FLASH()
   USE_DEF_RGBM_SH()
-
-  if (mobile_render == deferred &&
-    panorama_discard_by_subpass_depth == yes) {
-    USE_SUBPASS_LOADS()
-    INIT_SUBPASS_LOAD_DEPTH_GBUFFER(SP_PANORAMA_REG_DEPTH, SP_PANORAMA_IA_DEPTH)
-    USE_SUBPASS_LOAD_DEPTH_GBUFFER()
-
-    blend_src = sa;
-    blend_dst = isa;
-    color_write = 7;
-
-    (ps) {
-      skies_panorama_mobile_blendup_range@f1 = (skies_panorama_mobile_blendup_range);
-      skies_panorama_mobile_blendup_coef@f1 = (skies_panorama_mobile_blendup_coef);
-    }
-  }
 
   hlsl(ps) {
     ##if clouds_panorama_use_biquadratic == yes
@@ -200,9 +189,7 @@ shader applyCloudsPanorama
     {
       float4 screenpos = GET_SCREEN_POS(input.pos);
 
-      ##if mobile_render == deferred && panorama_discard_by_subpass_depth == yes
-        float depth = loadGbufferDepth(screenpos.xy);
-      ##elif uav_depth_texture != NULL
+      ##if uav_depth_texture != NULL
         float depth = texelFetch(uav_depth_texture, screenpos.xy, 0).r;
       ##endif
 
@@ -214,17 +201,6 @@ shader applyCloudsPanorama
           discard;
           return 0;
         }
-      ##endif
-
-      ##if (mobile_render == deferred && panorama_discard_by_subpass_depth == yes)
-        //fake distant fog/lightning
-        float w = linearize_z(depth, zn_zfar.zw) - skies_panorama_mobile_blendup_range;
-        if (w < 0)
-        {
-          discard;
-          return 0;
-        }
-        retAlpha = saturate(w*skies_panorama_mobile_blendup_coef);
       ##endif
 
       float3 viewDirection = normalize(input.viewVect);
@@ -243,10 +219,31 @@ shader applyCloudsPanorama
       half4 panorama = sample_biquadratic(sky_uv);
       //panorama = DodgsonQuadratic(sky_uv);//we don't use parametrized qudratic as it is slower, and basically we don't need sharpness
       #else
-      half4 panorama = tex2D( clouds_panorama_tex, sky_uv );
-
-      // if compressed panorama is active this decodes rgbm, else it does nothing because .a = 1, factor = 1
-      panorama = decode_rgbm(panorama, rgbm_panorama_scale_factor);
+      ##if compatibility_mode == compatibility_mode_on
+      //low-end: one hardware-bilinear tap and one decode; RGBM fringing at bright edges is accepted
+      half4 panorama = decode_rgbm(tex2D(clouds_panorama_tex, sky_uv), rgbm_panorama_scale_factor);
+      ##else
+      half4 panorama;
+      BRANCH
+      if (rgbm_panorama_scale_factor != 1)
+      {
+        //compressed panorama: RGBM must be decoded per tap; hardware-filtering the shared
+        //multiplier M against RGB fringes at bright edges (sun rim, cloud silhouettes)
+        float2 crd = sky_uv * clouds_panorama_tex_res.xy - 0.5;
+        float2 wt = frac(crd);
+        float2 base = (floor(crd) + 0.5) * clouds_panorama_tex_res.zw;//sampler wraps U across the seam
+        half4 t00 = sampleLevel0(base);
+        half4 t10 = sampleLevel0(base + float2(clouds_panorama_tex_res.z, 0));
+        half4 t01 = sampleLevel0(base + float2(0, clouds_panorama_tex_res.w));
+        half4 t11 = sampleLevel0(base + clouds_panorama_tex_res.zw);
+        panorama = lerp(lerp(t00, t10, wt.x), lerp(t01, t11, wt.x), wt.y);
+      }
+      else
+        //factor 1 does not imply uncompressed: dim-sun presets clamp the RGBM scale to
+        //exactly 1 while still encoding, so the shared multiplier must be applied here
+        //too (identity on truly uncompressed data where .a == 1)
+        panorama = decode_rgbm(tex2D(clouds_panorama_tex, sky_uv), rgbm_panorama_scale_factor);
+      ##endif
       #endif
 
       // Similar logic is also present in lightningFlashPanorama.dshl
@@ -277,8 +274,10 @@ shader applyCloudsPanorama
 
       apply_lightning_flash(sky_uv, viewDirection, originalViewDirection, panorama.rgb);
 
-      float2 jitteredVolfogTc = get_volfog_dithered_screen_tc(screenpos.xy, input.texcoord.xy);
-      apply_sky_custom_fog(panorama.rgb, input.texcoord.xy, jitteredVolfogTc);
+      ##if special_vision == special_vision_off
+        float2 jitteredVolfogTc = get_volfog_dithered_screen_tc(screenpos.xy, input.texcoord.xy);
+        apply_sky_custom_fog(panorama.rgb, input.texcoord.xy, jitteredVolfogTc);
+      ##endif
 
       applySpecialVision(panorama);
 
@@ -287,11 +286,6 @@ shader applyCloudsPanorama
 
         result.rgb=half3(pack_hdr(panorama.rgb).rgb);
         result.a = GetLuminanceScaled(result.rgb);
-        //hide tonemap_on interval usage under assumed interval
-        //to avoid extra variants
-        ##if mobile_render != off && tonemap_on == on && use_postfx == off
-          result.rgb = performLUTTonemap(result.rgb);
-        ##endif
         result.a = retAlpha;
       #else
         half4 result=half4(pack_hdr(panorama.rgb).rgb, retAlpha);
@@ -341,9 +335,11 @@ shader clouds_panorama_mip
 
 
   (ps) {
-    clouds_panorama_tex@smp2d = clouds_panorama_tex;
+    clouds_panorama_tex@tex2d = clouds_panorama_tex;
     rgbm_panorama_scale_factor@f1 = (rgbm_panorama_scale_factor);
   }
+  INIT_GLOBAL_LINEAR_WRAP_U_CLAMP_V_SAMPLER(ps)
+  hlsl(ps) { #define clouds_panorama_tex_samplerstate global_linear_wrap_u_clamp_v_sampler }
 
   hlsl(ps) {
     float4 samplePanorama(float2 uv)
@@ -402,7 +398,7 @@ shader clouds_panorama_update_subpixel
 {
   WRITE_TO_TEX2D()
   (ps) {
-    clouds_panorama_temp_tex@smp2d = clouds_panorama_temp_tex;
+    clouds_panorama_temp_tex@tex2d = clouds_panorama_temp_tex;
     clouds_panorama_subpixel@f4 = clouds_panorama_subpixel;
     //clouds_panorama_tex_res@f4 = (clouds_panorama_tex_res.x,clouds_panorama_tex_res.y, 1/clouds_panorama_tex_res.x,1/clouds_panorama_tex_res.y);
   }

@@ -16,6 +16,11 @@ IGenPointingClassDrv *createWinMouseClassDriver();
 
 IGenJoystickClassDrv *createJoystickClassDriver(bool exclude_xinput = false, bool remap_360 = false);
 IGenJoystickClassDrv *createXinputJoystickClassDriver(bool should_mix_input = false);
+IGenJoystickClassDrv *createGameInputJoystickClassDriver(bool should_mix_input = false);
+IGenJoystickClassDrv *createGameInputFlightStickClassDriver();
+CompositeJoystickClassDriver *createGameInputCompositeJoystickClassDriver(bool should_mix_input = false, bool add_flight_stick = true);
+IGenKeyboardClassDrv *createGameInputKeyboardClassDriver();
+IGenPointingClassDrv *createGameInputPointingClassDriver(bool emu_mouse = false, bool hw_mouse = false);
 IGenJoystickClassDrv *createSteamJoystickClassDriver(const char *absolute_path_to_controller_config);
 
 CompositeJoystickClassDriver *createPS4CompositeJoystickClassDriver();
@@ -27,7 +32,6 @@ IGenKeyboardClassDrv *createPS4KeyboardClassDriver();
 IGenJoystickClassDrv *createTvosJoystickClassDriver();
 
 IGenPointingClassDrv *createMouseEmuClassDriver();
-IGenKeyboardClassDrv *createKeyboardEmuClassDriver();
 
 IGenKeyboardClassDrv *createNullKeyboardClassDriver();
 IGenPointingClassDrv *createNullMouseClassDriver();
@@ -50,14 +54,21 @@ void showScreenKeyboard(bool show);
 int getScreenKeyboardStatus_android();
 #endif
 #if _TARGET_HAS_IME
-typedef void (*OnFinishIME)(void *userdata, const char *str, int cursor, int status);
-typedef bool (*OnShowIME)(const DataBlock &init_params, OnFinishIME on_finish_cb, void *userdata);
+enum
+{
+  IME_STATUS_ERROR = -1,
+  IME_STATUS_CANCELLED = 0,
+  IME_STATUS_CLOSED = 1,
+  IME_STATUS_UPDATED = 2,
+};
+typedef void (*OnUpdateIME)(void *userdata, const char *str, int cursor, int status);
+typedef bool (*OnShowIME)(const DataBlock &init_params, OnUpdateIME on_update_cb, void *userdata);
 //! returns true when showScreenKeyboard_IME() is supported by system
 bool isImeAvailable();
 //! shows IME (screen keyboard);
 //! init_params is open-spec data container (see engine/workCycle/ps4/orbisIME.cpp for details)
 //! supplied callback is called when input is finished;
 //! return status: 1=OK, 0=cancelled, -1=aborted
-bool showScreenKeyboard_IME(const DataBlock &init_params, OnFinishIME on_finish_cb, void *userdata);
+bool showScreenKeyboard_IME(const DataBlock &init_params, OnUpdateIME on_update_cb, void *userdata);
 #endif
 } // namespace HumanInput

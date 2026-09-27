@@ -21,20 +21,132 @@
 #include <daECS/core/componentTypes.h>
 #include <generic/dag_fixedMoveOnlyFunction.h>
 #include <ecs/anim/animchar_visbits.h>
-#include <render/world/animCharRenderAdditionalData.h>
+#include <ecs/render/renderEvent.h>
+#include <render/dynmodelRenderer.h>
+#include <render/resourceSlot/nodeHandleWithSlotsAccess.h>
 
 struct RiGenVisibility;
 struct CameraParams;
 class Occlusion;
 // all render events are called with broadcastImmediate. It is just generalized update stage.
 
+class CameraNodesRegistratorStorage
+{
+  eastl::vector<dafg::NodeHandle> *nodes;
+  uint32_t offset;
+  uint32_t oldReservedSpace;
+  uint32_t written = 0;
+  bool hasOverflow = false;
+
+public:
+  CameraNodesRegistratorStorage(eastl::vector<dafg::NodeHandle> &nodes_storage, uint32_t range_offset, uint32_t range_size) :
+    nodes(&nodes_storage), offset(range_size ? range_offset : uint32_t(nodes_storage.size())), oldReservedSpace(range_size)
+  {}
+
+  void push_back(dafg::NodeHandle &&node)
+  {
+    const bool hasReservedSpace = !hasOverflow && oldReservedSpace > 0;
+
+    if (hasReservedSpace)
+    {
+      if (written < oldReservedSpace)
+        (*nodes)[offset + written] = eastl::move(node);
+      else
+      {
+        const uint32_t newOffset = (uint32_t)nodes->size();
+
+        for (uint32_t i = 0; i < written; ++i)
+        {
+          nodes->push_back();
+          nodes->back() = eastl::move((*nodes)[offset + i]);
+        }
+        nodes->push_back(eastl::move(node));
+
+        hasOverflow = true;
+        offset = newOffset;
+      }
+    }
+    else
+      nodes->push_back(eastl::move(node));
+
+    ++written;
+  }
+
+  void clearUnused()
+  {
+    for (uint32_t i = written; i < oldReservedSpace; ++i)
+      (*nodes)[offset + i] = {};
+  }
+
+  uint32_t getWritten() const { return written; }
+  uint32_t getOffset() const { return offset; }
+  bool isOverflowed() const { return hasOverflow; }
+};
+
 struct OnCameraNodeConstruction : public ecs::Event
 {
   ECS_BROADCAST_EVENT_DECL(OnCameraNodeConstruction)
-  OnCameraNodeConstruction(eastl::vector<dafg::NodeHandle> *nodes_storage) :
-    ECS_EVENT_CONSTRUCTOR(OnCameraNodeConstruction), nodes(nodes_storage)
+  OnCameraNodeConstruction(eastl::vector<dafg::NodeHandle> *nodes_storage,
+    const bool has_opaque_prepass,
+    const bool gi_needs_reprojection,
+    const bool need_depth_history,
+    const bool is_bare_minimum,
+    const bool has_motion_vectors) :
+    ECS_EVENT_CONSTRUCTOR(OnCameraNodeConstruction),
+    nodes(nodes_storage),
+    hasOpaquePrepass(has_opaque_prepass),
+    giNeedsReprojection(gi_needs_reprojection),
+    needDepthHistory(need_depth_history),
+    isBareMinimum(is_bare_minimum),
+    hasMotionVectors(has_motion_vectors)
   {}
   eastl::vector<dafg::NodeHandle> *nodes;
+
+  bool hasOpaquePrepass = true;
+  bool giNeedsReprojection = true;
+  bool needDepthHistory = true;
+  bool isBareMinimum = false;
+  bool hasMotionVectors = true;
+};
+
+struct OnCameraNodeWithSlotsConstruction : public ecs::Event
+{
+  ECS_BROADCAST_EVENT_DECL(OnCameraNodeWithSlotsConstruction)
+  OnCameraNodeWithSlotsConstruction(eastl::vector<resource_slot::NodeHandleWithSlotsAccess> *slot_nodes_storage) :
+    ECS_EVENT_CONSTRUCTOR(OnCameraNodeWithSlotsConstruction), slotNodes(slot_nodes_storage)
+  {}
+  eastl::vector<resource_slot::NodeHandleWithSlotsAccess> *slotNodes;
+};
+
+struct OnCameraMainViewNodeConstruction : public ecs::Event
+{
+  ECS_UNICAST_EVENT_DECL(OnCameraMainViewNodeConstruction)
+  OnCameraMainViewNodeConstruction(const char *view_ns_name, CameraNodesRegistratorStorage *nodes_storage, bool has_opaque_prepass) :
+    ECS_EVENT_CONSTRUCTOR(OnCameraMainViewNodeConstruction),
+    viewNsName(view_ns_name),
+    nodes(nodes_storage),
+    hasOpaquePrepass(has_opaque_prepass)
+  {}
+  const char *viewNsName;
+  CameraNodesRegistratorStorage *nodes;
+  bool hasOpaquePrepass;
+};
+
+struct OnCameraPerViewNodeConstruction : public ecs::Event
+{
+  ECS_UNICAST_EVENT_DECL(OnCameraPerViewNodeConstruction)
+  OnCameraPerViewNodeConstruction(
+    bool is_main_view, const char *view_ns_name, CameraNodesRegistratorStorage *nodes_storage, bool has_opaque_prepass) :
+    ECS_EVENT_CONSTRUCTOR(OnCameraPerViewNodeConstruction),
+    isMainView(is_main_view),
+    viewNsName(view_ns_name),
+    nodes(nodes_storage),
+    hasOpaquePrepass(has_opaque_prepass)
+  {}
+  bool isMainView;
+  const char *viewNsName;
+  CameraNodesRegistratorStorage *nodes;
+  bool hasOpaquePrepass;
 };
 
 struct QueryShooterCamDistanceMultipliers : public ecs::Event
@@ -47,21 +159,29 @@ struct QueryShooterCamDistanceMultipliers : public ecs::Event
   float *impostorDistMul;
 };
 
+// Broadcast right before the world's framegraph multiplexing extents are
+// finalized, seeded with the renderer's defaults. A feature may raise any
+// dimension's extent to multiplex extra passes over it (e.g. the AA benchmark
+// iterating ground-truth accumulation over the sub-sample dimension). A consumer
+// should only override a dimension left unused by the renderer (extent == 1).
+// TODO: make screenshot nodes use this override mechanism instead of the current approach
+struct QueryMultiplexingExtents : public ecs::Event
+{
+  ECS_BROADCAST_EVENT_DECL(QueryMultiplexingExtents)
+  QueryMultiplexingExtents(dafg::multiplexing::Extents *extents) : ECS_EVENT_CONSTRUCTOR(QueryMultiplexingExtents), extents(extents) {}
+  dafg::multiplexing::Extents *extents;
+};
+
 struct UpdateBlurredUI : public ecs::Event
 {
   const IBBox2 *begin;
   const IBBox2 *end;
   int max_mip;
+  BaseTexture *uiTex;
   ECS_BROADCAST_EVENT_DECL(UpdateBlurredUI)
-  UpdateBlurredUI(const IBBox2 *begin, const IBBox2 *end, int max_mip) :
-    ECS_EVENT_CONSTRUCTOR(UpdateBlurredUI), begin(begin), end(end), max_mip(max_mip)
+  UpdateBlurredUI(const IBBox2 *begin, const IBBox2 *end, int max_mip, BaseTexture *ui_tex) :
+    ECS_EVENT_CONSTRUCTOR(UpdateBlurredUI), begin(begin), end(end), max_mip(max_mip), uiTex(ui_tex)
   {}
-};
-struct OnLevelLoaded : public ecs::Event
-{
-  const DataBlock &level_blk;
-  ECS_BROADCAST_EVENT_DECL(OnLevelLoaded)
-  OnLevelLoaded(const DataBlock &lev_blk) : ECS_EVENT_CONSTRUCTOR(OnLevelLoaded), level_blk(lev_blk) {}
 };
 struct BeforeDraw : public ecs::Event
 {
@@ -81,10 +201,15 @@ struct SetResolutionEvent : public ecs::Event
     SETTINGS_CHANGED,
     DYNAMIC_RESOLUTION
   } type;
-  IPoint2 displayResolution, renderingResolution, postFxResolution;
+  IPoint2 displayResolution, renderingResolution, postFxResolution, maxPossibleRenderResolution;
   ECS_BROADCAST_EVENT_DECL(SetResolutionEvent)
-  SetResolutionEvent(Type type, const IPoint2 &dr, const IPoint2 &rr, const IPoint2 &pr) :
-    ECS_EVENT_CONSTRUCTOR(SetResolutionEvent), type(type), displayResolution(dr), renderingResolution(rr), postFxResolution(pr)
+  SetResolutionEvent(Type type, const IPoint2 &dr, const IPoint2 &rr, const IPoint2 &pr, const IPoint2 &mpr) :
+    ECS_EVENT_CONSTRUCTOR(SetResolutionEvent),
+    type(type),
+    displayResolution(dr),
+    renderingResolution(rr),
+    postFxResolution(pr),
+    maxPossibleRenderResolution(mpr)
   {}
 };
 
@@ -115,14 +240,16 @@ struct BeforeDrawPostFx : public ecs::Event
 
 struct RenderPostFx : public ecs::Event
 {
-  TextureIDPair downsampledColor, prevRTColor;
-  TextureIDPair closedDepth, targetDepth;
+  BaseTexture *downsampledColor;
+  BaseTexture *prevRTColor;
+  BaseTexture *closedDepth;
+  BaseTexture *targetDepth;
   float zNear, zFar, fovScale;
   ECS_BROADCAST_EVENT_DECL(RenderPostFx)
-  RenderPostFx(TextureIDPair downsampled_color,
-    TextureIDPair prev_rt_color,
-    TextureIDPair closed_depth,
-    TextureIDPair target_depth,
+  RenderPostFx(BaseTexture *downsampled_color,
+    BaseTexture *prev_rt_color,
+    BaseTexture *closed_depth,
+    BaseTexture *target_depth,
     float z_near,
     float z_far,
     float fov_scale) :
@@ -135,6 +262,37 @@ struct RenderPostFx : public ecs::Event
     zFar(z_far),
     fovScale(fov_scale)
   {}
+};
+
+namespace bvh
+{
+struct Context;
+using ContextId = Context *;
+} // namespace bvh
+
+struct GatherSplinegenBVHDataEvent : public ecs::Event
+{
+  bvh::ContextId contextId;
+
+  ECS_BROADCAST_EVENT_DECL(GatherSplinegenBVHDataEvent)
+  GatherSplinegenBVHDataEvent(bvh::ContextId contextId) : ECS_EVENT_CONSTRUCTOR(GatherSplinegenBVHDataEvent), contextId(contextId) {}
+};
+
+struct BVHConnection;
+struct GatherSmokeTracersBVHDataEvent : public ecs::Event
+{
+  BVHConnection *connection;
+
+  ECS_BROADCAST_EVENT_DECL(GatherSmokeTracersBVHDataEvent)
+  GatherSmokeTracersBVHDataEvent(BVHConnection *connection) :
+    ECS_EVENT_CONSTRUCTOR(GatherSmokeTracersBVHDataEvent), connection(connection)
+  {}
+};
+
+struct RemoveSplinegenBVHEvent : public ecs::Event
+{
+  ECS_BROADCAST_EVENT_DECL(RemoveSplinegenBVHEvent)
+  RemoveSplinegenBVHEvent() : ECS_EVENT_CONSTRUCTOR(RemoveSplinegenBVHEvent) {}
 };
 
 struct AfterRenderWorld : public ecs::Event
@@ -189,14 +347,11 @@ struct RenderHmapDeform : public ecs::Event
 struct VehicleCockpitPrepass : public ecs::Event
 {
   TMatrix viewTm;
+  TexStreamingContext texCtx;
   ECS_BROADCAST_EVENT_DECL(VehicleCockpitPrepass)
-  VehicleCockpitPrepass(const TMatrix &view_tm) : ECS_EVENT_CONSTRUCTOR(VehicleCockpitPrepass), viewTm(view_tm) {}
-};
-
-struct RenderReinitCube : public ecs::Event
-{
-  ECS_BROADCAST_EVENT_DECL(RenderReinitCube)
-  RenderReinitCube() : ECS_EVENT_CONSTRUCTOR(RenderReinitCube) {}
+  VehicleCockpitPrepass(const TMatrix &view_tm, const TexStreamingContext &tex_ctx) :
+    ECS_EVENT_CONSTRUCTOR(VehicleCockpitPrepass), viewTm(view_tm), texCtx(tex_ctx)
+  {}
 };
 
 struct RenderSetExposure : public ecs::Event
@@ -206,10 +361,6 @@ struct RenderSetExposure : public ecs::Event
   RenderSetExposure(bool value) : ECS_EVENT_CONSTRUCTOR(RenderSetExposure), value(value) {}
 };
 
-namespace dynmodel_renderer
-{
-struct DynModelRenderingState;
-}
 class AnimCharShadowOcclusionManager;
 class Occlusion;
 class GlobalVariableStates;
@@ -228,35 +379,35 @@ static_assert(is_pow2(AnimcharRenderAsyncFilter::ARF_IDX_COUNT), "AnimcharRender
 
 struct AnimcharRenderAsyncEvent : public ecs::Event
 {
-  dynmodel_renderer::DynModelRenderingState &state;
+  dynrend::ContextId ctx;
   const GlobalVariableStates *globVarsState;
   const Occlusion *occlusion;
   const Frustum cullingFrustum;
-  const animchar_visbits_t add_vis_bits, check_bits;
+  const animchar_visbits_t add_vis_bits, require_any_vis_bits, reject_if_any_vis_bits;
   const uint8_t filterMask;
   const bool needPrevious;
   const AnimcharRenderAsyncFilter eidFilter;
   TexStreamingContext texCtx;
   ECS_INSIDE_EVENT_DECL(AnimcharRenderAsyncEvent, ::ecs::EVCAST_BROADCAST | ::ecs::EVFLG_PROFILE)
-  AnimcharRenderAsyncEvent(dynmodel_renderer::DynModelRenderingState &state_,
+  AnimcharRenderAsyncEvent(dynrend::ContextId ctx_,
     const GlobalVariableStates *gvars_state,
     const Occlusion *occlusion_,
     const Frustum &frustum_,
-    // uint32_t hints_,
     animchar_visbits_t add_vis_bits_,
-    animchar_visbits_t check_bits_,
+    animchar_visbits_t require_any_vis_bits_,
+    animchar_visbits_t reject_if_any_vis_bits_,
     uint8_t filter_mask,
     bool needPrevious_,
     AnimcharRenderAsyncFilter eid_filter,
     TexStreamingContext tex_context = TexStreamingContext(0)) :
     ECS_EVENT_CONSTRUCTOR(AnimcharRenderAsyncEvent),
-    state(state_),
+    ctx(ctx_),
     globVarsState(gvars_state),
     occlusion(occlusion_),
     cullingFrustum(frustum_),
-    // hints(hints_),
     add_vis_bits(add_vis_bits_),
-    check_bits(check_bits_),
+    require_any_vis_bits(require_any_vis_bits_),
+    reject_if_any_vis_bits(reject_if_any_vis_bits_),
     filterMask(filter_mask),
     needPrevious(needPrevious_),
     eidFilter(eid_filter),
@@ -269,10 +420,10 @@ struct RenderLateTransEvent : public ecs::Event
   TMatrix viewTm;
   Point3 cameraWorldPos;
   TexStreamingContext texCtx;
-  ManagedTexView prevFrameTex;
+  Texture *prevFrameTex;
   ECS_BROADCAST_EVENT_DECL(RenderLateTransEvent)
   RenderLateTransEvent(
-    const TMatrix &view_tm, const Point3 &camera_world_pos, const TexStreamingContext &tex_ctx, ManagedTexView prev_frame_tex) :
+    const TMatrix &view_tm, const Point3 &camera_world_pos, const TexStreamingContext &tex_ctx, Texture *prev_frame_tex) :
     viewTm(view_tm),
     cameraWorldPos(camera_world_pos),
     texCtx(tex_ctx),
@@ -298,6 +449,38 @@ struct ResetAoEvent : public ecs::Event
   } state;
   ECS_BROADCAST_EVENT_DECL(ResetAoEvent)
   ResetAoEvent(IPoint2 ao_resolution, State state) : ECS_EVENT_CONSTRUCTOR(ResetAoEvent), aoResolution(ao_resolution), state(state) {}
+};
+
+struct ResetAoNodes : public ecs::Event
+{
+  bool useGtao = false;
+  int aoW;
+  int aoH;
+  uint32_t creationFlags;
+  ECS_BROADCAST_EVENT_DECL(ResetAoNodes)
+  ResetAoNodes(bool use_gtao, int ao_w, int ao_h, uint32_t creation_flags) :
+    ECS_EVENT_CONSTRUCTOR(ResetAoNodes), useGtao(use_gtao), aoW(ao_w), aoH(ao_h), creationFlags(creation_flags)
+  {}
+};
+
+enum class SSRQuality;
+
+struct SsrNodesConfig
+{
+  int w = 0;
+  int h = 0;
+  uint32_t fmt = 0;
+  int denoiserType = 0;
+  SSRQuality quality = {};
+  bool isFullres = false;
+};
+ECS_DECLARE_RELOCATABLE_TYPE(SsrNodesConfig)
+
+struct ResetSsrNodes : public ecs::Event
+{
+  SsrNodesConfig config;
+  ECS_BROADCAST_EVENT_DECL(ResetSsrNodes)
+  ResetSsrNodes(const SsrNodesConfig &cfg) : ECS_EVENT_CONSTRUCTOR(ResetSsrNodes), config(cfg) {}
 };
 
 struct UpdateStageInfoNeedDistortion : public ecs::Event, public TransformHolder
@@ -343,18 +526,21 @@ struct RenderStaticSceneEvent : public ecs::Event
 struct RenderDecalsOnDynamic : public ecs::Event
 {
   TMatrix viewTm;
+  TMatrix4 projTm; // must match whatever the broadcaster set as TM_PROJ
   Point3 mainCamPos;
   Frustum cullingFrustum;
   const Occlusion *occlusion;
   TexStreamingContext texCtx;
   ECS_BROADCAST_EVENT_DECL(RenderDecalsOnDynamic);
   RenderDecalsOnDynamic(const TMatrix &view_tm,
+    const TMatrix4 &proj_tm,
     const Point3 &main_cam_pos,
     const Frustum &culling_frustum,
     const Occlusion *occlusion_,
     TexStreamingContext tex_ctx) :
     ECS_EVENT_CONSTRUCTOR(RenderDecalsOnDynamic),
     viewTm(view_tm),
+    projTm(proj_tm),
     mainCamPos(main_cam_pos),
     cullingFrustum(culling_frustum),
     occlusion(occlusion_),
@@ -371,13 +557,14 @@ struct RenderDecalsOnDynamic : public ecs::Event
   DEF_RENDER_PROF_EVENT(RenderEventDebugGUI)
 
 #define DEF_RENDER_EVENTS                                                                              \
-  DEF_RENDER_EVENT(UnloadLevel)                                                                        \
+  DEF_RENDER_EVENT(OnWorldRendererCreated)                                                             \
   DEF_RENDER_EVENT(OnRenderDecals, TMatrix /*viewTm*/, TMatrix /*viewItm*/, Point3 /*cameraWorldPos*/, \
     TexStreamingContext /*texCtx*/, const RiGenVisibility * /*rendinstMainVisibility*/)                \
   DEF_RENDER_EVENT(RenderDecalsOnGlass)                                                                \
+  DEF_RENDER_EVENT(RenderDecalsOnGlassDynamic)                                                         \
   DEF_RENDER_EVENT(RenderDecalsGlassMask)                                                              \
-  DEF_RENDER_EVENT(AfterDeviceReset, bool /*fullReset*/)                                               \
   DEF_RENDER_EVENT(RegisterPostfxResources, dafg::Registry)                                            \
+  DEF_RENDER_EVENT(RegisterDistortionModifiersResources, dafg::Registry)                               \
   DEF_RENDER_EVENT(AfterShaderReload)
 
 
@@ -412,3 +599,11 @@ using BVHAdditionalAnimcharIterateCallback = dag::FixedMoveOnlyFunction<32,
     animchar_additional_data::AnimcharAdditionalDataView,
     const animchar_visbits_t &)>;
 ECS_BROADCAST_EVENT_TYPE(BVHAdditionalAnimcharIterate, BVHAdditionalAnimcharIterateCallback &)
+ECS_BROADCAST_EVENT_TYPE(BVHDagdpChanged)
+
+ECS_BROADCAST_EVENT_TYPE(ChangeRenderFeaturesEarly)
+ECS_BROADCAST_EVENT_TYPE(SetAntialiasing)
+
+ECS_BROADCAST_EVENT_TYPE(RenderAlbedoVoxelization, BBox3 /*cullBox*/, bool /*outRenderedAnything*/)
+ECS_BROADCAST_EVENT_TYPE(RenderSdfVoxelization, BBox3 /*cullBox*/, bool /*outRenderedAnything*/)
+ECS_BROADCAST_EVENT_TYPE(SetGrassSdfEareaser, bool /* enable */)

@@ -8,6 +8,7 @@
 #include <assets/assetMgr.h>
 #include <libTools/util/makeBindump.h>
 #include <libTools/util/iLogWriter.h>
+#include <libTools/util/appDirRelativePath.h>
 #include <scriptHelpers/scriptHelpers.h>
 #include <fx/effectClassTools.h>
 #include <fx/dag_commonFx.h>
@@ -27,7 +28,7 @@ public:
 
   const char *__stdcall getAssetType() const override { return TYPE; }
   unsigned __stdcall getGameResClassId() const override { return EffectGameResClassId; }
-  unsigned __stdcall getGameResVersion() const override { return 159; }
+  unsigned __stdcall getGameResVersion() const override { return 167; }
 
   void __stdcall onRegister() override {}
   void __stdcall onUnregister() override {}
@@ -127,7 +128,7 @@ public:
       Ref &r = refs.push_back();
       r.flags = RFLG_EXTERNAL;
 
-      if (!name || !typeName)
+      if (!name || !typeName || strcmp(name, "") == 0)
       {
         r.flags |= RFLG_OPTIONAL;
         r.refAsset = NULL;
@@ -148,11 +149,9 @@ class EffectExporterPlugin : public IDaBuildPlugin
 public:
   bool __stdcall init(const DataBlock &appblk) override
   {
-    const char *fx_nut = appblk.getBlockByNameEx("assets")->getStr("fxScriptsDir", NULL);
-    if (fx_nut)
-      fx_devres_base_path.printf(260, "%s/%s/", appblk.getStr("appDir", "."), fx_nut);
+    make_eff_app_relative_path(fx_devres_base_path, appblk.getBlockByNameEx("assets")->getStr("fxScriptsDir", nullptr));
 
-    register_all_common_fx_tools();
+    register_all_common_fx_tools(appblk);
     return true;
   }
   void __stdcall destroy() override { delete this; }

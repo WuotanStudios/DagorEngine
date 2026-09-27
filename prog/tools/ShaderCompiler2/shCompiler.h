@@ -44,15 +44,15 @@ void resetCompiler();
 void reset_source_file();
 
 // check shader file cache & return true, if cache needs recompilation
-CompilerAction should_recompile(const ShCompilationInfo &comp);
-bool should_recompile_sh(const ShCompilationInfo &comp, const String &sourceFileName);
+CompilerAction should_recompile(const CompilationContext &ctx);
+bool should_recompile_sh(const CompilationContext &ctx, const String &sourceFileName);
 
 // compile shader files & generate variants to disk. return false, if error occurs
-void compileShader(CompilerAction compiler_action, bool no_save, bool should_rebuild, const shc::CompilationContext &comp);
+void compileShader(CompilerAction compiler_action, bool no_save, bool should_rebuild, shc::CompilationContext &comp);
 
 // build shader binary dump from compiled shaders (*.cached files)
 bool buildShaderBinDump(const char *bindump_fn, const char *sh_fn, bool forceRebuild, bool minidump, BindumpPackingFlags pack_flags,
-  const shc::CompilationContext &comp);
+  shc::CompilationContext &comp);
 
 bool try_enter_shutdown();
 bool try_lock_shutdown();
@@ -60,12 +60,11 @@ void unlock_shutdown();
 
 String get_obj_file_name_from_source(const String &source_file_name, const ShCompilationInfo &comp);
 
-void setRequiredShadersBlock(DataBlock *block);
-void setRequiredShadersDef(bool on);
+void runPreshaderParse(const ShCompilationInfo &compInfo, CompilationContext &comp);
+
 void clearFlobVarRefList();
 void addExplicitGlobVarRef(const char *var_name);
 
-bool isShaderRequired(const char *shader_name);
 bool isGlobVarRequired(const char *var_name);
 
 
@@ -87,7 +86,7 @@ struct Job : cpujobs::IJob
 {
 public:
   Job();
-  const char *getJobName(bool &) const override final { return "ShaderCompilerJob"; }
+  const char *getJobName(bool &) const override final { return DAPROFILER_STRING("ShaderCompilerJob"); }
   void doJob() final;
   void releaseJob() final;
 
@@ -96,18 +95,13 @@ protected:
   virtual void releaseJobBody() = 0;
 };
 
-enum class JobMgrChoiceStrategy
-{
-  ROUND_ROBIN,
-  LEAST_BUSY_COOPERATIVE
-};
-
 void init_jobs(unsigned num_workers);
 void deinit_jobs();
 unsigned worker_count();
 unsigned max_allowed_process_count();
 bool is_multithreaded();
+int current_worker();
 bool is_in_worker();
 void await_all_jobs(void (*on_released_cb)() = nullptr);
-void add_job(Job *job, JobMgrChoiceStrategy mgr_choice_strat);
+void add_job(Job *job);
 } // namespace shc

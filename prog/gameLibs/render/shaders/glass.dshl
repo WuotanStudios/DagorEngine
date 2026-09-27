@@ -1,10 +1,13 @@
 include "glass_hole_mask.dshl"
 include "glass_gbuffer_inc.dshl"
-include "use_tiled_lights.dshl"
+include "clusteredViewLights.dshl"
 include "glass_dual_source_blending_inc.dshl"
 
 int glass_dynamic_light = 0;
 interval glass_dynamic_light: no < 1, yes;
+
+int rendinst_reactive_mask_pass = 0;
+interval rendinst_reactive_mask_pass: no < 1, yes;
 
 interval special_vision : special_vision_off<1, thermal_vision;
 
@@ -17,10 +20,21 @@ int use_glass_backface_light = 0;
 interval use_glass_backface_light : no < 1, yes;
 assume_if_not_assumed use_glass_backface_light = no;
 
-macro INIT_COMMON_GLASS()
+int allow_rt_glass_reflection = 1;
+interval allow_rt_glass_reflection : no < 1, yes;
+assume_if_not_assumed allow_rt_glass_reflection = yes;
+
+macro INIT_RT_GLASS_REFLECTION_SUPPORT()
+  static int asset_supports_rt_glass_reflection = 1 no_warnings;
+  interval asset_supports_rt_glass_reflection: no < 1, yes;
+
+  bool use_rt_glass_reflection = asset_supports_rt_glass_reflection == yes && allow_rt_glass_reflection == yes;
+endmacro
+
+macro INIT_COMMON_GLASS(generate_transparent_gbuffer_pass)
   texture tex = material.texture.diffuse;
 
-  texture normal = material.texture[2];
+  texture normal = material.texture[2] stub=(0.9, 0.5, 0, 0.5);
   render_trans;
 
 
@@ -33,11 +47,6 @@ macro INIT_COMMON_GLASS()
     cull_mode = none;
   }
 
-  hlsl(ps) {
-    ##if normal != NULL
-      #define hasNormal 1
-    ##endif
-  }
   hlsl {
     struct VsOutput
     {
@@ -46,8 +55,10 @@ macro INIT_COMMON_GLASS()
       float2 texcoord               : TEXCOORD0;
       float3 normal                 : TEXCOORD1;
       float3 pointToEye             : TEXCOORD2;
-      float3 fogMul                 : TEXCOORD3;
-      float3 fogAdd                 : TEXCOORD4;
+      ##if !(generate_transparent_gbuffer_pass)
+        float3 fogMul                 : TEXCOORD3;
+        float3 fogAdd                 : TEXCOORD4;
+      ##endif
       float4 clipPos                : TEXCOORD5;
       #if defined(VSOUT_DRAW_ID)
         VSOUT_DRAW_ID
@@ -78,15 +89,27 @@ macro GLASS_BACKFACE_LIGHT_BLENDING()
   z_write = false;
 endmacro
 
-macro INIT_SIMPLE_GLASS()
-  INIT_COMMON_GLASS()
+macro INIT_SIMPLE_GLASS(generate_transparent_gbuffer_pass)
+  INIT_COMMON_GLASS(generate_transparent_gbuffer_pass)
   static int atest = 0;
   interval atest: atestOff < 1, atestOn;
 
   static float4 tint_color = (1.0, 1.0, 1.0, 0.0);
   interval tint_color: enabled < 1, default;
 
-  if (special_vision == thermal_vision)
+  if (is_transparent_triangle_debug)
+  {
+    blend_src = one; blend_dst = zero;
+    blend_asrc = one; blend_adst = zero;
+    z_write = false;
+  }
+  else if (generate_transparent_gbuffer_pass)
+  {
+    blend_src = one; blend_dst = zero;
+    blend_asrc = one; blend_adst = zero;
+    z_write = true;
+  }
+  else if (special_vision == thermal_vision)
   {
     z_write = true;
   }
@@ -140,38 +163,38 @@ macro INIT_GLASS_NIGHT_EMISSION()
   }
 endmacro
 
-macro INIT_REFRACTION_GLASS()
-  INIT_COMMON_GLASS()
+macro INIT_REFRACTION_GLASS(generate_transparent_gbuffer_pass)
+  INIT_COMMON_GLASS(generate_transparent_gbuffer_pass)
+  INIT_REFRACTION_GLASS_BASE(generate_transparent_gbuffer_pass)
+endmacro
+
+macro INIT_REFRACTION_GLASS_BASE(generate_transparent_gbuffer_pass)
   float4 mediumTintColor = material.diffuse; //tint color
   static float min_thickness = 0.02;
   static float max_thickness = 0.2;
   static float isShell = 1;
   static float glassIoR = 1.5;
-  texture isShellTex = material.texture[1];
+  static int diffuse_is_tint = 0;
 
-  (ps) {
-    mediumTintColor@f4 = (mediumTintColor.r, mediumTintColor.g, mediumTintColor.b, isShell);
-    mediumThickness@f4 = (min_thickness, max_thickness, 1./glassIoR, ((1-glassIoR)*(1-glassIoR))/((1+glassIoR)*(1+glassIoR)));
-    isShellTex@static = isShellTex;
-  }
-  hlsl(ps) {
-    #define isRefractionGlass 1
-    ##if isShellTex!=NULL
-      #define hasShellTex 1
-    ##endif
+  if(rendinst_transparent_gbuffer_pass != generate)
+  {
+    (ps) {
+      mediumTintColor@f4 = (mediumTintColor.r, mediumTintColor.g, mediumTintColor.b, isShell);
+      mediumThickness@f4 = (min_thickness, max_thickness, 1./glassIoR, ((1-glassIoR)*(1-glassIoR))/((1+glassIoR)*(1+glassIoR)));
+      diffuse_is_tint@i1 = diffuse_is_tint;
+    }
+    hlsl(ps) {
+      #define isRefractionGlass 1
+    }
   }
 endmacro
 
-macro INIT_GLASS_USE_TILED_LIGHTS()
+macro INIT_GLASS_USE_DYNAMIC_LIGHTS()
   if (glass_dynamic_light == yes && compatibility_mode == compatibility_mode_off)
   {
     WRITE_GBUFFER()
-    INIT_AND_USE_TILED_LIGHTS_WITHOUT_SSSS(ps)
-    (ps)
-    {
-      screen_size@f2 = (1./screen_pos_to_texcoord.x, 1./screen_pos_to_texcoord.y,0,0);
-    }
-    hlsl(ps){#define GLASS_USE_TILED_LIGHTS 1}
+    INIT_AND_USE_CLUSTERED_VIEW_LIGHTS(ps)
+    hlsl(ps){#define GLASS_USE_DYNAMIC_LIGHTS 1}
   }
 endmacro
 
@@ -186,7 +209,7 @@ hlsl(ps)
 {
   struct GlassOutput
   {
-    ##if (allow_glass_normal_pass && glass_normal_pass == yes)
+    ##if (allow_glass_normal_pass && rendinst_transparent_gbuffer_pass == generate)
       float4 normal : SV_Target0;
     ##else
       #if SIMPLE_GLASS_DUAL_SOURCE_BLENDING_ENABLED
@@ -197,7 +220,7 @@ hlsl(ps)
     ##endif
   };
 
-##if !(allow_glass_normal_pass && glass_normal_pass == yes)
+##if !(allow_glass_normal_pass && rendinst_transparent_gbuffer_pass == generate)
   #if isSimpleGlass && !SIMPLE_GLASS_DUAL_SOURCE_BLENDING_ENABLED
     #include <hsv_rgb_conversion.hlsl>
 
@@ -221,7 +244,22 @@ hlsl(ps)
 
   #include "glassEnviProbeSample.hlsl"
 
+##if shader == dynamic_refraction
+  float get_refraction_mip(float roughnessMip, float dist)
+  {
+    const float refractionMipCompensationStrength = 1.2;
+    const float refractionMipCompensationStartDist = 4.0;
+    return roughnessMip - (NUM_PROBE_MIPS - get_refraction_tex_mip_count())
+         - refractionMipCompensationStrength * log2(max(dist / refractionMipCompensationStartDist, 1.0));
+  }
+##endif
+
+#if OVERWRITE_GLASS_PROPERTIES_WITH_FUNCTION_ARGS
+  GlassOutput apply_glass_base(VsOutput input, float4 screenpos, half4 diffuseColor, half3 worldNormal, half thickness,
+    float smoothness, bool is_back_face, float4 mediumTintColor, float2 glassIoR_specular)
+#else
   GlassOutput apply_glass_base(VsOutput input, float4 screenpos, half4 diffuseColor, half3 worldNormal, half thickness, float smoothness, bool is_back_face = false)
+#endif
   {
 #if ICON_RENDER
     if (any(icon_silhouette_color.rgb != 0.0))
@@ -250,11 +288,16 @@ hlsl(ps)
     ##endif
 
     #if !isRefractionGlass
-      float glassIoR = 1. / 1.5;
+      float airToGlassIoR = 1. / 1.5;
       float glassSpecular = 0.04;//pow2((glassIoR-1)/(glassIoR+1));//0.04
     #else
-      float glassIoR = get_mediumThickness().z;
-      float glassSpecular = get_mediumThickness().w;
+      #if OVERWRITE_GLASS_PROPERTIES_WITH_FUNCTION_ARGS
+        float airToGlassIoR = 1. / glassIoR_specular.x;
+        float glassSpecular = glassIoR_specular.y;
+      #else
+        float airToGlassIoR = get_mediumThickness().z;
+        float glassSpecular = get_mediumThickness().w;
+      #endif
     #endif
 
     #if GLASS_HAS_BACKFACE_SPECULAR_LIGHT
@@ -286,16 +329,23 @@ hlsl(ps)
         #endif
       #endif
     #else
-      half3 mediumColor = diffuseColor.rgb*get_mediumTintColor().rgb;//doesn't have to be same as diffuseColor!
-      half isShell = get_mediumTintColor().a;
-      #if hasShellTex
-        isShell *= tex2DBindless(get_isShellTex(), input.texcoord).r;
+      #if OVERWRITE_GLASS_PROPERTIES_WITH_FUNCTION_ARGS
+        half3 mediumColor = mediumTintColor.rgb;
+        half isShell = mediumTintColor.a;
+      #else
+        half3 mediumColor = get_diffuse_is_tint() ? diffuseColor.rgb : get_mediumTintColor().rgb;
+        half isShell = get_mediumTintColor().a;
       #endif
-      float3 refractWorldDir = refract(-view, worldNormal, glassIoR);
+      float3 refractWorldDir = refract(-view, worldNormal, airToGlassIoR);
       float rayLengthSolid = thickness * (0.5 + 0.5*NoV);
       float rayLengthShell = thickness / max(NoV, 0.25);
       float rayLength = lerp(rayLengthSolid, rayLengthShell, isShell);
-      float3 refractionLight = mediumColor.rgb*fetchRefractedPixel(screenUV, cameraToPoint, refractWorldDir, rayLength, roughnessMip).rgb;
+      ##if shader == dynamic_refraction
+        float refractionMip = get_refraction_mip(roughnessMip, dist);
+      ##else
+        float refractionMip = roughnessMip;
+      ##endif
+      float3 refractionLight = mediumColor.rgb*fetchRefractedPixel(screenUV, cameraToPoint, refractWorldDir, rayLength, refractionMip).rgb;
 
       refractionLight *= 1 - fresnel;
       diffuseTerm = lerp(refractionLight, diffuseTerm, surfaceOpaqueness);
@@ -310,7 +360,7 @@ hlsl(ps)
       litColor *= (is_back_face ? get_backface_specular_multiplier() : 1.f);
     #endif
 
-    #if GLASS_USE_TILED_LIGHTS
+    #if GLASS_USE_DYNAMIC_LIGHTS
       UnpackedGbuffer gbuffer;
       init_gbuffer(gbuffer);
       init_material(gbuffer, SHADING_NORMAL);
@@ -325,7 +375,7 @@ hlsl(ps)
       packedGbuffer.smoothness_reflectance_metallTranslucency_shadow = fakeOutput.smoothness_reflectance_metallTranslucency_shadow;
       ProcessedGbuffer processedGbuffer = processGbuffer(unpackGbuffer(packedGbuffer));
       packedGbuffer.motion_reactive = 0;
-      litColor += get_dynamic_lighting(processedGbuffer, worldPos, view, input.clipPos.w, input.clipPos.xy, NoV, diffuseColor.rgb, screenUV, 1);
+      litColor += get_dynamic_lighting(processedGbuffer, worldPos, view, input.clipPos.w, screenpos.xy, NoV, glassSpecular, screenUV, 1);
     #endif
 
     float blendW = dstAmount;
@@ -385,38 +435,23 @@ hlsl(ps)
     #endif
     return result;
   }
-
-  GlassOutput apply_glass_ps(VsOutput input, float4 screenpos, half4 diffuseColor, float smoothness_const, bool is_back_face = false)
-  {
-    half thickness = 0;
-    #if hasNormal
-      half4 packedNormalMap = tex2DBindless(get_normal_tex(), input.texcoord);
-
-      half smoothness = packedNormalMap.r;
-      half3 normalMap = unpack_ag_normal(packedNormalMap);
-      half3 worldNormal = perturb_normal_precise(normalMap, normalize(input.normal.xyz), input.pointToEye.xyz, input.texcoord.xy);
-      #if isRefractionGlass
-        thickness = lerp(get_mediumThickness().x, get_mediumThickness().y, packedNormalMap.b);
-      #endif
-    #else
-      half3 worldNormal = normalize(input.normal.xyz);
-      half smoothness = smoothness_const;//there is nothing good here!
-      #if isRefractionGlass
-        thickness = get_mediumThickness().x;
-      #endif
-    #endif
-
-    return apply_glass_base(input, screenpos, diffuseColor, worldNormal, thickness, smoothness, is_back_face);
-  }
 ##endif
 }
 endmacro
 
-macro INIT_GLASS_TRANSP()
+macro INIT_GLASS_TRANSP_NO_TEX()
   static float transparency_mul = 1;
   (ps) { transparency_mul@f1 = (transparency_mul); }
   static int is_window = 1;
   (ps){is_window@i1 = is_window;}
+endmacro
+
+macro INIT_GLASS_TRANSP()
+  INIT_GLASS_TRANSP_NO_TEX()
+  (ps) {
+    diffuse_tex@staticSmp = tex;
+    normal_tex@staticSmp = normal;
+  }
 endmacro
 
 macro USE_GLASS(allow_glass_normal_pass)
@@ -435,16 +470,35 @@ macro USE_GLASS(allow_glass_normal_pass)
   GLASS_APPLY_FUNC_PS(allow_glass_normal_pass)
 endmacro
 
-macro GLASS_PS()
-  (ps) {
-    diffuse_tex@static = tex;
-    normal_tex@static = normal;
+define_macro_if_not_defined INIT_AND_USE_HERO_COCKPIT_DISCARD_TRANSPARENCY()
+  hlsl(ps) {
+    void hero_cockpit_discard_transparency(float3 world_pos, float2 tc) {}
   }
-  INIT_GLASS_TRANSP()
+endmacro
+
+macro GLASS_PS()
   USE_GLASS(true)
-  ENABLE_ASSERT(ps)
+  INIT_AND_USE_HERO_COCKPIT_DISCARD_TRANSPARENCY()
 
   hlsl(ps) {
+    GlassOutput apply_glass_ps(VsOutput input, float4 screenpos, half4 diffuseColor, bool is_back_face = false)
+    {
+      half thickness = 0;
+      half4 packedNormalMap = tex2DBindless(get_normal_tex(), input.texcoord);
+
+      half smoothness = packedNormalMap.r;
+      half3 normalMap = unpack_ag_normal(packedNormalMap);
+      half3 worldNormal = perturb_normal_precise(normalMap, normalize(input.normal.xyz), input.pointToEye.xyz, input.texcoord.xy);
+      #if isRefractionGlass
+        thickness = lerp(get_mediumThickness().x, get_mediumThickness().y, packedNormalMap.b);
+      #endif
+
+      #if OVERWRITE_GLASS_PROPERTIES_WITH_FUNCTION_ARGS
+        return apply_glass_base(input, screenpos, diffuseColor, worldNormal, thickness, smoothness, is_back_face, float4(1, 0, 1, 1), float2(1.5, 0.04));
+      #else
+        return apply_glass_base(input, screenpos, diffuseColor, worldNormal, thickness, smoothness, is_back_face);
+      #endif
+    }
 
     GlassOutput glass_ps(VsOutput input HW_USE_SCREEN_POS INPUT_VFACE)
     {
@@ -452,6 +506,10 @@ macro GLASS_PS()
         INIT_MULTIDRAW(input);
         SET_DRAW_CALL_ID(GET_MATERIAL_OFFSET(input));
       #endif
+
+      float3 worldPos = world_view_pos.xyz - input.pointToEye.xyz;
+      float2 screenUV = input.clipPos.xy / input.clipPos.w * float2(0.5, -0.5) + 0.5;
+      hero_cockpit_discard_transparency(worldPos, screenUV);
 
       float4 screenpos = GET_SCREEN_POS(input.pos);
       int2 texTCi = screenpos.xy * 0.5;
@@ -467,20 +525,6 @@ macro GLASS_PS()
           discard;
       }
       ##endif
-      ##if (glass_normal_pass == yes)
-      float3 worldNormal = normalize(input.normal.xyz);
-      worldNormal = normalize(MUL_VFACE(worldNormal));
-
-      ##if (shader != rendinst_simple_glass)
-          half4 packedNormalMap = tex2DBindless(get_normal_tex(), input.texcoord);
-          half3 normalMap = unpack_ag_normal(packedNormalMap);
-          worldNormal = perturb_normal_precise(normalMap, worldNormal, input.pointToEye, input.texcoord);
-      ##endif
-
-      GlassOutput result;
-      result.normal = float4(worldNormal * 0.5 + 0.5, 1);
-      return result;
-      ##else
       #if ABSENT_DIFFUSE_TEX // condition for old SQ assets without diffuse texture
         half4 diffuseColor = get_material_diffuse_and_opacity();
       #else
@@ -493,7 +537,7 @@ macro GLASS_PS()
       input.normal.xyz = MUL_VFACE(input.normal.xyz);
       bool isBackFace = false;
       SET_IF_IS_BACK_FACE(isBackFace, true);
-      GlassOutput result = apply_glass_ps(input, screenpos, diffuseColor, 0.9, isBackFace);
+      GlassOutput result = apply_glass_ps(input, screenpos, diffuseColor, isBackFace);
       ##if special_vision == thermal_vision
         const float glass_temperature = 20.0f/255.0f;
         float diffuseAndOpacity_a = saturate(diffuseColor.a*2);
@@ -502,19 +546,112 @@ macro GLASS_PS()
         result.color.gb = 0;
       ##endif
 
-    #if !ICON_RENDER_HAS_SILHOUETTE_SHADOW
-      #if SIMPLE_GLASS_DUAL_SOURCE_BLENDING_ENABLED
-        result.addend.rgb = pack_hdr(result.addend.rgb);
-      #else
-        result.color.rgb = pack_hdr(result.color.rgb);
+      #if !ICON_RENDER_HAS_SILHOUETTE_SHADOW
+        #if SIMPLE_GLASS_DUAL_SOURCE_BLENDING_ENABLED
+          result.addend.rgb = pack_hdr(result.addend.rgb);
+        #else
+          result.color.rgb = pack_hdr(result.color.rgb);
+        #endif
       #endif
-    #endif
 
       return result;
-      ##endif
     }
   }
 
   compile("target_ps", "glass_ps");
+endmacro
+
+macro GENERATE_TRANSPARENT_GBUFFER_PS()
+  bool use_normal_tex = (shader != rendinst_simple_glass);
+  if (use_normal_tex)
+  {
+    USE_PIXEL_TANGENT_SPACE()
+  }
+  INIT_AND_USE_HERO_COCKPIT_DISCARD_TRANSPARENCY()
+
+  hlsl (ps) {
+
+    struct GlassOutput
+    {
+      float4 normal : SV_Target0;
+    };
+
+    GlassOutput generate_transparent_gbuffer_ps(VsOutput input HW_USE_SCREEN_POS INPUT_VFACE)
+    {
+      #if SET_UP_MULTIDRAW
+      INIT_MULTIDRAW(input);
+      SET_DRAW_CALL_ID(GET_MATERIAL_OFFSET(input));
+      #endif
+
+      float3 worldPos = world_view_pos.xyz - input.pointToEye.xyz;
+      float2 screenUV = input.clipPos.xy / input.clipPos.w * float2(0.5, -0.5) + 0.5;
+      hero_cockpit_discard_transparency(worldPos, screenUV);
+
+      float4 screenpos = GET_SCREEN_POS(input.pos);
+      int2 texTCi = screenpos.xy * 0.5;
+      ##if (shader == rendinst_simple_glass)
+        BRANCH
+        if (glass_hole_exists)
+        {
+          float rawDepth = texelFetch(glass_hole_mask, texTCi, 0).x;
+          float offset = 0.02; // we use this offset to compensate offset which was added on bullet hole mask render
+          rawDepth = rawDepth - offset;
+          float w = linearize_z(rawDepth, zn_zfar.zw);
+          if (abs(w - screenpos.w) < 0.01) discard;
+        }
+      ##endif
+      float3 worldNormal = normalize(input.normal.xyz);
+      worldNormal = normalize(MUL_VFACE(worldNormal));
+
+      ##if (use_normal_tex)
+        half4 packedNormalMap = tex2DBindless(get_normal_tex(), input.texcoord);
+        half3 normalMap = unpack_ag_normal(packedNormalMap);
+        worldNormal = perturb_normal_precise(normalMap, worldNormal, input.pointToEye, input.texcoord);
+      ##endif
+
+      GlassOutput result;
+      result.normal = float4(worldNormal * 0.5 + 0.5, 1);
+      return result;
+    }
+  }
+
+  compile("target_ps", "generate_transparent_gbuffer_ps");
+endmacro
+
+macro REFRACTION_GLASS_REACTIVE_MASK_PS()
+  INIT_AND_USE_HERO_COCKPIT_DISCARD_TRANSPARENCY()
+
+  hlsl (ps) {
+    struct GlassOutput
+    {
+      float reactive_mask : SV_Target0;
+    };
+
+    GlassOutput glass_reactive_mask_ps(VsOutput input)
+    {
+      #if SET_UP_MULTIDRAW
+        INIT_MULTIDRAW(input);
+        SET_DRAW_CALL_ID(GET_MATERIAL_OFFSET(input));
+      #endif
+
+      float3 worldPos = world_view_pos.xyz - input.pointToEye.xyz;
+      float2 screenUV = input.clipPos.xy / input.clipPos.w * float2(0.5, -0.5) + 0.5;
+      hero_cockpit_discard_transparency(worldPos, screenUV);
+
+      float4 screenpos = GET_SCREEN_POS(input.pos);
+      int2 texTCi = screenpos.xy * 0.5;
+      #if ABSENT_DIFFUSE_TEX // condition for old SQ assets without diffuse texture
+        half4 diffuseColor = get_material_diffuse_and_opacity();
+      #else
+        half4 diffuseColor = tex2DBindless(get_diffuse_tex(), input.texcoord);
+      #endif
+      diffuseColor.a *= get_transparency_mul();
+      GlassOutput result;
+      result.reactive_mask = diffuseColor.a * 5.0;
+      return result;
+    }
+  }
+
+  compile("target_ps", "glass_reactive_mask_ps");
 endmacro
 

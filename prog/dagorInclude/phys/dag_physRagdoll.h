@@ -7,7 +7,8 @@
 #include <phys/dag_physSysInst.h>
 #include <phys/dag_physDecl.h>
 #include <phys/dag_physUserData.h>
-#include <animChar/dag_animCharacter2.h>
+#include <phys/dag_physTwistCtrl.h>
+#include <animChar/dag_animCharPostCtrl.h>
 #include <generic/dag_smallTab.h>
 
 
@@ -37,8 +38,10 @@ public:
 
   void setRecalcWtms(bool flag) { recalcWtms = flag; }
 
+  void setScaleTm(const TMatrix &scaleTm);
+
   // Create instance.
-  void startRagdoll(int interact_layer = 1, int interact_mask = 0xffffffff, const GeomNodeTree *tree = nullptr);
+  void startRagdoll(int interact_layer = 1, int interact_mask = 0xffffffff, const GeomNodeTree *tree = nullptr, float scale = 1.f);
 
   // Destroy instance, removing physical bodies from physical world.
   void endRagdoll();
@@ -71,12 +74,6 @@ protected:
   void setBodiesTm(const GeomNodeTree &tree, dag::Span<TMatrix> last_node_tms = {}, float dt = 0.f);
   void applyOverriddenVelocities();
 
-  struct NodeAlignCtrl
-  {
-    dag::Index16 node0Id, node1Id, twistId[3];
-    int16_t twistCnt = 0;
-    float angDiff = 0;
-  };
   Ptr<PhysicsResource> physRes;
   PhysSystemInstance *physSys;
   PhysWorld *physWorld;
@@ -92,7 +89,7 @@ protected:
   SmallTab<TMatrix *, MidmemAlloc> nodeHelpers;
   SmallTab<mat44f *, MidmemAlloc> driveBodiesToSkeletonWtms;
   SmallTab<TMatrix, TmpmemAlloc> lastNodeTms;
-  Tab<NodeAlignCtrl> nodeAlignCtrl;
+  Tab<TwistCtrlParams> twistCtrl;
   Tab<int> nodeBody;
 
   bool recalcWtms;

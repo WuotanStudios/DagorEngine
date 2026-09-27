@@ -3,6 +3,7 @@
 #include <workCycle/dag_gameSettings.h>
 #include <workCycle/dag_genGuiMgr.h>
 #include <workCycle/dag_wcHooks.h>
+#include <workCycle/dag_workCycle.h>
 #include <workCycle/wcPrivHooks.h>
 #include "workCyclePriv.h"
 
@@ -13,6 +14,7 @@ bool dgs_dont_use_cpu_in_background = false;
 bool dgs_higher_active_app_priority = false;
 
 bool dgctrl_need_screen_shot = false;
+SimpleString dgctrl_screen_shot_name;
 bool dgctrl_need_print_screen_shot = false;
 int dgctrl_print_screen_shot_multiplier = 3;
 
@@ -36,3 +38,11 @@ bool dwc_alloc_perform_delayed_actions = true;
 bool dwc_alloc_perform_delayed_actions_in_internal_winloop = true;
 
 float visibility_range_multiplier = 1.f;
+
+int dagor_get_fixed_act_per_frame() { return workcycle_internal::fixedActPerfFrame; }
+void dagor_set_fixed_act_per_frame(int acts_per_frame)
+{
+  workcycle_internal::fixedActPerfFrame = acts_per_frame;
+  workcycle_internal::curFrameActs = 0;
+}
+void dagor_reset_frame_acts() { workcycle_internal::curFrameActs = 0; }

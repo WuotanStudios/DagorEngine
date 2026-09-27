@@ -3,6 +3,7 @@
 
 #include <EASTL/string.h>
 #include <EASTL/vector.h>
+#include <EASTL/optional.h>
 
 struct ImpostorOptions
 {
@@ -20,7 +21,10 @@ struct ImpostorOptions
   bool valid = true;
   bool clean = false;
   bool dryMode = false;
-  bool skipGen = false;
   bool forceRebake = false;
+  bool profile = false;
+  eastl::optional<bool> defaultVoxelImpostor = eastl::nullopt;
+  bool bakeFlat = true;
+  bool bakeVoxel = true;
   FolderBlkGenMode folderBlkGenMode = FolderBlkGenMode::REPLACE;
 };

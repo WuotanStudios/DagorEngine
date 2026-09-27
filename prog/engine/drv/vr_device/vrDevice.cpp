@@ -6,10 +6,11 @@
 #include <drv/3d/dag_draw.h>
 #include <drv/3d/dag_vertexIndexBuffer.h>
 #include <drv/3d/dag_driver.h>
-#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_resetDevice.h>
 #include <drv/3d/dag_tex3d.h>
 #include <drv/3d/dag_variableRateShading.h>
+#include <drv/3d/dag_texture.h>
 #include "shaders/dag_postFxRenderer.h"
 #include "shaders/dag_overrideStates.h"
 #include "shaders/dag_shaders.h"
@@ -136,8 +137,6 @@ static RectInt calc_viewport(float srcAspect, const RectInt &dst)
   {
     // If the VR image is wider than the screen area,
     // cut the left and right sides
-    // If the screen area is wider than the VR image,
-    // cut the top and bottom sides
     int m = (dst.left + dst.right) / 2;
     int av = dstSize.y * srcAspect;
 
@@ -224,7 +223,7 @@ void VRDevice::renderMirror(FrameData &frame)
       auto vp = calc_viewport(srcAspect, RectInt{0, 0, w, h});
       d3d::setview(vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top, 0, 1);
       d3d::setscissor(0, 0, w, h);
-      ShaderGlobal::set_color4(vr_texture_transformVarId, uvTransformLeft);
+      ShaderGlobal::set_float4(vr_texture_transformVarId, uvTransformLeft);
       ShaderGlobal::set_texture(vr_texture_sourceVarId, leftTex);
       mirrorRenderer->render();
       break;
@@ -234,7 +233,7 @@ void VRDevice::renderMirror(FrameData &frame)
       auto vp = calc_viewport(srcAspect, RectInt{0, 0, w, h});
       d3d::setview(vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top, 0, 1);
       d3d::setscissor(0, 0, w, h);
-      ShaderGlobal::set_color4(vr_texture_transformVarId, uvTransformRight);
+      ShaderGlobal::set_float4(vr_texture_transformVarId, uvTransformRight);
       ShaderGlobal::set_texture(vr_texture_sourceVarId, rightTex);
       mirrorRenderer->render();
       break;
@@ -244,14 +243,14 @@ void VRDevice::renderMirror(FrameData &frame)
       auto vp = calc_viewport(srcAspect, RectInt{0, 0, w / 2, h});
       d3d::setview(vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top, 0, 1);
       d3d::setscissor(0, 0, w / 2, h);
-      ShaderGlobal::set_color4(vr_texture_transformVarId, uvTransformLeft);
+      ShaderGlobal::set_float4(vr_texture_transformVarId, uvTransformLeft);
       ShaderGlobal::set_texture(vr_texture_sourceVarId, leftTex);
       mirrorRenderer->render();
 
       vp = calc_viewport(srcAspect, RectInt{w / 2, 0, w, h});
       d3d::setview(vp.left, vp.top, vp.right - vp.left, vp.bottom - vp.top, 0, 1);
       d3d::setscissor(w / 2, 0, w / 2, h);
-      ShaderGlobal::set_color4(vr_texture_transformVarId, uvTransformRight);
+      ShaderGlobal::set_float4(vr_texture_transformVarId, uvTransformRight);
       ShaderGlobal::set_texture(vr_texture_sourceVarId, rightTex);
       mirrorRenderer->render();
       break;
@@ -261,19 +260,9 @@ void VRDevice::renderMirror(FrameData &frame)
   shaders::overrides::reset();
 }
 
-static bool enableXr = false;
 
-bool VRDevice::shouldBeEnabled()
-{
-  static bool once = true;
-  if (once)
-  {
-    enableXr = dgs_get_settings()->getBlockByNameEx("gameplay")->getBool("enableVR", false);
-    once = false;
-  }
+bool VRDevice::shouldBeEnabled() { return dgs_get_settings()->getBlockByNameEx("gameplay")->getBool("enableVR", false); }
 
-  return enableXr;
-}
 
 bool VRDevice::isPresenceSensorForcedToBeOn()
 {
@@ -281,16 +270,14 @@ bool VRDevice::isPresenceSensorForcedToBeOn()
   return forced;
 }
 
-void VRDevice::setEnabled(bool enabled) { enableXr = enabled; }
 
 static void vr_before_reset(bool full_reset)
 {
-  if (!full_reset)
+  if (!full_reset || !vr_instance)
     return;
 
   logdbg("[XR][device] vr_before_reset");
-  if (vr_instance)
-    vr_instance->beforeSoftDeviceReset();
+  vr_instance->beforeSoftDeviceReset();
 }
 
 static void vr_after_reset(bool full_reset)
@@ -301,12 +288,11 @@ static void vr_after_reset(bool full_reset)
     d3d::enable_vsync(VRDevice::hasActiveSession() ? false : initialVSyncValue);
   }
 
-  if (!full_reset)
+  if (!full_reset || !vr_instance)
     return;
 
   logdbg("[XR][device] vr_after_reset");
-  if (vr_instance)
-    vr_instance->afterSoftDeviceReset();
+  vr_instance->afterSoftDeviceReset();
 }
 
 bool VRDevice::renderScreenMask(const TMatrix4 &projection, int view_index, float scale, int value)
@@ -329,7 +315,7 @@ bool VRDevice::renderScreenMask(const TMatrix4 &projection, int view_index, floa
   static int openxr_screen_mask_scaleVarId = get_shader_variable_id("openxr_screen_mask_scale");
   static int openxr_screen_mask_valueVarId = get_shader_variable_id("openxr_screen_mask_value");
 
-  ShaderGlobal::set_real(openxr_screen_mask_scaleVarId, scale);
+  ShaderGlobal::set_float(openxr_screen_mask_scaleVarId, scale);
   ShaderGlobal::set_int(openxr_screen_mask_valueVarId, value);
 
   d3d::setvdecl(screenMaskVertexDeclaration);
@@ -616,13 +602,13 @@ void VRDevice::prepareVrsMask(FrameData &frameData)
   viewHeight = ceil(float(viewHeight) / vrsTileSize);
 
   UniqueTex vrs_mask_texture_gen =
-    dag::create_tex(nullptr, viewWidth, viewHeight, TEXFMT_R8UI | TEXCF_RTARGET, 1, "vrs_mask_texture_gen");
+    dag::create_tex(nullptr, viewWidth, viewHeight, TEXFMT_R8UI | TEXCF_RTARGET, 1, "vrs_mask_texture_gen", RESTAG_VR);
 
   for (auto ix : {0, 1})
   {
     d3d::setview(0, 0, viewWidth, viewHeight, 0, 1);
     d3d::setscissor(0, 0, viewWidth, viewHeight);
-    d3d::set_render_target(vrs_mask_texture_gen.getTex2D(), 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{vrs_mask_texture_gen.getTex2D(), 0, 0}});
     d3d::clearview(CLEAR_TARGET, 0, 0, 0);
 
     auto &persp = frameData.views[ix].projection;
@@ -634,7 +620,8 @@ void VRDevice::prepareVrsMask(FrameData &frameData)
 
     eastl::string name;
     name.sprintf("vrs_mask_texture_%s", ix ? "right" : "left");
-    vrs_mask_textures[ix] = dag::create_tex(nullptr, viewWidth, viewHeight, TEXFMT_R8UI | TEXCF_UPDATE_DESTINATION, 1, name.data());
+    vrs_mask_textures[ix] =
+      dag::create_tex(nullptr, viewWidth, viewHeight, TEXFMT_R8UI | TEXCF_UPDATE_DESTINATION, 1, name.data(), RESTAG_VR);
     vrs_mask_textures[ix]->update(vrs_mask_texture_gen.getTex2D());
   }
 
@@ -652,24 +639,25 @@ void VRDevice::prepareVrsMask(FrameData &frameData)
     targetWidth = ceil(float(targetWidth) / vrsTileSize);
     targetHeight = ceil(float(targetHeight) / vrsTileSize);
 
-    vrs_mask_textures[2] =
-      dag::create_tex(nullptr, targetWidth, targetHeight, TEXFMT_R8UI | TEXCF_UPDATE_DESTINATION, 1, "vrs_mask_texture_target");
+    vrs_mask_textures[2] = dag::create_tex(nullptr, targetWidth, targetHeight, TEXFMT_R8UI | TEXCF_UPDATE_DESTINATION, 1,
+      "vrs_mask_texture_target", RESTAG_VR);
 
-    vrs_mask_textures[2]->updateSubRegion(vrs_mask_textures[0].getTex2D(), 0, 0, 0, 0, viewWidth, viewHeight, 1, 0, 0, 0, 0);
+    d3d::update_sub_region(vrs_mask_textures[0].getTex2D(), 0, 0, 0, 0, viewWidth, viewHeight, 1, vrs_mask_textures[2].getBaseTex(), 0,
+      0, 0, 0);
     switch (getStereoMode())
     {
       case VRDevice::StereoMode::SideBySideHorizontal:
       {
         bool left = remX >= vrsTileSize / 2;
-        vrs_mask_textures[2]->updateSubRegion(vrs_mask_textures[1].getTex2D(), 0, 0, 0, 0, viewWidth, viewHeight, 1, 0,
-          left ? viewWidth - 1 : viewWidth, 0, 0);
+        d3d::update_sub_region(vrs_mask_textures[1].getTex2D(), 0, 0, 0, 0, viewWidth, viewHeight, 1,
+          vrs_mask_textures[2].getBaseTex(), 0, left ? viewWidth - 1 : viewWidth, 0, 0);
         break;
       }
       case VRDevice::StereoMode::SideBySideVertical:
       {
         bool up = remY >= vrsTileSize / 2;
-        vrs_mask_textures[2]->updateSubRegion(vrs_mask_textures[1].getTex2D(), 0, 0, 0, 0, viewWidth, viewHeight, 1, 0, 0,
-          up ? viewHeight - 1 : viewHeight, 0);
+        d3d::update_sub_region(vrs_mask_textures[1].getTex2D(), 0, 0, 0, 0, viewWidth, viewHeight, 1,
+          vrs_mask_textures[2].getBaseTex(), 0, 0, up ? viewHeight - 1 : viewHeight, 0);
         break;
       }
       default: break;
@@ -706,6 +694,35 @@ const ManagedTex *VRDevice::getVrsMask(StereoIndex stereo_index, bool combined) 
 
   return &vrs_mask_textures[combined ? 2 : (stereo_index == StereoIndex::Left ? 0 : 1)];
 }
+
+namespace vr
+{
+static StereoIndex stereo_index = StereoIndex::Mono;
+
+void set_stereo_index(StereoIndex index, bool update_driver)
+{
+  stereo_index = index;
+  if (update_driver)
+    if (VRDevice *vrDevice = VRDevice::getInstance())
+      vrDevice->setStereoIndex(index);
+}
+
+
+StereoIndex get_stereo_index() { return stereo_index; }
+
+NonLinearRenderingScope::~NonLinearRenderingScope()
+{
+  if (VRDevice *vrDevice = VRDevice::getInstance())
+    vrDevice->setStereoIndex(index);
+}
+
+NonLinearRenderingScope suppress_non_linear_rendering()
+{
+  if (VRDevice *vrDevice = VRDevice::getInstance())
+    vrDevice->setStereoIndex(StereoIndex::Mono);
+  return {stereo_index};
+}
+} // namespace vr
 
 REGISTER_D3D_BEFORE_RESET_FUNC(vr_before_reset);
 REGISTER_D3D_AFTER_RESET_FUNC(vr_after_reset);

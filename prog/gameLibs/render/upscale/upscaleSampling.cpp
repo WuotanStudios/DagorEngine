@@ -7,12 +7,14 @@
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_info.h>
 #include <drv/3d/dag_resetDevice.h>
+#include <drv/3d/dag_viewScissor.h>
 #include <osApiWrappers/dag_spinlock.h>
 #include <perfMon/dag_statDrv.h>
 #include <shaders/upscale_sampling_weights.hlsli>
 #include <shaders/dag_shaderBlock.h>
 #include <shaders/dag_postFxRenderer.h>
 #include <shaders/dag_computeShaders.h>
+#include <math/integer/dag_IPoint2.h>
 
 namespace
 {
@@ -88,7 +90,7 @@ static const float UPSCALE_WEIGHTS_DATA[UPSCALE_WEIGHTS_COUNT * 4] = {
 }; // anonymous namespace
 static struct UpsampleTextureSingleTone
 {
-  UniqueBufHolder upscaleWeightsBuffer;
+  UniqueBufWithShaderVar upscaleWeightsBuffer;
   uint32_t upscale_weights_buffer_counter;
   OSSpinlock upscale_weights_buffer_lock;
   PostFxRenderer upscaleRenderer;
@@ -98,8 +100,9 @@ static struct UpsampleTextureSingleTone
     OSSpinlockScopedLock lock(upscale_weights_buffer_lock);
     if (upscale_weights_buffer_counter++ == 0)
     {
-      upscaleWeightsBuffer = UniqueBufHolder(dag::buffers::create_persistent_cb(UPSCALE_WEIGHTS_COUNT, "upscale_sampling_weights"),
-        "upscale_sampling_weights");
+      upscaleWeightsBuffer =
+        UniqueBufWithShaderVar(dag::buffers::create_persistent_cb(UPSCALE_WEIGHTS_COUNT, "upscale_sampling_weights", RESTAG_POSTFX),
+          "upscale_sampling_weights");
       upload_weights();
       upscaleRenderer.init("upscale_sampling");
       upscaleRendererCS.reset(new_compute_shader("upscale_sampling_cs", true));
@@ -179,8 +182,11 @@ void UpscaleSamplingTex::render(float goffset_x, float goffset_y)
 
   if (upscaleTex && !!(ti.cflg & TEXCF_UNORDERED))
   {
+    int w = ti.w / 2 + 1;
+    int h = ti.h / 2 + 1;
+
     d3d::set_rwtex(STAGE_CS, 0, upscaleTex->getTex2D(), 0, 0);
-    upsample_single.upscaleRendererCS->dispatchThreads(ti.w, ti.h, 1);
+    upsample_single.upscaleRendererCS->dispatchThreads(w, h, 1);
     d3d::set_rwtex(STAGE_CS, 0, nullptr, 0, 0);
     d3d::resource_barrier({upscaleTex->getTex2D(), RB_RO_SRV | RB_STAGE_PIXEL | RB_STAGE_COMPUTE, 0, 0});
   }
@@ -190,7 +196,12 @@ void UpscaleSamplingTex::render(float goffset_x, float goffset_y)
 
     auto target = upscaleTex->getTex2D();
 
-    d3d::set_render_target(target, 0);
+    int w = ti.w;
+    int h = ti.h;
+
+    d3d::set_render_target({}, DepthAccess::RW, {{target, 0, 0}});
+    d3d::setview(0, 0, w, h, 0, 1);
+    d3d::setscissor(0, 0, w, h);
     upsample_single.upscaleRenderer.render();
     d3d::resource_barrier({target, RB_RO_SRV | RB_STAGE_PIXEL | RB_STAGE_COMPUTE, 0, 0});
   }

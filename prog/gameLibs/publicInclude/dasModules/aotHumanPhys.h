@@ -12,6 +12,7 @@
 #include <gamePhys/phys/walker/humanWeapState.h>
 #include <gamePhys/phys/walker/humanControlState.h>
 #include <util/dag_lookup.h>
+#include <util/dag_bitwise_cast.h>
 
 DAS_BIND_ENUM_CAST_98(HUMoveState);
 DAS_BIND_ENUM_CAST_98(HUStandState);
@@ -36,6 +37,7 @@ MAKE_TYPE_FACTORY(HumanWeaponEquipState, HumanWeaponEquipState);
 MAKE_TYPE_FACTORY(HumanPhysState, HumanPhysState);
 MAKE_TYPE_FACTORY(HumanControlState, HumanControlState);
 MAKE_TYPE_FACTORY(PrecomputedWeaponPositions, PrecomputedWeaponPositions);
+MAKE_TYPE_FACTORY(SegmentedHumanPhysicsState, SegmentedHumanPhysicsState);
 MAKE_TYPE_FACTORY(HumanPhys, HumanPhys);
 
 typedef Tab<HumanControlState> HumanControlStateTab;
@@ -45,8 +47,11 @@ DAS_BIND_VECTOR(HumanControlStateTab, HumanControlStateTab, HumanControlState, "
 using HumanWeaponParamsArray = carray<HumanWeaponParams, EWS_NUM>;
 DAS_BIND_ARRAY(HumanWeaponParamsArray, HumanWeaponParamsArray, HumanWeaponParams);
 
-using HumanPhysAlignSpeedsArray = carray<float, ESS_NUM>;
-DAS_BIND_ARRAY(HumanPhysAlignSpeedsArray, HumanPhysAlignSpeedsArray, float);
+using HumanPhysESSArray = carray<float, ESS_NUM>;
+DAS_BIND_ARRAY(HumanPhysESSArray, HumanPhysESSArray, float);
+
+using HumanPhysEMSArray = carray<float, EMS_NUM>;
+DAS_BIND_ARRAY(HumanPhysEMSArray, HumanPhysEMSArray, float);
 
 namespace bind_dascript
 {
@@ -103,13 +108,35 @@ inline Point3 human_phys_calcGunPos(const HumanPhys &phys, PrecomputedPresetMode
   return phys.calcGunPos(reinterpret_cast<const TMatrix &>(tm), gun_angles, lean_pos, height, mode);
 }
 
-inline void human_phys_calcGunTm(const HumanPhys &phys, PrecomputedPresetMode mode, const TMatrix &tm, float gun_angles,
+inline void human_phys_calcGunTm(const HumanPhys &phys, PrecomputedPresetMode mode, const das::float3x4 &tm, float gun_angles,
   float lean_pos, float height, das::float3x4 &out_gun_tm)
 {
-  reinterpret_cast<TMatrix &>(out_gun_tm) = phys.calcGunTm(reinterpret_cast<const TMatrix &>(tm), gun_angles, lean_pos, height, mode);
+  out_gun_tm = dag::bit_cast<das::float3x4>(phys.calcGunTm(dag::bit_cast<TMatrix>(tm), gun_angles, lean_pos, height, mode));
 }
 
 inline bool human_phys_isGoProneAllowed(const HumanPhys &phys) { return phys.isGoProneAllowed(); }
+
+inline int human_phys_get_segphys_num_anims(const HumanPhys &phys)
+{
+  const SegmentedHumanPhysics *segPhys = phys.segPhysShared;
+  return segPhys ? (int)segPhys->anims.size() : 0;
+}
+
+inline const char *human_phys_get_segphys_anim_name(const HumanPhys &phys, int anim_id)
+{
+  const SegmentedHumanPhysics *segPhys = phys.segPhysShared;
+  if (segPhys && (0 <= anim_id && anim_id < segPhys->anims.size()))
+    return segPhys->anims[anim_id].c_str();
+  return "";
+}
+
+inline int human_phys_get_segphys_anim_id(const HumanPhys &phys, int seg_index)
+{
+  const SegmentedHumanPhysics *segPhys = phys.segPhysShared;
+  if (segPhys && (0 <= seg_index && seg_index < segPhys->segs.size()))
+    return segPhys->segs[seg_index].animID;
+  return -1;
+}
 
 inline void human_control_state_set_walk_speed(HumanControlState &ct, float speed) { ct.setWalkSpeed(speed); }
 
@@ -230,8 +257,10 @@ inline bool human_phys_state_get_disableCollision(const HumanPhysState &phys) { 
 inline bool human_phys_processCcdOffset(HumanPhys &phys, das::float3x4 &tm, const Point3 &to_pos, const Point3 &offset,
   float collision_margin, float speed_hardness, bool secondary_ccd, const Point3 &ccd_pos)
 {
-  return phys.processCcdOffset(reinterpret_cast<TMatrix &>(tm), to_pos, offset, collision_margin, speed_hardness, secondary_ccd,
-    ccd_pos);
+  TMatrix res = dag::bit_cast<TMatrix>(tm);
+  bool ret = phys.processCcdOffset(res, to_pos, offset, collision_margin, speed_hardness, secondary_ccd, ccd_pos);
+  tm = dag::bit_cast<das::float3x4>(res);
+  return ret;
 }
 
 inline bool human_phys_getCollisionLinkData(HumanPhys &phys, HUStandState state, const char *nodeSlot,
@@ -278,10 +307,7 @@ inline void human_phys_state_get_torso_contacts(const HumanPhysState &state,
   das::LineInfoArg *at)
 {
   das::Array arr;
-  arr.data = (char *)state.torsoContacts.data();
-  arr.size = state.numTorsoContacts;
-  arr.capacity = arr.size;
-  arr.lock = 1;
+  das::array_mark_locked(arr, (char *)state.torsoContacts.data(), state.torsoContacts.size());
   arr.flags = 0;
   vec4f arg = das::cast<das::Array *>::from(&arr);
   context->invoke(block, &arg, nullptr, at);

@@ -17,6 +17,7 @@
 #include <libTools/util/fileUtils.h>
 
 #include <libTools/shaderResBuilder/shaderMeshData.h>
+#include <libTools/util/appDirRelativePath.h>
 
 #include <assets/asset.h>
 #include <assets/assetHlp.h>
@@ -89,36 +90,28 @@ void DaEditor3Engine::conRemarkV(const char *fmt, const DagorSafeArg *arg, int a
   conMessageV(ILogWriter::REMARK, fmt, arg, anum);
 }
 
-bool DaEditor3Engine::initAssetBase(const char *app_dir)
+bool DaEditor3Engine::initAssetBase(const char *app_dir, const DataBlock &app_blk)
 {
   char start_dir[260] = "";
   dag_get_appmodule_dir(start_dir, sizeof(start_dir));
 
-  String fname(260, "%sapplication.blk", app_dir);
-  DataBlock appblk;
-
   assetMgr.clear();
   assetMgr.setMsgPipe(&msgPipe);
-
-  if (!appblk.load(fname))
-  {
-    debug("cannot load %s", fname.str());
-    return false;
-  }
-  appblk.setStr("appDir", app_dir);
+  DataBlock appblk(app_blk);
   DataBlock::setRootIncludeResolver(app_dir);
 
-  // load asset base
   const DataBlock &blk = *appblk.getBlockByNameEx("assets");
-  int base_nid = blk.getNameId("base");
 
-  assetMgr.setupAllowedTypes(*blk.getBlockByNameEx("types"), blk.getBlockByName("export"));
-  for (int i = 0; srcAssetsScanAllowed && i < blk.paramCount(); i++)
-    if (blk.getParamNameId(i) == base_nid && blk.getParamType(i) == DataBlock::TYPE_STRING)
-    {
-      fname.printf(260, "%s%s", app_dir, blk.getStr(i));
-      assetMgr.loadAssetsBase(fname, "global");
-    }
+  { // load asset base
+    const int base_nid = blk.getNameId("base");
+    eastl::unique_ptr<DagorAssetMgrLoadAssetsBaseContext> loadContext = assetMgr.makeLoadAssetsBaseContext();
+
+    assetMgr.setupAllowedTypes(*blk.getBlockByNameEx("types"), blk.getBlockByName("export"));
+    for (int i = 0; srcAssetsScanAllowed && i < blk.paramCount(); i++)
+      if (blk.getParamNameId(i) == base_nid && blk.getParamType(i) == DataBlock::TYPE_STRING)
+        assetMgr.loadAssetsBase(make_eff_app_relative_path(blk.getStr(i)), "global", *loadContext);
+  }
+
   if (!minimizeDabuildUsage) // prefer real texture assets to gameres loaded from *.dxp.bin
   {
     dag::ConstSpan<DagorAsset *> assets = assetMgr.getAssets();
@@ -151,7 +144,6 @@ bool DaEditor3Engine::initAssetBase(const char *app_dir)
   }
 
   // add texture assets to texmgr
-  if (::get_gameres_sys_ver() == 2)
   {
     int atype = assetMgr.getTexAssetTypeId();
     dag::ConstSpan<DagorAsset *> assets = assetMgr.getAssets();
@@ -167,7 +159,7 @@ bool DaEditor3Engine::initAssetBase(const char *app_dir)
           add_managed_texture(nm);
       }
   }
-  assetlocalprops::init(app_dir, "develop/.asset-local");
+  assetlocalprops::init("develop/.asset-local");
   AssetExportCache::createSharedData(assetlocalprops::makePath("assets-hash.bin"));
 
   if (dabuildUsageAllowed)

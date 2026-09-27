@@ -114,6 +114,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
 
   ::measure_cpu_freq();
   ::dgs_dont_use_cpu_in_background = false;
+  ::dgs_execute_quiet = ::dgs_get_argv("quiet");
   //::dgs_limit_fps = true;
   ::dgs_post_shutdown_handler = post_shutdown_handler;
 
@@ -141,7 +142,7 @@ int DagorWinMain(int nCmdShow, bool /*debugmode*/)
   ::dagor_init_mouse_win();
   ::dagor_init_joystick();
 #else
-#if _TARGET_C1 == 0 && _TARGET_C2 == 0
+#if _TARGET_C1 == 0 && _TARGET_C2 == 0 && _TARGET_XBOX == 0
   ::dagor_init_mouse_null();
   ::dagor_init_keyboard_null();
 #endif

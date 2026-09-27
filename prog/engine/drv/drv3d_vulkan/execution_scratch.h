@@ -56,8 +56,45 @@ struct ExecutionScratch
     uint32_t originalSignalId;
     uint32_t originalWaitId;
     bool fenceWait;
+
+    // prepare a pooled slot for reuse: drop contents but keep the internal arrays' allocated storage
+    void reset(DeviceQueueType q, uint32_t original_id)
+    {
+      cbs.clear();
+      signals.clear();
+      waitSemaphores.clear();
+      waitTimelines.clear();
+      signalsCount = 0;
+      queue = q;
+      originalSignalId = original_id;
+      originalWaitId = original_id;
+      fenceWait = false;
+    }
   };
-  Tab<QueueSubmitItem> submitGraph;
+
+  struct SubmitGraph
+  {
+    Tab<QueueSubmitItem> pool;
+    uint32_t used = 0;
+
+    uint32_t size() const { return used; }
+    bool empty() const { return used == 0; }
+    QueueSubmitItem *data() { return pool.data(); }
+    QueueSubmitItem *begin() { return pool.data(); }
+    QueueSubmitItem *end() { return pool.data() + used; }
+    QueueSubmitItem &operator[](uint32_t i) { return pool[i]; }
+    QueueSubmitItem &back() { return pool[used - 1]; }
+
+    // grab next slot, growing the pool only when the high watermark increases; caller must reset() it
+    QueueSubmitItem &push_back()
+    {
+      if (used == pool.size())
+        pool.push_back();
+      return pool[used++];
+    }
+    void reuse() { used = 0; }
+  };
+  SubmitGraph submitGraph;
 
   struct UserQueueSignal
   {
@@ -72,6 +109,37 @@ struct ExecutionScratch
     const char *name;
   };
   dag::Vector<DebugEvent> debugEventStack;
+
+  dag::Vector<Image *> mipGenList;
+
+#if VULKAN_HAS_RAYTRACING
+  // inputs of one batched acceleration structure build, kept here to reuse the allocations
+  struct RaytraceBuildBatch
+  {
+    dag::Vector<VkAccelerationStructureBuildGeometryInfoKHR> infos;
+    dag::Vector<const VkAccelerationStructureBuildRangeInfoKHR *> ranges;
+    // BLAS geometries and ranges stay in the replay stores, TLAS ones have no store and live here
+    dag::Vector<VkAccelerationStructureGeometryKHR> tlasGeometries;
+    dag::Vector<VkAccelerationStructureBuildRangeInfoKHR> tlasRanges;
+
+    // reserve keeps the pointers installed into infos valid while the batch fills up
+    void reset(uint32_t count)
+    {
+      infos.clear();
+      infos.reserve(count);
+      ranges.clear();
+      ranges.reserve(count);
+      tlasGeometries.clear();
+      tlasGeometries.reserve(count);
+      tlasRanges.clear();
+      tlasRanges.reserve(count);
+    }
+  };
+  RaytraceBuildBatch raytraceBuildBatch;
+#if VK_EXT_opacity_micromap
+  dag::Vector<VkMicromapBuildInfoEXT> micromapBuildInfos;
+#endif
+#endif
 };
 
 } // namespace drv3d_vulkan

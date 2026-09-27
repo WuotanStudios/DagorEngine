@@ -70,6 +70,7 @@ endmacro
 float4 skies_sun_moon_effect;
 
 macro SKIES_VIEW_LUT_TEX_PREPARE(code)
+  SKIES_RAINMAP(code)
   (code) {
     prev_skies_view_lut_tex@smp2d = prev_skies_view_lut_tex;
     prev_skies_view_lut_mie_tex@smp2d = prev_skies_view_lut_mie_tex;
@@ -99,7 +100,7 @@ macro SKIES_VIEW_LUT_TEX_PREPARE(code)
     struct RetSkiesLut
     {
       half4 noPhaseScatter;
-      half3 miePhaseScatter;
+      half4 miePhaseScatter;//a: polarizable share of noPhaseScatter.rgb
     };
     #include <fp16_aware_lerp.hlsl>
 
@@ -149,6 +150,11 @@ macro SKIES_VIEW_LUT_TEX_PREPARE(code)
         //todo: remove shadows from moon, use only statistical shadows. it is not correct anyway
         skyInscatter.rgb += traceSky(shadow_origin, view, skies_secondary_sun_light_dir.xzy, randomOfs, canReproject ? float2(12,24) : float2(16,32), transmittance2, noMieInscatter2, mieInscatter2, addLight)*skies_secondary_sun_color.rgb;
       }
+      //the polarizer may darken only the primary sun Rayleigh+MS part of the sum, not the
+      //secondary sun trace (incl. its mie) or additive light: store that share for apply time
+      float polarizableLum = dot((float3)noMieInscatter, 1./3);
+      float noPhasedLum = dot((float3)skyInscatter.rgb, 1./3);
+      half4 skyMie = half4(skyMieInscatter, noPhasedLum > 1e-8 ? saturate(polarizableLum/noPhasedLum) : 0);
 
       if (canReproject)
       {
@@ -158,22 +164,22 @@ macro SKIES_VIEW_LUT_TEX_PREPARE(code)
           tex2Dlod(prev_skies_view_lut_tex, float4(prevUV + float2(+ofs.x, -ofs.y),0,0))+
           tex2Dlod(prev_skies_view_lut_tex, float4(prevUV + float2(-ofs.x, +ofs.y),0,0))+
           tex2Dlod(prev_skies_view_lut_tex, float4(prevUV + float2(+ofs.x, +ofs.y),0,0));
-        half3 oldMie =
-          tex2Dlod(prev_skies_view_lut_mie_tex, float4(prevUV + float2(-ofs.x, -ofs.y),0,0)).rgb+
-          tex2Dlod(prev_skies_view_lut_mie_tex, float4(prevUV + float2(+ofs.x, -ofs.y),0,0)).rgb+
-          tex2Dlod(prev_skies_view_lut_mie_tex, float4(prevUV + float2(-ofs.x, +ofs.y),0,0)).rgb+
-          tex2Dlod(prev_skies_view_lut_mie_tex, float4(prevUV + float2(+ofs.x, +ofs.y),0,0)).rgb;
+        half4 oldMie =
+          tex2Dlod(prev_skies_view_lut_mie_tex, float4(prevUV + float2(-ofs.x, -ofs.y),0,0))+
+          tex2Dlod(prev_skies_view_lut_mie_tex, float4(prevUV + float2(+ofs.x, -ofs.y),0,0))+
+          tex2Dlod(prev_skies_view_lut_mie_tex, float4(prevUV + float2(-ofs.x, +ofs.y),0,0))+
+          tex2Dlod(prev_skies_view_lut_mie_tex, float4(prevUV + float2(+ofs.x, +ofs.y),0,0));
         old*=0.25;
         oldMie*=0.25;
         //separate mie (so phase function can be done on apply) can actually be faster then blurring
         //todo:
         //old = tex2Dlod(prev_skies_view_lut_tex, float4(prevUV,0,0)).rgb;
         skyInscatter = fp16_aware_lerp_filtered(old, skyInscatter, newFrameWeight);
-        skyMieInscatter = fp16_aware_lerp_filtered(oldMie, skyMieInscatter, newFrameWeight);
+        skyMie = fp16_aware_lerp_filtered(oldMie, skyMie, newFrameWeight);
       }
       RetSkiesLut ret;
       ret.noPhaseScatter = skyInscatter;
-      ret.miePhaseScatter = skyMieInscatter;
+      ret.miePhaseScatter = skyMie;
       return ret;
     }
   }
@@ -198,7 +204,7 @@ shader skies_view_lut_tex_prepare_ps
       RetSkiesLut res = daskies_sky(input.viewVect, input.texcoord, screenpos.xy);
       MRT ret;
       ret.ret0 = res.noPhaseScatter;
-      ret.ret1 = float4(res.miePhaseScatter,0);
+      ret.ret1 = res.miePhaseScatter;
       return ret;
     }
   }
@@ -209,12 +215,17 @@ shader skies_view_lut_tex_prepare_cs
 {
   cull_mode=none;
   z_write=false;
-  ENABLE_ASSERT(cs)
   USE_PS5_WAVE32_MODE()
   SKIES_VIEW_LUT_TEX_PREPARE(cs)
+  (cs) {
+    output0@uav : register(0) hlsl {
+      RWTexture2D<float4> output0@uav;
+    }
+    output1@uav : register(1) hlsl {
+      RWTexture2D<float4> output1@uav;
+    }
+  }
   hlsl(cs) {
-    RWTexture2D<float4> output0 : register(u0);
-    RWTexture2D<float4> output1 : register(u1);
 ##if hardware.ps5
     [numthreads(8, 2, 1)]
 ##else
@@ -227,7 +238,7 @@ shader skies_view_lut_tex_prepare_cs
       float3 viewVect = getViewVecOptimized(texcoord.xy);
       RetSkiesLut ret = daskies_sky(viewVect, texcoord, screenpos.xy);
       texture2DAt(output0, dtId) = ret.noPhaseScatter;
-      texture2DAt(output1, dtId) = half4(ret.miePhaseScatter,0);
+      texture2DAt(output1, dtId) = ret.miePhaseScatter;
     }
   }
   compile("cs_5_0", "daskies_sky_cs");
@@ -326,6 +337,7 @@ shader skies_render_screen
     mu_horizon@f2 = (1-rRG*rRG, -sqrt(1-rRG*rRG),0,0);
     //mu_horizon@f1 = (-sqrt(1-Rh*Rh),0,0,0);
     //skies_primary_sun_light_dir@f3 = skies_primary_sun_light_dir;
+    zn_zfar_inv@f1 = (1.0/zn_zfar.y);
   }
   hlsl {
     #define SKIES_RENDER_TO_FRUSTUM 1
@@ -345,6 +357,9 @@ shader skies_render_screen
   INIT_BRUNETON_FOG(ps)
   BASE_USE_BRUNETON_FOG(ps)
   TRACE_SKY(ps, skies_world_view_pos, skies_primary_sun_light_dir.x, skies_primary_sun_light_dir.z, skies_primary_sun_light_dir.y)//this is only for shadows on earth in WT
+  SKIP_SKY_POLARIZATION_FILTER_TERM_INIT()
+  INIT_SKY_POLARIZATION_ANGULAR(ps)
+  USE_SKY_POLARIZATION_ANGULAR(ps)
   RENDER_SKIES()
   INIT_HDR(ps)
   USE_HDR(ps)
@@ -378,13 +393,12 @@ shader skies_render_screen
       if (distToEarth>=0)
       {
         DimensionlessSpectrum groundTransmittance = 0;
+        IrradianceSpectrum groundInscatter = skyInscatter.rgb;
         #if SKIES_RENDER_TO_FRUSTUM
-        float skyLerp = saturate(distToEarth * skies_panoramic_scattering__inv_distance.y*1000*4-3);//saturate(distToEarth/80 - 1);
-        //float skyLerp = saturate(distToEarth/80 - 1);
+        float skyLerp = saturate(1000.0f * distToEarth * zn_zfar_inv - 1); // we blend frustum scattering to infinite scattering on distance to hide seam
         BRANCH
         if (skyLerp < 1 && use_tc)//
         {
-           IrradianceSpectrum groundInscatter = skyInscatter.rgb;
            get_scattering_tc_fog(scattering_lut_tc, -viewVect, distToEarth*1000, groundTransmittance, groundInscatter);
            if (skyLerp > 0)
             groundTransmittance = lerp(groundTransmittance, GetTransmittance(theAtmosphere, SamplerTexture2DFromName(skies_transmittance_texture), atmosphereR, atmosphereMu, distToEarth, true), skyLerp);
@@ -424,8 +438,12 @@ shader skies_render_screen
         }
         float primaryNu = dot(view, skies_primary_sun_light_dir.xzy);
         float miePhase = MiePhaseFunctionDivideByRayleighOptimized(theAtmosphere.mie_phase_consts, primaryNu)*RayleighPhaseFunction(primaryNu);
-        float4 skyInscatter = sample_skies_scattering_color_tc(skiesLutTC, view, miePhase);
+        //panoramic scattering data serves 360 deg probe views (envi cubes): that is lighting,
+        //not a camera image, so the camera polarizer must not darken it
+        float4 skyInscatter = sample_skies_scattering_color_tc(skiesLutTC, view, miePhase,
+          skies_panoramic_scattering ? 1. : apply_sky_polarization_angular(primaryNu, view.y));
       #endif
+      skyInscatter.rgb *= apply_sky_polarization_filter();
       return renderSkyWithGround(data, r, skyInscatter, view, scatteringLutTC, true);
     }
     float4 daskies_sky_ps(VsOutput input HW_USE_SCREEN_POS):SV_Target0
@@ -523,6 +541,10 @@ shader skyPanorama
   z_write=false;
   USE_SPECIAL_VISION()
   USE_POSTFX_VERTEX_POSITIONS()
+  USE_SKY_POLARIZATION_FILTER_TERM(ps)
+  INIT_SKY_POLARIZATION_ANGULAR(ps)
+  USE_SKY_POLARIZATION_ANGULAR(ps)
+  SKIES_RAINMAP(ps)
   TRACE_SKY(ps, prepare_origin, skies_primary_sun_light_dir.x, skies_primary_sun_light_dir.z, skies_primary_sun_light_dir.y)
   RENDER_SKIES()
   INIT_AND_USE_PANORAMA_VIEW_VECT(ps)
@@ -568,7 +590,10 @@ shader skyPanorama
       half3 transmittance;
       //todo: add random ofs from panoram
       half3 noMie, mie, addLight;
-      half3 skyInscatter = traceSky(shadow_origin, view, skies_primary_sun_light_dir.xzy, 0, 2*float2(16,32), transmittance, noMie, mie, addLight)*skies_primary_sun_color.rgb;
+      half3 primarySky = traceSky(shadow_origin, view, skies_primary_sun_light_dir.xzy, 0, 2*float2(16,32), transmittance, noMie, mie, addLight);
+      //polarizer darkens the Rayleigh+MS part only; return minus noMie is the Mie part
+      primarySky += noMie*(apply_sky_polarization_angular(dot(view, skies_primary_sun_light_dir.xzy), view.y) - 1);
+      half3 skyInscatter = primarySky*skies_primary_sun_color.rgb;
       BRANCH
       if (skies_secondary_sun_color.w > 0)
       {
@@ -576,7 +601,7 @@ shader skyPanorama
         //todo: remove shadows from moon, use only statistical shadows. it is not correct anyway
         skyInscatter += traceSky(shadow_origin, view, skies_secondary_sun_light_dir.xzy, 0, float2(12,24), transmittance2,noMie, mie, addLight)*skies_secondary_sun_color.rgb;
       }
-      float3 res = skyInscatter;
+      float3 res = skyInscatter * apply_sky_polarization_filter();
       float distToEarthKm;
       PreparedGroundData data;
       prepare_ground_data(view.xzy, max(0, dist_to_plane(view.y, -1)), data);

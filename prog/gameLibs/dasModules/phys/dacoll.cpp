@@ -62,8 +62,8 @@ struct CollisionContactDataAnnotation final : das::ManagedStructureAnnotation<ga
     addField<DAS_BIND_MANAGED_FIELD(posA)>("posA");
     addField<DAS_BIND_MANAGED_FIELD(posB)>("posB");
     addField<DAS_BIND_MANAGED_FIELD(depth)>("depth");
-    addField<DAS_BIND_MANAGED_FIELD(riPool)>("riPool");
     addField<DAS_BIND_MANAGED_FIELD(matId)>("matId");
+    addField<DAS_BIND_MANAGED_FIELD(riDesc)>("riDesc");
 
     static_assert(eastl::is_base_of_v<gamephys::CollisionContactDataMin, gamephys::CollisionContactData>);
     parentType = das::makeType<gamephys::CollisionContactDataMin>(ml);
@@ -72,6 +72,18 @@ struct CollisionContactDataAnnotation final : das::ManagedStructureAnnotation<ga
   bool canBePlacedInContainer() const override { return true; }
 
   bool canBeSubstituted(TypeAnnotation *pass_type) const override { return parentType->annotation == pass_type; }
+
+  virtual void gc_collect(das::gc_root *target, das::gc_root *from) override
+  {
+    das::ManagedStructureAnnotation<gamephys::CollisionContactData, false>::gc_collect(target, from);
+    if (parentType)
+      parentType->gc_collect(target, from);
+  }
+  virtual void visitTypeDecls(const das::function<void(das::TypeDecl *)> &callback) override
+  {
+    if (parentType)
+      callback(parentType);
+  }
 };
 
 struct CollisionLinkDataAnnotation : das::ManagedStructureAnnotation<dacoll::CollisionLinkData, false>
@@ -105,16 +117,16 @@ public:
     addBuiltinDependency(lib, require("RendInst"), true);
     addBuiltinDependency(lib, require("DagorMath"));
     addBuiltinDependency(lib, require("DagorDataBlock"));
-    addEnumeration(das::make_smart<EnumerationPhysLayer>());
+    addEnumeration(new EnumerationPhysLayer());
     das::addEnumFlagOps<dacoll::PhysLayer>(*this, lib, "dacoll::PhysLayer");
-    addEnumeration(das::make_smart<EnumerationCollType>());
+    addEnumeration(new EnumerationCollType());
     das::addEnumFlagOps<dacoll::CollType>(*this, lib, "dacoll::CollType");
-    addAnnotation(das::make_smart<TraceMeshFacesAnnotation>(lib));
-    addAnnotation(das::make_smart<CollisionObjectAnnotation>(lib));
-    addAnnotation(das::make_smart<ShapeQueryOutputAnnotation>(lib));
-    addAnnotation(das::make_smart<CollisionContactDataMinAnnotation>(lib));
-    addAnnotation(das::make_smart<CollisionContactDataAnnotation>(lib));
-    addAnnotation(das::make_smart<CollisionLinkDataAnnotation>(lib));
+    addAnnotation(new TraceMeshFacesAnnotation(lib));
+    addAnnotation(new CollisionObjectAnnotation(lib));
+    addAnnotation(new ShapeQueryOutputAnnotation(lib));
+    addAnnotation(new CollisionContactDataMinAnnotation(lib));
+    addAnnotation(new CollisionContactDataAnnotation(lib));
+    addAnnotation(new CollisionLinkDataAnnotation(lib));
 
     das::addExtern<DAS_BIND_FUN(dacoll_traceray_normalized)>(*this, lib, "traceray_normalized", das::SideEffects::modifyArgument,
       "bind_dascript::dacoll_traceray_normalized");
@@ -132,6 +144,9 @@ public:
     das::addExtern<DAS_BIND_FUN(dacoll_tracedown_normalized_with_mat_id_ex)>(*this, lib, "tracedown_normalized_with_mat_id",
       das::SideEffects(uint32_t(das::SideEffects::modifyArgument) | uint32_t(das::SideEffects::accessExternal)),
       "bind_dascript::dacoll_tracedown_normalized_with_mat_id_ex");
+    das::addExtern<DAS_BIND_FUN(dacoll_tracedown_normalized_trace_handle_with_mat_id_ex)>(*this, lib,
+      "tracedown_normalized_with_mat_id", das::SideEffects::modifyArgument,
+      "bind_dascript::dacoll_tracedown_normalized_trace_handle_with_mat_id_ex");
     das::addExtern<DAS_BIND_FUN(dacoll_tracedown_normalized_with_norm)>(*this, lib, "tracedown_normalized",
       das::SideEffects::modifyArgument, "bind_dascript::dacoll_tracedown_normalized_with_norm");
     das::addExtern<DAS_BIND_FUN(dacoll_tracedown_normalized_with_pmid)>(*this, lib, "tracedown_normalized",
@@ -146,6 +161,8 @@ public:
       "bind_dascript::dacoll_validate_trace_cache");
     das::addExtern<DAS_BIND_FUN(dacoll::trace_game_objects)>(*this, lib, "trace_game_objects", das::SideEffects::modifyArgument,
       "dacoll::trace_game_objects");
+    das::addExtern<DAS_BIND_FUN(trace_game_objects_with_grid_filter)>(*this, lib, "trace_game_objects_with_grid_filter",
+      das::SideEffects::modifyArgument, "bind_dascript::trace_game_objects_with_grid_filter");
     das::addExtern<DAS_BIND_FUN(dacoll_rayhit_normalized)>(*this, lib, "rayhit_normalized", das::SideEffects::accessExternal,
       "bind_dascript::dacoll_rayhit_normalized");
     das::addExtern<DAS_BIND_FUN(dacoll_rayhit_normalized_trace_handle)>(*this, lib, "rayhit_normalized",
@@ -187,6 +204,8 @@ public:
       "bind_dascript::dacoll_sphere_cast_land");
     das::addExtern<DAS_BIND_FUN(dacoll_sphere_cast_ex)>(*this, lib, "sphere_cast_ex", das::SideEffects::modifyArgument,
       "bind_dascript::dacoll_sphere_cast_ex");
+    das::addExtern<DAS_BIND_FUN(dacoll_sphere_cast_ex_ref_trace_handle)>(*this, lib, "sphere_cast_ex_ref_trace_handle",
+      das::SideEffects::modifyArgument, "bind_dascript::dacoll_sphere_cast_ex_ref_trace_handle");
     das::addExtern<DAS_BIND_FUN(dacoll::trace_sphere_cast_ex)>(*this, lib, "trace_sphere_cast_ex", das::SideEffects::modifyArgument,
       "dacoll::trace_sphere_cast_ex");
 
@@ -251,14 +270,18 @@ public:
     das::addExtern<DAS_BIND_FUN(dacoll_test_capsule_collision_world)>(*this, lib, "test_capsule_collision_world",
       das::SideEffects::accessExternal, "bind_dascript::dacoll_test_capsule_collision_world");
 
-    das::addExtern<DAS_BIND_FUN(dacoll_fetch_sim_res)>(*this, lib, "dacoll_fetch_sim_res", das::SideEffects::accessExternal,
-      "bind_dascript::dacoll_fetch_sim_res");
+    das::addExtern<DAS_BIND_FUN(dacoll::fetch_sim_res)>(*this, lib, "dacoll_fetch_sim_res", das::SideEffects::accessExternal,
+      "dacoll::fetch_sim_res")
+      ->arg_init(/*wait*/ 0, new das::ExprConstBool(true));
+
     das::addExtern<DAS_BIND_FUN(dacoll::set_collision_object_tm)>(*this, lib, "dacoll_set_collision_object_tm",
       das::SideEffects::modifyArgumentAndExternal, "dacoll::set_collision_object_tm");
     das::addExtern<DAS_BIND_FUN(dacoll::set_vert_capsule_shape_size)>(*this, lib, "dacoll_set_vert_capsule_shape_size",
       das::SideEffects::modifyArgumentAndExternal, "dacoll::set_vert_capsule_shape_size");
     das::addExtern<DAS_BIND_FUN(dacoll::set_collision_sphere_rad)>(*this, lib, "dacoll_set_collision_sphere_rad",
       das::SideEffects::modifyArgumentAndExternal, "dacoll::set_collision_sphere_rad");
+    das::addExtern<DAS_BIND_FUN(dacoll::set_collision_box_extents)>(*this, lib, "dacoll_set_collision_box_extents",
+      das::SideEffects::modifyArgumentAndExternal, "dacoll::set_collision_box_extents");
     das::addExtern<DAS_BIND_FUN(dacoll_draw_collision_object)>(*this, lib, "dacoll_draw_collision_object",
       das::SideEffects::modifyExternal, "bind_dascript::dacoll_draw_collision_object");
 
@@ -295,6 +318,9 @@ public:
     using method_invalidate = DAS_CALL_MEMBER(rendinst::RendInstDesc::invalidate);
     das::addExtern<DAS_CALL_METHOD(method_invalidate)>(*this, lib, "invalidate", das::SideEffects::modifyArgument,
       DAS_CALL_MEMBER_CPP(rendinst::RendInstDesc::invalidate));
+
+    das::addExtern<DAS_BIND_FUN(dacoll::exchange_ttl_for_collision_instances)>(*this, lib,
+      "dacoll_exchange_ttl_for_collision_instances", das::SideEffects::modifyExternal, "dacoll::exchange_ttl_for_collision_instances");
 
     using method_markDirty = DAS_CALL_MEMBER(TraceMeshFaces::markDirty);
     das::addExtern<DAS_CALL_METHOD(method_markDirty)>(*this, lib, "markDirty", das::SideEffects::modifyArgument,

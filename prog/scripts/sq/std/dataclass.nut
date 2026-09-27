@@ -1,4 +1,3 @@
-from "string.nut" import tostring_r
 //local pp = @(...) print(vargv.reduce(@(a,b) a+", " +b) + "\n")
 
 /*
@@ -47,24 +46,26 @@ local Point2_manual = class {
 }
 */
 
+from "types" import Array, String
+
 let pp = @(...) print(" ".join(vargv.append("\n")))
 
-function unpackfield(field){
+function unpackfield(field): array {
   local def = null
-  if (type(field) == "array") {
+  if (field instanceof Array) {
     def = field[1]
     field = field[0]
   }
   return [field, def]
 }
-function _cfield(fieldname, def){
+function _cfield(fieldname, def): string {
   return $"{fieldname} = {def}"
 }
-function mkAddNewline(indent=""){
+function mkAddNewline(indent=""): function {
   return @(a,b) $"{a}\n{indent}{b}"
 }
 
-let addComma = @(a,b) ", ".concat(a,b)
+let addComma = @(a,b): string ", ".concat(a,b)
 //local addSemiCol = @(a,b) a+"; "+b
 //local addNewline0 = mkAddNewline()
 let addNewline1 = mkAddNewline("  ")
@@ -72,8 +73,8 @@ let addNewline1 = mkAddNewline("  ")
 let addNewline3 = mkAddNewline("      ")
 
 function valToStr(val){
-  assert(["string","null","float","integer", "bool"].indexof(type(val))!=null, "only simple immutable types currently supported")
-  if (type(val)=="string")
+  assert(["string","null","float","integer", "bool"].contains(type(val)), "only simple immutable types currently supported")
+  if (val instanceof String)
     val = $"\"{val}\""
   return val
 }
@@ -82,24 +83,23 @@ function mkClassFields(fields){
   return fields.map(@(v) _cfield(v[0], valToStr(v[1]))).reduce(addNewline1)
 }
 
-let mkPosFieldInit = @(fieldname, def) $"this.{fieldname} = {valToStr(def)}"
+let mkPosFieldInit = @(fieldname, _def): string $"this.{fieldname} = {fieldname}"
 
-function mkTableFieldInit(fieldname, firstarg, def){
+function mkTableFieldInit(fieldname, firstarg, def): string {
   def = valToStr(def)
   def = (def != null)
     ? $" ?? {def}"
     : ""
   return $"this.{fieldname} = {firstarg}?.{fieldname}{def}"
 }
-function mkArg(name, def){
+function mkArg(name, def): string {
   return $"{name} = {def}"
 }
 
-function mkCtor(fields, args){
+function mkCtor(fields, args): string {
   let firstarg = fields[0][0]
-  pp(tostring_r(fields))
   let kwargs_inits = fields.map(@(v) mkTableFieldInit(v[0], firstarg, v[1])).reduce(addNewline3)
-  let pargs_inits = fields.map(@(v) mkPosFieldInit(v[0], v[1])).filter(@(_idx, v) v!="" && v!=null).reduce(addNewline3) ?? ""
+  let pargs_inits = fields.map(@(v) mkPosFieldInit(v[0], v[1])).reduce(addNewline3) ?? ""
 
   let ret = @"
   constructor({0}){
@@ -116,8 +116,8 @@ function mkCtor(fields, args){
 
 let defParams = {name=null, verbose=false}
 function Dataclass(fields, params = defParams){
-  local name = defParams?.name
-  name = (type(name)=="string")
+  local name = params?.name
+  name = (name instanceof String)
     ? $"static __name__ = \"{name}\"\n"
     : ""
 

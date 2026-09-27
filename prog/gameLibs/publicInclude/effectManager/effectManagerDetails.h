@@ -6,6 +6,7 @@
 
 #include <effectManager/effectManager.h>
 #include "dafxCompound_decl.h"
+#include <math/dag_hlsl_floatx.h>
 
 struct EffectManager::SoundEffect
 {
@@ -28,6 +29,8 @@ struct EffectManager::LightEffect
   int extLightId = -1;
   BaseEffectObject *obj;
   float radiusMultiplier = 1.0f;
+  uint32_t lightFlags = 0;
+  float lightSourceRadius = 0.f;
   Point3 pos = {0, 0, 0};
   Point4 params = {0, 0, 0, 0};
   float intensity = 1.0f;
@@ -55,11 +58,17 @@ struct EffectManager::PendingData
   Point3 velocity = Point3(0, 0, 0);
   Point2 velocityScaleMinMax = Point2(1, 1);
   float lightRadiusMultiplier = 1.0f;
+  uint32_t lightFlags = 0;
+  float lightSourceRadius = 0.f;
   float lightIntensity = 1.0f;
   float windScale = -1.0f;
   Matrix3 gravityTm = Matrix3::IDENT;
   TMatrix lightBox = TMatrix::ZERO;
   Point3 fakeBrightnessBackgroundPos = Point3(0, 0, 0);
+  TMatrix4 splineGenData = TMatrix4::ZERO;
+  int biomeQueryId = -1;
+  float warmupTime = 0.f;
+  float warmupStepDt = 0.f; // 0 = dafx config default
 
   PendingData() = delete;
   explicit PendingData(AcesEffect::FxId fx_id) : fxId(fx_id) {}

@@ -29,8 +29,8 @@ public:
   void load(IGenLoad & cb, int load_flags);
 
 
-  bool getBodyTm(const char *name, TMatrix &tm);
-  bool getTmHelperWtm(const char *name, TMatrix &wtm);
+  bool getBodyTm(const char *name, TMatrix &tm) const;
+  bool getTmHelperWtm(const char *name, TMatrix &wtm) const;
 
 
   struct TmHelper
@@ -70,6 +70,11 @@ public:
     float angDiff = 0;
   };
 
+  struct CollisionPair
+  {
+    int body0, body1;
+  };
+
   struct Body
   {
     SimpleString name;
@@ -91,7 +96,7 @@ public:
 
     void load(IGenLoad &cb);
 
-    int findTmHelper(const char *name);
+    int findTmHelper(const char *name) const;
   };
 
   struct RdBallJoint
@@ -149,13 +154,18 @@ public:
     SimpleString name;
   };
 
-  const Tab<Body> &getBodies() const { return bodies; }
+  dag::ConstSpan<Body> getBodies() const { return bodies; }
+
+  dag::ConstSpan<RdBallJoint> getRdBallJoints() const { return rdBallJoints; }
+  dag::ConstSpan<RdHingeJoint> getRdHingeJoints() const { return rdHingeJoints; }
+  dag::ConstSpan<RevoluteJoint> getRevoluteJoints() const { return revoluteJoints; }
+  dag::ConstSpan<SphericalJoint> getSphericalJoints() const { return sphericalJoints; }
+
   dag::ConstSpan<NodeAlignCtrl> getNodeAlignCtrl() const { return nodeAlignCtrl; }
 
-protected:
-  friend class BulletPhysSystemInstance;
-  friend class JoltPhysSystemInstance;
+  dag::ConstSpan<CollisionPair> getNoCollisionPairs() const { return noCollisionPairs; }
 
+protected:
   Tab<Body> bodies;
 
   Tab<RdBallJoint> rdBallJoints;
@@ -163,6 +173,7 @@ protected:
   Tab<RevoluteJoint> revoluteJoints;
   Tab<SphericalJoint> sphericalJoints;
   Tab<NodeAlignCtrl> nodeAlignCtrl;
+  Tab<CollisionPair> noCollisionPairs;
 end_dclass_decl();
 
 

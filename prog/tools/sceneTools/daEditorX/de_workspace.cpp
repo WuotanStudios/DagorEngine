@@ -12,6 +12,7 @@
 
 #include <libTools/containers/dag_TabOps.h>
 #include <libTools/containers/tab_sort.h>
+#include <libTools/util/appDirRelativePath.h>
 
 #include <drv/3d/dag_info.h>
 #include <osApiWrappers/dag_files.h>
@@ -49,12 +50,7 @@ bool DeWorkspace::loadAppSpecific(const DataBlock &blk)
   const DataBlock *sdkBlk = blk.getBlockByName("SDK");
 
   if (sdkBlk)
-  {
-    params.additionalPlugins = sdkBlk->getStr("daeditor3x_additional_plugins", NULL);
-
-    if (params.additionalPlugins.length())
-      params.additionalPlugins = ::make_full_path(getAppDir(), params.additionalPlugins);
-  }
+    make_eff_app_relative_path(params.additionalPlugins, sdkBlk->getStr("daeditor3x_additional_plugins", nullptr));
 
   f11Tags.clear();
   plugTags.clear();
@@ -145,8 +141,8 @@ bool DeWorkspace::loadAppSpecific(const DataBlock &blk)
     {
       if (enCollBlk->getParamNameId(i) == nid && enCollBlk->getParamType(i) == DataBlock::TYPE_STRING)
       {
-        const char *name = enCollBlk->getStr(i);
-        params.enabledColliders.push_back() = name;
+        const char *mname = enCollBlk->getStr(i);
+        params.enabledColliders.push_back() = mname;
       }
     }
   }
@@ -223,7 +219,7 @@ void DeWorkspace::clear() { params.reset(); }
 bool DeWorkspace::getMetricsBlk(DataBlock &blk) const
 {
   DataBlock appBlk;
-  appBlk.load(getAppPath());
+  appBlk.load(getAppBlkPath());
 
   DataBlock *metrBlk = appBlk.getBlockByName("level_metrics");
 
@@ -234,27 +230,4 @@ bool DeWorkspace::getMetricsBlk(DataBlock &blk) const
   }
 
   return false;
-}
-
-
-const DataBlock *DeWorkspace::findWspBlk(const char *app_blk_path)
-{
-  if (wspData)
-  {
-    const int wspNid = wspData->blk.getNameId("workspace");
-
-    for (int i = 0; i < wspData->blk.blockCount(); ++i)
-    {
-      DataBlock *wspBlk = wspData->blk.getBlock(i);
-
-      if (wspBlk && wspBlk->getBlockNameId() == wspNid)
-      {
-        const char *appBlkPath = wspBlk->getStr("application_path", NULL);
-        if (appBlkPath && !::dag_path_compare(appBlkPath, app_blk_path))
-          return wspBlk;
-      }
-    }
-  }
-
-  return NULL;
 }

@@ -10,8 +10,19 @@
 class DataBlock;
 class BBox3;
 class Point3;
+class TMatrix;
+class TMatrix4;
 class ShaderElement;
 class ShaderMaterial;
+
+class IGridSettingChangeEventHandler
+{
+public:
+  // Called when the snap settings have changed.
+  virtual void onSnapSettingChanged() = 0;
+
+  static constexpr unsigned HUID = 0xBF98FF84u; // IGridSettingChangeEventHandler
+};
 
 /// Grid object.
 /// Used for representing Editor grid.
@@ -75,7 +86,8 @@ public:
   ///                 lines directions
   /// @param[in] zoom - viewport zoom
   /// @param[in] index - viewport index
-  void render(Point3 *pt, Point3 *dirs, real zoom, int index, bool test_z = true, bool write_z = true);
+  void render(Point3 *pt, Point3 *dirs, real zoom, int index, const TMatrix &view_tm, const TMatrix4 &proj_tm, bool test_z = true,
+    bool write_z = true);
 
   /// Round value to the nearest (snapped) value.
   /// @param[in] f - the value to snap
@@ -181,24 +193,32 @@ protected:
   real infiniteGridMinorLineWidth;
   int infiniteGridMajorSubdivisions;
 
-  void renderInfiniteGrid();
+  void renderInfiniteGrid(const TMatrix &view_tm, const TMatrix4 &proj_tm);
 };
 
 
 class GridEditDialog : public PropPanel::DialogWindow
 {
+  using Base = PropPanel::DialogWindow;
+
 public:
-  GridEditDialog(void *phandle, GridObject &grid, const char *caption);
+  GridEditDialog(IGridSettingChangeEventHandler &change_event_handler, GridObject &grid, const char *caption);
 
   void showGridEditDialog(int viewport_index);
   void onGridVisibilityChanged(int viewport_index);
+  void onSnapSettingChanged();
+  void onSnapStepChanged();
+
+  void updateImguiDialog(const PropPanel::DialogWindow::DialogFrameSizing &sizing) override;
 
 private:
+  bool onOk() override;
   void onChange(int pcb_id, PropPanel::ContainerPropertyControl *panel) override;
 
   void fillPanel();
   void updateShowGridDialogControl();
 
+  IGridSettingChangeEventHandler &gridSettingChangeEventHandler;
   GridObject &mGrid;
   int index = -1;
 };

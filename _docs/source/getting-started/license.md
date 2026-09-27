@@ -104,8 +104,6 @@ third-party component as follows:
   prog/3rdPartyLibs/flatbuffers/LICENSE.txt
   prog/3rdPartyLibs/freetype/freetype-2.8/LICENSE.TXT
   prog/3rdPartyLibs/freetype/harfbuzz-2.6.4/COPYING
-  prog/3rdPartyLibs/fsr2/dx12/license.txt
-  prog/3rdPartyLibs/fsr2/LICENSE.txt
   prog/3rdPartyLibs/hash/BLAKE3/LICENSE
   prog/3rdPartyLibs/hash/LICENSE
   prog/3rdPartyLibs/image/avif/LICENSE
@@ -124,7 +122,6 @@ third-party component as follows:
   prog/3rdPartyLibs/libcurl/COPYING
   prog/3rdPartyLibs/libev/LICENSE
   prog/3rdPartyLibs/libunwind/LICENSE.TXT
-  prog/3rdPartyLibs/lottie/COPYING
   prog/3rdPartyLibs/math/carve/LICENSE
   prog/3rdPartyLibs/math/clipper-4.x/license.txt
   prog/3rdPartyLibs/math/DelaunayTriangulator/LICENSE

@@ -53,12 +53,18 @@ KRNLIMP bool remove_delayed_action(DelayedAction *action);
 // This function is called from work_cycle().
 KRNLIMP void perform_delayed_actions();
 
+//! drains pending actions over several passes, for teardown paths where a single perform_delayed_actions()
+//! would leave buffered records unrun (and so silently drop whatever their callbacks were to free);
+//! best effort: it gives up after a bounded number of passes and logs whatever is still queued;
+//! runs the callbacks itself, so it has the same main-thread-only rule as perform_delayed_actions()
+KRNLIMP void flush_delayed_actions();
+
 // sets maximum time that perform_delayed_actions() may spend on one work cycle; default is 4000000 (4 sec)
 KRNLIMP void set_delayed_action_max_quota(int quota_usec);
 
-KRNLIMP void register_regular_action_to_idle_cycle(delayed_callback cb, void *cb_arg);
+KRNLIMP void register_regular_action_to_idle_cycle(delayed_callback cb, void *cb_arg, bool perform_on_work_cycle = true);
 KRNLIMP void unregister_regular_action_to_idle_cycle(delayed_callback cb, void *cb_arg);
-KRNLIMP void perform_regular_actions_for_idle_cycle();
+KRNLIMP void perform_regular_actions_for_idle_cycle(bool is_work_cycle);
 
 template <class F>
 DelayedAction *make_delayed_action(F &&func)
@@ -73,9 +79,9 @@ DelayedAction *make_delayed_action(F &&func)
 };
 
 template <class F>
-void delayed_call(F &&func)
+void delayed_call(F &&func, const char *debug_name = NULL, [[maybe_unused]] const char *dummy = NULL)
 {
-  add_delayed_action(make_delayed_action(eastl::forward<F>(func)));
+  add_delayed_action(make_delayed_action(eastl::forward<F>(func)), debug_name);
 }
 
 template <class F>
@@ -114,6 +120,7 @@ auto make_delayed_func(F func)
 #define add_delayed_action_buffered(...)   add_delayed_action_buffered(__VA_ARGS__, "DelayedAction(buf)" ACTION_DEBUG_NAMES_LOC)
 #define add_delayed_callback(...)          add_delayed_callback(__VA_ARGS__, "DelayedActionCB" ACTION_DEBUG_NAMES_LOC)
 #define add_delayed_callback_buffered(...) add_delayed_callback_buffered(__VA_ARGS__, "DelayedActionCB(buf)" ACTION_DEBUG_NAMES_LOC)
+#define delayed_call(...)                  delayed_call(__VA_ARGS__, "DelayedCall" ACTION_DEBUG_NAMES_LOC)
 #endif
 
 #include <supp/dag_undef_KRNLIMP.h>

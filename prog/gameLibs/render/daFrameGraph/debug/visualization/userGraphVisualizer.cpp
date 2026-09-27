@@ -1,0 +1,3161 @@
+// Copyright (C) Gaijin Games KFT.  All rights reserved.
+
+#define IMGUI_DEFINE_MATH_OPERATORS
+
+#include "userGraphVisualizer.h"
+
+#include <debug/backendDebug.h>
+#include <debug/textureVisualization.h>
+
+#include <runtime/runtime.h>
+#include <frontend/nodeTracker.h>
+#include <frontend/nameResolver.h>
+#include <frontend/multiplexingInternal.h>
+#include <backend/simdBitVector.h>
+#include <backend/simdBitMatrix.h>
+
+#include <imgui.h>
+#include <gui/dag_imgui.h>
+#include <gui/dag_imguiUtil.h>
+#include <imgui-node-editor/imgui_canvas.h>
+#include <imgui-node-editor/imgui_bezier_math.h>
+
+#include <generic/dag_reverseView.h>
+#include <generic/dag_bitset.h>
+#include <util/dag_convar.h>
+#include <util/dag_console.h>
+#include <render/debugTexOverlay.h>
+#include <perfMon/dag_statDrv.h>
+
+
+// Originally inspired by mr ocornut
+// https://gist.github.com/ocornut/7e9b3ec566a333d725d4
+
+
+constexpr float NODE_MIN_X_SIZE = 300.f;
+constexpr float NODE_MIN_Y_SIZE = 350.f;
+constexpr float NODE_Y_ANCHORS_START = 100.f;
+constexpr float NODE_ANCHORS_MARGIN = 5.f;
+constexpr float NODE_OUTLINE_WIDTH = 10.f;
+constexpr ImVec2 NODE_OUTLINE_OFFSET = ImVec2{NODE_OUTLINE_WIDTH, NODE_OUTLINE_WIDTH};
+constexpr ImVec2 NODE_BORDER_PADDING = ImVec2{10.f, 15.f};
+
+constexpr ImVec2 RES_BLOCK_BORDER_PADDING = ImVec2{10.f, 10.f};
+
+constexpr float OBJ_X_BASE_MARGIN = 3.0f * NODE_MIN_X_SIZE;
+constexpr float OBJ_Y_BASE_MARGIN = 1.0f * NODE_MIN_Y_SIZE;
+
+constexpr float NAMESPACE_BORDER_WIDTH = 2.f;
+constexpr ImVec2 NAMESPACE_BORDER_PADDING = ImVec2{50.f, 50.f};
+
+constexpr ImVec2 NAMETAG_PADDING = ImVec2{5.f, 5.f};
+
+constexpr float BASE_DEP_WIDTH = 10.f;
+constexpr float CYCLED_DEP_WIDTH = 1.6f * BASE_DEP_WIDTH;
+constexpr float DISABLED_DEP_WIDTH = 1.4f * BASE_DEP_WIDTH;
+
+constexpr float HISTORY_WAVE_LEN = NODE_MIN_X_SIZE / 3.f;
+constexpr float HISTORY_WAVE_HEIGHT = BASE_DEP_WIDTH * 3.f;
+
+
+constexpr ImU32 NODE_NAME_COLOR = IM_COL32(128, 128, 128, 255);       // rgb(128, 128, 128)
+constexpr ImU32 NODE_BASE_COLOR = IM_COL32(96, 96, 96, 255);          // rgb(96, 96, 96)
+constexpr ImU32 NODE_CHANGED_COLOR = IM_COL32(255, 64, 255, 255);     // rgb(255, 64, 255)
+constexpr ImU32 NODE_CHANGED_OLD_COLOR = IM_COL32(128, 64, 128, 255); // rgb(128, 64, 128)
+
+constexpr ImU32 DEP_COLOR_PREV = IM_COL32(0, 255, 255, 255);     // rgb(0, 255, 255)
+constexpr ImU32 DEP_COLOR_FOLLOW = IM_COL32(128, 128, 255, 255); // rgb(128, 128, 255)
+constexpr ImU32 DEP_COLOR_MOD = IM_COL32(255, 255, 0, 255);      // rgb(255, 255, 0)
+constexpr ImU32 DEP_COLOR_READ = IM_COL32(0, 128, 0, 255);       // rgb(0, 128, 0)
+constexpr ImU32 DEP_COLOR_CONS = IM_COL32(255, 0, 255, 255);     // rgb(255, 0, 255)
+constexpr ImU32 DEP_COLOR_HIST = IM_COL32(128, 255, 0, 255);     // rgb(128, 255, 0)
+
+constexpr ImU32 FOCUS_COLOR = IM_COL32(255, 255, 128, 255);     // rgb(255, 255, 128)
+constexpr ImU32 RES_INSPECT_COLOR = IM_COL32(255, 128, 0, 255); // rgb(255, 128, 0)
+constexpr ImU32 CYCLED_DEP_COLOR = IM_COL32(255, 0, 0, 255);    // rgb(255, 0, 0)
+constexpr ImU32 DISABLED_DEP_COLOR = CYCLED_DEP_COLOR;
+
+constexpr ImU32 CAPTURE_START_COLOR = IM_COL32(64, 220, 64, 255); // rgb(64, 220, 64)
+constexpr ImU32 CAPTURE_END_COLOR = IM_COL32(255, 96, 64, 255);   // rgb(255, 96, 64)
+
+
+constexpr ImU32 OPT_POPUP_POS_COLOR = IM_COL32(64, 196, 64, 255);  // rgb(64, 196, 64)
+constexpr ImU32 OPT_POPUP_WAR_COLOR = IM_COL32(196, 196, 64, 255); // rgb(196, 196, 64)
+constexpr ImU32 OPT_POPUP_NEG_COLOR = IM_COL32(196, 64, 64, 255);  // rgb(196, 64, 64)
+
+constexpr ImU32 SIDE_EFF_NON_COLOR = IM_COL32(64, 196, 64, 255);  // rgb(64, 196, 64)
+constexpr ImU32 SIDE_EFF_INT_COLOR = IM_COL32(196, 64, 196, 255); // rgb(196, 64, 196)
+constexpr ImU32 SIDE_EFF_EXT_COLOR = IM_COL32(196, 64, 0, 255);   // rgb(196, 64, 0)
+
+constexpr auto NODE_EXEX_REQ_POPUP = "node_exec_reqs";
+constexpr auto NODE_RENDER_REQ_POPUP = "node_render_reqs";
+constexpr auto NODE_BINDINGS_POPUP = "node_bindings";
+constexpr auto NODE_IDX_VTX_POPUP = "node_iv_bufs";
+constexpr auto EDGE_RESOURCES_POPUP = "edge_resources";
+constexpr auto HISTORY_EDGE_POPUP = "history_edge";
+constexpr auto NODE_CAPTURE_POPUP = "node_capture_range";
+
+
+template <class T, class... Ts>
+static void hash_pack(size_t &hash, T first, const Ts &...other)
+{
+  hash ^= eastl::hash<T>{}(first) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+  (hash_pack(hash, other), ...);
+}
+
+
+namespace dafg
+{
+
+extern ConVarT<bool, false> recompile_graph;
+
+void show_dependencies_window() { imgui_window_set_visible(IMGUI_WINDOW_GROUP_FG2, IMGUI_USG_WIN_NAME, true); }
+
+namespace visualization::usergraph
+{
+
+static const eastl::array<eastl::pair<NodeColorationType, const char *>, static_cast<size_t>(NodeColorationType::COUNT)>
+  nodeColorationTypeArray{eastl::pair{NodeColorationType::None, (const char *)"None"},
+    eastl::pair{NodeColorationType::Framebuffer, (const char *)"Color by framebuffers"},
+    eastl::pair{NodeColorationType::Pass, (const char *)"Color by passes"}};
+
+static const char *node_coloration_name_by_type(NodeColorationType type)
+{
+  return nodeColorationTypeArray[static_cast<size_t>(type)].second;
+}
+
+static const eastl::array<eastl::pair<ResourceFocusType, const char *>, static_cast<size_t>(ResourceFocusType::COUNT)>
+  resourceFocusTypeArray{eastl::pair{ResourceFocusType::All, (const char *)"Show all"},
+    eastl::pair{ResourceFocusType::Resource, (const char *)"Focus on resource"},
+    eastl::pair{ResourceFocusType::ResourceAndRenames, (const char *)"Focus on resource and renames"}};
+
+static const char *res_focus_name_by_type(ResourceFocusType type) { return resourceFocusTypeArray[static_cast<size_t>(type)].second; }
+
+struct DependencyTypeInfo
+{
+  eastl::string name;
+  uint32_t imguiColor = 0;
+  bool visible = true;
+};
+
+static eastl::array<DependencyTypeInfo, static_cast<size_t>(DependencyType::COUNT)> dependencyInfoByTypeArray{
+  DependencyTypeInfo{"Precedes", DEP_COLOR_PREV},
+  DependencyTypeInfo{"Follows", DEP_COLOR_FOLLOW},
+  DependencyTypeInfo{"Modifies", DEP_COLOR_MOD},
+  DependencyTypeInfo{"Reads", DEP_COLOR_READ},
+  DependencyTypeInfo{"Consumes", DEP_COLOR_CONS},
+  DependencyTypeInfo{"Reads History", DEP_COLOR_HIST},
+};
+
+static DependencyTypeInfo &dependency_info_by_type(const DependencyType type)
+{
+  return dependencyInfoByTypeArray[static_cast<size_t>(type)];
+}
+
+
+void Visualizer::draw()
+{
+  if (ImGui::IsWindowCollapsed())
+    return;
+
+  if (updateNeeded)
+    updateVisualization(lastChangedNodes);
+
+  if (check_user_node_focus_request())
+  {
+    const auto focusNameId = get_user_node_focus_request();
+    if (isPresented(focusNameId))
+    {
+      setFocus(focusNameId);
+      centerOnFocus();
+    }
+  }
+
+  if (check_user_resource_focus_request())
+  {
+    const auto focusResId = get_user_resource_focus_request();
+    if (isPresented(focusResId))
+    {
+      setFocus(focusResId);
+      centerOnFocus();
+    }
+  }
+
+
+  hoverState.reset();
+  hoverState.window = ImGui::IsWindowHovered();
+  gpuCapture.nodeRowPopupOpenedThisFrame = false;
+
+
+  drawUI();
+
+  drawCanvas();
+
+
+  processPopup();
+
+  processInput();
+
+  processTextureDebug();
+}
+
+void Visualizer::drawUI()
+{
+  {
+    if (ImGuiDagor::ComboWithFilter("User Node Search", nsNodeNames, focusedNodeIndex, nodeSearchInput, false, true,
+          "Search for node...") &&
+        focusedNodeIndex != UNKNOWN_INDEX)
+    {
+      setFocus(nsNodeNameIds[focusedNodeIndex]);
+      centerOnFocus();
+    }
+
+    if (focusState.nodeValid())
+    {
+      ImGui::SameLine();
+      if (ImGui::Button("Center on node"))
+        centerOnFocus();
+
+      ImGui::SameLine();
+      if (ImGui::Button("Reset node focus"))
+        clearFocus();
+    }
+  }
+
+  {
+    if (treeWithFilter("FG Managed Resource Search", nsResNames, focusedResourceIndex, resourceSearchInput, true,
+          "Search for resource...") &&
+        focusedResourceIndex != UNKNOWN_INDEX)
+    {
+      setFocus(nsResNameIds[focusedResourceIndex]);
+      centerOnFocus();
+    }
+
+    if (focusState.resValid())
+    {
+      ImGui::SameLine();
+      if (ImGui::Button("Center on resource"))
+        centerOnFocus();
+
+      ImGui::SameLine();
+      if (ImGui::Button("Reset resource focus"))
+        clearFocus();
+
+      ImGui::SameLine();
+      ImGuiDagor::EnumCombo("##resourceRenamesCombo", ResourceFocusType::All,
+        focusState.hasRenames ? ResourceFocusType::ResourceAndRenames : ResourceFocusType::Resource, focusState.focusType,
+        &res_focus_name_by_type, ImGuiComboFlags_WidthFitPreview);
+    }
+  }
+
+  {
+    ImGui::Text("Edge types: ");
+
+    for (auto &info : dependencyInfoByTypeArray)
+    {
+      ImGui::SameLine();
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(info.imguiColor));
+      ImGui::Checkbox(info.name.c_str(), &info.visible);
+      ImGui::PopStyleColor();
+    }
+
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::BeginCombo("##coloration", node_coloration_name_by_type(coloration)))
+    {
+      for (const auto [type, name] : nodeColorationTypeArray)
+      {
+        const bool selected = coloration == type;
+        if (ImGui::Selectable(name, selected))
+          coloration = type;
+        if (selected)
+          ImGui::SetItemDefaultFocus();
+      }
+      ImGui::EndCombo();
+    }
+
+    ImGui::SameLine();
+    ImGui::Text("Hierarchical view:");
+    ImGui::SameLine();
+    ImGui::Checkbox("##hierarchicalView", &hierarchicalView);
+  }
+
+  {
+    if (ImGui::Button("Recompile"))
+      dafg::recompile_graph.set(true);
+
+    ImGui::SameLine();
+    if (ImGui::Button("Reset changed nodes"))
+    {
+      lastChangedNodes.assign(lastChangedNodes.size(), false);
+      accumChangedNodes.assign(accumChangedNodes.size(), false);
+    }
+
+    ImGui::SameLine();
+    if (deselect_button("Deselect"))
+      clearInspectedDependency();
+
+    fg_texture_visualization_imgui_line(registry);
+
+    ImGui::SameLine();
+    overlay_checkbox("Overlay mode");
+  }
+
+  {
+    if (ImGui::Button("GPU capture"))
+    {
+      imgui_window_set_visible(IMGUI_WINDOW_GROUP_FG2, IMGUI_GPU_CAPTURE_WIN_NAME, true);
+      gpuCapture.focusGpuCaptureWindow = true;
+    }
+  }
+
+  {
+    ImGui::Text("Use mouse wheel button to pan.");
+  }
+}
+
+void Visualizer::drawCanvas()
+{
+  if (!canvas.Begin("##scrolling_region", ImVec2(0, 0)))
+    return;
+
+  checkHovering();
+
+  // here, we will perform draw, based on precalculated positions
+  ImDrawList *drawList = ImGui::GetWindowDrawList();
+  drawList->ChannelsSplit(CanvasChannels::COUNT);
+  {
+    const auto &layoutToUse = hierarchicalView ? condensedLayout : generalLayout;
+
+    drawNodes(drawList, layoutToUse);
+
+    drawEdges(drawList, layoutToUse);
+
+    if (hierarchicalView)
+      drawNodeBoxes(drawList);
+
+    // TODO: generate edges for disabled dependencies and draw them like others
+    {
+      for (const auto depId : disabledDependencies)
+      {
+        const auto &dep = registryDependencies[depId];
+        const auto resNameId = getNameId(dep.resource);
+        auto [fromOffset, fromSize] = layoutToUse.nodes[dep.from];
+        auto [toOffset, toSize] = layoutToUse.nodes[dep.to];
+
+        if (fromOffset.x > toOffset.x)
+        {
+          eastl::swap(fromOffset, toOffset);
+          eastl::swap(fromSize, toSize);
+        }
+        const ImVec2 leftAnchor = fromOffset + ImVec2{0.f, fromSize.y / 2.f};
+        const ImVec2 rightAnchor = toOffset + ImVec2{toSize.x, toSize.y / 2.f};
+        const float topBound = min(rightAnchor.y, leftAnchor.y) - abs(rightAnchor.x - leftAnchor.x) / 3;
+        const float leftBound = leftAnchor.x - (leftAnchor.y - topBound);
+        const float rightBound = rightAnchor.x + (rightAnchor.y - topBound);
+        const ImCubicBezierPoints backEdgeCurve = {leftAnchor, ImVec2{leftBound, topBound}, ImVec2{rightBound, topBound}, rightAnchor};
+
+        drawList->ChannelsSetCurrent(CanvasChannels::TEXTS);
+        drawList->AddBezierCubic(backEdgeCurve.P0, backEdgeCurve.P1, backEdgeCurve.P2, backEdgeCurve.P3, DISABLED_DEP_COLOR,
+          DISABLED_DEP_WIDTH);
+
+        if (ImProjectOnCubicBezier(ImGui::GetIO().MousePos, backEdgeCurve).Distance < DISABLED_DEP_WIDTH)
+          hoverState.tooltip.aprintf(0, "disabled: %s\n", getName(resNameId));
+      }
+    }
+
+    // TODO: generate edges for history dependencies and draw them like others
+    {
+      const auto &[_, depColor, depVisible] = dependency_info_by_type(DependencyType::IMPLICIT_RES_HIST);
+      if (depVisible)
+      {
+        drawList->ChannelsSetCurrent(CanvasChannels::EDGES);
+
+        const float vertOffset = NODE_ANCHORS_MARGIN + 1.5f * BASE_DEP_WIDTH;
+        const float wavesThird = HISTORY_WAVE_LEN / 3.f;
+
+        for (auto [nodeId, node] : userNodes.enumerate())
+        {
+          const auto [offset, size] = layoutToUse.nodes[nodeId];
+          ImVec2 leftAnchor = offset + ImVec2{0.f, size.y - vertOffset};
+          ImVec2 rightAnchor = offset + ImVec2{size.x, size.y - vertOffset};
+
+          for (const auto depId : node.inHistDeps)
+          {
+            const auto resId = registryDependencies[depId].resource;
+
+            if (isResourceVisible(resId))
+            {
+              const ImCubicBezierPoints spline = {leftAnchor, leftAnchor - ImVec2{1.f * wavesThird, HISTORY_WAVE_HEIGHT},
+                leftAnchor - ImVec2{2.f * wavesThird, -HISTORY_WAVE_HEIGHT}, leftAnchor - ImVec2{3.f * wavesThird, 0.f}};
+
+              if (inspectedDependency.depId == depId)
+                drawList->AddBezierCubic(spline.P0, spline.P1, spline.P2, spline.P3, RES_INSPECT_COLOR, 2.f * BASE_DEP_WIDTH);
+              drawList->AddBezierCubic(spline.P0, spline.P1, spline.P2, spline.P3, depColor, BASE_DEP_WIDTH);
+
+              // History waves are the lowest hover priority: never override a node or layout edge.
+              if (hoverState.node == NodeId::Invalid && hoverState.resource == ResourceId::Invalid &&
+                  ImProjectOnCubicBezier(ImGui::GetIO().MousePos, spline).Distance < BASE_DEP_WIDTH)
+              {
+                hoverState.tooltip.aprintf(0, "history of: %s\n", getName(getNameId(resId)));
+                hoverState.historyEdge = true;
+                hoverState.deps = {depId};
+                hoverState.resource = resId;
+              }
+            }
+
+            leftAnchor.y -= 3.f * BASE_DEP_WIDTH;
+          }
+
+          for (const auto depId : node.outHistDeps)
+          {
+            const auto resId = registryDependencies[depId].resource;
+
+            if (isResourceVisible(resId))
+            {
+              const ImCubicBezierPoints spline = {rightAnchor, rightAnchor + ImVec2{1.f * wavesThird, HISTORY_WAVE_HEIGHT},
+                rightAnchor + ImVec2{2.f * wavesThird, -HISTORY_WAVE_HEIGHT}, rightAnchor + ImVec2{3.f * wavesThird, 0.f}};
+
+              if (inspectedDependency.depId == depId)
+                drawList->AddBezierCubic(spline.P0, spline.P1, spline.P2, spline.P3, RES_INSPECT_COLOR, 2.f * BASE_DEP_WIDTH);
+              drawList->AddBezierCubic(spline.P0, spline.P1, spline.P2, spline.P3, depColor, BASE_DEP_WIDTH);
+
+              // The "to next frame" write has no previous-frame content to inspect, so the wave only labels it.
+              if (hoverState.node == NodeId::Invalid && hoverState.resource == ResourceId::Invalid &&
+                  ImProjectOnCubicBezier(ImGui::GetIO().MousePos, spline).Distance < BASE_DEP_WIDTH)
+                hoverState.tooltip.aprintf(0, "to next frame: %s\n", getName(getNameId(resId)));
+            }
+
+            rightAnchor.y -= 3.f * BASE_DEP_WIDTH;
+          }
+        }
+      }
+    }
+  }
+  drawList->ChannelsMerge();
+
+  canvas.End();
+}
+
+void Visualizer::drawNodes(ImDrawList *draw_list, const CanvasLayout &layout)
+{
+  const ImRect canvasView = canvas.ViewRect();
+  const bool mouseRclick = ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+
+  for (auto [nodeId, nodeRect] : layout.nodes.enumerate())
+  {
+    const ImVec2 leftTopPos = nodeRect.offset;
+    const ImVec2 rightBottomPos = nodeRect.offset + nodeRect.size;
+    if (!rect_is_visible(ImRect{leftTopPos, rightBottomPos}, canvasView))
+      continue;
+
+    const auto &node = userNodes[nodeId];
+    const auto nodeNameId = getNameId(nodeId);
+    const auto nodeName = getName(nodeNameId);
+    auto &nodeData = registry.nodes[node.regId];
+
+    const ImVec2 nameTagSize = ImMax(ImGui::CalcTextSize(nodeName.data()), ImVec2{nodeRect.size.x, 0.f}) + 2.f * NAMETAG_PADDING;
+    const ImVec2 nameTagLeftTopPos = leftTopPos - ImVec2{NAMETAG_PADDING.x, nameTagSize.y / 2};
+    const ImVec2 nameTagRightBottomPos = nameTagLeftTopPos + nameTagSize;
+
+    // draw node rectangle and borders
+    {
+      draw_list->ChannelsSetCurrent(CanvasChannels::NODES);
+
+      ImU32 nodeFillColor = NODE_BASE_COLOR;
+      switch (coloration)
+      {
+        case NodeColorationType::None: break;
+        case NodeColorationType::Framebuffer: nodeFillColor = node.fbImColor; break;
+        case NodeColorationType::Pass: nodeFillColor = node.passImColor; break;
+        default: break;
+      }
+      if (!nodeData.enabled)
+        nodeFillColor = apply_alpha_coeff(nodeFillColor, 0.5f);
+
+      draw_list->AddRectFilled(leftTopPos, rightBottomPos, nodeFillColor, 4.0f);
+
+
+      dag::RelocatableFixedVector<ImU32, 4> colorsToDraw;
+
+      if (nodeId == focusState.nodeId)
+        colorsToDraw.push_back(FOCUS_COLOR);
+      if (nodeNameId == gpuCapture.captureStart.nameId)
+        colorsToDraw.push_back(CAPTURE_START_COLOR);
+      if (nodeNameId == gpuCapture.captureEnd.nameId)
+        colorsToDraw.push_back(CAPTURE_END_COLOR);
+      if (node.cycled)
+        colorsToDraw.push_back(CYCLED_DEP_COLOR);
+
+      for (uint8_t i = 0; i < colorsToDraw.size(); ++i)
+        draw_list->AddRect(leftTopPos - NODE_OUTLINE_OFFSET * (0.5f + i), rightBottomPos + NODE_OUTLINE_OFFSET * (0.5f + i),
+          colorsToDraw[i], 4.0f, 0, NODE_OUTLINE_WIDTH);
+
+
+      if (accumChangedNodes[nodeNameId])
+      {
+        const ImVec2 nodeCenter = (leftTopPos + rightBottomPos) / 2.f;
+        const ImVec2 triP0 = ImVec2{nodeCenter.x, leftTopPos.y};
+        const ImVec2 triP1 = ImVec2{rightBottomPos.x, nodeCenter.y};
+        const ImVec2 triP2 = ImVec2{rightBottomPos.x, leftTopPos.y};
+        const ImU32 nodeCnangeColor = lastChangedNodes[nodeNameId] ? NODE_CHANGED_COLOR : NODE_CHANGED_OLD_COLOR;
+
+        add_triangle_filled_multicolor(draw_list, triP0, triP1, triP2, nodeFillColor, nodeFillColor, nodeCnangeColor);
+        if (ImGui::IsMouseHoveringRect(triP0, triP1, true))
+          hoverState.tooltip.printf(0,
+            lastChangedNodes[nodeNameId] ? "Node was changed on last recompilation\n" : "Node was changed since reset\n");
+      }
+
+      draw_list->AddRectFilled(nameTagLeftTopPos, nameTagRightBottomPos, NODE_NAME_COLOR, 4.0f);
+    }
+
+    // draw texts and buttons
+    {
+      draw_list->ChannelsSetCurrent(CanvasChannels::TEXTS);
+
+      if (hoverState.node == nodeId)
+        switch (coloration)
+        {
+          case NodeColorationType::None: break;
+          case NodeColorationType::Framebuffer: break;
+          case NodeColorationType::Pass:
+          {
+            if (node.passColor != UNKNOWN_PASS_COLOR)
+              hoverState.tooltip.printf(0, "Pass color: %d\n", eastl::to_underlying(node.passColor));
+            else
+              hoverState.tooltip.printf(0, "Culled node\n");
+            break;
+          }
+          default: break;
+        }
+
+      {
+        ImGui::SetCursorScreenPos(nameTagLeftTopPos + NAMETAG_PADDING);
+        ImGui::TextUnformatted(nodeName.data());
+        if (ImGui::IsItemHovered())
+          hoverState.tooltip.printf(0, "nameId: %d\ngeneration: %d\npriority: %d", eastl::to_underlying(nodeNameId),
+            nodeData.generation, nodeData.priority);
+      }
+
+      ImGui::SetCursorScreenPos(leftTopPos + NODE_BORDER_PADDING);
+      ImGui::BeginGroup();
+      {
+        const auto conditionalPopup = [this, draw_list, mouseRclick](const char *label, const bool condition,
+                                        const char *popup_name = nullptr, const char *hover_msg = "R-click for details") {
+          ImGui::TextUnformatted(label);
+          ImGui::SameLine();
+          ImGui::PushStyleColor(ImGuiCol_Text, condition ? OPT_POPUP_POS_COLOR : OPT_POPUP_NEG_COLOR);
+          ImGui::TextUnformatted(condition ? "[...]" : " --- ");
+          ImGui::PopStyleColor();
+
+          if (condition && ImGui::IsItemHovered())
+          {
+            hoverState.tooltip.printf(0, hover_msg);
+            if (popup_name && mouseRclick)
+            {
+              setPopupState(hoverState);
+              draw_list->ChannelsSetCurrent(CanvasChannels::SUSPEND);
+              canvas.Suspend();
+              ImGui::OpenPopup(popup_name);
+              gpuCapture.nodeRowPopupOpenedThisFrame = true;
+              canvas.Resume();
+              draw_list->ChannelsSetCurrent(CanvasChannels::TEXTS);
+            }
+          }
+        };
+
+
+        ImGui::Checkbox(String(0, "Enable node##%s", nodeName), &nodeData.enabled);
+
+        ImGui::TextUnformatted("");
+        conditionalPopup("State reqs:", bool(nodeData.stateRequirements), nullptr,
+          nodeData.stateRequirements ? state_reqs_descr(*nodeData.stateRequirements) : nullptr);
+        conditionalPopup("Exec reqs:", !eastl::holds_alternative<eastl::monostate>(nodeData.executeRequirements), NODE_EXEX_REQ_POPUP);
+        conditionalPopup("Render reqs:", bool(nodeData.renderingRequirements), NODE_RENDER_REQ_POPUP);
+
+        ImGui::TextUnformatted("");
+        conditionalPopup("Binds:", !nodeData.bindings.empty(), NODE_BINDINGS_POPUP);
+        {
+          bool hasIdxVtxBuf = bool(nodeData.indexSource);
+          for (const auto &vtxBuf : nodeData.vertexSources)
+            hasIdxVtxBuf |= bool(vtxBuf);
+          conditionalPopup("Idx/Vtx:", hasIdxVtxBuf, NODE_IDX_VTX_POPUP);
+        }
+
+        ImGui::TextUnformatted("Multiplex:");
+        ImGui::SameLine();
+        if (nodeData.multiplexingMode)
+        {
+          if (*nodeData.multiplexingMode == multiplexing::Mode::None)
+          {
+            ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_NEG_COLOR);
+            ImGui::TextUnformatted("Ignore");
+            if (ImGui::IsItemHovered())
+              hoverState.tooltip.printf(0, "Executes once");
+          }
+          else
+          {
+            ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_POS_COLOR);
+            ImGui::TextUnformatted("YES");
+            if (ImGui::IsItemHovered())
+              hoverState.tooltip.printf(0, multiplexing_descr(*nodeData.multiplexingMode));
+          }
+        }
+        else
+        {
+          ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_WAR_COLOR);
+          ImGui::TextUnformatted("Global");
+          if (ImGui::IsItemHovered())
+            hoverState.tooltip.printf(0, multiplexing_descr(registry.defaultMultiplexingMode));
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::TextUnformatted("Source file:");
+        ImGui::SameLine();
+        if (!nodeData.nodeSource.empty())
+        {
+          ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_POS_COLOR);
+          ImGui::TextUnformatted("[...]");
+          if (ImGui::IsItemHovered())
+          {
+            hoverState.tooltip.printf(0, "%s\n", nodeData.nodeSource.c_str());
+#if _TARGET_PC_WIN // there are some problems with calling system on not win platform
+            hoverState.tooltip.aprintf(0, "  L-click to open in VScode\n");
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+              // Open source file via VSCode: https://code.visualstudio.com/docs/editor/command-line
+              system(String(0, "code -g \"%s\"", nodeData.nodeSource).c_str());
+#endif
+            hoverState.tooltip.aprintf(0, "  R-click to copy\n");
+            if (mouseRclick)
+            {
+              ImGui::SetClipboardText(nodeData.nodeSource.c_str());
+              gpuCapture.nodeRowPopupOpenedThisFrame = true;
+            }
+          }
+        }
+        else
+        {
+          ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_NEG_COLOR);
+          ImGui::TextUnformatted("no source");
+        }
+        ImGui::PopStyleColor();
+
+
+        ImGui::TextUnformatted("");
+
+        ImGui::TextUnformatted("side effect:");
+        ImGui::SameLine();
+        switch (nodeData.sideEffect)
+        {
+          case SideEffects::None: ImGui::PushStyleColor(ImGuiCol_Text, SIDE_EFF_NON_COLOR); break;
+          case SideEffects::Internal: ImGui::PushStyleColor(ImGuiCol_Text, SIDE_EFF_INT_COLOR); break;
+          case SideEffects::External: ImGui::PushStyleColor(ImGuiCol_Text, SIDE_EFF_EXT_COLOR); break;
+        }
+        ImGui::TextUnformatted(side_effect_name(nodeData.sideEffect));
+        ImGui::PopStyleColor();
+
+        ImGui::TextUnformatted("async pipeline:");
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, nodeData.allowAsyncPipelines ? OPT_POPUP_POS_COLOR : OPT_POPUP_NEG_COLOR);
+        ImGui::TextUnformatted(nodeData.allowAsyncPipelines ? "Y" : "N");
+        ImGui::PopStyleColor();
+
+        ImGui::Text("shader block layers: %d %d %d", nodeData.shaderBlockLayers.objectLayer, nodeData.shaderBlockLayers.frameLayer,
+          nodeData.shaderBlockLayers.sceneLayer);
+      }
+      ImGui::EndGroup();
+    }
+  }
+}
+
+void Visualizer::drawEdges(ImDrawList *draw_list, const CanvasLayout &layout)
+{
+  draw_list->ChannelsSetCurrent(CanvasChannels::EDGES);
+
+  const ImRect canvasView = canvas.ViewRect();
+  for (const auto &[edgeDeps, edgeSplines] : layout.edges)
+  {
+    if (eastl::find_if(edgeSplines.begin(), edgeSplines.end(),
+          [&canvasView](const auto &spline) { return spline_is_visible(spline, canvasView); }) == edgeSplines.end())
+      continue;
+
+    const auto &frontDep = registryDependencies[edgeDeps.front()];
+    const auto &[_, depColor, depVisible] = dependency_info_by_type(frontDep.type);
+    const auto resId = frontDep.resource;
+    if (!(depVisible && isResourceVisible(resId)))
+      continue;
+
+    auto drawSpline = [&](const ImCubicBezierPoints &spline, const ImU32 color, const float line_thickness) {
+      draw_list->AddBezierCubic(spline.P0, spline.P1, spline.P2, spline.P3, color, line_thickness);
+    };
+
+    if (resId == ResourceId::Invalid)
+    {
+      const bool cycled = registryDependencies[edgeDeps.front()].cycled;
+      const float alpha = focusState.resValid() ? 0.2f : 1.0f;
+      for (const auto &spline : edgeSplines)
+      {
+        if (cycled)
+          drawSpline(spline, CYCLED_DEP_COLOR, CYCLED_DEP_WIDTH);
+        drawSpline(spline, apply_alpha_coeff(depColor, alpha), BASE_DEP_WIDTH);
+      }
+      continue;
+    }
+
+    const bool focusingThisRes = focusState.resId == resId;
+    bool edgeCycled = false;
+    bool edgeInspected = false;
+    for (const auto depId : edgeDeps)
+    {
+      edgeCycled |= registryDependencies[depId].cycled;
+      edgeInspected |= inspectedDependency.depId == depId;
+    }
+
+    dag::RelocatableFixedVector<ImU32, 4> colorsToDraw;
+
+    colorsToDraw.push_back(depColor);
+    if (focusingThisRes)
+      colorsToDraw.push_back(FOCUS_COLOR);
+    if (edgeInspected)
+      colorsToDraw.push_back(RES_INSPECT_COLOR);
+    if (edgeCycled)
+      colorsToDraw.push_back(CYCLED_DEP_COLOR);
+
+    for (const auto &spline : edgeSplines)
+      for (int i = colorsToDraw.size() - 1; i >= 0; --i)
+        drawSpline(spline, colorsToDraw[i], BASE_DEP_WIDTH * (i + 1));
+  }
+
+  if (hoverState.resource != ResourceId::Invalid)
+  {
+    const auto hoveredResNameId = getNameId(hoverState.resource);
+    const auto origResNameId = depData.renamingRepresentatives[hoveredResNameId];
+    const auto resData = registry.resources[origResNameId];
+
+    hoverState.tooltip.printf(0, "(%s) %s\n",
+      res_type_name(resData.createdResData ? resData.createdResData->type : ResourceType::Invalid), getName(hoveredResNameId));
+  }
+}
+
+void Visualizer::drawNodeBoxes(ImDrawList *draw_list)
+{
+  for (auto [boxId, box] : nodeBoxes.enumerate())
+    if (box.nameSpace != registry.knownNames.root())
+    {
+      draw_list->ChannelsSetCurrent(CanvasChannels::NAMESPACES);
+
+      const ImU32 nameSpaceBorderColor = color_by_hash(size_t(box.nameSpace));
+      const ImU32 nameSpaceFillColor = apply_alpha_coeff(nameSpaceBorderColor, 0.1f);
+
+      const ImVec2 leftTopPos = box.rect.offset;
+      const ImVec2 rightBottomPos = leftTopPos + box.rect.size;
+
+      draw_list->AddRectFilled(leftTopPos, rightBottomPos, nameSpaceFillColor, 4.0f);
+      draw_list->AddRect(leftTopPos, rightBottomPos, nameSpaceBorderColor, 4.0f, 0, NAMESPACE_BORDER_WIDTH);
+
+
+      draw_list->ChannelsSetCurrent(CanvasChannels::TEXTS);
+
+      const char *nameSpaceName = registry.knownNames.getName(box.nameSpace);
+      const ImVec2 nameBoxSize = ImGui::CalcTextSize(nameSpaceName) + 2.f * NAMETAG_PADDING;
+
+      const ImVec2 nameBoxLeftTopPos = leftTopPos - ImVec2{0.f, nameBoxSize.y / 2};
+      const ImVec2 nameBoxRightBottomPos = nameBoxLeftTopPos + nameBoxSize;
+      const ImVec2 nameBoxTextStart = nameBoxLeftTopPos + NAMETAG_PADDING;
+
+      draw_list->AddRectFilled(nameBoxLeftTopPos, nameBoxRightBottomPos, nameSpaceBorderColor, 4.0f);
+      ImGui::SetCursorPos(nameBoxTextStart);
+      ImGui::TextUnformatted(nameSpaceName);
+    }
+}
+
+
+void Visualizer::checkHovering()
+{
+  const auto &canvasView = canvas.ViewRect();
+
+  hoverState.canvas = canvasView.Contains(ImGui::GetMousePos());
+  if (!hoverState.isActive())
+    return;
+
+  const auto &layout = hierarchicalView ? condensedLayout : generalLayout;
+
+  for (auto [nodeId, nodeRect] : layout.nodes.enumerate())
+  {
+    const ImVec2 leftTopPos = nodeRect.offset;
+    const ImVec2 rightBottomPos = nodeRect.offset + nodeRect.size;
+    if (
+      rect_is_visible(ImRect{leftTopPos, rightBottomPos}, canvasView) && ImGui::IsMouseHoveringRect(leftTopPos, rightBottomPos, true))
+      hoverState.node = nodeId;
+  }
+
+  const ImVec2 mousePos = ImGui::GetMousePos();
+  for (const auto &[edgeDeps, edgeSplines] : layout.edges)
+  {
+    if (eastl::find_if(edgeSplines.begin(), edgeSplines.end(),
+          [&canvasView](const auto &spline) { return spline_is_visible(spline, canvasView); }) == edgeSplines.end())
+      continue;
+
+    const auto &frontDep = registryDependencies[edgeDeps.front()];
+    const bool depVisible = dependency_info_by_type(frontDep.type).visible;
+    const auto resId = frontDep.resource;
+    if (depVisible && resId != ResourceId::Invalid && isResourceVisible(resId))
+      for (const auto &spline : edgeSplines)
+        if (
+          mousePos.x >= spline.P0.x && mousePos.x <= spline.P3.x && ImProjectOnCubicBezier(mousePos, spline).Distance < BASE_DEP_WIDTH)
+        {
+          hoverState.deps = {edgeDeps.begin(), edgeDeps.end()};
+          hoverState.resource = resId;
+        }
+  }
+}
+
+void Visualizer::processInput()
+{
+  if (!hoverState.isActive())
+    return;
+
+  if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f))
+  {
+    canvasCamera.canvasOffset += ImGui::GetIO().MouseDelta;
+    canvas.SetView(canvasCamera.canvasOffset, canvasCamera.getZoom());
+  }
+
+  if (abs(ImGui::GetIO().MouseWheel) > 0.1)
+  {
+    ImGui::GetIO().MouseWheel > 0 ? canvasCamera.zoomIn() : canvasCamera.zoomOut();
+
+    ImVec2 oldPos = canvas.ToLocal(ImGui::GetIO().MousePos);
+    canvas.SetView(canvasCamera.canvasOffset, canvasCamera.getZoom());
+    ImVec2 newPos = canvas.ToLocal(ImGui::GetIO().MousePos);
+
+    canvasCamera.canvasOffset += canvas.FromLocalV(newPos - oldPos);
+    canvas.SetView(canvasCamera.canvasOffset, canvasCamera.getZoom());
+  }
+
+  if (hoverState.node != NodeId::Invalid && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+  {
+    setFocus(hoverState.node);
+  }
+
+  // A history wave must not silence resource focus: double-click focuses the resource.
+  if (hoverState.resource != ResourceId::Invalid && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+  {
+    setFocus(hoverState.resource);
+  }
+
+  // Right-click opens one popup, by priority: history wave, resource edge, then node.
+  if (ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+  {
+    if (hoverState.historyEdge)
+    {
+      setPopupState(hoverState);
+      ImGui::OpenPopup(HISTORY_EDGE_POPUP);
+    }
+    else if (hoverState.resource != ResourceId::Invalid)
+    {
+      setPopupState(hoverState);
+      ImGui::OpenPopup(EDGE_RESOURCES_POPUP);
+    }
+    else if (hoverState.node != NodeId::Invalid && !gpuCapture.nodeRowPopupOpenedThisFrame)
+    {
+      setPopupState(hoverState);
+      ImGui::OpenPopup(NODE_CAPTURE_POPUP);
+    }
+  }
+}
+
+void Visualizer::processPopup()
+{
+  static String label;
+
+#define CHECK_VALID_POPUP_NODE                \
+  if (!popupState.nodeValid())                \
+  {                                           \
+    ImGui::TextUnformatted("Invalid NodeId"); \
+    ImGui::EndPopup();                        \
+    return;                                   \
+  }
+
+#define CHECK_VALID_POPUP_RESOURCE                \
+  if (!popupState.resValid())                     \
+  {                                               \
+    ImGui::TextUnformatted("Invalid ResourceId"); \
+    ImGui::EndPopup();                            \
+    return;                                       \
+  }
+
+#define CHECK_VALID_POPUP_DEPENDENCIES                 \
+  if (popupState.deps.empty())                         \
+  {                                                    \
+    ImGui::TextUnformatted("No dependencies to show"); \
+    ImGui::EndPopup();                                 \
+    return;                                            \
+  }
+
+
+  if (ImGui::BeginPopup(NODE_EXEX_REQ_POPUP))
+  {
+    CHECK_VALID_POPUP_NODE
+
+    eastl::visit(
+      [&](const auto &reqs) {
+        using T = eastl::decay_t<decltype(reqs)>;
+        if constexpr (std::is_same_v<T, DispatchRequirements>)
+        {
+          const DispatchRequirements &dispReqs = reqs;
+          ImGui::Text("Dispatch requirements:\n  Shader: %s", registry.knownShaders.getName(dispReqs.shaderId).data());
+        }
+        else if constexpr (std::is_same_v<T, DrawRequirements>)
+        {
+          const DrawRequirements &drawReqs = reqs;
+          ImGui::Text("Draw requirements:\n  Shader: %s", registry.knownShaders.getName(drawReqs.shaderId).data());
+        }
+        else
+        {
+          ImGui::TextUnformatted("No execute requirements presented");
+        }
+      },
+      registry.nodes[popupState.nodeNameId].executeRequirements);
+
+    ImGui::EndPopup();
+  }
+
+  if (ImGui::BeginPopup(NODE_RENDER_REQ_POPUP))
+  {
+    CHECK_VALID_POPUP_NODE
+
+    if (!registry.nodes[popupState.nodeNameId].renderingRequirements.has_value())
+    {
+      ImGui::TextUnformatted("No render requirements presented");
+      ImGui::EndPopup();
+      return;
+    }
+    const auto &pass = *registry.nodes[popupState.nodeNameId].renderingRequirements;
+
+    ImGui::TextUnformatted("(mip,layer) name");
+
+    ImGui::TextUnformatted("Color attachments:");
+    if (pass.colorAttachments.empty())
+      ImGui::TextUnformatted("   NONE");
+    for (const auto &colorAtt : pass.colorAttachments)
+    {
+      const bool resValid = colorAtt.nameId != ResNameId::Invalid;
+
+      label.printf(0, "   (%d,%d) %s", colorAtt.mipLevel, colorAtt.layer,
+        resValid ? getName(colorAtt.nameId).data() : "Invalid name id");
+      if (ImGui::Selectable(label) && resValid)
+        setFocus(colorAtt.nameId);
+    }
+
+    ImGui::TextUnformatted("Depth attachment:");
+    {
+      const auto &depthAtt = pass.depthAttachment;
+      const bool resValid = depthAtt.nameId != ResNameId::Invalid;
+
+      label.printf(0, "%s (%d,%d) %s", pass.depthReadOnly ? "RO" : "RW", depthAtt.mipLevel, depthAtt.layer,
+        resValid ? getName(depthAtt.nameId).data() : "Invalid name id");
+      if (ImGui::Selectable(label) && resValid)
+        setFocus(depthAtt.nameId);
+    }
+
+    if (pass.vrsRateAttachment.nameId != ResNameId::Invalid)
+    {
+      ImGui::TextUnformatted("VRS attachment:");
+
+      const auto &vrsAtt = pass.vrsRateAttachment;
+      label.printf(0, "   (%d,%d) %s", vrsAtt.mipLevel, vrsAtt.layer, getName(vrsAtt.nameId).data());
+      if (ImGui::Selectable(label))
+        setFocus(vrsAtt.nameId);
+    }
+
+    if (!pass.resolves.empty())
+    {
+      ImGui::TextUnformatted("MSAA resolves:");
+      for (const auto [from, to] : pass.resolves)
+        ImGui::Text("   %s -> %s", from != ResNameId::Invalid ? getName(from).data() : "Invalid name id",
+          to != ResNameId::Invalid ? getName(to).data() : "Invalid name id");
+    }
+
+    ImGui::EndPopup();
+  }
+
+  if (ImGui::BeginPopup(NODE_BINDINGS_POPUP))
+  {
+    CHECK_VALID_POPUP_NODE
+
+    const auto &nodeData = registry.nodes[popupState.nodeNameId];
+
+    ImGui::TextUnformatted("idx: type (hist?)(reset?)(opt?) name");
+    if (ImGui::IsItemHovered())
+      hoverState.tooltip.printf(0, "SV - ShaderVar\nVM - ViewMatrix\nPM - ProjMatrix\nIN - Invalid\n");
+
+    for (const auto &[index, binding] : nodeData.bindings)
+    {
+      const auto resNameId = binding.resource;
+      const bool resValid = resNameId != ResNameId::Invalid;
+
+      label.printf(0, "%d: %s %s%s%s %s", index, bind_type_name(binding.type), binding.history ? "+" : "-", binding.reset ? "+" : "-",
+        binding.optional ? "+" : "-", resValid ? getName(resNameId).data() : "Invalid name id");
+      if (ImGui::Selectable(label) && resValid)
+        setFocus(resNameId);
+    }
+
+    ImGui::EndPopup();
+  }
+
+  if (ImGui::BeginPopup(NODE_IDX_VTX_POPUP))
+  {
+    CHECK_VALID_POPUP_NODE
+
+    const auto &nodeData = registry.nodes[popupState.nodeNameId];
+
+    ImGui::TextUnformatted("Index source:");
+    if (nodeData.indexSource)
+    {
+      const auto resNameId = nodeData.indexSource->buffer;
+      const bool resValid = resNameId != ResNameId::Invalid;
+
+      label.printf(0, "  %s", resValid ? getName(resNameId).data() : "Invalid name id");
+      if (ImGui::Selectable(label) && resValid)
+        setFocus(resNameId);
+    }
+    else
+    {
+      ImGui::TextUnformatted("  NONE");
+    }
+
+    ImGui::TextUnformatted("Vertex sources:");
+    if (ImGui::IsItemHovered())
+      hoverState.tooltip.printf(0, "i: (stride) name\n");
+    for (uint32_t i = 0; i < nodeData.vertexSources.size(); ++i)
+      if (nodeData.vertexSources[i])
+      {
+        const auto resNameId = nodeData.vertexSources[i]->buffer;
+        const bool resValid = resNameId != ResNameId::Invalid;
+
+        label.printf(0, "  %d: (%d) %s", i, nodeData.vertexSources[i]->stride,
+          resValid ? getName(resNameId).data() : "Invalid name id");
+        if (ImGui::Selectable(label) && resValid)
+          setFocus(resNameId);
+      }
+      else
+      {
+        ImGui::Text("  %d: NONE", i);
+      }
+
+    ImGui::EndPopup();
+  }
+
+  if (ImGui::BeginPopup(NODE_CAPTURE_POPUP))
+  {
+    CHECK_VALID_POPUP_NODE
+
+    if (ImGui::Selectable("Set as GPU capture START"))
+    {
+      setCaptureBoundary(gpuCapture.captureStart, popupState.nodeNameId);
+      imgui_window_set_visible(IMGUI_WINDOW_GROUP_FG2, IMGUI_GPU_CAPTURE_WIN_NAME, true);
+      gpuCapture.focusGpuCaptureWindow = true;
+    }
+
+    if (ImGui::Selectable("Set as GPU capture END"))
+    {
+      setCaptureBoundary(gpuCapture.captureEnd, popupState.nodeNameId);
+      imgui_window_set_visible(IMGUI_WINDOW_GROUP_FG2, IMGUI_GPU_CAPTURE_WIN_NAME, true);
+      gpuCapture.focusGpuCaptureWindow = true;
+    }
+
+    ImGui::EndPopup();
+  }
+
+  if (ImGui::BeginPopup(EDGE_RESOURCES_POPUP))
+  {
+    struct SubBlockHandler
+    {
+      ImVec2 &startPos;
+
+      SubBlockHandler(ImVec2 &start) : startPos(start)
+      {
+        ImGui::SetCursorScreenPos(startPos);
+        ImGui::BeginGroup();
+      }
+
+      ~SubBlockHandler()
+      {
+        ImGui::EndGroup();
+        startPos += ImVec2{ImGui::GetItemRectSize().x + RES_BLOCK_BORDER_PADDING.x, 0.f};
+      }
+    };
+
+#define SUBBLOCK_SCOPED auto sbh = SubBlockHandler(subBlockStart);
+
+
+    CHECK_VALID_POPUP_RESOURCE
+
+    const auto resNameId = popupState.resNameId;
+    const auto resName = getName(resNameId).data();
+    const auto &resData = registry.resources[depData.renamingRepresentatives[resNameId]];
+
+    ImGui::BeginGroup();
+    if (resData.createdResData)
+    {
+      const auto &createdData = *resData.createdResData;
+
+      ImGui::Text("%s %s", res_type_name(createdData.type), resName);
+
+      ImVec2 subBlockStart = ImGui::GetCursorScreenPos();
+
+      {
+        SUBBLOCK_SCOPED
+
+        if (auto tex2dDescr = eastl::get_if<Texture2dCreateInfo>(&createdData.creationInfo))
+        {
+          format_pretty(ImGui::GetWindowDrawList(), tex2dDescr->creationFlags & TEXFMT_MASK);
+          ImGui::Text("2D%s%s%s", tex2dDescr->creationFlags & TEXCF_RTARGET ? " - RT" : "",
+            tex2dDescr->creationFlags & TEXCF_UNORDERED ? " - UAV" : "",
+            tex2dDescr->creationFlags & TEXCF_VARIABLE_RATE ? " - VRS" : "");
+          {
+            IPoint2 res{-1, -1};
+            if (auto point2 = eastl::get_if<IPoint2>(&tex2dDescr->resolution))
+              res = *point2;
+            else if (auto autoRes2 = eastl::get_if<AutoResolutionRequest<2>>(&tex2dDescr->resolution))
+              res = autoRes2->get();
+            ImGui::Text("%dx%d", res.x, res.y);
+          }
+          {
+            ImGui::Text("mips: %d%s, flags:", tex2dDescr->mipLevels, tex2dDescr->mipLevels == 0 ? "(auto)" : "");
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_POS_COLOR);
+            ImGui::TextUnformatted("[...]");
+            if (ImGui::IsItemHovered())
+              hoverState.tooltip.printf(0, texture_flags_descr(tex2dDescr->creationFlags));
+            ImGui::PopStyleColor();
+          }
+        }
+        else if (auto tex3dDescr = eastl::get_if<Texture3dCreateInfo>(&createdData.creationInfo))
+        {
+          format_pretty(ImGui::GetWindowDrawList(), tex3dDescr->creationFlags & TEXFMT_MASK);
+          ImGui::Text("3D%s%s%s", tex3dDescr->creationFlags & TEXCF_RTARGET ? " - RT" : "",
+            tex3dDescr->creationFlags & TEXCF_UNORDERED ? " - UAV" : "",
+            tex3dDescr->creationFlags & TEXCF_VARIABLE_RATE ? " - VRS" : "");
+          {
+            IPoint3 res{-1, -1, -1};
+            if (auto point3 = eastl::get_if<IPoint3>(&tex3dDescr->resolution))
+              res = *point3;
+            else if (auto autoRes3 = eastl::get_if<AutoResolutionRequest<3>>(&tex3dDescr->resolution))
+              res = autoRes3->get();
+            ImGui::Text("%dx%dx%d", res.x, res.y, res.z);
+          }
+          {
+            ImGui::Text("mips: %d%s, flags:", tex3dDescr->mipLevels, tex3dDescr->mipLevels == 0 ? "(auto)" : "");
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_POS_COLOR);
+            ImGui::TextUnformatted("[...]");
+            if (ImGui::IsItemHovered())
+              hoverState.tooltip.printf(0, texture_flags_descr(tex3dDescr->creationFlags));
+            ImGui::PopStyleColor();
+          }
+        }
+        else if (auto bufferDescr = eastl::get_if<BufferCreateInfo>(&createdData.creationInfo))
+        {
+          ImGui::Text("Bind type: %s", buffer_bind_name(bufferDescr->flags));
+          ImGui::Text("%d byte x %d", bufferDescr->elementSize, bufferDescr->elementCount);
+          ImGui::Text("size: %d byte", bufferDescr->elementSize * bufferDescr->elementCount);
+          ImGui::Text("view: %u", bufferDescr->format);
+          ImGui::TextUnformatted("flags:");
+          ImGui::SameLine();
+          {
+            ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_POS_COLOR);
+            ImGui::TextUnformatted("[...]");
+            if (ImGui::IsItemHovered())
+              hoverState.tooltip.printf(0, buffer_flags_descr(bufferDescr->flags));
+            ImGui::PopStyleColor();
+          }
+        }
+        else if (auto blobDescr = eastl::get_if<BlobDescription>(&createdData.creationInfo))
+        {
+          if (!popupState.deps.empty())
+          {
+            auto blobData = inspectedBlob.set(popupState.deps.front(), blobDescr->typeTag);
+            print_blob_structured(blobDescr->typeTag, blobData);
+          }
+        }
+        else if (auto extResDescr = eastl::get_if<ExternalResourceProvider>(&createdData.creationInfo))
+        {
+          ImGui::TextUnformatted("External resource");
+        }
+        else if (auto drvDefDescr = eastl::get_if<DriverDeferredTexture>(&createdData.creationInfo))
+        {
+          ImGui::TextUnformatted("Backbuffer texture");
+        }
+        else
+        {
+          ImGui::TextUnformatted("No creation info");
+        }
+      }
+
+      if (createdData.resolution)
+      {
+        SUBBLOCK_SCOPED
+
+        auto autoResName = registry.knownNames.getName(createdData.resolution->id);
+        const auto &autoResData = registry.autoResTypes[createdData.resolution->id];
+
+        ImGui::Text("AutoRes: %s", autoResName);
+        if (auto vals = eastl::get_if<ResolutionValues<IPoint2>>(&autoResData.values))
+          ImGui::Text("static: %dx%d\n", vals->staticResolution.x, vals->staticResolution.y);
+        else if (auto vals = eastl::get_if<ResolutionValues<IPoint3>>(&autoResData.values))
+          ImGui::Text("static: %dx%dx%d\n", vals->staticResolution.x, vals->staticResolution.y, vals->staticResolution.z);
+        ImGui::Text("x%3f, cd:%3d\n", createdData.resolution->multiplier, autoResData.dynamicResolutionCountdown);
+      }
+
+      if (!eastl::holds_alternative<eastl::monostate>(createdData.clearValue))
+      {
+        SUBBLOCK_SCOPED
+        ImGui::Text("clear flags: %s", res_clear_flag_name(createdData.clearFlags));
+        ImGui::TextUnformatted("clear value:");
+        ImVec2 selectSize = ImGui::GetItemRectSize();
+        ImGui::SameLine();
+        if (eastl::holds_alternative<ResourceClearValue>(createdData.clearValue))
+        {
+          const auto &clearVal = eastl::get<ResourceClearValue>(createdData.clearValue);
+          ImGui::PushStyleColor(ImGuiCol_Text, OPT_POPUP_POS_COLOR);
+          ImGui::TextUnformatted("[...]");
+          if (ImGui::IsItemHovered())
+            hoverState.tooltip.printf(0, clear_value_descr(clearVal));
+          ImGui::PopStyleColor();
+        }
+        else
+        {
+          const auto clearResId = eastl::get<DynamicParameter>(createdData.clearValue).resource;
+          label.printf(0, "%s##%zu", getName(clearResId).data(), static_cast<uint32_t>(resNameId));
+          if (ImGui::Selectable(label, focusState.resId == getRepresentId(clearResId), 0, selectSize))
+            setFocus(clearResId);
+        }
+      }
+    }
+    else
+    {
+      ImGui::TextUnformatted(resName);
+      ImGui::TextUnformatted("No created data");
+    }
+    ImGui::EndGroup();
+
+
+    CHECK_VALID_POPUP_DEPENDENCIES
+
+    const auto &frontDep = registryDependencies[popupState.deps.front()];
+    const auto fromNodeId = frontDep.from;
+    const auto fromNodeName = getName(getNameId(fromNodeId)).data();
+    if (ImGui::Button(fromNodeName))
+      setFocus(fromNodeId);
+    ImGui::SameLine();
+
+    ImGui::BeginGroup();
+    for (const auto depId : popupState.deps)
+    {
+      const auto &dep = registryDependencies[depId];
+      const bool inspectingThisDep = inspectedDependency.depId == depId;
+      const auto toNodeName = getName(getNameId(dep.to)).data();
+
+      ImGui::TextUnformatted(" -> ");
+      ImGui::SameLine();
+      label.printf(0, "%s##%u", toNodeName, static_cast<uint32_t>(depId));
+      if (ImGui::Button(label))
+        setFocus(dep.to);
+      ImGui::SameLine();
+      if (inspectingThisDep)
+      {
+        ImGui::TextUnformatted("INPECTING");
+      }
+      else
+      {
+        label.printf(0, "Inspect##%u", static_cast<uint32_t>(depId));
+        if (ImGui::Button(label))
+          setInspectedDependency(depId);
+      }
+    }
+    ImGui::EndGroup();
+
+    ImGui::EndPopup();
+
+#undef SUBBLOCK_SCOPED
+  }
+
+  if (ImGui::BeginPopup(HISTORY_EDGE_POPUP))
+  {
+    CHECK_VALID_POPUP_RESOURCE
+    CHECK_VALID_POPUP_DEPENDENCIES
+
+    ImGui::Text("history of: %s", getName(popupState.resNameId).data());
+
+    const auto depId = popupState.deps.front();
+    if (inspectedDependency.depId == depId)
+    {
+      ImGui::TextUnformatted("INSPECTING");
+    }
+    else
+    {
+      label.printf(0, "Inspect##%u", static_cast<uint32_t>(depId));
+      if (ImGui::Button(label))
+        setInspectedDependency(depId);
+    }
+
+    ImGui::EndPopup();
+  }
+
+  if (!hoverState.tooltip.empty())
+  {
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(hoverState.tooltip);
+    ImGui::EndTooltip();
+  }
+
+#undef CHECK_VALID_POPUP_NODE
+#undef CHECK_VALID_POPUP_RESOURCE
+#undef CHECK_VALID_POPUP_DEPENDENCIES
+}
+
+void Visualizer::processTextureDebug()
+{
+  if (eastl::exchange(inspectedDependency.wasChanged, false))
+  {
+    eastl::optional<Selection> resSelection = eastl::nullopt;
+
+    if (inspectedDependency.depId != DependencyId::Invalid)
+      resSelection = Selection{PreciseTimePoint{inspectedDependency.fromNameId, inspectedDependency.toNameId},
+        inspectedDependency.resNameId, inspectedDependency.history};
+
+    update_fg_debug_tex(resSelection, registry, depData);
+  }
+}
+
+void Visualizer::receiveBlobData(NodeNameId node_id, ResNameId res_id, const BlobView &blob_view)
+{
+  const auto &typeDb = dafg::Runtime::get().getTypeDb();
+
+  if (inspectedBlob.inst != inspectedBlob.storedInst)
+  {
+    if (const auto storedRtti = typeDb.getRTTI(inspectedBlob.storedInst.tag))
+      if (inspectedBlob.dataStored)
+        storedRtti->dtor(inspectedBlob.buffer.data());
+
+    inspectedBlob.storedInst = inspectedBlob.inst;
+    inspectedBlob.dataStored = false;
+  }
+
+  if (registryDependencies.isMapped(inspectedBlob.storedInst.depId))
+  {
+    const auto &dep = registryDependencies[inspectedBlob.storedInst.depId];
+    if (getNameId(dep.to) == node_id && getNameId(dep.resource) == res_id && inspectedBlob.storedInst.tag == blob_view.typeTag)
+      if (const auto rtti = typeDb.getRTTI(inspectedBlob.storedInst.tag))
+      {
+        if (inspectedBlob.dataStored)
+          rtti->dtor(inspectedBlob.buffer.data());
+
+        inspectedBlob.buffer.resize(rtti->size);
+        rtti->copy(inspectedBlob.buffer.data(), blob_view.data);
+        inspectedBlob.dataStored = true;
+      }
+  }
+}
+
+Visualizer::InspectedBlob::~InspectedBlob()
+{
+  if (dataStored)
+    if (const auto storedRtti = dafg::Runtime::get().getTypeDb().getRTTI(storedInst.tag))
+      storedRtti->dtor(buffer.data());
+}
+
+void Visualizer::hideResourcesInSubTree(NameSpaceNameId name_space_id)
+{
+  nameSpaces[name_space_id].visibleResourcesInSubtree = 0;
+  for (const auto &subNameSpace : nameSpaces[name_space_id].subNameSpaces)
+    hideResourcesInSubTree(subNameSpace);
+}
+
+void Visualizer::hideResourcesInNameSpace(NameSpaceNameId namespace_id)
+{
+  const uint16_t old = nameSpaces[namespace_id].visibleResourcesInSubtree;
+  hideResourcesInSubTree(namespace_id);
+  while (namespace_id != registry.knownNames.root())
+  {
+    namespace_id = registry.knownNames.getParent(namespace_id);
+    nameSpaces[namespace_id].visibleResourcesInSubtree -= old;
+  }
+}
+
+void Visualizer::showResourcesInSubTree(NameSpaceNameId namespace_id)
+{
+  nameSpaces[namespace_id].visibleResourcesInSubtree = nameSpaces[namespace_id].totalResourcesInSubtree;
+  for (const auto &subNameSpace : nameSpaces[namespace_id].subNameSpaces)
+    showResourcesInSubTree(subNameSpace);
+}
+
+void Visualizer::showResourcesInNameSpace(NameSpaceNameId namespace_id)
+{
+  const uint16_t diff = nameSpaces[namespace_id].totalResourcesInSubtree - nameSpaces[namespace_id].visibleResourcesInSubtree;
+  showResourcesInSubTree(namespace_id);
+  while (namespace_id != registry.knownNames.root())
+  {
+    namespace_id = registry.knownNames.getParent(namespace_id);
+    nameSpaces[namespace_id].visibleResourcesInSubtree += diff;
+  }
+}
+
+
+void Visualizer::centerOnFocus()
+{
+  if (focusState.nodeValid())
+  {
+    const auto nodeRect = (hierarchicalView ? condensedLayout : generalLayout).nodes[focusState.nodeId];
+    canvas.CenterView(nodeRect.offset + nodeRect.size / 2.f);
+    canvasCamera.canvasOffset = canvas.ViewOrigin();
+    return;
+  }
+
+  if (focusState.resValid())
+  {
+    constexpr ImVec2 MAX_IMVEC2 = ImVec2{eastl::numeric_limits<float>::max(), eastl::numeric_limits<float>::max()};
+
+    ImVec2 leftPos = MAX_IMVEC2;
+    ImVec2 rightPos = MAX_IMVEC2;
+    for (auto [edgeId, edge] : (hierarchicalView ? condensedLayout : generalLayout).edges.enumerate())
+      for (const auto depId : edge.carriedDeps)
+        if (registryDependencies[depId].resource == focusState.resId)
+          for (const auto &spline : edge.splines)
+            if (spline.P0.x < leftPos.x)
+            {
+              leftPos = spline.P0;
+              rightPos = spline.P3;
+              break;
+            }
+
+    if (leftPos == MAX_IMVEC2 || rightPos == MAX_IMVEC2)
+      return;
+
+    canvas.CenterView((leftPos + rightPos) / 2.f);
+    canvasCamera.canvasOffset = canvas.ViewOrigin();
+  }
+}
+
+
+void Visualizer::updateVisualization(const IdIndexedFlags<NodeNameId, framemem_allocator> &nodes_changed)
+{
+  TIME_PROFILE(update_usergraph_visualization);
+
+  updateNeeded = true;
+  lastChangedNodes = nodes_changed;
+  accumChangedNodes.resize(lastChangedNodes.size(), true);
+  for (const auto changedId : lastChangedNodes.trueKeys())
+    accumChangedNodes[changedId] = true;
+
+  const bool isImguiActive = imgui_get_state() != ImGuiState::OFF;
+  // imgui_window_is_visible returns info from blk and it doesn't care if imgui window is visible or not
+  const bool isWindowVisible = imgui_window_is_visible(nullptr, IMGUI_USG_WIN_NAME);
+  // imgui_window_is_collapsed can't be used if window is not visible
+  const bool isWindowCollapsed = isWindowVisible && imgui_window_is_collapsed(nullptr, IMGUI_USG_WIN_NAME);
+  if (!isImguiActive || !isWindowVisible || isWindowCollapsed)
+    return;
+
+  inspectedBlob.reset();
+
+  updateNodesRess();
+  updateIRInfo();
+  updateNameSpaces();
+  updateDependencies();
+
+  gpuCapture.distinctExtents.clear();
+  for (const auto &irNode : intermediateGraph.nodes.values())
+    if (irNode.multiplexingIndex != intermediate::MultiplexingIndex::Invalid &&
+        eastl::find(gpuCapture.distinctExtents.begin(), gpuCapture.distinctExtents.end(), irNode.multiplexingIndex) ==
+          gpuCapture.distinctExtents.end())
+      gpuCapture.distinctExtents.push_back(irNode.multiplexingIndex);
+
+  calculateNodesColors();
+  checkCycles();
+  condenseGraph();
+
+  resolvePopupState();
+  resolveFocusState();
+  resolveInspectedDependency();
+
+  performLayout();
+  performCondensedLayout();
+
+  update_external_texture_visualization(registry, depData);
+
+  updateNeeded = false;
+}
+
+
+void Visualizer::updateNodesRess()
+{
+  TIME_PROFILE(update_nodes_resources);
+
+  const uint32_t totalNodeCount = registry.nodes.size();
+  const uint32_t totalResourceCount = registry.resources.size();
+
+  userNodes.clear();
+  userResources.clear();
+  regNodesRepresent.clear();
+  regResRepresent.clear();
+
+  userNodes.reserve(totalNodeCount);
+  userResources.reserve(totalResourceCount);
+  regNodesRepresent.resize(totalNodeCount, NodeId::Invalid);
+  regResRepresent.resize(totalResourceCount, ResourceId::Invalid);
+
+  for (const auto nodeNameId : registry.nodes.keys())
+    if (!getName(nodeNameId).starts_with("/.debug"))
+      regNodesRepresent[nodeNameId] = userNodes.appendNew(Node{nodeNameId}).first;
+
+  for (const auto resNameId : registry.resources.keys())
+    if (!getName(resNameId).starts_with("/.debug"))
+      regResRepresent[resNameId] = userResources.appendNew(Resource{resNameId}).first;
+}
+
+void Visualizer::updateIRInfo()
+{
+  TIME_PROFILE(update_ir_info);
+
+  uint32_t currExecTime = 0;
+  for (auto [irIndex, irNode] : intermediateGraph.nodes.enumerate())
+    if (irNode.multiplexingIndex == 0 && irNode.frontendNode && isPresented(*irNode.frontendNode))
+    {
+      auto &node = userNodes[getRepresentId(*irNode.frontendNode)];
+      node.passColor = intermediatePassColoring[irIndex];
+      node.executionTime = currExecTime;
+      ++currExecTime;
+    }
+}
+
+void Visualizer::updateNameSpaces()
+{
+  TIME_PROFILE(update_name_spaces);
+
+  nameSpaces.clear();
+  nsNodeNameIds.clear();
+  nsResNameIds.clear();
+
+  nameSpaces.resize(registry.knownNames.nameCount<NameSpaceNameId>(), {});
+  nsNodeNameIds.reserve(userNodes.size());
+  nsResNameIds.reserve(userResources.size());
+
+
+  // collect sub namespaces
+  for (const auto nameSpaceId : nameSpaces.keys())
+    if (nameSpaceId != registry.knownNames.root())
+      nameSpaces[getParent(nameSpaceId)].subNameSpaces.push_back(nameSpaceId);
+
+  // collect nodes and resources ids
+  for (const auto &node : userNodes)
+    nameSpaces[getParent(node.regId)].nodes.push_back(node.regId);
+  for (const auto &resource : userResources)
+    nameSpaces[getParent(resource.regId)].resources.push_back(resource.regId);
+
+  // calculate contents
+  {
+    const auto nameComparator = [&](const auto first, const auto second) { return getShortName(first) < getShortName(second); };
+
+    dag::FixedMoveOnlyFunction<24, void(const NameSpaceNameId)> calculateContents = [&](const NameSpaceNameId name_space_id) {
+      NameSpace &nameSpace = nameSpaces[name_space_id];
+      nameSpace.totalNodesInSubtree = nameSpace.nodes.size();
+      nameSpace.totalResourcesInSubtree = nameSpace.resources.size();
+
+      stlsort::sort(nameSpace.subNameSpaces.begin(), nameSpace.subNameSpaces.end(), nameComparator);
+      stlsort::sort(nameSpace.nodes.begin(), nameSpace.nodes.end(), nameComparator);
+      stlsort::sort(nameSpace.resources.begin(), nameSpace.resources.end(), nameComparator);
+
+      for (const auto &subNameSpaceId : nameSpace.subNameSpaces)
+      {
+        calculateContents(subNameSpaceId);
+
+        const NameSpace &subNameSpace = nameSpaces[subNameSpaceId];
+        nameSpace.totalNodesInSubtree += subNameSpace.totalNodesInSubtree;
+        nameSpace.totalResourcesInSubtree += subNameSpace.totalResourcesInSubtree;
+      }
+
+      nameSpace.visibleResourcesInSubtree = nameSpace.totalResourcesInSubtree;
+
+      nsNodeNameIds.insert(nsNodeNameIds.end(), nameSpace.nodes.begin(), nameSpace.nodes.end());
+      nsResNameIds.insert(nsResNameIds.end(), nameSpace.resources.begin(), nameSpace.resources.end());
+    };
+
+    calculateContents(registry.knownNames.root());
+  }
+
+  // get names
+  nsNodeNames.clear();
+  nsResNames.clear();
+  nsNodeNames = gatherNames<NodeNameId>(nsNodeNameIds);
+  nsResNames = gatherNames<ResNameId>(nsResNameIds);
+}
+
+void Visualizer::updateDependencies()
+{
+  TIME_PROFILE(update_dependencies);
+
+  registryDependencies.clear();
+
+  auto addDependency = [&](const NodeId from, const NodeId to, const DependencyType dep_type,
+                         const ResourceId res = ResourceId::Invalid) {
+    const auto depId = registryDependencies.appendNew(Dependency{dep_type, from, to, res}).first;
+    userNodes[from].outDeps.push_back(depId);
+    userNodes[to].inDeps.push_back(depId);
+  };
+
+  auto addHistoryRead = [&](const NodeId from, const NodeId to, const ResourceId res) {
+    const auto depId = registryDependencies.appendNew(Dependency{DependencyType::IMPLICIT_RES_HIST, from, to, res}).first;
+    userNodes[from].outHistDeps.push_back(depId);
+    userNodes[to].inHistDeps.push_back(depId);
+  };
+
+
+  // filling explicit dependencies
+  for (auto [nodeId, node] : userNodes.enumerate())
+  {
+    const auto &nodeData = registry.nodes[node.regId];
+
+    for (const auto prevNameId : nodeData.precedingNodeIds)
+      if (isPresented(prevNameId))
+        addDependency(getRepresentId(prevNameId), nodeId, DependencyType::EXPLICIT_PREVIOUS);
+
+    for (const auto nextNameId : nodeData.followingNodeIds)
+      if (isPresented(nextNameId))
+        addDependency(nodeId, getRepresentId(nextNameId), DependencyType::EXPLICIT_FOLLOW);
+  }
+
+  // filling resource dependencies
+  for (auto [resourceId, resource] : userResources.enumerate())
+  {
+    const auto &lifetime = depData.resourceLifetimes[resource.regId];
+
+    /*
+    consumer is dependent on every reader
+    if there are no readers, consumer is dependent on last modifier
+    if there are no modifiers and no readers, consumer is dependent on introducer
+
+    every reader is dependent on last modifier
+    if there are no modifiers, every reader is dependent on introducer
+
+    first modifier is dependent on introducer
+
+    // clang-format off
+    so, if we have modifiers, we get such dependencies:
+
+              M           R
+            / |         / | \
+           /  M        /  R  \
+          /   |       / / | \ \
+         /    ~      / /  ~  \ \
+        I           M===~   ~===C
+              ~    / \ \  ~  / /
+              |   /   \ \ | / /
+              M  /     \  R  /
+              | /       \ | /
+              M           R
+
+    or, if we dont have modifiers:
+
+              R
+            / | \
+           /  R  \
+          / / | \ \
+         / /  ~  \ \
+        I===~   ~===C
+         \ \  ~  / /
+          \ \ | / /
+           \  R  /
+            \ | /
+              R
+
+    // clang-format on
+    */
+
+    NodeId introducerId = getRepresentId(lifetime.introducedBy);
+    NodeId consumerId = getRepresentId(lifetime.consumedBy);
+    NodeId readSourceId = introducerId;
+
+    dag::Vector<NodeId, framemem_allocator> modifiers;
+    for (const auto modifierNameId : lifetime.modificationChain)
+      if (isPresented(modifierNameId))
+        modifiers.push_back(getRepresentId(modifierNameId));
+
+    dag::Vector<NodeId, framemem_allocator> readers;
+    for (const auto readerNameId : lifetime.readers)
+      if (isPresented(readerNameId))
+        readers.push_back(getRepresentId(readerNameId));
+
+    const bool resHasIntroducer = introducerId != NodeId::Invalid;
+    const bool resHasModifiers = !modifiers.empty();
+    const bool resHasReaders = !readers.empty();
+    const bool resHasConsumer = consumerId != NodeId::Invalid;
+
+    if (resHasModifiers)
+    {
+      // we sort modifiers as we can
+      // nodes, which were used in intermediate graph, will go first in execution order
+      // all other nodes will be considered culled away and will go in random order after exucutable nodes
+      dag::Vector<NodeId, framemem_allocator> modifiersOrder(modifiers.begin(), modifiers.end());
+      eastl::sort(modifiersOrder.begin(), modifiersOrder.end(),
+        [&](const NodeId first, const NodeId second) { return userNodes[first].executionTime < userNodes[second].executionTime; });
+
+      if (resHasIntroducer)
+        addDependency(introducerId, modifiersOrder.front(), DependencyType::IMPLICIT_RES_MODIFY, resourceId);
+
+      for (uint32_t modifierIdx = 1; modifierIdx < modifiersOrder.size(); ++modifierIdx)
+        addDependency(modifiersOrder[modifierIdx - 1], modifiersOrder[modifierIdx], DependencyType::IMPLICIT_RES_MODIFY, resourceId);
+
+      readSourceId = modifiersOrder.back();
+    }
+
+    const bool readSourceValid = readSourceId != NodeId::Invalid;
+
+    for (const auto readerNameId : lifetime.readers)
+      if (isPresented(readerNameId))
+      {
+        if (readSourceValid)
+          addDependency(readSourceId, getRepresentId(readerNameId), DependencyType::IMPLICIT_RES_READ, resourceId);
+        if (resHasConsumer)
+          addDependency(getRepresentId(readerNameId), consumerId, DependencyType::IMPLICIT_RES_CONSUME, resourceId);
+      }
+    if (!resHasReaders && readSourceValid && resHasConsumer)
+      addDependency(readSourceId, consumerId, DependencyType::IMPLICIT_RES_CONSUME, resourceId);
+
+    if (!resHasConsumer && readSourceValid)
+      for (const auto readerNameId : lifetime.historyReaders)
+        if (isPresented(readerNameId))
+          addHistoryRead(readSourceId, getRepresentId(readerNameId), resourceId);
+  }
+}
+
+
+void Visualizer::calculateNodesColors()
+{
+  for (auto &node : userNodes)
+  {
+    node.fbImColor = NODE_BASE_COLOR;
+    node.passImColor = NODE_BASE_COLOR;
+
+    auto &nodeData = registry.nodes[node.regId];
+    if (nodeData.renderingRequirements)
+    {
+      const auto &pass = *nodeData.renderingRequirements;
+
+      size_t hash = 0;
+      hash_pack(hash, pass.depthReadOnly);
+      for (auto colorAtt : pass.colorAttachments)
+        hash_pack(hash, colorAtt.nameId, colorAtt.mipLevel, colorAtt.layer);
+      hash_pack(hash, pass.depthAttachment.nameId, pass.depthAttachment.mipLevel, pass.depthAttachment.layer);
+
+      node.fbImColor = color_by_hash(hash);
+    }
+
+    if (node.passColor != UNKNOWN_PASS_COLOR)
+      node.passImColor = color_by_hash(static_cast<size_t>(node.passColor));
+  }
+}
+
+static dag::Vector<NodeIdx> get_reversed_topsort(const AdjacencyLists &graph)
+{
+  dag::Vector<NodeIdx> res;
+  res.reserve(graph.size());
+
+  // we will use DFS to sort indicies in topoligical order
+  dag::Vector<bool, framemem_allocator> indexVisited;
+  indexVisited.resize(graph.size(), false);
+
+  dag::FixedMoveOnlyFunction<32, void(const NodeIdx)> dfsNode = [&](const NodeIdx node_index) {
+    indexVisited[node_index] = true;
+
+    for (const auto to : graph[node_index])
+      if (!indexVisited[to])
+        dfsNode(to);
+
+    res.push_back(node_index);
+  };
+
+  // iterate on every index and we will get reversed topsort
+  for (uint32_t i = 0; i < graph.size(); ++i)
+    if (!indexVisited[i])
+      dfsNode(i);
+
+  return res;
+}
+
+void Visualizer::checkCycles()
+{
+  TIME_PROFILE(check_cycled_dependencies);
+
+  // here we will perform Kosaraju's algorithm to find all strongly connected components (SCC)
+  const uint32_t nodesCount = userNodes.size();
+  constexpr uint32_t NONE = static_cast<uint32_t>(-1);
+  IdIndexedMapping<NodeId, uint32_t, framemem_allocator> nodesSCC(nodesCount, NONE);
+
+  uint32_t currentSCC = 0;
+  {
+    AdjacencyLists graphAdjLists(nodesCount);
+    AdjacencyLists reversedGraphAdjLists(nodesCount);
+    for (const auto &dep : registryDependencies)
+      if (dep.type != DependencyType::IMPLICIT_RES_HIST)
+      {
+        graphAdjLists[NodeIdx(dep.from)].push_back(NodeIdx(dep.to));
+        reversedGraphAdjLists[NodeIdx(dep.to)].push_back(NodeIdx(dep.from));
+      }
+    dag::Vector<NodeIdx> componentOrder = get_reversed_topsort(reversedGraphAdjLists);
+
+    dag::Vector<uint32_t, framemem_allocator> visitStack;
+    dag::Vector<uint32_t, framemem_allocator> dfsStack;
+    dag::Vector<uint32_t, framemem_allocator> leftOut;
+
+    visitStack.reserve(nodesCount);
+    dfsStack.reserve(nodesCount);
+    leftOut.reserve(nodesCount);
+
+    for (const auto nodeIndex : dag::ReverseView{componentOrder})
+      if (nodesSCC[NodeId(nodeIndex)] == NONE)
+      {
+        visitStack.push_back(nodeIndex);
+        while (!visitStack.empty())
+        {
+          dfsStack.push_back(visitStack.back());
+          leftOut.push_back(0);
+          visitStack.pop_back();
+
+          nodesSCC[NodeId(dfsStack.back())] = currentSCC;
+
+          for (const auto toNodeIndex : graphAdjLists[dfsStack.back()])
+            if (nodesSCC[NodeId(toNodeIndex)] == NONE)
+            {
+              visitStack.push_back(toNodeIndex);
+              ++leftOut.back();
+            }
+
+          while (!leftOut.empty() && leftOut.back() == 0)
+          {
+            dfsStack.pop_back();
+            leftOut.pop_back();
+            if (!leftOut.empty())
+              --leftOut.back();
+          }
+        }
+        ++currentSCC;
+      }
+  }
+  const uint32_t sccCount = currentSCC;
+
+
+  // if each node is not a separate SCC - then some of them form a cycle
+  if (sccCount != nodesCount)
+  {
+    dag::Vector<uint32_t, framemem_allocator> sccSizes(sccCount, 0);
+    for (const auto nodeId : userNodes.keys())
+      ++sccSizes[nodesSCC[nodeId]];
+
+    dag::Vector<uint32_t, framemem_allocator> sccWithLoopsIndices;
+    for (uint32_t sccIndex = 0; sccIndex < sccCount; ++sccIndex)
+      if (sccSizes[sccIndex] > 1)
+        sccWithLoopsIndices.push_back(sccIndex);
+
+    dag::Vector<dag::Vector<NodeId, framemem_allocator>, framemem_allocator> sccMembers;
+    sccMembers.resize(sccCount, {});
+    for (const uint32_t sccIndex : dag::ReverseView{sccWithLoopsIndices})
+      sccMembers[sccIndex].reserve(sccSizes[sccIndex]);
+    for (const auto nodeId : userNodes.keys())
+      if (sccSizes[nodesSCC[nodeId]] > 1)
+        sccMembers[nodesSCC[nodeId]].push_back(nodeId);
+
+    dag::Vector<dag::Vector<DependencyId, framemem_allocator>, framemem_allocator> sccDependencies;
+    sccDependencies.resize(sccCount, {});
+    for (const uint32_t sccIndex : dag::ReverseView{sccWithLoopsIndices})
+      for (auto [depId, dep] : registryDependencies.enumerate())
+        if (nodesSCC[dep.from] == sccIndex && nodesSCC[dep.to] == sccIndex && dep.type != DependencyType::IMPLICIT_RES_HIST)
+          sccDependencies[sccIndex].push_back(depId);
+
+
+    for (const auto sccIndex : sccWithLoopsIndices)
+    {
+      const auto &sccNodes = sccMembers[sccIndex];
+      const auto &sccDeps = sccDependencies[sccIndex];
+
+      IdIndexedMapping<NodeId, uint32_t, framemem_allocator> localIdx(nodesCount, NONE);
+      for (uint32_t i = 0; i < sccNodes.size(); ++i)
+        localIdx[sccNodes[i]] = i;
+
+      // Alert! Vibecoded!
+      // abandon all hope, ye who enter here
+      //
+      // Find minimum feedback arc set (FAS) by finding a node ordering that minimizes
+      // backward edges. FAS = backward edges in the optimal ordering.
+      //
+      // For small SCCs (n <= 20): exact bitmask DP, O(2^n * n).
+      // For larger SCCs: Eades greedy heuristic, O(n^2), roughly 2x optimal.
+      {
+        const uint32_t n = sccNodes.size();
+
+        dag::Vector<uint32_t, framemem_allocator> ordering(n);
+
+        constexpr uint32_t EXACT_THRESHOLD = 20;
+        if (n <= EXACT_THRESHOLD)
+        {
+          // adjMask[u] has bit v set if there is an edge u->v
+          dag::Vector<uint32_t, framemem_allocator> adjMask(n, 0);
+          for (const auto depId : sccDeps)
+          {
+            const auto &dep = registryDependencies[depId];
+            adjMask[localIdx[dep.from]] |= (1u << localIdx[dep.to]);
+          }
+
+          const uint32_t fullMask = (1u << n) - 1;
+          dag::Vector<uint32_t, framemem_allocator> dp(fullMask + 1, UINT32_MAX);
+          dag::Vector<uint8_t, framemem_allocator> lastPlaced(fullMask + 1, 0xFF);
+          dp[0] = 0;
+          for (uint32_t mask = 0; mask < fullMask; ++mask)
+          {
+            if (dp[mask] == UINT32_MAX)
+              continue;
+            for (uint32_t v = 0; v < n; ++v)
+            {
+              if (mask & (1u << v))
+                continue;
+              // edges from v to already-placed nodes become backward edges
+              uint32_t cost = Bitset<32>(adjMask[v] & mask).count();
+              uint32_t newMask = mask | (1u << v);
+              if (dp[mask] + cost < dp[newMask])
+              {
+                dp[newMask] = dp[mask] + cost;
+                lastPlaced[newMask] = static_cast<uint8_t>(v);
+              }
+            }
+          }
+          uint32_t mask = fullMask;
+          for (int pos = static_cast<int>(n) - 1; pos >= 0; --pos)
+          {
+            ordering[pos] = lastPlaced[mask];
+            mask ^= (1u << lastPlaced[mask]);
+          }
+        }
+        else
+        {
+          // adjMatrix[u*n + v] = true if edge u->v exists
+          dag::Vector<bool, framemem_allocator> adjMatrix(n * n, false);
+          for (const auto depId : sccDeps)
+          {
+            const auto &dep = registryDependencies[depId];
+            adjMatrix[localIdx[dep.from] * n + localIdx[dep.to]] = true;
+          }
+
+          dag::Vector<int, framemem_allocator> outDeg(n, 0), inDeg(n, 0);
+          for (uint32_t u = 0; u < n; ++u)
+            for (uint32_t v = 0; v < n; ++v)
+              if (adjMatrix[u * n + v])
+              {
+                ++outDeg[u];
+                ++inDeg[v];
+              }
+
+          dag::Vector<bool, framemem_allocator> removed(n, false);
+          dag::Vector<uint32_t, framemem_allocator> seqLeft, seqRight;
+          seqLeft.reserve(n);
+          seqRight.reserve(n);
+
+          auto removeNode = [&](uint32_t v) {
+            removed[v] = true;
+            for (uint32_t u = 0; u < n; ++u)
+            {
+              if (removed[u])
+                continue;
+              if (adjMatrix[v * n + u])
+                --inDeg[u];
+              if (adjMatrix[u * n + v])
+                --outDeg[u];
+            }
+          };
+
+          int remaining = static_cast<int>(n);
+          while (remaining > 0)
+          {
+            bool progress = true;
+            while (progress)
+            {
+              progress = false;
+              for (uint32_t v = 0; v < n; ++v)
+              {
+                if (removed[v])
+                  continue;
+                if (inDeg[v] == 0)
+                {
+                  seqLeft.push_back(v);
+                  removeNode(v);
+                  --remaining;
+                  progress = true;
+                }
+                else if (outDeg[v] == 0)
+                {
+                  seqRight.push_back(v);
+                  removeNode(v);
+                  --remaining;
+                  progress = true;
+                }
+              }
+            }
+            if (remaining > 0)
+            {
+              uint32_t best = 0;
+              int bestDelta = INT_MIN;
+              for (uint32_t v = 0; v < n; ++v)
+                if (!removed[v] && outDeg[v] - inDeg[v] > bestDelta)
+                {
+                  bestDelta = outDeg[v] - inDeg[v];
+                  best = v;
+                }
+              seqLeft.push_back(best);
+              removeNode(best);
+              --remaining;
+            }
+          }
+          eastl::copy(seqLeft.begin(), seqLeft.end(), ordering.begin());
+          eastl::reverse_copy(seqRight.begin(), seqRight.end(), ordering.begin() + seqLeft.size());
+        }
+
+        // pos[local_idx] = position in ordering
+        dag::Vector<uint32_t, framemem_allocator> pos(n);
+        for (uint32_t i = 0; i < n; ++i)
+          pos[ordering[i]] = i;
+
+        // Disable all deps that go backward in the ordering
+        for (const auto depId : sccDeps)
+        {
+          auto &dep = registryDependencies[depId];
+          if (pos[localIdx[dep.from]] > pos[localIdx[dep.to]])
+            dep.disabled = true;
+        }
+      }
+      // Vibecode ended
+
+      for (const auto nodeId : sccNodes)
+        userNodes[nodeId].cycled = true;
+      for (const auto depId : sccDeps)
+        registryDependencies[depId].cycled = true;
+    }
+  }
+
+
+  // and finally, we recreate lists of dependencies per node,
+  // but we filter out disabled dependencies to keep graph acyclic
+  for (auto &node : userNodes)
+  {
+    node.inDeps.clear();
+    node.outDeps.clear();
+  }
+  disabledDependencies.clear();
+
+  for (auto [depId, dep] : registryDependencies.enumerate())
+    if (!dep.disabled)
+    {
+      if (dep.type != DependencyType::IMPLICIT_RES_HIST)
+      {
+        userNodes[dep.from].outDeps.push_back(depId);
+        userNodes[dep.to].inDeps.push_back(depId);
+      }
+    }
+    else
+    {
+      disabledDependencies.push_back(depId);
+    }
+}
+
+void Visualizer::condenseGraph()
+{
+  TIME_PROFILE(condense_graph_nodes);
+
+  nodeBoxes.clear();
+
+  IdIndexedMapping<NameSpaceNameId, dag::Vector<NodeBoxId, framemem_allocator>, framemem_allocator> nameSpacesNodeBoxes;
+  nameSpacesNodeBoxes.resize(registry.knownNames.nameCount<NameSpaceNameId>(), {});
+  for (auto [nameSpaceId, nameSpaceBoxes] : dag::ReverseView{nameSpacesNodeBoxes.enumerate()})
+    nameSpaceBoxes.reserve(nameSpaces[nameSpaceId].nodes.size());
+
+  {
+    dag::FixedMoveOnlyFunction<24, void(const NameSpaceNameId)> initNSBoxes = [&](const NameSpaceNameId namespace_id) {
+      if (nameSpaces[namespace_id].nodes.size() != 0)
+        nameSpacesNodeBoxes[namespace_id].push_back(nodeBoxes.appendNew(NodeBox{namespace_id}).first);
+
+      for (const auto subNameSpaceId : nameSpaces[namespace_id].subNameSpaces)
+        initNSBoxes(subNameSpaceId);
+    };
+    initNSBoxes(registry.knownNames.root());
+  }
+
+
+  // algorithm is similar to pass coloration in PassColorer::performSubpassColoring()
+  // but we dont check conflicts, caused by barriers, because we dont have them in user graph
+  {
+    const uint32_t userNodesCount = userNodes.size();
+
+    nodesNodeBox.clear();
+    nodesNodeBox.resize(userNodesCount, NodeBoxId::Invalid);
+
+    SimdBitMatrix<NodeBoxId, framemem_allocator> boxReachability(userNodesCount, false);
+    dag::Vector<NodeIdx, framemem_allocator> topOrder;
+    {
+      AdjacencyLists graphAdjLists(userNodesCount);
+      for (auto [nodeId, node] : userNodes.enumerate())
+      {
+        const auto nodeIdx = NodeIdx(nodeId);
+        graphAdjLists[nodeIdx].reserve(node.outDeps.size());
+        for (const auto depId : node.outDeps)
+          graphAdjLists[nodeIdx].push_back(NodeIdx(registryDependencies[depId].to));
+      }
+      topOrder = get_reversed_topsort(graphAdjLists);
+    }
+    for (const auto nodeIndex : dag::ReverseView{topOrder})
+    {
+      const auto nodeId = NodeId(nodeIndex);
+      const auto &node = userNodes[nodeId];
+      const auto nameSpaceId = getParent(node.regId);
+      const auto &nodePredecessors = node.inDeps;
+
+      SimdBitVector<NodeBoxId, framemem_allocator> reachableFromCurrent(userNodesCount, false);
+      {
+        dag::VectorSet<NodeBoxId, eastl::less<NodeBoxId>, framemem_allocator> predecessorBoxes;
+        predecessorBoxes.reserve(nodePredecessors.size());
+        for (const auto depId : nodePredecessors)
+          predecessorBoxes.insert(nodesNodeBox[registryDependencies[depId].from]);
+        for (const auto boxId : predecessorBoxes)
+          reachableFromCurrent |= boxReachability.row(boxId);
+      }
+
+      const auto candidateBoxId =
+        !nameSpacesNodeBoxes[nameSpaceId].empty() ? nameSpacesNodeBoxes[nameSpaceId].back() : NodeBoxId::Invalid;
+      if (candidateBoxId != NodeBoxId::Invalid && !reachableFromCurrent.test(candidateBoxId))
+      {
+        nodesNodeBox[nodeId] = candidateBoxId;
+      }
+      else
+      {
+        const auto newBoxId = nodeBoxes.appendNew(NodeBox{nameSpaceId}).first;
+        nameSpacesNodeBoxes[nameSpaceId].push_back(newBoxId);
+        nodesNodeBox[nodeId] = newBoxId;
+      }
+
+      for (const auto depId : nodePredecessors)
+        if (nodesNodeBox[registryDependencies[depId].from] != nodesNodeBox[nodeId])
+          reachableFromCurrent.set(nodesNodeBox[registryDependencies[depId].from], true);
+      boxReachability.row(nodesNodeBox[nodeId]) |= reachableFromCurrent;
+    }
+
+    for (const auto nodeId : userNodes.keys())
+      nodeBoxes[nodesNodeBox[nodeId]].nodes.push_back(nodeId);
+  }
+
+
+  // now, when we separated all nodes by boxes, we can
+  // add dependencies, that connect boxes with each other
+  for (auto [depId, dep] : registryDependencies.enumerate())
+  {
+    const auto fromNodeBoxId = nodesNodeBox[dep.from];
+    const auto toNodeBoxId = nodesNodeBox[dep.to];
+    if (fromNodeBoxId != toNodeBoxId && dep.type != DependencyType::IMPLICIT_RES_HIST)
+    {
+      nodeBoxes[fromNodeBoxId].outDeps.push_back(depId);
+      nodeBoxes[toNodeBoxId].inDeps.push_back(depId);
+    }
+  }
+}
+
+void Visualizer::performLayout()
+{
+  TIME_PROFILE(general_layout);
+
+  generalLayout = {};
+
+  const uint32_t userNodesCount = userNodes.size();
+  if (userNodesCount == 0)
+    return;
+
+
+  generalLayout.nodes.resize(userNodesCount);
+
+  dag::Vector<NodeId> nodeIds = {userNodes.keys().begin(), userNodes.keys().end()};
+
+  dag::Vector<dag::Vector<DependencyId>> nodeOutDeps;
+  for (const auto nodeId : nodeIds)
+    nodeOutDeps.push_back({userNodes[nodeId].outDeps.begin(), userNodes[nodeId].outDeps.end()});
+
+  GraphLayout nodeLayout = {};
+  {
+    TIME_PROFILE(ranking_nodes);
+    AdjacencyLists graphAdjLists(userNodesCount);
+    for (uint32_t nodeIndex = 0; nodeIndex < userNodesCount; ++nodeIndex)
+    {
+      graphAdjLists[nodeIndex].reserve(nodeOutDeps[nodeIndex].size());
+      for (const auto depId : nodeOutDeps[nodeIndex])
+        graphAdjLists[nodeIndex].push_back(NodeIdx(registryDependencies[depId].to));
+    }
+    nodeLayout = layouter->layout(graphAdjLists, get_reversed_topsort(graphAdjLists), true);
+  }
+  const uint32_t objectsCount = nodeLayout.adjacencyList.size();
+
+
+  RawLayout rawGeneralLayout = {.userNodeIds = eastl::move(nodeIds),
+    .outDeps = eastl::move(nodeOutDeps),
+    .layouterResult = eastl::move(nodeLayout),
+    .rawObjects = dag::Vector<RawObject>(objectsCount, RawObject{}),
+    .objectsOffsets = dag::Vector<ImVec2>(objectsCount, ImVec2{0.f, 0.f}),
+    .objectsSizes = dag::Vector<ImVec2>(objectsCount, ImVec2{0.f, 0.f}),
+    .objectsColumnSizes = dag::Vector<float>(objectsCount, 0.f)};
+  generateRawEdges(rawGeneralLayout);
+  generateAnchors(rawGeneralLayout);
+
+  calculateObjectsSizes(rawGeneralLayout);
+  calculateObjectsPositions(rawGeneralLayout);
+  calculateAnchorsPositions(rawGeneralLayout);
+
+  calculateNodeRectangles(generalLayout, rawGeneralLayout);
+  calculateEdgeSplines(generalLayout, rawGeneralLayout);
+}
+
+void Visualizer::performCondensedLayout()
+{
+  TIME_PROFILE(condenced_layout);
+
+  condensedLayout = {};
+
+  const uint32_t userNodesCount = userNodes.size();
+  if (userNodesCount == 0)
+    return;
+
+  const uint32_t nodeBoxesCount = nodeBoxes.size();
+  if (nodeBoxesCount == 0)
+    return;
+
+
+  condensedLayout.nodes.resize(userNodesCount);
+
+  IdIndexedMapping<NodeBoxId, RawLayout, framemem_allocator> boxesRawLayouts(nodeBoxesCount);
+  for (auto [nodeBoxId, nodeBox] : nodeBoxes.enumerate())
+  {
+    const uint32_t boxNodesCount = nodeBox.nodes.size();
+    if (boxNodesCount == 0)
+      continue;
+
+
+    dag::Vector<NodeId> nodeIds = {nodeBox.nodes.begin(), nodeBox.nodes.end()};
+
+    dag::Vector<dag::Vector<DependencyId>> nodeOutDeps;
+    for (const auto nodeId : nodeIds)
+      nodeOutDeps.push_back({userNodes[nodeId].outDeps.begin(), userNodes[nodeId].outDeps.end()});
+    nodeOutDeps.push_back({nodeBox.inDeps.begin(), nodeBox.inDeps.end()});
+    nodeOutDeps.push_back({});
+
+    GraphLayout nodeLayout = {};
+    {
+      TIME_PROFILE(ranking_nodes_in_box);
+
+      const uint32_t sourceIndex = boxNodesCount + 0;
+      const uint32_t sinkIndex = boxNodesCount + 1;
+
+      AdjacencyLists boxAdjLists(boxNodesCount + 2);
+      for (uint32_t nodeIndex = 0; nodeIndex < boxNodesCount; ++nodeIndex)
+      {
+        boxAdjLists[nodeIndex].reserve(nodeOutDeps[nodeIndex].size());
+        for (const auto depId : nodeOutDeps[nodeIndex])
+        {
+          const auto &dep = registryDependencies[depId];
+          if (nodesNodeBox[dep.from] == nodesNodeBox[dep.to])
+          {
+            for (uint32_t targetNodeIndex = 0; targetNodeIndex < boxNodesCount; ++targetNodeIndex)
+              if (nodeBox.nodes[targetNodeIndex] == dep.to)
+              {
+                boxAdjLists[nodeIndex].push_back(targetNodeIndex);
+                break;
+              }
+          }
+          else
+          {
+            boxAdjLists[nodeIndex].push_back(sinkIndex);
+          }
+        }
+      }
+      {
+        boxAdjLists[sourceIndex].reserve(nodeOutDeps[sourceIndex].size());
+        for (const auto depId : nodeOutDeps[sourceIndex])
+          for (uint32_t targetNodeIndex = 0; targetNodeIndex < boxNodesCount; ++targetNodeIndex)
+            if (nodeBox.nodes[targetNodeIndex] == registryDependencies[depId].to)
+            {
+              boxAdjLists[sourceIndex].push_back(targetNodeIndex);
+              break;
+            }
+      }
+      nodeLayout = layouter->layout(boxAdjLists, get_reversed_topsort(boxAdjLists), true);
+    }
+    const uint32_t objectsCount = nodeLayout.adjacencyList.size();
+
+
+    auto &boxRawLayout = boxesRawLayouts[nodeBoxId];
+    boxRawLayout = {.userNodeIds = eastl::move(nodeIds),
+      .outDeps = eastl::move(nodeOutDeps),
+      .layouterResult = eastl::move(nodeLayout),
+      .rawObjects = dag::Vector<RawObject>(objectsCount, RawObject{}),
+      .objectsOffsets = dag::Vector<ImVec2>(objectsCount, ImVec2{0.f, 0.f}),
+      .objectsSizes = dag::Vector<ImVec2>(objectsCount, ImVec2{0.f, 0.f}),
+      .objectsColumnSizes = dag::Vector<float>(objectsCount, 0.f)};
+    generateRawEdges(boxRawLayout);
+    generateAnchors(boxRawLayout);
+
+    calculateObjectsSizes(boxRawLayout);
+    calculateObjectsPositions(boxRawLayout);
+    calculateAnchorsPositions(boxRawLayout);
+
+    nodeBox.rect.size = boxRawLayout.size;
+  }
+
+
+  dag::Vector<NodeBoxId> nodeBoxIds = {nodeBoxes.keys().begin(), nodeBoxes.keys().end()};
+
+  dag::Vector<dag::Vector<DependencyId>> nodeBoxOutDeps;
+  for (const auto nodeBoxId : nodeBoxes.keys())
+    nodeBoxOutDeps.push_back({nodeBoxes[nodeBoxId].outDeps.begin(), nodeBoxes[nodeBoxId].outDeps.end()});
+
+  GraphLayout nodeBoxLayout = {};
+  {
+    TIME_PROFILE(ranking_node_boxes);
+    AdjacencyLists boxesAdjLists(nodeBoxesCount);
+    for (uint32_t nodeBoxIndex = 0; nodeBoxIndex < nodeBoxesCount; ++nodeBoxIndex)
+    {
+      boxesAdjLists[nodeBoxIndex].reserve(nodeBoxOutDeps[nodeBoxIndex].size());
+      for (const auto depId : nodeBoxOutDeps[nodeBoxIndex])
+        boxesAdjLists[nodeBoxIndex].push_back(NodeIdx(nodesNodeBox[registryDependencies[depId].to]));
+    }
+    nodeBoxLayout = layouter->layout(boxesAdjLists, get_reversed_topsort(boxesAdjLists), true);
+  }
+  const uint32_t objectsCount = nodeBoxLayout.adjacencyList.size();
+
+
+  RawLayout rawCondensedLayout = {.nodeBoxIds = eastl::move(nodeBoxIds),
+    .outDeps = eastl::move(nodeBoxOutDeps),
+    .layouterResult = eastl::move(nodeBoxLayout),
+    .rawObjects = dag::Vector<RawObject>(objectsCount, RawObject{}),
+    .objectsOffsets = dag::Vector<ImVec2>(objectsCount, ImVec2{0.f, 0.f}),
+    .objectsSizes = dag::Vector<ImVec2>(objectsCount, ImVec2{0.f, 0.f}),
+    .objectsColumnSizes = dag::Vector<float>(objectsCount, 0.f)};
+  generateRawEdges(rawCondensedLayout);
+  generateAnchors(rawCondensedLayout);
+
+  calculateObjectsSizes(rawCondensedLayout);
+  calculateObjectsPositions(rawCondensedLayout);
+  calculateAnchorsPositions(rawCondensedLayout);
+
+  for (uint32_t nodeBoxIndex = 0; nodeBoxIndex < nodeBoxesCount; ++nodeBoxIndex)
+  {
+    const auto nodeBoxId = rawCondensedLayout.nodeBoxIds[nodeBoxIndex];
+    const auto nodeBoxOffset = rawCondensedLayout.objectsOffsets[nodeBoxIndex];
+    auto &nodeBoxRawLayout = boxesRawLayouts[nodeBoxId];
+
+    nodeBoxes[nodeBoxId].rect = {nodeBoxOffset, nodeBoxRawLayout.size};
+    for (auto &objOffset : nodeBoxRawLayout.objectsOffsets)
+      objOffset += nodeBoxOffset;
+    for (auto &anchor : nodeBoxRawLayout.anchors)
+      anchor += nodeBoxOffset;
+
+    calculateNodeRectangles(condensedLayout, nodeBoxRawLayout);
+    calculateEdgeSplines(condensedLayout, nodeBoxRawLayout);
+  }
+
+
+  {
+    TIME_PROFILE(search_anchors);
+
+    for (auto &outerEdge : rawCondensedLayout.rawEdges)
+    {
+      const NodeIdx fromIdx = outerEdge.from;
+      const NodeIdx toIdx = outerEdge.to;
+      const auto outerDepId = outerEdge.carriedDeps.front();
+      const auto outerResId = registryDependencies[outerDepId].resource;
+
+      if (fromIdx < nodeBoxesCount)
+      {
+        const auto fromBoxId = rawCondensedLayout.nodeBoxIds[fromIdx];
+        const auto &fromBoxRawLayout = boxesRawLayouts[fromBoxId];
+        const NodeIdx fromBoxSinkIndex = fromBoxRawLayout.userNodeIds.size() + 1;
+
+        for (const auto innerEdgeId : fromBoxRawLayout.rawObjects[fromBoxSinkIndex].inEdges)
+        {
+          const auto &innerEdge = fromBoxRawLayout.rawEdges[innerEdgeId];
+          const auto innerDepId = innerEdge.carriedDeps.front();
+          const auto innerResId = registryDependencies[innerDepId].resource;
+
+          if (outerResId != ResourceId::Invalid && outerResId == innerResId ||
+              outerResId == ResourceId::Invalid && outerDepId == innerDepId)
+          {
+            auto [newAnchorId, newAnchor] = rawCondensedLayout.anchors.appendNew();
+            outerEdge.fromAnchor = newAnchorId;
+            newAnchor = fromBoxRawLayout.anchors[innerEdge.toAnchor];
+            break;
+          }
+        }
+      }
+
+      if (toIdx < nodeBoxesCount)
+      {
+        const auto toBoxId = rawCondensedLayout.nodeBoxIds[toIdx];
+        const auto &toBoxRawLayout = boxesRawLayouts[toBoxId];
+        const NodeIdx toBoxSourceIndex = toBoxRawLayout.userNodeIds.size() + 0;
+
+        for (const auto innerEdgeId : toBoxRawLayout.rawObjects[toBoxSourceIndex].outEdges)
+        {
+          const auto &innerEdge = toBoxRawLayout.rawEdges[innerEdgeId];
+          const auto innerDepId = innerEdge.carriedDeps.front();
+          const auto innerResId = registryDependencies[innerDepId].resource;
+
+          if (outerResId != ResourceId::Invalid && outerResId == innerResId ||
+              outerResId == ResourceId::Invalid && outerDepId == innerDepId)
+          {
+            auto [newAnchorId, newAnchor] = rawCondensedLayout.anchors.appendNew();
+            outerEdge.toAnchor = newAnchorId;
+            newAnchor = toBoxRawLayout.anchors[innerEdge.fromAnchor];
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  calculateEdgeSplines(condensedLayout, rawCondensedLayout);
+}
+
+
+void Visualizer::generateRawEdges(RawLayout &raw_layout)
+{
+  TIME_PROFILE(generate_raw_edges);
+
+  dag::Vector<RawEdgeId, framemem_allocator> edgesBetweenObjects;
+  const auto rawEdgeSignComp = [&](const RawEdgeId edge_id, const DependencyId dep_id) {
+    const auto &edgeDep = registryDependencies[raw_layout.rawEdges[edge_id].carriedDeps.front()];
+    const auto &valDep = registryDependencies[dep_id];
+    return edgeDep.type == valDep.type && edgeDep.resource == valDep.resource && edgeDep.resource != ResourceId::Invalid;
+  };
+
+  const auto &adjLists = raw_layout.layouterResult.adjacencyList;
+  const auto &depMapping = raw_layout.layouterResult.edgeMapping;
+  const auto &origDeps = raw_layout.outDeps;
+  auto &objects = raw_layout.rawObjects;
+  auto &edges = raw_layout.rawEdges;
+
+
+  for (uint32_t objectIndex = 0; objectIndex < objects.size(); ++objectIndex)
+    for (uint32_t edgeIndex = 0; edgeIndex < adjLists[objectIndex].size(); ++edgeIndex)
+    {
+      edgesBetweenObjects.clear();
+      const uint32_t fromObjIdx = objectIndex;
+      const uint32_t toObjIdx = adjLists[objectIndex][edgeIndex];
+      const auto &[depSourceObjectIndex, dependenciesIndices] = depMapping[objectIndex][edgeIndex];
+      for (const uint32_t dependencyIndex : dependenciesIndices)
+      {
+        const auto depId = origDeps[depSourceObjectIndex][dependencyIndex];
+        auto it = eastl::find(edgesBetweenObjects.begin(), edgesBetweenObjects.end(), depId, rawEdgeSignComp);
+        if (it == edgesBetweenObjects.end())
+        {
+          auto [newRawEdgeId, newRawEdge] = edges.appendNew(RawEdge{fromObjIdx, toObjIdx});
+          newRawEdge.carriedDeps.push_back(depId);
+          objects[fromObjIdx].outEdges.push_back(newRawEdgeId);
+          objects[toObjIdx].inEdges.push_back(newRawEdgeId);
+          edgesBetweenObjects.push_back(newRawEdgeId);
+        }
+        else
+        {
+          edges[*it].carriedDeps.push_back(depId);
+        }
+      }
+    }
+}
+
+void Visualizer::generateAnchors(RawLayout &raw_layout)
+{
+  TIME_PROFILE(generate_anchors);
+
+  const uint32_t objectsCount = raw_layout.rawObjects.size();
+
+  const uint32_t userNodesCount = raw_layout.userNodeIds.size();
+  const uint32_t nodeBoxesCount = raw_layout.nodeBoxIds.size();
+  const uint32_t serviceNodesCount = raw_layout.outDeps.size() - (userNodesCount + nodeBoxesCount);
+  const uint32_t fakeNodesCount = objectsCount - raw_layout.outDeps.size();
+
+  const uint32_t userNodesIndexOffset = 0;
+  const uint32_t nodeBoxesIndexOffset = userNodesIndexOffset + userNodesCount;
+  const uint32_t serviceNodesIndexOffset = nodeBoxesIndexOffset + nodeBoxesCount;
+  const uint32_t fakeNodesIndexOffset = serviceNodesIndexOffset + serviceNodesCount;
+
+  dag::Vector<uint32_t, framemem_allocator> objectsSubranks(objectsCount);
+  {
+    const auto &ranks = raw_layout.layouterResult.nodeLayout;
+    for (uint32_t rank = 0; rank < ranks.size(); ++rank)
+      for (uint32_t subrank = 0; subrank < ranks[rank].size(); ++subrank)
+        objectsSubranks[ranks[rank][subrank]] = subrank;
+  }
+  const auto rawEdgeBackOrder = [&](const RawEdgeId a, const RawEdgeId b) {
+    return objectsSubranks[raw_layout.rawEdges[a].from] < objectsSubranks[raw_layout.rawEdges[b].from];
+  };
+  const auto rawEdgeForwOrder = [&](const RawEdgeId a, const RawEdgeId b) {
+    return objectsSubranks[raw_layout.rawEdges[a].to] < objectsSubranks[raw_layout.rawEdges[b].to];
+  };
+
+
+  const uint32_t userResourceCount = userResources.size();
+  IdIndexedMapping<ResourceId, AnchorId, framemem_allocator> resAnchors(userResourceCount);
+  auto generateAnchorsOnSide = [&](dag::RelocatableFixedVector<RawEdgeId, 8> &edges_to_process,
+                                 dag::RelocatableFixedVector<AnchorId, 8> &anchors_to_populate, bool in_edges) {
+    resAnchors.clear();
+    resAnchors.resize(userResourceCount, AnchorId::Invalid);
+    for (const auto rawEdgeId : edges_to_process)
+    {
+      auto &edge = raw_layout.rawEdges[rawEdgeId];
+      auto &targetEdgeAnchor = in_edges ? edge.toAnchor : edge.fromAnchor;
+      const auto edgeResId = registryDependencies[edge.carriedDeps.front()].resource;
+      if (edgeResId != ResourceId::Invalid)
+      {
+        AnchorId candidateAnchorId = resAnchors[edgeResId];
+        if (candidateAnchorId == AnchorId::Invalid)
+        {
+          const auto newAnchorId = raw_layout.anchors.appendNew().first;
+          resAnchors[edgeResId] = newAnchorId;
+          anchors_to_populate.push_back(newAnchorId);
+          candidateAnchorId = newAnchorId;
+        }
+        targetEdgeAnchor = candidateAnchorId;
+      }
+      else
+      {
+        const auto newAnchorId = raw_layout.anchors.appendNew().first;
+        anchors_to_populate.push_back(newAnchorId);
+        targetEdgeAnchor = newAnchorId;
+      }
+    }
+  };
+
+
+  for (uint32_t userNodeIndex = 0; userNodeIndex < userNodesCount; ++userNodeIndex)
+  {
+    auto &userNodeObject = raw_layout.rawObjects[userNodesIndexOffset + userNodeIndex];
+
+    eastl::sort(userNodeObject.inEdges.begin(), userNodeObject.inEdges.end(), rawEdgeBackOrder);
+    eastl::sort(userNodeObject.outEdges.begin(), userNodeObject.outEdges.end(), rawEdgeForwOrder);
+
+    generateAnchorsOnSide(userNodeObject.inEdges, userNodeObject.inAnchors, true);
+    generateAnchorsOnSide(userNodeObject.outEdges, userNodeObject.outAnchors, false);
+  }
+
+  if (serviceNodesCount != 0)
+  {
+    auto &sourceObject = raw_layout.rawObjects[serviceNodesIndexOffset + 0];
+    auto &sinkObject = raw_layout.rawObjects[serviceNodesIndexOffset + 1];
+
+    eastl::sort(sourceObject.outEdges.begin(), sourceObject.outEdges.end(), rawEdgeForwOrder);
+    eastl::sort(sinkObject.inEdges.begin(), sinkObject.inEdges.end(), rawEdgeBackOrder);
+
+    generateAnchorsOnSide(sourceObject.outEdges, sourceObject.outAnchors, false);
+    generateAnchorsOnSide(sinkObject.inEdges, sinkObject.inAnchors, true);
+  }
+
+  for (uint32_t fakeNodeIndex = 0; fakeNodeIndex < fakeNodesCount; ++fakeNodeIndex)
+  {
+    auto &fakeNodeObject = raw_layout.rawObjects[fakeNodesIndexOffset + fakeNodeIndex];
+
+    eastl::sort(fakeNodeObject.inEdges.begin(), fakeNodeObject.inEdges.end(), rawEdgeBackOrder);
+
+    generateAnchorsOnSide(fakeNodeObject.inEdges, fakeNodeObject.inAnchors, true);
+
+    for (const auto rawEdgeId : fakeNodeObject.outEdges)
+    {
+      auto &edge = raw_layout.rawEdges[rawEdgeId];
+      const auto edgeResId = registryDependencies[edge.carriedDeps.front()].resource;
+      if (edgeResId != ResourceId::Invalid)
+        edge.fromAnchor = resAnchors[edgeResId];
+      else
+        for (const auto inRawEdgeId : fakeNodeObject.inEdges)
+        {
+          const auto &inEdge = raw_layout.rawEdges[inRawEdgeId];
+          if (edge.carriedDeps.front() == inEdge.carriedDeps.front())
+          {
+            edge.fromAnchor = inEdge.toAnchor;
+            break;
+          }
+        }
+    }
+  }
+}
+
+
+void Visualizer::calculateObjectsSizes(RawLayout &raw_layout)
+{
+  TIME_PROFILE(calculate_objects_sizes);
+
+  const uint32_t objectsCount = raw_layout.rawObjects.size();
+  if (objectsCount == 0)
+    return;
+
+
+  const uint32_t userNodesCount = raw_layout.userNodeIds.size();
+  const uint32_t nodeBoxesCount = raw_layout.nodeBoxIds.size();
+  const uint32_t fakeNodesCount = objectsCount - raw_layout.outDeps.size();
+
+  const uint32_t userNodesIndexOffset = 0;
+  const uint32_t nodeBoxesIndexOffset = userNodesIndexOffset + userNodesCount;
+  const uint32_t fakeNodesIndexOffset = raw_layout.outDeps.size();
+
+
+  const auto &objects = raw_layout.rawObjects;
+  auto &objectsSizes = raw_layout.objectsSizes;
+  auto &objectsColumnSizes = raw_layout.objectsColumnSizes;
+
+  for (uint32_t userNodeIndex = 0; userNodeIndex < userNodesCount; ++userNodeIndex)
+  {
+    const auto &object = objects[userNodesIndexOffset + userNodeIndex];
+    const auto &node = userNodes[raw_layout.userNodeIds[userNodeIndex]];
+    const uint32_t maxAnchorsCount = max(object.inAnchors.size(), object.outAnchors.size());
+    const uint32_t maxHistDepCount = max(node.inHistDeps.size(), node.outHistDeps.size());
+
+    const float calcWidth = ImGui::CalcTextSize(getName(node.regId).data()).x + 2.f * NAMESPACE_BORDER_PADDING.x;
+    const float calcHeight =
+      NODE_Y_ANCHORS_START + 2.f * NODE_ANCHORS_MARGIN + 3.f * BASE_DEP_WIDTH * (maxAnchorsCount + 1 + maxHistDepCount);
+    objectsSizes[userNodesIndexOffset + userNodeIndex] =
+      ImMax(ImVec2{calcWidth, calcHeight}, ImVec2{NODE_MIN_X_SIZE, NODE_MIN_Y_SIZE});
+  }
+
+  for (uint32_t nodeBoxIndex = 0; nodeBoxIndex < nodeBoxesCount; ++nodeBoxIndex)
+  {
+    const auto &box = nodeBoxes[raw_layout.nodeBoxIds[nodeBoxIndex]];
+    objectsSizes[nodeBoxesIndexOffset + nodeBoxIndex] = box.rect.size;
+  }
+
+  for (uint32_t fakeNodeIndex = 0; fakeNodeIndex < fakeNodesCount; ++fakeNodeIndex)
+  {
+    const auto &object = objects[fakeNodesIndexOffset + fakeNodeIndex];
+    const uint32_t maxAnchorsCount = max(object.inAnchors.size(), object.outAnchors.size());
+    objectsSizes[fakeNodesIndexOffset + fakeNodeIndex] =
+      ImVec2{0.f, 2.f * NODE_ANCHORS_MARGIN + 3.f * BASE_DEP_WIDTH * maxAnchorsCount};
+  }
+
+
+  const auto &ranks = raw_layout.layouterResult.nodeLayout;
+  const uint32_t rankCount = ranks.size();
+
+  dag::Vector<float, framemem_allocator> columnSizes(rankCount, 0.f);
+  for (uint32_t rank = 0; rank < rankCount; ++rank)
+    for (const uint32_t objIndex : ranks[rank])
+      columnSizes[rank] = max(columnSizes[rank], objectsSizes[objIndex].x);
+
+  for (uint32_t rank = 0; rank < rankCount; ++rank)
+    for (const uint32_t objIndex : ranks[rank])
+      objectsColumnSizes[objIndex] = columnSizes[rank];
+}
+
+
+void Visualizer::calculateObjectsPositions(RawLayout &raw_layout)
+{
+  TIME_PROFILE(calculate_objects_positions);
+
+  const uint32_t objectsCount = raw_layout.rawObjects.size();
+  if (objectsCount == 0)
+    return;
+
+
+  const uint32_t fakeNodesIndexOffset = raw_layout.outDeps.size();
+
+  const auto &ranks = raw_layout.layouterResult.nodeLayout;
+  const uint32_t rankCount = ranks.size();
+  dag::Vector<float, framemem_allocator> columnSizes(rankCount, 0.f);
+  for (uint32_t columnIndex = 0; columnIndex < rankCount; ++columnIndex)
+    columnSizes[columnIndex] = raw_layout.objectsColumnSizes[ranks[columnIndex][0]];
+
+  const auto &objects = raw_layout.rawObjects;
+  const auto &objectsSizes = raw_layout.objectsSizes;
+  auto &objectsOffsets = raw_layout.objectsOffsets;
+  const auto &edges = raw_layout.rawEdges;
+
+
+  // now, we calculate object offsets
+  {
+    // here we count how many edges are between each pair
+    // of adjacent columns, to make space between them wider if needed
+    {
+      dag::Vector<uint32_t, framemem_allocator> edgesBetween(rankCount, 0);
+      for (const uint32_t objIndex : ranks[0])
+        edgesBetween[0] = max(edgesBetween[0], objects[objIndex].outEdges.size());
+      for (uint32_t rank = 1; rank < rankCount; ++rank)
+        for (const uint32_t objIndex : ranks[rank])
+        {
+          edgesBetween[rank - 1] = max(edgesBetween[rank - 1], objects[objIndex].inEdges.size());
+          edgesBetween[rank] = max(edgesBetween[rank], objects[objIndex].outEdges.size());
+        }
+
+      float horOffset = 0.f;
+      float vertOffset = 0.f;
+      for (uint32_t rank = 0; rank < rankCount; ++rank)
+      {
+        const auto &column = ranks[rank];
+        vertOffset = 0.f;
+        for (const uint32_t objIndex : column)
+        {
+          objectsOffsets[objIndex] = ImVec2{horOffset, vertOffset};
+          vertOffset += objectsSizes[objIndex].y + OBJ_Y_BASE_MARGIN;
+        }
+        horOffset += columnSizes[rank] + OBJ_X_BASE_MARGIN * 0.1f * edgesBetween[rank];
+      }
+    }
+
+    // after that, we need move objects up and down in columns to straighten edges, connecting them,
+    // and lessen waves in long delendency lines
+    auto equalizeHeights = [&](const uint32_t left_idx, const uint32_t right_idx, const uint32_t left_rank, const uint32_t right_rank,
+                             bool forward) {
+      // choose which object/column to move and what target center Y to aim for
+      uint32_t rankToMove = 0;
+      uint32_t objToMove = 0;
+      uint32_t targetObj = 0;
+      if (forward)
+      {
+        rankToMove = right_rank;
+        objToMove = right_idx;
+        targetObj = left_idx;
+      }
+      else
+      {
+        rankToMove = left_rank;
+        objToMove = left_idx;
+        targetObj = right_idx;
+      }
+
+      // find position of objToMove in its column
+      const auto &column = raw_layout.layouterResult.nodeLayout[rankToMove];
+      uint32_t objToMoveSubrank = 0;
+      for (uint32_t subrank = 0; subrank < column.size(); ++subrank)
+        if (column[subrank] == objToMove)
+        {
+          objToMoveSubrank = subrank;
+          break;
+        }
+
+      // place the object at the target position
+      const float targetCenterY = raw_layout.objectsOffsets[targetObj].y + raw_layout.objectsSizes[targetObj].y / 2.f;
+      raw_layout.objectsOffsets[objToMove].y = targetCenterY - raw_layout.objectsSizes[objToMove].y / 2.f;
+
+      // push objects below down if they would overlap
+      for (uint32_t objIndex = objToMoveSubrank + 1; objIndex < column.size(); ++objIndex)
+      {
+        const uint32_t prev = column[objIndex - 1];
+        const uint32_t cur = column[objIndex];
+        const float minY = raw_layout.objectsOffsets[prev].y + raw_layout.objectsSizes[prev].y + OBJ_Y_BASE_MARGIN;
+        if (raw_layout.objectsOffsets[cur].y < minY)
+          raw_layout.objectsOffsets[cur].y = minY;
+        else
+          break;
+      }
+
+      // push objects above up if they would overlap
+      for (uint32_t objIndex = objToMoveSubrank; objIndex > 0; --objIndex)
+      {
+        const uint32_t cur = column[objIndex - 1];
+        const uint32_t next = column[objIndex];
+        const float maxY = raw_layout.objectsOffsets[next].y - raw_layout.objectsSizes[cur].y - OBJ_Y_BASE_MARGIN;
+        if (raw_layout.objectsOffsets[cur].y > maxY)
+          raw_layout.objectsOffsets[cur].y = maxY;
+        else
+          break;
+      }
+    };
+
+    // forward and backward run, trying to equalize fake nodes to keep long dependency edges straight
+    for (uint32_t rank = 0; rank < rankCount - 1; ++rank)
+      for (const auto from : ranks[rank])
+        for (const auto rawEdgeId : objects[from].outEdges)
+        {
+          const NodeIdx to = edges[rawEdgeId].to;
+          if (from >= fakeNodesIndexOffset && to >= fakeNodesIndexOffset)
+          {
+            equalizeHeights(from, to, rank, rank + 1, true);
+            break;
+          }
+        }
+    for (uint32_t rank = rankCount - 1; rank > 0; --rank)
+      for (const auto to : ranks[rank])
+        for (const auto rawEdgeId : objects[to].inEdges)
+        {
+          const NodeIdx from = edges[rawEdgeId].from;
+          if (from >= fakeNodesIndexOffset && to >= fakeNodesIndexOffset)
+          {
+            equalizeHeights(from, to, rank - 1, rank, false);
+            break;
+          }
+        }
+  }
+
+
+  // after, we shift all objects, so they all will have positive offsets
+  {
+    ImVec2 leftTop = objectsOffsets.front();
+    ImVec2 rightBottom = leftTop;
+    for (uint32_t objectIndex = 0; objectIndex < objectsCount; ++objectIndex)
+    {
+      leftTop = ImMin(leftTop, objectsOffsets[objectIndex]);
+      rightBottom = ImMax(rightBottom, objectsOffsets[objectIndex] + objectsSizes[objectIndex]);
+    }
+    raw_layout.size = rightBottom - leftTop + NAMESPACE_BORDER_PADDING * 2;
+
+    for (uint32_t objectIndex = 0; objectIndex < objectsCount; ++objectIndex)
+      objectsOffsets[objectIndex] += NAMESPACE_BORDER_PADDING - leftTop;
+  }
+}
+
+void Visualizer::calculateAnchorsPositions(RawLayout &raw_layout)
+{
+  TIME_PROFILE(calculate_anchors_positions);
+
+  const uint32_t objectsCount = raw_layout.rawObjects.size();
+  if (objectsCount == 0)
+    return;
+
+
+  const uint32_t userNodesCount = raw_layout.userNodeIds.size();
+  const uint32_t nodeBoxesCount = raw_layout.nodeBoxIds.size();
+  const uint32_t serviceNodesCount = raw_layout.outDeps.size() - (userNodesCount + nodeBoxesCount);
+
+  const uint32_t userNodesIndexOffset = 0;
+  const uint32_t nodeBoxesIndexOffset = userNodesIndexOffset + userNodesCount;
+  const uint32_t serviceNodesIndexOffset = nodeBoxesIndexOffset + nodeBoxesCount;
+
+
+  const auto &objects = raw_layout.rawObjects;
+  const auto &objectsOffsets = raw_layout.objectsOffsets;
+  const auto &objectsSizes = raw_layout.objectsSizes;
+  auto &anchors = raw_layout.anchors;
+
+  for (uint32_t objectIndex = 0; objectIndex < objectsCount; ++objectIndex)
+  {
+    const auto &object = objects[objectIndex];
+    const ImVec2 offset = objectsOffsets[objectIndex];
+    const ImVec2 size = objectsSizes[objectIndex];
+    const float anchorsStartOffset = NODE_Y_ANCHORS_START + NODE_ANCHORS_MARGIN + 1.5f * BASE_DEP_WIDTH;
+
+    float vertOffset = anchorsStartOffset;
+    for (const auto anchorId : object.inAnchors)
+    {
+      anchors[anchorId] = {offset.x, offset.y + vertOffset};
+      vertOffset += 3.f * BASE_DEP_WIDTH;
+    }
+    vertOffset = anchorsStartOffset;
+    for (const auto anchorId : object.outAnchors)
+    {
+      anchors[anchorId] = {offset.x + size.x, offset.y + vertOffset};
+      vertOffset += 3.f * BASE_DEP_WIDTH;
+    }
+  }
+
+  if (serviceNodesCount != 0)
+  {
+    const auto &edges = raw_layout.rawEdges;
+    const float rightBorder = raw_layout.size.x;
+
+    for (const auto rawEdgeId : objects[serviceNodesIndexOffset + 0].outEdges)
+    {
+      const auto &edge = edges[rawEdgeId];
+      anchors[edge.fromAnchor] = Anchor{0.f, anchors[edge.toAnchor].y};
+    }
+
+    for (const auto rawEdgeId : objects[serviceNodesIndexOffset + 1].inEdges)
+    {
+      const auto &edge = edges[rawEdgeId];
+      anchors[edge.toAnchor] = Anchor{rightBorder, anchors[edge.fromAnchor].y};
+    }
+  }
+}
+
+void Visualizer::calculateNodeRectangles(CanvasLayout &layout, const RawLayout &raw_layout)
+{
+  TIME_PROFILE(calculate_node_rectangles);
+
+  const uint32_t objectsCount = raw_layout.rawObjects.size();
+  if (objectsCount == 0)
+  {
+    layout.size = NAMESPACE_BORDER_PADDING * 2;
+    return;
+  }
+
+  auto &objectsOffsets = raw_layout.objectsOffsets;
+  auto &objectsSizes = raw_layout.objectsSizes;
+
+  layout.size = raw_layout.size;
+  for (uint32_t userNodeIndex = 0; userNodeIndex < raw_layout.userNodeIds.size(); ++userNodeIndex)
+    layout.nodes[raw_layout.userNodeIds[userNodeIndex]] = {objectsOffsets[userNodeIndex], objectsSizes[userNodeIndex]};
+}
+
+void Visualizer::calculateEdgeSplines(CanvasLayout &layout, const RawLayout &raw_layout)
+{
+  TIME_PROFILE(calculate_edge_splines);
+
+  const uint32_t edgesCount = raw_layout.rawEdges.size();
+  if (edgesCount == 0)
+    return;
+
+
+  layout.edges.reserve(edgesCount);
+
+  uint32_t backEdgesDrawn = 0;
+  for (const auto &rawEdge : raw_layout.rawEdges)
+  {
+    auto [edgeId, edge] = layout.edges.appendNew();
+    edge.carriedDeps = rawEdge.carriedDeps;
+
+
+    ImVec2 leftEdgeAnchor = raw_layout.anchors[rawEdge.fromAnchor];
+    ImVec2 rightEdgeAnchor = raw_layout.anchors[rawEdge.toAnchor];
+
+    // if starting object is narrower that column it is in,
+    // we make additional spline to not collide with other objects in this column
+    // and move edge start to the column end
+    const NodeIdx from = rawEdge.from;
+    if (raw_layout.objectsSizes[from].x < raw_layout.objectsColumnSizes[from])
+    {
+      const ImVec2 anchorDelta = ImVec2{raw_layout.objectsColumnSizes[from] - raw_layout.objectsSizes[from].x, 0.f};
+      edge.splines.push_back({leftEdgeAnchor, leftEdgeAnchor, leftEdgeAnchor + anchorDelta, leftEdgeAnchor + anchorDelta});
+      leftEdgeAnchor += anchorDelta;
+    }
+
+    // if the start of the edge is to the left of the end, we draw regular spline
+    const float bezierOffset = abs(rightEdgeAnchor.x - leftEdgeAnchor.x) / 4;
+    if (leftEdgeAnchor.x <= rightEdgeAnchor.x)
+    {
+      edge.splines.push_back(
+        {leftEdgeAnchor, leftEdgeAnchor + ImVec2{bezierOffset, 0.f}, rightEdgeAnchor - ImVec2{bezierOffset, 0.f}, rightEdgeAnchor});
+    }
+    // but if the start of the edge is to the right of the end, we have backward edge
+    // in that case we make 3 splines, to guide edge over the other objects
+    else
+    {
+      const float horizontalOffset = bezierOffset * (backEdgesDrawn + 1);
+      const float verticalOffset = OBJ_Y_BASE_MARGIN * (backEdgesDrawn + 1);
+
+      edge.splines.push_back({
+        .P0 = leftEdgeAnchor,
+        .P1 = leftEdgeAnchor + ImVec2{horizontalOffset, 0.f},
+        .P2 = ImVec2{leftEdgeAnchor.x + horizontalOffset, -verticalOffset},
+        .P3 = ImVec2{leftEdgeAnchor.x, -verticalOffset},
+      });
+      edge.splines.push_back({
+        .P0 = ImVec2{leftEdgeAnchor.x, -verticalOffset},
+        .P1 = ImVec2{leftEdgeAnchor.x, -verticalOffset},
+        .P2 = ImVec2{rightEdgeAnchor.x, -verticalOffset},
+        .P3 = ImVec2{rightEdgeAnchor.x, -verticalOffset},
+      });
+      edge.splines.push_back({
+        .P0 = ImVec2{rightEdgeAnchor.x, -verticalOffset},
+        .P1 = ImVec2{rightEdgeAnchor.x - horizontalOffset, -verticalOffset},
+        .P2 = rightEdgeAnchor - ImVec2{horizontalOffset, 0.f},
+        .P3 = rightEdgeAnchor,
+      });
+
+      ++backEdgesDrawn;
+    }
+  }
+}
+
+
+void Visualizer::drawTree(const dafg::NameSpaceNameId &namespace_id, int &res_idx, int &counter, bool &selected_by_mouse,
+  ImGuiDagor::ComboInfo &info, eastl::string &input, float text_width, float button_offset)
+{
+  const auto &knownNames = registry.knownNames;
+  auto &nsContent = nameSpaces[namespace_id];
+
+  eastl::string imguiLabel = namespace_id == knownNames.root() ? "" : knownNames.getShortName(namespace_id);
+  const float freeWidthAfterText = eastl::max(text_width - ImGui::GetCursorPosX() - ImGui::CalcTextSize(imguiLabel.data()).x, 0.f);
+  const int spaceCount = static_cast<int>(freeWidthAfterText / ImGui::CalcTextSize(" ").x);
+  imguiLabel.append(spaceCount, ' ');
+  imguiLabel.append_sprintf("##ns_%d", static_cast<int>(namespace_id));
+
+  const ImGuiTreeNodeFlags commonFlags = ImGuiTreeNodeFlags_SpanLabelWidth | ImGuiTreeNodeFlags_FramePadding;
+  const ImGuiTreeNodeFlags subTreeFlags = ImGuiTreeNodeFlags_DefaultOpen | commonFlags;
+
+  const bool active = ImGui::GetStateStorage()->GetInt(ImGui::GetID(imguiLabel.data()), 1) != 0;
+  const uint16_t totalResourcesInSubtree = nsContent.totalResourcesInSubtree;
+  const bool needOpenSubTree = counter <= res_idx && res_idx < counter + totalResourcesInSubtree; // to show focused res
+  bool closeSubTree = !active && needOpenSubTree;
+  if (!active && needOpenSubTree)
+    ImGui::TreeNodeSetOpen(ImGui::GetID(imguiLabel.data()), true);
+
+  const bool opened = ImGui::TreeNodeEx(imguiLabel.data(), subTreeFlags);
+  const bool hiddenNameSpace = nsContent.visibleResourcesInSubtree == 0;
+  eastl::string buttonLabel = hiddenNameSpace ? "Show" : "Hide";
+  buttonLabel.append_sprintf("##bns_%d", static_cast<int>(namespace_id));
+  ImGui::SameLine();
+  ImGui::SetCursorPosX(button_offset);
+  if (ImGui::Button(buttonLabel.data()))
+  {
+    auto cit = nsResNameIds.begin() + counter;
+    for (uint16_t i = 0; i < totalResourcesInSubtree; ++i, ++cit)
+      userResources[getRepresentId(*cit)].hidden = !hiddenNameSpace;
+    if (hiddenNameSpace)
+      showResourcesInNameSpace(namespace_id);
+    else
+      hideResourcesInNameSpace(namespace_id);
+  }
+
+  if (opened)
+  {
+    for (const auto &childNS : nsContent.subNameSpaces)
+      if (!selected_by_mouse)
+        drawTree(childNS, res_idx, counter, selected_by_mouse, info, input, text_width, button_offset);
+    ImGui::TreePop();
+    if (closeSubTree)
+      ImGui::TreeNodeSetOpen(ImGui::GetID(imguiLabel.data()), false);
+  }
+  else
+  {
+    counter += totalResourcesInSubtree;
+    return;
+  }
+
+  const ImGuiTreeNodeFlags leafFlags = commonFlags | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_Leaf;
+  for (const auto &resData : nsContent.resources)
+  {
+    const bool isSelected = res_idx == counter;
+    const bool hidden = userResources[getRepresentId(resData)].hidden;
+    if (isSelected && (ImGui::IsWindowAppearing() || info.selectionChanged))
+      ImGui::SetScrollHereY();
+    if (isSelected && info.arrowScroll)
+      ImGui::SetScrollHereY();
+
+    eastl::string imguiLabel = knownNames.getShortName(resData);
+    const float freeWidthAfterText = eastl::max(text_width - ImGui::GetCursorPosX() - ImGui::CalcTextSize(imguiLabel.data()).x, 0.f);
+    const int spaceCount = static_cast<int>(freeWidthAfterText / ImGui::CalcTextSize(" ").x);
+    imguiLabel.append(spaceCount, ' ');
+    imguiLabel.append_sprintf("##res_%d", static_cast<int>(resData));
+
+    const ImGuiTreeNodeFlags selectedFlag = isSelected ? ImGuiTreeNodeFlags_Selected : ImGuiTreeNodeFlags_None;
+    if (ImGui::TreeNodeEx(imguiLabel.data(), leafFlags | selectedFlag))
+    {
+      if (!hidden && ImGui::IsItemClicked(ImGuiMouseButton_Left))
+      {
+        info.selectionChanged = res_idx != counter;
+        res_idx = counter;
+        input = knownNames.getName(resData);
+        ImGui::CloseCurrentPopup();
+        selected_by_mouse = true;
+      }
+      if (hidden && isSelected)
+      {
+        info.selectionChanged = true;
+        res_idx = -1;
+        input.clear();
+        selected_by_mouse = true;
+      }
+    }
+
+    eastl::string buttonLabel = hidden ? "Show" : "Hide";
+    buttonLabel.append_sprintf("##bres_%d", static_cast<int>(resData));
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(button_offset);
+    if (ImGui::Button(buttonLabel.data()))
+    {
+      userResources[getRepresentId(resData)].hidden = !userResources[getRepresentId(resData)].hidden;
+      dafg::NameSpaceNameId updatedNS = namespace_id;
+      bool rootNameSpace = false;
+      while (!rootNameSpace)
+      {
+        nameSpaces[updatedNS].visibleResourcesInSubtree += hidden ? 1 : -1;
+        rootNameSpace = updatedNS == registry.knownNames.root();
+        updatedNS = registry.knownNames.getParent(updatedNS);
+      }
+    }
+
+    ++counter;
+  }
+}
+
+bool Visualizer::treeWithFilter(const char *label, const dag::Vector<eastl::string_view> &data, int &current_idx, eastl::string &input,
+  bool return_on_arrows, const char *hint, ImGuiComboFlags flags)
+{
+  if (data.empty())
+  {
+    ImGui::TextColored({1, 1, 0, 1}, "No resources");
+    return false;
+  }
+
+  float textWidth = 0.f;
+  eastl::for_each(data.begin(), data.end(),
+    [&max = textWidth](const auto &b) { max = eastl::max(max, ImGui::CalcTextSize(b.data()).x); });
+  const float buttonWidth = eastl::max(ImGui::CalcTextSize("Show").x, ImGui::CalcTextSize("Hide").x);
+  const float padding = ImGui::GetStyle().FramePadding.x + ImGui::GetStyle().WindowPadding.x;
+  const float width = textWidth + buttonWidth + ImGui::GetStyle().ScrollbarSize + 2.0f * padding;
+
+  auto res = ImGuiDagor::BeginComboWithFilter(label, data, current_idx, input, width, hint, flags);
+
+  if (!res.has_value())
+    return false;
+
+  auto &info = res.value();
+
+  if (info.inputTextChanged && !info.arrowScroll)
+    ImGui::CloseCurrentPopup();
+
+  int counter = 0;
+  bool selectedByMouse = false;
+  const float buttonOffset =
+    ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ScrollbarSize - buttonWidth - ImGui::GetStyle().FramePadding.x;
+  drawTree(registry.knownNames.root(), current_idx, counter, selectedByMouse, info, input, textWidth, buttonOffset);
+  info.arrowScroll = info.arrowScroll && return_on_arrows;
+  return ImGuiDagor::EndComboWithFilter(label, data, current_idx, input, info, selectedByMouse);
+}
+
+} // namespace visualization::usergraph
+
+} // namespace dafg
+
+static bool dafg_show_fg_tex_console_handler(const char *argv[], int argc)
+{
+  if (argc < 1)
+    return false;
+  int found = 0;
+  CONSOLE_CHECK_NAME("dafg", "show_fg_tex", 1, DebugTexOverlay::MAX_CONSOLE_ARGS_CNT)
+  {
+    if (dafg::Runtime::isInitialized())
+    {
+      // TODO: awful disgusting hack, remove asap
+      auto &registry = dafg::Runtime::get().getInternalRegistry();
+      const auto &depData = dafg::Runtime::get().getDependencyData();
+
+      if (argc > 1)
+      {
+        // I don't care about perf here
+        eastl::string name = argv[1];
+        if (name[0] != '/')
+          name = "/" + name;
+
+        auto resId = registry.knownNames.getNameId<dafg::ResNameId>(name);
+        if (resId == dafg::ResNameId::Invalid)
+        {
+          console::print_d("daFG: resource %s not found.", name.c_str());
+          return found;
+        }
+
+        eastl::string concatenatedParams;
+        for (int i = 2; i < argc; ++i)
+        {
+          concatenatedParams += argv[i];
+          if (i + 1 < argc)
+            concatenatedParams += " ";
+        }
+        set_manual_showtex_params(concatenatedParams.c_str());
+
+        update_fg_debug_tex(Selection{ReadTimePoint{}, resId, false}, registry, depData);
+      }
+      else
+      {
+        update_fg_debug_tex({}, registry, depData);
+      }
+    }
+  }
+  return found;
+}
+
+REGISTER_CONSOLE_HANDLER(dafg_show_fg_tex_console_handler);

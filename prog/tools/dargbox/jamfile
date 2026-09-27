@@ -3,15 +3,14 @@ Location = prog/tools/dargbox ;
 
 #Config = rel ;
 include $(Root)/prog/tools/tools_setup.jam ;
-UseQuirrel = sq3r ;
+UseQuirrel = yes ;
 SqVarTrace ?= yes ;
-LinuxUseX11 = yes ;
+LinuxUseGUI = yes ;
 
 Config ?= dev ;
 TargetType  = exe ;
 
 Target      = tools/dargbox ;
-if $(Platform)-$(PlatformArch) = windows-x86_64 { Target = $(Target)-64 ; }
 if ! $(Platform) in windows linux { ReproducibleExeBuild = no ; }
 
 if $(Config) = rel { # this is only needed to build with warnings-as-errors
@@ -20,11 +19,14 @@ if $(Config) = rel { # this is only needed to build with warnings-as-errors
 
 
 OutDir = $(Root)/tools/dargbox ;
-if $(Platform) in android iOS { OutDir = $(OutDir)/$(LegacyPlatformSuffix) ; }
+# per-arch subdir (windows-x86_64, windows-arm64, linux-x86_64) so exe and
+# bundled dlls of different arches do not overwrite each other
+if $(Platform) in windows linux { OutDir = $(OutDir)/$(Platform)-$(PlatformArch) ; }
+else if $(Platform) in android iOS { OutDir = $(OutDir)/$(Platform) ; }
 
 if $(Platform) in windows linux { UseD3DMulti ?= yes ; }
 
-if $(Platform) in windows && ! $(PlatformArch) in arm64 {
+if $(Platform) in windows {
   VRDeviceSupport ?= yes ;
 }
 
@@ -103,8 +105,7 @@ UseProgLibs =
   gameLibs/quirrel/nestdb
   gameLibs/quirrel/udp
   gameLibs/quirrel/sqDataCache
-  gameLibs/quirrel/lastInputMonitor
-  gameLibs/ecs/input
+  gameLibs/quirrel/asyncRuntime
   engine/perfMon
   engine/consoleProc
   tools/libTools/util
@@ -114,7 +115,6 @@ UseProgLibs =
   3rdPartyLibs/image/jpeg-6b
   3rdPartyLibs/image/avif
   3rdPartyLibs/image/psdRead
-  3rdPartyLibs/lottie
 
   1stPartyLibs/daScript
 ;
@@ -126,8 +126,10 @@ if $(Platform) in windows {
     engine/drv/hid_joystick
     engine/drv/hid_dinput
     engine/drv/hid_gamepad_xinput
+    gameLibs/quirrel/win_registry
   ;
   include $(Root)/prog/engine/drv/drv3d_DX12/copy_bundles.jam ;
+  include $(Root)/prog/engine/drv/drv3d_commonCode/copy_bundles.jam ;
 }
 else if $(Platform) = linux {
   UseProgLibs +=
@@ -186,7 +188,7 @@ else if $(Platform) = iOS {
   BundleCopy = ;
 }
 else if $(Platform) = macOS {
-  OutDir = $(Root)/tools/dargbox/dargbox.app/Contents/MacOS ;
+  OutDir = $(Root)/tools/dargbox/dargbox-$(PlatformArch).app/Contents/MacOS ;
 
   Sources +=
     platform/macosx_main.mm
@@ -277,16 +279,14 @@ if ! $(Platform) in android nswitch {
   }
 }
 
-if $(Platform)-$(PlatformArch) = windows-x86 { UseMemoryDebugLevel = dbg ; }
+if $(Platform) = windows { UseMemoryDebugLevel = dbg ; }
 
 
-if $(VRDeviceSupport) = yes {
-  BundleCopy +=
-    @$(OpenXrSdkPath)/$(LegacyPlatformSuffix)/bin/openxr_loader.dll openxr_loader.dll
-    @$(OpenXrSdkPath)/$(LegacyPlatformSuffix)/bin/openxr_loader.pdb openxr_loader.pdb
-  ;
-}
+
+if $(VRDeviceSupport) = yes { include $(Root)/prog/engine/drv/vr_device/bundle.jam ; }
+
 if [ GLOB $(Root)/prog/gameLibs/quirrel/matchingModule : jamfile ] {
+  HaveStunChecker = no ;
   UseProgLibs += gameLibs/matchingClient gameLibs/quirrel/matchingModule 1stPartyLibs/matching ;
   CPPopt += -DHAS_MATCHING_MODULE ;
 }

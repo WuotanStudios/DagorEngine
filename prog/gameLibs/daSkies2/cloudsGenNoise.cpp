@@ -7,8 +7,9 @@
 
 #include <drv/3d/dag_rwResource.h>
 #include <drv/3d/dag_draw.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <drv/3d/dag_lock.h>
-#include <drv/3d/dag_info.h>
+#include <drv/3d/dag_texture.h>
 
 #include <util/dag_convar.h>
 #include <osApiWrappers/dag_miscApi.h>
@@ -31,20 +32,21 @@ void GenNoise::close()
   resCloud2.close();
 
   cloudsCurl2d.close();
+  cloudsCurl3d.close();
   closeCompressor();
 }
 
-bool GenNoise::loadVolmap(const char *resname, int resolution, SharedTexHolder &tex)
+bool GenNoise::loadVolmap(const char *resname, int resolution, SharedTexWithShaderVar &tex)
 {
   tex.close();
 
   if (compressSupported)
-    tex = SharedTexHolder(dag::get_tex_gameres(String(128, "%s_%d", resname, resolution)), resname);
+    tex = SharedTexWithShaderVar(dag::get_tex_gameres(String(128, "%s_%d", resname, resolution)), resname);
 
   if (!tex) // There may not be a compressed variant, in which case load the uncompressed variant, even if compression is supported.
   {
     tex.close();
-    tex = SharedTexHolder(dag::get_tex_gameres(String(128, "%s_%d_raw", resname, resolution)), resname);
+    tex = SharedTexWithShaderVar(dag::get_tex_gameres(String(128, "%s_%d_raw", resname, resolution)), resname);
   }
 
   if (!tex)
@@ -97,21 +99,43 @@ void GenNoise::init()
     cloud2.setVar();
     initCompressor();
   }
-  ShaderGlobal::set_sampler(::get_shader_variable_id("gen_cloud_detail_samplerstate"), d3d::request_sampler({}));
-  ShaderGlobal::set_sampler(::get_shader_variable_id("gen_cloud_shape_samplerstate"), d3d::request_sampler({}));
 
   if (!curlRendered)
   {
-    if (VoltexRenderer::is_compute_supported())
-      genCurl2d.reset(new_compute_shader("gen_curl_clouds_2d", true));
+    const bool computeSupported = VoltexRenderer::is_compute_supported();
+    const bool copyConversion = d3d::get_driver_desc().caps.hasResourceCopyConversion;
+    genCurl2d.reset();
+    genCurl2dCompressed.reset();
+    if (computeSupported)
+    {
+      if (copyConversion && d3d::check_texformat(TEXFMT_BC5S))
+        genCurl2dCompressed.reset(new_compute_shader("gen_curl_clouds_2d_compressed", true));
+      if (!genCurl2dCompressed)
+        genCurl2d.reset(new_compute_shader("gen_curl_clouds_2d", true));
+    }
     else
       genCurl2dPs.init("gen_curl_clouds_2d_ps");
     cloudsCurl2d.close();
-    cloudsCurl2d = dag::create_tex(0, CLOUD_CURL_RES, CLOUD_CURL_RES, TEXFMT_R8G8S | (genCurl2d ? TEXCF_UNORDERED : TEXCF_RTARGET), 1,
-      "clouds_curl_2d");
+    const uint32_t curlFmt =
+      genCurl2dCompressed ? TEXFMT_BC5S | TEXCF_UPDATE_DESTINATION : TEXFMT_R8G8S | (genCurl2d ? TEXCF_UNORDERED : TEXCF_RTARGET);
+    cloudsCurl2d = dag::create_tex(0, CLOUD_CURL_RES, CLOUD_CURL_RES, curlFmt, 1, "clouds_curl_2d", RESTAG_DASKIES2);
     if (!cloudsCurl2d)
       return;
-    ShaderGlobal::set_sampler(::get_shader_variable_id("clouds_curl_2d_samplerstate"), d3d::request_sampler({}));
+    genCurl3dCompressed.reset();
+    if (computeSupported && copyConversion && d3d::check_voltexformat(TEXFMT_BC5S))
+      genCurl3dCompressed.reset(new_compute_shader("gen_curl_clouds_3d_compressed", true));
+    if (!genCurl3dCompressed)
+      genCurl3d.init("gen_curl_clouds_3d", "gen_curl_clouds_3d_ps");
+    cloudsCurl3d.close();
+    const int clouds_erosion_flowVarId = get_shader_variable_id("clouds_erosion_flow", true);
+    if (!ShaderGlobal::is_var_assumed(clouds_erosion_flowVarId) || ShaderGlobal::get_interval_assumed_value(clouds_erosion_flowVarId))
+    {
+      if (genCurl3dCompressed)
+        cloudsCurl3d = dag::create_voltex(CLOUD_CURL_3D_RES, CLOUD_CURL_3D_RES, CLOUD_CURL_3D_RES,
+          TEXFMT_BC5S | TEXCF_UPDATE_DESTINATION, 1, "clouds_curl_3d", RESTAG_DASKIES2);
+      else
+        genCurl3d.initVoltex(cloudsCurl3d, CLOUD_CURL_3D_RES, CLOUD_CURL_3D_RES, CLOUD_CURL_3D_RES, TEXFMT_R8G8S, 1, "clouds_curl_3d");
+    }
   }
 }
 
@@ -150,10 +174,10 @@ void GenNoise::initCompressor()
   cloud1Compressed.close();
   cloud2Compressed.close();
   auto cflg = TEXCF_UPDATE_DESTINATION | TEXFMT_ATI1N | CLOUDS_ESRAM_ONLY;
-  cloud1Compressed =
-    dag::create_voltex(shapeRes, shapeRes, shapeRes / 4, cflg, get_blocked_mips(cloud1), "gen_cloud_shape_compressed");
-  cloud2Compressed =
-    dag::create_voltex(detailRes, detailRes, detailRes, cflg, get_blocked_mips(cloud2), "gen_cloud_detail_compressed");
+  cloud1Compressed = dag::create_voltex(shapeRes, shapeRes, shapeRes / 4, cflg, get_blocked_mips(cloud1), "gen_cloud_shape_compressed",
+    RESTAG_DASKIES2);
+  cloud2Compressed = dag::create_voltex(detailRes, detailRes, detailRes, cflg, get_blocked_mips(cloud2), "gen_cloud_detail_compressed",
+    RESTAG_DASKIES2);
 
   compress3D.init("compress_voltex_bc4_cs", "compress_voltex_bc4_ps");
 }
@@ -176,17 +200,19 @@ void GenNoise::compressBC4(const ManagedTex &tex, const ManagedTex &dest)
   TextureInfo ti;
   tex->getinfo(ti);
   ShaderGlobal::set_texture(compress_voltex_bc4_sourceVarId, tex);
-  ShaderGlobal::set_sampler(compress_voltex_bc4_source_samplerstateVarId, d3d::request_sampler({}));
   for (int mips_count = dest->level_count(), i = 0; i < mips_count; ++i)
   {
     tex->texmiplevel(i, i);
 
     const int w = ti.w >> i, h = ti.h >> i, d = ti.d >> i;
-    compress3D.render(buffer, 0, IPoint3(w, h, d));
+    G_ASSERTF((w % 4) == 0 && (h % 4) == 0, "BC4 compress mip %d is %dx%d: XY must be a multiple of 4", i, w, h);
+    const int blockW = max(1, w / 4), blockH = max(1, h / 4);
+    // BC4 packs 4x4 texel blocks, one CS thread per block: dispatch over block dims, not source dims
+    compress3D.render(buffer, 0, IPoint3(blockW, blockH, d));
     d3d::resource_barrier({buffer.getVolTex(), RB_RO_COPY_SOURCE, 0, 0});
-    dest->updateSubRegion(buffer.getVolTex(), 0, 0, 0, 0, // source mip, x,y,z
-      max(1, w / 4), max(1, h / 4), d,                    // width x height x depth
-      i, 0, 0, 0);                                        // dest mip, x,y,z
+    d3d::update_sub_region(buffer.getVolTex(), 0, 0, 0, 0, // source tex, mip, x,y,z
+      blockW, blockH, d,                                   // width x height x depth
+      dest.getBaseTex(), i, 0, 0, 0);                      // dest tex, mip, x,y,z
   }
   tex->texmiplevel(-1, -1);
   ShaderElement::invalidate_cached_state_block();
@@ -205,7 +231,26 @@ bool GenNoise::renderCurl()
 
   {
     TIME_D3D_PROFILE(cloud_curl2d);
-    if (genCurl2d)
+    if (genCurl2dCompressed)
+    {
+      const int blocksRes = CLOUD_CURL_RES / 4;
+      UniqueTex curlBlocks =
+        dag::create_tex(0, blocksRes, blocksRes, TEXFMT_A32B32G32R32UI | TEXCF_UNORDERED, 1, "clouds_curl_2d_blocks");
+      if (!curlBlocks)
+      {
+        LOGERR_ONCE("clouds_curl_2d_blocks texture was not created");
+        return false;
+      }
+      {
+        // threads cover texels: each thread evaluates one curl texel into groupshared,
+        // then the first threads of the group each pack one 4x4-texel BC5S block
+        STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 0, VALUE, 0, 0), curlBlocks.getTex2D());
+        genCurl2dCompressed->dispatchThreads(CLOUD_CURL_RES, CLOUD_CURL_RES, 1);
+      }
+      d3d::resource_barrier({curlBlocks.getTex2D(), RB_RO_COPY_SOURCE, 0, 0});
+      d3d::update_sub_region(curlBlocks.getTex2D(), 0, 0, 0, 0, blocksRes, blocksRes, 1, cloudsCurl2d.getBaseTex(), 0, 0, 0, 0);
+    }
+    else if (genCurl2d)
     {
       STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 0, VALUE, 0, 0), cloudsCurl2d.getTex2D());
       genCurl2d->dispatchThreads(CLOUD_CURL_RES, CLOUD_CURL_RES, 1);
@@ -213,11 +258,36 @@ bool GenNoise::renderCurl()
     else
     {
       SCOPE_RENDER_TARGET;
-      d3d::set_render_target(cloudsCurl2d.getTex2D(), 0);
+      d3d::set_render_target({}, DepthAccess::RW, {{cloudsCurl2d.getTex2D(), 0, 0}});
       genCurl2dPs.getElem()->setStates();
       d3d::draw(PRIM_TRILIST, 0, 1);
     }
     d3d::resource_barrier({cloudsCurl2d.getTex2D(), RB_RO_SRV | RB_STAGE_COMPUTE | RB_STAGE_PIXEL, 0, 0});
+  }
+  if (cloudsCurl3d)
+  {
+    TIME_D3D_PROFILE(cloud_curl3d);
+    if (genCurl3dCompressed)
+    {
+      const int blocksRes = CLOUD_CURL_3D_RES / 4;
+      UniqueTex curlBlocks = dag::create_voltex(blocksRes, blocksRes, CLOUD_CURL_3D_RES, TEXFMT_A32B32G32R32UI | TEXCF_UNORDERED, 1,
+        "clouds_curl_3d_blocks");
+      if (!curlBlocks)
+      {
+        LOGERR_ONCE("clouds_curl_3d_blocks texture was not created");
+        return false;
+      }
+      {
+        STATE_GUARD_NULLPTR(d3d::set_rwtex(STAGE_CS, 0, VALUE, 0, 0), curlBlocks.getVolTex());
+        genCurl3dCompressed->dispatchThreads(CLOUD_CURL_3D_RES, CLOUD_CURL_3D_RES, CLOUD_CURL_3D_RES);
+      }
+      d3d::resource_barrier({curlBlocks.getVolTex(), RB_RO_COPY_SOURCE, 0, 0});
+      d3d::update_sub_region(curlBlocks.getVolTex(), 0, 0, 0, 0, blocksRes, blocksRes, CLOUD_CURL_3D_RES, cloudsCurl3d.getBaseTex(), 0,
+        0, 0, 0);
+    }
+    else
+      genCurl3d.render(cloudsCurl3d);
+    d3d::resource_barrier({cloudsCurl3d.getVolTex(), RB_RO_SRV | RB_STAGE_COMPUTE | RB_STAGE_PIXEL, 0, 0});
   }
   curlRendered = true;
   return true;
@@ -230,7 +300,6 @@ void GenNoise::generateMips3d(const ManagedTex &tex)
   tex->getinfo(ti);
   ShaderGlobal::set_int(clouds_gen_mips_3d_one_layerVarId, 0);
   ShaderGlobal::set_texture(clouds_gen_mips_3d_sourceVarId, tex.getTexId());
-  ShaderGlobal::set_sampler(clouds_gen_mips_3d_source_samplerstateVarId, d3d::request_sampler({}));
   for (int mips_count = tex->level_count(), i = 1; i < mips_count; ++i)
   {
     d3d::resource_barrier({tex.getVolTex(), RB_RO_SRV | RB_STAGE_PIXEL | RB_STAGE_COMPUTE, (unsigned)(i - 1), 1});
@@ -344,4 +413,5 @@ void GenNoise::setVars()
   }
 
   cloudsCurl2d.setVar();
+  cloudsCurl3d.setVar();
 }

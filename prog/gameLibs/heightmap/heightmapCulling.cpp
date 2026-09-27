@@ -17,12 +17,12 @@ Point2 HeightmapHeightCulling::generateLodPoint(int offset, int i, int j, const 
   return result;
 }
 
-void HeightmapHeightCulling::updateMinMaxHeights(HeightmapHandler *handler, const IBBox2 &ib)
+void HeightmapHeightCulling::updateMinMaxHeights(IHeightmapHandler *handler, const IBBox2 &ib)
 {
   displacementUpwardMaxOffset = handler->getMaxUpwardDisplacement();
   displacementDownwardMaxOffset = handler->getMaxDownwardDisplacement();
-
-  IBBox2 updateBox = {ib[0] / chunkSizeInTexels, ib[1] / chunkSizeInTexels + IPoint2(1, 1)};
+  IBBox2 updateBox = {div((ib[0] * HEIGHT_CULLING_BUFFER_SIZE), handler->getHeightmapSize()),
+    div(((ib[1] + IPoint2(1, 1)) * HEIGHT_CULLING_BUFFER_SIZE), handler->getHeightmapSize()) + IPoint2(1, 1)};
   updateBox[1] = min(updateBox[1], IPoint2(HEIGHT_CULLING_BUFFER_SIZE, HEIGHT_CULLING_BUFFER_SIZE));
   // fill lod 0
   for (int j = updateBox[0].y; j < updateBox[1].y; j++)
@@ -58,17 +58,16 @@ void HeightmapHeightCulling::updateMinMaxHeights(HeightmapHandler *handler, cons
   absMax = -minMaxHeights[lodOffsets[HEIGHT_CULLING_LOD_COUNT - 1]].y;
 }
 
-bool HeightmapHeightCulling::init(HeightmapHandler *handler)
+bool HeightmapHeightCulling::init(IHeightmapHandler *handler)
 {
   if (handler == NULL)
   {
     return false;
   }
 
-  G_ASSERT(handler->getHeightmapSizeX() == handler->getHeightmapSizeY());
+  G_ASSERT(handler->getHeightmapSize().x == handler->getHeightmapSize().y);
 
-  hmapSize = handler->getHeightmapCellSize() * (float)handler->getHeightmapSizeX();
-  chunkSizeInTexels = max<int>(1, (handler->getHeightmapSizeX() + HEIGHT_CULLING_BUFFER_SIZE - 1) / HEIGHT_CULLING_BUFFER_SIZE);
+  hmapSize = handler->getHeightmapCellSize() * (float)handler->getHeightmapSize().x;
   chunkSize = hmapSize / (float)HEIGHT_CULLING_BUFFER_SIZE;
 
   arraySize = 0;
@@ -86,7 +85,7 @@ bool HeightmapHeightCulling::init(HeightmapHandler *handler)
 
   origin = Point2::xz(handler->getHeightmapOffset());
 
-  updateMinMaxHeights(handler, IBBox2{{0, 0}, {handler->getHeightmapSizeX(), handler->getHeightmapSizeY()}});
+  updateMinMaxHeights(handler, IBBox2{{0, 0}, {handler->getHeightmapSize().x, handler->getHeightmapSize().y}});
   return true;
 }
 

@@ -28,7 +28,17 @@ rule ProcessCompileTarget
   }
   if $(CheckOnly) != yes { _CONFIG_OPT += -g ; }
 
+  if $(UseWholeOpt) != no {
+    if $(UseWholeOpt) = yes { _CONFIG_OPT += -flto=thin ; }
+    else { _CONFIG_OPT += -flto=$(UseWholeOpt) ; } # e.g. full
+    if $(UseWholeOptDevirt) = yes { _CONFIG_OPT += -fwhole-program-vtables ; }
+  }
+
   _CPP_OPT = "-I "$(AddIncludes) $(_CONFIG_OPT) $(_SUPPRESS_OPT) $(CPPopt) $(GlobalCPPopt) ;
+
+  if $(StrictCompile) = yes {
+    if ! [ MATCH /(3rdPartyLibs)/ : $(Location) ] { _CPP_OPT += -Wunused-lambda-capture -Wrange-loop-construct -Werror=unused-lambda-capture -Werror=range-loop-construct ; }
+  }
 
   $(Target)__CPP_OPT =  -include memory/dag_memBase.h $(_CPP_OPT) ;
   $(Target)__C_OPT   = $(Copt) $(_CPP_OPT) ;
@@ -41,7 +51,7 @@ if $(OS) in LINUX MACOSX {
   rule CheckHeaders
   {
     Depends $(<) : $(>) ;
-    NoCare $(>) ; # tolerant to .d absence
+    if $(StrictHeaderDeps) != yes || ! [ GLOB $(<:D) : $(<:D=) ] { NoCare $(>) ; } # tolerant to .d absence (also on fresh builds when .obj missing too)
     NOUPDATE $(>) ; # tolerant to .d timestamp
 
     # scan line for header, skipping any ../ at the beginning [will be prefixed with $(Root)]
@@ -49,11 +59,11 @@ if $(OS) in LINUX MACOSX {
                         ]*([^ \\\
                         ]+)[ \\\
                         ]" ;
-    HDRRULE  on $(>) = DepRule ;
+    HDRRULE  on $(>) = DepRuleDotDot ;
     HDRFS    on $(>) = yes ;
   }
 
-  rule DepRule
+  if ! DepRuleDotDot in $(JAM_BUILTINS) { rule DepRuleDotDot
   {
     local changed_dep = ;
 
@@ -63,7 +73,6 @@ if $(OS) in LINUX MACOSX {
       local rel_path = ;
       switch $(dep)
       {
-        case /Develop/SDK* : dep = ; # skip target part
         case *: : dep = ; # skip target part
         case /* : changed_dep += $(dep) ;   # absolute path with drive
         case *  : rel_path = [ MATCH "[\.\\\/]*([^ \
@@ -74,9 +83,9 @@ if $(OS) in LINUX MACOSX {
 
     Includes $(<) : $(changed_dep) ;
     null_action $(changed_dep) ;
-  }
+  } }
 } else {
-  rule DepRule
+  if ! DepRuleDotDot in $(JAM_BUILTINS) { rule DepRuleDotDot
   {
     local changed_dep = ;
 
@@ -94,19 +103,19 @@ if $(OS) in LINUX MACOSX {
     }
     Includes $(<) : $(changed_dep) ;
     null_action $(changed_dep) ;
-  }
+  } }
 
   rule CheckHeaders
   {
     Depends $(<) : $(>) ;
-    NoCare $(>) ; # tolerant to .d absence
+    if $(StrictHeaderDeps) != yes || ! [ GLOB $(<:D) : $(<:D=) ] { NoCare $(>) ; } # tolerant to .d absence (also on fresh builds when .obj missing too)
     NOUPDATE $(>) ; # tolerant to .d timestamp
 
     # scan line for header, skipping any ../ at the beginning [will be prefixed with $(Root)]
     HDRSCAN  on $(>) = "[ \.\\\/\
                         ]*([^ \
                         ]+)" ;
-    HDRRULE  on $(>) = DepRule ;
+    HDRRULE  on $(>) = DepRuleDotDot ;
     HDRFS    on $(>) = yes ;
   }
 }

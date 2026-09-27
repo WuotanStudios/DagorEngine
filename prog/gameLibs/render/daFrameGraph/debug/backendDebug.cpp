@@ -9,31 +9,37 @@
 
 namespace dafg
 {
-bool debug_graph_generation = true;
-
-bool should_update_visualization()
-{
-  bool visualizationWasEnabled = debug_graph_generation;
-  bool visualizationIsEnabled = (imgui_get_state() != ImGuiState::OFF);
-  debug_graph_generation = visualizationIsEnabled;
-  return (visualizationWasEnabled != visualizationIsEnabled);
-}
-
 void reset_texture_visualization() { clear_visualization_node(); }
 
+void debug_send_blob_data(NodeNameId node_id, ResNameId res_id, const BlobView &view)
+{
+  Runtime::get().getVisualizerPtr()->sendBlobData(node_id, res_id, view);
+}
 
 void debug_clear_resource_placements() { Runtime::get().getVisualizerPtr()->clearResourcePlacements(); }
 
 void debug_clear_resource_barriers() { Runtime::get().getVisualizerPtr()->clearResourceBarriers(); }
 
-void debug_rec_resource_placement(ResNameId id, int frame, int heap, int offset, int size)
+void debug_rec_resource_placement(ResNameId id, int frame, int heap, int offset, int size, bool is_cpu)
 {
-  Runtime::get().getVisualizerPtr()->recResourcePlacement(id, frame, heap, offset, size);
+  Runtime::get().getVisualizerPtr()->recResourcePlacement(id, frame, heap, offset, size, is_cpu);
 }
 
 void debug_rec_resource_barrier(ResNameId res_id, int res_frame, int exec_time, int exec_frame, ResourceBarrier barrier)
 {
   Runtime::get().getVisualizerPtr()->recResourceBarrier(res_id, res_frame, exec_time, exec_frame, barrier);
+}
+
+void debug_rec_enhanced_buffer_barrier(ResNameId res_id, int res_frame, int exec_time, int exec_frame,
+  const d3d::BufferBarrier &barrier)
+{
+  Runtime::get().getVisualizerPtr()->recEnhancedBufferBarrier(res_id, res_frame, exec_time, exec_frame, barrier);
+}
+
+void debug_rec_enhanced_texture_barrier(ResNameId res_id, int res_frame, int exec_time, int exec_frame,
+  const d3d::TextureBarrier &barrier)
+{
+  Runtime::get().getVisualizerPtr()->recEnhancedTextureBarrier(res_id, res_frame, exec_time, exec_frame, barrier);
 }
 
 } // namespace dafg

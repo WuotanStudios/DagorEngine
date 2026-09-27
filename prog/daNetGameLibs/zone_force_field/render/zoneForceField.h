@@ -1,7 +1,9 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 #pragma once
 
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 
 #include <scene/dag_occlusion.h>
 #include <3d/dag_resPtr.h>
@@ -13,6 +15,11 @@
 // Framegraph v2
 #include <render/daFrameGraph/daFG.h>
 
+struct ZoneForceFieldFrameZones
+{
+  eastl::vector<Point4> zones, zonesOut;
+};
+
 struct ZoneForceFieldRenderer
 {
   DynamicShaderHelper forceFieldShader;
@@ -21,7 +28,7 @@ struct ZoneForceFieldRenderer
   UniqueBuf sphereVb, sphereIb;
   uint32_t v_count = 0, f_count = 0, texHt = 1;
   shaders::OverrideStateId zonesInState, zonesOutState;
-  eastl::vector<Point4> frameZones, frameZonesOut;
+  ZoneForceFieldFrameZones mainViewZones;
   bool bilateral_upscale = true;
 
   enum
@@ -32,9 +39,11 @@ struct ZoneForceFieldRenderer
   ~ZoneForceFieldRenderer();
   ZoneForceFieldRenderer();
 
-  dafg::NodeHandle createRenderingNode(const char *rendering_shader_name, uint32_t render_target_fmt);
+  dafg::NodeHandle createRenderingNode(
+    const char *rendering_shader_name, uint32_t render_target_fmt, const char *view_ns, bool is_main_view);
 
-  dafg::NodeHandle createApplyingNode(const char *applying_shader_name, const char *fullscreen_applying_shader_name);
+  dafg::NodeHandle createApplyingNode(
+    const char *applying_shader_name, const char *fullscreen_applying_shader_name, const char *view_ns, bool is_main_view);
 
 
   void start() const;
@@ -46,6 +55,8 @@ struct ZoneForceFieldRenderer
   void applyMany() const;
 
   void gatherForceFields(const TMatrix &view_itm, const Frustum &culling_frustum, const Occlusion *occlusion);
+  void gatherForceFields(
+    const TMatrix &view_itm, const Frustum &culling_frustum, const Occlusion *occlusion, ZoneForceFieldFrameZones &gathered);
   PartitionSphere getClosestForceField(const Point3 &camera_pos) const;
 
   void renderForceFields(Texture *downsampled_depth, const ManagedTex *render_target);

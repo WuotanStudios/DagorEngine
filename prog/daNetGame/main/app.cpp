@@ -10,6 +10,7 @@
 #include <asyncHTTPClient/asyncHTTPClient.h>
 #include <debug/dag_logSys.h>
 #include <debug/dag_textMarks.h>
+#include <debug/dag_debugTextStream.h>
 #include <gameRes/dag_gameResSystem.h>
 #include <gameRes/dag_stdGameRes.h>
 #include <generic/dag_carray.h>
@@ -23,6 +24,7 @@
 #include <osApiWrappers/dag_files.h>
 #include <osApiWrappers/dag_direct.h>
 #include <osApiWrappers/dag_threads.h>
+#include <sepClientInstance/globalSepClientInstance.h>
 #include <startup/dag_globalSettings.h>
 #include <startup/dag_inpDevClsDrv.h>
 #include <startup/dag_restart.h>
@@ -40,14 +42,16 @@
 #include <rendInst/riexSync.h>
 #include <EASTL/tuple.h>
 #include <daGame/timers.h>
-#include <ecs/core/entityManager.h>
+#include <daECS/core/entityManager.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/componentTypes.h>
 #include <ecs/gameres/commonLoadingJobMgr.h>
 #include <ecs/camera/getActiveCameraSetup.h>
 #include <ecs/rendInst/riExtra.h>
 #include <daECS/scene/scene.h>
 #include <daECS/core/updateStage.h>
 #include <ecs/scripts/scripts.h>
-#include <ecs/delayedAct/actInThread.h>
+#include <daECS/delayedAct/actInThread.h>
 #include <propsRegistry/propsRegistry.h>
 #include <webvromfs/webvromfs.h>
 #include <folders/folders.h>
@@ -55,13 +59,17 @@
 #include <util/dag_convar.h>
 #include <gui/dag_imgui.h>
 #include <daScript/daScript.h>
+#include <dasModules/dasSharedStack.h>
 #include <quirrel/sqEventBus/sqEventBus.h>
 #include <quirrel/nestdb/nestdb.h>
 #include <perfMon/dag_memoryReport.h>
 #include <perfMon/dag_daProfilerSettings.h>
 #include <math/random/dag_random.h>
+#include <util/dag_compilerDefs.h>
+#include <gpuMemoryInspector/gpuMemoryInspector.h>
 
 #include "appProfile.h"
+#include "gameLoad.h"
 #include "camera/sceneCam.h"
 #include <daEditorE/editorCommon/inGameEditor.h>
 #include <webui/shaderEditors.h>
@@ -80,6 +88,7 @@
 #include "main/console.h"
 #include "main/ecsUtils.h"
 #include "main/gameLoad.h"
+#include "main/hostedServerLauncher.h"
 #include "main/level.h"
 #include "main/settings.h"
 #include "main/vromfs.h"
@@ -87,13 +96,15 @@
 #include "net/net.h"
 #include "net/time.h"
 #include "net/authEvents.h"
+#include "net/sepClientStats.h"
 #include "phys/netPhys.h"
 #include "phys/physUtils.h"
 #include "phys/gridCollision.h"
 #include "render/renderer.h"
 #include "render/screencap.h"
 #include <render/cinematicMode.h>
-#include "render/animatedSplashScreen.h"
+#include <render/antialiasing.h>
+#include <animated_splash_screen_api.h>
 #include "sound/dngSound.h"
 #include "sound_net/registerSoundNetProps.h"
 #include "ui/userUi.h"
@@ -104,6 +115,8 @@
 #include "main/gameProjConfig.h"
 #include <render/tdrGpu.h>
 #include <shaders/dag_rendInstRes.h>
+#include <render/autoGraphics.h>
+
 
 #include <gamePhys/collision/collisionLib.h>
 #include <gamePhys/collision/collisionObject.h>
@@ -143,6 +156,7 @@ namespace acesfx
 {
 extern void wait_fx_managers_update_and_allow_accum_cmds();
 }
+extern void wait_additional_game_job_done();
 
 extern const float DM_DEFAULT_BSPHERE_RAD = 2.15f; // Max empirically measured distance to root (climbing onto something pose) is ~2.14
 
@@ -155,27 +169,54 @@ static InitOnDemand<WebVromfsDataCache> webVromfs;
 extern void unload_localization();
 extern void update_float_exceptions();
 
+namespace
+{
+struct DummyAntialiasingAppGlue : render::antialiasing::AppGlue
+{
+  TMatrix4 getUvReprojectionToPrevFrameTmNoJitter() const override { return TMatrix4::IDENT; }
+  IPoint2 getInputResolution() const override { return {0, 0}; }
+  IPoint2 getOutputResolution() const override { return getDisplayResolution(); }
+  IPoint2 getDisplayResolution() const override
+  {
+    int w = 0, h = 0;
+    d3d::get_screen_size(w, h);
+    return {w, h};
+  }
+  bool hasMinimumRenderFeatures() const override { return true; }
+  bool isTiledRender() const override { return false; }
+  bool useMobileCodepath() const override { return false; }
+  bool isRayTracingEnabled() const override { return false; }
+  int getTargetFormat() const override { return 0; }
+  int getHangarPassValue() const override { return 0; }
+  SGSR2Interface *createSGSR2(const IPoint2 &, const IPoint2 &) const override { return nullptr; }
+  bool isVrHmdEnabled() const override { return false; }
+  bool pushSSAAoption() const override { return true; }
+};
+
+DummyAntialiasingAppGlue g_dummyAaGlue;
+} // namespace
+
 namespace game_scene
 {
-double total_time = 0.0;
+static float defaultTimeSpeed = 1.f;
 static float timeSpeed = 1.f;
 bool parallel_logic_mode = false;
 bool parallel_no_latency_mode = false;
 static String scenePath;
 
-void updateInput(float rtDt, float dt, float cur_time)
+void updateInput(float rtDt, float dt, double cur_time)
 {
   TIME_PROFILE(updateInput);
   controls::process_input(rtDt);
+  controls::check_system_keys();
   g_entity_mgr->broadcastEventImmediate(UpdateStageUpdateInput(cur_time, dt));
   // In order to send controls to server in start of the frame, update phys input as early as possible
   phys_enqueue_controls(cur_time);
 }
 
-void update(float dt, float real_dt, float cur_time)
+static void update(float dt, float real_dt, double cur_time)
 {
   TIME_PROFILE(update);
-  total_time += dt;
 
   {
 #if !_TARGET_PC
@@ -205,19 +246,30 @@ void update(float dt, float real_dt, float cur_time)
 
   {
     if (is_level_loaded())
+    {
+      FRAMEMEM_REGION;
+      bind_dascript::SharedFramememStack ctxStack;
       g_entity_mgr->update(ecs::UpdateStageInfoAct(dt, cur_time));
+    }
     if (parallel_logic_mode)
     {
       if (dedicated::is_dedicated())
         updateInput(real_dt, dt, cur_time); // we must update input on dedicated for bots and other input logic!
-      net_update();
+      net_update(*g_entity_mgr);
+      hosted_internal_server_management_update();
     }
     if (is_level_loaded())
     {
-      if (dedicated::is_dedicated())
+      if (dedicated::is_dedicated() || !dagor_work_cycle_is_need_to_draw())
+      {
+        wait_additional_game_job_done();
+        TIME_PROFILE(ParallelUpdateFrameDelayed);
         g_entity_mgr->broadcastEventImmediate(ParallelUpdateFrameDelayed(dt, cur_time));
+      }
+      else
+        ; // otherwise on client in fullscreen/window visible with it's normally started from render (drawScene)
       net_send_phys_snapshots(cur_time, dt); // after all phys/anim updates
-      ridestr::update(dt, calc_active_camera_globtm());
+      ridestr::update(dt, cur_time, calc_active_camera_globtm());
     }
   }
   g_entity_mgr->broadcastEventImmediate(UpdateStageGameLogic(dt, cur_time));
@@ -236,6 +288,7 @@ void update(float dt, float real_dt, float cur_time)
     rendinst::scheduleRIGenPrepare(points);
     rendinst::updateRIGen(dt);
     dacoll::update_ri_instances(dt);
+    dacoll::update_lmesh_phys_bodies(dt);
   }
 
   uishared::update();
@@ -246,7 +299,8 @@ void update(float dt, float real_dt, float cur_time)
   sqeventbus::process_events(gamescripts::get_vm());
 }
 
-eastl::tuple<float, float, float> updateTime() // [rtDt, dt, curTime]
+// Note: might be imported by DNG lib clients
+eastl::tuple<float /*rtDt*/, float /*dt*/, double /*curTime*/> updateTime()
 {
   float rtDt = ::dagor_game_act_time;
   float rtDtNoSmoothing = ::dagor_game_act_time;
@@ -264,13 +318,20 @@ eastl::tuple<float, float, float> updateTime() // [rtDt, dt, curTime]
   else
     d3d::driver_command(Drv3dCommand::GET_GPU_FRAME_TIME, &rtDt, &rtDt); // Choose the smoothest dt.
 
-  double curTime = get_time_mgr().advance(rtDtNoSmoothing * timeSpeed, /*out*/ rtDt);
+  double curTime = advance_time(rtDtNoSmoothing * timeSpeed, /*out*/ rtDt);
   float dt = rtDt * timeSpeed;
   return eastl::make_tuple(rtDt, dt, curTime);
 }
 
-static void act_scene()
+static
+#if DAGOR_DBGLEVEL > 0 && _TARGET_PC_WIN
+  __declspec(noinline) // for better debugging UX
+#endif
+  void
+  act_scene()
 {
+  g_entity_mgr->broadcastEventImmediate(EventWaitBeforeAct());
+
   if (log_memreport_interval.get() > 0)
     memreport::dump_memory_usage_report(int(log_memreport_interval.get() * 1000.f), memreport_sys.get(), memreport_gpu.get());
   if (sceneload::is_scene_switch_in_progress())
@@ -284,8 +345,7 @@ static void act_scene()
 
   gamescripts::collect_das_garbage();
 
-  float rtDt, dt, curTime;
-  eastl::tie(rtDt, dt, curTime) = updateTime();
+  auto [rtDt, dt, curTime] = updateTime();
 
   if (parallel_logic_mode)
   {
@@ -307,7 +367,8 @@ static void act_scene()
       game::g_timers_mgr->act(dt);
     }
 
-    net_update();
+    net_update(*g_entity_mgr);
+    hosted_internal_server_management_update();
     update(dt, rtDt, curTime);
   }
 
@@ -318,9 +379,13 @@ static void act_scene()
 
   get_da_editor4().act(dt);
 
-  dngsound::update(dt);
+  dngsound::sync_update(dt);
 
   g_entity_mgr->broadcastEventImmediate(OnStoreApiUpdate{});
+
+  // better to run immediately before `overlay_ui::update()`, `dedicated::update()`
+  // So SEP can fill eventbus queue with RPC responses immediately before those events are read.
+  sepclientinstance::global_instance::global_poll();
 
   overlay_ui::update();
   dedicated::update();
@@ -434,6 +499,13 @@ void init_loading_job_manager()
   ecs::set_common_loading_job_mgr(loading_job_mgr_id);
 }
 
+void set_default_timespeed(const float ts)
+{
+  game_scene::defaultTimeSpeed = ts;
+  debug("defaultTimeSpeed = %f", ts);
+}
+void reset_timespeed() { game_scene::timeSpeed = game_scene::defaultTimeSpeed; }
+
 void set_timespeed(float ts) { game_scene::timeSpeed = ts; }
 
 float get_timespeed() { return game_scene::timeSpeed; }
@@ -479,18 +551,24 @@ static void send_dedicated_exit_metrics()
 static void init_main_thread(void *);
 static void init_threads(const DataBlock &cfg)
 {
-  int coreCount = cpujobs::get_core_count();
-  // Note: according to measurements of current threadpool & ecs parallel for implementation there is (almost)
-  // no perfomance gain with more then 6 work threads (together with main thread this corresponds to 7/8 cores
-  // of typical consumer Intel CCU or one Ryzen's CCX)
-  int numWorkThreads = cfg.getInt("numWorkThreads", eastl::min(coreCount - /*main*/ 1, cfg.getInt("maxWorkThreads", 6)));
-  int num_workers = eastl::clamp(numWorkThreads, 0, threadpool::MAX_WORKER_COUNT);
+  using namespace cpujobs;
+  int coreCount = get_logical_core_count(), numPhysCores = get_physical_core_count(), numPerfCores = get_performance_core_count();
+  int numWorkThreads = 7; // Note: 7 + 1 (main) corresponds to 8 cores of typical consumer Intel CCU or one Ryzen's CCX
+#if _TARGET_PC
+  if (numPerfCores)
+    numWorkThreads = numPerfCores >= 6 ? (numPerfCores - /*main*/ 1) : 6;
+#elif _TARGET_C2
+
+
+#endif
+  int nwt = cfg.getInt("numWorkThreads", eastl::min(coreCount - /*main*/ 1, cfg.getInt("maxWorkThreads", numWorkThreads)));
+  int num_workers = eastl::clamp(nwt, 0, threadpool::MAX_WORKER_COUNT);
   int stack_size = cfg.getInt("workThreadsStackSize", 192 << 10);
-#if DAGOR_DBGLEVEL > 1 || defined(__SANITIZE_THREAD__)
+#if DAGOR_DBGLEVEL > 1 || defined(DAGOR_THREAD_SANITIZER)
   stack_size *= 2;
 #endif
   threadpool::init(num_workers, 2048, stack_size);
-  debug("threadpool inited for %d workers", num_workers);
+  debug("threadpool inited for %d workers (%d/%d/%d perf/physical/logical cores)", num_workers, numPerfCores, numPhysCores, coreCount);
   add_delayed_callback(init_main_thread, nullptr);
 }
 
@@ -510,8 +588,16 @@ static void init_main_thread(void *)
     DaThread::applyThisThreadPriority(THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
 
-  if (cfg.getBool("pinMainThreadToCore", true))
+  if (cfg.getBool("pinMainThreadToCore",
+#if _TARGET_XBOX
+        true
+#else
+        false
+#endif
+        ))
     G_VERIFY(SetThreadAffinityMask(GetCurrentThread(), MAIN_THREAD_AFFINITY));
+  else
+    SetThreadIdealProcessor(GetCurrentThread(), __ctz_unsafe(MAIN_THREAD_AFFINITY));
 #elif _TARGET_C1
 
 
@@ -522,18 +608,15 @@ static void init_main_thread(void *)
 
 
 static bool app_is_post_shutdown_state = false;
-bool dng_is_app_terminated() { return app_is_post_shutdown_state; }
+bool dng_is_app_terminating() { return app_is_post_shutdown_state; }
 
 void app_close()
 {
   app_is_post_shutdown_state = true;
+
   // should be called before quirrel VMs termination
   sqeventbus::send_event("app.shutdown");
-  // since both overlay_ui and user_ui use sqeventbus::ProcessingMode::MANUAL_PUMP we need to push event
-  if (auto *vm = overlay_ui::get_vm())
-    sqeventbus::process_events(vm);
-  if (auto *vm = user_ui::get_vm())
-    sqeventbus::process_events(vm);
+  sqeventbus::flush_events();
 
   da_profiler::sync_stop_sampling();
   memoryreport::stop_report();
@@ -546,12 +629,11 @@ void app_close()
   if (!is_initial_loading_complete() || sceneload::is_load_in_progress())
   {
     net_stop();
-    if (!gameproj::is_hosted_server_instance())
-    {
-      debug("app_close -> _exit(0) since no level is loaded and is not internal dedicated server");
-      debug_flush(false);
-      _exit(0);
-    }
+#if !DAGOR_HOSTED_INTERNAL_SERVER
+    debug("app_close -> _exit(0) since no level is loaded and is not internal dedicated server");
+    debug_flush(false);
+    _exit(0);
+#endif
   }
 #endif
   ecs_os::cleanup_window_handler();
@@ -581,6 +663,9 @@ void app_close()
   g_entity_mgr->clear();
   destroy_world_renderer();
 
+  if (!dedicated::is_dedicated())
+    render::antialiasing::close();
+
   dagor_select_game_scene(NULL);
   unmount_all_vroms();
   unregister_all_virtual_vrom();
@@ -599,6 +684,12 @@ void app_close()
   unload_localization();
 
   dedicated::shutdown();
+
+  // Note: `charsq` depends on `sepclientinstance::global_instance`;
+  // `charsq` is already stopped in `overlay_ui::shutdown_ui()` for client and in `dedicated::shutdown()` for dedicated server
+  constexpr int sepMaxWaitMilliseconds = 500;
+  sepclientinstance::global_instance::global_shutdown(sepMaxWaitMilliseconds);
+
   PictureManager::release();
   if (webVromfs)
   {
@@ -612,6 +703,7 @@ void app_close()
   httprequests::shutdown_async();
   syncvroms::shutdown();
   g_entity_mgr.demandDestroy();
+  ecs::EntityManager::destroy_shared_component_types();
   ecs::clear_component_manager_registry();
 }
 
@@ -626,10 +718,15 @@ static void dump_config_blk(const DataBlock &configBlk)
   dumpBlk.setFrom(&configBlk);
   for (const char *exludeBlockName : excludeConfigBlkDumpNames)
     dumpBlk.removeBlock(exludeBlockName);
+#if _TARGET_PC
   DynamicMemGeneralSaveCB dump(tmpmem);
   dumpBlk.saveToTextStream(dump);
   dump.writeInt(0);
   logmessage(_MAKE4C('SPAM'), "%s:\n%s", "config", dump.data());
+#else
+  DebugTextStream dump{"SPAM  config:"};
+  dumpBlk.saveToTextStream(dump);
+#endif
 #else
   G_UNUSED(configBlk);
 #endif
@@ -701,9 +798,18 @@ void app_start(bool register_dagor_scene)
   crashlytics::AppState appState("app_start");
 #endif
 
+  if (!dedicated::is_dedicated())
+  {
+    render::antialiasing::init(&g_dummyAaGlue); // allows early get_available_methods() before real renderer glue arrives
+
+    auto_graphics::startup::try_apply_auto_antialiasing_and_resolution_settings();
+  }
+
   const DataBlock &settings = *dgs_get_settings();
   dump_config_blk(settings);
   const DataBlock &debugSettings = *settings.getBlockByNameEx("debug");
+
+  set_default_timespeed(debugSettings.getReal("initialGameTimeSpeed", 1.0f));
 
   execute_delayed_action_on_main_thread(make_delayed_action([]() { controls::global_init(); }));
   execute_delayed_action_on_main_thread(make_delayed_action([]() { g_entity_mgr->broadcastEventImmediate(EventOnGameInit()); }));
@@ -719,7 +825,7 @@ void app_start(bool register_dagor_scene)
   ::dgs_limit_fps = settings.getBool("limitFps", false);
   dagor_set_game_act_rate(settings.getInt("actRate", -60));
 
-  if (gameproj::is_hosted_server_instance())
+  if (dedicated::is_hosted_server_instance())
   {
     DataBlock *video = const_cast<DataBlock *>(::dgs_get_settings())->addBlock("video");
     video->setBool("threadedWindow", false);
@@ -740,7 +846,7 @@ void app_start(bool register_dagor_scene)
 
   if (!dedicated::is_dedicated())
   {
-    ::startup_gui_base("ui/fonts.blk");
+    ::startup_gui_base(settings.getBool("initUiFonts", true) ? "ui/fonts.blk" : "");
     ::startup_game(RESTART_ALL);
     if (settings.getBool("useWebVromfs", false))
     {
@@ -753,6 +859,7 @@ void app_start(bool register_dagor_scene)
   }
 
   init_world_renderer();
+  sceneload::load_package_files(gameInfo, true);
 
   execute_delayed_action_on_main_thread(make_delayed_action([]() { dngsound::init(); }));
 
@@ -788,8 +895,9 @@ void app_start(bool register_dagor_scene)
     init_collision_world(collInitFlags, 0.1f);
     set_add_instances_to_world(true);
     // TTL must be grater than ttl for ragdolls in order to process ragdoll collision with RI correctly
-    set_ttl_for_collision_instances(dedicated::is_dedicated() ? 0.5f : 35.f);
-    set_trace_game_objects_cb(grid_trace_main_entities);
+    exchange_ttl_for_collision_instances(0.5f);
+    if (auto *prev_cb = set_trace_game_objects_cb(grid_trace_main_entities))
+      set_trace_game_objects_cb(prev_cb); // preserve CB if installed earlier by libraries
     set_gather_game_objects_on_ray_cb(grid_process_main_entities_collision_objects_on_ray);
   }
 
@@ -811,7 +919,8 @@ void app_start(bool register_dagor_scene)
       if (is_animated_splash_screen_in_thread() && !sceneload::is_load_in_progress())
       {
         debug("[splash] auto stop due to is_load_in_progress()=%d", sceneload::is_load_in_progress());
-        stop_animated_splash_screen_in_thread();
+        // the splash thread has no finished frame
+        stop_animated_splash_screen_thread_keep_scene();
       }
     }
     virtual void drawScene() override
@@ -840,17 +949,28 @@ void app_start(bool register_dagor_scene)
   if (register_dagor_scene)
     dagor_select_game_scene(&dagor_game_scene);
 
+  // Note: `charsq` depends on `sepclientinstance::global_instance`;
+  // Must be executed before EventOnGameAppStarted event for client and before `gamescripts::init()` for dedicated server.
+  // So `charsq` initialization will find sepclientinstance initialized.
+  const eastl::string &projectId = app_profile::get().projectId;
+  sepclientinstance::global_instance::global_init_once(&circuit::get_conf, nullptr, sepclientstats::spawn_callback(projectId),
+    projectId);
+
   G_VERIFY(gamescripts::init());
 
   gamescripts::run();
 
   delayed_call([] {
     gamescripts::main_thread_post_load();
+
     g_entity_mgr->broadcastEventImmediate(EventOnGameAppStarted());
   });
 
+  if (auto emptyScene = ::dgs_get_settings()->getStr("empty_scene", nullptr))
+    sceneload::switch_scene(emptyScene, {});
+
   // this DA will be executed after actual scene load
-  delayed_call([]() {
+  auto onSceneLoaded = []() {
 #if DAGOR_DBGLEVEL > 0
     if (::dgs_get_settings()->getBlockByNameEx("debug")->getBool("imguiStartWithOverlay", false))
       imgui_request_state_change(ImGuiState::OVERLAY);
@@ -860,7 +980,8 @@ void app_start(bool register_dagor_scene)
 
     memoryreport::init();
     memoryreport::start_report();
-  });
+  };
+  delayed_call(eastl::move(onSceneLoaded));
 }
 
 static int (*defaultRIGenLodSkip)(const char *name, bool has_impostors, int total_lods);
@@ -887,6 +1008,8 @@ void init_game()
 
   rendinst::init_phys();
   ridestr::init(app_profile::get().haveGraphicsWindow);
+
+  gpu_memory_inspector_load_settings(::dgs_get_settings());
 }
 
 void term_game()

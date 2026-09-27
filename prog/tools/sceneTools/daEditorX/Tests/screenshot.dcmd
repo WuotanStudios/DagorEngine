@@ -1,0 +1,6 @@
+wait.project_load
+wait.textures
+wait.time 10000
+screenshot.create
+wait.time 500
+exit no

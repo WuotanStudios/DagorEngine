@@ -12,6 +12,7 @@
 #include <ioSys/dag_dataBlock.h>
 
 class IGenLoad;
+class GlobalSharedMemStorage;
 
 #define DEF_UNICAST_GAME_EVENTS                                                                                           \
   DECL_GAME_EVENT(CmdUse, ecs::EntityId) /* unicast */                                                                    \
@@ -27,6 +28,7 @@ class IGenLoad;
   DECL_GAME_EVENT(EventOnGameInit)                                                                                             \
   DECL_GAME_EVENT(EventOnGameTerm)                                                                                             \
   DECL_GAME_EVENT(EventOnGameShutdown)                                                                                         \
+  DECL_GAME_EVENT(EventOnSharedMemInited, GlobalSharedMemStorage * /*shared_mem*/)                                             \
   DECL_GAME_EVENT(EventOnGameAppStarted)                                                                                       \
   DECL_GAME_EVENT(EventOnGameUnloadStart)                                                                                      \
   DECL_GAME_EVENT(EventOnGameUnloadEnd)                                                                                        \
@@ -42,9 +44,11 @@ class IGenLoad;
   DECL_GAME_EVENT(EventUserMMQueueJoined)                                                                                      \
   DECL_GAME_EVENT(EventRendinstDestroyed, rendinst::riex_handle_t /* riex_handle*/, TMatrix /*ri_tm*/, BBox3 /*ri_bbox*/)      \
   DECL_GAME_EVENT(EventLadderUpdate, TMatrix /* ladder_tm */)                                                                  \
+  DECL_GAME_EVENT(EventWaitBeforeAct)                                                                                          \
   DECL_GAME_EVENT(EventOnGameUpdateAfterGameLogic, float /*dt*/, float /*curTime*/)                                            \
   DECL_GAME_EVENT(EventOnGameUpdateAfterRenderer, float /*dt*/, float /*curTime*/)                                             \
-  DECL_GAME_EVENT(EventOnGameScriptsShutdown)
+  DECL_GAME_EVENT(EventOnGameScriptsShutdown)                                                                                  \
+  DECL_GAME_EVENT(EventOnRegisterBehTreeNodes)
 
 #define DECL_GAME_EVENT ECS_UNICAST_EVENT_TYPE
 DEF_UNICAST_GAME_EVENTS

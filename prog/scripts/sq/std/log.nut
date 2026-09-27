@@ -3,6 +3,8 @@ import "math" as math
 import "dagor.debug" as dagorDebug
 import "string.nut" as string
 from "string" import split_by_chars
+from "underscore.nut" import flatten
+from "types" import String, Function
 
 let tostring_r = string.tostring_r
 let join = string.join //like join, but skip emptylines
@@ -11,7 +13,7 @@ function print_(val, separator="\n"){
   print($"{val}{separator}")
 }
 const DEF_MAX_DEEPLEVEL = 4
-function Log(tostringfunc=null) {
+function Log(tostringfunc=null): table {
   function vlog(...){
     local out = ""
     if (vargv.len()==1)
@@ -63,36 +65,34 @@ function Log(tostringfunc=null) {
     dagorDebug.console_print(" ".join(vargv.map(@(v) tostring_r(v, {maxdeeplevel=DEF_MAX_DEEPLEVEL, showArrIdx=false, tostringfunc=tostringfunc}))))
   }
 
-  function with_prefix(prefix) {
+  function with_prefix(prefix): function {
     return @(...) log("".concat(prefix, " ".join(vargv.map(@(val) tostring_r(val, {compact=true, maxdeeplevel=DEF_MAX_DEEPLEVEL tostringfunc=tostringfunc})))))
   }
-  function dlog_prefix(prefix) {
+  function dlog_prefix(prefix): function {
     return @(...) dlog.acall([null, prefix].extend(vargv))  //disable: -dlog-warn
   }
 
-  function wlog(watched, prefix = null, transform=null, logger = log) {
-    local ftransform = transform ?? @(v) v
-    local fprefix = prefix
-    if (type(prefix) == "function") {
-      ftransform = prefix
-      fprefix = transform
+  function mkwlog(logger=log): function {
+    return function(...) {
+      let transform = vargv.findvalue(@(v) v instanceof Function) ?? @(v) v
+      let prefix = vargv.findvalue(@(v) v instanceof String)
+      let watched = flatten(vargv).filter(@(v) type(v) == "instance" && "subscribe" in v) ?? []
+      if (watched.len()==0)
+        dagorDebug.logerr("no observables in wlog!")
+      if (prefix != null)
+        foreach (w in watched) {
+          logger(prefix, transform(w.get()))
+          w.subscribe(@(v) logger(prefix, transform(v)))
+        }
+      else
+        foreach (w in watched) {
+          logger(transform(w.get()))
+          w.subscribe(@(v) logger(transform(v)))
+        }
     }
-    if (type(transform) == "string")
-      fprefix = transform
-    if (type(watched) != "array")
-      watched = [watched]
-    fprefix = fprefix != "" ? fprefix : null
-    if (fprefix != null)
-      foreach (w in watched) {
-        logger(fprefix, ftransform(w.get()))
-        w.subscribe(@(v) logger(fprefix, ftransform(v)))
-      }
-    else
-      foreach (w in watched) {
-        logger(ftransform(w.get()))
-        w.subscribe(@(v) logger(ftransform(v)))
-      }
   }
+  let wlog = mkwlog()
+  let wdlog = mkwlog(dlog) //disable: -dlog-warn
 
   return {
     vlog
@@ -106,6 +106,8 @@ function Log(tostringfunc=null) {
     with_prefix
     dlog_prefix
     wlog
+    wdlog
+    mkwlog
     //lowlevel dagor functions
     debug = dagorDebug.debug
     logerr = dagorDebug.logerr

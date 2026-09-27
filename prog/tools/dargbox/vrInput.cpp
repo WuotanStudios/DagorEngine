@@ -138,8 +138,6 @@ void handle_controller_input()
     return;
 
   darg::IGuiScene *darg_scene = get_ui_scene();
-  if (darg_scene)
-    darg_scene->ignoreDeviceCursorPos(true);
 
   for (int side = 0; side < NUM_HANDS; ++side)
   {
@@ -198,7 +196,7 @@ void render_controller_poses()
   {
     auto &view = get_view(index);
 
-    d3d::set_render_target(get_frame_target(index), 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{get_frame_target(index), 0, 0}});
 
     TMatrix localCamera;
     localCamera.makeTM(view.orientation);

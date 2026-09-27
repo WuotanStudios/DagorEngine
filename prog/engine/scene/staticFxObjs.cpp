@@ -10,8 +10,6 @@
 
 #include <math/dag_frustum.h>
 #include <scene/dag_occlusion.h>
-#include <drv/3d/dag_matricesAndPerspective.h>
-#include <drv/3d/dag_driver.h>
 #include <scene/dag_occlusionMap.h>
 #include <debug/dag_log.h>
 
@@ -58,30 +56,25 @@ static __forceinline bool is_sphere_visible(BSphere3 &sp, const Frustum &frustum
   return true;
 }
 
-void StaticFxObjects::render(int render_type, const TMatrix &view_itm, const Occlusion *occlusion)
+void StaticFxObjects::before_render(const Frustum &culling_frustum, const TMatrix &view_itm, const Occlusion *occlusion)
 {
-  if (render_type == FX_RENDER_BEFORE)
+  for (int i = 0; i < objects.size(); i++)
   {
-    mat44f gtm;
-    d3d::getglobtm(gtm);
-    Frustum frustum(gtm);
-    for (int i = 0; i < objects.size(); i++)
-    {
-      Effect &e = objects[i];
-      e.visible = e.bindumpRenderable && is_sphere_visible(e.sph, frustum, occlusion);
+    Effect &e = objects[i];
+    e.visible = e.bindumpRenderable && is_sphere_visible(e.sph, culling_frustum, occlusion);
 
-      if (e.visible)
-        e.fx->render(FX_RENDER_BEFORE, view_itm);
-    }
+    if (e.visible)
+      e.fx->render(FX_RENDER_BEFORE, view_itm);
   }
-  else
+}
+
+void StaticFxObjects::render(int render_type, const TMatrix &view_itm)
+{
+  for (int i = 0; i < objects.size(); i++)
   {
-    for (int i = 0; i < objects.size(); i++)
-    {
-      Effect &e = objects[i];
-      if (e.visible)
-        e.fx->render(render_type, view_itm);
-    }
+    Effect &e = objects[i];
+    if (e.visible)
+      e.fx->render(render_type, view_itm);
   }
 }
 
@@ -153,17 +146,12 @@ void StaticFxObjects::init(const RoDataBlock &blk, unsigned bindump_id /*= -1*/,
     const char *name = b->getStr("name", NULL);
 
     if (name && ::get_resource_type_id(name) == EffectGameResClassId)
-    {
-      GameResHandle handle = GAMERES_HANDLE_FROM_STRING(name);
-      BaseEffectObject *base_fx = (BaseEffectObject *)::get_game_resource(handle);
-      if (base_fx)
+      if (BaseEffectObject *base_fx = (BaseEffectObject *)::get_game_resource_ex(name, EffectGameResClassId))
       {
         TMatrix tm = b->getTm("matrix", TMatrix::IDENT);
-
         createOneStaticFxObject(b, base_fx, tm, name, bindump_id, renderable);
+        ::release_game_resource_ex(base_fx, EffectGameResClassId);
       }
-      ::release_game_resource(handle);
-    }
   }
 }
 
@@ -175,8 +163,7 @@ void StaticFxObjects::init(const ObjectsToPlace &o, unsigned bindump_id /*= -1*/
   for (int j = 0; j < o.objs.size(); j++)
   {
     const char *name = o.objs[j].resName;
-    GameResHandle handle = GAMERES_HANDLE_FROM_STRING(name);
-    BaseEffectObject *base_fx = (BaseEffectObject *)::get_game_resource(handle);
+    BaseEffectObject *base_fx = (BaseEffectObject *)::get_game_resource_ex(name, EffectGameResClassId);
     if (!base_fx)
       continue;
 
@@ -187,6 +174,6 @@ void StaticFxObjects::init(const ObjectsToPlace &o, unsigned bindump_id /*= -1*/
 
       createOneStaticFxObject(&b, base_fx, tm, name, bindump_id, renderable);
     }
-    ::release_game_resource(handle);
+    ::release_game_resource_ex(base_fx, EffectGameResClassId);
   }
 }

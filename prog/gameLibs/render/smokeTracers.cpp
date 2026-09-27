@@ -1,11 +1,13 @@
 // Copyright (C) Gaijin Games KFT.  All rights reserved.
 
+#include <EASTL/fixed_vector.h>
 #include <drv/3d/dag_draw.h>
 #include <drv/3d/dag_vertexIndexBuffer.h>
 #include <drv/3d/dag_shaderConstants.h>
 #include <drv/3d/dag_buffers.h>
 #include <drv/3d/dag_driver.h>
 #include <drv/3d/dag_info.h>
+#include <drv/3d/dag_driverDesc.h>
 #include <shaders/dag_computeShaders.h>
 #include <render/smokeTracers.h>
 #include <gameRes/dag_stdGameRes.h>
@@ -15,9 +17,12 @@
 #include <workCycle/dag_workCycle.h>
 #include <frustumCulling/frustumPlanes.h>
 
-#define GLOBAL_VARS_LIST VAR(smoke_trace_current_time)
+#define GLOBAL_VARS_LIST         \
+  VAR(smoke_trace_current_time)  \
+  VAR(smoke_trace_exposure_time) \
+  VAR(smoke_trace_pixel_scale)
 
-#define VAR(a) static int a##VarId = -1;
+#define VAR(a) static ShaderVariableInfo a##VarId(#a, true);
 GLOBAL_VARS_LIST
 #undef VAR
 
@@ -75,15 +80,17 @@ void SmokeTracerManager::initGPU(const DataBlock &settings)
 {
   closeGPU();
 
-#define VAR(a) a##VarId = get_shader_variable_id(#a);
-  GLOBAL_VARS_LIST
-#undef VAR
-
   const char *texName = settings.getStr("tail_texture", "tracer_tail_density");
+  const float tracer_head_radius_coeff = settings.getReal("tracer_head_radius_coeff", 1.0);
+  const float smoke_tracers_head_color_boost = settings.getReal("smoke_tracers_head_color_boost", 0.0);
+  const float smoke_tracers_head_profile_exp = settings.getReal("smoke_tracers_head_profile_exp", 0.0);
   tailTex = dag::get_tex_gameres(texName, "smoke_tracer_tail_tex");
   ShaderGlobal::set_sampler(::get_shader_variable_id("smoke_tracer_tail_tex_samplerstate", true),
     get_texture_separate_sampler(tailTex.getTexId()));
 
+  ShaderGlobal::set_float(::get_shader_variable_id("tracer_head_radius_coeff", true), tracer_head_radius_coeff);
+  ShaderGlobal::set_float(::get_shader_variable_id("smoke_tracers_head_profile_exp", true), smoke_tracers_head_profile_exp);
+  ShaderGlobal::set_float(::get_shader_variable_id("smoke_tracers_head_color_boost", true), smoke_tracers_head_color_boost);
   updateCommands_cs.reset(new_compute_shader("update_tracer_commands_cs"));
   createCommands_cs.reset(new_compute_shader("create_tracer_commands_cs"));
   cullTracers_cs.reset(new_compute_shader("cull_tracers_cs"));
@@ -93,14 +100,23 @@ void SmokeTracerManager::initGPU(const DataBlock &settings)
   G_ASSERT(updateCommands_cs);
   G_ASSERT(clearIndirectBuffers);
 
-  tracerBuffer = dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracer), MAX_TRACERS, "smokeTracers");
-  tracerVertsBuffer =
-    dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracerVertices), TRACER_SEGMENTS_COUNT * MAX_TRACERS, "smokeTracerVerts");
-  tracerBufferDynamic = dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracerDynamic), MAX_TRACERS, "smokeTracersDynamic");
+  tracerBuffer = dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracer), MAX_TRACERS, "smokeTracers", d3d::buffers::Init::Zero,
+    RESTAG_TRACER);
+  tracerVertsBuffer = dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracerVertices), TRACER_SEGMENTS_COUNT * MAX_TRACERS,
+    "smokeTracerVerts", d3d::buffers::Init::Zero, RESTAG_TRACER);
+  tracerBufferDynamic = dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracerDynamic), MAX_TRACERS, "smokeTracersDynamic",
+    d3d::buffers::Init::Zero, RESTAG_TRACER);
+
+  // Published for bvh_smoke_tracers_cs (raster path binds these directly).
+  ShaderGlobal::set_buffer(get_shader_variable_id("smoke_tracer_tracer_buf", true), tracerBuffer.get());
+  ShaderGlobal::set_buffer(get_shader_variable_id("smoke_tracer_dynamic_buf", true), tracerBufferDynamic.get());
+  ShaderGlobal::set_buffer(get_shader_variable_id("smoke_tracer_verts_buf", true), tracerVertsBuffer.get());
+
   culledTracerTails = dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracerTailRender), MAX_TRACERS, //*2
-    "culledTracerTails");
-  culledTracerHeads = dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracerHeadRender), MAX_TRACERS, "culledTracerHeads");
-  drawIndirectBuffer = dag::buffers::create_ua_indirect(dag::buffers::Indirect::Draw, 2, "culledTracersIndirect");
+    "culledTracerTails", d3d::buffers::Init::No, RESTAG_TRACER);
+  culledTracerHeads = dag::buffers::create_ua_sr_structured(sizeof(GPUSmokeTracerHeadRender), MAX_TRACERS, "culledTracerHeads",
+    d3d::buffers::Init::No, RESTAG_TRACER);
+  drawIndirectBuffer = dag::buffers::create_ua_indirect(dag::buffers::Indirect::Draw, 2, "culledTracersIndirect", RESTAG_TRACER);
 
   headRenderer.init("smoke_tracers_head", NULL, 0, "smoke_tracers_head");
   tailRenderer.init("smoke_tracers_tail", NULL, 0, "smoke_tracers_tail");
@@ -193,7 +209,7 @@ void SmokeTracerManager::performGPUCommands()
   }
   if (!createCommands.size() && !updateCommands.size())
     return;
-  // ShaderGlobal::set_real(smoke_trace_current_timeVarId, cTime);
+  // ShaderGlobal::set_float(smoke_trace_current_timeVarId, cTime);
   float time[4] = {cTime, lastDt, 0, 0};
   d3d::set_cs_const(2, (float *)time, 1);
   uint32_t v[4] = {0};
@@ -209,19 +225,18 @@ void SmokeTracerManager::performGPUCommands()
     G_STATIC_ASSERT(sizeof(createCommands[0]) == TRACER_SMOKE_CREATE_COMMAND_SIZE * sizeof(float4));
     // it is rare we create more than 28 tracers each frame, so use common constant buffer
     const int command_size_in_consts = (elem_size(createCommands) + 15) / 16;
-    const int req_size = 4 + createCommands.size() * command_size_in_consts;
-    const int cbuffer_size = d3d::set_cs_constbuffer_size(req_size);
-    // debug("cbuffer_size = %d req = %d", cbuffer_size, req_size);
-    for (int i = 0; i < createCommands.size(); i += (cbuffer_size - 4) / command_size_in_consts)
+    const int cbufSizeShortage = max<int>(CONST_BUF_MAX_SIZE - d3d::get_driver_desc().maxvpconsts, 0);
+    const int createBatchSizeMaxSizeRegs = TRACER_CMD_BUF_MAX_SIZE - cbufSizeShortage;
+    const int createBatchMaxCount = createBatchSizeMaxSizeRegs / TRACER_SMOKE_CREATE_COMMAND_SIZE;
+    for (int i = 0; i < createCommands.size(); i += createBatchMaxCount)
     {
-      int batch_size = min<int>(createCommands.size() - i, (cbuffer_size - 4) / command_size_in_consts);
+      int batch_size = min<int>(createCommands.size() - i, createBatchMaxCount);
       // debug("batch_size = %d", batch_size);
       v[0] = batch_size;
       d3d::set_cs_const(3, (float *)v, 1);
       d3d::set_cs_const(4, (float *)&createCommands[i], batch_size * command_size_in_consts);
       createCommands_cs->dispatch((batch_size + TRACER_COMMAND_WARP_SIZE - 1) / TRACER_COMMAND_WARP_SIZE, 1, 1);
     }
-    d3d::set_cs_constbuffer_size(0);
     if (updateCommands.size())
     {
       d3d::resource_barrier({tracerVertsBuffer.get(), RB_FLUSH_UAV | RB_SOURCE_STAGE_COMPUTE | RB_STAGE_COMPUTE});
@@ -248,19 +263,19 @@ void SmokeTracerManager::performGPUCommands()
     v[0] = updateCommands.size();
     const int command_size_in_consts = (elem_size(updateCommands) + 15) / 16;
     const int startFromReg = 4;
-    const int req_size = startFromReg + updateCommands.size() * command_size_in_consts;
-    const int cbuffer_size = d3d::set_cs_constbuffer_size(req_size);
-    // debug("cbuffer_size = %d req = %d", cbuffer_size, req_size);
 
-    for (int i = 0; i < updateCommands.size(); i += (cbuffer_size - startFromReg) / command_size_in_consts)
+    const int cbufSizeShortage = max<int>(CONST_BUF_MAX_SIZE - d3d::get_driver_desc().maxvpconsts, 0);
+    const int updateBatchSizeMaxSizeRegs = TRACER_CMD_BUF_MAX_SIZE - cbufSizeShortage;
+    const int updateBatchMaxCount = updateBatchSizeMaxSizeRegs / TRACER_SMOKE_UPDATE_COMMAND_SIZE;
+
+    for (int i = 0; i < updateCommands.size(); i += updateBatchMaxCount)
     {
-      int batch_size = min<int>(updateCommands.size() - i, (cbuffer_size - startFromReg) / command_size_in_consts);
+      int batch_size = min<int>(updateCommands.size() - i, updateBatchMaxCount);
       v[0] = batch_size;
       d3d::set_cs_const(startFromReg - 1, (float *)v, 1);
       d3d::set_cs_const(startFromReg, (float *)&updateCommands[i], batch_size * command_size_in_consts);
       updateCommands_cs->dispatch((batch_size + TRACER_COMMAND_WARP_SIZE - 1) / TRACER_COMMAND_WARP_SIZE, 1, 1);
     }
-    d3d::set_cs_constbuffer_size(0);
     updateCommands.clear();
     d3d::set_buffer(STAGE_CS, 0, 0);
     d3d::resource_barrier({tracerVertsBuffer.get(), RB_RO_SRV | RB_STAGE_VERTEX | RB_STAGE_COMPUTE});
@@ -271,11 +286,30 @@ void SmokeTracerManager::performGPUCommands()
 
 void SmokeTracerManager::beforeRender(const Frustum &frustum, float exposure_time, float pixel_scale)
 {
+  // cullTracers_cs and the three tracer buffers are created together in initGPU, so this guard covers them too.
   if (!cullTracers_cs)
     return;
+  const ResourceBarrier toSrvState[3] = {RB_RO_SRV | RB_STAGE_COMPUTE, RB_RO_SRV | RB_STAGE_COMPUTE, RB_RO_SRV | RB_STAGE_COMPUTE};
+  // Creation can fail on lost device or OOM.
+  const auto gatherNotNullBufs = [this] {
+    eastl::fixed_vector<Sbuffer *, 3, false> bufs;
+    for (Sbuffer *buf : {tracerBufferDynamic.get(), tracerBuffer.get(), tracerVertsBuffer.get()})
+      if (buf)
+        bufs.push_back(buf);
+    return bufs;
+  };
   performGPUCommands();
+  // For bvh_smoke_tracers_cs; raster cull_tracers_cs gets them via set_cs_const below.
+  ShaderGlobal::set_float(smoke_trace_current_timeVarId, cTime);
+  ShaderGlobal::set_float(smoke_trace_exposure_timeVarId, exposure_time);
+  ShaderGlobal::set_float(smoke_trace_pixel_scaleVarId, pixel_scale);
   if (!usedTracers[currentUsed].size())
+  {
+    const auto bufs = gatherNotNullBufs();
+    if (!bufs.empty())
+      d3d::resource_barrier({bufs.data(), toSrvState, (unsigned)bufs.size()});
     return;
+  }
   TIME_D3D_PROFILE(cull_tracers);
   // gpu culling
   d3d::resource_barrier({tracerBufferDynamic.get(), RB_FLUSH_UAV | RB_STAGE_COMPUTE | RB_SOURCE_STAGE_COMPUTE});
@@ -299,23 +333,24 @@ void SmokeTracerManager::beforeRender(const Frustum &frustum, float exposure_tim
   G_ASSERT(usedTracers[0].static_size % 16 == 0);
   const int tracersPerCommand = 16 / elem_size(usedTracers[currentUsed]);
 
-  const int req_size = startFromReg + (data_size(usedTracers[currentUsed]) + 15) / 16;
-  const int cbuffer_size = d3d::set_cs_constbuffer_size(req_size);
-  for (int i = 0; i < usedTracers[currentUsed].size(); i += (cbuffer_size - startFromReg) * tracersPerCommand) // up to 4094 consts
-                                                                                                               // i.e. up to 4094*8
-                                                                                                               // tracers
+  const int maxConstCountForBatch = min<int>(4096, d3d::get_driver_desc().maxvpconsts);
+  const int maxBatchSize = (maxConstCountForBatch - startFromReg) * tracersPerCommand;
+  for (int i = 0; i < usedTracers[currentUsed].size(); i += maxBatchSize)
   {
-    int batch_size = min<int>(usedTracers[currentUsed].size() - i, (cbuffer_size - startFromReg) * tracersPerCommand);
+    int batch_size = min<int>(usedTracers[currentUsed].size() - i, maxBatchSize);
     v[0] = batch_size;
     d3d::set_cs_const(startFromReg - 1, (float *)v, 1);
     d3d::set_cs_const(startFromReg, (const float *)&usedTracers[currentUsed][i],
       (elem_size(usedTracers[currentUsed]) * batch_size + 15) / 16);
     cullTracers_cs->dispatch((batch_size + TRACER_CULL_WARP_SIZE - 1) / TRACER_CULL_WARP_SIZE, 1, 1);
   }
-  d3d::set_cs_constbuffer_size(0);
   d3d::set_buffer(STAGE_CS, 8, 0);
   d3d::set_buffer(STAGE_CS, 9, 0);
   d3d::set_buffer(STAGE_CS, 10, 0);
+  // For bvh_smoke_tracers_cs on quiet frames where performGPUCommands skipped its RO_SRV transitions.
+  const auto bufs = gatherNotNullBufs();
+  if (!bufs.empty())
+    d3d::resource_barrier({bufs.data(), toSrvState, (unsigned)bufs.size()});
 }
 
 void SmokeTracerManager::renderTrans()
@@ -325,7 +360,7 @@ void SmokeTracerManager::renderTrans()
   d3d::resource_barrier({culledTracerHeads.get(), RB_RO_SRV | RB_STAGE_VERTEX});
   d3d::resource_barrier({culledTracerTails.get(), RB_RO_SRV | RB_STAGE_VERTEX});
   d3d::resource_barrier({drawIndirectBuffer.get(), RB_RO_INDIRECT_BUFFER});
-  ShaderGlobal::set_real(smoke_trace_current_timeVarId, cTime);
+  ShaderGlobal::set_float(smoke_trace_current_timeVarId, cTime);
   headRenderer.shader->setStates(0, true);
   d3d::setvsrc(0, 0, 0);
   static int smoke_tracers_head_culledTracers_const_no = ShaderGlobal::get_slot_by_name("smoke_tracers_head_culledTracers_const_no");

@@ -12,13 +12,12 @@
 #include <daECS/core/componentType.h>
 #include <memory/dag_framemem.h>
 #include <math/dag_bounds3.h>
+#include <math/dag_mathUtils.h>
 #include <grid/spatialHashGridImpl.h>
 
 typedef eastl::fixed_vector<ecs::EntityId, 64, true, framemem_allocator> TempGridEntities;
 typedef eastl::vector<const GridHolder *> GridHolders;
 ECS_DECLARE_RELOCATABLE_TYPE(GridHolders);
-
-const float MAX_VALID_BOUNDING_RADIUS = 64.f; // logerr anomalous large objects
 
 enum class GridEntCheck
 {
@@ -46,8 +45,7 @@ struct GridObjComponent : public GridObject
   BSphere3 getBSphere() const
   {
     BSphere3 bsph;
-    v_stu(&bsph.c.x, GridObject::wbsph);
-    bsph.r2 = bsph.r * bsph.r;
+    v_stu_bsphere3(bsph, GridObject::wbsph);
     return bsph;
   }
   void updatePos(vec4f new_pos, float new_bounding_rad);
@@ -61,6 +59,8 @@ GridHolder *find_grid_holder(ecs::HashedConstString grid_name_hash);
 inline const GridHolder *find_grid_holder(const GridHolder *gh) { return gh; };
 inline const GridHolder *find_grid_holder(const GridHolder &gh) { return &gh; };
 void for_each_grid_holder(const eastl::function<void(const GridHolder &)> &cb);
+
+GridHolder *find_grid_holder_opt(ecs::HashedConstString grid_name_hash);
 
 inline const GridObjComponent *to_comp(const GridObject *obj) { return static_cast<const GridObjComponent *>(obj); }
 
@@ -99,6 +99,16 @@ ecs::EntityId grid_find_entity(const GridHolder &grid_holder, const TMatrix &tra
   auto findFunc = check_type == GridEntCheck::POS ? grid_find_in_transformed_box_by_pos : grid_find_in_transformed_box_by_bounding;
   const GridObject *obj =
     findFunc(grid_holder, transform, bbox, [&pred](const GridObject *obj) { return pred(to_comp(obj)->eid, to_comp(obj)->getPos()); });
+  return obj ? to_comp(obj)->eid : ecs::INVALID_ENTITY_ID;
+}
+
+template <typename F>
+ecs::EntityId grid_find_entity(const GridHolder &grid_holder, const TMatrix &tm, const BBox3 &bbox, dag::ConstSpan<plane3f> convex,
+  GridEntCheck check_type, const F &pred)
+{
+  auto findFunc = check_type == GridEntCheck::POS ? grid_find_in_convex_by_pos : grid_find_in_convex_by_bounding;
+  const GridObject *obj = findFunc(grid_holder, tm, bbox, convex,
+    [&pred](const GridObject *obj) { return pred(to_comp(obj)->eid, to_comp(obj)->getPos()); });
   return obj ? to_comp(obj)->eid : ecs::INVALID_ENTITY_ID;
 }
 
@@ -153,6 +163,28 @@ void for_each_entity_in_grid(GridId grid_id, const TMatrix &transform, const BBo
 {
   if (const GridHolder *gridh = find_grid_holder(grid_id))
     grid_find_entity(*gridh, transform, bbox, check_type, [&cb](ecs::EntityId eid, vec3f pos) {
+      cb(eid, pos);
+      return false;
+    });
+}
+
+/* Call cb(ecs::EntityId) for each entity in a convex volume, e.g. a melee frustum.
+   Params:
+     * grid_id      = 32-bit ecs_hash or entity_id of grid holder
+     * tm           = Orientation TMatrix of the volume
+     * bbox         = Local AABB of the volume; must contain the convex, it is what cells are walked with
+     * convex       = Local outward planes: inside is dot(n, p) + d <= 0, as CollisionResource expects.
+                      EXACTLY 6 planes are tested; any other count ignores them and narrows by the
+                      oriented bbox alone, so cb then also sees entities outside the convex
+     * check_type   = See GridEntCheck
+     * cb           = Callback for each matching entity
+*/
+template <typename GridId, typename F>
+void for_each_entity_in_grid(GridId grid_id, const TMatrix &tm, const BBox3 &bbox, dag::ConstSpan<plane3f> convex,
+  GridEntCheck check_type, const F &cb)
+{
+  if (const GridHolder *gridh = find_grid_holder(grid_id))
+    grid_find_entity(*gridh, tm, bbox, convex, check_type, [&cb](ecs::EntityId eid, vec3f pos) {
       cb(eid, pos);
       return false;
     });

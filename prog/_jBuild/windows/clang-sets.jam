@@ -1,24 +1,22 @@
 #  Setup for Clang-CL C/C++ compiler for Windows (to be included from jBuild.jam)
 _OBJ_SUFFIX  = .obj ;
 
-_CLANG_LIB_FOLDER = $(CLangVer:B) ;
+local _CLANG_LIB_FOLDER = $(CLangVer:B) ;
 _CLANG_LIB_FOLDER = $(_CLANG_LIB_FOLDER:B) ;
 local COMPILER_AND_STL_VERSION_MISMATCH = ;
 
-if $(_CLANG_LIB_FOLDER) = 15 {
-  _VC_DIR         = $(_DEVTOOL)/vc2019_16.11.34 ;
-  _MSC_VER        = 19.29.30154 ;
-    _CLANG_LIB_FOLDER = $(CLangVer) ;
-} else if $(_CLANG_LIB_FOLDER) in 16 17 18 19 20 21 {
+if $(CLangVer) >= 16 { # Lex cmp
   _VC_DIR         = $(_DEVTOOL)/vc2022_17.9.5 ;
   _MSC_VER        = 19.39.33523 ;
-  if ! [ GLOB $(_VC_DIR)    : * ] {
+  if $(CLangVer) >= 19 || ! [ GLOB $(_VC_DIR)    : * ] {
     _VC_DIR         = $(_DEVTOOL)/vc2022_17.14.4 ;
     _MSC_VER        = 19.44.35209 ;
-    if $(_CLANG_LIB_FOLDER) in 16 17 18 { COMPILER_AND_STL_VERSION_MISMATCH = -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH ; }
+    if $(CLangVer) < 19 { COMPILER_AND_STL_VERSION_MISMATCH = -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH ; }
   }
-} else {
-    exit Unknown CLangVer $(CLangVer) ;
+} else { # 15
+  _VC_DIR         = $(_DEVTOOL)/vc2019_16.11.34 ;
+  _MSC_VER        = 19.29.30154 ;
+  _CLANG_LIB_FOLDER = $(CLangVer) ;
 }
 _CLANG_DIR = $(_DEVTOOL)/LLVM-$(CLangVer) ;
 
@@ -29,7 +27,8 @@ _VC_CRT_TYPE = -MT ;
 if $(PlatformArch) = x86_64 { _WIN_SDK_TARGET_SUFFIX = x64 ; }
 if $(PlatformArch) = arm64 { _WIN_SDK_TARGET_SUFFIX = arm64 ; }
 
-if $(UseGDK) != no {
+if $(UseGDK) = yes {
+  _VC_CRT_TYPE = -MD ;
   include $(Root)/prog/_jBuild/_gdk/setup.jam ;
   WinSdkVer = win.sdk.100 ;
   WinSdkUpdateVer = $(GdkWinSdk) ;
@@ -37,7 +36,7 @@ if $(UseGDK) != no {
 include $(Root)/prog/_jBuild/_vc/win_sdk.jam ;
 
 local _VC_HOST_DIR = Hostx64 ;
-if $(WindowsHostArch) = arm64 { _VC_HOST_DIR = Hostarm64 ; }
+if $(WindowsHostArch) = arm64 && [ GLOB $(_VC_DIR)/bin : Hostarm64 ] { _VC_HOST_DIR = Hostarm64 ; }
 _VC_DIR_BIN = $(_VC_DIR)/bin/$(_VC_HOST_DIR)/$(_WIN_SDK_TARGET_SUFFIX) ;
 
 if ! [ GLOB $(_DEVTOOL)/nasm : * ] { exit FATAL\: \"$(_DEVTOOL)/nasm\" not found!  Please, update DEVTOOLS ; }
@@ -46,7 +45,6 @@ local _DEF_C_CMDLINE =
   -fms-compatibility-version=$(_MSC_VER)
   -X -D_TARGET_PC=1 -D_TARGET_PC_WIN=1 -D_TARGET_SIMD_SSE=$(SSEVersion)
   -DWIN32_LEAN_AND_MEAN= -D_USE_MATH_DEFINES -DNOMINMAX -D_ALLOW_KEYWORD_MACROS=
-  -D_USING_V110_SDK71_
   -DDELAYIMP_INSECURE_WRITABLE_HOOKS
   /c /nologo /Zc:forScope /J /Zc:inline
   /Zc:dllexportInlines-
@@ -89,11 +87,17 @@ switch $(PlatformArch) {
   case x86_64 : _DEF_C_CMDLINE += -DWIN64 -D_TARGET_64BIT -D_TARGET_ARCH_X86_64 ;
   case arm64 :  _DEF_C_CMDLINE =  -DWIN64 -D_TARGET_64BIT -D_TARGET_ARCH_ARM64 --target=aarch64-pc-windows-msvc [ StripStrings $(_DEF_C_CMDLINE) : -D_TARGET_SIMD_SSE=$(SSEVersion) ] -D_TARGET_SIMD_NEON  -Wno-pointer-to-int-cast ;
 }
-if $(Analyze) = yes { _DEF_C_CMDLINE = [ StripStrings $(_DEF_C_CMDLINE) : -D_USING_V110_SDK71_ ] --analyze -Werror ; }
+if $(Analyze) = yes { _DEF_C_CMDLINE += --analyze -Werror ; }
 
 if $(Sanitize) != disabled {
   _DEF_C_CMDLINE += -fsanitize=$(Sanitize) ;
+  if $(Sanitize) = address { _DEF_C_CMDLINE += -fsanitize-address-use-after-scope -fsanitize-address-use-after-return=always ; }
+  if $(Sanitize) = undefined { _DEF_C_CMDLINE += -fsanitize-ignorelist=$(Root)/prog/ubsan.ignore ; }
   if $(PlatformArch) = x86 { _DEF_C_CMDLINE += -mllvm -asan-use-private-alias=1 ; }
+}
+
+if $(ClangCoverage) = yes {
+  _DEF_C_CMDLINE += -fprofile-instr-generate -fcoverage-mapping ;
 }
 
 if $(CLangVer) >= 15 { # Note: lex compare
@@ -108,6 +112,8 @@ if $(VCMathOption) = -fp:fast && $(CLangVer) >= 18 { # Note: lex compare
   _DEF_C_CMDLINE += -Wno-nan-infinity-disabled ;
 }
 
+if $(StrictAliasing) = yes { _DEF_C_CMDLINE += /clang:-fstrict-aliasing ; }
+
 if $(PlatformArch) = arm64 {
 } else if $(SSEVersion) = 4  {
   _DEF_C_CMDLINE += -msse4.1 -mpopcnt -mcx16 ;
@@ -121,10 +127,6 @@ if $(UseWholeOpt) = yes {
   UseLLDLink = yes ;
 }
 
-if $(Sanitize) != disabled {
-  UseLLDLink = no ; # currently there is false positive for ODR violation on string literals
-}
-
 if $(UseLLDLink) != yes {
   _LINK = $(_VC_DIR_BIN)/link.exe ;
 } else {
@@ -133,7 +135,8 @@ if $(UseLLDLink) != yes {
 _LIB  = $(_CLANG_DIR)/bin/lld-link.exe /lib ;
 LINK_RESPONSE_MARKER = @@@ ;
 
-_C_COMPILER = $(_CLANG_DIR)/bin/clang-cl.exe $(GDK_C_CMDLINE) $(_DEF_C_CMDLINE) ;
+# CI sets it to a compiler cache launcher (e.g. sccache) via `jam -sCompilerWrapper=sccache`; empty by default
+_C_COMPILER = $(CompilerWrapper) $(_CLANG_DIR)/bin/clang-cl.exe $(GDK_C_CMDLINE) $(_DEF_C_CMDLINE) ;
 _CPP_COMPILER = $(_C_COMPILER) /std:c++$(CPPStd) ;
 _DEP_COMPILER = $(Root)/prog/_jBuild/fastdep-g.exe --cVC80 -D_TARGET_PC=1 -D_TARGET_PC_WIN=1 ;
 _CVTRES_EXE   = $(_VC_DIR_BIN)/cvtres.exe /NOLOGO ;
@@ -162,7 +165,7 @@ switch $(PlatformArch) {
     _LIB  += /machine:arm64 ;
     _ASM_COMPILER  = $(_DEVTOOL)/nasm/nasm.exe -f arm64 ;
     _MASM_COMPILER = $(_VC_DIR)/bin/$(_VC_HOST_DIR)/arm64/ml64.exe -c -nologo ;
-    _GAS_COMPILER = $(_CLANG_DIR)/bin/clang.exe --target=aarch64-pc-windows-msvc -g -c ;
+    _GAS_COMPILER = $(CompilerWrapper) $(_CLANG_DIR)/bin/clang.exe --target=aarch64-pc-windows-msvc -g -c ;
     _DEP_COMPILER += -D_TARGET_ARCH_ARM64 -DWIN64 ;
     _CVTRES_EXE   += /MACHINE:arm64 ;
 }

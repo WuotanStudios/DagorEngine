@@ -4,19 +4,17 @@
 #include <shaders/dag_shaderBlock.h>
 #include <shaders/dag_overrideStates.h>
 #include <drv/3d/dag_matricesAndPerspective.h>
+#include <drv/3d/dag_renderTarget.h>
 #include <render/dag_cur_view.h>
 #include <render/world/wrDispatcher.h>
 #include <landMesh/lmeshManager.h>
 #include <landMesh/lmeshRenderer.h>
 #include <fftWater/fftWater.h>
 #include "landMeshToHeightmapRenderer.h"
+#include <drv/3d/dag_shaderConstants.h>
 
-void render_landmesh_to_heightmap(Texture *heightmap_tex,
-  float heightmap_size,
-  const Point2 &center_pos,
-  const BBox2 *box,
-  const float water_level,
-  Point4 &world_to_heightmap)
+void render_landmesh_to_heightmap(
+  Texture *heightmap_tex, float heightmap_size, const Point2 &center_pos, const BBox2 *box, Point4 &world_to_heightmap)
 {
   if (!heightmap_tex)
     return;
@@ -65,26 +63,21 @@ void render_landmesh_to_heightmap(Texture *heightmap_tex,
 
     SCOPE_RENDER_TARGET;
 
-    d3d::set_render_target(nullptr, 0);
-    d3d::set_depth(heightmap_tex, DepthAccess::RW);
+    d3d::set_render_target({heightmap_tex, 0, 0}, DepthAccess::RW, {});
     d3d::clearview(CLEAR_ZBUFFER, 0, 0.f, 0);
 
-    lmeshRenderer->setLMeshRenderingMode(LMeshRenderingMode::RENDERING_HEIGHTMAP);
     ShaderGlobal::setBlock(globalFrameBlockId, ShaderGlobal::LAYER_FRAME);
 
-    float oldInvGeomDist = lmeshRenderer->getInvGeomLodDist();
-    lmeshRenderer->setInvGeomLodDist(0.5 / heightmap_size);
+    lmeshRenderer->prepare(*lmeshMgr, HmapOrigin(Point3::xVz(origin, 0)));
 
-    lmeshRenderer->prepare(*lmeshMgr, Point3::xVz(origin, 0), 0, water_level);
-
-    lmeshRenderer->setRenderInBBox(levelBox);
+    LandMeshRenderDesc desc;
+    desc.mode = LMeshRenderingMode::RENDERING_HEIGHTMAP;
+    desc.renderInBBox = levelBox;
+    desc.invGeomLodDist = 0.5 / heightmap_size;
     shaders::overrides::set(depthClipState);
     lmeshRenderer->render(reinterpret_cast<mat44f_cref &>(globTm), projectionMatrix, Frustum{globTm}, *lmeshMgr,
-      LandMeshRenderer::RENDER_ONE_SHADER, ::grs_cur_view.pos);
+      LandMeshRenderer::RENDER_ONE_SHADER, desc, ::grs_cur_view.pos, HmapOrigin(Point3::xVz(origin, 0)));
     shaders::overrides::reset();
-    lmeshRenderer->setRenderInBBox(BBox3());
-
-    lmeshRenderer->setInvGeomLodDist(oldInvGeomDist);
   }
 
   // Restore.

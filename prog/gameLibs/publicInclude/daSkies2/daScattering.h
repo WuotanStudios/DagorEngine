@@ -10,7 +10,9 @@
 #include <generic/dag_carray.h>
 #include <shaders/dag_postFxRenderer.h>
 #include <math.h>
+#include <math/dag_Point2.h>
 #include <math/dag_Point3.h>
+#include <math/dag_Point4.h>
 #include <math/dag_color.h>
 #include <drv/3d/dag_consts.h>
 
@@ -47,6 +49,7 @@ struct SkyAtmosphereParams
   _PARAM(float, ozone_alt_dist, 1.f)                      \
   _PARAM(float, ozone_max_alt, 1.f)                       \
   _PARAM_RAND(float, ozone_scale, 1.f)                    \
+  _PARAM(float, polarization_strength, 0.f)               \
   _PARAM(float, sun_brightness, 1.f)                      \
   _PARAM(float, haze_strength, 1.f)                       \
   _PARAM(float, haze_min_angle, 0.f)                      \
@@ -93,6 +96,7 @@ struct PreparedSkiesParams
     OFF,
     ON
   } reprojection = Reprojection::ON;
+  bool strataInLowres = true;
   PreparedSkiesParams() = default;
   PreparedSkiesParams(int lut, int scr, int slices, int trans, float scale, float range, Panoramic pan, Reprojection rep) :
     skiesLUTQuality(lut),
@@ -136,7 +140,7 @@ public:
   SkyAtmosphereParams getParams() const { return current; }
   void init();
   void close();
-  void precompute(bool invalidate_cpu_data); // if invalidate_cpu_data, immediate requests will be cause heavy cpu computations
+  void precompute();
   void renderSky();
   bool prepareSkyForAltitude(const Point3 &origin, float tolerance, uint32_t gen, PreparedSkies *skies, const TMatrix &view_tm,
     const TMatrix4 &proj_tm, uint32_t prepare_frame, PreparedSkies *panorama_skies, const Point3 &primary_light_dir,
@@ -164,8 +168,12 @@ public:
   bool updateColors(); // to be called once per frame. return true if old vals are invalid
 
   void setCPUConsts();
+  // cloud droplet aerosol (mie3), derived from the cloud layers; returns true when
+  // changed (caller bumps the scattering generation to re-bake the LUTs)
+  bool setCloudAerosolInfo(const Point4 &layer0, const Point4 &layer1, const Point2 &rain);
   bool setStatisticalCloudsInfo(float clouds_ms_contribution, float clouds_ms_attenuation, float clouds_start_altitude2,
     float clouds_end_altitude2, float clouds_shadow_coverage, float global_clouds_sigma);
+  bool isGPUReadbackPending() const { return gpuReadbackIrradianceGen >= 0; }
 
 protected:
   Color3 getCpuSingleInscatter(const Point3 &camera, const Point3 &viewdir, float d, const Point3 &skies_sun_light_dir, int steps,
@@ -174,7 +182,11 @@ protected:
   void initCommon();
   bool finishGpuReadback(bool force_sync_readback = false);
   void startGpuReadback();
+  void applyCloudAerosol();
+  Point4 cloudAerosolLayer0 = {0, 0, 1, 1}, cloudAerosolLayer1 = {0, 0, 1, 1};
+  Point2 cloudAerosolRain = {0, 1};
   void invalidateCPUData();
+  void invalidateCPUIrradiance();
   void updateCPUIrradiance(const uint16_t *, int stride); // read halves
   void prepareScattering(PreparedSkies &skies, int w, int h, int d);
   void setParamsToShader();
@@ -187,11 +199,11 @@ protected:
 
   SkyAtmosphereParams current;
 
-  UniqueTexHolder skies_irradiance_texture, skies_transmittance_texture;
-  UniqueBufHolder gpuAtmosphereCb;
+  UniqueTexWithShaderVar skies_irradiance_texture, skies_transmittance_texture;
+  UniqueBufWithShaderVar gpuAtmosphereCb;
 
   // approximated MS https://sebh.github.io/publications/egsr2020.pdf
-  UniqueTexHolder skies_ms_texture;
+  UniqueTexWithShaderVar skies_ms_texture;
   PostFxRenderer indirect_irradiance_ms, skies_approximate_ms_lut_ps;
   eastl::unique_ptr<ComputeShaderElement> skies_approximate_ms_lut_cs, skies_generate_transmittance_cs, indirect_irradiance_ms_cs;
   //--
@@ -206,7 +218,6 @@ protected:
   PostFxRenderer skies_integrate_froxel_scattering_ps;
   eastl::unique_ptr<ComputeShaderElement> skies_integrate_froxel_scattering_cs;
 
-  bool gpuReadbackStarted = false;
-  uint32_t multipleScatteringGeneration = 0;
-  // for precompute
+  uint16_t cpuIrradianceGen = 0; // uint16_t is to avoid having int32_t(-1) value.
+  int32_t gpuReadbackIrradianceGen = -1;
 };

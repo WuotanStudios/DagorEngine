@@ -1,13 +1,17 @@
 options gen2
 options indenting = 4
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module remove_call_args shared private
 
-require ast
-require rtti
+//! Call argument removal annotation.
+//!
+//! ``[remove_call_args(index_list)]`` strips the specified arguments from
+//! a function's call site after the function has been type-checked, while
+//! keeping the arguments available during inference.
+
+require daslib/ast
+require daslib/rtti
 require daslib/ast_boost
 require daslib/templates_boost
 
@@ -15,9 +19,7 @@ require daslib/templates_boost
 [macro_function]
 def get_remove_indices(func) {
     for (ann in func.annotations) {
-        if (ann.annotation.name == "remove_call_args") {
-            return <- get_remove_indices(ann.arguments)
-        }
+        if (ann.annotation.name == "remove_call_args") return <- get_remove_indices(ann.arguments)
     }
     return <- array<int>()
 }
@@ -25,14 +27,9 @@ def get_remove_indices(func) {
 
 [macro_function]
 def get_remove_indices(args : AnnotationArgumentList) {
-    var indices : array<int>
-    for (arg in args) {
-        if (arg.name == "arg") {
-            indices |> push(arg.iValue)
-        }
-    }
-    if (length(indices) > 0) {
-        indices |> sort() <| $(a, b) => a >= b
+    var indices <- [for (arg in args); arg.iValue; where arg.name == "arg"]
+    if (!empty(indices)) {
+        indices |> sort() <| $(a, b) => a > b
     }
     return <- indices
 }
@@ -40,18 +37,16 @@ def get_remove_indices(args : AnnotationArgumentList) {
 
 [function_macro(name="remove_call_args")]
 class RemoveCallArgsMacro : AstFunctionAnnotation {
-    //! This macro remove all arguments by given indeces [remove_call_args(arg=(1,2,3))]
+    //! This macro removes all arguments by given indices [remove_call_args(arg=(1,2,3))]
     def override apply(var func : FunctionPtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
         var removeIndices <- get_remove_indices(args)
-        if (length(removeIndices) == 0) {
-            return true
-        }
+        if (empty(removeIndices)) return true
 
         for (arg in func.arguments) {
-            arg.flags |= VariableFlags.marked_used // to disable errors: unused function argument
+            arg.flags.marked_used = true // to disable errors: unused function argument
         }
 
-        var inscope fn <- clone_function(func)
+        var fn = clone_function(func)
         fn.flags |= FunctionFlags.generated | FunctionFlags.exports
         for (idx in removeIndices) {
             fn.arguments |> erase(idx)
@@ -68,14 +63,12 @@ class RemoveCallArgsMacro : AstFunctionAnnotation {
         return true
     }
 
-    def override transform(var call : smart_ptr<ExprCallFunc>; var errors : das_string) : ExpressionPtr {
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
         var removeIndices <- get_remove_indices(call.func)
 
-        if (length(removeIndices) == 0) {
-            return <- default<ExpressionPtr>
-        }
+        if (empty(removeIndices)) return null
 
-        var inscope newCall <- clone_expression(call)
+        var newCall = clone_expression(call)
         var ncall = newCall as ExprCall
         for (idx in removeIndices) {
             ncall.arguments |> erase(idx)

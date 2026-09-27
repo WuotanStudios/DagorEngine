@@ -6,9 +6,11 @@
 
 #include <drv/3d/dag_decl.h>
 #include <drv/3d/dag_barrier.h>
+#include <drv/3d/dag_enhanced_barrier.h>
 #include <drv/3d/dag_consts.h>
 #include <drv/3d/dag_resource.h>
 #include <drv/3d/dag_tex3d.h>
+#include <drv/3d/dag_multi_interface.h>
 #include <util/dag_globDef.h>
 #include <vecmath/dag_vecMathDecl.h>
 #include <EASTL/initializer_list.h>
@@ -21,7 +23,7 @@ class Driver3dInitCallback;
 class Sbuffer;
 enum class Drv3dCommand;
 
-//--- Driver3dDesc & initialization -------
+//--- DriverDesc & initialization -------
 #include "rayTrace/dag_drvRayTrace.h"
 
 // main window proc
@@ -66,7 +68,11 @@ enum
 void update_window_mode();
 
 static constexpr int RENDER_TO_WHOLE_ARRAY = 1023;
+} // namespace d3d
+
 #if !_TARGET_D3D_MULTI
+namespace d3d _MULTI_INTERFACE
+{
 // Driver initialization API
 
 /// initalizes 3d device driver
@@ -76,11 +82,11 @@ bool init_driver();
 bool is_inited();
 
 /// start up, read cfg, create window, init 3d hard&soft, ...
-/// if renderwnd!=NULL, mainwnd and renderwnd are used for rendering (when possible)
+/// mainwnd is used for rendering (or created and returned back when nullptr passed)
 /// on error, returns false
 /// on sucess, return true
-bool init_video(void *hinst, main_wnd_f *, const char *wcname, int ncmdshow, void *&mainwnd, void *renderwnd, void *hicon,
-  const char *title, Driver3dInitCallback *cb);
+bool init_video(void *hinst, main_wnd_f *, const char *wcname, int ncmdshow, void *&mainwnd, void *hicon, const char *title,
+  Driver3dInitCallback *cb);
 
 /// shutdown driver and release all resources
 void release_driver();
@@ -114,13 +120,6 @@ bool reset_device();
 /// app_active==false is hint to the driver
 /// returns false on error
 bool update_screen(uint32_t frame_id = 0, bool app_active = true);
-
-/**
- * @brief If the update_screen(bool) works asynchronously then under certain conditions it will block the execution
- * until the previously called update_screen(bool) is finished.
- * @param force Even if the internal conditions don't require the wait, the execution will wait for the present to finish
- */
-void wait_for_async_present(bool force = false);
 
 /**
  * @brief Marks the start of a new frame. Additionally it blocks the execution until the GPU finishes on going render task for delaying
@@ -194,14 +193,20 @@ bool get_vrr_supported();
 bool get_vsync_enabled();
 bool enable_vsync(bool enable);
 
-#include "rayTrace/rayTracedrv3d.inl.h"
-
 // See ResourceBarrierDesc and
 // https://dagor.rtd.gaijin.lan/en/latest/api-references/dagor-render/index/resource_and_execution_barriers.html
 void resource_barrier(const ResourceBarrierDesc &desc, GpuPipeline gpu_pipeline = GpuPipeline::GRAPHICS);
+void enhanced_texture_barrier(const TextureBarrier &barrier, BaseTexture *texture);
+void enhanced_buffer_barrier(const BufferBarrier &barrier, Sbuffer *buffer);
+void enhanced_barrier_batch(dag::ConstSpan<TextureBarrierBatchItem> texture_barriers,
+  dag::ConstSpan<BufferBarrierBatchItem> buffer_barriers);
+} // namespace d3d _MULTI_INTERFACE
 
+#include "rayTrace/rayTracedrv3d.inl.h"
 #endif
 
+namespace d3d
+{
 #if _TARGET_XBOX || _TARGET_C1 || _TARGET_C2
 void resummarize_htile(BaseTexture *tex);
 #else

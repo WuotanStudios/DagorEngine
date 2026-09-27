@@ -5,7 +5,6 @@
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_interop.h"
 #include "daScript/ast/ast_handle.h"
-#include "daScript/ast/ast_typefactory_bind.h"
 #include "daScript/simulate/bind_enum.h"
 #include "dasIMGUI_NODE_EDITOR.h"
 #include "need_dasIMGUI_NODE_EDITOR.h"
@@ -15,7 +14,7 @@ void Module_dasIMGUI_NODE_EDITOR::initFunctions_3() {
 // from imgui-node-editor/imgui_node_editor.h:330:28
 	makeExtern< bool (*)(ax::NodeEditor::PinId *,const ImVec4 &,float) , ax::NodeEditor::QueryNewNode , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"QueryNewNode","ax::NodeEditor::QueryNewNode")
 		->args({"pinId","color","thickness"})
-		->arg_init(2,make_smart<ExprConstFloat>(1))
+		->arg_init(2,new ExprConstFloat(1))
 		->addToModule(*this, SideEffects::worstDefault);
 // from imgui-node-editor/imgui_node_editor.h:331:28
 	makeExtern< bool (*)() , ax::NodeEditor::AcceptNewItem , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"AcceptNewItem","ax::NodeEditor::AcceptNewItem")
@@ -23,7 +22,7 @@ void Module_dasIMGUI_NODE_EDITOR::initFunctions_3() {
 // from imgui-node-editor/imgui_node_editor.h:332:28
 	makeExtern< bool (*)(const ImVec4 &,float) , ax::NodeEditor::AcceptNewItem , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"AcceptNewItem","ax::NodeEditor::AcceptNewItem")
 		->args({"color","thickness"})
-		->arg_init(1,make_smart<ExprConstFloat>(1))
+		->arg_init(1,new ExprConstFloat(1))
 		->addToModule(*this, SideEffects::worstDefault);
 // from imgui-node-editor/imgui_node_editor.h:333:28
 	makeExtern< void (*)() , ax::NodeEditor::RejectNewItem , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"RejectNewItem","ax::NodeEditor::RejectNewItem")
@@ -31,7 +30,7 @@ void Module_dasIMGUI_NODE_EDITOR::initFunctions_3() {
 // from imgui-node-editor/imgui_node_editor.h:334:28
 	makeExtern< void (*)(const ImVec4 &,float) , ax::NodeEditor::RejectNewItem , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"RejectNewItem","ax::NodeEditor::RejectNewItem")
 		->args({"color","thickness"})
-		->arg_init(1,make_smart<ExprConstFloat>(1))
+		->arg_init(1,new ExprConstFloat(1))
 		->addToModule(*this, SideEffects::worstDefault);
 // from imgui-node-editor/imgui_node_editor.h:335:28
 	makeExtern< void (*)() , ax::NodeEditor::EndCreate , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"EndCreate","ax::NodeEditor::EndCreate")
@@ -42,8 +41,8 @@ void Module_dasIMGUI_NODE_EDITOR::initFunctions_3() {
 // from imgui-node-editor/imgui_node_editor.h:338:28
 	makeExtern< bool (*)(ax::NodeEditor::LinkId *,ax::NodeEditor::PinId *,ax::NodeEditor::PinId *) , ax::NodeEditor::QueryDeletedLink , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"QueryDeletedLink","ax::NodeEditor::QueryDeletedLink")
 		->args({"linkId","startId","endId"})
-		->arg_init(1,make_smart<ExprConstPtr>())
-		->arg_init(2,make_smart<ExprConstPtr>())
+		->arg_init(1,new ExprConstPtr())
+		->arg_init(2,new ExprConstPtr())
 		->addToModule(*this, SideEffects::worstDefault);
 // from imgui-node-editor/imgui_node_editor.h:339:28
 	makeExtern< bool (*)(ax::NodeEditor::NodeId *) , ax::NodeEditor::QueryDeletedNode , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"QueryDeletedNode","ax::NodeEditor::QueryDeletedNode")
@@ -52,7 +51,7 @@ void Module_dasIMGUI_NODE_EDITOR::initFunctions_3() {
 // from imgui-node-editor/imgui_node_editor.h:340:28
 	makeExtern< bool (*)(bool) , ax::NodeEditor::AcceptDeletedItem , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"AcceptDeletedItem","ax::NodeEditor::AcceptDeletedItem")
 		->args({"deleteDependencies"})
-		->arg_init(0,make_smart<ExprConstBool>(true))
+		->arg_init(0,new ExprConstBool(true))
 		->addToModule(*this, SideEffects::worstDefault);
 // from imgui-node-editor/imgui_node_editor.h:341:28
 	makeExtern< void (*)() , ax::NodeEditor::RejectDeletedItem , SimNode_ExtFuncCall , imgui_node_editorTempFn>(lib,"RejectDeletedItem","ax::NodeEditor::RejectDeletedItem")

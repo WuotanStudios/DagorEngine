@@ -5,8 +5,14 @@
 #include <EASTL/fixed_string.h>
 #include <dag/dag_vector.h>
 #include <drv/3d/dag_texFlags.h>
-#include <ecs/core/entitySystem.h>
-#include <render/world/cameraParams.h>
+#include <daECS/core/entitySystem.h>
+#include <daECS/core/ecsQuery.h>
+#include <daECS/core/component.h>
+#include <daECS/core/componentsMap.h>
+#include <daECS/core/componentTypes.h>
+#include <daECS/core/entityComponent.h>
+#include <daECS/core/entityManager.h>
+#include <render/cameraParams.h>
 #include <render/daFrameGraph/nodeHandle.h>
 #include "../shaders/dagdp_constants.hlsli"
 
@@ -103,6 +109,7 @@ struct RulesBuilder
   uint32_t maxTriangles = 1 << 20;
   uint32_t maxMeshes = 1 << 10;
   uint32_t maxTiles = 1 << 10;
+  uint32_t max3dTiles = 1 << 10;
   uint32_t maxVolumes = 1 << 6;
   int targetMeshLod = 2;
 };
@@ -120,6 +127,8 @@ enum class ViewKind
 {
   MAIN_CAMERA, // DNG: main camera.
   DYN_SHADOWS, // DNG: dynamic light shadows.
+  BVH,         // DNG: BVH for raytracing
+  CSM_SHADOWS, // DNG: CSM shadows, viewport per cascade.
   // TODO: other types like CSM, probes, etc...
   COUNT
 };
@@ -152,6 +161,7 @@ struct Viewport
   DPoint3 worldPos;
   float maxDrawDistance; // Must be clipped, if greater than the maxDrawDistance of its View.
   Frustum frustum;
+  int csmCascade = -1;
 };
 
 struct ViewPerFrameData
@@ -172,7 +182,7 @@ ECS_BROADCAST_EVENT_TYPE(EventInitialize);
 ECS_BROADCAST_EVENT_TYPE(EventRecreateViews, const GlobalConfig *, ViewInserter);
 ECS_BROADCAST_EVENT_TYPE(EventInvalidateViews);
 ECS_BROADCAST_EVENT_TYPE(EventViewProcess, const RulesBuilder &, const ViewInfo &, ViewBuilder *);
-ECS_BROADCAST_EVENT_TYPE(EventViewFinalize, const ViewInfo &, const ViewBuilder &, NodeInserter, const RulesBuilder &);
+ECS_BROADCAST_EVENT_TYPE(EventViewFinalize, const ViewInfo &, const ViewBuilder &, NodeInserter, const RulesBuilder &, bool);
 ECS_BROADCAST_EVENT_TYPE(EventFinalize, NodeInserter);
 
 void set_global_range_scale(float scale);

@@ -45,11 +45,11 @@ d3d::ResUpdateBuffer *allocate_update_buffer(BaseTex *texture, Image *image, Mip
     mipExtents.width);
   D3D_CONTRACT_ASSERTF_RETURN(offset.y < mipExtents.height, nullptr, "DX12: offset.y: %u < mipExtents.height: %u", offset.y,
     mipExtents.height);
-  D3D_CONTRACT_ASSERTF_RETURN(offset.z < mipExtents.depth, nullptr, "DX12: offset.z: %u < mipExtents.width: %u", offset.z,
+  D3D_CONTRACT_ASSERTF_RETURN(offset.z < mipExtents.depth, nullptr, "DX12: offset.z: %u < mipExtents.depth: %u", offset.z,
     mipExtents.depth);
-  D3D_CONTRACT_ASSERTF_RETURN(outline.width <= mipExtents.width, nullptr, "DX12: outline.depth: %u <= mipExtents.depth: %u",
+  D3D_CONTRACT_ASSERTF_RETURN(outline.width <= mipExtents.width, nullptr, "DX12: outline.width: %u <= mipExtents.width: %u",
     outline.width, mipExtents.width);
-  D3D_CONTRACT_ASSERTF_RETURN(outline.height <= mipExtents.height, nullptr, "DX12: outline.depth: %u <= mipExtents.depth: %u",
+  D3D_CONTRACT_ASSERTF_RETURN(outline.height <= mipExtents.height, nullptr, "DX12: outline.height: %u <= mipExtents.height: %u",
     outline.height, mipExtents.height);
   D3D_CONTRACT_ASSERTF_RETURN(outline.depth <= mipExtents.depth, nullptr, "DX12: outline.depth: %u <= mipExtents.depth: %u",
     outline.depth, mipExtents.depth);
@@ -69,7 +69,7 @@ d3d::ResUpdateBuffer *allocate_update_buffer(BaseTex *texture, Image *image, Mip
   rubImp->uploadInfo.layout.Footprint = subResInfo.footprint;
   rubImp->uploadInfo.subresourceIndex = image->mipAndLayerIndexToStateIndex(mip, array).index();
   rubImp->uploadInfo.imageOffset = offset;
-  rubImp->slicePitch = subResInfo.rowByteSize * subResInfo.rowCount;
+  rubImp->slicePitch = subResInfo.footprint.RowPitch * subResInfo.rowCount;
 
   return reinterpret_cast<d3d::ResUpdateBuffer *>(rubImp);
 }
@@ -97,6 +97,8 @@ d3d::ResUpdateBuffer *d3d::allocate_update_buffer_for_tex(BaseTexture *dest_base
 {
   D3D_CONTRACT_ASSERT_RETURN(dest_base_texture, nullptr);
   STORE_RETURN_ADDRESS();
+
+  ScopedCommitLock lock{drv3d_dx12::get_device().getContext()};
 
   BaseTex *texture = cast_to_texture_base(dest_base_texture);
   Image *image = texture->getDeviceImage();

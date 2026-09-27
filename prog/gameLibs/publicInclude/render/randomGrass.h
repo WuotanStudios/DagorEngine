@@ -199,6 +199,7 @@ public:
   int addLayer(GrassLayerInfo &layer_info);
   void setLayerRes(GrassLayer *layer);
   GameResource *loadLayerResource(const char *resName);
+  void releaseLayerResource(const void *res);
 
 #if DAGOR_DBGLEVEL > 0
 
@@ -241,7 +242,7 @@ protected:
   void setLodStates(const GrassLod &lod);
   void closeTextures();
 
-  UniqueBufHolder layerDataVS, layerDataColor;
+  UniqueBufWithShaderVar layerDataVS, layerDataColor;
 
   float grassRadiusMul;
   float grassDensityMul;

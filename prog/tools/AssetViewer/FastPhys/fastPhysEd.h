@@ -82,6 +82,7 @@ public:
   FpdBone *getBoneByName(const char *name);
 
   IFPObject *getSelObject();
+  void getSelectedObjects(dag::Vector<IFPObject *> &objects);
 
   bool showNodeList(Tab<int> &sels);
 
@@ -113,7 +114,6 @@ protected:
   void exportBinaryDump();
   void export_fast_phys(mkbindump::BinDumpSaveCB &cb);
   void revert();
-  bool loadSkeleton(DagorAssetMgr &mgr, SimpleString sa_name, ILogWriter &log);
   bool loadCharacter(DagorAssetMgr &mgr, SimpleString sa_name, ILogWriter &log);
 };
 

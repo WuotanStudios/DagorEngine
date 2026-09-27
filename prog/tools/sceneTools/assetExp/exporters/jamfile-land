@@ -6,21 +6,20 @@ Target = tools/sceneTools/landClsExp ;
 
 include $(Root)/$(Location)/../dabuild_plugin_common.jam ;
 
-Sources = landClsExp.cpp ;
+Sources = landClsExp.cpp landClsExpStubs.cpp ;
 
 AddIncludes =
   $(Root)/prog/tools/sharedInclude
   $(Root)/prog/tools/sceneTools/daEditorX/include
 ;
 
-UseProgLibs =
+UseProgLibs +=
   engine/startup
   engine/image
 
   3rdPartyLibs/hash
 
   tools/libTools/assetMgr
-  tools/libTools/util
   tools/sceneTools/daEditorX/services/bitMaskMgr
 ;
 

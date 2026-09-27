@@ -18,10 +18,11 @@
 #include <render/toroidal_update.h>
 #include <render/toroidal_update_regions.h>
 #include <render/toroidalHeightmap.h>
+#include <landMesh/vtexRenderMode.h>
 
 namespace var
 {
-static ShaderVariableInfo clipmap_writes_height_only("clipmap_writes_height_only", true);
+static ShaderVariableInfo render_with_normalmap("render_with_normalmap", true);
 };
 
 void ToroidalHeightmap::close() { toroidalHeightmap.close(); }
@@ -62,7 +63,7 @@ void ToroidalHeightmap::init(int heightmap_size, float near_lod_size, float far_
   }
 
   toroidalHeightmap = dag::create_array_tex(heightmapCacheSize, heightmapCacheSize, LOD_COUNT, heightmapFormat | TEXCF_RTARGET, 1,
-    "toroidal_heightmap_texarray");
+    "toroidal_heightmap_texarray", RESTAG_LAND);
 
   // shader variables
   toroidalClipmap_world2uv_1VarId = ::get_shader_glob_var_id("toroidalClipmap_world2uv_1", true);
@@ -87,13 +88,13 @@ void ToroidalHeightmap::init(int heightmap_size, float near_lod_size, float far_
 void ToroidalHeightmap::setBlackTex(TEXTUREID black_tex_array)
 {
   // always sample center of texture
-  ShaderGlobal::set_color4(toroidalClipmap_world2uv_1VarId, Color4(0, 0, 0.5, 0.5));
+  ShaderGlobal::set_float4(toroidalClipmap_world2uv_1VarId, Color4(0, 0, 0.5, 0.5));
   ShaderGlobal::set_texture(toroidalHeightmap.getVarId(), black_tex_array);
 }
 
 void ToroidalHeightmap::setHeightmapTex()
 {
-  ShaderGlobal::set_color4(toroidalClipmap_world2uv_1VarId, worldToToroidal[0]); // restore correct coords
+  ShaderGlobal::set_float4(toroidalClipmap_world2uv_1VarId, worldToToroidal[0]); // restore correct coords
   toroidalHeightmap.setVar();
 }
 
@@ -229,7 +230,8 @@ void ToroidalHeightmap::updateHeightmap(ToroidalHeightmapRenderer &renderer, con
   SCOPE_RENDER_TARGET;
   SCOPE_VIEW_PROJ_MATRIX;
 
-  STATE_GUARD_0(ShaderGlobal::set_int(var::clipmap_writes_height_only, VALUE), 1);
+  STATE_GUARD(ShaderGlobal::set_int(var::render_with_normalmap, VALUE), (int)VTEX_RENDER_DISPLACEMENT,
+    ShaderGlobal::get_int(var::render_with_normalmap));
   // update all generated regions for all cascades
   for (int cascadeNo = LOD_COUNT - 1; cascadeNo >= 0; cascadeNo--)
   {
@@ -239,7 +241,7 @@ void ToroidalHeightmap::updateHeightmap(ToroidalHeightmapRenderer &renderer, con
     if ((texelSize < min_texel_size) || (quadRegions[cascadeNo].size() == 0))
       continue;
 
-    d3d::set_render_target(toroidalHeightmap.getArrayTex(), cascadeNo, 0);
+    d3d::set_render_target({}, DepthAccess::RW, {{toroidalHeightmap.getArrayTex(), 0, static_cast<uint32_t>(cascadeNo)}});
 
     // set matrix
     renderer.startRenderTiles(Point2::xz(camera_position));
@@ -254,10 +256,10 @@ void ToroidalHeightmap::updateHeightmap(ToroidalHeightmapRenderer &renderer, con
   }
 
   // shader var
-  ShaderGlobal::set_color4(toroidalClipmap_world2uv_1VarId, worldToToroidal[0]);
-  ShaderGlobal::set_color4(toroidalClipmap_world2uv_2VarId, worldToToroidal[1]);
+  ShaderGlobal::set_float4(toroidalClipmap_world2uv_1VarId, worldToToroidal[0]);
+  ShaderGlobal::set_float4(toroidalClipmap_world2uv_2VarId, worldToToroidal[1]);
 
-  ShaderGlobal::set_color4(toroidalClipmap_world_offsetsVarId, uvOffset[0].x, uvOffset[0].y, uvOffset[1].x, uvOffset[1].y);
+  ShaderGlobal::set_float4(toroidalClipmap_world_offsetsVarId, uvOffset[0].x, uvOffset[0].y, uvOffset[1].x, uvOffset[1].y);
 
   toroidalHeightmap.setVar();
   d3d::resource_barrier({toroidalHeightmap.getBaseTex(), RB_RO_SRV | RB_STAGE_PIXEL, 0, 0});

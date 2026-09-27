@@ -2,14 +2,15 @@
 #pragma once
 
 #include <perfMon/dag_perfTimer.h>
-#include <perfMon/dag_pix.h>
 #if _TARGET_C1 | _TARGET_C2
 
 #endif
 #include "stl/daProfilerFwdStl.h"
 #include "daProfilerDefines.h"
 
+
 //! signals to the processor that the thread is doing nothing. Not relevant to OS thread scheduling.
+#ifndef cpu_yield
 #if _TARGET_SIMD_SSE
 #include <emmintrin.h> // _mm_pause
 #define cpu_yield _mm_pause
@@ -17,6 +18,7 @@
 #define cpu_yield() __asm__ __volatile__("yield")
 #else
 #define cpu_yield() ((void)0)
+#endif
 #endif
 
 #define SPINS_BEFORE_SLEEP 8192
@@ -38,6 +40,7 @@ void sleep_msec(int msec);
 uint64_t global_timestamp();
 uint32_t time_since_launch_msec();
 uint64_t gpu_frequency();
+uint32_t gpu_current_clock_mhz();
 uint32_t get_current_process_id();
 uint32_t get_logical_cores();
 uint64_t get_current_thread_id();
@@ -78,20 +81,23 @@ inline T clamp(const T &v, const T &mn, const T &mx)
 }
 } // namespace da_profiler
 
-#if _TARGET_XBOX
+#if _TARGET_PC_WIN || _TARGET_XBOX
+
+void BEGIN_CPU_EVENT(const char *);
+void END_CPU_EVENT();
 
 #define PLATFORM_EVENT_START(enabled, label) \
   {                                          \
     if (enabled)                             \
     {                                        \
-      PIX_BEGIN_CPU_EVENT(label);            \
+      BEGIN_CPU_EVENT(label);                \
     }                                        \
   }
 #define PLATFORM_EVENT_STOP(enabled) \
   {                                  \
     if (enabled)                     \
     {                                \
-      PIX_END_CPU_EVENT();           \
+      END_CPU_EVENT();               \
     }                                \
   }
 

@@ -9,6 +9,7 @@
 #include <generic/dag_carray.h>
 #include <dag/dag_relocatable.h>
 #include <util/dag_bitFlagsMask.h>
+#include <util/dag_compilerDefs.h>
 
 #include <supp/dag_define_KRNLIMP.h>
 
@@ -16,6 +17,7 @@ class DataBlock;
 struct DataBlockShared;
 struct DataBlockOwned;
 struct DBNameMap;
+struct BufferedWriter;
 
 class Point2;
 class Point3;
@@ -54,6 +56,7 @@ enum class ReadFlag : uint8_t
   BINARY_ONLY = 2,   //< don't try to parse text files
   RESTORE_FLAGS = 4, //< restore sticky flags state after load() call
   ALLOW_SS = 8,      //< allow simple string during load call (see DataBlock::allowSimpleString)
+  NO_INCLUDES = 16,  //< reject 'include' directives while parsing text (sticky flag); fails the load even in ROBUST mode
 
 #if DAGOR_DBGLEVEL < 1
   ROBUST_IN_REL = ROBUST,
@@ -99,7 +102,7 @@ bool are_approximately_equal(const DataBlock &lhs, const DataBlock &rhs, float e
 /// DataBlock tree contents can be serialized in binary or text form.
 ///
 /// Text files of this format usually have extension ".blk".
-class DataBlock
+class DAGOR_WARN_IF_UNUSED DataBlock
 {
 public:
   KRNLIMP static const DataBlock emptyBlock;
@@ -112,6 +115,11 @@ public:
   KRNLIMP static bool fatalOnBadVarType;   // def= true;
   KRNLIMP static bool fatalOnMissingVar;   // def= true;
 
+  /// Enable strict (fatal) mode for all error categories
+  static KRNLIMP void enableStrictMode();
+  /// Disable strict (fatal) mode for all error categories (the default)
+  static KRNLIMP void disableStrictMode();
+
   //! when true, allows parsing 'param=val' just like 'param:t=val'
   KRNLIMP static bool allowSimpleString; // def= false;
 
@@ -123,6 +131,8 @@ public:
   KRNLIMP static bool parseOverridesIgnored; // def= false;
   //! when true, comments are not removed but added as 'special' string params
   KRNLIMP static bool parseCommentsAsParams; // def= false;
+  //! when true, writes blocks with one param in one line
+  KRNLIMP static bool writeOneParamBlockCompact; // def= false;
 
   //! error reporting pipe
   struct IErrorReporterPipe
@@ -191,7 +201,9 @@ public:
   };
 
   /// Default constructor, constructs empty block.
-  KRNLIMP DataBlock(IMemAlloc *allocator = tmpmem);
+  KRNLIMP DataBlock();
+  explicit DataBlock(IMemAlloc *) : DataBlock() {} // Legacy compat, allocator isnt used anymore
+  DataBlock(decltype(nullptr)) = delete;
 
   /// Constructor that loads DataBlock tree from specified file.
   /// If you want error checking, use default constructor and load().
@@ -267,22 +279,32 @@ public:
   /// @{
 
   /// Save this DataBlock (and its sub-tree) to the specified file (text form)
-  inline bool saveToTextFile(const char *filename) const;
+  inline bool saveToTextFileEx(const char *filename, int write_buf_sz) const;
+  inline bool saveToTextFile(const char *filename) const { return saveToTextFileEx(filename, 4 << 10); }
 
   /// Save this DataBlock (and its sub-tree) to the specified file (text compact form)
-  inline bool saveToTextFileCompact(const char *filename) const;
+  inline bool saveToTextFileCompactEx(const char *filename, int write_buf_sz) const;
+  inline bool saveToTextFileCompact(const char *filename) const { return saveToTextFileCompactEx(filename, 64 << 10); }
 
   /// Save this DataBlock (and its sub-tree) to the arbitrary stream (text form)
-  KRNLIMP bool saveToTextStream(IGenSave &cwr) const;
+  KRNLIMP bool saveToTextStream(IGenSave &cwr, int write_buf_sz = 4 << 10, bool write_arrays = false) const;
 
   /// Save this DataBlock (and its sub-tree) to the arbitrary stream in compact form (text form)
-  KRNLIMP bool saveToTextStreamCompact(IGenSave &cwr) const;
+  KRNLIMP bool saveToTextStreamCompact(IGenSave &cwr, int write_buf_sz = 64 << 10) const;
 
   /// Save this DataBlock (and its sub-tree) to arbitrary stream (binary form)
   KRNLIMP bool saveToStream(IGenSave &cwr) const;
 
+  /// Save this DataBlock (and its sub-tree) to arbitrary stream (binary form) with data deduplication:
+  /// blocks with identical param runs share params storage (both in the dump and when reloaded),
+  /// so the DataBlock reloaded from such dump occupies less memory.
+  /// NOTE: writes format label \6 which older engine builds do not recognize;
+  /// do not use for data that such readers must be able to load
+  KRNLIMP bool saveToStreamDedup(IGenSave &cwr) const;
+
   /// Print this DataBlock (and its sub-tree) to the arbitrary text stream with limitations; returns true when whole BLK is written
-  inline bool printToTextStreamLimited(IGenSave &cwr, int max_out_line_num = -1, int max_level_depth = -1, int init_indent = 0) const;
+  inline bool printToTextStreamLimited(IGenSave &cwr, int max_out_line_num = -1, int max_level_depth = -1, int init_indent = 0,
+    int write_buf_sz = 4 << 10, bool write_arrays = false) const;
 
 
   /// @}
@@ -552,9 +574,10 @@ public:
   KRNLIMP bool loadBinDumpWithSharedNamemap(IGenLoad &crd, const DBNameMap *shared_nm, const ZSTD_DDict_s *dict = nullptr);
 
   /// Save DataBlock tree to binary stream (optionally using namemap stored separately)
-  KRNLIMP bool saveDumpToBinStream(IGenSave &cwr, const DBNameMap *ro) const;
-  /// Load DataBlock tree from binary stream using namemap stored separately
-  KRNLIMP bool loadFromBinDump(IGenLoad &cr, const DBNameMap *ro);
+  KRNLIMP bool saveDumpToBinStream(IGenSave &cwr, const DBNameMap *ro, bool dedup = false) const;
+  /// Load DataBlock tree from binary stream using namemap stored separately;
+  /// dedup_ofs corresponds to the dedup flag the dump was saved with (explicit param data offsets)
+  KRNLIMP bool loadFromBinDump(IGenLoad &cr, const DBNameMap *ro, bool dedup_ofs = false);
 
 protected:
   static constexpr int INPLACE_PARAM_SIZE = 4;
@@ -592,9 +615,9 @@ protected:
   DataBlock(DataBlockShared *s, const char *nm);
   DataBlock(DataBlockShared *s, int nid, uint16_t pcnt, uint16_t bcnt, uint32_t fBlock, uint32_t ofs_);
 
-  void saveToBinStreamWithoutNames(const DataBlockShared &names, IGenSave &cwr) const;
+  void saveToBinStreamWithoutNames(const DataBlockShared &names, IGenSave &cwr, bool dedup) const;
   template <bool print_with_limits>
-  bool writeText(IGenSave &cwr, int lev, int *max_ln, int max_lev) const;
+  bool writeText(BufferedWriter &cwr, int lev, int *max_ln, int max_lev, bool write_arrays = false) const;
 
   KRNLIMP bool loadText(const char *text, int text_length, const char *fname, DataBlock::IFileNotify *fnotify);
   KRNLIMP bool loadFromStream(IGenLoad &crd, const char *fname, DataBlock::IFileNotify *fnotify, unsigned hint_size);
@@ -774,17 +797,17 @@ KRNLIMP bool load_from_stream(DataBlock &blk, IGenLoad &crd, ReadFlags flg = Rea
   DataBlock::IFileNotify *fnotify = nullptr, unsigned hint_size = 128);
 
 /// Save BLK (and its sub-tree) to the specified file (text form)
-KRNLIMP bool save_to_text_file(const DataBlock &blk, const char *filename);
+KRNLIMP bool save_to_text_file(const DataBlock &blk, const char *filename, int write_buf_sz = 4 << 10);
 
 /// Save BLK (and its sub-tree) to the specified file (text form) in compact form
-KRNLIMP bool save_to_text_file_compact(const DataBlock &blk, const char *filename);
+KRNLIMP bool save_to_text_file_compact(const DataBlock &blk, const char *filename, int write_buf_sz = 4 << 10);
 
 /// Save BLK (and its sub-tree) to the specified file (binary form)
 KRNLIMP bool save_to_binary_file(const DataBlock &blk, const char *filename);
 
 /// Print this DataBlock (and its sub-tree) to the arbitrary text stream with limitations; returns true when whole BLK is written
 KRNLIMP bool print_to_text_stream_limited(const DataBlock &blk, IGenSave &cwr, int max_out_line_num = -1, int max_level_depth = -1,
-  int init_indent = 0);
+  int init_indent = 0, int write_buf_sz = 4 << 10, bool write_arrays = false);
 
 /// Save BLK (and its sub-tree) to the specified file (binary form, packed format)
 KRNLIMP bool pack_to_binary_file(const DataBlock &blk, const char *filename, int approx_sz = 16 << 10);
@@ -821,6 +844,14 @@ static inline const char *resolve_short_type(uint32_t type)
   return types[type];
 }
 
+static inline const char *resolve_short_type_len(uint32_t type, int &str_len)
+{
+  static const int typeLen[DataBlock::TYPE_COUNT + 1] = {4, 1, 1, 1, 2, 2, 2, 3, 3, 1, 1, 1, 3, 3, 3};
+
+  str_len = typeLen[type < DataBlock::TYPE_COUNT ? type : DataBlock::TYPE_COUNT];
+  return resolve_short_type(type);
+}
+
 static inline uint32_t get_type_size(uint32_t type)
 {
   static const uint8_t sizes[DataBlock::TYPE_COUNT + 1] = {0, 8, 4, 4, 8, 12, 16, 8, 12, 1, 4, 12 * 4, 8, 16, 0};
@@ -841,6 +872,16 @@ KRNLIMP bool write_names(IGenSave &cwr, const DBNameMap &names, uint64_t *names_
 KRNLIMP bool read_names(IGenLoad &cr, DBNameMap &names, uint64_t *names_hash);
 KRNLIMP int db_names_count(DBNameMap *);
 
+struct ShrinkStats
+{
+  int added = 0;
+  int removed = 0;
+  int placeholders = 0;
+};
+
+//! return new shared name map with strings from src, but use order from order param
+KRNLIMP DBNameMap *shrink_names_saving_order(const DBNameMap &src, const DBNameMap &order, ShrinkStats &stats);
+
 //! returns shared name map for specified vromfs (acquires reference)
 KRNLIMP DBNameMap *get_vromfs_shared_name_map(const VirtualRomFsData *fs);
 //! releases reference to shared name map; returns residual ref count
@@ -850,6 +891,8 @@ KRNLIMP int release_vromfs_shared_name_map(DBNameMap *nm);
 KRNLIMP ZSTD_DDict_s *get_vromfs_blk_ddict(const VirtualRomFsData *fs);
 //! releases reference to ZSTD decoder dictionary; returns residual ref count
 KRNLIMP int release_vromfs_blk_ddict(ZSTD_DDict_s *ddict);
+//! drops the blk ddict left in the cache by a non-intrusive vromfs (which bypasses the unmount hook)
+KRNLIMP void discard_non_intrusive_vromfs_blk_ddict(const VirtualRomFsData *fs);
 
 //! returns the hash of ZSTD dictionary corresponding to given shared namemap
 KRNLIMP dag::ConstSpan<char> get_vromfs_dict_hash(dag::ConstSpan<char> shared_nm_data);
@@ -992,13 +1035,20 @@ inline T DataBlock::getByNameId(int paramNameId, const T &def) const
   return isOwned() ? getByNameId<T, true>(paramNameId, def) : getByNameId<T, false>(paramNameId, def);
 }
 
-inline bool DataBlock::saveToTextFile(const char *fn) const { return dblk::save_to_text_file(*this, fn); }
-
-inline bool DataBlock::saveToTextFileCompact(const char *fn) const { return dblk::save_to_text_file_compact(*this, fn); }
-
-inline bool DataBlock::printToTextStreamLimited(IGenSave &cwr, int max_out_line_num, int max_level_depth, int init_indent) const
+inline bool DataBlock::saveToTextFileEx(const char *fn, int write_buf_sz) const
 {
-  return dblk::print_to_text_stream_limited(*this, cwr, max_out_line_num, max_level_depth, init_indent);
+  return dblk::save_to_text_file(*this, fn, write_buf_sz);
+}
+
+inline bool DataBlock::saveToTextFileCompactEx(const char *fn, int write_buf_sz) const
+{
+  return dblk::save_to_text_file_compact(*this, fn, write_buf_sz);
+}
+
+inline bool DataBlock::printToTextStreamLimited(IGenSave &cwr, int max_out_line_num, int max_level_depth, int init_indent,
+  int write_buf_sz, bool write_arrays) const
+{
+  return dblk::print_to_text_stream_limited(*this, cwr, max_out_line_num, max_level_depth, init_indent, write_buf_sz, write_arrays);
 }
 
 template <typename Cb>

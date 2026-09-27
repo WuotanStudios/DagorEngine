@@ -3,6 +3,7 @@
 #include <gamePhys/collision/collisionLib.h>
 #include <gamePhys/collision/collisionCache.h>
 #include <gamePhys/collision/collisionInstances.h>
+#include "../collisionLibPrivate.h"
 
 namespace dacoll
 {
@@ -28,7 +29,13 @@ bool traceray_normalized_ri(const Point3 &, const Point3 &, real &, int *, Point
   G_ASSERT_RETURN(false, false);
 }
 void validate_trace_cache(const bbox3f &, const vec3f &, float, TraceMeshFaces *, float) { G_ASSERT(0); }
+bool append_static_collision_tris(bbox3f_cref, vec4f *, int &) { G_ASSERT_RETURN(false, false); }
+int resolve_static_cache_tri_mat(int) { G_ASSERT_RETURN(false, -1); }
 bool trace_game_objects(const Point3 &, const Point3 &, float &, Point3 &, int, int) { G_ASSERT_RETURN(false, false); }
+bool trace_game_objects_with_grid_filter(const Point3 &, const Point3 &, float &, Point3 &, int, int, const dag::ConstSpan<uint32_t>)
+{
+  G_ASSERT_RETURN(false, false);
+}
 bool traceht_water(const Point3 &, float &) { G_ASSERT_RETURN(false, false); }
 float traceht_lmesh(const Point2 &) { G_ASSERT_RETURN(false, 0.f); }
 float traceht_hmap(const Point2 &) { G_ASSERT_RETURN(false, 0.f); }
@@ -99,7 +106,7 @@ bool test_collision_world(dag::ConstSpan<CollisionObject>, const TMatrix &, floa
 {
   G_ASSERT_RETURN(false, false);
 }
-void update_ri_cache_in_volume_to_phys_world(const BBox3 &) {}
+int update_ri_cache_in_volume_to_phys_world(const BBox3 &) { return 0; }
 bool check_ri_collision_filtered(const rendinst::RendInstDesc &, const TMatrix &, const TMatrix &, int)
 {
   G_ASSERT_RETURN(false, false);
@@ -136,6 +143,7 @@ void shape_query_ri(const PhysBody *, class TMatrix const &, class TMatrix const
 void fetch_sim_res(bool) { G_ASSERT(0); }
 void set_vert_capsule_shape_size(const CollisionObject &, float, float) { G_ASSERT(0); }
 void set_collision_sphere_rad(const CollisionObject &, float) { G_ASSERT(0); }
+void set_collision_box_extents(const CollisionObject &, const Point3 &) { G_ASSERT(0); }
 void set_collision_object_tm(const CollisionObject &, const TMatrix &) { G_ASSERT(0); }
 void draw_collision_object(const CollisionObject &) { G_ASSERT(0); }
 
@@ -151,9 +159,12 @@ CollisionObject &get_reusable_box_collision() { G_ASSERT_RETURN(false, tmpObj); 
 void move_ri_instance(const rendinst::RendInstDesc &, const Point3 &, const Point3 &) { G_ASSERT(0); }
 void enable_disable_ri_instance(const rendinst::RendInstDesc &, bool) { G_ASSERT(0); }
 void flush_ri_instances() { G_ASSERT(0); }
-bool is_ri_instance_enabled(const CollisionInstances *, const rendinst::RendInstDesc &) { G_ASSERT_RETURN(false, true); }
+ska::flat_hash_map<rendinst::RendInstDesc, int, RendInstDescHash> disabled_ri_instances;
+bool is_ri_instance_disabled_outofline(const rendinst::RendInstDesc &) { G_ASSERT_RETURN(false, false); }
 int get_link_name_id(const char *) { G_ASSERT_RETURN(false, -1); }
 const char *get_link_name(const int) { G_ASSERT_RETURN(false, NULL); }
+
+float exchange_ttl_for_collision_instances(float) { G_ASSERT_RETURN(false, -1.f); }
 
 } // namespace dacoll
 

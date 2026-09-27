@@ -30,6 +30,8 @@ public:
   void setGradientValue(PGradient value) override { gradientControl.setValue(value); }
   void getGradientValue(PGradient destGradient) const override { gradientControl.getValue(destGradient); }
 
+  void setGradientMinMaxPointCount(int min, int max) override { gradientControl.setMinMaxPointCount(min, max); }
+
   void setCaptionValue(const char value[]) override { controlCaption = value; }
 
   // current X value line
@@ -98,11 +100,18 @@ public:
   {
     ScopedImguiBeginDisabled scopedDisabled(!controlEnabled);
 
-    ImguiHelper::separateLineLabel(controlCaption);
+    separateLineLabelWithTooltip(controlCaption.begin(), controlCaption.end());
 
     const int width =
       mW > 0 ? min((int)mW, (int)floorf(ImGui::GetContentRegionAvail().x)) : (int)floorf(ImGui::GetContentRegionAvail().x);
     gradientControl.updateImgui(width, mH);
+
+    // Every frame of a drag would otherwise close its own change: gradientControl takes the mouse
+    // buttons for itself, so it never holds ImGui's active item and ChangeFinishTracker sees no edit.
+    if (gradientControl.isGestureActive())
+    {
+      heldActiveImguiItem();
+    }
   }
 
 private:

@@ -33,7 +33,7 @@ static uint32_t getASSizeData(MTLAccelerationStructureDescriptor *desc, uint32_t
 }
 
 RaytraceBottomAccelerationStructure *d3d::create_raytrace_bottom_acceleration_structure(RaytraceGeometryDescription *desc, uint32_t count,
-  RaytraceBuildFlags flags, uint32_t &build_scratch_size_in_bytes, uint32_t *update_scratch_size_in_bytes)
+  RaytraceBuildFlags flags, uint32_t &build_scratch_size_in_bytes, uint32_t *update_scratch_size_in_bytes, ResourceTagType)
 {
   MTLPrimitiveAccelerationStructureDescriptor *accDesc = acceleration_structure_descriptors::getBLASDescriptor(desc, count, flags);
   uint32_t size = getASSizeData(accDesc, build_scratch_size_in_bytes, update_scratch_size_in_bytes);
@@ -41,11 +41,9 @@ RaytraceBottomAccelerationStructure *d3d::create_raytrace_bottom_acceleration_st
   return (RaytraceBottomAccelerationStructure *)drv3d_metal::render.createAccelerationStructure(flags, size, true);
 }
 
-RaytraceBottomAccelerationStructure *d3d::create_raytrace_bottom_acceleration_structure(uint32_t size)
+RaytraceBottomAccelerationStructure *d3d::create_raytrace_bottom_acceleration_structure(uint32_t size, ResourceTagType)
 {
-  G_UNUSED(size);
-  D3D_CONTRACT_ASSERT_FAIL("Creating arbitrary sized BLAS-es is not yet supported on Metal.");
-  return nullptr;
+  return (RaytraceBottomAccelerationStructure *)drv3d_metal::render.createAccelerationStructure(RaytraceBuildFlags::NONE, size, true);
 }
 
 void d3d::delete_raytrace_bottom_acceleration_structure(RaytraceBottomAccelerationStructure *botAccStruct)
@@ -54,10 +52,42 @@ void d3d::delete_raytrace_bottom_acceleration_structure(RaytraceBottomAccelerati
   drv3d_metal::render.deleteAccelerationStructure(botAccStruct);
 };
 
+static bool validate_compaction_flags(const ::raytrace::BottomAccelerationStructureBuildInfo &basbi)
+{
+  const bool flagPresent = RaytraceBuildFlags::ALLOW_COMPACTION == (basbi.flags & RaytraceBuildFlags::ALLOW_COMPACTION);
+  const bool bufPresent = basbi.compactedSizeOutputBuffer;
+  if (flagPresent)
+  {
+    if (@available(macOS 13.0, iOS 16.0, *))
+    {
+      D3D_CONTRACT_ASSERTF_RETURN(bufPresent, false,
+        "Metal: Compacted size buffer should provided when compaction is enabled");
+
+      auto compactedSizeOutputBuffer = reinterpret_cast<drv3d_metal::Buffer*>(basbi.compactedSizeOutputBuffer);
+      D3D_CONTRACT_ASSERTF_RETURN(compactedSizeOutputBuffer->bufFlags & SBCF_BIND_UNORDERED, false,
+        "Metal: Compacted size buffer must have an UAV");
+      D3D_CONTRACT_ASSERT_RETURN(compactedSizeOutputBuffer->getElementSize() == sizeof(uint64_t), false);
+      D3D_CONTRACT_ASSERT_RETURN((basbi.compactedSizeOutputBufferOffsetInBytes % sizeof(uint64_t)) == 0, false);
+    }
+    else
+    {
+      D3D_CONTRACT_ASSERTF_RETURN(false, false, "AS compaction called on unsupported os version");
+    }
+  }
+  else
+  {
+    D3D_CONTRACT_ASSERTF_RETURN(!bufPresent, false,
+      "Metal: Compaction flag should be true when size buffer is provided");
+  }
+  return true;
+}
+
 void d3d::build_bottom_acceleration_structure(RaytraceBottomAccelerationStructure *as,
   const ::raytrace::BottomAccelerationStructureBuildInfo &basbi)
 {
-  D3D_CONTRACT_ASSERTF(!basbi.compactedSizeOutputBuffer, "Calculating compacted_size is not yet implemented for Metal.");
+  if (!validate_compaction_flags(basbi))
+    return;
+
   drv3d_metal::render.buildBLAS(as, basbi);
 }
 
@@ -65,7 +95,7 @@ void d3d::build_bottom_acceleration_structures(::raytrace::BatchedBottomAccelera
 {
   for (uint32_t ix = 0; ix < as_count; ++ix)
   {
-    D3D_CONTRACT_ASSERTF_RETURN(as_array[ix].basbi.scratchSpaceBuffer, , "This API requires providing a scatch buffer for the AS builds");
+    D3D_CONTRACT_ASSERTF_RETURN(as_array[ix].basbi.scratchSpaceBuffer || as_array[ix].basbi.scratchSpaceBufferSizeInBytes == 0, , "This API requires providing a scatch buffer for the AS builds");
   }
 
   for (uint32_t ix = 0; ix < as_count; ++ix)
@@ -101,7 +131,7 @@ void d3d::write_raytrace_index_entries_to_memory(uint32_t count, const RaytraceG
 }
 
 RaytraceTopAccelerationStructure *d3d::create_raytrace_top_acceleration_structure(uint32_t elements, RaytraceBuildFlags flags,
-  uint32_t &build_scratch_size_in_bytes, uint32_t *update_scratch_size_in_bytes)
+  uint32_t &build_scratch_size_in_bytes, uint32_t *update_scratch_size_in_bytes, ResourceTagType)
 {
   MTLInstanceAccelerationStructureDescriptor *accDesc = acceleration_structure_descriptors::getTLASDescriptor(elements, flags);
   uint32_t size = getASSizeData(accDesc, build_scratch_size_in_bytes, update_scratch_size_in_bytes);
@@ -147,8 +177,14 @@ RaytraceAccelerationStructureGpuHandle d3d::get_raytrace_acceleration_structure_
 void d3d::copy_raytrace_acceleration_structure(RaytraceAnyAccelerationStructure dst, RaytraceAnyAccelerationStructure src, bool compact)
 {
   D3D_CONTRACT_ASSERT_RETURN((dst.bottom && src.bottom) || (dst.top && src.top), );
-  // D3D_CONTRACT_ASSERT_RETURN(!compact || (dst.bottom && src.bottom), );
-  D3D_CONTRACT_ASSERT_RETURN(!compact, );
+  if (@available(macOS 13.0, iOS 16.0, *))
+  {
+    D3D_CONTRACT_ASSERT_RETURN(!compact || (dst.bottom && src.bottom), );
+  }
+  else
+  {
+    D3D_CONTRACT_ASSERT_RETURN(!compact, );
+  }
 
   auto rsrc = src.top ? reinterpret_cast<RaytraceAccelerationStructure *>(src.top)
                       : reinterpret_cast<RaytraceAccelerationStructure *>(src.bottom);
@@ -159,7 +195,7 @@ void d3d::copy_raytrace_acceleration_structure(RaytraceAnyAccelerationStructure 
   D3D_CONTRACT_ASSERT(rdst);
   D3D_CONTRACT_ASSERT(rsrc->acceleration_struct);
   D3D_CONTRACT_ASSERT(rdst->acceleration_struct);
-  drv3d_metal::render.copyAccelerationStruct(rdst, rsrc);
+  drv3d_metal::render.copyAccelerationStruct(rdst, rsrc, compact);
 }
 
 bool d3d::raytrace::check_vertex_format_support_for_acceleration_structure_build(uint32_t format)
@@ -226,6 +262,8 @@ namespace
     info.sizeInBytes, false);
 }
 
+::raytrace::AnyAccelerationStructure create_as(const ::raytrace::OpacityMicroMapTriangleArrayPlacementInfo &) { return {}; }
+
 ::raytrace::AccelerationStructureSizes calculate_as_sizes(const ::raytrace::TopAccelerationStructureSizeCalculcationInfo &info)
 {
   ::raytrace::AccelerationStructureSizes result;
@@ -252,6 +290,11 @@ namespace
   }
 
   return result;
+}
+
+::raytrace::AccelerationStructureSizes calculate_as_sizes(const ::raytrace::OpacityMicroMapTriangleArraySizeCalculationInfo &)
+{
+  return {};
 }
 } // namespace
 

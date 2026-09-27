@@ -18,9 +18,9 @@ struct ToolsHeatHazeRendererGlue
   void term()
   {
     heatHazeRenderer.reset();
-    targetHazeOffset = UniqueTexHolder{};
-    targetHazeDepth = UniqueTexHolder{};
-    targetHazeColor = UniqueTexHolder{};
+    targetHazeOffset = UniqueTexWithShaderVar{};
+    targetHazeDepth = UniqueTexWithShaderVar{};
+    targetHazeColor = UniqueTexWithShaderVar{};
     targetHazeTemp = UniqueTex{};
     zFuncAlwaysStateId.reset();
   }
@@ -30,10 +30,9 @@ struct ToolsHeatHazeRendererGlue
     if (IDynRenderService *renderService = EDITORCORE->queryEditorInterface<IDynRenderService>())
     {
       Texture *renderBuffer = renderService->getRenderBuffer();
-      TEXTUREID renderBufferId = renderService->getRenderBufferId();
-      TEXTUREID depthBufferId = renderService->getDepthBufferId();
+      Texture *depthBuffer = renderService->getDepthBuffer();
 
-      if (renderBuffer && renderBufferId != BAD_TEXTUREID)
+      if (renderBuffer)
       {
         TextureInfo info;
         renderBuffer->getinfo(info);
@@ -87,26 +86,25 @@ struct ToolsHeatHazeRendererGlue
         }
 
         HeatHazeRenderer::RenderTargets targets;
-        targets.backBufferId = renderBufferId;
         targets.backBuffer = renderBuffer;
-        targets.depthId = depthBufferId;
-        targets.resolvedDepthId = depthBufferId;
+        targets.depth = depthBuffer;
+        targets.resolvedDepth = depthBuffer;
         targets.hazeOffset = targetHazeOffset.getTex2D();
         targets.hazeDepth = targetHazeDepth.getTex2D();
         targets.hazeColor = targetHazeColor.getTex2D();
         targets.hazeTemp = targetHazeTemp.getTex2D();
-        targets.hazeTempId = targetHazeTemp.getTexId();
 
-        heatHazeRenderer->render(float(get_time_msec()) / 1000, targets, {info.w, info.h}, 0, renderParticles, nullptr, renderRI);
+        if (renderParticles) // the engine calls it unconditionally, unlike renderRI
+          heatHazeRenderer->render(float(get_time_msec()) / 1000, targets, {info.w, info.h}, 0, renderParticles, renderRI);
       }
     }
   }
 
   eastl::unique_ptr<HeatHazeRenderer> heatHazeRenderer;
 
-  UniqueTexHolder targetHazeOffset;
-  UniqueTexHolder targetHazeDepth;
-  UniqueTexHolder targetHazeColor;
+  UniqueTexWithShaderVar targetHazeOffset;
+  UniqueTexWithShaderVar targetHazeDepth;
+  UniqueTexWithShaderVar targetHazeColor;
   UniqueTex targetHazeTemp;
 
   shaders::UniqueOverrideStateId zFuncAlwaysStateId;

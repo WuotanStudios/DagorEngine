@@ -1,6 +1,7 @@
 include "psh_tangent.dshl"
 include "rendinst_opaque_inc.dshl"
 include "emissive.dshl"
+include "unpack_unit_vector_inc.dshl"
 
 shader rendinst_emissive
 {
@@ -9,6 +10,7 @@ shader rendinst_emissive
   if (rendinst_render_pass == rendinst_render_pass_to_heightmap) { dont_render; }
   if (rendinst_render_pass == rendinst_render_pass_impostor_color ||
       rendinst_render_pass == rendinst_render_pass_impostor_shadow ||
+      rendinst_render_pass == rendinst_render_pass_impostor_voxel ||
       rendinst_render_pass == rendinst_render_pass_to_shadow ||
       rendinst_render_pass == rendinst_render_pass_grassify)
   {
@@ -34,6 +36,7 @@ shader rendinst_emissive
   ENABLE_MULTI_DRAW(rendinst_render_pass == rendinst_render_pass_to_shadow || rendinst_render_pass == rendinst_render_pass_depth)
   RENDINST_BLOCK()
   RENDINST_INSTANCING()
+  USE_UNPACK_UNIT_VECTOR_VS()
   if (rendinst_render_pass == rendinst_render_pass_normal)
   {
     EMISSIVE_VS_OUT()
@@ -56,7 +59,7 @@ shader rendinst_emissive
   hlsl(vs) {
 
     INSTANCING_BUFFERS
-    
+
     struct VsInput
     {
       float3 pos                  : POSITION;
@@ -75,7 +78,7 @@ shader rendinst_emissive
         SET_DRAW_CALL_ID(GET_MATERIAL_OFFSET);
       #endif
 
-      float3 localNormal = normalize(BGR_SWIZZLE(input.normal)*2-1);
+      float3 localNormal = normalize(unpack_unit_vector(input.normal.xyz));
       float3 localPos = input.pos;
       float opacity = 1;
       VB_PERFORM_INSTANCING
@@ -100,10 +103,15 @@ shader rendinst_emissive
   if (rendinst_render_pass == rendinst_render_pass_to_shadow || rendinst_render_pass == rendinst_render_pass_depth)
   {
     compile("ps_null", "rendinst_render_depth_black_ps");
-  } else
-  {
-    EMISSIVE_PS(true)
   }
-  
+  else if (is_triangle_size_debug)
+  {
+    RI_TRIANGLE_SIZE_DEBUG_PS()
+  }
+  else
+  {
+    EMISSIVE_PS()
+  }
+
   compile("target_vs", "simple_vs");
 }

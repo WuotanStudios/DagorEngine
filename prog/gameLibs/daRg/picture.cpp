@@ -4,8 +4,6 @@
 #include "guiScene.h"
 #include "picAsyncLoad.h"
 
-// To consider: move this to some public engine header
-extern void lottie_discard_animation(PICTUREID pid);
 
 namespace darg
 {
@@ -44,6 +42,10 @@ Picture::~Picture()
 IGuiScene *Picture::getScene() const { return guiScene; }
 
 
+// Reads pic directly instead of getPic(): must not kick the lazy load from observers.
+bool Picture::isContentReady() const { return !isLoading() && PictureManager::is_picture_content_ready(pic.pic); }
+
+
 const PictureManager::PicDesc &Picture::getPic()
 {
   if (!nameToLoadOnDemand.empty())
@@ -53,6 +55,27 @@ const PictureManager::PicDesc &Picture::getPic()
   }
 
   return pic;
+}
+
+
+void Picture::finishPrefetch()
+{
+  if (pic.pic == BAD_PICTUREID)
+    return;
+
+  Point2 tcLt, tcRb;
+  PictureManager::get_picture_data(pic.pic, tcLt, tcRb);
+}
+
+
+bool Picture::prefetch()
+{
+  getPic();
+
+  prefetchPending = isLoading();
+  if (!prefetchPending)
+    finishPrefetch();
+  return prefetchPending;
 }
 
 
@@ -101,7 +124,7 @@ bool Picture::load(const char *name)
   AsyncLoadRequest *req = PicAsyncLoad::make_request(this);
 
   bool sync = PictureManager::get_picture_ex(name, picId, texId, smpId, &req->tcLt, &req->tcRb, /*picSize*/ nullptr,
-    PicAsyncLoad::pic_mgr_async_load_cb, req);
+    PicAsyncLoad::pic_mgr_async_load_cb, req, PicAsyncLoad::pic_mgr_load_confirm_cb);
 
   pic.pic = picId;
   pic.tex = texId;
@@ -167,6 +190,12 @@ void Picture::onLoaded(PICTUREID pid, TEXTUREID tid, d3d::SamplerHandle smp, con
   {
     lazy = true;
     init(srcName);
+    // a load started here would be aborted too, the next getPic() retries
+  }
+  else if (prefetchPending)
+  {
+    prefetchPending = false;
+    finishPrefetch();
   }
 }
 
